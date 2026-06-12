@@ -2,68 +2,86 @@
 
 ## What This Is
 
-A full Rust rewrite of the CatBoost gradient boosting library, targeting complete feature parity with the original. It exposes first-class APIs in both Rust (using Rust-native patterns) and Python (via PyO3/maturin with a scikit-learn compatible interface). GPU acceleration is provided through CubeCL, with backends switchable via Cargo features.
+A full Rust rewrite of the CatBoost gradient boosting library, targeting complete feature parity with the original C++ implementation. It exposes first-class APIs in both Rust (using Rust-native patterns like the Builder pattern) and Python (via PyO3/maturin), where the Python surface is **both** scikit-learn compatible *and* CatBoost-native (Pool, parameter names) for drop-in migration. GPU acceleration is provided through CubeCL with backends switchable at compile time via Cargo features.
+
+It is for two audiences: Rust developers who want to embed a memory-efficient gradient booster directly, and Python ML practitioners who want a drop-in replacement for CatBoost in existing scikit-learn or CatBoost workflows.
 
 ## Core Value
 
-A memory-efficient, Rust-native CatBoost implementation that Rust developers can embed directly and Python ML practitioners can drop into scikit-learn pipelines — without sacrificing feature parity with the original CatBoost.
+A memory-efficient, Rust-native CatBoost implementation that achieves verifiable feature parity with the original (oracle-tested to within 10⁻⁵), embeddable directly in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
 
 ## Requirements
 
 ### Validated
 
+<!-- Shipped and confirmed valuable. -->
+
 (None yet — ship to validate)
 
 ### Active
 
-- [ ] Gradient boosting training and prediction (classifier, regressor, ranker)
-- [ ] Categorical feature encoding (target encoding, ordered boosting)
-- [ ] SHAP value computation
+<!-- Current scope. Building toward these. v1 target = full feature parity. -->
+
+- [ ] Gradient boosting training and prediction — classification, regression, and ranking
+- [ ] Categorical feature handling — target/ordered encoding, ordered boosting
 - [ ] Text and embedding feature support
-- [ ] Serialization / model save-load
-- [ ] Multi-backend GPU execution via CubeCL (cuda, rocm, wgpu) + cpu
-- [ ] Python bindings via PyO3/maturin with scikit-learn compatible API (fit/predict/score)
-- [ ] NumPy, Pandas, and Arrow/Polars input support in Python
-- [ ] Cargo workspace with feature-gated backend crates
-- [ ] Oracle test suite: random data, error tolerance ≤ 10⁻⁵, GPU tests on rocm
+- [ ] SHAP value computation (feature importance / explanations)
+- [ ] Model serialization — save/load with cross-version compatibility
+- [ ] Multi-backend GPU execution via CubeCL — `cuda`, `rocm`, `wgpu`, plus `cpu`, switched by Cargo feature
+- [ ] CubeCL runtime parameterized via generics for flexible backend switching with no runtime dispatch overhead
+- [ ] Rust API using the Builder pattern
+- [ ] Python bindings via PyO3 + maturin — per-backend wheels (e.g. `catboost-rs-rocm`)
+- [ ] Python API: scikit-learn compatible (fit/predict/predict_proba/score)
+- [ ] Python API: CatBoost-native (Pool, CatBoostClassifier/Regressor parameter parity)
+- [ ] Python input support: NumPy, Pandas, and Arrow/Polars
+- [ ] Modular Cargo workspace — feature-gated backend crates, clear separation of responsibilities
+- [ ] Oracle test suite — random inputs validated against original CatBoost outputs, absolute error ≤ 10⁻⁵
+- [ ] GPU test execution on the `rocm` backend
 
 ### Out of Scope
 
-- C API / C FFI layer — PyO3 direct bindings only; no CAPI needed
-- Mobile/embedded targets — desktop and server workloads only
-- Real-time streaming training — batch training only for v1
+<!-- Explicit boundaries. Includes reasoning to prevent re-adding. -->
+
+- C API / C FFI layer — PyO3 direct bindings only; no CAPI surface needed
+- Mobile / embedded targets — desktop and server workloads only
+- Real-time streaming / online training — batch training only
+- R and CLI interfaces — Rust and Python only for this milestone
 
 ## Context
 
-- CatBoost (original) is a C++ library with Python, R, and CLI interfaces. The rewrite targets full algorithmic parity in Rust.
-- CubeCL provides a Rust-native GPU compute abstraction; backends are selected at compile time via Cargo features: `cuda` (untestable locally), `rocm`, `wgpu`, `cpu`. The CubeCL runtime is parameterized via generics for flexible backend switching without runtime overhead.
-- Python packaging: users install the backend-specific wheel (e.g. `catboost-rs-rocm`). PyO3 + maturin handle the Rust→Python boundary.
-- Python version requirement: >= 3.12.
-- No `unwrap()` in production code — error propagation uses `thiserror` (library errors) + `anyhow` (application/binding errors).
-- Test design: oracle testing with randomly generated inputs; pass threshold is absolute error < 10⁻⁵ vs reference CatBoost output. GPU tests run exclusively on the rocm backend. Source and test code are strictly separated (no `#[cfg(test)]` inline with production logic).
+- **Reference implementation vendored:** the original CatBoost C++ source is present at `catboost-master/` and has been analyzed into `.planning/codebase/` (ARCHITECTURE, STACK, STRUCTURE, CONVENTIONS, TESTING, INTEGRATIONS, CONCERNS). It serves as the algorithmic reference and the oracle for parity testing — not as our codebase (the Rust implementation is greenfield).
+- **Oracle strategy:** expected values are generated by running the original CatBoost on the same randomly generated inputs; our output must match to within absolute error 10⁻⁵. This requires CatBoost available in the test harness.
+- **CubeCL** provides a Rust-native GPU compute abstraction. Backends are selected at compile time via Cargo features (`cuda` — untestable locally, `rocm`, `wgpu`, `cpu`). The runtime is parameterized via generics so backend switching carries no runtime dispatch cost.
+- **Python packaging:** users install the backend-specific wheel matching their hardware. PyO3 + maturin handle the Rust→Python boundary. Python ≥ 3.12.
+- **Error handling:** `thiserror` for library-level errors, `anyhow` for application/binding-level. `unwrap()` is strictly prohibited in production code.
+- **Test design:** oracle testing with randomly generated inputs; source and test code strictly separated (no inline `#[cfg(test)]` mixed with production logic). GPU tests run exclusively on the `rocm` backend.
 
 ## Constraints
 
 - **Tech stack**: Rust (latest stable), CubeCL for GPU kernels, PyO3 + maturin for Python bindings
 - **Python version**: >= 3.12
 - **Backend selection**: Cargo features only — `cuda`, `rocm`, `wgpu`, `cpu`; no runtime switching
-- **Dependencies**: Always use the latest crate versions
-- **Error handling**: `thiserror` for library errors, `anyhow` for application-level; `unwrap()` strictly prohibited in production
-- **Memory**: High memory efficiency is a first-class design constraint — minimize allocations, prefer zero-copy where possible
-- **Workspace**: Modular Cargo workspace from day one — clear crate separation of responsibilities
-- **API style**: Rust side uses Builder pattern; Python side is scikit-learn compatible (fit/predict/score)
+- **Dependencies**: always use the latest crate versions
+- **Error handling**: `thiserror` (library) + `anyhow` (application); `unwrap()` strictly prohibited in production
+- **Memory**: high memory efficiency is a first-class design constraint — minimize allocations, prefer zero-copy where possible
+- **Workspace**: modular Cargo workspace from day one — clear crate separation of responsibilities
+- **API style**: Rust side uses the Builder pattern; Python side is both scikit-learn compatible and CatBoost-native
+- **Parity bar**: oracle error tolerance ≤ 10⁻⁵ against original CatBoost outputs
+- **Testing**: source/test code strictly separated; GPU tests on `rocm` only
 - **No C API**: PyO3 bindings only; no C FFI or CAPI layer
 
 ## Key Decisions
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| CubeCL for GPU kernels | Rust-native abstraction supporting cuda/rocm/wgpu in a single codebase via generics | — Pending |
-| PyO3 + maturin (no CAPI) | Simplest correct path for Rust→Python; avoids unsafe C ABI layer | — Pending |
-| Scikit-learn compatible Python API | Allows drop-in use in existing ML pipelines without user rework | — Pending |
-| Feature-gated backends | Users compile and install only what their hardware supports | — Pending |
-| Oracle testing vs reference CatBoost | Ensures algorithmic correctness against the original implementation | — Pending |
-| thiserror + anyhow error strategy | thiserror for clean library API errors; anyhow for ergonomic error propagation at bindings/app level | — Pending |
+| Full CatBoost feature parity as v1 target | User wants a true drop-in replacement, not a subset | — Pending |
+| CubeCL for GPU kernels with generic runtime | Rust-native abstraction spanning cuda/rocm/wgpu in one codebase, zero-cost backend switching via generics | — Pending |
+| PyO3 + maturin (no CAPI) | Simplest correct Rust→Python path; avoids an unsafe C ABI layer; enables per-backend wheels | — Pending |
+| Dual Python API (sklearn + CatBoost-native) | Maximizes compatibility — drop into sklearn pipelines AND migrate existing CatBoost code unchanged | — Pending |
+| Feature-gated backend crates | Users compile/install only what their hardware supports | — Pending |
+| Oracle testing vs original CatBoost outputs | Proves algorithmic parity with the reference, not just internal self-consistency | — Pending |
+| thiserror + anyhow error strategy | thiserror for clean library API errors; anyhow for ergonomic propagation at bindings/app level | — Pending |
+| Vendored catboost-master as reference + oracle | Single source of truth for both algorithm behavior and expected test values | — Pending |
 
 ## Evolution
 
