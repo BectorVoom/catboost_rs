@@ -125,17 +125,80 @@ Explicitly excluded (anti-features). Documented to prevent scope creep.
 
 ## Traceability
 
-Populated during roadmap creation — each requirement maps to exactly one phase.
+Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for phase detail.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| _(filled by roadmapper)_ | — | Pending |
+| INFRA-01 | Phase 1 | Pending |
+| INFRA-02 | Phase 1 | Pending |
+| INFRA-03 | Phase 1 | Pending |
+| INFRA-04 | Phase 1 | Pending |
+| INFRA-05 | Phase 1 | Pending |
+| INFRA-06 | Phase 1 | Pending |
+| DATA-01 | Phase 2 | Pending |
+| DATA-02 | Phase 2 | Pending |
+| DATA-03 | Phase 2 | Pending |
+| DATA-04 | Phase 2 | Pending |
+| DATA-05 | Phase 2 | Pending |
+| DATA-06 | Phase 2 | Pending |
+| DATA-07 | Phase 2 | Pending |
+| DATA-08 | Phase 2 | Pending |
+| TRAIN-01 | Phase 3 | Pending |
+| TRAIN-02 | Phase 3 | Pending |
+| TRAIN-03 | Phase 3 | Pending |
+| TRAIN-04 | Phase 3 | Pending |
+| TRAIN-05 | Phase 3 | Pending |
+| TRAIN-06 | Phase 3 | Pending |
+| TRAIN-07 | Phase 3 | Pending |
+| TRAIN-08 | Phase 3 | Pending |
+| MODEL-01 | Phase 4 | Pending |
+| MODEL-02 | Phase 4 | Pending |
+| MODEL-03 | Phase 4 | Pending |
+| MODEL-04 | Phase 4 | Pending |
+| MODEL-06 | Phase 4 | Pending |
+| LOSS-01 | Phase 4 | Pending |
+| LOSS-06 | Phase 4 | Pending |
+| RAPI-01 | Phase 4 | Pending |
+| RAPI-02 | Phase 4 | Pending |
+| ORD-01 | Phase 5 | Pending |
+| ORD-02 | Phase 5 | Pending |
+| ORD-03 | Phase 5 | Pending |
+| ORD-04 | Phase 5 | Pending |
+| ORD-05 | Phase 5 | Pending |
+| LOSS-02 | Phase 6 | Pending |
+| LOSS-03 | Phase 6 | Pending |
+| LOSS-04 | Phase 6 | Pending |
+| LOSS-05 | Phase 6 | Pending |
+| LOSS-07 | Phase 6 | Pending |
+| LOSS-08 | Phase 6 | Pending |
+| LOSS-09 | Phase 6 | Pending |
+| FEAT-01 | Phase 6 | Pending |
+| FEAT-02 | Phase 6 | Pending |
+| FEAT-03 | Phase 6 | Pending |
+| FEAT-04 | Phase 6 | Pending |
+| FEAT-05 | Phase 6 | Pending |
+| FEAT-06 | Phase 6 | Pending |
+| MODEL-05 | Phase 6 | Pending |
+| GPU-01 | Phase 7 | Pending |
+| GPU-02 | Phase 7 | Pending |
+| GPU-03 | Phase 7 | Pending |
+| GPU-04 | Phase 7 | Pending |
+| GPU-05 | Phase 7 | Pending |
+| GPU-06 | Phase 7 | Pending |
+| PYAPI-01 | Phase 8 | Pending |
+| PYAPI-02 | Phase 8 | Pending |
+| PYAPI-03 | Phase 8 | Pending |
+| PYAPI-04 | Phase 8 | Pending |
+| PYAPI-05 | Phase 8 | Pending |
+| PYAPI-06 | Phase 8 | Pending |
 
 **Coverage:**
-- v1 requirements: 57 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 57 ⚠️
+- v1 requirements: 62 total
+- Mapped to phases: 62 ✓
+- Unmapped: 0
+
+**Per-phase counts:** Phase 1: 6 · Phase 2: 8 · Phase 3: 8 · Phase 4: 9 · Phase 5: 5 · Phase 6: 14 · Phase 7: 6 · Phase 8: 6 (= 62)
 
 ---
 *Requirements defined: 2026-06-13*
-*Last updated: 2026-06-13 after initial definition*
+*Last updated: 2026-06-13 after roadmap creation (traceability populated, 62/62 mapped; corrected v1 count from stale 57)*
