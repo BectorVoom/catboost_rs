@@ -31,6 +31,7 @@ use cb_compute::{
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
+use crate::autolr::{self, TargetType};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::metrics::{EvalMetric, EvalMetricHistory};
 use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
@@ -61,8 +62,19 @@ pub struct BoostParams {
     pub iterations: usize,
     /// Tree depth (number of splits per tree; `2^depth` leaves).
     pub depth: usize,
-    /// Learning rate scaling every leaf delta.
+    /// Learning rate scaling every leaf delta. Ignored when
+    /// [`BoostParams::auto_learning_rate`] is `true` and the loss is auto-LR
+    /// eligible (the value is then guessed pre-train via [`crate::autolr`]).
     pub learning_rate: f64,
+    /// When `true`, the learning rate is selected automatically pre-train
+    /// ([`crate::autolr`], TRAIN-08) — matching upstream's gate where
+    /// `learning_rate` / `leaf_estimation_method` / `leaf_estimation_iterations`
+    /// / `l2_leaf_reg` are all unset. The host caller maps "all four unset" to
+    /// this flag; this struct carries concrete values for the latter three, so
+    /// the flag is the single explicit auto-LR opt-in. When the loss is not in
+    /// the auto-LR table (e.g. MAE) the explicit [`BoostParams::learning_rate`]
+    /// is used unchanged (matches upstream `NeedToUpdate == false`).
+    pub auto_learning_rate: bool,
     /// L2 leaf regularization (`l2_leaf_reg`).
     pub l2_leaf_reg: f64,
     /// Split-score perturbation strength (`random_strength`, TRAIN-05). `0.0`
@@ -145,6 +157,18 @@ impl Model {
             .iter()
             .flat_map(|t| t.leaf_values.iter().copied())
             .collect()
+    }
+}
+
+/// Map the boosting [`Loss`] to the auto-LR [`TargetType`] (upstream
+/// `GetTargetType`, `options_helper.cpp:181-194`): RMSE -> RMSE, Logloss ->
+/// Logloss, everything else (MAE / Quantile) -> [`TargetType::Unknown`] (not in
+/// the auto-LR table, so no rate is guessed).
+const fn autolr_target_type(loss: Loss) -> TargetType {
+    match loss {
+        Loss::Rmse => TargetType::Rmse,
+        Loss::Logloss => TargetType::Logloss,
+        Loss::Mae => TargetType::Unknown,
     }
 }
 
@@ -391,6 +415,33 @@ pub fn train_with_eval_sets<R: Runtime>(
         return Err(CbError::Degenerate("empty target".to_owned()));
     }
 
+    // Automatic learning-rate selection (TRAIN-08): when the caller opted into
+    // auto-LR AND the loss is in the upstream coefficient table, guess the rate
+    // pre-train from (target, useBestModel, boostFromAverage, learnObjectCount,
+    // iterations) — exactly upstream's `UpdateLearningRate` gate
+    // (`options_helper.cpp:269-288`, fired when learning_rate /
+    // leaf_estimation_method / leaf_estimation_iterations / l2_leaf_reg all
+    // unset). When the loss is NOT auto-LR eligible the explicit
+    // `params.learning_rate` is used unchanged (matches `NeedToUpdate == false`).
+    let learning_rate = if params.auto_learning_rate {
+        let target_type = autolr_target_type(params.loss);
+        match autolr::guess(
+            target_type,
+            params.use_best_model,
+            params.boost_from_average,
+            n,
+            params.iterations,
+        ) {
+            Ok(lr) => lr,
+            // No coefficient row for this loss (Unknown target): keep the
+            // explicit rate, matching upstream `NeedToUpdate == false`.
+            Err(CbError::Degenerate(_)) => params.learning_rate,
+            Err(e) => return Err(e),
+        }
+    } else {
+        params.learning_rate
+    };
+
     // Per-object weights: default to 1.0 when no weights are supplied.
     let weights: Vec<f64> = if weights.is_empty() {
         vec![1.0; n]
@@ -535,7 +586,7 @@ pub fn train_with_eval_sets<R: Runtime>(
         //    `derivativesStDevFromZero` is computed over upstream).
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
         let perturb = if perturb_active {
-            let model_length = iter as f64 * params.learning_rate;
+            let model_length = iter as f64 * learning_rate;
             let std_dev = score_st_dev(params.random_strength, &score_weighted_der1, model_length);
             Some(Perturbation {
                 rng: &mut rng,
@@ -572,7 +623,7 @@ pub fn train_with_eval_sets<R: Runtime>(
         );
         let leaf_values: Vec<f64> = leaf_deltas
             .iter()
-            .map(|&delta| params.learning_rate * delta)
+            .map(|&delta| learning_rate * delta)
             .collect();
 
         // 4. Update approx: approx[i] += leaf_value[leaf(i)].

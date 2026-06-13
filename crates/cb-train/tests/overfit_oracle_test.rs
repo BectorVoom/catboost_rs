@@ -187,6 +187,7 @@ fn train_overfit(cfg: &OverfitConfig) -> (cb_train::Model, Vec<f64>) {
         od_wait: cfg.od_wait,
         use_best_model: cfg.use_best_model,
         eval_metric: None,
+        auto_learning_rate: false,
     };
 
     let eval = EvalSet {

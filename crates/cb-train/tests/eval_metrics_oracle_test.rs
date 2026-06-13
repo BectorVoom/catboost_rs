@@ -93,6 +93,7 @@ fn train_eval_metrics(
         od_wait: 0,
         use_best_model: false,
         eval_metric: Some(eval_metric),
+        auto_learning_rate: false,
     };
 
     let sets = [
@@ -181,6 +182,7 @@ fn eval_metric_defaults_to_objective_curve() {
         od_wait: 0,
         use_best_model: false,
         eval_metric: None, // default => RMSE (the objective)
+        auto_learning_rate: false,
     };
     let sets = [
         EvalSet {

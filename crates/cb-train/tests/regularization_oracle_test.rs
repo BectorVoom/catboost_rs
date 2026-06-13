@@ -86,6 +86,7 @@ fn train_scenario(
         od_wait: 0,
         use_best_model: false,
         eval_metric: None,
+        auto_learning_rate: false,
     };
 
     let mut staged = Vec::new();
@@ -167,6 +168,7 @@ fn check_scenario_first_trees(
         od_wait: 0,
         use_best_model: false,
         eval_metric: None,
+        auto_learning_rate: false,
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 
