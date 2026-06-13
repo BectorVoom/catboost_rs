@@ -36,7 +36,7 @@
 - [x] **TRAIN-05**: Regularization — `l2_leaf_reg`, `random_strength`, `bagging_temperature`
 - [x] **TRAIN-06**: Overfitting detection and early stopping — Wilcoxon/IncToDec/Iter, `od_pval`/`od_wait`, `use_best_model`
 - [x] **TRAIN-07**: Eval-set validation metrics logged per iteration (multiple eval sets, `eval_metric`)
-- [ ] **TRAIN-08**: Automatic learning-rate selection from dataset size
+- [x] **TRAIN-08**: Automatic learning-rate selection from dataset size
 
 ### Ordered Algorithms (Signature Features)
 
@@ -150,7 +150,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-05 | Phase 3 | Complete |
 | TRAIN-06 | Phase 3 | Complete |
 | TRAIN-07 | Phase 3 | Complete |
-| TRAIN-08 | Phase 3 | Pending |
+| TRAIN-08 | Phase 3 | Complete |
 | MODEL-01 | Phase 4 | Pending |
 | MODEL-02 | Phase 4 | Pending |
 | MODEL-03 | Phase 4 | Pending |

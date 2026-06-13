@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Workspace, Lint Discipline & Oracle Harness** - Foundational infrastructure, intermediate-oracle tooling, and the bitstream-exact `TFastRng64` port (completed 2026-06-13)
 - [x] **Phase 2: Data Layer — Pool, Quantization & Reduction** - `Pool`/`QuantizedPool`, oracle-validated `GreedyLogSum` borders, audited deterministic reduction (completed 2026-06-13)
-- [ ] **Phase 3: CPU Training Core — Plain Boosting & Oblivious Trees** - The generic `R: Runtime` boundary, plain boosting loop, symmetric trees, leaf estimation, early stopping
+- [x] **Phase 3: CPU Training Core — Plain Boosting & Oblivious Trees** - The generic `R: Runtime` boundary, plain boosting loop, symmetric trees, leaf estimation, early stopping (completed 2026-06-13)
 - [ ] **Phase 4: Model, Serialization, SHAP & Rust API (First Full Oracle Lock)** - `.cbm` serialize/apply, SHAP/fstr, binary-clf + regression end-to-end ≤1e-5, Builder API
 - [ ] **Phase 5: Ordered Boosting, Ordered CTR & Categoricals (High-Risk Parity Slice)** - Multi-permutation folds, ordered boosting, ordered CTR, one-hot, feature combinations
 - [ ] **Phase 6: Full Loss & Feature Parity** - Multiclass/regression/ranking losses, text/embedding features, uncertainty, advanced fstr, custom objectives
@@ -129,7 +129,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 8** *(blocked on Wave 7)*
 
-- [ ] 03-07-PLAN.md — Automatic learning-rate selection (TAutoLRParamsGuesser) + first end-to-end auto-LR train→predict (TRAIN-08)
+- [x] 03-07-PLAN.md — Automatic learning-rate selection (TAutoLRParamsGuesser) + first end-to-end auto-LR train→predict (TRAIN-08)
 
 ### Phase 4: Model, Serialization, SHAP & Rust API (First Full Oracle Lock)
 
