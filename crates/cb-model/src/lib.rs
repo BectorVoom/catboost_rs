@@ -7,10 +7,50 @@
 //! the per-float-feature borders, so apply / SHAP / serialize need no training
 //! pool. [`Split`] is REUSED from `cb-train` (not redefined).
 //!
-//! The `generated` module holds the `flatc --rust` FlatBuffers bindings for the
+//! The `*_generated` modules hold the `flatc --rust` FlatBuffers bindings for the
 //! vendored upstream `model` / `features` / `ctr_data` schema (D-01), consumed by
 //! the later `.cbm` (de)serializer plan.
 
 mod model;
 
 pub use model::{Model, ObliviousTree, Split};
+
+// flatc --rust generated FlatBuffers bindings for the vendored upstream schema
+// (D-01). Generated with `flatc --rust --gen-all` so each committed file is
+// SELF-CONTAINED (its schema includes are inlined under the file's own
+// `pub mod ncat_boost_fbs` — the `NCatBoostFbs` namespace), with NO cross-file
+// `use crate::*_generated::*` references. That makes each file mount as a plain
+// `#[path]` module with no extra wiring. The committed files under
+// `src/generated/` are unmodified flatc output (NEVER hand-edited, D-01):
+//   * `model_generated.rs`    — TModelCore / TModelTrees (LeafValues / LeafWeights
+//     / Bias) plus the inlined features + ctr_data + guid schema. This is the
+//     authoritative binding the later `.cbm` (de)serializer plan consumes.
+//   * `features_generated.rs` — features schema (+ guid), self-contained.
+//   * `ctr_data_generated.rs` — ctr_data schema (+ features + guid), self-contained.
+//
+// `#[allow(...)]` mirrors the generated-FFI exemption pattern in CLAUDE.md: the
+// bindings carry non-snake_case fields, unused helpers, and clippy-restricted
+// constructs intrinsic to flatc output, not project code.
+macro_rules! flatc_module {
+    ($modname:ident, $file:literal) => {
+        #[allow(
+            clippy::all,
+            clippy::pedantic,
+            clippy::nursery,
+            clippy::restriction,
+            non_snake_case,
+            non_camel_case_types,
+            non_upper_case_globals,
+            unused_imports,
+            dead_code,
+            missing_docs,
+            unsafe_op_in_unsafe_fn
+        )]
+        #[path = $file]
+        pub mod $modname;
+    };
+}
+
+flatc_module!(model_generated, "generated/model_generated.rs");
+flatc_module!(features_generated, "generated/features_generated.rs");
+flatc_module!(ctr_data_generated, "generated/ctr_data_generated.rs");

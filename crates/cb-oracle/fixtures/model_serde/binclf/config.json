@@ -1,0 +1,34 @@
+{
+  "artifacts": [
+    "model.cbm",
+    "model.json",
+    "predictions.npy"
+  ],
+  "boost_from_average": false,
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "label_definition": "y_binary = (numeric_tiny.y > median)",
+  "loss_function": "Logloss",
+  "n_features": 4,
+  "n_rows": 50,
+  "note": "MODEL-01 native .cbm load-parity; model.json carries leaf_weights",
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "scenario": "model_serde/binclf",
+  "seed": 0,
+  "thread_count": 1
+}

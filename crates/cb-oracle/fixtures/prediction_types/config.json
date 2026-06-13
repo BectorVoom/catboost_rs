@@ -1,0 +1,18 @@
+{
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "layout": "each *.npy is the flattened (row-major) f64 output for one prediction_type",
+  "loss_function": "Logloss",
+  "n_rows": 50,
+  "note": "LOSS-06 per-prediction-type transform oracle",
+  "prediction_types": [
+    "RawFormulaVal",
+    "Probability",
+    "LogProbability",
+    "Class",
+    "Exponent"
+  ],
+  "scenario": "prediction_types",
+  "seed": 0,
+  "thread_count": 1
+}

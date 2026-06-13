@@ -66,6 +66,36 @@ OVERFIT_INPUT = INPUTS / "overfit_eval"
 EVAL_METRICS = FIXTURES / "eval_metrics"
 EVAL_METRICS_INPUT = INPUTS / "eval_metrics"
 AUTOLR = FIXTURES / "autolr"
+# Phase-4 (Plan 04-01, D-13) offline fixture roots. These stage the downstream
+# Wave-2..5 oracle locks: native `.cbm` load-parity (MODEL-01), prediction-type
+# transforms (LOSS-06), SHAP / PredictionValuesChange / Interaction feature
+# importance (MODEL-03/04), and CrossEntropy + Focal training (LOSS-01).
+MODEL_SERDE = FIXTURES / "model_serde"
+PREDICTION_TYPES = FIXTURES / "prediction_types"
+FEATURE_IMPORTANCE = FIXTURES / "feature_importance"
+LOSS_EXTRA = FIXTURES / "loss_extra"
+
+# ---------------------------------------------------------------------------
+# PHASE-4 FIXTURE MANIFEST (D-13) — every NEW fixture path the downstream Wave-2..5
+# plans expect under crates/cb-oracle/fixtures/. Produced OFFLINE by this
+# generator on a machine with catboost==1.2.10 (Python catboost is NOT importable
+# in CI; CI only READS the committed artifacts — D-12). Re-run with
+# `.venv/bin/python gen_fixtures.py` then COMMIT the results.
+#
+#   model_serde/binclf/model.cbm          MODEL-01 native .cbm (binclf, 1-dim)
+#   model_serde/binclf/model.json         MODEL-01 matching JSON (carries leaf_weights)
+#   model_serde/binclf/predictions.npy    RawFormulaVal reference for round-trip apply
+#   model_serde/regression/model.cbm      MODEL-01 native .cbm (regression, 1-dim)
+#   model_serde/regression/model.json     MODEL-01 matching JSON (carries leaf_weights)
+#   model_serde/regression/predictions.npy reference predictions
+#   prediction_types/{rawformulaval,probability,logprobability,class,exponent}.npy
+#                                         LOSS-06 per-prediction-type transforms
+#   feature_importance/shap_values.npy    MODEL-03 SHAP (n_rows x (n_features+1))
+#   feature_importance/prediction_values_change.npy MODEL-04 PredictionValuesChange
+#   feature_importance/interaction.npy    MODEL-04 Interaction (flattened pairs)
+#   loss_extra/cross_entropy/{model.json,staged.npy,predictions.npy} LOSS-01 CrossEntropy
+#   loss_extra/focal/{model.json,staged.npy,predictions.npy}         LOSS-01 Focal
+# ---------------------------------------------------------------------------
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -1462,6 +1492,271 @@ def gen_autolr() -> None:
             fh.write("\n")
 
 
+def gen_model_serde() -> None:
+    """model_serde/{binclf,regression}/ — MODEL-01 native `.cbm` load-parity
+    fixtures (D-13). Trains a 1-dim binclf (Logloss) and a 1-dim regression (RMSE)
+    model with the simplified isolating params, saving BOTH the native `.cbm`
+    blob (the FlatBuffers `TModelCore`: `CBM1` magic + ui32 size + payload) AND the
+    matching `model.json` (now carrying per-tree `leaf_weights`, RESEARCH Pitfall
+    1/2). `predictions.npy` is the RawFormulaVal reference the later `.cbm`
+    load->apply round-trip locks against. Python-reachable oracle only (D-11/D-12).
+    """
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_bin = (y > np.median(y)).astype(np.int64)
+
+    scenarios = [
+        ("regression", CatBoostRegressor, True, y, "RMSE"),
+        ("binclf", CatBoostClassifier, False, y_bin, "Logloss"),
+    ]
+    for name, ctor, bfa, target, loss in scenarios:
+        scenario_dir = MODEL_SERDE / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        model = ctor(boost_from_average=bfa, **ISOLATING_PARAMS)
+        model.fit(x, target)
+
+        # Native .cbm (FlatBuffers TModelCore) + matching JSON (leaf_weights).
+        model.save_model(str(scenario_dir / "model.cbm"), format="cbm")
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        predictions = _assert_f64(
+            np.asarray(
+                model.predict(x, prediction_type="RawFormulaVal"), dtype=np.float64
+            ),
+            "predictions",
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": f"model_serde/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": loss,
+            "boost_from_average": bfa,
+            "params": {**ISOLATING_PARAMS, "boost_from_average": bfa},
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "label_definition": (
+                "y_binary = (numeric_tiny.y > median)" if name == "binclf" else "numeric_tiny.y"
+            ),
+            "artifacts": ["model.cbm", "model.json", "predictions.npy"],
+            "prediction_type": "RawFormulaVal",
+            "note": "MODEL-01 native .cbm load-parity; model.json carries leaf_weights",
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
+def gen_prediction_types() -> None:
+    """prediction_types/ — LOSS-06 per-prediction-type transform oracle (D-13).
+    Trains a binclf (Logloss) model and saves each upstream `prediction_type`'s
+    output over the training inputs: RawFormulaVal (raw logit), Probability
+    (sigmoid), LogProbability (log of the per-class probabilities), Class
+    (argmax/threshold label), and Exponent (exp(rawFormulaVal)). The later apply
+    plan locks each Rust transform against these (<= 1e-5). Python oracle (D-11).
+    """
+    PREDICTION_TYPES.mkdir(parents=True, exist_ok=True)
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_bin = (y > np.median(y)).astype(np.int64)
+
+    model = CatBoostClassifier(boost_from_average=False, **ISOLATING_PARAMS)
+    model.fit(x, y_bin)
+
+    # (filename, prediction_type). LogProbability/Probability are per-class 2-col
+    # arrays for a binary classifier; stored flat (row-major) f64.
+    for fname, ptype in [
+        ("rawformulaval", "RawFormulaVal"),
+        ("probability", "Probability"),
+        ("logprobability", "LogProbability"),
+        ("class", "Class"),
+        ("exponent", "Exponent"),
+    ]:
+        arr = np.asarray(model.predict(x, prediction_type=ptype), dtype=np.float64)
+        flat = _assert_f64(arr.ravel().astype(np.float64), fname)
+        np.save(PREDICTION_TYPES / f"{fname}.npy", flat, allow_pickle=False)
+
+    config = {
+        "scenario": "prediction_types",
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "loss_function": "Logloss",
+        "n_rows": int(x.shape[0]),
+        "prediction_types": [
+            "RawFormulaVal",
+            "Probability",
+            "LogProbability",
+            "Class",
+            "Exponent",
+        ],
+        "layout": "each *.npy is the flattened (row-major) f64 output for one prediction_type",
+        "note": "LOSS-06 per-prediction-type transform oracle",
+    }
+    with (PREDICTION_TYPES / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def gen_feature_importance() -> None:
+    """feature_importance/ — MODEL-03/04 SHAP + PredictionValuesChange +
+    Interaction oracle (D-13). Trains a binclf (Logloss) model and saves each
+    `get_feature_importance(type=...)` output over a training `Pool`:
+      * ShapValues             -> shap_values.npy             (n_rows x (n_features+1);
+                                  last column is the expected-value / bias term)
+      * PredictionValuesChange -> prediction_values_change.npy (n_features,)
+      * Interaction            -> interaction.npy             (flattened [i, j, score]
+                                  triples as returned by get_feature_importance)
+    The later SHAP/fstr plans lock the Rust TreeSHAP recursion + fstr against these
+    (<= 1e-5). Requires the per-leaf `leaf_weights` captured this plan (RESEARCH
+    Pitfall 1). Python oracle (D-11)."""
+    FEATURE_IMPORTANCE.mkdir(parents=True, exist_ok=True)
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_bin = (y > np.median(y)).astype(np.int64)
+
+    model = CatBoostClassifier(boost_from_average=False, **ISOLATING_PARAMS)
+    model.fit(x, y_bin)
+    pool = Pool(x, y_bin)
+
+    shap = np.asarray(
+        model.get_feature_importance(type="ShapValues", data=pool), dtype=np.float64
+    )
+    np.save(
+        FEATURE_IMPORTANCE / "shap_values.npy",
+        _assert_f64(shap.ravel().astype(np.float64), "shap"),
+        allow_pickle=False,
+    )
+
+    pvc = np.asarray(
+        model.get_feature_importance(type="PredictionValuesChange", data=pool),
+        dtype=np.float64,
+    )
+    np.save(
+        FEATURE_IMPORTANCE / "prediction_values_change.npy",
+        _assert_f64(pvc.ravel().astype(np.float64), "pvc"),
+        allow_pickle=False,
+    )
+
+    interaction = np.asarray(
+        model.get_feature_importance(type="Interaction", data=pool), dtype=np.float64
+    )
+    np.save(
+        FEATURE_IMPORTANCE / "interaction.npy",
+        _assert_f64(interaction.ravel().astype(np.float64), "interaction"),
+        allow_pickle=False,
+    )
+
+    config = {
+        "scenario": "feature_importance",
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "loss_function": "Logloss",
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "shap_shape": list(shap.shape),
+        "interaction_shape": list(interaction.shape),
+        "artifacts": [
+            "shap_values.npy",
+            "prediction_values_change.npy",
+            "interaction.npy",
+        ],
+        "note": "MODEL-03 SHAP + MODEL-04 PredictionValuesChange/Interaction (needs leaf_weights)",
+    }
+    with (FEATURE_IMPORTANCE / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def gen_loss_extra() -> None:
+    """loss_extra/{cross_entropy,focal}/ — LOSS-01 CrossEntropy + Focal training
+    oracle (D-13). Both train on the frozen numeric_tiny inputs with the
+    simplified isolating params (boost_from_average=False for these classification
+    losses), saving model.json (splits + leaf_values + leaf_weights), staged.npy
+    (RawFormulaVal raw logits per stage), and predictions.npy (RawFormulaVal). The
+    later loss-function plan locks the Rust CrossEntropy/Focal gradients against
+    these (<= 1e-5). Python oracle (D-11).
+
+    CrossEntropy accepts soft (probabilistic) targets in [0, 1]; Focal is a
+    focusing-parameter reweighting of Logloss. `focal_alpha`/`focal_gamma` are
+    MANDATORY for the Focal loss (catboost_options.cpp:234); we pin them to the
+    common reference values (alpha=0.25, gamma=2.0) and record them in
+    config.json. Targets: CrossEntropy uses the sigmoid of the standardized
+    regression target (soft labels in (0,1)); Focal uses the hard binary y_bin
+    label."""
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_bin = (y > np.median(y)).astype(np.int64)
+    # Soft probabilistic labels in (0, 1) for CrossEntropy.
+    y_std = (y - float(np.mean(y))) / (float(np.std(y)) + 1e-12)
+    y_soft = 1.0 / (1.0 + np.exp(-y_std))
+
+    FOCAL_ALPHA = 0.25
+    FOCAL_GAMMA = 2.0
+    # `focal_alpha`/`focal_gamma` are NOT constructor kwargs — they are embedded
+    # in the loss_function descriptor string (catboost_options.cpp:234 reads them
+    # from the parsed Focal loss params).
+    focal_loss = f"Focal:focal_alpha={FOCAL_ALPHA};focal_gamma={FOCAL_GAMMA}"
+    # (name, loss_function, target)
+    scenarios = [
+        ("cross_entropy", "CrossEntropy", y_soft),
+        ("focal", focal_loss, y_bin),
+    ]
+    for name, loss, target in scenarios:
+        scenario_dir = LOSS_EXTRA / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        params = {**ISOLATING_PARAMS, "loss_function": loss}
+        model = CatBoostClassifier(boost_from_average=False, **params)
+        model.fit(x, target)
+
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+        staged = [
+            np.asarray(p, dtype=np.float64)
+            for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+        ]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+        predictions = _assert_f64(
+            np.asarray(
+                model.predict(x, prediction_type="RawFormulaVal"), dtype=np.float64
+            ),
+            "predictions",
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": f"loss_extra/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": loss,
+            "boost_from_average": False,
+            "params": {**params, "boost_from_average": False},
+            "n_rows": int(x.shape[0]),
+            "n_iterations": len(staged),
+            "label_definition": (
+                "y_soft = sigmoid(standardize(numeric_tiny.y))"
+                if name == "cross_entropy"
+                else "y_binary = (numeric_tiny.y > median)"
+            ),
+            "prediction_type": "RawFormulaVal",
+            "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+            "note": "LOSS-01 CrossEntropy / Focal training oracle (model.json carries leaf_weights)",
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -1561,6 +1856,16 @@ def main() -> None:
     # --- autolr (TRAIN-08 automatic learning-rate selection, D-10) ----------
     gen_autolr()
     print(f"Wrote autolr oracle fixtures under {AUTOLR}")
+
+    # --- Phase-4 offline fixtures (Plan 04-01, D-13) ------------------------
+    gen_model_serde()
+    print(f"Wrote model_serde oracle fixtures under {MODEL_SERDE}")
+    gen_prediction_types()
+    print(f"Wrote prediction_types oracle fixtures under {PREDICTION_TYPES}")
+    gen_feature_importance()
+    print(f"Wrote feature_importance oracle fixtures under {FEATURE_IMPORTANCE}")
+    gen_loss_extra()
+    print(f"Wrote loss_extra oracle fixtures under {LOSS_EXTRA}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()

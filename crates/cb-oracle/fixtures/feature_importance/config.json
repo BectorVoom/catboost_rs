@@ -1,0 +1,24 @@
+{
+  "artifacts": [
+    "shap_values.npy",
+    "prediction_values_change.npy",
+    "interaction.npy"
+  ],
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "interaction_shape": [
+    1,
+    3
+  ],
+  "loss_function": "Logloss",
+  "n_features": 4,
+  "n_rows": 50,
+  "note": "MODEL-03 SHAP + MODEL-04 PredictionValuesChange/Interaction (needs leaf_weights)",
+  "scenario": "feature_importance",
+  "seed": 0,
+  "shap_shape": [
+    50,
+    5
+  ],
+  "thread_count": 1
+}

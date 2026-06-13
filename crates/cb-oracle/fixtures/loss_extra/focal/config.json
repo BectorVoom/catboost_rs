@@ -1,0 +1,36 @@
+{
+  "boost_from_average": false,
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "label_definition": "y_binary = (numeric_tiny.y > median)",
+  "loss_function": "Focal:focal_alpha=0.25;focal_gamma=2.0",
+  "n_iterations": 5,
+  "n_rows": 50,
+  "note": "LOSS-01 CrossEntropy / Focal training oracle (model.json carries leaf_weights)",
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "Focal:focal_alpha=0.25;focal_gamma=2.0",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "scenario": "loss_extra/focal",
+  "seed": 0,
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "thread_count": 1
+}
