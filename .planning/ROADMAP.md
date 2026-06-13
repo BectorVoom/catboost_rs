@@ -158,7 +158,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 04-02-PLAN.md — Pure-Rust CPU apply path (MODEL-02) + prediction-type transforms (LOSS-06) + CrossEntropy/Focal losses (LOSS-01)
+- [x] 04-02-PLAN.md — Pure-Rust CPU apply path (MODEL-02) + prediction-type transforms (LOSS-06) + CrossEntropy/Focal losses (LOSS-01) — _SUMMARY 04-02 (2 tasks; MODEL-02 + LOSS-01 complete, LOSS-06 partial — 5 deterministic types locked, uncertainty types deferred to Phase 6 per D-10)_
 
 **Wave 3** *(blocked on Wave 2 completion)*
 

@@ -48,12 +48,12 @@
 
 ### Losses, Metrics & Prediction
 
-- [~] **LOSS-01**: Binary classification — Logloss, CrossEntropy, Focal (Plan 04-01 staged the offline CrossEntropy+Focal fixture manifest; loss impl + oracle lock land in a later Phase-4 wave)
+- [x] **LOSS-01**: Binary classification — Logloss, CrossEntropy, Focal (Plan 04-02: CrossEntropy + Focal der1/der2 transcribed from `error_functions.{h,cpp}` and oracle-locked; binclf trains under all three losses with splits/leaf-values/staged-approx ≤1e-5)
 - [ ] **LOSS-02**: Multiclass (MultiClass softmax, MultiClassOneVsAll) and multilabel (MultiLogloss, MultiCrossEntropy)
 - [ ] **LOSS-03**: Regression matrix — RMSE, MAE, Quantile, MultiQuantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile, etc.
 - [ ] **LOSS-04**: Ranking losses — YetiRank(/Pairwise), PairLogit(/Pairwise), QueryRMSE, QuerySoftMax, LambdaMart, StochasticRank
 - [ ] **LOSS-05**: Ranking metrics — NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC
-- [ ] **LOSS-06**: Prediction types — Probability, LogProbability, Class, RawFormulaVal, Exponent, RMSEWithUncertainty, VirtEnsembles, TotalUncertainty
+- [~] **LOSS-06**: Prediction types — Probability, LogProbability, Class, RawFormulaVal, Exponent, RMSEWithUncertainty, VirtEnsembles, TotalUncertainty (Plan 04-02: the five in-scope deterministic types — RawFormulaVal/Probability/LogProbability/Class/Exponent — are implemented and oracle-locked ≤1e-5; the uncertainty types RMSEWithUncertainty/VirtEnsembles/TotalUncertainty are deferred to Phase 6 per D-10)
 - [ ] **LOSS-07**: Custom objectives/metrics — Rust trait + Python callback bridge
 - [ ] **LOSS-08**: Uncertainty estimation — RMSEWithUncertainty, virtual ensembles
 - [ ] **LOSS-09**: Score functions — SolarL2, Cosine, NewtonL2, NewtonCosine, LOOL2, SatL2, L2
@@ -70,7 +70,7 @@
 ### Model, Serialization & Explainability
 
 - [~] **MODEL-01**: Native `.cbm` (FlatBuffers) serialization — save/load, cross-version compatible, load upstream-produced `.cbm` files (Plan 04-01 laid the prerequisites: committed flatc FlatBuffers bindings + canonical cb-model::Model; save/load impl + oracle lock land in the later Phase-4 cbm wave)
-- [ ] **MODEL-02**: CPU inference/apply path (independent of the GPU toolchain)
+- [x] **MODEL-02**: CPU inference/apply path (independent of the GPU toolchain) (Plan 04-02: pure-Rust `cb-model::predict_raw` — strict-> binarize, forward-bit leaf index, bias + `sum_f64` over leaf values; imports no backend/cubecl symbol; oracle-locked ≤1e-5 vs upstream)
 - [ ] **MODEL-03**: Feature importance — PredictionValuesChange, LossFunctionChange, Interaction
 - [ ] **MODEL-04**: SHAP values (Regular `EShapCalcType`)
 - [ ] **MODEL-05**: SHAP interaction values + advanced fstr — ShapInteractionValues, PredictionDiff, SAGE
@@ -152,12 +152,12 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-07 | Phase 3 | Complete |
 | TRAIN-08 | Phase 3 | Complete |
 | MODEL-01 | Phase 4 | In progress (04-01 prerequisites: flatc bindings + canonical Model) |
-| MODEL-02 | Phase 4 | Pending |
+| MODEL-02 | Phase 4 | Complete (04-02: pure-Rust apply path, oracle-locked ≤1e-5) |
 | MODEL-03 | Phase 4 | Pending |
 | MODEL-04 | Phase 4 | Pending |
 | MODEL-06 | Phase 4 | Pending |
-| LOSS-01 | Phase 4 | In progress (04-01 staged offline CrossEntropy+Focal fixture manifest) |
-| LOSS-06 | Phase 4 | Pending |
+| LOSS-01 | Phase 4 | Complete (04-02: CrossEntropy + Focal der1/der2 oracle-locked; binclf trains under all three losses) |
+| LOSS-06 | Phase 4 | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types deferred to Phase 6 per D-10) |
 | RAPI-01 | Phase 4 | Pending |
 | RAPI-02 | Phase 4 | Pending |
 | ORD-01 | Phase 5 | Pending |
