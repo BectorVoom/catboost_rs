@@ -44,7 +44,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 01-02-PLAN.md — Exact TFastRng64 PRNG port in cb-core, bitstream-validated against vendored fast_ut.cpp vectors
+- [x] 01-02-PLAN.md — Exact TFastRng64 PRNG port in cb-core, bitstream-validated against vendored fast_ut.cpp vectors
 - [ ] 01-03-PLAN.md — Six feature-gated stub crates + Python catboost==1.2.10 oracle generator + frozen input corpus + per-stage comparator proof + source/test-separation gate
 
 ### Phase 2: Data Layer — Pool, Quantization & Reduction
@@ -169,7 +169,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Workspace, Lint & Oracle Harness | 1/3 | In Progress|  |
+| 1. Workspace, Lint & Oracle Harness | 2/3 | In Progress|  |
 | 2. Data Layer — Pool, Quantization & Reduction | 0/TBD | Not started | - |
 | 3. CPU Training Core — Plain Boosting & Trees | 0/TBD | Not started | - |
 | 4. Model, Serialization, SHAP & Rust API | 0/TBD | Not started | - |

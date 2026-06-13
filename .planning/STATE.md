@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 1 context gathered
-last_updated: "2026-06-13T01:00:45.164Z"
+last_updated: "2026-06-13T01:06:09.053Z"
 last_activity: 2026-06-13 -- Phase 01 execution started
 progress:
   total_phases: 8
   completed_phases: 0
   total_plans: 3
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 01 (workspace-lint-discipline-oracle-harness) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Ready to execute
 Last activity: 2026-06-13 -- Phase 01 execution started
 
@@ -53,6 +53,7 @@ Progress: [░░░░░░░░░░] 0%
 
 *Updated after each plan completion*
 | Phase 01 P01 | 5 | 4 tasks | 21 files |
+| Phase 01 P02 | 4min | 1 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -66,6 +67,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Plan 01-01: pinned approx to stable 0.5 (not 0.6.0-rc2 pre-release); test-only dev-dep
 - [Phase ?]: Plan 01-01: committed Cargo.lock for supply-chain integrity (T-01-SC)
 - [Phase ?]: Plan 01-01: uniform in-code test-lint exemption + --lib CI clippy gate (Pitfall 1)
+- [Phase ?]: Plan 01-02: TFastRng64 ported bit-for-bit; two PCG streams deduped into shared Lcg32 (bitstream-identical, oracle-proven)
+- [Phase ?]: Plan 01-02: derived Clone/PartialEq/Eq on CbError to enable Result equality assertions (backward-compatible)
 
 ### Pending Todos
 
@@ -90,6 +93,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T01:00:30.192Z
+Last session: 2026-06-13T01:06:04.068Z
 Stopped at: Phase 1 context gathered
 Resume file: .planning/phases/01-workspace-lint-discipline-oracle-harness/01-CONTEXT.md
