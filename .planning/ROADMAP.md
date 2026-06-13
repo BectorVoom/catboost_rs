@@ -162,7 +162,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 04-03-PLAN.md — .cbm save/load (FlatBuffers framing) + model.json export/import, semantic round-trip + upstream 1.2.10 load (MODEL-01, MODEL-06)
+- [x] 04-03-PLAN.md — .cbm save/load (FlatBuffers framing) + model.json export/import, semantic round-trip + upstream 1.2.10 load (MODEL-01, MODEL-06) — _SUMMARY 04-03 (2 tasks; MODEL-01 + MODEL-06 complete — .cbm + model.json round-trip + upstream binclf/regression load ≤1e-5, malformed-input typed errors V5; 1 Rule-1 fix: bias from MultiBias[0])_
 
 **Wave 4** *(blocked on Wave 3 completion)*
 

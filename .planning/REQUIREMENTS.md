@@ -69,12 +69,12 @@
 
 ### Model, Serialization & Explainability
 
-- [~] **MODEL-01**: Native `.cbm` (FlatBuffers) serialization — save/load, cross-version compatible, load upstream-produced `.cbm` files (Plan 04-01 laid the prerequisites: committed flatc FlatBuffers bindings + canonical cb-model::Model; save/load impl + oracle lock land in the later Phase-4 cbm wave)
+- [x] **MODEL-01**: Native `.cbm` (FlatBuffers) serialization — save/load, cross-version compatible, load upstream-produced `.cbm` files (Plan 04-03: `cb-model::cbm::{save_cbm, load_cbm}` — CBM1 magic + ui32 LE size + FlatBuffers TModelCore; semantic round-trip + upstream catboost 1.2.10 binclf/regression `.cbm` load applies ≤1e-5; malformed input → typed ModelError, never panics. Built on the 04-01 committed flatc bindings + canonical cb-model::Model)
 - [x] **MODEL-02**: CPU inference/apply path (independent of the GPU toolchain) (Plan 04-02: pure-Rust `cb-model::predict_raw` — strict-> binarize, forward-bit leaf index, bias + `sum_f64` over leaf values; imports no backend/cubecl symbol; oracle-locked ≤1e-5 vs upstream)
 - [ ] **MODEL-03**: Feature importance — PredictionValuesChange, LossFunctionChange, Interaction
 - [ ] **MODEL-04**: SHAP values (Regular `EShapCalcType`)
 - [ ] **MODEL-05**: SHAP interaction values + advanced fstr — ShapInteractionValues, PredictionDiff, SAGE
-- [ ] **MODEL-06**: JSON model export (interop minimum)
+- [x] **MODEL-06**: JSON model export (interop minimum) (Plan 04-03: `cb-model::json::{save_json, load_json}` on the upstream model.json schema — per-tree NESTED leaf_weights, scale_and_bias=[1,[bias]]; save_json round-trips through the cb-oracle model_json parser (D-04) and upstream binclf/regression model.json load applies ≤1e-5; malformed JSON → typed ModelError)
 
 ### GPU Backends (CubeCL)
 
@@ -151,11 +151,11 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-06 | Phase 3 | Complete |
 | TRAIN-07 | Phase 3 | Complete |
 | TRAIN-08 | Phase 3 | Complete |
-| MODEL-01 | Phase 4 | In progress (04-01 prerequisites: flatc bindings + canonical Model) |
+| MODEL-01 | Phase 4 | Complete (04-03: .cbm save/load, semantic round-trip + upstream 1.2.10 load ≤1e-5, malformed-input typed errors) |
 | MODEL-02 | Phase 4 | Complete (04-02: pure-Rust apply path, oracle-locked ≤1e-5) |
 | MODEL-03 | Phase 4 | Pending |
 | MODEL-04 | Phase 4 | Pending |
-| MODEL-06 | Phase 4 | Pending |
+| MODEL-06 | Phase 4 | Complete (04-03: model.json export/import, round-trips through cb-oracle parser + upstream load ≤1e-5) |
 | LOSS-01 | Phase 4 | Complete (04-02: CrossEntropy + Focal der1/der2 oracle-locked; binclf trains under all three losses) |
 | LOSS-06 | Phase 4 | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types deferred to Phase 6 per D-10) |
 | RAPI-01 | Phase 4 | Pending |

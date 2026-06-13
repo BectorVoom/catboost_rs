@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-02-PLAN.md
-last_updated: "2026-06-14T00:00:00.000Z"
-last_activity: 2026-06-14 -- Plan 04-02 complete (apply path + prediction types + CrossEntropy/Focal)
+stopped_at: Completed 04-03-PLAN.md
+last_updated: "2026-06-13T20:40:52.000Z"
+last_activity: 2026-06-13 -- Plan 04-03 complete (.cbm + model.json serialization, oracle-locked)
 progress:
   total_phases: 8
   completed_phases: 3
   total_plans: 22
-  completed_plans: 20
-  percent: 41
+  completed_plans: 21
+  percent: 43
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 04 (model-serialization-shap-rust-api-first-full-oracle-lock) — EXECUTING
-Plan: 3 of 5
-Status: 04-02 complete; Wave 3 (04-03 .cbm serialize) next
-Last activity: 2026-06-14 -- Plan 04-02 complete (apply path + prediction types + CrossEntropy/Focal)
+Plan: 4 of 5
+Status: 04-03 complete (.cbm + model.json serialization); Wave 4 (04-04 SHAP/fstr) next
+Last activity: 2026-06-13 -- Plan 04-03 complete (.cbm + model.json serialization, oracle-locked)
 
-Progress: [████░░░░░░] 40% (2 of 5 phase-04 plans complete)
+Progress: [██████░░░░] 60% (3 of 5 phase-04 plans complete)
 
 ## Performance Metrics
 
@@ -45,7 +45,7 @@ Progress: [████░░░░░░] 40% (2 of 5 phase-04 plans complete)
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 03 | 9 | - | - |
-| 04 | 2 | ~90 min | ~45 min |
+| 04 | 3 | ~98 min | ~33 min |
 
 **Recent Trend:**
 
@@ -72,6 +72,7 @@ Progress: [████░░░░░░] 40% (2 of 5 phase-04 plans complete)
 | Phase 03 P08 | 10min | 3 tasks | 8 files |
 | Phase 04 P01 | ~40min | 3 tasks | 10 files |
 | Phase 04 P02 | ~50min | 2 tasks | 15 files |
+| Phase 04 P03 | ~8min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -128,6 +129,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Plan 04-02 COMPLETE — pure-Rust cb-model::predict_raw apply path (strict-> binarize, forward-bit leaf index via cb_train::leaf_index, bias + sum_f64 over leaf values; NO backend/cubecl import — MODEL-02) oracle-locked ≤1e-5; PredictionType {RawFormulaVal/Probability/LogProbability/Class/Exponent} (two-column probs, f64::exp; Exponent absorbs FastExp gap A2) locked ≤1e-5 (LOSS-06, uncertainty types deferred to Phase 6 per D-10); Loss::CrossEntropy (delegates to logloss helper) + Loss::Focal{alpha,gamma} (error_functions.h:1684-1709, p-clamp [1e-13,1-1e-13] T-04-02-02) — binclf trains under all three losses oracle-locked ≤1e-5 (LOSS-01 complete, D-09).
 - [Phase 04]: Plan 04-02 CubeCL pattern — a GENERIC #[cube(launch)] scalar arg requires F: ScalarArgType (CubeElement+Scalar+NumCast), incompatible with the generics-float rule; pass loss params (alpha/gamma) as length-1 Array<F> read at index 0 to keep F: Float. Math via associated-fn form (F::ln/F::powf/F::exp/F::clamp) per the cubecl error guideline; label branch via if-as-statement. Loss enum dropped Eq (Focal carries f64; no call site needed Eq).
 - [Phase 04]: Plan 04-02 ENV — cargo test -p cb-compute loss and cargo test --workspace blocked by disk (<1GB free; polars-core test-profile rlib ~1.3GB). CrossEntropy/Focal der1/der2 fully exercised+passing via cb-train/tests/loss_oracle_test.rs instead; logged in deferred-items.md.
+- [Phase 04]: Plan 04-03 COMPLETE — native .cbm (CBM1 magic + ui32 LE size + FlatBuffers TModelCore; global bin-feature split encoding per CalcBinFeatures order; flat LeafValues/LeafWeights with per-tree offsets, Pitfall 2) save/load + model.json export/import (per-tree NESTED leaf_weights Pitfall 2; scale_and_bias=[1,[bias]] Pitfall 6) for cb-model::Model. Oracle-locked: .cbm semantic round-trip + upstream 1.2.10 binclf/regression .cbm load <=1e-5; model.json round-trips through cb-oracle parser (D-04) + upstream binclf/regression model.json load <=1e-5 (MODEL-01, MODEL-06). cb-model::error::ModelError typed/panic-free (Security V5: bad magic/oversized/truncated/short header/wrong FormatVersion/garbage JSON/malformed scale_and_bias all return typed Err). VERIFYING root_as_tmodel_core only; size bounded before slicing; no unwrap/raw-index.
+- [Phase 04]: Plan 04-03 (Rule 1 fix) — bias read prefers MultiBias[0] over scalar Bias: upstream catboost 1.2.10 stores the 1-dim bias (e.g. regression boost_from_average start) in the MultiBias VECTOR, leaving scalar Bias=0.0. Reading only scalar Bias made the regression load under-predict by exactly the bias (0.315); binclf (bias 0) masked it. save_cbm still writes scalar Bias (Open Q3) so ours->ours round-trip is unaffected. Borders are f32 on the .cbm wire (schema type) so the assert_eq round-trip uses f32-exact borders; LeafValues/LeafWeights are f64 (exact). Upstream-load cases run IN-ENV (real fixtures), not #[ignore].
 
 ### Pending Todos
 
@@ -154,6 +157,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T19:58:05.723Z
-Stopped at: Phase 4 context gathered
-Resume file: .planning/phases/04-model-serialization-shap-rust-api-first-full-oracle-lock/04-CONTEXT.md
+Last session: 2026-06-13T20:40:52.000Z
+Stopped at: Completed 04-03-PLAN.md (.cbm + model.json serialization)
+Resume file: None
