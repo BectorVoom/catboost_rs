@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-03-PLAN.md (bootstrap/sampling TRAIN-04; No/Bernoulli/MVS oracle-locked <=1e-5, Poisson CPU-rejected, Bayesian first-tree locked + multi-tree residual deferred)
-last_updated: "2026-06-13T10:30:26.317Z"
-last_activity: 2026-06-13 -- Completed Phase 03 Plan 03
+stopped_at: Completed 03-08-PLAN.md (gap closure CR-01; score_st_dev now over full-fold weighted_der1 matching upstream greedy_tensor_search.cpp:99, random_strength_bernoulli cross-scenario fixture + first-tree lock, CR-01 RED->GREEN locked at cb-compute unit boundary)
+last_updated: "2026-06-13T11:43:00.000Z"
+last_activity: 2026-06-13 -- Phase 03 gap-closure 03-08 complete (CR-01 closed)
 progress:
   total_phases: 8
-  completed_phases: 3
-  total_plans: 16
-  completed_plans: 16
-  percent: 38
+  completed_phases: 2
+  total_plans: 18
+  completed_plans: 17
+  percent: 26
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 03 (cpu-training-core-plain-boosting-oblivious-trees) — EXECUTING
-Plan: 8 of 8
-Status: Ready to execute
-Last activity: 2026-06-13 -- Completed Phase 03 Plan 03
+Plan: 9 of 9 (03-08 gap-closure complete)
+Status: Executing Phase 03
+Last activity: 2026-06-13 -- Phase 03 gap-closure 03-08 complete (CR-01 closed)
 
-Progress: [█████░░░░░] 50% (4 of 8 phase-03 plans complete)
+Progress: [██████████] 100% (9 of 9 phase-03 plans complete)
 
 ## Performance Metrics
 
@@ -68,6 +68,7 @@ Progress: [█████░░░░░] 50% (4 of 8 phase-03 plans complete)
 | Phase 03 P05 | 50min | 2 tasks | 11 files |
 | Phase 03 P06 | 35min | 2 tasks | 30 files |
 | Phase 03 P07 | 7min | 2 tasks | 5 files |
+| Phase 03 P08 | 10min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -118,6 +119,8 @@ Recent decisions affecting current work:
 - [Phase 03]: Plan 03-03: sample weights/control gate SPLIT SCORING ONLY; leaf VALUES use the full unsampled fold (verified vs upstream — Bayesian/MVS weights never enter CalcLeafValues). Per-tree RNG draw accounting: 2 pre (fold pick + derivative seed) + bootstrap-internal + (depth+1) per-level CalcScores + MVS full-doc +2
 - [Phase 03]: Plan 03-03 RESIDUAL: Bayesian MULTI-TREE end-to-end lock #[ignore]d (first tree + draw sequence locked); tree-1+ diverges ~0.02 INSENSITIVE to RNG phase — structural Bayesian draw-stream issue, tracked in deferred-items.md
 - [Phase ?]: TRAIN-05 random_strength: std_normal verbatim Marsaglia-polar port over TFastRng64; two-pass SetBestScore/SelectBestCandidate draw order; first-tree end-to-end lock, multi-tree RNG-phase residual escalated D-11
+- [Phase 03]: Plan 03-08 (CR-01 closed): score_st_dev now reads the FULL un-sampled fold weighted_der1, NOT the control-masked score_weighted_der1 — matches upstream CalcDerivativesStDevFromZeroPlainBoosting (greedy_tensor_search.cpp:99 = fold.BodyTailArr.front().WeightedDerivatives) and the leaf path; histogram inputs to the perturbed search stay masked. Masked input biases scoreStDev low (zeroed entries, full-n denominator) whenever bootstrap_type!=No + random_strength!=0.
+- [Phase 03]: Plan 03-08: CR-01 RED->GREEN locked at the cb-compute UNIT boundary (score_st_dev_masked_vector_biases_low_vs_full_fold_cr01), NOT first-tree end-to-end. Exhaustive sweep proved numeric_tiny's first tree cannot isolate the std-dev bias: tree-0 splits are robust to the masked-vs-full difference at small random_strength, and at large random_strength the variable-length Box-Muller draw-stream residual (D-11) dominates and the fix is not isolable. WR-06 (n-from-slice-length) deliberately NOT folded in (signature unchanged).
 
 ### Pending Todos
 
@@ -144,6 +147,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T10:06:58.645Z
-Stopped at: Completed 03-03-PLAN.md (bootstrap/sampling TRAIN-04; No/Bernoulli/MVS oracle-locked <=1e-5, Poisson CPU-rejected, Bayesian first-tree locked + multi-tree residual deferred)
+Last session: 2026-06-13T11:43:00.000Z
+Stopped at: Completed 03-08-PLAN.md (gap closure CR-01; score_st_dev over full-fold weighted_der1, random_strength_bernoulli cross-scenario fixture + first-tree lock, CR-01 RED->GREEN locked at cb-compute unit boundary)
 Resume file: None

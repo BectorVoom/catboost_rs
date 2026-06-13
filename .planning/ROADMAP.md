@@ -133,7 +133,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 9** *(blocked on Wave 5; gap closure)*
 
-- [ ] 03-08-PLAN.md — Gap closure CR-01: feed score_st_dev the FULL-fold weighted_der1 (not the masked score_weighted_der1) + new cross-scenario oracle (random_strength=1.0 + Bernoulli, subsample=0.7) locking first-tree splits/leaves ≤1e-5 (TRAIN-05)
+- [x] 03-08-PLAN.md — Gap closure CR-01: feed score_st_dev the FULL-fold weighted_der1 (not the masked score_weighted_der1) + new cross-scenario oracle (random_strength=1.0 + Bernoulli, subsample=0.7) locking first-tree splits/leaves ≤1e-5 (TRAIN-05) — _SUMMARY 03-08 (3 tasks; CR-01 closed, fix verified vs upstream greedy_tensor_search.cpp:99; RED→GREEN locked at the cb-compute unit boundary — first-tree end-to-end cannot isolate the std-dev bias on numeric_tiny, entangled with the D-11 draw-stream residual)_
 
 ### Phase 4: Model, Serialization, SHAP & Rust API (First Full Oracle Lock)
 
