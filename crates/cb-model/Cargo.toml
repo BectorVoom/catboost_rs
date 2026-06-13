@@ -1,0 +1,11 @@
+[package]
+name = "cb-model"
+version = "0.1.0"
+edition = "2021"
+description = "Model serialization and SHAP for catboost-rs (realized in Phase 4)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.

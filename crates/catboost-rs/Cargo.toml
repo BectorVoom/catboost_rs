@@ -1,0 +1,12 @@
+[package]
+name = "catboost-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Published Builder-pattern facade for catboost-rs (realized in Phase 4)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# D-15 default: the published facade is treated as a thiserror-only LIBRARY —
+# `anyhow` is intentionally absent (D-14 structural ban). Do not add it.

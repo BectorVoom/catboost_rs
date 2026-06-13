@@ -1,0 +1,11 @@
+[package]
+name = "cb-train"
+version = "0.1.0"
+edition = "2021"
+description = "Gradient-boosting training loop for catboost-rs (realized in Phase 3)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.

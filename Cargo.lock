@@ -60,11 +60,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "catboost-rs"
+version = "0.1.0"
+
+[[package]]
+name = "cb-backend"
+version = "0.1.0"
+
+[[package]]
+name = "cb-compute"
+version = "0.1.0"
+
+[[package]]
 name = "cb-core"
 version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
+
+[[package]]
+name = "cb-data"
+version = "0.1.0"
+
+[[package]]
+name = "cb-model"
+version = "0.1.0"
 
 [[package]]
 name = "cb-oracle"
@@ -79,6 +99,10 @@ dependencies = [
  "serde_json",
  "thiserror",
 ]
+
+[[package]]
+name = "cb-train"
+version = "0.1.0"
 
 [[package]]
 name = "cfg-if"

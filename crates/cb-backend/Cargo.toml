@@ -1,0 +1,23 @@
+[package]
+name = "cb-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Sole feature-gated runtime-alias owner for catboost-rs (CubeCL runtime wired in Phase 7)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# D-02: cb-backend is the SINGLE feature-gated runtime-alias owner. The concrete
+# CubeCL runtime is wired in Phase 7; in Phase 1 every backend arm is an inert
+# placeholder. NO per-backend crates; NO cubecl dependency yet.
+# NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
+
+[features]
+# Compile-time backend selection only — NO runtime dispatch (D-02). All arms are
+# inert placeholders in Phase 1.
+default = ["cpu"]
+cpu = []
+wgpu = []
+cuda = []
+rocm = []
