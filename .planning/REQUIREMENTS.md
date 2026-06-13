@@ -40,11 +40,11 @@
 
 ### Ordered Algorithms (Signature Features)
 
-- [ ] **ORD-01**: Multi-permutation fold machinery (`fold_count` permutations, `TFold`-equivalent bookkeeping)
-- [ ] **ORD-02**: Ordered boosting (`EBoostingType::Ordered`) with exact prefix boundaries, per-object intermediate oracle
-- [ ] **ORD-03**: Ordered target statistics / CTR — `Borders`, `Buckets`, `BinarizedTargetMeanValue`, `FloatTargetMeanValue`, `Counter`, `FeatureFreq` with priors
-- [ ] **ORD-04**: One-hot encoding for low-cardinality categoricals (`one_hot_max_size` threshold)
-- [ ] **ORD-05**: Feature combinations (tensor CTRs) — `SimpleCtrs`/`CombinationCtrs`, `max_ctr_complexity` control
+- [x] **ORD-01**: Multi-permutation fold machinery (`fold_count` permutations, `TFold`-equivalent bookkeeping)
+- [x] **ORD-02**: Ordered boosting (`EBoostingType::Ordered`) with exact prefix boundaries, per-object intermediate oracle
+- [x] **ORD-03**: Ordered target statistics / CTR — `Borders`, `Buckets`, `BinarizedTargetMeanValue`, `FloatTargetMeanValue`, `Counter`, `FeatureFreq` with priors
+- [x] **ORD-04**: One-hot encoding for low-cardinality categoricals (`one_hot_max_size` threshold)
+- [x] **ORD-05**: Feature combinations (tensor CTRs) — `SimpleCtrs`/`CombinationCtrs`, `max_ctr_complexity` control
 
 ### Losses, Metrics & Prediction
 
@@ -160,11 +160,11 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | LOSS-06 | Phase 4 | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types deferred to Phase 6 per D-10) |
 | RAPI-01 | Phase 4 | Complete |
 | RAPI-02 | Phase 4 | Complete |
-| ORD-01 | Phase 5 | Pending |
-| ORD-02 | Phase 5 | Pending |
-| ORD-03 | Phase 5 | Pending |
-| ORD-04 | Phase 5 | Pending |
-| ORD-05 | Phase 5 | Pending |
+| ORD-01 | Phase 5 | Complete |
+| ORD-02 | Phase 5 | Complete |
+| ORD-03 | Phase 5 | Complete |
+| ORD-04 | Phase 5 | Complete |
+| ORD-05 | Phase 5 | Complete |
 | LOSS-02 | Phase 6 | Pending |
 | LOSS-03 | Phase 6 | Pending |
 | LOSS-04 | Phase 6 | Pending |

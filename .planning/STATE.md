@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
+status: executing
 stopped_at: Phase 5 context gathered
-last_updated: "2026-06-13T22:59:00.225Z"
-last_activity: 2026-06-13 -- Plan 04-05 complete (CatBoostBuilder + Model facade + CatBoostError; end-to-end binclf+regression oracle <=1e-5)
+last_updated: "2026-06-13T23:12:54.708Z"
+last_activity: 2026-06-13 -- Phase 05 execution started
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 22
-  completed_plans: 22
+  total_plans: 28
+  completed_plans: 23
   percent: 50
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 04 — model-serialization-shap-rust-api-first-full-oracle-lock
+**Current focus:** Phase 05 — ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s
 
 ## Current Position
 
-Phase: 04 (model-serialization-shap-rust-api-first-full-oracle-lock) — COMPLETE
-Plan: 5 of 5 (all plans complete)
-Status: 04-05 complete (public catboost-rs facade: CatBoostBuilder + Model + CatBoostError); phase-04 first full vertical slice (train -> serialize -> load -> predict/explain) oracle-locked <=1e-5 through the public API
-Last activity: 2026-06-13 -- Plan 04-05 complete (CatBoostBuilder + Model facade + CatBoostError; end-to-end binclf+regression oracle <=1e-5)
+Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
+Last activity: 2026-06-13 -- Phase 05 execution started
 
 Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 
@@ -75,6 +75,7 @@ Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 | Phase 04 P03 | ~8min | 2 tasks | 7 files |
 | Phase 04 P04 | ~10min | 2 tasks | 5 files |
 | Phase 04 P05 | ~10min | 2 tasks | 8 files |
+| Phase 05 P01 | 8min | 3 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -137,6 +138,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Plan 04-04: PredictionValuesChange (Σ=100) + Interaction oracle-locked <=1e-5; loss-change importance deferred (MODEL-03 partial, D-12).
 - [Phase 04]: Plan 04-05 COMPLETE — published catboost-rs facade: CatBoostBuilder (D-05; new()+chained setters+fit(&pool); loss selects clf vs regression) wrapping cb_train::train over CpuBackend with borders computed from the pool (select_borders_greedy_logsum); Model facade (D-06/D-07: predict/predict_proba/predict_with enum core, save_cbm/load_cbm/save_json/load_json, shap_values, feature_importance) delegating to cb-model; public CatBoostError (D-08/RAPI-02: thiserror, #[from] CbError+ModelError+io::Error, Deserialize/SchemaVersion/FeatureMismatch, no Clone/PartialEq). anyhow structurally absent (D-14/D-15). RAPI-01, RAPI-02 done.
 - [Phase 04]: Plan 04-05 — end-to-end binclf + regression train->serialize->load->predict cycle through the PUBLIC API matches upstream catboost 1.2.10 <=1e-5 (ROADMAP Phase-4 criterion 5); the builder's fit-from-pool borders reproduce upstream border selection for numeric_tiny so the upstream oracle leg runs unconditionally (no #[ignore]). FeatureMismatch guard added (Rule 2, T-04-05-02). Phase 04 first full vertical slice CLOSED.
+- [Phase ?]: [Phase 05]: Plan 05-01 COMPLETE — Wave-0 oracle infra: Stage::{Permutation(integer-exact D-03 linchpin),OnlineCtr,OrderedApprox} + compare_permutation; model.json ctr_data parser (CtrTableJson #[serde(default)], backward-compatible); ordered_oracle.cpp zero-catboost transcription (perm self-oracle [4 2 0 3 1]==cb-core TFastRng64); 5 frozen categorical fixtures with per-knob config.json; 32 cb-oracle tests green
 
 ### Pending Todos
 
@@ -163,6 +165,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T21:50:48.055Z
+Last session: 2026-06-13T23:12:35.086Z
 Stopped at: Phase 5 context gathered
 Resume file: .planning/phases/05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s/05-CONTEXT.md

@@ -192,7 +192,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 05-01-PLAN.md — Wave-0 oracle infra: Stage::{Permutation,OnlineCtr,OrderedApprox} + model.json ctr_data parsing + transcribed ordered_oracle.cpp (zero catboost includes) + frozen purpose-built categorical fixtures
+- [x] 05-01-PLAN.md — Wave-0 oracle infra: Stage::{Permutation,OnlineCtr,OrderedApprox} + model.json ctr_data parsing + transcribed ordered_oracle.cpp (zero catboost includes) + frozen purpose-built categorical fixtures
 
 **Wave 2** *(blocked on 05-01)*
 
