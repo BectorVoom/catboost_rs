@@ -16,7 +16,7 @@ A memory-efficient, Rust-native CatBoost implementation that achieves verifiable
 
 <!-- Shipped and confirmed valuable. -->
 
-(None yet — ship to validate)
+- CPU gradient-boosting training core — plain boosting, symmetric oblivious trees, four leaf-estimation methods (Gradient/Newton/Exact/Simple), bootstrap/sampling, regularization (`l2_leaf_reg`/`random_strength`/`bagging_temperature`), overfitting detection / early stopping, per-iteration eval-set metrics, and automatic learning-rate selection — all oracle-locked vs upstream CatBoost ≤10⁻⁵. _Validated in Phase 3 (TRAIN-01–08); CR-01 random_strength+sampling parity break closed in gap-closure plan 03-08._
 
 ### Active
 
@@ -101,4 +101,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-13 after initialization*
+*Last updated: 2026-06-13 after Phase 3 (CPU Training Core) completion*
