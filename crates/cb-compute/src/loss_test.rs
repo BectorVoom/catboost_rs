@@ -1,8 +1,10 @@
-//! Unit tests for the per-loss derivatives (TRAIN-01). RMSE `t-a`/`-1`; Logloss
-//! `t-p`/`-p(1-p)` with `p = sigmoid(approx)` over the raw logit.
+//! Unit tests for the per-loss derivatives (TRAIN-01 / D-09). RMSE `t-a`/`-1`;
+//! Logloss / CrossEntropy `t-p`/`-p(1-p)` with `p = sigmoid(approx)` over the raw
+//! logit; Focal `alpha`/`gamma`-weighted der1/der2 (`error_functions.h`).
 
 use crate::loss::{
-    logloss_der1, logloss_der2, mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
+    cross_entropy_der1, cross_entropy_der2, focal_der1, focal_der2, logloss_der1, logloss_der2,
+    mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
 };
 
 #[test]
@@ -46,6 +48,50 @@ fn logloss_der2_is_neg_p_times_one_minus_p() {
     assert!((logloss_der2(0.0, 1.0) - (-0.25)).abs() < 1e-12);
     let p = sigmoid(1.3);
     assert!((logloss_der2(1.3, 0.0) - (-p * (1.0 - p))).abs() < 1e-12);
+}
+
+#[test]
+fn cross_entropy_matches_logloss_math() {
+    // CrossEntropy der1/der2 are IDENTICAL to Logloss (D-09); a SOFT target in
+    // [0,1] is the only CrossEntropy-specific input.
+    assert!((cross_entropy_der1(0.0, 0.7) - logloss_der1(0.0, 0.7)).abs() < 1e-15);
+    assert!((cross_entropy_der2(0.0, 0.7) - logloss_der2(0.0, 0.7)).abs() < 1e-15);
+    let p = sigmoid(1.4);
+    assert!((cross_entropy_der1(1.4, 0.3) - (0.3 - p)).abs() < 1e-12);
+    assert!((cross_entropy_der2(1.4, 0.3) - (-p * (1.0 - p))).abs() < 1e-12);
+}
+
+#[test]
+fn focal_der1_matches_reference_positive_class() {
+    // error_functions.h:1684-1709 transcription at (approx=0.5, target=1).
+    let (alpha, gamma, approx) = (0.25_f64, 2.0_f64, 0.5_f64);
+    let p = (1.0 / (1.0 + (-approx).exp())).clamp(1e-13, 1.0 - 1e-13);
+    let (at, pt, y) = (alpha, p, 1.0_f64);
+    let want = -(at * y * (1.0 - pt).powf(gamma) * (gamma * pt * pt.ln() + pt - 1.0));
+    assert!((focal_der1(approx, 1.0, alpha, gamma) - want).abs() < 1e-12);
+}
+
+#[test]
+fn focal_der2_matches_reference_positive_class() {
+    let (alpha, gamma, approx) = (0.25_f64, 2.0_f64, 0.5_f64);
+    let p = (1.0 / (1.0 + (-approx).exp())).clamp(1e-13, 1.0 - 1e-13);
+    let (at, pt, y) = (alpha, p, 1.0_f64);
+    let u = at * y * (1.0 - pt).powf(gamma);
+    let du = -at * y * gamma * (1.0 - pt).powf(gamma - 1.0);
+    let v = gamma * pt * pt.ln() + pt - 1.0;
+    let dv = gamma * pt.ln() + gamma + 1.0;
+    let want = -((du * v + u * dv) * y * (pt * (1.0 - pt)));
+    assert!((focal_der2(approx, 1.0, alpha, gamma) - want).abs() < 1e-12);
+}
+
+#[test]
+fn focal_clamps_saturated_logit_no_nan() {
+    // A large positive logit with the negative class drives pt -> 0; the clamp
+    // keeps ln(pt)/powf finite (T-04-02-02 — no NaN).
+    let g1 = focal_der1(40.0, 0.0, 0.25, 2.0);
+    let g2 = focal_der2(40.0, 0.0, 0.25, 2.0);
+    assert!(g1.is_finite(), "focal der1 must stay finite under saturation");
+    assert!(g2.is_finite(), "focal der2 must stay finite under saturation");
 }
 
 #[test]

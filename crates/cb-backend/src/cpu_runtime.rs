@@ -20,7 +20,8 @@ use cb_compute::{Derivatives, Loss, Runtime};
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
-    gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel, mae_gradient_kernel,
+    focal_gradient_kernel, focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel,
+    logloss_hessian_kernel, mae_gradient_kernel,
 };
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
@@ -126,6 +127,67 @@ fn launch_logloss_hessian(approx: &[f64]) -> Vec<f64> {
     bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
 }
 
+/// Launch a Focal elementwise derivative kernel (`gradient` or `hessian`) on
+/// `CpuRuntime`, passing the scalar `alpha`/`gamma` loss parameters, and read
+/// back the `f64` output in object order.
+fn launch_focal_f64(
+    approx: &[f64],
+    target: &[f64],
+    alpha: f64,
+    gamma: f64,
+    hessian: bool,
+) -> Vec<f64> {
+    let n = approx.len();
+    let device = cubecl::cpu::CpuDevice;
+    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
+    let out_handle = client.empty(std::mem::size_of_val(approx));
+    // Loss params pass as length-1 device arrays (the kernel stays generic over
+    // F — a generic scalar arg would need the non-generic ScalarArgType bound).
+    let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+    let gamma_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![gamma]));
+
+    let cube_dim = 32usize;
+    let num_cubes = n.div_ceil(cube_dim).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: cube_dim as u32,
+        y: 1,
+        z: 1,
+    };
+
+    if hessian {
+        focal_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+            unsafe { ArrayArg::from_raw_parts(gamma_handle, 1) },
+        );
+    } else {
+        focal_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+            unsafe { ArrayArg::from_raw_parts(gamma_handle, 1) },
+        );
+    }
+
+    let bytes = client
+        .read_one(out_handle)
+        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
+    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+}
+
 impl Runtime for CpuBackend {
     fn compute_gradients(
         &self,
@@ -154,9 +216,16 @@ impl Runtime for CpuBackend {
                 let der2 = vec![-1.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
             }
-            Loss::Logloss => {
+            // CrossEntropy shares Logloss's der1/der2 EXACTLY (D-09): reuse the
+            // Logloss gradient + hessian kernels (no separate kernel needed).
+            Loss::Logloss | Loss::CrossEntropy => {
                 let der1 = launch_binary_f64(approx, target, BinaryKernel::LoglossGradient);
                 let der2 = launch_logloss_hessian(approx);
+                Ok(Derivatives { der1, der2 })
+            }
+            Loss::Focal { alpha, gamma } => {
+                let der1 = launch_focal_f64(approx, target, alpha, gamma, false);
+                let der2 = launch_focal_f64(approx, target, alpha, gamma, true);
                 Ok(Derivatives { der1, der2 })
             }
             Loss::Mae => {

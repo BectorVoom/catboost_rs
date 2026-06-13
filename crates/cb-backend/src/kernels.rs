@@ -88,6 +88,92 @@ pub fn logloss_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) 
     }
 }
 
+/// First-order Focal gradient kernel (`error_functions.h:1684-1709` `TFocalError`):
+/// `p = clamp(sigmoid(approx), 1e-13, 1-1e-13)`; with `at`/`pt` selected by the
+/// binary label and `y = 2*target - 1`,
+/// `der1 = -( at*y*pow(1-pt, gamma) * (gamma*pt*log(pt) + pt - 1) )`.
+///
+/// Elementwise, order-independent, no reduction (D-02). The loss parameters
+/// `alpha`/`gamma` are passed as length-1 `Array<F>` arguments (read at index 0)
+/// rather than as scalar kernel args — this keeps the kernel FULLY generic over
+/// `F: Float` (AGENTS.md generics-float; a generic scalar arg would require the
+/// non-generic `F: ScalarArgType + CubeElement + …` bound). The `target == 1`
+/// branch selects `at`/`pt` via the if-as-STATEMENT pattern (CubeCL conditionals
+/// manual — never if-as-expression). `p` is clamped before `ln`/`powf` so a
+/// saturated logit cannot produce `NaN` (T-04-02-02).
+#[cube(launch)]
+pub fn focal_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+    alpha: &Array<F>,
+    gamma: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let p_min = F::new(1e-13);
+        let a = alpha[0];
+        let g = gamma[0];
+        let e = F::exp(F::new(0.0) - approx[ABSOLUTE_POS]);
+        let p = F::clamp(one / (one + e), p_min, one - p_min);
+
+        let is_pos = target[ABSOLUTE_POS] == one;
+        let mut at = one - a;
+        let mut pt = one - p;
+        if is_pos {
+            at = a;
+            pt = p;
+        }
+        let y = F::new(2.0) * target[ABSOLUTE_POS] - one;
+
+        let factor = F::powf(one - pt, g);
+        let inner = g * pt * F::ln(pt) + pt - one;
+        der1[ABSOLUTE_POS] = F::new(0.0) - (at * y * factor * inner);
+    }
+}
+
+/// Second-order Focal hessian kernel (`error_functions.h:1684-1709`
+/// `TFocalError`):
+/// ```text
+/// u = at*y*pow(1-pt, gamma);        du = -at*y*gamma*pow(1-pt, gamma-1)
+/// v = gamma*pt*log(pt) + pt - 1;    dv = gamma*log(pt) + gamma + 1
+/// der2 = -( (du*v + u*dv) * y * (pt*(1-pt)) )
+/// ```
+/// Same clamp / label-branch / generics-float discipline as
+/// [`focal_gradient_kernel`].
+#[cube(launch)]
+pub fn focal_hessian_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der2: &mut Array<F>,
+    alpha: &Array<F>,
+    gamma: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let p_min = F::new(1e-13);
+        let a = alpha[0];
+        let g = gamma[0];
+        let e = F::exp(F::new(0.0) - approx[ABSOLUTE_POS]);
+        let p = F::clamp(one / (one + e), p_min, one - p_min);
+
+        let is_pos = target[ABSOLUTE_POS] == one;
+        let mut at = one - a;
+        let mut pt = one - p;
+        if is_pos {
+            at = a;
+            pt = p;
+        }
+        let y = F::new(2.0) * target[ABSOLUTE_POS] - one;
+
+        let u = at * y * F::powf(one - pt, g);
+        let du = (F::new(0.0) - at) * y * g * F::powf(one - pt, g - one);
+        let v = g * pt * F::ln(pt) + pt - one;
+        let dv = g * F::ln(pt) + g + one;
+        der2[ABSOLUTE_POS] = F::new(0.0) - ((du * v + u * dv) * y * (pt * (one - pt)));
+    }
+}
+
 /// Histogram-scatter kernel: per-object, write the object's weighted gradient
 /// contribution into its OWN per-object output slot (`contrib[i] = der1[i] *
 /// weight[i]`).

@@ -59,7 +59,9 @@ impl EvalMetric {
     pub fn for_loss(loss: Loss) -> Self {
         match loss {
             Loss::Rmse | Loss::Mae => Self::Rmse,
-            Loss::Logloss => Self::Logloss,
+            // The binary-classification family (Logloss / CrossEntropy / Focal)
+            // reports the Logloss eval metric by default.
+            Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,
         }
     }
 

@@ -183,8 +183,10 @@ impl Model {
 const fn autolr_target_type(loss: Loss) -> TargetType {
     match loss {
         Loss::Rmse => TargetType::Rmse,
-        Loss::Logloss => TargetType::Logloss,
-        Loss::Mae => TargetType::Unknown,
+        // CrossEntropy shares Logloss's auto-LR coefficient row (same objective
+        // family); Focal is not in the upstream auto-LR table -> Unknown.
+        Loss::Logloss | Loss::CrossEntropy => TargetType::Logloss,
+        Loss::Focal { .. } | Loss::Mae => TargetType::Unknown,
     }
 }
 

@@ -39,13 +39,33 @@ impl Float for f64 {}
 /// Which loss's elementwise derivatives a [`Runtime::compute_gradients`] call
 /// should emit. Lets the backend pick the right per-object kernel without
 /// reaching into `cb-compute::loss`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Eq` is intentionally NOT derived: [`Loss::Focal`] carries `f64` parameters
+/// (`alpha` / `gamma`), and `f64` is not `Eq`. `PartialEq` is retained for the
+/// match-and-compare call sites.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Loss {
     /// RMSE (regression): der1 = `target - approx`, der2 = `-1`.
     Rmse,
     /// Logloss / CrossEntropy (binary classification): der1 = `target - p`,
     /// der2 = `-p*(1-p)`, `p = sigmoid(approx)` over the raw logit.
     Logloss,
+    /// CrossEntropy (binary classification, D-09): IDENTICAL math to
+    /// [`Loss::Logloss`] — der1 = `target - p`, der2 = `-p*(1-p)`,
+    /// `p = sigmoid(approx)`. The only difference is the admissible target range
+    /// (`[0,1]` probabilities vs `{0,1}` labels); the derivatives are the same, so
+    /// the backend reuses the Logloss gradient/hessian kernels.
+    CrossEntropy,
+    /// Focal loss (binary classification, D-09) with `alpha` (class balance) and
+    /// `gamma` (focusing exponent). der1/der2 transcribed verbatim from
+    /// `error_functions.h:1684-1709` `TFocalError`; `p` is clamped to
+    /// `[1e-13, 1-1e-13]` before the `log`/`pow` (T-04-02-02 — no NaN).
+    Focal {
+        /// Class-balance weight `alpha ∈ (0,1)` (`focal_alpha`).
+        alpha: f64,
+        /// Focusing exponent `gamma > 0` (`focal_gamma`).
+        gamma: f64,
+    },
     /// MAE / Quantile(alpha=0.5, delta=1e-6) (robust regression): der1 =
     /// `(target - approx > 0) ? alpha : -(1 - alpha)` with a `|residual| < delta`
     /// deadzone, der2 = `0`. Used by the Exact leaf-estimation method, whose leaf

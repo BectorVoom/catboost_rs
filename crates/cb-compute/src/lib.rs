@@ -32,8 +32,8 @@ pub use leaf::{
     simple_leaf_delta, LeafMethod,
 };
 pub use loss::{
-    logloss_der1, logloss_der2, mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
-    QUANTILE_ALPHA, QUANTILE_DELTA,
+    cross_entropy_der1, cross_entropy_der2, focal_der1, focal_der2, logloss_der1, logloss_der2,
+    mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid, FOCAL_P_MIN, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 pub use runtime::{Derivatives, Float, Loss, Runtime};
 pub use score::{
