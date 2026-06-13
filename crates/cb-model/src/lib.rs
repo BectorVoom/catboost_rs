@@ -11,9 +11,13 @@
 //! vendored upstream `model` / `features` / `ctr_data` schema (D-01), consumed by
 //! the later `.cbm` (de)serializer plan.
 
+mod apply;
 mod model;
+mod predict;
 
+pub use apply::{binarize_feature, predict_raw};
 pub use model::{Model, ObliviousTree, Split};
+pub use predict::{apply_prediction_type, PredictionType};
 
 // flatc --rust generated FlatBuffers bindings for the vendored upstream schema
 // (D-01). Generated with `flatc --rust --gen-all` so each committed file is

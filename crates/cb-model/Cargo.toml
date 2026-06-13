@@ -15,3 +15,10 @@ cb-train = { path = "../cb-train" }
 # authored for the vendored flatc 24.3.25 (wire format is version-stable;
 # RESEARCH A1). Vetted OK in the Package Legitimacy Audit.
 flatbuffers = "25.12.19"
+
+[dev-dependencies]
+# Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the
+# apply / prediction-type parity integration tests.
+cb-oracle = { path = "../cb-oracle" }
+ndarray.workspace = true
+ndarray-npy.workspace = true
