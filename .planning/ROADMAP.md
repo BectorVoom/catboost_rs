@@ -69,7 +69,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 02-02-PLAN.md — Pool (owned columns + IngestSource seam) + GreedyLogSum borders oracle-locked on numeric_tiny
+- [x] 02-02-PLAN.md — Pool (owned columns + IngestSource seam) + GreedyLogSum borders oracle-locked on numeric_tiny
 
 **Wave 3** *(blocked on Wave 2)*
 
@@ -190,7 +190,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Workspace, Lint & Oracle Harness | 3/3 | Complete   | 2026-06-13 |
-| 2. Data Layer — Pool, Quantization & Reduction | 1/5 | In Progress|  |
+| 2. Data Layer — Pool, Quantization & Reduction | 2/5 | In Progress|  |
 | 3. CPU Training Core — Plain Boosting & Trees | 0/TBD | Not started | - |
 | 4. Model, Serialization, SHAP & Rust API | 0/TBD | Not started | - |
 | 5. Ordered Boosting, Ordered CTR & Categoricals | 0/TBD | Not started | - |
