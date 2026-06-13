@@ -97,7 +97,39 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Overfitting detection / early stopping (Wilcoxon/IncToDec/Iter, `od_pval`/`od_wait`, `use_best_model`) and per-iteration eval-set metric logging (multiple eval sets, `eval_metric`) behave correctly.
   5. Automatic learning-rate selection from dataset size matches upstream, and a first end-to-end CPU train→predict cycle runs.
 
-**Plans**: TBD
+**Plans**: 8 plans in 8 waves
+
+**Wave 1**
+
+- [ ] 03-00-PLAN.md — Wave-0 foundation: install cubecl 0.10.0/bytemuck (cb-backend only, D-03), prove the #[cube] CpuRuntime gradient seam, add cb-oracle model.json parser, generate RMSE + Logloss training-oracle fixtures (simplified isolating params, D-07)
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 03-01-PLAN.md — First end-to-end slice: cb-compute R:Runtime/F:Float boundary + loss/histogram/score/leaf, cb-backend CpuRuntime impl, cb-train plain boosting + oblivious trees (Gradient leaf), oracle-locked RMSE + Logloss splits/leaves/staged ≤1e-5
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 03-02-PLAN.md — Newton/Exact/Simple leaf-estimation methods (completes TRAIN-03, D-09), each oracle-locked on leaf values
+
+**Wave 4** *(blocked on Wave 3)*
+
+- [ ] 03-03-PLAN.md — Bootstrap/sampling (Poisson/Bayesian/Bernoulli/MVS/No, subsample) seeded by TFastRng64 with exact per-block reseed order (TRAIN-04)
+
+**Wave 5** *(blocked on Wave 4)*
+
+- [ ] 03-04-PLAN.md — Full regularization: random_strength normal-draw perturbation (cb-core::normal port), bagging_temperature, l2_leaf_reg (TRAIN-05)
+
+**Wave 6** *(blocked on Wave 5)*
+
+- [ ] 03-05-PLAN.md — Overfitting detection / early stopping (IncToDec/Iter/Wilcoxon, od_pval/od_wait, use_best_model) (TRAIN-06)
+
+**Wave 7** *(blocked on Wave 6)*
+
+- [ ] 03-06-PLAN.md — Per-iteration eval-set metric logging (multiple eval sets, eval_metric) (TRAIN-07)
+
+**Wave 8** *(blocked on Wave 7)*
+
+- [ ] 03-07-PLAN.md — Automatic learning-rate selection (TAutoLRParamsGuesser) + first end-to-end auto-LR train→predict (TRAIN-08)
 
 ### Phase 4: Model, Serialization, SHAP & Rust API (First Full Oracle Lock)
 
