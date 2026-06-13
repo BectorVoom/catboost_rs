@@ -1,0 +1,36 @@
+name: CI
+
+# CPU-only lane (D-16). Accelerator backends cannot run on GitHub-hosted
+# runners; that lane is standalone scripts wired in Phase 7. This workflow only
+# READS committed fixtures (D-12) — it never installs catboost/numpy and never
+# runs the write_skeleton generator.
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    name: CPU lane (build + clippy + test + anyhow gate)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Honors rust-toolchain.toml (stable channel) and ensures clippy is present.
+      - name: Install Rust toolchain
+        run: rustup component add clippy
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      # Production lint gate. `--lib` scope is the Pitfall-1 convention chosen in
+      # Task 1: restriction lints are denied for library code; test code is
+      # exempted in-code via #![cfg_attr(test, allow(...))] / #![allow(...)].
+      - name: Clippy lint gate
+        run: cargo clippy --workspace --lib -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: anyhow ban backstop (D-14)
+        run: bash scripts/check-no-anyhow.sh
