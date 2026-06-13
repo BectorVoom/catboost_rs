@@ -2,7 +2,7 @@
 phase: 5
 slug: ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s
 status: draft
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-06-14
 ---
@@ -89,4 +89,4 @@ created: 2026-06-14
 - [ ] Feedback latency < 30s (single-stage)
 - [ ] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** planned — all ORD-01..05 requirements have <automated> verify blocks attached to owning tasks; Wave 0 (05-01) stands up every MISSING reference (Stage variants, ctr_data parsing, ordered_oracle.cpp, fixtures, D-03 ordering). wave_0_complete flips true on 05-01 execution.

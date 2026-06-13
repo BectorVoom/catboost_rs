@@ -186,8 +186,35 @@ Plans:
   4. One-hot encoding for low-cardinality categoricals (`one_hot_max_size` threshold) selects the correct encoding path.
   5. Feature combinations (tensor CTRs — `SimpleCtrs`/`CombinationCtrs`, `max_ctr_complexity` control) produce models matching upstream ≤1e-5 on categorical datasets.
 
-**Plans**: TBD
-**Research flag**: NEEDS DEEPER RESEARCH before planning — line-by-line read of `approx_calcer.cpp` + `online_ctr.*`; design the per-object intermediate-oracle schema (which values to extract and compare) before writing implementation code.
+**Plans**: 6 plans in 6 waves (additive isolation ladder: one-hot → permutation → Plain CTR → Ordered CTR → Ordered boosting → tensor CTR)
+
+Plans:
+
+**Wave 1**
+
+- [ ] 05-01-PLAN.md — Wave-0 oracle infra: Stage::{Permutation,OnlineCtr,OrderedApprox} + model.json ctr_data parsing + transcribed ordered_oracle.cpp (zero catboost includes) + frozen purpose-built categorical fixtures
+
+**Wave 2** *(blocked on 05-01)*
+
+- [ ] 05-02-PLAN.md — One-hot-only first slice (ORD-04, D-04): one_hot_max_size path selection + categorical one-hot splits, oracle-locked ≤1e-5 with NO permutation present
+
+**Wave 3** *(blocked on 05-01, 05-02)*
+
+- [ ] 05-03-PLAN.md — Multi-permutation fold machinery (ORD-01, D-03 linchpin): TFastRng64 Fisher-Yates + TFold body/tail prefixes, permutation locked integer-exact before any value stage
+
+**Wave 4** *(blocked on 05-01, 05-02, 05-03)*
+
+- [ ] 05-04-PLAN.md — Plain CTR (ORD-03, D-06): all six CTR types whole-set + ctr_data .cbm/model.json serde + model-side apply, locked BEFORE ordered
+
+**Wave 5** *(blocked on 05-01, 05-03, 05-04)*
+
+- [ ] 05-05-PLAN.md — Ordered CTR + Ordered boosting (ORD-02, ORD-03 ordered): per-permutation read-before-increment + body/tail approximant, per-object intermediate oracle (indirect anchor for ordered approx)
+
+**Wave 6** *(blocked on 05-01, 05-04, 05-05)*
+
+- [ ] 05-06-PLAN.md — Tensor / combination CTRs (ORD-05): TProjection enumeration + combined hash + max_ctr_complexity, oracle-locked ≤1e-5
+
+**Research flag (RESOLVED)**: line-by-line read of `approx_calcer.cpp` + `online_ctr.*` complete (05-RESEARCH.md, file:line citations); per-object oracle schema designed (D-02). Research ESCALATION resolved: the D-01 TU-linking mechanism is infeasible; the user-approved **transcribe-then-self-oracle** replacement (05-CONTEXT DECISION REVISION 2026-06-14) is the mechanism used.
 
 ### Phase 6: Full Loss & Feature Parity
 
