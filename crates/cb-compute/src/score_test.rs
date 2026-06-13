@@ -98,6 +98,57 @@ fn score_st_dev_zero_random_strength_is_zero() {
     assert_eq!(score_st_dev(0.0, &wd, 0.2), 0.0);
 }
 
+// CR-01 CONTRACT (isolated RED->GREEN at the unit boundary): upstream
+// `CalcDerivativesStDevFromZeroPlainBoosting` (greedy_tensor_search.cpp:92-107)
+// reads `fold.BodyTailArr.front().WeightedDerivatives` — the FULL, un-sampled
+// fold. The boosting score path historically fed the control-MASKED vector
+// (`score_weighted_der1`, control-false entries ZEROED but length preserved)
+// into `score_st_dev`. Zeroing entries shrinks the RMS numerator while `n`
+// (the denominator AND the `ln(n)` model-size multiplier) stays the same, so
+// the masked input yields a STRICTLY LOWER scoreStDev than the full fold
+// whenever any object is dropped. This is exactly the CR-01 parity break that
+// surfaces when `random_strength != 0` is combined with `bootstrap_type != No`.
+// The end-to-end first-tree oracle (`regularization_oracle_random_strength_
+// bernoulli`) cannot isolate this on the `numeric_tiny` corpus (the std-dev
+// difference is entangled with the variable-length Box-Muller draw-stream
+// residual and never flips a tree-0 split there); this unit test locks the
+// contract at the boundary where the bug IS observable. See SUMMARY "Deviations".
+#[test]
+fn score_st_dev_masked_vector_biases_low_vs_full_fold_cr01() {
+    // Full fold: 4 objects with non-trivial derivatives.
+    let full = [1.0, -2.0, 3.0, -0.5];
+    // Masked fold: same length (n=4) but two control-false entries zeroed —
+    // the shape the buggy boosting score path passed in.
+    let masked = [1.0, 0.0, 3.0, 0.0];
+
+    let dsdz_full = derivatives_std_dev_from_zero(&full);
+    let dsdz_masked = derivatives_std_dev_from_zero(&masked);
+
+    // The masked numerator under-counts (zeroed entries contribute 0) while the
+    // denominator n=4 is unchanged -> masked std-dev is strictly LOWER.
+    assert!(
+        dsdz_masked < dsdz_full,
+        "masked dsdz ({dsdz_masked}) must be < full-fold dsdz ({dsdz_full}) — \
+         this is the CR-01 bias the &weighted_der1 fix removes"
+    );
+
+    // Concretely: full = sqrt((1+4+9+0.25)/4) = sqrt(3.5625); masked =
+    // sqrt((1+0+9+0)/4) = sqrt(2.5). Both divide by the SAME n=4.
+    assert!((dsdz_full - 3.562_5_f64.sqrt()).abs() < 1e-13, "full: {dsdz_full}");
+    assert!((dsdz_masked - 2.5_f64.sqrt()).abs() < 1e-13, "masked: {dsdz_masked}");
+
+    // The model-size multiplier is identical for both (same n, same modelLength),
+    // so the scoreStDev difference is carried entirely by the numerator: the
+    // FULL fold is the upstream-correct input.
+    let model_length = 0.0; // first tree
+    let sd_full = score_st_dev(1.0, &full, model_length);
+    let sd_masked = score_st_dev(1.0, &masked, model_length);
+    assert!(
+        sd_masked < sd_full,
+        "masked scoreStDev ({sd_masked}) must be < full scoreStDev ({sd_full})"
+    );
+}
+
 #[test]
 fn random_score_instance_adds_normal_times_stdev() {
     // GetInstance(Normal) = Val + StdNormalDistribution(rand) * StDev.

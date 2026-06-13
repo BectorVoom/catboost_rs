@@ -581,13 +581,20 @@ pub fn train_with_eval_sets<R: Runtime>(
         //    `random_strength != 0`, the per-candidate `TRandomScore` normal
         //    perturbation is drawn from the persistent RNG in upstream order
         //    (`scoreStDev = random_strength * derivativesStDevFromZero *
-        //    modelSizeMultiplier`, `modelLength = iter * learning_rate`); the
-        //    perturbation uses the SCORE-path weighted derivatives (the same fold
-        //    `derivativesStDevFromZero` is computed over upstream).
+        //    modelSizeMultiplier`, `modelLength = iter * learning_rate`).
+        //    `scoreStDev` / `derivativesStDevFromZero` is computed over the FULL,
+        //    un-sampled AveragingFold derivatives (`weighted_der1`) — matching the
+        //    LEAF path below and upstream `CalcDerivativesStDevFromZeroPlainBoosting`
+        //    (greedy_tensor_search.cpp:92-107, which reads
+        //    `fold.BodyTailArr.front().WeightedDerivatives`, the full fold). Only
+        //    the split-scoring HISTOGRAM uses the masked `score_weighted_der1` /
+        //    `score_weights` (the `sampledDocs` restriction). Feeding the masked
+        //    vector into the std-dev biases it low whenever `bootstrap_type != No`
+        //    drops objects (CR-01) — fixed here by passing `&weighted_der1`.
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
         let perturb = if perturb_active {
             let model_length = iter as f64 * learning_rate;
-            let std_dev = score_st_dev(params.random_strength, &score_weighted_der1, model_length);
+            let std_dev = score_st_dev(params.random_strength, &weighted_der1, model_length);
             Some(Perturbation {
                 rng: &mut rng,
                 score_st_dev: std_dev,

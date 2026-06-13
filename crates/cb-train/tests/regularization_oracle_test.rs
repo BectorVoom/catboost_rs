@@ -145,6 +145,7 @@ fn check_scenario_first_trees(
     random_strength: f64,
     bootstrap_type: EBootstrapType,
     bagging_temperature: f32,
+    subsample: f64,
 ) {
     let columns = load_feature_columns();
     let model_json = load_model_json(&fixture(&format!("{scenario}/model.json"))).unwrap();
@@ -160,7 +161,7 @@ fn check_scenario_first_trees(
         boost_from_average: true,
         leaf_method: LeafMethod::Gradient,
         bootstrap_type,
-        subsample: 1.0,
+        subsample,
         bagging_temperature,
         random_seed: 0,
         od_type: EOverfittingDetectorType::None,
@@ -214,6 +215,35 @@ fn regularization_oracle_random_strength_first_tree() {
         1.0,
         EBootstrapType::No,
         0.0,
+        1.0,
+    );
+}
+
+/// CR-01 GATE: `random_strength=1.0` COMBINED with `bootstrap_type=Bernoulli`
+/// (`subsample=0.7`). The Bernoulli control mask drops objects on tree 0, so the
+/// masked split-scoring derivative vector (`score_weighted_der1`) differs from the
+/// FULL, un-sampled fold derivative vector (`weighted_der1`). Upstream
+/// `CalcDerivativesStDevFromZeroPlainBoosting` computes `scoreStDev` over the FULL
+/// fold (NOT the masked vector) — exactly as the leaf path does. Before the
+/// `boosting.rs` `&score_weighted_der1` -> `&weighted_der1` fix this FAILS (RED),
+/// proving the cross-scenario fixture gates CR-01; after the fix it PASSES.
+///
+/// Only the FIRST tree is gated: tree 0's split-score perturbation depends
+/// directly on `scoreStDev`, and Bernoulli's control mask makes the masked vs full
+/// derivative vectors differ on tree 0, so the first tree alone exposes CR-01. The
+/// multi-tree random_strength residual (tree-1+ RNG-phase drift) remains the
+/// existing `#[ignore]`d deferral (`regularization_oracle_random_strength`, D-11 /
+/// Open Q4) and is NOT re-litigated here.
+#[test]
+fn regularization_oracle_random_strength_bernoulli() {
+    check_scenario_first_trees(
+        "regularization/random_strength_bernoulli",
+        1,
+        3.0,
+        1.0,
+        EBootstrapType::Bernoulli,
+        0.0,
+        0.7,
     );
 }
 
@@ -257,6 +287,7 @@ fn regularization_oracle_bagging_temp_first_tree() {
         0.0,
         EBootstrapType::Bayesian,
         0.5,
+        1.0,
     );
 }
 
