@@ -48,7 +48,7 @@
 
 ### Losses, Metrics & Prediction
 
-- [ ] **LOSS-01**: Binary classification — Logloss, CrossEntropy, Focal
+- [~] **LOSS-01**: Binary classification — Logloss, CrossEntropy, Focal (Plan 04-01 staged the offline CrossEntropy+Focal fixture manifest; loss impl + oracle lock land in a later Phase-4 wave)
 - [ ] **LOSS-02**: Multiclass (MultiClass softmax, MultiClassOneVsAll) and multilabel (MultiLogloss, MultiCrossEntropy)
 - [ ] **LOSS-03**: Regression matrix — RMSE, MAE, Quantile, MultiQuantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile, etc.
 - [ ] **LOSS-04**: Ranking losses — YetiRank(/Pairwise), PairLogit(/Pairwise), QueryRMSE, QuerySoftMax, LambdaMart, StochasticRank
@@ -69,7 +69,7 @@
 
 ### Model, Serialization & Explainability
 
-- [ ] **MODEL-01**: Native `.cbm` (FlatBuffers) serialization — save/load, cross-version compatible, load upstream-produced `.cbm` files
+- [~] **MODEL-01**: Native `.cbm` (FlatBuffers) serialization — save/load, cross-version compatible, load upstream-produced `.cbm` files (Plan 04-01 laid the prerequisites: committed flatc FlatBuffers bindings + canonical cb-model::Model; save/load impl + oracle lock land in the later Phase-4 cbm wave)
 - [ ] **MODEL-02**: CPU inference/apply path (independent of the GPU toolchain)
 - [ ] **MODEL-03**: Feature importance — PredictionValuesChange, LossFunctionChange, Interaction
 - [ ] **MODEL-04**: SHAP values (Regular `EShapCalcType`)
@@ -151,12 +151,12 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-06 | Phase 3 | Complete |
 | TRAIN-07 | Phase 3 | Complete |
 | TRAIN-08 | Phase 3 | Complete |
-| MODEL-01 | Phase 4 | Pending |
+| MODEL-01 | Phase 4 | In progress (04-01 prerequisites: flatc bindings + canonical Model) |
 | MODEL-02 | Phase 4 | Pending |
 | MODEL-03 | Phase 4 | Pending |
 | MODEL-04 | Phase 4 | Pending |
 | MODEL-06 | Phase 4 | Pending |
-| LOSS-01 | Phase 4 | Pending |
+| LOSS-01 | Phase 4 | In progress (04-01 staged offline CrossEntropy+Focal fixture manifest) |
 | LOSS-06 | Phase 4 | Pending |
 | RAPI-01 | Phase 4 | Pending |
 | RAPI-02 | Phase 4 | Pending |

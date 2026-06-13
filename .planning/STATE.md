@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 4 context gathered
-last_updated: "2026-06-13T13:29:03.254Z"
-last_activity: 2026-06-13 -- Phase 04 planning complete
+last_updated: "2026-06-13T19:58:14.804Z"
+last_activity: 2026-06-13 -- Phase 04 execution started
 progress:
   total_phases: 8
   completed_phases: 3
-  total_plans: 17
-  completed_plans: 17
+  total_plans: 22
+  completed_plans: 18
   percent: 38
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 03 — cpu-training-core-plain-boosting-oblivious-trees
+**Current focus:** Phase 04 — model-serialization-shap-rust-api-first-full-oracle-lock
 
 ## Current Position
 
-Phase: 4
-Plan: Not started
+Phase: 04 (model-serialization-shap-rust-api-first-full-oracle-lock) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
-Last activity: 2026-06-13 -- Phase 04 planning complete
+Last activity: 2026-06-13 -- Phase 04 execution started
 
 Progress: [██████████] 100% (9 of 9 phase-03 plans complete)
 
@@ -69,6 +69,7 @@ Progress: [██████████] 100% (9 of 9 phase-03 plans complete)
 | Phase 03 P06 | 35min | 2 tasks | 30 files |
 | Phase 03 P07 | 7min | 2 tasks | 5 files |
 | Phase 03 P08 | 10min | 3 tasks | 8 files |
+| Phase 04 P01 | ~40min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -121,6 +122,7 @@ Recent decisions affecting current work:
 - [Phase ?]: TRAIN-05 random_strength: std_normal verbatim Marsaglia-polar port over TFastRng64; two-pass SetBestScore/SelectBestCandidate draw order; first-tree end-to-end lock, multi-tree RNG-phase residual escalated D-11
 - [Phase 03]: Plan 03-08 (CR-01 closed): score_st_dev now reads the FULL un-sampled fold weighted_der1, NOT the control-masked score_weighted_der1 — matches upstream CalcDerivativesStDevFromZeroPlainBoosting (greedy_tensor_search.cpp:99 = fold.BodyTailArr.front().WeightedDerivatives) and the leaf path; histogram inputs to the perturbed search stay masked. Masked input biases scoreStDev low (zeroed entries, full-n denominator) whenever bootstrap_type!=No + random_strength!=0.
 - [Phase 03]: Plan 03-08: CR-01 RED->GREEN locked at the cb-compute UNIT boundary (score_st_dev_masked_vector_biases_low_vs_full_fold_cr01), NOT first-tree end-to-end. Exhaustive sweep proved numeric_tiny's first tree cannot isolate the std-dev bias: tree-0 splits are robust to the masked-vs-full difference at small random_strength, and at large random_strength the variable-length Box-Muller draw-stream residual (D-11) dominates and the fix is not isolable. WR-06 (n-from-slice-length) deliberately NOT folded in (signature unchanged).
+- [Phase ?]: [Phase 04]: Plan 04-01 COMPLETE — per-leaf weights in cb-train (sum_f64, 2^depth, unweighted==doc count); canonical cb-model::Model {oblivious_trees,bias,float_feature_borders}+per-tree leaf_weights reusing cb_train::Split; flatc 25.12.19 bindings committed (D-01, genuine flatc --rust --gen-all, user-approved deviation from per-file cmd); model_json leaf_weights #[serde(default)]; oracle lock 2/2.
 
 ### Pending Todos
 
@@ -147,6 +149,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T12:51:03.566Z
+Last session: 2026-06-13T19:58:05.723Z
 Stopped at: Phase 4 context gathered
 Resume file: .planning/phases/04-model-serialization-shap-rust-api-first-full-oracle-lock/04-CONTEXT.md
