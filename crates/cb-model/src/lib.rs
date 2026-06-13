@@ -17,6 +17,7 @@ mod error;
 mod json;
 mod model;
 mod predict;
+mod shap;
 
 pub use apply::{binarize_feature, predict_raw};
 pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
@@ -24,6 +25,7 @@ pub use error::ModelError;
 pub use json::{decode_json, load_json, save_json};
 pub use model::{Model, ObliviousTree, Split};
 pub use predict::{apply_prediction_type, PredictionType};
+pub use shap::shap_values;
 
 // flatc --rust generated FlatBuffers bindings for the vendored upstream schema
 // (D-01). Generated with `flatc --rust --gen-all` so each committed file is
