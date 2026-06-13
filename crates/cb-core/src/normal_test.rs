@@ -62,7 +62,7 @@ fn std_normal_pins_hand_computed_values_seed_17() {
     let n1 = std_normal(&mut rng);
     let n2 = std_normal(&mut rng);
     assert!(
-        (n1 - (-1.812_286_613_368_193_9e-1)).abs() < 1e-15,
+        (n1 - (-1.812_286_613_368_193e-1)).abs() < 1e-15,
         "seed=17 first normal mismatch: {n1}"
     );
     assert!(
@@ -77,7 +77,7 @@ fn std_normal_pins_hand_computed_values_seed_0_and_42() {
     let mut rng0 = TFastRng64::from_seed(0);
     let n0 = std_normal(&mut rng0);
     assert!(
-        (n0 - 6.337_067_335_392_765_3e-1).abs() < 1e-15,
+        (n0 - 6.337_067_335_392_765e-1).abs() < 1e-15,
         "seed=0 first normal mismatch: {n0}"
     );
 
