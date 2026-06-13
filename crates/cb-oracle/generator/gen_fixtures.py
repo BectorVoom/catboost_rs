@@ -834,6 +834,18 @@ def gen_regularization() -> None:
       - bagging_temp   : bootstrap_type=Bayesian, bagging_temperature=0.5
         (distinct from the bootstrap oracle's 1.0), random_strength=0. Drives the
         Bayesian weight exponent `powf(-FastLogf(GenRandReal1()+1e-100), temp)`.
+      - random_strength_bernoulli : random_strength=1.0 COMBINED with
+        bootstrap_type=Bernoulli, subsample=0.7 (strictly < 1.0 so the Bernoulli
+        `control` mask actually DROPS objects on the first tree). This is the
+        CROSS-scenario that the other three deliberately do NOT exercise: when the
+        control mask drops objects, the SAMPLED/masked split-scoring derivative
+        vector (`score_weighted_der1`, control-false entries zeroed) differs from
+        the FULL, un-sampled fold derivative vector (`weighted_der1`). Upstream
+        `CalcDerivativesStDevFromZeroPlainBoosting` (greedy_tensor_search.cpp:
+        92-107) computes `scoreStDev` over the FULL fold derivatives — NOT the
+        masked vector — exactly as the LEAF path does; only the split-scoring
+        HISTOGRAM is restricted to control-true objects. This scenario gates that
+        the std-dev input is the full fold (closes CR-01).
 
     UPSTREAM RANDOM_STRENGTH DRAW SEMANTICS (CPU single-host, transcribed from
     greedy_tensor_search.cpp / tensor_search_helpers.cpp / rand_score.h for the
@@ -877,6 +889,20 @@ def gen_regularization() -> None:
                 "random_strength": 0,
                 "bootstrap_type": "Bayesian",
                 "bagging_temperature": 0.5,
+            },
+        ),
+        # CR-01 cross-scenario: random_strength != 0 COMBINED with a sampling
+        # bootstrap (Bernoulli, subsample < 1.0). The Bernoulli control mask
+        # drops objects on the first tree, so the masked score derivatives
+        # (score_weighted_der1) differ from the full-fold weighted_der1 that
+        # scoreStDev (CalcDerivativesStDevFromZeroPlainBoosting) must use.
+        (
+            "random_strength_bernoulli",
+            {
+                "l2_leaf_reg": 3.0,
+                "random_strength": 1.0,
+                "bootstrap_type": "Bernoulli",
+                "subsample": 0.7,
             },
         ),
     ]
@@ -932,7 +958,14 @@ def gen_regularization() -> None:
                 "TRestorableFastRng64(Rand.GenRand()+taskIdx).Advance(10) per "
                 "feature, SelectBestCandidate draws once per feature from the main "
                 "Rand. bagging_temp=0.5: Bayesian weight powf(-FastLogf("
-                "GenRandReal1()+1e-100),temp)."
+                "GenRandReal1()+1e-100),temp). random_strength_bernoulli: "
+                "random_strength=1.0 + Bernoulli(subsample=0.7). scoreStDev is "
+                "taken over the FULL, un-sampled fold derivatives "
+                "(CalcDerivativesStDevFromZeroPlainBoosting, "
+                "greedy_tensor_search.cpp:92-107) — NOT the control-masked "
+                "score_weighted_der1; the Bernoulli control mask restricts ONLY "
+                "the split-scoring histogram, so the std-dev input is the full "
+                "fold (same input as the leaf path)."
             ),
         }
         with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
