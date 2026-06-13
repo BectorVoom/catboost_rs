@@ -13,12 +13,14 @@
 //! (Pitfall 1); depth is capped against `2^depth` overflow (T-03-01-02). No
 //! `unwrap`/`expect`/raw float fold in production (deny-lints + D-08).
 
+mod autolr;
 mod bootstrap;
 mod boosting;
 mod metrics;
 mod overfit;
 mod tree;
 
+pub use autolr::{coefficients as autolr_coefficients, guess as autolr_guess, TargetType};
 pub use bootstrap::{
     bootstrap, last_iter_mean_leaf_value, BootstrapResult, EBootstrapType, BAYESIAN_BLOCK_SIZE,
     MVS_BLOCK_SIZE,
