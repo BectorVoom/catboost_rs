@@ -5,3 +5,8 @@
 # committed frozen (D-11/D-12) — `crates/cb-oracle/fixtures/` is intentionally
 # tracked and must never be ignored.
 crates/cb-oracle/generator/.venv/
+
+# CatBoost training-log output emitted by the generator (NOT a fixture). The
+# gen_fixtures.py training run writes a catboost_info/ dir of TSV/event logs we
+# never consume — keep it out of git.
+crates/cb-oracle/generator/catboost_info/
