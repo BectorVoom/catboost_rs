@@ -15,6 +15,11 @@ cb-train = { path = "../cb-train" }
 # authored for the vendored flatc 24.3.25 (wire format is version-stable;
 # RESEARCH A1). Vetted OK in the Package Legitimacy Audit.
 flatbuffers = "25.12.19"
+# Typed (de)serialization error enum (no anyhow, D-14) + model.json export/import
+# on the upstream schema (workspace-pinned, RESEARCH Standard Stack).
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the

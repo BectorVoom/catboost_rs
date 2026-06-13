@@ -12,10 +12,14 @@
 //! the later `.cbm` (de)serializer plan.
 
 mod apply;
+mod cbm;
+mod error;
 mod model;
 mod predict;
 
 pub use apply::{binarize_feature, predict_raw};
+pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
+pub use error::ModelError;
 pub use model::{Model, ObliviousTree, Split};
 pub use predict::{apply_prediction_type, PredictionType};
 

@@ -651,6 +651,9 @@ dependencies = [
  "flatbuffers",
  "ndarray",
  "ndarray-npy",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
