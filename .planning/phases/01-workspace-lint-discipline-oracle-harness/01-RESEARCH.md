@@ -532,19 +532,19 @@ echo "OK: no anyhow in core library code"
 
 **Note:** The PRNG algorithm, its test vectors, the JSON model schema, the Python oracle API names, `[workspace.lints]` support, and crate versions are all **VERIFIED/CITED** (not assumed) — the assumptions above are confined to minor test-tooling and environment-setup specifics.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Clippy scope for the test-lint exemption (Pitfall 1)**
+> All three questions were settled during Phase 1 planning (plans 01-01 / 01-02 / 01-03). Resolutions annotated inline.
+
+1. **Clippy scope for the test-lint exemption (Pitfall 1)** — **RESOLVED (Plan 01-01 T1):** uniform in-code convention chosen — `#![cfg_attr(test, allow(...))]` in library `lib.rs` + `#![allow(...)]` headers in `tests/*.rs`; no CI `--lib`-flag branching.
    - What we know: restriction lints hit test code; `lints.workspace=true` forbids per-crate manifest overrides; in-code `#![cfg_attr(test, allow(...))]` works for unit tests.
-   - What's unclear: whether to ALSO restrict the CI production gate to `--lib` vs blanket-allow in every `tests/*.rs`. Both work.
-   - Recommendation: Plan 1 picks one convention and applies it to the first test file written; prefer in-code `#![cfg_attr(test, allow(...))]` in libs + `#![allow(...)]` headers in `tests/*.rs` (uniform, no CI-flag branching).
+   - Recommendation: prefer in-code `#![cfg_attr(test, allow(...))]` in libs + `#![allow(...)]` headers in `tests/*.rs` (uniform, no CI-flag branching).
 
-2. **Frozen input corpus shape (D-11, Claude's discretion)**
+2. **Frozen input corpus shape (D-11, Claude's discretion)** — **RESOLVED (Plan 01-03 T2):** 3 tiny datasets specified (pure-numeric, numeric+categorical, grouped/ranking), pinned seed, committed frozen.
    - What we know: must exercise numeric, categorical, and grouped/ranking paths; small.
-   - What's unclear: exact row/feature counts.
    - Recommendation: 3 tiny datasets — (a) pure-numeric ~50×4, (b) numeric+categorical ~50×(3 num + 2 cat), (c) grouped/ranking ~60 rows × small features with `group_id`. Pin generation seed; commit. Planning may refine.
 
-3. **Facade anyhow classification (D-15)**
+3. **Facade anyhow classification (D-15)** — **RESOLVED (applied across plans):** `catboost-rs` facade treated as a thiserror-only library by default; revisit at Phase 4.
    - What we know: default is treat `catboost-rs` as a library (thiserror-only).
    - Recommendation: keep facade thiserror-only unless a Phase 4 ergonomics need surfaces; revisit at Phase 4.
 
