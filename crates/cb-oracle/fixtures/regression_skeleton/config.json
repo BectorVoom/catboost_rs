@@ -1,0 +1,33 @@
+{
+  "borders_feature_indices": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "borders_layout": "flat f64: feature 0 borders, then feature 1, ... ; borders_per_feature.npy gives the per-feature counts",
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "n_features": 4,
+  "n_iterations": 10,
+  "n_rows": 50,
+  "params": {
+    "depth": 4,
+    "iterations": 10,
+    "learning_rate": 0.1,
+    "random_seed": 0,
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "regression_skeleton",
+  "seed": 0,
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages",
+  "stages": [
+    "Borders",
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "thread_count": 1
+}

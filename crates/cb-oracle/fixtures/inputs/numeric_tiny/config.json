@@ -1,0 +1,16 @@
+{
+  "column_kinds": {
+    "f0": "numeric",
+    "f1": "numeric",
+    "f2": "numeric",
+    "f3": "numeric"
+  },
+  "dataset": "numeric_tiny",
+  "dtype": "float64",
+  "has_group_id": false,
+  "n_categorical": 0,
+  "n_numeric": 4,
+  "n_rows": 50,
+  "seed": 20260613,
+  "target": "regression"
+}

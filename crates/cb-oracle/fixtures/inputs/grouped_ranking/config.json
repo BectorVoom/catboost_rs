@@ -1,0 +1,17 @@
+{
+  "column_kinds": {
+    "f0": "numeric",
+    "f1": "numeric",
+    "f2": "numeric"
+  },
+  "dataset": "grouped_ranking",
+  "dtype": "float64",
+  "group_size": 5,
+  "has_group_id": true,
+  "n_categorical": 0,
+  "n_groups": 12,
+  "n_numeric": 3,
+  "n_rows": 60,
+  "seed": 20260615,
+  "target": "ranking"
+}

@@ -1,0 +1,21 @@
+{
+  "cat_feature_indices": [
+    3,
+    4
+  ],
+  "column_kinds": {
+    "c0": "categorical",
+    "c1": "categorical",
+    "f0": "numeric",
+    "f1": "numeric",
+    "f2": "numeric"
+  },
+  "dataset": "numeric_categorical",
+  "dtype": "float64",
+  "has_group_id": false,
+  "n_categorical": 2,
+  "n_numeric": 3,
+  "n_rows": 50,
+  "seed": 20260614,
+  "target": "regression"
+}

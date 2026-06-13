@@ -1,0 +1,10 @@
+# Pinned build-time oracle generator dependencies (D-07).
+#
+# These run OUTSIDE CI (D-12): the generator is executed once on a developer
+# machine to produce the committed frozen fixtures, and is NEVER installed or
+# run in the GitHub Actions CPU lane. Pin exact versions so the oracle baseline
+# is reproducible and the 1e-5 parity tolerance has a stable reference.
+catboost==1.2.10
+# numpy compatible with catboost 1.2.10 (D-07). catboost 1.2.10 requires
+# numpy>=1.16.0,<2.0 ; pin a stable 1.26.x that ships f64 .npy as we need.
+numpy==1.26.4
