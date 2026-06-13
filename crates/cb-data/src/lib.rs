@@ -31,6 +31,7 @@ mod nan_mode;
 mod pool;
 mod quantize;
 mod quantized_pool;
+mod weights;
 
 pub use borders::{penalty_maxsumlog, select_borders_greedy_logsum};
 pub use cat_hash::{
@@ -41,6 +42,10 @@ pub use pool::{Pair, Pool};
 pub use quantize::QuantizeParams;
 pub use quantized_pool::{
     pack_bins, select_bin_width, ColumnBins, FeatureKind, QuantizedPool,
+};
+pub use weights::{
+    balanced_class_weights, resolve_object_weights, sqrt_balanced_class_weights,
+    summary_class_weights, MINIMAL_CLASS_WEIGHT,
 };
 
 #[cfg(test)]
@@ -53,3 +58,5 @@ mod nan_mode_test;
 mod pool_test;
 #[cfg(test)]
 mod quantized_pool_test;
+#[cfg(test)]
+mod weights_test;

@@ -20,3 +20,16 @@ current plan's changes).
 - `clippy::neg_cmp_op_on_partial_ord` fires on `if !(diff <= tol)` (NaN-aware divergence check from Phase 1 commit 902368d).
 - Out of scope for 02-04 (cat-hash plan; compare.rs untouched). Surfaces only under `--all-targets` clippy of cb-data's dependency graph; the plan's gate `clippy -p cb-data --lib` is clean.
 - Suggested fix (later): rewrite as `if matches!(diff.partial_cmp(&tol), Some(Ordering::Greater) | None)` or add a scoped `#[allow]` with a NaN-handling comment.
+
+## [02-05] Pre-existing clippy lints surfacing under newer toolchain (rust-1.96.0)
+- **cb-oracle `neg_cmp_op_on_partial_ord` (recurring, see 02-03/02-04):** still
+  fires under `cargo clippy --workspace --lib -- -D warnings`. compare.rs
+  untouched by 02-05. The plan's per-crate gates (`clippy -p cb-data --lib`,
+  `clippy -p cb-core --lib`) are clean.
+- **cb-core `unnecessary_literal_unwrap` in error_test.rs:** the pre-existing
+  `cb_result_ok_path_round_trips` test (`let ok: CbResult<u32> = Ok(42);
+  assert_eq!(ok.unwrap(), 42);`) trips `clippy::unnecessary_literal_unwrap` under
+  rust-1.96.0 `--all-targets`. The pattern predates 02-05 (Phase-1 error_test);
+  my edit only shifted its line number. Out of scope for the ingestion+weights
+  slice. Suggested fix (later, in a cb-core housekeeping pass): replace with a
+  non-literal `Ok` value or a scoped `#[allow]`.
