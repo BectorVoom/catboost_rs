@@ -114,15 +114,20 @@ impl OwnedColumns {
     }
 }
 
-/// Returns an `OutOfRange` error if `actual != expected`, naming the offending
-/// column. Centralizes the length check so no call site indexes or panics.
+/// Returns a [`CbError::LengthMismatch`] if `actual != expected`, naming the
+/// offending column. Centralizes the length check so no call site indexes or
+/// panics. Uses the dedicated `LengthMismatch` variant (matching the Arrow path)
+/// so callers can `match` on a shape mismatch distinctly from any other range
+/// violation (WR-04).
 fn check_len(name: &str, expected: usize, actual: usize) -> CbResult<()> {
     if actual == expected {
         Ok(())
     } else {
-        Err(CbError::OutOfRange(format!(
-            "column `{name}` has length {actual}, expected {expected} (n_rows)"
-        )))
+        Err(CbError::LengthMismatch {
+            column: name.to_string(),
+            expected,
+            actual,
+        })
     }
 }
 

@@ -40,8 +40,8 @@ fn cat_feature_length_mismatch_is_error() {
         .into_pool();
 
     match result {
-        Err(CbError::OutOfRange(msg)) => assert!(msg.contains("cat_feature")),
-        other => panic!("expected OutOfRange for short cat column, got {other:?}"),
+        Err(CbError::LengthMismatch { column, .. }) => assert!(column.contains("cat_feature")),
+        other => panic!("expected LengthMismatch for short cat column, got {other:?}"),
     }
 }
 
@@ -52,7 +52,7 @@ fn embedding_feature_length_mismatch_is_error() {
         .with_embedding_features(vec![vec![vec![1.0_f32]]])
         .into_pool();
 
-    assert!(matches!(result, Err(CbError::OutOfRange(_))));
+    assert!(matches!(result, Err(CbError::LengthMismatch { .. })));
 }
 
 /// An all-empty source (no features, no label) is a legitimate zero-row Pool,
@@ -119,7 +119,7 @@ fn n_rows_derives_from_float_features() {
         .into_pool();
 
     match result {
-        Err(CbError::OutOfRange(msg)) => assert!(msg.contains("label")),
+        Err(CbError::LengthMismatch { column, .. }) => assert!(column.contains("label")),
         other => panic!("expected label length error, got {other:?}"),
     }
 }

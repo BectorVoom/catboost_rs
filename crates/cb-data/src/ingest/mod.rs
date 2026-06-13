@@ -42,7 +42,9 @@ pub trait IngestSource {
     ///
     /// # Errors
     ///
-    /// Returns [`cb_core::CbError::OutOfRange`] when the supplied columns are not
-    /// all the same length (a shape mismatch).
+    /// Returns [`cb_core::CbError::LengthMismatch`] when the supplied columns are
+    /// not all the same length (a shape mismatch), and
+    /// [`cb_core::CbError::OutOfRange`] when a ranking pair references a row index
+    /// beyond `n_rows`.
     fn into_pool(self) -> CbResult<Pool>;
 }
