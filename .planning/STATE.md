@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-00-PLAN.md (Wave-0 foundation; Nyquist signed off)
-last_updated: "2026-06-13T07:21:47Z"
-last_activity: 2026-06-13 -- Completed Phase 03 Plan 00 (CubeCL seam + model.json parser + training oracles)
+stopped_at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked)
+last_updated: "2026-06-13T07:52:06Z"
+last_activity: 2026-06-13 -- Completed Phase 03 Plan 01 (cb-compute boundary + CpuRuntime impl + plain boosting; TRAIN-01/02/03-Gradient)
 progress:
   total_phases: 8
   completed_phases: 2
   total_plans: 16
-  completed_plans: 9
-  percent: 27
+  completed_plans: 10
+  percent: 31
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 03 (cpu-training-core-plain-boosting-oblivious-trees) — EXECUTING
-Plan: 2 of 8
-Status: Executing Phase 03 (Plan 00 complete)
-Last activity: 2026-06-13 -- Completed Phase 03 Plan 00
+Plan: 3 of 8
+Status: Executing Phase 03 (Plans 00, 01 complete)
+Last activity: 2026-06-13 -- Completed Phase 03 Plan 01
 
-Progress: [█░░░░░░░░░] 13% (1 of 8 phase-03 plans complete)
+Progress: [██░░░░░░░░] 25% (2 of 8 phase-03 plans complete)
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ Progress: [█░░░░░░░░░] 13% (1 of 8 phase-03 plans complete)
 | Phase 02 P04 | 25min | 2 tasks | 11 files |
 | Phase 02 P05 | ~25min | 2 tasks | 12 files |
 | Phase 03 P00 | ~75min | 4 tasks | 16 files |
+| Phase 03 P01 | ~20min | 4 tasks | 27 files |
 
 ## Accumulated Context
 
@@ -100,6 +101,11 @@ Recent decisions affecting current work:
 - [Phase 03]: Plan 03-00: cb-oracle::model_json parses upstream model.json (scale_and_bias=[1,[bias]]); extractors return Vec<f64> for compare_stage(Stage::Splits|LeafValues); no unwrap, OracleError::MalformedModel
 - [Phase 03]: Plan 03-00: Open Q1 RESOLVED — score_function=L2 (simplest first-slice split math); regression_skeleton + binclf_skeleton frozen with D-07 isolating params (bootstrap_type=No, random_strength=0, depth=2, iterations=5, leaf_estimation_iterations=1, thread_count=1, explicit boost_from_average); Logloss staged = RawFormulaVal logits (A5/Pitfall 6)
 - [Phase 03]: Plan 03-00: Wave-0 Nyquist gate signed off (03-VALIDATION.md nyquist_compliant: true, wave_0_complete: true) — unblocks Plan 01 slice_first_oracle (gates TRAIN-01/02/03)
+- [Phase 03]: Plan 03-01: cb-compute abstract Runtime/Float boundary stood up cubecl-free (D-03 verified via cargo tree); cb-backend CpuBackend impls it launching elementwise gradient/hessian/scatter #[cube] kernels (UN-reduced, D-02), host folds via cb_core::sum_f64
+- [Phase 03]: Plan 03-01: oblivious leaf index = forward bit order (split i -> bit i); model.json leaf_values are ALREADY learning_rate-scaled — boosting stores lr*delta and adds directly to staged approx (verified vs regression_skeleton tree 0)
+- [Phase 03]: Plan 03-01: Gradient leaf delta = CalcAverage(sumDer, sumWeight, scaledL2), scaledL2 = l2*(sumAllW/docCount) (== l2 unweighted); L2 split score = sum over level leaves of avg*sumDer, strict gain>bestGain first-wins tie-break (Pitfall 1)
+- [Phase 03]: Plan 03-01: TRAIN-01/02 COMPLETE, TRAIN-03 Gradient done (Newton/Exact/Simple -> Plan 02); slice_first_oracle gates Splits/LeafValues/StagedApprox <=1e-5 for RMSE + Logloss; cargo test --workspace green
+- [Phase 03]: Plan 03-01: added CbError::DepthExceeded (depth>16) + CbError::Degenerate (no candidate split/empty) — guards, never panic (T-03-01-01/02); extended cb-oracle::model_json with float_feature_borders() accessor for the oracle test
 
 ### Pending Todos
 
@@ -114,6 +120,7 @@ None yet.
 - Phase 5 (Ordered Boosting/CTR), Phase 7 (GPU/CubeCL-ROCm), and Phase 8 (Python ABI/packaging) are flagged NEEDS DEEPER RESEARCH — run the per-phase research spike before planning each.
 - GPU tolerance epsilon (Phase 7) is unspecified — must be set and signed off before Phase 7 planning.
 - **Plan 02-01 COMPLETE (human approved Task-3 checkpoint).** Tasks 1–3 committed (1f2b9f1, d92ae65, 025c381); 02-01-SUMMARY.md written and self-checked; plan counter advanced to 02-02. No open blockers from 02-01.
+- **Environment: disk pressure.** `cargo test --workspace` pulls in `cubecl-cpu`'s heavy `tracel-mlir-sys` (MLIR) transitive dep, which filled the disk (100%) during Plan 03-01 and corrupted incremental caches mid-build. Resolved by clearing `target/debug/incremental` + stale deps and rebuilding. CPU-only builds still compile the MLIR optimizer dep — keep an eye on disk headroom before full-workspace builds.
 
 ## Deferred Items
 
@@ -125,6 +132,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T07:21:47Z
-Stopped at: Completed 03-00-PLAN.md (Wave-0 foundation; Nyquist signed off)
+Last session: 2026-06-13T07:52:06Z
+Stopped at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked at <=1e-5)
 Resume file: None

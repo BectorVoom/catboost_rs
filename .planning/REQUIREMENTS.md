@@ -29,9 +29,9 @@
 
 ### CPU Training Core
 
-- [ ] **TRAIN-01**: Plain gradient boosting train loop (`iterations`, `learning_rate`, `depth`)
-- [ ] **TRAIN-02**: Symmetric (oblivious) decision trees — the core CatBoost tree structure
-- [ ] **TRAIN-03**: Leaf value estimation — Gradient, Newton, Exact, Simple
+- [x] **TRAIN-01**: Plain gradient boosting train loop (`iterations`, `learning_rate`, `depth`)
+- [x] **TRAIN-02**: Symmetric (oblivious) decision trees — the core CatBoost tree structure
+- [~] **TRAIN-03**: Leaf value estimation — Gradient (done, Plan 01); Newton, Exact, Simple (Plan 02)
 - [ ] **TRAIN-04**: Bootstrap / sampling — Poisson, Bayesian, Bernoulli, MVS, No; `subsample`; object/group sampling units
 - [ ] **TRAIN-05**: Regularization — `l2_leaf_reg`, `random_strength`, `bagging_temperature`
 - [ ] **TRAIN-06**: Overfitting detection and early stopping — Wilcoxon/IncToDec/Iter, `od_pval`/`od_wait`, `use_best_model`
@@ -143,9 +143,9 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | DATA-06 | Phase 2 | Complete |
 | DATA-07 | Phase 2 | Complete |
 | DATA-08 | Phase 2 | Complete |
-| TRAIN-01 | Phase 3 | Pending |
-| TRAIN-02 | Phase 3 | Pending |
-| TRAIN-03 | Phase 3 | Pending |
+| TRAIN-01 | Phase 3 | Complete |
+| TRAIN-02 | Phase 3 | Complete |
+| TRAIN-03 | Phase 3 | Partial (Gradient; Newton/Exact/Simple in Plan 02) |
 | TRAIN-04 | Phase 3 | Pending |
 | TRAIN-05 | Phase 3 | Pending |
 | TRAIN-06 | Phase 3 | Pending |
