@@ -11,6 +11,7 @@
 //! file or malformed JSON (T-03-00-01 mitigation). No `unwrap`/`expect` in the
 //! production path — the deny-lints stay satisfied.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -69,6 +70,87 @@ pub struct FeaturesInfoJson {
     pub float_features: Vec<FloatFeatureJson>,
 }
 
+/// One CTR table from the upstream `model.json` `ctr_data` hash-map (the value
+/// half of one `"<ctr-base-string>": { … }` entry).
+///
+/// Upstream emits each table as (see `json_model_helpers.cpp:475-482`):
+/// ```json
+/// { "hash_map": ["<hash0>", n00, n01, "<hash1>", n10, n11, …],
+///   "hash_stride": 3,
+///   "counter_denominator": 0 }
+/// ```
+/// where `hash_map` is a FLAT, heterogeneous array: each stride is one bucket —
+/// a hash STRING followed by `hash_stride - 1` integer counts. The interpretation
+/// of those counts depends on the CTR type (encoded in the map key, per
+/// `static_ctr_provider.cpp:14-126`):
+/// - **Borders / Buckets / *TargetMeanValue (classes):** `hash_stride - 1` class
+///   counts per bucket; CTR = `ctrHistory[1] / (ctrHistory[0] + ctrHistory[1])`
+///   for Borders (and analogous per-class forms).
+/// - **Counter / FeatureFreq:** a single `ctrTotal` per bucket; CTR =
+///   `ctrTotal[bucket] / counter_denominator`.
+/// - **Mean (TCtrMeanHistory):** a `Sum` then a `Count` per bucket (stride 3 incl.
+///   hash); CTR = `Sum / Count`.
+///
+/// Every field is `#[serde(default)]` so Phase-3/4 fixtures WITHOUT a `ctr_data`
+/// block keep parsing (RESEARCH A5 — the parser was borders-only before this).
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct CtrTableJson {
+    /// Flat, heterogeneous bucket array: `[hash_string, count, count, …]`
+    /// repeated every `hash_stride` elements. Stored as raw JSON values because
+    /// the array mixes hash strings and integer counts.
+    #[serde(default)]
+    pub hash_map: Vec<serde_json::Value>,
+    /// Number of elements per bucket (1 hash + `hash_stride - 1` counts). Zero
+    /// for a degenerate/empty table.
+    #[serde(default)]
+    pub hash_stride: i64,
+    /// `CounterDenominator` for `Counter`/`FeatureFreq` CTRs; `0` otherwise.
+    #[serde(default)]
+    pub counter_denominator: i64,
+}
+
+impl CtrTableJson {
+    /// The integer counts of every bucket, in `hash_map` order, with the leading
+    /// per-bucket hash string stripped. Each inner `Vec<i64>` has length
+    /// `hash_stride - 1`.
+    ///
+    /// Non-integer entries (a malformed blob) yield [`OracleError::MalformedModel`]
+    /// rather than a panic (T-05-01-01). A `hash_stride <= 0` is treated as an
+    /// empty table (no buckets).
+    ///
+    /// # Errors
+    /// [`OracleError::MalformedModel`] if a stride boundary is ragged or a count
+    /// slot is not an integer.
+    pub fn bucket_counts(&self) -> Result<Vec<Vec<i64>>, OracleError> {
+        let stride = self.hash_stride;
+        if stride <= 0 {
+            return Ok(Vec::new());
+        }
+        let stride = stride as usize;
+        if !self.hash_map.len().is_multiple_of(stride) {
+            return Err(OracleError::MalformedModel {
+                what: format!(
+                    "ctr_data hash_map length {} is not a multiple of hash_stride {stride}",
+                    self.hash_map.len()
+                ),
+            });
+        }
+        let mut out = Vec::with_capacity(self.hash_map.len() / stride);
+        for bucket in self.hash_map.chunks_exact(stride) {
+            // bucket[0] is the hash string; bucket[1..] are the integer counts.
+            let mut counts = Vec::with_capacity(stride - 1);
+            for slot in bucket.iter().skip(1) {
+                let value = slot.as_i64().ok_or_else(|| OracleError::MalformedModel {
+                    what: "ctr_data hash_map count slot is not an integer".to_owned(),
+                })?;
+                counts.push(value);
+            }
+            out.push(counts);
+        }
+        Ok(out)
+    }
+}
+
 /// Top-level upstream `model.json` (the subset the oracle consumes).
 ///
 /// `scale_and_bias` is upstream's `[scale, [bias, …]]` pair; for the
@@ -84,6 +166,13 @@ pub struct ModelJson {
     /// outer array mixes a scalar scale and a nested bias vector; the typed
     /// accessor [`ModelJson::bias`] extracts the bias without `unwrap`.
     pub scale_and_bias: serde_json::Value,
+    /// The upstream `ctr_data` hash-map: CTR-base-string key → per-bucket count
+    /// table (`json_model_helpers.cpp:524`). Only present when the model has
+    /// CTR features; `#[serde(default)]` keeps borders-only Phase-3/4 fixtures
+    /// parsing (RESEARCH A5). A `BTreeMap` gives a deterministic key order for
+    /// reproducible per-CTR-type comparison.
+    #[serde(default)]
+    pub ctr_data: BTreeMap<String, CtrTableJson>,
 }
 
 impl ModelJson {
@@ -130,6 +219,15 @@ impl ModelJson {
             .iter()
             .map(|f| f.borders.clone())
             .collect()
+    }
+
+    /// The parsed `ctr_data` tables, keyed by upstream CTR-base string. Empty
+    /// for a borders-only model (no CTR features). Each table exposes its
+    /// per-bucket counts via [`CtrTableJson::bucket_counts`] for per-CTR-type
+    /// comparison through `compare_stage`.
+    #[must_use]
+    pub fn ctr_data(&self) -> &BTreeMap<String, CtrTableJson> {
+        &self.ctr_data
     }
 
     /// The model bias `scale_and_bias[1][0]`.
