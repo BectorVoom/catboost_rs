@@ -16,8 +16,12 @@
 )]
 
 mod error;
+mod rng;
 
 pub use error::{CbError, CbResult};
+pub use rng::TFastRng64;
 
 #[cfg(test)]
 mod error_test;
+#[cfg(test)]
+mod rng_test;

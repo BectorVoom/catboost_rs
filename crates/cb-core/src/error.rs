@@ -13,7 +13,7 @@ pub type CbResult<T> = std::result::Result<T, CbError>;
 ///
 /// New variants may be added as later plans land; downstream `match`es should
 /// remain robust to additional variants.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CbError {
     /// A uniform-sampling bound (or similar exclusive upper bound) was not
     /// strictly positive. Reserved for Plan 02's `TFastRng64::uniform`.
