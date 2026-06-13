@@ -1,0 +1,37 @@
+{
+  "boost_from_average": false,
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "leaf_estimation_method": "Newton",
+  "leaf_formula_note": "Gradient: CalcAverage(SumDer,SumWeights,scaledL2). Newton: SumDer/(-SumDer2+scaledL2) (Logloss der2=-p(1-p) makes it distinct from Gradient; RMSE der2=-1 makes Newton==Gradient). Exact: CalcOneDimensionalOptimumConstApprox -> weighted quantile (MAE alpha=0.5,delta=1e-6) of leaf residuals (target-approx). Simple: == Gradient leaf-delta (A6, CalcLeafDeltasSimple Gradient branch).",
+  "loss_function": "Logloss",
+  "n_features": 4,
+  "n_iterations": 5,
+  "n_rows": 50,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Newton",
+    "learning_rate": 0.1,
+    "loss_function": "Logloss",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "scenario": "leaf_methods/newton",
+  "seed": 0,
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw approximant / logit)",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox"
+  ],
+  "thread_count": 1
+}

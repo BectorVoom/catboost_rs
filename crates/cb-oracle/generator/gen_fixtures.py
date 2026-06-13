@@ -57,6 +57,7 @@ BINCLF_SCENARIO = FIXTURES / "binclf_skeleton"
 BORDERS_QUANT = FIXTURES / "borders_quant"
 CAT_HASH = FIXTURES / "cat_hash"
 CLASS_WEIGHTS = FIXTURES / "class_weights"
+LEAF_METHODS = FIXTURES / "leaf_methods"
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -517,6 +518,129 @@ def gen_binclf_skeleton() -> None:
         fh.write("\n")
 
 
+def gen_leaf_methods() -> None:
+    """leaf_methods/{gradient,newton,exact,simple}/ — the TRAIN-03 (D-09) four
+    leaf-estimation-method oracle. Each scenario pins ONE
+    `leaf_estimation_method` and every other knob at the first-slice simplified
+    isolating values, so a divergence is attributable to a single method's leaf
+    math.
+
+    TRANSCRIBED LEAF FORMULAS (read from vendored catboost 1.2.10, recorded here
+    for the Rust Task-2 implementation):
+
+      online_predictor.h:112-178 + approx_calcer.cpp:482-525
+      - CalcAverage(sumDelta, count, scaledL2) = count>0 ? sumDelta/(count+scaledL2) : 0
+      - ScaleL2Reg(l2, sumAllWeights, allDocCount) = l2*(sumAllWeights/allDocCount)
+      - GRADIENT leaf delta = CalcAverage(SumDer, SumWeights, scaledL2)
+      - NEWTON   leaf delta = CalcDeltaNewtonBody(sumDer, sumDer2, l2, sumAllW, docCount)
+                             = sumDer / (-sumDer2 + scaledL2)
+      - SIMPLE: `CalcLeafDeltasSimple` (approx_calcer.cpp:506-524) dispatches the
+        ELeavesEstimation::Simple value through the SAME Gradient branch (the
+        `else`/Y_ASSERT(Gradient) path); EMPIRICALLY (probe, catboost 1.2.10)
+        Simple leaf values are bit-identical to Gradient for these params (A6
+        RESOLVED: Simple == the Gradient leaf-delta formula).
+      - EXACT (approx_calcer.cpp:681-704 -> optimal_const_for_loss.h:180-216):
+        per leaf, collect residuals r_i = target_i - approx_i (as f32) and weights
+        w_i, then leafDelta = CalcOneDimensionalOptimumConstApprox(loss, r, w):
+          * MAE / Quantile(alpha=0.5, delta=1e-6): weighted sample quantile
+            (quantile.cpp CalcSampleQuantileLinearSearch for <100 samples:
+            stable-sort r ascending, accumulate w, return first value where
+            sumWeight >= totalWeight*alpha - DBL_EPSILON), then the delta
+            adjustment in CalculateWeightedTargetQuantile (alpha=0.5, delta=1e-6):
+            q -= delta if (lessWeight + equalWeight*alpha >= needWeight-DBL_EPSILON)
+            else q += delta.
+      NOTE (parity-critical): Exact is ONLY available upstream for
+      Quantile/GroupQuantile/MultiQuantile/MAE/MAPE/... (catboost_options.cpp:346
+      rejects Exact for RMSE/Logloss). So the `exact` scenario uses loss_function
+      'MAE' (alpha=0.5). Newton is mathematically == Gradient for RMSE (der2==-1
+      so -sumDer2==sumWeight), so the `newton` scenario uses Logloss (der2 =
+      -p(1-p)) where Newton is genuinely distinct from Gradient.
+
+    The stored model.json `leaf_values` are already learning_rate-scaled (the
+    boosting loop multiplies the raw delta by learning_rate); staged.npy stores
+    the per-iteration RAW approximant (RawFormulaVal for the classifier)."""
+    LEAF_METHODS.mkdir(parents=True, exist_ok=True)
+
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_bin = (y > np.median(y)).astype(np.int64)
+
+    # (method, loss, estimator, target, boost_from_average, prediction_type)
+    scenarios = [
+        ("gradient", "RMSE", "Gradient", y, True, None),
+        ("newton", "Logloss", "Newton", y_bin, False, "RawFormulaVal"),
+        ("exact", "MAE", "Exact", y, False, None),
+        ("simple", "RMSE", "Simple", y, True, None),
+    ]
+
+    for name, loss, estimator, target, bfa, pred_type in scenarios:
+        scenario_dir = LEAF_METHODS / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        # All four pin the first-slice simplified isolating params, overriding
+        # only leaf_estimation_method (and loss_function / boost_from_average
+        # per method's parity requirement above).
+        params = {**ISOLATING_PARAMS}
+        params["leaf_estimation_method"] = estimator
+        params["loss_function"] = loss
+        params["boost_from_average"] = bfa
+
+        if loss == "Logloss":
+            model = CatBoostClassifier(**params)
+        else:
+            model = CatBoostRegressor(**params)
+        model.fit(x, target)
+
+        # --- Stage: Splits + LeafValues (model.json) ------------------------
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        # --- Stage: StagedApprox (raw approximant / logit) ------------------
+        if pred_type is not None:
+            staged = [
+                np.asarray(p, dtype=np.float64)
+                for p in model.staged_predict(x, prediction_type=pred_type)
+            ]
+        else:
+            staged = [np.asarray(p, dtype=np.float64) for p in model.staged_predict(x)]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        config = {
+            "scenario": f"leaf_methods/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": loss,
+            "leaf_estimation_method": estimator,
+            "boost_from_average": bfa,
+            "params": params,
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "prediction_type": pred_type or "RawFormulaVal",
+            "stages": ["Splits", "LeafValues", "StagedApprox"],
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (raw approximant / logit)"
+            ),
+            "leaf_formula_note": (
+                "Gradient: CalcAverage(SumDer,SumWeights,scaledL2). "
+                "Newton: SumDer/(-SumDer2+scaledL2) (Logloss der2=-p(1-p) makes it "
+                "distinct from Gradient; RMSE der2=-1 makes Newton==Gradient). "
+                "Exact: CalcOneDimensionalOptimumConstApprox -> weighted quantile "
+                "(MAE alpha=0.5,delta=1e-6) of leaf residuals (target-approx). "
+                "Simple: == Gradient leaf-delta (A6, CalcLeafDeltasSimple Gradient "
+                "branch)."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -592,6 +716,10 @@ def main() -> None:
     # --- binclf_skeleton (Logloss training oracle, D-07/D-08) ---------------
     gen_binclf_skeleton()
     print(f"Wrote binclf_skeleton oracle fixtures under {BINCLF_SCENARIO}")
+
+    # --- leaf_methods (TRAIN-03 four-method leaf oracle, D-09) --------------
+    gen_leaf_methods()
+    print(f"Wrote leaf_methods oracle fixtures under {LEAF_METHODS}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
