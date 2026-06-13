@@ -65,6 +65,7 @@ OVERFIT = FIXTURES / "overfit"
 OVERFIT_INPUT = INPUTS / "overfit_eval"
 EVAL_METRICS = FIXTURES / "eval_metrics"
 EVAL_METRICS_INPUT = INPUTS / "eval_metrics"
+AUTOLR = FIXTURES / "autolr"
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -1322,6 +1323,112 @@ def gen_eval_metrics() -> None:
             fh.write("\n")
 
 
+def gen_autolr() -> None:
+    """autolr/{rmse,logloss}/ — the TRAIN-08 automatic learning-rate oracle.
+
+    Trains an RMSE regressor and a Logloss classifier WITHOUT setting
+    `learning_rate`, `leaf_estimation_method`, `leaf_estimation_iterations`, or
+    `l2_leaf_reg` — the exact four-param gate upstream's `UpdateLearningRate`
+    (`options_helper.cpp:269-288`) checks before invoking
+    `TAutoLRParamsGuesser`. With all four unset (and a fixed `iterations` and a
+    dataset of known object count) CatBoost auto-selects the learning rate via
+    the coefficient table keyed by (target, CPU, useBestModel, boostFromAverage)
+    and the exp/log/round formula.
+
+    The persisted oracle value is `model.get_all_params()['learning_rate']` — the
+    upstream-selected rate the Rust `autolr::guess` must reproduce to <= 1e-5.
+    All keying inputs (target type, use_best_model, boost_from_average,
+    learn_object_count, iterations) are recorded in config.json so the unit test
+    asserts the formula on the exact key + inputs CatBoost used (no eval set, so
+    use_best_model defaults to False; boost_from_average defaults True for RMSE,
+    False for Logloss — Pitfall 2). Python-reachable oracle only (D-11)."""
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y_cont = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    learn_object_count = int(x.shape[0])
+
+    # A fixed iteration count != 1000 so the custIter/defIter ratio is exercised
+    # (defIter is computed at iterCount=1000 in the formula).
+    iterations = 500
+
+    # NOTE: deliberately DO NOT set learning_rate / leaf_estimation_method /
+    # leaf_estimation_iterations / l2_leaf_reg, so the auto-LR gate fires. Also
+    # do NOT set bootstrap_type/random_strength here — they do not affect the
+    # learning-rate guess (a pure pre-train scalar of size/iters/key), and the
+    # parity assertion is on get_all_params()['learning_rate'] only, not splits.
+    scenarios = [
+        {
+            "name": "rmse",
+            "loss_function": "RMSE",
+            "target_type": "RMSE",
+            "boost_from_average": True,  # upstream default for RMSE (Pitfall 2)
+            "model_cls": CatBoostRegressor,
+            "y": _assert_f64(y_cont.astype(np.float64), "autolr rmse y"),
+        },
+        {
+            "name": "logloss",
+            "loss_function": "Logloss",
+            "target_type": "Logloss",
+            "boost_from_average": False,  # upstream default for Logloss
+            "model_cls": CatBoostClassifier,
+            "y": (y_cont > np.median(y_cont)).astype(np.int64),
+        },
+    ]
+
+    for sc in scenarios:
+        params = {
+            "iterations": iterations,
+            "loss_function": sc["loss_function"],
+            "depth": 2,
+            "random_seed": SEED,
+            "thread_count": 1,
+            "verbose": False,
+        }
+        model = sc["model_cls"](**params)
+        model.fit(x, sc["y"])
+
+        all_params = model.get_all_params()
+        selected_lr = float(all_params["learning_rate"])
+        # use_best_model: no eval set => defaults to False (and stays False).
+        use_best_model = bool(all_params.get("use_best_model", False))
+        boost_from_average = bool(
+            all_params.get("boost_from_average", sc["boost_from_average"])
+        )
+
+        scenario_dir = AUTOLR / sc["name"]
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        config = {
+            "scenario": f"autolr/{sc['name']}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": sc["loss_function"],
+            # The auto-LR keying inputs the Rust guess() consumes.
+            "target_type": sc["target_type"],
+            "task_type": "CPU",
+            "use_best_model": use_best_model,
+            "boost_from_average": boost_from_average,
+            "learn_object_count": learn_object_count,
+            "iterations": iterations,
+            # The upstream-selected learning rate (the parity target, <= 1e-5).
+            "selected_learning_rate": selected_lr,
+            "gate_note": (
+                "learning_rate / leaf_estimation_method / "
+                "leaf_estimation_iterations / l2_leaf_reg are ALL unset so "
+                "TAutoLRParamsGuesser fires (options_helper.cpp:269-288)."
+            ),
+            "formula_note": (
+                "lr = round(min(exp(A*ln(N)+B) * exp(C*ln(iter)+D) / "
+                "exp(C*ln(1000)+D), 0.5), 6) with coeffs {A,B,C,D} keyed by "
+                "(target_type, CPU, use_best_model, boost_from_average)."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -1417,6 +1524,10 @@ def main() -> None:
     # --- eval_metrics (TRAIN-07 per-iteration eval-set metric logging, D-10) -
     gen_eval_metrics()
     print(f"Wrote eval_metrics oracle fixtures under {EVAL_METRICS}")
+
+    # --- autolr (TRAIN-08 automatic learning-rate selection, D-10) ----------
+    gen_autolr()
+    print(f"Wrote autolr oracle fixtures under {AUTOLR}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()

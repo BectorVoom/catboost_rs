@@ -1,0 +1,17 @@
+{
+  "boost_from_average": true,
+  "catboost_version": "1.2.10",
+  "formula_note": "lr = round(min(exp(A*ln(N)+B) * exp(C*ln(iter)+D) / exp(C*ln(1000)+D), 0.5), 6) with coeffs {A,B,C,D} keyed by (target_type, CPU, use_best_model, boost_from_average).",
+  "gate_note": "learning_rate / leaf_estimation_method / leaf_estimation_iterations / l2_leaf_reg are ALL unset so TAutoLRParamsGuesser fires (options_helper.cpp:269-288).",
+  "input_dataset": "numeric_tiny",
+  "iterations": 500,
+  "learn_object_count": 50,
+  "loss_function": "RMSE",
+  "scenario": "autolr/rmse",
+  "seed": 0,
+  "selected_learning_rate": 0.044808000326156616,
+  "target_type": "RMSE",
+  "task_type": "CPU",
+  "thread_count": 1,
+  "use_best_model": false
+}
