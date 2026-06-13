@@ -9,3 +9,7 @@ workspace = true
 
 [dependencies]
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
+cb-core = { path = "../cb-core" }
+thiserror.workspace = true
+arrow.workspace = true
+polars.workspace = true

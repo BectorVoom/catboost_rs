@@ -50,5 +50,8 @@ jobs:
       - name: anyhow ban backstop (D-14)
         run: bash scripts/check-no-anyhow.sh
 
+      - name: raw float summation ban backstop (D-08)
+        run: bash scripts/check-no-raw-float-sum.sh
+
       - name: source/test separation gate (D-17 / INFRA-06)
         run: bash scripts/check-source-test-separation.sh
