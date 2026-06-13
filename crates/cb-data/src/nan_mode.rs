@@ -68,8 +68,23 @@ impl NanMode {
 /// identical index.
 ///
 /// `borders` MUST be sorted ascending (the binarizer guarantees this).
+///
+/// # Budget invariant (WR-06)
+///
+/// A bin index is at most `borders.len()`, returned as a `u32`. Float callers
+/// guarantee a border set bounded by the per-feature budget (`< 65536`, the
+/// `u16` bin cap enforced by the width selector, `utils.h:175-181`), so the cast
+/// never truncates a real bin index. A `debug_assert!` documents and checks this
+/// at the public boundary so a future caller passing an oversized border set
+/// (e.g. a categorical reuse with `> u32::MAX` borders) trips in debug builds
+/// rather than silently truncating.
 #[must_use]
 pub fn bin_of(borders: &[f32], value: f32) -> u32 {
+    debug_assert!(
+        borders.len() <= u32::MAX as usize,
+        "bin_of: border count {} exceeds u32::MAX; the u32 bin index would truncate",
+        borders.len()
+    );
     // ui32 GetBinFromBorders(borders, value): count of `value > border`.
     let index = if borders.len() <= LINEAR_SCAN_THRESHOLD {
         // for (border : borders) bin += (value > border);  -- equal -> lower bin.
@@ -80,7 +95,8 @@ pub fn bin_of(borders: &[f32], value: f32) -> u32 {
         borders.partition_point(|&border| border < value)
     };
     // Border counts are bounded by the budget (<= 65535 for float, asserted by
-    // the width selector), so this cast cannot truncate a real bin index.
+    // the width selector and the debug_assert above), so this cast cannot
+    // truncate a real bin index.
     index as u32
 }
 
@@ -137,7 +153,15 @@ pub fn nan_bin(mode: NanMode, borders: &[f32]) -> u32 {
         // dedicated NaN bin.
         NanMode::Min | NanMode::Forbidden => 0,
         // NaN -> top bin; the Max sentinel at the end makes the last bin the
-        // dedicated NaN bin.
-        NanMode::Max => borders.len() as u32,
+        // dedicated NaN bin. Same budget invariant as `bin_of` (WR-06 / IN-01):
+        // the float border budget keeps the count well below `u32::MAX`.
+        NanMode::Max => {
+            debug_assert!(
+                borders.len() <= u32::MAX as usize,
+                "nan_bin: border count {} exceeds u32::MAX; the u32 top-bin index would truncate",
+                borders.len()
+            );
+            borders.len() as u32
+        }
     }
 }
