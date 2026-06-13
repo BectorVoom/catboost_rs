@@ -601,6 +601,18 @@ dependencies = [
 [[package]]
 name = "catboost-rs"
 version = "0.1.0"
+dependencies = [
+ "cb-backend",
+ "cb-compute",
+ "cb-core",
+ "cb-data",
+ "cb-model",
+ "cb-oracle",
+ "cb-train",
+ "ndarray",
+ "ndarray-npy",
+ "thiserror",
+]
 
 [[package]]
 name = "cb-backend"

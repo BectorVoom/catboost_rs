@@ -10,3 +10,18 @@ workspace = true
 [dependencies]
 # D-15 default: the published facade is treated as a thiserror-only LIBRARY —
 # `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
+cb-core = { path = "../cb-core" }
+cb-data = { path = "../cb-data" }
+cb-compute = { path = "../cb-compute" }
+cb-backend = { path = "../cb-backend" }
+cb-train = { path = "../cb-train" }
+cb-model = { path = "../cb-model" }
+thiserror.workspace = true
+
+[dev-dependencies]
+# Oracle harness + npy readers for the end-to-end train->serialize->load->predict
+# parity integration test (RAPI-01 / ROADMAP criterion 5). Test/dev edge only
+# (D-14/D-15).
+cb-oracle = { path = "../cb-oracle" }
+ndarray.workspace = true
+ndarray-npy.workspace = true
