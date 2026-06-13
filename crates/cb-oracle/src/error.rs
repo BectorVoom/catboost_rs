@@ -57,6 +57,15 @@ pub enum OracleError {
         diff: f64,
     },
 
+    /// A parsed `model.json` did not have the expected shape (e.g. a malformed
+    /// `scale_and_bias`). Surfaced instead of panicking on a bad oracle file
+    /// (T-03-00-01).
+    #[error("malformed model.json: {what}")]
+    MalformedModel {
+        /// Human-readable description of what was malformed.
+        what: String,
+    },
+
     /// Failed to read a `.npy` fixture (bad header, dtype mismatch, etc.).
     #[error("failed to read .npy fixture: {0}")]
     Npy(#[from] ndarray_npy::ReadNpyError),

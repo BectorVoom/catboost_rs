@@ -19,12 +19,16 @@
 mod compare;
 mod error;
 mod fixture;
+mod model_json;
 
 pub use compare::{assert_abs_close, compare_stage, Stage};
 pub use error::OracleError;
 pub use fixture::{load_config, load_f64_vec, FixtureConfig};
+pub use model_json::{load_model_json, ModelJson, ObliviousTree, SplitJson};
 
 #[cfg(test)]
 mod compare_test;
 #[cfg(test)]
 mod fixture_test;
+#[cfg(test)]
+mod model_json_test;
