@@ -11,3 +11,5 @@ workspace = true
 # D-03: cb-compute is a PURE-GENERIC crate. It MUST NOT depend on `cubecl` or any
 # backend runtime — the concrete runtime is bound only in `cb-backend` (D-02).
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
+cb-core = { path = "../cb-core" }
+cb-data = { path = "../cb-data" }

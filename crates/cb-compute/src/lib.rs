@@ -1,4 +1,40 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-//! `cb-compute` — pure-generic compute boundary. Stub only; the generic
-//! `R: Runtime` / `F: Float` seam (with NO cubecl dependency, D-03) is realized
-//! in Phase 3 (D-05).
+//! `cb-compute` — the pure-generic compute boundary and host-side training math
+//! (D-03/D-04). This crate defines the abstract [`Runtime`] / [`Float`] traits
+//! the `cb-backend` CubeCL `CpuRuntime` implements, plus the host-side
+//! parity-critical math: per-loss derivatives ([`loss`]), the ordered bucket
+//! reduction ([`histogram`]), the L2 split score ([`score`]), and the
+//! L2-regularized leaf estimation ([`leaf`]).
+//!
+//! # No `cubecl` (D-03)
+//!
+//! This crate MUST NOT depend on `cubecl`. The concrete runtime is bound only in
+//! `cb-backend`; the GPU runtimes attach additively in Phase 7 without touching
+//! this crate or `cb-train`.
+//!
+//! # Parity discipline (D-02/D-05/D-08)
+//!
+//! Every parity-critical float SUM in this crate routes through
+//! `cb_core::sum_f64` in canonical object order. The backend kernels do ONLY
+//! order-independent elementwise work; the order-sensitive reduction lives here.
+
+mod histogram;
+mod leaf;
+mod loss;
+mod runtime;
+mod score;
+
+pub use histogram::{reduce_leaf_stats, LeafStats};
+pub use leaf::{calc_average, gradient_leaf_delta, scale_l2_reg};
+pub use loss::{logloss_der1, logloss_der2, rmse_der1, rmse_der2, sigmoid};
+pub use runtime::{Derivatives, Float, Loss, Runtime};
+pub use score::{add_leaf_plain, l2_split_score, MINIMAL_SCORE};
+
+#[cfg(test)]
+mod histogram_test;
+#[cfg(test)]
+mod leaf_test;
+#[cfg(test)]
+mod loss_test;
+#[cfg(test)]
+mod score_test;
