@@ -1,0 +1,35 @@
+{
+  "boost_from_average": true,
+  "catboost_version": "1.2.10",
+  "draw_note": "l2: pure ScaleL2Reg scaling, no RNG draws. random_strength=1.0: TRandomScore::GetInstance adds StdNormalDistribution(rand)*scoreStDev per candidate; scoreStDev = random_strength * sqrt(sum(weightedDer^2)/n) * (modelLeft/(1+modelLeft)), modelLeft=exp(log(n)-treeIdx*lr); SetBestScore reseeds TRestorableFastRng64(Rand.GenRand()+taskIdx).Advance(10) per feature, SelectBestCandidate draws once per feature from the main Rand. bagging_temp=0.5: Bayesian weight powf(-FastLogf(GenRandReal1()+1e-100),temp).",
+  "input_dataset": "numeric_tiny",
+  "loss_function": "RMSE",
+  "n_features": 4,
+  "n_iterations": 3,
+  "n_rows": 50,
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 3,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "random_seed": 0,
+    "random_strength": 1.0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "regularization/random_strength",
+  "seed": 0,
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw approximant)",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "thread_count": 1
+}

@@ -22,7 +22,7 @@
 //! [`cb_core::sum_f64`] so even the score fold honors the single-primitive rule;
 //! no raw iterator-sum or zero-seeded float fold is spelled here (D-08).
 
-use cb_core::sum_f64;
+use cb_core::{std_normal, sum_f64, TFastRng64};
 
 use crate::histogram::LeafStats;
 use crate::leaf::calc_average;
@@ -52,4 +52,70 @@ pub fn l2_split_score(leaves: &[LeafStats], scaled_l2: f64) -> f64 {
         .map(|&stats| add_leaf_plain(stats, scaled_l2))
         .collect();
     sum_f64(&terms)
+}
+
+// ----------------------------------------------------------------------------
+// random_strength split-score perturbation (TRAIN-05).
+//
+// `random_strength != 0` adds a normal perturbation to every candidate split
+// score, drawn from `TFastRng64` via the exact Box-Muller/Marsaglia-polar
+// `std_normal`. Parity hinges on (a) the perturbation MAGNITUDE `scoreStDev`
+// (`CalcScoreStDev`) and (b) the per-candidate draw ORDER (Pitfall 3 — wired in
+// `cb-train::tree`). These helpers own (a) and the single-candidate `GetInstance`.
+// ----------------------------------------------------------------------------
+
+/// `CalcDerivativesStDevFromZeroPlainBoosting`
+/// (`greedy_tensor_search.cpp:92-107`): the RMS of the (weighted) first
+/// derivatives over all objects, `sqrt(sum(wd_i^2) / n)`. This is the per-tree
+/// scale the `random_strength` perturbation is measured in.
+///
+/// The sum of squares routes through the sanctioned ordered reduction
+/// ([`sum_f64`], D-08); an empty derivative vector returns `0.0` (guarded, no
+/// divide-by-zero — the trainer never grows a tree on an empty fold).
+#[must_use]
+pub fn derivatives_std_dev_from_zero(weighted_der1: &[f64]) -> f64 {
+    let n = weighted_der1.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let squares: Vec<f64> = weighted_der1.iter().map(|&d| d * d).collect();
+    (sum_f64(&squares) / n as f64).sqrt()
+}
+
+/// `CalcDerivativesStDevFromZeroMultiplier` (`greedy_tensor_search.cpp:125-129`):
+/// the model-size-decrease multiplier of the default `random_score_type`
+/// (`NormalWithModelSizeDecrease`). `modelLength` is `treeIndex * learning_rate`;
+/// `modelLeft = exp(ln(n) - modelLength)` and the multiplier is
+/// `modelLeft / (1 + modelLeft)`, shrinking the perturbation as the model grows.
+#[must_use]
+fn model_size_multiplier(n: usize, model_length: f64) -> f64 {
+    let model_exp_length = (n as f64).ln();
+    let model_left = (model_exp_length - model_length).exp();
+    model_left / (1.0 + model_left)
+}
+
+/// `CalcScoreStDev` (`greedy_tensor_search.cpp:851-866`): the standard deviation
+/// of the `random_strength` split-score perturbation,
+/// `random_strength * derivativesStDevFromZero * modelSizeMultiplier` for the
+/// default `random_score_type = NormalWithModelSizeDecrease`.
+///
+/// `weighted_der1` is the per-object weighted first derivative (the same fold the
+/// score histogram reduces); `model_length = tree_index * learning_rate`. A
+/// `random_strength` of `0.0` yields `0.0` (no perturbation — the first-slice
+/// behaviour where no normal magnitude is applied).
+#[must_use]
+pub fn score_st_dev(random_strength: f64, weighted_der1: &[f64], model_length: f64) -> f64 {
+    let dsdz = derivatives_std_dev_from_zero(weighted_der1);
+    let mult = model_size_multiplier(weighted_der1.len(), model_length);
+    random_strength * dsdz * mult
+}
+
+/// `TRandomScore::GetInstance` for the Normal distribution (`rand_score.h:42-49`):
+/// `Val + NormalDistribution<double>(rand, 0, StDev) = Val + std_normal(rand) *
+/// StDev`. The normal is ALWAYS drawn (even at `StDev == 0`), so the RNG advances
+/// by exactly one `std_normal` per call — the per-candidate draw order the
+/// parity contract depends on (Pitfall 3) stays aligned regardless of `StDev`.
+#[must_use]
+pub fn random_score_instance(val: f64, std_dev: f64, rng: &mut TFastRng64) -> f64 {
+    val + std_normal(rng) * std_dev
 }

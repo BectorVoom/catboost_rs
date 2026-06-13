@@ -29,8 +29,8 @@
 //! [`CbError::DepthExceeded`] BEFORE any `2^depth` allocation (T-03-01-02). No
 //! `unwrap`/`expect`/raw float fold (deny-lints + D-08).
 
-use cb_compute::{l2_split_score, reduce_leaf_stats, LeafStats, MINIMAL_SCORE};
-use cb_core::{CbError, CbResult};
+use cb_compute::{l2_split_score, random_score_instance, reduce_leaf_stats, LeafStats, MINIMAL_SCORE};
+use cb_core::{CbError, CbResult, TFastRng64};
 
 // Tests live in dedicated sibling files (source/test separation, CLAUDE.md /
 // AGENTS.md — no test body in this production file). Mounted as CHILD modules of
@@ -214,48 +214,201 @@ pub fn greedy_tensor_search_oblivious(
     depth: usize,
     n_objects: usize,
 ) -> CbResult<GrownTree> {
+    // The unperturbed path is `random_strength == 0` with no RNG draws — exactly
+    // the first-slice behaviour. Delegate to the perturbed search with `None`.
+    greedy_tensor_search_oblivious_perturbed(
+        matrix, der1, weight, scaled_l2, depth, n_objects, None,
+    )
+}
+
+/// The `random_strength` split-score perturbation state threaded through the
+/// greedy search (`TRandomScore` / `SetBestScore` / `SelectBestCandidate`,
+/// TRAIN-05). When supplied, every candidate score is perturbed by a normal draw
+/// in the EXACT upstream order; when `None`, the search is the deterministic
+/// first-slice path with zero RNG draws.
+pub struct Perturbation<'a> {
+    /// The persistent training RNG (`LearnProgress->Rand`). Consumed in upstream
+    /// draw order: per level one `gen_rand` for the per-feature reseed seed, then
+    /// one `std_normal` per candidate feature in `SelectBestCandidate`.
+    pub rng: &'a mut TFastRng64,
+    /// `scoreStDev` (`CalcScoreStDev`): the perturbation magnitude for this tree
+    /// (`random_strength * derivativesStDevFromZero * modelSizeMultiplier`).
+    pub score_st_dev: f64,
+}
+
+/// Grow one oblivious tree with the OPTIONAL `random_strength` perturbation
+/// (`GreedyTensorSearchOblivious` + `SetBestScore`/`SelectBestCandidate`).
+///
+/// Per level the upstream CPU single-host draw order is reproduced EXACTLY when
+/// `perturb` is `Some` (Pitfall 3):
+///
+/// 1. `randSeed = Rand.GenRand()` — one draw from the main RNG (`CalcScores`,
+///    `greedy_tensor_search.cpp:884`).
+/// 2. `SetBestScore` (per candidate FEATURE `taskIdx`, `tensor_search_helpers.cpp:716`):
+///    a FRESH `TFastRng64::from_seed(randSeed + taskIdx).advance(10)`, then per
+///    border `instance = score + std_normal(featRng) * scoreStDev`, keeping the
+///    border with the strict-max `instance` as that feature's `BestScore`
+///    (Val = winning raw score, StDev = scoreStDev).
+/// 3. `SelectBestCandidate` (`:948-966`): per feature ONE
+///    `instance = BestScore.GetInstance(Rand)` from the MAIN RNG, then strict
+///    `gain > bestGain` first-wins. `gain = instance - scoreBeforeSplit`; since
+///    `scoreBeforeSplit` is the same constant for every candidate at a level and
+///    there are no feature weights here, the argmax of `gain` equals the argmax
+///    of `instance` — so the strict `instance > best` first-wins is exact.
+///
+/// When `perturb` is `None`, no RNG is touched and the search is the plain
+/// strict-`>` L2 argmax (the first-slice / `random_strength == 0` path).
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `depth > MAX_DEPTH` (before allocation).
+/// - [`CbError::Degenerate`] if a level has no candidate split at all.
+pub fn greedy_tensor_search_oblivious_perturbed(
+    matrix: &FeatureMatrix,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    depth: usize,
+    n_objects: usize,
+    mut perturb: Option<Perturbation<'_>>,
+) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
     let mut chosen: Vec<Split> = Vec::with_capacity(depth);
 
     for _level in 0..depth {
-        // Enumerate candidates in upstream order: feature ascending, border
-        // ascending within feature (the borders are stored ascending).
-        let mut candidates: Vec<Candidate> = Vec::new();
-        for feature in 0..matrix.n_features() {
-            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-            for &border in borders {
-                let score = score_candidate(
-                    matrix,
-                    &chosen,
-                    Split { feature, border },
-                    der1,
-                    weight,
-                    scaled_l2,
-                    n_objects,
-                );
-                candidates.push(Candidate {
-                    feature,
-                    border,
-                    score,
-                });
+        let best = match perturb.as_mut() {
+            None => select_level_plain(matrix, &chosen, der1, weight, scaled_l2, n_objects)?,
+            Some(p) => {
+                select_level_perturbed(matrix, &chosen, der1, weight, scaled_l2, n_objects, p)?
             }
-        }
-
-        let best = select_best_candidate(&candidates).ok_or_else(|| {
-            CbError::Degenerate(
-                "no candidate split available (no feature has any border)".to_owned(),
-            )
-        })?;
-        chosen.push(Split {
-            feature: best.feature,
-            border: best.border,
-        });
+        };
+        chosen.push(best);
     }
 
     let leaf_of = assign_leaves(matrix, &chosen, n_objects);
     Ok(GrownTree {
         splits: chosen,
         leaf_of,
+    })
+}
+
+/// One level of the UNPERTURBED search: enumerate candidates in upstream order
+/// (feature ascending, border ascending), score each via the L2 calcer, and pick
+/// the strict first-wins best. No RNG draws (the first-slice path).
+fn select_level_plain(
+    matrix: &FeatureMatrix,
+    chosen: &[Split],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+) -> CbResult<Split> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        for &border in borders {
+            let score = score_candidate(
+                matrix,
+                chosen,
+                Split { feature, border },
+                der1,
+                weight,
+                scaled_l2,
+                n_objects,
+            );
+            candidates.push(Candidate {
+                feature,
+                border,
+                score,
+            });
+        }
+    }
+    let best = select_best_candidate(&candidates).ok_or_else(|| {
+        CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+    })?;
+    Ok(Split {
+        feature: best.feature,
+        border: best.border,
+    })
+}
+
+/// One level of the PERTURBED search reproducing the upstream two-pass draw order
+/// (`SetBestScore` then `SelectBestCandidate`, Pitfall 3). See
+/// [`greedy_tensor_search_oblivious_perturbed`] for the draw contract.
+fn select_level_perturbed(
+    matrix: &FeatureMatrix,
+    chosen: &[Split],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+    perturb: &mut Perturbation<'_>,
+) -> CbResult<Split> {
+    let std_dev = perturb.score_st_dev;
+
+    // (1) randSeed = Rand.GenRand() — one main-RNG draw per level (CalcScores).
+    let rand_seed = perturb.rng.gen_rand();
+
+    // (2) SetBestScore: per candidate FEATURE (taskIdx ascending) reseed a fresh
+    //     RNG and pick the strict-best border WITHIN the feature by perturbed
+    //     instance. The chosen border's RAW score is that feature's BestScore.Val.
+    //     A feature with no border is not a candidate (taskIdx skips it), matching
+    //     upstream where empty candidate lists produce no task.
+    let mut feature_best: Vec<Option<(f64, f64)>> = Vec::with_capacity(matrix.n_features());
+    let mut task_idx: u64 = 0;
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        if borders.is_empty() {
+            feature_best.push(None);
+            continue;
+        }
+        // TRestorableFastRng64(randSeed + taskIdx); rand.Advance(10).
+        let mut feat_rng = TFastRng64::from_seed(rand_seed.wrapping_add(task_idx));
+        feat_rng.advance(10);
+        task_idx += 1;
+
+        let mut best_instance = MINIMAL_SCORE;
+        let mut best_border: f64 = 0.0;
+        let mut best_raw: f64 = MINIMAL_SCORE;
+        for &border in borders {
+            let raw = score_candidate(
+                matrix,
+                chosen,
+                Split { feature, border },
+                der1,
+                weight,
+                scaled_l2,
+                n_objects,
+            );
+            // scoreInstance = scoreWoNoise + std_normal(featRng) * scoreStDev.
+            let instance = random_score_instance(raw, std_dev, &mut feat_rng);
+            // Strict `>` first-wins on the per-feature border (SetBestScore).
+            if instance > best_instance {
+                best_instance = instance;
+                best_border = border;
+                best_raw = raw;
+            }
+        }
+        feature_best.push(Some((best_border, best_raw)));
+    }
+
+    // (3) SelectBestCandidate: per feature ONE GetInstance(Rand) from the MAIN
+    //     RNG; strict `gain > bestGain` first-wins (scoreBeforeSplit cancels in
+    //     the argmax, no feature weights here).
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut chosen_split: Option<Split> = None;
+    for (feature, slot) in feature_best.iter().enumerate() {
+        let &Some((border, raw)) = slot else {
+            continue;
+        };
+        let instance = random_score_instance(raw, std_dev, perturb.rng);
+        if instance > best_gain {
+            best_gain = instance;
+            chosen_split = Some(Split { feature, border });
+        }
+    }
+
+    chosen_split.ok_or_else(|| {
+        CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
     })
 }

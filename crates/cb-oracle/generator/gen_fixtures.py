@@ -60,6 +60,7 @@ CLASS_WEIGHTS = FIXTURES / "class_weights"
 LEAF_METHODS = FIXTURES / "leaf_methods"
 BOOTSTRAP = FIXTURES / "bootstrap"
 BOOTSTRAP_INPUT = INPUTS / "bootstrap_multiblock"
+REGULARIZATION = FIXTURES / "regularization"
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -794,6 +795,140 @@ def gen_bootstrap() -> None:
             fh.write("\n")
 
 
+def gen_regularization() -> None:
+    """regularization/{l2,random_strength,bagging_temp}/ — the TRAIN-05 (D-10)
+    regularization oracle. Each scenario varies ONE regularization knob and pins
+    every OTHER knob at the first-slice simplified isolating values, so an
+    end-to-end divergence is attributable to that single knob (Pitfall 3 for
+    random_strength; the Bayesian draw stream for bagging_temp).
+
+    Trained on the TINY `numeric_tiny` corpus (50 objects, 4 features, single RNG
+    block) so a `random_strength` divergence is localizable at tree granularity
+    (Open Q4 / D-11: end-to-end lock on a tiny dataset; C++ instrumentation is
+    escalated only if it genuinely cannot be localized).
+
+    SCENARIOS:
+      - l2             : random_strength=0, bootstrap_type=No, l2_leaf_reg=10.0
+        (distinct from the skeleton's 3.0). Pure `ScaleL2Reg` scaling in the
+        score (CalcAverage) and the leaf delta — NO RNG draws. Verifies the L2
+        path tracks a varied regularizer end-to-end.
+      - random_strength: random_strength=1.0, bootstrap_type=No, l2_leaf_reg=3.0.
+        Turns the split-score perturbation ON. Per scored candidate
+        `TRandomScore::GetInstance` adds `StdNormalDistribution(rand)*scoreStDev`
+        where `scoreStDev = random_strength * derivativesStDevFromZero *
+        CalcDerivativesStDevFromZeroMultiplier(n, modelLength)` (default
+        random_score_type=NormalWithModelSizeDecrease). The Box-Muller draw
+        consumes a VARIABLE number of GenRandReal1 uniforms per candidate
+        (Pitfall 3) — the parity landmine this scenario locks.
+      - bagging_temp   : bootstrap_type=Bayesian, bagging_temperature=0.5
+        (distinct from the bootstrap oracle's 1.0), random_strength=0. Drives the
+        Bayesian weight exponent `powf(-FastLogf(GenRandReal1()+1e-100), temp)`.
+
+    UPSTREAM RANDOM_STRENGTH DRAW SEMANTICS (CPU single-host, transcribed from
+    greedy_tensor_search.cpp / tensor_search_helpers.cpp / rand_score.h for the
+    Rust implementation):
+      - modelLength = treeIndex * learning_rate (train.cpp:177-178).
+      - derivativesStDevFromZero (Plain) = sqrt(sum(weightedDer^2) / nObjects)
+        (CalcDerivativesStDevFromZeroPlainBoosting, :92-107).
+      - multiplier = modelLeft/(1+modelLeft), modelLeft = exp(log(n) - modelLength)
+        (CalcDerivativesStDevFromZeroMultiplier, :125-129).
+      - scoreStDev = random_strength * derivativesStDevFromZero * multiplier (:861).
+      - Per level: randSeed = Rand.GenRand() (CalcScores, :884).
+      - SetBestScore (per candidate/feature taskIdx, tensor_search_helpers.cpp:716):
+        TRestorableFastRng64(randSeed + taskIdx); rand.Advance(10); then per
+        border `scoreInstance = scoreWoNoise + StdNormalDistribution(rand)*scoreStDev`
+        keeping the border with the max scoreInstance (strict `>`). The kept
+        TRandomScore (Val=winning scoreWoNoise, StDev=scoreStDev) is stored.
+      - SelectBestCandidate (greedy_tensor_search.cpp:948-966): per candidate ONE
+        `score = candidate.BestScore.GetInstance(Rand)` from the MAIN persistent
+        Rand (= Val + StdNormalDistribution(Rand)*StDev), then strict
+        `gain > bestGain` first-wins.
+
+    staged.npy stores the per-iteration RAW approximant; model.json carries the
+    learning_rate-scaled leaf_values (the end-to-end <=1e-5 parity targets)."""
+    REGULARIZATION.mkdir(parents=True, exist_ok=True)
+
+    x = _assert_f64(np.load(INPUTS / "numeric_tiny" / "X.npy"), "regularization X")
+    y = _assert_f64(np.load(INPUTS / "numeric_tiny" / "y.npy"), "regularization y")
+
+    # (name, overrides). RMSE + boost_from_average=True (the first-slice
+    # regression path); only the named regularization knob varies per scenario.
+    scenarios = [
+        ("l2", {"l2_leaf_reg": 10.0, "random_strength": 0, "bootstrap_type": "No"}),
+        (
+            "random_strength",
+            {"l2_leaf_reg": 3.0, "random_strength": 1.0, "bootstrap_type": "No"},
+        ),
+        (
+            "bagging_temp",
+            {
+                "l2_leaf_reg": 3.0,
+                "random_strength": 0,
+                "bootstrap_type": "Bayesian",
+                "bagging_temperature": 0.5,
+            },
+        ),
+    ]
+
+    # Shared isolating params. iterations bumped to 3 so the modelLength
+    # multiplier and the continuous RNG stream advance across multiple trees.
+    shared = {**ISOLATING_PARAMS, "iterations": 3, "boost_from_average": True}
+
+    for name, overrides in scenarios:
+        scenario_dir = REGULARIZATION / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        params = {**shared, **overrides}
+
+        model = CatBoostRegressor(**params)
+        model.fit(x, y)
+
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        staged = [np.asarray(p, dtype=np.float64) for p in model.staged_predict(x)]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        predictions = _assert_f64(
+            np.asarray(model.predict(x), dtype=np.float64), "predictions"
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": f"regularization/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": "RMSE",
+            "boost_from_average": True,
+            "params": params,
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (raw approximant)"
+            ),
+            "draw_note": (
+                "l2: pure ScaleL2Reg scaling, no RNG draws. random_strength=1.0: "
+                "TRandomScore::GetInstance adds StdNormalDistribution(rand)*"
+                "scoreStDev per candidate; scoreStDev = random_strength * "
+                "sqrt(sum(weightedDer^2)/n) * (modelLeft/(1+modelLeft)), modelLeft="
+                "exp(log(n)-treeIdx*lr); SetBestScore reseeds "
+                "TRestorableFastRng64(Rand.GenRand()+taskIdx).Advance(10) per "
+                "feature, SelectBestCandidate draws once per feature from the main "
+                "Rand. bagging_temp=0.5: Bayesian weight powf(-FastLogf("
+                "GenRandReal1()+1e-100),temp)."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -877,6 +1012,10 @@ def main() -> None:
     # --- bootstrap (TRAIN-04 sampling oracle, D-10) -------------------------
     gen_bootstrap()
     print(f"Wrote bootstrap oracle fixtures under {BOOTSTRAP}")
+
+    # --- regularization (TRAIN-05 l2/random_strength/bagging_temp, D-10) ----
+    gen_regularization()
+    print(f"Wrote regularization oracle fixtures under {REGULARIZATION}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()

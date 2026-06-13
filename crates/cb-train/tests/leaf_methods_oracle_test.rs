@@ -89,6 +89,7 @@ fn train_scenario(
         depth: 2,
         learning_rate: 0.1,
         l2_leaf_reg: 3.0,
+        random_strength: 0.0,
         boost_from_average,
         leaf_method,
         // Leaf-method scenarios pin sampling off (D-07 isolating discipline).

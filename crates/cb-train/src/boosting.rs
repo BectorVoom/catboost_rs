@@ -26,13 +26,15 @@
 
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta,
-    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, simple_leaf_delta, LeafMethod, Loss,
-    Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev, simple_leaf_delta, LeafMethod,
+    Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
-use crate::tree::{check_depth, greedy_tensor_search_oblivious, FeatureMatrix, Split};
+use crate::tree::{
+    check_depth, greedy_tensor_search_oblivious_perturbed, FeatureMatrix, Perturbation, Split,
+};
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
 /// the fold pick (`Rand.GenRand() % foldCount`) and the derivative-seed draw
@@ -60,6 +62,11 @@ pub struct BoostParams {
     pub learning_rate: f64,
     /// L2 leaf regularization (`l2_leaf_reg`).
     pub l2_leaf_reg: f64,
+    /// Split-score perturbation strength (`random_strength`, TRAIN-05). `0.0`
+    /// disables the perturbation (no normal draws — the first-slice path);
+    /// non-zero turns on the per-candidate `TRandomScore::GetInstance` normal
+    /// draw over the persistent RNG.
+    pub random_strength: f64,
     /// Whether to start from the per-loss optimum constant approx (the target
     /// mean for RMSE), stored as the model bias. `false` starts from `0`.
     pub boost_from_average: bool,
@@ -267,12 +274,18 @@ pub fn train<R: Runtime>(
     //     random-strength seed, consumed even at `random_strength=0`) = `depth`
     //     draws per tree.
     let mut rng = TFastRng64::from_seed(params.random_seed);
-    let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No);
+    // The persistent RNG is consumed when EITHER sampling is active (bootstrap !=
+    // No) OR the `random_strength` perturbation is on. With perturbation the
+    // per-level `randSeed` draw and the `SelectBestCandidate` normal draws are
+    // consumed INLINE by the perturbed tree search (in exact upstream order), so
+    // the bulk POST per-level draws must NOT be applied in that case.
+    let perturb_active = params.random_strength != 0.0;
+    let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No) || perturb_active;
     // MVS lambda for trees after the first uses the previous tree's mean leaf L2
     // norm (`CalculateLastIterMeanLeafValue`); `None` on the first tree.
     let mut prev_leaf_mean_l2: Option<f64> = None;
 
-    for _iter in 0..params.iterations {
+    for iter in 0..params.iterations {
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
         let ders = runtime.compute_gradients(params.loss, &approx, target)?;
 
@@ -327,15 +340,32 @@ pub fn train<R: Runtime>(
             .collect();
 
         // 2. Grow one oblivious tree using the L2 split score over the ordered
-        //    leaf-stat reduction (sampled subset / sample-weighted).
+        //    leaf-stat reduction (sampled subset / sample-weighted). When
+        //    `random_strength != 0`, the per-candidate `TRandomScore` normal
+        //    perturbation is drawn from the persistent RNG in upstream order
+        //    (`scoreStDev = random_strength * derivativesStDevFromZero *
+        //    modelSizeMultiplier`, `modelLength = iter * learning_rate`); the
+        //    perturbation uses the SCORE-path weighted derivatives (the same fold
+        //    `derivativesStDevFromZero` is computed over upstream).
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
-        let grown = greedy_tensor_search_oblivious(
+        let perturb = if perturb_active {
+            let model_length = iter as f64 * params.learning_rate;
+            let std_dev = score_st_dev(params.random_strength, &score_weighted_der1, model_length);
+            Some(Perturbation {
+                rng: &mut rng,
+                score_st_dev: std_dev,
+            })
+        } else {
+            None
+        };
+        let grown = greedy_tensor_search_oblivious_perturbed(
             &matrix,
             &score_weighted_der1,
             &score_weights,
             scaled_l2,
             params.depth,
             n,
+            perturb,
         )?;
 
         // 3. Leaf values via the selected estimation method (TRAIN-03 / D-09),
@@ -371,11 +401,30 @@ pub fn train<R: Runtime>(
             out.extend_from_slice(&approx);
         }
 
-        // POST-bootstrap per-depth-level draws (greedy_tensor_search.cpp:884):
-        // CalcScores draws ONE Rand.GenRand() per level (the random-strength
-        // seed, drawn even at random_strength=0). Keep the RNG phase-aligned for
-        // the next tree's Bootstrap.
-        if draws_active {
+        // POST per-tree draws. Two distinct main-RNG consumers run AFTER the tree
+        // structure is grown:
+        //   (a) the per-level `CalcScores` randSeed (greedy_tensor_search.cpp:884)
+        //       — ONE `Rand.GenRand()` per level; and
+        //   (b) the leaf-estimation seed (train.cpp:303,
+        //       `GenRandUI64Vector(foldCount, Rand.GenRand())`) — ONE
+        //       `Rand.GenRand()` per TREE, drawn once the tree is built.
+        // When the perturbation is OFF but sampling is on, (a) is not observable
+        // individually, so the prior wave folds (a)+(b) into a single bulk
+        // `depth + 1` advance that keeps the next tree's Bootstrap phase-aligned.
+        // When the perturbation is ON, the perturbed search ALREADY consumed (a)'s
+        // randSeed AND the `SelectBestCandidate` normal draws inline in exact
+        // upstream order, so only (b) — the single leaf-estimation seed draw —
+        // remains to be consumed here (train.cpp:303). This source-faithful draw
+        // locks the FIRST tree end-to-end (splits + leaf values <= 1e-5); a
+        // per-tree main-RNG phase drift remains for tree-1+ (the variable-length
+        // normal-draw accounting could not be localized at tree granularity
+        // without C++ instrumentation of `LearnProgress->Rand` — escalated to
+        // D-11 / Open Q4, see the regularization oracle test header and SUMMARY).
+        if perturb_active {
+            for _ in 0..POST_TREE_EXTRA_DRAWS {
+                rng.gen_rand();
+            }
+        } else if draws_active {
             for _ in 0..(params.depth + POST_TREE_EXTRA_DRAWS) {
                 rng.gen_rand();
             }

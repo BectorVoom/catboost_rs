@@ -36,7 +36,10 @@ pub use loss::{
     QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 pub use runtime::{Derivatives, Float, Loss, Runtime};
-pub use score::{add_leaf_plain, l2_split_score, MINIMAL_SCORE};
+pub use score::{
+    add_leaf_plain, derivatives_std_dev_from_zero, l2_split_score, random_score_instance,
+    score_st_dev, MINIMAL_SCORE,
+};
 
 #[cfg(test)]
 mod histogram_test;

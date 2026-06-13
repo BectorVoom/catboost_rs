@@ -607,12 +607,18 @@ name = "cb-backend"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cb-compute",
+ "cb-core",
  "cubecl",
 ]
 
 [[package]]
 name = "cb-compute"
 version = "0.1.0"
+dependencies = [
+ "cb-core",
+ "cb-data",
+]
 
 [[package]]
 name = "cb-core"
@@ -656,6 +662,16 @@ dependencies = [
 [[package]]
 name = "cb-train"
 version = "0.1.0"
+dependencies = [
+ "approx",
+ "cb-backend",
+ "cb-compute",
+ "cb-core",
+ "cb-data",
+ "cb-oracle",
+ "ndarray",
+ "ndarray-npy",
+]
 
 [[package]]
 name = "cc"

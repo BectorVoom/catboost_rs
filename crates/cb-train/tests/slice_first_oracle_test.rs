@@ -75,6 +75,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         depth: 2,
         learning_rate: 0.1,
         l2_leaf_reg: 3.0,
+        random_strength: 0.0,
         boost_from_average,
         leaf_method: LeafMethod::Gradient,
         // First-slice isolating params: sampling disabled (D-07).
