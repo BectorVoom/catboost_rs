@@ -1,0 +1,21 @@
+[package]
+name = "cb-oracle"
+version = "0.1.0"
+edition = "2021"
+description = "Oracle parity harness: read committed fixtures and compare to actuals at <= 1e-5"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ndarray.workspace = true
+ndarray-npy.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+cb-core = { path = "../cb-core" }
+
+[dev-dependencies]
+# Permitted at test/dev edges only (D-14/D-15).
+approx.workspace = true
+anyhow.workspace = true
