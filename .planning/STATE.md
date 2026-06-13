@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 04-03-PLAN.md (.cbm + model.json serialization)
-last_updated: "2026-06-13T20:56:49.679Z"
-last_activity: 2026-06-13 -- Plan 04-03 complete (.cbm + model.json serialization, oracle-locked)
+stopped_at: Completed 04-05-PLAN.md (public catboost-rs facade — phase 04 first full slice, oracle-locked)
+last_updated: "2026-06-13T21:01:00.000Z"
+last_activity: 2026-06-13 -- Plan 04-05 complete (CatBoostBuilder + Model facade + CatBoostError; end-to-end binclf+regression oracle <=1e-5)
 progress:
   total_phases: 8
-  completed_phases: 3
-  total_plans: 22
-  completed_plans: 21
-  percent: 38
+  completed_phases: 4
+  total_plans: 23
+  completed_plans: 23
+  percent: 50
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 04 (model-serialization-shap-rust-api-first-full-oracle-lock) — EXECUTING
-Plan: 5 of 5
-Status: 04-03 complete (.cbm + model.json serialization); Wave 4 (04-04 SHAP/fstr) next
-Last activity: 2026-06-13 -- Plan 04-03 complete (.cbm + model.json serialization, oracle-locked)
+Phase: 04 (model-serialization-shap-rust-api-first-full-oracle-lock) — COMPLETE
+Plan: 5 of 5 (all plans complete)
+Status: 04-05 complete (public catboost-rs facade: CatBoostBuilder + Model + CatBoostError); phase-04 first full vertical slice (train -> serialize -> load -> predict/explain) oracle-locked <=1e-5 through the public API
+Last activity: 2026-06-13 -- Plan 04-05 complete (CatBoostBuilder + Model facade + CatBoostError; end-to-end binclf+regression oracle <=1e-5)
 
-Progress: [██████░░░░] 60% (3 of 5 phase-04 plans complete)
+Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 
 ## Performance Metrics
 
@@ -74,6 +74,7 @@ Progress: [██████░░░░] 60% (3 of 5 phase-04 plans complete)
 | Phase 04 P02 | ~50min | 2 tasks | 15 files |
 | Phase 04 P03 | ~8min | 2 tasks | 7 files |
 | Phase 04 P04 | ~10min | 2 tasks | 5 files |
+| Phase 04 P05 | ~10min | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -134,6 +135,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Plan 04-03 (Rule 1 fix) — bias read prefers MultiBias[0] over scalar Bias: upstream catboost 1.2.10 stores the 1-dim bias (e.g. regression boost_from_average start) in the MultiBias VECTOR, leaving scalar Bias=0.0. Reading only scalar Bias made the regression load under-predict by exactly the bias (0.315); binclf (bias 0) masked it. save_cbm still writes scalar Bias (Open Q3) so ours->ours round-trip is unaffected. Borders are f32 on the .cbm wire (schema type) so the assert_eq round-trip uses f32-exact borders; LeafValues/LeafWeights are f64 (exact). Upstream-load cases run IN-ENV (real fixtures), not #[ignore].
 - [Phase ?]: Plan 04-04: regular TreeSHAP transcribed verbatim; local-accuracy invariant holds; SHAP matrix oracle-locked <=1e-5 (MODEL-04, D-11).
 - [Phase ?]: Plan 04-04: PredictionValuesChange (Σ=100) + Interaction oracle-locked <=1e-5; loss-change importance deferred (MODEL-03 partial, D-12).
+- [Phase 04]: Plan 04-05 COMPLETE — published catboost-rs facade: CatBoostBuilder (D-05; new()+chained setters+fit(&pool); loss selects clf vs regression) wrapping cb_train::train over CpuBackend with borders computed from the pool (select_borders_greedy_logsum); Model facade (D-06/D-07: predict/predict_proba/predict_with enum core, save_cbm/load_cbm/save_json/load_json, shap_values, feature_importance) delegating to cb-model; public CatBoostError (D-08/RAPI-02: thiserror, #[from] CbError+ModelError+io::Error, Deserialize/SchemaVersion/FeatureMismatch, no Clone/PartialEq). anyhow structurally absent (D-14/D-15). RAPI-01, RAPI-02 done.
+- [Phase 04]: Plan 04-05 — end-to-end binclf + regression train->serialize->load->predict cycle through the PUBLIC API matches upstream catboost 1.2.10 <=1e-5 (ROADMAP Phase-4 criterion 5); the builder's fit-from-pool borders reproduce upstream border selection for numeric_tiny so the upstream oracle leg runs unconditionally (no #[ignore]). FeatureMismatch guard added (Rule 2, T-04-05-02). Phase 04 first full vertical slice CLOSED.
 
 ### Pending Todos
 

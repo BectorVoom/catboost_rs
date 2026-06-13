@@ -87,8 +87,8 @@
 
 ### Rust Public API
 
-- [ ] **RAPI-01**: Rust Builder-pattern public API — `CatBoostBuilder::new()...fit(&pool) -> Model`, predict
-- [ ] **RAPI-02**: Typed `thiserror` error enum across the public surface
+- [x] **RAPI-01**: Rust Builder-pattern public API — `CatBoostBuilder::new()...fit(&pool) -> Model`, predict
+- [x] **RAPI-02**: Typed `thiserror` error enum across the public surface
 
 ### Python Bindings & Packaging
 
@@ -158,8 +158,8 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | MODEL-06 | Phase 4 | Complete (04-03: model.json export/import, round-trips through cb-oracle parser + upstream load ≤1e-5) |
 | LOSS-01 | Phase 4 | Complete (04-02: CrossEntropy + Focal der1/der2 oracle-locked; binclf trains under all three losses) |
 | LOSS-06 | Phase 4 | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types deferred to Phase 6 per D-10) |
-| RAPI-01 | Phase 4 | Pending |
-| RAPI-02 | Phase 4 | Pending |
+| RAPI-01 | Phase 4 | Complete |
+| RAPI-02 | Phase 4 | Complete |
 | ORD-01 | Phase 5 | Pending |
 | ORD-02 | Phase 5 | Pending |
 | ORD-03 | Phase 5 | Pending |
