@@ -77,14 +77,17 @@ pub fn summary_class_weights(
         .collect::<Vec<f64>>())
 }
 
-/// The largest summary class weight, as `f32` (upstream's `maxSummaryClassWeight`
-/// is a `float`). Returns `0.0` for an empty slice (no class).
+/// The largest summary class weight, as `f32` — upstream's plain
+/// `*MaxElement(summaryClassWeights...)` (`calc_class_weights.cpp:79`), with no
+/// zero floor. The only caller passes the [`summary_class_weights`] output,
+/// which is non-empty (`class_count > 0` is enforced there), so the
+/// `NEG_INFINITY` seed is always overwritten by a real element — there is no
+/// empty-slice case to defend against here (WR-05).
 fn max_summary_weight_f32(summary: &[f64]) -> f32 {
     summary
         .iter()
         .map(|&w| w as f32)
         .fold(f32::NEG_INFINITY, f32::max)
-        .max(0.0)
 }
 
 /// Balanced auto class weights (`GetWeightFunction::Balanced`): per class `c`,
