@@ -25,7 +25,9 @@
 //! `unwrap`/`expect`/raw float fold in production (deny-lints + D-08).
 
 use cb_compute::{
-    gradient_leaf_delta, reduce_leaf_stats, scale_l2_reg, Loss, Runtime,
+    collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta,
+    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, simple_leaf_delta, LeafMethod, Loss,
+    Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult};
 
@@ -47,6 +49,9 @@ pub struct BoostParams {
     /// Whether to start from the per-loss optimum constant approx (the target
     /// mean for RMSE), stored as the model bias. `false` starts from `0`.
     pub boost_from_average: bool,
+    /// Which leaf-estimation method computes the per-leaf deltas (TRAIN-03 /
+    /// D-09). The first-slice path is [`LeafMethod::Gradient`].
+    pub leaf_method: LeafMethod,
 }
 
 /// One trained oblivious tree: the ordered splits and the per-leaf values
@@ -99,6 +104,75 @@ fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
         sum_f64(target) / target.len() as f64
     } else {
         0.0
+    }
+}
+
+/// Compute the per-leaf deltas for the selected [`LeafMethod`] (TRAIN-03 / D-09).
+///
+/// Gradient/Newton/Simple are closed-form over each leaf's ordered reduced sums
+/// (`cb_core::sum_f64` via `reduce_leaf_stats` / `reduce_leaf_der2`, D-05). Exact
+/// takes the weighted median of each leaf's per-member residuals
+/// (`target - approx`) via the quantile-style optimum. `weighted_der1[i]` is
+/// `der1*weight`; `der2[i]` the per-object second derivative (weighted below for
+/// the Newton sum); `approx`/`target` the running approximant/labels.
+#[allow(clippy::too_many_arguments)]
+fn compute_leaf_deltas(
+    method: LeafMethod,
+    leaf_of: &[usize],
+    weighted_der1: &[f64],
+    der2: &[f64],
+    weights: &[f64],
+    approx: &[f64],
+    target: &[f64],
+    scaled_l2: f64,
+    n_leaves: usize,
+) -> Vec<f64> {
+    match method {
+        LeafMethod::Gradient => {
+            let stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            stats
+                .iter()
+                .map(|s| gradient_leaf_delta(s.sum_weighted_delta, s.sum_weight, scaled_l2))
+                .collect()
+        }
+        LeafMethod::Simple => {
+            let stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            stats
+                .iter()
+                .map(|s| simple_leaf_delta(s.sum_weighted_delta, s.sum_weight, scaled_l2))
+                .collect()
+        }
+        LeafMethod::Newton => {
+            let stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            // Newton needs Σ der2*weight per leaf; build the weighted-der2 column
+            // (elementwise product the host folds), then reduce ordered (D-05).
+            let weighted_der2: Vec<f64> = der2
+                .iter()
+                .zip(weights.iter())
+                .map(|(&d, &w)| d * w)
+                .collect();
+            let sum_der2 = reduce_leaf_der2(leaf_of, &weighted_der2, n_leaves);
+            stats
+                .iter()
+                .zip(sum_der2.iter())
+                .map(|(s, &d2)| newton_leaf_delta(s.sum_weighted_delta, d2, scaled_l2))
+                .collect()
+        }
+        LeafMethod::Exact => {
+            // Exact: per-leaf weighted median of residuals r_i = target_i -
+            // approx_i (MAE / Quantile alpha=0.5, delta=1e-6). scaled_l2 is unused
+            // (Exact has no L2 term — it is a rank statistic, not an average).
+            let residuals: Vec<f64> = approx
+                .iter()
+                .zip(target.iter())
+                .map(|(&a, &t)| t - a)
+                .collect();
+            let members = collect_leaf_residuals(leaf_of, &residuals, weights, n_leaves);
+            members
+                .iter()
+                .map(|(r, w)| exact_leaf_delta(r, w, QUANTILE_ALPHA, QUANTILE_DELTA))
+                .collect()
+        }
     }
 }
 
@@ -174,15 +248,23 @@ pub fn train<R: Runtime>(
             n,
         )?;
 
-        // 3. Gradient leaf values: CalcAverage over each leaf's ordered member
-        //    sums, scaled by learning_rate (stored value matches model.json).
-        let stats = reduce_leaf_stats(&grown.leaf_of, &weighted_der1, &weights, n_leaves);
-        let leaf_values: Vec<f64> = stats
+        // 3. Leaf values via the selected estimation method (TRAIN-03 / D-09),
+        //    scaled by learning_rate (stored value matches model.json). Every
+        //    reduction over leaf members routes through cb_core::sum_f64 (D-05).
+        let leaf_deltas = compute_leaf_deltas(
+            params.leaf_method,
+            &grown.leaf_of,
+            &weighted_der1,
+            &ders.der2,
+            &weights,
+            &approx,
+            target,
+            scaled_l2,
+            n_leaves,
+        );
+        let leaf_values: Vec<f64> = leaf_deltas
             .iter()
-            .map(|s| {
-                let delta = gradient_leaf_delta(s.sum_weighted_delta, s.sum_weight, scaled_l2);
-                params.learning_rate * delta
-            })
+            .map(|&delta| params.learning_rate * delta)
             .collect();
 
         // 4. Update approx: approx[i] += leaf_value[leaf(i)].

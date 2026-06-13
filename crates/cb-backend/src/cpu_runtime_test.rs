@@ -44,6 +44,31 @@ fn logloss_gradients_match_host_reference() {
 }
 
 #[test]
+fn mae_gradients_match_host_reference() {
+    // MAE / Quantile(alpha=0.5, delta=1e-6): der1 = sign(residual)*half-quantile
+    // with a deadzone; der2 = 0. Includes an exact-tie object (approx==target).
+    let approx = [0.0, 1.0, -2.5, 3.25, 7.0];
+    let target = [1.0, 0.0, 2.5, -3.25, 7.0];
+
+    let ders = CpuBackend.compute_gradients(Loss::Mae, &approx, &target).unwrap();
+
+    assert_eq!(ders.der1.len(), approx.len());
+    assert_eq!(ders.der2.len(), approx.len());
+    for i in 0..approx.len() {
+        let val = target[i] - approx[i];
+        let expected = if val.abs() < 1e-6 {
+            0.0
+        } else if val > 0.0 {
+            0.5
+        } else {
+            -0.5
+        };
+        assert!((ders.der1[i] - expected).abs() <= 1e-12, "i={i}");
+        assert_eq!(ders.der2[i], 0.0);
+    }
+}
+
+#[test]
 fn length_mismatch_is_error_not_panic() {
     let approx = [0.0, 1.0];
     let target = [1.0];

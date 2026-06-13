@@ -73,3 +73,36 @@ pub fn logloss_der2(approx: f64, _target: f64) -> f64 {
     let p = sigmoid(approx);
     -p * (1.0 - p)
 }
+
+/// The MAE / Quantile default parameters: `alpha = 0.5` (the median) and the
+/// `delta = 1e-6` deadzone (`error_functions.h:468-469` `TQuantileError`).
+pub const QUANTILE_ALPHA: f64 = 0.5;
+/// The MAE / Quantile deadzone half-width.
+pub const QUANTILE_DELTA: f64 = 1e-6;
+
+/// MAE / Quantile(alpha, delta) first derivative for one object:
+/// `(target - approx > 0) ? alpha : -(1 - alpha)`, with a `|residual| < delta`
+/// deadzone returning `0` (`error_functions.h:485-489` `TQuantileError::CalcDer`).
+///
+/// For the median (`alpha = 0.5`) the non-deadzone gradient is `+0.5` above the
+/// approx and `-0.5` below — the sign of the residual scaled by the half-quantile.
+#[must_use]
+pub fn mae_der1(approx: f64, target: f64) -> f64 {
+    let val = target - approx;
+    if val.abs() < QUANTILE_DELTA {
+        0.0
+    } else if val > 0.0 {
+        QUANTILE_ALPHA
+    } else {
+        -(1.0 - QUANTILE_ALPHA)
+    }
+}
+
+/// MAE / Quantile second derivative for one object: `der2 = 0`
+/// (`error_functions.h:491-493` — `QUANTILE_DER2_AND_DER3 = 0.0`). The Exact leaf
+/// method does not use the hessian (it takes the weighted median), and Newton is
+/// undefined for this loss (its denominator would be `scaledL2` alone).
+#[must_use]
+pub fn mae_der2(_approx: f64, _target: f64) -> f64 {
+    0.0
+}

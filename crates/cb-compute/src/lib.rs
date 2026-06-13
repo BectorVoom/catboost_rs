@@ -24,9 +24,17 @@ mod loss;
 mod runtime;
 mod score;
 
-pub use histogram::{reduce_leaf_stats, LeafStats};
-pub use leaf::{calc_average, gradient_leaf_delta, scale_l2_reg};
-pub use loss::{logloss_der1, logloss_der2, rmse_der1, rmse_der2, sigmoid};
+pub use histogram::{
+    collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
+};
+pub use leaf::{
+    calc_average, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta, scale_l2_reg,
+    simple_leaf_delta, LeafMethod,
+};
+pub use loss::{
+    logloss_der1, logloss_der2, mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
+    QUANTILE_ALPHA, QUANTILE_DELTA,
+};
 pub use runtime::{Derivatives, Float, Loss, Runtime};
 pub use score::{add_leaf_plain, l2_split_score, MINIMAL_SCORE};
 

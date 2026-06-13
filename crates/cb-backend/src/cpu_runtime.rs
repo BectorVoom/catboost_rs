@@ -20,7 +20,7 @@ use cb_compute::{Derivatives, Loss, Runtime};
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
-    gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
+    gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel, mae_gradient_kernel,
 };
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
@@ -72,6 +72,14 @@ fn launch_binary_f64(
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
             )
         }
+        BinaryKernel::MaeGradient => mae_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        ),
     }
 
     let bytes = client
@@ -85,6 +93,7 @@ fn launch_binary_f64(
 enum BinaryKernel {
     RmseGradient,
     LoglossGradient,
+    MaeGradient,
 }
 
 /// Launch the Logloss hessian kernel (`der2 = -p*(1-p)`) on `CpuRuntime`.
@@ -148,6 +157,12 @@ impl Runtime for CpuBackend {
             Loss::Logloss => {
                 let der1 = launch_binary_f64(approx, target, BinaryKernel::LoglossGradient);
                 let der2 = launch_logloss_hessian(approx);
+                Ok(Derivatives { der1, der2 })
+            }
+            Loss::Mae => {
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::MaeGradient);
+                // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
+                let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
             }
         }

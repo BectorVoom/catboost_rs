@@ -50,6 +50,29 @@ pub fn logloss_gradient_kernel<F: Float>(
     }
 }
 
+/// First-order MAE / Quantile(alpha=0.5, delta=1e-6) gradient kernel:
+/// `val = target - approx; der1 = |val|<delta ? 0 : (val>0 ? alpha : -(1-alpha))`.
+///
+/// `error_functions.h:485-489` (`TQuantileError::CalcDer`, alpha=0.5, delta=1e-6).
+/// Elementwise, order-independent, no reduction (D-02). Per the CubeCL
+/// conditionals manual the branch result is assigned to a `mut` variable
+/// initialized to the deadzone value (avoiding `if`-as-expression IR pitfalls).
+#[cube(launch)]
+pub fn mae_gradient_kernel<F: Float>(approx: &Array<F>, target: &Array<F>, der1: &mut Array<F>) {
+    if ABSOLUTE_POS < approx.len() {
+        let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        let alpha = F::new(0.5);
+        let delta = F::new(1e-6);
+        let mut g = F::new(0.0);
+        if val > delta {
+            g = alpha;
+        } else if val < F::new(0.0) - delta {
+            g = F::new(0.0) - (F::new(1.0) - alpha);
+        }
+        der1[ABSOLUTE_POS] = g;
+    }
+}
+
 /// Second-order Logloss / CrossEntropy hessian kernel:
 /// `p = sigmoid(approx[i]); der2[i] = -p*(1-p)`.
 ///

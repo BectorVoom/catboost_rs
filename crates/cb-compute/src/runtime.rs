@@ -46,6 +46,12 @@ pub enum Loss {
     /// Logloss / CrossEntropy (binary classification): der1 = `target - p`,
     /// der2 = `-p*(1-p)`, `p = sigmoid(approx)` over the raw logit.
     Logloss,
+    /// MAE / Quantile(alpha=0.5, delta=1e-6) (robust regression): der1 =
+    /// `(target - approx > 0) ? alpha : -(1 - alpha)` with a `|residual| < delta`
+    /// deadzone, der2 = `0`. Used by the Exact leaf-estimation method, whose leaf
+    /// delta is the weighted median of the leaf residuals
+    /// (`error_functions.h:457-498` `TQuantileError`).
+    Mae,
 }
 
 /// The per-object first and second derivatives returned by

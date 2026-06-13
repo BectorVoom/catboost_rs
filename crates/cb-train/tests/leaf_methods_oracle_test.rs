@@ -1,11 +1,22 @@
-//! First-slice train→predict oracle (TRAIN-01/02/03 Gradient): train a plain
-//! boosted oblivious-tree model on the frozen `regression_skeleton` (RMSE) and
-//! `binclf_skeleton` (Logloss) inputs and gate per-tree splits, per-tree leaf
-//! values, and per-iteration staged approximants against the committed upstream
-//! catboost 1.2.10 fixtures at <= 1e-5 for BOTH losses (D-08).
+//! Leaf-methods train→predict oracle (TRAIN-03 / D-09): train a plain boosted
+//! oblivious-tree model with each of the four leaf-estimation methods (Gradient,
+//! Newton, Exact, Simple) and gate per-tree splits, per-tree leaf values, and
+//! per-iteration staged approximants against the committed upstream catboost
+//! 1.2.10 `leaf_methods/{gradient,newton,exact,simple}` fixtures at <= 1e-5.
+//!
+//! Each method gets its own scenario so a divergence is attributable to a single
+//! method's leaf math (the D-07 simplified-isolating discipline carried into the
+//! per-method oracle):
+//!   - gradient: RMSE, boost_from_average=true (== the first-slice path).
+//!   - newton:   Logloss, boost_from_average=false (der2 = -p(1-p) makes Newton
+//!               distinct from Gradient; RMSE der2==-1 would collapse them).
+//!   - exact:    MAE,  boost_from_average=false (Exact is rejected upstream for
+//!               RMSE/Logloss; its leaf delta is the weighted median of leaf
+//!               residuals).
+//!   - simple:   RMSE, boost_from_average=true (== Gradient leaf delta, A6).
 //!
 //! Integration test (under `tests/`) so it can depend on `cb-oracle`; the
-//! top-line `#![allow(...)]` mirrors `borders_oracle_test.rs:14`.
+//! top-line `#![allow(...)]` mirrors `slice_first_oracle_test.rs:9`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
@@ -35,18 +46,17 @@ fn load_feature_columns() -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Load the raw `numeric_tiny` target (regression `y`).
+/// Load the raw `numeric_tiny` target (continuous `y`, used by RMSE and MAE).
 fn load_regression_target() -> Vec<f64> {
     load_f64_vec(&fixture("inputs/numeric_tiny/y.npy")).unwrap()
 }
 
 /// Derive the binary Logloss label `y_binary = (y > median(y))`, matching the
-/// binclf fixture's `label_definition`.
+/// generator's `y_bin` definition for the newton scenario.
 fn load_binclf_target() -> Vec<f64> {
     let y = load_regression_target();
     let mut sorted = y.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    // numpy median for an even count is the mean of the two middle values.
     let n = sorted.len();
     let median = if n % 2 == 0 {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
@@ -56,9 +66,13 @@ fn load_binclf_target() -> Vec<f64> {
     y.iter().map(|&v| if v > median { 1.0 } else { 0.0 }).collect()
 }
 
-/// Train a model on the given scenario and return it plus the recorded staged
-/// approximants (flat, `iterations * n_rows`).
-fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Model, Vec<f64>) {
+/// Train one leaf-method scenario and return the model plus staged approximants.
+fn train_scenario(
+    scenario: &str,
+    loss: Loss,
+    leaf_method: LeafMethod,
+    boost_from_average: bool,
+) -> (Model, Vec<f64>) {
     let columns = load_feature_columns();
     let model_json = load_model_json(&fixture(&format!("{scenario}/model.json")))
         .unwrap_or_else(|e| panic!("{scenario}/model.json must load: {e:?}"));
@@ -76,7 +90,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         learning_rate: 0.1,
         l2_leaf_reg: 3.0,
         boost_from_average,
-        leaf_method: LeafMethod::Gradient,
+        leaf_method,
     };
 
     let mut staged = Vec::new();
@@ -94,9 +108,14 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
     (model, staged)
 }
 
-/// Gate splits, leaf values, and staged approximants for one scenario.
-fn check_scenario(scenario: &str, loss: Loss, boost_from_average: bool) {
-    let (model, staged) = train_scenario(scenario, loss, boost_from_average);
+/// Gate splits, leaf values, and staged approximants for one method scenario.
+fn check_scenario(
+    scenario: &str,
+    loss: Loss,
+    leaf_method: LeafMethod,
+    boost_from_average: bool,
+) {
+    let (model, staged) = train_scenario(scenario, loss, leaf_method, boost_from_average);
     let model_json = load_model_json(&fixture(&format!("{scenario}/model.json"))).unwrap();
 
     // Stage::Splits — per-tree split borders (float feature + border).
@@ -118,13 +137,24 @@ fn check_scenario(scenario: &str, loss: Loss, boost_from_average: bool) {
 }
 
 #[test]
-fn slice_first_oracle_regression_skeleton_rmse() {
-    // RMSE with boost_from_average=true (bias == target mean).
-    check_scenario("regression_skeleton", Loss::Rmse, true);
+fn leaf_methods_oracle_gradient() {
+    check_scenario("leaf_methods/gradient", Loss::Rmse, LeafMethod::Gradient, true);
 }
 
 #[test]
-fn slice_first_oracle_binclf_skeleton_logloss() {
-    // Logloss with boost_from_average=false (bias == 0; raw-logit staged).
-    check_scenario("binclf_skeleton", Loss::Logloss, false);
+fn leaf_methods_oracle_newton() {
+    // Logloss makes the Newton hessian (-p(1-p)) genuinely distinct from Gradient.
+    check_scenario("leaf_methods/newton", Loss::Logloss, LeafMethod::Newton, false);
+}
+
+#[test]
+fn leaf_methods_oracle_exact() {
+    // MAE: Exact leaf delta == weighted median of leaf residuals.
+    check_scenario("leaf_methods/exact", Loss::Mae, LeafMethod::Exact, false);
+}
+
+#[test]
+fn leaf_methods_oracle_simple() {
+    // Simple == Gradient leaf delta (A6); RMSE scenario mirrors gradient.
+    check_scenario("leaf_methods/simple", Loss::Rmse, LeafMethod::Simple, true);
 }
