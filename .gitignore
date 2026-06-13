@@ -12,6 +12,8 @@ crates/cb-oracle/generator/.venv/
 # to either its own cwd or the cb-oracle crate root, so ignore both.
 crates/cb-oracle/generator/catboost_info/
 crates/cb-oracle/catboost_info/
+# Also emitted at the repo root when the generator is invoked from elsewhere.
+/catboost_info/
 
 # Python bytecode cache emitted when the generator is imported/run.
 crates/cb-oracle/generator/__pycache__/

@@ -1,0 +1,9 @@
+{
+  "n_eval": 80,
+  "n_features": 4,
+  "n_train": 120,
+  "note": "Held-out eval set whose RMSE loss rises after a few iters (overfit signal) for the TRAIN-06 detector oracle.",
+  "scenario": "inputs/overfit_eval",
+  "seed": 20260614,
+  "target": "x @ [1.5,-2.0,0.5,3.0] + noise (train 1.5*N, eval 0.1*N)"
+}

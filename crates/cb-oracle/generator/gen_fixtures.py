@@ -61,6 +61,8 @@ LEAF_METHODS = FIXTURES / "leaf_methods"
 BOOTSTRAP = FIXTURES / "bootstrap"
 BOOTSTRAP_INPUT = INPUTS / "bootstrap_multiblock"
 REGULARIZATION = FIXTURES / "regularization"
+OVERFIT = FIXTURES / "overfit"
+OVERFIT_INPUT = INPUTS / "overfit_eval"
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -73,6 +75,9 @@ SEED = 0
 # Dedicated synthesis seed for the TRAIN-04 multi-block bootstrap dataset (kept
 # distinct from numeric_tiny's seed so the corpus is reproducible in isolation).
 INPUT_SEED_BOOTSTRAP = 20260613
+# Dedicated synthesis seed for the TRAIN-06 overfit train/eval corpus (kept
+# distinct so the dataset is reproducible in isolation).
+INPUT_SEED_OVERFIT = 20260614
 
 # D-07 simplified isolating params shared by BOTH training scenarios. Every knob
 # that interacts with the tree/leaf math is pinned to its most isolating value so
@@ -929,6 +934,192 @@ def gen_regularization() -> None:
             fh.write("\n")
 
 
+def gen_overfit() -> None:
+    """overfit/{inctodec,iter,wilcoxon,use_best_model}/ — the TRAIN-06 (D-10)
+    overfitting-detection / early-stopping oracle. Each scenario trains with an
+    explicit held-out eval set and pins the matching `od_type`/`od_pval`/`od_wait`
+    (and `use_best_model` where applicable) so the detector FIRES inside the
+    iteration budget, stopping the model at an iteration < the configured maximum.
+
+    DETERMINISTIC EVAL CONFIG (prior-wave guidance / D-07): the eval-loss curve is
+    produced with `bootstrap_type=No`, `random_strength=0` so the stop decision
+    and best iteration lock cleanly and are NOT perturbed by the known stochastic
+    multi-tree RNG-phase residual (TRAIN-04/05). A purpose-built train/eval split
+    is synthesized whose eval loss starts to RISE after a handful of iterations so
+    every detector type has a real overfit signal to detect.
+
+    UPSTREAM DETECTOR SEMANTICS (overfitting_detector.cpp:120-208, transcribed for
+    the Rust Task-2 port):
+      - default type = IncToDec, wait_iterations = 20, stop_pvalue (od_pval) = 0
+        (0 => detector INACTIVE: IsActive() iff Threshold>0).
+      - IncToDec: AddError tracks a running LocalMax of the (sign-adjusted) error,
+        an exponentially-forgotten ExpectedInc over the last ITERATION_FORGET=2000
+        errors (LAMBDA_FORGET=0.99), and after IterationsFromLocalMax>=wait sets
+        CurrentPValue = exp(-LAMBDA_SCALE / max(ExpectedInc/max(LocalMax-Last,EPS),
+        EPS)), LAMBDA_SCALE=0.5, EPS=1e-10. IsNeedStop iff !IsEmpty && pval<thresh.
+      - Iter == IncToDec with threshold forced to 1.0 (stops wait iters after the
+        best, since pval<1.0 always holds once the wait elapses past the max).
+      - Wilcoxon: deltas (LastError-err) AFTER the local max; once >= wait deltas
+        accumulate, CurrentPValue = NStatistics::Wilcoxon(deltas) (the signed-rank
+        statistic over post-local-max deltas).
+      - maxIsOptimal=false for a LOSS metric (RMSE/Logloss): err is negated so a
+        DECREASING loss is an INCREASING (improving) score.
+
+    Persists per scenario:
+      - model.json   : the trained model whose tree count == the STOP iteration
+                       (catboost truncates the saved trees to best_iteration+1 when
+                       use_best_model, and to the stop point otherwise).
+      - staged.npy   : the per-iteration eval-set metric curve (the loss the
+                       detector consumes), n_iterations_run f64.
+      - eval X/y     : the held-out eval inputs (committed under inputs/) so the
+                       Rust harness recomputes the same eval-loss curve.
+      - config.json  : od_type/od_pval/od_wait/use_best_model + tree_count_ +
+                       best_iteration_ from the Python API (the assertion targets).
+    """
+    OVERFIT.mkdir(parents=True, exist_ok=True)
+    OVERFIT_INPUT.mkdir(parents=True, exist_ok=True)
+
+    # Synthesize a train/eval split where the eval loss bottoms out early and then
+    # rises (overfit signal). Train is small + noisy so the model keeps fitting
+    # train noise; eval is a clean held-out sample drawn from the SAME linear
+    # signal so its loss starts climbing once the model overfits the train noise.
+    rng = np.random.default_rng(INPUT_SEED_OVERFIT)
+    n_train, n_eval, n_cols = 120, 80, 4
+    coeffs = np.array([1.5, -2.0, 0.5, 3.0], dtype=np.float64)
+    x_tr = _assert_f64(rng.standard_normal((n_train, n_cols)).astype(np.float64), "overfit Xtr")
+    # Heavy train noise so the model overfits within a few dozen iterations.
+    y_tr = _assert_f64(
+        (x_tr @ coeffs + 1.5 * rng.standard_normal(n_train)).astype(np.float64),
+        "overfit ytr",
+    )
+    x_ev = _assert_f64(rng.standard_normal((n_eval, n_cols)).astype(np.float64), "overfit Xev")
+    # Clean eval signal (light noise) so the held-out loss has a clear minimum.
+    y_ev = _assert_f64(
+        (x_ev @ coeffs + 0.1 * rng.standard_normal(n_eval)).astype(np.float64),
+        "overfit yev",
+    )
+    np.save(OVERFIT_INPUT / "X_train.npy", x_tr, allow_pickle=False)
+    np.save(OVERFIT_INPUT / "y_train.npy", y_tr, allow_pickle=False)
+    np.save(OVERFIT_INPUT / "X_eval.npy", x_ev, allow_pickle=False)
+    np.save(OVERFIT_INPUT / "y_eval.npy", y_ev, allow_pickle=False)
+    with (OVERFIT_INPUT / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "scenario": "inputs/overfit_eval",
+                "seed": INPUT_SEED_OVERFIT,
+                "n_train": n_train,
+                "n_eval": n_eval,
+                "n_features": n_cols,
+                "target": "x @ [1.5,-2.0,0.5,3.0] + noise (train 1.5*N, eval 0.1*N)",
+                "note": "Held-out eval set whose RMSE loss rises after a few iters (overfit signal) for the TRAIN-06 detector oracle.",
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+        )
+        fh.write("\n")
+
+    # Deterministic eval config (No bootstrap, random_strength=0) so the stop
+    # decision locks cleanly. Larger iteration budget so the detector has room to
+    # fire and stop EARLY (tree_count_ < iterations).
+    shared = {
+        k: v
+        for k, v in ISOLATING_PARAMS.items()
+        if k not in ("bootstrap_type", "random_strength", "iterations")
+    }
+    shared = {
+        **shared,
+        "iterations": 200,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "boost_from_average": True,
+        "depth": 3,
+        "learning_rate": 0.3,
+    }
+
+    # (name, od_type, od_pval, od_wait, use_best_model). od_wait small so the
+    # detector reacts within the budget; od_pval chosen so the (in/dec) p-value
+    # actually crosses the threshold once eval loss starts climbing.
+    scenarios = [
+        ("inctodec", "IncToDec", 0.99, 10, False),
+        ("iter", "Iter", 0.0, 10, False),
+        ("wilcoxon", "Wilcoxon", 0.01, 10, False),
+        ("use_best_model", "IncToDec", 0.99, 10, True),
+    ]
+
+    for name, od_type, od_pval, od_wait, use_best in scenarios:
+        scenario_dir = OVERFIT / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        params = {
+            **shared,
+            "od_type": od_type,
+            "od_wait": od_wait,
+            "use_best_model": use_best,
+        }
+        # Iter does not consume od_pval (threshold is forced to 1.0); IncToDec /
+        # Wilcoxon take od_pval as the AutoStopPValue threshold.
+        if od_type != "Iter":
+            params["od_pval"] = od_pval
+
+        model = CatBoostRegressor(**params)
+        model.fit(x_tr, y_tr, eval_set=(x_ev, y_ev))
+
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        # The eval-set metric curve the detector consumes: the per-iteration RMSE
+        # on the eval set (staged_predict over the eval inputs -> RMSE per stage).
+        eval_staged = [
+            np.asarray(p, dtype=np.float64) for p in model.staged_predict(x_ev)
+        ]
+        eval_losses = [
+            float(np.sqrt(np.mean((stage - y_ev) ** 2))) for stage in eval_staged
+        ]
+        eval_curve = _assert_f64(np.asarray(eval_losses, dtype=np.float64), "eval_curve")
+        np.save(scenario_dir / "staged.npy", eval_curve, allow_pickle=False)
+
+        tree_count = int(model.tree_count_)
+        best_iteration = int(model.get_best_iteration())
+
+        config = {
+            "scenario": f"overfit/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "overfit_eval",
+            "loss_function": "RMSE",
+            "eval_metric": "RMSE",
+            "boost_from_average": True,
+            "od_type": od_type,
+            "od_pval": od_pval,
+            "od_wait": od_wait,
+            "use_best_model": use_best,
+            "params": params,
+            "n_train": n_train,
+            "n_eval": n_eval,
+            "n_features": n_cols,
+            "n_iterations_run": len(eval_curve),
+            "tree_count_": tree_count,
+            "best_iteration_": best_iteration,
+            "stages": ["Splits", "LeafValues", "StagedEvalLoss"],
+            "staged_layout": (
+                "flat f64: per-iteration RMSE on the EVAL set (the detector's "
+                "AddError sequence); n_iterations_run entries."
+            ),
+            "detector_note": (
+                "IncToDec(default,wait=20,pval=0=>inactive): IsNeedStop iff "
+                "!IsEmpty && CurrentPValue<Threshold; pval=exp(-0.5/max(ExpInc/"
+                "max(LocalMax-Last,1e-10),1e-10)). Iter==IncToDec threshold=1.0 "
+                "(stops od_wait after best). Wilcoxon over post-local-max deltas. "
+                "maxIsOptimal=false for a loss metric (err negated). tree_count_ "
+                "is the STOP iteration; best_iteration_ the use_best_model best."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -1016,6 +1207,10 @@ def main() -> None:
     # --- regularization (TRAIN-05 l2/random_strength/bagging_temp, D-10) ----
     gen_regularization()
     print(f"Wrote regularization oracle fixtures under {REGULARIZATION}")
+
+    # --- overfit (TRAIN-06 inctodec/iter/wilcoxon/use_best_model, D-10) ------
+    gen_overfit()
+    print(f"Wrote overfit oracle fixtures under {OVERFIT}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
