@@ -14,6 +14,19 @@
 #[cfg(feature = "cpu")]
 pub mod kernels;
 
+/// The CubeCL `CpuRuntime` as `cb-compute`'s abstract `Runtime` (D-01/D-03):
+/// launches the elementwise `#[cube]` kernels and returns UN-reduced per-object
+/// buffers for the host to fold (D-02). The GPU runtimes implement the same
+/// trait additively in Phase 7.
+#[cfg(feature = "cpu")]
+pub mod cpu_runtime;
+
+#[cfg(feature = "cpu")]
+pub use cpu_runtime::CpuBackend;
+
+#[cfg(all(test, feature = "cpu"))]
+mod cpu_runtime_test;
+
 /// Compile-time-selected runtime alias. One `cfg` arm per backend feature. Under
 /// `cpu` this is CubeCL's `CpuRuntime` (D-01); the GPU arms replace `()` in
 /// Phase 7. Selection is purely compile-time (D-02) — no runtime `match`.

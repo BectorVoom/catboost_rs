@@ -16,6 +16,10 @@ workspace = true
 # ban). Do not add it.
 cubecl.workspace = true
 bytemuck.workspace = true
+# cb-backend implements cb-compute's abstract Runtime trait by launching the
+# `#[cube]` kernels (D-03 keeps cubecl OUT of cb-compute, not the reverse).
+cb-compute = { path = "../cb-compute" }
+cb-core = { path = "../cb-core" }
 
 [features]
 # Compile-time backend selection only — NO runtime dispatch (D-02). All arms are
