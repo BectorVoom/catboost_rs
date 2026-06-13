@@ -13,8 +13,10 @@
 //! (Pitfall 1); depth is capped against `2^depth` overflow (T-03-01-02). No
 //! `unwrap`/`expect`/raw float fold in production (deny-lints + D-08).
 
+mod boosting;
 mod tree;
 
+pub use boosting::{train, BoostParams, Model, ObliviousTree};
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, leaf_index, select_best_candidate, Candidate,
     FeatureMatrix, GrownTree, Split, MAX_DEPTH,

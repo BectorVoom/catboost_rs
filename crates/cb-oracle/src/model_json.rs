@@ -42,6 +42,27 @@ pub struct ObliviousTree {
     pub splits: Vec<SplitJson>,
 }
 
+/// One float feature's metadata (verified `model.json` schema:
+/// `features_info.float_features[i]`). Only the `borders` are consumed by the
+/// training oracle (they are the candidate split borders the trainer scores).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FloatFeatureJson {
+    /// The feature's index among float features.
+    pub feature_index: i64,
+    /// The ascending quantization borders for this feature (the candidate split
+    /// thresholds). May be empty when the model never split on the feature.
+    #[serde(default)]
+    pub borders: Vec<f64>,
+}
+
+/// The `features_info` block (the subset the oracle consumes).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FeaturesInfoJson {
+    /// Per-float-feature metadata in feature order.
+    #[serde(default)]
+    pub float_features: Vec<FloatFeatureJson>,
+}
+
 /// Top-level upstream `model.json` (the subset the oracle consumes).
 ///
 /// `scale_and_bias` is upstream's `[scale, [bias, …]]` pair; for the
@@ -49,6 +70,8 @@ pub struct ObliviousTree {
 /// [`ModelJson::bias`] reads `scale_and_bias[1][0]`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelJson {
+    /// Per-feature metadata, including each float feature's candidate borders.
+    pub features_info: FeaturesInfoJson,
     /// All oblivious trees in boosting (iteration) order.
     pub oblivious_trees: Vec<ObliviousTree>,
     /// Upstream `[scale, [bias, …]]`. Untyped (`serde_json::Value`) because the
@@ -75,6 +98,19 @@ impl ModelJson {
         self.oblivious_trees
             .iter()
             .flat_map(|tree| tree.leaf_values.iter().copied())
+            .collect()
+    }
+
+    /// Per-float-feature candidate borders, in feature order (each feature's
+    /// ascending borders). Empty inner vectors are preserved so the index lines
+    /// up with the float-feature index. Ready to feed the trainer as the
+    /// candidate split borders.
+    #[must_use]
+    pub fn float_feature_borders(&self) -> Vec<Vec<f64>> {
+        self.features_info
+            .float_features
+            .iter()
+            .map(|f| f.borders.clone())
             .collect()
     }
 

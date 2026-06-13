@@ -24,7 +24,9 @@ mod model_json;
 pub use compare::{assert_abs_close, compare_stage, Stage};
 pub use error::OracleError;
 pub use fixture::{load_config, load_f64_vec, FixtureConfig};
-pub use model_json::{load_model_json, ModelJson, ObliviousTree, SplitJson};
+pub use model_json::{
+    load_model_json, FeaturesInfoJson, FloatFeatureJson, ModelJson, ObliviousTree, SplitJson,
+};
 
 #[cfg(test)]
 mod compare_test;
