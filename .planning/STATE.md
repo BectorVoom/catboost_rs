@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 2 context gathered
-last_updated: "2026-06-13T03:23:27.369Z"
-last_activity: 2026-06-13 -- Phase 01 execution started
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-06-13T04:04:07.283Z"
+last_activity: 2026-06-13 -- Plan 02-01 complete (reduction primitive, D-08 gate, Wave-0 fixtures, A1–A5 resolved)
 progress:
   total_phases: 8
   completed_phases: 1
-  total_plans: 3
-  completed_plans: 3
-  percent: 13
+  total_plans: 8
+  completed_plans: 4
+  percent: 50
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 01 — workspace-lint-discipline-oracle-harness
+**Current focus:** Phase 02 — data-layer-pool-quantization-reduction
 
 ## Current Position
 
-Phase: 01 (workspace-lint-discipline-oracle-harness) — EXECUTING
-Plan: 3 of 3
-Status: Ready to execute
-Last activity: 2026-06-13 -- Phase 01 execution started
+Phase: 02 (data-layer-pool-quantization-reduction) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute (02-01 complete)
+Last activity: 2026-06-13 -- Plan 02-01 complete (reduction primitive, D-08 gate, Wave-0 fixtures, A1–A5 resolved)
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██░░░░░░░░] 20% (1 of 5 phase-02 plans complete)
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P01 | 5 | 4 tasks | 21 files |
 | Phase 01 P02 | 4min | 1 tasks | 4 files |
 | Phase 01 P03 | 9min | 3 tasks | 42 files |
+| Phase 02 P01 | 10min | 3 tasks | 22 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,12 @@ Recent decisions affecting current work:
 - [Phase ?]: Plan 01-02: TFastRng64 ported bit-for-bit; two PCG streams deduped into shared Lcg32 (bitstream-identical, oracle-proven)
 - [Phase ?]: Plan 01-02: derived Clone/PartialEq/Eq on CbError to enable Result equality assertions (backward-compatible)
 - [Phase ?]: INFRA-04 compare_stage ships API + real-fixture read + 1e-5 gate in P1; comparison vs Rust-computed actuals deferred to P3/P4
+- [Phase 02]: Plan 02-01: single sequential f64 reduction primitive (`cb-core::sum_f64`/`sum_f32_in_f64`) order-locked via `[1e16,1.0,-1e16]==0.0`; D-08 CI grep bans all other float summation
+- [Phase 02]: Plan 02-01 A1/A3 (RESOLVED): `get_borders()` surfaces the `f32::MIN` NanMode sentinel for NaN(Min) features at the default border budget; presence is config-dependent (omitted at small budgets / nan_mode=Max), so pinned per-fixture in `borders_quant/config.json` — Rust must match each fixture verbatim
+- [Phase 02]: Plan 02-01 A2 (RESOLVED): catboost 1.2.10 default `border_count=254`, `feature_border_type=GreedyLogSum`, `nan_mode=Min`
+- [Phase 02]: Plan 02-01 A4 (RESOLVED): integer cat features stringify as PLAIN integers before `CalcCatFeatureHash` (`'3'` ui32=2658984922 ≠ `'3.0'` ui32=1187060909)
+- [Phase 02]: Plan 02-01 A5 (RESOLVED): `(string→ui32)` hash vectors extracted from upstream model.json `ctr_data` hash_map; Rust must port `util/digest/city.cpp` (CityHash64 & 0xffffffff) to reproduce them bit-exactly (no third-party crate)
+- [Phase ?]: [Phase 02]: Plan 02-01 COMPLETE — sum_f64/sum_f32_in_f64 reduction primitive shipped + order-locked; D-08 grep gate live; arrow 59 / polars 0.54 wired; Wave-0 borders/cat-hash/class-weight fixtures committed; A1-A5 resolved
 
 ### Pending Todos
 
@@ -84,6 +91,7 @@ None yet.
 
 - Phase 5 (Ordered Boosting/CTR), Phase 7 (GPU/CubeCL-ROCm), and Phase 8 (Python ABI/packaging) are flagged NEEDS DEEPER RESEARCH — run the per-phase research spike before planning each.
 - GPU tolerance epsilon (Phase 7) is unspecified — must be set and signed off before Phase 7 planning.
+- **Plan 02-01 COMPLETE (human approved Task-3 checkpoint).** Tasks 1–3 committed (1f2b9f1, d92ae65, 025c381); 02-01-SUMMARY.md written and self-checked; plan counter advanced to 02-02. No open blockers from 02-01.
 
 ## Deferred Items
 
@@ -95,6 +103,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T02:44:28.000Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-data-layer-pool-quantization-reduction/02-CONTEXT.md
+Last session: 2026-06-13T04:03:52.453Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: .planning/phases/02-data-layer-pool-quantization-reduction/02-02-PLAN.md

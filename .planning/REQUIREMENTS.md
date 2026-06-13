@@ -24,7 +24,7 @@
 - [ ] **DATA-04**: Missing-value handling — `NanMode` (Min/Max/Forbidden)
 - [ ] **DATA-05**: Categorical feature hashing
 - [ ] **DATA-06**: Zero-copy NumPy ingestion and Arrow/Polars ingestion with dtype/contiguity validation; copy-in path for training
-- [ ] **DATA-07**: Single audited deterministic reduction utility matching the C++ `double` accumulator type and summation order
+- [x] **DATA-07**: Single audited deterministic reduction utility matching the C++ `double` accumulator type and summation order
 - [ ] **DATA-08**: Per-object / per-class weights and auto class weights (Balanced/SqrtBalanced)
 
 ### CPU Training Core
@@ -141,7 +141,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | DATA-04 | Phase 2 | Pending |
 | DATA-05 | Phase 2 | Pending |
 | DATA-06 | Phase 2 | Pending |
-| DATA-07 | Phase 2 | Pending |
+| DATA-07 | Phase 2 | Complete |
 | DATA-08 | Phase 2 | Pending |
 | TRAIN-01 | Phase 3 | Pending |
 | TRAIN-02 | Phase 3 | Pending |

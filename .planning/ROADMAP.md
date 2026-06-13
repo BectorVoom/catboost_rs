@@ -65,7 +65,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1**
 
-- [ ] 02-01-PLAN.md — Foundation: cb-core reduction primitive + D-08 CI-grep gate + Wave-0 oracle fixtures (numeric_nan/borders/cat-hash/class-weights) resolving Assumptions A1–A5
+- [x] 02-01-PLAN.md — Foundation: cb-core reduction primitive + D-08 CI-grep gate + Wave-0 oracle fixtures (numeric_nan/borders/cat-hash/class-weights) resolving Assumptions A1–A5
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -190,7 +190,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Workspace, Lint & Oracle Harness | 3/3 | Complete   | 2026-06-13 |
-| 2. Data Layer — Pool, Quantization & Reduction | 0/5 | Planned | - |
+| 2. Data Layer — Pool, Quantization & Reduction | 1/5 | In Progress|  |
 | 3. CPU Training Core — Plain Boosting & Trees | 0/TBD | Not started | - |
 | 4. Model, Serialization, SHAP & Rust API | 0/TBD | Not started | - |
 | 5. Ordered Boosting, Ordered CTR & Categoricals | 0/TBD | Not started | - |
