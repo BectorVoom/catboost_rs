@@ -1,20 +1,14 @@
 {
-  "boost_from_average": true,
-  "borders_feature_indices": [
-    0,
-    1,
-    2,
-    3
-  ],
-  "borders_layout": "flat f64: feature 0 borders, then feature 1, ... ; borders_per_feature.npy gives the per-feature counts",
+  "boost_from_average": false,
   "catboost_version": "1.2.10",
   "input_dataset": "numeric_tiny",
-  "loss_function": "RMSE",
+  "label_definition": "y_binary = (numeric_tiny.y > median(numeric_tiny.y))",
+  "loss_function": "Logloss",
   "n_features": 4,
   "n_iterations": 5,
   "n_rows": 50,
   "params": {
-    "boost_from_average": true,
+    "boost_from_average": false,
     "bootstrap_type": "No",
     "depth": 2,
     "iterations": 5,
@@ -28,11 +22,11 @@
     "thread_count": 1,
     "verbose": false
   },
-  "scenario": "regression_skeleton",
+  "prediction_type": "RawFormulaVal",
+  "scenario": "binclf_skeleton",
   "seed": 0,
-  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages",
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw logits)",
   "stages": [
-    "Borders",
     "Splits",
     "LeafValues",
     "StagedApprox",

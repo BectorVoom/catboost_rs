@@ -1,26 +1,39 @@
 #!/usr/bin/env python3
-"""Generate per-stage expected-OUTPUT oracle fixtures (regression_skeleton).
+"""Generate per-stage expected-OUTPUT oracle fixtures (training + Wave-0).
 
-BUILD-TIME tool (D-12): runs OUTSIDE CI, writes committed frozen fixtures. CI
-only READS the committed artifacts.
+RUN-ONCE / COMMIT discipline (D-12): this is a BUILD-TIME tool that runs OUTSIDE
+CI and writes committed frozen fixtures. CI only READS the committed artifacts;
+the generator is NEVER invoked from CI. Re-run it by hand only to regenerate a
+fixture, then COMMIT the result. It adds NO C++ build step for the training
+oracles (D-11 — Python-reachable oracle only; the cat_hash scenario's small C++
+cityhash oracle is a pre-existing Wave-0 asset unrelated to training).
 
-Loads the frozen `numeric_tiny` INPUT corpus (produced by `gen_inputs.py`),
-trains a pinned `CatBoostRegressor`, and extracts the per-stage oracle values the
-Rust harness compares against at <= 1e-5 (INFRA-04):
+Loads the frozen `numeric_tiny` INPUT corpus (produced by `gen_inputs.py`) and
+trains TWO pinned training oracles whose per-stage values the Rust harness
+compares against at <= 1e-5 (INFRA-04):
 
-    get_borders()            -> borders.npy        (flattened f64, layout below)
-    save_model(format=json)  -> model.json         (splits + leaf_values, INFRA-04)
-    staged_predict()         -> staged.npy         (n_iterations x n_rows, flat f64)
-    predict()                -> predictions.npy    (n_rows f64)
+    regression_skeleton (RMSE)   -> CatBoostRegressor,  boost_from_average=True
+    binclf_skeleton     (Logloss) -> CatBoostClassifier, boost_from_average=False
+
+For each scenario:
+    save_model(format=json)  -> model.json    (splits + leaf_values, INFRA-04)
+    staged_predict()         -> staged.npy    (n_iterations x n_rows, flat f64;
+                                                Logloss uses RawFormulaVal raw
+                                                logits, A5/Pitfall 6)
+    predict()                -> predictions.npy
+
+SIMPLIFIED ISOLATING PARAMS (D-07/A1/A2/A4): both scenarios deliberately pin
+`bootstrap_type='No'`, `random_strength=0`, fixed `l2_leaf_reg`/`depth`/
+`learning_rate`/`iterations`, `leaf_estimation_iterations=1`, `score_function='L2'`
+(Open Q1 RESOLVED to L2 — simplest first-slice math), `leaf_estimation_method=
+'Gradient'`, a fixed `random_seed`, and `thread_count=1` so any first-slice
+divergence can only be the tree/leaf math, not an interacting subsystem.
+`boost_from_average` is set explicitly per loss (True for RMSE, False for
+Logloss — Pitfall 2).
 
 Determinism (Pitfall 2 / T-01-07): thread_count=1 and a fixed random_seed make
-the summation order reproducible; the exact params + seed are recorded in
-fixtures/regression_skeleton/config.json so the baseline is auditable.
-
-borders.npy layout: borders for feature 0, then feature 1, ... concatenated in
-ascending feature-index order. borders_per_feature.npy records the count for each
-feature (f64-encoded integer counts) so a reader can split the flat vector back
-into per-feature border lists.
+the summation order reproducible; the exact params + seed are recorded in each
+scenario's config.json so the baseline is auditable.
 
 Run (after gen_inputs.py):
     .venv/bin/python gen_fixtures.py
@@ -40,6 +53,7 @@ GENERATOR_DIR = Path(__file__).resolve().parent
 FIXTURES = GENERATOR_DIR.parent / "fixtures"
 INPUTS = FIXTURES / "inputs"
 SCENARIO = FIXTURES / "regression_skeleton"
+BINCLF_SCENARIO = FIXTURES / "binclf_skeleton"
 BORDERS_QUANT = FIXTURES / "borders_quant"
 CAT_HASH = FIXTURES / "cat_hash"
 CLASS_WEIGHTS = FIXTURES / "class_weights"
@@ -52,14 +66,39 @@ F32_MAX = float(np.finfo(np.float32).max)
 
 CATBOOST_VERSION = "1.2.10"
 SEED = 0
-PARAMS = {
-    "iterations": 10,
+
+# D-07 simplified isolating params shared by BOTH training scenarios. Every knob
+# that interacts with the tree/leaf math is pinned to its most isolating value so
+# a first-slice divergence can only be the tree/leaf math itself (A1/A2/A4):
+#   bootstrap_type=No / subsample-free      -> no sampling draw interaction
+#   random_strength=0                       -> no score noise (TRAIN-05 deferred)
+#   l2_leaf_reg=3.0                         -> fixed, explicit regularization
+#   depth=2                                 -> 4 leaves/tree, small split count
+#   learning_rate=0.1, iterations=5         -> small, fixed boosting loop
+#   leaf_estimation_iterations=1            -> single Newton/Gradient leaf step (A4/Pitfall 5)
+#   score_function=L2                       -> simplest split-score math (Open Q1 RESOLVED)
+#   leaf_estimation_method=Gradient         -> simplest leaf estimator first
+#   random_seed fixed, thread_count=1       -> deterministic summation order (Pitfall 2)
+# `boost_from_average` is set PER LOSS at the call site (True RMSE / False
+# Logloss, Pitfall 2), so it is intentionally absent from this shared dict.
+ISOLATING_PARAMS = {
+    "iterations": 5,
     "learning_rate": 0.1,
-    "depth": 4,
+    "depth": 2,
+    "l2_leaf_reg": 3.0,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "leaf_estimation_iterations": 1,
+    "score_function": "L2",
+    "leaf_estimation_method": "Gradient",
     "random_seed": SEED,
     "thread_count": 1,  # Pitfall 2: pin to 1 for deterministic summation order.
     "verbose": False,
 }
+
+# Back-compat alias: the borders_quant / numeric_tiny Wave-0 borders stage still
+# reads `PARAMS` for the regression skeleton's recorded baseline.
+PARAMS = ISOLATING_PARAMS
 
 
 def _assert_f64(arr: np.ndarray, name: str) -> np.ndarray:
@@ -414,12 +453,78 @@ def gen_class_weights() -> None:
         fh.write("\n")
 
 
+def gen_binclf_skeleton() -> None:
+    """binclf_skeleton/ — Logloss binary-classification training oracle mirroring
+    regression_skeleton with the SAME simplified isolating params (D-07) except
+    `boost_from_average=False` (Pitfall 2: Logloss boosts from 0, not the label
+    mean). Reuses the frozen `numeric_tiny` feature matrix; binary labels are the
+    deterministic `y > median(y)` split of the same target (no new input corpus).
+
+    staged.npy stores RAW LOGITS via prediction_type='RawFormulaVal' (A5 /
+    Pitfall 6) so the oracle is the pre-sigmoid approximant the Rust boosting
+    loop produces directly — NOT the sigmoid probability."""
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y_cont = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    # Deterministic binary labels from the frozen regression target.
+    y = (y_cont > np.median(y_cont)).astype(np.int64)
+
+    model = CatBoostClassifier(boost_from_average=False, **ISOLATING_PARAMS)
+    model.fit(x, y)
+
+    BINCLF_SCENARIO.mkdir(parents=True, exist_ok=True)
+
+    # --- Stage: Splits + LeafValues (model.json) ----------------------------
+    model.save_model(str(BINCLF_SCENARIO / "model.json"), format="json")
+
+    # --- Stage: StagedApprox (RAW logits, A5/Pitfall 6) ---------------------
+    staged = [
+        np.asarray(p, dtype=np.float64)
+        for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+    ]
+    staged_flat = _assert_f64(
+        np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+    )
+    np.save(BINCLF_SCENARIO / "staged.npy", staged_flat, allow_pickle=False)
+
+    # --- Stage: Predictions (raw logits, to match staged final stage) -------
+    predictions = _assert_f64(
+        np.asarray(
+            model.predict(x, prediction_type="RawFormulaVal"), dtype=np.float64
+        ),
+        "predictions",
+    )
+    np.save(BINCLF_SCENARIO / "predictions.npy", predictions, allow_pickle=False)
+
+    config = {
+        "scenario": "binclf_skeleton",
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "loss_function": "Logloss",
+        "label_definition": "y_binary = (numeric_tiny.y > median(numeric_tiny.y))",
+        "boost_from_average": False,
+        "params": {**ISOLATING_PARAMS, "boost_from_average": False},
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "n_iterations": len(staged),
+        "prediction_type": "RawFormulaVal",
+        "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+        "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw logits)",
+    }
+    with (BINCLF_SCENARIO / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
     y = np.load(INPUTS / "numeric_tiny" / "y.npy")
 
-    model = CatBoostRegressor(**PARAMS)
+    # RMSE regression skeleton: simplified isolating params (D-07) with
+    # boost_from_average=True (Pitfall 2: RMSE boosts from the label mean).
+    model = CatBoostRegressor(boost_from_average=True, **ISOLATING_PARAMS)
     model.fit(x, y)
 
     SCENARIO.mkdir(parents=True, exist_ok=True)
@@ -460,7 +565,9 @@ def main() -> None:
         "catboost_version": CATBOOST_VERSION,
         "thread_count": 1,
         "input_dataset": "numeric_tiny",
-        "params": PARAMS,
+        "loss_function": "RMSE",
+        "boost_from_average": True,
+        "params": {**ISOLATING_PARAMS, "boost_from_average": True},
         "n_rows": int(x.shape[0]),
         "n_features": int(x.shape[1]),
         "n_iterations": len(staged),
@@ -481,6 +588,10 @@ def main() -> None:
         f"  borders={borders_arr.shape}, staged={staged_flat.shape}, "
         f"predictions={predictions.shape}"
     )
+
+    # --- binclf_skeleton (Logloss training oracle, D-07/D-08) ---------------
+    gen_binclf_skeleton()
+    print(f"Wrote binclf_skeleton oracle fixtures under {BINCLF_SCENARIO}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()

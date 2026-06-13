@@ -6,8 +6,7 @@
           {
             "borders":
               [
-                0.57567954063415527,
-                0.79633522033691406
+                0.75937354564666748
               ],
             "feature_id":"",
             "feature_index":0,
@@ -18,8 +17,6 @@
           {
             "borders":
               [
-                -0.083649508655071259,
-                0.28499358892440796
               ],
             "feature_id":"",
             "feature_index":1,
@@ -40,9 +37,8 @@
           {
             "borders":
               [
-                -0.15853103995323181,
-                0.3004736602306366,
-                1.0769416093826294
+                0.056806605309247971,
+                0.3004736602306366
               ],
             "feature_id":"",
             "feature_index":3,
@@ -55,14 +51,29 @@
   "model_info":
     {
       "catboost_version_info":"Git info:\n    Commit: b1bd2a6d77219e82a1acfcedfccb8e6f6c1ee084\n    Branch: tags/v1.2.10\n    Author: akhropov <akhropov@yandex-team.com>\n    Summary: CatBoost release 1.2.10. commit_hash:f8e0038b19555d36a9ba7b81b6730254b352960d\n    git-svn info:\n    Last Changed Rev: 9293085\n\nOther info:\n    Build by: Unknown user\n    Top src dir: /src/catboost\n",
-      "model_guid":"f22c76e2-b18041d2-a033647-28c1dc98",
+      "class_params":
+        {
+          "class_label_type":"Integer",
+          "class_names":
+            [
+              0,
+              1
+            ],
+          "class_to_label":
+            [
+              0,
+              1
+            ],
+          "classes_count":0
+        },
+      "model_guid":"3bad41ac-c9d2c56c-bff7c6a9-771ec5d3",
       "output_options":"{\"name\":\"experiment\",\"verbose\":0,\"test_error_log\":\"test_error.tsv\",\"json_log\":\"catboost_training.json\",\"result_model_file\":\"model\",\"roc_file\":\"\",\"eval_file_name\":\"\",\"use_best_model\":false,\"allow_writing_files\":true,\"prediction_type\":[\"RawFormulaVal\"],\"fstr_internal_file\":\"\",\"output_columns\":[\"SampleId\",\"RawFormulaVal\",\"Label\"],\"snapshot_interval\":600,\"time_left_log\":\"time_left.tsv\",\"fstr_type\":\"FeatureImportance\",\"profile_log\":\"catboost_profile.log\",\"train_dir\":\"catboost_info\",\"learn_error_log\":\"learn_error.tsv\",\"training_options_file\":\"\",\"snapshot_file\":\"experiment.cbsnapshot\",\"save_snapshot\":false,\"model_format\":[\"CatboostBinary\"],\"final_feature_calcer_computation_mode\":\"Default\",\"metric_period\":1,\"output_borders\":\"\",\"final_ctr_computation_mode\":\"Default\",\"best_model_min_trees\":1,\"fstr_regular_file\":\"\"}",
       "params":
         {
           "boosting_options":
             {
               "approx_on_full_history":false,
-              "boost_from_average":true,
+              "boost_from_average":false,
               "boosting_type":"Plain",
               "fold_len_multiplier":2,
               "fold_permutation_block":0,
@@ -197,6 +208,8 @@
               "auto_class_weights":"None",
               "class_names":
                 [
+                  0,
+                  1
                 ],
               "class_weights":
                 [
@@ -279,6 +292,20 @@
                               [
                                 "Space"
                               ]
+                          },
+                          {
+                            "dictionaries_names":
+                              [
+                                "Word"
+                              ],
+                            "feature_calcers":
+                              [
+                                "NaiveBayes"
+                              ],
+                            "tokenizers_names":
+                              [
+                                "Space"
+                              ]
                           }
                         ]
                     },
@@ -311,7 +338,7 @@
           "detailed_profile":false,
           "flat_params":
             {
-              "boost_from_average":true,
+              "boost_from_average":false,
               "bootstrap_type":"No",
               "depth":2,
               "iterations":5,
@@ -319,7 +346,7 @@
               "leaf_estimation_iterations":1,
               "leaf_estimation_method":"Gradient",
               "learning_rate":0.10000000000000001,
-              "loss_function":"RMSE",
+              "loss_function":"Logloss",
               "random_seed":0,
               "random_strength":0,
               "score_function":"L2",
@@ -332,7 +359,7 @@
               "params":
                 {
                 },
-              "type":"RMSE"
+              "type":"Logloss"
             },
           "metadata":
             {
@@ -347,14 +374,14 @@
                   "params":
                     {
                     },
-                  "type":"RMSE"
+                  "type":"Logloss"
                 },
               "objective_metric":
                 {
                   "params":
                     {
                     },
-                  "type":"RMSE"
+                  "type":"Logloss"
                 }
             },
           "pool_metainfo_options":
@@ -417,35 +444,35 @@
             }
         },
       "train_finish_time":"2026-06-13T07:19:50Z",
-      "training":"{\"metrics\":{\"learn_best_error\":{\"RMSE\":3.023348209258485},\"test_metrics_history\":[],\"learn_metrics_history\":[{\"RMSE\":3.691113717063441},{\"RMSE\":3.5007198327638807},{\"RMSE\":3.325183086271042},{\"RMSE\":3.166983396180925},{\"RMSE\":3.023348209258485}],\"test_best_error\":[]}}"
+      "training":"{\"metrics\":{\"learn_best_error\":{\"Logloss\":0.6162879697978496},\"test_metrics_history\":[],\"learn_metrics_history\":[{\"Logloss\":0.6764910285174847},{\"Logloss\":0.6605367009341717},{\"Logloss\":0.645250635445118},{\"Logloss\":0.6306082792580128},{\"Logloss\":0.6162879697978496}],\"test_best_error\":[]}}"
     },
   "oblivious_trees":
     [
       {
         "leaf_values":
           [
-            -0.29212603981407614,
-            0.22227151215977728,
-            0.059606706411408625,
-            0.33976994729361509
+            -0.040740741347825085,
+            0.042105263785312048,
+            0.018750000279396772,
+            0.018750000279396772
           ],
         "leaf_weights":
           [
-            23,
-            15,
-            6,
-            6
+            24,
+            16,
+            5,
+            5
           ],
         "splits":
           [
             {
               "border":0.3004736602306366,
               "float_feature_index":3,
-              "split_index":5,
+              "split_index":2,
               "split_type":"FloatFeature"
             },
             {
-              "border":0.57567954063415527,
+              "border":0.75937354564666748,
               "float_feature_index":0,
               "split_index":0,
               "split_type":"FloatFeature"
@@ -455,61 +482,30 @@
       {
         "leaf_values":
           [
-            -0.036228581575872811,
-            0.31914139477120146,
-            -0.30752807868656795,
-            0.15796676716153357
+            -0.039835516731396736,
+            0.04121896810157568,
+            0.018457040103433249,
+            0.018457040103433249
           ],
         "leaf_weights":
           [
-            13,
-            11,
+            24,
             16,
-            10
+            5,
+            5
           ],
         "splits":
           [
             {
               "border":0.3004736602306366,
               "float_feature_index":3,
-              "split_index":5,
-              "split_type":"FloatFeature"
-            },
-            {
-              "border":-0.083649508655071259,
-              "float_feature_index":1,
               "split_index":2,
               "split_type":"FloatFeature"
-            }
-          ]
-      },
-      {
-        "leaf_values":
-          [
-            -0.22153944944538065,
-            0.066885908748452738,
-            0,
-            0.35047108986980252
-          ],
-        "leaf_weights":
-          [
-            24,
-            15,
-            0,
-            11
-          ],
-        "splits":
-          [
-            {
-              "border":-0.15853103995323181,
-              "float_feature_index":3,
-              "split_index":4,
-              "split_type":"FloatFeature"
             },
             {
-              "border":1.0769416093826294,
-              "float_feature_index":3,
-              "split_index":6,
+              "border":0.75937354564666748,
+              "float_feature_index":0,
+              "split_index":0,
               "split_type":"FloatFeature"
             }
           ]
@@ -517,30 +513,30 @@
       {
         "leaf_values":
           [
-            -0.22685466525008047,
-            0.17538615032122168,
-            0.092472372899202293,
-            0.29319972430440905
+            -0.038951125964978864,
+            0.040352083636542226,
+            0.018168707323284669,
+            0.018168707323284669
           ],
         "leaf_weights":
           [
             24,
-            17,
+            16,
             5,
-            4
+            5
           ],
         "splits":
           [
             {
               "border":0.3004736602306366,
               "float_feature_index":3,
-              "split_index":5,
+              "split_index":2,
               "split_type":"FloatFeature"
             },
             {
-              "border":0.79633522033691406,
+              "border":0.75937354564666748,
               "float_feature_index":0,
-              "split_index":1,
+              "split_index":0,
               "split_type":"FloatFeature"
             }
           ]
@@ -548,30 +544,61 @@
       {
         "leaf_values":
           [
-            -0.074338683945706224,
-            0.23448212568568652,
-            -0.28995326413895328,
-            0.050092525940221677
+            -0.038087735046412108,
+            0.039504865600339958,
+            0.017884975245322988,
+            0.017884975245322988
           ],
         "leaf_weights":
           [
-            14,
-            17,
-            10,
-            9
+            24,
+            16,
+            5,
+            5
           ],
         "splits":
           [
             {
-              "border":-0.15853103995323181,
+              "border":0.3004736602306366,
               "float_feature_index":3,
-              "split_index":4,
+              "split_index":2,
               "split_type":"FloatFeature"
             },
             {
-              "border":0.28499358892440796,
-              "float_feature_index":1,
-              "split_index":3,
+              "border":0.75937354564666748,
+              "float_feature_index":0,
+              "split_index":0,
+              "split_type":"FloatFeature"
+            }
+          ]
+      },
+      {
+        "leaf_values":
+          [
+            -0.04053962871791994,
+            0.035368403603856881,
+            0.017605813170867839,
+            0.017605813170867839
+          ],
+        "leaf_weights":
+          [
+            22,
+            18,
+            5,
+            5
+          ],
+        "splits":
+          [
+            {
+              "border":0.056806605309247971,
+              "float_feature_index":3,
+              "split_index":1,
+              "split_type":"FloatFeature"
+            },
+            {
+              "border":0.75937354564666748,
+              "float_feature_index":0,
+              "split_index":0,
               "split_type":"FloatFeature"
             }
           ]
@@ -581,7 +608,7 @@
     [
       1,
       [
-        0.31519675254821777
+        0
       ]
     ]
 }
