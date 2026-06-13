@@ -1,6 +1,7 @@
 {
-  "A4_resolution": "Integer cat features stringify as PLAIN integers before hashing: '3' -> ui32=2658984922 differs from '3.0' -> ui32=1187060909. Rust must hash the integer string form ('3'), never the float form ('3.0').",
-  "A5_resolution": "(string -> ui32) vectors are EXTRACTED from upstream catboost 1.2.10 (model.json ctr_data hash_map), not from a third-party cityhash crate. Rust's port of util/digest/city.cpp must reproduce string_to_ui32 bit-exactly.",
+  "A4_resolution": "Integer cat features stringify as PLAIN integers before hashing: '3' -> ui32=593172586 differs from '3.0' -> ui32=3194819829. Rust must hash the integer string form ('3'), never the float form ('3.0').",
+  "A5_resolution": "(string -> ui32) vectors are CalcCatFeatureHash(s) = CityHash64(s) & 0xffffffff, computed by a standalone C++ oracle (generator/cityhash_oracle.cpp) transcribed from the VENDORED catboost-master/util/digest/city.cpp (CityHash 1.0, the same algorithm the live catboost library compiles). CORRECTION: the previous fixtures pulled these from a trained model's ctr_data hash_map, which stores CTR-PROJECTION hashes (CalcHashes + MultiHash + priors, index_hash_calcer.h), NOT raw CalcCatFeatureHash -- the wrong oracle target for a CityHash64 port. Rust's port of util/digest/city.cpp reproduces string_to_ui32 bit-exactly.",
+  "borders_source": "vendored util/digest/city.cpp via generator/cityhash_oracle.cpp",
   "c0_first_seen_order": [
     "alpha",
     "beta",
@@ -22,28 +23,28 @@
   "scenario": "cat_hash",
   "seed": 0,
   "string_to_ui32": {
-    "-2": 1031063797,
-    "10": 1248546038,
-    "3": 2658984922,
-    "3.0": 1187060909,
-    "7": 2282918139,
-    "alpha": 3214079027,
-    "beta": 1348281933,
-    "delta": 1934101689,
-    "epsilon": 686881752,
-    "gamma": 2843793638
+    "-2": 2015104637,
+    "10": 2957118694,
+    "3": 593172586,
+    "3.0": 3194819829,
+    "7": 4277023987,
+    "alpha": 1296865003,
+    "beta": 1564428181,
+    "delta": 1773912545,
+    "epsilon": 4096080792,
+    "gamma": 2872234582
   },
   "string_to_ui64_precursor": {
-    "-2": "2801878477000984821",
-    "10": "6514551042282835190",
-    "3": "3644720124901778394",
-    "3.0": "1699882558692596909",
-    "7": "11294937213853405435",
-    "alpha": "7657953995089179699",
-    "beta": "7262361550774412877",
-    "delta": "3805318885633690809",
-    "epsilon": "2703189787576171480",
-    "gamma": "6946772444896090342"
+    "-2": "3282459681747635837",
+    "10": "14482936244000132326",
+    "3": "11275350073939794026",
+    "3.0": "510719357545682165",
+    "7": "5566429635965498611",
+    "alpha": "1772952377847748331",
+    "beta": "2945048523696981909",
+    "delta": "3351461251694445025",
+    "epsilon": "13796353081122044824",
+    "gamma": "10780933386931458646"
   },
   "thread_count": 1
 }

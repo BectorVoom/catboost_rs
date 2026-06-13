@@ -25,6 +25,7 @@
 )]
 
 mod borders;
+mod cat_hash;
 pub mod ingest;
 mod nan_mode;
 mod pool;
@@ -32,6 +33,9 @@ mod quantize;
 mod quantized_pool;
 
 pub use borders::{penalty_maxsumlog, select_borders_greedy_logsum};
+pub use cat_hash::{
+    calc_cat_feature_hash, city_hash_64, perfect_hash_bins, stringify_int_category, PerfectHash,
+};
 pub use nan_mode::{bin_of, insert_sentinel, nan_bin, NanMode};
 pub use pool::{Pair, Pool};
 pub use quantize::QuantizeParams;
@@ -41,6 +45,8 @@ pub use quantized_pool::{
 
 #[cfg(test)]
 mod borders_test;
+#[cfg(test)]
+mod cat_hash_test;
 #[cfg(test)]
 mod nan_mode_test;
 #[cfg(test)]

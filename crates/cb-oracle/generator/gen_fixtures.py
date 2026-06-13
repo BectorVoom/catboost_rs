@@ -28,12 +28,16 @@ Run (after gen_inputs.py):
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
 from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 
-FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+GENERATOR_DIR = Path(__file__).resolve().parent
+FIXTURES = GENERATOR_DIR.parent / "fixtures"
 INPUTS = FIXTURES / "inputs"
 SCENARIO = FIXTURES / "regression_skeleton"
 BORDERS_QUANT = FIXTURES / "borders_quant"
@@ -207,39 +211,55 @@ def gen_borders_quant() -> None:
         fh.write("\n")
 
 
-def _isolate_cat_hash(probe: str, anchors: list[str]) -> int:
-    """Return the full ui64 CalcCatFeatureHash precursor for `probe` by training
-    a CTR model on (anchors + [probe]) and taking the hash_map entry absent from
-    an anchors-only run. Deterministic; thread_count=1."""
-    empty = 18446744073709551615
+_CITYHASH_ORACLE_SRC = GENERATOR_DIR / "cityhash_oracle.cpp"
+_VENDORED_CITY_CPP = (
+    GENERATOR_DIR.parent.parent.parent / "catboost-master" / "util" / "digest" / "city.cpp"
+)
 
-    def hash_set(distinct: list[str]) -> set[int]:
-        import pandas as pd
 
-        cats = (distinct * 6)[: max(12, len(distinct) * 3)]
-        labels = [j % 2 for j in range(len(cats))]
-        df = pd.DataFrame({"c0": cats})
-        pool = Pool(df, label=labels, cat_features=["c0"])
-        m = CatBoostClassifier(
-            iterations=20, depth=2, random_seed=SEED, thread_count=1, verbose=False
+def _build_cityhash_oracle() -> Path:
+    """Compile the standalone CalcCatFeatureHash oracle (a dependency-free
+    transcription of the vendored `util/digest/city.cpp` — the same algorithm the
+    live catboost library compiles) and return the executable path.
+
+    AUTHORITATIVE SOURCE OF TRUTH (A5 correction): the previous fixtures pulled
+    (string -> ui32) values from a trained model's `ctr_data` `hash_map`, which
+    stores CTR-PROJECTION hashes (CalcHashes over projections, MultiHash-combined
+    with priors — index_hash_calcer.h), NOT raw `CalcCatFeatureHash(string)`.
+    Those are the wrong oracle target for a CityHash64 port. We instead hash each
+    string with the vendored CityHash 1.0 algorithm directly."""
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if cxx is None:
+        raise RuntimeError(
+            "no C++ compiler (g++/clang++) found to build the CalcCatFeatureHash oracle"
         )
-        m.fit(pool)
-        import tempfile
+    out = Path(tempfile.mkdtemp()) / "cityhash_oracle"
+    subprocess.run(
+        [cxx, "-O2", "-std=c++17", str(_CITYHASH_ORACLE_SRC), "-o", str(out)],
+        check=True,
+    )
+    return out
 
-        p = tempfile.mktemp(suffix=".json")
-        m.save_model(p, format="json")
-        cd = json.load(open(p)).get("ctr_data") or {}
-        key = next(k for k in cd if '"type":"Borders"' in k)
-        hm = cd[key]["hash_map"]
-        st = cd[key]["hash_stride"]
-        return {int(hm[i]) for i in range(0, len(hm), st) if int(hm[i]) != empty}
 
-    base = hash_set(anchors)
-    full = hash_set(anchors + [probe])
-    new = [h for h in full if h not in base]
-    if len(new) != 1:
-        raise AssertionError(f"hash isolation for {probe!r} ambiguous: {sorted(new)}")
-    return new[0]
+def _calc_cat_feature_hashes(strings: list[str]) -> dict[str, tuple[int, int]]:
+    """Map each string to (ui64 CityHash64, ui32 CalcCatFeatureHash) via the
+    vendored-source oracle tool. Strings are passed one-per-line; they must not
+    contain a newline (none of the categorical corpus does)."""
+    exe = _build_cityhash_oracle()
+    payload = "".join(s + "\n" for s in strings)
+    proc = subprocess.run(
+        [str(exe)], input=payload, capture_output=True, text=True, check=True
+    )
+    lines = proc.stdout.splitlines()
+    if len(lines) != len(strings):
+        raise AssertionError(
+            f"oracle returned {len(lines)} lines for {len(strings)} strings"
+        )
+    out: dict[str, tuple[int, int]] = {}
+    for s, line in zip(strings, lines):
+        ui64_s, ui32_s = line.split("\t")
+        out[s] = (int(ui64_s), int(ui32_s))
+    return out
 
 
 def gen_cat_hash() -> None:
@@ -252,18 +272,18 @@ def gen_cat_hash() -> None:
     c0 = [str(v) for v in np.load(INPUTS / "explicit_categorical" / "c0.npy")]
     c1 = [str(v) for v in np.load(INPUTS / "explicit_categorical" / "c1.npy")]
 
-    # Stable anchor set kept distinct from all probe strings so the CTR builds.
-    anchors = ["A_anchor0", "A_anchor1", "A_anchor2", "A_anchor3"]
     # All distinct category strings across both columns, first-seen order.
     distinct = list(dict.fromkeys(c0 + c1))
     # A4 demonstrator: include '3' and '3.0' to PROVE they hash differently.
     a4_demo = ["3", "3.0"]
     probe_strings = list(dict.fromkeys(distinct + a4_demo))
 
-    str_to_ui64: dict[str, int] = {}
-    for s in probe_strings:
-        str_to_ui64[s] = _isolate_cat_hash(s, anchors)
-    str_to_ui32 = {s: (h & 0xFFFFFFFF) for s, h in str_to_ui64.items()}
+    # Hash each distinct string with the vendored CityHash 1.0 oracle
+    # (CalcCatFeatureHash, NOT the trained model's CTR hash_map — see
+    # _build_cityhash_oracle for why the old extraction was wrong).
+    str_to_hashes = _calc_cat_feature_hashes(probe_strings)
+    str_to_ui64 = {s: h64 for s, (h64, _h32) in str_to_hashes.items()}
+    str_to_ui32 = {s: h32 for s, (_h64, h32) in str_to_hashes.items()}
 
     # Per-object ui32 hash + perfect-hash bin (first-seen -> incrementing bin)
     # for each categorical column, mirroring upstream first-seen remap
@@ -325,11 +345,18 @@ def gen_cat_hash() -> None:
             "integer string form ('3'), never the float form ('3.0')."
         ),
         "A5_resolution": (
-            "(string -> ui32) vectors are EXTRACTED from upstream catboost "
-            "1.2.10 (model.json ctr_data hash_map), not from a third-party "
-            "cityhash crate. Rust's port of util/digest/city.cpp must reproduce "
-            "string_to_ui32 bit-exactly."
+            "(string -> ui32) vectors are CalcCatFeatureHash(s) = "
+            "CityHash64(s) & 0xffffffff, computed by a standalone C++ oracle "
+            "(generator/cityhash_oracle.cpp) transcribed from the VENDORED "
+            "catboost-master/util/digest/city.cpp (CityHash 1.0, the same "
+            "algorithm the live catboost library compiles). CORRECTION: the "
+            "previous fixtures pulled these from a trained model's ctr_data "
+            "hash_map, which stores CTR-PROJECTION hashes (CalcHashes + MultiHash "
+            "+ priors, index_hash_calcer.h), NOT raw CalcCatFeatureHash -- the "
+            "wrong oracle target for a CityHash64 port. Rust's port of "
+            "util/digest/city.cpp reproduces string_to_ui32 bit-exactly."
         ),
+        "borders_source": "vendored util/digest/city.cpp via generator/cityhash_oracle.cpp",
     }
     with (CAT_HASH / "config.json").open("w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2, sort_keys=True)
