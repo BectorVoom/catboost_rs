@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Completed 02-02-PLAN.md
-last_updated: "2026-06-13T04:24:42.767Z"
+last_updated: "2026-06-13T04:32:56.683Z"
 last_activity: 2026-06-13 -- Plan 02-01 complete (reduction primitive, D-08 gate, Wave-0 fixtures, A1–A5 resolved)
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 13
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 02 (data-layer-pool-quantization-reduction) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute (02-01 complete)
 Last activity: 2026-06-13 -- Plan 02-01 complete (reduction primitive, D-08 gate, Wave-0 fixtures, A1–A5 resolved)
 
@@ -57,6 +57,7 @@ Progress: [██░░░░░░░░] 20% (1 of 5 phase-02 plans complete)
 | Phase 01 P03 | 9min | 3 tasks | 42 files |
 | Phase 02 P01 | 10min | 3 tasks | 22 files |
 | Phase 02 P02 | 30min | 2 tasks | 18 files |
+| Phase 02 P03 | 5 | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -82,6 +83,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 02]: Plan 02-02: Pool is lifetime-free owned Vecs (D-02); IngestSource trait seam validates column lengths with typed CbError; borrowed view plugs in at Phase 8 without reshaping Pool
 - [Phase ?]: [Phase 02]: Plan 02-02: GreedyLogSum binarizer bit-transcribed from binarization.cpp (f64 penalty/score, f32 border midpoints), oracle-locked <=1e-5 per feature; sums routed through cb_core::sum_f64
 - [Phase ?]: [Phase 02]: Plan 02-02 (Rule 1 fix): borders_quant fixtures regenerated from STANDALONE Pool.quantize().save_quantization_borders() (raw 49/49/49/49) instead of training-pruned get_borders(); f32 sentinel snapped to exact f32::MIN
+- [Phase ?]: Per-feature NanMode: NaN-bearing column -> Min sentinel, NaN-free -> Forbidden
+- [Phase ?]: Float bin width hard-capped at u16 -> CbError not panic; u32 categorical-only (utils.h:175-181)
 
 ### Pending Todos
 
@@ -107,6 +110,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T04:24:42.760Z
+Last session: 2026-06-13T04:32:35.982Z
 Stopped at: Completed 02-02-PLAN.md
 Resume file: None

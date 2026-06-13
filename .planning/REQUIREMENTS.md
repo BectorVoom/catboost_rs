@@ -19,9 +19,9 @@
 ### Data Layer (Pool & Quantization)
 
 - [x] **DATA-01**: `Pool` abstraction — float/categorical/text/embedding columns, label, weights, group_id, subgroup_id, pairs, baseline
-- [ ] **DATA-02**: `QuantizedPool` — columnar SoA `u8`/`u16` bin storage with pre-allocated buffers reused across rounds (memory efficiency)
+- [x] **DATA-02**: `QuantizedPool` — columnar SoA `u8`/`u16` bin storage with pre-allocated buffers reused across rounds (memory efficiency)
 - [x] **DATA-03**: `GreedyLogSum` border selection, per-feature border set oracle-validated (including NaN/duplicate columns, `<`/`<=` semantics)
-- [ ] **DATA-04**: Missing-value handling — `NanMode` (Min/Max/Forbidden)
+- [x] **DATA-04**: Missing-value handling — `NanMode` (Min/Max/Forbidden)
 - [ ] **DATA-05**: Categorical feature hashing
 - [ ] **DATA-06**: Zero-copy NumPy ingestion and Arrow/Polars ingestion with dtype/contiguity validation; copy-in path for training
 - [x] **DATA-07**: Single audited deterministic reduction utility matching the C++ `double` accumulator type and summation order
@@ -136,9 +136,9 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | INFRA-05 | Phase 1 | Complete |
 | INFRA-06 | Phase 1 | Complete |
 | DATA-01 | Phase 2 | Complete |
-| DATA-02 | Phase 2 | Pending |
+| DATA-02 | Phase 2 | Complete |
 | DATA-03 | Phase 2 | Complete |
-| DATA-04 | Phase 2 | Pending |
+| DATA-04 | Phase 2 | Complete |
 | DATA-05 | Phase 2 | Pending |
 | DATA-06 | Phase 2 | Pending |
 | DATA-07 | Phase 2 | Complete |
