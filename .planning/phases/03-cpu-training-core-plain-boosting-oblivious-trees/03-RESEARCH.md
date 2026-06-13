@@ -394,27 +394,33 @@ lr = Round(min(defLR * custIter / defIter, 0.5), 6);
 
 **Note:** A1–A6 need confirmation in `/gsd-discuss-phase` or by extending the oracle generator and reading the `Simple`/`Exact` leaf paths before the relevant slice.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All four open questions are resolved below. Each resolution names the plan/task that owns the answer so executors can trace it. Resolutions reflect the locked first-slice params (D-07) and the Python-reachable oracle floor (D-11).
 
 1. **Which `score_function` does the first slice pin?**
    - What we know: CPU default is Cosine; only Cosine and L2 are CPU-supported (`MakePointwiseScoreCalcer`). L2 is the simpler formula.
    - What's unclear: Whether locking against the *default* (Cosine) or pinning L2 gives the cleaner first slice.
    - Recommendation: Pin `score_function=L2` for the very first isolating slice (simplest score math), then add a Cosine-default slice. Implement both calcers (both are short).
+   - **RESOLVED — `score_function=L2` for the first slice.** The first-slice oracle (Plan 00 Task 3) and the slice implementation (Plan 01) both pin `score_function='L2'` for the simplest, unambiguous split-score math. The Cosine-default calcer is implemented but locked in a later additive slice. This matches A2.
 
 2. **CubeCL `CpuRuntime` build spike.**
    - What we know: cubecl 0.10.0, features `["cpu"]`, `bytemuck` for transfer; manual has a working `CpuRuntime` example.
    - What's unclear: Interaction with the workspace deny-lints (`indexing_slicing`, `panic`) inside generated `#[cube]` code, and whether `cb-backend` needs a test-lint exemption.
    - Recommendation: First `cb-backend` task is a minimal `#[cube]` gradient kernel that compiles + runs on `CpuRuntime`, BEFORE wiring it into the boosting loop. Read the CubeCL manual + error guideline first (AGENTS.md).
+   - **RESOLVED — the CubeCL CpuRuntime build spike is Plan 00 Task 1.** Plan 00 Task 1 stands up the minimal `#[cube]` gradient kernel and proves it compiles + runs on `CpuRuntime` under the workspace deny-lints, before any boosting wiring (Plan 01). Any lint-exemption need surfaces there. This matches A3.
 
 3. **Exact `Exact` and `Simple` leaf-estimation formulas (D-09).**
    - What we know: `CalcExactLeafDeltas` is called for `ELeavesEstimation::Exact` (`approx_calcer.cpp:734-744`); Gradient/Newton are in `CalcLeafDeltasSimple`.
    - What's unclear: The exact body of `CalcExactLeafDeltas` (quantile-style exact optimization) and how `Simple` differs.
    - Recommendation: Read `CalcExactLeafDeltas` and the `Simple` path fully in the TRAIN-03 wave (planner: add a focused read task) before implementing; the four methods land together (D-09) so all four must be pinned.
+   - **RESOLVED — the Exact/Simple leaf bodies are read first in Plan 02 Task 1 (read-first) before implementation.** The TRAIN-03 leaf-methods wave (Plan 02) carries an explicit read-first of `CalcExactLeafDeltas` and the `Simple` path so all four methods (Gradient/Newton/Exact/Simple) are transcribed verbatim and oracle-locked together (D-09). This matches A6.
 
 4. **`random_strength` normal-draw oracle observability.**
    - What we know: The draws affect split selection but the draw sequence isn't Python-observable.
    - What's unclear: Whether a `random_strength!=0` slice can be localized at tree granularity, or whether it needs the C++ instrumentation deferred to Phase 5.
    - Recommendation: Lock the TRAIN-05 slice end-to-end (splits+leaves) on a tiny dataset; if it diverges and can't be localized, escalate to instrumentation per D-11.
+   - **RESOLVED — `random_strength != 0` is locked end-to-end at tree granularity.** The TRAIN-05 regularization slice locks `random_strength`/`bagging_temperature` end-to-end (splits + leaf_values + staged approximants) on a tiny dataset via the Python-reachable oracle (D-11). C++ instrumentation is escalated only if a divergence genuinely cannot be localized at tree granularity — deferred to Phase 5 by default (D-11 floor).
 
 ## Environment Availability
 

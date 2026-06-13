@@ -4,7 +4,7 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Phase 3 context gathered
-last_updated: "2026-06-13T06:08:54.494Z"
+last_updated: "2026-06-13T07:04:44.265Z"
 last_activity: 2026-06-13 -- Plan 02-04 complete (CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked; corrected cat_hash fixtures)
 progress:
   total_phases: 8
