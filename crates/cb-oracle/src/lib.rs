@@ -20,7 +20,7 @@ mod compare;
 mod error;
 mod fixture;
 
-pub use compare::{assert_abs_close, Stage};
+pub use compare::{assert_abs_close, compare_stage, Stage};
 pub use error::OracleError;
 pub use fixture::{load_config, load_f64_vec, FixtureConfig};
 

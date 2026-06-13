@@ -29,6 +29,34 @@ pub enum OracleError {
         diff: f64,
     },
 
+    /// A stage-tagged length mismatch (`compare_stage`): the expected and actual
+    /// slices for `stage` had different lengths.
+    #[error("stage {stage:?}: length mismatch: expected {expected} values, got {actual}")]
+    StageLengthMismatch {
+        /// Oracle stage the mismatch occurred in.
+        stage: crate::compare::Stage,
+        /// Length of the expected (oracle) slice.
+        expected: usize,
+        /// Length of the actual (computed) slice.
+        actual: usize,
+    },
+
+    /// A stage-tagged divergence (`compare_stage`): a paired value for `stage`
+    /// diverged beyond `1e-5` at `index`.
+    #[error("stage {stage:?}: diverged at index {index}: expected {expected}, actual {actual}, |diff| = {diff}")]
+    StageDiverged {
+        /// Oracle stage the divergence occurred in.
+        stage: crate::compare::Stage,
+        /// First index whose absolute difference exceeded the tolerance.
+        index: usize,
+        /// Expected (oracle) value at `index`.
+        expected: f64,
+        /// Actual (computed) value at `index`.
+        actual: f64,
+        /// Absolute difference `|expected - actual|`.
+        diff: f64,
+    },
+
     /// Failed to read a `.npy` fixture (bad header, dtype mismatch, etc.).
     #[error("failed to read .npy fixture: {0}")]
     Npy(#[from] ndarray_npy::ReadNpyError),

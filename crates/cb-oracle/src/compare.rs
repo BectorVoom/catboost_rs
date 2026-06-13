@@ -49,3 +49,45 @@ pub fn assert_abs_close(expected: &[f64], actual: &[f64], tol: f64) -> Result<()
     }
     Ok(())
 }
+
+/// Per-stage convenience wrapper over [`assert_abs_close`] at the fixed `1e-5`
+/// parity tolerance (D-12), tagging any failure with the [`Stage`] it occurred
+/// in so callers know which oracle stage drifted (INFRA-04).
+///
+/// This is the per-stage API surface the later phases call with Rust-computed
+/// `actual` values: cb-train (P3) supplies `Stage::StagedApprox`/`Predictions`
+/// actuals, cb-model (P4) supplies `Stage::Splits`/`Stage::LeafValues`. Phase 1
+/// has no Rust algorithm yet, so it only proves the API gates falsifiably on
+/// real oracle fixtures.
+///
+/// # Errors
+/// - [`OracleError::StageLengthMismatch`] if the slices differ in length.
+/// - [`OracleError::StageDiverged`] at the first index whose absolute difference
+///   exceeds `1e-5`, carrying the offending `stage` and `index`.
+pub fn compare_stage(stage: Stage, expected: &[f64], actual: &[f64]) -> Result<(), OracleError> {
+    match assert_abs_close(expected, actual, 1e-5) {
+        Ok(()) => Ok(()),
+        Err(OracleError::LengthMismatch { expected, actual }) => {
+            Err(OracleError::StageLengthMismatch {
+                stage,
+                expected,
+                actual,
+            })
+        }
+        Err(OracleError::Diverged {
+            index,
+            expected,
+            actual,
+            diff,
+        }) => Err(OracleError::StageDiverged {
+            stage,
+            index,
+            expected,
+            actual,
+            diff,
+        }),
+        // `assert_abs_close` only ever yields LengthMismatch / Diverged; any
+        // other variant would be a future addition — propagate it untouched.
+        Err(other) => Err(other),
+    }
+}

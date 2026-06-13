@@ -23,14 +23,32 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
+      # Prove cb-backend's compile-time feature gates all build (D-02). These are
+      # inert placeholders in Phase 1; the build only confirms each cfg arm
+      # compiles. Still CPU-only: nothing here installs accelerator toolchains or
+      # runs a device — it is a pure `cargo build` of the alias crate.
+      - name: cb-backend feature-gate build (wgpu)
+        run: cargo build -p cb-backend --no-default-features --features wgpu
+
+      - name: cb-backend feature-gate build (cuda)
+        run: cargo build -p cb-backend --no-default-features --features cuda
+
+      - name: cb-backend feature-gate build (rocm)
+        run: cargo build -p cb-backend --no-default-features --features rocm
+
       # Production lint gate. `--lib` scope is the Pitfall-1 convention chosen in
       # Task 1: restriction lints are denied for library code; test code is
       # exempted in-code via #![cfg_attr(test, allow(...))] / #![allow(...)].
       - name: Clippy lint gate
         run: cargo clippy --workspace --lib -- -D warnings
 
+      # Reads ONLY committed frozen fixtures (D-12); never installs catboost/numpy
+      # and never runs the build-time generator.
       - name: Test workspace
         run: cargo test --workspace
 
       - name: anyhow ban backstop (D-14)
         run: bash scripts/check-no-anyhow.sh
+
+      - name: source/test separation gate (D-17 / INFRA-06)
+        run: bash scripts/check-source-test-separation.sh
