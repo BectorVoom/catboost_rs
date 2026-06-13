@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked)
-last_updated: "2026-06-13T07:52:06Z"
-last_activity: 2026-06-13 -- Completed Phase 03 Plan 01 (cb-compute boundary + CpuRuntime impl + plain boosting; TRAIN-01/02/03-Gradient)
+stopped_at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked at <=1e-5)
+last_updated: "2026-06-13T08:17:30.587Z"
+last_activity: 2026-06-13 -- Completed Phase 03 Plan 01
 progress:
   total_phases: 8
   completed_phases: 2
   total_plans: 16
-  completed_plans: 10
-  percent: 31
+  completed_plans: 11
+  percent: 25
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 03 (cpu-training-core-plain-boosting-oblivious-trees) — EXECUTING
-Plan: 3 of 8
-Status: Executing Phase 03 (Plans 00, 01 complete)
+Plan: 4 of 8
+Status: Ready to execute
 Last activity: 2026-06-13 -- Completed Phase 03 Plan 01
 
-Progress: [██░░░░░░░░] 25% (2 of 8 phase-03 plans complete)
+Progress: [████░░░░░░] 38% (3 of 8 phase-03 plans complete)
 
 ## Performance Metrics
 
@@ -62,6 +62,7 @@ Progress: [██░░░░░░░░] 25% (2 of 8 phase-03 plans complete)
 | Phase 02 P05 | ~25min | 2 tasks | 12 files |
 | Phase 03 P00 | ~75min | 4 tasks | 16 files |
 | Phase 03 P01 | ~20min | 4 tasks | 27 files |
+| Phase 03 P02 | 12min | 2 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -106,6 +107,7 @@ Recent decisions affecting current work:
 - [Phase 03]: Plan 03-01: Gradient leaf delta = CalcAverage(sumDer, sumWeight, scaledL2), scaledL2 = l2*(sumAllW/docCount) (== l2 unweighted); L2 split score = sum over level leaves of avg*sumDer, strict gain>bestGain first-wins tie-break (Pitfall 1)
 - [Phase 03]: Plan 03-01: TRAIN-01/02 COMPLETE, TRAIN-03 Gradient done (Newton/Exact/Simple -> Plan 02); slice_first_oracle gates Splits/LeafValues/StagedApprox <=1e-5 for RMSE + Logloss; cargo test --workspace green
 - [Phase 03]: Plan 03-01: added CbError::DepthExceeded (depth>16) + CbError::Degenerate (no candidate split/empty) — guards, never panic (T-03-01-01/02); extended cb-oracle::model_json with float_feature_borders() accessor for the oracle test
+- [Phase ?]: Plan 03-02: TRAIN-03 complete — four leaf methods (Gradient/Newton/Exact/Simple) oracle-locked <=1e-5; Newton via Logloss (der2=-p(1-p) distinct), Exact via MAE weighted-median (Exact rejected for RMSE/Logloss upstream), Simple==Gradient (A6); added Loss::Mae + mae_gradient_kernel
 
 ### Pending Todos
 
@@ -132,6 +134,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T07:52:06Z
+Last session: 2026-06-13T08:16:49.870Z
 Stopped at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked at <=1e-5)
 Resume file: None
