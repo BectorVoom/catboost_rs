@@ -58,6 +58,8 @@ BORDERS_QUANT = FIXTURES / "borders_quant"
 CAT_HASH = FIXTURES / "cat_hash"
 CLASS_WEIGHTS = FIXTURES / "class_weights"
 LEAF_METHODS = FIXTURES / "leaf_methods"
+BOOTSTRAP = FIXTURES / "bootstrap"
+BOOTSTRAP_INPUT = INPUTS / "bootstrap_multiblock"
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -67,6 +69,9 @@ F32_MAX = float(np.finfo(np.float32).max)
 
 CATBOOST_VERSION = "1.2.10"
 SEED = 0
+# Dedicated synthesis seed for the TRAIN-04 multi-block bootstrap dataset (kept
+# distinct from numeric_tiny's seed so the corpus is reproducible in isolation).
+INPUT_SEED_BOOTSTRAP = 20260613
 
 # D-07 simplified isolating params shared by BOTH training scenarios. Every knob
 # that interacts with the tree/leaf math is pinned to its most isolating value so
@@ -641,6 +646,154 @@ def gen_leaf_methods() -> None:
             fh.write("\n")
 
 
+def gen_bootstrap() -> None:
+    """bootstrap/{no,bayesian,bernoulli,mvs}/ — the TRAIN-04 (D-10) sampling
+    oracle. Each scenario pins ONE `bootstrap_type` (+ the matching `subsample`
+    or `bagging_temperature`) and every other knob at the first-slice simplified
+    isolating values, so an end-to-end divergence is attributable to the sampler.
+
+    A DEDICATED multi-block dataset (1500 objects > 1000) is synthesized and
+    committed as `inputs/bootstrap_multiblock/` so the per-1000-element-block
+    reseed contract (Pitfall 4: `TRestorableFastRng64(randSeed + blockIdx)` then
+    `Advance(10)`, block size 1000) is actually exercised across >=2 blocks for
+    Bayesian/Bernoulli (MVS uses a single 8192-element block, so it is locked
+    end-to-end only — D-11: MVS internal weights are not Python-observable).
+
+    POISSON IS DELIBERATELY ABSENT: upstream rejects `bootstrap_type=Poisson` on
+    CPU (`bootstrap_options.cpp:27-33` -- "poisson bootstrap is not supported on
+    CPU"), so there is NO Python-reachable CPU oracle for it. The Rust dispatch
+    mirrors upstream by surfacing a `CbError` for Poisson on the CPU path; it is
+    validated only by a unit test of the dispatch error, never an oracle.
+
+    UPSTREAM DRAW SEMANTICS (transcribed from tensor_search_helpers.cpp /
+    calc_score_cache.cpp / mvs.cpp for the Rust Task-2 implementation; CPU,
+    SamplingFrequency=PerTree default, object sampling unit, non-pairwise loss):
+      - Bootstrap runs ONCE PER TREE (greedy_tensor_search.cpp:1916), with the
+        persistent LearnProgress->Rand (seeded `random_seed`) advancing across
+        every iteration -- the draw stream is continuous, NOT reseeded per tree.
+      - No        : SampleWeights all 1.0; SetControl all true; zero RNG draws.
+      - Bayesian  : GenerateRandomWeights -- randSeed = Rand.GenRand(); per
+        1000-block `r = TRestorableFastRng64(randSeed + blockIdx); r.Advance(10)`;
+        per object `w = powf(-ln(r.GenRandReal1() + 1e-100), bagging_temperature)`.
+        SampleWeights[i] = w (Control all true -- performRandomChoice path uses
+        SetSampledControl but BernoulliSampleRate==1 so no draw).
+      - Bernoulli : SampleWeights all 1.0 (Fill); the object subsample lives in
+        TCalcScoreFold::Sample -> SetSampledControl, which draws SEQUENTIALLY from
+        the SAME continuous Rand (NO per-block reseed): `Control[i] =
+        Rand.GenRandReal1() < subsample`. Only sampled (Control true) objects feed
+        the split-score histograms; leaf VALUES are computed on the full fold
+        (SampleWeights==1).
+      - MVS       : performRandomChoice=false; single 8192-block;
+        lambda = (mean|grad|)^2 on iter 0 (CalculateMeanGradValue), else
+        (mean last-iter leaf L2 norm)^2; per block threshold via CalculateThreshold
+        over sqrt(lambda + der^2); per object prob = GetSingleProbability(
+        sqrt(grad2+lambda), threshold); randSeed = Rand.GenRand(); per 8192-block
+        `r = TRestorableFastRng64(randSeed + blockIdx); r.Advance(10)`;
+        SampleWeights[i] = (1/prob) * (r.GenRandReal1() < prob). Control = weight>eps.
+
+    staged.npy stores the per-iteration RAW approximant; model.json carries the
+    learning_rate-scaled leaf_values (the end-to-end <=1e-5 parity targets)."""
+    BOOTSTRAP.mkdir(parents=True, exist_ok=True)
+    BOOTSTRAP_INPUT.mkdir(parents=True, exist_ok=True)
+
+    # Dedicated multi-block dataset: 1500 objects (>= 2 blocks of 1000), 4 numeric
+    # features. Deterministic from a fixed seed; committed as a frozen input.
+    n_rows, n_cols = 1500, 4
+    rng = np.random.default_rng(INPUT_SEED_BOOTSTRAP)
+    x = _assert_f64(rng.standard_normal((n_rows, n_cols)).astype(np.float64), "bootstrap X")
+    coeffs = np.array([1.5, -2.0, 0.5, 3.0], dtype=np.float64)
+    y = _assert_f64(
+        (x @ coeffs + 0.1 * rng.standard_normal(n_rows)).astype(np.float64),
+        "bootstrap y",
+    )
+    np.save(BOOTSTRAP_INPUT / "X.npy", x, allow_pickle=False)
+    np.save(BOOTSTRAP_INPUT / "y.npy", y, allow_pickle=False)
+    with (BOOTSTRAP_INPUT / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "scenario": "inputs/bootstrap_multiblock",
+                "seed": INPUT_SEED_BOOTSTRAP,
+                "n_rows": n_rows,
+                "n_features": n_cols,
+                "target": "x @ [1.5,-2.0,0.5,3.0] + 0.1*N(0,1) (RMSE regression)",
+                "note": "1500 objects (>= 2 reseed blocks of 1000) for the TRAIN-04 bootstrap oracle.",
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+        )
+        fh.write("\n")
+
+    # (name, bootstrap_type, extra-params). RMSE + boost_from_average=True for all
+    # (the first-slice regression path); only the sampler differs per scenario.
+    scenarios = [
+        ("no", "No", {}),
+        ("bayesian", "Bayesian", {"bagging_temperature": 1.0}),
+        ("bernoulli", "Bernoulli", {"subsample": 0.8}),
+        ("mvs", "MVS", {"subsample": 0.8}),
+    ]
+
+    # Shared isolating params WITHOUT the default bootstrap (overridden per
+    # scenario). boost_from_average=True (RMSE). iterations bumped to 3 so the
+    # continuous RNG stream advances across multiple per-tree Bootstrap calls.
+    shared = {k: v for k, v in ISOLATING_PARAMS.items() if k != "bootstrap_type"}
+    shared = {**shared, "iterations": 3, "boost_from_average": True}
+
+    for name, bt, extra in scenarios:
+        scenario_dir = BOOTSTRAP / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        params = {**shared, "bootstrap_type": bt, **extra}
+
+        model = CatBoostRegressor(**params)
+        model.fit(x, y)
+
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        staged = [np.asarray(p, dtype=np.float64) for p in model.staged_predict(x)]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        predictions = _assert_f64(
+            np.asarray(model.predict(x), dtype=np.float64), "predictions"
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": f"bootstrap/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "bootstrap_multiblock",
+            "loss_function": "RMSE",
+            "bootstrap_type": bt,
+            "boost_from_average": True,
+            "params": params,
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (raw approximant)"
+            ),
+            "draw_note": (
+                "CPU SamplingFrequency=PerTree, object sampling, non-pairwise. "
+                "Bootstrap runs once per tree on the continuous LearnProgress->Rand "
+                "(seeded random_seed). No=all 1.0/no draws. Bayesian=per-1000-block "
+                "reseed (randSeed+blockIdx, Advance(10)) powf(-ln(GenRandReal1()+1e-100"
+                "),temp). Bernoulli=Fill(1) + SetSampledControl GenRandReal1()<subsample "
+                "sequential on the SAME Rand (no block reseed). MVS=single 8192-block "
+                "threshold sampler (mvs.cpp). Poisson is rejected on CPU upstream -- no "
+                "oracle exists for it."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -720,6 +873,10 @@ def main() -> None:
     # --- leaf_methods (TRAIN-03 four-method leaf oracle, D-09) --------------
     gen_leaf_methods()
     print(f"Wrote leaf_methods oracle fixtures under {LEAF_METHODS}")
+
+    # --- bootstrap (TRAIN-04 sampling oracle, D-10) -------------------------
+    gen_bootstrap()
+    print(f"Wrote bootstrap oracle fixtures under {BOOTSTRAP}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()

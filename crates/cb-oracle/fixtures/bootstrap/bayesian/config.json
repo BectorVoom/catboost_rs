@@ -1,0 +1,37 @@
+{
+  "boost_from_average": true,
+  "bootstrap_type": "Bayesian",
+  "catboost_version": "1.2.10",
+  "draw_note": "CPU SamplingFrequency=PerTree, object sampling, non-pairwise. Bootstrap runs once per tree on the continuous LearnProgress->Rand (seeded random_seed). No=all 1.0/no draws. Bayesian=per-1000-block reseed (randSeed+blockIdx, Advance(10)) powf(-ln(GenRandReal1()+1e-100),temp). Bernoulli=Fill(1) + SetSampledControl GenRandReal1()<subsample sequential on the SAME Rand (no block reseed). MVS=single 8192-block threshold sampler (mvs.cpp). Poisson is rejected on CPU upstream -- no oracle exists for it.",
+  "input_dataset": "bootstrap_multiblock",
+  "loss_function": "RMSE",
+  "n_features": 4,
+  "n_iterations": 3,
+  "n_rows": 1500,
+  "params": {
+    "bagging_temperature": 1.0,
+    "boost_from_average": true,
+    "bootstrap_type": "Bayesian",
+    "depth": 2,
+    "iterations": 3,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "bootstrap/bayesian",
+  "seed": 0,
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw approximant)",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "thread_count": 1
+}
