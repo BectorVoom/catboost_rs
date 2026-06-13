@@ -21,3 +21,6 @@ cb-oracle = { path = "../cb-oracle" }
 approx.workspace = true
 ndarray.workspace = true
 ndarray-npy.workspace = true
+# Reads the overfit fixtures' config.json (tree_count_ / best_iteration_
+# assertion targets) in the TRAIN-06 oracle test.
+serde_json.workspace = true

@@ -88,7 +88,7 @@ fn iter_stops_exactly_od_wait_after_best() {
     // reaches od_wait, i.e. at iteration 4 + od_wait.
     assert_eq!(
         stopped_at,
-        Some(4 + od_wait as usize),
+        Some(4 + od_wait),
         "Iter must stop exactly od_wait iterations after the best"
     );
 }

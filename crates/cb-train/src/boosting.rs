@@ -26,14 +26,16 @@
 
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta,
-    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev, simple_leaf_delta, LeafMethod,
-    Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev, sigmoid, simple_leaf_delta,
+    LeafMethod, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
+use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 use crate::tree::{
-    check_depth, greedy_tensor_search_oblivious_perturbed, FeatureMatrix, Perturbation, Split,
+    check_depth, greedy_tensor_search_oblivious_perturbed, leaf_index, FeatureMatrix, Perturbation,
+    Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -85,6 +87,18 @@ pub struct BoostParams {
     /// The training random seed seeding the persistent sampling RNG
     /// (`random_seed`). Only consumed when `bootstrap_type != No`.
     pub random_seed: u64,
+    /// Overfitting-detector type (`od_type`, TRAIN-06). [`EOverfittingDetectorType::None`]
+    /// (or a non-positive `od_pval`) disables early stopping.
+    pub od_type: EOverfittingDetectorType,
+    /// Overfitting-detector stop threshold (`od_pval` / `AutoStopPValue`). `0`
+    /// makes IncToDec / Wilcoxon inactive (the upstream default); Iter ignores it
+    /// (the threshold is forced to `1.0`).
+    pub od_pval: f64,
+    /// Overfitting-detector wait iterations (`od_wait` / `IterationsWait`).
+    pub od_wait: usize,
+    /// `use_best_model`: when `true`, track the best eval-metric iteration and
+    /// truncate the model's tree list to it (best_iteration + 1 trees).
+    pub use_best_model: bool,
 }
 
 /// One trained oblivious tree: the ordered splits and the per-leaf values
@@ -209,12 +223,86 @@ fn compute_leaf_deltas(
     }
 }
 
+/// A held-out evaluation set feeding the overfitting detector (TRAIN-06). The
+/// `feature_values` reuse the training feature borders (the model's float-feature
+/// borders) for the `value > border` split tests.
+pub struct EvalSet<'a> {
+    /// `feature_values[f]` is eval float feature `f`'s per-object `f32` column.
+    pub feature_values: &'a [Vec<f32>],
+    /// Eval per-object target labels.
+    pub target: &'a [f64],
+}
+
+/// Apply one oblivious tree to a single eval object: walk its splits to the leaf
+/// and return that leaf's value. Out-of-range indices contribute `0` (defensive;
+/// the trainer supplies valid trees).
+fn tree_eval_contribution(tree: &ObliviousTree, matrix: &FeatureMatrix, obj: usize) -> f64 {
+    let passes: Vec<bool> = tree
+        .splits
+        .iter()
+        .map(|s| {
+            matrix
+                .feature_values
+                .get(s.feature)
+                .and_then(|col| col.get(obj))
+                .is_some_and(|&v| f64::from(v) > s.border)
+        })
+        .collect();
+    let leaf = leaf_index(&passes);
+    tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
+}
+
+/// The minimal inline eval-set metric (the loss the stop decision uses): RMSE for
+/// regression (`sqrt(mean((approx - target)^2))`), Logloss for binary
+/// classification (`mean(-(y*log(p) + (1-y)*log(1-p)))`, `p = sigmoid(approx)`).
+///
+/// Every fold routes through `cb_core::sum_f64` (D-08). `eval_approx` is the
+/// running eval-set raw approximant (bias + Σ tree contributions).
+///
+// STUB: minimal inline eval-set loss for the stop decision; superseded by cb-train::metrics in Plan 06 (TRAIN-07).
+fn inline_eval_metric(loss: Loss, eval_approx: &[f64], eval_target: &[f64]) -> f64 {
+    let n = eval_approx.len();
+    if n == 0 {
+        return 0.0;
+    }
+    match loss {
+        Loss::Rmse | Loss::Mae => {
+            let sq: Vec<f64> = eval_approx
+                .iter()
+                .zip(eval_target.iter())
+                .map(|(&a, &t)| {
+                    let d = a - t;
+                    d * d
+                })
+                .collect();
+            (sum_f64(&sq) / n as f64).sqrt()
+        }
+        Loss::Logloss => {
+            // Cross-entropy over raw logits: -(y*log p + (1-y)*log(1-p)),
+            // p = sigmoid(approx). Clamp p away from {0,1} to avoid -inf.
+            let terms: Vec<f64> = eval_approx
+                .iter()
+                .zip(eval_target.iter())
+                .map(|(&a, &y)| {
+                    let p = sigmoid(a).clamp(1e-15, 1.0 - 1e-15);
+                    -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+                })
+                .collect();
+            sum_f64(&terms) / n as f64
+        }
+    }
+}
+
 /// Train a plain-boosted oblivious-tree model over the generic runtime `R`.
 ///
 /// `feature_values[f]` is float feature `f`'s per-object `f32` column;
 /// `feature_borders[f]` its ascending candidate borders (the model's float-feature
 /// borders). `target`/`weights` are per-object; `staged_out`, when `Some`, is
 /// filled with the per-iteration staged approximants (flat, `iterations * n`).
+/// `eval_set`, when `Some`, drives the overfitting detector (TRAIN-06) and
+/// `use_best_model` truncation via a minimal inline eval-set loss.
+///
+/// Delegates to [`train_with_eval`] without an eval set (no early stopping).
 ///
 /// # Errors
 /// - [`CbError::DepthExceeded`] if `params.depth > MAX_DEPTH`.
@@ -228,7 +316,46 @@ pub fn train<R: Runtime>(
     target: &[f64],
     weights: &[f64],
     params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+) -> CbResult<Model> {
+    train_with_eval(
+        runtime,
+        feature_values,
+        feature_borders,
+        target,
+        weights,
+        params,
+        staged_out,
+        None,
+        None,
+    )
+}
+
+/// Train with an OPTIONAL held-out eval set driving the overfitting detector
+/// (TRAIN-06) and `use_best_model` truncation, plus an optional `eval_loss_out`
+/// receiving the per-iteration inline eval-set loss curve (the detector's
+/// `AddError` sequence).
+///
+/// When `params.od_type` is active (and an `eval_set` is supplied) the loop feeds
+/// the per-iteration inline eval-set loss to the detector and breaks on
+/// `IsNeedStop()`. When `params.use_best_model` is set the model's trees are
+/// truncated to `best_iteration + 1` after the loop (upstream
+/// `model.tree_count_` for a use_best_model run).
+///
+/// # Errors
+/// As [`train`], plus any detector-construction error
+/// ([`CbError::Degenerate`] for Wilcoxon without a test set).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn train_with_eval<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
     mut staged_out: Option<&mut Vec<f64>>,
+    eval_set: Option<&EvalSet>,
+    mut eval_loss_out: Option<&mut Vec<f64>>,
 ) -> CbResult<Model> {
     check_depth(params.depth)?;
 
@@ -255,6 +382,22 @@ pub fn train<R: Runtime>(
 
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
+
+    // Overfitting detection / use_best_model (TRAIN-06). The detector + best-model
+    // tracker consume the per-iteration inline eval-set loss; both are no-ops
+    // without an eval set. The eval-set raw approximant accumulates the bias plus
+    // each tree's leaf contribution as trees are grown.
+    let has_test = eval_set.is_some();
+    let mut detector =
+        OverfittingDetector::new(params.od_type, params.od_pval, params.od_wait, has_test)?;
+    let mut best_model = BestModelTracker::new();
+    let eval_matrix = eval_set.map(|es| FeatureMatrix {
+        feature_values: es.feature_values,
+        feature_borders,
+    });
+    let mut eval_approx: Vec<f64> = eval_set
+        .map(|es| vec![bias; es.target.len()])
+        .unwrap_or_default();
 
     // Persistent, continuously-advancing sampling RNG (`LearnProgress->Rand`,
     // seeded `random_seed`). Only consumed when bootstrap_type != No (Bayesian /
@@ -439,6 +582,37 @@ pub fn train<R: Runtime>(
             splits: grown.splits,
             leaf_values,
         });
+
+        // Overfitting detection / use_best_model (TRAIN-06): once the tree is
+        // grown, update the eval-set raw approximant with this tree's leaf
+        // contribution, compute the minimal inline eval-set loss (the SAME loss
+        // used for the stop decision), feed it to the detector + best-model
+        // tracker, record the curve, and break on IsNeedStop().
+        if let (Some(em), Some(es)) = (eval_matrix.as_ref(), eval_set) {
+            if let Some(tree) = trees.last() {
+                for (obj, a) in eval_approx.iter_mut().enumerate() {
+                    *a += tree_eval_contribution(tree, em, obj);
+                }
+            }
+            let eval_loss = inline_eval_metric(params.loss, &eval_approx, es.target);
+            if let Some(out) = eval_loss_out.as_deref_mut() {
+                out.push(eval_loss);
+            }
+            best_model.add_error(eval_loss);
+            detector.add_error(eval_loss);
+            if detector.is_need_stop() {
+                break;
+            }
+        }
+    }
+
+    // use_best_model: truncate the model's trees to best_iteration + 1
+    // (upstream `model.tree_count_` for a use_best_model run). Without an eval set
+    // there is no best iteration, so the model keeps every grown tree.
+    if params.use_best_model {
+        if let Some(best) = best_model.best_iteration() {
+            trees.truncate(best + 1);
+        }
     }
 
     Ok(Model {

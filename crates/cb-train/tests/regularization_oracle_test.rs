@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, Stage};
-use cb_train::{train, BoostParams, EBootstrapType, Model};
+use cb_train::{train, BoostParams, EBootstrapType, EOverfittingDetectorType, Model};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
 
@@ -81,6 +81,10 @@ fn train_scenario(
         bagging_temperature,
         // The generator pins random_seed=0 (SEED) for every regularization scenario.
         random_seed: 0,
+        od_type: EOverfittingDetectorType::None,
+        od_pval: 0.0,
+        od_wait: 0,
+        use_best_model: false,
     };
 
     let mut staged = Vec::new();
@@ -157,6 +161,10 @@ fn check_scenario_first_trees(
         subsample: 1.0,
         bagging_temperature,
         random_seed: 0,
+        od_type: EOverfittingDetectorType::None,
+        od_pval: 0.0,
+        od_wait: 0,
+        use_best_model: false,
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 
