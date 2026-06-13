@@ -14,6 +14,7 @@
 mod apply;
 mod cbm;
 mod error;
+mod fstr;
 mod json;
 mod model;
 mod predict;
@@ -22,6 +23,7 @@ mod shap;
 pub use apply::{binarize_feature, predict_raw};
 pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
 pub use error::ModelError;
+pub use fstr::{interaction, prediction_values_change, FeatureImportanceType};
 pub use json::{decode_json, load_json, save_json};
 pub use model::{Model, ObliviousTree, Split};
 pub use predict::{apply_prediction_type, PredictionType};

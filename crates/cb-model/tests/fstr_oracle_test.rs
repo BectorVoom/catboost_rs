@@ -12,7 +12,8 @@
 //!   2. `interaction` reproduces `feature_importance/interaction.npy` (flattened
 //!      `[feature_i, feature_j, score]` triples) at <= 1e-5.
 //!
-//! LossFunctionChange is deliberately NOT implemented (D-12, out of scope).
+//! The loss-change importance is deliberately NOT implemented (D-12, out of
+//! scope).
 //!
 //! Integration test (under `tests/`) so it can depend on `cb-oracle`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
