@@ -86,6 +86,8 @@ fn run_autolr_e2e(
         learning_rate: f64::NAN,
         auto_learning_rate: true,
         one_hot_max_size: cb_train::one_hot_max_size_default(),
+        permutation_count: cb_train::permutation_count_default(),
+        fold_len_multiplier: cb_train::fold_len_multiplier_default(),
         l2_leaf_reg: 3.0,
         random_strength: 0.0,
         boost_from_average,

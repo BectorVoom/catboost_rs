@@ -126,6 +126,36 @@ pub struct BoostParams {
     /// encoding-path selection; the numeric-only first slices leave it at the
     /// pinned default and never exercise the one-hot branch.
     pub one_hot_max_size: u32,
+    /// Number of random permutations used by the multi-permutation fold
+    /// machinery (`permutation_count`, default 4 — `boosting_options.cpp`).
+    /// Pinned EXPLICITLY here, never auto-selected (RESEARCH Pitfall 6). The
+    /// learning-fold count is `max(1, permutation_count - 1)` plus one averaging
+    /// fold ([`crate::learning_fold_count`] / [`crate::create_folds`],
+    /// `learn_context.cpp:48-49`). Consumed by ordered boosting / ordered CTR
+    /// (later waves); the numeric/one-hot Plain slices need no permutation and
+    /// leave it at the pinned default.
+    pub permutation_count: usize,
+    /// Tail-growth multiplier for the dynamic (ordered) fold body/tail
+    /// (`fold_len_multiplier`, default 2.0 — `fold.cpp:39-41`
+    /// `SelectTailSize(old, mult) = ceil(old * mult)`). Pinned EXPLICITLY
+    /// (never auto). Consumed by [`crate::body_tail_boundaries`] /
+    /// [`crate::create_folds`]; the plain single-span path ignores it.
+    pub fold_len_multiplier: f64,
+}
+
+/// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
+/// Pinned EXPLICITLY at every `BoostParams` construction site (RESEARCH
+/// Pitfall 6 — never auto-selected).
+#[must_use]
+pub fn permutation_count_default() -> usize {
+    4
+}
+
+/// The canonical default `fold_len_multiplier` (`2.0`, `fold.cpp:39-41`).
+/// Pinned EXPLICITLY at every `BoostParams` construction site.
+#[must_use]
+pub fn fold_len_multiplier_default() -> f64 {
+    2.0
 }
 
 /// One trained oblivious tree: the ordered splits, the per-leaf values

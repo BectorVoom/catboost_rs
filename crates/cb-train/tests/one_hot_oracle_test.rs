@@ -207,6 +207,8 @@ fn one_hot_predict_matches_oracle_locked_float_reference() {
         eval_metric: None,
         auto_learning_rate: false,
         one_hot_max_size: 3,
+        permutation_count: cb_train::permutation_count_default(),
+        fold_len_multiplier: cb_train::fold_len_multiplier_default(),
     };
     let mut float_staged = Vec::new();
     let float_model = train(

@@ -17,6 +17,7 @@ mod autolr;
 mod bootstrap;
 mod boosting;
 mod candidates;
+mod fold;
 mod metrics;
 mod overfit;
 mod permutation;
@@ -30,13 +31,18 @@ pub use bootstrap::{
 pub use candidates::{
     learn_set_cardinality, one_hot_max_size_default, route_categorical, route_column, EncodingPath,
 };
+pub use fold::{
+    body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
+    plain_fold_body_tail, select_min_batch_size, select_tail_size, Fold,
+};
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 pub use permutation::{
     fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 pub use boosting::{
-    train, train_with_eval, train_with_eval_sets, BoostParams, EvalSet, Model, ObliviousTree,
+    fold_len_multiplier_default, permutation_count_default, train, train_with_eval,
+    train_with_eval_sets, BoostParams, EvalSet, Model, ObliviousTree,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, grow_one_hot_tree, leaf_index,

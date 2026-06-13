@@ -19,7 +19,8 @@ use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
 use cb_train::{
-    one_hot_max_size_default, train, BoostParams, EBootstrapType, EOverfittingDetectorType,
+    fold_len_multiplier_default, one_hot_max_size_default, permutation_count_default, train,
+    BoostParams, EBootstrapType, EOverfittingDetectorType,
 };
 
 use crate::error::CatBoostError;
@@ -221,6 +222,10 @@ impl CatBoostBuilder {
             // the facade does not yet surface categorical config, and the
             // numeric-only train path never exercises the one-hot branch.
             one_hot_max_size: one_hot_max_size_default(),
+            // Pinned to the upstream defaults (RESEARCH Pitfall 6); the numeric
+            // facade path needs no permutation, so these are inert here.
+            permutation_count: permutation_count_default(),
+            fold_len_multiplier: fold_len_multiplier_default(),
         }
     }
 

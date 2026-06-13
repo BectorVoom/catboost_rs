@@ -95,6 +95,8 @@ fn train_eval_metrics(
         eval_metric: Some(eval_metric),
         auto_learning_rate: false,
         one_hot_max_size: cb_train::one_hot_max_size_default(),
+        permutation_count: cb_train::permutation_count_default(),
+        fold_len_multiplier: cb_train::fold_len_multiplier_default(),
     };
 
     let sets = [
@@ -185,6 +187,8 @@ fn eval_metric_defaults_to_objective_curve() {
         eval_metric: None, // default => RMSE (the objective)
         auto_learning_rate: false,
         one_hot_max_size: cb_train::one_hot_max_size_default(),
+        permutation_count: cb_train::permutation_count_default(),
+        fold_len_multiplier: cb_train::fold_len_multiplier_default(),
     };
     let sets = [
         EvalSet {
