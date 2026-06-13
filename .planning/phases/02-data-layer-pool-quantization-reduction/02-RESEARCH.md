@@ -403,6 +403,8 @@ fn ingest_float_column(col: &ArrayRef) -> Result<&[f64], CbError> {
 
 ## Open Questions
 
+> **Resolution path (planning note):** All five questions below (and the corresponding Assumptions A1–A5) are resolved **empirically during Plan 02-01 Task 3** — the Wave-0 `checkpoint:human-verify` that runs the pinned `catboost==1.2.10` fixture generator. The resolved values (sentinel presence in `get_borders()`, default `border_count`, integer-cat stringification form, and the extracted CityHash64 `(string → ui32)` vectors) are recorded in each scenario's `config.json` and summarized in **02-01-SUMMARY.md**, which downstream plans (02-02 borders, 02-03 quantization, 02-04 cat-hash) read as their source of truth. These questions are retained here for traceability — do not delete them.
+
 1. **Does `get_borders()` include the NaN sentinel border?**
    - What we know: stored borders inject `f32::MIN`/`MAX` for Min/Max NanMode (quantization.cpp:341-345).
    - What's unclear: whether the Python `get_borders()` API surfaces or strips it.
