@@ -1,0 +1,37 @@
+{
+  "scenario": "ordered_boost",
+  "requirement": "ORD-02",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 30,
+  "description": "Ordered-boosting approximant prefix isolation (no CTR — pure numeric, so the body/tail prefix machinery is the only variable). boosting_type=Ordered builds growing body/tail segments (fold.cpp:156-198); a tail document's approximant is estimated on the body prefix and never depends on itself (approx_calcer.cpp:566-600). This is the per-object ordered-approx oracle.",
+  "params": {
+    "boosting_type": "Ordered",
+    "one_hot_max_size": 255,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "depth": 2,
+    "iterations": 5,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "loss_function": "RMSE"
+  },
+  "cardinalities": {},
+  "stages": ["Permutation", "OrderedApprox"],
+  "npy_schema": {
+    "permutation_fold0.npy": "[N] int32 — Stage::Permutation (integer-exact, D-03)",
+    "body_tail_boundaries.npy": "[*] int32 — growing body-finish boundaries (fold.cpp:156-198)",
+    "ordered_approx_iter0.npy": "[N] f64 — Stage::OrderedApprox (<=1e-5)"
+  }
+}

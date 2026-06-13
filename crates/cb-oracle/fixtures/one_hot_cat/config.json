@@ -1,0 +1,42 @@
+{
+  "scenario": "one_hot_cat",
+  "requirement": "ORD-04",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 30,
+  "description": "One-hot vs CTR boundary isolation (RESEARCH Pitfall 3). cat0 has cardinality EXACTLY one_hot_max_size (=3) so it is ONE-HOT encoded; cat1 has cardinality one_hot_max_size+1 (=4) so it crosses into the CTR path. Because a cat feature exceeds one_hot_max_size, a permutation IS generated (learn_context.cpp:71-73).",
+  "params": {
+    "boosting_type": "Plain",
+    "one_hot_max_size": 3,
+    "max_ctr_complexity": 1,
+    "simple_ctr": ["Borders:Prior=0.5"],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "depth": 2,
+    "iterations": 5,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "loss_function": "Logloss"
+  },
+  "cardinalities": {
+    "cat0": 3,
+    "cat1": 4
+  },
+  "stages": ["Permutation", "OnlineCtr"],
+  "npy_schema": {
+    "permutation_fold0.npy": "[N] int32 — Stage::Permutation (integer-exact, D-03)",
+    "ctr_good_count.npy": "[N] int32 — exact numerator (cat1 CTR column)",
+    "ctr_total_count.npy": "[N] int32 — exact denominator",
+    "ctr_value.npy": "[N] f64 — Stage::OnlineCtr (<=1e-5)",
+    "body_tail_boundaries.npy": "[*] int32 — Plain single body/tail span audit"
+  }
+}

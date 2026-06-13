@@ -1,0 +1,41 @@
+{
+  "scenario": "ordered_ctr",
+  "requirement": "ORD-03",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 30,
+  "description": "Ordered-boosting ordered CTR isolation. boosting_type=Ordered drives the per-fold ordered target statistics: each document's CTR reads ONLY the prefix that precedes it in the permutation (read-before-increment, online_ctr.cpp:300-307). Single Borders CTR, explicit prior. fold_count = max(1, permutation_count-1) per learn_context.cpp:48-49.",
+  "params": {
+    "boosting_type": "Ordered",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": ["Borders:Prior=0.5"],
+    "combinations_ctr": [],
+    "permutation_count": 2,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "depth": 2,
+    "iterations": 5,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "loss_function": "Logloss"
+  },
+  "cardinalities": {
+    "cat0": 6
+  },
+  "stages": ["Permutation", "OnlineCtr"],
+  "npy_schema": {
+    "permutation_fold0.npy": "[N] int32 — fold 0 permutation, Stage::Permutation",
+    "permutation_fold1.npy": "[N] int32 — fold 1 permutation, Stage::Permutation",
+    "ctr_good_count.npy": "[N] int32 — exact numerator (fold-0 ordered)",
+    "ctr_total_count.npy": "[N] int32 — exact denominator",
+    "ctr_value.npy": "[N] f64 — Stage::OnlineCtr (<=1e-5)"
+  }
+}
