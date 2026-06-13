@@ -15,12 +15,14 @@
 
 mod bootstrap;
 mod boosting;
+mod overfit;
 mod tree;
 
 pub use bootstrap::{
     bootstrap, last_iter_mean_leaf_value, BootstrapResult, EBootstrapType, BAYESIAN_BLOCK_SIZE,
     MVS_BLOCK_SIZE,
 };
+pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 pub use boosting::{train, BoostParams, Model, ObliviousTree};
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, leaf_index, select_best_candidate, Candidate,
