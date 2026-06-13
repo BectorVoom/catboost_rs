@@ -151,12 +151,25 @@ Decimal phases appear between their surrounding integers in numeric order.
   5. The `catboost-rs` Builder API (`CatBoostBuilder::new()...fit(&pool) -> Model`, predict) with a typed `thiserror` error enum drives a full numeric-only binary-clf + regression train→serialize→predict oracle pass ≤1e-5 vs C++.
 
 **Plans**: 5 plans in 5 waves
-
 Plans:
+**Wave 1**
+
 - [ ] 04-01-PLAN.md — Wave-0 prerequisite: capture per-leaf weights in cb-train, re-home canonical Model into cb-model (leaf_weights + float_feature_borders), extend model_json with leaf_weights, commit flatc-generated FlatBuffers bindings, stage offline fixtures
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 04-02-PLAN.md — Pure-Rust CPU apply path (MODEL-02) + prediction-type transforms (LOSS-06) + CrossEntropy/Focal losses (LOSS-01)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 04-03-PLAN.md — .cbm save/load (FlatBuffers framing) + model.json export/import, semantic round-trip + upstream 1.2.10 load (MODEL-01, MODEL-06)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 04-04-PLAN.md — Regular TreeSHAP + local-accuracy lock (MODEL-04) + PredictionValuesChange/Interaction (MODEL-03 partial)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 04-05-PLAN.md — Public CatBoostBuilder + Model facade + CatBoostError + end-to-end binclf+regression train→serialize→load→predict oracle (RAPI-01, RAPI-02)
 
 ### Phase 5: Ordered Boosting, Ordered CTR & Categoricals (High-Risk Parity Slice)
