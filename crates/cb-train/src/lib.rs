@@ -15,6 +15,7 @@
 
 mod bootstrap;
 mod boosting;
+mod metrics;
 mod overfit;
 mod tree;
 
@@ -22,8 +23,11 @@ pub use bootstrap::{
     bootstrap, last_iter_mean_leaf_value, BootstrapResult, EBootstrapType, BAYESIAN_BLOCK_SIZE,
     MVS_BLOCK_SIZE,
 };
+pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
-pub use boosting::{train, train_with_eval, BoostParams, EvalSet, Model, ObliviousTree};
+pub use boosting::{
+    train, train_with_eval, train_with_eval_sets, BoostParams, EvalSet, Model, ObliviousTree,
+};
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, leaf_index, select_best_candidate, Candidate,
     FeatureMatrix, GrownTree, Split, MAX_DEPTH,

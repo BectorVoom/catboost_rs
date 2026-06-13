@@ -26,12 +26,13 @@
 
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta,
-    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev, sigmoid, simple_leaf_delta,
+    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev, simple_leaf_delta,
     LeafMethod, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
+use crate::metrics::{EvalMetric, EvalMetricHistory};
 use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 use crate::tree::{
     check_depth, greedy_tensor_search_oblivious_perturbed, leaf_index, FeatureMatrix, Perturbation,
@@ -99,6 +100,10 @@ pub struct BoostParams {
     /// `use_best_model`: when `true`, track the best eval-metric iteration and
     /// truncate the model's tree list to it (best_iteration + 1 trees).
     pub use_best_model: bool,
+    /// The per-iteration eval-set validation metric (`eval_metric`, TRAIN-07).
+    /// `None` defaults to the objective ([`EvalMetric::for_loss`]); `Some`
+    /// overrides it. Only consumed when an eval set is supplied.
+    pub eval_metric: Option<EvalMetric>,
 }
 
 /// One trained oblivious tree: the ordered splits and the per-leaf values
@@ -252,57 +257,14 @@ fn tree_eval_contribution(tree: &ObliviousTree, matrix: &FeatureMatrix, obj: usi
     tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
 }
 
-/// The minimal inline eval-set metric (the loss the stop decision uses): RMSE for
-/// regression (`sqrt(mean((approx - target)^2))`), Logloss for binary
-/// classification (`mean(-(y*log(p) + (1-y)*log(1-p)))`, `p = sigmoid(approx)`).
-///
-/// Every fold routes through `cb_core::sum_f64` (D-08). `eval_approx` is the
-/// running eval-set raw approximant (bias + Σ tree contributions).
-///
-// STUB: minimal inline eval-set loss for the stop decision; superseded by cb-train::metrics in Plan 06 (TRAIN-07).
-fn inline_eval_metric(loss: Loss, eval_approx: &[f64], eval_target: &[f64]) -> f64 {
-    let n = eval_approx.len();
-    if n == 0 {
-        return 0.0;
-    }
-    match loss {
-        Loss::Rmse | Loss::Mae => {
-            let sq: Vec<f64> = eval_approx
-                .iter()
-                .zip(eval_target.iter())
-                .map(|(&a, &t)| {
-                    let d = a - t;
-                    d * d
-                })
-                .collect();
-            (sum_f64(&sq) / n as f64).sqrt()
-        }
-        Loss::Logloss => {
-            // Cross-entropy over raw logits: -(y*log p + (1-y)*log(1-p)),
-            // p = sigmoid(approx). Clamp p away from {0,1} to avoid -inf.
-            let terms: Vec<f64> = eval_approx
-                .iter()
-                .zip(eval_target.iter())
-                .map(|(&a, &y)| {
-                    let p = sigmoid(a).clamp(1e-15, 1.0 - 1e-15);
-                    -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
-                })
-                .collect();
-            sum_f64(&terms) / n as f64
-        }
-    }
-}
-
 /// Train a plain-boosted oblivious-tree model over the generic runtime `R`.
 ///
 /// `feature_values[f]` is float feature `f`'s per-object `f32` column;
 /// `feature_borders[f]` its ascending candidate borders (the model's float-feature
 /// borders). `target`/`weights` are per-object; `staged_out`, when `Some`, is
 /// filled with the per-iteration staged approximants (flat, `iterations * n`).
-/// `eval_set`, when `Some`, drives the overfitting detector (TRAIN-06) and
-/// `use_best_model` truncation via a minimal inline eval-set loss.
 ///
-/// Delegates to [`train_with_eval`] without an eval set (no early stopping).
+/// Delegates to [`train_with_eval_sets`] without an eval set (no early stopping).
 ///
 /// # Errors
 /// - [`CbError::DepthExceeded`] if `params.depth > MAX_DEPTH`.
@@ -318,7 +280,7 @@ pub fn train<R: Runtime>(
     params: &BoostParams,
     staged_out: Option<&mut Vec<f64>>,
 ) -> CbResult<Model> {
-    train_with_eval(
+    train_with_eval_sets(
         runtime,
         feature_values,
         feature_borders,
@@ -326,26 +288,29 @@ pub fn train<R: Runtime>(
         weights,
         params,
         staged_out,
-        None,
+        &[],
         None,
     )
 }
 
-/// Train with an OPTIONAL held-out eval set driving the overfitting detector
-/// (TRAIN-06) and `use_best_model` truncation, plus an optional `eval_loss_out`
-/// receiving the per-iteration inline eval-set loss curve (the detector's
-/// `AddError` sequence).
+/// Train with a SINGLE optional held-out eval set driving the overfitting
+/// detector (TRAIN-06) and `use_best_model` truncation, plus an optional
+/// `eval_loss_out` receiving the PRIMARY eval set's per-iteration `eval_metric`
+/// curve (the detector's `AddError` sequence).
 ///
-/// When `params.od_type` is active (and an `eval_set` is supplied) the loop feeds
-/// the per-iteration inline eval-set loss to the detector and breaks on
-/// `IsNeedStop()`. When `params.use_best_model` is set the model's trees are
-/// truncated to `best_iteration + 1` after the loop (upstream
+/// This is the single-eval-set convenience wrapper over [`train_with_eval_sets`]
+/// (the TRAIN-06 entry point); the per-iteration eval value is now the formalized
+/// `eval_metric` ([`crate::metrics`], TRAIN-07) rather than the Plan 05 inline
+/// stub. When `params.od_type` is active the loop feeds the eval metric to the
+/// detector and breaks on `IsNeedStop()`. When `params.use_best_model` is set the
+/// model's trees are truncated to `best_iteration + 1` after the loop (upstream
 /// `model.tree_count_` for a use_best_model run).
 ///
 /// # Errors
 /// As [`train`], plus any detector-construction error
-/// ([`CbError::Degenerate`] for Wilcoxon without a test set).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// ([`CbError::Degenerate`] for Wilcoxon without a test set) or a degenerate eval
+/// set ([`CbError::Degenerate`] from the metric).
+#[allow(clippy::too_many_arguments)]
 pub fn train_with_eval<R: Runtime>(
     runtime: &R,
     feature_values: &[Vec<f32>],
@@ -353,9 +318,71 @@ pub fn train_with_eval<R: Runtime>(
     target: &[f64],
     weights: &[f64],
     params: &BoostParams,
-    mut staged_out: Option<&mut Vec<f64>>,
+    staged_out: Option<&mut Vec<f64>>,
     eval_set: Option<&EvalSet>,
-    mut eval_loss_out: Option<&mut Vec<f64>>,
+    eval_loss_out: Option<&mut Vec<f64>>,
+) -> CbResult<Model> {
+    // Adapt the single eval set into the multi-set path. The primary (index 0)
+    // set is the one the detector + best-model tracker consume; its per-iteration
+    // metric curve is mirrored into `eval_loss_out` for backward compatibility.
+    let sets: Vec<EvalSet> = eval_set
+        .map(|es| {
+            vec![EvalSet {
+                feature_values: es.feature_values,
+                target: es.target,
+            }]
+        })
+        .unwrap_or_default();
+    let mut history = eval_loss_out.as_ref().map(|_| EvalMetricHistory::new(sets.len()));
+    let model = train_with_eval_sets(
+        runtime,
+        feature_values,
+        feature_borders,
+        target,
+        weights,
+        params,
+        staged_out,
+        &sets,
+        history.as_mut(),
+    )?;
+    if let (Some(out), Some(h)) = (eval_loss_out, history) {
+        out.clear();
+        out.extend_from_slice(h.primary());
+    }
+    Ok(model)
+}
+
+/// Train with ZERO OR MORE held-out eval sets, computing the `eval_metric`
+/// (TRAIN-07) over EACH set per iteration, logging the per-set per-iteration
+/// values into `history`, and feeding the PRIMARY (index 0) set's metric to the
+/// overfitting detector (TRAIN-06) + `use_best_model` tracker.
+///
+/// `eval_sets[0]` is the primary (validation_0) set the detector consumes;
+/// further sets are logged only. `params.eval_metric` overrides the metric;
+/// `None` defaults to the objective ([`EvalMetric::for_loss`]). When
+/// `params.od_type` is active the loop breaks on `IsNeedStop()`; when
+/// `params.use_best_model` is set the trees are truncated to `best_iteration + 1`.
+///
+/// This is the formalized replacement for the Plan 05 inline eval-set loss stub:
+/// the metric set (multiple eval sets, `eval_metric` override, per-iteration
+/// logging) lives in [`crate::metrics`]; the detector's stop/best-iteration path
+/// is UNCHANGED — only the metric SOURCE changed.
+///
+/// # Errors
+/// As [`train`], plus any detector-construction error
+/// ([`CbError::Degenerate`] for Wilcoxon without a test set) or a degenerate eval
+/// set ([`CbError::Degenerate`] from the metric).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn train_with_eval_sets<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    mut staged_out: Option<&mut Vec<f64>>,
+    eval_sets: &[EvalSet],
+    mut history: Option<&mut EvalMetricHistory>,
 ) -> CbResult<Model> {
     check_depth(params.depth)?;
 
@@ -383,21 +410,37 @@ pub fn train_with_eval<R: Runtime>(
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
 
-    // Overfitting detection / use_best_model (TRAIN-06). The detector + best-model
-    // tracker consume the per-iteration inline eval-set loss; both are no-ops
-    // without an eval set. The eval-set raw approximant accumulates the bias plus
-    // each tree's leaf contribution as trees are grown.
-    let has_test = eval_set.is_some();
+    // Overfitting detection / use_best_model (TRAIN-06) + per-iteration eval-set
+    // metric logging (TRAIN-07). The detector + best-model tracker consume the
+    // PRIMARY (index 0) eval set's per-iteration `eval_metric`; ALL eval sets are
+    // logged into `history`. Both are no-ops without any eval set. Each eval set's
+    // raw approximant accumulates the bias plus every tree's leaf contribution as
+    // trees are grown.
+    //
+    // `eval_metric` formalizes the Plan 05 inline eval-set loss STUB: the metric
+    // (RMSE / Logloss, weighted, multi-set) lives in `crate::metrics`; it defaults
+    // to the objective and may be overridden via `params.eval_metric`.
+    let has_test = !eval_sets.is_empty();
+    let eval_metric = params
+        .eval_metric
+        .unwrap_or_else(|| EvalMetric::for_loss(params.loss));
     let mut detector =
         OverfittingDetector::new(params.od_type, params.od_pval, params.od_wait, has_test)?;
     let mut best_model = BestModelTracker::new();
-    let eval_matrix = eval_set.map(|es| FeatureMatrix {
-        feature_values: es.feature_values,
-        feature_borders,
-    });
-    let mut eval_approx: Vec<f64> = eval_set
+    let eval_matrices: Vec<FeatureMatrix> = eval_sets
+        .iter()
+        .map(|es| FeatureMatrix {
+            feature_values: es.feature_values,
+            feature_borders,
+        })
+        .collect();
+    let mut eval_approx: Vec<Vec<f64>> = eval_sets
+        .iter()
         .map(|es| vec![bias; es.target.len()])
-        .unwrap_or_default();
+        .collect();
+    if let Some(h) = history.as_deref_mut() {
+        *h = EvalMetricHistory::new(eval_sets.len());
+    }
 
     // Persistent, continuously-advancing sampling RNG (`LearnProgress->Rand`,
     // seeded `random_seed`). Only consumed when bootstrap_type != No (Bayesian /
@@ -584,24 +627,45 @@ pub fn train_with_eval<R: Runtime>(
         });
 
         // Overfitting detection / use_best_model (TRAIN-06): once the tree is
-        // grown, update the eval-set raw approximant with this tree's leaf
-        // contribution, compute the minimal inline eval-set loss (the SAME loss
-        // used for the stop decision), feed it to the detector + best-model
-        // tracker, record the curve, and break on IsNeedStop().
-        if let (Some(em), Some(es)) = (eval_matrix.as_ref(), eval_set) {
+        // grown, update EACH eval set's raw approximant with this tree's leaf
+        // contribution, compute the `eval_metric` over each set (TRAIN-07), log
+        // the per-set per-iteration value, and feed the PRIMARY set's metric to
+        // the detector + best-model tracker (TRAIN-06), breaking on IsNeedStop().
+        if has_test {
             if let Some(tree) = trees.last() {
-                for (obj, a) in eval_approx.iter_mut().enumerate() {
-                    *a += tree_eval_contribution(tree, em, obj);
+                for (set_idx, approx_col) in eval_approx.iter_mut().enumerate() {
+                    if let Some(em) = eval_matrices.get(set_idx) {
+                        for (obj, a) in approx_col.iter_mut().enumerate() {
+                            *a += tree_eval_contribution(tree, em, obj);
+                        }
+                    }
                 }
             }
-            let eval_loss = inline_eval_metric(params.loss, &eval_approx, es.target);
-            if let Some(out) = eval_loss_out.as_deref_mut() {
-                out.push(eval_loss);
+
+            // The PRIMARY set's metric drives the stop decision (unchanged from
+            // Plan 05 — only the metric source moved to `crate::metrics`).
+            let mut primary_metric: Option<f64> = None;
+            for (set_idx, es) in eval_sets.iter().enumerate() {
+                if let Some(approx_col) = eval_approx.get(set_idx) {
+                    // Eval sets carry no per-object weights in this phase — the
+                    // metric uses uniform weight 1.0 (matching the upstream eval
+                    // metric for unweighted eval pools).
+                    let value = eval_metric.eval(approx_col, es.target, &[])?;
+                    if let Some(h) = history.as_deref_mut() {
+                        h.push(set_idx, value);
+                    }
+                    if set_idx == 0 {
+                        primary_metric = Some(value);
+                    }
+                }
             }
-            best_model.add_error(eval_loss);
-            detector.add_error(eval_loss);
-            if detector.is_need_stop() {
-                break;
+
+            if let Some(value) = primary_metric {
+                best_model.add_error(value);
+                detector.add_error(value);
+                if detector.is_need_stop() {
+                    break;
+                }
             }
         }
     }

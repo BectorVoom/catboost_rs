@@ -80,6 +80,7 @@ fn train_scenario(
         od_pval: 0.0,
         od_wait: 0,
         use_best_model: false,
+        eval_metric: None,
     };
 
     let mut staged = Vec::new();
@@ -173,6 +174,7 @@ fn bootstrap_oracle_bayesian_first_tree() {
         od_pval: 0.0,
         od_wait: 0,
         use_best_model: false,
+        eval_metric: None,
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 

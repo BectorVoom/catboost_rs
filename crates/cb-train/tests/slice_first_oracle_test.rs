@@ -88,6 +88,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         od_pval: 0.0,
         od_wait: 0,
         use_best_model: false,
+        eval_metric: None,
     };
 
     let mut staged = Vec::new();
