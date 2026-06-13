@@ -16,6 +16,54 @@ fn out_of_range_display_message_is_stable() {
 }
 
 #[test]
+fn dtype_display_message_is_stable() {
+    let err = CbError::Dtype {
+        expected: "Float64",
+        got: "Int64".to_string(),
+    };
+    assert_eq!(err.to_string(), "unsupported dtype: expected Float64, got Int64");
+}
+
+#[test]
+fn length_mismatch_display_message_is_stable() {
+    let err = CbError::LengthMismatch {
+        column: "label".to_string(),
+        expected: 40,
+        actual: 39,
+    };
+    assert_eq!(
+        err.to_string(),
+        "column `label` has length 39, expected 40 (n_rows)"
+    );
+}
+
+#[test]
+fn nan_in_categorical_display_message_is_stable() {
+    let err = CbError::NanInCategorical { column: 2 };
+    assert_eq!(err.to_string(), "NaN in categorical column 2");
+}
+
+#[test]
+fn ingestion_display_message_is_stable() {
+    let err = CbError::Ingestion {
+        message: "non-contiguous chunk".to_string(),
+    };
+    assert_eq!(err.to_string(), "ingestion error: non-contiguous chunk");
+}
+
+#[test]
+fn new_variants_preserve_clone_and_eq() {
+    // The ingestion variants must keep CbError `Clone + PartialEq + Eq` (no
+    // `#[from]` of a non-Eq external error). This will not compile otherwise.
+    let a = CbError::Dtype {
+        expected: "Float64",
+        got: "Utf8".to_string(),
+    };
+    let b = a.clone();
+    assert_eq!(a, b);
+}
+
+#[test]
 fn cb_result_ok_path_round_trips() {
     let ok: CbResult<u32> = Ok(42);
     assert_eq!(ok.unwrap(), 42);

@@ -15,12 +15,20 @@ use cb_core::CbResult;
 
 use crate::Pool;
 
+pub mod arrow;
 mod owned;
+pub mod polars;
 
+pub use arrow::{arrow_f64_column, ArrowColumns};
 pub use owned::OwnedColumns;
+pub use polars::PolarsColumns;
 
 #[cfg(test)]
+mod arrow_test;
+#[cfg(test)]
 mod owned_test;
+#[cfg(test)]
+mod polars_test;
 
 /// A source of dataset columns that can be validated and materialized into a
 /// [`Pool`].
