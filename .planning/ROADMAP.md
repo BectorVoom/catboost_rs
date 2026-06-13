@@ -97,7 +97,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Overfitting detection / early stopping (Wilcoxon/IncToDec/Iter, `od_pval`/`od_wait`, `use_best_model`) and per-iteration eval-set metric logging (multiple eval sets, `eval_metric`) behave correctly.
   5. Automatic learning-rate selection from dataset size matches upstream, and a first end-to-end CPU train→predict cycle runs.
 
-**Plans**: 8 plans in 8 waves
+**Plans**: 9 plans in 9 waves (03-08 gap-closure for CR-01)
 
 **Wave 1**
 
@@ -130,6 +130,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 8** *(blocked on Wave 7)*
 
 - [x] 03-07-PLAN.md — Automatic learning-rate selection (TAutoLRParamsGuesser) + first end-to-end auto-LR train→predict (TRAIN-08)
+
+**Wave 9** *(blocked on Wave 5; gap closure)*
+
+- [ ] 03-08-PLAN.md — Gap closure CR-01: feed score_st_dev the FULL-fold weighted_der1 (not the masked score_weighted_der1) + new cross-scenario oracle (random_strength=1.0 + Bernoulli, subsample=0.7) locking first-tree splits/leaves ≤1e-5 (TRAIN-05)
 
 ### Phase 4: Model, Serialization, SHAP & Rust API (First Full Oracle Lock)
 
