@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 5 context gathered
-last_updated: "2026-06-13T23:12:54.708Z"
-last_activity: 2026-06-13 -- Phase 05 execution started
+last_updated: "2026-06-13T23:49:33.477Z"
+last_activity: 2026-06-13 -- Plan 05-02 complete (ORD-04 one-hot encoding path)
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 28
-  completed_plans: 23
+  completed_plans: 25
   percent: 50
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 3 of 6
+Plan: 4 of 6
 Status: Ready to execute
 Last activity: 2026-06-13 -- Plan 05-02 complete (ORD-04 one-hot encoding path)
 
@@ -77,6 +77,7 @@ Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 | Phase 04 P05 | ~10min | 2 tasks | 8 files |
 | Phase 05 P01 | 8min | 3 tasks | 13 files |
 | Phase 05 P02 | 17min | 2 tasks | 17 files |
+| Phase 05 P03 | 12min | 2 tasks | 18 files |
 
 ## Accumulated Context
 
@@ -142,6 +143,7 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 05]: Plan 05-01 COMPLETE — Wave-0 oracle infra: Stage::{Permutation(integer-exact D-03 linchpin),OnlineCtr,OrderedApprox} + compare_permutation; model.json ctr_data parser (CtrTableJson #[serde(default)], backward-compatible); ordered_oracle.cpp zero-catboost transcription (perm self-oracle [4 2 0 3 1]==cb-core TFastRng64); 5 frozen categorical fixtures with per-knob config.json; 32 cb-oracle tests green
 - [Phase 05]: Plan 05-02 COMPLETE (ORD-04 / D-04) — one-hot vs CTR routing on learn-set cardinality (route_categorical/EncodingPath; inclusive at count==one_hot_max_size, exclusive above=CTR, skip<=1; AddOneHotFeatures greedy_tensor_search.cpp:171-197, Pitfall 3); learn_set_cardinality via calc_cat_feature_hash+PerfectHash (OnLearnOnly, never ctr_data hash_map); BoostParams.one_hot_max_size (explicit default 2). tree.rs OneHotSplit/AnySplit/grow_one_hot_tree (cat_bin==value IsTrueOneHotFeature split.h:16-17; same L2 score + strict first-wins + forward-bit leaf index) — shared float Split left byte-for-byte (no cb-model literal churn).
 - [Phase 05]: Plan 05-02 (Rule 3 deviation) — D-04 oracle is transcribe-then-self-oracle: one-hot-only model anchored bit-for-bit == the upstream-oracle-locked float train on equivalent one-hot binary columns (StagedApprox+Predictions <=1e-5), NO permutation present. The committed one_hot_cat fixture is the CTR/permutation Wave-0 anchor (no one-hot-only model.json; its config generates a permutation), so it cannot be the D-04 isolation oracle as literally planned. one_hot 11 lib + 3 integration green; slice_first float reference still locked 2/2.
+- [Phase 05]: 05-03: Fisher-Yates fold permutation over TFastRng64 locked integer-exact (D-03) vs permutation_fold0.npy; TFold body/tail boundaries [1 2 4 8 16 30] for N=30; permutation_count(4)/fold_len_multiplier(2.0) pinned on shared BoostParams. — Permutation reproduced exactly before any value stage; reused BoostParams to keep workspace compiling.
 
 ### Pending Todos
 
@@ -168,6 +170,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T23:12:35.086Z
+Last session: 2026-06-13T23:49:02.331Z
 Stopped at: Phase 5 context gathered
 Resume file: .planning/phases/05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s/05-CONTEXT.md

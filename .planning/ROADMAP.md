@@ -200,7 +200,7 @@ Plans:
 
 **Wave 3** *(blocked on 05-01, 05-02)*
 
-- [ ] 05-03-PLAN.md — Multi-permutation fold machinery (ORD-01, D-03 linchpin): TFastRng64 Fisher-Yates + TFold body/tail prefixes, permutation locked integer-exact before any value stage
+- [x] 05-03-PLAN.md — Multi-permutation fold machinery (ORD-01, D-03 linchpin): TFastRng64 Fisher-Yates + TFold body/tail prefixes, permutation locked integer-exact before any value stage
 
 **Wave 4** *(blocked on 05-01, 05-02, 05-03)*
 
