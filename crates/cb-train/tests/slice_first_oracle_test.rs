@@ -66,7 +66,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
 
     let target = match loss {
         Loss::Rmse | Loss::Mae => load_regression_target(),
-        Loss::Logloss => load_binclf_target(),
+        Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 
     let params = BoostParams {

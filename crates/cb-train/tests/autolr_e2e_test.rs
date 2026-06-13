@@ -140,7 +140,8 @@ fn run_autolr_e2e(
     //    value the unit test pins) — proving the auto-LR path drove training.
     let target_type = match loss {
         Loss::Rmse => TargetType::Rmse,
-        Loss::Logloss => TargetType::Logloss,
+        Loss::Logloss | Loss::CrossEntropy => TargetType::Logloss,
+        Loss::Focal { .. } => TargetType::Logloss,
         Loss::Mae => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
