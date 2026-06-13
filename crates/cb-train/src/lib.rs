@@ -19,6 +19,7 @@ mod boosting;
 mod candidates;
 mod metrics;
 mod overfit;
+mod permutation;
 mod tree;
 
 pub use autolr::{coefficients as autolr_coefficients, guess as autolr_guess, TargetType};
@@ -31,6 +32,9 @@ pub use candidates::{
 };
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
+pub use permutation::{
+    fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
+};
 pub use boosting::{
     train, train_with_eval, train_with_eval_sets, BoostParams, EvalSet, Model, ObliviousTree,
 };
