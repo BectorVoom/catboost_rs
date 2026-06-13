@@ -77,7 +77,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 4** *(blocked on Wave 3)*
 
-- [ ] 02-04-PLAN.md — CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked on the categorical corpus
+- [x] 02-04-PLAN.md — CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked on the categorical corpus (corrected cat_hash fixtures from the vendored city.cpp; the CTR-hash extraction was the wrong target)
 
 **Wave 5** *(blocked on Wave 4)*
 

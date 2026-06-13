@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 02-02-PLAN.md
-last_updated: "2026-06-13T04:32:56.683Z"
-last_activity: 2026-06-13 -- Plan 02-01 complete (reduction primitive, D-08 gate, Wave-0 fixtures, A1–A5 resolved)
+stopped_at: Completed 02-04-PLAN.md
+last_updated: "2026-06-13T05:05:00.000Z"
+last_activity: 2026-06-13 -- Plan 02-04 complete (CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked; corrected cat_hash fixtures)
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 8
-  completed_plans: 6
-  percent: 13
+  completed_plans: 7
+  percent: 15
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 02 (data-layer-pool-quantization-reduction) — EXECUTING
-Plan: 4 of 5
-Status: Ready to execute (02-01 complete)
-Last activity: 2026-06-13 -- Plan 02-01 complete (reduction primitive, D-08 gate, Wave-0 fixtures, A1–A5 resolved)
+Plan: 5 of 5
+Status: Ready to execute (02-04 complete)
+Last activity: 2026-06-13 -- Plan 02-04 complete (CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked; corrected cat_hash fixtures)
 
-Progress: [██░░░░░░░░] 20% (1 of 5 phase-02 plans complete)
+Progress: [████████░░] 80% (4 of 5 phase-02 plans complete)
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ Progress: [██░░░░░░░░] 20% (1 of 5 phase-02 plans complete)
 | Phase 02 P01 | 10min | 3 tasks | 22 files |
 | Phase 02 P02 | 30min | 2 tasks | 18 files |
 | Phase 02 P03 | 5 | 2 tasks | 7 files |
+| Phase 02 P04 | 25min | 2 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -85,6 +86,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 02]: Plan 02-02 (Rule 1 fix): borders_quant fixtures regenerated from STANDALONE Pool.quantize().save_quantization_borders() (raw 49/49/49/49) instead of training-pruned get_borders(); f32 sentinel snapped to exact f32::MIN
 - [Phase ?]: Per-feature NanMode: NaN-bearing column -> Min sentinel, NaN-free -> Forbidden
 - [Phase ?]: Float bin width hard-capped at u16 -> CbError not panic; u32 categorical-only (utils.h:175-181)
+- [Phase 02]: Plan 02-04: CityHash64 ported bit-exact from vendored util/digest/city.cpp (Yandex CityHash 1.0, NOT mainline/third-party crate); CalcCatFeatureHash = city_hash_64 & 0xffffffff; first-seen perfect-hash bins (bin = map.size()), uniq count bounded to u32::MAX with typed CbError (no panic)
+- [Phase 02]: Plan 02-04 (Rule 1 fix): cat_hash string_to_ui32 fixtures regenerated from a standalone C++ tool transcribing the vendored city.cpp (generator/cityhash_oracle.cpp) -- the Wave-0 vectors had been extracted from a trained model's ctr_data hash_map (CTR-projection hashes, NOT CalcCatFeatureHash). 'alpha'=1296865003 (was 3214079027); '3'=593172586 (was 2658984922). Downstream cat-hash consumers must use cb_data::calc_cat_feature_hash, never a model's ctr_data hash_map.
 
 ### Pending Todos
 
@@ -110,6 +113,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T04:32:35.982Z
-Stopped at: Completed 02-02-PLAN.md
+Last session: 2026-06-13T05:05:00.000Z
+Stopped at: Completed 02-04-PLAN.md
 Resume file: None
