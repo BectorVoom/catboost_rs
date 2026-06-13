@@ -26,12 +26,16 @@
 
 mod borders;
 pub mod ingest;
+mod nan_mode;
 mod pool;
 
 pub use borders::{penalty_maxsumlog, select_borders_greedy_logsum};
+pub use nan_mode::{bin_of, insert_sentinel, nan_bin, NanMode};
 pub use pool::{Pair, Pool};
 
 #[cfg(test)]
 mod borders_test;
+#[cfg(test)]
+mod nan_mode_test;
 #[cfg(test)]
 mod pool_test;
