@@ -73,6 +73,47 @@ fn two_distinct_values_yield_single_midpoint_border() {
     assert!((borders[0] - expected).abs() <= 1e-6, "border {} != {}", borders[0], expected);
 }
 
+/// WR-01: a tie-prone column (many equal gaps -> equal split scores) under a
+/// small `max_borders` exercises the STL binary-heap tie-break. The result must
+/// be deterministic and order-independent of the input permutation: shuffling
+/// the column must not change the final sorted border set (the selector sorts
+/// internally, and the heap tie-break is keyed on score, not input order).
+#[test]
+fn tie_prone_column_is_deterministic_under_permutation() {
+    // Evenly spaced values produce many equal-score split candidates (ties).
+    let ascending: Vec<f64> = (0..16).map(|i| i as f64).collect();
+    let mut shuffled = ascending.clone();
+    shuffled.reverse();
+    let mut interleaved = Vec::with_capacity(16);
+    for i in 0..8 {
+        interleaved.push(ascending[i]);
+        interleaved.push(ascending[15 - i]);
+    }
+
+    // A small budget forces the greedy heap to choose among tied bins.
+    for max_borders in [2usize, 3, 5, 7] {
+        let a = select_borders_greedy_logsum(&ascending, max_borders, false);
+        let b = select_borders_greedy_logsum(&shuffled, max_borders, false);
+        let c = select_borders_greedy_logsum(&interleaved, max_borders, false);
+        assert_eq!(a, b, "max_borders={max_borders}: reversed input changed borders");
+        assert_eq!(a, c, "max_borders={max_borders}: interleaved input changed borders");
+    }
+}
+
+/// WR-01: a constant column (all equal values) produces no internal split (no
+/// border), and the heap handling never panics regardless of budget.
+#[test]
+fn constant_column_yields_no_borders() {
+    let column = vec![3.0_f64; 12];
+    for max_borders in [1usize, 4, 254] {
+        let borders = select_borders_greedy_logsum(&column, max_borders, false);
+        assert!(
+            borders.is_empty(),
+            "constant column must yield no borders (max_borders={max_borders}), got {borders:?}"
+        );
+    }
+}
+
 /// The NanMode(Min) sentinel is prepended at index 0 when requested, before the
 /// sorted borders.
 #[test]

@@ -247,6 +247,17 @@ pub fn select_borders_greedy_logsum(
 /// split score. While the heap holds `<= max_borders` bins and the top bin can
 /// split, pop it, split it, and push both halves; then collect the left border
 /// of every non-first bin into a dedup set.
+///
+/// # Heap tie-break parity (WR-01)
+///
+/// Upstream uses `std::priority_queue<TBinType>` whose `operator<` compares
+/// **only** `Score()` (binarization.cpp:1345-1351). On equal scores, which bin
+/// the heap pops is fixed by the binary-heap array structure, not insertion
+/// order. We therefore reproduce the C++ STL binary max-heap operations
+/// (`std::push_heap` / `std::pop_heap`, libstdc++ `__push_heap` / `__adjust_heap`
+/// semantics) bit-for-bit in [`heap_push`] / [`heap_pop`] rather than a
+/// first-occurrence linear scan, so the SET of bins that get split — and hence
+/// the final sorted border set — matches upstream even when scores tie.
 fn greedy_split(values: &[f32], max_borders: usize, total_weight: f64) -> Vec<f32> {
     // total_weight equals values.len() in the unweighted path; assert the
     // reduction routed through cb_core agrees with the slice length so a future
@@ -257,34 +268,33 @@ fn greedy_split(values: &[f32], max_borders: usize, total_weight: f64) -> Vec<f3
         return Vec::new();
     }
 
-    // std::priority_queue<TBinType> is a max-heap on Score(). We model it as a
-    // Vec scanned for the max each iteration; the bin counts here are tiny
-    // (<= max_borders + 1), so a linear scan is fine and avoids the Ord/NaN
-    // hazards of BinaryHeap on f64 scores.
-    let mut bins: Vec<Bin> = vec![Bin::new(values, 0, values.len())];
+    // std::priority_queue<TBinType> backed by a Vec maintained in binary-max-heap
+    // order on `best_score` (the STL heap invariant). `heap_push`/`heap_pop`
+    // reproduce libstdc++'s push_heap/pop_heap so tie-break pops match upstream.
+    let mut heap: Vec<Bin> = Vec::new();
+    heap_push(&mut heap, Bin::new(values, 0, values.len()));
 
     // while (splits.size() <= maxBordersCount && splits.top().CanSplit())
-    while bins.len() <= max_borders {
-        // Find the current top (max best_score).
-        let Some(top_idx) = arg_max_score(&bins) else {
+    while heap.len() <= max_borders {
+        // splits.top() is the heap root.
+        if !heap.first().map(Bin::can_split).unwrap_or(false) {
+            break;
+        }
+        // auto top = splits.top(); splits.pop();
+        let Some(mut top) = heap_pop(&mut heap) else {
             break;
         };
-        if !bins.get(top_idx).map(Bin::can_split).unwrap_or(false) {
-            break;
-        }
-        // pop top, split, push left + the mutated top.
-        if let Some(mut top) = pop_at(&mut bins, top_idx) {
-            let left = top.split(values);
-            bins.push(left);
-            bins.push(top);
-        } else {
-            break;
-        }
+        // auto left = top.Split(); splits.push(left); splits.push(top);
+        let left = top.split(values);
+        heap_push(&mut heap, left);
+        heap_push(&mut heap, top);
     }
 
-    // Collect LeftBorder of every non-first bin.
-    let mut borders: Vec<f32> = Vec::with_capacity(bins.len());
-    for bin in &bins {
+    // Collect LeftBorder of every non-first bin. The collection order is
+    // irrelevant (the caller dedups into a sorted set), so iterating the heap
+    // array directly is equivalent to draining `splits` top-by-top.
+    let mut borders: Vec<f32> = Vec::with_capacity(heap.len());
+    for bin in &heap {
         if !bin.is_first() {
             borders.push(bin.left_border(values));
         }
@@ -292,27 +302,100 @@ fn greedy_split(values: &[f32], max_borders: usize, total_weight: f64) -> Vec<f3
     borders
 }
 
-/// Index of the bin with the maximum `best_score` (the priority-queue top).
-/// Ties keep the first occurrence, mirroring a stable max selection.
-fn arg_max_score(bins: &[Bin]) -> Option<usize> {
-    let mut best_idx: Option<usize> = None;
-    let mut best_score = f64::NEG_INFINITY;
-    for (idx, bin) in bins.iter().enumerate() {
-        if best_idx.is_none() || bin.best_score > best_score {
-            best_idx = Some(idx);
-            best_score = bin.best_score;
+/// `std::push_heap(first, last, comp)` (libstdc++ `__push_heap`): sift the
+/// just-appended last element up toward the root while its parent compares less
+/// (`comp(parent, value)`), reproducing the STL heap's exact placement so tied
+/// scores settle into the same array positions as upstream.
+fn heap_push(heap: &mut Vec<Bin>, value: Bin) {
+    heap.push(value);
+    let mut hole = heap.len() - 1;
+    // __push_heap: while (holeIndex > topIndex && comp(arr[parent], value))
+    while hole > 0 {
+        let parent = (hole - 1) / 2;
+        // Compare parent against the value currently sitting at `hole`.
+        let parent_lt_value = {
+            // SAFETY of indexing: parent < hole < heap.len(); both in bounds.
+            let (p, h) = (parent, hole);
+            match (heap.get(p), heap.get(h)) {
+                (Some(pp), Some(hh)) => pp.best_score < hh.best_score,
+                _ => false,
+            }
+        };
+        if !parent_lt_value {
+            break;
         }
+        heap.swap(parent, hole);
+        hole = parent;
     }
-    best_idx
 }
 
-/// Remove and return the bin at `index` (`swap_remove`-free to avoid disturbing
-/// the relative order, which keeps tie-breaking deterministic).
-fn pop_at(bins: &mut Vec<Bin>, index: usize) -> Option<Bin> {
-    if index < bins.len() {
-        Some(bins.remove(index))
-    } else {
-        None
+/// `std::pop_heap(first, last, comp)` then `pop_back()` (libstdc++ `__pop_heap`
+/// with `__adjust_heap`): move the root out, then sift the former last element
+/// down from the root, always descending into the larger child, exactly as the
+/// STL does, so the next `top()` matches upstream's heap on tied scores.
+fn heap_pop(heap: &mut Vec<Bin>) -> Option<Bin> {
+    let len = heap.len();
+    if len == 0 {
+        return None;
+    }
+    // Move the root to the back and shrink; `result` is the popped top.
+    let last = len - 1;
+    heap.swap(0, last);
+    let result = heap.pop();
+    let new_len = heap.len();
+    if new_len > 1 {
+        // __adjust_heap from the root over [0, new_len): sift the value now at
+        // index 0 down, picking the larger child each step (comp(child, other)).
+        adjust_heap(heap, 0, new_len);
+    }
+    result
+}
+
+/// libstdc++ `std::__adjust_heap(first, holeIndex, len, value)` specialized to
+/// `holeIndex == 0` with `value` already placed at `heap[0]`. Sifts that value
+/// down: at each level it moves the larger of the two children up into the hole,
+/// then descends. Children of `i` are `2*i+1` and `2*i+2`; on a tie between the
+/// two children the STL picks the **right** child (`comp(child[2*i+1],
+/// child[2*i+2])` chooses the second when the first is not greater).
+fn adjust_heap(heap: &mut [Bin], start: usize, len: usize) {
+    let mut hole = start;
+    loop {
+        let right = 2 * hole + 2;
+        if right >= len {
+            break;
+        }
+        // secondChild = right; if comp(arr[right], arr[right-1]) secondChild = left.
+        let left = right - 1;
+        let larger = match (heap.get(left), heap.get(right)) {
+            (Some(l), Some(r)) => {
+                if r.best_score < l.best_score {
+                    left
+                } else {
+                    right
+                }
+            }
+            _ => break,
+        };
+        let hole_lt_larger = match (heap.get(hole), heap.get(larger)) {
+            (Some(h), Some(g)) => h.best_score < g.best_score,
+            _ => break,
+        };
+        if !hole_lt_larger {
+            break;
+        }
+        heap.swap(hole, larger);
+        hole = larger;
+    }
+    // Handle a lone left child (no right child) at the bottom level.
+    let left = 2 * hole + 1;
+    if left == len - 1 {
+        let hole_lt_left = match (heap.get(hole), heap.get(left)) {
+            (Some(h), Some(l)) => h.best_score < l.best_score,
+            _ => return,
+        };
+        if hole_lt_left {
+            heap.swap(hole, left);
+        }
     }
 }
 
