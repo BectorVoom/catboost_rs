@@ -185,6 +185,18 @@ impl TFastRng64 {
         self.r2.advance(delta);
     }
 
+    /// `TCommonRNG::GenRandReal1` for a `ui64` engine (`common_ops.h:19,99`):
+    /// a real in `[0, 1]` with 53-bit resolution, `(GenRand() >> 11) *
+    /// (1.0 / 9007199254740991.0)`. This is the exact draw the bootstrap /
+    /// sampling path consumes (`tensor_search_helpers.cpp`, `mvs.cpp`,
+    /// `calc_score_cache.cpp`); the divisor `2^53 - 1` and the `>> 11` shift are
+    /// the parity contract — do not substitute a `[0,1)` variant.
+    #[inline]
+    pub fn gen_rand_real1(&mut self) -> f64 {
+        // ToRandReal1(ui64 x) = (x >> 11) * (1.0 / 9007199254740991.0).
+        (self.gen_rand() >> 11) as f64 * (1.0 / 9_007_199_254_740_991.0)
+    }
+
     /// Fallible uniform draw in `[0, bound)` via rejection sampling
     /// (`NPrivate::GenUniform`). Ports the C++ `Y_ABORT_UNLESS(max > 0)`
     /// precondition into a `Result`: a zero `bound` returns

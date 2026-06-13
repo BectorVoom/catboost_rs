@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, Stage};
-use cb_train::{train, BoostParams, Model};
+use cb_train::{train, BoostParams, EBootstrapType, Model};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
 
@@ -91,6 +91,11 @@ fn train_scenario(
         l2_leaf_reg: 3.0,
         boost_from_average,
         leaf_method,
+        // Leaf-method scenarios pin sampling off (D-07 isolating discipline).
+        bootstrap_type: EBootstrapType::No,
+        subsample: 1.0,
+        bagging_temperature: 0.0,
+        random_seed: 0,
     };
 
     let mut staged = Vec::new();

@@ -82,3 +82,17 @@ fn try_uniform_valid_bound_matches_uniform_first_value() {
     let mut rng = TFastRng64::new(0, 1, 2, 3);
     assert_eq!(rng.try_uniform(100), Ok(37));
 }
+
+/// `GenRandReal1` (common_ops.h:19,99) for a ui64 engine is
+/// `(GenRand() >> 11) * (1.0 / (2^53 - 1))`. From `from_seed(17)` the first
+/// `GenRand()` is `14895365814383052362` (fast_ut.cpp `Test3`), so the first
+/// `gen_rand_real1()` is exactly `(14895365814383052362 >> 11) / 9007199254740991`.
+#[test]
+fn gen_rand_real1_from_seed_17_matches_to_rand_real1() {
+    let mut rng = TFastRng64::from_seed(17);
+    let expected = (14_895_365_814_383_052_362u64 >> 11) as f64 * (1.0 / 9_007_199_254_740_991.0);
+    let got = rng.gen_rand_real1();
+    assert_eq!(got, expected);
+    // The draw lies in the closed unit interval [0, 1].
+    assert!((0.0..=1.0).contains(&got));
+}

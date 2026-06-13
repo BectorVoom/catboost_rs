@@ -29,9 +29,23 @@ use cb_compute::{
     reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, simple_leaf_delta, LeafMethod, Loss,
     Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
-use cb_core::{sum_f64, CbError, CbResult};
+use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
+use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::tree::{check_depth, greedy_tensor_search_oblivious, FeatureMatrix, Split};
+
+/// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
+/// the fold pick (`Rand.GenRand() % foldCount`) and the derivative-seed draw
+/// (`Rand.GenRand()` feeding `GenRandUI64Vector`). Consumed only when sampling
+/// is active so the bootstrap draws land on the correct RNG phase every tree.
+const PRE_TREE_DRAWS: usize = 2;
+
+/// Per-iteration POST-bootstrap draws BEYOND the `depth` per-level
+/// `CalcScores` random-strength seed draws (greedy_tensor_search.cpp:884): the
+/// depth loop evaluates `depth + 1` candidate levels (the final level finds no
+/// improving split and breaks), so `CalcScores` draws one extra `GenRand()`.
+/// Verified end-to-end against the Bernoulli oracle (post = depth + 1).
+const POST_TREE_EXTRA_DRAWS: usize = 1;
 
 /// Parameters for the plain boosting loop (the D-07 simplified isolating set).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,6 +66,18 @@ pub struct BoostParams {
     /// Which leaf-estimation method computes the per-leaf deltas (TRAIN-03 /
     /// D-09). The first-slice path is [`LeafMethod::Gradient`].
     pub leaf_method: LeafMethod,
+    /// Bootstrap / sampling type (TRAIN-04). The first-slice path is
+    /// [`EBootstrapType::No`].
+    pub bootstrap_type: EBootstrapType,
+    /// Object subsample fraction (`subsample`), used by Bernoulli and MVS. `1.0`
+    /// disables subsampling. Ignored by `No`/`Bayesian`.
+    pub subsample: f64,
+    /// Bayesian bagging temperature (`bagging_temperature`); `0.0` makes Bayesian
+    /// weights all `1.0`. Ignored by the other types.
+    pub bagging_temperature: f32,
+    /// The training random seed seeding the persistent sampling RNG
+    /// (`random_seed`). Only consumed when `bootstrap_type != No`.
+    pub random_seed: u64,
 }
 
 /// One trained oblivious tree: the ordered splits and the per-leaf values
@@ -223,6 +249,29 @@ pub fn train<R: Runtime>(
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
 
+    // Persistent, continuously-advancing sampling RNG (`LearnProgress->Rand`,
+    // seeded `random_seed`). Only consumed when bootstrap_type != No (Bayesian /
+    // Bernoulli / MVS). The draw stream is NOT reseeded per tree (Pitfall 4).
+    //
+    // The bootstrap draws are NOT the only consumers of the persistent RNG:
+    // upstream's per-iteration boosting body advances `LearnProgress->Rand` in a
+    // FIXED pattern around each tree's `DoBootstrap` (train.cpp:206-243,
+    // greedy_tensor_search.cpp:884,1916). Reproducing the draw ORDER (the parity
+    // contract) requires consuming those non-bootstrap draws in the exact same
+    // sequence so the bootstrap draws land on the correct RNG state every tree:
+    //   * PRE-bootstrap, per iteration (train.cpp:208,211): `Rand.GenRand()`
+    //     (fold pick `% foldCount`) + `Rand.GenRand()` (seed for
+    //     `GenRandUI64Vector`) = [`PRE_TREE_DRAWS`] draws.
+    //   * POST-bootstrap, per depth level (greedy_tensor_search.cpp:884):
+    //     `CalcScores` draws ONE `Rand.GenRand()` per level (the
+    //     random-strength seed, consumed even at `random_strength=0`) = `depth`
+    //     draws per tree.
+    let mut rng = TFastRng64::from_seed(params.random_seed);
+    let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No);
+    // MVS lambda for trees after the first uses the previous tree's mean leaf L2
+    // norm (`CalculateLastIterMeanLeafValue`); `None` on the first tree.
+    let mut prev_leaf_mean_l2: Option<f64> = None;
+
     for _iter in 0..params.iterations {
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
         let ders = runtime.compute_gradients(params.loss, &approx, target)?;
@@ -236,21 +285,64 @@ pub fn train<R: Runtime>(
             .map(|(&d, &w)| d * w)
             .collect();
 
+        // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211): keep the RNG
+        //     phase-aligned with upstream before the per-tree Bootstrap.
+        if draws_active {
+            for _ in 0..PRE_TREE_DRAWS {
+                rng.gen_rand();
+            }
+        }
+
+        // 1b. Bootstrap / sampling (TRAIN-04): once per tree, on the continuous
+        //     RNG. MVS reads the weighted derivatives; the others ignore them.
+        let sampled = bootstrap(
+            params.bootstrap_type,
+            &weighted_der1,
+            params.subsample,
+            params.bagging_temperature,
+            prev_leaf_mean_l2,
+            &mut rng,
+        )?;
+
+        // The SAMPLE WEIGHTS and CONTROL mask affect ONLY the SPLIT SCORING
+        // (the `sampledDocs` histogram path); LEAF VALUES are estimated on the
+        // FULL, UN-sampled AveragingFold derivatives (verified against upstream:
+        // Bayesian/MVS sample weights never enter `CalcLeafValues`). So:
+        //   * SCORE path: der1*weight*sampleWeight, restricted to control-true
+        //     objects (zero score weight excludes an object from the ordered
+        //     histogram reduction, exactly as `sampledDocs` drops it).
+        //   * LEAF path: the raw weighted_der1 / weights (no sampling) —
+        //     unchanged from the first slice.
+        let score_weighted_der1: Vec<f64> = weighted_der1
+            .iter()
+            .zip(sampled.sample_weights.iter())
+            .zip(sampled.control.iter())
+            .map(|((&d, &sw), &c)| if c { d * sw } else { 0.0 })
+            .collect();
+        let score_weights: Vec<f64> = weights
+            .iter()
+            .zip(sampled.sample_weights.iter())
+            .zip(sampled.control.iter())
+            .map(|((&w, &sw), &c)| if c { w * sw } else { 0.0 })
+            .collect();
+
         // 2. Grow one oblivious tree using the L2 split score over the ordered
-        //    leaf-stat reduction.
+        //    leaf-stat reduction (sampled subset / sample-weighted).
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
         let grown = greedy_tensor_search_oblivious(
             &matrix,
-            &weighted_der1,
-            &weights,
+            &score_weighted_der1,
+            &score_weights,
             scaled_l2,
             params.depth,
             n,
         )?;
 
         // 3. Leaf values via the selected estimation method (TRAIN-03 / D-09),
-        //    scaled by learning_rate (stored value matches model.json). Every
-        //    reduction over leaf members routes through cb_core::sum_f64 (D-05).
+        //    scaled by learning_rate (stored value matches model.json). Leaf
+        //    estimation uses the FULL fold (all objects) with the RAW (un-sampled)
+        //    derivatives/weights. Every reduction over leaf members routes through
+        //    cb_core::sum_f64 (D-05).
         let leaf_deltas = compute_leaf_deltas(
             params.leaf_method,
             &grown.leaf_of,
@@ -278,6 +370,21 @@ pub fn train<R: Runtime>(
         if let Some(out) = staged_out.as_deref_mut() {
             out.extend_from_slice(&approx);
         }
+
+        // POST-bootstrap per-depth-level draws (greedy_tensor_search.cpp:884):
+        // CalcScores draws ONE Rand.GenRand() per level (the random-strength
+        // seed, drawn even at random_strength=0). Keep the RNG phase-aligned for
+        // the next tree's Bootstrap.
+        if draws_active {
+            for _ in 0..(params.depth + POST_TREE_EXTRA_DRAWS) {
+                rng.gen_rand();
+            }
+        }
+
+        // MVS lambda for the NEXT tree uses this tree's mean leaf L2 norm
+        // (`CalculateLastIterMeanLeafValue`, mvs.cpp:21-35) over the stored
+        // (learning_rate-scaled) leaf values.
+        prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&leaf_values));
 
         trees.push(ObliviousTree {
             splits: grown.splits,
