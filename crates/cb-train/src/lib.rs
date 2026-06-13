@@ -35,6 +35,7 @@ pub use boosting::{
     train, train_with_eval, train_with_eval_sets, BoostParams, EvalSet, Model, ObliviousTree,
 };
 pub use tree::{
-    check_depth, greedy_tensor_search_oblivious, leaf_index, select_best_candidate, Candidate,
-    FeatureMatrix, GrownTree, Split, MAX_DEPTH,
+    check_depth, greedy_tensor_search_oblivious, grow_one_hot_tree, leaf_index,
+    select_best_candidate, AnySplit, Candidate, FeatureMatrix, GrownOneHotTree, GrownTree,
+    OneHotSplit, Split, MAX_DEPTH,
 };

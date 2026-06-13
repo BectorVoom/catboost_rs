@@ -50,12 +50,42 @@ mod tie_break;
 pub const MAX_DEPTH: usize = 16;
 
 /// One split in an oblivious tree: a `value > border` test on one float feature.
+///
+/// This is the canonical float-split type shared with `cb-model` (`pub use
+/// cb_train::Split`). The ORD-04 one-hot categorical split is a SEPARATE type
+/// ([`OneHotSplit`]) confined to the categorical tree-growth path so this widely
+/// re-used struct stays byte-for-byte unchanged (no cross-crate literal churn).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Split {
     /// The float feature this split tests.
     pub feature: usize,
     /// The split border (threshold); an object passes when `value > border`.
     pub border: f64,
+}
+
+/// One one-hot categorical split: a `cat_bin == value` equality test on one
+/// categorical feature (`ESplitType::OneHotFeature`,
+/// `IsTrueOneHotFeature(featureValue, splitValue) = featureValue == splitValue`,
+/// `catboost/libs/model/split.h:16-17`). The bin is the first-seen perfect-hash
+/// bin (`cb_data::PerfectHash`) of the object's categorical value (ORD-04).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OneHotSplit {
+    /// The categorical feature this split tests.
+    pub feature: usize,
+    /// The categorical bin this split tests equality against (`splitValue`).
+    pub value: u32,
+}
+
+/// A split in the ORD-04 categorical tree-growth path: either a float
+/// `value > border` ([`Split`]) or a one-hot `cat_bin == value` ([`OneHotSplit`]).
+/// Used only inside the categorical-aware search ([`grow_one_hot_tree`]); the
+/// numeric first-slice path keeps using bare [`Split`] unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnySplit {
+    /// A float threshold split.
+    Float(Split),
+    /// A one-hot categorical equality split.
+    OneHot(OneHotSplit),
 }
 
 /// A scored candidate split during the greedy search. `score` is the L2 split
@@ -131,43 +161,101 @@ pub fn select_best_candidate(candidates: &[Candidate]) -> Option<Candidate> {
     best
 }
 
-/// Per-object access to one feature's `f32` value, for the `value > border` test.
-/// `values[feature][object]` SoA layout (object order preserved for D-05).
+/// Per-object access to feature values for split tests: float `value > border`
+/// columns plus optional one-hot categorical bin columns (`cat_bins`). SoA
+/// layout, object order preserved for D-05.
 pub struct FeatureMatrix<'a> {
-    /// `feature_values[f]` is feature `f`'s per-object `f32` column.
+    /// `feature_values[f]` is float feature `f`'s per-object `f32` column.
     pub feature_values: &'a [Vec<f32>],
-    /// `feature_borders[f]` is the ascending candidate borders for feature `f`
-    /// (the model's float-feature borders).
+    /// `feature_borders[f]` is the ascending candidate borders for float feature
+    /// `f` (the model's float-feature borders).
     pub feature_borders: &'a [Vec<f64>],
+    /// `cat_bins[c]` is categorical feature `c`'s per-object first-seen
+    /// perfect-hash bin column (`cb_data::PerfectHash`), for one-hot
+    /// `cat_bin == value` splits (ORD-04). Empty for the numeric-only first
+    /// slice (no categorical features).
+    pub cat_bins: &'a [Vec<u32>],
 }
 
-impl FeatureMatrix<'_> {
+impl<'a> FeatureMatrix<'a> {
+    /// Construct a numeric-only matrix (no categorical features). The
+    /// backward-compatible constructor for the float first-slice callers.
+    #[must_use]
+    pub fn new(feature_values: &'a [Vec<f32>], feature_borders: &'a [Vec<f64>]) -> Self {
+        Self {
+            feature_values,
+            feature_borders,
+            cat_bins: &[],
+        }
+    }
+
     /// Number of float features.
     #[must_use]
     pub fn n_features(&self) -> usize {
         self.feature_values.len()
     }
 
-    /// Whether object `obj` passes the split `value > border` on `feature`.
-    /// Out-of-range indices return `false` defensively (the trainer passes valid
-    /// indices).
+    /// Number of categorical features (one-hot bin columns).
     #[must_use]
-    fn passes(&self, feature: usize, obj: usize, border: f64) -> bool {
+    pub fn n_cat_features(&self) -> usize {
+        self.cat_bins.len()
+    }
+
+    /// Whether object `obj` passes the float split `value > border` on float
+    /// feature `feature`. Out-of-range indices return `false` defensively (the
+    /// trainer passes valid indices).
+    #[must_use]
+    fn passes_float(&self, feature: usize, obj: usize, border: f64) -> bool {
         self.feature_values
             .get(feature)
             .and_then(|col| col.get(obj))
             .is_some_and(|&v| f64::from(v) > border)
     }
+
+    /// Whether object `obj` passes the one-hot split `cat_bin == value` on
+    /// categorical feature `feature` (`IsTrueOneHotFeature`, `split.h:16-17`).
+    /// Out-of-range indices return `false` defensively.
+    #[must_use]
+    fn passes_one_hot(&self, feature: usize, obj: usize, value: u32) -> bool {
+        self.cat_bins
+            .get(feature)
+            .and_then(|col| col.get(obj))
+            .is_some_and(|&bin| bin == value)
+    }
+
+    /// Whether object `obj` passes the float [`Split`] `split`.
+    #[must_use]
+    fn passes(&self, split: &Split, obj: usize) -> bool {
+        self.passes_float(split.feature, obj, split.border)
+    }
+
+    /// Whether object `obj` passes the [`AnySplit`] `split` (float or one-hot).
+    #[must_use]
+    fn passes_any(&self, split: &AnySplit, obj: usize) -> bool {
+        match split {
+            AnySplit::Float(s) => self.passes_float(s.feature, obj, s.border),
+            AnySplit::OneHot(s) => self.passes_one_hot(s.feature, obj, s.value),
+        }
+    }
 }
 
-/// Assign every object to a leaf given the chosen `splits` (forward bit order).
+/// Assign every object to a leaf given the chosen float `splits` (forward bit
+/// order). The numeric first-slice path.
 fn assign_leaves(matrix: &FeatureMatrix, splits: &[Split], n_objects: usize) -> Vec<usize> {
     (0..n_objects)
         .map(|obj| {
-            let passes: Vec<bool> = splits
-                .iter()
-                .map(|s| matrix.passes(s.feature, obj, s.border))
-                .collect();
+            let passes: Vec<bool> = splits.iter().map(|s| matrix.passes(s, obj)).collect();
+            leaf_index(&passes)
+        })
+        .collect()
+}
+
+/// Assign every object to a leaf given the chosen [`AnySplit`] list (float or
+/// one-hot, forward bit order). The ORD-04 categorical path.
+fn assign_leaves_any(matrix: &FeatureMatrix, splits: &[AnySplit], n_objects: usize) -> Vec<usize> {
+    (0..n_objects)
+        .map(|obj| {
+            let passes: Vec<bool> = splits.iter().map(|s| matrix.passes_any(s, obj)).collect();
             leaf_index(&passes)
         })
         .collect()
@@ -293,8 +381,17 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 }
 
 /// One level of the UNPERTURBED search: enumerate candidates in upstream order
-/// (feature ascending, border ascending), score each via the L2 calcer, and pick
-/// the strict first-wins best. No RNG draws (the first-slice path).
+/// — FLOAT features (feature ascending, border ascending; `AddFloatFeatures`)
+/// THEN ONE-HOT categorical features (feature ascending, bin ascending;
+/// `AddOneHotFeatures`, `greedy_tensor_search.cpp:171-197`) — score each via the
+/// L2 calcer, and pick the strict first-wins best. No RNG draws (the first-slice
+/// / D-04 path).
+///
+/// Each scored [`Candidate`] is paired with the concrete [`Split`] it represents
+/// (float or one-hot) at the same index, so the strict first-wins winner maps
+/// back to the actual split. The `Candidate::border` carries the float border for
+/// a float candidate and the categorical bin (as `f64`) for a one-hot candidate,
+/// preserving the ascending iteration order the strict `>` tie-break relies on.
 fn select_level_plain(
     matrix: &FeatureMatrix,
     chosen: &[Split],
@@ -410,5 +507,152 @@ fn select_level_perturbed(
 
     chosen_split.ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+    })
+}
+
+// ===========================================================================
+// ORD-04 categorical one-hot tree growth (D-04 isolation path)
+// ===========================================================================
+//
+// The categorical-aware greedy search: identical L2 split math and strict
+// first-wins tie-break to the float `select_level_plain` above, but the
+// candidate set ALSO includes one-hot `cat_bin == value` splits
+// (`AddOneHotFeatures`, greedy_tensor_search.cpp:171-197). It rides the EXISTING
+// plain boosting unchanged: NO permutation and NO RNG draws (random_strength=0).
+// A one-hot split is structurally a binary feature, so a one-hot-only model is
+// the same oblivious tree the float path would grow on the equivalent binary
+// columns — the load-bearing D-04 parity property the oracle test locks.
+
+/// The grown categorical oblivious tree: ordered [`AnySplit`] splits (float or
+/// one-hot) plus the per-object leaf assignment. The categorical analog of
+/// [`GrownTree`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrownOneHotTree {
+    /// The `depth` ordered splits (float or one-hot), one per level.
+    pub splits: Vec<AnySplit>,
+    /// Per-object leaf index (`0..2^depth`), object order.
+    pub leaf_of: Vec<usize>,
+}
+
+/// The distinct categorical bins present in `column`, in ASCENDING bin order
+/// (the one-hot candidate enumeration order, bin asc). Checked access only.
+fn distinct_bins_ascending(column: &[u32]) -> Vec<u32> {
+    let mut seen: Vec<u32> = Vec::new();
+    for &bin in column {
+        if !seen.contains(&bin) {
+            seen.push(bin);
+        }
+    }
+    seen.sort_unstable();
+    seen
+}
+
+/// Score one [`AnySplit`] candidate applied across the CURRENT level (the
+/// categorical analog of [`score_candidate`]): extend the chosen splits with the
+/// candidate, assign leaves ([`assign_leaves_any`]), reduce per-leaf stats
+/// ordered, and fold the L2 score.
+fn score_candidate_any(
+    matrix: &FeatureMatrix,
+    chosen: &[AnySplit],
+    candidate: AnySplit,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+) -> f64 {
+    let mut splits = chosen.to_vec();
+    splits.push(candidate);
+    let n_leaves = 1usize << splits.len();
+    let leaf_of = assign_leaves_any(matrix, &splits, n_objects);
+    let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
+    l2_split_score(&stats, scaled_l2)
+}
+
+/// One level of the categorical UNPERTURBED search: enumerate FLOAT candidates
+/// (feature asc, border asc; `AddFloatFeatures`) THEN ONE-HOT candidates
+/// (categorical feature asc, bin asc; `AddOneHotFeatures`,
+/// `greedy_tensor_search.cpp:171-197`), score each via the L2 calcer, and pick
+/// the strict first-wins best over that FIXED order. No RNG draws (the D-04
+/// path). The winning candidate's concrete [`AnySplit`] is recovered from a
+/// vector kept in lockstep with the scores.
+fn select_level_one_hot(
+    matrix: &FeatureMatrix,
+    chosen: &[AnySplit],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+) -> CbResult<AnySplit> {
+    let mut scored: Vec<(AnySplit, f64)> = Vec::new();
+
+    // FLOAT candidates first (AddFloatFeatures), feature asc / border asc.
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        for &border in borders {
+            let split = AnySplit::Float(Split { feature, border });
+            let score =
+                score_candidate_any(matrix, chosen, split, der1, weight, scaled_l2, n_objects);
+            scored.push((split, score));
+        }
+    }
+
+    // ONE-HOT candidates next (AddOneHotFeatures), categorical feature asc / bin
+    // asc. One candidate per distinct learn-set bin (the one-hot expansion); the
+    // `crate::candidates` routing already gated which categorical features reach
+    // here (`1 < cardinality <= one_hot_max_size`).
+    for feature in 0..matrix.n_cat_features() {
+        let bins = matrix.cat_bins.get(feature).map_or(&[][..], Vec::as_slice);
+        for value in distinct_bins_ascending(bins) {
+            let split = AnySplit::OneHot(OneHotSplit { feature, value });
+            let score =
+                score_candidate_any(matrix, chosen, split, der1, weight, scaled_l2, n_objects);
+            scored.push((split, score));
+        }
+    }
+
+    // Strict first-wins over the FIXED enumeration order (floats then one-hots),
+    // identical to `select_best_candidate` (strict `>`, NOT `>=`; Pitfall 1).
+    let mut best: Option<AnySplit> = None;
+    let mut best_score = MINIMAL_SCORE;
+    for &(split, score) in &scored {
+        if score > best_score {
+            best_score = score;
+            best = Some(split);
+        }
+    }
+    best.ok_or_else(|| {
+        CbError::Degenerate(
+            "no candidate split available (no float border and no one-hot categorical)".to_owned(),
+        )
+    })
+}
+
+/// Grow one oblivious tree of depth `depth` over the FLOAT + ONE-HOT candidate
+/// set (ORD-04 / D-04), with the strict first-wins greedy search. Each level
+/// selects one [`AnySplit`] (float or one-hot) applied across the whole level;
+/// a depth-`d` tree has `d` splits and `2^d` leaves. Rides the EXISTING plain
+/// boosting math unchanged — NO permutation, NO RNG draws.
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `depth > MAX_DEPTH` (before allocation).
+/// - [`CbError::Degenerate`] if a level has no candidate split at all.
+pub fn grow_one_hot_tree(
+    matrix: &FeatureMatrix,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    depth: usize,
+    n_objects: usize,
+) -> CbResult<GrownOneHotTree> {
+    check_depth(depth)?;
+    let mut chosen: Vec<AnySplit> = Vec::with_capacity(depth);
+    for _level in 0..depth {
+        let best = select_level_one_hot(matrix, &chosen, der1, weight, scaled_l2, n_objects)?;
+        chosen.push(best);
+    }
+    let leaf_of = assign_leaves_any(matrix, &chosen, n_objects);
+    Ok(GrownOneHotTree {
+        splits: chosen,
+        leaf_of,
     })
 }

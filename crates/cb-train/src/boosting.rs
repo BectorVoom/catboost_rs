@@ -503,10 +503,10 @@ pub fn train_with_eval_sets<R: Runtime>(
     let bias = starting_approx(params, target);
     let mut approx = vec![bias; n];
 
-    let matrix = FeatureMatrix {
-        feature_values,
-        feature_borders,
-    };
+    // Numeric-only training matrix (no categorical features in this path; the
+    // one-hot categorical splits are exercised through the categorical-aware
+    // tree search directly in the ORD-04 oracle test, D-04).
+    let matrix = FeatureMatrix::new(feature_values, feature_borders);
 
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
@@ -530,10 +530,7 @@ pub fn train_with_eval_sets<R: Runtime>(
     let mut best_model = BestModelTracker::new();
     let eval_matrices: Vec<FeatureMatrix> = eval_sets
         .iter()
-        .map(|es| FeatureMatrix {
-            feature_values: es.feature_values,
-            feature_borders,
-        })
+        .map(|es| FeatureMatrix::new(es.feature_values, feature_borders))
         .collect();
     let mut eval_approx: Vec<Vec<f64>> = eval_sets
         .iter()
