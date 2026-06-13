@@ -2,8 +2,8 @@
 phase: 4
 slug: model-serialization-shap-rust-api-first-full-oracle-lock
 status: draft
-nyquist_compliant: false
-wave_0_complete: false
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-06-13
 ---
 
@@ -87,6 +87,6 @@ created: 2026-06-13
 - [ ] Wave 0 covers all MISSING references
 - [ ] No watch-mode flags
 - [ ] Feedback latency acceptable (per-crate seconds)
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** signed off at planning — every task carries an <automated> verify; Wave-0 (Plan 01) provisions leaf-weights + flatc bindings + offline fixtures; oracle legs that require offline catboost fixtures degrade to documented #[ignore] with an in-env invariant gate (local-accuracy, Σ=100, Rust↔Rust round-trip). No 3 consecutive tasks lack automated verify.

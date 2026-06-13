@@ -141,6 +141,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Mode:** mvp
 **Depends on**: Phase 3
 **Requirements**: MODEL-01, MODEL-02, MODEL-03, MODEL-04, MODEL-06, LOSS-01, LOSS-06, RAPI-01, RAPI-02
+**Note**: MODEL-03 is only PARTIALLY delivered this phase — PredictionValuesChange + Interaction land here; `LossFunctionChange` is deferred to a later advanced-fstr phase (D-12).
 **Success Criteria** (what must be TRUE):
 
   1. Native `.cbm` (FlatBuffers) serialization round-trips, and a model produced by upstream CatBoost can be loaded and applied (cross-version compatible).
@@ -149,7 +150,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Binary classification (Logloss, CrossEntropy, Focal) and prediction types (Probability, LogProbability, Class, RawFormulaVal, Exponent, etc.) produce outputs matching upstream ≤1e-5.
   5. The `catboost-rs` Builder API (`CatBoostBuilder::new()...fit(&pool) -> Model`, predict) with a typed `thiserror` error enum drives a full numeric-only binary-clf + regression train→serialize→predict oracle pass ≤1e-5 vs C++.
 
-**Plans**: TBD
+**Plans**: 5 plans in 5 waves
+
+Plans:
+- [ ] 04-01-PLAN.md — Wave-0 prerequisite: capture per-leaf weights in cb-train, re-home canonical Model into cb-model (leaf_weights + float_feature_borders), extend model_json with leaf_weights, commit flatc-generated FlatBuffers bindings, stage offline fixtures
+- [ ] 04-02-PLAN.md — Pure-Rust CPU apply path (MODEL-02) + prediction-type transforms (LOSS-06) + CrossEntropy/Focal losses (LOSS-01)
+- [ ] 04-03-PLAN.md — .cbm save/load (FlatBuffers framing) + model.json export/import, semantic round-trip + upstream 1.2.10 load (MODEL-01, MODEL-06)
+- [ ] 04-04-PLAN.md — Regular TreeSHAP + local-accuracy lock (MODEL-04) + PredictionValuesChange/Interaction (MODEL-03 partial)
+- [ ] 04-05-PLAN.md — Public CatBoostBuilder + Model facade + CatBoostError + end-to-end binclf+regression train→serialize→load→predict oracle (RAPI-01, RAPI-02)
 
 ### Phase 5: Ordered Boosting, Ordered CTR & Categoricals (High-Risk Parity Slice)
 
