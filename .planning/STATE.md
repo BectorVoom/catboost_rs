@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 1 context gathered
-last_updated: "2026-06-13T00:50:34.879Z"
-last_activity: 2026-06-13 — Roadmap created (8 phases, 62/62 v1 requirements mapped)
+last_updated: "2026-06-13T01:00:45.164Z"
+last_activity: 2026-06-13 -- Phase 01 execution started
 progress:
   total_phases: 8
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 3
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 1 — Workspace, Lint Discipline & Oracle Harness
+**Current focus:** Phase 01 — workspace-lint-discipline-oracle-harness
 
 ## Current Position
 
-Phase: 1 of 8 (Workspace, Lint Discipline & Oracle Harness)
-Plan: 0 of TBD in current phase
+Phase: 01 (workspace-lint-discipline-oracle-harness) — EXECUTING
+Plan: 2 of 3
 Status: Ready to execute
-Last activity: 2026-06-13 — Roadmap created (8 phases, 62/62 v1 requirements mapped)
+Last activity: 2026-06-13 -- Phase 01 execution started
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -52,6 +52,7 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: —
 
 *Updated after each plan completion*
+| Phase 01 P01 | 5 | 4 tasks | 21 files |
 
 ## Accumulated Context
 
@@ -62,6 +63,9 @@ Recent decisions affecting current work:
 
 - Roadmap: Phased by oracle-passing vertical slices, narrowest-first (research-mandated); each phase must be oracle-passing ≤1e-5 vs upstream before the next begins.
 - Roadmap: CPU path fully oracle-locked (through Phase 6) before GPU (Phase 7); GPU is additive on the generic `R: Runtime` boundary established in Phase 3.
+- [Phase ?]: Plan 01-01: pinned approx to stable 0.5 (not 0.6.0-rc2 pre-release); test-only dev-dep
+- [Phase ?]: Plan 01-01: committed Cargo.lock for supply-chain integrity (T-01-SC)
+- [Phase ?]: Plan 01-01: uniform in-code test-lint exemption + --lib CI clippy gate (Pitfall 1)
 
 ### Pending Todos
 
@@ -86,6 +90,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T00:02:32.774Z
+Last session: 2026-06-13T01:00:30.192Z
 Stopped at: Phase 1 context gathered
 Resume file: .planning/phases/01-workspace-lint-discipline-oracle-harness/01-CONTEXT.md
