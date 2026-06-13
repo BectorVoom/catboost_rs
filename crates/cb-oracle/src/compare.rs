@@ -18,6 +18,20 @@ pub enum Stage {
     StagedApprox,
     /// Final model predictions.
     Predictions,
+    /// Per-fold object permutation indices (Phase-5 Wave-0, D-02/D-03).
+    ///
+    /// Unlike every other stage this is compared **integer-exact** (`!=`), NOT
+    /// at the `1e-5` tolerance: the permutation is the D-03 linchpin and any
+    /// single-index mismatch must be rejected BEFORE any value stage runs. Use
+    /// [`compare_permutation`] for this stage, not [`compare_stage`].
+    Permutation,
+    /// Per-object online (ordered) CTR values (Phase-5 Wave-0, D-02).
+    ///
+    /// Routed through the existing `≤1e-5` [`compare_stage`] path.
+    OnlineCtr,
+    /// Per-object per-iteration ordered-boosting approximants (Phase-5 Wave-0,
+    /// D-02). Routed through the existing `≤1e-5` [`compare_stage`] path.
+    OrderedApprox,
 }
 
 /// Asserts that every paired value in `expected` and `actual` is within `tol`
@@ -93,4 +107,41 @@ pub fn compare_stage(stage: Stage, expected: &[f64], actual: &[f64]) -> Result<(
         // other variant would be a future addition — propagate it untouched.
         Err(other) => Err(other),
     }
+}
+
+/// Integer-exact comparator for the [`Stage::Permutation`] linchpin (Phase-5
+/// Wave-0, D-03).
+///
+/// Permutation indices are integers (`int32`/`i64` on the upstream side), so
+/// they are compared with `==`, NOT at the `1e-5` float tolerance. Any single
+/// index mismatch is rejected at the FIRST offending position — this is what
+/// lets the D-03 ordering hold: a permutation that fails to reproduce upstream
+/// exactly must short-circuit before any value stage (OnlineCtr / OrderedApprox)
+/// is allowed to run.
+///
+/// This function never panics and never indexes (mitigates T-01-02): it walks
+/// the two slices with a zipped iterator and returns a typed [`OracleError`].
+///
+/// # Errors
+/// - [`OracleError::PermutationLengthMismatch`] if the slices differ in length.
+/// - [`OracleError::PermutationDiverged`] at the first index whose value differs.
+pub fn compare_permutation(expected: &[i64], actual: &[i64]) -> Result<(), OracleError> {
+    if expected.len() != actual.len() {
+        return Err(OracleError::PermutationLengthMismatch {
+            stage: Stage::Permutation,
+            expected: expected.len(),
+            actual: actual.len(),
+        });
+    }
+    for (index, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
+        if e != a {
+            return Err(OracleError::PermutationDiverged {
+                stage: Stage::Permutation,
+                index,
+                expected: *e,
+                actual: *a,
+            });
+        }
+    }
+    Ok(())
 }

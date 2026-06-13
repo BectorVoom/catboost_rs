@@ -21,7 +21,7 @@ mod error;
 mod fixture;
 mod model_json;
 
-pub use compare::{assert_abs_close, compare_stage, Stage};
+pub use compare::{assert_abs_close, compare_permutation, compare_stage, Stage};
 pub use error::OracleError;
 pub use fixture::{load_config, load_f64_vec, FixtureConfig};
 pub use model_json::{

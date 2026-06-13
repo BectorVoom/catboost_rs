@@ -57,6 +57,36 @@ pub enum OracleError {
         diff: f64,
     },
 
+    /// A stage-tagged length mismatch for the integer-exact permutation stage
+    /// (`compare_permutation`): the expected and actual index slices differed in
+    /// length.
+    #[error("stage {stage:?}: permutation length mismatch: expected {expected} indices, got {actual}")]
+    PermutationLengthMismatch {
+        /// Oracle stage the mismatch occurred in (always [`crate::compare::Stage::Permutation`]).
+        stage: crate::compare::Stage,
+        /// Length of the expected (oracle) permutation.
+        expected: usize,
+        /// Length of the actual (computed) permutation.
+        actual: usize,
+    },
+
+    /// A stage-tagged integer-exact mismatch (`compare_permutation`): a paired
+    /// permutation index for `stage` differed at `index`. Unlike
+    /// [`Self::StageDiverged`] this is an *exact* (`!=`) comparison, not a 1e-5
+    /// tolerance — the permutation is the D-03 linchpin and must reproduce
+    /// bit-for-bit before any value stage runs.
+    #[error("stage {stage:?}: permutation diverged at index {index}: expected {expected}, actual {actual}")]
+    PermutationDiverged {
+        /// Oracle stage the divergence occurred in (always [`crate::compare::Stage::Permutation`]).
+        stage: crate::compare::Stage,
+        /// First index whose value differed.
+        index: usize,
+        /// Expected (oracle) permutation index at `index`.
+        expected: i64,
+        /// Actual (computed) permutation index at `index`.
+        actual: i64,
+    },
+
     /// A parsed `model.json` did not have the expected shape (e.g. a malformed
     /// `scale_and_bias`). Surfaced instead of panicking on a bad oracle file
     /// (T-03-00-01).
