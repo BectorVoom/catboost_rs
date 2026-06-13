@@ -34,7 +34,7 @@
 - [~] **TRAIN-03**: Leaf value estimation — Gradient (done, Plan 01); Newton, Exact, Simple (Plan 02)
 - [x] **TRAIN-04**: Bootstrap / sampling — Poisson, Bayesian, Bernoulli, MVS, No; `subsample`; object/group sampling units (Plan 03; No/Bernoulli/MVS oracle-locked ≤1e-5, Poisson CPU-rejected per upstream, Bayesian first-tree + draw-sequence locked)
 - [x] **TRAIN-05**: Regularization — `l2_leaf_reg`, `random_strength`, `bagging_temperature`
-- [ ] **TRAIN-06**: Overfitting detection and early stopping — Wilcoxon/IncToDec/Iter, `od_pval`/`od_wait`, `use_best_model`
+- [x] **TRAIN-06**: Overfitting detection and early stopping — Wilcoxon/IncToDec/Iter, `od_pval`/`od_wait`, `use_best_model`
 - [ ] **TRAIN-07**: Eval-set validation metrics logged per iteration (multiple eval sets, `eval_metric`)
 - [ ] **TRAIN-08**: Automatic learning-rate selection from dataset size
 
@@ -148,7 +148,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-03 | Phase 3 | Complete (Gradient/Newton/Exact/Simple, Plan 02) |
 | TRAIN-04 | Phase 3 | Complete (No/Bernoulli/MVS oracle-locked; Poisson CPU-rejected; Bayesian first-tree + draw-sequence, Plan 03) |
 | TRAIN-05 | Phase 3 | Complete |
-| TRAIN-06 | Phase 3 | Pending |
+| TRAIN-06 | Phase 3 | Complete |
 | TRAIN-07 | Phase 3 | Pending |
 | TRAIN-08 | Phase 3 | Pending |
 | MODEL-01 | Phase 4 | Pending |
