@@ -64,6 +64,25 @@ pub enum CbError {
         column: usize,
     },
 
+    /// A requested tree `depth` exceeded the supported cap (upstream
+    /// `MaxDepth`). `2^depth` leaf counts are allocated up front, so an
+    /// oversized depth is rejected before allocation rather than overflowing
+    /// (Phase-3 T-03-01-02 mitigation).
+    #[error("tree depth {depth} exceeds the maximum supported depth {max}")]
+    DepthExceeded {
+        /// The requested depth.
+        depth: usize,
+        /// The maximum supported depth (upstream `MaxDepth`, 16).
+        max: usize,
+    },
+
+    /// A training step hit a degenerate condition that cannot produce a valid
+    /// tree (e.g. no candidate split improves the score, or an input dimension
+    /// is empty). Surfaced as an error rather than a panic (Phase-3
+    /// T-03-01-01 mitigation).
+    #[error("degenerate training input: {0}")]
+    Degenerate(String),
+
     /// An external (Arrow / Polars) source failed to yield a usable column.
     ///
     /// The external error is STRINGIFIED into `message` rather than wrapped via

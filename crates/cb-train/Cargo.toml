@@ -9,3 +9,15 @@ workspace = true
 
 [dependencies]
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
+cb-core = { path = "../cb-core" }
+cb-data = { path = "../cb-data" }
+cb-compute = { path = "../cb-compute" }
+cb-backend = { path = "../cb-backend" }
+
+[dev-dependencies]
+# Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the
+# first-slice train->predict parity integration test.
+cb-oracle = { path = "../cb-oracle" }
+approx.workspace = true
+ndarray.workspace = true
+ndarray-npy.workspace = true
