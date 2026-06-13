@@ -61,7 +61,27 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. A single audited deterministic reduction utility matches the C++ `double` accumulator type and summation order, and is the only summation primitive used in the codebase.
   5. NumPy is ingested zero-copy and Arrow/Polars with dtype/contiguity validation; per-object/per-class weights and auto class weights (Balanced/SqrtBalanced) are computed correctly.
 
-**Plans**: TBD
+**Plans**: 5 plans in 5 waves
+
+**Wave 1**
+
+- [ ] 02-01-PLAN.md — Foundation: cb-core reduction primitive + D-08 CI-grep gate + Wave-0 oracle fixtures (numeric_nan/borders/cat-hash/class-weights) resolving Assumptions A1–A5
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 02-02-PLAN.md — Pool (owned columns + IngestSource seam) + GreedyLogSum borders oracle-locked on numeric_tiny
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 02-03-PLAN.md — NanMode sentinel + strict value>border + QuantizedPool SoA width enum + pool.quantize driver, oracle-locked on numeric_nan
+
+**Wave 4** *(blocked on Wave 3)*
+
+- [ ] 02-04-PLAN.md — CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked on the categorical corpus
+
+**Wave 5** *(blocked on Wave 4)*
+
+- [ ] 02-05-PLAN.md — Arrow/Polars ingestion (typed CbError taxonomy) + Balanced/SqrtBalanced auto class weights, oracle-locked; full workspace suite green
 
 ### Phase 3: CPU Training Core — Plain Boosting & Oblivious Trees
 
@@ -170,7 +190,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Workspace, Lint & Oracle Harness | 3/3 | Complete   | 2026-06-13 |
-| 2. Data Layer — Pool, Quantization & Reduction | 0/TBD | Not started | - |
+| 2. Data Layer — Pool, Quantization & Reduction | 0/5 | Planned | - |
 | 3. CPU Training Core — Plain Boosting & Trees | 0/TBD | Not started | - |
 | 4. Model, Serialization, SHAP & Rust API | 0/TBD | Not started | - |
 | 5. Ordered Boosting, Ordered CTR & Categoricals | 0/TBD | Not started | - |
