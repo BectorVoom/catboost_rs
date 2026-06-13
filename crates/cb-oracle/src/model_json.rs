@@ -38,6 +38,12 @@ pub struct SplitJson {
 pub struct ObliviousTree {
     /// Leaf values in canonical (binary-index) order; length is `2^depth`.
     pub leaf_values: Vec<f64>,
+    /// Per-leaf summed training-document weights in the SAME per-tree nested
+    /// layout as `leaf_values` (RESEARCH Pitfall 2: `model.json` `leaf_weights`
+    /// is per-tree nested, NOT the `.cbm` flat array). `#[serde(default)]` keeps
+    /// existing Phase-3 fixtures without `leaf_weights` parsing.
+    #[serde(default)]
+    pub leaf_weights: Vec<f64>,
     /// The ordered splits defining this tree's symmetric structure.
     pub splits: Vec<SplitJson>,
 }
@@ -98,6 +104,18 @@ impl ModelJson {
         self.oblivious_trees
             .iter()
             .flat_map(|tree| tree.leaf_values.iter().copied())
+            .collect()
+    }
+
+    /// Per-tree leaf weights as a nested `Vec<Vec<f64>>` (one inner vector per
+    /// tree, RESEARCH Pitfall 2). Trees whose fixture predates the
+    /// `leaf_weights` regeneration yield an empty inner vector (the
+    /// `#[serde(default)]` field), so callers can detect a missing fixture.
+    #[must_use]
+    pub fn leaf_weights(&self) -> Vec<Vec<f64>> {
+        self.oblivious_trees
+            .iter()
+            .map(|tree| tree.leaf_weights.clone())
             .collect()
     }
 

@@ -644,6 +644,10 @@ dependencies = [
 [[package]]
 name = "cb-model"
 version = "0.1.0"
+dependencies = [
+ "cb-core",
+ "cb-train",
+]
 
 [[package]]
 name = "cb-oracle"

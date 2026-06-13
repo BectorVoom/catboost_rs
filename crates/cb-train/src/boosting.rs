@@ -118,14 +118,20 @@ pub struct BoostParams {
     pub eval_metric: Option<EvalMetric>,
 }
 
-/// One trained oblivious tree: the ordered splits and the per-leaf values
-/// (already scaled by `learning_rate`, matching upstream `model.json`).
+/// One trained oblivious tree: the ordered splits, the per-leaf values
+/// (already scaled by `learning_rate`, matching upstream `model.json`), and the
+/// per-leaf summed training-document weights (`leaf_weights`, RESEARCH Pitfall 1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObliviousTree {
     /// The ordered splits (feature + border) defining the symmetric structure.
     pub splits: Vec<Split>,
     /// Leaf values in canonical forward-bit-order, length `2^depth`.
     pub leaf_values: Vec<f64>,
+    /// Per-leaf summed training-document weights in the same forward-bit-order
+    /// as `leaf_values`, length `2^depth`. For unweighted training a leaf weight
+    /// equals its document count (RESEARCH A4). Required by SHAP /
+    /// PredictionValuesChange / Interaction (RESEARCH Pitfall 1).
+    pub leaf_weights: Vec<f64>,
 }
 
 /// A trained plain-boosted model: the boosting-order trees plus the starting
@@ -156,6 +162,16 @@ impl Model {
         self.oblivious_trees
             .iter()
             .flat_map(|t| t.leaf_values.iter().copied())
+            .collect()
+    }
+
+    /// Per-tree leaf weights flattened in tree order (RESEARCH Pitfall 1; for
+    /// `compare_stage(Stage::LeafValues, …)` against the upstream `leaf_weights`).
+    #[must_use]
+    pub fn leaf_weights(&self) -> Vec<f64> {
+        self.oblivious_trees
+            .iter()
+            .flat_map(|t| t.leaf_weights.iter().copied())
             .collect()
     }
 }
@@ -250,6 +266,28 @@ fn compute_leaf_deltas(
                 .collect()
         }
     }
+}
+
+/// Accumulate per-leaf summed training-document weights (RESEARCH Pitfall 1,
+/// `approx_calcer.cpp:154-160` = `leafWeights[leafIndex] += rowWeight`).
+///
+/// For each leaf, collect its member objects' weights (the FULL, un-sampled fold
+/// weights used for leaf estimation) in object order, then reduce ordered through
+/// the sanctioned `cb_core::sum_f64` primitive (D-08 — never a raw `iter().sum()`
+/// / `fold(0.0, …)`). The result is in the same forward-bit-order as
+/// `leaf_of` produces: `leaf_weights[leaf]` is `Σ weight` over members of `leaf`.
+/// For unweighted training (`weights` all `1.0`) a leaf weight equals its
+/// document count (RESEARCH A4).
+fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) -> Vec<f64> {
+    // Bucket each leaf's member weights in object order (checked `.get` only —
+    // `indexing_slicing` is deny).
+    let mut members: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+    for (i, &leaf) in leaf_of.iter().enumerate() {
+        if let (Some(bucket), Some(&w)) = (members.get_mut(leaf), weights.get(i)) {
+            bucket.push(w);
+        }
+    }
+    members.iter().map(|bucket| sum_f64(bucket)).collect()
 }
 
 /// A held-out evaluation set feeding the overfitting detector (TRAIN-06). The
@@ -633,6 +671,11 @@ pub fn train_with_eval_sets<R: Runtime>(
             .map(|&delta| learning_rate * delta)
             .collect();
 
+        // Per-leaf summed training-document weights (RESEARCH Pitfall 1). Uses
+        // the FULL un-sampled fold weights (same as leaf estimation), reduced
+        // ordered through cb_core::sum_f64 (D-08).
+        let leaf_weights = accumulate_leaf_weights(&grown.leaf_of, &weights, n_leaves);
+
         // 4. Update approx: approx[i] += leaf_value[leaf(i)].
         for (i, &leaf) in grown.leaf_of.iter().enumerate() {
             if let (Some(a), Some(&lv)) = (approx.get_mut(i), leaf_values.get(leaf)) {
@@ -682,6 +725,7 @@ pub fn train_with_eval_sets<R: Runtime>(
         trees.push(ObliviousTree {
             splits: grown.splits,
             leaf_values,
+            leaf_weights,
         });
 
         // Overfitting detection / use_best_model (TRAIN-06): once the tree is
