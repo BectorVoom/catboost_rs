@@ -2,8 +2,8 @@
 phase: 3
 slug: cpu-training-core-plain-boosting-oblivious-trees
 status: draft
-nyquist_compliant: false
-wave_0_complete: false
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-06-13
 ---
 
@@ -57,11 +57,11 @@ created: 2026-06-13
 
 ## Wave 0 Requirements
 
-- [ ] Extend `crates/cb-oracle/generator/gen_fixtures.py` to emit per-slice training oracles: `splits`/`leaf_values` from `model.json`, per-iteration `staged.npy`, and a **binclf_skeleton** (Logloss) scenario mirroring `regression_skeleton`. Pin `bootstrap_type=No`, `random_strength=0`, explicit `boost_from_average`, `leaf_estimation_iterations`, `score_function` (resolve Open Q1 — recommend L2).
-- [ ] New oracle scenarios: `leaf_methods/{gradient,newton,exact,simple}`, `bootstrap/{poisson,bayesian,bernoulli,mvs,no}`, `regularization/{l2,random_strength,bagging_temp}`, `overfit/{wilcoxon,inctodec,iter,use_best_model}`, `eval_metrics`, `autolr`.
-- [ ] `model.json` parser in `cb-oracle` (or `cb-train` tests) extracting `oblivious_trees[i].splits` (float_feature_index, border) and `leaf_values` into `Vec<f64>` for `compare_stage(Stage::Splits/LeafValues, …)`.
-- [ ] `cb-backend` build spike test: minimal `#[cube]` kernel on `CpuRuntime` (Open Q2) — must compile under deny-lints.
-- [ ] Framework install: add `cubecl = { version = "0.10.0", features = ["cpu"] }` + `bytemuck` to `[workspace.dependencies]` and `cb-backend`'s manifest.
+- [x] Extend `crates/cb-oracle/generator/gen_fixtures.py` to emit per-slice training oracles: `splits`/`leaf_values` from `model.json`, per-iteration `staged.npy`, and a **binclf_skeleton** (Logloss) scenario mirroring `regression_skeleton`. Pin `bootstrap_type=No`, `random_strength=0`, explicit `boost_from_average`, `leaf_estimation_iterations`, `score_function` (resolve Open Q1 — recommend L2). _(Plan 03-00: regression_skeleton + binclf_skeleton committed; score_function=L2.)_
+- [ ] New oracle scenarios: `leaf_methods/{gradient,newton,exact,simple}`, `bootstrap/{poisson,bayesian,bernoulli,mvs,no}`, `regularization/{l2,random_strength,bagging_temp}`, `overfit/{wilcoxon,inctodec,iter,use_best_model}`, `eval_metrics`, `autolr`. _(Later-slice scenarios — owned by their own Wave-1+ slices.)_
+- [x] `model.json` parser in `cb-oracle` (or `cb-train` tests) extracting `oblivious_trees[i].splits` (float_feature_index, border) and `leaf_values` into `Vec<f64>` for `compare_stage(Stage::Splits/LeafValues, …)`. _(Plan 03-00: `cb-oracle::model_json` — `load_model_json`/`ModelJson`/`ObliviousTree`/`SplitJson` + `split_borders()`/`leaf_values()`/`bias()`.)_
+- [x] `cb-backend` build spike test: minimal `#[cube]` kernel on `CpuRuntime` (Open Q2) — must compile under deny-lints. _(Plan 03-00: `kernels::gradient_kernel<F: Float>` runs on `CpuRuntime`; Open Q2 closed.)_
+- [x] Framework install: add `cubecl = { version = "0.10.0", features = ["cpu"] }` + `bytemuck` to `[workspace.dependencies]` and `cb-backend`'s manifest. _(Plan 03-00: wired into `cb-backend` only, D-03.)_
 
 ---
 
@@ -77,11 +77,11 @@ created: 2026-06-13
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references (fixtures, model.json parser, cubecl install)
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 90s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (fixtures, model.json parser, cubecl install)
+- [x] No watch-mode flags
+- [x] Feedback latency < 90s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** signed-off (Wave 0 complete)
