@@ -16,15 +16,19 @@
 )]
 
 mod error;
+mod normal;
 mod reduction;
 mod rng;
 
 pub use error::{CbError, CbResult};
+pub use normal::std_normal;
 pub use reduction::{sum_f32_in_f64, sum_f64};
 pub use rng::TFastRng64;
 
 #[cfg(test)]
 mod error_test;
+#[cfg(test)]
+mod normal_test;
 #[cfg(test)]
 mod reduction_test;
 #[cfg(test)]
