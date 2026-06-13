@@ -27,3 +27,9 @@ anyhow      = "1.0.102"
 # Phase-2 ingestion stack (RESEARCH Standard Stack; latest stable, 2026-06-13).
 arrow       = "59.0.0"
 polars      = { version = "0.54.4", default-features = false, features = ["dtype-full"] }
+# Phase-3 CubeCL CPU compute seam (D-01/D-03). Wired into `cb-backend` ONLY —
+# never into `cb-compute` (D-03 keeps the generic boundary cubecl-free). Versions
+# confirmed via `cargo search` (cubecl 0.10.0; bytemuck 1.x floor) and the CubeCL
+# manual (`features=["cpu"]`, `bytemuck` for host<->device transfer).
+cubecl      = { version = "0.10.0", features = ["cpu"] }
+bytemuck    = { version = "1", features = ["extern_crate_std"] }

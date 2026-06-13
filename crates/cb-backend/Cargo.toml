@@ -8,10 +8,14 @@ description = "Sole feature-gated runtime-alias owner for catboost-rs (CubeCL ru
 workspace = true
 
 [dependencies]
-# D-02: cb-backend is the SINGLE feature-gated runtime-alias owner. The concrete
-# CubeCL runtime is wired in Phase 7; in Phase 1 every backend arm is an inert
-# placeholder. NO per-backend crates; NO cubecl dependency yet.
-# NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
+# D-02: cb-backend is the SINGLE feature-gated runtime-alias owner. As of Phase 3
+# (D-01) the `cpu` arm stands up the real CubeCL CPU runtime here — `cubecl` and
+# `bytemuck` live in THIS crate ONLY (D-03 keeps `cb-compute` cubecl-free). The
+# `wgpu`/`cuda`/`rocm` arms remain inert placeholders until Phase 7.
+# NO per-backend crates. NOTE: `anyhow` is intentionally absent (D-14 structural
+# ban). Do not add it.
+cubecl.workspace = true
+bytemuck.workspace = true
 
 [features]
 # Compile-time backend selection only — NO runtime dispatch (D-02). All arms are
