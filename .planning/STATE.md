@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 04-03-PLAN.md
-last_updated: "2026-06-13T20:40:52.000Z"
+status: completed
+stopped_at: Completed 04-03-PLAN.md (.cbm + model.json serialization)
+last_updated: "2026-06-13T20:56:49.679Z"
 last_activity: 2026-06-13 -- Plan 04-03 complete (.cbm + model.json serialization, oracle-locked)
 progress:
   total_phases: 8
   completed_phases: 3
   total_plans: 22
   completed_plans: 21
-  percent: 43
+  percent: 38
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 04 (model-serialization-shap-rust-api-first-full-oracle-lock) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: 04-03 complete (.cbm + model.json serialization); Wave 4 (04-04 SHAP/fstr) next
 Last activity: 2026-06-13 -- Plan 04-03 complete (.cbm + model.json serialization, oracle-locked)
 
@@ -73,6 +73,7 @@ Progress: [██████░░░░] 60% (3 of 5 phase-04 plans complete)
 | Phase 04 P01 | ~40min | 3 tasks | 10 files |
 | Phase 04 P02 | ~50min | 2 tasks | 15 files |
 | Phase 04 P03 | ~8min | 2 tasks | 7 files |
+| Phase 04 P04 | ~10min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -131,6 +132,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Plan 04-02 ENV — cargo test -p cb-compute loss and cargo test --workspace blocked by disk (<1GB free; polars-core test-profile rlib ~1.3GB). CrossEntropy/Focal der1/der2 fully exercised+passing via cb-train/tests/loss_oracle_test.rs instead; logged in deferred-items.md.
 - [Phase 04]: Plan 04-03 COMPLETE — native .cbm (CBM1 magic + ui32 LE size + FlatBuffers TModelCore; global bin-feature split encoding per CalcBinFeatures order; flat LeafValues/LeafWeights with per-tree offsets, Pitfall 2) save/load + model.json export/import (per-tree NESTED leaf_weights Pitfall 2; scale_and_bias=[1,[bias]] Pitfall 6) for cb-model::Model. Oracle-locked: .cbm semantic round-trip + upstream 1.2.10 binclf/regression .cbm load <=1e-5; model.json round-trips through cb-oracle parser (D-04) + upstream binclf/regression model.json load <=1e-5 (MODEL-01, MODEL-06). cb-model::error::ModelError typed/panic-free (Security V5: bad magic/oversized/truncated/short header/wrong FormatVersion/garbage JSON/malformed scale_and_bias all return typed Err). VERIFYING root_as_tmodel_core only; size bounded before slicing; no unwrap/raw-index.
 - [Phase 04]: Plan 04-03 (Rule 1 fix) — bias read prefers MultiBias[0] over scalar Bias: upstream catboost 1.2.10 stores the 1-dim bias (e.g. regression boost_from_average start) in the MultiBias VECTOR, leaving scalar Bias=0.0. Reading only scalar Bias made the regression load under-predict by exactly the bias (0.315); binclf (bias 0) masked it. save_cbm still writes scalar Bias (Open Q3) so ours->ours round-trip is unaffected. Borders are f32 on the .cbm wire (schema type) so the assert_eq round-trip uses f32-exact borders; LeafValues/LeafWeights are f64 (exact). Upstream-load cases run IN-ENV (real fixtures), not #[ignore].
+- [Phase ?]: Plan 04-04: regular TreeSHAP transcribed verbatim; local-accuracy invariant holds; SHAP matrix oracle-locked <=1e-5 (MODEL-04, D-11).
+- [Phase ?]: Plan 04-04: PredictionValuesChange (Σ=100) + Interaction oracle-locked <=1e-5; loss-change importance deferred (MODEL-03 partial, D-12).
 
 ### Pending Todos
 
@@ -157,6 +160,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T20:40:52.000Z
+Last session: 2026-06-13T20:56:27.360Z
 Stopped at: Completed 04-03-PLAN.md (.cbm + model.json serialization)
 Resume file: None

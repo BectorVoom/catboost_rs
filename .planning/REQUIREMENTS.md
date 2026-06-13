@@ -71,8 +71,8 @@
 
 - [x] **MODEL-01**: Native `.cbm` (FlatBuffers) serialization — save/load, cross-version compatible, load upstream-produced `.cbm` files (Plan 04-03: `cb-model::cbm::{save_cbm, load_cbm}` — CBM1 magic + ui32 LE size + FlatBuffers TModelCore; semantic round-trip + upstream catboost 1.2.10 binclf/regression `.cbm` load applies ≤1e-5; malformed input → typed ModelError, never panics. Built on the 04-01 committed flatc bindings + canonical cb-model::Model)
 - [x] **MODEL-02**: CPU inference/apply path (independent of the GPU toolchain) (Plan 04-02: pure-Rust `cb-model::predict_raw` — strict-> binarize, forward-bit leaf index, bias + `sum_f64` over leaf values; imports no backend/cubecl symbol; oracle-locked ≤1e-5 vs upstream)
-- [ ] **MODEL-03**: Feature importance — PredictionValuesChange, LossFunctionChange, Interaction
-- [ ] **MODEL-04**: SHAP values (Regular `EShapCalcType`)
+- [~] **MODEL-03**: Feature importance — PredictionValuesChange, LossFunctionChange, Interaction (Plan 04-04: `cb-model::prediction_values_change` (CalcEffect, Σ=100) + `cb-model::interaction` (CalcMostInteractingFeatures + CalcFeatureInteraction) oracle-locked ≤1e-5 vs upstream `feature_importance/*.npy`. PARTIAL — LossFunctionChange deferred per D-12, out of scope this phase)
+- [x] **MODEL-04**: SHAP values (Regular `EShapCalcType`) (Plan 04-04: `cb-model::shap_values` — regular TreeSHAP per-object [n_features+1] matrix (trailing column = Σ_trees meanValue + bias) transcribed verbatim from `shap_values.cpp` + `shap_prepared_trees.cpp`; oracle-locked ≤1e-5 vs upstream `feature_importance/shap_values.npy` AND the local-accuracy invariant Σshap == predict_raw holds for every object, D-11)
 - [ ] **MODEL-05**: SHAP interaction values + advanced fstr — ShapInteractionValues, PredictionDiff, SAGE
 - [x] **MODEL-06**: JSON model export (interop minimum) (Plan 04-03: `cb-model::json::{save_json, load_json}` on the upstream model.json schema — per-tree NESTED leaf_weights, scale_and_bias=[1,[bias]]; save_json round-trips through the cb-oracle model_json parser (D-04) and upstream binclf/regression model.json load applies ≤1e-5; malformed JSON → typed ModelError)
 
@@ -153,8 +153,8 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-08 | Phase 3 | Complete |
 | MODEL-01 | Phase 4 | Complete (04-03: .cbm save/load, semantic round-trip + upstream 1.2.10 load ≤1e-5, malformed-input typed errors) |
 | MODEL-02 | Phase 4 | Complete (04-02: pure-Rust apply path, oracle-locked ≤1e-5) |
-| MODEL-03 | Phase 4 | Pending |
-| MODEL-04 | Phase 4 | Pending |
+| MODEL-03 | Phase 4 | Partial (04-04: PredictionValuesChange + Interaction oracle-locked ≤1e-5; LossFunctionChange deferred per D-12) |
+| MODEL-04 | Phase 4 | Complete (04-04: regular TreeSHAP matrix + local-accuracy invariant, oracle-locked ≤1e-5, D-11) |
 | MODEL-06 | Phase 4 | Complete (04-03: model.json export/import, round-trips through cb-oracle parser + upstream load ≤1e-5) |
 | LOSS-01 | Phase 4 | Complete (04-02: CrossEntropy + Focal der1/der2 oracle-locked; binclf trains under all three losses) |
 | LOSS-06 | Phase 4 | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types deferred to Phase 6 per D-10) |
