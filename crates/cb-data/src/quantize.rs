@@ -86,7 +86,10 @@ impl Pool {
 
             // (2) Borders via the GreedyLogSum binarizer; the Min sentinel is
             // prepended here so the result matches the standalone-quantizer
-            // oracle verbatim (borders_quant fixtures, A1/A3).
+            // oracle verbatim (borders_quant fixtures, A1/A3). The Max sentinel
+            // is appended afterwards (it is a tail value, so it cannot affect
+            // real-border selection — mirroring upstream's post-selection
+            // `numeric_limits<float>::max()` append, quantization.cpp).
             let prepend_min_sentinel = feature_mode.prepends_min_sentinel();
             let borders_f64 = crate::select_borders_greedy_logsum(
                 column,
@@ -95,7 +98,18 @@ impl Pool {
             );
             // Narrow the (already f32-valued, f64-stored) borders back to f32 for
             // the f32 bin comparison.
-            let borders_f32: Vec<f32> = borders_f64.iter().map(|&b| b as f32).collect();
+            let borders_f32_real: Vec<f32> = borders_f64.iter().map(|&b| b as f32).collect();
+
+            // Append the `f32::MAX` sentinel for a `Max` feature so NaN gets a
+            // dedicated top bin (`borders_f32.len()`) that no finite value can
+            // reach via `bin_of` (CR-01). For `Min`/`Forbidden` this is a no-op
+            // and `borders_f32_real` is stored unchanged (keeping the Min oracle
+            // byte-identical).
+            let borders_f32: Vec<f32> = if feature_mode.appends_max_sentinel() {
+                crate::nan_mode::insert_sentinel(feature_mode, &borders_f32_real)
+            } else {
+                borders_f32_real
+            };
 
             // (3) Assign each value to a bin (strict `>`); NaN -> nan_bin.
             let mut bins: Vec<u32> = Vec::with_capacity(column.len());

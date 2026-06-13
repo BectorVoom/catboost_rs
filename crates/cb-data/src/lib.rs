@@ -57,6 +57,8 @@ mod nan_mode_test;
 #[cfg(test)]
 mod pool_test;
 #[cfg(test)]
+mod quantize_test;
+#[cfg(test)]
 mod quantized_pool_test;
 #[cfg(test)]
 mod weights_test;
