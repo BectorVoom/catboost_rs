@@ -51,8 +51,11 @@ while IFS= read -r file; do
         }
         if ($0 ~ /#\[cfg\(test\)\]/) { pending = 1; next }
         if (pending) {
-          # skip blank lines / attribute lines between cfg(test) and mod
+          # skip blank lines / attribute lines between cfg(test) and mod, so an
+          # intervening attribute (e.g. #[path = "..."]) cannot mask an inline
+          # `mod tests {` body and defeat the gate.
           if ($0 ~ /^[[:space:]]*$/) next
+          if ($0 ~ /^[[:space:]]*#\[/) next
           check_modline($0, NR)
           pending = 0
         }

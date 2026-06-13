@@ -38,7 +38,10 @@ pub fn assert_abs_close(expected: &[f64], actual: &[f64], tol: f64) -> Result<()
     }
     for (index, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
         let diff = (e - a).abs();
-        if diff > tol {
+        // `!(diff <= tol)` rather than `diff > tol`: a non-finite `diff` — NaN
+        // from a NaN/Inf `actual`, or Inf−Inf — must count as divergence, not
+        // silently pass the gate (`NaN > tol` is always false, `NaN <= tol` too).
+        if !(diff <= tol) {
             return Err(OracleError::Diverged {
                 index,
                 expected: *e,
