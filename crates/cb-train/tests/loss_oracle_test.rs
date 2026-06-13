@@ -100,6 +100,7 @@ fn base_params(loss: Loss) -> BoostParams {
         use_best_model: false,
         eval_metric: None,
         auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
     }
 }
 

@@ -94,6 +94,7 @@ fn train_eval_metrics(
         use_best_model: false,
         eval_metric: Some(eval_metric),
         auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
     };
 
     let sets = [
@@ -183,6 +184,7 @@ fn eval_metric_defaults_to_objective_curve() {
         use_best_model: false,
         eval_metric: None, // default => RMSE (the objective)
         auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
     };
     let sets = [
         EvalSet {

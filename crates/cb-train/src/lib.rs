@@ -16,6 +16,7 @@
 mod autolr;
 mod bootstrap;
 mod boosting;
+mod candidates;
 mod metrics;
 mod overfit;
 mod tree;
@@ -24,6 +25,9 @@ pub use autolr::{coefficients as autolr_coefficients, guess as autolr_guess, Tar
 pub use bootstrap::{
     bootstrap, last_iter_mean_leaf_value, BootstrapResult, EBootstrapType, BAYESIAN_BLOCK_SIZE,
     MVS_BLOCK_SIZE,
+};
+pub use candidates::{
+    learn_set_cardinality, one_hot_max_size_default, route_categorical, route_column, EncodingPath,
 };
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};

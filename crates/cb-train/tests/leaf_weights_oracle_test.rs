@@ -79,6 +79,7 @@ fn train_regression_skeleton() -> (Model, usize) {
         use_best_model: false,
         eval_metric: None,
         auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
     };
 
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None)

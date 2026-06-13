@@ -188,6 +188,7 @@ fn train_overfit(cfg: &OverfitConfig) -> (cb_train::Model, Vec<f64>) {
         use_best_model: cfg.use_best_model,
         eval_metric: None,
         auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
     };
 
     let eval = EvalSet {

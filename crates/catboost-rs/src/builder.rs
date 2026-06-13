@@ -18,7 +18,9 @@
 use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
-use cb_train::{train, BoostParams, EBootstrapType, EOverfittingDetectorType};
+use cb_train::{
+    one_hot_max_size_default, train, BoostParams, EBootstrapType, EOverfittingDetectorType,
+};
 
 use crate::error::CatBoostError;
 use crate::model::Model;
@@ -215,6 +217,10 @@ impl CatBoostBuilder {
             od_wait: 0,
             use_best_model: false,
             eval_metric: None,
+            // Pinned to the upstream default (cat_feature_options.cpp:231-232);
+            // the facade does not yet surface categorical config, and the
+            // numeric-only train path never exercises the one-hot branch.
+            one_hot_max_size: one_hot_max_size_default(),
         }
     }
 

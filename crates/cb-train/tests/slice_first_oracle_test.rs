@@ -90,6 +90,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         use_best_model: false,
         eval_metric: None,
         auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
     };
 
     let mut staged = Vec::new();

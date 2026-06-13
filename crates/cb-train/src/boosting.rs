@@ -116,6 +116,16 @@ pub struct BoostParams {
     /// `None` defaults to the objective ([`EvalMetric::for_loss`]); `Some`
     /// overrides it. Only consumed when an eval set is supplied.
     pub eval_metric: Option<EvalMetric>,
+    /// One-hot encoding threshold (`one_hot_max_size`,
+    /// `cat_feature_options.cpp:231-232`, default 2 — pinned EXPLICITLY here,
+    /// never auto-selected, RESEARCH Pitfall 6). A categorical column routes to
+    /// the one-hot path when `1 < learn-set-cardinality <= one_hot_max_size`
+    /// (inclusive boundary) and to the CTR path (deferred to later waves) when
+    /// `cardinality > one_hot_max_size`. See [`crate::route_categorical`] /
+    /// [`crate::EncodingPath`] (ORD-04 / D-04). Consumed by the categorical
+    /// encoding-path selection; the numeric-only first slices leave it at the
+    /// pinned default and never exercise the one-hot branch.
+    pub one_hot_max_size: u32,
 }
 
 /// One trained oblivious tree: the ordered splits, the per-leaf values

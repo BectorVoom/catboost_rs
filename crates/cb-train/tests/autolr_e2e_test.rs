@@ -85,6 +85,7 @@ fn run_autolr_e2e(
         // loss is auto-LR eligible; set to a sentinel to prove it is unused.
         learning_rate: f64::NAN,
         auto_learning_rate: true,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
         l2_leaf_reg: 3.0,
         random_strength: 0.0,
         boost_from_average,
