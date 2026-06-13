@@ -9,6 +9,7 @@
 use cb_core::CbError;
 
 use crate::ingest::{IngestSource, OwnedColumns};
+use crate::Pair;
 
 /// All column kinds at matching lengths materialize a `Pool` with the right
 /// shape.
@@ -64,6 +65,50 @@ fn empty_source_builds_zero_row_pool() {
 
     assert_eq!(pool.n_rows(), 0);
     assert_eq!(pool.n_float_features(), 0);
+}
+
+/// WR-02: ranking pairs whose ids are all within `n_rows` build a `Pool`.
+#[test]
+fn pairs_within_n_rows_build_pool() {
+    let pool = OwnedColumns::new(vec![vec![1.0, 2.0, 3.0]], vec![0.0, 1.0, 0.0])
+        .with_pairs(vec![
+            Pair { winner_id: 0, loser_id: 2 },
+            Pair { winner_id: 1, loser_id: 0 },
+        ])
+        .into_pool()
+        .expect("in-range pairs must build");
+
+    assert_eq!(pool.n_rows(), 3);
+}
+
+/// WR-02: a pair referencing a non-existent row (`id >= n_rows`) is a typed
+/// `OutOfRange` error, not a latent out-of-bounds.
+#[test]
+fn pair_winner_id_out_of_range_is_rejected() {
+    let result = OwnedColumns::new(vec![vec![1.0, 2.0, 3.0]], vec![0.0, 1.0, 0.0])
+        .with_pairs(vec![Pair { winner_id: 5, loser_id: 1 }])
+        .into_pool();
+
+    match result {
+        Err(CbError::OutOfRange(msg)) => {
+            assert!(msg.contains("winner_id"), "msg: {msg}");
+            assert!(msg.contains('5'), "msg: {msg}");
+        }
+        other => panic!("expected OutOfRange for OOB winner_id, got {other:?}"),
+    }
+}
+
+/// WR-02: the `loser_id` is bounds-checked symmetrically with `winner_id`.
+#[test]
+fn pair_loser_id_out_of_range_is_rejected() {
+    let result = OwnedColumns::new(vec![vec![1.0, 2.0]], vec![0.0, 1.0])
+        .with_pairs(vec![Pair { winner_id: 0, loser_id: 2 }])
+        .into_pool();
+
+    match result {
+        Err(CbError::OutOfRange(msg)) => assert!(msg.contains("loser_id"), "msg: {msg}"),
+        other => panic!("expected OutOfRange for OOB loser_id, got {other:?}"),
+    }
 }
 
 /// `n_rows` is taken from the float features when present, and the label is

@@ -30,8 +30,10 @@ pub struct Pair {
 ///
 /// Construct through the ingestion seam — see
 /// [`crate::ingest::OwnedColumns::into_pool`] — which validates that every
-/// supplied column has the same length before a `Pool` exists. A `Pool`
-/// obtained that way is guaranteed internally length-consistent.
+/// supplied column has the same length, and that every ranking [`Pair`]'s
+/// `winner_id`/`loser_id` is a valid object index (`< n_rows`), before a `Pool`
+/// exists. A `Pool` obtained that way is guaranteed internally length-consistent
+/// and pair-index-consistent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pool {
     /// Number of objects (rows).

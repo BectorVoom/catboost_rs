@@ -126,6 +126,19 @@ fn check_len(name: &str, expected: usize, actual: usize) -> CbResult<()> {
     }
 }
 
+/// Returns an `OutOfRange` error if a ranking pair's row id is not a valid
+/// object index (`id >= n_rows`), naming the offending pair and field. An
+/// `n_rows == 0` dataset rejects any pair (no valid object id exists).
+fn check_pair_id(field: &str, pair_index: usize, id: u32, n_rows: usize) -> CbResult<()> {
+    if (id as usize) < n_rows {
+        Ok(())
+    } else {
+        Err(CbError::OutOfRange(format!(
+            "pair[{pair_index}].{field} = {id} is out of range for n_rows {n_rows}"
+        )))
+    }
+}
+
 impl IngestSource for OwnedColumns {
     fn into_pool(self) -> CbResult<Pool> {
         let n_rows = self.reference_n_rows();
@@ -159,6 +172,15 @@ impl IngestSource for OwnedColumns {
         }
         if !self.baseline.is_empty() {
             check_len("baseline", n_rows, self.baseline.len())?;
+        }
+
+        // Ranking pairs reference object (row) indices; an id beyond `n_rows`
+        // is a latent out-of-bounds for any downstream code that indexes
+        // objects by pair id (threats T-02-04 / T-02-05). Validate every pair so
+        // the `Pool` length-consistency guarantee actually holds for pairs (WR-02).
+        for (index, pair) in self.pairs.iter().enumerate() {
+            check_pair_id("winner_id", index, pair.winner_id, n_rows)?;
+            check_pair_id("loser_id", index, pair.loser_id, n_rows)?;
         }
 
         Ok(Pool::from_validated_columns(
