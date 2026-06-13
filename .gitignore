@@ -1,0 +1,7 @@
+# Rust build artifacts
+/target
+
+# Build-time oracle generator virtualenv (Plan 03). NOT the fixtures, which are
+# committed frozen (D-11/D-12) — `crates/cb-oracle/fixtures/` is intentionally
+# tracked and must never be ignored.
+crates/cb-oracle/generator/.venv/

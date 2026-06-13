@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Centralized clippy restriction-lint policy (D-13). Each library crate opts in
+# with `[lints] workspace = true`. These four restriction lints are denied
+# workspace-wide; test code is exempted in-code via
+# `#![cfg_attr(test, allow(...))]` (manifest-level per-crate overrides are
+# forbidden when `lints.workspace = true`, so the exemption must live in code).
+[workspace.lints.clippy]
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+indexing_slicing = "deny"
+
+# Pinned latest stable versions (confirmed via `cargo search`, 2026-06-13).
+# `approx` is pinned to the latest STABLE 0.5 line (0.6.0-rc2 is a pre-release
+# and not appropriate to pin); it is a test-only dev-dependency.
+[workspace.dependencies]
+thiserror   = "2.0.18"
+ndarray     = "0.17.2"
+ndarray-npy = "0.10.0"
+serde       = { version = "1.0.228", features = ["derive"] }
+serde_json  = "1.0.150"
+approx      = "0.5"
+anyhow      = "1.0.102"
