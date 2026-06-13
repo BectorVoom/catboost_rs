@@ -1,0 +1,49 @@
+{
+  "A4_resolution": "Integer cat features stringify as PLAIN integers before hashing: '3' -> ui32=2658984922 differs from '3.0' -> ui32=1187060909. Rust must hash the integer string form ('3'), never the float form ('3.0').",
+  "A5_resolution": "(string -> ui32) vectors are EXTRACTED from upstream catboost 1.2.10 (model.json ctr_data hash_map), not from a third-party cityhash crate. Rust's port of util/digest/city.cpp must reproduce string_to_ui32 bit-exactly.",
+  "c0_first_seen_order": [
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon"
+  ],
+  "c1_first_seen_order": [
+    "3",
+    "7",
+    "-2",
+    "10"
+  ],
+  "cat_hashes_layout": "flat f64-encoded ui32: column c0 per-object hashes (n_rows), then column c1 per-object hashes (n_rows).",
+  "catboost_version": "1.2.10",
+  "hash_definition": "CalcCatFeatureHash(s) = CityHash64(s) & 0xffffffff",
+  "input_dataset": "explicit_categorical",
+  "perfect_hash_bins_layout": "flat f64-encoded bin index: column c0 bins (n_rows), then c1 bins (n_rows); bin = first-seen order within each column.",
+  "scenario": "cat_hash",
+  "seed": 0,
+  "string_to_ui32": {
+    "-2": 1031063797,
+    "10": 1248546038,
+    "3": 2658984922,
+    "3.0": 1187060909,
+    "7": 2282918139,
+    "alpha": 3214079027,
+    "beta": 1348281933,
+    "delta": 1934101689,
+    "epsilon": 686881752,
+    "gamma": 2843793638
+  },
+  "string_to_ui64_precursor": {
+    "-2": "2801878477000984821",
+    "10": "6514551042282835190",
+    "3": "3644720124901778394",
+    "3.0": "1699882558692596909",
+    "7": "11294937213853405435",
+    "alpha": "7657953995089179699",
+    "beta": "7262361550774412877",
+    "delta": "3805318885633690809",
+    "epsilon": "2703189787576171480",
+    "gamma": "6946772444896090342"
+  },
+  "thread_count": 1
+}

@@ -1,0 +1,38 @@
+{
+  "c0_first_seen_order": [
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon"
+  ],
+  "c1_first_seen_order": [
+    "3",
+    "7",
+    "-2",
+    "10"
+  ],
+  "cat_feature_columns": [
+    "c0",
+    "c1"
+  ],
+  "cat_features_are_strings": true,
+  "column_kinds": {
+    "c0": "categorical",
+    "c1": "categorical",
+    "num": "numeric"
+  },
+  "dataset": "explicit_categorical",
+  "dtype_categorical": "string",
+  "dtype_numeric": "float64",
+  "has_group_id": false,
+  "n_categorical": 2,
+  "n_numeric": 1,
+  "n_rows": 30,
+  "note": "Categorical columns are EXPLICIT strings (resolves A4). c1 uses integer-valued strings ('3','10','-2','7') stringified as plain integers (no '.0'), matching CatBoost CalcCatFeatureHash on the string form. First-seen orders are recorded for perfect-hash (first-seen -> bin) validation.",
+  "numeric_columns": [
+    "num"
+  ],
+  "seed": 20260617,
+  "target": "binary"
+}

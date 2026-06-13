@@ -1,0 +1,38 @@
+{
+  "A1_A3_resolution": "EMPIRICAL (catboost 1.2.10): get_borders() DOES surface the NanMode f32::MIN sentinel for a NaN feature under nan_mode=Min, as borders[0] = -3.4028234663852886e+38 (== numeric_limits<float>::lowest). This scenario uses default params (border_count=254, nan_mode=Min) and records scenarios.numeric_nan.nan_sentinel_present_in_get_borders=true; the NaN-free numeric_tiny set records =false. CAVEAT (config-dependent, verified): sentinel inclusion tracks the realized border budget, not nan_mode alone -- at a small border budget (e.g. depth=4 / few borders) the same NaN(Min) feature can OMIT the sentinel (4-5 borders, borders[0] != f32::MIN), and nan_mode=Max never prepends f32::MIN. The Rust border oracle MUST therefore compare against the per-fixture borders verbatim (sentinel present iff the fixture has it at index 0) rather than assuming a fixed rule. This fixture pins the default-param baseline (sentinel PRESENT).",
+  "A2_resolution": "Default border_count in catboost 1.2.10 is recorded per scenario (observed: 254), border_selection_type=GreedyLogSum, nan_mode=Min.",
+  "borders_layout": "<dataset>.borders.npy = flat f64 (feature 0 borders, then feature 1, ...); <dataset>.borders_per_feature.npy = per-feature counts.",
+  "catboost_version": "1.2.10",
+  "scenario": "borders_quant",
+  "scenarios": {
+    "numeric_nan": {
+      "border_count": 254,
+      "border_selection_type": "GreedyLogSum",
+      "borders_feature_indices": [
+        0,
+        1,
+        2
+      ],
+      "input_dataset": "numeric_nan",
+      "n_borders_total": 52,
+      "nan_mode": "Min",
+      "nan_sentinel_present_in_get_borders": true
+    },
+    "numeric_tiny": {
+      "border_count": 254,
+      "border_selection_type": "GreedyLogSum",
+      "borders_feature_indices": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "input_dataset": "numeric_tiny",
+      "n_borders_total": 44,
+      "nan_mode": "Min",
+      "nan_sentinel_present_in_get_borders": false
+    }
+  },
+  "seed": 0,
+  "thread_count": 1
+}

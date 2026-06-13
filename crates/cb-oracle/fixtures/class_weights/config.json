@@ -1,0 +1,28 @@
+{
+  "catboost_version": "1.2.10",
+  "class_counts": [
+    30.0,
+    10.0
+  ],
+  "computed": {
+    "Balanced": [
+      1.0,
+      3.0
+    ],
+    "SqrtBalanced": [
+      1.0,
+      1.7320507764816284
+    ]
+  },
+  "formulas": {
+    "Balanced": "max(counts) / counts[c]",
+    "SqrtBalanced": "sqrt(max(counts) / counts[c])",
+    "accumulation": "double (f64) summary sums",
+    "floor": 1e-08
+  },
+  "n_classes": 2,
+  "scenario": "class_weights",
+  "seed": 0,
+  "source": "CatBoostClassifier.get_all_params()['class_weights'] (upstream-computed)",
+  "thread_count": 1
+}

@@ -8,5 +8,7 @@ crates/cb-oracle/generator/.venv/
 
 # CatBoost training-log output emitted by the generator (NOT a fixture). The
 # gen_fixtures.py training run writes a catboost_info/ dir of TSV/event logs we
-# never consume — keep it out of git.
+# never consume — keep it out of git. The generator may emit this dir relative
+# to either its own cwd or the cb-oracle crate root, so ignore both.
 crates/cb-oracle/generator/catboost_info/
+crates/cb-oracle/catboost_info/
