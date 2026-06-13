@@ -64,24 +64,72 @@ def _assert_f64(arr: np.ndarray, name: str) -> np.ndarray:
     return arr
 
 
-def _extract_borders(model) -> tuple[np.ndarray, np.ndarray, list[int], bool]:
-    """Flatten get_borders() into (flat_borders, per_feature_counts, indices,
-    sentinel_present). Layout matches regression_skeleton: feature 0 borders,
-    then feature 1, ... ascending. sentinel_present records whether any returned
-    border equals the f32 MIN/MAX NanMode sentinel (A3)."""
-    borders_dict = model.get_borders()
+def _quantization_borders(x, y, nan_mode: str) -> dict[int, list[float]]:
+    """Raw GreedyLogSum quantization borders via the STANDALONE binarizer
+    (`Pool.quantize(...).save_quantization_borders(...)`), NOT a trained model's
+    `get_borders()`.
+
+    This is the parity target the Rust `borders.rs` reproduces: the full
+    GreedyLogSum border set at the given `border_count`, including the NanMode
+    sentinel for NaN features under `nan_mode=Min`. A trained model's
+    `get_borders()` instead returns a *pruned* subset (only borders used by some
+    tree split), which is training-dependent and NOT reproducible by a
+    standalone binarizer — using it as the oracle target was the Wave-0 bug this
+    function fixes (Rule 1)."""
+    import tempfile
+
+    pool = Pool(x, y)
+    pool.quantize(
+        border_count=254,
+        feature_border_type="GreedyLogSum",
+        nan_mode=nan_mode,
+    )
+    path = tempfile.mktemp(suffix=".borders.tsv")
+    pool.save_quantization_borders(path)
+    borders: dict[int, list[float]] = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            # Lines are "<feature>\t<border>" for plain features and
+            # "<feature>\t<border>\t<nan_mode>" for NaN features; take the first
+            # two columns and ignore any trailing nan-mode annotation.
+            parts = line.split("\t")
+            fi_str, val_str = parts[0], parts[1]
+            borders.setdefault(int(fi_str), []).append(float(val_str))
+    return borders
+
+
+def _extract_borders(borders_dict) -> tuple[np.ndarray, np.ndarray, list[int], bool]:
+    """Flatten a {feature_index: [borders]} dict into (flat_borders,
+    per_feature_counts, indices, sentinel_present). Layout matches
+    regression_skeleton: feature 0 borders, then feature 1, ... ascending.
+    sentinel_present records whether any returned border equals the f32 MIN/MAX
+    NanMode sentinel (A3)."""
     indices = sorted(borders_dict.keys())
     flat: list[float] = []
     counts: list[float] = []
     sentinel = False
     for fi in indices:
-        fb = list(borders_dict[fi])
-        for b in fb:
-            bf = float(b)
-            if bf <= F32_MIN * 0.99 or bf >= F32_MAX * 0.99:
+        fb = sorted(float(b) for b in borders_dict[fi])
+        # save_quantization_borders() serializes the f32 sentinel as truncated
+        # text (~10 sig figs), which loses precision vs the exact
+        # numeric_limits<float>::lowest the Rust port emits (f32::MIN widened to
+        # f64). Snap any sentinel-magnitude border to the EXACT F32_MIN / F32_MAX
+        # so the committed f64 oracle equals f64::from(f32::MIN) bit-for-bit.
+        snapped: list[float] = []
+        for bf in fb:
+            if bf <= F32_MIN * 0.99:
                 sentinel = True
-        flat.extend(float(b) for b in fb)
-        counts.append(float(len(fb)))
+                snapped.append(F32_MIN)
+            elif bf >= F32_MAX * 0.99:
+                sentinel = True
+                snapped.append(F32_MAX)
+            else:
+                snapped.append(bf)
+        flat.extend(snapped)
+        counts.append(float(len(snapped)))
     return (
         _assert_f64(np.asarray(flat, dtype=np.float64), "borders"),
         _assert_f64(np.asarray(counts, dtype=np.float64), "borders_per_feature"),
@@ -97,28 +145,30 @@ def gen_borders_quant() -> None:
     whether get_borders() surfaces the NaN sentinel."""
     BORDERS_QUANT.mkdir(parents=True, exist_ok=True)
     scenarios = {}
+    # nan_mode=Min is the catboost 1.2.10 default (A2). numeric_tiny is NaN-free
+    # so the sentinel never appears; numeric_nan has a NaN feature so the
+    # f32::MIN sentinel is prepended to that feature's borders under Min.
+    nan_mode = "Min"
+    border_count = 254
     for name in ("numeric_tiny", "numeric_nan"):
         x = np.load(INPUTS / name / "X.npy")
         y = np.load(INPUTS / name / "y.npy")
-        # Defaults EXCEPT thread_count=1 / pinned seed so we read upstream's
-        # default border_count (A2) and nan_mode back from the trained model.
-        model = CatBoostRegressor(
-            iterations=10, random_seed=SEED, thread_count=1, verbose=False
-        )
-        model.fit(x, y)
-        flat, counts, indices, sentinel = _extract_borders(model)
+        # RAW standalone GreedyLogSum quantization borders (the Rust parity
+        # target), NOT a trained model's pruned get_borders() (Rule 1 fix).
+        borders_dict = _quantization_borders(x, y, nan_mode)
+        flat, counts, indices, sentinel = _extract_borders(borders_dict)
         np.save(BORDERS_QUANT / f"{name}.borders.npy", flat, allow_pickle=False)
         np.save(
             BORDERS_QUANT / f"{name}.borders_per_feature.npy", counts, allow_pickle=False
         )
-        ap = model.get_all_params()
         scenarios[name] = {
             "input_dataset": name,
-            "border_count": ap.get("border_count"),
-            "nan_mode": ap.get("nan_mode"),
-            "border_selection_type": ap.get("feature_border_type"),
+            "border_count": border_count,
+            "nan_mode": nan_mode,
+            "border_selection_type": "GreedyLogSum",
             "borders_feature_indices": indices,
             "nan_sentinel_present_in_get_borders": sentinel,
+            "borders_source": "standalone Pool.quantize().save_quantization_borders()",
             "n_borders_total": int(flat.shape[0]),
         }
     config = {
@@ -132,25 +182,24 @@ def gen_borders_quant() -> None:
             "1, ...); <dataset>.borders_per_feature.npy = per-feature counts."
         ),
         "A1_A3_resolution": (
-            "EMPIRICAL (catboost 1.2.10): get_borders() DOES surface the NanMode "
-            "f32::MIN sentinel for a NaN feature under nan_mode=Min, as "
-            "borders[0] = -3.4028234663852886e+38 "
-            "(== numeric_limits<float>::lowest). This scenario uses default "
-            "params (border_count=254, nan_mode=Min) and records "
-            "scenarios.numeric_nan.nan_sentinel_present_in_get_borders=true; the "
-            "NaN-free numeric_tiny set records =false. CAVEAT (config-dependent, "
-            "verified): sentinel inclusion tracks the realized border budget, "
-            "not nan_mode alone -- at a small border budget (e.g. depth=4 / few "
-            "borders) the same NaN(Min) feature can OMIT the sentinel (4-5 "
-            "borders, borders[0] != f32::MIN), and nan_mode=Max never prepends "
-            "f32::MIN. The Rust border oracle MUST therefore compare against the "
-            "per-fixture borders verbatim (sentinel present iff the fixture has "
-            "it at index 0) rather than assuming a fixed rule. This fixture pins "
-            "the default-param baseline (sentinel PRESENT)."
+            "EMPIRICAL (catboost 1.2.10): the STANDALONE GreedyLogSum "
+            "quantization (Pool.quantize().save_quantization_borders()) surfaces "
+            "the NanMode f32::MIN sentinel as borders[0] for a NaN feature under "
+            "nan_mode=Min (numeric_nan feature 0: borders[0] = "
+            "-3.4028234663852886e+38 == numeric_limits<float>::lowest); the "
+            "NaN-free numeric_tiny set has no sentinel. nan_mode=Max never "
+            "prepends f32::MIN. NOTE (Rule-1 fix, 02-02): these borders are the "
+            "RAW standalone quantization output, NOT a trained model's "
+            "get_borders() -- the latter returns a training-PRUNED subset (only "
+            "borders used by some tree split, ~11/11/7/15 for numeric_tiny) that "
+            "no standalone binarizer can reproduce. The Rust borders.rs "
+            "reproduces the raw standalone set (49/49/49/49 for numeric_tiny; "
+            "44/49/49 for numeric_nan with the feature-0 sentinel) verbatim "
+            "(per-feature, sentinel present iff index 0 equals f32::MIN)."
         ),
         "A2_resolution": (
-            "Default border_count in catboost 1.2.10 is recorded per scenario "
-            "(observed: 254), border_selection_type=GreedyLogSum, nan_mode=Min."
+            "border_count=254 (catboost 1.2.10 default), "
+            "border_selection_type=GreedyLogSum, nan_mode=Min."
         ),
     }
     with (BORDERS_QUANT / "config.json").open("w", encoding="utf-8") as fh:

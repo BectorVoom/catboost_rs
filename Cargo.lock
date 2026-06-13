@@ -537,6 +537,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "cb-core",
+ "cb-oracle",
+ "ndarray",
+ "ndarray-npy",
  "polars",
  "thiserror",
 ]

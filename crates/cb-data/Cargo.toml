@@ -13,3 +13,10 @@ cb-core = { path = "../cb-core" }
 thiserror.workspace = true
 arrow.workspace = true
 polars.workspace = true
+
+[dev-dependencies]
+# Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the
+# per-feature border parity integration test.
+cb-oracle = { path = "../cb-oracle" }
+ndarray.workspace = true
+ndarray-npy.workspace = true

@@ -24,10 +24,14 @@
     )
 )]
 
+mod borders;
 pub mod ingest;
 mod pool;
 
+pub use borders::{penalty_maxsumlog, select_borders_greedy_logsum};
 pub use pool::{Pair, Pool};
 
+#[cfg(test)]
+mod borders_test;
 #[cfg(test)]
 mod pool_test;
