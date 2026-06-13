@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Phase 3 context gathered
-last_updated: "2026-06-13T07:04:44.265Z"
-last_activity: 2026-06-13 -- Plan 02-04 complete (CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked; corrected cat_hash fixtures)
+status: executing
+stopped_at: Completed 03-00-PLAN.md (Wave-0 foundation; Nyquist signed off)
+last_updated: "2026-06-13T07:21:47Z"
+last_activity: 2026-06-13 -- Completed Phase 03 Plan 00 (CubeCL seam + model.json parser + training oracles)
 progress:
   total_phases: 8
   completed_phases: 2
-  total_plans: 8
-  completed_plans: 8
-  percent: 25
+  total_plans: 16
+  completed_plans: 9
+  percent: 27
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 02 — data-layer-pool-quantization-reduction
+**Current focus:** Phase 03 — cpu-training-core-plain-boosting-oblivious-trees
 
 ## Current Position
 
-Phase: 02 (data-layer-pool-quantization-reduction) — EXECUTING
-Plan: 5 of 5
-Status: Ready to execute (02-04 complete)
-Last activity: 2026-06-13 -- Plan 02-04 complete (CityHash64 port + CalcCatFeatureHash + first-seen perfect-hash remap, oracle-locked; corrected cat_hash fixtures)
+Phase: 03 (cpu-training-core-plain-boosting-oblivious-trees) — EXECUTING
+Plan: 2 of 8
+Status: Executing Phase 03 (Plan 00 complete)
+Last activity: 2026-06-13 -- Completed Phase 03 Plan 00
 
-Progress: [████████░░] 80% (4 of 5 phase-02 plans complete)
+Progress: [█░░░░░░░░░] 13% (1 of 8 phase-03 plans complete)
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [████████░░] 80% (4 of 5 phase-02 plans complete)
 | Phase 02 P03 | 5 | 2 tasks | 7 files |
 | Phase 02 P04 | 25min | 2 tasks | 11 files |
 | Phase 02 P05 | ~25min | 2 tasks | 12 files |
+| Phase 03 P00 | ~75min | 4 tasks | 16 files |
 
 ## Accumulated Context
 
@@ -93,6 +94,12 @@ Recent decisions affecting current work:
 - [Phase 02]: Plan 02-05: ingestion CbError variants (Dtype/LengthMismatch/NanInCategorical/Ingestion) stringify external arrow/polars errors (no #[from]) so the enum keeps Clone+PartialEq+Eq (Shared Pattern C / D-06); this is the taxonomy Phase 8 maps to Python exceptions (PYAPI-05)
 - [Phase 02]: Plan 02-05: class weights computed in f32 to bit-match upstream float lambdas (SqrtBalanced fixture is f32 sqrt(3) widened, absorbed by <=1e-5, fixture unchanged); 1e-8 floor returns 1.0 on an empty/degenerate class (no div-by-zero); all summary sums via cb_core::sum_f64
 - [Phase 02]: Plan 02-05 COMPLETE — DATA-06 (Arrow+Polars validated ingestion) + DATA-08 (Balanced/SqrtBalanced + per-object/per-class weights) shipped, oracle-locked; Phase 2 data layer complete
+- [Phase 03]: Plan 03-00: CubeCL CpuRuntime stood up now (D-01) — SelectedRuntime = cubecl::cpu::CpuRuntime; cubecl 0.10.0 + bytemuck wired into cb-backend ONLY (D-03); cb-compute stays cubecl-free
+- [Phase 03]: Plan 03-00: first #[cube] gradient_kernel<F: Float> (generics-float, RMSE der1 = target-approx) runs on CpuRuntime — order-independent elementwise only, NO reduction (D-02/D-06); RESEARCH Open Q2 closed
+- [Phase 03]: Plan 03-00: cubecl 0.10.0 launch API — ArrayArg::from_raw_parts(Handle, len) (2 args, by value, no turbofish); read_one(Handle)->Result<Bytes, ServerError>; clone output Handle for launch arg
+- [Phase 03]: Plan 03-00: cb-oracle::model_json parses upstream model.json (scale_and_bias=[1,[bias]]); extractors return Vec<f64> for compare_stage(Stage::Splits|LeafValues); no unwrap, OracleError::MalformedModel
+- [Phase 03]: Plan 03-00: Open Q1 RESOLVED — score_function=L2 (simplest first-slice split math); regression_skeleton + binclf_skeleton frozen with D-07 isolating params (bootstrap_type=No, random_strength=0, depth=2, iterations=5, leaf_estimation_iterations=1, thread_count=1, explicit boost_from_average); Logloss staged = RawFormulaVal logits (A5/Pitfall 6)
+- [Phase 03]: Plan 03-00: Wave-0 Nyquist gate signed off (03-VALIDATION.md nyquist_compliant: true, wave_0_complete: true) — unblocks Plan 01 slice_first_oracle (gates TRAIN-01/02/03)
 
 ### Pending Todos
 
@@ -118,6 +125,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T06:08:54.486Z
-Stopped at: Phase 3 context gathered
-Resume file: .planning/phases/03-cpu-training-core-plain-boosting-oblivious-trees/03-CONTEXT.md
+Last session: 2026-06-13T07:21:47Z
+Stopped at: Completed 03-00-PLAN.md (Wave-0 foundation; Nyquist signed off)
+Resume file: None

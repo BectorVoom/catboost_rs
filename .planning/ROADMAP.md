@@ -101,7 +101,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1**
 
-- [ ] 03-00-PLAN.md — Wave-0 foundation: install cubecl 0.10.0/bytemuck (cb-backend only, D-03), prove the #[cube] CpuRuntime gradient seam, add cb-oracle model.json parser, generate RMSE + Logloss training-oracle fixtures (simplified isolating params, D-07)
+- [x] 03-00-PLAN.md — Wave-0 foundation: install cubecl 0.10.0/bytemuck (cb-backend only, D-03), prove the #[cube] CpuRuntime gradient seam, add cb-oracle model.json parser, generate RMSE + Logloss training-oracle fixtures (simplified isolating params, D-07) — _SUMMARY 03-00 (4 tasks, Nyquist Wave-0 signed off)_
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -202,30 +202,4 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Goal**: Python ML practitioners can drop catboost-rs into existing scikit-learn or CatBoost workflows via a dual-surface PyO3 binding distributed as per-backend wheels.
 **Mode:** mvp
 **Depends on**: Phase 7
-**Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAPI-06
-**Success Criteria** (what must be TRUE):
-
-  1. The scikit-learn-compatible API (`fit`/`predict`/`predict_proba`/`score`/`get_params`/`set_params`) passes `check_estimator`.
-  2. The CatBoost-native API (`Pool`, `CatBoostClassifier`/`Regressor`/`Ranker`) has full parameter-name parity and matching default values with upstream.
-  3. Python input accepts NumPy, Pandas, Arrow, and Polars with dtype/contiguity validation, copying/quantizing under the GIL before release (free-threaded-aware; no GIL reliance for buffer safety).
-  4. Typed `thiserror` errors map to specific Python exceptions with actionable messages.
-  5. Per-backend wheels (`cpu` + `rocm` minimum) build via `maturin --features <backend>` with `abi3-py312` on Python ≥ 3.12.
-
-**Plans**: TBD
-**Research flag**: NEEDS RESEARCH before planning — confirm current PyO3/maturin `abi3`/`abi3t` status for Python 3.12–3.15 (PEP 803: `abi3t` only on 3.15+; free-threaded 3.12–3.14 needs version-specific wheels); verify the pinned `pyo3 0.28.3` + `rust-numpy 0.28` + `ndarray 0.17` triad before committing the ABI strategy.
-
-## Progress
-
-**Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
-
-| Phase | Plans Complete | Status | Completed |
-|-------|----------------|--------|-----------|
-| 1. Workspace, Lint & Oracle Harness | 3/3 | Complete   | 2026-06-13 |
-| 2. Data Layer — Pool, Quantization & Reduction | 5/5 | Complete   | 2026-06-13 |
-| 3. CPU Training Core — Plain Boosting & Trees | 0/TBD | Not started | - |
-| 4. Model, Serialization, SHAP & Rust API | 0/TBD | Not started | - |
-| 5. Ordered Boosting, Ordered CTR & Categoricals | 0/TBD | Not started | - |
-| 6. Full Loss & Feature Parity | 0/TBD | Not started | - |
-| 7. GPU Backends via CubeCL | 0/TBD | Not started | - |
-| 8. Python Bindings, Dual API & Packaging | 0/TBD | Not started | - |
+**Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAP
