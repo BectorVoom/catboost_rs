@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
-Last activity: 2026-06-13 -- Phase 05 execution started
+Last activity: 2026-06-13 -- Plan 05-02 complete (ORD-04 one-hot encoding path)
 
 Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 
@@ -76,6 +76,7 @@ Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 | Phase 04 P04 | ~10min | 2 tasks | 5 files |
 | Phase 04 P05 | ~10min | 2 tasks | 8 files |
 | Phase 05 P01 | 8min | 3 tasks | 13 files |
+| Phase 05 P02 | 17min | 2 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -139,6 +140,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Plan 04-05 COMPLETE — published catboost-rs facade: CatBoostBuilder (D-05; new()+chained setters+fit(&pool); loss selects clf vs regression) wrapping cb_train::train over CpuBackend with borders computed from the pool (select_borders_greedy_logsum); Model facade (D-06/D-07: predict/predict_proba/predict_with enum core, save_cbm/load_cbm/save_json/load_json, shap_values, feature_importance) delegating to cb-model; public CatBoostError (D-08/RAPI-02: thiserror, #[from] CbError+ModelError+io::Error, Deserialize/SchemaVersion/FeatureMismatch, no Clone/PartialEq). anyhow structurally absent (D-14/D-15). RAPI-01, RAPI-02 done.
 - [Phase 04]: Plan 04-05 — end-to-end binclf + regression train->serialize->load->predict cycle through the PUBLIC API matches upstream catboost 1.2.10 <=1e-5 (ROADMAP Phase-4 criterion 5); the builder's fit-from-pool borders reproduce upstream border selection for numeric_tiny so the upstream oracle leg runs unconditionally (no #[ignore]). FeatureMismatch guard added (Rule 2, T-04-05-02). Phase 04 first full vertical slice CLOSED.
 - [Phase ?]: [Phase 05]: Plan 05-01 COMPLETE — Wave-0 oracle infra: Stage::{Permutation(integer-exact D-03 linchpin),OnlineCtr,OrderedApprox} + compare_permutation; model.json ctr_data parser (CtrTableJson #[serde(default)], backward-compatible); ordered_oracle.cpp zero-catboost transcription (perm self-oracle [4 2 0 3 1]==cb-core TFastRng64); 5 frozen categorical fixtures with per-knob config.json; 32 cb-oracle tests green
+- [Phase 05]: Plan 05-02 COMPLETE (ORD-04 / D-04) — one-hot vs CTR routing on learn-set cardinality (route_categorical/EncodingPath; inclusive at count==one_hot_max_size, exclusive above=CTR, skip<=1; AddOneHotFeatures greedy_tensor_search.cpp:171-197, Pitfall 3); learn_set_cardinality via calc_cat_feature_hash+PerfectHash (OnLearnOnly, never ctr_data hash_map); BoostParams.one_hot_max_size (explicit default 2). tree.rs OneHotSplit/AnySplit/grow_one_hot_tree (cat_bin==value IsTrueOneHotFeature split.h:16-17; same L2 score + strict first-wins + forward-bit leaf index) — shared float Split left byte-for-byte (no cb-model literal churn).
+- [Phase 05]: Plan 05-02 (Rule 3 deviation) — D-04 oracle is transcribe-then-self-oracle: one-hot-only model anchored bit-for-bit == the upstream-oracle-locked float train on equivalent one-hot binary columns (StagedApprox+Predictions <=1e-5), NO permutation present. The committed one_hot_cat fixture is the CTR/permutation Wave-0 anchor (no one-hot-only model.json; its config generates a permutation), so it cannot be the D-04 isolation oracle as literally planned. one_hot 11 lib + 3 integration green; slice_first float reference still locked 2/2.
 
 ### Pending Todos
 

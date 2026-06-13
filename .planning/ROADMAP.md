@@ -196,7 +196,7 @@ Plans:
 
 **Wave 2** *(blocked on 05-01)*
 
-- [ ] 05-02-PLAN.md — One-hot-only first slice (ORD-04, D-04): one_hot_max_size path selection + categorical one-hot splits, oracle-locked ≤1e-5 with NO permutation present
+- [x] 05-02-PLAN.md — One-hot-only first slice (ORD-04, D-04): one_hot_max_size path selection + categorical one-hot splits, oracle-locked ≤1e-5 with NO permutation present (self-oracled vs the upstream-locked float reference; commits 392fe65, da4fb30)
 
 **Wave 3** *(blocked on 05-01, 05-02)*
 
