@@ -82,6 +82,9 @@ fn train_regression_skeleton() -> (Model, usize) {
         one_hot_max_size: cb_train::one_hot_max_size_default(),
         permutation_count: cb_train::permutation_count_default(),
         fold_len_multiplier: cb_train::fold_len_multiplier_default(),
+        simple_ctr: cb_train::simple_ctr_default(),
+        simple_ctr_priors: cb_train::simple_ctr_priors_default(),
+        counter_calc_method: cb_train::counter_calc_method_default(),
     };
 
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None)

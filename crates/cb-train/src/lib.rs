@@ -17,6 +17,7 @@ mod autolr;
 mod bootstrap;
 mod boosting;
 mod candidates;
+mod ctr;
 mod fold;
 mod metrics;
 mod overfit;
@@ -31,6 +32,11 @@ pub use bootstrap::{
 pub use candidates::{
     learn_set_cardinality, one_hot_max_size_default, route_categorical, route_column, EncodingPath,
 };
+pub use ctr::{
+    accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
+    calc_normalization, CounterCalcMethod, ECtrType, FinalCtrTable, OnlineCtrAccumulator, Prior,
+    TCtrHistory, TCtrMeanHistory, SIMPLE_CLASSES_COUNT,
+};
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
     plain_fold_body_tail, select_min_batch_size, select_tail_size, Fold,
@@ -41,8 +47,9 @@ pub use permutation::{
     fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 pub use boosting::{
-    fold_len_multiplier_default, permutation_count_default, train, train_with_eval,
-    train_with_eval_sets, BoostParams, EvalSet, Model, ObliviousTree,
+    counter_calc_method_default, fold_len_multiplier_default, permutation_count_default,
+    simple_ctr_default, simple_ctr_priors_default, train, train_with_eval, train_with_eval_sets,
+    BoostParams, EvalSet, Model, ObliviousTree,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, grow_one_hot_tree, leaf_index,

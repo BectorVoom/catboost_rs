@@ -33,6 +33,7 @@ use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
 use crate::autolr::{self, TargetType};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
+use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::metrics::{EvalMetric, EvalMetricHistory};
 use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 use crate::tree::{
@@ -54,7 +55,11 @@ const PRE_TREE_DRAWS: usize = 2;
 const POST_TREE_EXTRA_DRAWS: usize = 1;
 
 /// Parameters for the plain boosting loop (the D-07 simplified isolating set).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// No longer `Copy`: the CTR config carries an owned `Vec<f64>` of explicit
+/// priors ([`Self::simple_ctr_priors`]); callers pass `&BoostParams` (as every
+/// `train*` entry point already does) or `.clone()` it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoostParams {
     /// Which loss / objective (RMSE or Logloss).
     pub loss: Loss,
@@ -141,6 +146,24 @@ pub struct BoostParams {
     /// (never auto). Consumed by [`crate::body_tail_boundaries`] /
     /// [`crate::create_folds`]; the plain single-span path ignores it.
     pub fold_len_multiplier: f64,
+    /// The SINGLE `simple_ctr` type the high-cardinality categorical path bakes
+    /// (ORD-03 / D-07 — one explicit CTR type per fixture, never the upstream
+    /// auto default set `[Borders, Counter]`, RESEARCH Pitfall 6). Pinned
+    /// EXPLICITLY ([`simple_ctr_default`]). Consumed by the Plain-CTR bake
+    /// ([`crate::build_final_ctr`]); the numeric/one-hot slices leave it at the
+    /// default and never exercise the CTR path.
+    pub simple_ctr: ECtrType,
+    /// The explicit per-prior numerators for [`Self::simple_ctr`] (D-07 — one
+    /// prior per CTR column, never auto). Each entry is a unit-denominator prior
+    /// numerator (`PriorDenom = 1`, RESEARCH A6 — so the online `+1` denom and
+    /// the inference `+PriorDenom` coincide). Pinned EXPLICITLY
+    /// ([`simple_ctr_priors_default`]).
+    pub simple_ctr_priors: Vec<f64>,
+    /// The `counter_calc_method` (`SkipTest` default, Pitfall 4 — pinned
+    /// EXPLICITLY, never auto). In the whole-learn-set Plain build there are no
+    /// test documents, so the flag does not change the counts; it is carried for
+    /// the tensor-CTR path. [`counter_calc_method_default`].
+    pub counter_calc_method: CounterCalcMethod,
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -156,6 +179,31 @@ pub fn permutation_count_default() -> usize {
 #[must_use]
 pub fn fold_len_multiplier_default() -> f64 {
     2.0
+}
+
+/// The canonical default `simple_ctr` type ([`ECtrType::Borders`], the upstream
+/// default CTR family head). Pinned EXPLICITLY at every `BoostParams`
+/// construction site (RESEARCH Pitfall 6 — never auto-selected); the
+/// numeric/one-hot slices leave it here and never exercise the CTR path.
+#[must_use]
+pub fn simple_ctr_default() -> ECtrType {
+    ECtrType::Borders
+}
+
+/// The canonical default `simple_ctr` priors — a single unit-denominator prior
+/// `0.5/1` (the in-scope plain_ctr fixture pins `Borders:Prior=0.5`, so the
+/// online `+1` denom and the inference `+PriorDenom` coincide, RESEARCH A6).
+/// Pinned EXPLICITLY at every `BoostParams` construction site.
+#[must_use]
+pub fn simple_ctr_priors_default() -> Vec<f64> {
+    vec![0.5]
+}
+
+/// The canonical default `counter_calc_method` ([`CounterCalcMethod::SkipTest`],
+/// `cat_feature_options.cpp:234`, Pitfall 4). Pinned EXPLICITLY (never auto).
+#[must_use]
+pub fn counter_calc_method_default() -> CounterCalcMethod {
+    CounterCalcMethod::SkipTest
 }
 
 /// One trained oblivious tree: the ordered splits, the per-leaf values

@@ -19,8 +19,9 @@ use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
 use cb_train::{
-    fold_len_multiplier_default, one_hot_max_size_default, permutation_count_default, train,
-    BoostParams, EBootstrapType, EOverfittingDetectorType,
+    counter_calc_method_default, fold_len_multiplier_default, one_hot_max_size_default,
+    permutation_count_default, simple_ctr_default, simple_ctr_priors_default, train, BoostParams,
+    EBootstrapType, EOverfittingDetectorType,
 };
 
 use crate::error::CatBoostError;
@@ -226,6 +227,11 @@ impl CatBoostBuilder {
             // facade path needs no permutation, so these are inert here.
             permutation_count: permutation_count_default(),
             fold_len_multiplier: fold_len_multiplier_default(),
+            // CTR config pinned to the upstream defaults (D-07 / Pitfall 6); the
+            // numeric facade path bakes no CTR table, so these are inert here.
+            simple_ctr: simple_ctr_default(),
+            simple_ctr_priors: simple_ctr_priors_default(),
+            counter_calc_method: counter_calc_method_default(),
         }
     }
 
