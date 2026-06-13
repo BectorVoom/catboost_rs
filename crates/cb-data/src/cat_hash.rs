@@ -428,14 +428,28 @@ impl PerfectHash {
     /// [`MAX_UNIQ_CAT_VALUES`] distinct hashes (mirrors the `CB_ENSURE` at
     /// `cat_feature_perfect_hash_helper.cpp:114-119`) — no panic.
     pub fn remap(&mut self, hash: u32) -> CbResult<u32> {
+        self.remap_bounded(hash, MAX_UNIQ_CAT_VALUES)
+    }
+
+    /// Inner remap with an explicit uniq-count cap. The public [`Self::remap`]
+    /// always passes [`MAX_UNIQ_CAT_VALUES`]; the explicit cap exists so the
+    /// overflow / `CB_ENSURE` path can be exercised without materializing
+    /// `u32::MAX` distinct hashes (the C++ `CB_ENSURE` bound,
+    /// `cat_feature_perfect_hash_helper.cpp:114-119`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CbError::OutOfRange`] if the map already holds `max_uniq`
+    /// distinct hashes — no panic.
+    pub(crate) fn remap_bounded(&mut self, hash: u32, max_uniq: usize) -> CbResult<u32> {
         if let Some(&bin) = self.map.get(&hash) {
             // it != end: reuse the assigned bin (`it->second.Value`).
             return Ok(bin);
         }
         // it == end: CB_ENSURE(map.size() != MAX_UNIQ_CAT_VALUES, ...) before insert.
-        if self.map.len() >= MAX_UNIQ_CAT_VALUES {
+        if self.map.len() >= max_uniq {
             return Err(CbError::OutOfRange(format!(
-                "categorical feature has more than {MAX_UNIQ_CAT_VALUES} unique values, which is currently unsupported"
+                "categorical feature has more than {max_uniq} unique values, which is currently unsupported"
             )));
         }
         // const ui32 bin = (ui32)perfectHashMap.GetSize();

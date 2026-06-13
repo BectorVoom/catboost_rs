@@ -10,7 +10,10 @@
 //! mirrored into `cb-oracle/fixtures/cat_hash/config.json` `string_to_ui32` /
 //! `string_to_ui64_precursor`.
 
-use super::cat_hash::{calc_cat_feature_hash, city_hash_64, stringify_int_category};
+use super::cat_hash::{
+    calc_cat_feature_hash, city_hash_64, perfect_hash_bins, stringify_int_category, PerfectHash,
+};
+use cb_core::CbError;
 
 /// `(input, expected ui64, expected ui32)` vectors transcribed verbatim from the
 /// vendored-source oracle. Coverage spans every CityHash64 length path:
@@ -93,4 +96,49 @@ fn integer_category_stringifies_to_plain_integer() {
         calc_cat_feature_hash("3.0"),
         "'3' and '3.0' must hash differently (A4)"
     );
+}
+
+/// First-seen remap: bin 0 to the first-seen hash, 1 to the next NEW hash, and
+/// repeats reuse the prior bin (`cat_feature_perfect_hash_helper.cpp:120` /
+/// `:127`). Driven over a column with a repeated value.
+#[test]
+fn perfect_hash_first_seen_assignment() {
+    let column = ["alpha", "beta", "alpha", "gamma", "beta", "alpha"];
+    let bins = perfect_hash_bins(&column).expect("within uniq bound");
+    assert_eq!(bins, vec![0, 1, 0, 2, 1, 0]);
+}
+
+/// `PerfectHash::remap` reuses the assigned bin on repeats and advances
+/// `len()` only for new hashes.
+#[test]
+fn perfect_hash_remap_reuses_bins() {
+    let mut ph = PerfectHash::new();
+    assert!(ph.is_empty());
+    assert_eq!(ph.remap(100).unwrap(), 0);
+    assert_eq!(ph.remap(200).unwrap(), 1);
+    assert_eq!(ph.remap(100).unwrap(), 0); // repeat -> same bin
+    assert_eq!(ph.remap(300).unwrap(), 2);
+    assert_eq!(ph.len(), 3);
+}
+
+/// The uniq-count bound returns a typed [`CbError::OutOfRange`] (NOT a panic)
+/// when a new hash would exceed the cap. Exercised with a tiny cap so the bound
+/// is reachable without materializing `u32::MAX` distinct hashes; the production
+/// `remap` uses the real `MAX_UNIQ_CAT_VALUES = u32::MAX` cap
+/// (`cat_feature_perfect_hash_helper.cpp:53-54`, Security V5 / T-02-11).
+#[test]
+fn perfect_hash_uniq_bound_returns_error_not_panic() {
+    let mut ph = PerfectHash::new();
+    // Fill the map to a cap of 2 distinct hashes.
+    assert_eq!(ph.remap_bounded(10, 2).unwrap(), 0);
+    assert_eq!(ph.remap_bounded(20, 2).unwrap(), 1);
+    // A repeat of an existing hash is always fine (no new bin needed).
+    assert_eq!(ph.remap_bounded(10, 2).unwrap(), 0);
+    // A THIRD distinct hash would exceed the cap -> typed error, no panic.
+    match ph.remap_bounded(30, 2) {
+        Err(CbError::OutOfRange(msg)) => {
+            assert!(msg.contains("unique values"), "got: {msg}");
+        }
+        other => panic!("expected OutOfRange on overflow, got {other:?}"),
+    }
 }

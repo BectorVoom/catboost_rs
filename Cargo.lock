@@ -541,6 +541,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "polars",
+ "serde_json",
  "thiserror",
 ]
 
