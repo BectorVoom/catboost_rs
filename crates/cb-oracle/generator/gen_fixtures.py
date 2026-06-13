@@ -63,6 +63,8 @@ BOOTSTRAP_INPUT = INPUTS / "bootstrap_multiblock"
 REGULARIZATION = FIXTURES / "regularization"
 OVERFIT = FIXTURES / "overfit"
 OVERFIT_INPUT = INPUTS / "overfit_eval"
+EVAL_METRICS = FIXTURES / "eval_metrics"
+EVAL_METRICS_INPUT = INPUTS / "eval_metrics"
 
 # IEEE-754 single-precision extremes — the NanMode sentinel borders upstream
 # injects into the STORED border set (quantization.cpp:342/344). Wave-0 probing
@@ -78,6 +80,9 @@ INPUT_SEED_BOOTSTRAP = 20260613
 # Dedicated synthesis seed for the TRAIN-06 overfit train/eval corpus (kept
 # distinct so the dataset is reproducible in isolation).
 INPUT_SEED_OVERFIT = 20260614
+# Dedicated synthesis seed for the TRAIN-07 eval-metrics multi-eval-set corpus
+# (kept distinct so the dataset is reproducible in isolation).
+INPUT_SEED_EVAL_METRICS = 20260615
 
 # D-07 simplified isolating params shared by BOTH training scenarios. Every knob
 # that interacts with the tree/leaf math is pinned to its most isolating value so
@@ -1120,6 +1125,203 @@ def gen_overfit() -> None:
             fh.write("\n")
 
 
+def gen_eval_metrics() -> None:
+    """eval_metrics/{rmse,logloss}/ — the TRAIN-07 (D-10) per-iteration eval-set
+    metric-logging oracle. Each scenario trains with TWO held-out eval sets
+    (`eval_set=[(X1,y1),(X2,y2)]`) and an EXPLICIT `eval_metric`, and persists the
+    upstream PER-ITERATION metric history FOR EACH eval set (from
+    `model.get_evals_result()` -> `validation_0`/`validation_1`) as committed
+    `.npy`. The Rust harness recomputes the same per-iteration metric curve per
+    eval set via `cb-train::metrics` and locks it at <= 1e-5.
+
+    `eval_metric` semantics (upstream): the metric reported per iteration per eval
+    set; it DEFAULTS to the objective when unset. Two scenarios cover both losses:
+      - rmse:    CatBoostRegressor,  loss=RMSE,    eval_metric='RMSE'
+                 (RMSE == sqrt(sum_w (pred-target)^2 / sum_w)).
+      - logloss: CatBoostClassifier, loss=Logloss, eval_metric='Logloss'
+                 (weighted cross-entropy over p=sigmoid(raw logit)).
+
+    DETERMINISTIC CONFIG (prior-wave guidance / D-07): `bootstrap_type=No`,
+    `random_strength=0`, fixed seed, `thread_count=1` so the per-iteration metric
+    values lock CLEANLY and are not perturbed by the known stochastic multi-tree
+    RNG residual (TRAIN-04/05). NO early stopping (the full iteration budget runs)
+    so every iteration's metric value is locked. Python-reachable oracle only
+    (D-11): the per-eval-set per-iteration history comes straight from the public
+    `get_evals_result()` API — no C++ instrumentation.
+
+    Persists per scenario:
+      - model.json          : the trained model (splits + leaf_values).
+      - eval0_metric.npy    : validation_0 per-iteration eval_metric history (f64).
+      - eval1_metric.npy    : validation_1 per-iteration eval_metric history (f64).
+      - config.json         : loss/eval_metric + n_iterations + assertion metadata.
+    Eval-set inputs (X/y for both eval sets + the train set) are committed under
+    inputs/eval_metrics/ so the Rust harness recomputes the curves.
+    """
+    EVAL_METRICS.mkdir(parents=True, exist_ok=True)
+    EVAL_METRICS_INPUT.mkdir(parents=True, exist_ok=True)
+
+    # Synthesize a train set + two distinct held-out eval sets from the same linear
+    # signal (different sizes so per-eval-set bookkeeping is exercised, not a single
+    # shared length).
+    rng = np.random.default_rng(INPUT_SEED_EVAL_METRICS)
+    n_train, n_eval0, n_eval1, n_cols = 120, 60, 45, 4
+    coeffs = np.array([1.5, -2.0, 0.5, 3.0], dtype=np.float64)
+    x_tr = _assert_f64(rng.standard_normal((n_train, n_cols)).astype(np.float64), "em Xtr")
+    x_e0 = _assert_f64(rng.standard_normal((n_eval0, n_cols)).astype(np.float64), "em Xe0")
+    x_e1 = _assert_f64(rng.standard_normal((n_eval1, n_cols)).astype(np.float64), "em Xe1")
+
+    # Regression targets (continuous) for the RMSE scenario; binary labels (from a
+    # thresholded linear score) for the Logloss scenario. Both eval sets are clean
+    # (light noise) held-out samples from the same signal.
+    y_tr_reg = _assert_f64(
+        (x_tr @ coeffs + 0.3 * rng.standard_normal(n_train)).astype(np.float64), "em ytr_reg"
+    )
+    y_e0_reg = _assert_f64(
+        (x_e0 @ coeffs + 0.1 * rng.standard_normal(n_eval0)).astype(np.float64), "em ye0_reg"
+    )
+    y_e1_reg = _assert_f64(
+        (x_e1 @ coeffs + 0.1 * rng.standard_normal(n_eval1)).astype(np.float64), "em ye1_reg"
+    )
+    clf_coeffs = np.array([1.0, -1.5, 0.5, 2.0], dtype=np.float64)
+    y_tr_clf = _assert_f64(
+        (x_tr @ clf_coeffs + 0.5 * rng.standard_normal(n_train) > 0).astype(np.float64),
+        "em ytr_clf",
+    )
+    y_e0_clf = _assert_f64((x_e0 @ clf_coeffs > 0).astype(np.float64), "em ye0_clf")
+    y_e1_clf = _assert_f64((x_e1 @ clf_coeffs > 0).astype(np.float64), "em ye1_clf")
+
+    # Commit the shared feature matrices + per-loss targets for the Rust harness.
+    np.save(EVAL_METRICS_INPUT / "X_train.npy", x_tr, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "X_eval0.npy", x_e0, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "X_eval1.npy", x_e1, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "y_train_rmse.npy", y_tr_reg, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "y_eval0_rmse.npy", y_e0_reg, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "y_eval1_rmse.npy", y_e1_reg, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "y_train_logloss.npy", y_tr_clf, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "y_eval0_logloss.npy", y_e0_clf, allow_pickle=False)
+    np.save(EVAL_METRICS_INPUT / "y_eval1_logloss.npy", y_e1_clf, allow_pickle=False)
+    with (EVAL_METRICS_INPUT / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "scenario": "inputs/eval_metrics",
+                "seed": INPUT_SEED_EVAL_METRICS,
+                "n_train": n_train,
+                "n_eval0": n_eval0,
+                "n_eval1": n_eval1,
+                "n_features": n_cols,
+                "note": (
+                    "Train set + TWO held-out eval sets (different sizes) for the "
+                    "TRAIN-07 per-iteration eval-metric oracle; rmse targets are "
+                    "continuous, logloss targets binary (thresholded linear score)."
+                ),
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+        )
+        fh.write("\n")
+
+    shared = {
+        "iterations": 12,
+        "learning_rate": 0.3,
+        "depth": 3,
+        "l2_leaf_reg": 3.0,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "leaf_estimation_iterations": 1,
+        "score_function": "L2",
+        "leaf_estimation_method": "Gradient",
+        "random_seed": SEED,
+        "thread_count": 1,
+        "verbose": False,
+    }
+
+    # (name, eval_metric, loss, is_classifier, boost_from_average, train_y, e0_y, e1_y)
+    scenarios = [
+        (
+            "rmse",
+            "RMSE",
+            "RMSE",
+            False,
+            True,
+            y_tr_reg,
+            y_e0_reg,
+            y_e1_reg,
+        ),
+        (
+            "logloss",
+            "Logloss",
+            "Logloss",
+            True,
+            False,
+            y_tr_clf,
+            y_e0_clf,
+            y_e1_clf,
+        ),
+    ]
+
+    for name, eval_metric, loss, is_clf, bfa, y_tr, y_e0, y_e1 in scenarios:
+        scenario_dir = EVAL_METRICS / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        params = {
+            **shared,
+            "boost_from_average": bfa,
+            "eval_metric": eval_metric,
+        }
+        if is_clf:
+            model = CatBoostClassifier(loss_function=loss, **params)
+        else:
+            model = CatBoostRegressor(loss_function=loss, **params)
+        model.fit(x_tr, y_tr, eval_set=[(x_e0, y_e0), (x_e1, y_e1)])
+
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        evals = model.get_evals_result()
+        curve0 = _assert_f64(
+            np.asarray(evals["validation_0"][eval_metric], dtype=np.float64), "em eval0"
+        )
+        curve1 = _assert_f64(
+            np.asarray(evals["validation_1"][eval_metric], dtype=np.float64), "em eval1"
+        )
+        np.save(scenario_dir / "eval0_metric.npy", curve0, allow_pickle=False)
+        np.save(scenario_dir / "eval1_metric.npy", curve1, allow_pickle=False)
+
+        config = {
+            "scenario": f"eval_metrics/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "eval_metrics",
+            "loss_function": loss,
+            "eval_metric": eval_metric,
+            "boost_from_average": bfa,
+            "n_eval_sets": 2,
+            "params": params,
+            "n_train": n_train,
+            "n_eval0": n_eval0,
+            "n_eval1": n_eval1,
+            "n_features": n_cols,
+            "n_iterations_run": int(len(curve0)),
+            "tree_count_": int(model.tree_count_),
+            "stages": ["Splits", "LeafValues", "EvalMetricPerSet"],
+            "metric_layout": (
+                "eval0_metric.npy / eval1_metric.npy: flat f64, the per-iteration "
+                "eval_metric on validation_0 / validation_1 respectively "
+                "(n_iterations_run entries each)."
+            ),
+            "metric_note": (
+                "eval_metric defaults to the objective and is set EXPLICITLY here. "
+                "RMSE == sqrt(sum_w (pred-target)^2 / sum_w); Logloss == weighted "
+                "cross-entropy over p=sigmoid(raw logit). Two eval sets exercise "
+                "per-eval-set per-iteration logging (TRAIN-07)."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -1211,6 +1413,10 @@ def main() -> None:
     # --- overfit (TRAIN-06 inctodec/iter/wilcoxon/use_best_model, D-10) ------
     gen_overfit()
     print(f"Wrote overfit oracle fixtures under {OVERFIT}")
+
+    # --- eval_metrics (TRAIN-07 per-iteration eval-set metric logging, D-10) -
+    gen_eval_metrics()
+    print(f"Wrote eval_metrics oracle fixtures under {EVAL_METRICS}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()

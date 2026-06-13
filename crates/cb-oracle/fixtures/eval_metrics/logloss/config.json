@@ -1,0 +1,40 @@
+{
+  "boost_from_average": false,
+  "catboost_version": "1.2.10",
+  "eval_metric": "Logloss",
+  "input_dataset": "eval_metrics",
+  "loss_function": "Logloss",
+  "metric_layout": "eval0_metric.npy / eval1_metric.npy: flat f64, the per-iteration eval_metric on validation_0 / validation_1 respectively (n_iterations_run entries each).",
+  "metric_note": "eval_metric defaults to the objective and is set EXPLICITLY here. RMSE == sqrt(sum_w (pred-target)^2 / sum_w); Logloss == weighted cross-entropy over p=sigmoid(raw logit). Two eval sets exercise per-eval-set per-iteration logging (TRAIN-07).",
+  "n_eval0": 60,
+  "n_eval1": 45,
+  "n_eval_sets": 2,
+  "n_features": 4,
+  "n_iterations_run": 12,
+  "n_train": 120,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 3,
+    "eval_metric": "Logloss",
+    "iterations": 12,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "eval_metrics/logloss",
+  "seed": 0,
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "EvalMetricPerSet"
+  ],
+  "thread_count": 1,
+  "tree_count_": 12
+}

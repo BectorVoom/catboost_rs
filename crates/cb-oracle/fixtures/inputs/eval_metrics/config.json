@@ -1,0 +1,9 @@
+{
+  "n_eval0": 60,
+  "n_eval1": 45,
+  "n_features": 4,
+  "n_train": 120,
+  "note": "Train set + TWO held-out eval sets (different sizes) for the TRAIN-07 per-iteration eval-metric oracle; rmse targets are continuous, logloss targets binary (thresholded linear score).",
+  "scenario": "inputs/eval_metrics",
+  "seed": 20260615
+}
