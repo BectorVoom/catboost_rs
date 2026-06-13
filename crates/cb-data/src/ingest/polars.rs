@@ -58,22 +58,44 @@ impl PolarsColumns {
 /// Rechunk a named `f64` Polars column to one contiguous chunk and wrap it as an
 /// Arrow `Float64Array` — the bridge onto the shared Arrow validation path.
 ///
+/// Nullability is preserved across the bridge (CR-02 / WR-03): a column carrying
+/// `null`s is materialized into a nullable Arrow `Float64Array` (validity bitmap
+/// intact) via `Option<f64>` iteration rather than `cont_slice()`, which would
+/// strip the null information and leave undefined payload in the value buffer.
+/// The shared Arrow path ([`arrow_f64_column`]) then normalizes those nulls to
+/// `f64::NAN` (numeric) or rejects them (categorical). A null-free column takes
+/// the fast contiguous `cont_slice` route unchanged.
+///
 /// # Errors
 ///
-/// - [`CbError::Ingestion`] if the column is missing, is not `f64`, or (after
-///   `rechunk`) is still non-contiguous.
+/// - [`CbError::Ingestion`] if the column is missing, is not `f64`, or (for a
+///   null-free column) is still non-contiguous after `rechunk`. The
+///   non-contiguous and nullable cases are handled distinctly so the boundary
+///   contract is enforced, not conflated (WR-03).
 fn column_to_arrow(frame: &DataFrame, name: &str) -> CbResult<ArrayRef> {
     let column = frame.column(name).map_err(|e| CbError::Ingestion {
         message: format!("column `{name}`: {e}"),
     })?;
 
     // One contiguous chunk, then a typed f64 view of it (D-05: rechunk -> shared
-    // Arrow path). `cont_slice` errors (not panics) on a multi-chunk / nullable
-    // column, surfaced as a typed ingestion error.
+    // Arrow path).
     let rechunked = column.rechunk();
     let f64_chunked = rechunked.f64().map_err(|e| CbError::Ingestion {
         message: format!("column `{name}` is not f64: {e}"),
     })?;
+
+    // Nullable column: preserve the validity bitmap by building a nullable
+    // Arrow array from `Option<f64>` values. `cont_slice` would discard the
+    // null information (returning the raw value buffer with garbage in null
+    // slots), so it is bypassed here (CR-02 / WR-03).
+    if f64_chunked.null_count() > 0 {
+        let array: Float64Array = f64_chunked.iter().collect();
+        return Ok(std::sync::Arc::new(array) as ArrayRef);
+    }
+
+    // Null-free column: take the fast contiguous route. `cont_slice` only fails
+    // here on genuine fragmentation (a non-contiguous single chunk), which is a
+    // distinct failure mode from nullability (handled above).
     let slice = f64_chunked.cont_slice().map_err(|e| CbError::Ingestion {
         message: format!("column `{name}` is non-contiguous after rechunk: {e}"),
     })?;

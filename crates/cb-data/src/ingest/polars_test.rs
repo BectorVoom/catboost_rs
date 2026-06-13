@@ -90,6 +90,40 @@ fn polars_nan_in_categorical_column_is_rejected() {
 }
 
 #[test]
+fn polars_numeric_null_becomes_nan() {
+    // CR-02 / WR-03: a nullable Polars f64 feature column must reach the Pool
+    // with its `null` materialized as `f64::NAN` (not stripped to 0.0 by
+    // `cont_slice`). Build a column with an explicit null via Option values.
+    let f0 = Column::new("f0".into(), &[Some(1.0_f64), None, Some(3.0)]);
+    let y = Column::new("y".into(), &[0.0_f64, 1.0, 0.0]);
+    let frame = DataFrame::new(3, vec![f0, y]).unwrap();
+
+    let pool = PolarsColumns::new(frame, vec!["f0".to_string()], vec![false], "y")
+        .into_pool()
+        .unwrap();
+
+    let col = pool.float_feature(0).unwrap();
+    assert_eq!(col.len(), 3);
+    assert_eq!(col[0], 1.0);
+    assert!(col[1].is_nan(), "Polars null must become NaN, not 0.0");
+    assert_eq!(col[2], 3.0);
+}
+
+#[test]
+fn polars_null_in_categorical_column_is_rejected() {
+    // CR-02 / threat T-02-14: a Polars `null` in a categorical column must be
+    // rejected exactly like a NaN, even though it lives in the validity bitmap.
+    let f0 = Column::new("f0".into(), &[Some(1.0_f64), None, Some(3.0)]);
+    let y = Column::new("y".into(), &[0.0_f64, 1.0, 0.0]);
+    let frame = DataFrame::new(3, vec![f0, y]).unwrap();
+
+    let err = PolarsColumns::new(frame, vec!["f0".to_string()], vec![true], "y")
+        .into_pool()
+        .unwrap_err();
+    assert_eq!(err, CbError::NanInCategorical { column: 0 });
+}
+
+#[test]
 fn polars_missing_column_is_a_typed_error() {
     let err = PolarsColumns::new(
         sample_frame(),

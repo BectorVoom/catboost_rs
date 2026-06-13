@@ -13,6 +13,11 @@ fn f64_array(values: &[f64]) -> ArrayRef {
     Arc::new(Float64Array::from(values.to_vec())) as ArrayRef
 }
 
+/// A nullable `Float64Array` from `Option<f64>` slots (validity bitmap intact).
+fn nullable_f64_array(values: &[Option<f64>]) -> ArrayRef {
+    Arc::new(Float64Array::from(values.to_vec())) as ArrayRef
+}
+
 #[test]
 fn arrow_float64_column_matches_owned_vec_path() {
     let raw = vec![1.0_f64, 2.5, -3.0, 4.25];
@@ -67,6 +72,28 @@ fn nan_in_non_categorical_column_is_allowed() {
     let read = arrow_f64_column(&col, 0, false).unwrap();
     assert_eq!(read.len(), 3);
     assert!(read[1].is_nan());
+}
+
+#[test]
+fn arrow_numeric_null_becomes_nan() {
+    // CR-02: a numeric column with a `null` (validity-bitmap, value slot holds
+    // undefined payload) must materialize that slot as `f64::NAN`, NOT `0.0`.
+    let col = nullable_f64_array(&[Some(1.0), None, Some(3.0)]);
+    let read = arrow_f64_column(&col, 0, false).unwrap();
+    assert_eq!(read.len(), 3);
+    assert_eq!(read[0], 1.0);
+    assert!(read[1].is_nan(), "null slot must become NaN, not 0.0");
+    assert_eq!(read[2], 3.0);
+}
+
+#[test]
+fn arrow_null_in_categorical_column_is_rejected() {
+    // CR-02 / threat T-02-14: a `null` in a categorical column must be rejected
+    // exactly like a smuggled NaN — the validity bitmap, not the value buffer,
+    // carries the missing value, so the guard must consult `null_count`.
+    let col = nullable_f64_array(&[Some(1.0), None, Some(3.0)]);
+    let err = arrow_f64_column(&col, 5, true).unwrap_err();
+    assert_eq!(err, CbError::NanInCategorical { column: 5 });
 }
 
 #[test]

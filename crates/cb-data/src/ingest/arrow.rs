@@ -11,9 +11,19 @@
 //! Validation rejects, as a typed [`cb_core::CbError`] (never a panic, never a
 //! blind index):
 //! - a non-`Float64` column dtype → [`CbError::Dtype`] (threat T-02-13);
-//! - a `NaN` in a column declared categorical → [`CbError::NanInCategorical`]
-//!   (threat T-02-14);
+//! - a `NaN` (or a `null`) in a column declared categorical →
+//!   [`CbError::NanInCategorical`] (threat T-02-14);
 //! - a column-length disagreement → [`CbError::LengthMismatch`] (threat T-02-13).
+//!
+//! # Null handling (CR-02 / threat T-02-14)
+//!
+//! Arrow stores nulls out-of-band in a validity bitmap, with the value buffer
+//! at a null slot holding undefined payload (commonly `0.0`). Reading
+//! `values()` alone would silently turn a `null` into `0.0`, bypassing the
+//! missing-value pipeline. This module therefore consults the validity bitmap:
+//! a `null` in a numeric column becomes `f64::NAN` (the missing-value
+//! representation the quantizer's NanMode handling expects), and a `null` in a
+//! column declared categorical is rejected exactly like a smuggled `NaN`.
 //!
 //! No `unwrap` / `expect` / `panic` / `[]`-indexing appears in this module
 //! (Shared Pattern C).
@@ -28,8 +38,10 @@ use crate::pool::Pool;
 /// Validate an Arrow column is a contiguous `Float64` array and read it into an
 /// owned `Vec<f64>` — the same buffer the owned-`Vec` path yields.
 ///
-/// When `categorical` is `true`, any `NaN` in the column is rejected with
-/// [`CbError::NanInCategorical`] (a `NaN` must never reach a categorical hash).
+/// When `categorical` is `true`, any `NaN` OR `null` in the column is rejected
+/// with [`CbError::NanInCategorical`] (a missing value must never reach a
+/// categorical hash). For a numeric column, `null` entries are normalized to
+/// `f64::NAN` so they flow through the quantizer's NanMode handling (CR-02).
 ///
 /// # Errors
 ///
@@ -37,7 +49,7 @@ use crate::pool::Pool;
 /// - [`CbError::Ingestion`] if the validated column cannot be downcast to a
 ///   `Float64Array` (a defensive guard; dtype is checked first).
 /// - [`CbError::NanInCategorical`] if `categorical` is set and the column holds a
-///   `NaN`.
+///   `NaN` or a `null`.
 pub fn arrow_f64_column(
     column: &ArrayRef,
     column_index: usize,
@@ -59,12 +71,17 @@ pub fn arrow_f64_column(
             message: format!("column {column_index}: Float64 downcast failed"),
         })?;
 
-    // Zero-copy view of the contiguous backing buffer; copied once into the
-    // owned column the Pool takes ownership of.
-    let values = typed.values();
-
+    // A categorical column must never carry a missing value: a `null` (tracked
+    // in the validity bitmap, NOT the value buffer) is rejected exactly like a
+    // smuggled `NaN`. Checking `null_count()` first catches the bitmap case the
+    // raw `values()` scan below cannot see (CR-02 / threat T-02-14).
     if categorical {
-        for &v in values.iter() {
+        if typed.null_count() > 0 {
+            return Err(CbError::NanInCategorical {
+                column: column_index,
+            });
+        }
+        for &v in typed.values().iter() {
             if v.is_nan() {
                 return Err(CbError::NanInCategorical {
                     column: column_index,
@@ -73,7 +90,24 @@ pub fn arrow_f64_column(
         }
     }
 
-    Ok(values.to_vec())
+    // Numeric path. When the column carries no nulls, the value buffer is a
+    // faithful view and is copied once. When it has nulls, the null slots hold
+    // undefined payload, so each null must be explicitly materialized as
+    // `f64::NAN` (the missing-value representation) by consulting the validity
+    // bitmap via `is_null` (CR-02).
+    if typed.null_count() == 0 {
+        Ok(typed.values().to_vec())
+    } else {
+        Ok((0..typed.len())
+            .map(|i| {
+                if typed.is_null(i) {
+                    f64::NAN
+                } else {
+                    typed.value(i)
+                }
+            })
+            .collect())
+    }
 }
 
 /// An Arrow-backed dataset source: float feature columns (one `ArrayRef` per
