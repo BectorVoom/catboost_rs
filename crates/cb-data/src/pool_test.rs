@@ -60,11 +60,11 @@ fn mismatched_label_length_is_typed_error() {
     let result = OwnedColumns::new(vec![vec![1.0, 2.0, 3.0]], vec![0.0, 1.0]).into_pool();
 
     match result {
-        Err(CbError::OutOfRange(msg)) => assert!(
-            msg.contains("label"),
-            "error should name the offending column, got: {msg}"
+        Err(CbError::LengthMismatch { column, .. }) => assert!(
+            column.contains("label"),
+            "error should name the offending column, got: {column}"
         ),
-        other => panic!("expected OutOfRange for mismatched label, got {other:?}"),
+        other => panic!("expected LengthMismatch for mismatched label, got {other:?}"),
     }
 }
 
@@ -76,7 +76,7 @@ fn mismatched_float_feature_length_is_typed_error() {
         OwnedColumns::new(vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0]], vec![0.0, 1.0, 0.0])
             .into_pool();
 
-    assert!(matches!(result, Err(CbError::OutOfRange(_))));
+    assert!(matches!(result, Err(CbError::LengthMismatch { .. })));
 }
 
 /// Optional metadata columns (here, weights) are also length-validated.
@@ -87,13 +87,14 @@ fn mismatched_weights_length_is_typed_error() {
         .into_pool();
 
     match result {
-        Err(CbError::OutOfRange(msg)) => assert!(msg.contains("weights")),
-        other => panic!("expected OutOfRange for mismatched weights, got {other:?}"),
+        Err(CbError::LengthMismatch { column, .. }) => assert!(column.contains("weights")),
+        other => panic!("expected LengthMismatch for mismatched weights, got {other:?}"),
     }
 }
 
-/// Pairs are carried through unchanged (they are object-index references, not
-/// per-row columns, so they are not length-validated against `n_rows`).
+/// Pairs whose ids are in range are carried through unchanged. Pairs are
+/// object-index references, not per-row columns, so they are validated by id
+/// bounds (`id < n_rows`, WR-02) rather than by column length.
 #[test]
 fn pairs_are_carried_through() {
     let pairs = vec![Pair { winner_id: 0, loser_id: 1 }];
