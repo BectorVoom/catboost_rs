@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked at <=1e-5)
-last_updated: "2026-06-13T08:17:30.587Z"
-last_activity: 2026-06-13 -- Completed Phase 03 Plan 01
+stopped_at: Completed 03-03-PLAN.md (bootstrap/sampling TRAIN-04; No/Bernoulli/MVS oracle-locked <=1e-5, Poisson CPU-rejected, Bayesian first-tree locked)
+last_updated: "2026-06-13T08:50:46Z"
+last_activity: 2026-06-13 -- Completed Phase 03 Plan 03
 progress:
   total_phases: 8
   completed_phases: 2
   total_plans: 16
-  completed_plans: 11
-  percent: 25
+  completed_plans: 12
+  percent: 28
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 03 (cpu-training-core-plain-boosting-oblivious-trees) — EXECUTING
-Plan: 4 of 8
+Plan: 5 of 8
 Status: Ready to execute
-Last activity: 2026-06-13 -- Completed Phase 03 Plan 01
+Last activity: 2026-06-13 -- Completed Phase 03 Plan 03
 
-Progress: [████░░░░░░] 38% (3 of 8 phase-03 plans complete)
+Progress: [█████░░░░░] 50% (4 of 8 phase-03 plans complete)
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Progress: [████░░░░░░] 38% (3 of 8 phase-03 plans complete)
 | Phase 03 P00 | ~75min | 4 tasks | 16 files |
 | Phase 03 P01 | ~20min | 4 tasks | 27 files |
 | Phase 03 P02 | 12min | 2 tasks | 14 files |
+| Phase 03 P03 | ~70min | 2 tasks | 28 files |
 
 ## Accumulated Context
 
@@ -108,6 +109,10 @@ Recent decisions affecting current work:
 - [Phase 03]: Plan 03-01: TRAIN-01/02 COMPLETE, TRAIN-03 Gradient done (Newton/Exact/Simple -> Plan 02); slice_first_oracle gates Splits/LeafValues/StagedApprox <=1e-5 for RMSE + Logloss; cargo test --workspace green
 - [Phase 03]: Plan 03-01: added CbError::DepthExceeded (depth>16) + CbError::Degenerate (no candidate split/empty) — guards, never panic (T-03-01-01/02); extended cb-oracle::model_json with float_feature_borders() accessor for the oracle test
 - [Phase ?]: Plan 03-02: TRAIN-03 complete — four leaf methods (Gradient/Newton/Exact/Simple) oracle-locked <=1e-5; Newton via Logloss (der2=-p(1-p) distinct), Exact via MAE weighted-median (Exact rejected for RMSE/Logloss upstream), Simple==Gradient (A6); added Loss::Mae + mae_gradient_kernel
+- [Phase 03]: Plan 03-03: TRAIN-04 bootstrap/sampling — No/Bernoulli/MVS oracle-locked <=1e-5 end-to-end; added TFastRng64::gen_rand_real1; Bayesian per-1000-block reseed (from_seed(rand_seed+block_idx).advance(10)) + verbatim FastLogf (NOT ln); Bernoulli f32-subsample sequential control; MVS CalculateThreshold importance sampler (8192 block)
+- [Phase 03]: Plan 03-03: Poisson REJECTED on CPU (CbError) mirroring upstream bootstrap_options.cpp — no Python CPU oracle exists; unit-locked dispatch rejection only (plan deviation, Rule 3)
+- [Phase 03]: Plan 03-03: sample weights/control gate SPLIT SCORING ONLY; leaf VALUES use the full unsampled fold (verified vs upstream — Bayesian/MVS weights never enter CalcLeafValues). Per-tree RNG draw accounting: 2 pre (fold pick + derivative seed) + bootstrap-internal + (depth+1) per-level CalcScores + MVS full-doc +2
+- [Phase 03]: Plan 03-03 RESIDUAL: Bayesian MULTI-TREE end-to-end lock #[ignore]d (first tree + draw sequence locked); tree-1+ diverges ~0.02 INSENSITIVE to RNG phase — structural Bayesian draw-stream issue, tracked in deferred-items.md
 
 ### Pending Todos
 
@@ -134,6 +139,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T08:16:49.870Z
-Stopped at: Completed 03-01-PLAN.md (first end-to-end CPU train slice; RMSE + Logloss oracle-locked at <=1e-5)
+Last session: 2026-06-13T08:50:46Z
+Stopped at: Completed 03-03-PLAN.md (bootstrap/sampling TRAIN-04; No/Bernoulli/MVS oracle-locked <=1e-5, Poisson CPU-rejected, Bayesian first-tree locked + multi-tree residual deferred)
 Resume file: None

@@ -113,7 +113,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 4** *(blocked on Wave 3)*
 
-- [ ] 03-03-PLAN.md — Bootstrap/sampling (Poisson/Bayesian/Bernoulli/MVS/No, subsample) seeded by TFastRng64 with exact per-block reseed order (TRAIN-04)
+- [x] 03-03-PLAN.md — Bootstrap/sampling (No/Bayesian/Bernoulli/MVS/Poisson, subsample) seeded by TFastRng64 with exact per-block reseed order (TRAIN-04); No/Bernoulli/MVS oracle-locked ≤1e-5 end-to-end, Poisson CPU-rejected (upstream-faithful), Bayesian first-tree + draw-sequence locked (multi-tree residual deferred) — _SUMMARY 03-03 (2 tasks; TRAIN-04 complete)_
 
 **Wave 5** *(blocked on Wave 4)*
 
