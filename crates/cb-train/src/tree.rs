@@ -97,6 +97,35 @@ pub enum AnySplit {
     OneHot(OneHotSplit),
 }
 
+/// A trainer-side tensor / combination CTR split spec (ORD-05 / D-05): a
+/// `ctr_value > border` test on a materialized CTR feature value computed over
+/// the combined categorical [`crate::TProjection`]. The trainer persists one of
+/// these per chosen CTR split so [`crate::Model`] → `cb_model::Model::from_trained`
+/// can lift it into the canonical model's CTR-split representation. The CTR
+/// VALUE math underneath is the 05-04/05/06 online accumulation keyed on the
+/// combined projection hash (consumed, not re-derived here).
+///
+/// `prior_num` / `prior_denom` carry the CTR prior (`Borders:Prior=0.5` pins
+/// `prior_num = 0.5`, `prior_denom = 1`, RESEARCH A6); `ctr_type` is the i8
+/// discriminant of the baked `CtrValueTable` type (the SAME values as
+/// `crate::ECtrType` / `cb_model::ECtrType`); `target_border_idx` selects the
+/// Buckets per-class numerator (default `0`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtrSplitSpec {
+    /// The combined categorical projection (sorted cat-feature member set).
+    pub projection: crate::TProjection,
+    /// The CTR type i8 discriminant of the baked table this split tests.
+    pub ctr_type: i8,
+    /// The CTR prior numerator (`PriorNum`).
+    pub prior_num: f64,
+    /// The CTR prior denominator (`PriorDenom`).
+    pub prior_denom: f64,
+    /// The Buckets per-class numerator selector (default `0`).
+    pub target_border_idx: usize,
+    /// The CTR-value threshold; the split passes when `ctr_value > border`.
+    pub border: f64,
+}
+
 /// A scored candidate split during the greedy search. `score` is the L2 split
 /// score (`l2_split_score`) of applying this split across the current level.
 #[derive(Debug, Clone, Copy, PartialEq)]

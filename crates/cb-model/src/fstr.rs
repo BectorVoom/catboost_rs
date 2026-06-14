@@ -65,7 +65,10 @@ fn feature_count(model: &Model) -> usize {
         .oblivious_trees
         .iter()
         .flat_map(|t| t.splits.iter())
-        .map(|s| s.feature + 1)
+        // Numeric-only feature importance projects over FLOAT splits; a CTR split
+        // has no single float-feature index and does not widen the float vector.
+        .filter_map(crate::ModelSplit::float_feature)
+        .map(|f| f + 1)
         .max()
         .unwrap_or(0)
 }
@@ -96,7 +99,11 @@ pub fn prediction_values_change(model: &Model) -> Vec<f64> {
         let leaf_count = tree.leaf_values.len();
         // for (feature = 0; feature < tree.SrcFeatures.size(); ++feature)
         for (feature_bit, split) in tree.splits.iter().enumerate() {
-            let src_idx = split.feature;
+            // Numeric-only importance: a CTR split has no single float-feature
+            // index, so it contributes nothing to the per-float-feature vector.
+            let Some(src_idx) = split.float_feature() else {
+                continue;
+            };
             // for (leafIdx = 0; leafIdx < tree.Leaves.size(); ++leafIdx)
             for leaf_idx in 0..leaf_count {
                 let inverted = leaf_idx ^ (1usize << feature_bit);
@@ -163,8 +170,14 @@ pub fn interaction(model: &Model) -> Vec<(usize, usize, f64)> {
                     .collect();
                 let delta = sum_f64(&signed);
 
-                let src1 = tree.splits.get(first_idx).map_or(0, |s| s.feature);
-                let src2 = tree.splits.get(second_idx).map_or(0, |s| s.feature);
+                // Numeric-only interaction: skip a pair that involves a CTR split
+                // (no single float-feature index).
+                let (Some(src1), Some(src2)) = (
+                    tree.splits.get(first_idx).and_then(crate::ModelSplit::float_feature),
+                    tree.splits.get(second_idx).and_then(crate::ModelSplit::float_feature),
+                ) else {
+                    continue;
+                };
                 if src1 == src2 {
                     continue;
                 }

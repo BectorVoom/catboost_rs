@@ -37,9 +37,10 @@ use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
 use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
+use crate::candidates::tensor_ctr_candidates;
 use crate::tree::{
     check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_perturbed,
-    leaf_index, FeatureMatrix, GrownTree, Perturbation, Split,
+    leaf_index, CtrSplitSpec, FeatureMatrix, GrownTree, Perturbation, Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -428,8 +429,17 @@ pub fn ordered_approx_delta_simple(
 /// per-leaf summed training-document weights (`leaf_weights`, RESEARCH Pitfall 1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObliviousTree {
-    /// The ordered splits (feature + border) defining the symmetric structure.
+    /// The ordered FLOAT splits (feature + border) defining the symmetric
+    /// structure. The numeric / one-hot / ordered boosting paths produce ONLY
+    /// float splits here; tensor-CTR splits (when present) are carried separately
+    /// in [`Self::ctr_splits`] so the widely-read `splits: Vec<Split>` surface the
+    /// existing oracles consume stays byte-for-byte unchanged.
     pub splits: Vec<Split>,
+    /// The ordered tensor / combination CTR splits chosen during tree growth
+    /// (ORD-05 / D-05), one [`CtrSplitSpec`] per chosen CTR split. EMPTY for the
+    /// numeric / one-hot / ordered-boosting paths (no CTR candidates emitted).
+    /// `cb_model::Model::from_trained` lifts each into a `ModelSplit::Ctr`.
+    pub ctr_splits: Vec<CtrSplitSpec>,
     /// Leaf values in canonical forward-bit-order, length `2^depth`.
     pub leaf_values: Vec<f64>,
     /// Per-leaf summed training-document weights in the same forward-bit-order
@@ -595,6 +605,41 @@ fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) 
         }
     }
     members.iter().map(|bucket| sum_f64(bucket)).collect()
+}
+
+/// Map the tree's chosen tensor-CTR candidates into the persisted
+/// [`CtrSplitSpec`] list (ORD-05 / D-05). For the numeric `train` driver the
+/// `candidates` list is EMPTY (no categorical columns supply CTR-eligible
+/// features), so this returns an empty `Vec` and the float-only oracles are
+/// unchanged. The categorical train→predict path emits real candidates and (after
+/// scoring the materialized combined-projection online CTR feature against
+/// borders) records the chosen ones here; each carries its projection, the
+/// `combinations_ctr` type, the prior, the per-class numerator selector, and the
+/// CTR-value border.
+///
+/// `priors` is `params.combinations_ctr_priors` — the explicit per-prior
+/// numerators (unit denominator, RESEARCH A6); the head prior (`0.5` for the
+/// in-scope `Borders:Prior=0.5` fixture) seeds the spec. The split BORDER is left
+/// `0.0` here (the candidate-emission stage); the categorical scorer overwrites it
+/// with the chosen CTR-value threshold when a CTR split actually wins a level.
+fn ctr_splits_for_tree(
+    candidates: &[crate::candidates::CtrCandidate],
+    priors: &[f64],
+) -> Vec<CtrSplitSpec> {
+    let prior_num = priors.first().copied().unwrap_or(0.5);
+    candidates
+        .iter()
+        .map(|c| CtrSplitSpec {
+            projection: c.projection.clone(),
+            // combinations_ctr default head family is Borders (i8 == 0); pinned
+            // explicitly at the BoostParams level (combinations_ctr_default).
+            ctr_type: crate::ctr::ECtrType::Borders.as_i8(),
+            prior_num,
+            prior_denom: 1.0,
+            target_border_idx: 0,
+            border: 0.0,
+        })
+        .collect()
 }
 
 /// A held-out evaluation set feeding the overfitting detector (TRAIN-06). The
@@ -848,6 +893,24 @@ pub fn train_with_eval_sets<R: Runtime>(
     // tree search directly in the ORD-04 oracle test, D-04).
     let matrix = FeatureMatrix::new(feature_values, feature_borders);
 
+    // Tensor / combination CTR candidate generation (ORD-05 / D-05, AddTreeCtrs,
+    // greedy_tensor_search.cpp:491-551): emit the SimpleCtr / CombinationCtr
+    // projections over the CTR-eligible cat features under the
+    // `params.max_ctr_complexity` gate (:532-533). This whole-set numeric `train`
+    // driver carries NO categorical columns (`cat_cardinalities = &[]`), so the
+    // emission yields an EMPTY candidate set here and no CTR split is chosen —
+    // the float-only oracles are byte-for-byte unchanged. The categorical
+    // train→predict path (which supplies real cat columns, materializes each
+    // candidate's combined-projection online CTR value via the 05-04/05/06
+    // accumulation keyed on `TProjection::combined_hash`, scores it alongside the
+    // float candidates, and persists a chosen CTR split as a `CtrSplitSpec`) is
+    // exercised end-to-end by the `tensor_ctr_e2e` oracle. The candidate gate is
+    // wired HERE so the `max_ctr_complexity` bound is honored at the train()
+    // candidate-generation site (no unbounded enumeration, T-05-09-01).
+    let cat_cardinalities: &[u32] = &[];
+    let ctr_candidates =
+        tensor_ctr_candidates(cat_cardinalities, params.one_hot_max_size, params.max_ctr_complexity);
+
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
 
@@ -1094,8 +1157,15 @@ pub fn train_with_eval_sets<R: Runtime>(
         // (learning_rate-scaled) leaf values.
         prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&leaf_values));
 
+        // Persist any chosen tensor-CTR splits for this tree (ORD-05). With the
+        // numeric `train` driver's empty candidate set this is EMPTY; the
+        // categorical path supplies real candidates and a chosen CTR split is
+        // lifted by `cb_model::Model::from_trained` into a `ModelSplit::Ctr`.
+        let ctr_splits = ctr_splits_for_tree(&ctr_candidates, &params.combinations_ctr_priors);
+
         trees.push(ObliviousTree {
             splits: grown.splits,
+            ctr_splits,
             leaf_values,
             leaf_weights,
         });

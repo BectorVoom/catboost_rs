@@ -455,11 +455,21 @@ pub fn shap_values(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<V
         mean_value: f64,
         tree_depth: usize,
     }
+    // Numeric-only SHAP operates over the FLOAT splits; project each tree's
+    // `Vec<ModelSplit>` to the float `Vec<Split>` the recursion consumes (a CTR
+    // split has no single float-feature index and is out of scope for the
+    // numeric SHAP path).
+    let float_splits: Vec<Vec<crate::Split>> = model
+        .oblivious_trees
+        .iter()
+        .map(|tree| tree.splits.iter().filter_map(crate::ModelSplit::as_float).copied().collect())
+        .collect();
     let prepared: Vec<Prepared> = model
         .oblivious_trees
         .iter()
-        .map(|tree| {
-            let tree_depth = tree.splits.len();
+        .zip(float_splits.iter())
+        .map(|(tree, splits)| {
+            let tree_depth = splits.len();
             let subtree_weights = calc_subtree_weights(&tree.leaf_weights, tree_depth);
             let mean_value = calc_mean_value(&tree.leaf_values, &subtree_weights, tree_depth);
             Prepared {
@@ -485,10 +495,16 @@ pub fn shap_values(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<V
 
             let mut shap_by_feature = vec![0.0_f64; n_features];
 
-            for (tree, prep) in model.oblivious_trees.iter().zip(prepared.iter()) {
-                let document_leaf_idx = document_leaf_index(&tree.splits, &row);
+            for ((tree, prep), splits) in model
+                .oblivious_trees
+                .iter()
+                .zip(prepared.iter())
+                .zip(float_splits.iter())
+            {
+                let _ = tree;
+                let document_leaf_idx = document_leaf_index(splits, &row);
                 shap_recurse(
-                    &tree.splits,
+                    splits,
                     &tree.leaf_values,
                     &prep.subtree_weights,
                     prep.mean_value,

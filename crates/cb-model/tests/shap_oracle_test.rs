@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use cb_model::{predict_raw, shap_values, Model, ObliviousTree, Split};
+use cb_model::{predict_raw, shap_values, Model, ModelSplit, ObliviousTree, Split};
 use cb_oracle::{load_f64_vec, load_model_json, ModelJson};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
@@ -57,10 +57,10 @@ fn model_from_json(mj: &ModelJson) -> Model {
             let splits = t
                 .splits
                 .iter()
-                .map(|s| Split {
+                .map(|s| ModelSplit::Float(Split {
                     feature: usize::try_from(s.float_feature_index).expect("non-negative feature"),
                     border: s.border,
-                })
+                }))
                 .collect();
             ObliviousTree {
                 splits,
@@ -73,6 +73,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         oblivious_trees,
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
+        ctr_data: None,
     }
 }
 
@@ -140,16 +141,16 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
     // realistic per-leaf weights.
     let tree0 = ObliviousTree {
         splits: vec![
-            Split { feature: 0, border: 0.5 },
-            Split { feature: 1, border: 1.5 },
+            ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+            ModelSplit::Float(Split { feature: 1, border: 1.5 }),
         ],
         leaf_values: vec![0.10, -0.20, 0.30, -0.05],
         leaf_weights: vec![10.0, 5.0, 8.0, 7.0],
     };
     let tree1 = ObliviousTree {
         splits: vec![
-            Split { feature: 1, border: 0.5 },
-            Split { feature: 0, border: 2.5 },
+            ModelSplit::Float(Split { feature: 1, border: 0.5 }),
+            ModelSplit::Float(Split { feature: 0, border: 2.5 }),
         ],
         leaf_values: vec![-0.01, 0.04, 0.02, 0.07],
         leaf_weights: vec![6.0, 9.0, 4.0, 11.0],
@@ -158,6 +159,7 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
         oblivious_trees: vec![tree0, tree1],
         bias: 0.123,
         float_feature_borders: vec![vec![0.5, 2.5], vec![0.5, 1.5]],
+        ctr_data: None,
     };
 
     // A spread of objects covering every leaf.

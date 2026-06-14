@@ -19,8 +19,8 @@
 use std::path::PathBuf;
 
 use cb_model::{
-    decode_cbm, load_cbm, predict_raw, save_cbm, Model, ModelError, ObliviousTree, Split, CBM1,
-    FLATBUFFERS_MODEL_V1,
+    decode_cbm, load_cbm, predict_raw, save_cbm, Model, ModelError, ModelSplit, ObliviousTree,
+    Split, CBM1, FLATBUFFERS_MODEL_V1,
 };
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, ModelJson, Stage};
 use ndarray::Array2;
@@ -57,10 +57,10 @@ fn model_from_json(mj: &ModelJson) -> Model {
             let splits = t
                 .splits
                 .iter()
-                .map(|s| Split {
+                .map(|s| ModelSplit::Float(Split {
                     feature: usize::try_from(s.float_feature_index).expect("non-negative feature"),
                     border: s.border,
-                })
+                }))
                 .collect();
             let weights = leaf_weights
                 .get(ti)
@@ -78,6 +78,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         oblivious_trees,
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
+        ctr_data: None,
     }
 }
 
@@ -89,20 +90,21 @@ fn rust_built_model() -> Model {
         oblivious_trees: vec![
             ObliviousTree {
                 splits: vec![
-                    Split { feature: 0, border: 0.5 },
-                    Split { feature: 1, border: 1.5 },
+                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                    ModelSplit::Float(Split { feature: 1, border: 1.5 }),
                 ],
                 leaf_values: vec![0.1, -0.2, 0.3, -0.4],
                 leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
             },
             ObliviousTree {
-                splits: vec![Split { feature: 0, border: 2.5 }],
+                splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
                 leaf_values: vec![0.05, -0.05],
                 leaf_weights: vec![12.0, 13.0],
             },
         ],
         bias: 0.25,
         float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
+        ctr_data: None,
     }
 }
 

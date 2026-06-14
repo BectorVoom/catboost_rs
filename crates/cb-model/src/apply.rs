@@ -32,9 +32,10 @@
 
 use cb_core::sum_f64;
 use cb_data::calc_cat_feature_hash;
-use cb_train::{fold_cat_hash, leaf_index, Split};
+use cb_train::{fold_cat_hash, leaf_index};
 
 use crate::ctr_data::{CtrValueTable, Prior};
+use crate::model::ModelSplit;
 use crate::Model;
 
 /// The bin index of `raw` against ascending `borders`: the COUNT of borders the
@@ -114,13 +115,27 @@ pub fn ctr_value_for_combined_projection(
     table.calc_for_hash(combined, prior, shift, scale, target_border_idx)
 }
 
-/// Whether an object passes one split: the split's `value > border` test on its
-/// float feature (Step B). Out-of-range feature indices return `false`
-/// defensively (the loaded model supplies valid indices) — checked `.get` only.
-fn passes_split(split: &Split, features: &[f32]) -> bool {
+/// Whether an object passes one float split (`value > border`, Step B).
+/// Out-of-range feature indices return `false` defensively (the loaded model
+/// supplies valid indices) — checked `.get` only.
+fn passes_float_split(feature: usize, border: f64, features: &[f32]) -> bool {
     features
-        .get(split.feature)
-        .is_some_and(|&v| f64::from(v) > split.border)
+        .get(feature)
+        .is_some_and(|&v| f64::from(v) > border)
+}
+
+/// Whether an object passes one [`ModelSplit`] (Step B): a [`ModelSplit::Float`]
+/// keeps the existing `value > border` path byte-for-byte; a [`ModelSplit::Ctr`]
+/// is routed to the not-found→empty `false` path HERE (Task 1a) and gets its full
+/// combined-projection CTR evaluation in Task 1b.
+fn passes_split(split: &ModelSplit, features: &[f32]) -> bool {
+    match split {
+        ModelSplit::Float(s) => passes_float_split(s.feature, s.border, features),
+        // Task 1a placeholder: a CTR split temporarily evaluates `false` (the
+        // not-found→empty route) so the `Vec<ModelSplit>` cross-crate change
+        // compiles; Task 1b fills in the combined-projection CTR-value lookup.
+        ModelSplit::Ctr(_) => false,
+    }
 }
 
 /// Apply every oblivious tree to one object and accumulate `bias + Σ_trees

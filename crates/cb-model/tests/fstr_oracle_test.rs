@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use cb_model::{interaction, prediction_values_change, Model, ObliviousTree, Split};
+use cb_model::{interaction, prediction_values_change, Model, ModelSplit, ObliviousTree, Split};
 use cb_oracle::{load_f64_vec, load_model_json, ModelJson};
 
 const TOL: f64 = 1e-5;
@@ -45,10 +45,10 @@ fn model_from_json(mj: &ModelJson) -> Model {
             let splits = t
                 .splits
                 .iter()
-                .map(|s| Split {
+                .map(|s| ModelSplit::Float(Split {
                     feature: usize::try_from(s.float_feature_index).expect("non-negative feature"),
                     border: s.border,
-                })
+                }))
                 .collect();
             ObliviousTree {
                 splits,
@@ -61,6 +61,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         oblivious_trees,
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
+        ctr_data: None,
     }
 }
 

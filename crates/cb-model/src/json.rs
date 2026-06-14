@@ -32,7 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ModelError;
-use crate::{Model, ObliviousTree, Split};
+use crate::{Model, ModelSplit, ObliviousTree, Split};
 
 /// One split in an oblivious tree (upstream `oblivious_trees[i].splits[j]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,9 +125,15 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
         .oblivious_trees
         .iter()
         .map(|t| {
+            // The numeric-only `model.json` schema emits FLOAT splits only; CTR
+            // splits round-trip through the `.cbm` / `ctr_data` path, not this
+            // numeric JSON export (a CTR split is skipped here, the json round-trip
+            // covers float-only models — the apply path for CTR splits is exercised
+            // via the trainer-lifted model + baked ctr_data, not this loader).
             let splits = t
                 .splits
                 .iter()
+                .filter_map(ModelSplit::as_float)
                 .enumerate()
                 .map(|(si, s)| SplitJson {
                     border: s.border,
@@ -187,10 +193,10 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
                             s.float_feature_index
                         ))
                     })?;
-                    Ok(Split {
+                    Ok(ModelSplit::Float(Split {
                         feature,
                         border: s.border,
-                    })
+                    }))
                 })
                 .collect::<Result<Vec<_>, ModelError>>()?;
             // Zero-fill weights if a fixture predates leaf_weights (length match
@@ -212,6 +218,7 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         oblivious_trees,
         bias: read_bias(&doc.scale_and_bias)?,
         float_feature_borders,
+        ctr_data: None,
     })
 }
 

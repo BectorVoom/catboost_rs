@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use cb_model::{binarize_feature, predict_raw, Model, ObliviousTree, Split};
+use cb_model::{binarize_feature, predict_raw, Model, ModelSplit, ObliviousTree, Split};
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, ModelJson, Stage};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
@@ -51,10 +51,10 @@ fn model_from_json(mj: &ModelJson) -> Model {
             let splits = t
                 .splits
                 .iter()
-                .map(|s| Split {
+                .map(|s| ModelSplit::Float(Split {
                     feature: usize::try_from(s.float_feature_index).expect("non-negative feature"),
                     border: s.border,
-                })
+                }))
                 .collect();
             ObliviousTree {
                 splits,
@@ -67,6 +67,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         oblivious_trees,
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
+        ctr_data: None,
     }
 }
 
@@ -106,6 +107,7 @@ fn bias_added_once_no_trees() {
         oblivious_trees: Vec::new(),
         bias: 0.42,
         float_feature_borders: vec![vec![0.5]],
+        ctr_data: None,
     };
     let columns = vec![vec![0.1_f32, 0.9, 0.3]];
     let preds = predict_raw(&model, &columns);

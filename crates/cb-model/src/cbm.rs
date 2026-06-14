@@ -153,7 +153,13 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
             ModelError::SchemaVersion("cumulative tree-split offset overflow".to_owned())
         })?;
         for split in &tree.splits {
-            tree_splits.push(split_to_global_index(split, &bins)?);
+            // The native `.cbm` numeric core serializes FLOAT splits (the global
+            // split-pool index is a float-feature/border pair); a CTR split
+            // round-trips through the `ctr_data` model-parts region, not the float
+            // split pool, so it is skipped here.
+            if let Some(float_split) = split.as_float() {
+                tree_splits.push(split_to_global_index(float_split, &bins)?);
+            }
         }
         leaf_values.extend_from_slice(&tree.leaf_values);
         leaf_weights.extend_from_slice(&tree.leaf_weights);
@@ -337,10 +343,10 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
                     bins.len()
                 ))
             })?;
-            splits.push(Split {
+            splits.push(crate::ModelSplit::Float(Split {
                 feature: bin.feature,
                 border: bin.border,
-            });
+            }));
         }
         split_cursor = split_cursor.saturating_add(size);
 
@@ -365,6 +371,7 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
         oblivious_trees,
         bias: read_bias(trees),
         float_feature_borders,
+        ctr_data: None,
     })
 }
 

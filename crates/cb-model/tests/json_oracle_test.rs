@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use cb_model::{decode_json, load_json, predict_raw, save_json, Model, ModelError, ObliviousTree, Split};
+use cb_model::{decode_json, load_json, predict_raw, save_json, Model, ModelError, ModelSplit, ObliviousTree, Split};
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, Stage};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
@@ -54,20 +54,21 @@ fn rust_built_model() -> Model {
         oblivious_trees: vec![
             ObliviousTree {
                 splits: vec![
-                    Split { feature: 0, border: 0.5 },
-                    Split { feature: 1, border: 1.5 },
+                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                    ModelSplit::Float(Split { feature: 1, border: 1.5 }),
                 ],
                 leaf_values: vec![0.1, -0.2, 0.3, -0.4],
                 leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
             },
             ObliviousTree {
-                splits: vec![Split { feature: 0, border: 2.5 }],
+                splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
                 leaf_values: vec![0.05, -0.05],
                 leaf_weights: vec![12.0, 13.0],
             },
         ],
         bias: 0.25,
         float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
+        ctr_data: None,
     }
 }
 
@@ -86,7 +87,7 @@ fn save_json_round_trips_through_oracle_parser() {
     let expected_borders: Vec<f64> = model
         .oblivious_trees
         .iter()
-        .flat_map(|t| t.splits.iter().map(|s| s.border))
+        .flat_map(|t| t.splits.iter().filter_map(ModelSplit::as_float).map(|s| s.border))
         .collect();
     compare_stage(Stage::Splits, &expected_borders, &mj.split_borders())
         .unwrap_or_else(|e| panic!("split_borders diverged: {e:?}"));
