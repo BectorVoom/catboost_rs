@@ -1,0 +1,29 @@
+{
+  "phase": "3",
+  "phase_name": "CPU Training Core — Plain Boosting & Oblivious Trees",
+  "timestamp": "2026-06-13",
+  "areas_completed": ["Compute boundary design", "Threading & determinism", "First oracle-locked slice", "Intermediate-oracle depth"],
+  "areas_remaining": [],
+  "decisions": {
+    "Compute boundary design": [
+      {"question": "What should the CPU compute path be in Phase 3?", "answer": "CubeCL CPU runtime now — prove the CubeCL seam in Phase 3", "options_presented": ["Plain Rust CubeCL-shaped trait", "CubeCL CPU runtime now", "Plain Rust CPU-native trait"]},
+      {"question": "How to coexist with the order-locked cb-core::sum_f64 invariant (D-08)?", "answer": "Kernels do order-independent elementwise work; every parity-critical SUM finalized host-side via cb-core::sum_f64 in frozen order", "options_presented": ["Kernels elementwise + host-side ordered reduce", "Reproduce sum order inside kernels", "Redefine invariant around CubeCL"]},
+      {"question": "Where do the #[cube] kernels live and what is cb-compute's role?", "answer": "Kernels + cubecl dep ONLY in cb-backend; cb-compute defines own abstract R: Runtime/F: Float traits + host orchestration, never sees cubecl (D-03 honored)", "options_presented": ["Kernels in cb-backend, cb-compute abstract", "Kernels in cb-compute, relax D-03", "Split: traits in cb-compute, kernels in cb-backend, share cubecl::Float"]},
+      {"question": "Trait granularity?", "answer": "Coarse domain ops (build_histograms, compute_gradients, eval_splits); backend owns kernel decomposition, host finalizes ordered sums", "options_presented": ["Coarse domain ops", "Fine primitives", "You decide"]}
+    ],
+    "Threading & determinism": [
+      {"question": "How to make per-bin histogram accumulation deterministic vs thread_count=1?", "answer": "Ordered single-pass f64 per-bin accumulators in canonical object order (cb-core::sum_f64 semantics); kernel computes per-object gradients in parallel", "options_presented": ["Ordered single-pass f64 bins", "Parallel partial-histograms + ordered merge", "You decide"]},
+      {"question": "Phase 3 threading target?", "answer": "Parallel elementwise kernels now (order-independent gradient/hessian), all reductions ordered host-side — exercises CubeCL parallelism early, de-risks Phase 7", "options_presented": ["Single-thread end-to-end now", "Parallel elementwise, ordered reductions", "You decide"]}
+    ],
+    "First oracle-locked slice": [
+      {"question": "Parameter posture for the first slice?", "answer": "Simplified isolating params (bootstrap_type=No, random_strength=0, fixed l2/depth/lr/iterations); each knob added as its own additive oracle", "options_presented": ["Simplified isolating params first", "Full upstream defaults immediately", "You decide"]},
+      {"question": "Anchor loss?", "answer": "Both RMSE + Logloss in the first slice (regression + binary classification together)", "options_presented": ["RMSE regression", "Logloss binary classification", "Both RMSE + Logloss"]},
+      {"question": "Leaf-method rollout?", "answer": "All four (Gradient/Newton/Exact/Simple) up front — complete TRAIN-03 in one wave", "options_presented": ["Default method first, others additive", "All four up front", "You decide"]}
+    ],
+    "Intermediate-oracle depth": [
+      {"question": "How deep should the oracle go?", "answer": "Python-reachable floor: per-tree splits + leaf values + per-iteration approximants (save_model json + staged_predict); no C++ instrumentation (honors P1 D-08); drift localized by the simplified first slice", "options_presented": ["Python-reachable floor", "Add C++ instrumentation now", "You decide"]}
+    ]
+  },
+  "deferred_ideas": [],
+  "canonical_refs": []
+}
