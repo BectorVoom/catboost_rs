@@ -147,6 +147,40 @@ pub struct GrownTree {
     pub splits: Vec<Split>,
     /// Per-object leaf index (`0..2^depth`), object order.
     pub leaf_of: Vec<usize>,
+    /// The chosen tensor / combination CTR splits (ORD-05), one
+    /// [`CtrSplitSpec`] per level a CTR candidate won. EMPTY for the float-only /
+    /// one-hot / ordered searches (so their consumers keep compiling unchanged).
+    /// The boosting loop persists these onto the [`crate::ObliviousTree`] and
+    /// (Plan 05-13 Task 2) REASSIGNS `leaf_of` over the averaging-fold CTR column
+    /// using these chosen borders for LEAF-VALUE estimation.
+    pub ctr_splits: Vec<CtrSplitSpec>,
+    /// The per-level chosen-split kinds in level order: each entry records whether
+    /// level `d` is a float split (and its index into [`Self::splits`]) or a CTR
+    /// split (and its index into [`Self::ctr_splits`] plus the chosen CTR-value
+    /// border the `ctr_bin > border` test uses). Empty for the searches that do
+    /// not mix CTR candidates. Drives the forward-bit leaf index when float and
+    /// CTR levels interleave, and lets Plan 05-13 Task 2 rebuild `leaf_of` over the
+    /// averaging-fold CTR column in the correct level order.
+    pub level_kinds: Vec<LevelKind>,
+}
+
+/// One level's chosen-split kind in [`GrownTree::level_kinds`] (ORD-05): a float
+/// split or a CTR split. Records the index back into the parallel `splits` /
+/// `ctr_splits` vectors plus, for CTR levels, the chosen CTR-value `border` the
+/// forward-bit `ctr_bin > border` leaf test uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LevelKind {
+    /// This level is a float `value > border` split; the payload is its index
+    /// into [`GrownTree::splits`].
+    Float(usize),
+    /// This level is a CTR `ctr_bin > border` split; the payload is its index into
+    /// [`GrownTree::ctr_splits`] and the chosen CTR-value border.
+    Ctr {
+        /// Index into [`GrownTree::ctr_splits`].
+        ctr_idx: usize,
+        /// The chosen CTR-value border (`ctr_bin > border` passes).
+        border: f64,
+    },
 }
 
 /// Reject a depth that exceeds [`MAX_DEPTH`] before any `2^depth` allocation.
@@ -415,6 +449,8 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     Ok(GrownTree {
         splits: chosen,
         leaf_of,
+        ctr_splits: Vec::new(),
+        level_kinds: Vec::new(),
     })
 }
 
@@ -830,6 +866,274 @@ pub fn greedy_tensor_search_oblivious_ordered(
     Ok(GrownTree {
         splits: chosen,
         leaf_of,
+        ctr_splits: Vec::new(),
+        level_kinds: Vec::new(),
+    })
+}
+
+// ===========================================================================
+// ORD-05 CTR-feature scoring in the oblivious search (the STRUCTURE half)
+// ===========================================================================
+//
+// The CTR-aware oblivious search enumerates, at each level, BOTH the float
+// candidates (the existing `select_level_plain` order, unchanged) AND — for each
+// materialized `CtrFeatureColumn` — one candidate per CTR border (the value test
+// `ctr_bin > border`, borders `0..ctr_border_count`). Every candidate is scored
+// with the SAME `l2_split_score` over `reduce_leaf_stats` the float path uses (no
+// forked scoring math). The fixed candidate-iteration order is FLOAT-then-CTR
+// (upstream enumerates float features, THEN AddTreeCtrs), and the strict
+// first-wins (`> best`) tie-break is reused verbatim (Pitfall 1).
+//
+// A winning CTR split is recorded as a `CtrSplitSpec` carrying the chosen
+// CTR-value border + the column's prior num/denom PAIR; `GrownTree.level_kinds`
+// records which level each split occupies so the forward-bit leaf index assigns
+// CTR bits (`ctr_bin > border`) and float bits in the correct level order.
+//
+// IMPORTANT: this search computes the STRUCTURE only. The `grown.leaf_of` it
+// returns is the structure partition over the IDENTITY-fold CTR column; Plan
+// 05-13 Task 2 REPLACES the leaf_of used for leaf VALUES with the averaging-fold
+// partition (boosting.rs), driven by the chosen `ctr_splits` + `level_kinds`.
+
+/// A unified candidate split in the CTR-aware oblivious search: a float
+/// `value > border` ([`Split`]) or a CTR `ctr_bin > border` over one materialized
+/// [`crate::ctr::CtrFeatureColumn`] (identified by its index into the supplied
+/// column slice). Used only inside [`greedy_tensor_search_oblivious_with_ctr`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CtrAwareSplit {
+    /// A float threshold split.
+    Float(Split),
+    /// A CTR split: the column index and the CTR-value border (`ctr_bin > border`).
+    Ctr { col: usize, border: f64 },
+}
+
+/// Whether object `obj` passes the [`CtrAwareSplit`] given the materialized CTR
+/// columns. A float split delegates to [`FeatureMatrix::passes_float`]; a CTR
+/// split tests `ctr_bin > border` over the column's quantized `bins` (the
+/// forward-bit CTR test). Out-of-range indices return `false` defensively.
+fn passes_ctr_aware(
+    matrix: &FeatureMatrix,
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    split: &CtrAwareSplit,
+    obj: usize,
+) -> bool {
+    match split {
+        CtrAwareSplit::Float(s) => matrix.passes_float(s.feature, obj, s.border),
+        CtrAwareSplit::Ctr { col, border } => ctr_features
+            .get(*col)
+            .and_then(|c| c.bins.get(obj))
+            .is_some_and(|&bin| f64::from(bin) > *border),
+    }
+}
+
+/// Assign every object to a leaf given the chosen [`CtrAwareSplit`] list (float or
+/// CTR, forward bit order). The ORD-05 structure path.
+fn assign_leaves_ctr_aware(
+    matrix: &FeatureMatrix,
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    splits: &[CtrAwareSplit],
+    n_objects: usize,
+) -> Vec<usize> {
+    (0..n_objects)
+        .map(|obj| {
+            let passes: Vec<bool> = splits
+                .iter()
+                .map(|s| passes_ctr_aware(matrix, ctr_features, s, obj))
+                .collect();
+            leaf_index(&passes)
+        })
+        .collect()
+}
+
+/// Score one [`CtrAwareSplit`] candidate applied across the CURRENT level (the
+/// CTR-aware analog of [`score_candidate`]): extend the chosen splits with the
+/// candidate, assign leaves, reduce per-leaf stats (ordered), and fold the SAME
+/// L2 score the float path uses (`l2_split_score` over `reduce_leaf_stats` — NOT
+/// a forked scorer).
+fn score_candidate_ctr_aware(
+    matrix: &FeatureMatrix,
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    chosen: &[CtrAwareSplit],
+    candidate: CtrAwareSplit,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+) -> f64 {
+    let mut splits = chosen.to_vec();
+    splits.push(candidate);
+    let n_leaves = 1usize << splits.len();
+    let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, &splits, n_objects);
+    let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
+    l2_split_score(&stats, scaled_l2)
+}
+
+/// One level of the CTR-aware UNPERTURBED search: enumerate FLOAT candidates
+/// (feature asc, border asc; `AddFloatFeatures`) THEN CTR candidates (column asc,
+/// border asc; `AddTreeCtrs`) — one CTR candidate per border `0..ctr_border_count`
+/// for each column — score each via the SHARED L2 calcer, and pick the strict
+/// first-wins best over that FIXED float-then-CTR order
+/// ([`select_best_candidate`] discipline, strict `>`, Pitfall 1). The winning
+/// candidate's concrete [`CtrAwareSplit`] is recovered from a vector kept in
+/// lockstep with the scores.
+#[allow(clippy::too_many_arguments)]
+fn select_level_ctr_aware(
+    matrix: &FeatureMatrix,
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    ctr_border_count: usize,
+    chosen: &[CtrAwareSplit],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+) -> CbResult<CtrAwareSplit> {
+    let mut scored: Vec<(CtrAwareSplit, f64)> = Vec::new();
+
+    // FLOAT candidates first (AddFloatFeatures), feature asc / border asc.
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        for &border in borders {
+            let split = CtrAwareSplit::Float(Split { feature, border });
+            let score = score_candidate_ctr_aware(
+                matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
+            );
+            scored.push((split, score));
+        }
+    }
+
+    // CTR candidates next (AddTreeCtrs), column asc / border asc. One candidate per
+    // CTR-value border in `0..ctr_border_count`; the `ctr_bin > border` test
+    // borders are the integer bucket thresholds the materialized `bins` are
+    // quantized into (a border `b` ⇔ bucket > `b`, i.e. bucket ≥ `b + 1`).
+    for col in 0..ctr_features.len() {
+        for border_idx in 0..ctr_border_count {
+            let border = border_idx as f64;
+            let split = CtrAwareSplit::Ctr { col, border };
+            let score = score_candidate_ctr_aware(
+                matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
+            );
+            scored.push((split, score));
+        }
+    }
+
+    // Strict first-wins over the FIXED float-then-CTR enumeration order, identical
+    // to `select_best_candidate` (strict `>`, NOT `>=`; Pitfall 1).
+    let mut best: Option<CtrAwareSplit> = None;
+    let mut best_score = MINIMAL_SCORE;
+    for &(split, score) in &scored {
+        if score > best_score {
+            best_score = score;
+            best = Some(split);
+        }
+    }
+    best.ok_or_else(|| {
+        CbError::Degenerate(
+            "no candidate split available (no float border and no CTR candidate)".to_owned(),
+        )
+    })
+}
+
+/// Grow one oblivious tree of depth `depth` over the FLOAT + CTR candidate set
+/// (ORD-05 / D-05, the STRUCTURE half), with the strict first-wins greedy search.
+///
+/// At each level `0..depth`, both the float candidates (`select_level_plain`
+/// order, unchanged) and — for each materialized [`crate::ctr::CtrFeatureColumn`]
+/// — one candidate per CTR border `0..ctr_border_count` (the `ctr_bin > border`
+/// test) are scored with the SHARED [`l2_split_score`]/[`reduce_leaf_stats`], and
+/// the strict first-wins (`> best`) winner over the FIXED FLOAT-then-CTR order is
+/// chosen. A winning CTR split is recorded as a [`CtrSplitSpec`] (carrying the
+/// chosen CTR-value border + the column's prior num/denom PAIR + projection +
+/// ctr_type); `GrownTree.level_kinds` records each level's kind so the forward-bit
+/// leaf index assigns CTR bits and float bits in the correct level order.
+///
+/// `ctr_features` are the IDENTITY-learning-fold materialized CTR columns
+/// (structure search); `target_border_idx` is the Buckets per-class numerator
+/// selector carried onto each chosen `CtrSplitSpec` (default `0`).
+///
+/// IMPORTANT — this computes the STRUCTURE only. `grown.leaf_of` is the structure
+/// partition; Plan 05-13 Task 2 REASSIGNS leaf_of over the averaging-fold CTR
+/// column (boosting.rs) using `grown.ctr_splits` + `grown.level_kinds` for
+/// LEAF-VALUE estimation. When `ctr_features` is empty this is the plain float
+/// search (byte-identical structure to `greedy_tensor_search_oblivious`), with
+/// empty `ctr_splits` / `level_kinds`.
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `depth > MAX_DEPTH` (before allocation).
+/// - [`CbError::Degenerate`] if a level has no candidate split at all.
+#[allow(clippy::too_many_arguments)]
+pub fn greedy_tensor_search_oblivious_with_ctr(
+    matrix: &FeatureMatrix,
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    ctr_border_count: usize,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    depth: usize,
+    n_objects: usize,
+    target_border_idx: usize,
+) -> CbResult<GrownTree> {
+    check_depth(depth)?;
+
+    let mut chosen: Vec<CtrAwareSplit> = Vec::with_capacity(depth);
+    for _level in 0..depth {
+        let best = select_level_ctr_aware(
+            matrix,
+            ctr_features,
+            ctr_border_count,
+            &chosen,
+            der1,
+            weight,
+            scaled_l2,
+            n_objects,
+        )?;
+        chosen.push(best);
+    }
+
+    let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, &chosen, n_objects);
+
+    // Split the chosen unified splits back into the parallel `splits` / `ctr_splits`
+    // vectors, recording each level's kind so the forward-bit leaf index (and Plan
+    // 05-13 Task 2's averaging-fold reassignment) can rebuild the partition in
+    // level order.
+    let mut splits: Vec<Split> = Vec::new();
+    let mut ctr_splits: Vec<CtrSplitSpec> = Vec::new();
+    let mut level_kinds: Vec<LevelKind> = Vec::with_capacity(chosen.len());
+    for split in &chosen {
+        match split {
+            CtrAwareSplit::Float(s) => {
+                level_kinds.push(LevelKind::Float(splits.len()));
+                splits.push(*s);
+            }
+            CtrAwareSplit::Ctr { col, border } => {
+                // Recover the projection / prior PAIR / ctr_type from the winning
+                // column; the chosen CTR-value border is the structure threshold
+                // (Plan 05-14 reconciles Scale/Shift so apply compares in the same
+                // space). A missing column index is a degenerate internal error.
+                let column = ctr_features.get(*col).ok_or_else(|| {
+                    CbError::Degenerate(
+                        "ctr search: chosen CTR column index out of range".to_owned(),
+                    )
+                })?;
+                level_kinds.push(LevelKind::Ctr {
+                    ctr_idx: ctr_splits.len(),
+                    border: *border,
+                });
+                ctr_splits.push(CtrSplitSpec {
+                    projection: column.projection.clone(),
+                    ctr_type: column.ctr_type,
+                    prior_num: column.prior_num,
+                    prior_denom: column.prior_denom,
+                    target_border_idx,
+                    border: *border,
+                });
+            }
+        }
+    }
+
+    Ok(GrownTree {
+        splits,
+        leaf_of,
+        ctr_splits,
+        level_kinds,
     })
 }
 
