@@ -325,7 +325,12 @@ pub fn combinations_ctr_priors_default() -> Vec<f64> {
 /// - `weights[doc]` — object `doc`'s weight (empty ⇒ all `1.0`).
 /// - `permutation[p]` — the object at learn-order position `p`.
 /// - `body_finish` / `tail_finish` — the segment boundary (learn-order positions).
-/// - `body_sum_weight` — the body prefix's summed weight (`fold.cpp:170-172`).
+/// - `_body_sum_weight` — the body prefix's summed weight (`fold.cpp:170-172`).
+///   Part of the public signature (consumed by 05-05/05-10 wiring); the simple
+///   Gradient delta reads the per-leaf running weight, so this prefix total is
+///   not read here (WR-01 cleanup — the dead running-total accumulator that
+///   carried it is removed). `_`-prefixed to mark it unused without changing the
+///   parameter list/order callers depend on.
 /// - `n_leaves` — the tree's leaf count.
 /// - `scaled_l2` — the L2 regularizer ([`cb_compute::scale_l2_reg`]).
 ///
@@ -345,7 +350,7 @@ pub fn ordered_approx_delta_simple(
     permutation: &[i32],
     body_finish: usize,
     tail_finish: usize,
-    body_sum_weight: f64,
+    _body_sum_weight: f64,
     n_leaves: usize,
     scaled_l2: f64,
 ) -> CbResult<Vec<f64>> {
@@ -383,10 +388,6 @@ pub fn ordered_approx_delta_simple(
         }
     }
 
-    // The running total weight starts at the body prefix's summed weight
-    // (upstream `double sumWeights = bodySumWeight;`).
-    let mut sum_weights = body_sum_weight;
-
     // Walk the TAIL rows in permutation order; add-then-read the running delta.
     for p in body_finish..tail_finish.min(n) {
         let Some(&doc_i) = permutation.get(p) else {
@@ -403,7 +404,6 @@ pub fn ordered_approx_delta_simple(
         } else {
             weights.get(doc).copied().unwrap_or(1.0)
         };
-        sum_weights += w;
         // AddMethodDer: this row's der/weight enters its leaf's running sum.
         if let (Some(sd), Some(sw)) = (leaf_sum_der.get_mut(leaf), leaf_sum_weight.get_mut(leaf)) {
             *sd += d;
@@ -417,11 +417,6 @@ pub fn ordered_approx_delta_simple(
         if let Some(slot) = approx_delta.get_mut(doc) {
             *slot = delta;
         }
-        // `sum_weights` mirrors upstream's running total; the simple Gradient
-        // delta uses the per-leaf weight, so `sum_weights` is carried for parity
-        // bookkeeping (the multi-leaf pooled denom variant) without changing the
-        // single-leaf delta above.
-        let _ = sum_weights;
     }
 
     Ok(approx_delta)
