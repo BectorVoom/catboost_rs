@@ -29,8 +29,13 @@
 //! [`CbError::DepthExceeded`] BEFORE any `2^depth` allocation (T-03-01-02). No
 //! `unwrap`/`expect`/raw float fold (deny-lints + D-08).
 
-use cb_compute::{l2_split_score, random_score_instance, reduce_leaf_stats, LeafStats, MINIMAL_SCORE};
+use cb_compute::{
+    l2_split_score, random_score_instance, reduce_leaf_stats, scale_l2_reg, LeafStats,
+    MINIMAL_SCORE,
+};
 use cb_core::{CbError, CbResult, TFastRng64};
+
+use crate::fold::{body_sum_weights, body_tail_segments};
 
 // Tests live in dedicated sibling files (source/test separation, CLAUDE.md /
 // AGENTS.md — no test body in this production file). Mounted as CHILD modules of
@@ -44,6 +49,10 @@ mod general;
 #[cfg(test)]
 #[path = "tree_tie_break_test.rs"]
 mod tie_break;
+
+#[cfg(test)]
+#[path = "tree_ordered_test.rs"]
+mod ordered;
 
 /// Maximum supported tree depth (upstream `MaxDepth`). Capping `depth <= 16`
 /// keeps `2^depth` within `usize` and bounds leaf-buffer allocation.
@@ -507,6 +516,291 @@ fn select_level_perturbed(
 
     chosen_split.ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+    })
+}
+
+// ===========================================================================
+// ORD-02 ordered split-scoring subsystem (the structural heart of Ordered
+// boosting — per-segment ordered L2 score over the learning fold's BodyTailArr)
+// ===========================================================================
+//
+// # Why Ordered trees differ from Plain
+//
+// The Plain search (`select_level_plain`) scores every candidate on the WHOLE
+// fold (`reduce_leaf_stats` over all objects, one `l2_split_score`). Ordered
+// boosting instead scores a candidate by SUMMING its per-segment ordered L2
+// score across the learning fold's `BodyTailArr` (`scoring.cpp:746-760`
+// `CalculateNonPairwiseScore`: `for bodyTailIdx in 0..GetBodyTailCount()` the
+// score calcer's `AddLeaf` is additive, so the final candidate score is the SUM
+// over segments). Each segment `(body_finish, tail_finish)` uses a per-segment
+// `scaledL2 = l2 * (BodySumWeight / BodyFinish)` (`scoring.cpp:746-748`,
+// `online_predictor.h::ScaleL2Reg` = [`scale_l2_reg`]).
+//
+// # Per-segment stats
+//
+// `scoring.cpp:283-308` `CalcStatsKernel` non-plain branch: the BODY range
+// `[0, body_finish)` contributes `WeightedDerivatives` and the TAIL range
+// `[body_finish, tail_finish)` contributes `SampleWeightedDerivatives` — both
+// into the SAME per-leaf stats for that segment. Under the in-scope
+// `ordered_boost` fixture `random_strength == 0` ⇒ NO bootstrap perturbation ⇒
+// `SampleWeightedDerivatives == WeightedDerivatives` (no RNG draws here, the
+// D-11 multi-tree Box-Muller drift does NOT apply). So a segment accumulates the
+// SAME per-object `der`/`weight` over BOTH the body rows and the tail rows, in
+// permutation order, into the candidate's leaf buckets, then folds
+// `l2_split_score(stats, scaledL2_segment)`.
+//
+// The leaf VALUES (downstream, 05-10) still come from `CalcLeafValuesSimple` on
+// the AVERAGING fold exactly as Plain (STATE.md re-scope note), so `leaf_of` is
+// assigned over the object order (forward-bit `leaf_index`) like the Plain path.
+
+/// Per-segment ordered leaf statistics for ONE candidate split: accumulate the
+/// candidate's per-leaf `(sum_weighted_delta, sum_weight)` over the segment's
+/// BODY rows `[0, body_finish)` then TAIL rows `[body_finish, tail_finish)`, both
+/// walked in `permutation` order (`scoring.cpp:283-308` non-plain branch). Under
+/// `random_strength == 0` the tail's `SampleWeightedDerivatives` equals the body's
+/// `WeightedDerivatives`, so both ranges accumulate the SAME `der`/`weight`.
+///
+/// Bounds are checked: a permutation index out of range, or a `der`/`weight`
+/// slice shorter than the document it indexes, returns [`CbError::Degenerate`]
+/// (T-05-08-01/02 — no raw index, no panic). The final per-leaf sums route
+/// through [`reduce_leaf_stats`] so the fold order is the sanctioned `sum_f64`
+/// object order (D-08, T-05-08-03).
+fn ordered_segment_leaf_stats(
+    leaf_of: &[usize],
+    der1: &[f64],
+    weight: &[f64],
+    permutation: &[i32],
+    body_finish: usize,
+    tail_finish: usize,
+    n_leaves: usize,
+) -> CbResult<Vec<LeafStats>> {
+    // Gather this segment's member objects (body ∪ tail) in permutation order,
+    // along with their parallel der/weight, then reduce via the sanctioned
+    // primitive so the sum order is the canonical object order (D-08).
+    let mut seg_leaf_of: Vec<usize> = Vec::new();
+    let mut seg_der: Vec<f64> = Vec::new();
+    let mut seg_weight: Vec<f64> = Vec::new();
+
+    let n = permutation.len();
+    let upper = tail_finish.min(n);
+    // Walk [0, tail_finish): the BODY rows [0, body_finish) then the TAIL rows
+    // [body_finish, tail_finish) are accumulated identically (random_strength == 0
+    // ⇒ SampleWeightedDerivatives == WeightedDerivatives), so a single contiguous
+    // walk over [0, tail_finish) is exact. `body_finish` is retained in the
+    // signature to document the body/tail split the segment represents.
+    let _ = body_finish;
+    for p in 0..upper {
+        let Some(&doc_i) = permutation.get(p) else {
+            return Err(CbError::Degenerate(
+                "ordered score: permutation index out of range".to_owned(),
+            ));
+        };
+        if doc_i < 0 {
+            return Err(CbError::Degenerate(
+                "ordered score: negative permutation index".to_owned(),
+            ));
+        }
+        let doc = doc_i as usize;
+        let (Some(&leaf), Some(&d)) = (leaf_of.get(doc), der1.get(doc)) else {
+            return Err(CbError::Degenerate(
+                "ordered score: leaf_of / der shorter than permutation".to_owned(),
+            ));
+        };
+        let w = if weight.is_empty() {
+            1.0
+        } else {
+            match weight.get(doc) {
+                Some(&w) => w,
+                None => {
+                    return Err(CbError::Degenerate(
+                        "ordered score: weight shorter than permutation".to_owned(),
+                    ))
+                }
+            }
+        };
+        seg_leaf_of.push(leaf);
+        seg_der.push(d);
+        seg_weight.push(w);
+    }
+
+    Ok(reduce_leaf_stats(&seg_leaf_of, &seg_der, &seg_weight, n_leaves))
+}
+
+/// Score one candidate split with the ORDERED per-segment sum (the ordered analog
+/// of [`score_candidate`]): extend `chosen` with `candidate`, assign leaves over
+/// the object order, then for each `(body_finish, tail_finish)` segment compute
+/// the per-segment `scaledL2 = l2 * (body_sum_weight / body_finish)`
+/// ([`scale_l2_reg`], `scoring.cpp:746-748`), fold `l2_split_score`, and SUM
+/// across all segments (`scoreCalcer->AddLeaf` additive over `bodyTailIdx`,
+/// `scoring.cpp:746-760`).
+///
+/// `segments` and `seg_body_sum_weights` are paired index-for-index (segment `s`
+/// uses `segments[s]` and `seg_body_sum_weights[s]`). A segment with
+/// `body_finish == 0` would divide by zero in the scaled L2; [`scale_l2_reg`]
+/// guards that by returning `l2` directly (T-05-08-02), and `body_tail_segments`
+/// never emits a zero `body_finish` (floor `SelectMinBatchSize ≥ 1`).
+///
+/// The per-segment sums route through [`reduce_leaf_stats`]/[`l2_split_score`]
+/// (D-08); the cross-segment sum is a short accumulation of the per-segment
+/// scores, folded via `sum_f64` for the sanctioned reduction discipline.
+#[allow(clippy::too_many_arguments)]
+fn score_candidate_ordered(
+    matrix: &FeatureMatrix,
+    chosen: &[Split],
+    candidate: Split,
+    der1: &[f64],
+    weight: &[f64],
+    permutation: &[i32],
+    segments: &[(usize, usize)],
+    seg_body_sum_weights: &[f64],
+    l2_leaf_reg: f64,
+    n_objects: usize,
+) -> CbResult<f64> {
+    let mut splits = chosen.to_vec();
+    splits.push(candidate);
+    let n_leaves = 1usize << splits.len();
+    let leaf_of = assign_leaves(matrix, &splits, n_objects);
+
+    let mut segment_scores: Vec<f64> = Vec::with_capacity(segments.len());
+    for (idx, &(body_finish, tail_finish)) in segments.iter().enumerate() {
+        let body_sum_weight = seg_body_sum_weights.get(idx).copied().unwrap_or(0.0);
+        // Per-segment scaled L2 = l2 * (BodySumWeight / BodyFinish)
+        // (scoring.cpp:746-748). scale_l2_reg guards body_finish == 0.
+        let scaled_l2_segment = scale_l2_reg(l2_leaf_reg, body_sum_weight, body_finish);
+        let stats = ordered_segment_leaf_stats(
+            &leaf_of,
+            der1,
+            weight,
+            permutation,
+            body_finish,
+            tail_finish,
+            n_leaves,
+        )?;
+        segment_scores.push(l2_split_score(&stats, scaled_l2_segment));
+    }
+    Ok(cb_core::sum_f64(&segment_scores))
+}
+
+/// One level of the ORDERED search: enumerate candidates in the SAME upstream
+/// order as [`select_level_plain`] (float feature ascending, border ascending —
+/// the in-scope `ordered_boost` fixture is numeric-only), score each via the
+/// segment-summed ordered L2 ([`score_candidate_ordered`]), and pick the strict
+/// first-wins best via the SAME [`select_best_candidate`] discipline (strict `>`,
+/// feature asc then border asc; Pitfall 1). No RNG draws (`random_strength == 0`).
+#[allow(clippy::too_many_arguments)]
+fn select_level_ordered(
+    matrix: &FeatureMatrix,
+    chosen: &[Split],
+    der1: &[f64],
+    weight: &[f64],
+    permutation: &[i32],
+    segments: &[(usize, usize)],
+    seg_body_sum_weights: &[f64],
+    l2_leaf_reg: f64,
+    n_objects: usize,
+) -> CbResult<Split> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        for &border in borders {
+            let score = score_candidate_ordered(
+                matrix,
+                chosen,
+                Split { feature, border },
+                der1,
+                weight,
+                permutation,
+                segments,
+                seg_body_sum_weights,
+                l2_leaf_reg,
+                n_objects,
+            )?;
+            candidates.push(Candidate {
+                feature,
+                border,
+                score,
+            });
+        }
+    }
+    let best = select_best_candidate(&candidates).ok_or_else(|| {
+        CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+    })?;
+    Ok(Split {
+        feature: best.feature,
+        border: best.border,
+    })
+}
+
+/// Grow one oblivious tree with the ORDERED per-segment split-scoring subsystem
+/// (the structural heart of ORD-02). Per level `0..depth`, each candidate is
+/// scored by SUMMING its per-segment ordered L2 score across the learning fold's
+/// `body_tail_segments(n_objects, fold_len_multiplier)` (each segment's
+/// `scaledL2 = l2 * (BodySumWeight / BodyFinish)`), then the strict first-wins
+/// best is chosen ([`select_best_candidate`], `>` not `>=`). After `depth` levels
+/// `leaf_of` is assigned over the object order (forward-bit `leaf_index`) so the
+/// downstream leaf-value estimation (05-10) runs on the averaging fold exactly as
+/// Plain (`CalcLeafValuesSimple`).
+///
+/// `permutation` is the learning fold's object permutation (the order the body/
+/// tail rows are walked); `der1`/`weight` are object-order parallel slices. The
+/// per-segment `BodySumWeight` is derived from `body_sum_weights(n_objects,
+/// fold_len_multiplier, weight)` (the same fold machinery 05-03 locked).
+///
+/// # Degeneration anchor
+///
+/// At a single full-span segment `[(n, n)]` (the plain `body_tail_segments`
+/// degenerate case) AND the identity permutation, the segment-summed ordered
+/// score reduces to the plain whole-fold L2 score, so this produces the SAME
+/// splits as [`greedy_tensor_search_oblivious`] (falsifiable degeneration anchor,
+/// unit-locked in `tree_ordered_test.rs`).
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `depth > MAX_DEPTH` (before allocation).
+/// - [`CbError::Degenerate`] if a level has no candidate split, or a permutation
+///   index / body-tail boundary is out of range (T-05-08-01/02).
+#[allow(clippy::too_many_arguments)]
+pub fn greedy_tensor_search_oblivious_ordered(
+    matrix: &FeatureMatrix,
+    der1: &[f64],
+    weight: &[f64],
+    permutation: &[i32],
+    l2_leaf_reg: f64,
+    fold_len_multiplier: f64,
+    depth: usize,
+    n_objects: usize,
+) -> CbResult<GrownTree> {
+    check_depth(depth)?;
+
+    // The learning fold's BodyTailArr for this object count + multiplier, and the
+    // per-segment body prefix weights (fold.rs, 05-03 — consume, do not re-port).
+    let segments = body_tail_segments(n_objects, fold_len_multiplier);
+    if segments.is_empty() {
+        return Err(CbError::Degenerate(
+            "ordered search: empty body/tail segments (n_objects == 0)".to_owned(),
+        ));
+    }
+    let seg_body_sum_weights = body_sum_weights(n_objects, fold_len_multiplier, weight);
+
+    let mut chosen: Vec<Split> = Vec::with_capacity(depth);
+    for _level in 0..depth {
+        let best = select_level_ordered(
+            matrix,
+            &chosen,
+            der1,
+            weight,
+            permutation,
+            &segments,
+            &seg_body_sum_weights,
+            l2_leaf_reg,
+            n_objects,
+        )?;
+        chosen.push(best);
+    }
+
+    let leaf_of = assign_leaves(matrix, &chosen, n_objects);
+    Ok(GrownTree {
+        splits: chosen,
+        leaf_of,
     })
 }
 

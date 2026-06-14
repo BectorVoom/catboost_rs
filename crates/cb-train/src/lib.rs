@@ -58,7 +58,7 @@ pub use boosting::{
     EBoostingType, EvalSet, Model, ObliviousTree,
 };
 pub use tree::{
-    check_depth, greedy_tensor_search_oblivious, grow_one_hot_tree, leaf_index,
-    select_best_candidate, AnySplit, Candidate, FeatureMatrix, GrownOneHotTree, GrownTree,
-    OneHotSplit, Split, MAX_DEPTH,
+    check_depth, greedy_tensor_search_oblivious, greedy_tensor_search_oblivious_ordered,
+    grow_one_hot_tree, leaf_index, select_best_candidate, AnySplit, Candidate, FeatureMatrix,
+    GrownOneHotTree, GrownTree, OneHotSplit, Split, MAX_DEPTH,
 };
