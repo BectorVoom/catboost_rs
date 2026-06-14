@@ -216,7 +216,7 @@ Plans:
 
 **Wave 7** *(gap closure — blocks on existing 05-01..05-06; from 05-VERIFICATION.md gaps_found)*
 
-- [ ] 05-07-PLAN.md — GAP 3 (CR-01, ORD-01/ORD-03): fix ordered_oracle.cpp to continuous-stream multi-fold seeding (single persistent TFastRng64 across folds, matching create_folds/permutations); regenerate ordered_ctr/permutation_fold1.npy; re-key the D-03 fold-1 gate to permutations(30,2,0)[1] so the production permutations() is validated integer-exact for k≥1 (was self-consistency-only)
+- [x] 05-07-PLAN.md — GAP 3 (CR-01, ORD-01/ORD-03): fix ordered_oracle.cpp to continuous-stream multi-fold seeding (single persistent TFastRng64 across folds, matching create_folds/permutations); regenerate ordered_ctr/permutation_fold1.npy; re-key the D-03 fold-1 gate to permutations(30,2,0)[1] so the production permutations() is validated integer-exact for k≥1 (was self-consistency-only)
 - [ ] 05-08-PLAN.md — GAP 1 (ORD-02): wire ordered_approx_delta_simple into train() under EBoostingType::Ordered (no longer dead code); new ordered_boost_e2e fixture (X/y/model.json/predictions, D-09 offline); end-to-end ordered train→predict ≤1e-5 + in-training per-object no-leakage anchor
 
 **Wave 8** *(gap closure — blocks on 05-08; shares boosting.rs)*

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Completed 05-06-PLAN.md (ORD-05 tensor / combination CTRs; Phase 5 additive ladder complete)
-last_updated: "2026-06-14T01:20:56.479Z"
-last_activity: 2026-06-14 -- Plan 05-06 complete (tensor / combination CTRs; ORD-05 closed; Phase 5 additive ladder complete)
+status: executing
+stopped_at: Completed 05-07-PLAN.md (CR-01 multi-fold permutation oracle fix)
+last_updated: "2026-06-14T01:34:28.771Z"
+last_activity: 2026-06-14 -- Phase 05 execution started
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 28
-  completed_plans: 28
-  percent: 54
+  total_plans: 31
+  completed_plans: 29
+  percent: 50
 ---
 
 # Project State
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 6 of 6
-Status: Phase plans complete (all 6 of 6)
-Last activity: 2026-06-14 -- Plan 05-06 complete (tensor / combination CTRs; ORD-05 closed; Phase 5 additive ladder complete)
+Plan: 2 of 9
+Status: Ready to execute
+Last activity: 2026-06-14 -- Phase 05 execution started
 
 Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 
@@ -81,6 +81,7 @@ Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 | Phase 05 P04 | 19min | 3 tasks | 21 files |
 | Phase 05 P05 | 16min | 2 tasks | 18 files |
 | Phase 05 P06 | 14min | 2 tasks | 21 files |
+| Phase 05 P07 | 9min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -150,6 +151,7 @@ Recent decisions affecting current work:
 - [Phase 05]: Plan 05-04 COMPLETE (ORD-03 / D-06): Plain-mode CTR locked — six-type whole-set math (online +1 vs inference +PriorDenom CalcCTR separate; Counter-max vs FeatureFreq-total denom Pitfall 4; FloatTargetMeanValue final-path-only Pitfall 5) + online_ctr_prefix_binclf read-before-increment no-leakage prefix; cb-model::ctr_data CtrValueTable serde over model.json hash_map + self-describing .cbm BlobReader (bounds-before-slice, malformed/oversized/OOB -> typed ModelError, Security V5); per-type inference Calc + not-found->empty; cat-hash via calc_cat_feature_hash never model hash_map. ECtrType duplicated in cb-train (below cb-model); BoostParams dropped Copy for owned simple_ctr_priors. plain_ctr oracle: Stage::Permutation (D-03) then Stage::OnlineCtr <=1e-5 (transcribe-then-self-oracle, fixture commits only per-object OUTPUT .npy).
 - [Phase 05]: Plan 05-06 COMPLETE (ORD-05 / D-05, FINAL rung): feature combinations / tensor CTRs = the SAME single-feature online read-before-increment accumulation (05-04/05-05) over a COMBINED projection hash, not new CTR math. cb-train::projection — TProjection (sorted CatFeatures combination), calc_hash (hash.h MAGIC_MULT=0x4906ba494954cb65 fold), fold_cat_hash (ctr_provider.h:72 SIGN-EXTENDED (ui64)(int) cast — the parity landmine for top-bit-set hashes), combined_hash, enumerate_projections bounded by GetFullProjectionLength <= max_ctr_complexity (AddTreeCtrs gate). candidates::tensor_ctr_candidates emits SimpleCtrs (len 1) + CombinationCtrs (len >= 2) over CTR-eligible features (one-hot/skip excluded). BoostParams.{max_ctr_complexity(default 4),combinations_ctr(Borders),combinations_ctr_priors(0.5)} pinned via *_default() across all 14 literals. cb-model::ctr_value_for_combined_projection folds each member's calc_cat_feature_hash into the combined key (NEVER the model hash_map), then the SAME per-type Calc + not-found->empty (T-05-06-V5). (Rule 3) tensor oracle locks D-03 permutation -> per-object (good,total) exact -> combined OnlineCtr <=1e-5 + combined-projection accumulation + single-feature degeneration; full train->predict is the accepted D-09 residual (cat0/cat1/target inputs uncommitted). Phase 5 additive ladder COMPLETE: one-hot -> permutation -> Plain CTR -> Ordered CTR -> Ordered boosting -> tensor CTR all oracle-locked.
 - [Phase 05]: Plan 05-05 COMPLETE (ORD-02 / ORD-03 ordered half, D-05/D-06): ordered (per-permutation prefix) CTR = the 05-04 read-before-increment loop UNDER a specific permutation (ordered_ctr_per_permutation/OrderedCtrPrefix; per-step running num/denom + per_bucket_monotone anchor); ordered boosting approximant ordered_approx_delta_simple (UpdateApproxDeltasHistoricallyImpl approx_calcer.cpp:566-600 — body-seeded running per-leaf der/weight, add-then-read Gradient delta over the tail in permutation order; tail doc never depends on itself, body docs keep delta 0). EBoostingType{Plain,Ordered}+BoostParams.boosting_type pinned via boosting_type_default() (CPU default Plain, Ordered=GPU-only Pitfall 6), propagated across all 13 literals. Oracles: D-03 permutation gate FIRST then per-object integer anchors exact + values <=1e-5 + monotone/identity-degeneration. (Rule 3) ordered_ctr fold-1 uses a PER-FOLD RESEED fisher_yates(N, seed+foldIdx) [fold0<-seed0, fold1<-seed1, confirmed] NOT the continuous-stream draw; (Rule 3) ordered approx validated via structural+indirect anchors (A2 residual) since fold inputs uncommitted (D-09). ordered_approx_delta_simple oracle-tested standalone, NOT wired into the whole-set train driver (Plain path unchanged; no numeric/one-hot regression).
+- [Phase ?]: [Phase 05]: Plan 05-07 (CR-01 CLOSED): multi-fold permutation oracle fixed to continuous-stream — ordered_oracle.cpp GenMultiFoldPermutations draws ALL folds from ONE persistent TFastRng64::FromSeed (never reseeded per fold), matching permutation.rs::permutations / fold.rs::create_folds and upstream learn_context.cpp shared TRestorableFastRng64. permutation_fold1.npy regenerated = permutations(30,2,0)[1] (fold0 byte-identical); D-03 fold-1 gate re-keyed to permutations(30,2,0)[1] integer-exact, asserts permutations(30,2,0)[0]==fisher_yates_permutation(30,0). Production permutations() now validated for k=0 AND k=1. Only fold1 overwritten; ctr_*/ordered_approx/body_tail untouched (D-09).
 
 ### Pending Todos
 
@@ -176,6 +178,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-14T01:00:00.000Z
-Stopped at: Completed 05-06-PLAN.md (ORD-05 tensor / combination CTRs; Phase 5 additive ladder complete)
+Last session: 2026-06-14T01:34:22.098Z
+Stopped at: Completed 05-07-PLAN.md (CR-01 multi-fold permutation oracle fix)
 Resume file: None
