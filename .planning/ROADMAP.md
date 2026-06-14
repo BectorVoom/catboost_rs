@@ -186,7 +186,7 @@ Plans:
   4. One-hot encoding for low-cardinality categoricals (`one_hot_max_size` threshold) selects the correct encoding path.
   5. Feature combinations (tensor CTRs — `SimpleCtrs`/`CombinationCtrs`, `max_ctr_complexity` control) produce models matching upstream ≤1e-5 on categorical datasets.
 
-**Plans**: 9 plans in 8 waves (additive isolation ladder waves 1-6: one-hot → permutation → Plain CTR → Ordered CTR → Ordered boosting → tensor CTR; gap-closure waves 7-8 wire Ordered boosting + tensor CTRs into train() and fix the multi-fold permutation oracle, per 05-VERIFICATION.md)
+**Plans**: 10 plans in 9 waves (additive isolation ladder waves 1-6: one-hot → permutation → Plain CTR → Ordered CTR → Ordered boosting → tensor CTR; gap-closure waves 7-9: wave 7 fixed the multi-fold permutation oracle (05-07) + built the ordered split-scoring subsystem in tree.rs (05-08, the ORD-02 re-scope per STATE.md 2026-06-14); wave 8 wires ordered boosting into train() + locks the FULL multi-tree ordered e2e oracle (05-10); wave 9 wires tensor CTRs into train() (05-09) — per 05-VERIFICATION.md, the ORD-02 e2e bar is a full multi-tree hard gate, no #[ignore])
 
 Plans:
 
@@ -217,11 +217,15 @@ Plans:
 **Wave 7** *(gap closure — blocks on existing 05-01..05-06; from 05-VERIFICATION.md gaps_found)*
 
 - [x] 05-07-PLAN.md — GAP 3 (CR-01, ORD-01/ORD-03): fix ordered_oracle.cpp to continuous-stream multi-fold seeding (single persistent TFastRng64 across folds, matching create_folds/permutations); regenerate ordered_ctr/permutation_fold1.npy; re-key the D-03 fold-1 gate to permutations(30,2,0)[1] so the production permutations() is validated integer-exact for k≥1 (was self-consistency-only)
-- [ ] 05-08-PLAN.md — GAP 1 (ORD-02): wire ordered_approx_delta_simple into train() under EBoostingType::Ordered (no longer dead code); new ordered_boost_e2e fixture (X/y/model.json/predictions, D-09 offline); end-to-end ordered train→predict ≤1e-5 + in-training per-object no-leakage anchor
+- [ ] 05-08-PLAN.md — GAP 1 (ORD-02) Part 1/2 — ORDERED SPLIT-SCORING SUBSYSTEM: the previous 05-08 (wire approximant into leaf-update only) was UNDER-SCOPED (STATE.md 2026-06-14: ordered vs plain differ in tree STRUCTURE, not just leaf update). Build greedy_tensor_search_oblivious_ordered in tree.rs — per-segment ordered split scoring over the learning fold's BodyTailArr (segment-summed ordered L2, per-segment scaled L2 = l2*(BodySumWeight/BodyFinish), scoring.cpp:746-760), strict-first-wins preserved, degenerating to the plain search at a single full-span segment; + WR-01 dead sum_weights cleanup; unit-locked standalone
 
-**Wave 8** *(gap closure — blocks on 05-08; shares boosting.rs)*
+**Wave 8** *(gap closure — blocks on 05-08; shares boosting.rs + tree.rs)*
 
-- [ ] 05-09-PLAN.md — GAP 2 (ORD-05): wire tensor_ctr_candidates into train() candidate generation under max_ctr_complexity + CTR-split evaluation in cb-model apply (combined hash via calc_cat_feature_hash + baked ctr_data, bounds-safe); new tensor_ctr_e2e categorical fixture; end-to-end tensor-CTR train→predict ≤1e-5
+- [ ] 05-10-PLAN.md — GAP 1 (ORD-02) Part 2/2 — WIRE + E2E HARD GATE: branch train_with_eval_sets() on EBoostingType::Ordered — build folds ONCE (create_folds), grow tree STRUCTURE via greedy_tensor_search_oblivious_ordered (05-08) over the learning fold, estimate leaf VALUES on the averaging fold (Plain-identical CalcLeafValuesSimple); ordered per-iteration RNG draw accounting (folds created once, random_strength=0 ⇒ no Box-Muller D-11 drift); new ordered_boost_e2e fixture (X/y/model.json/predictions, D-09 offline); FULL multi-tree ordered train→predict ≤1e-5 across ALL trees, NO #[ignore], + in-training per-object no-leakage anchor
+
+**Wave 9** *(gap closure — blocks on 05-10; shares boosting.rs + apply.rs)*
+
+- [ ] 05-09-PLAN.md — GAP 2 (ORD-05): wire tensor_ctr_candidates into train() candidate generation under max_ctr_complexity + CTR-split evaluation in cb-model apply (combined hash via calc_cat_feature_hash + baked ctr_data, bounds-safe); new tensor_ctr_e2e categorical fixture; end-to-end tensor-CTR train→predict ≤1e-5 across ALL trees, NO #[ignore] (consistent with the ORD-02 multi-tree bar)
 
 **Research flag (RESOLVED)**: line-by-line read of `approx_calcer.cpp` + `online_ctr.*` complete (05-RESEARCH.md, file:line citations); per-object oracle schema designed (D-02). Research ESCALATION resolved: the D-01 TU-linking mechanism is infeasible; the user-approved **transcribe-then-self-oracle** replacement (05-CONTEXT DECISION REVISION 2026-06-14) is the mechanism used.
 
