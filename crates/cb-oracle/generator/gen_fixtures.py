@@ -80,6 +80,14 @@ LOSS_EXTRA = FIXTURES / "loss_extra"
 # predictions) for boosting_type=Ordered so the multi-tree e2e oracle validates
 # final predictions through the production cb_model::predict_raw apply path.
 ORDERED_BOOST_E2E = FIXTURES / "ordered_boost_e2e"
+# Phase-5 (Plan 05-09, ORD-05) end-to-end TENSOR-CTR train->predict fixture root.
+# Closes the D-09 omission of the prior `tensor_ctr/` fixture (per-object combined
+# CTR internals only, no inputs/model): this carries the FULL train->predict stack
+# (X_cat/y/model.json WITH baked ctr_data/predictions) for a categorical model
+# trained with simple_ctr + combinations_ctr + max_ctr_complexity, so the e2e
+# oracle validates final predictions through the production cb_model::predict_raw
+# CTR-split apply path (ModelSplit::Ctr) ≤1e-5 across ALL trees.
+TENSOR_CTR_E2E = FIXTURES / "tensor_ctr_e2e"
 
 # ---------------------------------------------------------------------------
 # PHASE-4 FIXTURE MANIFEST (D-13) — every NEW fixture path the downstream Wave-2..5
@@ -1879,6 +1887,146 @@ def gen_ordered_boost_e2e() -> None:
         fh.write("\n")
 
 
+def gen_tensor_ctr_e2e() -> None:
+    """tensor_ctr_e2e/ — the FULL multi-tree TENSOR-CTR train->predict oracle
+    (ORD-05, Plan 05-09, the gap-closure for the D-09 omission of `tensor_ctr/`).
+
+    The prior `tensor_ctr/` fixture committed only per-object combined-CTR
+    internals (permutation + good/total/value over the combined projection) and
+    OMITTED the input cat columns/labels AND the trained model with its baked
+    `ctr_data`, so it could not validate a full categorical train->predict stack
+    (D-09). This scenario commits the WHOLE stack — `X_cat.npy` (the raw
+    categorical columns, integer categories stringified per A4), `y.npy` (Logloss
+    labels), `model.json` (the upstream catboost 1.2.10 model trained with
+    simple_ctr + combinations_ctr + max_ctr_complexity=2, INCLUDING the baked
+    `ctr_data` section), and `predictions.npy` (upstream RawFormulaVal) — so the
+    Rust e2e oracle (`tensor_ctr_e2e_oracle_test.rs`) trains the SAME isolating
+    config via `cb_train::train`, lifts the model into `cb_model::Model` (with the
+    baked ctr_data), predicts via the PRODUCTION `cb_model::predict_raw` /
+    `predict_raw_cat` apply path (the ModelSplit::Ctr evaluation), and asserts
+    ≤1e-5 vs these `predictions.npy` across ALL iterations/trees (no `#[ignore]`).
+
+    ISOLATING CONFIG (mirrors `tensor_ctr/config.json`): boosting_type=Plain,
+    one_hot_max_size=1, max_ctr_complexity=2, simple_ctr=["Borders:Prior=0.5"],
+    combinations_ctr=["Borders:Prior=0.5"], permutation_count=1,
+    fold_len_multiplier=2.0, counter_calc_method=SkipTest, depth=2, iterations=5,
+    learning_rate=0.1, l2_leaf_reg=3.0, leaf_estimation_method=Gradient,
+    leaf_estimation_iterations=1, bootstrap_type=No, random_strength=0,
+    random_seed=0, thread_count=1, loss_function=Logloss. Two cat features each
+    above one_hot_max_size (cardinalities 5 and 4) so a genuine 2-feature
+    combination is formed.
+
+    OFFLINE / RUN-ONCE (D-12): catboost is NOT importable in CI; this is generated
+    on a machine with `catboost==1.2.10` then COMMITTED. CI only READS the
+    committed `.npy`/`model.json`. The dataset is a small deterministic categorical
+    corpus (N=30, 2 cat features) synthesized here with a fixed seed so the fixture
+    is reproducible in isolation.
+    """
+    TENSOR_CTR_E2E.mkdir(parents=True, exist_ok=True)
+
+    # Deterministic small categorical dataset (N=30, 2 integer-coded cat features
+    # with cardinalities 5 and 4 — both above one_hot_max_size=1 so the CTR path
+    # and a genuine 2-feature combination are exercised). Fixed seed so the corpus
+    # is reproducible without an external input file.
+    rng = np.random.default_rng(SEED)
+    n_rows = 30
+    cat0 = rng.integers(0, 5, size=n_rows)  # cardinality 5
+    cat1 = rng.integers(0, 4, size=n_rows)  # cardinality 4
+    # A label with mild dependence on the (cat0, cat1) combination + small noise,
+    # binarized to a balanced-ish Logloss target.
+    logit = 0.6 * cat0.astype(np.float64) - 0.4 * cat1.astype(np.float64)
+    logit = logit - logit.mean() + rng.normal(0.0, 0.5, size=n_rows)
+    y = (logit > 0.0).astype(np.float64)
+
+    # X_cat: the raw categorical columns as INTEGER CODES ([N, 2] int32). The
+    # Rust oracle stringifies each via cb_data::stringify_int_category (A4 — the
+    # PLAIN-integer form cb_data::calc_cat_feature_hash hashes), which is also the
+    # form fed to upstream's Pool below (catboost stringifies integer categoricals
+    # the same way). int32 keeps the npy loadable by ndarray-npy (no str-npy dep).
+    x_cat = np.stack([cat0.astype(np.int32), cat1.astype(np.int32)], axis=1)
+    np.save(TENSOR_CTR_E2E / "X_cat.npy", x_cat, allow_pickle=False)
+    np.save(TENSOR_CTR_E2E / "y.npy", _assert_f64(y, "y"), allow_pickle=False)
+
+    # The string form upstream's Pool hashes (integer categories stringified, A4).
+    x_cat_str = np.stack(
+        [cat0.astype(int).astype(str), cat1.astype(int).astype(str)], axis=1
+    )
+
+    tensor_ctr_params = {
+        "boosting_type": "Plain",
+        "one_hot_max_size": 1,
+        "max_ctr_complexity": 2,
+        "simple_ctr": ["Borders:Prior=0.5"],
+        "combinations_ctr": ["Borders:Prior=0.5"],
+        "permutation_count": 1,
+        "fold_len_multiplier": 2.0,
+        "counter_calc_method": "SkipTest",
+        "depth": 2,
+        "iterations": 5,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "leaf_estimation_method": "Gradient",
+        "leaf_estimation_iterations": 1,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "random_seed": SEED,
+        "thread_count": 1,
+        "loss_function": "Logloss",
+        "verbose": False,
+    }
+
+    # Logloss → boost_from_average=False (starting approx 0, Pitfall 2).
+    model = CatBoostClassifier(boost_from_average=False, **tensor_ctr_params)
+    # Pool with the two columns declared categorical (cat_features=[0, 1]).
+    pool = Pool(x_cat_str, y, cat_features=[0, 1])
+    model.fit(pool)
+
+    # --- Stage: Splits + LeafValues + ctr_data (the upstream tensor-CTR model) --
+    model.save_model(str(TENSOR_CTR_E2E / "model.json"), format="json")
+
+    # --- Stage: Predictions (RawFormulaVal, the production apply-path target) ---
+    predictions = _assert_f64(
+        np.asarray(model.predict(x_cat_str, prediction_type="RawFormulaVal"), dtype=np.float64),
+        "predictions",
+    )
+    np.save(TENSOR_CTR_E2E / "predictions.npy", predictions, allow_pickle=False)
+
+    config = {
+        "scenario": "tensor_ctr_e2e",
+        "requirement": "ORD-05",
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "n_rows": int(x_cat_str.shape[0]),
+        "n_cat_features": int(x_cat_str.shape[1]),
+        "n_iterations": 5,
+        "boost_from_average": False,
+        "prediction_type": "RawFormulaVal",
+        "params": {**tensor_ctr_params, "boost_from_average": False},
+        "stages": ["Splits", "LeafValues", "Predictions"],
+        "carries_full_train_predict_stack": True,
+        "note": (
+            "FULL tensor-CTR train->predict stack (X_cat/y/model.json WITH baked "
+            "ctr_data/predictions), closing the D-09 omission of the per-object-only "
+            "tensor_ctr/ fixture. Generated OFFLINE with pinned catboost==1.2.10 "
+            "(thread_count=1); NEVER run in CI — CI only READS the committed "
+            "artifacts (D-12). The Rust oracle trains the SAME config via cb_train, "
+            "lifts to cb_model::Model with the baked ctr_data, and asserts "
+            "cb_model::predict_raw ≤1e-5 vs predictions.npy across ALL trees through "
+            "the ModelSplit::Ctr apply path."
+        ),
+        "npy_schema": {
+            "X_cat.npy": "[N, 2] int32 — raw categorical columns as integer codes (the Rust oracle stringifies via cb_data::stringify_int_category, A4)",
+            "y.npy": "[N] float64 — Logloss labels",
+            "model.json": "upstream catboost 1.2.10 tensor-CTR model (splits + leaf_values + borders + baked ctr_data)",
+            "predictions.npy": "[N] float64 — upstream RawFormulaVal (the production-apply-path ≤1e-5 target)",
+        },
+    }
+    with (TENSOR_CTR_E2E / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -1992,6 +2140,10 @@ def main() -> None:
     # --- Phase-5 ordered end-to-end fixture (Plan 05-10, ORD-02, D-09) -------
     gen_ordered_boost_e2e()
     print(f"Wrote ordered_boost_e2e oracle fixtures under {ORDERED_BOOST_E2E}")
+
+    # --- Phase-5 tensor-CTR end-to-end fixture (Plan 05-09, ORD-05, D-09) -----
+    gen_tensor_ctr_e2e()
+    print(f"Wrote tensor_ctr_e2e oracle fixtures under {TENSOR_CTR_E2E}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
