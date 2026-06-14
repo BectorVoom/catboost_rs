@@ -51,6 +51,15 @@ pub struct CtrSplit {
     pub target_border_idx: usize,
     /// The CTR-value threshold; the split passes when `ctr_value > border`.
     pub border: f64,
+    /// The inference `Shift` (`calc_normalization(prior_num)` → `shift`), threaded
+    /// into the apply `Calc` on BOTH the table-found and not-found branches so the
+    /// CTR value reaches the same scaled-border space as the baked borders
+    /// (`Borders:Prior=0.5/1` → `0.0`). Defaults to `0.0` for back-compat (Plan 05-14).
+    pub shift: f64,
+    /// The inference `Scale` (`ctr_border_count / norm`), threaded into the apply
+    /// `Calc` on BOTH branches (`Borders:Prior=0.5/1`, `ctr_border_count=15` →
+    /// `15.0`). Defaults to `1.0` for back-compat (Plan 05-14).
+    pub scale: f64,
 }
 
 /// One stored oblivious-tree split: EITHER a float threshold ([`Split`]) OR a
@@ -163,6 +172,11 @@ impl Model {
                         },
                         target_border_idx: c.target_border_idx,
                         border: c.border,
+                        // Carry the bake-derived (Shift, Scale) so the apply path
+                        // scales the CTR value into the baked-border space on BOTH
+                        // the found and not-found branches (Plan 05-14).
+                        shift: c.shift,
+                        scale: c.scale,
                     }));
                 }
                 ObliviousTree {

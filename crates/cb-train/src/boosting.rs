@@ -33,6 +33,7 @@ use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
 use crate::autolr::{self, TargetType};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
+use crate::ctr::bake::{bake_ctr_table, BakedCtrData};
 use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
@@ -710,6 +711,8 @@ fn ctr_splits_for_tree(
             prior_denom: 1.0,
             target_border_idx: 0,
             border: 0.0,
+            shift: 0.0,
+            scale: 1.0,
         })
         .collect()
 }
@@ -871,8 +874,9 @@ pub fn train_with_eval_sets<R: Runtime>(
     history: Option<&mut EvalMetricHistory>,
 ) -> CbResult<Model> {
     // The numeric entry point carries NO categorical columns — byte-identical to
-    // before (empty cat set ⇒ empty CTR candidates ⇒ no materialization).
-    train_inner(
+    // before (empty cat set ⇒ empty CTR candidates ⇒ no materialization). The
+    // baked ctr_data is empty here and discarded (train's return type is UNCHANGED).
+    let (model, _baked) = train_inner(
         runtime,
         feature_values,
         feature_borders,
@@ -883,7 +887,8 @@ pub fn train_with_eval_sets<R: Runtime>(
         staged_out,
         eval_sets,
         history,
-    )
+    )?;
+    Ok(model)
 }
 
 /// Train a CAT-AWARE model: thread categorical columns into training, computing
@@ -899,16 +904,19 @@ pub fn train_with_eval_sets<R: Runtime>(
 /// are exactly as [`train`]. When `cat_columns` is empty `train_cat` is
 /// byte-identical to [`train`] (no candidates, no materialization).
 ///
-/// In THIS plan (05-11) the materialized CTR-feature columns are computed and
-/// carried on the iteration so the wiring compiles and the numeric path is
-/// unaffected; the tree search does NOT yet SCORE them (Plan 05-12 Task 1). The
-/// chosen-candidate projections are persisted via the existing `ctr_splits_for_tree`
-/// seam unchanged.
+/// Returns the trained [`Model`] PLUS the baked whole-set inference [`BakedCtrData`]
+/// (ORD-05, Plan 05-14): one [`BakedCtrTable`] per DISTINCT chosen CTR split,
+/// carrying the whole-set per-bucket class counts (keyed by the combined projection
+/// hash the apply path reconstructs) and the inference `(Shift, Scale)` derived from
+/// the prior PAIR. The e2e call site attaches it to the canonical model via
+/// `cb_model::Model::with_ctr_data` (after `cb_model::CtrData::from_baked`). When
+/// `cat_columns` is empty the baked data is empty and the model is byte-identical to
+/// [`train`].
 ///
 /// # Errors
 /// As [`train`], plus [`CbError::OutOfRange`] from cardinality counting on a
 /// column exceeding the perfect-hash `u32::MAX` bound, or any error
-/// [`crate::materialize_ctr_feature`] surfaces.
+/// [`crate::materialize_ctr_feature`] / [`crate::bake_ctr_table`] surfaces.
 #[allow(clippy::too_many_arguments)]
 pub fn train_cat<R: Runtime>(
     runtime: &R,
@@ -919,7 +927,7 @@ pub fn train_cat<R: Runtime>(
     weights: &[f64],
     params: &BoostParams,
     staged_out: Option<&mut Vec<f64>>,
-) -> CbResult<Model> {
+) -> CbResult<(Model, BakedCtrData)> {
     train_inner(
         runtime,
         feature_values,
@@ -952,7 +960,7 @@ fn train_inner<R: Runtime>(
     mut staged_out: Option<&mut Vec<f64>>,
     eval_sets: &[EvalSet],
     mut history: Option<&mut EvalMetricHistory>,
-) -> CbResult<Model> {
+) -> CbResult<(Model, BakedCtrData)> {
     check_depth(params.depth)?;
 
     let n = target.len();
@@ -1581,8 +1589,64 @@ fn train_inner<R: Runtime>(
         }
     }
 
-    Ok(Model {
-        oblivious_trees: trees,
-        bias,
-    })
+    // ---------------------------------------------------------------------------
+    // Bake the WHOLE-SET inference ctr_data for each DISTINCT chosen CTR split
+    // (ORD-05, Plan 05-14). After the boosting loop, for each distinct
+    // (projection, ctr_type, prior_num, prior_denom) the trees chose, accumulate
+    // the WHOLE learn set into per-bucket class counts keyed on the COMBINED
+    // projection hash (`bake_ctr_table`, via the SHARED accumulate_online +
+    // build_final_ctr producer — the inference TOTALS, NOT the prefix), derive the
+    // inference (Shift, Scale) from the prior PAIR (calc_normalization(prior_num),
+    // Scale = ctr_border_count / norm; Borders:0.5/1 → Shift=0, Scale=15), and copy
+    // (Shift, Scale) + the prior PAIR onto EVERY matching chosen CtrSplitSpec so
+    // they flow into cb_model::CtrSplit via from_trained.
+    //
+    // Off the CTR path (numeric train driver, empty cat_columns) no tree carries a
+    // CtrSplitSpec, so this loop is a no-op and `baked` is empty — the float-only
+    // models keep ctr_data None.
+    let mut baked = BakedCtrData::default();
+    if !cat_columns.is_empty() {
+        // Distinct chosen projections (by the sorted member set) across all trees.
+        let mut seen: Vec<crate::TProjection> = Vec::new();
+        for tree in &trees {
+            for spec in &tree.ctr_splits {
+                if !seen.iter().any(|p| p == &spec.projection) {
+                    seen.push(spec.projection.clone());
+                    let table = bake_ctr_table(
+                        cat_columns,
+                        &spec.projection,
+                        &target_class,
+                        2, // binclf target-class count
+                        ctr_border_count,
+                        ctr_prior_num,
+                        ctr_prior_denom,
+                    )?;
+                    baked.tables.push(table);
+                }
+            }
+        }
+        // Copy the bake-derived (Shift, Scale) + prior PAIR onto each chosen split.
+        for tree in &mut trees {
+            for spec in &mut tree.ctr_splits {
+                if let Some(table) = baked
+                    .tables
+                    .iter()
+                    .find(|t| t.projection == spec.projection)
+                {
+                    spec.shift = table.shift;
+                    spec.scale = table.scale;
+                    spec.prior_num = table.prior_num;
+                    spec.prior_denom = table.prior_denom;
+                }
+            }
+        }
+    }
+
+    Ok((
+        Model {
+            oblivious_trees: trees,
+            bias,
+        },
+        baked,
+    ))
 }

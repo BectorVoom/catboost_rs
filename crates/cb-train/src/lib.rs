@@ -35,6 +35,7 @@ pub use candidates::{
     tensor_ctr_candidates, CtrCandidate, EncodingPath,
 };
 pub use ctr::{
+    bake_ctr_table, BakedCtrData, BakedCtrTable,
     accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
     calc_normalization, materialize_ctr_feature, online_ctr_prefix_binclf,
     ordered_ctr_per_permutation, CounterCalcMethod, CtrFeatureColumn, ECtrType, FinalCtrTable,

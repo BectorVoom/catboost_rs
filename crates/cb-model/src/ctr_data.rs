@@ -285,6 +285,47 @@ pub struct CtrData {
     pub tables: BTreeMap<String, CtrValueTable>,
 }
 
+/// The canonical `(projection, ctr_type)` CTR-base key — the SAME form
+/// `crate::apply::ctr_table_key` reconstructs at apply time:
+/// `"ctr:type=<i8>:proj=<f0>,<f1>,…"` over the projection's SORTED cat-feature
+/// members. Defined here (not only in `apply`) so the trainer-side bake lift uses
+/// the IDENTICAL key the apply lookup expects (Plan 05-14).
+#[must_use]
+pub fn ctr_base_key(ctr_type: ECtrType, cat_features: &[usize]) -> String {
+    let members: Vec<String> = cat_features.iter().map(usize::to_string).collect();
+    format!("ctr:type={}:proj={}", ctr_type.as_i8(), members.join(","))
+}
+
+impl CtrData {
+    /// Lift a trainer-side [`cb_train::BakedCtrData`] (ORD-05, Plan 05-14) into the
+    /// canonical model-side `ctr_data`: each baked whole-set table becomes a
+    /// [`CtrValueTable`] keyed by the canonical [`ctr_base_key`] the apply path
+    /// reconstructs. The per-bucket combined projection hashes + class counts are
+    /// carried verbatim; the inference `(Shift, Scale)` ride on the model's
+    /// `CtrSplit` (via `from_trained`), not the table, so they are not duplicated
+    /// here.
+    #[must_use]
+    pub fn from_baked(baked: &cb_train::BakedCtrData) -> Self {
+        let mut tables = BTreeMap::new();
+        for t in &baked.tables {
+            let ctr_type = ECtrType::from_i8(t.ctr_type).unwrap_or(ECtrType::Borders);
+            let key = ctr_base_key(ctr_type, t.projection.cat_features());
+            tables.insert(
+                key,
+                CtrValueTable {
+                    ctr_type,
+                    target_classes_count: t.target_classes_count,
+                    hashes: t.hashes.clone(),
+                    int_counts: t.int_counts.clone(),
+                    mean: Vec::new(),
+                    counter_denominator: t.counter_denominator,
+                },
+            );
+        }
+        Self { tables }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // model.json serde (the upstream hash_map / hash_stride / counter_denominator
 // flat heterogeneous array — the SAME shape cb-oracle's CtrTableJson parses).

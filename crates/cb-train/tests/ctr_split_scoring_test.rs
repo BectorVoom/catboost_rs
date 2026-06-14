@@ -23,8 +23,8 @@
 
 use cb_compute::{gradient_leaf_delta, reduce_leaf_stats, scale_l2_reg};
 use cb_train::{
-    greedy_tensor_search_oblivious_with_ctr, materialize_ctr_feature, ctr_border_count_default,
-    CtrFeatureColumn, FeatureMatrix, LevelKind, TProjection,
+    bake_ctr_table, greedy_tensor_search_oblivious_with_ctr, materialize_ctr_feature,
+    ctr_border_count_default, CtrFeatureColumn, FeatureMatrix, LevelKind, TProjection,
 };
 
 const PRIOR_NUM: f64 = 0.5;
@@ -390,4 +390,185 @@ fn averaging_partition_reproduces_tree0_leaf_values() {
 
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
+}
+
+// ===========================================================================
+// Plan 05-14 — ctr_data bake (Scale/Shift) + apply Scale/Shift on BOTH branches
+// ===========================================================================
+
+/// Build a single-CTR-split, depth-1 `cb_model::Model` over projection {0} whose
+/// leaf 0 / leaf 1 values are distinguishable, with the given baked `ctr_data` and
+/// the split's `(shift, scale, border)`. Predicting one object reveals which leaf
+/// the `ctr_value > border` test selected (leaf value 10.0 for pass, -10.0 for not).
+fn single_ctr_split_model(
+    ctr_data: cb_model::CtrData,
+    shift: f64,
+    scale: f64,
+    border: f64,
+) -> cb_model::Model {
+    let split = cb_model::CtrSplit {
+        projection: TProjection::single(0),
+        ctr_type: cb_model::ECtrType::Borders,
+        prior: cb_model::Prior { num: PRIOR_NUM, denom: PRIOR_DENOM },
+        target_border_idx: 0,
+        border,
+        shift,
+        scale,
+    };
+    let tree = cb_model::ObliviousTree {
+        splits: vec![cb_model::ModelSplit::Ctr(split)],
+        // forward-bit leaf index: bit0 = (ctr_value > border). leaf0 = not-pass,
+        // leaf1 = pass.
+        leaf_values: vec![-10.0, 10.0],
+        leaf_weights: vec![1.0, 1.0],
+    };
+    cb_model::Model {
+        oblivious_trees: vec![tree],
+        bias: 0.0,
+        float_feature_borders: Vec::new(),
+        ctr_data: Some(ctr_data),
+    }
+}
+
+/// Test (Scale/Shift derivation): a Borders CTR with prior_num=0.5, prior_denom=1
+/// and ctr_border_count=15 derives (Shift, Scale) == (0.0, 15.0) —
+/// calc_normalization(0.5) gives shift=0, norm=1, Scale=15/1=15 — matching the
+/// fixture ctrs[0].{shift,scale}. The bake sets BOTH prior halves on the table.
+#[test]
+fn bake_derives_shift_zero_scale_fifteen_for_borders_prior_half() {
+    // A single-feature {0} projection over 3 documents (2 distinct categories).
+    let cat0: Vec<String> = ["0", "0", "1"].iter().map(|s| (*s).to_owned()).collect();
+    let cat_columns = vec![cat0];
+    let target_class = vec![1usize, 0, 1];
+    let proj = TProjection::single(0);
+
+    let table = bake_ctr_table(
+        &cat_columns,
+        &proj,
+        &target_class,
+        2,
+        ctr_border_count_default(),
+        PRIOR_NUM,
+        PRIOR_DENOM,
+    )
+    .expect("bake");
+
+    assert!((table.shift - 0.0).abs() < 1e-12, "Shift == 0 for Borders:0.5/1");
+    assert!((table.scale - 15.0).abs() < 1e-12, "Scale == 15 for ctr_border_count=15");
+    assert_eq!(table.prior_num, PRIOR_NUM, "prior_num carried");
+    assert_eq!(table.prior_denom, PRIOR_DENOM, "prior_denom carried");
+    // The two distinct categories produce two buckets with class counts.
+    assert_eq!(table.hashes.len(), 2, "two distinct combined buckets");
+    assert_eq!(table.int_counts.len(), 2, "per-bucket class counts");
+}
+
+/// Test (apply uses split Scale/Shift on the FOUND branch): the SAME baked table
+/// + the SAME border, applied with Scale=15 vs Scale=1, selects DIFFERENT leaves —
+/// proving the found-branch hardcode (`scale = 1.0`) is removed and the split uses
+/// the model's Scale.
+#[test]
+fn apply_found_branch_uses_split_scale() {
+    // One category "0" appearing in the document; whole-set bucket {0}: class
+    // counts make the raw inference ctr ((good+0.5)/(tot+1)) a value in [0,1].
+    // good=1, tot=1 → (1.5)/(2)=0.75. Scaled by 15 → 11.25 (> border 5); scaled by
+    // 1 → 0.75 (< border 5). So the same border lands on opposite sides.
+    let cat0: Vec<String> = ["0", "0"].iter().map(|s| (*s).to_owned()).collect();
+    let cat_columns = vec![cat0];
+    let target_class = vec![1usize, 0]; // good=1, tot=2 over the whole set
+    let proj = TProjection::single(0);
+    let table = bake_ctr_table(
+        &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
+    )
+    .expect("bake");
+    let ctr_data = cb_model::CtrData::from_baked(&cb_train::BakedCtrData {
+        tables: vec![table],
+    });
+    let border = 5.0;
+
+    // Predict the FIRST object (category "0"). Found branch (bucket present).
+    let cat_cols_obj = vec![vec!["0".to_owned()]];
+
+    let model_scale_15 = single_ctr_split_model(ctr_data.clone(), 0.0, 15.0, border);
+    let model_scale_1 = single_ctr_split_model(ctr_data, 0.0, 1.0, border);
+
+    let pred_15 = cb_model::predict_raw_cat(&model_scale_15, &[], &cat_cols_obj);
+    let pred_1 = cb_model::predict_raw_cat(&model_scale_1, &[], &cat_cols_obj);
+
+    // Scale=15 → scaled ctr > border → leaf1 (10.0); Scale=1 → < border → leaf0 (-10.0).
+    assert!(pred_15[0] > 0.0, "Scale=15 lands above border (found branch)");
+    assert!(pred_1[0] < 0.0, "Scale=1 lands below border (found branch)");
+    assert_ne!(
+        pred_15[0], pred_1[0],
+        "the found-branch split outcome depends on split.scale (hardcode removed)"
+    );
+}
+
+/// Test (apply uses split Scale/Shift on the NOT-FOUND branch): for a split whose
+/// combined bucket is ABSENT from the baked table, the empty-CTR value is STILL
+/// scaled by split.shift/split.scale — Scale=15 vs Scale=1 over the empty bucket
+/// yields a different `ctr_value > border` outcome, proving the not-found hardcode
+/// (`calc_inference(.., 0.0, 1.0)`) is removed.
+#[test]
+fn apply_not_found_branch_uses_split_scale() {
+    // An EMPTY baked table (no buckets) → every lookup is the not-found→empty path.
+    let ctr_data = cb_model::CtrData {
+        tables: std::collections::BTreeMap::new(),
+    };
+    // Empty CTR: Calc(0,0) over prior 0.5/1 = (0+0.5)/(0+1) = 0.5. Scaled by 15 →
+    // 7.5 (> border 5); scaled by 1 → 0.5 (< border 5).
+    let border = 5.0;
+    let cat_cols_obj = vec![vec!["0".to_owned()]];
+
+    let model_scale_15 = single_ctr_split_model(ctr_data.clone(), 0.0, 15.0, border);
+    let model_scale_1 = single_ctr_split_model(ctr_data, 0.0, 1.0, border);
+
+    let pred_15 = cb_model::predict_raw_cat(&model_scale_15, &[], &cat_cols_obj);
+    let pred_1 = cb_model::predict_raw_cat(&model_scale_1, &[], &cat_cols_obj);
+
+    assert!(pred_15[0] > 0.0, "Scale=15 scales the empty CTR above border (not-found branch)");
+    assert!(pred_1[0] < 0.0, "Scale=1 leaves the empty CTR below border (not-found branch)");
+    assert_ne!(
+        pred_15[0], pred_1[0],
+        "the NOT-FOUND-branch empty CTR is scaled by split.scale (hardcode removed)"
+    );
+}
+
+/// Test (bake round-trips to apply): a baked whole-set table for projection {0},
+/// looked up through the apply path with the split's Scale/Shift, reproduces the
+/// upstream inference Calc value for a known document — the whole-set partition
+/// counts feed `((good+0.5)/(tot+1))*15` for that document's category.
+#[test]
+fn bake_round_trips_to_apply_inference_value() {
+    // 4 documents, single category "7": whole-set bucket {7} has good = #pos,
+    // tot = 4. Choose 3 pos / 1 neg → good=3, tot=4 → (3.5)/(5) = 0.7 → *15 = 10.5.
+    let cat0: Vec<String> = ["7", "7", "7", "7"].iter().map(|s| (*s).to_owned()).collect();
+    let cat_columns = vec![cat0];
+    let target_class = vec![1usize, 1, 1, 0];
+    let proj = TProjection::single(0);
+    let table = bake_ctr_table(
+        &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
+    )
+    .expect("bake");
+    let shift = table.shift;
+    let scale = table.scale;
+    let ctr_data = cb_model::CtrData::from_baked(&cb_train::BakedCtrData { tables: vec![table] });
+
+    // The expected scaled inference value: ((3 + 0.5) / (4 + 1)) * 15 = 10.5.
+    let expected = ((3.0 + 0.5) / (4.0 + 1.0)) * 15.0;
+    // Border just below the expected value → the split passes (leaf1, 10.0); a
+    // border just above → it fails (leaf0, -10.0). This pins the apply value.
+    let below = single_ctr_split_model(ctr_data.clone(), shift, scale, expected - 0.01);
+    let above = single_ctr_split_model(ctr_data, shift, scale, expected + 0.01);
+    let cat_cols_obj = vec![vec!["7".to_owned()]];
+    let pred_below = cb_model::predict_raw_cat(&below, &[], &cat_cols_obj);
+    let pred_above = cb_model::predict_raw_cat(&above, &[], &cat_cols_obj);
+
+    assert!(
+        pred_below[0] > 0.0,
+        "ctr_value ({expected}) > border-0.01 → leaf1 (apply reproduced the inference Calc)"
+    );
+    assert!(
+        pred_above[0] < 0.0,
+        "ctr_value ({expected}) < border+0.01 → leaf0 (apply reproduced the inference Calc)"
+    );
 }

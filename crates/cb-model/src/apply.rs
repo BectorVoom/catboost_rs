@@ -34,7 +34,7 @@ use cb_core::sum_f64;
 use cb_data::calc_cat_feature_hash;
 use cb_train::{fold_cat_hash, leaf_index};
 
-use crate::ctr_data::{calc_inference, CtrValueTable, Prior};
+use crate::ctr_data::{calc_inference, ctr_base_key, CtrValueTable, Prior};
 use crate::model::{CtrSplit, ModelSplit};
 use crate::Model;
 
@@ -123,13 +123,10 @@ pub fn ctr_value_for_combined_projection(
 /// reconstruction matches the stored key byte-for-byte.
 #[must_use]
 fn ctr_table_key(split: &CtrSplit) -> String {
-    let members: Vec<String> = split
-        .projection
-        .cat_features()
-        .iter()
-        .map(usize::to_string)
-        .collect();
-    format!("ctr:type={}:proj={}", split.ctr_type.as_i8(), members.join(","))
+    // Delegate to the shared canonical key (the SAME form the trainer-side bake
+    // lift `CtrData::from_baked` uses — Plan 05-14), so the bake key matches the
+    // apply key byte-for-byte.
+    ctr_base_key(split.ctr_type, split.projection.cat_features())
 }
 
 /// Whether an object passes one float split (`value > border`, Step B).
@@ -178,13 +175,15 @@ fn passes_ctr_split(model: &Model, split: &CtrSplit, cat_values: &[String]) -> b
             table,
             &members,
             split.prior,
-            /* shift = */ 0.0,
-            /* scale = */ 1.0,
+            split.shift,
+            split.scale,
             split.target_border_idx,
         ),
         // No baked table for this split: the not-found→empty CTR value
-        // (`Calc(0, 0)` over the prior). Bounds-safe — never an OOB index.
-        None => calc_inference(0.0, 0.0, split.prior, 0.0, 1.0),
+        // (`Calc(0, 0)` over the prior), STILL scaled by the split's Shift/Scale
+        // so an absent combined bucket lands in the same border space as the baked
+        // borders (Plan 05-14 — never the hardcoded 0.0/1.0). Bounds-safe.
+        None => calc_inference(0.0, 0.0, split.prior, split.shift, split.scale),
     };
     ctr_value > split.border
 }

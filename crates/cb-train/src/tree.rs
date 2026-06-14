@@ -124,6 +124,16 @@ pub struct CtrSplitSpec {
     pub target_border_idx: usize,
     /// The CTR-value threshold; the split passes when `ctr_value > border`.
     pub border: f64,
+    /// The inference `Shift` derived from the prior (`calc_normalization(prior_num)`
+    /// → `shift`); `0.0` for the in-scope `Borders:Prior=0.5/1`. Threaded into
+    /// `cb_model::CtrSplit.shift` so the apply path scales the CTR value into the
+    /// same baked-border space (Plan 05-14). Defaults to `0.0` until the bake sets
+    /// it on a chosen split.
+    pub shift: f64,
+    /// The inference `Scale` derived from `ctr_border_count / norm`
+    /// (`Borders:Prior=0.5/1` → `15/1 = 15`). Threaded into
+    /// `cb_model::CtrSplit.scale`. Defaults to `1.0` until the bake sets it.
+    pub scale: f64,
 }
 
 /// A scored candidate split during the greedy search. `score` is the L2 split
@@ -1124,6 +1134,11 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
                     prior_denom: column.prior_denom,
                     target_border_idx,
                     border: *border,
+                    // Default Shift/Scale at structure-search time; the train_cat
+                    // bake (Plan 05-14) overwrites these on the chosen splits with
+                    // the calc_normalization(prior_num)-derived (Shift, Scale).
+                    shift: 0.0,
+                    scale: 1.0,
                 });
             }
         }
