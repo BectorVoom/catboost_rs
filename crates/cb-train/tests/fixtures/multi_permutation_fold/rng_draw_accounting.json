@@ -1,0 +1,74 @@
+{
+  "catboost_version": "1.2.10",
+  "scenario": "multi_permutation_fold",
+  "requirement": "ORD-01",
+  "n_rows": 30,
+  "seed": 0,
+  "authorization": "2026-06-15 CONTEXT decision revision (user-approved C++ instrumentation, scoped to the pc=4 AveragingFold gap)",
+  "discovered_rule": "averaging_shuffle_start_callcount == learning_folds",
+  "rule_explanation": "The AveragingFold Fisher-Yates shuffle begins after EXACTLY learning_folds GenRand draws on the persistent TRestorableFastRng64. Each of the learning_folds fold positions consumes exactly one non-shuffle pre-averaging GenRand (the per-fold upstream RNG consumption: InitOnlineEstimatedFeatures / target-classifier / per-fold CTR-grid, learn_context.cpp:490-589, fold.cpp:43-95,200-211,298-309). This ONE rule reproduces the committed catboost 1.2.10 partitions [6,0,7,17] (pc=1/2, learning_folds=1, C=1) AND [6,0,10,14] (pc=4, learning_folds=3, C=3) — the discovery the empirical 05-15 partition sweep could not reach. At learning_folds==1 it reduces to the prior single pre-averaging GenRand (no regression on pc=1/2).",
+  "note": "Per-fold RNG draw accounting discovered offline by instrument_fold_rng.cpp via TRestorableFastRng64::GetCallCount. RUN-ONCE/COMMIT; CI reads THIS file, never the harness (D-09/D-12). Ground-truth anchor for cb_train::create_folds.",
+  "accounting": [
+    {
+      "permutation_count": 1,
+      "learning_folds": 1,
+      "averaging_shuffle_start_callcount": 1,
+      "folds": [
+        {"fold_idx": 0, "is_averaging": false, "callcount_before": 0, "callcount_after": 1, "pre_averaging_draws": 1},
+        {"fold_idx": 1, "is_averaging": true, "callcount_before": 1, "callcount_after": 30, "shuffle_draws": 29}
+      ],
+      "averaging_permutation": [7,21,27,24,25,15,2,23,10,16,8,17,5,28,18,6,19,22,29,0,9,13,3,12,20,14,4,26,1,11],
+      "cross_check_partition": [6,0,7,17],
+      "cross_check_expected": [6,0,7,17],
+      "cross_check_ok": true
+    },
+    {
+      "permutation_count": 2,
+      "learning_folds": 1,
+      "averaging_shuffle_start_callcount": 1,
+      "folds": [
+        {"fold_idx": 0, "is_averaging": false, "callcount_before": 0, "callcount_after": 1, "pre_averaging_draws": 1},
+        {"fold_idx": 1, "is_averaging": true, "callcount_before": 1, "callcount_after": 30, "shuffle_draws": 29}
+      ],
+      "averaging_permutation": [7,21,27,24,25,15,2,23,10,16,8,17,5,28,18,6,19,22,29,0,9,13,3,12,20,14,4,26,1,11],
+      "cross_check_partition": [6,0,7,17],
+      "cross_check_expected": [6,0,7,17],
+      "cross_check_ok": true
+    },
+    {
+      "permutation_count": 4,
+      "learning_folds": 3,
+      "averaging_shuffle_start_callcount": 3,
+      "folds": [
+        {"fold_idx": 0, "is_averaging": false, "callcount_before": 0, "callcount_after": 1, "pre_averaging_draws": 1},
+        {"fold_idx": 1, "is_averaging": false, "callcount_before": 1, "callcount_after": 2, "pre_averaging_draws": 1},
+        {"fold_idx": 2, "is_averaging": false, "callcount_before": 2, "callcount_after": 3, "pre_averaging_draws": 1},
+        {"fold_idx": 3, "is_averaging": true, "callcount_before": 3, "callcount_after": 32, "shuffle_draws": 29}
+      ],
+      "averaging_permutation": [23,19,25,29,14,13,10,12,9,3,2,4,17,21,27,11,28,8,1,15,26,16,7,24,5,6,20,0,22,18],
+      "cross_check_partition": [6,0,10,14],
+      "cross_check_expected": [6,0,10,14],
+      "cross_check_ok": true
+    },
+    {
+      "permutation_count": 8,
+      "learning_folds": 7,
+      "averaging_shuffle_start_callcount": 7,
+      "folds": [
+        {"fold_idx": 0, "is_averaging": false, "callcount_before": 0, "callcount_after": 1, "pre_averaging_draws": 1},
+        {"fold_idx": 1, "is_averaging": false, "callcount_before": 1, "callcount_after": 2, "pre_averaging_draws": 1},
+        {"fold_idx": 2, "is_averaging": false, "callcount_before": 2, "callcount_after": 3, "pre_averaging_draws": 1},
+        {"fold_idx": 3, "is_averaging": false, "callcount_before": 3, "callcount_after": 4, "pre_averaging_draws": 1},
+        {"fold_idx": 4, "is_averaging": false, "callcount_before": 4, "callcount_after": 5, "pre_averaging_draws": 1},
+        {"fold_idx": 5, "is_averaging": false, "callcount_before": 5, "callcount_after": 6, "pre_averaging_draws": 1},
+        {"fold_idx": 6, "is_averaging": false, "callcount_before": 6, "callcount_after": 7, "pre_averaging_draws": 1},
+        {"fold_idx": 7, "is_averaging": true, "callcount_before": 7, "callcount_after": 36, "shuffle_draws": 29}
+      ],
+      "averaging_permutation": [1,25,13,14,19,11,26,17,28,16,8,20,27,2,21,7,12,9,23,10,4,18,29,22,5,15,6,3,24,0],
+      "cross_check_partition": [6,0,7,17],
+      "cross_check_expected": null,
+      "cross_check_ok": true
+    }
+  ],
+  "cross_check_all_ok": true
+}

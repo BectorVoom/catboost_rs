@@ -124,6 +124,15 @@ def main() -> None:
             json.dump(mjson, fh)
         print(f"pc={pc}: tree0_leaf_weights={tree0_lw}")
 
+        # For the production-default pc=4, ALSO dump the trained model's
+        # RawFormulaVal predictions over X — the upstream anchor for the pc=4
+        # end-to-end <=1e-5 prediction oracle (Plan 05-17, mirrors
+        # gen_fixtures.py predict()->predictions.npy).
+        if pc == 4:
+            preds = model.predict(pool, prediction_type="RawFormulaVal")
+            np.save(OUT_DIR / "predictions_pc4.npy", np.asarray(preds, dtype=np.float64))
+            print(f"pc=4: wrote predictions_pc4.npy shape={np.asarray(preds).shape}")
+
     with open(OUT_DIR / "leaf_weights.json", "w") as fh:
         json.dump(leaf_weights_by_pc, fh, indent=2, sort_keys=True)
 
@@ -135,13 +144,21 @@ def main() -> None:
         "seed": SEED,
         "note": (
             "REAL catboost 1.2.10 AveragingFold draw-order anchor for "
-            "permutation_count>=2 (WR-01). leaf_weights.json records catboost's "
-            "trained-model tree-0 leaf_weights (the AveragingFold partition counts) "
-            "for pc=1,2,4 of the tensor_ctr_e2e config family. The Rust oracle "
-            "asserts the partition cb_train::create_folds's AveragingFold "
-            "permutation produces over the online-prefix CTR column equals these "
-            "committed catboost leaf_weights integer-exact. A wrong pre-averaging "
-            "advance count would yield a different partition and FAIL the check. "
+            "permutation_count>=2 (WR-01; pc=4 gap closed by Plan 05-17). "
+            "leaf_weights.json records catboost's trained-model tree-0 leaf_weights "
+            "(the AveragingFold partition counts) for pc=1,2,4 of the tensor_ctr_e2e "
+            "config family. The Rust oracle asserts the partition "
+            "cb_train::create_folds's AveragingFold permutation produces over the "
+            "online-prefix CTR column equals these committed catboost leaf_weights "
+            "integer-exact. The per-fold RNG draw accounting that makes the pc=4 "
+            "partition [6,0,10,14] reproduce integer-exact is committed alongside as "
+            "rng_draw_accounting.json, DISCOVERED by the instrumented C++ harness "
+            "instrument_fold_rng.cpp (a deliberate, user-approved C++ instrumentation "
+            "deviation authorized by the 2026-06-15 CONTEXT decision revision, SCOPED "
+            "to this pc=4 AveragingFold gap only). The discovered rule: the averaging "
+            "shuffle starts at RNG call-count == learning_folds (one pre-averaging "
+            "GenRand per fold position). predictions_pc4.npy carries the pc=4 "
+            "RawFormulaVal predictions for the end-to-end <=1e-5 oracle. "
             "model_pc{1,2,4}.json are the full upstream dumps for audit. Generated "
             "OFFLINE; NEVER run in CI (D-12)."
         ),
