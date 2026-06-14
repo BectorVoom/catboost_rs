@@ -797,11 +797,94 @@ pub fn train_with_eval<R: Runtime>(
 /// As [`train`], plus any detector-construction error
 /// ([`CbError::Degenerate`] for Wilcoxon without a test set) or a degenerate eval
 /// set ([`CbError::Degenerate`] from the metric).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub fn train_with_eval_sets<R: Runtime>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+    eval_sets: &[EvalSet],
+    history: Option<&mut EvalMetricHistory>,
+) -> CbResult<Model> {
+    // The numeric entry point carries NO categorical columns — byte-identical to
+    // before (empty cat set ⇒ empty CTR candidates ⇒ no materialization).
+    train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        &[],
+        target,
+        weights,
+        params,
+        staged_out,
+        eval_sets,
+        history,
+    )
+}
+
+/// Train a CAT-AWARE model: thread categorical columns into training, computing
+/// OnLearnOnly per-feature cardinalities and materializing a per-candidate
+/// combined-projection online CTR feature column the tree search can split on
+/// (ORD-05 / D-05, the upstream `greedy_tensor_search.cpp` AddTreeCtrs +
+/// per-fold online-CTR-during-growth path).
+///
+/// `cat_columns[f]` is categorical feature `f`'s per-object value column (already
+/// in the A4 string form — integer-coded values pre-stringified via
+/// [`cb_data::stringify_int_category`]). The numeric `feature_values` /
+/// `feature_borders` / `target` / `weights` / `params` / `staged_out` arguments
+/// are exactly as [`train`]. When `cat_columns` is empty `train_cat` is
+/// byte-identical to [`train`] (no candidates, no materialization).
+///
+/// In THIS plan (05-11) the materialized CTR-feature columns are computed and
+/// carried on the iteration so the wiring compiles and the numeric path is
+/// unaffected; the tree search does NOT yet SCORE them (Plan 05-12 Task 1). The
+/// chosen-candidate projections are persisted via the existing `ctr_splits_for_tree`
+/// seam unchanged.
+///
+/// # Errors
+/// As [`train`], plus [`CbError::OutOfRange`] from cardinality counting on a
+/// column exceeding the perfect-hash `u32::MAX` bound, or any error
+/// [`crate::materialize_ctr_feature`] surfaces.
+#[allow(clippy::too_many_arguments)]
+pub fn train_cat<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_columns: &[Vec<String>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+) -> CbResult<Model> {
+    train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        cat_columns,
+        target,
+        weights,
+        params,
+        staged_out,
+        &[],
+        None,
+    )
+}
+
+/// The shared boosting loop body for the numeric ([`train_with_eval_sets`]) and
+/// cat-aware ([`train_cat`]) entry points. `cat_columns` is EMPTY for the numeric
+/// path (byte-identical to the pre-05-11 driver); a non-empty `cat_columns`
+/// computes OnLearnOnly cardinalities, feeds the REAL cat set to
+/// [`tensor_ctr_candidates`], and materializes a per-candidate combined-projection
+/// online CTR feature column ([`crate::materialize_ctr_feature`]).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn train_inner<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_columns: &[Vec<String>],
     target: &[f64],
     weights: &[f64],
     params: &BoostParams,
@@ -907,20 +990,117 @@ pub fn train_with_eval_sets<R: Runtime>(
     // Tensor / combination CTR candidate generation (ORD-05 / D-05, AddTreeCtrs,
     // greedy_tensor_search.cpp:491-551): emit the SimpleCtr / CombinationCtr
     // projections over the CTR-eligible cat features under the
-    // `params.max_ctr_complexity` gate (:532-533). This whole-set numeric `train`
-    // driver carries NO categorical columns (`cat_cardinalities = &[]`), so the
-    // emission yields an EMPTY candidate set here and no CTR split is chosen —
-    // the float-only oracles are byte-for-byte unchanged. The categorical
-    // train→predict path (which supplies real cat columns, materializes each
-    // candidate's combined-projection online CTR value via the 05-04/05/06
-    // accumulation keyed on `TProjection::combined_hash`, scores it alongside the
-    // float candidates, and persists a chosen CTR split as a `CtrSplitSpec`) is
-    // exercised end-to-end by the `tensor_ctr_e2e` oracle. The candidate gate is
-    // wired HERE so the `max_ctr_complexity` bound is honored at the train()
-    // candidate-generation site (no unbounded enumeration, T-05-09-01).
-    let cat_cardinalities: &[u32] = &[];
-    let ctr_candidates =
-        tensor_ctr_candidates(cat_cardinalities, params.one_hot_max_size, params.max_ctr_complexity);
+    // `params.max_ctr_complexity` gate (:532-533).
+    //
+    // CAT INGESTION (Plan 05-11): the cat-aware path computes per-cat-feature
+    // OnLearnOnly cardinalities (`learn_set_cardinality` = calc_cat_feature_hash +
+    // PerfectHash, NEVER a model's CTR hash map) and feeds the REAL cat set to
+    // `tensor_ctr_candidates`. The numeric `train` / `train_with_eval_sets` path
+    // supplies an EMPTY `cat_columns`, so the cardinalities and candidate set are
+    // both empty and the float-only oracles are byte-for-byte unchanged.
+    let cat_cardinalities: Vec<u32> = cat_columns
+        .iter()
+        .map(|col| {
+            let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+            crate::candidates::learn_set_cardinality(&as_str)
+        })
+        .collect::<CbResult<Vec<u32>>>()?;
+    let ctr_candidates = tensor_ctr_candidates(
+        &cat_cardinalities,
+        params.one_hot_max_size,
+        params.max_ctr_complexity,
+    );
+
+    // Map the CTR-eligible-position projection members emitted by
+    // `tensor_ctr_candidates` (dense positions into the CTR-eligible feature list,
+    // candidates.rs) back to ABSOLUTE `cat_columns` indices so
+    // `materialize_ctr_feature` reads the right columns. The eligible list is the
+    // cat features routing to the CTR path (cardinality > one_hot_max_size), in
+    // ascending absolute-index order.
+    let eligible_absolute: Vec<usize> = cat_cardinalities
+        .iter()
+        .enumerate()
+        .filter(|(_, &card)| {
+            crate::candidates::route_categorical(card, params.one_hot_max_size)
+                == crate::candidates::EncodingPath::Ctr
+        })
+        .map(|(abs_idx, _)| abs_idx)
+        .collect();
+
+    // The single learn permutation for the per-candidate online CTR materialization
+    // (the per-fold online-CTR-during-growth order). Built ONCE here, BEFORE the
+    // tree loop, from the continuous-stream RNG — `create_folds` appears at most
+    // TWICE in this production module (one for the Ordered split-scoring fold set
+    // above, one here for the cat-CTR learn permutation; FOLDS-BUILT-ONCE grep
+    // bound <= 2). Only built when there are CTR candidates to materialize (the
+    // numeric path skips it entirely, leaving the draw stream untouched).
+    let cat_learn_permutation: Option<Vec<i32>> = if ctr_candidates.is_empty() {
+        None
+    } else {
+        let folds: Vec<Fold> = crate::fold::create_folds(
+            n,
+            params.permutation_count,
+            /* permutation_needed_for_learning = */ true,
+            /* dynamic_body_tail = */ false,
+            params.fold_len_multiplier,
+            params.random_seed,
+        );
+        // The learn permutation is the first learning fold's (permutation_count=1 →
+        // one learning fold); fall back to identity if none (degenerate).
+        Some(
+            folds
+                .iter()
+                .find(|f| !f.is_averaging)
+                .map(|f| f.permutation.clone())
+                .unwrap_or_else(|| (0..n as i32).collect()),
+        )
+    };
+
+    // The binclf target class per object (matching the e2e oracle binarization):
+    // `target_class[i] = usize::from(target[i] > 0.5)`.
+    let target_class: Vec<usize> = target.iter().map(|&t| usize::from(t > 0.5)).collect();
+
+    // The combination/simple CTR prior PAIR (numerator + unit denominator). The
+    // head prior of the explicit `combinations_ctr_priors` (`0.5` for the in-scope
+    // `Borders:Prior=0.5` fixture); the denominator is `1` (RESEARCH A6) — both
+    // halves are carried so the Plan 05-12 bake receives the denominator for
+    // `calc_normalization`, never a pre-divided scalar.
+    let ctr_prior_num = params.combinations_ctr_priors.first().copied().unwrap_or(0.5);
+    let ctr_prior_denom = 1.0;
+    let ctr_border_count = ctr_border_count_default();
+
+    // Materialize a combined-projection online CTR feature column PER candidate
+    // (Plan 05-11). In THIS plan the columns are carried for Plan 05-12's scoring;
+    // the tree search does not yet split on them, so the numeric path is unaffected.
+    let materialized_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
+        if let Some(learn_perm) = cat_learn_permutation.as_deref() {
+            let mut cols = Vec::with_capacity(ctr_candidates.len());
+            for cand in &ctr_candidates {
+                // Re-index the candidate's CTR-eligible-position members to absolute
+                // cat-feature indices, then materialize over the absolute projection.
+                let absolute_members: Vec<usize> = cand
+                    .projection
+                    .cat_features()
+                    .iter()
+                    .filter_map(|&pos| eligible_absolute.get(pos).copied())
+                    .collect();
+                let absolute_projection = crate::TProjection::from_features(&absolute_members);
+                let col = crate::ctr::materialize_ctr_feature(
+                    cat_columns,
+                    &absolute_projection,
+                    learn_perm,
+                    &target_class,
+                    ctr_prior_num, ctr_prior_denom,
+                    ctr_border_count,
+                )?;
+                cols.push(col);
+            }
+            cols
+        } else {
+            Vec::new()
+        };
+    // Carried for Plan 05-12 scoring; not yet split on (numeric path unaffected).
+    let _ = &materialized_ctr_features;
 
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
