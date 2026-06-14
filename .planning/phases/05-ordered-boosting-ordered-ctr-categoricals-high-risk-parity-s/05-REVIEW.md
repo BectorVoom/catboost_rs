@@ -2,373 +2,208 @@
 phase: 05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s
 reviewed: 2026-06-14T00:00:00Z
 depth: standard
-files_reviewed: 20
+files_reviewed: 12
 files_reviewed_list:
-  - crates/catboost-rs/src/builder.rs
   - crates/cb-model/src/apply.rs
   - crates/cb-model/src/ctr_data.rs
   - crates/cb-model/src/lib.rs
-  - crates/cb-oracle/src/compare.rs
-  - crates/cb-oracle/src/error.rs
-  - crates/cb-oracle/src/lib.rs
-  - crates/cb-oracle/src/model_json.rs
-  - crates/cb-oracle/generator/ordered_oracle.cpp
+  - crates/cb-model/src/model.rs
   - crates/cb-train/src/boosting.rs
-  - crates/cb-train/src/candidates.rs
-  - crates/cb-train/src/ctr/calc_ctr.rs
-  - crates/cb-train/src/ctr/final_ctr.rs
+  - crates/cb-train/src/ctr/bake.rs
+  - crates/cb-train/src/ctr/ctr_feature.rs
   - crates/cb-train/src/ctr/mod.rs
-  - crates/cb-train/src/ctr/online.rs
   - crates/cb-train/src/fold.rs
   - crates/cb-train/src/lib.rs
   - crates/cb-train/src/permutation.rs
-  - crates/cb-train/src/projection.rs
   - crates/cb-train/src/tree.rs
 findings:
-  critical: 3
-  warning: 7
+  critical: 0
+  warning: 3
   info: 5
-  total: 15
+  total: 8
 status: issues_found
 ---
 
-# Phase 5: Code Review Report
+# Phase 5: Code Review Report (ORD-05 CTR leaf-value gap closure, plans 05-12/05-13/05-14)
 
 **Reviewed:** 2026-06-14
 **Depth:** standard
-**Files Reviewed:** 20
+**Files Reviewed:** 12
 **Status:** issues_found
+**Scope:** diff `03e3b1f..HEAD` for the 12 listed files only.
 
 ## Summary
 
-This slice implements the high-risk parity surface: per-fold permutation
-(Fisher-Yates over `TFastRng64`), online/ordered CTR, categorical one-hot vs CTR
-routing, tensor-CTR projections, the ordered-boosting approximant, and the
-standalone C++ oracle generator. The Rust code is disciplined about checked
-access and the no-panic contract; most paths route float sums through `sum_f64`.
+Reviewed the ORD-05 CTR leaf-value gap-closure diff: the identity-`Folds[0]` +
+pre-averaging draw rework in `fold.rs`, the CTR-aware oblivious structure search
+in `tree.rs`, the two-materialization leaf-value wiring + whole-set `ctr_data`
+bake in `boosting.rs`/`bake.rs`, and the Scale/Shift threading + canonical key
+sharing in `apply.rs`/`ctr_data.rs`/`model.rs`.
 
-The dominant risk in a bit-exact-parity project is not crashes but **silent
-numeric divergence**, and the most serious finding is exactly that: the C++
-oracle generator (`ordered_oracle.cpp`) — which is supposed to be the cross-check
-ground truth for the D-03 permutation linchpin — generates per-fold permutations
-with a DIFFERENT seeding discipline than the Rust `permutations()` it is meant to
-agree with. For fold 0 they coincide; for every fold k>0 they diverge, which
-defeats the multi-fold oracle and is a correctness defect in the parity harness
-itself. Two further C++ oracle transcription divergences (online CTR float-cast
-ordering and the body/tail growth guard) are flagged.
+The parity-critical machinery is sound for the in-scope `permutation_count = 1`
+config that the `tensor_ctr_e2e` hard gate validates:
+- bake key reconstructs the apply key byte-for-byte — both via `ctr_base_key`
+  over the sorted projection (`TProjection::from_features` sorts), both folding
+  per-feature `calc_cat_feature_hash` through `fold_cat_hash` from the `0` seed;
+- the Borders class-count ordering `[N0, N1]` is consistent between
+  `build_final_ctr` (flattened `[bucket0_class0, bucket0_class1, …]`) and
+  `calc_for_hash` (`n0=counts[0]`, `n1=counts[1]`, `(n1, n0+n1)`);
+- the online-bin and inference-`Calc` spaces reconcile through `(Shift, Scale)`
+  when `PriorDenom == 1` (`(ctr+shift)/norm*borderCount` == `(ctr+Shift)*Scale`
+  with `Scale = borderCount/norm`);
+- Scale/Shift now thread through BOTH the table-found and not-found apply
+  branches (the prior hardcoded `0.0/1.0` is gone on both);
+- NO `unwrap`/`expect`/`panic`/`unreachable` in any reviewed production file —
+  all lookups are checked `.get`; the `l2_split_score` terms are non-negative so
+  the `cat_feature_weight` multiplier cannot invert a penalty into a bonus.
 
-Several Rust findings concern subtle parity hazards: the `Counter` CTR
-denominator (max bucket total) interacts with the documented "missing bucket →
-emptyVal" path in a way that can disagree with upstream when the queried hash is
-present-but-empty vs absent; the ordered-approx carries a dead `sum_weights`
-accumulator that signals an unfinished multi-leaf pooled-denominator path; and
-the FeatureFreq denominator uses `.sum()` which, while integer-correct here,
-violates the stated reduction discipline as a latent footgun.
+Both changed crates `cargo check` clean.
 
-## Critical Issues
-
-### CR-01: C++ oracle generates per-fold permutations with the wrong seeding discipline (diverges from the Rust ground truth for every fold k>0)
-
-**File:** `crates/cb-oracle/generator/ordered_oracle.cpp:391-395`
-**Issue:** The harness header (lines 38-49) declares the permutation is
-cross-checked against the Rust `TFastRng64` reproduction, which is "ground
-truth; this harness must AGREE with it (Stage::Permutation, integer-exact)." But
-the Rust ground truth (`crates/cb-train/src/permutation.rs:155-160`
-`permutations`, used by `crates/cb-train/src/fold.rs:221` `create_folds`) draws
-ALL folds from a SINGLE persistent RNG advancing continuously across folds — fold
-1 continues from fold 0's resulting RNG phase, never reseeded. The C++ generator
-instead reseeds each fold independently:
-
-```cpp
-for (int k = 0; k < std::max(1, foldCount); ++k) {
-    ui64 foldSeed = seed + (ui64)k;                 // WRONG: fresh per-fold seed
-    std::vector<i32> perm = FisherYatesPermutation(n, foldSeed);
-    WriteNpyI32(outDir + "/permutation_fold" + std::to_string(k) + ".npy", perm);
-}
-```
-
-`FisherYatesPermutation` calls `TFastRng64::FromSeed(foldSeed)` (line 216),
-re-deriving a fresh stream. For fold 0 (`foldSeed == seed`) this coincides with
-the Rust output, masking the bug; for every fold k>0 the C++ permutation is
-computed from `from_seed(seed + k)` while the Rust permutation continues the
-fold-0 stream — these are different index arrays. Since the `ordered_ctr`
-fixture commits fold-0 AND fold-1 permutations specifically for the D-03 gate
-(see `online.rs:343-345`), a fixture regenerated by this harness would either
-fail `compare_permutation(Stage::Permutation)` against the Rust impl for fold 1,
-or — worse — if the fixtures were frozen FROM this harness, the Rust impl would
-be silently validated against a wrong oracle, defeating the entire D-03 linchpin.
-
-**Fix:** Reproduce the continuous-stream discipline: seed one `TFastRng64` once
-and draw each fold's shuffle from it in order, exactly as `permutations()` does:
-```cpp
-TFastRng64 gen = TFastRng64::FromSeed(seed);
-for (int k = 0; k < std::max(1, foldCount); ++k) {
-    std::vector<i32> perm(n);
-    for (size_t i = 0; i < n; ++i) perm[i] = (i32)i;
-    for (size_t i = 1; i < n; ++i) std::swap(perm[i], perm[(size_t)gen.Uniform((ui64)i + 1)]);
-    WriteNpyI32(outDir + "/permutation_fold" + std::to_string(k) + ".npy", perm);
-}
-```
-Refactor `FisherYatesPermutation` to take a `TFastRng64&` (matching
-`shuffle_in_place`) so fold 0's online-CTR path (line 398) can reuse the same
-continuous draw rather than re-seeding. Note line 398 ALSO re-seeds
-(`FisherYatesPermutation(n, seed)`), so the online-CTR fixture is computed over a
-fold-0 permutation that happens to match Rust today only because fold 0's seed is
-`seed` — fragile and must be unified.
-
-### CR-02: `Counter`/`FeatureFreq` CTR cannot distinguish a present-empty bucket from a missing bucket, diverging from upstream emptyVal semantics
-
-**File:** `crates/cb-model/src/ctr_data.rs:252-259` (and `apply.rs` callers)
-**Issue:** The module doc (lines 32-34) states the not-found path must yield
-`Calc(0, CounterDenominator)` for Counter/FeatureFreq. `numerator_denominator`
-implements this by mapping a `None` bucket to total `0`:
-```rust
-let total = bucket
-    .and_then(|b| self.counts_at(b))
-    .and_then(|c| c.first().copied())
-    .unwrap_or(0) as f64;
-(total, self.counter_denominator as f64)
-```
-The problem is the `unwrap_or(0)` collapses THREE distinct cases to the same
-`(0, denom)`: (a) bucket absent, (b) bucket present but `counts_at` returns
-`Some(&[])` (empty inner vector), and (c) bucket present with first count `0`.
-For Counter the upstream emptyVal is `Calc(0, denom)` only for the genuinely
-not-found case; a present bucket with total `0` is impossible upstream (a bucket
-exists iff at least one document landed in it, so its total is ≥ 1), so case (c)
-is benign. But case (b) — a structurally present hash whose decoded counts vector
-is empty (reachable from a malformed/zero-stride `.cbm` or a `hash_stride == 1`
-JSON table where every bucket has zero counts, see `from_json` lines 412-420
-which push an empty `counts` when `stride == 1`) — is silently treated as the
-empty value instead of being rejected or producing the bucket's real (degenerate)
-value. Combined with `CR-03`, a `stride == 1` integer table round-trips to
-all-empty `int_counts`, so `counts_at(b)` returns `Some(&[])`, `c.first()` is
-`None`, and the lookup yields `(0, denom)` for EVERY hash whether present or not —
-indistinguishable, and not what upstream computes.
-**Fix:** Treat a present-but-empty counts vector as a typed decode error at
-parse time (a Counter/FeatureFreq table must have stride ≥ 2: hash + ≥1 total),
-rather than letting it silently degrade at apply time. In
-`numerator_denominator`, distinguish `Some(counts)` with `counts.is_empty()` from
-the `None` bucket and surface it (e.g. via a checked path) instead of folding
-both to `(0, denom)`.
-
-### CR-03: `to_json`/`from_json` integer-table stride is derived from the FIRST bucket, silently corrupting ragged or empty tables
-
-**File:** `crates/cb-model/src/ctr_data.rs:331-342` (`to_json`) and `547-587`
-(`encode_ctr_data`)
-**Issue:** For the integer (non-mean) path `to_json` computes the stride from
-only the first bucket:
-```rust
-let width = self.int_counts.first().map_or(0, Vec::len);
-stride = 1 + width as i64;
-```
-then emits every bucket's counts regardless of that bucket's actual length. If
-buckets have differing widths (which `from_json` permits — it pushes whatever
-count slots each chunk holds, lines 412-420, and `decode_ctr_data` likewise reads
-`stride` counts per bucket but never asserts every bucket matches), `to_json`
-produces a `hash_map` whose true element count is NOT `bucket_count * stride`, so
-the re-parse `is_multiple_of(stride)` check (line 373) either rejects a valid
-table or, worse, silently re-chunks counts into the wrong buckets. The same
-first-bucket-stride assumption is in `encode_ctr_data` (line 569) and
-`decode_ctr_data` (line 615 reads a single `stride` for all buckets). The model
-side never validates that all `int_counts[i].len()` are equal, so a table built
-with ragged widths (e.g. from a hand-constructed `CtrValueTable` or a future
-multi-class Buckets path with variable class counts) serializes to a corrupt blob
-that mis-parses without error — a silent data-integrity defect in a
-parity-critical serializer.
-**Fix:** Validate the table invariant before encoding: assert every
-`int_counts[i].len() == width` (return a typed error otherwise), or carry the
-stride explicitly on `CtrValueTable` and bound each bucket's read to it. At
-decode, reject any blob whose remaining length is not consistent with
-`bucket_count * stride`.
+No Critical defects (no new network/auth/file surface, no data-loss path, no
+crash path). The findings center on one real correctness risk: the new draw-order
+logic and the structure/averaging permutation selection are validated ONLY for
+`permutation_count = 1`, while the production DEFAULT is `permutation_count = 4`,
+and the inline draw-order contract is incorrect for that default.
 
 ## Warnings
 
-### WR-01: Dead `sum_weights` accumulator signals an unfinished ordered-approx pooled denominator
+### WR-01: Pre-averaging draw fires before the first LEARNING fold (not the averaging fold) when `permutation_count > 1` — default is 4
 
-**File:** `crates/cb-train/src/boosting.rs:388-424`
-**Issue:** `ordered_approx_delta_simple` maintains `sum_weights` (seeded from
-`body_sum_weight`, incremented per tail row) but never uses it — line 424
-explicitly discards it with `let _ = sum_weights;`. The delta is computed from
-the PER-LEAF weight only (`gradient_leaf_delta(leaf_der, leaf_weight, ...)`). The
-doc comment (lines 420-423) rationalizes this as "carried for parity
-bookkeeping ... the multi-leaf pooled denom variant." For the single-leaf path
-this is harmless, but for a real depth>0 ordered tree the upstream
-`CalcMethodDelta` denominator is the per-leaf sum (correct here) — so the
-`sum_weights` machinery is pure dead code that misleads a reader into thinking a
-pooled denominator is wired up. If a future depth>0 ordered path is added, this
-half-built accumulator is a trap.
-**Fix:** Delete the `sum_weights` accumulator entirely (it never affects output),
-or finish the multi-leaf path and consume it. Dead code must be removed
-(CLAUDE.md: "Dead code must be deleted, not commented out" — the spirit applies
-to dead live-code too).
+**File:** `crates/cb-train/src/fold.rs:259-286`
+**Issue:** The learning-permutation-needed branch emits the identity for `idx ==
+0` and inserts exactly ONE pre-draw (`rng.gen_rand()`) before the FIRST
+non-identity shuffle, guarded by `first_real_shuffle`, then shuffles every
+subsequent fold. For `permutation_count = 1` this is correct: `learning_folds =
+1`, so `idx == 1` IS the averaging fold and the pre-draw precedes the averaging
+shuffle (matching the "averaging shuffle starts at RNG call-count 1" upstream
+claim). But the production default is `permutation_count = 4`
+(`boosting.rs:227-229` `permutation_count_default()` returns `4`), giving
+`learning_folds = 3`. There the pre-draw lands before `idx == 1` — the FIRST
+LEARNING fold — and three learning shuffles are drawn before the averaging fold
+at `idx == 4`. The doc comment at `fold.rs:264-271` asserts the draw is "between
+the identity learning Folds[0] and the AveragingFold's Shuffle," which is FALSE
+once intervening learning folds exist. Consequently `boosting.rs:1147-1150`
+(`find(|f| f.is_averaging)`) pulls the averaging permutation at an unvalidated RNG
+call-count for the default config, and the structure search uses only the FIRST
+learning fold (`boosting.rs:1140-1143`, the identity), ignoring learning folds
+1..3. The `tensor_ctr_e2e` gate exercises ONLY `permutation_count = 1`, so the
+default path's bit-exact parity is untested and the comment is misleading.
+**Fix:** Confirm against upstream whether the single pre-`GenRand` precedes the
+AVERAGING shuffle specifically. If so, fire it immediately before the averaging
+fold regardless of how many learning folds precede it, and correct the comment:
+```rust
+let is_averaging_fold = idx == learning_folds;
+let permutation: Vec<i32> = if idx == 0 {
+    (0..n).map(|i| i as i32).collect()
+} else {
+    if is_averaging_fold && needs_pre_averaging_draw {
+        rng.gen_rand(); // one GenRand immediately before the averaging shuffle
+    }
+    shuffle_in_place(n, &mut rng)
+};
+```
+Otherwise gate the new discipline to `permutation_count == 1` and add an oracle
+covering `permutation_count > 1`, or document the restriction at the `train_cat`
+boundary.
 
-### WR-02: FeatureFreq denominator uses `.sum()` rather than the sanctioned reduction, contradicting the stated discipline
+### WR-02: Whole-set bake dedups by projection only, but the apply table key is `(ctr_type, projection)`
 
-**File:** `crates/cb-train/src/ctr/final_ctr.rs:123`
-**Issue:** `table.counter_denominator = acc.total_counts.iter().copied().sum();`
-uses the raw iterator `.sum()`. The module doc (lines 28-35) and the project
-constraint both insist parity-critical reductions route through `sum_f64`. These
-are `i64` integer counts so the result is exact regardless — this is not a
-present numeric bug — but it (a) violates the explicitly documented discipline in
-the same file, and (b) the FeatureFreq total over many large buckets can overflow
-`i64` silently (wrapping in release), whereas a checked accumulation would catch
-it. The neighboring `TCtrHistory::total` (`online.rs:76` `self.n.iter().sum()`)
-has the same pattern.
-**Fix:** Use a checked/explicit fold (`try_fold` with `checked_add`, surfacing
-`CbError::OutOfRange` on overflow) for the integer denominators, consistent with
-the no-silent-overflow parity bar.
+**File:** `crates/cb-train/src/boosting.rs:1624-1648`
+**Issue:** The bake loop tracks distinct chosen splits by projection alone
+(`if !seen.iter().any(|p| p == &spec.projection)`, line 1630) and the
+Shift/Scale/prior copy-back also matches on projection only
+(`.find(|t| t.projection == spec.projection)`, line 1652). The apply-side table
+key is `(ctr_type, projection)` (`ctr_base_key`, `apply.rs:129`;
+`ctr_data.rs:303`). Today every `CtrSplitSpec.ctr_type` is `Borders` (the only
+type `materialize_ctr_feature` emits) and `bake_ctr_table` hardcodes
+`ECtrType::Borders` (`bake.rs:227`), so the mismatch is latent. But if a second
+CTR type is ever scored for the same projection: (1) only ONE Borders table is
+baked, (2) the second type's split gets Borders prior/Scale/Shift copied onto it,
+and (3) its apply lookup (`ctr:type=<other>:proj=…`) misses the table and
+silently falls to the not-found branch — a silent wrong-prediction path with no
+error.
+**Fix:** Key the `seen` dedup and the copy-back on the full `(ctr_type,
+projection)` tuple, and bake a table per distinct `(ctr_type, projection)`,
+threading `spec.ctr_type` into `bake_ctr_table` instead of the hardcoded
+`ECtrType::Borders`.
 
-### WR-03: C++ online-CTR cast ordering may diverge from upstream `(float)good`/`int total`
+### WR-03: Bake uses the global prior, ignoring (and overwriting) each split's own prior
 
-**File:** `crates/cb-oracle/generator/ordered_oracle.cpp:238-240, 273`
-**Issue:** `CalcCtrValue(float countInClass, int totalCount, float prior)`
-computes `(countInClass + prior) / (float)(totalCount + 1)` — the numerator and
-denominator are `float`. The Rust `calc_ctr_online` (`calc_ctr.rs:76-79`) does
-`(count_in_class + prior) / (total_count as f64 + 1.0)` in `f64`. The harness
-then stores `(double)CalcCtrValue(...)` (line 273), so the f32 intermediate is
-widened to f64 AFTER the f32 division. The Rust path divides in f64 throughout.
-For the `≤1e-5` tolerance these usually agree, but a f32 division rounded then
-widened is NOT bit-identical to an f64 division, and for adversarial counts the
-relative error of a single-precision divide can approach ~6e-8 of the magnitude —
-fine at 1e-5 today, but the harness is supposed to be the EXACT transcription of
-upstream `online_ctr.h:128-131`. If upstream's `CalcCTR` is genuinely f32 (the
-comment claims so), then the RUST side is wrong (computing in f64); if upstream
-is f64, the HARNESS is wrong. The two implementations disagree on the
-accumulation type, and one of them does not match upstream.
-**Fix:** Pin the precision against the upstream source: confirm whether
-`online_ctr.h:128-131 CalcCTR` returns `float` or `double` and make BOTH the
-harness and `calc_ctr_online` match it exactly (same intermediate type, same cast
-points). Document the resolved type at both sites.
-
-### WR-04: `body_tail_boundaries` forces `n` on a degenerate multiplier, masking a misconfiguration instead of matching upstream
-
-**File:** `crates/cb-train/src/fold.rs:121-125`
-**Issue:** When `select_tail_size(left_part_len, multiplier) <= left_part_len`
-(a multiplier ≤ 1.0, which never grows the prefix) the code forces
-`tail_finish = n` to guarantee termination. This is a reasonable anti-infinite-
-loop guard, but it SILENTLY produces a body/tail sequence that does not match
-what upstream would do with that multiplier (upstream's real multiplier is always
-> 1, so upstream never hits this; but if a fixture or caller passes
-`fold_len_multiplier <= 1.0`, the Rust output is a fabricated single jump to `n`
-rather than an error). Since `fold_len_multiplier` is a tunable `BoostParams`
-field (`boosting.rs:166`), a bad value yields a plausible-but-wrong fold
-structure with no signal.
-**Fix:** Reject `multiplier <= 1.0` with a typed `CbError::Degenerate` at the
-fold-construction entry point (`create_folds` / `body_tail_boundaries`), so a
-misconfigured multiplier fails loudly rather than producing a non-parity fold.
-
-### WR-05: `predict_raw` substitutes `f32::NAN` for short feature columns, which can pass float splits
-
-**File:** `crates/cb-model/src/apply.rs:163-176`
-**Issue:** When gathering an object's row, a column shorter than `n_objects`
-contributes `f32::NAN` (line 172). The doc claims a missing value yields a
-`false` split test, and `passes_split` does `f64::from(v) > split.border` which
-is indeed `false` for NaN. So far benign. But `n_objects` is taken from the FIRST
-column only (line 164); if the first column is the SHORT one and a later column
-is longer, objects beyond the first column's length are never produced at all
-(under-prediction), while if the first column is the longest, short later columns
-inject NaN rows. Either way a ragged `feature_values` (a caller bug) produces
-silent wrong-length or NaN-laden output rather than an error. In a parity context
-a length mismatch should be rejected.
-**Fix:** Validate that every column in `feature_values` has the same length up
-front; return a typed `ModelError` on a ragged matrix instead of silently
-NaN-filling.
-
-### WR-06: C++ oracle reads `targetClass[doc]` and `catBin[doc]` with no bounds check on permutation indices
-
-**File:** `crates/cb-oracle/generator/ordered_oracle.cpp:265-275, 381-385`
-**Issue:** `ComputeOnlineCtr` indexes `catBin[doc]` and `targetClass[doc]` with
-`doc = permutation[p]` using raw `operator[]`. The permutation is generated
-internally so indices are in range today, but stdin-driven `targetClass` /
-`catBin` are read with `std::cin >> ...` into vectors sized `n` (lines 380-385)
-with no validation that the stream actually supplied `n` well-formed integers — a
-short or malformed stdin leaves trailing elements value-initialized (0) silently,
-and a `targetClass` value outside `{0,1}` would index `elem[targetClass[doc]]`
-(`std::array<int,2>`) out of bounds (UB) at line 275. This is an offline
-generator that "never runs in CI," but it produces the FROZEN fixtures the whole
-Rust lane trusts; a malformed input silently yields a plausible-but-wrong fixture.
-**Fix:** After each `std::cin >> x` block, check `std::cin` state and `abort`
-with a diagnostic on failure; validate `0 <= targetClass[i] < 2` and
-`doc < n` before indexing.
-
-### WR-07: `learning_fold_count` / fold draw-order parity is asserted only by comment, and `from_seed(rand_seed + task_idx)` can collide across features
-
-**File:** `crates/cb-train/src/tree.rs:462-465`
-**Issue:** In the perturbed search, each candidate feature reseeds
-`TFastRng64::from_seed(rand_seed.wrapping_add(task_idx))` then `advance(10)`. The
-header (lines 333-345) claims this matches upstream `randSeed + taskIdx`. Two
-hazards: (1) `task_idx` is a dense re-index over features-WITH-borders (line 455,
-incremented only when `!borders.is_empty()`), whereas upstream's `taskIdx` may be
-the absolute candidate/feature index — if upstream does NOT skip empty-border
-features in the task numbering, the seeds diverge for every feature after the
-first empty one, silently breaking perturbation parity. (2) `rand_seed +
-task_idx` with wrapping can alias two different `(rand_seed, task_idx)` pairs to
-the same feature RNG across levels, though `advance(10)` mitigates within a level.
-The boosting.rs header itself (lines 1028-1032) admits "a per-tree main-RNG phase
-drift remains for tree-1+" — i.e. perturbation parity is known-unlocked beyond
-tree 0.
-**Fix:** Confirm upstream's `taskIdx` numbering (absolute feature index vs
-dense-over-nonempty) against `tensor_search_helpers.cpp:716` and make the Rust
-re-index match exactly; if it must be absolute, increment `task_idx` for EVERY
-feature, not only non-empty ones.
+**File:** `crates/cb-train/src/boosting.rs:1631-1640,1649-1659`
+**Issue:** `bake_ctr_table(... ctr_prior_num, ctr_prior_denom)` passes the SINGLE
+global prior (`ctr_prior_num = combinations_ctr_priors.first().copied().unwrap_or(0.5)`,
+line 1164) for every chosen split, then copies `table.prior_num`/`table.prior_denom`
+(the global prior) BACK onto each `CtrSplitSpec` (lines 1655-1656), OVERWRITING
+the per-column prior the structure search recorded (`tree.rs:803-804`).
+`calc_normalization` is prior-dependent, so a future multi-prior candidate set
+(`combinations_ctr_priors` with >1 entry — the API accepts it) would bake the
+WRONG `(Shift, Scale)` and prior for any split whose prior differs from
+`priors[0]`. Inert for the in-scope single-prior fixture.
+**Fix:** Bake with the split's own prior (`spec.prior_num`, `spec.prior_denom`)
+and copy back only `shift`/`scale`, leaving `spec.prior_num`/`spec.prior_denom`
+intact.
 
 ## Info
 
-### IN-01: `bias` added once but `scale` is dropped on the apply path
+### IN-01: `ECtrType::from_i8(...).unwrap_or(ECtrType::Borders)` silently coerces unknown types
 
-**File:** `crates/cb-model/src/apply.rs:130-149`; `model_json.rs:233-247`
-**Issue:** The oracle parses `scale_and_bias = [scale, [bias,…]]` but only reads
-`bias` (`model_json.rs:239-247`); the apply path adds `bias` and never multiplies
-by `scale`. For the in-scope single-target models `scale == 1`, so this is inert,
-but it is an undocumented assumption — a model with `scale != 1` would silently
-mis-predict.
-**Fix:** Either read and apply `scale` in the canonical model, or assert
-`scale == 1.0` at load and reject otherwise, documenting the constraint.
+**File:** `crates/cb-model/src/ctr_data.rs:311`
+**Issue:** `CtrData::from_baked` maps an unrecognized `t.ctr_type` i8 to `Borders`
+rather than surfacing the inconsistency. Since `bake_ctr_table` only emits
+`Borders.as_i8()` this cannot misfire today, but it would mask a future bake/lift
+type mismatch as a silent wrong-table selection.
+**Fix:** Make `from_baked` fallible and propagate a typed error, or assert the
+expected discriminant rather than defaulting.
 
-### IN-02: `target_classes_count.max(0) as usize` clamp hides a malformed negative value
+### IN-02: Hardcoded `2` target-class count in the bake call
 
-**File:** `crates/cb-model/src/ctr_data.rs:365, 426`
-**Issue:** `json.target_classes_count.max(0) as usize` silently coerces a negative
-`target_classes_count` (a malformed model.json) to `0` rather than erroring. The
-surrounding code is otherwise scrupulous about rejecting malformed input with
-typed errors.
-**Fix:** Return `ModelError::Deserialize` for a negative `target_classes_count`,
-consistent with the rest of the parser.
+**File:** `crates/cb-train/src/boosting.rs:1635`
+**Issue:** `bake_ctr_table(..., 2, ...)` hardcodes the binclf class count
+(`// binclf target-class count`). The same magic `2` and a `> 0.5` binarization
+recur in the materialization path. Acceptable for the binclf-only scope, but it
+pins the bake to binary classification with no compile-time tie to the actual
+target arity.
+**Fix:** Derive the class count from a named constant or the resolved target type
+so a future multiclass path cannot silently bake a 2-class table.
 
-### IN-03: `calc_inference` / `calc_ctr_inference` guard `denom == 0.0` but not a NaN denom
+### IN-03: `bake_ctr_table` passes `classes` as `target_border_count`
 
-**File:** `crates/cb-model/src/ctr_data.rs:269-277`; `calc_ctr.rs:114-129`
-**Issue:** The zero-denominator guard returns `0.0`, but if `tot` or `prior.denom`
-is NaN (not reachable from the current integer-count callers, but the function is
-`pub`), `denom == 0.0` is false and the NaN propagates into the result. The
-companion `assert_abs_close` (`compare.rs:58`) is explicitly NaN-aware; these
-producers are not.
-**Fix:** Guard `!denom.is_finite() || denom == 0.0` to return the empty value,
-mirroring the comparator's NaN discipline.
+**File:** `crates/cb-train/src/ctr/bake.rs:191`
+**Issue:** `accumulate_online(&key_refs, &target_class_n, &target_zero, classes,
+classes)` supplies `classes` (2) for BOTH the `classes` and the
+`target_border_count` parameters. For binclf Borders the conventional target
+border count is `1`, not `2`. The `tensor_ctr_e2e` gate passes (the producer is
+internally consistent), but the dual use of `classes` is non-obvious and easy to
+mis-read when the producer signature is reused for another type.
+**Fix:** Bind a named `target_border_count` with a justifying comment and pass it
+explicitly.
 
-### IN-04: `distinct_bins_ascending` is O(n²) but, more relevantly, relies on `Vec::contains` where a sorted dedup is clearer
+### IN-04: Apply compares a continuous CTR value to an integer bin border; train truncates first
 
-**File:** `crates/cb-train/src/tree.rs:539-548`
-**Issue:** `distinct_bins_ascending` does a linear `seen.contains(&bin)` per
-element then sorts. Performance is out of v1 scope, but the two-phase
-(collect-distinct-then-sort) is more error-prone than `sort_unstable(); dedup()`.
-Not a correctness bug.
-**Fix:** `let mut v = column.to_vec(); v.sort_unstable(); v.dedup(); v` — single
-pass intent, identical ascending-distinct result.
+**File:** `crates/cb-model/src/apply.rs:188`, `crates/cb-train/src/ctr/ctr_feature.rs:218`, `crates/cb-train/src/tree.rs` (`passes_ctr_aware`)
+**Issue:** The structure/averaging assignment compares the TRUNCATED integer bin
+(`f64::from(bin) > border`; `bins` are `bin_f.trunc()`), while the apply path
+compares the CONTINUOUS scaled CTR value (`ctr_value > split.border`). The two
+share the same border space (verified: online-bin == inference-`Calc` when
+`PriorDenom == 1`) but differ on the fractional part — e.g. a continuous `8.5`
+passes border `8` at apply while a truncated bin `8` does not exceed `8` at train.
+This is intentional (train/apply partitions legitimately differ — the summaries'
+`[6,0,9,15]` structure vs `[10,0,0,20]` apply) and the e2e gate validates apply
+against upstream, so it is NOT a defect — but the asymmetry is subtle and
+undocumented at the comparison sites.
+**Fix:** Add a one-line comment at `passes_ctr_split` noting that apply compares
+the continuous CTR value whereas the train-side search compares the truncated
+bin, so the partitions need not match.
 
-### IN-05: Large commented draw-order narratives risk drifting from the code
+### IN-05: Import ordering breaks the alphabetical grouping in two `pub use` blocks
 
-**File:** `crates/cb-train/src/boosting.rs:857-1041`
-**Issue:** The RNG draw-order accounting is documented in very large inline
-comment blocks that encode load-bearing parity assumptions (`PRE_TREE_DRAWS`,
-`POST_TREE_EXTRA_DRAWS`, the perturb-vs-bulk branch). These are correct as far as
-reviewable, but their correctness is asserted only in prose and a single
-`debug_assert!`; the "phase drift remains for tree-1+" admission (lines 1028-1032)
-means this is a known-incomplete parity area carried as comments rather than a
-typed/tested invariant.
-**Fix:** Where feasible, convert the draw-count invariants into asserted/tested
-quantities (e.g. a test that counts `gen_rand` calls per tree) so the prose
-cannot silently drift from behavior.
+**File:** `crates/cb-train/src/lib.rs:38`, `crates/cb-train/src/ctr/mod.rs:141`
+**Issue:** `bake_ctr_table, BakedCtrData, BakedCtrTable,` is inserted at the TOP
+of the `ctr::{...}` re-export block, before `accumulate_online` (lib.rs:38), and
+`pub use bake::{...}` is appended after `calc_ctr::{...}` out of module order
+(mod.rs:141). Cosmetic only.
+**Fix:** Sort the re-exported names / module re-exports to match the surrounding
+alphabetical convention.
 
 ---
 
