@@ -208,7 +208,7 @@ Plans:
 
 **Wave 5** *(blocked on 05-01, 05-03, 05-04)*
 
-- [ ] 05-05-PLAN.md — Ordered CTR + Ordered boosting (ORD-02, ORD-03 ordered): per-permutation read-before-increment + body/tail approximant, per-object intermediate oracle (indirect anchor for ordered approx)
+- [x] 05-05-PLAN.md — Ordered CTR + Ordered boosting (ORD-02, ORD-03 ordered): per-permutation read-before-increment + body/tail approximant, per-object intermediate oracle (indirect anchor for ordered approx)
 
 **Wave 6** *(blocked on 05-01, 05-04, 05-05)*
 

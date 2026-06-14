@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-04-PLAN.md (ORD-03 Plain CTR / D-06 lock)
-last_updated: "2026-06-14T00:12:16.848Z"
-last_activity: 2026-06-13 -- Plan 05-02 complete (ORD-04 one-hot encoding path)
+stopped_at: Completed 05-05-PLAN.md (ORD-02 / ORD-03 ordered — ordered CTR + ordered boosting)
+last_updated: "2026-06-14T00:30:00.000Z"
+last_activity: 2026-06-14 -- Plan 05-05 complete (ordered CTR + ordered boosting approximant)
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 28
-  completed_plans: 26
-  percent: 50
+  completed_plans: 27
+  percent: 52
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
-Last activity: 2026-06-13 -- Plan 05-02 complete (ORD-04 one-hot encoding path)
+Last activity: 2026-06-14 -- Plan 05-05 complete (ordered CTR + ordered boosting approximant; ORD-02 / ORD-03 ordered half)
 
-Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
+Progress: [█████████░] 83% (5 of 6 phase-05 plans complete)
 
 ## Performance Metrics
 
@@ -79,6 +79,7 @@ Progress: [██████████] 100% (5 of 5 phase-04 plans complete)
 | Phase 05 P02 | 17min | 2 tasks | 17 files |
 | Phase 05 P03 | 12min | 2 tasks | 18 files |
 | Phase 05 P04 | 19min | 3 tasks | 21 files |
+| Phase 05 P05 | 16min | 2 tasks | 18 files |
 
 ## Accumulated Context
 
@@ -146,6 +147,7 @@ Recent decisions affecting current work:
 - [Phase 05]: Plan 05-02 (Rule 3 deviation) — D-04 oracle is transcribe-then-self-oracle: one-hot-only model anchored bit-for-bit == the upstream-oracle-locked float train on equivalent one-hot binary columns (StagedApprox+Predictions <=1e-5), NO permutation present. The committed one_hot_cat fixture is the CTR/permutation Wave-0 anchor (no one-hot-only model.json; its config generates a permutation), so it cannot be the D-04 isolation oracle as literally planned. one_hot 11 lib + 3 integration green; slice_first float reference still locked 2/2.
 - [Phase 05]: 05-03: Fisher-Yates fold permutation over TFastRng64 locked integer-exact (D-03) vs permutation_fold0.npy; TFold body/tail boundaries [1 2 4 8 16 30] for N=30; permutation_count(4)/fold_len_multiplier(2.0) pinned on shared BoostParams. — Permutation reproduced exactly before any value stage; reused BoostParams to keep workspace compiling.
 - [Phase 05]: Plan 05-04 COMPLETE (ORD-03 / D-06): Plain-mode CTR locked — six-type whole-set math (online +1 vs inference +PriorDenom CalcCTR separate; Counter-max vs FeatureFreq-total denom Pitfall 4; FloatTargetMeanValue final-path-only Pitfall 5) + online_ctr_prefix_binclf read-before-increment no-leakage prefix; cb-model::ctr_data CtrValueTable serde over model.json hash_map + self-describing .cbm BlobReader (bounds-before-slice, malformed/oversized/OOB -> typed ModelError, Security V5); per-type inference Calc + not-found->empty; cat-hash via calc_cat_feature_hash never model hash_map. ECtrType duplicated in cb-train (below cb-model); BoostParams dropped Copy for owned simple_ctr_priors. plain_ctr oracle: Stage::Permutation (D-03) then Stage::OnlineCtr <=1e-5 (transcribe-then-self-oracle, fixture commits only per-object OUTPUT .npy).
+- [Phase 05]: Plan 05-05 COMPLETE (ORD-02 / ORD-03 ordered half, D-05/D-06): ordered (per-permutation prefix) CTR = the 05-04 read-before-increment loop UNDER a specific permutation (ordered_ctr_per_permutation/OrderedCtrPrefix; per-step running num/denom + per_bucket_monotone anchor); ordered boosting approximant ordered_approx_delta_simple (UpdateApproxDeltasHistoricallyImpl approx_calcer.cpp:566-600 — body-seeded running per-leaf der/weight, add-then-read Gradient delta over the tail in permutation order; tail doc never depends on itself, body docs keep delta 0). EBoostingType{Plain,Ordered}+BoostParams.boosting_type pinned via boosting_type_default() (CPU default Plain, Ordered=GPU-only Pitfall 6), propagated across all 13 literals. Oracles: D-03 permutation gate FIRST then per-object integer anchors exact + values <=1e-5 + monotone/identity-degeneration. (Rule 3) ordered_ctr fold-1 uses a PER-FOLD RESEED fisher_yates(N, seed+foldIdx) [fold0<-seed0, fold1<-seed1, confirmed] NOT the continuous-stream draw; (Rule 3) ordered approx validated via structural+indirect anchors (A2 residual) since fold inputs uncommitted (D-09). ordered_approx_delta_simple oracle-tested standalone, NOT wired into the whole-set train driver (Plain path unchanged; no numeric/one-hot regression).
 
 ### Pending Todos
 
