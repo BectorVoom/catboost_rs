@@ -237,7 +237,7 @@ Plans:
 
 **Wave 12** *(gap closure — ORD-05 two-materialization leaf values; blocks on 05-12's draw order)*
 
-- [ ] 05-13-PLAN.md — ORD-05 CTR-SPLIT SCORING + AVERAGING-FOLD LEAF VALUES: score the IDENTITY-learning-fold CTR column into the oblivious search (shared L2 score, strict first-wins, forward-bit leaf index → structure partition [6,0,9,15]); materialize a SECOND CTR column under the AveragingFold's SHUFFLED permutation and estimate leaf VALUES on it (leaf_of/leaf_weights partition [6,0,7,17], train.cpp:130 BuildIndices(AveragingFold)); the Gradient leaf FORMULA is unchanged (research Q3 #4) and reproduces tree0 [-0.033333,0,-0.005,0.0275] ≤1e-5; numeric/one-hot/ordered oracles byte-identical. (2 tasks)
+- [x] 05-13-PLAN.md — ORD-05 CTR-SPLIT SCORING + AVERAGING-FOLD LEAF VALUES: score the IDENTITY-learning-fold CTR column into the oblivious search (shared L2 score, strict first-wins, forward-bit leaf index → structure partition [6,0,9,15]); materialize a SECOND CTR column under the AveragingFold's SHUFFLED permutation and estimate leaf VALUES on it (leaf_of/leaf_weights partition [6,0,7,17], train.cpp:130 BuildIndices(AveragingFold)); the Gradient leaf FORMULA is unchanged (research Q3 #4) and reproduces tree0 [-0.033333,0,-0.005,0.0275] ≤1e-5; numeric/one-hot/ordered oracles byte-identical. (2 tasks)
 
 **Wave 13** *(gap closure — ORD-05 bake + apply Scale/Shift + e2e HARD GATE; blocks on 05-13; carries forward the CORRECT parts of the original 05-12)*
 
