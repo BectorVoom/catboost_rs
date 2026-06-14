@@ -658,6 +658,7 @@ name = "cb-model"
 version = "0.1.0"
 dependencies = [
  "cb-core",
+ "cb-data",
  "cb-oracle",
  "cb-train",
  "flatbuffers",

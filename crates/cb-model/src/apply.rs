@@ -31,8 +31,10 @@
 //! `.get` (no panics, `indexing_slicing` deny — T-04-02-01).
 
 use cb_core::sum_f64;
+use cb_data::calc_cat_feature_hash;
 use cb_train::{leaf_index, Split};
 
+use crate::ctr_data::{CtrValueTable, Prior};
 use crate::Model;
 
 /// The bin index of `raw` against ascending `borders`: the COUNT of borders the
@@ -44,6 +46,32 @@ use crate::Model;
 #[must_use]
 pub fn binarize_feature(raw: f64, borders: &[f64]) -> usize {
     borders.iter().filter(|&&b| raw > b).count()
+}
+
+/// Compute one CTR value for a document's simple (single-feature) categorical
+/// projection at inference (`static_ctr_provider.cpp:52-122`).
+///
+/// The projection categorical VALUE (already in the A4 string form,
+/// [`cb_data::stringify_int_category`] for integer-coded values) is hashed via
+/// [`cb_data::calc_cat_feature_hash`] — the single categorical-hash source,
+/// NEVER the model's STORED `ctr_data` hash_map (RESEARCH Anti-Pattern). The
+/// table's [`CtrValueTable::calc_for_hash`] then applies the per-type
+/// `Calc(cic, tot)` with the `prior` / `(shift, scale)` normalization, replicating
+/// the not-found→empty path (a missing bucket returns the empty value, never an
+/// OOB index — T-05-04-01).
+///
+/// `target_border_idx` selects the Buckets per-class numerator (default `0`).
+#[must_use]
+pub fn ctr_value_for_projection(
+    table: &CtrValueTable,
+    cat_value: &str,
+    prior: Prior,
+    shift: f64,
+    scale: f64,
+    target_border_idx: usize,
+) -> f64 {
+    let hash = u64::from(calc_cat_feature_hash(cat_value));
+    table.calc_for_hash(hash, prior, shift, scale, target_border_idx)
 }
 
 /// Whether an object passes one split: the split's `value > border` test on its

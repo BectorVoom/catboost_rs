@@ -11,6 +11,9 @@ workspace = true
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
 cb-core = { path = "../cb-core" }
 cb-train = { path = "../cb-train" }
+# Categorical hashing single source (calc_cat_feature_hash) for CTR projection
+# at inference — NEVER a model's stored ctr_data hash_map (D Carried-Forward).
+cb-data = { path = "../cb-data" }
 # flatc-generated FlatBuffers bindings runtime (D-01). 25.12.19 reads schemas
 # authored for the vendored flatc 24.3.25 (wire format is version-stable;
 # RESEARCH A1). Vetted OK in the Package Legitimacy Audit.
