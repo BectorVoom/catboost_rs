@@ -204,7 +204,7 @@ Plans:
 
 **Wave 4** *(blocked on 05-01, 05-02, 05-03)*
 
-- [ ] 05-04-PLAN.md — Plain CTR (ORD-03, D-06): all six CTR types whole-set + ctr_data .cbm/model.json serde + model-side apply, locked BEFORE ordered
+- [x] 05-04-PLAN.md — Plain CTR (ORD-03, D-06): all six CTR types whole-set + ctr_data .cbm/model.json serde + model-side apply, locked BEFORE ordered
 
 **Wave 5** *(blocked on 05-01, 05-03, 05-04)*
 
