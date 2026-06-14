@@ -23,6 +23,7 @@ mod shap;
 
 pub use apply::{
     binarize_feature, ctr_value_for_combined_projection, ctr_value_for_projection, predict_raw,
+    predict_raw_cat,
 };
 pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
 pub use ctr_data::{

@@ -34,8 +34,8 @@ use cb_core::sum_f64;
 use cb_data::calc_cat_feature_hash;
 use cb_train::{fold_cat_hash, leaf_index};
 
-use crate::ctr_data::{CtrValueTable, Prior};
-use crate::model::ModelSplit;
+use crate::ctr_data::{calc_inference, CtrValueTable, Prior};
+use crate::model::{CtrSplit, ModelSplit};
 use crate::Model;
 
 /// The bin index of `raw` against ascending `borders`: the COUNT of borders the
@@ -115,6 +115,23 @@ pub fn ctr_value_for_combined_projection(
     table.calc_for_hash(combined, prior, shift, scale, target_border_idx)
 }
 
+/// The CTR-base table key a [`CtrSplit`] reconstructs from its
+/// `(projection, ctr_type)` — used to look up the baked [`CtrValueTable`] in the
+/// model's `ctr_data` map. The key form is
+/// `"ctr:type=<i8>:proj=<f0>,<f1>,…"` over the projection's SORTED cat-feature
+/// members. The trainer-side bake uses the SAME canonical form so the apply-time
+/// reconstruction matches the stored key byte-for-byte.
+#[must_use]
+fn ctr_table_key(split: &CtrSplit) -> String {
+    let members: Vec<String> = split
+        .projection
+        .cat_features()
+        .iter()
+        .map(usize::to_string)
+        .collect();
+    format!("ctr:type={}:proj={}", split.ctr_type.as_i8(), members.join(","))
+}
+
 /// Whether an object passes one float split (`value > border`, Step B).
 /// Out-of-range feature indices return `false` defensively (the loaded model
 /// supplies valid indices) — checked `.get` only.
@@ -124,17 +141,62 @@ fn passes_float_split(feature: usize, border: f64, features: &[f32]) -> bool {
         .is_some_and(|&v| f64::from(v) > border)
 }
 
+/// Whether an object passes one CTR split (`ctr_value > border`, ORD-05 / D-05).
+///
+/// The object's combined-projection CTR value is computed from its RAW cat values
+/// (gathered in the projection's sorted member order from `cat_values`) by folding
+/// each member's [`cb_data::calc_cat_feature_hash`] via [`cb_train::fold_cat_hash`]
+/// into the combined key (NEVER the model's stored `ctr_data` hash_map — RESEARCH
+/// Anti-Pattern), then looking up the baked [`CtrValueTable`] (keyed by
+/// `(projection, ctr_type)`) with the not-found→empty bounds-safe path
+/// ([`ctr_value_for_combined_projection`]). A missing table or a missing combined
+/// bucket returns the empty CTR value ([`calc_inference`] over a `None` bucket),
+/// never an OOB index (T-05-09-V5).
+///
+/// `cat_values[c]` is the object's raw categorical VALUE for cat feature `c`
+/// (already in the A4 string form, [`cb_data::stringify_int_category`] for
+/// integer-coded values); the projection members index into it.
+fn passes_ctr_split(model: &Model, split: &CtrSplit, cat_values: &[String]) -> bool {
+    // Gather the projection-member raw cat values in the projection's sorted
+    // order (checked `.get`; a missing member is dropped — the fold then sees
+    // fewer members, which the not-found→empty path tolerates).
+    let members: Vec<&str> = split
+        .projection
+        .cat_features()
+        .iter()
+        .filter_map(|&f| cat_values.get(f).map(String::as_str))
+        .collect();
+
+    // Look up the baked table by the reconstructed (projection, ctr_type) key.
+    let key = ctr_table_key(split);
+    let ctr_value = match model.ctr_data.as_ref().and_then(|d| d.tables.get(&key)) {
+        // The combined-projection CTR value: fold each member's
+        // calc_cat_feature_hash via fold_cat_hash into the combined key, then the
+        // per-type Calc over the baked table with the bounds-safe not-found→empty
+        // bucket path (T-05-09-V5).
+        Some(table) => ctr_value_for_combined_projection(
+            table,
+            &members,
+            split.prior,
+            /* shift = */ 0.0,
+            /* scale = */ 1.0,
+            split.target_border_idx,
+        ),
+        // No baked table for this split: the not-found→empty CTR value
+        // (`Calc(0, 0)` over the prior). Bounds-safe — never an OOB index.
+        None => calc_inference(0.0, 0.0, split.prior, 0.0, 1.0),
+    };
+    ctr_value > split.border
+}
+
 /// Whether an object passes one [`ModelSplit`] (Step B): a [`ModelSplit::Float`]
 /// keeps the existing `value > border` path byte-for-byte; a [`ModelSplit::Ctr`]
-/// is routed to the not-found→empty `false` path HERE (Task 1a) and gets its full
-/// combined-projection CTR evaluation in Task 1b.
-fn passes_split(split: &ModelSplit, features: &[f32]) -> bool {
+/// evaluates the combined-projection CTR value against the split border
+/// ([`passes_ctr_split`]).
+fn passes_split(model: &Model, split: &ModelSplit, features: &[f32], cat_values: &[String]) -> bool {
     match split {
         ModelSplit::Float(s) => passes_float_split(s.feature, s.border, features),
-        // Task 1a placeholder: a CTR split temporarily evaluates `false` (the
-        // not-found→empty route) so the `Vec<ModelSplit>` cross-crate change
-        // compiles; Task 1b fills in the combined-projection CTR-value lookup.
-        ModelSplit::Ctr(_) => false,
+        ModelSplit::Ctr(c) => passes_ctr_split(model, c, cat_values),
     }
 }
 
@@ -142,7 +204,11 @@ fn passes_split(split: &ModelSplit, features: &[f32]) -> bool {
 /// leaf_values[leaf]` (Steps B + C). The per-tree leaf contributions are summed
 /// host-side through [`sum_f64`] (D-08); `bias` is added exactly once afterward
 /// (RESEARCH Pitfall 6).
-fn predict_raw_one(model: &Model, features: &[f32]) -> f64 {
+///
+/// `features` is the object's contiguous float-feature row; `cat_values` its raw
+/// categorical values (empty for the numeric-only apply path, where no CTR split
+/// is ever evaluated — the `ModelSplit::Float` path is byte-for-byte unchanged).
+fn predict_raw_one(model: &Model, features: &[f32], cat_values: &[String]) -> f64 {
     let leaf_contributions: Vec<f64> = model
         .oblivious_trees
         .iter()
@@ -151,7 +217,7 @@ fn predict_raw_one(model: &Model, features: &[f32]) -> f64 {
             let passes: Vec<bool> = tree
                 .splits
                 .iter()
-                .map(|s| passes_split(s, features))
+                .map(|s| passes_split(model, s, features, cat_values))
                 .collect();
             let leaf = leaf_index(&passes);
             // Step C (per tree): the leaf value (already learning_rate-scaled).
@@ -173,20 +239,47 @@ fn predict_raw_one(model: &Model, features: &[f32]) -> f64 {
 /// otherwise an empty vector.
 ///
 /// This is the pure-Rust apply path: it touches NO backend / GPU compute
-/// symbol, so it runs with no GPU toolchain present (MODEL-02).
+/// symbol, so it runs with no GPU toolchain present (MODEL-02). Models with CTR
+/// splits need the categorical columns — use [`predict_raw_cat`] for those.
 #[must_use]
 pub fn predict_raw(model: &Model, feature_values: &[Vec<f32>]) -> Vec<f64> {
-    let n_objects = feature_values.first().map_or(0, Vec::len);
+    predict_raw_cat(model, feature_values, &[])
+}
+
+/// Apply `model` to a numeric + categorical feature view (ORD-05 / D-05),
+/// returning the per-object `RawFormulaVal` in object order.
+///
+/// `feature_values[f]` is float feature `f`'s per-object `f32` column;
+/// `cat_columns[c]` is categorical feature `c`'s per-object raw VALUE column
+/// (already in the A4 string form). A [`ModelSplit::Ctr`] reads its
+/// projection-member cat values from `cat_columns` and looks up the baked
+/// `ctr_data` table (the combined-projection CTR apply); a [`ModelSplit::Float`]
+/// keeps the existing numeric path. The numeric-only [`predict_raw`] is the
+/// `cat_columns = &[]` special case (no CTR split is ever evaluated, so the
+/// Float-only apply is byte-for-byte unchanged).
+#[must_use]
+pub fn predict_raw_cat(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    cat_columns: &[Vec<String>],
+) -> Vec<f64> {
+    let n_float = feature_values.first().map_or(0, Vec::len);
+    let n_cat = cat_columns.first().map_or(0, Vec::len);
+    let n_objects = n_float.max(n_cat);
     (0..n_objects)
         .map(|obj| {
-            // Gather this object's per-feature values into a contiguous row
-            // (checked `.get`; a short column contributes nothing for that
-            // feature, so its split test reads a missing value -> `false`).
+            // Gather this object's per-feature float row (checked `.get`; a short
+            // column reads NaN, which fails every strict `> border` test).
             let row: Vec<f32> = feature_values
                 .iter()
                 .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
                 .collect();
-            predict_raw_one(model, &row)
+            // Gather this object's raw categorical values (checked `.get`).
+            let cats: Vec<String> = cat_columns
+                .iter()
+                .map(|col| col.get(obj).cloned().unwrap_or_default())
+                .collect();
+            predict_raw_one(model, &row, &cats)
         })
         .collect()
 }
