@@ -47,7 +47,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from catboost import CatBoostClassifier, CatBoostRegressor, Pool
+from catboost import CatBoost, CatBoostClassifier, CatBoostRegressor, Pool
 
 GENERATOR_DIR = Path(__file__).resolve().parent
 FIXTURES = GENERATOR_DIR.parent / "fixtures"
@@ -1840,8 +1840,13 @@ def gen_ordered_boost_e2e() -> None:
     }
 
     # RMSE → boost_from_average=True (bias == target mean, Pitfall 2).
-    model = CatBoostRegressor(boost_from_average=True, **ordered_params)
-    model.fit(x, y)
+    # `permutation_count` is a real catboost training parameter (default 4) but is
+    # NOT accepted as a sklearn-style named kwarg on CatBoostRegressor; route the
+    # whole config through the low-level CatBoost(params) API so permutation_count=1
+    # is honored (verified via get_all_params()["permutation_count"] == 1). With an
+    # explicit loss_function=RMSE this is identical to CatBoostRegressor.
+    model = CatBoost({**ordered_params, "boost_from_average": True})
+    model.fit(Pool(x, y))
 
     # --- Stage: Splits + LeafValues (the upstream Ordered model) -------------
     model.save_model(str(ORDERED_BOOST_E2E / "model.json"), format="json")
@@ -1976,7 +1981,12 @@ def gen_tensor_ctr_e2e() -> None:
     }
 
     # Logloss → boost_from_average=False (starting approx 0, Pitfall 2).
-    model = CatBoostClassifier(boost_from_average=False, **tensor_ctr_params)
+    # `permutation_count` is a real catboost training parameter (default 4) but is
+    # NOT accepted as a sklearn-style named kwarg on CatBoostClassifier; route the
+    # whole config through the low-level CatBoost(params) API so permutation_count=1
+    # is honored (verified via get_all_params()["permutation_count"] == 1). With an
+    # explicit loss_function=Logloss this is identical to CatBoostClassifier.
+    model = CatBoost({**tensor_ctr_params, "boost_from_average": False})
     # Pool with the two columns declared categorical (cat_features=[0, 1]).
     pool = Pool(x_cat_str, y, cat_features=[0, 1])
     model.fit(pool)

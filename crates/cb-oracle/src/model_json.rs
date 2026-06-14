@@ -22,14 +22,22 @@ use crate::error::OracleError;
 /// `oblivious_trees[i].splits[j]`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SplitJson {
-    /// Split border (threshold) on the referenced float feature.
+    /// Split border (threshold). For a `FloatFeature` split this is the float
+    /// feature threshold; for an `OnlineCtr` split it is the CTR-value border.
     pub border: f64,
-    /// Index of the float feature this split tests.
+    /// Index of the float feature this split tests. Present on `FloatFeature`
+    /// splits; ABSENT on `OnlineCtr` (CTR) splits — those reference a CTR table
+    /// via `split_index` instead, so the field is `#[serde(default)]` (0) and is
+    /// not meaningful for a CTR split. Categorical/tensor-CTR upstream models
+    /// (ORD-05) emit `OnlineCtr` splits, so requiring this field would reject a
+    /// real `model.json` outright.
+    #[serde(default)]
     pub float_feature_index: i64,
-    /// Global split index in the model's split pool.
+    /// Global split index in the model's split pool. For an `OnlineCtr` split this
+    /// indexes the model's CTR feature definitions.
     pub split_index: i64,
-    /// Split kind (e.g. `"FloatFeature"`); plain numeric models only emit
-    /// `FloatFeature` splits this phase.
+    /// Split kind: `"FloatFeature"` (numeric) or `"OnlineCtr"` (CTR). Unknown
+    /// CTR-only fields (e.g. `ctr_target_border_idx`) are ignored by serde.
     pub split_type: String,
 }
 
