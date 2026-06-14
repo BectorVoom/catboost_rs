@@ -1,91 +1,62 @@
 ---
 phase: 05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s
-verified: 2026-06-14T18:00:00Z
+verified: 2026-06-15T00:00:00Z
 status: gaps_found
 score: 4/5 must-haves verified
 overrides_applied: 0
+escalation_decision:
+  date: 2026-06-15
+  by: developer
+  decision: "ESCALATED AS BLOCKER. The verifier returned human_needed for the pc=4 (production-default permutation_count=4) AveragingFold divergence; the developer ruled it a blocker, not an accepted residual. SC-1 ('reproduces upstream permutations exactly') has no permutation_count carve-out and pc=4 is the production default, so Phase 5 stays open with status: gaps_found. Resolve via /gsd-plan-phase 5 --gaps."
 re_verification:
   previous_status: gaps_found
-  previous_score: 3/5
+  previous_score: 4/5
   gaps_closed:
-    - "Feature combinations (tensor CTRs — SimpleCtrs/CombinationCtrs, max_ctr_complexity control) produce models matching upstream ≤1e-5 on categorical datasets (SC-5 / ORD-05)"
-    - "Multi-fold permutation draw-order on the learning-permutation-needed path is now upstream-faithful for the gated config (permutation_count=1)"
+    - "ordered_structure_differs_from_plain FAILING test — RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); all 3/3 wiring tests now PASS (commit 9a2c974)"
+    - "WR-01 permutation_count>1 pre-averaging draw order unvalidated — RESOLVED for pc=2: create_folds now guards the pre-averaging gen_rand() at idx==learning_folds for ALL permutation_count (commit b69f5aa); pc=2 AveragingFold partition [6,0,7,17] locked integer-exact against committed catboost 1.2.10 output (commit f22ad0b)"
   gaps_remaining:
-    - "ordered_structure_differs_from_plain test FAILS — the ordered branch is wired but the test assertion is now invalid for the correct identity-Folds[0] upstream behavior (epistemic dispute, not implementation gap)"
-    - "WR-01: permutation_count > 1 averaging-fold draw order is unvalidated against upstream — production DEFAULT (permutation_count=4) is untested"
+    - "pc=4 (production default permutation_count=4) AveragingFold partition [6,0,8,16] diverges from catboost 1.2.10 [6,0,10,14] — SC-1 says 'reproduces upstream permutations exactly'; pc=4 bit-exact parity needs C++ instrumentation of catboost's per-fold RNG accounting and is documented as out-of-scope for Phase 5"
   regressions: []
 gaps:
-  - truth: "ordered_structure_differs_from_plain test — the Ordered split-scoring path must produce tree structure that differs from Plain on a dataset where per-segment body/tail weighting should diverge"
+  - truth: "Multi-permutation fold machinery seeded by TFastRng64 reproduces upstream permutations exactly at the production-default permutation_count=4 (SC-1 / ORD-01)"
     status: failed
-    reason: |
-      The test ordered_structure_differs_from_plain FAILS with exit 101. After the
-      05-12 identity-Folds[0] change, for permutation_count=1 the Ordered structure
-      search runs on the identity fold (object order), which is identical to Plain's
-      input ordering on this synthetic dataset with no randomness (random_strength=0,
-      bootstrap=No). The per-segment L2 scores collapse to Plain-identical scores
-      on this particular input. The Ordered branch IS wired: boosting.rs line 1416
-      calls greedy_tensor_search_oblivious_ordered when ordered_learning_perm is
-      Some. The ordered_boost_e2e_oracle_test (2/2 PASS, ≤1e-5) confirms the Ordered
-      branch actually produces upstream-matching predictions. The wiring-test's
-      falsifiability assumption — "the identity fold makes Ordered degenerate toward
-      Plain for this dataset" — was known at plan time (05-14 SUMMARY mentions this
-      pre-existing failure). The question is whether this signals dead code or an
-      invalidated test assumption.
-
-      Verdict: the test is testing an ASSUMPTION that is now VIOLATED by the
-      identity-Folds[0] upstream-faithful change. The Ordered branch is demonstrably
-      alive (e2e oracle passes). However: the wiring test is still a FAILING test in
-      the suite at HEAD. It must either be fixed (new synthetic dataset where Ordered
-      diverges even on identity fold, or multi-permutation config) or the test must
-      be documented as invalid and retired with a tracked issue.
-    artifacts:
-      - path: "crates/cb-train/tests/ordered_boost_wiring_test.rs"
-        issue: "Test assertion `ordered_splits != plain_splits` fails because permutation_count=1 identity-Folds[0] makes Ordered structure collapse to Plain on this dataset. Test design assumption violated by upstream-faithful RNG fix."
-    missing:
-      - "Either replace the synthetic dataset with one that diverges under identity-fold ordered scoring (different target distribution, more features) OR gate the test on permutation_count>=2 where non-identity learning folds exist. Alternatively, retire the structural-divergence sub-test and add a note referencing the e2e oracle as the authoritative check."
-
-  - truth: "The production default permutation_count=4 averaging-fold draw order is validated against upstream (permutation_count > 1 RNG discipline)"
-    status: failed
-    reason: |
-      WR-01 from the code review is confirmed in source. The pre-averaging GenRand
-      draw in create_folds fires via the `first_real_shuffle` flag, which fires
-      before idx==1 (the first non-identity fold). For permutation_count=1,
-      learning_folds=0 so idx==1 IS the averaging fold — correct. For
-      permutation_count=4, learning_folds=3: the pre-draw fires before the FIRST
-      LEARNING fold (idx==1), not before the averaging fold (idx==4). The three
-      learning shuffles then draw, and the averaging fold gets the 4th call — an
-      unvalidated RNG position. The production default `permutation_count_default()`
-      returns 4 (boosting.rs:227-229). No test exercises permutation_count > 1 with
-      the CTR or ordered paths. The e2e gates only cover permutation_count=1.
+    reason: "At pc=4 (permutation_count_default() = 4, the production default) the cb-train AveragingFold partition is [6,0,8,16] while catboost 1.2.10 produces [6,0,10,14]. SC-1 says 'reproduces upstream permutations exactly' with no permutation_count carve-out, and pc=4 is the default config, so this is a parity gap at the most-used setting. pc=1 and pc=2 ARE integer-exact (locked by multi_permutation_fold_oracle_test); only pc>=4 diverges. The e2e prediction oracles (ordered_boost_e2e, tensor_ctr_e2e) are locked at pc=1, so final-prediction parity at pc=4 is unproven. 05-15's exhaustive draw-stream sweep found no clean per-fold draw rule that reproduces BOTH the e2e-bit-exact pc=1/pc=2 stream AND pc=4; the executor concluded a pc=4 bit-exact fix needs C++ instrumentation of catboost's per-fold RNG accounting. NOTE: that approach is in tension with the Phase-3 P1/D-08 'Python-reachable floor, no C++ instrumentation' decision — the gap-closure plan must reconcile this (find a Python-reachable per-fold RNG oracle, or obtain an explicit user-approved deviation from D-08, before committing to C++ instrumentation)."
     artifacts:
       - path: "crates/cb-train/src/fold.rs"
-        issue: "Lines 277-281: the `first_real_shuffle` pre-draw fires before the first non-identity fold (idx==1) regardless of how many learning folds precede the averaging fold. Correct only for permutation_count=1 where idx==1 is the averaging fold. Doc comment at line 257-258 says 'Fold 0 (idx==0) is the IDENTITY; every subsequent fold takes one Fisher-Yates draw IN ORDER' but does NOT document the pre-draw mis-position for permutation_count>1."
-      - path: "crates/cb-train/src/boosting.rs"
-        issue: "permutation_count_default() returns 4; no test exercises the CTR or Ordered train paths with permutation_count > 1 against an upstream oracle"
+        issue: "create_folds pre-averaging draw position (idx == learning_folds, line ~309) reproduces upstream for pc=1/pc=2 but not pc=4; the per-fold RNG draw accounting for permutation_count>=4 does not match catboost's AveragingFold partition"
+      - path: "crates/cb-train/tests/multi_permutation_fold_oracle_test.rs"
+        issue: "multi_permutation_count_four_partition_pinned_and_upstream_delta_recorded PINS cb-train [6,0,8,16] and records the upstream delta [6,0,10,14] but does NOT assert equality — the pc=4 case is documented, not closed"
+      - path: "crates/cb-train/tests/fixtures/multi_permutation_fold/"
+        issue: "catboost 1.2.10 pc=4 dump (leaf_weights.json [6,0,10,14], model_pc4.json) is committed and available as the oracle target for the closure plan"
     missing:
-      - "Determine correct upstream pre-averaging draw position for permutation_count > 1 (does it fire immediately before the averaging shuffle at idx==learning_folds regardless of how many learning folds precede it, or is the current 'before the first learning shuffle' correct?)"
-      - "Fix fold.rs to fire the pre-draw at the correct position for all permutation_count values (guarded by `idx == learning_folds - 0` before the averaging shuffle, not before idx==1)"
-      - "Add an oracle covering permutation_count=4 (or at minimum permutation_count=2) against upstream catboost 1.2.10"
+      - "Make create_folds reproduce catboost 1.2.10's pc=4 (and ideally general permutation_count>=4) AveragingFold permutation exactly — partition must equal [6,0,10,14] for the committed fixture"
+      - "Upgrade multi_permutation_count_four_... from a pinned-delta test to an integer-exact assertion vs the committed catboost pc=4 leaf_weights"
+      - "Add (or extend) an e2e prediction oracle at permutation_count=4 to prove final predictions match upstream <=1e-5 once the partition is exact"
+      - "Reconcile the fix path with P1/D-08: prefer a Python-reachable per-fold RNG accounting oracle; only pursue C++ instrumentation with an explicit user-approved D-08 deviation"
 ---
 
 # Phase 5: Ordered Boosting, Ordered CTR & Categoricals — Re-Verification Report
 
 **Phase Goal:** CatBoost's defining anti-leakage algorithms — ordered boosting and ordered CTR — plus native categorical handling produce models matching upstream ≤1e-5, with per-object intermediate oracles confirming no silent leakage.
-**Verified:** 2026-06-14T18:00:00Z
-**Status:** gaps_found
-**Re-verification:** Yes — after gap closure (plans 05-12, 05-13, 05-14)
+**Verified:** 2026-06-15T00:00:00Z
+**Status:** gaps_found (developer escalated the pc=4 divergence — see escalation_decision)
+**Re-verification:** Yes — after gap closure (plans 05-15 and 05-16), superseding the 2026-06-14T18:00:00Z gaps_found report
+
+> **Developer decision (2026-06-15):** the verifier surfaced the pc=4 AveragingFold divergence as `human_needed`. The developer ESCALATED it as a blocker rather than accepting it as a tracked residual. Phase 5 remains open at `gaps_found`; the single blocking gap is recorded in the `gaps:` frontmatter for `/gsd-plan-phase 5 --gaps`. Both prior gaps (ORD-02 wiring test, ORD-01 pc=2 draw order) are confirmed CLOSED.
 
 ## Re-verification Context
 
-This is a re-verification of the prior `gaps_found` verdict (score 3/5). The prior gaps were:
+This is a re-verification of the prior `gaps_found` verdict (score 4/5, 2026-06-14). The two prior gaps were:
 
-1. ORD-02 ordered boosting not wired into train()
-2. ORD-05 tensor CTRs not wired into train(), no e2e oracle
-3. CR-01 multi-fold permutation oracle invalid for k>1
+1. `ordered_structure_differs_from_plain` FAILING test (GAP 1 / ORD-02) — closed by 05-16 (commit 9a2c974): retired the invalidated assertion in place, delegated ORD-02 structural authority to `ordered_boost_e2e_oracle_test`.
+2. WR-01: permutation_count>1 pre-averaging draw order unvalidated (ORD-01) — closed for pc=2 by 05-15 (commits b69f5aa, f22ad0b): corrected guard position to `idx == learning_folds` for all permutation_count; pc=2 partition locked integer-exact against catboost 1.2.10.
 
-Plans 05-12/13/14 addressed gaps 2 and 3 end-to-end, and the prior ORD-02 gap was partially re-evaluated: ordered boosting WAS wired in a prior plan (05-08/05-10); the prior verifier's finding that it was "dead code" was inaccurate — the 05-14 code review confirms `greedy_tensor_search_oblivious_ordered` IS called from boosting.rs:1416 under `EBoostingType::Ordered`. The prior finding was driven by the wiring test being green at the time; the wiring test now FAILS after the identity-Folds[0] RNG fix.
+One residual issue from 05-15 was NOT closed: pc=4 (the production default, `permutation_count_default() = 4`) AveragingFold partition diverges from catboost 1.2.10. This is documented, pinned, and explicitly deferred as needing C++ RNG instrumentation.
 
-Two new issues emerged from 05-12/05-14 execution: (a) the `ordered_structure_differs_from_plain` wiring test FAILS (a test assumption invalidated by the upstream-faithful RNG fix), and (b) the pre-averaging draw fires at the wrong position for `permutation_count > 1`.
+All claimed commits are VERIFIED at HEAD:
+- `b69f5aa` — fix pre-averaging draw position
+- `f22ad0b` — multi-permutation AveragingFold oracle
+- `9a2c974` — retire ordered_structure_differs_from_plain
 
 ## Goal Achievement
 
@@ -93,107 +64,114 @@ Two new issues emerged from 05-12/05-14 execution: (a) the `ordered_structure_di
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Multi-permutation ordered boosting matches upstream ≤1e-5 (SC-1 / ORD-02) | VERIFIED | `ordered_boost_e2e_oracle_test` 2/2 PASS; `ordered_boost_oracle_test` 5/5 PASS. Ordered branch wired: boosting.rs:1416 calls `greedy_tensor_search_oblivious_ordered`. `ordered_training_grows_a_full_finite_model` and `plain_path_still_trains` both PASS. |
-| 2 | Ordered boosting wiring test passes (structural divergence from Plain) | FAILED | `ordered_structure_differs_from_plain` FAILS: after the 05-12 identity-Folds[0] fix, permutation_count=1 Ordered runs on the identity fold, collapsing to Plain-identical splits on this dataset. The Ordered branch IS alive (e2e oracle passes); the test assumption is invalidated. |
-| 3 | Ordered CTR — all six types + priors ≤1e-5 (SC-2 / ORD-03) | PARTIAL | `plain_ctr_oracle_test` 3/3, `ordered_ctr_oracle_test` 3/3 PASS. Per-object math oracle-locked. No end-to-end train→predict CTR-model oracle beyond the binclf tensor_ctr_e2e (which exercises `Borders` type only). The multi-fold permutation gap (CR-01) is resolved for permutation_count=1; permutation_count>1 unvalidated. |
-| 4 | One-hot encoding path selection correct (SC-4 / ORD-04) | VERIFIED | `one_hot_oracle_test` 3/3 PASS. `route_categorical` inclusive/exclusive boundary oracle-locked. |
-| 5 | Feature combinations / tensor CTRs produce models matching upstream ≤1e-5 (SC-5 / ORD-05) | VERIFIED | `tensor_ctr_e2e_oracle_test` 3/3 PASS including `tensor_ctr_e2e_oracle_predictions_match_upstream`. `train_cat` drives training; `bake_ctr_table` bakes CtrData; `from_baked` lifts to cb-model under the shared `ctr_base_key`; `apply.rs` threads `split.shift`/`split.scale` on both found and not-found branches. NO `#[ignore]`, fixtures untouched. |
+| 1 | Multi-permutation fold machinery seeded by TFastRng64 reproduces upstream permutations exactly (SC-1 / ORD-01) | PARTIAL | pc=1 and pc=2 are integer-exact vs catboost 1.2.10 (multi_permutation 4/4 PASS; PRIMARY test `multi_permutation_count_two_averaging_matches_catboost_1_2_10` locks pc=2 partition [6,0,7,17]). pc=4 (production default) diverges: cb-train [6,0,8,16] vs catboost [6,0,10,14] — documented and pinned in `multi_permutation_count_four_partition_pinned_and_upstream_delta_recorded`. SC-1 says "exactly"; pc=4 is not exact. |
+| 2 | EBoostingType::Ordered trains with exact prefix boundaries, per-object intermediate oracle passes with no leakage (SC-2 / ORD-02) | VERIFIED | `ordered_boost_e2e_oracle_test` 2/2 PASS ≤1e-5 (AUTHORITATIVE). `ordered_boost_oracle_test` 5/5 PASS. `ordered_boost_wiring_test` 3/3 PASS (was 2/3 FAIL). Ordered branch wired: boosting.rs:1054-1057 `find(|f| !f.is_averaging)` = Folds[0] identity learning fold; greedy_tensor_search_oblivious_ordered called at boosting.rs:1416. |
+| 3 | Ordered CTR — all six types (Borders, Buckets, BinarizedTargetMeanValue, FloatTargetMeanValue, Counter, FeatureFreq) with priors ≤1e-5 (SC-3 / ORD-03) | PARTIAL | `plain_ctr_oracle_test` 3/3 PASS; `ordered_ctr_oracle_test` 3/3 PASS. `tensor_ctr_e2e_oracle_test` 3/3 PASS locks the Borders type end-to-end. Other five CTR types verified per-object standalone but no full train→predict oracle for Counter/FeatureFreq/BinarizedTargetMeanValue/FloatTargetMeanValue/Buckets beyond the prefix-binclf math. |
+| 4 | One-hot encoding path selection correct for low-cardinality categoricals (SC-4 / ORD-04) | VERIFIED | `one_hot_oracle_test` 3/3 PASS. `route_categorical` inclusive/exclusive boundary oracle-locked. |
+| 5 | Feature combinations (tensor CTRs) produce models matching upstream ≤1e-5 on categorical datasets (SC-5 / ORD-05) | VERIFIED | `tensor_ctr_e2e_oracle_predictions_match_upstream` PASS (full multi-tree, NO #[ignore]); 3/3 tensor_ctr_e2e PASS. THREE materializations (identity structure [6,0,9,15], averaging-fold leaf values [6,0,7,17], whole-set apply [10,0,0,20]). model_size_reg cat-feature weight + AveragingFold pre-draw Rule-1 fixes validated. |
 
-**Score: 4/5 truths verified (SC-5 gap closed; ORD-02 wiring test fails; ORD-03 permutation_count>1 unvalidated)**
+**Score: 4/5 (SC-1 partial due to pc=4 divergence; SC-3 partial but materially oracle-locked via tensor CTR e2e; SC-2/SC-4/SC-5 VERIFIED)**
+
+### Deferred Items
+
+| # | Item | Addressed In | Evidence |
+|---|------|-------------|----------|
+| — | pc=4 AveragingFold permutation divergence | Not in current roadmap | No future phase explicitly targets this; requires C++ instrumentation of catboost's per-fold RNG accounting. Documented in 05-15 SUMMARY (Deviations), pinned in multi_permutation_fold_oracle_test.rs. Tracked residual, not silently passed. |
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `crates/cb-train/src/ctr/bake.rs` | NEW: whole-set inference CTR bake (bake_ctr_table, BakedCtrData) | VERIFIED | File exists; `bake_ctr_table` + `BakedCtrData` + `BakedCtrTable`; Scale/Shift from `calc_normalization`; uses shared `accumulate_online` + `build_final_ctr` |
-| `crates/cb-train/src/fold.rs` | identity Folds[0] + AveragingFold first seeded draw (call-count 1) | VERIFIED (permutation_count=1 only) | The one-`GenRand` pre-draw exists (line 278-281); correct for permutation_count=1; fires at wrong position for permutation_count>1 (WR-01) |
-| `crates/cb-train/src/tree.rs` | greedy_tensor_search_oblivious_with_ctr + CtrSplitSpec + LevelKind + GrownTree.ctr_splits | VERIFIED | All present: `CtrSplitSpec` (line 114), `LevelKind` enum (line 182), `GrownTree.ctr_splits` (line 166), `greedy_tensor_search_oblivious_with_ctr` (line 1126); `model_size_reg`/`cat_feature_weight` penalty present |
-| `crates/cb-train/src/boosting.rs` | train_cat returns (Model,BakedCtrData); two materialize_ctr_feature calls; bake_ctr_table called after loop; is_averaging used | VERIFIED | `train_cat` exists (line 932); `bake_ctr_table` called (line 1631); `find(|f| f.is_averaging)` (line 1149); 6 `materialize_ctr_feature` calls confirmed by grep |
-| `crates/cb-model/src/apply.rs` | passes_ctr_split threads split.shift/scale on BOTH branches; no hardcoded 1.0/0.0 | VERIFIED | `split.shift` + `split.scale` at lines 178-179 (found branch) and line 186 (not-found branch); grep for `scale = */ 1.0` and `calc_inference(0.0, 0.0, split.prior, 0.0, 1.0)` both return zero matches |
-| `crates/cb-model/src/ctr_data.rs` | ctr_base_key + CtrData::from_baked | VERIFIED | `ctr_base_key` exported from cb-model; `CtrData::from_baked` lifts BakedCtrData under the shared key |
-| `crates/cb-train/tests/tensor_ctr_e2e_oracle_test.rs` | drives train_cat; NO #[ignore]; fixtures untouched | VERIFIED | `train_cat` at line 222; NO `#[ignore]` in file; `git status` clean under tensor_ctr_e2e/; 3/3 PASS |
-| `crates/cb-train/tests/averaging_fold_permutation_oracle_test.rs` | integer-exact AveragingFold draw-order oracle (call-count-1 permutation) | VERIFIED | 3/3 PASS; tests updated from call-count-0 to call-count-1 (the 05-14 upstream-validated correction); NO `#[ignore]` |
-| `crates/cb-train/tests/ctr_split_scoring_test.rs` | 10 tests: CTR scoring + partitions + leaf values + Scale/Shift derivation + bake round-trip | VERIFIED | 10/10 PASS including `bake_derives_shift_zero_scale_fifteen`, `apply_found_branch_uses_split_scale`, `apply_not_found_branch_uses_split_scale`, `bake_round_trips_to_apply_inference_value` |
-| `crates/cb-train/tests/ordered_boost_wiring_test.rs` | ordered_structure_differs_from_plain asserts Ordered != Plain splits | FAILED | Test FAILS: 2/3 PASS, 1/3 FAIL (`ordered_structure_differs_from_plain`). The test assumption is invalidated by the upstream-faithful identity-Folds[0] change. |
+| `crates/cb-train/src/fold.rs` | Pre-averaging draw at idx==learning_folds (not idx==1) for ALL permutation_count | VERIFIED | Line 309: `if idx == learning_folds { rng.gen_rand(); }`. `first_real_shuffle` flag absent (grep returns 0). Citied upstream: learn_context.cpp:524/575-578, fold.cpp:43-95. |
+| `crates/cb-train/tests/multi_permutation_fold_oracle_test.rs` | 4 tests, none #[ignore], pc=2 upstream-anchored | VERIFIED | 4/4 PASS; zero `#[ignore]` attributes; `compare_permutation` present 5 times; pc=2 asserts catboost 1.2.10 `[6,0,7,17]` integer-exact; pc=4 pins cb-train `[6,0,8,16]` and records upstream delta [6,0,10,14] WITHOUT a hard equality |
+| `crates/cb-train/tests/fixtures/multi_permutation_fold/` | Committed catboost 1.2.10 dump (leaf_weights, model_pc{1,2,4}.json, config.json) | VERIFIED | Files exist: leaf_weights.json (confirms pc=1/2=[6,0,7,17], pc=4=[6,0,10,14]), model_pc1.json, model_pc2.json, model_pc4.json, config.json |
+| `crates/cb-train/tests/ordered_boost_wiring_test.rs` | 3/3 PASS; retired sub-test has in-file rationale + delegates to e2e oracle | VERIFIED | 3/3 PASS (was 2/3 FAIL). `ordered_branch_alive_structural_authority_is_e2e_oracle` contains in-file rationale with boosting.rs:~1054 citation and `ordered_boost_e2e_oracle_test` delegation. Aliveness gates `ordered_training_grows_a_full_finite_model` and `plain_path_still_trains` PRESERVED UNCHANGED. |
+| `.planning/phases/05-.../05-DEFERRED.md` | Retire decision record for ordered_structure_differs_from_plain | VERIFIED | File exists; contains dated 2026-06-14 entry; explains identity-fold consumption; notes `find(|f| !f.is_averaging)` = Folds[0]; references `ordered_boost_e2e_oracle_test` 3 times; no `.planning/todos/` created. |
+| `crates/cb-train/src/boosting.rs` | ordered_learning_perm via find(!is_averaging); train_cat + bake; permutation_count_default()=4 | VERIFIED | boosting.rs:1054-1057 `find(|f| !f.is_averaging)`; boosting.rs:1416 `greedy_tensor_search_oblivious_ordered`; `permutation_count_default()` = 4 at line 227. |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|----|-----|--------|---------|
-| `boosting.rs::train_cat` | `ctr/bake.rs::bake_ctr_table` | called after boosting loop per distinct chosen split | WIRED | `use crate::ctr::bake::{bake_ctr_table, BakedCtrData}` at line 36; `bake_ctr_table(...)` at line 1631 |
-| `boosting.rs::train_cat` | `ctr/ctr_feature.rs::materialize_ctr_feature` | 2+ calls: identity fold (structure) + averaging fold (leaf values) | WIRED | 6 total calls found; both identity (structure) and averaging (`find(|f| f.is_averaging)`) paths present |
-| `boosting.rs` | `tree.rs::greedy_tensor_search_oblivious_with_ctr` | CTR-aware structure search on has_ctr path | WIRED | Called inside `train_inner` gated on `has_ctr` |
-| `boosting.rs` | `tree.rs::greedy_tensor_search_oblivious_ordered` | Ordered split-scoring when `EBoostingType::Ordered` | WIRED | boosting.rs:1416 `Some(learning_perm) => greedy_tensor_search_oblivious_ordered(...)` |
-| `ctr_data.rs::from_baked` | `apply.rs::passes_ctr_split` | shared `ctr_base_key` guarantees bake key == apply key | WIRED | `ctr_base_key` exported from cb-model; `apply.rs` delegates to it (`ctr_table_key` delegates) |
-| `apply.rs::passes_ctr_split` | `ctr_data.rs::ctr_value_for_combined_projection` | split.shift/split.scale threaded on found branch | WIRED | Lines 178-179: `split.shift, split.scale` passed; no hardcode |
-| `apply.rs::passes_ctr_split` | `ctr_data.rs::calc_inference` | split.shift/split.scale threaded on not-found branch | WIRED | Line 186: `calc_inference(0.0, 0.0, split.prior, split.shift, split.scale)` |
-| `fold.rs::create_folds` | `permutation.rs::shuffle_in_place` | pre-averaging GenRand + shuffle; correct for permutation_count=1 | WIRED (permutation_count=1 only) | Pre-draw fires before idx==1; for permutation_count=1 this is the averaging fold; for permutation_count>1 this is a learning fold (WR-01) |
+| `fold.rs::create_folds` | `permutation.rs::shuffle_in_place` | pre-averaging gen_rand() fires at `idx == learning_folds` | WIRED | Line 309: `if idx == learning_folds { rng.gen_rand(); }` — confirmed by grep "idx == learning_folds" returning 6 hits |
+| `multi_permutation_fold_oracle_test.rs` | `fixtures/multi_permutation_fold/leaf_weights.json` | `upstream_leaf_weights(2)` → catboost [6,0,7,17] vs `averaging_partition` | WIRED | pc=2 hard equality present; upstream source committed and non-empty |
+| `ordered_boost_wiring_test.rs` | `ordered_boost_e2e_oracle_test.rs` | in-file rationale comment delegates ORD-02 structural authority | WIRED | `ordered_boost_e2e_oracle_test` appears 7 times in wiring test; comment cites boosting.rs:~1054 |
+| `boosting.rs::train_cat` | `ctr/bake.rs::bake_ctr_table` | called after boosting loop | WIRED | `use crate::ctr::bake::{bake_ctr_table, BakedCtrData}` at line 36; `bake_ctr_table(...)` at line 1631 |
+| `boosting.rs` | `tree.rs::greedy_tensor_search_oblivious_ordered` | EBoostingType::Ordered branch at boosting.rs:1416 | WIRED | Confirmed at boosting.rs:1416 `Some(learning_perm) => greedy_tensor_search_oblivious_ordered(...)` |
+| `apply.rs::passes_ctr_split` | `ctr_data.rs::ctr_value_for_combined_projection` | split.shift/split.scale threaded both branches | WIRED | Confirmed in prior verification, unchanged by 05-15/05-16 |
 
 ### Data-Flow Trace (Level 4)
 
+All data-flow traces carried forward from prior verification (unchanged by 05-15/05-16 — test-only changes):
+
 | Artifact | Data Variable | Source | Produces Real Data | Status |
 |----------|---------------|--------|--------------------|--------|
-| `train_cat` → `bake_ctr_table` | BakedCtrData (whole-set CtrValueTable) | `accumulate_online` over entire learn set (NOT prefix); `build_final_ctr` → per-bucket class counts | Yes — real whole-set totals per combined-hash bucket | FLOWING |
-| `passes_ctr_split` (found branch) | CTR value for inference | `ctr_value_for_combined_projection` with split.shift/split.scale from the baked CtrSplit | Yes — baked integer counts → Calc formula | FLOWING |
-| `passes_ctr_split` (not-found branch) | empty-bucket CTR value | `calc_inference(0,0,prior,split.shift,split.scale)` | Yes — correctly scaled prior-only value | FLOWING |
-| `ordered_approx_delta_simple` | delta per tail doc | body-seeded per-segment leaf stats | Yes — called from `ordered_boost_e2e_oracle_test` standalone AND wired into `greedy_tensor_search_oblivious_ordered` | FLOWING |
-| `ctr_value_for_projection` / `_combined_projection` | CTR value at inference | `CtrValueTable.numerator_denominator` → `calc_inference` with Scale/Shift | Yes — real lookup | FLOWING |
+| `train_cat` → `bake_ctr_table` | BakedCtrData | `accumulate_online` over entire learn set + `build_final_ctr` | Yes | FLOWING |
+| `passes_ctr_split` (found branch) | CTR value | `ctr_value_for_combined_projection` with real split.shift/scale | Yes | FLOWING |
+| `passes_ctr_split` (not-found branch) | CTR value | `calc_inference(0,0,prior,split.shift,split.scale)` | Yes | FLOWING |
+| `create_folds` AveragingFold permutation | permutation array | persistent TFastRng64 at idx==learning_folds position | Yes — locked pc=2 integer-exact vs catboost | FLOWING (pc=1/pc=2); DIVERGENT (pc=4) |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| tensor CTR e2e 3/3 ≤1e-5 (SC-5) | `cargo test -p cb-train --test tensor_ctr_e2e_oracle_test` | 3/3 PASS | PASS |
-| Ordered boost e2e 2/2 ≤1e-5 (SC-1) | `cargo test -p cb-train --test ordered_boost_e2e_oracle_test` | 2/2 PASS | PASS |
-| Ordered boost oracle 5/5 | `cargo test -p cb-train --test ordered_boost_oracle_test` | 5/5 PASS | PASS |
-| Ordered boost wiring 3 tests | `cargo test -p cb-train --test ordered_boost_wiring_test` | 2/3 PASS, 1 FAIL (`ordered_structure_differs_from_plain`) | FAIL |
-| CTR split scoring 10/10 | `cargo test -p cb-train --test ctr_split_scoring_test` | 10/10 PASS | PASS |
-| AveragingFold draw order 3/3 | `cargo test -p cb-train --test averaging_fold_permutation_oracle_test` | 3/3 PASS | PASS |
-| cb-model full suite | `cargo test -p cb-model` | 49/49 PASS (all suites) | PASS |
-| cb-train lib unit tests | `cargo test -p cb-train --lib` | 130/130 PASS | PASS |
+| ordered_boost_wiring_test 3/3 (GAP 1 closure) | `cargo test -p cb-train --test ordered_boost_wiring_test` | 3/3 PASS (0 FAIL) | PASS |
+| ordered_boost_e2e_oracle_test 2/2 ≤1e-5 (SC-2) | `cargo test -p cb-train --test ordered_boost_e2e_oracle_test` | 2/2 PASS | PASS |
+| ordered_boost_oracle_test 5/5 | `cargo test -p cb-train --test ordered_boost_oracle_test` | 5/5 PASS | PASS |
+| multi_permutation_fold_oracle_test 4/4 (SC-1) | `cargo test -p cb-train --test multi_permutation_fold_oracle_test` | 4/4 PASS (pc=2 upstream-exact; pc=4 pinned+divergence recorded) | PASS |
+| tensor_ctr_e2e_oracle_test 3/3 ≤1e-5 (SC-5) | `cargo test -p cb-train --test tensor_ctr_e2e_oracle_test` | 3/3 PASS | PASS |
+| averaging_fold_permutation_oracle_test 3/3 | `cargo test -p cb-train --test averaging_fold_permutation_oracle_test` | 3/3 PASS | PASS |
+| cb-train lib unit tests | `cargo test -p cb-train --lib` | 130 passed; 0 failed; 0 ignored | PASS |
+| cb-model full suite | `cargo test -p cb-model` | 3 passed; 0 failed | PASS |
+| Full cb-train suite (all integration tests) | `cargo test -p cb-train` | 0 FAILED; ignored tests are pre-existing Phase 3 deferred items (Bayesian, overfit e2e, random_strength) | PASS |
 | cargo check --tests cb-train | `cargo check --tests -p cb-train` | 0 errors, 0 warnings | PASS |
-| cargo check --tests cb-model | `cargo check --tests -p cb-model` | 0 errors, 0 warnings | PASS |
+
+**Confirmed: NO failing test exists at HEAD in cb-train or cb-model.**
 
 ### Requirements Coverage
 
 | Requirement | Source Plan | Description | Status | Evidence |
 |-------------|------------|-------------|--------|---------|
-| ORD-01 | 05-03 | Multi-permutation fold machinery | PARTIAL | `permutations()` and `create_folds()` exist; fold-0 integer-exact; the upstream pre-averaging draw is now validated for permutation_count=1 by the e2e gate. For permutation_count>1 (production default=4) the pre-draw fires at the wrong position (WR-01). |
-| ORD-02 | 05-05, 05-08, 05-10 | Ordered boosting with exact prefix boundaries, per-object oracle | VERIFIED | `greedy_tensor_search_oblivious_ordered` wired at boosting.rs:1416; e2e oracle 2/2 ≤1e-5; iter-0 no-leakage signature validated. Wiring-test FAILS due to invalidated test assumption. |
-| ORD-03 | 05-04, 05-05 | Ordered CTR — all six types with priors | PARTIAL | All six CTR types implemented; per-object math oracle-locked for Borders end-to-end (tensor_ctr_e2e). Other types only per-object standalone. No full train→predict oracle for Counter/FeatureFreq/BinarizedTargetMeanValue/etc. |
-| ORD-04 | 05-02 | One-hot encoding path selection | VERIFIED | `route_categorical` inclusive/exclusive boundary oracle-locked ≤1e-5; 3/3 PASS |
-| ORD-05 | 05-06, 05-11..05-14 | Feature combinations / tensor CTRs ≤1e-5 | VERIFIED | Full train→predict oracle 3/3 PASS through `train_cat` + `predict_raw_cat`; three-materialization pipeline (structure, averaging-fold leaf values, whole-set apply) all flowing; model_size_reg penalty reproduces upstream split selection |
+| ORD-01 | 05-03, 05-15 | Multi-permutation fold machinery | PARTIAL | pc=1/pc=2 integer-exact vs catboost 1.2.10; pc=4 (production default) diverges with documented residual needing C++ instrumentation |
+| ORD-02 | 05-05, 05-08, 05-10, 05-16 | Ordered boosting with exact prefix boundaries, per-object oracle | VERIFIED | e2e oracle 2/2 ≤1e-5; wiring test 3/3 PASS; branch wired at boosting.rs:1416; retire decision in 05-DEFERRED.md |
+| ORD-03 | 05-04, 05-05 | Ordered CTR — all six types with priors | PARTIAL | Math oracle-locked for Borders end-to-end (tensor_ctr_e2e); other types per-object standalone only |
+| ORD-04 | 05-02 | One-hot encoding path selection | VERIFIED | `one_hot_oracle_test` 3/3 PASS; boundary oracle-locked |
+| ORD-05 | 05-06, 05-11..05-14 | Feature combinations / tensor CTRs ≤1e-5 | VERIFIED | `tensor_ctr_e2e_oracle_predictions_match_upstream` PASS; three-materialization pipeline flowing; no #[ignore]; fixtures untouched |
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| `crates/cb-train/src/fold.rs` | 277-281 | Pre-averaging draw fires before idx==1 (first non-identity fold), not before the averaging fold — wrong for permutation_count>1 | BLOCKER (permutation_count>1 paths) | For permutation_count=4 (the production default), the averaging fold is drawn at an unvalidated RNG call-count. All CTR and Ordered train paths with the default config are potentially parity-broken for permutation_count>1. |
-| `crates/cb-train/tests/ordered_boost_wiring_test.rs` | 120-139 | `ordered_structure_differs_from_plain` asserts divergence that no longer holds for the correct identity-Folds[0] upstream behavior | BLOCKER | A failing test at HEAD. Must be fixed or retired — a failing test in the oracle suite is not acceptable for "phase complete." |
-| `crates/cb-train/src/boosting.rs` | 1624-1648 | Bake dedup by projection only, not (ctr_type, projection) | WARNING (WR-02 from review) | Latent: inert today because only Borders is scored, but will silently produce wrong tables if a second CTR type is added for the same projection |
-| `crates/cb-train/src/boosting.rs` | 1631-1640, 1649-1659 | Global prior used for all splits; per-split prior overwritten | WARNING (WR-03 from review) | Latent: inert for single-prior fixture; would bake wrong Scale/Shift for a multi-prior CTR config |
-| `crates/cb-model/src/ctr_data.rs` | 311 | `unwrap_or(ECtrType::Borders)` silently coerces unknown CTR types | INFO (IN-01 from review) | Masks future type mismatches silently |
+| `crates/cb-train/src/boosting.rs` | 1624-1648 | Bake dedup by projection only, not (ctr_type, projection) | WARNING (WR-02) | Latent; inert today since only Borders is scored; latent bug if second CTR type added for same projection |
+| `crates/cb-train/src/boosting.rs` | 1631-1640, 1649-1659 | Global prior used for all splits; per-split prior overwritten | WARNING (WR-03) | Latent; inert for single-prior fixture |
+| `crates/cb-model/src/ctr_data.rs` | ~311 | `unwrap_or(ECtrType::Borders)` silently coerces unknown CTR types | INFO (IN-01) | Masks future type mismatches silently |
 
-No `TBD`, `FIXME`, or `XXX` debt markers found in phase-5 modified files.
+No `TBD`, `FIXME`, or `XXX` debt markers found in phase-5 modified files (fold.rs, boosting.rs, ordered_boost_wiring_test.rs, multi_permutation_fold_oracle_test.rs). The WARNING items (WR-02, WR-03) are carried from the prior review and remain latent/inert.
 
 ### Human Verification Required
 
-None — all critical behaviors are verifiable programmatically via the oracle test suite.
+#### 1. Accept or Escalate: pc=4 AveragingFold partition divergence vs SC-1
+
+**Test:** Review the documented pc=4 (production default, `permutation_count_default() = 4`) AveragingFold divergence: cb-train produces `[6,0,8,16]`; catboost 1.2.10 expects `[6,0,10,14]`. The divergence is pinned in `multi_permutation_count_four_partition_pinned_and_upstream_delta_recorded` (4/4 tests pass, but the test deliberately does NOT assert equality to upstream, only records the delta). Phase 5 plans (05-15 Plan, 05-15 SUMMARY Deviations) explicitly state pc=4 needs C++ instrumentation of catboost's per-fold RNG accounting and is out-of-scope for Phase 5.
+
+**Expected:** Developer explicitly accepts the pc=4 divergence as a tracked residual that does not block Phase 5 closure — the SC-1 wording "reproduces upstream permutations exactly" is satisfied for the gated configs (pc=1, pc=2) and the production-default (pc=4) gap is a known, committed, tracked forward-compat issue. OR: developer escalates this as a blocker requiring a Phase 5 gap-closure plan before Phase 6 begins.
+
+**Why human:** SC-1 says "exactly" without a permutation_count carve-out. The production default is pc=4 and it diverges from upstream. Whether the oracle scope was always implicitly gated on pc=1/pc=2 (per the phase plan documents) or whether the phase goal requires pc=4 parity is a judgment call that depends on development intent, not code reading. The technical state is fully documented and honest — the ambiguity is in acceptance criteria interpretation.
 
 ### Gaps Summary
 
-**Two gaps block clean phase completion.**
+**GAP 1 (CLOSED — ordered_structure_differs_from_plain):** The prior failing test at HEAD has been retired in place with a documented rationale and in-file citation (commit 9a2c974). `ordered_boost_wiring_test` now passes 3/3. The retire decision is recorded in `05-DEFERRED.md`. ORD-02 structural authority rests on `ordered_boost_e2e_oracle_test` (2/2 PASS ≤1e-5 vs catboost 1.2.10). **This gap is CLOSED.**
 
-**Gap 1 (Failing test — `ordered_structure_differs_from_plain`):** The test is FAILING at HEAD. Even though the Ordered branch is correctly wired (e2e oracle passes ≤1e-5), a failing test in the oracle suite is a concrete blocker. The test's falsifiability assumption — "the Ordered path should produce different splits than Plain" — is violated because `permutation_count=1` with the upstream-faithful identity `Folds[0]` makes the Ordered structure search run on object-order input, yielding Plain-identical scores on this particular synthetic dataset. The test needs to be either (a) replaced with a dataset/config where Ordered diverges even on the identity fold, or (b) updated to use `permutation_count>=2` where the learning fold IS a non-identity permutation, or (c) retired as a structural-divergence gate with the e2e oracle serving as the authoritative ORD-02 check.
+**GAP 2 (CLOSED for pc=2 — WR-01 permutation_count>1):** The pre-averaging draw position is corrected to `idx == learning_folds` for all permutation_count (commit b69f5aa). pc=2 AveragingFold partition is locked integer-exact against committed catboost 1.2.10 output [6,0,7,17] (commit f22ad0b, test PRIMARY: `multi_permutation_count_two_averaging_matches_catboost_1_2_10`). **WR-01 is CLOSED for pc=2.**
 
-**Gap 2 (WR-01 — permutation_count>1 draw order unvalidated):** The pre-averaging `GenRand` draw fires at `idx==1` unconditionally (the `first_real_shuffle` flag), which is the averaging fold only when `permutation_count=1` (`learning_folds=0`). For `permutation_count=4` (the production default, `permutation_count_default()` = 4), `learning_folds=3` so the pre-draw fires before the first learning fold, and the averaging fold gets the 4th draw at an unvalidated RNG call-count. The entire CTR and Ordered train paths with the default config are operating under an unvalidated draw order. The e2e gates exclusively use `permutation_count=1` (the gated config pinned in all oracle fixtures). This is the most consequential open issue — a user training with default params gets an unvalidated permutation draw that may silently diverge from upstream.
+**RESIDUAL — pc=4 AveragingFold divergence (not new, documented):** The production default `permutation_count=4` AveragingFold partition diverges from catboost 1.2.10 ([6,0,8,16] vs [6,0,10,14]). Exhaustive draw-stream enumeration in the 05-15 SUMMARY shows no clean per-fold rule reproduces both pc=1/pc=2 and pc=4 — pc=4 bit-exact parity needs C++ instrumentation of catboost's per-fold RNG accounting. The divergence is committed, pinned, and tracked. This is the only item requiring human acceptance.
 
-**Non-blocking warnings (carried from prior review):**
-- WR-02: bake deduplication by projection only, not (ctr_type, projection) — latent, inert today.
-- WR-03: global prior overwriting per-split priors during bake copy-back — latent, inert for single-prior fixture.
+**Non-blocking warnings (carried):**
+- WR-02: bake deduplication by projection only — latent, inert today.
+- WR-03: global prior overwriting per-split priors during bake — latent, inert for single-prior fixture.
 - IN-01: unknown CTR type silently coerces to Borders.
 
 ---
 
-_Verified: 2026-06-14T18:00:00Z_
-_Verifier: Claude (gsd-verifier) — re-verification after plans 05-12, 05-13, 05-14_
+_Verified: 2026-06-15T00:00:00Z_
+_Verifier: Claude (gsd-verifier) — re-verification after plans 05-15 (WR-01/ORD-01) and 05-16 (ORD-02)_
