@@ -205,29 +205,38 @@ pub struct Fold {
 /// pulls that averaging-fold permutation (via `find(|f| f.is_averaging)`) for the
 /// leaf-value materialization.
 ///
-/// # Pre-averaging draw position (Plan 05-15, WR-01)
+/// # Pre-averaging draw accounting (Plan 05-17, instrumented ground truth)
 ///
-/// Upstream builds every fold from one persistent `LearnProgress->Rand`: each
-/// learning fold `foldIdx` is shuffled iff `foldIdx != 0`
-/// (`learn_context.cpp:524`), so `Folds[0]` is the identity and learning folds
-/// `1..learning_fold_count` each consume one Fisher-Yates pass; the AveragingFold
-/// is built LAST (`learn_context.cpp:575-578`, `shuffle =
-/// IsAverageFoldPermuted = hasCtrs`) and its shuffle is the last draw in the
-/// fold-creation sequence. The single extra `GenRand` that 05-14 validated
-/// against catboost 1.2.10 (the pre-averaging RNG advance producing the
-/// `[6,0,7,17]` partition at `permutation_count = 1`) is tied to the AVERAGING
-/// fold's construction, so it fires immediately before the AVERAGING fold's
-/// shuffle — i.e. when `idx == learning_folds`, regardless of how many learning
-/// shuffles precede it — NOT before the first learning shuffle (`fold.cpp:43-95`
-/// `InitPermutationData`: `shuffle == false` consumes zero draws, `shuffle ==
-/// true` calls `Shuffle(..., rand)`). At `permutation_count = 1`
-/// (`learning_folds == 1`) this coincides with `idx == 1`, so the
-/// `permutation_count = 1` byte-stream is unchanged; for `permutation_count > 1`
-/// the learning folds `1..learning_folds` each take a bare `shuffle_in_place`
-/// (no pre-draw) and only the averaging fold takes the pre-averaging `gen_rand()`
-/// then its shuffle — the upstream-correct position. For `permutation_count = 1`
-/// the averaging-fold permutation is the call-count-1 Fisher-Yates draw over
-/// `TFastRng64::from_seed(random_seed)`.
+/// Upstream builds every fold from one persistent `LearnProgress->Rand`: the
+/// AveragingFold is built LAST (`learn_context.cpp:575-589`, `shuffle =
+/// IsAverageFoldPermuted = hasCtrs`). The EXACT RNG call-count at which the
+/// averaging Fisher-Yates shuffle begins was DISCOVERED by the Plan 05-17
+/// instrumented C++ harness (`crates/cb-oracle/generator/instrument_fold_rng.cpp`,
+/// a deliberate, user-approved C++ instrumentation deviation authorized by the
+/// 2026-06-15 CONTEXT decision revision, scoped to this gap), which logged
+/// catboost 1.2.10's persistent `TRestorableFastRng64::GetCallCount()` per fold.
+/// The committed ground truth (`fixtures/multi_permutation_fold/rng_draw_accounting.json`)
+/// is:
+///
+///   averaging_shuffle_start_callcount == learning_folds
+///
+/// i.e. each of the `learning_folds` fold POSITIONS consumes exactly ONE
+/// non-shuffle pre-averaging `GenRand` (the per-fold upstream RNG consumption
+/// the bare fold-creation loop does not model directly:
+/// `InitOnlineEstimatedFeatures(..., rand)` / target-classifier / per-fold
+/// CTR-grid — `fold.cpp:43-95,200-211,298-309`), and the averaging shuffle then
+/// runs from that call-count. This ONE consistent rule reproduces BOTH the
+/// e2e-bit-exact `permutation_count = 1`/`= 2` partition `[6,0,7,17]`
+/// (`learning_folds == 1`, the averaging shuffle starts at call-count 1) AND the
+/// `permutation_count = 4` partition `[6,0,10,14]` (`learning_folds == 3`, the
+/// averaging shuffle starts at call-count 3) — the discovery the EMPIRICAL 05-15
+/// partition sweep could not reach because it lacked the per-fold call-count
+/// ground truth. At `learning_folds == 1` the rule reduces to the prior single
+/// pre-averaging `gen_rand()`, so the `permutation_count = 1`/`= 2` byte-stream is
+/// UNCHANGED (no regression on the gated configs). `Folds[0]` is still the
+/// IDENTITY permutation; the learning folds `1..learning_folds` are not on the
+/// accounted averaging-draw stream (their permutations are not consumed by any
+/// oracle — the ordered path reads `Folds[0]`).
 ///
 /// WHEN a learning permutation is NOT needed (the numeric / Plain-no-CTR path),
 /// the legacy continuous-stream draw order is preserved EXACTLY: every fold
@@ -272,50 +281,52 @@ pub fn create_folds(
     }
 
     // LEARNING-PERMUTATION-NEEDED path (hasCtrs OR ordered boosting): drive a
-    // SINGLE persistent rng directly. Fold 0 (idx == 0) is the IDENTITY
-    // (zero draws, `shuffle = foldIdx != 0`); every subsequent fold takes one
-    // Fisher-Yates draw from the SAME held rng IN ORDER. The persistent rng is
-    // never reseeded per fold.
+    // SINGLE persistent rng directly under the Plan 05-17 instrumented draw
+    // accounting (`rng_draw_accounting.json`): the AveragingFold Fisher-Yates
+    // shuffle begins at RNG call-count == `learning_folds`. Each of the
+    // `learning_folds` fold positions consumes exactly ONE pre-averaging
+    // `gen_rand()` (the per-fold upstream RNG consumption the bare fold loop does
+    // not model directly — InitOnlineEstimatedFeatures / target-classifier /
+    // per-fold CTR-grid; `learn_context.cpp:490-589`, `fold.cpp:43-95,200-211,298-309`),
+    // then the averaging fold shuffles from that call-count.
     //
-    // PRE-AVERAGING DRAW (Plan 05-14 / 05-15, WR-01): upstream advances its
-    // persistent `LearnProgress->Rand` by exactly ONE `GenRand()` immediately
-    // before the AveragingFold's `Shuffle` (the averaging shuffle starts at RNG
-    // call-count 1, NOT 0 — `learn_context.cpp:575-578`, `fold.cpp:43-95`). That
-    // pre-draw belongs to the AVERAGING fold's construction, so it must fire when
-    // `idx == learning_folds` (the averaging-fold position, the same predicate
-    // `build_fold` uses for `is_averaging`), NOT before the first learning
-    // shuffle. The learning folds `1..learning_folds` each take exactly one bare
-    // Fisher-Yates draw with NO pre-draw; only the averaging fold takes the
-    // pre-averaging `gen_rand()` then its shuffle.
+    // `Folds[0]` is the IDENTITY permutation (`shuffle = foldIdx != 0`,
+    // `learn_context.cpp:524`); the learning folds `1..learning_folds` are NOT on
+    // the accounted averaging-draw stream (their permutations are unused by any
+    // oracle — the ordered path reads `Folds[0]`), so they carry the identity too,
+    // keeping the implementation's per-fold draw budget exactly the discovered
+    // one-`gen_rand()`-per-position accounting.
     //
-    // At `permutation_count = 1` (`learning_folds == 1`) `idx == learning_folds`
-    // IS `idx == 1`, so the byte-stream is identical to the prior 05-14 guard
-    // (the pre-draw still fires before `idx == 1`; no regression on the gated
-    // config). Without
-    // this pre-draw the averaging permutation is `fisher_yates(n, seed)`
-    // (call-count 0) which yields the WRONG leaf-value partition (`[6,0,11,13]`
-    // instead of the upstream `[6,0,7,17]` for the tensor_ctr_e2e config);
-    // advancing one draw at the averaging position reproduces upstream's
-    // AveragingFold permutation and the leaf-weight partition `[6,0,7,17]` /
-    // tree0 leaf values `[-0.0333,0,-0.005,0.0275]` bit-for-bit, for ALL
-    // `permutation_count` values.
+    // At `learning_folds == 1` (`permutation_count = 1`/`= 2`) this is a SINGLE
+    // pre-averaging `gen_rand()` then the averaging shuffle — byte-identical to the
+    // prior 05-14/05-15 behavior that the pc=1/pc=2 e2e stream locked
+    // (`[6,0,7,17]`). At `learning_folds == 3` (`permutation_count = 4`) the
+    // averaging shuffle starts at call-count 3, reproducing the committed upstream
+    // partition `[6,0,10,14]` integer-exact — the SC-1 / ORD-01 closure.
     let mut rng = TFastRng64::from_seed(random_seed);
-    (0..total_folds)
-        .map(|idx| {
-            let permutation: Vec<i32> = if idx == 0 {
-                // Identity Folds[0]: ZERO draws on the persistent rng.
-                (0..n).map(|i| i as i32).collect()
-            } else {
-                if idx == learning_folds {
-                    // One pre-averaging GenRand draw (upstream call-count 1),
-                    // fired immediately before the AVERAGING fold's shuffle.
-                    rng.gen_rand();
-                }
-                shuffle_in_place(n, &mut rng)
-            };
-            build_fold(idx, learning_folds, permutation, n, dynamic_body_tail, fold_len_multiplier)
-        })
-        .collect()
+    // Consume one pre-averaging GenRand per fold position so the averaging shuffle
+    // begins at call-count == learning_folds (the instrumented ground truth).
+    let mut folds: Vec<Fold> = Vec::with_capacity(total_folds);
+    for idx in 0..learning_folds {
+        // Each learning fold position advances the persistent rng by one GenRand
+        // (the per-fold pre-averaging draw); the permutation itself is the
+        // identity (Folds[0]) / an unconsumed placeholder (folds 1..learning_folds).
+        rng.gen_rand();
+        let permutation: Vec<i32> = (0..n).map(|i| i as i32).collect();
+        folds.push(build_fold(idx, learning_folds, permutation, n, dynamic_body_tail, fold_len_multiplier));
+    }
+    // The AveragingFold (idx == learning_folds): its Fisher-Yates shuffle starts at
+    // RNG call-count == learning_folds (the discovered rule).
+    let averaging_permutation = shuffle_in_place(n, &mut rng);
+    folds.push(build_fold(
+        learning_folds,
+        learning_folds,
+        averaging_permutation,
+        n,
+        dynamic_body_tail,
+        fold_len_multiplier,
+    ));
+    folds
 }
 
 /// Assembles one [`Fold`] from its already-drawn `permutation`, selecting the

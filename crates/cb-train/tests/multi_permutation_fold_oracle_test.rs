@@ -40,30 +40,28 @@
 //! diverged pc=2. The pc=2 anchor is the MANDATORY upstream authority this gate
 //! enforces.
 //!
-//! # pc=4: a documented forward-compat divergence (NOT a regression)
+//! # pc=4: CLOSED integer-exact via the instrumented draw accounting (Plan 05-17)
 //!
 //! At `permutation_count=4` (`learning_folds == 3`) the cb-train AveragingFold
-//! permutation produces partition `[6,0,8,16]`, NOT catboost's `[6,0,10,14]`.
-//! Exhaustive draw-stream enumeration (committed in the SUMMARY) shows NO clean
-//! per-fold (shuffles, pre-draws) rule reproduces BOTH the bit-exact-validated
-//! pc=1/pc=2 partition AND the pc=4 partition: pc=1/2 require one pre-averaging
-//! GenRand on top of the identity-Folds[0] + (lf-1) learning shuffles (the
-//! 05-14-validated, e2e-bit-exact rule), while pc=4 matches a model with `lf`
-//! full Fisher-Yates shuffles and ZERO pre-draws — an inconsistent draw count
-//! that points to additional RNG consumption upstream at pc>2 (catboost's
-//! multi-fold structure-fold selection / CTR-grid construction draws on the same
-//! persistent `Rand`, not captured by the fold-creation loop alone). Reproducing
-//! pc=4 bit-exact requires C++ instrumentation of catboost's per-fold RNG
-//! accounting (the same class of escalation the original 05-12 blocker flagged),
-//! which is OUT OF SCOPE for this RNG-draw-position fix. The production default
-//! is `permutation_count=4`; this divergence is recorded as a known limitation
-//! in the SUMMARY (Deviations) so it is tracked, NOT silently passed. The pc=4
-//! catboost dump is committed (`model_pc4.json` / `leaf_weights.json`) so a
-//! future C++-instrumented gap-closure plan has the upstream anchor ready. This
-//! test asserts the pc=4 cross-check (create_folds == the self-derived draw
-//! stream) and the identity-Folds[0] invariant, and records the catboost-vs-
-//! cb-train partition delta WITHOUT a hard equality (the honest state: pc=2
-//! upstream-locked, pc=4 cross-checked + flagged).
+//! permutation now reproduces catboost 1.2.10's committed partition `[6,0,10,14]`
+//! integer-exact. The earlier divergence (`[6,0,8,16]`) was resolved by the Plan
+//! 05-17 instrumented C++ harness (`instrument_fold_rng.cpp`), a deliberate,
+//! user-approved C++ instrumentation deviation authorized by the 2026-06-15
+//! CONTEXT decision revision (scoped to this gap only). The harness logged
+//! catboost's per-fold `TRestorableFastRng64::GetCallCount()` and DISCOVERED the
+//! ground-truth rule the empirical 05-15 partition sweep could not reach: the
+//! AveragingFold shuffle starts at RNG call-count `== learning_folds` (each of
+//! the `learning_folds` fold positions consumes exactly ONE non-shuffle
+//! pre-averaging GenRand — the per-fold upstream RNG consumption:
+//! InitOnlineEstimatedFeatures / target-classifier / per-fold CTR-grid). This ONE
+//! consistent rule reproduces BOTH the e2e-bit-exact pc=1/pc=2 partition
+//! `[6,0,7,17]` (learning_folds == 1, C == 1) AND the pc=4 partition `[6,0,10,14]`
+//! (learning_folds == 3, C == 3), reducing to the prior single pre-averaging
+//! GenRand at `learning_folds == 1` (no regression on pc=1/pc=2). The discovered
+//! per-fold accounting is committed as
+//! `fixtures/multi_permutation_fold/rng_draw_accounting.json`. The pc=4 test below
+//! is now a HARD integer-exact equality against the committed catboost
+//! `[6,0,10,14]` — no pin, no assert_ne, no #[ignore].
 //!
 //! # Secondary cross-check (NOT the authority)
 //!
@@ -201,31 +199,29 @@ fn averaging_partition(permutation: &[i32]) -> Vec<i64> {
 }
 
 /// Self-derived (SECONDARY cross-check, NOT the authority) AveragingFold
-/// permutation: drive a persistent `TFastRng64(seed)` exactly as upstream's
-/// fold-creation loop — identity Folds[0] (zero draws), learning folds 1..lf-1
-/// each one Fisher-Yates pass, ONE pre-averaging GenRand, then the AveragingFold
-/// Fisher-Yates pass. Per WR-01 this bakes in the same advance-count assumption
-/// the implementation makes, so it can only CROSS-CHECK `create_folds`, never
-/// validate it against upstream (that is the committed catboost leaf_weights'
-/// job).
+/// permutation under the Plan 05-17 instrumented draw accounting: drive a
+/// persistent `TFastRng64(seed)` with EXACTLY `learning_folds` pre-averaging
+/// GenRand draws (one per fold position — the discovered
+/// `averaging_shuffle_start_callcount == learning_folds` rule from
+/// `rng_draw_accounting.json`), then the AveragingFold Fisher-Yates pass. Per
+/// WR-01 this bakes in the same advance-count assumption the implementation makes,
+/// so it can only CROSS-CHECK `create_folds`, never validate it against upstream
+/// (that is the committed catboost leaf_weights' job). At `learning_folds == 1`
+/// this is the single pre-averaging GenRand the pc=1/pc=2 e2e stream locked.
 fn self_derived_averaging_permutation(n: usize, seed: u64, learning_folds: usize) -> Vec<i32> {
     let mut rng = TFastRng64::from_seed(seed);
-    let shuffle = |rng: &mut TFastRng64| -> Vec<i32> {
-        let mut v: Vec<i32> = (0..n as i32).collect();
-        for i in 1..n {
-            let j = rng.uniform((i as u64) + 1) as usize;
-            v.swap(i, j);
-        }
-        v
-    };
-    // Learning folds 1..learning_folds: one Fisher-Yates pass each (Folds[0] is identity).
-    for _ in 1..learning_folds {
-        let _ = shuffle(&mut rng);
+    // One pre-averaging GenRand per fold position: the averaging shuffle begins at
+    // RNG call-count == learning_folds.
+    for _ in 0..learning_folds {
+        rng.gen_rand();
     }
-    // Pre-averaging GenRand (RNG call-count 1 at the averaging position).
-    rng.gen_rand();
     // AveragingFold Fisher-Yates pass.
-    shuffle(&mut rng)
+    let mut v: Vec<i32> = (0..n as i32).collect();
+    for i in 1..n {
+        let j = rng.uniform((i as u64) + 1) as usize;
+        v.swap(i, j);
+    }
+    v
 }
 
 /// PRIMARY (upstream-anchored, MANDATORY): the partition the cb-train pc=2
@@ -246,48 +242,36 @@ fn multi_permutation_count_two_averaging_matches_catboost_1_2_10() {
     });
 }
 
-/// pc=4 (production default) — a DOCUMENTED forward-compat divergence, NOT a hard
-/// upstream-equality assertion (see the module header). The committed catboost
-/// 1.2.10 pc=4 leaf_weights are `[6,0,10,14]`; the cb-train pc=4 AveragingFold
-/// partition is `[6,0,8,16]`. No clean per-fold draw rule reproduces BOTH the
-/// e2e-bit-exact pc=1/pc=2 stream AND the pc=4 stream (exhaustive enumeration in
-/// the SUMMARY), so pc=4 bit-exact parity needs C++ instrumentation of catboost's
-/// per-fold RNG accounting (out of scope for this RNG-draw-POSITION fix). This
-/// test PINS the current cb-train pc=4 partition so any future change is visible,
-/// and records the upstream delta — it does NOT silently pass an unvalidated draw
-/// as upstream-correct, and it does NOT fabricate a match.
+/// pc=4 (production default), HARD integer-exact equality (Plan 05-17 closure):
+/// the partition the cb-train pc=4 AveragingFold permutation produces over the
+/// online-prefix CTR equals catboost 1.2.10's committed tree-0 leaf_weights
+/// `[6,0,10,14]` integer-exact via `compare_permutation`. This is the closure of
+/// the SC-1 / ORD-01 blocking gap at the production default: `create_folds` now
+/// consumes the instrumented per-fold draw accounting (averaging shuffle starts at
+/// call-count == learning_folds; see `rng_draw_accounting.json`). NO pin, NO
+/// assert_ne, NO #[ignore].
 #[test]
-fn multi_permutation_count_four_partition_pinned_and_upstream_delta_recorded() {
+fn multi_permutation_count_four_averaging_matches_catboost_1_2_10() {
     let fs = folds(4);
     let averaging = fs.iter().find(|f| f.is_averaging).expect("averaging fold for pc=4");
     let actual = averaging_partition(&averaging.permutation);
-    let upstream = upstream_leaf_weights(4);
-    // Pin the current cb-train pc=4 partition (regression guard on the draw order).
-    assert_eq!(
-        actual,
-        vec![6, 0, 8, 16],
-        "cb-train pc=4 AveragingFold partition changed; review the draw-order fix"
-    );
-    // Record (do NOT assert-equal) the upstream delta: catboost 1.2.10 = [6,0,10,14].
-    assert_eq!(
-        upstream,
-        vec![6, 0, 10, 14],
-        "committed catboost 1.2.10 pc=4 anchor must be [6,0,10,14] (the upstream target a future C++-instrumented plan must reach)"
-    );
-    assert_ne!(
-        actual, upstream,
-        "documented forward-compat divergence: pc=4 cb-train != catboost (tracked in SUMMARY)"
-    );
+    let expected = upstream_leaf_weights(4);
+    compare_permutation(&expected, &actual).unwrap_or_else(|e| {
+        panic!(
+            "pc=4 AveragingFold partition {actual:?} diverged from committed catboost 1.2.10 leaf_weights {expected:?} [{:?}]: {e}",
+            Stage::Permutation
+        )
+    });
 }
 
-/// The pre-averaging draw fires AFTER all learning shuffles, not before the first:
-/// the SECONDARY self-derived sequence (identity Folds[0] -> lf-1 learning passes
-/// -> pre-averaging GenRand -> averaging pass) AGREES with `create_folds`'s
-/// averaging permutation integer-exact, for pc=2 and pc=4. A self-consistency
-/// cross-check ONLY (per WR-01 — the committed catboost leaf_weights above are the
-/// validating authority).
+/// The averaging shuffle begins at RNG call-count == learning_folds (Plan 05-17):
+/// the SECONDARY self-derived sequence (learning_folds pre-averaging GenRand draws,
+/// then the averaging Fisher-Yates pass) AGREES with `create_folds`'s averaging
+/// permutation integer-exact, for pc=2 and pc=4. A self-consistency cross-check
+/// ONLY (per WR-01 — the committed catboost leaf_weights above are the validating
+/// authority).
 #[test]
-fn multi_permutation_averaging_fires_after_all_learning_shuffles() {
+fn multi_permutation_averaging_starts_at_learning_folds_callcount() {
     for pc in [2usize, 4usize] {
         let learning_folds = usize::max(1, pc - 1);
         let fs = folds(pc);
