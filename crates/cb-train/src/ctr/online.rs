@@ -334,3 +334,122 @@ pub struct OnlineCtrPrefix {
     /// (`ctr_value.npy`).
     pub value: Vec<f64>,
 }
+
+/// The ORDERED (per-permutation) online CTR for one permutation — the focused
+/// delta of Wave 5 over the Plain-mode whole-set CTR of 05-04 (D-05/D-06). It is
+/// the SAME read-before-increment prefix loop ([`online_ctr_prefix_binclf`]) but
+/// computed UNDER A SPECIFIC PERMUTATION (the per-fold order, `online_ctr.cpp`
+/// `CalcOnlineCTRClasses` runs once per learn permutation). Ordered boosting
+/// drives one ordered CTR per learning fold; the `ordered_ctr` fixture commits
+/// fold-0's per-object prefix (and the fold-0 / fold-1 permutations themselves
+/// for the D-03 gate).
+///
+/// Beyond the OBJECT-order `good`/`total`/`value` ([`OnlineCtrPrefix`]), this
+/// also returns the running `(num, denom)` along the PERMUTATION (the prefix
+/// read by each successive document, in learn order) — the internal-consistency
+/// anchor the per-object oracle asserts MONOTONE non-decreasing (a document only
+/// ever sees more predecessors as the prefix grows; a non-monotone running count
+/// would betray an out-of-order accumulation, the silent-leakage signature).
+///
+/// # Parameters
+/// As [`online_ctr_prefix_binclf`]: `permutation[p]` is the object at learn-order
+/// position `p`; `bins[doc]` the bucket; `target_class[doc]` the binclf class;
+/// `prior` the additive numerator.
+///
+/// # Errors
+/// Propagated from [`online_ctr_prefix_binclf`] (length / range checks).
+pub fn ordered_ctr_per_permutation(
+    permutation: &[i32],
+    bins: &[u32],
+    target_class: &[usize],
+    prior: f64,
+) -> CbResult<OrderedCtrPrefix> {
+    // The per-object prefix is exactly the read-before-increment loop; recompute
+    // it AND capture the running (num, denom) read at each permutation step for
+    // the monotone internal-consistency anchor (per-bucket prefixes grow as the
+    // permutation advances, so the per-step read for a fixed bucket is monotone).
+    let prefix = online_ctr_prefix_binclf(permutation, bins, target_class, prior)?;
+
+    // Running num/denom AT EACH permutation STEP (learn order), i.e. the prefix
+    // value each successive document reads — indexed by permutation position.
+    let n = permutation.len();
+    let bucket_count = bins.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut counts: Vec<[i64; SIMPLE_CLASSES_COUNT]> = vec![[0, 0]; bucket_count];
+    let mut step_num = Vec::with_capacity(n);
+    let mut step_denom = Vec::with_capacity(n);
+    for &doc_i in permutation {
+        let doc = doc_i as usize;
+        let Some(&bin) = bins.get(doc) else {
+            return Err(CbError::Degenerate(
+                "ordered_ctr: permutation index out of range for bins".to_owned(),
+            ));
+        };
+        let Some(&class) = target_class.get(doc) else {
+            return Err(CbError::Degenerate(
+                "ordered_ctr: permutation index out of range for target_class".to_owned(),
+            ));
+        };
+        let bucket = bin as usize;
+        let (n0, n1) = counts.get(bucket).map_or((0, 0), |e| (e[0], e[1]));
+        step_num.push(n1);
+        step_denom.push(n0 + n1);
+        if let Some(elem) = counts.get_mut(bucket) {
+            if let Some(c) = elem.get_mut(class) {
+                *c += 1;
+            }
+        }
+    }
+
+    Ok(OrderedCtrPrefix {
+        prefix,
+        step_num,
+        step_denom,
+    })
+}
+
+/// The ordered (per-permutation) online CTR result: the OBJECT-order per-object
+/// prefix plus the PERMUTATION-order running `(num, denom)` (the prefix read at
+/// each learn-order step) for the monotone internal-consistency anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderedCtrPrefix {
+    /// The per-object `good`/`total`/`value` (OBJECT order) — matches the
+    /// `ordered_ctr` fixture's `ctr_good_count`/`ctr_total_count`/`ctr_value`.
+    pub prefix: OnlineCtrPrefix,
+    /// The running good count read at each PERMUTATION step (learn order). For a
+    /// fixed bucket this is monotone non-decreasing across that bucket's steps.
+    pub step_num: Vec<i64>,
+    /// The running total count read at each PERMUTATION step (learn order).
+    pub step_denom: Vec<i64>,
+}
+
+impl OrderedCtrPrefix {
+    /// True iff, within EACH bucket, the running `(num, denom)` read along the
+    /// permutation is monotone non-decreasing — the no-out-of-order anchor.
+    /// `bins[permutation[p]]` keys each step to its bucket.
+    #[must_use]
+    pub fn per_bucket_monotone(&self, permutation: &[i32], bins: &[u32]) -> bool {
+        let bucket_count = bins.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let mut last_num = vec![i64::MIN; bucket_count];
+        let mut last_denom = vec![i64::MIN; bucket_count];
+        for (p, &doc_i) in permutation.iter().enumerate() {
+            let doc = doc_i as usize;
+            let Some(&bin) = bins.get(doc) else {
+                return false;
+            };
+            let bucket = bin as usize;
+            let (Some(&num), Some(&denom)) = (self.step_num.get(p), self.step_denom.get(p)) else {
+                return false;
+            };
+            let (Some(ln), Some(ld)) = (last_num.get_mut(bucket), last_denom.get_mut(bucket))
+            else {
+                return false;
+            };
+            if num < *ln || denom < *ld {
+                return false;
+            }
+            *ln = num;
+            *ld = denom;
+        }
+        true
+    }
+}

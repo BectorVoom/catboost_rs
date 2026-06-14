@@ -34,8 +34,9 @@ pub use candidates::{
 };
 pub use ctr::{
     accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
-    calc_normalization, online_ctr_prefix_binclf, CounterCalcMethod, ECtrType, FinalCtrTable,
-    OnlineCtrAccumulator, OnlineCtrPrefix, Prior, TCtrHistory, TCtrMeanHistory, SIMPLE_CLASSES_COUNT,
+    calc_normalization, online_ctr_prefix_binclf, ordered_ctr_per_permutation, CounterCalcMethod,
+    ECtrType, FinalCtrTable, OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior,
+    TCtrHistory, TCtrMeanHistory, SIMPLE_CLASSES_COUNT,
 };
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
