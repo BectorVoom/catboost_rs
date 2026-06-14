@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-07-PLAN.md (CR-01 multi-fold permutation oracle fix)
-last_updated: "2026-06-14T01:34:28.771Z"
+stopped_at: 05-07 complete (CR-01 fix); 05-08 BLOCKED at decision checkpoint (ORD-02 under-scoped — needs ordered split-scoring subsystem in tree.rs); 05-09 blocked by 05-08. User chose re-scope → /gsd-plan-phase 5 --gaps.
+last_updated: "2026-06-14T02:31:45.706Z"
 last_activity: 2026-06-14 -- Phase 05 execution started
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 31
-  completed_plans: 29
+  total_plans: 32
+  completed_plans: 30
   percent: 50
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 2 of 9
+Plan: 2 of 10
 Status: Ready to execute
 Last activity: 2026-06-14 -- Phase 05 execution started
 
@@ -82,6 +82,7 @@ Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 | Phase 05 P05 | 16min | 2 tasks | 18 files |
 | Phase 05 P06 | 14min | 2 tasks | 21 files |
 | Phase 05 P07 | 9min | 2 tasks | 4 files |
+| Phase 05 P08 | 25m | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -152,6 +153,8 @@ Recent decisions affecting current work:
 - [Phase 05]: Plan 05-06 COMPLETE (ORD-05 / D-05, FINAL rung): feature combinations / tensor CTRs = the SAME single-feature online read-before-increment accumulation (05-04/05-05) over a COMBINED projection hash, not new CTR math. cb-train::projection — TProjection (sorted CatFeatures combination), calc_hash (hash.h MAGIC_MULT=0x4906ba494954cb65 fold), fold_cat_hash (ctr_provider.h:72 SIGN-EXTENDED (ui64)(int) cast — the parity landmine for top-bit-set hashes), combined_hash, enumerate_projections bounded by GetFullProjectionLength <= max_ctr_complexity (AddTreeCtrs gate). candidates::tensor_ctr_candidates emits SimpleCtrs (len 1) + CombinationCtrs (len >= 2) over CTR-eligible features (one-hot/skip excluded). BoostParams.{max_ctr_complexity(default 4),combinations_ctr(Borders),combinations_ctr_priors(0.5)} pinned via *_default() across all 14 literals. cb-model::ctr_value_for_combined_projection folds each member's calc_cat_feature_hash into the combined key (NEVER the model hash_map), then the SAME per-type Calc + not-found->empty (T-05-06-V5). (Rule 3) tensor oracle locks D-03 permutation -> per-object (good,total) exact -> combined OnlineCtr <=1e-5 + combined-projection accumulation + single-feature degeneration; full train->predict is the accepted D-09 residual (cat0/cat1/target inputs uncommitted). Phase 5 additive ladder COMPLETE: one-hot -> permutation -> Plain CTR -> Ordered CTR -> Ordered boosting -> tensor CTR all oracle-locked.
 - [Phase 05]: Plan 05-05 COMPLETE (ORD-02 / ORD-03 ordered half, D-05/D-06): ordered (per-permutation prefix) CTR = the 05-04 read-before-increment loop UNDER a specific permutation (ordered_ctr_per_permutation/OrderedCtrPrefix; per-step running num/denom + per_bucket_monotone anchor); ordered boosting approximant ordered_approx_delta_simple (UpdateApproxDeltasHistoricallyImpl approx_calcer.cpp:566-600 — body-seeded running per-leaf der/weight, add-then-read Gradient delta over the tail in permutation order; tail doc never depends on itself, body docs keep delta 0). EBoostingType{Plain,Ordered}+BoostParams.boosting_type pinned via boosting_type_default() (CPU default Plain, Ordered=GPU-only Pitfall 6), propagated across all 13 literals. Oracles: D-03 permutation gate FIRST then per-object integer anchors exact + values <=1e-5 + monotone/identity-degeneration. (Rule 3) ordered_ctr fold-1 uses a PER-FOLD RESEED fisher_yates(N, seed+foldIdx) [fold0<-seed0, fold1<-seed1, confirmed] NOT the continuous-stream draw; (Rule 3) ordered approx validated via structural+indirect anchors (A2 residual) since fold inputs uncommitted (D-09). ordered_approx_delta_simple oracle-tested standalone, NOT wired into the whole-set train driver (Plain path unchanged; no numeric/one-hot regression).
 - [Phase ?]: [Phase 05]: Plan 05-07 (CR-01 CLOSED): multi-fold permutation oracle fixed to continuous-stream — ordered_oracle.cpp GenMultiFoldPermutations draws ALL folds from ONE persistent TFastRng64::FromSeed (never reseeded per fold), matching permutation.rs::permutations / fold.rs::create_folds and upstream learn_context.cpp shared TRestorableFastRng64. permutation_fold1.npy regenerated = permutations(30,2,0)[1] (fold0 byte-identical); D-03 fold-1 gate re-keyed to permutations(30,2,0)[1] integer-exact, asserts permutations(30,2,0)[0]==fisher_yates_permutation(30,0). Production permutations() now validated for k=0 AND k=1. Only fold1 overwritten; ctr_*/ordered_approx/body_tail untouched (D-09).
+- [Phase ?]: [Phase 05]: Plan 05-08 (ORD-02 structural heart): greedy_tensor_search_oblivious_ordered scores each candidate by SUMMING per-segment ordered L2 over the learning fold's BodyTailArr (scoring.cpp:746-760), per-segment scaledL2 = l2*(BodySumWeight/BodyFinish); strict first-wins reused from Plain; leaf_of stays object-order (leaf VALUES Plain-identical via averaging-fold). Re-exported for 05-10 wiring.
+- [Phase ?]: [Phase 05]: Plan 05-08 WR-01: removed dead sum_weights accumulator from ordered_approx_delta_simple (never read); body_sum_weight param _-prefixed (9-param signature unchanged); approx byte-identical (ordered_boost_oracle 5/5).
 
 ### Pending Todos
 
@@ -179,6 +182,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-14T01:34:22.098Z
+Last session: 2026-06-14T02:31:25.375Z
 Stopped at: 05-07 complete (CR-01 fix); 05-08 BLOCKED at decision checkpoint (ORD-02 under-scoped — needs ordered split-scoring subsystem in tree.rs); 05-09 blocked by 05-08. User chose re-scope → /gsd-plan-phase 5 --gaps.
 Resume file: None
