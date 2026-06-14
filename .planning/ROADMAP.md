@@ -212,7 +212,7 @@ Plans:
 
 **Wave 6** *(blocked on 05-01, 05-04, 05-05)*
 
-- [ ] 05-06-PLAN.md — Tensor / combination CTRs (ORD-05): TProjection enumeration + combined hash + max_ctr_complexity, oracle-locked ≤1e-5
+- [x] 05-06-PLAN.md — Tensor / combination CTRs (ORD-05): TProjection enumeration + combined hash (ctr_provider.h CalcHash, sign-extended (ui64)(int)) + max_ctr_complexity gate; tensor CTR = the single-feature online accumulation over a combined key (D-05), oracle-locked D-03 → per-object (good,total) exact → combined OnlineCtr ≤1e-5 + model-side combined apply — _SUMMARY 05-06 (2 tasks; commits aa580ec, 659b0cc; Phase 5 additive ladder COMPLETE)_
 
 **Research flag (RESOLVED)**: line-by-line read of `approx_calcer.cpp` + `online_ctr.*` complete (05-RESEARCH.md, file:line citations); per-object oracle schema designed (D-02). Research ESCALATION resolved: the D-01 TU-linking mechanism is infeasible; the user-approved **transcribe-then-self-oracle** replacement (05-CONTEXT DECISION REVISION 2026-06-14) is the mechanism used.
 
