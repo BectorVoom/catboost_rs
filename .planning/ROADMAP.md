@@ -186,7 +186,7 @@ Plans:
   4. One-hot encoding for low-cardinality categoricals (`one_hot_max_size` threshold) selects the correct encoding path.
   5. Feature combinations (tensor CTRs — `SimpleCtrs`/`CombinationCtrs`, `max_ctr_complexity` control) produce models matching upstream ≤1e-5 on categorical datasets.
 
-**Plans**: 6 plans in 6 waves (additive isolation ladder: one-hot → permutation → Plain CTR → Ordered CTR → Ordered boosting → tensor CTR)
+**Plans**: 9 plans in 8 waves (additive isolation ladder waves 1-6: one-hot → permutation → Plain CTR → Ordered CTR → Ordered boosting → tensor CTR; gap-closure waves 7-8 wire Ordered boosting + tensor CTRs into train() and fix the multi-fold permutation oracle, per 05-VERIFICATION.md)
 
 Plans:
 
@@ -213,6 +213,15 @@ Plans:
 **Wave 6** *(blocked on 05-01, 05-04, 05-05)*
 
 - [x] 05-06-PLAN.md — Tensor / combination CTRs (ORD-05): TProjection enumeration + combined hash (ctr_provider.h CalcHash, sign-extended (ui64)(int)) + max_ctr_complexity gate; tensor CTR = the single-feature online accumulation over a combined key (D-05), oracle-locked D-03 → per-object (good,total) exact → combined OnlineCtr ≤1e-5 + model-side combined apply — _SUMMARY 05-06 (2 tasks; commits aa580ec, 659b0cc; Phase 5 additive ladder COMPLETE)_
+
+**Wave 7** *(gap closure — blocks on existing 05-01..05-06; from 05-VERIFICATION.md gaps_found)*
+
+- [ ] 05-07-PLAN.md — GAP 3 (CR-01, ORD-01/ORD-03): fix ordered_oracle.cpp to continuous-stream multi-fold seeding (single persistent TFastRng64 across folds, matching create_folds/permutations); regenerate ordered_ctr/permutation_fold1.npy; re-key the D-03 fold-1 gate to permutations(30,2,0)[1] so the production permutations() is validated integer-exact for k≥1 (was self-consistency-only)
+- [ ] 05-08-PLAN.md — GAP 1 (ORD-02): wire ordered_approx_delta_simple into train() under EBoostingType::Ordered (no longer dead code); new ordered_boost_e2e fixture (X/y/model.json/predictions, D-09 offline); end-to-end ordered train→predict ≤1e-5 + in-training per-object no-leakage anchor
+
+**Wave 8** *(gap closure — blocks on 05-08; shares boosting.rs)*
+
+- [ ] 05-09-PLAN.md — GAP 2 (ORD-05): wire tensor_ctr_candidates into train() candidate generation under max_ctr_complexity + CTR-split evaluation in cb-model apply (combined hash via calc_cat_feature_hash + baked ctr_data, bounds-safe); new tensor_ctr_e2e categorical fixture; end-to-end tensor-CTR train→predict ≤1e-5
 
 **Research flag (RESOLVED)**: line-by-line read of `approx_calcer.cpp` + `online_ctr.*` complete (05-RESEARCH.md, file:line citations); per-object oracle schema designed (D-02). Research ESCALATION resolved: the D-01 TU-linking mechanism is infeasible; the user-approved **transcribe-then-self-oracle** replacement (05-CONTEXT DECISION REVISION 2026-06-14) is the mechanism used.
 
