@@ -84,6 +84,13 @@ pub struct CtrFeatureColumn {
     /// read-before-increment `(good + prior) / (total + 1)` prefix), kept for the
     /// materialization test's value-relation assertion and Plan 05-12 scoring.
     pub ctr_value: Vec<f64>,
+    /// The number of DISTINCT combined-projection buckets (the projection's
+    /// categorical cardinality — `TOnlineCtrUniqValuesCounts::Count`,
+    /// `ctrs.h:50`). Used by the `model_size_reg` cat-feature-weight penalty in the
+    /// structure search (`GetCatFeatureWeight`, greedy_tensor_search.cpp:908-932) to
+    /// down-weight high-cardinality (e.g. combination) CTR candidates so they do not
+    /// out-score a lower-cardinality simple CTR on a thin margin.
+    pub bucket_count: usize,
 }
 
 /// Materialize a per-document combined-projection online CTR feature column for
@@ -227,5 +234,8 @@ pub fn materialize_ctr_feature(
         prior_denom,
         bins,
         ctr_value: prefix.value,
+        // Distinct combined-projection buckets (the projection cardinality) — the
+        // size of the first-seen remap.
+        bucket_count: remap.len(),
     })
 }

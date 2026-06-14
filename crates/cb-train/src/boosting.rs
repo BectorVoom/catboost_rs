@@ -309,6 +309,17 @@ pub fn ctr_border_count_default() -> usize {
     15
 }
 
+/// The canonical default `model_size_reg` (`0.5`, upstream
+/// `boosting_options.cpp` / `get_all_params` default). Drives the CTR
+/// cat-feature-weight penalty in the structure search (`GetCatFeatureWeight`,
+/// greedy_tensor_search.cpp:925-928): a NEW CTR projection's score is multiplied
+/// by `(1 + count/maxCount)^(-model_size_reg)`, so high-cardinality (combination)
+/// CTR candidates are down-weighted relative to a lower-cardinality simple CTR.
+#[must_use]
+pub fn model_size_reg_default() -> f64 {
+    0.5
+}
+
 /// The ORDERED-boosting per-object approximant delta for one tree iteration over
 /// one body/tail segment (`UpdateApproxDeltasHistoricallyImpl`,
 /// `approx_calcer.cpp:566-600`; the simple single-dim Gradient/Newton path,
@@ -1385,6 +1396,11 @@ fn train_inner<R: Runtime>(
                 params.depth,
                 n,
                 0,
+                // model_size_reg cat-feature weight (GetCatFeatureWeight): the
+                // default 0.5 down-weights high-cardinality (combination) CTR
+                // candidates so a new {0,1} combination does not out-score a second
+                // border on an already-used {0} simple CTR on a thin margin.
+                model_size_reg_default(),
             )?
         } else {
             match ordered_learning_perm.as_deref() {

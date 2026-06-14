@@ -41,7 +41,7 @@ use cb_data::{calc_cat_feature_hash, stringify_int_category};
 use cb_model::{predict_raw, Model as CbModel};
 use cb_oracle::{compare_permutation, compare_stage, load_f64_vec, load_model_json, Stage};
 use cb_train::{
-    fisher_yates_permutation, online_ctr_prefix_binclf, train, BoostParams, EBootstrapType,
+    fisher_yates_permutation, online_ctr_prefix_binclf, train_cat, BoostParams, EBootstrapType,
     EBoostingType, EOverfittingDetectorType, TProjection,
 };
 use ndarray::Array2;
@@ -211,14 +211,19 @@ fn tensor_ctr_e2e_oracle_predictions_match_upstream() {
     let expected_predictions =
         load_f64_vec(&fixture("tensor_ctr_e2e/predictions.npy")).unwrap();
 
-    // Train the tensor-CTR model under the pinned isolating config. The trainer
-    // emits the tensor CTR candidates under max_ctr_complexity=2 (simple +
-    // combination), materializes each combined-projection online CTR feature, and
-    // persists the chosen CTR splits — lifted into ModelSplit::Ctr below.
-    let trained = train(
+    // Train the tensor-CTR model under the pinned isolating config, driving the
+    // CATEGORICAL columns through the cat-aware entry point `train_cat` (the bug
+    // this gate-closure fixes: the bare `train` never saw the cat columns). The
+    // trainer emits the tensor CTR candidates under max_ctr_complexity=2 (simple +
+    // combination), materializes each combined-projection online CTR feature,
+    // scores them into the oblivious search, estimates leaf values on the averaging
+    // fold, persists the chosen CTR splits, AND bakes the whole-set inference
+    // ctr_data (Plan 05-14) — returned alongside the model.
+    let (trained, baked_ctr_data) = train_cat(
         &CpuBackend,
         &[], // categorical-only model: no float feature columns
         &borders,
+        &cat_cols,
         &target,
         &[],
         &tensor_ctr_params(),
@@ -226,10 +231,13 @@ fn tensor_ctr_e2e_oracle_predictions_match_upstream() {
     )
     .unwrap_or_else(|e| panic!("tensor-CTR e2e training failed: {e:?}"));
 
-    // Lift into the canonical model and predict via the PRODUCTION apply path
-    // (cb_model::predict_raw over the ModelSplit::Ctr evaluation). The categorical
-    // columns drive the combined-projection CTR lookup against the baked ctr_data.
-    let model = CbModel::from_trained(&trained, borders.clone());
+    // Lift into the canonical model, ATTACH the baked ctr_data (the whole-set
+    // inference tables + Scale/Shift carried on each CtrSplit), and predict via the
+    // PRODUCTION apply path (cb_model::predict_raw_cat over the ModelSplit::Ctr
+    // evaluation). The categorical columns drive the combined-projection CTR lookup
+    // against the baked ctr_data.
+    let model = CbModel::from_trained(&trained, borders.clone())
+        .with_ctr_data(cb_model::CtrData::from_baked(&baked_ctr_data));
     let actual = cb_model::predict_raw_cat(&model, &[], &cat_cols);
     // Sanity: the numeric predict_raw entry point is the cat-free special case.
     let _ = predict_raw(&model, &[]);

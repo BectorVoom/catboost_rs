@@ -35,6 +35,9 @@ const PRIOR_DENOM: f64 = 1.0;
 /// monotone stand-in; only `bins` drives the structure-search `ctr_bin > border`
 /// test). A single-feature projection {0} with default `Borders:Prior=0.5/1`.
 fn ctr_column_from_bins(bins: &[u32]) -> CtrFeatureColumn {
+    let mut distinct: Vec<u32> = bins.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
     CtrFeatureColumn {
         projection: TProjection::single(0),
         ctr_type: 0,
@@ -42,6 +45,7 @@ fn ctr_column_from_bins(bins: &[u32]) -> CtrFeatureColumn {
         prior_denom: PRIOR_DENOM,
         bins: bins.to_vec(),
         ctr_value: bins.iter().map(|&b| f64::from(b)).collect(),
+        bucket_count: distinct.len().max(1),
     }
 }
 
@@ -84,6 +88,7 @@ fn ctr_candidate_wins_over_uninformative_float() {
         1,
         n,
         0,
+        0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
     )
     .expect("ctr search");
 
@@ -130,6 +135,7 @@ fn tie_break_float_then_ctr_first_wins() {
         1,
         n,
         0,
+        0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
     )
     .expect("ctr search");
 
@@ -170,6 +176,7 @@ fn forward_bit_leaf_index_mixed_float_and_ctr() {
         2,
         n,
         0,
+        0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
     )
     .expect("ctr search");
 
@@ -225,6 +232,7 @@ fn single_feature_ctr_structure_partition_6_0_9_15() {
         2,
         n,
         0,
+        0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
     )
     .expect("ctr search");
 

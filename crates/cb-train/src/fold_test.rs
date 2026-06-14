@@ -147,12 +147,12 @@ fn create_folds_numeric_path_permutations_drawn_in_continuous_order() {
 
 #[test]
 fn create_folds_learning_fold0_is_identity_zero_draws() {
-    use crate::fisher_yates_permutation;
+    use cb_core::TFastRng64;
     // WHEN a learning permutation is needed (hasCtrs OR ordered boosting),
     // upstream builds Folds[0] as the IDENTITY (shuffle = foldIdx != 0,
     // learn_context.cpp:524 / fold.cpp:54) consuming ZERO RNG draws, and the
-    // AveragingFold takes the FIRST seeded Fisher-Yates draw
-    // (IsAverageFoldPermuted = hasCtrs).
+    // AveragingFold takes its seeded Fisher-Yates draw AFTER one pre-averaging
+    // GenRand (RNG call-count 1 — the Plan 05-14 upstream-validated draw order).
     let n = 30;
     let seed = 0;
     let folds = create_folds(n, 1, /* needed = */ true, false, MULT, seed);
@@ -168,17 +168,23 @@ fn create_folds_learning_fold0_is_identity_zero_draws() {
         "Folds[0] must be the identity (zero draws) when a learning permutation is needed"
     );
 
-    // The averaging fold is the FIRST real seeded draw: since the identity
-    // learning fold drew nothing, the averaging shuffle equals a fresh-seed
-    // Fisher-Yates draw.
+    // The averaging fold is the Fisher-Yates shuffle over a TFastRng64(seed)
+    // advanced by one GenRand (RNG call-count 1) — upstream's pre-averaging draw
+    // (validated bit-for-bit by the tensor_ctr_e2e e2e gate).
+    let mut rng = TFastRng64::from_seed(seed);
+    rng.gen_rand();
+    let mut expected_avg: Vec<i32> = (0..n as i32).collect();
+    for i in 1..n {
+        let j = rng.uniform((i as u64) + 1) as usize;
+        expected_avg.swap(i, j);
+    }
     let averaging = folds
         .iter()
         .find(|f| f.is_averaging)
         .expect("an averaging fold");
     assert_eq!(
-        averaging.permutation,
-        fisher_yates_permutation(n, seed),
-        "the averaging fold must be the first seeded Fisher-Yates draw"
+        averaging.permutation, expected_avg,
+        "the averaging fold is the call-count-1 seeded Fisher-Yates draw"
     );
 }
 
@@ -194,9 +200,11 @@ fn create_folds_multi_permutation_identity_then_shuffles() {
     let seed = 7;
     let folds = create_folds(n, 2, /* needed = */ true, false, MULT, seed);
     let identity: Vec<i32> = (0..n as i32).collect();
-    // Replay the persistent stream: identity (no draw) then one shuffle for the
-    // averaging fold.
+    // Replay the persistent stream: identity (no draw), then ONE pre-averaging
+    // GenRand (RNG call-count 1, Plan 05-14 upstream-validated draw order), then
+    // one shuffle for the averaging fold.
     let mut rng = TFastRng64::from_seed(seed);
+    rng.gen_rand();
     let mut expected_avg: Vec<i32> = (0..n as i32).collect();
     for i in 1..n {
         let j = rng.uniform((i as u64) + 1) as usize;

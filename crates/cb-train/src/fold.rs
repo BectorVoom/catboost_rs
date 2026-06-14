@@ -254,17 +254,31 @@ pub fn create_folds(
     // LEARNING-PERMUTATION-NEEDED path (hasCtrs OR ordered boosting): drive a
     // SINGLE persistent rng directly. Fold 0 (idx == 0) is the IDENTITY
     // (zero draws, `shuffle = foldIdx != 0`); every subsequent fold takes one
-    // Fisher-Yates draw from the SAME held rng IN ORDER (so the averaging fold is
-    // the first seeded draw == fisher_yates_permutation(n, seed) for
-    // permutation_count=1). The persistent rng is never reseeded per fold.
+    // Fisher-Yates draw from the SAME held rng IN ORDER. The persistent rng is
+    // never reseeded per fold.
+    //
+    // PRE-AVERAGING DRAW (Plan 05-14): upstream advances its persistent
+    // `LearnProgress->Rand` by exactly ONE `GenRand()` between the identity
+    // learning Folds[0] and the AveragingFold's `Shuffle` (the averaging shuffle
+    // starts at RNG call-count 1, NOT 0). Without this the averaging permutation
+    // is `fisher_yates(n, seed)` (call-count 0) which yields the WRONG leaf-value
+    // partition (`[6,0,11,13]` instead of the upstream `[6,0,7,17]` for the
+    // tensor_ctr_e2e config). Advancing one draw reproduces upstream's
+    // AveragingFold permutation and the leaf-weight partition `[6,0,7,17]` /
+    // tree0 leaf values `[-0.0333,0,-0.005,0.0275]` bit-for-bit.
     let mut rng = TFastRng64::from_seed(random_seed);
+    let mut first_real_shuffle = true;
     (0..total_folds)
         .map(|idx| {
             let permutation: Vec<i32> = if idx == 0 {
                 // Identity Folds[0]: ZERO draws on the persistent rng.
                 (0..n).map(|i| i as i32).collect()
             } else {
-                // First and subsequent real shuffles from the held rng.
+                if first_real_shuffle {
+                    // One pre-averaging GenRand draw (upstream call-count 1).
+                    rng.gen_rand();
+                    first_real_shuffle = false;
+                }
                 shuffle_in_place(n, &mut rng)
             };
             build_fold(idx, learning_folds, permutation, n, dynamic_body_tail, fold_len_multiplier)

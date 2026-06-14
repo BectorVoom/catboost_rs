@@ -985,6 +985,21 @@ fn score_candidate_ctr_aware(
 /// ([`select_best_candidate`] discipline, strict `>`, Pitfall 1). The winning
 /// candidate's concrete [`CtrAwareSplit`] is recovered from a vector kept in
 /// lockstep with the scores.
+/// The `model_size_reg` cat-feature weight for a NEW CTR projection
+/// (`GetCatFeatureWeight`, greedy_tensor_search.cpp:925-928):
+/// `(1 + count / maxCount)^(-model_size_reg)`. With the default `model_size_reg =
+/// 0.5` a projection whose distinct-bucket `count` equals `maxCount` is weighted
+/// `2^-0.5 ≈ 0.707`, while a low-cardinality projection is weighted nearer `1.0`.
+/// `model_size_reg == 0` ⇒ weight `1.0` (no penalty).
+#[must_use]
+fn cat_feature_weight(count: usize, max_count: usize, model_size_reg: f64) -> f64 {
+    if model_size_reg == 0.0 || max_count == 0 {
+        return 1.0;
+    }
+    let ratio = count as f64 / max_count as f64;
+    (1.0 + ratio).powf(-model_size_reg)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_level_ctr_aware(
     matrix: &FeatureMatrix,
@@ -995,6 +1010,7 @@ fn select_level_ctr_aware(
     weight: &[f64],
     scaled_l2: f64,
     n_objects: usize,
+    model_size_reg: f64,
 ) -> CbResult<CtrAwareSplit> {
     let mut scored: Vec<(CtrAwareSplit, f64)> = Vec::new();
 
@@ -1010,17 +1026,54 @@ fn select_level_ctr_aware(
         }
     }
 
+    // The `model_size_reg` cat-feature-weight penalty inputs (GetCatFeatureWeight,
+    // greedy_tensor_search.cpp:908-932 + CalcMaxFeatureValueCount:1070-1088):
+    //   * `max_bucket_count` = max distinct-bucket count over ALL CTR candidate
+    //     columns (the candidates this level scores).
+    //   * a projection ALREADY split in this tree (`chosen`) is exempt (weight 1.0)
+    //     — the penalty only down-weights NEW projections, so a second border on an
+    //     already-used simple CTR is never penalized while a new combination CTR is.
+    let max_bucket_count = ctr_features
+        .iter()
+        .map(|c| c.bucket_count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let used_projections: Vec<&crate::TProjection> = chosen
+        .iter()
+        .filter_map(|s| match s {
+            CtrAwareSplit::Ctr { col, .. } => {
+                ctr_features.get(*col).map(|c| &c.projection)
+            }
+            CtrAwareSplit::Float(_) => None,
+        })
+        .collect();
+
     // CTR candidates next (AddTreeCtrs), column asc / border asc. One candidate per
     // CTR-value border in `0..ctr_border_count`; the `ctr_bin > border` test
     // borders are the integer bucket thresholds the materialized `bins` are
     // quantized into (a border `b` ⇔ bucket > `b`, i.e. bucket ≥ `b + 1`).
     for col in 0..ctr_features.len() {
+        // The cat-feature weight for this column's projection (1.0 if already used,
+        // else (1 + count/maxCount)^(-model_size_reg)).
+        let cat_weight = match ctr_features.get(col) {
+            Some(column) => {
+                let already_used = used_projections.iter().any(|p| **p == column.projection);
+                if already_used {
+                    1.0
+                } else {
+                    cat_feature_weight(column.bucket_count, max_bucket_count, model_size_reg)
+                }
+            }
+            None => 1.0,
+        };
         for border_idx in 0..ctr_border_count {
             let border = border_idx as f64;
             let split = CtrAwareSplit::Ctr { col, border };
-            let score = score_candidate_ctr_aware(
-                matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
-            );
+            let score = cat_weight
+                * score_candidate_ctr_aware(
+                    matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
+                );
             scored.push((split, score));
         }
     }
@@ -1080,6 +1133,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
     depth: usize,
     n_objects: usize,
     target_border_idx: usize,
+    model_size_reg: f64,
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
@@ -1094,6 +1148,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
             weight,
             scaled_l2,
             n_objects,
+            model_size_reg,
         )?;
         chosen.push(best);
     }
