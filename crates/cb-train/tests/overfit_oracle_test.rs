@@ -195,6 +195,9 @@ fn train_overfit(cfg: &OverfitConfig) -> (cb_train::Model, Vec<f64>) {
         simple_ctr_priors: cb_train::simple_ctr_priors_default(),
         counter_calc_method: cb_train::counter_calc_method_default(),
         boosting_type: cb_train::boosting_type_default(),
+        max_ctr_complexity: cb_train::max_ctr_complexity_default(),
+        combinations_ctr: cb_train::combinations_ctr_default(),
+        combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
     };
 
     let eval = EvalSet {

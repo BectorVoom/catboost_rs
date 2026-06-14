@@ -189,6 +189,31 @@ pub struct BoostParams {
     /// ([`ordered_approx_delta_simple`]) drives the anti-leakage body/tail update
     /// (ORD-02); the numeric/one-hot Plain slices leave it at the default.
     pub boosting_type: EBoostingType,
+    /// The maximum feature-combination (tensor-CTR) projection length
+    /// (`max_ctr_complexity` / upstream `MaxTensorComplexity`,
+    /// `cat_feature_options.cpp:231-232`, default 4 — pinned EXPLICITLY here,
+    /// never auto-selected, RESEARCH Pitfall 6). Bounds
+    /// [`crate::TProjection::full_projection_length`] in
+    /// [`crate::tensor_ctr_candidates`] (`GetFullProjectionLength` gate,
+    /// `greedy_tensor_search.cpp:532-533`): `== 1` emits only SimpleCtrs, `>= 2`
+    /// admits CombinationCtrs (tensors) of that length. The numeric/one-hot and
+    /// single-feature CTR slices leave it at the pinned default and never form a
+    /// combination (ORD-05 / D-05). [`max_ctr_complexity_default`].
+    pub max_ctr_complexity: usize,
+    /// The SINGLE `combinations_ctr` type the tensor-CTR (CombinationCtr) path
+    /// bakes (ORD-05 / D-07 — one explicit CTR type per fixture, never the
+    /// upstream auto default set, RESEARCH Pitfall 6). Pinned EXPLICITLY
+    /// ([`combinations_ctr_default`]); the tensor CTR keys the SAME online/ordered
+    /// accumulation (05-04/05-05) on the combined projection hash. The
+    /// numeric/one-hot/simple-CTR slices leave it at the default and never
+    /// exercise the combination path.
+    pub combinations_ctr: ECtrType,
+    /// The explicit per-prior numerators for [`Self::combinations_ctr`] (D-07 —
+    /// one prior per combination CTR column, never auto; the tensor_ctr fixture
+    /// pins `Borders:Prior=0.5`, so the online `+1` denom and the inference
+    /// `+PriorDenom` coincide, RESEARCH A6). Pinned EXPLICITLY
+    /// ([`combinations_ctr_priors_default`]).
+    pub combinations_ctr_priors: Vec<f64>,
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -238,6 +263,35 @@ pub fn counter_calc_method_default() -> CounterCalcMethod {
 #[must_use]
 pub fn boosting_type_default() -> EBoostingType {
     EBoostingType::Plain
+}
+
+/// The canonical default `max_ctr_complexity` (`4`,
+/// `cat_feature_options.cpp:231-232`; upstream `MaxTensorComplexity`). Pinned
+/// EXPLICITLY at every `BoostParams` construction site (RESEARCH Pitfall 6 —
+/// never auto-selected). Re-exports [`crate::projection::max_ctr_complexity_default`]
+/// so the magic number lives in one place.
+#[must_use]
+pub fn max_ctr_complexity_default() -> usize {
+    crate::projection::max_ctr_complexity_default()
+}
+
+/// The canonical default `combinations_ctr` type ([`ECtrType::Borders`], the
+/// upstream default CTR family head). Pinned EXPLICITLY at every `BoostParams`
+/// construction site (RESEARCH Pitfall 6 — never auto-selected); the
+/// numeric/one-hot/simple-CTR slices leave it here and never exercise the
+/// combination path.
+#[must_use]
+pub fn combinations_ctr_default() -> ECtrType {
+    ECtrType::Borders
+}
+
+/// The canonical default `combinations_ctr` priors — a single unit-denominator
+/// prior `0.5/1` (the in-scope tensor_ctr fixture pins `Borders:Prior=0.5`, so
+/// the online `+1` denom and the inference `+PriorDenom` coincide, RESEARCH A6).
+/// Pinned EXPLICITLY at every `BoostParams` construction site.
+#[must_use]
+pub fn combinations_ctr_priors_default() -> Vec<f64> {
+    vec![0.5]
 }
 
 /// The ORDERED-boosting per-object approximant delta for one tree iteration over

@@ -101,6 +101,9 @@ fn train_eval_metrics(
         simple_ctr_priors: cb_train::simple_ctr_priors_default(),
         counter_calc_method: cb_train::counter_calc_method_default(),
         boosting_type: cb_train::boosting_type_default(),
+        max_ctr_complexity: cb_train::max_ctr_complexity_default(),
+        combinations_ctr: cb_train::combinations_ctr_default(),
+        combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
     };
 
     let sets = [
@@ -197,6 +200,9 @@ fn eval_metric_defaults_to_objective_curve() {
         simple_ctr_priors: cb_train::simple_ctr_priors_default(),
         counter_calc_method: cb_train::counter_calc_method_default(),
         boosting_type: cb_train::boosting_type_default(),
+        max_ctr_complexity: cb_train::max_ctr_complexity_default(),
+        combinations_ctr: cb_train::combinations_ctr_default(),
+        combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
     };
     let sets = [
         EvalSet {

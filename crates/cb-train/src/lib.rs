@@ -22,6 +22,7 @@ mod fold;
 mod metrics;
 mod overfit;
 mod permutation;
+mod projection;
 mod tree;
 
 pub use autolr::{coefficients as autolr_coefficients, guess as autolr_guess, TargetType};
@@ -30,7 +31,8 @@ pub use bootstrap::{
     MVS_BLOCK_SIZE,
 };
 pub use candidates::{
-    learn_set_cardinality, one_hot_max_size_default, route_categorical, route_column, EncodingPath,
+    learn_set_cardinality, one_hot_max_size_default, route_categorical, route_column,
+    tensor_ctr_candidates, CtrCandidate, EncodingPath,
 };
 pub use ctr::{
     accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
@@ -47,8 +49,10 @@ pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetecto
 pub use permutation::{
     fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
+pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
 pub use boosting::{
-    boosting_type_default, counter_calc_method_default, fold_len_multiplier_default,
+    boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
+    counter_calc_method_default, fold_len_multiplier_default, max_ctr_complexity_default,
     ordered_approx_delta_simple, permutation_count_default, simple_ctr_default,
     simple_ctr_priors_default, train, train_with_eval, train_with_eval_sets, BoostParams,
     EBoostingType, EvalSet, Model, ObliviousTree,

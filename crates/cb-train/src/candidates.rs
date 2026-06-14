@@ -42,6 +42,8 @@
 use cb_core::CbResult;
 use cb_data::{calc_cat_feature_hash, PerfectHash};
 
+use crate::projection::{enumerate_projections, TProjection};
+
 // Tests live in a dedicated sibling file (source/test separation, CLAUDE.md /
 // AGENTS.md — no test body in this production file). Mounted as a CHILD module
 // of `candidates` so the canonical filter `cargo test -p cb-train candidates::`
@@ -138,4 +140,62 @@ pub fn learn_set_cardinality(column: &[&str]) -> CbResult<u32> {
 pub fn route_column(column: &[&str], one_hot_max_size: u32) -> CbResult<EncodingPath> {
     let cardinality = learn_set_cardinality(column)?;
     Ok(route_categorical(cardinality, one_hot_max_size))
+}
+
+/// A tensor / combination CTR candidate emitted by [`tensor_ctr_candidates`]: a
+/// categorical-feature projection ([`TProjection`]) plus its kind (Simple for a
+/// single feature, Combination for a tensor of ≥ 2). The downstream CTR bake
+/// keys the SAME online/ordered accumulation (05-04/05-05) on the projection's
+/// COMBINED hash ([`TProjection::combined_hash`]) instead of a single feature's
+/// hash — a tensor CTR is that math over a combined key (D-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtrCandidate {
+    /// The categorical-feature projection (sorted member set).
+    pub projection: TProjection,
+    /// `true` for a SimpleCtr (single feature), `false` for a CombinationCtr.
+    pub is_simple: bool,
+}
+
+/// Emit the tensor / combination CTR candidates for a tree level
+/// (`AddTreeCtrs`, `greedy_tensor_search.cpp:491-551`, the from-empty enumeration
+/// the tensor-CTR fixture exercises): every projection over the CTR-ELIGIBLE
+/// categorical features (those routing to [`EncodingPath::Ctr`], i.e. learn-set
+/// cardinality `> one_hot_max_size`) whose `GetFullProjectionLength` is
+/// `<= max_ctr_complexity` (`:532-533`). SimpleCtrs (length 1) AND
+/// CombinationCtrs (length ≥ 2) are both emitted.
+///
+/// `cat_cardinalities[f]` is cat feature `f`'s learn-set distinct-value count
+/// ([`learn_set_cardinality`]). One-hot / skipped features (cardinality
+/// `<= one_hot_max_size`) are NOT CTR-eligible and never enter a projection —
+/// matching upstream's `isOneHot` early-return (`:523-527`). The emitted
+/// projection member indices are POSITIONS into the CTR-eligible feature list (a
+/// dense re-index), so a downstream bake folds the eligible features' per-document
+/// hashes in that order.
+///
+/// The enumeration is bounded by `max_ctr_complexity` (no unbounded combinatorial
+/// blow-up, T-05-06-01); `max_ctr_complexity == 1` yields only SimpleCtrs,
+/// `== 2` adds pairs, and so on.
+#[must_use]
+pub fn tensor_ctr_candidates(
+    cat_cardinalities: &[u32],
+    one_hot_max_size: u32,
+    max_ctr_complexity: usize,
+) -> Vec<CtrCandidate> {
+    // CTR-eligible features: those routing to the CTR path (cardinality strictly
+    // above one_hot_max_size). One-hot / skip features are excluded.
+    let eligible_count = cat_cardinalities
+        .iter()
+        .filter(|&&card| route_categorical(card, one_hot_max_size) == EncodingPath::Ctr)
+        .count();
+
+    enumerate_projections(eligible_count, max_ctr_complexity)
+        .into_iter()
+        .map(|projection| {
+            let is_simple = projection.is_simple();
+            CtrCandidate {
+                projection,
+                is_simple,
+            }
+        })
+        .collect()
 }

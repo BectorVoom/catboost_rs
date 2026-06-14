@@ -19,7 +19,8 @@ use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
 use cb_train::{
-    boosting_type_default, counter_calc_method_default, fold_len_multiplier_default,
+    boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
+    counter_calc_method_default, fold_len_multiplier_default, max_ctr_complexity_default,
     one_hot_max_size_default, permutation_count_default, simple_ctr_default,
     simple_ctr_priors_default, train, BoostParams, EBootstrapType, EOverfittingDetectorType,
 };
@@ -233,6 +234,12 @@ impl CatBoostBuilder {
             simple_ctr_priors: simple_ctr_priors_default(),
             counter_calc_method: counter_calc_method_default(),
             boosting_type: boosting_type_default(),
+            // Tensor-CTR config pinned to the upstream defaults (D-07 / Pitfall
+            // 6); the numeric facade path forms no combination, so these are
+            // inert here.
+            max_ctr_complexity: max_ctr_complexity_default(),
+            combinations_ctr: combinations_ctr_default(),
+            combinations_ctr_priors: combinations_ctr_priors_default(),
         }
     }
 
