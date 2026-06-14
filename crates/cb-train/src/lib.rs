@@ -36,9 +36,10 @@ pub use candidates::{
 };
 pub use ctr::{
     accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
-    calc_normalization, online_ctr_prefix_binclf, ordered_ctr_per_permutation, CounterCalcMethod,
-    ECtrType, FinalCtrTable, OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior,
-    TCtrHistory, TCtrMeanHistory, SIMPLE_CLASSES_COUNT,
+    calc_normalization, materialize_ctr_feature, online_ctr_prefix_binclf,
+    ordered_ctr_per_permutation, CounterCalcMethod, CtrFeatureColumn, ECtrType, FinalCtrTable,
+    OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior, TCtrHistory, TCtrMeanHistory,
+    SIMPLE_CLASSES_COUNT,
 };
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
@@ -52,10 +53,10 @@ pub use permutation::{
 pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
 pub use boosting::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
-    counter_calc_method_default, fold_len_multiplier_default, max_ctr_complexity_default,
-    ordered_approx_delta_simple, permutation_count_default, simple_ctr_default,
-    simple_ctr_priors_default, train, train_with_eval, train_with_eval_sets, BoostParams,
-    EBoostingType, EvalSet, Model, ObliviousTree,
+    counter_calc_method_default, ctr_border_count_default, fold_len_multiplier_default,
+    max_ctr_complexity_default, ordered_approx_delta_simple, permutation_count_default,
+    simple_ctr_default, simple_ctr_priors_default, train, train_with_eval, train_with_eval_sets,
+    BoostParams, EBoostingType, EvalSet, Model, ObliviousTree,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, greedy_tensor_search_oblivious_ordered,

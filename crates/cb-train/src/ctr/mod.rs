@@ -34,6 +34,8 @@ pub mod online;
 pub mod calc_ctr;
 #[path = "final_ctr.rs"]
 pub mod final_ctr;
+#[path = "ctr_feature.rs"]
+pub mod ctr_feature;
 
 #[cfg(test)]
 #[path = "online_test.rs"]
@@ -134,6 +136,7 @@ pub enum CounterCalcMethod {
 pub use calc_ctr::{
     calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin, calc_normalization, Prior,
 };
+pub use ctr_feature::{materialize_ctr_feature, CtrFeatureColumn};
 pub use final_ctr::{build_final_ctr, FinalCtrTable};
 pub use online::{
     accumulate_online, online_ctr_prefix_binclf, ordered_ctr_per_permutation,

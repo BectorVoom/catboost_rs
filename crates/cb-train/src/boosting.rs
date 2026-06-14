@@ -296,6 +296,17 @@ pub fn combinations_ctr_priors_default() -> Vec<f64> {
     vec![0.5]
 }
 
+/// The canonical default Borders CTR border count (`15`, the upstream
+/// `cat_feature_options.cpp` `ctr_border_count` default for the Borders CTR
+/// family). Pinned EXPLICITLY by the caller (never auto-selected — RESEARCH
+/// Pitfall 6); the materialized combined-projection online CTR feature is
+/// quantized into `[0, 15]` integer CTR bins against this count
+/// ([`crate::calc_ctr_online_bin`]).
+#[must_use]
+pub fn ctr_border_count_default() -> usize {
+    15
+}
+
 /// The ORDERED-boosting per-object approximant delta for one tree iteration over
 /// one body/tail segment (`UpdateApproxDeltasHistoricallyImpl`,
 /// `approx_calcer.cpp:566-600`; the simple single-dim Gradient/Newton path,
