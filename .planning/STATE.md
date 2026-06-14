@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: "catboost==1.2.10 now in .venv (user-installed). Generated the 2 blocked e2e fixtures + 2 code fixes (commits 6176ab5, 301f54c). ORD-02 ordered_boost_e2e oracle 2/2 GREEN — ORD-02 e2e CLOSED. ORD-05 tensor_ctr_e2e 2/3: full train->predict fails because cb_train::train() has NO categorical-column input (cat_cardinalities hardcoded &[] at boosting.rs:910) — the categorical-CTR TRAINING pipeline is unbuilt (apply path is complete). ORD-05 re-scoped to a dedicated gap-closure plan (user decision 2026-06-14), NOT a fixture blocker."
-last_updated: "2026-06-14T05:45:00.000Z"
-last_activity: 2026-06-14 -- ORD-02 e2e closed via offline fixtures; ORD-05 re-scoped (categorical-CTR training pipeline)
+status: completed
+stopped_at: "05-09 Tasks 1a + 1b COMPLETE + verified (commits b2261ec, 200ffb0) — cb-model CTR-split representation RESOLVED (ModelSplit { Float, Ctr(CtrSplit) }, ObliviousTree.splits: Vec<ModelSplit>, Model.ctr_data); tensor_ctr_candidates wired into train() under max_ctr_complexity; apply.rs evaluates ModelSplit::Ctr via combined hash + baked ctr_data (bounds-safe). cargo check --workspace --tests clean; standalone tensor_ctr 3/3, ctr_data_roundtrip 5/5, all cb-model + cb-train float oracles green. 05-09 Task 2 source COMPLETE (commit 10f4a92) but the ORD-05 e2e oracle is BLOCKED (checkpoint:human-action) — catboost==1.2.10 not importable here, so tensor_ctr_e2e/ fixtures cannot be generated. Oracle NOT weakened / NOT #[ignore]'d. ORD-05 end-to-end closure pending offline fixture generation."
+last_updated: "2026-06-14T06:06:56.518Z"
+last_activity: 2026-06-14 -- ORD-02 ordered-boost e2e oracle green via offline fixtures; ORD-05 reframed as unbuilt training pipeline
 progress:
   total_phases: 8
   completed_phases: 4
