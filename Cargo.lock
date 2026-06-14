@@ -692,6 +692,7 @@ dependencies = [
  "cb-compute",
  "cb-core",
  "cb-data",
+ "cb-model",
  "cb-oracle",
  "ndarray",
  "ndarray-npy",

@@ -18,6 +18,12 @@ cb-backend = { path = "../cb-backend" }
 # Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the
 # first-slice train->predict parity integration test.
 cb-oracle = { path = "../cb-oracle" }
+# Test-only (ORD-02 e2e, Plan 05-10): the production apply path
+# (cb_model::predict_raw) the ordered train->predict oracle validates through.
+# A DEV-dependency ONLY — the normal cb-train build graph never links cb-model
+# (cb-model depends on cb-train in the build graph; dev-deps are exempt from the
+# cycle and compiled solely for the integration test, no runtime cycle).
+cb-model = { path = "../cb-model" }
 approx.workspace = true
 ndarray.workspace = true
 ndarray-npy.workspace = true

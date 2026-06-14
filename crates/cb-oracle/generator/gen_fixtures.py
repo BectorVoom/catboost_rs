@@ -74,6 +74,12 @@ MODEL_SERDE = FIXTURES / "model_serde"
 PREDICTION_TYPES = FIXTURES / "prediction_types"
 FEATURE_IMPORTANCE = FIXTURES / "feature_importance"
 LOSS_EXTRA = FIXTURES / "loss_extra"
+# Phase-5 (Plan 05-10, ORD-02) end-to-end ordered train->predict fixture root.
+# Closes the D-09 omission of the prior `ordered_boost/` fixture (per-object
+# internals only): this carries the FULL train->predict stack (X/y/model.json/
+# predictions) for boosting_type=Ordered so the multi-tree e2e oracle validates
+# final predictions through the production cb_model::predict_raw apply path.
+ORDERED_BOOST_E2E = FIXTURES / "ordered_boost_e2e"
 
 # ---------------------------------------------------------------------------
 # PHASE-4 FIXTURE MANIFEST (D-13) — every NEW fixture path the downstream Wave-2..5
@@ -1757,6 +1763,122 @@ def gen_loss_extra() -> None:
             fh.write("\n")
 
 
+def gen_ordered_boost_e2e() -> None:
+    """ordered_boost_e2e/ — the FULL multi-tree ordered train->predict oracle
+    (ORD-02, Plan 05-10, the gap-closure for the D-09 omission).
+
+    The prior `ordered_boost/` fixture committed only per-object internals
+    (permutation + body/tail boundaries + the iter-0 ordered approx) and OMITTED
+    the input features/labels, so it could not validate a full train->predict
+    stack (D-09). This scenario commits the WHOLE stack — `X.npy` (f32 features),
+    `y.npy` (RMSE labels), `model.json` (the upstream catboost 1.2.10
+    boosting_type=Ordered trained model), and `predictions.npy` (upstream
+    RawFormulaVal) — so the Rust e2e oracle (`ordered_boost_e2e_oracle_test.rs`)
+    trains the SAME isolating config via `cb_train::train`
+    (boosting_type=Ordered), lifts the model into `cb_model::Model`, predicts via
+    the PRODUCTION `cb_model::predict_raw` apply path, and asserts ≤1e-5 vs these
+    `predictions.npy` across ALL iterations/trees (no `#[ignore]`).
+
+    ISOLATING CONFIG (mirrors `ordered_boost/config.json`, the in-scope ordered
+    knobs): boosting_type=Ordered, permutation_count=1 (→ 1 learning + 1 averaging
+    fold), fold_len_multiplier=2.0, depth=2, iterations=5, learning_rate=0.1,
+    l2_leaf_reg=3.0, leaf_estimation_method=Gradient, leaf_estimation_iterations=1,
+    bootstrap_type=No, random_strength=0 (→ NO Box-Muller perturbation draws, so
+    the once-created fold permutation is deterministic across all iterations —
+    the D-11 multi-tree concern does not apply on the ordered path here),
+    random_seed=0, thread_count=1, loss=RMSE, boost_from_average explicit.
+
+    OFFLINE / RUN-ONCE (D-12): catboost is NOT importable in CI; this is generated
+    on a machine with `catboost==1.2.10` then COMMITTED. CI only READS the
+    committed `.npy`/`model.json`. The dataset is a small deterministic numeric
+    corpus (N=30, 2 float features) synthesized here with a fixed seed so the
+    fixture is reproducible in isolation.
+    """
+    ORDERED_BOOST_E2E.mkdir(parents=True, exist_ok=True)
+
+    # Deterministic small numeric dataset (N=30, 2 float features, RMSE labels).
+    # Fixed seed so the corpus is reproducible without an external input file.
+    rng = np.random.default_rng(SEED)
+    n_rows = 30
+    x = rng.uniform(-3.0, 3.0, size=(n_rows, 2)).astype(np.float32)
+    # A smooth-ish target with mild feature dependence + small noise.
+    y = (
+        1.5 * x[:, 0].astype(np.float64)
+        - 0.7 * x[:, 1].astype(np.float64)
+        + 0.3 * (x[:, 0].astype(np.float64) ** 2)
+        + rng.normal(0.0, 0.1, size=n_rows)
+    ).astype(np.float64)
+
+    np.save(ORDERED_BOOST_E2E / "X.npy", x, allow_pickle=False)
+    np.save(ORDERED_BOOST_E2E / "y.npy", _assert_f64(y, "y"), allow_pickle=False)
+
+    ordered_params = {
+        "boosting_type": "Ordered",
+        "permutation_count": 1,
+        "fold_len_multiplier": 2.0,
+        "depth": 2,
+        "iterations": 5,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "leaf_estimation_method": "Gradient",
+        "leaf_estimation_iterations": 1,
+        "score_function": "L2",
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "random_seed": SEED,
+        "thread_count": 1,
+        "loss_function": "RMSE",
+        "verbose": False,
+    }
+
+    # RMSE → boost_from_average=True (bias == target mean, Pitfall 2).
+    model = CatBoostRegressor(boost_from_average=True, **ordered_params)
+    model.fit(x, y)
+
+    # --- Stage: Splits + LeafValues (the upstream Ordered model) -------------
+    model.save_model(str(ORDERED_BOOST_E2E / "model.json"), format="json")
+
+    # --- Stage: Predictions (RawFormulaVal, the production apply-path target) -
+    predictions = _assert_f64(
+        np.asarray(model.predict(x, prediction_type="RawFormulaVal"), dtype=np.float64),
+        "predictions",
+    )
+    np.save(ORDERED_BOOST_E2E / "predictions.npy", predictions, allow_pickle=False)
+
+    config = {
+        "scenario": "ordered_boost_e2e",
+        "requirement": "ORD-02",
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "n_iterations": 5,
+        "boost_from_average": True,
+        "prediction_type": "RawFormulaVal",
+        "params": {**ordered_params, "boost_from_average": True},
+        "stages": ["Splits", "LeafValues", "Predictions"],
+        "carries_full_train_predict_stack": True,
+        "note": (
+            "FULL ordered train->predict stack (X/y/model.json/predictions), "
+            "closing the D-09 omission of the per-object-only ordered_boost/ "
+            "fixture. Generated OFFLINE with pinned catboost==1.2.10 (thread_count=1); "
+            "NEVER run in CI — CI only READS the committed artifacts (D-12). The Rust "
+            "oracle trains the SAME config via cb_train (boosting_type=Ordered) and "
+            "asserts cb_model::predict_raw ≤1e-5 vs predictions.npy across ALL trees."
+        ),
+        "npy_schema": {
+            "X.npy": "[N, 2] float32 — input float features (SoA-loaded per column by the Rust oracle)",
+            "y.npy": "[N] float64 — RMSE labels",
+            "model.json": "upstream catboost 1.2.10 boosting_type=Ordered trained model (splits + leaf_values + borders)",
+            "predictions.npy": "[N] float64 — upstream RawFormulaVal (the production-apply-path ≤1e-5 target)",
+        },
+    }
+    with (ORDERED_BOOST_E2E / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -1866,6 +1988,10 @@ def main() -> None:
     print(f"Wrote feature_importance oracle fixtures under {FEATURE_IMPORTANCE}")
     gen_loss_extra()
     print(f"Wrote loss_extra oracle fixtures under {LOSS_EXTRA}")
+
+    # --- Phase-5 ordered end-to-end fixture (Plan 05-10, ORD-02, D-09) -------
+    gen_ordered_boost_e2e()
+    print(f"Wrote ordered_boost_e2e oracle fixtures under {ORDERED_BOOST_E2E}")
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
