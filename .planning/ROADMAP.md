@@ -221,7 +221,7 @@ Plans:
 
 **Wave 8** *(gap closure — blocks on 05-08; shares boosting.rs + tree.rs)*
 
-- [ ] 05-10-PLAN.md — GAP 1 (ORD-02) Part 2/2 — WIRE + E2E HARD GATE: branch train_with_eval_sets() on EBoostingType::Ordered — build folds ONCE (create_folds), grow tree STRUCTURE via greedy_tensor_search_oblivious_ordered (05-08) over the learning fold, estimate leaf VALUES on the averaging fold (Plain-identical CalcLeafValuesSimple); ordered per-iteration RNG draw accounting (folds created once, random_strength=0 ⇒ no Box-Muller D-11 drift); new ordered_boost_e2e fixture (X/y/model.json/predictions, D-09 offline); FULL multi-tree ordered train→predict ≤1e-5 across ALL trees, NO #[ignore], + in-training per-object no-leakage anchor
+- [~] 05-10-PLAN.md — GAP 1 (ORD-02) Part 2/2 — WIRE + E2E HARD GATE: **Task 1 DONE** (eee112c) — train_with_eval_sets() branches on EBoostingType::Ordered, folds built ONCE (create_folds, FOLDS-BUILT-ONCE grep-enforced), tree STRUCTURE via greedy_tensor_search_oblivious_ordered (05-08), leaf VALUES on the averaging fold (Plain-identical); Plain unchanged; wiring test locks Ordered≠Plain. **Task 2 source DONE, oracle BLOCKED** (018c633) — gen_ordered_boost_e2e() + ordered_boost_e2e_oracle_test.rs (FULL multi-tree ≤1e-5 via cb_model::predict_raw, NO #[ignore]) authored & compile-clean, but the ordered_boost_e2e/ fixtures CANNOT be generated here (catboost==1.2.10 not importable). Oracle NOT weakened. **ORD-02 closure pending OFFLINE fixture generation** (run gen_fixtures.py on a catboost==1.2.10 machine, commit the 4 fixtures, then the e2e test must pass).
 
 **Wave 9** *(gap closure — blocks on 05-10; shares boosting.rs + apply.rs)*
 
