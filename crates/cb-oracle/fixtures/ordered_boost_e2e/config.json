@@ -1,0 +1,44 @@
+{
+  "boost_from_average": true,
+  "carries_full_train_predict_stack": true,
+  "catboost_version": "1.2.10",
+  "n_features": 2,
+  "n_iterations": 5,
+  "n_rows": 30,
+  "note": "FULL ordered train->predict stack (X/y/model.json/predictions), closing the D-09 omission of the per-object-only ordered_boost/ fixture. Generated OFFLINE with pinned catboost==1.2.10 (thread_count=1); NEVER run in CI \u2014 CI only READS the committed artifacts (D-12). The Rust oracle trains the SAME config via cb_train (boosting_type=Ordered) and asserts cb_model::predict_raw \u22641e-5 vs predictions.npy across ALL trees.",
+  "npy_schema": {
+    "X.npy": "[N, 2] float32 \u2014 input float features (SoA-loaded per column by the Rust oracle)",
+    "model.json": "upstream catboost 1.2.10 boosting_type=Ordered trained model (splits + leaf_values + borders)",
+    "predictions.npy": "[N] float64 \u2014 upstream RawFormulaVal (the production-apply-path \u22641e-5 target)",
+    "y.npy": "[N] float64 \u2014 RMSE labels"
+  },
+  "params": {
+    "boost_from_average": true,
+    "boosting_type": "Ordered",
+    "bootstrap_type": "No",
+    "depth": 2,
+    "fold_len_multiplier": 2.0,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "RMSE",
+    "permutation_count": 1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "requirement": "ORD-02",
+  "scenario": "ordered_boost_e2e",
+  "seed": 0,
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "Predictions"
+  ],
+  "thread_count": 1
+}

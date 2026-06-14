@@ -1,0 +1,52 @@
+{
+  "boost_from_average": false,
+  "carries_full_train_predict_stack": true,
+  "catboost_version": "1.2.10",
+  "n_cat_features": 2,
+  "n_iterations": 5,
+  "n_rows": 30,
+  "note": "FULL tensor-CTR train->predict stack (X_cat/y/model.json WITH baked ctr_data/predictions), closing the D-09 omission of the per-object-only tensor_ctr/ fixture. Generated OFFLINE with pinned catboost==1.2.10 (thread_count=1); NEVER run in CI \u2014 CI only READS the committed artifacts (D-12). The Rust oracle trains the SAME config via cb_train, lifts to cb_model::Model with the baked ctr_data, and asserts cb_model::predict_raw \u22641e-5 vs predictions.npy across ALL trees through the ModelSplit::Ctr apply path.",
+  "npy_schema": {
+    "X_cat.npy": "[N, 2] int32 \u2014 raw categorical columns as integer codes (the Rust oracle stringifies via cb_data::stringify_int_category, A4)",
+    "model.json": "upstream catboost 1.2.10 tensor-CTR model (splits + leaf_values + borders + baked ctr_data)",
+    "predictions.npy": "[N] float64 \u2014 upstream RawFormulaVal (the production-apply-path \u22641e-5 target)",
+    "y.npy": "[N] float64 \u2014 Logloss labels"
+  },
+  "params": {
+    "boost_from_average": false,
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "combinations_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "counter_calc_method": "SkipTest",
+    "depth": 2,
+    "fold_len_multiplier": 2.0,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "Logloss",
+    "max_ctr_complexity": 2,
+    "one_hot_max_size": 1,
+    "permutation_count": 1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "simple_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "requirement": "ORD-05",
+  "scenario": "tensor_ctr_e2e",
+  "seed": 0,
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "Predictions"
+  ],
+  "thread_count": 1
+}
