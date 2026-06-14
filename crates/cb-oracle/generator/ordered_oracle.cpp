@@ -221,6 +221,41 @@ static std::vector<i32> FisherYatesPermutation(size_t n, ui64 seed) {
     return v;
 }
 
+// One Fisher-Yates fold over an ALREADY-seeded generator (shuffle.h:28-30): the
+// draw stream is supplied by the caller, NEVER re-seeded here. Mirrors the Rust
+// production `permutation.rs::shuffle_in_place`.
+static std::vector<i32> ShuffleInPlace(size_t n, TFastRng64& gen) {
+    std::vector<i32> v(n);
+    for (size_t i = 0; i < n; ++i) { v[i] = (i32)i; }
+    for (size_t i = 1; i < n; ++i) {
+        ui64 j = gen.Uniform((ui64)i + 1); // gen.Uniform(i + 1)
+        std::swap(v[i], v[(size_t)j]);
+    }
+    return v;
+}
+
+// CONTINUOUS-STREAM multi-fold permutation generation — the upstream-faithful
+// discipline. ALL folds are drawn from ONE persistent TFastRng64::FromSeed(seed)
+// (single FromSeed for all folds; the GenRand draw stream advances continuously
+// across folds and is NEVER re-seeded between folds). Fold k consumes exactly
+// n-1 draws; fold k+1 continues from the resulting generator phase. This matches
+// the Rust production `permutation.rs::permutations` / `fold.rs::create_folds`
+// and upstream `learn_context.cpp`'s shared `TRestorableFastRng64`
+// (learn_context.cpp:48-49 CountLearningFolds + the fold-creation loop driving a
+// single shared RNG). Fold 0 of the continuous stream is identical to a
+// fresh-seed single fold (`FisherYatesPermutation(n, seed)`), since the first
+// fold begins from the freshly-seeded generator phase.
+static std::vector<std::vector<i32>> GenMultiFoldPermutations(size_t n, int foldCount, ui64 seed) {
+    TFastRng64 gen = TFastRng64::FromSeed(seed); // SINGLE seed for ALL folds
+    std::vector<std::vector<i32>> folds;
+    const int count = std::max(1, foldCount);
+    folds.reserve((size_t)count);
+    for (int k = 0; k < count; ++k) {
+        folds.push_back(ShuffleInPlace(n, gen)); // continuous draw stream
+    }
+    return folds;
+}
+
 // ===========================================================================
 // (c) Online CTR — read-before-increment + CalcCTR online form.
 // ===========================================================================
@@ -386,15 +421,19 @@ int main(int argc, char** argv) {
     ui64 seed = 0;
     std::cin >> seed;
 
-    // (b) per-fold permutations. Each fold k advances the seed deterministically
-    // (k as a sub-seed) so folds differ; fold 0 uses the base seed.
-    for (int k = 0; k < std::max(1, foldCount); ++k) {
-        ui64 foldSeed = seed + (ui64)k;
-        std::vector<i32> perm = FisherYatesPermutation(n, foldSeed);
-        WriteNpyI32(outDir + "/permutation_fold" + std::to_string(k) + ".npy", perm);
+    // (b) continuous-stream multi-fold permutations. ALL folds draw from ONE
+    // persistent TFastRng64::FromSeed(seed) (the generator is NEVER re-seeded
+    // between folds) — the upstream-faithful discipline matching the Rust
+    // production permutations()/create_folds and learn_context.cpp's shared
+    // TRestorableFastRng64. permutation_fold{k}.npy = permutations(N, foldCount,
+    // seed)[k]; in particular permutation_fold1.npy = permutations(N, 2, seed)[1].
+    std::vector<std::vector<i32>> folds = GenMultiFoldPermutations(n, foldCount, seed);
+    for (size_t k = 0; k < folds.size(); ++k) {
+        WriteNpyI32(outDir + "/permutation_fold" + std::to_string(k) + ".npy", folds[k]);
     }
 
-    // (c) online CTR over fold-0 permutation.
+    // (c) online CTR over fold-0 permutation. Fold 0 of the continuous stream is
+    // identical to a fresh-seed single fold (FisherYatesPermutation(n, seed)).
     std::vector<i32> perm0 = FisherYatesPermutation(n, seed);
     OnlineCtrOut ctr = ComputeOnlineCtr(perm0, catBin, targetClass, (float)prior);
     WriteNpyI32(outDir + "/ctr_good_count.npy", ctr.goodCount);

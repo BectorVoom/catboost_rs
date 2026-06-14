@@ -2,6 +2,7 @@
   "scenario": "ordered_ctr",
   "requirement": "ORD-03",
   "seed": 0,
+  "fold_seeding": "continuous-stream (single persistent TFastRng64 across folds, learn_context.cpp shared TRestorableFastRng64); fold1 = permutations(N,2,seed)[1]",
   "catboost_version": "1.2.10",
   "thread_count": 1,
   "n_rows": 30,
