@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "05-09 Tasks 1a + 1b COMPLETE + verified (commits b2261ec, 200ffb0) — cb-model CTR-split representation RESOLVED (ModelSplit { Float, Ctr(CtrSplit) }, ObliviousTree.splits: Vec<ModelSplit>, Model.ctr_data); tensor_ctr_candidates wired into train() under max_ctr_complexity; apply.rs evaluates ModelSplit::Ctr via combined hash + baked ctr_data (bounds-safe). cargo check --workspace --tests clean; standalone tensor_ctr 3/3, ctr_data_roundtrip 5/5, all cb-model + cb-train float oracles green. 05-09 Task 2 source COMPLETE (commit 10f4a92) but the ORD-05 e2e oracle is BLOCKED (checkpoint:human-action) — catboost==1.2.10 not importable here, so tensor_ctr_e2e/ fixtures cannot be generated. Oracle NOT weakened / NOT #[ignore]'d. ORD-05 end-to-end closure pending offline fixture generation."
-last_updated: "2026-06-14T07:00:00.000Z"
-last_activity: 2026-06-14 -- 05-11 complete (train_cat + materialize_ctr_feature)
+stopped_at: "05-12 COMPLETE (commits c0c790d fix / 28507d8 test) — ORD-05 RNG-draw-order DE-RISK. create_folds now builds the lone learning Folds[0] as the IDENTITY (zero RNG draws, upstream shuffle = foldIdx != 0, learn_context.cpp:524/fold.cpp:54) and the AveragingFold as the FIRST seeded Fisher-Yates draw (IsAverageFoldPermuted=hasCtrs) WHEN a learning permutation is needed — driving a single persistent TFastRng64 directly (permutation::shuffle_in_place exposed pub(crate); permutations/fisher_yates_permutation public API unchanged); the numeric / Plain-no-CTR path keeps the legacy continuous-stream draws BYTE-IDENTICAL. For permutation_count=1 the averaging-fold permutation == fisher_yates_permutation(N, seed) (the first seeded draw). Standalone integer-exact oracle averaging_fold_permutation_oracle_test.rs (3 tests) locks the tensor_ctr_e2e config (N=30, seed=0, permutation_count=1, hasCtrs): AveragingFold == fisher_yates_permutation(30,0) via cb_oracle::compare_permutation (Stage::Permutation), learning fold == identity, the two distinct; NO #[ignore], no committed fixture touched (self-consistent from production fisher_yates_permutation). ORD-02 NOT regressed: ordered_boost_e2e 2/2 + slice_first/one_hot/leaf_methods/ctr_feature_materialize all green; cb-train fold unit tests 22/22. RECONCILES the prior 05-12 blocker: post-fix the STRUCTURE (learning) fold is identity and the AVERAGING fold takes the first draw = fisher_yates(30,0) (the byte sequence the OLD all-shuffle scheme assigned to learning fold0 is now the averaging fold's). NEXT: 05-13 (ORD-05 two-materialization leaf values) — score the identity-learning-fold CTR into the oblivious search + materialize a SECOND CTR under the AveragingFold's shuffled permutation for leaf VALUES (find(|f| f.is_averaging))."
+last_updated: "2026-06-14T16:15:00.000Z"
+last_activity: 2026-06-14 -- 05-12 complete (identity Folds[0] + AveragingFold draw-order oracle)
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 34
+  total_plans: 36
   completed_plans: 33
-  percent: 51
+  percent: 50
 ---
 
 # Project State
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 12 of 12
-Status: Executing Phase 05 — 05-11 COMPLETE (cat ingestion + CTR-feature materialization); 05-12 (CTR-split scoring + ctr_data bake + e2e hard gate) remaining
-Last activity: 2026-06-14 -- 05-11 complete (train_cat + materialize_ctr_feature)
+Plan: 13 of 14
+Status: Executing Phase 05
+Last activity: 2026-06-14 -- 05-12 complete (identity Folds[0] + AveragingFold draw-order oracle)
 
 Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 
@@ -84,6 +84,7 @@ Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 | Phase 05 P07 | 9min | 2 tasks | 4 files |
 | Phase 05 P08 | 25m | 2 tasks | 4 files |
 | Phase 05 P11 | ~18min | 2 tasks | 5 files |
+| Phase 05 P12 | ~16min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -161,6 +162,8 @@ Recent decisions affecting current work:
 
 - [Phase 05]: Plan 05-11 COMPLETE (ORD-05 Part 1/2 — cat ingestion + CTR-feature materialization; commits 4fe07b3 RED / fe09f25 GREEN / 5f0b678 train_cat): NEW cat-aware `train_cat` entry point + `materialize_ctr_feature`/`CtrFeatureColumn`. The hardcoded `cat_cardinalities=&[]` is replaced on the cat path — `train_cat` computes OnLearnOnly per-feature cardinalities (learn_set_cardinality), feeds the REAL cat set to tensor_ctr_candidates, re-indexes CTR-eligible-position members to ABSOLUTE cat indices, builds the single learn permutation ONCE (create_folds, dynamic_body_tail=false for the online prefix), and materializes a per-candidate combined-projection ONLINE CTR feature column (materialize_ctr_feature: combined_hash fold → first-seen dense bins → EXISTING online_ctr_prefix_binclf read-before-increment → calc_ctr_online_bin Borders quantizer truncated+clamped to [0,15]). Prior carried as a num/denom PAIR (never a pre-divided scalar) so the 05-12 bake receives the denominator; scalar fed to the online prefix is prior_num/prior_denom. Materialized columns are CARRIED for 05-12 scoring, NOT yet split on. `train()`/`train_with_eval_sets` BYTE-IDENTICAL via a factored private `train_inner` (delegate with empty cat_columns); slice_first/one_hot/leaf_methods/ordered_boost_e2e oracles all green; ctr_feature_materialize_test 3/3 green; cb-train lib 128/128. FOLDS-BUILT-ONCE held at create_folds non-comment count == 2 (Ordered split-scoring fold + cat-CTR learn permutation). ctr_border_count_default()==15 pinned. ORD-05 e2e closure remains pending 05-12 (CTR-split scoring into the oblivious search + build_final_ctr ctr_data bake + Scale/Shift through apply.rs + tensor_ctr_e2e hard gate).
 
+- [Phase 05]: Plan 05-12 COMPLETE (ORD-05 RNG-draw-order DE-RISK; commits c0c790d fix / 28507d8 test): create_folds reworked so the lone learning Folds[0] is the IDENTITY (zero RNG draws, upstream `shuffle = foldIdx != 0`, learn_context.cpp:524/fold.cpp:54) and the AveragingFold is the FIRST seeded Fisher-Yates draw (IsAverageFoldPermuted=hasCtrs) WHEN a learning permutation is needed — driving a single persistent TFastRng64 directly (permutation::shuffle_in_place exposed pub(crate); permutations/fisher_yates_permutation public API UNCHANGED). The numeric / Plain-no-CTR path keeps the legacy continuous-stream draws BYTE-IDENTICAL (regression anchor). For permutation_count=1 the averaging-fold permutation == fisher_yates_permutation(N, seed). Standalone integer-exact oracle averaging_fold_permutation_oracle_test.rs (3 tests, NO #[ignore], no committed fixture touched — self-consistent from production fisher_yates_permutation) locks AveragingFold == fisher_yates_permutation(30,0) via Stage::Permutation + learning fold == identity. ORD-02 NOT regressed (ordered_boost_e2e 2/2 + slice_first/one_hot/leaf_methods/ctr_feature_materialize green; fold unit tests 22/22). The two-materialization roles: identity learning fold = STRUCTURE-search permutation, averaging fold = LEAF-VALUE permutation (Plan 05-13 pulls it via find(|f| f.is_averaging)).
+
 ### Pending Todos
 
 [From .planning/todos/pending/ — ideas captured during sessions]
@@ -171,7 +174,8 @@ None yet.
 
 [Issues that affect future work]
 
-- **BLOCKED — Plan 05-12 (ORD-05 Part 2/2 — CTR-split scoring + ctr_data bake + e2e hard gate) — deep CTR-feature LEAF-VALUE parity (2026-06-14).** No source changes made; tree CLEAN; NO commits; fixtures `tensor_ctr_e2e/` UNTOUCHED; the e2e gate was NOT weakened / NOT `#[ignore]`'d / NOT fabricated (per the user's hard gate, STATE 2026-06-14). Executor reverse-engineered the committed `tensor_ctr_e2e/` fixtures offline (real learn perm = `fisher_yates(30,0)` = [8,12,5,18,14,28,13,17,29,25,7,24,26,10,3,11,6,19,27,15,23,4,22,2,21,20,16,0,1,9]; averaging perm = `permutations(30,2,0)[1]`).
+- **RESOLVED — Plan 05-12 DE-RISK GATE CLOSED (2026-06-14, commits c0c790d / 28507d8).** The RNG-draw-order divergence the original 05-12 blocker flagged is FIXED at the root: create_folds builds the lone learning Folds[0] as the IDENTITY (zero draws) and the AveragingFold as the first seeded draw when a learning permutation is needed, so cb-train's TFastRng64 draw stream now matches upstream's `shuffle = foldIdx != 0`. The AveragingFold permutation is locked integer-exact (== fisher_yates_permutation(30,0)) by a standalone oracle BEFORE any leaf-value stage. The deep leaf-value MATH itself (the CTR-split scoring + two-materialization leaf values + ctr_data bake + e2e hard gate) is now re-scoped to 05-13/05-14 per the RESOLVED-BY-RESEARCH note below; this de-risk gate is the linchpin those plans build on. Historical blocker analysis retained below for context:
+- **(history) BLOCKED — Plan 05-12 (ORD-05 Part 2/2 — CTR-split scoring + ctr_data bake + e2e hard gate) — deep CTR-feature LEAF-VALUE parity (2026-06-14).** No source changes made; tree CLEAN; NO commits; fixtures `tensor_ctr_e2e/` UNTOUCHED; the e2e gate was NOT weakened / NOT `#[ignore]`'d / NOT fabricated (per the user's hard gate, STATE 2026-06-14). Executor reverse-engineered the committed `tensor_ctr_e2e/` fixtures offline (real learn perm = `fisher_yates(30,0)` = [8,12,5,18,14,28,13,17,29,25,7,24,26,10,3,11,6,19,27,15,23,4,22,2,21,20,16,0,1,9]; averaging perm = `permutations(30,2,0)[1]`).
   - **APPLY math fully understood & VERIFIED 0.0 err:** the chosen split is the SINGLE-feature projection {0} (the combination {0,1} was a candidate but NEVER won a split — the trainer must reproduce that selection). Borders type, prior 0.5/1, scale=15 shift=0. model.json tree splits apply order: bit0 = `ctr > 7.999`, bit1 = `ctr > 2.999`. Apply uses the WHOLE-SET INFERENCE scaled CTR per category `((good+0.5)/(tot+1))*15`, tested `> {2.999, 7.999}`. Borders [2.999, 7.999] = quantized-bin boundaries {3, 8} stored as `k - 2^-20`.
   - **BLOCKER = LEAF VALUE estimation (NOT scoring, NOT apply, NOT the bake).** Model tree0 `leaf_values=[-0.0333333(leaf0), 0(leaf1), -0.005(leaf2), 0.0275(leaf3)]`. Solver shows the required train-time partition is leaf0=(0pos,6neg), leaf2=(3pos,4neg), leaf3=(14pos,3neg), leaf1=empty. **NO single-fold floor-quantized online-CTR partition reproduces it** (exhaustive over learn|avg fold × both bit orders × all threshold pairs 0..15): best single-fold err = 0.0046; best 2-real-border err = 0.005 — both ~500× over the 1e-5 gate. **AVERAGING der/count across BOTH folds** (`sum_der/(count+2*l2)`) reproduces leaf0 EXACTLY (-0.033333333) and leaf1=0, but leaf2 → -0.002 (model -0.005) and leaf3 → 0.030 (model 0.0275) still diverge.
   - **CONCLUSION (Rule 4 architectural escalation):** reaching ≤1e-5 requires porting upstream catboost 1.2.10's multi-permutation AVERAGED CTR-feature leaf-value estimation (`CalcLeafValues`/`CalcApproxForLeafStruct` over the fold permutations, ordered-vs-plain leaf approx for `boosting_type=Plain` WITH `hasCtrs`) PLUS the exact CTR-feature border-selection algorithm (which 2 of 0..15 bins → [2.999, 7.999]). These are research-grade subsystems ABSENT from `cb-train`; Tasks 1–2 as planned (per-bin candidate scoring + simple whole-set bake) would diverge ~5e-3 and FAIL the hard gate. **NEEDS: catboost 1.2.10 C++ instrumentation** of the CTR leaf-value path (which permutations are averaged; ordered vs plain leaf approx under Plain boosting with hasCtrs; the CTR-feature border-selection) before 05-12 can be RE-PLANNED. Suggest `/gsd-plan-phase 5 --gaps` (or a research spike) — do NOT weaken the gate.
