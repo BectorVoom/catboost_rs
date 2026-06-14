@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
+status: executing
 stopped_at: "05-09 Tasks 1a + 1b COMPLETE + verified (commits b2261ec, 200ffb0) — cb-model CTR-split representation RESOLVED (ModelSplit { Float, Ctr(CtrSplit) }, ObliviousTree.splits: Vec<ModelSplit>, Model.ctr_data); tensor_ctr_candidates wired into train() under max_ctr_complexity; apply.rs evaluates ModelSplit::Ctr via combined hash + baked ctr_data (bounds-safe). cargo check --workspace --tests clean; standalone tensor_ctr 3/3, ctr_data_roundtrip 5/5, all cb-model + cb-train float oracles green. 05-09 Task 2 source COMPLETE (commit 10f4a92) but the ORD-05 e2e oracle is BLOCKED (checkpoint:human-action) — catboost==1.2.10 not importable here, so tensor_ctr_e2e/ fixtures cannot be generated. Oracle NOT weakened / NOT #[ignore]'d. ORD-05 end-to-end closure pending offline fixture generation."
-last_updated: "2026-06-14T06:06:56.518Z"
-last_activity: 2026-06-14 -- ORD-02 ordered-boost e2e oracle green via offline fixtures; ORD-05 reframed as unbuilt training pipeline
+last_updated: "2026-06-14T07:00:00.000Z"
+last_activity: 2026-06-14 -- 05-11 complete (train_cat + materialize_ctr_feature)
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 32
-  completed_plans: 30
-  percent: 50
+  total_plans: 34
+  completed_plans: 33
+  percent: 51
 ---
 
 # Project State
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: ORD-02 e2e CLOSED (ordered_boost_e2e 2/2 ≤1e-5); ORD-05 needs a new gap-closure plan (categorical-CTR training pipeline)
-Status: ORD-02 done; ORD-05 re-scope pending → run /gsd-plan-phase 5 --gaps
-Last activity: 2026-06-14 -- ORD-02 ordered-boost e2e oracle green via offline fixtures; ORD-05 reframed as unbuilt training pipeline
+Plan: 12 of 12
+Status: Executing Phase 05 — 05-11 COMPLETE (cat ingestion + CTR-feature materialization); 05-12 (CTR-split scoring + ctr_data bake + e2e hard gate) remaining
+Last activity: 2026-06-14 -- 05-11 complete (train_cat + materialize_ctr_feature)
 
 Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 
@@ -83,6 +83,7 @@ Progress: [██████████] 100% (6 of 6 phase-05 plans complete)
 | Phase 05 P06 | 14min | 2 tasks | 21 files |
 | Phase 05 P07 | 9min | 2 tasks | 4 files |
 | Phase 05 P08 | 25m | 2 tasks | 4 files |
+| Phase 05 P11 | ~18min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -158,6 +159,8 @@ Recent decisions affecting current work:
 - [Phase 05]: Plan 05-10 (ORD-02 wiring, Task 1 COMPLETE): train_with_eval_sets now branches on boosting_type — the Ordered path builds the fold set ONCE before the loop (crate::fold::create_folds, grep-enforced non-comment count==1, FOLDS-BUILT-ONCE), grows tree STRUCTURE via greedy_tensor_search_oblivious_ordered (REAL 8-param 05-08 signature: matrix,der1,weight,permutation,l2,fold_len_multiplier,depth,n — derives segments/body-sum-weights internally; the plan's placeholder arg list was wrong), estimates leaf VALUES on the averaging fold via the existing Plain compute_leaf_deltas/accumulate_leaf_weights (Plain-identical). Plain byte-identical; slice_first/one_hot/leaf_methods/ordered_boost oracles green. ordered_boost_wiring_test locks Ordered-structure≠Plain (falsifiable dead-branch catch). cb-model added as DEV-dep of cb-train for the e2e oracle's production apply path.
 - [Phase 05]: Plan 05-10 (ORD-02 oracle, Task 2 BLOCKED — checkpoint:human-action): gen_ordered_boost_e2e() + ordered_boost_e2e_oracle_test.rs (FULL multi-tree ordered ≤1e-5 via cb_model::predict_raw, NO #[ignore]) authored and compile-clean, but the binary fixtures (ordered_boost_e2e/{X,y,predictions}.npy + model.json) CANNOT be generated here — catboost==1.2.10 is NOT importable in this environment (contradicting T-05-10-SC's D-09 assumption). Per the user's hard gate the oracle was NOT weakened / NOT #[ignore]'d / NOT fabricated. ORD-02 closure pending an OFFLINE `python3 gen_fixtures.py` run on a catboost==1.2.10 machine + commit of the four fixtures, then `cargo test -p cb-train --test ordered_boost_e2e_oracle_test`.
 
+- [Phase 05]: Plan 05-11 COMPLETE (ORD-05 Part 1/2 — cat ingestion + CTR-feature materialization; commits 4fe07b3 RED / fe09f25 GREEN / 5f0b678 train_cat): NEW cat-aware `train_cat` entry point + `materialize_ctr_feature`/`CtrFeatureColumn`. The hardcoded `cat_cardinalities=&[]` is replaced on the cat path — `train_cat` computes OnLearnOnly per-feature cardinalities (learn_set_cardinality), feeds the REAL cat set to tensor_ctr_candidates, re-indexes CTR-eligible-position members to ABSOLUTE cat indices, builds the single learn permutation ONCE (create_folds, dynamic_body_tail=false for the online prefix), and materializes a per-candidate combined-projection ONLINE CTR feature column (materialize_ctr_feature: combined_hash fold → first-seen dense bins → EXISTING online_ctr_prefix_binclf read-before-increment → calc_ctr_online_bin Borders quantizer truncated+clamped to [0,15]). Prior carried as a num/denom PAIR (never a pre-divided scalar) so the 05-12 bake receives the denominator; scalar fed to the online prefix is prior_num/prior_denom. Materialized columns are CARRIED for 05-12 scoring, NOT yet split on. `train()`/`train_with_eval_sets` BYTE-IDENTICAL via a factored private `train_inner` (delegate with empty cat_columns); slice_first/one_hot/leaf_methods/ordered_boost_e2e oracles all green; ctr_feature_materialize_test 3/3 green; cb-train lib 128/128. FOLDS-BUILT-ONCE held at create_folds non-comment count == 2 (Ordered split-scoring fold + cat-CTR learn permutation). ctr_border_count_default()==15 pinned. ORD-05 e2e closure remains pending 05-12 (CTR-split scoring into the oblivious search + build_final_ctr ctr_data bake + Scale/Shift through apply.rs + tensor_ctr_e2e hard gate).
+
 ### Pending Todos
 
 [From .planning/todos/pending/ — ideas captured during sessions]
@@ -187,5 +190,5 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-14
-Stopped at: 05-09 Tasks 1a + 1b COMPLETE + verified (commits b2261ec, 200ffb0) — cb-model CTR-split representation RESOLVED (ModelSplit { Float, Ctr(CtrSplit) }, ObliviousTree.splits: Vec<ModelSplit>, Model.ctr_data); tensor_ctr_candidates wired into train() under max_ctr_complexity; apply.rs evaluates ModelSplit::Ctr via combined hash + baked ctr_data (bounds-safe). cargo check --workspace --tests clean; standalone tensor_ctr 3/3, ctr_data_roundtrip 5/5, all cb-model + cb-train float oracles green. 05-09 Task 2 source COMPLETE (commit 10f4a92) but the ORD-05 e2e oracle is BLOCKED (checkpoint:human-action) — catboost==1.2.10 not importable here, so tensor_ctr_e2e/ fixtures cannot be generated. Oracle NOT weakened / NOT #[ignore]'d. ORD-05 end-to-end closure pending offline fixture generation.
-Resume file: .planning/phases/05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s/05-09-SUMMARY.md (see Blocking Issue)
+Stopped at: 05-11 COMPLETE (commits 4fe07b3 RED / fe09f25 GREEN / 5f0b678 train_cat) — ORD-05 Part 1/2 cat ingestion + CTR-feature materialization. NEW cat-aware train_cat entry point + materialize_ctr_feature/CtrFeatureColumn; hardcoded cat_cardinalities=&[] replaced on the cat path; combined-projection online CTR feature materialized per candidate (read-before-increment + Borders quantizer reused verbatim), prior carried as a num/denom PAIR; train() byte-identical via factored train_inner. ctr_feature_materialize_test 3/3, slice_first/one_hot/leaf_methods/ordered_boost_e2e all green, cb-train lib 128/128. Materialized columns CARRIED for 05-12, not yet scored. NEXT: 05-12 (ORD-05 Part 2/2) — score materialized CTR columns into the oblivious search, bake build_final_ctr ctr_data into Model with the correct Scale/Shift, thread split.shift/scale through apply.rs, and drive the FULL multi-tree tensor_ctr_e2e oracle ≤1e-5 through train_cat + predict_raw_cat (NO #[ignore], NO weakened tolerance).
+Resume file: .planning/phases/05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s/05-11-SUMMARY.md
