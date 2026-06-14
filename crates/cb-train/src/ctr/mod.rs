@@ -136,5 +136,6 @@ pub use calc_ctr::{
 };
 pub use final_ctr::{build_final_ctr, FinalCtrTable};
 pub use online::{
-    accumulate_online, OnlineCtrAccumulator, TCtrHistory, TCtrMeanHistory, SIMPLE_CLASSES_COUNT,
+    accumulate_online, online_ctr_prefix_binclf, OnlineCtrAccumulator, OnlineCtrPrefix,
+    TCtrHistory, TCtrMeanHistory, SIMPLE_CLASSES_COUNT,
 };

@@ -44,6 +44,8 @@
 use cb_core::{CbError, CbResult};
 use cb_data::{calc_cat_feature_hash, PerfectHash};
 
+use crate::ctr::calc_ctr::calc_ctr_online;
+
 /// The number of target classes for the simple binary-classification CTR path
 /// (`online_ctr.cpp` `SIMPLE_CLASSES_COUNT == 2`). The neg/pos class counts are
 /// `N[0]`/`N[1]`.
@@ -229,4 +231,106 @@ pub fn accumulate_online(
         bucket_count,
         classes,
     })
+}
+
+/// The per-object ONLINE (ordered, read-before-increment) binclf CTR over a
+/// permutation — the per-object prefix statistic the `plain_ctr` fixture dumps
+/// (`online_ctr.cpp:300-307`, `CalcQuantizedCtrs` simple binclf path).
+///
+/// For each position `p` in permutation order, the document `doc = permutation[p]`
+/// READS its bucket's accumulated prefix counts BEFORE its own label is added:
+/// `good = N[1]`, `total = N[0] + N[1]`, then `ctr = (good + prior) / (total + 1)`
+/// ([`calc_ctr_online`]), then `++N[targetClass[doc]]`. The READ-BEFORE-INCREMENT
+/// is the no-leakage property — a document's CTR never sees its own label.
+///
+/// Even in Plain BOOSTING mode this online prefix is computed within the single
+/// permutation whenever a cat feature exceeds `one_hot_max_size` (`hasCtrs`,
+/// RESEARCH Pitfall 2) — that is exactly the `plain_ctr` scenario.
+///
+/// Returns the per-object `(good_count, total_count, ctr_value)` in OBJECT order
+/// (indexed by `doc`, not by permutation position), matching the fixture's
+/// `ctr_good_count` / `ctr_total_count` / `ctr_value` `.npy` schema (D-02).
+///
+/// # Parameters
+/// - `permutation[p]` — the object index at learn-order position `p`.
+/// - `bins[doc]` — object `doc`'s categorical bucket (perfect-hash bin).
+/// - `target_class[doc]` — object `doc`'s binarized class in `[0, 2)`.
+/// - `prior` — the additive CTR prior numerator (e.g. `0.5`).
+///
+/// # Errors
+/// [`CbError::Degenerate`] if `bins` / `target_class` are shorter than the
+/// permutation implies, or a permutation index is out of range.
+pub fn online_ctr_prefix_binclf(
+    permutation: &[i32],
+    bins: &[u32],
+    target_class: &[usize],
+    prior: f64,
+) -> CbResult<OnlineCtrPrefix> {
+    let n = permutation.len();
+    if bins.len() != n || target_class.len() != n {
+        return Err(CbError::Degenerate(
+            "online_ctr_prefix: permutation / bins / target_class length mismatch".to_owned(),
+        ));
+    }
+
+    // Per-bucket [N0, N1] prefix counts; the bucket count bounds the histogram.
+    let bucket_count = bins.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut counts: Vec<[i64; SIMPLE_CLASSES_COUNT]> = vec![[0, 0]; bucket_count];
+
+    let mut good = vec![0i64; n];
+    let mut total = vec![0i64; n];
+    let mut value = vec![0f64; n];
+
+    for &doc_i in permutation {
+        let doc = doc_i as usize;
+        let Some(&bin) = bins.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_ctr_prefix: permutation index out of range for bins".to_owned(),
+            ));
+        };
+        let Some(&class) = target_class.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_ctr_prefix: permutation index out of range for target_class".to_owned(),
+            ));
+        };
+        let bucket = bin as usize;
+        let elem = counts.get(bucket);
+        // READ the prefix counts BEFORE incrementing (online_ctr.cpp:303-304).
+        let (n0, n1) = elem.map_or((0, 0), |e| (e[0], e[1]));
+        let g = n1; // good = N[1] (pos class)
+        let t = n0 + n1; // total = N[0] + N[1]
+        if let Some(slot) = good.get_mut(doc) {
+            *slot = g;
+        }
+        if let Some(slot) = total.get_mut(doc) {
+            *slot = t;
+        }
+        if let Some(slot) = value.get_mut(doc) {
+            *slot = calc_ctr_online(g as f64, t, prior);
+        }
+        // INCREMENT after read (learn set): ++N[targetClass[doc]].
+        if let Some(elem) = counts.get_mut(bucket) {
+            if let Some(c) = elem.get_mut(class) {
+                *c += 1;
+            }
+        }
+    }
+
+    Ok(OnlineCtrPrefix { good, total, value })
+}
+
+/// The per-object online (ordered) CTR prefix vectors in OBJECT order
+/// (`online_ctr_prefix_binclf`): the integer numerator/denominator and the f64
+/// CTR value per document, matching the `plain_ctr` fixture's D-02 `.npy` schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnlineCtrPrefix {
+    /// Per-object good count `N[1]` read BEFORE the document's own label
+    /// (`ctr_good_count.npy`).
+    pub good: Vec<i64>,
+    /// Per-object total count `N[0] + N[1]` read before the label
+    /// (`ctr_total_count.npy`).
+    pub total: Vec<i64>,
+    /// Per-object online CTR value `(good + prior) / (total + 1)`
+    /// (`ctr_value.npy`).
+    pub value: Vec<f64>,
 }
