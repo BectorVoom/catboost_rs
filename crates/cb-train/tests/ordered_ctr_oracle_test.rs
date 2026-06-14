@@ -37,7 +37,7 @@
 use std::path::PathBuf;
 
 use cb_oracle::{compare_permutation, compare_stage, Stage};
-use cb_train::{calc_ctr_online, fisher_yates_permutation, ordered_ctr_per_permutation};
+use cb_train::{calc_ctr_online, fisher_yates_permutation, ordered_ctr_per_permutation, permutations};
 use ndarray::Array1;
 use ndarray_npy::read_npy;
 
@@ -66,23 +66,27 @@ fn load_f64(rel: &str) -> Vec<f64> {
 }
 
 /// D-03 linchpin — MUST pass before any value stage. BOTH committed fold
-/// permutations reproduce integer-exact via the per-fold reseed
-/// `fisher_yates_permutation(N, random_seed + foldIdx)`.
+/// permutations reproduce the production continuous-stream
+/// `cb_train::permutations(N, 2, random_seed)` integer-exact (fold 0 == `[0]`,
+/// fold 1 == `[1]`).
 ///
-/// # Fold-seeding (Rule 3 — fixture-sourcing finding)
+/// # Fold-seeding (CR-01 CLOSED — continuous-stream discipline)
 ///
-/// The `ordered_ctr` offline harness drew each fold's permutation from a FRESH
-/// `TFastRng64::from_seed(random_seed + foldIdx)` (fold-0 ← seed 0, fold-1 ←
-/// seed 1), NOT the continuous-stream multi-fold draw order that
-/// `cb_train::permutations` / `create_folds` model (one persistent RNG across
-/// folds). This was CONFIRMED by reproducing the committed `permutation_fold1`
-/// EXACTLY with `fisher_yates_permutation(30, 1)`. The D-03 contract is "our
-/// permutation reproduces upstream's"; this fixture's fold-1 reproduces under the
-/// per-fold reseed, so the gate is locked against that exact seeding. (The
-/// continuous-stream draw order remains the create_folds model for a single
-/// training run; the offline per-fold dump used independent seeds — the
-/// orthogonal fixture-sourcing axis, the 05-04 transcribe-then-self-oracle
-/// precedent.)
+/// The `ordered_ctr` offline harness now draws ALL folds from ONE persistent
+/// `TFastRng64::from_seed(random_seed)` — the draw stream advances continuously
+/// across folds and is NEVER re-seeded per fold (the upstream-faithful
+/// `learn_context.cpp` shared `TRestorableFastRng64` discipline that
+/// `cb_train::permutations` / `create_folds` model). The previous fixture used a
+/// per-fold reseed `fisher_yates(N, seed + foldIdx)` for fold 1, which did NOT
+/// correspond to upstream's second fold — the production `permutations()` was
+/// never validated for any fold k > 0 (the CR-01 BLOCKER). The harness was fixed
+/// (`GenMultiFoldPermutations`) and `permutation_fold1.npy` regenerated, so BOTH
+/// folds now reproduce the production `permutations()` continuous-stream output
+/// integer-exact vs the regenerated upstream-faithful fixture — closing CR-01.
+///
+/// Fold 0 of the continuous stream is identical to a fresh-seed single fold, so
+/// `permutations(30, 2, 0)[0] == fisher_yates_permutation(30, 0)` (asserted
+/// below); the fold-0-only single-fold gate elsewhere stays valid.
 #[test]
 fn ordered_ctr_permutations_are_integer_exact_first() {
     let fold0 = load_i32("ordered_ctr/permutation_fold0.npy");
@@ -90,20 +94,27 @@ fn ordered_ctr_permutations_are_integer_exact_first() {
     assert_eq!(fold0.len(), FIXTURE_N, "fixture N must be 30");
     assert_eq!(fold1.len(), FIXTURE_N);
 
-    // Fold-0 ← seed (random_seed + 0); the canonical D-03 anchor.
-    let actual0: Vec<i64> = fisher_yates_permutation(FIXTURE_N, FIXTURE_SEED)
-        .iter()
-        .map(|&x| i64::from(x))
-        .collect();
+    // Production continuous-stream: a SINGLE persistent RNG drives BOTH folds.
+    // multi[0] is fold 0; multi[1] is fold 1 (continued from fold 0's RNG phase).
+    let multi = permutations(FIXTURE_N, 2, FIXTURE_SEED);
+    assert_eq!(multi.len(), 2, "permutations(30, 2, 0) yields exactly two folds");
+
+    // Continuous-stream fold 0 == fresh-seed single fold (the first fold begins
+    // from the freshly-seeded generator phase). This is what lets the
+    // fold-0-only single-fold gate (fisher_yates_permutation(30, 0)) stay valid.
+    assert_eq!(
+        multi[0],
+        fisher_yates_permutation(FIXTURE_N, FIXTURE_SEED),
+        "permutations(30, 2, 0)[0] == fisher_yates_permutation(30, 0)"
+    );
+
+    let actual0: Vec<i64> = multi[0].iter().map(|&x| i64::from(x)).collect();
     compare_permutation(&fold0, &actual0)
         .unwrap_or_else(|e| panic!("ordered_ctr fold-0 permutation diverged (D-03): {e}"));
 
-    // Fold-1 ← seed (random_seed + 1); the per-fold reseed the offline harness
-    // used (confirmed: fisher_yates_permutation(30, 1) == committed fold-1).
-    let actual1: Vec<i64> = fisher_yates_permutation(FIXTURE_N, FIXTURE_SEED + 1)
-        .iter()
-        .map(|&x| i64::from(x))
-        .collect();
+    // Fold-1 == permutations(30, 2, 0)[1] — the continuous-stream second fold
+    // (CR-01 fix: validates the production permutations() for k = 1, not just 0).
+    let actual1: Vec<i64> = multi[1].iter().map(|&x| i64::from(x)).collect();
     compare_permutation(&fold1, &actual1)
         .unwrap_or_else(|e| panic!("ordered_ctr fold-1 permutation diverged (D-03): {e}"));
 }
