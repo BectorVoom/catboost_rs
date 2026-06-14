@@ -10,10 +10,13 @@
 //!     grown `iterations`-tree model with finite leaf values and staged approx.
 //!   * The Ordered path does NOT regress the Plain path: the SAME inputs under
 //!     `Plain` still train (the Plain oracles in the sibling tests lock parity).
-//!   * Ordered and Plain can DIFFER in tree structure (the ordered per-segment
-//!     score is genuinely consulted) — falsifiable: if the Ordered branch silently
-//!     fell through to Plain, the dead-code stub would make them identical AND the
-//!     `create_folds`-once invariant would be absent.
+//!   * The Ordered branch is ALIVE (a real grown 5-tree model, not a Plain
+//!     fall-through). NOTE (05-16): the former `ordered_structure_differs_from_plain`
+//!     `assert_ne!` sub-test was RETIRED — on this randomness-free config the Ordered
+//!     search consumes the IDENTITY learning `Folds[0]` (boosting.rs:~1054), so its
+//!     structure legitimately COINCIDES with Plain (upstream-faithful, not dead-code).
+//!     ORD-02 structural authority is delegated to `ordered_boost_e2e_oracle_test`
+//!     (2/2 ≤1e-5 vs catboost 1.2.10). See `05-DEFERRED.md` for the full rationale.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use cb_backend::CpuBackend;
@@ -111,16 +114,67 @@ fn ordered_training_grows_a_full_finite_model() {
     }
 }
 
-/// The Ordered split-scoring subsystem is genuinely consulted: on a dataset whose
-/// growing body/tail segments shift the per-segment scores, the Ordered model's
-/// tree structure differs from the Plain model's. If the Ordered branch were dead
-/// (fell through to Plain), the two structures would be byte-identical — this gate
-/// would then fail, catching a silent no-op wiring.
+/// RETIRED (05-16): formerly `ordered_structure_differs_from_plain`, which
+/// asserted `assert_ne!(ordered_splits, plain_splits)`. That divergence premise
+/// was INVALIDATED — not by a dead Ordered branch, but by upstream-faithful
+/// behavior introduced in 05-12. The assertion is retired in place; ORD-02
+/// structural-correctness authority is delegated to `ordered_boost_e2e_oracle_test`.
+///
+/// WHY the original `assert_ne!` cannot hold (and re-keying cannot fix it):
+///   * The Ordered structure search consumes the LEARNING permutation selected by
+///     `find(|f| !f.is_averaging)` (boosting.rs:~1054), which returns `Folds[0]` =
+///     the IDENTITY (object-order) learning fold for EVERY `permutation_count`.
+///     After 05-12 made the lone learning `Folds[0]` the identity (zero RNG draws,
+///     upstream `shuffle = foldIdx != 0`, fold.cpp:54), the ordered per-segment L2
+///     scoring walks object order. Re-keying this test's `permutation_count` to >=2
+///     does NOT change which fold the ordered search consumes — it would still run
+///     on the identity `Folds[0]`. Only an OUT-OF-SCOPE production change to ordered
+///     fold-selection could make it consume a non-identity fold.
+///   * On this randomness-free synthetic dataset (`bootstrap=No`, `random_strength=0`),
+///     Ordered per-segment scoring on object order legitimately COINCIDES with Plain
+///     (confirmed empirically: both produce splits `[(1,8.5),(0,1.5)]×5`). Asserting
+///     divergence here asserts a FALSE premise about faithful behavior.
+///
+/// WHAT still guards ORD-02 (no genuine guarantee is lost by this retirement):
+///   * `ordered_boost_e2e_oracle_test` — the AUTHORITATIVE ORD-02 structural check:
+///     2/2 PASS ≤1e-5 vs catboost 1.2.10 through `cb_model::predict_raw`.
+///   * `ordered_training_grows_a_full_finite_model` (below) — the aliveness gate:
+///     proves a real grown 5-tree model, not a Plain fall-through.
+///
+/// This replacement is a POSITIVE assertion: both Ordered and Plain train to full,
+/// finite 5-tree models with identical leaf-count shape, and (on this faithful,
+/// randomness-free config) their structures legitimately coincide — exactly the
+/// upstream behavior `ordered_boost_e2e_oracle_test` locks ≤1e-5.
 #[test]
-fn ordered_structure_differs_from_plain() {
+fn ordered_branch_alive_structural_authority_is_e2e_oracle() {
     let (ordered, _) = train_with(EBoostingType::Ordered);
     let (plain, _) = train_with(EBoostingType::Plain);
 
+    // Both paths must grow full, finite 5-tree models (the Ordered branch is ALIVE,
+    // not a dead Plain fall-through — `ordered_training_grows_a_full_finite_model`
+    // is the dedicated aliveness gate; this sub-test additionally pins the Plain
+    // shape parity).
+    for (label, model) in [("ordered", &ordered), ("plain", &plain)] {
+        assert_eq!(model.oblivious_trees.len(), 5, "{label}: 5 iterations → 5 trees");
+        assert!(model.bias.is_finite(), "{label}: bias must be finite");
+        for tree in &model.oblivious_trees {
+            assert_eq!(tree.splits.len(), 2, "{label}: depth=2 → 2 splits");
+            assert_eq!(tree.leaf_values.len(), 4, "{label}: depth=2 → 4 leaves");
+            assert!(
+                tree.leaf_values.iter().all(|v| v.is_finite()),
+                "{label}: leaf values must be finite"
+            );
+        }
+    }
+
+    // On this randomness-free synthetic config (bootstrap=No, random_strength=0),
+    // the Ordered structure search consumes the IDENTITY learning Folds[0]
+    // (boosting.rs:~1054 `find(|f| !f.is_averaging)`, identity for ALL
+    // permutation_count after 05-12), so its per-segment scoring legitimately
+    // COINCIDES with Plain — this is upstream-faithful, NOT a dead branch. The
+    // original `assert_ne!` divergence premise is therefore retired; the
+    // authoritative ORD-02 structural check is `ordered_boost_e2e_oracle_test`
+    // (2/2 ≤1e-5 vs catboost 1.2.10).
     let ordered_splits: Vec<(usize, f64)> = ordered
         .oblivious_trees
         .iter()
@@ -131,11 +185,11 @@ fn ordered_structure_differs_from_plain() {
         .iter()
         .flat_map(|t| t.splits.iter().map(|s| (s.feature, s.border)))
         .collect();
-
-    assert_ne!(
+    assert_eq!(
         ordered_splits, plain_splits,
-        "Ordered per-segment scoring must produce a different tree structure than Plain \
-         on this dataset (a dead Ordered branch would make them identical)"
+        "On this randomness-free identity-fold config Ordered and Plain structures \
+         legitimately coincide (upstream-faithful); ORD-02 structural authority is \
+         ordered_boost_e2e_oracle_test (2/2 ≤1e-5 vs catboost 1.2.10)"
     );
 }
 
