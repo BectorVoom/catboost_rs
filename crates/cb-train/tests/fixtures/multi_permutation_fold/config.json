@@ -1,0 +1,65 @@
+{
+  "catboost_version": "1.2.10",
+  "leaf_weights": {
+    "1": {
+      "learning_folds": 1,
+      "permutation_count": 1,
+      "tree0_leaf_weights": [
+        6,
+        0,
+        7,
+        17
+      ]
+    },
+    "2": {
+      "learning_folds": 1,
+      "permutation_count": 2,
+      "tree0_leaf_weights": [
+        6,
+        0,
+        7,
+        17
+      ]
+    },
+    "4": {
+      "learning_folds": 3,
+      "permutation_count": 4,
+      "tree0_leaf_weights": [
+        6,
+        0,
+        10,
+        14
+      ]
+    }
+  },
+  "n_rows": 30,
+  "note": "REAL catboost 1.2.10 AveragingFold draw-order anchor for permutation_count>=2 (WR-01). leaf_weights.json records catboost's trained-model tree-0 leaf_weights (the AveragingFold partition counts) for pc=1,2,4 of the tensor_ctr_e2e config family. The Rust oracle asserts the partition cb_train::create_folds's AveragingFold permutation produces over the online-prefix CTR column equals these committed catboost leaf_weights integer-exact. A wrong pre-averaging advance count would yield a different partition and FAIL the check. model_pc{1,2,4}.json are the full upstream dumps for audit. Generated OFFLINE; NEVER run in CI (D-12).",
+  "params": {
+    "boost_from_average": false,
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "combinations_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "depth": 2,
+    "fold_len_multiplier": 2.0,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "Logloss",
+    "max_ctr_complexity": 2,
+    "one_hot_max_size": 1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "simple_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "thread_count": 1,
+    "verbose": false
+  },
+  "requirement": "ORD-01",
+  "scenario": "multi_permutation_fold",
+  "seed": 0
+}

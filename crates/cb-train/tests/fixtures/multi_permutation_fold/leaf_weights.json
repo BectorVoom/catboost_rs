@@ -1,0 +1,32 @@
+{
+  "1": {
+    "learning_folds": 1,
+    "permutation_count": 1,
+    "tree0_leaf_weights": [
+      6,
+      0,
+      7,
+      17
+    ]
+  },
+  "2": {
+    "learning_folds": 1,
+    "permutation_count": 2,
+    "tree0_leaf_weights": [
+      6,
+      0,
+      7,
+      17
+    ]
+  },
+  "4": {
+    "learning_folds": 3,
+    "permutation_count": 4,
+    "tree0_leaf_weights": [
+      6,
+      0,
+      10,
+      14
+    ]
+  }
+}
