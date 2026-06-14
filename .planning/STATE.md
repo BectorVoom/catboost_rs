@@ -167,6 +167,7 @@ None yet.
 - GPU tolerance epsilon (Phase 7) is unspecified — must be set and signed off before Phase 7 planning.
 - **Plan 02-01 COMPLETE (human approved Task-3 checkpoint).** Tasks 1–3 committed (1f2b9f1, d92ae65, 025c381); 02-01-SUMMARY.md written and self-checked; plan counter advanced to 02-02. No open blockers from 02-01.
 - **Environment: disk pressure.** `cargo test --workspace` pulls in `cubecl-cpu`'s heavy `tracel-mlir-sys` (MLIR) transitive dep, which filled the disk (100%) during Plan 03-01 and corrupted incremental caches mid-build. Resolved by clearing `target/debug/incremental` + stale deps and rebuilding. CPU-only builds still compile the MLIR optimizer dep — keep an eye on disk headroom before full-workspace builds.
+- **BLOCKED — Plan 05-08 (GAP 1, ORD-02) under-scoped; re-scope required (2026-06-14).** Executor analysis (grounded in upstream catboost 1.2.10 `approx_calcer.cpp`/`greedy_tensor_search.cpp` + empirical run: ordered vs plain predictions differ max 0.70 on the e2e config) found the plan's two must-haves are in tension. Upstream ordered boosting differs from Plain in the **tree STRUCTURE** — splits are scored on per-segment ordered derivatives across the learning fold's `BodyTailArr` (multi-segment histogram score reduction), recomputed each iteration via `UpdateApproxDeltasHistoricallyImpl` (= our `ordered_approx_delta_simple`). Final leaf values still come from `CalcLeafValuesSimple` on the averaging fold (same as Plain). `tree.rs` has **NO ordered/body-tail-segment split-scoring path**, so wiring `ordered_approx_delta_simple` into the leaf-update alone reproduces Plain tree structure with a perturbed leaf-update — fails the ≤1e-5-vs-upstream oracle. True ORD-02 parity needs a NEW ordered split-scoring subsystem in `tree.rs` (per-learning-fold `BodyTailArr` state, per-segment ordered-derivative recompute, cross-segment histogram score), comparable in size to the Plain tree-search and entangled with the D-11 multi-tree RNG residual. **User decision (2026-06-14): re-scope via `/gsd-plan-phase 5 --gaps`.** No commits made; tree clean. 05-09 (tensor CTR wiring) depends on 05-08 → also blocked.
 
 ## Deferred Items
 
@@ -179,5 +180,5 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-14T01:34:22.098Z
-Stopped at: Completed 05-07-PLAN.md (CR-01 multi-fold permutation oracle fix)
+Stopped at: 05-07 complete (CR-01 fix); 05-08 BLOCKED at decision checkpoint (ORD-02 under-scoped — needs ordered split-scoring subsystem in tree.rs); 05-09 blocked by 05-08. User chose re-scope → /gsd-plan-phase 5 --gaps.
 Resume file: None
