@@ -118,7 +118,13 @@ pub fn fisher_yates_permutation(n: usize, seed: u64) -> Vec<i32> {
 /// `swap` semantics over a `Vec` (no raw index; `Vec::swap` is bounds-safe and
 /// the indices `i`, `j` are both `< n` by construction — `j = uniform(i+1)` is
 /// in `[0, i]`).
-fn shuffle_in_place(n: usize, rng: &mut TFastRng64) -> Vec<i32> {
+///
+/// Exposed `pub(crate)` so [`crate::fold::create_folds`] can drive a single
+/// persistent `TFastRng64` directly — emitting the IDENTITY for the lone
+/// learning `Folds[0]` (ZERO draws, upstream's `shuffle = foldIdx != 0`) and
+/// taking ONE shuffle for each subsequent fold from the SAME held rng. The
+/// public `permutations` / `fisher_yates_permutation` API is unchanged.
+pub(crate) fn shuffle_in_place(n: usize, rng: &mut TFastRng64) -> Vec<i32> {
     // Identity `[0, 1, …, n-1]`. `i32` matches the upstream `int32` index width
     // and the `.npy` schema (D-02); indices fit comfortably for in-scope N.
     let mut v: Vec<i32> = (0..n).map(|idx| idx as i32).collect();

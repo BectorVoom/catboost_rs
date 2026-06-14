@@ -133,14 +133,85 @@ fn create_folds_plain_path_all_single_span() {
 }
 
 #[test]
-fn create_folds_permutations_drawn_in_continuous_order() {
+fn create_folds_numeric_path_permutations_drawn_in_continuous_order() {
     use crate::permutations;
-    // The fold permutations must equal the continuous-stream draws (learning
-    // folds first, then averaging) — not per-fold reseeds.
-    let folds = create_folds(16, 2, true, true, MULT, 99);
+    // NUMERIC / Plain-no-CTR path (permutation_needed_for_learning = false):
+    // there is no identity-Folds[0] rule — the folds keep the legacy
+    // continuous-stream draws (learning fold then averaging), byte-identical to
+    // before this plan. This is the regression anchor for the numeric oracles.
+    let folds = create_folds(16, 2, /* needed = */ false, true, MULT, 99);
     let expected = permutations(16, folds.len(), 99);
     let got: Vec<Vec<i32>> = folds.iter().map(|f| f.permutation.clone()).collect();
     assert_eq!(got, expected);
+}
+
+#[test]
+fn create_folds_learning_fold0_is_identity_zero_draws() {
+    use crate::fisher_yates_permutation;
+    // WHEN a learning permutation is needed (hasCtrs OR ordered boosting),
+    // upstream builds Folds[0] as the IDENTITY (shuffle = foldIdx != 0,
+    // learn_context.cpp:524 / fold.cpp:54) consuming ZERO RNG draws, and the
+    // AveragingFold takes the FIRST seeded Fisher-Yates draw
+    // (IsAverageFoldPermuted = hasCtrs).
+    let n = 30;
+    let seed = 0;
+    let folds = create_folds(n, 1, /* needed = */ true, false, MULT, seed);
+
+    // The FIRST non-averaging (learning) fold is the identity [0,1,…,n-1].
+    let identity: Vec<i32> = (0..n as i32).collect();
+    let learning = folds
+        .iter()
+        .find(|f| !f.is_averaging)
+        .expect("a learning fold");
+    assert_eq!(
+        learning.permutation, identity,
+        "Folds[0] must be the identity (zero draws) when a learning permutation is needed"
+    );
+
+    // The averaging fold is the FIRST real seeded draw: since the identity
+    // learning fold drew nothing, the averaging shuffle equals a fresh-seed
+    // Fisher-Yates draw.
+    let averaging = folds
+        .iter()
+        .find(|f| f.is_averaging)
+        .expect("an averaging fold");
+    assert_eq!(
+        averaging.permutation,
+        fisher_yates_permutation(n, seed),
+        "the averaging fold must be the first seeded Fisher-Yates draw"
+    );
+}
+
+#[test]
+fn create_folds_multi_permutation_identity_then_shuffles() {
+    use cb_core::TFastRng64;
+    // Forward-compat note (research Open-q 4): for permutation_count=2,
+    // hasCtrs=true, Folds[0] is identity (zero draws) and the averaging fold is
+    // the FIRST real persistent-RNG shuffle. (learning_fold_count(2,true)==1, so
+    // permutation_count=2 → 1 learning + 1 averaging.) The in-scope fixture is
+    // permutation_count=1; this locks the documented multi-permutation draw order.
+    let n = 12;
+    let seed = 7;
+    let folds = create_folds(n, 2, /* needed = */ true, false, MULT, seed);
+    let identity: Vec<i32> = (0..n as i32).collect();
+    // Replay the persistent stream: identity (no draw) then one shuffle for the
+    // averaging fold.
+    let mut rng = TFastRng64::from_seed(seed);
+    let mut expected_avg: Vec<i32> = (0..n as i32).collect();
+    for i in 1..n {
+        let j = rng.uniform((i as u64) + 1) as usize;
+        expected_avg.swap(i, j);
+    }
+
+    let learning: Vec<&_> = folds.iter().filter(|f| !f.is_averaging).collect();
+    assert_eq!(learning.len(), 1, "permutation_count=2 → 1 learning fold");
+    assert_eq!(learning[0].permutation, identity, "Folds[0] identity");
+
+    let averaging = folds.iter().find(|f| f.is_averaging).expect("averaging");
+    assert_eq!(
+        averaging.permutation, expected_avg,
+        "averaging fold is the first real persistent-RNG shuffle"
+    );
 }
 
 #[test]

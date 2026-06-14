@@ -45,9 +45,9 @@
 //! through `cb_core::sum_f64` (D-08). No `unwrap`/`expect`/panic/raw index, no
 //! `anyhow`.
 
-use cb_core::sum_f64;
+use cb_core::{sum_f64, TFastRng64};
 
-use crate::permutation::permutations;
+use crate::permutation::{permutations, shuffle_in_place};
 
 // Tests live in a dedicated sibling file (source/test separation, CLAUDE.md /
 // AGENTS.md), mounted as a child module so `cargo test -p cb-train fold` and
@@ -190,9 +190,30 @@ pub struct Fold {
 
 /// Creates the full fold set for one training run: `learning_fold_count(...)`
 /// learning folds PLUS one averaging fold (`learn_context.cpp` fold-creation
-/// loop), each with its OWN permutation drawn IN ORDER from a single persistent
-/// `TFastRng64::from_seed(random_seed)` (the continuous-stream discipline —
-/// folds are never reseeded; see [`crate::permutations`]).
+/// loop).
+///
+/// # Draw-order contract (the parity linchpin)
+///
+/// WHEN a learning permutation is needed (`permutation_needed_for_learning`,
+/// i.e. `hasCtrs` OR ordered boosting), `Folds[0]` is the IDENTITY permutation
+/// `[0,1,…,n-1]` consuming ZERO RNG draws — mirroring upstream's `shuffle =
+/// foldIdx != 0` (`learn_context.cpp:524`, `fold.cpp:54`). Every SUBSEQUENT fold
+/// (learning folds `1..learning_fold_count`, then the averaging fold) consumes
+/// ONE Fisher-Yates draw IN ORDER from the SAME persistent
+/// `TFastRng64::from_seed(random_seed)` (the upstream persistent
+/// `TRestorableFastRng64` — never reseeded per fold). Because the lone learning
+/// `Folds[0]` draws nothing, the averaging fold's shuffle is the FIRST seeded
+/// draw: for `permutation_count = 1` the averaging-fold permutation byte-equals
+/// `fisher_yates_permutation(n, random_seed)` index-for-index
+/// (`IsAverageFoldPermuted = hasCtrs`, `learn_context.cpp:575-577`). Plan 05-13
+/// pulls that averaging-fold permutation (via `find(|f| f.is_averaging)`) for the
+/// leaf-value materialization.
+///
+/// WHEN a learning permutation is NOT needed (the numeric / Plain-no-CTR path),
+/// the legacy continuous-stream draw order is preserved EXACTLY: every fold
+/// (learning then averaging) draws one Fisher-Yates shuffle in order from the
+/// persistent RNG, byte-identical to before this change (the numeric oracles
+/// stay byte-for-byte).
 ///
 /// `dynamic_body_tail` selects the learning folds' body/tail shape: `true` (the
 /// ordered-boosting path) gives each learning fold the growing dynamic
@@ -200,11 +221,8 @@ pub struct Fold {
 /// The AVERAGING fold always uses the plain single span (it is the
 /// non-ordered, whole-dataset fold).
 ///
-/// Draw order (mirrors upstream's persistent `rand`): learning fold 0's
-/// permutation is drawn first, then learning fold 1, …, then the averaging
-/// fold's — each consuming exactly `n - 1` draws. `permutation_count = 2` →
-/// 1 learning + 1 averaging fold (RESEARCH Open Q2). The total permutation
-/// count is `learning_fold_count + 1`.
+/// The total fold count is `learning_fold_count + 1`. `permutation_count = 2` →
+/// 1 learning + 1 averaging fold (RESEARCH Open Q2).
 #[must_use]
 pub fn create_folds(
     n: usize,
@@ -215,29 +233,69 @@ pub fn create_folds(
     random_seed: u64,
 ) -> Vec<Fold> {
     let learning_folds = learning_fold_count(permutation_count, permutation_needed_for_learning);
-    // One permutation per learning fold + one for the averaging fold, drawn in
-    // order from a single continuous RNG.
+    // One permutation per learning fold + one for the averaging fold.
     let total_folds = learning_folds.saturating_add(1);
-    let perms = permutations(n, total_folds, random_seed);
 
-    perms
-        .into_iter()
-        .enumerate()
-        .map(|(idx, permutation)| {
-            let is_averaging = idx == learning_folds;
-            let boundaries = if is_averaging || !dynamic_body_tail {
-                // Plain single span: [n] (body == tail == n).
-                vec![n]
+    if !permutation_needed_for_learning {
+        // NUMERIC / Plain-no-CTR path: preserve the legacy continuous-stream
+        // draws (learning fold then averaging), byte-identical to before — there
+        // is no CTR/ordered draw stream to align with upstream's identity-Folds[0]
+        // rule, so the prior behavior is kept verbatim (regression anchor).
+        let perms = permutations(n, total_folds, random_seed);
+        return perms
+            .into_iter()
+            .enumerate()
+            .map(|(idx, permutation)| {
+                build_fold(idx, learning_folds, permutation, n, dynamic_body_tail, fold_len_multiplier)
+            })
+            .collect();
+    }
+
+    // LEARNING-PERMUTATION-NEEDED path (hasCtrs OR ordered boosting): drive a
+    // SINGLE persistent rng directly. Fold 0 (idx == 0) is the IDENTITY
+    // (zero draws, `shuffle = foldIdx != 0`); every subsequent fold takes one
+    // Fisher-Yates draw from the SAME held rng IN ORDER (so the averaging fold is
+    // the first seeded draw == fisher_yates_permutation(n, seed) for
+    // permutation_count=1). The persistent rng is never reseeded per fold.
+    let mut rng = TFastRng64::from_seed(random_seed);
+    (0..total_folds)
+        .map(|idx| {
+            let permutation: Vec<i32> = if idx == 0 {
+                // Identity Folds[0]: ZERO draws on the persistent rng.
+                (0..n).map(|i| i as i32).collect()
             } else {
-                body_tail_boundaries(n, fold_len_multiplier)
+                // First and subsequent real shuffles from the held rng.
+                shuffle_in_place(n, &mut rng)
             };
-            Fold {
-                permutation,
-                body_tail_boundaries: boundaries,
-                is_averaging,
-            }
+            build_fold(idx, learning_folds, permutation, n, dynamic_body_tail, fold_len_multiplier)
         })
         .collect()
+}
+
+/// Assembles one [`Fold`] from its already-drawn `permutation`, selecting the
+/// body/tail shape: the averaging fold (`idx == learning_folds`) and the plain
+/// path (`!dynamic_body_tail`) use the single full span `[n]`; a dynamic
+/// learning fold uses the growing [`body_tail_boundaries`].
+fn build_fold(
+    idx: usize,
+    learning_folds: usize,
+    permutation: Vec<i32>,
+    n: usize,
+    dynamic_body_tail: bool,
+    fold_len_multiplier: f64,
+) -> Fold {
+    let is_averaging = idx == learning_folds;
+    let body_tail_boundaries = if is_averaging || !dynamic_body_tail {
+        // Plain single span: [n] (body == tail == n).
+        vec![n]
+    } else {
+        body_tail_boundaries(n, fold_len_multiplier)
+    };
+    Fold {
+        permutation,
+        body_tail_boundaries,
+        is_averaging,
+    }
 }
 
 /// The per-fold body-prefix summed weights (`fold.cpp:170-172`
