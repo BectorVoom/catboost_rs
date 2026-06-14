@@ -34,11 +34,12 @@ use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 use crate::autolr::{self, TargetType};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::ctr::{CounterCalcMethod, ECtrType};
+use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
 use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 use crate::tree::{
-    check_depth, greedy_tensor_search_oblivious_perturbed, leaf_index, FeatureMatrix, Perturbation,
-    Split,
+    check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_perturbed,
+    leaf_index, FeatureMatrix, GrownTree, Perturbation, Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -799,18 +800,48 @@ pub fn train_with_eval_sets<R: Runtime>(
 
     // Boosting type (ORD-02): the Plain path below estimates every document's
     // leaf delta on the whole fold (single body/tail span). The ORDERED path
-    // (`EBoostingType::Ordered`) instead drives the anti-leakage growing
-    // body/tail prefix via [`ordered_approx_delta_simple`] — a tail document's
-    // delta never depends on itself. The ordered approximant is exercised through
-    // its own oracle (`ordered_boost_oracle_test`) over the committed
-    // permutation + body/tail boundaries (the raw fold inputs are uncommitted,
-    // D-09); this whole-set `train` driver stays the Plain path so the existing
-    // numeric/one-hot oracles are unchanged. `params.boosting_type` is the
-    // explicit pin (never auto — Ordered auto-select is GPU-only, Pitfall 6).
-    debug_assert!(
-        matches!(params.boosting_type, EBoostingType::Plain | EBoostingType::Ordered),
-        "boosting_type pinned explicitly"
-    );
+    // (`EBoostingType::Ordered`) instead grows each tree's STRUCTURE via the
+    // 05-08 ordered split-scoring subsystem
+    // ([`greedy_tensor_search_oblivious_ordered`]) over the learning fold's
+    // growing body/tail segments, then estimates the leaf VALUES on the AVERAGING
+    // fold exactly as Plain (`CalcLeafValuesSimple` — leaf values are
+    // Plain-identical; only the split scoring differs, STATE.md re-scope).
+    // `params.boosting_type` is the explicit pin (never auto — Ordered
+    // auto-select is GPU-only, Pitfall 6).
+    //
+    // FOLDS-BUILT-ONCE (learn_context.cpp:494-590): the fold set is created ONCE
+    // here, BEFORE the tree-iteration loop, from the continuous-stream RNG
+    // (`random_seed`) — the fold permutations are fixed for the whole run and are
+    // NEVER redrawn per iteration. `create_folds` appears EXACTLY ONCE in this
+    // production module (grep-enforced, FOLDS-BUILT-ONCE invariant). The Plain
+    // path leaves `ordered_learning_perm` `None` and is byte-identical to before.
+    let ordered_learning_perm: Option<Vec<i32>> = match params.boosting_type {
+        EBoostingType::Plain => None,
+        EBoostingType::Ordered => {
+            // Build learning fold(s) (ordered ⇒ permutation needed, dynamic
+            // body/tail) + one averaging fold. For permutation_count=1 →
+            // learning_fold_count(1, true) == 1 learning fold + 1 averaging fold.
+            let folds: Vec<Fold> = crate::fold::create_folds(
+                n,
+                params.permutation_count,
+                /* permutation_needed_for_learning = */ true,
+                /* dynamic_body_tail = */ true,
+                params.fold_len_multiplier,
+                params.random_seed,
+            );
+            // The learning fold (first non-averaging) supplies the object order
+            // the ordered per-segment split score walks. Degenerate (no learning
+            // fold) ⇒ surface a typed error rather than silently falling through.
+            let perm = folds
+                .iter()
+                .find(|f| !f.is_averaging)
+                .map(|f| f.permutation.clone())
+                .ok_or_else(|| {
+                    CbError::Degenerate("ordered boosting: no learning fold created".to_owned())
+                })?;
+            Some(perm)
+        }
+    };
 
     // Numeric-only training matrix (no categorical features in this path; the
     // one-hot categorical splits are exercised through the categorical-aware
@@ -958,15 +989,38 @@ pub fn train_with_eval_sets<R: Runtime>(
         } else {
             None
         };
-        let grown = greedy_tensor_search_oblivious_perturbed(
-            &matrix,
-            &score_weighted_der1,
-            &score_weights,
-            scaled_l2,
-            params.depth,
-            n,
-            perturb,
-        )?;
+        let grown: GrownTree = match ordered_learning_perm.as_deref() {
+            // ORDERED (ORD-02): grow the tree STRUCTURE via the 05-08 ordered
+            // per-segment split-scoring subsystem over the learning fold's
+            // BodyTailArr. At random_strength=0 + bootstrap_type=No there are no
+            // perturbation/bootstrap draws, so the ordered split score consumes the
+            // FULL (un-masked) `weighted_der1` / `weights` in learning-fold object
+            // order; the function derives the body/tail segments + per-segment body
+            // sum-weights internally from `fold_len_multiplier` (fold.rs, 05-03).
+            // `leaf_of` is object-order (Plain-identical) so the SAME averaging-fold
+            // leaf-value path below applies (`CalcLeafValuesSimple`).
+            Some(learning_perm) => greedy_tensor_search_oblivious_ordered(
+                &matrix,
+                &weighted_der1,
+                &weights,
+                learning_perm,
+                params.l2_leaf_reg,
+                params.fold_len_multiplier,
+                params.depth,
+                n,
+            )?,
+            // PLAIN (unchanged): the perturbed whole-fold search over the
+            // sampled/sample-weighted histogram (byte-identical to before).
+            None => greedy_tensor_search_oblivious_perturbed(
+                &matrix,
+                &score_weighted_der1,
+                &score_weights,
+                scaled_l2,
+                params.depth,
+                n,
+                perturb,
+            )?,
+        };
 
         // 3. Leaf values via the selected estimation method (TRAIN-03 / D-09),
         //    scaled by learning_rate (stored value matches model.json). Leaf
