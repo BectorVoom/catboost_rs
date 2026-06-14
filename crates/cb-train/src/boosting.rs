@@ -40,7 +40,8 @@ use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDete
 use crate::candidates::tensor_ctr_candidates;
 use crate::tree::{
     check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_perturbed,
-    leaf_index, CtrSplitSpec, FeatureMatrix, GrownTree, Perturbation, Split,
+    greedy_tensor_search_oblivious_with_ctr, leaf_index, CtrSplitSpec, FeatureMatrix, GrownTree,
+    LevelKind, Perturbation, Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -618,6 +619,66 @@ fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) 
     members.iter().map(|bucket| sum_f64(bucket)).collect()
 }
 
+/// Assign each object's LEAF-VALUE leaf index over the AVERAGING-fold CTR columns
+/// (ORD-05, research Q1/Q3 #3 — `train.cpp:130` `BuildIndices(AveragingFold)`).
+///
+/// Walks the grown tree's `level_kinds` in level order (so float and CTR levels
+/// interleave in the correct forward-bit order). For a FLOAT level the bit is
+/// `value > border` on the float matrix (the SAME test the structure search used,
+/// reproduced from the public `feature_values` / the chosen `Split`). For a CTR
+/// level the bit is `ctr_bin > border` against the AVERAGING-fold column's `bins`
+/// (NOT the structure column) — this is the single place the leaf-VALUE partition
+/// diverges from the structure partition (`[6,0,7,17]` vs `[6,0,9,15]` for the
+/// tensor_ctr_e2e config).
+///
+/// `averaging_ctr_features` is index-aligned with the structure
+/// `materialized_ctr_features` (same projection order), and a `LevelKind::Ctr`'s
+/// `ctr_idx` indexes the tree's chosen `ctr_splits`, whose projection identifies
+/// which averaging column to read. Out-of-range indices contribute a `false` bit
+/// defensively (checked `.get` only — no panic, no raw index).
+fn assign_leaf_of_averaging(
+    matrix: &FeatureMatrix,
+    averaging_ctr_features: &[crate::ctr::CtrFeatureColumn],
+    grown: &GrownTree,
+    n_objects: usize,
+) -> Vec<usize> {
+    (0..n_objects)
+        .map(|obj| {
+            let mut passes: Vec<bool> = Vec::with_capacity(grown.level_kinds.len());
+            for kind in &grown.level_kinds {
+                let bit = match kind {
+                    LevelKind::Float(split_idx) => grown
+                        .splits
+                        .get(*split_idx)
+                        .and_then(|s| {
+                            matrix
+                                .feature_values
+                                .get(s.feature)
+                                .and_then(|col| col.get(obj))
+                                .map(|&v| f64::from(v) > s.border)
+                        })
+                        .unwrap_or(false),
+                    LevelKind::Ctr { ctr_idx, border } => grown
+                        .ctr_splits
+                        .get(*ctr_idx)
+                        // Find the averaging column whose projection matches this
+                        // chosen CTR split (index-aligned with the structure
+                        // columns; the projection is the stable key).
+                        .and_then(|spec| {
+                            averaging_ctr_features
+                                .iter()
+                                .find(|c| c.projection == spec.projection)
+                        })
+                        .and_then(|col| col.bins.get(obj))
+                        .is_some_and(|&bin| f64::from(bin) > *border),
+                };
+                passes.push(bit);
+            }
+            leaf_index(&passes)
+        })
+        .collect()
+}
+
 /// Map the tree's chosen tensor-CTR candidates into the persisted
 /// [`CtrSplitSpec`] list (ORD-05 / D-05). For the numeric `train` driver the
 /// `candidates` list is EMPTY (no categorical columns supply CTR-eligible
@@ -1027,34 +1088,50 @@ fn train_inner<R: Runtime>(
         .map(|(abs_idx, _)| abs_idx)
         .collect();
 
-    // The single learn permutation for the per-candidate online CTR materialization
-    // (the per-fold online-CTR-during-growth order). Built ONCE here, BEFORE the
-    // tree loop, from the continuous-stream RNG — `create_folds` appears at most
-    // TWICE in this production module (one for the Ordered split-scoring fold set
-    // above, one here for the cat-CTR learn permutation; FOLDS-BUILT-ONCE grep
-    // bound <= 2). Only built when there are CTR candidates to materialize (the
-    // numeric path skips it entirely, leaving the draw stream untouched).
-    let cat_learn_permutation: Option<Vec<i32>> = if ctr_candidates.is_empty() {
-        None
-    } else {
-        let folds: Vec<Fold> = crate::fold::create_folds(
-            n,
-            params.permutation_count,
-            /* permutation_needed_for_learning = */ true,
-            /* dynamic_body_tail = */ false,
-            params.fold_len_multiplier,
-            params.random_seed,
-        );
-        // The learn permutation is the first learning fold's (permutation_count=1 →
-        // one learning fold); fall back to identity if none (degenerate).
-        Some(
-            folds
+    // The TWO permutations for the cat-CTR two-materialization (research Q1/Q3):
+    //   * `cat_learn_permutation` — the STRUCTURE-search fold (the lone learning
+    //     `Folds[0]`, which Plan 05-12 made the IDENTITY for permutation_count=1).
+    //     The structure-search CTR column is materialized under this permutation.
+    //   * `cat_averaging_permutation` — the AveragingFold's SHUFFLED permutation
+    //     (`find(|f| f.is_averaging)`, the first seeded Fisher-Yates draw locked by
+    //     Plan 05-12's oracle == fisher_yates_permutation(n, seed) for pc=1). The
+    //     LEAF-VALUE CTR column is materialized under THIS permutation
+    //     (train.cpp:130 BuildIndices(AveragingFold)).
+    //
+    // Both come from ONE `create_folds` call (FOLDS-BUILT-ONCE: `create_folds`
+    // appears at most TWICE in this production module — the Ordered split-scoring
+    // fold set above + this cat-CTR fold set). Only built when there are CTR
+    // candidates (the numeric path skips it entirely, leaving the draw stream
+    // untouched).
+    let (cat_learn_permutation, cat_averaging_permutation): (Option<Vec<i32>>, Option<Vec<i32>>) =
+        if ctr_candidates.is_empty() {
+            (None, None)
+        } else {
+            let folds: Vec<Fold> = crate::fold::create_folds(
+                n,
+                params.permutation_count,
+                /* permutation_needed_for_learning = */ true,
+                /* dynamic_body_tail = */ false,
+                params.fold_len_multiplier,
+                params.random_seed,
+            );
+            // STRUCTURE: the first learning (non-averaging) fold — the IDENTITY for
+            // permutation_count=1 (Plan 05-12); fall back to identity if none.
+            let learn = folds
                 .iter()
                 .find(|f| !f.is_averaging)
                 .map(|f| f.permutation.clone())
-                .unwrap_or_else(|| (0..n as i32).collect()),
-        )
-    };
+                .unwrap_or_else(|| (0..n as i32).collect());
+            // LEAF VALUES: the AveragingFold's shuffled permutation (research Q1).
+            // Fall back to identity if absent (degenerate — there is always one
+            // averaging fold).
+            let averaging = folds
+                .iter()
+                .find(|f| f.is_averaging)
+                .map(|f| f.permutation.clone())
+                .unwrap_or_else(|| (0..n as i32).collect());
+            (Some(learn), Some(averaging))
+        };
 
     // The binclf target class per object (matching the e2e oracle binarization):
     // `target_class[i] = usize::from(target[i] > 0.5)`.
@@ -1069,25 +1146,34 @@ fn train_inner<R: Runtime>(
     let ctr_prior_denom = 1.0;
     let ctr_border_count = ctr_border_count_default();
 
-    // Materialize a combined-projection online CTR feature column PER candidate
-    // (Plan 05-11). In THIS plan the columns are carried for Plan 05-12's scoring;
-    // the tree search does not yet split on them, so the numeric path is unaffected.
+    // Resolve the per-candidate ABSOLUTE projections ONCE (re-index the CTR-
+    // eligible-position members emitted by `tensor_ctr_candidates` back to absolute
+    // `cat_columns` indices). Both the structure (identity) and the leaf-value
+    // (averaging) materializations share these projections.
+    let absolute_projections: Vec<crate::TProjection> = ctr_candidates
+        .iter()
+        .map(|cand| {
+            let absolute_members: Vec<usize> = cand
+                .projection
+                .cat_features()
+                .iter()
+                .filter_map(|&pos| eligible_absolute.get(pos).copied())
+                .collect();
+            crate::TProjection::from_features(&absolute_members)
+        })
+        .collect();
+
+    // Materialize the STRUCTURE-search combined-projection online CTR feature
+    // column PER candidate under the IDENTITY learning permutation (Plan 05-11).
+    // Plan 05-13 SCORES these into the oblivious search
+    // (`greedy_tensor_search_oblivious_with_ctr`) to grow the tree STRUCTURE.
     let materialized_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
         if let Some(learn_perm) = cat_learn_permutation.as_deref() {
             let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for cand in &ctr_candidates {
-                // Re-index the candidate's CTR-eligible-position members to absolute
-                // cat-feature indices, then materialize over the absolute projection.
-                let absolute_members: Vec<usize> = cand
-                    .projection
-                    .cat_features()
-                    .iter()
-                    .filter_map(|&pos| eligible_absolute.get(pos).copied())
-                    .collect();
-                let absolute_projection = crate::TProjection::from_features(&absolute_members);
+            for proj in &absolute_projections {
                 let col = crate::ctr::materialize_ctr_feature(
                     cat_columns,
-                    &absolute_projection,
+                    proj,
                     learn_perm,
                     &target_class,
                     ctr_prior_num, ctr_prior_denom,
@@ -1099,8 +1185,32 @@ fn train_inner<R: Runtime>(
         } else {
             Vec::new()
         };
-    // Carried for Plan 05-12 scoring; not yet split on (numeric path unaffected).
-    let _ = &materialized_ctr_features;
+
+    // Materialize the SECOND (LEAF-VALUE) combined-projection online CTR feature
+    // column PER candidate under the AVERAGING-fold's SHUFFLED permutation
+    // (research Q3 #2: `materialize_ctr_feature(..., averaging_perm, ...)` — the
+    // SAME function, the AVERAGING permutation input). For the tensor_ctr_e2e
+    // config these bins yield the leaf-VALUE partition [6,0,7,17] (vs the structure
+    // [6,0,9,15]). Index-aligned with `materialized_ctr_features` (same projection
+    // order), so a chosen structure CTR split maps to the same averaging column.
+    let averaging_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
+        if let Some(avg_perm) = cat_averaging_permutation.as_deref() {
+            let mut cols = Vec::with_capacity(ctr_candidates.len());
+            for proj in &absolute_projections {
+                let col = crate::ctr::materialize_ctr_feature(
+                    cat_columns,
+                    proj,
+                    avg_perm,
+                    &target_class,
+                    ctr_prior_num, ctr_prior_denom,
+                    ctr_border_count,
+                )?;
+                cols.push(col);
+            }
+            cols
+        } else {
+            Vec::new()
+        };
 
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
@@ -1243,47 +1353,91 @@ fn train_inner<R: Runtime>(
         } else {
             None
         };
-        let grown: GrownTree = match ordered_learning_perm.as_deref() {
-            // ORDERED (ORD-02): grow the tree STRUCTURE via the 05-08 ordered
-            // per-segment split-scoring subsystem over the learning fold's
-            // BodyTailArr. At random_strength=0 + bootstrap_type=No there are no
-            // perturbation/bootstrap draws, so the ordered split score consumes the
-            // FULL (un-masked) `weighted_der1` / `weights` in learning-fold object
-            // order; the function derives the body/tail segments + per-segment body
-            // sum-weights internally from `fold_len_multiplier` (fold.rs, 05-03).
-            // `leaf_of` is object-order (Plain-identical) so the SAME averaging-fold
-            // leaf-value path below applies (`CalcLeafValuesSimple`).
-            Some(learning_perm) => greedy_tensor_search_oblivious_ordered(
+        // CTR-aware structure search is taken when there ARE materialized CTR
+        // candidates (the cat path). It is mutually exclusive with the Ordered
+        // path here (the in-scope tensor_ctr_e2e config is Plain + hasCtrs); the
+        // numeric / one-hot / ordered paths have NO CTR candidates so this gate is
+        // false for them and they keep their exact previous dispatch.
+        let has_ctr = !materialized_ctr_features.is_empty();
+        let grown: GrownTree = if has_ctr {
+            // ORD-05 STRUCTURE: score the IDENTITY-fold CTR columns into the
+            // oblivious search alongside float candidates (shared L2 score, strict
+            // first-wins, forward-bit leaf index). At random_strength=0 +
+            // bootstrap_type=No there are no perturbation/bootstrap draws, so the
+            // FULL (un-masked) `weighted_der1` / `weights` drive scoring. The
+            // returned `grown.leaf_of` is the STRUCTURE partition; the leaf VALUES
+            // are reassigned over the averaging-fold columns below.
+            greedy_tensor_search_oblivious_with_ctr(
                 &matrix,
+                &materialized_ctr_features,
+                ctr_border_count,
                 &weighted_der1,
                 &weights,
-                learning_perm,
-                params.l2_leaf_reg,
-                params.fold_len_multiplier,
-                params.depth,
-                n,
-            )?,
-            // PLAIN (unchanged): the perturbed whole-fold search over the
-            // sampled/sample-weighted histogram (byte-identical to before).
-            None => greedy_tensor_search_oblivious_perturbed(
-                &matrix,
-                &score_weighted_der1,
-                &score_weights,
                 scaled_l2,
                 params.depth,
                 n,
-                perturb,
-            )?,
+                0,
+            )?
+        } else {
+            match ordered_learning_perm.as_deref() {
+                // ORDERED (ORD-02): grow the tree STRUCTURE via the 05-08 ordered
+                // per-segment split-scoring subsystem over the learning fold's
+                // BodyTailArr. At random_strength=0 + bootstrap_type=No there are no
+                // perturbation/bootstrap draws, so the ordered split score consumes
+                // the FULL (un-masked) `weighted_der1` / `weights` in learning-fold
+                // object order; the function derives the body/tail segments +
+                // per-segment body sum-weights internally from `fold_len_multiplier`
+                // (fold.rs, 05-03). `leaf_of` is object-order (Plain-identical) so
+                // the SAME averaging-fold leaf-value path below applies.
+                Some(learning_perm) => greedy_tensor_search_oblivious_ordered(
+                    &matrix,
+                    &weighted_der1,
+                    &weights,
+                    learning_perm,
+                    params.l2_leaf_reg,
+                    params.fold_len_multiplier,
+                    params.depth,
+                    n,
+                )?,
+                // PLAIN (unchanged): the perturbed whole-fold search over the
+                // sampled/sample-weighted histogram (byte-identical to before).
+                None => greedy_tensor_search_oblivious_perturbed(
+                    &matrix,
+                    &score_weighted_der1,
+                    &score_weights,
+                    scaled_l2,
+                    params.depth,
+                    n,
+                    perturb,
+                )?,
+            }
+        };
+
+        // LEAF-VALUE leaf_of (research Q1/Q3 #3, train.cpp:130
+        // BuildIndices(AveragingFold)). On the CTR path, the per-object leaf indices
+        // for LEAF-VALUE estimation are computed over the AVERAGING-fold CTR columns
+        // (NOT the structure-search columns), reassigning each CTR level's
+        // `ctr_bin > border` test against the averaging column's bins while keeping
+        // float levels on the float matrix. On every OTHER path (no CTR candidates)
+        // `leaf_value_leaf_of` is EXACTLY the structure `grown.leaf_of`
+        // (byte-identical to before — the numeric / one-hot / ordered oracles are
+        // provably unaffected by the gate below).
+        let leaf_value_leaf_of: Vec<usize> = if has_ctr {
+            assign_leaf_of_averaging(&matrix, &averaging_ctr_features, &grown, n)
+        } else {
+            grown.leaf_of.clone()
         };
 
         // 3. Leaf values via the selected estimation method (TRAIN-03 / D-09),
         //    scaled by learning_rate (stored value matches model.json). Leaf
         //    estimation uses the FULL fold (all objects) with the RAW (un-sampled)
-        //    derivatives/weights. Every reduction over leaf members routes through
-        //    cb_core::sum_f64 (D-05).
+        //    derivatives/weights over the LEAF-VALUE leaf_of (the averaging-fold
+        //    partition on the CTR path; the structure partition otherwise). The
+        //    Gradient FORMULA is UNCHANGED (research Q3 #4). Every reduction over
+        //    leaf members routes through cb_core::sum_f64 (D-05).
         let leaf_deltas = compute_leaf_deltas(
             params.leaf_method,
-            &grown.leaf_of,
+            &leaf_value_leaf_of,
             &weighted_der1,
             &ders.der2,
             &weights,
@@ -1297,13 +1451,16 @@ fn train_inner<R: Runtime>(
             .map(|&delta| learning_rate * delta)
             .collect();
 
-        // Per-leaf summed training-document weights (RESEARCH Pitfall 1). Uses
-        // the FULL un-sampled fold weights (same as leaf estimation), reduced
-        // ordered through cb_core::sum_f64 (D-08).
-        let leaf_weights = accumulate_leaf_weights(&grown.leaf_of, &weights, n_leaves);
+        // Per-leaf summed training-document weights (RESEARCH Pitfall 1; research
+        // Open-q 5: on the CTR path these are the AVERAGING-fold partition counts).
+        // Uses the FULL un-sampled fold weights (same as leaf estimation) over the
+        // SAME `leaf_value_leaf_of`, reduced ordered through cb_core::sum_f64 (D-08).
+        let leaf_weights = accumulate_leaf_weights(&leaf_value_leaf_of, &weights, n_leaves);
 
-        // 4. Update approx: approx[i] += leaf_value[leaf(i)].
-        for (i, &leaf) in grown.leaf_of.iter().enumerate() {
+        // 4. Update approx: approx[i] += leaf_value[leaf(i)] over the LEAF-VALUE
+        //    leaf_of (so each iteration's der recompute is sequential over the same
+        //    averaging-fold partition — research "Empirical verification" #2).
+        for (i, &leaf) in leaf_value_leaf_of.iter().enumerate() {
             if let (Some(a), Some(&lv)) = (approx.get_mut(i), leaf_values.get(leaf)) {
                 *a += lv;
             }
@@ -1348,11 +1505,21 @@ fn train_inner<R: Runtime>(
         // (learning_rate-scaled) leaf values.
         prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&leaf_values));
 
-        // Persist any chosen tensor-CTR splits for this tree (ORD-05). With the
-        // numeric `train` driver's empty candidate set this is EMPTY; the
-        // categorical path supplies real candidates and a chosen CTR split is
-        // lifted by `cb_model::Model::from_trained` into a `ModelSplit::Ctr`.
-        let ctr_splits = ctr_splits_for_tree(&ctr_candidates, &params.combinations_ctr_priors);
+        // Persist the ACTUAL chosen tensor-CTR splits for this tree (ORD-05). On
+        // the CTR path `grown.ctr_splits` holds ONLY the WINNING CTR splits
+        // (recorded by `greedy_tensor_search_oblivious_with_ctr` with their chosen
+        // CTR-value borders + prior PAIR), replacing the prior candidate-only
+        // emission. Off the CTR path (numeric `train` driver, empty candidate set)
+        // `grown.ctr_splits` is EMPTY, so this is a no-op and the float-only oracles
+        // stay byte-identical. `cb_model::Model::from_trained` lifts each chosen
+        // split into a `ModelSplit::Ctr` (Plan 05-14 bakes the ctr_data + Scale/
+        // Shift). `ctr_splits_for_tree` is retained for the no-CTR candidate path
+        // (it returns empty there) so the existing seam keeps compiling.
+        let ctr_splits = if has_ctr {
+            grown.ctr_splits.clone()
+        } else {
+            ctr_splits_for_tree(&ctr_candidates, &params.combinations_ctr_priors)
+        };
 
         trees.push(ObliviousTree {
             splits: grown.splits,
