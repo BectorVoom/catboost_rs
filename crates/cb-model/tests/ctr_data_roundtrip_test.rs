@@ -21,11 +21,11 @@
 use std::collections::BTreeMap;
 
 use cb_model::{
-    ctr_value_for_projection, decode_ctr_data, encode_ctr_data, CtrData, CtrValueTable, ECtrType,
-    Prior,
+    ctr_value_for_combined_projection, ctr_value_for_projection, decode_ctr_data, encode_ctr_data,
+    CtrData, CtrValueTable, ECtrType, Prior,
 };
 use cb_oracle::assert_abs_close;
-use cb_train::{accumulate_online, build_final_ctr};
+use cb_train::{accumulate_online, build_final_ctr, fold_cat_hash};
 
 /// The same small categorical column the Task-1 unit tests use, as the
 /// trainer-side anchor. `a` 3x (classes 1,1,0), `b` 2x (0,1), `c` 1x (1).
@@ -175,6 +175,57 @@ fn float_target_mean_round_trips_and_applies() {
     // (2+0)/(3+1) = 0.5.
     let v_a = ctr_value_for_projection(&table, "a", Prior::unit(0.0), 0.0, 1.0, 0);
     assert_abs_close(&[0.5], &[v_a], 1e-5).expect("float-mean 'a'");
+}
+
+/// The COMBINED (tensor / combination) projection apply (ORD-05 / D-05): the
+/// model-side `ctr_value_for_combined_projection` keys the SAME per-type
+/// `Calc(cic, tot)` on the COMBINED projection hash (folding each member's
+/// `calc_cat_feature_hash` via `fold_cat_hash`, NEVER the model's stored
+/// hash_map), with the same not-found→empty bounds-safe path (T-05-06-V5). The
+/// combined keys are computed here exactly as the apply path computes them, so a
+/// present combination reproduces its bucket value and an absent one degenerates
+/// to the empty `Calc(0,0)`.
+#[test]
+fn combined_projection_ctr_applies_on_folded_hash() {
+    // The combined key for a 2-feature projection (catA, catB) the apply path
+    // computes: fold(fold(0, hash(a)), hash(b)).
+    let combined = |a: &str, b: &str| -> u64 {
+        let r = fold_cat_hash(0, cb_data::calc_cat_feature_hash(a));
+        fold_cat_hash(r, cb_data::calc_cat_feature_hash(b))
+    };
+
+    // Two combination buckets keyed on the folded projection hash, each a Borders
+    // [N0, N1] count. (a,x): N1=2 total=3 -> (2+0.5)/(3+1)=0.625. (b,y): N1=1
+    // total=4 -> (1+0.5)/(4+1)=0.3.
+    let table = CtrValueTable {
+        ctr_type: ECtrType::Borders,
+        target_classes_count: 2,
+        hashes: vec![combined("a", "x"), combined("b", "y")],
+        int_counts: vec![vec![1, 2], vec![3, 1]],
+        mean: Vec::new(),
+        counter_denominator: 0,
+    };
+
+    // The combined projection apply reproduces the bucket values ≤1e-5, keying on
+    // the FOLDED hash (the projection members IN ORDER), not a single feature.
+    let v_ax = ctr_value_for_combined_projection(&table, &["a", "x"], Prior::unit(0.5), 0.0, 1.0, 0);
+    assert_abs_close(&[0.625], &[v_ax], 1e-5).expect("combined (a,x) CTR");
+    let v_by = ctr_value_for_combined_projection(&table, &["b", "y"], Prior::unit(0.5), 0.0, 1.0, 0);
+    assert_abs_close(&[0.3], &[v_by], 1e-5).expect("combined (b,y) CTR");
+
+    // A combination NOT present in the table -> not-found→empty Calc(0,0):
+    // (0+0.5)/(0+1)=0.5, never an OOB index (T-05-06-V5).
+    let v_missing =
+        ctr_value_for_combined_projection(&table, &["a", "y"], Prior::unit(0.5), 0.0, 1.0, 0);
+    assert_abs_close(&[0.5], &[v_missing], 1e-5).expect("absent combination → empty");
+
+    // The combined key is ORDER-bearing AND distinct from either single-feature
+    // key: applying the single feature "a" to the same table hits no bucket
+    // (the simple key differs from the combined key), so the tensor path is NOT
+    // the single-feature path.
+    let v_simple_a = ctr_value_for_projection(&table, "a", Prior::unit(0.5), 0.0, 1.0, 0);
+    assert_abs_close(&[0.5], &[v_simple_a], 1e-5)
+        .expect("single 'a' misses the combined buckets (distinct keyspace)");
 }
 
 #[test]

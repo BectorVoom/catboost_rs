@@ -222,6 +222,10 @@ pub fn enumerate_projections(cat_feature_count: usize, max_ctr_complexity: usize
 /// Append every sorted distinct-feature subset of size `len` over
 /// `[0, cat_feature_count)` to `out`, in lexicographic order. A pure
 /// combinatorial helper (no hashing) bounded by `len <= cat_feature_count`.
+///
+/// All `indices` access is checked `.get`/`.get_mut` (no raw indexing —
+/// `indexing_slicing` deny); the lexicographic walk advances the rightmost
+/// position that can grow then resets the suffix to consecutive values.
 fn enumerate_subsets_of_len(cat_feature_count: usize, len: usize, out: &mut Vec<TProjection>) {
     if len == 0 || len > cat_feature_count {
         return;
@@ -233,22 +237,33 @@ fn enumerate_subsets_of_len(cat_feature_count: usize, len: usize, out: &mut Vec<
             cat_features: indices.clone(),
         });
         // Advance to the next lexicographic combination: find the rightmost index
-        // that can be incremented, bump it, then reset the suffix.
+        // that can be incremented, bump it, then reset the suffix to consecutive
+        // values. Checked access throughout.
         let mut i = len;
-        loop {
+        let advanced = loop {
             if i == 0 {
-                return;
+                break false;
             }
             i -= 1;
             // The max value position `i` may hold so the suffix still fits.
             let max_for_pos = cat_feature_count - len + i;
-            if indices[i] < max_for_pos {
-                indices[i] += 1;
-                for j in (i + 1)..len {
-                    indices[j] = indices[j - 1] + 1;
+            let current = indices.get(i).copied().unwrap_or(usize::MAX);
+            if current < max_for_pos {
+                if let Some(slot) = indices.get_mut(i) {
+                    *slot = current + 1;
                 }
-                break;
+                // Reset the suffix j > i to consecutive values: position `j`
+                // holds `indices[i] + (j - i)` = `current + 1 + (j - i)`.
+                for j in (i + 1)..len {
+                    if let Some(slot) = indices.get_mut(j) {
+                        *slot = current + 1 + (j - i);
+                    }
+                }
+                break true;
             }
+        };
+        if !advanced {
+            return;
         }
     }
 }

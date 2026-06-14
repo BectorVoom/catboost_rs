@@ -21,7 +21,9 @@ mod model;
 mod predict;
 mod shap;
 
-pub use apply::{binarize_feature, ctr_value_for_projection, predict_raw};
+pub use apply::{
+    binarize_feature, ctr_value_for_combined_projection, ctr_value_for_projection, predict_raw,
+};
 pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
 pub use ctr_data::{
     calc_inference, decode_ctr_data, encode_ctr_data, CtrData, CtrTableJson, CtrValueTable,

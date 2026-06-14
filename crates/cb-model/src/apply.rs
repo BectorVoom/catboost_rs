@@ -32,7 +32,7 @@
 
 use cb_core::sum_f64;
 use cb_data::calc_cat_feature_hash;
-use cb_train::{leaf_index, Split};
+use cb_train::{fold_cat_hash, leaf_index, Split};
 
 use crate::ctr_data::{CtrValueTable, Prior};
 use crate::Model;
@@ -72,6 +72,46 @@ pub fn ctr_value_for_projection(
 ) -> f64 {
     let hash = u64::from(calc_cat_feature_hash(cat_value));
     table.calc_for_hash(hash, prior, shift, scale, target_border_idx)
+}
+
+/// Compute one CTR value for a document's TENSOR / COMBINATION projection at
+/// inference (ORD-05 / D-05). A tensor CTR is the SAME per-type
+/// [`CtrValueTable::calc_for_hash`] apply as the single-feature path
+/// ([`ctr_value_for_projection`]) — only the KEY changes: it is the COMBINED
+/// projection hash folding each member feature's per-document categorical hash,
+/// NOT a single feature's hash.
+///
+/// `cat_values` holds the document's projection-member categorical VALUES (each
+/// already in the A4 string form, [`cb_data::stringify_int_category`] for
+/// integer-coded values) IN THE PROJECTION'S SORTED MEMBER ORDER. Each is hashed
+/// via [`cb_data::calc_cat_feature_hash`] — the single categorical-hash source,
+/// NEVER the model's STORED `ctr_data` hash_map (RESEARCH Anti-Pattern) — and
+/// folded into the combined ui64 key via [`cb_train::fold_cat_hash`]
+/// (`ctr_provider.h:65-78` `CalcHash`, the sign-extended `(ui64)(int)` cast). The
+/// table's [`CtrValueTable::calc_for_hash`] then applies the per-type
+/// `Calc(cic, tot)` with the not-found→empty path (a missing combined bucket
+/// returns the empty value, never an OOB index — T-05-06-V5). A single-element
+/// `cat_values` degenerates to the simple-CTR combined key (one fold over the
+/// empty `0` seed), so the simple and tensor paths share one keyspace.
+///
+/// `target_border_idx` selects the Buckets per-class numerator (default `0`).
+#[must_use]
+pub fn ctr_value_for_combined_projection(
+    table: &CtrValueTable,
+    cat_values: &[&str],
+    prior: Prior,
+    shift: f64,
+    scale: f64,
+    target_border_idx: usize,
+) -> f64 {
+    // Fold each member feature's per-document ui32 cat hash into the combined key,
+    // starting from the 0 seed (ctr_provider.h:70 `ui64 result = 0`), in the
+    // supplied (projection-sorted) member order.
+    let mut combined: u64 = 0;
+    for &cat_value in cat_values {
+        combined = fold_cat_hash(combined, calc_cat_feature_hash(cat_value));
+    }
+    table.calc_for_hash(combined, prior, shift, scale, target_border_idx)
 }
 
 /// Whether an object passes one split: the split's `value > border` test on its
