@@ -96,6 +96,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         simple_ctr: cb_train::simple_ctr_default(),
         simple_ctr_priors: cb_train::simple_ctr_priors_default(),
         counter_calc_method: cb_train::counter_calc_method_default(),
+        boosting_type: cb_train::boosting_type_default(),
     };
 
     let mut staged = Vec::new();

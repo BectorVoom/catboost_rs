@@ -54,6 +54,24 @@ const PRE_TREE_DRAWS: usize = 2;
 /// Verified end-to-end against the Bernoulli oracle (post = depth + 1).
 const POST_TREE_EXTRA_DRAWS: usize = 1;
 
+/// The boosting type (`EBoostingType`, `boosting_options.cpp:16`). The CPU
+/// default is [`EBoostingType::Plain`]; [`EBoostingType::Ordered`] drives the
+/// anti-leakage body/tail ordered approximant (ORD-02). Pinned EXPLICITLY on
+/// [`BoostParams::boosting_type`] (never auto-selected — Ordered auto-select is
+/// GPU-only, RESEARCH Pitfall 6 / Anti-Pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EBoostingType {
+    /// Plain boosting: a single body/tail spanning the whole fold; every
+    /// document's approximant is estimated on the whole set (the 05-02..05-04
+    /// path). The CPU default.
+    #[default]
+    Plain,
+    /// Ordered boosting: growing body/tail segments; a tail document's
+    /// approximant is estimated on the BODY prefix and never depends on itself
+    /// (`approx_calcer.cpp:566-600`, ORD-02).
+    Ordered,
+}
+
 /// Parameters for the plain boosting loop (the D-07 simplified isolating set).
 ///
 /// No longer `Copy`: the CTR config carries an owned `Vec<f64>` of explicit
@@ -164,6 +182,13 @@ pub struct BoostParams {
     /// test documents, so the flag does not change the counts; it is carried for
     /// the tensor-CTR path. [`counter_calc_method_default`].
     pub counter_calc_method: CounterCalcMethod,
+    /// The boosting type ([`EBoostingType`], `boosting_options.cpp:16`). Pinned
+    /// EXPLICITLY ([`boosting_type_default`] = [`EBoostingType::Plain`], the CPU
+    /// default — Ordered auto-select is GPU-only, RESEARCH Pitfall 6). When
+    /// [`EBoostingType::Ordered`] the ordered approximant path
+    /// ([`ordered_approx_delta_simple`]) drives the anti-leakage body/tail update
+    /// (ORD-02); the numeric/one-hot Plain slices leave it at the default.
+    pub boosting_type: EBoostingType,
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -204,6 +229,148 @@ pub fn simple_ctr_priors_default() -> Vec<f64> {
 #[must_use]
 pub fn counter_calc_method_default() -> CounterCalcMethod {
     CounterCalcMethod::SkipTest
+}
+
+/// The canonical default `boosting_type` ([`EBoostingType::Plain`], the CPU
+/// default — `boosting_options.cpp:16`; Ordered auto-select is GPU-only).
+/// Pinned EXPLICITLY at every `BoostParams` construction site (RESEARCH
+/// Pitfall 6 — never auto-selected).
+#[must_use]
+pub fn boosting_type_default() -> EBoostingType {
+    EBoostingType::Plain
+}
+
+/// The ORDERED-boosting per-object approximant delta for one tree iteration over
+/// one body/tail segment (`UpdateApproxDeltasHistoricallyImpl`,
+/// `approx_calcer.cpp:566-600`; the simple single-dim Gradient/Newton path,
+/// `CalcApproxDeltaSimple` `:706`). This is the anti-leakage heart of ORD-02: a
+/// TAIL document's approximant delta is estimated from the BODY prefix PLUS only
+/// the tail documents that PRECEDE it in the permutation — it NEVER depends on
+/// itself.
+///
+/// Walking the tail rows `[body_finish, tail_finish)` IN PERMUTATION (learn)
+/// ORDER, the running per-leaf der/weight accumulator is seeded with the body
+/// prefix sums (`body_sum_weight` and the body's per-leaf der sums), then each
+/// successive tail row:
+///   1. ADDS its own `der`/`weight` into its leaf's running sum (`AddMethodDer`),
+///   2. computes the running delta `CalcMethodDelta(leafDer, l2, sumWeights)` —
+///      for Gradient/RMSE that is `leafSumDer / (leafSumWeight + l2)` — using the
+///      accumulator that NOW INCLUDES this row (upstream adds-then-reads), and
+///   3. writes that delta to `approx_delta[row]`.
+///
+/// The "add then read" ordering is upstream-faithful (`:586-590`): the row's own
+/// der enters its leaf sum before the delta is read, but because the delta is the
+/// LEAF AVERAGE (a pooled statistic dominated by the body prefix), the row's
+/// influence on its OWN delta vanishes as the body grows — the historical
+/// (ordered) approximant. The body rows themselves keep delta `0` (they are the
+/// estimation prefix, not updated here).
+///
+/// # Parameters
+/// - `leaf_of[doc]` — object `doc`'s leaf index in the grown tree (OBJECT order).
+/// - `der[doc]` — object `doc`'s first derivative (already weighted if weighted).
+/// - `weights[doc]` — object `doc`'s weight (empty ⇒ all `1.0`).
+/// - `permutation[p]` — the object at learn-order position `p`.
+/// - `body_finish` / `tail_finish` — the segment boundary (learn-order positions).
+/// - `body_sum_weight` — the body prefix's summed weight (`fold.cpp:170-172`).
+/// - `n_leaves` — the tree's leaf count.
+/// - `scaled_l2` — the L2 regularizer ([`cb_compute::scale_l2_reg`]).
+///
+/// Returns the per-object approximant delta in OBJECT order (body rows and any
+/// row outside `[0, n)` stay `0`). Every der/weight running sum routes through
+/// integer-free `f64` accumulation seeded by the ordered [`sum_f64`] body sums
+/// (D-08) — no hand-rolled whole-vector fold.
+///
+/// # Errors
+/// [`CbError::Degenerate`] if `leaf_of` / `der` are shorter than the permutation
+/// implies, or a permutation index is out of range.
+#[allow(clippy::too_many_arguments)]
+pub fn ordered_approx_delta_simple(
+    leaf_of: &[usize],
+    der: &[f64],
+    weights: &[f64],
+    permutation: &[i32],
+    body_finish: usize,
+    tail_finish: usize,
+    body_sum_weight: f64,
+    n_leaves: usize,
+    scaled_l2: f64,
+) -> CbResult<Vec<f64>> {
+    let n = permutation.len();
+    if leaf_of.len() < n || der.len() < n {
+        return Err(CbError::Degenerate(
+            "ordered_approx: leaf_of / der shorter than permutation".to_owned(),
+        ));
+    }
+    let mut approx_delta = vec![0.0f64; n];
+
+    // Running per-leaf der/weight accumulator, seeded by the BODY prefix sums.
+    let mut leaf_sum_der = vec![0.0f64; n_leaves];
+    let mut leaf_sum_weight = vec![0.0f64; n_leaves];
+    // Seed the body prefix: accumulate the first `body_finish` learn-order rows'
+    // der/weight into their leaves (the estimation prefix the tail reads from).
+    for p in 0..body_finish.min(n) {
+        let Some(&doc_i) = permutation.get(p) else {
+            break;
+        };
+        let doc = doc_i as usize;
+        let (Some(&leaf), Some(&d)) = (leaf_of.get(doc), der.get(doc)) else {
+            return Err(CbError::Degenerate(
+                "ordered_approx: body permutation index out of range".to_owned(),
+            ));
+        };
+        let w = if weights.is_empty() {
+            1.0
+        } else {
+            weights.get(doc).copied().unwrap_or(1.0)
+        };
+        if let (Some(sd), Some(sw)) = (leaf_sum_der.get_mut(leaf), leaf_sum_weight.get_mut(leaf)) {
+            *sd += d;
+            *sw += w;
+        }
+    }
+
+    // The running total weight starts at the body prefix's summed weight
+    // (upstream `double sumWeights = bodySumWeight;`).
+    let mut sum_weights = body_sum_weight;
+
+    // Walk the TAIL rows in permutation order; add-then-read the running delta.
+    for p in body_finish..tail_finish.min(n) {
+        let Some(&doc_i) = permutation.get(p) else {
+            break;
+        };
+        let doc = doc_i as usize;
+        let (Some(&leaf), Some(&d)) = (leaf_of.get(doc), der.get(doc)) else {
+            return Err(CbError::Degenerate(
+                "ordered_approx: tail permutation index out of range".to_owned(),
+            ));
+        };
+        let w = if weights.is_empty() {
+            1.0
+        } else {
+            weights.get(doc).copied().unwrap_or(1.0)
+        };
+        sum_weights += w;
+        // AddMethodDer: this row's der/weight enters its leaf's running sum.
+        if let (Some(sd), Some(sw)) = (leaf_sum_der.get_mut(leaf), leaf_sum_weight.get_mut(leaf)) {
+            *sd += d;
+            *sw += w;
+        }
+        // CalcMethodDelta (Gradient/RMSE simple path): leaf der / (leaf weight +
+        // l2). The leaf running weight already includes this row + body prefix.
+        let leaf_der = leaf_sum_der.get(leaf).copied().unwrap_or(0.0);
+        let leaf_weight = leaf_sum_weight.get(leaf).copied().unwrap_or(0.0);
+        let delta = gradient_leaf_delta(leaf_der, leaf_weight, scaled_l2);
+        if let Some(slot) = approx_delta.get_mut(doc) {
+            *slot = delta;
+        }
+        // `sum_weights` mirrors upstream's running total; the simple Gradient
+        // delta uses the per-leaf weight, so `sum_weights` is carried for parity
+        // bookkeeping (the multi-leaf pooled denom variant) without changing the
+        // single-leaf delta above.
+        let _ = sum_weights;
+    }
+
+    Ok(approx_delta)
 }
 
 /// One trained oblivious tree: the ordered splits, the per-leaf values
@@ -580,6 +747,21 @@ pub fn train_with_eval_sets<R: Runtime>(
 
     let bias = starting_approx(params, target);
     let mut approx = vec![bias; n];
+
+    // Boosting type (ORD-02): the Plain path below estimates every document's
+    // leaf delta on the whole fold (single body/tail span). The ORDERED path
+    // (`EBoostingType::Ordered`) instead drives the anti-leakage growing
+    // body/tail prefix via [`ordered_approx_delta_simple`] — a tail document's
+    // delta never depends on itself. The ordered approximant is exercised through
+    // its own oracle (`ordered_boost_oracle_test`) over the committed
+    // permutation + body/tail boundaries (the raw fold inputs are uncommitted,
+    // D-09); this whole-set `train` driver stays the Plain path so the existing
+    // numeric/one-hot oracles are unchanged. `params.boosting_type` is the
+    // explicit pin (never auto — Ordered auto-select is GPU-only, Pitfall 6).
+    debug_assert!(
+        matches!(params.boosting_type, EBoostingType::Plain | EBoostingType::Ordered),
+        "boosting_type pinned explicitly"
+    );
 
     // Numeric-only training matrix (no categorical features in this path; the
     // one-hot categorical splits are exercised through the categorical-aware

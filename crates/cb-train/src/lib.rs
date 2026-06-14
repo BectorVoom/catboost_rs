@@ -48,9 +48,10 @@ pub use permutation::{
     fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 pub use boosting::{
-    counter_calc_method_default, fold_len_multiplier_default, permutation_count_default,
-    simple_ctr_default, simple_ctr_priors_default, train, train_with_eval, train_with_eval_sets,
-    BoostParams, EvalSet, Model, ObliviousTree,
+    boosting_type_default, counter_calc_method_default, fold_len_multiplier_default,
+    ordered_approx_delta_simple, permutation_count_default, simple_ctr_default,
+    simple_ctr_priors_default, train, train_with_eval, train_with_eval_sets, BoostParams,
+    EBoostingType, EvalSet, Model, ObliviousTree,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, grow_one_hot_tree, leaf_index,
