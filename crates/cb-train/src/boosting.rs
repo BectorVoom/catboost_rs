@@ -225,6 +225,15 @@ pub struct BoostParams {
     /// ([`score_function_default`]); only the regression-skeleton / eval-metric /
     /// leaf-method fixtures set it to `L2`.
     pub score_function: cb_compute::EScoreFunction,
+    /// Whether the learn dataset is TIME-ORDERED (`has_time`,
+    /// `data_processing_options`). When `true`, upstream SKIPS the initial
+    /// learn-set Fisher-Yates shuffle `S` (`NeedShuffle` is `false` regardless of
+    /// cat features / ordered boosting — `preprocess.cpp:161`), preserving the
+    /// natural object order. Pinned EXPLICITLY ([`has_time_default`] = `false` —
+    /// every in-scope fixture is NOT time-ordered, so the initial shuffle `S` DOES
+    /// fire on the cat / ordered paths). Consumed by [`need_shuffle`] in
+    /// [`train_inner`] to gate the initial learn-set shuffle (ORD-01 / bar (c)).
+    pub has_time: bool,
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -335,6 +344,28 @@ pub fn model_size_reg_default() -> f64 {
 #[must_use]
 pub fn score_function_default() -> cb_compute::EScoreFunction {
     cb_compute::EScoreFunction::Cosine
+}
+
+/// The canonical default `has_time` (`false` — the learn dataset is NOT
+/// time-ordered, `data_processing_options` default). Pinned EXPLICITLY at every
+/// `BoostParams` construction site (RESEARCH Pitfall 6 — never auto-selected).
+/// `false` means the initial learn-set shuffle `S` DOES fire whenever there are
+/// cat features OR ordered boosting (`NeedShuffle`, `preprocess.cpp:161`).
+#[must_use]
+pub fn has_time_default() -> bool {
+    false
+}
+
+/// `NeedShuffle` (`catboost/private/libs/algo/preprocess.cpp:161`): the initial
+/// learn-set Fisher-Yates shuffle `S` fires when the data has CTRs (any cat
+/// feature present in this slice's CTR path) OR ordered boosting is on, AND the
+/// dataset is NOT time-ordered (`!has_time`). A time-ordered dataset preserves
+/// the natural object order (no shuffle), and a pure-numeric Plain dataset (no
+/// cat features, no ordered boosting) is never shuffled either — both paths stay
+/// byte-identical (the shuffle is a no-op there).
+#[must_use]
+pub fn need_shuffle(has_cat_features: bool, boosting_type: EBoostingType, has_time: bool) -> bool {
+    (has_cat_features || matches!(boosting_type, EBoostingType::Ordered)) && !has_time
 }
 
 /// The ORDERED-boosting per-object approximant delta for one tree iteration over
@@ -1124,48 +1155,64 @@ fn train_inner<R: Runtime>(
         .map(|(abs_idx, _)| abs_idx)
         .collect();
 
-    // The TWO permutations for the cat-CTR two-materialization (research Q1/Q3):
-    //   * `cat_learn_permutation` — the STRUCTURE-search fold (the lone learning
-    //     `Folds[0]`, which Plan 05-12 made the IDENTITY for permutation_count=1).
-    //     The structure-search CTR column is materialized under this permutation.
-    //   * `cat_averaging_permutation` — the AveragingFold's SHUFFLED permutation
-    //     (`find(|f| f.is_averaging)`, the first seeded Fisher-Yates draw locked by
-    //     Plan 05-12's oracle == fisher_yates_permutation(n, seed) for pc=1). The
-    //     LEAF-VALUE CTR column is materialized under THIS permutation
-    //     (train.cpp:130 BuildIndices(AveragingFold)).
+    // The TWO permutations for the cat-CTR two-materialization (research Q1/Q3),
+    // now CARRYING the initial learn-set shuffle `S` in the averaging order (ORD-01
+    // / bar (c), plan 05-19):
+    //   * `cat_learn_permutation` — the STRUCTURE-search fold = the lone learning
+    //     `Folds[0]`, the IDENTITY (`shuffle = foldIdx != 0`,
+    //     `learn_context.cpp:524`). The structure-search CTR column is materialized
+    //     under this permutation. (Per-iteration structure-fold cycling
+    //     `[0,2,0,2,2]` is Task 4; T3 keeps the fixed identity Folds[0].)
+    //   * `cat_averaging_permutation` — the AveragingFold's original-object CTR
+    //     order `Q = [S[p] for p in P_avg]`
+    //     ([`crate::averaging_ctr_permutation`]), where `S` is the initial
+    //     learn-set shuffle (`ShuffleLearnDataIfNeeded`, `preprocess.cpp:183`) and
+    //     `P_avg` is the averaging perm over the S-shuffled data — both off ONE
+    //     persistent `random_seed` stream. This SUBSUMES the prior 05-17
+    //     per-fold-`gen_rand` pre-draw hack (which matched the partition counts on a
+    //     COMPENSATING wrong-perm+wrong-bins error). The LEAF-VALUE CTR column is
+    //     materialized under THIS permutation (`train.cpp:130
+    //     BuildIndices(AveragingFold)`).
     //
-    // Both come from ONE `create_folds` call (FOLDS-BUILT-ONCE: `create_folds`
-    // appears at most TWICE in this production module — the Ordered split-scoring
-    // fold set above + this cat-CTR fold set). Only built when there are CTR
-    // candidates (the numeric path skips it entirely, leaving the draw stream
-    // untouched).
+    // Feeding `Q` (original-object order) straight to `materialize_ctr_feature`
+    // carries `S` WITHOUT a physical data shuffle/invert: the materialization order
+    // is the only place `S` is observable for the leaf-VALUE partition (de-risk
+    // gate `s_order_ctr_bins_oracle_test` proves this reproduces the self-consistent
+    // bins bit-exact, pc=1 + pc=4). The structure search, numeric/one-hot/ordered
+    // paths, and all per-object output order stay BYTE-IDENTICAL (no inversion
+    // needed — the data is never moved).
+    //
+    // `need_shuffle` transcribes upstream `NeedShuffle` (`preprocess.cpp:161`):
+    // CTRs present (any CTR-routed cat feature ⇒ non-empty candidates here) OR
+    // ordered boosting, AND not time-ordered (`!has_time`). When it is FALSE
+    // (e.g. a hypothetical `has_time=true` cat run) the averaging order falls back
+    // to the plain unshuffled averaging permutation (no `S`).
+    let need_shuffle = need_shuffle(
+        !ctr_candidates.is_empty(),
+        params.boosting_type,
+        params.has_time,
+    );
     let (cat_learn_permutation, cat_averaging_permutation): (Option<Vec<i32>>, Option<Vec<i32>>) =
         if ctr_candidates.is_empty() {
             (None, None)
         } else {
-            let folds: Vec<Fold> = crate::fold::create_folds(
-                n,
-                params.permutation_count,
-                /* permutation_needed_for_learning = */ true,
-                /* dynamic_body_tail = */ false,
-                params.fold_len_multiplier,
-                params.random_seed,
-            );
-            // STRUCTURE: the first learning (non-averaging) fold — the IDENTITY for
-            // permutation_count=1 (Plan 05-12); fall back to identity if none.
-            let learn = folds
-                .iter()
-                .find(|f| !f.is_averaging)
-                .map(|f| f.permutation.clone())
-                .unwrap_or_else(|| (0..n as i32).collect());
-            // LEAF VALUES: the AveragingFold's shuffled permutation (research Q1).
-            // Fall back to identity if absent (degenerate — there is always one
-            // averaging fold).
-            let averaging = folds
-                .iter()
-                .find(|f| f.is_averaging)
-                .map(|f| f.permutation.clone())
-                .unwrap_or_else(|| (0..n as i32).collect());
+            let learning_folds =
+                crate::learning_fold_count(params.permutation_count, /* needed = */ true);
+            // STRUCTURE: identity Folds[0] (the structure-search fold).
+            let learn: Vec<i32> = (0..n as i32).collect();
+            // LEAF VALUES: the averaging-fold original-object CTR order.
+            // `need_shuffle` (the normal cat path) ⇒ `Q = S ∘ P_avg` carries the
+            // initial learn-set shuffle. The (time-ordered) `!need_shuffle` fallback
+            // is the plain averaging perm with NO S — `P_avg` over UNshuffled data,
+            // i.e. `permutations(n, learning_folds + 1, seed)[learning_folds]`.
+            let averaging: Vec<i32> = if need_shuffle {
+                crate::averaging_ctr_permutation(n, learning_folds, params.random_seed)
+            } else {
+                crate::permutations(n, learning_folds.saturating_add(1), params.random_seed)
+                    .into_iter()
+                    .nth(learning_folds)
+                    .unwrap_or_else(|| (0..n as i32).collect())
+            };
             (Some(learn), Some(averaging))
         };
 

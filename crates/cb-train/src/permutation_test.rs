@@ -6,7 +6,8 @@
 //! in the `permutation_oracle_test.rs` integration test (D-03).
 
 use super::{
-    fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
+    averaging_ctr_permutation, create_shuffled_indices, fisher_yates_permutation, fold_block_size,
+    permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 use cb_core::TFastRng64;
 
@@ -111,6 +112,63 @@ fn permutations_fold0_equals_single_fisher_yates() {
 #[test]
 fn permutations_zero_count_is_empty() {
     assert!(permutations(30, 0, 0).is_empty());
+}
+
+#[test]
+fn averaging_ctr_permutation_reproduces_self_consistent_q_pc1() {
+    // ORD-01 / bar (c): Q = [S[p] for p in P_avg] must equal the trainer-captured
+    // `object_permutation_Q` (live_trainer_self_consistent.json, pc1.averaging_fold).
+    // pc1: permutation_count == 1 ⇒ learning_folds == max(1, 1-1) == 1.
+    let q_expected: [i32; 30] = [
+        7, 19, 20, 18, 13, 2, 17, 1, 14, 28, 12, 3, 8, 22, 4, 29, 26, 16, 24, 27, 5, 23, 21, 10, 9,
+        15, 11, 25, 0, 6,
+    ];
+    assert_eq!(
+        averaging_ctr_permutation(30, 1, 0),
+        q_expected.to_vec(),
+        "pc1 averaging CTR order Q must match the self-consistent fixture"
+    );
+}
+
+#[test]
+fn averaging_ctr_permutation_reproduces_self_consistent_q_pc4() {
+    // pc4: permutation_count == 4 ⇒ learning_folds == max(1, 4-1) == 3. The
+    // averaging shuffle is the 3rd full shuffle on the persistent stream (S is the
+    // 0th), NOT the 05-17 single-`gen_rand`-per-fold compensating hack.
+    let q_expected: [i32; 30] = [
+        24, 27, 11, 9, 6, 26, 8, 17, 15, 0, 14, 18, 28, 19, 3, 20, 25, 23, 29, 2, 13, 1, 16, 21, 5,
+        10, 4, 22, 7, 12,
+    ];
+    assert_eq!(
+        averaging_ctr_permutation(30, 3, 0),
+        q_expected.to_vec(),
+        "pc4 averaging CTR order Q must match the self-consistent fixture"
+    );
+}
+
+#[test]
+fn averaging_ctr_permutation_composes_s_with_p_avg() {
+    // Structural identity: Q[k] == S[P_avg[k]], where S is shuffle #0 and P_avg is
+    // shuffle #learning_folds on the SAME persistent stream.
+    let n = 30;
+    let seed = 0;
+    let lf = 3;
+    let s = create_shuffled_indices(n, seed);
+    let p_avg = permutations(n, lf + 1, seed)[lf].clone();
+    let expected: Vec<i32> = p_avg.iter().map(|&p| s[p as usize]).collect();
+    assert_eq!(averaging_ctr_permutation(n, lf, seed), expected);
+    // And it is always a valid permutation of 0..n.
+    assert!(is_permutation_of_range(
+        &averaging_ctr_permutation(n, lf, seed),
+        n
+    ));
+}
+
+#[test]
+fn averaging_ctr_permutation_edge_cases() {
+    // n <= 1 ⇒ identity (no draws).
+    assert_eq!(averaging_ctr_permutation(0, 1, 0), Vec::<i32>::new());
+    assert_eq!(averaging_ctr_permutation(1, 3, 0), vec![0]);
 }
 
 #[test]

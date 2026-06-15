@@ -114,6 +114,7 @@ fn tensor_ctr_params() -> BoostParams {
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: cb_train::score_function_default(),
+        has_time: false,
     }
 }
 

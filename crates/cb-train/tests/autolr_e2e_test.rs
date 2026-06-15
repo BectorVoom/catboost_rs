@@ -96,6 +96,7 @@ fn run_autolr_e2e(
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: cb_compute::EScoreFunction::L2,
+        has_time: false,
         l2_leaf_reg: 3.0,
         random_strength: 0.0,
         boost_from_average,

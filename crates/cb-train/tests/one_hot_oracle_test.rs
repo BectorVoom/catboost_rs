@@ -225,6 +225,7 @@ fn one_hot_predict_matches_oracle_locked_float_reference() {
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: cb_train::score_function_default(),
+        has_time: false,
     };
     let mut float_staged = Vec::new();
     let float_model = train(

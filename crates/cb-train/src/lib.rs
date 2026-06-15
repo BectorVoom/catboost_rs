@@ -49,14 +49,15 @@ pub use fold::{
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 pub use permutation::{
-    create_shuffled_indices, fisher_yates_permutation, fold_block_size, permutations,
-    PERMUTATION_BLOCK_SIZE_THRESHOLD,
+    averaging_ctr_permutation, create_shuffled_indices, fisher_yates_permutation, fold_block_size,
+    permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
 pub use boosting::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
     counter_calc_method_default, ctr_border_count_default, fold_len_multiplier_default,
-    max_ctr_complexity_default, model_size_reg_default, ordered_approx_delta_simple,
+    has_time_default, max_ctr_complexity_default, model_size_reg_default, need_shuffle,
+    ordered_approx_delta_simple,
     permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_with_eval,
     train_with_eval_sets, BoostParams, EBoostingType, EvalSet, Model, ObliviousTree,

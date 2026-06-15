@@ -93,6 +93,7 @@ fn train_scenario(
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: cb_compute::EScoreFunction::L2,
+        has_time: false,
     };
 
     let mut staged = Vec::new();
@@ -199,6 +200,7 @@ fn bootstrap_oracle_bayesian_first_tree() {
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: cb_compute::EScoreFunction::L2,
+        has_time: false,
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 

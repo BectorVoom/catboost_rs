@@ -163,6 +163,60 @@ pub(crate) fn shuffle_in_place(n: usize, rng: &mut TFastRng64) -> Vec<i32> {
     v
 }
 
+/// The ORIGINAL-OBJECT averaging-fold online-CTR order `Q` (ORD-01 / bar (c)):
+/// `Q = [S[p] for p in P_avg]`, where `S = create_shuffled_indices(n, seed)` is
+/// the upstream initial learn-set Fisher-Yates shuffle (`shuffle #0` on the
+/// persistent stream) and `P_avg` is the averaging fold's permutation OVER THE
+/// S-SHUFFLED data.
+///
+/// # Derived RNG mechanism (plan 05-19, instrument-confirmed)
+///
+/// Upstream drives ONE persistent `TRestorableFastRng64(random_seed)` for the
+/// whole run. The shuffles consumed in order are:
+///   * `shuffle #0` = `S` (`ShuffleLearnDataIfNeeded`, the FIRST consumer — zero
+///     pre-draws, `train_model.cpp:1057-1058`); it also IS `Folds[0]`'s draw
+///     budget on the shared stream;
+///   * `shuffle #1 .. #(learning_folds-1)` = the remaining learning folds'
+///     permutations (each a FULL Fisher-Yates over the S-shuffled data);
+///   * `shuffle #learning_folds` = the AveragingFold's permutation `P_avg`.
+///
+/// So `P_avg = permutations(n, learning_folds + 1, seed)[learning_folds]` and
+/// `S = permutations(...)[0]` — both off the SAME stream (NOT a per-fold single
+/// `gen_rand` pre-draw; that was the 05-17 compensating-error hack which matched
+/// the partition COUNTS but produced the wrong per-bucket bin→object assignment).
+/// Composing `Q = [S[p] for p in P_avg]` recovers the TRUE original-object CTR
+/// order: VERIFIED bit-exact against `live_trainer_self_consistent.json`'s
+/// `object_permutation_Q` / `ctr_bins_object_order` for pc=1 (`learning_folds=1`)
+/// AND pc=4 (`learning_folds=3`).
+///
+/// `Q[k]` is the ORIGINAL object index materialized at averaging-CTR position `k`
+/// (feed `Q` straight to [`crate::ctr::materialize_ctr_feature`] — no physical
+/// data shuffle/invert is needed; the order alone carries `S`). `n <= 1` returns
+/// the identity. `learning_folds` is `max(1, permutation_count - 1)`
+/// ([`crate::learning_fold_count`]).
+#[must_use]
+pub fn averaging_ctr_permutation(n: usize, learning_folds: usize, random_seed: u64) -> Vec<i32> {
+    // The persistent stream's shuffles: index 0 is S, index `learning_folds` is
+    // P_avg (the averaging perm over the S-shuffled data). One unified draw stream
+    // SUBSUMES the prior per-fold `gen_rand` pre-draw hack (no compensating advance).
+    let stream = permutations(n, learning_folds.saturating_add(1), random_seed);
+    let s = stream.first();
+    let p_avg = stream.get(learning_folds);
+    match (s, p_avg) {
+        (Some(s), Some(p_avg)) => p_avg
+            .iter()
+            // Q = [S[p] for p in P_avg]: compose the averaging-over-shuffled perm
+            // back through S to land in ORIGINAL object indices. Checked `.get`
+            // only (no raw index); a degenerate out-of-range entry falls back to
+            // the position itself so the result stays a valid permutation.
+            .enumerate()
+            .map(|(k, &p)| s.get(p as usize).copied().unwrap_or(k as i32))
+            .collect(),
+        // n == 0 (empty stream) ⇒ identity (empty); defensive only.
+        _ => (0..n).map(|i| i as i32).collect(),
+    }
+}
+
 /// Generates `permutation_count` fold permutations from a single persistent
 /// `TFastRng64::from_seed(random_seed)`, advancing the draw stream CONTINUOUSLY
 /// across folds (the upstream `TRestorableFastRng64 rand` shared by every
