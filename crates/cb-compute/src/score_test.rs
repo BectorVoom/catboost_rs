@@ -5,8 +5,8 @@ use cb_core::TFastRng64;
 
 use crate::histogram::LeafStats;
 use crate::score::{
-    add_leaf_plain, derivatives_std_dev_from_zero, l2_split_score, random_score_instance,
-    score_st_dev, MINIMAL_SCORE,
+    add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
+    random_score_instance, score_st_dev, MINIMAL_SCORE,
 };
 
 #[test]
@@ -174,4 +174,52 @@ fn random_score_instance_zero_stdev_returns_val_but_still_draws() {
         let _ = cb_core::std_normal(&mut probe);
         probe.gen_rand()
     });
+}
+
+/// Build a 4-leaf candidate from `(sum_weighted_delta, sum_weight)` pairs.
+fn leaves(stats: [(f64, f64); 4]) -> Vec<LeafStats> {
+    stats
+        .iter()
+        .map(|&(sum_weighted_delta, sum_weight)| LeafStats {
+            sum_weighted_delta,
+            sum_weight,
+        })
+        .collect()
+}
+
+#[test]
+fn cosine_picks_upstream_border_where_l2_diverges() {
+    // The pc=1 tensor_ctr_e2e tree-0 second split under the S-order structure CTR
+    // (plan 05-19). der1 = y-0.5, scaled_l2 = l2*(sumW/n) = 3*(30/30) = 3.
+    let scaled_l2 = 3.0;
+    let border2 = leaves([(-3.0, 6.0), (0.0, 0.0), (-0.5, 11.0), (5.5, 13.0)]);
+    let border3 = leaves([(-3.5, 9.0), (0.0, 0.0), (0.0, 8.0), (5.5, 13.0)]);
+    // L2 ranks border 3 ABOVE border 2 (the latent-bug behaviour cb-train shipped).
+    assert!(
+        l2_split_score(&border3, scaled_l2) > l2_split_score(&border2, scaled_l2),
+        "L2 (incorrectly for the default config) prefers border 3"
+    );
+    // Cosine (catboost default) ranks border 2 ABOVE border 3 — matching upstream.
+    assert!(
+        cosine_split_score(&border2, scaled_l2) > cosine_split_score(&border3, scaled_l2),
+        "Cosine must prefer border 2 (the upstream split), reversing L2's choice"
+    );
+}
+
+#[test]
+fn cosine_is_l2_numerator_over_sqrt_denominator() {
+    let scaled_l2 = 3.0;
+    let cand = leaves([(-3.0, 6.0), (1.0, 2.0), (-0.5, 11.0), (5.5, 13.0)]);
+    let num = l2_split_score(&cand, scaled_l2);
+    let mut den = 1e-100;
+    for s in &cand {
+        let avg = s.sum_weighted_delta / (s.sum_weight + scaled_l2);
+        den += avg * avg * s.sum_weight;
+    }
+    let expected = num / den.sqrt();
+    let got = cosine_split_score(&cand, scaled_l2);
+    assert!(
+        (got - expected).abs() <= 1e-12,
+        "cosine == DP/sqrt(D2): got {got}, expected {expected}"
+    );
 }

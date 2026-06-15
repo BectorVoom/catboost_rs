@@ -54,6 +54,36 @@ pub fn l2_split_score(leaves: &[LeafStats], scaled_l2: f64) -> f64 {
     sum_f64(&terms)
 }
 
+/// The total **Cosine** score for a candidate split — catboost's DEFAULT
+/// `score_function` (`oblivious_tree_options.cpp:22 EScoreFunction::Cosine`).
+///
+/// `TCosineScoreCalcer` (`score_calcers.h:47-72`) accumulates a `{DP, D2}` pair
+/// per split — `DP += leafApprox * SumWeightedDelta`, `D2 += leafApprox² *
+/// SumWeight`, seeded `{0, 1e-100}` — and the final score is `DP / sqrt(D2)`. The
+/// `leafApprox` is the SAME leaf value the L2 calcer uses
+/// (`avg = CalcAverage(SumWeightedDelta, SumWeight, scaled_l2)`), so the numerator
+/// `DP` is exactly the [`l2_split_score`] fold; only the `sqrt(D2)` normalization
+/// differs. The `1e-100` seed (a) avoids a divide-by-zero on an all-empty split and
+/// (b) is far below f64 resolution relative to any real `avg²·SumWeight` term, so it
+/// does not perturb the ≤1e-5 parity. A higher score is a better split.
+///
+/// Like L2, every fold routes through [`sum_f64`] (D-08); the `1e-100` seed is the
+/// first summand so the accumulation order mirrors upstream's seeded `Scores[1]`.
+#[must_use]
+pub fn cosine_split_score(leaves: &[LeafStats], scaled_l2: f64) -> f64 {
+    // Numerator DP == the L2 score fold (sum of avg * SumWeightedDelta).
+    let numerator = l2_split_score(leaves, scaled_l2);
+    // Denominator D2 = 1e-100 (the seed, first summand) + sum(avg² * SumWeight).
+    let mut den_terms: Vec<f64> = Vec::with_capacity(leaves.len() + 1);
+    den_terms.push(1e-100);
+    for &stats in leaves {
+        let avg = calc_average(stats.sum_weighted_delta, stats.sum_weight, scaled_l2);
+        den_terms.push(avg * avg * stats.sum_weight);
+    }
+    let denominator = sum_f64(&den_terms);
+    numerator / denominator.sqrt()
+}
+
 // ----------------------------------------------------------------------------
 // random_strength split-score perturbation (TRAIN-05).
 //
