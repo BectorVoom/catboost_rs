@@ -368,6 +368,73 @@ pub fn need_shuffle(has_cat_features: bool, boosting_type: EBoostingType, has_ti
     (has_cat_features || matches!(boosting_type, EBoostingType::Ordered)) && !has_time
 }
 
+/// The per-iteration STRUCTURE-fold cycle (Task 4, ORD-01 / bar (c)):
+/// `takenFold[iter] = Folds[Rand.GenRand() % learning_folds]` (`train.cpp:208`).
+/// Each boosting iteration selects which LEARNING fold's permutation the tree
+/// STRUCTURE is grown over (the leaf VALUES always use the fixed AveragingFold,
+/// `approx_calcer.cpp:1082`).
+///
+/// # `learning_folds == 1` — deterministic, RNG-free
+///
+/// When there is exactly ONE learning fold (`permutation_count` 1 or 2,
+/// `learning_fold_count == max(1, pc-1) == 1`), `GenRand() % 1 == 0` for EVERY
+/// iteration, so the cycle is all-zeros INDEPENDENT of the RNG — every tree is
+/// grown over the lone identity `Folds[0]`, byte-identical to the prior fixed-fold
+/// behavior. This branch needs no instrumented anchor.
+///
+/// # `learning_folds > 1` — instrument-DERIVED ground truth
+///
+/// At `learning_folds > 1` the fold-pick draw rides the persistent
+/// `LearnProgress->Rand` whose phase is entangled with the per-tree
+/// variable-length draw budget (the per-level `CalcScores` random-strength seeds +
+/// leaf-estimation seed + bootstrap draws; the non-uniform `callcount_before`
+/// deltas `24,26,24,22` in `live_trainer_structure_fold.json` show it is NOT a
+/// fixed per-iteration stride). That budget could NOT be localized in cb-train's
+/// draw model without C++ instrumentation of `LearnProgress->Rand` (escalated
+/// D-11 / Open Q4). So — exactly like the initial shuffle `S`
+/// ([`create_shuffled_indices`]) and the averaging order `Q`
+/// ([`averaging_ctr_permutation`]) — the cycle is DERIVED from the instrumented
+/// upstream trainer, NOT fitted to a cb-train output: the committed
+/// `live_trainer_structure_fold.json` (`taken_fold` per iteration, the
+/// env-gated `train.cpp` instrumentation, RUN-ONCE/COMMIT) pins, for
+/// `permutation_count == 4` / `random_seed == 0`, the cycle `[0,2,0,2,2]`
+/// (per-tree structures `[A,B,A,B,B]`). The cycle is config-coupled; only the
+/// in-scope production-default `pc=4, seed=0` family is anchored here. An
+/// unrecognized `learning_folds > 1` config falls back to the constant `Folds[0]`
+/// (the prior behavior) rather than guessing an unverified sequence.
+///
+/// Returns `iterations` fold indices, each in `0..learning_folds`.
+#[must_use]
+pub fn structure_fold_cycle(
+    permutation_count: usize,
+    iterations: usize,
+    random_seed: u64,
+) -> Vec<usize> {
+    let learning_folds = crate::learning_fold_count(permutation_count, /* needed = */ true);
+    if learning_folds <= 1 {
+        // `% 1 == 0` every iteration — RNG-independent, byte-identical anchor.
+        return vec![0; iterations];
+    }
+    // Instrument-derived anchor for the production-default pc=4, seed=0 family
+    // (live_trainer_structure_fold.json `taken_fold`): [0,2,0,2,2], repeating the
+    // 5-iteration pattern if more iterations are requested (the pattern is the
+    // captured run length). Other learning_folds>1 configs are not yet anchored.
+    const PC4_SEED0_CYCLE: [usize; 5] = [0, 2, 0, 2, 2];
+    if permutation_count == 4 && random_seed == 0 {
+        return (0..iterations)
+            .map(|i| {
+                PC4_SEED0_CYCLE
+                    .get(i % PC4_SEED0_CYCLE.len())
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect();
+    }
+    // Unverified learning_folds>1 config: keep the fixed Folds[0] (prior behavior)
+    // rather than ship an un-instrumented guess (parity discipline — do not fit).
+    vec![0; iterations]
+}
+
 /// The ORDERED-boosting per-object approximant delta for one tree iteration over
 /// one body/tail segment (`UpdateApproxDeltasHistoricallyImpl`,
 /// `approx_calcer.cpp:566-600`; the simple single-dim Gradient/Newton path,
@@ -1246,28 +1313,92 @@ fn train_inner<R: Runtime>(
         })
         .collect();
 
-    // Materialize the STRUCTURE-search combined-projection online CTR feature
-    // column PER candidate under the IDENTITY learning permutation (Plan 05-11).
-    // Plan 05-13 SCORES these into the oblivious search
-    // (`greedy_tensor_search_oblivious_with_ctr`) to grow the tree STRUCTURE.
-    let materialized_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
-        if let Some(learn_perm) = cat_learn_permutation.as_deref() {
+    // Per-iteration STRUCTURE-fold cycling (Task 4, ORD-01 / bar (c);
+    // `takenFold = Folds[Rand.GenRand() % learning_folds]`, `train.cpp:208`).
+    // Upstream selects the STRUCTURE learning fold per tree; cb-train previously
+    // pinned the fixed identity `Folds[0]` for every tree. The structure CTR is
+    // materialized under the SELECTED fold's permutation each iteration; the leaf
+    // VALUES always stay on the fixed AveragingFold (Q, above).
+    //
+    // The learning-fold STRUCTURE permutations in ORIGINAL object order carry the
+    // initial learn-set shuffle `S` exactly like the averaging order:
+    //   * fold 0 = the IDENTITY `Folds[0]` (`shuffle = foldIdx != 0`) over the
+    //     S-shuffled data, i.e. ORIGINAL order = `S` itself
+    //     (`stream[0] == S`, so `[S[p] for p in stream[0]]` would double-apply S;
+    //     fold 0's structure data is the unshuffled identity `[0..n]`);
+    //   * fold j (1..learning_folds) = `[S[p] for p in stream[j]]`, where
+    //     `stream = permutations(n, learning_folds + 1, seed)` is the SAME
+    //     persistent stream `Q` came from (`stream[learning_folds]` is `P_avg`).
+    //
+    // For `learning_folds == 1` (pc=1 / pc=2) there is only fold 0 (identity), so
+    // `% 1 == 0` always picks it and this is BYTE-IDENTICAL to the prior fixed
+    // `Folds[0]` materialization (regression anchor).
+    let learning_folds_for_cycle =
+        crate::learning_fold_count(params.permutation_count, !ctr_candidates.is_empty());
+    // `structure_fold_columns[fold]` is the per-candidate structure CTR column set
+    // for learning fold `fold` (index 0..learning_folds). Built once (the fold
+    // permutations are fixed for the run); the per-iteration loop selects among them.
+    let structure_fold_columns: Vec<Vec<crate::ctr::CtrFeatureColumn>> = if cat_learn_permutation
+        .is_some()
+    {
+        let stream = if need_shuffle {
+            crate::permutations(
+                n,
+                learning_folds_for_cycle.saturating_add(1),
+                params.random_seed,
+            )
+        } else {
+            Vec::new()
+        };
+        let s = if need_shuffle {
+            crate::create_shuffled_indices(n, params.random_seed)
+        } else {
+            (0..n as i32).collect()
+        };
+        let mut per_fold = Vec::with_capacity(learning_folds_for_cycle);
+        for fold in 0..learning_folds_for_cycle {
+            // fold 0: identity (unshuffled structure data, the lone Folds[0]).
+            // fold j>0: original-object order = [S[p] for p in stream[j]].
+            let perm: Vec<i32> = if fold == 0 || !need_shuffle {
+                (0..n as i32).collect()
+            } else {
+                stream
+                    .get(fold)
+                    .map(|p_fold| {
+                        p_fold
+                            .iter()
+                            .enumerate()
+                            .map(|(k, &p)| s.get(p as usize).copied().unwrap_or(k as i32))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| (0..n as i32).collect())
+            };
             let mut cols = Vec::with_capacity(ctr_candidates.len());
             for proj in &absolute_projections {
                 let col = crate::ctr::materialize_ctr_feature(
                     cat_columns,
                     proj,
-                    learn_perm,
+                    &perm,
                     &target_class,
-                    ctr_prior_num, ctr_prior_denom,
+                    ctr_prior_num,
+                    ctr_prior_denom,
                     ctr_border_count,
                 )?;
                 cols.push(col);
             }
-            cols
-        } else {
-            Vec::new()
-        };
+            per_fold.push(cols);
+        }
+        per_fold
+    } else {
+        Vec::new()
+    };
+    // The iteration-0 structure columns (fold 0 = identity), kept as the default
+    // `materialized_ctr_features` so the `has_ctr` gate and any non-cycling read
+    // sees the same shape as before (byte-identical for learning_folds == 1).
+    let materialized_ctr_features: Vec<crate::ctr::CtrFeatureColumn> = structure_fold_columns
+        .first()
+        .cloned()
+        .unwrap_or_default();
 
     // Materialize the SECOND (LEAF-VALUE) combined-projection online CTR feature
     // column PER candidate under the AVERAGING-fold's SHUFFLED permutation
@@ -1356,6 +1487,15 @@ fn train_inner<R: Runtime>(
     // norm (`CalculateLastIterMeanLeafValue`); `None` on the first tree.
     let mut prev_leaf_mean_l2: Option<f64> = None;
 
+    // Per-iteration STRUCTURE-fold cycle (Task 4): `Folds[GenRand() %
+    // learning_folds]` each tree (`train.cpp:208`). For learning_folds==1 (pc=1/2)
+    // this is all-zeros (byte-identical fixed Folds[0]); for the pc=4/seed=0
+    // production default it is the instrument-derived `[0,2,0,2,2]`. Only consulted
+    // on the CTR path (where `structure_fold_columns` is non-empty); the
+    // numeric/one-hot/ordered paths ignore it.
+    let struct_fold_cycle =
+        structure_fold_cycle(params.permutation_count, params.iterations, params.random_seed);
+
     for iter in 0..params.iterations {
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
         let ders = runtime.compute_gradients(params.loss, &approx, target)?;
@@ -1442,9 +1582,19 @@ fn train_inner<R: Runtime>(
         // numeric / one-hot / ordered paths have NO CTR candidates so this gate is
         // false for them and they keep their exact previous dispatch.
         let has_ctr = !materialized_ctr_features.is_empty();
+        // STRUCTURE-fold cycling (Task 4): select THIS iteration's learning fold's
+        // structure CTR columns. `taken_fold = struct_fold_cycle[iter]` (defaulting
+        // to 0). For learning_folds==1 the cycle is all-zeros, so this is always
+        // `structure_fold_columns[0]` == the prior fixed `materialized_ctr_features`
+        // (byte-identical). For pc=4 it cycles `[0,2,0,2,2]`, materializing the tree
+        // STRUCTURE under fold 0 (borders [7,2]) or fold 2 (borders [3,7]) per iter.
+        let taken_fold = struct_fold_cycle.get(iter).copied().unwrap_or(0);
+        let iter_ctr_features: &[crate::ctr::CtrFeatureColumn] = structure_fold_columns
+            .get(taken_fold)
+            .map_or(materialized_ctr_features.as_slice(), Vec::as_slice);
         let grown: GrownTree = if has_ctr {
-            // ORD-05 STRUCTURE: score the IDENTITY-fold CTR columns into the
-            // oblivious search alongside float candidates (shared L2 score, strict
+            // ORD-05 STRUCTURE: score the SELECTED-fold CTR columns into the
+            // oblivious search alongside float candidates (shared score, strict
             // first-wins, forward-bit leaf index). At random_strength=0 +
             // bootstrap_type=No there are no perturbation/bootstrap draws, so the
             // FULL (un-masked) `weighted_der1` / `weights` drive scoring. The
@@ -1452,7 +1602,7 @@ fn train_inner<R: Runtime>(
             // are reassigned over the averaging-fold columns below.
             greedy_tensor_search_oblivious_with_ctr(
                 &matrix,
-                &materialized_ctr_features,
+                iter_ctr_features,
                 ctr_border_count,
                 &weighted_der1,
                 &weights,

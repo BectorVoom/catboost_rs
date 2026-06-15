@@ -57,7 +57,7 @@ pub use boosting::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
     counter_calc_method_default, ctr_border_count_default, fold_len_multiplier_default,
     has_time_default, max_ctr_complexity_default, model_size_reg_default, need_shuffle,
-    ordered_approx_delta_simple,
+    ordered_approx_delta_simple, structure_fold_cycle,
     permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_with_eval,
     train_with_eval_sets, BoostParams, EBoostingType, EvalSet, Model, ObliviousTree,
