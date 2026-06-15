@@ -230,3 +230,12 @@ weakened. Committed: the self-consistent oracle + blocker annotation + README
 update. Closing bar (c) requires porting `S` (the data-provider quantized-object
 storage order) into cb-train — a research-grade subsystem, a new plan. Bars
 (a),(b),(d),(e) remain green.
+
+**UPDATE (2026-06-15) — bar (c) is FEASIBLE; user chose to port S.** Follow-up
+investigation found `S` is NOT research-grade: it is catboost's initial learn-set
+Fisher-Yates shuffle (`preprocess.cpp:183 ShuffleLearnDataIfNeeded` →
+`NCB::Shuffle`/`CreateShuffledIndices`, seeded by `random_seed`, applied before fold
+creation whenever `catFeatureCount > 0`). Port = apply this shuffle in `train_cat`
+before `create_folds`, thread its RNG draws (subsumes the cc=29/87 pre-draw hack), and
+map predictions back to object order. Full gap-source + scope + no-regression
+constraints: `05-BAR-C-S-SHUFFLE-RESEARCH.md`. Next: a planned bar-(c) closure plan.
