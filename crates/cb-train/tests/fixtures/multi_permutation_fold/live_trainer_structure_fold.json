@@ -1,0 +1,389 @@
+{
+  "catboost_version": "1.2.10",
+  "scenario": "multi_permutation_fold (tensor_ctr_e2e config family, N=30, seed=0, thread_count=1)",
+  "requirement": "ORD-01 / SC-1 bar (c)",
+  "authorization": "2026-06-15 CONTEXT decision revision (user-approved LIVE-trainer C++ instrumentation, scoped to the pc=4 AveragingFold boosting gap). Built an instrumented catboost 1.2.10 _catboost extension (train.cpp patched, env-gated CB_INSTRUMENT_LOG) and ran the pc={1,2,4} fit RUN-ONCE/COMMIT.",
+  "discovered_rule": "Per boosting iteration the STRUCTURE fold is selected as Folds[Rand.GenRand() % foldCount] where foldCount==LearningFoldCount (train.cpp:208). Leaf VALUES always use the FIXED AveragingFold (approx_calcer.cpp:1082). At pc=1/pc=2 foldCount==1 so the structure fold is ALWAYS Folds[0] (every tree identical -> [6,0,7,17], byte-identical to the prior fixed-fold behavior). At pc=4 foldCount==3 and the per-iteration structure fold cycles [0,2,0,2,2], producing tree structures [A,B,A,B,B] = [6,0,10,14],[8,8,0,14],[6,0,10,14],[8,8,0,14],[8,8,0,14].",
+  "leaf_values_note": "leaf_values_raw is the catboost pre-NormalizeLeafValues per-leaf delta (before *learning_rate). The committed predictions_pc4.npy is the post-training RawFormulaVal; the Rust e2e oracle checks predictions, not these raw deltas.",
+  "note": "Ground truth from instrument_fold_rng_live (train.cpp instrumentation). RUN-ONCE/COMMIT; CI reads THIS file, never the live trainer (D-09/D-12). Anchor for the structure-fold cycling rule ported into cb_train::boosting.rs::train_cat.",
+  "per_pc": {
+    "1": {
+      "permutation_count": 1,
+      "learning_fold_count": 1,
+      "iterations": [
+        {
+          "iter": 0,
+          "fold_count": 1,
+          "callcount_before": 58,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3333333333,
+              0,
+              -0.05,
+              0.275
+            ]
+          ]
+        },
+        {
+          "iter": 1,
+          "fold_count": 1,
+          "callcount_before": 90,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.327778292,
+              0,
+              -0.04912500181,
+              0.2691566182
+            ]
+          ]
+        },
+        {
+          "iter": 2,
+          "fold_count": 1,
+          "callcount_before": 114,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3223188175,
+              0,
+              -0.04826532665,
+              0.2634395242
+            ]
+          ]
+        },
+        {
+          "iter": 3,
+          "fold_count": 1,
+          "callcount_before": 140,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3169560228,
+              0,
+              -0.04742071591,
+              0.257847903
+            ]
+          ]
+        },
+        {
+          "iter": 4,
+          "fold_count": 1,
+          "callcount_before": 166,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3116907148,
+              0,
+              -0.04659091449,
+              0.252380707
+            ]
+          ]
+        }
+      ]
+    },
+    "2": {
+      "permutation_count": 2,
+      "learning_fold_count": 1,
+      "iterations": [
+        {
+          "iter": 0,
+          "fold_count": 1,
+          "callcount_before": 58,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3333333333,
+              0,
+              -0.05,
+              0.275
+            ]
+          ]
+        },
+        {
+          "iter": 1,
+          "fold_count": 1,
+          "callcount_before": 90,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.327778292,
+              0,
+              -0.04912500181,
+              0.2691566182
+            ]
+          ]
+        },
+        {
+          "iter": 2,
+          "fold_count": 1,
+          "callcount_before": 114,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3223188175,
+              0,
+              -0.04826532665,
+              0.2634395242
+            ]
+          ]
+        },
+        {
+          "iter": 3,
+          "fold_count": 1,
+          "callcount_before": 140,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3169560228,
+              0,
+              -0.04742071591,
+              0.257847903
+            ]
+          ]
+        },
+        {
+          "iter": 4,
+          "fold_count": 1,
+          "callcount_before": 166,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            7,
+            17
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3116907148,
+              0,
+              -0.04659091449,
+              0.252380707
+            ]
+          ]
+        }
+      ]
+    },
+    "4": {
+      "permutation_count": 4,
+      "learning_fold_count": 3,
+      "iterations": [
+        {
+          "iter": 0,
+          "fold_count": 3,
+          "callcount_before": 116,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            10,
+            14
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3333333333,
+              0,
+              0,
+              0.2941176471
+            ]
+          ]
+        },
+        {
+          "iter": 1,
+          "fold_count": 3,
+          "callcount_before": 140,
+          "taken_fold": 2,
+          "split_bin_borders": [
+            3,
+            7
+          ],
+          "sum_leaf_weights": [
+            8,
+            8,
+            0,
+            14
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3590913299,
+              0.09090909091,
+              0,
+              0.2880627201
+            ]
+          ]
+        },
+        {
+          "iter": 2,
+          "fold_count": 3,
+          "callcount_before": 166,
+          "taken_fold": 0,
+          "split_bin_borders": [
+            7,
+            2
+          ],
+          "sum_leaf_weights": [
+            6,
+            0,
+            10,
+            14
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3217975308,
+              0,
+              -1.761965712e-05,
+              0.2821349648
+            ]
+          ]
+        },
+        {
+          "iter": 3,
+          "fold_count": 3,
+          "callcount_before": 190,
+          "taken_fold": 2,
+          "split_bin_borders": [
+            3,
+            7
+          ],
+          "sum_leaf_weights": [
+            8,
+            8,
+            0,
+            14
+          ],
+          "leaf_values_raw": [
+            [
+              -0.348185766,
+              0.08925653006,
+              0,
+              0.2763339889
+            ]
+          ]
+        },
+        {
+          "iter": 4,
+          "fold_count": 3,
+          "callcount_before": 212,
+          "taken_fold": 2,
+          "split_bin_borders": [
+            3,
+            7
+          ],
+          "sum_leaf_weights": [
+            8,
+            8,
+            0,
+            14
+          ],
+          "leaf_values_raw": [
+            [
+              -0.3418731202,
+              0.08763376123,
+              0,
+              0.2706591191
+            ]
+          ]
+        }
+      ]
+    }
+  }
+}
