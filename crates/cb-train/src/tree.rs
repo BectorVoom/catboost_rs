@@ -30,9 +30,20 @@
 //! `unwrap`/`expect`/raw float fold (deny-lints + D-08).
 
 use cb_compute::{
-    l2_split_score, random_score_instance, reduce_leaf_stats, scale_l2_reg, LeafStats,
-    MINIMAL_SCORE,
+    cosine_split_score, l2_split_score, random_score_instance, reduce_leaf_stats, scale_l2_reg,
+    EScoreFunction, LeafStats, MINIMAL_SCORE,
 };
+
+/// Dispatch the configured split-score calcer over reduced leaf statistics.
+/// catboost CPU supports exactly Cosine (default) and L2
+/// (`score_calcers.h`); selected per-config via [`EScoreFunction`].
+#[inline]
+fn split_score(score_function: EScoreFunction, leaves: &[LeafStats], scaled_l2: f64) -> f64 {
+    match score_function {
+        EScoreFunction::Cosine => cosine_split_score(leaves, scaled_l2),
+        EScoreFunction::L2 => l2_split_score(leaves, scaled_l2),
+    }
+}
 use cb_core::{CbError, CbResult, TFastRng64};
 
 use crate::fold::{body_sum_weights, body_tail_segments};
@@ -354,13 +365,14 @@ fn score_candidate(
     weight: &[f64],
     scaled_l2: f64,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> f64 {
     let mut splits = chosen.to_vec();
     splits.push(candidate);
     let n_leaves = 1usize << splits.len();
     let leaf_of = assign_leaves(matrix, &splits, n_objects);
     let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
-    l2_split_score(&stats, scaled_l2)
+    split_score(score_function, &stats, scaled_l2)
 }
 
 /// Grow one oblivious tree of depth `depth` with the strict first-wins greedy
@@ -383,11 +395,12 @@ pub fn greedy_tensor_search_oblivious(
     scaled_l2: f64,
     depth: usize,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> CbResult<GrownTree> {
     // The unperturbed path is `random_strength == 0` with no RNG draws — exactly
     // the first-slice behaviour. Delegate to the perturbed search with `None`.
     greedy_tensor_search_oblivious_perturbed(
-        matrix, der1, weight, scaled_l2, depth, n_objects, None,
+        matrix, der1, weight, scaled_l2, depth, n_objects, None, score_function,
     )
 }
 
@@ -440,6 +453,7 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     depth: usize,
     n_objects: usize,
     mut perturb: Option<Perturbation<'_>>,
+    score_function: EScoreFunction,
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
@@ -447,10 +461,12 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 
     for _level in 0..depth {
         let best = match perturb.as_mut() {
-            None => select_level_plain(matrix, &chosen, der1, weight, scaled_l2, n_objects)?,
-            Some(p) => {
-                select_level_perturbed(matrix, &chosen, der1, weight, scaled_l2, n_objects, p)?
-            }
+            None => select_level_plain(
+                matrix, &chosen, der1, weight, scaled_l2, n_objects, score_function,
+            )?,
+            Some(p) => select_level_perturbed(
+                matrix, &chosen, der1, weight, scaled_l2, n_objects, p, score_function,
+            )?,
         };
         chosen.push(best);
     }
@@ -483,6 +499,7 @@ fn select_level_plain(
     weight: &[f64],
     scaled_l2: f64,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> CbResult<Split> {
     let mut candidates: Vec<Candidate> = Vec::new();
     for feature in 0..matrix.n_features() {
@@ -496,6 +513,7 @@ fn select_level_plain(
                 weight,
                 scaled_l2,
                 n_objects,
+                score_function,
             );
             candidates.push(Candidate {
                 feature,
@@ -524,6 +542,7 @@ fn select_level_perturbed(
     scaled_l2: f64,
     n_objects: usize,
     perturb: &mut Perturbation<'_>,
+    score_function: EScoreFunction,
 ) -> CbResult<Split> {
     let std_dev = perturb.score_st_dev;
 
@@ -560,6 +579,7 @@ fn select_level_perturbed(
                 weight,
                 scaled_l2,
                 n_objects,
+                score_function,
             );
             // scoreInstance = scoreWoNoise + std_normal(featRng) * scoreStDev.
             let instance = random_score_instance(raw, std_dev, &mut feat_rng);
@@ -959,6 +979,7 @@ fn assign_leaves_ctr_aware(
 /// candidate, assign leaves, reduce per-leaf stats (ordered), and fold the SAME
 /// L2 score the float path uses (`l2_split_score` over `reduce_leaf_stats` — NOT
 /// a forked scorer).
+#[allow(clippy::too_many_arguments)]
 fn score_candidate_ctr_aware(
     matrix: &FeatureMatrix,
     ctr_features: &[crate::ctr::CtrFeatureColumn],
@@ -968,13 +989,14 @@ fn score_candidate_ctr_aware(
     weight: &[f64],
     scaled_l2: f64,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> f64 {
     let mut splits = chosen.to_vec();
     splits.push(candidate);
     let n_leaves = 1usize << splits.len();
     let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, &splits, n_objects);
     let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
-    l2_split_score(&stats, scaled_l2)
+    split_score(score_function, &stats, scaled_l2)
 }
 
 /// One level of the CTR-aware UNPERTURBED search: enumerate FLOAT candidates
@@ -1011,6 +1033,7 @@ fn select_level_ctr_aware(
     scaled_l2: f64,
     n_objects: usize,
     model_size_reg: f64,
+    score_function: EScoreFunction,
 ) -> CbResult<CtrAwareSplit> {
     let mut scored: Vec<(CtrAwareSplit, f64)> = Vec::new();
 
@@ -1021,6 +1044,7 @@ fn select_level_ctr_aware(
             let split = CtrAwareSplit::Float(Split { feature, border });
             let score = score_candidate_ctr_aware(
                 matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
+                score_function,
             );
             scored.push((split, score));
         }
@@ -1073,6 +1097,7 @@ fn select_level_ctr_aware(
             let score = cat_weight
                 * score_candidate_ctr_aware(
                     matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
+                    score_function,
                 );
             scored.push((split, score));
         }
@@ -1134,6 +1159,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
     n_objects: usize,
     target_border_idx: usize,
     model_size_reg: f64,
+    score_function: EScoreFunction,
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
@@ -1149,6 +1175,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
             scaled_l2,
             n_objects,
             model_size_reg,
+            score_function,
         )?;
         chosen.push(best);
     }
@@ -1256,13 +1283,14 @@ fn score_candidate_any(
     weight: &[f64],
     scaled_l2: f64,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> f64 {
     let mut splits = chosen.to_vec();
     splits.push(candidate);
     let n_leaves = 1usize << splits.len();
     let leaf_of = assign_leaves_any(matrix, &splits, n_objects);
     let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
-    l2_split_score(&stats, scaled_l2)
+    split_score(score_function, &stats, scaled_l2)
 }
 
 /// One level of the categorical UNPERTURBED search: enumerate FLOAT candidates
@@ -1279,6 +1307,7 @@ fn select_level_one_hot(
     weight: &[f64],
     scaled_l2: f64,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> CbResult<AnySplit> {
     let mut scored: Vec<(AnySplit, f64)> = Vec::new();
 
@@ -1287,8 +1316,9 @@ fn select_level_one_hot(
         let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
         for &border in borders {
             let split = AnySplit::Float(Split { feature, border });
-            let score =
-                score_candidate_any(matrix, chosen, split, der1, weight, scaled_l2, n_objects);
+            let score = score_candidate_any(
+                matrix, chosen, split, der1, weight, scaled_l2, n_objects, score_function,
+            );
             scored.push((split, score));
         }
     }
@@ -1301,8 +1331,9 @@ fn select_level_one_hot(
         let bins = matrix.cat_bins.get(feature).map_or(&[][..], Vec::as_slice);
         for value in distinct_bins_ascending(bins) {
             let split = AnySplit::OneHot(OneHotSplit { feature, value });
-            let score =
-                score_candidate_any(matrix, chosen, split, der1, weight, scaled_l2, n_objects);
+            let score = score_candidate_any(
+                matrix, chosen, split, der1, weight, scaled_l2, n_objects, score_function,
+            );
             scored.push((split, score));
         }
     }
@@ -1340,11 +1371,14 @@ pub fn grow_one_hot_tree(
     scaled_l2: f64,
     depth: usize,
     n_objects: usize,
+    score_function: EScoreFunction,
 ) -> CbResult<GrownOneHotTree> {
     check_depth(depth)?;
     let mut chosen: Vec<AnySplit> = Vec::with_capacity(depth);
     for _level in 0..depth {
-        let best = select_level_one_hot(matrix, &chosen, der1, weight, scaled_l2, n_objects)?;
+        let best = select_level_one_hot(
+            matrix, &chosen, der1, weight, scaled_l2, n_objects, score_function,
+        )?;
         chosen.push(best);
     }
     let leaf_of = assign_leaves_any(matrix, &chosen, n_objects);

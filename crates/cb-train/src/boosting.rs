@@ -218,6 +218,13 @@ pub struct BoostParams {
     /// `+PriorDenom` coincide, RESEARCH A6). Pinned EXPLICITLY
     /// ([`combinations_ctr_priors_default`]).
     pub combinations_ctr_priors: Vec<f64>,
+    /// The split-score function the greedy tree search uses (catboost CPU default
+    /// [`cb_compute::EScoreFunction::Cosine`], `oblivious_tree_options.cpp:22`).
+    /// cb-train historically hardcoded L2 — a latent parity gap exposed by the
+    /// initial learn-set shuffle `S`. Pinned EXPLICITLY
+    /// ([`score_function_default`]); only the regression-skeleton / eval-metric /
+    /// leaf-method fixtures set it to `L2`.
+    pub score_function: cb_compute::EScoreFunction,
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -318,6 +325,16 @@ pub fn ctr_border_count_default() -> usize {
 #[must_use]
 pub fn model_size_reg_default() -> f64 {
     0.5
+}
+
+/// The canonical default split-score function ([`cb_compute::EScoreFunction::Cosine`],
+/// the catboost CPU default — `oblivious_tree_options.cpp:22`). Pinned EXPLICITLY
+/// at every `BoostParams` construction site (RESEARCH Pitfall 6 — never
+/// auto-selected); only the regression-skeleton / eval-metric / leaf-method
+/// fixtures override to `L2`.
+#[must_use]
+pub fn score_function_default() -> cb_compute::EScoreFunction {
+    cb_compute::EScoreFunction::Cosine
 }
 
 /// The ORDERED-boosting per-object approximant delta for one tree iteration over
@@ -1401,6 +1418,7 @@ fn train_inner<R: Runtime>(
                 // candidates so a new {0,1} combination does not out-score a second
                 // border on an already-used {0} simple CTR on a thin margin.
                 model_size_reg_default(),
+                params.score_function,
             )?
         } else {
             match ordered_learning_perm.as_deref() {
@@ -1433,6 +1451,7 @@ fn train_inner<R: Runtime>(
                     params.depth,
                     n,
                     perturb,
+                    params.score_function,
                 )?,
             }
         };

@@ -136,8 +136,16 @@ fn train_one_hot_only(
             feature_borders: &no_borders,
             cat_bins: &cat_cols,
         };
-        let grown = grow_one_hot_tree(&matrix, &weighted_der1, &weights, scaled_l2, depth, n)
-            .expect("one-hot tree grows");
+        let grown = grow_one_hot_tree(
+            &matrix,
+            &weighted_der1,
+            &weights,
+            scaled_l2,
+            depth,
+            n,
+            cb_compute::EScoreFunction::Cosine,
+        )
+        .expect("one-hot tree grows");
 
         // Gradient leaf deltas over the FULL fold (no sampling), lr-scaled.
         let stats = reduce_leaf_stats(&grown.leaf_of, &weighted_der1, &weights, n_leaves);
@@ -216,6 +224,7 @@ fn one_hot_predict_matches_oracle_locked_float_reference() {
         max_ctr_complexity: cb_train::max_ctr_complexity_default(),
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
+        score_function: cb_train::score_function_default(),
     };
     let mut float_staged = Vec::new();
     let float_model = train(

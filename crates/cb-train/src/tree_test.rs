@@ -79,8 +79,16 @@ fn one_hot_single_split_assigns_by_bin_equality() {
     let der1 = [-1.0, 1.0, -1.0, 1.0];
     let weight = [1.0, 1.0, 1.0, 1.0];
 
-    let GrownOneHotTree { splits, leaf_of } =
-        grow_one_hot_tree(&matrix, &der1, &weight, 0.0, 1, 4).expect("one-hot tree grows");
+    let GrownOneHotTree { splits, leaf_of } = grow_one_hot_tree(
+        &matrix,
+        &der1,
+        &weight,
+        0.0,
+        1,
+        4,
+        cb_compute::EScoreFunction::Cosine,
+    )
+    .expect("one-hot tree grows");
 
     // One split, on categorical feature 0, an equality test on SOME learn-set
     // bin (which bin wins is decided by the L2 score + strict first-wins
@@ -117,5 +125,8 @@ fn one_hot_no_candidates_is_degenerate_not_panic() {
     };
     let der1 = [1.0, -1.0];
     let weight = [1.0, 1.0];
-    assert!(grow_one_hot_tree(&matrix, &der1, &weight, 0.0, 1, 2).is_err());
+    assert!(
+        grow_one_hot_tree(&matrix, &der1, &weight, 0.0, 1, 2, cb_compute::EScoreFunction::Cosine)
+            .is_err()
+    );
 }

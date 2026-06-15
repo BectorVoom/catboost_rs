@@ -74,6 +74,26 @@ pub enum Loss {
     Mae,
 }
 
+/// Which split-score function the greedy tree search uses to rank candidate
+/// splits. catboost's CPU default is [`EScoreFunction::Cosine`]
+/// (`oblivious_tree_options.cpp:22 EScoreFunction::Cosine`); `L2` is the only
+/// other CPU-supported option. cb-train historically hardcoded `L2`, which is a
+/// latent parity gap exposed by the initial learn-set shuffle `S` (pc=1 tree-0
+/// second split: L2 picks border 3, Cosine picks border 2 = upstream).
+///
+/// `Default` is `Cosine` to match catboost; configs that need the regression
+/// skeleton's L2 set it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EScoreFunction {
+    /// Cosine split score (`score_calcers.h:47-72`): `score = sum(leafVal·sumDer)
+    /// / sqrt(sum(count·leafVal²))`. catboost CPU default.
+    #[default]
+    Cosine,
+    /// L2 split score (variance reduction). cb-train's historical hardcoded
+    /// choice; only correct for configs that select it explicitly.
+    L2,
+}
+
 /// The per-object first and second derivatives returned by
 /// [`Runtime::compute_gradients`], UN-reduced (D-02). Parallel to the input
 /// `approx`/`target` slices, in object order.

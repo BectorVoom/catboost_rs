@@ -113,6 +113,7 @@ fn tensor_ctr_params() -> BoostParams {
         max_ctr_complexity: 2,
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
+        score_function: cb_train::score_function_default(),
     }
 }
 

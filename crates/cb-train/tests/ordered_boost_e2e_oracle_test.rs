@@ -102,6 +102,7 @@ fn ordered_params() -> BoostParams {
         max_ctr_complexity: cb_train::max_ctr_complexity_default(),
         combinations_ctr: cb_train::combinations_ctr_default(),
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
+        score_function: cb_compute::EScoreFunction::L2,
     }
 }
 

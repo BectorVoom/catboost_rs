@@ -51,9 +51,19 @@ fn single_full_span_segment_identity_perm_degenerates_to_plain_splits() {
     let matrix = FeatureMatrix::new(&fv, &fb);
     let scaled_l2 = 3.0;
 
-    // Plain whole-fold search (the reference structure).
-    let plain = greedy_tensor_search_oblivious(&matrix, &der1, &weight, scaled_l2, 2, n)
-        .expect("plain search");
+    // Plain whole-fold search (the reference structure). The ordered path scores
+    // with L2 (`score_candidate_ordered`), so the plain reference must too for the
+    // degeneration equality to hold.
+    let plain = greedy_tensor_search_oblivious(
+        &matrix,
+        &der1,
+        &weight,
+        scaled_l2,
+        2,
+        n,
+        cb_compute::EScoreFunction::L2,
+    )
+    .expect("plain search");
 
     // Force a single full-span segment [(n, n)] with body_sum_weight = n (the
     // unweighted whole-fold weight) and the identity permutation. With

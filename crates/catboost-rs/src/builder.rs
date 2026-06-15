@@ -21,8 +21,9 @@ use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
     counter_calc_method_default, fold_len_multiplier_default, max_ctr_complexity_default,
-    one_hot_max_size_default, permutation_count_default, simple_ctr_default,
-    simple_ctr_priors_default, train, BoostParams, EBootstrapType, EOverfittingDetectorType,
+    one_hot_max_size_default, permutation_count_default, score_function_default,
+    simple_ctr_default, simple_ctr_priors_default, train, BoostParams, EBootstrapType,
+    EOverfittingDetectorType,
 };
 
 use crate::error::CatBoostError;
@@ -240,6 +241,9 @@ impl CatBoostBuilder {
             max_ctr_complexity: max_ctr_complexity_default(),
             combinations_ctr: combinations_ctr_default(),
             combinations_ctr_priors: combinations_ctr_priors_default(),
+            // catboost CPU default split-score function (Cosine,
+            // oblivious_tree_options.cpp:22); the facade does not surface it.
+            score_function: score_function_default(),
         }
     }
 
