@@ -1,4 +1,6 @@
 {
+  "superseded_by": "live_trainer_self_consistent.json",
+  "superseded_reason": "Spike-001 (3cee12a) proved this file's (upstream_avg_perm, upstream_avg_ctr_bins_avg_order) pair is INTERNALLY INCONSISTENT under the upstream algorithm: the bins are stored in the CTR materialization order Q (= storage-reorder S o LearnPermutation), but were paired here with upstream_avg_perm=GetLearnPermutationArray()=[11,18,15,29,..] (the leaf-index iteration order, a DIFFERENT order), and LearnTargetClass was never captured. Re-instrumentation (plan 05-18, 2026-06-15) captured the self-consistent (Q, target=LearnTargetClass[1]=binarized-y, bins) tuple atomically in live_trainer_self_consistent.json. DO NOT re-pin against this file. Kept for the Spike-001 evidence trail.",
   "catboost_version": "1.2.10",
   "scenario": "tensor_ctr_e2e config family, pc=4, N=30, seed=0, thread_count=1",
   "authorization": "2026-06-15 CONTEXT decision revision (live-trainer instrumentation, bar (c) toolchain-provision path)",

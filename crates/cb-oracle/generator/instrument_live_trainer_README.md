@@ -92,3 +92,49 @@ At `foldCount==1` the modulo is always 0, so the structure fold is always
 stay byte-identical (no regression). Only at pc>=4 does the per-iteration
 cycling produce per-tree structure variation. The committed ground truth is
 `live_trainer_structure_fold.json`.
+
+## Second instrumentation cycle (Plan 05-18, 2026-06-15) — Spike-001 resolution
+
+**Authorization.** RE-AUTHORIZED by the user 2026-06-15 for a second cycle to
+derive a SELF-CONSISTENT oracle, after Spike 001 proved the first-cycle
+`live_trainer_ctr_bins_blocker.json` was internally inconsistent.
+
+**Two added env-gated (`CB_INSTRUMENT_LOG`) events:**
+
+1. `train.cpp` `self_consistent_ctr` (helper `CbLogSelfConsistentCtr`): for the
+   AveragingFold AND the per-iteration structure (taken) fold, dumps the
+   projection cat-features, `LearnPermutationFeaturesSubset` (via `ForEach`),
+   `GetLearnPermutationArray()`, `LearnTargetClass`, and the `GetData` ui8 bins —
+   all from the SAME fold object.
+2. `online_ctr.cpp` `online_ctr_inputs`: right before `CalcOnlineCTRSimple`, dumps
+   the LITERAL inputs the algorithm consumes — `perm_subset`
+   (`foldLearnPermutationFeaturesSubset`), the reindexed `enumerated` cat features
+   (`hashArr`), and every classifier's `target_classes` (`foldLearnTargetClass`).
+
+**What it revealed (the Spike-001 inconsistency, explained).** The averaging
+online-CTR ui8 bins (`GetData`/`Feature[docIdx]`) are stored in the CTR
+materialization order **Q**, where `Q = S ∘ LearnPermutation` and `S` is the
+catboost quantized data-provider's internal object STORAGE reorder (verified: the
+identity learning fold's `perm_subset == [0..29]` yields a NON-natural object
+cat-sequence). The first cycle paired those bins with
+`GetLearnPermutationArray()` = `[11,18,15,29,…]` — the leaf-index iteration order,
+a DIFFERENT order — and never logged `LearnTargetClass`. Hence inconsistent.
+
+With the atomic capture: the bins ARE the single-cat-0 Borders online prefix
+under order **Q** with target `LearnTargetClass[1]` (= binarized y;
+`LearnTargetClass[0]` is all-zeros / unused). Q reproduces all five tree
+partitions `[6,0,10,14],[8,8,0,14],[6,0,10,14],[8,8,0,14],[8,8,0,14]` bit-exact.
+The self-consistent ground truth is `live_trainer_self_consistent.json`;
+`live_trainer_ctr_bins_blocker.json` is annotated `superseded_by` it.
+
+**Why bar-(c) is DEFERRED (the precise remaining blocker).** pc=4 tree-B borders
+`[3,7]` SPLIT the mixed cat buckets (cat3, cat4), so the leaf VALUES depend on the
+exact per-mixed-bucket bin→object assignment — which is fixed by `S`. cb-train
+materializes CTRs on object-order `X_cat` WITHOUT `S`; the must_haves'
+`[11,18,15,…]` reproduces the pc=4 PARTITION `[8,8,0,14]` but the wrong leaf
+VALUES (leaf1 `sum_y=6` vs upstream `5`, ≫1e-5). Closing bar-(c) requires porting
+`S` (the data-provider quantized-object storage order) into cb-train — a
+research-grade subsystem out of this plan's scope. pc=1 stays green because its
+borders do not split the mixed buckets (leaf composition is order-invariant
+there). Per the authorized FALLBACK: cb-train production is UNTOUCHED, the pc=4
+e2e oracle is UNCOMMITTED, no oracle weakened.

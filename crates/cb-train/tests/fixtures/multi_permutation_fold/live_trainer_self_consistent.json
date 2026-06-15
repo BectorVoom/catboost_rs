@@ -1,0 +1,494 @@
+{
+  "schema": "live_trainer_self_consistent.v1",
+  "catboost_version": "1.2.10",
+  "scenario": "multi_permutation_fold / pc4 bar-(c) self-consistent oracle",
+  "authorization": "D-01 + 2026-06-15 RE-AUTHORIZED second live-trainer instrumentation cycle (plan 05-18). OFFLINE RUN-ONCE/COMMIT; CI reads only this JSON, never the trainer (D-08/D-09).",
+  "spike001_resolution": "The committed live_trainer_ctr_bins_blocker.json paired the averaging online-CTR ui8 bins (stored in CTR materialization order Q) with GetLearnPermutationArray()=[11,18,15,29,..] (the DIFFERENT leaf-index iteration order) and never logged LearnTargetClass \u2014 hence internally inconsistent (Spike-001 VERDICT). Atomically re-instrumented (train.cpp self_consistent_ctr + online_ctr.cpp online_ctr_inputs): the bins ARE the single-cat-0 Borders online prefix under order Q with target=LearnTargetClass[1]=binarized-y; Q reproduces all 5 tree partitions [6,0,10,14],[8,8,0,14],[6,0,10,14],[8,8,0,14],[8,8,0,14] bit-exact.",
+  "bar_c_blocker": "Q = S o LearnPermutation where S is the catboost quantized data-provider's internal object STORAGE reorder (verified: the identity learning fold's perm_subset=[0..29] yields a non-natural object cat-sequence). pc=4 tree-B borders [3,7] SPLIT the mixed cat buckets (cat3,cat4), so leaf VALUES depend on the exact per-mixed-bucket bin->object assignment, which needs S. The must_haves [11,18,15,..] reproduces the pc=4 PARTITION [8,8,0,14] but the wrong leaf VALUES (leaf1 sum_y=6 vs upstream 5). cb-train materializes on object-order X_cat without S; closing bar-(c) requires porting S (data-provider storage order) \u2014 a research-grade subsystem out of scope. pc=1 is green because its borders do not split the mixed buckets (leaf composition invariant to order there).",
+  "storage_reorder_S_object_order": [
+    5,
+    2,
+    6,
+    12,
+    9,
+    28,
+    1,
+    17,
+    29,
+    11,
+    7,
+    3,
+    18,
+    10,
+    4,
+    14,
+    8,
+    19,
+    23,
+    13,
+    27,
+    20,
+    15,
+    26,
+    21,
+    24,
+    16,
+    0,
+    22,
+    25
+  ],
+  "pc1": {
+    "permutation_count": 1,
+    "averaging_fold": {
+      "object_permutation_Q": [
+        5,
+        9,
+        3,
+        2,
+        1,
+        12,
+        17,
+        10,
+        11,
+        28,
+        18,
+        4,
+        6,
+        13,
+        20,
+        29,
+        26,
+        15,
+        24,
+        7,
+        8,
+        23,
+        14,
+        16,
+        19,
+        22,
+        21,
+        25,
+        0,
+        27
+      ],
+      "note": "Q = data-provider storage reorder S composed with the averaging fold LearnPermutation; this is the ORDER the online-CTR prefix consumes (Feature[docIdx]/GetData order), NOT GetLearnPermutationArray()=[11,18,15,..] (the leaf-index iteration order).",
+      "target_class_object_order": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "target_classifier": "LearnTargetClass[1] (= binarized y); LearnTargetClass[0] is all-zeros (unused)",
+      "ctr_bins_object_order": [
+        13,
+        7,
+        7,
+        7,
+        3,
+        7,
+        3,
+        2,
+        1,
+        7,
+        11,
+        11,
+        11,
+        9,
+        12,
+        8,
+        9,
+        12,
+        13,
+        13,
+        2,
+        13,
+        10,
+        1,
+        1,
+        13,
+        13,
+        1,
+        12,
+        10
+      ],
+      "per_bucket_y_sequence_Q_order": {
+        "0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "1": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "2": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "3": [
+          1,
+          1,
+          0,
+          1,
+          0,
+          1,
+          1,
+          1
+        ],
+        "4": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0
+        ]
+      },
+      "prior": "0.5/1.0",
+      "ctr_border_count": 15,
+      "projection": "single cat feature 0 (Borders)"
+    },
+    "structure_fold_cycle": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "iterations": [
+      {
+        "iter": 0,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          7,
+          17
+        ]
+      },
+      {
+        "iter": 1,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          7,
+          17
+        ]
+      },
+      {
+        "iter": 2,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          7,
+          17
+        ]
+      },
+      {
+        "iter": 3,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          7,
+          17
+        ]
+      },
+      {
+        "iter": 4,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          7,
+          17
+        ]
+      }
+    ]
+  },
+  "pc4": {
+    "permutation_count": 4,
+    "averaging_fold": {
+      "object_permutation_Q": [
+        3,
+        5,
+        9,
+        11,
+        6,
+        2,
+        7,
+        12,
+        1,
+        0,
+        14,
+        17,
+        28,
+        19,
+        4,
+        20,
+        21,
+        8,
+        29,
+        18,
+        10,
+        13,
+        15,
+        25,
+        23,
+        16,
+        24,
+        22,
+        27,
+        26
+      ],
+      "note": "Q = data-provider storage reorder S composed with the averaging fold LearnPermutation; this is the ORDER the online-CTR prefix consumes (Feature[docIdx]/GetData order), NOT GetLearnPermutationArray()=[11,18,15,..] (the leaf-index iteration order).",
+      "target_class_object_order": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "target_classifier": "LearnTargetClass[1] (= binarized y); LearnTargetClass[0] is all-zeros (unused)",
+      "ctr_bins_object_order": [
+        12,
+        7,
+        7,
+        7,
+        3,
+        7,
+        3,
+        2,
+        1,
+        7,
+        5,
+        11,
+        11,
+        7,
+        9,
+        8,
+        9,
+        12,
+        13,
+        10,
+        2,
+        11,
+        10,
+        1,
+        1,
+        11,
+        13,
+        1,
+        11,
+        7
+      ],
+      "per_bucket_y_sequence_Q_order": {
+        "0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "1": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "2": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "3": [
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "4": [
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "prior": "0.5/1.0",
+      "ctr_border_count": 15,
+      "projection": "single cat feature 0 (Borders)"
+    },
+    "structure_fold_cycle": [
+      0,
+      2,
+      0,
+      2,
+      2
+    ],
+    "iterations": [
+      {
+        "iter": 0,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          10,
+          14
+        ]
+      },
+      {
+        "iter": 1,
+        "taken_structure_fold": 2,
+        "ctr_split_borders": [
+          3,
+          7
+        ],
+        "averaging_leaf_partition": [
+          8,
+          8,
+          0,
+          14
+        ]
+      },
+      {
+        "iter": 2,
+        "taken_structure_fold": 0,
+        "ctr_split_borders": [
+          7,
+          2
+        ],
+        "averaging_leaf_partition": [
+          6,
+          0,
+          10,
+          14
+        ]
+      },
+      {
+        "iter": 3,
+        "taken_structure_fold": 2,
+        "ctr_split_borders": [
+          3,
+          7
+        ],
+        "averaging_leaf_partition": [
+          8,
+          8,
+          0,
+          14
+        ]
+      },
+      {
+        "iter": 4,
+        "taken_structure_fold": 2,
+        "ctr_split_borders": [
+          3,
+          7
+        ],
+        "averaging_leaf_partition": [
+          8,
+          8,
+          0,
+          14
+        ]
+      }
+    ]
+  }
+}

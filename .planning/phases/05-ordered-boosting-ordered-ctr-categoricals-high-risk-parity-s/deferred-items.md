@@ -190,3 +190,43 @@ tweak of the existing `online_ctr_prefix_binclf`. Only then can the corrected
 permutation (#1) + structure-fold cycling (#2) + the true bins (#3) be re-pinned
 together to a simultaneously-green pc=1 + pc=4 + partition-lock state. Until that
 online-CTR fix exists, bar (c) stays deferred; bars (a),(b),(d),(e) remain green.
+
+---
+
+## 05-18 (2026-06-15) — Spike-001 RESOLVED; bar (c) blocker precisely re-localized to data-provider storage reorder S
+
+**Re-instrumentation (second, re-authorized cycle) SUCCEEDED** and produced a
+SELF-CONSISTENT oracle (`live_trainer_self_consistent.json`), superseding the
+internally-inconsistent `live_trainer_ctr_bins_blocker.json`. Two atomic
+`CB_INSTRUMENT_LOG` events were added (`train.cpp` `self_consistent_ctr`,
+`online_ctr.cpp` `online_ctr_inputs`).
+
+**The Spike-001 inconsistency, explained.** The averaging online-CTR ui8 bins
+(`GetData`/`Feature[docIdx]`) are stored in the CTR materialization order **Q**,
+where `Q = S ∘ LearnPermutation`. The first cycle paired those bins with
+`GetLearnPermutationArray()` = `[11,18,15,29,…]` (the leaf-index iteration order, a
+DIFFERENT order) and never logged `LearnTargetClass` — hence inconsistent. With the
+atomic capture the bins ARE the single-cat-0 Borders online prefix under order Q
+with target `LearnTargetClass[1]` (= binarized y; `[0]` is all-zeros/unused). Q
+reproduces all 5 partitions `[6,0,10,14],[8,8,0,14],…` bit-exact.
+
+**The REAL bar-(c) blocker (sharper than the prior "online-CTR bins" note).** The
+online-CTR math in cb-train is ALREADY correct (Spike-001 proof). The gap is `S` —
+the catboost quantized data-provider's internal object STORAGE reorder (verified:
+the identity learning fold's `perm_subset == [0..29]` produces a NON-natural object
+cat-sequence). pc=4 tree-B borders `[3,7]` SPLIT the mixed cat buckets, so leaf
+VALUES depend on the exact per-mixed-bucket bin→object assignment fixed by `S`. The
+must_haves' `[11,18,15,…]` reproduces the pc=4 PARTITION `[8,8,0,14]` but the WRONG
+leaf VALUES (leaf1 `sum_y=6` vs upstream `5`, ≫1e-5). cb-train materializes on
+object-order `X_cat` WITHOUT `S`; no `create_folds`-generable permutation reproduces
+upstream's pc=4 leaf values, and re-pinning to a lucky cb-train permutation is
+forbidden (invariant #2). pc=1 is green because its borders do not split the mixed
+buckets (leaf composition order-invariant there) — NOT because cb-train reproduces
+the CTR order.
+
+**FALLBACK taken (user-chosen 2026-06-15).** cb-train production
+(`fold.rs`/`boosting.rs`) UNTOUCHED; pc=4 e2e oracle UNCOMMITTED; no oracle
+weakened. Committed: the self-consistent oracle + blocker annotation + README
+update. Closing bar (c) requires porting `S` (the data-provider quantized-object
+storage order) into cb-train — a research-grade subsystem, a new plan. Bars
+(a),(b),(d),(e) remain green.
