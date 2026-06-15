@@ -72,3 +72,58 @@ transcribe the structure-fold cycling + that exact boundary CTR into `boosting.r
 or (b) accept bar (c) deferred at pc=4 with bars (a),(b),(d),(e) green and the
 mechanism + evidence documented here. Bars (a)/(b)/(d)/(e) are NOT regressed: no
 production code was modified in this session.
+
+---
+
+## 05-17 bar (c) — UPDATE: live trainer BUILT; structure-fold + permutation recovered; root blocker re-localized to online-CTR bins
+
+**Decision taken (2026-06-15):** "Attempt toolchain provision + build." DONE.
+
+### Toolchain provisioned (sudo-free) and instrumented trainer built
+- Conan 2.29.1, Ninja 1.13.0, Cython 3.2.5(+numpy) via `uv tool install`.
+- **clang-18 + lld-18** (catboost 1.2.10's vendored libc++ needs clang>=16 builtins;
+  clang-14 FAILS). `apt-get download` (no sudo) + `dpkg -x` into `/tmp/clang18_prefix`.
+- Built instrumented `_catboost` against the project `.venv` Python 3.13 via
+  `build_native.py` (FindPython overridden to 3.13; default picks system 3.12 → ABI
+  mismatch). Conan fetched openssl/ragel/swig/yasm from conancenter (network OK).
+- Instrumented `train.cpp` + `learn_context.cpp` (env-gated `CB_INSTRUMENT_LOG`).
+  The trainer reproduced upstream tree leaf_weights `[A,B,A,B,B]` and predictions
+  **bit-identical (max abs diff 0.0)** to `predictions_pc4.npy`. Disk stayed >47G free.
+
+### What the live instrumentation RECOVERED (committed ground truth)
+1. **Structure-fold cycling** (`live_trainer_structure_fold.json`): per iteration
+   `takenFold = Folds[Rand.GenRand() % foldCount]` (`train.cpp:208`); pc=4 sequence
+   `[0,2,0,2,2]`; leaf values stay on the FIXED AveragingFold. Ported & verified:
+   the structure-fold cycling produces tree0 `[6,0,10,14]` exactly.
+2. **The AveragingFold permutation in `create_folds` was WRONG.** The `fold_cc`
+   `GetCallCount()` log proves the averaging Fisher-Yates shuffle begins at
+   call-count **29 (pc=1) / 87 (pc=4)** = `learning_folds` FULL Fisher-Yates passes
+   (one prefix pass + one per non-identity learning fold), NOT the committed
+   "callcount == learning_folds" (=1/=3) rule. Our `uniform`-shuffle advanced to
+   cc=87 reproduces upstream `[11,18,15,29,16,...]` BIT-EXACT (cc=29 →
+   `[10,17,25,3,6,...]` for pc=1). The OLD permutation `[23,19,25,...]` only
+   *coincidentally* yielded the partition COUNTS `[6,0,10,14]`/`[6,0,7,17]`.
+
+### The NEWLY-LOCALIZED root blocker (`live_trainer_ctr_bins_blocker.json`)
+Even WITH the bit-exact averaging permutation, **our online-CTR ui8 bins differ
+from upstream's `ComputeOnlineCTRs(AveragingFold)`.** Upstream avg-order bins
+`[7,7,7,11,3,7,2,11,7,12,9,...]` are not reproduced by `materialize_ctr_feature`
+(single-cat Borders, prior 0.5, border_count 15): the first 4 match then diverge
+at position 4 (ours 7, upstream 3). Neither class-0-as-good nor the {0,1}
+combination projection reproduces the sequence. Correcting `create_folds` to the
+true permutation therefore REGRESSES pc=1/pc=2 `[6,0,7,17]`→`[6,0,8,16]` and the
+pc=1 e2e — because the current locks are pinned to the *compensating*
+wrong-permutation + wrong-CTR-bins combination.
+
+### Why bar (c) is still deferred (architectural blast radius)
+Closing (c) now requires a `cb_train` online-CTR materialization fix to match
+`ComputeOnlineCTRs(AveragingFold)` bit-exact — a CTR-SUBSYSTEM change that ripples
+through EVERY committed CTR oracle (pc=1/pc=2/pc=4 partition locks, tensor_ctr_e2e,
+the leaf-value path), since those locks currently pass on the compensating-error
+combination. That is beyond "port the recovered structure-fold rule" and is the
+objective's explicit STOP-and-checkpoint condition. Per the FALLBACK: production
+code left UNTOUCHED (`fold.rs`/`boosting.rs` zero diff), the pc=4 e2e oracle left
+UNCOMMITTED, bars (a),(b),(d),(e) green. The instrumented ground truth
+(`live_trainer_structure_fold.json`, `live_trainer_ctr_bins_blocker.json`,
+`instrument_live_trainer_README.md`) is committed so a follow-up CTR-parity plan
+can transcribe the exact `ComputeOnlineCTRs(AveragingFold)` bins directly.
