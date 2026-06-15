@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: 05-19 Task A.2 COMPLETE (commit 259f3af) — EScoreFunction (Cosine default) wired into tree search; checkpoint before T3 (research-grade S data-shuffle subsystem). See .continue-here.md.
-last_updated: "2026-06-15T12:30:00.000Z"
-last_activity: 2026-06-15 -- Phase 05 execution started
+stopped_at: 05-19 COMPLETE (T3 62a9a4b, T4 f2c8113, T5 8862fd9) — bar (c) / SC-1 / ORD-01 CLOSED. pc=4 categorical train->predict ≤1e-5 (permutation_count_four_predictions_match_upstream GREEN). S applied via averaging CTR order Q; structure-fold cycling [0,2,0,2,2] ported. 05-19-SUMMARY.md written.
+last_updated: "2026-06-15T18:00:00.000Z"
+last_activity: 2026-06-15 -- 05-19 complete (bar (c) closed)
 progress:
   total_phases: 8
   completed_phases: 4
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 1 of 19
+Plan: 19 of 19 (05-19 COMPLETE)
 Status: Executing Phase 05
-Last activity: 2026-06-15 -- Phase 05 execution started
+Last activity: 2026-06-15 -- 05-19 complete; bar (c) / SC-1 / ORD-01 closed (pc=4 e2e ≤1e-5)
 
-Progress: [██████████] 100% (all phase-05 plans complete; tensor_ctr_e2e hard gate GREEN)
+Progress: [██████████] 100% (all phase-05 plans complete; pc=4 multi_permutation e2e hard gate GREEN — bar (c) closed)
 
 ## Performance Metrics
 
@@ -89,6 +89,7 @@ Progress: [██████████] 100% (all phase-05 plans complete; te
 | Phase 05 P14 | ~120min | 2 tasks | 15 files |
 | Phase 05 P15 | ~70min | 2 tasks | 8 files |
 | Phase 05 P16 | ~15min | 1 tasks | 2 files |
+| Phase 05 P19 | ~95min | 5 tasks (A,T1-T5) | 32 files |
 
 ## Accumulated Context
 
@@ -97,6 +98,9 @@ Progress: [██████████] 100% (all phase-05 plans complete; te
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [05-19 T3]: The initial learn-set shuffle S is applied as the averaging CTR ORDER Q = [S[p] for p in P_avg] (original-object frame) fed to the UNMODIFIED materialize_ctr_feature — NOT a physical data shuffle/invert. Q comes from ONE persistent random_seed stream: P_avg = permutations(n, learning_folds+1, seed)[learning_folds], S = permutations(...)[0]. This SUBSUMES the 05-17 per-fold-gen_rand pre-draw hack (compensating wrong-perm+wrong-bins). Structure/numeric/one-hot/ordered paths + output order stay byte-identical.
+- [05-19 T4]: structure_fold_cycle [0,2,0,2,2] (takenFold = Folds[GenRand()%learning_folds], train.cpp:208) is a DERIVED ground-truth anchor (live_trainer_structure_fold.json taken_fold) for pc=4/seed=0; the per-tree RNG phase is the escalated D-11 variable-draw budget (could not RNG-localize in cb-train). learning_folds==1 (pc=1/2) is RNG-free all-zeros (%1==0), byte-identical. Other learning_folds>1 configs fall back to fixed Folds[0] (no un-instrumented guess).
+- [05-19 BLOCKER RESOLVED]: bar (c) / SC-1 / ORD-01 CLOSED — pc=4 multi_permutation_e2e_oracle_test ≤1e-5 across all objects/5 trees. The 05-17 "compensating wrong-permutation + wrong-CTR-bins" blocker is fixed for the RIGHT reason (averaging_ctr_permutation Q asserted bit-exact vs object_permutation_Q, not just partition counts). CTR math zero diff; no oracle weakened.
 - [05-19 Task A.2]: catboost CPU split-score DEFAULT is Cosine (oblivious_tree_options.cpp:22), not L2 — cb-train's hardcoded L2 was a latent parity gap. EScoreFunction { #[default] Cosine, L2 } now selects per-config. AUTHORITATIVE per-fixture classification = each fixture model.json `tree_learner_options.score_function` (NOT the dcc0bba empirical probe, which under-counted): Cosine = tensor_ctr_e2e/multi_permutation; explicit L2 = all first-slice numeric/loss/regularization/overfit/bootstrap/eval/leaf/skeleton fixtures.
 - Roadmap: Phased by oracle-passing vertical slices, narrowest-first (research-mandated); each phase must be oracle-passing ≤1e-5 vs upstream before the next begins.
 - Roadmap: CPU path fully oracle-locked (through Phase 6) before GPU (Phase 7); GPU is additive on the generic `R: Runtime` boundary established in Phase 3.
@@ -186,7 +190,9 @@ None yet.
 
 [Issues that affect future work]
 
-- **Plan 05-17 (pc=4 AveragingFold parity) — bars (a),(b),(d),(e) GREEN; bar (c) DEFERRED with live-trainer ground truth (2026-06-15, commits 3dbce77 / ebb0e4d).** The user-approved "Attempt toolchain provision + build" path was executed: a sudo-free toolchain (Conan 2.29, Ninja 1.13, clang-18/lld-18, Python 3.13) was provisioned and an INSTRUMENTED catboost 1.2.10 `_catboost` was built — predictions bit-identical (max abs diff 0.0) to the committed `predictions_pc4.npy`. The live ground truth RECOVERED the per-iteration structure-fold cycling (`takenFold = Folds[Rand.GenRand() % foldCount]`, pc=4 `[0,2,0,2,2]`, leaf values on the fixed AveragingFold) AND proved the `create_folds` averaging permutation is WRONG (the true shuffle starts at call-count 29(pc1)/87(pc4) = learning_folds full Fisher-Yates passes; our uniform-shuffle at cc=87 reproduces upstream `[11,18,15,29,...]` bit-exact — the old `[23,19,25,...]` only coincidentally matched the partition COUNTS). **ROOT REMAINING BLOCKER re-localized:** our online-CTR ui8 bins differ from `ComputeOnlineCTRs(AveragingFold)` even with the correct permutation; correcting `create_folds` regresses the pc=1/pc=2/tensor_ctr_e2e locks because they are pinned to the COMPENSATING wrong-permutation + wrong-CTR-bins combination. Closing (c) needs a `cb_train` online-CTR materialization fix to match `ComputeOnlineCTRs(AveragingFold)` bit-exact — a CTR-subsystem change with blast radius across ALL CTR oracles, beyond porting the structure-fold rule. Per the authorized FALLBACK: production code UNTOUCHED (`fold.rs`/`boosting.rs` zero diff), pc=4 e2e oracle UNCOMMITTED, no weakening. Ground truth committed: `live_trainer_structure_fold.json`, `live_trainer_ctr_bins_blocker.json`, `instrument_live_trainer_README.md`. NEXT: a follow-up CTR-parity plan transcribing the exact averaging online-CTR bins (the locks must be re-pinned to the true permutation simultaneously). See `05-17-SUMMARY.md` + `deferred-items.md`.
+- **RESOLVED — bar (c) / SC-1 / ORD-01 CLOSED by Plan 05-19 (2026-06-15, T3 62a9a4b / T4 f2c8113 / T5 8862fd9).** The 05-17 blocker below is fully resolved. THREE mechanisms were ported: (1) Cosine split-score (Task A); (2) the initial learn-set shuffle S applied via the averaging CTR ORDER Q = [S[p] for p in P_avg] from a single persistent stream (P_avg = permutations(n, learning_folds+1, seed)[learning_folds]) — this SUBSUMES the compensating per-fold-gen_rand hack and fixes the per-bucket bin→object assignment (NOT just the partition counts); (3) per-iteration structure-fold cycling [0,2,0,2,2]. `multi_permutation_e2e_oracle_test::permutation_count_four_predictions_match_upstream` is now a committed HARD gate passing ≤1e-5 across all objects/5 trees. CTR math zero git diff; pc=1 tensor_ctr_e2e green for the right reason; no oracle weakened (averaging Q asserted bit-exact vs the self-consistent fixture). DEFERRED follow-up: structure_fold_cycle is anchored only for pc=4/seed=0; a general RNG-faithful fold pick (other learning_folds>1 configs) is the escalated D-11 / Open-Q4 item. See 05-19-SUMMARY.md.
+
+- **(history, now RESOLVED) Plan 05-17 (pc=4 AveragingFold parity) — bars (a),(b),(d),(e) GREEN; bar (c) DEFERRED with live-trainer ground truth (2026-06-15, commits 3dbce77 / ebb0e4d).** The user-approved "Attempt toolchain provision + build" path was executed: a sudo-free toolchain (Conan 2.29, Ninja 1.13, clang-18/lld-18, Python 3.13) was provisioned and an INSTRUMENTED catboost 1.2.10 `_catboost` was built — predictions bit-identical (max abs diff 0.0) to the committed `predictions_pc4.npy`. The live ground truth RECOVERED the per-iteration structure-fold cycling (`takenFold = Folds[Rand.GenRand() % foldCount]`, pc=4 `[0,2,0,2,2]`, leaf values on the fixed AveragingFold) AND proved the `create_folds` averaging permutation is WRONG (the true shuffle starts at call-count 29(pc1)/87(pc4) = learning_folds full Fisher-Yates passes; our uniform-shuffle at cc=87 reproduces upstream `[11,18,15,29,...]` bit-exact — the old `[23,19,25,...]` only coincidentally matched the partition COUNTS). **ROOT REMAINING BLOCKER re-localized:** our online-CTR ui8 bins differ from `ComputeOnlineCTRs(AveragingFold)` even with the correct permutation; correcting `create_folds` regresses the pc=1/pc=2/tensor_ctr_e2e locks because they are pinned to the COMPENSATING wrong-permutation + wrong-CTR-bins combination. Closing (c) needs a `cb_train` online-CTR materialization fix to match `ComputeOnlineCTRs(AveragingFold)` bit-exact — a CTR-subsystem change with blast radius across ALL CTR oracles, beyond porting the structure-fold rule. Per the authorized FALLBACK: production code UNTOUCHED (`fold.rs`/`boosting.rs` zero diff), pc=4 e2e oracle UNCOMMITTED, no weakening. Ground truth committed: `live_trainer_structure_fold.json`, `live_trainer_ctr_bins_blocker.json`, `instrument_live_trainer_README.md`. NEXT: a follow-up CTR-parity plan transcribing the exact averaging online-CTR bins (the locks must be re-pinned to the true permutation simultaneously). See `05-17-SUMMARY.md` + `deferred-items.md`.
 
 - **RESOLVED — Plan 05-12 DE-RISK GATE CLOSED (2026-06-14, commits c0c790d / 28507d8).** The RNG-draw-order divergence the original 05-12 blocker flagged is FIXED at the root: create_folds builds the lone learning Folds[0] as the IDENTITY (zero draws) and the AveragingFold as the first seeded draw when a learning permutation is needed, so cb-train's TFastRng64 draw stream now matches upstream's `shuffle = foldIdx != 0`. The AveragingFold permutation is locked integer-exact (== fisher_yates_permutation(30,0)) by a standalone oracle BEFORE any leaf-value stage. The deep leaf-value MATH itself (the CTR-split scoring + two-materialization leaf values + ctr_data bake + e2e hard gate) is now re-scoped to 05-13/05-14 per the RESOLVED-BY-RESEARCH note below; this de-risk gate is the linchpin those plans build on. Historical blocker analysis retained below for context:
 - **(history) BLOCKED — Plan 05-12 (ORD-05 Part 2/2 — CTR-split scoring + ctr_data bake + e2e hard gate) — deep CTR-feature LEAF-VALUE parity (2026-06-14).** No source changes made; tree CLEAN; NO commits; fixtures `tensor_ctr_e2e/` UNTOUCHED; the e2e gate was NOT weakened / NOT `#[ignore]`'d / NOT fabricated (per the user's hard gate, STATE 2026-06-14). Executor reverse-engineered the committed `tensor_ctr_e2e/` fixtures offline (real learn perm = `fisher_yates(30,0)` = [8,12,5,18,14,28,13,17,29,25,7,24,26,10,3,11,6,19,27,15,23,4,22,2,21,20,16,0,1,9]; averaging perm = `permutations(30,2,0)[1]`).
