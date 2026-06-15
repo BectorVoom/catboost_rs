@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: 05-19 COMPLETE (T3 62a9a4b, T4 f2c8113, T5 8862fd9) — bar (c) / SC-1 / ORD-01 CLOSED. pc=4 categorical train->predict ≤1e-5 (permutation_count_four_predictions_match_upstream GREEN). S applied via averaging CTR order Q; structure-fold cycling [0,2,0,2,2] ported. 05-19-SUMMARY.md written.
-last_updated: "2026-06-15T18:00:00.000Z"
-last_activity: 2026-06-15 -- 05-19 complete (bar (c) closed)
+stopped_at: Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
+last_updated: "2026-06-15T12:29:38.405Z"
+last_activity: 2026-06-15 -- 05-19 complete; bar (c) / SC-1 / ORD-01 closed (pc=4 e2e ≤1e-5)
 progress:
   total_phases: 8
   completed_phases: 5
@@ -218,10 +218,10 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-15 (resumed)
-Stopped at: 05-19 Task A.2 COMPLETE (commit 259f3af). EScoreFunction { #[default] Cosine, L2 } added to cb-compute; BoostParams.score_function + score_function_default() (Cosine); split_score() dispatch threaded through tree.rs (score_candidate / _ctr_aware / _any + plain/perturbed/with_ctr/one_hot greedy entry points + select_level_*; ordered path stays L2). Per-fixture score_function PINNED authoritatively from each model.json tree_learner_options.score_function: Cosine = tensor_ctr_e2e/one_hot/multi_permutation; explicit L2 = ALL other numeric/loss/regularization/overfit/bootstrap/eval/leaf/skeleton fixtures (the dcc0bba probe under-counted the L2 blast radius — leaf_weights/loss/bootstrap/overfit/regularization/autolr/ordered_* are also L2). cb-train lib 130/130, cb-compute 47/47, ALL structure-search oracles GREEN on their correct score function; CTR math zero diff. The ONLY failing test in the whole cb-train suite is permutation_count_four_predictions_match_upstream (the untracked pc4 e2e oracle = the bar-(c) TARGET T3/T4/T5 close — NOT a regression). CHECKPOINTED before T3 (the research-grade S data-shuffle subsystem with hard STOP conditions: apply S to data, replace fold cc-hack with permutations model, fix Q=[S[p] for p in P_avg] not just the partition, keep pc1 green for the right reason). Resume: .continue-here.md (detailed T3/T4/T5 plan + authoritative fixture map). Non-worktree run (executor owns STATE/ROADMAP).
+Last session: 2026-06-15T12:29:38.400Z
+Stopped at: Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
 Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
-Resume file: .planning/phases/05-ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s/.continue-here.md
+Resume file: .planning/phases/06-full-loss-feature-parity/06-CONTEXT.md
