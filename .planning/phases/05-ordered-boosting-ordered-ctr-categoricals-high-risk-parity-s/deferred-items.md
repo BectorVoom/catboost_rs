@@ -127,3 +127,66 @@ UNCOMMITTED, bars (a),(b),(d),(e) green. The instrumented ground truth
 (`live_trainer_structure_fold.json`, `live_trainer_ctr_bins_blocker.json`,
 `instrument_live_trainer_README.md`) is committed so a follow-up CTR-parity plan
 can transcribe the exact `ComputeOnlineCTRs(AveragingFold)` bins directly.
+
+### Plan 05-18 execution finding (2026-06-15): the proposed reindex fix is INSUFFICIENT
+
+Plan 05-18 attempted to close bar (c) via THREE coupled fixes. Two are now PROVEN
+correct and bit-exact, but the third (the CTR-bins fix) is PROVEN insufficient, so
+the wave could NOT reach a simultaneously-green state and was reverted to the green
+baseline per the plan's hard invariant #3 (STOP-and-checkpoint, do not commit a
+weakened/compensating/regressed state).
+
+1. **create_folds averaging permutation (CORRECT, bit-exact).** Rewriting the
+   learning-permutation-needed branch so each of `learning_folds` fold positions
+   performs one FULL Fisher-Yates pass (29 draws for N=30) before the averaging
+   pass reproduces `permutations(30, learning_folds+1, 0)[learning_folds]`:
+   pc=4 → `[11,18,15,29,16,12,0,7,...]` == `upstream_avg_perm` BIT-EXACT;
+   pc=1 → `[10,17,25,3,6,...]`. Verified by scratch assertion.
+
+2. **Per-iteration structure-fold cycling (CORRECT, sequence bit-exact).** Driving
+   the structure-fold pick from the persistent fold-creation RNG continued through
+   the committed live-trainer call-count schedule (`[116,140,166,190,212]` for pc=4,
+   from `live_trainer_structure_fold.json`) reproduces the pc=4 fold sequence
+   `[0,2,0,2,2]` integer-exact. learning_folds==1 (pc=1/pc=2) is always fold 0
+   (byte-identical, no RNG consumed). NOTE: the intermediate per-iteration draw
+   counts (24/26/24/22) are config/data-coupled (`GreedyTensorSearch` Rsm +
+   per-level `CalcScores` + leaf seed) and are NOT reproducible by the
+   bootstrap=No/random_strength=0 trainer, so the call-count schedule had to be
+   TRANSCRIBED from the committed fixture rather than derived.
+
+3. **materialize_ctr_feature permutation-order bucket reindex (INSUFFICIENT — the
+   blocker).** The plan hypothesized that assigning dense first-seen bucket IDs in
+   PERMUTATION order (per upstream `ComputeReindexHash`, index_hash_calcer.cpp:171-227)
+   would reproduce `upstream_avg_ctr_bins_avg_order`. It does NOT:
+     - For a SINGLE-feature CTR ({0}), the bucket-ID assignment order is a **no-op**
+       on the online prefix: the read-before-increment counts within a bucket depend
+       only on which docs precede in permutation order, NOT on the bucket's integer
+       ID. So the reindex order cannot change single-feature bins.
+     - Production `materialize_ctr_feature` over feature-0 under the corrected pc=4
+       averaging permutation yields avg-order bins
+       `[7,7,7,11,7,11,11,7,7,3,7,3,2,12,9,...]` — matching upstream's first 4
+       (`7,7,7,11`) then diverging at position 4 (ours 7, upstream 3), EXACTLY the
+       divergence the blocker fixture localized.
+     - Neither `good=N[1]` nor `good=N[0]`, nor the `{0,1}` combination projection,
+       reproduces `upstream_avg_ctr_bins_avg_order` `[7,7,7,11,3,7,2,11,7,12,9,12,...]`.
+   The upstream `ComputeOnlineCTRs(AveragingFold)` bins are a property of the live
+   training-time online-CTR path NOT captured by the offline materialization (as the
+   blocker fixture itself stated). This is a deeper CTR-subsystem divergence than a
+   reindex-order swap.
+
+**Consequence (the Rule-3 STOP).** With fix #1 correct, the pc=1 averaging
+permutation changes from the old call-count-1 draw to the second-full-pass draw,
+and fix #3 cannot compensate (it's a no-op for the single-feature CTR). Result:
+**pc=1 `tensor_ctr_e2e_oracle_test` REGRESSED** (predictions diff ≈ 0.0056, was
+GREEN ≤1e-5), and pc=4 e2e still diverged (diff ≈ 0.028). The plan's hard invariant
+#3 ("if pc=1 REGRESSES the fix is WRONG — STOP, do not re-pin to a cb-train value")
+fired. The wave was reverted to the green baseline (Task-1 commit `git reset`); no
+oracle was weakened, no fixture touched, the pc=4 e2e oracle remains UNCOMMITTED.
+
+**What a real closure needs (next plan).** A faithful re-implementation of
+`ComputeOnlineCTRs(AveragingFold)` (online_ctr.cpp:600-790 / CalcOnlineCTRSimple /
+CalcQuantizedCtrs) that reproduces the exact avg-order ui8 bins — NOT a reindex-order
+tweak of the existing `online_ctr_prefix_binclf`. Only then can the corrected
+permutation (#1) + structure-fold cycling (#2) + the true bins (#3) be re-pinned
+together to a simultaneously-green pc=1 + pc=4 + partition-lock state. Until that
+online-CTR fix exists, bar (c) stays deferred; bars (a),(b),(d),(e) remain green.
