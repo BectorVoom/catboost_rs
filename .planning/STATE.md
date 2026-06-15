@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "PHASE 05 RE-VERIFIED → gaps_found (commit 0d0f9c8). All 16 plans executed; no failing test at HEAD. Both prior gaps CLOSED (ORD-02 wiring retire 05-16; ORD-01 pc=2 draw order 05-15). One BLOCKER remains by developer escalation (2026-06-15): pc=4 (production-default permutation_count=4) AveragingFold partition [6,0,8,16] != catboost 1.2.10 [6,0,10,14]. The verifier flagged this human_needed; developer ruled it a BLOCKER (SC-1 says "reproduces upstream permutations exactly", no pc carve-out, pc=4 is the default; e2e oracles only lock pc=1). Recorded as the single blocking gap in 05-VERIFICATION.md gaps: frontmatter. NOTE: fix path is in tension with P1/D-08 ("Python-reachable floor, no C++ instrumentation") — the gap plan must reconcile this. NEXT: /gsd-plan-phase 5 --gaps (reads 05-VERIFICATION.md → creates gap_closure plan) → /gsd-execute-phase 5 --gaps-only → re-verify. Resume file: .planning/phases/05-.../05-VERIFICATION.md."
-last_updated: "2026-06-14T22:34:21.798Z"
+stopped_at: "PLAN 05-17 EXECUTED (continuation) → bars (a),(b),(d),(e) GREEN; bar (c) DEFERRED via authorized FALLBACK. Provisioned a sudo-free build toolchain (Conan 2.29, Ninja 1.13, clang-18/lld-18, Python 3.13) and built an INSTRUMENTED catboost 1.2.10 trainer (predictions bit-identical to predictions_pc4.npy). Recovered the structure-fold cycling rule AND proved the create_folds averaging permutation is wrong (true shuffle-start cc=29/87 = learning_folds full FY passes → upstream [11,18,15,29,...] bit-exact). Re-localized the root bar-(c) blocker to the online-CTR ui8 bins (ComputeOnlineCTRs(AveragingFold)), which materialize_ctr_feature does not reproduce even with the correct permutation; correcting create_folds regresses the pc=1/pc=2/tensor_ctr_e2e locks (pinned to the compensating wrong-perm+wrong-bins combo). Production code UNTOUCHED (fold.rs/boosting.rs zero diff), pc=4 e2e oracle UNCOMMITTED, no weakening. Commits: 3dbce77 (live-trainer ground truth), ebb0e4d (blocker re-localization), + this 05-17-SUMMARY. All baseline oracles GREEN (partition 4/4, tensor_ctr_e2e 3/3, ordered_boost_e2e 2/2, cb-train lib 130/130). NEXT (needs decision): a follow-up CTR-parity plan transcribing the exact averaging online-CTR bins + re-pinning the partition locks to the true permutation — OR finalize Phase 5 on bars (a),(b),(d),(e) with (c) deferred. Resume files: .planning/phases/05-.../05-17-SUMMARY.md + deferred-items.md + crates/cb-train/tests/fixtures/multi_permutation_fold/live_trainer_ctr_bins_blocker.json."
+last_updated: "2026-06-15T04:08:25.584Z"
 last_activity: 2026-06-14 -- Phase 05 execution started
 progress:
   total_phases: 8
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
 Plan: 1 of 17
-Status: Executing Phase 05
+Status: Ready to execute
 Last activity: 2026-06-14 -- Phase 05 execution started
 
 Progress: [██████████] 100% (all phase-05 plans complete; tensor_ctr_e2e hard gate GREEN)
