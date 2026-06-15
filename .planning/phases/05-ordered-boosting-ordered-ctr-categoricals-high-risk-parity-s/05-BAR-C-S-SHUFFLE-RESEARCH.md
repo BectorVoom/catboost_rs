@@ -22,13 +22,18 @@ RELATIVE to the shuffled data. cb-train currently skips `S` and operates on obje
 `X_cat`, so its fold permutations are relative to object order → wrong per-mixed-bucket
 interleaving → wrong pc=4 leaf values (bar (c)).
 
-Verified `S` for the `tensor_ctr_e2e` fixture (n=30, seed=0, captured unambiguously via
-both cat columns + target from the identity learning fold `perm_subset == [0..29]`):
-`S = [5,2,6,12,9,28,1,17,29,11,7,3,18,10,4,14,8,19,23,13,27,20,15,26,21,24,16,0,22,25]`.
-(Note `S != fisher_yates_permutation(30,0) = [8,12,5,18,…]`, so either `CreateShuffledIndices`
-uses a different shuffle direction than `shuffle_in_place`, or the shared RNG has consumed
-some pre-shuffle draws — the plan's first task must byte-match `CreateShuffledIndices` +
-the exact RNG state at the shuffle.)
+**`S` DERIVED by direct trainer instrumentation (plan 05-19, `learn_set_shuffle` event):** for
+the `tensor_ctr_e2e` fixture (n=30, seed=0), `pre_shuffle_callcount == 0` (zero pre-draws,
+confirming `ShuffleLearnDataIfNeeded` is the first RNG consumer) and
+`S = [8,12,5,18,14,28,13,17,29,25,7,24,26,10,3,11,6,19,27,15,23,4,22,2,21,20,16,0,1,9]` =
+**exactly `fisher_yates_permutation(30,0)`** — cb-train's EXISTING primitive. `S[k]` = original
+object index at shuffled position `k`. The earlier reconstructed `S=[5,2,6,12,…]` (05-18 SUMMARY /
+this note's first draft) was a cat+y reconstruction artifact (ambiguous within (cat,y) groups),
+NOT the real shuffle; the captured value above supersedes it. Validated end-to-end:
+`Q = S ∘ P_avg` (S then the averaging fold permutation over the shuffled data) reproduces the
+self-consistent averaging CTR bins 30/30 and all 5 tree partitions
+`[6,0,10,14],[8,8,0,14],[6,0,10,14],[8,8,0,14],[8,8,0,14]` bit-exact. So porting `S` is a thin
+alias over the existing `fisher_yates_permutation`; there is NO shuffle-direction mystery.
 
 ## The port (next plan scope)
 

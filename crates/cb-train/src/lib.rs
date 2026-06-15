@@ -49,7 +49,8 @@ pub use fold::{
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 pub use permutation::{
-    fisher_yates_permutation, fold_block_size, permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
+    create_shuffled_indices, fisher_yates_permutation, fold_block_size, permutations,
+    PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
 pub use boosting::{

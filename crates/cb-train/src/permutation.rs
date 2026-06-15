@@ -111,6 +111,27 @@ pub fn fisher_yates_permutation(n: usize, seed: u64) -> Vec<i32> {
     shuffle_in_place(n, &mut rng)
 }
 
+/// The upstream INITIAL LEARN-SET SHUFFLE `S` — catboost's `CreateShuffledIndices`
+/// (`catboost/libs/helpers/permutation.h:84` = `std::iota` + `util/random/shuffle.h::Shuffle`),
+/// invoked by `ShuffleLearnDataIfNeeded` (`preprocess.cpp:183`) via
+/// `NCB::Shuffle(grouping, /*blockSize*/1, rand)` over a trivial object grouping. The shuffle
+/// is the FIRST consumer of `TRestorableFastRng64(random_seed)` (`train_model.cpp:1057-1058`,
+/// ZERO pre-draws), so for object count `n` and seed `random_seed` it is bit-identical to
+/// [`fisher_yates_permutation`] — VERIFIED by direct trainer instrumentation (plan 05-19,
+/// `learn_set_shuffle` event): `create_shuffled_indices(30, 0)` ==
+/// `[8,12,5,18,14,28,13,17,29,25,7,24,26,10,3,11,6,19,27,15,23,4,22,2,21,20,16,0,1,9]`,
+/// `pre_shuffle_callcount == 0`, 29 draws consumed.
+///
+/// `S[k]` is the ORIGINAL object index placed at shuffled position `k`
+/// (`shuffled_data[k] = original[S[k]]`). This is a thin, intent-revealing alias over
+/// `fisher_yates_permutation` so the boosting driver reads as "apply the upstream learn-set
+/// shuffle" rather than an unrelated fold permutation; the persistent-stream form is
+/// [`shuffle_in_place`] (drive S then continue fold creation on the SAME rng).
+#[must_use]
+pub fn create_shuffled_indices(n: usize, random_seed: u64) -> Vec<i32> {
+    fisher_yates_permutation(n, random_seed)
+}
+
 /// The modern Fisher-Yates shuffle (`shuffle.h:28-30`) over an ALREADY-seeded
 /// generator, so a caller driving a persistent multi-fold RNG can keep the
 /// draw stream continuous across folds (see [`permutations`]). Identity init,
