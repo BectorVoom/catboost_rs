@@ -90,7 +90,8 @@ use cb_core::TFastRng64;
 use cb_data::{calc_cat_feature_hash, stringify_int_category};
 use cb_oracle::{compare_permutation, Stage};
 use cb_train::{
-    calc_ctr_online_bin, create_folds, online_ctr_prefix_binclf, Fold,
+    averaging_ctr_permutation, calc_ctr_online_bin, create_folds, learning_fold_count,
+    online_ctr_prefix_binclf, Fold,
 };
 use ndarray::Array2;
 use ndarray_npy::read_npy;
@@ -304,6 +305,85 @@ fn multi_permutation_learning_fold_zero_is_identity() {
         compare_permutation(&identity, &actual).unwrap_or_else(|e| {
             panic!(
                 "pc={pc} learning Folds[0] is not the identity [0..30] [{:?}]: {e}",
+                Stage::Permutation
+            )
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SELF-CONSISTENT AVERAGING ORDER Q (plan 05-19 T5 re-pin, ORD-01 / bar (c)).
+//
+// The partition-count tests above match catboost's tree-0 leaf_weights, but the
+// COUNTS alone do NOT distinguish the TRUE averaging order `Q = S ∘ P_avg` from
+// the prior 05-17 per-fold-`gen_rand` "compensating error" (which matched the
+// COUNTS on a wrong permutation + wrong per-bucket bin→object assignment —
+// memory `pc4-partition-compensating-error.md`). The PRODUCTION averaging CTR is
+// now materialized under `averaging_ctr_permutation` (= Q), so these tests pin
+// the FULL PERMUTATION against the instrumented self-consistent ground truth
+// `live_trainer_self_consistent.json` (`object_permutation_Q`) — the stronger
+// authority that catches the compensating error. Re-pinned ONLY to the
+// upstream-derived self-consistent fixture, NEVER a cb-train output.
+// ---------------------------------------------------------------------------
+
+/// Load `live_trainer_self_consistent.json`'s `pc{pc}.averaging_fold.object_permutation_Q`
+/// (the TRUE original-object averaging CTR order = `[S[p] for p in P_avg]`).
+fn self_consistent_q(pc: usize) -> Vec<i32> {
+    let raw =
+        std::fs::read_to_string(fixture("multi_permutation_fold/live_trainer_self_consistent.json"))
+            .expect("live_trainer_self_consistent.json must exist (instrumented catboost 1.2.10)");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("self_consistent JSON is valid");
+    let q = v
+        .get(format!("pc{pc}"))
+        .and_then(|p| p.get("averaging_fold"))
+        .and_then(|a| a.get("object_permutation_Q"))
+        .and_then(|a| a.as_array())
+        .unwrap_or_else(|| panic!("self_consistent JSON must record pc{pc} object_permutation_Q"));
+    q.iter()
+        .map(|x| x.as_i64().expect("Q entries are integers") as i32)
+        .collect()
+}
+
+/// PRIMARY self-consistent authority (T5): `averaging_ctr_permutation` (the order
+/// the production leaf-VALUE CTR is materialized under) reproduces the instrumented
+/// `object_permutation_Q` integer-exact, for pc=1 (learning_folds==1) AND pc=4
+/// (learning_folds==3). This catches the compensating wrong-permutation error the
+/// counts-only tests cannot — the true closure of bar (c).
+#[test]
+fn averaging_ctr_permutation_matches_self_consistent_q() {
+    for pc in [1usize, 4usize] {
+        let learning_folds = learning_fold_count(pc, /* needed = */ true);
+        let actual: Vec<i64> = averaging_ctr_permutation(FIXTURE_N, learning_folds, FIXTURE_SEED)
+            .into_iter()
+            .map(i64::from)
+            .collect();
+        let expected: Vec<i64> = self_consistent_q(pc).into_iter().map(i64::from).collect();
+        compare_permutation(&expected, &actual).unwrap_or_else(|e| {
+            panic!(
+                "pc={pc} averaging CTR order Q diverged from the self-consistent fixture [{:?}]: {e}",
+                Stage::Permutation
+            )
+        });
+    }
+}
+
+/// The partition the TRUE averaging order Q produces over the online-prefix CTR
+/// equals catboost's committed tree-0 leaf_weights — for pc=1 `[6,0,7,17]` and
+/// pc=4 `[6,0,10,14]`. Unlike the `create_folds`-based tests above (which exercise
+/// the legacy fold path), this drives the SAME `averaging_ctr_permutation` the
+/// production loop uses, so the partition AND the underlying permutation are both
+/// the self-consistent upstream values (no compensating error).
+#[test]
+fn self_consistent_q_partition_matches_catboost_leaf_weights() {
+    for pc in [1usize, 4usize] {
+        let learning_folds = learning_fold_count(pc, /* needed = */ true);
+        let q = averaging_ctr_permutation(FIXTURE_N, learning_folds, FIXTURE_SEED);
+        let actual = averaging_partition(&q);
+        let expected = upstream_leaf_weights(pc);
+        compare_permutation(&expected, &actual).unwrap_or_else(|e| {
+            panic!(
+                "pc={pc} self-consistent Q partition {actual:?} diverged from committed catboost \
+                 1.2.10 leaf_weights {expected:?} [{:?}]: {e}",
                 Stage::Permutation
             )
         });
