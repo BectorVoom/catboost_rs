@@ -50,47 +50,19 @@ pub fn logloss_gradient_kernel<F: Float>(
     }
 }
 
-/// First-order MAE / Quantile(alpha=0.5, delta=1e-6) gradient kernel:
-/// `val = target - approx; der1 = |val|<delta ? 0 : (val>0 ? alpha : -(1-alpha))`.
-///
-/// `error_functions.h:485-489` (`TQuantileError::CalcDer`, alpha=0.5, delta=1e-6).
-/// Elementwise, order-independent, no reduction (D-02). Per the CubeCL
-/// conditionals manual the branch result is assigned to a `mut` variable
-/// initialized to the deadzone value (avoiding `if`-as-expression IR pitfalls).
-#[cube(launch)]
-pub fn mae_gradient_kernel<F: Float>(approx: &Array<F>, target: &Array<F>, der1: &mut Array<F>) {
-    if ABSOLUTE_POS < approx.len() {
-        let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let alpha = F::new(0.5);
-        let delta = F::new(1e-6);
-        // Band complement of the scalar `|val| < delta` deadzone: `|val| >= delta`
-        // is OUTSIDE the deadzone, so the boundary `|val| == delta` returns the
-        // signed quantile weight (matching `mae_der1`/`quantile_der1`), NOT 0.
-        // Mirrors `huber_gradient_kernel` and `quantile_gradient_kernel`.
-        let mut g = F::new(0.0);
-        if F::abs(val) >= delta {
-            g = F::new(0.0) - (F::new(1.0) - alpha);
-            if val > F::new(0.0) {
-                g = alpha;
-            }
-        }
-        der1[ABSOLUTE_POS] = g;
-    }
-}
-
 /// First-order Quantile{alpha, delta} gradient kernel: with `val = target -
 /// approx`, `der1 = |val| < delta ? 0 : (val > 0 ? alpha : -(1-alpha))`.
 ///
-/// `error_functions.h:485-489` (`TQuantileError::CalcDer`). Generalizes
-/// [`mae_gradient_kernel`] (which hardcodes `alpha = 0.5`, `delta = 1e-6`) to
-/// arbitrary `alpha`/`delta`, passed as length-1 `Array<F>` arguments (read at
-/// index 0) — NOT scalar args — to keep the kernel fully generic over `F: Float`
-/// (AGENTS.md generics-float; the [`focal_gradient_kernel`] / [`lq_gradient_kernel`]
-/// length-1-array precedent). der2 is the constant `0` (no kernel — the dispatch
-/// fills a zero vec, the Mae precedent). The branch result is assigned to a `mut`
-/// variable initialized to the deadzone value via the if-as-STATEMENT pattern
-/// (CubeCL conditionals manual). Elementwise, order-independent, no reduction
-/// (D-02). At `alpha = 0.5`, `delta = 1e-6` this equals [`mae_gradient_kernel`].
+/// `error_functions.h:485-489` (`TQuantileError::CalcDer`). `alpha`/`delta` pass
+/// as length-1 `Array<F>` arguments (read at index 0) — NOT scalar args — to keep
+/// the kernel fully generic over `F: Float` (AGENTS.md generics-float; the
+/// [`focal_gradient_kernel`] / [`lq_gradient_kernel`] length-1-array precedent).
+/// der2 is the constant `0` (no kernel — the dispatch fills a zero vec). The
+/// branch result is assigned to a `mut` variable initialized to the deadzone
+/// value via the if-as-STATEMENT pattern (CubeCL conditionals manual).
+/// Elementwise, order-independent, no reduction (D-02). MAE routes through THIS
+/// kernel at `alpha = 0.5`, `delta = 1e-6` (WR-04 — no duplicate MAE kernel), so
+/// MAE and Quantile{0.5} are bit-identical by construction.
 #[cube(launch)]
 pub fn quantile_gradient_kernel<F: Float>(
     approx: &Array<F>,

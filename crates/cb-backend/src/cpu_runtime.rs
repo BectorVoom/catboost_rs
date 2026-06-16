@@ -16,14 +16,14 @@
 
 use cubecl::prelude::*;
 
-use cb_compute::{Derivatives, Loss, Runtime};
+use cb_compute::{Derivatives, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA};
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
     expectile_gradient_kernel, expectile_hessian_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, huber_gradient_kernel, huber_hessian_kernel,
     logcosh_gradient_kernel, logcosh_hessian_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    lq_gradient_kernel, lq_hessian_kernel, mae_gradient_kernel, mape_gradient_kernel,
+    lq_gradient_kernel, lq_hessian_kernel, mape_gradient_kernel,
     poisson_gradient_kernel, poisson_hessian_kernel, quantile_gradient_kernel,
     tweedie_gradient_kernel, tweedie_hessian_kernel,
 };
@@ -82,14 +82,6 @@ fn launch_binary_f64(
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
             )
         }
-        BinaryKernel::MaeGradient => mae_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-            &client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-        ),
         BinaryKernel::LogCoshGradient => {
             logcosh_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
                 &client,
@@ -150,7 +142,6 @@ fn launch_binary_f64(
 enum BinaryKernel {
     RmseGradient,
     LoglossGradient,
-    MaeGradient,
     LogCoshGradient,
     LogCoshHessian,
     /// Poisson gradient `target - exp(approx)` (the hessian is the unary
@@ -494,8 +485,14 @@ impl Runtime for CpuBackend {
                 let der2 = launch_focal_f64(approx, target, alpha, gamma, true)?;
                 Ok(Derivatives { der1, der2 })
             }
+            // MAE == Quantile{alpha=0.5, delta=1e-6} (WR-04): route through the
+            // parametric quantile kernel (alpha/delta as length-1 device arrays)
+            // rather than a duplicate `mae_gradient_kernel` that hardcodes
+            // `F::new(1e-6)` / `F::new(0.5)` — the hardcoded path would drift from
+            // the host scalar under a future f32 instantiation. This makes MAE and
+            // Quantile{0.5} bit-identical by construction.
             Loss::Mae => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::MaeGradient)?;
+                let der1 = launch_quantile_f64(approx, target, QUANTILE_ALPHA, QUANTILE_DELTA)?;
                 // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
                 let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
