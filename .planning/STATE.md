@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 6.3 Plan 01 complete (grouped der seam + ranking corpus)
+stopped_at: Phase 6.3 Plan 02 complete (QueryRMSE + QuerySoftMax, grouped-seam end-to-end)
 last_updated: "2026-06-17T00:00:00.000Z"
-last_activity: 2026-06-17 -- 06.3-01 complete (QueryInfo seam, calc_ders_for_queries, ranking corpus generator)
+last_activity: 2026-06-17 -- 06.3-02 complete (QueryRMSE/QuerySoftMax der + grouped der dispatch + per-stage oracles <=1e-5)
 progress:
   total_phases: 14
   completed_phases: 7
   total_plans: 56
-  completed_plans: 52
-  percent: 50
+  completed_plans: 53
+  percent: 51
 ---
 
 # Project State
@@ -26,17 +26,17 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
-Plan: 2 of 5 (Plan 01 complete)
+Plan: 3 of 5 (Plans 01-02 complete)
 Status: Executing Phase 06.3
-Last activity: 2026-06-17 -- 06.3-01 complete (grouped der seam + ranking fixture corpus)
+Last activity: 2026-06-17 -- 06.3-02 complete (QueryRMSE + QuerySoftMax vertical slices, grouped-seam end-to-end)
 
-Progress: [##............] ~20% of Phase 6.3 plans (1 of 5 plans complete; 7 of 14 top-level phases complete)
+Progress: [####..........] ~40% of Phase 6.3 plans (2 of 5 plans complete; 7 of 14 top-level phases complete)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 24
+- Total plans completed: 25
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -47,7 +47,7 @@ Progress: [##............] ~20% of Phase 6.3 plans (1 of 5 plans complete; 7 of 
 | 03 | 9 | - | - |
 | 04 | 3 | ~98 min | ~33 min |
 | 06.2 | 7 | - | - |
-| 06.3 | 1 | ~35 min | ~35 min |
+| 06.3 | 2 | ~75 min | ~38 min |
 
 **Recent Trend:**
 
@@ -208,6 +208,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 06.2-06: predict_raw_cat routes approx_dimension>1 to dim-aware accumulator; <=1 stays byte-identical (D-04)
 - [Phase ?]: 06.2-06: class labels round-trip via class_params/multiclass_params on json + .cbm InfoMap
 - [Phase ?]: 06.2-07: multi-output sampling now per-object (der_obj L2-norm); random_strength std-dev divides by n not dim*n; WR-05 target_class<k + WR-01 stride guards typed-error-hardened (CR-02 closed)
+- [Phase 06.3]: 06.3-02 COMPLETE (LOSS-04 Wave A — QueryRMSE + QuerySoftMax; commits f42e3e6 Task1 / 6b208dd Task2): the first two deterministic querywise ranking losses land end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. QueryRMSE der1=(target-approx-queryAvrg)·w / der2=-1·w (queryAvrg=Σ(t-a)·w/Σw, queryCount>0 guard, error_functions.h:879-933); QuerySoftMax per-group max-shifted softmax der (p=expApprox·w/Σ, der1=Beta·(-sumWT·p+w·t), der2=Beta·sumWT·(Beta·p·(p-1)-Lambda), sumWT≤0/weight≤0 → ders 0, error_functions.cpp:531-577). Both UNWEIGHTED→der already folds weight in (the corpus is unweighted so the downstream der1·weight is a no-op). All per-group reductions via cb_core::sum_f64. Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} added (validate rejects lambda<0/beta≤0); QUERYSOFTMAX_LAMBDA_DEFAULT=0.01 / BETA_DEFAULT=1.0 (loss_description.cpp:209-216).
+- [Phase 06.3]: 06.3-02: boosting der-site BRANCHES on is_grouped_loss(&Loss) — ranking losses route through Runtime::compute_gradients_grouped over a per-fit QueryInfo view (build_query_info ONCE), per-group ders flattened to the object-order buffer; non-ranking der site BYTE-IDENTICAL (D-04). NEW train_ranking entry + RankingData{group_id,subgroup_id,pairs} thread the group structure through a new train_inner param (existing train/train_cat/train_with_eval_sets pass RankingData::default() — 24 BoostParams sites untouched).
+- [Phase 06.3]: 06.3-02 LEAF-METHOD parity (RESEARCH A4 resolved from fixture model.json): QueryRMSE default leaf_estimation_method=Newton (der2=-w real); QuerySoftMax default=Gradient (NOT Newton). Both score_function=Cosine (catboost CPU default — the ranking corpus pins no override; L2 diverges at tree-0 split 1). Predictions RAW (identity, no link transform) via cb_model::predict_raw. QuerySoftMax fixture frozen OFFLINE via gen_ranking_fixtures.py --loss QuerySoftMax (QueryRMSE smoke fixture from 06.3-01 reused). Per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5; full cb-train suite green (154 lib + all oracles incl. D-04 scalar/N-dim no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. DEFERRED: weighted-ranking general case (per-object weights != 1) would double-weight in the shared leaf loop — out of scope (the Wave-A corpus is unweighted); fold-into-leaf-only routing is a hardening item.
 
 ### Pending Todos
 
@@ -248,7 +251,8 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-17T00:00:00.000Z
-Stopped at: 06.3-01 COMPLETE (commits c1a38a9 Task1 / 1939ab8 Task2 / 441f36d Task3) — the grouped der seam + ranking fixture corpus, the LOSS-04 design hinge. Task1: cb-train::build_query_info builds Vec<QueryInfo> (mirror TQueryInfo query.h:19-44) from Pool group_id/subgroup_id/pairs — contiguous-unique run assertion (GroupSamples query.h:48-67) -> typed CbError::Degenerate (no panic, T-06.3-01-01); explicit pairs -> group-local competitors (data_providers.cpp:315-340); cross-group/out-of-range pair -> CbError::OutOfRange (T-06.3-01-02); group weight = mean of members via sum_f64; 10 unit tests. Task2: cb-compute::calc_ders_for_queries grouped der seam (mirror CalcDersForQueries error_functions.h:831-841) — re-declared compute-tier GroupSpan/Competitor (NO cb-train dep, preserves layering); per-group slice + bounds-validate; group_reduce_weighted normalizer through sum_f64; empty group -> 0 (no divide, Security V5); every loss arm -> typed "not yet wired" OutOfRange (Plans 02-05 fill). Runtime::compute_gradients_grouped sibling trait method (host-side default impl, no kernel); pointwise compute_gradients signature BYTE-IDENTICAL (D-04 no-regression); 9 unit tests. Task3: OFFLINE gen_ranking_fixtures.py — frozen catboost 1.2.10 ranking corpus (5 varied groups [3,2,4,1,2]/12 objs + subgroup_id + explicit pairs), --inputs/--loss/--metric args, per-stage .npy, pinned thread_count=1/depth=2/iterations=5/leaf_estimation_iterations=1/Plain/seed; END-TO-END validated against .venv catboost 1.2.10 (corpus inputs + QueryRMSE smoke fixture frozen-committed); README documents shape+params+version+OFFLINE run cmd. Gates: query_info 10/10, ranking_der 9/9, cb-train lib 154/154 (no regression), wave2/wave3 oracles 5/5. NOTE: gsd-tools CLI absent on this machine -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-02 (QueryRMSE + QuerySoftMax der arms). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-01-SUMMARY.md.
+Stopped at: 06.3-02 COMPLETE (commits f42e3e6 Task1 / 6b208dd Task2) — QueryRMSE + QuerySoftMax, the first two deterministic querywise ranking losses, trained end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. Task1: loss.rs queryrmse_der/querysoftmax_der per-object inner formulas (weight folded in); runtime.rs Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} (validate rejects lambda<0/beta≤0; defaults 0.01/1.0); ranking_der.rs wired arms — QueryRMSE per-group queryAvrg via sum_f64, QuerySoftMax max-shifted softmax der with sumWTargets≤0/weight≤0 guards; exhaustive-match arms added in cb-backend cpu_runtime + cb-train metrics/boosting + 3 cb-train oracle test files (workspace check --tests GREEN — the prior attempt's non-exhaustive cb-backend arm is closed). 11 new unit tests. Task2: boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view; train_ranking entry + RankingData; queryrmse/querysoftmax per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 (Cosine score; QueryRMSE=Newton leaf, QuerySoftMax=Gradient leaf per fixture model.json); QuerySoftMax fixture frozen OFFLINE. Gates: cb-compute 102/102, full cb-train suite 0 failures (154 lib + all oracles incl. D-04 no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-03 (PairLogit + LambdaMart, Wave B pairwise). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-02-SUMMARY.md.
+Stopped at (prior): 06.3-01 COMPLETE (commits c1a38a9 Task1 / 1939ab8 Task2 / 441f36d Task3) — the grouped der seam + ranking fixture corpus, the LOSS-04 design hinge. Task1: cb-train::build_query_info builds Vec<QueryInfo> (mirror TQueryInfo query.h:19-44) from Pool group_id/subgroup_id/pairs — contiguous-unique run assertion (GroupSamples query.h:48-67) -> typed CbError::Degenerate (no panic, T-06.3-01-01); explicit pairs -> group-local competitors (data_providers.cpp:315-340); cross-group/out-of-range pair -> CbError::OutOfRange (T-06.3-01-02); group weight = mean of members via sum_f64; 10 unit tests. Task2: cb-compute::calc_ders_for_queries grouped der seam (mirror CalcDersForQueries error_functions.h:831-841) — re-declared compute-tier GroupSpan/Competitor (NO cb-train dep, preserves layering); per-group slice + bounds-validate; group_reduce_weighted normalizer through sum_f64; empty group -> 0 (no divide, Security V5); every loss arm -> typed "not yet wired" OutOfRange (Plans 02-05 fill). Runtime::compute_gradients_grouped sibling trait method (host-side default impl, no kernel); pointwise compute_gradients signature BYTE-IDENTICAL (D-04 no-regression); 9 unit tests. Task3: OFFLINE gen_ranking_fixtures.py — frozen catboost 1.2.10 ranking corpus (5 varied groups [3,2,4,1,2]/12 objs + subgroup_id + explicit pairs), --inputs/--loss/--metric args, per-stage .npy, pinned thread_count=1/depth=2/iterations=5/leaf_estimation_iterations=1/Plain/seed; END-TO-END validated against .venv catboost 1.2.10 (corpus inputs + QueryRMSE smoke fixture frozen-committed); README documents shape+params+version+OFFLINE run cmd. Gates: query_info 10/10, ranking_der 9/9, cb-train lib 154/154 (no regression), wave2/wave3 oracles 5/5. NOTE: gsd-tools CLI absent on this machine -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-02 (QueryRMSE + QuerySoftMax der arms). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-01-SUMMARY.md.
 Stopped at (prior): Phase 6.3 context gathered
 Stopped at (prior): Phase 6.2 context gathered
 Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.

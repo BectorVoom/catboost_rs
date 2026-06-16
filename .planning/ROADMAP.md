@@ -364,7 +364,7 @@ Plans:
 
 **Wave 2** *(blocked on 06.3-01; 02 and 05 run in parallel — zero file overlap)*
 
-- [ ] 06.3-02-PLAN.md — Wave A losses: QueryRMSE + QuerySoftMax (deterministic per-group der on the grouped seam, pointwise leaf) — per-stage oracle ≤1e-5 (LOSS-04)
+- [x] 06.3-02-PLAN.md — Wave A losses: QueryRMSE + QuerySoftMax (deterministic per-group der on the grouped seam, pointwise leaf) — per-stage oracle ≤1e-5 (LOSS-04) — **COMPLETE** (f42e3e6/6b208dd): queryrmse_der/querysoftmax_der + Loss::QueryRmse/QuerySoftMax{lambda,beta} (validate, defaults 0.01/1.0); ranking_der.rs arms (queryAvrg + max-shifted softmax der, sum_f64, empty-group/sumWTargets≤0 guards); boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view (train_ranking + RankingData; non-ranking site byte-identical D-04); QueryRMSE=Newton / QuerySoftMax=Gradient leaf, Cosine score (per fixture); per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 vs catboost 1.2.10; QuerySoftMax fixture frozen OFFLINE. cb-compute 102/102, full cb-train suite 0 failures (D-04 no-regression). 11 new unit tests.
 - [ ] 06.3-05-PLAN.md — Wave D metrics: NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC — widened EvalMetric::eval_grouped + shared CompareDocs, eval-only, per-metric oracle ≤1e-5 (LOSS-05)
 
 **Wave 3** *(blocked on 06.3-01, 06.3-02)*
