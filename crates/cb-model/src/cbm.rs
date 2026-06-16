@@ -49,8 +49,8 @@ use flatbuffers::FlatBufferBuilder;
 
 use crate::error::ModelError;
 use crate::model_generated::ncat_boost_fbs::{
-    root_as_tmodel_core, TFloatFeature, TFloatFeatureArgs, TModelCore, TModelCoreArgs, TModelTrees,
-    TModelTreesArgs,
+    root_as_tmodel_core, TFloatFeature, TFloatFeatureArgs, TKeyValue, TKeyValueArgs, TModelCore,
+    TModelCoreArgs, TModelTrees, TModelTreesArgs,
 };
 use crate::{Model, ObliviousTree, Split};
 
@@ -239,11 +239,37 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     );
 
     let format_version = fbb.create_string(FLATBUFFERS_MODEL_V1);
+
+    // InfoMap: emit the multiclass `class_params` (the SORTED distinct class labels
+    // in `class_to_label`, the generic key upstream reads first, `model.cpp:1431`)
+    // as a JSON STRING value, ONLY when the model carries class labels. A scalar /
+    // regression model emits NO InfoMap, so the `.cbm` bytes stay byte-identical to
+    // the pre-6.2 scalar model (D-04). CR-01 / LOSS-02.
+    let info_map = if model.class_to_label.is_empty() {
+        None
+    } else {
+        let class_params_json = serde_json::json!({
+            "class_to_label": model.class_to_label,
+        })
+        .to_string();
+        let key = fbb.create_string("class_params");
+        let value = fbb.create_string(&class_params_json);
+        let kv = TKeyValue::create(
+            &mut fbb,
+            &TKeyValueArgs {
+                Key: Some(key),
+                Value: Some(value),
+            },
+        );
+        Some(fbb.create_vector(&[kv]))
+    };
+
     let core = TModelCore::create(
         &mut fbb,
         &TModelCoreArgs {
             FormatVersion: Some(format_version),
             ModelTrees: Some(model_trees),
+            InfoMap: info_map,
             ..TModelCoreArgs::default()
         },
     );
@@ -321,11 +347,54 @@ pub fn decode_cbm(buf: &[u8]) -> Result<Model, ModelError> {
         .ModelTrees()
         .ok_or_else(|| ModelError::Deserialize("missing ModelTrees".to_owned()))?;
 
-    reconstruct_model(&trees)
+    // Recover the multiclass class labels from the InfoMap `class_params` /
+    // `multiclass_params` JSON-string value (CR-01 / LOSS-02). Absent for a scalar
+    // model (empty vector).
+    let class_to_label = read_class_to_label(&model_core)?;
+
+    reconstruct_model(&trees, class_to_label)
 }
 
-/// Reconstruct the canonical [`Model`] from a verified `TModelTrees`.
-fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
+/// Parse the SORTED distinct class labels from the `TModelCore` InfoMap: find the
+/// `class_params` key (the generic key upstream reads first, `model.cpp:1431`),
+/// falling back to `multiclass_params`, whose VALUE is a JSON string carrying
+/// `class_to_label`. Each label coerces to `f64` (the canonical
+/// [`Model::class_to_label`] type). Absent InfoMap / key yields an empty vector (a
+/// scalar model carries no labels). A malformed JSON value is a typed
+/// [`ModelError::Deserialize`] — never a panic (T-6.2-06-02).
+fn read_class_to_label(core: &TModelCore) -> Result<Vec<f64>, ModelError> {
+    let Some(info_map) = core.InfoMap() else {
+        return Ok(Vec::new());
+    };
+    for key in ["class_params", "multiclass_params"] {
+        for i in 0..info_map.len() {
+            let kv = info_map.get(i);
+            if kv.Key() == key {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(kv.Value()).map_err(|e| {
+                        ModelError::Deserialize(format!(
+                            "malformed InfoMap {key} JSON value: {e}"
+                        ))
+                    })?;
+                let labels = parsed
+                    .get("class_to_label")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(serde_json::Value::as_f64)
+                            .collect::<Vec<f64>>()
+                    })
+                    .unwrap_or_default();
+                return Ok(labels);
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Reconstruct the canonical [`Model`] from a verified `TModelTrees`, carrying the
+/// `class_to_label` already parsed from the enclosing `TModelCore` InfoMap.
+fn reconstruct_model(trees: &TModelTrees, class_to_label: Vec<f64>) -> Result<Model, ModelError> {
     // Float-feature borders (f32 on the wire -> f64 canonical), in feature order.
     let float_feature_borders = read_float_feature_borders(trees)?;
     let bins = build_bin_features(&float_feature_borders);
@@ -415,11 +484,9 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
         float_feature_borders,
         ctr_data: None,
         approx_dimension: dim,
-        // The .cbm flatbuffer carries the class labels in the model-info blob; the
-        // per-stage train oracle constructs the model via `from_trained` (which
-        // carries `class_to_label`), so the deserialize path leaves it empty until
-        // a later plan wires the model-info class_params round-trip.
-        class_to_label: Vec::new(),
+        // Recovered from the `TModelCore` InfoMap `class_params` / `multiclass_params`
+        // JSON value (CR-01 / LOSS-02); empty for a scalar model.
+        class_to_label,
     })
 }
 

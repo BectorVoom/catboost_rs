@@ -100,6 +100,48 @@ struct ModelJsonDoc {
     oblivious_trees: Vec<ObliviousTreeJson>,
     /// Upstream `[scale, [bias, …]]`; emitted as `[1, [bias]]` (Pitfall 6).
     scale_and_bias: serde_json::Value,
+    /// The upstream `model_info` block — carries `class_params` /
+    /// `multiclass_params` for a multiclass model (the SORTED distinct class labels
+    /// in `class_to_label`, LOSS-02 / CR-01). `#[serde(default)]` so scalar fixtures
+    /// with NO `model_info` still parse; `skip_serializing_if` so a scalar export
+    /// (no class labels) omits the key entirely (the D-04 json round-trip stays
+    /// byte-identical to the pre-6.2 scalar export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_info: Option<serde_json::Value>,
+}
+
+/// Extract the SORTED distinct class labels (`class_to_label`) from a parsed
+/// `model_info` value: read `class_params.class_to_label` (the new generic key,
+/// `model.cpp:1431`), falling back to `multiclass_params.class_to_label`. Each
+/// label is coerced to `f64` (the canonical `Model::class_to_label` type, matching
+/// the trainer-side sorted distinct labels). An absent / malformed block yields an
+/// empty vector (a scalar model carries no class labels) — never a panic.
+fn class_to_label_from_model_info(model_info: &serde_json::Value) -> Vec<f64> {
+    for key in ["class_params", "multiclass_params"] {
+        if let Some(arr) = model_info
+            .get(key)
+            .and_then(|p| p.get("class_to_label"))
+            .and_then(serde_json::Value::as_array)
+        {
+            return arr.iter().filter_map(serde_json::Value::as_f64).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Build a `model_info` value carrying the model's `class_to_label` under the
+/// generic `class_params` key (matching upstream `model.cpp:1765`), or `None` when
+/// the model has no class labels (a scalar / regression model — the key is then
+/// omitted so the scalar json export stays byte-identical, D-04).
+fn model_info_from_class_labels(class_to_label: &[f64]) -> Option<serde_json::Value> {
+    if class_to_label.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "class_params": {
+            "class_to_label": class_to_label,
+        }
+    }))
 }
 
 /// Build the serializable document from the canonical model.
@@ -169,6 +211,9 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
         // (per-dim bias plumbing lands with the multi-output losses, Plans
         // 06.2-03..05); for the in-scope dim=1 models this branch is never taken.
         scale_and_bias: serde_json::json!([1, vec![model.bias; dim]]),
+        // Emit the multiclass `class_params.class_to_label` only when present; a
+        // scalar model omits `model_info` entirely (byte-identical scalar export).
+        model_info: model_info_from_class_labels(&model.class_to_label),
     }
 }
 
@@ -275,17 +320,23 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         })
         .collect::<Result<Vec<_>, ModelError>>()?;
 
+    // Recover the SORTED distinct class labels from `model_info.class_params`
+    // (falling back to `multiclass_params`), CR-01 / LOSS-02. Absent for a scalar
+    // model (empty vector — the Class transform then falls back to the raw class
+    // index, predict.rs).
+    let class_to_label = doc
+        .model_info
+        .as_ref()
+        .map(class_to_label_from_model_info)
+        .unwrap_or_default();
+
     Ok(Model {
         oblivious_trees,
         bias: read_bias(&doc.scale_and_bias)?,
         float_feature_borders,
         ctr_data: None,
         approx_dimension: dim,
-        // The json model carries class labels in `model_info.class_params`; the
-        // per-stage train oracle constructs the model via `from_trained`, so the
-        // json deserialize path leaves it empty until a later plan wires the
-        // class_params round-trip.
-        class_to_label: Vec::new(),
+        class_to_label,
     })
 }
 
