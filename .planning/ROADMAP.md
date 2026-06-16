@@ -294,8 +294,16 @@ Plans:
   4. "etc." losses not explicitly named here are deferred-to-v2 (D-06), not silently in-scope.
 
 **Plans**: 3 plans (family waves, each its own ≤1e-5 oracle gate — D-6.1-02)
+**Wave 1**
+
 - [ ] 06.1-01-PLAN.md — Wave 1: smooth losses (LogCosh, Lq{q≥2}, Huber{δ}, Expectile{α}) — der1/der2 transcription + Newton/Exact leaf, per-stage oracle ≤1e-5
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 06.1-02-PLAN.md — Wave 2: positive-domain/link (Poisson exp-link, Tweedie{p}, MAPE) + MSLE eval-metric-only (D-6.1-06)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 06.1-03-PLAN.md — Wave 3: Quantile{α,δ} generalizing MAE via α-threaded Exact leaf — completes the LOSS-03 scalar matrix
 
 ### Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor

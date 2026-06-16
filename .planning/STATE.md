@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
-last_updated: "2026-06-15T12:29:38.405Z"
-last_activity: 2026-06-15 -- 05-19 complete; bar (c) / SC-1 / ORD-01 closed (pc=4 e2e ≤1e-5)
+status: planning
+stopped_at: "Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md."
+last_updated: "2026-06-16T04:42:54.420Z"
+last_activity: "2026-06-16 -- 6.1 discuss complete: MultiQuantile→6.2, grouped family waves, Loss enum-variant params + upstream defaults, Exact leaf est for non-smooth losses"
 progress:
   total_phases: 8
   completed_phases: 5
