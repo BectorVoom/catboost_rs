@@ -158,6 +158,70 @@ fn expectile_gradients_match_host_reference() {
     }
 }
 
+// --- Wave-2 positive-domain / link losses (Plan 06.1-02) -------------------
+
+/// Poisson kernels: der1 = `target - exp(approx)`, der2 = `-exp(approx)` over the
+/// RAW approx (inline exp). Moderate approx range so exp stays finite
+/// (T-06.1.02-01).
+#[test]
+fn poisson_gradients_match_host_reference() {
+    let approx = [0.0, 0.5, -1.0, 1.5, 2.0, -0.25, 1.0];
+    let target = [3.0, 1.0, 4.0, 2.0, 5.0, 1.5, 2.0];
+
+    let ders = CpuBackend
+        .compute_gradients(Loss::Poisson, &approx, &target)
+        .unwrap();
+
+    for i in 0..approx.len() {
+        let e = approx[i].exp();
+        assert!((ders.der1[i] - (target[i] - e)).abs() <= 1e-12, "poisson der1 i={i}");
+        assert!((ders.der2[i] - (-e)).abs() <= 1e-12, "poisson der2 i={i}");
+    }
+}
+
+/// Tweedie{variance_power=1.5} kernels: exp INSIDE the der over the RAW approx.
+#[test]
+fn tweedie_gradients_match_host_reference() {
+    let p = 1.5;
+    let approx = [0.0, 0.5, -1.0, 1.0, 2.0, -0.5, 0.25];
+    let target = [3.0, 1.0, 4.0, 2.0, 5.0, 1.5, 2.0];
+
+    let ders = CpuBackend
+        .compute_gradients(Loss::Tweedie { variance_power: p }, &approx, &target)
+        .unwrap();
+
+    for i in 0..approx.len() {
+        let a = approx[i];
+        let t = target[i];
+        let e1 = ((1.0 - p) * a).exp();
+        let e2 = ((2.0 - p) * a).exp();
+        let want1 = t * e1 - e2;
+        let want2 = t * (1.0 - p) * e1 - (2.0 - p) * e2;
+        assert!((ders.der1[i] - want1).abs() <= 1e-12, "tweedie der1 i={i}");
+        assert!((ders.der2[i] - want2).abs() <= 1e-12, "tweedie der2 i={i}");
+    }
+}
+
+/// MAPE kernel: der1 = `sign(target-approx)/max(1,|target|)`, der2 = 0
+/// (constant). Exercises the |target|<1 vs >1 divisor floor and the sign branch.
+#[test]
+fn mape_gradients_match_host_reference() {
+    let approx = [2.0, 7.0, 0.0, 2.0, 3.0, -1.0, 0.5];
+    let target = [5.0, 5.0, 0.5, 0.5, 3.0, 4.0, 0.5];
+
+    let ders = CpuBackend
+        .compute_gradients(Loss::Mape, &approx, &target)
+        .unwrap();
+
+    for i in 0..approx.len() {
+        let denom = 1.0_f64.max(target[i].abs());
+        let sign = if target[i] - approx[i] > 0.0 { 1.0 } else { -1.0 };
+        let want1 = sign / denom;
+        assert!((ders.der1[i] - want1).abs() <= 1e-12, "mape der1 i={i}");
+        assert!(ders.der2[i].abs() <= 1e-12, "mape der2 i={i} must be 0");
+    }
+}
+
 #[test]
 fn length_mismatch_is_error_not_panic() {
     let approx = [0.0, 1.0];

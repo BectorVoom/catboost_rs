@@ -108,6 +108,37 @@ pub enum Loss {
         /// Expectile asymmetry `alpha ∈ [0, 1]` (`Expectile:alpha=<value>`).
         alpha: f64,
     },
+    /// Poisson (positive-domain / exp-link regression, D-6.1-02 Wave 2): der1 =
+    /// `target - exp(approx)`, der2 = `-exp(approx)` over the RAW approx
+    /// (`error_functions.h:657-676` `TPoissonError`). Poisson is `IsStoreExpApprox`
+    /// upstream (`approx_updater_helpers.h:60-72`) — cb-train stores RAW approx and
+    /// computes `exp()` INLINE in the der (the Logloss inline-sigmoid precedent),
+    /// with the final prediction transformed via `Exponent` (raw staged approx,
+    /// `exp(raw)` predictions; Open Q1 / Pitfall 4). Non-parametric. Upstream
+    /// default leaf method is Newton with `leaf_estimation_iterations:10`; the
+    /// fixture pins iterations:1 (Pitfall 3).
+    Poisson,
+    /// Tweedie{variance_power} (positive-domain regression, D-6.1-02 Wave 2;
+    /// D-6.1-03 parametric variant): with `p = variance_power`, der1 =
+    /// `target*e^((1-p)*approx) - e^((2-p)*approx)`, der2 =
+    /// `target*(1-p)*e^((1-p)*approx) - (2-p)*e^((2-p)*approx)` over the RAW approx
+    /// (`error_functions.h:1634-1665` `TTweedieError`). `variance_power` is
+    /// MANDATORY (no default) and must lie in `(1, 2)` (`error_functions.h:643`).
+    /// NOT exp-approx (`isExpApprox==false`, `error_functions.h:1644`) — the `exp`
+    /// lives INSIDE the der formula; the prediction is the RAW approx (NO Exponent
+    /// transform — A4). Upstream default leaf method is Newton.
+    Tweedie {
+        /// Tweedie variance power `p ∈ (1, 2)` (`Tweedie:variance_power=<value>`).
+        variance_power: f64,
+    },
+    /// MAPE (positive-domain robust regression, D-6.1-02 Wave 2): with the divisor
+    /// `max(1.0, |target|)`, der1 = `sign(target - approx) / max(1.0, |target|)`,
+    /// der2 = `0` (`error_functions.h:607-630` `TMAPEError`). Non-parametric. The
+    /// `1.f` divisor floor is an f32-domain literal upstream (Pitfall 7);
+    /// transcribed as `f64::max(1.0, target.abs())`. der2=0 so Newton is undefined
+    /// (Pitfall 5) — upstream default leaf method is Gradient
+    /// (`catboost_options.cpp:113-124`), which the fixture pins.
+    Mape,
 }
 
 /// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
@@ -155,12 +186,26 @@ impl Loss {
                     )));
                 }
             }
+            // Tweedie variance_power MUST be in the open interval (1, 2)
+            // (`error_functions.h:643` `CB_ENSURE(VariancePower > 1 &&
+            // VariancePower < 2)`). Outside this range the `e^((1-p)*a)` /
+            // `e^((2-p)*a)` der terms degenerate (T-06.1.02-02), so reject up front
+            // with a typed CbError (no `unwrap`/`panic`).
+            Self::Tweedie { variance_power } => {
+                if !variance_power.is_finite() || variance_power <= 1.0 || variance_power >= 2.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "Tweedie variance_power must be finite and in (1, 2), got {variance_power}"
+                    )));
+                }
+            }
             Self::Rmse
             | Self::Logloss
             | Self::CrossEntropy
             | Self::Focal { .. }
             | Self::Mae
-            | Self::LogCosh => {}
+            | Self::LogCosh
+            | Self::Poisson
+            | Self::Mape => {}
         }
         Ok(())
     }

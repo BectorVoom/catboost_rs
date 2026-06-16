@@ -23,7 +23,9 @@ use crate::kernels::{
     expectile_gradient_kernel, expectile_hessian_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, huber_gradient_kernel, huber_hessian_kernel,
     logcosh_gradient_kernel, logcosh_hessian_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    lq_gradient_kernel, lq_hessian_kernel, mae_gradient_kernel,
+    lq_gradient_kernel, lq_hessian_kernel, mae_gradient_kernel, mape_gradient_kernel,
+    poisson_gradient_kernel, poisson_hessian_kernel, tweedie_gradient_kernel,
+    tweedie_hessian_kernel,
 };
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
@@ -103,6 +105,26 @@ fn launch_binary_f64(
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
             )
         }
+        BinaryKernel::PoissonGradient => {
+            poisson_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            )
+        }
+        BinaryKernel::MapeGradient => {
+            mape_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            )
+        }
     }
 
     let bytes = client
@@ -121,6 +143,12 @@ enum BinaryKernel {
     MaeGradient,
     LogCoshGradient,
     LogCoshHessian,
+    /// Poisson gradient `target - exp(approx)` (the hessian is the unary
+    /// [`launch_poisson_hessian`] — no target input).
+    PoissonGradient,
+    /// MAPE gradient `sign(target-approx)/max(1,|target|)` (der2=0 — no hessian
+    /// kernel; the dispatch fills a constant-0 vec, the Mae precedent).
+    MapeGradient,
 }
 
 /// Launch the Logloss hessian kernel (`der2 = -p*(1-p)`) on `CpuRuntime`.
@@ -136,6 +164,38 @@ fn launch_logloss_hessian(approx: &[f64]) -> Vec<f64> {
     let num_cubes = n.div_ceil(cube_dim).max(1);
 
     logloss_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+        &client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim {
+            x: cube_dim as u32,
+            y: 1,
+            z: 1,
+        },
+        unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+    );
+
+    let bytes = client
+        .read_one(out_handle)
+        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
+    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+}
+
+/// Launch the Poisson hessian kernel (`der2 = -exp(approx)`) on `CpuRuntime`. A
+/// unary (approx-only) kernel like [`launch_logloss_hessian`] — the Poisson
+/// hessian does not depend on the target.
+fn launch_poisson_hessian(approx: &[f64]) -> Vec<f64> {
+    let n = approx.len();
+    let device = cubecl::cpu::CpuDevice;
+    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let out_handle = client.empty(std::mem::size_of_val(approx));
+
+    let cube_dim = 32usize;
+    let num_cubes = n.div_ceil(cube_dim).max(1);
+
+    poisson_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
         &client,
         CubeCount::Static(num_cubes as u32, 1, 1),
         CubeDim {
@@ -224,6 +284,9 @@ enum ParamKernel {
     Lq,
     Huber,
     Expectile,
+    /// Tweedie{variance_power}: gradient + hessian both carry the `variance_power`
+    /// scalar as a length-1 device array (the exp lives inside the der; raw approx).
+    Tweedie,
 }
 
 /// Launch a single-parameter smooth-loss derivative kernel (`gradient` or
@@ -287,6 +350,16 @@ fn launch_param_f64(
         }
         (ParamKernel::Expectile, true) => {
             expectile_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+            )
+        }
+        (ParamKernel::Tweedie, false) => {
+            tweedie_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+            )
+        }
+        (ParamKernel::Tweedie, true) => {
+            tweedie_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
                 &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
             )
         }
@@ -364,6 +437,30 @@ impl Runtime for CpuBackend {
             Loss::Expectile { alpha } => {
                 let der1 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, false);
                 let der2 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, true);
+                Ok(Derivatives { der1, der2 })
+            }
+            // Wave-2 positive-domain / link losses (D-6.1-02 / Plan 06.1-02).
+            // Poisson: exp-link der (inline F::exp); gradient is a binary kernel,
+            // the hessian is the unary -exp(approx) kernel (no target input).
+            Loss::Poisson => {
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::PoissonGradient);
+                let der2 = launch_poisson_hessian(approx);
+                Ok(Derivatives { der1, der2 })
+            }
+            // Tweedie: exp INSIDE the der (raw approx, NOT exp-approx); both
+            // gradient and hessian carry the variance_power scalar param.
+            Loss::Tweedie { variance_power } => {
+                let der1 =
+                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, false);
+                let der2 =
+                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, true);
+                Ok(Derivatives { der1, der2 })
+            }
+            // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient
+            // kernel; the hessian is the constant 0.0 vec (the Mae precedent).
+            Loss::Mape => {
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::MapeGradient);
+                let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
             }
         }

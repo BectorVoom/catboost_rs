@@ -375,6 +375,124 @@ pub fn expectile_hessian_kernel<F: Float>(
     }
 }
 
+/// First-order Poisson gradient kernel: `der1[i] = target[i] - exp(approx[i])`
+/// over the RAW approx.
+///
+/// `error_functions.h:657-676` (`TPoissonError::CalcDer`). Poisson is
+/// IsStoreExpApprox upstream but cb-train stores RAW approx and computes `F::exp`
+/// INLINE here (the [`logloss_gradient_kernel`] inline-link precedent — the final
+/// prediction applies the `Exponent` transform). `F::exp` is kernel-legal.
+/// Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn poisson_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let e = F::exp(approx[ABSOLUTE_POS]);
+        der1[ABSOLUTE_POS] = target[ABSOLUTE_POS] - e;
+    }
+}
+
+/// Second-order Poisson hessian kernel: `der2[i] = -exp(approx[i])` over the RAW
+/// approx.
+///
+/// `error_functions.h:657-676` (`TPoissonError::CalcDer2 = -expApprox`). Always
+/// strictly negative (convex). `F::exp` INLINE on the raw approx (the Poisson
+/// inline-link discipline). Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn poisson_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) {
+    if ABSOLUTE_POS < approx.len() {
+        let e = F::exp(approx[ABSOLUTE_POS]);
+        der2[ABSOLUTE_POS] = F::new(0.0) - e;
+    }
+}
+
+/// First-order Tweedie{variance_power} gradient kernel: with `p = variance_power`,
+/// `der1[i] = target*e^((1-p)*approx) - e^((2-p)*approx)` over the RAW approx.
+///
+/// `error_functions.h:1648-1652` (`TTweedieError::CalcDer`). The `variance_power`
+/// passes as a length-1 `Array<F>` (read at index 0) — generics-float discipline
+/// (the [`focal_gradient_kernel`] length-1-array precedent). Tweedie is NOT
+/// exp-approx (`error_functions.h:1644`): the `F::exp` lives INSIDE the der over
+/// the raw approx; no `Exponent` predict transform (A4). `F::exp` is kernel-legal.
+/// Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn tweedie_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+    variance_power: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let two = F::new(2.0);
+        let p = variance_power[0];
+        let a = approx[ABSOLUTE_POS];
+        let t = target[ABSOLUTE_POS];
+        let e1 = F::exp((one - p) * a);
+        let e2 = F::exp((two - p) * a);
+        der1[ABSOLUTE_POS] = t * e1 - e2;
+    }
+}
+
+/// Second-order Tweedie{variance_power} hessian kernel: with `p = variance_power`,
+/// `der2[i] = target*(1-p)*e^((1-p)*approx) - (2-p)*e^((2-p)*approx)` over the RAW
+/// approx.
+///
+/// `error_functions.h:1654-1658` (`TTweedieError::CalcDer2`). `variance_power`
+/// passes as a length-1 `Array<F>` like [`tweedie_gradient_kernel`]. exp INSIDE
+/// the der (raw approx, NOT exp-approx). Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn tweedie_hessian_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der2: &mut Array<F>,
+    variance_power: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let two = F::new(2.0);
+        let p = variance_power[0];
+        let a = approx[ABSOLUTE_POS];
+        let t = target[ABSOLUTE_POS];
+        let e1 = F::exp((one - p) * a);
+        let e2 = F::exp((two - p) * a);
+        der2[ABSOLUTE_POS] = t * (one - p) * e1 - (two - p) * e2;
+    }
+}
+
+/// First-order MAPE gradient kernel: `der1[i] = sign(target-approx) /
+/// max(1.0, |target|)`.
+///
+/// `error_functions.h:607-630` (`TMAPEError::CalcDer`). Non-parametric; the divisor
+/// `max(1.0, |target|) >= 1.0` so the division is always safe (T-06.1.02-04). The
+/// `1.f` divisor floor is f32-domain upstream (Pitfall 7); `F::max(1.0, |t|)`
+/// reproduces it. The `target - approx > 0` sign uses the if-as-STATEMENT pattern
+/// (CubeCL conditionals manual): `sign` is initialized to `-1` (covering the tie
+/// `target == approx`, upstream's `> 0 ? 1 : -1`) and flipped to `+1` only when the
+/// residual is positive. der2 is the constant 0 (no kernel — the dispatch fills a
+/// zero vec, the Mae precedent). Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn mape_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let a = approx[ABSOLUTE_POS];
+        let t = target[ABSOLUTE_POS];
+        let denom = F::max(one, F::abs(t));
+        let mut sign = F::new(0.0) - one;
+        if t - a > F::new(0.0) {
+            sign = one;
+        }
+        der1[ABSOLUTE_POS] = sign / denom;
+    }
+}
+
 /// Histogram-scatter kernel: per-object, write the object's weighted gradient
 /// contribution into its OWN per-object output slot (`contrib[i] = der1[i] *
 /// weight[i]`).

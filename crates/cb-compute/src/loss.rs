@@ -301,3 +301,87 @@ pub fn expectile_der2(approx: f64, target: f64, alpha: f64) -> f64 {
         -2.0 * (1.0 - alpha)
     }
 }
+
+/// Poisson first derivative for one object: `der1 = target - exp(approx)` over the
+/// RAW approx.
+///
+/// `error_functions.h:657-676` — `TPoissonError::CalcDer`: upstream receives the
+/// already-exponentiated approx (`expApprox`) and returns `target - expApprox`.
+/// Poisson is `IsStoreExpApprox` upstream (`approx_updater_helpers.h:60-72`), but
+/// cb-train stores RAW approx and computes `exp()` INLINE here — the same inline-
+/// link equivalence as Logloss's [`sigmoid`] (`approx` is the model's
+/// `RawFormulaVal`; the final prediction applies the `Exponent` transform). No
+/// exp-approx storage is implemented (RESEARCH Pattern 2 / Pitfall 4).
+#[must_use]
+pub fn poisson_der1(approx: f64, target: f64) -> f64 {
+    target - approx.exp()
+}
+
+/// Poisson second derivative for one object: `der2 = -exp(approx)` over the RAW
+/// approx.
+///
+/// `error_functions.h:657-676` — `TPoissonError::CalcDer2 = -expApprox`. Always
+/// strictly negative (the loss is convex), so Newton is well-defined. `exp()` is
+/// computed INLINE on the raw approx (the [`poisson_der1`] inline-link discipline).
+#[must_use]
+pub fn poisson_der2(approx: f64, _target: f64) -> f64 {
+    -approx.exp()
+}
+
+/// Tweedie{variance_power} first derivative for one object: with `p =
+/// variance_power` and the RAW approx,
+/// `der1 = target*e^((1-p)*approx) - e^((2-p)*approx)`.
+///
+/// `error_functions.h:1648-1652` — `TTweedieError::CalcDer`:
+/// `der1 = -(-target*exp((1-p)*approx) + exp((2-p)*approx))` =
+/// `target*exp((1-p)*approx) - exp((2-p)*approx)`. Tweedie is NOT exp-approx
+/// (`isExpApprox==false`, `error_functions.h:1644`) — the `exp` lives INSIDE the
+/// der formula directly over the raw approx; there is NO `Exponent` predict
+/// transform (the prediction is the raw approx — A4). `variance_power ∈ (1, 2)` is
+/// validated by [`crate::Loss::validate`].
+#[must_use]
+pub fn tweedie_der1(approx: f64, target: f64, variance_power: f64) -> f64 {
+    let p = variance_power;
+    target * ((1.0 - p) * approx).exp() - ((2.0 - p) * approx).exp()
+}
+
+/// Tweedie{variance_power} second derivative for one object: with `p =
+/// variance_power` and the RAW approx,
+/// `der2 = target*(1-p)*e^((1-p)*approx) - (2-p)*e^((2-p)*approx)`.
+///
+/// `error_functions.h:1654-1658` — `TTweedieError::CalcDer2`:
+/// `der2 = -(target*(1-p)*exp((1-p)*approx) ... )` simplifies to
+/// `target*(1-p)*exp((1-p)*approx) - (2-p)*exp((2-p)*approx)` (the partial
+/// derivative of [`tweedie_der1`] w.r.t. `approx`). exp INSIDE the der (raw
+/// approx, NOT exp-approx — `error_functions.h:1644`).
+#[must_use]
+pub fn tweedie_der2(approx: f64, target: f64, variance_power: f64) -> f64 {
+    let p = variance_power;
+    target * (1.0 - p) * ((1.0 - p) * approx).exp() - (2.0 - p) * ((2.0 - p) * approx).exp()
+}
+
+/// MAPE first derivative for one object: `der1 = sign(target - approx) /
+/// max(1.0, |target|)`.
+///
+/// `error_functions.h:607-630` — `TMAPEError::CalcDer`: `der = (target - approx >
+/// 0 ? 1 : -1) / Max(1.f, Abs(target))`. The `1.f` divisor floor is an f32-domain
+/// literal upstream (Pitfall 7); transcribed as `f64::max(1.0, target.abs())` —
+/// the divisor is always `>= 1.0` so the division is never by zero (T-06.1.02-04).
+/// The `> 0 ? 1 : -1` branch maps the tie `target == approx` to `-1` (upstream's
+/// exact form).
+#[must_use]
+pub fn mape_der1(approx: f64, target: f64) -> f64 {
+    let denom = 1.0_f64.max(target.abs());
+    let sign = if target - approx > 0.0 { 1.0 } else { -1.0 };
+    sign / denom
+}
+
+/// MAPE second derivative for one object: `der2 = 0`.
+///
+/// `error_functions.h:607-630` — `TMAPEError` has `MAPE_DER2 = 0.0` (the absolute-
+/// percentage residual is piecewise-linear, zero curvature). der2=0 makes Newton
+/// undefined (Pitfall 5), so upstream routes MAPE to the Gradient leaf method.
+#[must_use]
+pub fn mape_der2(_approx: f64, _target: f64) -> f64 {
+    0.0
+}

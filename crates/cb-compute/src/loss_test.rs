@@ -5,7 +5,8 @@
 use crate::loss::{
     cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
     huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
-    lq_der2, mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
+    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, rmse_der1,
+    rmse_der2, sigmoid, tweedie_der1, tweedie_der2,
 };
 
 #[test]
@@ -214,4 +215,72 @@ fn expectile_der2_piecewise_constant() {
     assert!((expectile_der2(2.0, 0.0, alpha) - (-1.4)).abs() < 1e-12); // e<0 -> -2*0.7
     // e == 0 -> below-branch -2*(1-a).
     assert!((expectile_der2(1.0, 1.0, alpha) - (-1.4)).abs() < 1e-12);
+}
+
+// --- Wave-2 positive-domain / link losses (Plan 06.1-02) -------------------
+
+/// Poisson der1 = `target - exp(approx)`, exp computed INLINE on the raw approx.
+#[test]
+fn poisson_der1_is_target_minus_exp_approx() {
+    // approx = 0 -> exp(0) = 1, der1 = target - 1.
+    assert!((poisson_der1(0.0, 3.0) - 2.0).abs() < 1e-12);
+    // approx = 1 -> exp(1) = e, der1 = 5 - e.
+    assert!((poisson_der1(1.0, 5.0) - (5.0 - std::f64::consts::E)).abs() < 1e-12);
+    // A known approx: approx = ln(4) -> exp = 4, der1 = 10 - 4 = 6.
+    assert!((poisson_der1(4.0_f64.ln(), 10.0) - 6.0).abs() < 1e-12);
+}
+
+/// Poisson der2 = `-exp(approx)` (strictly negative, convex).
+#[test]
+fn poisson_der2_is_negative_exp_approx() {
+    assert!((poisson_der2(0.0, 99.0) - (-1.0)).abs() < 1e-12);
+    assert!((poisson_der2(4.0_f64.ln(), 0.0) - (-4.0)).abs() < 1e-12);
+    // der2 does not depend on target.
+    assert!((poisson_der2(2.0, 1.0) - poisson_der2(2.0, 7.0)).abs() < 1e-12);
+}
+
+/// Tweedie der1 = `target*e^((1-p)*approx) - e^((2-p)*approx)` at p=1.5 (exp
+/// INSIDE the der; raw approx).
+#[test]
+fn tweedie_der1_at_p_1_5() {
+    let p = 1.5;
+    // approx = 0 -> e^0 = 1 both terms: der1 = target*1 - 1 = target - 1.
+    assert!((tweedie_der1(0.0, 4.0, p) - 3.0).abs() < 1e-12);
+    // approx = 2, target = 3: 3*e^(-1) - e^(1).
+    let expected = 3.0 * (-1.0_f64).exp() - (1.0_f64).exp();
+    assert!((tweedie_der1(2.0, 3.0, p) - expected).abs() < 1e-12);
+}
+
+/// Tweedie der2 = `target*(1-p)*e^((1-p)*approx) - (2-p)*e^((2-p)*approx)` at p=1.5.
+#[test]
+fn tweedie_der2_at_p_1_5() {
+    let p = 1.5;
+    // approx = 0: target*(1-p) - (2-p) = target*(-0.5) - 0.5.
+    assert!((tweedie_der2(0.0, 4.0, p) - (4.0 * -0.5 - 0.5)).abs() < 1e-12);
+    let expected = 3.0 * (-0.5) * (-1.0_f64).exp() - 0.5 * (1.0_f64).exp();
+    assert!((tweedie_der2(2.0, 3.0, p) - expected).abs() < 1e-12);
+}
+
+/// MAPE der1 = `sign(target-approx)/max(1.0,|target|)` — test the |target|<1 vs
+/// >1 divisor boundary (Pitfall 7) and the sign branch.
+#[test]
+fn mape_der1_divisor_boundary_and_sign() {
+    // |target| = 5 > 1 -> divisor 5. target>approx -> +1/5 = 0.2.
+    assert!((mape_der1(2.0, 5.0) - 0.2).abs() < 1e-12);
+    // target<approx -> -1/5.
+    assert!((mape_der1(7.0, 5.0) - (-0.2)).abs() < 1e-12);
+    // |target| = 0.5 < 1 -> divisor floored to 1.0. target>approx -> +1.
+    assert!((mape_der1(0.0, 0.5) - 1.0).abs() < 1e-12);
+    // |target| = 0.5, target<approx -> -1 (divisor floor 1.0).
+    assert!((mape_der1(2.0, 0.5) - (-1.0)).abs() < 1e-12);
+    // tie target == approx maps to the -1 branch (upstream `> 0 ? 1 : -1`).
+    assert!((mape_der1(3.0, 3.0) - (-1.0 / 3.0)).abs() < 1e-12);
+}
+
+/// MAPE der2 is constant 0 (Pitfall 5: Newton undefined -> Gradient leaf).
+#[test]
+fn mape_der2_is_zero() {
+    assert!(mape_der2(0.0, 5.0).abs() < 1e-12);
+    assert!(mape_der2(2.0, 0.5).abs() < 1e-12);
+    assert!(mape_der2(-100.0, 100.0).abs() < 1e-12);
 }
