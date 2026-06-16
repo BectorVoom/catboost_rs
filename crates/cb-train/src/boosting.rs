@@ -671,6 +671,50 @@ fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
     }
 }
 
+/// Reject `(loss, leaf_method)` combinations with no defined leaf optimizer
+/// before any training work (WR-01 / WR-02), rather than silently producing a
+/// plausible-but-wrong leaf value.
+///
+/// - `Exact` has a defined 1-D optimum ONLY for the losses dispatched in
+///   [`compute_leaf_deltas`]'s `Exact` arm: [`Loss::LogCosh`] (monotone-bisection
+///   `Σ tanh(δ - r) = 0` root) and [`Loss::Mae`] / [`Loss::Quantile`] (weighted
+///   sample quantile). Every other loss falls through to the quantile-median
+///   fallback, which is NOT that loss's optimum, so reject it up front (upstream
+///   `catboost_options.cpp:346` likewise rejects Exact for most losses).
+/// - [`Loss::Lq`] with `q < 2` produces a `-q*(q-1)*|r|^(q-2)` hessian that
+///   diverges to `±inf` as the residual approaches zero; Newton's denominator
+///   then sees `inf`/`NaN`. `Loss::validate` permits any `q >= 1`, so gate the
+///   Newton + `q < 2` combination here (the only Newton-clean regime is
+///   `q >= 2`).
+///
+/// # Errors
+/// Returns [`CbError::OutOfRange`] for an unsupported `(loss, method)` pair.
+fn validate_leaf_method(loss: Loss, method: LeafMethod) -> CbResult<()> {
+    if matches!(method, LeafMethod::Exact)
+        && !matches!(
+            loss,
+            Loss::LogCosh | Loss::Mae | Loss::Quantile { .. }
+        )
+    {
+        return Err(CbError::OutOfRange(format!(
+            "LeafMethod::Exact has no defined optimizer for {loss:?}; \
+             Exact is supported only for LogCosh, Mae, and Quantile"
+        )));
+    }
+    if matches!(method, LeafMethod::Newton) {
+        if let Loss::Lq { q } = loss {
+            if q < 2.0 {
+                return Err(CbError::OutOfRange(format!(
+                    "Lq{{q={q}}} with LeafMethod::Newton is undefined: the \
+                     hessian -q*(q-1)*|r|^(q-2) diverges for q < 2 near a zero \
+                     residual; use q >= 2 or a non-Newton leaf method"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compute the per-leaf deltas for the selected [`LeafMethod`] (TRAIN-03 / D-09).
 ///
 /// Gradient/Newton/Simple are closed-form over each leaf's ordered reduced sums
@@ -1134,6 +1178,12 @@ fn train_inner<R: Runtime>(
     // NaN/Inf derivatives that poison the histogram and leaf reductions, so it is
     // rejected up front with a typed CbError rather than producing a corrupt model.
     params.loss.validate()?;
+
+    // Reject unsupported (loss, leaf_method) combinations up front (WR-01 /
+    // WR-02): an Exact method on a loss with no defined optimizer would silently
+    // compute the weighted median instead of that loss's true optimum, and an
+    // Lq{q<2} Newton step would inject inf/NaN into the leaf denominator.
+    validate_leaf_method(params.loss, params.leaf_method)?;
 
     let n = target.len();
     if n == 0 {
