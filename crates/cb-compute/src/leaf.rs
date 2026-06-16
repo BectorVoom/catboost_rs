@@ -186,7 +186,15 @@ pub fn exact_leaf_delta(residuals: &[f32], weights: &[f64], alpha: f64, delta: f
         .enumerate()
         .map(|(i, &v)| (v, weights.get(i).copied().unwrap_or(1.0)))
         .collect();
-    elements.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Use `f32::total_cmp` rather than `partial_cmp(...).unwrap_or(Equal)`: the
+    // latter treats a NaN residual as equal to EVERYTHING, collapsing the total
+    // order the stable quantile relies on and yielding an arbitrary, unstable
+    // rank statistic (WR-06). `total_cmp` is a true total order (NaN sorts to a
+    // deterministic end), so a non-finite residual produces a stable, repeatable
+    // ordering instead of silent nondeterminism. For all-finite inputs (the
+    // tested/oracle regime) `total_cmp` agrees with `partial_cmp`, preserving
+    // upstream `StableSort` parity.
+    elements.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     // totalWeight = Accumulate(weights) — ordered f64 sum via the sanctioned
     // primitive (D-08); needWeight = totalWeight * alpha.
