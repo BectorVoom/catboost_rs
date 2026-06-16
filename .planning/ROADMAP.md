@@ -360,7 +360,7 @@ Plans:
 
 **Wave 1** — grouped der seam foundation
 
-- [ ] 06.3-01-PLAN.md — Grouped der seam (QueryInfo builder mirroring TQueryInfo + ranking_der.rs + Runtime::compute_gradients_grouped sibling, pointwise path byte-identical) + OFFLINE catboost 1.2.10 ranking fixture corpus generator (LOSS-04)
+- [x] 06.3-01-PLAN.md — Grouped der seam (QueryInfo builder mirroring TQueryInfo + ranking_der.rs + Runtime::compute_gradients_grouped sibling, pointwise path byte-identical) + OFFLINE catboost 1.2.10 ranking fixture corpus generator (LOSS-04) — **COMPLETE** (c1a38a9/1939ab8/441f36d): build_query_info (10 tests), calc_ders_for_queries + group_reduce_weighted + compute_gradients_grouped (9 tests, pointwise byte-identical D-04), gen_ranking_fixtures.py end-to-end-validated against .venv catboost 1.2.10; corpus inputs + QueryRMSE smoke fixture frozen. Loss arms return typed "not yet wired" until 02–05.
 
 **Wave 2** *(blocked on 06.3-01; 02 and 05 run in parallel — zero file overlap)*
 

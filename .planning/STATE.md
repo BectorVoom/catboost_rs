@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Phase 6.3 context gathered
-last_updated: "2026-06-16T21:17:17.235Z"
-last_activity: 2026-06-16 -- Phase 06.3 planning complete
+status: executing
+stopped_at: Phase 6.3 Plan 01 complete (grouped der seam + ranking corpus)
+last_updated: "2026-06-17T00:00:00.000Z"
+last_activity: 2026-06-17 -- 06.3-01 complete (QueryInfo seam, calc_ders_for_queries, ranking corpus generator)
 progress:
   total_phases: 14
   completed_phases: 7
-  total_plans: 51
-  completed_plans: 51
+  total_plans: 56
+  completed_plans: 52
   percent: 50
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 06.2 — multiclass-multilabel-and-n-dim-approx-refactor
+**Current focus:** Phase 06.3 — ranking-losses-and-metrics
 
 ## Current Position
 
-Phase: 06.3
-Plan: Not started
-Status: Plan 06.2-05 complete — Loss::MultiQuantile { alpha: Vec<f64>, delta: f64 } = K INDEPENDENT Quantile dimensions (D-6.2-05). approx_dimension = alpha.len(); per-object target (every dimension predicts a quantile of the SAME scalar target, unlike multilabel's dim-major target). Each dimension d reuses (a) the scalar quantile der VERBATIM via launch_quantile_f64 with its own alpha[d] and the shared delta (der2 = 0; compute_multiquantile_gradients in cpu_runtime.rs), and (b) the 6.1 Exact weighted-alpha[d]-quantile leaf path — exact_leaf_delta threaded with alpha[dim_index] via a new dim_index param on compute_leaf_deltas, leaf.rs UNCHANGED (git-diff-clean). MultiQuantile gated to LeafMethod::Exact (validate_leaf_method, Pitfall 3 single-host CPU default); alpha[k] in [0,1] + delta >= 0 validated (Loss::validate via match self, non-Copy Vec; T-6.2-03). Predictions are RAW per-quantile (identity — RawFormulaVal transposed dim-major->object-major; predict.rs needed NO change, the identity path is loss-agnostic). One frozen offline fixture (multiquantile/, catboost 1.2.10, alpha=[0.1,0.5,0.9], leaf_estimation_method:Exact, thread_count:1); multiquantile_oracle_test.rs per-stage oracle (Splits/LeafValues/StagedApprox/Predictions) <=1e-5. FULL cb-train --tests green (scalar D-04 + Wave-1 multiclass + Wave-2 multilabel + Wave-3 multiquantile, 0 failures); cb-compute 81, cb-backend 25, cb-model 15. LOSS-03 scalar+multi matrix CLOSED; all four Phase 6.2 ROADMAP success criteria met. Commits c48f6d0 (variant+der+leaf) / Task 2 (fixture+oracle+phase-close).
-Last activity: 2026-06-16 -- Phase 06.3 planning complete
+Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
+Plan: 2 of 5 (Plan 01 complete)
+Status: Executing Phase 06.3
+Last activity: 2026-06-17 -- 06.3-01 complete (grouped der seam + ranking fixture corpus)
 
-Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 14 top-level phases complete)
+Progress: [##............] ~20% of Phase 6.3 plans (1 of 5 plans complete; 7 of 14 top-level phases complete)
 
 ## Performance Metrics
 
@@ -47,6 +47,7 @@ Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 
 | 03 | 9 | - | - |
 | 04 | 3 | ~98 min | ~33 min |
 | 06.2 | 7 | - | - |
+| 06.3 | 1 | ~35 min | ~35 min |
 
 **Recent Trend:**
 
@@ -246,8 +247,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-16T20:47:52.220Z
-Stopped at: Phase 6.3 context gathered
+Last session: 2026-06-17T00:00:00.000Z
+Stopped at: 06.3-01 COMPLETE (commits c1a38a9 Task1 / 1939ab8 Task2 / 441f36d Task3) — the grouped der seam + ranking fixture corpus, the LOSS-04 design hinge. Task1: cb-train::build_query_info builds Vec<QueryInfo> (mirror TQueryInfo query.h:19-44) from Pool group_id/subgroup_id/pairs — contiguous-unique run assertion (GroupSamples query.h:48-67) -> typed CbError::Degenerate (no panic, T-06.3-01-01); explicit pairs -> group-local competitors (data_providers.cpp:315-340); cross-group/out-of-range pair -> CbError::OutOfRange (T-06.3-01-02); group weight = mean of members via sum_f64; 10 unit tests. Task2: cb-compute::calc_ders_for_queries grouped der seam (mirror CalcDersForQueries error_functions.h:831-841) — re-declared compute-tier GroupSpan/Competitor (NO cb-train dep, preserves layering); per-group slice + bounds-validate; group_reduce_weighted normalizer through sum_f64; empty group -> 0 (no divide, Security V5); every loss arm -> typed "not yet wired" OutOfRange (Plans 02-05 fill). Runtime::compute_gradients_grouped sibling trait method (host-side default impl, no kernel); pointwise compute_gradients signature BYTE-IDENTICAL (D-04 no-regression); 9 unit tests. Task3: OFFLINE gen_ranking_fixtures.py — frozen catboost 1.2.10 ranking corpus (5 varied groups [3,2,4,1,2]/12 objs + subgroup_id + explicit pairs), --inputs/--loss/--metric args, per-stage .npy, pinned thread_count=1/depth=2/iterations=5/leaf_estimation_iterations=1/Plain/seed; END-TO-END validated against .venv catboost 1.2.10 (corpus inputs + QueryRMSE smoke fixture frozen-committed); README documents shape+params+version+OFFLINE run cmd. Gates: query_info 10/10, ranking_der 9/9, cb-train lib 154/154 (no regression), wave2/wave3 oracles 5/5. NOTE: gsd-tools CLI absent on this machine -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-02 (QueryRMSE + QuerySoftMax der arms). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-01-SUMMARY.md.
+Stopped at (prior): Phase 6.3 context gathered
 Stopped at (prior): Phase 6.2 context gathered
 Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
 Stopped at (prior): Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created.
@@ -256,4 +258,4 @@ Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
-Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-CONTEXT.md
+Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-01-SUMMARY.md
