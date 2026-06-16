@@ -4,8 +4,8 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: "Phase 6.2 COMPLETE — 06.2-05 (Wave-3 MultiQuantile, LOSS-03 multi-output) shipped; all 5 plans done, all 4 ROADMAP success criteria met. LOSS-02 + LOSS-03 (scalar+multi) matrix CLOSED. NEXT: /gsd-transition or /gsd-plan-phase 6.3 (ranking losses)."
-last_updated: "2026-06-16T11:44:49.875Z"
-last_activity: 2026-06-16 -- Phase 06.2 Plan 05 (Wave-3 MultiQuantile, LOSS-03 multi-output) COMPLETE — Phase 6.2 CLOSED
+last_updated: "2026-06-16T11:55:42.601Z"
+last_activity: 2026-06-16
 progress:
   total_phases: 14
   completed_phases: 7
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 06.2 (multiclass-multilabel-and-n-dim-approx-refactor) — COMPLETE (all 5 plans)
-Plan: 5 of 5 — 06.2-05 COMPLETE (Wave 3 MultiQuantile closed; Phase 6.2 CLOSED — LOSS-02 + LOSS-03 multi done)
+Phase: 06.3
+Plan: Not started
 Status: Plan 06.2-05 complete — Loss::MultiQuantile { alpha: Vec<f64>, delta: f64 } = K INDEPENDENT Quantile dimensions (D-6.2-05). approx_dimension = alpha.len(); per-object target (every dimension predicts a quantile of the SAME scalar target, unlike multilabel's dim-major target). Each dimension d reuses (a) the scalar quantile der VERBATIM via launch_quantile_f64 with its own alpha[d] and the shared delta (der2 = 0; compute_multiquantile_gradients in cpu_runtime.rs), and (b) the 6.1 Exact weighted-alpha[d]-quantile leaf path — exact_leaf_delta threaded with alpha[dim_index] via a new dim_index param on compute_leaf_deltas, leaf.rs UNCHANGED (git-diff-clean). MultiQuantile gated to LeafMethod::Exact (validate_leaf_method, Pitfall 3 single-host CPU default); alpha[k] in [0,1] + delta >= 0 validated (Loss::validate via match self, non-Copy Vec; T-6.2-03). Predictions are RAW per-quantile (identity — RawFormulaVal transposed dim-major->object-major; predict.rs needed NO change, the identity path is loss-agnostic). One frozen offline fixture (multiquantile/, catboost 1.2.10, alpha=[0.1,0.5,0.9], leaf_estimation_method:Exact, thread_count:1); multiquantile_oracle_test.rs per-stage oracle (Splits/LeafValues/StagedApprox/Predictions) <=1e-5. FULL cb-train --tests green (scalar D-04 + Wave-1 multiclass + Wave-2 multilabel + Wave-3 multiquantile, 0 failures); cb-compute 81, cb-backend 25, cb-model 15. LOSS-03 scalar+multi matrix CLOSED; all four Phase 6.2 ROADMAP success criteria met. Commits c48f6d0 (variant+der+leaf) / Task 2 (fixture+oracle+phase-close).
-Last activity: 2026-06-16 -- Phase 06.2 Plan 05 (Wave-3 MultiQuantile, LOSS-03 multi-output) COMPLETE — Phase 6.2 CLOSED
+Last activity: 2026-06-16
 
 Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 14 top-level phases complete)
 
@@ -36,7 +36,7 @@ Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 
 
 **Velocity:**
 
-- Total plans completed: 10
+- Total plans completed: 24
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -46,6 +46,7 @@ Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 
 |-------|-------|-------|----------|
 | 03 | 9 | - | - |
 | 04 | 3 | ~98 min | ~33 min |
+| 06.2 | 7 | - | - |
 
 **Recent Trend:**
 
