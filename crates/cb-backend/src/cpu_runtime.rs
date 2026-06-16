@@ -45,7 +45,7 @@ fn launch_binary_f64(
     approx: &[f64],
     target: &[f64],
     kernel: BinaryKernel,
-) -> Vec<f64> {
+) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
     let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
@@ -132,10 +132,15 @@ fn launch_binary_f64(
         }
     }
 
-    let bytes = client
-        .read_one(out_handle)
-        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
+    // to a zero buffer would masquerade as a valid all-zero derivative vector,
+    // silently producing a degenerate (no-gradient) tree instead of surfacing the
+    // backend failure. `compute_gradients` returns CbResult, so the error channel
+    // exists — use it.
+    let bytes = client.read_one(out_handle).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
 /// Which elementwise binary (approx, target) -> der kernel to launch. LogCosh is
@@ -157,7 +162,7 @@ enum BinaryKernel {
 }
 
 /// Launch the Logloss hessian kernel (`der2 = -p*(1-p)`) on `CpuRuntime`.
-fn launch_logloss_hessian(approx: &[f64]) -> Vec<f64> {
+fn launch_logloss_hessian(approx: &[f64]) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
     let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
@@ -180,16 +185,21 @@ fn launch_logloss_hessian(approx: &[f64]) -> Vec<f64> {
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
     );
 
-    let bytes = client
-        .read_one(out_handle)
-        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
+    // to a zero buffer would masquerade as a valid all-zero derivative vector,
+    // silently producing a degenerate (no-gradient) tree instead of surfacing the
+    // backend failure. `compute_gradients` returns CbResult, so the error channel
+    // exists — use it.
+    let bytes = client.read_one(out_handle).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
 /// Launch the Poisson hessian kernel (`der2 = -exp(approx)`) on `CpuRuntime`. A
 /// unary (approx-only) kernel like [`launch_logloss_hessian`] — the Poisson
 /// hessian does not depend on the target.
-fn launch_poisson_hessian(approx: &[f64]) -> Vec<f64> {
+fn launch_poisson_hessian(approx: &[f64]) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
     let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
@@ -212,10 +222,15 @@ fn launch_poisson_hessian(approx: &[f64]) -> Vec<f64> {
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
     );
 
-    let bytes = client
-        .read_one(out_handle)
-        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
+    // to a zero buffer would masquerade as a valid all-zero derivative vector,
+    // silently producing a degenerate (no-gradient) tree instead of surfacing the
+    // backend failure. `compute_gradients` returns CbResult, so the error channel
+    // exists — use it.
+    let bytes = client.read_one(out_handle).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
 /// Launch a Focal elementwise derivative kernel (`gradient` or `hessian`) on
@@ -227,7 +242,7 @@ fn launch_focal_f64(
     alpha: f64,
     gamma: f64,
     hessian: bool,
-) -> Vec<f64> {
+) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
     let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
@@ -273,10 +288,15 @@ fn launch_focal_f64(
         );
     }
 
-    let bytes = client
-        .read_one(out_handle)
-        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
+    // to a zero buffer would masquerade as a valid all-zero derivative vector,
+    // silently producing a degenerate (no-gradient) tree instead of surfacing the
+    // backend failure. `compute_gradients` returns CbResult, so the error channel
+    // exists — use it.
+    let bytes = client.read_one(out_handle).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
 /// Launch the Quantile gradient kernel (`val = target - approx; der1 = |val| <
@@ -285,7 +305,12 @@ fn launch_focal_f64(
 /// `f64` der1 in object order. Gradient-only — the Quantile der2 is the constant
 /// `0` (the dispatch fills a zero vec, the Mae precedent). Mirrors
 /// [`launch_focal_f64`] for the two-parameter Quantile gradient.
-fn launch_quantile_f64(approx: &[f64], target: &[f64], alpha: f64, delta: f64) -> Vec<f64> {
+fn launch_quantile_f64(
+    approx: &[f64],
+    target: &[f64],
+    alpha: f64,
+    delta: f64,
+) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
     let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
@@ -316,10 +341,15 @@ fn launch_quantile_f64(approx: &[f64], target: &[f64], alpha: f64, delta: f64) -
         unsafe { ArrayArg::from_raw_parts(delta_handle, 1) },
     );
 
-    let bytes = client
-        .read_one(out_handle)
-        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
+    // to a zero buffer would masquerade as a valid all-zero derivative vector,
+    // silently producing a degenerate (no-gradient) tree instead of surfacing the
+    // backend failure. `compute_gradients` returns CbResult, so the error channel
+    // exists — use it.
+    let bytes = client.read_one(out_handle).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
 /// Which single-parameter smooth-loss derivative kernel to launch (Lq{q},
@@ -347,7 +377,7 @@ fn launch_param_f64(
     param: f64,
     kind: ParamKernel,
     hessian: bool,
-) -> Vec<f64> {
+) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
     let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
@@ -413,10 +443,15 @@ fn launch_param_f64(
         }
     }
 
-    let bytes = client
-        .read_one(out_handle)
-        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
+    // to a zero buffer would masquerade as a valid all-zero derivative vector,
+    // silently producing a degenerate (no-gradient) tree instead of surfacing the
+    // backend failure. `compute_gradients` returns CbResult, so the error channel
+    // exists — use it.
+    let bytes = client.read_one(out_handle).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
 impl Runtime for CpuBackend {
@@ -442,7 +477,7 @@ impl Runtime for CpuBackend {
 
         match loss {
             Loss::Rmse => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::RmseGradient);
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::RmseGradient)?;
                 // RMSE hessian is the constant -1.0 (no kernel needed).
                 let der2 = vec![-1.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
@@ -450,17 +485,17 @@ impl Runtime for CpuBackend {
             // CrossEntropy shares Logloss's der1/der2 EXACTLY (D-09): reuse the
             // Logloss gradient + hessian kernels (no separate kernel needed).
             Loss::Logloss | Loss::CrossEntropy => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::LoglossGradient);
-                let der2 = launch_logloss_hessian(approx);
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::LoglossGradient)?;
+                let der2 = launch_logloss_hessian(approx)?;
                 Ok(Derivatives { der1, der2 })
             }
             Loss::Focal { alpha, gamma } => {
-                let der1 = launch_focal_f64(approx, target, alpha, gamma, false);
-                let der2 = launch_focal_f64(approx, target, alpha, gamma, true);
+                let der1 = launch_focal_f64(approx, target, alpha, gamma, false)?;
+                let der2 = launch_focal_f64(approx, target, alpha, gamma, true)?;
                 Ok(Derivatives { der1, der2 })
             }
             Loss::Mae => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::MaeGradient);
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::MaeGradient)?;
                 // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
                 let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
@@ -470,53 +505,53 @@ impl Runtime for CpuBackend {
             // constant-0 vec, the Mae precedent). At alpha=0.5,delta=1e-6 the
             // gradient equals the Mae arm above (MAE == Quantile{0.5}).
             Loss::Quantile { alpha, delta } => {
-                let der1 = launch_quantile_f64(approx, target, alpha, delta);
+                let der1 = launch_quantile_f64(approx, target, alpha, delta)?;
                 let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
             }
             // Wave-1 smooth losses (D-6.1-02): all four have a real der2, so each
             // launches BOTH a gradient and a hessian kernel.
             Loss::LogCosh => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::LogCoshGradient);
-                let der2 = launch_binary_f64(approx, target, BinaryKernel::LogCoshHessian);
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::LogCoshGradient)?;
+                let der2 = launch_binary_f64(approx, target, BinaryKernel::LogCoshHessian)?;
                 Ok(Derivatives { der1, der2 })
             }
             Loss::Lq { q } => {
-                let der1 = launch_param_f64(approx, target, q, ParamKernel::Lq, false);
-                let der2 = launch_param_f64(approx, target, q, ParamKernel::Lq, true);
+                let der1 = launch_param_f64(approx, target, q, ParamKernel::Lq, false)?;
+                let der2 = launch_param_f64(approx, target, q, ParamKernel::Lq, true)?;
                 Ok(Derivatives { der1, der2 })
             }
             Loss::Huber { delta } => {
-                let der1 = launch_param_f64(approx, target, delta, ParamKernel::Huber, false);
-                let der2 = launch_param_f64(approx, target, delta, ParamKernel::Huber, true);
+                let der1 = launch_param_f64(approx, target, delta, ParamKernel::Huber, false)?;
+                let der2 = launch_param_f64(approx, target, delta, ParamKernel::Huber, true)?;
                 Ok(Derivatives { der1, der2 })
             }
             Loss::Expectile { alpha } => {
-                let der1 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, false);
-                let der2 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, true);
+                let der1 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, false)?;
+                let der2 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, true)?;
                 Ok(Derivatives { der1, der2 })
             }
             // Wave-2 positive-domain / link losses (D-6.1-02 / Plan 06.1-02).
             // Poisson: exp-link der (inline F::exp); gradient is a binary kernel,
             // the hessian is the unary -exp(approx) kernel (no target input).
             Loss::Poisson => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::PoissonGradient);
-                let der2 = launch_poisson_hessian(approx);
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::PoissonGradient)?;
+                let der2 = launch_poisson_hessian(approx)?;
                 Ok(Derivatives { der1, der2 })
             }
             // Tweedie: exp INSIDE the der (raw approx, NOT exp-approx); both
             // gradient and hessian carry the variance_power scalar param.
             Loss::Tweedie { variance_power } => {
                 let der1 =
-                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, false);
+                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, false)?;
                 let der2 =
-                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, true);
+                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, true)?;
                 Ok(Derivatives { der1, der2 })
             }
             // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient
             // kernel; the hessian is the constant 0.0 vec (the Mae precedent).
             Loss::Mape => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::MapeGradient);
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::MapeGradient)?;
                 let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
             }
