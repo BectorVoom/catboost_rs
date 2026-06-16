@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md."
-last_updated: "2026-06-16T05:12:29.276Z"
-last_activity: 2026-06-16 -- Phase 06.1 execution started
+stopped_at: "06.1-02 COMPLETE (commits fa4e664 T1 / bb3202f T2 / 2a39193 T3 / d554828 T4) — Wave-2 positive-domain/link regression losses LANDED + oracle-locked <=1e-5. Loss::{Poisson(inline exp-link),Tweedie{variance_power}(exp-in-der raw),Mape(der2=0)} wired enum->der->kernel->dispatch; 5 generics-float CubeCL kernels; EvalMetric::Msle as a metric-ONLY member (D-6.1-06; NO Loss variant). Open Q1 RESOLVED empirically: Poisson StagedApprox=RAW, Predictions=exp(raw)==PredictionType::Exponent (8.88e-16). A4 confirmed: Tweedie predictions RAW. wave2 oracle 3/3 GREEN (Poisson raw+exp / Tweedie raw / MAPE per-stage); msle_metric oracle 1/1 GREEN; Wave-1 4/4 + full cb-train suite (lib 139 + all oracle suites) stay green. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: /gsd-execute-phase 06.1 plan 03 (Wave 3 — quantile family). Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-02-SUMMARY.md."
+last_updated: "2026-06-16T05:28:00.000Z"
+last_activity: 2026-06-16 -- Phase 06.1 Plan 02 (Wave-2 positive-domain/link losses) COMPLETE
 progress:
   total_phases: 14
   completed_phases: 5
   total_plans: 44
-  completed_plans: 42
-  percent: 36
+  completed_plans: 43
+  percent: 38
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.1 (regression-loss-matrix) — EXECUTING
-Plan: 2 of 3
-Status: Ready to execute
-Last activity: 2026-06-16 -- Phase 06.1 execution started
+Plan: 3 of 3 (Plans 01 + 02 COMPLETE; Plan 03 — Wave 3 quantile family — next)
+Status: Plan 02 complete; ready to execute Plan 03
+Last activity: 2026-06-16 -- Phase 06.1 Plan 02 (Wave-2 positive-domain/link losses) COMPLETE
 
-Progress: [          ] 0% (Phase 6.1 planned next; 5 of 8 top-level phases complete)
+Progress: [######    ] 67% of Phase 6.1 plans (2 of 3 plans complete; 5 of 8 top-level phases complete)
 
 ## Performance Metrics
 
@@ -91,6 +91,7 @@ Progress: [          ] 0% (Phase 6.1 planned next; 5 of 8 top-level phases compl
 | Phase 05 P16 | ~15min | 1 tasks | 2 files |
 | Phase 05 P19 | ~95min | 5 tasks (A,T1-T5) | 32 files |
 | Phase 06.1 P01 | 19min | 3 tasks | 14 files |
+| Phase 06.1 P02 | 12min | 4 tasks | 31 files |
 
 ## Accumulated Context
 
@@ -98,6 +99,11 @@ Progress: [          ] 0% (Phase 6.1 planned next; 5 of 8 top-level phases compl
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [06.1-02 Open Q1 RESOLVED]: Poisson is IsStoreExpApprox upstream but cb-train stores RAW approx + computes exp() INLINE in the der (the Logloss sigmoid precedent); StagedApprox(RawFormulaVal) is RAW, Predictions = exp(raw) == cb_model::PredictionType::Exponent (matched to 8.88e-16 vs the default predict). StagedApprox oracle compares RAW; Predictions applies Exponent. NO exp-approx storage implemented.
+- [06.1-02 A4 confirmed]: Tweedie is NOT exp-approx (error_functions.h:1644) — the exp lives INSIDE the der over the raw approx; Tweedie predictions are RAW (default predict == RawFormulaVal), so NO Exponent transform is applied.
+- [06.1-02 D-6.1-06]: MSLE is metric-ONLY (enum_helpers.cpp:200,533-549 — absent from RegressionObjectives). Added to EvalMetric ONLY (NO Loss variant, NO for_loss default; selected via explicit eval_metric). MSLE = mean_w((log(1+approx)-log(1+target))^2), approx RAW, NOT sqrt'd (metric.cpp:1899-1926). The msle_metric fixture trains RMSE w/ eval_metric=MSLE; there is no MSLE-as-objective model (it throws upstream).
+- [06.1-02]: Wave-2 positive losses use the positive-target transform y_pos = y - min(y) + 1.0 (shift recorded per fixture); Poisson/Tweedie pin Newton + leaf_estimation_iterations:1 (override upstream Poisson default 10), MAPE pins Gradient (der2=0 -> Newton undefined, Pitfall 5).
 
 - [05-19 T3]: The initial learn-set shuffle S is applied as the averaging CTR ORDER Q = [S[p] for p in P_avg] (original-object frame) fed to the UNMODIFIED materialize_ctr_feature — NOT a physical data shuffle/invert. Q comes from ONE persistent random_seed stream: P_avg = permutations(n, learning_folds+1, seed)[learning_folds], S = permutations(...)[0]. This SUBSUMES the 05-17 per-fold-gen_rand pre-draw hack (compensating wrong-perm+wrong-bins). Structure/numeric/one-hot/ordered paths + output order stay byte-identical.
 - [05-19 T4]: structure_fold_cycle [0,2,0,2,2] (takenFold = Folds[GenRand()%learning_folds], train.cpp:208) is a DERIVED ground-truth anchor (live_trainer_structure_fold.json taken_fold) for pc=4/seed=0; the per-tree RNG phase is the escalated D-11 variable-draw budget (could not RNG-localize in cb-train). learning_folds==1 (pc=1/2) is RNG-free all-zeros (%1==0), byte-identical. Other learning_folds>1 configs fall back to fixed Folds[0] (no un-instrumented guess).
@@ -220,8 +226,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-16T05:12:23.297Z
-Stopped at: Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
+Last session: 2026-06-16T05:28:00.000Z
+Stopped at: 06.1-02 COMPLETE (commits fa4e664 T1 / bb3202f T2 / 2a39193 T3 / d554828 T4) — Wave-2 positive-domain/link regression losses (Poisson exp-link, Tweedie{variance_power}, MAPE) LANDED + oracle-locked <=1e-5; MSLE as a metric-ONLY EvalMetric member (D-6.1-06). wave2 oracle 3/3 GREEN, msle_metric 1/1 GREEN, Wave-1 4/4 + full cb-train suite green. Open Q1 resolved (Poisson StagedApprox=RAW, Predictions=Exponent(raw)); A4 confirmed (Tweedie predictions RAW). gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: /gsd-execute-phase 06.1 plan 03 (Wave 3 — quantile family). Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-02-SUMMARY.md.
+Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
 Stopped at (prior): Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created.
 Stopped at (prior): Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
 Stopped at (prior): context exhaustion at 75% (2026-06-15)

@@ -298,11 +298,11 @@ Plans:
 
 - [x] 06.1-01-PLAN.md — Wave 1: smooth losses (LogCosh, Lq{q≥2}, Huber{δ}, Expectile{α}) — der1/der2 transcription + Newton/Exact leaf, per-stage oracle ≤1e-5
 
-**Wave 2** *(blocked on Wave 1 completion)*
+**Wave 2**
 
-- [ ] 06.1-02-PLAN.md — Wave 2: positive-domain/link (Poisson exp-link, Tweedie{p}, MAPE) + MSLE eval-metric-only (D-6.1-06)
+- [x] 06.1-02-PLAN.md — Wave 2: positive-domain/link (Poisson exp-link, Tweedie{p}, MAPE) + MSLE eval-metric-only (D-6.1-06) — der1/der2 transcription + 5 generics-float kernels, Poisson raw-approx+inline-exp+Exponent-predict, per-stage oracle ≤1e-5; MSLE metric oracle ≤1e-5 (completed 2026-06-16, commits fa4e664/bb3202f/2a39193/d554828)
 
-**Wave 3** *(blocked on Wave 2 completion)*
+**Wave 3** *(ready — Wave 2 complete)*
 
 - [ ] 06.1-03-PLAN.md — Wave 3: Quantile{α,δ} generalizing MAE via α-threaded Exact leaf — completes the LOSS-03 scalar matrix
 
