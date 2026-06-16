@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 05 — ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s
+**Current focus:** Phase 6.1 — regression-loss-matrix (first sub-phase of the Phase 6 split)
 
 ## Current Position
 
-Phase: 05 (ordered-boosting-ordered-ctr-categoricals-high-risk-parity-s) — EXECUTING
-Plan: 19 of 19 (05-19 COMPLETE)
-Status: Executing Phase 05
-Last activity: 2026-06-15 -- 05-19 complete; bar (c) / SC-1 / ORD-01 closed (pc=4 e2e ≤1e-5)
+Phase: 6.1 (regression-loss-matrix) — NOT STARTED (Phase 5 complete; Phase 6 restructured into 6.1–6.6)
+Plan: 0 of TBD (run /gsd-discuss-phase 6.1 then /gsd-plan-phase 6.1)
+Status: Phase 6 roadmap restructure COMPLETE — ready to discuss/plan 6.1
+Last activity: 2026-06-16 -- Phase 6 split into sub-phases 6.1–6.6 (D-01/D-02); ROADMAP + REQUIREMENTS traceability remapped; six 06.x dirs created
 
-Progress: [██████████] 100% (all phase-05 plans complete; pc=4 multi_permutation e2e hard gate GREEN — bar (c) closed)
+Progress: [          ] 0% (Phase 6.1 not yet planned; 5 of 8 top-level phases complete)
 
 ## Performance Metrics
 
@@ -219,7 +219,8 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-15T12:29:38.400Z
-Stopped at: Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
+Stopped at: Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created. NEXT: /gsd-discuss-phase 6.1 (then /gsd-plan-phase 6.1).
+Stopped at (prior): Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
 Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.

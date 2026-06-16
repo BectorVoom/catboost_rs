@@ -153,11 +153,11 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | TRAIN-08 | Phase 3 | Complete |
 | MODEL-01 | Phase 4 | Complete (04-03: .cbm save/load, semantic round-trip + upstream 1.2.10 load ≤1e-5, malformed-input typed errors) |
 | MODEL-02 | Phase 4 | Complete (04-02: pure-Rust apply path, oracle-locked ≤1e-5) |
-| MODEL-03 | Phase 4 | Partial (04-04: PredictionValuesChange + Interaction oracle-locked ≤1e-5; LossFunctionChange deferred per D-12) |
+| MODEL-03 | Phase 4 (+6.6) | Partial (04-04: PredictionValuesChange + Interaction oracle-locked ≤1e-5; LossFunctionChange completes in Phase 6.6 per D-12) |
 | MODEL-04 | Phase 4 | Complete (04-04: regular TreeSHAP matrix + local-accuracy invariant, oracle-locked ≤1e-5, D-11) |
 | MODEL-06 | Phase 4 | Complete (04-03: model.json export/import, round-trips through cb-oracle parser + upstream load ≤1e-5) |
 | LOSS-01 | Phase 4 | Complete (04-02: CrossEntropy + Focal der1/der2 oracle-locked; binclf trains under all three losses) |
-| LOSS-06 | Phase 4 | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types deferred to Phase 6 per D-10) |
+| LOSS-06 | Phase 4 (+6.4) | In progress (04-02: 5 in-scope prediction types oracle-locked; uncertainty types RMSEWithUncertainty/VirtEnsembles/TotalUncertainty complete in Phase 6.4 per D-10) |
 | RAPI-01 | Phase 4 | Complete |
 | RAPI-02 | Phase 4 | Complete |
 | ORD-01 | Phase 5 | Complete |
@@ -165,20 +165,20 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | ORD-03 | Phase 5 | Complete |
 | ORD-04 | Phase 5 | Complete |
 | ORD-05 | Phase 5 | Complete |
-| LOSS-02 | Phase 6 | Pending |
-| LOSS-03 | Phase 6 | Pending |
-| LOSS-04 | Phase 6 | Pending |
-| LOSS-05 | Phase 6 | Pending |
-| LOSS-07 | Phase 6 | Pending |
-| LOSS-08 | Phase 6 | Pending |
-| LOSS-09 | Phase 6 | Pending |
-| FEAT-01 | Phase 6 | Pending |
-| FEAT-02 | Phase 6 | Pending |
-| FEAT-03 | Phase 6 | Pending |
-| FEAT-04 | Phase 6 | Pending |
-| FEAT-05 | Phase 6 | Pending |
-| FEAT-06 | Phase 6 | Pending |
-| MODEL-05 | Phase 6 | Pending |
+| LOSS-02 | Phase 6.2 | Pending |
+| LOSS-03 | Phase 6.1 | Pending |
+| LOSS-04 | Phase 6.3 | Pending |
+| LOSS-05 | Phase 6.3 | Pending |
+| LOSS-07 | Phase 6.4 | Pending (Rust trait; Python callback bridge → Phase 8 per D-09) |
+| LOSS-08 | Phase 6.4 | Pending |
+| LOSS-09 | Phase 6.4 | Pending |
+| FEAT-01 | Phase 6.5 | Pending |
+| FEAT-02 | Phase 6.5 | Pending |
+| FEAT-03 | Phase 6.6 | Pending |
+| FEAT-04 | Phase 6.6 | Pending |
+| FEAT-05 | Phase 6.6 | Pending |
+| FEAT-06 | Phase 6.6 | Pending |
+| MODEL-05 | Phase 6.6 | Pending |
 | GPU-01 | Phase 7 | Pending |
 | GPU-02 | Phase 7 | Pending |
 | GPU-03 | Phase 7 | Pending |
