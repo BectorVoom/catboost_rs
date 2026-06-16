@@ -96,7 +96,13 @@ impl EvalMetric {
             // MultiQuantile (Wave 3) reports the parity-neutral RMSE eval surface
             // by default; the in-scope fixture pins no eval set, so this default is
             // never exercised (a named MultiQuantile eval metric is a later phase).
-            | Loss::MultiQuantile { .. } => Self::Rmse,
+            | Loss::MultiQuantile { .. }
+            // The Wave-A ranking losses (QueryRMSE / QuerySoftMax) report the
+            // parity-neutral RMSE eval surface by default; the in-scope ranking
+            // fixtures pin `od_type=None` with no eval set, so this default is
+            // never exercised (a named ranking eval metric — NDCG etc. — is Wave D).
+            | Loss::QueryRmse
+            | Loss::QuerySoftMax { .. } => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,

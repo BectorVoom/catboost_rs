@@ -171,7 +171,11 @@ fn run_autolr_e2e(
         | Loss::MultiClassOneVsAll
         | Loss::MultiLogloss
         | Loss::MultiCrossEntropy
-        | Loss::MultiQuantile { .. } => TargetType::Unknown,
+        | Loss::MultiQuantile { .. }
+        // Ranking losses are not in the auto-LR table and not exercised here;
+        // map to Unknown to keep the match exhaustive.
+        | Loss::QueryRmse
+        | Loss::QuerySoftMax { .. } => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");

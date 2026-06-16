@@ -680,7 +680,12 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         | Loss::MultiCrossEntropy
         // MultiQuantile (Wave 3) is not in the upstream auto-LR coefficient table
         // -> Unknown (no rate guessed); the fixture pins an explicit learning_rate.
-        | Loss::MultiQuantile { .. } => TargetType::Unknown,
+        | Loss::MultiQuantile { .. }
+        // The Wave-A ranking losses (QueryRMSE / QuerySoftMax) are not in the
+        // upstream auto-LR coefficient table -> Unknown (no rate guessed); the
+        // ranking fixtures pin an explicit learning_rate.
+        | Loss::QueryRmse
+        | Loss::QuerySoftMax { .. } => TargetType::Unknown,
     }
 }
 

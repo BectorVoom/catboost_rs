@@ -577,6 +577,21 @@ fn compute_gradients_one_dim(
              alpha[d]), not the single-dimension scalar path"
                 .to_owned(),
         )),
+        // QueryRMSE / QuerySoftMax (Wave A ranking losses, LOSS-04) are QUERYWISE:
+        // their der is computed PER GROUP via the grouped seam
+        // (`Runtime::compute_gradients_grouped` →
+        // `cb_compute::calc_ders_for_queries`), NOT the pointwise per-dimension
+        // scalar path. The trainer routes ranking losses to `compute_gradients_grouped`
+        // (boosting.rs der site), so they never enter this single-dimension scalar
+        // dispatch; reject defensively (typed CbError, no `unwrap`/panic) rather
+        // than silently producing a pointwise gradient that ignores the group
+        // structure.
+        Loss::QueryRmse | Loss::QuerySoftMax { .. } => Err(CbError::Degenerate(
+            "ranking losses (QueryRMSE / QuerySoftMax) are dispatched through the \
+             grouped der seam (compute_gradients_grouped), not the pointwise \
+             single-dimension scalar path"
+                .to_owned(),
+        )),
     }
 }
 

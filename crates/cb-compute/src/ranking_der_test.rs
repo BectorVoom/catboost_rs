@@ -135,3 +135,129 @@ fn runtime_compute_gradients_grouped_default_delegates_to_seam() {
         .unwrap();
     assert!(out.is_empty());
 }
+
+// --- QueryRMSE grouped der (LOSS-04 Wave A) -----------------------------------
+
+#[test]
+fn queryrmse_two_group_der_matches_hand_computed() {
+    // Two groups: [0,2) and [2,5). Unweighted (w=1).
+    // Group 0: approx [0.0, 1.0], target [1.0, 0.0].
+    //   residuals (t-a) = [1.0, -1.0]; queryAvrg = (1 + -1)/2 = 0.
+    //   der1 = (t - a - 0)·1 = [1.0, -1.0]; der2 = [-1, -1].
+    // Group 1: approx [0.0, 0.0, 1.0], target [2.0, 1.0, 0.0].
+    //   residuals = [2, 1, -1]; queryAvrg = (2+1-1)/3 = 2/3.
+    //   der1 = [2 - 2/3, 1 - 2/3, -1 - 2/3] = [4/3, 1/3, -5/3]; der2 = [-1,-1,-1].
+    let approx = [0.0, 1.0, 0.0, 0.0, 1.0];
+    let target = [1.0, 0.0, 2.0, 1.0, 0.0];
+    let groups = [span(0, 2), span(2, 5)];
+    let out = calc_ders_for_queries(&Loss::QueryRmse, &approx, &target, &[], &groups, 0).unwrap();
+    assert_eq!(out.len(), 2);
+    let g0 = &out[0];
+    assert!((g0.der1[0] - 1.0).abs() < 1e-12);
+    assert!((g0.der1[1] - (-1.0)).abs() < 1e-12);
+    assert!(g0.der2.iter().all(|&d| (d - (-1.0)).abs() < 1e-12));
+    let g1 = &out[1];
+    assert!((g1.der1[0] - (4.0 / 3.0)).abs() < 1e-12);
+    assert!((g1.der1[1] - (1.0 / 3.0)).abs() < 1e-12);
+    assert!((g1.der1[2] - (-5.0 / 3.0)).abs() < 1e-12);
+    assert!(g1.der2.iter().all(|&d| (d - (-1.0)).abs() < 1e-12));
+}
+
+#[test]
+fn queryrmse_empty_group_yields_empty_ders_no_divide() {
+    // A zero-size group contributes an empty der set; no divide-by-zero on Σw=0.
+    let approx = [0.5, 0.5];
+    let target = [1.0, 0.0];
+    let groups = [
+        GroupSpan { begin: 0, end: 0, weight: 1.0, competitors: Vec::new() },
+        span(0, 2),
+    ];
+    let out = calc_ders_for_queries(&Loss::QueryRmse, &approx, &target, &[], &groups, 0).unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(out[0].der1.is_empty() && out[0].der2.is_empty());
+    assert_eq!(out[1].der1.len(), 2);
+}
+
+#[test]
+fn queryrmse_weighted_folds_weight_into_der() {
+    // Group [0,2), weights [2.0, 1.0]. residuals (t-a) = [1.0, -2.0].
+    // queryAvrg = (1·2 + -2·1)/(2+1) = (2 - 2)/3 = 0.
+    // der1 = (t-a-0)·w = [1·2, -2·1] = [2.0, -2.0]; der2 = [-1·2, -1·1] = [-2,-1].
+    let approx = [0.0, 2.0];
+    let target = [1.0, 0.0];
+    let weights = [2.0, 1.0];
+    let groups = [span(0, 2)];
+    let out =
+        calc_ders_for_queries(&Loss::QueryRmse, &approx, &target, &weights, &groups, 0).unwrap();
+    let g = &out[0];
+    assert!((g.der1[0] - 2.0).abs() < 1e-12);
+    assert!((g.der1[1] - (-2.0)).abs() < 1e-12);
+    assert!((g.der2[0] - (-2.0)).abs() < 1e-12);
+    assert!((g.der2[1] - (-1.0)).abs() < 1e-12);
+}
+
+// --- QuerySoftMax grouped der (LOSS-04 Wave A) --------------------------------
+
+#[test]
+fn querysoftmax_single_group_der_matches_hand_computed() {
+    // One group [0,3); beta=1, lambda=0; unweighted.
+    // approx [0.0, 0.0, ln2]; target [1.0, 0.0, 0.0].
+    // maxApprox = ln2; shifted exp = [exp(-ln2), exp(-ln2), exp(0)] = [0.5, 0.5, 1.0].
+    // weighted_exp (w=1) = [0.5, 0.5, 1.0]; sumExp = 2.0.
+    // p = [0.25, 0.25, 0.5]; sumWTargets = 1·1 = 1.
+    // der1 = 1·(-1·p + w·target):
+    //   obj0: -0.25 + 1 = 0.75 ; obj1: -0.25 + 0 = -0.25 ; obj2: -0.5 + 0 = -0.5
+    // der2 = 1·1·(1·p·(p-1) - 0):
+    //   obj0: 0.25·(-0.75) = -0.1875 ; obj1: -0.1875 ; obj2: 0.5·(-0.5) = -0.25
+    let ln2 = 2.0_f64.ln();
+    let approx = [0.0, 0.0, ln2];
+    let target = [1.0, 0.0, 0.0];
+    let groups = [span(0, 3)];
+    let loss = Loss::QuerySoftMax { lambda: 0.0, beta: 1.0 };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    assert!((g.der1[0] - 0.75).abs() < 1e-12, "der1[0]={}", g.der1[0]);
+    assert!((g.der1[1] - (-0.25)).abs() < 1e-12);
+    assert!((g.der1[2] - (-0.5)).abs() < 1e-12);
+    assert!((g.der2[0] - (-0.1875)).abs() < 1e-12);
+    assert!((g.der2[1] - (-0.1875)).abs() < 1e-12);
+    assert!((g.der2[2] - (-0.25)).abs() < 1e-12);
+}
+
+#[test]
+fn querysoftmax_max_shift_avoids_exp_overflow() {
+    // A group with huge approx values must NOT overflow exp to Inf/NaN: the
+    // max-shift subtracts maxApprox before exp (error_functions.cpp:540-552).
+    let approx = [1000.0, 1000.5, 999.0];
+    let target = [1.0, 0.0, 0.0];
+    let groups = [span(0, 3)];
+    let loss = Loss::QuerySoftMax { lambda: 0.01, beta: 1.0 };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    assert!(g.der1.iter().all(|d| d.is_finite()), "der1 must be finite (no exp overflow)");
+    assert!(g.der2.iter().all(|d| d.is_finite()), "der2 must be finite (no exp overflow)");
+}
+
+#[test]
+fn querysoftmax_zero_sum_targets_yields_zero_ders() {
+    // sumWTargets <= 0 (all targets 0) → ders 0 (error_functions.cpp:571-576).
+    let approx = [0.1, 0.2, 0.3];
+    let target = [0.0, 0.0, 0.0];
+    let groups = [span(0, 3)];
+    let loss = Loss::QuerySoftMax { lambda: 0.01, beta: 1.0 };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    assert!(g.der1.iter().all(|&d| d == 0.0));
+    assert!(g.der2.iter().all(|&d| d == 0.0));
+}
+
+#[test]
+fn querysoftmax_validate_rejects_bad_params() {
+    // lambda < 0 and beta <= 0 are rejected by Loss::validate (T-06.3-02-03).
+    assert!(Loss::QuerySoftMax { lambda: -0.1, beta: 1.0 }.validate().is_err());
+    assert!(Loss::QuerySoftMax { lambda: 0.0, beta: 0.0 }.validate().is_err());
+    assert!(Loss::QuerySoftMax { lambda: f64::NAN, beta: 1.0 }.validate().is_err());
+    assert!(Loss::QuerySoftMax { lambda: 0.01, beta: 1.0 }.validate().is_ok());
+    // QueryRmse carries no params — always valid.
+    assert!(Loss::QueryRmse.validate().is_ok());
+}

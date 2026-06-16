@@ -7,8 +7,8 @@ use crate::loss::{
     focal_der1, focal_der2, huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1,
     logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
     multi_crossentropy_ders, multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1,
-    quantile_der2, rmse_der1, rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2,
-    QUANTILE_ALPHA, QUANTILE_DELTA,
+    quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1, rmse_der2, sigmoid, softmax_ders,
+    tweedie_der1, tweedie_der2, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 
 #[test]
@@ -440,4 +440,50 @@ fn multi_crossentropy_der2_equals_onevsall_diagonal() {
         let (_, ova_d2) = multiclass_onevsall_ders(a, true);
         assert!((ce_d2 - ova_d2).abs() < 1e-12, "diagonal der2 must match OneVsAll at a={a}");
     }
+}
+
+// --- QueryRMSE / QuerySoftMax per-object der (LOSS-04 Wave A) -----------------
+
+#[test]
+fn queryrmse_der_matches_hand_formula_unweighted() {
+    // der1 = (target - approx - queryAvrg)·w, der2 = -1·w (error_functions.h:901-907).
+    // Unweighted (w=1): der1 = target - approx - queryAvrg.
+    let (d1, d2) = queryrmse_der(/*approx*/ 0.5, /*target*/ 2.0, /*weight*/ 1.0, /*avrg*/ 0.3);
+    assert!((d1 - (2.0 - 0.5 - 0.3)).abs() < 1e-12);
+    assert!((d2 - (-1.0)).abs() < 1e-12);
+}
+
+#[test]
+fn queryrmse_der_folds_weight_into_both_ders() {
+    // The querywise der is ALREADY weighted (unlike the scalar *_der1 helpers).
+    let (d1, d2) = queryrmse_der(1.0, 3.0, 2.0, 0.5);
+    // (3 - 1 - 0.5)·2 = 3.0 ; -1·2 = -2.0
+    assert!((d1 - 3.0).abs() < 1e-12);
+    assert!((d2 - (-2.0)).abs() < 1e-12);
+}
+
+#[test]
+fn querysoftmax_der_matches_hand_formula() {
+    // der1 = Beta·(-sumWTargets·p + w·target),
+    // der2 = Beta·sumWTargets·(Beta·p·(p-1) - LambdaReg) (error_functions.cpp:564-565).
+    let beta = 1.0_f64;
+    let lambda = 0.01_f64;
+    let p = 0.25_f64;
+    let sum_wt = 2.0_f64;
+    let w = 1.0_f64;
+    let t = 1.0_f64;
+    let (d1, d2) = querysoftmax_der(p, sum_wt, w, t, beta, lambda);
+    let want_d1 = beta * (-sum_wt * p + w * t);
+    let want_d2 = beta * sum_wt * (beta * p * (p - 1.0) - lambda);
+    assert!((d1 - want_d1).abs() < 1e-12);
+    assert!((d2 - want_d2).abs() < 1e-12);
+}
+
+#[test]
+fn querysoftmax_der_scales_with_beta() {
+    // Beta enters both terms; a non-unit beta must scale per the formula.
+    let (d1, d2) = querysoftmax_der(0.4, 1.5, 1.0, 0.0, 2.0, 0.0);
+    // der1 = 2·(-1.5·0.4 + 0) = -1.2 ; der2 = 2·1.5·(2·0.4·(0.4-1) - 0) = 3·(-0.48) = -1.44
+    assert!((d1 - (-1.2)).abs() < 1e-12);
+    assert!((d2 - (-1.44)).abs() < 1e-12);
 }

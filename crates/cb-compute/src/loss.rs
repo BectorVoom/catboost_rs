@@ -557,3 +557,63 @@ pub fn multi_crossentropy_ders(approx_d: f64, target_d: f64) -> (f64, f64) {
     let der2 = -p * (1.0 - p);
     (der1, der2)
 }
+
+/// QueryRMSE per-object first/second derivative for one object, given the
+/// already-computed per-group `query_avrg` (LOSS-04, Wave A). RAW approx
+/// (`isExpApprox == false`).
+///
+/// `error_functions.h:901-907` — `TQueryRmseError::CalcDersForQueries`:
+/// ```text
+/// ders[d].Der1 = targets[d] - approxes[d] - queryAvrg;
+/// ders[d].Der2 = -1;
+/// if (!weights.empty()) { ders[d].Der1 *= w; ders[d].Der2 *= w; }
+/// ```
+/// so `der1 = (target - approx - query_avrg) * weight` and `der2 = -1 * weight`.
+/// Unlike the scalar `*_der1` helpers (which return the UNWEIGHTED scalar for the
+/// caller to weight), the upstream querywise der folds the per-object `weight`
+/// INTO the der here (the leaf reduction consumes it directly without re-
+/// weighting); the per-group wrapper ([`crate::calc_ders_for_queries`]) passes the
+/// object's `weight` (or `1.0` when unweighted) and the group's `query_avrg`
+/// (computed via [`crate::group_reduce_weighted`] over `target - approx`).
+///
+/// The `query_avrg` is the per-group weighted residual mean
+/// `Σ_g (target - approx)·w / Σ_g w` (`CalcQueryAvrg`, `error_functions.h:912-932`),
+/// `0` for an empty / zero-weight group (the upstream `queryCount > 0` guard).
+#[must_use]
+pub fn queryrmse_der(approx: f64, target: f64, weight: f64, query_avrg: f64) -> (f64, f64) {
+    let der1 = (target - approx - query_avrg) * weight;
+    let der2 = -1.0 * weight;
+    (der1, der2)
+}
+
+/// QuerySoftMax per-object first/second derivative for one object within a group,
+/// given the already-computed per-group softmax probability `p` (the object's
+/// weighted exp-share `expApprox·w / Σ_g expApprox·w`), the per-group
+/// `sum_weighted_targets`, the object's `weight` and `target`, and the loss
+/// `beta` / `lambda_reg` (LOSS-04, Wave A). RAW approx (`isExpApprox == false`);
+/// the `exp` is taken INLINE in the per-group wrapper, max-shifted before `exp`.
+///
+/// `error_functions.cpp:560-569` — `TQuerySoftMaxError::CalcDersForSingleQuery`:
+/// ```text
+/// p = ders[dim].Der1 / sumExpApprox;       // Der1 held expApprox*weight
+/// ders[dim].Der2 = Beta*sumWTargets*(Beta*p*(p-1) - LambdaReg);
+/// ders[dim].Der1 = Beta*(-sumWTargets*p + weight*target);
+/// ```
+/// for `weight > 0`; objects with `weight <= 0` (and the whole group when
+/// `sumWTargets <= 0`) get `der1 = der2 = 0` (the per-group wrapper applies those
+/// guards). Like [`queryrmse_der`] this returns the der ALREADY weighted (the
+/// `weight·target` term and the `p` numerator fold the per-object weight in), so
+/// the caller does NOT re-multiply by `weight`.
+#[must_use]
+pub fn querysoftmax_der(
+    p: f64,
+    sum_weighted_targets: f64,
+    weight: f64,
+    target: f64,
+    beta: f64,
+    lambda_reg: f64,
+) -> (f64, f64) {
+    let der2 = beta * sum_weighted_targets * (beta * p * (p - 1.0) - lambda_reg);
+    let der1 = beta * (-sum_weighted_targets * p + weight * target);
+    (der1, der2)
+}

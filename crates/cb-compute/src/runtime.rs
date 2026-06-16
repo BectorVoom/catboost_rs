@@ -256,7 +256,54 @@ pub enum Loss {
         /// `|target - approx| < delta` contribute `0` in every dimension.
         delta: f64,
     },
+    /// QueryRMSE (querywise ranking, D-6.3-03 / LOSS-04 Wave A): a per-query-group
+    /// RMSE whose der subtracts the group's weighted residual mean so the model
+    /// learns the WITHIN-group ranking, not the absolute target. RAW approx
+    /// (`isExpApprox == false`, `error_functions.h:876`). Over one group:
+    /// `queryAvrg = Σ_g (target - approx)·w / Σ_g w`; per object
+    /// `der1 = (target - approx - queryAvrg)·w`, `der2 = -1·w`
+    /// (`error_functions.h:879-933` `TQueryRmseError`,
+    /// [`crate::queryrmse_der`] / [`crate::calc_ders_for_queries`]). Empty /
+    /// zero-weight group → `queryAvrg = 0`, ders `0` (the upstream `queryCount > 0`
+    /// guard — no divide). No params on the variant. Rides the EXISTING pointwise
+    /// leaf estimators (Gradient/Newton — the der is per-object); no pairwise
+    /// Cholesky path. Predictions are RAW (identity — no link transform).
+    QueryRmse,
+    /// QuerySoftMax (querywise ranking, D-6.3-03 / LOSS-04 Wave A): a per-query-
+    /// group softmax cross-entropy over `Beta·approx`, MAX-SHIFTED before `exp`
+    /// (`error_functions.cpp:540-552`; the [`crate::calc_softmax`] NaN guard,
+    /// Security V5 / T-06.3-02-01). RAW approx (`isExpApprox == false`,
+    /// `error_functions.h:1040`). Over one group with
+    /// `p = expApprox·w / Σ_g expApprox·w` and
+    /// `sumWTargets = Σ_g w·target` (over `target > 0`, `weight > 0`):
+    /// `der1 = Beta·(-sumWTargets·p + w·target)`,
+    /// `der2 = Beta·sumWTargets·(Beta·p·(p-1) - LambdaReg)`
+    /// (`error_functions.cpp:560-565` `TQuerySoftMaxError`,
+    /// [`crate::querysoftmax_der`]). `sumWTargets <= 0` (or `weight <= 0`) → ders
+    /// `0` (T-06.3-02-02 — no divide). Rides the EXISTING pointwise leaf
+    /// estimators (Gradient/Newton); no pairwise path. Predictions are RAW.
+    ///
+    /// `lambda` (`LambdaReg`) defaults to `0.01`, `beta` to `1.0`
+    /// (`loss_description.cpp:209-216`). Both are owned `f64` params (the
+    /// `Loss::Variant { params }` pattern). `lambda` finite `>= 0` and `beta`
+    /// finite `> 0` are validated by [`Loss::validate`] (T-06.3-02-03).
+    QuerySoftMax {
+        /// L2 regularization on the softmax der `LambdaReg >= 0`
+        /// (`QuerySoftMax:lambda=<value>`; default `0.01`).
+        lambda: f64,
+        /// Inverse-temperature `Beta > 0` scaling the approx before `exp`
+        /// (`QuerySoftMax:beta=<value>`; default `1.0`).
+        beta: f64,
+    },
 }
+
+/// The default QuerySoftMax L2 regularization `lambda = 0.01`
+/// (`NCatboostOptions::GetQuerySoftMaxLambdaReg`, `loss_description.cpp:211`).
+pub const QUERYSOFTMAX_LAMBDA_DEFAULT: f64 = 0.01;
+
+/// The default QuerySoftMax inverse-temperature `beta = 1.0`
+/// (`NCatboostOptions::GetQuerySoftMaxBeta`, `loss_description.cpp:215`).
+pub const QUERYSOFTMAX_BETA_DEFAULT: f64 = 1.0;
 
 /// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
 /// one-argument constructor, `error_functions.h:512`), the symmetric L2 case.
@@ -375,6 +422,24 @@ impl Loss {
             // `[0,1]`, T-6.2-04a) needs the target, which `Loss::validate` does not
             // see, so it is enforced at training time (the multiclass remap
             // precedent) — nothing to reject here.
+            // QuerySoftMax (Wave A, D-6.3-03 / LOSS-04): `lambda` (LambdaReg) must be
+            // finite and `>= 0` (an L2 regularizer), `beta` (the inverse-temperature
+            // scaling the approx before `exp`) finite and `> 0`. An out-of-domain
+            // lambda/beta yields a NaN/Inf softmax der that would poison the leaf
+            // reductions (T-06.3-02-03), so reject up front with a typed CbError (no
+            // `unwrap`/`panic`). QueryRmse carries no params (nothing to reject).
+            Self::QuerySoftMax { lambda, beta } => {
+                if !lambda.is_finite() || *lambda < 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "QuerySoftMax lambda must be finite and >= 0, got {lambda}"
+                    )));
+                }
+                if !beta.is_finite() || *beta <= 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "QuerySoftMax beta must be finite and > 0, got {beta}"
+                    )));
+                }
+            }
             Self::Rmse
             | Self::Logloss
             | Self::CrossEntropy
@@ -386,7 +451,8 @@ impl Loss {
             | Self::MultiClass
             | Self::MultiClassOneVsAll
             | Self::MultiLogloss
-            | Self::MultiCrossEntropy => {}
+            | Self::MultiCrossEntropy
+            | Self::QueryRmse => {}
         }
         Ok(())
     }

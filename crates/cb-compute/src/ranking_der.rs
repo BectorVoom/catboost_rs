@@ -33,6 +33,7 @@
 
 use cb_core::{sum_f64, CbError, CbResult};
 
+use crate::loss::{queryrmse_der, querysoftmax_der};
 use crate::runtime::{Derivatives, Loss};
 
 /// A competitor edge inside a group: the group-local loser index plus the pair
@@ -150,7 +151,7 @@ pub fn calc_ders_for_queries(
         let approx_slice = approx.get(group.begin..group.end).ok_or_else(|| {
             CbError::Degenerate("calc_ders_for_queries: approx slice out of range".to_owned())
         })?;
-        let _target_slice = target.get(group.begin..group.end).ok_or_else(|| {
+        let target_slice = target.get(group.begin..group.end).ok_or_else(|| {
             CbError::Degenerate("calc_ders_for_queries: target slice out of range".to_owned())
         })?;
         let weight_slice: &[f64] = if weights.is_empty() {
@@ -161,26 +162,153 @@ pub fn calc_ders_for_queries(
             })?
         };
 
-        // Empty-group guard: a zero-size group contributes nothing and never
-        // divides (Security V5 — mirror metrics.rs:145-149). The per-group
-        // normalizer is computed (and discarded for now) to exercise the seam's
-        // reduction path through cb_core::sum_f64.
-        let _normalizer = if group.size() == 0 {
-            0.0
-        } else {
-            group_reduce_weighted(approx_slice, weight_slice)
+        // Per-object weight accessor for this group: uniform 1.0 when unweighted.
+        let weight_at = |i: usize| -> f64 {
+            if weight_slice.is_empty() {
+                1.0
+            } else {
+                weight_slice.get(i).copied().unwrap_or(0.0)
+            }
         };
 
-        // Dispatch to the per-loss arm. Plan 06.3-01: every variant is unwired —
-        // Plans 02–05 replace this with the transcribed per-loss der arms
-        // (QueryRMSE / QuerySoftMax / PairLogit / LambdaMart / YetiRank /
-        // StochasticRank). The per-group slicing + normalizer above is the
-        // infrastructure those arms attach to.
-        let _ = &mut per_group;
-        return Err(CbError::OutOfRange(format!(
-            "calc_ders_for_queries: ranking loss not yet wired for {loss:?} \
-             (grouped der arms land in Plans 06.3-02..05)"
-        )));
+        // Empty group → an empty der set for the group (Security V5 — never
+        // divides, mirror metrics.rs:145-149). Plans 02–05 wired arms below all
+        // short-circuit on a zero-size group to the empty der.
+        if group.size() == 0 {
+            per_group.push(Derivatives {
+                der1: Vec::new(),
+                der2: Vec::new(),
+            });
+            continue;
+        }
+
+        // Dispatch to the per-loss arm (Plan 06.3-02 wires the first two querywise
+        // ranking losses; PairLogit / LambdaMart / YetiRank / StochasticRank stay
+        // unwired until Plans 03–05).
+        let ders = match loss {
+            // QueryRMSE (Wave A): per-group weighted residual mean `queryAvrg`,
+            // then per-object `der1 = (target - approx - queryAvrg)·w`,
+            // `der2 = -1·w` (error_functions.h:879-933). The `queryAvrg`
+            // numerator `Σ (target - approx)·w` and denominator `Σ w` both route
+            // through cb_core::sum_f64 (D-08, doc-ascending order).
+            Loss::QueryRmse => {
+                // residual[i] = target[i] - approx[i] (group-local).
+                let residuals: Vec<f64> = (0..group.size())
+                    .map(|i| {
+                        target_slice.get(i).copied().unwrap_or(0.0)
+                            - approx_slice.get(i).copied().unwrap_or(0.0)
+                    })
+                    .collect();
+                // numerator = Σ residual·w ; denominator = Σ w (both sum_f64).
+                let numerator = group_reduce_weighted(&residuals, weight_slice);
+                let weight_col: Vec<f64> = (0..group.size()).map(weight_at).collect();
+                let denominator = sum_f64(&weight_col);
+                // queryCount > 0 guard (error_functions.h:928): zero-weight group →
+                // queryAvrg 0, never divides.
+                let query_avrg = if denominator > 0.0 {
+                    numerator / denominator
+                } else {
+                    0.0
+                };
+                let mut der1 = Vec::with_capacity(group.size());
+                let mut der2 = Vec::with_capacity(group.size());
+                for i in 0..group.size() {
+                    let a = approx_slice.get(i).copied().unwrap_or(0.0);
+                    let t = target_slice.get(i).copied().unwrap_or(0.0);
+                    let (d1, d2) = queryrmse_der(a, t, weight_at(i), query_avrg);
+                    der1.push(d1);
+                    der2.push(d2);
+                }
+                Derivatives { der1, der2 }
+            }
+            // QuerySoftMax (Wave A): per-group softmax over `Beta·approx`,
+            // MAX-SHIFTED before exp (error_functions.cpp:540-552). The exp share
+            // `p = expApprox·w / Σ expApprox·w`; der per error_functions.cpp:560-565.
+            // `sumWTargets <= 0` (or `weight <= 0`) → ders 0 (no divide).
+            Loss::QuerySoftMax { lambda, beta } => {
+                // (1) maxApprox + sumWeightedTargets over weight>0 objects
+                // (error_functions.cpp:540-550). maxApprox seeds at the most
+                // negative finite f64 (upstream `-numeric_limits::max()`); an
+                // all-zero-weight group leaves it at that seed but the
+                // `sumWTargets <= 0` guard short-circuits before exp.
+                let mut max_approx = f64::MIN;
+                let mut target_terms: Vec<f64> = Vec::with_capacity(group.size());
+                for i in 0..group.size() {
+                    let w = weight_at(i);
+                    let a = approx_slice.get(i).copied().unwrap_or(0.0);
+                    let t = target_slice.get(i).copied().unwrap_or(0.0);
+                    if w > 0.0 {
+                        if a > max_approx {
+                            max_approx = a;
+                        }
+                        if t > 0.0 {
+                            target_terms.push(w * t);
+                        }
+                    }
+                }
+                // Σ w·target through the sanctioned ordered reduction (D-08).
+                let sum_weighted_targets = sum_f64(&target_terms);
+                if sum_weighted_targets > 0.0 {
+                    // (2) expApprox[i] = exp(Beta·(approx[i] - maxApprox)) · w, the
+                    // numerator the share p divides by. `calc_softmax` already
+                    // max-subtracts + exps, but it normalizes UNWEIGHTED over ALL
+                    // objects; here the share is WEIGHTED and the shift uses Beta.
+                    // Transcribe the shift directly (the calc_softmax NaN-guard
+                    // discipline) so weight>0/weight==0 objects are handled per
+                    // upstream.
+                    let weighted_exp: Vec<f64> = (0..group.size())
+                        .map(|i| {
+                            let w = weight_at(i);
+                            let a = approx_slice.get(i).copied().unwrap_or(0.0);
+                            // exp(Beta·(approx - maxApprox)) · w.
+                            (beta * (a - max_approx)).exp() * w
+                        })
+                        .collect();
+                    // sumExpApprox = Σ weighted_exp (sum_f64, doc-ascending — D-08).
+                    let sum_exp = sum_f64(&weighted_exp);
+                    let mut der1 = Vec::with_capacity(group.size());
+                    let mut der2 = Vec::with_capacity(group.size());
+                    for i in 0..group.size() {
+                        let w = weight_at(i);
+                        if w > 0.0 && sum_exp > 0.0 {
+                            let p = weighted_exp.get(i).copied().unwrap_or(0.0) / sum_exp;
+                            let t = target_slice.get(i).copied().unwrap_or(0.0);
+                            let (d1, d2) = querysoftmax_der(
+                                p,
+                                sum_weighted_targets,
+                                w,
+                                t,
+                                *beta,
+                                *lambda,
+                            );
+                            der1.push(d1);
+                            der2.push(d2);
+                        } else {
+                            // weight <= 0 → ders 0 (error_functions.cpp:566-569).
+                            der1.push(0.0);
+                            der2.push(0.0);
+                        }
+                    }
+                    Derivatives { der1, der2 }
+                } else {
+                    // sumWTargets <= 0 → all ders 0 (error_functions.cpp:571-576).
+                    Derivatives {
+                        der1: vec![0.0; group.size()],
+                        der2: vec![0.0; group.size()],
+                    }
+                }
+            }
+            // PairLogit / LambdaMart / YetiRank / StochasticRank (and every non-
+            // ranking loss) stay unwired here — Plans 03–05 fill them; the
+            // pointwise losses never reach the grouped seam.
+            _ => {
+                return Err(CbError::OutOfRange(format!(
+                    "calc_ders_for_queries: ranking loss not yet wired for {loss:?} \
+                     (grouped der arms land in Plans 06.3-03..05)"
+                )));
+            }
+        };
+        per_group.push(ders);
     }
 
     // Reached only when `groups` is empty (no group ever dispatched): the seam
