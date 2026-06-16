@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: "Phase 6.2 COMPLETE — 06.2-05 (Wave-3 MultiQuantile, LOSS-03 multi-output) shipped; all 5 plans done, all 4 ROADMAP success criteria met. LOSS-02 + LOSS-03 (scalar+multi) matrix CLOSED. NEXT: /gsd-transition or /gsd-plan-phase 6.3 (ranking losses)."
-last_updated: "2026-06-16T11:26:08.852Z"
+last_updated: "2026-06-16T11:44:49.875Z"
 last_activity: 2026-06-16 -- Phase 06.2 Plan 05 (Wave-3 MultiQuantile, LOSS-03 multi-output) COMPLETE — Phase 6.2 CLOSED
 progress:
   total_phases: 14
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 51
-  completed_plans: 50
-  percent: 43
+  completed_plans: 51
+  percent: 50
 ---
 
 # Project State
@@ -99,6 +99,7 @@ Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 
 | Phase 06.2 P04 | ~45min | 2 tasks | 21 files |
 | Phase 06.2 P05 | ~16min | 2 tasks | 13 files |
 | Phase 06.2 P06.2-06 | 8m | 3 tasks | 7 files |
+| Phase 06.2 P07 | 13min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -204,6 +205,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Smooth-loss Exact leaf estimation is loss-dispatched: LogCosh uses the monotone-bisection 1-D optimum (Sum tanh=0), not the MAE weighted-median
 - [Phase ?]: 06.2-06: predict_raw_cat routes approx_dimension>1 to dim-aware accumulator; <=1 stays byte-identical (D-04)
 - [Phase ?]: 06.2-06: class labels round-trip via class_params/multiclass_params on json + .cbm InfoMap
+- [Phase ?]: 06.2-07: multi-output sampling now per-object (der_obj L2-norm); random_strength std-dev divides by n not dim*n; WR-05 target_class<k + WR-01 stride guards typed-error-hardened (CR-02 closed)
 
 ### Pending Todos
 
@@ -243,7 +245,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-16T11:25:26.840Z
+Last session: 2026-06-16T11:44:45.200Z
 Stopped at: Phase 6.2 COMPLETE — 06.2-05 (Wave-3 MultiQuantile, LOSS-03 multi-output) shipped; all 5 plans done, all 4 ROADMAP success criteria met. LOSS-02 + LOSS-03 (scalar+multi) matrix CLOSED. NEXT: /gsd-transition or /gsd-plan-phase 6.3 (ranking losses).
 Stopped at (prior): Phase 6.2 context gathered
 Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
