@@ -193,6 +193,36 @@ pub enum Loss {
     /// leaf method is Newton with 1 iteration (Pitfall 2). Predictions are per-dim
     /// sigmoid probabilities (which do NOT sum to 1, unlike softmax) + argmax class.
     MultiClassOneVsAll,
+    /// MultiLogloss (multilabel binary classification, D-6.2-04 / LOSS-02): a
+    /// SEPARABLE (per-dimension diagonal) multilabel loss. Each label dimension `d`
+    /// is an independent binary sigmoid cross-entropy over a `{0,1}` label column,
+    /// so it reuses the scalar Logloss / Newton leaf math per dimension (no dense
+    /// solve, no softmax coupling). Over one object's label dimension `d` with
+    /// `p = sigmoid(approx_d)`: `der1 = target_d - p`, `der2 = -p*(1 - p)`
+    /// (`error_functions.h:781-820` `TMultiCrossEntropyError`,
+    /// [`crate::multi_crossentropy_ders`]).
+    ///
+    /// `approx_dimension` = the label-set WIDTH (number of binary label columns,
+    /// `approx_dimension.cpp:22-23` `IsMultiTargetObjective`); the training target
+    /// is dim-major length `dim*n` (one `{0,1}` label per dimension per object).
+    /// Identical der path to [`Loss::MultiCrossEntropy`] — they map to the SAME
+    /// upstream `TMultiCrossEntropyError` class (`tensor_search_helpers.cpp:236-238`);
+    /// only the admissible target range differs (`{0,1}` here). Upstream default
+    /// leaf method is Newton with `leaf_estimation_iterations:10`; fixtures pin it
+    /// to 1 (Pitfall 2). Predictions are per-dim sigmoid probabilities.
+    MultiLogloss,
+    /// MultiCrossEntropy (multilabel classification with soft probability targets,
+    /// D-6.2-04 / LOSS-02): the SAME `TMultiCrossEntropyError` per-dimension
+    /// diagonal der path as [`Loss::MultiLogloss`] — they dispatch to ONE shared
+    /// [`crate::multi_crossentropy_ders`] helper (`tensor_search_helpers.cpp:236-238`).
+    /// The ONLY difference is the admissible target range: MultiCrossEntropy admits
+    /// soft probability targets in `[0,1]` (vs MultiLogloss's binary `{0,1}`).
+    ///
+    /// `approx_dimension` = the label-set width; the training target is dim-major
+    /// length `dim*n` (one `[0,1]` probability per dimension per object). Upstream
+    /// default leaf method is Newton with `leaf_estimation_iterations:10`; fixtures
+    /// pin it to 1 (Pitfall 2). Predictions are per-dim sigmoid probabilities.
+    MultiCrossEntropy,
 }
 
 /// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
@@ -273,6 +303,13 @@ impl Loss {
             // class-index range check (T-6.2-01) is enforced at training time
             // against the REMAPPED `[0, k)` index — `Loss::validate` has no target
             // in scope, so there is nothing to reject here.
+            //
+            // MultiLogloss / MultiCrossEntropy likewise carry no hyperparameters
+            // (the label-set width is target-derived, D-6.2-04). Their per-dimension
+            // target-range guard (MultiLogloss ∈ `{0,1}`, MultiCrossEntropy ∈
+            // `[0,1]`, T-6.2-04a) needs the target, which `Loss::validate` does not
+            // see, so it is enforced at training time (the multiclass remap
+            // precedent) — nothing to reject here.
             Self::Rmse
             | Self::Logloss
             | Self::CrossEntropy
@@ -282,7 +319,9 @@ impl Loss {
             | Self::Poisson
             | Self::Mape
             | Self::MultiClass
-            | Self::MultiClassOneVsAll => {}
+            | Self::MultiClassOneVsAll
+            | Self::MultiLogloss
+            | Self::MultiCrossEntropy => {}
         }
         Ok(())
     }

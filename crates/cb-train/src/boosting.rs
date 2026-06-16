@@ -675,7 +675,9 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         | Loss::Tweedie { .. }
         | Loss::Mape
         | Loss::MultiClass
-        | Loss::MultiClassOneVsAll => TargetType::Unknown,
+        | Loss::MultiClassOneVsAll
+        | Loss::MultiLogloss
+        | Loss::MultiCrossEntropy => TargetType::Unknown,
     }
 }
 
@@ -801,6 +803,20 @@ fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
         return Err(CbError::OutOfRange(format!(
             "{loss:?} requires LeafMethod::Newton (the upstream default, 1 \
              iteration); {method:?} has no defined multiclass leaf optimizer"
+        )));
+    }
+    // MultiLogloss / MultiCrossEntropy are gated to Newton (Pitfall 2 — the
+    // upstream default leaf method for both is Newton; the fixtures pin
+    // `leaf_estimation_iterations:1`). They are SEPARABLE (per-dimension diagonal),
+    // so they reuse the scalar Newton leaf step per dimension; Gradient/Simple/Exact
+    // have no defined multilabel leaf optimizer here. Reject any non-Newton method
+    // up front rather than silently producing a wrong leaf value.
+    if matches!(loss, Loss::MultiLogloss | Loss::MultiCrossEntropy)
+        && !matches!(method, LeafMethod::Newton)
+    {
+        return Err(CbError::OutOfRange(format!(
+            "{loss:?} requires LeafMethod::Newton (the upstream default); \
+             {method:?} has no defined multilabel leaf optimizer"
         )));
     }
     if matches!(method, LeafMethod::Newton) {
@@ -1382,7 +1398,34 @@ fn train_inner<R: Runtime>(
     // Lq{q<2} Newton step would inject inf/NaN into the leaf denominator.
     validate_leaf_method(&params.loss, params.leaf_method)?;
 
-    let n = target.len();
+    // The multilabel losses (MultiLogloss / MultiCrossEntropy) carry a DIM-MAJOR
+    // target of length `dim*n` (one label per dimension per object), so `n` cannot
+    // be `target.len()` (that would be `dim*n`). Derive the OBJECT count `n` from
+    // the feature columns instead; the label-set WIDTH (approx_dimension) is then
+    // `target.len() / n` (`approx_dimension.cpp:22-23` IsMultiTargetObjective ->
+    // targetDimension). For every other loss `n == target.len()` (per-object).
+    let is_multilabel = matches!(
+        params.loss,
+        Loss::MultiLogloss | Loss::MultiCrossEntropy
+    );
+    let n = if is_multilabel {
+        let n_obj = feature_values.first().map_or(0, Vec::len);
+        if n_obj == 0 {
+            return Err(CbError::Degenerate(
+                "multilabel training requires at least one feature column with objects".to_owned(),
+            ));
+        }
+        if target.len() % n_obj != 0 {
+            return Err(CbError::LengthMismatch {
+                column: "multilabel target".to_owned(),
+                expected: target.len() - (target.len() % n_obj),
+                actual: target.len(),
+            });
+        }
+        n_obj
+    } else {
+        target.len()
+    };
     if n == 0 {
         return Err(CbError::Degenerate("empty target".to_owned()));
     }
@@ -1431,7 +1474,42 @@ fn train_inner<R: Runtime>(
     // `approx_dimension == 1` it is EXACTLY `vec![bias; n]` (the same slice,
     // same length, same summation order) — the D-04 byte-identity invariant
     // (RESEARCH Pitfall 1).
-    let approx_dimension: usize = loss_approx_dimension(&params.loss, target);
+    // For the multilabel losses (MultiLogloss / MultiCrossEntropy) the approx
+    // dimension is the label-set WIDTH `target.len() / n` (dim-major target,
+    // `approx_dimension.cpp:22-23`), derived HERE because `loss_approx_dimension`
+    // has no object count in scope. For every other loss it is the loss-derived
+    // dimension (1 for scalar/binary; the distinct class count for multiclass).
+    let approx_dimension: usize = if is_multilabel {
+        target.len() / n
+    } else {
+        loss_approx_dimension(&params.loss, target)
+    };
+
+    // MULTILABEL per-dimension target-range validation (T-6.2-04a): MultiLogloss
+    // labels must be `{0,1}`, MultiCrossEntropy probabilities `[0,1]`. Reject an
+    // out-of-range label up front with a typed CbError (no `unwrap`/panic) rather
+    // than feeding a poisoned der into the histogram/leaf reductions. The target is
+    // dim-major `dim*n`; every entry is one label.
+    if is_multilabel {
+        let binary = matches!(params.loss, Loss::MultiLogloss);
+        for &t in target {
+            let ok = if binary {
+                t == 0.0 || t == 1.0
+            } else {
+                t.is_finite() && (0.0..=1.0).contains(&t)
+            };
+            if !ok {
+                let (name, range) = if binary {
+                    ("MultiLogloss", "{0, 1}")
+                } else {
+                    ("MultiCrossEntropy", "[0, 1]")
+                };
+                return Err(CbError::OutOfRange(format!(
+                    "{name} target label {t} is outside the admissible range {range}"
+                )));
+            }
+        }
+    }
 
     // MULTICLASS class-label remap (Pitfall 4, LOSS-02). The raw labels are mapped
     // to a contiguous `[0, k)` class index BEFORE training (`label_converter.cpp:142`)

@@ -556,7 +556,49 @@ fn compute_gradients_one_dim(
              single-dimension scalar path"
                 .to_owned(),
         )),
+        // MultiLogloss / MultiCrossEntropy are multi-output (multilabel) losses
+        // dispatched in `compute_gradients` BEFORE the per-dimension scalar loop
+        // (they need the dim-major target to read `target[d*n+i]`). They never enter
+        // this single-dimension scalar dispatch; reject defensively (typed CbError,
+        // no `unwrap`/panic).
+        Loss::MultiLogloss | Loss::MultiCrossEntropy => Err(CbError::Degenerate(
+            "multilabel losses are dispatched in compute_gradients, not the \
+             single-dimension scalar path"
+                .to_owned(),
+        )),
     }
+}
+
+/// Compute the MultiLogloss / MultiCrossEntropy SEPARABLE per-dimension diagonal
+/// der1/der2 over the dimension-major `approx` buffer. Both losses are the SAME
+/// upstream `TMultiCrossEntropyError` class (`error_functions.h:781-820`), so they
+/// share THIS one der path — only the admissible target range differs (validated
+/// upstream of training). Each label dimension `d` is an independent binary sigmoid
+/// cross-entropy with `der1 = target[d*n+i] - sigmoid(approx[d*n+i])`,
+/// `der2 = -p*(1-p)`.
+///
+/// Unlike the multiclass losses (per-OBJECT class index), the multilabel `target`
+/// is DIM-MAJOR length `dim*n` — one `{0,1}`/`[0,1]` label per dimension per object.
+/// Both outputs are dimension-major length `dim*n` (`buf[d*n+i]`), reusing the
+/// diagonal-loss leaf path per dimension.
+fn compute_multilabel_gradients(approx: &[f64], target: &[f64], dim: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut der1 = vec![0.0_f64; dim * n];
+    let mut der2 = vec![0.0_f64; dim * n];
+    for d in 0..dim {
+        for i in 0..n {
+            let idx = d * n + i;
+            let a = approx.get(idx).copied().unwrap_or(0.0);
+            let t = target.get(idx).copied().unwrap_or(0.0);
+            let (od1, od2) = cb_compute::multi_crossentropy_ders(a, t);
+            if let Some(slot) = der1.get_mut(idx) {
+                *slot = od1;
+            }
+            if let Some(slot) = der2.get_mut(idx) {
+                *slot = od2;
+            }
+        }
+    }
+    (der1, der2)
 }
 
 /// Compute the MultiClass softmax COUPLED der1 (dimension-major) + PACKED symmetric
@@ -654,6 +696,28 @@ impl Runtime for CpuBackend {
             });
         }
         let n = approx.len() / approx_dimension;
+        // The multilabel losses (MultiLogloss / MultiCrossEntropy) carry a DIM-MAJOR
+        // target of length `dim*n` (one label per dimension per object), unlike the
+        // scalar / multiclass losses whose target is per-object length `n`. Validate
+        // and dispatch them here, BEFORE the per-object `target.len() == n` check.
+        let is_multilabel = matches!(loss, Loss::MultiLogloss | Loss::MultiCrossEntropy);
+        if is_multilabel {
+            if target.len() != approx_dimension * n {
+                return Err(CbError::LengthMismatch {
+                    column: "target".to_owned(),
+                    expected: approx_dimension * n,
+                    actual: target.len(),
+                });
+            }
+            if approx.is_empty() {
+                return Ok(Derivatives {
+                    der1: Vec::new(),
+                    der2: Vec::new(),
+                });
+            }
+            let (der1, der2) = compute_multilabel_gradients(approx, target, approx_dimension, n);
+            return Ok(Derivatives { der1, der2 });
+        }
         // `target` stays per-object length `n` for the scalar / class losses
         // dispatched in this wave (the dim-major target widening is a later plan).
         if target.len() != n {

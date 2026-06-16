@@ -520,3 +520,40 @@ pub fn multiclass_onevsall_ders(approx_d: f64, is_target: bool) -> (f64, f64) {
     let der2 = -p * (1.0 - p);
     (der1, der2)
 }
+
+/// The MultiLogloss / MultiCrossEntropy per-dimension DIAGONAL der for one object
+/// and one label dimension `d` (`error_functions.h:781-820`
+/// `TMultiCrossEntropyError`), transcribed verbatim.
+///
+/// MultiLogloss and MultiCrossEntropy are the SAME upstream class
+/// (`tensor_search_helpers.cpp:236-238` dispatches both to
+/// `TMultiCrossEntropyError`); they differ ONLY in the admissible target range
+/// (MultiLogloss = `{0,1}` binary labels; MultiCrossEntropy = `[0,1]` probability
+/// targets), validated in [`crate::Loss::validate`]. The der is identical, so both
+/// losses call THIS single helper — there is no per-loss branch in the der math.
+///
+/// The loss is fully SEPARABLE (each label dimension independent), so this is a
+/// SCALAR pair per dimension reusing the existing scalar [`sigmoid`]. Upstream
+/// computes (`error_functions.h:791-808`):
+/// ```text
+/// derRef[d] = -sigmoid(approx_d);             // = -FastExp(a)/(1+FastExp(a))
+/// der2[d]   = derRef[d] * (1 + derRef[d]);    // diagonal: -sigmoid*(1-sigmoid)
+/// derRef[d] += target[d];                     // => target_d - sigmoid(approx_d)
+/// ```
+/// so with `p = sigmoid(approx_d)`:
+/// - `der1 = target_d - p` (`:807`), and
+/// - `der2 = (-p)*(1 - p) = -p*(1 - p)` (`:802`, the diagonal Hessian entry —
+///   identical to the binary Logloss / OneVsAll diagonal).
+///
+/// Because the Hessian is diagonal, the leaf delta is the EXISTING scalar Newton
+/// step per dimension (`crate::newton_leaf_delta`) — no dense solve. `target_d` is
+/// the per-dimension label (`{0,1}` for MultiLogloss, `[0,1]` for
+/// MultiCrossEntropy). Returns `(der1, der2)` unweighted (the caller folds in the
+/// weight).
+#[must_use]
+pub fn multi_crossentropy_ders(approx_d: f64, target_d: f64) -> (f64, f64) {
+    let p = sigmoid(approx_d);
+    let der1 = target_d - p;
+    let der2 = -p * (1.0 - p);
+    (der1, der2)
+}

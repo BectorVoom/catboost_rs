@@ -6,8 +6,9 @@ use crate::loss::{
     calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,
     focal_der1, focal_der2, huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1,
     logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
-    multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1, quantile_der2, rmse_der1,
-    rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2, QUANTILE_ALPHA, QUANTILE_DELTA,
+    multi_crossentropy_ders, multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1,
+    quantile_der2, rmse_der1, rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2,
+    QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 
 #[test]
@@ -400,4 +401,43 @@ fn multiclass_onevsall_ders_match_sigmoid() {
     let (d1_n, d2_n) = multiclass_onevsall_ders(0.0, false);
     assert!((d1_n - (-0.5)).abs() < 1e-12);
     assert!((d2_n - (-0.25)).abs() < 1e-12);
+}
+
+// --- MultiLogloss / MultiCrossEntropy (diagonal TMultiCrossEntropyError der) --
+
+#[test]
+fn multi_crossentropy_ders_is_target_minus_sigmoid_diagonal() {
+    // approx_d = 0 -> sigmoid = 0.5. der1 = target - 0.5; der2 = -0.5*0.5 = -0.25.
+    let (d1_one, d2_one) = multi_crossentropy_ders(0.0, 1.0);
+    assert!((d1_one - 0.5).abs() < 1e-12);
+    assert!((d2_one - (-0.25)).abs() < 1e-12);
+    let (d1_zero, d2_zero) = multi_crossentropy_ders(0.0, 0.0);
+    assert!((d1_zero - (-0.5)).abs() < 1e-12);
+    assert!((d2_zero - (-0.25)).abs() < 1e-12);
+}
+
+#[test]
+fn multi_crossentropy_der1_matches_target_minus_sigmoid_over_range() {
+    // Spot-check the der1 = target_d - sigmoid(approx_d) closed form at several
+    // logits (the MultiLogloss/MultiCrossEntropy diagonal der reuses the scalar
+    // sigmoid per dimension).
+    for &a in &[-2.0_f64, -0.7, 0.3, 1.5, 3.0] {
+        for &t in &[0.0_f64, 0.25, 1.0] {
+            let (der1, der2) = multi_crossentropy_ders(a, t);
+            let p = sigmoid(a);
+            assert!((der1 - (t - p)).abs() < 1e-12, "der1 mismatch at a={a} t={t}");
+            assert!((der2 - (-p * (1.0 - p))).abs() < 1e-12, "der2 mismatch");
+        }
+    }
+}
+
+#[test]
+fn multi_crossentropy_der2_equals_onevsall_diagonal() {
+    // MultiLogloss/MultiCrossEntropy and OneVsAll share the SAME diagonal Hessian
+    // entry -sigmoid*(1-sigmoid); only the der1 target-vs-class-indicator differs.
+    for &a in &[-1.0_f64, 0.0, 0.8, 2.2] {
+        let (_, ce_d2) = multi_crossentropy_ders(a, 1.0);
+        let (_, ova_d2) = multiclass_onevsall_ders(a, true);
+        assert!((ce_d2 - ova_d2).abs() < 1e-12, "diagonal der2 must match OneVsAll at a={a}");
+    }
 }

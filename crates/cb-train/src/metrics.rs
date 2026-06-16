@@ -90,7 +90,9 @@ impl EvalMetric {
             | Loss::Tweedie { .. }
             | Loss::Mape
             | Loss::MultiClass
-            | Loss::MultiClassOneVsAll => Self::Rmse,
+            | Loss::MultiClassOneVsAll
+            | Loss::MultiLogloss
+            | Loss::MultiCrossEntropy => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,

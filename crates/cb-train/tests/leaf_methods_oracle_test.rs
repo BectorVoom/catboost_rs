@@ -94,7 +94,9 @@ fn train_scenario(
         // Multiclass losses are not exercised by this scalar oracle; map to the
         // regression-target arm to keep the match exhaustive (never constructed here).
         | Loss::MultiClass
-        | Loss::MultiClassOneVsAll => load_regression_target(),
+        | Loss::MultiClassOneVsAll
+        | Loss::MultiLogloss
+        | Loss::MultiCrossEntropy => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 
