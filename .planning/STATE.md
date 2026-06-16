@@ -10,8 +10,8 @@ progress:
   total_phases: 14
   completed_phases: 6
   total_plans: 49
-  completed_plans: 44
-  percent: 43
+  completed_plans: 45
+  percent: 44
 ---
 
 # Project State
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.2 (multiclass-multilabel-and-n-dim-approx-refactor) — EXECUTING
-Plan: 1 of 5 — 06.2-01 COMPLETE (next: 06.2-02 Wave-0 train/model tier + D-04 hard checkpoint)
-Status: Plan 06.2-01 complete (compute-tier N-dim widening; Loss non-Copy; approx_dimension threaded; dim=1 byte-identical at the unit level)
-Last activity: 2026-06-16 -- Phase 06.2 Plan 01 (Wave-0 compute-tier N-dim refactor) COMPLETE
+Plan: 2 of 5 — 06.2-02 COMPLETE (Wave 0 CLOSED; next: 06.2-03 Wave-1 MultiClass/OneVsAll + multi-dim split-score)
+Status: Plan 06.2-02 complete — train/model-tier N-dim refactor + D-04 HARD CHECKPOINT GREEN (dim-major approx[d*n+i] boosting loop; leaf-major cb-model serialization; ndim_dim1_identity_test == 0.0; FULL scalar oracle suite re-locked at dim=1). wave_0_complete: true.
+Last activity: 2026-06-16 -- Phase 06.2 Plan 02 (Wave-0 train/model tier + D-04 re-lock) COMPLETE
 
 Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 top-level phases complete)
 
@@ -93,6 +93,8 @@ Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 to
 | Phase 06.1 P01 | 19min | 3 tasks | 14 files |
 | Phase 06.1 P02 | 12min | 4 tasks | 31 files |
 | Phase 06.1 P03 | ~11min | 3 tasks | 21 files |
+| Phase 06.2 P01 | ~20min | 2 tasks | 9 files |
+| Phase 06.2 P02 | ~12min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -101,6 +103,7 @@ Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 to
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [06.2-02 Wave-0 train/model tier COMPLETE — D-04 HARD CHECKPOINT GREEN; WAVE 0 CLOSED]: The `cb-train` boosting loop now carries the DIMENSION-MAJOR approx buffer `approx[d*n+i]` (length `approx_dimension*n`) at every seam — init `vec![bias; approx_dimension*n]`, gradient call `compute_gradients(...,approx_dimension)`, per-object weighting `idx%n`, per-dimension `compute_leaf_deltas` over `approx[d*n..d*n+n]` (OUTER `for d` loop, NEVER fused into `0..dim*n` — Pitfall 1), per-dimension approx update, staged record. `loss_approx_dimension(&Loss)=1` for all scalar losses (multi-output losses override it in 03..05). Per-tree `leaf_values` stored dim-major `leaf_values[d*n_leaves+l]`. `cb_train::Model` + `cb_model::Model` gained `approx_dimension: usize` (default 1). cb-model `.cbm`/json serialization: `ApproxDimension` reads the real dim (NOT hardcoded 1); dim-major training buffer transposed to LEAF-MAJOR `leaf_values[l*dim+d]` on save, un-transposed on load via SEPARATE value (stride `leaf_count*dim`) / weight (stride `leaf_count`) cursors; per-dim bias vector `[1,[b0,..]]`; `leaf_weights` one-per-leaf. At dim=1 leaf-major==dim-major so the wire is byte-identical. D-04 GATE GREEN: `ndim_dim1_identity_test` asserts `== 0.0` (not <=1e-5) on staged approx + leaf values; the FULL `cb-train --tests` scalar oracle suite (slice_first/leaf_methods/wave1-3/one_hot/ordered_boost_e2e/tensor_ctr_e2e/plain_ctr/ordered_ctr/regularization/overfit/eval_metrics/...) + cb-model round-trip oracles re-run green at dim=1 (0 failures); cb-backend 22; cb-train --lib 141. MVS norm + tree.rs cross-dim split-score + predict.rs per-dim transforms DEFERRED to 06.2-03 (neutral at dim=1 / bootstrap=No, Pitfall 7). NO new loss math. gsd-tools CLI ABSENT -> STATE/ROADMAP/VALIDATION updated MANUALLY. `wave_0_complete: true` set — Wave 1 unblocked.
 - [06.2-01 Wave-0 compute tier COMPLETE]: `Loss` Copy derive DROPPED now (before any new variant) so the Wave-3 `MultiQuantile{alpha:Vec<f64>}` non-Copy ripple is a ONE-TIME refactor — `Clone` retained, by-value sites take `&Loss` (cb-train `autolr_target_type`/`validate_leaf_method`/`compute_leaf_deltas`/`EvalMetric::for_loss`) and `catboost-rs::CatBoostBuilder` drops `Copy` + clones `loss` into `BoostParams`. `Runtime::compute_gradients` + `CpuBackend` gained `approx_dimension: usize` (after `target`); `approx` is the dim-major flat buffer `approx[d*n+i]` (D-6.2-01), validated `len % dim == 0` + `target.len()==n` with typed `CbError::LengthMismatch` (T-6.2-01a, no panic). The backend runs an OUTER `for d in 0..approx_dimension` loop over `approx[d*n..d*n+n]` reusing the EXISTING per-loss kernel launchers (extracted to `compute_gradients_one_dim`) — NOT fused into a single `0..dim*n` launch (RESEARCH Pitfall 1), so at dim=1 the output is byte-identical to the pre-6.2 scalar path. NO new Loss variant, NO loss math touched (loss.rs git-clean). cb-train still calls with `approx_dimension=1` (N-dim approx-buffer threading is 06.2-02). Unit gates green: cb-compute 69, cb-backend 22 (incl. new dim=1 byte-identity + multi-dim concat + shape-error tests), cb-train 141; workspace compiles. D-04 full ~38-fixture re-lock is 06.2-02's gate, not this plan's. gsd-tools CLI ABSENT -> STATE/ROADMAP updated MANUALLY.
 - [06.1-03 LOSS-03 scalar matrix COMPLETE]: Loss::Quantile{alpha,delta} generalizes Loss::Mae — MAE == Quantile{0.5,1e-6} confirmed bit-exact (0.0 diff) at THREE levels (fixture leaf_values, der dispatch, Exact leaf). mae_der1/der2 now DELEGATE to quantile_der1/der2 (single source of truth, byte-stable). The ONE real-code item (RESEARCH Pattern 3 / D-6.1-05): compute_leaf_deltas Exact branch threads params.loss (alpha,delta) into the ALREADY-alpha-general exact_leaf_delta — leaf.rs UNCHANGED (git diff empty), so this is wiring, not algorithm. quantile_gradient_kernel reuses the focal two-param length-1-array launch pattern. wave3 oracle ≤1e-5 at alpha=0.7 (weighted 0.7-quantile Exact leaf) + alpha=0.5 (== leaf_methods/exact MAE). Quantile fixtures use the RAW target (no positive shift — full real line) + leaf_estimation_method:Exact PINNED. MultiQuantile remains relocated to 6.2 (multi-output, N-dim foundation). gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY (as in 06.1-02).
 - [06.1-02 Open Q1 RESOLVED]: Poisson is IsStoreExpApprox upstream but cb-train stores RAW approx + computes exp() INLINE in the der (the Logloss sigmoid precedent); StagedApprox(RawFormulaVal) is RAW, Predictions = exp(raw) == cb_model::PredictionType::Exponent (matched to 8.88e-16 vs the default predict). StagedApprox oracle compares RAW; Predictions applies Exponent. NO exp-approx storage implemented.
