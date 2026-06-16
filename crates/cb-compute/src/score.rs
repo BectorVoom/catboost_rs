@@ -84,6 +84,66 @@ pub fn cosine_split_score(leaves: &[LeafStats], scaled_l2: f64) -> f64 {
     numerator / denominator.sqrt()
 }
 
+/// The multi-dimension CROSS-DIMENSION split score — a SINGLE shared accumulator
+/// fed every dimension's per-leaf bucket stats, with the score transform applied
+/// ONCE after the dimension loop (RESEARCH "Multi-dim split-score reduction",
+/// transcribed from `scoring.cpp:751-766`/`:1033-1049`, `score_calcers.h:47-97`,
+/// `short_vector_ops.h:61-81`). It is NOT a sum of per-dimension scalar scores.
+///
+/// `per_dim_leaves[d]` is dimension `d`'s per-leaf [`LeafStats`] (in canonical
+/// leaf-index order); `scaled_l2` is the per-tree `scale_l2_reg` output. For each
+/// `(d, leaf)`: `avrg = SWD/(SW + scaled_l2)`; the shared accumulator does
+/// `num += avrg·SWD` and `den += avrg²·SW`. Then ONCE:
+/// - **Cosine** (default): `score = num / sqrt(den)` — dimensions COUPLED inside
+///   the sqrt (sum numerators, sum denominators, THEN one division + sqrt).
+/// - **L2**: `score = num` (linear; still routed through the single accumulator).
+///
+/// # dim=1 byte-identity (D-04 anchor, Pitfall 1)
+/// At `per_dim_leaves.len() == 1` the dimension loop runs exactly once, the
+/// `num`/`den` accumulators receive precisely one dimension's contribution through
+/// the SAME `cb_core::sum_f64` reduction order as [`l2_split_score`] /
+/// [`cosine_split_score`], and `GetScores()` applies the identical transform — so
+/// the score is bit-for-bit today's scalar split score. (For L2 the per-dim sum is
+/// literally [`l2_split_score`]; for Cosine the num is [`l2_split_score`] and the
+/// den is the same seeded `1e-100 + Σ avrg²·SW` fold.)
+#[must_use]
+pub fn multi_dim_split_score(
+    score_function: crate::runtime::EScoreFunction,
+    per_dim_leaves: &[Vec<LeafStats>],
+    scaled_l2: f64,
+) -> f64 {
+    use crate::runtime::EScoreFunction;
+    // Numerator accumulator: the per-(dim,leaf) `avrg·SWD` terms across ALL dims,
+    // folded through the sanctioned ordered primitive (D-08). This is exactly the
+    // concatenation of each dimension's `l2_split_score` summands in dimension then
+    // leaf order, so at dim=1 it is byte-identical to `l2_split_score`.
+    let mut num_terms: Vec<f64> = Vec::new();
+    for leaves in per_dim_leaves {
+        for &stats in leaves {
+            num_terms.push(add_leaf_plain(stats, scaled_l2));
+        }
+    }
+    let numerator = sum_f64(&num_terms);
+    match score_function {
+        EScoreFunction::L2 => numerator,
+        EScoreFunction::Cosine => {
+            // Denominator: the seeded `1e-100` first summand (matching the scalar
+            // Cosine seed so dim=1 accumulation order is identical), then the
+            // per-(dim,leaf) `avrg²·SW` terms across all dims.
+            let mut den_terms: Vec<f64> = Vec::with_capacity(num_terms.len() + 1);
+            den_terms.push(1e-100);
+            for leaves in per_dim_leaves {
+                for &stats in leaves {
+                    let avrg = calc_average(stats.sum_weighted_delta, stats.sum_weight, scaled_l2);
+                    den_terms.push(avrg * avrg * stats.sum_weight);
+                }
+            }
+            let denominator = sum_f64(&den_terms);
+            numerator / denominator.sqrt()
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // random_strength split-score perturbation (TRAIN-05).
 //

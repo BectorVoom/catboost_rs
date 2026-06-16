@@ -30,8 +30,8 @@
 //! `unwrap`/`expect`/raw float fold (deny-lints + D-08).
 
 use cb_compute::{
-    cosine_split_score, l2_split_score, random_score_instance, reduce_leaf_stats, scale_l2_reg,
-    EScoreFunction, LeafStats, MINIMAL_SCORE,
+    cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
+    reduce_leaf_stats, scale_l2_reg, EScoreFunction, LeafStats, MINIMAL_SCORE,
 };
 
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
@@ -371,8 +371,49 @@ fn score_candidate(
     splits.push(candidate);
     let n_leaves = 1usize << splits.len();
     let leaf_of = assign_leaves(matrix, &splits, n_objects);
-    let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
-    split_score(score_function, &stats, scaled_l2)
+    multi_dim_candidate_score(&leaf_of, der1, weight, scaled_l2, n_objects, n_leaves, score_function)
+}
+
+/// Score one candidate's leaf partition over the (possibly multi-dimensional)
+/// dimension-major `der1` buffer via the SINGLE shared cross-dimension accumulator
+/// ([`cb_compute::multi_dim_split_score`], RESEARCH "Multi-dim split-score
+/// reduction"). `der1` is `der1[d*n_objects + i]` of length
+/// `approx_dimension * n_objects`; `weight` is per-object (length `n_objects`,
+/// shared across dimensions). The leaf partition `leaf_of` is shared across
+/// dimensions (the oblivious structure is one tree).
+///
+/// The `approx_dimension` is inferred from `der1.len() / n_objects` (so the call
+/// sites do not all need a new argument): for every scalar / binary loss `der1` is
+/// length `n_objects`, the inferred dimension is `1`, the outer loop runs once, and
+/// the resulting score is BYTE-IDENTICAL to the prior single-column
+/// `split_score` (D-04 anchor, Pitfall 1). For multiclass `der1` is `k*n_objects`,
+/// so each dimension's per-leaf stats are fed into the shared accumulator and the
+/// transform is applied once (Cosine couples num/den inside the sqrt).
+fn multi_dim_candidate_score(
+    leaf_of: &[usize],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    n_objects: usize,
+    n_leaves: usize,
+    score_function: EScoreFunction,
+) -> f64 {
+    let approx_dimension = if n_objects == 0 {
+        1
+    } else {
+        (der1.len() / n_objects).max(1)
+    };
+    // Per-dimension per-leaf stats: dimension `d` reduces over its own slice
+    // `der1[d*n .. d*n+n]` against the SHARED `leaf_of` / per-object `weight`. At
+    // dim=1 this is exactly one `reduce_leaf_stats(leaf_of, der1, weight, …)`.
+    let per_dim_leaves: Vec<Vec<LeafStats>> = (0..approx_dimension)
+        .map(|d| {
+            let base = d * n_objects;
+            let der1_d = der1.get(base..base + n_objects).unwrap_or(der1);
+            reduce_leaf_stats(leaf_of, der1_d, weight, n_leaves)
+        })
+        .collect();
+    multi_dim_split_score(score_function, &per_dim_leaves, scaled_l2)
 }
 
 /// Grow one oblivious tree of depth `depth` with the strict first-wins greedy

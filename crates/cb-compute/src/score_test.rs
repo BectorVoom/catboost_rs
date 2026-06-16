@@ -4,10 +4,87 @@
 use cb_core::TFastRng64;
 
 use crate::histogram::LeafStats;
+use crate::runtime::EScoreFunction;
 use crate::score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
-    random_score_instance, score_st_dev, MINIMAL_SCORE,
+    multi_dim_split_score, random_score_instance, score_st_dev, MINIMAL_SCORE,
 };
+
+#[test]
+fn multi_dim_split_score_dim1_equals_scalar_score() {
+    // dim=1 byte-identity (D-04 anchor): with ONE dimension's leaf stats, the
+    // single-shared-accumulator score is bit-for-bit the scalar split score, for
+    // BOTH Cosine and L2.
+    let leaves = vec![
+        LeafStats {
+            sum_weighted_delta: 4.0,
+            sum_weight: 3.0,
+        },
+        LeafStats {
+            sum_weighted_delta: -2.5,
+            sum_weight: 2.0,
+        },
+        LeafStats {
+            sum_weighted_delta: 1.0,
+            sum_weight: 1.0,
+        },
+    ];
+    let scaled_l2 = 3.0;
+    let per_dim = vec![leaves.clone()];
+    let cos_multi = multi_dim_split_score(EScoreFunction::Cosine, &per_dim, scaled_l2);
+    let cos_scalar = cosine_split_score(&leaves, scaled_l2);
+    assert_eq!(
+        cos_multi.to_bits(),
+        cos_scalar.to_bits(),
+        "Cosine dim=1 multi-dim score must be BIT-identical to the scalar score"
+    );
+    let l2_multi = multi_dim_split_score(EScoreFunction::L2, &per_dim, scaled_l2);
+    let l2_scalar = l2_split_score(&leaves, scaled_l2);
+    assert_eq!(
+        l2_multi.to_bits(),
+        l2_scalar.to_bits(),
+        "L2 dim=1 multi-dim score must be BIT-identical to the scalar score"
+    );
+}
+
+#[test]
+fn multi_dim_split_score_couples_dimensions_inside_sqrt() {
+    // Cosine couples num/den INSIDE the sqrt: it is NOT the sum of per-dimension
+    // cosine scores. Build two distinct dimensions and assert the coupled form
+    // num/sqrt(den) differs from Σ_d cosine_d (the wrong reduction).
+    let dim0 = vec![
+        LeafStats {
+            sum_weighted_delta: 4.0,
+            sum_weight: 3.0,
+        },
+        LeafStats {
+            sum_weighted_delta: -1.0,
+            sum_weight: 2.0,
+        },
+    ];
+    let dim1 = vec![
+        LeafStats {
+            sum_weighted_delta: 2.0,
+            sum_weight: 1.0,
+        },
+        LeafStats {
+            sum_weighted_delta: -3.0,
+            sum_weight: 4.0,
+        },
+    ];
+    let scaled_l2 = 3.0;
+    let coupled = multi_dim_split_score(
+        EScoreFunction::Cosine,
+        &[dim0.clone(), dim1.clone()],
+        scaled_l2,
+    );
+    let sum_of_cosines =
+        cosine_split_score(&dim0, scaled_l2) + cosine_split_score(&dim1, scaled_l2);
+    assert!(
+        (coupled - sum_of_cosines).abs() > 1e-9,
+        "coupled num/sqrt(den) must differ from the (wrong) Σ_d cosine_d reduction"
+    );
+}
 
 #[test]
 fn minimal_score_is_neg_infinity() {
