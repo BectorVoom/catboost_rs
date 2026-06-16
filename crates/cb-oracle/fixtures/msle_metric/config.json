@@ -1,0 +1,42 @@
+{
+  "boost_from_average": false,
+  "catboost_version": "1.2.10",
+  "eval_metric": "MSLE",
+  "input_dataset": "numeric_tiny",
+  "is_objective": false,
+  "loss_function": "RMSE",
+  "metric_note": "MSLE is metric-ONLY upstream (D-6.1-06 / Pitfall 1: loss_function='MSLE' throws). model.json here is the RMSE-trained model kept ONLY so the Rust oracle reproduces the per-iteration staged approx the MSLE metric is computed over. MSLE = mean_w((log(1+approx) - log(1+target))^2), approx RAW (isExpApprox=false; metric.cpp:1899-1926; GetFinalError = Stats[0]/(Stats[1]+1e-38)).",
+  "metric_values_layout": "flat f64: per-iteration MSLE eval-metric value over the (x, y_pos) eval set; one entry per boosting iteration.",
+  "n_features": 4,
+  "n_iterations": 5,
+  "n_rows": 50,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "eval_metric": "MSLE",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "RMSE",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "requirement": "LOSS-03",
+  "scenario": "msle_metric",
+  "seed": 0,
+  "stages": [
+    "StagedApprox",
+    "MetricValues"
+  ],
+  "target_shift": 8.189371256914892,
+  "target_transform": "y_pos = y - min(y) + 1.0 (additive shift 8.189371256914892); strictly-positive target keeps log(1+x) in domain.",
+  "thread_count": 1,
+  "wave": 2
+}

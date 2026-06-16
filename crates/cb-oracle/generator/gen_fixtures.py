@@ -2182,6 +2182,315 @@ def gen_wave1_only() -> None:
     print("Wrote Wave-1 smooth-loss oracle fixtures (logcosh/lq/huber/expectile)")
 
 
+# Phase-06.1 (Plan 06.1-02, Wave 2, LOSS-03) positive-domain / link regression
+# loss fixture roots. Poisson (exp-link / IsStoreExpApprox upstream — cb-train
+# computes exp inline on raw approx + Exponent predict), Tweedie{variance_power}
+# (exp inside der only, raw approx, NO Exponent), MAPE (der2=0, Gradient leaf),
+# and MSLE as an eval-metric ONLY (D-6.1-06: MSLE is metric-only upstream —
+# enum_helpers.cpp:200,533-549 — so it has NO training oracle and is NOT a Loss
+# variant). Generated OFFLINE / RUN-ONCE; CI only READS the committed artifacts.
+POISSON = FIXTURES / "poisson"
+TWEEDIE = FIXTURES / "tweedie"
+MAPE = FIXTURES / "mape"
+MSLE_METRIC = FIXTURES / "msle_metric"
+
+# numeric_tiny.y carries negatives (min ~ -7.19); Poisson/Tweedie/MAPE require a
+# POSITIVE target. Shift the frozen target into a strictly-positive range
+# (min -> 1.0) and record the EXACT transform in each config.json so the Rust
+# oracle applies the identical positive label column. `y_pos = y - min(y) + 1.0`.
+WAVE2_TARGET_SHIFT = 1.0
+
+
+def _positive_target(y: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return (y_pos, shift) where `y_pos = y - min(y) + 1.0` is strictly
+    positive (min element is exactly 1.0) and `shift = -min(y) + 1.0` is the
+    additive constant the Rust oracle reproduces. f64 throughout."""
+    y = _assert_f64(np.asarray(y, dtype=np.float64), "wave2 y")
+    shift = float(-y.min() + WAVE2_TARGET_SHIFT)
+    y_pos = _assert_f64((y + shift).astype(np.float64), "wave2 y_pos")
+    return y_pos, shift
+
+
+def gen_wave2_positive_losses() -> None:
+    """poisson/ tweedie/ mape/ — the Wave-2 positive-domain / link
+    regression-loss training oracle (LOSS-03, Plan 06.1-02). Each scenario trains
+    a CatBoostRegressor on a POSITIVE-target variant of the frozen `numeric_tiny`
+    corpus (y shifted into (0, inf) via `_positive_target`, the transform recorded
+    in config.json) with the D-07 simplified isolating params and the per-loss
+    `leaf_estimation_method` PINNED + `leaf_estimation_iterations:1` PINNED
+    (overriding upstream's Poisson default of 10 — Pitfall 3).
+
+    Per-loss config (RESEARCH Wave-2 table, error_functions.h):
+      - poisson : loss_function='Poisson', leaf_estimation_method='Newton',
+        leaf_estimation_iterations:1 PINNED (override upstream default 10 —
+        Pitfall 3). Poisson is IsStoreExpApprox upstream (approx_updater_helpers.h:
+        60-72); StagedApprox(RawFormulaVal) is the RAW approx, Predictions are the
+        EXP-transformed values (Open Q1 / Pitfall 4 — empirically confirmed below).
+      - tweedie : loss_function='Tweedie:variance_power=1.5' (1<p<2 MANDATORY),
+        leaf_estimation_method='Newton', iterations:1. NOT exp-approx
+        (error_functions.h:1644) — exp lives inside the der; Predictions are RAW
+        (A4 — confirmed below, RawFormulaVal == default predict).
+      - mape    : loss_function='MAPE', leaf_estimation_method='Gradient'
+        (der2=0 so Newton is undefined — Pitfall 5; catboost_options.cpp:113-124),
+        iterations:1.
+
+    boost_from_average=False for all three (the cb-train regression-loss path
+    boosts from 0; bias 0 keeps the Rust oracle's starting approx trivially
+    matched). Each saves config.json (full params + the positive-target transform
+    + the Open-Q1 finding for Poisson), model.json (splits + leaf_values +
+    leaf_weights), staged.npy (per-iteration RawFormulaVal raw approximant), and —
+    for Poisson + Tweedie — predictions.npy (the Predictions stage: Poisson exp'd,
+    Tweedie raw).
+
+    OFFLINE / RUN-ONCE (D-12): catboost==1.2.10 is NOT importable in CI.
+    """
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y_raw = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_pos, shift = _positive_target(y_raw)
+
+    # (name, dir, loss_function, leaf_estimation_method, save_predictions).
+    scenarios = [
+        ("poisson", POISSON, "Poisson", "Newton", True),
+        ("tweedie", TWEEDIE, "Tweedie:variance_power=1.5", "Newton", True),
+        ("mape", MAPE, "MAPE", "Gradient", False),
+    ]
+
+    for name, scenario_dir, loss, estimator, save_predictions in scenarios:
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        # D-07 isolating params, overriding leaf_estimation_method + loss_function
+        # per scenario. leaf_estimation_iterations stays 1 (Pitfall 3 — overrides
+        # Poisson's upstream default of 10).
+        params = {**ISOLATING_PARAMS}
+        params["leaf_estimation_method"] = estimator
+        params["loss_function"] = loss
+
+        model = CatBoostRegressor(boost_from_average=False, **params)
+        model.fit(x, y_pos)
+
+        # --- Stage: Splits + LeafValues (model.json) ------------------------
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        # --- Stage: StagedApprox (RAW approximant, RawFormulaVal) -----------
+        staged = [
+            np.asarray(p, dtype=np.float64)
+            for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+        ]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        # --- Open Q1 (Poisson): inspect StagedApprox-raw vs exp(raw) --------
+        # Pin the empirical finding: staged.npy is RAW approx; the DEFAULT predict
+        # (and Exponent transform) is exp(raw). Confirm StagedApprox != exp(raw)
+        # for Poisson (so the layout note is auditable).
+        open_q1_note = None
+        raw_final = staged[-1]
+        default_pred = np.asarray(model.predict(x), dtype=np.float64)
+        if name == "poisson":
+            exp_raw = np.exp(raw_final)
+            staged_is_raw = bool(np.max(np.abs(raw_final - default_pred)) > 1e-9)
+            predictions_are_exp = bool(np.max(np.abs(exp_raw - default_pred)) <= 1e-6)
+            open_q1_note = (
+                "EMPIRICAL (catboost 1.2.10, Poisson): "
+                f"StagedApprox(RawFormulaVal) is RAW approx (max|raw - default_pred| = "
+                f"{float(np.max(np.abs(raw_final - default_pred))):.6e} > 0 confirms "
+                f"staged != predict). Predictions = exp(raw): max|exp(raw) - "
+                f"default_pred| = {float(np.max(np.abs(exp_raw - default_pred))):.3e} "
+                "(<=1e-6 confirms default predict == Exponent(raw)). "
+                f"staged_is_raw={staged_is_raw}, predictions_are_exp={predictions_are_exp}. "
+                "=> StagedApprox oracle compares RAW; Predictions oracle applies "
+                "PredictionType::Exponent (A2 / Pitfall 4)."
+            )
+
+        # --- Stage: Predictions (Poisson exp'd via DEFAULT predict; Tweedie RAW) -
+        if save_predictions:
+            if name == "poisson":
+                # Poisson Predictions = exp(raw) = the DEFAULT predict (Exponent).
+                predictions = _assert_f64(default_pred, "predictions")
+            else:
+                # Tweedie Predictions are RAW (no Exponent — A4). Confirm the
+                # default predict equals RawFormulaVal (raw) for Tweedie.
+                tw_raw = _assert_f64(
+                    np.asarray(
+                        model.predict(x, prediction_type="RawFormulaVal"),
+                        dtype=np.float64,
+                    ),
+                    "tweedie raw predictions",
+                )
+                predictions = tw_raw
+            np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": name,
+            "requirement": "LOSS-03",
+            "wave": 2,
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "target_transform": (
+                f"y_pos = y - min(y) + {WAVE2_TARGET_SHIFT} (additive shift "
+                f"{shift!r}); strictly-positive target required by "
+                "Poisson/Tweedie/MAPE (min element -> 1.0). The Rust oracle "
+                "reproduces the identical positive label column."
+            ),
+            "target_shift": shift,
+            "loss_function": loss,
+            "leaf_estimation_method": estimator,
+            "leaf_estimation_iterations": 1,
+            "boost_from_average": False,
+            "bootstrap_type": "No",
+            "score_function": "L2",
+            "params": {**params, "boost_from_average": False},
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "prediction_type": (
+                "Predictions = Exponent(RawFormulaVal) for Poisson (exp-link); "
+                "Predictions = RawFormulaVal (raw) for Tweedie (A4)"
+                if save_predictions
+                else "RawFormulaVal"
+            ),
+            "stages": (
+                ["Splits", "LeafValues", "StagedApprox", "Predictions"]
+                if save_predictions
+                else ["Splits", "LeafValues", "StagedApprox"]
+            ),
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (RAW approximant, RawFormulaVal)"
+            ),
+            "leaf_method_note": (
+                "Poisson=Newton, leaf_estimation_iterations:1 PINNED (override "
+                "upstream default 10, Pitfall 3). Tweedie(p=1.5)=Newton/1. "
+                "MAPE=Gradient/1 (der2=0 so Newton is undefined — Pitfall 5, "
+                "catboost_options.cpp:113-124)."
+            ),
+            "der_note": (
+                "Poisson der1=target-exp(rawApprox), der2=-exp(rawApprox) "
+                "(error_functions.h:657-676; IsStoreExpApprox upstream — cb-train "
+                "stores RAW approx + computes exp inline, sigmoid precedent; "
+                "approx_updater_helpers.h:60-72). Tweedie der1=target*e^((1-p)*a)-"
+                "e^((2-p)*a), der2=target*(1-p)*e^((1-p)*a)-(2-p)*e^((2-p)*a), "
+                "p=variance_power, raw approx, exp INSIDE der, NOT exp-approx "
+                "(error_functions.h:1634-1665,1644). MAPE der1=sign(target-approx)/"
+                "max(1.0,|target|), der2=0 (error_functions.h:607-630; the 1.f "
+                "divisor is f32-domain, Pitfall 7)."
+            ),
+        }
+        if open_q1_note is not None:
+            config["open_q1_finding"] = open_q1_note
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
+def gen_msle_metric() -> None:
+    """msle_metric/ — the MSLE EVAL-METRIC oracle (D-6.1-06: MSLE is metric-only
+    upstream — enum_helpers.cpp:200,533-549 — NOT a trainable objective; Pitfall 1:
+    loss_function='MSLE' throws upstream).
+
+    Trains a regression model with a VALID training objective (RMSE) but
+    `eval_metric='MSLE'`, capturing catboost's per-iteration MSLE eval-history into
+    metric_values.npy. The model.json kept here is the RMSE-trained model (used
+    ONLY so the Rust oracle can reproduce the SAME per-iteration staged approx the
+    metric is computed over) — there is NO MSLE-as-objective model (it cannot
+    exist). MSLE metric = mean_w( (log(1+approx) - log(1+target))^2 ), approx RAW
+    (isExpApprox asserted false; metric.cpp:1899-1926).
+
+    The positive target (`_positive_target`) keeps `log(1+approx)`/`log(1+target)`
+    in the log domain (1+x > 0). OFFLINE / RUN-ONCE (D-12).
+    """
+    MSLE_METRIC.mkdir(parents=True, exist_ok=True)
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y_raw = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    y_pos, shift = _positive_target(y_raw)
+
+    # RMSE objective (valid trainable) + MSLE eval_metric. Use an eval set == the
+    # train set so the per-iteration MSLE history is over the same data the Rust
+    # oracle reproduces from staged.npy.
+    params = {**ISOLATING_PARAMS}
+    params["loss_function"] = "RMSE"
+    model = CatBoostRegressor(
+        boost_from_average=False, eval_metric="MSLE", **params
+    )
+    model.fit(x, y_pos, eval_set=(x, y_pos))
+
+    # Per-iteration MSLE eval history (validation_0 == the (x, y_pos) eval set).
+    evals = model.get_evals_result()
+    # Key is "validation" or "validation_0" depending on version; pick the MSLE
+    # curve from the first validation set present.
+    val_key = next(k for k in evals if k.startswith("validation"))
+    msle_curve = _assert_f64(
+        np.asarray(evals[val_key]["MSLE"], dtype=np.float64), "msle metric_values"
+    )
+    np.save(MSLE_METRIC / "metric_values.npy", msle_curve, allow_pickle=False)
+
+    # The RMSE-trained model + raw staged approx so the Rust oracle reproduces the
+    # SAME per-iteration approx the MSLE metric is evaluated over.
+    model.save_model(str(MSLE_METRIC / "model.json"), format="json")
+    staged = [
+        np.asarray(p, dtype=np.float64)
+        for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+    ]
+    staged_flat = _assert_f64(
+        np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+    )
+    np.save(MSLE_METRIC / "staged.npy", staged_flat, allow_pickle=False)
+
+    config = {
+        "scenario": "msle_metric",
+        "requirement": "LOSS-03",
+        "wave": 2,
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "target_transform": (
+            f"y_pos = y - min(y) + {WAVE2_TARGET_SHIFT} (additive shift {shift!r}); "
+            "strictly-positive target keeps log(1+x) in domain."
+        ),
+        "target_shift": shift,
+        "loss_function": "RMSE",
+        "eval_metric": "MSLE",
+        "is_objective": False,
+        "boost_from_average": False,
+        "params": {**params, "boost_from_average": False, "eval_metric": "MSLE"},
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "n_iterations": len(staged),
+        "prediction_type": "RawFormulaVal",
+        "stages": ["StagedApprox", "MetricValues"],
+        "metric_values_layout": (
+            "flat f64: per-iteration MSLE eval-metric value over the (x, y_pos) "
+            "eval set; one entry per boosting iteration."
+        ),
+        "metric_note": (
+            "MSLE is metric-ONLY upstream (D-6.1-06 / Pitfall 1: loss_function="
+            "'MSLE' throws). model.json here is the RMSE-trained model kept ONLY "
+            "so the Rust oracle reproduces the per-iteration staged approx the "
+            "MSLE metric is computed over. MSLE = mean_w((log(1+approx) - "
+            "log(1+target))^2), approx RAW (isExpApprox=false; metric.cpp:1899-"
+            "1926; GetFinalError = Stats[0]/(Stats[1]+1e-38))."
+        ),
+    }
+    with (MSLE_METRIC / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def gen_wave2_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the Plan 06.1-02 Wave-2 fixtures
+    (poisson/tweedie/mape training + msle_metric) without re-running the full
+    `main()` (which would overwrite every committed Phase 2-5 fixture)."""
+    gen_wave2_positive_losses()
+    print("Wrote Wave-2 positive-loss oracle fixtures (poisson/tweedie/mape)")
+    gen_msle_metric()
+    print("Wrote MSLE eval-metric oracle fixture (msle_metric)")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -2304,6 +2613,12 @@ def main() -> None:
     gen_wave1_smooth_losses()
     print("Wrote Wave-1 smooth-loss oracle fixtures (logcosh/lq/huber/expectile)")
 
+    # --- Phase-06.1 Wave-2 positive-loss fixtures (Plan 06.1-02, LOSS-03) ----
+    gen_wave2_positive_losses()
+    print("Wrote Wave-2 positive-loss oracle fixtures (poisson/tweedie/mape)")
+    gen_msle_metric()
+    print("Wrote MSLE eval-metric oracle fixture (msle_metric)")
+
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
     print(f"Wrote borders_quant oracle fixtures under {BORDERS_QUANT}")
@@ -2321,5 +2636,10 @@ if __name__ == "__main__":
     # untouched. Bare invocation regenerates everything (the RUN-ONCE full path).
     if "--wave1-only" in sys.argv:
         gen_wave1_only()
+    elif "--wave2-only" in sys.argv:
+        # `--wave2-only` regenerates ONLY the Plan 06.1-02 Wave-2 fixtures
+        # (poisson/tweedie/mape + msle_metric), leaving every committed Phase 2-5
+        # / Wave-1 fixture untouched.
+        gen_wave2_only()
     else:
         main()
