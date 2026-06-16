@@ -72,6 +72,98 @@ pub enum Loss {
     /// delta is the weighted median of the leaf residuals
     /// (`error_functions.h:457-498` `TQuantileError`).
     Mae,
+    /// LogCosh (smooth regression, D-6.1-02 Wave 1): der1 =
+    /// `-tanh(approx - target)`, der2 = `-1/cosh(approx - target)^2`
+    /// (`error_functions.h:405-425` `TLogCoshError`). Non-parametric. Upstream
+    /// default leaf method is Exact (`catboost_options.cpp:65-70` — NOT Newton;
+    /// RESEARCH Pitfall 2), so the fixture pins `leaf_estimation_method: Exact`.
+    LogCosh,
+    /// Lq{q} (smooth regression, D-6.1-02 Wave 1; D-6.1-03 parametric variant):
+    /// der1 = `q*sign(target-approx)*|approx-target|^(q-1)`, der2 =
+    /// `-q*(q-1)*|target-approx|^(q-2)` (`error_functions.h:539-568` `TLqError`).
+    /// `q` is MANDATORY (no default) and must be `>= 1`; the der2 above is only
+    /// Newton-clean for `q >= 2` (the `^(q-2)` term diverges near a zero residual
+    /// for `q < 2`; RESEARCH Pitfall 6), so the Wave-1 fixture pins `q = 2.0`.
+    Lq {
+        /// Loss exponent `q >= 1` (`Lq:q=<value>`).
+        q: f64,
+    },
+    /// Huber{delta} (smooth regression, D-6.1-02 Wave 1; D-6.1-03 parametric):
+    /// with `diff = target - approx`, der1 =
+    /// `|diff| < delta ? diff : sign(diff)*delta`, der2 =
+    /// `|diff| < delta ? -1 : 0` (`error_functions.h:1596-1632` `THuberError`).
+    /// `delta` is MANDATORY (no default) and must be `> 0`. Upstream default leaf
+    /// method is Newton (`catboost_options.cpp:187-192`).
+    Huber {
+        /// Huber transition half-width `delta > 0` (`Huber:delta=<value>`).
+        delta: f64,
+    },
+    /// Expectile{alpha} (smooth regression, D-6.1-02 Wave 1; D-6.1-03 parametric):
+    /// with `e = target - approx`, der1 = `(e > 0) ? 2*alpha*e : 2*(1-alpha)*e`,
+    /// der2 = `(e > 0) ? -2*alpha : -2*(1-alpha)` (`error_functions.h:500-537`
+    /// `TExpectileError`). `alpha` defaults to `0.5` upstream and must lie in
+    /// `[0, 1]`. Leaf method Newton; the fixture pins
+    /// `leaf_estimation_iterations: 1` (override upstream default 5; Pitfall 3).
+    Expectile {
+        /// Expectile asymmetry `alpha ∈ [0, 1]` (`Expectile:alpha=<value>`).
+        alpha: f64,
+    },
+}
+
+/// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
+/// one-argument constructor, `error_functions.h:512`), the symmetric L2 case.
+pub const EXPECTILE_ALPHA_DEFAULT: f64 = 0.5;
+
+impl Loss {
+    /// Validate the loss's hyperparameters before training (the
+    /// constructor-path range guard, T-06.1.01-01 / T-06.1.01-02). Out-of-domain
+    /// `q`/`delta`/`alpha` produce `NaN`/`Inf` derivatives that would poison the
+    /// histogram and leaf reductions, so they are rejected up front with a typed
+    /// [`cb_core::CbError`] rather than `unwrap`/`panic` (CLAUDE.md: no `unwrap`
+    /// in production).
+    ///
+    /// Mirrors upstream's `Y_ASSERT` domain checks:
+    /// - `Lq`: `Q >= 1` (`error_functions.h:548`).
+    /// - `Huber`: `delta > 0` (positive transition width).
+    /// - `Expectile`: `alpha ∈ [0, 1]` (`error_functions.h:520` — the
+    ///   `Alpha > -1e-6 && Alpha < 1.0 + 1e-6` assert, tightened to the exact
+    ///   closed interval).
+    ///
+    /// # Errors
+    /// Returns [`cb_core::CbError::OutOfRange`] when a parameter is outside its
+    /// admissible domain (or is non-finite).
+    pub fn validate(&self) -> CbResult<()> {
+        match *self {
+            Self::Lq { q } => {
+                if !q.is_finite() || q < 1.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "Lq exponent q must be finite and >= 1, got {q}"
+                    )));
+                }
+            }
+            Self::Huber { delta } => {
+                if !delta.is_finite() || delta <= 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "Huber delta must be finite and > 0, got {delta}"
+                    )));
+                }
+            }
+            Self::Expectile { alpha } => {
+                if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "Expectile alpha must be finite and in [0, 1], got {alpha}"
+                    )));
+                }
+            }
+            Self::Rmse
+            | Self::Logloss
+            | Self::CrossEntropy
+            | Self::Focal { .. }
+            | Self::Mae
+            | Self::LogCosh => {}
+        }
+        Ok(())
+    }
 }
 
 /// Which split-score function the greedy tree search uses to rank candidate

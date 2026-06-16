@@ -3,8 +3,9 @@
 //! logit; Focal `alpha`/`gamma`-weighted der1/der2 (`error_functions.h`).
 
 use crate::loss::{
-    cross_entropy_der1, cross_entropy_der2, focal_der1, focal_der2, logloss_der1, logloss_der2,
-    mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
+    cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
+    huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
+    lq_der2, mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid,
 };
 
 #[test]
@@ -112,4 +113,105 @@ fn mae_der1_deadzone_returns_zero() {
 fn mae_der2_is_zero() {
     assert_eq!(mae_der2(0.5, 2.0), 0.0);
     assert_eq!(mae_der2(-3.0, 7.0), 0.0);
+}
+
+// ---- Wave-1 smooth losses (D-6.1-02) ----
+
+#[test]
+fn logcosh_der1_is_neg_tanh_of_residual() {
+    // error_functions.h:414 — der1 = -tanh(approx - target).
+    assert!((logcosh_der1(2.0, 0.5) - (-(1.5_f64).tanh())).abs() < 1e-12);
+    assert!((logcosh_der1(0.5, 2.0) - (-(-1.5_f64).tanh())).abs() < 1e-12);
+    // At zero residual the gradient vanishes (tanh(0) = 0).
+    assert!(logcosh_der1(3.0, 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn logcosh_der2_is_neg_sech_squared() {
+    // error_functions.h:418 — der2 = -1/cosh(approx - target)^2.
+    let want = -1.0 / ((1.5_f64).cosh() * (1.5_f64).cosh());
+    assert!((logcosh_der2(2.0, 0.5) - want).abs() < 1e-12);
+    // At zero residual cosh(0)=1 -> der2 = -1 (max curvature).
+    assert!((logcosh_der2(3.0, 3.0) - (-1.0)).abs() < 1e-12);
+}
+
+#[test]
+fn lq_der1_signed_power_residual() {
+    // error_functions.h:553 — der1 = q*sign(target-approx)*|approx-target|^(q-1).
+    // q=2: der1 = 2*sign(t-a)*|a-t| ; (approx=0.5,target=2.0) -> 2*(+1)*1.5 = 3.0
+    assert!((lq_der1(0.5, 2.0, 2.0) - 3.0).abs() < 1e-12);
+    // target below approx -> negative gradient.
+    assert!((lq_der1(2.0, 0.5, 2.0) - (-3.0)).abs() < 1e-12);
+    // q=3, (approx=0.0,target=2.0): 3*(+1)*2^2 = 12.0
+    assert!((lq_der1(0.0, 2.0, 3.0) - 12.0).abs() < 1e-12);
+}
+
+#[test]
+fn lq_der2_neg_q_qm1_power() {
+    // error_functions.h:558 — der2 = -q*(q-1)*|target-approx|^(q-2).
+    // q=2: collapses to constant -2 (pow(.,0)=1).
+    assert!((lq_der2(0.5, 2.0, 2.0) - (-2.0)).abs() < 1e-12);
+    assert!((lq_der2(7.0, -3.0, 2.0) - (-2.0)).abs() < 1e-12);
+    // q=3, |t-a|=2: -3*2*2^1 = -12.0
+    assert!((lq_der2(0.0, 2.0, 3.0) - (-12.0)).abs() < 1e-12);
+}
+
+#[test]
+fn huber_der1_band_and_saturation() {
+    // error_functions.h:1612 — diff=target-approx; |diff|<delta ? diff : sign*delta.
+    let delta = 1.0;
+    // Inside band (|diff|=0.5<1): der1 = diff = 0.5.
+    assert!((huber_der1(0.0, 0.5, delta) - 0.5).abs() < 1e-12);
+    // Outside band, positive diff -> +delta.
+    assert!((huber_der1(0.0, 3.0, delta) - delta).abs() < 1e-12);
+    // Outside band, negative diff -> -delta.
+    assert!((huber_der1(3.0, 0.0, delta) - (-delta)).abs() < 1e-12);
+}
+
+#[test]
+fn huber_der1_band_boundary_is_strict() {
+    // |diff| == delta is NOT < delta (strict): saturates to sign*delta, not diff.
+    let delta = 2.0;
+    // diff = +2.0 == delta -> saturated +delta (== diff here, but via the sign arm).
+    assert!((huber_der1(0.0, 2.0, delta) - delta).abs() < 1e-12);
+    // diff = -2.0, |diff| == delta -> -delta.
+    assert!((huber_der1(2.0, 0.0, delta) - (-delta)).abs() < 1e-12);
+}
+
+#[test]
+fn huber_der2_minus_one_in_band_zero_outside() {
+    // error_functions.h:1621 — |diff|<delta ? -1 : 0.
+    let delta = 1.0;
+    assert!((huber_der2(0.0, 0.5, delta) - (-1.0)).abs() < 1e-12); // in band
+    assert_eq!(huber_der2(0.0, 3.0, delta), 0.0); // outside band
+    // Boundary |diff| == delta is outside (strict <) -> 0.
+    assert_eq!(huber_der2(0.0, 1.0, delta), 0.0);
+}
+
+#[test]
+fn expectile_der1_asymmetric_l2() {
+    // error_functions.h:527 — e=target-approx; (e>0)?2a*e:2(1-a)*e.
+    let alpha = 0.3;
+    // e = +2 (>0): 2*0.3*2 = 1.2
+    assert!((expectile_der1(0.0, 2.0, alpha) - 1.2).abs() < 1e-12);
+    // e = -2 (<0): 2*0.7*(-2) = -2.8
+    assert!((expectile_der1(2.0, 0.0, alpha) - (-2.8)).abs() < 1e-12);
+    // alpha=0.5 reduces to the RMSE gradient e.
+    assert!((expectile_der1(0.0, 1.7, 0.5) - 1.7).abs() < 1e-12);
+}
+
+#[test]
+fn expectile_der1_zero_residual_boundary() {
+    // e == 0 is NOT > 0: selects the below-branch 2*(1-a)*e = 0 (continuous here).
+    assert!(expectile_der1(1.0, 1.0, 0.3).abs() < 1e-12);
+}
+
+#[test]
+fn expectile_der2_piecewise_constant() {
+    // error_functions.h:532 — (e>0)?-2a:-2(1-a).
+    let alpha = 0.3;
+    assert!((expectile_der2(0.0, 2.0, alpha) - (-0.6)).abs() < 1e-12); // e>0 -> -2*0.3
+    assert!((expectile_der2(2.0, 0.0, alpha) - (-1.4)).abs() < 1e-12); // e<0 -> -2*0.7
+    // e == 0 -> below-branch -2*(1-a).
+    assert!((expectile_der2(1.0, 1.0, alpha) - (-1.4)).abs() < 1e-12);
 }

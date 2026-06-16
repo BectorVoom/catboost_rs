@@ -174,6 +174,207 @@ pub fn focal_hessian_kernel<F: Float>(
     }
 }
 
+/// First-order LogCosh gradient kernel: `der1[i] = -tanh(approx[i] - target[i])`.
+///
+/// `error_functions.h:414` (`TLogCoshError::CalcDer`). Non-parametric, smooth
+/// (the saturating analogue of MAE's sign gradient). Elementwise, no reduction
+/// (D-02). `F::tanh` is a kernel-legal `Float` op.
+#[cube(launch)]
+pub fn logcosh_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let r = approx[ABSOLUTE_POS] - target[ABSOLUTE_POS];
+        der1[ABSOLUTE_POS] = F::new(0.0) - F::tanh(r);
+    }
+}
+
+/// Second-order LogCosh hessian kernel:
+/// `der2[i] = -1 / (cosh(approx[i] - target[i]))^2`.
+///
+/// `error_functions.h:418` (`TLogCoshError::CalcDer2`). Always strictly negative
+/// (convex loss). Elementwise, no reduction (D-02). `F::cosh` is kernel-legal.
+#[cube(launch)]
+pub fn logcosh_hessian_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der2: &mut Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let r = approx[ABSOLUTE_POS] - target[ABSOLUTE_POS];
+        let c = F::cosh(r);
+        der2[ABSOLUTE_POS] = F::new(0.0) - F::new(1.0) / (c * c);
+    }
+}
+
+/// First-order Lq{q} gradient kernel:
+/// `der1[i] = q * sign(target-approx) * |approx-target|^(q-1)`.
+///
+/// `error_functions.h:553` (`TLqError::CalcDer`). The loss exponent `q` is passed
+/// as a length-1 `Array<F>` (read at index 0) — NOT a scalar arg — to keep the
+/// kernel fully generic over `F: Float` (AGENTS.md generics-float; the
+/// `focal_gradient_kernel` length-1-array precedent). The `target - approx > 0`
+/// sign is selected via the if-as-STATEMENT pattern (CubeCL conditionals manual —
+/// never if-as-expression): `sign` is initialized to `-1` and flipped to `+1`
+/// only when the residual is positive, matching upstream's `> 0 ? 1 : -1`.
+#[cube(launch)]
+pub fn lq_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+    q: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let qv = q[0];
+        let a = approx[ABSOLUTE_POS];
+        let t = target[ABSOLUTE_POS];
+        let abs_loss = F::abs(a - t);
+        let abs_loss_q = F::powf(abs_loss, qv - one);
+        let mut sign = F::new(0.0) - one;
+        if t - a > F::new(0.0) {
+            sign = one;
+        }
+        der1[ABSOLUTE_POS] = qv * sign * abs_loss_q;
+    }
+}
+
+/// Second-order Lq{q} hessian kernel:
+/// `der2[i] = -q * (q-1) * |target-approx|^(q-2)`.
+///
+/// `error_functions.h:558` (`TLqError::CalcDer2`). Newton-clean only for
+/// `q >= 2` (RESEARCH Pitfall 6); the Wave-1 fixture pins `q = 2.0`, where this
+/// collapses to the constant `-2`. `q` passes as a length-1 `Array<F>` like
+/// [`lq_gradient_kernel`]. Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn lq_hessian_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der2: &mut Array<F>,
+    q: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let qv = q[0];
+        let abs_loss = F::abs(target[ABSOLUTE_POS] - approx[ABSOLUTE_POS]);
+        let pow_term = F::powf(abs_loss, qv - F::new(2.0));
+        der2[ABSOLUTE_POS] = (F::new(0.0) - qv) * (qv - one) * pow_term;
+    }
+}
+
+/// First-order Huber{delta} gradient kernel: with `diff = target - approx`,
+/// `der1[i] = |diff| < delta ? diff : (diff > 0 ? delta : -delta)`.
+///
+/// `error_functions.h:1612` (`THuberError::CalcDer`). `delta` passes as a
+/// length-1 `Array<F>` (read at index 0) — generics-float discipline. The
+/// in-band / saturated branch and the `diff > 0` sign both use the
+/// if-as-STATEMENT pattern (CubeCL conditionals manual): `g` is initialized to
+/// the in-band value `diff`, then overwritten by `±delta` only when
+/// `|diff| >= delta`. Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn huber_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+    delta: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let d = delta[0];
+        let diff = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        let mut g = diff;
+        if F::abs(diff) >= d {
+            g = F::new(0.0) - d;
+            if diff > F::new(0.0) {
+                g = d;
+            }
+        }
+        der1[ABSOLUTE_POS] = g;
+    }
+}
+
+/// Second-order Huber{delta} hessian kernel: with `diff = target - approx`,
+/// `der2[i] = |diff| < delta ? -1 : 0`.
+///
+/// `error_functions.h:1621` (`THuberError::CalcDer2`). `delta` passes as a
+/// length-1 `Array<F>` like [`huber_gradient_kernel`]. The strict `<` band
+/// boundary matches upstream. if-as-STATEMENT: `h` initialized to the saturated
+/// `0`, set to `-1` only inside the band. Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn huber_hessian_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der2: &mut Array<F>,
+    delta: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let d = delta[0];
+        let diff = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        let mut h = F::new(0.0);
+        if F::abs(diff) < d {
+            h = F::new(0.0) - F::new(1.0);
+        }
+        der2[ABSOLUTE_POS] = h;
+    }
+}
+
+/// First-order Expectile{alpha} gradient kernel: with `e = target - approx`,
+/// `der1[i] = (e > 0) ? 2*alpha*e : 2*(1-alpha)*e`.
+///
+/// `error_functions.h:527` (`TExpectileError::CalcDer`). `alpha` passes as a
+/// length-1 `Array<F>` (read at index 0) — generics-float discipline. The
+/// `e > 0` asymmetry uses the if-as-STATEMENT pattern: `g` is initialized to the
+/// below-branch (`2*(1-alpha)*e`, which also covers the `e == 0` boundary like
+/// upstream's `> 0` test) and overwritten by the above-branch only for `e > 0`.
+/// Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn expectile_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+    alpha: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let two = F::new(2.0);
+        let a = alpha[0];
+        let e = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        let mut g = two * (one - a) * e;
+        if e > F::new(0.0) {
+            g = two * a * e;
+        }
+        der1[ABSOLUTE_POS] = g;
+    }
+}
+
+/// Second-order Expectile{alpha} hessian kernel: with `e = target - approx`,
+/// `der2[i] = (e > 0) ? -2*alpha : -2*(1-alpha)`.
+///
+/// `error_functions.h:532` (`TExpectileError::CalcDer2`). `alpha` passes as a
+/// length-1 `Array<F>` like [`expectile_gradient_kernel`]. Piecewise-constant; the
+/// `e == 0` boundary selects the below-branch (`-2*(1-alpha)`), matching
+/// upstream's `> 0`. if-as-STATEMENT. Elementwise, no reduction (D-02).
+#[cube(launch)]
+pub fn expectile_hessian_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der2: &mut Array<F>,
+    alpha: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let two = F::new(2.0);
+        let a = alpha[0];
+        let e = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        let mut h = (F::new(0.0) - two) * (one - a);
+        if e > F::new(0.0) {
+            h = (F::new(0.0) - two) * a;
+        }
+        der2[ABSOLUTE_POS] = h;
+    }
+}
+
 /// Histogram-scatter kernel: per-object, write the object's weighted gradient
 /// contribution into its OWN per-object output slot (`contrib[i] = der1[i] *
 /// weight[i]`).

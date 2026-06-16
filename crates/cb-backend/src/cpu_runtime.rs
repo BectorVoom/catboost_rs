@@ -20,8 +20,10 @@ use cb_compute::{Derivatives, Loss, Runtime};
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
-    focal_gradient_kernel, focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel,
-    logloss_hessian_kernel, mae_gradient_kernel,
+    expectile_gradient_kernel, expectile_hessian_kernel, focal_gradient_kernel,
+    focal_hessian_kernel, gradient_kernel, huber_gradient_kernel, huber_hessian_kernel,
+    logcosh_gradient_kernel, logcosh_hessian_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
+    lq_gradient_kernel, lq_hessian_kernel, mae_gradient_kernel,
 };
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
@@ -81,6 +83,26 @@ fn launch_binary_f64(
             unsafe { ArrayArg::from_raw_parts(target_handle, n) },
             unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
         ),
+        BinaryKernel::LogCoshGradient => {
+            logcosh_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            )
+        }
+        BinaryKernel::LogCoshHessian => {
+            logcosh_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            )
+        }
     }
 
     let bytes = client
@@ -89,12 +111,16 @@ fn launch_binary_f64(
     bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
 }
 
-/// Which elementwise binary (approx, target) -> der1 kernel to launch.
+/// Which elementwise binary (approx, target) -> der kernel to launch. LogCosh is
+/// non-parametric, so BOTH its gradient and hessian are binary kernels here (no
+/// length-1 param array, unlike Lq/Huber/Expectile).
 #[derive(Clone, Copy)]
 enum BinaryKernel {
     RmseGradient,
     LoglossGradient,
     MaeGradient,
+    LogCoshGradient,
+    LogCoshHessian,
 }
 
 /// Launch the Logloss hessian kernel (`der2 = -p*(1-p)`) on `CpuRuntime`.
@@ -188,6 +214,90 @@ fn launch_focal_f64(
     bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
 }
 
+/// Which single-parameter smooth-loss derivative kernel to launch (Lq{q},
+/// Huber{delta}, Expectile{alpha}). Each carries one scalar loss parameter passed
+/// as a length-1 device `Array<F>` (the `focal` length-1-array precedent — keeps
+/// the kernel generic over `F: Float`, AGENTS.md), and has a gradient and a
+/// hessian form selected by the `hessian` flag.
+#[derive(Clone, Copy)]
+enum ParamKernel {
+    Lq,
+    Huber,
+    Expectile,
+}
+
+/// Launch a single-parameter smooth-loss derivative kernel (`gradient` or
+/// `hessian`) on `CpuRuntime`, passing the scalar loss `param` (q / delta /
+/// alpha) as a length-1 device array, and read back the `f64` output in object
+/// order. Mirrors [`launch_focal_f64`] for the one-parameter losses.
+fn launch_param_f64(
+    approx: &[f64],
+    target: &[f64],
+    param: f64,
+    kind: ParamKernel,
+    hessian: bool,
+) -> Vec<f64> {
+    let n = approx.len();
+    let device = cubecl::cpu::CpuDevice;
+    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
+    let out_handle = client.empty(std::mem::size_of_val(approx));
+    // The loss parameter passes as a length-1 device array (the kernel stays
+    // generic over F — a generic scalar arg would need the non-generic
+    // ScalarArgType bound).
+    let param_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![param]));
+
+    let cube_dim = 32usize;
+    let num_cubes = n.div_ceil(cube_dim).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: cube_dim as u32,
+        y: 1,
+        z: 1,
+    };
+
+    let approx_arg = unsafe { ArrayArg::from_raw_parts(approx_handle, n) };
+    let target_arg = unsafe { ArrayArg::from_raw_parts(target_handle, n) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) };
+    let param_arg = unsafe { ArrayArg::from_raw_parts(param_handle, 1) };
+
+    match (kind, hessian) {
+        (ParamKernel::Lq, false) => lq_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+            &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+        ),
+        (ParamKernel::Lq, true) => lq_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+            &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+        ),
+        (ParamKernel::Huber, false) => {
+            huber_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+            )
+        }
+        (ParamKernel::Huber, true) => {
+            huber_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+            )
+        }
+        (ParamKernel::Expectile, false) => {
+            expectile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+            )
+        }
+        (ParamKernel::Expectile, true) => {
+            expectile_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
+            )
+        }
+    }
+
+    let bytes = client
+        .read_one(out_handle)
+        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
+    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+}
+
 impl Runtime for CpuBackend {
     fn compute_gradients(
         &self,
@@ -232,6 +342,28 @@ impl Runtime for CpuBackend {
                 let der1 = launch_binary_f64(approx, target, BinaryKernel::MaeGradient);
                 // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
                 let der2 = vec![0.0_f64; approx.len()];
+                Ok(Derivatives { der1, der2 })
+            }
+            // Wave-1 smooth losses (D-6.1-02): all four have a real der2, so each
+            // launches BOTH a gradient and a hessian kernel.
+            Loss::LogCosh => {
+                let der1 = launch_binary_f64(approx, target, BinaryKernel::LogCoshGradient);
+                let der2 = launch_binary_f64(approx, target, BinaryKernel::LogCoshHessian);
+                Ok(Derivatives { der1, der2 })
+            }
+            Loss::Lq { q } => {
+                let der1 = launch_param_f64(approx, target, q, ParamKernel::Lq, false);
+                let der2 = launch_param_f64(approx, target, q, ParamKernel::Lq, true);
+                Ok(Derivatives { der1, der2 })
+            }
+            Loss::Huber { delta } => {
+                let der1 = launch_param_f64(approx, target, delta, ParamKernel::Huber, false);
+                let der2 = launch_param_f64(approx, target, delta, ParamKernel::Huber, true);
+                Ok(Derivatives { der1, der2 })
+            }
+            Loss::Expectile { alpha } => {
+                let der1 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, false);
+                let der2 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, true);
                 Ok(Derivatives { der1, der2 })
             }
         }

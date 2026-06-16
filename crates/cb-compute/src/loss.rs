@@ -177,3 +177,127 @@ pub fn mae_der1(approx: f64, target: f64) -> f64 {
 pub fn mae_der2(_approx: f64, _target: f64) -> f64 {
     0.0
 }
+
+/// LogCosh first derivative for one object: `der1 = -tanh(approx - target)`.
+///
+/// `error_functions.h:414-415` — `TLogCoshError::CalcDer(approx, target) =
+/// -tanh(approx - target)`. Non-parametric; the smooth analogue of the MAE sign
+/// gradient (`tanh` saturates to `±1` for large residuals, is ~linear near zero).
+#[must_use]
+pub fn logcosh_der1(approx: f64, target: f64) -> f64 {
+    -(approx - target).tanh()
+}
+
+/// LogCosh second derivative for one object:
+/// `der2 = -1 / cosh(approx - target)^2`.
+///
+/// `error_functions.h:418-419` — `TLogCoshError::CalcDer2(approx, target) =
+/// -1 / (cosh(approx - target) * cosh(approx - target))`. Always strictly
+/// negative (the loss is convex), so Newton is well-defined; the Wave-1 fixture
+/// nonetheless uses upstream's Exact default (Pitfall 2).
+#[must_use]
+pub fn logcosh_der2(approx: f64, target: f64) -> f64 {
+    let c = (approx - target).cosh();
+    -1.0 / (c * c)
+}
+
+/// Lq{q} first derivative for one object:
+/// `der1 = q * sign(target - approx) * |approx - target|^(q-1)`.
+///
+/// `error_functions.h:553-556` — `TLqError::CalcDer`: `absLoss = |approx -
+/// target|; return Q * (target - approx > 0 ? 1 : -1) * pow(absLoss, Q - 1)`.
+/// The sign is taken on `target - approx` (note: ties `target == approx` map to
+/// `-1` upstream, the `> 0 ? 1 : -1` branch). `q` is the caller-supplied exponent
+/// (`>= 1`, validated by [`crate::Loss::validate`]).
+#[must_use]
+pub fn lq_der1(approx: f64, target: f64, q: f64) -> f64 {
+    let abs_loss = (approx - target).abs();
+    let abs_loss_q = abs_loss.powf(q - 1.0);
+    let sign = if target - approx > 0.0 { 1.0 } else { -1.0 };
+    q * sign * abs_loss_q
+}
+
+/// Lq{q} second derivative for one object:
+/// `der2 = -q * (q-1) * |target - approx|^(q-2)`.
+///
+/// `error_functions.h:558-561` — `TLqError::CalcDer2`: `absLoss = |target -
+/// approx|; return -Q * (Q - 1) * pow(absLoss, Q - 2)`. Newton-clean only for
+/// `q >= 2`; for `q < 2` the `^(q-2)` term diverges as the residual approaches
+/// zero (RESEARCH Pitfall 6), so the Wave-1 fixture pins `q = 2.0`. At `q = 2`
+/// this collapses to the constant `-2` (`pow(absLoss, 0) == 1`).
+#[must_use]
+pub fn lq_der2(approx: f64, target: f64, q: f64) -> f64 {
+    let abs_loss = (target - approx).abs();
+    -q * (q - 1.0) * abs_loss.powf(q - 2.0)
+}
+
+/// Huber{delta} first derivative for one object: with `diff = target - approx`,
+/// `der1 = |diff| < delta ? diff : (diff > 0 ? delta : -delta)`.
+///
+/// `error_functions.h:1612-1619` — `THuberError::CalcDer`: inside the band
+/// (`|diff| < delta`) the gradient is the raw residual (L2-like); outside it
+/// saturates to `±delta` (L1-like). The band boundary is the `<` (strict) test,
+/// matching upstream. `delta > 0` is validated by [`crate::Loss::validate`].
+#[must_use]
+pub fn huber_der1(approx: f64, target: f64, delta: f64) -> f64 {
+    let diff = target - approx;
+    if diff.abs() < delta {
+        diff
+    } else if diff > 0.0 {
+        delta
+    } else {
+        -delta
+    }
+}
+
+/// Huber{delta} second derivative for one object: with `diff = target - approx`,
+/// `der2 = |diff| < delta ? -1 : 0`.
+///
+/// `error_functions.h:1621-1627` — `THuberError::CalcDer2`: `HUBER_DER2 = -1.0`
+/// inside the band, `0.0` outside (the saturated L1 region has zero curvature).
+/// The same strict `<` band boundary as [`huber_der1`].
+#[must_use]
+pub fn huber_der2(approx: f64, target: f64, delta: f64) -> f64 {
+    let diff = target - approx;
+    if diff.abs() < delta {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// Expectile{alpha} first derivative for one object: with `e = target - approx`,
+/// `der1 = (e > 0) ? 2*alpha*e : 2*(1-alpha)*e`.
+///
+/// `error_functions.h:527-530` — `TExpectileError::CalcDer`: `e = target -
+/// approx; return (e > 0) ? 2*Alpha*e : 2*(1-Alpha)*e`. The asymmetric L2
+/// gradient — above-prediction residuals are weighted `alpha`, below `1-alpha`.
+/// At `alpha = 0.5` this is exactly the RMSE gradient (`2*0.5*e = e`).
+/// `alpha ∈ [0, 1]` is validated by [`crate::Loss::validate`].
+#[must_use]
+pub fn expectile_der1(approx: f64, target: f64, alpha: f64) -> f64 {
+    let e = target - approx;
+    if e > 0.0 {
+        2.0 * alpha * e
+    } else {
+        2.0 * (1.0 - alpha) * e
+    }
+}
+
+/// Expectile{alpha} second derivative for one object: with `e = target - approx`,
+/// `der2 = (e > 0) ? -2*alpha : -2*(1-alpha)`.
+///
+/// `error_functions.h:532-535` — `TExpectileError::CalcDer2`: `e = target -
+/// approx; return (e > 0) ? -2*Alpha : -2*(1-Alpha)`. Piecewise-constant
+/// (`-2*alpha` above prediction, `-2*(1-alpha)` below), so Newton is well-defined
+/// everywhere. The `e > 0` boundary at `e == 0` selects the below-branch
+/// (`-2*(1-alpha)`), matching upstream's `> 0` test exactly.
+#[must_use]
+pub fn expectile_der2(approx: f64, target: f64, alpha: f64) -> f64 {
+    let e = target - approx;
+    if e > 0.0 {
+        -2.0 * alpha
+    } else {
+        -2.0 * (1.0 - alpha)
+    }
+}

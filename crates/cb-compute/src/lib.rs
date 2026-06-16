@@ -32,10 +32,14 @@ pub use leaf::{
     simple_leaf_delta, LeafMethod,
 };
 pub use loss::{
-    cross_entropy_der1, cross_entropy_der2, focal_der1, focal_der2, logloss_der1, logloss_der2,
-    mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid, FOCAL_P_MIN, QUANTILE_ALPHA, QUANTILE_DELTA,
+    cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
+    huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
+    lq_der2, mae_der1, mae_der2, rmse_der1, rmse_der2, sigmoid, FOCAL_P_MIN, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
 };
-pub use runtime::{Derivatives, EScoreFunction, Float, Loss, Runtime};
+pub use runtime::{
+    Derivatives, EScoreFunction, Float, Loss, Runtime, EXPECTILE_ALPHA_DEFAULT,
+};
 pub use score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
     random_score_instance, score_st_dev, MINIMAL_SCORE,
