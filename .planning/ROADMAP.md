@@ -320,12 +320,19 @@ Plans:
   4. MultiQuantile (the multi-output member of LOSS-03, relocated from 6.1) produces its per-quantile outputs matching upstream ≤1e-5 on the N-dim approx path.
 
 **Plans**: 5 plans in 5 waves (Wave 0 mechanical refactor split into 2 sequential plans — compute-tier then train/model-tier + D-04 re-lock; Waves 1-3 = one plan per loss family, each its own ≤1e-5 per-stage oracle gate, D-6.2-02)
-
 Plans:
+**Wave 1**
+
 - [ ] 06.2-01-PLAN.md — Wave 0 (compute tier): widen `Runtime::compute_gradients` + `CpuBackend` to a dimension-major buffer with `approx_dimension`; drop `Copy` on `Loss` (the Wave-3 `MultiQuantile{alpha:Vec}` ripple, surfaced early); dim=1 byte-identical at the unit level (D-03/D-6.2-01)
 - [ ] 06.2-02-PLAN.md — Wave 0 (train/model tier + **D-04 HARD CHECKPOINT**): N-dim approx buffer in `boosting.rs`, per-dim leaf deltas, leaf-major `cb-model` serialization; re-lock ALL ~38 scalar oracles green at dim=1 + an explicit `0.0`-diff byte-identity gate
 - [ ] 06.2-03-PLAN.md — Wave 1: MultiClass (softmax coupled der + symmetric-Hessian Newton solve, solver-choice decision checkpoint / Open-Q1) + MultiClassOneVsAll (diagonal) + multi-dim split-score transcription + class-label remap; per-stage oracle ≤1e-5 (LOSS-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 06.2-04-PLAN.md — Wave 2: MultiLogloss + MultiCrossEntropy (shared `TMultiCrossEntropyError` diagonal der, per-dim sigmoid); per-stage oracle ≤1e-5 (LOSS-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 06.2-05-PLAN.md — Wave 3: MultiQuantile (K independent Exact quantile dims reusing the 6.1 `exact_leaf_delta` per dim, `alpha:Vec<f64>` param); per-stage oracle ≤1e-5; closes LOSS-02 + LOSS-03 multi (D-6.2-05)
 
 ### Phase 6.3: Ranking Losses & Metrics
