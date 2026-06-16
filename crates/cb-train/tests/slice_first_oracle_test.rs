@@ -76,7 +76,11 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         | Loss::Expectile { .. }
         | Loss::Poisson
         | Loss::Tweedie { .. }
-        | Loss::Mape => load_regression_target(),
+        | Loss::Mape
+        // Multiclass losses are not exercised by this scalar oracle; map to the
+        // regression-target arm to keep the match exhaustive (never constructed here).
+        | Loss::MultiClass
+        | Loss::MultiClassOneVsAll => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

@@ -545,7 +545,86 @@ fn compute_gradients_one_dim(
             let der2 = vec![0.0_f64; approx_d.len()];
             Ok((der1, der2))
         }
+        // MultiClass / MultiClassOneVsAll are multi-output losses handled in
+        // `compute_gradients` BEFORE the per-dimension scalar loop reaches here
+        // (softmax is cross-dimension-coupled; OneVsAll needs the per-object class
+        // index to test `d == target_class`). They never enter this single-dimension
+        // scalar dispatch, so reject them defensively rather than silently producing
+        // a wrong gradient (no `unwrap`/panic — a typed CbError).
+        Loss::MultiClass | Loss::MultiClassOneVsAll => Err(CbError::Degenerate(
+            "multiclass losses are dispatched in compute_gradients, not the \
+             single-dimension scalar path"
+                .to_owned(),
+        )),
     }
+}
+
+/// Compute the MultiClass softmax COUPLED der1 (dimension-major) + PACKED symmetric
+/// Hessian (per-object) over the full dimension-major `approx` buffer.
+///
+/// `approx` is `approx[d*n + i]` (length `k*n`); `target[i]` is object `i`'s
+/// REMAPPED contiguous class index `[0, k)` (cast from `f64`). Returns
+/// `(der1, der2_packed)` where:
+/// - `der1` is dimension-major length `k*n` (`der1[d*n + i] = softmax_ders(...).0[d]`),
+///   matching the diagonal losses' layout, and
+/// - `der2_packed` is PER-OBJECT length `n * k*(k+1)/2`, object `i`'s packed
+///   lower-triangular Hessian at `der2_packed[i*pk .. i*pk + pk]` (`pk = k*(k+1)/2`).
+///
+/// The coupled Hessian cannot ride the dimension-major `der2[d*n+i]` layout (it is
+/// not diagonal), so the boosting loop reads it per-object via the packed stride.
+fn compute_softmax_gradients(
+    approx: &[f64],
+    target: &[f64],
+    k: usize,
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let pk = k * (k + 1) / 2;
+    let mut der1 = vec![0.0_f64; k * n];
+    let mut der2_packed = vec![0.0_f64; n * pk];
+    // Per-object gather of the k-dimensional approx slice (dim-major → object view).
+    let mut obj_approx = vec![0.0_f64; k];
+    for i in 0..n {
+        for d in 0..k {
+            obj_approx[d] = approx.get(d * n + i).copied().unwrap_or(0.0);
+        }
+        let target_class = target.get(i).copied().unwrap_or(0.0) as usize;
+        let (od1, od2) = cb_compute::softmax_ders(&obj_approx, target_class);
+        for d in 0..k {
+            if let Some(slot) = der1.get_mut(d * n + i) {
+                *slot = od1.get(d).copied().unwrap_or(0.0);
+            }
+        }
+        for (j, &v) in od2.iter().enumerate() {
+            if let Some(slot) = der2_packed.get_mut(i * pk + j) {
+                *slot = v;
+            }
+        }
+    }
+    (der1, der2_packed)
+}
+
+/// Compute the MultiClassOneVsAll SEPARABLE per-dimension diagonal der1/der2 over
+/// the dimension-major `approx` buffer. Each dimension `d` is an independent binary
+/// one-vs-rest sigmoid with `der1 = δ(d == class_i) - sigmoid(approx_d)`,
+/// `der2 = -p*(1-p)` (`error_functions.h:746-779`). Both outputs are dimension-major
+/// length `k*n` (`buf[d*n + i]`), reusing the diagonal-loss leaf path per dimension.
+fn compute_onevsall_gradients(approx: &[f64], target: &[f64], k: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut der1 = vec![0.0_f64; k * n];
+    let mut der2 = vec![0.0_f64; k * n];
+    for i in 0..n {
+        let class_i = target.get(i).copied().unwrap_or(0.0) as usize;
+        for d in 0..k {
+            let a = approx.get(d * n + i).copied().unwrap_or(0.0);
+            let (od1, od2) = cb_compute::multiclass_onevsall_ders(a, d == class_i);
+            if let Some(slot) = der1.get_mut(d * n + i) {
+                *slot = od1;
+            }
+            if let Some(slot) = der2.get_mut(d * n + i) {
+                *slot = od2;
+            }
+        }
+    }
+    (der1, der2)
 }
 
 impl Runtime for CpuBackend {
@@ -589,6 +668,26 @@ impl Runtime for CpuBackend {
                 der1: Vec::new(),
                 der2: Vec::new(),
             });
+        }
+
+        // MULTICLASS dispatch (LOSS-02): handle the two multi-output classification
+        // losses BEFORE the per-dimension scalar loop. MultiClass softmax is
+        // cross-dimension-COUPLED — its `der2` is a PER-OBJECT packed symmetric
+        // Hessian (length `n * k*(k+1)/2`), NOT the diagonal `der2[d*n+i]` layout;
+        // the boosting loop reads it via the packed stride and runs the symmetric
+        // Newton solve. MultiClassOneVsAll is SEPARABLE (per-dim diagonal sigmoid),
+        // so its outputs ride the standard dimension-major `buf[d*n+i]` layout and
+        // reuse the scalar Newton leaf path per dimension.
+        match loss {
+            Loss::MultiClass => {
+                let (der1, der2) = compute_softmax_gradients(approx, target, approx_dimension, n);
+                return Ok(Derivatives { der1, der2 });
+            }
+            Loss::MultiClassOneVsAll => {
+                let (der1, der2) = compute_onevsall_gradients(approx, target, approx_dimension, n);
+                return Ok(Derivatives { der1, der2 });
+            }
+            _ => {}
         }
 
         // Per-dimension kernel-launch loop (D-6.2-01 / RESEARCH Pitfall 1). The

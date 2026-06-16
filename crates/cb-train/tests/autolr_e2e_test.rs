@@ -156,6 +156,8 @@ fn run_autolr_e2e(
         Loss::Focal { .. } => TargetType::Logloss,
         // MAE, the Wave-1 smooth regression losses, and the Wave-2 positive-domain
         // / link losses (Poisson / Tweedie / MAPE) are not in the auto-LR table.
+        // Multiclass losses are not in the auto-LR table and are not exercised
+        // here; map to Unknown to keep the match exhaustive.
         Loss::Mae
         | Loss::Quantile { .. }
         | Loss::LogCosh
@@ -164,7 +166,9 @@ fn run_autolr_e2e(
         | Loss::Expectile { .. }
         | Loss::Poisson
         | Loss::Tweedie { .. }
-        | Loss::Mape => TargetType::Unknown,
+        | Loss::Mape
+        | Loss::MultiClass
+        | Loss::MultiClassOneVsAll => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");

@@ -3,11 +3,11 @@
 //! logit; Focal `alpha`/`gamma`-weighted der1/der2 (`error_functions.h`).
 
 use crate::loss::{
-    cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
-    huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
-    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, quantile_der1,
-    quantile_der2, rmse_der1, rmse_der2, sigmoid, tweedie_der1, tweedie_der2, QUANTILE_ALPHA,
-    QUANTILE_DELTA,
+    calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,
+    focal_der1, focal_der2, huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1,
+    logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
+    multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1, quantile_der2, rmse_der1,
+    rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 
 #[test]
@@ -321,4 +321,83 @@ fn mape_der2_is_zero() {
     assert!(mape_der2(0.0, 5.0).abs() < 1e-12);
     assert!(mape_der2(2.0, 0.5).abs() < 1e-12);
     assert!(mape_der2(-100.0, 100.0).abs() < 1e-12);
+}
+
+// --- MultiClass softmax (coupled der + packed symmetric Hessian) -------------
+
+#[test]
+fn calc_softmax_uniform_at_equal_approx() {
+    // All-equal approx -> uniform distribution (max-subtraction makes every
+    // exponent 1.0, so each p = 1/k).
+    let p = calc_softmax(&[0.0, 0.0, 0.0]);
+    for &pd in &p {
+        assert!((pd - 1.0 / 3.0).abs() < 1e-12);
+    }
+    // Probabilities sum to 1.
+    let s: f64 = p.iter().sum();
+    assert!((s - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn calc_softmax_max_subtraction_no_overflow() {
+    // A large-magnitude approx must NOT overflow exp to Inf/NaN (T-6.2-02): the
+    // max-subtraction keeps every exponent <= 1.0. The dominant dimension's
+    // probability approaches 1, the rest approach 0; nothing is NaN/Inf.
+    let p = calc_softmax(&[1000.0, 0.0, -1000.0]);
+    for &pd in &p {
+        assert!(pd.is_finite());
+        assert!((0.0..=1.0).contains(&pd));
+    }
+    let s: f64 = p.iter().sum();
+    assert!((s - 1.0).abs() < 1e-12);
+    assert!(p[0] > 0.999_999);
+}
+
+#[test]
+fn softmax_ders_match_hand_computed_three_class() {
+    // 3-class object, approx = [0, 0, 0] -> p = [1/3, 1/3, 1/3], target_class = 1.
+    // der1[d] = δ(d==1) - p[d]: [-1/3, 2/3, -1/3].
+    let (der1, der2) = softmax_ders(&[0.0, 0.0, 0.0], 1);
+    let third = 1.0 / 3.0;
+    assert!((der1[0] - (-third)).abs() < 1e-12);
+    assert!((der1[1] - (2.0 * third)).abs() < 1e-12);
+    assert!((der1[2] - (-third)).abs() < 1e-12);
+
+    // Packed Hessian order [(0,0),(0,1),(0,2),(1,1),(1,2),(2,2)] of length 6.
+    // diag (y,y) = p_y*(p_y-1) = (1/3)*(1/3 - 1) = -2/9.
+    // off  (y,x) = p_y*p_x     = (1/3)*(1/3)     = 1/9.
+    assert_eq!(der2.len(), 6);
+    let diag = third * (third - 1.0); // -2/9
+    let off = third * third; // 1/9
+    for &idx in &[0usize, 3, 5] {
+        assert!((der2[idx] - diag).abs() < 1e-12, "diag at {idx}");
+    }
+    for &idx in &[1usize, 2, 4] {
+        assert!((der2[idx] - off).abs() < 1e-12, "off at {idx}");
+    }
+}
+
+#[test]
+fn softmax_ders_out_of_range_target_does_not_panic() {
+    // An out-of-range target_class (>= k) leaves der1 = -p[d] (no +1) without
+    // panicking — the caller's range validation is the defense (T-6.2-01).
+    let (der1, _) = softmax_ders(&[0.1, 0.2, 0.3], 99);
+    let p = calc_softmax(&[0.1, 0.2, 0.3]);
+    for d in 0..3 {
+        assert!((der1[d] - (-p[d])).abs() < 1e-12);
+    }
+}
+
+// --- MultiClassOneVsAll (diagonal per-dimension sigmoid der) -----------------
+
+#[test]
+fn multiclass_onevsall_ders_match_sigmoid() {
+    // approx_d = 0 -> sigmoid = 0.5. Target dimension: der1 = 1 - 0.5 = 0.5;
+    // non-target: der1 = -0.5. der2 = -0.5*0.5 = -0.25 in both.
+    let (d1_t, d2_t) = multiclass_onevsall_ders(0.0, true);
+    assert!((d1_t - 0.5).abs() < 1e-12);
+    assert!((d2_t - (-0.25)).abs() < 1e-12);
+    let (d1_n, d2_n) = multiclass_onevsall_ders(0.0, false);
+    assert!((d1_n - (-0.5)).abs() < 1e-12);
+    assert!((d2_n - (-0.25)).abs() < 1e-12);
 }

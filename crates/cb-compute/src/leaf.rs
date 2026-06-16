@@ -144,6 +144,177 @@ pub fn simple_leaf_delta(sum_der: f64, sum_weight: f64, scaled_l2: f64) -> f64 {
     gradient_leaf_delta(sum_der, sum_weight, scaled_l2)
 }
 
+/// The MultiClass softmax per-leaf SYMMETRIC Newton solve — the single piece of
+/// genuinely-new numerical machinery this phase (RESEARCH "Key insight"),
+/// transcribing `TSymmetricHessian::SolveNewtonEquation`
+/// (`hessian.cpp:22-52`) verbatim with a hand-rolled symmetric positive-definite
+/// solve (the RESEARCH-recommended hand-roll default — NO new linalg crate, so the
+/// T-6.2-SC supply-chain gate is a no-op).
+///
+/// # Inputs
+/// - `sum_der`: the leaf's summed per-dimension first derivative `Σ der1[d]`
+///   (length `k`), the OUTPUT of `softmax_ders`' `der1` summed over the leaf's
+///   members through `cb_core::sum_f64` (D-08).
+/// - `sum_der2_packed`: the leaf's summed PACKED lower-triangular Hessian (length
+///   `k*(k+1)/2`), `Σ` of `softmax_ders`' `der2` over the same members, in the same
+///   `[(0,0),(0,1),…]` order.
+/// - `scaled_l2`: the per-tree `scale_l2_reg(l2, sumAllWeights, docCount)` output
+///   (upstream `l2Regularizer *= sumAllWeights/allDocCount` is applied by the
+///   caller, `online_predictor.cpp:17`).
+///
+/// # Algorithm (`hessian.cpp:30-50`)
+/// 1. `negativeDer = -sum_der`.
+/// 2. `maxTraceElement = max(scaled_l2, max_d(-H[d][d]))` at **`f32` precision** —
+///    the trace-epsilon regularizer uses `f32::EPSILON` (Pitfall 5; reproduced
+///    bit-faithfully so leaf values match `<= 1e-5`).
+/// 3. `adjustedL2 = max(scaled_l2, maxTraceElement * f32::EPSILON)`.
+/// 4. Subtract `adjustedL2` from each diagonal, NEGATE the whole matrix, solve
+///    `M · x = negativeDer`, then NEGATE the result: `res = -x` (the leaf delta per
+///    dimension).
+///
+/// The negated matrix `M = -(H - adjustedL2·I)` is symmetric positive definite for
+/// the softmax Hessian (the diagonal `-(p_y(p_y-1)) = p_y(1-p_y) > 0` dominates),
+/// so a Cholesky `M = L·Lᵀ` solve reproduces LAPACK `dppsv_`'s result to machine
+/// precision. The `k <= ~10` in-scope class counts make the dense solve trivial.
+///
+/// Returns the per-dimension leaf delta (length `k`). A non-positive-definite or
+/// degenerate system (an empty leaf — all-zero stats) returns all-zeros rather than
+/// panicking (no `unwrap`, no div-by-zero — T-6.2-01 discipline).
+#[must_use]
+pub fn solve_symmetric_newton(
+    sum_der: &[f64],
+    sum_der2_packed: &[f64],
+    scaled_l2: f64,
+) -> Vec<f64> {
+    let k = sum_der.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    // Reconstruct the dense symmetric Hessian H[i][j] from the packed
+    // [(0,0),(0,1),…,(0,k-1),(1,1),…] order (mirrors `softmax_ders`' packing).
+    // Each packed entry is written to BOTH H[i][j] and H[j][i] via index writes
+    // (the borrow checker forbids holding two `&mut` rows at once).
+    let mut h = vec![vec![0.0_f64; k]; k];
+    let mut idx = 0usize;
+    for i in 0..k {
+        for j in i..k {
+            let v = sum_der2_packed.get(idx).copied().unwrap_or(0.0);
+            idx += 1;
+            if let Some(cell) = h.get_mut(i).and_then(|r| r.get_mut(j)) {
+                *cell = v;
+            }
+            if let Some(cell) = h.get_mut(j).and_then(|r| r.get_mut(i)) {
+                *cell = v;
+            }
+        }
+    }
+
+    // maxTraceElement at f32 precision (hessian.cpp:35-38): start at scaled_l2 (the
+    // `l2Regularizer` arg), then max with each `-H[d][d]`. The Max<float> cast and
+    // the `* numeric_limits<float>::epsilon()` are reproduced at f32 (Pitfall 5).
+    let mut max_trace = scaled_l2 as f32;
+    for d in 0..k {
+        let diag = h.get(d).and_then(|r| r.get(d)).copied().unwrap_or(0.0);
+        max_trace = max_trace.max((-diag) as f32);
+    }
+    let adjusted_l2 = (scaled_l2 as f32).max(max_trace * f32::EPSILON) as f64;
+
+    // M = -(H - adjustedL2·I): subtract adjustedL2 from the diagonal, then negate
+    // the entire matrix (hessian.cpp:41-47).
+    for d in 0..k {
+        if let Some(cell) = h.get_mut(d).and_then(|r| r.get_mut(d)) {
+            *cell -= adjusted_l2;
+        }
+    }
+    for row in &mut h {
+        for cell in row.iter_mut() {
+            *cell = -*cell;
+        }
+    }
+
+    // negativeDer = -sum_der (hessian.cpp:32 via online_predictor.cpp:13-16).
+    let neg_der: Vec<f64> = sum_der.iter().map(|&d| -d).collect();
+
+    // Solve M · x = neg_der via Cholesky (M is SPD). Then res = -x.
+    match cholesky_solve(&h, &neg_der) {
+        Some(x) => x.into_iter().map(|v| -v).collect(),
+        None => vec![0.0; k],
+    }
+}
+
+/// Solve the dense symmetric positive-definite system `a · x = b` via a Cholesky
+/// factorization `a = L·Lᵀ` followed by forward/back substitution. `a` is `k×k`
+/// row-major; `b` is length `k`. Returns `None` if `a` is not positive definite (a
+/// non-positive pivot), so the caller can fall back to zeros rather than producing
+/// a NaN. Used only by [`solve_symmetric_newton`] for the tiny (`k <= ~10`) softmax
+/// leaf systems.
+fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let k = b.len();
+    let mut l = vec![vec![0.0_f64; k]; k];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = a.get(i).and_then(|r| r.get(j)).copied().unwrap_or(0.0);
+            for p in 0..j {
+                let lip = l.get(i).and_then(|r| r.get(p)).copied().unwrap_or(0.0);
+                let ljp = l.get(j).and_then(|r| r.get(p)).copied().unwrap_or(0.0);
+                sum -= lip * ljp;
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return None;
+                }
+                let diag = sum.sqrt();
+                if let Some(cell) = l.get_mut(i).and_then(|r| r.get_mut(j)) {
+                    *cell = diag;
+                }
+            } else {
+                let ljj = l.get(j).and_then(|r| r.get(j)).copied().unwrap_or(0.0);
+                if ljj == 0.0 {
+                    return None;
+                }
+                if let Some(cell) = l.get_mut(i).and_then(|r| r.get_mut(j)) {
+                    *cell = sum / ljj;
+                }
+            }
+        }
+    }
+    // Forward solve L·y = b.
+    let mut y = vec![0.0_f64; k];
+    for i in 0..k {
+        let mut sum = b.get(i).copied().unwrap_or(0.0);
+        for p in 0..i {
+            let lip = l.get(i).and_then(|r| r.get(p)).copied().unwrap_or(0.0);
+            let yp = y.get(p).copied().unwrap_or(0.0);
+            sum -= lip * yp;
+        }
+        let lii = l.get(i).and_then(|r| r.get(i)).copied().unwrap_or(0.0);
+        if lii == 0.0 {
+            return None;
+        }
+        if let Some(slot) = y.get_mut(i) {
+            *slot = sum / lii;
+        }
+    }
+    // Back solve Lᵀ·x = y.
+    let mut x = vec![0.0_f64; k];
+    for i in (0..k).rev() {
+        let mut sum = y.get(i).copied().unwrap_or(0.0);
+        for p in (i + 1)..k {
+            let lpi = l.get(p).and_then(|r| r.get(i)).copied().unwrap_or(0.0);
+            let xp = x.get(p).copied().unwrap_or(0.0);
+            sum -= lpi * xp;
+        }
+        let lii = l.get(i).and_then(|r| r.get(i)).copied().unwrap_or(0.0);
+        if lii == 0.0 {
+            return None;
+        }
+        if let Some(slot) = x.get_mut(i) {
+            *slot = sum / lii;
+        }
+    }
+    Some(x)
+}
+
 /// The Exact-method leaf delta — the weighted sample quantile of a leaf's
 /// per-member residuals, with the upstream alpha/delta adjustment
 /// (`CalcExactLeafDeltas` -> `CalcOneDimensionalOptimumConstApprox` ->

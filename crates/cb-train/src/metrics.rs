@@ -75,6 +75,10 @@ impl EvalMetric {
             // the MAE arm) unless a fixture pins `eval_metric`. MSLE is NOT mapped
             // here — it is metric-only (D-6.1-06) and selected explicitly, never a
             // default for any objective.
+            // The multiclass losses (MultiClass / MultiClassOneVsAll) report the
+            // parity-neutral RMSE eval surface by default; the in-scope fixtures pin
+            // `od_type=None` with no eval set, so this default is never exercised
+            // (a named multiclass eval metric is a later phase).
             Loss::Rmse
             | Loss::Mae
             | Loss::Quantile { .. }
@@ -84,7 +88,9 @@ impl EvalMetric {
             | Loss::Expectile { .. }
             | Loss::Poisson
             | Loss::Tweedie { .. }
-            | Loss::Mape => Self::Rmse,
+            | Loss::Mape
+            | Loss::MultiClass
+            | Loss::MultiClassOneVsAll => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,

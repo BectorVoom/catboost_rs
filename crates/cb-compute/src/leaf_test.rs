@@ -2,8 +2,45 @@
 
 use crate::leaf::{
     calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
-    newton_leaf_delta, scale_l2_reg, simple_leaf_delta,
+    newton_leaf_delta, scale_l2_reg, simple_leaf_delta, solve_symmetric_newton,
 };
+
+#[test]
+fn solve_symmetric_newton_reproduces_hessian_cpp_three_class() {
+    // A leaf with a single 3-class object at approx = [0,0,0], target_class = 1:
+    //   der1 = [-1/3, 2/3, -1/3] (softmax_ders der1)
+    //   packed Hessian der2 = [p_y(p_y-1) diag, p_y*p_x off] with p = 1/3:
+    //     [(0,0),(0,1),(0,2),(1,1),(1,2),(2,2)] = [-2/9, 1/9, 1/9, -2/9, 1/9, -2/9]
+    // Solving hessian.cpp:22-52 (trace-eps at f32 precision) with scaled_l2 = 3.0
+    // gives the leaf delta [-0.1, 0.2, -0.1] (verified against numpy.linalg.solve).
+    let third = 1.0 / 3.0;
+    let der1 = [-third, 2.0 * third, -third];
+    let diag = third * (third - 1.0); // -2/9
+    let off = third * third; // 1/9
+    let der2_packed = [diag, off, off, diag, off, diag];
+    let delta = solve_symmetric_newton(&der1, &der2_packed, 3.0);
+    let want = [-0.1, 0.2, -0.1];
+    for d in 0..3 {
+        assert!(
+            (delta[d] - want[d]).abs() < 1e-9,
+            "delta[{d}] = {} want {}",
+            delta[d],
+            want[d]
+        );
+    }
+}
+
+#[test]
+fn solve_symmetric_newton_empty_leaf_returns_zeros() {
+    // An all-zero leaf (empty / degenerate) returns zeros, not NaN (T-6.2-01: no
+    // panic / div-by-zero). With der1 = [0,0] and a zero Hessian, the negated
+    // matrix is `adjustedL2·I` (SPD), so the solve yields exactly 0.
+    let delta = solve_symmetric_newton(&[0.0, 0.0], &[0.0, 0.0, 0.0], 3.0);
+    assert_eq!(delta.len(), 2);
+    for &d in &delta {
+        assert_eq!(d, 0.0);
+    }
+}
 
 #[test]
 fn calc_average_guards_empty_leaf_returns_zero() {

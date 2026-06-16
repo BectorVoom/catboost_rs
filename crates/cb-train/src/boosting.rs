@@ -27,7 +27,8 @@
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
     newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev,
-    simple_leaf_delta, LeafMethod, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+    simple_leaf_delta, solve_symmetric_newton, LeafMethod, Loss, Runtime, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
@@ -603,6 +604,12 @@ pub struct Model {
     /// `approx_dimension * n_leaves`; at `1` it is exactly `n_leaves` values in
     /// leaf order, byte-identical to the pre-6.2 scalar model.
     pub approx_dimension: usize,
+    /// The `ClassToLabel` map for a multiclass model (LOSS-02, Pitfall 4): the
+    /// SORTED distinct original class labels, so `class_to_label[c]` is the original
+    /// label for class index `c`. The training target is the remapped index `[0, k)`;
+    /// predictions recover the original labels via this map. EMPTY for every scalar
+    /// regression / binary model (byte-identical to the pre-6.2 model).
+    pub class_to_label: Vec<f64>,
 }
 
 impl Model {
@@ -654,6 +661,9 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         // link losses (Poisson / Tweedie / MAPE) are not in the upstream auto-LR
         // table (`options_helper.cpp:181-194`) -> Unknown (no rate guessed),
         // mirroring the existing MAE arm.
+        // The multiclass losses (MultiClass / MultiClassOneVsAll) are not in the
+        // upstream auto-LR coefficient table -> Unknown (no rate guessed). Fixtures
+        // pin an explicit learning_rate, so auto-LR never fires for them.
         Loss::Focal { .. }
         | Loss::Mae
         | Loss::Quantile { .. }
@@ -663,7 +673,9 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         | Loss::Expectile { .. }
         | Loss::Poisson
         | Loss::Tweedie { .. }
-        | Loss::Mape => TargetType::Unknown,
+        | Loss::Mape
+        | Loss::MultiClass
+        | Loss::MultiClassOneVsAll => TargetType::Unknown,
     }
 }
 
@@ -680,8 +692,63 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
 /// boosting loop, leaf-delta solver, approx update, and staged record are all
 /// dimension-major over this value; at `1` they are byte-identical to the
 /// pre-6.2 scalar path (D-04).
-fn loss_approx_dimension(_loss: &Loss) -> usize {
-    1
+fn loss_approx_dimension(loss: &Loss, target: &[f64]) -> usize {
+    match loss {
+        // MultiClass / MultiClassOneVsAll: the distinct class count
+        // `max(distinct, 2)` (`approx_dimension.cpp:24-27`,
+        // `label_converter.cpp:142`). The class labels are remapped to a
+        // contiguous `[0, k)` index by [`build_class_remap`]; the approx dimension
+        // is that map's width.
+        Loss::MultiClass | Loss::MultiClassOneVsAll => {
+            let map = build_class_remap(target);
+            map.len().max(2)
+        }
+        // Every scalar regression / binary loss is single-output.
+        _ => 1,
+    }
+}
+
+/// Build the `ClassToLabel` map for a multiclass target: the SORTED distinct raw
+/// labels, so the contiguous class index `[0, k)` is `index_of(label)` in this
+/// vector (upstream `TLabelConverter::Initialize`, `label_converter.cpp:136-145`).
+///
+/// Returns the labels in ascending order; `class_to_label[c]` is the original label
+/// for class index `c`, and the inverse (label → index) is a binary search. The
+/// model stores this vector (`class_params`/`multiclass_params`) so predictions
+/// recover the original labels (Pitfall 4). Labels are compared as `f64` bit
+/// patterns via a total order (NaN is not expected in a class target).
+fn build_class_remap(target: &[f64]) -> Vec<f64> {
+    let mut labels: Vec<f64> = target.to_vec();
+    labels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    labels.dedup_by(|a, b| (*a - *b).abs() == 0.0);
+    labels
+}
+
+/// Remap a raw multiclass target to its contiguous `[0, k)` class index using the
+/// `class_to_label` map from [`build_class_remap`]. `remapped[i]` is the index `c`
+/// such that `class_to_label[c] == target[i]` (Pitfall 4 — the der writes
+/// `der[target_class]`, which assumes a contiguous index).
+///
+/// # Errors
+/// Returns [`CbError::OutOfRange`] (T-6.2-01) if a target label is not present in
+/// the map — never panics / never indexes out of bounds. The map is built FROM the
+/// same target, so every label is present in the normal path; this guards a caller
+/// that passes a mismatched (label, map) pair.
+fn remap_target_to_class(target: &[f64], class_to_label: &[f64]) -> CbResult<Vec<f64>> {
+    target
+        .iter()
+        .map(|&t| {
+            class_to_label
+                .iter()
+                .position(|&l| (l - t).abs() == 0.0)
+                .map(|c| c as f64)
+                .ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "multiclass target label {t} is not in the class map"
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
@@ -720,6 +787,20 @@ fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
         return Err(CbError::OutOfRange(format!(
             "LeafMethod::Exact has no defined optimizer for {loss:?}; \
              Exact is supported only for LogCosh, Mae, and Quantile"
+        )));
+    }
+    // MultiClass / MultiClassOneVsAll are gated to Newton (WR-01 / Pitfall 2 —
+    // the upstream default leaf method for both is Newton with 1 iteration;
+    // Gradient/Simple/Exact have no defined multiclass leaf optimizer here).
+    // MultiClass additionally rides the dense symmetric Hessian solve; OneVsAll
+    // reuses the per-dimension scalar Newton step. Reject any non-Newton method up
+    // front rather than silently producing a wrong leaf value.
+    if matches!(loss, Loss::MultiClass | Loss::MultiClassOneVsAll)
+        && !matches!(method, LeafMethod::Newton)
+    {
+        return Err(CbError::OutOfRange(format!(
+            "{loss:?} requires LeafMethod::Newton (the upstream default, 1 \
+             iteration); {method:?} has no defined multiclass leaf optimizer"
         )));
     }
     if matches!(method, LeafMethod::Newton) {
@@ -827,6 +908,101 @@ fn compute_leaf_deltas(
                 .collect()
         }
     }
+}
+
+/// Compute the MultiClass softmax per-leaf SYMMETRIC Newton leaf deltas — the
+/// COUPLED cross-dimension leaf solve (`approx_calcer_multi_helpers.cpp` +
+/// `hessian.cpp:22-52`). UNLIKE the diagonal losses (which solve each dimension
+/// independently in the boosting loop's per-`d` arm over [`compute_leaf_deltas`]),
+/// softmax's per-leaf delta is one dense symmetric solve over ALL `k` dimensions,
+/// so it is computed here ONCE and returns the dimension-major leaf values.
+///
+/// # Inputs
+/// - `leaf_of[i]`: object `i`'s leaf index (shared across dimensions — the
+///   oblivious structure is one tree).
+/// - `weighted_der1`: the DIMENSION-MAJOR weighted first derivative
+///   `der1[d*n + i] * weight[i]` (length `k*n`).
+/// - `der2_packed`: the PER-OBJECT packed symmetric Hessian `der2_packed[i*pk + j]`
+///   (length `n * pk`, `pk = k*(k+1)/2`), already weighted per object (the
+///   `weight != 1` branch of `softmax_ders`; unit weights in scope).
+/// - `weights[i]`: per-object weight (folded into the Hessian below).
+/// - `scaled_l2`: the per-tree `scale_l2_reg` output.
+/// - `n_leaves`, `k`, `n`.
+///
+/// # Output
+/// The DIMENSION-MAJOR leaf-delta buffer `delta[d * n_leaves + leaf]` (length
+/// `k * n_leaves`), BEFORE the `learning_rate` scaling (the caller multiplies).
+/// Per leaf: sum the per-member `der1[d]` and packed `der2[j]` via
+/// `cb_core::sum_f64` (ordered, D-08), then [`solve_symmetric_newton`].
+fn compute_softmax_leaf_deltas(
+    leaf_of: &[usize],
+    weighted_der1: &[f64],
+    der2_packed: &[f64],
+    weights: &[f64],
+    scaled_l2: f64,
+    n_leaves: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f64> {
+    let pk = k * (k + 1) / 2;
+    // Per-leaf gather of the per-dimension der1 and the per-element packed der2,
+    // each member contribution pushed in ascending object order so the
+    // `cb_core::sum_f64` reduction order matches upstream's thread_count==1 pass.
+    let mut der1_members: Vec<Vec<Vec<f64>>> =
+        vec![vec![Vec::new(); k]; n_leaves];
+    let mut der2_members: Vec<Vec<Vec<f64>>> =
+        vec![vec![Vec::new(); pk]; n_leaves];
+    for (i, &leaf) in leaf_of.iter().enumerate() {
+        if leaf >= n_leaves {
+            continue;
+        }
+        let w = weights.get(i).copied().unwrap_or(1.0);
+        for d in 0..k {
+            let v = weighted_der1.get(d * n + i).copied().unwrap_or(0.0);
+            if let Some(slot) = der1_members.get_mut(leaf).and_then(|r| r.get_mut(d)) {
+                slot.push(v);
+            }
+        }
+        for j in 0..pk {
+            // The per-object packed Hessian is unweighted (softmax_ders returns
+            // weight==1); fold the per-object weight in here (the
+            // `der.Der2 *= weight` upstream branch) so weighted training matches.
+            let v = der2_packed.get(i * pk + j).copied().unwrap_or(0.0) * w;
+            if let Some(slot) = der2_members.get_mut(leaf).and_then(|r| r.get_mut(j)) {
+                slot.push(v);
+            }
+        }
+    }
+
+    // Per-leaf: reduce the gathered members (D-08) and run the symmetric solve.
+    let mut leaf_values = vec![0.0_f64; k * n_leaves];
+    for leaf in 0..n_leaves {
+        let sum_der: Vec<f64> = (0..k)
+            .map(|d| {
+                let members = der1_members
+                    .get(leaf)
+                    .and_then(|r| r.get(d))
+                    .map_or(&[][..], Vec::as_slice);
+                sum_f64(members)
+            })
+            .collect();
+        let sum_der2: Vec<f64> = (0..pk)
+            .map(|j| {
+                let members = der2_members
+                    .get(leaf)
+                    .and_then(|r| r.get(j))
+                    .map_or(&[][..], Vec::as_slice);
+                sum_f64(members)
+            })
+            .collect();
+        let delta = solve_symmetric_newton(&sum_der, &sum_der2, scaled_l2);
+        for d in 0..k {
+            if let Some(slot) = leaf_values.get_mut(d * n_leaves + leaf) {
+                *slot = delta.get(d).copied().unwrap_or(0.0);
+            }
+        }
+    }
+    leaf_values
 }
 
 /// Accumulate per-leaf summed training-document weights (RESEARCH Pitfall 1,
@@ -1255,7 +1431,33 @@ fn train_inner<R: Runtime>(
     // `approx_dimension == 1` it is EXACTLY `vec![bias; n]` (the same slice,
     // same length, same summation order) — the D-04 byte-identity invariant
     // (RESEARCH Pitfall 1).
-    let approx_dimension: usize = loss_approx_dimension(&params.loss);
+    let approx_dimension: usize = loss_approx_dimension(&params.loss, target);
+
+    // MULTICLASS class-label remap (Pitfall 4, LOSS-02). The raw labels are mapped
+    // to a contiguous `[0, k)` class index BEFORE training (`label_converter.cpp:142`)
+    // so the softmax / one-vs-all der can write `der[target_class]` safely
+    // (T-6.2-01); the `class_to_label` map is stored on the model to recover the
+    // original labels at predict time. For the scalar / binary losses
+    // `class_to_label` stays empty and `effective_target` is the raw target
+    // (byte-identical).
+    let is_multiclass = matches!(
+        params.loss,
+        Loss::MultiClass | Loss::MultiClassOneVsAll
+    );
+    let class_to_label: Vec<f64> = if is_multiclass {
+        build_class_remap(target)
+    } else {
+        Vec::new()
+    };
+    let remapped_target: Option<Vec<f64>> = if is_multiclass {
+        Some(remap_target_to_class(target, &class_to_label)?)
+    } else {
+        None
+    };
+    // The target the boosting loop trains on: the remapped class index for
+    // multiclass, else the raw target (unchanged for every scalar / binary loss).
+    let target: &[f64] = remapped_target.as_deref().unwrap_or(target);
+
     let bias = starting_approx(params, target);
     let mut approx = vec![bias; approx_dimension * n];
 
@@ -1831,27 +2033,55 @@ fn train_inner<R: Runtime>(
         //    in leaf order (unchanged). The leaf_value leaf_of partition is shared
         //    across dimensions (the oblivious structure is one tree).
         let mut leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
-        for d in 0..approx_dimension {
-            let base = d * n;
-            // Per-dimension slices (length `n`). At dim=1 `base == 0` so these are
-            // the whole buffers — byte-identical to the pre-6.2 scalar call.
-            let der1_d = weighted_der1.get(base..base + n).unwrap_or(&[]);
-            let der2_d = ders.der2.get(base..base + n).unwrap_or(&[]);
-            let approx_d = approx.get(base..base + n).unwrap_or(&[]);
-            let leaf_deltas = compute_leaf_deltas(
-                params.leaf_method,
-                &params.loss,
+        if matches!(params.loss, Loss::MultiClass) {
+            // MultiClass softmax: the COUPLED per-leaf symmetric Newton solve over
+            // ALL dimensions at once (`ders.der2` is the PER-OBJECT packed Hessian
+            // of length `n * k*(k+1)/2`, NOT the diagonal `der2[d*n+i]` layout).
+            // Produces the dimension-major leaf deltas; scaled by learning_rate
+            // into the same `leaf_values[d*n_leaves + leaf]` layout the diagonal
+            // path emits.
+            let deltas = compute_softmax_leaf_deltas(
                 &leaf_value_leaf_of,
-                der1_d,
-                der2_d,
+                &weighted_der1,
+                &ders.der2,
                 &weights,
-                approx_d,
-                target,
                 scaled_l2,
                 n_leaves,
+                approx_dimension,
+                n,
             );
-            for delta in &leaf_deltas {
+            for delta in &deltas {
                 leaf_values.push(learning_rate * delta);
+            }
+        } else {
+            // Diagonal / separable losses (every scalar loss AND MultiClassOneVsAll):
+            // solve each output dimension INDEPENDENTLY over its own approx/der slice
+            // `[d*n .. d*n+n]`, reusing the EXISTING per-dimension scalar solver. The
+            // per-dimension reduction is an OUTER `for d` loop (NEVER fused) so at
+            // `approx_dimension == 1` the slices are exactly today's full-`n` buffers
+            // and the `cb_core::sum_f64` summation order is byte-identical (Pitfall 1).
+            // MultiClassOneVsAll's diagonal Newton step equals the scalar Logloss
+            // Newton arm per dimension.
+            for d in 0..approx_dimension {
+                let base = d * n;
+                let der1_d = weighted_der1.get(base..base + n).unwrap_or(&[]);
+                let der2_d = ders.der2.get(base..base + n).unwrap_or(&[]);
+                let approx_d = approx.get(base..base + n).unwrap_or(&[]);
+                let leaf_deltas = compute_leaf_deltas(
+                    params.leaf_method,
+                    &params.loss,
+                    &leaf_value_leaf_of,
+                    der1_d,
+                    der2_d,
+                    &weights,
+                    approx_d,
+                    target,
+                    scaled_l2,
+                    n_leaves,
+                );
+                for delta in &leaf_deltas {
+                    leaf_values.push(learning_rate * delta);
+                }
             }
         }
 
@@ -2054,6 +2284,7 @@ fn train_inner<R: Runtime>(
             oblivious_trees: trees,
             bias,
             approx_dimension,
+            class_to_label,
         },
         baked,
     ))

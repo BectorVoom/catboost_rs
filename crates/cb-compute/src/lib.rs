@@ -29,14 +29,15 @@ pub use histogram::{
 };
 pub use leaf::{
     calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
-    newton_leaf_delta, scale_l2_reg, simple_leaf_delta, LeafMethod,
+    newton_leaf_delta, scale_l2_reg, simple_leaf_delta, solve_symmetric_newton, LeafMethod,
 };
 pub use loss::{
-    cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
-    huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
-    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, quantile_der1,
-    quantile_der2, rmse_der1, rmse_der2, sigmoid, tweedie_der1, tweedie_der2, FOCAL_P_MIN,
-    QUANTILE_ALPHA, QUANTILE_DELTA,
+    calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,
+    focal_der1, focal_der2, huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1,
+    logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
+    multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1, quantile_der2, rmse_der1,
+    rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2, FOCAL_P_MIN, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
 };
 pub use runtime::{
     Derivatives, EScoreFunction, Float, Loss, Runtime, EXPECTILE_ALPHA_DEFAULT,

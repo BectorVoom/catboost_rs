@@ -166,6 +166,33 @@ pub enum Loss {
     /// (Pitfall 5) — upstream default leaf method is Gradient
     /// (`catboost_options.cpp:113-124`), which the fixture pins.
     Mape,
+    /// MultiClass (softmax multiclass classification, D-6.2-04 / LOSS-02): the ONLY
+    /// cross-dimension-COUPLED loss this phase. Over one object's `k`-dimensional
+    /// raw approx, `p = softmax(approx)` (max-subtracted, `eval_processing.h:18`);
+    /// `der1[d] = δ(d == target_class) - p[d]`; the second derivative is a PACKED
+    /// symmetric Hessian (`der2[(y,y)] = p_y*(p_y-1)`, `der2[(y,x)] = p_y*p_x`,
+    /// `error_functions.h:687-728`). The leaf delta is a dense symmetric Newton
+    /// solve per leaf (`hessian.cpp:22-52`,
+    /// [`crate::solve_symmetric_newton`]) — NOT a per-dimension scalar step.
+    ///
+    /// `approx_dimension` = the distinct class count `max(k, 2)` derived from the
+    /// target (`approx_dimension.cpp:24-27`); the training target is the REMAPPED
+    /// contiguous class index `[0, k)` (Pitfall 4). No params on the variant (the
+    /// class count is target-derived, not stored). Upstream default leaf method is
+    /// Newton with 1 iteration (Pitfall 2); fixtures pin `leaf_estimation_iterations:1`.
+    MultiClass,
+    /// MultiClassOneVsAll (multiclass classification, D-6.2-04 / LOSS-02): a
+    /// SEPARABLE (per-dimension diagonal) multiclass loss — each dimension is an
+    /// independent binary one-vs-rest sigmoid, so it reuses the scalar
+    /// Newton/Logloss leaf math per dimension (no dense solve). Over one object's
+    /// dimension `d`: `p = sigmoid(approx_d)`; `der1 = δ(d == target_class) - p`;
+    /// `der2 = -p*(1 - p)` (`error_functions.h:746-779`).
+    ///
+    /// `approx_dimension` = the distinct class count `max(k, 2)`; the training
+    /// target is the REMAPPED contiguous class index `[0, k)`. Upstream default
+    /// leaf method is Newton with 1 iteration (Pitfall 2). Predictions are per-dim
+    /// sigmoid probabilities (which do NOT sum to 1, unlike softmax) + argmax class.
+    MultiClassOneVsAll,
 }
 
 /// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
@@ -241,6 +268,11 @@ impl Loss {
                     )));
                 }
             }
+            // MultiClass / MultiClassOneVsAll carry NO hyperparameters on the
+            // variant (the class count is derived from the target, D-6.2-04). The
+            // class-index range check (T-6.2-01) is enforced at training time
+            // against the REMAPPED `[0, k)` index — `Loss::validate` has no target
+            // in scope, so there is nothing to reject here.
             Self::Rmse
             | Self::Logloss
             | Self::CrossEntropy
@@ -248,7 +280,9 @@ impl Loss {
             | Self::Mae
             | Self::LogCosh
             | Self::Poisson
-            | Self::Mape => {}
+            | Self::Mape
+            | Self::MultiClass
+            | Self::MultiClassOneVsAll => {}
         }
         Ok(())
     }

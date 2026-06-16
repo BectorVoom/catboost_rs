@@ -408,3 +408,115 @@ pub fn mape_der1(approx: f64, target: f64) -> f64 {
 pub fn mape_der2(_approx: f64, _target: f64) -> f64 {
     0.0
 }
+
+/// The softmax `p[d] = exp(approx[d] - maxApprox) / Σ_d exp(approx[d] - maxApprox)`
+/// over one object's per-dimension raw approx, reproducing upstream `CalcSoftmax`
+/// (`eval_processing.h:15-26`) with the MAX-SUBTRACTION before `exp` (T-6.2-02 NaN
+/// guard — a large approx magnitude cannot overflow `exp` to `Inf`/`NaN`).
+///
+/// `eval_processing.h:16` — `maxApprox = *MaxElement(approx)`; `:18` —
+/// `softmax[d] = approx[d] - maxApprox`; FastExp; normalize by the sum. Uses
+/// `f64::exp` (the oracle absorbs the upstream `FastExpWithInfInplace` table gap,
+/// A2 — the established 6.1 precedent). Returns the normalized probabilities in
+/// dimension order. An empty input returns an empty vector; an all-equal input
+/// returns the uniform distribution.
+#[must_use]
+pub fn calc_softmax(approx: &[f64]) -> Vec<f64> {
+    if approx.is_empty() {
+        return Vec::new();
+    }
+    // maxApprox = MaxElement(approx) (eval_processing.h:16). `fold` over a copied
+    // start avoids `partial_cmp().unwrap()` on NaN; the approx is finite here.
+    let mut max_approx = f64::NEG_INFINITY;
+    for &a in approx {
+        if a > max_approx {
+            max_approx = a;
+        }
+    }
+    // exp(approx[d] - maxApprox) (eval_processing.h:18-20); f64::exp (A2).
+    let exps: Vec<f64> = approx.iter().map(|&a| (a - max_approx).exp()).collect();
+    // sumExpApprox = Σ exps (eval_processing.h:21-24). The k summands (k <= ~10
+    // classes in scope) are summed left-to-right matching upstream's scalar loop;
+    // this is a per-object normalizer, NOT a parity-critical histogram/leaf SUM, so
+    // it does not route through `cb_core::sum_f64` (which is reserved for the
+    // ordered cross-object reductions, D-08).
+    let mut sum_exp = 0.0_f64;
+    for &e in &exps {
+        sum_exp += e;
+    }
+    exps.iter().map(|&e| e / sum_exp).collect()
+}
+
+/// The MultiClass softmax coupled first derivative + packed symmetric Hessian for
+/// one object (`error_functions.h:687-728` `TMultiClassError::CalcDersMulti`),
+/// transcribed verbatim.
+///
+/// Given the object's per-dimension raw `approx` (length `k`) and its REMAPPED
+/// contiguous class index `target_class ∈ [0, k)` (Pitfall 4 — the raw label MUST
+/// be remapped before this call), returns:
+/// - `der1[d] = δ(d == target_class) - p[d]` with `p = calc_softmax(approx)`
+///   (max-subtracted), and
+/// - `der2` = the PACKED lower-triangular (== row-major upper-triangular, the
+///   matrix is symmetric) Hessian of length `k*(k+1)/2`, ordered
+///   `[(0,0),(0,1),…,(0,k-1),(1,1),(1,2),…,(k-1,k-1)]`: diagonal `(y,y)` entry is
+///   `p_y*(p_y - 1)`, off-diagonal `(y,x>y)` entry is `p_y*p_x`
+///   (`error_functions.h:704-712`).
+///
+/// This is the ONLY cross-dimension-coupled der this phase: the off-diagonal
+/// Hessian entries couple dimensions, so the leaf delta is a dense symmetric solve
+/// (`crate::solve_symmetric_newton`), not a per-dimension scalar Newton step.
+///
+/// The unweighted form is returned (`weight == 1`); the caller folds the per-object
+/// weight in afterward (the `error_functions.h:716-726` `weight != 1` branch), the
+/// same convention as the scalar `*_der1` helpers.
+///
+/// # Panics
+/// Does not panic. An out-of-range `target_class` (`>= k`) leaves `der1` unchanged
+/// at `-p[d]` for every dimension (no `+1`), so the caller's range validation
+/// (T-6.2-01, `Loss::validate` / boosting gate) is the defense; this helper never
+/// indexes out of bounds.
+#[must_use]
+pub fn softmax_ders(approx: &[f64], target_class: usize) -> (Vec<f64>, Vec<f64>) {
+    let k = approx.len();
+    let p = calc_softmax(approx);
+    // Packed symmetric Hessian (error_functions.h:704-712): diag p_y*(p_y-1),
+    // off-diag p_y*p_x, in `idx++` row-major-upper order.
+    let mut der2 = Vec::with_capacity(k * (k + 1) / 2);
+    for dim_y in 0..k {
+        let p_y = p.get(dim_y).copied().unwrap_or(0.0);
+        der2.push(p_y * (p_y - 1.0));
+        for dim_x in (dim_y + 1)..k {
+            let p_x = p.get(dim_x).copied().unwrap_or(0.0);
+            der2.push(p_y * p_x);
+        }
+    }
+    // der1[d] = -p[d], then der1[target_class] += 1 (error_functions.h:714-717).
+    let mut der1: Vec<f64> = p.iter().map(|&pd| -pd).collect();
+    if let Some(slot) = der1.get_mut(target_class) {
+        *slot += 1.0;
+    }
+    (der1, der2)
+}
+
+/// The MultiClassOneVsAll per-dimension diagonal der for one object and one
+/// dimension `d` (`error_functions.h:746-779` `TMultiClassOneVsAllError`),
+/// transcribed verbatim — separable, so this is a SCALAR pair per dimension (no
+/// cross-dimension coupling).
+///
+/// With `p = sigmoid(approx_d)` (the per-dimension positive-class probability,
+/// `error_functions.h:758-759` — the SAME upstream sigmoid arithmetic as
+/// [`sigmoid`]):
+/// - `der1 = δ(d == target_class) - p` (`:760-762`), and
+/// - `der2 = -p*(1 - p)` (`:763`, the diagonal Hessian entry).
+///
+/// `is_target` is `d == target_class`. Because the Hessian is diagonal, the leaf
+/// delta is the EXISTING scalar Newton step per dimension
+/// (`crate::newton_leaf_delta`), identical to the binary Logloss path — no dense
+/// solve. Returns `(der1, der2)` unweighted (the caller folds in the weight).
+#[must_use]
+pub fn multiclass_onevsall_ders(approx_d: f64, is_target: bool) -> (f64, f64) {
+    let p = sigmoid(approx_d);
+    let der1 = if is_target { 1.0 - p } else { -p };
+    let der2 = -p * (1.0 - p);
+    (der1, der2)
+}
