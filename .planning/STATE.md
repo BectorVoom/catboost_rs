@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 6.2 context gathered
-last_updated: "2026-06-16T08:56:07.568Z"
-last_activity: 2026-06-16 -- Phase 06.2 execution started
+stopped_at: Completed 06.2-03-PLAN.md
+last_updated: "2026-06-16T10:00:00.000Z"
+last_activity: 2026-06-16 -- Phase 06.2 Plan 03 (Wave-1 MultiClass/OneVsAll, LOSS-02) COMPLETE
 progress:
   total_phases: 14
   completed_phases: 6
   total_plans: 49
-  completed_plans: 45
-  percent: 44
+  completed_plans: 46
+  percent: 45
 ---
 
 # Project State
@@ -26,17 +26,17 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.2 (multiclass-multilabel-and-n-dim-approx-refactor) — EXECUTING
-Plan: 2 of 5 — 06.2-02 COMPLETE (Wave 0 CLOSED; next: 06.2-03 Wave-1 MultiClass/OneVsAll + multi-dim split-score)
-Status: Plan 06.2-02 complete — train/model-tier N-dim refactor + D-04 HARD CHECKPOINT GREEN (dim-major approx[d*n+i] boosting loop; leaf-major cb-model serialization; ndim_dim1_identity_test == 0.0; FULL scalar oracle suite re-locked at dim=1). wave_0_complete: true.
-Last activity: 2026-06-16 -- Phase 06.2 Plan 02 (Wave-0 train/model tier + D-04 re-lock) COMPLETE
+Plan: 3 of 5 — 06.2-03 COMPLETE (Wave 1 MultiClass/OneVsAll closed; next: 06.2-04 Wave-2 MultiLogloss/MultiCrossEntropy)
+Status: Plan 06.2-03 complete — Loss::MultiClass (softmax, packed symmetric Hessian + hand-rolled per-leaf SPD Newton solve, hessian.cpp:22-52, NO new crate) + Loss::MultiClassOneVsAll (separable diagonal); multi-dim single-shared-accumulator split-score (Cosine couples inside sqrt; dim=1 BIT-identical); class [0,k) remap; softmax/sigmoid predict transforms; two frozen fixtures; per-stage oracle (Splits/LeafValues/StagedApprox/Predictions) <=1e-5 for BOTH losses; D-04 scalar suite still green. LOSS-02 MultiClass+OneVsAll members closed.
+Last activity: 2026-06-16 -- Phase 06.2 Plan 03 (Wave-1 MultiClass/OneVsAll, LOSS-02) COMPLETE
 
-Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 top-level phases complete)
+Progress: [##########] 60% of Phase 6.2 plans (3 of 5 plans complete; 5 of 8 top-level phases complete)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 9
+- Total plans completed: 10
 - Average duration: — min
 - Total execution time: 0.0 hours
 
