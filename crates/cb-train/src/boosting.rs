@@ -677,7 +677,10 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         | Loss::MultiClass
         | Loss::MultiClassOneVsAll
         | Loss::MultiLogloss
-        | Loss::MultiCrossEntropy => TargetType::Unknown,
+        | Loss::MultiCrossEntropy
+        // MultiQuantile (Wave 3) is not in the upstream auto-LR coefficient table
+        // -> Unknown (no rate guessed); the fixture pins an explicit learning_rate.
+        | Loss::MultiQuantile { .. } => TargetType::Unknown,
     }
 }
 
@@ -705,6 +708,11 @@ fn loss_approx_dimension(loss: &Loss, target: &[f64]) -> usize {
             let map = build_class_remap(target);
             map.len().max(2)
         }
+        // MultiQuantile (Wave 3, D-6.2-05): `approx_dimension` = the number of
+        // quantiles, `alpha.len()` (`approx_dimension.cpp:17-19`
+        // `GetAlphaMultiQuantile(params).size()`). Each dimension is an independent
+        // quantile at its own `alpha[d]`.
+        Loss::MultiQuantile { alpha, .. } => alpha.len(),
         // Every scalar regression / binary loss is single-output.
         _ => 1,
     }
@@ -783,12 +791,25 @@ fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
     if matches!(method, LeafMethod::Exact)
         && !matches!(
             loss,
-            Loss::LogCosh | Loss::Mae | Loss::Quantile { .. }
+            Loss::LogCosh | Loss::Mae | Loss::Quantile { .. } | Loss::MultiQuantile { .. }
         )
     {
         return Err(CbError::OutOfRange(format!(
             "LeafMethod::Exact has no defined optimizer for {loss:?}; \
-             Exact is supported only for LogCosh, Mae, and Quantile"
+             Exact is supported only for LogCosh, Mae, Quantile, and MultiQuantile"
+        )));
+    }
+    // MultiQuantile (Wave 3, D-6.2-05 / Pitfall 3) is gated to Exact: the upstream
+    // single-host-CPU default leaf method is the `useExact` override
+    // (`catboost_options.cpp:289-301`). Each dimension reuses the weighted-alpha[d]-
+    // quantile Exact leaf; der2 = 0 per dimension, so Newton/Gradient/Simple have no
+    // defined optimizer here. Reject any non-Exact method up front rather than
+    // silently producing a wrong leaf value.
+    if matches!(loss, Loss::MultiQuantile { .. }) && !matches!(method, LeafMethod::Exact) {
+        return Err(CbError::OutOfRange(format!(
+            "MultiQuantile requires LeafMethod::Exact (the upstream single-host CPU \
+             default, weighted alpha-quantile per dimension); {method:?} has no \
+             defined MultiQuantile leaf optimizer (der2 = 0)"
         )));
     }
     // MultiClass / MultiClassOneVsAll are gated to Newton (WR-01 / Pitfall 2 —
@@ -856,6 +877,11 @@ fn compute_leaf_deltas(
     target: &[f64],
     scaled_l2: f64,
     n_leaves: usize,
+    // The output dimension index `d` this leaf solve is for (the per-`d` outer loop
+    // index). For the scalar losses this is always `0`; for MultiQuantile the Exact
+    // arm reads this dimension's quantile level `alpha[dim_index]` (D-6.2-05). Every
+    // other loss ignores it.
+    dim_index: usize,
 ) -> Vec<f64> {
     match method {
         LeafMethod::Gradient => {
@@ -908,17 +934,27 @@ fn compute_leaf_deltas(
             // prior hardcoded behavior, so MAE Exact stays byte-identical); any
             // other Exact-eligible loss keeps the default median. `exact_leaf_delta`
             // (leaf.rs) is ALREADY alpha-general — UNCHANGED.
-            let (quantile_alpha, quantile_delta) = match *loss {
-                Loss::Quantile { alpha, delta } => (alpha, delta),
+            //   - MultiQuantile -> the weighted alpha[dim_index]-quantile of THIS
+            //     dimension's leaf residuals (D-6.2-05; K independent quantile dims,
+            //     each with its own alpha[d], shared delta). `exact_leaf_delta` is
+            //     reused VERBATIM per dimension (leaf.rs UNCHANGED).
+            let (quantile_alpha, quantile_delta) = match loss {
+                Loss::Quantile { alpha, delta } => (*alpha, *delta),
+                // MultiQuantile: thread THIS dimension's alpha (alpha[dim_index]) and
+                // the shared delta into the SAME Exact weighted-quantile leaf. A
+                // missing index (defensive) falls back to the median anchor.
+                Loss::MultiQuantile { alpha, delta } => {
+                    (alpha.get(dim_index).copied().unwrap_or(QUANTILE_ALPHA), *delta)
+                }
                 _ => (QUANTILE_ALPHA, QUANTILE_DELTA),
             };
             members
                 .iter()
-                .map(|(r, w)| match *loss {
+                .map(|(r, w)| match loss {
                     Loss::LogCosh => logcosh_exact_leaf_delta(r, w),
-                    // MAE / Quantile (and any other Exact-eligible loss for this
-                    // wave) uses the weighted sample quantile at the threaded
-                    // (alpha, delta).
+                    // MAE / Quantile / MultiQuantile (and any other Exact-eligible
+                    // loss for this wave) uses the weighted sample quantile at the
+                    // threaded (alpha, delta) — for MultiQuantile, alpha[dim_index].
                     _ => exact_leaf_delta(r, w, quantile_alpha, quantile_delta),
                 })
                 .collect()
@@ -2156,6 +2192,7 @@ fn train_inner<R: Runtime>(
                     target,
                     scaled_l2,
                     n_leaves,
+                    d,
                 );
                 for delta in &leaf_deltas {
                     leaf_values.push(learning_rate * delta);

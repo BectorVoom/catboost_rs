@@ -22,6 +22,12 @@ use super::compute_leaf_deltas;
 /// return the single leaf delta. `der2`/`weighted_der1` are unused by the Exact
 /// branch (it works off the residuals), so they are filled trivially.
 fn exact_single_leaf(loss: Loss, residuals: &[f64]) -> f64 {
+    exact_single_leaf_dim(loss, residuals, 0)
+}
+
+/// As [`exact_single_leaf`] but for a specific output dimension index `dim_index`
+/// (the MultiQuantile per-dimension `alpha[dim_index]` selector).
+fn exact_single_leaf_dim(loss: Loss, residuals: &[f64], dim_index: usize) -> f64 {
     let n = residuals.len();
     let leaf_of = vec![0_usize; n]; // every object in leaf 0.
     let weighted_der1 = vec![0.0_f64; n];
@@ -41,6 +47,7 @@ fn exact_single_leaf(loss: Loss, residuals: &[f64]) -> f64 {
         &target,
         /* scaled_l2 */ 0.0,
         /* n_leaves */ 1,
+        dim_index,
     );
     assert_eq!(deltas.len(), 1);
     deltas[0]
@@ -95,5 +102,69 @@ fn quantile_alpha05_equals_mae_exact_leaf() {
     assert_eq!(
         mae_delta, q05_delta,
         "MAE Exact leaf must equal Quantile{{0.5}} Exact leaf (byte-stable)"
+    );
+}
+
+#[test]
+fn multiquantile_threads_per_dimension_alpha() {
+    // MultiQuantile (D-6.2-05): the Exact leaf for dimension `d` must thread
+    // alpha[d] (each dimension is an independent quantile). With alpha=[0.3,0.7],
+    // dimension 0 takes the weighted 0.3-quantile and dimension 1 the weighted
+    // 0.7-quantile of the SAME residuals — DISTINCT values. A regression that used
+    // a single fixed alpha (or alpha[0] for every dim) flips dimension 1.
+    let residuals = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
+    let delta = QUANTILE_DELTA;
+    let alpha = vec![0.3_f64, 0.7];
+
+    let d0 = exact_single_leaf_dim(
+        Loss::MultiQuantile {
+            alpha: alpha.clone(),
+            delta,
+        },
+        &residuals,
+        0,
+    );
+    let d1 = exact_single_leaf_dim(
+        Loss::MultiQuantile {
+            alpha: alpha.clone(),
+            delta,
+        },
+        &residuals,
+        1,
+    );
+
+    // Each dimension must equal the alpha-general exact_leaf_delta at its own alpha.
+    let residuals_f32: Vec<f32> = residuals.iter().map(|&r| r as f32).collect();
+    let weights = vec![1.0_f64; residuals.len()];
+    let expected_d0 = exact_leaf_delta(&residuals_f32, &weights, 0.3, delta);
+    let expected_d1 = exact_leaf_delta(&residuals_f32, &weights, 0.7, delta);
+    assert!((d0 - expected_d0).abs() < 1e-12, "dim 0 must thread alpha[0]=0.3");
+    assert!((d1 - expected_d1).abs() < 1e-12, "dim 1 must thread alpha[1]=0.7");
+    assert!(
+        (d0 - d1).abs() > 0.5,
+        "the two quantile levels must produce distinct leaf deltas (got d0={d0}, d1={d1})"
+    );
+}
+
+#[test]
+fn multiquantile_alpha07_dimension_equals_scalar_quantile07_leaf() {
+    // The degenerate-equivalence anchor at the leaf level (D-6.2-05): a
+    // MultiQuantile dimension at alpha=0.7 must produce the SAME Exact leaf delta as
+    // the scalar Quantile{0.7} path (leaf.rs reused verbatim per dimension).
+    let residuals = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
+    let delta = QUANTILE_DELTA;
+
+    let mq = exact_single_leaf_dim(
+        Loss::MultiQuantile {
+            alpha: vec![0.7],
+            delta,
+        },
+        &residuals,
+        0,
+    );
+    let scalar = exact_single_leaf(Loss::Quantile { alpha: 0.7, delta }, &residuals);
+    assert_eq!(
+        mq, scalar,
+        "MultiQuantile{{[0.7]}} dimension-0 leaf must equal scalar Quantile{{0.7}} leaf"
     );
 }

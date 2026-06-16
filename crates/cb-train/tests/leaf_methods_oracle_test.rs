@@ -96,7 +96,8 @@ fn train_scenario(
         | Loss::MultiClass
         | Loss::MultiClassOneVsAll
         | Loss::MultiLogloss
-        | Loss::MultiCrossEntropy => load_regression_target(),
+        | Loss::MultiCrossEntropy
+        | Loss::MultiQuantile { .. } => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

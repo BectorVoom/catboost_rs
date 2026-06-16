@@ -424,3 +424,110 @@ fn ndim_shape_mismatch_is_error_not_panic() {
         .compute_gradients(&Loss::Rmse, &approx4, &target3, 2)
         .is_err());
 }
+
+/// MultiQuantile (Wave 3, D-6.2-05): K INDEPENDENT quantile dimensions. The
+/// backend der for each dimension `d` must equal the scalar `quantile_der1`
+/// applied per dimension with THAT dimension's level `alpha[d]` (the shared
+/// `delta`), and `der2` must be the constant `0` across every dimension
+/// (QUANTILE_DER2 = 0 -> Exact leaf). The target stays PER-OBJECT length `n`.
+#[test]
+fn multiquantile_der_equals_per_dimension_quantile_der_and_der2_zero() {
+    let n = 4;
+    let dim = 3;
+    // Distinct per-dimension approx blocks (dim-major); one shared per-object target.
+    let approx: Vec<f64> = vec![
+        // d=0
+        0.0, 1.0, -2.0, 3.0, //
+        // d=1
+        0.5, -0.5, 2.5, -3.5, //
+        // d=2
+        1.5, -1.5, 0.25, -0.25,
+    ];
+    let target = [1.0, 0.0, 2.0, -3.0];
+    let alpha = vec![0.1, 0.5, 0.9];
+    let delta = 1e-6_f64;
+    assert_eq!(approx.len(), dim * n);
+
+    let nd = CpuBackend
+        .compute_gradients(
+            &Loss::MultiQuantile {
+                alpha: alpha.clone(),
+                delta,
+            },
+            &approx,
+            &target,
+            dim,
+        )
+        .unwrap();
+    assert_eq!(nd.der1.len(), dim * n);
+    assert_eq!(nd.der2.len(), dim * n);
+
+    // Host reference: the scalar quantile_der1 per dimension at alpha[d].
+    let quantile_der1 = |a: f64, t: f64, alpha: f64, delta: f64| -> f64 {
+        let val = t - a;
+        if val.abs() < delta {
+            0.0
+        } else if val > 0.0 {
+            alpha
+        } else {
+            -(1.0 - alpha)
+        }
+    };
+    for d in 0..dim {
+        for i in 0..n {
+            let idx = d * n + i;
+            let want1 = quantile_der1(approx[idx], target[i], alpha[d], delta);
+            assert!((nd.der1[idx] - want1).abs() <= 1e-12, "der1 d={d} i={i}");
+            // der2 = 0 across every dimension.
+            assert_eq!(nd.der2[idx], 0.0, "der2 must be 0 at d={d} i={i}");
+        }
+    }
+}
+
+/// MultiQuantile at `dim == 1` with `alpha = [a]` is byte-identical to the scalar
+/// `Loss::Quantile { alpha: a, delta }` backend path (the degenerate-equivalence
+/// anchor at the gradient level — D-6.2-05).
+#[test]
+fn multiquantile_dim1_equals_scalar_quantile() {
+    let approx = [0.0_f64, 1.0, -2.0, 3.0, 0.5];
+    let target = [1.0_f64, 0.0, 2.0, -3.0, 0.5];
+    let alpha = 0.7_f64;
+    let delta = 1e-6_f64;
+
+    let mq = CpuBackend
+        .compute_gradients(
+            &Loss::MultiQuantile {
+                alpha: vec![alpha],
+                delta,
+            },
+            &approx,
+            &target,
+            1,
+        )
+        .unwrap();
+    let scalar = CpuBackend
+        .compute_gradients(&Loss::Quantile { alpha, delta }, &approx, &target, 1)
+        .unwrap();
+    assert_eq!(mq.der1, scalar.der1, "der1 must be byte-identical at dim=1");
+    assert_eq!(mq.der2, scalar.der2, "der2 must be byte-identical at dim=1");
+}
+
+/// MultiQuantile shape validation: `alpha.len()` must equal `approx_dimension`
+/// (the backend rejects a mismatch with a typed `CbError`, no panic).
+#[test]
+fn multiquantile_alpha_dim_mismatch_is_error_not_panic() {
+    let approx = [0.0_f64, 1.0, 2.0, 3.0]; // dim=2, n=2
+    let target = [0.0_f64, 1.0];
+    // alpha.len()=3 != approx_dimension=2.
+    assert!(CpuBackend
+        .compute_gradients(
+            &Loss::MultiQuantile {
+                alpha: vec![0.1, 0.5, 0.9],
+                delta: 1e-6,
+            },
+            &approx,
+            &target,
+            2,
+        )
+        .is_err());
+}

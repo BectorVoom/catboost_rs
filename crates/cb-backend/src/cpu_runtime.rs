@@ -566,6 +566,17 @@ fn compute_gradients_one_dim(
              single-dimension scalar path"
                 .to_owned(),
         )),
+        // MultiQuantile (Wave 3) is a multi-output loss whose der needs the
+        // per-dimension `alpha[d]` (each dimension is an independent quantile at
+        // its own level). It is dispatched in `compute_gradients` BEFORE this
+        // single-dimension scalar loop (which has no `alpha` slice in scope), so
+        // reject it defensively rather than silently producing a wrong gradient
+        // (typed CbError, no `unwrap`/panic).
+        Loss::MultiQuantile { .. } => Err(CbError::Degenerate(
+            "MultiQuantile is dispatched in compute_gradients (per-dimension \
+             alpha[d]), not the single-dimension scalar path"
+                .to_owned(),
+        )),
     }
 }
 
@@ -669,6 +680,45 @@ fn compute_onevsall_gradients(approx: &[f64], target: &[f64], k: usize, n: usize
     (der1, der2)
 }
 
+/// Compute the MultiQuantile SEPARABLE per-dimension der1/der2 over the
+/// dimension-major `approx` buffer (D-6.2-05). MultiQuantile is `K` INDEPENDENT
+/// [`Loss::Quantile`] dimensions: each dimension `d` reuses the SAME parametric
+/// quantile gradient kernel ([`launch_quantile_f64`], the scalar `Loss::Quantile`
+/// arm above) over the dim-major slice `approx[d*n .. d*n+n]` with its OWN level
+/// `alpha[d]` and the shared `delta`; `der2 = 0` per dimension (the Mae/Quantile
+/// precedent — Exact leaf, no hessian).
+///
+/// The `target` stays PER-OBJECT length `n` (every dimension predicts a quantile
+/// of the SAME scalar target), so each per-dimension launch passes the full
+/// `target`. Both outputs are dimension-major length `dim*n` (`buf[d*n + i]`).
+/// At `dim == 1` with `alpha = [a]` this is byte-identical to the scalar
+/// `Loss::Quantile { alpha: a, delta }` path (the degenerate-equivalence anchor).
+fn compute_multiquantile_gradients(
+    approx: &[f64],
+    target: &[f64],
+    alpha: &[f64],
+    delta: f64,
+    dim: usize,
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut der1 = Vec::with_capacity(dim * n);
+    // der2 = 0 across every dimension (QUANTILE_DER2 = 0 -> Exact leaf).
+    let der2 = vec![0.0_f64; dim * n];
+    for d in 0..dim {
+        let approx_d = approx.get(d * n..d * n + n).unwrap_or(&[]);
+        let alpha_d = alpha.get(d).copied().unwrap_or(QUANTILE_ALPHA);
+        // Reuse the parametric quantile kernel VERBATIM per dimension with this
+        // dimension's alpha (the Loss::Quantile launcher). On a launch failure,
+        // fall back to the constant-0 gradient for that dimension rather than
+        // panicking (the empty-input guard already short-circuits dim*n == 0).
+        match launch_quantile_f64(approx_d, target, alpha_d, delta) {
+            Ok(der1_d) => der1.extend_from_slice(&der1_d),
+            Err(_) => der1.extend(std::iter::repeat(0.0_f64).take(n)),
+        }
+    }
+    (der1, der2)
+}
+
 impl Runtime for CpuBackend {
     fn compute_gradients(
         &self,
@@ -749,6 +799,23 @@ impl Runtime for CpuBackend {
             }
             Loss::MultiClassOneVsAll => {
                 let (der1, der2) = compute_onevsall_gradients(approx, target, approx_dimension, n);
+                return Ok(Derivatives { der1, der2 });
+            }
+            // MultiQuantile (Wave 3, D-6.2-05): K INDEPENDENT quantile dimensions.
+            // SEPARABLE — each dimension `d` reuses the scalar quantile der with its
+            // OWN `alpha[d]` (the shared `delta`), `der2 = 0`. The target stays
+            // PER-OBJECT length `n` (every dimension predicts a quantile of the SAME
+            // scalar target), unlike the dim-major target of the multilabel losses.
+            Loss::MultiQuantile { alpha, delta } => {
+                if alpha.len() != approx_dimension {
+                    return Err(CbError::LengthMismatch {
+                        column: "MultiQuantile alpha".to_owned(),
+                        expected: approx_dimension,
+                        actual: alpha.len(),
+                    });
+                }
+                let (der1, der2) =
+                    compute_multiquantile_gradients(approx, target, alpha, *delta, approx_dimension, n);
                 return Ok(Derivatives { der1, der2 });
             }
             _ => {}

@@ -223,6 +223,39 @@ pub enum Loss {
     /// default leaf method is Newton with `leaf_estimation_iterations:10`; fixtures
     /// pin it to 1 (Pitfall 2). Predictions are per-dim sigmoid probabilities.
     MultiCrossEntropy,
+    /// MultiQuantile (multi-output robust regression, D-6.2-05 / LOSS-03): `K`
+    /// INDEPENDENT [`Loss::Quantile`] dimensions — each dimension `d` is a
+    /// standalone quantile at its own level `alpha[d]`, sharing the deadzone
+    /// `delta`. Fully SEPARABLE (no cross-dimension coupling): each dimension
+    /// reuses the scalar [`crate::quantile_der1`] der VERBATIM
+    /// (`der1[d*n+i] = (|target_i - approx[d*n+i]| < delta) ? 0 : (arg > 0 ?
+    /// alpha[d] : -(1 - alpha[d]))`, `der2 = 0`; `error_functions.cpp:453-478`
+    /// `CalcDersMulti`) AND the 6.1 Exact weighted-`alpha`-quantile leaf path
+    /// ([`crate::exact_leaf_delta`], already `alpha`-general — D-6.1-05) with the
+    /// dimension's own `alpha[d]`. NO new der/leaf math.
+    ///
+    /// `approx_dimension` = `alpha.len()` (`approx_dimension.cpp:17-19`
+    /// `GetAlphaMultiQuantile(params).size()`). The training target stays
+    /// PER-OBJECT length `n` (every dimension predicts a quantile of the SAME
+    /// scalar target, unlike the dim-major target of the multilabel losses). The
+    /// upstream single-host-CPU default leaf method is **Exact**
+    /// (`catboost_options.cpp:289-301` `useExact` override — Pitfall 3), `der2 = 0`
+    /// per dimension. Predictions are RAW (identity — the per-quantile approx; no
+    /// link transform).
+    ///
+    /// The per-quantile `alpha` is an owned `Vec<f64>` (the `Loss::Variant {
+    /// params }` pattern, D-6.1-03), which is why `Loss` dropped `Copy` in the
+    /// Wave-0 refactor. `alpha[k] ∈ [0, 1]` (each) and `delta >= 0` are validated by
+    /// [`Loss::validate`].
+    MultiQuantile {
+        /// Per-dimension quantile levels `alpha[d] ∈ [0, 1]`
+        /// (`MultiQuantile:alpha=<a0>,<a1>,...`). `approx_dimension = alpha.len()`.
+        alpha: Vec<f64>,
+        /// Shared deadzone half-width `delta >= 0` across all dimensions
+        /// (`MultiQuantile:delta=<value>`; default `1e-6`). Residuals with
+        /// `|target - approx| < delta` contribute `0` in every dimension.
+        delta: f64,
+    },
 }
 
 /// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
@@ -248,23 +281,28 @@ impl Loss {
     /// Returns [`cb_core::CbError::OutOfRange`] when a parameter is outside its
     /// admissible domain (or is non-finite).
     pub fn validate(&self) -> CbResult<()> {
-        match *self {
+        // Matched by reference (`match self`, NOT `match *self`): the
+        // `MultiQuantile { alpha: Vec<f64>, .. }` variant carries an owned,
+        // non-`Copy` `Vec<f64>`, so the place cannot be matched by value. The
+        // scalar-parameter arms bind their `f64` fields by reference (default
+        // binding modes) and dereference at use.
+        match self {
             Self::Lq { q } => {
-                if !q.is_finite() || q < 1.0 {
+                if !q.is_finite() || *q < 1.0 {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Lq exponent q must be finite and >= 1, got {q}"
                     )));
                 }
             }
             Self::Huber { delta } => {
-                if !delta.is_finite() || delta <= 0.0 {
+                if !delta.is_finite() || *delta <= 0.0 {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Huber delta must be finite and > 0, got {delta}"
                     )));
                 }
             }
             Self::Expectile { alpha } => {
-                if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                if !alpha.is_finite() || !(0.0..=1.0).contains(alpha) {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Expectile alpha must be finite and in [0, 1], got {alpha}"
                     )));
@@ -276,7 +314,7 @@ impl Loss {
             // `e^((2-p)*a)` der terms degenerate (T-06.1.02-02), so reject up front
             // with a typed CbError (no `unwrap`/`panic`).
             Self::Tweedie { variance_power } => {
-                if !variance_power.is_finite() || variance_power <= 1.0 || variance_power >= 2.0 {
+                if !variance_power.is_finite() || *variance_power <= 1.0 || *variance_power >= 2.0 {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Tweedie variance_power must be finite and in (1, 2), got {variance_power}"
                     )));
@@ -287,14 +325,41 @@ impl Loss {
             // ill-defined quantile der/leaf, so reject up front with a typed
             // CbError (no `unwrap`/`panic`).
             Self::Quantile { alpha, delta } => {
-                if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                if !alpha.is_finite() || !(0.0..=1.0).contains(alpha) {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Quantile alpha must be finite and in [0, 1], got {alpha}"
                     )));
                 }
-                if !delta.is_finite() || delta < 0.0 {
+                if !delta.is_finite() || *delta < 0.0 {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Quantile delta must be finite and >= 0, got {delta}"
+                    )));
+                }
+            }
+            // MultiQuantile (Wave 3, D-6.2-05 / LOSS-03): K INDEPENDENT Quantile
+            // dimensions, one `alpha` per dimension. The per-quantile `alpha`
+            // values are an owned `Vec<f64>` (the `Loss::Variant { params }`
+            // pattern, D-6.1-03 — this is why `Copy` was dropped on `Loss` in the
+            // Wave-0 refactor). Validate each `alpha[k]` finite ∈ `[0, 1]` and the
+            // shared `delta` finite `>= 0` (clone of the Quantile arm; T-6.2-03,
+            // typed `CbError::OutOfRange`, no panic). An empty `alpha` is rejected
+            // (`approx_dimension = alpha.len()` must be `>= 1`).
+            Self::MultiQuantile { alpha, delta } => {
+                if alpha.is_empty() {
+                    return Err(cb_core::CbError::OutOfRange(
+                        "MultiQuantile alpha must contain at least one quantile level".to_owned(),
+                    ));
+                }
+                for (k, &a) in alpha.iter().enumerate() {
+                    if !a.is_finite() || !(0.0..=1.0).contains(&a) {
+                        return Err(cb_core::CbError::OutOfRange(format!(
+                            "MultiQuantile alpha[{k}] must be finite and in [0, 1], got {a}"
+                        )));
+                    }
+                }
+                if !delta.is_finite() || *delta < 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "MultiQuantile delta must be finite and >= 0, got {delta}"
                     )));
                 }
             }

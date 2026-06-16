@@ -170,7 +170,8 @@ fn run_autolr_e2e(
         | Loss::MultiClass
         | Loss::MultiClassOneVsAll
         | Loss::MultiLogloss
-        | Loss::MultiCrossEntropy => TargetType::Unknown,
+        | Loss::MultiCrossEntropy
+        | Loss::MultiQuantile { .. } => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");
