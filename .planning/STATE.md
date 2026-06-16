@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: planning
+status: executing
 stopped_at: "Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md."
-last_updated: "2026-06-16T04:42:54.420Z"
-last_activity: "2026-06-16 -- 6.1 discuss complete: MultiQuantile→6.2, grouped family waves, Loss enum-variant params + upstream defaults, Exact leaf est for non-smooth losses"
+last_updated: "2026-06-16T05:12:29.276Z"
+last_activity: 2026-06-16 -- Phase 06.1 execution started
 progress:
-  total_phases: 8
+  total_phases: 14
   completed_phases: 5
-  total_plans: 41
-  completed_plans: 41
-  percent: 63
+  total_plans: 44
+  completed_plans: 42
+  percent: 36
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 6.1 — regression-loss-matrix (first sub-phase of the Phase 6 split)
+**Current focus:** Phase 06.1 — regression-loss-matrix
 
 ## Current Position
 
-Phase: 6.1 (regression-loss-matrix) — CONTEXT GATHERED (ready to plan)
-Plan: 0 of TBD (run /gsd-plan-phase 6.1)
-Status: 6.1 context captured (06.1-CONTEXT.md); ready for planning
-Last activity: 2026-06-16 -- 6.1 discuss complete: MultiQuantile→6.2, grouped family waves, Loss enum-variant params + upstream defaults, Exact leaf est for non-smooth losses
+Phase: 06.1 (regression-loss-matrix) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
+Last activity: 2026-06-16 -- Phase 06.1 execution started
 
 Progress: [          ] 0% (Phase 6.1 planned next; 5 of 8 top-level phases complete)
 
@@ -90,6 +90,7 @@ Progress: [          ] 0% (Phase 6.1 planned next; 5 of 8 top-level phases compl
 | Phase 05 P15 | ~70min | 2 tasks | 8 files |
 | Phase 05 P16 | ~15min | 1 tasks | 2 files |
 | Phase 05 P19 | ~95min | 5 tasks (A,T1-T5) | 32 files |
+| Phase 06.1 P01 | 19min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -179,6 +180,7 @@ Recent decisions affecting current work:
 
 - [Phase 05]: Plan 05-16 COMPLETE (GAP 1 / ORD-02 wiring-test closure; commit 9a2c974 Task1): the only failing test at HEAD, ordered_structure_differs_from_plain, RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle). CONFIRMED the load-bearing fact (boosting.rs:1054-1057 find(|f| !f.is_averaging) returns the IDENTITY Folds[0] for ALL permutation_count after 05-12), reproduced the failure (Ordered==Plain [(1,8.5),(0,1.5)]x5 on the randomness-free bootstrap=No/random_strength=0 config), so the assert_ne! divergence premise is invalidated by UPSTREAM-FAITHFUL behavior (shuffle=foldIdx!=0, fold.cpp:54), NOT a dead branch. Re-keying permutation_count cannot fix it (still consumes identity fold; an out-of-scope production fold-selection change would be needed, and the e2e oracle already locks ORD-02 <=1e-5) -> PRIMARY path (retire) taken, CONDITIONAL option (b) correctly NOT triggered. Replaced with a passing positive assertion (both Ordered+Plain grow finite 5-tree models; structures legitimately coincide) + in-file rationale delegating ORD-02 structural authority to ordered_boost_e2e_oracle_test (2/2 <=1e-5 vs catboost 1.2.10). Aliveness gates ordered_training_grows_a_full_finite_model + plain_path_still_trains UNCHANGED. Retire decision recorded in discoverable 05-DEFERRED.md (no orphan todos/). TEST-ONLY: git diff = only the wiring test; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, cargo check --tests 0 warnings. Phase 05 gap-closure complete; no failing test at HEAD.
 - [Phase 05]: Plan 05-15 COMPLETE (WR-01 / ORD-01; commits b69f5aa Task1 / f22ad0b Task2): create_folds pre-averaging GenRand now fires at idx == learning_folds (the averaging-fold position) for ALL permutation_count, replacing the first_real_shuffle flag that fired at idx==1 (correct only at pc=1). pc=1 byte-stream UNCHANGED (positions coincide). NEW catboost-1.2.10-anchored multi_permutation_fold oracle: PRIMARY pc=2 partition == catboost tree-0 leaf_weights [6,0,7,17] integer-exact (the upstream authority, since the AveragingFold permutation is not Python-API-exposed but leaf_weights ARE its partition counts — a wrong advance count fails the check). DOCUMENTED DIVERGENCE: pc=4 (production default) cb-train [6,0,8,16] != catboost [6,0,10,14]; exhaustive sweep shows no clean per-fold draw rule reproduces both the e2e-bit-exact pc=1/2 stream and pc=4, so pc=4 bit-exact needs C++ instrumentation of catboost's per-fold RNG accounting (out of scope for this draw-POSITION fix; pc=4 dump committed for a future plan, partition pinned + delta recorded, NOT fabricated/ignored). No lib/e2e regression (130/130 lib, tensor_ctr_e2e 3/3, ordered_boost_e2e 2/2).
+- [Phase ?]: Smooth-loss Exact leaf estimation is loss-dispatched: LogCosh uses the monotone-bisection 1-D optimum (Sum tanh=0), not the MAE weighted-median
 
 ### Pending Todos
 
@@ -218,7 +220,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-15T12:29:38.400Z
+Last session: 2026-06-16T05:12:23.297Z
 Stopped at: Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
 Stopped at (prior): Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created.
 Stopped at (prior): Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)

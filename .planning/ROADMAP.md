@@ -296,7 +296,7 @@ Plans:
 **Plans**: 3 plans (family waves, each its own ≤1e-5 oracle gate — D-6.1-02)
 **Wave 1**
 
-- [ ] 06.1-01-PLAN.md — Wave 1: smooth losses (LogCosh, Lq{q≥2}, Huber{δ}, Expectile{α}) — der1/der2 transcription + Newton/Exact leaf, per-stage oracle ≤1e-5
+- [x] 06.1-01-PLAN.md — Wave 1: smooth losses (LogCosh, Lq{q≥2}, Huber{δ}, Expectile{α}) — der1/der2 transcription + Newton/Exact leaf, per-stage oracle ≤1e-5
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
