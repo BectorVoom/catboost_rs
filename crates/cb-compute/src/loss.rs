@@ -151,31 +151,54 @@ pub const QUANTILE_ALPHA: f64 = 0.5;
 /// The MAE / Quantile deadzone half-width.
 pub const QUANTILE_DELTA: f64 = 1e-6;
 
-/// MAE / Quantile(alpha, delta) first derivative for one object:
-/// `(target - approx > 0) ? alpha : -(1 - alpha)`, with a `|residual| < delta`
-/// deadzone returning `0` (`error_functions.h:485-489` `TQuantileError::CalcDer`).
+/// Quantile(alpha, delta) first derivative for one object: with `val = target -
+/// approx`, `|val| < delta ? 0 : (val > 0 ? alpha : -(1 - alpha))`
+/// (`error_functions.h:485-489` `TQuantileError::CalcDer`).
 ///
-/// For the median (`alpha = 0.5`) the non-deadzone gradient is `+0.5` above the
-/// approx and `-0.5` below — the sign of the residual scaled by the half-quantile.
+/// The asymmetric pinball gradient: residuals where the target sits ABOVE the
+/// approx (`val > 0`, i.e. the model under-predicts) are pushed up with weight
+/// `alpha`; residuals BELOW (`val < 0`, over-prediction) are pushed down with
+/// weight `1 - alpha`. The `|val| < delta` deadzone returns `0` to avoid a
+/// vanishing-residual chatter. At the median (`alpha = 0.5`, `delta = 1e-6`) this
+/// is exactly [`mae_der1`] (the MAE-equivalence — MAE == Quantile{0.5}).
+/// `alpha ∈ [0, 1]`, `delta >= 0` are validated by [`crate::Loss::validate`].
 #[must_use]
-pub fn mae_der1(approx: f64, target: f64) -> f64 {
+pub fn quantile_der1(approx: f64, target: f64, alpha: f64, delta: f64) -> f64 {
     let val = target - approx;
-    if val.abs() < QUANTILE_DELTA {
+    if val.abs() < delta {
         0.0
     } else if val > 0.0 {
-        QUANTILE_ALPHA
+        alpha
     } else {
-        -(1.0 - QUANTILE_ALPHA)
+        -(1.0 - alpha)
     }
 }
 
-/// MAE / Quantile second derivative for one object: `der2 = 0`
-/// (`error_functions.h:491-493` — `QUANTILE_DER2_AND_DER3 = 0.0`). The Exact leaf
-/// method does not use the hessian (it takes the weighted median), and Newton is
-/// undefined for this loss (its denominator would be `scaledL2` alone).
+/// Quantile(alpha, delta) second derivative for one object: `der2 = 0`
+/// (`error_functions.h:491-493` — `QUANTILE_DER2_AND_DER3 = 0.0`), independent of
+/// `alpha`/`delta`. The Exact leaf method takes the weighted alpha-quantile (it
+/// does not use the hessian), and Newton is undefined for this loss (its
+/// denominator would be `scaledL2` alone).
 #[must_use]
-pub fn mae_der2(_approx: f64, _target: f64) -> f64 {
+pub fn quantile_der2(_approx: f64, _target: f64, _alpha: f64, _delta: f64) -> f64 {
     0.0
+}
+
+/// MAE first derivative for one object — the median quantile: delegates to
+/// [`quantile_der1`] with the default `alpha = 0.5`, `delta = 1e-6`
+/// (`error_functions.h:485-489`; MAE == Quantile{0.5}). The non-deadzone gradient
+/// is `+0.5` above the approx and `-0.5` below.
+#[must_use]
+pub fn mae_der1(approx: f64, target: f64) -> f64 {
+    quantile_der1(approx, target, QUANTILE_ALPHA, QUANTILE_DELTA)
+}
+
+/// MAE second derivative for one object: `der2 = 0` — delegates to
+/// [`quantile_der2`] (`error_functions.h:491-493`). The Exact leaf method does not
+/// use the hessian (it takes the weighted median).
+#[must_use]
+pub fn mae_der2(approx: f64, target: f64) -> f64 {
+    quantile_der2(approx, target, QUANTILE_ALPHA, QUANTILE_DELTA)
 }
 
 /// LogCosh first derivative for one object: `der1 = -tanh(approx - target)`.

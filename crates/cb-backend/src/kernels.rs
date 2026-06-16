@@ -73,6 +73,42 @@ pub fn mae_gradient_kernel<F: Float>(approx: &Array<F>, target: &Array<F>, der1:
     }
 }
 
+/// First-order Quantile{alpha, delta} gradient kernel: with `val = target -
+/// approx`, `der1 = |val| < delta ? 0 : (val > 0 ? alpha : -(1-alpha))`.
+///
+/// `error_functions.h:485-489` (`TQuantileError::CalcDer`). Generalizes
+/// [`mae_gradient_kernel`] (which hardcodes `alpha = 0.5`, `delta = 1e-6`) to
+/// arbitrary `alpha`/`delta`, passed as length-1 `Array<F>` arguments (read at
+/// index 0) — NOT scalar args — to keep the kernel fully generic over `F: Float`
+/// (AGENTS.md generics-float; the [`focal_gradient_kernel`] / [`lq_gradient_kernel`]
+/// length-1-array precedent). der2 is the constant `0` (no kernel — the dispatch
+/// fills a zero vec, the Mae precedent). The branch result is assigned to a `mut`
+/// variable initialized to the deadzone value via the if-as-STATEMENT pattern
+/// (CubeCL conditionals manual). Elementwise, order-independent, no reduction
+/// (D-02). At `alpha = 0.5`, `delta = 1e-6` this equals [`mae_gradient_kernel`].
+#[cube(launch)]
+pub fn quantile_gradient_kernel<F: Float>(
+    approx: &Array<F>,
+    target: &Array<F>,
+    der1: &mut Array<F>,
+    alpha: &Array<F>,
+    delta: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let one = F::new(1.0);
+        let a = alpha[0];
+        let d = delta[0];
+        let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        let mut g = F::new(0.0);
+        if val > d {
+            g = a;
+        } else if val < F::new(0.0) - d {
+            g = F::new(0.0) - (one - a);
+        }
+        der1[ABSOLUTE_POS] = g;
+    }
+}
+
 /// Second-order Logloss / CrossEntropy hessian kernel:
 /// `p = sigmoid(approx[i]); der2[i] = -p*(1-p)`.
 ///

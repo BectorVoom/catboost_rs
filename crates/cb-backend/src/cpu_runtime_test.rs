@@ -69,6 +69,58 @@ fn mae_gradients_match_host_reference() {
 }
 
 #[test]
+fn quantile_gradients_match_host_reference_alpha07() {
+    // Quantile{alpha=0.7, delta=1e-6}: der1 = |val|<delta ? 0 : (val>0 ? 0.7 :
+    // -0.3); der2 = 0. Includes an exact-tie object (approx==target -> deadzone 0).
+    let approx = [0.0, 1.0, -2.5, 3.25, 7.0];
+    let target = [1.0, 0.0, 2.5, -3.25, 7.0];
+    let alpha = 0.7;
+    let delta = 1e-6;
+
+    let ders = CpuBackend
+        .compute_gradients(Loss::Quantile { alpha, delta }, &approx, &target)
+        .unwrap();
+
+    assert_eq!(ders.der1.len(), approx.len());
+    assert_eq!(ders.der2.len(), approx.len());
+    for i in 0..approx.len() {
+        let val = target[i] - approx[i];
+        let expected = if val.abs() < delta {
+            0.0
+        } else if val > 0.0 {
+            alpha
+        } else {
+            -(1.0 - alpha)
+        };
+        assert!((ders.der1[i] - expected).abs() <= 1e-12, "i={i}");
+        assert_eq!(ders.der2[i], 0.0);
+    }
+}
+
+#[test]
+fn quantile_alpha05_gradients_equal_mae() {
+    // MAE == Quantile{alpha=0.5, delta=1e-6} at the dispatch level: the launched
+    // der1/der2 must be bit-identical between Loss::Mae and Loss::Quantile{0.5}.
+    let approx = [0.0, 1.0, -2.5, 3.25, 7.0, -0.5];
+    let target = [1.0, 0.0, 2.5, -3.25, 7.0, 0.5];
+
+    let mae = CpuBackend.compute_gradients(Loss::Mae, &approx, &target).unwrap();
+    let q05 = CpuBackend
+        .compute_gradients(
+            Loss::Quantile {
+                alpha: 0.5,
+                delta: 1e-6,
+            },
+            &approx,
+            &target,
+        )
+        .unwrap();
+
+    assert_eq!(mae.der1, q05.der1, "Quantile{{0.5}} der1 must equal MAE der1");
+    assert_eq!(mae.der2, q05.der2, "Quantile{{0.5}} der2 must equal MAE der2");
+}
+
+#[test]
 fn logcosh_gradients_match_host_reference() {
     // der1 = -tanh(approx-target); der2 = -1/cosh(approx-target)^2.
     let approx = [0.0, 1.0, -2.5, 3.25, 7.0];

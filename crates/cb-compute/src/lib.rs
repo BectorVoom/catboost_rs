@@ -34,8 +34,9 @@ pub use leaf::{
 pub use loss::{
     cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
     huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
-    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, rmse_der1,
-    rmse_der2, sigmoid, tweedie_der1, tweedie_der2, FOCAL_P_MIN, QUANTILE_ALPHA, QUANTILE_DELTA,
+    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, quantile_der1,
+    quantile_der2, rmse_der1, rmse_der2, sigmoid, tweedie_der1, tweedie_der2, FOCAL_P_MIN,
+    QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 pub use runtime::{
     Derivatives, EScoreFunction, Float, Loss, Runtime, EXPECTILE_ALPHA_DEFAULT,

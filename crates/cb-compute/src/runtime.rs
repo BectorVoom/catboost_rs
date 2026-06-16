@@ -72,6 +72,24 @@ pub enum Loss {
     /// delta is the weighted median of the leaf residuals
     /// (`error_functions.h:457-498` `TQuantileError`).
     Mae,
+    /// Quantile{alpha, delta} (robust regression, D-6.1-02 Wave 3; D-6.1-03
+    /// parametric variant generalizing [`Loss::Mae`]): with `val = target -
+    /// approx`, der1 = `|val| < delta ? 0 : (val > 0 ? alpha : -(1 - alpha))`,
+    /// der2 = `0` (`error_functions.h:457-498` `TQuantileError`). `alpha` defaults
+    /// to `0.5` and `delta` to `1e-6` upstream (`error_functions.h:468-469`), the
+    /// median case — so **MAE == Quantile{alpha: 0.5, delta: 1e-6}**. Like
+    /// [`Loss::Mae`] it uses the Exact leaf-estimation method, whose leaf delta is
+    /// the weighted alpha-quantile of the leaf residuals (`exact_leaf_delta` is
+    /// already alpha-general; D-6.1-05). `alpha ∈ [0, 1]`, `delta >= 0` are
+    /// validated by [`Loss::validate`].
+    Quantile {
+        /// Quantile level `alpha ∈ [0, 1]` (`Quantile:alpha=<value>`; default
+        /// `0.5`, the median). The Exact leaf takes the weighted alpha-quantile.
+        alpha: f64,
+        /// Deadzone half-width `delta >= 0` (`Quantile:delta=<value>`; default
+        /// `1e-6`). Residuals with `|target - approx| < delta` contribute `0`.
+        delta: f64,
+    },
     /// LogCosh (smooth regression, D-6.1-02 Wave 1): der1 =
     /// `-tanh(approx - target)`, der2 = `-1/cosh(approx - target)^2`
     /// (`error_functions.h:405-425` `TLogCoshError`). Non-parametric. Upstream
@@ -195,6 +213,22 @@ impl Loss {
                 if !variance_power.is_finite() || variance_power <= 1.0 || variance_power >= 2.0 {
                     return Err(cb_core::CbError::OutOfRange(format!(
                         "Tweedie variance_power must be finite and in (1, 2), got {variance_power}"
+                    )));
+                }
+            }
+            // Quantile alpha MUST be in [0, 1] and delta >= 0 (T-06.1.03-01;
+            // `error_functions.h:479-480`). An out-of-domain alpha/delta yields an
+            // ill-defined quantile der/leaf, so reject up front with a typed
+            // CbError (no `unwrap`/`panic`).
+            Self::Quantile { alpha, delta } => {
+                if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "Quantile alpha must be finite and in [0, 1], got {alpha}"
+                    )));
+                }
+                if !delta.is_finite() || delta < 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "Quantile delta must be finite and >= 0, got {delta}"
                     )));
                 }
             }

@@ -24,8 +24,8 @@ use crate::kernels::{
     focal_hessian_kernel, gradient_kernel, huber_gradient_kernel, huber_hessian_kernel,
     logcosh_gradient_kernel, logcosh_hessian_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
     lq_gradient_kernel, lq_hessian_kernel, mae_gradient_kernel, mape_gradient_kernel,
-    poisson_gradient_kernel, poisson_hessian_kernel, tweedie_gradient_kernel,
-    tweedie_hessian_kernel,
+    poisson_gradient_kernel, poisson_hessian_kernel, quantile_gradient_kernel,
+    tweedie_gradient_kernel, tweedie_hessian_kernel,
 };
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
@@ -274,6 +274,49 @@ fn launch_focal_f64(
     bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
 }
 
+/// Launch the Quantile gradient kernel (`val = target - approx; der1 = |val| <
+/// delta ? 0 : (val > 0 ? alpha : -(1-alpha))`) on `CpuRuntime`, passing the
+/// `alpha`/`delta` loss parameters as length-1 device arrays, and read back the
+/// `f64` der1 in object order. Gradient-only — the Quantile der2 is the constant
+/// `0` (the dispatch fills a zero vec, the Mae precedent). Mirrors
+/// [`launch_focal_f64`] for the two-parameter Quantile gradient.
+fn launch_quantile_f64(approx: &[f64], target: &[f64], alpha: f64, delta: f64) -> Vec<f64> {
+    let n = approx.len();
+    let device = cubecl::cpu::CpuDevice;
+    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
+    let out_handle = client.empty(std::mem::size_of_val(approx));
+    // The loss params pass as length-1 device arrays (the kernel stays generic
+    // over F — a generic scalar arg would need the non-generic ScalarArgType bound).
+    let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+    let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
+
+    let cube_dim = 32usize;
+    let num_cubes = n.div_ceil(cube_dim).max(1);
+
+    quantile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+        &client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim {
+            x: cube_dim as u32,
+            y: 1,
+            z: 1,
+        },
+        unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+        unsafe { ArrayArg::from_raw_parts(delta_handle, 1) },
+    );
+
+    let bytes = client
+        .read_one(out_handle)
+        .unwrap_or_else(|_| cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n]));
+    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+}
+
 /// Which single-parameter smooth-loss derivative kernel to launch (Lq{q},
 /// Huber{delta}, Expectile{alpha}). Each carries one scalar loss parameter passed
 /// as a length-1 device `Array<F>` (the `focal` length-1-array precedent — keeps
@@ -414,6 +457,15 @@ impl Runtime for CpuBackend {
             Loss::Mae => {
                 let der1 = launch_binary_f64(approx, target, BinaryKernel::MaeGradient);
                 // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
+                let der2 = vec![0.0_f64; approx.len()];
+                Ok(Derivatives { der1, der2 })
+            }
+            // Quantile{alpha, delta} (Wave 3): the alpha-general pinball gradient
+            // (the alpha/delta passed as length-1 device arrays). der2 = 0 (the
+            // constant-0 vec, the Mae precedent). At alpha=0.5,delta=1e-6 the
+            // gradient equals the Mae arm above (MAE == Quantile{0.5}).
+            Loss::Quantile { alpha, delta } => {
+                let der1 = launch_quantile_f64(approx, target, alpha, delta);
                 let der2 = vec![0.0_f64; approx.len()];
                 Ok(Derivatives { der1, der2 })
             }
