@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "06.1-02 COMPLETE (commits fa4e664 T1 / bb3202f T2 / 2a39193 T3 / d554828 T4) — Wave-2 positive-domain/link regression losses LANDED + oracle-locked <=1e-5. Loss::{Poisson(inline exp-link),Tweedie{variance_power}(exp-in-der raw),Mape(der2=0)} wired enum->der->kernel->dispatch; 5 generics-float CubeCL kernels; EvalMetric::Msle as a metric-ONLY member (D-6.1-06; NO Loss variant). Open Q1 RESOLVED empirically: Poisson StagedApprox=RAW, Predictions=exp(raw)==PredictionType::Exponent (8.88e-16). A4 confirmed: Tweedie predictions RAW. wave2 oracle 3/3 GREEN (Poisson raw+exp / Tweedie raw / MAPE per-stage); msle_metric oracle 1/1 GREEN; Wave-1 4/4 + full cb-train suite (lib 139 + all oracle suites) stay green. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: /gsd-execute-phase 06.1 plan 03 (Wave 3 — quantile family). Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-02-SUMMARY.md."
-last_updated: "2026-06-16T05:28:00.000Z"
-last_activity: 2026-06-16 -- Phase 06.1 Plan 02 (Wave-2 positive-domain/link losses) COMPLETE
+stopped_at: "06.1-03 COMPLETE (commits 89bd431 T1-fixtures / a75f296 T2-RED / e4f7b1d T2-GREEN / 5c5d1e5 T3) — Wave-3 quantile family LANDED + oracle-locked <=1e-5; LOSS-03 SCALAR MATRIX COMPLETE. Loss::Quantile{alpha,delta} generalizes Loss::Mae (MAE==Quantile{0.5,1e-6}): quantile_der1/der2 in cb-compute::loss (mae_der1/der2 now DELEGATE -> MAE byte-stable); quantile_gradient_kernel<F:Float> (alpha/delta length-1 arrays) + launch_quantile_f64 dispatch; the ONE real-code item (RESEARCH Pattern 3 / D-6.1-05) = compute_leaf_deltas Exact branch threads params.loss (alpha,delta) instead of hardcoded QUANTILE_ALPHA/DELTA — exact_leaf_delta (leaf.rs) UNCHANGED (git diff empty, free reuse). MAE==Quantile{0.5} confirmed bit-exact (0.0 diff) at THREE levels: fixture leaf_values, der dispatch, Exact leaf. wave3 oracle 2/2 GREEN (alpha=0.7 + alpha=0.5 Splits/LeafValues/StagedApprox <=1e-5; Quantile{0.5}==leaf_methods/exact MAE <=1e-5); cb-compute 69 / cb-backend 18 / cb-train lib 141 + leaf_methods/wave1/wave2/slice_first/autolr/loss/ordered/tensor/eval_metrics oracles all green. Task-1 checkpoint:human-verify (fixture provenance) auto-satisfied: fixtures generated offline from .venv catboost==1.2.10 (NOT fabricated), MAE==Quantile{0.5} sanity printed 0.0 diff, RED confirmed before GREEN — disposition recorded in SUMMARY. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: Phase 6.1 verifier / Phase 6.2 (N-dim refactor + MultiQuantile). Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-03-SUMMARY.md."
+last_updated: "2026-06-16T05:43:04.000Z"
+last_activity: 2026-06-16 -- Phase 06.1 Plan 03 (Wave-3 quantile family) COMPLETE — LOSS-03 scalar matrix complete
 progress:
   total_phases: 14
   completed_phases: 5
   total_plans: 44
-  completed_plans: 43
-  percent: 38
+  completed_plans: 44
+  percent: 39
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 06.1 (regression-loss-matrix) — EXECUTING
-Plan: 3 of 3 (Plans 01 + 02 COMPLETE; Plan 03 — Wave 3 quantile family — next)
-Status: Plan 02 complete; ready to execute Plan 03
-Last activity: 2026-06-16 -- Phase 06.1 Plan 02 (Wave-2 positive-domain/link losses) COMPLETE
+Phase: 06.1 (regression-loss-matrix) — ALL PLANS COMPLETE (verifier next)
+Plan: 3 of 3 (Plans 01 + 02 + 03 COMPLETE — LOSS-03 scalar matrix complete)
+Status: Plan 03 complete; Phase 6.1 plan execution done — ready for phase verifier / Phase 6.2
+Last activity: 2026-06-16 -- Phase 06.1 Plan 03 (Wave-3 quantile family) COMPLETE
 
-Progress: [######    ] 67% of Phase 6.1 plans (2 of 3 plans complete; 5 of 8 top-level phases complete)
+Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 top-level phases complete)
 
 ## Performance Metrics
 
@@ -92,6 +92,7 @@ Progress: [######    ] 67% of Phase 6.1 plans (2 of 3 plans complete; 5 of 8 top
 | Phase 05 P19 | ~95min | 5 tasks (A,T1-T5) | 32 files |
 | Phase 06.1 P01 | 19min | 3 tasks | 14 files |
 | Phase 06.1 P02 | 12min | 4 tasks | 31 files |
+| Phase 06.1 P03 | ~11min | 3 tasks | 21 files |
 
 ## Accumulated Context
 
@@ -100,6 +101,7 @@ Progress: [######    ] 67% of Phase 6.1 plans (2 of 3 plans complete; 5 of 8 top
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [06.1-03 LOSS-03 scalar matrix COMPLETE]: Loss::Quantile{alpha,delta} generalizes Loss::Mae — MAE == Quantile{0.5,1e-6} confirmed bit-exact (0.0 diff) at THREE levels (fixture leaf_values, der dispatch, Exact leaf). mae_der1/der2 now DELEGATE to quantile_der1/der2 (single source of truth, byte-stable). The ONE real-code item (RESEARCH Pattern 3 / D-6.1-05): compute_leaf_deltas Exact branch threads params.loss (alpha,delta) into the ALREADY-alpha-general exact_leaf_delta — leaf.rs UNCHANGED (git diff empty), so this is wiring, not algorithm. quantile_gradient_kernel reuses the focal two-param length-1-array launch pattern. wave3 oracle ≤1e-5 at alpha=0.7 (weighted 0.7-quantile Exact leaf) + alpha=0.5 (== leaf_methods/exact MAE). Quantile fixtures use the RAW target (no positive shift — full real line) + leaf_estimation_method:Exact PINNED. MultiQuantile remains relocated to 6.2 (multi-output, N-dim foundation). gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY (as in 06.1-02).
 - [06.1-02 Open Q1 RESOLVED]: Poisson is IsStoreExpApprox upstream but cb-train stores RAW approx + computes exp() INLINE in the der (the Logloss sigmoid precedent); StagedApprox(RawFormulaVal) is RAW, Predictions = exp(raw) == cb_model::PredictionType::Exponent (matched to 8.88e-16 vs the default predict). StagedApprox oracle compares RAW; Predictions applies Exponent. NO exp-approx storage implemented.
 - [06.1-02 A4 confirmed]: Tweedie is NOT exp-approx (error_functions.h:1644) — the exp lives INSIDE the der over the raw approx; Tweedie predictions are RAW (default predict == RawFormulaVal), so NO Exponent transform is applied.
 - [06.1-02 D-6.1-06]: MSLE is metric-ONLY (enum_helpers.cpp:200,533-549 — absent from RegressionObjectives). Added to EvalMetric ONLY (NO Loss variant, NO for_loss default; selected via explicit eval_metric). MSLE = mean_w((log(1+approx)-log(1+target))^2), approx RAW, NOT sqrt'd (metric.cpp:1899-1926). The msle_metric fixture trains RMSE w/ eval_metric=MSLE; there is no MSLE-as-objective model (it throws upstream).

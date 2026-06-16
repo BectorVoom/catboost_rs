@@ -166,7 +166,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | ORD-04 | Phase 5 | Complete |
 | ORD-05 | Phase 5 | Complete |
 | LOSS-02 | Phase 6.2 | Pending |
-| LOSS-03 | Phase 6.1 (+6.2) | In progress (Wave 1 ✓ LogCosh/Lq/Huber/Expectile; Wave 2 ✓ Poisson/Tweedie/MAPE + MSLE metric-only; Wave 3 pending Quantile{α,δ}. MultiQuantile multi-output member lands in 6.2 on the N-dim foundation) |
+| LOSS-03 | Phase 6.1 (+6.2) | Scalar matrix ✓ (Wave 1 ✓ LogCosh/Lq/Huber/Expectile; Wave 2 ✓ Poisson/Tweedie/MAPE + MSLE metric-only; Wave 3 ✓ Quantile{α,δ} — MAE==Quantile{0.5}, α-threaded Exact leaf, oracle ≤1e-5). Phase 6.1 scalar LOSS-03 COMPLETE. MultiQuantile multi-output member lands in 6.2 on the N-dim foundation |
 | LOSS-04 | Phase 6.3 | Pending |
 | LOSS-05 | Phase 6.3 | Pending |
 | LOSS-07 | Phase 6.4 | Pending (Rust trait; Python callback bridge → Phase 8 per D-09) |

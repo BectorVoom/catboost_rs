@@ -302,9 +302,9 @@ Plans:
 
 - [x] 06.1-02-PLAN.md — Wave 2: positive-domain/link (Poisson exp-link, Tweedie{p}, MAPE) + MSLE eval-metric-only (D-6.1-06) — der1/der2 transcription + 5 generics-float kernels, Poisson raw-approx+inline-exp+Exponent-predict, per-stage oracle ≤1e-5; MSLE metric oracle ≤1e-5 (completed 2026-06-16, commits fa4e664/bb3202f/2a39193/d554828)
 
-**Wave 3** *(ready — Wave 2 complete)*
+**Wave 3** *(complete)*
 
-- [ ] 06.1-03-PLAN.md — Wave 3: Quantile{α,δ} generalizing MAE via α-threaded Exact leaf — completes the LOSS-03 scalar matrix
+- [x] 06.1-03-PLAN.md — Wave 3: Quantile{α,δ} generalizing MAE via α-threaded Exact leaf — completes the LOSS-03 scalar matrix; quantile_der1/der2 + Loss::Quantile{α,δ} + generics-float kernel + Exact-alpha threading (D-6.1-05 free reuse, leaf.rs UNCHANGED); MAE==Quantile{0.5} bit-exact at fixture/der/leaf; wave3 oracle ≤1e-5 at α=0.7 + α=0.5; all prior oracles green (completed 2026-06-16, commits 89bd431/a75f296/e4f7b1d/5c5d1e5)
 
 ### Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor
 
