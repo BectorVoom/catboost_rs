@@ -28,8 +28,8 @@ pub use histogram::{
     collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
 };
 pub use leaf::{
-    calc_average, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta, scale_l2_reg,
-    simple_leaf_delta, LeafMethod,
+    calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
+    newton_leaf_delta, scale_l2_reg, simple_leaf_delta, LeafMethod,
 };
 pub use loss::{
     cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,

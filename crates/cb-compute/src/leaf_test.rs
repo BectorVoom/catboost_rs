@@ -1,8 +1,8 @@
 //! Unit tests for leaf-value estimation primitives (TRAIN-03 all four methods).
 
 use crate::leaf::{
-    calc_average, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta, scale_l2_reg,
-    simple_leaf_delta,
+    calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
+    newton_leaf_delta, scale_l2_reg, simple_leaf_delta,
 };
 
 #[test]
@@ -116,4 +116,50 @@ fn exact_leaf_delta_alpha_zero_is_min() {
     // alpha <= 0 -> min element (CalcSampleQuantile early return).
     let v = exact_leaf_delta(&[5.0, -2.0, 3.0], &[1.0, 1.0, 1.0], 0.0, 1e-6);
     assert!((v - (-2.0)).abs() < 1e-9, "got {v}");
+}
+
+#[test]
+fn logcosh_exact_leaf_delta_empty_leaf_returns_zero() {
+    assert_eq!(logcosh_exact_leaf_delta(&[], &[]), 0.0);
+}
+
+#[test]
+fn logcosh_exact_leaf_delta_symmetric_residuals_is_zero() {
+    // Σ tanh(δ - r) = 0 for symmetric residuals {-1, +1} at δ = 0 (tanh is odd).
+    // The bracket is [-1, 1]; the bisection converges to ~0 within 1e-9.
+    let v = logcosh_exact_leaf_delta(&[-1.0, 1.0], &[]);
+    assert!(v.abs() < 1e-8, "got {v}");
+}
+
+#[test]
+fn logcosh_exact_leaf_delta_matches_bisection_reference() {
+    // Reproduce the upstream bisection (optimal_const_for_loss.h:110-154) over an
+    // asymmetric residual set with weights; the root of g(δ)=Σ w·tanh(δ-r) must
+    // match the production fn bit-for-bit (same op order, same return-`left`).
+    let residuals: [f32; 4] = [-2.0, 0.5, 1.0, 3.0];
+    let weights = [1.0_f64, 2.0, 0.5, 1.5];
+
+    let g = |approx: f64| -> f64 {
+        residuals
+            .iter()
+            .zip(weights.iter())
+            .map(|(&r, &w)| (approx - f64::from(r)).tanh() * w)
+            .sum::<f64>()
+    };
+    let mut left = -2.0_f64;
+    let mut right = 3.0_f64;
+    for _ in 0..100 {
+        if (right - left) <= 1e-9 {
+            break;
+        }
+        let m = (left + right) / 2.0;
+        if g(m) > 0.0 {
+            right = m;
+        } else {
+            left = m;
+        }
+    }
+
+    let v = logcosh_exact_leaf_delta(&residuals, &weights);
+    assert!((v - left).abs() < 1e-9, "got {v}, want {left}");
 }

@@ -58,7 +58,16 @@ impl EvalMetric {
     #[must_use]
     pub fn for_loss(loss: Loss) -> Self {
         match loss {
-            Loss::Rmse | Loss::Mae => Self::Rmse,
+            // The Wave-1 smooth regression losses (LogCosh / Lq / Huber /
+            // Expectile) each default upstream to their own-named regression
+            // metric; for Wave 1 they report the parity-neutral RMSE eval surface
+            // (mirroring the MAE arm) unless a fixture pins `eval_metric`.
+            Loss::Rmse
+            | Loss::Mae
+            | Loss::LogCosh
+            | Loss::Lq { .. }
+            | Loss::Huber { .. }
+            | Loss::Expectile { .. } => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,

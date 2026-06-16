@@ -231,3 +231,80 @@ pub fn exact_leaf_delta(residuals: &[f32], weights: &[f64], alpha: f64, delta: f
 
     quantile
 }
+
+/// The binary-search iteration count and precision for the LogCosh exact optimum
+/// (`optimal_const_for_loss.h:122-123` — `BINSEARCH_ITERATIONS = 100`,
+/// `APPROX_PRECISION = 1e-9`).
+const LOGCOSH_BINSEARCH_ITERATIONS: usize = 100;
+const LOGCOSH_APPROX_PRECISION: f64 = 1e-9;
+
+/// The Exact-method leaf delta for **LogCosh** — the 1-D optimum `δ` minimizing
+/// `Σ_i w_i · logcosh(δ - r_i)`, found by the monotone-bisection root of its
+/// derivative `g(δ) = Σ_i w_i · tanh(δ - r_i)`
+/// (`CalcOneDimensionalOptimumConstApprox` -> `CalculateOptimalConstApproxForLogCosh`,
+/// `optimal_const_for_loss.h:110-154`).
+///
+/// `residuals[i]` is member `i`'s `r_i = target_i - approx_i` (widened through
+/// `f32` to match upstream's `TVector<float> leafSamples`); `weights[i]` its
+/// object weight (an empty `weights` slice means uniform weight `1.0`, matching
+/// the `weights.empty()` dispatch). The bracket is `[min(r), max(r)]`
+/// (`minmax_element`); each of up to `100` bisection steps evaluates `g` at the
+/// midpoint `m` and keeps the half where the sign of `g` flips (`g > 0 ->`
+/// right=m, else left=m), returning `left` once the bracket narrows below `1e-9`
+/// (or the iteration cap is hit) — transcribed verbatim from upstream, including
+/// returning `left` (not the midpoint).
+///
+/// An empty leaf returns `0.0` (`target.empty()` guard). `g` is monotone
+/// increasing in `δ` (`tanh` is), so the bisection is well-defined; the per-step
+/// `Σ` is the same order upstream uses (member order), and is a `tanh`-weighted
+/// fold — routed through `cb_core::sum_f64` to honor D-08.
+#[must_use]
+pub fn logcosh_exact_leaf_delta(residuals: &[f32], weights: &[f64]) -> f64 {
+    if residuals.is_empty() {
+        return 0.0;
+    }
+
+    let has_weights = !weights.is_empty();
+    // g(approx) = Σ_i tanh(approx - r_i) * w_i, member order, ordered f64 fold.
+    let g = |approx: f64| -> f64 {
+        let terms: Vec<f64> = residuals
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| {
+                let w = if has_weights {
+                    weights.get(i).copied().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                (approx - f64::from(r)).tanh() * w
+            })
+            .collect();
+        sum_f64(&terms)
+    };
+
+    // Bracket [min(r), max(r)] (minmax_element over the f32 residuals).
+    let mut left = f64::INFINITY;
+    let mut right = f64::NEG_INFINITY;
+    for &r in residuals {
+        let v = f64::from(r);
+        if v < left {
+            left = v;
+        }
+        if v > right {
+            right = v;
+        }
+    }
+
+    let mut id = 0;
+    while id < LOGCOSH_BINSEARCH_ITERATIONS && (right - left) > LOGCOSH_APPROX_PRECISION {
+        let m = (left + right) / 2.0;
+        if g(m) > 0.0 {
+            right = m;
+        } else {
+            left = m;
+        }
+        id += 1;
+    }
+
+    left
+}

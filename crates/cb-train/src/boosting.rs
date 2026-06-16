@@ -25,9 +25,9 @@
 //! `unwrap`/`expect`/raw float fold in production (deny-lints + D-08).
 
 use cb_compute::{
-    collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, newton_leaf_delta,
-    reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev, simple_leaf_delta,
-    LeafMethod, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+    collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
+    newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev,
+    simple_leaf_delta, LeafMethod, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 
@@ -640,7 +640,15 @@ const fn autolr_target_type(loss: Loss) -> TargetType {
         // CrossEntropy shares Logloss's auto-LR coefficient row (same objective
         // family); Focal is not in the upstream auto-LR table -> Unknown.
         Loss::Logloss | Loss::CrossEntropy => TargetType::Logloss,
-        Loss::Focal { .. } | Loss::Mae => TargetType::Unknown,
+        // The Wave-1 smooth regression losses are not in the upstream auto-LR
+        // table (`options_helper.cpp:181-194`) -> Unknown (no rate guessed),
+        // mirroring the existing MAE arm.
+        Loss::Focal { .. }
+        | Loss::Mae
+        | Loss::LogCosh
+        | Loss::Lq { .. }
+        | Loss::Huber { .. }
+        | Loss::Expectile { .. } => TargetType::Unknown,
     }
 }
 
@@ -659,13 +667,17 @@ fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
 ///
 /// Gradient/Newton/Simple are closed-form over each leaf's ordered reduced sums
 /// (`cb_core::sum_f64` via `reduce_leaf_stats` / `reduce_leaf_der2`, D-05). Exact
-/// takes the weighted median of each leaf's per-member residuals
-/// (`target - approx`) via the quantile-style optimum. `weighted_der1[i]` is
+/// is the loss's 1-D exact optimum over each leaf's per-member residuals
+/// (`target - approx`): the weighted sample quantile for MAE / Quantile, the
+/// monotone-bisection `Σ tanh(δ - r) = 0` root for LogCosh
+/// (`CalcOneDimensionalOptimumConstApprox` dispatch). `weighted_der1[i]` is
 /// `der1*weight`; `der2[i]` the per-object second derivative (weighted below for
-/// the Newton sum); `approx`/`target` the running approximant/labels.
+/// the Newton sum); `approx`/`target` the running approximant/labels; `loss`
+/// selects the Exact optimizer.
 #[allow(clippy::too_many_arguments)]
 fn compute_leaf_deltas(
     method: LeafMethod,
+    loss: Loss,
     leaf_of: &[usize],
     weighted_der1: &[f64],
     der2: &[f64],
@@ -707,9 +719,13 @@ fn compute_leaf_deltas(
                 .collect()
         }
         LeafMethod::Exact => {
-            // Exact: per-leaf weighted median of residuals r_i = target_i -
-            // approx_i (MAE / Quantile alpha=0.5, delta=1e-6). scaled_l2 is unused
-            // (Exact has no L2 term — it is a rank statistic, not an average).
+            // Exact: the loss's 1-D exact optimum over each leaf's per-member
+            // residuals r_i = target_i - approx_i. scaled_l2 is unused (Exact has
+            // no L2 term — it is the unregularized const-approx optimum). The
+            // optimizer is selected by `loss` (CalcOneDimensionalOptimumConstApprox
+            // switch, optimal_const_for_loss.h:180-216):
+            //   - MAE / Quantile -> weighted sample quantile (alpha=0.5, delta=1e-6)
+            //   - LogCosh        -> monotone-bisection Σ tanh(δ - r) = 0 root
             let residuals: Vec<f64> = approx
                 .iter()
                 .zip(target.iter())
@@ -718,7 +734,12 @@ fn compute_leaf_deltas(
             let members = collect_leaf_residuals(leaf_of, &residuals, weights, n_leaves);
             members
                 .iter()
-                .map(|(r, w)| exact_leaf_delta(r, w, QUANTILE_ALPHA, QUANTILE_DELTA))
+                .map(|(r, w)| match loss {
+                    Loss::LogCosh => logcosh_exact_leaf_delta(r, w),
+                    // MAE / Quantile (and any other Exact-eligible loss for this
+                    // wave) uses the weighted sample quantile.
+                    _ => exact_leaf_delta(r, w, QUANTILE_ALPHA, QUANTILE_DELTA),
+                })
                 .collect()
         }
     }
@@ -1088,6 +1109,12 @@ fn train_inner<R: Runtime>(
     mut history: Option<&mut EvalMetricHistory>,
 ) -> CbResult<(Model, BakedCtrData)> {
     check_depth(params.depth)?;
+
+    // Validate the loss's hyperparameters before any training work
+    // (T-06.1.01-01 / T-06.1.01-02): an out-of-domain q/delta/alpha would yield
+    // NaN/Inf derivatives that poison the histogram and leaf reductions, so it is
+    // rejected up front with a typed CbError rather than producing a corrupt model.
+    params.loss.validate()?;
 
     let n = target.len();
     if n == 0 {
@@ -1677,6 +1704,7 @@ fn train_inner<R: Runtime>(
         //    leaf members routes through cb_core::sum_f64 (D-05).
         let leaf_deltas = compute_leaf_deltas(
             params.leaf_method,
+            params.loss,
             &leaf_value_leaf_of,
             &weighted_der1,
             &ders.der2,
