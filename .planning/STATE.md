@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: "06.1-03 COMPLETE (commits 89bd431 T1-fixtures / a75f296 T2-RED / e4f7b1d T2-GREEN / 5c5d1e5 T3) — Wave-3 quantile family LANDED + oracle-locked <=1e-5; LOSS-03 SCALAR MATRIX COMPLETE. Loss::Quantile{alpha,delta} generalizes Loss::Mae (MAE==Quantile{0.5,1e-6}): quantile_der1/der2 in cb-compute::loss (mae_der1/der2 now DELEGATE -> MAE byte-stable); quantile_gradient_kernel<F:Float> (alpha/delta length-1 arrays) + launch_quantile_f64 dispatch; the ONE real-code item (RESEARCH Pattern 3 / D-6.1-05) = compute_leaf_deltas Exact branch threads params.loss (alpha,delta) instead of hardcoded QUANTILE_ALPHA/DELTA — exact_leaf_delta (leaf.rs) UNCHANGED (git diff empty, free reuse). MAE==Quantile{0.5} confirmed bit-exact (0.0 diff) at THREE levels: fixture leaf_values, der dispatch, Exact leaf. wave3 oracle 2/2 GREEN (alpha=0.7 + alpha=0.5 Splits/LeafValues/StagedApprox <=1e-5; Quantile{0.5}==leaf_methods/exact MAE <=1e-5); cb-compute 69 / cb-backend 18 / cb-train lib 141 + leaf_methods/wave1/wave2/slice_first/autolr/loss/ordered/tensor/eval_metrics oracles all green. Task-1 checkpoint:human-verify (fixture provenance) auto-satisfied: fixtures generated offline from .venv catboost==1.2.10 (NOT fabricated), MAE==Quantile{0.5} sanity printed 0.0 diff, RED confirmed before GREEN — disposition recorded in SUMMARY. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: Phase 6.1 verifier / Phase 6.2 (N-dim refactor + MultiQuantile). Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-03-SUMMARY.md."
-last_updated: "2026-06-16T05:43:04.000Z"
-last_activity: 2026-06-16 -- Phase 06.1 Plan 03 (Wave-3 quantile family) COMPLETE — LOSS-03 scalar matrix complete
+status: verifying
+stopped_at: Phase 6.2 context gathered
+last_updated: "2026-06-16T08:07:05.300Z"
+last_activity: 2026-06-16 -- Phase 06.1 Plan 03 (Wave-3 quantile family) COMPLETE
 progress:
   total_phases: 14
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 44
   completed_plans: 44
-  percent: 39
+  percent: 43
 ---
 
 # Project State
@@ -228,8 +228,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-16T05:28:00.000Z
-Stopped at: 06.1-02 COMPLETE (commits fa4e664 T1 / bb3202f T2 / 2a39193 T3 / d554828 T4) — Wave-2 positive-domain/link regression losses (Poisson exp-link, Tweedie{variance_power}, MAPE) LANDED + oracle-locked <=1e-5; MSLE as a metric-ONLY EvalMetric member (D-6.1-06). wave2 oracle 3/3 GREEN, msle_metric 1/1 GREEN, Wave-1 4/4 + full cb-train suite green. Open Q1 resolved (Poisson StagedApprox=RAW, Predictions=Exponent(raw)); A4 confirmed (Tweedie predictions RAW). gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: /gsd-execute-phase 06.1 plan 03 (Wave 3 — quantile family). Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-02-SUMMARY.md.
+Last session: 2026-06-16T08:07:05.295Z
+Stopped at: Phase 6.2 context gathered
 Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
 Stopped at (prior): Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created.
 Stopped at (prior): Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
@@ -237,4 +237,4 @@ Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
-Resume file: .planning/phases/06-full-loss-feature-parity/06-CONTEXT.md
+Resume file: .planning/phases/06.2-multiclass-multilabel-and-n-dim-approx-refactor/06.2-CONTEXT.md
