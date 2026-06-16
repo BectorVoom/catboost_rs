@@ -288,7 +288,7 @@ Plans:
 **Requirements**: LOSS-03 (scalar matrix; MultiQuantile relocated to 6.2 — it is multi-output and rides the N-dim foundation)
 **Success Criteria** (what must be TRUE):
 
-  1. RMSE, MAE, Quantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile each train and produce predictions matching upstream catboost 1.2.10 ≤1e-5 (per-stage: splits/leaves/staged-approx + final prediction). (MultiQuantile is in 6.2.)
+  1. RMSE, MAE, Quantile, LogCosh, Huber, Poisson, Tweedie, MAPE, Lq, Expectile each train and produce predictions matching upstream catboost 1.2.10 ≤1e-5 (per-stage: splits/leaves/staged-approx + final prediction). MSLE is **metric-only upstream** (not a trainable objective in 1.2.10 — `enum_helpers.cpp:200,533-549`), so it is implemented as an `eval_metric` only, oracle-locked as a metric, not a training loss. (MultiQuantile is in 6.2.)
   2. der1/der2 for each loss are transcribed from upstream `error_functions.{h,cpp}` and self-oracled; all parity-critical summation routes through `cb-core::sum_f64`.
   3. The existing ~40 scalar oracles (Phases 3–5) stay green — new losses attach at the `cb-compute` `Loss` enum with no behavior change to existing losses.
   4. "etc." losses not explicitly named here are deferred-to-v2 (D-06), not silently in-scope.
