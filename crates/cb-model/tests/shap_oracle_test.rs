@@ -75,6 +75,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
         approx_dimension: 1,
+        class_to_label: Vec::new(),
     }
 }
 
@@ -162,6 +163,7 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
         float_feature_borders: vec![vec![0.5, 2.5], vec![0.5, 1.5]],
         ctr_data: None,
         approx_dimension: 1,
+        class_to_label: Vec::new(),
     };
 
     // A spread of objects covering every leaf.

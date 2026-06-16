@@ -440,6 +440,7 @@ fn single_ctr_split_model(
         float_feature_borders: Vec::new(),
         ctr_data: Some(ctr_data),
         approx_dimension: 1,
+        class_to_label: Vec::new(),
     }
 }
 

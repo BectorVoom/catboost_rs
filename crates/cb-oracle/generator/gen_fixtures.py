@@ -2664,6 +2664,142 @@ def gen_wave2_only() -> None:
     print("Wrote MSLE eval-metric oracle fixture (msle_metric)")
 
 
+# Phase-06.2 Wave-1 (Plan 06.2-03, LOSS-02) multiclass fixture roots. A 3-class
+# target is built from the numeric_tiny regression target's terciles; the
+# remapped contiguous class index [0,3) is the training target. MultiClass is the
+# cross-dimension-coupled softmax loss (symmetric Hessian Newton solve); OneVsAll
+# is the separable per-dimension diagonal sigmoid. BOTH use the catboost MultiClass
+# default score_function=Cosine (NOT the L2 the scalar fixtures pin) and
+# leaf_estimation_method=Newton / leaf_estimation_iterations=1 (Pitfall 2).
+MULTICLASS_SOFTMAX = FIXTURES / "multiclass_softmax"
+MULTICLASS_ONEVSALL = FIXTURES / "multiclass_onevsall"
+
+
+def _multiclass_target() -> np.ndarray:
+    """The 3-class target derived from numeric_tiny.y terciles: digitize y into
+    {0,1,2} at the 1/3 and 2/3 quantiles. Deterministic (numeric_tiny.y is frozen);
+    the same tercile rule is reproduced by the Rust oracle test so train/predict
+    use the identical class labels."""
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    q = np.quantile(y, [1.0 / 3.0, 2.0 / 3.0])
+    return np.digitize(y, q).astype(np.int64)  # 0, 1, 2
+
+
+def _gen_one_multiclass(scenario_dir: Path, loss: str) -> None:
+    """Train one multiclass loss (MultiClass | MultiClassOneVsAll) on the 3-class
+    numeric_tiny target and freeze its per-stage oracle: model.json (splits +
+    LEAF-MAJOR leaf_values + class_params), staged.npy (staged_predict
+    RawFormulaVal, shape (n,dim) object-major — A4 flatten recorded), and
+    predictions.npy (Probability)."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    yc = _multiclass_target()
+
+    # MultiClass default score_function is Cosine (NOT the scalar fixtures' L2);
+    # leaf_estimation_method=Newton (the multiclass default) with iterations=1
+    # (Pitfall 2). bootstrap_type=No, random_strength=0, thread_count=1 isolate the
+    # tree/leaf math (D-07). boost_from_average=False (classification).
+    params = {
+        "iterations": 5,
+        "learning_rate": 0.1,
+        "depth": 2,
+        "l2_leaf_reg": 3.0,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "leaf_estimation_iterations": 1,
+        "leaf_estimation_method": "Newton",
+        "score_function": "Cosine",
+        "random_seed": SEED,
+        "thread_count": 1,
+        "verbose": False,
+        "loss_function": loss,
+        "boost_from_average": False,
+    }
+    model = CatBoostClassifier(**params)
+    model.fit(x, yc)
+
+    # --- Stage: Splits + LeafValues + class_params (model.json) -------------
+    model.save_model(str(scenario_dir / "model.json"), format="json")
+
+    # --- Stage: StagedApprox (RawFormulaVal, shape (n,dim) object-major) ----
+    # staged_predict(RawFormulaVal) yields one (n, dim) array per iteration; flatten
+    # OBJECT-MAJOR (row-major, object then dim) and concatenate across iterations.
+    # The Rust oracle transposes its dimension-major training buffer to this
+    # object-major layout before comparing (A4).
+    staged = [
+        np.asarray(p, dtype=np.float64)
+        for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+    ]
+    staged_flat = _assert_f64(
+        np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+    )
+    np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+    # --- Stage: Predictions (Probability, shape (n,dim) object-major) -------
+    proba = np.asarray(model.predict(x, prediction_type="Probability"), dtype=np.float64)
+    proba_flat = _assert_f64(proba.ravel().astype(np.float64), "predictions")
+    np.save(scenario_dir / "predictions.npy", proba_flat, allow_pickle=False)
+
+    n_iter = len(staged)
+    dim = int(np.asarray(staged[0]).shape[1]) if n_iter else 0
+    config = {
+        "scenario": scenario_dir.name,
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "loss_function": loss,
+        "leaf_estimation_method": "Newton",
+        "score_function": "Cosine",
+        "boost_from_average": False,
+        "params": params,
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "n_iterations": n_iter,
+        "approx_dimension": dim,
+        "class_labels": [0, 1, 2],
+        "target_rule": "digitize(numeric_tiny.y, quantile(y,[1/3,2/3])) -> {0,1,2}",
+        "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+        "staged_layout": (
+            "staged_predict(RawFormulaVal): per-iter (n_rows, dim) OBJECT-MAJOR "
+            "(row-major object then dim), concatenated across iterations; flat f64."
+        ),
+        "predictions_layout": (
+            "predict(Probability): (n_rows, dim) OBJECT-MAJOR row-major, flat f64."
+        ),
+        "leaf_values_layout": (
+            "model.json leaf_values are LEAF-MAJOR (leaf0_d0, leaf0_d1, ..., "
+            "leaf1_d0, ...) length leaves*dim; leaf_weights length leaves."
+        ),
+        "prediction_type": "Probability",
+    }
+    with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def gen_multiclass() -> None:
+    """multiclass_softmax/ + multiclass_onevsall/ — the Plan 06.2-03 (LOSS-02)
+    multiclass per-stage oracle. MultiClass (softmax, cross-dimension coupled
+    symmetric Hessian Newton solve) and MultiClassOneVsAll (separable per-dimension
+    diagonal sigmoid Newton). Each gates Splits / LeafValues / StagedApprox /
+    Predictions <= 1e-5 vs catboost 1.2.10 (thread_count=1, the pinned isolating
+    params)."""
+    _gen_one_multiclass(MULTICLASS_SOFTMAX, "MultiClass")
+    _gen_one_multiclass(MULTICLASS_ONEVSALL, "MultiClassOneVsAll")
+
+
+def gen_multiclass_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the Plan 06.2-03 multiclass fixtures
+    (multiclass_softmax / multiclass_onevsall) without re-running the full `main()`
+    (which would overwrite every committed Phase 2-5 / 6.1 fixture)."""
+    gen_multiclass()
+    print(
+        "Wrote multiclass oracle fixtures "
+        "(multiclass_softmax/multiclass_onevsall)"
+    )
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -2799,6 +2935,13 @@ def main() -> None:
         "(quantile_alpha07/quantile_alpha05_mae)"
     )
 
+    # --- Phase-06.2 Wave-1 multiclass fixtures (Plan 06.2-03, LOSS-02) -------
+    gen_multiclass()
+    print(
+        "Wrote multiclass oracle fixtures "
+        "(multiclass_softmax/multiclass_onevsall)"
+    )
+
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
     print(f"Wrote borders_quant oracle fixtures under {BORDERS_QUANT}")
@@ -2826,5 +2969,10 @@ if __name__ == "__main__":
         # fixtures (quantile_alpha07/quantile_alpha05_mae), leaving every committed
         # Phase 2-5 / Wave-1/2 fixture untouched.
         gen_wave3_only()
+    elif "--multiclass-only" in sys.argv:
+        # `--multiclass-only` regenerates ONLY the Plan 06.2-03 multiclass fixtures
+        # (multiclass_softmax / multiclass_onevsall), leaving every committed
+        # Phase 2-5 / 6.1 fixture untouched.
+        gen_multiclass_only()
     else:
         main()

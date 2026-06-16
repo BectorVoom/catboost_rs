@@ -80,6 +80,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
         approx_dimension: 1,
+        class_to_label: Vec::new(),
     }
 }
 
@@ -107,6 +108,7 @@ fn rust_built_model() -> Model {
         float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
         ctr_data: None,
         approx_dimension: 1,
+        class_to_label: Vec::new(),
     }
 }
 

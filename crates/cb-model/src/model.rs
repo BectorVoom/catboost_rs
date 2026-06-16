@@ -143,6 +143,12 @@ pub struct Model {
     /// Pitfall 6). At `1` leaf-major == dim-major, so the serialized bytes are
     /// byte-identical to the pre-6.2 scalar model.
     pub approx_dimension: usize,
+    /// The `ClassToLabel` map for a multiclass model (LOSS-02, Pitfall 4): the
+    /// SORTED distinct original class labels, so `class_to_label[c]` is the original
+    /// label for class index `c`. EMPTY for every scalar regression / binary model.
+    /// Predictions recover the original labels via this map (`class_params` /
+    /// `multiclass_params` model_info, verified empirically against catboost 1.2.10).
+    pub class_to_label: Vec<f64>,
 }
 
 impl Model {
@@ -200,6 +206,7 @@ impl Model {
             float_feature_borders,
             ctr_data: None,
             approx_dimension: trained.approx_dimension,
+            class_to_label: trained.class_to_label.clone(),
         }
     }
 

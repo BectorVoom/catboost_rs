@@ -415,6 +415,11 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
         float_feature_borders,
         ctr_data: None,
         approx_dimension: dim,
+        // The .cbm flatbuffer carries the class labels in the model-info blob; the
+        // per-stage train oracle constructs the model via `from_trained` (which
+        // carries `class_to_label`), so the deserialize path leaves it empty until
+        // a later plan wires the model-info class_params round-trip.
+        class_to_label: Vec::new(),
     })
 }
 

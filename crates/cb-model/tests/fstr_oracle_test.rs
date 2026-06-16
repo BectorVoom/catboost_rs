@@ -63,6 +63,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
         approx_dimension: 1,
+        class_to_label: Vec::new(),
     }
 }
 

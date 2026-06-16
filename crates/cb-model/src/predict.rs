@@ -101,3 +101,130 @@ pub fn apply_prediction_type(prediction_type: PredictionType, approx: &[f64]) ->
         PredictionType::Exponent => approx.iter().map(|&a| a.exp()).collect(),
     }
 }
+
+/// Which multiclass prediction transform a multi-dimensional model uses (LOSS-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiClassKind {
+    /// MultiClass (softmax): `Probability` = softmax over the per-object dimension
+    /// slice (the probabilities sum to 1); `Class` = argmax over dim.
+    Softmax,
+    /// MultiClassOneVsAll: `Probability` = per-dimension sigmoid (the probabilities
+    /// do NOT sum to 1); `Class` = argmax over dim.
+    OneVsAll,
+}
+
+/// The per-object softmax over `slice` (max-subtracted, `eval_processing.h:18`) —
+/// the MultiClass `Probability` transform's per-object normalizer. Reproduces the
+/// MAX-SUBTRACTION before `exp` so a large logit cannot overflow to `Inf`/`NaN`
+/// (T-6.2-02); `f64::exp` (A2). An empty slice returns empty.
+#[must_use]
+fn softmax(slice: &[f64]) -> Vec<f64> {
+    if slice.is_empty() {
+        return Vec::new();
+    }
+    let mut max_a = f64::NEG_INFINITY;
+    for &a in slice {
+        if a > max_a {
+            max_a = a;
+        }
+    }
+    let exps: Vec<f64> = slice.iter().map(|&a| (a - max_a).exp()).collect();
+    let mut sum = 0.0_f64;
+    for &e in &exps {
+        sum += e;
+    }
+    exps.iter().map(|&e| e / sum).collect()
+}
+
+/// `sigmoid(a) = 1 / (1 + exp(-a))` for the OneVsAll per-dimension `Probability`.
+#[must_use]
+fn sigmoid_pos(a: f64) -> f64 {
+    1.0 / (1.0 + (-a).exp())
+}
+
+/// Apply a multiclass prediction transform to the DIMENSION-MAJOR raw approx
+/// `approx[d * n + i]` (length `approx_dimension * n`), returning the flattened
+/// OBJECT-MAJOR output (row-major, object then dim) — matching upstream's
+/// `predict(prediction_type)` `(n, dim)` layout (LOSS-02, RESEARCH A4).
+///
+/// - `Probability`: per object, softmax over its `k` dimensions (MultiClass) or
+///   per-dimension sigmoid (OneVsAll); emits `k` values per object (`n*k` total).
+/// - `Class`: per object, the argmax dimension mapped through `class_to_label`
+///   (so the ORIGINAL label is recovered, Pitfall 4); emits ONE value per object.
+/// - `RawFormulaVal`: the raw approx transposed dim-major → object-major.
+///
+/// `class_to_label[c]` is the original label for class index `c`; an empty map
+/// falls back to the raw class index. `n = approx.len() / approx_dimension`. A
+/// zero `approx_dimension` returns empty (guarded — no div-by-zero/panic).
+#[must_use]
+pub fn apply_multiclass_prediction(
+    prediction_type: PredictionType,
+    kind: MultiClassKind,
+    approx: &[f64],
+    approx_dimension: usize,
+    class_to_label: &[f64],
+) -> Vec<f64> {
+    if approx_dimension == 0 || approx.is_empty() {
+        return Vec::new();
+    }
+    let n = approx.len() / approx_dimension;
+    // Gather each object's k-dimensional slice (dim-major -> object view).
+    let object_slice = |i: usize| -> Vec<f64> {
+        (0..approx_dimension)
+            .map(|d| approx.get(d * n + i).copied().unwrap_or(0.0))
+            .collect()
+    };
+    match prediction_type {
+        // Raw approx, transposed dim-major -> object-major (n, dim).
+        PredictionType::RawFormulaVal => {
+            let mut out = Vec::with_capacity(approx.len());
+            for i in 0..n {
+                out.extend(object_slice(i));
+            }
+            out
+        }
+        PredictionType::Probability => {
+            let mut out = Vec::with_capacity(n * approx_dimension);
+            for i in 0..n {
+                let slice = object_slice(i);
+                match kind {
+                    MultiClassKind::Softmax => out.extend(softmax(&slice)),
+                    MultiClassKind::OneVsAll => {
+                        out.extend(slice.iter().map(|&a| sigmoid_pos(a)));
+                    }
+                }
+            }
+            out
+        }
+        // Argmax over dim -> original label via class_to_label (Pitfall 4).
+        PredictionType::Class => {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let slice = object_slice(i);
+                let mut best_dim = 0usize;
+                let mut best_val = f64::NEG_INFINITY;
+                for (d, &v) in slice.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_dim = d;
+                    }
+                }
+                let label = class_to_label
+                    .get(best_dim)
+                    .copied()
+                    .unwrap_or(best_dim as f64);
+                out.push(label);
+            }
+            out
+        }
+        // LogProbability / Exponent are not multiclass transforms in scope; fall
+        // back to the raw object-major approx (no NaN, no panic).
+        PredictionType::LogProbability | PredictionType::Exponent => {
+            let mut out = Vec::with_capacity(approx.len());
+            for i in 0..n {
+                out.extend(object_slice(i));
+            }
+            out
+        }
+    }
+}

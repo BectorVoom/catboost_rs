@@ -281,6 +281,11 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         float_feature_borders,
         ctr_data: None,
         approx_dimension: dim,
+        // The json model carries class labels in `model_info.class_params`; the
+        // per-stage train oracle constructs the model via `from_trained`, so the
+        // json deserialize path leaves it empty until a later plan wires the
+        // class_params round-trip.
+        class_to_label: Vec::new(),
     })
 }
 
