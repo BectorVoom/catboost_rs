@@ -199,6 +199,20 @@ fn passes_split(model: &Model, split: &ModelSplit, features: &[f32], cat_values:
     }
 }
 
+/// The forward-bit-order leaf index of one object in one tree (Step B): the
+/// dimension-AGNOSTIC structural leaf the object lands in. Shared verbatim by the
+/// scalar ([`predict_raw_one`]) and N-dim ([`predict_raw_multi`]) apply paths so
+/// the leaf selection is identical (CR-01: only the leaf-VALUE read differs by
+/// dimension, never the leaf index).
+fn leaf_index_for(model: &Model, tree: &crate::ObliviousTree, features: &[f32], cat_values: &[String]) -> usize {
+    let passes: Vec<bool> = tree
+        .splits
+        .iter()
+        .map(|s| passes_split(model, s, features, cat_values))
+        .collect();
+    leaf_index(&passes)
+}
+
 /// Apply every oblivious tree to one object and accumulate `bias + Σ_trees
 /// leaf_values[leaf]` (Steps B + C). The per-tree leaf contributions are summed
 /// host-side through [`sum_f64`] (D-08); `bias` is added exactly once afterward
@@ -213,12 +227,7 @@ fn predict_raw_one(model: &Model, features: &[f32], cat_values: &[String]) -> f6
         .iter()
         .map(|tree| {
             // Step B: forward-bit-order leaf index over this tree's splits.
-            let passes: Vec<bool> = tree
-                .splits
-                .iter()
-                .map(|s| passes_split(model, s, features, cat_values))
-                .collect();
-            let leaf = leaf_index(&passes);
+            let leaf = leaf_index_for(model, tree, features, cat_values);
             // Step C (per tree): the leaf value (already learning_rate-scaled).
             // Out-of-range leaf indices contribute 0.0 (T-04-02-01 checked access).
             tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
@@ -262,6 +271,12 @@ pub fn predict_raw_cat(
     feature_values: &[Vec<f32>],
     cat_columns: &[Vec<String>],
 ) -> Vec<f64> {
+    // Multi-output models (`approx_dimension > 1`) route through the dim-aware
+    // accumulator (CR-01). A scalar model (`<= 1`) keeps the BYTE-IDENTICAL scalar
+    // `predict_raw_one` path (D-04 on the public apply surface).
+    if model.approx_dimension > 1 {
+        return predict_raw_multi_cat(model, feature_values, cat_columns);
+    }
     let n_float = feature_values.first().map_or(0, Vec::len);
     let n_cat = cat_columns.first().map_or(0, Vec::len);
     let n_objects = n_float.max(n_cat);
@@ -281,4 +296,88 @@ pub fn predict_raw_cat(
             predict_raw_one(model, &row, &cats)
         })
         .collect()
+}
+
+/// Apply `model` to a numeric feature view, returning the DIMENSION-MAJOR raw
+/// approx of length `approx_dimension * n` (output index `d * n + i`) — the public
+/// N-dim apply for multi-output models (MultiClass / MultiClassOneVsAll /
+/// MultiLogloss / MultiCrossEntropy / MultiQuantile), closing CR-01.
+///
+/// This is the producer [`crate::apply_multiclass_prediction`] consumes: a loaded
+/// model.json / .cbm multi-output model predicts ALL `approx_dimension` outputs,
+/// not just dimension 0. At `approx_dimension <= 1` the output is BYTE-IDENTICAL
+/// to [`predict_raw`] (the multi accumulator collapses to the scalar path — same
+/// leaf index, same `bias + leaf_value` per object), preserving D-04 on the
+/// public surface. Models with CTR splits need the categorical columns — use the
+/// `cat_columns` form via [`predict_raw_multi_cat`] is internal; this numeric
+/// wrapper passes `&[]`.
+#[must_use]
+pub fn predict_raw_multi(model: &Model, feature_values: &[Vec<f32>]) -> Vec<f64> {
+    predict_raw_multi_cat(model, feature_values, &[])
+}
+
+/// The dim-aware accumulator backing [`predict_raw_multi`] (and the multi-output
+/// branch of [`predict_raw_cat`]).
+///
+/// Per object: compute the forward-bit-order `leaf` ONCE ([`leaf_index_for`] —
+/// the leaf index is dimension-agnostic). Per tree, set
+/// `n_leaves = tree.leaf_values.len() / dim` (checked; a non-multiple yields a
+/// 0-contribution, never a panic) and, for each `d in 0..dim`, read
+/// `tree.leaf_values.get(d * n_leaves + leaf)` (the DIMENSION-MAJOR in-memory
+/// buffer — the loaded model un-transposes the LEAF-MAJOR wire form to dim-major).
+/// The per-(dim, object) tree contributions are summed through [`sum_f64`] (D-08),
+/// then `model.bias` is added exactly once per output slot (single scalar bias
+/// this wave, RESEARCH Pitfall 6). All access is checked `.get` (`indexing_slicing`
+/// deny, T-6.2-06-01).
+#[must_use]
+fn predict_raw_multi_cat(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    cat_columns: &[Vec<String>],
+) -> Vec<f64> {
+    let dim = model.approx_dimension.max(1);
+    let n_float = feature_values.first().map_or(0, Vec::len);
+    let n_cat = cat_columns.first().map_or(0, Vec::len);
+    let n = n_float.max(n_cat);
+
+    // dim-major output `out[d * n + i]`, seeded with `bias` per slot (single
+    // scalar bias this wave — added exactly once, RESEARCH Pitfall 6).
+    let mut out = vec![model.bias; dim.saturating_mul(n)];
+
+    for obj in 0..n {
+        // This object's float row + raw cat values (checked `.get`; a short float
+        // column reads NaN, failing every strict `> border` test).
+        let row: Vec<f32> = feature_values
+            .iter()
+            .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+            .collect();
+        let cats: Vec<String> = cat_columns
+            .iter()
+            .map(|col| col.get(obj).cloned().unwrap_or_default())
+            .collect();
+
+        // Per dimension, accumulate this object's per-tree leaf values through the
+        // order-locked sum (D-08), then the seeded `bias` already holds the +bias.
+        for d in 0..dim {
+            let contributions: Vec<f64> = model
+                .oblivious_trees
+                .iter()
+                .map(|tree| {
+                    let leaf = leaf_index_for(model, tree, &row, &cats);
+                    // n_leaves = leaf_values.len() / dim (checked); a non-multiple
+                    // makes n_leaves a floor and the read may fall out of range,
+                    // which contributes 0.0 (T-6.2-06-01) — never a panic.
+                    let n_leaves = tree.leaf_values.len() / dim;
+                    tree.leaf_values
+                        .get(d.saturating_mul(n_leaves).saturating_add(leaf))
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            if let Some(slot) = out.get_mut(d.saturating_mul(n).saturating_add(obj)) {
+                *slot += sum_f64(&contributions);
+            }
+        }
+    }
+    out
 }
