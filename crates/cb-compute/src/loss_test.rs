@@ -5,8 +5,9 @@
 use crate::loss::{
     cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2, focal_der1, focal_der2,
     huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1, logloss_der2, lq_der1,
-    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, rmse_der1,
-    rmse_der2, sigmoid, tweedie_der1, tweedie_der2,
+    lq_der2, mae_der1, mae_der2, mape_der1, mape_der2, poisson_der1, poisson_der2, quantile_der1,
+    quantile_der2, rmse_der1, rmse_der2, sigmoid, tweedie_der1, tweedie_der2, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
 };
 
 #[test]
@@ -114,6 +115,43 @@ fn mae_der1_deadzone_returns_zero() {
 fn mae_der2_is_zero() {
     assert_eq!(mae_der2(0.5, 2.0), 0.0);
     assert_eq!(mae_der2(-3.0, 7.0), 0.0);
+}
+
+#[test]
+fn quantile_der1_at_alpha07_is_asymmetric() {
+    // alpha=0.7: residual > delta -> +alpha (0.7); residual < -delta ->
+    // -(1-alpha) (-0.3); |residual| < delta -> 0 (the deadzone).
+    let alpha = 0.7;
+    let delta = 1e-6;
+    // target above approx (val = target - approx > 0) -> +0.7.
+    assert!((quantile_der1(0.0, 2.0, alpha, delta) - 0.7).abs() < 1e-12);
+    // target below approx (val < 0) -> -(1 - 0.7) = -0.3.
+    assert!((quantile_der1(2.0, 0.0, alpha, delta) - (-0.3)).abs() < 1e-12);
+    // |val| < delta -> deadzone 0.
+    assert_eq!(quantile_der1(1.0, 1.0, alpha, delta), 0.0);
+    assert_eq!(quantile_der1(1.0, 1.0 + 1e-9, alpha, delta), 0.0);
+}
+
+#[test]
+fn quantile_der1_at_alpha05_equals_mae() {
+    // The MAE-equivalence guarantee: quantile_der1(a, t, 0.5, 1e-6) == mae_der1(a,
+    // t) at sample points (above, below, deadzone). MAE byte-stability hinges on
+    // this — re-expressing MAE through Quantile must not move the math.
+    for &(a, t) in &[(0.0, 2.0), (2.0, 0.0), (1.0, 1.0), (3.0, -4.5), (-1.0, -1.0)] {
+        assert_eq!(
+            quantile_der1(a, t, QUANTILE_ALPHA, QUANTILE_DELTA),
+            mae_der1(a, t),
+            "quantile_der1({a}, {t}, 0.5, 1e-6) must equal mae_der1({a}, {t})"
+        );
+    }
+}
+
+#[test]
+fn quantile_der2_is_zero() {
+    // der2 == 0 for any alpha/delta (TQuantileError QUANTILE_DER2 = 0).
+    assert_eq!(quantile_der2(0.5, 2.0, 0.7, 1e-6), 0.0);
+    assert_eq!(quantile_der2(-3.0, 7.0, 0.5, 1e-6), 0.0);
+    assert_eq!(quantile_der2(1.0, 1.0, 0.9, 1e-3), 0.0);
 }
 
 // ---- Wave-1 smooth losses (D-6.1-02) ----
