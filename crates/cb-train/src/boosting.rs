@@ -1976,16 +1976,55 @@ fn train_inner<R: Runtime>(
             }
         }
 
+        // CR-02 (06.2-07): the sampling path operates PER OBJECT on the L2 norm
+        // of the multi-dimensional gradient, not on the dim-major buffer.
+        // Upstream (`mvs.cpp:50-55` `CalculateMeanGradValue`,
+        // `greedy_tensor_search.cpp:92-107`) aggregates each object's gradient
+        // across dimensions: `der_obj[i] = sqrt(Σ_d weighted_der1[d*n+i]²)`. This
+        // per-object vector (length `n`, NOT `dim*n`) is what `bootstrap` /
+        // `mvs_lambda` consume so `set_sampled_control` / `mvs_sample_weights`
+        // draw and mask PER OBJECT (the RNG phase advances by `n`, not `dim*n`).
+        // At `approx_dimension == 1` this is `sqrt(wd²) == |wd|` and the buffer
+        // already has length `n`, so the scalar bootstrap/MVS inputs are
+        // byte-identical to before (D-04). The per-dim squares route through the
+        // sanctioned ordered `sum_f64` (D-08).
+        let der_obj: Vec<f64> = (0..n)
+            .map(|i| {
+                let squares: Vec<f64> = (0..approx_dimension)
+                    .map(|d| {
+                        let v = weighted_der1.get(d * n + i).copied().unwrap_or(0.0);
+                        v * v
+                    })
+                    .collect();
+                sum_f64(&squares).sqrt()
+            })
+            .collect();
+
         // 1b. Bootstrap / sampling (TRAIN-04): once per tree, on the continuous
-        //     RNG. MVS reads the weighted derivatives; the others ignore them.
+        //     RNG. MVS reads the per-OBJECT derivatives; the others ignore them.
         let sampled = bootstrap(
             params.bootstrap_type,
-            &weighted_der1,
+            &der_obj,
             params.subsample,
             params.bagging_temperature,
             prev_leaf_mean_l2,
             &mut rng,
         )?;
+
+        // WR-04 (06.2-07): after CR-02 the sample weight / control mask are
+        // per-OBJECT (length `n`). Assert it so a future dimension-major
+        // regression is caught here rather than silently truncated by the
+        // dim-major `zip` below (which would re-introduce CR-02).
+        debug_assert_eq!(
+            sampled.sample_weights.len(),
+            n,
+            "sample weights must be per-object (length n), not dim-major"
+        );
+        debug_assert_eq!(
+            sampled.control.len(),
+            n,
+            "control mask must be per-object (length n), not dim-major"
+        );
 
         // The SAMPLE WEIGHTS and CONTROL mask affect ONLY the SPLIT SCORING
         // (the `sampledDocs` histogram path); LEAF VALUES are estimated on the
@@ -1996,17 +2035,40 @@ fn train_inner<R: Runtime>(
         //     histogram reduction, exactly as `sampledDocs` drops it).
         //   * LEAF path: the raw weighted_der1 / weights (no sampling) —
         //     unchanged from the first slice.
+        // The per-OBJECT sample weight / control (length `n`) is shared across
+        // ALL dimensions of the dim-major score buffer: object `i`'s weight
+        // `sample_weights[i]` multiplies every dimension `d*n + i`
+        // (tensor_search_helpers.cpp:468-472 — the same per-object weight the
+        // leaf path already shares). At `approx_dimension == 1`, `idx % n == idx`
+        // so this is byte-identical to the prior per-object zip (D-04).
         let score_weighted_der1: Vec<f64> = weighted_der1
             .iter()
-            .zip(sampled.sample_weights.iter())
-            .zip(sampled.control.iter())
-            .map(|((&d, &sw), &c)| if c { d * sw } else { 0.0 })
+            .enumerate()
+            .map(|(idx, &d)| {
+                let i = idx % n;
+                let sw = sampled.sample_weights.get(i).copied().unwrap_or(1.0);
+                let c = sampled.control.get(i).copied().unwrap_or(true);
+                if c {
+                    d * sw
+                } else {
+                    0.0
+                }
+            })
             .collect();
+        // `score_weights` stays per-OBJECT (length `n`): the histogram weight is
+        // per object, masked/scaled by the per-object sample weight.
         let score_weights: Vec<f64> = weights
             .iter()
-            .zip(sampled.sample_weights.iter())
-            .zip(sampled.control.iter())
-            .map(|((&w, &sw), &c)| if c { w * sw } else { 0.0 })
+            .enumerate()
+            .map(|(i, &w)| {
+                let sw = sampled.sample_weights.get(i).copied().unwrap_or(1.0);
+                let c = sampled.control.get(i).copied().unwrap_or(true);
+                if c {
+                    w * sw
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         // 2. Grow one oblivious tree using the L2 split score over the ordered
@@ -2027,7 +2089,12 @@ fn train_inner<R: Runtime>(
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
         let perturb = if perturb_active {
             let model_length = iter as f64 * learning_rate;
-            let std_dev = score_st_dev(params.random_strength, &weighted_der1, model_length);
+            // CR-02: std-dev sums `wd²` over the FULL dim-major buffer but
+            // divides by the per-OBJECT count `n` (NOT `dim*n`); the `ln(n)`
+            // model-size multiplier likewise uses `n` (greedy_tensor_search.cpp:
+            // 106, 125). At dim=1, `weighted_der1.len() == n` so this is
+            // byte-identical to the prior call (D-04).
+            let std_dev = score_st_dev(params.random_strength, &weighted_der1, n, model_length);
             Some(Perturbation {
                 rng: &mut rng,
                 score_st_dev: std_dev,

@@ -133,8 +133,9 @@ fn l2_split_score_hand_computed_bucket() {
 #[test]
 fn derivatives_std_dev_from_zero_is_rms_of_weighted_ders() {
     // Plain boosting: sqrt(sum(wd^2)/n) (CalcDerivativesStDevFromZeroPlainBoosting).
+    // dim=1: buffer length == n == 4 (D-04 scalar path unchanged).
     let wd = [1.0, -2.0, 3.0, -0.5];
-    let got = derivatives_std_dev_from_zero(&wd);
+    let got = derivatives_std_dev_from_zero(&wd, wd.len());
     assert!(
         (got - 1.887_458_608_817_687_5).abs() < 1e-13,
         "dsdz mismatch: {got}"
@@ -143,8 +144,32 @@ fn derivatives_std_dev_from_zero_is_rms_of_weighted_ders() {
 
 #[test]
 fn derivatives_std_dev_from_zero_empty_is_zero() {
-    // Guarded: an empty derivative vector yields 0.0 (no divide-by-zero).
-    assert_eq!(derivatives_std_dev_from_zero(&[]), 0.0);
+    // Guarded: n==0 yields 0.0 (no divide-by-zero).
+    assert_eq!(derivatives_std_dev_from_zero(&[], 0), 0.0);
+}
+
+#[test]
+fn derivatives_std_dev_from_zero_multidim_divides_by_n_not_dim_n() {
+    // CR-02: with approx_dimension=2 and n=2, the dim-major buffer has length
+    // dim*n = 4. sum2 = Σ over ALL 4 elements; divisor is the per-object count
+    // n=2, NOT dim*n=4 (CalcDerivativesStDevFromZeroPlainBoosting divides by
+    // weightedDerivatives.front().size() == n).
+    let n = 2usize;
+    // dim 0: [1.0, -2.0]; dim 1: [3.0, -0.5]  (dim-major: d*n + i)
+    let wd = [1.0, -2.0, 3.0, -0.5];
+    let sum2 = 1.0 + 4.0 + 9.0 + 0.25; // 14.25
+    let expected = (sum2 / n as f64).sqrt(); // sqrt(7.125)
+    let got = derivatives_std_dev_from_zero(&wd, n);
+    assert!(
+        (got - expected).abs() < 1e-13,
+        "multidim dsdz must divide by n={n}: got {got}, expected {expected}"
+    );
+    // And it must NOT equal the wrong divide-by-(dim*n) value.
+    let wrong = (sum2 / wd.len() as f64).sqrt();
+    assert!(
+        (got - wrong).abs() > 1e-9,
+        "dsdz must not divide by dim*n={}", wd.len()
+    );
 }
 
 #[test]
@@ -152,7 +177,7 @@ fn score_st_dev_applies_model_size_multiplier() {
     // scoreStDev = random_strength * dsdz * modelLeft/(1+modelLeft),
     // modelLeft = exp(ln(n) - modelLength). n=4, modelLength=0.2, rs=1.0.
     let wd = [1.0, -2.0, 3.0, -0.5];
-    let got = score_st_dev(1.0, &wd, 0.2);
+    let got = score_st_dev(1.0, &wd, wd.len(), 0.2);
     assert!(
         (got - 1.445_939_871_899_679_9).abs() < 1e-13,
         "scoreStDev mismatch: {got}"
@@ -163,8 +188,8 @@ fn score_st_dev_applies_model_size_multiplier() {
 fn score_st_dev_first_tree_multiplier() {
     // modelLength=0 -> modelLeft = n -> mult = n/(1+n) = 4/5 = 0.8.
     let wd = [1.0, -2.0, 3.0, -0.5];
-    let dsdz = derivatives_std_dev_from_zero(&wd);
-    let got = score_st_dev(1.0, &wd, 0.0);
+    let dsdz = derivatives_std_dev_from_zero(&wd, wd.len());
+    let got = score_st_dev(1.0, &wd, wd.len(), 0.0);
     assert!((got - dsdz * 0.8).abs() < 1e-13, "first-tree scoreStDev: {got}");
 }
 
@@ -172,7 +197,7 @@ fn score_st_dev_first_tree_multiplier() {
 fn score_st_dev_zero_random_strength_is_zero() {
     // random_strength=0 -> no perturbation magnitude (first-slice behaviour).
     let wd = [1.0, -2.0, 3.0, -0.5];
-    assert_eq!(score_st_dev(0.0, &wd, 0.2), 0.0);
+    assert_eq!(score_st_dev(0.0, &wd, wd.len(), 0.2), 0.0);
 }
 
 // CR-01 CONTRACT (isolated RED->GREEN at the unit boundary): upstream
@@ -198,8 +223,8 @@ fn score_st_dev_masked_vector_biases_low_vs_full_fold_cr01() {
     // the shape the buggy boosting score path passed in.
     let masked = [1.0, 0.0, 3.0, 0.0];
 
-    let dsdz_full = derivatives_std_dev_from_zero(&full);
-    let dsdz_masked = derivatives_std_dev_from_zero(&masked);
+    let dsdz_full = derivatives_std_dev_from_zero(&full, full.len());
+    let dsdz_masked = derivatives_std_dev_from_zero(&masked, masked.len());
 
     // The masked numerator under-counts (zeroed entries contribute 0) while the
     // denominator n=4 is unchanged -> masked std-dev is strictly LOWER.
@@ -218,8 +243,8 @@ fn score_st_dev_masked_vector_biases_low_vs_full_fold_cr01() {
     // so the scoreStDev difference is carried entirely by the numerator: the
     // FULL fold is the upstream-correct input.
     let model_length = 0.0; // first tree
-    let sd_full = score_st_dev(1.0, &full, model_length);
-    let sd_masked = score_st_dev(1.0, &masked, model_length);
+    let sd_full = score_st_dev(1.0, &full, full.len(), model_length);
+    let sd_masked = score_st_dev(1.0, &masked, masked.len(), model_length);
     assert!(
         sd_masked < sd_full,
         "masked scoreStDev ({sd_masked}) must be < full scoreStDev ({sd_full})"

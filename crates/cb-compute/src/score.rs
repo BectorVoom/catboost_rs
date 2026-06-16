@@ -156,15 +156,22 @@ pub fn multi_dim_split_score(
 
 /// `CalcDerivativesStDevFromZeroPlainBoosting`
 /// (`greedy_tensor_search.cpp:92-107`): the RMS of the (weighted) first
-/// derivatives over all objects, `sqrt(sum(wd_i^2) / n)`. This is the per-tree
-/// scale the `random_strength` perturbation is measured in.
+/// derivatives, `sqrt(sum2 / n)` where `sum2 = Σ_d L2NormSquared(der[d])` is
+/// summed over the FULL dimension-major buffer (all `approx_dimension * n`
+/// elements) and the divisor is the per-OBJECT count `n`
+/// (`weightedDerivatives.front().size()`), NOT the buffer length. This is the
+/// per-tree scale the `random_strength` perturbation is measured in.
+///
+/// `weighted_der1` is the dimension-major weighted first-derivative buffer
+/// (length `approx_dimension * n`); `n` is the per-object count. At
+/// `approx_dimension == 1` the buffer length equals `n` and this reduces to the
+/// historical scalar `sqrt(sum(wd_i^2) / n)` (D-04).
 ///
 /// The sum of squares routes through the sanctioned ordered reduction
-/// ([`sum_f64`], D-08); an empty derivative vector returns `0.0` (guarded, no
-/// divide-by-zero — the trainer never grows a tree on an empty fold).
+/// ([`sum_f64`], D-08); `n == 0` returns `0.0` (guarded, no divide-by-zero —
+/// the trainer never grows a tree on an empty fold).
 #[must_use]
-pub fn derivatives_std_dev_from_zero(weighted_der1: &[f64]) -> f64 {
-    let n = weighted_der1.len();
+pub fn derivatives_std_dev_from_zero(weighted_der1: &[f64], n: usize) -> f64 {
     if n == 0 {
         return 0.0;
     }
@@ -189,14 +196,17 @@ fn model_size_multiplier(n: usize, model_length: f64) -> f64 {
 /// `random_strength * derivativesStDevFromZero * modelSizeMultiplier` for the
 /// default `random_score_type = NormalWithModelSizeDecrease`.
 ///
-/// `weighted_der1` is the per-object weighted first derivative (the same fold the
-/// score histogram reduces); `model_length = tree_index * learning_rate`. A
-/// `random_strength` of `0.0` yields `0.0` (no perturbation — the first-slice
-/// behaviour where no normal magnitude is applied).
+/// `weighted_der1` is the dimension-major weighted first-derivative buffer
+/// (length `approx_dimension * n`, the same fold the score histogram reduces);
+/// `n` is the per-OBJECT count (the `learnSampleCount` upstream feeds BOTH the
+/// std-dev divisor AND the `ln(n)` model-size multiplier — never `dim*n`);
+/// `model_length = tree_index * learning_rate`. A `random_strength` of `0.0`
+/// yields `0.0` (no perturbation — the first-slice behaviour where no normal
+/// magnitude is applied).
 #[must_use]
-pub fn score_st_dev(random_strength: f64, weighted_der1: &[f64], model_length: f64) -> f64 {
-    let dsdz = derivatives_std_dev_from_zero(weighted_der1);
-    let mult = model_size_multiplier(weighted_der1.len(), model_length);
+pub fn score_st_dev(random_strength: f64, weighted_der1: &[f64], n: usize, model_length: f64) -> f64 {
+    let dsdz = derivatives_std_dev_from_zero(weighted_der1, n);
+    let mult = model_size_multiplier(n, model_length);
     random_strength * dsdz * mult
 }
 
