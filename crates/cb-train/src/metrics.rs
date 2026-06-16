@@ -34,12 +34,24 @@
 use cb_compute::{sigmoid, Loss};
 use cb_core::{sum_f64, CbError, CbResult};
 
+use crate::ranking_metrics::{
+    dcg_group, err_group, map_at_group, mrr_group, ndcg_group, pfound_group, precision_at_group,
+    query_auc_group, recall_at_group, AucType, DcgDenominator, DcgMetricType,
+};
+
 /// The validation metric reported per iteration per eval set (`eval_metric`).
 ///
 /// `eval_metric` defaults to the objective ([`EvalMetric::for_loss`]); it can be
 /// overridden explicitly. This phase covers the two metrics matching the two
 /// objectives — RMSE and Logloss.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The ranking metrics (NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/
+/// QueryAUC) carry their upstream params (`top`/`border`/`decay`/type) via the
+/// established variant-with-params pattern and are evaluated through
+/// [`EvalMetric::eval_grouped`] (group seam, D-6.3-05); they are eval-only (no
+/// derivative). `Eq` is NOT derived because the ranking variants carry `f64`
+/// params (`border`/`decay`).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EvalMetric {
     /// Root-mean-square error: `sqrt(sum_w (pred-target)^2 / sum_w)`.
     Rmse,
@@ -52,6 +64,73 @@ pub enum EvalMetric {
     /// (`EvalMetric::for_loss` has no MSLE arm). The approx is RAW (`isExpApprox`
     /// asserted false upstream, `metric.cpp:1912`).
     Msle,
+    /// Normalized DCG per group, averaged over groups (`metric.cpp:3079`).
+    /// `top=-1` → full group; upstream defaults `type=Base`,
+    /// `denominator=LogPosition`, `normalized=true`. IDCG==0 → 1.
+    Ndcg {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Numerator gain type (`Base` default).
+        dcg_type: DcgMetricType,
+        /// Position-discount denominator (`LogPosition` default).
+        denominator: DcgDenominator,
+    },
+    /// DCG per group, averaged over groups (`metric.cpp:3079`, `normalized=false`).
+    Dcg {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Numerator gain type (`Base` default).
+        dcg_type: DcgMetricType,
+        /// Position-discount denominator (`LogPosition` default).
+        denominator: DcgDenominator,
+    },
+    /// Mean Average Precision @k per group (`metric.cpp:4564`). `border` default
+    /// `0.5` (`GetDefaultTargetBorder`).
+    Map {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Relevance binarization threshold (`target > border`).
+        border: f64,
+    },
+    /// Mean Reciprocal Rank per group (`metric.cpp:6062`).
+    Mrr {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Relevance binarization threshold (`target > border`).
+        border: f64,
+    },
+    /// Expected Reciprocal Rank per group (`metric.cpp:6166`).
+    Err {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+    },
+    /// PFound cascade per group (`metric.cpp:2918`). `decay` default `0.85`.
+    PFound {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Cascade decay factor (default `0.85`).
+        decay: f64,
+    },
+    /// Precision @k per group (`metric.cpp:4369`). `border` default `0.5`.
+    PrecisionAt {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Relevance binarization threshold (`target > border`).
+        border: f64,
+    },
+    /// Recall @k per group (`metric.cpp:4466`). `border` default `0.5`.
+    RecallAt {
+        /// `top` size; `-1` (default) uses the full group.
+        top: i64,
+        /// Relevance binarization threshold (`target > border`).
+        border: f64,
+    },
+    /// Per-group AUC averaged over groups (`metric.cpp:5606`). Singleclass
+    /// `Classic` (binary-class AUC) default; `Ranking` for graded relevance.
+    QueryAuc {
+        /// Singleclass AUC type (`Classic` default).
+        auc_type: AucType,
+    },
 }
 
 impl EvalMetric {
@@ -207,8 +286,209 @@ impl EvalMetric {
                 }
                 Ok(sum_f64(&weighted_sq) / total_weight)
             }
+            // The ranking metrics are per-query-group quantities — they are
+            // evaluated through `eval_grouped` (D-6.3-05), never the flat path.
+            // Selecting one here is a misuse, surfaced as a typed error (never a
+            // panic). The flat path above stays byte-identical (D-04).
+            Self::Ndcg { .. }
+            | Self::Dcg { .. }
+            | Self::Map { .. }
+            | Self::Mrr { .. }
+            | Self::Err { .. }
+            | Self::PFound { .. }
+            | Self::PrecisionAt { .. }
+            | Self::RecallAt { .. }
+            | Self::QueryAuc { .. } => Err(CbError::Degenerate(
+                "ranking eval metric requires the grouped seam (use eval_grouped)".to_owned(),
+            )),
         }
     }
+
+    /// Compute a ranking eval metric over a grouped eval set (D-6.3-05).
+    ///
+    /// `approx[i]`/`target[i]` are object `i`'s raw approximant and graded
+    /// relevance label; `weights` is empty (uniform `1.0`) or per-object.
+    /// `group_id` carries the per-object query-group id (contiguous, unique runs —
+    /// mirrors upstream `GroupSamples`); when empty the whole eval set is treated
+    /// as one group. `subgroup_id` is accepted for API symmetry (only PFound uses
+    /// it upstream to dedup positions; the in-scope fixtures do not set it).
+    ///
+    /// Each metric is computed per group and averaged over groups. The weighting
+    /// matches upstream exactly: DCG/NDCG/PFound/ERR/MRR/QueryAUC weight each group
+    /// by its group weight (mean of member weights, else `1.0`); MAP/PrecisionAt/
+    /// RecallAt weight every group uniformly (`Stats[1]++`,
+    /// `metric.cpp:4390/4487/4586`). Every per-group and cross-group reduction
+    /// routes through `cb_core::sum_f64` (group asc — D-08).
+    ///
+    /// The non-ranking metrics (RMSE/Logloss/MSLE) are rejected here with a typed
+    /// error — they use the flat [`EvalMetric::eval`] path (kept byte-identical,
+    /// D-04).
+    ///
+    /// # Errors
+    /// - [`CbError::Degenerate`] if `approx`/`target`/`group_id`/`weights` lengths
+    ///   disagree, the eval set is empty, `group_id` is non-contiguous, or a
+    ///   non-ranking metric is selected.
+    pub fn eval_grouped(
+        self,
+        approx: &[f64],
+        target: &[f64],
+        weights: &[f64],
+        group_id: &[u64],
+        subgroup_id: &[u64],
+    ) -> CbResult<f64> {
+        let _ = subgroup_id; // accepted for API symmetry; unused by the in-scope metrics.
+        if approx.len() != target.len() {
+            return Err(CbError::Degenerate(
+                "ranking eval: approx/target length mismatch".to_owned(),
+            ));
+        }
+        if approx.is_empty() {
+            return Err(CbError::Degenerate("ranking eval: empty eval set".to_owned()));
+        }
+        if !weights.is_empty() && weights.len() != approx.len() {
+            return Err(CbError::Degenerate(
+                "ranking eval: weights length mismatch".to_owned(),
+            ));
+        }
+        if !group_id.is_empty() && group_id.len() != approx.len() {
+            return Err(CbError::Degenerate(
+                "ranking eval: group_id length mismatch".to_owned(),
+            ));
+        }
+
+        // (1) Detect contiguous group runs as half-open [begin, end) spans
+        //     (mirrors `build_query_info` / upstream `GroupSamples`). An empty
+        //     group_id is one big group.
+        let spans = group_spans(group_id, approx.len())?;
+
+        // (2) Per-group weight (mean of member weights, else 1.0) — reduced
+        //     through cb_core::sum_f64 (D-08).
+        let weight_at = |i: usize| -> f64 {
+            if weights.is_empty() {
+                1.0
+            } else {
+                weights.get(i).copied().unwrap_or(1.0)
+            }
+        };
+
+        // (3) Whether this metric weights groups by group weight (DCG family,
+        //     PFound, ERR, MRR, QueryAUC) or uniformly (MAP/Precision/Recall —
+        //     `Stats[1]++`).
+        let use_group_weight = matches!(
+            self,
+            Self::Ndcg { .. }
+                | Self::Dcg { .. }
+                | Self::PFound { .. }
+                | Self::Err { .. }
+                | Self::Mrr { .. }
+                | Self::QueryAuc { .. }
+        );
+
+        let mut numerators: Vec<f64> = Vec::with_capacity(spans.len());
+        let mut denominators: Vec<f64> = Vec::with_capacity(spans.len());
+        for &(begin, end) in &spans {
+            let a = approx.get(begin..end).ok_or_else(|| {
+                CbError::Degenerate("ranking eval: group span out of range".to_owned())
+            })?;
+            let t = target.get(begin..end).ok_or_else(|| {
+                CbError::Degenerate("ranking eval: group span out of range".to_owned())
+            })?;
+            if a.is_empty() {
+                continue; // empty group contributes nothing (never divides).
+            }
+            let group_weight = if use_group_weight {
+                let members: Vec<f64> = (begin..end).map(weight_at).collect();
+                sum_f64(&members) / (members.len() as f64)
+            } else {
+                1.0
+            };
+            let value = self.eval_one_group(a, t)?;
+            numerators.push(group_weight * value);
+            denominators.push(group_weight);
+        }
+
+        let total = sum_f64(&denominators);
+        if !total.is_finite() || total <= 0.0 {
+            // No groups / zero total weight: upstream `GetFinalError` returns 0
+            // (PFound/DCG/NDCG/ERR/MRR/MAP) or 1 (Precision/Recall). Mirror the
+            // per-metric default rather than dividing.
+            return Ok(self.empty_metric_default());
+        }
+        Ok(sum_f64(&numerators) / total)
+    }
+
+    /// The per-group metric value for ONE group's approx/target slice (no
+    /// weighting — the caller applies the group weight).
+    fn eval_one_group(self, approx: &[f64], target: &[f64]) -> CbResult<f64> {
+        Ok(match self {
+            Self::Ndcg {
+                top,
+                dcg_type,
+                denominator,
+            } => ndcg_group(approx, target, top, dcg_type, denominator),
+            Self::Dcg {
+                top,
+                dcg_type,
+                denominator,
+            } => dcg_group(approx, target, top, dcg_type, denominator),
+            Self::Map { top, border } => map_at_group(approx, target, top, border),
+            Self::Mrr { top, border } => mrr_group(approx, target, top, border),
+            Self::Err { top } => err_group(approx, target, top),
+            Self::PFound { top, decay } => pfound_group(approx, target, top, decay),
+            Self::PrecisionAt { top, border } => precision_at_group(approx, target, top, border),
+            Self::RecallAt { top, border } => recall_at_group(approx, target, top, border),
+            Self::QueryAuc { auc_type } => query_auc_group(approx, target, auc_type),
+            Self::Rmse | Self::Logloss | Self::Msle => {
+                return Err(CbError::Degenerate(
+                    "non-ranking metric passed to the grouped seam (use eval)".to_owned(),
+                ))
+            }
+        })
+    }
+
+    /// The empty-eval-set default per metric (`GetFinalError` with `Stats[1]==0`):
+    /// Precision/Recall return `1`, every other ranking metric returns `0`.
+    fn empty_metric_default(self) -> f64 {
+        match self {
+            Self::PrecisionAt { .. } | Self::RecallAt { .. } => 1.0,
+            _ => 0.0,
+        }
+    }
+}
+
+/// Detect contiguous group runs as half-open `[begin, end)` spans (mirrors
+/// `build_query_info` / upstream `GroupSamples`, `query.h:48-67`): each run is one
+/// group; a group id reappearing after a different id intervened is rejected
+/// (typed `CbError::Degenerate`, never a panic). An empty `group_id` yields a
+/// single span covering all `n_rows` objects.
+fn group_spans(group_id: &[u64], n_rows: usize) -> CbResult<Vec<(usize, usize)>> {
+    if group_id.is_empty() {
+        return Ok(if n_rows == 0 {
+            Vec::new()
+        } else {
+            vec![(0, n_rows)]
+        });
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut seen: Vec<u64> = Vec::new();
+    let mut i = 0usize;
+    while i < group_id.len() {
+        let current = group_id.get(i).copied().unwrap_or_default();
+        let begin = i;
+        i += 1;
+        while i < group_id.len() && group_id.get(i).copied() == Some(current) {
+            i += 1;
+        }
+        runs.push((begin, i));
+        seen.push(current);
+    }
+    seen.sort_unstable();
+    if seen.windows(2).any(|w| w.first() == w.get(1)) {
+        return Err(CbError::Degenerate(
+            "ranking eval: group_id is not contiguous (queryIds should be grouped)".to_owned(),
+        ));
+    }
+    Ok(runs)
 }
 
 /// Per-eval-set per-iteration metric history (TRAIN-07 logging).

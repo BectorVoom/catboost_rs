@@ -24,6 +24,7 @@ mod overfit;
 mod permutation;
 mod projection;
 mod query_info;
+mod ranking_metrics;
 mod tree;
 
 pub use autolr::{coefficients as autolr_coefficients, guess as autolr_guess, TargetType};
@@ -55,6 +56,11 @@ pub use permutation::{
 };
 pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
 pub use query_info::{build_query_info, Competitor, QueryInfo};
+pub use ranking_metrics::{
+    clamp_top, compare_docs, dcg_group, err_group, map_at_group, mrr_group, ndcg_group,
+    pfound_group, precision_at_group, query_auc_group, recall_at_group, AucType, DcgDenominator,
+    DcgMetricType,
+};
 pub use boosting::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
     counter_calc_method_default, ctr_border_count_default, fold_len_multiplier_default,
