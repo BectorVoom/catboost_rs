@@ -2675,6 +2675,7 @@ MULTICLASS_SOFTMAX = FIXTURES / "multiclass_softmax"
 MULTICLASS_ONEVSALL = FIXTURES / "multiclass_onevsall"
 MULTILOGLOSS = FIXTURES / "multilogloss"
 MULTICROSSENTROPY = FIXTURES / "multicrossentropy"
+MULTIQUANTILE = FIXTURES / "multiquantile"
 
 
 def _multiclass_target() -> np.ndarray:
@@ -2940,6 +2941,142 @@ def gen_multilabel_only() -> None:
     )
 
 
+# The per-quantile alpha vector for the multiquantile fixture (K=3 independent
+# quantile dimensions). Mirrored verbatim by the Rust oracle test.
+MULTIQUANTILE_ALPHAS = [0.1, 0.5, 0.9]
+
+
+def gen_multiquantile() -> None:
+    """multiquantile/ — the Plan 06.2-05 (LOSS-03 multi-output) MultiQuantile
+    per-stage oracle. MultiQuantile = K INDEPENDENT Quantile dimensions (D-6.2-05):
+    each dimension d is a standalone quantile at its own level alpha[d], reusing the
+    scalar quantile der + the 6.1 Exact weighted-alpha-quantile leaf per dimension.
+
+    Trained as a CatBoostRegressor on the frozen numeric_tiny corpus (the RAW target
+    `y` — MultiQuantile admits the full real line, like the 6.1 quantile fixtures)
+    with:
+      - loss_function='MultiQuantile:alpha=0.1,0.5,0.9' (K=3 quantile dimensions),
+      - leaf_estimation_method='Exact' (Pitfall 3 — the single-host CPU default
+        `useExact` override; the weighted alpha[d]-quantile leaf per dimension),
+      - the D-07 isolating params (boosting_type=Plain, bootstrap_type=No,
+        random_strength=0, thread_count=1, leaf_estimation_iterations=1), depth 2,
+        5 iterations, learning_rate 0.1, l2_leaf_reg 3.0, boost_from_average=False.
+
+    approx_dimension = len(alpha) = 3. Predictions are RAW per-quantile (identity —
+    no link transform): staged.npy is staged_predict(RawFormulaVal) shape (n,dim)
+    object-major (A4); predictions.npy is predict(RawFormulaVal) shape (n,dim).
+    Gates Splits / LeafValues (LEAF-MAJOR) / StagedApprox (N-dim) / Predictions
+    <= 1e-5 vs catboost 1.2.10 (thread_count=1).
+
+    OFFLINE / RUN-ONCE (D-12): catboost==1.2.10 is NOT importable in CI.
+    """
+    MULTIQUANTILE.mkdir(parents=True, exist_ok=True)
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+
+    alpha_str = ",".join(str(a) for a in MULTIQUANTILE_ALPHAS)
+    loss = f"MultiQuantile:alpha={alpha_str}"
+
+    params = {
+        "iterations": 5,
+        "learning_rate": 0.1,
+        "depth": 2,
+        "l2_leaf_reg": 3.0,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "leaf_estimation_iterations": 1,
+        "leaf_estimation_method": "Exact",  # Pitfall 3 (single-host CPU default).
+        "score_function": "L2",
+        "random_seed": SEED,
+        "thread_count": 1,
+        "verbose": False,
+        "loss_function": loss,
+        "boost_from_average": False,
+    }
+    model = CatBoostRegressor(**params)
+    model.fit(x, y)
+
+    # --- Stage: Splits + LeafValues (model.json) ----------------------------
+    model.save_model(str(MULTIQUANTILE / "model.json"), format="json")
+
+    # --- Stage: StagedApprox (RawFormulaVal, shape (n,dim) object-major) -----
+    staged = [
+        np.asarray(p, dtype=np.float64)
+        for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+    ]
+    staged_flat = _assert_f64(
+        np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+    )
+    np.save(MULTIQUANTILE / "staged.npy", staged_flat, allow_pickle=False)
+
+    # --- Stage: Predictions (RAW per-quantile, identity, (n,dim) obj-major) --
+    preds = np.asarray(
+        model.predict(x, prediction_type="RawFormulaVal"), dtype=np.float64
+    )
+    preds_flat = _assert_f64(preds.ravel().astype(np.float64), "predictions")
+    np.save(MULTIQUANTILE / "predictions.npy", preds_flat, allow_pickle=False)
+
+    n_iter = len(staged)
+    dim = int(np.asarray(staged[0]).shape[1]) if n_iter else 0
+    config = {
+        "scenario": "multiquantile",
+        "requirement": "LOSS-03",
+        "wave": 3,
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "loss_function": loss,
+        "alpha": MULTIQUANTILE_ALPHAS,
+        "delta": 1e-6,
+        "leaf_estimation_method": "Exact",
+        "leaf_estimation_iterations": 1,
+        "score_function": "L2",
+        "boost_from_average": False,
+        "params": params,
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "n_iterations": n_iter,
+        "approx_dimension": dim,
+        "quantile_count": len(MULTIQUANTILE_ALPHAS),
+        "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+        "staged_layout": (
+            "staged_predict(RawFormulaVal): per-iter (n_rows, dim) OBJECT-MAJOR "
+            "(row-major object then dim), concatenated across iterations; flat f64."
+        ),
+        "predictions_layout": (
+            "predict(RawFormulaVal): (n_rows, dim) OBJECT-MAJOR row-major (RAW "
+            "per-quantile approx, identity), flat f64."
+        ),
+        "leaf_values_layout": (
+            "model.json leaf_values are LEAF-MAJOR (leaf0_d0, leaf0_d1, ..., "
+            "leaf1_d0, ...) length leaves*dim; leaf_weights length leaves."
+        ),
+        "prediction_type": "RawFormulaVal",
+        "leaf_method_note": (
+            "MultiQuantile=Exact (per dimension d: weighted alpha[d]-quantile of "
+            "leaf residuals target-approx; reuses the 6.1 exact_leaf_delta verbatim "
+            "per dimension, D-6.2-05). leaf_estimation_iterations:1."
+        ),
+        "der_note": (
+            "MultiQuantile der (K independent quantile dims, "
+            "error_functions.cpp:453-478): per dimension d, val=target-approx[d]; "
+            "|val|<delta ? 0 : (val>0 ? alpha[d] : -(1-alpha[d])); der2=0."
+        ),
+    }
+    with (MULTIQUANTILE / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def gen_multiquantile_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the Plan 06.2-05 MultiQuantile fixture
+    without re-running the full `main()` (which would overwrite every committed
+    Phase 2-5 / 6.1 / 6.2-03/04 fixture)."""
+    gen_multiquantile()
+    print("Wrote multiquantile oracle fixture (multiquantile)")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -3087,6 +3224,10 @@ def main() -> None:
         "(multilogloss/multicrossentropy)"
     )
 
+    # --- Phase-06.2 Wave-3 MultiQuantile fixture (Plan 06.2-05, LOSS-03) ------
+    gen_multiquantile()
+    print("Wrote multiquantile oracle fixture (multiquantile)")
+
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
     print(f"Wrote borders_quant oracle fixtures under {BORDERS_QUANT}")
@@ -3124,5 +3265,10 @@ if __name__ == "__main__":
         # (multilogloss / multicrossentropy), leaving every committed
         # Phase 2-5 / 6.1 / 6.2-03 fixture untouched.
         gen_multilabel_only()
+    elif "--multiquantile-only" in sys.argv:
+        # `--multiquantile-only` regenerates ONLY the Plan 06.2-05 MultiQuantile
+        # fixture (multiquantile), leaving every committed Phase 2-5 / 6.1 /
+        # 6.2-03/04 fixture untouched.
+        gen_multiquantile_only()
     else:
         main()

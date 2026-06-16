@@ -1,0 +1,53 @@
+{
+  "alpha": [
+    0.1,
+    0.5,
+    0.9
+  ],
+  "approx_dimension": 3,
+  "boost_from_average": false,
+  "catboost_version": "1.2.10",
+  "delta": 1e-06,
+  "der_note": "MultiQuantile der (K independent quantile dims, error_functions.cpp:453-478): per dimension d, val=target-approx[d]; |val|<delta ? 0 : (val>0 ? alpha[d] : -(1-alpha[d])); der2=0.",
+  "input_dataset": "numeric_tiny",
+  "leaf_estimation_iterations": 1,
+  "leaf_estimation_method": "Exact",
+  "leaf_method_note": "MultiQuantile=Exact (per dimension d: weighted alpha[d]-quantile of leaf residuals target-approx; reuses the 6.1 exact_leaf_delta verbatim per dimension, D-6.2-05). leaf_estimation_iterations:1.",
+  "leaf_values_layout": "model.json leaf_values are LEAF-MAJOR (leaf0_d0, leaf0_d1, ..., leaf1_d0, ...) length leaves*dim; leaf_weights length leaves.",
+  "loss_function": "MultiQuantile:alpha=0.1,0.5,0.9",
+  "n_features": 4,
+  "n_iterations": 5,
+  "n_rows": 50,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Exact",
+    "learning_rate": 0.1,
+    "loss_function": "MultiQuantile:alpha=0.1,0.5,0.9",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "predictions_layout": "predict(RawFormulaVal): (n_rows, dim) OBJECT-MAJOR row-major (RAW per-quantile approx, identity), flat f64.",
+  "quantile_count": 3,
+  "requirement": "LOSS-03",
+  "scenario": "multiquantile",
+  "score_function": "L2",
+  "seed": 0,
+  "staged_layout": "staged_predict(RawFormulaVal): per-iter (n_rows, dim) OBJECT-MAJOR (row-major object then dim), concatenated across iterations; flat f64.",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "thread_count": 1,
+  "wave": 3
+}
