@@ -354,7 +354,26 @@ WARNINGs deferred (latent, not gap-blocking; tracked for 6.2 hardening / 6.3 pre
   2. Ranking metrics NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC each match upstream ≤1e-5.
   3. Randomized ranking losses (YetiRank/StochasticRank RNG streams) are validated against a C++-instrumented harness where no clean Python-reachable ground truth exists (D-07), under the disk-pressure feasibility constraint (D-08).
 
-**Plans**: TBD
+**Plans**: 5 plans in 4 waves (family-wave gates per D-6.3-01; Plan 05 metrics runs parallel with Wave A)
+
+Plans:
+
+**Wave 1** — grouped der seam foundation
+
+- [ ] 06.3-01-PLAN.md — Grouped der seam (QueryInfo builder mirroring TQueryInfo + ranking_der.rs + Runtime::compute_gradients_grouped sibling, pointwise path byte-identical) + OFFLINE catboost 1.2.10 ranking fixture corpus generator (LOSS-04)
+
+**Wave 2** *(blocked on 06.3-01; 02 and 05 run in parallel — zero file overlap)*
+
+- [ ] 06.3-02-PLAN.md — Wave A losses: QueryRMSE + QuerySoftMax (deterministic per-group der on the grouped seam, pointwise leaf) — per-stage oracle ≤1e-5 (LOSS-04)
+- [ ] 06.3-05-PLAN.md — Wave D metrics: NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC — widened EvalMetric::eval_grouped + shared CompareDocs, eval-only, per-metric oracle ≤1e-5 (LOSS-05)
+
+**Wave 3** *(blocked on 06.3-01, 06.3-02)*
+
+- [ ] 06.3-03-PLAN.md — Wave B losses: PairLogit (explicit pairs) + PairLogitPairwise (Cholesky pairwise-leaf reusing in-house cholesky_solve, Plain) + LambdaMart — per-stage oracle ≤1e-5 (LOSS-04)
+
+**Wave 4** *(blocked on 06.3-01, 06.3-02, 06.3-03; autonomous: false — instrumented-build feasibility-probe checkpoint)*
+
+- [ ] 06.3-04-PLAN.md — Wave C randomized losses: YetiRank/YetiRankPairwise + StochasticRank — feasibility-probe → 2-level TFastRng64 + Gumbel/Gaussian draw transcription → OFFLINE instrumented ground truth (CB_INSTRUMENT_LOG) → per-stage oracle ≤1e-5 + RNG-draw-log exact (LOSS-04, SC-3)
 
 ### Phase 6.4: Score Functions, Uncertainty & Custom Objectives
 
