@@ -20,7 +20,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 5: Ordered Boosting, Ordered CTR & Categoricals (High-Risk Parity Slice)** - Multi-permutation folds, ordered boosting, ordered CTR, one-hot, feature combinations (bar (c) / SC-1 / ORD-01 CLOSED by 05-19 — pc=4 e2e ≤1e-5)
 - [ ] **Phase 6: Full Loss & Feature Parity** (umbrella) - Multiclass/regression/ranking losses, text/embedding features, uncertainty, advanced fstr, custom objectives — split into 6.1–6.6 (D-01/D-02, narrowest-first)
   - [ ] **Phase 6.1: Regression-Loss Matrix** - LOSS-03 scalar matrix (RMSE/MAE/Quantile/LogCosh/Huber/Poisson/Tweedie/MAPE/MSLE/Lq/Expectile), rides the scalar loop; MultiQuantile → 6.2
-  - [ ] **Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor** - LOSS-02 + LOSS-03 MultiQuantile; N-dim approx refactor with a no-behavior-change checkpoint (D-03/D-04)
+  - [x] **Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor** - LOSS-02 + LOSS-03 MultiQuantile; N-dim approx refactor with a no-behavior-change checkpoint (D-03/D-04) — COMPLETE 2026-06-16 (all 5 plans; N-dim spine + MultiClass/OneVsAll/MultiLogloss/MultiCrossEntropy/MultiQuantile all per-stage oracle ≤1e-5)
   - [ ] **Phase 6.3: Ranking Losses & Metrics** - LOSS-04, LOSS-05 over group_id/subgroup_id/pairs; C++ instrumentation for randomized losses
   - [ ] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8)
   - [ ] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first
@@ -314,10 +314,10 @@ Plans:
 **Requirements**: LOSS-02, LOSS-03 (MultiQuantile only — multi-output, lands on the N-dim foundation built here)
 **Success Criteria** (what must be TRUE):
 
-  1. The train loop carries approx as a vector everywhere (matching upstream `TVector<TVector<double>>`); scalar losses run as dim=1. Single code path — no parallel scalar/multi-dim duplication (D-03).
-  2. HARD CHECKPOINT (D-04): the pure mechanical refactor re-runs ALL existing scalar oracles green at dim=1 BEFORE any multiclass math is written — isolating refactor risk from new-loss risk.
-  3. MultiClass (softmax), MultiClassOneVsAll, MultiLogloss, MultiCrossEntropy each pass their oracle ≤1e-5 vs upstream catboost 1.2.10.
-  4. MultiQuantile (the multi-output member of LOSS-03, relocated from 6.1) produces its per-quantile outputs matching upstream ≤1e-5 on the N-dim approx path.
+  1. [x] The train loop carries approx as a vector everywhere (matching upstream `TVector<TVector<double>>`); scalar losses run as dim=1. Single code path — no parallel scalar/multi-dim duplication (D-03).
+  2. [x] HARD CHECKPOINT (D-04): the pure mechanical refactor re-runs ALL existing scalar oracles green at dim=1 BEFORE any multiclass math is written — isolating refactor risk from new-loss risk.
+  3. [x] MultiClass (softmax), MultiClassOneVsAll, MultiLogloss, MultiCrossEntropy each pass their oracle ≤1e-5 vs upstream catboost 1.2.10.
+  4. [x] MultiQuantile (the multi-output member of LOSS-03, relocated from 6.1) produces its per-quantile outputs matching upstream ≤1e-5 on the N-dim approx path (06.2-05 — K independent Exact quantile dims, per-stage oracle Splits/LeafValues/StagedApprox/Predictions ≤1e-5).
 
 **Plans**: 5 plans in 5 waves (Wave 0 mechanical refactor split into 2 sequential plans — compute-tier then train/model-tier + D-04 re-lock; Waves 1-3 = one plan per loss family, each its own ≤1e-5 per-stage oracle gate, D-6.2-02)
 Plans:
@@ -331,9 +331,9 @@ Plans:
 
 - [x] 06.2-04-PLAN.md — Wave 2: MultiLogloss + MultiCrossEntropy (shared `TMultiCrossEntropyError` diagonal der `der1=target_d-sigmoid(approx_d)`/`der2=-sigmoid*(1-sigmoid)`, two enum names → one `multi_crossentropy_ders`; dim-major target plumbing, label-set-width `approx_dimension=target.len/n`, `MultiClassKind::MultiLabel` per-dim sigmoid); per-stage oracle ≤1e-5 for BOTH losses; D-04 scalar + Wave-1 multiclass green (completed 2026-06-16, commits 7372756/1b26ad5)
 
-**Wave 3** *(unblocked — Wave 2 complete)*
+**Wave 3** *(COMPLETE)*
 
-- [ ] 06.2-05-PLAN.md — Wave 3: MultiQuantile (K independent Exact quantile dims reusing the 6.1 `exact_leaf_delta` per dim, `alpha:Vec<f64>` param); per-stage oracle ≤1e-5; closes LOSS-02 + LOSS-03 multi (D-6.2-05)
+- [x] 06.2-05-PLAN.md — Wave 3: MultiQuantile (K independent Exact quantile dims reusing the 6.1 `exact_leaf_delta` per dim, `alpha:Vec<f64>` param); per-stage oracle ≤1e-5; closes LOSS-03 multi (D-6.2-05) — COMPLETE 2026-06-16 (Loss::MultiQuantile{alpha:Vec<f64>,delta} + per-dim quantile der reusing launch_quantile_f64 with alpha[d] + per-dim Exact leaf threading alpha[dim_index] into the UNCHANGED exact_leaf_delta; multiquantile per-stage oracle Splits/LeafValues/StagedApprox/Predictions ≤1e-5 vs catboost 1.2.10; full cb-train --tests suite green — scalar + multiclass + multilabel + multiquantile)
 
 ### Phase 6.3: Ranking Losses & Metrics
 
