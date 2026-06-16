@@ -157,6 +157,7 @@ fn run_autolr_e2e(
         // MAE, the Wave-1 smooth regression losses, and the Wave-2 positive-domain
         // / link losses (Poisson / Tweedie / MAPE) are not in the auto-LR table.
         Loss::Mae
+        | Loss::Quantile { .. }
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }

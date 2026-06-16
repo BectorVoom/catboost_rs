@@ -69,6 +69,7 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         // raw regression target.
         Loss::Rmse
         | Loss::Mae
+        | Loss::Quantile { .. }
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }

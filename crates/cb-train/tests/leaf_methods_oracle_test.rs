@@ -83,6 +83,7 @@ fn train_scenario(
         // raw regression target.
         Loss::Rmse
         | Loss::Mae
+        | Loss::Quantile { .. }
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }

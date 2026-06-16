@@ -649,6 +649,7 @@ const fn autolr_target_type(loss: Loss) -> TargetType {
         // mirroring the existing MAE arm.
         Loss::Focal { .. }
         | Loss::Mae
+        | Loss::Quantile { .. }
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }
@@ -739,13 +740,24 @@ fn compute_leaf_deltas(
                 .map(|(&a, &t)| t - a)
                 .collect();
             let members = collect_leaf_residuals(leaf_of, &residuals, weights, n_leaves);
+            // Thread the active loss's (alpha, delta) into the Exact leaf
+            // (RESEARCH Pattern 3 / D-6.1-05): Quantile carries arbitrary
+            // alpha/delta; MAE is the median anchor (alpha=0.5, delta=1e-6 == the
+            // prior hardcoded behavior, so MAE Exact stays byte-identical); any
+            // other Exact-eligible loss keeps the default median. `exact_leaf_delta`
+            // (leaf.rs) is ALREADY alpha-general — UNCHANGED.
+            let (quantile_alpha, quantile_delta) = match loss {
+                Loss::Quantile { alpha, delta } => (alpha, delta),
+                _ => (QUANTILE_ALPHA, QUANTILE_DELTA),
+            };
             members
                 .iter()
                 .map(|(r, w)| match loss {
                     Loss::LogCosh => logcosh_exact_leaf_delta(r, w),
                     // MAE / Quantile (and any other Exact-eligible loss for this
-                    // wave) uses the weighted sample quantile.
-                    _ => exact_leaf_delta(r, w, QUANTILE_ALPHA, QUANTILE_DELTA),
+                    // wave) uses the weighted sample quantile at the threaded
+                    // (alpha, delta).
+                    _ => exact_leaf_delta(r, w, quantile_alpha, quantile_delta),
                 })
                 .collect()
         }
@@ -1917,3 +1929,7 @@ fn train_inner<R: Runtime>(
         baked,
     ))
 }
+
+#[cfg(test)]
+#[path = "boosting_test.rs"]
+mod tests;

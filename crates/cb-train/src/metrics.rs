@@ -77,6 +77,7 @@ impl EvalMetric {
             // default for any objective.
             Loss::Rmse
             | Loss::Mae
+            | Loss::Quantile { .. }
             | Loss::LogCosh
             | Loss::Lq { .. }
             | Loss::Huber { .. }
