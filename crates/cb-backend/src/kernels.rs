@@ -63,11 +63,16 @@ pub fn mae_gradient_kernel<F: Float>(approx: &Array<F>, target: &Array<F>, der1:
         let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
         let alpha = F::new(0.5);
         let delta = F::new(1e-6);
+        // Band complement of the scalar `|val| < delta` deadzone: `|val| >= delta`
+        // is OUTSIDE the deadzone, so the boundary `|val| == delta` returns the
+        // signed quantile weight (matching `mae_der1`/`quantile_der1`), NOT 0.
+        // Mirrors `huber_gradient_kernel` and `quantile_gradient_kernel`.
         let mut g = F::new(0.0);
-        if val > delta {
-            g = alpha;
-        } else if val < F::new(0.0) - delta {
+        if F::abs(val) >= delta {
             g = F::new(0.0) - (F::new(1.0) - alpha);
+            if val > F::new(0.0) {
+                g = alpha;
+            }
         }
         der1[ABSOLUTE_POS] = g;
     }
@@ -99,11 +104,18 @@ pub fn quantile_gradient_kernel<F: Float>(
         let a = alpha[0];
         let d = delta[0];
         let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
+        // Band complement of the scalar `|val| < delta` deadzone: `|val| >= delta`
+        // is OUTSIDE the deadzone, so the boundary `|val| == delta` returns the
+        // signed quantile weight (matching `quantile_der1`), NOT 0. This mirrors
+        // the correct `huber_gradient_kernel` `>= delta` band. The if-as-STATEMENT
+        // pattern (CubeCL conditionals manual): `g` starts at the deadzone `0`,
+        // then is overwritten with the `val < 0` arm and finally the `val > 0` arm.
         let mut g = F::new(0.0);
-        if val > d {
-            g = a;
-        } else if val < F::new(0.0) - d {
+        if F::abs(val) >= d {
             g = F::new(0.0) - (one - a);
+            if val > F::new(0.0) {
+                g = a;
+            }
         }
         der1[ABSOLUTE_POS] = g;
     }

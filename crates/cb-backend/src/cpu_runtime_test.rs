@@ -121,6 +121,43 @@ fn quantile_alpha05_gradients_equal_mae() {
 }
 
 #[test]
+fn quantile_kernel_matches_scalar_at_deadzone_boundary() {
+    // CR-01 regression: a residual EXACTLY equal to `delta` is OUTSIDE the
+    // scalar `|val| < delta` deadzone, so it must return the signed quantile
+    // weight, NOT 0. Construct `val == +delta` (approx=0, target=delta) and
+    // `val == -delta` (approx=delta, target=0) and assert the launched kernel
+    // matches the scalar `quantile_der1`/`mae_der1` reference bit-for-bit.
+    let delta = 1e-6;
+    let alpha = 0.7;
+    // [+delta, -delta] residuals plus a strictly-inside-deadzone control.
+    let approx = [0.0, delta, 0.0];
+    let target = [delta, 0.0, 0.0];
+
+    let q = CpuBackend
+        .compute_gradients(Loss::Quantile { alpha, delta }, &approx, &target)
+        .unwrap();
+    for i in 0..approx.len() {
+        let expected = cb_compute::quantile_der1(approx[i], target[i], alpha, delta);
+        assert!(
+            (q.der1[i] - expected).abs() <= 1e-12,
+            "quantile boundary i={i}: kernel={} scalar={expected}",
+            q.der1[i]
+        );
+    }
+
+    // MAE (Quantile{0.5}) must likewise honor the boundary.
+    let m = CpuBackend.compute_gradients(Loss::Mae, &approx, &target).unwrap();
+    for i in 0..approx.len() {
+        let expected = cb_compute::mae_der1(approx[i], target[i]);
+        assert!(
+            (m.der1[i] - expected).abs() <= 1e-12,
+            "mae boundary i={i}: kernel={} scalar={expected}",
+            m.der1[i]
+        );
+    }
+}
+
+#[test]
 fn logcosh_gradients_match_host_reference() {
     // der1 = -tanh(approx-target); der2 = -1/cosh(approx-target)^2.
     let approx = [0.0, 1.0, -2.5, 3.25, 7.0];
