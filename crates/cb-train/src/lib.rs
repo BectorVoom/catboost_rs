@@ -23,6 +23,7 @@ mod metrics;
 mod overfit;
 mod permutation;
 mod projection;
+mod query_info;
 mod tree;
 
 pub use autolr::{coefficients as autolr_coefficients, guess as autolr_guess, TargetType};
@@ -53,6 +54,7 @@ pub use permutation::{
     permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
 };
 pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
+pub use query_info::{build_query_info, Competitor, QueryInfo};
 pub use boosting::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
     counter_calc_method_default, ctr_border_count_default, fold_len_multiplier_default,
