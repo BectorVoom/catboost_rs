@@ -72,7 +72,10 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }
-        | Loss::Expectile { .. } => load_regression_target(),
+        | Loss::Expectile { .. }
+        | Loss::Poisson
+        | Loss::Tweedie { .. }
+        | Loss::Mape => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

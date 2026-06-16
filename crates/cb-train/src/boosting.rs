@@ -643,12 +643,19 @@ const fn autolr_target_type(loss: Loss) -> TargetType {
         // The Wave-1 smooth regression losses are not in the upstream auto-LR
         // table (`options_helper.cpp:181-194`) -> Unknown (no rate guessed),
         // mirroring the existing MAE arm.
+        // The Wave-1 smooth regression losses and the Wave-2 positive-domain /
+        // link losses (Poisson / Tweedie / MAPE) are not in the upstream auto-LR
+        // table (`options_helper.cpp:181-194`) -> Unknown (no rate guessed),
+        // mirroring the existing MAE arm.
         Loss::Focal { .. }
         | Loss::Mae
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }
-        | Loss::Expectile { .. } => TargetType::Unknown,
+        | Loss::Expectile { .. }
+        | Loss::Poisson
+        | Loss::Tweedie { .. }
+        | Loss::Mape => TargetType::Unknown,
     }
 }
 

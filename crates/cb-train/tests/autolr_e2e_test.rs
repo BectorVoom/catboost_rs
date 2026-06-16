@@ -154,12 +154,16 @@ fn run_autolr_e2e(
         Loss::Rmse => TargetType::Rmse,
         Loss::Logloss | Loss::CrossEntropy => TargetType::Logloss,
         Loss::Focal { .. } => TargetType::Logloss,
-        // MAE and the Wave-1 smooth regression losses are not in the auto-LR table.
+        // MAE, the Wave-1 smooth regression losses, and the Wave-2 positive-domain
+        // / link losses (Poisson / Tweedie / MAPE) are not in the auto-LR table.
         Loss::Mae
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }
-        | Loss::Expectile { .. } => TargetType::Unknown,
+        | Loss::Expectile { .. }
+        | Loss::Poisson
+        | Loss::Tweedie { .. }
+        | Loss::Mape => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");

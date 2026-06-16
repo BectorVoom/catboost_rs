@@ -86,7 +86,10 @@ fn train_scenario(
         | Loss::LogCosh
         | Loss::Lq { .. }
         | Loss::Huber { .. }
-        | Loss::Expectile { .. } => load_regression_target(),
+        | Loss::Expectile { .. }
+        | Loss::Poisson
+        | Loss::Tweedie { .. }
+        | Loss::Mape => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

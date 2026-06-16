@@ -62,12 +62,21 @@ impl EvalMetric {
             // Expectile) each default upstream to their own-named regression
             // metric; for Wave 1 they report the parity-neutral RMSE eval surface
             // (mirroring the MAE arm) unless a fixture pins `eval_metric`.
+            // The Wave-2 positive-domain / link losses (Poisson / Tweedie / MAPE)
+            // each default upstream to their own-named regression metric; for
+            // Wave 2 they report the parity-neutral RMSE eval surface (mirroring
+            // the MAE arm) unless a fixture pins `eval_metric`. MSLE is NOT mapped
+            // here — it is metric-only (D-6.1-06) and selected explicitly, never a
+            // default for any objective.
             Loss::Rmse
             | Loss::Mae
             | Loss::LogCosh
             | Loss::Lq { .. }
             | Loss::Huber { .. }
-            | Loss::Expectile { .. } => Self::Rmse,
+            | Loss::Expectile { .. }
+            | Loss::Poisson
+            | Loss::Tweedie { .. }
+            | Loss::Mape => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,
