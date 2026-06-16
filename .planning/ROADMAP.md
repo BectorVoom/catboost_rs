@@ -323,7 +323,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 06.2-01-PLAN.md — Wave 0 (compute tier): widen `Runtime::compute_gradients` + `CpuBackend` to a dimension-major buffer with `approx_dimension`; drop `Copy` on `Loss` (the Wave-3 `MultiQuantile{alpha:Vec}` ripple, surfaced early); dim=1 byte-identical at the unit level (D-03/D-6.2-01)
+- [x] 06.2-01-PLAN.md — Wave 0 (compute tier): widen `Runtime::compute_gradients` + `CpuBackend` to a dimension-major buffer with `approx_dimension`; drop `Copy` on `Loss` (the Wave-3 `MultiQuantile{alpha:Vec}` ripple, surfaced early); dim=1 byte-identical at the unit level (D-03/D-6.2-01) — COMPLETE 2026-06-16 (cb-compute 69 + cb-backend 22 + cb-train 141 lib tests green; workspace compiles)
 - [ ] 06.2-02-PLAN.md — Wave 0 (train/model tier + **D-04 HARD CHECKPOINT**): N-dim approx buffer in `boosting.rs`, per-dim leaf deltas, leaf-major `cb-model` serialization; re-lock ALL ~38 scalar oracles green at dim=1 + an explicit `0.0`-diff byte-identity gate
 - [ ] 06.2-03-PLAN.md — Wave 1: MultiClass (softmax coupled der + symmetric-Hessian Newton solve, solver-choice decision checkpoint / Open-Q1) + MultiClassOneVsAll (diagonal) + multi-dim split-score transcription + class-label remap; per-stage oracle ≤1e-5 (LOSS-02)
 

@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
+status: executing
 stopped_at: Phase 6.2 context gathered
-last_updated: "2026-06-16T08:54:17.851Z"
-last_activity: 2026-06-16 -- Phase 06.1 Plan 03 (Wave-3 quantile family) COMPLETE
+last_updated: "2026-06-16T08:56:07.568Z"
+last_activity: 2026-06-16 -- Phase 06.2 execution started
 progress:
   total_phases: 14
   completed_phases: 6
-  total_plans: 44
+  total_plans: 49
   completed_plans: 44
   percent: 43
 ---
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 06.1 — regression-loss-matrix
+**Current focus:** Phase 06.2 — multiclass-multilabel-and-n-dim-approx-refactor
 
 ## Current Position
 
-Phase: 06.1 (regression-loss-matrix) — ALL PLANS COMPLETE (verifier next)
-Plan: 3 of 3 (Plans 01 + 02 + 03 COMPLETE — LOSS-03 scalar matrix complete)
-Status: Plan 03 complete; Phase 6.1 plan execution done — ready for phase verifier / Phase 6.2
-Last activity: 2026-06-16 -- Phase 06.1 Plan 03 (Wave-3 quantile family) COMPLETE
+Phase: 06.2 (multiclass-multilabel-and-n-dim-approx-refactor) — EXECUTING
+Plan: 1 of 5 — 06.2-01 COMPLETE (next: 06.2-02 Wave-0 train/model tier + D-04 hard checkpoint)
+Status: Plan 06.2-01 complete (compute-tier N-dim widening; Loss non-Copy; approx_dimension threaded; dim=1 byte-identical at the unit level)
+Last activity: 2026-06-16 -- Phase 06.2 Plan 01 (Wave-0 compute-tier N-dim refactor) COMPLETE
 
 Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 top-level phases complete)
 
@@ -101,6 +101,7 @@ Progress: [##########] 100% of Phase 6.1 plans (3 of 3 plans complete; 5 of 8 to
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [06.2-01 Wave-0 compute tier COMPLETE]: `Loss` Copy derive DROPPED now (before any new variant) so the Wave-3 `MultiQuantile{alpha:Vec<f64>}` non-Copy ripple is a ONE-TIME refactor — `Clone` retained, by-value sites take `&Loss` (cb-train `autolr_target_type`/`validate_leaf_method`/`compute_leaf_deltas`/`EvalMetric::for_loss`) and `catboost-rs::CatBoostBuilder` drops `Copy` + clones `loss` into `BoostParams`. `Runtime::compute_gradients` + `CpuBackend` gained `approx_dimension: usize` (after `target`); `approx` is the dim-major flat buffer `approx[d*n+i]` (D-6.2-01), validated `len % dim == 0` + `target.len()==n` with typed `CbError::LengthMismatch` (T-6.2-01a, no panic). The backend runs an OUTER `for d in 0..approx_dimension` loop over `approx[d*n..d*n+n]` reusing the EXISTING per-loss kernel launchers (extracted to `compute_gradients_one_dim`) — NOT fused into a single `0..dim*n` launch (RESEARCH Pitfall 1), so at dim=1 the output is byte-identical to the pre-6.2 scalar path. NO new Loss variant, NO loss math touched (loss.rs git-clean). cb-train still calls with `approx_dimension=1` (N-dim approx-buffer threading is 06.2-02). Unit gates green: cb-compute 69, cb-backend 22 (incl. new dim=1 byte-identity + multi-dim concat + shape-error tests), cb-train 141; workspace compiles. D-04 full ~38-fixture re-lock is 06.2-02's gate, not this plan's. gsd-tools CLI ABSENT -> STATE/ROADMAP updated MANUALLY.
 - [06.1-03 LOSS-03 scalar matrix COMPLETE]: Loss::Quantile{alpha,delta} generalizes Loss::Mae — MAE == Quantile{0.5,1e-6} confirmed bit-exact (0.0 diff) at THREE levels (fixture leaf_values, der dispatch, Exact leaf). mae_der1/der2 now DELEGATE to quantile_der1/der2 (single source of truth, byte-stable). The ONE real-code item (RESEARCH Pattern 3 / D-6.1-05): compute_leaf_deltas Exact branch threads params.loss (alpha,delta) into the ALREADY-alpha-general exact_leaf_delta — leaf.rs UNCHANGED (git diff empty), so this is wiring, not algorithm. quantile_gradient_kernel reuses the focal two-param length-1-array launch pattern. wave3 oracle ≤1e-5 at alpha=0.7 (weighted 0.7-quantile Exact leaf) + alpha=0.5 (== leaf_methods/exact MAE). Quantile fixtures use the RAW target (no positive shift — full real line) + leaf_estimation_method:Exact PINNED. MultiQuantile remains relocated to 6.2 (multi-output, N-dim foundation). gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY (as in 06.1-02).
 - [06.1-02 Open Q1 RESOLVED]: Poisson is IsStoreExpApprox upstream but cb-train stores RAW approx + computes exp() INLINE in the der (the Logloss sigmoid precedent); StagedApprox(RawFormulaVal) is RAW, Predictions = exp(raw) == cb_model::PredictionType::Exponent (matched to 8.88e-16 vs the default predict). StagedApprox oracle compares RAW; Predictions applies Exponent. NO exp-approx storage implemented.
 - [06.1-02 A4 confirmed]: Tweedie is NOT exp-approx (error_functions.h:1644) — the exp lives INSIDE the der over the raw approx; Tweedie predictions are RAW (default predict == RawFormulaVal), so NO Exponent transform is applied.
