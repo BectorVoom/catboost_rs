@@ -1,0 +1,22 @@
+{
+  "catboost_version": "1.2.10",
+  "n_rows": 12,
+  "group_sizes": [
+    3,
+    2,
+    4,
+    1,
+    2
+  ],
+  "random_seed": 20260617,
+  "pinned_params": {
+    "thread_count": 1,
+    "depth": 2,
+    "iterations": 5,
+    "leaf_estimation_iterations": 1,
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "learning_rate": 0.3
+  }
+}
