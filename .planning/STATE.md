@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 06.2-05-PLAN.md — Phase 6.2 COMPLETE
-last_updated: "2026-06-16T10:40:00.000Z"
+status: completed
+stopped_at: "Phase 6.2 COMPLETE — 06.2-05 (Wave-3 MultiQuantile, LOSS-03 multi-output) shipped; all 5 plans done, all 4 ROADMAP success criteria met. LOSS-02 + LOSS-03 (scalar+multi) matrix CLOSED. NEXT: /gsd-transition or /gsd-plan-phase 6.3 (ranking losses)."
+last_updated: "2026-06-16T11:26:08.852Z"
 last_activity: 2026-06-16 -- Phase 06.2 Plan 05 (Wave-3 MultiQuantile, LOSS-03 multi-output) COMPLETE — Phase 6.2 CLOSED
 progress:
   total_phases: 14
-  completed_phases: 7
-  total_plans: 49
-  completed_plans: 48
-  percent: 48
+  completed_phases: 6
+  total_plans: 51
+  completed_plans: 50
+  percent: 43
 ---
 
 # Project State
@@ -98,6 +98,7 @@ Progress: [##############] 100% of Phase 6.2 plans (5 of 5 plans complete; 7 of 
 | Phase 06.2 P03 | ~50min | 4 tasks | ~30 files |
 | Phase 06.2 P04 | ~45min | 2 tasks | 21 files |
 | Phase 06.2 P05 | ~16min | 2 tasks | 13 files |
+| Phase 06.2 P06.2-06 | 8m | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -201,6 +202,8 @@ Recent decisions affecting current work:
 - [Phase 05]: Plan 05-16 COMPLETE (GAP 1 / ORD-02 wiring-test closure; commit 9a2c974 Task1): the only failing test at HEAD, ordered_structure_differs_from_plain, RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle). CONFIRMED the load-bearing fact (boosting.rs:1054-1057 find(|f| !f.is_averaging) returns the IDENTITY Folds[0] for ALL permutation_count after 05-12), reproduced the failure (Ordered==Plain [(1,8.5),(0,1.5)]x5 on the randomness-free bootstrap=No/random_strength=0 config), so the assert_ne! divergence premise is invalidated by UPSTREAM-FAITHFUL behavior (shuffle=foldIdx!=0, fold.cpp:54), NOT a dead branch. Re-keying permutation_count cannot fix it (still consumes identity fold; an out-of-scope production fold-selection change would be needed, and the e2e oracle already locks ORD-02 <=1e-5) -> PRIMARY path (retire) taken, CONDITIONAL option (b) correctly NOT triggered. Replaced with a passing positive assertion (both Ordered+Plain grow finite 5-tree models; structures legitimately coincide) + in-file rationale delegating ORD-02 structural authority to ordered_boost_e2e_oracle_test (2/2 <=1e-5 vs catboost 1.2.10). Aliveness gates ordered_training_grows_a_full_finite_model + plain_path_still_trains UNCHANGED. Retire decision recorded in discoverable 05-DEFERRED.md (no orphan todos/). TEST-ONLY: git diff = only the wiring test; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, cargo check --tests 0 warnings. Phase 05 gap-closure complete; no failing test at HEAD.
 - [Phase 05]: Plan 05-15 COMPLETE (WR-01 / ORD-01; commits b69f5aa Task1 / f22ad0b Task2): create_folds pre-averaging GenRand now fires at idx == learning_folds (the averaging-fold position) for ALL permutation_count, replacing the first_real_shuffle flag that fired at idx==1 (correct only at pc=1). pc=1 byte-stream UNCHANGED (positions coincide). NEW catboost-1.2.10-anchored multi_permutation_fold oracle: PRIMARY pc=2 partition == catboost tree-0 leaf_weights [6,0,7,17] integer-exact (the upstream authority, since the AveragingFold permutation is not Python-API-exposed but leaf_weights ARE its partition counts — a wrong advance count fails the check). DOCUMENTED DIVERGENCE: pc=4 (production default) cb-train [6,0,8,16] != catboost [6,0,10,14]; exhaustive sweep shows no clean per-fold draw rule reproduces both the e2e-bit-exact pc=1/2 stream and pc=4, so pc=4 bit-exact needs C++ instrumentation of catboost's per-fold RNG accounting (out of scope for this draw-POSITION fix; pc=4 dump committed for a future plan, partition pinned + delta recorded, NOT fabricated/ignored). No lib/e2e regression (130/130 lib, tensor_ctr_e2e 3/3, ordered_boost_e2e 2/2).
 - [Phase ?]: Smooth-loss Exact leaf estimation is loss-dispatched: LogCosh uses the monotone-bisection 1-D optimum (Sum tanh=0), not the MAE weighted-median
+- [Phase ?]: 06.2-06: predict_raw_cat routes approx_dimension>1 to dim-aware accumulator; <=1 stays byte-identical (D-04)
+- [Phase ?]: 06.2-06: class labels round-trip via class_params/multiclass_params on json + .cbm InfoMap
 
 ### Pending Todos
 
@@ -240,7 +243,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-16T10:40:00.000Z
+Last session: 2026-06-16T11:25:26.840Z
 Stopped at: Phase 6.2 COMPLETE — 06.2-05 (Wave-3 MultiQuantile, LOSS-03 multi-output) shipped; all 5 plans done, all 4 ROADMAP success criteria met. LOSS-02 + LOSS-03 (scalar+multi) matrix CLOSED. NEXT: /gsd-transition or /gsd-plan-phase 6.3 (ranking losses).
 Stopped at (prior): Phase 6.2 context gathered
 Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
