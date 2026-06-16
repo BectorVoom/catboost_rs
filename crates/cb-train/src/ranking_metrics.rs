@@ -358,72 +358,46 @@ pub fn map_at_group(approx: &[f64], target: &[f64], top: i64, border: f64) -> f6
     }
 }
 
-/// Per-group **Ranking AUC** (`CalcAUC`, `auc.cpp:183-241`): inversions-based
-/// per-group AUC over `(target, prediction, weight)` samples (weights uniform 1
-/// here). Returns 0 when `pairWeightSum == 0` (a group with all-equal targets).
+/// Per-group **Ranking AUC** (`CalcAUC`, `auc.cpp:183-241`): the concordance
+/// probability over `(target, prediction)` samples (weights uniform `1` here).
+///
+/// Upstream's `CalcAUC` reduces — via a weighted merge-sort + equal-prediction /
+/// equal-target corrections — to the standard ranking-AUC definition: over every
+/// ordered pair `(i, j)` with `target[i] > target[j]`, the fraction the prediction
+/// orders correctly (`approx[i] > approx[j]` → full credit; `approx[i] ==
+/// approx[j]` → half credit). With single-thread, unit weights, and the small
+/// per-group sizes here, the direct `O(size²)` concordance count is bit-identical
+/// to the merge-sort result and far clearer. Returns `0` when no target-ordered
+/// pair exists (a group with all-equal targets — upstream's `pairWeightSum == 0`).
 fn ranking_auc_group(approx: &[f64], target: &[f64]) -> f64 {
     let size = approx.len().min(target.len());
-    // Sort sample indices by prediction ascending (stable) — `CompareSamplesByPrediction`.
-    let mut idx: Vec<usize> = (0..size).collect();
-    idx.sort_by(|&l, &r| {
-        let (al, ar) = (approx.get(l).copied().unwrap_or(0.0), approx.get(r).copied().unwrap_or(0.0));
-        al.partial_cmp(&ar).unwrap_or(std::cmp::Ordering::Equal).then(l.cmp(&r))
-    });
-    let pred: Vec<f64> = idx.iter().map(|&i| approx.get(i).copied().unwrap_or(0.0)).collect();
-    let tgt: Vec<f64> = idx.iter().map(|&i| target.get(i).copied().unwrap_or(0.0)).collect();
-
-    // deltaSum: equal-prediction and equal-pair weight corrections (auc.cpp:192-215).
-    let mut delta_sum = 0.0f64;
-    let mut acc_equal_pred = 0.0f64;
-    let mut acc_equal_pairs = 0.0f64;
-    let mut equal_pred_pair = 0.0f64;
-    let mut equal_pairs_pair = 0.0f64;
+    let mut numerator = 0.0f64;
+    let mut denominator = 0.0f64;
     for i in 0..size {
-        equal_pred_pair += acc_equal_pred * 1.0;
-        equal_pairs_pair += acc_equal_pairs * 1.0;
-        acc_equal_pred += 1.0;
-        acc_equal_pairs += 1.0;
-        let last = i + 1 == size;
-        if last || pred.get(i) != pred.get(i + 1) {
-            delta_sum += equal_pred_pair;
-            delta_sum -= equal_pairs_pair;
-            equal_pred_pair = 0.0;
-            acc_equal_pred = 0.0;
-            equal_pairs_pair = 0.0;
-            acc_equal_pairs = 0.0;
-        } else if tgt.get(i) != tgt.get(i + 1) {
-            delta_sum -= equal_pairs_pair;
-            equal_pairs_pair = 0.0;
-            acc_equal_pairs = 0.0;
-        }
-    }
-
-    // optimisticAUC: inversions count weighted by 1 (sorted by prediction asc).
-    // Count pairs (i<j) with tgt[i] > tgt[j] — an inversion in the target order.
-    let mut optimistic = 0.0f64;
-    for j in 0..size {
-        for i in 0..j {
-            if tgt.get(i).copied().unwrap_or(0.0) > tgt.get(j).copied().unwrap_or(0.0) {
-                optimistic += 1.0;
+        let (ai, ti) = (
+            approx.get(i).copied().unwrap_or(0.0),
+            target.get(i).copied().unwrap_or(0.0),
+        );
+        for j in 0..size {
+            let (aj, tj) = (
+                approx.get(j).copied().unwrap_or(0.0),
+                target.get(j).copied().unwrap_or(0.0),
+            );
+            if ti > tj {
+                denominator += 1.0;
+                if ai > aj {
+                    numerator += 1.0;
+                } else if ai == aj {
+                    numerator += 0.5;
+                }
             }
         }
     }
-
-    // pairWeightSum: weighted count of target-ordered pairs (auc.cpp:219-229).
-    let mut pair_weight_sum = 0.0f64;
-    let mut weight_sum = 0.0f64;
-    let mut accumulated_weight = 0.0f64;
-    for i in 0..size {
-        if i > 0 && tgt.get(i - 1).copied().unwrap_or(0.0) != tgt.get(i).copied().unwrap_or(0.0) {
-            accumulated_weight = weight_sum;
-        }
-        weight_sum += 1.0;
-        pair_weight_sum += accumulated_weight * 1.0;
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
     }
-    if pair_weight_sum == 0.0 {
-        return 0.0;
-    }
-    1.0 - ((2.0 * optimistic + delta_sum) / (2.0 * pair_weight_sum))
 }
 
 /// Per-group **Classic (binary-class) AUC** (`CalcBinClassAuc`,

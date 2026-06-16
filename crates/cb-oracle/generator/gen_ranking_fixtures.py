@@ -236,11 +236,105 @@ def gen_metric(metric: str) -> None:
     print(f"wrote metric fixture under {scenario}")
 
 
+# ---------------------------------------------------------------------------
+# Per-metric eval-only fixtures (LOSS-05, Plan 06.3-05).
+#
+# Ranking metrics are eval-only, so the cleanest Python-reachable ground truth is
+# `catboost.utils.eval_metric(label, approx, metric, group_id=...)` over a FIXED,
+# KNOWN approx vector (NOT a trained-model prediction — the Rust trainer need not
+# reproduce a PairLogit model to gate the metric formula). The frozen `approx` +
+# `group_id` + `target` are shared by every metric scenario; each scenario freezes
+# its upstream scalar value(s). The Rust `EvalMetric::eval_grouped` is fed the same
+# approx/target/group_id and compared ≤1e-5.
+#
+# group_id / target / approx are stored as float64 so the Rust oracle can load them
+# all via `cb_oracle::load_f64_vec` (the only npy loader in cb-oracle).
+# ---------------------------------------------------------------------------
+METRICS_DIR = RANKING_CORPUS / "ranking_metrics"
+METRIC_APPROX_SEED = 42
+
+# The metric scenarios: (scenario_name, catboost_metric_string). Defaults +
+# explicit top=2 cases exercise the nth_element / tie path; QueryAUC uses
+# type=Ranking for the graded-relevance corpus (the singleclass Classic default
+# requires target in [0,1]) plus a Classic case on a binarized target.
+METRIC_SCENARIOS = [
+    ("ndcg", "NDCG"),
+    ("dcg", "DCG"),
+    ("map", "MAP"),
+    ("mrr", "MRR"),
+    ("err", "ERR"),
+    ("pfound", "PFound"),
+    ("precision_at", "PrecisionAt"),
+    ("recall_at", "RecallAt"),
+    ("queryauc_ranking", "QueryAUC:type=Ranking"),
+    ("ndcg_top2", "NDCG:top=2"),
+    ("dcg_top2", "DCG:top=2"),
+    ("map_top2", "MAP:top=2"),
+    ("mrr_top2", "MRR:top=2"),
+    ("err_top2", "ERR:top=2"),
+    ("pfound_top2", "PFound:top=2"),
+    ("precision_at_top2", "PrecisionAt:top=2"),
+    ("recall_at_top2", "RecallAt:top=2"),
+]
+
+
+def _metric_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Shared (group_id, target, approx, binary_target) for the metric fixtures."""
+    _, y = _load_inputs()
+    group_id = GROUP_ID.astype(np.float64)
+    target = y.astype(np.float64)
+    rng = np.random.default_rng(METRIC_APPROX_SEED)
+    approx = rng.normal(size=N_ROWS).astype(np.float64)
+    # A binarized target (relevance > 1.5 -> 1) for the Classic QueryAUC case,
+    # which requires target in [0, 1].
+    binary_target = (target > 1.5).astype(np.float64)
+    return group_id, target, approx, binary_target
+
+
+def gen_metrics_eval() -> None:
+    """Freeze the per-metric eval-only fixtures over a FIXED approx (LOSS-05)."""
+    from catboost.utils import eval_metric
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    group_id, target, approx, binary_target = _metric_inputs()
+
+    # Shared inputs (float64 so cb_oracle::load_f64_vec can read them).
+    np.save(METRICS_DIR / "group_id.npy", group_id, allow_pickle=False)
+    np.save(METRICS_DIR / "target.npy", target, allow_pickle=False)
+    np.save(METRICS_DIR / "approx.npy", approx, allow_pickle=False)
+    np.save(METRICS_DIR / "binary_target.npy", binary_target, allow_pickle=False)
+
+    group_id_int = GROUP_ID.astype(np.int64)
+    summary = {"catboost_version": CATBOOST_VERSION, "approx_seed": METRIC_APPROX_SEED, "scenarios": {}}
+    for name, metric in METRIC_SCENARIOS:
+        value = eval_metric(target, approx, metric, group_id=group_id_int)
+        arr = np.asarray(value, dtype=np.float64)
+        np.save(METRICS_DIR / f"{name}.npy", arr.reshape(-1), allow_pickle=False)
+        summary["scenarios"][name] = {"metric": metric, "value": [float(v) for v in arr.reshape(-1)]}
+
+    # The Classic QueryAUC case uses the binarized target (target in [0,1]).
+    qauc_classic = eval_metric(binary_target, approx, "QueryAUC:type=Classic", group_id=group_id_int)
+    arr = np.asarray(qauc_classic, dtype=np.float64).reshape(-1)
+    np.save(METRICS_DIR / "queryauc_classic.npy", arr, allow_pickle=False)
+    summary["scenarios"]["queryauc_classic"] = {
+        "metric": "QueryAUC:type=Classic (binary_target)",
+        "value": [float(v) for v in arr],
+    }
+
+    (METRICS_DIR / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"wrote {len(summary['scenarios'])} metric fixtures under {METRICS_DIR}")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", action="store_true", help="write corpus inputs only")
     parser.add_argument("--loss", type=str, default=None, help="ranking loss name (e.g. QueryRMSE)")
     parser.add_argument("--metric", type=str, default=None, help="ranking metric name (e.g. NDCG)")
+    parser.add_argument(
+        "--metrics-eval",
+        action="store_true",
+        help="freeze all eval-only ranking metric fixtures (LOSS-05, Plan 06.3-05)",
+    )
     args = parser.parse_args(argv)
 
     RANKING_CORPUS.mkdir(parents=True, exist_ok=True)
@@ -251,7 +345,9 @@ def main(argv: list[str]) -> int:
         gen_loss(args.loss)
     if args.metric is not None:
         gen_metric(args.metric)
-    if not (args.inputs or args.loss or args.metric):
+    if args.metrics_eval:
+        gen_metrics_eval()
+    if not (args.inputs or args.loss or args.metric or args.metrics_eval):
         # Default: (re)write the corpus inputs so the frozen shape is materialized.
         write_inputs()
     return 0
