@@ -2673,6 +2673,8 @@ def gen_wave2_only() -> None:
 # leaf_estimation_method=Newton / leaf_estimation_iterations=1 (Pitfall 2).
 MULTICLASS_SOFTMAX = FIXTURES / "multiclass_softmax"
 MULTICLASS_ONEVSALL = FIXTURES / "multiclass_onevsall"
+MULTILOGLOSS = FIXTURES / "multilogloss"
+MULTICROSSENTROPY = FIXTURES / "multicrossentropy"
 
 
 def _multiclass_target() -> np.ndarray:
@@ -2797,6 +2799,144 @@ def gen_multiclass_only() -> None:
     print(
         "Wrote multiclass oracle fixtures "
         "(multiclass_softmax/multiclass_onevsall)"
+    )
+
+
+def _multilabel_target() -> np.ndarray:
+    """The 3-LABEL binary multilabel target (n, 3) derived deterministically from
+    the frozen numeric_tiny corpus: three NESTED binary thresholds on `y` at its
+    0.25 / 0.5 / 0.75 quantiles — label k = (y > quantile(y, [0.25,0.5,0.75])[k]).
+
+    Deliberately NESTED on a single signal (not one-feature-per-label) so the
+    multi-dim split score has a CLEAR winner at every level (no symmetric
+    cross-feature tie that an ULP could resolve either way). Three binary {0,1}
+    label columns (a multilabel target). The same rule is reproduced by the Rust
+    oracle test so train/predict use identical labels."""
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+    q = np.quantile(y, [0.25, 0.5, 0.75])
+    l0 = (y > q[0]).astype(np.int64)
+    l1 = (y > q[1]).astype(np.int64)
+    l2 = (y > q[2]).astype(np.int64)
+    return np.stack([l0, l1, l2], axis=1)  # (n, 3) binary
+
+
+def _gen_one_multilabel(scenario_dir: Path, loss: str) -> None:
+    """Train one multilabel loss (MultiLogloss | MultiCrossEntropy) on the 3-label
+    binary numeric_tiny target and freeze its per-stage oracle: model.json (splits +
+    LEAF-MAJOR leaf_values), staged.npy (staged_predict RawFormulaVal, shape (n,dim)
+    object-major — A4), and predictions.npy (Probability, per-dim sigmoid).
+
+    MultiLogloss and MultiCrossEntropy are the SAME upstream TMultiCrossEntropyError
+    der path (tensor_search_helpers.cpp:236-238) — both train on the SAME binary
+    {0,1} label matrix here (MultiCrossEntropy additionally admits soft [0,1]
+    targets, but a binary target exercises the identical der and keeps the two
+    fixtures comparable)."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    yl = _multilabel_target()
+
+    # MultiLabel default score_function is Cosine; leaf_estimation_method=Newton
+    # with iterations=1 — the upstream multilabel default is Newton with 10
+    # iterations (Pitfall 2), PINNED to 1 for a single deterministic solve.
+    # bootstrap_type=No, random_strength=0, thread_count=1 isolate the tree/leaf
+    # math (D-07). boost_from_average=False (classification).
+    params = {
+        "iterations": 5,
+        "learning_rate": 0.1,
+        "depth": 2,
+        "l2_leaf_reg": 3.0,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "leaf_estimation_iterations": 1,
+        "leaf_estimation_method": "Newton",
+        "score_function": "Cosine",
+        "random_seed": SEED,
+        "thread_count": 1,
+        "verbose": False,
+        "loss_function": loss,
+        "boost_from_average": False,
+    }
+    model = CatBoostClassifier(**params)
+    model.fit(x, yl)
+
+    # --- Stage: Splits + LeafValues (model.json) ----------------------------
+    model.save_model(str(scenario_dir / "model.json"), format="json")
+
+    # --- Stage: StagedApprox (RawFormulaVal, shape (n,dim) object-major) -----
+    staged = [
+        np.asarray(p, dtype=np.float64)
+        for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+    ]
+    staged_flat = _assert_f64(
+        np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+    )
+    np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+    # --- Stage: Predictions (Probability = per-dim sigmoid, (n,dim) obj-major) -
+    proba = np.asarray(model.predict(x, prediction_type="Probability"), dtype=np.float64)
+    proba_flat = _assert_f64(proba.ravel().astype(np.float64), "predictions")
+    np.save(scenario_dir / "predictions.npy", proba_flat, allow_pickle=False)
+
+    n_iter = len(staged)
+    dim = int(np.asarray(staged[0]).shape[1]) if n_iter else 0
+    config = {
+        "scenario": scenario_dir.name,
+        "seed": SEED,
+        "catboost_version": CATBOOST_VERSION,
+        "thread_count": 1,
+        "input_dataset": "numeric_tiny",
+        "loss_function": loss,
+        "leaf_estimation_method": "Newton",
+        "score_function": "Cosine",
+        "boost_from_average": False,
+        "params": params,
+        "n_rows": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "n_iterations": n_iter,
+        "approx_dimension": dim,
+        "label_count": 3,
+        "target_rule": (
+            "label0=(y>median(y)), label1=(X0>median(X0)), label2=(X1>median(X1)); "
+            "3 independent binary {0,1} label columns"
+        ),
+        "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+        "staged_layout": (
+            "staged_predict(RawFormulaVal): per-iter (n_rows, dim) OBJECT-MAJOR "
+            "(row-major object then dim), concatenated across iterations; flat f64."
+        ),
+        "predictions_layout": (
+            "predict(Probability): (n_rows, dim) OBJECT-MAJOR row-major (per-dim "
+            "sigmoid), flat f64."
+        ),
+        "leaf_values_layout": (
+            "model.json leaf_values are LEAF-MAJOR (leaf0_d0, leaf0_d1, ..., "
+            "leaf1_d0, ...) length leaves*dim; leaf_weights length leaves."
+        ),
+        "prediction_type": "Probability",
+    }
+    with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def gen_multilabel() -> None:
+    """multilogloss/ + multicrossentropy/ — the Plan 06.2-04 (LOSS-02) multilabel
+    per-stage oracle. MultiLogloss + MultiCrossEntropy are the SAME upstream
+    TMultiCrossEntropyError diagonal der path (two enum names). Each gates Splits /
+    LeafValues / StagedApprox / Predictions <= 1e-5 vs catboost 1.2.10
+    (thread_count=1, leaf_estimation_iterations:1, the pinned isolating params)."""
+    _gen_one_multilabel(MULTILOGLOSS, "MultiLogloss")
+    _gen_one_multilabel(MULTICROSSENTROPY, "MultiCrossEntropy")
+
+
+def gen_multilabel_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the Plan 06.2-04 multilabel fixtures
+    (multilogloss / multicrossentropy) without re-running the full `main()` (which
+    would overwrite every committed Phase 2-5 / 6.1 / 6.2-03 fixture)."""
+    gen_multilabel()
+    print(
+        "Wrote multilabel oracle fixtures "
+        "(multilogloss/multicrossentropy)"
     )
 
 
@@ -2941,6 +3081,11 @@ def main() -> None:
         "Wrote multiclass oracle fixtures "
         "(multiclass_softmax/multiclass_onevsall)"
     )
+    gen_multilabel()
+    print(
+        "Wrote multilabel oracle fixtures "
+        "(multilogloss/multicrossentropy)"
+    )
 
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
@@ -2974,5 +3119,10 @@ if __name__ == "__main__":
         # (multiclass_softmax / multiclass_onevsall), leaving every committed
         # Phase 2-5 / 6.1 fixture untouched.
         gen_multiclass_only()
+    elif "--multilabel-only" in sys.argv:
+        # `--multilabel-only` regenerates ONLY the Plan 06.2-04 multilabel fixtures
+        # (multilogloss / multicrossentropy), leaving every committed
+        # Phase 2-5 / 6.1 / 6.2-03 fixture untouched.
+        gen_multilabel_only()
     else:
         main()

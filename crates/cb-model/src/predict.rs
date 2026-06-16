@@ -111,6 +111,13 @@ pub enum MultiClassKind {
     /// MultiClassOneVsAll: `Probability` = per-dimension sigmoid (the probabilities
     /// do NOT sum to 1); `Class` = argmax over dim.
     OneVsAll,
+    /// MultiLogloss / MultiCrossEntropy (multilabel, LOSS-02): `Probability` =
+    /// per-dimension sigmoid of the raw approx — each label dimension is an
+    /// INDEPENDENT binary probability (the values do NOT sum to 1; there is no
+    /// softmax coupling and no single "winning" class). Identical `Probability`
+    /// transform to [`MultiClassKind::OneVsAll`]; named separately because the
+    /// dimensions are label columns, not mutually-exclusive classes.
+    MultiLabel,
 }
 
 /// The per-object softmax over `slice` (max-subtracted, `eval_processing.h:18`) —
@@ -189,7 +196,10 @@ pub fn apply_multiclass_prediction(
                 let slice = object_slice(i);
                 match kind {
                     MultiClassKind::Softmax => out.extend(softmax(&slice)),
-                    MultiClassKind::OneVsAll => {
+                    // OneVsAll and MultiLabel share the per-dimension sigmoid
+                    // Probability transform (each dimension an independent binary
+                    // probability; no softmax coupling).
+                    MultiClassKind::OneVsAll | MultiClassKind::MultiLabel => {
                         out.extend(slice.iter().map(|&a| sigmoid_pos(a)));
                     }
                 }
