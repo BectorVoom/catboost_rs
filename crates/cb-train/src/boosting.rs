@@ -687,7 +687,13 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         // upstream auto-LR coefficient table -> Unknown (no rate guessed); the
         // ranking fixtures pin an explicit learning_rate.
         | Loss::QueryRmse
-        | Loss::QuerySoftMax { .. } => TargetType::Unknown,
+        | Loss::QuerySoftMax { .. }
+        // The Wave-B ranking losses (PairLogit / PairLogitPairwise / LambdaMart)
+        // are likewise not in the upstream auto-LR coefficient table -> Unknown;
+        // the ranking fixtures pin an explicit learning_rate.
+        | Loss::PairLogit
+        | Loss::PairLogitPairwise
+        | Loss::LambdaMart { .. } => TargetType::Unknown,
     }
 }
 
@@ -695,13 +701,21 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
 /// PER QUERY-GROUP through the grouped seam
 /// (`cb_compute::Runtime::compute_gradients_grouped` →
 /// `calc_ders_for_queries`), rather than the pointwise per-object
-/// `compute_gradients` (LOSS-04, D-6.3-03). Wave A wires the two querywise
-/// deterministic losses; Plans 03–05 extend this predicate as PairLogit /
-/// LambdaMart / YetiRank / StochasticRank land. Every NON-ranking loss returns
-/// `false` and keeps the pointwise der site BYTE-IDENTICAL (D-04 no-regression).
+/// `compute_gradients` (LOSS-04, D-6.3-03). Wave A wired the two querywise
+/// deterministic losses; Wave B (this plan) adds the pairwise/listwise
+/// deterministic losses (PairLogit / PairLogitPairwise / LambdaMart); Plans 04–05
+/// extend it for YetiRank / StochasticRank. Every NON-ranking loss returns `false`
+/// and keeps the pointwise der site BYTE-IDENTICAL (D-04 no-regression).
 #[must_use]
 fn is_grouped_loss(loss: &Loss) -> bool {
-    matches!(loss, Loss::QueryRmse | Loss::QuerySoftMax { .. })
+    matches!(
+        loss,
+        Loss::QueryRmse
+            | Loss::QuerySoftMax { .. }
+            | Loss::PairLogit
+            | Loss::PairLogitPairwise
+            | Loss::LambdaMart { .. }
+    )
 }
 
 /// Compute the starting approx (and model bias): the target mean for RMSE with

@@ -261,3 +261,178 @@ fn querysoftmax_validate_rejects_bad_params() {
     // QueryRmse carries no params — always valid.
     assert!(Loss::QueryRmse.validate().is_ok());
 }
+
+// --- PairLogit grouped der over Competitors (LOSS-04 Wave B) ------------------
+
+fn group_with_competitors(begin: usize, end: usize, comps: Vec<Vec<Competitor>>) -> GroupSpan {
+    GroupSpan { begin, end, weight: 1.0, competitors: comps }
+}
+
+#[test]
+fn pairlogit_single_pair_group_der_matches_hand_computed() {
+    // One group [0,2); a single pair: winner = doc 0, loser = doc 1, weight 1.
+    // approx [0.0, 0.0] (raw) ⇒ expApprox [1, 1].
+    //   p = exp(loser)/(exp(loser)+exp(winner)) = 1/(1+1) = 0.5.
+    //   winnerDer += w·p = 0.5 ; der1[loser] -= w·p = -0.5.
+    //   winnerDer2 += w·p·(p-1) = 0.5·(-0.5) = -0.25 ; der2[loser] += -0.25.
+    //   der1[winner] += 0.5 ; der2[winner] += -0.25.
+    // ⇒ der1 = [0.5, -0.5]; der2 = [-0.25, -0.25].
+    let approx = [0.0, 0.0];
+    let target = [1.0, 0.0]; // target unused by PairLogit
+    let comps = vec![vec![Competitor { id: 1, weight: 1.0 }], Vec::new()];
+    let groups = [group_with_competitors(0, 2, comps)];
+    let out = calc_ders_for_queries(&Loss::PairLogit, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    assert!((g.der1[0] - 0.5).abs() < 1e-12, "der1[0]={}", g.der1[0]);
+    assert!((g.der1[1] - (-0.5)).abs() < 1e-12, "der1[1]={}", g.der1[1]);
+    assert!((g.der2[0] - (-0.25)).abs() < 1e-12, "der2[0]={}", g.der2[0]);
+    assert!((g.der2[1] - (-0.25)).abs() < 1e-12, "der2[1]={}", g.der2[1]);
+}
+
+#[test]
+fn pairlogit_pairwise_shares_pairlogit_der() {
+    // PairLogitPairwise uses the SAME der as PairLogit (only the leaf path differs).
+    let approx = [0.5, -0.5];
+    let target = [1.0, 0.0];
+    let comps = vec![vec![Competitor { id: 1, weight: 2.0 }], Vec::new()];
+    let groups = [group_with_competitors(0, 2, comps)];
+    let a =
+        calc_ders_for_queries(&Loss::PairLogit, &approx, &target, &[], &groups, 0).unwrap();
+    let b = calc_ders_for_queries(
+        &Loss::PairLogitPairwise,
+        &approx,
+        &target,
+        &[],
+        &groups,
+        0,
+    )
+    .unwrap();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn pairlogit_pair_weight_scales_der() {
+    // weight 2 doubles the contribution vs weight 1 at the symmetric p=0.5 point.
+    let approx = [0.0, 0.0];
+    let target = [1.0, 0.0];
+    let comps = vec![vec![Competitor { id: 1, weight: 2.0 }], Vec::new()];
+    let groups = [group_with_competitors(0, 2, comps)];
+    let out = calc_ders_for_queries(&Loss::PairLogit, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    // winnerDer = 2·0.5 = 1.0 ; der1[loser] = -1.0 ; der2 = 2·(-0.25) = -0.5.
+    assert!((g.der1[0] - 1.0).abs() < 1e-12);
+    assert!((g.der1[1] - (-1.0)).abs() < 1e-12);
+    assert!((g.der2[0] - (-0.5)).abs() < 1e-12);
+    assert!((g.der2[1] - (-0.5)).abs() < 1e-12);
+}
+
+// --- LambdaMart grouped der (LOSS-04 Wave B) ----------------------------------
+
+#[test]
+fn lambdamart_two_doc_ndcg_der_matches_hand_computed() {
+    // One group [0,2); metric NDCG, sigma=1, top=-1, norm=false (isolate the core).
+    // approx [1.0, 0.0]; target [1.0, 0.0]. Sort by approx desc ⇒ order [0,1].
+    //   idealScore (target sorted desc [1,0], top=2):
+    //     1/log2(2) + 0/log2(3) = 1/1 = 1.0.
+    //   pair (firstId=0,secondId=1): firstTarget=1 > secondTarget=0.
+    //     approxDiff = approx[0]-approx[1] = 1.0.
+    //     dcgNum = 1 - 0 = 1 ; dcgDen = |1/log2(2) - 1/log2(3)| = |1 - 0.63093| = 0.36907.
+    //     delta = 1·0.36907 / 1.0 = 0.36907.
+    //     σ = 1/(1+exp(1)) = 0.268941 ; antigrad = -1·δ·σ ; hessian = 1·δ·σ(1-σ).
+    let approx = [1.0_f64, 0.0];
+    let target = [1.0_f64, 0.0];
+    let groups = [span(0, 2)];
+    let loss = Loss::LambdaMart {
+        metric: crate::runtime::LambdaMartMetric::Ndcg,
+        sigma: 1.0,
+        top: -1,
+        norm: false,
+    };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+
+    let dcg_den = (1.0 / (2.0_f64).log2() - 1.0 / (3.0_f64).log2()).abs();
+    let delta = 1.0 * dcg_den / 1.0;
+    let sig = 1.0 / (1.0 + 1.0_f64.exp());
+    let antigrad = -1.0 * delta * sig;
+    let hessian = 1.0 * 1.0 * delta * sig * (1.0 - sig);
+    // doc 0 is the high doc (firstId=0): der1 += antigrad, der2 += hessian.
+    // doc 1 is the low doc: der1 -= antigrad, der2 += hessian.
+    assert!((g.der1[0] - antigrad).abs() < 1e-12, "der1[0]={}", g.der1[0]);
+    assert!((g.der1[1] - (-antigrad)).abs() < 1e-12, "der1[1]={}", g.der1[1]);
+    assert!((g.der2[0] - hessian).abs() < 1e-12, "der2[0]={}", g.der2[0]);
+    assert!((g.der2[1] - hessian).abs() < 1e-12, "der2[1]={}", g.der2[1]);
+}
+
+#[test]
+fn lambdamart_singleton_group_yields_zero_der() {
+    // A 1-doc group has no ordered pairs ⇒ zero der (no panic, count<=1 guard).
+    let approx = [0.7];
+    let target = [2.0];
+    let groups = [span(0, 1)];
+    let loss = Loss::LambdaMart {
+        metric: crate::runtime::LambdaMartMetric::Ndcg,
+        sigma: 1.0,
+        top: -1,
+        norm: true,
+    };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    assert_eq!(g.der1, vec![0.0]);
+    assert_eq!(g.der2, vec![0.0]);
+}
+
+#[test]
+fn lambdamart_equal_targets_yields_zero_der() {
+    // No ordered pair has firstTarget > secondTarget ⇒ zero der.
+    let approx = [0.5, 0.2, 0.9];
+    let target = [1.0, 1.0, 1.0];
+    let groups = [span(0, 3)];
+    let loss = Loss::LambdaMart {
+        metric: crate::runtime::LambdaMartMetric::Ndcg,
+        sigma: 1.0,
+        top: -1,
+        norm: true,
+    };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    let g = &out[0];
+    assert!(g.der1.iter().all(|&d| d == 0.0));
+    assert!(g.der2.iter().all(|&d| d == 0.0));
+}
+
+#[test]
+fn lambdamart_validate_rejects_bad_sigma_and_top() {
+    let bad_sigma = Loss::LambdaMart {
+        metric: crate::runtime::LambdaMartMetric::Ndcg,
+        sigma: 0.0,
+        top: -1,
+        norm: true,
+    };
+    assert!(bad_sigma.validate().is_err());
+    let bad_top = Loss::LambdaMart {
+        metric: crate::runtime::LambdaMartMetric::Ndcg,
+        sigma: 1.0,
+        top: 0,
+        norm: true,
+    };
+    assert!(bad_top.validate().is_err());
+    let ok = Loss::LambdaMart {
+        metric: crate::runtime::LambdaMartMetric::Ndcg,
+        sigma: 1.0,
+        top: -1,
+        norm: true,
+    };
+    assert!(ok.validate().is_ok());
+}
+
+#[test]
+fn is_pairwise_scoring_and_plain_only_predicates() {
+    use super::{is_pairwise_scoring, is_plain_only};
+    assert!(is_pairwise_scoring(&Loss::PairLogitPairwise));
+    assert!(is_plain_only(&Loss::PairLogitPairwise));
+    // Non-pairwise ranking losses are neither.
+    assert!(!is_pairwise_scoring(&Loss::PairLogit));
+    assert!(!is_plain_only(&Loss::PairLogit));
+    assert!(!is_pairwise_scoring(&Loss::QueryRmse));
+    assert!(!is_pairwise_scoring(&Loss::Rmse));
+}

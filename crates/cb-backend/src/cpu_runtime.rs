@@ -586,9 +586,18 @@ fn compute_gradients_one_dim(
         // dispatch; reject defensively (typed CbError, no `unwrap`/panic) rather
         // than silently producing a pointwise gradient that ignores the group
         // structure.
-        Loss::QueryRmse | Loss::QuerySoftMax { .. } => Err(CbError::Degenerate(
-            "ranking losses (QueryRMSE / QuerySoftMax) are dispatched through the \
-             grouped der seam (compute_gradients_grouped), not the pointwise \
+        // PairLogit / PairLogitPairwise / LambdaMart (Wave B ranking losses,
+        // LOSS-04) are likewise PAIRWISE / QUERYWISE: their der is computed PER
+        // GROUP via the grouped seam, NOT this pointwise single-dimension scalar
+        // path. Reject defensively (typed CbError, no `unwrap`/panic).
+        Loss::QueryRmse
+        | Loss::QuerySoftMax { .. }
+        | Loss::PairLogit
+        | Loss::PairLogitPairwise
+        | Loss::LambdaMart { .. } => Err(CbError::Degenerate(
+            "ranking losses (QueryRMSE / QuerySoftMax / PairLogit / \
+             PairLogitPairwise / LambdaMart) are dispatched through the grouped \
+             der seam (compute_gradients_grouped), not the pointwise \
              single-dimension scalar path"
                 .to_owned(),
         )),

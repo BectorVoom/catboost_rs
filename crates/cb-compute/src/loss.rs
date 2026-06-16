@@ -617,3 +617,63 @@ pub fn querysoftmax_der(
     let der1 = beta * (-sum_weighted_targets * p + weight * target);
     (der1, der2)
 }
+
+/// PairLogit per-competitor logistic probability `p = expApprox[loser] /
+/// (expApprox[loser] + expApprox[winner])` for ONE (winner, loser) pair
+/// (LOSS-04, Wave B). EXP-approx (`isExpApprox == true`): the caller passes the
+/// RAW approxes and this takes `exp()` INLINE (the [`poisson_der1`] precedent), so
+/// the per-group wrapper ([`crate::calc_ders_for_queries`]) never materializes an
+/// exp-approx buffer.
+///
+/// `error_functions.h:857-858` — `TPairLogitError::CalcDersForQueries`:
+/// ```text
+/// const double p = expApproxes[competitor.Id + begin] /
+///     (expApproxes[competitor.Id + begin] + expApproxes[docId]);
+/// ```
+/// `p ∈ [0, 1]` is a bounded ratio (T-06.3-03-03 — no unbounded growth). The
+/// winner/loser der accumulation (`winnerDer += w·p`, `der1[loser] -= w·p`,
+/// `winnerDer2 += w·p·(p-1)`, `der2[loser] += w·p·(p-1)`,
+/// `error_functions.h:859-862`) lives in the per-group wrapper because it scatters
+/// across both the winner and loser objects; this helper supplies the parity-
+/// critical `p` from the two RAW approxes.
+#[must_use]
+pub fn pairlogit_pair_prob(winner_approx: f64, loser_approx: f64) -> f64 {
+    let exp_loser = loser_approx.exp();
+    let exp_winner = winner_approx.exp();
+    let denom = exp_loser + exp_winner;
+    if denom > 0.0 {
+        exp_loser / denom
+    } else {
+        // Degenerate (both exps underflowed to 0): no preference, p = 0.5 keeps the
+        // der finite (never a 0/0 NaN — T-06.3-03-03 / Security V5).
+        0.5
+    }
+}
+
+/// LambdaMart per-ordered-pair lambda gradient `(antigrad, hessian)` for a pair
+/// (high doc, low doc) given the metric-derived position weight `delta` and the
+/// pairwise sigmoid scale `sigma` (LOSS-04, Wave B). RAW approx
+/// (`isExpApprox == false`).
+///
+/// `error_functions.cpp:664-667` — the shared LambdaMART per-pair core (identical
+/// across `CalcDersNDCG`/`CalcDersMRR`/`CalcDersERR`/`CalcDersMAP`):
+/// ```text
+/// double antigrad = 1.0 / (1.0 + std::exp(Sigma * approxDiff));
+/// double hessian  = antigrad * (1 - antigrad);
+/// antigrad *= - Sigma * delta;
+/// hessian  *=   Sigma * Sigma * delta;
+/// ```
+/// where `approxDiff = approx[high] - approx[low]`. The per-group wrapper scatters
+/// `der1[high] += antigrad`, `der1[low] -= antigrad`, `der2[high] += hessian`,
+/// `der2[low] += hessian`, and accumulates `sumDer1 -= 2·antigrad`
+/// (`error_functions.cpp:669-674`). `delta` is the metric-specific position weight
+/// (e.g. `(dcgNum·dcgDen)/idealScore` for (N)DCG, optionally `/= 0.01 +
+/// |approxDiff|` when `norm`), computed in the wrapper.
+#[must_use]
+pub fn lambdamart_pair_grad(approx_diff: f64, delta: f64, sigma: f64) -> (f64, f64) {
+    let sig = 1.0 / (1.0 + (sigma * approx_diff).exp());
+    let mut hessian = sig * (1.0 - sig);
+    let antigrad = -sigma * delta * sig;
+    hessian *= sigma * sigma * delta;
+    (antigrad, hessian)
+}

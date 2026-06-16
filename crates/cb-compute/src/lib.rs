@@ -36,16 +36,18 @@ pub use loss::{
     calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,
     focal_der1, focal_der2, huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1,
     logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
-    multi_crossentropy_ders, multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1,
+    lambdamart_pair_grad, multi_crossentropy_ders, multiclass_onevsall_ders, pairlogit_pair_prob,
+    poisson_der1, poisson_der2, quantile_der1,
     quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1,
     rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2, FOCAL_P_MIN, QUANTILE_ALPHA,
     QUANTILE_DELTA,
 };
 pub use ranking_der::{
-    calc_ders_for_queries, group_reduce_weighted, Competitor as RankingCompetitor, GroupSpan,
+    calc_ders_for_queries, group_reduce_weighted, is_pairwise_scoring, is_plain_only,
+    Competitor as RankingCompetitor, GroupSpan,
 };
 pub use runtime::{
-    Derivatives, EScoreFunction, Float, Loss, Runtime, EXPECTILE_ALPHA_DEFAULT,
+    Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime, EXPECTILE_ALPHA_DEFAULT,
     QUERYSOFTMAX_BETA_DEFAULT, QUERYSOFTMAX_LAMBDA_DEFAULT,
 };
 pub use score::{

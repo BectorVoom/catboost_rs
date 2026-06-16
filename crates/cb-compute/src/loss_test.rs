@@ -6,7 +6,8 @@ use crate::loss::{
     calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,
     focal_der1, focal_der2, huber_der1, huber_der2, logcosh_der1, logcosh_der2, logloss_der1,
     logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
-    multi_crossentropy_ders, multiclass_onevsall_ders, poisson_der1, poisson_der2, quantile_der1,
+    lambdamart_pair_grad, multi_crossentropy_ders, multiclass_onevsall_ders, pairlogit_pair_prob,
+    poisson_der1, poisson_der2, quantile_der1,
     quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1, rmse_der2, sigmoid, softmax_ders,
     tweedie_der1, tweedie_der2, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
@@ -486,4 +487,45 @@ fn querysoftmax_der_scales_with_beta() {
     // der1 = 2·(-1.5·0.4 + 0) = -1.2 ; der2 = 2·1.5·(2·0.4·(0.4-1) - 0) = 3·(-0.48) = -1.44
     assert!((d1 - (-1.2)).abs() < 1e-12);
     assert!((d2 - (-1.44)).abs() < 1e-12);
+}
+
+// --- PairLogit / LambdaMart pairwise primitives (LOSS-04 Wave B) --------------
+
+#[test]
+fn pairlogit_pair_prob_is_exp_ratio_over_raw_approxes() {
+    // p = exp(loser) / (exp(loser) + exp(winner)) over the RAW approxes
+    // (error_functions.h:857-858, exp() taken INLINE).
+    let winner = 0.5_f64;
+    let loser = -0.25_f64;
+    let want = loser.exp() / (loser.exp() + winner.exp());
+    let p = pairlogit_pair_prob(winner, loser);
+    assert!((p - want).abs() < 1e-12, "p={p} want={want}");
+    // Equal approxes ⇒ p = 0.5 (the winner currently has no preference).
+    assert!((pairlogit_pair_prob(1.0, 1.0) - 0.5).abs() < 1e-12);
+    // A strongly-preferred winner drives p toward 0 (small loser share).
+    assert!(pairlogit_pair_prob(10.0, -10.0) < 1e-6);
+}
+
+#[test]
+fn lambdamart_pair_grad_matches_hand_formula() {
+    // antigrad = -Sigma·delta·σ(Sigma·approxDiff),
+    // hessian  =  Sigma²·delta·σ·(1-σ), σ = 1/(1+exp(Sigma·approxDiff))
+    // (error_functions.cpp:664-667).
+    let sigma = 1.0_f64;
+    let delta = 0.5_f64;
+    let approx_diff = 0.2_f64;
+    let sig = 1.0 / (1.0 + (sigma * approx_diff).exp());
+    let want_anti = -sigma * delta * sig;
+    let want_hess = sigma * sigma * delta * sig * (1.0 - sig);
+    let (anti, hess) = lambdamart_pair_grad(approx_diff, delta, sigma);
+    assert!((anti - want_anti).abs() < 1e-12, "anti={anti} want={want_anti}");
+    assert!((hess - want_hess).abs() < 1e-12, "hess={hess} want={want_hess}");
+}
+
+#[test]
+fn lambdamart_pair_grad_scales_with_sigma_and_delta() {
+    // sigma=2, delta=1, approx_diff=0 ⇒ σ=0.5; antigrad=-2·1·0.5=-1; hessian=4·1·0.25=1.
+    let (anti, hess) = lambdamart_pair_grad(0.0, 1.0, 2.0);
+    assert!((anti - (-1.0)).abs() < 1e-12);
+    assert!((hess - 1.0).abs() < 1e-12);
 }

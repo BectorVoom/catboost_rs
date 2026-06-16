@@ -88,7 +88,10 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         // scalar oracle; map to the regression-target arm to keep the match
         // exhaustive (never constructed here).
         | Loss::QueryRmse
-        | Loss::QuerySoftMax { .. } => load_regression_target(),
+        | Loss::QuerySoftMax { .. }
+        | Loss::PairLogit
+        | Loss::PairLogitPairwise
+        | Loss::LambdaMart { .. } => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

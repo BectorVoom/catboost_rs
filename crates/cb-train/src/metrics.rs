@@ -181,7 +181,14 @@ impl EvalMetric {
             // fixtures pin `od_type=None` with no eval set, so this default is
             // never exercised (a named ranking eval metric — NDCG etc. — is Wave D).
             | Loss::QueryRmse
-            | Loss::QuerySoftMax { .. } => Self::Rmse,
+            | Loss::QuerySoftMax { .. }
+            // The Wave-B ranking losses (PairLogit / PairLogitPairwise / LambdaMart)
+            // likewise report the parity-neutral RMSE eval surface by default; the
+            // in-scope fixtures pin `od_type=None` with no eval set, so this default
+            // is never exercised (named ranking eval metrics are Wave D).
+            | Loss::PairLogit
+            | Loss::PairLogitPairwise
+            | Loss::LambdaMart { .. } => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,

@@ -101,7 +101,10 @@ fn train_scenario(
         // Ranking losses (QueryRMSE / QuerySoftMax) are not exercised by this
         // scalar oracle; map to the regression-target arm (never constructed here).
         | Loss::QueryRmse
-        | Loss::QuerySoftMax { .. } => load_regression_target(),
+        | Loss::QuerySoftMax { .. }
+        | Loss::PairLogit
+        | Loss::PairLogitPairwise
+        | Loss::LambdaMart { .. } => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

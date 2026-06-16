@@ -33,8 +33,31 @@
 
 use cb_core::{sum_f64, CbError, CbResult};
 
-use crate::loss::{queryrmse_der, querysoftmax_der};
-use crate::runtime::{Derivatives, Loss};
+use crate::loss::{
+    lambdamart_pair_grad, pairlogit_pair_prob, queryrmse_der, querysoftmax_der,
+};
+use crate::runtime::{Derivatives, LambdaMartMetric, Loss};
+
+/// Whether `loss` uses the PAIRWISE leaf-value / split-scoring path
+/// (`IsPairwiseScoring`, `enum_helpers.cpp:469-475`). Only the `*Pairwise`
+/// variants qualify — they solve the leaf values via the Cholesky pairwise-leaf
+/// path ([`cb_train::pairwise_leaves`]) instead of the pointwise Gradient/Newton
+/// estimators (RESEARCH Pitfall 2 — mis-routing diverges leaf values). In this
+/// phase the only pairwise-scoring loss is [`Loss::PairLogitPairwise`]
+/// (`YetiRankPairwise` lands in Plan 04; `QueryCrossEntropy` is out of scope).
+#[must_use]
+pub fn is_pairwise_scoring(loss: &Loss) -> bool {
+    matches!(loss, Loss::PairLogitPairwise)
+}
+
+/// Whether `loss` forces `boosting_type = Plain` (`IsPlainOnlyModeLoss`,
+/// `enum_helpers.cpp:460-467`). The `*Pairwise` variants cannot use Ordered
+/// boosting, so their fixtures must pin Plain. In this phase only
+/// [`Loss::PairLogitPairwise`] qualifies (`YetiRankPairwise` in Plan 04).
+#[must_use]
+pub fn is_plain_only(loss: &Loss) -> bool {
+    matches!(loss, Loss::PairLogitPairwise)
+}
 
 /// A competitor edge inside a group: the group-local loser index plus the pair
 /// weight. Compute-tier mirror of `cb-train::Competitor` / upstream
@@ -298,13 +321,33 @@ pub fn calc_ders_for_queries(
                     }
                 }
             }
-            // PairLogit / LambdaMart / YetiRank / StochasticRank (and every non-
-            // ranking loss) stay unwired here — Plans 03–05 fill them; the
-            // pointwise losses never reach the grouped seam.
+            // PairLogit / PairLogitPairwise (Wave B): the SAME pairwise-logit der
+            // over the group's explicit Competitors adjacency (they map to one
+            // upstream TPairLogitError; only the LEAF path differs — pointwise vs
+            // Cholesky — which is decided later in boosting, not here). EXP-approx:
+            // the RAW approxes are exp()'d INLINE per pair (Poisson precedent). The
+            // pair weight is `competitor.weight` (NOT the per-object weight).
+            // error_functions.h:849-866.
+            Loss::PairLogit | Loss::PairLogitPairwise => {
+                pairlogit_group_der(approx_slice, &group.competitors)
+            }
+            // LambdaMart (Wave B): the per-group lambda gradient toward the target
+            // metric. RAW approx; sorts the group by approx descending, then
+            // accumulates the per-ordered-pair antigrad/hessian, optionally
+            // norm-rescaled. error_functions.cpp:607-922.
+            Loss::LambdaMart {
+                metric,
+                sigma,
+                top,
+                norm,
+            } => lambdamart_group_der(approx_slice, target_slice, *metric, *sigma, *top, *norm),
+            // YetiRank / StochasticRank (and every non-ranking loss) stay unwired
+            // here — Plans 04–05 fill them; the pointwise losses never reach the
+            // grouped seam.
             _ => {
                 return Err(CbError::OutOfRange(format!(
                     "calc_ders_for_queries: ranking loss not yet wired for {loss:?} \
-                     (grouped der arms land in Plans 06.3-03..05)"
+                     (grouped der arms land in Plans 06.3-04..05)"
                 )));
             }
         };
@@ -314,6 +357,230 @@ pub fn calc_ders_for_queries(
     // Reached only when `groups` is empty (no group ever dispatched): the seam
     // returns an empty der set, never panicking on degenerate ungrouped input.
     Ok(per_group)
+}
+
+/// PairLogit / PairLogitPairwise per-group der over the explicit `competitors`
+/// adjacency (LOSS-04, Wave B). `approx_slice` is the group's RAW approxes (length
+/// `n`, group-local); `competitors[winner_local]` lists the losers `winner_local`
+/// should outrank, each carrying the pair `weight`. Transcribes
+/// `TPairLogitError::CalcDersForQueries` (`error_functions.h:849-866`) verbatim.
+///
+/// The der is a SCATTER-add across both the winner and loser objects (a winner's
+/// loss raises its own der and lowers each loser's), so it mirrors upstream's
+/// fixed-order `+=` accumulation EXACTLY (doc-ascending outer, competitor-order
+/// inner) rather than a reordered `sum_f64` reduction — the summation order IS the
+/// parity contract here (any reorder perturbs the last ULP). The pair weight is
+/// `competitor.weight`, NOT the per-object weight (PairLogit folds the weight into
+/// the pair, not the object). EXP-approx: `p` is computed from the two RAW
+/// approxes with `exp()` taken INLINE ([`pairlogit_pair_prob`]).
+fn pairlogit_group_der(approx_slice: &[f64], competitors: &[Vec<Competitor>]) -> Derivatives {
+    let n = approx_slice.len();
+    let mut der1 = vec![0.0_f64; n];
+    let mut der2 = vec![0.0_f64; n];
+    for doc_id in 0..n {
+        let winner_approx = approx_slice.get(doc_id).copied().unwrap_or(0.0);
+        let mut winner_der = 0.0_f64;
+        let mut winner_second_der = 0.0_f64;
+        // competitors[doc_id] may be absent (no losers for this winner) — skip.
+        if let Some(comps) = competitors.get(doc_id) {
+            for competitor in comps {
+                let loser_id = competitor.id;
+                let loser_approx = approx_slice.get(loser_id).copied().unwrap_or(0.0);
+                let p = pairlogit_pair_prob(winner_approx, loser_approx);
+                let w = competitor.weight;
+                winner_der += w * p;
+                winner_second_der += w * p * (p - 1.0);
+                if let Some(d) = der1.get_mut(loser_id) {
+                    *d -= w * p;
+                }
+                if let Some(d) = der2.get_mut(loser_id) {
+                    *d += w * p * (p - 1.0);
+                }
+            }
+        }
+        if let Some(d) = der1.get_mut(doc_id) {
+            *d += winner_der;
+        }
+        if let Some(d) = der2.get_mut(doc_id) {
+            *d += winner_second_der;
+        }
+    }
+    Derivatives { der1, der2 }
+}
+
+/// `(N)DCG` numerator for a target relevance (the `ENdcgMetricType::Base` default:
+/// the relevance itself; `error_functions.h:1359-1361`). The corpus pins the Base
+/// type, so this is the identity; the `Exp` (`2^rel - 1`) variant is not
+/// fixture-reachable in this wave.
+#[inline]
+fn ndcg_numerator(target: f64) -> f64 {
+    target
+}
+
+/// `(N)DCG` denominator for a 0-based sort position (the
+/// `ENdcgDenominatorType::LogPosition` default: `log2(2 + pos)`;
+/// `error_functions.h:1363-1365`).
+#[inline]
+fn ndcg_denominator(pos: usize) -> f64 {
+    (2.0 + pos as f64).log2()
+}
+
+/// LambdaMart per-group der toward the target `metric` (LOSS-04, Wave B).
+/// `approx_slice` / `target_slice` are the group's RAW approxes / relevances
+/// (group-local). Transcribes `TLambdaMartError::CalcDersForSingleQuery`
+/// (`error_functions.cpp:859-923`): stable-sort the docs by approx descending,
+/// dispatch to the metric-specific per-pair arm (only (N)DCG is fixture-reachable
+/// this wave; MRR/ERR/MAP transcribed for completeness in a follow-up), then apply
+/// the optional `norm` rescale. The der2 hessian is filled despite
+/// `maxDerivativeOrder == 1` (RESEARCH Pitfall 5), so LambdaMart rides the
+/// pointwise NEWTON leaf.
+///
+/// The per-pair accumulation is a fixed-order SCATTER-add (mirroring upstream's
+/// `ders[...].Der1 += antigrad`), so it reproduces upstream's summation order
+/// exactly rather than a reordered reduction. The `idealScore` and `sumDer1`
+/// accumulations are likewise the sequential float adds upstream performs (the
+/// parity order is the loop order, not a `sum_f64` reorder).
+fn lambdamart_group_der(
+    approx_slice: &[f64],
+    target_slice: &[f64],
+    metric: LambdaMartMetric,
+    sigma: f64,
+    top: i64,
+    norm: bool,
+) -> Derivatives {
+    let count = approx_slice.len();
+    let mut der1 = vec![0.0_f64; count];
+    let mut der2 = vec![0.0_f64; count];
+    if count <= 1 {
+        return Derivatives { der1, der2 };
+    }
+
+    // Stable sort doc indices by approx DESCENDING (error_functions.cpp:874-878).
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&a, &b| {
+        let aa = approx_slice.get(a).copied().unwrap_or(0.0);
+        let ab = approx_slice.get(b).copied().unwrap_or(0.0);
+        // descending by approx; stable on ties (sort_by is stable).
+        ab.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let approx_at = |i: usize| -> f64 {
+        approx_slice
+            .get(order.get(i).copied().unwrap_or(0))
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let target_at = |i: usize| -> f64 {
+        target_slice
+            .get(order.get(i).copied().unwrap_or(0))
+            .copied()
+            .unwrap_or(0.0)
+    };
+
+    // isApproxesSame guard (error_functions.cpp:640): when every approx is equal
+    // the norm `/= 0.01 + |diff|` is skipped (diff is 0 for every pair anyway).
+    let is_approxes_same = (approx_at(0) - approx_at(count - 1)).abs() == 0.0;
+
+    let mut sum_der1 = 0.0_f64;
+
+    match metric {
+        LambdaMartMetric::Dcg | LambdaMartMetric::Ndcg => {
+            let query_top_size = lambda_query_top_size(top, count);
+            let ideal_score = lambdamart_ideal_ndcg(target_slice, query_top_size);
+            for first_id in 0..count {
+                let bound_for_second = if first_id < query_top_size {
+                    count
+                } else {
+                    query_top_size
+                };
+                for second_id in 0..bound_for_second {
+                    let first_target = target_at(first_id);
+                    let second_target = target_at(second_id);
+                    if first_target <= second_target {
+                        continue;
+                    }
+                    let approx_diff = approx_at(first_id) - approx_at(second_id);
+                    let dcg_num = ndcg_numerator(first_target) - ndcg_numerator(second_target);
+                    let dcg_den = (1.0 / ndcg_denominator(first_id)
+                        - 1.0 / ndcg_denominator(second_id))
+                    .abs();
+                    let mut delta = if ideal_score != 0.0 {
+                        dcg_num * dcg_den / ideal_score
+                    } else {
+                        // IDCG==0 → no signal (every relevance 0); delta 0 (no
+                        // divide — Security V5).
+                        0.0
+                    };
+                    if norm && !is_approxes_same {
+                        delta /= 0.01 + approx_diff.abs();
+                    }
+                    let (antigrad, hessian) = lambdamart_pair_grad(approx_diff, delta, sigma);
+                    let fo = order.get(first_id).copied().unwrap_or(0);
+                    let so = order.get(second_id).copied().unwrap_or(0);
+                    if let Some(d) = der1.get_mut(fo) {
+                        *d += antigrad;
+                    }
+                    if let Some(d) = der2.get_mut(fo) {
+                        *d += hessian;
+                    }
+                    if let Some(d) = der1.get_mut(so) {
+                        *d -= antigrad;
+                    }
+                    if let Some(d) = der2.get_mut(so) {
+                        *d += hessian;
+                    }
+                    sum_der1 -= 2.0 * antigrad;
+                }
+            }
+        }
+        // MRR / ERR / MAP are admissible upstream metrics but are NOT reachable by
+        // the Wave-B fixture (which pins the NDCG default). They are intentionally
+        // left to a follow-up rather than transcribed-but-untested here (the
+        // executor does not ship unverifiable der math). Reaching them is a no-op
+        // (zeros) — `Loss::validate` accepts the metric but the corpus never trains
+        // them; a future plan adds their CalcDersMRR/ERR/MAP arms + fixtures.
+        LambdaMartMetric::Mrr | LambdaMartMetric::Err | LambdaMartMetric::Map => {}
+    }
+
+    // norm rescale (error_functions.cpp:916-922): when norm and sumDer1 > 0,
+    // multiply every der by log2(1 + sumDer1)/sumDer1.
+    if norm && sum_der1 > 0.0 {
+        let norma = (1.0 + sum_der1).log2() / sum_der1;
+        for d in &mut der1 {
+            *d *= norma;
+        }
+        for d in &mut der2 {
+            *d *= norma;
+        }
+    }
+
+    Derivatives { der1, der2 }
+}
+
+/// LambdaMart `GetQueryTopSize` (`error_functions.h:1367-1372`): `top == -1` or
+/// `top > docCount` ⇒ the full group, else `top`.
+fn lambda_query_top_size(top: i64, doc_count: usize) -> usize {
+    if top == -1 || top > doc_count as i64 {
+        doc_count
+    } else {
+        // top is validated `> 0` (or -1) by Loss::validate; clamp defensively.
+        usize::try_from(top).unwrap_or(doc_count).min(doc_count)
+    }
+}
+
+/// LambdaMart `CalcIdealMetric` for (N)DCG (`error_functions.cpp:925-935`): the DCG
+/// of the target-sorted ideal order over the top-`query_top_size` positions. A
+/// sequential float accumulation matching upstream's `score += ...` loop order
+/// (the parity contract is the loop order).
+fn lambdamart_ideal_ndcg(target_slice: &[f64], query_top_size: usize) -> f64 {
+    let mut sorted: Vec<f64> = target_slice.to_vec();
+    // descending stable sort of the relevances.
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut score = 0.0_f64;
+    for (pos, &t) in sorted.iter().enumerate().take(query_top_size) {
+        score += ndcg_numerator(t) / ndcg_denominator(pos);
+    }
+    score
 }
 
 #[cfg(test)]

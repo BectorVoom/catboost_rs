@@ -175,7 +175,10 @@ fn run_autolr_e2e(
         // Ranking losses are not in the auto-LR table and not exercised here;
         // map to Unknown to keep the match exhaustive.
         | Loss::QueryRmse
-        | Loss::QuerySoftMax { .. } => TargetType::Unknown,
+        | Loss::QuerySoftMax { .. }
+        | Loss::PairLogit
+        | Loss::PairLogitPairwise
+        | Loss::LambdaMart { .. } => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");

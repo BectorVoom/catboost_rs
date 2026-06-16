@@ -295,6 +295,88 @@ pub enum Loss {
         /// (`QuerySoftMax:beta=<value>`; default `1.0`).
         beta: f64,
     },
+    /// PairLogit (pairwise ranking, D-6.3-04 / LOSS-04 Wave B): the pairwise
+    /// logistic loss over explicit `Pool.pairs`. EXP-approx (`isExpApprox == true`,
+    /// `error_functions.h:828` `CB_ENSURE(isExpApprox == true)`) — cb-train stores
+    /// the RAW approx and computes `exp()` INLINE in the der (the Poisson
+    /// precedent, [`Loss::Poisson`]). Over one group, per winner `docId` and each
+    /// of its `Competitors` (the explicit losers it should outrank):
+    /// `p = expApprox[loser] / (expApprox[loser] + expApprox[winner])`;
+    /// `winnerDer += w·p`, `der1[loser] -= w·p`; `winnerDer2 += w·p·(p-1)`,
+    /// `der2[loser] += w·p·(p-1)`; then `der1[winner] += winnerDer`,
+    /// `der2[winner] += winnerDer2` (`error_functions.h:849-866`
+    /// `TPairLogitError::CalcDersForQueries`, [`crate::pairlogit_competitors_der`]).
+    /// The pair weight `w` is `competitor.weight` (NOT the per-object weight). No
+    /// params on the variant. Rides the EXISTING pointwise leaf estimators
+    /// (POINTWISE, NOT pairwise scoring — `IsPairwiseScoring` is false for the
+    /// non-`Pairwise` variant; upstream default leaf method Newton). Predictions
+    /// are RAW (identity — the ranking score; no link transform on apply).
+    PairLogit,
+    /// PairLogitPairwise (pairwise ranking, D-6.3-04 / LOSS-04 Wave B): the SAME
+    /// pairwise-logit der as [`Loss::PairLogit`] (it maps to the same upstream
+    /// `TPairLogitError`, `tensor_search_helpers.cpp:259-262`), but `IsPairwise`
+    /// scoring (`enum_helpers.cpp:469-475`) — so the leaf VALUES are solved via the
+    /// dedicated Cholesky pairwise-leaf path (`pairwise_leaves_calculation.cpp:9`,
+    /// [`cb_train::pairwise_leaves`]) over the per-leaf pairwise weight sums + der
+    /// sums, NOT the pointwise Gradient/Newton estimators. `*Pairwise` losses force
+    /// `boosting_type = Plain` (`IsPlainOnlyModeLoss`, `enum_helpers.cpp:460-467`).
+    /// EXP-approx (same as PairLogit). No params on the variant. Predictions are
+    /// RAW.
+    PairLogitPairwise,
+    /// LambdaMart (listwise ranking, LOSS-04 Wave B): a per-group lambda gradient
+    /// toward a target ranking `metric` (NDCG default). RAW approx
+    /// (`isExpApprox == false`, ctor `IDerCalcer(false, 1, …)`,
+    /// `error_functions.cpp:594`). Per group: stable-sort docs by approx
+    /// descending, then for each ordered pair with `firstTarget > secondTarget`:
+    /// `delta = (dcgNum·dcgDen) / idealScore` (the metric-specific position weight,
+    /// `error_functions.cpp:653-658`), optionally `delta /= 0.01 + |approxDiff|`
+    /// when `norm`; `antigrad = -Sigma·delta / (1 + exp(Sigma·approxDiff))`,
+    /// `hessian = Sigma²·delta · σ(Sigma·approxDiff)·(1 - σ(...))`; accumulate
+    /// `±antigrad` into `der1` and `+hessian` into `der2` for the high/low doc
+    /// (`error_functions.cpp:664-674` `CalcDersNDCG`). The der2 hessian is filled
+    /// despite `maxDerivativeOrder == 1` (RESEARCH Pitfall 5), so the upstream
+    /// default leaf method is Newton. Optional `norm` post-scales all ders by
+    /// `log2(1 + Σder1)/Σder1` (`error_functions.cpp:916-922`). Rides the EXISTING
+    /// pointwise leaf estimators (POINTWISE — `IsPairwiseScoring` false). Predictions
+    /// are RAW. Defaults: `metric = NDCG`, `sigma = 1.0`, `top = -1` (full group),
+    /// `norm = true` (`tensor_search_helpers.cpp:273-278`).
+    LambdaMart {
+        /// The target ranking metric the lambda gradient optimizes
+        /// (`LambdaMart:metric=<NDCG|DCG|MRR|ERR|MAP>`; default `NDCG`).
+        metric: LambdaMartMetric,
+        /// Scale parameter `Sigma > 0` in the pairwise sigmoid
+        /// (`LambdaMart:sigma=<value>`; default `1.0`).
+        sigma: f64,
+        /// Top-`k` cutoff for the metric (`LambdaMart:top=<value>`; `-1` = the full
+        /// group, the default). Stored as `i64` so `-1` is representable.
+        top: i64,
+        /// `norm` flag: when `true` (the default) the per-pair `delta` is divided by
+        /// `0.01 + |approxDiff|` and the whole group's ders are rescaled by
+        /// `log2(1 + Σder1)/Σder1` (`error_functions.cpp:660-662,916-922`).
+        norm: bool,
+    },
+}
+
+/// The target ranking metric a [`Loss::LambdaMart`] optimizes its per-group lambda
+/// gradient toward. Mirrors the `EqualToOneOf(TargetMetric, DCG, NDCG, MRR, ERR,
+/// MAP)` set the upstream `TLambdaMartError` ctor admits
+/// (`error_functions.cpp:602-603`). `DCG`/`NDCG` share the same `CalcDersNDCG`
+/// arm (the ideal-metric normalization differs only in `CalcIdealMetric`, which
+/// the der treats identically — both route through `CalcDersNDCG`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LambdaMartMetric {
+    /// Discounted Cumulative Gain — the `CalcDersNDCG` arm (`error_functions.cpp:882`).
+    Dcg,
+    /// Normalized DCG (the default upstream LambdaMART metric); same
+    /// `CalcDersNDCG` arm as [`LambdaMartMetric::Dcg`].
+    #[default]
+    Ndcg,
+    /// Mean Reciprocal Rank — the `CalcDersMRR` arm (`error_functions.cpp:679`).
+    Mrr,
+    /// Expected Reciprocal Rank — the `CalcDersERR` arm (`error_functions.cpp:748`).
+    Err,
+    /// Mean Average Precision — the `CalcDersMAP` arm (`error_functions.cpp:805`).
+    Map,
 }
 
 /// The default QuerySoftMax L2 regularization `lambda = 0.01`
@@ -440,6 +522,28 @@ impl Loss {
                     )));
                 }
             }
+            // LambdaMart (Wave B, LOSS-04): `sigma` (the pairwise-sigmoid scale)
+            // must be finite and `> 0` (`error_functions.cpp:604`
+            // `CB_ENSURE(Sigma > 0)`). A non-positive sigma collapses the sigmoid
+            // and yields a degenerate gradient (T-06.3-03-04), so reject up front
+            // with a typed CbError (no `unwrap`/`panic`). `top` is unbounded
+            // (`-1` = full group; any positive `k` is clamped to the group size by
+            // `GetQueryTopSize`), but `top == 0` would make every group's metric
+            // window empty — reject it as out of range. `metric` is an exhaustive
+            // enum (nothing to reject); `norm` is a bool.
+            Self::LambdaMart { sigma, top, .. } => {
+                if !sigma.is_finite() || *sigma <= 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "LambdaMart sigma must be finite and > 0, got {sigma}"
+                    )));
+                }
+                if *top == 0 {
+                    return Err(cb_core::CbError::OutOfRange(
+                        "LambdaMart top must be -1 (full group) or a positive cutoff, got 0"
+                            .to_owned(),
+                    ));
+                }
+            }
             Self::Rmse
             | Self::Logloss
             | Self::CrossEntropy
@@ -452,7 +556,9 @@ impl Loss {
             | Self::MultiClassOneVsAll
             | Self::MultiLogloss
             | Self::MultiCrossEntropy
-            | Self::QueryRmse => {}
+            | Self::QueryRmse
+            | Self::PairLogit
+            | Self::PairLogitPairwise => {}
         }
         Ok(())
     }
