@@ -2194,6 +2194,13 @@ TWEEDIE = FIXTURES / "tweedie"
 MAPE = FIXTURES / "mape"
 MSLE_METRIC = FIXTURES / "msle_metric"
 
+# Phase-06.1 Wave-3 (Plan 06.1-03, LOSS-03) quantile-family fixture roots. The
+# Quantile{alpha,delta} Exact-leaf oracle: alpha=0.7 exercises the weighted
+# 0.7-quantile leaf (the alpha!=0.5 path), alpha=0.5 is the MAE-equivalence
+# anchor (Quantile{0.5} must reproduce leaf_methods/exact (MAE) bit-for-bit).
+QUANTILE_ALPHA07 = FIXTURES / "quantile_alpha07"
+QUANTILE_ALPHA05_MAE = FIXTURES / "quantile_alpha05_mae"
+
 # numeric_tiny.y carries negatives (min ~ -7.19); Poisson/Tweedie/MAPE require a
 # POSITIVE target. Shift the frozen target into a strictly-positive range
 # (min -> 1.0) and record the EXACT transform in each config.json so the Rust
@@ -2481,6 +2488,172 @@ def gen_msle_metric() -> None:
         fh.write("\n")
 
 
+def gen_wave3_quantile_losses() -> None:
+    """quantile_alpha07/ quantile_alpha05_mae/ — the Wave-3 quantile-family
+    training oracle (LOSS-03, Plan 06.1-03). Each scenario trains a
+    CatBoostRegressor on the frozen `numeric_tiny` corpus (the RAW target `y`,
+    NOT the Wave-2 positive shift — Quantile admits the full real line) with the
+    D-07 simplified isolating params, `leaf_estimation_method='Exact'` PINNED so
+    the Exact weighted-alpha-quantile leaf is exercised, and
+    `leaf_estimation_iterations:1`.
+
+    The two scenarios (RESEARCH Wave-3 table; error_functions.h:457-498
+    TQuantileError, alpha/delta defaults at :468-469):
+
+      - quantile_alpha07 : loss_function='Quantile:alpha=0.7',
+        leaf_estimation_method='Exact'. Exercises the alpha!=0.5 weighted-0.7-
+        quantile Exact leaf (the genuinely-new path — the thing Task 3 threads).
+      - quantile_alpha05_mae : loss_function='Quantile:alpha=0.5',
+        leaf_estimation_method='Exact'. The MAE-equivalence ANCHOR: Quantile{0.5}
+        must reproduce the existing leaf_methods/exact (MAE) model bit-for-bit
+        within <=1e-5 (MAE == Quantile{alpha=0.5}). Identical isolating params to
+        leaf_methods/exact except loss_function spelled as Quantile:alpha=0.5.
+
+    boost_from_average=False (the cb-train regression-loss path boosts from 0;
+    bias 0 keeps the Rust oracle's starting approx trivially matched — same as the
+    MAE leaf_methods/exact fixture). Each saves config.json (full params), model.
+    json (splits + leaf_values + leaf_weights), and staged.npy (per-iteration
+    RawFormulaVal raw approximant). No predictions.npy — Quantile predictions are
+    RAW (no link transform); the StagedApprox stage gates the raw approx.
+
+    A fixture-level MAE==Quantile{0.5} sanity check runs here: the alpha=0.5 model
+    leaf_values are compared against the existing leaf_methods/exact (MAE) model
+    leaf_values and asserted <=1e-5 before the fixtures are committed.
+
+    OFFLINE / RUN-ONCE (D-12): catboost==1.2.10 is NOT importable in CI.
+    """
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+
+    # (name, dir, loss_function, alpha).
+    scenarios = [
+        ("quantile_alpha07", QUANTILE_ALPHA07, "Quantile:alpha=0.7", 0.7),
+        ("quantile_alpha05_mae", QUANTILE_ALPHA05_MAE, "Quantile:alpha=0.5", 0.5),
+    ]
+
+    for name, scenario_dir, loss, alpha in scenarios:
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        # D-07 isolating params, overriding leaf_estimation_method='Exact' (so the
+        # Exact weighted-alpha-quantile leaf is under test) + loss_function per
+        # scenario. leaf_estimation_iterations stays 1.
+        params = {**ISOLATING_PARAMS}
+        params["leaf_estimation_method"] = "Exact"
+        params["loss_function"] = loss
+
+        model = CatBoostRegressor(boost_from_average=False, **params)
+        model.fit(x, y)
+
+        # --- Stage: Splits + LeafValues (model.json) ------------------------
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        # --- Stage: StagedApprox (RAW approximant, RawFormulaVal) -----------
+        staged = [
+            np.asarray(p, dtype=np.float64)
+            for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+        ]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        config = {
+            "scenario": name,
+            "requirement": "LOSS-03",
+            "wave": 3,
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": loss,
+            "alpha": alpha,
+            "delta": 1e-6,
+            "leaf_estimation_method": "Exact",
+            "leaf_estimation_iterations": 1,
+            "boost_from_average": False,
+            "bootstrap_type": "No",
+            "score_function": "L2",
+            "params": {**params, "boost_from_average": False},
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "prediction_type": "RawFormulaVal",
+            "stages": ["Splits", "LeafValues", "StagedApprox"],
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (RAW approximant, RawFormulaVal)"
+            ),
+            "leaf_method_note": (
+                "Quantile=Exact (weighted alpha-quantile of leaf residuals "
+                "target-approx; CalcOneDimensionalOptimumConstApprox -> "
+                "CalculateWeightedTargetQuantile, error_functions.h:457-498). "
+                "leaf_estimation_iterations:1. The alpha=0.7 fixture exercises the "
+                "alpha!=0.5 path; the alpha=0.5 fixture is the MAE-equivalence "
+                "anchor (Quantile{0.5}==MAE bit-for-bit vs leaf_methods/exact)."
+            ),
+            "der_note": (
+                "Quantile der1: val=target-approx; |val|<delta ? 0 : "
+                "(val>0 ? alpha : -(1-alpha)); der2=0 "
+                "(error_functions.h:485-493 TQuantileError; alpha/delta defaults "
+                "0.5/1e-6 at :468-469). At alpha=0.5,delta=1e-6 it equals MAE."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    # --- Fixture-level MAE == Quantile{0.5} sanity (acceptance criterion) -----
+    # The alpha=0.5 Quantile model leaf_values MUST match the existing
+    # leaf_methods/exact (MAE) model leaf_values within <=1e-5 (MAE ==
+    # Quantile{alpha=0.5}). Assert here so a misconfigured fixture is caught at
+    # generation time, before commit.
+    mae_model_path = LEAF_METHODS / "exact" / "model.json"
+    if mae_model_path.exists():
+        with mae_model_path.open(encoding="utf-8") as fh:
+            mae_model = json.load(fh)
+        with (QUANTILE_ALPHA05_MAE / "model.json").open(encoding="utf-8") as fh:
+            q05_model = json.load(fh)
+
+        def _leaf_values(model_json: dict) -> np.ndarray:
+            vals: list[float] = []
+            for tree in model_json["oblivious_trees"]:
+                vals.extend(float(v) for v in tree["leaf_values"])
+            return np.asarray(vals, dtype=np.float64)
+
+        mae_lv = _leaf_values(mae_model)
+        q05_lv = _leaf_values(q05_model)
+        if mae_lv.shape != q05_lv.shape:
+            raise AssertionError(
+                "MAE==Quantile{0.5} sanity: leaf-value shape mismatch "
+                f"(MAE {mae_lv.shape} vs Quantile{{0.5}} {q05_lv.shape})"
+            )
+        max_diff = float(np.max(np.abs(mae_lv - q05_lv)))
+        if max_diff > 1e-5:
+            raise AssertionError(
+                "MAE==Quantile{0.5} sanity FAILED: max|leaf_value diff| = "
+                f"{max_diff:.6e} > 1e-5 — the alpha=0.5 fixture does not reproduce "
+                "the leaf_methods/exact (MAE) model. Check the config."
+            )
+        print(
+            "  MAE==Quantile{0.5} sanity OK: max|leaf_value diff| = "
+            f"{max_diff:.6e} <= 1e-5"
+        )
+
+
+def gen_wave3_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the Plan 06.1-03 Wave-3 quantile
+    fixtures (quantile_alpha07 / quantile_alpha05_mae) without re-running the full
+    `main()` (which would overwrite every committed Phase 2-5 / Wave-1/2 fixture).
+
+    NOTE: the MAE==Quantile{0.5} sanity reads the committed leaf_methods/exact
+    model.json, so that fixture must already exist (it is committed)."""
+    gen_wave3_quantile_losses()
+    print(
+        "Wrote Wave-3 quantile-family oracle fixtures "
+        "(quantile_alpha07/quantile_alpha05_mae)"
+    )
+
+
 def gen_wave2_only() -> None:
     """Targeted entrypoint: regenerate ONLY the Plan 06.1-02 Wave-2 fixtures
     (poisson/tweedie/mape training + msle_metric) without re-running the full
@@ -2619,6 +2792,13 @@ def main() -> None:
     gen_msle_metric()
     print("Wrote MSLE eval-metric oracle fixture (msle_metric)")
 
+    # --- Phase-06.1 Wave-3 quantile-family fixtures (Plan 06.1-03, LOSS-03) ---
+    gen_wave3_quantile_losses()
+    print(
+        "Wrote Wave-3 quantile-family oracle fixtures "
+        "(quantile_alpha07/quantile_alpha05_mae)"
+    )
+
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
     print(f"Wrote borders_quant oracle fixtures under {BORDERS_QUANT}")
@@ -2641,5 +2821,10 @@ if __name__ == "__main__":
         # (poisson/tweedie/mape + msle_metric), leaving every committed Phase 2-5
         # / Wave-1 fixture untouched.
         gen_wave2_only()
+    elif "--wave3-only" in sys.argv:
+        # `--wave3-only` regenerates ONLY the Plan 06.1-03 Wave-3 quantile
+        # fixtures (quantile_alpha07/quantile_alpha05_mae), leaving every committed
+        # Phase 2-5 / Wave-1/2 fixture untouched.
+        gen_wave3_only()
     else:
         main()
