@@ -30,7 +30,8 @@ pub use histogram::{
 };
 pub use leaf::{
     calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
-    newton_leaf_delta, scale_l2_reg, simple_leaf_delta, solve_symmetric_newton, LeafMethod,
+    newton_leaf_delta, pairwise_cholesky_solve, scale_l2_reg, simple_leaf_delta,
+    solve_symmetric_newton, LeafMethod,
 };
 pub use loss::{
     calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,

@@ -242,12 +242,26 @@ pub fn solve_symmetric_newton(
     }
 }
 
+/// Public re-export of the in-house dense SPD Cholesky solver for the pairwise
+/// leaf path (LOSS-04 Wave B, `cb_train::pairwise_leaves`). Solves `a · x = b`
+/// where `a` is a `k×k` row-major symmetric positive-definite matrix and `b` is
+/// length `k`, returning `None` on a non-positive pivot so the caller falls back
+/// to zeros rather than a NaN (T-06.3-03-01). This is the SAME routine
+/// [`solve_symmetric_newton`] uses for the multiclass softmax leaf solve — the
+/// pairwise-leaf transcription (`pairwise_leaves_calculation.cpp`) reuses it
+/// instead of vendoring a second solver or adding a linear-algebra crate
+/// (RESEARCH Open Q1 RESOLVED).
+#[must_use]
+pub fn pairwise_cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    cholesky_solve(a, b)
+}
+
 /// Solve the dense symmetric positive-definite system `a · x = b` via a Cholesky
 /// factorization `a = L·Lᵀ` followed by forward/back substitution. `a` is `k×k`
 /// row-major; `b` is length `k`. Returns `None` if `a` is not positive definite (a
 /// non-positive pivot), so the caller can fall back to zeros rather than producing
-/// a NaN. Used only by [`solve_symmetric_newton`] for the tiny (`k <= ~10`) softmax
-/// leaf systems.
+/// a NaN. Used by [`solve_symmetric_newton`] for the tiny (`k <= ~10`) softmax
+/// leaf systems and (via [`pairwise_cholesky_solve`]) the pairwise leaf path.
 fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
     let k = b.len();
     let mut l = vec![vec![0.0_f64; k]; k];

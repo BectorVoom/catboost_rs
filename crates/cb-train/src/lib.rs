@@ -21,6 +21,7 @@ mod ctr;
 mod fold;
 mod metrics;
 mod overfit;
+mod pairwise_leaves;
 mod permutation;
 mod projection;
 mod query_info;
@@ -50,6 +51,7 @@ pub use fold::{
 };
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
+pub use pairwise_leaves::{calculate_pairwise_leaf_values, compute_pairwise_leaf_deltas};
 pub use permutation::{
     averaging_ctr_permutation, create_shuffled_indices, fisher_yates_permutation, fold_block_size,
     permutations, PERMUTATION_BLOCK_SIZE_THRESHOLD,
