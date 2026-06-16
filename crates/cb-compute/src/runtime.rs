@@ -43,7 +43,16 @@ impl Float for f64 {}
 /// `Eq` is intentionally NOT derived: [`Loss::Focal`] carries `f64` parameters
 /// (`alpha` / `gamma`), and `f64` is not `Eq`. `PartialEq` is retained for the
 /// match-and-compare call sites.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `Copy` is intentionally NOT derived (Phase 6.2, D-6.2-05 / D-6.1-03): the
+/// Wave-3 `MultiQuantile { alpha: Vec<f64> }` variant carries an owned `Vec<f64>`
+/// and so cannot be `Copy`. The `Copy` derive is dropped HERE, in the Wave-0
+/// mechanical refactor, before any new variant is added, so the cross-crate
+/// "by-value `Loss` → borrow/clone" ripple is a ONE-TIME refactor rather than a
+/// second pass when MultiQuantile lands. `Clone` is retained and is cheap for the
+/// current parameter-light variants; by-value call sites now pass `&Loss` or
+/// `.clone()`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Loss {
     /// RMSE (regression): der1 = `target - approx`, der2 = `-1`.
     Rmse,
@@ -266,13 +275,30 @@ pub enum EScoreFunction {
 }
 
 /// The per-object first and second derivatives returned by
-/// [`Runtime::compute_gradients`], UN-reduced (D-02). Parallel to the input
-/// `approx`/`target` slices, in object order.
+/// [`Runtime::compute_gradients`], UN-reduced (D-02).
+///
+/// # Dimension-major flat layout (Phase 6.2, D-6.2-01)
+///
+/// `approx`, `der1`, and `der2` are dimension-major flat buffers of length
+/// `approx_dimension * n_objects`, indexed `buf[d * n_objects + i]` for dimension
+/// `d` and object `i` (the OUTER index is the dimension). For the diagonal /
+/// separable losses handled in this wave, `der1` and `der2` share the input
+/// `approx`'s `approx_dimension * n_objects` length and per-object/per-dimension
+/// ordering.
+///
+/// At `approx_dimension == 1` this collapses to the historical per-object scalar
+/// layout `buf[i]`, and the per-dimension reduction MUST run as an outer loop with
+/// a single iteration over `approx[0..n]` so the values are BYTE-IDENTICAL to the
+/// pre-6.2 scalar path (RESEARCH Pitfall 1 — never fuse the per-dimension
+/// reduction into a single `0..approx_dimension * n` pass, which would perturb the
+/// `cb_core::sum_f64` order downstream).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Derivatives {
-    /// Per-object first derivative (gradient), object order.
+    /// Per-object first derivative (gradient), dimension-major
+    /// (`der1[d * n_objects + i]`); see the struct-level layout note.
     pub der1: Vec<f64>,
-    /// Per-object second derivative (hessian), object order.
+    /// Per-object second derivative (hessian), dimension-major
+    /// (`der2[d * n_objects + i]`); see the struct-level layout note.
     pub der2: Vec<f64>,
 }
 
@@ -285,14 +311,28 @@ pub trait Runtime {
     /// Compute the per-object derivatives for `loss` from the raw approximants
     /// and targets, returning them UN-reduced in object order (D-02).
     ///
-    /// `approx` and `target` MUST be the same length (`n` objects). The
-    /// elementwise work is order-independent (a per-object kernel on the
-    /// backend); no reduction happens here — the histogram / leaf SUM is the
-    /// caller's ordered host-side pass.
+    /// `approx` is the dimension-major flat buffer of length
+    /// `approx_dimension * n_objects` (`approx[d * n_objects + i]`, D-6.2-01).
+    /// `target` stays per-object (length `n_objects`) for the scalar / class
+    /// losses. The returned [`Derivatives`] share `approx`'s dimension-major length
+    /// for the diagonal / separable losses. The elementwise work is
+    /// order-independent (a per-object kernel on the backend); no reduction happens
+    /// here — the histogram / leaf SUM is the caller's ordered host-side pass.
+    ///
+    /// At `approx_dimension == 1` the output is byte-identical to the pre-6.2
+    /// scalar path: the backend runs the per-dimension kernel launch as an outer
+    /// loop with a single iteration over `approx[0..n_objects]` (RESEARCH
+    /// Pitfall 1 — no fused `0..approx_dimension * n` pass).
     ///
     /// # Errors
-    /// Returns a [`cb_core::CbError`] if the backend cannot launch the kernel or
-    /// the input lengths disagree.
-    fn compute_gradients(&self, loss: Loss, approx: &[f64], target: &[f64])
-        -> CbResult<Derivatives>;
+    /// Returns a [`cb_core::CbError`] if the backend cannot launch the kernel, the
+    /// `approx` length is not a multiple of `approx_dimension`, or the input
+    /// lengths disagree.
+    fn compute_gradients(
+        &self,
+        loss: &Loss,
+        approx: &[f64],
+        target: &[f64],
+        approx_dimension: usize,
+    ) -> CbResult<Derivatives>;
 }
