@@ -52,7 +52,7 @@
 - [x] **LOSS-02**: Multiclass (MultiClass softmax, MultiClassOneVsAll) and multilabel (MultiLogloss, MultiCrossEntropy) — multiclass members in 06.2-03, multilabel members in 06.2-04; all four pass per-stage oracle ≤1e-5 vs catboost 1.2.10
 - [x] **LOSS-03**: Regression matrix — RMSE, MAE, Quantile, MultiQuantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile, etc.
 - [ ] **LOSS-04**: Ranking losses — YetiRank(/Pairwise), PairLogit(/Pairwise), QueryRMSE, QuerySoftMax, LambdaMart, StochasticRank
-- [ ] **LOSS-05**: Ranking metrics — NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC
+- [x] **LOSS-05**: Ranking metrics — NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC — all nine eval-only on the widened EvalMetric::eval_grouped seam (06.3-05), oracle-locked ≤1e-5 vs catboost 1.2.10
 - [~] **LOSS-06**: Prediction types — Probability, LogProbability, Class, RawFormulaVal, Exponent, RMSEWithUncertainty, VirtEnsembles, TotalUncertainty (Plan 04-02: the five in-scope deterministic types — RawFormulaVal/Probability/LogProbability/Class/Exponent — are implemented and oracle-locked ≤1e-5; the uncertainty types RMSEWithUncertainty/VirtEnsembles/TotalUncertainty are deferred to Phase 6 per D-10)
 - [ ] **LOSS-07**: Custom objectives/metrics — Rust trait + Python callback bridge
 - [ ] **LOSS-08**: Uncertainty estimation — RMSEWithUncertainty, virtual ensembles
@@ -168,7 +168,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | LOSS-02 | Phase 6.2 | Complete (06.2-03 multiclass + 06.2-04 multilabel) |
 | LOSS-03 | Phase 6.1 (+6.2) | Complete. Scalar matrix ✓ (Wave 1 ✓ LogCosh/Lq/Huber/Expectile; Wave 2 ✓ Poisson/Tweedie/MAPE + MSLE metric-only; Wave 3 ✓ Quantile{α,δ} — MAE==Quantile{0.5}, α-threaded Exact leaf, oracle ≤1e-5; Phase 6.1 scalar LOSS-03 COMPLETE). MultiQuantile multi-output member ✓ (06.2-05 — K independent Quantile dims on the N-dim foundation, per-dim alpha[d] der + Exact weighted-alpha[d]-quantile leaf reused verbatim, leaf.rs unchanged; per-stage oracle ≤1e-5 vs catboost 1.2.10). LOSS-03 scalar+multi matrix CLOSED. |
 | LOSS-04 | Phase 6.3 | In progress (06.3-01: grouped der seam landed — build_query_info + calc_ders_for_queries + compute_gradients_grouped; pointwise byte-identical D-04; ranking corpus generator OFFLINE-validated. 06.3-02 (Wave A): **QueryRMSE + QuerySoftMax** der arms wired + trained end-to-end on the grouped seam (train_ranking / is_grouped_loss dispatch), per-stage oracles ≤1e-5 vs catboost 1.2.10. Remaining der arms PairLogit/LambdaMart (Wave B, Plan 03) + YetiRank/StochasticRank (Wave C, Plan 04) return typed "not yet wired" until landed). |
-| LOSS-05 | Phase 6.3 | Pending |
+| LOSS-05 | Phase 6.3 | Complete (06.3-05, Wave D): all 9 ranking metrics — NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC — land eval-only on the widened EvalMetric::eval_grouped seam (D-6.3-05; flat eval byte-identical D-04), shared compare_docs tie-break transcribed once, per-metric oracle ≤1e-5 vs catboost 1.2.10 (default + top=2; QueryAUC Ranking+Classic). |
 | LOSS-07 | Phase 6.4 | Pending (Rust trait; Python callback bridge → Phase 8 per D-09) |
 | LOSS-08 | Phase 6.4 | Pending |
 | LOSS-09 | Phase 6.4 | Pending |
