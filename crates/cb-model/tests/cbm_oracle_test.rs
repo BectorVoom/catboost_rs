@@ -79,6 +79,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
+        approx_dimension: 1,
     }
 }
 
@@ -105,6 +106,7 @@ fn rust_built_model() -> Model {
         bias: 0.25,
         float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
         ctr_data: None,
+        approx_dimension: 1,
     }
 }
 

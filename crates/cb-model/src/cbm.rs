@@ -135,6 +135,11 @@ pub fn save_cbm(model: &Model, path: &Path) -> Result<(), ModelError> {
 fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     let bins = build_bin_features(&model.float_feature_borders);
 
+    // Number of output dimensions (D-6.2-01 / Plan 06.2-02). A model carries its
+    // training `approx_dimension`; `0` is meaningless, so treat it as the scalar
+    // default `1` (older models / construction paths that left it unset).
+    let dim = model.approx_dimension.max(1);
+
     // Global tree splits + per-tree sizes/offsets, and the flat leaf arrays.
     let mut tree_splits: Vec<i32> = Vec::new();
     let mut tree_sizes: Vec<i32> = Vec::new();
@@ -161,7 +166,26 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
                 tree_splits.push(split_to_global_index(float_split, &bins)?);
             }
         }
-        leaf_values.extend_from_slice(&tree.leaf_values);
+        // LEAF-MAJOR transpose (Pitfall 6): the training buffer is DIMENSION-MAJOR
+        // (`leaf_values[d * n_leaves + l]`), but the `.cbm` / json `LeafValues` are
+        // LEAF-MAJOR (`leaf0_d0, leaf0_d1, …, leaf1_d0, …` = `leaf_values[l * dim +
+        // d]`). At `dim == 1` the two orders coincide (a single dimension), so the
+        // wire bytes are byte-identical to the pre-6.2 scalar model. `leaf_weights`
+        // stays one-per-leaf (the document partition is shared across dimensions),
+        // so it is emitted unchanged at any dimension.
+        let n_leaves = if dim == 0 { 0 } else { tree.leaf_values.len() / dim };
+        for l in 0..n_leaves {
+            for d in 0..dim {
+                // Source dim-major index `d * n_leaves + l`; checked `.get` only.
+                let v = tree.leaf_values.get(d * n_leaves + l).copied().ok_or_else(|| {
+                    ModelError::SchemaVersion(
+                        "leaf_values length is not a multiple of approx_dimension"
+                            .to_owned(),
+                    )
+                })?;
+                leaf_values.push(v);
+            }
+        }
         leaf_weights.extend_from_slice(&tree.leaf_weights);
     }
 
@@ -195,10 +219,13 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     let leaf_values_vec = fbb.create_vector(&leaf_values);
     let leaf_weights_vec = fbb.create_vector(&leaf_weights);
 
+    let approx_dimension = i32::try_from(dim).map_err(|_| {
+        ModelError::SchemaVersion("approx_dimension exceeds i32 range".to_owned())
+    })?;
     let model_trees = TModelTrees::create(
         &mut fbb,
         &TModelTreesArgs {
-            ApproxDimension: 1,
+            ApproxDimension: approx_dimension,
             TreeSplits: Some(tree_splits_vec),
             TreeSizes: Some(tree_sizes_vec),
             TreeStartOffsets: Some(tree_start_offsets_vec),
@@ -315,9 +342,17 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
     // LeafWeights may be absent in older models; default to zeros per leaf.
     let leaf_weights = trees.LeafWeights();
 
+    // Number of output dimensions (D-6.2-01 / Plan 06.2-02); `<= 0` (older models
+    // / unset) means the scalar default `1`.
+    let dim = usize::try_from(trees.ApproxDimension()).unwrap_or(1).max(1);
+
     let mut oblivious_trees = Vec::with_capacity(tree_sizes.len());
     let mut split_cursor: usize = 0;
-    let mut leaf_cursor: usize = 0;
+    // Separate cursors: `value_cursor` strides the LEAF-MAJOR `LeafValues` by
+    // `leaf_count * dim`; `weight_cursor` strides the one-per-leaf `LeafWeights`
+    // by `leaf_count`. At `dim == 1` they advance in lockstep (byte-identical).
+    let mut value_cursor: usize = 0;
+    let mut weight_cursor: usize = 0;
 
     for ti in 0..tree_sizes.len() {
         let size = usize::try_from(tree_sizes.get(ti)).map_err(|_| {
@@ -356,9 +391,16 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
         })?)
         .ok_or_else(|| ModelError::Deserialize("2^depth overflowed usize".to_owned()))?;
 
-        let (tree_values, tree_weights) =
-            read_tree_leaves(&leaf_values, leaf_weights.as_ref(), leaf_cursor, leaf_count)?;
-        leaf_cursor = leaf_cursor.saturating_add(leaf_count);
+        let (tree_values, tree_weights) = read_tree_leaves(
+            &leaf_values,
+            leaf_weights.as_ref(),
+            value_cursor,
+            weight_cursor,
+            leaf_count,
+            dim,
+        )?;
+        value_cursor = value_cursor.saturating_add(leaf_count.saturating_mul(dim));
+        weight_cursor = weight_cursor.saturating_add(leaf_count);
 
         oblivious_trees.push(ObliviousTree {
             splits,
@@ -372,6 +414,7 @@ fn reconstruct_model(trees: &TModelTrees) -> Result<Model, ModelError> {
         bias: read_bias(trees),
         float_feature_borders,
         ctr_data: None,
+        approx_dimension: dim,
     })
 }
 
@@ -424,25 +467,50 @@ fn read_float_feature_borders(trees: &TModelTrees) -> Result<Vec<Vec<f64>>, Mode
 
 /// Slice one tree's `leaf_count` values (and weights, zero-filled if absent) out
 /// of the flat leaf arrays starting at `offset`, with bounds checks.
+/// Read one tree's leaves, un-transposing the wire LEAF-MAJOR `LeafValues`
+/// (`leaf_values[l * dim + d]`) back into the canonical DIMENSION-MAJOR buffer
+/// (`leaf_values[d * leaf_count + l]`, Pitfall 6 / Plan 06.2-02). `value_offset`
+/// is this tree's start in the flat `LeafValues` array (`leaf_count * dim`
+/// values consumed); `weight_offset` is its start in `LeafWeights` (`leaf_count`
+/// weights consumed — weights are one-per-leaf, NOT per-dimension). At `dim == 1`
+/// leaf-major == dim-major, so the returned `values` are byte-identical to the
+/// pre-6.2 scalar read.
 fn read_tree_leaves(
     leaf_values: &flatbuffers::Vector<f64>,
     leaf_weights: Option<&flatbuffers::Vector<f64>>,
-    offset: usize,
+    value_offset: usize,
+    weight_offset: usize,
     leaf_count: usize,
+    dim: usize,
 ) -> Result<(Vec<f64>, Vec<f64>), ModelError> {
-    let end = offset.checked_add(leaf_count).ok_or_else(|| {
-        ModelError::Deserialize("leaf offset + count overflow".to_owned())
+    let value_span = leaf_count.checked_mul(dim).ok_or_else(|| {
+        ModelError::Deserialize("leaf_count * approx_dimension overflow".to_owned())
     })?;
-    if end > leaf_values.len() {
+    let value_end = value_offset.checked_add(value_span).ok_or_else(|| {
+        ModelError::Deserialize("leaf value offset + span overflow".to_owned())
+    })?;
+    if value_end > leaf_values.len() {
         return Err(ModelError::Deserialize(
             "LeafValues shorter than declared tree leaves".to_owned(),
         ));
     }
-    let mut values = Vec::with_capacity(leaf_count);
+    // Un-transpose leaf-major -> dim-major: dst[d * leaf_count + l] = src[l*dim+d].
+    let mut values = vec![0.0_f64; value_span];
+    for l in 0..leaf_count {
+        for d in 0..dim {
+            let src = value_offset + l * dim + d;
+            if let Some(slot) = values.get_mut(d * leaf_count + l) {
+                *slot = leaf_values.get(src);
+            }
+        }
+    }
+    // Weights are one-per-leaf (shared across dimensions). Optional: zero-fill
+    // when absent or short.
+    let weight_end = weight_offset.checked_add(leaf_count).ok_or_else(|| {
+        ModelError::Deserialize("leaf weight offset + count overflow".to_owned())
+    })?;
     let mut weights = Vec::with_capacity(leaf_count);
-    for i in offset..end {
-        values.push(leaf_values.get(i));
-        // Weights are optional: zero-fill when absent or short.
+    for i in weight_offset..weight_end {
         let w = leaf_weights
             .filter(|lw| i < lw.len())
             .map_or(0.0, |lw| lw.get(i));

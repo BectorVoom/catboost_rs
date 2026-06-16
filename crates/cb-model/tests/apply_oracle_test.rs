@@ -68,6 +68,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
+        approx_dimension: 1,
     }
 }
 
@@ -108,6 +109,7 @@ fn bias_added_once_no_trees() {
         bias: 0.42,
         float_feature_borders: vec![vec![0.5]],
         ctr_data: None,
+        approx_dimension: 1,
     };
     let columns = vec![vec![0.1_f32, 0.9, 0.3]];
     let preds = predict_raw(&model, &columns);

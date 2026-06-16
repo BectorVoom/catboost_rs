@@ -439,6 +439,7 @@ fn single_ctr_split_model(
         bias: 0.0,
         float_feature_borders: Vec::new(),
         ctr_data: Some(ctr_data),
+        approx_dimension: 1,
     }
 }
 

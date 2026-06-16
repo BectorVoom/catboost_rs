@@ -135,6 +135,14 @@ pub struct Model {
     /// CTR-base string; a [`CtrSplit`] reconstructs its key from
     /// `(projection, ctr_type)`.
     pub ctr_data: Option<CtrData>,
+    /// The number of output (approx) dimensions (D-6.2-01 / Plan 06.2-02). `1`
+    /// for every scalar regression / binary model; `> 1` for multiclass /
+    /// multilabel / MultiQuantile. Each tree's `leaf_values` is the
+    /// DIMENSION-MAJOR training buffer `leaf_values[d * n_leaves + l]`; the `.cbm`
+    /// / json wire format stores it LEAF-MAJOR (`leaf_values[l * dim + d]`,
+    /// Pitfall 6). At `1` leaf-major == dim-major, so the serialized bytes are
+    /// byte-identical to the pre-6.2 scalar model.
+    pub approx_dimension: usize,
 }
 
 impl Model {
@@ -191,6 +199,7 @@ impl Model {
             bias: trained.bias,
             float_feature_borders,
             ctr_data: None,
+            approx_dimension: trained.approx_dimension,
         }
     }
 

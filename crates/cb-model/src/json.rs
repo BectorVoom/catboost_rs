@@ -104,6 +104,9 @@ struct ModelJsonDoc {
 
 /// Build the serializable document from the canonical model.
 fn to_doc(model: &Model) -> ModelJsonDoc {
+    // Output dimensions (D-6.2-01 / Plan 06.2-02); `0`/unset means the scalar
+    // default `1`. Drives the leaf-major transpose + per-dim bias vector below.
+    let dim = model.approx_dimension.max(1);
     let float_features = model
         .float_feature_borders
         .iter()
@@ -142,8 +145,15 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
                     split_type: "FloatFeature".to_owned(),
                 })
                 .collect();
+            // LEAF-MAJOR transpose (Pitfall 6): the in-memory buffer is
+            // DIMENSION-MAJOR (`leaf_values[d * n_leaves + l]`); the upstream
+            // `model.json` stores `leaf_values` LEAF-MAJOR (`leaf_values[l * dim
+            // + d]`). At `dim == 1` the orders coincide, so the emitted array is
+            // byte-identical to the pre-6.2 scalar export. `leaf_weights` stays
+            // one-per-leaf.
+            let leaf_values = transpose_dim_major_to_leaf_major(&t.leaf_values, dim);
             ObliviousTreeJson {
-                leaf_values: t.leaf_values.clone(),
+                leaf_values,
                 leaf_weights: t.leaf_weights.clone(),
                 splits,
             }
@@ -153,9 +163,51 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
     ModelJsonDoc {
         features_info: FeaturesInfoJson { float_features },
         oblivious_trees,
-        // [1, [bias]] — scale 1, single-element bias vector (Pitfall 6).
-        scale_and_bias: serde_json::json!([1, [model.bias]]),
+        // [1, [bias_d0, …]] — scale 1, a per-dimension bias vector (Pitfall 6).
+        // At `dim == 1` this is exactly `[1, [bias]]` (byte-identical). The model
+        // carries a single scalar bias this wave, so higher dimensions repeat it
+        // (per-dim bias plumbing lands with the multi-output losses, Plans
+        // 06.2-03..05); for the in-scope dim=1 models this branch is never taken.
+        scale_and_bias: serde_json::json!([1, vec![model.bias; dim]]),
     }
+}
+
+/// Transpose a DIMENSION-MAJOR leaf buffer (`src[d * n_leaves + l]`) into the
+/// LEAF-MAJOR wire order (`dst[l * dim + d]`, Pitfall 6). At `dim == 1` (or `dim
+/// == 0`) the input is returned verbatim, so the dim=1 path is byte-identical.
+fn transpose_dim_major_to_leaf_major(src: &[f64], dim: usize) -> Vec<f64> {
+    if dim <= 1 {
+        return src.to_vec();
+    }
+    let n_leaves = src.len() / dim;
+    let mut dst = vec![0.0_f64; src.len()];
+    for l in 0..n_leaves {
+        for d in 0..dim {
+            if let (Some(slot), Some(&v)) = (dst.get_mut(l * dim + d), src.get(d * n_leaves + l)) {
+                *slot = v;
+            }
+        }
+    }
+    dst
+}
+
+/// Transpose a LEAF-MAJOR wire buffer (`src[l * dim + d]`) back into the
+/// canonical DIMENSION-MAJOR order (`dst[d * n_leaves + l]`). At `dim == 1` the
+/// input is returned verbatim (byte-identical scalar load).
+fn transpose_leaf_major_to_dim_major(src: &[f64], dim: usize) -> Vec<f64> {
+    if dim <= 1 {
+        return src.to_vec();
+    }
+    let n_leaves = src.len() / dim;
+    let mut dst = vec![0.0_f64; src.len()];
+    for l in 0..n_leaves {
+        for d in 0..dim {
+            if let (Some(slot), Some(&v)) = (dst.get_mut(d * n_leaves + l), src.get(l * dim + d)) {
+                *slot = v;
+            }
+        }
+    }
+    dst
 }
 
 /// Serialize `model` to the upstream `model.json` schema at `path` (MODEL-06).
@@ -179,6 +231,9 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         .map(|f| f.borders.clone())
         .collect();
 
+    // Output dimensions from the bias-vector length (Pitfall 6); `1` for scalar.
+    let dim = read_approx_dimension(&doc.scale_and_bias);
+
     let oblivious_trees = doc
         .oblivious_trees
         .iter()
@@ -199,16 +254,22 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
                     }))
                 })
                 .collect::<Result<Vec<_>, ModelError>>()?;
-            // Zero-fill weights if a fixture predates leaf_weights (length match
-            // to leaf_values keeps SHAP/fstr shape-consistent).
-            let leaf_weights = if t.leaf_weights.len() == t.leaf_values.len() {
+            // Un-transpose the wire LEAF-MAJOR `leaf_values` (`leaf_values[l*dim
+            // + d]`) back into the canonical DIMENSION-MAJOR buffer
+            // (`leaf_values[d*n_leaves + l]`). At `dim == 1` this is the verbatim
+            // array (byte-identical scalar load). `leaf_weights` is one-per-leaf.
+            let leaf_values = transpose_leaf_major_to_dim_major(&t.leaf_values, dim);
+            // Zero-fill weights if a fixture predates leaf_weights (one weight per
+            // leaf == `leaf_values.len() / dim`); keep SHAP/fstr shape-consistent.
+            let n_leaves = if dim == 0 { t.leaf_values.len() } else { t.leaf_values.len() / dim };
+            let leaf_weights = if t.leaf_weights.len() == n_leaves {
                 t.leaf_weights.clone()
             } else {
-                vec![0.0; t.leaf_values.len()]
+                vec![0.0; n_leaves]
             };
             Ok(ObliviousTree {
                 splits,
-                leaf_values: t.leaf_values.clone(),
+                leaf_values,
                 leaf_weights,
             })
         })
@@ -219,10 +280,23 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         bias: read_bias(&doc.scale_and_bias)?,
         float_feature_borders,
         ctr_data: None,
+        approx_dimension: dim,
     })
 }
 
 /// Read `scale_and_bias[1][0]` without panicking (Pitfall 6).
+/// Derive the model's `approx_dimension` from the `scale_and_bias` bias vector
+/// length (`scale_and_bias[1]` has one entry per output dimension, Pitfall 6).
+/// Defaults to `1` when the vector is absent / empty, so a scalar `[1, [bias]]`
+/// model reads back as `approx_dimension == 1` (byte-identical).
+fn read_approx_dimension(scale_and_bias: &serde_json::Value) -> usize {
+    scale_and_bias
+        .get(1)
+        .and_then(serde_json::Value::as_array)
+        .map_or(1, Vec::len)
+        .max(1)
+}
+
 fn read_bias(scale_and_bias: &serde_json::Value) -> Result<f64, ModelError> {
     scale_and_bias
         .get(1)

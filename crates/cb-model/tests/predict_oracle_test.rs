@@ -61,6 +61,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
+        approx_dimension: 1,
     }
 }
 

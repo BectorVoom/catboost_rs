@@ -74,6 +74,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
+        approx_dimension: 1,
     }
 }
 
@@ -160,6 +161,7 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
         bias: 0.123,
         float_feature_borders: vec![vec![0.5, 2.5], vec![0.5, 1.5]],
         ctr_data: None,
+        approx_dimension: 1,
     };
 
     // A spread of objects covering every leaf.
