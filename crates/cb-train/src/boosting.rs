@@ -596,6 +596,13 @@ pub struct Model {
     pub oblivious_trees: Vec<ObliviousTree>,
     /// The starting approx / model bias.
     pub bias: f64,
+    /// The number of output (approx) dimensions (D-6.2-01 / Plan 06.2-02). `1`
+    /// for every scalar regression / binary model; `> 1` for multiclass /
+    /// multilabel / MultiQuantile. Each tree's `leaf_values` is the
+    /// DIMENSION-MAJOR flat buffer `leaf_values[d * n_leaves + l]` of length
+    /// `approx_dimension * n_leaves`; at `1` it is exactly `n_leaves` values in
+    /// leaf order, byte-identical to the pre-6.2 scalar model.
+    pub approx_dimension: usize,
 }
 
 impl Model {
@@ -663,6 +670,20 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
 /// Compute the starting approx (and model bias): the target mean for RMSE with
 /// `boost_from_average`, else `0` (Pitfall 2). The mean is folded through the
 /// sanctioned `sum_f64` primitive (D-05).
+/// The number of approx (output) dimensions a loss produces — the
+/// `approxDimension` of upstream `TLearnContext` (`approx_dimension.cpp`).
+///
+/// Every loss in scope this wave (all the scalar regression / binary losses) is
+/// single-output, so this is `1`. The multi-output losses (MultiClass /
+/// MultiClassOneVsAll / MultiLogloss / MultiCrossEntropy / MultiQuantile) added
+/// in Plans 06.2-03..05 override it (e.g. `class_count` or `alpha.len()`). The
+/// boosting loop, leaf-delta solver, approx update, and staged record are all
+/// dimension-major over this value; at `1` they are byte-identical to the
+/// pre-6.2 scalar path (D-04).
+fn loss_approx_dimension(_loss: &Loss) -> usize {
+    1
+}
+
 fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
     if params.boost_from_average && matches!(params.loss, Loss::Rmse) && !target.is_empty() {
         sum_f64(target) / target.len() as f64
@@ -1225,8 +1246,18 @@ fn train_inner<R: Runtime>(
     };
     let sum_all_weights = sum_f64(&weights);
 
+    // N-dim approx buffer (D-6.2-01 / Plan 06.2-02). `approx_dimension` is the
+    // number of output dimensions the loss produces. Every existing scalar loss
+    // is single-dimension, so this is `1` until Plans 06.2-03..05 derive it per
+    // loss (multiclass/multilabel/MultiQuantile). The approx is the
+    // DIMENSION-MAJOR flat buffer `approx[d * n + i]` of length
+    // `approx_dimension * n`, with one bias per dimension. At
+    // `approx_dimension == 1` it is EXACTLY `vec![bias; n]` (the same slice,
+    // same length, same summation order) — the D-04 byte-identity invariant
+    // (RESEARCH Pitfall 1).
+    let approx_dimension: usize = loss_approx_dimension(&params.loss);
     let bias = starting_approx(params, target);
-    let mut approx = vec![bias; n];
+    let mut approx = vec![bias; approx_dimension * n];
 
     // Boosting type (ORD-02): the Plain path below estimates every document's
     // leaf delta on the whole fold (single body/tail span). The ORDERED path
@@ -1594,19 +1625,31 @@ fn train_inner<R: Runtime>(
 
     for iter in 0..params.iterations {
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
-        //    `approx_dimension` is 1 here: cb-train's approx buffer is still the
-        //    scalar `Vec<f64>` this wave; the N-dim approx-buffer threading through
-        //    boosting is Plan 06.2-02. At dim=1 the backend's per-dimension loop is
-        //    byte-identical to the pre-6.2 scalar path (RESEARCH Pitfall 1).
-        let ders = runtime.compute_gradients(&params.loss, &approx, target, 1)?;
+        //    `approx` is the DIMENSION-MAJOR flat buffer `approx[d*n+i]` of length
+        //    `approx_dimension * n` (Plan 06.2-02). The backend runs an OUTER
+        //    per-dimension loop over `approx[d*n..d*n+n]` reusing the existing
+        //    per-loss kernel launchers; at `approx_dimension == 1` this is
+        //    byte-identical to the pre-6.2 scalar path (RESEARCH Pitfall 1). The
+        //    returned `der1`/`der2` are the matching dimension-major buffers.
+        let ders =
+            runtime.compute_gradients(&params.loss, &approx, target, approx_dimension)?;
 
         // Weighted gradient contribution per object: der1 * weight (the
         // histogram-scatter elementwise product; the host reduces it ordered).
+        // DIMENSION-MAJOR: `ders.der1` is length `approx_dimension * n`; each
+        // dimension's slice `der1[d*n + i]` is weighted by the per-OBJECT weight
+        // `weights[i]` (weights are per-object, shared across dimensions). At
+        // `approx_dimension == 1` the index `d*n + i` collapses to `i`, so this
+        // is exactly `der1.iter().zip(weights)` — byte-identical (Pitfall 1).
         let weighted_der1: Vec<f64> = ders
             .der1
             .iter()
-            .zip(weights.iter())
-            .map(|(&d, &w)| d * w)
+            .enumerate()
+            .map(|(idx, &d)| {
+                let i = idx % n;
+                let w = weights.get(i).copied().unwrap_or(1.0);
+                d * w
+            })
             .collect();
 
         // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211): keep the RNG
@@ -1775,35 +1818,66 @@ fn train_inner<R: Runtime>(
         //    partition on the CTR path; the structure partition otherwise). The
         //    Gradient FORMULA is UNCHANGED (research Q3 #4). Every reduction over
         //    leaf members routes through cb_core::sum_f64 (D-05).
-        let leaf_deltas = compute_leaf_deltas(
-            params.leaf_method,
-            &params.loss,
-            &leaf_value_leaf_of,
-            &weighted_der1,
-            &ders.der2,
-            &weights,
-            &approx,
-            target,
-            scaled_l2,
-            n_leaves,
-        );
-        let leaf_values: Vec<f64> = leaf_deltas
-            .iter()
-            .map(|&delta| learning_rate * delta)
-            .collect();
+        //
+        //    DIMENSION-MAJOR (Plan 06.2-02): solve each output dimension `d`
+        //    INDEPENDENTLY over its own approx/der slice `[d*n .. d*n+n]`, reusing
+        //    the EXISTING per-dimension scalar solver `compute_leaf_deltas`. The
+        //    per-dimension reduction is an OUTER `for d` loop (NEVER fused into a
+        //    single `0..dim*n` reduction) so at `approx_dimension == 1` the slices
+        //    are exactly today's full-`n` buffers and the `cb_core::sum_f64`
+        //    summation order is byte-identical (RESEARCH Pitfall 1). The leaf
+        //    VALUES are stored dimension-major `leaf_values[d*n_leaves + l]`
+        //    (length `dim*n_leaves`); at dim=1 this is exactly `n_leaves` values
+        //    in leaf order (unchanged). The leaf_value leaf_of partition is shared
+        //    across dimensions (the oblivious structure is one tree).
+        let mut leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
+        for d in 0..approx_dimension {
+            let base = d * n;
+            // Per-dimension slices (length `n`). At dim=1 `base == 0` so these are
+            // the whole buffers — byte-identical to the pre-6.2 scalar call.
+            let der1_d = weighted_der1.get(base..base + n).unwrap_or(&[]);
+            let der2_d = ders.der2.get(base..base + n).unwrap_or(&[]);
+            let approx_d = approx.get(base..base + n).unwrap_or(&[]);
+            let leaf_deltas = compute_leaf_deltas(
+                params.leaf_method,
+                &params.loss,
+                &leaf_value_leaf_of,
+                der1_d,
+                der2_d,
+                &weights,
+                approx_d,
+                target,
+                scaled_l2,
+                n_leaves,
+            );
+            for delta in &leaf_deltas {
+                leaf_values.push(learning_rate * delta);
+            }
+        }
 
         // Per-leaf summed training-document weights (RESEARCH Pitfall 1; research
         // Open-q 5: on the CTR path these are the AVERAGING-fold partition counts).
         // Uses the FULL un-sampled fold weights (same as leaf estimation) over the
         // SAME `leaf_value_leaf_of`, reduced ordered through cb_core::sum_f64 (D-08).
+        // Leaf WEIGHTS are one-per-leaf (NOT per-dimension — the document partition
+        // is shared across output dimensions), so this is unchanged at any dim.
         let leaf_weights = accumulate_leaf_weights(&leaf_value_leaf_of, &weights, n_leaves);
 
-        // 4. Update approx: approx[i] += leaf_value[leaf(i)] over the LEAF-VALUE
-        //    leaf_of (so each iteration's der recompute is sequential over the same
-        //    averaging-fold partition — research "Empirical verification" #2).
-        for (i, &leaf) in leaf_value_leaf_of.iter().enumerate() {
-            if let (Some(a), Some(&lv)) = (approx.get_mut(i), leaf_values.get(leaf)) {
-                *a += lv;
+        // 4. Update approx: per dimension, `approx[d*n+i] += leaf_value[d][leaf(i)]`
+        //    over the LEAF-VALUE leaf_of (so each iteration's der recompute is
+        //    sequential over the same averaging-fold partition — research
+        //    "Empirical verification" #2). At dim=1 (`base == 0`,
+        //    `leaf_values[0..n_leaves]`) this is exactly the prior scalar update.
+        for d in 0..approx_dimension {
+            let approx_base = d * n;
+            let leaf_base = d * n_leaves;
+            for (i, &leaf) in leaf_value_leaf_of.iter().enumerate() {
+                if let (Some(a), Some(&lv)) = (
+                    approx.get_mut(approx_base + i),
+                    leaf_values.get(leaf_base + leaf),
+                ) {
+                    *a += lv;
+                }
             }
         }
 
@@ -1979,6 +2053,7 @@ fn train_inner<R: Runtime>(
         Model {
             oblivious_trees: trees,
             bias,
+            approx_dimension,
         },
         baked,
     ))
