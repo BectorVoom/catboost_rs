@@ -634,8 +634,8 @@ impl Model {
 /// `GetTargetType`, `options_helper.cpp:181-194`): RMSE -> RMSE, Logloss ->
 /// Logloss, everything else (MAE / Quantile) -> [`TargetType::Unknown`] (not in
 /// the auto-LR table, so no rate is guessed).
-const fn autolr_target_type(loss: Loss) -> TargetType {
-    match loss {
+const fn autolr_target_type(loss: &Loss) -> TargetType {
+    match *loss {
         Loss::Rmse => TargetType::Rmse,
         // CrossEntropy shares Logloss's auto-LR coefficient row (same objective
         // family); Focal is not in the upstream auto-LR table -> Unknown.
@@ -689,7 +689,7 @@ fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
 ///
 /// # Errors
 /// Returns [`CbError::OutOfRange`] for an unsupported `(loss, method)` pair.
-fn validate_leaf_method(loss: Loss, method: LeafMethod) -> CbResult<()> {
+fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
     if matches!(method, LeafMethod::Exact)
         && !matches!(
             loss,
@@ -702,7 +702,7 @@ fn validate_leaf_method(loss: Loss, method: LeafMethod) -> CbResult<()> {
         )));
     }
     if matches!(method, LeafMethod::Newton) {
-        if let Loss::Lq { q } = loss {
+        if let Loss::Lq { q } = *loss {
             if q < 2.0 {
                 return Err(CbError::OutOfRange(format!(
                     "Lq{{q={q}}} with LeafMethod::Newton is undefined: the \
@@ -729,7 +729,7 @@ fn validate_leaf_method(loss: Loss, method: LeafMethod) -> CbResult<()> {
 #[allow(clippy::too_many_arguments)]
 fn compute_leaf_deltas(
     method: LeafMethod,
-    loss: Loss,
+    loss: &Loss,
     leaf_of: &[usize],
     weighted_der1: &[f64],
     der2: &[f64],
@@ -790,13 +790,13 @@ fn compute_leaf_deltas(
             // prior hardcoded behavior, so MAE Exact stays byte-identical); any
             // other Exact-eligible loss keeps the default median. `exact_leaf_delta`
             // (leaf.rs) is ALREADY alpha-general — UNCHANGED.
-            let (quantile_alpha, quantile_delta) = match loss {
+            let (quantile_alpha, quantile_delta) = match *loss {
                 Loss::Quantile { alpha, delta } => (alpha, delta),
                 _ => (QUANTILE_ALPHA, QUANTILE_DELTA),
             };
             members
                 .iter()
-                .map(|(r, w)| match loss {
+                .map(|(r, w)| match *loss {
                     Loss::LogCosh => logcosh_exact_leaf_delta(r, w),
                     // MAE / Quantile (and any other Exact-eligible loss for this
                     // wave) uses the weighted sample quantile at the threaded
@@ -1183,7 +1183,7 @@ fn train_inner<R: Runtime>(
     // WR-02): an Exact method on a loss with no defined optimizer would silently
     // compute the weighted median instead of that loss's true optimum, and an
     // Lq{q<2} Newton step would inject inf/NaN into the leaf denominator.
-    validate_leaf_method(params.loss, params.leaf_method)?;
+    validate_leaf_method(&params.loss, params.leaf_method)?;
 
     let n = target.len();
     if n == 0 {
@@ -1199,7 +1199,7 @@ fn train_inner<R: Runtime>(
     // unset). When the loss is NOT auto-LR eligible the explicit
     // `params.learning_rate` is used unchanged (matches `NeedToUpdate == false`).
     let learning_rate = if params.auto_learning_rate {
-        let target_type = autolr_target_type(params.loss);
+        let target_type = autolr_target_type(&params.loss);
         match autolr::guess(
             target_type,
             params.use_best_model,
@@ -1538,7 +1538,7 @@ fn train_inner<R: Runtime>(
     let has_test = !eval_sets.is_empty();
     let eval_metric = params
         .eval_metric
-        .unwrap_or_else(|| EvalMetric::for_loss(params.loss));
+        .unwrap_or_else(|| EvalMetric::for_loss(&params.loss));
     let mut detector =
         OverfittingDetector::new(params.od_type, params.od_pval, params.od_wait, has_test)?;
     let mut best_model = BestModelTracker::new();
@@ -1594,7 +1594,11 @@ fn train_inner<R: Runtime>(
 
     for iter in 0..params.iterations {
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
-        let ders = runtime.compute_gradients(params.loss, &approx, target)?;
+        //    `approx_dimension` is 1 here: cb-train's approx buffer is still the
+        //    scalar `Vec<f64>` this wave; the N-dim approx-buffer threading through
+        //    boosting is Plan 06.2-02. At dim=1 the backend's per-dimension loop is
+        //    byte-identical to the pre-6.2 scalar path (RESEARCH Pitfall 1).
+        let ders = runtime.compute_gradients(&params.loss, &approx, target, 1)?;
 
         // Weighted gradient contribution per object: der1 * weight (the
         // histogram-scatter elementwise product; the host reduces it ordered).
@@ -1773,7 +1777,7 @@ fn train_inner<R: Runtime>(
         //    leaf members routes through cb_core::sum_f64 (D-05).
         let leaf_deltas = compute_leaf_deltas(
             params.leaf_method,
-            params.loss,
+            &params.loss,
             &leaf_value_leaf_of,
             &weighted_der1,
             &ders.der2,

@@ -44,7 +44,11 @@ use crate::model::Model;
 /// (`depth = 6`, `learning_rate = 0.03`, `l2_leaf_reg = 3.0`,
 /// `iterations = 1000`, no sampling, no early stopping) so a bare
 /// `CatBoostBuilder::new().fit(&pool)` is a sensible default run.
-#[derive(Debug, Clone, Copy, PartialEq)]
+// `Copy` is NOT derived: the `loss: Loss` field is non-Copy (Phase 6.2,
+// D-6.2-05 — the Wave-3 MultiQuantile variant carries an owned Vec<f64>). The
+// builder remains `Clone`; the consuming-`self` builder methods move rather than
+// copy, so dropping `Copy` is source-compatible here.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatBoostBuilder {
     loss: Loss,
     iterations: usize,
@@ -204,7 +208,10 @@ impl CatBoostBuilder {
     /// facade).
     fn boost_params(&self) -> BoostParams {
         BoostParams {
-            loss: self.loss,
+            // `Loss` is no longer `Copy` (Phase 6.2, D-6.2-05 — the Wave-3
+            // MultiQuantile variant carries an owned Vec<f64>); clone out of the
+            // borrowed builder. Cheap for the current parameter-light variants.
+            loss: self.loss.clone(),
             iterations: self.iterations,
             depth: self.depth,
             learning_rate: self.learning_rate,

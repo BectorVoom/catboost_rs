@@ -16,7 +16,7 @@ fn rmse_gradients_match_host_reference() {
     let approx = [0.0, 1.0, -2.5, 3.25, 10.0, -0.5, 7.0];
     let target = [1.0, 0.0, 2.5, -3.25, 4.0, 0.5, 7.0];
 
-    let ders = CpuBackend.compute_gradients(Loss::Rmse, &approx, &target).unwrap();
+    let ders = CpuBackend.compute_gradients(&Loss::Rmse, &approx, &target, 1).unwrap();
 
     assert_eq!(ders.der1.len(), approx.len());
     assert_eq!(ders.der2.len(), approx.len());
@@ -32,7 +32,7 @@ fn logloss_gradients_match_host_reference() {
     let target = [1.0, 0.0, 1.0, 0.0, 1.0];
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Logloss, &approx, &target)
+        .compute_gradients(&Loss::Logloss, &approx, &target, 1)
         .unwrap();
 
     assert_eq!(ders.der1.len(), approx.len());
@@ -50,7 +50,7 @@ fn mae_gradients_match_host_reference() {
     let approx = [0.0, 1.0, -2.5, 3.25, 7.0];
     let target = [1.0, 0.0, 2.5, -3.25, 7.0];
 
-    let ders = CpuBackend.compute_gradients(Loss::Mae, &approx, &target).unwrap();
+    let ders = CpuBackend.compute_gradients(&Loss::Mae, &approx, &target, 1).unwrap();
 
     assert_eq!(ders.der1.len(), approx.len());
     assert_eq!(ders.der2.len(), approx.len());
@@ -78,7 +78,7 @@ fn quantile_gradients_match_host_reference_alpha07() {
     let delta = 1e-6;
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Quantile { alpha, delta }, &approx, &target)
+        .compute_gradients(&Loss::Quantile { alpha, delta }, &approx, &target, 1)
         .unwrap();
 
     assert_eq!(ders.der1.len(), approx.len());
@@ -104,15 +104,16 @@ fn quantile_alpha05_gradients_equal_mae() {
     let approx = [0.0, 1.0, -2.5, 3.25, 7.0, -0.5];
     let target = [1.0, 0.0, 2.5, -3.25, 7.0, 0.5];
 
-    let mae = CpuBackend.compute_gradients(Loss::Mae, &approx, &target).unwrap();
+    let mae = CpuBackend.compute_gradients(&Loss::Mae, &approx, &target, 1).unwrap();
     let q05 = CpuBackend
         .compute_gradients(
-            Loss::Quantile {
+            &Loss::Quantile {
                 alpha: 0.5,
                 delta: 1e-6,
             },
             &approx,
             &target,
+            1,
         )
         .unwrap();
 
@@ -134,7 +135,7 @@ fn quantile_kernel_matches_scalar_at_deadzone_boundary() {
     let target = [delta, 0.0, 0.0];
 
     let q = CpuBackend
-        .compute_gradients(Loss::Quantile { alpha, delta }, &approx, &target)
+        .compute_gradients(&Loss::Quantile { alpha, delta }, &approx, &target, 1)
         .unwrap();
     for i in 0..approx.len() {
         let expected = cb_compute::quantile_der1(approx[i], target[i], alpha, delta);
@@ -146,7 +147,7 @@ fn quantile_kernel_matches_scalar_at_deadzone_boundary() {
     }
 
     // MAE (Quantile{0.5}) must likewise honor the boundary.
-    let m = CpuBackend.compute_gradients(Loss::Mae, &approx, &target).unwrap();
+    let m = CpuBackend.compute_gradients(&Loss::Mae, &approx, &target, 1).unwrap();
     for i in 0..approx.len() {
         let expected = cb_compute::mae_der1(approx[i], target[i]);
         assert!(
@@ -164,7 +165,7 @@ fn logcosh_gradients_match_host_reference() {
     let target = [1.0, 0.0, 2.5, -3.25, 7.0];
 
     let ders = CpuBackend
-        .compute_gradients(Loss::LogCosh, &approx, &target)
+        .compute_gradients(&Loss::LogCosh, &approx, &target, 1)
         .unwrap();
 
     assert_eq!(ders.der1.len(), approx.len());
@@ -185,7 +186,7 @@ fn lq_gradients_match_host_reference() {
     let q = 2.0;
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Lq { q }, &approx, &target)
+        .compute_gradients(&Loss::Lq { q }, &approx, &target, 1)
         .unwrap();
 
     for i in 0..approx.len() {
@@ -206,7 +207,7 @@ fn huber_gradients_match_host_reference() {
     let delta = 1.0;
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Huber { delta }, &approx, &target)
+        .compute_gradients(&Loss::Huber { delta }, &approx, &target, 1)
         .unwrap();
 
     for i in 0..approx.len() {
@@ -232,7 +233,7 @@ fn expectile_gradients_match_host_reference() {
     let alpha = 0.3;
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Expectile { alpha }, &approx, &target)
+        .compute_gradients(&Loss::Expectile { alpha }, &approx, &target, 1)
         .unwrap();
 
     for i in 0..approx.len() {
@@ -258,7 +259,7 @@ fn poisson_gradients_match_host_reference() {
     let target = [3.0, 1.0, 4.0, 2.0, 5.0, 1.5, 2.0];
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Poisson, &approx, &target)
+        .compute_gradients(&Loss::Poisson, &approx, &target, 1)
         .unwrap();
 
     for i in 0..approx.len() {
@@ -276,7 +277,7 @@ fn tweedie_gradients_match_host_reference() {
     let target = [3.0, 1.0, 4.0, 2.0, 5.0, 1.5, 2.0];
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Tweedie { variance_power: p }, &approx, &target)
+        .compute_gradients(&Loss::Tweedie { variance_power: p }, &approx, &target, 1)
         .unwrap();
 
     for i in 0..approx.len() {
@@ -299,7 +300,7 @@ fn mape_gradients_match_host_reference() {
     let target = [5.0, 5.0, 0.5, 0.5, 3.0, 4.0, 0.5];
 
     let ders = CpuBackend
-        .compute_gradients(Loss::Mape, &approx, &target)
+        .compute_gradients(&Loss::Mape, &approx, &target, 1)
         .unwrap();
 
     for i in 0..approx.len() {
@@ -316,13 +317,110 @@ fn length_mismatch_is_error_not_panic() {
     let approx = [0.0, 1.0];
     let target = [1.0];
     assert!(CpuBackend
-        .compute_gradients(Loss::Rmse, &approx, &target)
+        .compute_gradients(&Loss::Rmse, &approx, &target, 1)
         .is_err());
 }
 
 #[test]
 fn empty_input_yields_empty_derivatives() {
-    let ders = CpuBackend.compute_gradients(Loss::Rmse, &[], &[]).unwrap();
+    let ders = CpuBackend.compute_gradients(&Loss::Rmse, &[], &[], 1).unwrap();
     assert!(ders.der1.is_empty());
     assert!(ders.der2.is_empty());
+}
+
+// --- Phase 6.2 Wave-0 N-dim refactor: dim=1 byte-identity + per-dim dispatch ---
+
+/// D-04 anchor (RESEARCH Pitfall 1): at `approx_dimension == 1` the dim-major
+/// buffer is the historical scalar buffer, and the per-dimension loop runs exactly
+/// once over `approx[0..n]`. The output MUST be BYTE-IDENTICAL (exact `==`, NOT a
+/// `<= 1e-5` tolerance) to the scalar `Rmse` host reference computed in the same
+/// order, and deterministic for `Logloss` — proving the widening perturbs nothing
+/// at dim=1.
+#[test]
+fn dim1_is_byte_identical_to_scalar_path() {
+    let approx = [0.0, 1.0, -2.5, 3.25, 10.0, -0.5, 7.0];
+    let target = [1.0, 0.0, 2.5, -3.25, 4.0, 0.5, 7.0];
+
+    // Rmse: der1 = target - approx (exact), der2 = -1.0 (exact).
+    let rmse = CpuBackend
+        .compute_gradients(&Loss::Rmse, &approx, &target, 1)
+        .unwrap();
+    assert_eq!(rmse.der1.len(), approx.len());
+    for i in 0..approx.len() {
+        assert_eq!(rmse.der1[i], target[i] - approx[i], "rmse der1 i={i}");
+        assert_eq!(rmse.der2[i], -1.0, "rmse der2 i={i}");
+    }
+
+    // Logloss: der1 = target - sigmoid(approx), der2 = -p*(1-p), the SAME launch
+    // path as the scalar arm — two dim-1 launches must agree bit-for-bit.
+    let ll_a = CpuBackend
+        .compute_gradients(&Loss::Logloss, &approx, &target, 1)
+        .unwrap();
+    let ll_b = CpuBackend
+        .compute_gradients(&Loss::Logloss, &approx, &target, 1)
+        .unwrap();
+    assert_eq!(ll_a.der1, ll_b.der1, "logloss der1 dim=1 must be deterministic");
+    assert_eq!(ll_a.der2, ll_b.der2, "logloss der2 dim=1 must be deterministic");
+}
+
+/// For a separable loss at `approx_dimension == k > 1`, the backend launches the
+/// per-loss kernel once per dimension over `approx[d*n..d*n+n]` and concatenates
+/// into a dim-major output of length `k*n`. Each dimension's slice must produce
+/// exactly the same der1/der2 as an independent dim=1 call on that slice (the
+/// outer loop introduces no cross-dimension coupling for separable losses).
+#[test]
+fn multi_dim_separable_concatenates_per_dimension() {
+    // dim=3, n=4. Distinct per-dimension approx blocks; one shared target column.
+    let n = 4;
+    let dim = 3;
+    let approx: Vec<f64> = vec![
+        // d=0
+        0.0, 1.0, -2.0, 3.0, //
+        // d=1
+        0.5, -0.5, 2.5, -3.5, //
+        // d=2
+        1.5, -1.5, 0.25, -0.25,
+    ];
+    let target = [1.0, 0.0, 2.0, -3.0];
+    assert_eq!(approx.len(), dim * n);
+
+    let nd = CpuBackend
+        .compute_gradients(&Loss::Rmse, &approx, &target, dim)
+        .unwrap();
+    assert_eq!(nd.der1.len(), dim * n);
+    assert_eq!(nd.der2.len(), dim * n);
+
+    for d in 0..dim {
+        let approx_d = &approx[d * n..d * n + n];
+        let scalar = CpuBackend
+            .compute_gradients(&Loss::Rmse, approx_d, &target, 1)
+            .unwrap();
+        // Byte-identical per-dimension block (exact ==).
+        assert_eq!(&nd.der1[d * n..d * n + n], scalar.der1.as_slice(), "der1 d={d}");
+        assert_eq!(&nd.der2[d * n..d * n + n], scalar.der2.as_slice(), "der2 d={d}");
+    }
+}
+
+/// Shape validation (T-6.2-01a): a non-divisible `approx.len()` vs
+/// `approx_dimension`, a zero dimension, or an inconsistent `target` length all
+/// return a typed `CbError` (no panic, no `unwrap` in production).
+#[test]
+fn ndim_shape_mismatch_is_error_not_panic() {
+    let approx = [0.0, 1.0, 2.0, 3.0, 4.0]; // len 5, not divisible by 2
+    let target = [0.0, 1.0];
+    assert!(CpuBackend
+        .compute_gradients(&Loss::Rmse, &approx, &target, 2)
+        .is_err());
+
+    // Zero dimension is rejected.
+    assert!(CpuBackend
+        .compute_gradients(&Loss::Rmse, &approx, &target, 0)
+        .is_err());
+
+    // target length inconsistent with n = approx.len()/dim (4/2 = 2 != 3).
+    let approx4 = [0.0, 1.0, 2.0, 3.0];
+    let target3 = [0.0, 1.0, 2.0];
+    assert!(CpuBackend
+        .compute_gradients(&Loss::Rmse, &approx4, &target3, 2)
+        .is_err());
 }

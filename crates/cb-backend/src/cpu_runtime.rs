@@ -445,17 +445,142 @@ fn launch_param_f64(
     Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
+/// Compute the per-object der1/der2 for `loss` over a SINGLE dimension's slices
+/// (`approx_d` and `target_d` both length `n`), reusing the existing per-loss
+/// CubeCL kernel launchers. This is the scalar body of the historical
+/// `compute_gradients` match, extracted verbatim so the outer per-dimension loop
+/// in [`CpuBackend::compute_gradients`] can call it once per dimension over the
+/// dim-major slices. At `approx_dimension == 1` the loop runs this exactly once
+/// over `approx[0..n]`, so the kernel inputs, the `cb_core::sum_f64` order
+/// downstream, and the output are byte-identical to the pre-6.2 scalar path
+/// (RESEARCH Pitfall 1). No new loss arm is added here.
+fn compute_gradients_one_dim(
+    loss: &Loss,
+    approx_d: &[f64],
+    target_d: &[f64],
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
+    match *loss {
+        Loss::Rmse => {
+            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::RmseGradient)?;
+            // RMSE hessian is the constant -1.0 (no kernel needed).
+            let der2 = vec![-1.0_f64; approx_d.len()];
+            Ok((der1, der2))
+        }
+        // CrossEntropy shares Logloss's der1/der2 EXACTLY (D-09): reuse the
+        // Logloss gradient + hessian kernels (no separate kernel needed).
+        Loss::Logloss | Loss::CrossEntropy => {
+            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::LoglossGradient)?;
+            let der2 = launch_logloss_hessian(approx_d)?;
+            Ok((der1, der2))
+        }
+        Loss::Focal { alpha, gamma } => {
+            let der1 = launch_focal_f64(approx_d, target_d, alpha, gamma, false)?;
+            let der2 = launch_focal_f64(approx_d, target_d, alpha, gamma, true)?;
+            Ok((der1, der2))
+        }
+        // MAE == Quantile{alpha=0.5, delta=1e-6} (WR-04): route through the
+        // parametric quantile kernel (alpha/delta as length-1 device arrays)
+        // rather than a duplicate `mae_gradient_kernel` that hardcodes
+        // `F::new(1e-6)` / `F::new(0.5)` — the hardcoded path would drift from
+        // the host scalar under a future f32 instantiation. This makes MAE and
+        // Quantile{0.5} bit-identical by construction.
+        Loss::Mae => {
+            let der1 = launch_quantile_f64(approx_d, target_d, QUANTILE_ALPHA, QUANTILE_DELTA)?;
+            // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
+            let der2 = vec![0.0_f64; approx_d.len()];
+            Ok((der1, der2))
+        }
+        // Quantile{alpha, delta} (Wave 3): the alpha-general pinball gradient
+        // (the alpha/delta passed as length-1 device arrays). der2 = 0 (the
+        // constant-0 vec, the Mae precedent). At alpha=0.5,delta=1e-6 the
+        // gradient equals the Mae arm above (MAE == Quantile{0.5}).
+        Loss::Quantile { alpha, delta } => {
+            let der1 = launch_quantile_f64(approx_d, target_d, alpha, delta)?;
+            let der2 = vec![0.0_f64; approx_d.len()];
+            Ok((der1, der2))
+        }
+        // Wave-1 smooth losses (D-6.1-02): all four have a real der2, so each
+        // launches BOTH a gradient and a hessian kernel.
+        Loss::LogCosh => {
+            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::LogCoshGradient)?;
+            let der2 = launch_binary_f64(approx_d, target_d, BinaryKernel::LogCoshHessian)?;
+            Ok((der1, der2))
+        }
+        Loss::Lq { q } => {
+            let der1 = launch_param_f64(approx_d, target_d, q, ParamKernel::Lq, false)?;
+            let der2 = launch_param_f64(approx_d, target_d, q, ParamKernel::Lq, true)?;
+            Ok((der1, der2))
+        }
+        Loss::Huber { delta } => {
+            let der1 = launch_param_f64(approx_d, target_d, delta, ParamKernel::Huber, false)?;
+            let der2 = launch_param_f64(approx_d, target_d, delta, ParamKernel::Huber, true)?;
+            Ok((der1, der2))
+        }
+        Loss::Expectile { alpha } => {
+            let der1 = launch_param_f64(approx_d, target_d, alpha, ParamKernel::Expectile, false)?;
+            let der2 = launch_param_f64(approx_d, target_d, alpha, ParamKernel::Expectile, true)?;
+            Ok((der1, der2))
+        }
+        // Wave-2 positive-domain / link losses (D-6.1-02 / Plan 06.1-02).
+        // Poisson: exp-link der (inline F::exp); gradient is a binary kernel,
+        // the hessian is the unary -exp(approx) kernel (no target input).
+        Loss::Poisson => {
+            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::PoissonGradient)?;
+            let der2 = launch_poisson_hessian(approx_d)?;
+            Ok((der1, der2))
+        }
+        // Tweedie: exp INSIDE the der (raw approx, NOT exp-approx); both
+        // gradient and hessian carry the variance_power scalar param.
+        Loss::Tweedie { variance_power } => {
+            let der1 =
+                launch_param_f64(approx_d, target_d, variance_power, ParamKernel::Tweedie, false)?;
+            let der2 =
+                launch_param_f64(approx_d, target_d, variance_power, ParamKernel::Tweedie, true)?;
+            Ok((der1, der2))
+        }
+        // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient
+        // kernel; the hessian is the constant 0.0 vec (the Mae precedent).
+        Loss::Mape => {
+            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::MapeGradient)?;
+            let der2 = vec![0.0_f64; approx_d.len()];
+            Ok((der1, der2))
+        }
+    }
+}
+
 impl Runtime for CpuBackend {
     fn compute_gradients(
         &self,
-        loss: Loss,
+        loss: &Loss,
         approx: &[f64],
         target: &[f64],
+        approx_dimension: usize,
     ) -> CbResult<Derivatives> {
-        if approx.len() != target.len() {
+        // Shape validation (T-6.2-01a): `approx_dimension` partitions the
+        // dim-major `approx` into `approx_dimension` contiguous per-dimension
+        // slices of length `n`. Reject a zero dimension or a non-divisible
+        // length up front with a typed CbError (no panic / no `unwrap`).
+        if approx_dimension == 0 {
+            return Err(CbError::LengthMismatch {
+                column: "approx_dimension".to_owned(),
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if approx.len() % approx_dimension != 0 {
+            return Err(CbError::LengthMismatch {
+                column: "approx".to_owned(),
+                expected: approx.len() - (approx.len() % approx_dimension),
+                actual: approx.len(),
+            });
+        }
+        let n = approx.len() / approx_dimension;
+        // `target` stays per-object length `n` for the scalar / class losses
+        // dispatched in this wave (the dim-major target widening is a later plan).
+        if target.len() != n {
             return Err(CbError::LengthMismatch {
                 column: "target".to_owned(),
-                expected: approx.len(),
+                expected: n,
                 actual: target.len(),
             });
         }
@@ -466,92 +591,21 @@ impl Runtime for CpuBackend {
             });
         }
 
-        match loss {
-            Loss::Rmse => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::RmseGradient)?;
-                // RMSE hessian is the constant -1.0 (no kernel needed).
-                let der2 = vec![-1.0_f64; approx.len()];
-                Ok(Derivatives { der1, der2 })
-            }
-            // CrossEntropy shares Logloss's der1/der2 EXACTLY (D-09): reuse the
-            // Logloss gradient + hessian kernels (no separate kernel needed).
-            Loss::Logloss | Loss::CrossEntropy => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::LoglossGradient)?;
-                let der2 = launch_logloss_hessian(approx)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            Loss::Focal { alpha, gamma } => {
-                let der1 = launch_focal_f64(approx, target, alpha, gamma, false)?;
-                let der2 = launch_focal_f64(approx, target, alpha, gamma, true)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            // MAE == Quantile{alpha=0.5, delta=1e-6} (WR-04): route through the
-            // parametric quantile kernel (alpha/delta as length-1 device arrays)
-            // rather than a duplicate `mae_gradient_kernel` that hardcodes
-            // `F::new(1e-6)` / `F::new(0.5)` — the hardcoded path would drift from
-            // the host scalar under a future f32 instantiation. This makes MAE and
-            // Quantile{0.5} bit-identical by construction.
-            Loss::Mae => {
-                let der1 = launch_quantile_f64(approx, target, QUANTILE_ALPHA, QUANTILE_DELTA)?;
-                // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
-                let der2 = vec![0.0_f64; approx.len()];
-                Ok(Derivatives { der1, der2 })
-            }
-            // Quantile{alpha, delta} (Wave 3): the alpha-general pinball gradient
-            // (the alpha/delta passed as length-1 device arrays). der2 = 0 (the
-            // constant-0 vec, the Mae precedent). At alpha=0.5,delta=1e-6 the
-            // gradient equals the Mae arm above (MAE == Quantile{0.5}).
-            Loss::Quantile { alpha, delta } => {
-                let der1 = launch_quantile_f64(approx, target, alpha, delta)?;
-                let der2 = vec![0.0_f64; approx.len()];
-                Ok(Derivatives { der1, der2 })
-            }
-            // Wave-1 smooth losses (D-6.1-02): all four have a real der2, so each
-            // launches BOTH a gradient and a hessian kernel.
-            Loss::LogCosh => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::LogCoshGradient)?;
-                let der2 = launch_binary_f64(approx, target, BinaryKernel::LogCoshHessian)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            Loss::Lq { q } => {
-                let der1 = launch_param_f64(approx, target, q, ParamKernel::Lq, false)?;
-                let der2 = launch_param_f64(approx, target, q, ParamKernel::Lq, true)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            Loss::Huber { delta } => {
-                let der1 = launch_param_f64(approx, target, delta, ParamKernel::Huber, false)?;
-                let der2 = launch_param_f64(approx, target, delta, ParamKernel::Huber, true)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            Loss::Expectile { alpha } => {
-                let der1 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, false)?;
-                let der2 = launch_param_f64(approx, target, alpha, ParamKernel::Expectile, true)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            // Wave-2 positive-domain / link losses (D-6.1-02 / Plan 06.1-02).
-            // Poisson: exp-link der (inline F::exp); gradient is a binary kernel,
-            // the hessian is the unary -exp(approx) kernel (no target input).
-            Loss::Poisson => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::PoissonGradient)?;
-                let der2 = launch_poisson_hessian(approx)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            // Tweedie: exp INSIDE the der (raw approx, NOT exp-approx); both
-            // gradient and hessian carry the variance_power scalar param.
-            Loss::Tweedie { variance_power } => {
-                let der1 =
-                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, false)?;
-                let der2 =
-                    launch_param_f64(approx, target, variance_power, ParamKernel::Tweedie, true)?;
-                Ok(Derivatives { der1, der2 })
-            }
-            // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient
-            // kernel; the hessian is the constant 0.0 vec (the Mae precedent).
-            Loss::Mape => {
-                let der1 = launch_binary_f64(approx, target, BinaryKernel::MapeGradient)?;
-                let der2 = vec![0.0_f64; approx.len()];
-                Ok(Derivatives { der1, der2 })
-            }
+        // Per-dimension kernel-launch loop (D-6.2-01 / RESEARCH Pitfall 1). The
+        // reduction is an OUTER loop over dimensions; each iteration launches the
+        // existing scalar kernel over the dim-major slice `approx[d*n..d*n+n]` and
+        // concatenates into the dim-major output (`der1[d*n+i]`). This is NOT fused
+        // into a single `0..approx_dimension * n` launch: at `approx_dimension==1`
+        // the loop runs once over `approx[0..n]`, so the kernel inputs and outputs
+        // are byte-identical to the pre-6.2 scalar path.
+        let mut der1 = Vec::with_capacity(approx.len());
+        let mut der2 = Vec::with_capacity(approx.len());
+        for d in 0..approx_dimension {
+            let approx_d = &approx[d * n..d * n + n];
+            let (der1_d, der2_d) = compute_gradients_one_dim(loss, approx_d, target)?;
+            der1.extend_from_slice(&der1_d);
+            der2.extend_from_slice(&der2_d);
         }
+        Ok(Derivatives { der1, der2 })
     }
 }

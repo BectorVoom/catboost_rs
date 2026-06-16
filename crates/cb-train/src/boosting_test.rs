@@ -32,7 +32,7 @@ fn exact_single_leaf(loss: Loss, residuals: &[f64]) -> f64 {
 
     let deltas = compute_leaf_deltas(
         LeafMethod::Exact,
-        loss,
+        &loss,
         &leaf_of,
         &weighted_der1,
         &der2,

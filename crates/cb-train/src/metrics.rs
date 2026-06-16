@@ -63,8 +63,8 @@ impl EvalMetric {
     /// two losses this phase locks; MAE training uses RMSE eval reporting until a
     /// later phase adds the MAE metric.
     #[must_use]
-    pub fn for_loss(loss: Loss) -> Self {
-        match loss {
+    pub fn for_loss(loss: &Loss) -> Self {
+        match *loss {
             // The Wave-1 smooth regression losses (LogCosh / Lq / Huber /
             // Expectile) each default upstream to their own-named regression
             // metric; for Wave 1 they report the parity-neutral RMSE eval surface

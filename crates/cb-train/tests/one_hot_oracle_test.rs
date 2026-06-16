@@ -122,7 +122,7 @@ fn train_one_hot_only(
 
     for _iter in 0..iterations {
         let ders = runtime
-            .compute_gradients(Loss::Rmse, &approx, target)
+            .compute_gradients(&Loss::Rmse, &approx, target, 1)
             .expect("gradients");
         let weighted_der1: Vec<f64> = ders
             .der1

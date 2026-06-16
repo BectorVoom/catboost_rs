@@ -16,9 +16,9 @@ use crate::metrics::{EvalMetric, EvalMetricHistory};
 /// `eval_metric` defaults to the objective when unset.
 #[test]
 fn eval_metric_defaults_to_objective() {
-    assert_eq!(EvalMetric::for_loss(Loss::Rmse), EvalMetric::Rmse);
-    assert_eq!(EvalMetric::for_loss(Loss::Mae), EvalMetric::Rmse);
-    assert_eq!(EvalMetric::for_loss(Loss::Logloss), EvalMetric::Logloss);
+    assert_eq!(EvalMetric::for_loss(&Loss::Rmse), EvalMetric::Rmse);
+    assert_eq!(EvalMetric::for_loss(&Loss::Mae), EvalMetric::Rmse);
+    assert_eq!(EvalMetric::for_loss(&Loss::Logloss), EvalMetric::Logloss);
 }
 
 /// RMSE over a hand-computed unweighted set:
@@ -175,6 +175,6 @@ fn msle_is_never_a_for_loss_default() {
         Loss::Tweedie { variance_power: 1.5 },
         Loss::Mape,
     ] {
-        assert_ne!(EvalMetric::for_loss(loss), EvalMetric::Msle);
+        assert_ne!(EvalMetric::for_loss(&loss), EvalMetric::Msle);
     }
 }
