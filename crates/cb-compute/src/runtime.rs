@@ -473,4 +473,34 @@ pub trait Runtime {
         target: &[f64],
         approx_dimension: usize,
     ) -> CbResult<Derivatives>;
+
+    /// Compute the GROUPED per-object derivatives for a ranking `loss` over the
+    /// query-group structure `groups` (LOSS-04, D-6.3-03), mirroring upstream
+    /// `IDerCalcer::CalcDersForQueries` (`error_functions.h:831-841`).
+    ///
+    /// This is the sibling grouped seam to [`Runtime::compute_gradients`]: the
+    /// pointwise signature above stays BYTE-IDENTICAL (D-04 no-regression on the
+    /// shipped scalar / N-dim oracles), and ranking losses route here instead.
+    /// The reduction is host-side (NO CubeCL kernel — RESEARCH Architectural
+    /// Responsibility Map; AGENTS.md: 6.3 is host reductions), so the trait
+    /// supplies a default implementation delegating to
+    /// [`crate::ranking_der::calc_ders_for_queries`]; backends do not override it.
+    ///
+    /// Returns one [`Derivatives`] per group, in group order. Plan 06.3-01 lands
+    /// the seam; every concrete ranking-loss arm is filled by Plans 02–05.
+    ///
+    /// # Errors
+    /// Returns a [`cb_core::CbError`] if a group span is out of range, the input
+    /// lengths disagree, or (in this plan) the ranking loss is not yet wired.
+    fn compute_gradients_grouped(
+        &self,
+        loss: &Loss,
+        approx: &[f64],
+        target: &[f64],
+        weights: &[f64],
+        groups: &[crate::ranking_der::GroupSpan],
+        random_seed: u64,
+    ) -> CbResult<Vec<Derivatives>> {
+        crate::ranking_der::calc_ders_for_queries(loss, approx, target, weights, groups, random_seed)
+    }
 }
