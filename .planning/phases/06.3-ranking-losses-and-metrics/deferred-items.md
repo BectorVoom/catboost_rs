@@ -17,13 +17,23 @@ PairLogitPairwise is DEFERRED pending a leaf-estimation der2 parity fix.
   `p(p-1)` with `p ∈ [0,1]` (the quadratic `p(1-p)=0.2755` has no real root) AND the
   pair weights were confirmed to be exactly `1.0` (2-col and 3-col-weight-1 pools give
   identical leaves) AND the leaf assignment matches (leaf_weights `[8,4]`).
-- **Conclusion:** catboost computes the PairLogit per-leaf der2 by a path NOT captured by
-  the per-object der2 sum — most likely the pairwise-aware `weightedDers` / leaf-der
-  reduction (`approx_calcer_querywise.cpp` `AddLeafDersForQueries` over the pairwise
-  bucket der2), or an iterative recompute inside the gradient walker. This is a
-  leaf-estimation subsystem gap, NOT a der-formula gap (the per-object der1/der2 and the
-  Cholesky pairwise-leaf solve are independently unit-test-verified, including bit-exact
-  vs `pairwise_leaves_calculation_ut.cpp`).
+- **Conclusion (refined via Gradient/Newton probes):** the gap is a **pair-weight
+  normalization** catboost applies to explicit `Pool.pairs`, NOT a der-formula error.
+  Probing the SAME depth-1/l2=0/lr=1 tree with both leaf methods isolates the leaf der
+  sums directly:
+  - `Gradient` leaf (`sumDer/sumWeight`): catboost = `[7/36, -14/36]`. The transcribed
+    `sumDer` (= `[2.0, -2.0]`) MATCHES, but the implied per-leaf `sumWeight` is
+    `[72/7, 36/7] ≈ [10.29, 5.14]`, NOT the raw pair-incidence counts `[8, 6]`.
+  - `Newton` leaf (`sumDer/-sumDer2`): catboost = `[7/9, -14/9]`; implied `-sumDer2 =
+    [18/7, 9/7]`, not the raw `p(1-p)` sums `[2.0, 1.5]`.
+  Both the Gradient `sumWeight` AND the Newton `-sumDer2` are scaled by the SAME
+  non-uniform per-pair weight (the `7` denominator == total pair count; group-relative
+  factors). A `1/(group-pair-count)` scheme reproduces the leaf values to ~2 s.f. but not
+  ≤1e-5 — the exact upstream normalization (likely `GeneratePairs` / `bt.PairwiseWeights`
+  group-weight folding in `data_providers.cpp` / `approx_calcer.cpp:444`) must be
+  transcribed into `build_query_info`'s pair→`Competitor.weight` mapping (Plan 01 seam).
+  The der1/der2 FORMULAS and the Cholesky pairwise-leaf solve are independently
+  unit-test-verified (the latter bit-exact vs `pairwise_leaves_calculation_ut.cpp`).
 
 **What landed (green):**
 - `Loss::PairLogit` / `Loss::PairLogitPairwise` der over Competitors (inline exp), unit-tested.
