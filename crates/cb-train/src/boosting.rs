@@ -25,10 +25,10 @@
 //! `unwrap`/`expect`/raw float fold in production (deny-lints + D-08).
 
 use cb_compute::{
-    collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
-    newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev,
-    simple_leaf_delta, solve_symmetric_newton, Derivatives, GroupSpan, LeafMethod, Loss, Runtime,
-    RankingCompetitor, QUANTILE_ALPHA, QUANTILE_DELTA,
+    collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, is_pairwise_scoring,
+    logcosh_exact_leaf_delta, newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg,
+    score_st_dev, simple_leaf_delta, solve_symmetric_newton, Derivatives, GroupSpan, LeafMethod,
+    Loss, Runtime, RankingCompetitor, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 use cb_data::Pair;
@@ -717,6 +717,13 @@ fn is_grouped_loss(loss: &Loss) -> bool {
             | Loss::LambdaMart { .. }
     )
 }
+
+/// The default `PairwiseNonDiagReg` (`bayesian_matrix_reg`) prior the Cholesky
+/// pairwise-leaf solve uses for the off-diagonal / diagonal reg terms
+/// (`oblivious_tree_options.cpp:16` `PairwiseNonDiagReg("bayesian_matrix_reg", 0.1)`).
+/// The corpus pins no override, so the upstream default `0.1` applies for the
+/// `*Pairwise` leaf path (`pairwise_leaves::compute_pairwise_leaf_deltas`).
+const PAIRWISE_NON_DIAG_REG_DEFAULT: f64 = 0.1;
 
 /// Compute the starting approx (and model bias): the target mean for RMSE with
 /// `boost_from_average`, else `0` (Pitfall 2). The mean is folded through the
@@ -2386,7 +2393,36 @@ fn train_inner<R: Runtime>(
         //    in leaf order (unchanged). The leaf_value leaf_of partition is shared
         //    across dimensions (the oblivious structure is one tree).
         let mut leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
-        if matches!(params.loss, Loss::MultiClass) {
+        if is_pairwise_scoring(&params.loss) {
+            // PAIRWISE leaf path (LOSS-04 Wave B): the `*Pairwise` losses
+            // (`IsPairwiseScoring`) solve their leaf VALUES via the Cholesky
+            // pairwise-leaf system (`pairwise_leaves.rs`) over the per-leaf
+            // pairwise weight sums (from the group Competitors) + der sums — NOT
+            // the pointwise Gradient/Newton estimators (RESEARCH Pitfall 2). This
+            // is the THIRD leaf branch, kept separate from the pointwise and
+            // softmax paths. `*Pairwise` is single-dimension (approx_dimension == 1)
+            // and `boost_from_average=false`, so this writes exactly `n_leaves`
+            // values. The der1 fed here is the RAW (un-weighted) PairLogit der1
+            // (`ders.der1`) — the pair weight already lives inside the der, so the
+            // per-leaf `SumDer` is a plain reduction (upstream `leafDers[leaf].SumDer`,
+            // approx_calcer.cpp:495). `l2_diag_reg = L2Reg` is the RAW l2 (NOT the
+            // sumAllWeights-scaled `scaled_l2` the pointwise path uses —
+            // CalcLeafDeltasSimple passes `params.ObliviousTreeOptions->L2Reg`
+            // directly). `pairwise_bucket_weight_prior_reg = PairwiseNonDiagReg`
+            // (`bayesian_matrix_reg`, default 0.1).
+            let spans = group_spans.as_deref().unwrap_or(&[]);
+            let deltas = crate::pairwise_leaves::compute_pairwise_leaf_deltas(
+                spans,
+                &leaf_value_leaf_of,
+                &ders.der1,
+                n_leaves,
+                params.l2_leaf_reg,
+                PAIRWISE_NON_DIAG_REG_DEFAULT,
+            );
+            for delta in &deltas {
+                leaf_values.push(learning_rate * delta);
+            }
+        } else if matches!(params.loss, Loss::MultiClass) {
             // MultiClass softmax: the COUPLED per-leaf symmetric Newton solve over
             // ALL dimensions at once (`ders.der2` is the PER-OBJECT packed Hessian
             // of length `n * k*(k+1)/2`, NOT the diagonal `der2[d*n+i]` layout).

@@ -120,19 +120,36 @@ pub fn gradient_leaf_delta(sum_der: f64, sum_weight: f64, scaled_l2: f64) -> f64
 ///
 /// `sum_der` / `sum_der2` are the leaf's reduced first/second-derivative sums
 /// (the per-object weight already folded in by the caller, matching upstream
-/// `TSum`); `scaled_l2` is the [`scale_l2_reg`] output. The denominator
-/// `-sum_der2 + scaled_l2` is guarded: a degenerate `<= 0` denominator (an empty
-/// leaf, or a loss with `der2 == 0` such as MAE/Quantile where Newton is
-/// undefined) returns `0.0` rather than dividing by zero or producing a NaN/inf
-/// (T-03-02-01 mitigation — never panic/div-by-zero). For RMSE `der2 == -1` so
-/// `-sum_der2 == sum_weight` and this equals the Gradient delta.
+/// `TSum`); `scaled_l2` is the [`scale_l2_reg`] output. Upstream
+/// `CalcDeltaNewtonBody` divides UNCONDITIONALLY (`online_predictor.h:162-170`):
+/// `sumDer / (-sumDer2 + scaledL2)`. The ONLY guard here is the exact-zero
+/// denominator (an empty leaf with no L2, where `sumDer == 0` too) → `0.0`,
+/// avoiding a `0/0` NaN (T-03-02-01 — never panic/div-by-zero); for every
+/// non-zero denominator the upstream division is reproduced VERBATIM, including a
+/// NEGATIVE denominator.
+///
+/// # Why a negative denominator must NOT be clamped (LOSS-04 Wave B)
+///
+/// The regression / binary losses store a NON-positive `der2` (e.g. RMSE
+/// `der2 == -1`, Logloss `der2 == -p(1-p)`), so `-sum_der2 >= 0` and the
+/// denominator is always `> 0` — clamping `<= 0` to `0` was a safe no-op for
+/// them. But the LISTWISE LambdaMart loss fills a STRICTLY POSITIVE Newton
+/// hessian (`Sigma²·delta·σ(1-σ)`, `error_functions.cpp:665-667`), so
+/// `-sum_der2 < 0` and (with the near-zero LambdaMart default `l2`) the
+/// denominator is legitimately NEGATIVE. Upstream divides by it (yielding the
+/// correct leaf value), so clamping it to `0` would zero out EVERY LambdaMart
+/// leaf (parity bug — RESEARCH Pitfall 5). The exact-zero guard below keeps the
+/// regression empty-leaf safety while letting the negative-denominator listwise
+/// case divide exactly as upstream.
 #[must_use]
 pub fn newton_leaf_delta(sum_der: f64, sum_der2: f64, scaled_l2: f64) -> f64 {
     let denom = -sum_der2 + scaled_l2;
-    if denom > 0.0 {
-        sum_der / denom
-    } else {
+    if denom == 0.0 {
+        // 0/0 empty-leaf guard only (no L2): never a NaN. Every non-zero
+        // denominator — positive OR negative — divides verbatim like upstream.
         0.0
+    } else {
+        sum_der / denom
     }
 }
 

@@ -107,13 +107,19 @@ fn newton_equals_gradient_for_rmse_hessian() {
 }
 
 #[test]
-fn newton_guards_degenerate_denominator_returns_zero() {
-    // der2 == 0 (MAE/Quantile) with scaledL2 == 0 -> denom 0 -> guarded 0.0.
+fn newton_guards_only_exact_zero_denominator() {
+    // der2 == 0 (MAE/Quantile) with scaledL2 == 0 -> denom exactly 0 -> guarded 0.0
+    // (the ONLY guard — avoids the 0/0 NaN; T-03-02-01).
     assert_eq!(newton_leaf_delta(5.0, 0.0, 0.0), 0.0);
-    // Empty leaf: sum_der2 == 0, scaledL2 == 0 -> 0.0, no div-by-zero (T-03-02-01).
+    // Empty leaf: sum_der2 == 0, scaledL2 == 0 -> 0.0, no div-by-zero.
     assert_eq!(newton_leaf_delta(0.0, 0.0, 0.0), 0.0);
-    // A negative denominator (-sum_der2 + scaledL2 < 0) is also degenerate -> 0.0.
-    assert_eq!(newton_leaf_delta(5.0, 4.0, 1.0), 0.0);
+    // A NEGATIVE denominator (-sum_der2 + scaledL2 < 0) must DIVIDE verbatim like
+    // upstream `CalcDeltaNewtonBody` (online_predictor.h:162-170), NOT be clamped:
+    // the listwise LambdaMart loss fills a strictly POSITIVE hessian, so its
+    // denominator is legitimately negative and upstream divides by it (LOSS-04
+    // Wave B; clamping it to 0 zeroed every LambdaMart leaf). denom = -4 + 1 = -3;
+    // 5/-3 = -1.6667.
+    assert!((newton_leaf_delta(5.0, 4.0, 1.0) - (-5.0 / 3.0)).abs() < 1e-12);
 }
 
 #[test]
