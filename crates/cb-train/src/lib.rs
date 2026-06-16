@@ -61,8 +61,9 @@ pub use boosting::{
     has_time_default, max_ctr_complexity_default, model_size_reg_default, need_shuffle,
     ordered_approx_delta_simple, structure_fold_cycle,
     permutation_count_default, score_function_default,
-    simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_with_eval,
-    train_with_eval_sets, BoostParams, EBoostingType, EvalSet, Model, ObliviousTree,
+    simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_ranking,
+    train_with_eval, train_with_eval_sets, BoostParams, EBoostingType, EvalSet, Model,
+    ObliviousTree, RankingData,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, greedy_tensor_search_oblivious_ordered,

@@ -27,12 +27,14 @@
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
     newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg, score_st_dev,
-    simple_leaf_delta, solve_symmetric_newton, LeafMethod, Loss, Runtime, QUANTILE_ALPHA,
-    QUANTILE_DELTA,
+    simple_leaf_delta, solve_symmetric_newton, Derivatives, GroupSpan, LeafMethod, Loss, Runtime,
+    RankingCompetitor, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
+use cb_data::Pair;
 
 use crate::autolr::{self, TargetType};
+use crate::query_info::{build_query_info, QueryInfo};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::ctr::bake::{bake_ctr_table, BakedCtrData};
 use crate::ctr::{CounterCalcMethod, ECtrType};
@@ -689,6 +691,19 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
     }
 }
 
+/// Whether `loss` is a GROUPED (ranking/querywise) loss whose der is computed
+/// PER QUERY-GROUP through the grouped seam
+/// (`cb_compute::Runtime::compute_gradients_grouped` →
+/// `calc_ders_for_queries`), rather than the pointwise per-object
+/// `compute_gradients` (LOSS-04, D-6.3-03). Wave A wires the two querywise
+/// deterministic losses; Plans 03–05 extend this predicate as PairLogit /
+/// LambdaMart / YetiRank / StochasticRank land. Every NON-ranking loss returns
+/// `false` and keeps the pointwise der site BYTE-IDENTICAL (D-04 no-regression).
+#[must_use]
+fn is_grouped_loss(loss: &Loss) -> bool {
+    matches!(loss, Loss::QueryRmse | Loss::QuerySoftMax { .. })
+}
+
 /// Compute the starting approx (and model bias): the target mean for RMSE with
 /// `boost_from_average`, else `0` (Pitfall 2). The mean is folded through the
 /// sanctioned `sum_f64` primitive (D-05).
@@ -1191,6 +1206,49 @@ pub struct EvalSet<'a> {
     pub target: &'a [f64],
 }
 
+/// The ranking (grouped) structure a ranking loss reads (LOSS-04, D-6.3-03):
+/// per-object `group_id` / `subgroup_id` and explicit `pairs`. Threaded into
+/// [`train_ranking`] → [`train_inner`]; the grouped view ([`QueryInfo`]) is built
+/// ONCE per fit via [`build_query_info`] and lowered to a compute-tier
+/// `Vec<GroupSpan>` at the der site. Empty (all-empty columns) for the non-ranking
+/// entry points, so the pointwise der site stays byte-identical (D-04).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RankingData<'a> {
+    /// Per-object group id (contiguous, unique runs — `query.h:48-67`).
+    pub group_id: &'a [u64],
+    /// Per-object subgroup id (optional; empty when absent).
+    pub subgroup_id: &'a [u64],
+    /// Explicit ranking pairs (global `(winner_id, loser_id)`).
+    pub pairs: &'a [Pair],
+}
+
+/// Lower a `cb-train` [`QueryInfo`] grouped view into the compute-tier
+/// [`GroupSpan`] the grouped der seam consumes (LOSS-04). The compute tier
+/// re-declares the plain-data shape to keep `cb-compute` free of a `cb-train`
+/// dependency (06.3-01 layering decision); this is the trainer-side lowering.
+fn lower_query_info(groups: &[QueryInfo]) -> Vec<GroupSpan> {
+    groups
+        .iter()
+        .map(|g| GroupSpan {
+            begin: g.begin,
+            end: g.end,
+            weight: g.weight,
+            competitors: g
+                .competitors
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|c| RankingCompetitor {
+                            id: c.id,
+                            weight: c.weight,
+                        })
+                        .collect()
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Apply one oblivious tree to a single eval object: walk its splits to the leaf
 /// and return that leaf's value. Out-of-range indices contribute `0` (defensive;
 /// the trainer supplies valid trees).
@@ -1351,6 +1409,47 @@ pub fn train_with_eval_sets<R: Runtime>(
         staged_out,
         eval_sets,
         history,
+        RankingData::default(),
+    )?;
+    Ok(model)
+}
+
+/// Train a RANKING model (LOSS-04, D-6.3-03): the numeric [`train`] entry plus the
+/// grouped [`RankingData`] (`group_id` / `subgroup_id` / `pairs`) a ranking loss
+/// reads. When `params.loss` is a querywise/ranking loss
+/// ([`is_grouped_loss`]) the der site builds the [`QueryInfo`] grouped view once
+/// and routes the gradient through the grouped seam
+/// (`Runtime::compute_gradients_grouped`); the leaf path reuses the existing
+/// pointwise estimators (QueryRMSE / QuerySoftMax are per-object der, no pairwise
+/// Cholesky path). For a NON-ranking loss this is byte-identical to [`train`] (the
+/// grouped view is built but never consumed — D-04).
+///
+/// # Errors
+/// As [`train`], plus [`CbError::Degenerate`] / [`CbError::OutOfRange`] from
+/// [`build_query_info`] on malformed group/pair structure.
+#[allow(clippy::too_many_arguments)]
+pub fn train_ranking<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+    ranking: RankingData,
+) -> CbResult<Model> {
+    let (model, _baked) = train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        &[],
+        target,
+        weights,
+        params,
+        staged_out,
+        &[],
+        None,
+        ranking,
     )?;
     Ok(model)
 }
@@ -1403,6 +1502,7 @@ pub fn train_cat<R: Runtime>(
         staged_out,
         &[],
         None,
+        RankingData::default(),
     )
 }
 
@@ -1424,6 +1524,7 @@ fn train_inner<R: Runtime>(
     mut staged_out: Option<&mut Vec<f64>>,
     eval_sets: &[EvalSet],
     mut history: Option<&mut EvalMetricHistory>,
+    ranking: RankingData,
 ) -> CbResult<(Model, BakedCtrData)> {
     check_depth(params.depth)?;
 
@@ -1505,6 +1606,27 @@ fn train_inner<R: Runtime>(
         weights.to_vec()
     };
     let sum_all_weights = sum_f64(&weights);
+
+    // GROUPED (ranking) view (LOSS-04, D-6.3-03): for a querywise/ranking loss
+    // build the `Vec<GroupSpan>` ONCE (mirroring upstream's per-fit
+    // `TVector<TQueryInfo>`), lowered from the `cb-train::QueryInfo` view, so the
+    // der site can route through the grouped seam each iteration. For every
+    // NON-ranking loss this is `None` and the pointwise der site is byte-identical
+    // (D-04 no-regression). `build_query_info` validates the group/pair structure
+    // up front (contiguous-unique runs, in-range/in-group pairs) — a typed
+    // CbError, never a panic.
+    let group_spans: Option<Vec<GroupSpan>> = if is_grouped_loss(&params.loss) {
+        let qi = build_query_info(
+            n,
+            ranking.group_id,
+            ranking.subgroup_id,
+            ranking.pairs,
+            &weights,
+        )?;
+        Some(lower_query_info(&qi))
+    } else {
+        None
+    };
 
     // N-dim approx buffer (D-6.2-01 / Plan 06.2-02). `approx_dimension` is the
     // number of output dimensions the loss produces. Every existing scalar loss
@@ -1952,8 +2074,39 @@ fn train_inner<R: Runtime>(
         //    per-loss kernel launchers; at `approx_dimension == 1` this is
         //    byte-identical to the pre-6.2 scalar path (RESEARCH Pitfall 1). The
         //    returned `der1`/`der2` are the matching dimension-major buffers.
-        let ders =
-            runtime.compute_gradients(&params.loss, &approx, target, approx_dimension)?;
+        let ders = if let Some(spans) = group_spans.as_deref() {
+            // GROUPED (ranking) der (LOSS-04, D-6.3-03): route through the grouped
+            // seam over the per-fit `QueryInfo` view instead of the pointwise
+            // per-object kernel. The seam returns one `Derivatives` per group (in
+            // group order); the groups are contiguous half-open `[begin, end)`
+            // spans covering all `n` objects in order, so concatenating their
+            // der1/der2 in group order reproduces the object-order flat buffer the
+            // pointwise path emits (approx_dimension == 1 for the Wave-A querywise
+            // losses). The querywise der is ALREADY weighted (the weight is folded
+            // into der1/der2 upstream), matching the pointwise `der1 * weight`
+            // applied below at the uniform-weight fixtures.
+            let per_group =
+                runtime.compute_gradients_grouped(&params.loss, &approx, target, &weights, spans, params.random_seed)?;
+            let mut der1 = Vec::with_capacity(n);
+            let mut der2 = Vec::with_capacity(n);
+            for g in &per_group {
+                der1.extend_from_slice(&g.der1);
+                der2.extend_from_slice(&g.der2);
+            }
+            // The grouped der must cover every object exactly once (contiguous
+            // groups). A shortfall would silently truncate the histogram; reject it.
+            if der1.len() != n || der2.len() != n {
+                return Err(CbError::Degenerate(format!(
+                    "grouped der produced {} der1 / {} der2 entries, expected {n} \
+                     (group spans must cover every object exactly once)",
+                    der1.len(),
+                    der2.len()
+                )));
+            }
+            Derivatives { der1, der2 }
+        } else {
+            runtime.compute_gradients(&params.loss, &approx, target, approx_dimension)?
+        };
 
         // Weighted gradient contribution per object: der1 * weight (the
         // histogram-scatter elementwise product; the host reduces it ordered).
