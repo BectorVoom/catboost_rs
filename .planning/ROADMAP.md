@@ -369,7 +369,7 @@ Plans:
 
 **Wave 3** *(blocked on 06.3-01, 06.3-02)*
 
-- [ ] 06.3-03-PLAN.md — Wave B losses: PairLogit (explicit pairs) + PairLogitPairwise (Cholesky pairwise-leaf reusing in-house cholesky_solve, Plain) + LambdaMart — per-stage oracle ≤1e-5 (LOSS-04)
+- [~] 06.3-03-PLAN.md — Wave B losses: PairLogit (explicit pairs) + PairLogitPairwise (Cholesky pairwise-leaf reusing in-house cholesky_solve, Plain) + LambdaMart — per-stage oracle ≤1e-5 (LOSS-04) — **LambdaMart COMPLETE; PairLogit/PairLogitPairwise machinery lands, oracle DEFERRED** (9b2606d/b25a2be/bef767d): LambdaMart NDCG per-group lambda grad + pointwise Newton leaf — per-stage oracle GREEN ≤1e-5 vs catboost 1.2.10 (unlocked by the Rule-1 newton_leaf_delta fix: divide verbatim for NEGATIVE denominators — listwise positive hessian; regression losses unaffected). PairLogit/PairLogitPairwise der over Competitors (inline exp, error_functions.h:849-866) + the Cholesky pairwise-leaf path (pairwise_leaves.rs, 2×2 + general SPD via REUSED cb_compute::pairwise_cholesky_solve + diag/nonDiag reg + MakeZeroAverage — BIT-EXACT vs pairwise_leaves_calculation_ut.cpp, no new crate) + is_pairwise_scoring leaf-routing all LAND and are unit-tested; the two PairLogit/PairLogitPairwise per-stage ORACLES are DEFERRED on a precisely-isolated pair-weight normalization gap (catboost group-relative pair weighting not yet in build_query_info — deferred-items.md; fixtures frozen; NO #[ignore]/NO weakened tolerance). Gates: cb-compute 113/113, pairwise_leaves 6/6, lambdamart_oracle 1/1, full cb-train green, cargo check --workspace --tests GREEN.
 
 **Wave 4** *(blocked on 06.3-01, 06.3-02, 06.3-03; autonomous: false — instrumented-build feasibility-probe checkpoint)*
 
