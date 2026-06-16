@@ -327,11 +327,11 @@ Plans:
 - [x] 06.2-02-PLAN.md — Wave 0 (train/model tier + **D-04 HARD CHECKPOINT**): N-dim approx buffer in `boosting.rs`, per-dim leaf deltas, leaf-major `cb-model` serialization; re-lock ALL ~38 scalar oracles green at dim=1 + an explicit `0.0`-diff byte-identity gate — COMPLETE 2026-06-16 (dim-major `approx[d*n+i]` boosting loop; leaf-major transpose; `ndim_dim1_identity_test == 0.0`; FULL cb-train scalar oracle suite + cb-model round-trip oracles green at dim=1; cb-backend 22 / cb-train --lib 141; `wave_0_complete: true` — Wave 1 unblocked)
 - [x] 06.2-03-PLAN.md — Wave 1: MultiClass (softmax coupled der + symmetric-Hessian Newton solve, solver-choice decision checkpoint / Open-Q1) + MultiClassOneVsAll (diagonal) + multi-dim split-score transcription + class-label remap; per-stage oracle ≤1e-5 (LOSS-02)
 
-**Wave 2** *(blocked on Wave 1 completion)*
+**Wave 2** *(COMPLETE)*
 
-- [ ] 06.2-04-PLAN.md — Wave 2: MultiLogloss + MultiCrossEntropy (shared `TMultiCrossEntropyError` diagonal der, per-dim sigmoid); per-stage oracle ≤1e-5 (LOSS-02)
+- [x] 06.2-04-PLAN.md — Wave 2: MultiLogloss + MultiCrossEntropy (shared `TMultiCrossEntropyError` diagonal der `der1=target_d-sigmoid(approx_d)`/`der2=-sigmoid*(1-sigmoid)`, two enum names → one `multi_crossentropy_ders`; dim-major target plumbing, label-set-width `approx_dimension=target.len/n`, `MultiClassKind::MultiLabel` per-dim sigmoid); per-stage oracle ≤1e-5 for BOTH losses; D-04 scalar + Wave-1 multiclass green (completed 2026-06-16, commits 7372756/1b26ad5)
 
-**Wave 3** *(blocked on Wave 2 completion)*
+**Wave 3** *(unblocked — Wave 2 complete)*
 
 - [ ] 06.2-05-PLAN.md — Wave 3: MultiQuantile (K independent Exact quantile dims reusing the 6.1 `exact_leaf_delta` per dim, `alpha:Vec<f64>` param); per-stage oracle ≤1e-5; closes LOSS-02 + LOSS-03 multi (D-6.2-05)
 

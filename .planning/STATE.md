@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.2-03-PLAN.md
-last_updated: "2026-06-16T10:00:00.000Z"
-last_activity: 2026-06-16 -- Phase 06.2 Plan 03 (Wave-1 MultiClass/OneVsAll, LOSS-02) COMPLETE
+stopped_at: Completed 06.2-04-PLAN.md
+last_updated: "2026-06-16T11:00:00.000Z"
+last_activity: 2026-06-16 -- Phase 06.2 Plan 04 (Wave-2 MultiLogloss/MultiCrossEntropy, LOSS-02 multilabel) COMPLETE
 progress:
   total_phases: 14
   completed_phases: 6
   total_plans: 49
-  completed_plans: 46
-  percent: 45
+  completed_plans: 47
+  percent: 46
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.2 (multiclass-multilabel-and-n-dim-approx-refactor) — EXECUTING
-Plan: 3 of 5 — 06.2-03 COMPLETE (Wave 1 MultiClass/OneVsAll closed; next: 06.2-04 Wave-2 MultiLogloss/MultiCrossEntropy)
-Status: Plan 06.2-03 complete — Loss::MultiClass (softmax, packed symmetric Hessian + hand-rolled per-leaf SPD Newton solve, hessian.cpp:22-52, NO new crate) + Loss::MultiClassOneVsAll (separable diagonal); multi-dim single-shared-accumulator split-score (Cosine couples inside sqrt; dim=1 BIT-identical); class [0,k) remap; softmax/sigmoid predict transforms; two frozen fixtures; per-stage oracle (Splits/LeafValues/StagedApprox/Predictions) <=1e-5 for BOTH losses; D-04 scalar suite still green. LOSS-02 MultiClass+OneVsAll members closed.
-Last activity: 2026-06-16 -- Phase 06.2 Plan 03 (Wave-1 MultiClass/OneVsAll, LOSS-02) COMPLETE
+Plan: 4 of 5 — 06.2-04 COMPLETE (Wave 2 MultiLogloss/MultiCrossEntropy closed; next: 06.2-05 Wave-3 MultiQuantile, LOSS-03)
+Status: Plan 06.2-04 complete — Loss::MultiLogloss + Loss::MultiCrossEntropy (the SAME TMultiCrossEntropyError per-dimension DIAGONAL der, error_functions.h:781-820, two enum names dispatching to one shared multi_crossentropy_ders helper: der1=target_d-sigmoid(approx_d), der2=-sigmoid*(1-sigmoid); separable, reuse the scalar sigmoid + scalar Newton leaf step per dimension, NO softmax coupling). Dim-major multilabel target plumbing (object count from feature columns, approx_dimension=target.len/n = label-set width); per-dim target-range validation ({0,1} vs [0,1], T-6.2-04a); MultiClassKind::MultiLabel per-dim sigmoid predictions; two frozen fixtures (nested y-quantile binary labels, leaf_estimation_iterations:1 pinned); per-stage oracle (Splits/LeafValues/StagedApprox/Predictions) <=1e-5 for BOTH losses; D-04 scalar suite + Wave-1 multiclass oracle still green. LOSS-02 (multiclass + multilabel) FULLY CLOSED.
+Last activity: 2026-06-16 -- Phase 06.2 Plan 04 (Wave-2 MultiLogloss/MultiCrossEntropy, LOSS-02 multilabel) COMPLETE
 
-Progress: [##########] 60% of Phase 6.2 plans (3 of 5 plans complete; 5 of 8 top-level phases complete)
+Progress: [############] 80% of Phase 6.2 plans (4 of 5 plans complete; 5 of 8 top-level phases complete)
 
 ## Performance Metrics
 
@@ -95,6 +95,8 @@ Progress: [##########] 60% of Phase 6.2 plans (3 of 5 plans complete; 5 of 8 top
 | Phase 06.1 P03 | ~11min | 3 tasks | 21 files |
 | Phase 06.2 P01 | ~20min | 2 tasks | 9 files |
 | Phase 06.2 P02 | ~12min | 3 tasks | 10 files |
+| Phase 06.2 P03 | ~50min | 4 tasks | ~30 files |
+| Phase 06.2 P04 | ~45min | 2 tasks | 21 files |
 
 ## Accumulated Context
 
@@ -102,6 +104,10 @@ Progress: [##########] 60% of Phase 6.2 plans (3 of 5 plans complete; 5 of 8 top
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [06.2-04 Wave-2 MultiLogloss/MultiCrossEntropy COMPLETE — LOSS-02 multilabel CLOSED]: `Loss::MultiLogloss` + `Loss::MultiCrossEntropy` are the SAME upstream `TMultiCrossEntropyError` per-dimension DIAGONAL der (`error_functions.h:781-820`; dispatch `tensor_search_helpers.cpp:236-238`), two enum names → ONE shared `cb_compute::multi_crossentropy_ders` helper (`der1 = target_d - sigmoid(approx_d)`, `der2 = -sigmoid*(1-sigmoid)`, der2 uses derRef BEFORE the target add). Fully SEPARABLE → reuse the scalar sigmoid + the EXISTING per-dimension scalar Newton leaf step (the OneVsAll precedent), NO softmax coupling, NO new machinery, NO new crate. The ONLY difference between the two losses is the admissible target range (MultiLogloss `{0,1}` / MultiCrossEntropy `[0,1]`), validated at train time (T-6.2-04a). MULTILABEL TARGET PLUMBING (the key Wave-2 difference from Wave-1): the target is DIM-MAJOR length `dim*n` (one label per dimension per object), NOT the per-object class index of multiclass — so `train` derives the object count `n` from the feature columns (`feature_values[0].len()`, not `target.len()`) and `approx_dimension = target.len()/n` (label-set width, `approx_dimension.cpp:22-23`); `compute_gradients` relaxes its `target.len()==n` check for the two multilabel losses and dispatches `compute_multilabel_gradients` over the dim-major target. `MultiClassKind::MultiLabel` = per-dim sigmoid `Probability` (shares the OneVsAll transform; independent binary label probabilities, no Class argmax). Two frozen fixtures (`multilogloss/`, `multicrossentropy/`) from catboost 1.2.10 on a 3-NESTED-y-quantile binary label target (`leaf_estimation_iterations:1` pinned — upstream multilabel default is Newton/10, Pitfall 2); per-stage oracle Splits/LeafValues/StagedApprox/Predictions <=1e-5 for BOTH. FIXTURE-DESIGN GOTCHA (resolved): the initial one-feature-per-label target made the level-0 multi-dim Cosine scores of feat0/feat1 EXACTLY tied → upstream picked feat0 (first-wins), Rust picked feat1 by an ULP → Splits flipped; fixed by switching to a single-signal NESTED y-quantile target with a clear split-score winner per level. D-04 scalar suite + Wave-1 multiclass oracle STILL GREEN (cb-train --tests 0 failures, cb-compute 81, cb-backend 22, cb-model 15). gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits `7372756` (der+plumbing) / `1b26ad5` (predict+fixtures+oracle).
+
+- [06.2-03 Wave-1 MultiClass/OneVsAll COMPLETE — LOSS-02 multiclass members closed]: `Loss::MultiClass` (softmax, the ONLY cross-dim-coupled loss: PACKED symmetric Hessian + hand-rolled per-leaf SPD Newton solve transcribing `hessian.cpp:22-52`, trace-epsilon at `f32::EPSILON`, NO new linalg crate) + `Loss::MultiClassOneVsAll` (separable per-dim diagonal sigmoid). Multi-dim split score = SINGLE shared num/den accumulator across dims (Cosine couples inside sqrt), dim inferred from `der1.len()/n_objects` so dim=1 is BIT-identical to the scalar split score. Class labels remapped to `[0,k)`; softmax/sigmoid predict transforms + `MultiClassKind`. Default score_function Cosine (NOT scalar L2). Per-stage oracle <=1e-5 for BOTH; D-04 scalar suite green. Commits `c67d4d0`/`d493a17`/`5e0a42f`.
 
 - [06.2-02 Wave-0 train/model tier COMPLETE — D-04 HARD CHECKPOINT GREEN; WAVE 0 CLOSED]: The `cb-train` boosting loop now carries the DIMENSION-MAJOR approx buffer `approx[d*n+i]` (length `approx_dimension*n`) at every seam — init `vec![bias; approx_dimension*n]`, gradient call `compute_gradients(...,approx_dimension)`, per-object weighting `idx%n`, per-dimension `compute_leaf_deltas` over `approx[d*n..d*n+n]` (OUTER `for d` loop, NEVER fused into `0..dim*n` — Pitfall 1), per-dimension approx update, staged record. `loss_approx_dimension(&Loss)=1` for all scalar losses (multi-output losses override it in 03..05). Per-tree `leaf_values` stored dim-major `leaf_values[d*n_leaves+l]`. `cb_train::Model` + `cb_model::Model` gained `approx_dimension: usize` (default 1). cb-model `.cbm`/json serialization: `ApproxDimension` reads the real dim (NOT hardcoded 1); dim-major training buffer transposed to LEAF-MAJOR `leaf_values[l*dim+d]` on save, un-transposed on load via SEPARATE value (stride `leaf_count*dim`) / weight (stride `leaf_count`) cursors; per-dim bias vector `[1,[b0,..]]`; `leaf_weights` one-per-leaf. At dim=1 leaf-major==dim-major so the wire is byte-identical. D-04 GATE GREEN: `ndim_dim1_identity_test` asserts `== 0.0` (not <=1e-5) on staged approx + leaf values; the FULL `cb-train --tests` scalar oracle suite (slice_first/leaf_methods/wave1-3/one_hot/ordered_boost_e2e/tensor_ctr_e2e/plain_ctr/ordered_ctr/regularization/overfit/eval_metrics/...) + cb-model round-trip oracles re-run green at dim=1 (0 failures); cb-backend 22; cb-train --lib 141. MVS norm + tree.rs cross-dim split-score + predict.rs per-dim transforms DEFERRED to 06.2-03 (neutral at dim=1 / bootstrap=No, Pitfall 7). NO new loss math. gsd-tools CLI ABSENT -> STATE/ROADMAP/VALIDATION updated MANUALLY. `wave_0_complete: true` set — Wave 1 unblocked.
 - [06.2-01 Wave-0 compute tier COMPLETE]: `Loss` Copy derive DROPPED now (before any new variant) so the Wave-3 `MultiQuantile{alpha:Vec<f64>}` non-Copy ripple is a ONE-TIME refactor — `Clone` retained, by-value sites take `&Loss` (cb-train `autolr_target_type`/`validate_leaf_method`/`compute_leaf_deltas`/`EvalMetric::for_loss`) and `catboost-rs::CatBoostBuilder` drops `Copy` + clones `loss` into `BoostParams`. `Runtime::compute_gradients` + `CpuBackend` gained `approx_dimension: usize` (after `target`); `approx` is the dim-major flat buffer `approx[d*n+i]` (D-6.2-01), validated `len % dim == 0` + `target.len()==n` with typed `CbError::LengthMismatch` (T-6.2-01a, no panic). The backend runs an OUTER `for d in 0..approx_dimension` loop over `approx[d*n..d*n+n]` reusing the EXISTING per-loss kernel launchers (extracted to `compute_gradients_one_dim`) — NOT fused into a single `0..dim*n` launch (RESEARCH Pitfall 1), so at dim=1 the output is byte-identical to the pre-6.2 scalar path. NO new Loss variant, NO loss math touched (loss.rs git-clean). cb-train still calls with `approx_dimension=1` (N-dim approx-buffer threading is 06.2-02). Unit gates green: cb-compute 69, cb-backend 22 (incl. new dim=1 byte-identity + multi-dim concat + shape-error tests), cb-train 141; workspace compiles. D-04 full ~38-fixture re-lock is 06.2-02's gate, not this plan's. gsd-tools CLI ABSENT -> STATE/ROADMAP updated MANUALLY.
@@ -232,7 +238,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-16T08:07:05.295Z
+Last session: 2026-06-16T11:00:00.000Z
 Stopped at: Phase 6.2 context gathered
 Stopped at (prior): Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
 Stopped at (prior): Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created.
