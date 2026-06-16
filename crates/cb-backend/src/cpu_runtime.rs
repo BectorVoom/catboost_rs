@@ -28,6 +28,11 @@ use crate::kernels::{
     tweedie_gradient_kernel, tweedie_hessian_kernel,
 };
 
+/// Launch geometry: threads per cube (the cube `x` dimension) shared by every
+/// launch helper below. Extracted to a single constant (IN-02) so the launch
+/// geometry lives in one place instead of being repeated verbatim per helper.
+const CUBE_DIM: usize = 32;
+
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
 /// the actual CubeCL client is created per call from the default device (the
 /// CPU runtime's client construction is cheap and stateless for this slice).
@@ -49,7 +54,7 @@ fn launch_binary_f64(
     let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let cube_dim = 32usize;
+    let cube_dim = CUBE_DIM;
     let num_cubes = n.div_ceil(cube_dim).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
@@ -160,7 +165,7 @@ fn launch_logloss_hessian(approx: &[f64]) -> Vec<f64> {
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let cube_dim = 32usize;
+    let cube_dim = CUBE_DIM;
     let num_cubes = n.div_ceil(cube_dim).max(1);
 
     logloss_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
@@ -192,7 +197,7 @@ fn launch_poisson_hessian(approx: &[f64]) -> Vec<f64> {
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let cube_dim = 32usize;
+    let cube_dim = CUBE_DIM;
     let num_cubes = n.div_ceil(cube_dim).max(1);
 
     poisson_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
@@ -235,7 +240,7 @@ fn launch_focal_f64(
     let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
     let gamma_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![gamma]));
 
-    let cube_dim = 32usize;
+    let cube_dim = CUBE_DIM;
     let num_cubes = n.div_ceil(cube_dim).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
@@ -293,7 +298,7 @@ fn launch_quantile_f64(approx: &[f64], target: &[f64], alpha: f64, delta: f64) -
     let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
     let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
 
-    let cube_dim = 32usize;
+    let cube_dim = CUBE_DIM;
     let num_cubes = n.div_ceil(cube_dim).max(1);
 
     quantile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
@@ -355,7 +360,7 @@ fn launch_param_f64(
     // ScalarArgType bound).
     let param_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![param]));
 
-    let cube_dim = 32usize;
+    let cube_dim = CUBE_DIM;
     let num_cubes = n.div_ceil(cube_dim).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
