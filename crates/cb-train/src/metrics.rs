@@ -45,6 +45,13 @@ pub enum EvalMetric {
     Rmse,
     /// Weighted cross-entropy over `p = sigmoid(approx)`.
     Logloss,
+    /// Mean squared logarithmic error (metric-ONLY, D-6.1-06): `sum_w (log(1+
+    /// approx) - log(1+target))^2 / sum_w`. MSLE is NOT a trainable objective
+    /// upstream (`enum_helpers.cpp:200,533-549`) — it has no `Loss` variant and is
+    /// selected only via an explicit `eval_metric`, never as an objective default
+    /// (`EvalMetric::for_loss` has no MSLE arm). The approx is RAW (`isExpApprox`
+    /// asserted false upstream, `metric.cpp:1912`).
+    Msle,
 }
 
 impl EvalMetric {
@@ -156,6 +163,30 @@ impl EvalMetric {
                     })
                     .collect();
                 Ok(sum_f64(&weighted_ce) / total_weight)
+            }
+            Self::Msle => {
+                // sum_w (log(1+approx) - log(1+target))^2 / sum_w, approx RAW
+                // (`metric.cpp:1899-1926`: error.Stats[0] += Sqr(log(1+approx) -
+                // log(1+target))*w; GetFinalError = Stats[0]/(Stats[1]+1e-38)).
+                // NOT sqrt'd — MSLE is the MEAN squared log error (cf. RMSLE).
+                // Log-domain guard (T-06.1.02-03): `1+approx` / `1+target` must be
+                // strictly positive, else the `ln` is a domain violation (NaN);
+                // surface a typed CbError rather than leaking a NaN to the gate
+                // (mirrors the Logloss clamp discipline; never `unwrap`/panic).
+                let mut weighted_sq: Vec<f64> = Vec::with_capacity(approx.len());
+                for (i, (&a, &t)) in approx.iter().zip(target.iter()).enumerate() {
+                    let one_plus_a = 1.0 + a;
+                    let one_plus_t = 1.0 + t;
+                    if !(one_plus_a > 0.0) || !(one_plus_t > 0.0) {
+                        return Err(CbError::Degenerate(format!(
+                            "MSLE log-domain violation at object {i}: 1+approx={one_plus_a}, \
+                             1+target={one_plus_t} (both must be > 0)"
+                        )));
+                    }
+                    let d = one_plus_a.ln() - one_plus_t.ln();
+                    weighted_sq.push(weight_at(i) * d * d);
+                }
+                Ok(sum_f64(&weighted_sq) / total_weight)
             }
         }
     }

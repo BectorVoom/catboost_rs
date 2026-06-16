@@ -114,3 +114,67 @@ fn empty_history_primary_is_empty() {
     assert!(h.is_empty());
     assert!(h.primary().is_empty());
 }
+
+// --- MSLE eval-metric (metric-only, D-6.1-06) ------------------------------
+
+/// MSLE = mean_w( (log(1+approx) - log(1+target))^2 ) over a hand-computed
+/// unweighted set (NOT sqrt'd — it is the MEAN squared log error).
+#[test]
+fn msle_unweighted_hand_computed() {
+    // approx = [e-1, e^2-1], target = [0, 0] -> 1+approx = [e, e^2], 1+target=1.
+    // log diffs = [1, 2], squares = [1, 4], mean = 2.5.
+    let approx = [std::f64::consts::E - 1.0, std::f64::consts::E.powi(2) - 1.0];
+    let target = [0.0, 0.0];
+    let got = EvalMetric::Msle.eval(&approx, &target, &[]).unwrap();
+    assert!((got - 2.5).abs() < 1e-12, "got {got}");
+}
+
+/// MSLE is 0 when approx == target (perfect prediction).
+#[test]
+fn msle_zero_on_exact_match() {
+    let approx = [1.0, 2.0, 3.5];
+    let target = [1.0, 2.0, 3.5];
+    let got = EvalMetric::Msle.eval(&approx, &target, &[]).unwrap();
+    assert!(got.abs() < 1e-12, "got {got}");
+}
+
+/// MSLE weighted mean routes through the weight column.
+#[test]
+fn msle_weighted_hand_computed() {
+    // 1+approx = [e, e^2], 1+target = [1, 1]; log diffs [1, 2], sq [1, 4].
+    // weights [3, 1]: sum_w sq = 3*1 + 1*4 = 7; total_weight = 4; mean = 1.75.
+    let approx = [std::f64::consts::E - 1.0, std::f64::consts::E.powi(2) - 1.0];
+    let target = [0.0, 0.0];
+    let got = EvalMetric::Msle.eval(&approx, &target, &[3.0, 1.0]).unwrap();
+    assert!((got - 1.75).abs() < 1e-12, "got {got}");
+}
+
+/// MSLE log-domain violation (1+approx <= 0) returns a typed error, never NaN /
+/// panic (T-06.1.02-03).
+#[test]
+fn msle_log_domain_violation_is_error() {
+    // 1+approx = 1 + (-2) = -1 < 0 -> domain violation.
+    let approx = [-2.0];
+    let target = [0.0];
+    assert!(EvalMetric::Msle.eval(&approx, &target, &[]).is_err());
+    // 1+target = 1 + (-1.5) = -0.5 < 0 -> domain violation.
+    let approx2 = [0.0];
+    let target2 = [-1.5];
+    assert!(EvalMetric::Msle.eval(&approx2, &target2, &[]).is_err());
+}
+
+/// MSLE is NOT a default for any objective — `for_loss` never returns it (MSLE is
+/// metric-only, selected explicitly via eval_metric).
+#[test]
+fn msle_is_never_a_for_loss_default() {
+    for loss in [
+        Loss::Rmse,
+        Loss::Mae,
+        Loss::Logloss,
+        Loss::Poisson,
+        Loss::Tweedie { variance_power: 1.5 },
+        Loss::Mape,
+    ] {
+        assert_ne!(EvalMetric::for_loss(loss), EvalMetric::Msle);
+    }
+}
