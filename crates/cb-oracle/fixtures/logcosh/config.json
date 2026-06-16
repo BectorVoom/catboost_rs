@@ -1,0 +1,43 @@
+{
+  "boost_from_average": false,
+  "bootstrap_type": "No",
+  "catboost_version": "1.2.10",
+  "der_note": "LogCosh der1=-tanh(approx-target), der2=-1/cosh^2(approx-target) (error_functions.h:405-425). Lq der1=q*sign(target-approx)*|approx-target|^(q-1), der2=-q*(q-1)*|target-approx|^(q-2) (error_functions.h:539-568). Huber der1=|diff|<delta?diff:sign*delta, der2=|diff|<delta?-1:0, diff=target-approx (error_functions.h:1596-1632). Expectile der1=(e>0)?2a*e:2(1-a)*e, der2=(e>0)?-2a:-2(1-a), e=target-approx (error_functions.h:500-537).",
+  "input_dataset": "numeric_tiny",
+  "leaf_estimation_iterations": 1,
+  "leaf_estimation_method": "Exact",
+  "leaf_method_note": "leaf_estimation_method PINNED per upstream default (Pitfall 2): LogCosh=Exact (catboost_options.cpp:65-70, NOT Newton); Lq(q=2.0)=Newton (q>=2 Newton-clean der2, Pitfall 6); Huber=Newton (catboost_options.cpp:187-192); Expectile=Newton with leaf_estimation_iterations:1 PINNED (override upstream default 5, Pitfall 3).",
+  "loss_function": "LogCosh",
+  "n_features": 4,
+  "n_iterations": 5,
+  "n_rows": 50,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Exact",
+    "learning_rate": 0.1,
+    "loss_function": "LogCosh",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "requirement": "LOSS-03",
+  "scenario": "logcosh",
+  "score_function": "L2",
+  "seed": 0,
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw approximant)",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox"
+  ],
+  "thread_count": 1,
+  "wave": 1
+}

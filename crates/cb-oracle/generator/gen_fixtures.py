@@ -2037,6 +2037,151 @@ def gen_tensor_ctr_e2e() -> None:
         fh.write("\n")
 
 
+# Phase-06.1 (Plan 06.1-01, Wave 1, LOSS-03) smooth-regression-loss fixture root.
+# The four smooth losses with a REAL der2 — LogCosh, Lq{q}, Huber{delta},
+# Expectile{alpha} — each trained on the frozen numeric_tiny corpus with the D-07
+# isolating params and the per-loss leaf method PINNED per upstream default
+# (RESEARCH Pitfall 2/3/6): LogCosh=Exact (not Newton), Lq(q>=2)/Huber/Expectile=
+# Newton, leaf_estimation_iterations:1 pinned (Expectile overrides the upstream
+# default of 5 — cb-train is single-step). Generated OFFLINE / RUN-ONCE; CI only
+# READS the committed model.json/staged.npy (D-12).
+WAVE1_SMOOTH = FIXTURES / "logcosh"  # parent dir is FIXTURES; per-loss subdirs below
+
+
+def gen_wave1_smooth_losses() -> None:
+    """logcosh/ lq/ huber/ expectile/ — the Wave-1 smooth-regression-loss oracle
+    (LOSS-03, Plan 06.1-01). Each scenario trains a CatBoostRegressor on the
+    frozen `numeric_tiny` corpus with the D-07 simplified isolating params, the
+    per-loss `leaf_estimation_method` PINNED per the upstream default (NOT the
+    auto-default switch — Pitfall 2), and `leaf_estimation_iterations:1` PINNED
+    (Pitfall 3 — cb-train is single-step; this overrides Expectile's upstream
+    default of 5). All on depth 2, 5 iterations, lr 0.1, l2 3.0, bootstrap_type
+    No, random_strength 0, score_function L2, boost_from_average False,
+    random_seed 0, thread_count 1.
+
+    Per-loss config (RESEARCH Wave-1 table, error_functions.h):
+      - logcosh : loss_function='LogCosh', leaf_estimation_method='Exact'
+        (catboost_options.cpp:65-70 default Exact, NOT Newton — Pitfall 2).
+      - lq      : loss_function='Lq:q=2.0' (q>=2 so der2 is Newton-clean,
+        Pitfall 6), leaf_estimation_method='Newton'.
+      - huber   : loss_function='Huber:delta=1.0', leaf_estimation_method='Newton'
+        (catboost_options.cpp:187-192).
+      - expectile: loss_function='Expectile:alpha=0.3', leaf_estimation_method=
+        'Newton', leaf_estimation_iterations:1 PINNED (override upstream 5).
+
+    boost_from_average is set to False for all four so the starting approx is 0
+    (the cb-train smooth-loss path does not boost-from-average for these losses;
+    bias 0 keeps the Rust oracle's starting approx trivially matched). Each
+    scenario saves config.json (full params recorded), model.json (splits +
+    leaf_values + leaf_weights), and staged.npy (per-iteration RawFormulaVal raw
+    approximant); stages=[Splits, LeafValues, StagedApprox].
+
+    OFFLINE / RUN-ONCE (D-12): catboost==1.2.10 is NOT importable in CI; this is
+    generated on a machine with the pinned catboost then COMMITTED. CI only READS
+    the committed artifacts.
+    """
+    x = np.load(INPUTS / "numeric_tiny" / "X.npy")
+    y = np.load(INPUTS / "numeric_tiny" / "y.npy")
+
+    # (name, loss_function, leaf_estimation_method). All four pin
+    # leaf_estimation_iterations:1 and boost_from_average=False below.
+    scenarios = [
+        ("logcosh", "LogCosh", "Exact"),
+        ("lq", "Lq:q=2.0", "Newton"),
+        ("huber", "Huber:delta=1.0", "Newton"),
+        ("expectile", "Expectile:alpha=0.3", "Newton"),
+    ]
+
+    for name, loss, estimator in scenarios:
+        scenario_dir = FIXTURES / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        # D-07 isolating params, overriding leaf_estimation_method + loss_function
+        # per scenario. leaf_estimation_iterations stays 1 (Pitfall 3).
+        params = {**ISOLATING_PARAMS}
+        params["leaf_estimation_method"] = estimator
+        params["loss_function"] = loss
+
+        model = CatBoostRegressor(boost_from_average=False, **params)
+        model.fit(x, y)
+
+        # --- Stage: Splits + LeafValues (model.json) ------------------------
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        # --- Stage: StagedApprox (raw approximant, RawFormulaVal) -----------
+        staged = [
+            np.asarray(p, dtype=np.float64)
+            for p in model.staged_predict(x, prediction_type="RawFormulaVal")
+        ]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        # --- Stage: Predictions (RawFormulaVal, to match staged final stage) -
+        predictions = _assert_f64(
+            np.asarray(
+                model.predict(x, prediction_type="RawFormulaVal"), dtype=np.float64
+            ),
+            "predictions",
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": name,
+            "requirement": "LOSS-03",
+            "wave": 1,
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "numeric_tiny",
+            "loss_function": loss,
+            "leaf_estimation_method": estimator,
+            "leaf_estimation_iterations": 1,
+            "boost_from_average": False,
+            "bootstrap_type": "No",
+            "score_function": "L2",
+            "params": {**params, "boost_from_average": False},
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "prediction_type": "RawFormulaVal",
+            "stages": ["Splits", "LeafValues", "StagedApprox"],
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (raw approximant)"
+            ),
+            "leaf_method_note": (
+                "leaf_estimation_method PINNED per upstream default (Pitfall 2): "
+                "LogCosh=Exact (catboost_options.cpp:65-70, NOT Newton); "
+                "Lq(q=2.0)=Newton (q>=2 Newton-clean der2, Pitfall 6); "
+                "Huber=Newton (catboost_options.cpp:187-192); "
+                "Expectile=Newton with leaf_estimation_iterations:1 PINNED "
+                "(override upstream default 5, Pitfall 3)."
+            ),
+            "der_note": (
+                "LogCosh der1=-tanh(approx-target), der2=-1/cosh^2(approx-target) "
+                "(error_functions.h:405-425). Lq der1=q*sign(target-approx)*"
+                "|approx-target|^(q-1), der2=-q*(q-1)*|target-approx|^(q-2) "
+                "(error_functions.h:539-568). Huber der1=|diff|<delta?diff:sign*delta, "
+                "der2=|diff|<delta?-1:0, diff=target-approx (error_functions.h:1596-1632). "
+                "Expectile der1=(e>0)?2a*e:2(1-a)*e, der2=(e>0)?-2a:-2(1-a), "
+                "e=target-approx (error_functions.h:500-537)."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
+def gen_wave1_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the Wave-1 smooth-loss fixtures
+    (logcosh/lq/huber/expectile) without re-running the full `main()` (which would
+    overwrite every committed Phase 2-5 fixture). Used by Plan 06.1-01."""
+    gen_wave1_smooth_losses()
+    print("Wrote Wave-1 smooth-loss oracle fixtures (logcosh/lq/huber/expectile)")
+
+
 def main() -> None:
     # Load the frozen numeric_tiny input corpus.
     x = np.load(INPUTS / "numeric_tiny" / "X.npy")
@@ -2155,6 +2300,10 @@ def main() -> None:
     gen_tensor_ctr_e2e()
     print(f"Wrote tensor_ctr_e2e oracle fixtures under {TENSOR_CTR_E2E}")
 
+    # --- Phase-06.1 Wave-1 smooth-loss fixtures (Plan 06.1-01, LOSS-03) ------
+    gen_wave1_smooth_losses()
+    print("Wrote Wave-1 smooth-loss oracle fixtures (logcosh/lq/huber/expectile)")
+
     # --- Wave-0 scenarios (A1-A5 resolution) --------------------------------
     gen_borders_quant()
     print(f"Wrote borders_quant oracle fixtures under {BORDERS_QUANT}")
@@ -2165,4 +2314,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    # `--wave1-only` regenerates ONLY the Plan 06.1-01 smooth-loss fixtures
+    # (logcosh/lq/huber/expectile), leaving every committed Phase 2-5 fixture
+    # untouched. Bare invocation regenerates everything (the RUN-ONCE full path).
+    if "--wave1-only" in sys.argv:
+        gen_wave1_only()
+    else:
+        main()
