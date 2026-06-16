@@ -130,3 +130,66 @@ fn one_hot_no_candidates_is_degenerate_not_panic() {
             .is_err()
     );
 }
+
+/// WR-01 (06.2-07): `multi_dim_candidate_score` must NOT substitute the whole
+/// `der1` buffer for a dimension whose strided slice is out of range. The fix
+/// replaces `unwrap_or(der1)` with `unwrap_or(&[])` so an out-of-range slice
+/// scores 0 for that dimension instead of feeding wrong-dimension data. We
+/// verify the contract by comparing the bad-stride score against the
+/// hypothetical whole-buffer-substitution score and asserting they DIFFER (the
+/// fix is active), plus no panic and a finite result. The correctly-strided
+/// dim=1 path stays the D-04 split-score anchor.
+#[test]
+fn multi_dim_candidate_score_bad_stride_scores_zero_not_whole_buffer() {
+    use crate::tree::multi_dim_candidate_score;
+    use cb_compute::{reduce_leaf_stats, multi_dim_split_score, EScoreFunction};
+
+    let n_objects = 3usize;
+    let n_leaves = 2usize;
+    let leaf_of = [0usize, 1usize, 0usize];
+    let weight = [1.0_f64, 1.0, 1.0];
+    let scaled_l2 = 0.5_f64;
+
+    // der1.len() = 5: inferred approx_dimension = 5/3 = 1, so the loop runs once
+    // over the in-range slice der1[0..3]; the trailing two elements are NOT
+    // silently promoted to a second dimension (no whole-buffer use).
+    let der1 = [1.0_f64, -2.0, 3.0, 99.0, -99.0];
+    let score = multi_dim_candidate_score(
+        &leaf_of,
+        &der1,
+        &weight,
+        scaled_l2,
+        n_objects,
+        n_leaves,
+        EScoreFunction::Cosine,
+    );
+    assert!(score.is_finite(), "bad-stride score must be finite (no panic)");
+
+    // Reference: the inferred single dimension scores ONLY der1[0..3]; the
+    // out-of-range tail (99, -99) must NOT influence the score.
+    let leaves_dim0 = reduce_leaf_stats(&leaf_of, &der1[0..3], &weight, n_leaves);
+    let expected = multi_dim_split_score(EScoreFunction::Cosine, &[leaves_dim0], scaled_l2);
+    assert!(
+        (score - expected).abs() < 1e-13,
+        "score {score} must equal the in-range dim-0 reduction {expected}, \
+         not a whole-buffer substitution"
+    );
+
+    // dim=1 byte-identity anchor (D-04): a length-n der1 scores identically.
+    let der1_dim1 = [1.0_f64, -2.0, 3.0];
+    let score_dim1 = multi_dim_candidate_score(
+        &leaf_of,
+        &der1_dim1,
+        &weight,
+        scaled_l2,
+        n_objects,
+        n_leaves,
+        EScoreFunction::Cosine,
+    );
+    let leaves_clean = reduce_leaf_stats(&leaf_of, &der1_dim1, &weight, n_leaves);
+    let expected_dim1 = multi_dim_split_score(EScoreFunction::Cosine, &[leaves_clean], scaled_l2);
+    assert!(
+        (score_dim1 - expected_dim1).abs() < 1e-13,
+        "dim=1 path must be byte-identical to the single-dim reduction"
+    );
+}

@@ -630,7 +630,7 @@ fn compute_softmax_gradients(
     target: &[f64],
     k: usize,
     n: usize,
-) -> (Vec<f64>, Vec<f64>) {
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
     let pk = k * (k + 1) / 2;
     let mut der1 = vec![0.0_f64; k * n];
     let mut der2_packed = vec![0.0_f64; n * pk];
@@ -641,6 +641,15 @@ fn compute_softmax_gradients(
             obj_approx[d] = approx.get(d * n + i).copied().unwrap_or(0.0);
         }
         let target_class = target.get(i).copied().unwrap_or(0.0) as usize;
+        // WR-05 (06.2-07): `softmax_ders` leaves der1 at `-p[d]` (no `+1`) when
+        // `target_class >= k`, silently producing a degenerate gradient. Reject
+        // an out-of-range class here so a mismatched (target, remap) pair fails
+        // loudly instead of training a no-`+1` softmax (loss.rs:478-499).
+        if target_class >= k {
+            return Err(CbError::OutOfRange(format!(
+                "MultiClass target_class {target_class} (object {i}) >= approx_dimension {k}"
+            )));
+        }
         let (od1, od2) = cb_compute::softmax_ders(&obj_approx, target_class);
         for d in 0..k {
             if let Some(slot) = der1.get_mut(d * n + i) {
@@ -653,7 +662,7 @@ fn compute_softmax_gradients(
             }
         }
     }
-    (der1, der2_packed)
+    Ok((der1, der2_packed))
 }
 
 /// Compute the MultiClassOneVsAll SEPARABLE per-dimension diagonal der1/der2 over
@@ -661,11 +670,25 @@ fn compute_softmax_gradients(
 /// one-vs-rest sigmoid with `der1 = δ(d == class_i) - sigmoid(approx_d)`,
 /// `der2 = -p*(1-p)` (`error_functions.h:746-779`). Both outputs are dimension-major
 /// length `k*n` (`buf[d*n + i]`), reusing the diagonal-loss leaf path per dimension.
-fn compute_onevsall_gradients(approx: &[f64], target: &[f64], k: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+fn compute_onevsall_gradients(
+    approx: &[f64],
+    target: &[f64],
+    k: usize,
+    n: usize,
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
     let mut der1 = vec![0.0_f64; k * n];
     let mut der2 = vec![0.0_f64; k * n];
     for i in 0..n {
         let class_i = target.get(i).copied().unwrap_or(0.0) as usize;
+        // WR-05 (06.2-07): reject an out-of-range class. With `class_i >= k` no
+        // dimension matches `d == class_i`, so every dimension would train the
+        // "rest" sigmoid — a degenerate all-negative one-vs-all target. Fail
+        // loudly instead (mirrors the softmax guard above).
+        if class_i >= k {
+            return Err(CbError::OutOfRange(format!(
+                "MultiClassOneVsAll target_class {class_i} (object {i}) >= approx_dimension {k}"
+            )));
+        }
         for d in 0..k {
             let a = approx.get(d * n + i).copied().unwrap_or(0.0);
             let (od1, od2) = cb_compute::multiclass_onevsall_ders(a, d == class_i);
@@ -677,7 +700,7 @@ fn compute_onevsall_gradients(approx: &[f64], target: &[f64], k: usize, n: usize
             }
         }
     }
-    (der1, der2)
+    Ok((der1, der2))
 }
 
 /// Compute the MultiQuantile SEPARABLE per-dimension der1/der2 over the
@@ -794,11 +817,11 @@ impl Runtime for CpuBackend {
         // reuse the scalar Newton leaf path per dimension.
         match loss {
             Loss::MultiClass => {
-                let (der1, der2) = compute_softmax_gradients(approx, target, approx_dimension, n);
+                let (der1, der2) = compute_softmax_gradients(approx, target, approx_dimension, n)?;
                 return Ok(Derivatives { der1, der2 });
             }
             Loss::MultiClassOneVsAll => {
-                let (der1, der2) = compute_onevsall_gradients(approx, target, approx_dimension, n);
+                let (der1, der2) = compute_onevsall_gradients(approx, target, approx_dimension, n)?;
                 return Ok(Derivatives { der1, der2 });
             }
             // MultiQuantile (Wave 3, D-6.2-05): K INDEPENDENT quantile dimensions.

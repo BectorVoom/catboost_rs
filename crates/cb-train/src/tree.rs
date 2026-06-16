@@ -409,7 +409,14 @@ fn multi_dim_candidate_score(
     let per_dim_leaves: Vec<Vec<LeafStats>> = (0..approx_dimension)
         .map(|d| {
             let base = d * n_objects;
-            let der1_d = der1.get(base..base + n_objects).unwrap_or(der1);
+            // WR-01 (06.2-07): on a stride mismatch (der1.len() not a multiple of
+            // n_objects, so this dimension's slice is out of range) fall back to an
+            // EMPTY slice — scoring 0 for this dimension — NOT `der1` (the whole
+            // buffer), which would silently feed a wrong-length, wrong-dimension
+            // slice into reduce_leaf_stats and produce a plausible-but-wrong score.
+            // The caller (compute_gradients) validates the shape upstream, so the
+            // correctly-strided path is unchanged (dim=1 byte-identical, D-04).
+            let der1_d = der1.get(base..base + n_objects).unwrap_or(&[]);
             reduce_leaf_stats(leaf_of, der1_d, weight, n_leaves)
         })
         .collect();

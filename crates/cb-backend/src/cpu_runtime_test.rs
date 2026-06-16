@@ -531,3 +531,46 @@ fn multiquantile_alpha_dim_mismatch_is_error_not_panic() {
         )
         .is_err());
 }
+
+/// WR-05 (06.2-07): `compute_softmax_gradients` must reject a `target_class >= k`
+/// with a typed `CbError` instead of silently producing the degenerate
+/// no-`+1` (`-p[d]`) gradient. A valid `target_class < k` still succeeds.
+#[test]
+fn multiclass_softmax_target_class_ge_k_is_error_not_degenerate() {
+    let n = 2usize;
+    let k = 3usize;
+    // dim-major approx (length k*n).
+    let approx = [0.1_f64, 0.2, -0.3, 0.4, 0.5, -0.6];
+    // Valid path: every class in [0, k).
+    let target_ok = [0.0_f64, 2.0];
+    assert!(CpuBackend
+        .compute_gradients(&Loss::MultiClass, &approx, &target_ok, k)
+        .is_ok());
+    assert_eq!(approx.len(), k * n);
+
+    // Out-of-range class (3 >= k=3) must be a typed error, NOT a trained
+    // degenerate softmax.
+    let target_oob = [0.0_f64, 3.0];
+    assert!(CpuBackend
+        .compute_gradients(&Loss::MultiClass, &approx, &target_oob, k)
+        .is_err());
+}
+
+/// WR-05 (06.2-07): the OneVsAll producer likewise rejects `target_class >= k`
+/// (no degenerate all-negative one-vs-rest target). Valid path still succeeds.
+#[test]
+fn multiclass_onevsall_target_class_ge_k_is_error_not_degenerate() {
+    let n = 2usize;
+    let k = 3usize;
+    let approx = [0.1_f64, 0.2, -0.3, 0.4, 0.5, -0.6];
+    let target_ok = [1.0_f64, 2.0];
+    assert!(CpuBackend
+        .compute_gradients(&Loss::MultiClassOneVsAll, &approx, &target_ok, k)
+        .is_ok());
+    assert_eq!(approx.len(), k * n);
+
+    let target_oob = [1.0_f64, 5.0];
+    assert!(CpuBackend
+        .compute_gradients(&Loss::MultiClassOneVsAll, &approx, &target_oob, k)
+        .is_err());
+}
