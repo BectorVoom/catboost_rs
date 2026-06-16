@@ -319,7 +319,7 @@ Plans:
   3. [x] MultiClass (softmax), MultiClassOneVsAll, MultiLogloss, MultiCrossEntropy each pass their oracle ≤1e-5 vs upstream catboost 1.2.10.
   4. [x] MultiQuantile (the multi-output member of LOSS-03, relocated from 6.1) produces its per-quantile outputs matching upstream ≤1e-5 on the N-dim approx path (06.2-05 — K independent Exact quantile dims, per-stage oracle Splits/LeafValues/StagedApprox/Predictions ≤1e-5).
 
-**Plans**: 5 plans in 5 waves (Wave 0 mechanical refactor split into 2 sequential plans — compute-tier then train/model-tier + D-04 re-lock; Waves 1-3 = one plan per loss family, each its own ≤1e-5 per-stage oracle gate, D-6.2-02)
+**Plans**: 5 plans in 5 waves + 2 gap-closure plans in Wave 5 (06.2-06/07 — close CR-01/CR-02) (Wave 0 mechanical refactor split into 2 sequential plans — compute-tier then train/model-tier + D-04 re-lock; Waves 1-3 = one plan per loss family, each its own ≤1e-5 per-stage oracle gate, D-6.2-02)
 Plans:
 **Wave 1**
 
@@ -334,6 +334,13 @@ Plans:
 **Wave 3** *(COMPLETE)*
 
 - [x] 06.2-05-PLAN.md — Wave 3: MultiQuantile (K independent Exact quantile dims reusing the 6.1 `exact_leaf_delta` per dim, `alpha:Vec<f64>` param); per-stage oracle ≤1e-5; closes LOSS-03 multi (D-6.2-05) — COMPLETE 2026-06-16 (Loss::MultiQuantile{alpha:Vec<f64>,delta} + per-dim quantile der reusing launch_quantile_f64 with alpha[d] + per-dim Exact leaf threading alpha[dim_index] into the UNCHANGED exact_leaf_delta; multiquantile per-stage oracle Splits/LeafValues/StagedApprox/Predictions ≤1e-5 vs catboost 1.2.10; full cb-train --tests suite green — scalar + multiclass + multilabel + multiquantile)
+
+**Wave 5** *(gap closure — CR-01 / CR-02 from 06.2-REVIEW.md; phase status `human_needed` → closing the two Criticals)*
+
+- [ ] 06.2-06-PLAN.md — Wave 5 (gap, cb-model): CR-01 public N-dim apply — `predict_raw_multi` (leaf-major `leaf*dim+d`, dim-major output, dim=1 byte-identical) wired through `apply_multiclass_prediction`, plus the `class_params`/`multiclass_params` deserialize round-trip (closes the 06.2-03 empty `class_to_label` stub); PUBLIC load-model→predict oracle for all 5 multi-output losses ≤1e-5 (LOSS-02, LOSS-03)
+- [ ] 06.2-07-PLAN.md — Wave 5 (gap, cb-train/cb-compute/cb-backend): CR-02 dim-major sampling corruption — per-object derivative aggregation (sqrt(sum_d wd^2), length n) feeding bootstrap/MVS, `derivatives_std_dev_from_zero` divisor corrected to n (CalcDerivativesStDevFromZeroPlainBoosting parity); folds in WR-05 (`target_class<k` typed bound) + WR-01 (`multi_dim_candidate_score` stride guard); regression test; D-04 + all 5 oracles re-locked
+
+WARNINGs deferred (latent, not gap-blocking; tracked for 6.2 hardening / 6.3 pre-work): WR-02 (MultiQuantile per-dim launch failure silently swallowed to zero gradient — mirrors the 6.1 WR-04 MAE pattern), WR-03 (oracle generator `target_rule` config contradicts the multilabel target code), WR-06 (`build_class_remap` total_cmp/dedup consistency), IN-01..04 (doc/comment cleanups).
 
 ### Phase 6.3: Ranking Losses & Metrics
 
