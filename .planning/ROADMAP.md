@@ -19,8 +19,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 4: Model, Serialization, SHAP & Rust API (First Full Oracle Lock)** - `.cbm` serialize/apply, SHAP/fstr, binary-clf + regression end-to-end ≤1e-5, Builder API
 - [x] **Phase 5: Ordered Boosting, Ordered CTR & Categoricals (High-Risk Parity Slice)** - Multi-permutation folds, ordered boosting, ordered CTR, one-hot, feature combinations (bar (c) / SC-1 / ORD-01 CLOSED by 05-19 — pc=4 e2e ≤1e-5)
 - [ ] **Phase 6: Full Loss & Feature Parity** (umbrella) - Multiclass/regression/ranking losses, text/embedding features, uncertainty, advanced fstr, custom objectives — split into 6.1–6.6 (D-01/D-02, narrowest-first)
-  - [ ] **Phase 6.1: Regression-Loss Matrix** - LOSS-03 (RMSE/MAE/Quantile/MultiQuantile/LogCosh/Huber/Poisson/Tweedie/MAPE/MSLE/Lq/Expectile), rides the scalar loop
-  - [ ] **Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor** - LOSS-02; N-dim approx refactor with a no-behavior-change checkpoint (D-03/D-04)
+  - [ ] **Phase 6.1: Regression-Loss Matrix** - LOSS-03 scalar matrix (RMSE/MAE/Quantile/LogCosh/Huber/Poisson/Tweedie/MAPE/MSLE/Lq/Expectile), rides the scalar loop; MultiQuantile → 6.2
+  - [ ] **Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor** - LOSS-02 + LOSS-03 MultiQuantile; N-dim approx refactor with a no-behavior-change checkpoint (D-03/D-04)
   - [ ] **Phase 6.3: Ranking Losses & Metrics** - LOSS-04, LOSS-05 over group_id/subgroup_id/pairs; C++ instrumentation for randomized losses
   - [ ] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8)
   - [ ] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first
@@ -285,10 +285,10 @@ Plans:
 **Goal**: Every named CatBoost regression loss trains end-to-end on the existing scalar boosting loop and passes its own per-stage oracle ≤1e-5 vs upstream catboost 1.2.10 — the narrowest, lowest-risk slice, landed before the N-dim refactor.
 **Mode:** mvp
 **Depends on**: Phase 5
-**Requirements**: LOSS-03
+**Requirements**: LOSS-03 (scalar matrix; MultiQuantile relocated to 6.2 — it is multi-output and rides the N-dim foundation)
 **Success Criteria** (what must be TRUE):
 
-  1. RMSE, MAE, Quantile, MultiQuantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile each train and produce predictions matching upstream catboost 1.2.10 ≤1e-5 (per-stage: splits/leaves/staged-approx + final prediction).
+  1. RMSE, MAE, Quantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile each train and produce predictions matching upstream catboost 1.2.10 ≤1e-5 (per-stage: splits/leaves/staged-approx + final prediction). (MultiQuantile is in 6.2.)
   2. der1/der2 for each loss are transcribed from upstream `error_functions.{h,cpp}` and self-oracled; all parity-critical summation routes through `cb-core::sum_f64`.
   3. The existing ~40 scalar oracles (Phases 3–5) stay green — new losses attach at the `cb-compute` `Loss` enum with no behavior change to existing losses.
   4. "etc." losses not explicitly named here are deferred-to-v2 (D-06), not silently in-scope.
@@ -300,12 +300,13 @@ Plans:
 **Goal**: Generalize the core train loop from scalar approx to N-dim (scalar = the dim=1 degenerate case), then implement multiclass/multilabel losses on the stable N-dim foundation — each oracle-locked ≤1e-5.
 **Mode:** mvp
 **Depends on**: Phase 6.1
-**Requirements**: LOSS-02
+**Requirements**: LOSS-02, LOSS-03 (MultiQuantile only — multi-output, lands on the N-dim foundation built here)
 **Success Criteria** (what must be TRUE):
 
   1. The train loop carries approx as a vector everywhere (matching upstream `TVector<TVector<double>>`); scalar losses run as dim=1. Single code path — no parallel scalar/multi-dim duplication (D-03).
   2. HARD CHECKPOINT (D-04): the pure mechanical refactor re-runs ALL existing scalar oracles green at dim=1 BEFORE any multiclass math is written — isolating refactor risk from new-loss risk.
   3. MultiClass (softmax), MultiClassOneVsAll, MultiLogloss, MultiCrossEntropy each pass their oracle ≤1e-5 vs upstream catboost 1.2.10.
+  4. MultiQuantile (the multi-output member of LOSS-03, relocated from 6.1) produces its per-quantile outputs matching upstream ≤1e-5 on the N-dim approx path.
 
 **Plans**: TBD
 

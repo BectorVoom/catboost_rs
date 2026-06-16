@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 6.1 (regression-loss-matrix) — NOT STARTED (Phase 5 complete; Phase 6 restructured into 6.1–6.6)
-Plan: 0 of TBD (run /gsd-discuss-phase 6.1 then /gsd-plan-phase 6.1)
-Status: Phase 6 roadmap restructure COMPLETE — ready to discuss/plan 6.1
-Last activity: 2026-06-16 -- Phase 6 split into sub-phases 6.1–6.6 (D-01/D-02); ROADMAP + REQUIREMENTS traceability remapped; six 06.x dirs created
+Phase: 6.1 (regression-loss-matrix) — CONTEXT GATHERED (ready to plan)
+Plan: 0 of TBD (run /gsd-plan-phase 6.1)
+Status: 6.1 context captured (06.1-CONTEXT.md); ready for planning
+Last activity: 2026-06-16 -- 6.1 discuss complete: MultiQuantile→6.2, grouped family waves, Loss enum-variant params + upstream defaults, Exact leaf est for non-smooth losses
 
-Progress: [          ] 0% (Phase 6.1 not yet planned; 5 of 8 top-level phases complete)
+Progress: [          ] 0% (Phase 6.1 planned next; 5 of 8 top-level phases complete)
 
 ## Performance Metrics
 
@@ -219,7 +219,8 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-15T12:29:38.400Z
-Stopped at: Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created. NEXT: /gsd-discuss-phase 6.1 (then /gsd-plan-phase 6.1).
+Stopped at: Phase 6.1 context gathered (2026-06-16) — 06.1-CONTEXT.md written. Decisions: MultiQuantile relocated 6.1→6.2 (multi-output, needs N-dim foundation; ROADMAP/REQUIREMENTS updated); grouped family waves with per-wave oracle gates (smooth → positive-domain/link → quantile); Loss params via the `Loss::Variant{params}` enum pattern + upstream `error_functions.h` defaults (string parsing → Phase 8); Exact leaf est for non-smooth Quantile/MAE/MAPE (research flag: confirm 03-02 Exact supports weighted α-quantile α≠0.5). NEXT: /gsd-plan-phase 6.1. Resume file: .planning/phases/06.1-regression-loss-matrix/06.1-CONTEXT.md.
+Stopped at (prior): Phase 6 roadmap restructure COMPLETE (2026-06-16) — Phase 6 split into umbrella + sub-phases 6.1–6.6 per 06-CONTEXT.md D-01/D-02; ROADMAP.md summary+details authored, REQUIREMENTS.md traceability remapped (LOSS-03→6.1, LOSS-02→6.2, LOSS-04/05→6.3, LOSS-07/08/09+LOSS-06unc→6.4, FEAT-01/02→6.5, FEAT-03/04/05/06+MODEL-05+MODEL-03→6.6), six 06.x phase dirs created.
 Stopped at (prior): Phase 6 context gathered (split into sub-phases 6.1-6.6 — roadmap restructure pending)
 Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
