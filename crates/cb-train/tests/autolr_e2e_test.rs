@@ -78,7 +78,7 @@ fn run_autolr_e2e(
     let iterations = 500usize;
 
     let params = BoostParams {
-        loss,
+        loss: loss.clone(),
         iterations,
         depth: 2,
         // Explicit value is IGNORED because auto_learning_rate == true and the
@@ -150,7 +150,7 @@ fn run_autolr_e2e(
 
     // 3. The rate the loop applied matches the upstream-selected rate (the same
     //    value the unit test pins) — proving the auto-LR path drove training.
-    let target_type = match loss {
+    let target_type = match &loss {
         Loss::Rmse => TargetType::Rmse,
         Loss::Logloss | Loss::CrossEntropy => TargetType::Logloss,
         Loss::Focal { .. } => TargetType::Logloss,
