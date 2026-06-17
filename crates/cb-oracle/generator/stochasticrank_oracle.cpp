@@ -194,12 +194,23 @@ static void StochasticRankNoiseStream(
         for (size_t d = 0; d < count; ++d) {
             noise[d] = transcribed::StdNormal(rng);
             scores[d] = shifted[d] + sigmaParam * noise[d];
+            // CR-01 (Plan 06.3-12): the f64 ground-truth fields (`noise`/`score`)
+            // MUST round-trip at full double precision so the fixture can back a
+            // ≤1e-5 gate for magnitudes >= 1. std::to_string(double) emits only ~6
+            // decimals after the point (< 1e-5 of usable precision at |x| >= 1), so
+            // serialize via "%.17g" — the SAME 17-sig-digit form the self-oracle
+            // already prints to stderr (line ~229). Integer fields stay
+            // std::to_string.
+            char noiseBuf[32];
+            std::snprintf(noiseBuf, sizeof(noiseBuf), "%.17g", noise[d]);
+            char scoreBuf[32];
+            std::snprintf(scoreBuf, sizeof(scoreBuf), "%.17g", scores[d]);
             LogLine("{\"event\":\"gauss_draw\",\"group\":" + std::to_string(groupIndex) +
                     ",\"sample\":" + std::to_string(sample) + ",\"doc\":" + std::to_string(d) +
-                    ",\"noise\":" + std::to_string(noise[d]) + "}");
+                    ",\"noise\":" + std::string(noiseBuf) + "}");
             LogLine("{\"event\":\"score\",\"group\":" + std::to_string(groupIndex) +
                     ",\"sample\":" + std::to_string(sample) + ",\"doc\":" + std::to_string(d) +
-                    ",\"score\":" + std::to_string(scores[d]) + "}");
+                    ",\"score\":" + std::string(scoreBuf) + "}");
         }
         std::vector<size_t> order(count);
         std::iota(order.begin(), order.end(), 0);
@@ -235,12 +246,20 @@ int main() {
     OpenLog();
     SelfOracle();
 
-    // Smallest instrumented unit: ONE group, 3 docs, num_estimations small.
-    const std::vector<double> approxes = {0.3, -0.4, 0.1};
-    const std::vector<double> targets = {2.0, 0.0, 1.0};
+    // WR-05 (Plan 06.3-12): a NON-masking instrumented unit. The prior unit used
+    // mu = 0.0 — the degenerate case where the Stage-1 shift is identically zero,
+    // so the shifted[] sum is exactly 0 and the centering subtraction is a provable
+    // no-op (it never exercises the centering path). Here mu != 0 with graded
+    // targets makes the per-doc shift `sigma*mu*target` vary across docs, so the
+    // shifted sum is NON-zero and the centering subtraction is non-trivial. Widened
+    // to > 4 docs (5) so the Stage-1 centering fold is over a non-degenerate input.
+    // ONE group, num_estimations minimal — a non-degenerate centering input, not a
+    // large corpus.
+    const std::vector<double> approxes = {0.30, -0.40, 0.10, 0.55, -0.20};
+    const std::vector<double> targets = {2.0, 0.0, 1.0, 3.0, 1.0};
     const double sigma = 1.0;          // upstream default.
-    const double mu = 0.0;             // upstream default.
-    const int numEstimations = 1;      // upstream default.
+    const double mu = 0.5;             // non-zero: a small graded shift (non-masking).
+    const int numEstimations = 1;      // minimal.
     const uint64_t randomSeed = 5;     // group 0 seed = randomSeed + 0.
 
     const int groupIndex = 0;
