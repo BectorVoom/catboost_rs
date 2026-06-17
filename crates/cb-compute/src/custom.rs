@@ -50,8 +50,11 @@ use cb_core::CbResult;
 /// RMSE `der1 = target - approx`, `der2 = -1`; Logloss `der1 = target -
 /// sigmoid(approx)`, `der2 = -p*(1-p)`). The rest of the pipeline (leaf
 /// estimation, tree search) is loss-agnostic and consumes the resulting
-/// derivative buffer unchanged; the default leaf-estimation method for a custom
-/// objective is Newton (der2 is provided), matching the RMSE/Logloss defaults.
+/// derivative buffer unchanged. The leaf-estimation method is the
+/// CALLER-SELECTED [`crate::runtime`] leaf method (the Builder default is
+/// `Gradient`, which uses only der1); the user-supplied der2 is consumed ONLY
+/// when the caller selects the Newton leaf method. Provide der2 if you intend to
+/// train with Newton; under Gradient the der2 column is ignored (WR-02).
 ///
 /// `Send + Sync` is required so the handle can live inside a `Loss` shared
 /// across the (single-threaded in this phase, thread-safe by contract) train

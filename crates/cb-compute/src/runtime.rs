@@ -486,8 +486,10 @@ pub enum Loss {
     /// `#[derive(Debug, Clone, PartialEq)]` still compiles because the handle
     /// implements all three manually (`Arc::ptr_eq` identity equality;
     /// 06.4-RESEARCH Strand 3 / Pitfall 7). The custom der buffer is consumed by
-    /// the loss-agnostic leaf/tree pipeline unchanged; the default leaf method is
-    /// Newton/1-iter (der2 is provided). The Phase-8 PyO3 callback (D-09) wraps
+    /// the loss-agnostic leaf/tree pipeline unchanged; the leaf method is the
+    /// CALLER-SELECTED one (the Builder default is `Gradient`, which uses only der1
+    /// — the user-supplied der2 is consumed only under the Newton leaf method,
+    /// WR-02). The Phase-8 PyO3 callback (D-09) wraps
     /// the SAME trait — no `pyo3` dependency is added here.
     Custom(CustomObjectiveHandle),
 }
