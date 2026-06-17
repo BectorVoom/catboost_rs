@@ -425,7 +425,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 06.4-03-PLAN.md — Wave B (LOSS-06): 3 uncertainty prediction types (RmseWithUncertainty/VirtEnsembles/TotalUncertainty) + apply_virtual_ensembles; oracle ≤1e-5 (Phase-4 D-10 closed)
+- [x] 06.4-03-PLAN.md — Wave B (LOSS-06): 3 uncertainty prediction types (RmseWithUncertainty/VirtEnsembles/TotalUncertainty) + apply_virtual_ensembles; oracle ≤1e-5 (Phase-4 D-10 closed)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
