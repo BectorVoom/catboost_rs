@@ -88,3 +88,21 @@ the three corpus configs with `CB_INSTRUMENT_LOG`, freeze the per-stage `.npy` +
 **Also deferred (scoped out, not gap-blocking):** StochasticRank non-DCG metrics
 (PFound/ERR/MRR/FilteredDCG — admitted by the enum), YetiRank multi-thread (blockCount>1)
 block-seed partition (fixtures are single-thread).
+
+## [06.3-06] Pre-existing `clippy::indexing_slicing` errors in `stochastic_rank_group_der` (OUT OF SCOPE)
+
+**Status:** DEFERRED — pre-existing, NOT introduced by 06.3-06.
+
+`cargo clippy -p cb-compute --lib` reports 42 `error: indexing may panic` diagnostics
+inside the production `stochastic_rank_group_der` body (`ranking_der.rs` ~742-829:
+`noise[d]`, `scores[d]`, `cum_sum[pos+1]`, `cum_sum_up[..]`, `cum_sum_low[..]`,
+`order[pos]`, `der1[doc_id]`, etc.). Confirmed pre-existing: stashing the 06.3-06
+changes and re-running clippy on `HEAD` (00b299a) reproduces the identical 42-error
+count. The 06.3-06 edits (`calc_dcg_metric_diff` pos_weights read + `lambdamart_ideal_ndcg`
+sum_f64) add NO new indexing-panic sites — both use bounds-checked
+`.get(..).copied().unwrap_or(..)` / iterator forms. No git hook or pre-commit config
+gates clippy, so commits are unaffected. Out of scope per the executor scope-boundary
+rule (only auto-fix issues directly caused by the current task). Remediation: convert the
+`stochastic_rank_group_der` direct-index accesses to `.get(..).copied().unwrap_or(0.0)` in a
+dedicated hardening pass (touches the parity-critical DCG cumulative-stats loop, so it must
+be oracle-revalidated, not blind-fixed here).
