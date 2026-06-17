@@ -158,10 +158,31 @@ def _make_pool(x: np.ndarray, y: np.ndarray):
     )
 
 
+# StochasticRank requires an EXPLICIT target metric in its loss spec
+# (`StochasticRank:metric=<DCG|NDCG|...>`). The prior corpus config did NOT pin
+# one, so no model.json could be trained. We pin DCG to match the Rust
+# `StochasticRankMetric::Dcg` arm the end-to-end oracle drives (the DCG arm avoids
+# the per-iteration ideal-DCG renormalization NDCG layers on top, keeping the
+# trainer-level per-group noise gate the sole RNG variable). The full loss spec
+# string upstream parses is `StochasticRank:metric=DCG`.
+STOCHASTIC_RANK_METRIC = "DCG"
+
+
+def _loss_function_spec(loss: str) -> str:
+    """The exact `loss_function` string upstream parses for `loss`.
+
+    StochasticRank needs its target metric folded into the spec; every other
+    ranking loss is its bare name.
+    """
+    if loss == "StochasticRank":
+        return f"StochasticRank:metric={STOCHASTIC_RANK_METRIC}"
+    return loss
+
+
 def _pinned_params(loss: str) -> dict:
     """The uniform pinned param set for one ranking loss/objective."""
     return {
-        "loss_function": loss,
+        "loss_function": _loss_function_spec(loss),
         "iterations": ITERATIONS,
         "depth": DEPTH,
         "learning_rate": LEARNING_RATE,
@@ -188,7 +209,12 @@ def gen_loss(loss: str) -> None:
 
     x, y = _load_inputs()
     pool = _make_pool(x, y)
-    scenario = RANKING_CORPUS / loss
+    # The randomized losses (yetirank / stochasticrank) live under a LOWERCASE
+    # scenario dir (their model.json is the instrumented-trainer fixture the Rust
+    # oracle reads at `ranking_corpus/stochasticrank/`). The deterministic losses
+    # keep their PascalCase name. Honor the existing on-disk convention.
+    scenario_name = "stochasticrank" if loss == "StochasticRank" else loss
+    scenario = RANKING_CORPUS / scenario_name
     scenario.mkdir(parents=True, exist_ok=True)
 
     params = _pinned_params(loss)

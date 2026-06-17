@@ -94,3 +94,25 @@ with the precise failing step, and plans 13/14 would keep the PairLogit oracles
 `#[ignore]`'d and the YetiRank/StochasticRank `model.json` absent-fixture
 invariants in force — with NO weakened tolerance and NO fabricated fixtures.
 That branch did not occur; the build is GO.
+
+## Plan 06.3-18 GO record (StochasticRank D-07, 2026-06-17)
+
+**Decision: GO (option `reuse` → incremental rebuild).** Task 1 of plan 06.3-18
+(StochasticRank end-to-end ≤1e-5 + D-07 per-group noise gate) verified the
+persisted toolchain is intact and disk is healthy:
+
+| Precondition | State at 06.3-18 |
+|--------------|------------------|
+| clang-18 prefix | `/tmp/clang18_prefix/usr/bin/clang` → clang-18 present |
+| lld-18 | `/tmp/clang18_prefix/usr/lib/llvm-18/bin/ld.lld` present |
+| build tree | `/tmp/cb_build313` intact |
+| instrumented `_catboost.so` | `/tmp/cb_build313/instr_pkg/catboost/_catboost.so` (39.7 MB) present |
+| disk on `/` | ~60 GB free / 74% used — well above the 25 GB floor |
+
+The prior `srank_noise` hook (`error_functions.cpp`) emitted only
+`std::to_string`-precision noise with no per-group seed context. Plan 06.3-18
+upgraded it to a per-group event at `%.17g` carrying `seed` (= randomSeed +
+queryIndex, the per-group `TFastRng64` seed per error_functions.h:1257), `sample`,
+`doc`, `count` — the D-07 trainer-level ground truth distinct from the standalone
+single-group self-oracle. An INCREMENTAL rebuild (only the one TU recompiles)
+restages the `.so`; no fresh build, no toolchain re-fetch.
