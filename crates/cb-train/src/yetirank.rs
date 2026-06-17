@@ -138,14 +138,19 @@ pub fn sample_pairs(
     #[allow(clippy::cast_possible_truncation)]
     let query_weight_f32 = query_weight as f32;
     let denom = permutation_count as f32;
-    for winner in 0..query_size {
-        for loser in 0..query_size {
-            let w_f32 = query_weight_f32 * competitors_weights[winner][loser] / denom;
+    // Iterate by reference rather than raw `[]` indexing (workspace-denied
+    // clippy::indexing_slicing); `winner`/`loser` stay the dense-matrix indices via
+    // `enumerate`, so the numeric result is bit-identical to the indexed form.
+    for (winner, row) in competitors_weights.iter().enumerate() {
+        for (loser, &cw) in row.iter().enumerate() {
+            let w_f32 = query_weight_f32 * cw / denom;
             if w_f32 != 0.0 {
-                competitors[winner].push(Competitor {
-                    id: loser,
-                    weight: f64::from(w_f32),
-                });
+                if let Some(out_row) = competitors.get_mut(winner) {
+                    out_row.push(Competitor {
+                        id: loser,
+                        weight: f64::from(w_f32),
+                    });
+                }
             }
         }
     }
@@ -299,7 +304,14 @@ impl YetiRankTreeSeeder {
         // 2. derivative recalc: deriv_base -> GenRandUI64Vector(1, deriv_base)[0]
         //    is the randomSeed UpdatePairsForYetiRank receives.
         let deriv_base = self.rng.gen_rand();
-        let deriv_recalc_seed = gen_rand_ui64_vec(deriv_base, 1)[0];
+        // GenRandUI64Vector(1, ·) always yields exactly one element; bounds-check
+        // (clippy::indexing_slicing) rather than raw `[0]`. The `unwrap_or(deriv_base)`
+        // is unreachable for the hardcoded size 1 (debug_assert pins the invariant).
+        let deriv_recalc_seed = {
+            let v = gen_rand_ui64_vec(deriv_base, 1);
+            debug_assert_eq!(v.len(), 1, "GenRandUI64Vector(1, ·) must yield one seed");
+            v.first().copied().unwrap_or(deriv_base)
+        };
         let deriv = derive_per_tree_query_seeds(deriv_recalc_seed, self.group_count);
 
         // 3. per-level GreedyTensorSearch draws (consumed, output-irrelevant at
@@ -331,8 +343,19 @@ impl YetiRankTreeSeeder {
         // (approx_calcer.cpp:1147, BodyTailArr=1) — the seed `CalcApproxDeltaSimple`
         // passes verbatim to `UpdatePairsForYetiRank`.
         let learnfold_base = self.rng.gen_rand();
-        let learnfold_rs0 = gen_rand_ui64_vec(learnfold_base, 1)[0];
-        let learnfold_recalc_seed = gen_rand_ui64_vec(learnfold_rs0, 1)[0];
+        // Two GenRandUI64Vector(1, ·) layers; bounds-check both `[0]` reads
+        // (clippy::indexing_slicing). Each vec has exactly one element (size 1), so
+        // the `unwrap_or` fallbacks are unreachable — pinned by debug_assert.
+        let learnfold_rs0 = {
+            let v = gen_rand_ui64_vec(learnfold_base, 1);
+            debug_assert_eq!(v.len(), 1, "GenRandUI64Vector(1, ·) must yield one seed");
+            v.first().copied().unwrap_or(learnfold_base)
+        };
+        let learnfold_recalc_seed = {
+            let v = gen_rand_ui64_vec(learnfold_rs0, 1);
+            debug_assert_eq!(v.len(), 1, "GenRandUI64Vector(1, ·) must yield one seed");
+            v.first().copied().unwrap_or(learnfold_rs0)
+        };
         let learnfold = derive_per_tree_query_seeds(learnfold_recalc_seed, self.group_count);
 
         // 5. averaging-fold leaf-value recalc: leafval_base is the RAW
@@ -373,8 +396,12 @@ fn calc_weights_classic(
     let query_size = permutation.len();
     let mut decay_coefficient = 1.0_f64;
     for doc_id in 1..query_size {
-        let first = permutation[doc_id - 1];
-        let second = permutation[doc_id];
+        // doc_id in 1..query_size and query_size == permutation.len(), so both reads
+        // are provably in range; bounds-check (clippy::indexing_slicing) anyway,
+        // mirroring this file's stable_sort/add_weight `.get().copied().unwrap_or`
+        // discipline. The `unwrap_or(0)` fallbacks are unreachable here.
+        let first = permutation.get(doc_id - 1).copied().unwrap_or(0);
+        let second = permutation.get(doc_id).copied().unwrap_or(0);
         // upstream `Relevs` is `const float*`; the per-pair |Δrelev| is computed in
         // f32 (`Abs(Relevs[i] - Relevs[j])`). Cast the f64 corpus relevances to f32
         // first so the subtraction round matches.
