@@ -1180,6 +1180,68 @@ fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) 
     members.iter().map(|bucket| sum_f64(bucket)).collect()
 }
 
+/// `NormalizeLeafValues` (`approx_updater_helpers.cpp:8-21`, called from
+/// `train.cpp:562`): apply the per-tree leaf-value normalization upstream runs
+/// AFTER the leaf estimator and BEFORE storing the tree.
+///
+/// For a pairwise loss (`is_pairwise == UsesPairsForCalculation`) the leaf values
+/// are shifted by the DOCUMENT-WEIGHTED mean so the tree adds no constant offset
+/// (the pairwise objective is invariant to a global additive constant):
+/// ```text
+/// avg = Σ leafValue[l] * leafWeight[l] / Σ leafWeight[l]
+/// leafValue[l] = (|leafWeight[l]| > 1e-9) ? (leafValue[l] - avg) : 0
+/// ```
+/// Empty leaves (zero document weight) are forced to exactly `0`, NOT shifted.
+/// Then, for EVERY loss, each leaf value is scaled by `learning_rate` (this is the
+/// SINGLE place lr is applied — the leaf branches push RAW deltas). For a
+/// non-pairwise loss this reduces to the prior `learning_rate * delta` exactly
+/// (D-04). The weighted-mean accumulation routes through `cb_core::sum_f64`
+/// (D-08 — the single sanctioned strict left-to-right f64 fold).
+///
+/// `leaf_values` is dimension-major (`[d*n_leaves + l]`); the pairwise centering is
+/// per-dimension over each `n_leaves` slice (upstream `treeValues[0]`; pairwise
+/// losses are single-dimension so only dimension 0 exists, but the loop is dim-safe).
+/// `leaf_weights` is one-per-leaf (shared across dimensions).
+fn normalize_leaf_values(
+    is_pairwise: bool,
+    learning_rate: f64,
+    leaf_weights: &[f64],
+    leaf_values: &mut [f64],
+    n_leaves: usize,
+    approx_dimension: usize,
+) {
+    if is_pairwise {
+        let total_weight = sum_f64(leaf_weights);
+        if total_weight.abs() > 1e-9 {
+            for d in 0..approx_dimension {
+                let base = d * n_leaves;
+                // Document-weighted sum of this dimension's leaf values.
+                let weighted: Vec<f64> = (0..n_leaves)
+                    .map(|l| {
+                        let v = leaf_values.get(base + l).copied().unwrap_or(0.0);
+                        let w = leaf_weights.get(l).copied().unwrap_or(0.0);
+                        v * w
+                    })
+                    .collect();
+                let avg = sum_f64(&weighted) / total_weight;
+                for l in 0..n_leaves {
+                    if let Some(v) = leaf_values.get_mut(base + l) {
+                        let w = leaf_weights.get(l).copied().unwrap_or(0.0);
+                        if w.abs() > 1e-9 {
+                            *v -= avg;
+                        } else {
+                            *v = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for v in leaf_values.iter_mut() {
+        *v *= learning_rate;
+    }
+}
+
 /// Assign each object's LEAF-VALUE leaf index over the AVERAGING-fold CTR columns
 /// (ORD-05, research Q1/Q3 #3 — `train.cpp:130` `BuildIndices(AveragingFold)`).
 ///
@@ -2443,18 +2505,21 @@ fn train_inner<R: Runtime>(
         //    vector into the std-dev biases it low whenever `bootstrap_type != No`
         //    drops objects (CR-01) — fixed here by passing `&weighted_der1`.
         // L2 scaling uses `sumAllWeights / docCount` (`CalcDeltaNewtonBody`,
-        // `online_predictor.h:126`). For a pairwise loss `sumAllWeights` is the
-        // total PAIRWISE weight `Σ eff_weights` (each pair contributes its weight to
-        // both endpoints, so this is `2 × Σ competitor.weight`, upstream
-        // `fold.GetSumWeight()` over `bt.PairwiseWeights`), NOT the per-object sum;
-        // `docCount` stays `n`. For every non-pairwise loss `sum_pairwise_all ==
-        // sum_all_weights` so `scaled_l2` is byte-identical (D-04).
-        let sum_eff_weights = if uses_pairwise_weights(&params.loss) {
-            sum_f64(&eff_weights)
-        } else {
-            sum_all_weights
-        };
-        let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_eff_weights, n);
+        // `online_predictor.h:126`). `sumAllWeights` is upstream's
+        // `bt.BodySumWeight`, which `fold.cpp:170-172` defines as the sum of the
+        // per-object LEARN WEIGHTS (or `bodyFinish == docCount` when weights are
+        // empty) — the SAME for both the split-scoring L2 (`scoring.cpp:747-749`,
+        // `BodyTailArr[..].BodySumWeight`) and the leaf-value Newton/Gradient L2
+        // (`approx_calcer.cpp:811`, `bt.BodySumWeight`). It is the PER-OBJECT weight
+        // sum, NOT the pairwise-weight total — even for a pairwise loss. (06.3-13
+        // instrumented ground truth `PairLogit/per_leaf_der_log.jsonl`:
+        // `sum_all_weights == all_doc_count == 12`, the document count, with the
+        // Newton denom `-SumDer2 + l2*(12/12)`; the 06.3-09 `sum_eff_weights`
+        // pairwise-total scaling was wrong and diverged the Splits at index 6.) The
+        // PAIRWISE weight enters ONLY the histogram `sumWeight` (`score_weights` /
+        // `eff_weights`, `scoring.cpp:276-279`), never the L2 scaling. `docCount`
+        // stays `n`. For every non-pairwise loss this is byte-identical (D-04).
+        let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
         let perturb = if perturb_active {
             let model_length = iter as f64 * learning_rate;
             // CR-02: std-dev sums `wd²` over the FULL dim-major buffer but
@@ -2582,6 +2647,9 @@ fn train_inner<R: Runtime>(
         //    in leaf order (unchanged). The leaf_value leaf_of partition is shared
         //    across dimensions (the oblivious structure is one tree).
         let mut leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
+        // NOTE: each leaf branch below pushes RAW deltas (NO learning_rate); the
+        // `learning_rate` scale + pairwise weighted-mean centering are applied once,
+        // after the branches, by `normalize_leaf_values` (upstream order).
         if is_pairwise_scoring(&params.loss) {
             // PAIRWISE leaf path (LOSS-04 Wave B): the `*Pairwise` losses
             // (`IsPairwiseScoring`) solve their leaf VALUES via the Cholesky
@@ -2608,9 +2676,13 @@ fn train_inner<R: Runtime>(
                 params.l2_leaf_reg,
                 PAIRWISE_NON_DIAG_REG_DEFAULT,
             );
-            for delta in &deltas {
-                leaf_values.push(learning_rate * delta);
-            }
+            // RAW deltas (NO learning_rate yet): the `NormalizeLeafValues`
+            // weighted-mean centering + `learning_rate` scale are applied below,
+            // matching upstream `train.cpp:562` (NormalizeLeafValues runs AFTER the
+            // estimator, lr applied LAST inside it). The Cholesky path already did
+            // its own simple `MakeZeroAverage`; the weighted `NormalizeLeafValues`
+            // is the second, doc-weight-weighted centering upstream applies on top.
+            leaf_values.extend_from_slice(&deltas);
         } else if matches!(params.loss, Loss::MultiClass) {
             // MultiClass softmax: the COUPLED per-leaf symmetric Newton solve over
             // ALL dimensions at once (`ders.der2` is the PER-OBJECT packed Hessian
@@ -2628,9 +2700,10 @@ fn train_inner<R: Runtime>(
                 approx_dimension,
                 n,
             );
-            for delta in &deltas {
-                leaf_values.push(learning_rate * delta);
-            }
+            // RAW deltas (NO learning_rate yet); MultiClass is not a pairwise loss
+            // so `NormalizeLeafValues` below only applies the lr scale (byte-identical
+            // to the prior `learning_rate * delta`, D-04).
+            leaf_values.extend_from_slice(&deltas);
         } else {
             // Diagonal / separable losses (every scalar loss AND MultiClassOneVsAll):
             // solve each output dimension INDEPENDENTLY over its own approx/der slice
@@ -2671,9 +2744,8 @@ fn train_inner<R: Runtime>(
                     n_leaves,
                     d,
                 );
-                for delta in &leaf_deltas {
-                    leaf_values.push(learning_rate * delta);
-                }
+                // RAW deltas (NO learning_rate yet); see `NormalizeLeafValues` below.
+                leaf_values.extend_from_slice(&leaf_deltas);
             }
         }
 
@@ -2683,7 +2755,36 @@ fn train_inner<R: Runtime>(
         // SAME `leaf_value_leaf_of`, reduced ordered through cb_core::sum_f64 (D-08).
         // Leaf WEIGHTS are one-per-leaf (NOT per-dimension — the document partition
         // is shared across output dimensions), so this is unchanged at any dim.
-        let leaf_weights = accumulate_leaf_weights(&leaf_value_leaf_of, &eff_weights, n_leaves);
+        //
+        // 06.3-13: `leaf_weights` is upstream's `SumLeafWeights(GetWeights(TargetData))`
+        // (`train.cpp:456`) — the per-object DOCUMENT weight sum, NOT the pairwise
+        // weight total. For a pairwise loss the model.json `leaf_weights` are the
+        // document counts (`PairLogit` fixture tree0 `[8,3,0,1]` == 12 docs), so the
+        // accumulation uses the per-object `weights` (all 1.0 here), never
+        // `eff_weights` (`bt.PairwiseWeights`). For every NON-pairwise loss
+        // `eff_weights == weights` so this is byte-identical (D-04). These SAME
+        // doc-weight sums feed the `NormalizeLeafValues` weighted-mean centering below.
+        let leaf_weights = accumulate_leaf_weights(&leaf_value_leaf_of, &weights, n_leaves);
+
+        // NormalizeLeafValues (`approx_updater_helpers.cpp:8-21`, called from
+        // `train.cpp:562`): for a pairwise loss (`UsesPairsForCalculation` ==
+        // `uses_pairwise_weights`) subtract the DOCUMENT-WEIGHTED mean leaf value so
+        // the tree contributes no constant shift (the pairwise objective is invariant
+        // to a global additive constant). Empty leaves (|weight| <= 1e-9) are forced
+        // to exactly 0 (NOT shifted), matching upstream. The `learning_rate` scale is
+        // applied LAST, inside `NormalizeLeafValues`, for ALL losses. At dim=1 the
+        // single dimension's `n_leaves` slice is normalized in place. (06.3-13: this
+        // closes the PairLogit/PairLogitPairwise LeafValues parity — the instrumented
+        // ground truth `PairLogit/per_leaf_der_log.jsonl` per-leaf raw deltas minus
+        // this weighted mean reproduce the frozen model.json leaf values ≤1e-9.)
+        normalize_leaf_values(
+            uses_pairwise_weights(&params.loss),
+            learning_rate,
+            &leaf_weights,
+            &mut leaf_values,
+            n_leaves,
+            approx_dimension,
+        );
 
         // 4. Update approx: per dimension, `approx[d*n+i] += leaf_value[d][leaf(i)]`
         //    over the LEAF-VALUE leaf_of (so each iteration's der recompute is

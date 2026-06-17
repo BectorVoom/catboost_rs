@@ -112,20 +112,22 @@ fn base_params(loss: Loss) -> BoostParams {
     }
 }
 
-// DEFERRED (06.3-09 escalate-don't-weaken, D-6.3-03b precedent): the pairwise
-// split-scoring `sumWeight` (`bt.PairwiseWeights`) + L2 scaling are now wired
-// (06.3-09 Task 1), which advances the Splits match from index 4 to index 6.
-// The remaining gap is the PairLogit LEAF-der2 reduction parity isolated in
-// deferred-items.md [06.3-03]: for a single cross-leaf-pair leaf (e.g. object 10,
-// pair (10,11) split across leaves) the upstream Newton leaf delta is ~6x smaller
-// than `sumDer/(-sumDer2 + scaledL2)` predicts from the (verified-identical)
-// `TPairLogitError` der — a denominator inconsistency that no global L2 / pairwise
-// scaling reconciles across leaves. Resolving it requires the instrumented
-// catboost 1.2.10 trainer oracle (per-leaf SumDer2 log), which is INFEASIBLE this
-// session (toolchain/disk, MEMORY.md catboost-instrumented-trainer-build). The
-// tolerance is NOT weakened: this test runs the full <= 1e-5 gate the moment the
-// leaf-der2 parity lands. Remove `#[ignore]` then.
-#[ignore = "deferred: PairLogit leaf-der2 reduction parity needs the instrumented catboost trainer oracle (06.3-03 / D-6.3-03b)"]
+// CLOSED (06.3-13, GAP 1 / Truth #4): the PairLogit per-stage ≤1e-5 oracle now
+// runs the FULL gate (Splits|LeafValues|StagedApprox|Predictions) with NO
+// `#[ignore]` and NO weakened tolerance. The 06.3-10 instrumented catboost 1.2.10
+// trainer (GO) captured the per-leaf SumDer/SumDer2 ground truth
+// (`ranking_corpus/PairLogit/per_leaf_der_log.jsonl`), which proved TWO upstream
+// facts the prior diagnosis missed:
+//   1. The Newton denom is `-SumDer2 + l2*(sumAllWeights/docCount)` with
+//      `sumAllWeights == docCount == 12` (the per-OBJECT document weight sum, NOT
+//      the pairwise-weight total) — the 06.3-09 `sum_eff_weights` pairwise scaling
+//      diverged Splits at index 6; `sum_all_weights` fixes it.
+//   2. The "~6x" / "~23-denominator" anomaly was the MISSING `NormalizeLeafValues`
+//      (`approx_updater_helpers.cpp:8-21`): for a pairwise loss upstream subtracts
+//      the DOCUMENT-WEIGHTED mean leaf value (empty leaves forced to 0) BEFORE the
+//      learning_rate scale. The raw per-leaf deltas were correct all along
+//      (`leaf3` raw delta 0.1538 = 0.5/3.25); the centering is what makes the
+//      stored values match model.json (verified ≤1e-9 against the frozen fixture).
 #[test]
 fn pairlogit_oracle_per_stage() {
     let scenario = "ranking_corpus/PairLogit";
@@ -161,6 +163,16 @@ fn pairlogit_oracle_per_stage() {
         .unwrap_or_else(|e| panic!("PairLogit: splits diverged: {e:?}"));
     compare_stage(Stage::LeafValues, &model_json.leaf_values(), &model.leaf_values())
         .unwrap_or_else(|e| panic!("PairLogit: leaf values diverged: {e:?}"));
+
+    // REVIEW IN-01 (06.3-13): the model's per-tree `leaf_weights` are upstream's
+    // `SumLeafWeights(GetWeights(TargetData))` — the per-OBJECT document weight sum
+    // (counts here, all sample weight 1.0), NOT the pairwise-weight total. The
+    // frozen PairLogit fixture stores integer document counts (tree0 `[8,3,0,1]`);
+    // gate them ≤1e-5 now that this oracle executes (this is the SAME doc-weight
+    // vector that feeds the `NormalizeLeafValues` weighted-mean centering).
+    let expected_leaf_weights: Vec<f64> = model_json.leaf_weights().into_iter().flatten().collect();
+    compare_stage(Stage::LeafValues, &expected_leaf_weights, &model.leaf_weights())
+        .unwrap_or_else(|e| panic!("PairLogit: leaf weights (document counts) diverged: {e:?}"));
 
     let expected_staged = load_f64_vec(&fixture(&format!("{scenario}/staged.npy"))).unwrap();
     compare_stage(Stage::StagedApprox, &expected_staged, &staged)

@@ -134,3 +134,52 @@ rule (only auto-fix issues directly caused by the current task). Remediation: co
 `stochastic_rank_group_der` direct-index accesses to `.get(..).copied().unwrap_or(0.0)` in a
 dedicated hardening pass (touches the parity-critical DCG cumulative-stats loop, so it must
 be oracle-revalidated, not blind-fixed here).
+
+## [06.3-13] PairLogit CLOSED; PairLogitPairwise needs the pairwise SPLIT-scorer (DEFERRED)
+
+**Status:** GAP 1 / Truth #4 PARTIALLY CLOSED. `PairLogit` (the POINTWISE pairwise loss)
+is now GREEN end-to-end at ≤1e-5 (`pairlogit_oracle_test.rs`, `#[ignore]` removed, all four
+`compare_stage(Splits|LeafValues|StagedApprox|Predictions)` + a `leaf_weights` document-count
+assertion). `PairLogitPairwise` stays `#[ignore]`'d — root cause NEWLY ISOLATED, NOT the
+leaf-der theory the prior [06.3-03] comment assumed.
+
+**PairLogit fix (06.3-13, both from the 06.3-10 instrumented GO ground truth
+`ranking_corpus/PairLogit/per_leaf_der_log.jsonl`):**
+1. L2 split/leaf scaling uses `sum_all_weights` (per-object document weight sum == 12 ==
+   docCount), NOT the `sum_eff_weights` pairwise-weight total the 06.3-09 wiring used; the
+   pairwise total diverged Splits at index 6. Newton denom == `-SumDer2 + l2*(12/12)`.
+2. Added `normalize_leaf_values` (`NormalizeLeafValues`, `approx_updater_helpers.cpp:8-21`,
+   called `train.cpp:562`): for `uses_pairwise_weights` losses subtract the DOCUMENT-WEIGHTED
+   mean leaf value (empty leaves forced to 0) BEFORE the learning_rate scale. This — NOT a
+   leaf-der2 reduction — was the real cause of the prior "~6x" / "~23-denominator" anomaly;
+   the raw per-leaf deltas (e.g. leaf3 = 0.5/3.25 = 0.1538) were correct all along, only the
+   per-tree centering was missing. Also fixed the stored model `leaf_weights` to use the
+   per-object document weights (upstream `SumLeafWeights(GetWeights(TargetData))`), matching
+   the fixture integer counts `[8,3,0,1]`, not the pairwise-weight total.
+
+**PairLogitPairwise remaining gap (the TRUE root cause):** a SPLIT-SELECTION divergence, NOT
+leaf-der. With BOTH the `sum_all_weights` and `sum_eff_weights` L2 scalings the test diverges
+IDENTICALLY at tree-0 split index 1: upstream picks float feature 0 @ border
+1.6280884742736816, we pick float feature 1 @ border 1.8161416053771973 (|Δborder| ≈ 0.188).
+`*Pairwise` (`IsPairwiseScoring`) losses score splits through upstream's dedicated
+`TPairwiseScoreCalcer` / `CalculatePairwiseScore` (`pairwise_scoring.cpp`, ~440 lines: a
+per-candidate pairwise-weight matrix + regularized least-squares score over the group
+Competitors), whereas cb-train's split path reuses the POINTWISE der histogram. cb-train has
+NO pairwise SPLIT-scorer (the `pairwise_leaves.rs` Cholesky system is the LEAF-VALUE solver
+only). Closing this requires implementing the pairwise split-scoring subsystem (a new
+component — Rule 4 architectural scope) plus an instrumented split-score oracle; the 06.3-13
+ground truth captured ONLY the PairLogit pointwise per-leaf der, not pairwise split scores.
+**Escalate-don't-weaken:** tolerance unchanged, no fixture fabricated, `#[ignore]` retained
+with the precise divergence recorded in the test header.
+
+## [06.3-13] Pre-existing `clippy::indexing_slicing` error in `cb-backend` cpu_runtime (OUT OF SCOPE)
+
+**Status:** DEFERRED — pre-existing, NOT introduced by 06.3-13.
+
+`cargo clippy -p cb-train --lib` (which pulls in `cb-backend`) reports one
+`error: indexing may panic` at `crates/cb-backend/src/cpu_runtime.rs:674`
+(`obj_approx[d] = approx.get(d * n + i)...`). `cb-backend` is untouched by 06.3-13
+(`git status crates/cb-backend/` is empty), so this is pre-existing. No git hook gates clippy,
+so commits are unaffected. Out of scope per the executor scope-boundary rule (only auto-fix
+issues directly caused by the current task). Remediation: convert the `obj_approx[d]` write to
+a bounds-checked `get_mut` in a dedicated cb-backend hardening pass.
