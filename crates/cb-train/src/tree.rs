@@ -37,13 +37,32 @@ use cb_compute::{
 };
 
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
-/// catboost CPU supports exactly Cosine (default) and L2
-/// (`score_calcers.h`); selected per-config via [`EScoreFunction`].
+///
+/// catboost CPU supports exactly Cosine (default) and L2 (`score_calcers.h`);
+/// the five additional variants (`SolarL2`/`NewtonL2`/`NewtonCosine`/`LOOL2`/`SatL2`)
+/// are GPU-only upstream (D-6.4-06) and route through the single
+/// [`cb_compute::multi_dim_split_score`] seam (D-6.4-03 single code path) wrapped as a
+/// one-dimension call so the dim=1 fold is byte-identical to the scalar score. For the
+/// Newton variants the caller must supply `leaves` whose `sum_weight` slot already
+/// carries the summed positive der2 hessian (via
+/// [`cb_compute::reduce_leaf_stats_newton`]); for every first-order variant `sum_weight`
+/// is the weight count, exactly as today.
 #[inline]
 fn split_score(score_function: EScoreFunction, leaves: &[LeafStats], scaled_l2: f64) -> f64 {
     match score_function {
+        // Hot path: the two shipped CPU functions stay on the dedicated scalar calcers
+        // so the 05-19 Task A L2-vs-Cosine split lock is byte-identical (no-regression).
         EScoreFunction::Cosine => cosine_split_score(leaves, scaled_l2),
         EScoreFunction::L2 => l2_split_score(leaves, scaled_l2),
+        // The five GPU-only variants reuse the single multi-dim seam at dim=1.
+        EScoreFunction::SolarL2
+        | EScoreFunction::NewtonL2
+        | EScoreFunction::NewtonCosine
+        | EScoreFunction::LOOL2
+        | EScoreFunction::SatL2 => {
+            let per_dim = [leaves.to_vec()];
+            multi_dim_split_score(score_function, &per_dim, scaled_l2)
+        }
     }
 }
 use cb_core::{CbError, CbResult, TFastRng64};

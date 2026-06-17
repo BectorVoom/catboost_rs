@@ -120,6 +120,56 @@ pub fn reduce_leaf_der2(
         .collect()
 }
 
+/// Reduce per-object contributions into per-leaf [`LeafStats`] for a **second-order
+/// score function** (`NewtonL2` / `NewtonCosine`, `IsSecondOrderScoreFunction`,
+/// `enum_helpers.cpp:830-847`): the `sum_weighted_delta` slot carries the summed
+/// gradient exactly as [`reduce_leaf_stats`], but the `sum_weight` slot carries the
+/// summed **positive hessian** `Σ(-der2*weight)` instead of the weight count.
+///
+/// # Newton fill mechanism (D-6.4-03, RESEARCH Strand 1 "How der2 threads in")
+///
+/// The Newton split-score variants reuse the L2/Cosine score FORMULA verbatim
+/// (`pointwise_scores.cu:504-521`); only the histogram FILL differs — the calcer's
+/// `weight` slot is the summed hessian rather than the object/weight count. RMSE
+/// `der2 = -1` and Logloss `der2 = -p(1-p)` are both ≤0, so the per-object
+/// `der2 * weight` is negated to a POSITIVE hessian (Pitfall 2) before summation.
+/// `weighted_der2[i]` is object `i`'s `der2 * weight`; it is negated here so the
+/// caller passes the raw (≤0) weighted second derivative — the SAME column
+/// [`reduce_leaf_der2`] consumes for the Newton leaf delta.
+///
+/// `LeafStats` is UNCHANGED (this is a different FILL, not a different struct); the
+/// first-order functions (`Cosine`/`L2`/`SolarL2`/`LOOL2`/`SatL2`) keep calling
+/// [`reduce_leaf_stats`] (the `Σ weight` path) so the shipped 05-19 Task A
+/// L2-vs-Cosine split lock is byte-identical (no-regression, Pitfall 3). Both folds
+/// route through [`cb_core::sum_f64`] in canonical object order (D-05/D-08).
+#[must_use]
+pub fn reduce_leaf_stats_newton(
+    leaf_of: &[usize],
+    der1: &[f64],
+    weighted_der2: &[f64],
+    n_leaves: usize,
+) -> Vec<LeafStats> {
+    // Reuse the existing der1 fold (via `reduce_leaf_der2`, a plain Σ over each
+    // leaf's member column through `sum_f64`) for `sum_weighted_delta` (gradient
+    // sum), and the same fold over the weighted der2 column for the hessian, NEGATED
+    // to a positive hessian per leaf.
+    let sum_delta = reduce_leaf_der2(leaf_of, der1, n_leaves);
+    let sum_der2 = reduce_leaf_der2(leaf_of, weighted_der2, n_leaves);
+    (0..n_leaves)
+        .map(|leaf| {
+            let sum_weighted_delta = sum_delta.get(leaf).copied().unwrap_or(0.0);
+            // der2 is ≤0 for RMSE/Logloss; negate to the positive hessian the Newton
+            // denominator wants (Pitfall 2). `reduce_leaf_der2` already summed via
+            // sum_f64, so negating the total is order-faithful.
+            let positive_hessian = -sum_der2.get(leaf).copied().unwrap_or(0.0);
+            LeafStats {
+                sum_weighted_delta,
+                sum_weight: positive_hessian,
+            }
+        })
+        .collect()
+}
+
 /// Gather each leaf's per-member residuals (as `f32`, matching upstream's
 /// `TVector<float> leafSamples`) and weights, in ascending object order — the
 /// input the Exact-method quantile (`exact_leaf_delta`) consumes per leaf.
