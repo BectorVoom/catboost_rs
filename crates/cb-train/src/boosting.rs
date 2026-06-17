@@ -1847,6 +1847,42 @@ fn train_inner<R: Runtime>(
         None
     };
 
+    // StochasticRank per-tree RNG seeder (D-07 trainer-level closure, 06.3-18).
+    // StochasticRank is the OTHER randomized listwise loss, but its noise model is
+    // DISTINCT from YetiRank's pairwise re-sample: there are NO competitors — the
+    // per-group Gaussian noise stream is re-seeded each `CalcDersForQueries` with
+    // `recalc_seed + group_index` (`error_functions.h:1257`), where `recalc_seed`
+    // is the trainer's per-tree `randomSeed` argument. The PRIOR Rust path passed
+    // the FIXED `params.random_seed` to `compute_gradients_grouped` for EVERY tree,
+    // which matched the standalone single-group self-oracle but DIVERGED from the
+    // live trainer, whose persistent `LearnProgress->Rand(random_seed)` advances
+    // per tree through the structure draw, the derivative-recalc seed, the per-level
+    // split-search draws, the learning-fold seed and the leaf-value-recalc seed —
+    // yielding TWO fresh base recalc seeds per tree (a DERIVATIVE recalc seed and a
+    // LEAF-VALUE recalc seed; 10 base seeds across the 5-tree corpus). The per-tree
+    // main-RNG consumption is IDENTICAL to YetiRank's (verified bit-exact against
+    // the instrumented catboost 1.2.10 `stochasticrank_pertree_noise_groundtruth.jsonl`
+    // — `YetiRankTreeSeeder::next_tree().recalc_seeds[0]` is the DERIVATIVE base and
+    // `[2]` is the LEAF-VALUE base, both matching the GT cluster bases), so the SAME
+    // seeder drives both losses. StochasticRank consumes the two BASE recalc seeds
+    // directly (the per-group `+ group_index` offset is applied inside the grouped
+    // der), NOT the per-group YetiRank query seeds (which carry an extra block layer).
+    let is_stochasticrank = matches!(params.loss, Loss::StochasticRank { .. });
+    let mut stochasticrank_seeder: Option<crate::YetiRankTreeSeeder> = if is_stochasticrank {
+        // `group_count` only feeds the (unused-here) per-group YetiRank query-seed
+        // derivation; StochasticRank consumes the raw `recalc_seeds` bases, so any
+        // count yields identical bases. Pass the real group count for correctness.
+        let group_count = group_spans.as_ref().map_or(0, Vec::len);
+        Some(crate::YetiRankTreeSeeder::new(
+            params.random_seed,
+            group_count,
+            yetirank_n_candidate_features,
+            params.depth,
+        ))
+    } else {
+        None
+    };
+
     // N-dim approx buffer (D-6.2-01 / Plan 06.2-02). `approx_dimension` is the
     // number of output dimensions the loss produces. Every existing scalar loss
     // is single-dimension, so this is `1` until Plans 06.2-03..05 derive it per
@@ -2312,6 +2348,23 @@ fn train_inner<R: Runtime>(
         //    draws + the two recalc seeds) draw-for-draw, so the sampled competitors
         //    match the catboost fixture from tree 0 onward.
         let yetirank_tree_seeds = yetirank_seeder.as_mut().map(crate::YetiRankTreeSeeder::next_tree);
+
+        // StochasticRank per-tree recalc seeds (D-07, 06.3-18). Advance the persistent
+        // context RNG once for THIS tree (the SAME draw sequence as YetiRank), then
+        // take the two BASE recalc seeds the grouped der re-seeds the per-group noise
+        // stream with: `recalc_seeds[0]` is the DERIVATIVE recalc base (drives the
+        // gradient + split scoring), `recalc_seeds[2]` is the LEAF-VALUE recalc base
+        // (drives the AveragingFold leaf-value re-estimation). The grouped der applies
+        // the `+ group_index` per-group offset internally (`error_functions.h:1257`).
+        let stochasticrank_tree_seeds =
+            stochasticrank_seeder.as_mut().map(crate::YetiRankTreeSeeder::next_tree);
+        let stochasticrank_deriv_seed = stochasticrank_tree_seeds
+            .as_ref()
+            .map_or(params.random_seed, |s| s.recalc_seeds[0]);
+        let stochasticrank_leafval_seed = stochasticrank_tree_seeds
+            .as_ref()
+            .map_or(params.random_seed, |s| s.recalc_seeds[2]);
+
         if is_yetirank {
             if let (Some(spans), Some(seeds)) =
                 (group_spans.as_mut(), yetirank_tree_seeds.as_ref())
@@ -2375,7 +2428,7 @@ fn train_inner<R: Runtime>(
             // `approx` (byte-identical, `is_yetirank` false).
             let grad_approx: &[f64] = if is_yetirank { &learn_approx } else { &approx };
             let per_group =
-                runtime.compute_gradients_grouped(&params.loss, grad_approx, target, &weights, spans, params.random_seed)?;
+                runtime.compute_gradients_grouped(&params.loss, grad_approx, target, &weights, spans, stochasticrank_deriv_seed)?;
             let mut der1 = Vec::with_capacity(n);
             let mut der2 = Vec::with_capacity(n);
             for g in &per_group {
@@ -2785,10 +2838,67 @@ fn train_inner<R: Runtime>(
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
+
+        // StochasticRank LEAF-VALUE der RE-COMPUTE (D-07, 06.3-18): the live trainer
+        // re-runs the Monte-Carlo querywise der for the AveragingFold leaf-value
+        // estimation (`CalcLeafValuesSimple` -> `CalcLeafDersSimple`), drawing a FRESH
+        // per-group Gaussian noise stream re-seeded with `leafval_recalc_seed +
+        // group_index` — a DIFFERENT base than the gradient/split recalc. Unlike
+        // YetiRank there are NO competitors to re-sample; the only thing that changes
+        // is the noise seed fed into `compute_gradients_grouped`. Recompute the grouped
+        // der over the SAME averaging-fold `approx` with the leaf-value recalc base so
+        // the leaf-value estimation rides the leaf-value noise stream (the gradient
+        // recalc above already consumed the deriv base). For NON-StochasticRank losses
+        // this block is skipped (the leaf-value path reuses the gradient der, D-04).
+        let (srank_lv_der1, srank_lv_der2): (Vec<f64>, Vec<f64>) = if is_stochasticrank {
+            let spans_ref = group_spans.as_deref().unwrap_or(&[]);
+            let per_group = runtime.compute_gradients_grouped(
+                &params.loss,
+                &approx,
+                target,
+                &weights,
+                spans_ref,
+                stochasticrank_leafval_seed,
+            )?;
+            let mut d1 = Vec::with_capacity(n);
+            let mut d2 = Vec::with_capacity(n);
+            for g in &per_group {
+                d1.extend_from_slice(&g.der1);
+                d2.extend_from_slice(&g.der2);
+            }
+            if d1.len() != n || d2.len() != n {
+                return Err(CbError::Degenerate(format!(
+                    "StochasticRank leaf-value der produced {} der1 / {} der2 entries, \
+                     expected {n} (group spans must cover every object exactly once)",
+                    d1.len(),
+                    d2.len()
+                )));
+            }
+            (d1, d2)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         // Select the der/weights the leaf-value estimation reads: the YetiRank
-        // leaf-value re-sample above, or (every other loss) the gradient buffers.
-        let lv_weighted_der1: &[f64] = if is_yetirank { &lv_weighted_der1 } else { &weighted_der1 };
-        let lv_der2: &[f64] = if is_yetirank { &lv_der2 } else { &ders.der2 };
+        // leaf-value re-sample, the StochasticRank leaf-value der re-compute, or (every
+        // other loss) the gradient buffers. StochasticRank's grouped der ALREADY folds
+        // the per-object weight (CR-02), so its leaf-value `der1` is the raw grouped
+        // der1 (no per-object re-weight) and the leaf weights are the per-object
+        // `eff_weights` (pointwise grouped path, no pairwise weights).
+        let lv_weighted_der1: &[f64] = if is_yetirank {
+            &lv_weighted_der1
+        } else if is_stochasticrank {
+            &srank_lv_der1
+        } else {
+            &weighted_der1
+        };
+        let lv_der2: &[f64] = if is_yetirank {
+            &lv_der2
+        } else if is_stochasticrank {
+            &srank_lv_der2
+        } else {
+            &ders.der2
+        };
         let lv_eff_weights: &[f64] = if is_yetirank { &lv_eff_weights } else { &eff_weights };
 
         // LEAF-VALUE leaf_of (research Q1/Q3 #3, train.cpp:130

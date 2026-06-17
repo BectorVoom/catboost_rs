@@ -454,7 +454,14 @@ fn ndcg_numerator(target: f64) -> f64 {
 /// `error_functions.h:1363-1365`).
 #[inline]
 fn ndcg_denominator(pos: usize) -> f64 {
-    (2.0 + pos as f64).log2()
+    // catboost computes `Log2(x)` as `log(x) * M_LN2_INV` (`util/generic/ymath.h:29`,
+    // `M_LN2_INV == M_LOG2E == 1/ln(2)`), NOT the `std::log2` intrinsic. The two differ
+    // at the last ULP for some positions (e.g. pos==1), which seeds a tiny `pos_weights`
+    // divergence that the StochasticRank SFA approx-projection (an ill-conditioned
+    // `dot/(√Σz²+ν)²` amplifier) magnifies across trees. Reproduce catboost's exact
+    // `log·M_LN2_INV` form so the position weights are bit-identical.
+    const M_LN2_INV: f64 = std::f64::consts::LOG2_E; // 1/ln(2) == log2(e).
+    (2.0 + pos as f64).ln() * M_LN2_INV
 }
 
 /// LambdaMart per-group der toward the target `metric` (LOSS-04, Wave B).
@@ -714,6 +721,25 @@ fn stochastic_rank_group_der(
     let num_est = num_estimations.max(1) as usize;
     // top == -1 (full group): queryTopSize == count (error_functions.h:1579-1583).
     let query_top_size = count;
+
+    // GROUP-MEAN-CENTER the per-query approx (06.3-18 root cause). The catboost
+    // trainer feeds `CalcDersForSingleQuery` a per-query MEAN-CENTERED `bt.Approx`
+    // (the AveragingFold approx is maintained zero-mean per group — a ranking loss is
+    // shift-invariant within a query). The instrumented `srank_rawder.score`/`mean`
+    // fences (06.3-18) showed catboost's `approxes[docId]` is the centered value
+    // (e.g. `0.0118…`), NOT the raw accumulated approx (`0.0247…`). The `mean` formula
+    // (`approx + (noiseSum − (score − approx))/(count − 1)`) and the SFA approx
+    // projection (`k = dot/(√Σz² + ν)²`) BOTH read this raw `approxes`, so feeding the
+    // un-centered approx shifts the gradient by the per-query mean — invisible at tree
+    // 0 (uniform approx ⇒ mean 0) but amplified by the ~1/0.0036 projection into a
+    // >1e-5 leaf-value divergence from tree 1 on (count > 2) groups. Center here so
+    // every internal use (`shifted`, `mean`, projection) sees catboost's exact input;
+    // `shifted` is unchanged by the pre-centering (centering is idempotent through the
+    // `shifted` re-centering below), and the per-group noise stream is approx-
+    // independent (RNG-seeded), so the standalone draw-log oracle is unaffected.
+    let approx_mean = sum_f64(approx_slice) / count as f64;
+    let approx_centered: Vec<f64> = approx_slice.iter().map(|&a| a - approx_mean).collect();
+    let approx_slice: &[f64] = &approx_centered;
 
     // Stage 1 — shift approxes to break ties, then center (non-FilteredDCG).
     // shifted[d] = approx[d] - Sigma·Mu·target[d] (error_functions.cpp:1026-1028).
