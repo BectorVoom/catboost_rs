@@ -208,7 +208,11 @@ fn assert_single_weight_invariant(produced: &[f64], reference: &[f64], weights: 
     let mut distinguished = false;
     for (i, (&p, &w)) in produced.iter().zip(weights.iter()).enumerate() {
         let squared = p * w;
-        if (w - 1.0).abs() > f64::EPSILON && p.abs() > EXACT_TOL {
+        // WR-04 (T-06.3-12): gate on the SAME scale as the inner assertion.
+        // `squared - p == p*w - p == p*(w-1)`, so guarding on `(p*(w-1.0)).abs() > 1e-6`
+        // makes the guard IMPLY `(squared - p).abs() > 1e-6` (removing the latent
+        // false-negative for ders p in [1e-12, 1e-6] with w near 1).
+        if (w - 1.0).abs() > f64::EPSILON && (p * (w - 1.0)).abs() > 1e-6 {
             assert!(
                 (squared - p).abs() > 1e-6,
                 "object {i}: squared-weight value {squared} (der*weight, weight {w}) must differ \
