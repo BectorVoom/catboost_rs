@@ -8,7 +8,8 @@ use crate::loss::{
     logloss_der2, lq_der1, lq_der2, mae_der1, mae_der2, mape_der1, mape_der2,
     lambdamart_pair_grad, multi_crossentropy_ders, multiclass_onevsall_ders, pairlogit_pair_prob,
     poisson_der1, poisson_der2, quantile_der1,
-    quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1, rmse_der2, sigmoid, softmax_ders,
+    quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1, rmse_der2,
+    rmse_with_uncertainty_ders, sigmoid, softmax_ders,
     tweedie_der1, tweedie_der2, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 
@@ -528,4 +529,44 @@ fn lambdamart_pair_grad_scales_with_sigma_and_delta() {
     let (anti, hess) = lambdamart_pair_grad(0.0, 1.0, 2.0);
     assert!((anti - (-1.0)).abs() < 1e-12);
     assert!((hess - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn rmse_with_uncertainty_ders_match_formula() {
+    // error_functions.h:280-313: diff=target-approx0; prec=exp(-2*approx1);
+    // der1=[w*diff, w*(diff²·prec-1)]; der2-diag=[-w, -2·w·diff²·prec].
+    // Hand-picked (approx0, approx1, target, weight) triples, hessian DIAGONAL.
+    let cases = [
+        (0.0_f64, 0.0_f64, 1.0_f64, 1.0_f64),
+        (2.0, -0.5, 5.0, 1.0),
+        (-1.0, 0.3, -3.0, 2.0),
+        (0.7, 1.25, 0.7, 0.5), // diff == 0 -> der1[1] = w*(0-1) = -w, der2[1] = 0.
+    ];
+    for (a0, a1, t, w) in cases {
+        let diff = t - a0;
+        let prec = (-2.0 * a1).exp();
+        let dsp = diff * diff * prec;
+        let want_der1 = [w * diff, w * (dsp - 1.0)];
+        let want_der2 = [-w, -2.0 * w * dsp];
+        let (der1, der2) = rmse_with_uncertainty_ders(a0, a1, t, w);
+        assert!(
+            (der1[0] - want_der1[0]).abs() < 1e-12 && (der1[1] - want_der1[1]).abs() < 1e-12,
+            "der1={der1:?} want={want_der1:?} (a0={a0}, a1={a1}, t={t}, w={w})"
+        );
+        assert!(
+            (der2[0] - want_der2[0]).abs() < 1e-12 && (der2[1] - want_der2[1]).abs() < 1e-12,
+            "der2={der2:?} want={want_der2:?} (a0={a0}, a1={a1}, t={t}, w={w})"
+        );
+    }
+}
+
+#[test]
+fn rmse_with_uncertainty_ders_zero_residual_is_negative_unit_der1_log_scale() {
+    // diff == 0: der1=[0, -w], der2=[-w, 0] (the log-scale gradient pulls the scale
+    // DOWN toward 0 when the residual is zero; the log-scale hessian vanishes).
+    let (der1, der2) = rmse_with_uncertainty_ders(3.0, 0.4, 3.0, 1.0);
+    assert!((der1[0]).abs() < 1e-12);
+    assert!((der1[1] - (-1.0)).abs() < 1e-12);
+    assert!((der2[0] - (-1.0)).abs() < 1e-12);
+    assert!((der2[1]).abs() < 1e-12);
 }

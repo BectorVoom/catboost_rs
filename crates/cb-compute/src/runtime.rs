@@ -223,6 +223,35 @@ pub enum Loss {
     /// default leaf method is Newton with `leaf_estimation_iterations:10`; fixtures
     /// pin it to 1 (Pitfall 2). Predictions are per-dim sigmoid probabilities.
     MultiCrossEntropy,
+    /// RMSEWithUncertainty (regression with predicted uncertainty, D-6.4-04 /
+    /// LOSS-08): a 2-dimensional DIAGONAL-hessian loss riding the 6.2 N-dim spine.
+    /// Dim 0 is the regression MEAN (`approx[0]`), dim 1 is the LOG-SCALE
+    /// (`approx[1]`). Over one object with a scalar `target` and weight `w`
+    /// (`error_functions.h:280-313` `TRMSEWithUncertaintyError`,
+    /// [`crate::rmse_with_uncertainty_ders`]):
+    /// ```text
+    /// diff    = target - approx[0]
+    /// prec    = exp(-2 * approx[1])
+    /// der1    = [w*diff, w*(diff²·prec - 1)]
+    /// der2-diag = [-w, -2·w·diff²·prec]
+    /// ```
+    /// It is the ngboost "natural gradient" (regular gradient × Fisher info). The
+    /// hessian is `EHessianType::Diagonal`, so each dimension is an INDEPENDENT
+    /// scalar Newton step (the [`Self::MultiClassOneVsAll`]/[`Self::MultiLogloss`]
+    /// diagonal leaf path), NOT the [`Self::MultiClass`] dense symmetric solve
+    /// (06.4-RESEARCH Pitfall 4).
+    ///
+    /// `approx_dimension = 2` (`approx_dimension.cpp:16`). The training target stays
+    /// PER-OBJECT length `n` (a single scalar target; the mean and log-scale are the
+    /// two approx dims). RMSEWithUncertainty ALWAYS starts from the optimal constant
+    /// approx `[mean(target), 0.5·log(var(target))]` even with
+    /// `boost_from_average=false` (`train_model.cpp:858`,
+    /// `optimal_const_for_loss.h:225-229`). No params on the variant. Upstream
+    /// default leaf method is Newton with `leaf_estimation_iterations:1`
+    /// (`catboost_options.cpp:77-82`); the fixture pins both. Predictions are RAW
+    /// 2-dim (RawFormulaVal — identity; the variance transform `exp(2·approx[1])` is
+    /// a separate prediction-type concern, not the loss der).
+    RmseWithUncertainty,
     /// MultiQuantile (multi-output robust regression, D-6.2-05 / LOSS-03): `K`
     /// INDEPENDENT [`Loss::Quantile`] dimensions — each dimension `d` is a
     /// standalone quantile at its own level `alpha[d]`, sharing the deadzone
@@ -757,6 +786,9 @@ impl Loss {
             | Self::MultiClassOneVsAll
             | Self::MultiLogloss
             | Self::MultiCrossEntropy
+            // RMSEWithUncertainty (Wave B, LOSS-08): no hyperparameters — the two
+            // approx dims (mean, log-scale) and the diagonal hessian are fixed.
+            | Self::RmseWithUncertainty
             | Self::QueryRmse
             | Self::PairLogit
             | Self::PairLogitPairwise => {}

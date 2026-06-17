@@ -677,3 +677,41 @@ pub fn lambdamart_pair_grad(approx_diff: f64, delta: f64, sigma: f64) -> (f64, f
     hessian *= sigma * sigma * delta;
     (antigrad, hessian)
 }
+
+/// RMSEWithUncertainty 2-dim DIAGONAL der1/der2 for one object (LOSS-08, Wave B).
+/// `TRMSEWithUncertaintyError : TMultiDerCalcer(EHessianType::Diagonal)`, `dim = 2`
+/// — dim 0 is the regression MEAN (`approx[0]`), dim 1 is the LOG-SCALE
+/// (`approx[1]`). RAW approx (no link transform on the der inputs).
+///
+/// `error_functions.h:280-313`, transcribed verbatim:
+/// ```text
+/// diff   = target - approx[0]
+/// prec   = FastExp(-2 * approx[1])         // FastExpWithInfInplace on (-2*approx[1])
+/// der[0] = weight * diff
+/// der[1] = weight * (diff*diff * prec - 1)
+/// // diagonal hessian:
+/// der2[0] = -weight
+/// der2[1] = -2 * weight * diff*diff * prec
+/// ```
+/// It is the ngboost "natural gradient" (regular gradient × Fisher info). The
+/// hessian is DIAGONAL, so each dimension is an INDEPENDENT scalar Newton step
+/// (the 6.2 MultiClassOneVsAll/MultiLogloss diagonal leaf path), NOT the
+/// MultiClass dense symmetric solve (06.4-RESEARCH Pitfall 4).
+///
+/// `prec` uses `(-2.0 * a1).exp()` — `f64::exp` reproduces upstream `FastExp` within
+/// 1e-5 (the established `predict.rs:Exponent` precedent, A4). The weight `w` is
+/// folded into BOTH der1 entries and BOTH der2 entries per the formula (unlike the
+/// unweighted `multiclass_onevsall_ders`/`multi_crossentropy_ders` helpers, the
+/// upstream RMSEWithUncertainty der folds the weight HERE).
+///
+/// Returns `(der1[2], der2_diag[2])` for the single object, both indexed `[mean,
+/// log-scale]`.
+#[must_use]
+pub fn rmse_with_uncertainty_ders(approx0: f64, approx1: f64, target: f64, weight: f64) -> ([f64; 2], [f64; 2]) {
+    let diff = target - approx0;
+    let prec = (-2.0 * approx1).exp();
+    let diff_sq_prec = diff * diff * prec;
+    let der1 = [weight * diff, weight * (diff_sq_prec - 1.0)];
+    let der2 = [-weight, -2.0 * weight * diff_sq_prec];
+    (der1, der2)
+}

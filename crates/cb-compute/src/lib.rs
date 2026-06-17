@@ -42,8 +42,8 @@ pub use loss::{
     lambdamart_pair_grad, multi_crossentropy_ders, multiclass_onevsall_ders, pairlogit_pair_prob,
     poisson_der1, poisson_der2, quantile_der1,
     quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1,
-    rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2, FOCAL_P_MIN, QUANTILE_ALPHA,
-    QUANTILE_DELTA,
+    rmse_der2, rmse_with_uncertainty_ders, sigmoid, softmax_ders, tweedie_der1, tweedie_der2,
+    FOCAL_P_MIN, QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 pub use pairwise_scoring::{
     calculate_pairwise_score, compute_der_sums, compute_pair_weight_statistics,
