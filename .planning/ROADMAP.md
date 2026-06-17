@@ -414,11 +414,21 @@ Plans:
   3. The Rust custom-objective/-metric trait (user-supplied der1/der2 + eval) is oracle-tested against a Rust-defined reference; designed so the Phase-8 PyO3 callback wraps it cleanly. Python callback bridge DEFERRED to Phase 8 (D-09).
 
 **Plans**: 4 plans (Waves A/B/C, family-wave per D-6.4-01)
-
 Plans:
+**Wave 1**
+
 - [ ] 06.4-01-PLAN.md — Wave A (LOSS-09): 5 score functions (SolarL2/NewtonL2/NewtonCosine/LOOL2/SatL2) extend EScoreFunction; transcribe-then-self-oracle (GPU-only upstream, weakened-oracle caveat D-6.4-06)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 06.4-02-PLAN.md — Wave B (LOSS-08): Loss::RmseWithUncertainty 2-dim diagonal loss on the 6.2 N-dim spine; training per-stage oracle ≤1e-5
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 06.4-03-PLAN.md — Wave B (LOSS-06): 3 uncertainty prediction types (RmseWithUncertainty/VirtEnsembles/TotalUncertainty) + apply_virtual_ensembles; oracle ≤1e-5 (Phase-4 D-10 closed)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 06.4-04-PLAN.md — Wave C (LOSS-07): CustomObjective/CustomMetric Rust traits via Arc<dyn> seam; self-oracle ≤1e-5 (PyO3 deferred to Phase 8, D-09)
 
 ### Phase 6.5: Text & Embedding Features
