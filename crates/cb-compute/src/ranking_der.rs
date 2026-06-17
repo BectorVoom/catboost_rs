@@ -790,6 +790,7 @@ fn stochastic_rank_group_der(
                     new_pos,
                     target_slice,
                     &order,
+                    &pos_weights,
                     &cum_sum,
                     &cum_sum_up,
                     &cum_sum_low,
@@ -863,46 +864,36 @@ fn stochastic_rank_group_der(
 /// non-FilteredDCG branch (the only one in scope). `docGain = numerator(target[
 /// order[oldPos]])`, `docDiff = docGain·(newWeight - oldWeight)`, and the mid
 /// section uses the cumSum/cumSumUp/cumSumLow prefix sums.
+///
+/// `old_weight`/`new_weight` are read directly from the NORMALIZED `pos_weights`
+/// vector — the SAME vector that built `cum_sum`/`cum_sum_up`/`cum_sum_low` — so
+/// `doc_diff` and `mid_diff` share the `1/ideal_dcg` scale for NDCG groups where
+/// `ideal_dcg != 1.0`. This mirrors upstream `oldWeight = posWeights[oldPos]` /
+/// `newWeight = posWeights[newPos]` (`error_functions.cpp:1233-1234`). For the DCG
+/// arm `pos_weights[pos] == 1/CalcDenominator(pos)`, so the result is unchanged.
 #[allow(clippy::too_many_arguments)]
 fn calc_dcg_metric_diff(
     old_pos: usize,
     new_pos: usize,
     target_slice: &[f64],
     order: &[usize],
+    pos_weights: &[f64],
     cum_sum: &[f64],
     cum_sum_up: &[f64],
     cum_sum_low: &[f64],
 ) -> f64 {
-    // posWeights enter via the cumSum prefix arrays already; the raw old/new
-    // position weights are folded into docDiff through cumSum construction. Here we
-    // reproduce upstream's explicit oldWeight/newWeight + docGain term.
-    // NOTE: upstream reads posWeights[oldPos]/posWeights[newPos]; we recompute them
-    // from the denominator (Base numerator, LogPosition denominator) — but for the
-    // *non-normalized* DCG these match ComputeDCGPosWeights pre-normalization. To
-    // stay exact for NDCG we must pass the SAME normalized posWeights; this helper
-    // is therefore only invoked from the DCG/NDCG arm where the cumSum arrays were
-    // built from the normalized posWeights, and the docDiff oldWeight/newWeight are
-    // taken from the SAME normalized vector via the closure below.
-    // (See stochastic_rank_group_der: pos_weights is the normalized vector; we pass
-    // it implicitly through cumSum. The bare oldWeight/newWeight term is supplied by
-    // the caller through cumSum differences — upstream's docDiff is computed from
-    // posWeights directly, so we surface it here.)
     let doc_gain = ndcg_numerator(
         target_slice
             .get(order.get(old_pos).copied().unwrap_or(0))
             .copied()
             .unwrap_or(0.0),
     );
-    // Reconstruct old/new position weights from the cumSum first differences is not
-    // robust; instead the caller-built cumSum already encodes posWeights. Upstream's
-    // docDiff = docGain·(posWeights[newPos] - posWeights[oldPos]); we recompute the
-    // UNNORMALIZED denominator weights here and rely on NDCG normalization being a
-    // global scalar (idealDCG) that the oracle-frozen ground truth captures. For the
-    // DCG arm this is exact; for NDCG the scalar cancels in the metricDiff·density
-    // product only up to the frozen-fixture scale, which the instrumented oracle
-    // pins. (Documented as an OFFLINE-closure precision note in the README.)
-    let old_weight = 1.0 / ndcg_denominator(old_pos);
-    let new_weight = 1.0 / ndcg_denominator(new_pos);
+    // Read old/new position weights from the SAME normalized pos_weights vector that
+    // built the cumSum prefix arrays (upstream posWeights[oldPos]/posWeights[newPos],
+    // error_functions.cpp:1233-1234). Bounds-checked .get (CLAUDE.md unchecked-index
+    // ban; T-06.3-06-01).
+    let old_weight = pos_weights.get(old_pos).copied().unwrap_or(0.0);
+    let new_weight = pos_weights.get(new_pos).copied().unwrap_or(0.0);
     let doc_diff = doc_gain * (new_weight - old_weight);
     let mid_diff = if new_pos < old_pos {
         let old_mid = cum_sum[old_pos] - cum_sum[new_pos];

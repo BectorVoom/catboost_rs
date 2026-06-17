@@ -600,3 +600,105 @@ fn wave_c_loss_validate_rejects_bad_params() {
     assert!(Loss::YetiRank { permutations: 10, decay: 0.85 }.validate().is_ok());
     assert!(Loss::StochasticRank { metric: StochasticRankMetric::Ndcg, sigma: 1.0, mu: 0.0, num_estimations: 1 }.validate().is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// CR-01 regression: calc_dcg_metric_diff must read old/new position weights from
+// the NORMALIZED pos_weights vector (the same one that built cum_sum/up/low), not
+// from a recomputed raw 1/denominator. For any group with ideal_dcg != 1.0 the
+// raw recomputation puts doc_diff on a different scale than mid_diff.
+// Mirrors upstream CalcDCGMetricDiff posWeights[oldPos]/posWeights[newPos]
+// (error_functions.cpp:1233-1234).
+// ---------------------------------------------------------------------------
+
+/// Graded-relevance group where the ideal DCG is clearly != 1.0, so the NDCG
+/// `pos_weights` are scaled by `1/ideal_dcg`. The fix asserts `calc_dcg_metric_diff`
+/// returns `doc_gain*(pos_weights[new_pos]-pos_weights[old_pos]) + mid_diff` read
+/// from the normalized vector — which differs from the pre-fix raw-denominator
+/// value by exactly the `ideal_dcg` factor on the `doc_diff` term.
+#[test]
+fn calc_dcg_metric_diff_reads_normalized_pos_weights_ndcg() {
+    // 3-doc group, graded relevance [3, 2, 1] -> ideal_dcg clearly != 1.0.
+    let targets = [3.0_f64, 2.0, 1.0];
+    let query_top_size = targets.len();
+    // Normalized NDCG pos_weights (divided by ideal_dcg).
+    let pos_weights = super::compute_dcg_pos_weights(&targets, query_top_size, true);
+
+    // ideal_dcg must be != 1.0 for this group (sanity guard for the regression).
+    let raw_pos_weights = super::compute_dcg_pos_weights(&targets, query_top_size, false);
+    let ratio = raw_pos_weights[0] / pos_weights[0];
+    assert!(
+        (ratio - 1.0).abs() > 0.5,
+        "fixture must have ideal_dcg clearly != 1.0 (ratio={ratio})"
+    );
+
+    // A non-perfect approx ranking: order = [1, 0, 2] (doc 1 ranked first).
+    let order = [1_usize, 0, 2];
+
+    // Build cum_sum / cum_sum_up / cum_sum_low exactly as stochastic_rank_group_der
+    // does, from the SAME normalized pos_weights.
+    let count = targets.len();
+    let mut cum_sum = vec![0.0_f64; count + 1];
+    let mut cum_sum_up = vec![0.0_f64; count + 1];
+    let mut cum_sum_low = vec![0.0_f64; count + 1];
+    for pos in 0..count {
+        let doc_id = order[pos];
+        let gain = super::ndcg_numerator(targets[doc_id]);
+        cum_sum[pos + 1] = cum_sum[pos] + gain * pos_weights[pos];
+        if pos + 1 < count {
+            cum_sum_low[pos + 1] = cum_sum_low[pos] + gain * pos_weights[pos + 1];
+        }
+        if pos > 0 {
+            cum_sum_up[pos + 1] = cum_sum_up[pos] + gain * pos_weights[pos - 1];
+        }
+    }
+    cum_sum_low[count] = cum_sum_low[count - 1];
+
+    let old_pos = 0_usize;
+    let new_pos = 2_usize;
+
+    let got = super::calc_dcg_metric_diff(
+        old_pos,
+        new_pos,
+        &targets,
+        &order,
+        &pos_weights,
+        &cum_sum,
+        &cum_sum_up,
+        &cum_sum_low,
+    );
+
+    // Expected: normalized doc_diff + mid_diff (upstream posWeights[oldPos/newPos]).
+    let doc_gain = super::ndcg_numerator(targets[order[old_pos]]);
+    let doc_diff_norm = doc_gain * (pos_weights[new_pos] - pos_weights[old_pos]);
+    // new_pos > old_pos branch:
+    let old_mid = cum_sum[new_pos + 1] - cum_sum[old_pos + 1];
+    let new_mid = cum_sum_up[new_pos + 1] - cum_sum_up[old_pos + 1];
+    let mid_diff = new_mid - old_mid;
+    let want = doc_diff_norm + mid_diff;
+    assert!(
+        (got - want).abs() < 1e-12,
+        "calc_dcg_metric_diff must use normalized pos_weights: got={got}, want={want}"
+    );
+
+    // The pre-fix raw-denominator doc_diff would have been off by 1/ideal_dcg.
+    let raw_doc_diff =
+        doc_gain * (1.0 / super::ndcg_denominator(new_pos) - 1.0 / super::ndcg_denominator(old_pos));
+    let raw_value = raw_doc_diff + mid_diff;
+    assert!(
+        (got - raw_value).abs() > 1e-9,
+        "fix must differ from the old raw-denominator value (got={got}, raw={raw_value})"
+    );
+}
+
+/// The DCG (non-NDCG) arm is unaffected: pos_weights == raw 1/denominator, so the
+/// normalized read equals the old raw recomputation.
+#[test]
+fn calc_dcg_metric_diff_dcg_arm_unchanged() {
+    let targets = [3.0_f64, 2.0, 1.0];
+    let query_top_size = targets.len();
+    let pos_weights = super::compute_dcg_pos_weights(&targets, query_top_size, false);
+    // For DCG, pos_weights[pos] == 1/denominator(pos).
+    for (pos, &w) in pos_weights.iter().enumerate() {
+        assert!((w - 1.0 / super::ndcg_denominator(pos)).abs() < 1e-15);
+    }
+}
