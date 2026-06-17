@@ -195,18 +195,16 @@ pub fn calculate_pairwise_leaf_values(
 }
 
 /// `MakeZeroAverage` (`catboost/libs/helpers/matrix.h:5-15`): subtract the mean so
-/// the leaf deltas are zero-centered. A sequential accumulation matching upstream's
-/// `average += res[i]` loop order (the parity contract is the loop order).
+/// the leaf deltas are zero-centered. The mean accumulation routes through
+/// `cb_core::sum_f64` per D-08 — the single sanctioned strict left-to-right f64 fold
+/// (CLAUDE.md admits no silent summation exception). `sum_f64` IS upstream's
+/// `average += res[i]` sequential order, so this is bit-identical to the prior loop.
 fn make_zero_average(res: &mut [f64]) {
     let n = res.len();
     if n == 0 {
         return;
     }
-    let mut average = 0.0_f64;
-    for &v in res.iter() {
-        average += v;
-    }
-    average /= n as f64;
+    let average = sum_f64(res) / n as f64;
     for v in res.iter_mut() {
         *v -= average;
     }

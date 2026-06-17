@@ -12,6 +12,7 @@
 
 use super::{calculate_pairwise_leaf_values, compute_pairwise_leaf_deltas};
 use cb_compute::{GroupSpan, RankingCompetitor};
+use cb_core::sum_f64;
 
 #[test]
 fn pairwise_leaf_calculation_small_matrix_matches_upstream() {
@@ -54,11 +55,39 @@ fn pairwise_leaf_values_are_zero_averaged() {
     ];
     let der_sums = vec![16.0, -32.0, 32.0, -16.0];
     let leaf_values = calculate_pairwise_leaf_values(&weight_sums, &der_sums, 0.3, 0.1);
-    let s: f64 = leaf_values.iter().sum();
-    assert!(s.abs() < 1e-9, "leaf deltas must be zero-averaged, sum={s}");
+    // WR-01 / D-08: the zero-average invariant is asserted via cb_core::sum_f64
+    // (the same sanctioned fold make_zero_average now uses).
+    let s = sum_f64(&leaf_values);
+    assert!(s.abs() < 1e-9, "leaf deltas must be zero-averaged, sum_f64={s}");
     // 2×2 case is also zero-centered: v0 + v1 == 0.
     let small = calculate_pairwise_leaf_values(&[vec![5.0, -5.0], vec![-5.0, 5.0]], &[-2.0, 2.0], 0.3, 0.1);
     assert!((small[0] + small[1]).abs() < 1e-12);
+}
+
+#[test]
+fn compute_pairwise_leaf_deltas_are_zero_averaged_via_sum_f64() {
+    // WR-01 / D-08: end-to-end through compute_pairwise_leaf_deltas the leaf deltas
+    // sum to ~0 measured by cb_core::sum_f64 (the explicit zero-average invariant).
+    let group = GroupSpan {
+        begin: 0,
+        end: 3,
+        weight: 1.0,
+        competitors: vec![
+            vec![
+                RankingCompetitor { id: 1, weight: 1.0 },
+                RankingCompetitor { id: 2, weight: 0.5 },
+            ],
+            vec![RankingCompetitor { id: 2, weight: 0.25 }],
+            Vec::new(),
+        ],
+    };
+    let leaf_of = vec![0usize, 1usize, 2usize];
+    let der1 = vec![-0.5_f64, 0.2, 0.3];
+    let deltas = compute_pairwise_leaf_deltas(&[group], &leaf_of, &der1, 3, 3.0, 0.1);
+    assert_eq!(deltas.len(), 3);
+    assert!(deltas.iter().all(|v| v.is_finite()), "no NaN");
+    let s = sum_f64(&deltas);
+    assert!(s.abs() < 1e-9, "deltas must be zero-averaged via sum_f64, sum={s}");
 }
 
 #[test]
