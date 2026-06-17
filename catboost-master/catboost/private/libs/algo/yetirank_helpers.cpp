@@ -361,6 +361,15 @@ static void GenerateYetiRankPairsForQuery(
                 = queryWeight * competitorsWeights[winnerIndex][loserIndex] / permutationCount;
             if (competitorsWeight != 0) {
                 competitorsRef[winnerIndex].push_back({loserIndex, competitorsWeight});
+                // 06.3-17: log the final sampled competitor weights so the Rust
+                // yetirank_sample_pairs output can be matched per (winner,loser).
+                if (std::getenv("CB_INSTRUMENT_LOG")) {
+                    CbInstrumentLog(std::string(R"J({"event":"competitor_weight","seed":)J")
+                        + std::to_string(randomSeed)
+                        + R"J(,"winner":)J" + std::to_string((unsigned long long)winnerIndex)
+                        + R"J(,"loser":)J" + std::to_string((unsigned long long)loserIndex)
+                        + R"J(,"weight":)J" + CbFmt17((double)competitorsWeight) + "}");
+                }
             }
         }
     }
