@@ -1645,7 +1645,7 @@ fn train_inner<R: Runtime>(
     // (D-04 no-regression). `build_query_info` validates the group/pair structure
     // up front (contiguous-unique runs, in-range/in-group pairs) — a typed
     // CbError, never a panic.
-    let group_spans: Option<Vec<GroupSpan>> = if is_grouped_loss(&params.loss) {
+    let mut group_spans: Option<Vec<GroupSpan>> = if is_grouped_loss(&params.loss) {
         let qi = build_query_info(
             n,
             ranking.group_id,
@@ -1656,6 +1656,46 @@ fn train_inner<R: Runtime>(
         Some(lower_query_info(&qi))
     } else {
         None
+    };
+
+    // YetiRank / YetiRankPairwise (Wave C) re-SAMPLE their pairwise competitors
+    // every boosting iteration from the CURRENT approx (the pairs are not fixed —
+    // `UpdatePairsForYetiRank` runs per tree, yetirank_helpers.cpp:347-393). The
+    // per-query inner seeds are derived ONCE from the 2-level chain (single-thread,
+    // blockCount=1); each iteration re-samples with those same seeds over the
+    // updated approx. We capture the group relevances (the ranking target per
+    // group) and the per-group seeds here so the per-iteration regeneration is a
+    // cheap re-sample, not a re-derive.
+    let is_yetirank = matches!(
+        params.loss,
+        Loss::YetiRank { .. } | Loss::YetiRankPairwise { .. }
+    );
+    let (yetirank_permutations, yetirank_decay) = match params.loss {
+        Loss::YetiRank { permutations, decay }
+        | Loss::YetiRankPairwise { permutations, decay } => (permutations, decay),
+        _ => (0, 0.0),
+    };
+    // Per-query inner seeds (group order) + each group's [begin, end) + weight +
+    // relevances, snapshotted from the group view for the per-iteration re-sample.
+    let yetirank_groups: Vec<(usize, usize, f64, Vec<f64>)> = if is_yetirank {
+        group_spans
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|g| {
+                let relevs: Vec<f64> = (g.begin..g.end)
+                    .map(|i| target.get(i).copied().unwrap_or(0.0))
+                    .collect();
+                (g.begin, g.end, g.weight, relevs)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let yetirank_query_seeds: Vec<u64> = if is_yetirank {
+        crate::derive_query_seeds(params.random_seed, yetirank_groups.len())
+    } else {
+        Vec::new()
     };
 
     // N-dim approx buffer (D-6.2-01 / Plan 06.2-02). `approx_dimension` is the
@@ -2097,6 +2137,36 @@ fn train_inner<R: Runtime>(
         structure_fold_cycle(params.permutation_count, params.iterations, params.random_seed);
 
     for iter in 0..params.iterations {
+        // 0. YetiRank / YetiRankPairwise (Wave C): RE-SAMPLE the per-group
+        //    competitor adjacency from the CURRENT approx before the der
+        //    (yetirank_helpers.cpp:347-393 — the pairs are recomputed each tree).
+        //    The sampled competitors are injected into the group spans the grouped
+        //    seam reads; the per-query inner seeds are the FIXED 2-level-derived
+        //    seeds (single-thread), so each iteration re-samples the same RNG stream
+        //    over the updated approx. The der then rides the PairLogit der (YetiRank
+        //    pointwise) / Cholesky pairwise leaf (YetiRankPairwise) over these pairs.
+        if is_yetirank {
+            if let Some(spans) = group_spans.as_mut() {
+                for (gi, span) in spans.iter_mut().enumerate() {
+                    if let Some((begin, end, weight, relevs)) = yetirank_groups.get(gi) {
+                        let raw_approx: Vec<f64> = approx
+                            .get(*begin..*end)
+                            .map(<[f64]>::to_vec)
+                            .unwrap_or_default();
+                        let query_seed =
+                            yetirank_query_seeds.get(gi).copied().unwrap_or(0);
+                        span.competitors = crate::yetirank_sample_pairs(
+                            &raw_approx,
+                            relevs,
+                            *weight,
+                            yetirank_permutations,
+                            yetirank_decay,
+                            query_seed,
+                        );
+                    }
+                }
+            }
+        }
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
         //    `approx` is the DIMENSION-MAJOR flat buffer `approx[d*n+i]` of length
         //    `approx_dimension * n` (Plan 06.2-02). The backend runs an OUTER

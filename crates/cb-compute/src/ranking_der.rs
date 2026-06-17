@@ -47,7 +47,7 @@ use crate::runtime::{Derivatives, LambdaMartMetric, Loss, StochasticRankMetric};
 /// (`YetiRankPairwise` lands in Plan 04; `QueryCrossEntropy` is out of scope).
 #[must_use]
 pub fn is_pairwise_scoring(loss: &Loss) -> bool {
-    matches!(loss, Loss::PairLogitPairwise)
+    matches!(loss, Loss::PairLogitPairwise | Loss::YetiRankPairwise { .. })
 }
 
 /// Whether `loss` forces `boosting_type = Plain` (`IsPlainOnlyModeLoss`,
@@ -56,7 +56,7 @@ pub fn is_pairwise_scoring(loss: &Loss) -> bool {
 /// [`Loss::PairLogitPairwise`] qualifies (`YetiRankPairwise` in Plan 04).
 #[must_use]
 pub fn is_plain_only(loss: &Loss) -> bool {
-    matches!(loss, Loss::PairLogitPairwise)
+    matches!(loss, Loss::PairLogitPairwise | Loss::YetiRankPairwise { .. })
 }
 
 /// A competitor edge inside a group: the group-local loser index plus the pair
