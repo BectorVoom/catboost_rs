@@ -35,6 +35,7 @@ use cb_data::calc_cat_feature_hash;
 use cb_train::{fold_cat_hash, leaf_index};
 
 use crate::ctr_data::{calc_inference, ctr_base_key, CtrValueTable, Prior};
+use crate::error::ModelError;
 use crate::model::{CtrSplit, ModelSplit};
 use crate::Model;
 
@@ -380,4 +381,151 @@ fn predict_raw_multi_cat(
         }
     }
     out
+}
+
+/// Accumulate one object's per-dimension leaf-value sum over the tree SLICE
+/// `[tree_start, tree_end)` — the dimension-major `[d0, d1, …]` contribution of
+/// that tree range, WITHOUT any bias (the VE bias is applied once by
+/// [`apply_virtual_ensembles`], matching upstream `ApplyScaleAndBias`'s
+/// `treeStart > 0` no-bias path, `scale_and_bias.cpp:13`).
+///
+/// `dim = model.approx_dimension.max(1)`; `row` / `cats` are the object's gathered
+/// float / categorical values. All per-(dim) Σ route through [`sum_f64`] (D-08).
+/// Out-of-range tree indices are skipped (checked `.get`); a leaf index out of a
+/// tree's range contributes `0.0` (T-04-02-01) — never a panic.
+fn apply_tree_slice_one(
+    model: &Model,
+    row: &[f32],
+    cats: &[String],
+    tree_start: usize,
+    tree_end: usize,
+    dim: usize,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(dim);
+    for d in 0..dim {
+        let contributions: Vec<f64> = (tree_start..tree_end)
+            .filter_map(|ti| model.oblivious_trees.get(ti))
+            .map(|tree| {
+                let leaf = leaf_index_for(model, tree, row, cats);
+                let n_leaves = tree.leaf_values.len() / dim;
+                tree.leaf_values
+                    .get(d.saturating_mul(n_leaves).saturating_add(leaf))
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        out.push(sum_f64(&contributions));
+    }
+    out
+}
+
+/// Apply the trained model's virtual-ensemble slicing (`apply.cpp:526-600`),
+/// producing the per-ensemble RAW approx matrix in OBJECT-MAJOR
+/// `(n, virtual_ensembles_count, approx_dimension)` flat layout — value at index
+/// `i * (V * dim) + e * dim + d`. These are the RAW per-ensemble dims (dim 0 mean,
+/// dim 1 log-scale for RMSEWithUncertainty); the variance transform `exp(2*x)` is
+/// applied later by [`crate::apply_prediction_type`] (`VirtEnsembles` /
+/// `TotalUncertainty`).
+///
+/// Transcribes upstream EXACTLY (default `unshrinkCoef = 1`, A2 — `model_shrink_rate
+/// = 0`; non-zero constant-shrink is a documented v2 follow-up, NOT a silent
+/// omission):
+/// - `end = model.oblivious_trees.len()` (all trees; upstream `ntree_end = 0`).
+/// - `eval_period = end / (2 * V)` (INTEGER division).
+/// - Guard `eval_period > 0 && eval_period * V < end`, else a `ModelError`
+///   ("Not enough trees …", `CB_ENSURE` equivalent — NOT a panic, T-06.4C-01).
+///   `V = 0` also errors (eval_period would div-by-zero / the guard fails).
+/// - `begin = end - eval_period * V`.
+/// - Ensemble 0 seeds from the apply of trees `[0, begin)` PLUS the per-dim
+///   `bias` (the `treeStart == 0` bias path, `scale_and_bias.cpp:13`).
+/// - For `v in 0..V`: add the apply of trees `[begin + v*eval_period,
+///   begin + (v+1)*eval_period)` (NO bias — `treeStart > 0`) to the running
+///   ensemble approx; for all but the last ensemble, copy the running sum forward
+///   to seed the next ensemble (the `copyerLambda` with `copyToNextEnsemble`).
+///
+/// `bias` is the per-dimension model bias (`scale_and_bias[1]`, length
+/// `approx_dimension`); a shorter slice reads `0.0` for the missing dims (checked
+/// `.get`). All Σ route through [`sum_f64`] (D-08). All access is checked `.get`
+/// (`indexing_slicing` deny) — out-of-range tree / leaf indices never panic.
+///
+/// # Errors
+/// [`ModelError::Deserialize`] when the model has fewer than `2*V + 1` trees for
+/// the requested `virtual_ensembles_count` (or `V == 0`).
+pub fn apply_virtual_ensembles(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    bias: &[f64],
+    virtual_ensembles_count: usize,
+) -> Result<Vec<f64>, ModelError> {
+    let dim = model.approx_dimension.max(1);
+    let end = model.oblivious_trees.len();
+    let v = virtual_ensembles_count;
+
+    // evalPeriod = end / (2*V) (integer); guard evalPeriod>0 && evalPeriod*V < end
+    // (need >= 2V+1 trees). V == 0 makes the denominator 0 -> reject up front.
+    if v == 0 {
+        return Err(ModelError::Deserialize(
+            "virtual_ensembles_count must be > 0".to_owned(),
+        ));
+    }
+    let eval_period = end / (2 * v);
+    if eval_period == 0 || eval_period.saturating_mul(v) >= end {
+        return Err(ModelError::Deserialize(format!(
+            "Not enough trees in model for {v} virtual ensembles \
+             (have {end}, need >= {})",
+            2 * v + 1
+        )));
+    }
+    let begin = end - eval_period * v;
+
+    let n_float = feature_values.first().map_or(0, Vec::len);
+    let n = n_float;
+
+    // Object-major output `(n, V, dim)`: out[i*(V*dim) + e*dim + d].
+    let mut out = vec![0.0_f64; n.saturating_mul(v).saturating_mul(dim)];
+
+    for obj in 0..n {
+        // This object's float row (checked `.get`; a short column reads NaN,
+        // failing every strict `> border` test). No categorical columns on the VE
+        // numeric apply path (the RMSEWithUncertainty fixture is numeric-only).
+        let row: Vec<f32> = feature_values
+            .iter()
+            .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+            .collect();
+        let cats: Vec<String> = Vec::new();
+
+        // Ensemble 0 base: apply trees [0, begin) PLUS the per-dim bias (the
+        // treeStart == 0 bias path). This becomes the running approx seed.
+        let base = apply_tree_slice_one(model, &row, &cats, 0, begin, dim);
+        let mut running: Vec<f64> = (0..dim)
+            .map(|d| base.get(d).copied().unwrap_or(0.0) + bias.get(d).copied().unwrap_or(0.0))
+            .collect();
+
+        // Each ensemble adds its evalPeriod-tree slice (NO bias, treeStart > 0),
+        // then the running sum is the ensemble's approx; copy-forward seeds the
+        // next ensemble (copyerLambda, copyToNextEnsemble for all but the last).
+        for e in 0..v {
+            let slice_start = begin + e.saturating_mul(eval_period);
+            let slice_end = (slice_start + eval_period).min(end);
+            let slice = apply_tree_slice_one(model, &row, &cats, slice_start, slice_end, dim);
+            for d in 0..dim {
+                // running[d] += slice[d] (the per-dim ensemble accumulation).
+                if let Some(r) = running.get_mut(d) {
+                    *r = sum_f64(&[*r, slice.get(d).copied().unwrap_or(0.0)]);
+                }
+                // Store this ensemble's approx (object-major (n, V, dim)).
+                let idx = obj
+                    .saturating_mul(v)
+                    .saturating_mul(dim)
+                    .saturating_add(e.saturating_mul(dim))
+                    .saturating_add(d);
+                if let Some(slot) = out.get_mut(idx) {
+                    *slot = running.get(d).copied().unwrap_or(0.0);
+                }
+            }
+            // The running sum carries forward to seed the next ensemble (it is NOT
+            // reset) — `unshrinkCoef = 1` (default A2 path), so no rescale.
+        }
+    }
+    Ok(out)
 }
