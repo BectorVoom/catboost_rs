@@ -169,6 +169,13 @@ static void CbInstrumentLog(const std::string& line) {
     std::FILE* f = std::fopen(path, "a");
     if (f != nullptr) { std::fputs(line.c_str(), f); std::fputc(10, f); std::fclose(f); }
 }
+// 17 significant digits round-trips an IEEE-754 double exactly (06.3-13: the
+// ≤1e-5 PairLogit oracle needs full precision, std::to_string truncates to 6dp).
+static std::string CbFmt17(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.17g", v);
+    return std::string(buf);
+}
 // === end CB_INSTRUMENT_LOG sink ===
 CPP
 
@@ -208,7 +215,7 @@ ensure_sink "${QW}"
 if ! grep -q 'cb_instr_leafder' "${QW}"; then
     # Log merged per-leaf Der1/Der2 after the block-merge in AddLeafDersForQueries.
     perl -0777 -pi -e '
-        s{(mergedStats->first\[idx\]\.Der2 \+= blockStats\.first\[idx\]\.Der2;\s*\n)}{$1            /* cb_instr_leafder */ if (std::getenv("CB_INSTRUMENT_LOG")) { CbInstrumentLog(std::string(R"J({"event":"leaf_der","leaf":)J") + std::to_string(idx) + R"J(,"der1":)J" + std::to_string(mergedStats->first[idx].Der1) + R"J(,"der2":)J" + std::to_string(mergedStats->first[idx].Der2) + "}"); }\n}s;
+        s{(mergedStats->first\[idx\]\.Der2 \+= blockStats\.first\[idx\]\.Der2;\s*\n)}{$1            /* cb_instr_leafder */ if (std::getenv("CB_INSTRUMENT_LOG")) { CbInstrumentLog(std::string(R"J({"event":"leaf_der","leaf":)J") + std::to_string(idx) + R"J(,"der1":)J" + CbFmt17(mergedStats->first[idx].Der1) + R"J(,"der2":)J" + CbFmt17(mergedStats->first[idx].Der2) + "}"); }\n}s;
     ' "${QW}" || step "  (querywise leaf-der hook not matched — schema may have shifted; recorded)"
     step "  patched per-leaf der1/der2 hook into approx_calcer_querywise.cpp"
 fi
@@ -217,9 +224,31 @@ fi
 ensure_sink "${AC}"
 if ! grep -q 'cb_instr_leafweight' "${AC}"; then
     perl -0777 -pi -e '
-        s{(if \(blockBucketSumWeights\[blockId\]\[leafId\] > FLT_EPSILON\) \{\n)}{$1                    /* cb_instr_leafweight */ if (std::getenv("CB_INSTRUMENT_LOG")) { CbInstrumentLog(std::string(R"J({"event":"leaf_weight","leaf":)J") + std::to_string(leafId) + R"J(,"sum_weight":)J" + std::to_string(blockBucketSumWeights[blockId][leafId]) + "}"); }\n}s;
+        s{(if \(blockBucketSumWeights\[blockId\]\[leafId\] > FLT_EPSILON\) \{\n)}{$1                    /* cb_instr_leafweight */ if (std::getenv("CB_INSTRUMENT_LOG")) { CbInstrumentLog(std::string(R"J({"event":"leaf_weight","leaf":)J") + std::to_string(leafId) + R"J(,"sum_weight":)J" + CbFmt17(blockBucketSumWeights[blockId][leafId]) + "}"); }\n}s;
     ' "${AC}" || step "  (approx_calcer leaf-weight hook not matched; recorded)"
     step "  patched per-leaf sum-weight hook into approx_calcer.cpp"
+fi
+
+# 3e. (06.3-13) per-leaf FINAL delta + denominator inputs in CalcLeafDeltasSimple.
+#     This captures, at full precision, the exact leaf delta upstream emits AND the
+#     sumAllWeights / allDocCount that feed the Newton/Gradient/pairwise denom — the
+#     ground truth the PairLogit ≤1e-5 oracle (plan 13) needs to pin the per-leaf
+#     der2 reduction. Hooks the Newton-branch leaf loop and the pairwise branch.
+ensure_sink "${AC}"
+if ! grep -q 'cb_instr_leafdelta' "${AC}"; then
+    # Newton branch: log SumDer / SumDer2 / SumWeights / sumAllWeights / allDocCount / delta.
+    perl -0777 -pi -e '
+        s{(\(\*leafDeltas\)\[leaf\] = CalcMethodDelta<ELeavesEstimation::Newton>\(\s*leafDers\[leaf\],\s*l2Regularizer,\s*sumAllWeights,\s*allDocCount\);\n)}{$1            /* cb_instr_leafdelta */ if (std::getenv("CB_INSTRUMENT_LOG")) { CbInstrumentLog(std::string(R"J({"event":"leaf_delta","method":"Newton","leaf":)J") + std::to_string(leaf) + R"J(,"sum_der":)J" + CbFmt17(leafDers[leaf].SumDer) + R"J(,"sum_der2":)J" + CbFmt17(leafDers[leaf].SumDer2) + R"J(,"sum_weights":)J" + CbFmt17(leafDers[leaf].SumWeights) + R"J(,"sum_all_weights":)J" + CbFmt17(sumAllWeights) + R"J(,"all_doc_count":)J" + std::to_string(allDocCount) + R"J(,"l2":)J" + CbFmt17((double)l2Regularizer) + R"J(,"delta":)J" + CbFmt17((*leafDeltas)[leaf]) + "}"); }\n}s;
+    ' "${AC}" || step "  (newton leaf-delta hook not matched; recorded)"
+    # Gradient branch.
+    perl -0777 -pi -e '
+        s{(\(\*leafDeltas\)\[leaf\] = CalcMethodDelta<ELeavesEstimation::Gradient>\(\s*leafDers\[leaf\],\s*l2Regularizer,\s*sumAllWeights,\s*allDocCount\);\n)}{$1            /* cb_instr_leafdelta */ if (std::getenv("CB_INSTRUMENT_LOG")) { CbInstrumentLog(std::string(R"J({"event":"leaf_delta","method":"Gradient","leaf":)J") + std::to_string(leaf) + R"J(,"sum_der":)J" + CbFmt17(leafDers[leaf].SumDer) + R"J(,"sum_der2":)J" + CbFmt17(leafDers[leaf].SumDer2) + R"J(,"sum_weights":)J" + CbFmt17(leafDers[leaf].SumWeights) + R"J(,"sum_all_weights":)J" + CbFmt17(sumAllWeights) + R"J(,"all_doc_count":)J" + std::to_string(allDocCount) + R"J(,"l2":)J" + CbFmt17((double)l2Regularizer) + R"J(,"delta":)J" + CbFmt17((*leafDeltas)[leaf]) + "}"); }\n}s;
+    ' "${AC}" || step "  (gradient leaf-delta hook not matched; recorded)"
+    # Pairwise branch: log the resulting per-leaf delta after CalculatePairwiseLeafValues.
+    perl -0777 -pi -e '
+        s{(\*leafDeltas = CalculatePairwiseLeafValues\(\s*pairwiseWeightSums,\s*derSums,\s*l2Regularizer,\s*pairwiseNonDiagReg\);\n)}{$1        /* cb_instr_leafdelta */ if (std::getenv("CB_INSTRUMENT_LOG")) { for (int cbL = 0; cbL < leafCount; ++cbL) { CbInstrumentLog(std::string(R"J({"event":"leaf_delta","method":"Pairwise","leaf":)J") + std::to_string(cbL) + R"J(,"sum_der":)J" + CbFmt17(leafDers[cbL].SumDer) + R"J(,"sum_der2":)J" + CbFmt17(leafDers[cbL].SumDer2) + R"J(,"l2":)J" + CbFmt17((double)l2Regularizer) + R"J(,"pairwise_non_diag_reg":)J" + CbFmt17((double)pairwiseNonDiagReg) + R"J(,"delta":)J" + CbFmt17((*leafDeltas)[cbL]) + "}"); } }\n}s;
+    ' "${AC}" || step "  (pairwise leaf-delta hook not matched; recorded)"
+    step "  patched per-leaf delta + denom hook into approx_calcer.cpp (CalcLeafDeltasSimple)"
 fi
 
 # 3c. YetiRank RNG-draw events (GenerateYetiRankPairsForQuery).
@@ -288,13 +317,22 @@ fi
 # STEP 5 — Locate built _catboost.so + drop into a venv-package copy
 # --------------------------------------------------------------------------
 step "STEP 5: locate + stage built _catboost.so"
-BUILT_SO="$(find "${BUILD_ROOT}" -name '_catboost.so' -o -name 'lib_catboost.so' 2>/dev/null | head -1)"
+STAGE_PKG="${BUILD_ROOT}/instr_pkg"
+# Find the FRESHLY-built shared object. The canonical ninja output is
+# catboost/python-package/catboost/lib_catboost.so; PREFER it. Critically, EXCLUDE
+# the staged package dir (${STAGE_PKG}) from the search — a prior run leaves a
+# `_catboost.so` there, and a bare `find ... | head -1` would pick that STALE copy
+# over the just-built lib_catboost.so (06.3-13 staging bug: the stale 276 MB
+# self-copy silently shipped an un-instrumented trainer).
+BUILT_SO="$(find "${BUILD_ROOT}" -path "${STAGE_PKG}" -prune -o -name 'lib_catboost.so' -print 2>/dev/null | head -1)"
 if [ -z "${BUILT_SO}" ]; then
-    fail "STEP 5 — no _catboost.so / lib_catboost.so found under ${BUILD_ROOT} despite rc=0"
+    BUILT_SO="$(find "${BUILD_ROOT}" -path "${STAGE_PKG}" -prune -o -name '_catboost.so' -print 2>/dev/null | head -1)"
+fi
+if [ -z "${BUILT_SO}" ]; then
+    fail "STEP 5 — no lib_catboost.so / _catboost.so found under ${BUILD_ROOT} (excluding ${STAGE_PKG}) despite rc=0"
 fi
 step "  built artifact: ${BUILT_SO}"
 
-STAGE_PKG="${BUILD_ROOT}/instr_pkg"
 SRC_PKG="${REPO_ROOT}/.venv/lib/python3.13/site-packages/catboost"
 if [ -d "${SRC_PKG}" ]; then
     rm -rf "${STAGE_PKG}"
