@@ -257,12 +257,17 @@ impl EvalMetric {
         }
 
         // The weight column the denominator and the weighted numerator share:
-        // uniform 1.0 when no weights are supplied.
+        // uniform 1.0 when no weights are supplied. A missing per-object weight
+        // falls back to 1.0 (the upstream "missing weight == 1.0" convention),
+        // MATCHING `eval_grouped` so both metric paths weight an out-of-range index
+        // identically (WR-05). After the up-front `weights.len() == approx.len()`
+        // check this branch is unreachable; the shared fallback keeps the two paths
+        // consistent if that guard is ever relaxed.
         let weight_at = |i: usize| -> f64 {
             if weights.is_empty() {
                 1.0
             } else {
-                weights.get(i).copied().unwrap_or(0.0)
+                weights.get(i).copied().unwrap_or(1.0)
             }
         };
 
