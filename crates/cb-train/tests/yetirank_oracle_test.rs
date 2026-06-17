@@ -23,16 +23,37 @@
 //! # Deferred end-to-end per-stage fixture (escalate-don't-weaken, D-6.3-03b)
 //!
 //! The FULL per-stage `compare_stage(Splits|LeafValues|StagedApprox|Predictions)`
-//! over a trained YetiRank `model.json` requires the instrumented catboost 1.2.10
-//! TRAINER build, which the Task-1 feasibility probe found INFEASIBLE this session
-//! (toolchain absent + disk NO-GO; see the README STATUS section). Per
-//! D-6.3-03b that step is DEFERRED — NOT weakened, NOT `#[ignore]`d, NOT
-//! fabricated. [`yetirank_end_to_end_per_stage`] is the wired-but-pending compare:
-//! it runs the full per-stage gate the MOMENT the frozen trainer fixture
-//! (`ranking_corpus/yetirank/model.json`) lands, and otherwise asserts the
-//! deferred-fixture invariant (the directory exists with the RNG ground truth) so
-//! the test never silently passes on a missing gate. This mirrors the Phase-5
-//! ORD-01 "ground truth committed, oracle wired, no weakening" precedent.
+//! over a trained YetiRank `model.json` remains DEFERRED — but for a NEWLY
+//! ISOLATED reason (06.3-14), NOT the prior toolchain/disk NO-GO. The 06.3-10
+//! instrumented catboost 1.2.10 TRAINER is now BUILT (GO) and was RUN on the
+//! ranking corpus this plan (06.3-14 Task 2). The captured per-tree
+//! `CB_INSTRUMENT_LOG` `yeti_gumbel` draw stream proves the trainer-level RNG
+//! draw COUNT matches the Rust per-doc/per-permutation/per-query model
+//! (`12 docs × 10 perms × 3 permutation folds × 5 trees == 1800` draws), BUT the
+//! draw ORDER diverges from the current Rust sampler, which:
+//!   (a) uses ONE permutation fold where the trainer uses THREE
+//!       (`leaf_estimation`/AveragingFold folds), and
+//!   (b) re-derives the per-query seed ONCE from `params.random_seed`
+//!       (`derive_query_seeds`) and reuses it for ALL trees, whereas catboost
+//!       `UpdatePairsForYetiRank` re-derives the seed PER TREE from a per-tree
+//!       context-RNG-advanced `randomSeed` (`yetirank_helpers.cpp:369-414`).
+//! Because the sampled pairs drive the gradient, this RNG-order gap diverges the
+//! YetiRank model end-to-end (measured: leaf-value max |Δ| ≈ 8.3e-1, split max
+//! |Δ| ≈ 1.44 vs the catboost trainer fixture — far above 1e-5). Reproducing the
+//! trainer's per-tree multi-fold seed derivation in the boosting loop is a NEW
+//! seeding subsystem (Rule 4 architectural scope — the same class as the
+//! 06.3-13 deferred PairLogitPairwise split-scorer). Per D-6.3-03b that step is
+//! DEFERRED — NOT weakened, NOT `#[ignore]`d, NOT fabricated; see
+//! `deferred-items.md [06.3-14]`. [`yetirank_end_to_end_per_stage`] is the
+//! wired-but-pending compare: it runs the full per-stage gate the MOMENT the
+//! frozen trainer fixture (`ranking_corpus/yetirank/model.json`) lands, and
+//! otherwise asserts the deferred-fixture invariant (the directory exists with the
+//! RNG ground truth) so the test never silently passes on a missing gate. This
+//! mirrors the Phase-5 ORD-01 "ground truth committed, oracle wired, no weakening"
+//! precedent. NOTE: the standalone full-precision RNG-draw oracle
+//! ([`yetirank_rng_draw_log_oracle`]) stays GREEN — it gates the SAMPLER against
+//! the single-group standalone ground truth, which is correct; the gap is the
+//! TRAINER's multi-fold/per-tree seed PLUMBING, not the per-query Gumbel sampler.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;

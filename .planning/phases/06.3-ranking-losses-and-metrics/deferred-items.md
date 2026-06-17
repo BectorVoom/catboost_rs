@@ -172,6 +172,71 @@ ground truth captured ONLY the PairLogit pointwise per-leaf der, not pairwise sp
 **Escalate-don't-weaken:** tolerance unchanged, no fixture fabricated, `#[ignore]` retained
 with the precise divergence recorded in the test header.
 
+## [06.3-14] YetiRank/StochasticRank end-to-end trainer fixture — trainer-level RNG multi-fold/per-tree seed plumbing (DEFERRED, Rule 4)
+
+**Status:** GAP 2 / Truth #5 (end-to-end per-stage YetiRank/YetiRankPairwise/
+StochasticRank fixtures) and the GAP 3 trainer-half (D-07 trainer-level RNG)
+remain DEFERRED — but the BLOCKER MOVED. The prior [06.3-04] deferral was a
+toolchain/disk NO-GO. As of 06.3-14 the 06.3-10 instrumented catboost 1.2.10
+TRAINER is BUILT (GO, `/tmp/cb_build313/instr_pkg/catboost/_catboost.so`) and was
+RUN on the ranking corpus. The NEW, precisely-isolated blocker is in the **Rust
+sampler's RNG model**, not the build.
+
+**What 06.3-14 Task 2 measured (trainer-level RNG draw log, GO path executed):**
+Training `YetiRank` on the corpus with `CB_INSTRUMENT_LOG` produced **1800**
+`yeti_gumbel` uniform draws. The COUNT matches the Rust per-doc/per-permutation/
+per-query model EXACTLY: `12 docs × 10 perms × 3 permutation folds × 5 trees ==
+1800`. The ORDER, however, DIVERGES — the trainer's first group-0 draws are
+`0.704696, 0.214508, 0.136204, …` while the Rust `derive_query_seeds(20260617)`
+chain yields `0.03523, 0.16043, 0.58092, …` (and the single-group standalone
+ground-truth seed=0 chain yields `0.19309, 0.05946, …`). Root cause (transcribed
+from the vendored source, NOT guessed):
+  - **(a) fold count.** The trainer samples YetiRank pairs over **3 permutation/
+    averaging folds** per tree; the Rust trainer (`boosting.rs:1808`) derives ONE
+    fixed `yetirank_query_seeds` set and reuses it for all trees over ONE fold.
+    `1800 / (12·10·5) = 3` confirms the 3-fold factor.
+  - **(b) per-tree reseed.** `UpdatePairsForYetiRank` /
+    `YetiRankRecalculation` (`yetirank_helpers.cpp:369-414`) re-derive the
+    per-query seed PER TREE from a per-tree context-RNG-advanced `randomSeed`
+    (`GenRandUI64Vector(blockCount, randomSeed)` then `rand.GenRand()` per query),
+    whereas the Rust sampler uses a single 2-level chain off `params.random_seed`
+    for every tree.
+
+**End-to-end consequence (decisive, measured):** because the sampled pairs drive
+the gradient → splits → leaf values, this RNG-order gap diverges the Rust YetiRank
+model from the catboost trainer fixture by **leaf-value max |Δ| ≈ 8.3e-1** and
+**split max |Δ| ≈ 1.44** (probe trained against the freshly generated
+`/tmp/cb314_stage/yetirank/model.json`, NOT committed). This is ~5 orders of
+magnitude above the ≤1e-5 bar — so freezing the trainer fixture and un-gating the
+per-stage oracle now would FAIL the gate, not pass it. Escalate-don't-weaken: the
+three `model.json` stay ABSENT, the `*_end_to_end_per_stage` tests keep the
+deferred-fixture invariant, no tolerance is touched, no fixture is fabricated.
+
+**Also confirmed (affects WR-03 interpretation, not a regression):** catboost's
+default `leaf_estimation_method` for YetiRank is **Newton** (`model.json` params),
+so the production YetiRank leaf rides the Newton arm (unit weights — correct, der2
+folds the pair weight). The WR-03 Gradient-leaf `eff_weights` branch (06.3-14
+Task 1) is the correct code for a Gradient-leaf YetiRank configuration and remains
+landed and unit-green; it becomes oracle-exercised only once the seed-plumbing
+gap below is closed AND a Gradient-leaf fixture is frozen.
+
+**Closure recipe (a dedicated future plan — Rule 4 architectural scope):**
+1. Model catboost's per-tree YetiRank seed derivation in the boosting loop: advance
+   a per-tree context RNG and call `derive_query_seeds(per_tree_seed, n_groups)`
+   PER TREE (not once), matching `UpdatePairsForYetiRank`.
+2. Add the 3-fold (AveragingFold permutation) YetiRank pair re-sampling so the draw
+   COUNT-and-ORDER match per fold.
+3. Re-run the instrumented trainer (GO artifact persists in `/tmp`), confirm the
+   per-tree `yeti_gumbel` draw stream matches the Rust sampler bit-for-bit
+   (note: the trainer logs `u` at `%f`/1e-6 precision, so the trainer-level compare
+   is ~1e-6; the full-precision crux stays the standalone self-oracle), THEN freeze
+   the three `model.json` + staged/predictions and un-gate the per-stage oracles
+   ≤1e-5. The standalone full-precision RNG-draw oracles already gate the per-query
+   Gumbel/Gaussian samplers and stay GREEN throughout.
+
+**Out of scope (carried from [06.3-04]):** StochasticRank non-DCG metrics;
+YetiRank multi-thread (blockCount>1) block-seed partition.
+
 ## [06.3-13] Pre-existing `clippy::indexing_slicing` error in `cb-backend` cpu_runtime (OUT OF SCOPE)
 
 **Status:** DEFERRED — pre-existing, NOT introduced by 06.3-13.

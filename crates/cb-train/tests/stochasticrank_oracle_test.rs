@@ -12,10 +12,21 @@
 //! against that frozen ground truth at <= 1e-5 — the integer/f64-exact RNG-draw
 //! compare that gates the randomized stream INDEPENDENTLY of the der. This is LIVE.
 //!
-//! The end-to-end per-stage compare over a trained StochasticRank `model.json` is
-//! DEFERRED on the instrumented trainer build (path c — toolchain absent + disk
-//! NO-GO; escalate-don't-weaken, D-6.3-03b). NO `#[ignore]`, NO weakened
-//! tolerance — see the README STATUS section.
+//! The end-to-end per-stage compare over a trained StochasticRank `model.json`
+//! remains DEFERRED — but for a NEWLY ISOLATED reason (06.3-14), NOT the prior
+//! toolchain/disk NO-GO. The 06.3-10 instrumented trainer is now BUILT (GO) and
+//! was RUN this plan (06.3-14 Task 2). The captured per-tree `CB_INSTRUMENT_LOG`
+//! RNG draw stream proves the trainer draws over MULTIPLE permutation/averaging
+//! folds with a PER-TREE-advanced context seed — the same multi-fold/per-tree
+//! seed-plumbing gap isolated for YetiRank (the Rust trainer derives a single
+//! seed once and reuses it for all trees over ONE fold). Reproducing the
+//! trainer's per-tree multi-fold Gaussian-noise seed stream in the boosting loop
+//! is a NEW seeding subsystem (Rule 4 architectural scope). Per D-6.3-03b that
+//! step is DEFERRED — NO `#[ignore]`, NO weakened tolerance; see
+//! `deferred-items.md [06.3-14]`. The standalone full-precision noise-draw oracle
+//! ([`stochasticrank_rng_draw_log_oracle`]) stays GREEN — it gates the
+//! `cb_core::std_normal` stream (correct); the gap is the TRAINER's fold/seed
+//! plumbing, not the per-draw Gaussian sampler.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;

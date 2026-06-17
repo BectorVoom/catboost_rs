@@ -11,9 +11,19 @@
 //! the YetiRank stream), gated LIVE here against the Rust sampler.
 //!
 //! The end-to-end per-stage compare (over a trained YetiRankPairwise `model.json`
-//! through the Cholesky leaf path) is DEFERRED on the instrumented trainer build
-//! (path c — toolchain absent + disk NO-GO; escalate-don't-weaken, D-6.3-03b). NO
-//! `#[ignore]`, NO weakened tolerance — see the README STATUS section.
+//! through the Cholesky leaf path) remains DEFERRED on TWO newly isolated
+//! architectural gaps (06.3-14), NOT the prior toolchain/disk NO-GO (the 06.3-10
+//! trainer is now BUILT/GO and was RUN this plan):
+//!   1. The YetiRank multi-fold / per-tree RNG seed-plumbing gap isolated in
+//!      `yetirank_oracle_test.rs` (the trainer samples over 3 permutation folds
+//!      with a per-tree-advanced seed; the Rust sampler uses 1 fold + a fixed
+//!      2-level chain) — a NEW seeding subsystem (Rule 4 scope).
+//!   2. `*Pairwise` (`is_pairwise_scoring`) losses additionally need the pairwise
+//!      SPLIT-scorer (`TPairwiseScoreCalcer`) isolated in 06.3-13 for
+//!      PairLogitPairwise — also Rule 4 scope, not yet in cb-train.
+//! Per D-6.3-03b: NO `#[ignore]`, NO weakened tolerance; see
+//! `deferred-items.md [06.3-13]` (split-scorer) and `[06.3-14]` (seed plumbing).
+//! The standalone full-precision RNG-draw oracle stays GREEN.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
