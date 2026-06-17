@@ -29,7 +29,8 @@
 use std::path::PathBuf;
 
 use cb_model::{
-    apply_prediction_type, apply_virtual_ensembles, load_json, predict_raw_multi, PredictionType,
+    apply_prediction_type, apply_ve_prediction_type, apply_virtual_ensembles, load_json,
+    predict_raw_multi_biased, PredictionType,
 };
 use cb_oracle::{compare_stage, load_f64_vec, Stage};
 use ndarray::Array2;
@@ -87,8 +88,11 @@ fn rmse_with_uncertainty_predict_oracle() {
         .unwrap_or_else(|e| panic!("model.json must load: {e:?}"));
     assert_eq!(model.approx_dimension, APPROX_DIMENSION);
 
-    // Dim-major raw approx (length 2*n): [mean(0..n), log-scale(n..2n)].
-    let raw = predict_raw_multi(&model, &columns);
+    // Dim-major raw approx (length 2*n): [mean(0..n), log-scale(n..2n)], seeded
+    // with the PER-DIM bias [mean, 0.5*log(var)] (the scalar `Model.bias` drops
+    // dim-1 — `predict_raw_multi_biased` carries the full per-dim bias).
+    let bias = per_dim_bias();
+    let raw = predict_raw_multi_biased(&model, &columns, &bias);
     // The RmseWithUncertainty transform -> object-major (n, 2) [mean, variance].
     let predictions = apply_prediction_type(PredictionType::RmseWithUncertainty, &raw);
 
@@ -109,7 +113,12 @@ fn virt_ensembles_predict_oracle() {
 
     let ve = apply_virtual_ensembles(&model, &columns, &bias, VIRTUAL_ENSEMBLES_COUNT)
         .unwrap_or_else(|e| panic!("apply_virtual_ensembles failed: {e:?}"));
-    let predictions = apply_prediction_type(PredictionType::VirtEnsembles, &ve);
+    let predictions = apply_ve_prediction_type(
+        PredictionType::VirtEnsembles,
+        &ve,
+        VIRTUAL_ENSEMBLES_COUNT,
+        APPROX_DIMENSION,
+    );
 
     let expected = load_f64_vec(&fixture("uncertainty_predict/virt_ensembles.npy")).unwrap();
     assert_eq!(
@@ -133,7 +142,12 @@ fn total_uncertainty_predict_oracle() {
 
     let ve = apply_virtual_ensembles(&model, &columns, &bias, VIRTUAL_ENSEMBLES_COUNT)
         .unwrap_or_else(|e| panic!("apply_virtual_ensembles failed: {e:?}"));
-    let predictions = apply_prediction_type(PredictionType::TotalUncertainty, &ve);
+    let predictions = apply_ve_prediction_type(
+        PredictionType::TotalUncertainty,
+        &ve,
+        VIRTUAL_ENSEMBLES_COUNT,
+        APPROX_DIMENSION,
+    );
 
     let expected = load_f64_vec(&fixture("uncertainty_predict/total_uncertainty.npy")).unwrap();
     assert_eq!(predictions.len(), n * 3, "TotalUncertainty output must be (n, 3)");

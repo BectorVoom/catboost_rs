@@ -317,6 +317,61 @@ pub fn predict_raw_multi(model: &Model, feature_values: &[Vec<f32>]) -> Vec<f64>
     predict_raw_multi_cat(model, feature_values, &[])
 }
 
+/// Apply `model` to a numeric feature view with a PER-DIMENSION bias, returning
+/// the DIMENSION-MAJOR raw approx of length `approx_dimension * n` (output index
+/// `d * n + i`) — the N-dim apply for models whose `scale_and_bias[1]` is a true
+/// per-dimension bias vector (e.g. RMSEWithUncertainty's `[mean, 0.5*log(var)]`,
+/// LOSS-06 / D-6.4-04).
+///
+/// The project's scalar [`Model::bias`] keeps only dim-0 (06.4-02 decision — no
+/// per-dim bias struct field), so [`predict_raw_multi`] seeds EVERY dim with that
+/// one scalar. That is WRONG for a genuinely multi-dim-bias model (the dim-1
+/// log-scale bias is dropped). This variant seeds output slot `d` with
+/// `per_dim_bias[d]` instead (the `treeStart == 0` per-dim bias path,
+/// `scale_and_bias.cpp:42`), leaving the leaf accumulation identical. A shorter
+/// `per_dim_bias` reads `0.0` for the missing dims (checked `.get`).
+///
+/// At `approx_dimension <= 1` with a single-element `per_dim_bias` this is
+/// byte-identical to [`predict_raw_multi`] (same leaf index, same `bias +
+/// leaf_value`); the scalar D-04 surface is unaffected.
+#[must_use]
+pub fn predict_raw_multi_biased(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    per_dim_bias: &[f64],
+) -> Vec<f64> {
+    let dim = model.approx_dimension.max(1);
+    let n = feature_values.first().map_or(0, Vec::len);
+
+    // dim-major output `out[d * n + i]`, seeded with the PER-DIM bias per slot.
+    let mut out = vec![0.0_f64; dim.saturating_mul(n)];
+    for d in 0..dim {
+        let bias_d = per_dim_bias.get(d).copied().unwrap_or(0.0);
+        for i in 0..n {
+            if let Some(slot) = out.get_mut(d.saturating_mul(n).saturating_add(i)) {
+                *slot = bias_d;
+            }
+        }
+    }
+
+    for obj in 0..n {
+        let row: Vec<f32> = feature_values
+            .iter()
+            .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+            .collect();
+        let cats: Vec<String> = Vec::new();
+        // Per dimension, accumulate this object's per-tree leaf values over the
+        // FULL tree sequence (the per-dim bias seed already holds + bias_d).
+        let contributions = apply_tree_slice_one(model, &row, &cats, 0, model.oblivious_trees.len(), dim);
+        for d in 0..dim {
+            if let Some(slot) = out.get_mut(d.saturating_mul(n).saturating_add(obj)) {
+                *slot += contributions.get(d).copied().unwrap_or(0.0);
+            }
+        }
+    }
+    out
+}
+
 /// The dim-aware accumulator backing [`predict_raw_multi`] (and the multi-output
 /// branch of [`predict_raw_cat`]).
 ///

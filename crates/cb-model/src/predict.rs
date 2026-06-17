@@ -30,8 +30,11 @@
 //! class-1), flattened row-major to match the upstream binary `predict` output
 //! (`eval_helpers.cpp:393`).
 
-/// The in-scope prediction types (RESEARCH D-10 — uncertainty types deferred to
-/// Phase 6).
+use cb_core::sum_f64;
+
+/// The in-scope prediction types: the Phase-4 deterministic transforms plus the
+/// Phase-6.4 uncertainty types (`RmseWithUncertainty` / `VirtEnsembles` /
+/// `TotalUncertainty` — LOSS-06, the Phase-4 D-10 deferral closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredictionType {
     /// The raw model score / logit (identity transform).
@@ -45,6 +48,26 @@ pub enum PredictionType {
     Class,
     /// `exp(approx)` (e.g. for Poisson-style exponentiated scores).
     Exponent,
+    /// RMSEWithUncertainty single-model predict (LOSS-06, the Phase-4 D-10
+    /// deferral closed): two columns `[mean = approx[0], variance =
+    /// exp(2*approx[1])]`. The variance is `CalcSquaredExponent(approx[1]) =
+    /// exp(2*x)` — NOT `exp(x)` and NOT `x²` (RESEARCH Pitfall 6,
+    /// `eval_processing.h:47`); the log-scale dim is `0.5*log(variance)`.
+    /// Consumes the DIM-MAJOR 2-dim raw approx (`[mean(0..n), log-scale(n..2n)]`).
+    RmseWithUncertainty,
+    /// Virtual-ensembles predict (LOSS-06): the `V` per-ensemble `[mean,
+    /// variance=exp(2*log-scale)]` pairs. Consumes the OBJECT-MAJOR `(n, V, 2)`
+    /// virtual-ensemble matrix from [`crate::apply_virtual_ensembles`]; only the
+    /// odd (log-scale) dims are `exp(2*x)`-transformed in place
+    /// (`eval_helpers.cpp:428-444`). VE-aware — apply via
+    /// [`apply_ve_prediction_type`].
+    VirtEnsembles,
+    /// Total-uncertainty predict (LOSS-06): the `[mean, knowledgeUncertainty,
+    /// dataUncertainty]` regression-uncertainty decomposition
+    /// (`CalcRegressionUncertaitny`, `eval_helpers.cpp:209-269`). Consumes the
+    /// OBJECT-MAJOR `(n, V, 2)` virtual-ensemble matrix. VE-aware — apply via
+    /// [`apply_ve_prediction_type`].
+    TotalUncertainty,
 }
 
 /// The default binary-class logit threshold (`eval_helpers.cpp:329`, Pitfall 4):
@@ -99,6 +122,130 @@ pub fn apply_prediction_type(prediction_type: PredictionType, approx: &[f64]) ->
         // `exp(approx)` — upstream uses FastExp; `f64::exp` is within 1e-5 (A2,
         // `eval_helpers.cpp:420` -> `CalcExponent`, `eval_processing.h:30-33`).
         PredictionType::Exponent => approx.iter().map(|&a| a.exp()).collect(),
+        // RMSEWithUncertainty single-model predict (LOSS-06): the DIM-MAJOR 2-dim
+        // raw approx `[mean(0..n), log-scale(n..2n)]` -> OBJECT-MAJOR `(n, 2)`
+        // `[mean, variance = exp(2*log-scale)]` (`eval_helpers.cpp:422-427`;
+        // `CalcSquaredExponent = exp(2x)`, Pitfall 6). `n = approx.len() / 2`; an
+        // odd length yields empty (guarded — no panic).
+        PredictionType::RmseWithUncertainty => {
+            let n = approx.len() / 2;
+            if approx.len() != 2 * n {
+                return Vec::new();
+            }
+            let mut out = Vec::with_capacity(approx.len());
+            for i in 0..n {
+                let mean = approx.get(i).copied().unwrap_or(0.0);
+                let log_scale = approx.get(n + i).copied().unwrap_or(0.0);
+                out.push(mean);
+                out.push((2.0 * log_scale).exp());
+            }
+            out
+        }
+        // VirtEnsembles / TotalUncertainty consume the VE matrix, not a single
+        // approx — they are VE-aware (`apply_ve_prediction_type`). On the
+        // single-approx path they pass the input through unchanged (no panic).
+        PredictionType::VirtEnsembles | PredictionType::TotalUncertainty => approx.to_vec(),
+    }
+}
+
+/// Apply a VIRTUAL-ENSEMBLE uncertainty prediction transform (LOSS-06) to the
+/// OBJECT-MAJOR `(n, V, dim)` virtual-ensemble matrix produced by
+/// [`crate::apply_virtual_ensembles`] — value at `i*(V*dim) + e*dim + d` is object
+/// `i`'s ensemble `e` dimension `d` RAW approx (dim 0 mean, dim 1 log-scale for
+/// RMSEWithUncertainty).
+///
+/// - [`PredictionType::VirtEnsembles`]: identity over the matrix with every
+///   ODD dimension (the log-scale dims) → `exp(2*x)` IN PLACE, so each ensemble
+///   reads `[mean, variance]` (`eval_helpers.cpp:428-444`). Output shape
+///   `(n, V, dim)`.
+/// - [`PredictionType::TotalUncertainty`]: per object over its `V` ensembles
+///   (`dimShift = dim`, `CalcRegressionUncertaitny`, `eval_helpers.cpp:209-269`):
+///   `mean = (1/V) Σ_e approx[e*dim]`,
+///   `knowledgeUncertainty = (1/V) Σ_e (approx[e*dim] - mean)²` (epistemic),
+///   `dataUncertainty = (1/V) Σ_e exp(2*approx[e*dim+1])` (aleatoric); output
+///   `(n, 3)` `[mean, knowledgeUncertainty, dataUncertainty]`.
+/// - any other [`PredictionType`]: the matrix unchanged (no panic).
+///
+/// All per-ensemble Σ route through [`cb_core::sum_f64`] (D-08). `n` is derived
+/// from `ve.len() / (virtual_ensembles_count * approx_dimension)`; a zero `V` /
+/// `dim` or a non-conforming length returns empty (guarded — no div-by-zero /
+/// panic). All access is checked `.get` (`indexing_slicing` deny).
+#[must_use]
+pub fn apply_ve_prediction_type(
+    prediction_type: PredictionType,
+    ve: &[f64],
+    virtual_ensembles_count: usize,
+    approx_dimension: usize,
+) -> Vec<f64> {
+    let v = virtual_ensembles_count;
+    let dim = approx_dimension;
+    if v == 0 || dim == 0 {
+        return Vec::new();
+    }
+    let block = v.saturating_mul(dim);
+    if block == 0 || ve.len() % block != 0 {
+        return Vec::new();
+    }
+    let n = ve.len() / block;
+    match prediction_type {
+        // The 2V-row matrix with the log-scale dims (odd `d`) -> exp(2*x).
+        PredictionType::VirtEnsembles => {
+            let mut out = Vec::with_capacity(ve.len());
+            for i in 0..n {
+                for e in 0..v {
+                    for d in 0..dim {
+                        let idx = i.saturating_mul(block).saturating_add(e * dim).saturating_add(d);
+                        let raw = ve.get(idx).copied().unwrap_or(0.0);
+                        // dim 0 = mean (identity); dim 1 = log-scale -> exp(2*x).
+                        if d % 2 == 1 {
+                            out.push((2.0 * raw).exp());
+                        } else {
+                            out.push(raw);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        // [mean, knowledgeUncertainty, dataUncertainty] per object (dimShift=dim).
+        PredictionType::TotalUncertainty => {
+            let v_f = v as f64;
+            let mut out = Vec::with_capacity(n * 3);
+            for i in 0..n {
+                // Gather the per-ensemble mean (dim 0) and exp(2*log-scale) (dim 1).
+                let means: Vec<f64> = (0..v)
+                    .map(|e| {
+                        let idx = i.saturating_mul(block).saturating_add(e * dim);
+                        ve.get(idx).copied().unwrap_or(0.0)
+                    })
+                    .collect();
+                let data_terms: Vec<f64> = (0..v)
+                    .map(|e| {
+                        let idx = i.saturating_mul(block).saturating_add(e * dim).saturating_add(1);
+                        let log_scale = ve.get(idx).copied().unwrap_or(0.0);
+                        (2.0 * log_scale).exp()
+                    })
+                    .collect();
+                // mean = (1/V) Σ_e mean_e.
+                let mean = sum_f64(&means) / v_f;
+                // knowledgeUncertainty = (1/V) Σ_e (mean_e - mean)^2 (epistemic).
+                let sq: Vec<f64> = means.iter().map(|&m| (m - mean) * (m - mean)).collect();
+                let knowledge = sum_f64(&sq) / v_f;
+                // dataUncertainty = (1/V) Σ_e exp(2*log-scale_e) (aleatoric).
+                let data = sum_f64(&data_terms) / v_f;
+                out.push(mean);
+                out.push(knowledge);
+                out.push(data);
+            }
+            out
+        }
+        // Not a VE transform: the matrix unchanged (no panic).
+        PredictionType::RawFormulaVal
+        | PredictionType::Probability
+        | PredictionType::LogProbability
+        | PredictionType::Class
+        | PredictionType::Exponent
+        | PredictionType::RmseWithUncertainty => ve.to_vec(),
     }
 }
 
@@ -227,9 +374,16 @@ pub fn apply_multiclass_prediction(
             }
             out
         }
-        // LogProbability / Exponent are not multiclass transforms in scope; fall
-        // back to the raw object-major approx (no NaN, no panic).
-        PredictionType::LogProbability | PredictionType::Exponent => {
+        // LogProbability / Exponent and the uncertainty types are not multiclass
+        // transforms in scope; fall back to the raw object-major approx (no NaN,
+        // no panic). The uncertainty types apply via `apply_prediction_type`
+        // (RmseWithUncertainty) / `apply_ve_prediction_type` (VirtEnsembles /
+        // TotalUncertainty), not this multiclass entry point.
+        PredictionType::LogProbability
+        | PredictionType::Exponent
+        | PredictionType::RmseWithUncertainty
+        | PredictionType::VirtEnsembles
+        | PredictionType::TotalUncertainty => {
             let mut out = Vec::with_capacity(approx.len());
             for i in 0..n {
                 out.extend(object_slice(i));
