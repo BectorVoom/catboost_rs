@@ -39,14 +39,19 @@ use cb_compute::{
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
 ///
 /// catboost CPU supports exactly Cosine (default) and L2 (`score_calcers.h`);
-/// the five additional variants (`SolarL2`/`NewtonL2`/`NewtonCosine`/`LOOL2`/`SatL2`)
-/// are GPU-only upstream (D-6.4-06) and route through the single
+/// the three additional FIRST-ORDER variants (`SolarL2`/`LOOL2`/`SatL2`) are GPU-only
+/// upstream (D-6.4-06) and route through the single
 /// [`cb_compute::multi_dim_split_score`] seam (D-6.4-03 single code path) wrapped as a
-/// one-dimension call so the dim=1 fold is byte-identical to the scalar score. For the
-/// Newton variants the caller must supply `leaves` whose `sum_weight` slot already
-/// carries the summed positive der2 hessian (via
-/// [`cb_compute::reduce_leaf_stats_newton`]); for every first-order variant `sum_weight`
-/// is the weight count, exactly as today.
+/// one-dimension call so the dim=1 fold is byte-identical to the scalar score. Every
+/// reachable variant here computes its per-leaf term from the first-order stats
+/// (`sum_weighted_delta` = gradient sum, `sum_weight` = weight count).
+///
+/// The second-order (Newton) score functions `NewtonL2` / `NewtonCosine` are NOT
+/// reachable on this path: `validate_score_function` (CR-01) rejects them at train
+/// time because the CPU scoring path produces only the first-order weight-count
+/// reduction, so they would silently degrade to L2 / Cosine. They remain in the
+/// `EScoreFunction` enum (the score FORMULA seam in `multi_dim_split_score`) for the
+/// future GPU der2-hessian-fill path, but cannot be selected for CPU training.
 #[inline]
 fn split_score(score_function: EScoreFunction, leaves: &[LeafStats], scaled_l2: f64) -> f64 {
     match score_function {

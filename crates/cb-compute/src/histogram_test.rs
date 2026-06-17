@@ -1,8 +1,7 @@
 //! Unit tests for the host-side ordered bucket reduction (D-02/D-05).
 
 use crate::histogram::{
-    collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, reduce_leaf_stats_newton,
-    LeafStats,
+    collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
 };
 
 #[test]
@@ -53,40 +52,6 @@ fn reduce_leaf_stats_ordered_determinism() {
     // Object order preserved -> sequential fold loses the 1.0, exactly as
     // cb_core::sum_f64 (the parity contract) does.
     assert_eq!(stats[0].sum_weighted_delta, 0.0);
-}
-
-#[test]
-fn reduce_leaf_stats_newton_fills_positive_hessian_in_weight_slot() {
-    // Newton fill (D-6.4-03): `sum_weighted_delta` is the gradient sum (as in
-    // reduce_leaf_stats), but `sum_weight` carries the POSITIVE summed hessian
-    // Σ(-der2*weight) — der2 is ≤0 (RMSE=-1, Logloss=-p(1-p)), negated to +.
-    // leaf 0 = {obj0, obj2}, leaf 1 = {obj1, obj3}.
-    let leaf_of = [0usize, 1, 0, 1];
-    let der1 = [1.0, 2.0, 3.0, 4.0];
-    // weighted der2 = der2 * weight, all ≤0 (e.g. RMSE der2=-1 * weight).
-    let weighted_der2 = [-1.0, -0.5, -1.0, -0.25];
-    let stats = reduce_leaf_stats_newton(&leaf_of, &der1, &weighted_der2, 2);
-    assert_eq!(stats.len(), 2);
-    // gradient sums match reduce_leaf_stats; hessian is negated der2 sum.
-    assert!((stats[0].sum_weighted_delta - 4.0).abs() < 1e-12); // 1+3
-    assert!((stats[0].sum_weight - 2.0).abs() < 1e-12); // -(-1 + -1)
-    assert!((stats[1].sum_weighted_delta - 6.0).abs() < 1e-12); // 2+4
-    assert!((stats[1].sum_weight - 0.75).abs() < 1e-12); // -(-0.5 + -0.25)
-}
-
-#[test]
-fn reduce_leaf_stats_newton_empty_leaf_is_zero() {
-    // A degenerate (empty) leaf yields zero gradient AND zero hessian — finite,
-    // never NaN/Inf (T-06.4A-01 robustness).
-    let leaf_of = [0usize, 0, 0];
-    let der1 = [1.0, 2.0, 3.0];
-    let weighted_der2 = [-1.0, -1.0, -1.0];
-    let stats = reduce_leaf_stats_newton(&leaf_of, &der1, &weighted_der2, 2);
-    assert_eq!(stats[1], LeafStats::default());
-    assert!(stats[1].sum_weight.is_finite());
-    // leaf 0: gradient 6.0, positive hessian 3.0.
-    assert!((stats[0].sum_weighted_delta - 6.0).abs() < 1e-12);
-    assert!((stats[0].sum_weight - 3.0).abs() < 1e-12);
 }
 
 #[test]

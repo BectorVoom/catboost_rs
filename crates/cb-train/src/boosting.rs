@@ -936,6 +936,36 @@ fn rmse_uncertainty_starting_approx(target: &[f64]) -> [f64; 2] {
 ///
 /// # Errors
 /// Returns [`CbError::OutOfRange`] for an unsupported `(loss, method)` pair.
+/// Reject split-score functions that have no faithful CPU training implementation
+/// (CR-01). `NewtonL2` / `NewtonCosine` are second-order calcers
+/// (`IsSecondOrderScoreFunction`, `enum_helpers.cpp:830-847`): they reuse the
+/// `L2` / `Cosine` score FORMULA verbatim and depend on the histogram FILL placing
+/// the summed positive der2 hessian in the `sum_weight` leaf-stat slot. The CPU
+/// scoring path produces only the first-order (weight-count) reduction, so a Newton
+/// score function would silently degrade to its first-order counterpart. These are
+/// GPU-only upstream (D-6.4-06); reject them rather than mislead the caller.
+///
+/// The first-order GPU-only variants (`SolarL2` / `LOOL2` / `SatL2`) compute their
+/// per-leaf term purely from the gradient sum and the weight count, so they remain
+/// correct (self-oracled, D-6.4-06) on the CPU path and are NOT rejected here.
+fn validate_score_function(score_function: cb_compute::EScoreFunction) -> CbResult<()> {
+    use cb_compute::EScoreFunction;
+    if matches!(
+        score_function,
+        EScoreFunction::NewtonL2 | EScoreFunction::NewtonCosine
+    ) {
+        return Err(CbError::OutOfRange(format!(
+            "{score_function:?} is a second-order (Newton) split-score function that \
+             requires a der2-hessian histogram fill; it is GPU-only upstream and has \
+             no faithful CPU training implementation (the CPU scoring path produces \
+             only the first-order weight-count reduction, which would silently \
+             degrade NewtonL2 to L2 and NewtonCosine to Cosine). Use a first-order \
+             score function (Cosine, L2, SolarL2, LOOL2, or SatL2)."
+        )));
+    }
+    Ok(())
+}
+
 fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
     if matches!(method, LeafMethod::Exact)
         && !matches!(
@@ -1736,6 +1766,17 @@ fn train_inner<R: Runtime>(
     // NaN/Inf derivatives that poison the histogram and leaf reductions, so it is
     // rejected up front with a typed CbError rather than producing a corrupt model.
     params.loss.validate()?;
+
+    // Reject the second-order (Newton) split-score functions on the CPU training
+    // path (CR-01): `NewtonL2` / `NewtonCosine` reuse the L2 / Cosine score formula
+    // VERBATIM and rely entirely on a der2-hessian histogram fill in the
+    // `sum_weight` leaf-stat slot. The CPU scoring path
+    // (`multi_dim_candidate_score`) only ever produces the FIRST-ORDER
+    // (weight-count) reduction, so selecting a Newton score function would silently
+    // compute its first-order counterpart instead of the requested second-order
+    // score. These variants are GPU-only upstream (D-6.4-06); reject them up front
+    // with a typed error rather than producing a silently-wrong split score.
+    validate_score_function(params.score_function)?;
 
     // Reject unsupported (loss, leaf_method) combinations up front (WR-01 /
     // WR-02): an Exact method on a loss with no defined optimizer would silently

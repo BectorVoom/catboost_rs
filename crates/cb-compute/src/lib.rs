@@ -31,8 +31,7 @@ pub use custom::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle,
 };
 pub use histogram::{
-    collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, reduce_leaf_stats_newton,
-    LeafStats,
+    collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
 };
 pub use leaf::{
     calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
