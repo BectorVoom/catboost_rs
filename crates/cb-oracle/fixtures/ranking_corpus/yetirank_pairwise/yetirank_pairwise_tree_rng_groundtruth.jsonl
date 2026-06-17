@@ -1,4 +1,5 @@
 {"event":"tree_rng_start","iter":0,"fold_count":1,"cc":0}
+{"event":"update_pairs","random_seed":15633625930631570581,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_pre_gts","iter":0,"cc":2}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":2}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":4}
@@ -12,8 +13,11 @@
 {"event":"gts_level_rng","depth":1,"cc_start":21,"cc_after_calcscores":22,"cc_after_selectbest":32,"calcscores_draws":1,"selectbest_draws":10}
 {"event":"tree_rng_post_gts","iter":0,"cc":32}
 {"event":"tree_rng_pre_leaf","iter":0,"cc":32}
+{"event":"update_pairs","random_seed":10655570528986688571,"block_count":5,"query_begin":0,"query_end":5}
+{"event":"update_pairs","random_seed":5403541349322082677,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_end","iter":0,"cc":34}
 {"event":"tree_rng_start","iter":1,"fold_count":1,"cc":34}
+{"event":"update_pairs","random_seed":18221665289867341830,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_pre_gts","iter":1,"cc":36}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":2}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":6}
@@ -27,8 +31,11 @@
 {"event":"gts_level_rng","depth":1,"cc_start":63,"cc_after_calcscores":64,"cc_after_selectbest":74,"calcscores_draws":1,"selectbest_draws":10}
 {"event":"tree_rng_post_gts","iter":1,"cc":74}
 {"event":"tree_rng_pre_leaf","iter":1,"cc":74}
+{"event":"update_pairs","random_seed":668001753116302666,"block_count":5,"query_begin":0,"query_end":5}
+{"event":"update_pairs","random_seed":8242757884959957636,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_end","iter":1,"cc":76}
 {"event":"tree_rng_start","iter":2,"fold_count":1,"cc":76}
+{"event":"update_pairs","random_seed":6467907799201081327,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_pre_gts","iter":2,"cc":78}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":2}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":4}
@@ -42,8 +49,11 @@
 {"event":"gts_level_rng","depth":1,"cc_start":97,"cc_after_calcscores":98,"cc_after_selectbest":106,"calcscores_draws":1,"selectbest_draws":8}
 {"event":"tree_rng_post_gts","iter":2,"cc":106}
 {"event":"tree_rng_pre_leaf","iter":2,"cc":106}
+{"event":"update_pairs","random_seed":14874550880909208717,"block_count":5,"query_begin":0,"query_end":5}
+{"event":"update_pairs","random_seed":9874501368574407582,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_end","iter":2,"cc":108}
 {"event":"tree_rng_start","iter":3,"fold_count":1,"cc":108}
+{"event":"update_pairs","random_seed":3382290655990315007,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_pre_gts","iter":3,"cc":110}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":4}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":2}
@@ -57,8 +67,11 @@
 {"event":"gts_level_rng","depth":1,"cc_start":133,"cc_after_calcscores":134,"cc_after_selectbest":144,"calcscores_draws":1,"selectbest_draws":10}
 {"event":"tree_rng_post_gts","iter":3,"cc":144}
 {"event":"tree_rng_pre_leaf","iter":3,"cc":144}
+{"event":"update_pairs","random_seed":464974090676558225,"block_count":5,"query_begin":0,"query_end":5}
+{"event":"update_pairs","random_seed":4700170923500328149,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_end","iter":3,"cc":146}
 {"event":"tree_rng_start","iter":4,"fold_count":1,"cc":146}
+{"event":"update_pairs","random_seed":18142958534302089013,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_pre_gts","iter":4,"cc":148}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":2}
 {"event":"cand_score_rng","dist":"Normal","stdev":0,"draws":2}
@@ -72,4 +85,6 @@
 {"event":"gts_level_rng","depth":1,"cc_start":167,"cc_after_calcscores":168,"cc_after_selectbest":184,"calcscores_draws":1,"selectbest_draws":16}
 {"event":"tree_rng_post_gts","iter":4,"cc":184}
 {"event":"tree_rng_pre_leaf","iter":4,"cc":184}
+{"event":"update_pairs","random_seed":3795848668619038260,"block_count":5,"query_begin":0,"query_end":5}
+{"event":"update_pairs","random_seed":6097890924767598559,"block_count":5,"query_begin":0,"query_end":5}
 {"event":"tree_rng_end","iter":4,"cc":186}

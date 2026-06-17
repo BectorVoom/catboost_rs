@@ -141,6 +141,13 @@ fn fix_seq(seq1: u32, seq2: u32) -> u32 {
 pub struct TFastRng64 {
     r1: Lcg32,
     r2: Lcg32,
+    /// Number of [`Self::gen_rand`] primitive draws consumed since construction.
+    /// Mirrors upstream `TRestorableFastRng64::GetCallCount()`
+    /// (`restorable_rng.h:47`) — every higher-level draw (`gen_rand_real1`,
+    /// `std_normal` via Marsaglia-polar) bottoms out in `gen_rand`, so this is the
+    /// exact parity counter the per-tree RNG-draw oracles compare against the
+    /// instrumented trainer's call-count fences (06.3-17).
+    call_count: u64,
 }
 
 impl TFastRng64 {
@@ -152,6 +159,7 @@ impl TFastRng64 {
         Self {
             r1: Lcg32::new(seed1, seq1),
             r2: Lcg32::new(seed2, fix_seq(seq1, seq2)),
+            call_count: 0,
         }
     }
 
@@ -175,6 +183,7 @@ impl TFastRng64 {
     pub fn gen_rand(&mut self) -> u64 {
         let x = self.r1.gen_rand32() as u64;
         let y = self.r2.gen_rand32() as u64;
+        self.call_count = self.call_count.wrapping_add(1);
         (x << 32) | y
     }
 
@@ -183,6 +192,17 @@ impl TFastRng64 {
     pub fn advance(&mut self, delta: u64) {
         self.r1.advance(delta);
         self.r2.advance(delta);
+        self.call_count = self.call_count.wrapping_add(delta);
+    }
+
+    /// Number of [`Self::gen_rand`] primitive draws consumed since construction
+    /// (mirrors upstream `TRestorableFastRng64::GetCallCount()`). Used by the
+    /// per-tree RNG-draw oracles to assert the seeder lands the context RNG on the
+    /// exact trainer call-count fence.
+    #[inline]
+    #[must_use]
+    pub fn call_count(&self) -> u64 {
+        self.call_count
     }
 
     /// `TCommonRNG::GenRandReal1` for a `ui64` engine (`common_ops.h:19,99`):

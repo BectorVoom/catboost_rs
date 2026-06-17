@@ -264,14 +264,6 @@ pub struct YetiRankTreeSeeder {
     group_count: usize,
     n_features: usize,
     depth: usize,
-    /// `*Pairwise` (`IsPairwiseScoring`) split path: upstream routes `CalcScores`
-    /// through `TPairwiseScoreCalcer` and the `SetBestScore` random-score normals
-    /// are drawn from a CHILD `TRestorableFastRng64(randSeed)` that does NOT
-    /// advance `LearnProgress->Rand`. The pointwise seeder model folded those
-    /// normals into the main-RNG phase as an empirical pointwise calibration; the
-    /// pairwise per-level draw count differs. This flag selects the pairwise
-    /// per-level advance accounting.
-    pairwise: bool,
 }
 
 /// The per-tree YetiRank query seeds: one set for the derivative/split recalc, one
@@ -288,6 +280,11 @@ pub struct YetiRankTreeSeeds {
     /// Per-group inner seeds for the AVERAGING-fold leaf-value competitor
     /// re-sample (the stored model leaf values).
     pub leafval: Vec<u64>,
+    /// The recalc `randomSeed` values passed to `UpdatePairsForYetiRank` for the
+    /// deriv / learnfold / leafval phases respectively (the trainer's
+    /// `update_pairs.random_seed` fences). Exposed for the per-tree RNG-seed
+    /// oracle to compare call-for-call against the instrumented trainer.
+    pub recalc_seeds: [u64; 3],
 }
 
 impl YetiRankTreeSeeder {
@@ -297,23 +294,38 @@ impl YetiRankTreeSeeder {
         Self::new_with_scoring(random_seed, group_count, n_features, depth, false)
     }
 
-    /// As [`Self::new`] but selecting the pairwise (`IsPairwiseScoring`) per-level
-    /// RNG-advance accounting (see the `pairwise` field).
+    /// As [`Self::new`] but kept for the `*Pairwise` (`IsPairwiseScoring`) call site.
+    ///
+    /// 06.3-17: the `pairwise` argument is retained for caller-site clarity /
+    /// API stability but no longer changes the per-tree RNG-advance accounting —
+    /// the instrumented `yetirank_pairwise_tree_rng_groundtruth.jsonl` fences
+    /// proved BOTH the pointwise and the pairwise split paths draw the
+    /// per-candidate `BestScore.GetInstance` normals directly from
+    /// `LearnProgress->Rand` (see [`Self::next_tree`]). The single draw model now
+    /// serves both losses.
     #[must_use]
     pub fn new_with_scoring(
         random_seed: u64,
         group_count: usize,
         n_features: usize,
         depth: usize,
-        pairwise: bool,
+        _pairwise: bool,
     ) -> Self {
         Self {
             rng: TFastRng64::from_seed(random_seed),
             group_count,
             n_features,
             depth,
-            pairwise,
         }
+    }
+
+    /// The persistent context-RNG call count (`TRestorableFastRng64::GetCallCount`)
+    /// consumed so far. Exposed so the per-tree RNG-draw oracle can assert the
+    /// seeder lands on the exact trainer call-count fence
+    /// (`yetirank_pairwise_tree_rng_groundtruth.jsonl` `tree_rng_start.cc`).
+    #[must_use]
+    pub fn call_count(&self) -> u64 {
+        self.rng.call_count()
     }
 
     /// Advance the context RNG through ONE tree's full draw sequence and return the
@@ -338,26 +350,38 @@ impl YetiRankTreeSeeder {
 
         // 3. per-level GreedyTensorSearch draws (consumed, output-irrelevant at
         //    random_strength=0 / Rsm=1, but they ADVANCE the shared RNG phase).
+        //
+        // 06.3-17 calibration (instrumented YetiRankPairwise trainer, the
+        // `yetirank_pairwise_tree_rng_groundtruth.jsonl` per-level fences):
+        // BOTH the pointwise and the `*Pairwise` (`IsPairwiseScoring`) split paths
+        // draw the per-candidate `TRandomScore::GetInstance` normals DIRECTLY from
+        // `LearnProgress->Rand` (`greedy_tensor_search.cpp:952` —
+        // `candidate.BestScore.GetInstance(ctx.LearnProgress->Rand)`). The earlier
+        // `pairwise`-skip hypothesis (that the pairwise child `TRestorableFastRng64`
+        // bypasses the main RNG) was REFUTED by the `cand_score_rng` fence: every
+        // candidate logs `dist=Normal, stdev=0` and a non-zero Marsaglia-polar
+        // rejection draw count (2/4/6/8) on the PERSISTENT RNG. So the pairwise path
+        // advances the main RNG by the SAME per-candidate normals as the pointwise
+        // path; the `pairwise` flag no longer gates the normal draws.
         for _level in 0..self.depth {
-            // SelectCandidates: one Rsm GenRandReal1 per float-feature sublist.
+            // SelectCandidates: one Rsm GenRandReal1 per float-feature sublist
+            // (greedy_tensor_search.cpp:334, OneFeature). `n_features` draws.
             for _ in 0..self.n_features {
                 let _ = self.rng.gen_rand_real1();
             }
-            // CalcScores: one per-level score randSeed.
+            // CalcScores: one per-level score randSeed
+            // (greedy_tensor_search.cpp:884, `Rand.GenRand()`).
             let _ = self.rng.gen_rand();
-            // SelectBestCandidate: one Box-Muller normal per candidate (one
-            // BestScore per float feature). Upstream draws these from a CHILD
-            // `TRestorableFastRng64(randSeed)` (greedy_tensor_search.cpp:718,
-            // tensor_search_helpers.cpp:724) that does NOT advance
-            // `LearnProgress->Rand`. The POINTWISE seeder model folds them into the
-            // main-RNG phase as an empirical calibration that matches the
-            // instrumented pointwise trainer; the PAIRWISE split path
-            // (`TPairwiseScoreCalcer`) does not, so it must NOT advance the main
-            // RNG by these normals (`pairwise == true`).
-            if !self.pairwise {
-                for _ in 0..self.n_features {
-                    let _ = std_normal(&mut self.rng);
-                }
+            // SelectBestCandidate: one Box-Muller (Marsaglia-polar) standard-normal
+            // per candidate (`BestScore.GetInstance` → `NormalDistribution(rand, 0,
+            // StDev)` → `StdNormalDistribution`, greedy_tensor_search.cpp:952 +
+            // rand_score.h:42-44). One `BestScore` per float-feature candidate;
+            // `n_features` candidates. The draw is taken even at `StDev==0` (the
+            // value is discarded but the RNG still advances). The variable
+            // (rejection-driven) even draw count is reproduced bit-exact by
+            // [`cb_core::std_normal`] over the shared [`TFastRng64`].
+            for _ in 0..self.n_features {
+                let _ = std_normal(&mut self.rng);
             }
         }
 
@@ -397,7 +421,12 @@ impl YetiRankTreeSeeder {
         let leafval_base = self.rng.gen_rand();
         let leafval = derive_per_tree_query_seeds(leafval_base, self.group_count);
 
-        YetiRankTreeSeeds { deriv, learnfold, leafval }
+        YetiRankTreeSeeds {
+            deriv,
+            learnfold,
+            leafval,
+            recalc_seeds: [deriv_recalc_seed, learnfold_recalc_seed, leafval_base],
+        }
     }
 }
 

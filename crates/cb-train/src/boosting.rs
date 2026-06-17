@@ -1817,14 +1817,24 @@ fn train_inner<R: Runtime>(
     // per-tree, per-group first-Gumbel stream). `next_tree()` is called once per
     // boosting iteration below to yield this tree's deriv + leafval per-group seeds.
     // Candidate-sublist count for the per-level split-search draws: ONE
-    // `OneFeature` candidate sublist per FLOAT feature that has at least one border
-    // (`AddFloatFeatures` skips border-less features). This is the count of Rsm
-    // selection draws AND the count of `SelectBestCandidate` Box-Muller normals per
-    // level (one `BestScore` per feature). Corpus: 4 float features, all bordered.
-    let yetirank_n_candidate_features = feature_borders
-        .iter()
-        .filter(|b| !b.is_empty())
-        .count();
+    // `OneFeature` candidate sublist per FLOAT feature that is a TRAINING candidate.
+    // This is the count of Rsm selection `GenRandReal1` draws AND the count of
+    // `SelectBestCandidate` Box-Muller normals per level (one `BestScore` per
+    // candidate feature).
+    //
+    // WR-02 FIX (06.3-17): the trainer counts EVERY float feature it quantized in
+    // the LEARN data — a feature that ends up UNUSED in the final model (no SELECTED
+    // borders, e.g. corpus feature 2) STILL consumed an Rsm draw + a normal per
+    // level during the search. The model.json lists every such float feature in
+    // `features_info.float_features` (here surfaced as `feature_borders`), with an
+    // EMPTY `borders` vec when none of its candidate borders were chosen. The prior
+    // `!b.is_empty()` filter UNDER-COUNTED by dropping these unused-but-quantized
+    // features (3 instead of 4 on the corpus), which short-changed the per-tree GTS
+    // draw count and desynced the learnfold/leafval recalc seeds from tree 1 onward
+    // (instrumented `cand_score_rng` shows 4 candidates/level). Count ALL listed
+    // float features — each listed feature was a training candidate. A truly
+    // constant feature is NOT listed by upstream, so it never inflates the count.
+    let yetirank_n_candidate_features = feature_borders.len();
     let mut yetirank_seeder: Option<crate::YetiRankTreeSeeder> = if is_yetirank {
         Some(crate::YetiRankTreeSeeder::new_with_scoring(
             params.random_seed,
