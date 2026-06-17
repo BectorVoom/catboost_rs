@@ -54,7 +54,7 @@
 - [x] **LOSS-04**: Ranking losses — YetiRank(/Pairwise), PairLogit(/Pairwise), QueryRMSE, QuerySoftMax, LambdaMart, StochasticRank
 - [x] **LOSS-05**: Ranking metrics — NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC — all nine eval-only on the widened EvalMetric::eval_grouped seam (06.3-05), oracle-locked ≤1e-5 vs catboost 1.2.10
 - [~] **LOSS-06**: Prediction types — Probability, LogProbability, Class, RawFormulaVal, Exponent, RMSEWithUncertainty, VirtEnsembles, TotalUncertainty (Plan 04-02: the five in-scope deterministic types — RawFormulaVal/Probability/LogProbability/Class/Exponent — are implemented and oracle-locked ≤1e-5; the uncertainty types RMSEWithUncertainty/VirtEnsembles/TotalUncertainty are deferred to Phase 6 per D-10)
-- [ ] **LOSS-07**: Custom objectives/metrics — Rust trait + Python callback bridge
+- [x] **LOSS-07**: Custom objectives/metrics — Rust trait + Python callback bridge
 - [x] **LOSS-08**: Uncertainty estimation — RMSEWithUncertainty, virtual ensembles
 - [x] **LOSS-09**: Score functions — SolarL2, Cosine, NewtonL2, NewtonCosine, LOOL2, SatL2, L2 (06.4-01: all 7 EScoreFunction variants implemented; Cosine/L2 shipped 05-19; the 5 GPU-only fns self-oracled vs hand-computed CUDA arithmetic per D-6.4-06 weakened-oracle — NOT a ≤1e-5-vs-upstream-CPU lock; Newton live-search der2 wiring deferred to Phase-7 GPU)
 
