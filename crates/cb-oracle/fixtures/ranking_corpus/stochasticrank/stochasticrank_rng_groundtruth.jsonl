@@ -1,0 +1,7 @@
+{"event":"gauss_draw","group":0,"sample":0,"doc":0,"noise":-0.697193}
+{"event":"score","group":0,"sample":0,"doc":0,"score":-0.397193}
+{"event":"gauss_draw","group":0,"sample":0,"doc":1,"noise":0.853079}
+{"event":"score","group":0,"sample":0,"doc":1,"score":0.453079}
+{"event":"gauss_draw","group":0,"sample":0,"doc":2,"noise":-0.504139}
+{"event":"score","group":0,"sample":0,"doc":2,"score":-0.404139}
+{"event":"sorted_order","group":0,"sample":0,"order":[1,0,2]}
