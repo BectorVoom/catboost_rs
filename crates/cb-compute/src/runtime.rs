@@ -783,6 +783,28 @@ pub enum EScoreFunction {
     /// L2 split score (variance reduction). cb-train's historical hardcoded
     /// choice; only correct for configs that select it explicitly.
     L2,
+    /// SolarL2 split score (`score_calcers.cuh:22-24`): per-leaf term
+    /// `weight > 1e-20 ? (-sum*sum)*(1 + 2*ln(weight + 1.0))/weight : 0.0`.
+    /// GPU-only upstream (D-6.4-06): no CPU training ground truth — the Rust port
+    /// is self-oracled against the hand-computed CUDA arithmetic, NOT a strict lock.
+    SolarL2,
+    /// NewtonL2 split score (`pointwise_scores.cu:504-510`): reuses the [`Self::L2`]
+    /// formula VERBATIM; the only difference is the histogram fill, which feeds the
+    /// summed positive `der2` hessian into the `sum_weight` leaf-stat slot
+    /// (second-order, `enum_helpers.cpp:830-847`). GPU-only upstream (D-6.4-06).
+    NewtonL2,
+    /// NewtonCosine split score (`pointwise_scores.cu:512-521`): reuses the
+    /// [`Self::Cosine`] formula VERBATIM; like [`Self::NewtonL2`] the difference is
+    /// the der2 histogram fill, not the score math. GPU-only upstream (D-6.4-06).
+    NewtonCosine,
+    /// LOOL2 (leave-one-out L2) split score (`score_calcers.cuh:83-87`):
+    /// `adjust = weight>1.0 ? weight/(weight-1.0) : 0.0; adjust*=adjust;
+    /// weight>0.0 ? adjust*(-sum*sum)/weight : 0.0`. GPU-only upstream (D-6.4-06).
+    LOOL2,
+    /// SatL2 (saturated L2) split score (`score_calcers.cuh:114-117`):
+    /// `adjust = weight>2.0 ? weight*(weight-2.0)/(weight*weight-3.0*weight+1.0) : 0.0;
+    /// weight>0.0 ? adjust*(-sum*sum)/weight : 0.0`. GPU-only upstream (D-6.4-06).
+    SatL2,
 }
 
 /// The per-object first and second derivatives returned by

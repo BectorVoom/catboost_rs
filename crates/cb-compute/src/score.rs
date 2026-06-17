@@ -125,8 +125,13 @@ pub fn multi_dim_split_score(
     }
     let numerator = sum_f64(&num_terms);
     match score_function {
-        EScoreFunction::L2 => numerator,
-        EScoreFunction::Cosine => {
+        // NewtonL2 (`pointwise_scores.cu:504-510`) reuses the L2 calcer VERBATIM —
+        // the second-order distinction is the histogram FILL (summed positive der2 in
+        // the `sum_weight` slot, wired in cb-train/histogram), NOT this score formula.
+        EScoreFunction::L2 | EScoreFunction::NewtonL2 => numerator,
+        // NewtonCosine (`pointwise_scores.cu:512-521`) reuses the Cosine calcer
+        // VERBATIM — same der2-fill-vs-formula split as NewtonL2.
+        EScoreFunction::Cosine | EScoreFunction::NewtonCosine => {
             // Denominator: the seeded `1e-100` first summand (matching the scalar
             // Cosine seed so dim=1 accumulation order is identical), then the
             // per-(dim,leaf) `avrg²·SW` terms across all dims.
@@ -141,7 +146,96 @@ pub fn multi_dim_split_score(
             let denominator = sum_f64(&den_terms);
             numerator / denominator.sqrt()
         }
+        // SolarL2 (`score_calcers.cuh:22-24`): per-leaf scalar
+        // `weight > 1e-20 ? (-sum*sum)*(1 + 2*ln(weight + 1.0))/weight : 0.0`, folded
+        // through `sum_f64` in dimension-then-leaf order (mirroring the L2 num fold).
+        EScoreFunction::SolarL2 => {
+            let terms = solar_l2_terms(per_dim_leaves);
+            sum_f64(&terms)
+        }
+        // LOOL2 (`score_calcers.cuh:83-87`).
+        EScoreFunction::LOOL2 => {
+            let terms = loo_l2_terms(per_dim_leaves);
+            sum_f64(&terms)
+        }
+        // SatL2 (`score_calcers.cuh:114-117`).
+        EScoreFunction::SatL2 => {
+            let terms = sat_l2_terms(per_dim_leaves);
+            sum_f64(&terms)
+        }
     }
+}
+
+/// SolarL2 per-leaf terms across all dimensions (dimension-then-leaf order):
+/// `weight > 1e-20 ? (-sum*sum) * (1 + 2*ln(weight + 1.0)) / weight : 0.0`
+/// (`score_calcers.cuh:22-24`). Returned as a `Vec` so the caller folds through the
+/// single sanctioned reduction primitive (D-08).
+fn solar_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
+    let mut terms: Vec<f64> = Vec::new();
+    for leaves in per_dim_leaves {
+        for &stats in leaves {
+            let sum = stats.sum_weighted_delta;
+            let weight = stats.sum_weight;
+            let term = if weight > 1e-20 {
+                (-sum * sum) * (1.0 + 2.0 * (weight + 1.0).ln()) / weight
+            } else {
+                0.0
+            };
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// LOOL2 per-leaf terms (`score_calcers.cuh:83-87`):
+/// `adjust = weight>1.0 ? weight/(weight-1.0) : 0.0; adjust*=adjust;
+/// weight>0.0 ? adjust*(-sum*sum)/weight : 0.0`.
+fn loo_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
+    let mut terms: Vec<f64> = Vec::new();
+    for leaves in per_dim_leaves {
+        for &stats in leaves {
+            let sum = stats.sum_weighted_delta;
+            let weight = stats.sum_weight;
+            let mut adjust = if weight > 1.0 {
+                weight / (weight - 1.0)
+            } else {
+                0.0
+            };
+            adjust *= adjust;
+            let term = if weight > 0.0 {
+                adjust * (-sum * sum) / weight
+            } else {
+                0.0
+            };
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// SatL2 per-leaf terms (`score_calcers.cuh:114-117`):
+/// `adjust = weight>2.0 ? weight*(weight-2.0)/(weight*weight-3.0*weight+1.0) : 0.0;
+/// weight>0.0 ? adjust*(-sum*sum)/weight : 0.0`.
+fn sat_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
+    let mut terms: Vec<f64> = Vec::new();
+    for leaves in per_dim_leaves {
+        for &stats in leaves {
+            let sum = stats.sum_weighted_delta;
+            let weight = stats.sum_weight;
+            let adjust = if weight > 2.0 {
+                weight * (weight - 2.0) / (weight * weight - 3.0 * weight + 1.0)
+            } else {
+                0.0
+            };
+            let term = if weight > 0.0 {
+                adjust * (-sum * sum) / weight
+            } else {
+                0.0
+            };
+            terms.push(term);
+        }
+    }
+    terms
 }
 
 // ----------------------------------------------------------------------------
