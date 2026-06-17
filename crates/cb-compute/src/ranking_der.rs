@@ -671,11 +671,16 @@ fn compute_dcg_pos_weights(
         // idealDCG = CalcDCG(sortedTargets desc, posWeights) (error_functions.cpp:1530).
         let mut sorted: Vec<f64> = targets.to_vec();
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let mut ideal_dcg = 0.0_f64;
-        for (pos, &t) in sorted.iter().enumerate().take(query_top_size) {
-            // CalcDCG = Σ numerator(target) * posWeight (error_functions.cpp:1572-...).
-            ideal_dcg += ndcg_numerator(t) * pos_weights.get(pos).copied().unwrap_or(0.0);
-        }
+        // CalcDCG = Σ numerator(target) * posWeight (error_functions.cpp:1572-...),
+        // reduced through cb_core::sum_f64 (D-08, doc-ascending order) to match the
+        // sibling lambdamart_ideal_ndcg's ordered fold — no raw += accumulation.
+        let ideal_terms: Vec<f64> = sorted
+            .iter()
+            .enumerate()
+            .take(query_top_size)
+            .map(|(pos, &t)| ndcg_numerator(t) * pos_weights.get(pos).copied().unwrap_or(0.0))
+            .collect();
+        let ideal_dcg = sum_f64(&ideal_terms);
         if ideal_dcg > f64::EPSILON {
             for w in pos_weights.iter_mut().take(query_top_size) {
                 *w /= ideal_dcg;
