@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: "06.3-03 COMPLETE (commits 9b2606d Task1 / b25a2be Task2 / bef767d Task3) — LOSS-04 Wave B. LambdaMart (listwise) ships end-to-end per-stage ≤1e-5 vs catboost 1.2.10; PairLogit/PairLogitPairwise der + the Cholesky pairwise-leaf path + is_pairwise_scoring routing LAND and are unit-tested green, with the PairLogit/PairLogitPairwise per-stage ORACLE DEFERRED on a precisely-isolated pair-weight normalization gap (deferred-items.md — NO #[ignore]/NO weakened tolerance). Task1: Loss::{PairLogit,PairLogitPairwise,LambdaMart{metric,sigma,top,norm}}+LambdaMartMetric, pairlogit_pair_prob/lambdamart_pair_grad primitives, wired PairLogit (Competitors scatter-der, inline exp) + LambdaMart (NDCG per-pair lambda grad) arms, is_pairwise_scoring/is_plain_only, exhaustive Loss arms across cb-backend+cb-train+3 test files. Task2: pairwise_leaves.rs Cholesky solve (2×2 + general via REUSED cb_compute::pairwise_cholesky_solve + diag/nonDiag reg + MakeZeroAverage), BIT-EXACT vs pairwise_leaves_calculation_ut.cpp. Task3: boosting THIRD leaf branch (is_pairwise_scoring), LambdaMart oracle GREEN — unlocked by the RULE-1 newton_leaf_delta fix (divide verbatim for NEGATIVE denominators; listwise positive hessian; only exact-zero guarded; regression losses unaffected). Gates: cb-compute 113/113, pairwise_leaves 6/6, lambdamart_oracle 1/1, full cb-train suite green (QueryRMSE/QuerySoftMax + D-04 no-regression), cargo check --workspace --tests GREEN. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-04 (YetiRank + StochasticRank, Wave C instrumented) + the PairLogit oracle follow-up. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-03-SUMMARY.md."
-last_updated: "2026-06-17T07:49:57.509Z"
-last_activity: "2026-06-17 -- 06.3-14 EXT: YetiRank END-TO-END per-stage oracle CLOSED <=1e-5 (per-tree multi-block seed plumbing subsystem + dual fold approx + f32 sampler; D-07 trainer-level RNG closed bit-exact vs instrumented trainer, all 5 trees). YetiRankPairwise deferred on pairwise split-scorer (06.3-13); StochasticRank deferred on per-group noise-seed model."
+status: executing
+stopped_at: "06.3-15 COMPLETE (commits 03ae077 Task1 / 653e083 Task2) — LOSS-04 pairwise split-scorer ENABLER. The Rule-4 architectural piece the 06.3-13/14 verification isolated (SPLIT-SELECTION divergence for PairLogitPairwise + YetiRankPairwise) LANDS as a pure cb-compute library: compute_der_sums (ComputeDerSums) + compute_pair_weight_statistics (ComputePairWeightStatistics, OneFeature) + calculate_pairwise_score (CalculatePairwiseScore + TPairwiseScoreCalcer::CalculateScore + UpdateWeightSumFromTotal/NonDiagStats) + BucketPairWeightStatistics, exported from lib.rs. Per-split leaf solve reuses crate::pairwise_cholesky_solve via a cb-compute-LOCAL calculate_pairwise_leaf_values twin (cb-compute can't depend on cb-train; layering) — 2×2 closed form + general (n-1)×(n-1) Cholesky + diag/nonDiag reg + MakeZeroAverage. NO new crate, NO tree-search wiring (that's 06.3-16), NO fixture frozen, NO tolerance touched (library-only). All reductions via cb_core::sum_f64 (D-08); only documented upstream-order scatter cells use raw +=/-=. Bounds-guarded scatter -> CbError::OutOfRange (T-06.3-15-01, public fns return CbResult — Rule-2 deviation from the bare-return artifact table to honor the threat mitigation); degenerate Cholesky -> zeros -> finite 0.0 score not NaN (T-06.3-15-02). Self-oracled: der_sums + pair-weight stats hand-derived bit-for-bit; calculate_pairwise_score vs an INDEPENDENT Gaussian-elimination reference solver ≤1e-9; single-leaf 2×2 closed-form re-derivation. Gates: cb-compute lib 131/131 (124 baseline + 7 new), 0 indexing_slicing/unwrap_used in the new file (only deviation: add->merge rename for should_implement_trait), no new crate in Cargo.toml, cargo check --workspace --tests GREEN. NOTE: gsd-tools CLI ABSENT -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-16 (wire calculate_pairwise_score into tree search). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-15-SUMMARY.md."
+last_updated: "2026-06-17T08:20:00.000Z"
+last_activity: 2026-06-17 -- Phase 06.3 execution started
 progress:
   total_phases: 14
-  completed_phases: 8
-  total_plans: 65
+  completed_phases: 7
+  total_plans: 69
   completed_plans: 65
-  percent: 57
+  percent: 50
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
-Plan: 14 of 14
-Status: 06.3-14 EXT COMPLETE — YetiRank end-to-end CLOSED
-Last activity: 2026-06-17 -- 06.3-14 EXT: YetiRank END-TO-END per-stage oracle CLOSED <=1e-5 (per-tree multi-block seed plumbing subsystem + dual fold approx + f32 sampler; D-07 trainer-level RNG closed bit-exact vs instrumented trainer, all 5 trees). YetiRankPairwise deferred on pairwise split-scorer (06.3-13); StochasticRank deferred on per-group noise-seed model.
+Plan: 1 of 18
+Status: Executing Phase 06.3
+Last activity: 2026-06-17 -- Phase 06.3 execution started
 
-Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED (7 of 14 top-level phases complete)
+Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE (compute_der_sums/compute_pair_weight_statistics/calculate_pairwise_score in cb-compute) (7 of 14 top-level phases complete)
 
 ## Performance Metrics
 
@@ -112,6 +112,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.3 P12 | 10m | 3 tasks | 4 files |
 | Phase 06.3 P13 | 40 | - tasks | - files |
 | Phase 06.3 P14 | ~35min | 3 tasks | 5 files |
+| Phase 06.3 P15 | ~25min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -119,6 +120,8 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [06.3-15 pairwise split-scorer ENABLER — LOSS-04 Rule-4 piece lands as a pure cb-compute library]: The SPLIT-SELECTION divergence the 06.3-13/14 verification isolated (PairLogitPairwise + YetiRankPairwise defer because `IsPairwiseScoring` losses score candidate splits through `TPairwiseScoreCalcer`/`CalculatePairwiseScore`, NOT the pointwise der histogram) now has its primitive in `crates/cb-compute/src/pairwise_scoring.rs`: `compute_der_sums` (ComputeDerSums, pairwise_scoring.h:52-68), `compute_pair_weight_statistics` (ComputePairWeightStatistics, h:72-103, OneFeature), `calculate_pairwise_score` (CalculatePairwiseScore + CalculateScore + UpdateWeightSumFromTotal/NonDiagStats, cpp:51-232), and `BucketPairWeightStatistics`. **cb-compute-LOCAL leaf-solve twin (not a cb-train dependency):** crate layering forbids cb-compute→cb-train, so a local `calculate_pairwise_leaf_values` (2×2 closed form + general (n-1)×(n-1) Cholesky + diag/nonDiag reg + MakeZeroAverage) reuses the SAME `crate::pairwise_cholesky_solve` that `cb_train::calculate_pairwise_leaf_values` calls → identical leaf path, NO new crate. **Rule-2 deviation:** the three public fns return `CbResult` (the artifact table showed bare returns) to honor the T-06.3-15-01 bounds-guard mitigation — a malformed leaf/bucket/doc index from the trainer trust boundary surfaces `CbError::OutOfRange`, never a panic; 06.3-16/17 will `?`-propagate. **Rule-1 deviation:** `add`→`merge` rename (clippy::should_implement_trait). Self-oracled: der-sums + pair-weight stats hand-derived BIT-FOR-BIT (both winnerBucket≷loserBucket branches + winner==loser skip); `calculate_pairwise_score` vs an INDEPENDENT Gaussian-elimination reference solver (different algorithm than the production Cholesky) ≤1e-9; degenerate single-leaf 2×2 closed-form re-derivation (finite 0.0, never NaN — T-06.3-15-02). All reductions via `cb_core::sum_f64` (D-08); only the documented upstream-order scatter cells use raw `+=`/`-=`. Library-ONLY: NO tree-search wiring (06.3-16), NO fixture frozen, NO tolerance touched. Gates: cb-compute lib 131/131 (124 baseline + 7 new), 0 indexing_slicing/unwrap_used in the new file, no new crate in Cargo.toml, `cargo check --workspace --tests` GREEN. LOSS-04 truths #5 (end-to-end trainer fixtures) / #7 (SC-3 instrumented harness) STILL DEFERRED — unchanged by this library-only plan. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits 03ae077 (Task1) / 653e083 (Task2). Symbol names match the plan's artifact contract exactly so 06.3-16/17 key_links resolve.
 
 - [06.3-11 ranking_der.rs index-panic hardening — WR-02 + 42 clippy::indexing_slicing CLOSED]: Two trainer-INDEPENDENT findings landed + committed independently of the 06.3-10 build outcome. **WR-02** (`crates/cb-compute/src/ranking_der.rs:calc_dcg_metric_diff`): the 6 raw `cum_sum[old_pos]`/`cum_sum[new_pos]`/`cum_sum_low[old_pos/new_pos]`/`cum_sum[new_pos+1]`/`cum_sum[old_pos+1]`/`cum_sum_up[new_pos+1/old_pos+1]` subscripts in BOTH `mid_diff` arms now read via `.get(..).copied().unwrap_or(0.0)`, matching the CR-01 `pos_weights.get(..)` discipline two lines above (the cumSum arrays are length `count+1` so all reads are in-range → bit-identical for the present caller; removes the latent panic on a future `top`/`query_top_size` index desync). RED-first behavior tests `calc_dcg_metric_diff_boundary_new_pos_plus_one_eq_count` (tail index `count`) + `calc_dcg_metric_diff_graded_relevance_identical_both_arms` (NDCG ideal_dcg!=1.0, all old/new pos pairs vs explicit-subscript reference). **Task 2** (`stochastic_rank_group_der`, deferred-items.md [06.3-06] 42-baseline): ALL 42 `clippy::indexing_slicing` sites converted — noise/scores fill → zip; DCG cumulative-stats prefix build → `.get()` reads + `get_mut` guarded writes; per-position der loop → `.get()`; nested `scores[order[p]]` density reads → a `score_at(p)` closure; `der1[doc_id] +=` → `get_mut`; SFA dot+projection → zip in canonical doc-ascending order (D-08-preserving). NO `unwrap()`/`expect()` introduced (CLAUDE.md ban); `count<=1` early return guarantees `count>=2` so `saturating_sub(1)==count-1` and every `.get()` index is in-range → BIT-IDENTICAL. **Oracle-revalidated NOT blind-fixed:** lambdamart_oracle 1/1 + stochasticrank_oracle 2/2 stay ≤1e-5; `cargo clippy -p cb-compute --lib` 42→0 'indexing may panic'; cb-compute lib 124/124 (122 baseline + 2 new), cb-train lib 189/189 — zero parity regression. LOSS-04's two trainer-INDEPENDENT findings CLOSED; LOSS-04 truths #5 (end-to-end trainer fixtures) / #7 (SC-3 instrumented harness) STILL DEFERRED pending the 06.3-10 GO sign-off. No deviations. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits 21ddf5a (Task1 WR-02) / 0fdd507 (Task2 clippy).
 
