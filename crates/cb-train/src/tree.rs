@@ -30,8 +30,10 @@
 //! `unwrap`/`expect`/raw float fold (deny-lints + D-08).
 
 use cb_compute::{
-    cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
-    reduce_leaf_stats, scale_l2_reg, EScoreFunction, LeafStats, MINIMAL_SCORE,
+    calculate_pairwise_score, compute_der_sums as compute_pairwise_der_sums,
+    compute_pair_weight_statistics, cosine_split_score, l2_split_score, multi_dim_split_score,
+    random_score_instance, reduce_leaf_stats, scale_l2_reg, EScoreFunction, GroupSpan, LeafStats,
+    MINIMAL_SCORE,
 };
 
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
@@ -64,6 +66,10 @@ mod tie_break;
 #[cfg(test)]
 #[path = "tree_ordered_test.rs"]
 mod ordered;
+
+#[cfg(test)]
+#[path = "tree_pairwise_test.rs"]
+mod pairwise;
 
 /// Maximum supported tree depth (upstream `MaxDepth`). Capping `depth <= 16`
 /// keeps `2^depth` within `usize` and bounds leaf-buffer allocation.
@@ -1433,5 +1439,242 @@ pub fn grow_one_hot_tree(
     Ok(GrownOneHotTree {
         splits: chosen,
         leaf_of,
+    })
+}
+
+// ===========================================================================
+// LOSS-04 pairwise split-scoring search (the SPLIT-SELECTION half for
+// `*Pairwise` losses — `IsPairwiseScoring`)
+// ===========================================================================
+//
+// # Why a separate split path
+//
+// `*Pairwise` losses (`PairLogitPairwise`, `YetiRankPairwise`) score candidate
+// splits through upstream's dedicated `TPairwiseScoreCalcer` /
+// `CalculatePairwiseScore` (`pairwise_scoring.cpp`), NOT the pointwise
+// L2/Cosine der histogram the float `select_level_plain` path reuses
+// (`greedy_tensor_search.cpp:680-690`:
+// `if (IsPairwiseScoring(loss)) scoreCalcer.Reset(new TPairwiseScoreCalcer)`).
+// The 06.3-13/14 verification isolated this as the SPLIT divergence cause for
+// PairLogitPairwise (upstream f0@1.628 vs cb-train f1@1.816 at tree-0 split 1).
+//
+// Plan 06.3-15 built the scorer primitive in `cb-compute::pairwise_scoring`
+// (`compute_der_sums` + `compute_pair_weight_statistics` +
+// `calculate_pairwise_score`); this path WIRES it into the greedy oblivious
+// level search. Per candidate float feature: bucket the docs by that feature's
+// borders, build the `[leaf][bucket]` der sums + `[leaf][leaf][bucket]`
+// pair-weight statistics over the CURRENT leaf assignment and the per-tree
+// global competitor pairs, call `calculate_pairwise_score` (one score per
+// border), and emit one [`Candidate`] per border. The strict first-wins
+// [`select_best_candidate`] tie-break is reused VERBATIM (feature asc, border
+// asc; Pitfall 1).
+//
+// # Regularization
+//
+// `l2_diag_reg = params.l2_leaf_reg` is the RAW L2
+// (`scoring.cpp:809,844`: `l2Regularizer = ObliviousTreeOptions->L2Reg`, passed
+// UNSCALED to `CalculatePairwiseScore` — the same RAW l2 the pairwise LEAF path
+// uses, NOT the `sumAllWeights`-scaled `scaled_l2` the pointwise path uses).
+// `pairwise_bucket_weight_prior_reg = bayesian_matrix_reg` default `0.1`
+// (`oblivious_tree_options.cpp:16` `PairwiseNonDiagReg`).
+
+/// The bucket index of a float `value` against ascending `borders`: the number
+/// of borders the value is strictly greater than (`value > border`), mirroring
+/// upstream's float-feature bin (`bucketCount = borders.len() + 1`,
+/// `pairwise_scoring.h:169`). A doc with `bucket > splitId` passes the candidate
+/// split at border index `splitId` (consistent with [`FeatureMatrix::passes_float`]).
+#[must_use]
+fn float_bucket_of(value: f32, borders: &[f64]) -> usize {
+    let v = f64::from(value);
+    borders.iter().filter(|&&b| v > b).count()
+}
+
+/// Flatten the per-tree group competitor adjacency into the GLOBAL
+/// `(winner_global, loser_global, weight)` pair list the cb-compute pairwise
+/// scorer consumes (`TFlatPairsInfo`). `competitors[winner_local]` lists the
+/// losers `winner_local` is preferred over; the group-local indices are lifted
+/// to global object indices by adding the group's `begin` offset — the SAME
+/// lift `pairwise_leaves::compute_pairwise_weight_sums` performs (group asc,
+/// winner asc, competitor order — the parity contract).
+#[must_use]
+fn flatten_global_pairs(groups: &[GroupSpan]) -> Vec<(usize, usize, f64)> {
+    let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
+    for group in groups {
+        let begin = group.begin;
+        for (winner_local, comps) in group.competitors.iter().enumerate() {
+            let winner_global = begin + winner_local;
+            for competitor in comps {
+                let loser_global = begin + competitor.id;
+                pairs.push((winner_global, loser_global, competitor.weight));
+            }
+        }
+    }
+    pairs
+}
+
+/// Score every candidate (feature, border) for ONE level via the pairwise
+/// scorer and return the per-border scores keyed by feature
+/// (`CalculatePairwiseScore`, `pairwise_scoring.cpp:140-232`, `OneFeature`).
+///
+/// For each candidate float feature, bucket the docs against the feature's
+/// borders (`bucket_count = borders.len() + 1`), build the `[leaf][bucket]`
+/// der sums (over the SAME weighted der1 the pairwise leaf path uses) and the
+/// `[leaf][leaf][bucket]` pair-weight statistics (over the global pairs), then
+/// `calculate_pairwise_score` returns `bucket_count - 1` scores (one per border).
+#[allow(clippy::too_many_arguments)]
+fn score_pairwise_feature(
+    matrix: &FeatureMatrix,
+    feature: usize,
+    leaf_of: &[usize],
+    leaf_count: usize,
+    der1: &[f64],
+    global_pairs: &[(usize, usize, f64)],
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    n_objects: usize,
+) -> CbResult<Vec<f64>> {
+    let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+    let bucket_count = borders.len() + 1;
+    let values = matrix.feature_values.get(feature).map_or(&[][..], Vec::as_slice);
+
+    let bucket_of: Vec<usize> = (0..n_objects)
+        .map(|obj| {
+            let v = values.get(obj).copied().unwrap_or(0.0_f32);
+            float_bucket_of(v, borders)
+        })
+        .collect();
+
+    let der_sums =
+        compute_pairwise_der_sums(der1, leaf_count, bucket_count, leaf_of, &bucket_of)?;
+    let pair_weight_statistics = compute_pair_weight_statistics(
+        global_pairs,
+        leaf_count,
+        bucket_count,
+        leaf_of,
+        &bucket_of,
+    )?;
+    calculate_pairwise_score(
+        &der_sums,
+        &pair_weight_statistics,
+        bucket_count,
+        l2_diag_reg,
+        pairwise_bucket_weight_prior_reg,
+    )
+}
+
+/// One level of the PAIRWISE search: enumerate candidates in the SAME upstream
+/// order as [`select_level_plain`] (float feature ascending, border ascending),
+/// score each border via the pairwise scorer ([`score_pairwise_feature`]), and
+/// pick the strict first-wins best ([`select_best_candidate`], strict `>`;
+/// Pitfall 1). The `*Pairwise` corpus is float-only and `boosting_type = Plain`
+/// (`IsPlainOnlyModeLoss`), so there are no ordered / CTR / perturbation draws.
+#[allow(clippy::too_many_arguments)]
+fn select_level_pairwise(
+    matrix: &FeatureMatrix,
+    chosen: &[Split],
+    leaf_of: &[usize],
+    der1: &[f64],
+    global_pairs: &[(usize, usize, f64)],
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    n_objects: usize,
+) -> CbResult<Split> {
+    let leaf_count = 1usize << chosen.len();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        if borders.is_empty() {
+            continue;
+        }
+        let scores = score_pairwise_feature(
+            matrix,
+            feature,
+            leaf_of,
+            leaf_count,
+            der1,
+            global_pairs,
+            l2_diag_reg,
+            pairwise_bucket_weight_prior_reg,
+            n_objects,
+        )?;
+        // scores[j] is the score of splitting at border index `j`; enumerate in
+        // border-ascending order so the strict first-wins tie-break matches
+        // upstream's candidate iteration (feature asc, border asc).
+        for (border_idx, &border) in borders.iter().enumerate() {
+            let score = scores.get(border_idx).copied().unwrap_or(MINIMAL_SCORE);
+            candidates.push(Candidate {
+                feature,
+                border,
+                score,
+            });
+        }
+    }
+    let best = select_best_candidate(&candidates).ok_or_else(|| {
+        CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+    })?;
+    Ok(Split {
+        feature: best.feature,
+        border: best.border,
+    })
+}
+
+/// Grow one oblivious tree of depth `depth` with the PAIRWISE split-scoring
+/// subsystem (the SPLIT-SELECTION half of LOSS-04 for `*Pairwise` losses). Per
+/// level `0..depth`, each candidate (feature, border) is scored via the
+/// cb-compute pairwise scorer over the CURRENT leaf assignment + the per-tree
+/// global competitor pairs, then the strict first-wins best is chosen
+/// ([`select_best_candidate`], `>` not `>=`). After `depth` levels `leaf_of` is
+/// assigned over the object order (forward-bit [`leaf_index`]) exactly like the
+/// plain path, so the downstream pairwise leaf-value estimation
+/// (`pairwise_leaves.rs`) runs over the same partition.
+///
+/// `der1` is the per-object pairwise weighted der1 (the SAME buffer fed to the
+/// pairwise leaf path); `groups` carries the per-tree competitor adjacency.
+/// `l2_diag_reg = params.l2_leaf_reg` (RAW, NOT `scaled_l2`);
+/// `pairwise_bucket_weight_prior_reg = bayesian_matrix_reg` default `0.1`.
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `depth > MAX_DEPTH` (before allocation).
+/// - [`CbError::Degenerate`] if a level has no candidate split at all.
+/// - [`CbError::OutOfRange`] if a competitor/leaf/bucket index from the trainer
+///   trust boundary is out of range (propagated from the cb-compute scorer).
+#[allow(clippy::too_many_arguments)]
+pub fn greedy_tensor_search_oblivious_pairwise(
+    matrix: &FeatureMatrix,
+    der1: &[f64],
+    groups: &[GroupSpan],
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    depth: usize,
+    n_objects: usize,
+) -> CbResult<GrownTree> {
+    check_depth(depth)?;
+
+    let global_pairs = flatten_global_pairs(groups);
+    let mut chosen: Vec<Split> = Vec::with_capacity(depth);
+
+    for _level in 0..depth {
+        // The current leaf assignment over the already-chosen splits (forward-bit
+        // leaf index); leaf_count = 2^chosen.len().
+        let leaf_of = assign_leaves(matrix, &chosen, n_objects);
+        let best = select_level_pairwise(
+            matrix,
+            &chosen,
+            &leaf_of,
+            der1,
+            &global_pairs,
+            l2_diag_reg,
+            pairwise_bucket_weight_prior_reg,
+            n_objects,
+        )?;
+        chosen.push(best);
+    }
+
+    let leaf_of = assign_leaves(matrix, &chosen, n_objects);
+    Ok(GrownTree {
+        splits: chosen,
+        leaf_of,
+        ctr_splits: Vec::new(),
+        level_kinds: Vec::new(),
     })
 }

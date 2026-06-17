@@ -43,9 +43,9 @@ use crate::metrics::{EvalMetric, EvalMetricHistory};
 use crate::overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 use crate::candidates::tensor_ctr_candidates;
 use crate::tree::{
-    check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_perturbed,
-    greedy_tensor_search_oblivious_with_ctr, leaf_index, CtrSplitSpec, FeatureMatrix, GrownTree,
-    LevelKind, Perturbation, Split,
+    check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_pairwise,
+    greedy_tensor_search_oblivious_perturbed, greedy_tensor_search_oblivious_with_ctr, leaf_index,
+    CtrSplitSpec, FeatureMatrix, GrownTree, LevelKind, Perturbation, Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -2604,7 +2604,37 @@ fn train_inner<R: Runtime>(
         let iter_ctr_features: &[crate::ctr::CtrFeatureColumn] = structure_fold_columns
             .get(taken_fold)
             .map_or(materialized_ctr_features.as_slice(), Vec::as_slice);
-        let grown: GrownTree = if has_ctr {
+        let grown: GrownTree = if is_pairwise_scoring(&params.loss) {
+            // PAIRWISE SPLIT-SCORING (LOSS-04, Plan 06.3-16): `*Pairwise` losses
+            // (`IsPairwiseScoring`) score candidate splits through upstream's
+            // dedicated `TPairwiseScoreCalcer` / `CalculatePairwiseScore`
+            // (`greedy_tensor_search.cpp:680-690`), NOT the pointwise L2/Cosine
+            // der histogram. Wire the Plan 06.3-15 cb-compute scorer into the
+            // greedy oblivious level search over the CURRENT leaf assignment + the
+            // per-tree global competitor pairs (`group_spans`). `*Pairwise` forces
+            // `boosting_type = Plain` + the corpus is float-only, so this is
+            // mutually exclusive with the CTR / Ordered paths (no perturbation /
+            // bootstrap draws). The der1 fed here is `weighted_der1` — for a
+            // pairwise loss `group_spans.is_some()` so `weighted_der1 == ders.der1`
+            // (the grouped der1 with the pair weight already folded), the SAME
+            // buffer the pairwise LEAF path consumes (`pairwise_leaves.rs`).
+            //
+            // `l2_diag_reg = params.l2_leaf_reg` is the RAW l2 (NOT the
+            // sumAllWeights-scaled `scaled_l2`): `scoring.cpp:809,844` passes
+            // `ObliviousTreeOptions->L2Reg` UNSCALED to `CalculatePairwiseScore`,
+            // matching the pairwise leaf path. `pairwise_bucket_weight_prior_reg =
+            // PairwiseNonDiagReg` (`bayesian_matrix_reg`, default 0.1).
+            let spans = group_spans.as_deref().unwrap_or(&[]);
+            greedy_tensor_search_oblivious_pairwise(
+                &matrix,
+                &weighted_der1,
+                spans,
+                params.l2_leaf_reg,
+                PAIRWISE_NON_DIAG_REG_DEFAULT,
+                params.depth,
+                n,
+            )?
+        } else if has_ctr {
             // ORD-05 STRUCTURE: score the SELECTED-fold CTR columns into the
             // oblivious search alongside float candidates (shared score, strict
             // first-wins, forward-bit leaf index). At random_strength=0 +
