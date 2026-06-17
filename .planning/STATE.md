@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: "06.3-03 COMPLETE (commits 9b2606d Task1 / b25a2be Task2 / bef767d Task3) — LOSS-04 Wave B. LambdaMart (listwise) ships end-to-end per-stage ≤1e-5 vs catboost 1.2.10; PairLogit/PairLogitPairwise der + the Cholesky pairwise-leaf path + is_pairwise_scoring routing LAND and are unit-tested green, with the PairLogit/PairLogitPairwise per-stage ORACLE DEFERRED on a precisely-isolated pair-weight normalization gap (deferred-items.md — NO #[ignore]/NO weakened tolerance). Task1: Loss::{PairLogit,PairLogitPairwise,LambdaMart{metric,sigma,top,norm}}+LambdaMartMetric, pairlogit_pair_prob/lambdamart_pair_grad primitives, wired PairLogit (Competitors scatter-der, inline exp) + LambdaMart (NDCG per-pair lambda grad) arms, is_pairwise_scoring/is_plain_only, exhaustive Loss arms across cb-backend+cb-train+3 test files. Task2: pairwise_leaves.rs Cholesky solve (2×2 + general via REUSED cb_compute::pairwise_cholesky_solve + diag/nonDiag reg + MakeZeroAverage), BIT-EXACT vs pairwise_leaves_calculation_ut.cpp. Task3: boosting THIRD leaf branch (is_pairwise_scoring), LambdaMart oracle GREEN — unlocked by the RULE-1 newton_leaf_delta fix (divide verbatim for NEGATIVE denominators; listwise positive hessian; only exact-zero guarded; regression losses unaffected). Gates: cb-compute 113/113, pairwise_leaves 6/6, lambdamart_oracle 1/1, full cb-train suite green (QueryRMSE/QuerySoftMax + D-04 no-regression), cargo check --workspace --tests GREEN. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-04 (YetiRank + StochasticRank, Wave C instrumented) + the PairLogit oracle follow-up. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-03-SUMMARY.md."
-last_updated: "2026-06-17T05:49:27.955Z"
+last_updated: "2026-06-17T06:03:07.949Z"
 last_activity: 2026-06-17 -- 06.3-11 ranking_der.rs index-panic hardening COMPLETE
 progress:
   total_phases: 14
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 65
-  completed_plans: 64
-  percent: 50
+  completed_plans: 65
+  percent: 57
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
-Plan: 13 of 14
+Plan: 14 of 14
 Status: Ready to execute
 Last activity: 2026-06-17 -- 06.3-11 ranking_der.rs index-panic hardening COMPLETE
 
@@ -111,6 +111,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.3 P11 | ~5min | 2 tasks | 2 files |
 | Phase 06.3 P12 | 10m | 3 tasks | 4 files |
 | Phase 06.3 P13 | 40 | - tasks | - files |
+| Phase 06.3 P14 | ~35min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -240,6 +241,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 06.3-12: StochasticRank RNG ground truth regenerated full-precision (%.17g, non-masking mu=0.5/5-doc); consuming-test draw count derived from ground truth; CR-01/WR-04/WR-05 closed at ≤1e-5
 - [Phase ?]: 06.3-13: PairLogit pairwise L2 scaling uses sum_all_weights (per-object docCount), not the pairwise-weight total; proven by the instrumented per-leaf der ground truth
 - [Phase ?]: 06.3-13: pairwise losses need NormalizeLeafValues document-weighted leaf centering (empty leaves -> 0, lr last); this (not a leaf-der2 reduction) closed the PairLogit oracle
+- [Phase ?]: [06.3-14] WR-03 closed (b32efb5: grouped leaf sumWeight branches on leaf method — Gradient->eff_weights, Newton->unit); GAP2/Truth#5 + GAP3 trainer-half deferred un-weakened (1ae9739): the 06.3-10 trainer is GO and was run, but the Rust sampler's RNG model diverges (3 perm folds + per-tree reseed vs 1 fold + fixed 2-level chain; count matches 1800, order diverges), diverging the end-to-end YetiRank model ~8.3e-1 (>>1e-5) — three model.json stay absent, oracles keep the deferred invariant, Rule-4 seeding-subsystem recipe in deferred-items.md [06.3-14]. Task 3 = blocking-human checkpoint on the deferral.
 
 ### Pending Todos
 
@@ -280,7 +282,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-17T05:48:51.856Z
+Last session: 2026-06-17T06:02:54.550Z
 Stopped at: 06.3-03 COMPLETE (commits 9b2606d Task1 / b25a2be Task2 / bef767d Task3) — LOSS-04 Wave B. LambdaMart (listwise) ships end-to-end per-stage ≤1e-5 vs catboost 1.2.10; PairLogit/PairLogitPairwise der + the Cholesky pairwise-leaf path + is_pairwise_scoring routing LAND and are unit-tested green, with the PairLogit/PairLogitPairwise per-stage ORACLE DEFERRED on a precisely-isolated pair-weight normalization gap (deferred-items.md — NO #[ignore]/NO weakened tolerance). Task1: Loss::{PairLogit,PairLogitPairwise,LambdaMart{metric,sigma,top,norm}}+LambdaMartMetric, pairlogit_pair_prob/lambdamart_pair_grad primitives, wired PairLogit (Competitors scatter-der, inline exp) + LambdaMart (NDCG per-pair lambda grad) arms, is_pairwise_scoring/is_plain_only, exhaustive Loss arms across cb-backend+cb-train+3 test files. Task2: pairwise_leaves.rs Cholesky solve (2×2 + general via REUSED cb_compute::pairwise_cholesky_solve + diag/nonDiag reg + MakeZeroAverage), BIT-EXACT vs pairwise_leaves_calculation_ut.cpp. Task3: boosting THIRD leaf branch (is_pairwise_scoring), LambdaMart oracle GREEN — unlocked by the RULE-1 newton_leaf_delta fix (divide verbatim for NEGATIVE denominators; listwise positive hessian; only exact-zero guarded; regression losses unaffected). Gates: cb-compute 113/113, pairwise_leaves 6/6, lambdamart_oracle 1/1, full cb-train suite green (QueryRMSE/QuerySoftMax + D-04 no-regression), cargo check --workspace --tests GREEN. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-04 (YetiRank + StochasticRank, Wave C instrumented) + the PairLogit oracle follow-up. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-03-SUMMARY.md.
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
 Stopped at (prior): 06.3-02 COMPLETE (commits f42e3e6 Task1 / 6b208dd Task2) — QueryRMSE + QuerySoftMax, the first two deterministic querywise ranking losses, trained end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. Task1: loss.rs queryrmse_der/querysoftmax_der per-object inner formulas (weight folded in); runtime.rs Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} (validate rejects lambda<0/beta≤0; defaults 0.01/1.0); ranking_der.rs wired arms — QueryRMSE per-group queryAvrg via sum_f64, QuerySoftMax max-shifted softmax der with sumWTargets≤0/weight≤0 guards; exhaustive-match arms added in cb-backend cpu_runtime + cb-train metrics/boosting + 3 cb-train oracle test files (workspace check --tests GREEN — the prior attempt's non-exhaustive cb-backend arm is closed). 11 new unit tests. Task2: boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view; train_ranking entry + RankingData; queryrmse/querysoftmax per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 (Cosine score; QueryRMSE=Newton leaf, QuerySoftMax=Gradient leaf per fixture model.json); QuerySoftMax fixture frozen OFFLINE. Gates: cb-compute 102/102, full cb-train suite 0 failures (154 lib + all oracles incl. D-04 no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-03 (PairLogit + LambdaMart, Wave B pairwise). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-02-SUMMARY.md.
