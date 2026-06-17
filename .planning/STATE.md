@@ -4,8 +4,8 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: "06.3-03 COMPLETE (commits 9b2606d Task1 / b25a2be Task2 / bef767d Task3) — LOSS-04 Wave B. LambdaMart (listwise) ships end-to-end per-stage ≤1e-5 vs catboost 1.2.10; PairLogit/PairLogitPairwise der + the Cholesky pairwise-leaf path + is_pairwise_scoring routing LAND and are unit-tested green, with the PairLogit/PairLogitPairwise per-stage ORACLE DEFERRED on a precisely-isolated pair-weight normalization gap (deferred-items.md — NO #[ignore]/NO weakened tolerance). Task1: Loss::{PairLogit,PairLogitPairwise,LambdaMart{metric,sigma,top,norm}}+LambdaMartMetric, pairlogit_pair_prob/lambdamart_pair_grad primitives, wired PairLogit (Competitors scatter-der, inline exp) + LambdaMart (NDCG per-pair lambda grad) arms, is_pairwise_scoring/is_plain_only, exhaustive Loss arms across cb-backend+cb-train+3 test files. Task2: pairwise_leaves.rs Cholesky solve (2×2 + general via REUSED cb_compute::pairwise_cholesky_solve + diag/nonDiag reg + MakeZeroAverage), BIT-EXACT vs pairwise_leaves_calculation_ut.cpp. Task3: boosting THIRD leaf branch (is_pairwise_scoring), LambdaMart oracle GREEN — unlocked by the RULE-1 newton_leaf_delta fix (divide verbatim for NEGATIVE denominators; listwise positive hessian; only exact-zero guarded; regression losses unaffected). Gates: cb-compute 113/113, pairwise_leaves 6/6, lambdamart_oracle 1/1, full cb-train suite green (QueryRMSE/QuerySoftMax + D-04 no-regression), cargo check --workspace --tests GREEN. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-04 (YetiRank + StochasticRank, Wave C instrumented) + the PairLogit oracle follow-up. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-03-SUMMARY.md."
-last_updated: "2026-06-17T06:03:07.949Z"
-last_activity: 2026-06-17 -- 06.3-11 ranking_der.rs index-panic hardening COMPLETE
+last_updated: "2026-06-17T15:30:00.000Z"
+last_activity: 2026-06-17 -- 06.3-14 EXT: YetiRank END-TO-END per-stage oracle CLOSED <=1e-5 (per-tree multi-block seed plumbing + f32 sampler; D-07 trainer-level RNG closed bit-exact)
 progress:
   total_phases: 14
   completed_phases: 8
@@ -27,10 +27,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
 Plan: 14 of 14
-Status: Ready to execute
-Last activity: 2026-06-17 -- 06.3-11 ranking_der.rs index-panic hardening COMPLETE
+Status: 06.3-14 EXT COMPLETE — YetiRank end-to-end CLOSED
+Last activity: 2026-06-17 -- 06.3-14 EXT: YetiRank END-TO-END per-stage oracle CLOSED <=1e-5 (per-tree multi-block seed plumbing subsystem + dual fold approx + f32 sampler; D-07 trainer-level RNG closed bit-exact vs instrumented trainer, all 5 trees). YetiRankPairwise deferred on pairwise split-scorer (06.3-13); StochasticRank deferred on per-group noise-seed model.
 
-Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO awaiting human sign-off (7 of 14 top-level phases complete)
+Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED (7 of 14 top-level phases complete)
 
 ## Performance Metrics
 
