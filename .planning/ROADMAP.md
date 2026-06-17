@@ -22,7 +22,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [ ] **Phase 6.1: Regression-Loss Matrix** - LOSS-03 scalar matrix (RMSE/MAE/Quantile/LogCosh/Huber/Poisson/Tweedie/MAPE/MSLE/Lq/Expectile), rides the scalar loop; MultiQuantile → 6.2
   - [x] **Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor** - LOSS-02 + LOSS-03 MultiQuantile; N-dim approx refactor with a no-behavior-change checkpoint (D-03/D-04) — COMPLETE 2026-06-16 (all 5 plans; N-dim spine + MultiClass/OneVsAll/MultiLogloss/MultiCrossEntropy/MultiQuantile all per-stage oracle ≤1e-5)
   - [x] **Phase 6.3: Ranking Losses & Metrics** - LOSS-04, LOSS-05 over group_id/subgroup_id/pairs; C++ instrumentation for randomized losses (completed 2026-06-17)
-  - [x] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8) (completed 2026-06-17)
+  - [x] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8) (completed 2026-06-18)
   - [ ] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first
   - [ ] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine
 - [ ] **Phase 7: GPU Backends via CubeCL** - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, documented GPU tolerance
