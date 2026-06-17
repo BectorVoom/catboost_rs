@@ -138,3 +138,34 @@ research-grade subsystem out of this plan's scope. pc=1 stays green because its
 borders do not split the mixed buckets (leaf composition is order-invariant
 there). Per the authorized FALLBACK: cb-train production is UNTOUCHED, the pc=4
 e2e oracle is UNCOMMITTED, no oracle weakened.
+
+## 06.3-10 re-run note (2026-06-17) — instrumented trainer GO
+
+The full instrumented `_catboost` trainer build was **re-attempted and SUCCEEDED**
+this session (GO; see `instrumented_trainer_STATUS.md`). The disk NO-GO
+precondition that forced the 06.3-03/04/09 deferrals no longer holds: `/` is now
+**67 GB free / 72% used**, well above the 25 GB Release-C++-link safety floor
+(the README documents linking failed only at ~8-12 GB / 95-97%).
+
+The `/tmp` toolchain (`/tmp/clang18_prefix`, `/tmp/cb_build313`) from prior
+sessions was **absent** and was re-fetched from scratch by the new re-runnable
+driver `build_instrumented_trainer.sh`:
+
+- clang-18 / lld-18 / llvm-18 (noble `1:18.1.3-1ubuntu1`) via sudo-free
+  `apt-get download` + `dpkg -x` into `/tmp/clang18_prefix`;
+- conan / ninja / cython reused from `~/.local/bin` (uv tool);
+- `build_native.py --targets _catboost` against the `.venv` Python 3.13 with
+  `-DPython3_INCLUDE_DIR` / `-DPython3_EXECUTABLE` overrides.
+
+**Build-config fix discovered (recorded for re-runs):** catboost's
+`build/toolchains/clang.toolchain` hardcodes bare `clang` / `clang++` and
+re-exports `ENV{CC}`/`ENV{CXX}`, overriding the `-DCMAKE_*_COMPILER` cache
+entries. The driver therefore creates `clang` → `clang-18` /
+`clang++` → `clang++-18` (and a `clang-14` alias for the CUDA-host probe)
+symlinks inside the prefix bin so the bare names resolve on PATH.
+
+The 06.3-10 instrumentation adds two NEW env-gated surfaces beyond the pc=4
+work above: per-leaf `Der1`/`Der2` in `approx_calcer_querywise.cpp`
+(`leaf_der` event, PairLogit plan 13) and the YetiRank Gumbel RNG draw in
+`yetirank_helpers.cpp` (`yeti_gumbel` event, plan 14) — both verified firing in
+the smoke run. Artifact paths are in `instrumented_trainer_STATUS.md`.
