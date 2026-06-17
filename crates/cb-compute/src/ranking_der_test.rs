@@ -702,3 +702,42 @@ fn calc_dcg_metric_diff_dcg_arm_unchanged() {
         assert!((w - 1.0 / super::ndcg_denominator(pos)).abs() < 1e-15);
     }
 }
+
+// ---------------------------------------------------------------------------
+// WR-02 (D-08): lambdamart_ideal_ndcg must accumulate the per-position ideal-DCG
+// terms through cb_core::sum_f64, not a raw `score +=` fold. sum_f64 is a strict
+// left-to-right f64 fold (same order, same accumulator as the old loop), so the
+// numeric result is unchanged — this guards the D-08 summation discipline.
+// ---------------------------------------------------------------------------
+
+/// `lambdamart_ideal_ndcg` over a known graded-relevance slice equals the
+/// `sum_f64` of the explicit per-position `ndcg_numerator(t)/ndcg_denominator(pos)`
+/// terms over the descending-sorted top window.
+#[test]
+fn lambdamart_ideal_ndcg_equals_sum_f64_of_terms() {
+    let target = [1.0_f64, 3.0, 2.0]; // unsorted; the fn sorts descending.
+    let query_top_size = target.len();
+    let got = super::lambdamart_ideal_ndcg(&target, query_top_size);
+
+    // Reference: descending sort [3, 2, 1], terms = num(t)/den(pos), reduced via sum_f64.
+    let mut sorted = target.to_vec();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let terms: Vec<f64> = sorted
+        .iter()
+        .enumerate()
+        .take(query_top_size)
+        .map(|(pos, &t)| super::ndcg_numerator(t) / super::ndcg_denominator(pos))
+        .collect();
+    let want = sum_f64(&terms);
+    assert!((got - want).abs() < 1e-15, "got={got}, want={want}");
+}
+
+/// Trivial windows: empty slice -> 0.0; a single element -> its sole term.
+#[test]
+fn lambdamart_ideal_ndcg_trivial_windows() {
+    assert_eq!(super::lambdamart_ideal_ndcg(&[], 0), 0.0);
+    assert_eq!(super::lambdamart_ideal_ndcg(&[5.0], 0), 0.0); // top window 0 -> empty.
+    let single = super::lambdamart_ideal_ndcg(&[5.0], 1);
+    let want = super::ndcg_numerator(5.0) / super::ndcg_denominator(0);
+    assert!((single - want).abs() < 1e-15);
+}

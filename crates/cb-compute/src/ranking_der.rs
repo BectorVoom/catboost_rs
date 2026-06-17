@@ -601,18 +601,22 @@ fn lambda_query_top_size(top: i64, doc_count: usize) -> usize {
 }
 
 /// LambdaMart `CalcIdealMetric` for (N)DCG (`error_functions.cpp:925-935`): the DCG
-/// of the target-sorted ideal order over the top-`query_top_size` positions. A
-/// sequential float accumulation matching upstream's `score += ...` loop order
-/// (the parity contract is the loop order).
+/// of the target-sorted ideal order over the top-`query_top_size` positions. The
+/// per-position terms are collected and reduced through `cb_core::sum_f64` per the
+/// D-08 summation discipline (CLAUDE.md admits no silent raw-accumulation
+/// exception); `sum_f64` is the sanctioned strict left-to-right f64 fold, so this
+/// matches upstream's sequential `score += ...` accumulation order exactly.
 fn lambdamart_ideal_ndcg(target_slice: &[f64], query_top_size: usize) -> f64 {
     let mut sorted: Vec<f64> = target_slice.to_vec();
     // descending stable sort of the relevances.
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let mut score = 0.0_f64;
-    for (pos, &t) in sorted.iter().enumerate().take(query_top_size) {
-        score += ndcg_numerator(t) / ndcg_denominator(pos);
-    }
-    score
+    let terms: Vec<f64> = sorted
+        .iter()
+        .enumerate()
+        .take(query_top_size)
+        .map(|(pos, &t)| ndcg_numerator(t) / ndcg_denominator(pos))
+        .collect();
+    sum_f64(&terms)
 }
 
 /// Standard-normal density `φ((x-mean)/sigma)/sigma` for the StochasticRank
