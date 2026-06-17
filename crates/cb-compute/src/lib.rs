@@ -45,7 +45,8 @@ pub use loss::{
     QUANTILE_DELTA,
 };
 pub use pairwise_scoring::{
-    compute_der_sums, compute_pair_weight_statistics, BucketPairWeightStatistics,
+    calculate_pairwise_score, compute_der_sums, compute_pair_weight_statistics,
+    BucketPairWeightStatistics,
 };
 pub use ranking_der::{
     calc_ders_for_queries, group_reduce_weighted, is_pairwise_scoring, is_plain_only,
