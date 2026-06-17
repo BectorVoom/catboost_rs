@@ -21,6 +21,7 @@
 mod histogram;
 mod leaf;
 mod loss;
+mod pairwise_scoring;
 mod ranking_der;
 mod runtime;
 mod score;
@@ -42,6 +43,9 @@ pub use loss::{
     quantile_der2, queryrmse_der, querysoftmax_der, rmse_der1,
     rmse_der2, sigmoid, softmax_ders, tweedie_der1, tweedie_der2, FOCAL_P_MIN, QUANTILE_ALPHA,
     QUANTILE_DELTA,
+};
+pub use pairwise_scoring::{
+    compute_der_sums, compute_pair_weight_statistics, BucketPairWeightStatistics,
 };
 pub use ranking_der::{
     calc_ders_for_queries, group_reduce_weighted, is_pairwise_scoring, is_plain_only,
