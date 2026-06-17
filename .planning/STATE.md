@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
-Plan: 9 of 9 complete (gap-closure wave done; LOSS-04 still partially open pending instrumented trainer)
-Status: Executing Phase 06.3 (Wave-5 gap closure complete; ready for re-verify)
-Last activity: 2026-06-17 -- 06.3-09 complete (bt.PairwiseWeights split-scoring/L2 wiring; PairLogit leaf-der2 oracle DEFERRED)
+Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING (gap-closure round 2 PLANNED)
+Plan: 9 of 14 complete; plans 10–14 (gap-closure round 2) PLANNED, ready to execute
+Status: Gap-closure round 2 planned to drive all 3 open truths (#4 PairLogit leaf-der2, #5 YetiRank/StochasticRank trainer fixtures, #7 D-07 RNG) to closure. DISK NOW 67 GB FREE (71%) — no longer the link-failure regime; operator chose ATTEMPT THE FULL INSTRUMENTED TRAINER BUILD. Plans 10 (build centerpiece+checkpoint), 11+12 (trainer-independent, parallel), 13 (PairLogit), 14 (YetiRank/StochasticRank+WR-03+RNG). Escalate-don't-weaken (D-6.3-03b) on build NO-GO.
+Last activity: 2026-06-17 -- 06.3 gap-closure round 2 PLANNED (06.3-10..14, 5 plans / 3 waves)
 
 Progress: [##############] Phase 6.3 gap-closure wave: 06.3-06/07/08/09 COMPLETE (7 of 14 top-level phases complete)
 
