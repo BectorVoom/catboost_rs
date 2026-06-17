@@ -313,3 +313,44 @@ YetiRank multi-thread (blockCount>1) block-seed partition.
 so commits are unaffected. Out of scope per the executor scope-boundary rule (only auto-fix
 issues directly caused by the current task). Remediation: convert the `obj_approx[d]` write to
 a bounds-checked `get_mut` in a dedicated cb-backend hardening pass.
+
+## [06.3-17] YetiRankPairwise per-tree RNG draw-count calibration for trees 2+ (DEFERRED — Rule 4)
+
+**Status:** PARTIALLY CLOSED. The genuine catboost 1.2.10 YetiRankPairwise fixture
+is frozen + committed (provenance human-approved). The end-to-end per-stage gate
+(`yetirank_pairwise_end_to_end_per_stage`) now takes the present-fixture branch and
+exercises the FULL 4-stage ≤1e-5 compare. The pairwise split-scorer (06.3-15/16) +
+the pairwise-aware seeder (this plan) make **trees 0 and 1 match upstream bit-for-bit**;
+the gate **diverges at tree 2** (Splits index 5).
+
+**Root cause (Rule 4 architectural / SC-3 toolchain):** The per-tree `LearnProgress->Rand`
+draw count for the `*Pairwise` (`IsPairwiseScoring`) split path is NOT a constant and
+cannot be derived analytically. Upstream draws the `SetBestScore` random-score normals
+from a CHILD `TRestorableFastRng64(randSeed)` (greedy_tensor_search.cpp:718,
+tensor_search_helpers.cpp:724) that does not advance the context RNG — handled this plan
+(`YetiRankTreeSeeder` pairwise flag, which closed trees 0+1). The residual tree-2+ drift
+is a variable-length per-tree draw accounting (same family as boosting.rs:3097-3100 /
+D-11 / Open Q4) that requires the **instrumented multi-tree pairwise trainer**
+(`CB_INSTRUMENT_LOG` of `LearnProgress->Rand`) to localize draw-for-draw. That toolchain
+was deferred in 06.3 verification (SC-3) and is currently ABSENT from `/tmp` (only the
+standalone single-group `yetirank_oracle` competitor-draw binary remains; the clang-18 +
+built `_catboost.so` instrumented trainer must be re-fetched per the
+`catboost-instrumented-trainer-build` memory recipe).
+
+**Empirically verified (this plan):** sweeping per-level normal-draw counts (0..4) and
+per-tree extra advances (0..8) does NOT align tree 2 — confirming the drift is
+non-constant and needs instrumentation, not a constant offset.
+
+**Escalate-don't-weaken (D-6.3-03b):** NO `#[ignore]` added, NO `compare_stage` tolerance
+weakened, NO fabricated fixture. The present-fixture gate stays RED as the honest invariant
+that closure is incomplete. Non-regression preserved: YetiRank pointwise (2/2) +
+PairLogitPairwise (1/1) oracles green; no new clippy warnings.
+
+**Remediation (dedicated Rule-4 plan):** re-fetch the instrumented pairwise multi-tree
+trainer toolchain; capture the per-tree `LearnProgress->Rand` draw log for the
+YetiRankPairwise corpus; calibrate the seeder's per-tree pairwise advance draw-for-draw;
+then trees 2-4 close and the gate passes ≤1e-5.
+
+**Also landed this plan (independent correctness fixes, committed):** WR-04 typed
+`CbError::OutOfRange` on the three out-of-range competitor-span `unwrap_or_default()` sites;
+learning-fold `*Pairwise` leaf routed through the Cholesky pairwise system.
