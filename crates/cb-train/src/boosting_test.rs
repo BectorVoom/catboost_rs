@@ -12,9 +12,12 @@
 //! so it can reach the private `compute_leaf_deltas`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use cb_compute::{exact_leaf_delta, LeafMethod, Loss, QUANTILE_ALPHA, QUANTILE_DELTA};
+use cb_compute::{
+    exact_leaf_delta, GroupSpan, LeafMethod, Loss, RankingCompetitor, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
+};
 
-use super::compute_leaf_deltas;
+use super::{calc_pairwise_weights, compute_leaf_deltas, uses_pairwise_weights};
 
 /// Run the Exact-leaf branch of `compute_leaf_deltas` over a single leaf whose
 /// per-member residuals are exactly `residuals` (we feed `approx = 0`, `target =
@@ -167,4 +170,90 @@ fn multiquantile_alpha07_dimension_equals_scalar_quantile07_leaf() {
         mq, scalar,
         "MultiQuantile{{[0.7]}} dimension-0 leaf must equal scalar Quantile{{0.7}} leaf"
     );
+}
+
+// --- LOSS-04 06.3-09: pairwise split-scoring / leaf weight (`bt.PairwiseWeights`) ---
+
+/// `uses_pairwise_weights` selects exactly the `UsesPairsForCalculation` losses
+/// (`enum_helpers.cpp:502` = YetiRank* | PairLogit*) — these drive split-scoring
+/// `sumWeight` + L2 scaling off the per-object PAIRWISE weights, not the per-object
+/// sample weights. A regression that drops PairLogit/PairLogitPairwise (or adds a
+/// pointwise loss) flips this.
+#[test]
+fn uses_pairwise_weights_selects_only_pair_losses() {
+    assert!(uses_pairwise_weights(&Loss::PairLogit));
+    assert!(uses_pairwise_weights(&Loss::PairLogitPairwise));
+    assert!(uses_pairwise_weights(&Loss::YetiRank {
+        permutations: 10,
+        decay: 0.85
+    }));
+    assert!(uses_pairwise_weights(&Loss::YetiRankPairwise {
+        permutations: 10,
+        decay: 0.85
+    }));
+    // Pointwise / querywise / listwise losses do NOT use pairwise weights.
+    assert!(!uses_pairwise_weights(&Loss::Logloss));
+    assert!(!uses_pairwise_weights(&Loss::QueryRmse));
+    assert!(!uses_pairwise_weights(&Loss::LambdaMart {
+        metric: cb_compute::LambdaMartMetric::Ndcg,
+        sigma: 1.0,
+        top: -1,
+        norm: true
+    }));
+}
+
+/// `calc_pairwise_weights` mirrors upstream `CalcPairwiseWeights`
+/// (`approx_updater_helpers.h:74-89`): for every winner→loser competitor edge it
+/// adds `competitor.weight` to BOTH the winner's and the loser's per-object slot,
+/// so `pw[obj] = Σ competitor.weight` over all pairs incident on `obj`. This is the
+/// histogram / leaf `sumWeight` (`bt.PairwiseWeights`) the pairwise-loss split
+/// scoring consumes — NOT the uniform per-object `1.0`.
+#[test]
+fn calc_pairwise_weights_sums_competitor_weights_over_both_endpoints() {
+    // One group [0,3): winner 0 -> loser 1 (w 1.0); winner 0 -> loser 2 (w 1.0);
+    // winner 1 -> loser 2 (w 1.0). Object 0 is a winner twice (pw 2), object 1 is
+    // winner once + loser once (pw 2), object 2 is loser twice (pw 2).
+    let group = GroupSpan {
+        begin: 0,
+        end: 3,
+        weight: 1.0,
+        competitors: vec![
+            vec![
+                RankingCompetitor { id: 1, weight: 1.0 },
+                RankingCompetitor { id: 2, weight: 1.0 },
+            ],
+            vec![RankingCompetitor { id: 2, weight: 1.0 }],
+            Vec::new(),
+        ],
+    };
+    let pw = calc_pairwise_weights(&[group], 3);
+    // NON-uniform vs the old hardcoded 1.0: each object touched by 2 pairs -> 2.0.
+    assert_eq!(pw, vec![2.0, 2.0, 2.0]);
+    // The total pairwise weight is 2 x (number of pairs) = 6 (each pair scores both
+    // endpoints), the value `scale_l2_reg` divides by `n` for the L2 scaling.
+    let total: f64 = pw.iter().sum();
+    assert!((total - 6.0).abs() < 1e-12);
+}
+
+/// A weighted-pair group: `competitor.weight` (not a uniform 1.0) is what gets
+/// summed, and a group with NO competitors leaves its objects at pairwise weight
+/// `0.0` (upstream `bt.PairwiseWeights` is zero-initialized, `Fill(..., 0)`).
+#[test]
+fn calc_pairwise_weights_honors_weights_and_empty_groups() {
+    // Group A [0,2): winner 0 -> loser 1, weight 2.5.
+    let group_a = GroupSpan {
+        begin: 0,
+        end: 2,
+        weight: 1.0,
+        competitors: vec![vec![RankingCompetitor { id: 1, weight: 2.5 }], Vec::new()],
+    };
+    // Group B [2,4): NO pairs -> both objects stay at 0.0.
+    let group_b = GroupSpan {
+        begin: 2,
+        end: 4,
+        weight: 1.0,
+        competitors: vec![Vec::new(), Vec::new()],
+    };
+    let pw = calc_pairwise_weights(&[group_a, group_b], 4);
+    assert_eq!(pw, vec![2.5, 2.5, 0.0, 0.0]);
 }

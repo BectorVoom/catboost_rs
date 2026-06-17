@@ -727,6 +727,57 @@ fn is_grouped_loss(loss: &Loss) -> bool {
     )
 }
 
+/// Whether `loss` drives split-scoring / leaf-weight accounting off the per-object
+/// PAIRWISE weights (`bt.PairwiseWeights`) rather than the per-object sample
+/// weights. Mirrors upstream `UsesPairsForCalculation`
+/// (`enum_helpers.cpp:502` = `IsYetiRankLossFunction(loss) || IsPairLogit(loss)`):
+/// for these losses the histogram / leaf `sumWeight` is the per-object sum of
+/// competitor weights (`CalcPairwiseWeights`, `approx_updater_helpers.h:74-89`),
+/// NOT the per-object weight (which is `1.0` here). Every other loss returns
+/// `false` and keeps the per-object weight path byte-identical (D-04).
+#[must_use]
+fn uses_pairwise_weights(loss: &Loss) -> bool {
+    matches!(
+        loss,
+        Loss::PairLogit
+            | Loss::PairLogitPairwise
+            | Loss::YetiRank { .. }
+            | Loss::YetiRankPairwise { .. }
+    )
+}
+
+/// Per-object PAIRWISE weight vector mirroring upstream `CalcPairwiseWeights`
+/// (`approx_updater_helpers.h:74-89`): for every group's winner→loser competitor
+/// edge, add `competitor.weight` to BOTH the winner's and the loser's object slot.
+/// The result `pw[obj] = Σ competitor.weight` over all pairs incident on `obj`
+/// (as winner OR loser) is the histogram / leaf `sumWeight` the pairwise-loss
+/// (`UsesPairsForCalculation`) split scoring + Gradient leaf consume in place of
+/// the per-object sample weight (upstream `bt.PairwiseWeights`,
+/// `scoring.cpp:275-279` + `approx_calcer.cpp:444`). Accumulation order is
+/// group-ascending, winner-doc-ascending, competitor-order — the same fixed `+=`
+/// order upstream uses; no `unwrap`/`expect`/`panic`/indexing-slicing.
+#[must_use]
+fn calc_pairwise_weights(groups: &[GroupSpan], n: usize) -> Vec<f64> {
+    let mut pw = vec![0.0_f64; n];
+    for group in groups {
+        let begin = group.begin;
+        for (winner_local, comps) in group.competitors.iter().enumerate() {
+            let winner_global = begin + winner_local;
+            for competitor in comps {
+                let loser_global = begin + competitor.id;
+                let w = competitor.weight;
+                if let Some(slot) = pw.get_mut(winner_global) {
+                    *slot += w;
+                }
+                if let Some(slot) = pw.get_mut(loser_global) {
+                    *slot += w;
+                }
+            }
+        }
+    }
+    pw
+}
+
 /// The default `PairwiseNonDiagReg` (`bayesian_matrix_reg`) prior the Cholesky
 /// pairwise-leaf solve uses for the off-diagonal / diagonal reg terms
 /// (`oblivious_tree_options.cpp:16` `PairwiseNonDiagReg("bayesian_matrix_reg", 0.1)`).
@@ -2252,6 +2303,23 @@ fn train_inner<R: Runtime>(
                 .collect()
         };
 
+        // EFFECTIVE histogram / leaf weight (LOSS-04, 06.3-09): for a
+        // pairwise-loss (`UsesPairsForCalculation` — PairLogit / PairLogitPairwise /
+        // YetiRank{,Pairwise}) the split-scoring histogram `sumWeight` and the
+        // Gradient leaf `sumWeight` are the per-object PAIRWISE weights
+        // (`bt.PairwiseWeights` = Σ competitor.weight incident on the object;
+        // `scoring.cpp:275-279`, `approx_calcer.cpp:444`), NOT the per-object sample
+        // weight (which is `1.0` here). The der1 already carries the pair weight
+        // (`competitor.weight`), so ONLY the `sumWeight` denominator changes. For
+        // YetiRank the competitors are re-sampled per iteration above, so this is
+        // recomputed from the CURRENT `group_spans` each tree. For every NON-pairwise
+        // loss `eff_weights` IS the per-object `weights` (byte-identical, D-04).
+        let eff_weights: Vec<f64> = if uses_pairwise_weights(&params.loss) {
+            calc_pairwise_weights(group_spans.as_deref().unwrap_or(&[]), n)
+        } else {
+            weights.clone()
+        };
+
         // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211): keep the RNG
         //     phase-aligned with upstream before the per-tree Bootstrap.
         if draws_active {
@@ -2340,8 +2408,12 @@ fn train_inner<R: Runtime>(
             })
             .collect();
         // `score_weights` stays per-OBJECT (length `n`): the histogram weight is
-        // per object, masked/scaled by the per-object sample weight.
-        let score_weights: Vec<f64> = weights
+        // per object, masked/scaled by the per-object sample weight. For a
+        // pairwise loss the per-object weight is the PAIRWISE weight `eff_weights`
+        // (`bt.PairwiseWeights`), upstream `scoring.cpp:276-279`
+        // (`hasPairwiseWeights ? bt.PairwiseWeights : fold.LearnWeights`); for every
+        // other loss `eff_weights == weights` so this is byte-identical (D-04).
+        let score_weights: Vec<f64> = eff_weights
             .iter()
             .enumerate()
             .map(|(i, &w)| {
@@ -2370,7 +2442,19 @@ fn train_inner<R: Runtime>(
         //    `score_weights` (the `sampledDocs` restriction). Feeding the masked
         //    vector into the std-dev biases it low whenever `bootstrap_type != No`
         //    drops objects (CR-01) — fixed here by passing `&weighted_der1`.
-        let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
+        // L2 scaling uses `sumAllWeights / docCount` (`CalcDeltaNewtonBody`,
+        // `online_predictor.h:126`). For a pairwise loss `sumAllWeights` is the
+        // total PAIRWISE weight `Σ eff_weights` (each pair contributes its weight to
+        // both endpoints, so this is `2 × Σ competitor.weight`, upstream
+        // `fold.GetSumWeight()` over `bt.PairwiseWeights`), NOT the per-object sum;
+        // `docCount` stays `n`. For every non-pairwise loss `sum_pairwise_all ==
+        // sum_all_weights` so `scaled_l2` is byte-identical (D-04).
+        let sum_eff_weights = if uses_pairwise_weights(&params.loss) {
+            sum_f64(&eff_weights)
+        } else {
+            sum_all_weights
+        };
+        let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_eff_weights, n);
         let perturb = if perturb_active {
             let model_length = iter as f64 * learning_rate;
             // CR-02: std-dev sums `wd²` over the FULL dim-major buffer but
@@ -2561,13 +2645,26 @@ fn train_inner<R: Runtime>(
                 let der1_d = weighted_der1.get(base..base + n).unwrap_or(&[]);
                 let der2_d = ders.der2.get(base..base + n).unwrap_or(&[]);
                 let approx_d = approx.get(base..base + n).unwrap_or(&[]);
+                // LEAF-VALUE weights: the pointwise estimator re-weights the
+                // per-object `der2` (Newton) / `sum_weight` (Gradient) by this
+                // vector. For a GROUPED ranking der the `der1`/`der2` ALREADY fold
+                // the pair weight (`competitor.weight`) inside the per-group der —
+                // upstream Newton (`AddDerDer2`) consumes `der.Der1/der.Der2`
+                // verbatim with NO extra weight (`approx_calcer_helpers.h`) — so the
+                // grouped path passes UNIT weights here (re-weighting would
+                // double-count, the der2 analogue of CR-02 06.3-07). The pairwise
+                // `sumWeight` (`eff_weights`) only enters `scaled_l2` above. For the
+                // pointwise path this is the per-object `weights` (byte-identical, D-04).
+                let unit_weights: Vec<f64> = vec![1.0; n];
+                let leaf_weights_for_deltas: &[f64] =
+                    if group_spans.is_some() { &unit_weights } else { &eff_weights };
                 let leaf_deltas = compute_leaf_deltas(
                     params.leaf_method,
                     &params.loss,
                     &leaf_value_leaf_of,
                     der1_d,
                     der2_d,
-                    &weights,
+                    leaf_weights_for_deltas,
                     approx_d,
                     target,
                     scaled_l2,
@@ -2586,7 +2683,7 @@ fn train_inner<R: Runtime>(
         // SAME `leaf_value_leaf_of`, reduced ordered through cb_core::sum_f64 (D-08).
         // Leaf WEIGHTS are one-per-leaf (NOT per-dimension — the document partition
         // is shared across output dimensions), so this is unchanged at any dim.
-        let leaf_weights = accumulate_leaf_weights(&leaf_value_leaf_of, &weights, n_leaves);
+        let leaf_weights = accumulate_leaf_weights(&leaf_value_leaf_of, &eff_weights, n_leaves);
 
         // 4. Update approx: per dimension, `approx[d*n+i] += leaf_value[d][leaf(i)]`
         //    over the LEAF-VALUE leaf_of (so each iteration's der recompute is
