@@ -314,43 +314,51 @@ so commits are unaffected. Out of scope per the executor scope-boundary rule (on
 issues directly caused by the current task). Remediation: convert the `obj_approx[d]` write to
 a bounds-checked `get_mut` in a dedicated cb-backend hardening pass.
 
-## [06.3-17] YetiRankPairwise per-tree RNG draw-count calibration for trees 2+ (DEFERRED — Rule 4)
+## [06.3-17] YetiRankPairwise per-tree RNG draw-count calibration — CLOSED ✅ (supersedes the prior DEFERRED note)
 
-**Status:** PARTIALLY CLOSED. The genuine catboost 1.2.10 YetiRankPairwise fixture
-is frozen + committed (provenance human-approved). The end-to-end per-stage gate
-(`yetirank_pairwise_end_to_end_per_stage`) now takes the present-fixture branch and
-exercises the FULL 4-stage ≤1e-5 compare. The pairwise split-scorer (06.3-15/16) +
-the pairwise-aware seeder (this plan) make **trees 0 and 1 match upstream bit-for-bit**;
-the gate **diverges at tree 2** (Splits index 5).
+**Status:** CLOSED. `yetirank_pairwise_end_to_end_per_stage` passes ALL four stages
+(Splits|LeafValues|StagedApprox|Predictions) at ≤1e-5 on the present-fixture branch
+against the genuine catboost 1.2.10 YetiRankPairwise fixture. Gap #2 of LOSS-04 is
+closed. NO `#[ignore]`, NO tolerance weakening.
 
-**Root cause (Rule 4 architectural / SC-3 toolchain):** The per-tree `LearnProgress->Rand`
-draw count for the `*Pairwise` (`IsPairwiseScoring`) split path is NOT a constant and
-cannot be derived analytically. Upstream draws the `SetBestScore` random-score normals
-from a CHILD `TRestorableFastRng64(randSeed)` (greedy_tensor_search.cpp:718,
-tensor_search_helpers.cpp:724) that does not advance the context RNG — handled this plan
-(`YetiRankTreeSeeder` pairwise flag, which closed trees 0+1). The residual tree-2+ drift
-is a variable-length per-tree draw accounting (same family as boosting.rs:3097-3100 /
-D-11 / Open Q4) that requires the **instrumented multi-tree pairwise trainer**
-(`CB_INSTRUMENT_LOG` of `LearnProgress->Rand`) to localize draw-for-draw. That toolchain
-was deferred in 06.3 verification (SC-3) and is currently ABSENT from `/tmp` (only the
-standalone single-group `yetirank_oracle` competitor-draw binary remains; the clang-18 +
-built `_catboost.so` instrumented trainer must be re-fetched per the
-`catboost-instrumented-trainer-build` memory recipe).
+**The prior note (ff10d51) claimed trees 0+1 matched and tree 2+ needed an
+instrumented trainer. That was SUPERSEDED:** the instrumented multi-tree pairwise
+trainer WAS built (this plan, the persistent `/tmp/cb_build313` + clang-18 toolchain),
+and the per-tree `LearnProgress->Rand` call-count + recalc-seed fences it produced
+localized the TRUE root cause, which was NOT a "child-RNG bypass" and NOT a
+non-derivable per-tree draw count.
 
-**Empirically verified (this plan):** sweeping per-level normal-draw counts (0..4) and
-per-tree extra advances (0..8) does NOT align tree 2 — confirming the drift is
-non-constant and needs instrumentation, not a constant offset.
+**True root cause — WR-02 (candidate-feature undercount):** The per-tree
+GreedyTensorSearch draws an Rsm `GenRandReal1` + a `SelectBestCandidate` Box-Muller
+normal per ALL quantized float features. `boosting.rs::yetirank_n_candidate_features`
+counted only float features with SELECTED borders in the FINAL model (3), dropping
+corpus feature 2, which ends UNUSED (0 selected borders) but WAS a training candidate
+that consumed those draws. The undercount short-changed each tree's GTS draw count,
+desyncing the learnfold/leafval recalc seeds from tree 1 onward. Fix:
+`yetirank_n_candidate_features = feature_borders.len()` (all listed float features).
 
-**Escalate-don't-weaken (D-6.3-03b):** NO `#[ignore]` added, NO `compare_stage` tolerance
-weakened, NO fabricated fixture. The present-fixture gate stays RED as the honest invariant
-that closure is incomplete. Non-regression preserved: YetiRank pointwise (2/2) +
-PairLogitPairwise (1/1) oracles green; no new clippy warnings.
+**Also refuted:** the earlier "the pairwise path draws SetBestScore normals from a
+child RNG that does not advance the context RNG" hypothesis. The instrumented
+`cand_score_rng` fence proved every candidate draws `dist=Normal, stdev=0` with a
+non-zero Marsaglia-polar count DIRECTLY on `LearnProgress->Rand`. The
+`YetiRankTreeSeeder` `pairwise` flag is now a no-op; both losses use the single draw
+model.
 
-**Remediation (dedicated Rule-4 plan):** re-fetch the instrumented pairwise multi-tree
-trainer toolchain; capture the per-tree `LearnProgress->Rand` draw log for the
-YetiRankPairwise corpus; calibrate the seeder's per-tree pairwise advance draw-for-draw;
-then trees 2-4 close and the gate passes ≤1e-5.
+**Instrumentation landed (RUN-ONCE/COMMIT, env-gated `CB_INSTRUMENT_LOG`, D-08/D-11):**
+per-tree call-count fences in `train.cpp::TrainOneIteration`; per-level + per-candidate
+fences in `greedy_tensor_search.cpp`; `update_pairs` recalc/per-query seed + final
+competitor-weight fences in `yetirank_helpers.cpp`. Ground truth frozen at
+`ranking_corpus/yetirank_pairwise/yetirank_pairwise_tree_rng_groundtruth.jsonl`.
 
-**Also landed this plan (independent correctness fixes, committed):** WR-04 typed
-`CbError::OutOfRange` on the three out-of-range competitor-span `unwrap_or_default()` sites;
-learning-fold `*Pairwise` leaf routed through the Cholesky pairwise system.
+**Oracle added:** `yetirank_pairwise_tree_rng_oracle_test.rs` asserts the seeder lands
+the context RNG on the trainer's per-tree fences (0/34/76/108/146/186) AND reproduces
+the deriv/learnfold/leafval recalc seeds bit-exact for all 5 trees (`cb-core`
+`TFastRng64::call_count()` mirrors upstream `GetCallCount()`).
+
+**Non-regression:** YetiRank pointwise (2/2), PairLogitPairwise (1/1), PairLogit /
+QueryRMSE / QuerySoftMax / LambdaMart oracles all green; cb-train lib 194/194; cb-core
+26/26; no new clippy warnings.
+
+**Also landed (independent correctness fixes):** WR-04 typed `CbError::OutOfRange` on
+the out-of-range competitor-span sites; learning-fold `*Pairwise` leaf routed through
+the Cholesky pairwise system.
