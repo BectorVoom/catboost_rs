@@ -59,7 +59,10 @@ pub use permutation::{
 };
 pub use projection::{calc_hash, enumerate_projections, fold_cat_hash, TProjection};
 pub use query_info::{build_query_info, Competitor, QueryInfo};
-pub use yetirank::{derive_query_seeds, sample_pairs as yetirank_sample_pairs, sum_competitor_weights};
+pub use yetirank::{
+    derive_per_tree_query_seeds, derive_query_seeds, sample_pairs as yetirank_sample_pairs,
+    sum_competitor_weights, YetiRankTreeSeeder, YetiRankTreeSeeds,
+};
 pub use ranking_metrics::{
     clamp_top, compare_docs, dcg_group, err_group, map_at_group, mrr_group, ndcg_group,
     pfound_group, precision_at_group, query_auc_group, recall_at_group, AucType, DcgDenominator,

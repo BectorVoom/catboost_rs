@@ -40,7 +40,7 @@
 //! competitor-weight normalisation divides by `permutation_count` (validated
 //! `>= 1` by `cb_compute::Loss::validate`, so never by zero).
 
-use cb_core::{sum_f64, TFastRng64};
+use cb_core::{std_normal, sum_f64, TFastRng64};
 use cb_compute::RankingCompetitor as Competitor;
 
 /// The Classic-weight magic constant `0.15` ("Like in GPU",
@@ -91,8 +91,12 @@ pub fn sample_pairs(
     let mut rand = TFastRng64::from_seed(query_seed);
 
     // competitorsWeights[w][l] accumulates across permutations
-    // (yetirank_helpers.cpp:320).
-    let mut competitors_weights = vec![vec![0.0_f64; query_size]; query_size];
+    // (yetirank_helpers.cpp:320). Upstream the matrix is `TVector<TVector<float>>`
+    // — f32 storage + f32 accumulation. Transcribed as f32 here: the f32 bit-width
+    // of the accumulated pair weights is LOAD-BEARING for the end-to-end ≤1e-5 gate
+    // (an f64 accumulation drifts the leaf values ~1e-8 and flips a close split by
+    // ~tree 2, 06.3-14 ext).
+    let mut competitors_weights = vec![vec![0.0_f32; query_size]; query_size];
 
     for _perm in 0..permutation_count {
         // std::iota(indices, 0) (yetirank_helpers.cpp:322).
@@ -103,9 +107,17 @@ pub fn sample_pairs(
         // expApprox[d] *= u / (1.000001 - u) (yetirank_helpers.cpp:149-152). The
         // draw is per-doc in ASCENDING docId order (the parity contract).
         for b in bootstrapped.iter_mut() {
-            let u = rand.gen_rand_real1();
-            // 1.000001f is an f32 literal upstream; transcribe as f64 1.000_001.
-            *b *= u / (1.000_001 - u);
+            // upstream: `const float uniformValue = rand.GenRandReal1();` — the
+            // draw is CAST TO f32, and `expApproxes[d] *= uniformValue /
+            // (1.000001f - uniformValue)` evaluates the ratio in f32 (both operands
+            // f32), then promotes to f64 for the `*=` on the f64 `expApprox`. The
+            // f32 round of `uniformValue` + the f32 ratio is LOAD-BEARING: doing the
+            // whole thing in f64 drifts the sampled competitor weights by ~1e-8,
+            // which compounds across trees and flips a close split by ~tree 2
+            // (06.3-14 ext: end-to-end ≤1e-5 needs the f32 bit-width here).
+            let u = rand.gen_rand_real1() as f32;
+            let ratio = u / (1.000_001_f32 - u);
+            *b *= f64::from(ratio);
         }
         // StableSort(indices, bootstrapped[i] > bootstrapped[j]) — descending,
         // stable on ties (yetirank_helpers.cpp:326-331).
@@ -117,13 +129,23 @@ pub fn sample_pairs(
 
     // competitorsWeight[w][l] = queryWeight · weights[w][l] / permutationCount;
     // nonzero entries become competitor edges (yetirank_helpers.cpp:336-344).
+    // Upstream: `const float competitorsWeight = queryWeight * competitorsWeights[w][l]
+    //            / permutationCount;` — f32 throughout (queryWeight is `float`,
+    // TCompetitor.Weight is `float`). Compute in f32, then promote to the f64
+    // Competitor.weight (the der consumers promote f32→f64). The `!= 0` test is on
+    // the f32 value (upstream).
     let mut competitors: Vec<Vec<Competitor>> = vec![Vec::new(); query_size];
-    let denom = permutation_count as f64;
+    #[allow(clippy::cast_possible_truncation)]
+    let query_weight_f32 = query_weight as f32;
+    let denom = permutation_count as f32;
     for winner in 0..query_size {
         for loser in 0..query_size {
-            let w = query_weight * competitors_weights[winner][loser] / denom;
-            if w != 0.0 {
-                competitors[winner].push(Competitor { id: loser, weight: w });
+            let w_f32 = query_weight_f32 * competitors_weights[winner][loser] / denom;
+            if w_f32 != 0.0 {
+                competitors[winner].push(Competitor {
+                    id: loser,
+                    weight: f64::from(w_f32),
+                });
             }
         }
     }
@@ -153,6 +175,178 @@ pub fn derive_query_seeds(random_seed: u64, group_count: usize) -> Vec<u64> {
     (0..group_count).map(|_| block_rng.gen_rand()).collect()
 }
 
+/// `GenRandUI64Vector(size, seed)` (`restorable_rng.cpp:3-9`): `size` consecutive
+/// `GenRand()` draws from `TFastRng64(seed)`. The trainer's per-block seed vector.
+#[must_use]
+fn gen_rand_ui64_vec(seed: u64, size: usize) -> Vec<u64> {
+    let mut rng = TFastRng64::from_seed(seed);
+    (0..size).map(|_| rng.gen_rand()).collect()
+}
+
+/// Derive the per-query inner seeds for ONE `UpdatePairsForYetiRank` call, the
+/// FAITHFUL multi-block trainer model (`yetirank_helpers.cpp:369-414`).
+///
+/// Unlike [`derive_query_seeds`] (the standalone single-block self-oracle chain),
+/// the live trainer partitions the `[0, group_count)` query range into BLOCKS via
+/// `TExecRangeParams::SetBlockCount(CB_THREAD_LIMIT=128)`. For the small fixture
+/// corpora `block_size == CeilDiv(group_count, 128) == 1`, so `block_count ==
+/// group_count` — i.e. ONE block per query. Each block draws its OWN block seed
+/// from `randomSeeds = GenRandUI64Vector(block_count, recalc_seed)`, then a fresh
+/// `TFastRng64(randomSeeds[blockId])` yields that block's single query seed via one
+/// `GenRand()`. So per group `g`:
+/// ```text
+/// blockSeeds = GenRandUI64Vector(group_count, recalc_seed)
+/// querySeed[g] = TFastRng64(blockSeeds[g]).GenRand()
+/// ```
+/// `recalc_seed` is the `randomSeed` argument `UpdatePairsForYetiRank` receives
+/// (already passed through the caller's `GenRandUI64Vector(BodyTailArr=1, ·)` —
+/// see [`YetiRankTreeSeeder`]). Verified bit-exact against the instrumented
+/// trainer's per-group first Gumbel draws for all 5 corpus groups (06.3-14 ext).
+///
+/// NOTE: for `group_count == 1` this is NOT identical to [`derive_query_seeds`] —
+/// the block model adds one extra `GenRandUI64Vector` layer. The standalone
+/// self-oracle keeps [`derive_query_seeds`]; the trainer path uses THIS.
+#[must_use]
+pub fn derive_per_tree_query_seeds(recalc_seed: u64, group_count: usize) -> Vec<u64> {
+    let block_seeds = gen_rand_ui64_vec(recalc_seed, group_count);
+    block_seeds
+        .into_iter()
+        .map(|bs| TFastRng64::from_seed(bs).gen_rand())
+        .collect()
+}
+
+/// Per-tree YetiRank seeding driver: a persistent context RNG that mirrors
+/// `TLearnContext::LearnProgress->Rand` (seeded with `params.random_seed`) and
+/// reproduces, draw-for-draw, the upstream per-tree RNG consumption so the
+/// derivative-recalc and leaf-value-recalc YetiRank query seeds land on the exact
+/// trainer stream (`train.cpp` boosting step + `greedy_tensor_search.cpp` +
+/// `approx_calcer.cpp`). This closes the D-07 trainer-level RNG seed-plumbing gap.
+///
+/// # Per-tree draw sequence (single-host, `boosting_type=Plain`, `bootstrap=No`)
+///
+/// Transcribed from the instrumented trainer (06.3-14 ext, all events env-gated):
+/// 1. `structure_draw = Rand.GenRand()` — the structure-fold selection
+///    (`train.cpp:316`, `Folds[draw % foldCount]`).
+/// 2. `deriv_base = Rand.GenRand()` → `randomSeeds = GenRandUI64Vector(1, deriv_base)`
+///    (`train.cpp:326`, `BodyTailArr.size()==1`) → `UpdatePairsForYetiRank(randomSeeds[0])`
+///    re-samples the DERIVATIVE competitors (drives gradient + split scoring).
+/// 3. Per tree LEVEL (`depth` levels, `greedy_tensor_search.cpp:1189`):
+///    - `SelectCandidatesAndCleanupStatsFromPrevTree`: one `GenRandReal1()` per
+///      float-feature candidate sublist (`:334`, `OneFeature`, Rsm draw — Rsm=1 so
+///      every feature survives but the draw still advances the RNG); `n_features`
+///      draws.
+///    - `CalcScores`: one `GenRand()` (`:884`, the per-level score randSeed).
+///    - `SelectBestCandidate`: one `TRandomScore::GetInstance` per candidate
+///      (`:955`), which calls `NormalDistribution(rand, 0, stDev)` →
+///      `StdNormalDistribution` (Box–Muller). With `random_strength==0` the result
+///      is discarded but the draws STILL happen; `n_features` candidates (one
+///      `BestScore` per float feature). Each consumes a variable (rejection-driven)
+///      even count of `GenRandReal1()` — reproduced via [`cb_core::std_normal`].
+/// 4. `learnfold_base = Rand.GenRand()` → `GenRandUI64Vector(foldCount=1, ·)`
+///    (`train.cpp:420`) for the learning-fold approx update (its YetiRank recalc is
+///    consumed but does not feed the model; we only ADVANCE the RNG here).
+/// 5. `leafval_base = Rand.GenRand()` (`approx_calcer.cpp:983`, inside
+///    `CalcLeafValuesSimple`) → `UpdatePairsForYetiRank(leafval_base)` re-samples
+///    the LEAF-VALUE competitors (drives leaf der + leaf weights on the
+///    AveragingFold).
+///
+/// The deriv recalc seed passes through TWO `GenRandUI64Vector` layers
+/// (`deriv_base → randomSeeds[0] → block seeds`); the leaf-value recalc seed is the
+/// RAW `Rand.GenRand()` (ONE fewer layer). Both are handled here so callers receive
+/// ready-to-use per-group query seeds.
+pub struct YetiRankTreeSeeder {
+    rng: TFastRng64,
+    group_count: usize,
+    n_features: usize,
+    depth: usize,
+}
+
+/// The per-tree YetiRank query seeds: one set for the derivative/split recalc, one
+/// for the learning-fold approx-update recalc, and one for the (averaging-fold)
+/// leaf-value recalc — each a per-group inner Gumbel seed.
+pub struct YetiRankTreeSeeds {
+    /// Per-group inner seeds for the gradient/split competitor re-sample (learning
+    /// fold 0 approx).
+    pub deriv: Vec<u64>,
+    /// Per-group inner seeds for the LEARNING-fold approx-update competitor
+    /// re-sample (`UpdateLearningFold` -> `CalcApproxForLeafStruct`, drawn at
+    /// `train.cpp:420` BEFORE the averaging-fold leaf values).
+    pub learnfold: Vec<u64>,
+    /// Per-group inner seeds for the AVERAGING-fold leaf-value competitor
+    /// re-sample (the stored model leaf values).
+    pub leafval: Vec<u64>,
+}
+
+impl YetiRankTreeSeeder {
+    /// Create the seeder mirroring `LearnProgress->Rand(random_seed)`.
+    #[must_use]
+    pub fn new(random_seed: u64, group_count: usize, n_features: usize, depth: usize) -> Self {
+        Self {
+            rng: TFastRng64::from_seed(random_seed),
+            group_count,
+            n_features,
+            depth,
+        }
+    }
+
+    /// Advance the context RNG through ONE tree's full draw sequence and return the
+    /// derivative + leaf-value per-group query seeds. Must be called once per tree,
+    /// in tree order, so the persistent RNG phase stays aligned with the trainer.
+    pub fn next_tree(&mut self) -> YetiRankTreeSeeds {
+        // 1. structure-fold selection draw.
+        let _structure = self.rng.gen_rand();
+
+        // 2. derivative recalc: deriv_base -> GenRandUI64Vector(1, deriv_base)[0]
+        //    is the randomSeed UpdatePairsForYetiRank receives.
+        let deriv_base = self.rng.gen_rand();
+        let deriv_recalc_seed = gen_rand_ui64_vec(deriv_base, 1)[0];
+        let deriv = derive_per_tree_query_seeds(deriv_recalc_seed, self.group_count);
+
+        // 3. per-level GreedyTensorSearch draws (consumed, output-irrelevant at
+        //    random_strength=0 / Rsm=1, but they ADVANCE the shared RNG phase).
+        for _level in 0..self.depth {
+            // SelectCandidates: one Rsm GenRandReal1 per float-feature sublist.
+            for _ in 0..self.n_features {
+                let _ = self.rng.gen_rand_real1();
+            }
+            // CalcScores: one per-level score randSeed.
+            let _ = self.rng.gen_rand();
+            // SelectBestCandidate: one Box-Muller normal per candidate (one
+            // BestScore per float feature).
+            for _ in 0..self.n_features {
+                let _ = std_normal(&mut self.rng);
+            }
+        }
+
+        // 4. learning-fold update recalc: learnfold_base ->
+        //    GenRandUI64Vector(foldCount=1, learnfold_base)[0] is the randomSeed
+        //    `UpdateLearningFold -> CalcApproxForLeafStruct` passes to
+        //    `UpdatePairsForYetiRank` (train.cpp:420 + approx_calcer.cpp:1147,
+        //    `GenRandUI64Vector(BodyTailArr=1, ·)`). This re-samples the LEARNING
+        //    fold's competitors, whose leaf values update the learning-fold approx
+        //    that feeds the NEXT tree's gradient/structure (YetiRank is NOT
+        //    UseAveragingFoldAsFoldZero — usePairs is true, learn_context.cpp:855).
+        // Two GenRandUI64Vector(1, ·) layers: randomSeeds[0]=vec1(learnfold_base)
+        // (train.cpp:420, foldCount=1), then randomSeeds2[0]=vec1(randomSeeds[0])
+        // (approx_calcer.cpp:1147, BodyTailArr=1) — the seed `CalcApproxDeltaSimple`
+        // passes verbatim to `UpdatePairsForYetiRank`.
+        let learnfold_base = self.rng.gen_rand();
+        let learnfold_rs0 = gen_rand_ui64_vec(learnfold_base, 1)[0];
+        let learnfold_recalc_seed = gen_rand_ui64_vec(learnfold_rs0, 1)[0];
+        let learnfold = derive_per_tree_query_seeds(learnfold_recalc_seed, self.group_count);
+
+        // 5. averaging-fold leaf-value recalc: leafval_base is the RAW
+        //    Rand.GenRand() passed directly to CalcLeafDersSimple ->
+        //    UpdatePairsForYetiRank (one fewer GenRandUI64Vector layer than the
+        //    deriv/learnfold recalcs). These competitors drive the STORED model
+        //    leaf values on the AveragingFold.
+        let leafval_base = self.rng.gen_rand();
+        let leafval = derive_per_tree_query_seeds(leafval_base, self.group_count);
+
+        YetiRankTreeSeeds { deriv, learnfold, leafval }
+    }
+}
+
 /// Classic pairwise-weight accumulation along the sorted adjacency
 /// (`yetirank_helpers.cpp:193-205` `CalcWeightsClassic`):
 /// ```text
@@ -174,17 +368,25 @@ fn calc_weights_classic(
     permutation: &[usize],
     relevs: &[f64],
     decay: f64,
-    competitors_weights: &mut [Vec<f64>],
+    competitors_weights: &mut [Vec<f32>],
 ) {
     let query_size = permutation.len();
     let mut decay_coefficient = 1.0_f64;
     for doc_id in 1..query_size {
         let first = permutation[doc_id - 1];
         let second = permutation[doc_id];
-        let rf = relevs.get(first).copied().unwrap_or(0.0);
-        let rs = relevs.get(second).copied().unwrap_or(0.0);
-        // pairWeight = magicConst · decayCoefficient · |Δrelev|.
-        let pair_weight = MAGIC_CONST * decay_coefficient * (rf - rs).abs();
+        // upstream `Relevs` is `const float*`; the per-pair |Δrelev| is computed in
+        // f32 (`Abs(Relevs[i] - Relevs[j])`). Cast the f64 corpus relevances to f32
+        // first so the subtraction round matches.
+        #[allow(clippy::cast_possible_truncation)]
+        let rf = relevs.get(first).copied().unwrap_or(0.0) as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let rs = relevs.get(second).copied().unwrap_or(0.0) as f32;
+        // `const float pairWeight = magicConst * decayCoefficient * Abs(rf - rs)` —
+        // the f64 product (magicConst, decayCoefficient are `double`) is assigned to
+        // an f32, so cast the result to f32.
+        #[allow(clippy::cast_possible_truncation)]
+        let pair_weight = (MAGIC_CONST * decay_coefficient * f64::from((rf - rs).abs())) as f32;
         add_weight(first, second, rf, rs, pair_weight, competitors_weights);
         decay_coefficient *= decay;
     }
@@ -193,15 +395,16 @@ fn calc_weights_classic(
 /// `AddWeight` (`yetirank_helpers.cpp:185-191`): route the pair weight to the
 /// higher-relevance doc as the winner. `relev[first] > relev[second]` →
 /// `competitorsWeights[first][second] += w`; `relev[first] < relev[second]` →
-/// `competitorsWeights[second][first] += w`; ties (`==`) add nothing.
+/// `competitorsWeights[second][first] += w`; ties (`==`) add nothing. f32 storage
+/// + f32 accumulation, matching upstream `TVector<TVector<float>>`.
 #[inline]
 fn add_weight(
     first: usize,
     second: usize,
-    relev_first: f64,
-    relev_second: f64,
-    weight: f64,
-    competitors_weights: &mut [Vec<f64>],
+    relev_first: f32,
+    relev_second: f32,
+    weight: f32,
+    competitors_weights: &mut [Vec<f32>],
 ) {
     if relev_first > relev_second {
         if let Some(row) = competitors_weights.get_mut(first) {

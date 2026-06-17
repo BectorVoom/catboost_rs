@@ -1805,10 +1805,35 @@ fn train_inner<R: Runtime>(
     } else {
         Vec::new()
     };
-    let yetirank_query_seeds: Vec<u64> = if is_yetirank {
-        crate::derive_query_seeds(params.random_seed, yetirank_groups.len())
+    // Per-tree YetiRank seeding driver (D-07 trainer-level RNG closure, 06.3-14
+    // ext). The PRIOR model derived ONE fixed `derive_query_seeds(params.random_seed,
+    // n_groups)` set and reused it for EVERY tree over ONE permutation fold — which
+    // matched the standalone single-group self-oracle but DIVERGED from the live
+    // trainer, whose `UpdatePairsForYetiRank` re-derives the per-query seed PER TREE
+    // from the persistent `LearnProgress->Rand` (advanced through the structure /
+    // split-search / leaf-estimation draws each tree) AND samples DISTINCT competitor
+    // sets for the gradient/split recalc vs the leaf-value recalc. `YetiRankTreeSeeder`
+    // reproduces that draw-for-draw (verified bit-exact vs the instrumented trainer's
+    // per-tree, per-group first-Gumbel stream). `next_tree()` is called once per
+    // boosting iteration below to yield this tree's deriv + leafval per-group seeds.
+    // Candidate-sublist count for the per-level split-search draws: ONE
+    // `OneFeature` candidate sublist per FLOAT feature that has at least one border
+    // (`AddFloatFeatures` skips border-less features). This is the count of Rsm
+    // selection draws AND the count of `SelectBestCandidate` Box-Muller normals per
+    // level (one `BestScore` per feature). Corpus: 4 float features, all bordered.
+    let yetirank_n_candidate_features = feature_borders
+        .iter()
+        .filter(|b| !b.is_empty())
+        .count();
+    let mut yetirank_seeder: Option<crate::YetiRankTreeSeeder> = if is_yetirank {
+        Some(crate::YetiRankTreeSeeder::new(
+            params.random_seed,
+            yetirank_groups.len(),
+            yetirank_n_candidate_features,
+            params.depth,
+        ))
     } else {
-        Vec::new()
+        None
     };
 
     // N-dim approx buffer (D-6.2-01 / Plan 06.2-02). `approx_dimension` is the
@@ -1884,6 +1909,17 @@ fn train_inner<R: Runtime>(
 
     let bias = starting_approx(params, target);
     let mut approx = vec![bias; approx_dimension * n];
+
+    // YetiRank LEARNING-fold approx (D-07, 06.3-14 ext): YetiRank is NOT
+    // `UseAveragingFoldAsFoldZero` (usePairs is true — `learn_context.cpp:855`), so
+    // the LEARNING fold (fold 0, drives the gradient + tree STRUCTURE) and the
+    // AVERAGING fold (drives the stored model leaf VALUES) carry SEPARATE approxes
+    // that diverge after tree 0. The structure search + deriv recalc read the
+    // learning-fold approx; the leaf-value recalc reads the averaging-fold approx
+    // (`approx`). `learn_approx` mirrors the learning-fold approx, updated each tree
+    // by the learning-fold leaf-value recalc (`UpdateLearningFold`). For every
+    // NON-YetiRank loss this buffer is unused (the single `approx` is correct).
+    let mut learn_approx: Vec<f64> = if is_yetirank { approx.clone() } else { Vec::new() };
 
     // Boosting type (ORD-02): the Plain path below estimates every document's
     // leaf delta on the whole fold (single body/tail span). The ORDERED path
@@ -2253,21 +2289,33 @@ fn train_inner<R: Runtime>(
         // 0. YetiRank / YetiRankPairwise (Wave C): RE-SAMPLE the per-group
         //    competitor adjacency from the CURRENT approx before the der
         //    (yetirank_helpers.cpp:347-393 — the pairs are recomputed each tree).
-        //    The sampled competitors are injected into the group spans the grouped
-        //    seam reads; the per-query inner seeds are the FIXED 2-level-derived
-        //    seeds (single-thread), so each iteration re-samples the same RNG stream
-        //    over the updated approx. The der then rides the PairLogit der (YetiRank
-        //    pointwise) / Cholesky pairwise leaf (YetiRankPairwise) over these pairs.
+        //
+        //    PER-TREE seeding (D-07 trainer-level RNG closure, 06.3-14 ext): advance
+        //    the persistent `YetiRankTreeSeeder` once for THIS tree, yielding the
+        //    DERIVATIVE per-group seeds (used HERE for the gradient + split-scoring
+        //    competitor sample) and the LEAF-VALUE per-group seeds (used later, at
+        //    leaf-value estimation, to re-sample a DISTINCT competitor set —
+        //    `CalcLeafValuesSimple` re-derives its own seed off the same context
+        //    RNG, `approx_calcer.cpp:983`). The seeder reproduces the trainer's
+        //    per-tree main-RNG consumption (structure draw + split-search Rsm/normal
+        //    draws + the two recalc seeds) draw-for-draw, so the sampled competitors
+        //    match the catboost fixture from tree 0 onward.
+        let yetirank_tree_seeds = yetirank_seeder.as_mut().map(crate::YetiRankTreeSeeder::next_tree);
         if is_yetirank {
-            if let Some(spans) = group_spans.as_mut() {
+            if let (Some(spans), Some(seeds)) =
+                (group_spans.as_mut(), yetirank_tree_seeds.as_ref())
+            {
                 for (gi, span) in spans.iter_mut().enumerate() {
                     if let Some((begin, end, weight, relevs)) = yetirank_groups.get(gi) {
-                        let raw_approx: Vec<f64> = approx
+                        // Deriv competitors are sampled from the LEARNING-fold approx
+                        // (the gradient/structure fold), NOT the averaging-fold
+                        // `approx` (which drives leaf values). They coincide at tree 0
+                        // (both == bias) and diverge after.
+                        let raw_approx: Vec<f64> = learn_approx
                             .get(*begin..*end)
                             .map(<[f64]>::to_vec)
                             .unwrap_or_default();
-                        let query_seed =
-                            yetirank_query_seeds.get(gi).copied().unwrap_or(0);
+                        let query_seed = seeds.deriv.get(gi).copied().unwrap_or(0);
                         span.competitors = crate::yetirank_sample_pairs(
                             &raw_approx,
                             relevs,
@@ -2300,8 +2348,13 @@ fn train_inner<R: Runtime>(
             // the `weighted_der1` computation below uses this buffer AS-IS for the
             // grouped path — re-multiplying by `weights[i]` would double-weight the
             // gradient (CR-02, 06.3-07). The pointwise branch applies `der1 * weight`.
+            // YetiRank: the GRADIENT (structure/split) der is computed over the
+            // LEARNING-fold approx (`learn_approx`), the fold whose competitors were
+            // just re-sampled above; every other grouped loss uses the single
+            // `approx` (byte-identical, `is_yetirank` false).
+            let grad_approx: &[f64] = if is_yetirank { &learn_approx } else { &approx };
             let per_group =
-                runtime.compute_gradients_grouped(&params.loss, &approx, target, &weights, spans, params.random_seed)?;
+                runtime.compute_gradients_grouped(&params.loss, grad_approx, target, &weights, spans, params.random_seed)?;
             let mut der1 = Vec::with_capacity(n);
             let mut der2 = Vec::with_capacity(n);
             for g in &per_group {
@@ -2612,6 +2665,73 @@ fn train_inner<R: Runtime>(
             }
         };
 
+        // YetiRank LEAF-VALUE competitor RE-SAMPLE (D-07, 06.3-14 ext): the live
+        // trainer re-samples a DISTINCT YetiRank competitor set for the AveragingFold
+        // leaf-value estimation (`CalcLeafValuesSimple` -> `CalcLeafDersSimple` ->
+        // `YetiRankRecalculation`, `approx_calcer.cpp:983`), drawn off the SAME
+        // persistent context RNG AFTER the tree structure is grown — a DIFFERENT seed
+        // than the gradient/split recalc. Re-sample the competitors with the
+        // leaf-value per-group seeds, then recompute the grouped der + pairwise
+        // `eff_weights` so the leaf-value estimation rides the leaf-value competitor
+        // stream (the gradient/split recalc above already consumed the deriv seeds).
+        // For NON-YetiRank losses this block is skipped (the leaf-value path reuses
+        // the gradient der/weights, byte-identical, D-04).
+        let (lv_weighted_der1, lv_der2, lv_eff_weights): (Vec<f64>, Vec<f64>, Vec<f64>) =
+            if is_yetirank {
+                if let (Some(spans), Some(seeds)) =
+                    (group_spans.as_mut(), yetirank_tree_seeds.as_ref())
+                {
+                    for (gi, span) in spans.iter_mut().enumerate() {
+                        if let Some((begin, end, weight, relevs)) = yetirank_groups.get(gi) {
+                            let raw_approx: Vec<f64> = approx
+                                .get(*begin..*end)
+                                .map(<[f64]>::to_vec)
+                                .unwrap_or_default();
+                            let query_seed = seeds.leafval.get(gi).copied().unwrap_or(0);
+                            span.competitors = crate::yetirank_sample_pairs(
+                                &raw_approx,
+                                relevs,
+                                *weight,
+                                yetirank_permutations,
+                                yetirank_decay,
+                                query_seed,
+                            );
+                        }
+                    }
+                }
+                // Recompute the grouped der over the leaf-value competitors. The
+                // grouped der already folds the pair weight (CR-02), so the leaf-value
+                // `weighted_der1` is the raw grouped der1 (no per-object re-weight).
+                let spans_ref = group_spans.as_deref().unwrap_or(&[]);
+                let per_group = runtime.compute_gradients_grouped(
+                    &params.loss,
+                    &approx,
+                    target,
+                    &weights,
+                    spans_ref,
+                    params.random_seed,
+                )?;
+                let mut d1 = Vec::with_capacity(n);
+                let mut d2 = Vec::with_capacity(n);
+                for g in &per_group {
+                    d1.extend_from_slice(&g.der1);
+                    d2.extend_from_slice(&g.der2);
+                }
+                let eff = if uses_pairwise_weights(&params.loss) {
+                    calc_pairwise_weights(spans_ref, n)
+                } else {
+                    weights.clone()
+                };
+                (d1, d2, eff)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        // Select the der/weights the leaf-value estimation reads: the YetiRank
+        // leaf-value re-sample above, or (every other loss) the gradient buffers.
+        let lv_weighted_der1: &[f64] = if is_yetirank { &lv_weighted_der1 } else { &weighted_der1 };
+        let lv_der2: &[f64] = if is_yetirank { &lv_der2 } else { &ders.der2 };
+        let lv_eff_weights: &[f64] = if is_yetirank { &lv_eff_weights } else { &eff_weights };
+
         // LEAF-VALUE leaf_of (research Q1/Q3 #3, train.cpp:130
         // BuildIndices(AveragingFold)). On the CTR path, the per-object leaf indices
         // for LEAF-VALUE estimation are computed over the AVERAGING-fold CTR columns
@@ -2668,10 +2788,16 @@ fn train_inner<R: Runtime>(
             // directly). `pairwise_bucket_weight_prior_reg = PairwiseNonDiagReg`
             // (`bayesian_matrix_reg`, default 0.1).
             let spans = group_spans.as_deref().unwrap_or(&[]);
+            // YetiRankPairwise: the leaf-value der + Competitors are the leaf-value
+            // re-sample (`lv_weighted_der1` == the grouped der1, pair weight already
+            // folded); the `spans[*].competitors` were re-sampled with the leaf-value
+            // seeds above. PairLogit{,Pairwise} (non-YetiRank) reuse `ders.der1`
+            // (byte-identical — `is_yetirank` is false, D-04).
+            let pairwise_der1: &[f64] = if is_yetirank { lv_weighted_der1 } else { &ders.der1 };
             let deltas = crate::pairwise_leaves::compute_pairwise_leaf_deltas(
                 spans,
                 &leaf_value_leaf_of,
-                &ders.der1,
+                pairwise_der1,
                 n_leaves,
                 params.l2_leaf_reg,
                 PAIRWISE_NON_DIAG_REG_DEFAULT,
@@ -2715,8 +2841,11 @@ fn train_inner<R: Runtime>(
             // Newton arm per dimension.
             for d in 0..approx_dimension {
                 let base = d * n;
-                let der1_d = weighted_der1.get(base..base + n).unwrap_or(&[]);
-                let der2_d = ders.der2.get(base..base + n).unwrap_or(&[]);
+                // YetiRank: the leaf-value der is the leaf-value-competitor re-sample
+                // (`lv_weighted_der1`/`lv_der2`); every other loss reuses the gradient
+                // buffers (byte-identical, `lv_* == weighted_der1`/`ders.der2`, D-04).
+                let der1_d = lv_weighted_der1.get(base..base + n).unwrap_or(&[]);
+                let der2_d = lv_der2.get(base..base + n).unwrap_or(&[]);
                 let approx_d = approx.get(base..base + n).unwrap_or(&[]);
                 // LEAF-VALUE weights (REVIEW WR-03 / T-06.3-14): the pointwise
                 // estimator re-weights the per-object `der2` (Newton) / `sum_weight`
@@ -2753,8 +2882,9 @@ fn train_inner<R: Runtime>(
                     && uses_pairwise_weights(&params.loss);
                 let leaf_weights_for_deltas: &[f64] = if group_spans.is_some() {
                     if grouped_gradient_pairwise {
-                        // YetiRank Gradient leaf: pairwise sumWeight (bt.PairwiseWeights).
-                        &eff_weights
+                        // YetiRank Gradient leaf: pairwise sumWeight (bt.PairwiseWeights),
+                        // from the LEAF-VALUE competitor re-sample (`lv_eff_weights`).
+                        lv_eff_weights
                     } else {
                         // Newton (or non-pairwise grouped) leaf: der already folds the
                         // pair weight → unit weights (no double-count).
@@ -2833,6 +2963,83 @@ fn train_inner<R: Runtime>(
                     leaf_values.get(leaf_base + leaf),
                 ) {
                     *a += lv;
+                }
+            }
+        }
+
+        // YetiRank LEARNING-fold approx update (D-07, 06.3-14 ext): the learning
+        // fold (fold 0, drives the NEXT tree's gradient/structure) carries its OWN
+        // approx, updated by a SEPARATE leaf-value recalc over the LEARNING-fold
+        // competitors (`UpdateLearningFold -> CalcApproxForLeafStruct`,
+        // train.cpp:585). Re-sample the learnfold competitors off `learn_approx`,
+        // recompute the grouped der + the Newton leaf deltas over the SAME structure
+        // partition (`leaf_value_leaf_of`; Plain/no-CTR shares it), apply the
+        // weighted-mean NormalizeLeafValues + learning_rate, and add to
+        // `learn_approx`. This is single-dimension (YetiRank approx_dimension == 1)
+        // and rides the Newton leaf (unit weights — der2 folds the pair weight).
+        // Done AFTER the averaging-fold `approx` update so the staged/model output is
+        // unaffected; only the next tree's gradient reads `learn_approx`.
+        if is_yetirank {
+            if let (Some(spans), Some(seeds)) =
+                (group_spans.as_mut(), yetirank_tree_seeds.as_ref())
+            {
+                for (gi, span) in spans.iter_mut().enumerate() {
+                    if let Some((begin, end, weight, relevs)) = yetirank_groups.get(gi) {
+                        let raw_approx: Vec<f64> = learn_approx
+                            .get(*begin..*end)
+                            .map(<[f64]>::to_vec)
+                            .unwrap_or_default();
+                        let query_seed = seeds.learnfold.get(gi).copied().unwrap_or(0);
+                        span.competitors = crate::yetirank_sample_pairs(
+                            &raw_approx,
+                            relevs,
+                            *weight,
+                            yetirank_permutations,
+                            yetirank_decay,
+                            query_seed,
+                        );
+                    }
+                }
+            }
+            let spans_ref = group_spans.as_deref().unwrap_or(&[]);
+            let per_group = runtime.compute_gradients_grouped(
+                &params.loss,
+                &learn_approx,
+                target,
+                &weights,
+                spans_ref,
+                params.random_seed,
+            )?;
+            let mut lf_der1 = Vec::with_capacity(n);
+            let mut lf_der2 = Vec::with_capacity(n);
+            for g in &per_group {
+                lf_der1.extend_from_slice(&g.der1);
+                lf_der2.extend_from_slice(&g.der2);
+            }
+            // Newton leaf (unit weights — der already folds the pair weight, WR-03).
+            let lf_unit = vec![1.0_f64; n];
+            let lf_leaf_values = compute_leaf_deltas(
+                params.leaf_method,
+                &params.loss,
+                &leaf_value_leaf_of,
+                &lf_der1,
+                &lf_der2,
+                &lf_unit,
+                &learn_approx,
+                target,
+                scaled_l2,
+                n_leaves,
+                0,
+            );
+            // The LEARNING-fold approx update applies ONLY `learning_rate`
+            // (`UpdateBodyTailApprox` -> `ApplyLearningRate`,
+            // `approx_updater_helpers.h:26-30`) — NOT `NormalizeLeafValues` (the
+            // doc-weighted-mean centering is applied ONLY to the AVERAGING-fold
+            // STORED model leaves at `train.cpp:562`). So the learning-fold delta is
+            // the RAW Newton leaf delta scaled by `learning_rate`, with no centering.
+            for (i, &leaf) in leaf_value_leaf_of.iter().enumerate() {
+                if let (Some(a), Some(&lv)) = (learn_approx.get_mut(i), lf_leaf_values.get(leaf)) {
+                    *a += lv * learning_rate;
                 }
             }
         }

@@ -69,28 +69,40 @@ fn permutations_one_two_doc_group_draws_two_gumbel_uniforms() {
     let decay = 0.85_f64;
 
     // Hand trace the inner rng: TFastRng64(querySeed); per doc one gen_rand_real1().
+    // The sampler transcribes upstream's f32 bit-width: `uniformValue` is cast to
+    // f32, the Gumbel ratio is computed in f32, the competitor-weight matrix is f32,
+    // and the final `competitorsWeight = queryWeight * w / permutationCount` is f32
+    // (`TVector<TVector<float>>` + `float TCompetitor.Weight`, yetirank_helpers.cpp).
+    // The hand trace mirrors that exactly so the assertion stays bit-tight.
     let mut rand = TFastRng64::from_seed(query_seed);
     let exp0 = raw_approx[0].exp();
     let exp1 = raw_approx[1].exp();
-    let u0 = rand.gen_rand_real1();
-    let boot0 = exp0 * (u0 / (1.000_001 - u0));
-    let u1 = rand.gen_rand_real1();
-    let boot1 = exp1 * (u1 / (1.000_001 - u1));
+    #[allow(clippy::cast_possible_truncation)]
+    let u0 = rand.gen_rand_real1() as f32;
+    let boot0 = exp0 * f64::from(u0 / (1.000_001_f32 - u0));
+    #[allow(clippy::cast_possible_truncation)]
+    let u1 = rand.gen_rand_real1() as f32;
+    let boot1 = exp1 * f64::from(u1 / (1.000_001_f32 - u1));
     // Sort descending: the higher bootstrapped approx is the first sorted position.
-    // Classic weight: 0.15 · decay^0 · |relev[first] - relev[second]|, routed to
-    // the higher-relevance doc as winner.
+    // Classic weight (f32): 0.15 · decay^0 · |relev[first] - relev[second]|, routed
+    // to the higher-relevance doc as winner.
     let (first, second) = if boot0 >= boot1 { (0_usize, 1_usize) } else { (1_usize, 0_usize) };
-    let pair_weight = 0.15 * 1.0 * (relevs[first] - relevs[second]).abs();
+    #[allow(clippy::cast_possible_truncation)]
+    let rdiff = (relevs[first] as f32 - relevs[second] as f32).abs();
+    #[allow(clippy::cast_possible_truncation)]
+    let pair_weight = (0.15_f64 * 1.0 * f64::from(rdiff)) as f32;
     // AddWeight routes to the higher-relevance doc: doc0 (relev 1.0) wins over doc1.
-    let mut expected = vec![vec![0.0_f64; 2]; 2];
+    let mut expected = vec![vec![0.0_f32; 2]; 2];
     if relevs[first] > relevs[second] {
         expected[first][second] += pair_weight;
     } else if relevs[first] < relevs[second] {
         expected[second][first] += pair_weight;
     }
-    // competitorsWeight = queryWeight · w / permutations.
-    let expected_w01 = query_weight * expected[0][1] / permutations as f64;
-    let expected_w10 = query_weight * expected[1][0] / permutations as f64;
+    // competitorsWeight = queryWeight(f32) · w(f32) / permutations, then f64-promoted.
+    #[allow(clippy::cast_possible_truncation)]
+    let qw = query_weight as f32;
+    let expected_w01 = f64::from(qw * expected[0][1] / permutations as f32);
+    let expected_w10 = f64::from(qw * expected[1][0] / permutations as f32);
 
     let competitors = sample_pairs(&raw_approx, &relevs, query_weight, permutations, decay, query_seed);
     assert_eq!(competitors.len(), 2, "two docs => two competitor rows");
