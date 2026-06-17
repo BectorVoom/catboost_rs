@@ -172,15 +172,80 @@ ground truth captured ONLY the PairLogit pointwise per-leaf der, not pairwise sp
 **Escalate-don't-weaken:** tolerance unchanged, no fixture fabricated, `#[ignore]` retained
 with the precise divergence recorded in the test header.
 
-## [06.3-14] YetiRank/StochasticRank end-to-end trainer fixture — trainer-level RNG multi-fold/per-tree seed plumbing (DEFERRED, Rule 4)
+## [06.3-14] YetiRank end-to-end CLOSED; YetiRankPairwise needs the pairwise split-scorer; StochasticRank needs its own noise-seed analysis
 
-**Status:** GAP 2 / Truth #5 (end-to-end per-stage YetiRank/YetiRankPairwise/
-StochasticRank fixtures) and the GAP 3 trainer-half (D-07 trainer-level RNG)
-remain DEFERRED — but the BLOCKER MOVED. The prior [06.3-04] deferral was a
-toolchain/disk NO-GO. As of 06.3-14 the 06.3-10 instrumented catboost 1.2.10
-TRAINER is BUILT (GO, `/tmp/cb_build313/instr_pkg/catboost/_catboost.so`) and was
-RUN on the ranking corpus. The NEW, precisely-isolated blocker is in the **Rust
-sampler's RNG model**, not the build.
+**Status (06.3-14 EXT — user-directed "push to close now"):** GAP 2 / Truth #5 is
+**CLOSED for YetiRank**: the end-to-end per-stage oracle
+(`yetirank_oracle_test.rs::yetirank_end_to_end_per_stage`) now PASSES all four
+stages (Splits | LeafValues | StagedApprox | Predictions) at ≤1e-5 against a frozen
+catboost 1.2.10 fixture, and the trainer-half of GAP 3 / D-07 is CLOSED (the Rust
+per-tree seed stream matches the instrumented trainer's per-group, per-recalc first
+Gumbel draws bit-exact for all 5 trees). The closure subsystem is
+`cb_train::YetiRankTreeSeeder` + `derive_per_tree_query_seeds` (yetirank.rs) plus the
+dual learning/averaging fold approx wiring + the f32 sampler bit-width transcription
+in boosting.rs / yetirank.rs.
+
+**Root cause — the FULL per-tree RNG model (transcribed + verified bit-exact):**
+The prior deferral's "(a) 3 permutation folds + (b) per-tree reseed" reading was
+refined to the exact mechanism:
+  - `fold_count == 1` (NOT 3). The 1800 draws = `12 docs × 10 perms × 3 RECALCS ×
+    5 trees`. The **3 recalcs per tree** are: the DERIVATIVE recalc
+    (`CalcWeightedDerivatives`, drives gradient+splits on the learning fold), the
+    LEARNING-fold approx-update recalc (`UpdateLearningFold ->
+    CalcApproxForLeafStruct`), and the AVERAGING-fold LEAF-VALUE recalc
+    (`CalcLeafValuesSimple`).
+  - The persistent `LearnProgress->Rand(random_seed)` is consumed per tree IN
+    ORDER: structure-fold draw (1) → deriv recalc seed → per-level split-search
+    draws [`n_features` Rsm `GenRandReal1` + 1 `CalcScores` `GenRand` + `n_features`
+    `SelectBestCandidate` Box-Muller normals via `std_normal`] → learnfold recalc
+    seed → leafval recalc seed. The Box-Muller rejection makes the per-tree draw
+    count vary (34, 42, 32, 38, …), reproduced exactly by running `cb_core::std_normal`
+    on the same context RNG.
+  - Each recalc's seed passes through DIFFERENT `GenRandUI64Vector` layering: deriv
+    = 2 layers (`train.cpp:326` BodyTail=1 → `UpdatePairsForYetiRank`), learnfold =
+    2 layers (`train.cpp:420` foldCount=1 → `approx_calcer.cpp:1147` BodyTail=1),
+    leafval = 1 layer (raw `Rand.GenRand()` → `CalcLeafDersSimple`,
+    `approx_calcer.cpp:983`).
+  - Per recalc, the query range is BLOCK-partitioned (`SetBlockCount(CB_THREAD_LIMIT
+    =128)` ⇒ `block_count == n_groups` for the small corpus): per-block seed via
+    `GenRandUI64Vector(n_groups, recalc_seed)`, then one query seed per block. This
+    is `derive_per_tree_query_seeds` — DISTINCT from the standalone self-oracle's
+    single shared block_rng (`derive_query_seeds`), which is correct for THAT
+    generator and stays GREEN.
+  - YetiRank is NOT `UseAveragingFoldAsFoldZero` (usePairs true,
+    `learn_context.cpp:855`), so the LEARNING and AVERAGING folds carry SEPARATE
+    approxes; the learning-fold approx update applies ONLY `learning_rate` (NO
+    `NormalizeLeafValues` — that runs only on the stored averaging-fold leaves,
+    `train.cpp:562`).
+  - The sampler uses upstream's f32 bit-width (uniform cast to f32, f32 Gumbel
+    ratio `u/(1.000001f-u)`, `TVector<TVector<float>>` competitor weights, `float
+    TCompetitor.Weight`). LOAD-BEARING: an all-f64 sampler drifts the leaf values
+    ~1e-8, compounding to flip a close split by tree 2.
+
+**Still DEFERRED (independent gaps, NOT the seed plumbing):**
+  1. **YetiRankPairwise end-to-end** — the seed plumbing is closed (shares the
+     YetiRank sampler/seeder; RNG draw-log oracle GREEN), but with correct seeds the
+     tree-0 STRUCTURE still diverges at split index 1 (upstream border
+     1.2888507843017578 vs cb-train -0.3575027287006378). This is the SAME pairwise
+     SPLIT-scorer gap isolated in [06.3-13] for PairLogitPairwise: `*Pairwise`
+     (`is_pairwise_scoring`) losses score splits through `TPairwiseScoreCalcer`
+     (`pairwise_scoring.cpp`), which cb-train lacks. Implementing the pairwise
+     split-scoring subsystem is a dedicated Rule-4 plan (the [06.3-13] deferral).
+     The `yetirank_pairwise/model.json` stays absent; the oracle keeps the
+     deferred-fixture invariant and runs the full gate the moment it + the
+     split-scorer land. NO tolerance weakened.
+  2. **StochasticRank end-to-end** — a DIFFERENT RNG model (per-group Monte-Carlo
+     Gaussian noise re-seeded with `randomSeed + group_index`,
+     `error_functions.h:1257`), NOT the pairwise `UpdatePairsForYetiRank` recalc.
+     Mapping its per-group noise stream onto the per-tree context-RNG consumption
+     needs a dedicated StochasticRank analysis + an instrumented per-stage fixture
+     (the corpus config also needs an explicit `metric` param). Follow-on effort.
+     The standalone noise-draw oracle stays GREEN; `stochasticrank/model.json` stays
+     absent.
+
+**Historical context (superseded by the closure above):** the prior 06.3-14
+deferral recorded the COUNT-matches/ORDER-diverges finding under the (now-rejected)
+deferral. The original analysis below is retained for provenance.
 
 **What 06.3-14 Task 2 measured (trainer-level RNG draw log, GO path executed):**
 Training `YetiRank` on the corpus with `CB_INSTRUMENT_LOG` produced **1800**
