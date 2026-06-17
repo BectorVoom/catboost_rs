@@ -1826,11 +1826,12 @@ fn train_inner<R: Runtime>(
         .filter(|b| !b.is_empty())
         .count();
     let mut yetirank_seeder: Option<crate::YetiRankTreeSeeder> = if is_yetirank {
-        Some(crate::YetiRankTreeSeeder::new(
+        Some(crate::YetiRankTreeSeeder::new_with_scoring(
             params.random_seed,
             yetirank_groups.len(),
             yetirank_n_candidate_features,
             params.depth,
+            is_pairwise_scoring(&params.loss),
         ))
     } else {
         None
@@ -2311,10 +2312,20 @@ fn train_inner<R: Runtime>(
                         // (the gradient/structure fold), NOT the averaging-fold
                         // `approx` (which drives leaf values). They coincide at tree 0
                         // (both == bias) and diverge after.
+                        // WR-04 (06.3-17): an out-of-range `[begin, end)` learning-fold
+                        // span MUST be a typed error, not a silently dropped group (the
+                        // prior `unwrap_or_default()` would yield an EMPTY competitor set
+                        // and corrupt the gradient without any signal).
                         let raw_approx: Vec<f64> = learn_approx
                             .get(*begin..*end)
                             .map(<[f64]>::to_vec)
-                            .unwrap_or_default();
+                            .ok_or_else(|| {
+                                CbError::OutOfRange(format!(
+                                    "YetiRank deriv re-sample: group {gi} span [{begin}, {end}) \
+                                     is out of range for learn_approx (len {})",
+                                    learn_approx.len()
+                                ))
+                            })?;
                         let query_seed = seeds.deriv.get(gi).copied().unwrap_or(0);
                         span.competitors = crate::yetirank_sample_pairs(
                             &raw_approx,
@@ -2713,10 +2724,18 @@ fn train_inner<R: Runtime>(
                 {
                     for (gi, span) in spans.iter_mut().enumerate() {
                         if let Some((begin, end, weight, relevs)) = yetirank_groups.get(gi) {
+                            // WR-04 (06.3-17): typed error on an out-of-range span
+                            // instead of a silent empty competitor set.
                             let raw_approx: Vec<f64> = approx
                                 .get(*begin..*end)
                                 .map(<[f64]>::to_vec)
-                                .unwrap_or_default();
+                                .ok_or_else(|| {
+                                    CbError::OutOfRange(format!(
+                                        "YetiRank leaf-value re-sample: group {gi} span \
+                                         [{begin}, {end}) is out of range for approx (len {})",
+                                        approx.len()
+                                    ))
+                                })?;
                             let query_seed = seeds.leafval.get(gi).copied().unwrap_or(0);
                             span.competitors = crate::yetirank_sample_pairs(
                                 &raw_approx,
@@ -3015,10 +3034,18 @@ fn train_inner<R: Runtime>(
             {
                 for (gi, span) in spans.iter_mut().enumerate() {
                     if let Some((begin, end, weight, relevs)) = yetirank_groups.get(gi) {
+                        // WR-04 (06.3-17): typed error on an out-of-range span
+                        // instead of a silent empty competitor set.
                         let raw_approx: Vec<f64> = learn_approx
                             .get(*begin..*end)
                             .map(<[f64]>::to_vec)
-                            .unwrap_or_default();
+                            .ok_or_else(|| {
+                                CbError::OutOfRange(format!(
+                                    "YetiRank learning-fold re-sample: group {gi} span \
+                                     [{begin}, {end}) is out of range for learn_approx (len {})",
+                                    learn_approx.len()
+                                ))
+                            })?;
                         let query_seed = seeds.learnfold.get(gi).copied().unwrap_or(0);
                         span.competitors = crate::yetirank_sample_pairs(
                             &raw_approx,
@@ -3046,21 +3073,42 @@ fn train_inner<R: Runtime>(
                 lf_der1.extend_from_slice(&g.der1);
                 lf_der2.extend_from_slice(&g.der2);
             }
-            // Newton leaf (unit weights — der already folds the pair weight, WR-03).
-            let lf_unit = vec![1.0_f64; n];
-            let lf_leaf_values = compute_leaf_deltas(
-                params.leaf_method,
-                &params.loss,
-                &leaf_value_leaf_of,
-                &lf_der1,
-                &lf_der2,
-                &lf_unit,
-                &learn_approx,
-                target,
-                scaled_l2,
-                n_leaves,
-                0,
-            );
+            // LEARNING-fold leaf delta: the leaf ESTIMATOR must match the
+            // STORED averaging-fold leaf path, NOT default to the pointwise
+            // Newton/Gradient solver. For an `IsPairwiseScoring` loss
+            // (YetiRankPairwise) `CalcApproxForLeafStruct` on the learning fold
+            // solves the SAME Cholesky pairwise-leaf system as the averaging
+            // fold (`approx_calcer.cpp` routes `*Pairwise` through the pairwise
+            // estimator regardless of fold). YetiRank (pointwise, non-pairwise)
+            // is NOT `is_pairwise_scoring`, so it keeps the exact prior
+            // Newton/Gradient `compute_leaf_deltas` path (byte-identical, D-04).
+            let lf_leaf_values: Vec<f64> = if is_pairwise_scoring(&params.loss) {
+                crate::pairwise_leaves::compute_pairwise_leaf_deltas(
+                    spans_ref,
+                    &leaf_value_leaf_of,
+                    &lf_der1,
+                    n_leaves,
+                    params.l2_leaf_reg,
+                    PAIRWISE_NON_DIAG_REG_DEFAULT,
+                )
+            } else {
+                // Newton leaf (unit weights — der already folds the pair weight,
+                // WR-03).
+                let lf_unit = vec![1.0_f64; n];
+                compute_leaf_deltas(
+                    params.leaf_method,
+                    &params.loss,
+                    &leaf_value_leaf_of,
+                    &lf_der1,
+                    &lf_der2,
+                    &lf_unit,
+                    &learn_approx,
+                    target,
+                    scaled_l2,
+                    n_leaves,
+                    0,
+                )
+            };
             // The LEARNING-fold approx update applies ONLY `learning_rate`
             // (`UpdateBodyTailApprox` -> `ApplyLearningRate`,
             // `approx_updater_helpers.h:26-30`) — NOT `NormalizeLeafValues` (the

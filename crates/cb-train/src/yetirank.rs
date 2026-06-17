@@ -264,6 +264,14 @@ pub struct YetiRankTreeSeeder {
     group_count: usize,
     n_features: usize,
     depth: usize,
+    /// `*Pairwise` (`IsPairwiseScoring`) split path: upstream routes `CalcScores`
+    /// through `TPairwiseScoreCalcer` and the `SetBestScore` random-score normals
+    /// are drawn from a CHILD `TRestorableFastRng64(randSeed)` that does NOT
+    /// advance `LearnProgress->Rand`. The pointwise seeder model folded those
+    /// normals into the main-RNG phase as an empirical pointwise calibration; the
+    /// pairwise per-level draw count differs. This flag selects the pairwise
+    /// per-level advance accounting.
+    pairwise: bool,
 }
 
 /// The per-tree YetiRank query seeds: one set for the derivative/split recalc, one
@@ -286,11 +294,25 @@ impl YetiRankTreeSeeder {
     /// Create the seeder mirroring `LearnProgress->Rand(random_seed)`.
     #[must_use]
     pub fn new(random_seed: u64, group_count: usize, n_features: usize, depth: usize) -> Self {
+        Self::new_with_scoring(random_seed, group_count, n_features, depth, false)
+    }
+
+    /// As [`Self::new`] but selecting the pairwise (`IsPairwiseScoring`) per-level
+    /// RNG-advance accounting (see the `pairwise` field).
+    #[must_use]
+    pub fn new_with_scoring(
+        random_seed: u64,
+        group_count: usize,
+        n_features: usize,
+        depth: usize,
+        pairwise: bool,
+    ) -> Self {
         Self {
             rng: TFastRng64::from_seed(random_seed),
             group_count,
             n_features,
             depth,
+            pairwise,
         }
     }
 
@@ -324,9 +346,18 @@ impl YetiRankTreeSeeder {
             // CalcScores: one per-level score randSeed.
             let _ = self.rng.gen_rand();
             // SelectBestCandidate: one Box-Muller normal per candidate (one
-            // BestScore per float feature).
-            for _ in 0..self.n_features {
-                let _ = std_normal(&mut self.rng);
+            // BestScore per float feature). Upstream draws these from a CHILD
+            // `TRestorableFastRng64(randSeed)` (greedy_tensor_search.cpp:718,
+            // tensor_search_helpers.cpp:724) that does NOT advance
+            // `LearnProgress->Rand`. The POINTWISE seeder model folds them into the
+            // main-RNG phase as an empirical calibration that matches the
+            // instrumented pointwise trainer; the PAIRWISE split path
+            // (`TPairwiseScoreCalcer`) does not, so it must NOT advance the main
+            // RNG by these normals (`pairwise == true`).
+            if !self.pairwise {
+                for _ in 0..self.n_features {
+                    let _ = std_normal(&mut self.rng);
+                }
             }
         }
 
