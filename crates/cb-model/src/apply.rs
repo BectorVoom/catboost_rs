@@ -312,6 +312,16 @@ pub fn predict_raw_cat(
 /// public surface. Models with CTR splits need the categorical columns — use the
 /// `cat_columns` form via [`predict_raw_multi_cat`] is internal; this numeric
 /// wrapper passes `&[]`.
+/// # WARNING — multi-dim-bias models (WR-03)
+///
+/// This entry point seeds EVERY output dimension with the single scalar
+/// [`Model::bias`] (= dim-0 bias). It is therefore WRONG for a model whose
+/// `scale_and_bias[1]` is a genuine per-dimension bias vector —
+/// RMSEWithUncertainty's `[mean, 0.5*log(var)]` (LOSS-06 / D-6.4-04) — because the
+/// dim-1 log-scale starting bias is silently dropped (yielding a wrong
+/// `exp(2*log-scale)` variance). For such models use
+/// [`predict_raw_multi_biased`] with the per-dim bias read from
+/// `model.json`'s `scale_and_bias[1]`.
 #[must_use]
 pub fn predict_raw_multi(model: &Model, feature_values: &[Vec<f32>]) -> Vec<f64> {
     predict_raw_multi_cat(model, feature_values, &[])
@@ -397,7 +407,10 @@ fn predict_raw_multi_cat(
     let n = n_float.max(n_cat);
 
     // dim-major output `out[d * n + i]`, seeded with `bias` per slot (single
-    // scalar bias this wave — added exactly once, RESEARCH Pitfall 6).
+    // scalar bias this wave — added exactly once, RESEARCH Pitfall 6). NOTE
+    // (WR-03): every dim is seeded with the SAME scalar dim-0 bias, so this path
+    // is WRONG for a genuine per-dim-bias model (e.g. RMSEWithUncertainty's dim-1
+    // log-scale bias) — those callers must use `predict_raw_multi_biased`.
     let mut out = vec![model.bias; dim.saturating_mul(n)];
 
     for obj in 0..n {
