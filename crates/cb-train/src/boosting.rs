@@ -837,8 +837,10 @@ fn loss_approx_dimension(loss: &Loss, target: &[f64]) -> usize {
 /// Returns the labels in ascending order; `class_to_label[c]` is the original label
 /// for class index `c`, and the inverse (label → index) is a binary search. The
 /// model stores this vector (`class_params`/`multiclass_params`) so predictions
-/// recover the original labels (Pitfall 4). Labels are compared as `f64` bit
-/// patterns via a total order (NaN is not expected in a class target).
+/// recover the original labels (Pitfall 4). Labels are compared with `partial_cmp`
+/// and an exact-difference dedup, which require a TOTAL order — the train entry
+/// point rejects a non-finite (NaN/Inf) class label up front (WR-06) so this fn is
+/// only ever called on finite labels.
 fn build_class_remap(target: &[f64]) -> Vec<f64> {
     let mut labels: Vec<f64> = target.to_vec();
     labels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2042,6 +2044,18 @@ fn train_inner<R: Runtime>(
         Loss::MultiClass | Loss::MultiClassOneVsAll
     );
     let class_to_label: Vec<f64> = if is_multiclass {
+        // Reject a non-finite (NaN/Inf) class label up front (WR-06): NaN makes
+        // `partial_cmp` return None (treated as Equal -> a non-total sort order) and
+        // `(NaN - NaN).abs() == 0.0` is false (so the dedup keeps duplicate NaNs),
+        // yielding a silently corrupt `class_to_label` and therefore wrong predicted
+        // labels. Surface it as a typed error instead, consistent with the
+        // no-NaN-poisoning discipline on the custom-objective der path.
+        if let Some(bad) = target.iter().copied().find(|l| !l.is_finite()) {
+            return Err(CbError::OutOfRange(format!(
+                "multiclass target contains a non-finite class label ({bad}); class \
+                 labels must be finite for a total sort/dedup order"
+            )));
+        }
         build_class_remap(target)
     } else {
         Vec::new()
