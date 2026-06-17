@@ -10,20 +10,20 @@
 //! (`ranking_corpus/yetirank_pairwise/yetirank_rng_groundtruth.jsonl`, a copy of
 //! the YetiRank stream), gated LIVE here against the Rust sampler.
 //!
-//! The end-to-end per-stage compare (over a trained YetiRankPairwise `model.json`
-//! through the Cholesky leaf path) remains DEFERRED on TWO newly isolated
-//! architectural gaps (06.3-14), NOT the prior toolchain/disk NO-GO (the 06.3-10
-//! trainer is now BUILT/GO and was RUN this plan):
-//!   1. The YetiRank multi-fold / per-tree RNG seed-plumbing gap isolated in
-//!      `yetirank_oracle_test.rs` (the trainer samples over 3 permutation folds
-//!      with a per-tree-advanced seed; the Rust sampler uses 1 fold + a fixed
-//!      2-level chain) — a NEW seeding subsystem (Rule 4 scope).
-//!   2. `*Pairwise` (`is_pairwise_scoring`) losses additionally need the pairwise
-//!      SPLIT-scorer (`TPairwiseScoreCalcer`) isolated in 06.3-13 for
-//!      PairLogitPairwise — also Rule 4 scope, not yet in cb-train.
-//! Per D-6.3-03b: NO `#[ignore]`, NO weakened tolerance; see
-//! `deferred-items.md [06.3-13]` (split-scorer) and `[06.3-14]` (seed plumbing).
-//! The standalone full-precision RNG-draw oracle stays GREEN.
+//! CLOSED (06.3-17): the end-to-end per-stage compare over the trained
+//! YetiRankPairwise `model.json` through the Cholesky leaf path now passes all four
+//! per-stage gates (Splits|LeafValues|StagedApprox|Predictions) at ≤1e-5. The two
+//! gaps that previously deferred it are both resolved:
+//!   1. The per-tree RNG seed-plumbing (`YetiRankTreeSeeder`) is calibrated
+//!      draw-for-draw against the instrumented trainer's per-tree call-count
+//!      fences (see `yetirank_pairwise_tree_rng_oracle_test.rs`). The crux was
+//!      WR-02: the candidate-feature count must include EVERY quantized float
+//!      feature (4), not just those with selected borders in the final model (3) —
+//!      an unused-but-quantized feature still consumed an Rsm + normal draw per
+//!      level.
+//!   2. The pairwise SPLIT-scorer (`TPairwiseScoreCalcer`) landed in 06.3-15/16
+//!      (the same scorer PairLogitPairwise uses).
+//! Per D-6.3-03b: NO `#[ignore]`, NO weakened tolerance.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
@@ -136,24 +136,20 @@ fn yetirank_pairwise_rng_draw_log_oracle() {
     });
 }
 
-/// END-TO-END per-stage YetiRankPairwise compare. The per-tree multi-block seed
-/// plumbing ([`cb_train::YetiRankTreeSeeder`]) is CLOSED for YetiRankPairwise too
-/// (it shares the YetiRank sampler + seeder, verified by the RNG draw-log oracle
-/// above). The REMAINING blocker is the second, independent Rule-4 gap isolated in
-/// 06.3-13 for PairLogitPairwise: `*Pairwise` (`is_pairwise_scoring`) losses score
-/// tree SPLITS through upstream's dedicated `TPairwiseScoreCalcer` /
-/// `CalculatePairwiseScore` (`pairwise_scoring.cpp`, a per-candidate pairwise-weight
-/// matrix + regularized least-squares score over the group Competitors), whereas
-/// cb-train's split path reuses the POINTWISE der histogram. With the seed plumbing
-/// now correct the YetiRankPairwise tree-0 STRUCTURE still diverges at split index 1
-/// (measured: upstream border 1.2888507843017578 vs cb-train -0.3575027287006378),
-/// EXACTLY the PairLogitPairwise split-scorer divergence shape — confirming the gap
-/// is the pairwise SPLIT-scorer, NOT the seed plumbing. Implementing the pairwise
-/// split-scoring subsystem is a dedicated Rule-4 plan (the 06.3-13 deferral); per
-/// D-6.3-03b the per-stage gate stays the deferred-fixture invariant here — NO
-/// `#[ignore]`, NO weakened tolerance, NO fabricated fixture. The YetiRankPairwise
-/// `model.json` is intentionally NOT committed until the split-scorer lands; the
-/// test runs the FULL gate the moment it does.
+/// END-TO-END per-stage YetiRankPairwise compare (CLOSED, 06.3-17). Trains under
+/// `Loss::YetiRankPairwise` with the Cholesky leaf path + the pairwise split-scorer
+/// (06.3-15/16) over the per-tree-calibrated `YetiRankTreeSeeder` stream, and gates
+/// all four stages (Splits|LeafValues|StagedApprox|Predictions) at ≤1e-5 against the
+/// committed catboost 1.2.10 `model.json` / `staged.npy` / `predictions.npy`.
+///
+/// The final root cause was WR-02 (the candidate-feature undercount, fixed in
+/// `boosting.rs`): the seeder drew an Rsm + normal per BORDERED feature (3) instead
+/// of per QUANTIZED feature (4), short-changing the per-tree GTS draw count and
+/// desyncing the learnfold/leafval recalc seeds from tree 1 onward. With the count
+/// corrected the per-tree draw stream matches the instrumented trainer bit-exact
+/// (`yetirank_pairwise_tree_rng_oracle_test.rs`) and the structure + leaf values +
+/// staged approx + predictions all land within ≤1e-5. Per D-6.3-03b: NO `#[ignore]`,
+/// NO weakened tolerance.
 #[test]
 fn yetirank_pairwise_end_to_end_per_stage() {
     let model_json = fixture("ranking_corpus/yetirank_pairwise/model.json");
@@ -224,15 +220,13 @@ fn yetirank_pairwise_end_to_end_per_stage() {
         compare_stage(Stage::Predictions, &expected_predictions, &predictions)
             .unwrap_or_else(|e| panic!("YetiRankPairwise: predictions diverged: {e:?}"));
     } else {
-        // Deferred: the pairwise SPLIT-scorer (06.3-13 Rule-4 gap) is not yet in
-        // cb-train; the seed plumbing is closed but the structure still diverges.
-        // Assert the RNG ground truth IS committed so this is a real gate on the
-        // deferred-closure invariant, not a silent skip.
-        let gt = fixture("ranking_corpus/yetirank_pairwise/yetirank_rng_groundtruth.jsonl");
-        assert!(
-            gt.exists(),
-            "YetiRankPairwise RNG ground truth must be committed while the pairwise \
-             split-scorer (06.3-13) is deferred (escalate-don't-weaken, D-6.3-03b)"
+        // CLOSED (06.3-17): the YetiRankPairwise fixture is committed and the
+        // present-fixture branch above runs the full 4-stage ≤1e-5 gate. A missing
+        // model.json is now a regression (a removed/renamed fixture), not a deferred
+        // state — fail loudly rather than silently pass.
+        panic!(
+            "YetiRankPairwise model.json fixture is missing — gap #2 is CLOSED and the \
+             fixture must remain committed (escalate-don't-weaken, D-6.3-03b)"
         );
     }
 }
