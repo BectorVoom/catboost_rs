@@ -577,6 +577,17 @@ fn compute_gradients_one_dim(
              alpha[d]), not the single-dimension scalar path"
                 .to_owned(),
         )),
+        // RMSEWithUncertainty (Wave B, LOSS-08) is a 2-dim DIAGONAL loss COUPLED
+        // through the shared residual `target - approx[0]` (the log-scale der reads
+        // the mean approx), dispatched in `compute_gradients` BEFORE this
+        // single-dimension scalar loop (which sees one dim's slice in isolation, so
+        // it cannot compute the cross-dim residual). Reject defensively (typed
+        // CbError, no `unwrap`/panic).
+        Loss::RmseWithUncertainty => Err(CbError::Degenerate(
+            "RMSEWithUncertainty is dispatched in compute_gradients (2-dim coupled \
+             residual), not the single-dimension scalar path"
+                .to_owned(),
+        )),
         // QueryRMSE / QuerySoftMax (Wave A ranking losses, LOSS-04) are QUERYWISE:
         // their der is computed PER GROUP via the grouped seam
         // (`Runtime::compute_gradients_grouped` →
@@ -736,6 +747,52 @@ fn compute_onevsall_gradients(
     Ok((der1, der2))
 }
 
+/// Compute the RMSEWithUncertainty 2-dim DIAGONAL der1/der2 over the
+/// dimension-major `approx` buffer (LOSS-08, D-6.4-04). UNLIKE the separable
+/// per-dimension losses, RMSEWithUncertainty COUPLES the two dims through the
+/// shared residual `diff = target - approx[0]`: the log-scale (dim 1) der depends
+/// on the mean (dim 0) approx, so it cannot run as `K` independent per-dim kernel
+/// launches over `approx[d*n..]`. The hessian is still DIAGONAL (each dim is an
+/// independent scalar Newton step), so the outputs ride the standard
+/// dimension-major `buf[d*n+i]` diagonal layout (the MultiClassOneVsAll/MultiLogloss
+/// leaf path), NOT the MultiClass packed symmetric Hessian (06.4-RESEARCH Pitfall 4).
+///
+/// `approx` is the dim-major `[mean(0..n), log-scale(n..2n)]` buffer; `target` is
+/// PER-OBJECT length `n` (a single scalar target). Both outputs are dimension-major
+/// length `2*n` (`buf[d*n+i]`). Unit object weights in scope (the boosting loop
+/// folds the document weight into the leaf reduction; the upstream der weight `w`
+/// here is the per-object weight, `1.0` for the unweighted fixture path — matching
+/// the OneVsAll/multilabel precedents which also receive unit weights).
+fn compute_rmse_uncertainty_gradients(
+    approx: &[f64],
+    target: &[f64],
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut der1 = vec![0.0_f64; 2 * n];
+    let mut der2 = vec![0.0_f64; 2 * n];
+    for i in 0..n {
+        let a0 = approx.get(i).copied().unwrap_or(0.0);
+        let a1 = approx.get(n + i).copied().unwrap_or(0.0);
+        let t = target.get(i).copied().unwrap_or(0.0);
+        // Unit per-object weight (the document weight is applied in the leaf
+        // reduction, like the OneVsAll/multilabel arms).
+        let (od1, od2) = cb_compute::rmse_with_uncertainty_ders(a0, a1, t, 1.0);
+        if let Some(slot) = der1.get_mut(i) {
+            *slot = od1[0];
+        }
+        if let Some(slot) = der1.get_mut(n + i) {
+            *slot = od1[1];
+        }
+        if let Some(slot) = der2.get_mut(i) {
+            *slot = od2[0];
+        }
+        if let Some(slot) = der2.get_mut(n + i) {
+            *slot = od2[1];
+        }
+    }
+    (der1, der2)
+}
+
 /// Compute the MultiQuantile SEPARABLE per-dimension der1/der2 over the
 /// dimension-major `approx` buffer (D-6.2-05). MultiQuantile is `K` INDEPENDENT
 /// [`Loss::Quantile`] dimensions: each dimension `d` reuses the SAME parametric
@@ -872,6 +929,17 @@ impl Runtime for CpuBackend {
                 }
                 let (der1, der2) =
                     compute_multiquantile_gradients(approx, target, alpha, *delta, approx_dimension, n);
+                return Ok(Derivatives { der1, der2 });
+            }
+            // RMSEWithUncertainty (Wave B, LOSS-08 / D-6.4-04): a 2-dim DIAGONAL
+            // loss COUPLED through the shared residual `target - approx[0]` (the
+            // log-scale der depends on the mean approx), so it dispatches here as a
+            // dedicated arm rather than the per-dim scalar loop. The target stays
+            // PER-OBJECT length `n` (a single scalar target). The diagonal hessian
+            // outputs ride the standard dim-major `buf[d*n+i]` layout → the existing
+            // per-dim scalar Newton leaf path (NOT the MultiClass dense solve).
+            Loss::RmseWithUncertainty => {
+                let (der1, der2) = compute_rmse_uncertainty_gradients(approx, target, n);
                 return Ok(Derivatives { der1, der2 });
             }
             _ => {}

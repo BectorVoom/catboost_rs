@@ -683,6 +683,10 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         // MultiQuantile (Wave 3) is not in the upstream auto-LR coefficient table
         // -> Unknown (no rate guessed); the fixture pins an explicit learning_rate.
         | Loss::MultiQuantile { .. }
+        // RMSEWithUncertainty (Wave B, LOSS-08) is not in the upstream auto-LR
+        // coefficient table -> Unknown (no rate guessed); the fixture pins an
+        // explicit learning_rate.
+        | Loss::RmseWithUncertainty
         // The Wave-A ranking losses (QueryRMSE / QuerySoftMax) are not in the
         // upstream auto-LR coefficient table -> Unknown (no rate guessed); the
         // ranking fixtures pin an explicit learning_rate.
@@ -814,6 +818,9 @@ fn loss_approx_dimension(loss: &Loss, target: &[f64]) -> usize {
         // `GetAlphaMultiQuantile(params).size()`). Each dimension is an independent
         // quantile at its own `alpha[d]`.
         Loss::MultiQuantile { alpha, .. } => alpha.len(),
+        // RMSEWithUncertainty (Wave B, LOSS-08 / D-6.4-04): 2 output dimensions —
+        // dim 0 the regression MEAN, dim 1 the LOG-SCALE (`approx_dimension.cpp:16`).
+        Loss::RmseWithUncertainty => 2,
         // Every scalar regression / binary loss is single-output.
         _ => 1,
     }
@@ -868,6 +875,43 @@ fn starting_approx(params: &BoostParams, target: &[f64]) -> f64 {
     } else {
         0.0
     }
+}
+
+/// The per-dimension RMSEWithUncertainty optimal-constant starting approx
+/// `[mean(target), 0.5·log(var(target))]` (LOSS-08, D-6.4-04).
+///
+/// RMSEWithUncertainty ALWAYS starts from this optimal constant, even with
+/// `boost_from_average=false` (`train_model.cpp:858` — the explicit
+/// non-BoostFromAverage branch calls `CalcOptimumConstApprox`;
+/// `optimal_const_for_loss.h:225-229` returns `{mean, 0.5*log(var)}`). The mean and
+/// the (population, divisor `n`) variance are computed in `f32` upstream
+/// (`CalculateWeightedTargetAverage` / `CalculateWeightedTargetVariance` return
+/// `float`), then `0.5*log(var)` widens to `f64` — replicated here so the starting
+/// approx is parity-faithful (the f32 round + the ≤1e-5 tolerance both hold). The
+/// `Σtarget` and `Σ(target-mean)²` accumulations route through the sanctioned
+/// `cb_core::sum_f64` (D-08). An empty target yields `[0, 0]`.
+///
+/// Returns the length-2 `[mean, log-scale]` starting approx (dim-major dimension
+/// order). Every other loss is single-dimension and uses [`starting_approx`].
+fn rmse_uncertainty_starting_approx(target: &[f64]) -> [f64; 2] {
+    if target.is_empty() {
+        return [0.0, 0.0];
+    }
+    // mean in f32 (upstream returns `float`): the f64 Σ folded through sum_f64, the
+    // /n in f64, then truncated to f32.
+    let n = target.len() as f64;
+    let mean_f64 = sum_f64(target) / n;
+    let mean_f32 = mean_f64 as f32;
+    // var = Σ(target - mean)² / n (population, divisor n), accumulated in f64 over
+    // the f32-mean-centred residuals (upstream centres on the f32 `mean`), then
+    // truncated to f32.
+    let mean = f64::from(mean_f32);
+    let sq: Vec<f64> = target.iter().map(|&t| (t - mean) * (t - mean)).collect();
+    let var_f64 = sum_f64(&sq) / n;
+    let var_f32 = var_f64 as f32;
+    // 0.5 * log(var) in f64 (the only dimension upstream widens before the log).
+    let log_scale = 0.5 * f64::from(var_f32).ln();
+    [mean, log_scale]
 }
 
 /// Reject `(loss, leaf_method)` combinations with no defined leaf optimizer
@@ -939,6 +983,18 @@ fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
         return Err(CbError::OutOfRange(format!(
             "{loss:?} requires LeafMethod::Newton (the upstream default); \
              {method:?} has no defined multilabel leaf optimizer"
+        )));
+    }
+    // RMSEWithUncertainty (Wave B, LOSS-08) is gated to Newton (the upstream default,
+    // 1 iteration — `catboost_options.cpp:77-82`). The diagonal hessian gives a
+    // per-dimension scalar Newton step (der2[0]=-w, der2[1]=-2*w*diff²*prec); the
+    // Exact/Gradient/Simple leaves have no defined RMSEWithUncertainty optimizer
+    // (the log-scale dim is not a quantile/median target). Reject any non-Newton
+    // method up front.
+    if matches!(loss, Loss::RmseWithUncertainty) && !matches!(method, LeafMethod::Newton) {
+        return Err(CbError::OutOfRange(format!(
+            "RMSEWithUncertainty requires LeafMethod::Newton (the upstream default, \
+             1 iteration); {method:?} has no defined RMSEWithUncertainty leaf optimizer"
         )));
     }
     if matches!(method, LeafMethod::Newton) {
@@ -1955,7 +2011,28 @@ fn train_inner<R: Runtime>(
     let target: &[f64] = remapped_target.as_deref().unwrap_or(target);
 
     let bias = starting_approx(params, target);
-    let mut approx = vec![bias; approx_dimension * n];
+    // RMSEWithUncertainty (Wave B, LOSS-08 / D-6.4-04) starts from the per-dimension
+    // optimal-constant `[mean, 0.5·log(var)]` REGARDLESS of `boost_from_average`
+    // (`train_model.cpp:858`), unlike every other loss (single scalar `bias`). The
+    // approx buffer is dim-major `[mean(0..n), log-scale(n..2n)]`; `Model.bias`
+    // keeps dim-0's mean bias (the dim-1 log-scale bias lives only in the staged
+    // approx, which the oracle compares — the predict path reconstructs it from the
+    // staged buffer, not a stored per-dim bias).
+    let mut approx = if matches!(params.loss, Loss::RmseWithUncertainty) {
+        let dim_bias = rmse_uncertainty_starting_approx(target);
+        let mut buf = vec![0.0_f64; approx_dimension * n];
+        for d in 0..approx_dimension {
+            let b = dim_bias.get(d).copied().unwrap_or(0.0);
+            for i in 0..n {
+                if let Some(slot) = buf.get_mut(d * n + i) {
+                    *slot = b;
+                }
+            }
+        }
+        buf
+    } else {
+        vec![bias; approx_dimension * n]
+    };
 
     // YetiRank LEARNING-fold approx (D-07, 06.3-14 ext): YetiRank is NOT
     // `UseAveragingFoldAsFoldZero` (usePairs is true — `learn_context.cpp:855`), so

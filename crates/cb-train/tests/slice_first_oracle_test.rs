@@ -84,6 +84,9 @@ fn train_scenario(scenario: &str, loss: Loss, boost_from_average: bool) -> (Mode
         | Loss::MultiLogloss
         | Loss::MultiCrossEntropy
         | Loss::MultiQuantile { .. }
+        // RMSEWithUncertainty is not exercised by this scalar oracle; map to the
+        // regression-target arm (never constructed here).
+        | Loss::RmseWithUncertainty
         // Ranking losses (QueryRMSE / QuerySoftMax) are not exercised by this
         // scalar oracle; map to the regression-target arm to keep the match
         // exhaustive (never constructed here).

@@ -172,6 +172,9 @@ fn run_autolr_e2e(
         | Loss::MultiLogloss
         | Loss::MultiCrossEntropy
         | Loss::MultiQuantile { .. }
+        // RMSEWithUncertainty is not in the auto-LR table and not exercised here;
+        // map to Unknown to keep the match exhaustive.
+        | Loss::RmseWithUncertainty
         // Ranking losses are not in the auto-LR table and not exercised here;
         // map to Unknown to keep the match exhaustive.
         | Loss::QueryRmse

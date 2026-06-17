@@ -176,6 +176,11 @@ impl EvalMetric {
             // by default; the in-scope fixture pins no eval set, so this default is
             // never exercised (a named MultiQuantile eval metric is a later phase).
             | Loss::MultiQuantile { .. }
+            // RMSEWithUncertainty (Wave B, LOSS-08) reports the parity-neutral RMSE
+            // eval surface by default; the in-scope fixture pins `od_type=None` with
+            // no eval set, so this default is never exercised (a named uncertainty
+            // eval metric is out of scope for this loss oracle).
+            | Loss::RmseWithUncertainty
             // The Wave-A ranking losses (QueryRMSE / QuerySoftMax) report the
             // parity-neutral RMSE eval surface by default; the in-scope ranking
             // fixtures pin `od_type=None` with no eval set, so this default is
