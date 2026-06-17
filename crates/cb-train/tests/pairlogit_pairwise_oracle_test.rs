@@ -114,33 +114,16 @@ fn base_params(loss: Loss) -> BoostParams {
     }
 }
 
-// DEFERRED (06.3-13 escalate-don't-weaken — root cause NEWLY ISOLATED, NOT the one
-// the prior comment assumed): PairLogit (the POINTWISE sibling) is now CLOSED at
-// ≤1e-5 (see pairlogit_oracle_test.rs) via the 06.3-13 `sum_all_weights` L2 fix +
-// the `NormalizeLeafValues` document-weighted centering. Applying the SAME fixes
-// here advanced this test PAST the prior leaf-der theory and surfaced the TRUE
-// remaining gap, which is NOT leaf-der at all:
-//
-//   PairLogitPairwise diverges at the FIRST tree's SECOND split (tree-0 split
-//   index 1): upstream selects float feature 0 @ border 1.6280884742736816, we
-//   select float feature 1 @ border 1.8161416053771973 (|Δborder| ≈ 0.188). This
-//   is a SPLIT-SELECTION divergence, reproduced IDENTICALLY under both the
-//   `sum_eff_weights` and `sum_all_weights` L2 scalings — so it is NOT an L2 / leaf
-//   issue. `*Pairwise` (`IsPairwiseScoring`) losses score splits through upstream's
-//   dedicated `TPairwiseScoreCalcer` / `CalculatePairwiseScore`
-//   (`pairwise_scoring.cpp`, ~440 lines: a per-candidate pairwise-weight matrix +
-//   regularized least-squares score over the group Competitors), NOT the pointwise
-//   der histogram our split path currently reuses. cb-train has NO pairwise
-//   SPLIT-scorer yet (the Cholesky pairwise system in `pairwise_leaves.rs` is the
-//   LEAF-VALUE solver only). Closing this requires implementing the pairwise
-//   split-scoring subsystem (a new component — Rule 4 architectural scope) plus its
-//   own instrumented split-score oracle; the 06.3-13 ground truth covers ONLY the
-//   PairLogit pointwise per-leaf der, not pairwise split scores.
-//
-// The tolerance is NOT weakened and no fixture is fabricated: this test runs the
-// full ≤1e-5 gate the moment the pairwise split-scorer lands. Remove `#[ignore]`
-// then. Tracked as a 06.3 deferral (see deferred-items.md [06.3-13]).
-#[ignore = "deferred: PairLogitPairwise SPLIT selection needs the pairwise split-scorer (TPairwiseScoreCalcer); diverges tree0 split1 (f0 vs f1), NOT a leaf-der gap (06.3-13)"]
+// CLOSED (gap #1, Plan 06.3-16): the pairwise split-scorer is now wired into the
+// greedy oblivious tree search behind `is_pairwise_scoring` (Plan 06.3-15 built
+// `calculate_pairwise_score`; commit 6aaa769 routed candidate scoring through it).
+// This resolves the tree-0 split-1 SPLIT-SELECTION divergence (upstream f0@1.628 vs
+// the prior pointwise-histogram f1@1.816) that was deferred under 06.3-13. The
+// `#[ignore]` is removed and the full four-stage ≤1e-5 gate (Splits | LeafValues |
+// StagedApprox | Predictions) runs against the genuine catboost 1.2.10
+// `ranking_corpus/PairLogitPairwise` fixture (model_guid 7a8f259-…, tags/v1.2.10).
+// No tolerance was weakened and the fixture is upstream training output, not
+// hand-authored.
 #[test]
 fn pairlogit_pairwise_oracle_per_stage() {
     let scenario = "ranking_corpus/PairLogitPairwise";
