@@ -354,7 +354,7 @@ WARNINGs deferred (latent, not gap-blocking; tracked for 6.2 hardening / 6.3 pre
   2. Ranking metrics NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC each match upstream ≤1e-5.
   3. Randomized ranking losses (YetiRank/StochasticRank RNG streams) are validated against a C++-instrumented harness where no clean Python-reachable ground truth exists (D-07), under the disk-pressure feasibility constraint (D-08).
 
-**Plans**: 5 plans in 4 waves (family-wave gates per D-6.3-01; Plan 05 metrics runs parallel with Wave A)
+**Plans**: 9 plans in 5 waves (5 original + 4 gap-closure plans 06–09 from 06.3-VERIFICATION.md; gap-closure wave runs after the original waves)
 
 Plans:
 
@@ -374,6 +374,15 @@ Plans:
 **Wave 4** *(blocked on 06.3-01, 06.3-02, 06.3-03; autonomous: false — instrumented-build feasibility-probe checkpoint)*
 
 - [~] 06.3-04-PLAN.md — Wave C randomized losses: YetiRank/YetiRankPairwise + StochasticRank — **RNG STREAM VALIDATED ≤1e-5; end-to-end trainer fixture DEFERRED (path c)** (5a77507/6c59fde/3890089): Loss::YetiRank/YetiRankPairwise{permutations,decay} + Loss::StochasticRank{metric,sigma,mu,num_estimations} + validate; yetirank.rs sampler (2-level TFastRng64 seed + Gumbel noise + Classic decayed weights, yetirank_helpers.cpp:146-393) rides PairLogit der over SAMPLED pairs; StochasticRank DCG/NDCG Monte-Carlo der (std_normal noise + SFA, error_functions.cpp:1008-1256, der2=0) in ranking_der.rs; boosting per-iteration competitor re-sample; YetiRankPairwise → Cholesky leaf (Plain). TWO standalone OFFLINE instrumented generators (yetirank_oracle.cpp + stochasticrank_oracle.cpp, ZERO catboost includes) compile clean + RUN + SELF-ORACLE bit-for-bit vs cb-core::TFastRng64/std_normal (block_seed 12283622132691337806, std_normal(0)=[0.6337,-0.5284,-0.4408]); RNG-draw ground truth frozen; 3 per-stage oracles gate the draw log (sampled competitor weights 0.192/0.098250/0.083250 + 2-level query seed + Gaussian noise stream) ≤1e-5, NO #[ignore]/NO weakened tolerance. Feasibility-probe Task 1 → path (c) ESCALATE: instrumented catboost TRAINER build infeasible (toolchain absent + disk 95-97%/~8-12G = link-failure regime, D-6.3-03b); end-to-end per-stage trainer fixture DEFERRED, oracle tests wired to run the full gate the moment it lands (deferred-items.md / instrument_ranking_rng_README.md). decay AMBIGUITY resolved = 0.85. cargo check --workspace --tests GREEN; D-04 + Wave-A/B + cb-compute/cb-backend suites green.
+
+**Wave 5 — gap closure** *(from 06.3-VERIFICATION.md, scoped: code fixes now, instrumented trainer build deferred; plans 06–09 are independent — zero file overlap, all parallel)*
+
+- [ ] 06.3-06-PLAN.md — CR-01 (StochasticRank NDCG calc_dcg_metric_diff reads normalized pos_weights) + WR-02 (lambdamart_ideal_ndcg via cb_core::sum_f64) — both in ranking_der.rs (LOSS-04)
+- [ ] 06.3-07-PLAN.md — CR-02 (boosting.rs weighted_der1 branches on group_spans.is_some() so grouped ranking ders are not double-weighted) + non-uniform-weight regression test (LOSS-04)
+- [ ] 06.3-08-PLAN.md — WR-01 (make_zero_average via cb_core::sum_f64) + WR-03 (stochasticrank_oracle.cpp centering aligned to sum_f64 order) + >4-doc non-zero-mu test; autonomous: false (frozen RNG groundtruth regeneration human-gated) (LOSS-04)
+- [ ] 06.3-09-PLAN.md — PairLogit pair-weight normalization in build_query_info + PairLogit/PairLogitPairwise per-stage oracle tests ≤1e-5 against the frozen fixtures (LOSS-04)
+
+> Still deferred after this gap-closure round (out of scope — instrumented catboost trainer build): YetiRank/YetiRankPairwise/StochasticRank end-to-end TRAINER fixtures + ≤1e-5 trainer gates (truth #5); SC-3 / D-07 instrumented-harness RNG validation (truth #7). LOSS-04 stays partially open.
 
 ### Phase 6.4: Score Functions, Uncertainty & Custom Objectives
 
