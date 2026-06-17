@@ -863,7 +863,7 @@ fn compute_multiquantile_gradients(
     delta: f64,
     dim: usize,
     n: usize,
-) -> (Vec<f64>, Vec<f64>) {
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
     let mut der1 = Vec::with_capacity(dim * n);
     // der2 = 0 across every dimension (QUANTILE_DER2 = 0 -> Exact leaf).
     let der2 = vec![0.0_f64; dim * n];
@@ -871,15 +871,15 @@ fn compute_multiquantile_gradients(
         let approx_d = approx.get(d * n..d * n + n).unwrap_or(&[]);
         let alpha_d = alpha.get(d).copied().unwrap_or(QUANTILE_ALPHA);
         // Reuse the parametric quantile kernel VERBATIM per dimension with this
-        // dimension's alpha (the Loss::Quantile launcher). On a launch failure,
-        // fall back to the constant-0 gradient for that dimension rather than
-        // panicking (the empty-input guard already short-circuits dim*n == 0).
-        match launch_quantile_f64(approx_d, target, alpha_d, delta) {
-            Ok(der1_d) => der1.extend_from_slice(&der1_d),
-            Err(_) => der1.extend(std::iter::repeat(0.0_f64).take(n)),
-        }
+        // dimension's alpha (the Loss::Quantile launcher). PROPAGATE a device launch
+        // failure as a typed CbError (WR-01 / WR-05): mapping it to a zero buffer
+        // would masquerade as a valid all-zero gradient for that quantile dimension,
+        // silently training a degenerate (no-gradient) tree instead of surfacing the
+        // backend failure. The empty-input guard already short-circuits dim*n == 0.
+        let der1_d = launch_quantile_f64(approx_d, target, alpha_d, delta)?;
+        der1.extend_from_slice(&der1_d);
     }
-    (der1, der2)
+    Ok((der1, der2))
 }
 
 impl Runtime for CpuBackend {
@@ -978,7 +978,7 @@ impl Runtime for CpuBackend {
                     });
                 }
                 let (der1, der2) =
-                    compute_multiquantile_gradients(approx, target, alpha, *delta, approx_dimension, n);
+                    compute_multiquantile_gradients(approx, target, alpha, *delta, approx_dimension, n)?;
                 return Ok(Derivatives { der1, der2 });
             }
             // RMSEWithUncertainty (Wave B, LOSS-08 / D-6.4-04): a 2-dim DIAGONAL
