@@ -89,6 +89,16 @@ fn sigmoid(approx: f64) -> f64 {
 /// `LogProbability`) the output has `2 * approx.len()` values: object `i`'s
 /// `[class-0, class-1]` pair at indices `2*i` and `2*i + 1` (matching upstream's
 /// binary `predict` row-major layout, `eval_helpers.cpp:393`).
+///
+/// # Empty return means a SHAPE VIOLATION (WR-04)
+///
+/// The [`PredictionType::RmseWithUncertainty`] arm requires an EVEN-length
+/// dim-major `[mean(0..n), log-scale(n..2n)]` approx. Because this function has no
+/// error channel (`-> Vec<f64>`), an ODD-length input cannot be signalled and
+/// returns `Vec::new()`. Callers MUST treat a non-empty input that produces an
+/// empty output as a malformed-shape error rather than "no predictions" —
+/// validate `approx.len()` is even for `RmseWithUncertainty` before invoking, or
+/// check for the empty-on-non-empty-input condition afterward.
 #[must_use]
 pub fn apply_prediction_type(prediction_type: PredictionType, approx: &[f64]) -> Vec<f64> {
     match prediction_type {
@@ -127,6 +137,10 @@ pub fn apply_prediction_type(prediction_type: PredictionType, approx: &[f64]) ->
         // `[mean, variance = exp(2*log-scale)]` (`eval_helpers.cpp:422-427`;
         // `CalcSquaredExponent = exp(2x)`, Pitfall 6). `n = approx.len() / 2`; an
         // odd length yields empty (guarded — no panic).
+        // WR-04: an ODD length is a SHAPE VIOLATION and yields empty (guarded — no
+        // panic). Because this fn has no error channel, an empty return on a
+        // NON-EMPTY input signals the malformed shape to the caller (see the
+        // fn-level doc); it is NOT "no predictions".
         PredictionType::RmseWithUncertainty => {
             let n = approx.len() / 2;
             if approx.len() != 2 * n {
