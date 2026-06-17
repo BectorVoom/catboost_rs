@@ -178,7 +178,10 @@ fn run_autolr_e2e(
         | Loss::QuerySoftMax { .. }
         | Loss::PairLogit
         | Loss::PairLogitPairwise
-        | Loss::LambdaMart { .. } => TargetType::Unknown,
+        | Loss::LambdaMart { .. }
+        | Loss::YetiRank { .. }
+        | Loss::YetiRankPairwise { .. }
+        | Loss::StochasticRank { .. } => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");

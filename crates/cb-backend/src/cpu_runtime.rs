@@ -590,15 +590,24 @@ fn compute_gradients_one_dim(
         // LOSS-04) are likewise PAIRWISE / QUERYWISE: their der is computed PER
         // GROUP via the grouped seam, NOT this pointwise single-dimension scalar
         // path. Reject defensively (typed CbError, no `unwrap`/panic).
+        //
+        // YetiRank / YetiRankPairwise / StochasticRank (Wave C randomized ranking
+        // losses, LOSS-04) are the SAME: their der is the per-group RNG-stream
+        // sampler (YetiRank) / Monte-Carlo estimator (StochasticRank) computed
+        // through the grouped seam, never this pointwise scalar path.
         Loss::QueryRmse
         | Loss::QuerySoftMax { .. }
         | Loss::PairLogit
         | Loss::PairLogitPairwise
-        | Loss::LambdaMart { .. } => Err(CbError::Degenerate(
+        | Loss::LambdaMart { .. }
+        | Loss::YetiRank { .. }
+        | Loss::YetiRankPairwise { .. }
+        | Loss::StochasticRank { .. } => Err(CbError::Degenerate(
             "ranking losses (QueryRMSE / QuerySoftMax / PairLogit / \
-             PairLogitPairwise / LambdaMart) are dispatched through the grouped \
-             der seam (compute_gradients_grouped), not the pointwise \
-             single-dimension scalar path"
+             PairLogitPairwise / LambdaMart / YetiRank / YetiRankPairwise / \
+             StochasticRank) are dispatched through the grouped der seam \
+             (compute_gradients_grouped), not the pointwise single-dimension \
+             scalar path"
                 .to_owned(),
         )),
     }

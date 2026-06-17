@@ -693,7 +693,13 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         // the ranking fixtures pin an explicit learning_rate.
         | Loss::PairLogit
         | Loss::PairLogitPairwise
-        | Loss::LambdaMart { .. } => TargetType::Unknown,
+        | Loss::LambdaMart { .. }
+        // The Wave-C randomized ranking losses (YetiRank / YetiRankPairwise /
+        // StochasticRank) are likewise absent from the upstream auto-LR table ->
+        // Unknown; the ranking fixtures pin an explicit learning_rate.
+        | Loss::YetiRank { .. }
+        | Loss::YetiRankPairwise { .. }
+        | Loss::StochasticRank { .. } => TargetType::Unknown,
     }
 }
 
@@ -715,6 +721,9 @@ fn is_grouped_loss(loss: &Loss) -> bool {
             | Loss::PairLogit
             | Loss::PairLogitPairwise
             | Loss::LambdaMart { .. }
+            | Loss::YetiRank { .. }
+            | Loss::YetiRankPairwise { .. }
+            | Loss::StochasticRank { .. }
     )
 }
 

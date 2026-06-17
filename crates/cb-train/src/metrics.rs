@@ -188,7 +188,15 @@ impl EvalMetric {
             // is never exercised (named ranking eval metrics are Wave D).
             | Loss::PairLogit
             | Loss::PairLogitPairwise
-            | Loss::LambdaMart { .. } => Self::Rmse,
+            | Loss::LambdaMart { .. }
+            // The Wave-C randomized ranking losses (YetiRank / YetiRankPairwise /
+            // StochasticRank) likewise report the parity-neutral RMSE eval surface
+            // by default; the in-scope fixtures pin `od_type=None` with no eval set,
+            // so this default is never exercised (named ranking eval metrics are
+            // Wave D).
+            | Loss::YetiRank { .. }
+            | Loss::YetiRankPairwise { .. }
+            | Loss::StochasticRank { .. } => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,

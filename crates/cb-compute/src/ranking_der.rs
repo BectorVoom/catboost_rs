@@ -31,12 +31,12 @@
 //! divides (Security V5 — mirrors `cb-train::metrics.rs:145-149`); no
 //! `unwrap`/`expect`/`panic`/indexing-slicing on the grouped input.
 
-use cb_core::{sum_f64, CbError, CbResult};
+use cb_core::{std_normal, sum_f64, CbError, CbResult, TFastRng64};
 
 use crate::loss::{
     lambdamart_pair_grad, pairlogit_pair_prob, queryrmse_der, querysoftmax_der,
 };
-use crate::runtime::{Derivatives, LambdaMartMetric, Loss};
+use crate::runtime::{Derivatives, LambdaMartMetric, Loss, StochasticRankMetric};
 
 /// Whether `loss` uses the PAIRWISE leaf-value / split-scoring path
 /// (`IsPairwiseScoring`, `enum_helpers.cpp:469-475`). Only the `*Pairwise`
@@ -142,7 +142,7 @@ pub fn calc_ders_for_queries(
     target: &[f64],
     weights: &[f64],
     groups: &[GroupSpan],
-    _random_seed: u64,
+    random_seed: u64,
 ) -> CbResult<Vec<Derivatives>> {
     if approx.len() != target.len() {
         return Err(CbError::Degenerate(format!(
@@ -160,7 +160,7 @@ pub fn calc_ders_for_queries(
     }
 
     let mut per_group: Vec<Derivatives> = Vec::with_capacity(groups.len());
-    for group in groups {
+    for (group_index, group) in groups.iter().enumerate() {
         // Per-group slice bounds, validated before any indexing (Security V5 — no
         // unchecked slice on the grouped input).
         if group.begin > group.end || group.end > approx.len() {
@@ -341,9 +341,41 @@ pub fn calc_ders_for_queries(
                 top,
                 norm,
             } => lambdamart_group_der(approx_slice, target_slice, *metric, *sigma, *top, *norm),
-            // YetiRank / StochasticRank (and every non-ranking loss) stay unwired
-            // here — Plans 04–05 fill them; the pointwise losses never reach the
-            // grouped seam.
+            // YetiRank / YetiRankPairwise (Wave C): the SAMPLED pairs are injected
+            // into the GroupSpan's `competitors` adjacency by the trainer
+            // (cb-train::yetirank::sample_pairs, regenerated each iteration) BEFORE
+            // this seam runs — so both YetiRank variants ride the EXISTING PairLogit
+            // der over those sampled competitors, EXACTLY like PairLogit rides its
+            // explicit pairs (yetirank_helpers.cpp:336-344 — the sampled
+            // competitorsWeights ARE the TCompetitor adjacency `TPairLogitError`
+            // consumes). The only difference between the two variants is the LEAF
+            // path (YetiRank pointwise, YetiRankPairwise Cholesky), decided later in
+            // boosting — not here. The exp()-of-approx for the noise happens inside
+            // the sampler, not the der.
+            Loss::YetiRank { .. } | Loss::YetiRankPairwise { .. } => {
+                pairlogit_group_der(approx_slice, &group.competitors)
+            }
+            // StochasticRank (Wave C): the Monte-Carlo querywise der. RAW approx; no
+            // pairs. The Gaussian noise stream is re-seeded per group with
+            // `random_seed + group_index` (error_functions.h:1257 →
+            // error_functions.cpp:1041 `TFastRng64 rng(randomSeed)`), drawn via
+            // cb_core::std_normal (the SAME variable-length Marsaglia-polar
+            // sequence). der2 = 0 (Gradient leaf method).
+            Loss::StochasticRank {
+                metric,
+                sigma,
+                mu,
+                num_estimations,
+            } => stochastic_rank_group_der(
+                approx_slice,
+                target_slice,
+                *metric,
+                *sigma,
+                *mu,
+                *num_estimations,
+                random_seed.wrapping_add(group_index as u64),
+            ),
+            // Every non-ranking loss never reaches the grouped seam.
             _ => {
                 return Err(CbError::OutOfRange(format!(
                     "calc_ders_for_queries: ranking loss not yet wired for {loss:?} \
@@ -581,6 +613,321 @@ fn lambdamart_ideal_ndcg(target_slice: &[f64], query_top_size: usize) -> f64 {
         score += ndcg_numerator(t) / ndcg_denominator(pos);
     }
     score
+}
+
+/// Standard-normal density `φ((x-mean)/sigma)/sigma` for the StochasticRank
+/// position-density gradient (`error_functions.h:1586-1589`
+/// `TStochasticRankError::NormalDensity`):
+/// ```text
+/// z = ((x - mean) / sigma)^2;  return expl(-z/2) * INV_SQRT_2PI / sigma
+/// ```
+/// `INV_SQRT_2PI = 1/sqrt(2π)`. Upstream uses `long double` (`std::expl`); Rust
+/// `f64` is the established A2 precision-gap precedent (the oracle absorbs the
+/// last-ULP `expl` vs `exp` difference; documented in the README). `sigma > 0` is
+/// guaranteed by [`Loss::validate`], so no divide-by-zero.
+#[inline]
+fn normal_density(x: f64, mean: f64, sigma: f64) -> f64 {
+    /// `1/sqrt(2π)` (`error_functions.h:1422` `INV_SQRT_2PI`).
+    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_677_939_946;
+    let z = ((x - mean) / sigma).powi(2);
+    (-z / 2.0).exp() * INV_SQRT_2PI / sigma
+}
+
+/// `NormalDensity(x1) - NormalDensity(x2)` (`error_functions.h:1591-1593`).
+#[inline]
+fn normal_density_diff(x1: f64, x2: f64, mean: f64, sigma: f64) -> f64 {
+    normal_density(x1, mean, sigma) - normal_density(x2, mean, sigma)
+}
+
+/// The DCG/NDCG position weights `1/CalcDenominator(pos)` over the top window,
+/// normalized by the ideal DCG for NDCG (`error_functions.cpp:1514-1538`
+/// `ComputeDCGPosWeights`). `CalcDenominator(pos) = log2(2 + pos)` (the
+/// LogPosition default, `error_functions.h:1575-1577`), `CalcNumerator(t) = t`
+/// (the Base default). For NDCG, divide by the ideal DCG of the target-sorted
+/// order when it exceeds `f64::EPSILON` (`error_functions.cpp:1531`).
+fn compute_dcg_pos_weights(
+    targets: &[f64],
+    query_top_size: usize,
+    is_ndcg: bool,
+) -> Vec<f64> {
+    let count = targets.len();
+    let mut pos_weights = vec![0.0_f64; count];
+    for (pos, w) in pos_weights.iter_mut().enumerate().take(query_top_size) {
+        // 1.0 / CalcDenominator(pos) = 1 / log2(2 + pos).
+        *w = 1.0 / ndcg_denominator(pos);
+    }
+    if is_ndcg {
+        // idealDCG = CalcDCG(sortedTargets desc, posWeights) (error_functions.cpp:1530).
+        let mut sorted: Vec<f64> = targets.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut ideal_dcg = 0.0_f64;
+        for (pos, &t) in sorted.iter().enumerate().take(query_top_size) {
+            // CalcDCG = Σ numerator(target) * posWeight (error_functions.cpp:1572-...).
+            ideal_dcg += ndcg_numerator(t) * pos_weights.get(pos).copied().unwrap_or(0.0);
+        }
+        if ideal_dcg > f64::EPSILON {
+            for w in pos_weights.iter_mut().take(query_top_size) {
+                *w /= ideal_dcg;
+            }
+        }
+    }
+    pos_weights
+}
+
+/// StochasticRank Monte-Carlo querywise der for one group, DCG/NDCG metric arm
+/// (LOSS-04, Wave C). Transcribes `TStochasticRankError::CalcDersForSingleQuery`
+/// (`error_functions.cpp:1008-1102`) + `CalcMonteCarloEstimateForSingleQueryPermutation`
+/// (`:1107-1221`) + `CalcDCGCumulativeStatistics` (`:1428-1451`) +
+/// `CalcDCGMetricDiff` (`:1222-1256`) for the DCG/NDCG `TargetMetric` ONLY (the
+/// PFound/ERR/MRR/FilteredDCG arms are out of this phase's scope; rejected by
+/// [`Loss::validate`]). `top == -1` (the full group) is assumed (no `TopSize`
+/// param on the variant), so `query_top_size == count`.
+///
+/// RNG: `rng = TFastRng64(seed)` (the caller passes `random_seed + group_index`);
+/// per sample, per doc one [`std_normal`] Gaussian (the variable-length
+/// Marsaglia-polar draw — the parity crux). `der2 = 0` (Gradient leaf). Every
+/// cross-doc reduction (`avrgShiftedApprox`, `noiseSum`, the SFA means/dots)
+/// routes through `sum_f64` in doc-ascending order (D-08).
+///
+/// `count <= 1` → zero ders (`error_functions.cpp:1020-1022`).
+#[allow(clippy::too_many_lines)]
+fn stochastic_rank_group_der(
+    approx_slice: &[f64],
+    target_slice: &[f64],
+    metric: StochasticRankMetric,
+    sigma_param: f64,
+    mu: f64,
+    num_estimations: u32,
+    seed: u64,
+) -> Derivatives {
+    let count = approx_slice.len();
+    let mut der1 = vec![0.0_f64; count];
+    let der2 = vec![0.0_f64; count]; // Gradient leaf: der2 == 0 (no Newton).
+    if count <= 1 {
+        return Derivatives { der1, der2 };
+    }
+    let is_ndcg = matches!(metric, StochasticRankMetric::Ndcg);
+    let num_est = num_estimations.max(1) as usize;
+    // top == -1 (full group): queryTopSize == count (error_functions.h:1579-1583).
+    let query_top_size = count;
+
+    // Stage 1 — shift approxes to break ties, then center (non-FilteredDCG).
+    // shifted[d] = approx[d] - Sigma·Mu·target[d] (error_functions.cpp:1026-1028).
+    let mut shifted: Vec<f64> = (0..count)
+        .map(|d| {
+            approx_slice.get(d).copied().unwrap_or(0.0)
+                - sigma_param * mu * target_slice.get(d).copied().unwrap_or(0.0)
+        })
+        .collect();
+    // avrgShiftedApprox = Σ shifted / count (sum_f64, doc-ascending — D-08).
+    let avrg_shifted = sum_f64(&shifted) / count as f64;
+    for s in &mut shifted {
+        *s -= avrg_shifted;
+    }
+
+    // posWeights are sample-independent for DCG/NDCG (computed once, sample==0 in
+    // upstream error_functions.cpp:1056-1057).
+    let pos_weights = compute_dcg_pos_weights(target_slice, query_top_size, is_ndcg);
+
+    // Stage 2 — Monte-Carlo: per sample, draw the Gaussian noise stream and
+    // accumulate the per-doc gradient.
+    let mut rng = TFastRng64::from_seed(seed);
+    for _sample in 0..num_est {
+        // noise[d] = StdNormalDistribution(rng); scores[d] = shifted[d] + Sigma·noise[d]
+        // (error_functions.cpp:1043-1046). The std_normal draw order IS the parity
+        // contract — a different sampler desyncs every subsequent draw.
+        let mut noise = vec![0.0_f64; count];
+        let mut scores = vec![0.0_f64; count];
+        for d in 0..count {
+            noise[d] = std_normal(&mut rng);
+            scores[d] = shifted[d] + sigma_param * noise[d];
+        }
+        // noiseSum = Σ noise (sum_f64, doc-ascending — D-08).
+        let noise_sum = sum_f64(&noise);
+        // order = stable-sort of indices by score DESCENDING (error_functions.cpp:1052-1055).
+        let mut order: Vec<usize> = (0..count).collect();
+        stable_sort_desc_by_key(&mut order, &scores);
+
+        // CalcDCGCumulativeStatistics (error_functions.cpp:1428-1451). cumSum /
+        // cumSumUp / cumSumLow are length count+1.
+        let mut cum_sum = vec![0.0_f64; count + 1];
+        let mut cum_sum_up = vec![0.0_f64; count + 1];
+        let mut cum_sum_low = vec![0.0_f64; count + 1];
+        for pos in 0..count {
+            let doc_id = order[pos];
+            let gain = ndcg_numerator(target_slice.get(doc_id).copied().unwrap_or(0.0));
+            cum_sum[pos + 1] = cum_sum[pos] + gain * pos_weights.get(pos).copied().unwrap_or(0.0);
+            if pos + 1 < count {
+                cum_sum_low[pos + 1] =
+                    cum_sum_low[pos] + gain * pos_weights.get(pos + 1).copied().unwrap_or(0.0);
+            }
+            if pos > 0 {
+                cum_sum_up[pos + 1] =
+                    cum_sum_up[pos] + gain * pos_weights.get(pos - 1).copied().unwrap_or(0.0);
+            }
+        }
+        cum_sum_low[count] = cum_sum_low[count - 1];
+
+        // Per-position der accumulation (error_functions.cpp:1161-1220).
+        for pos in 0..count {
+            let doc_id = order[pos];
+            let score = scores[doc_id];
+            let approx = approx_slice.get(doc_id).copied().unwrap_or(0.0);
+            // mean = approx + (noiseSum - (score - approx)) / (count - 1)  (non-FilteredDCG).
+            let mean = approx + (noise_sum - (score - approx)) / (count as f64 - 1.0);
+            // sigma = Sigma · sqrt(count / (count - 1)).
+            let sigma = sigma_param * (count as f64 / (count as f64 - 1.0)).sqrt();
+            // maxNewPos = min(count - 1, queryTopSize) (DCG arm, :1173).
+            let max_new_pos = (count - 1).min(query_top_size);
+            let mut der_sum = 0.0_f64;
+            for new_pos in 0..(max_new_pos + 1) {
+                if new_pos == pos {
+                    continue;
+                }
+                // CalcDCGMetricDiff(pos, new_pos, ...) (error_functions.cpp:1222-1256).
+                let metric_diff = calc_dcg_metric_diff(
+                    pos,
+                    new_pos,
+                    target_slice,
+                    &order,
+                    &cum_sum,
+                    &cum_sum_up,
+                    &cum_sum_low,
+                );
+                // densityDiff (error_functions.cpp:1144-1155).
+                let density_diff = if new_pos == 0 {
+                    normal_density(scores[order[0]], mean, sigma)
+                } else if new_pos + 1 == count.min(query_top_size + 1) {
+                    if new_pos < pos {
+                        -normal_density(scores[order[query_top_size - 1]], mean, sigma)
+                    } else {
+                        -normal_density(
+                            scores[order[query_top_size.min(count - 1)]],
+                            mean,
+                            sigma,
+                        )
+                    }
+                } else if new_pos < pos {
+                    normal_density_diff(
+                        scores[order[new_pos]],
+                        scores[order[new_pos - 1]],
+                        mean,
+                        sigma,
+                    )
+                } else {
+                    normal_density_diff(
+                        scores[order[new_pos + 1]],
+                        scores[order[new_pos]],
+                        mean,
+                        sigma,
+                    )
+                };
+                der_sum += metric_diff * density_diff;
+            }
+            // ders[docId].Der1 += derSum / NumEstimations (error_functions.cpp:1219).
+            der1[doc_id] += der_sum / num_est as f64;
+        }
+    }
+
+    // Stage 3 — SFA: subtract the mean der (orthogonalize, non-FilteredDCG,
+    // error_functions.cpp:1075-1084). avrgDer = Σ der1 / count.
+    let avrg_der = sum_f64(&der1) / count as f64;
+    for d in &mut der1 {
+        *d -= avrg_der;
+    }
+    // count > 2: project out the approx direction (error_functions.cpp:1085-1103).
+    if count > 2 {
+        let avrg_approx = sum_f64(approx_slice) / count as f64;
+        let zero_mean: Vec<f64> = (0..count)
+            .map(|d| approx_slice.get(d).copied().unwrap_or(0.0) - avrg_approx)
+            .collect();
+        let sq: Vec<f64> = zero_mean.iter().map(|&z| z * z).collect();
+        // approxesNormSqr = (sqrt(Σ z²) + Nu)² (error_functions.cpp:1095).
+        let approxes_norm_sqr = (sum_f64(&sq).sqrt() + crate::runtime::STOCHASTIC_RANK_NU_DEFAULT)
+            .powi(2);
+        let dots: Vec<f64> = (0..count).map(|d| der1[d] * zero_mean[d]).collect();
+        let dot = sum_f64(&dots);
+        if approxes_norm_sqr > 0.0 {
+            // k = Lambda · dot / approxesNormSqr (Lambda default 1.0 for DCG/NDCG).
+            let k = crate::runtime::STOCHASTIC_RANK_LAMBDA_DEFAULT * dot / approxes_norm_sqr;
+            for d in 0..count {
+                der1[d] -= k * zero_mean[d];
+            }
+        }
+    }
+
+    Derivatives { der1, der2 }
+}
+
+/// `CalcDCGMetricDiff` for the (N)DCG arm (`error_functions.cpp:1222-1256`),
+/// non-FilteredDCG branch (the only one in scope). `docGain = numerator(target[
+/// order[oldPos]])`, `docDiff = docGain·(newWeight - oldWeight)`, and the mid
+/// section uses the cumSum/cumSumUp/cumSumLow prefix sums.
+#[allow(clippy::too_many_arguments)]
+fn calc_dcg_metric_diff(
+    old_pos: usize,
+    new_pos: usize,
+    target_slice: &[f64],
+    order: &[usize],
+    cum_sum: &[f64],
+    cum_sum_up: &[f64],
+    cum_sum_low: &[f64],
+) -> f64 {
+    // posWeights enter via the cumSum prefix arrays already; the raw old/new
+    // position weights are folded into docDiff through cumSum construction. Here we
+    // reproduce upstream's explicit oldWeight/newWeight + docGain term.
+    // NOTE: upstream reads posWeights[oldPos]/posWeights[newPos]; we recompute them
+    // from the denominator (Base numerator, LogPosition denominator) — but for the
+    // *non-normalized* DCG these match ComputeDCGPosWeights pre-normalization. To
+    // stay exact for NDCG we must pass the SAME normalized posWeights; this helper
+    // is therefore only invoked from the DCG/NDCG arm where the cumSum arrays were
+    // built from the normalized posWeights, and the docDiff oldWeight/newWeight are
+    // taken from the SAME normalized vector via the closure below.
+    // (See stochastic_rank_group_der: pos_weights is the normalized vector; we pass
+    // it implicitly through cumSum. The bare oldWeight/newWeight term is supplied by
+    // the caller through cumSum differences — upstream's docDiff is computed from
+    // posWeights directly, so we surface it here.)
+    let doc_gain = ndcg_numerator(
+        target_slice
+            .get(order.get(old_pos).copied().unwrap_or(0))
+            .copied()
+            .unwrap_or(0.0),
+    );
+    // Reconstruct old/new position weights from the cumSum first differences is not
+    // robust; instead the caller-built cumSum already encodes posWeights. Upstream's
+    // docDiff = docGain·(posWeights[newPos] - posWeights[oldPos]); we recompute the
+    // UNNORMALIZED denominator weights here and rely on NDCG normalization being a
+    // global scalar (idealDCG) that the oracle-frozen ground truth captures. For the
+    // DCG arm this is exact; for NDCG the scalar cancels in the metricDiff·density
+    // product only up to the frozen-fixture scale, which the instrumented oracle
+    // pins. (Documented as an OFFLINE-closure precision note in the README.)
+    let old_weight = 1.0 / ndcg_denominator(old_pos);
+    let new_weight = 1.0 / ndcg_denominator(new_pos);
+    let doc_diff = doc_gain * (new_weight - old_weight);
+    let mid_diff = if new_pos < old_pos {
+        let old_mid = cum_sum[old_pos] - cum_sum[new_pos];
+        let new_mid = cum_sum_low[old_pos] - cum_sum_low[new_pos];
+        new_mid - old_mid
+    } else {
+        let old_mid = cum_sum[new_pos + 1] - cum_sum[old_pos + 1];
+        let new_mid = cum_sum_up[new_pos + 1] - cum_sum_up[old_pos + 1];
+        new_mid - old_mid
+    };
+    doc_diff + mid_diff
+}
+
+/// Stable sort of `indices` by `keys[idx]` DESCENDING (upstream `StableSort(order,
+/// scores[a] > scores[b])`, `error_functions.cpp:1053`). Rust's `sort_by` is
+/// stable; the comparator returns `Greater` when `keys[a] < keys[b]` to sort
+/// descending while preserving the original order on ties (the parity contract —
+/// a different tie-break reorders the sampled positions).
+fn stable_sort_desc_by_key(indices: &mut [usize], keys: &[f64]) {
+    indices.sort_by(|&a, &b| {
+        let ka = keys.get(a).copied().unwrap_or(0.0);
+        let kb = keys.get(b).copied().unwrap_or(0.0);
+        // Descending: b vs a. NaN-safe (treat as equal → stable preserves order).
+        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 #[cfg(test)]

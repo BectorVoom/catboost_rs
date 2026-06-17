@@ -355,6 +355,118 @@ pub enum Loss {
         /// `log2(1 + Σder1)/Σder1` (`error_functions.cpp:660-662,916-922`).
         norm: bool,
     },
+    /// YetiRank (randomized listwise ranking, LOSS-04 Wave C / D-6.3-02). The
+    /// RNG-STREAM loss: each group's pairwise weights are SAMPLED via a 2-level
+    /// `TFastRng64` seed derivation + Gumbel noise over the exp-approxes
+    /// (`yetirank_helpers.cpp:146-163,305-393`), NOT a closed-form der. For a
+    /// single-thread fit (`blockCount == 1`,
+    /// `restorable_rng.cpp:3-9 GenRandUI64Vector(1, seed)` → one block seed):
+    /// 1. block `rand = TFastRng64(GenRandUI64Vector(1, seed)[0])`;
+    /// 2. per query: `querySeed = rand.GenRand()` re-seeds the inner per-query
+    ///    `TFastRng64(querySeed)`;
+    /// 3. per permutation (`permutations`, default 10): AddNoise draws one
+    ///    `gen_rand_real1()` Gumbel uniform PER doc (`u`, then
+    ///    `expApprox[d] *= u / (1.000001 - u)`), stable-sorts the indices by the
+    ///    bootstrapped approx DESCENDING, and accumulates the Classic pairwise
+    ///    weights (`magicConst 0.15 · decay^k · |Δrelev|` along the sorted
+    ///    adjacency, `decay` default 0.85);
+    /// 4. `competitorsWeight[w][l] = queryWeight · weights[w][l] / permutations`;
+    ///    nonzero entries become the SAMPLED competitor pairs.
+    /// Those sampled pairs then feed the EXISTING `TPairLogitError` der over the
+    /// group (POINTWISE leaf path — `IsPairwiseScoring` false). The der is
+    /// recomputed every boosting iteration (the pairs are re-sampled,
+    /// `yetirank_helpers.cpp:347-393`). RAW approx is exp()'d INLINE for the noise
+    /// (the bootstrappedApprox is the exp-approx). Predictions are RAW. The RNG
+    /// draw order is the parity crux (RESEARCH Pitfall 1) and is validated against
+    /// the instrumented `CB_INSTRUMENT_LOG` ground truth BEFORE the der is checked.
+    /// Defaults: `permutations = 10`, `decay = 0.85`
+    /// (`loss_description.cpp:181-193`).
+    YetiRank {
+        /// Number of noise permutations sampled per group (`permutations`,
+        /// `loss_description.cpp:185`; default 10). Each permutation draws
+        /// `querySize` Gumbel uniforms. Validated `>= 1` by [`Loss::validate`].
+        permutations: u32,
+        /// Classic-weight geometric decay `decay ∈ [0, 1]`
+        /// (`yetirank_helpers.cpp:203` `decayCoefficient *= Config.Decay`;
+        /// `loss_description.cpp:192`, default 0.85). Validated by
+        /// [`Loss::validate`].
+        decay: f64,
+    },
+    /// YetiRankPairwise (randomized listwise ranking, PAIRWISE leaf path, LOSS-04
+    /// Wave C). The SAME sampled-pair RNG stream as [`Loss::YetiRank`] (identical
+    /// 2-level seed + Gumbel noise + Classic weights), but the leaf values are
+    /// solved via the Cholesky PAIRWISE-leaf path
+    /// ([`cb_train::pairwise_leaves`], the Plan 06.3-03 machinery
+    /// `PairLogitPairwise` rides) instead of the pointwise estimators
+    /// (`IsPairwiseScoring` true). Forces `boosting_type = Plain`
+    /// (`IsPlainOnlyModeLoss`, `enum_helpers.cpp:460-467`). Predictions are RAW.
+    /// Defaults match [`Loss::YetiRank`] (`permutations = 10`, `decay = 0.85`).
+    YetiRankPairwise {
+        /// Number of noise permutations per group (default 10); see
+        /// [`Loss::YetiRank::permutations`].
+        permutations: u32,
+        /// Classic-weight geometric decay (default 0.85); see
+        /// [`Loss::YetiRank::decay`].
+        decay: f64,
+    },
+    /// StochasticRank (randomized querywise ranking, LOSS-04 Wave C /
+    /// D-6.3-02). The OTHER RNG-stream loss: a Monte-Carlo gradient estimator that
+    /// perturbs each group's tie-broken/centered approxes with Gaussian noise and
+    /// averages the per-position metric-difference gradient over `num_estimations`
+    /// samples (`error_functions.cpp:1008-1102`). Per group (single-thread,
+    /// `randomSeed = randomSeed + queryIndex`,
+    /// `error_functions.h:1257 GenRandUI64Vector`):
+    /// 1. shift `shifted[d] = approx[d] - Sigma·Mu·target[d]`, then center by
+    ///    subtracting the group mean (non-FilteredDCG);
+    /// 2. `rng = TFastRng64(randomSeed)`; per sample (`num_estimations`): draw one
+    ///    `std_normal(rng)` Gaussian PER doc (`noise[d]`), `scores[d] = shifted[d]
+    ///    + Sigma·noise[d]`, stable-sort the order DESCENDING by score, compute the
+    ///    metric position weights + cumulative statistics, and accumulate the
+    ///    per-doc `Σ metricDiff · densityDiff / num_estimations` into `der1`;
+    /// 3. SFA: subtract the mean der (orthogonalize), then (count > 2) project out
+    ///    the approx direction (`Lambda`/`Nu`). `der2 = 0` (Gradient leaf method).
+    /// RAW approx; querywise POINTWISE (no pairs). The Gaussian draws go through
+    /// [`cb_core::std_normal`] (the SAME variable-length Marsaglia-polar draw
+    /// sequence — a different sampler desyncs the stream, RESEARCH Pitfall 1).
+    /// Predictions are RAW. Defaults: `sigma = 1.0`, `mu = 0.0`,
+    /// `num_estimations = 1`, `nu = 0.01`, `lambda = 1.0`
+    /// (`tensor_search_helpers.cpp:284-289`).
+    StochasticRank {
+        /// The target ranking metric the Monte-Carlo gradient optimizes. Only the
+        /// DCG/NDCG arm is transcribed in this phase (the most common; the
+        /// PFound/ERR/MRR arms are out of scope, gated by [`Loss::validate`]).
+        metric: StochasticRankMetric,
+        /// Noise scale `Sigma > 0` (`sigma`, default 1.0). Validated by
+        /// [`Loss::validate`].
+        sigma: f64,
+        /// Tie-resolving coefficient `Mu >= 0` (`mu`, default 0.0). Validated by
+        /// [`Loss::validate`].
+        mu: f64,
+        /// Number of Monte-Carlo samples per group (`num_estimations`, default 1).
+        /// Each sample draws `querySize` Gaussian noises. Validated `>= 1` by
+        /// [`Loss::validate`].
+        num_estimations: u32,
+    },
+}
+
+/// The target ranking metric a [`Loss::StochasticRank`] Monte-Carlo gradient
+/// optimizes. Mirrors the `EqualToOneOf(TargetMetric, DCG, NDCG, PFound,
+/// FilteredDCG, ERR, MRR)` set the upstream `TStochasticRankError` ctor admits
+/// (`error_functions.cpp:962-966`). This phase transcribes ONLY the DCG/NDCG arm
+/// (`CalcDCGMetricDiff` / `CalcDCGCumulativeStatistics` /
+/// `ComputeDCGPosWeights`); the other metrics are admitted by the enum for
+/// future waves but rejected by [`Loss::validate`] until transcribed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StochasticRankMetric {
+    /// Discounted Cumulative Gain — `CalcDCGMetricDiff` arm
+    /// (`error_functions.cpp:1222-1256`).
+    Dcg,
+    /// Normalized DCG (the default StochasticRank metric); same
+    /// `CalcDCGMetricDiff` arm as [`StochasticRankMetric::Dcg`], differing only in
+    /// the `ComputeDCGPosWeights` ideal-DCG normalization
+    /// (`error_functions.cpp:1525-1536`).
+    #[default]
+    Ndcg,
 }
 
 /// The target ranking metric a [`Loss::LambdaMart`] optimizes its per-group lambda
@@ -390,6 +502,38 @@ pub const QUERYSOFTMAX_BETA_DEFAULT: f64 = 1.0;
 /// The default Expectile asymmetry: `alpha = 0.5` (`TExpectileError`'s
 /// one-argument constructor, `error_functions.h:512`), the symmetric L2 case.
 pub const EXPECTILE_ALPHA_DEFAULT: f64 = 0.5;
+
+/// The default YetiRank noise permutation count (`permutations = 10`,
+/// `loss_description.cpp:185`).
+pub const YETIRANK_PERMUTATIONS_DEFAULT: u32 = 10;
+
+/// The default YetiRank Classic-weight geometric decay (`decay = 0.85`,
+/// `loss_description.cpp:192`).
+pub const YETIRANK_DECAY_DEFAULT: f64 = 0.85;
+
+/// The YetiRank Classic-weight magic constant `0.15` ("Like in GPU",
+/// `yetirank_helpers.cpp:198`).
+pub const YETIRANK_MAGIC_CONST: f64 = 0.15;
+
+/// The default StochasticRank Gaussian noise scale (`sigma = 1.0`,
+/// `tensor_search_helpers.cpp:284`).
+pub const STOCHASTIC_RANK_SIGMA_DEFAULT: f64 = 1.0;
+
+/// The default StochasticRank tie-resolving coefficient (`mu = 0.0`,
+/// `tensor_search_helpers.cpp:286`).
+pub const STOCHASTIC_RANK_MU_DEFAULT: f64 = 0.0;
+
+/// The default StochasticRank Monte-Carlo sample count (`num_estimations = 1`,
+/// `tensor_search_helpers.cpp:285`).
+pub const STOCHASTIC_RANK_NUM_ESTIMATIONS_DEFAULT: u32 = 1;
+
+/// The default StochasticRank approx-norm addition (`nu = 0.01`,
+/// `tensor_search_helpers.cpp:287`). Used in the Stage-3 SFA projection.
+pub const STOCHASTIC_RANK_NU_DEFAULT: f64 = 0.01;
+
+/// The default StochasticRank SFA coefficient for DCG/NDCG (`lambda = 1.0`,
+/// `tensor_search_helpers.cpp:288-289`; FilteredDCG would use 0.0).
+pub const STOCHASTIC_RANK_LAMBDA_DEFAULT: f64 = 1.0;
 
 impl Loss {
     /// Validate the loss's hyperparameters before training (the
@@ -541,6 +685,63 @@ impl Loss {
                     return Err(cb_core::CbError::OutOfRange(
                         "LambdaMart top must be -1 (full group) or a positive cutoff, got 0"
                             .to_owned(),
+                    ));
+                }
+            }
+            // YetiRank / YetiRankPairwise (Wave C, LOSS-04): `permutations >= 1`
+            // (`loss_description.cpp:185`; a zero count would sample no pairs and
+            // divide by zero in `competitorsWeight / permutationCount`,
+            // `yetirank_helpers.cpp:339`, T-06.3-04-03) and `decay ∈ [0, 1]`
+            // (`yetirank_helpers.cpp:203` — a decay outside the unit interval
+            // either explodes or sign-flips the geometric Classic weights). Both
+            // variants share the same RNG-stream params. `u32` is non-negative;
+            // the `>= 1` check rejects only `0`.
+            Self::YetiRank {
+                permutations,
+                decay,
+            }
+            | Self::YetiRankPairwise {
+                permutations,
+                decay,
+            } => {
+                if *permutations < 1 {
+                    return Err(cb_core::CbError::OutOfRange(
+                        "YetiRank permutations must be >= 1, got 0".to_owned(),
+                    ));
+                }
+                if !decay.is_finite() || !(0.0..=1.0).contains(decay) {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "YetiRank decay must be finite and in [0, 1], got {decay}"
+                    )));
+                }
+            }
+            // StochasticRank (Wave C, LOSS-04): `sigma > 0` (the Gaussian noise
+            // scale; a non-positive sigma collapses the Monte-Carlo perturbation,
+            // `error_functions.cpp:1045`, T-06.3-04-03), `mu >= 0` (the
+            // tie-resolving coefficient, `error_functions.cpp:1027`), and
+            // `num_estimations >= 1` (a zero sample count averages over nothing →
+            // `der / 0`, `error_functions.cpp:1219`). The `metric` enum admits
+            // only DCG/NDCG (the transcribed arm); any other future variant would
+            // be a non-exhaustive bug — both current variants are accepted.
+            Self::StochasticRank {
+                sigma,
+                mu,
+                num_estimations,
+                metric: _,
+            } => {
+                if !sigma.is_finite() || *sigma <= 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "StochasticRank sigma must be finite and > 0, got {sigma}"
+                    )));
+                }
+                if !mu.is_finite() || *mu < 0.0 {
+                    return Err(cb_core::CbError::OutOfRange(format!(
+                        "StochasticRank mu must be finite and >= 0, got {mu}"
+                    )));
+                }
+                if *num_estimations < 1 {
+                    return Err(cb_core::CbError::OutOfRange(
+                        "StochasticRank num_estimations must be >= 1, got 0".to_owned(),
                     ));
                 }
             }

@@ -6,8 +6,8 @@
 //! via the `#[path]` footer — never inline.
 
 use super::{calc_ders_for_queries, group_reduce_weighted, Competitor, GroupSpan};
-use crate::runtime::{Derivatives, Loss, Runtime};
-use cb_core::{sum_f64, CbResult};
+use crate::runtime::{Derivatives, Loss, Runtime, StochasticRankMetric};
+use cb_core::{std_normal, sum_f64, CbResult, TFastRng64};
 
 fn span(begin: usize, end: usize) -> GroupSpan {
     GroupSpan {
@@ -435,4 +435,168 @@ fn is_pairwise_scoring_and_plain_only_predicates() {
     assert!(!is_plain_only(&Loss::PairLogit));
     assert!(!is_pairwise_scoring(&Loss::QueryRmse));
     assert!(!is_pairwise_scoring(&Loss::Rmse));
+}
+
+// ---------------------------------------------------------------------------
+// Wave-C randomized ranking losses (YetiRank / StochasticRank) — LOSS-04.
+// ---------------------------------------------------------------------------
+
+/// A GroupSpan carrying a sampled competitor adjacency (the YetiRank pair source
+/// the trainer injects). Helper for the YetiRank-rides-PairLogit test.
+fn span_with_competitors(begin: usize, end: usize, competitors: Vec<Vec<Competitor>>) -> GroupSpan {
+    GroupSpan {
+        begin,
+        end,
+        weight: 1.0,
+        competitors,
+    }
+}
+
+/// YetiRank rides the EXISTING PairLogit der over the SAMPLED competitors: feeding
+/// the same competitor adjacency through `Loss::YetiRank` and `Loss::PairLogit`
+/// must produce BIT-IDENTICAL ders (the only difference between the two is the leaf
+/// path, decided in boosting — the der math is the shared PairLogit der).
+#[test]
+fn yetirank_rides_pairlogit_der_over_sampled_competitors() {
+    let approx = [0.5_f64, -0.2, 0.1];
+    let target = [2.0_f64, 0.0, 1.0];
+    // Sampled adjacency: doc0 beats doc1 (w=0.3), doc2 beats doc1 (w=0.1).
+    let competitors = vec![
+        vec![Competitor { id: 1, weight: 0.3 }],
+        vec![],
+        vec![Competitor { id: 1, weight: 0.1 }],
+    ];
+    let groups_y = vec![span_with_competitors(0, 3, competitors.clone())];
+    let groups_p = vec![span_with_competitors(0, 3, competitors)];
+
+    let yeti = calc_ders_for_queries(
+        &Loss::YetiRank { permutations: 10, decay: 0.85 },
+        &approx,
+        &target,
+        &[],
+        &groups_y,
+        0,
+    )
+    .unwrap();
+    let pair = calc_ders_for_queries(&Loss::PairLogit, &approx, &target, &[], &groups_p, 0).unwrap();
+
+    assert_eq!(yeti.len(), 1);
+    assert_eq!(pair.len(), 1);
+    for (y, p) in yeti[0].der1.iter().zip(&pair[0].der1) {
+        assert!((y - p).abs() < 1e-15, "YetiRank der1 must equal PairLogit der1 over the same sampled pairs");
+    }
+    for (y, p) in yeti[0].der2.iter().zip(&pair[0].der2) {
+        assert!((y - p).abs() < 1e-15, "YetiRank der2 must equal PairLogit der2");
+    }
+}
+
+/// StochasticRank (num_estimations=1) draws EXACTLY `count` Gaussian noises per
+/// sample, one per doc, from `TFastRng64(random_seed + group_index)` via the SAME
+/// `cb_core::std_normal` Marsaglia-polar sequence. We hand-trace the first group's
+/// noise draws (group_index=0 => seed=random_seed) and assert the der is finite +
+/// the draw stream is the std_normal one (a different sampler would desync). The
+/// der2 must be all-zero (Gradient leaf method).
+#[test]
+fn stochasticrank_num_estimations_one_draws_count_gaussians_via_std_normal() {
+    let approx = [0.3_f64, -0.4, 0.1];
+    let target = [2.0_f64, 0.0, 1.0];
+    let random_seed = 5_u64;
+    let loss = Loss::StochasticRank {
+        metric: StochasticRankMetric::Ndcg,
+        sigma: 1.0,
+        mu: 0.0,
+        num_estimations: 1,
+    };
+
+    // Hand trace: group 0 seed = random_seed + 0; one std_normal per doc.
+    let mut rng = TFastRng64::from_seed(random_seed);
+    let hand: Vec<f64> = (0..3).map(|_| std_normal(&mut rng)).collect();
+    assert_eq!(hand.len(), 3, "3 docs => 3 Gaussian draws for num_estimations=1");
+
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &[span(0, 3)], random_seed).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].der1.len(), 3);
+    assert!(out[0].der1.iter().all(|d| d.is_finite()), "StochasticRank der1 must be finite");
+    assert!(out[0].der2.iter().all(|&d| d == 0.0), "StochasticRank der2 == 0 (Gradient leaf)");
+    // SFA Stage-3 orthogonalization: the der1 sums to ~0 (mean subtracted).
+    let s: f64 = sum_f64(&out[0].der1);
+    assert!(s.abs() < 1e-9, "StochasticRank der1 mean-centered by SFA (sum ~ 0), got {s}");
+}
+
+/// StochasticRank on a single-doc group (count <= 1) yields zero ders, never
+/// divides by `count - 1` (T-06.3-04-02 — the Security V5 guard,
+/// error_functions.cpp:1020-1022).
+#[test]
+fn stochasticrank_single_doc_group_is_zero_no_divide() {
+    let approx = [0.7_f64];
+    let target = [1.0_f64];
+    let loss = Loss::StochasticRank {
+        metric: StochasticRankMetric::Dcg,
+        sigma: 1.0,
+        mu: 0.0,
+        num_estimations: 1,
+    };
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &[span(0, 1)], 0).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].der1, vec![0.0]);
+    assert_eq!(out[0].der2, vec![0.0]);
+}
+
+/// StochasticRank re-seeds per group with `random_seed + group_index`: two
+/// identical groups at different indices must draw DIFFERENT noise (so their ders
+/// differ) — a missing `+ group_index` would make every group's stream identical.
+#[test]
+fn stochasticrank_reseeds_per_group_index() {
+    let approx = [0.3_f64, -0.4, 0.1, 0.3, -0.4, 0.1];
+    let target = [2.0_f64, 0.0, 1.0, 2.0, 0.0, 1.0];
+    let loss = Loss::StochasticRank {
+        metric: StochasticRankMetric::Ndcg,
+        sigma: 1.0,
+        mu: 0.0,
+        num_estimations: 1,
+    };
+    let groups = vec![span(0, 3), span(3, 6)];
+    let out = calc_ders_for_queries(&loss, &approx, &target, &[], &groups, 0).unwrap();
+    assert_eq!(out.len(), 2);
+    // Same approx/target shape, different seed (0 vs 1) => different der streams.
+    let differs = out[0]
+        .der1
+        .iter()
+        .zip(&out[1].der1)
+        .any(|(a, b)| (a - b).abs() > 1e-12);
+    assert!(differs, "per-group reseed (random_seed + group_index) must vary the noise stream");
+}
+
+/// `Loss::validate` rejects out-of-range Wave-C params with a typed OutOfRange
+/// error (T-06.3-04-03), never a panic.
+#[test]
+fn wave_c_loss_validate_rejects_bad_params() {
+    // permutations == 0.
+    assert!(matches!(
+        Loss::YetiRank { permutations: 0, decay: 0.85 }.validate(),
+        Err(cb_core::CbError::OutOfRange(_))
+    ));
+    // decay out of [0, 1].
+    assert!(matches!(
+        Loss::YetiRankPairwise { permutations: 10, decay: 1.5 }.validate(),
+        Err(cb_core::CbError::OutOfRange(_))
+    ));
+    // sigma <= 0.
+    assert!(matches!(
+        Loss::StochasticRank { metric: StochasticRankMetric::Ndcg, sigma: 0.0, mu: 0.0, num_estimations: 1 }.validate(),
+        Err(cb_core::CbError::OutOfRange(_))
+    ));
+    // mu < 0.
+    assert!(matches!(
+        Loss::StochasticRank { metric: StochasticRankMetric::Ndcg, sigma: 1.0, mu: -0.1, num_estimations: 1 }.validate(),
+        Err(cb_core::CbError::OutOfRange(_))
+    ));
+    // num_estimations == 0.
+    assert!(matches!(
+        Loss::StochasticRank { metric: StochasticRankMetric::Ndcg, sigma: 1.0, mu: 0.0, num_estimations: 0 }.validate(),
+        Err(cb_core::CbError::OutOfRange(_))
+    ));
+    // Valid defaults pass.
+    assert!(Loss::YetiRank { permutations: 10, decay: 0.85 }.validate().is_ok());
+    assert!(Loss::StochasticRank { metric: StochasticRankMetric::Ndcg, sigma: 1.0, mu: 0.0, num_estimations: 1 }.validate().is_ok());
 }

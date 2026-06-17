@@ -48,8 +48,12 @@ pub use ranking_der::{
     Competitor as RankingCompetitor, GroupSpan,
 };
 pub use runtime::{
-    Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime, EXPECTILE_ALPHA_DEFAULT,
-    QUERYSOFTMAX_BETA_DEFAULT, QUERYSOFTMAX_LAMBDA_DEFAULT,
+    Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime, StochasticRankMetric,
+    EXPECTILE_ALPHA_DEFAULT, QUERYSOFTMAX_BETA_DEFAULT, QUERYSOFTMAX_LAMBDA_DEFAULT,
+    STOCHASTIC_RANK_LAMBDA_DEFAULT, STOCHASTIC_RANK_MU_DEFAULT,
+    STOCHASTIC_RANK_NUM_ESTIMATIONS_DEFAULT, STOCHASTIC_RANK_NU_DEFAULT,
+    STOCHASTIC_RANK_SIGMA_DEFAULT, YETIRANK_DECAY_DEFAULT, YETIRANK_MAGIC_CONST,
+    YETIRANK_PERMUTATIONS_DEFAULT,
 };
 pub use score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
