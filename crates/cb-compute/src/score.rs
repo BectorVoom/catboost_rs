@@ -117,7 +117,12 @@ pub fn multi_dim_split_score(
     // folded through the sanctioned ordered primitive (D-08). This is exactly the
     // concatenation of each dimension's `l2_split_score` summands in dimension then
     // leaf order, so at dim=1 it is byte-identical to `l2_split_score`.
-    let mut num_terms: Vec<f64> = Vec::new();
+    // Pre-size to the total per-(dim,leaf) term count (IN-01) — consistent with the
+    // Cosine denominator's `with_capacity` and avoids reallocations as the nested
+    // loop pushes. Does not change the fold ORDER (still dimension-then-leaf), so
+    // the dim=1 byte-identity (D-04) is preserved.
+    let total_terms: usize = per_dim_leaves.iter().map(Vec::len).sum();
+    let mut num_terms: Vec<f64> = Vec::with_capacity(total_terms);
     for leaves in per_dim_leaves {
         for &stats in leaves {
             num_terms.push(add_leaf_plain(stats, scaled_l2));
@@ -149,6 +154,10 @@ pub fn multi_dim_split_score(
         // SolarL2 (`score_calcers.cuh:22-24`): per-leaf scalar
         // `weight > 1e-20 ? (-sum*sum)*(1 + 2*ln(weight + 1.0))/weight : 0.0`, folded
         // through `sum_f64` in dimension-then-leaf order (mirroring the L2 num fold).
+        // IN-04: the GPU Solar/LOO/Sat calcers compute `(-sum*sum)/weight`-style
+        // terms directly and do NOT apply the `scaled_l2` regularizer that L2 /
+        // Cosine thread in (correct per `score_calcers.cuh` — do not "fix" by adding
+        // it). Hence `scaled_l2` is intentionally unused by these three arms.
         EScoreFunction::SolarL2 => {
             let terms = solar_l2_terms(per_dim_leaves);
             sum_f64(&terms)
@@ -171,7 +180,7 @@ pub fn multi_dim_split_score(
 /// (`score_calcers.cuh:22-24`). Returned as a `Vec` so the caller folds through the
 /// single sanctioned reduction primitive (D-08).
 fn solar_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
-    let mut terms: Vec<f64> = Vec::new();
+    let mut terms: Vec<f64> = Vec::with_capacity(per_dim_leaves.iter().map(Vec::len).sum());
     for leaves in per_dim_leaves {
         for &stats in leaves {
             let sum = stats.sum_weighted_delta;
@@ -191,7 +200,7 @@ fn solar_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
 /// `adjust = weight>1.0 ? weight/(weight-1.0) : 0.0; adjust*=adjust;
 /// weight>0.0 ? adjust*(-sum*sum)/weight : 0.0`.
 fn loo_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
-    let mut terms: Vec<f64> = Vec::new();
+    let mut terms: Vec<f64> = Vec::with_capacity(per_dim_leaves.iter().map(Vec::len).sum());
     for leaves in per_dim_leaves {
         for &stats in leaves {
             let sum = stats.sum_weighted_delta;
@@ -217,7 +226,7 @@ fn loo_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
 /// `adjust = weight>2.0 ? weight*(weight-2.0)/(weight*weight-3.0*weight+1.0) : 0.0;
 /// weight>0.0 ? adjust*(-sum*sum)/weight : 0.0`.
 fn sat_l2_terms(per_dim_leaves: &[Vec<LeafStats>]) -> Vec<f64> {
-    let mut terms: Vec<f64> = Vec::new();
+    let mut terms: Vec<f64> = Vec::with_capacity(per_dim_leaves.iter().map(Vec::len).sum());
     for leaves in per_dim_leaves {
         for &stats in leaves {
             let sum = stats.sum_weighted_delta;
