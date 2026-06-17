@@ -175,7 +175,15 @@ static void StochasticRankNoiseStream(
     for (size_t d = 0; d < count; ++d) {
         shifted[d] = approxes[d] - sigmaParam * mu * targets[d];
     }
-    double avrg = std::accumulate(shifted.begin(), shifted.end(), 0.0) / count;
+    // WR-03 / D-08: cb_core::sum_f64 (crates/cb-core/src/reduction.rs) is the parity
+    // SOURCE OF TRUTH — a strict left-to-right f64 fold with NO compensated/pairwise
+    // summation. The oracle adapts to it: accumulate shifted[] in the SAME
+    // doc-ascending sequential order sum_f64 uses (the Rust centering at
+    // ranking_der.rs:726-727 is sum_f64(&shifted) / count). std::accumulate could be
+    // reordered by an implementation, so transcribe the fold explicitly here.
+    double avrg = 0.0;
+    for (double s : shifted) avrg += s;
+    avrg /= static_cast<double>(count);
     for (auto& s : shifted) s -= avrg;
 
     // Stage 2 — Monte-Carlo noise stream, error_functions.cpp:1041-1055.
