@@ -48,6 +48,34 @@ matches upstream, then gate the `pairlogit_oracle` + `pairlogit_pairwise_oracle`
 per-stage tests ≤1e-5 against the already-frozen fixtures. The fixtures are committed;
 only the leaf-der2 reduction + the two oracle tests remain.
 
+**[06.3-09 UPDATE] PARTIAL CLOSURE + refined root cause.** The pairwise SPLIT-SCORING
+weight was wired: `bt.PairwiseWeights` (per-object Σ competitor.weight, `CalcPairwiseWeights`
+`approx_updater_helpers.h:74-89`) now feeds the histogram `sumWeight` (`scoring.cpp:275-279`)
++ the Newton L2 scaling (`CalcDeltaNewtonBody`, `sumAllWeights = Σ pairwise / n`) for the
+`UsesPairsForCalculation` losses (`uses_pairwise_weights` / `calc_pairwise_weights` in
+`boosting.rs`). This advanced the PairLogit oracle Splits match from index 4 → index 6.
+
+The plan's diagnosis (normalize `Competitor.weight`) was REFUTED empirically: the frozen
+fixture's explicit pairs carry weight `1.0` (pairs.npy is `(7,2)` winner/loser only, no
+weight col) and upstream sets `Competitor.Weight = pair.Weight` verbatim
+(`data_providers.cpp:327-329`) — `Competitor.weight` is correct as-is.
+
+**The TRUE remaining blocker (still DEFERRED — needs the instrumented trainer):** the
+PairLogit LEAF-der2 reduction. At iter-0 tree-0 the `TPairLogitError` der is
+bit-verified-identical to upstream (der1 leaf sums match), yet the Newton leaf deltas
+diverge in a way NO global L2 / pairwise scaling reconciles: e.g. the single-object leaf
+holding object 10 (its only pair (10,11) split across leaves) needs an effective
+denominator of ~23 (delta 0.0064) where `sumDer/(-sumDer2 + scaledL2)` with the identical
+der (`sumDer=0.5`, `sumDer2=-0.25`) yields ~3.75 (delta 0.04) — a ~6× gap, while leaf 0
+needs denom 7.47 vs 5.5. The per-leaf denominators are mutually inconsistent with any
+`-sumDer2 + C`, so the per-leaf SumDer2 (or a per-leaf coupling the pointwise path omits)
+genuinely differs from a plain per-object der2 sum. Pinning it ≤1e-5 requires the
+instrumented catboost 1.2.10 trainer's per-leaf SumDer/SumDer2 log, INFEASIBLE this
+session (toolchain/disk, `catboost-instrumented-trainer-build`). The two oracle tests
+(`pairlogit_oracle_test.rs` / `pairlogit_pairwise_oracle_test.rs`) are committed,
+`#[ignore]`'d with this deferral, and run the FULL ≤1e-5 gate the moment `#[ignore]` is
+removed — no tolerance weakened.
+
 **LambdaMart (Wave B) shipped fully** — per-stage oracle ≤1e-5 GREEN (the listwise
 positive-hessian Newton-denominator fix in `leaf.rs::newton_leaf_delta` was the key).
 
