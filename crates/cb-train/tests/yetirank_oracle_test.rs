@@ -20,47 +20,59 @@
 //! diverge at the default if the seed re-derivation is wrong). This assertion is
 //! LIVE — it fails if the sampler's RNG draw order regresses.
 //!
-//! # Deferred end-to-end per-stage fixture (escalate-don't-weaken, D-6.3-03b)
+//! # End-to-end per-stage closure (06.3-14 ext — D-07 trainer-level RNG CLOSED)
 //!
 //! The FULL per-stage `compare_stage(Splits|LeafValues|StagedApprox|Predictions)`
-//! over a trained YetiRank `model.json` remains DEFERRED — but for a NEWLY
-//! ISOLATED reason (06.3-14), NOT the prior toolchain/disk NO-GO. The 06.3-10
-//! instrumented catboost 1.2.10 TRAINER is now BUILT (GO) and was RUN on the
-//! ranking corpus this plan (06.3-14 Task 2). The captured per-tree
-//! `CB_INSTRUMENT_LOG` `yeti_gumbel` draw stream proves the trainer-level RNG
-//! draw COUNT matches the Rust per-doc/per-permutation/per-query model
-//! (`12 docs × 10 perms × 3 permutation folds × 5 trees == 1800` draws), BUT the
-//! draw ORDER diverges from the current Rust sampler, which:
-//!   (a) uses ONE permutation fold where the trainer uses THREE
-//!       (`leaf_estimation`/AveragingFold folds), and
-//!   (b) re-derives the per-query seed ONCE from `params.random_seed`
-//!       (`derive_query_seeds`) and reuses it for ALL trees, whereas catboost
-//!       `UpdatePairsForYetiRank` re-derives the seed PER TREE from a per-tree
-//!       context-RNG-advanced `randomSeed` (`yetirank_helpers.cpp:369-414`).
-//! Because the sampled pairs drive the gradient, this RNG-order gap diverges the
-//! YetiRank model end-to-end (measured: leaf-value max |Δ| ≈ 8.3e-1, split max
-//! |Δ| ≈ 1.44 vs the catboost trainer fixture — far above 1e-5). Reproducing the
-//! trainer's per-tree multi-fold seed derivation in the boosting loop is a NEW
-//! seeding subsystem (Rule 4 architectural scope — the same class as the
-//! 06.3-13 deferred PairLogitPairwise split-scorer). Per D-6.3-03b that step is
-//! DEFERRED — NOT weakened, NOT `#[ignore]`d, NOT fabricated; see
-//! `deferred-items.md [06.3-14]`. [`yetirank_end_to_end_per_stage`] is the
-//! wired-but-pending compare: it runs the full per-stage gate the MOMENT the
-//! frozen trainer fixture (`ranking_corpus/yetirank/model.json`) lands, and
-//! otherwise asserts the deferred-fixture invariant (the directory exists with the
-//! RNG ground truth) so the test never silently passes on a missing gate. This
-//! mirrors the Phase-5 ORD-01 "ground truth committed, oracle wired, no weakening"
-//! precedent. NOTE: the standalone full-precision RNG-draw oracle
-//! ([`yetirank_rng_draw_log_oracle`]) stays GREEN — it gates the SAMPLER against
-//! the single-group standalone ground truth, which is correct; the gap is the
-//! TRAINER's multi-fold/per-tree seed PLUMBING, not the per-query Gumbel sampler.
+//! over the frozen catboost 1.2.10 YetiRank `model.json` now PASSES at <= 1e-5
+//! ([`yetirank_end_to_end_per_stage`]). The closure required reproducing the
+//! trainer's per-tree RNG seed PLUMBING draw-for-draw
+//! ([`cb_train::YetiRankTreeSeeder`]), the precise root cause the prior deferral
+//! isolated. The actual model (verified against the instrumented trainer) is:
+//!   * Per tree the persistent context RNG (`LearnProgress->Rand(random_seed)`)
+//!     draws, IN ORDER: the structure-fold selection (1); the DERIVATIVE recalc
+//!     seed (drives gradient + splits, learning fold); the per-level split-search
+//!     draws (Rsm selection + `CalcScores` + `SelectBestCandidate` Box-Muller
+//!     normals, consumed via `cb_core::std_normal` to advance the phase exactly);
+//!     the LEARNING-fold approx-update recalc seed; and the AVERAGING-fold
+//!     LEAF-VALUE recalc seed — THREE distinct YetiRank competitor re-samples per
+//!     tree, NOT one. (The earlier "3 permutation folds" reading was the 3 RECALCS
+//!     per tree; `fold_count == 1`.)
+//!   * Each recalc partitions the query range into BLOCKS
+//!     (`SetBlockCount(CB_THREAD_LIMIT=128)` ⇒ `block_count == n_groups` for the
+//!     small corpus), drawing a per-block seed via
+//!     `GenRandUI64Vector(n_groups, recalc_seed)` then one query seed per block
+//!     ([`cb_train::derive_per_tree_query_seeds`]) — NOT the single shared block_rng
+//!     the standalone self-oracle uses.
+//!   * YetiRank is NOT `UseAveragingFoldAsFoldZero` (usePairs is true), so the
+//!     LEARNING fold (gradient/structure) and AVERAGING fold (stored leaf values)
+//!     carry SEPARATE approxes; the learning-fold approx is updated by the
+//!     learnfold recalc WITHOUT `NormalizeLeafValues` (only `learning_rate`).
+//!   * The sampler transcribes upstream's f32 bit-width (uniform cast to f32, f32
+//!     Gumbel ratio, `TVector<TVector<float>>` competitor weights) — load-bearing
+//!     for the end-to-end <= 1e-5 (an f64 sampler drifts ~1e-8 and flips a close
+//!     split by tree 2).
+//! The standalone full-precision RNG-draw oracle
+//! ([`yetirank_rng_draw_log_oracle`]) stays GREEN throughout (it gates the
+//! per-query Gumbel sampler against the single-block standalone ground truth via
+//! [`cb_train::derive_query_seeds`], which is the correct chain for THAT generator).
+//! The trainer fixture is OFFLINE/RUN-ONCE frozen (the 06.3-10 GO trainer); CI only
+//! reads it. NO `#[ignore]`, NO weakened tolerance.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
 
+use cb_backend::CpuBackend;
 use cb_compute::RankingCompetitor as Competitor;
-use cb_oracle::{compare_stage, Stage};
-use cb_train::{derive_query_seeds, yetirank_sample_pairs};
+use cb_compute::{LeafMethod, Loss};
+use cb_data::Pair;
+use cb_model::{predict_raw, Model as CbModel};
+use cb_oracle::{compare_stage, load_f64_vec, load_model_json, Stage};
+use cb_train::{
+    derive_query_seeds, train_ranking, yetirank_sample_pairs, BoostParams, EBootstrapType,
+    EOverfittingDetectorType, RankingData,
+};
+use ndarray::Array2;
+use ndarray_npy::read_npy;
 
 fn fixture(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -68,6 +80,70 @@ fn fixture(rel: &str) -> PathBuf {
         .join("cb-oracle")
         .join("fixtures")
         .join(rel)
+}
+
+const N_ROWS: usize = 12;
+const ITERATIONS: usize = 5;
+
+fn load_feature_columns() -> Vec<Vec<f32>> {
+    let x: Array2<f64> = read_npy(fixture("ranking_corpus/inputs/X.npy"))
+        .unwrap_or_else(|e| panic!("ranking_corpus/inputs/X.npy must load: {e:?}"));
+    (0..x.ncols())
+        .map(|fi| x.column(fi).iter().map(|&v| v as f32).collect())
+        .collect()
+}
+
+fn load_u64_vec(rel: &str) -> Vec<u64> {
+    let arr: ndarray::Array1<u64> =
+        read_npy(fixture(rel)).unwrap_or_else(|e| panic!("{rel} must load: {e:?}"));
+    arr.to_vec()
+}
+
+fn load_pairs() -> Vec<Pair> {
+    let arr: Array2<u32> = read_npy(fixture("ranking_corpus/inputs/pairs.npy"))
+        .unwrap_or_else(|e| panic!("pairs.npy must load: {e:?}"));
+    (0..arr.nrows())
+        .map(|r| Pair {
+            winner_id: arr[(r, 0)],
+            loser_id: arr[(r, 1)],
+        })
+        .collect()
+}
+
+fn yetirank_params(loss: Loss, leaf_method: LeafMethod) -> BoostParams {
+    BoostParams {
+        loss,
+        iterations: ITERATIONS,
+        depth: 2,
+        learning_rate: 0.3,
+        // YetiRank's upstream l2_leaf_reg default is ~0 (1e-20 in the fixture).
+        l2_leaf_reg: 1e-20,
+        random_strength: 0.0,
+        boost_from_average: false,
+        leaf_method,
+        bootstrap_type: EBootstrapType::No,
+        subsample: 1.0,
+        bagging_temperature: 0.0,
+        random_seed: 20_260_617,
+        od_type: EOverfittingDetectorType::None,
+        od_pval: 0.0,
+        od_wait: 0,
+        use_best_model: false,
+        eval_metric: None,
+        auto_learning_rate: false,
+        one_hot_max_size: cb_train::one_hot_max_size_default(),
+        permutation_count: cb_train::permutation_count_default(),
+        fold_len_multiplier: cb_train::fold_len_multiplier_default(),
+        simple_ctr: cb_train::simple_ctr_default(),
+        simple_ctr_priors: cb_train::simple_ctr_priors_default(),
+        counter_calc_method: cb_train::counter_calc_method_default(),
+        boosting_type: cb_train::boosting_type_default(),
+        max_ctr_complexity: cb_train::max_ctr_complexity_default(),
+        combinations_ctr: cb_train::combinations_ctr_default(),
+        combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
+        score_function: cb_compute::EScoreFunction::Cosine,
+        has_time: false,
+    }
 }
 
 /// Parse the frozen `competitor` events from the instrumented ground-truth JSONL
@@ -166,33 +242,63 @@ fn yetirank_rng_draw_log_oracle() {
         .unwrap_or_else(|e| panic!("YetiRank: sampled competitor weights diverged from instrumented ground truth: {e:?}"));
 }
 
-/// Wired-but-pending end-to-end per-stage compare. Runs the full
-/// `compare_stage(Splits|LeafValues|StagedApprox|Predictions)` over a trained
-/// YetiRank `model.json` the MOMENT the deferred instrumented trainer fixture
-/// lands; until then it asserts the deferred-fixture invariant (the RNG ground
-/// truth is committed) so the test never silently passes on a missing gate. NO
-/// `#[ignore]`, NO weakened tolerance.
+/// END-TO-END per-stage YetiRank oracle (D-07 closure, 06.3-14 ext): train a Plain
+/// boosted YetiRank model over the shared ranking corpus and gate per-tree splits,
+/// per-tree leaf values, per-iteration staged approximants, and final predictions
+/// against the frozen catboost 1.2.10 `ranking_corpus/yetirank` fixture at <= 1e-5.
+///
+/// This exercises the [`cb_train::YetiRankTreeSeeder`] per-tree multi-block seed
+/// plumbing: the gradient/split competitor sample uses the derivative recalc seeds,
+/// the leaf-value estimation uses a DISTINCT leaf-value recalc seed set, both
+/// advanced off the persistent context RNG draw-for-draw with the trainer. YetiRank
+/// rides the pointwise Newton leaf (model.json `leaf_estimation_method`). The
+/// fixture is OFFLINE/RUN-ONCE-frozen (the instrumented 06.3-10 trainer); CI only
+/// reads it. NO `#[ignore]`, NO weakened tolerance.
 #[test]
 fn yetirank_end_to_end_per_stage() {
-    let model_json = fixture("ranking_corpus/yetirank/model.json");
-    if model_json.exists() {
-        // OFFLINE closure landed: wire the full per-stage compare here (identical
-        // shape to lambdamart_oracle_per_stage — load model.json/staged/predictions,
-        // train_ranking under Loss::YetiRank, compare_stage all four stages <= 1e-5).
-        panic!(
-            "ranking_corpus/yetirank/model.json now exists — wire the full per-stage \
-             compare_stage gate (see lambdamart_oracle_test.rs precedent) and remove \
-             this guard. The end-to-end YetiRank trainer fixture has landed."
-        );
-    } else {
-        // Deferred (path c): the trainer fixture is not yet built. Assert the RNG
-        // ground truth IS committed (the recoverable part) so this is a real gate
-        // on the deferred-closure invariant, not a silent skip.
-        let gt = fixture("ranking_corpus/yetirank/yetirank_rng_groundtruth.jsonl");
-        assert!(
-            gt.exists(),
-            "YetiRank RNG ground truth must be committed even while the end-to-end \
-             trainer fixture is deferred (escalate-don't-weaken, D-6.3-03b)"
-        );
-    }
+    let scenario = "ranking_corpus/yetirank";
+    let columns = load_feature_columns();
+    let target = load_f64_vec(&fixture("ranking_corpus/inputs/y.npy")).unwrap();
+    let group_id = load_u64_vec("ranking_corpus/inputs/group_id.npy");
+    let subgroup_id = load_u64_vec("ranking_corpus/inputs/subgroup_id.npy");
+    let pairs = load_pairs();
+    let model_json = load_model_json(&fixture(&format!("{scenario}/model.json")))
+        .unwrap_or_else(|e| panic!("{scenario}/model.json must load: {e:?}"));
+    let borders = model_json.float_feature_borders();
+
+    let ranking = RankingData {
+        group_id: &group_id,
+        subgroup_id: &subgroup_id,
+        pairs: &pairs,
+    };
+    let loss = Loss::YetiRank { permutations: 10, decay: 0.85 };
+
+    let mut staged = Vec::new();
+    let model = train_ranking(
+        &CpuBackend,
+        &columns,
+        &borders,
+        &target,
+        &[],
+        &yetirank_params(loss, LeafMethod::Newton),
+        Some(&mut staged),
+        ranking,
+    )
+    .unwrap_or_else(|e| panic!("YetiRank training failed: {e:?}"));
+
+    compare_stage(Stage::Splits, &model_json.split_borders(), &model.split_borders())
+        .unwrap_or_else(|e| panic!("YetiRank: splits diverged: {e:?}"));
+    compare_stage(Stage::LeafValues, &model_json.leaf_values(), &model.leaf_values())
+        .unwrap_or_else(|e| panic!("YetiRank: leaf values diverged: {e:?}"));
+
+    let expected_staged = load_f64_vec(&fixture(&format!("{scenario}/staged.npy"))).unwrap();
+    compare_stage(Stage::StagedApprox, &expected_staged, &staged)
+        .unwrap_or_else(|e| panic!("YetiRank: staged approx diverged: {e:?}"));
+
+    let cb_model = CbModel::from_trained(&model, borders.clone());
+    let predictions = predict_raw(&cb_model, &columns);
+    assert_eq!(predictions.len(), N_ROWS);
+    let expected_predictions = load_f64_vec(&fixture(&format!("{scenario}/predictions.npy"))).unwrap();
+    compare_stage(Stage::Predictions, &expected_predictions, &predictions)
+        .unwrap_or_else(|e| panic!("YetiRank: raw predictions diverged: {e:?}"));
 }
