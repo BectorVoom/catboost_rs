@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.4-01-PLAN.md (Wave-A score functions, LOSS-09)
-last_updated: "2026-06-17T22:13:48.000Z"
-last_activity: 2026-06-17 -- 06.4-01 COMPLETE (5 GPU-only score fns self-oracled)
+stopped_at: Completed 06.4-02-PLAN.md
+last_updated: "2026-06-17T22:32:21.253Z"
+last_activity: 2026-06-17 -- 06.4-01 COMPLETE (Wave-A LOSS-09 score functions)
 progress:
   total_phases: 14
   completed_phases: 8
   total_plans: 73
-  completed_plans: 70
-  percent: 58
+  completed_plans: 71
+  percent: 57
 ---
 
 # Project State
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.4 (score-functions-uncertainty-and-custom-objectives) — EXECUTING
-Plan: 2 of 4 (06.4-01 Wave-A COMPLETE)
-Status: Executing Phase 06.4
+Plan: 3 of 4 (06.4-01 Wave-A COMPLETE)
+Status: Ready to execute
 Last activity: 2026-06-17 -- 06.4-01 COMPLETE (Wave-A LOSS-09 score functions)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
@@ -114,6 +114,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.3 P14 | ~35min | 3 tasks | 5 files |
 | Phase 06.3 P15 | ~25min | 2 tasks | 3 files |
 | Phase 06.4 P01 | ~8min | 3 tasks | 6 files |
+| Phase 06.4 P02 | 11min | 3 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -248,6 +249,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 06.3-13: PairLogit pairwise L2 scaling uses sum_all_weights (per-object docCount), not the pairwise-weight total; proven by the instrumented per-leaf der ground truth
 - [Phase ?]: 06.3-13: pairwise losses need NormalizeLeafValues document-weighted leaf centering (empty leaves -> 0, lr last); this (not a leaf-der2 reduction) closed the PairLogit oracle
 - [Phase ?]: [06.3-14] WR-03 closed (b32efb5: grouped leaf sumWeight branches on leaf method — Gradient->eff_weights, Newton->unit); GAP2/Truth#5 + GAP3 trainer-half deferred un-weakened (1ae9739): the 06.3-10 trainer is GO and was run, but the Rust sampler's RNG model diverges (3 perm folds + per-tree reseed vs 1 fold + fixed 2-level chain; count matches 1800, order diverges), diverging the end-to-end YetiRank model ~8.3e-1 (>>1e-5) — three model.json stay absent, oracles keep the deferred invariant, Rule-4 seeding-subsystem recipe in deferred-items.md [06.3-14]. Task 3 = blocking-human checkpoint on the deferral.
+- [Phase ?]: 06.4-02: RMSEWithUncertainty starting approx [mean, 0.5*log(var)] applied even with boost_from_average=false (train_model.cpp:858); 2-dim diagonal-hessian der rides the 6.2 per-dim Newton leaf path, NOT MultiClass dense solve.
 
 ### Pending Todos
 
@@ -288,8 +290,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-17T21:00:08.758Z
-Stopped at: Phase 6.4 context gathered
+Last session: 2026-06-17T22:32:21.247Z
+Stopped at: Completed 06.4-02-PLAN.md
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
 Stopped at (prior): 06.3-02 COMPLETE (commits f42e3e6 Task1 / 6b208dd Task2) — QueryRMSE + QuerySoftMax, the first two deterministic querywise ranking losses, trained end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. Task1: loss.rs queryrmse_der/querysoftmax_der per-object inner formulas (weight folded in); runtime.rs Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} (validate rejects lambda<0/beta≤0; defaults 0.01/1.0); ranking_der.rs wired arms — QueryRMSE per-group queryAvrg via sum_f64, QuerySoftMax max-shifted softmax der with sumWTargets≤0/weight≤0 guards; exhaustive-match arms added in cb-backend cpu_runtime + cb-train metrics/boosting + 3 cb-train oracle test files (workspace check --tests GREEN — the prior attempt's non-exhaustive cb-backend arm is closed). 11 new unit tests. Task2: boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view; train_ranking entry + RankingData; queryrmse/querysoftmax per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 (Cosine score; QueryRMSE=Newton leaf, QuerySoftMax=Gradient leaf per fixture model.json); QuerySoftMax fixture frozen OFFLINE. Gates: cb-compute 102/102, full cb-train suite 0 failures (154 lib + all oracles incl. D-04 no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-03 (PairLogit + LambdaMart, Wave B pairwise). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-02-SUMMARY.md.
 Stopped at (prior): 06.3-01 COMPLETE (commits c1a38a9 Task1 / 1939ab8 Task2 / 441f36d Task3) — the grouped der seam + ranking fixture corpus, the LOSS-04 design hinge. Task1: cb-train::build_query_info builds Vec<QueryInfo> (mirror TQueryInfo query.h:19-44) from Pool group_id/subgroup_id/pairs — contiguous-unique run assertion (GroupSamples query.h:48-67) -> typed CbError::Degenerate (no panic, T-06.3-01-01); explicit pairs -> group-local competitors (data_providers.cpp:315-340); cross-group/out-of-range pair -> CbError::OutOfRange (T-06.3-01-02); group weight = mean of members via sum_f64; 10 unit tests. Task2: cb-compute::calc_ders_for_queries grouped der seam (mirror CalcDersForQueries error_functions.h:831-841) — re-declared compute-tier GroupSpan/Competitor (NO cb-train dep, preserves layering); per-group slice + bounds-validate; group_reduce_weighted normalizer through sum_f64; empty group -> 0 (no divide, Security V5); every loss arm -> typed "not yet wired" OutOfRange (Plans 02-05 fill). Runtime::compute_gradients_grouped sibling trait method (host-side default impl, no kernel); pointwise compute_gradients signature BYTE-IDENTICAL (D-04 no-regression); 9 unit tests. Task3: OFFLINE gen_ranking_fixtures.py — frozen catboost 1.2.10 ranking corpus (5 varied groups [3,2,4,1,2]/12 objs + subgroup_id + explicit pairs), --inputs/--loss/--metric args, per-stage .npy, pinned thread_count=1/depth=2/iterations=5/leaf_estimation_iterations=1/Plain/seed; END-TO-END validated against .venv catboost 1.2.10 (corpus inputs + QueryRMSE smoke fixture frozen-committed); README documents shape+params+version+OFFLINE run cmd. Gates: query_info 10/10, ranking_der 9/9, cb-train lib 154/154 (no regression), wave2/wave3 oracles 5/5. NOTE: gsd-tools CLI absent on this machine -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-02 (QueryRMSE + QuerySoftMax der arms). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-01-SUMMARY.md.
@@ -302,4 +304,4 @@ Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
-Resume file: .planning/phases/06.4-score-functions-uncertainty-and-custom-objectives/06.4-CONTEXT.md
+Resume file: None

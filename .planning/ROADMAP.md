@@ -421,7 +421,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 06.4-02-PLAN.md — Wave B (LOSS-08): Loss::RmseWithUncertainty 2-dim diagonal loss on the 6.2 N-dim spine; training per-stage oracle ≤1e-5
+- [x] 06.4-02-PLAN.md — Wave B (LOSS-08): Loss::RmseWithUncertainty 2-dim diagonal loss on the 6.2 N-dim spine; training per-stage oracle ≤1e-5
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
