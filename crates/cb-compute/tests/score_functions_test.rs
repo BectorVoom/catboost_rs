@@ -198,9 +198,14 @@ fn sat_l2_weight_two_boundary_adjust_is_zero() {
 
 // ---------------------------------------------------------------------------
 // NewtonL2 — pointwise_scores.cu:504-510 reuses the L2 calcer VERBATIM.
-// The der2-vs-weight difference is the histogram FILL (the `sum_weight` slot is
-// fed the summed positive der2 hessian), exercised here by constructing the
-// der2-filled LeafStats directly: NewtonL2(stats) MUST equal L2(stats).
+//
+// SCOPE (WR-07): this test verifies only the score-FORMULA seam — that
+// `multi_dim_split_score` maps NewtonL2 to the SAME formula as L2. The der2-vs-
+// weight distinction lives entirely in the histogram FILL, which the CPU training
+// path does NOT produce; NewtonL2/NewtonCosine are therefore REJECTED at train
+// time by `cb_train::validate_score_function` (CR-01), and that rejection — not
+// this formula-identity assertion — is the guard against silent first-order
+// degradation. This assertion is true for ANY der2-filled stats by construction.
 // ---------------------------------------------------------------------------
 #[test]
 fn newton_l2_reuses_l2_formula_on_der2_filled_stats() {
@@ -233,7 +238,12 @@ fn newton_l2_reuses_l2_formula_on_der2_filled_stats() {
 
 // ---------------------------------------------------------------------------
 // NewtonCosine — pointwise_scores.cu:512-521 reuses the Cosine calcer VERBATIM.
-// NewtonCosine(stats) MUST equal Cosine(stats) on the same der2-filled stats.
+//
+// SCOPE (WR-07): like `newton_l2_reuses_l2_formula_on_der2_filled_stats`, this
+// only verifies the formula seam (NewtonCosine maps to the Cosine formula). The
+// second-order behavior depends on a der2 histogram fill the CPU path never
+// produces; `cb_train::validate_score_function` rejects NewtonCosine at train time
+// (CR-01). This assertion is true for ANY der2-filled stats by construction.
 // ---------------------------------------------------------------------------
 #[test]
 fn newton_cosine_reuses_cosine_formula_on_der2_filled_stats() {

@@ -18,6 +18,50 @@ use cb_compute::{
 };
 
 use super::{calc_pairwise_weights, compute_leaf_deltas, uses_pairwise_weights};
+use super::validate_score_function;
+use cb_compute::EScoreFunction;
+
+// WR-07 / CR-01: the second-order (Newton) split-score functions have no faithful
+// CPU training implementation (the CPU scoring path produces only the first-order
+// weight-count reduction, so they would silently degrade to L2 / Cosine). The
+// formula-identity self-oracles in `cb-compute` cannot catch that wiring gap; the
+// real guard is `validate_score_function`, which must REJECT them at train time.
+// These falsifiable regression catches flip if that gate is ever removed.
+#[test]
+fn validate_score_function_rejects_newton_l2() {
+    assert!(
+        validate_score_function(EScoreFunction::NewtonL2).is_err(),
+        "NewtonL2 must be rejected on the CPU training path (no der2-fill; would \
+         silently degrade to L2)"
+    );
+}
+
+#[test]
+fn validate_score_function_rejects_newton_cosine() {
+    assert!(
+        validate_score_function(EScoreFunction::NewtonCosine).is_err(),
+        "NewtonCosine must be rejected on the CPU training path (no der2-fill; would \
+         silently degrade to Cosine)"
+    );
+}
+
+#[test]
+fn validate_score_function_accepts_first_order_variants() {
+    // Cosine/L2 (shipped) plus the first-order GPU-only calcers (Solar/LOO/Sat),
+    // which compute correctly from the first-order stats, are accepted.
+    for sf in [
+        EScoreFunction::Cosine,
+        EScoreFunction::L2,
+        EScoreFunction::SolarL2,
+        EScoreFunction::LOOL2,
+        EScoreFunction::SatL2,
+    ] {
+        assert!(
+            validate_score_function(sf).is_ok(),
+            "first-order score function {sf:?} must be accepted on the CPU path"
+        );
+    }
+}
 
 /// Run the Exact-leaf branch of `compute_leaf_deltas` over a single leaf whose
 /// per-member residuals are exactly `residuals` (we feed `approx = 0`, `target =
