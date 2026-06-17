@@ -354,7 +354,7 @@ WARNINGs deferred (latent, not gap-blocking; tracked for 6.2 hardening / 6.3 pre
   2. Ranking metrics NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC each match upstream ≤1e-5.
   3. Randomized ranking losses (YetiRank/StochasticRank RNG streams) are validated against a C++-instrumented harness where no clean Python-reachable ground truth exists (D-07), under the disk-pressure feasibility constraint (D-08).
 
-**Plans**: 14 plans in 8 waves (5 original + 4 gap-closure 06–09 + 5 gap-closure 10–14 from the 7/9 re-verification; the round-2 gap-closure wave drives all three open truths to closure with the instrumented trainer build as the feasibility-first centerpiece)
+**Plans**: 18 plans in 11 waves (5 original + 4 gap-closure 06–09 + 5 gap-closure 10–14 + 4 gap-closure-round-3 15–18 from the 8/9 re-verification; round-3 lands the pairwise split-scorer subsystem that unblocks both *Pairwise losses + closes StochasticRank end-to-end + D-07 trainer-level)
 
 Plans:
 
@@ -391,6 +391,15 @@ Plans:
 - [x] 06.3-14-PLAN.md — Wave 3 (depends 10,12,13): GAP 2 / truth #5 — train + freeze YetiRank/YetiRankPairwise/StochasticRank model.json fixtures, remove absent-fixture invariants, wire full compare_stage ≤1e-5 gates + REVIEW WR-03 (YetiRank Gradient leaf eff_weights, branched on leaf method not group_spans) + GAP 3 / truth #7 trainer-half (CB_INSTRUMENT_LOG RNG draw log vs Rust sampler, D-07); autonomous: false; escalate-don't-weaken on NO-GO (LOSS-04)
 
 > Still deferred after this gap-closure round (out of scope — instrumented catboost trainer build): YetiRank/YetiRankPairwise/StochasticRank end-to-end TRAINER fixtures + ≤1e-5 trainer gates (truth #5); SC-3 / D-07 instrumented-harness RNG validation (truth #7). LOSS-04 stays partially open.
+
+**Wave 7 — gap closure round 3** *(from the 8/9 re-verification 06.3-VERIFICATION.md; THREE remaining gaps, all escalated un-weakened. The PairLogitPairwise + YetiRankPairwise gaps share ONE new subsystem — the pairwise SPLIT-scorer (TPairwiseScoreCalcer / CalculatePairwiseScore) — isolated precisely as a tree-0 split-selection divergence, NOT a leaf-der gap; StochasticRank's distinct per-group noise-seed model (randomSeed+group_index) closes in parallel. Plans 15 (library) → 16 (wire + PairLogitPairwise) → 17 (YetiRankPairwise) are sequential; plan 18 (StochasticRank) is independent/parallel.)*
+
+- [ ] 06.3-15-PLAN.md — Wave 1 (parallel with 18): pairwise SPLIT-scorer subsystem in cb-compute (compute_der_sums + compute_pair_weight_statistics + calculate_pairwise_score, OneFeature float path, reusing the in-house Cholesky leaf solver, all reductions via cb_core::sum_f64) — pure library, self-oracled bit-for-bit vs hand-derived references (LOSS-04)
+- [ ] 06.3-16-PLAN.md — Wave 2 (depends 15): GAP 1 / truth #4 — wire the pairwise scorer into tree.rs greedy search gated on is_pairwise_scoring (non-pairwise path byte-identical D-04), freeze the PairLogitPairwise fixture OFFLINE (catboost 1.2.10), REMOVE #[ignore] from pairlogit_pairwise_oracle_test.rs (full 4-stage ≤1e-5 gate); autonomous: false (LOSS-04)
+- [ ] 06.3-17-PLAN.md — Wave 3 (depends 16): GAP 2 / truth #5 — train + freeze the YetiRankPairwise fixture OFFLINE (RNG seed plumbing already closed; scorer from 16 supplies structure), activate the end-to-end present-fixture branch (4-stage ≤1e-5), fix latent REVIEW WR-01/WR-02 if the fixture unmasks them; autonomous: false (LOSS-04)
+- [ ] 06.3-18-PLAN.md — Wave 1 (parallel with 15-17, independent): GAP 3 / truth #5+#7 — StochasticRank per-group noise-seed (randomSeed+group_index) closure: instrumented-trainer feasibility probe → run the trainer for the StochasticRank corpus (explicit metric param) producing the per-tree noise log + model.json, activate the end-to-end present-fixture branch (4-stage ≤1e-5) + the trainer-level D-07 per-tree noise gate; autonomous: false; escalate-don't-weaken on toolchain NO-GO (LOSS-04)
+
+> After Wave 7: all three remaining LOSS-04 gaps (PairLogitPairwise, YetiRankPairwise, StochasticRank end-to-end + D-07) target closure; LOSS-05 already complete (18/18). The pairwise split-scorer (15) is the single subsystem unblocking both *Pairwise losses.
 
 ### Phase 6.4: Score Functions, Uncertainty & Custom Objectives
 
