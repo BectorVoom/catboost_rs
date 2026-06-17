@@ -56,7 +56,7 @@
 - [~] **LOSS-06**: Prediction types — Probability, LogProbability, Class, RawFormulaVal, Exponent, RMSEWithUncertainty, VirtEnsembles, TotalUncertainty (Plan 04-02: the five in-scope deterministic types — RawFormulaVal/Probability/LogProbability/Class/Exponent — are implemented and oracle-locked ≤1e-5; the uncertainty types RMSEWithUncertainty/VirtEnsembles/TotalUncertainty are deferred to Phase 6 per D-10)
 - [ ] **LOSS-07**: Custom objectives/metrics — Rust trait + Python callback bridge
 - [ ] **LOSS-08**: Uncertainty estimation — RMSEWithUncertainty, virtual ensembles
-- [ ] **LOSS-09**: Score functions — SolarL2, Cosine, NewtonL2, NewtonCosine, LOOL2, SatL2, L2
+- [x] **LOSS-09**: Score functions — SolarL2, Cosine, NewtonL2, NewtonCosine, LOOL2, SatL2, L2 (06.4-01: all 7 EScoreFunction variants implemented; Cosine/L2 shipped 05-19; the 5 GPU-only fns self-oracled vs hand-computed CUDA arithmetic per D-6.4-06 weakened-oracle — NOT a ≤1e-5-vs-upstream-CPU lock; Newton live-search der2 wiring deferred to Phase-7 GPU)
 
 ### Advanced Feature Types
 
@@ -171,7 +171,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | LOSS-05 | Phase 6.3 | Complete (06.3-05, Wave D): all 9 ranking metrics — NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC — land eval-only on the widened EvalMetric::eval_grouped seam (D-6.3-05; flat eval byte-identical D-04), shared compare_docs tie-break transcribed once, per-metric oracle ≤1e-5 vs catboost 1.2.10 (default + top=2; QueryAUC Ranking+Classic). |
 | LOSS-07 | Phase 6.4 | Pending (Rust trait; Python callback bridge → Phase 8 per D-09) |
 | LOSS-08 | Phase 6.4 | Pending |
-| LOSS-09 | Phase 6.4 | Pending |
+| LOSS-09 | Phase 6.4 | Complete (06.4-01; 5 GPU-only fns self-oracled per D-6.4-06) |
 | FEAT-01 | Phase 6.5 | Pending |
 | FEAT-02 | Phase 6.5 | Pending |
 | FEAT-03 | Phase 6.6 | Pending |

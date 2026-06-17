@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Phase 06.3 shipped — pushed to origin/main (ce21e20)
-stopped_at: Phase 6.4 context gathered
-last_updated: "2026-06-17T22:03:12.732Z"
-last_activity: 2026-06-17 -- Phase 06.4 planning complete
+status: executing
+stopped_at: Completed 06.4-01-PLAN.md (Wave-A score functions, LOSS-09)
+last_updated: "2026-06-17T22:13:48.000Z"
+last_activity: 2026-06-17 -- 06.4-01 COMPLETE (5 GPU-only score fns self-oracled)
 progress:
   total_phases: 14
   completed_phases: 8
-  total_plans: 69
-  completed_plans: 69
-  percent: 57
+  total_plans: 73
+  completed_plans: 70
+  percent: 58
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 06.3 — ranking-losses-and-metrics
+**Current focus:** Phase 06.4 — score-functions-uncertainty-and-custom-objectives
 
 ## Current Position
 
-Phase: 06.3 — COMPLETE
-Plan: 1 of 18
-Status: Phase 06.3 shipped — pushed to origin/main (ce21e20)
-Last activity: 2026-06-17 -- Phase 06.4 planning complete
+Phase: 06.4 (score-functions-uncertainty-and-custom-objectives) — EXECUTING
+Plan: 2 of 4 (06.4-01 Wave-A COMPLETE)
+Status: Executing Phase 06.4
+Last activity: 2026-06-17 -- 06.4-01 COMPLETE (Wave-A LOSS-09 score functions)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -113,6 +113,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.3 P13 | 40 | - tasks | - files |
 | Phase 06.3 P14 | ~35min | 3 tasks | 5 files |
 | Phase 06.3 P15 | ~25min | 2 tasks | 3 files |
+| Phase 06.4 P01 | ~8min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -120,6 +121,8 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [06.4-01 Wave-A LOSS-09 — 5 GPU-only score functions self-oracled, COMPLETE]: Added `EScoreFunction::{SolarL2,NewtonL2,NewtonCosine,LOOL2,SatL2}` (unit variants — `Copy+Eq+Default` retained, NO regression) + 5 `multi_dim_split_score` arms (`score.rs`). SolarL2/LOOL2/SatL2 are first-order per-leaf scalars transcribed verbatim from `score_calcers.cuh:22-24/83-87/114-117`, folded through `cb_core::sum_f64` (D-08; helpers `solar_l2_terms`/`loo_l2_terms`/`sat_l2_terms`). NewtonL2 reuses the L2 arm VERBATIM, NewtonCosine reuses the Cosine arm VERBATIM (`pointwise_scores.cu:504-521`) — the second-order distinction is the FILL, not the math. **NEW histogram primitive `reduce_leaf_stats_newton`** (`histogram.rs`, exported): `sum_weight` slot carries the summed POSITIVE hessian `Σ(-der2*weight)` (der2≤0 → negated, Pitfall 2); `LeafStats` struct UNCHANGED; reuses `reduce_leaf_der2` fold. `tree.rs::split_score` now dispatches all 7 variants (Cosine/L2 stay on the dedicated scalar calcers — byte-identical hot path; the 5 new route through the dim=1 multi-dim seam, D-6.4-03 single code path). **D-6.4-06 WEAKENED ORACLE (NON-NEGOTIABLE):** these 5 are GPU-only upstream (CPU rejects at `oblivious_tree_options.cpp:146`); NO upstream-CPU training ground truth → transcribe-then-self-oracle (Rust vs hand-computed CUDA arithmetic, ≤1e-12 machine-eps), NOT a ≤1e-5-vs-upstream lock; caveat stated verbatim in the test file doc-comment. **Scope decision:** live-search der2 threading for Newton* into the PLAIN boosting greedy-search is DEFERRED to the Phase-7 GPU path (these fns are unreachable/non-oracle-able on CPU; threading der2 through the der1/weight-only search chain would be untestable scaffolding risking the Cosine/L2 lock); the reusable Newton FILL primitive + 7-variant dispatch are shipped. Gates: cb-compute 133 lib (+2 newton) + 9 `score_functions_test` int; cb-train 194 lib + all oracles green (05-19 Task A L2-vs-Cosine split lock UNREGRESSED, Pitfall 3); clippy 0 indexing_slicing/unwrap_used; D-08 grep clean. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits 59657ea (RED) / 79cef4c (GREEN variants+arms) / d07ad66 (Newton fill + dispatch).
 
 - [06.3-15 pairwise split-scorer ENABLER — LOSS-04 Rule-4 piece lands as a pure cb-compute library]: The SPLIT-SELECTION divergence the 06.3-13/14 verification isolated (PairLogitPairwise + YetiRankPairwise defer because `IsPairwiseScoring` losses score candidate splits through `TPairwiseScoreCalcer`/`CalculatePairwiseScore`, NOT the pointwise der histogram) now has its primitive in `crates/cb-compute/src/pairwise_scoring.rs`: `compute_der_sums` (ComputeDerSums, pairwise_scoring.h:52-68), `compute_pair_weight_statistics` (ComputePairWeightStatistics, h:72-103, OneFeature), `calculate_pairwise_score` (CalculatePairwiseScore + CalculateScore + UpdateWeightSumFromTotal/NonDiagStats, cpp:51-232), and `BucketPairWeightStatistics`. **cb-compute-LOCAL leaf-solve twin (not a cb-train dependency):** crate layering forbids cb-compute→cb-train, so a local `calculate_pairwise_leaf_values` (2×2 closed form + general (n-1)×(n-1) Cholesky + diag/nonDiag reg + MakeZeroAverage) reuses the SAME `crate::pairwise_cholesky_solve` that `cb_train::calculate_pairwise_leaf_values` calls → identical leaf path, NO new crate. **Rule-2 deviation:** the three public fns return `CbResult` (the artifact table showed bare returns) to honor the T-06.3-15-01 bounds-guard mitigation — a malformed leaf/bucket/doc index from the trainer trust boundary surfaces `CbError::OutOfRange`, never a panic; 06.3-16/17 will `?`-propagate. **Rule-1 deviation:** `add`→`merge` rename (clippy::should_implement_trait). Self-oracled: der-sums + pair-weight stats hand-derived BIT-FOR-BIT (both winnerBucket≷loserBucket branches + winner==loser skip); `calculate_pairwise_score` vs an INDEPENDENT Gaussian-elimination reference solver (different algorithm than the production Cholesky) ≤1e-9; degenerate single-leaf 2×2 closed-form re-derivation (finite 0.0, never NaN — T-06.3-15-02). All reductions via `cb_core::sum_f64` (D-08); only the documented upstream-order scatter cells use raw `+=`/`-=`. Library-ONLY: NO tree-search wiring (06.3-16), NO fixture frozen, NO tolerance touched. Gates: cb-compute lib 131/131 (124 baseline + 7 new), 0 indexing_slicing/unwrap_used in the new file, no new crate in Cargo.toml, `cargo check --workspace --tests` GREEN. LOSS-04 truths #5 (end-to-end trainer fixtures) / #7 (SC-3 instrumented harness) STILL DEFERRED — unchanged by this library-only plan. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits 03ae077 (Task1) / 653e083 (Task2). Symbol names match the plan's artifact contract exactly so 06.3-16/17 key_links resolve.
 

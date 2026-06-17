@@ -417,7 +417,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 06.4-01-PLAN.md — Wave A (LOSS-09): 5 score functions (SolarL2/NewtonL2/NewtonCosine/LOOL2/SatL2) extend EScoreFunction; transcribe-then-self-oracle (GPU-only upstream, weakened-oracle caveat D-6.4-06)
+- [x] 06.4-01-PLAN.md — Wave A (LOSS-09): 5 score functions (SolarL2/NewtonL2/NewtonCosine/LOOL2/SatL2) extend EScoreFunction; transcribe-then-self-oracle (GPU-only upstream, weakened-oracle caveat D-6.4-06) — COMPLETE 2026-06-17 (3 tasks, 6 files; self-oracle ≤1e-12; Cosine/L2 lock unregressed; Newton live-search der2 deferred to Phase-7 GPU)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
