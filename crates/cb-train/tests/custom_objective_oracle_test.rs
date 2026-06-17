@@ -104,11 +104,14 @@ fn cross_entropy_target() -> Vec<f64> {
     standardize(&load_y()).iter().map(|&z| sigmoid(z)).collect()
 }
 
-/// The cross_entropy fixture's training config (depth 2, 5 iters, lr 0.1,
-/// l2 3.0, no sampling, `boost_from_average=false`, Newton/1-iter leaf — the
-/// custom-objective default). Mirrors `loss_oracle_test::base_params`, but with
-/// the leaf method pinned to Newton (the LOSS-07 custom default; CrossEntropy's
-/// upstream default leaf is Newton).
+/// The cross_entropy fixture's EXACT training config (depth 2, 5 iters, lr 0.1,
+/// l2 3.0, no sampling, `boost_from_average=false`,
+/// `leaf_estimation_method=Gradient` / `leaf_estimation_iterations=1` per the
+/// committed `config.json`). The leaf method is pinned to Gradient to MATCH the
+/// frozen fixture — the self-oracle reproduces the EXISTING per-stage oracle, so
+/// the training config must be identical (the custom path's own Newton default
+/// is a separate concern, exercised only when the caller does not pin a leaf
+/// method). Mirrors `loss_oracle_test::base_params`.
 fn base_params(loss: Loss) -> BoostParams {
     BoostParams {
         loss,
@@ -118,7 +121,7 @@ fn base_params(loss: Loss) -> BoostParams {
         l2_leaf_reg: 3.0,
         random_strength: 0.0,
         boost_from_average: false,
-        leaf_method: LeafMethod::Newton,
+        leaf_method: LeafMethod::Gradient,
         bootstrap_type: EBootstrapType::No,
         subsample: 1.0,
         bagging_temperature: 0.0,

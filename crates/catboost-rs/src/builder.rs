@@ -15,8 +15,12 @@
 //! (carrying `leaf_weights` + `float_feature_borders`) wrapped in the facade
 //! [`crate::Model`].
 
+use std::sync::Arc;
+
 use cb_backend::CpuBackend;
-use cb_compute::{LeafMethod, Loss};
+use cb_compute::{
+    CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, LeafMethod, Loss,
+};
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
@@ -24,7 +28,7 @@ use cb_train::{
     max_ctr_complexity_default,
     one_hot_max_size_default, permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, BoostParams, EBootstrapType,
-    EOverfittingDetectorType,
+    EOverfittingDetectorType, EvalMetric,
 };
 
 use crate::error::CatBoostError;
@@ -51,6 +55,10 @@ use crate::model::Model;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatBoostBuilder {
     loss: Loss,
+    /// Optional explicit eval metric (LOSS-07). `None` derives it from `loss`
+    /// (`EvalMetric::for_loss`); a `Some(EvalMetric::Custom(..))` is set via
+    /// [`CatBoostBuilder::custom_metric`].
+    eval_metric: Option<EvalMetric>,
     iterations: usize,
     depth: usize,
     learning_rate: f64,
@@ -80,6 +88,7 @@ impl CatBoostBuilder {
     pub fn new() -> Self {
         Self {
             loss: Loss::Rmse,
+            eval_metric: None,
             iterations: 1000,
             depth: 6,
             learning_rate: 0.03,
@@ -101,6 +110,27 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn loss(mut self, loss: Loss) -> Self {
         self.loss = loss;
+        self
+    }
+
+    /// Select a user-supplied custom training objective (LOSS-07, D-6.4-05). The
+    /// `Arc<dyn CustomObjective>` is plugged into the SAME loss dispatch the
+    /// built-ins ride via [`Loss::Custom`]; its per-object `(der1, der2)` from
+    /// `calc_ders_range` drive leaf estimation. The Phase-8 PyO3 callback bridge
+    /// (D-09) wraps the SAME trait through this surface — no `pyo3` here.
+    #[must_use]
+    pub fn custom_objective(mut self, objective: Arc<dyn CustomObjective>) -> Self {
+        self.loss = Loss::Custom(CustomObjectiveHandle::new(objective));
+        self
+    }
+
+    /// Select a user-supplied custom evaluation metric (LOSS-07, D-6.4-05),
+    /// plugged into the SAME [`cb_train::EvalMetric`] dispatch via
+    /// [`EvalMetric::Custom`]. The Phase-8 PyO3 callback (D-09) wraps the SAME
+    /// [`cb_compute::CustomMetric`] trait through this setter.
+    #[must_use]
+    pub fn custom_metric(mut self, metric: Arc<dyn CustomMetric>) -> Self {
+        self.eval_metric = Some(EvalMetric::Custom(CustomMetricHandle::new(metric)));
         self
     }
 
@@ -228,7 +258,9 @@ impl CatBoostBuilder {
             od_pval: 0.0,
             od_wait: 0,
             use_best_model: false,
-            eval_metric: None,
+            // Custom eval metric (LOSS-07) when set via `custom_metric`; else the
+            // train loop derives it from the loss (`EvalMetric::for_loss`).
+            eval_metric: self.eval_metric.clone(),
             // Pinned to the upstream default (cat_feature_options.cpp:231-232);
             // the facade does not yet surface categorical config, and the
             // numeric-only train path never exercises the one-hot branch.
