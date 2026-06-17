@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: "Gap-closure round 2 planned to drive all 3 open truths (#4 PairLogit leaf-der2, #5 YetiRank/StochasticRank trainer fixtures, #7 D-07 RNG) to closure. DISK NOW 67 GB FREE (71%) — no longer the link-failure regime; operator chose ATTEMPT THE FULL INSTRUMENTED TRAINER BUILD. Plans 10 (build centerpiece+checkpoint), 11+12 (trainer-independent, parallel), 13 (PairLogit), 14 (YetiRank/StochasticRank+WR-03+RNG). Escalate-don't-weaken (D-6.3-03b) on build NO-GO."
-stopped_at: "06.3-03 COMPLETE (commits 9b2606d Task1 / b25a2be Task2 / bef767d Task3) — LOSS-04 Wave B. LambdaMart (listwise) ships end-to-end per-stage ≤1e-5 vs catboost 1.2.10; PairLogit/PairLogitPairwise der + the Cholesky pairwise-leaf path + is_pairwise_scoring routing LAND and are unit-tested green, with the PairLogit/PairLogitPairwise per-stage ORACLE DEFERRED on a precisely-isolated pair-weight normalization gap (deferred-items.md — NO #[ignore]/NO weakened tolerance). Task1: Loss::{PairLogit,PairLogitPairwise,LambdaMart{metric,sigma,top,norm}}+LambdaMartMetric, pairlogit_pair_prob/lambdamart_pair_grad primitives, wired PairLogit (Competitors scatter-der, inline exp) + LambdaMart (NDCG per-pair lambda grad) arms, is_pairwise_scoring/is_plain_only, exhaustive Loss arms across cb-backend+cb-train+3 test files. Task2: pairwise_leaves.rs Cholesky solve (2×2 + general via REUSED cb_compute::pairwise_cholesky_solve + diag/nonDiag reg + MakeZeroAverage), BIT-EXACT vs pairwise_leaves_calculation_ut.cpp. Task3: boosting THIRD leaf branch (is_pairwise_scoring), LambdaMart oracle GREEN — unlocked by the RULE-1 newton_leaf_delta fix (divide verbatim for NEGATIVE denominators; listwise positive hessian; only exact-zero guarded; regression losses unaffected). Gates: cb-compute 113/113, pairwise_leaves 6/6, lambdamart_oracle 1/1, full cb-train suite green (QueryRMSE/QuerySoftMax + D-04 no-regression), cargo check --workspace --tests GREEN. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-04 (YetiRank + StochasticRank, Wave C instrumented) + the PairLogit oracle follow-up. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-03-SUMMARY.md."
-last_updated: "2026-06-17T03:14:14.205Z"
-last_activity: 2026-06-17 -- 06.3 gap-closure round 2 PLANNED (06.3-10..14, 5 plans / 3 waves)
+status: executing
+stopped_at: "06.3-10 Task1 COMPLETE + Task2 GO recorded — AWAITING blocking-human GO sign-off (commits dae8bff Task1 driver / 472922c STATUS+README). The instrumented catboost 1.2.10 _catboost.so trainer BUILT, LINKED, runs, and emits CB_INSTRUMENT_LOG: a sudo-free re-runnable driver (crates/cb-oracle/generator/build_instrumented_trainer.sh, 287 lines) does disk-gate(>=25GB; now 67GB free)->clang-18/lld-18 restore (apt-get download + dpkg -x into /tmp/clang18_prefix)->idempotent env-gated patch of 4 trainer TUs (per-leaf der1/der2 in approx_calcer_querywise.cpp + leaf-weight in approx_calcer.cpp + YetiRank Gumbel in yetirank_helpers.cpp + StochasticRank noise in error_functions.cpp; no-op when CB_INSTRUMENT_LOG unset)->build_native.py --targets _catboost against .venv Py3.13. RC=0 after 3 RULE-1/RULE-3 auto-fixes (toolchain hardcodes bare clang/clang++ -> prefix symlinks; awk -v mangled '\\n' -> fputc(10); perl \\\" mangled JSON -> R\"J(...)J\" raw literals). Smoke CatBoostRanker(YetiRank).fit() wrote 58KB JSONL: 264 leaf_der + 1080 yeti_gumbel events fire. instrumented_trainer_STATUS.md records GO with artifact paths (/tmp/cb_build313/instr_pkg/catboost/_catboost.so, 39.7MB; /tmp/clang18_prefix). Vendored catboost-master/ patches stay UNCOMMITTED (OFFLINE/RUN-ONCE, D-09/D-12). GO UNBLOCKS plans 06.3-13 (PairLogit per-leaf SumDer2 oracle) + 06.3-14 (YetiRank/StochasticRank end-to-end per-stage fixtures). NO oracle weakened, NO fixture fabricated. gsd-tools CLI ABSENT -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-10-SUMMARY.md."
+last_updated: "2026-06-17T13:10:00.000Z"
+last_activity: 2026-06-17 -- 06.3-10 instrumented trainer built (GO), awaiting human sign-off
 progress:
   total_phases: 14
   completed_phases: 7
-  total_plans: 60
-  completed_plans: 59
-  percent: 52
+  total_plans: 65
+  completed_plans: 60
+  percent: 50
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING (gap-closure round 2 PLANNED)
-Plan: 9 of 14 complete; plans 10–14 (gap-closure round 2) PLANNED, ready to execute
-Status: Gap-closure round 2 planned to drive all 3 open truths (#4 PairLogit leaf-der2, #5 YetiRank/StochasticRank trainer fixtures, #7 D-07 RNG) to closure. DISK NOW 67 GB FREE (71%) — no longer the link-failure regime; operator chose ATTEMPT THE FULL INSTRUMENTED TRAINER BUILD. Plans 10 (build centerpiece+checkpoint), 11+12 (trainer-independent, parallel), 13 (PairLogit), 14 (YetiRank/StochasticRank+WR-03+RNG). Escalate-don't-weaken (D-6.3-03b) on build NO-GO.
-Last activity: 2026-06-17 -- 06.3 gap-closure round 2 PLANNED (06.3-10..14, 5 plans / 3 waves)
+Phase: 06.3 (ranking-losses-and-metrics) — EXECUTING
+Plan: 1 of 14
+Status: Executing Phase 06.3
+Last activity: 2026-06-17 -- Phase 06.3 execution started
 
 Progress: [##############] Phase 6.3 gap-closure wave: 06.3-06/07/08/09 COMPLETE (7 of 14 top-level phases complete)
 
