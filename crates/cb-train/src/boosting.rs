@@ -2718,19 +2718,52 @@ fn train_inner<R: Runtime>(
                 let der1_d = weighted_der1.get(base..base + n).unwrap_or(&[]);
                 let der2_d = ders.der2.get(base..base + n).unwrap_or(&[]);
                 let approx_d = approx.get(base..base + n).unwrap_or(&[]);
-                // LEAF-VALUE weights: the pointwise estimator re-weights the
-                // per-object `der2` (Newton) / `sum_weight` (Gradient) by this
-                // vector. For a GROUPED ranking der the `der1`/`der2` ALREADY fold
-                // the pair weight (`competitor.weight`) inside the per-group der —
-                // upstream Newton (`AddDerDer2`) consumes `der.Der1/der.Der2`
-                // verbatim with NO extra weight (`approx_calcer_helpers.h`) — so the
-                // grouped path passes UNIT weights here (re-weighting would
-                // double-count, the der2 analogue of CR-02 06.3-07). The pairwise
-                // `sumWeight` (`eff_weights`) only enters `scaled_l2` above. For the
-                // pointwise path this is the per-object `weights` (byte-identical, D-04).
+                // LEAF-VALUE weights (REVIEW WR-03 / T-06.3-14): the pointwise
+                // estimator re-weights the per-object `der2` (Newton) / `sum_weight`
+                // (Gradient) by this vector. The correct grouped-path weight depends
+                // on the LEAF METHOD, NOT uniformly on `group_spans.is_some()`:
+                //
+                //   * NEWTON leaf (`SumDer / (-SumDer2 + scaledL2)`): the der1/der2
+                //     ALREADY fold the pair weight (`competitor.weight`) inside the
+                //     per-group der — upstream Newton (`AddDerDer2`) consumes
+                //     `der.Der1/der.Der2` verbatim with NO extra weight
+                //     (`approx_calcer_helpers.h`). Re-weighting would double-count
+                //     (the der2 analogue of CR-02 06.3-07) → UNIT weights.
+                //
+                //   * GRADIENT leaf (`CalcAverage(SumDer, SumWeights, scaledL2)`):
+                //     upstream `UsesPairsForCalculation` makes the leaf `sumWeight`
+                //     the PAIRWISE weight `bt.PairwiseWeights` (= Σ competitor.weight
+                //     incident on the object), NOT the doc count
+                //     (`approx_calcer.cpp:444`, `CalcLeafValues`). YetiRank
+                //     (non-Pairwise) rides this Gradient leaf, so its denominator
+                //     `sumWeight + scaledL2` must use `eff_weights` (the pairwise
+                //     sumWeight) — otherwise the doc-count `sumWeight` mixes
+                //     inconsistently with the pairwise-weight-scaled `scaled_l2`
+                //     built above (REVIEW WR-03).
+                //
+                // For the POINTWISE path (`group_spans.is_none()`) `eff_weights` IS
+                // the per-object `weights` (byte-identical, D-04). The deciding
+                // predicate is `uses_pairwise_weights(loss) && method == Gradient`:
+                // only a pairwise-weight loss on the Gradient leaf needs the pairwise
+                // sumWeight; every other grouped case (e.g. LambdaMart/QueryRMSE
+                // Newton) keeps unit/per-object weights.
                 let unit_weights: Vec<f64> = vec![1.0; n];
-                let leaf_weights_for_deltas: &[f64] =
-                    if group_spans.is_some() { &unit_weights } else { &eff_weights };
+                let grouped_gradient_pairwise = group_spans.is_some()
+                    && matches!(params.leaf_method, LeafMethod::Gradient)
+                    && uses_pairwise_weights(&params.loss);
+                let leaf_weights_for_deltas: &[f64] = if group_spans.is_some() {
+                    if grouped_gradient_pairwise {
+                        // YetiRank Gradient leaf: pairwise sumWeight (bt.PairwiseWeights).
+                        &eff_weights
+                    } else {
+                        // Newton (or non-pairwise grouped) leaf: der already folds the
+                        // pair weight → unit weights (no double-count).
+                        &unit_weights
+                    }
+                } else {
+                    // Pointwise path: per-object weights (eff_weights == weights, D-04).
+                    &eff_weights
+                };
                 let leaf_deltas = compute_leaf_deltas(
                     params.leaf_method,
                     &params.loss,
