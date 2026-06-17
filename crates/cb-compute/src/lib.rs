@@ -18,6 +18,7 @@
 //! `cb_core::sum_f64` in canonical object order. The backend kernels do ONLY
 //! order-independent elementwise work; the order-sensitive reduction lives here.
 
+mod custom;
 mod histogram;
 mod leaf;
 mod loss;
@@ -26,6 +27,9 @@ mod ranking_der;
 mod runtime;
 mod score;
 
+pub use custom::{
+    CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle,
+};
 pub use histogram::{
     collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, reduce_leaf_stats_newton,
     LeafStats,

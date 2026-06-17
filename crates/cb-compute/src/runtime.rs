@@ -25,6 +25,8 @@
 
 use cb_core::CbResult;
 
+use crate::custom::CustomObjectiveHandle;
+
 /// The numeric element type a runtime computes over. A pure marker bound so
 /// `cb-compute` can stay generic without naming any backend's float trait
 /// (`cubecl::Float`); the backend maps its concrete element types onto this.
@@ -476,6 +478,18 @@ pub enum Loss {
         /// [`Loss::validate`].
         num_estimations: u32,
     },
+    /// Custom user objective (LOSS-07, D-6.4-05): a user-supplied
+    /// [`crate::CustomObjective`] trait object (per-object `(der1, der2)`,
+    /// mirroring the Python `calc_ders_range`) plugged into the ONE
+    /// `compute_gradients` dispatch via the [`CustomObjectiveHandle`] `Arc<dyn>`
+    /// newtype (the workspace's first trait-object loss variant). `Loss`'s
+    /// `#[derive(Debug, Clone, PartialEq)]` still compiles because the handle
+    /// implements all three manually (`Arc::ptr_eq` identity equality;
+    /// 06.4-RESEARCH Strand 3 / Pitfall 7). The custom der buffer is consumed by
+    /// the loss-agnostic leaf/tree pipeline unchanged; the default leaf method is
+    /// Newton/1-iter (der2 is provided). The Phase-8 PyO3 callback (D-09) wraps
+    /// the SAME trait — no `pyo3` dependency is added here.
+    Custom(CustomObjectiveHandle),
 }
 
 /// The target ranking metric a [`Loss::StochasticRank`] Monte-Carlo gradient
@@ -791,6 +805,12 @@ impl Loss {
             | Self::RmseWithUncertainty
             | Self::QueryRmse
             | Self::PairLogit
+            // Custom (LOSS-07): the user objective is an opaque trait object —
+            // there are no variant-level hyperparameters for `validate` to range-
+            // check. Any der-domain precondition is the implementor's; the
+            // consumer (`compute_gradients`) rejects non-finite ders at runtime
+            // (T-06.4D-02). Nothing to reject here.
+            | Self::Custom(_)
             | Self::PairLogitPairwise => {}
         }
         Ok(())
