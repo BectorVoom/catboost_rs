@@ -110,7 +110,10 @@ fn train_scenario(
         | Loss::LambdaMart { .. }
         | Loss::YetiRank { .. }
         | Loss::YetiRankPairwise { .. }
-        | Loss::StochasticRank { .. } => load_regression_target(),
+        | Loss::StochasticRank { .. }
+        // Custom (LOSS-07) is not exercised by this scalar oracle; map to the
+        // regression-target arm to keep the match exhaustive (never constructed here).
+        | Loss::Custom(_) => load_regression_target(),
         Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => load_binclf_target(),
     };
 

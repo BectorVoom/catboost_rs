@@ -703,7 +703,11 @@ const fn autolr_target_type(loss: &Loss) -> TargetType {
         // Unknown; the ranking fixtures pin an explicit learning_rate.
         | Loss::YetiRank { .. }
         | Loss::YetiRankPairwise { .. }
-        | Loss::StochasticRank { .. } => TargetType::Unknown,
+        | Loss::StochasticRank { .. }
+        // Custom (LOSS-07): a user objective is not in the upstream auto-LR
+        // coefficient table -> Unknown (no rate guessed). The custom path defaults
+        // to an explicit learning_rate; auto-LR never fires for it.
+        | Loss::Custom(_) => TargetType::Unknown,
     }
 }
 
@@ -2353,8 +2357,12 @@ fn train_inner<R: Runtime>(
     // (RMSE / Logloss, weighted, multi-set) lives in `crate::metrics`; it defaults
     // to the objective and may be overridden via `params.eval_metric`.
     let has_test = !eval_sets.is_empty();
+    // `EvalMetric` is no longer `Copy` (LOSS-07 — the `Custom` variant carries a
+    // non-`Copy` `Arc`); clone out of the borrowed `params` (cheap — an `Arc`
+    // refcount bump for `Custom`, a bitwise copy otherwise).
     let eval_metric = params
         .eval_metric
+        .clone()
         .unwrap_or_else(|| EvalMetric::for_loss(&params.loss));
     let mut detector =
         OverfittingDetector::new(params.od_type, params.od_pval, params.od_wait, has_test)?;

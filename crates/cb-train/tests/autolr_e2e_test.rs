@@ -184,7 +184,10 @@ fn run_autolr_e2e(
         | Loss::LambdaMart { .. }
         | Loss::YetiRank { .. }
         | Loss::YetiRankPairwise { .. }
-        | Loss::StochasticRank { .. } => TargetType::Unknown,
+        | Loss::StochasticRank { .. }
+        // Custom (LOSS-07) is not in the auto-LR table and not exercised here;
+        // map to Unknown to keep the match exhaustive.
+        | Loss::Custom(_) => TargetType::Unknown,
     };
     let guessed = autolr_guess(target_type, false, boost_from_average, target.len(), iterations)
         .expect("auto-LR guess");

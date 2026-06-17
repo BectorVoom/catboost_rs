@@ -31,7 +31,7 @@
 //! (T-03-06-01, deny-lints). No raw float summation exists in this module — every
 //! fold is the sanctioned `cb_core::sum_f64`.
 
-use cb_compute::{sigmoid, Loss};
+use cb_compute::{sigmoid, CustomMetricHandle, Loss};
 use cb_core::{sum_f64, CbError, CbResult};
 
 use crate::ranking_metrics::{
@@ -51,7 +51,16 @@ use crate::ranking_metrics::{
 /// [`EvalMetric::eval_grouped`] (group seam, D-6.3-05); they are eval-only (no
 /// derivative). `Eq` is NOT derived because the ranking variants carry `f64`
 /// params (`border`/`decay`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `Copy` is intentionally NOT derived (LOSS-07, 06.4-RESEARCH Pitfall 7): the
+/// [`EvalMetric::Custom`] variant carries a [`CustomMetricHandle`] (`Arc<dyn>`),
+/// and `Arc` is not `Copy`. `Copy` was dropped HERE in a one-time mechanical
+/// refactor (mirroring the 6.2 `Loss` Copy-drop) — the by-value `self` methods
+/// (`eval` / `eval_grouped` / `eval_one_group` / `empty_metric_default`) became
+/// `&self`; the call sites that matched `*self` now match `self` by reference.
+/// `Clone` is retained and cheap (an `Arc` refcount bump for `Custom`, a bitwise
+/// copy for every other variant).
+#[derive(Debug, Clone, PartialEq)]
 pub enum EvalMetric {
     /// Root-mean-square error: `sqrt(sum_w (pred-target)^2 / sum_w)`.
     Rmse,
@@ -131,6 +140,14 @@ pub enum EvalMetric {
         /// Singleclass AUC type (`Classic` default).
         auc_type: AucType,
     },
+    /// Custom user metric (LOSS-07, D-6.4-05): a user-supplied
+    /// [`cb_compute::CustomMetric`] trait object (`evaluate` / `get_final_error`
+    /// / `is_max_optimal`, mirroring the Python `CustomMetric` callback) plugged
+    /// into the ONE [`EvalMetric::eval`] dispatch via the [`CustomMetricHandle`]
+    /// `Arc<dyn>` newtype. Carrying a non-`Copy` `Arc` is why `EvalMetric` drops
+    /// `Copy` (06.4-RESEARCH Pitfall 7). The Phase-8 PyO3 callback (D-09) wraps
+    /// the SAME trait — no `pyo3` dependency is added here.
+    Custom(CustomMetricHandle),
 }
 
 impl EvalMetric {
@@ -202,6 +219,12 @@ impl EvalMetric {
             | Loss::YetiRank { .. }
             | Loss::YetiRankPairwise { .. }
             | Loss::StochasticRank { .. } => Self::Rmse,
+            // Custom objective (LOSS-07): with no explicit `eval_metric` we cannot
+            // auto-derive a `CustomMetric` from an opaque objective, so default to
+            // the parity-neutral RMSE eval surface (the same default the other
+            // non-classification arms use). A user wanting a custom eval surface
+            // sets `eval_metric = EvalMetric::Custom(..)` explicitly.
+            Loss::Custom(_) => Self::Rmse,
             // The binary-classification family (Logloss / CrossEntropy / Focal)
             // reports the Logloss eval metric by default.
             Loss::Logloss | Loss::CrossEntropy | Loss::Focal { .. } => Self::Logloss,
@@ -218,7 +241,7 @@ impl EvalMetric {
     /// # Errors
     /// - [`CbError::Degenerate`] if `approx`/`target` lengths disagree, the eval
     ///   set is empty, or the total weight is `<= 0` (T-03-06-01 — no div-by-zero).
-    pub fn eval(self, approx: &[f64], target: &[f64], weights: &[f64]) -> CbResult<f64> {
+    pub fn eval(&self, approx: &[f64], target: &[f64], weights: &[f64]) -> CbResult<f64> {
         if approx.len() != target.len() {
             return Err(CbError::Degenerate(
                 "eval metric: approx/target length mismatch".to_owned(),
@@ -306,6 +329,24 @@ impl EvalMetric {
                 }
                 Ok(sum_f64(&weighted_sq) / total_weight)
             }
+            // Custom user metric (LOSS-07, D-6.4-05): the user trait accumulates
+            // `(error_sum, weight_sum)` via `evaluate`, then `get_final_error`
+            // reduces them (e.g. `error / weight`). The trait owns its own folding
+            // (it may, like the built-ins, route through a stable order); the
+            // result is REJECTED if non-finite (T-06.4D-02 — a NaN/Inf metric must
+            // not reach the overfitting-detector gate). No `unwrap`/`panic`
+            // (T-06.4D-01) — the trait returns a typed `CbError`.
+            Self::Custom(handle) => {
+                let (error, weight) = handle.0.evaluate(approx, target, weights)?;
+                let value = handle.0.get_final_error(error, weight);
+                if !value.is_finite() {
+                    return Err(CbError::Degenerate(format!(
+                        "custom eval metric produced a non-finite value: {value} \
+                         (error={error}, weight={weight})"
+                    )));
+                }
+                Ok(value)
+            }
             // The ranking metrics are per-query-group quantities — they are
             // evaluated through `eval_grouped` (D-6.3-05), never the flat path.
             // Selecting one here is a misuse, surfaced as a typed error (never a
@@ -349,7 +390,7 @@ impl EvalMetric {
     ///   disagree, the eval set is empty, `group_id` is non-contiguous, or a
     ///   non-ranking metric is selected.
     pub fn eval_grouped(
-        self,
+        &self,
         approx: &[f64],
         target: &[f64],
         weights: &[f64],
@@ -439,26 +480,32 @@ impl EvalMetric {
 
     /// The per-group metric value for ONE group's approx/target slice (no
     /// weighting — the caller applies the group weight).
-    fn eval_one_group(self, approx: &[f64], target: &[f64]) -> CbResult<f64> {
+    fn eval_one_group(&self, approx: &[f64], target: &[f64]) -> CbResult<f64> {
+        // Matched by reference (`&self`, the Copy-drop ripple of LOSS-07): the
+        // `Custom` variant carries a non-`Copy` `Arc`, so `self` cannot be matched
+        // by value. The ranking arms bind their `Copy` params by reference and
+        // dereference at the call site (byte-identical to the pre-LOSS-07
+        // by-value path; D-04 no-regression).
         Ok(match self {
             Self::Ndcg {
                 top,
                 dcg_type,
                 denominator,
-            } => ndcg_group(approx, target, top, dcg_type, denominator),
+            } => ndcg_group(approx, target, *top, *dcg_type, *denominator),
             Self::Dcg {
                 top,
                 dcg_type,
                 denominator,
-            } => dcg_group(approx, target, top, dcg_type, denominator),
-            Self::Map { top, border } => map_at_group(approx, target, top, border),
-            Self::Mrr { top, border } => mrr_group(approx, target, top, border),
-            Self::Err { top } => err_group(approx, target, top),
-            Self::PFound { top, decay } => pfound_group(approx, target, top, decay),
-            Self::PrecisionAt { top, border } => precision_at_group(approx, target, top, border),
-            Self::RecallAt { top, border } => recall_at_group(approx, target, top, border),
-            Self::QueryAuc { auc_type } => query_auc_group(approx, target, auc_type),
-            Self::Rmse | Self::Logloss | Self::Msle => {
+            } => dcg_group(approx, target, *top, *dcg_type, *denominator),
+            Self::Map { top, border } => map_at_group(approx, target, *top, *border),
+            Self::Mrr { top, border } => mrr_group(approx, target, *top, *border),
+            Self::Err { top } => err_group(approx, target, *top),
+            Self::PFound { top, decay } => pfound_group(approx, target, *top, *decay),
+            Self::PrecisionAt { top, border } => precision_at_group(approx, target, *top, *border),
+            Self::RecallAt { top, border } => recall_at_group(approx, target, *top, *border),
+            Self::QueryAuc { auc_type } => query_auc_group(approx, target, *auc_type),
+            // Custom is a FLAT metric (the `eval` path), never the grouped seam.
+            Self::Rmse | Self::Logloss | Self::Msle | Self::Custom(_) => {
                 return Err(CbError::Degenerate(
                     "non-ranking metric passed to the grouped seam (use eval)".to_owned(),
                 ))
@@ -468,7 +515,7 @@ impl EvalMetric {
 
     /// The empty-eval-set default per metric (`GetFinalError` with `Stats[1]==0`):
     /// Precision/Recall return `1`, every other ranking metric returns `0`.
-    fn empty_metric_default(self) -> f64 {
+    fn empty_metric_default(&self) -> f64 {
         match self {
             Self::PrecisionAt { .. } | Self::RecallAt { .. } => 1.0,
             _ => 0.0,

@@ -16,7 +16,9 @@
 
 use cubecl::prelude::*;
 
-use cb_compute::{Derivatives, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA};
+use cb_compute::{
+    CustomObjectiveHandle, Derivatives, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+};
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
@@ -621,6 +623,15 @@ fn compute_gradients_one_dim(
              scalar path"
                 .to_owned(),
         )),
+        // Custom (LOSS-07) is dispatched in `compute_gradients` BEFORE the
+        // per-dimension scalar loop (the user trait fills `(der1, der2)` directly
+        // via `calc_ders_range`). It never enters this single-dimension scalar
+        // dispatch; reject defensively (typed CbError, no `unwrap`/panic).
+        Loss::Custom(_) => Err(CbError::Degenerate(
+            "custom objective is dispatched in compute_gradients, not the \
+             single-dimension scalar path"
+                .to_owned(),
+        )),
     }
 }
 
@@ -793,6 +804,45 @@ fn compute_rmse_uncertainty_gradients(
     (der1, der2)
 }
 
+/// Compute the per-object `(der1, der2)` for a user [`CustomObjectiveHandle`]
+/// (LOSS-07, D-6.4-05) by calling its `calc_ders_range` over the scalar
+/// (`approx_dimension == 1`) `approx`/`target`, then SPLITTING the `(der1, der2)`
+/// tuples into the two parallel buffers the rest of the pipeline consumes.
+///
+/// Unit per-object weights are passed (the empty `weights` slice == all `1.0`,
+/// the upstream convention); the document weight is folded into the leaf
+/// reduction downstream, like the OneVsAll / RMSEWithUncertainty arms.
+///
+/// Every produced der is checked FINITE (T-06.4D-02 — Tampering: a user
+/// objective returning NaN/Inf must surface a typed `CbError`, never silently
+/// poison leaf values). No `unwrap`/`panic`/indexing — a typed `CbError` on any
+/// failure (T-06.4D-01).
+fn compute_custom_gradients(
+    handle: &CustomObjectiveHandle,
+    approx: &[f64],
+    target: &[f64],
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
+    let n = approx.len();
+    let mut ders = vec![(0.0_f64, 0.0_f64); n];
+    // Empty weights == uniform 1.0 (upstream convention). The user objective
+    // returns a typed CbError on any precondition violation (no panic).
+    handle.0.calc_ders_range(approx, target, &[], &mut ders)?;
+
+    let mut der1 = Vec::with_capacity(n);
+    let mut der2 = Vec::with_capacity(n);
+    for (i, &(d1, d2)) in ders.iter().enumerate() {
+        if !d1.is_finite() || !d2.is_finite() {
+            return Err(CbError::Degenerate(format!(
+                "custom objective produced a non-finite derivative at object {i}: \
+                 der1={d1}, der2={d2}"
+            )));
+        }
+        der1.push(d1);
+        der2.push(d2);
+    }
+    Ok((der1, der2))
+}
+
 /// Compute the MultiQuantile SEPARABLE per-dimension der1/der2 over the
 /// dimension-major `approx` buffer (D-6.2-05). MultiQuantile is `K` INDEPENDENT
 /// [`Loss::Quantile`] dimensions: each dimension `d` reuses the SAME parametric
@@ -940,6 +990,23 @@ impl Runtime for CpuBackend {
             // per-dim scalar Newton leaf path (NOT the MultiClass dense solve).
             Loss::RmseWithUncertainty => {
                 let (der1, der2) = compute_rmse_uncertainty_gradients(approx, target, n);
+                return Ok(Derivatives { der1, der2 });
+            }
+            // Custom user objective (LOSS-07, D-6.4-05): the user trait fills the
+            // per-object `(der1, der2)` directly via `calc_ders_range` (the SAME
+            // one-code-path dispatch the built-ins ride, D-6.2-03). This is a
+            // CPU-side trait call (user Rust, no kernel). Scalar (per-object)
+            // only in this phase — `approx_dimension == 1`. Non-finite ders are
+            // REJECTED before they reach leaf estimation (T-06.4D-02 — Tampering:
+            // a NaN/Inf der from a user objective must not poison leaf values).
+            Loss::Custom(handle) => {
+                if approx_dimension != 1 {
+                    return Err(CbError::Degenerate(format!(
+                        "custom objective supports approx_dimension == 1 only, got \
+                         {approx_dimension}"
+                    )));
+                }
+                let (der1, der2) = compute_custom_gradients(handle, approx, target)?;
                 return Ok(Derivatives { der1, der2 });
             }
             _ => {}
