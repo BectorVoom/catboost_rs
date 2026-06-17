@@ -51,19 +51,21 @@ fn load_noise_ground_truth(rel: &str) -> Vec<f64> {
 
 /// LIVE RNG-draw oracle: the Rust `cb_core::std_normal` stream (the SAME the
 /// StochasticRank der consumes) must reproduce the instrumented ground-truth
-/// Gaussian noise draws EXACTLY (<= 1e-5). The generator's smallest unit is one
-/// group, 3 docs, num_estimations=1, group-0 seed = random_seed(5) + 0; the noise
-/// is one std_normal per doc in ascending order.
+/// Gaussian noise draws EXACTLY (<= 1e-5). The generator's unit is one group,
+/// num_estimations=1, group-0 seed = random_seed(5) + 0; the noise is one
+/// std_normal per doc in ascending order. The draw COUNT is derived from the
+/// frozen ground truth (now a non-masking mu!=0 / 5-doc unit per T-06.3-12 WR-05),
+/// not hardcoded, so it stays correct across fixture regenerations.
 #[test]
 fn stochasticrank_rng_draw_log_oracle() {
     let gt_rel = "ranking_corpus/stochasticrank/stochasticrank_rng_groundtruth.jsonl";
-    let count = 3_usize;
     let group_seed = 5_u64; // random_seed 5 + group_index 0.
+
+    let expected = load_noise_ground_truth(gt_rel);
+    let count = expected.len();
 
     let mut rng = TFastRng64::from_seed(group_seed);
     let got: Vec<f64> = (0..count).map(|_| std_normal(&mut rng)).collect();
-
-    let expected = load_noise_ground_truth(gt_rel);
     assert_eq!(
         got.len(),
         expected.len(),
