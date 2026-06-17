@@ -2182,9 +2182,11 @@ fn train_inner<R: Runtime>(
             // spans covering all `n` objects in order, so concatenating their
             // der1/der2 in group order reproduces the object-order flat buffer the
             // pointwise path emits (approx_dimension == 1 for the Wave-A querywise
-            // losses). The querywise der is ALREADY weighted (the weight is folded
-            // into der1/der2 upstream), matching the pointwise `der1 * weight`
-            // applied below at the uniform-weight fixtures.
+            // losses). The querywise der is ALREADY weighted (the per-object weight
+            // is folded into der1/der2 INSIDE the per-group derivative function), so
+            // the `weighted_der1` computation below uses this buffer AS-IS for the
+            // grouped path — re-multiplying by `weights[i]` would double-weight the
+            // gradient (CR-02, 06.3-07). The pointwise branch applies `der1 * weight`.
             let per_group =
                 runtime.compute_gradients_grouped(&params.loss, &approx, target, &weights, spans, params.random_seed)?;
             let mut der1 = Vec::with_capacity(n);
@@ -2208,23 +2210,47 @@ fn train_inner<R: Runtime>(
             runtime.compute_gradients(&params.loss, &approx, target, approx_dimension)?
         };
 
-        // Weighted gradient contribution per object: der1 * weight (the
-        // histogram-scatter elementwise product; the host reduces it ordered).
-        // DIMENSION-MAJOR: `ders.der1` is length `approx_dimension * n`; each
-        // dimension's slice `der1[d*n + i]` is weighted by the per-OBJECT weight
-        // `weights[i]` (weights are per-object, shared across dimensions). At
-        // `approx_dimension == 1` the index `d*n + i` collapses to `i`, so this
-        // is exactly `der1.iter().zip(weights)` — byte-identical (Pitfall 1).
-        let weighted_der1: Vec<f64> = ders
-            .der1
-            .iter()
-            .enumerate()
-            .map(|(idx, &d)| {
-                let i = idx % n;
-                let w = weights.get(i).copied().unwrap_or(1.0);
-                d * w
-            })
-            .collect();
+        // Weighted gradient contribution per object (the histogram-scatter
+        // elementwise product; the host reduces it ordered). The weight handling
+        // branches on whether this iteration routed the GROUPED (ranking) der seam
+        // (`group_spans.is_some()`) or the pointwise per-object kernel (CR-02,
+        // 06.3-07):
+        //
+        //   * GROUPED ranking ders (QueryRMSE, QuerySoftMax, and any future
+        //     querywise loss) ALREADY fold the per-object weight INSIDE the
+        //     per-group derivative function — QueryRMSE returns
+        //     `der1 = (target - approx - query_avrg) * weight`
+        //     (loss.rs queryrmse_der), QuerySoftMax returns
+        //     `der1 = beta * (-sumWTargets * p + weight * target)`
+        //     (loss.rs querysoftmax_der, where the softmax probability `p` also
+        //     carries the weight in its numerator). Re-multiplying by `weights[i]`
+        //     here would DOUBLE-WEIGHT the gradient (squared weights → corrupt
+        //     split scores and leaf values). So the grouped path uses `ders.der1`
+        //     as-is. At the uniform-weight (w=1.0) oracle fixtures this is
+        //     numerically identical to `der1 * 1.0`, which is why the bug was
+        //     invisible there; non-uniform weights expose it
+        //     (grouped_weight_regression_test).
+        //
+        //   * POINTWISE losses do NOT pre-weight their der, so the per-object
+        //     weight is applied HERE. DIMENSION-MAJOR: `ders.der1` is length
+        //     `approx_dimension * n`; each dimension's slice `der1[d*n + i]` is
+        //     weighted by the per-OBJECT weight `weights[i]` (weights are
+        //     per-object, shared across dimensions). At `approx_dimension == 1`
+        //     the index `d*n + i` collapses to `i`, so this is exactly
+        //     `der1.iter().zip(weights)` — byte-identical (Pitfall 1, D-04).
+        let weighted_der1: Vec<f64> = if group_spans.is_some() {
+            ders.der1.clone()
+        } else {
+            ders.der1
+                .iter()
+                .enumerate()
+                .map(|(idx, &d)| {
+                    let i = idx % n;
+                    let w = weights.get(i).copied().unwrap_or(1.0);
+                    d * w
+                })
+                .collect()
+        };
 
         // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211): keep the RNG
         //     phase-aligned with upstream before the per-tree Bootstrap.
