@@ -741,3 +741,138 @@ fn lambdamart_ideal_ndcg_trivial_windows() {
     let want = super::ndcg_numerator(5.0) / super::ndcg_denominator(0);
     assert!((single - want).abs() < 1e-15);
 }
+
+// ---------------------------------------------------------------------------
+// WR-02 (06.3-11): the cum_sum / cum_sum_up / cum_sum_low prefix reads inside
+// calc_dcg_metric_diff must be bounds-checked (.get(..).copied().unwrap_or(0.0)),
+// matching the pos_weights.get(..) discipline the CR-01 fix already uses two lines
+// above (CLAUDE.md unchecked-index ban; T-06.3-11). The cum_sum* arrays are
+// length count+1, so the conversion is numerically IDENTICAL for the present
+// caller — these tests lock that the .get() form introduces no off-by-one and no
+// numeric change.
+// ---------------------------------------------------------------------------
+
+/// Build the cum_sum / cum_sum_up / cum_sum_low prefix arrays exactly as
+/// `stochastic_rank_group_der` does, from a normalized `pos_weights` vector and a
+/// document `order`. Returns `(cum_sum, cum_sum_up, cum_sum_low)`.
+fn build_dcg_prefix_arrays(
+    targets: &[f64],
+    order: &[usize],
+    pos_weights: &[f64],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let count = targets.len();
+    let mut cum_sum = vec![0.0_f64; count + 1];
+    let mut cum_sum_up = vec![0.0_f64; count + 1];
+    let mut cum_sum_low = vec![0.0_f64; count + 1];
+    for pos in 0..count {
+        let doc_id = order[pos];
+        let gain = super::ndcg_numerator(targets[doc_id]);
+        cum_sum[pos + 1] = cum_sum[pos] + gain * pos_weights[pos];
+        if pos + 1 < count {
+            cum_sum_low[pos + 1] = cum_sum_low[pos] + gain * pos_weights[pos + 1];
+        }
+        if pos > 0 {
+            cum_sum_up[pos + 1] = cum_sum_up[pos] + gain * pos_weights[pos - 1];
+        }
+    }
+    cum_sum_low[count] = cum_sum_low[count - 1];
+    (cum_sum, cum_sum_up, cum_sum_low)
+}
+
+/// Boundary case `new_pos + 1 == count`: the `new_pos > old_pos` arm reads
+/// `cum_sum[new_pos + 1]` / `cum_sum_up[new_pos + 1]` at the LAST in-range index
+/// (`count`). The bounds-checked `.get()` form must return the exact same f64 the
+/// raw subscript does — no off-by-one at the prefix-array tail.
+#[test]
+fn calc_dcg_metric_diff_boundary_new_pos_plus_one_eq_count() {
+    let targets = [3.0_f64, 2.0, 1.0];
+    let query_top_size = targets.len();
+    let pos_weights = super::compute_dcg_pos_weights(&targets, query_top_size, true);
+    let order = [1_usize, 0, 2];
+    let (cum_sum, cum_sum_up, cum_sum_low) =
+        build_dcg_prefix_arrays(&targets, &order, &pos_weights);
+
+    // old_pos=0, new_pos=2 -> new_pos+1 == count (3): the tail index of cum_sum/up.
+    let old_pos = 0_usize;
+    let new_pos = 2_usize;
+    assert_eq!(new_pos + 1, targets.len(), "fixture must hit the tail index");
+
+    let got = super::calc_dcg_metric_diff(
+        old_pos,
+        new_pos,
+        &targets,
+        &order,
+        &pos_weights,
+        &cum_sum,
+        &cum_sum_up,
+        &cum_sum_low,
+    );
+
+    // Independent reference computed with explicit in-range subscripts.
+    let doc_gain = super::ndcg_numerator(targets[order[old_pos]]);
+    let doc_diff = doc_gain * (pos_weights[new_pos] - pos_weights[old_pos]);
+    let old_mid = cum_sum[new_pos + 1] - cum_sum[old_pos + 1];
+    let new_mid = cum_sum_up[new_pos + 1] - cum_sum_up[old_pos + 1];
+    let want = doc_diff + (new_mid - old_mid);
+    assert!(
+        (got - want).abs() < 1e-15,
+        "boundary new_pos+1==count must be numerically identical: got={got}, want={want}"
+    );
+}
+
+/// Graded-relevance NDCG group (`ideal_dcg != 1.0`) exercising BOTH metric-diff
+/// arms (`new_pos < old_pos` reads cum_sum / cum_sum_low; `new_pos > old_pos`
+/// reads cum_sum / cum_sum_up). The bounds-checked prefix reads must produce the
+/// identical metric diff for every (old_pos, new_pos) pair vs an explicit
+/// subscript reference — proving the WR-02 conversion is numerically a no-op.
+#[test]
+fn calc_dcg_metric_diff_graded_relevance_identical_both_arms() {
+    let targets = [3.0_f64, 1.0, 2.0, 0.0];
+    let query_top_size = targets.len();
+    let pos_weights = super::compute_dcg_pos_weights(&targets, query_top_size, true);
+    // ideal_dcg != 1.0 guard.
+    let raw = super::compute_dcg_pos_weights(&targets, query_top_size, false);
+    assert!(
+        (raw[0] / pos_weights[0] - 1.0).abs() > 0.5,
+        "fixture must have ideal_dcg clearly != 1.0"
+    );
+    let order = [0_usize, 2, 1, 3];
+    let (cum_sum, cum_sum_up, cum_sum_low) =
+        build_dcg_prefix_arrays(&targets, &order, &pos_weights);
+
+    let count = targets.len();
+    for old_pos in 0..count {
+        for new_pos in 0..count {
+            if new_pos == old_pos {
+                continue;
+            }
+            let got = super::calc_dcg_metric_diff(
+                old_pos,
+                new_pos,
+                &targets,
+                &order,
+                &pos_weights,
+                &cum_sum,
+                &cum_sum_up,
+                &cum_sum_low,
+            );
+            // Explicit-subscript reference (the pre-WR-02 access form).
+            let doc_gain = super::ndcg_numerator(targets[order[old_pos]]);
+            let doc_diff = doc_gain * (pos_weights[new_pos] - pos_weights[old_pos]);
+            let mid_diff = if new_pos < old_pos {
+                let old_mid = cum_sum[old_pos] - cum_sum[new_pos];
+                let new_mid = cum_sum_low[old_pos] - cum_sum_low[new_pos];
+                new_mid - old_mid
+            } else {
+                let old_mid = cum_sum[new_pos + 1] - cum_sum[old_pos + 1];
+                let new_mid = cum_sum_up[new_pos + 1] - cum_sum_up[old_pos + 1];
+                new_mid - old_mid
+            };
+            let want = doc_diff + mid_diff;
+            assert!(
+                (got - want).abs() < 1e-15,
+                "old_pos={old_pos} new_pos={new_pos}: got={got}, want={want}"
+            );
+        }
+    }
+}

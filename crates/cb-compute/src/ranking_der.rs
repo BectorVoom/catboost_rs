@@ -899,13 +899,23 @@ fn calc_dcg_metric_diff(
     let old_weight = pos_weights.get(old_pos).copied().unwrap_or(0.0);
     let new_weight = pos_weights.get(new_pos).copied().unwrap_or(0.0);
     let doc_diff = doc_gain * (new_weight - old_weight);
+    // Bounds-checked prefix-sum reads (CLAUDE.md unchecked-index ban; T-06.3-11,
+    // WR-02). cum_sum/cum_sum_up/cum_sum_low are length count+1, so every index
+    // below is in-range for the present caller — the .get() form yields IDENTICAL
+    // values, matching the pos_weights.get(..) discipline used two lines above and
+    // removing the latent panic if a future top/query_top_size change desyncs the
+    // index range.
     let mid_diff = if new_pos < old_pos {
-        let old_mid = cum_sum[old_pos] - cum_sum[new_pos];
-        let new_mid = cum_sum_low[old_pos] - cum_sum_low[new_pos];
+        let old_mid = cum_sum.get(old_pos).copied().unwrap_or(0.0)
+            - cum_sum.get(new_pos).copied().unwrap_or(0.0);
+        let new_mid = cum_sum_low.get(old_pos).copied().unwrap_or(0.0)
+            - cum_sum_low.get(new_pos).copied().unwrap_or(0.0);
         new_mid - old_mid
     } else {
-        let old_mid = cum_sum[new_pos + 1] - cum_sum[old_pos + 1];
-        let new_mid = cum_sum_up[new_pos + 1] - cum_sum_up[old_pos + 1];
+        let old_mid = cum_sum.get(new_pos + 1).copied().unwrap_or(0.0)
+            - cum_sum.get(old_pos + 1).copied().unwrap_or(0.0);
+        let new_mid = cum_sum_up.get(new_pos + 1).copied().unwrap_or(0.0)
+            - cum_sum_up.get(old_pos + 1).copied().unwrap_or(0.0);
         new_mid - old_mid
     };
     doc_diff + mid_diff
