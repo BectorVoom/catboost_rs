@@ -740,11 +740,14 @@ fn stochastic_rank_group_der(
         // noise[d] = StdNormalDistribution(rng); scores[d] = shifted[d] + Sigma·noise[d]
         // (error_functions.cpp:1043-1046). The std_normal draw order IS the parity
         // contract — a different sampler desyncs every subsequent draw.
+        // Bounds-checked fill (CLAUDE.md unchecked-index ban; T-06.3-11). zip over
+        // (&shifted, &mut noise, &mut scores) so every write lands in a valid slot
+        // and shifted[d] is read in-range — bit-identical to the indexed loop.
         let mut noise = vec![0.0_f64; count];
         let mut scores = vec![0.0_f64; count];
-        for d in 0..count {
-            noise[d] = std_normal(&mut rng);
-            scores[d] = shifted[d] + sigma_param * noise[d];
+        for ((sh, n), sc) in shifted.iter().zip(noise.iter_mut()).zip(scores.iter_mut()) {
+            *n = std_normal(&mut rng);
+            *sc = sh + sigma_param * *n;
         }
         // noiseSum = Σ noise (sum_f64, doc-ascending — D-08).
         let noise_sum = sum_f64(&noise);
@@ -757,25 +760,38 @@ fn stochastic_rank_group_der(
         let mut cum_sum = vec![0.0_f64; count + 1];
         let mut cum_sum_up = vec![0.0_f64; count + 1];
         let mut cum_sum_low = vec![0.0_f64; count + 1];
+        // Bounds-checked prefix-sum build (CLAUDE.md unchecked-index ban;
+        // T-06.3-11). Reads via .get(..).unwrap_or(0.0), writes via get_mut guards.
+        // All indices are in-range for the present caller — bit-identical values.
         for pos in 0..count {
-            let doc_id = order[pos];
+            let doc_id = order.get(pos).copied().unwrap_or(0);
             let gain = ndcg_numerator(target_slice.get(doc_id).copied().unwrap_or(0.0));
-            cum_sum[pos + 1] = cum_sum[pos] + gain * pos_weights.get(pos).copied().unwrap_or(0.0);
+            let prev = cum_sum.get(pos).copied().unwrap_or(0.0);
+            if let Some(slot) = cum_sum.get_mut(pos + 1) {
+                *slot = prev + gain * pos_weights.get(pos).copied().unwrap_or(0.0);
+            }
             if pos + 1 < count {
-                cum_sum_low[pos + 1] =
-                    cum_sum_low[pos] + gain * pos_weights.get(pos + 1).copied().unwrap_or(0.0);
+                let prev_low = cum_sum_low.get(pos).copied().unwrap_or(0.0);
+                if let Some(slot) = cum_sum_low.get_mut(pos + 1) {
+                    *slot = prev_low + gain * pos_weights.get(pos + 1).copied().unwrap_or(0.0);
+                }
             }
             if pos > 0 {
-                cum_sum_up[pos + 1] =
-                    cum_sum_up[pos] + gain * pos_weights.get(pos - 1).copied().unwrap_or(0.0);
+                let prev_up = cum_sum_up.get(pos).copied().unwrap_or(0.0);
+                if let Some(slot) = cum_sum_up.get_mut(pos + 1) {
+                    *slot = prev_up + gain * pos_weights.get(pos - 1).copied().unwrap_or(0.0);
+                }
             }
         }
-        cum_sum_low[count] = cum_sum_low[count - 1];
+        let last_low = cum_sum_low.get(count.saturating_sub(1)).copied().unwrap_or(0.0);
+        if let Some(slot) = cum_sum_low.get_mut(count) {
+            *slot = last_low;
+        }
 
         // Per-position der accumulation (error_functions.cpp:1161-1220).
         for pos in 0..count {
-            let doc_id = order[pos];
-            let score = scores[doc_id];
+            let doc_id = order.get(pos).copied().unwrap_or(0);
+            let score = scores.get(doc_id).copied().unwrap_or(0.0);
             let approx = approx_slice.get(doc_id).copied().unwrap_or(0.0);
             // mean = approx + (noiseSum - (score - approx)) / (count - 1)  (non-FilteredDCG).
             let mean = approx + (noise_sum - (score - approx)) / (count as f64 - 1.0);
@@ -799,38 +815,35 @@ fn stochastic_rank_group_der(
                     &cum_sum_up,
                     &cum_sum_low,
                 );
-                // densityDiff (error_functions.cpp:1144-1155).
+                // densityDiff (error_functions.cpp:1144-1155). `score_at(p)` reads
+                // scores[order[p]] bounds-checked (CLAUDE.md unchecked-index ban;
+                // T-06.3-11) — in-range for the present caller, bit-identical.
+                let score_at = |p: usize| -> f64 {
+                    scores
+                        .get(order.get(p).copied().unwrap_or(0))
+                        .copied()
+                        .unwrap_or(0.0)
+                };
                 let density_diff = if new_pos == 0 {
-                    normal_density(scores[order[0]], mean, sigma)
+                    normal_density(score_at(0), mean, sigma)
                 } else if new_pos + 1 == count.min(query_top_size + 1) {
                     if new_pos < pos {
-                        -normal_density(scores[order[query_top_size - 1]], mean, sigma)
+                        -normal_density(score_at(query_top_size - 1), mean, sigma)
                     } else {
-                        -normal_density(
-                            scores[order[query_top_size.min(count - 1)]],
-                            mean,
-                            sigma,
-                        )
+                        -normal_density(score_at(query_top_size.min(count - 1)), mean, sigma)
                     }
                 } else if new_pos < pos {
-                    normal_density_diff(
-                        scores[order[new_pos]],
-                        scores[order[new_pos - 1]],
-                        mean,
-                        sigma,
-                    )
+                    normal_density_diff(score_at(new_pos), score_at(new_pos - 1), mean, sigma)
                 } else {
-                    normal_density_diff(
-                        scores[order[new_pos + 1]],
-                        scores[order[new_pos]],
-                        mean,
-                        sigma,
-                    )
+                    normal_density_diff(score_at(new_pos + 1), score_at(new_pos), mean, sigma)
                 };
                 der_sum += metric_diff * density_diff;
             }
             // ders[docId].Der1 += derSum / NumEstimations (error_functions.cpp:1219).
-            der1[doc_id] += der_sum / num_est as f64;
+            // Bounds-checked write (CLAUDE.md unchecked-index ban; T-06.3-11).
+            if let Some(slot) = der1.get_mut(doc_id) {
+                *slot += der_sum / num_est as f64;
+            }
         }
     }
 
@@ -850,13 +863,20 @@ fn stochastic_rank_group_der(
         // approxesNormSqr = (sqrt(Σ z²) + Nu)² (error_functions.cpp:1095).
         let approxes_norm_sqr = (sum_f64(&sq).sqrt() + crate::runtime::STOCHASTIC_RANK_NU_DEFAULT)
             .powi(2);
-        let dots: Vec<f64> = (0..count).map(|d| der1[d] * zero_mean[d]).collect();
+        // Bounds-checked dot + projection (CLAUDE.md unchecked-index ban;
+        // T-06.3-11). der1 and zero_mean are both length count — the zip is
+        // bit-identical to the indexed loop, in canonical doc-ascending order (D-08).
+        let dots: Vec<f64> = der1
+            .iter()
+            .zip(zero_mean.iter())
+            .map(|(&d1, &z)| d1 * z)
+            .collect();
         let dot = sum_f64(&dots);
         if approxes_norm_sqr > 0.0 {
             // k = Lambda · dot / approxesNormSqr (Lambda default 1.0 for DCG/NDCG).
             let k = crate::runtime::STOCHASTIC_RANK_LAMBDA_DEFAULT * dot / approxes_norm_sqr;
-            for d in 0..count {
-                der1[d] -= k * zero_mean[d];
+            for (d1, &z) in der1.iter_mut().zip(zero_mean.iter()) {
+                *d1 -= k * z;
             }
         }
     }
