@@ -444,7 +444,37 @@ Plans:
   3. Embedding calcers LDA, KNN produce upstream-matching encodings ≤1e-5.
   4. Text/embedding columns flow through the `Pool` (DATA-01) → calcer → quantized features into the existing tree path; calcer internals get C++ instrumentation where Python-reachable ground truth is thin (D-07).
 
-**Plans**: TBD
+**Plans**: 7 plans in 7 waves (strict tokenizer-first ladder — D-01 GATE blocks every calcer; narrowest-first per RESEARCH: tokenizer/dictionary → BoW → NaiveBayes+BM25 → LDA (spike-led) → KNN (spike-led, highest risk) → SC-4 integration; embedding plans 05/06 are `autonomous: false`, each opens with an instrumented-GT spike that drives the f32-LAPACK / HNSW reproduction decision from real divergence numbers, any external linear-algebra crate gated behind `checkpoint:human-verify`, escalate-don't-weaken on infeasible ≤1e-5)
+
+Plans:
+
+**Wave 1**
+
+- [ ] 06.5-01-PLAN.md — Wave 0: re-provision + rebuild the instrumented catboost 1.2.10 trainer with text/embedding CB_INSTRUMENT_LOG hooks (token stream / dict ids / TText / calcer encodings / online order / LDA projection / KNN neighbors, D-07) + single-thread per-stage fixture corpora for all 5 calcers + the tokenizer D-01 corpus (autonomous: false)
+
+**Wave 2** *(blocked on 06.5-01 — D-01 GATE)*
+
+- [ ] 06.5-02-PLAN.md — Tokenizer + frequency dictionary + digitizer + TText (SC-1 load-bearing gate): ByDelimiter split/lowercase, deterministic (count DESC, token ASC) dictionary build, sorted-RLE TText, bit-exact vs the instrumented D-07 dump — every calcer blocks on this
+
+**Wave 3** *(blocked on 06.5-02)*
+
+- [ ] 06.5-03-PLAN.md — BoW (target-independent, simplest slice) + the SC-4 estimated-feature integration seam (estimated floats → existing borders/quantize/tree); BoW per-stage oracle ≤1e-5 (FEAT-01)
+
+**Wave 4** *(blocked on 06.5-03)*
+
+- [ ] 06.5-04-PLAN.md — NaiveBayes + BM25 (shared online-text seam, D-03 read-before-update prefix over the TFold learn permutation); per-stage + per-prefix oracles ≤1e-5 — completes FEAT-01 text calcers / SC-2
+
+**Wave 5** *(blocked on 06.5-04; autonomous: false — LDA landmine A1)*
+
+- [ ] 06.5-05-PLAN.md — LDA (first embedding calcer): instrumented-GT projection SPIKE → eigensolver decision (hand-roll f32 vs LAPACK crate behind checkpoint:human-verify vs documented tolerance) → LinearDA calcer + online-embedding prefix; LDA per-stage + projection oracle ≤1e-5 or human-signed-off tolerance (FEAT-02)
+
+**Wave 6** *(blocked on 06.5-05; autonomous: false — KNN landmine A2, highest risk)*
+
+- [ ] 06.5-06-PLAN.md — KNN (last/highest-risk): instrumented per-query neighbor-id SPIKE → exact online_hnsw hand-port vs brute-force-exact L2 (NEVER a third-party HNSW crate) → neighbor-vote calcer; KNN per-stage + neighbor-id oracle ≤1e-5 or human-signed-off tolerance — completes FEAT-02 / SC-3
+
+**Wave 7** *(blocked on 06.5-04 + 06.5-06)*
+
+- [ ] 06.5-07-PLAN.md — SC-4 integration: mixed text+embedding pool flows Pool → calcers (online per-fold) → estimated floats → existing quantize → tree in one trained model; end-to-end per-stage oracle ≤1e-5 (no-text/no-embedding path byte-identical) — FEAT-01 + FEAT-02 terminal hard gate
 
 ### Phase 6.6: Advanced Features & Non-Symmetric Trees
 
