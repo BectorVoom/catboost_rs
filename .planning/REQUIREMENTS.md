@@ -179,12 +179,12 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | FEAT-05 | Phase 6.6 | Complete |
 | FEAT-06 | Phase 6.6 | Complete |
 | MODEL-05 | Phase 6.6 | Complete |
-| GPU-01 | Phase 7 | Pending |
-| GPU-02 | Phase 7 | Pending |
-| GPU-03 | Phase 7 | Pending |
-| GPU-04 | Phase 7 | Pending |
-| GPU-05 | Phase 7 | Pending |
-| GPU-06 | Phase 7 | Pending |
+| GPU-01 | Phase 7.1–7.5 | Pending (scan/reductions 7.1, grad/hess 7.2, pointwise hist 7.3, pairwise hist 7.4, on-device loop close 7.5) |
+| GPU-02 | Phase 7.1 | Pending |
+| GPU-03 | Phase 7.6 | Pending (incremental rocm validation each sub-phase; formal gate + sign-off 7.6) |
+| GPU-04 | Phase 7.1 | Pending |
+| GPU-05 | Phase 7.1 | Pending |
+| GPU-06 | Phase 7.6 | Pending |
 | PYAPI-01 | Phase 8 | Pending |
 | PYAPI-02 | Phase 8 | Pending |
 | PYAPI-03 | Phase 8 | Pending |

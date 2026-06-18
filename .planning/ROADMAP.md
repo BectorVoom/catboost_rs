@@ -25,7 +25,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8) (completed 2026-06-18)
   - [x] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first (SC-2 BM25 per-stage CLOSED via 06.5-09 PATH-A fixture-correctness fix)
   - [x] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine (completed 2026-06-18)
-- [ ] **Phase 7: GPU Backends via CubeCL** - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, documented GPU tolerance
+- [ ] **Phase 7: GPU Backends via CubeCL** (umbrella — split into 7.1–7.6) - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, full structural parity with `catboost/cuda/`, documented GPU tolerance
+  - [ ] **Phase 7.1: GPU Backend Runtime & Device Primitives** - GPU-02/04/05 + GPU-01 scan/reductions; cfg-gated `SelectedRuntime`, device memory, wave-agnostic scan/reduction primitives
+  - [ ] **Phase 7.2: On-Device Gradient/Hessian & Targets** - GPU-01 grad/hess; port `targets/` derivative computation device-resident
+  - [ ] **Phase 7.3: Pointwise Histogram Family** - GPU-01 hist; `pointwise_hist2_*` incl. 5/6/7/8-bit, half-byte, binary variants
+  - [ ] **Phase 7.4: Pairwise Histogram Family** - GPU-01 hist; `pairwise_hist_*` incl. 8-bit atomics and one-hot variants
+  - [ ] **Phase 7.5: Score/Split Selection & On-Device Tree-Grow Loop** - GPU-01 close; score calcers + split selection + full device-resident grow loop (D-05)
+  - [ ] **Phase 7.6: GPU Tolerance, rocm Validation & Sign-off** - GPU-03/06; empirical epsilon vs Rust CPU path, rocm oracle gate, user sign-off
 - [ ] **Phase 8: Python Bindings, Dual API & Packaging** - PyO3 dual sklearn + CatBoost-native API, NumPy/Pandas/Arrow/Polars input, per-backend wheels
 
 ## Phase Details
@@ -534,22 +540,109 @@ Plans:
 
 - [x] 06.6-09-PLAN.md — Close CR-02 sentinel mismatch: leaf_wise_grower finalization inits node_id_to_leaf_id to u32::MAX (interior sentinel) + checked u16::try_from step-node diffs (CR-01); NEW cb-model oracle test trains a non-symmetric model via the Rust grower → save_cbm → load_cbm → predict ≤1e-5 (FEAT-06 / SC-3 grower→save→load→predict complete) — **COMPLETE** (f19d98a fix / f079142 test): tree.rs:1143 `vec![u32::MAX; node_count]` + explicit interior-arm sentinel; step diffs via `u16::try_from(...) -> CbError::OutOfRange` (no new variant). New `non_symmetric_grower_roundtrip_oracle_test` (cb-model dev-deps += cb-backend/cb-compute) green: grower→from_trained→save_cbm→load_cbm→predict_raw ≤1e-5. Non-regression: cb-train grower SPLITS oracle (1), cb-train lib (228), cb-model non_symmetric_oracle_test (3) all green. **SC-3 / FEAT-06 grower→save→load→predict CLOSED.** gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY.
 
-### Phase 7: GPU Backends via CubeCL
+### Phase 7: GPU Backends via CubeCL (umbrella — split into 7.1–7.6)
 
-**Goal**: GPU training runs on the `rocm`/`wgpu`/`cuda` backends purely additively on the locked generic boundary, within a documented and signed-off GPU tolerance versus the Rust CPU path.
+**Goal**: GPU training runs on the `rocm`/`wgpu`/`cuda` backends purely additively on the locked generic boundary, at **full structural parity** with the upstream `catboost/cuda/` engine (D-01/D-02), within a documented and signed-off GPU tolerance versus the Rust CPU path.
 **Mode:** mvp
 **Depends on**: Phase 6 (6.1–6.6)
-**Requirements**: GPU-01, GPU-02, GPU-03, GPU-04, GPU-05, GPU-06
+**Requirements**: GPU-01, GPU-02, GPU-03, GPU-04, GPU-05, GPU-06 — delegated to sub-phases 7.1–7.6.
+**Structure**: Split into six additive sub-phases per `07-CONTEXT.md` D-08 (narrowest-first, mirroring 6.1–6.6). The all-maximal fidelity choices (structural parity D-01, pointwise+pairwise D-02, CUDA-atomic reductions D-03, full on-device loop D-05) amount to porting essentially CatBoost's entire CUDA training engine — far larger than a single phase. Each sub-phase has its own discuss→plan→execute→verify cycle and its own rocm oracle gate. **This umbrella entry is not planned directly — plan the sub-phases 7.1–7.6.**
+**Success Criteria**: The union of the 7.1–7.6 success criteria below. Overarching invariants threaded through every sub-phase: CubeCL kernels generic over `R: Runtime` and `F: Float` (GPU-01); `cb-core`/`cb-model`/`cb-compute` unchanged from their Phase 3–6 form (additive boundary, `cb-compute` stays cubecl-free); compile-time backend selection only, zero runtime dispatch (GPU-02); strictly wave-size-agnostic, no warp-size constants (D-09).
+
+**Plans**: See sub-phases 7.1–7.6.
+
+### Phase 7.1: GPU Backend Runtime & Device Primitives
+
+**Goal**: The `rocm`/`wgpu`/`cuda` GPU runtimes are wired into the `cb-backend` `SelectedRuntime` cfg-alias (replacing the inert `()` placeholders) with zero runtime dispatch, and the device-side scan/reduction/memory primitives that all later kernels build on land at structural parity with `catboost/cuda/cuda_lib` + `cuda_util` — wave-size-agnostic, using CUDA-style in-kernel atomic/plane reductions (D-03).
+**Mode:** mvp
+**Depends on**: Phase 6 (6.1–6.6)
+**Requirements**: GPU-02 (compile-time backend selection), GPU-04 (`wgpu` builds/runs on dev machines), GPU-05 (`cuda` compile-gated), GPU-01 (scan + reductions slice)
 **Success Criteria** (what must be TRUE):
 
-  1. CubeCL kernels generic over `R: Runtime` and `F: Float` (histogram, gradient/hessian, scan, reductions) compile and run, with `cb-core`/`cb-model` unchanged from their Phase 3–6 form.
-  2. Compile-time backend selection via Cargo features (`cpu`/`wgpu`/`cuda`/`rocm`) flows through a single `cfg`-gated type alias with zero runtime dispatch.
-  3. The `rocm`/HIP backend is validated on AMD hardware (wavefront-64 safe; no warp-size assumptions), and GPU tests run on `rocm`.
-  4. The `wgpu` backend runs on dev machines without ROCm/CUDA, and the `cuda` backend compiles behind its feature gate (untested locally).
-  5. A documented GPU tolerance is established and signed off: `rocm` results fall within a separately-stated epsilon vs the Rust CPU path (not vs the C++ CPU oracle).
+  1. Cargo features `cpu`/`wgpu`/`cuda`/`rocm` each resolve `SelectedRuntime` through the single `cfg`-gated alias with zero runtime `match` over backends; `cb-compute` stays cubecl-free and `cb-core`/`cb-model` are unchanged.
+  2. `rocm` runtime initializes and runs on the in-env gfx1100 GPU; `wgpu` builds and runs on a dev machine with no ROCm/CUDA; `cuda` compiles behind its feature gate (untested locally — no CUDA hardware here, D-07).
+  3. Generic-over-`F: Float` scan and reduction primitives run on `rocm`, are wave-size-agnostic (no warp-size constants — pass on wave32-native gfx1100, D-09), and mirror the CUDA reduction/scan structure (D-03 atomic/plane reductions).
+  4. The primitives self-oracle against the Rust CPU path on representative inputs (tolerance reported, not yet the signed-off GPU-06 epsilon — that lands in 7.6).
 
 **Plans**: TBD
-**Research flag**: NEEDS DEEPER RESEARCH before planning — spike `cubecl-hip` kernel coverage (histogram atomics, prefix scan, reductions) at cubecl 0.10.0; validate wavefront-64 reduction determinism; match `cubecl-hip-sys` HIP version to the test machine; set the concrete GPU epsilon and get sign-off.
+**Research flag**: NEEDS DEEPER RESEARCH — spike `cubecl-hip` at the pinned cubecl version: scan/reduction primitive coverage, plane/subgroup ops for wave-size-agnostic reductions; match `cubecl-hip-sys` HIP version to ROCm 7.1.1 on the test box.
+
+### Phase 7.2: On-Device Gradient/Hessian & Targets
+
+**Goal**: Gradient and Hessian (der1/der2) computation and the target/derivative path run device-resident on the GPU runtimes, ported at structural parity from `catboost/cuda/targets/`, feeding the histogram kernels without host round-trips.
+**Mode:** mvp
+**Depends on**: Phase 7.1
+**Requirements**: GPU-01 (gradient/hessian + targets slice)
+**Success Criteria** (what must be TRUE):
+
+  1. Generic-over-`R: Runtime`/`F: Float` gradient/hessian kernels compute der1/der2 device-resident for the in-scope losses, structurally mirroring `catboost/cuda/targets/` (memory layout, blocking, accumulation).
+  2. Derivative results match the Rust CPU der1/der2 path on representative fixtures within the reported GPU tolerance (run-to-run variance from D-03 atomics absorbed).
+  3. Outputs stay device-resident and are consumable directly by the histogram kernels (no host fold inserted between derivatives and histograms).
+  4. Validated on `rocm` (gfx1100); `cb-core`/`cb-model`/`cb-compute` unchanged.
+
+**Plans**: TBD
+
+### Phase 7.3: Pointwise Histogram Family
+
+**Goal**: The pointwise histogram kernel family is ported at full structural parity from `catboost/cuda/methods/kernel/pointwise_hist2*` — including the bit-width-specialized variants (5/6/7/8-bit, half-byte, binary) — generic over `R: Runtime`/`F: Float`, accumulating with CUDA-style in-kernel atomics (D-03).
+**Mode:** mvp
+**Depends on**: Phase 7.2
+**Requirements**: GPU-01 (pointwise histogram slice)
+**Success Criteria** (what must be TRUE):
+
+  1. The `pointwise_hist2` family — general path plus 5/6/7/8-bit, half-byte, and binary specializations — runs on `rocm`, structurally mirroring the upstream kernel decomposition (shared-memory blocking, accumulation strategy).
+  2. Histogram outputs match the Rust CPU histogram path within the reported GPU tolerance on representative fixtures across the covered bit-widths.
+  3. Kernels are wave-size-agnostic (no warp-size constants; pass on wave32-native gfx1100, D-09) and generic-float (no hard-coded float types, per AGENTS.md).
+  4. Validated on `rocm`; the additive boundary holds (`cb-compute` cubecl-free; `cb-core`/`cb-model` unchanged).
+
+**Plans**: TBD
+**Research flag**: NEEDS DEEPER RESEARCH — histogram atomic-add coverage and shared-memory model in `cubecl-hip`; bit-width specialization strategy in CubeCL (`comptime`/generics) vs the CUDA template variants.
+
+### Phase 7.4: Pairwise Histogram Family
+
+**Goal**: The pairwise histogram kernel family is ported at full structural parity from `catboost/cuda/methods/kernel/pairwise_hist*` — including the 8-bit atomics path and one-hot variants — generic over `R: Runtime`/`F: Float`, completing the GPU histogram surface alongside 7.3.
+**Mode:** mvp
+**Depends on**: Phase 7.3
+**Requirements**: GPU-01 (pairwise histogram slice)
+**Success Criteria** (what must be TRUE):
+
+  1. The `pairwise_hist` family — general path plus 5/6/7-bit, half-byte, binary, 8-bit-atomics, and the one-hot variants — runs on `rocm`, structurally mirroring the upstream pairwise kernel decomposition.
+  2. Pairwise histogram outputs match the Rust CPU pairwise path within the reported GPU tolerance on representative fixtures (including a pairwise/ranking loss).
+  3. Kernels are wave-size-agnostic and generic-float; the bit-width/one-hot specializations match the upstream variant set (D-02 scope).
+  4. Validated on `rocm`; additive boundary holds.
+
+**Plans**: TBD
+
+### Phase 7.5: Score/Split Selection & On-Device Tree-Grow Loop
+
+**Goal**: Score calcers and split selection (`catboost/cuda/methods/kernel/score_calcers.cuh`) and the full tree-grow loop run **device-resident** end-to-end (candidates/scores/leaves on device, minimal host↔device round-trips), mirroring upstream CUDA's design (D-05) and integrating 7.1–7.4 into a complete on-GPU training pass.
+**Mode:** mvp
+**Depends on**: Phase 7.3, Phase 7.4
+**Requirements**: GPU-01 (full on-device loop integration — closes the GPU-01 kernel surface)
+**Success Criteria** (what must be TRUE):
+
+  1. Score computation and split selection run on `rocm` from device-resident histograms, structurally mirroring `score_calcers.cuh`.
+  2. The full tree-grow loop (candidate generation → histograms → scoring → split → leaf update) runs device-resident with minimal host↔device transfers, mirroring upstream `gpu_data/` + `train_lib/` (D-05) — not a host-orchestrated kernel-offload hybrid.
+  3. A complete GPU-trained tree/model matches the Rust CPU-trained result within the reported GPU tolerance on representative fixtures (per-tree structure + leaf values).
+  4. Validated on `rocm`; `cb-core`/`cb-model`/`cb-compute` unchanged from Phase 3–6 form.
+
+**Plans**: TBD
+**Research flag**: NEEDS DEEPER RESEARCH — device-resident loop orchestration in CubeCL (kernel launch graph, persistent device buffers) vs upstream CUDA's host-light train loop; non-determinism budget from D-03 atomics across a full multi-tree run.
+
+### Phase 7.6: GPU Tolerance, rocm Validation & Sign-off
+
+**Goal**: The GPU-06 tolerance is established empirically on the in-env gfx1100 GPU, documented, and **signed off by the user**; `rocm` is locked in as the sole GPU oracle gate with GPU tests running on `rocm` (GPU-03), closing the Phase 7 umbrella.
+**Mode:** mvp
+**Depends on**: Phase 7.5
+**Requirements**: GPU-03 (`rocm` validated on AMD hardware, GPU tests run on `rocm`), GPU-06 (documented signed-off GPU tolerance vs Rust CPU path)
+**Success Criteria** (what must be TRUE):
+
+  1. The executor measures actual `rocm`-vs-Rust-CPU divergence (including run-to-run variance from D-03 atomics) across representative fixtures on gfx1100, and proposes a concrete epsilon with headroom over observed max + variance.
+  2. The user signs off the concrete epsilon, recorded in CONTEXT/VERIFICATION; the epsilon is documented as **vs the Rust CPU path**, not vs the C++ CPU oracle, and is looser than the CPU path's 1e-5 (D-04).
+  3. The `rocm` GPU test suite runs locally/manually in-env on gfx1100 and is the authoritative GPU gate — **never run in GitHub Actions** (standing ROCm CI constraint, D-06); `wgpu`/`cuda` remain compile-gated stubs, not validation gates (D-07).
+  4. The wave32-native validation scope is documented: wave-size-agnostic correctness is validated on gfx1100 (wave32); literal wave64 (CDNA/MI-series) execution remains an explicit documented gap, not closed by this phase (D-09).
+
+**Plans**: TBD
 
 ### Phase 8: Python Bindings, Dual API & Packaging
 
