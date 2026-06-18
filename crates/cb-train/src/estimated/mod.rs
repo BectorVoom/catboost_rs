@@ -23,6 +23,9 @@
 #[path = "online_text.rs"]
 pub mod online_text;
 
+#[path = "online_embedding.rs"]
+pub mod online_embedding;
+
 #[path = "estimated_features.rs"]
 pub mod estimated_features;
 
@@ -33,3 +36,7 @@ mod estimated_features_test;
 #[cfg(test)]
 #[path = "online_text_test.rs"]
 mod online_text_test;
+
+#[cfg(test)]
+#[path = "online_embedding_test.rs"]
+mod online_embedding_test;
