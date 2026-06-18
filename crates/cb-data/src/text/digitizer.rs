@@ -31,6 +31,11 @@ use super::tokenizer::{tokenize, TokenizerOptions};
 /// Digitize a single raw document: tokenize, dictionary-apply (Skip unknown),
 /// then build the sorted-RLE [`TText`]. Mirrors
 /// `TTextColumnBuilder::AddText` (`text_column_builder.cpp:6-11`).
+///
+/// # Invariant (WR-05)
+/// `tokenizer_options` MUST match the options used to BUILD `dictionary`;
+/// otherwise tokens silently miss the dictionary and the document digitizes to
+/// all-unknown with no error. This coupling is not type-enforced.
 #[must_use]
 pub fn digitize_document(
     text: &str,
@@ -63,6 +68,14 @@ pub fn digitize_column(
 /// apply the BiGram dictionary (Skip unknown bigrams) and build the sorted-RLE
 /// [`TText`]. The BoW calcer applies over BOTH the BiGram and Word dictionaries
 /// (RESEARCH Pitfall 4); this is the BiGram arm.
+///
+/// # Invariant (WR-05)
+/// `tokenizer_options` MUST be the same options used to BUILD `dictionary`. The
+/// dictionary keys are produced by a separate tokenization pass; if the options
+/// here diverge (e.g. lowercasing on at build but off at digitize), every bigram
+/// silently misses and the BoW block becomes all-zero with no error. This
+/// coupling is not type-enforced — prefer driving both passes from
+/// `build_bow_estimated_features`, the single source that owns both.
 #[must_use]
 pub fn digitize_document_bigram(
     text: &str,
