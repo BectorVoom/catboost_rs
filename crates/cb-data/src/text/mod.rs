@@ -36,6 +36,10 @@
 pub mod text;
 #[path = "tokenizer.rs"]
 pub mod tokenizer;
+#[path = "dictionary.rs"]
+pub mod dictionary;
+#[path = "digitizer.rs"]
+pub mod digitizer;
 
 #[cfg(test)]
 #[path = "text_test.rs"]
@@ -43,3 +47,9 @@ mod text_test;
 #[cfg(test)]
 #[path = "tokenizer_test.rs"]
 mod tokenizer_test;
+#[cfg(test)]
+#[path = "dictionary_test.rs"]
+mod dictionary_test;
+#[cfg(test)]
+#[path = "digitizer_test.rs"]
+mod digitizer_test;

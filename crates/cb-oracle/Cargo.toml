@@ -19,3 +19,8 @@ cb-core = { path = "../cb-core" }
 # Permitted at test/dev edges only (D-14/D-15).
 approx.workspace = true
 anyhow.workspace = true
+# SC-1 (06.5-02): the tokenizer/dictionary/digitizer oracle compares cb-data's
+# text pipeline against the instrumented D-07 dump. A dev-dependency only (the
+# cb-oracle library never depends on cb-data); cb-data already dev-depends on
+# cb-oracle, and Cargo permits dev-dependency cycles.
+cb-data = { path = "../cb-data" }

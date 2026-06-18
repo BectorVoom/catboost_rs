@@ -676,6 +676,7 @@ dependencies = [
  "anyhow",
  "approx",
  "cb-core",
+ "cb-data",
  "ndarray",
  "ndarray-npy",
  "serde",
