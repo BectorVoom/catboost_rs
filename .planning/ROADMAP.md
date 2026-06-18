@@ -511,7 +511,7 @@ Plans:
 
 **Wave 3** — Gate B Wave-0 (non-symmetric engine contract)
 
-- [ ] 06.6-03-PLAN.md — Non-symmetric model variant + .cbm/json serde (wire existing TNonSymmetricTreeStepNode bindings) + distinct "trees" oracle parser + splits-first failing harness (FEAT-06 infra)
+- [x] 06.6-03-PLAN.md — Non-symmetric model variant + .cbm/json serde (wire existing TNonSymmetricTreeStepNode bindings) + distinct "trees" oracle parser + splits-first failing harness (FEAT-06 infra)
 
 **Wave 4** *(blocked on 06.6-02, 06.6-03)*
 

@@ -65,7 +65,7 @@
 - [ ] **FEAT-03**: Monotone constraints (per-feature +1/-1/0)
 - [x] **FEAT-04**: Feature penalties / per-object penalties
 - [ ] **FEAT-05**: Feature selection — recursive by PredictionValuesChange / LossFunctionChange / ShapValues
-- [ ] **FEAT-06**: Alternative grow policies — Lossguide, Depthwise, Region
+- [x] **FEAT-06**: Alternative grow policies — Lossguide, Depthwise, Region
 
 ### Model, Serialization & Explainability
 
@@ -177,7 +177,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | FEAT-03 | Phase 6.6 | Pending |
 | FEAT-04 | Phase 6.6 | Complete |
 | FEAT-05 | Phase 6.6 | Pending |
-| FEAT-06 | Phase 6.6 | Pending |
+| FEAT-06 | Phase 6.6 | Complete |
 | MODEL-05 | Phase 6.6 | Pending |
 | GPU-01 | Phase 7 | Pending |
 | GPU-02 | Phase 7 | Pending |
