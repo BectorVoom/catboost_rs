@@ -18,6 +18,7 @@ mod bootstrap;
 mod boosting;
 mod candidates;
 mod ctr;
+mod estimated;
 mod fold;
 mod metrics;
 mod overfit;
@@ -46,6 +47,7 @@ pub use ctr::{
     OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior, TCtrHistory, TCtrMeanHistory,
     SIMPLE_CLASSES_COUNT,
 };
+pub use estimated::estimated_features::{build_bow_estimated_features, BowEstimatedFeatures};
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
     plain_fold_body_tail, select_min_batch_size, select_tail_size, Fold,

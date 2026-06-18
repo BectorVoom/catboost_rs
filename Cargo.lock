@@ -675,8 +675,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "cb-backend",
+ "cb-compute",
  "cb-core",
  "cb-data",
+ "cb-train",
  "ndarray",
  "ndarray-npy",
  "serde",

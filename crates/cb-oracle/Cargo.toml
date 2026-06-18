@@ -24,3 +24,12 @@ anyhow.workspace = true
 # cb-oracle library never depends on cb-data); cb-data already dev-depends on
 # cb-oracle, and Cargo permits dev-dependency cycles.
 cb-data = { path = "../cb-data" }
+# SC-4 (06.5-03): the BoW per-stage oracle trains the model END-TO-END through
+# the estimated-feature seam (cb-train), the BoW calcer math (cb-compute), and
+# the CPU runtime (cb-backend), then compares per-stage outputs to the frozen
+# fixtures. Dev-dependencies only (the cb-oracle library depends on none of
+# them); cb-train already dev-depends on cb-oracle, and Cargo permits
+# dev-dependency cycles.
+cb-train = { path = "../cb-train" }
+cb-compute = { path = "../cb-compute" }
+cb-backend = { path = "../cb-backend" }

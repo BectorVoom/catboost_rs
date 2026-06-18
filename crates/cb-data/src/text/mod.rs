@@ -38,12 +38,17 @@ pub mod text;
 pub mod tokenizer;
 #[path = "dictionary.rs"]
 pub mod dictionary;
+#[path = "bigram_dictionary.rs"]
+pub mod bigram_dictionary;
 #[path = "digitizer.rs"]
 pub mod digitizer;
 
 #[cfg(test)]
 #[path = "text_test.rs"]
 mod text_test;
+#[cfg(test)]
+#[path = "bigram_dictionary_test.rs"]
+mod bigram_dictionary_test;
 #[cfg(test)]
 #[path = "tokenizer_test.rs"]
 mod tokenizer_test;
