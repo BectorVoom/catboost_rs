@@ -14,25 +14,30 @@
 //!
 //! 2. **Upstream oracle (`compare_stage`, <= 1e-5), always runs.** The reloaded
 //!    model's predictions are compared to the committed upstream
-//!    `predictions.npy`. The facade's `fit` computes its OWN quantization borders
-//!    from the pool (`select_borders_greedy_logsum`); for `numeric_tiny` those
-//!    borders reproduce upstream's border selection exactly, so the full
-//!    train -> serialize -> load -> predict cycle matches upstream catboost
+//!    `predictions.npy`. The facade's `fit` computes its OWN greedy-logsum
+//!    quantization borders from the pool (`select_borders_greedy_logsum`); for
+//!    `numeric_tiny` those computed borders DIFFER from the fixture's pinned
+//!    per-feature border counts, but the difference does not affect the final
+//!    predictions once the split-score function matches: with
+//!    `score_function = L2` (the value the upstream fixtures were trained with),
+//!    the border differences cancel through the trained tree structure and the
+//!    full train -> serialize -> load -> predict cycle matches upstream catboost
 //!    1.2.10 <= 1e-5 for BOTH binclf and regression (ROADMAP Phase-4 criterion 5).
 //!    This leg runs unconditionally as the end-to-end public-API oracle lock.
 //!
 //! The upstream `model_serde/{binclf,regression}` fixtures were trained on
 //! `numeric_tiny` with `boost_from_average`, `depth=2`, `iterations=5`,
 //! `learning_rate=0.1`, `l2_leaf_reg=3.0`, `leaf_estimation_method=Gradient`,
-//! `bootstrap_type=No`, `random_seed=0` (see each `config.json`) — the builder
-//! is configured to match.
+//! `score_function=L2`, `bootstrap_type=No`, `random_seed=0` (see each
+//! `config.json`) — the builder is configured to match.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
 
 use catboost_rs::{
-    CatBoostBuilder, IngestSource, LeafMethod, Loss, Model, OwnedColumns, Pool, PredictionType,
+    CatBoostBuilder, EScoreFunction, IngestSource, LeafMethod, Loss, Model, OwnedColumns, Pool,
+    PredictionType,
 };
 use cb_oracle::{compare_stage, load_f64_vec, Stage};
 use ndarray::Array2;
@@ -105,6 +110,7 @@ fn configured_builder(loss: Loss, boost_from_average: bool) -> CatBoostBuilder {
         .random_strength(0.0)
         .boost_from_average(boost_from_average)
         .leaf_method(LeafMethod::Gradient)
+        .score_function(EScoreFunction::L2)
         .random_seed(0)
 }
 
@@ -162,9 +168,11 @@ fn run_scenario(scenario: &str, loss: Loss, boost_from_average: bool, target: Ve
 
     // (5) Upstream oracle leg (<= 1e-5): the reloaded model's predictions match
     //     the committed upstream catboost 1.2.10 `predictions.npy` (ROADMAP
-    //     Phase-4 criterion 5). The builder's fit-from-pool borders reproduce
-    //     upstream's border selection for numeric_tiny, so the whole public-API
-    //     cycle is oracle-locked.
+    //     Phase-4 criterion 5). The builder's fit-from-pool greedy-logsum borders
+    //     DIFFER from the fixture's pinned border counts for numeric_tiny, but
+    //     those differences cancel through the trained tree structure once the
+    //     split-score function matches (`score_function = L2`), so the whole
+    //     public-API cycle is oracle-locked.
     let expected = load_f64_vec(&fixture(&format!("model_serde/{scenario}/predictions.npy")))
         .unwrap_or_else(|e| panic!("{scenario}: predictions.npy must load: {e:?}"));
     compare_stage(Stage::Predictions, &expected, &after_cbm)
