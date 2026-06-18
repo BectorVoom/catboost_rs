@@ -1,0 +1,24 @@
+{
+  "catboost_version": "1.2.10",
+  "grow_policy": "Lossguide",
+  "params": {
+    "iterations": 4,
+    "learning_rate": 0.3,
+    "loss_function": "RMSE",
+    "random_strength": 0,
+    "bootstrap_type": "No",
+    "thread_count": 1,
+    "random_seed": 42,
+    "feature_border_type": "GreedyLogSum",
+    "border_count": 32,
+    "leaf_estimation_iterations": 1,
+    "allow_writing_files": false,
+    "boost_from_average": false,
+    "grow_policy": "Lossguide",
+    "max_leaves": 6
+  },
+  "n_objects": 64,
+  "n_features": 3,
+  "seed": 42,
+  "note": "offline-generated from .venv catboost 1.2.10; splits-first oracle fixture (FEAT-06, Open Question 1)"
+}

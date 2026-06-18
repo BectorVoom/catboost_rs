@@ -57,6 +57,161 @@ pub struct ObliviousTree {
     pub splits: Vec<SplitJson>,
 }
 
+/// One node of a NON-SYMMETRIC (Lossguide / Depthwise) tree in the upstream
+/// `"trees"` recursive nested-node schema (FEAT-06, RESEARCH Pitfall 3). A node
+/// is EITHER interior (`split` + `left` + `right`) OR a leaf (`value` +
+/// `weight`). This schema is STRUCTURALLY DIFFERENT from `oblivious_trees`
+/// (flat arrays) and MUST NOT be routed through [`ObliviousTree`] (Pitfall 3).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct NonSymmetricNodeJson {
+    /// The interior-node split (absent on a leaf).
+    #[serde(default)]
+    pub split: Option<SplitJson>,
+    /// The left child (absent on a leaf). Boxed — the schema is recursive.
+    #[serde(default)]
+    pub left: Option<Box<NonSymmetricNodeJson>>,
+    /// The right child (absent on a leaf). Boxed — the schema is recursive.
+    #[serde(default)]
+    pub right: Option<Box<NonSymmetricNodeJson>>,
+    /// The leaf value (absent on an interior node).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// The leaf's summed training-document weight (absent on an interior node).
+    #[serde(default)]
+    pub weight: Option<f64>,
+}
+
+/// The flat triple a non-symmetric `"trees"` tree converts to (the per-stage
+/// comparator consumes these). Mirrors the canonical `cb_model::NonSymmetricTree`
+/// layout: per-node splits / step-node diffs / leaf ids + the distinct leaves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonSymmetricFlatTree {
+    /// Per-node split border (interior nodes) in flat pre-order. Leaf nodes carry
+    /// a placeholder (`f64::NEG_INFINITY`) the apply walk never reads.
+    pub split_borders: Vec<f64>,
+    /// Per-node `(left_subtree_diff, right_subtree_diff)`; `(0, 0)` marks a leaf.
+    pub step_nodes: Vec<(u16, u16)>,
+    /// Per-node index into `leaf_values` (only meaningful for leaf nodes).
+    pub node_id_to_leaf_id: Vec<u32>,
+    /// The distinct leaf values in leaf-visitation (pre-order) order.
+    pub leaf_values: Vec<f64>,
+    /// The per-leaf summed weights, same order as `leaf_values`.
+    pub leaf_weights: Vec<f64>,
+}
+
+impl NonSymmetricNodeJson {
+    /// Flatten this nested-node tree into the [`NonSymmetricFlatTree`] triple
+    /// (RESEARCH Pitfall 3 — a DISTINCT parser path, NOT the oblivious flat
+    /// arrays). Node ids are assigned in a deterministic PRE-ORDER walk; an
+    /// interior node's `(left_diff, right_diff)` are the offsets from its id to
+    /// its children. Depth-bounded by [`MAX_NON_SYMMETRIC_DEPTH`] (no unbounded
+    /// recursion on a crafted file).
+    ///
+    /// # Errors
+    /// [`OracleError::MalformedModel`] on a malformed node (interior missing a
+    /// child/split, leaf missing its value) or a tree deeper than the bound.
+    pub fn flatten(&self) -> Result<NonSymmetricFlatTree, OracleError> {
+        let mut order: Vec<&NonSymmetricNodeJson> = Vec::new();
+        collect_preorder(self, 0, &mut order)?;
+        let node_count = order.len();
+
+        let id_of = |target: &NonSymmetricNodeJson| -> Option<usize> {
+            order.iter().position(|n| std::ptr::eq(*n, target))
+        };
+
+        let mut split_borders: Vec<f64> = Vec::with_capacity(node_count);
+        let mut step_nodes: Vec<(u16, u16)> = Vec::with_capacity(node_count);
+        let mut node_id_to_leaf_id: Vec<u32> = vec![0; node_count];
+        let mut leaf_values: Vec<f64> = Vec::new();
+        let mut leaf_weights: Vec<f64> = Vec::new();
+
+        for (id, node) in order.iter().enumerate() {
+            if let Some(split) = node.split.as_ref() {
+                split_borders.push(split.border);
+                let left = node.left.as_deref().ok_or_else(|| OracleError::MalformedModel {
+                    what: "non-symmetric interior node missing left".to_owned(),
+                })?;
+                let right = node.right.as_deref().ok_or_else(|| OracleError::MalformedModel {
+                    what: "non-symmetric interior node missing right".to_owned(),
+                })?;
+                let left_id = id_of(left).ok_or_else(|| OracleError::MalformedModel {
+                    what: "non-symmetric left child id not found".to_owned(),
+                })?;
+                let right_id = id_of(right).ok_or_else(|| OracleError::MalformedModel {
+                    what: "non-symmetric right child id not found".to_owned(),
+                })?;
+                let left_diff = u16::try_from(left_id.saturating_sub(id)).map_err(|_| {
+                    OracleError::MalformedModel {
+                        what: "non-symmetric left subtree diff exceeds u16".to_owned(),
+                    }
+                })?;
+                let right_diff = u16::try_from(right_id.saturating_sub(id)).map_err(|_| {
+                    OracleError::MalformedModel {
+                        what: "non-symmetric right subtree diff exceeds u16".to_owned(),
+                    }
+                })?;
+                step_nodes.push((left_diff, right_diff));
+            } else {
+                let value = node.value.ok_or_else(|| OracleError::MalformedModel {
+                    what: "non-symmetric leaf missing value".to_owned(),
+                })?;
+                split_borders.push(f64::NEG_INFINITY);
+                step_nodes.push((0, 0));
+                let leaf_id = leaf_values.len();
+                node_id_to_leaf_id[id] =
+                    u32::try_from(leaf_id).map_err(|_| OracleError::MalformedModel {
+                        what: "non-symmetric leaf id exceeds u32".to_owned(),
+                    })?;
+                leaf_values.push(value);
+                leaf_weights.push(node.weight.unwrap_or(0.0));
+            }
+        }
+
+        Ok(NonSymmetricFlatTree {
+            split_borders,
+            step_nodes,
+            node_id_to_leaf_id,
+            leaf_values,
+            leaf_weights,
+        })
+    }
+}
+
+/// The maximum non-symmetric `"trees"` nested-node recursion depth the oracle
+/// converter accepts (T-06.6-07 — a crafted file cannot drive unbounded stack
+/// recursion). Well past any real upstream tree depth.
+const MAX_NON_SYMMETRIC_DEPTH: usize = 64;
+
+/// Pre-order traversal collecting node references in id order (root, whole left
+/// subtree, whole right subtree). Depth-bounded by [`MAX_NON_SYMMETRIC_DEPTH`].
+///
+/// # Errors
+/// [`OracleError::MalformedModel`] if `depth` exceeds the bound or an interior
+/// node is missing a child.
+fn collect_preorder<'a>(
+    node: &'a NonSymmetricNodeJson,
+    depth: usize,
+    out: &mut Vec<&'a NonSymmetricNodeJson>,
+) -> Result<(), OracleError> {
+    if depth > MAX_NON_SYMMETRIC_DEPTH {
+        return Err(OracleError::MalformedModel {
+            what: format!("non-symmetric tree exceeds max depth {MAX_NON_SYMMETRIC_DEPTH}"),
+        });
+    }
+    out.push(node);
+    if node.split.is_some() {
+        let left = node.left.as_deref().ok_or_else(|| OracleError::MalformedModel {
+            what: "non-symmetric interior node missing left".to_owned(),
+        })?;
+        let right = node.right.as_deref().ok_or_else(|| OracleError::MalformedModel {
+            what: "non-symmetric interior node missing right".to_owned(),
+        })?;
+        collect_preorder(left, depth + 1, out)?;
+        collect_preorder(right, depth + 1, out)?;
+    }
+    Ok(())
+}
+
 /// One float feature's metadata (verified `model.json` schema:
 /// `features_info.float_features[i]`). Only the `borders` are consumed by the
 /// training oracle (they are the candidate split borders the trainer scores).
@@ -168,8 +323,17 @@ impl CtrTableJson {
 pub struct ModelJson {
     /// Per-feature metadata, including each float feature's candidate borders.
     pub features_info: FeaturesInfoJson,
-    /// All oblivious trees in boosting (iteration) order.
+    /// All oblivious (symmetric) trees in boosting order. EMPTY for a
+    /// non-symmetric model (which populates `trees` instead). `#[serde(default)]`
+    /// so a non-symmetric `model.json` (no `oblivious_trees` key) still parses.
+    #[serde(default)]
     pub oblivious_trees: Vec<ObliviousTree>,
+    /// All NON-SYMMETRIC (Lossguide / Depthwise) trees in boosting order, in the
+    /// recursive nested-node schema (FEAT-06, RESEARCH Pitfall 3 — a DISTINCT
+    /// top-level key from `oblivious_trees`). EMPTY for a symmetric model;
+    /// `#[serde(default)]` keeps oblivious fixtures parsing.
+    #[serde(default)]
+    pub trees: Vec<NonSymmetricNodeJson>,
     /// Upstream `[scale, [bias, …]]`. Untyped (`serde_json::Value`) because the
     /// outer array mixes a scalar scale and a nested bias vector; the typed
     /// accessor [`ModelJson::bias`] extracts the bias without `unwrap`.
@@ -202,6 +366,56 @@ impl ModelJson {
             .iter()
             .flat_map(|tree| tree.leaf_values.iter().copied())
             .collect()
+    }
+
+    /// Whether this is a NON-SYMMETRIC (Lossguide / Depthwise) model — it
+    /// populates `trees` (nested-node) rather than `oblivious_trees` (Pitfall 3).
+    #[must_use]
+    pub fn is_non_symmetric(&self) -> bool {
+        !self.trees.is_empty()
+    }
+
+    /// Flatten every non-symmetric `"trees"` nested-node tree into the flat
+    /// triple the per-stage comparator consumes (FEAT-06, RESEARCH Pitfall 3).
+    /// Returns an EMPTY vector for an oblivious model. The result MUST be
+    /// non-empty (and per-tree non-zero-length) for a non-symmetric fixture —
+    /// a zero-length triple is the Pitfall-3 "parsed as oblivious" warning sign.
+    ///
+    /// # Errors
+    /// [`OracleError::MalformedModel`] from [`NonSymmetricNodeJson::flatten`].
+    pub fn non_symmetric_flat_trees(&self) -> Result<Vec<NonSymmetricFlatTree>, OracleError> {
+        self.trees.iter().map(NonSymmetricNodeJson::flatten).collect()
+    }
+
+    /// Per-tree non-symmetric split borders flattened in tree order (the INTERIOR
+    /// nodes' borders, leaf placeholders excluded), ready for
+    /// `compare_stage(Stage::Splits, …)` — the SPLITS-FIRST lock (Open Question 1).
+    ///
+    /// # Errors
+    /// [`OracleError::MalformedModel`] from flattening.
+    pub fn non_symmetric_split_borders(&self) -> Result<Vec<f64>, OracleError> {
+        let mut out = Vec::new();
+        for tree in self.non_symmetric_flat_trees()? {
+            for (border, &(l, r)) in tree.split_borders.iter().zip(tree.step_nodes.iter()) {
+                if !(l == 0 && r == 0) {
+                    out.push(*border);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per-tree non-symmetric leaf values flattened in tree order (distinct
+    /// leaves, leaf-visitation order), ready for `compare_stage(Stage::LeafValues, …)`.
+    ///
+    /// # Errors
+    /// [`OracleError::MalformedModel`] from flattening.
+    pub fn non_symmetric_leaf_values(&self) -> Result<Vec<f64>, OracleError> {
+        let mut out = Vec::new();
+        for tree in self.non_symmetric_flat_trees()? {
+            out.extend_from_slice(&tree.leaf_values);
+        }
+        Ok(out)
     }
 
     /// Per-tree leaf weights as a nested `Vec<Vec<f64>>` (one inner vector per

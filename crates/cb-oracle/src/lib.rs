@@ -25,8 +25,8 @@ pub use compare::{assert_abs_close, compare_permutation, compare_stage, Stage};
 pub use error::OracleError;
 pub use fixture::{load_config, load_f64_vec, FixtureConfig};
 pub use model_json::{
-    load_model_json, CtrTableJson, FeaturesInfoJson, FloatFeatureJson, ModelJson, ObliviousTree,
-    SplitJson,
+    load_model_json, CtrTableJson, FeaturesInfoJson, FloatFeatureJson, ModelJson,
+    NonSymmetricFlatTree, NonSymmetricNodeJson, ObliviousTree, SplitJson,
 };
 
 #[cfg(test)]
