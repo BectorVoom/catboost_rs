@@ -282,22 +282,29 @@ fn naive_bayes_log_prob(
 /// RESEARCH Pitfall 6). The `total` reduction routes through [`cb_core::sum_f64`]
 /// (D-04); upstream uses a running `double total` — the canonical-order sum
 /// matches it for the small per-class vectors here.
-fn softmax_in_place(vals: &mut [f64]) {
+fn softmax_in_place(vals: &mut [f64]) -> CbResult<()> {
     let mut max_value = f64::NEG_INFINITY;
     for &v in vals.iter() {
         if v > max_value {
             max_value = v;
         }
     }
-    // Empty input (no classes) — nothing to normalize.
+    // A non-finite max (empty input, all `-inf`, or a `NaN` that the `v >
+    // max_value` comparison can never beat) means there is no valid
+    // distribution to normalize. Surface a typed error rather than silently
+    // returning the input un-softmaxed (raw log-probs or NaN as a
+    // "probability"), which would poison the emitted feature (WR-04).
     if !max_value.is_finite() {
-        return;
+        return Err(CbError::Degenerate(format!(
+            "softmax_in_place: non-finite max {max_value} (degenerate log-prob vector)"
+        )));
     }
     let exps: Vec<f64> = vals.iter().map(|&v| (v - max_value).exp()).collect();
     let total = sum_f64(&exps);
     for (slot, e) in vals.iter_mut().zip(exps.iter()) {
         *slot = if total > 0.0 { e / total } else { *slot };
     }
+    Ok(())
 }
 
 /// NaiveBayes per-document compute (`TMultinomialNaiveBayes::Compute`,
@@ -341,7 +348,7 @@ pub fn naive_bayes_compute(state: &NaiveBayesState, text: &TText) -> CbResult<Ve
     }
 
     // Softmax(logProbs) (naive_bayesian.cpp:55).
-    softmax_in_place(&mut log_probs);
+    softmax_in_place(&mut log_probs)?;
 
     // ForEachActiveFeature emits logProbs[featureId] for featureId in
     // 0..FeatureCount (naive_bayesian.cpp:57-62). Active ids = Iota(0..width).
