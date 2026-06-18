@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 Phase: 07
 Plan: Not started
 Status: Executing Phase 06.6 — 06.6-09 gap-closure COMPLETE
-Last activity: 2026-06-18
+Last activity: 2026-06-19 - Completed quick task 260619-bac: fix builder_oracle_test score-function mismatch
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -316,6 +316,12 @@ None yet.
 - **RESOLVED — Plan 05-08/05-10 (GAP 1, ORD-02) (2026-06-14).** The ordered split-scoring subsystem (05-08) + train() wiring (05-10) landed and the FULL multi-tree ordered_boost_e2e oracle now passes ≤1e-5 vs upstream catboost 1.2.10 (commit 301f54c). ORD-02 e2e CLOSED. Original under-scope analysis retained below for history:
 - **(history) BLOCKED — Plan 05-08 (GAP 1, ORD-02) under-scoped; re-scope required (2026-06-14).** Executor analysis (grounded in upstream catboost 1.2.10 `approx_calcer.cpp`/`greedy_tensor_search.cpp` + empirical run: ordered vs plain predictions differ max 0.70 on the e2e config) found the plan's two must-haves are in tension. Upstream ordered boosting differs from Plain in the **tree STRUCTURE** — splits are scored on per-segment ordered derivatives across the learning fold's `BodyTailArr` (multi-segment histogram score reduction), recomputed each iteration via `UpdateApproxDeltasHistoricallyImpl` (= our `ordered_approx_delta_simple`). Final leaf values still come from `CalcLeafValuesSimple` on the averaging fold (same as Plain). `tree.rs` has **NO ordered/body-tail-segment split-scoring path**, so wiring `ordered_approx_delta_simple` into the leaf-update alone reproduces Plain tree structure with a perturbed leaf-update — fails the ≤1e-5-vs-upstream oracle. True ORD-02 parity needs a NEW ordered split-scoring subsystem in `tree.rs` (per-learning-fold `BodyTailArr` state, per-segment ordered-derivative recompute, cross-segment histogram score), comparable in size to the Plain tree-search and entangled with the D-11 multi-tree RNG residual. **User decision (2026-06-14): re-scope via `/gsd-plan-phase 5 --gaps`.** No commits made; tree clean. 05-09 (tensor CTR wiring) depends on 05-08 → also blocked.
 - 06.3-13: PairLogitPairwise per-stage oracle still #[ignore]'d (escalate-don't-weaken) — true gap is split-selection needing the pairwise split-scorer TPairwiseScoreCalcer (pairwise_scoring.cpp), a new subsystem (Rule 4); diverges tree0 split1 f0 vs f1
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260619-bac | Fix builder_oracle_test score-function mismatch — expose `.score_function()` on CatBoostBuilder (default stays Cosine), re-export `EScoreFunction`, test opts into L2, fix false borders docstring. Both legs now pass ≤1e-5. | 2026-06-19 | 3ff254d | [260619-bac-fix-builder-oracle-test-score-function-m](./quick/260619-bac-fix-builder-oracle-test-score-function-m/) |
 
 ## Deferred Items
 
