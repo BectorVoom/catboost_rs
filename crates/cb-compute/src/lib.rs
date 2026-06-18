@@ -26,6 +26,7 @@ mod pairwise_scoring;
 mod ranking_der;
 mod runtime;
 mod score;
+mod text_calcers;
 
 pub use custom::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle,
@@ -68,6 +69,7 @@ pub use score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
     multi_dim_split_score, random_score_instance, score_st_dev, MINIMAL_SCORE,
 };
+pub use text_calcers::bag_of_words_compute;
 
 #[cfg(test)]
 mod histogram_test;
@@ -77,3 +79,5 @@ mod leaf_test;
 mod loss_test;
 #[cfg(test)]
 mod score_test;
+#[cfg(test)]
+mod text_calcers_test;
