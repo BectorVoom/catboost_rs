@@ -60,7 +60,7 @@
 
 ### Advanced Feature Types
 
-- [ ] **FEAT-01**: Text features — tokenization → BoW, NaiveBayes, BM25 calcers
+- [x] **FEAT-01**: Text features — tokenization → BoW, NaiveBayes, BM25 calcers
 - [x] **FEAT-02**: Embedding features — LDA, KNN calcers
 - [ ] **FEAT-03**: Monotone constraints (per-feature +1/-1/0)
 - [ ] **FEAT-04**: Feature penalties / per-object penalties
@@ -172,7 +172,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | LOSS-07 | Phase 6.4 | Pending (Rust trait; Python callback bridge → Phase 8 per D-09) |
 | LOSS-08 | Phase 6.4 | Complete |
 | LOSS-09 | Phase 6.4 | Complete (06.4-01; 5 GPU-only fns self-oracled per D-6.4-06) |
-| FEAT-01 | Phase 6.5 | In Progress (06.5-02 tokenizer/dictionary/digitizer SC-1 bit-exact; 06.5-03 BoW per-stage ≤1e-5; 06.5-04 NaiveBayes per-stage ≤1e-5 + BM25 calcer math bit-exact ≤1e-5. REMAINING: BM25 per-stage NORMALIZED-border scale deferred to catboost trainer estimated-feature normalization — see 06.5 deferred-items.md) |
+| FEAT-01 | Phase 6.5 | Complete (06.5-02 tokenizer/dictionary/digitizer SC-1 bit-exact; 06.5-03 BoW per-stage ≤1e-5; 06.5-04 NaiveBayes per-stage ≤1e-5 + BM25 calcer math bit-exact ≤1e-5; 06.5-08 PATH-A investigation: the BM25 splits.npy ±1.24 borders were the DEFAULT EMBEDDING calcer's, mislabeled — NOT a BM25 normalization; 06.5-09 regenerated the BM25 fixture text-only (O(1e-3) BM25 text-feature borders) + the full BM25 per-stage oracle GREEN — Splits/LeafValues from the online-estimate tree, StagedApprox/Predictions via the offline whole-set apply column, all ≤1e-5. All three text calcers BoW/NaiveBayes/BM25 per-stage closed. No #[ignore], no weakened tolerance.) |
 | FEAT-02 | Phase 6.5 | Complete (06.5-05 LDA per-stage parity via binarization stability + documented raw-projection tolerance; 06.5-06 KNN neighbor-id bit-exact → integer-vote bit-exact → byte-identical per-stage; 06.5-07 SC-4 mixed text+embedding end-to-end re-exercises KNN: StagedApprox + Predictions ≤1e-5 bit-for-bit) |
 | FEAT-03 | Phase 6.6 | Pending |
 | FEAT-04 | Phase 6.6 | Pending |

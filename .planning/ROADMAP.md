@@ -23,7 +23,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 6.2: Multiclass / Multilabel + N-Dim Approx Refactor** - LOSS-02 + LOSS-03 MultiQuantile; N-dim approx refactor with a no-behavior-change checkpoint (D-03/D-04) — COMPLETE 2026-06-16 (all 5 plans; N-dim spine + MultiClass/OneVsAll/MultiLogloss/MultiCrossEntropy/MultiQuantile all per-stage oracle ≤1e-5)
   - [x] **Phase 6.3: Ranking Losses & Metrics** - LOSS-04, LOSS-05 over group_id/subgroup_id/pairs; C++ instrumentation for randomized losses (completed 2026-06-17)
   - [x] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8) (completed 2026-06-18)
-  - [ ] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first
+  - [x] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first (SC-2 BM25 per-stage CLOSED via 06.5-09 PATH-A fixture-correctness fix)
   - [ ] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine
 - [ ] **Phase 7: GPU Backends via CubeCL** - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, documented GPU tolerance
 - [ ] **Phase 8: Python Bindings, Dual API & Packaging** - PyO3 dual sklearn + CatBoost-native API, NumPy/Pandas/Arrow/Polars input, per-backend wheels
@@ -440,7 +440,7 @@ Plans:
 **Success Criteria** (what must be TRUE):
 
   1. Tokenizer parity — the upstream text-processing token stream is reproduced bit-identical before any calcer is scored (D-11 named first risk).
-  2. Text calcers BoW, NaiveBayes, BM25 produce upstream-matching encodings ≤1e-5.
+  2. Text calcers BoW, NaiveBayes, BM25 produce upstream-matching encodings ≤1e-5. — **CLOSED (06.5-09):** BoW/NaiveBayes per-stage ≤1e-5 (06.5-03/04); BM25 per-stage ≤1e-5 (06.5-09) after 06.5-08's PATH-A finding that the splits.npy ±1.24 "BM25 normalized borders" were the DEFAULT EMBEDDING calcer's borders mislabeled (the fixture pool wrongly included emb0). Fixture regenerated text-only → genuine O(1e-3) BM25 text-feature borders; full BM25 per-stage oracle GREEN (Splits/LeafValues from the online-estimate tree, StagedApprox/Predictions via the offline whole-set apply column).
   3. Embedding calcers LDA, KNN produce upstream-matching encodings ≤1e-5.
   4. Text/embedding columns flow through the `Pool` (DATA-01) → calcer → quantized features into the existing tree path; calcer internals get C++ instrumentation where Python-reachable ground truth is thin (D-07).
 
@@ -482,7 +482,7 @@ Plans:
 
 **Wave 9 — gap closure** *(blocked on 06.5-08; executes the recorded path)*
 
-- [ ] 06.5-09-PLAN.md — Close BM25 SC-2/FEAT-01 along the 06.5-08 path: PATH-A → implement the located estimated-feature value-normalization (reuse the existing quantizer, SC-4; no parallel quantizer) so the stored BM25 borders reproduce splits.npy ≤1e-5 + add the full BM25 per-stage trained-model oracle (Splits/LeafValues/StagedApprox/Predictions ≤1e-5, mirror naive_bayes_oracle_test); PATH-B → gate the bit-exact-reproducible parity contract (StagedApprox/Predictions ≤1e-5 HARD + a necessary-and-sufficient structure/binarization-invariant gate) and convert the irreducible normalization residual into a documented, human-signed-off OWNED scope (REQUIREMENTS.md/ROADMAP SC-2/deferred-items.md updated), mirroring the SC-3 LDA + SC-4 precedent. NO #[ignore], NO weakened model-output tolerance. `autonomous: false` (blocking SC-2/FEAT-01 closure checkpoint)
+- [x] 06.5-09-PLAN.md — Close BM25 SC-2/FEAT-01 along the 06.5-08 PATH-A path — **COMPLETE** (3426145/+oracle): executed PATH-A (the recorded DECISION) as a FIXTURE-CORRECTNESS fix, NOT a normalization implementation (the PLAN.md normalization-transform wording predated 08's conclusion → DEVIATION recorded). 06.5-08 proved the splits.npy ±1.24/-0.550486 borders carry `calcer_id=96AE6D4D` (the DEFAULT EMBEDDING calcer on `emb0`), NOT the BM25 text calcer — the fixture pool wrongly included `embedding_features=[emb0]`, whose ±1.0 clouds dominated the split search. `gen_text_embedding_fixtures.py::_make_pool(text_only=True)` drops `emb0` from the text-calcer path; BM25/BoW/NaiveBayes fixtures regenerated single-thread text-only (BoW/NaiveBayes per-stage `.npy` byte-identical → zero regression; BM25 splits now the genuine O(1e-3) BM25 text-feature borders `0.00248965, 0.00127047, …`, `calcer_id=0BDFE5…`). Full BM25 per-stage oracle GREEN, 0 ignored: Splits/LeafValues ≤1e-5 from the ONLINE-estimate tree; StagedApprox/Predictions ≤1e-5 (2.9e-8) via the OFFLINE whole-set apply column (the Plain-mode online-tree / offline-apply contract `online_text.rs` documents — doc 0's online no-leakage value is 0 but its offline value routes it to the correct leaf, the one place BM25 differs from NaiveBayes). NO production trainer change (the Rust seam already produces O(1e-3) BM25 borders); NO #[ignore], NO weakened tolerance. `autonomous: false` (blocking SC-2/FEAT-01 closure checkpoint)
 
 ### Phase 6.6: Advanced Features & Non-Symmetric Trees
 

@@ -10,26 +10,37 @@
   `cb-data/src/text/bigram_dictionary.rs`, `cb-train/src/estimated/estimated_features.rs`) are
   clean of all four restriction lints (0 indexing_slicing/unwrap_used/expect_used/panic).
 
-## BM25 per-stage normalized-border scale (06.5-04)
+## BM25 per-stage normalized-border scale (06.5-04) — CLOSED (06.5-09, PATH-A)
 
-- **`crates/cb-oracle/fixtures/text_calcers/BM25/splits.npy`** stores catboost's BM25 estimated-
-  feature split borders in a NORMALIZED internal scale (`splits.npy` reaches ±1.24) while the raw
-  BM25 calcer scores — verified exact against an independent closed-form `bm25.cpp:12-83`
-  re-derivation, both online and offline — are O(1e-3). The upstream BM25 tree is also a genuine
-  depth-2 structure (`leaf_weights = [7,2,0,7]`) produced by catboost's estimated-feature averaging
-  across `permutation_count` permutations.
-- **Root cause (investigated exhaustively in 06.5-04):** neither the online read-before-update
-  prefix nor the offline whole-set estimate produces values near the ±1.24 border scale; no single
-  learn permutation's strict prefix reproduces the instrumented NaiveBayes per-prefix dump's
-  interior either. This is catboost's internal estimated-feature value NORMALIZATION + multi-
-  permutation ordered averaging — a TRAINER/serialization concern, NOT a BM25 calcer-math defect.
-- **What 06.5-04 gates instead (no `#[ignore]`, no weakened tolerance):** the BM25 calcer math +
-  online seam are oracle-green at the calcer-encoding level (`bm25_oracle_columns_match_closed_form`
-  ≤1e-5 vs an independent closed-form online reference, the no-leakage empty-prefix anchor, and the
-  SC-4 quantizer integration). NaiveBayes is FULLY per-stage oracle-green (Splits/LeafValues/
-  StagedApprox/Predictions ≤1e-5) because its online column's split border (0.590515) and clean 8/8
-  separation are robust to the normalization. The BM25 NORMALIZED per-stage borders are deferred to
-  the trainer estimated-feature-normalization work (a follow-on slice / Phase 6.6 trainer concern).
+**Status: CLOSED. This was a FIXTURE MISLABEL, not a real BM25 normalization. No trainer
+normalization exists or was needed.**
+
+- **Original symptom (06.5-04):** `crates/cb-oracle/fixtures/text_calcers/BM25/splits.npy` stored
+  ±1.24 / -0.550486 borders while the raw BM25 calcer scores — exact against an independent
+  closed-form `bm25.cpp:12-83` re-derivation, both online and offline — are O(1e-3). It was deferred
+  as a presumed catboost estimated-feature value-NORMALIZATION + multi-permutation averaging concern.
+- **Resolution (06.5-08 instrumented dump + 06.5-09 fix):** the ±1.24 borders were **never a BM25
+  normalization**. 06.5-08's `cb_instr_estimated_borders` dump proved the genuine BM25 estimated-
+  feature borders are O(1e-3) (`BestSplit` selects them verbatim from the raw column — source chain
+  `base_text_feature_estimator.h:74-88` → `estimated_features.cpp:204-250` → `split.cpp:45-46` →
+  `model.cpp:209` is entirely scale-preserving, no transform/averaging-rescale/standardization). The
+  committed `splits.npy` ±1.24 borders ALL carried `calcer_id=96AE6D4D…` — the **DEFAULT EMBEDDING
+  calcer on the `emb0` column**, NOT the BM25 text calcer. The fixture's pool inadvertently included
+  `embedding_features=["emb0"]` (the generator's `_make_pool` default); the well-separated embedding
+  clouds (centers ±1.0) dominated the split search, so the tree split on the EMBEDDING feature and
+  `splits.npy` recorded the embedding feature's borders, mislabeled as BM25's. The genuine depth-2
+  `[7,2,0,7]` structure was likewise the embedding clouds'.
+- **06.5-09 fix (PATH-A, fixture-correctness):** `gen_text_embedding_fixtures.py::_make_pool` gains
+  `text_only=True`; the text-calcer path (BoW/NaiveBayes/BM25) drops `emb0` so the fixture records the
+  genuine BM25 **text** feature. The regenerated BM25 `splits.npy` is O(1e-3) (`0.00248965, 0.00127047,
+  …`, `calcer_id=0BDFE5…`). The full BM25 per-stage oracle (`bm25_oracle_splits_match_upstream` /
+  `_leaf_values_match_upstream` / `_staged_approx_match_upstream` / `_predictions_match_upstream`) is
+  GREEN ≤1e-5, 0 ignored — the same gate NaiveBayes passes. Splits/LeafValues come from the ONLINE-
+  estimate tree; StagedApprox/Predictions are applied through the OFFLINE whole-set column (the Plain-
+  mode online-tree / offline-apply contract `online_text.rs` documents — the one place BM25 differs
+  from NaiveBayes, since BM25's online no-leakage doc-0 value is 0 but its offline value routes doc 0
+  to the correct leaf). **NO production trainer change** (the Rust seam already produced the O(1e-3)
+  borders), NO `#[ignore]`, NO weakened tolerance. FEAT-01 / SC-2 BM25 per-stage closed.
 
 ## Out-of-scope pre-existing dead const (06.5-06)
 
@@ -57,6 +68,12 @@
   The 06.5-07 SC-4 oracle isolates the JOIN question (closed) from the GRID question (open) by using a
   degenerate-separating corpus + structure-invariant Splits/LeafValues gating (per-tree leaf MULTISET
   ≤1e-5; magnitudes exact, only the ambiguous leaf ORDER freed).
-- **Impact:** FEAT-01 is NOT fully closed (BM25 per-stage normalized borders remain). FEAT-02 IS closed
-  (LDA documented-tolerance + KNN bit-exact; SC-4 re-exercises KNN end-to-end ≤1e-5). A follow-on
-  trainer-estimated-feature-normalization slice should own the BM25 normalized border + this general grid.
+- **Impact (updated 06.5-09):** FEAT-01 IS now fully closed — the "BM25 per-stage normalized borders"
+  item above was resolved as a fixture mislabel (06.5-08/09), not a real grid concern, so all three
+  text calcers BoW/NaiveBayes/BM25 are per-stage ≤1e-5. FEAT-02 IS closed (LDA documented-tolerance +
+  KNN bit-exact; SC-4 re-exercises KNN end-to-end ≤1e-5). What remains here is the GENERAL estimated-
+  feature stored-border-VALUE grid (KNN integer-vote `0.5` vs `1.5`; BoW digitization grid under a
+  non-degenerate XOR corpus) — predictions/staged match ≤1e-5 under the degenerate-separating SC-4
+  corpus, only the stored border VALUE differs. This is a separate, still-open TRAINER estimated-
+  feature quantization-grid concern (NOT FEAT-01/SC-2, which are closed); a follow-on
+  trainer-estimated-feature-grid slice should own it. It does NOT block FEAT-01 or FEAT-02.
