@@ -230,6 +230,7 @@ fn one_hot_predict_matches_oracle_locked_float_reference() {
         first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
+        monotone_constraints: cb_train::monotone_constraints_default(),
     };
     let mut float_staged = Vec::new();
     let float_model = train(

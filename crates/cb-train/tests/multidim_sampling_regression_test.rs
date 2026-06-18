@@ -83,6 +83,7 @@ fn sampling_params(loss: Loss, bootstrap_type: EBootstrapType) -> BoostParams {
         first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
+        monotone_constraints: cb_train::monotone_constraints_default(),
     }
 }
 

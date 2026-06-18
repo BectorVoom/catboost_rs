@@ -103,6 +103,7 @@ fn train_scenario(
         first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
+        monotone_constraints: cb_train::monotone_constraints_default(),
     };
 
     let mut staged = Vec::new();
@@ -202,6 +203,7 @@ fn check_scenario_first_trees(
         first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
+        monotone_constraints: cb_train::monotone_constraints_default(),
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 

@@ -98,6 +98,7 @@ fn train_scenario(
         first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
+        monotone_constraints: cb_train::monotone_constraints_default(),
     };
 
     let mut staged = Vec::new();
@@ -209,6 +210,7 @@ fn bootstrap_oracle_bayesian_first_tree() {
         first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
+        monotone_constraints: cb_train::monotone_constraints_default(),
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 

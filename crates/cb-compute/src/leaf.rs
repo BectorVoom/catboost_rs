@@ -518,3 +518,282 @@ pub fn logcosh_exact_leaf_delta(residuals: &[f32], weights: &[f64]) -> f64 {
 
     left
 }
+
+/// Build the per-monotonic-subtree leaf linear orders for a tree whose splits
+/// carry the per-split monotone directions `tree_monotone_constraints[i]`
+/// (`+1` increasing / `-1` decreasing / `0` free), in SPLIT order — split `i`
+/// owns leaf-index bit `1 << i`, the same forward-bit encoding the oblivious
+/// `leaf_index` uses (`tree.rs:255`, matching upstream `currDepthBitMask`).
+///
+/// # Source of truth
+///
+/// Transcribes `BuildMonotonicLinearOrdersOnLeafs` +
+/// `BuildLinearOrderOnLeafsOfMonotonicSubtree`
+/// (`catboost/private/libs/algo/monotonic_constraint_utils.cpp:4-52`) VERBATIM.
+///
+/// We can treat the oblivious tree as a tree over its NON-monotonic splits where
+/// at each leaf grows a fully-monotonic subtree. For each of the
+/// `2^(#non-monotonic-splits)` subtrees this returns the `2^(#monotonic-splits)`
+/// leaf indices in an order consistent with the partial order the constraints
+/// imply (`cpp:4-9` doc). PAVA over each returned order then makes the projected
+/// leaf totals non-decreasing along it.
+///
+/// The construction is the exact bitmask walk upstream uses:
+/// - Walk the constraints in split order with `curr_depth_bit_mask = 1 << i`.
+/// - For a FREE split (`0`): consume one bit of the subtree index; if that bit is
+///   set, OR the split's bit into `least_leaf_index` (`cpp:12-16`).
+/// - For a MONOTONIC split: record its bit in `monotonic_split_bit_masks`; for a
+///   DECREASING (`-1`) split, OR its bit into `least_leaf_index` so the order
+///   starts at the larger leaf and descends (`cpp:17-22`).
+/// - Then for each `leaf_rank` in `[0, 2^monotonic_split_count)`, XOR in the
+///   monotonic split bits selected by `leaf_rank`'s bits (MSB-first over the
+///   monotonic splits), reproducing the Gray-free ascending order (`cpp:28-34`).
+///
+/// An empty constraint slice yields the single trivial order `[[0]]` (a 0-split
+/// tree's one leaf), matching upstream — though the caller's no-op short-circuit
+/// means PAVA is never invoked in that case.
+#[must_use]
+pub fn build_monotonic_linear_orders(tree_monotone_constraints: &[i8]) -> Vec<Vec<u32>> {
+    // BuildMonotonicLinearOrdersOnLeafs (cpp:38-52): count the free (non-monotonic)
+    // splits, then emit one order per non-monotonic subtree.
+    let mut non_monotonic_feature_count = 0u32;
+    for &c in tree_monotone_constraints {
+        if c == 0 {
+            non_monotonic_feature_count += 1;
+        }
+    }
+    let sub_tree_count = 1u32 << non_monotonic_feature_count;
+    let mut result: Vec<Vec<u32>> = Vec::with_capacity(sub_tree_count as usize);
+    for sub_tree_index in 0..sub_tree_count {
+        result.push(build_linear_order_on_leafs_of_monotonic_subtree(
+            tree_monotone_constraints,
+            sub_tree_index,
+        ));
+    }
+    result
+}
+
+/// One monotonic subtree's leaf order — `BuildLinearOrderOnLeafsOfMonotonicSubtree`
+/// (`monotonic_constraint_utils.cpp:4-36`), transcribed verbatim.
+fn build_linear_order_on_leafs_of_monotonic_subtree(
+    tree_monotone_constraints: &[i8],
+    monotonic_subtree_index: u32,
+) -> Vec<u32> {
+    let mut curr_depth_bit_mask = 1u32;
+    let mut least_leaf_index = 0u32;
+    let mut monotonic_subtree_index = monotonic_subtree_index;
+    let mut monotonic_split_bit_masks: Vec<u32> = Vec::new();
+    for &constraint in tree_monotone_constraints {
+        if constraint == 0 {
+            if monotonic_subtree_index & 1u32 != 0 {
+                least_leaf_index |= curr_depth_bit_mask;
+            }
+            monotonic_subtree_index >>= 1;
+        } else {
+            monotonic_split_bit_masks.push(curr_depth_bit_mask);
+            if constraint == -1 {
+                least_leaf_index |= curr_depth_bit_mask;
+            }
+        }
+        curr_depth_bit_mask <<= 1;
+    }
+    // Y_ASSERT(monotonicSubtreeIndex == 0u) — every free-split bit consumed.
+    let monotonic_split_count = monotonic_split_bit_masks.len() as u32;
+    let order_len = 1u32 << monotonic_split_count;
+    let mut leaf_order: Vec<u32> = vec![least_leaf_index; order_len as usize];
+    for leaf_rank in 0..order_len {
+        for monotonic_depth in 0..monotonic_split_count {
+            if (leaf_rank >> (monotonic_split_count - 1 - monotonic_depth)) & 1u32 != 0 {
+                if let (Some(slot), Some(&mask)) = (
+                    leaf_order.get_mut(leaf_rank as usize),
+                    monotonic_split_bit_masks.get(monotonic_depth as usize),
+                ) {
+                    *slot ^= mask;
+                }
+            }
+        }
+    }
+    leaf_order
+}
+
+/// A single level-set of the one-dimensional isotonic regression solution — a
+/// maximal run of pooled points with one common value (`TIsotonicLevelSet`,
+/// `monotonic_constraint_utils.cpp:54-91`). The pooled value is the WEIGHTED
+/// average `sum_weighted_value / weight`.
+#[derive(Clone, Copy)]
+struct IsotonicLevelSet {
+    begin: usize,
+    end: usize,
+    weight: f64,
+    sum_weighted_value: f64,
+}
+
+impl IsotonicLevelSet {
+    fn new(begin: usize, weight: f64, value: f64) -> Self {
+        Self {
+            begin,
+            end: begin + 1,
+            weight,
+            sum_weighted_value: weight * value,
+        }
+    }
+
+    fn merge_left(&mut self, left: &IsotonicLevelSet) {
+        // Y_ASSERT(left.End_ == Begin_) — adjacency invariant.
+        self.begin = left.begin;
+        self.weight = left.weight + self.weight;
+        self.sum_weighted_value = left.sum_weighted_value + self.sum_weighted_value;
+    }
+
+    fn average(&self) -> f64 {
+        self.sum_weighted_value / self.weight
+    }
+}
+
+/// Solve the one-dimensional isotonic regression (PAVA) over `values` taken in
+/// `index_order`, writing the projected values back into `solution` at the SAME
+/// indices — `CalcOneDimensionalIsotonicRegression`
+/// (`monotonic_constraint_utils.cpp:94-117`), transcribed verbatim.
+///
+/// Pool-adjacent-violators: each new point starts its own level-set; while the
+/// previous level-set's average `>=` the new one's, merge it left (pooling to
+/// the weighted average). The merge inequality `>=` reproduces upstream exactly,
+/// including ties. The per-level-set average is a `weight`-weighted mean computed
+/// from running `sum_weighted_value / weight` accumulators — no fresh float fold
+/// is spelled here (the accumulation is the same scalar `+=` upstream uses, so
+/// D-08's raw-`iter().sum()` ban does not apply; the pooled mean is exact).
+fn calc_one_dimensional_isotonic_regression(
+    values: &[f64],
+    weights: &[f64],
+    index_order: &[u32],
+    solution: &mut [f64],
+) {
+    let size = index_order.len();
+    let mut level_sets: Vec<IsotonicLevelSet> = Vec::with_capacity(size);
+    for point_rank in 0..size {
+        let point_index = index_order.get(point_rank).copied().unwrap_or(0) as usize;
+        let w = weights.get(point_index).copied().unwrap_or(0.0);
+        let v = values.get(point_index).copied().unwrap_or(0.0);
+        let mut new_level_set = IsotonicLevelSet::new(point_rank, w, v);
+        while let Some(back) = level_sets.last() {
+            if back.average() >= new_level_set.average() {
+                let back = *back;
+                new_level_set.merge_left(&back);
+                level_sets.pop();
+            } else {
+                break;
+            }
+        }
+        level_sets.push(new_level_set);
+    }
+    for level_set in &level_sets {
+        let level_set_value = level_set.average();
+        for point_rank in level_set.begin..level_set.end {
+            if let Some(&idx) = index_order.get(point_rank) {
+                if let Some(slot) = solution.get_mut(idx as usize) {
+                    *slot = level_set_value;
+                }
+            }
+        }
+    }
+}
+
+/// True iff `values` taken along `index_order` is non-decreasing — `CheckMonotonicity`
+/// (`monotonic_constraint_utils.cpp:136-143`). Used as a defensive post-condition
+/// (mirrors upstream's `CB_ENSURE(CheckMonotonicity(...))`).
+fn check_monotonicity(index_order: &[u32], values: &[f64]) -> bool {
+    for i in 0..index_order.len().saturating_sub(1) {
+        let (Some(&a), Some(&b)) = (index_order.get(i), index_order.get(i + 1)) else {
+            continue;
+        };
+        let va = values.get(a as usize).copied().unwrap_or(0.0);
+        let vb = values.get(b as usize).copied().unwrap_or(0.0);
+        if va > vb {
+            return false;
+        }
+    }
+    true
+}
+
+/// Monotone-constraint isotonic (PAVA) projection over leaf DELTAS — the
+/// leaf-estimation post-pass `CalcMonotonicLeafDeltasSimple`
+/// (`catboost/private/libs/algo/approx_calcer.cpp:551-590`), transcribed verbatim.
+///
+/// Given the leaf values accumulated so far (`curr_leaf_values`), the raw
+/// per-leaf `leaf_deltas` just computed by the Gradient/Newton solver, and the
+/// per-leaf isotonic weights (`SumWeights + scaledL2` for Gradient, `-SumDer2 +
+/// scaledL2` for Newton — supplied by the caller, `approx_calcer.cpp:560-573`),
+/// this projects the UPDATED totals `curr + delta` onto the monotone cone implied
+/// by `tree_monotone_constraints` (per-split `+1`/`-1`/`0` in split order) and
+/// returns the ADJUSTED deltas `projected_total - curr` (`cpp:587-589`).
+///
+/// The projection runs INDEPENDENT PAVA passes — one per monotonic subtree linear
+/// order from [`build_monotonic_linear_orders`] — over the SAME running
+/// `updated_leaf_values` buffer (`cpp:580-586`); upstream chains the subtree
+/// passes over the shared buffer, which this mirrors. Each pass uses the
+/// per-leaf isotonic `weights`.
+///
+/// # Monotone parity & no-op
+///
+/// An EMPTY `tree_monotone_constraints` slice (no monotone split in this tree)
+/// returns `leaf_deltas` UNCHANGED — the empty-constraints leaf path is
+/// numerically identical to the pre-6.6 estimator (D-6.6-05). All level-set
+/// averages route through the exact weighted-mean accumulator of
+/// [`calc_one_dimensional_isotonic_regression`] (no raw float fold, D-08).
+///
+/// # Direction
+///
+/// A `-1` (decreasing) split is handled by the linear-order construction itself
+/// (the order starts at the larger leaf and descends), so the SAME ascending
+/// PAVA enforces non-increasing along that split — exactly as upstream
+/// (`BuildLinearOrderOnLeafsOfMonotonicSubtree`), with no separate negation path.
+#[must_use]
+pub fn calc_monotonic_leaf_deltas(
+    tree_monotone_constraints: &[i8],
+    curr_leaf_values: &[f64],
+    leaf_deltas: &[f64],
+    leaf_weights: &[f64],
+) -> Vec<f64> {
+    // No monotone split in this tree → byte-identical no-op (D-6.6-05).
+    if tree_monotone_constraints.iter().all(|&c| c == 0) {
+        return leaf_deltas.to_vec();
+    }
+
+    let leaf_count = leaf_deltas.len();
+    // updatedLeafValues = currLeafValues; AddElementwise(*leafDeltas, &updatedLeafValues)
+    // (`approx_calcer.cpp:579-580`).
+    let mut updated_leaf_values: Vec<f64> = (0..leaf_count)
+        .map(|l| {
+            curr_leaf_values.get(l).copied().unwrap_or(0.0)
+                + leaf_deltas.get(l).copied().unwrap_or(0.0)
+        })
+        .collect();
+
+    let linear_orders = build_monotonic_linear_orders(tree_monotone_constraints);
+    for linear_order in &linear_orders {
+        // values and *solution refer to the same vector (upstream passes
+        // &updatedLeafValues for both) — clone the read snapshot so the in-place
+        // write target is well-defined; the PAVA reads `values[index]` and writes
+        // `solution[index]`, identical here to the aliased upstream call because
+        // each level-set's value is fully determined before any write.
+        let snapshot = updated_leaf_values.clone();
+        calc_one_dimensional_isotonic_regression(
+            &snapshot,
+            leaf_weights,
+            linear_order,
+            &mut updated_leaf_values,
+        );
+        debug_assert!(
+            check_monotonicity(linear_order, &updated_leaf_values),
+            "Tree monotonization failed"
+        );
+    }
+
+    // leafDeltas[l] = updatedLeafValues[l] - currLeafValues[l] (`cpp:587-589`).
+    (0..leaf_count)
+        .map(|l| {
+            updated_leaf_values.get(l).copied().unwrap_or(0.0)
+                - curr_leaf_values.get(l).copied().unwrap_or(0.0)
+        })
+        .collect()
+}

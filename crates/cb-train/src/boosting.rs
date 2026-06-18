@@ -272,6 +272,23 @@ pub struct BoostParams {
     /// ([`penalties_coefficient_default`]). With both penalty vectors empty this
     /// coefficient is never consumed, so the default path stays byte-identical.
     pub penalties_coefficient: f64,
+    /// Per-FLOAT-feature monotone constraints (`monotone_constraints`, FEAT-03 —
+    /// `monotonic_constraint_utils.cpp`). Each entry is `+1` (the model output must
+    /// be NON-DECREASING in that feature), `-1` (NON-INCREASING), or `0` (free).
+    /// Enforced as an isotonic (PAVA) projection over the per-leaf DELTAS during
+    /// leaf estimation (`CalcMonotonicLeafDeltasSimple`, `approx_calcer.cpp:551`),
+    /// AFTER the tree structure is built — a leaf-value post-pass, NOT a
+    /// structure-time constraint (D-6.6-06). Monotone constraints are
+    /// OBLIVIOUS-ONLY: upstream EXPLICITLY rejects them under every non-symmetric
+    /// grow policy (`monotonic_constraint_utils.h:42`,
+    /// `CB_ENSURE_INTERNAL(monotoneConstraints.empty(), "...unsupported for
+    /// non-symmetric trees yet")`) — that escalated gap (D-6.6-07) is enforced by
+    /// the typed guard in [`validate_monotone_constraints`]. An EMPTY vector (the
+    /// upstream default) means NO monotone split, so the leaf path is byte-identical
+    /// to the pre-6.6 estimator (D-6.6-05). Out-of-range feature indices are treated
+    /// as free (`0`). Pinned EXPLICITLY ([`monotone_constraints_default`]); only the
+    /// monotone fixture sets a non-default vector.
+    pub monotone_constraints: Vec<i8>,
 }
 
 /// The canonical default `feature_weights` (EMPTY — every float feature weight is
@@ -312,6 +329,17 @@ pub fn per_object_feature_penalties_default() -> Vec<f64> {
 #[must_use]
 pub fn penalties_coefficient_default() -> f64 {
     1.0
+}
+
+/// The canonical default `monotone_constraints` (EMPTY — no float feature is
+/// monotone-constrained, the upstream `feature_penalties_options.cpp` default).
+/// Pinned EXPLICITLY at every `BoostParams` construction site (RESEARCH Pitfall 6
+/// — never auto-selected); only the monotone fixture sets a non-default vector.
+/// An empty vector means NO monotone split, so the leaf-estimation path is
+/// byte-identical to the pre-6.6 estimator (D-6.6-05).
+#[must_use]
+pub fn monotone_constraints_default() -> Vec<i8> {
+    Vec::new()
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -1122,6 +1150,92 @@ fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
     Ok(())
 }
 
+/// Reject unsupported `monotone_constraints` configurations up front — the FEAT-03
+/// escalated-gap guard (D-6.6-07), mirroring upstream's
+/// `CB_ENSURE_INTERNAL(monotoneConstraints.empty(), "...unsupported for
+/// non-symmetric trees yet")` (`monotonic_constraint_utils.h:42`).
+///
+/// Monotone constraints are OBLIVIOUS-ONLY: upstream throws under EVERY
+/// non-symmetric grow policy because there is no defined leaf-monotonization for a
+/// non-symmetric structure. cb-train only HAS the oblivious (SymmetricTree)
+/// grower today, so any non-empty `monotone_constraints` necessarily routes
+/// through the supported oblivious path — there is no way to construct an
+/// unsupported combination yet. The guard therefore validates only what is
+/// REACHABLE now: each entry must be a valid direction `{-1, 0, +1}` (a malformed
+/// constraint vector errors rather than silently mis-encoding the PAVA order).
+///
+/// # Deferred (owned by Plan 06.6-04, D-6.6-07)
+///
+/// The `monotone_constraints` × `grow_policy ∈ {Lossguide, Depthwise}` and the
+/// `grow_policy == Region` typed-error guards CANNOT be written here because the
+/// `grow_policy` enum/field does not exist until Plan 06.6-04 (the plan's
+/// do-NOT-invent-a-partial-enum directive). Plan 06.6-04 OWNS adding
+/// `grow_policy` and extending THIS guard to reject those combinations the moment
+/// the field lands (its acceptance criteria + `monotone_oracle_test` assertions).
+/// Until then, the oblivious-only routing makes the unsupported combinations
+/// unconstructable, so no fabricated output is possible.
+fn validate_monotone_constraints(monotone_constraints: &[i8]) -> CbResult<()> {
+    for (f, &c) in monotone_constraints.iter().enumerate() {
+        if c != -1 && c != 0 && c != 1 {
+            return Err(CbError::OutOfRange(format!(
+                "monotone_constraints[{f}] = {c} is invalid: each entry must be \
+                 -1 (non-increasing), 0 (free), or +1 (non-decreasing)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Map the per-feature `monotone_constraints` onto this oblivious tree's SPLITS,
+/// in split order — `GetTreeMonotoneConstraints`
+/// (`monotonic_constraint_utils.cpp:120-134`). Split `i` (a `value > border` test
+/// on float feature `splits[i].feature`) gets that feature's constraint, or `0`
+/// when the feature is unconstrained / out of range. The returned vector is in the
+/// SAME split order the forward-bit leaf index uses, so split `i` owns leaf bit
+/// `1 << i` (matching upstream `currDepthBitMask`).
+fn tree_monotone_constraints(splits: &[Split], monotone_constraints: &[i8]) -> Vec<i8> {
+    splits
+        .iter()
+        .map(|s| monotone_constraints.get(s.feature).copied().unwrap_or(0))
+        .collect()
+}
+
+/// Per-leaf isotonic weights for the monotone PAVA pass —
+/// `CalcMonotonicLeafDeltasSimple` (`approx_calcer.cpp:560-573`): the Gradient leaf
+/// weight is `SumWeights + scaledL2`, the Newton leaf weight is `-SumDer2 +
+/// scaledL2`. These are reduced over the SAME `leaf_value_leaf_of` partition the
+/// leaf-delta solver used, through `cb_core::sum_f64` (D-08), so the isotonic
+/// weighted means are exact. Simple reuses the Gradient weight (it shares the
+/// Gradient leaf delta). Exact has no Newton/Gradient leaf weight; it falls back to
+/// the Gradient `SumWeights + scaledL2` form (the document-weight isotonic weight),
+/// which is the only defined per-leaf weight for a quantile leaf.
+fn monotonic_leaf_isotonic_weights(
+    method: LeafMethod,
+    leaf_of: &[usize],
+    weighted_der1: &[f64],
+    der2: &[f64],
+    weights: &[f64],
+    scaled_l2: f64,
+    n_leaves: usize,
+) -> Vec<f64> {
+    match method {
+        LeafMethod::Newton => {
+            let weighted_der2: Vec<f64> = der2
+                .iter()
+                .zip(weights.iter())
+                .map(|(&d, &w)| d * w)
+                .collect();
+            let sum_der2 = reduce_leaf_der2(leaf_of, &weighted_der2, n_leaves);
+            sum_der2.iter().map(|&d2| -d2 + scaled_l2).collect()
+        }
+        // Gradient / Simple / Exact: SumWeights + scaledL2.
+        LeafMethod::Gradient | LeafMethod::Simple | LeafMethod::Exact => {
+            let stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            stats.iter().map(|s| s.sum_weight + scaled_l2).collect()
+        }
+    }
+}
+
 /// Compute the per-leaf deltas for the selected [`LeafMethod`] (TRAIN-03 / D-09).
 ///
 /// Gradient/Newton/Simple are closed-form over each leaf's ordered reduced sums
@@ -1860,6 +1974,13 @@ fn train_inner<R: Runtime>(
     // compute the weighted median instead of that loss's true optimum, and an
     // Lq{q<2} Newton step would inject inf/NaN into the leaf denominator.
     validate_leaf_method(&params.loss, params.leaf_method)?;
+
+    // Reject malformed / unsupported monotone_constraints up front (FEAT-03 /
+    // D-6.6-07): each entry must be a valid direction {-1,0,+1}; the
+    // grow_policy-dependent rejections (non-symmetric × monotone, Region) are
+    // owned by Plan 06.6-04 once `grow_policy` lands (oblivious-only is the only
+    // reachable path today, so no fabricated output is possible).
+    validate_monotone_constraints(&params.monotone_constraints)?;
 
     // The multilabel losses (MultiLogloss / MultiCrossEntropy) carry a DIM-MAJOR
     // target of length `dim*n` (one label per dimension per object), so `n` cannot
@@ -3337,6 +3458,46 @@ fn train_inner<R: Runtime>(
                     n_leaves,
                     d,
                 );
+                // FEAT-03 monotone post-pass (D-6.6-06): project the RAW per-leaf
+                // deltas onto the monotone cone implied by `monotone_constraints`
+                // via the isotonic (PAVA) leaf-value pass
+                // (`CalcMonotonicLeafDeltasSimple`, `approx_calcer.cpp:551`). This
+                // runs AFTER the structure-built leaf estimator and BEFORE the
+                // `learning_rate`/centering `NormalizeLeafValues`, exactly where
+                // upstream inserts it (the deltas it adjusts are the raw,
+                // pre-learning-rate ones). It is OBLIVIOUS-ONLY (this is the
+                // symmetric grower) and a NO-OP when `monotone_constraints` is empty,
+                // so the default leaf path stays byte-identical (D-6.6-05). The
+                // current within-iteration leaf totals are 0 (leaf_estimation
+                // iterations == 1, `curr == 0`).
+                let leaf_deltas = if params.monotone_constraints.is_empty() {
+                    leaf_deltas
+                } else {
+                    let tree_monotone = tree_monotone_constraints(
+                        &grown.splits,
+                        &params.monotone_constraints,
+                    );
+                    if tree_monotone.iter().all(|&c| c == 0) {
+                        leaf_deltas
+                    } else {
+                        let iso_weights = monotonic_leaf_isotonic_weights(
+                            params.leaf_method,
+                            &leaf_value_leaf_of,
+                            der1_d,
+                            der2_d,
+                            leaf_weights_for_deltas,
+                            scaled_l2,
+                            n_leaves,
+                        );
+                        let curr_zero = vec![0.0_f64; n_leaves];
+                        cb_compute::calc_monotonic_leaf_deltas(
+                            &tree_monotone,
+                            &curr_zero,
+                            &leaf_deltas,
+                            &iso_weights,
+                        )
+                    }
+                };
                 // RAW deltas (NO learning_rate yet); see `NormalizeLeafValues` below.
                 leaf_values.extend_from_slice(&leaf_deltas);
             }

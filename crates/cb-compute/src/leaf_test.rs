@@ -1,8 +1,9 @@
 //! Unit tests for leaf-value estimation primitives (TRAIN-03 all four methods).
 
 use crate::leaf::{
-    calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
-    newton_leaf_delta, scale_l2_reg, simple_leaf_delta, solve_symmetric_newton,
+    build_monotonic_linear_orders, calc_average, calc_monotonic_leaf_deltas, exact_leaf_delta,
+    gradient_leaf_delta, logcosh_exact_leaf_delta, newton_leaf_delta, scale_l2_reg,
+    simple_leaf_delta, solve_symmetric_newton,
 };
 
 #[test]
@@ -205,4 +206,125 @@ fn logcosh_exact_leaf_delta_matches_bisection_reference() {
 
     let v = logcosh_exact_leaf_delta(&residuals, &weights);
     assert!((v - left).abs() < 1e-9, "got {v}, want {left}");
+}
+
+// --- Monotone-constraint isotonic (PAVA) projection (FEAT-03) ---------------
+
+/// `build_monotonic_linear_orders` for a single monotonic feature (+1) on a
+/// depth-1 tree reproduces `BuildMonotonicLinearOrdersOnLeafs`
+/// (`monotonic_constraint_utils.cpp:38-52`): one non-monotonic feature count = 0
+/// → exactly one subtree; its order over the 2 leaves is `[leaf0, leaf1]` (the
+/// least-leaf is 0 for a `+1` constraint, then leafRank 1 XORs in bit `1`).
+#[test]
+fn build_monotonic_linear_orders_single_increasing_split() {
+    let orders = build_monotonic_linear_orders(&[1]);
+    assert_eq!(orders, vec![vec![0u32, 1u32]]);
+}
+
+/// A single DECREASING (`-1`) split flips the least-leaf: `leastLeafIndex |=
+/// bit` so the order starts at leaf 1 and descends to leaf 0
+/// (`cpp:19-21`). The PAVA over this order then enforces NON-INCREASING values
+/// along the split.
+#[test]
+fn build_monotonic_linear_orders_single_decreasing_split() {
+    let orders = build_monotonic_linear_orders(&[-1]);
+    assert_eq!(orders, vec![vec![1u32, 0u32]]);
+}
+
+/// Two splits, the FIRST non-monotonic (0) and the SECOND monotonic (+1):
+/// `nonMonotonicFeatureCount == 1` → 2 subtrees. Split 0 is bit `1`, split 1 is
+/// bit `2`. Subtree 0 (the non-monotonic bit = 0) orders leaves `[0, 2]`;
+/// subtree 1 (the non-monotonic bit = 1) orders leaves `[1, 3]` — each subtree
+/// is the monotonic order along the second split within a fixed first-split
+/// value (`cpp:4-52`).
+#[test]
+fn build_monotonic_linear_orders_one_free_one_increasing() {
+    let orders = build_monotonic_linear_orders(&[0, 1]);
+    assert_eq!(orders, vec![vec![0u32, 2u32], vec![1u32, 3u32]]);
+}
+
+/// Empty constraints → exactly one trivial subtree containing every leaf in
+/// natural order; the PAVA over it is a NO-OP for any value vector. (Upstream
+/// `BuildMonotonicLinearOrdersOnLeafs([])` returns `[[0]]` for a 0-split tree;
+/// for the no-op path the caller never reaches PAVA — see the no-op test.)
+#[test]
+fn calc_monotonic_leaf_deltas_empty_constraints_is_noop() {
+    let curr = [0.0_f64, 0.0, 0.0, 0.0];
+    let deltas = [0.5_f64, -0.3, 0.9, 0.1];
+    let weights = [4.0_f64, 4.0, 4.0, 4.0];
+    let out = calc_monotonic_leaf_deltas(&[], &curr, &deltas, &weights);
+    assert_eq!(out, deltas.to_vec());
+}
+
+/// A depth-1 increasing constraint where the raw deltas VIOLATE monotonicity
+/// (leaf0 delta > leaf1 delta). PAVA pools the two equal-weight leaves to their
+/// weighted average; the returned deltas, added to `curr` (== 0), must be
+/// NON-DECREASING along `[0, 1]`. With equal weights the pooled value is the
+/// arithmetic mean `(1.0 + 0.0)/2 = 0.5`, so both deltas become `0.5`.
+#[test]
+fn calc_monotonic_leaf_deltas_pools_increasing_violation() {
+    let curr = [0.0_f64, 0.0];
+    let deltas = [1.0_f64, 0.0]; // violates +1 (leaf0 > leaf1)
+    let weights = [3.0_f64, 3.0];
+    let out = calc_monotonic_leaf_deltas(&[1], &curr, &deltas, &weights);
+    assert!((out[0] - 0.5).abs() < 1e-12, "out[0] = {}", out[0]);
+    assert!((out[1] - 0.5).abs() < 1e-12, "out[1] = {}", out[1]);
+    // Monotone non-decreasing along the order [0, 1].
+    assert!(out[0] <= out[1] + 1e-12);
+}
+
+/// Weighted pooling: an increasing violation with UNEQUAL weights pools to the
+/// WEIGHTED average (`SumWeightedValue / Weight`, `TIsotonicLevelSet::Average`).
+/// leaf0 (value 1.0, weight 1) and leaf1 (value 0.0, weight 3) pool to
+/// `(1*1 + 3*0)/(1+3) = 0.25`.
+#[test]
+fn calc_monotonic_leaf_deltas_weighted_pool() {
+    let curr = [0.0_f64, 0.0];
+    let deltas = [1.0_f64, 0.0];
+    let weights = [1.0_f64, 3.0];
+    let out = calc_monotonic_leaf_deltas(&[1], &curr, &deltas, &weights);
+    assert!((out[0] - 0.25).abs() < 1e-12, "out[0] = {}", out[0]);
+    assert!((out[1] - 0.25).abs() < 1e-12, "out[1] = {}", out[1]);
+}
+
+/// An ALREADY-monotone increasing delta vector is returned UNCHANGED (PAVA never
+/// merges when each new level-set average exceeds the previous).
+#[test]
+fn calc_monotonic_leaf_deltas_already_monotone_unchanged() {
+    let curr = [0.0_f64, 0.0];
+    let deltas = [-0.2_f64, 0.7];
+    let weights = [5.0_f64, 5.0];
+    let out = calc_monotonic_leaf_deltas(&[1], &curr, &deltas, &weights);
+    assert!((out[0] - (-0.2)).abs() < 1e-12);
+    assert!((out[1] - 0.7).abs() < 1e-12);
+}
+
+/// A decreasing (`-1`) constraint enforces NON-INCREASING in leaf index. The
+/// linear order is `[1, 0]` (larger leaf first), so PAVA enforces
+/// `value[leaf1] <= value[leaf0]`. A raw pair leaf0=0.0, leaf1=1.0 VIOLATES that
+/// (leaf1 > leaf0): along the order `[1, 0]` the sequence is 1.0 then 0.0
+/// (decreasing) → PAVA pools the two equal-weight leaves to their mean 0.5.
+#[test]
+fn calc_monotonic_leaf_deltas_decreasing_pools_violation() {
+    let curr = [0.0_f64, 0.0];
+    let deltas = [0.0_f64, 1.0]; // leaf0=0.0, leaf1=1.0 — violates -1 (leaf1 > leaf0)
+    let weights = [2.0_f64, 2.0];
+    let out = calc_monotonic_leaf_deltas(&[-1], &curr, &deltas, &weights);
+    // Order [1,0]: values 1.0 (leaf1) then 0.0 (leaf0) decreasing → pool to 0.5.
+    assert!((out[0] - 0.5).abs() < 1e-12, "out[0] = {}", out[0]);
+    assert!((out[1] - 0.5).abs() < 1e-12, "out[1] = {}", out[1]);
+}
+
+/// The projection operates on `curr + delta` and returns the ADJUSTED DELTA
+/// (`updatedLeafValues[l] - currLeafValues[l]`, `approx_calcer.cpp:587-589`).
+/// With a non-zero `curr`, an already-monotone TOTAL is unchanged so the delta
+/// is returned verbatim.
+#[test]
+fn calc_monotonic_leaf_deltas_returns_delta_relative_to_curr() {
+    let curr = [10.0_f64, 20.0];
+    let deltas = [0.1_f64, 0.2]; // totals 10.1, 20.2 — monotone increasing
+    let weights = [4.0_f64, 4.0];
+    let out = calc_monotonic_leaf_deltas(&[1], &curr, &deltas, &weights);
+    assert!((out[0] - 0.1).abs() < 1e-12);
+    assert!((out[1] - 0.2).abs() < 1e-12);
 }
