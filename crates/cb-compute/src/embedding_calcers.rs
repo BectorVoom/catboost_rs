@@ -654,12 +654,16 @@ impl KnnCalcer {
     pub fn update(&mut self, target: f32, embed: &[f32]) -> CbResult<()> {
         self.cloud.add_vector(embed)?;
         if self.is_classification {
-            // `(ui32)target` — the class label as a non-negative integer.
-            let class = if target.is_finite() && target >= 0.0 {
-                target as usize
-            } else {
-                0
-            };
+            // The class label must be a non-negative integer in `[0, num_classes)`.
+            // Upstream `(ui32)target` wraps/UB on negative/fractional/non-finite
+            // labels; we instead surface a typed error rather than silently
+            // bucketing every out-of-domain label into class 0 (WR-01).
+            if !(target.is_finite() && target >= 0.0 && target.fract() == 0.0) {
+                return Err(CbError::OutOfRange(format!(
+                    "KnnCalcer::update: class label {target} is not a non-negative integer"
+                )));
+            }
+            let class = target as usize;
             self.target_classes.push(class);
         } else {
             self.targets.push(target);
