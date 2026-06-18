@@ -38,3 +38,25 @@
   06.5-05 (commit `4c194ae`), NOT by 06.5-06. Out of scope per the SCOPE BOUNDARY rule (pre-
   existing, not caused by this plan's KNN additions). Warning-only (not a denied lint); does not
   affect the build or any test. Left untouched.
+
+## General estimated-feature quantization-GRID parity (06.5-07)
+
+- **What:** the SC-4 *join* (mixed text+embedding+numeric → existing quantizer → tree) is CLOSED in
+  06.5-07 — the combined model's StagedApprox + Predictions match upstream catboost 1.2.10 ≤1e-5
+  bit-for-bit. What remains open is the exact estimated-feature *quantization GRID* (the border VALUES
+  upstream stores for estimated columns), which generalizes the 06.5-04 BM25 ±1.24 normalized-border
+  deferral to the other calcers:
+  - **KNN integer-vote border:** upstream stores `0.5` for the KNN class-vote split; the Rust
+    `select_borders_greedy_logsum` on the `{0, k}` vote distribution returns the midpoint (e.g. `1.5`).
+    Both induce the SAME 8/8 partition, so predictions match — but the stored border VALUE differs.
+  - **BoW / digitization grid:** an XOR-structured non-degenerate mixed corpus (prototyped in 06.5-07
+    and REJECTED) forces the model onto exact KNN vote-count + BoW digitization grid parity; under it
+    the staged/predictions did NOT match ≤1e-5, confirming the grid is a distinct, still-open concern.
+- **Why deferred:** this is a TRAINER estimated-feature-normalization / serialization concern (how
+  catboost picks the stored border grid for estimated features), NOT a calcer-math or SC-4-join defect.
+  The 06.5-07 SC-4 oracle isolates the JOIN question (closed) from the GRID question (open) by using a
+  degenerate-separating corpus + structure-invariant Splits/LeafValues gating (per-tree leaf MULTISET
+  ≤1e-5; magnitudes exact, only the ambiguous leaf ORDER freed).
+- **Impact:** FEAT-01 is NOT fully closed (BM25 per-stage normalized borders remain). FEAT-02 IS closed
+  (LDA documented-tolerance + KNN bit-exact; SC-4 re-exercises KNN end-to-end ≤1e-5). A follow-on
+  trainer-estimated-feature-normalization slice should own the BM25 normalized border + this general grid.

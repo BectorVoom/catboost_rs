@@ -173,7 +173,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | LOSS-08 | Phase 6.4 | Complete |
 | LOSS-09 | Phase 6.4 | Complete (06.4-01; 5 GPU-only fns self-oracled per D-6.4-06) |
 | FEAT-01 | Phase 6.5 | In Progress (06.5-02 tokenizer/dictionary/digitizer SC-1 bit-exact; 06.5-03 BoW per-stage ≤1e-5; 06.5-04 NaiveBayes per-stage ≤1e-5 + BM25 calcer math bit-exact ≤1e-5. REMAINING: BM25 per-stage NORMALIZED-border scale deferred to catboost trainer estimated-feature normalization — see 06.5 deferred-items.md) |
-| FEAT-02 | Phase 6.5 | In Progress (06.5-01 Wave-0 ground truth: LDA/KNN single-thread fixtures + instrumented projection/neighbor dumps frozen; parity in Plans 05-06) |
+| FEAT-02 | Phase 6.5 | Complete (06.5-05 LDA per-stage parity via binarization stability + documented raw-projection tolerance; 06.5-06 KNN neighbor-id bit-exact → integer-vote bit-exact → byte-identical per-stage; 06.5-07 SC-4 mixed text+embedding end-to-end re-exercises KNN: StagedApprox + Predictions ≤1e-5 bit-for-bit) |
 | FEAT-03 | Phase 6.6 | Pending |
 | FEAT-04 | Phase 6.6 | Pending |
 | FEAT-05 | Phase 6.6 | Pending |

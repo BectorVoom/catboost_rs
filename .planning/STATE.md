@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.5-05-PLAN.md
-last_updated: "2026-06-18T03:39:25.651Z"
-last_activity: "2026-06-18 -- 06.5-04 COMPLETE: NaiveBayes (naive_bayesian.cpp:14-63, LogProb+Softmax, priors 0.5, width numClasses>2?numClasses:1) + BM25 (bm25.cpp:12-83, IDF+saturation, k=1.5/b=0.75/truncate=1e-3, width numClasses) as IOnlineFeatureEstimators over the TFold learn permutation with the read-before-update prefix (D-03, mirrors ctr/online.rs); the ONLINE estimate feeds the Plain tree (NaiveBayes split border 0.590515 matches online, NOT offline 0.5). NaiveBayes per-stage oracle <=1e-5 (Splits/LeafValues/StagedApprox/Predictions) + per-prefix leakage-order anchors (no-leakage doc0=0.5 + head/tail prefix-boundary vs instrumented dump). BM25 calcer math bit-exact <=1e-5 vs independent closed-form online ref + no-leakage anchor + SC-4 quantizer; BM25 per-stage NORMALIZED-border scale (splits.npy +-1.24 vs raw O(1e-3)) + depth-2 [7,2,0,7] from catboost permutation averaging DEFERRED (trainer normalization, not calcer math; deferred-items.md). D-04 non-text byte-identical (BoW + e2e oracles unchanged). cb-train lib 210 + cb-compute lib 151 pass; new lib files clippy-clean. Commits d53a7a1 (Task1 math) / 8eeef44 (Task2 prefix+oracles)"
+stopped_at: Completed 06.5-07-PLAN.md
+last_updated: "2026-06-18T05:20:00.000Z"
+last_activity: "2026-06-18 -- 06.5-07 COMPLETE (SC-4 TERMINAL GATE): build_mixed_estimated_features joins numeric + BoW text + KNN embedding into ONE float-feature layout [numeric|text|embedding] through the EXISTING select_borders_greedy_logsum quantizer->tree (SC-4, no parallel quantizer; KNN offline whole-set Plain-tree estimate; inert-when-absent D-04). SC-4 mixed end-to-end oracle: StagedApprox + Predictions match upstream catboost 1.2.10 <=1e-5 BIT-FOR-BIT (text AND embedding flow together -> upstream's model); Splits/LeafValues gated structure-invariantly under a documented feature-selection tie (1 distinct split/tree + valid separating border; per-tree leaf-value MULTISET <=1e-5 -- magnitudes exact, only ambiguous leaf ORDER freed; upstream's own splits.npy shows the tie [0.0,0.0,0.5,0.0,0.0]). Mixed model scoped to BoW + KNN (the two fully per-stage-closed calcers); BM25 normalized borders (06.5-04) + LDA raw-projection tolerance (06.5-05) EXCLUDED. 5 oracle tests 0-ignored; cb-train lib 228 + cb-data 106 + cb-compute 176; D-04 no-text e2e unchanged; clippy-clean. FEAT-02 COMPLETE; FEAT-01 residual = BM25 per-stage normalized borders + general estimated-feature quantization-GRID parity (deferred to a trainer-normalization slice). Commits a20cd9b (orchestration) / 2be89ba (oracle+fixture)"
 progress:
   total_phases: 14
   completed_phases: 9
   total_plans: 80
-  completed_plans: 79
-  percent: 64
+  completed_plans: 80
+  percent: 65
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 06.5 (text-and-embedding-features) — EXECUTING
-Plan: 7 of 7
-Status: Ready to execute
-Last activity: 2026-06-18 -- 06.5-04 COMPLETE: NaiveBayes (naive_bayesian.cpp:14-63, LogProb+Softmax, priors 0.5, width numClasses>2?numClasses:1) + BM25 (bm25.cpp:12-83, IDF+saturation, k=1.5/b=0.75/truncate=1e-3, width numClasses) as IOnlineFeatureEstimators over the TFold learn permutation with the read-before-update prefix (D-03, mirrors ctr/online.rs); the ONLINE estimate feeds the Plain tree (NaiveBayes split border 0.590515 matches online, NOT offline 0.5). NaiveBayes per-stage oracle <=1e-5 (Splits/LeafValues/StagedApprox/Predictions) + per-prefix leakage-order anchors (no-leakage doc0=0.5 + head/tail prefix-boundary vs instrumented dump). BM25 calcer math bit-exact <=1e-5 vs independent closed-form online ref + no-leakage anchor + SC-4 quantizer; BM25 per-stage NORMALIZED-border scale (splits.npy +-1.24 vs raw O(1e-3)) + depth-2 [7,2,0,7] from catboost permutation averaging DEFERRED (trainer normalization, not calcer math; deferred-items.md). D-04 non-text byte-identical (BoW + e2e oracles unchanged). cb-train lib 210 + cb-compute lib 151 pass; new lib files clippy-clean. Commits d53a7a1 (Task1 math) / 8eeef44 (Task2 prefix+oracles)
+Phase: 06.5 (text-and-embedding-features) — EXECUTING (all 7 plans complete; awaiting phase verification)
+Plan: 7 of 7 — COMPLETE
+Status: Phase plans done; FEAT-02 closed, FEAT-01 has the BM25 normalized-border residual
+Last activity: 2026-06-18 -- 06.5-07 COMPLETE (SC-4 TERMINAL GATE): build_mixed_estimated_features joins numeric + BoW text + KNN embedding into ONE float-feature layout [numeric|text|embedding] through the EXISTING quantizer->tree (SC-4, no parallel quantizer; inert-when-absent D-04). SC-4 mixed end-to-end oracle: StagedApprox + Predictions <=1e-5 BIT-FOR-BIT (text AND embedding flow together -> upstream's model); Splits/LeafValues gated structure-invariantly under a documented feature-selection tie (per-tree leaf MULTISET <=1e-5, magnitudes exact). Mixed scoped to BoW + KNN (fully per-stage-closed); BM25 (06.5-04) + LDA tolerance (06.5-05) EXCLUDED. 5 oracle tests 0-ignored; cb-train 228 + cb-data 106 + cb-compute 176; D-04 unchanged. FEAT-01 residual = BM25 per-stage normalized borders + general estimated-feature quantization-GRID parity (future trainer-normalization slice). Commits a20cd9b / 2be89ba
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
