@@ -19,6 +19,7 @@
 //! order-independent elementwise work; the order-sensitive reduction lives here.
 
 mod custom;
+mod embedding_calcers;
 mod histogram;
 mod lda_linalg;
 mod leaf;
@@ -31,6 +32,9 @@ mod text_calcers;
 
 pub use custom::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle,
+};
+pub use embedding_calcers::{
+    between_matrix, total_scatter, IncrementalCloud, LdaCalcer, LDA_DEFAULT_REG,
 };
 pub use histogram::{
     collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
@@ -79,6 +83,8 @@ pub use text_calcers::{
     NAIVE_BAYES_SEEN_TOKENS_PRIOR,
 };
 
+#[cfg(test)]
+mod embedding_calcers_test;
 #[cfg(test)]
 mod histogram_test;
 #[cfg(test)]
