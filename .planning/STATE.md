@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.5-01-PLAN.md
-last_updated: "2026-06-18T00:53:16.000Z"
-last_activity: 2026-06-18 -- 06.5-01 COMPLETE (Wave 0 ground-truth gate)
+stopped_at: Phase 6.5 context gathered
+last_updated: "2026-06-18T01:09:27.497Z"
+last_activity: "2026-06-18 -- 06.5-01 COMPLETE: instrumented trainer + 7 text/embedding hooks rebuilt RC=0; single-thread fixtures for 5 calcers + D-01 corpus frozen"
 progress:
   total_phases: 14
   completed_phases: 9
   total_plans: 80
-  completed_plans: 73
+  completed_plans: 75
   percent: 64
 ---
 
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.5 (text-and-embedding-features) — EXECUTING
-Plan: 2 of 7
-Status: Executing Phase 06.5 (Plan 01 COMPLETE — Wave 0 ground-truth gate GREEN)
+Plan: 3 of 7
+Status: Ready to execute
 Last activity: 2026-06-18 -- 06.5-01 COMPLETE: instrumented trainer + 7 text/embedding hooks rebuilt RC=0; single-thread fixtures for 5 calcers + D-01 corpus frozen
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
@@ -118,6 +118,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.4 P03 | ~15min | 3 tasks | 9 files |
 | Phase 06.4 P04 | 35min | 3 tasks | 9 files |
 | Phase 06.5 P01 | ~95min | 2 tasks | 57 files |
+| Phase 06.5 P02 | 8min | 2 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -256,6 +257,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [06.3-14] WR-03 closed (b32efb5: grouped leaf sumWeight branches on leaf method — Gradient->eff_weights, Newton->unit); GAP2/Truth#5 + GAP3 trainer-half deferred un-weakened (1ae9739): the 06.3-10 trainer is GO and was run, but the Rust sampler's RNG model diverges (3 perm folds + per-tree reseed vs 1 fold + fixed 2-level chain; count matches 1800, order diverges), diverging the end-to-end YetiRank model ~8.3e-1 (>>1e-5) — three model.json stay absent, oracles keep the deferred invariant, Rule-4 seeding-subsystem recipe in deferred-items.md [06.3-14]. Task 3 = blocking-human checkpoint on the deferral.
 - [Phase ?]: 06.4-02: RMSEWithUncertainty starting approx [mean, 0.5*log(var)] applied even with boost_from_average=false (train_model.cpp:858); 2-dim diagonal-hessian der rides the 6.2 per-dim Newton leaf path, NOT MultiClass dense solve.
 - [Phase ?]: 06.4-04 (LOSS-07): workspace first Arc<dyn> trait object — CustomObjective/CustomMetric via Arc<dyn> newtype (manual Clone+Debug+Arc::ptr_eq); EvalMetric Copy-dropped; self-oracle Logloss-as-Custom == cross_entropy fixture <=1e-5; PyO3 deferred to Phase 8 (D-09)
+- [Phase ?]: 06.5-02: SC-1 ttext gate asserted on NaiveBayes (Word unigram) path; BoW ttext is BiGram (ids to 24), deferred to BoW calcer slice
+- [Phase ?]: 06.5-02: oracle reads instrumented JSON dumps directly (no model.json for text models); OLB resolved data-dependently (16-row corpus -> 1)
 
 ### Pending Todos
 
@@ -296,7 +299,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-18T00:01:51.195Z
+Last session: 2026-06-18T01:09:04.564Z
 Stopped at: Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
 Stopped at (prior): 06.3-02 COMPLETE (commits f42e3e6 Task1 / 6b208dd Task2) — QueryRMSE + QuerySoftMax, the first two deterministic querywise ranking losses, trained end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. Task1: loss.rs queryrmse_der/querysoftmax_der per-object inner formulas (weight folded in); runtime.rs Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} (validate rejects lambda<0/beta≤0; defaults 0.01/1.0); ranking_der.rs wired arms — QueryRMSE per-group queryAvrg via sum_f64, QuerySoftMax max-shifted softmax der with sumWTargets≤0/weight≤0 guards; exhaustive-match arms added in cb-backend cpu_runtime + cb-train metrics/boosting + 3 cb-train oracle test files (workspace check --tests GREEN — the prior attempt's non-exhaustive cb-backend arm is closed). 11 new unit tests. Task2: boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view; train_ranking entry + RankingData; queryrmse/querysoftmax per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 (Cosine score; QueryRMSE=Newton leaf, QuerySoftMax=Gradient leaf per fixture model.json); QuerySoftMax fixture frozen OFFLINE. Gates: cb-compute 102/102, full cb-train suite 0 failures (154 lib + all oracles incl. D-04 no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-03 (PairLogit + LambdaMart, Wave B pairwise). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-02-SUMMARY.md.

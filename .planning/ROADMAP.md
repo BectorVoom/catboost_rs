@@ -454,7 +454,7 @@ Plans:
 
 **Wave 2** *(blocked on 06.5-01 — D-01 GATE)*
 
-- [ ] 06.5-02-PLAN.md — Tokenizer + frequency dictionary + digitizer + TText (SC-1 load-bearing gate): ByDelimiter split/lowercase, deterministic (count DESC, token ASC) dictionary build, sorted-RLE TText, bit-exact vs the instrumented D-07 dump — every calcer blocks on this
+- [x] 06.5-02-PLAN.md — Tokenizer + frequency dictionary + digitizer + TText (SC-1 load-bearing gate): ByDelimiter split/lowercase, deterministic (count DESC, token ASC) dictionary build, sorted-RLE TText, bit-exact vs the instrumented D-07 dump — every calcer blocks on this
 
 **Wave 3** *(blocked on 06.5-02)*
 
