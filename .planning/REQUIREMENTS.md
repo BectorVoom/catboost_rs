@@ -73,7 +73,7 @@
 - [x] **MODEL-02**: CPU inference/apply path (independent of the GPU toolchain) (Plan 04-02: pure-Rust `cb-model::predict_raw` — strict-> binarize, forward-bit leaf index, bias + `sum_f64` over leaf values; imports no backend/cubecl symbol; oracle-locked ≤1e-5 vs upstream)
 - [x] **MODEL-03**: Feature importance — PredictionValuesChange, LossFunctionChange, Interaction (Plan 04-04: `cb-model::prediction_values_change` (CalcEffect, Σ=100) + `cb-model::interaction` (CalcMostInteractingFeatures + CalcFeatureInteraction) oracle-locked ≤1e-5 vs upstream `feature_importance/*.npy`. COMPLETE — Plan 06.6-06 added `cb-model::loss_function_change` (loss_change_fstr.cpp:154-356; Logloss single-dim metric-delta importance) oracle-locked ≤1e-5 vs `get_feature_importance(type='LossFunctionChange', data=pool)`, completing the deferred D-12, AND generalized PVC/Interaction to non-symmetric trees ≤1e-5 (D-6.6-10))
 - [x] **MODEL-04**: SHAP values (Regular `EShapCalcType`) (Plan 04-04: `cb-model::shap_values` — regular TreeSHAP per-object [n_features+1] matrix (trailing column = Σ_trees meanValue + bias) transcribed verbatim from `shap_values.cpp` + `shap_prepared_trees.cpp`; oracle-locked ≤1e-5 vs upstream `feature_importance/shap_values.npy` AND the local-accuracy invariant Σshap == predict_raw holds for every object, D-11)
-- [ ] **MODEL-05**: SHAP interaction values + advanced fstr — ShapInteractionValues, PredictionDiff, SAGE
+- [x] **MODEL-05**: SHAP interaction values + advanced fstr — ShapInteractionValues, PredictionDiff, SAGE
 - [x] **MODEL-06**: JSON model export (interop minimum) (Plan 04-03: `cb-model::json::{save_json, load_json}` on the upstream model.json schema — per-tree NESTED leaf_weights, scale_and_bias=[1,[bias]]; save_json round-trips through the cb-oracle model_json parser (D-04) and upstream binclf/regression model.json load applies ≤1e-5; malformed JSON → typed ModelError)
 
 ### GPU Backends (CubeCL)
@@ -178,7 +178,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | FEAT-04 | Phase 6.6 | Complete |
 | FEAT-05 | Phase 6.6 | Pending |
 | FEAT-06 | Phase 6.6 | Complete |
-| MODEL-05 | Phase 6.6 | Pending |
+| MODEL-05 | Phase 6.6 | Complete |
 | GPU-01 | Phase 7 | Pending |
 | GPU-02 | Phase 7 | Pending |
 | GPU-03 | Phase 7 | Pending |

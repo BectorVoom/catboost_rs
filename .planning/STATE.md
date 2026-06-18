@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 06.6-06-PLAN.md
-last_updated: "2026-06-18T12:30:00.000Z"
-last_activity: 2026-06-18 -- 06.6-06 LossFunctionChange (MODEL-03/D-12) + non-symmetric PVC/Interaction oracle GREEN (D-6.6-10)
+status: completed
+stopped_at: Completed 06.6-07-PLAN.md
+last_updated: "2026-06-18T10:13:44.362Z"
+last_activity: 2026-06-18 -- 06.6-06 LossFunctionChange + non-symmetric PVC/Interaction oracle GREEN (D-6.6-10)
 progress:
   total_phases: 14
   completed_phases: 10
   total_plans: 90
   completed_plans: 89
-  percent: 73
+  percent: 71
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.6 (advanced-features-and-non-symmetric-trees) — EXECUTING
-Plan: 7 of 8
+Plan: 8 of 8
 Status: 06.6-06 COMPLETE — LossFunctionChange (MODEL-03/D-12) oracle-locked ≤1e-5 + PVC/Interaction generalized to non-symmetric trees (D-6.6-10), oblivious arm byte-identical; next: 06.6-07 advanced SHAP (shap.rs)
 Last activity: 2026-06-18 -- 06.6-06 LossFunctionChange + non-symmetric PVC/Interaction oracle GREEN (D-6.6-10)
 
@@ -130,6 +130,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.6 P04 | 95min | 3 tasks | 53 files |
 | Phase 06.6 P05 | ~55min | 2 tasks | 5 files |
 | Phase 06.6 P06 | ~40min | 2 tasks | 15 files |
+| Phase 06.6 P07 | 70min | 2 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -279,6 +280,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 06.6-03: non-symmetric TreeVariant landed — Model.non_symmetric_trees field; oblivious .cbm/json/apply byte-identical (D-6.6-05)
 - [Phase ?]: 06.6-03: bit-exact = our-save→load→identical model, NOT byte-identity vs upstream .cbm
 - [Phase ?]: 06.6-03: non_symmetric_oracle_test is expected-fail Wave-0 (not ignored); 04 grower + 05 apply turn it green
+- [Phase 06.6]: 06.6-07: ShapInteractionValues bias slot = last index (reverse-mapped); interactions via FixedOn/FixedOff SHAP re-runs
+- [Phase 06.6]: 06.6-07: PredictionDiff is the compare_documents.cpp indicator-coefficient algorithm (NOT SHAP); oracle-locked <=1e-5
+- [Phase 06.6]: 06.6-07: SAGE seed-match infeasible in scope -> deterministic structural surrogate per D-6.6-11 fallback (b); value oracle deferred
 
 ### Pending Todos
 
@@ -319,8 +323,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-18T09:27:49.682Z
-Stopped at: Completed 06.6-03-PLAN.md
+Last session: 2026-06-18T10:13:44.355Z
+Stopped at: Completed 06.6-07-PLAN.md
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
 Stopped at (prior): 06.3-02 COMPLETE (commits f42e3e6 Task1 / 6b208dd Task2) — QueryRMSE + QuerySoftMax, the first two deterministic querywise ranking losses, trained end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. Task1: loss.rs queryrmse_der/querysoftmax_der per-object inner formulas (weight folded in); runtime.rs Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} (validate rejects lambda<0/beta≤0; defaults 0.01/1.0); ranking_der.rs wired arms — QueryRMSE per-group queryAvrg via sum_f64, QuerySoftMax max-shifted softmax der with sumWTargets≤0/weight≤0 guards; exhaustive-match arms added in cb-backend cpu_runtime + cb-train metrics/boosting + 3 cb-train oracle test files (workspace check --tests GREEN — the prior attempt's non-exhaustive cb-backend arm is closed). 11 new unit tests. Task2: boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view; train_ranking entry + RankingData; queryrmse/querysoftmax per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 (Cosine score; QueryRMSE=Newton leaf, QuerySoftMax=Gradient leaf per fixture model.json); QuerySoftMax fixture frozen OFFLINE. Gates: cb-compute 102/102, full cb-train suite 0 failures (154 lib + all oracles incl. D-04 no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-03 (PairLogit + LambdaMart, Wave B pairwise). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-02-SUMMARY.md.
