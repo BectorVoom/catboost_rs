@@ -3,7 +3,19 @@ title: Isolate whether pool-computed borders also diverge in builder_oracle_test
 date: 2026-06-19
 priority: high
 blocks: builder-oracle-fix
+status: DONE
+resolved: 2026-06-19
 ---
+
+> **RESOLVED 2026-06-19** via `/gsd-debug borders-vs-score-fn-builder`. A 2×2
+> (score_function × borders-source) experiment proved **score_function is the SOLE
+> cause** (Cosine→L2 with borders fixed: regression 5.555e-1 → 2.404e-8; binclf
+> 7.261e-2 → 2.843e-9). **Borders exonerated** — swapping computed↔pinned with score
+> fixed changes predictions by < f64 print precision. Latent doc bug found: the
+> docstring's "computed borders match upstream for numeric_tiny" claim is FALSE
+> (49 computed vs 2/2/0/3 pinned) but benign. See
+> `.planning/notes/builder-oracle-score-function-root-cause.md` and
+> `.planning/debug/borders-vs-score-fn-builder.md`.
 
 # Isolate score-function vs borders for builder_oracle_test
 
