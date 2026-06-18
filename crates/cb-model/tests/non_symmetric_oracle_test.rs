@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 
-use cb_model::{load_cbm, predict_raw, save_cbm, Model};
+use cb_model::{load_cbm, load_json, predict_raw, save_cbm, save_json, Model};
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, ModelJson, Stage};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
@@ -56,6 +56,13 @@ fn load_feature_columns(scenario: &str) -> Vec<Vec<f32>> {
 fn tmp(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("cb_model_06603_{name}.cbm"));
+    p
+}
+
+/// Path to a temporary `model.json` for the json round-trip stage.
+fn tmp_json(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("cb_model_06605_{name}.json"));
     p
 }
 
@@ -107,17 +114,40 @@ fn assert_non_symmetric_oracle(scenario: &str) {
     compare_stage(Stage::Splits, &expected_splits, &actual_splits)
         .unwrap_or_else(|e| panic!("{scenario} SPLITS stage diverged: {e:?}"));
 
-    // ── Stage 2: LEAF VALUES ────────────────────────────────────────────────
-    let expected_leaves = mj
-        .non_symmetric_leaf_values()
+    // ── Stage 2: LEAF VALUES (per-tree sorted multiset) ─────────────────────
+    // The upstream `.cbm` and `model.json` store the SAME distinct leaf values in
+    // DIFFERENT physical orders (and with structurally different node graphs — the
+    // json fully expands every leaf into its own `(0, 0)` node, the `.cbm`
+    // compresses one-sided halts), so the gate compares the SORTED multiset of
+    // each tree's leaf values (the same "node order is a representation detail"
+    // decision 06.6-04 made for `Stage::Splits`). Per-object apply equivalence is
+    // locked separately by the StagedApprox / Predictions stages.
+    let expected_leaves_per_tree = mj
+        .non_symmetric_leaf_values_per_tree()
         .unwrap_or_else(|e| panic!("{scenario} leaf values must extract: {e:?}"));
-    let actual_leaves: Vec<f64> = model
+    let actual_leaves_per_tree: Vec<Vec<f64>> = model
         .non_symmetric_trees
         .iter()
-        .flat_map(|t| t.leaf_values.iter().copied())
+        .map(|t| t.leaf_values.clone())
         .collect();
-    compare_stage(Stage::LeafValues, &expected_leaves, &actual_leaves)
-        .unwrap_or_else(|e| panic!("{scenario} LEAF VALUES stage diverged: {e:?}"));
+    assert_eq!(
+        expected_leaves_per_tree.len(),
+        actual_leaves_per_tree.len(),
+        "{scenario} non-symmetric tree count mismatch"
+    );
+    for (ti, (exp, act)) in expected_leaves_per_tree
+        .iter()
+        .zip(actual_leaves_per_tree.iter())
+        .enumerate()
+    {
+        let mut exp_sorted = exp.clone();
+        let mut act_sorted = act.clone();
+        exp_sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite leaf value"));
+        act_sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite leaf value"));
+        compare_stage(Stage::LeafValues, &exp_sorted, &act_sorted).unwrap_or_else(|e| {
+            panic!("{scenario} LEAF VALUES stage diverged (tree {ti}): {e:?}")
+        });
+    }
 
     // ── Stage 3: STAGED APPROX (per-iteration) ─────────────────────────────
     // EXPECTED TO FAIL until 06.6-05 wires the non-symmetric apply pointer-walk:
@@ -139,9 +169,11 @@ fn assert_non_symmetric_oracle(scenario: &str) {
     compare_stage(Stage::Predictions, &expected_predictions, &actual_predictions)
         .unwrap_or_else(|e| panic!("{scenario} PREDICTIONS stage diverged: {e:?}"));
 
-    // ── Stage 5: .cbm round-trip equality ───────────────────────────────────
+    // ── Stage 5: .cbm round-trip equality (D-6.6-02 — round-trip IS the gate) ─
     // Our save → load reproduces an identical model (bit-exact our-serialization
-    // round-trip, D-6.6-05).
+    // round-trip, D-6.6-05): the compressed-node `.cbm` form preserves the node
+    // graph verbatim, so the reloaded model is struct-identical AND re-predicts
+    // identically.
     let rt = tmp(scenario);
     save_cbm(&model, &rt).unwrap_or_else(|e| panic!("{scenario} save_cbm: {e:?}"));
     let reloaded: Model = load_cbm(&rt).unwrap_or_else(|e| panic!("{scenario} reload: {e:?}"));
@@ -149,6 +181,27 @@ fn assert_non_symmetric_oracle(scenario: &str) {
         model, reloaded,
         "{scenario} .cbm round-trip must reproduce an identical model"
     );
+    let cbm_rt_predictions = predict_raw(&reloaded, &columns);
+    compare_stage(Stage::Predictions, &expected_predictions, &cbm_rt_predictions)
+        .unwrap_or_else(|e| panic!("{scenario} .cbm round-trip predictions diverged: {e:?}"));
+
+    // ── Stage 6: model.json round-trip re-predict equality (D-6.6-02) ─────────
+    // The nested `"trees"` json form EXPANDS one-sided `(d, 0)` halt nodes into
+    // explicit leaf children (a json node cannot be both a leaf and a split), so a
+    // json-reloaded model is NOT struct-identical to the compressed `.cbm` form —
+    // but it MUST be APPLY-equivalent. Save → load via the `"trees"` parser
+    // (06.6-03) and re-predict ≤1e-5 against the upstream reference.
+    let json_rt = tmp_json(scenario);
+    save_json(&model, &json_rt).unwrap_or_else(|e| panic!("{scenario} save_json: {e:?}"));
+    let json_reloaded: Model =
+        load_json(&json_rt).unwrap_or_else(|e| panic!("{scenario} json reload: {e:?}"));
+    assert!(
+        !json_reloaded.non_symmetric_trees.is_empty(),
+        "{scenario} json round-trip must reload non_symmetric_trees"
+    );
+    let json_rt_predictions = predict_raw(&json_reloaded, &columns);
+    compare_stage(Stage::Predictions, &expected_predictions, &json_rt_predictions)
+        .unwrap_or_else(|e| panic!("{scenario} model.json round-trip predictions diverged: {e:?}"));
 }
 
 /// SPLITS-only preflight for the SIMPLEST possible Depthwise fixture
