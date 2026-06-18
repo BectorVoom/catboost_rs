@@ -532,7 +532,7 @@ Plans:
 
 **Wave 8** — Gap closure (verification gaps_found 4/5, SC-3 partial)
 
-- [ ] 06.6-09-PLAN.md — Close CR-02 sentinel mismatch: leaf_wise_grower finalization inits node_id_to_leaf_id to u32::MAX (interior sentinel) + checked u16::try_from step-node diffs (CR-01); NEW cb-model oracle test trains a non-symmetric model via the Rust grower → save_cbm → load_cbm → predict ≤1e-5 (FEAT-06 / SC-3 grower→save→load→predict complete)
+- [x] 06.6-09-PLAN.md — Close CR-02 sentinel mismatch: leaf_wise_grower finalization inits node_id_to_leaf_id to u32::MAX (interior sentinel) + checked u16::try_from step-node diffs (CR-01); NEW cb-model oracle test trains a non-symmetric model via the Rust grower → save_cbm → load_cbm → predict ≤1e-5 (FEAT-06 / SC-3 grower→save→load→predict complete) — **COMPLETE** (f19d98a fix / f079142 test): tree.rs:1143 `vec![u32::MAX; node_count]` + explicit interior-arm sentinel; step diffs via `u16::try_from(...) -> CbError::OutOfRange` (no new variant). New `non_symmetric_grower_roundtrip_oracle_test` (cb-model dev-deps += cb-backend/cb-compute) green: grower→from_trained→save_cbm→load_cbm→predict_raw ≤1e-5. Non-regression: cb-train grower SPLITS oracle (1), cb-train lib (228), cb-model non_symmetric_oracle_test (3) all green. **SC-3 / FEAT-06 grower→save→load→predict CLOSED.** gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY.
 
 ### Phase 7: GPU Backends via CubeCL
 
