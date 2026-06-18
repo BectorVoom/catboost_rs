@@ -94,6 +94,10 @@ fn train_regression_skeleton() -> (Model, usize) {
         // default — pin L2 so the captured structure matches the upstream model.json.
         score_function: cb_compute::EScoreFunction::L2,
         has_time: false,
+        feature_weights: cb_train::feature_weights_default(),
+        first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
+        per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
+        penalties_coefficient: cb_train::penalties_coefficient_default(),
     };
 
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None)

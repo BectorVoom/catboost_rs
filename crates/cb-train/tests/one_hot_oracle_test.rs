@@ -226,6 +226,10 @@ fn one_hot_predict_matches_oracle_locked_float_reference() {
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: cb_train::score_function_default(),
         has_time: false,
+        feature_weights: cb_train::feature_weights_default(),
+        first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
+        per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
+        penalties_coefficient: cb_train::penalties_coefficient_default(),
     };
     let mut float_staged = Vec::new();
     let float_model = train(

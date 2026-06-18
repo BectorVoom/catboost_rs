@@ -285,6 +285,10 @@ impl CatBoostBuilder {
             // oblivious_tree_options.cpp:22); the facade does not surface it.
             score_function: score_function_default(),
             has_time: has_time_default(),
+            feature_weights: cb_train::feature_weights_default(),
+            first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
+            per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
+            penalties_coefficient: cb_train::penalties_coefficient_default(),
         }
     }
 

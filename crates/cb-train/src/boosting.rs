@@ -237,6 +237,81 @@ pub struct BoostParams {
     /// fire on the cat / ordered paths). Consumed by [`need_shuffle`] in
     /// [`train_inner`] to gate the initial learn-set shuffle (ORD-01 / bar (c)).
     pub has_time: bool,
+    /// Per-float-feature MULTIPLICATIVE gain weights (`feature_weights`, FEAT-04 —
+    /// `GetSplitFeatureWeight`, `greedy_tensor_search.cpp:980-988`). A split on
+    /// float feature `f` scales its candidate gain by `feature_weights[f]`. An
+    /// EMPTY vector (the upstream default — `feature_penalties_options.cpp`) means
+    /// every feature weight is `1.0`, so the candidate scores are byte-identical to
+    /// the pre-6.6 oblivious path (D-6.6-05 no-regression). Out-of-range indices
+    /// fall back to `1.0` (`.get(f).copied().unwrap_or(1.0)`, no panic — T-06.6-01).
+    /// Pinned EXPLICITLY ([`feature_weights_default`]); only the penalty fixtures
+    /// set a non-default vector.
+    pub feature_weights: Vec<f64>,
+    /// Per-float-feature SUBTRACTIVE first-use penalties (`first_feature_use_penalties`,
+    /// FEAT-04 — `GetSplitFirstFeatureUsePenalty`, `feature_penalties_calcer.cpp:191-205`).
+    /// While float feature `f` is not yet used anywhere in the model being built,
+    /// each candidate split on `f` has `first_feature_use_penalties[f] *
+    /// penalties_coefficient` SUBTRACTED from its score (the `PenalizeBestSplits`
+    /// pass). Once `f` is used by any prior tree the penalty is zero. EMPTY (the
+    /// upstream default) ⇒ `0.0` for every feature ⇒ scores byte-identical to the
+    /// pre-6.6 path. Pinned EXPLICITLY ([`first_feature_use_penalties_default`]).
+    pub first_feature_use_penalties: Vec<f64>,
+    /// Per-float-feature SUBTRACTIVE per-object penalties (`per_object_feature_penalties`,
+    /// FEAT-04 — `GetSplitPerObjectPenalty`, `feature_penalties_calcer.cpp:191-205`).
+    /// For the SYMMETRIC (oblivious) path, when float feature `f` is globally unused
+    /// in the model being built, each candidate split on `f` has
+    /// `per_object_feature_penalties[f] * penalties_coefficient * unused_doc_count`
+    /// SUBTRACTED from its score, where `unused_doc_count` is the whole-fold object
+    /// count (RESEARCH Pitfall 6). Once `f` is used the term is zero. EMPTY (the
+    /// upstream default) ⇒ `0.0` ⇒ scores byte-identical to the pre-6.6 path.
+    /// Pinned EXPLICITLY ([`per_object_feature_penalties_default`]).
+    pub per_object_feature_penalties: Vec<f64>,
+    /// The SUBTRACTIVE-penalty scaling coefficient (`penalties_coefficient`, FEAT-04
+    /// — `feature_penalties_calcer.cpp`). Multiplies BOTH the first-use and the
+    /// per-object penalty terms. Upstream default `1.0`
+    /// ([`penalties_coefficient_default`]). With both penalty vectors empty this
+    /// coefficient is never consumed, so the default path stays byte-identical.
+    pub penalties_coefficient: f64,
+}
+
+/// The canonical default `feature_weights` (EMPTY — every float feature weight is
+/// `1.0`, the upstream `feature_penalties_options.cpp` default). Pinned EXPLICITLY
+/// at every `BoostParams` construction site (RESEARCH Pitfall 6 — never
+/// auto-selected); only the penalty fixtures set a non-default vector. An empty
+/// vector leaves the multiplicative gain factor at `1.0`, so the candidate scores
+/// are byte-identical to the pre-6.6 oblivious path (D-6.6-05).
+#[must_use]
+pub fn feature_weights_default() -> Vec<f64> {
+    Vec::new()
+}
+
+/// The canonical default `first_feature_use_penalties` (EMPTY — every per-feature
+/// first-use penalty is `0.0`, the upstream default). Pinned EXPLICITLY at every
+/// `BoostParams` construction site. An empty vector means the subtractive
+/// first-use term is never applied, so the default path stays byte-identical
+/// (D-6.6-05).
+#[must_use]
+pub fn first_feature_use_penalties_default() -> Vec<f64> {
+    Vec::new()
+}
+
+/// The canonical default `per_object_feature_penalties` (EMPTY — every per-object
+/// penalty is `0.0`, the upstream default). Pinned EXPLICITLY at every
+/// `BoostParams` construction site. An empty vector means the subtractive
+/// per-object term is never applied, so the default path stays byte-identical
+/// (D-6.6-05).
+#[must_use]
+pub fn per_object_feature_penalties_default() -> Vec<f64> {
+    Vec::new()
+}
+
+/// The canonical default `penalties_coefficient` (`1.0`, the upstream
+/// `feature_penalties_calcer.cpp` default). Pinned EXPLICITLY at every
+/// `BoostParams` construction site. With both penalty vectors empty this
+/// coefficient is never consumed, so the default path stays byte-identical.
+#[must_use]
+pub fn penalties_coefficient_default() -> f64 {
+    1.0
 }
 
 /// The canonical default `permutation_count` (`4`, `boosting_options.cpp`).
@@ -2154,6 +2229,17 @@ fn train_inner<R: Runtime>(
     // tree search directly in the ORD-04 oracle test, D-04).
     let matrix = FeatureMatrix::new(feature_values, feature_borders);
 
+    // FEAT-04 first-use / per-object penalty state (`feature_penalties_calcer.cpp`):
+    // `used_features[f] == true` once any PRIOR tree in this run has split on float
+    // feature `f`. While unused, the subtractive penalties fire; once used they go
+    // to zero. Sized to the float-feature count and updated after each tree is
+    // grown. With both penalty vectors empty the context is a no-op and this vector
+    // is never consulted (the default oblivious path stays byte-identical, D-6.6-05).
+    let penalties_active = !params.feature_weights.is_empty()
+        || !params.first_feature_use_penalties.is_empty()
+        || !params.per_object_feature_penalties.is_empty();
+    let mut used_features: Vec<bool> = vec![false; matrix.n_features()];
+
     // Tensor / combination CTR candidate generation (ORD-05 / D-05, AddTreeCtrs,
     // greedy_tensor_search.cpp:491-551): emit the SimpleCtr / CombinationCtr
     // projections over the CTR-eligible cat features under the
@@ -2894,20 +2980,55 @@ fn train_inner<R: Runtime>(
                     params.depth,
                     n,
                 )?,
-                // PLAIN (unchanged): the perturbed whole-fold search over the
-                // sampled/sample-weighted histogram (byte-identical to before).
-                None => greedy_tensor_search_oblivious_perturbed(
-                    &matrix,
-                    &score_weighted_der1,
-                    &score_weights,
-                    scaled_l2,
-                    params.depth,
-                    n,
-                    perturb,
-                    params.score_function,
-                )?,
+                // PLAIN: the perturbed whole-fold search over the
+                // sampled/sample-weighted histogram. FEAT-04 penalties are threaded
+                // in via the `FeaturePenalties` context — multiplicative
+                // `feature_weights` on the candidate gain + subtractive
+                // `first_feature_use_penalties` / `per_object_feature_penalties`
+                // (× `penalties_coefficient`) while a feature is globally unused
+                // (RESEARCH Pitfall 6; the per-object term uses the whole-fold doc
+                // count `n`). With all penalty vectors empty the context is `None`
+                // and the search is byte-identical to the pre-6.6 path (D-6.6-05).
+                None => {
+                    let pen = if penalties_active {
+                        Some(crate::tree::FeaturePenalties {
+                            feature_weights: &params.feature_weights,
+                            first_feature_use_penalties: &params.first_feature_use_penalties,
+                            per_object_feature_penalties: &params.per_object_feature_penalties,
+                            penalties_coefficient: params.penalties_coefficient,
+                            used_features: &used_features,
+                            doc_count: n,
+                        })
+                    } else {
+                        None
+                    };
+                    greedy_tensor_search_oblivious_perturbed(
+                        &matrix,
+                        &score_weighted_der1,
+                        &score_weights,
+                        scaled_l2,
+                        params.depth,
+                        n,
+                        perturb,
+                        params.score_function,
+                        pen.as_ref(),
+                    )?
+                }
             }
         };
+
+        // FEAT-04: mark this tree's float splits as "used" so subsequent trees no
+        // longer pay the first-use / per-object penalty for those features
+        // (`feature_penalties_calcer.cpp` — the penalty fires until a feature first
+        // becomes used). Only consulted when penalties are active; the default path
+        // leaves `used_features` untouched (D-6.6-05).
+        if penalties_active {
+            for split in &grown.splits {
+                if let Some(flag) = used_features.get_mut(split.feature) {
+                    *flag = true;
+                }
+            }
+        }
 
         // YetiRank LEAF-VALUE competitor RE-SAMPLE (D-07, 06.3-14 ext): the live
         // trainer re-samples a DISTINCT YetiRank competitor set for the AveragingFold

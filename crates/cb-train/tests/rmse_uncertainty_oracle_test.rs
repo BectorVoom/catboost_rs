@@ -109,6 +109,10 @@ fn base_params(loss: Loss) -> BoostParams {
         // RMSEWithUncertainty fixture pins the regression-skeleton L2 split score.
         score_function: cb_compute::EScoreFunction::L2,
         has_time: false,
+        feature_weights: cb_train::feature_weights_default(),
+        first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
+        per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
+        penalties_coefficient: cb_train::penalties_coefficient_default(),
     }
 }
 

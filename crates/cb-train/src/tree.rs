@@ -476,9 +476,10 @@ pub fn greedy_tensor_search_oblivious(
     score_function: EScoreFunction,
 ) -> CbResult<GrownTree> {
     // The unperturbed path is `random_strength == 0` with no RNG draws — exactly
-    // the first-slice behaviour. Delegate to the perturbed search with `None`.
+    // the first-slice behaviour. Delegate to the perturbed search with `None`
+    // perturbation and `None` penalties (the byte-identical pre-6.6 path).
     greedy_tensor_search_oblivious_perturbed(
-        matrix, der1, weight, scaled_l2, depth, n_objects, None, score_function,
+        matrix, der1, weight, scaled_l2, depth, n_objects, None, score_function, None,
     )
 }
 
@@ -532,6 +533,7 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     n_objects: usize,
     mut perturb: Option<Perturbation<'_>>,
     score_function: EScoreFunction,
+    penalties: Option<&FeaturePenalties<'_>>,
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
@@ -540,10 +542,10 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     for _level in 0..depth {
         let best = match perturb.as_mut() {
             None => select_level_plain(
-                matrix, &chosen, der1, weight, scaled_l2, n_objects, score_function,
+                matrix, &chosen, der1, weight, scaled_l2, n_objects, score_function, penalties,
             )?,
             Some(p) => select_level_perturbed(
-                matrix, &chosen, der1, weight, scaled_l2, n_objects, p, score_function,
+                matrix, &chosen, der1, weight, scaled_l2, n_objects, p, score_function, penalties,
             )?,
         };
         chosen.push(best);
@@ -578,12 +580,17 @@ fn select_level_plain(
     scaled_l2: f64,
     n_objects: usize,
     score_function: EScoreFunction,
+    penalties: Option<&FeaturePenalties<'_>>,
 ) -> CbResult<Split> {
+    // FEAT-04 penalties are applied ONLY when an active (non-no-op) context is
+    // supplied; otherwise the candidate scores stay byte-identical to the pre-6.6
+    // path (D-6.6-05 — gate on the param being non-empty).
+    let active_penalties = penalties.filter(|p| !p.is_noop());
     let mut candidates: Vec<Candidate> = Vec::new();
     for feature in 0..matrix.n_features() {
         let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
         for &border in borders {
-            let score = score_candidate(
+            let raw = score_candidate(
                 matrix,
                 chosen,
                 Split { feature, border },
@@ -593,6 +600,13 @@ fn select_level_plain(
                 n_objects,
                 score_function,
             );
+            // FEAT-04: multiplicative feature_weight + subtractive first-use /
+            // per-object penalties (the two upstream insertion points). The no-op
+            // context leaves `raw` untouched.
+            let score = match active_penalties {
+                Some(p) => p.penalize(feature, raw),
+                None => raw,
+            };
             candidates.push(Candidate {
                 feature,
                 border,
@@ -621,8 +635,15 @@ fn select_level_perturbed(
     n_objects: usize,
     perturb: &mut Perturbation<'_>,
     score_function: EScoreFunction,
+    penalties: Option<&FeaturePenalties<'_>>,
 ) -> CbResult<Split> {
     let std_dev = perturb.score_st_dev;
+    // FEAT-04 penalties apply at the per-feature SelectBestCandidate stage (pass 3
+    // below) — the multiplicative feature weight scales the gain and the
+    // subtractive first-use / per-object penalties act on the per-feature best
+    // score (`PenalizeBestSplits`). A no-op (or absent) context leaves the score
+    // untouched, so the unpenalized perturbed path is byte-identical (D-6.6-05).
+    let active_penalties = penalties.filter(|p| !p.is_noop());
 
     // (1) randSeed = Rand.GenRand() — one main-RNG draw per level (CalcScores).
     let rand_seed = perturb.rng.gen_rand();
@@ -680,7 +701,14 @@ fn select_level_perturbed(
         let &Some((border, raw)) = slot else {
             continue;
         };
-        let instance = random_score_instance(raw, std_dev, perturb.rng);
+        // FEAT-04: penalize the per-feature best RAW score before the noise instance
+        // (multiplicative weight + subtractive first-use/per-object). No-op context
+        // ⇒ `raw` unchanged.
+        let penalized_raw = match active_penalties {
+            Some(p) => p.penalize(feature, raw),
+            None => raw,
+        };
+        let instance = random_score_instance(penalized_raw, std_dev, perturb.rng);
         if instance > best_gain {
             best_gain = instance;
             chosen_split = Some(Split { feature, border });
@@ -1098,6 +1126,108 @@ fn cat_feature_weight(count: usize, max_count: usize, model_size_reg: f64) -> f6
     }
     let ratio = count as f64 / max_count as f64;
     (1.0 + ratio).powf(-model_size_reg)
+}
+
+/// The MULTIPLICATIVE float-feature gain weight (`GetSplitFeatureWeight`,
+/// greedy_tensor_search.cpp:980-988; the float-feature analogue of
+/// [`cat_feature_weight`], FEAT-04). A split on float feature `feature` scales its
+/// candidate gain by `feature_weights[feature]`. An out-of-range index (including
+/// the EMPTY default vector) falls back to `1.0` — a no-op multiplier that leaves
+/// the candidate score byte-identical to the pre-6.6 path (D-6.6-05). Access via
+/// `.get(..).copied()` (no `indexing_slicing`, no panic — T-06.6-01).
+#[must_use]
+pub fn feature_weight(feature: usize, feature_weights: &[f64]) -> f64 {
+    feature_weights.get(feature).copied().unwrap_or(1.0)
+}
+
+/// The FEAT-04 feature-penalty context threaded through the plain oblivious search
+/// (`SelectBestCandidate` multiplicative weight + the `PenalizeBestSplits`
+/// subtractive pass, `feature_penalties_calcer.cpp:191-205`). A `None` context (or
+/// one whose vectors are all empty) leaves every candidate score numerically
+/// untouched, so the default oblivious path is byte-identical (D-6.6-05). Each
+/// vector is indexed by FLOAT feature id via `.get(..)` (no panic — T-06.6-01).
+pub struct FeaturePenalties<'a> {
+    /// MULTIPLICATIVE per-feature gain weights (`feature_weights`); empty ⇒ `1.0`
+    /// per feature.
+    pub feature_weights: &'a [f64],
+    /// SUBTRACTIVE per-feature first-use penalties (`first_feature_use_penalties`);
+    /// applied (× `penalties_coefficient`) only while the feature is unused. Empty
+    /// ⇒ `0.0`.
+    pub first_feature_use_penalties: &'a [f64],
+    /// SUBTRACTIVE per-feature per-object penalties (`per_object_feature_penalties`);
+    /// applied (× `penalties_coefficient` × `unused_doc_count`) only while the
+    /// feature is globally unused on the symmetric path. Empty ⇒ `0.0`.
+    pub per_object_feature_penalties: &'a [f64],
+    /// The shared penalty scaling coefficient (`penalties_coefficient`).
+    pub penalties_coefficient: f64,
+    /// Per-FLOAT-feature "already used anywhere in the model built so far" flags
+    /// (`used_features[f] == true` ⇒ feature `f` has been split on by a prior tree
+    /// in this boosting run). Drives the "only when unused" gate of BOTH subtractive
+    /// penalties (`feature_penalties_calcer.cpp` — the penalty fires until the
+    /// feature first becomes used). An out-of-range index reads as unused (`false`).
+    pub used_features: &'a [bool],
+    /// The whole-fold object count used as the per-object penalty's `unused_doc_count`
+    /// on the symmetric path (RESEARCH Pitfall 6 — the per-object term counts EVERY
+    /// document when the feature is globally unused).
+    pub doc_count: usize,
+}
+
+impl FeaturePenalties<'_> {
+    /// `true` when every penalty knob is at its no-op default (all vectors empty),
+    /// so the search can skip the penalty arithmetic and stay byte-identical to the
+    /// pre-6.6 path (D-6.6-05 — gate on the param being non-empty, mirroring the
+    /// `has_ctr` discriminator discipline).
+    #[must_use]
+    fn is_noop(&self) -> bool {
+        self.feature_weights.is_empty()
+            && self.first_feature_use_penalties.is_empty()
+            && self.per_object_feature_penalties.is_empty()
+    }
+
+    /// Apply the FEAT-04 penalties to one candidate's `raw_score` for float feature
+    /// `feature`, returning the penalized score. Transcribes the two upstream
+    /// insertion points (RESEARCH "Penalty application"):
+    ///
+    /// 1. MULTIPLICATIVE on the gain (`gain *= GetSplitFeatureWeight(...)`,
+    ///    greedy_tensor_search.cpp:980-988). With `scoreBeforeSplit` constant across
+    ///    a level and no other feature weights, the candidate `raw_score` is the
+    ///    pre-gain quantity the strict-`>` argmax ranks; scaling it by the
+    ///    feature weight matches the upstream gain scaling.
+    /// 2. SUBTRACTIVE first-use + per-object (`score -= ... × penalties_coefficient`,
+    ///    feature_penalties_calcer.cpp:191-205), each fired ONLY while the feature is
+    ///    unused so far. The per-object term multiplies by the whole-fold
+    ///    `doc_count` (symmetric path, RESEARCH Pitfall 6).
+    ///
+    /// All sums route through [`cb_core::sum_f64`] (D-08); the per-object product is
+    /// a single multiply (no reduction). Empty vectors ⇒ identity (`1.0` / `0.0`).
+    #[must_use]
+    fn penalize(&self, feature: usize, raw_score: f64) -> f64 {
+        // (1) Multiplicative feature weight on the (pre-gain) candidate score.
+        let weighted = raw_score * feature_weight(feature, self.feature_weights);
+
+        // (2) Subtractive penalties — only while the feature is globally unused.
+        let already_used = self.used_features.get(feature).copied().unwrap_or(false);
+        if already_used {
+            return weighted;
+        }
+        let first_use = self
+            .first_feature_use_penalties
+            .get(feature)
+            .copied()
+            .unwrap_or(0.0);
+        let per_object = self
+            .per_object_feature_penalties
+            .get(feature)
+            .copied()
+            .unwrap_or(0.0);
+        // first_use * coeff  +  per_object * coeff * unused_doc_count.
+        let first_use_term = first_use * self.penalties_coefficient;
+        let per_object_term =
+            per_object * self.penalties_coefficient * self.doc_count as f64;
+        // Deterministic-order accumulation of the subtracted terms (D-08).
+        let subtracted = cb_core::sum_f64(&[first_use_term, per_object_term]);
+        weighted - subtracted
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

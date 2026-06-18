@@ -130,6 +130,10 @@ fn bm25_params() -> BoostParams {
         combinations_ctr_priors: combinations_ctr_priors_default(),
         score_function: score_function_default(),
         has_time: false,
+        feature_weights: cb_train::feature_weights_default(),
+        first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
+        per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
+        penalties_coefficient: cb_train::penalties_coefficient_default(),
     }
 }
 

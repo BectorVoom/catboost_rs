@@ -79,6 +79,10 @@ fn sampling_params(loss: Loss, bootstrap_type: EBootstrapType) -> BoostParams {
         combinations_ctr_priors: cb_train::combinations_ctr_priors_default(),
         score_function: EScoreFunction::Cosine,
         has_time: false,
+        feature_weights: cb_train::feature_weights_default(),
+        first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
+        per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
+        penalties_coefficient: cb_train::penalties_coefficient_default(),
     }
 }
 
