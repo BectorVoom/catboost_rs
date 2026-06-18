@@ -402,3 +402,302 @@ impl LdaCalcer {
         self.projection_dimension
     }
 }
+
+// ===========================================================================
+// KNN (k-nearest-neighbor vote) embedding calcer — `knn.cpp` / `knn.h`.
+// ===========================================================================
+//
+// Upstream `TKNNCalcer` (`knn.h:94-142`) stores the inserted embedding vectors in
+// an ONLINE HNSW approximate index (`TOnlineHnswDenseVectorIndex<float,
+// TL2SqrDistance>`) and, for each query, votes over the `CloseNum` nearest
+// neighbors: classification accumulates per-class counts
+// (`++result[TargetClasses[id]]`, `knn.cpp:56-59`), regression averages the
+// neighbor targets (`result[0] = mean(Targets[id])`, `knn.cpp:60-66`).
+//
+// # Why brute-force-exact L2 (06.5-06 spike, A2/A5 — NOT a third-party HNSW crate)
+//
+// The 06.5-06 neighbor-id SPIKE compared a brute-force-exact L2-squared k-NN
+// against the INSTRUMENTED upstream HNSW neighbor-id dump
+// (`fixtures/text_tokenizer/knn_neighbors.json`, the Plan-01 D-07 `knn_neighbors`
+// hook) on the frozen 16-row / 4-dim fixture. Result: **0 / 64 neighbor-id
+// mismatches** (ordered AND set), across all online prefixes. At fixture scale the
+// HNSW index degenerates to exact (A5), so brute-force-exact reproduces the
+// upstream neighbor set BIT-FOR-BIT. The class-vote encoding is an integer count
+// over that neighbor set, so the per-stage model oracle is byte-identical (a
+// strictly stronger result than the LDA binarization-stability argument). A
+// third-party HNSW/ANN crate is FORBIDDEN (any non-identical graph -> different
+// neighbors -> parity fail, A2 / D-05).
+//
+// # Summation routing (D-04)
+//
+// The L2-squared distance and the regression neighbor mean route through
+// [`cb_core::sum_f64`] (object-order reductions, NOT BLAS cells). The distance
+// per-component squares are summed in an f64 accumulator over the (widened) f32
+// component differences, matching upstream's `TL2SqrDistance<float>` summed in the
+// HNSW comparator. Ties break by ascending neighbor id (the stable secondary key
+// the dump exhibits), reproduced here by a stable sort on `(distance, id)`.
+
+/// Brute-force-exact L2-squared nearest-neighbor cloud (the spike-validated
+/// `IKNNCloud` analog, `knn.h:22-46`). Stores inserted embedding vectors in
+/// INSERTION order (= the learn permutation when driven by the online seam) and
+/// answers a `k`-NN query by an exact distance scan.
+#[derive(Debug, Clone, Default)]
+pub struct KnnCloud {
+    /// Dimension of each stored vector.
+    dimension: usize,
+    /// Inserted vectors, flattened row-major (`points[i*dim .. (i+1)*dim]`), in
+    /// insertion order. Insertion id `i` is the neighbor id the vote indexes.
+    points: Vec<f32>,
+    /// Number of inserted vectors (`points.len() / dimension`).
+    size: usize,
+}
+
+impl KnnCloud {
+    /// A new empty cloud over `dimension`-dim vectors.
+    #[must_use]
+    pub fn new(dimension: usize) -> Self {
+        Self {
+            dimension,
+            points: Vec::new(),
+            size: 0,
+        }
+    }
+
+    /// Number of inserted vectors so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Whether no vectors have been inserted yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Insert `embed` at the next insertion id (`AddItem` analog, `knn.h:35-37`).
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] if `embed.len()` differs from the cloud dimension
+    /// (the `CB_ENSURE` analog; never indexes past the buffer).
+    pub fn add_vector(&mut self, embed: &[f32]) -> CbResult<()> {
+        if embed.len() != self.dimension {
+            return Err(CbError::OutOfRange(format!(
+                "KnnCloud::add_vector: embedding length {} != cloud dimension {}",
+                embed.len(),
+                self.dimension
+            )));
+        }
+        self.points.extend_from_slice(embed);
+        self.size += 1;
+        Ok(())
+    }
+
+    /// L2-squared distance from `query` to inserted vector `id`, summed in f64
+    /// over the f32 component squares (`TL2SqrDistance<float>` analog, D-04).
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] on a dimension mismatch or an out-of-range id.
+    fn l2_sqr(&self, query: &[f32], id: usize) -> CbResult<f64> {
+        if query.len() != self.dimension {
+            return Err(CbError::OutOfRange(format!(
+                "KnnCloud::l2_sqr: query length {} != cloud dimension {}",
+                query.len(),
+                self.dimension
+            )));
+        }
+        let start = id.checked_mul(self.dimension).ok_or_else(|| {
+            CbError::OutOfRange("KnnCloud::l2_sqr: id*dim overflow".to_owned())
+        })?;
+        let end = start.checked_add(self.dimension).ok_or_else(|| {
+            CbError::OutOfRange("KnnCloud::l2_sqr: id range overflow".to_owned())
+        })?;
+        let row = self
+            .points
+            .get(start..end)
+            .ok_or_else(|| CbError::OutOfRange("KnnCloud::l2_sqr: id out of range".to_owned()))?;
+        let squares: Vec<f64> = row
+            .iter()
+            .zip(query.iter())
+            .map(|(&p, &q)| {
+                let d = p - q;
+                f64::from(d * d)
+            })
+            .collect();
+        Ok(cb_core::sum_f64(&squares))
+    }
+
+    /// The `k` nearest insertion ids to `query`, sorted by ascending L2-squared
+    /// distance with an ascending-id tie-break (`GetNearestNeighbors` analog,
+    /// `knn.cpp:31-49`). Returns at most `min(k, len)` ids.
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] on a dimension mismatch.
+    pub fn nearest_neighbors(&self, query: &[f32], k: usize) -> CbResult<Vec<usize>> {
+        if query.len() != self.dimension {
+            return Err(CbError::OutOfRange(format!(
+                "KnnCloud::nearest_neighbors: query length {} != cloud dimension {}",
+                query.len(),
+                self.dimension
+            )));
+        }
+        let mut scored: Vec<(f64, usize)> = Vec::with_capacity(self.size);
+        for id in 0..self.size {
+            scored.push((self.l2_sqr(query, id)?, id));
+        }
+        // Ascending distance, ascending id on ties (the dump's stable secondary key).
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(core::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        Ok(scored.into_iter().take(k).map(|(_, id)| id).collect())
+    }
+}
+
+/// KNN neighbor-vote calcer (`TKNNCalcer`, `knn.h:94-142` / `knn.cpp:51-90`).
+///
+/// Classification emits per-class neighbor-vote COUNTS (`width = num_classes`);
+/// regression emits the neighbor target MEAN (`width = 1`, Pitfall 5). The
+/// neighbor set is the brute-force-exact spike-validated `k`-NN (see module note).
+#[derive(Debug, Clone)]
+pub struct KnnCalcer {
+    cloud: KnnCloud,
+    /// `CloseNum` — the query `k` (`knn.h:107`; fixtures `KNN:k=3`).
+    close_num: usize,
+    /// `true` -> classification (per-class vote counts); `false` -> regression mean.
+    is_classification: bool,
+    /// `FeatureCount_` — `num_classes` (clf) or `1` (reg) (`knn.cpp:110`).
+    feature_count: usize,
+    /// Per-insertion-id target class (classification) — `TargetClasses`, parallel
+    /// to the cloud insertion ids.
+    target_classes: Vec<usize>,
+    /// Per-insertion-id target value (regression) — `Targets`.
+    targets: Vec<f32>,
+}
+
+impl KnnCalcer {
+    /// A new empty KNN calcer over `dimension`-dim embeddings.
+    ///
+    /// - `close_num` is the query `k` (`KNN:k=...`).
+    /// - `is_classification` selects the vote-count vs mean arm.
+    /// - `num_classes` sets the classification output width (ignored for reg).
+    #[must_use]
+    pub fn new(
+        dimension: usize,
+        close_num: usize,
+        is_classification: bool,
+        num_classes: usize,
+    ) -> Self {
+        let feature_count = if is_classification {
+            num_classes.max(1)
+        } else {
+            1
+        };
+        Self {
+            cloud: KnnCloud::new(dimension),
+            close_num,
+            is_classification,
+            feature_count,
+            target_classes: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    /// Output feature width (`FeatureCount`, `knn.h:115-117`).
+    #[must_use]
+    pub fn feature_count(&self) -> usize {
+        self.feature_count
+    }
+
+    /// Number of inserted neighbors so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cloud.len()
+    }
+
+    /// Whether no neighbors have been inserted yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cloud.is_empty()
+    }
+
+    /// The k nearest insertion ids to `embed` over the currently-inserted prefix
+    /// (the spike's neighbor-id surface — used by the per-query neighbor oracle).
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] on a dimension mismatch.
+    pub fn neighbors(&self, embed: &[f32]) -> CbResult<Vec<usize>> {
+        self.cloud.nearest_neighbors(embed, self.close_num)
+    }
+
+    /// Insert `embed` with its `target` (`TKNNCalcerVisitor::Update`,
+    /// `knn.cpp:76-90`): add to the cloud, then push the parallel class/target.
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] on a dimension mismatch.
+    pub fn update(&mut self, target: f32, embed: &[f32]) -> CbResult<()> {
+        self.cloud.add_vector(embed)?;
+        if self.is_classification {
+            // `(ui32)target` — the class label as a non-negative integer.
+            let class = if target.is_finite() && target >= 0.0 {
+                target as usize
+            } else {
+                0
+            };
+            self.target_classes.push(class);
+        } else {
+            self.targets.push(target);
+        }
+        Ok(())
+    }
+
+    /// Compute the KNN vote feature row for `embed` over the inserted prefix
+    /// (`TKNNCalcer::Compute`, `knn.cpp:51-74`).
+    ///
+    /// Classification: `result[class(neighbor)] += 1` over the k neighbors
+    /// (width = `num_classes`). Regression: `result[0] = mean(target(neighbor))`
+    /// via [`cb_core::sum_f64`] (width = 1); an empty neighbor set yields all-zero.
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] on a dimension mismatch or a neighbor id with no
+    /// recorded class/target (a parallel-array desync — never silently indexed).
+    pub fn compute(&self, embed: &[f32]) -> CbResult<Vec<f32>> {
+        let mut result = vec![0.0_f32; self.feature_count];
+        let neighbors = self.cloud.nearest_neighbors(embed, self.close_num)?;
+        if self.is_classification {
+            for &id in &neighbors {
+                let class = *self.target_classes.get(id).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "KnnCalcer::compute: neighbor id {id} has no recorded class"
+                    ))
+                })?;
+                let slot = result.get_mut(class.min(self.feature_count.saturating_sub(1)));
+                if let Some(s) = slot {
+                    *s += 1.0;
+                }
+            }
+        } else if !neighbors.is_empty() {
+            let vals: Vec<f64> = neighbors
+                .iter()
+                .map(|&id| {
+                    self.targets
+                        .get(id)
+                        .copied()
+                        .map(f64::from)
+                        .ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "KnnCalcer::compute: neighbor id {id} has no recorded target"
+                            ))
+                        })
+                })
+                .collect::<CbResult<Vec<f64>>>()?;
+            #[allow(clippy::cast_possible_truncation)]
+            let mean = (cb_core::sum_f64(&vals) / neighbors.len() as f64) as f32;
+            if let Some(s) = result.get_mut(0) {
+                *s = mean;
+            }
+        }
+        Ok(result)
+    }
+}

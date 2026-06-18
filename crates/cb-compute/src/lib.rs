@@ -34,7 +34,8 @@ pub use custom::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle,
 };
 pub use embedding_calcers::{
-    between_matrix, total_scatter, IncrementalCloud, LdaCalcer, LDA_DEFAULT_REG,
+    between_matrix, total_scatter, IncrementalCloud, KnnCalcer, KnnCloud, LdaCalcer,
+    LDA_DEFAULT_REG,
 };
 pub use histogram::{
     collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
