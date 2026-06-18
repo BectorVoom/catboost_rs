@@ -466,7 +466,7 @@ Plans:
 
 **Wave 5** *(blocked on 06.5-04; autonomous: false — LDA landmine A1)*
 
-- [ ] 06.5-05-PLAN.md — LDA (first embedding calcer): instrumented-GT projection SPIKE → eigensolver decision (hand-roll f32 vs LAPACK crate behind checkpoint:human-verify vs documented tolerance) → LinearDA calcer + online-embedding prefix; LDA per-stage + projection oracle ≤1e-5 or human-signed-off tolerance (FEAT-02)
+- [x] 06.5-05-PLAN.md — LDA (first embedding calcer): instrumented-GT projection SPIKE → eigensolver decision (hand-roll f32 vs LAPACK crate behind checkpoint:human-verify vs documented tolerance) → LinearDA calcer + online-embedding prefix; LDA per-stage + projection oracle ≤1e-5 or human-signed-off tolerance (FEAT-02)
 
 **Wave 6** *(blocked on 06.5-05; autonomous: false — KNN landmine A2, highest risk)*
 

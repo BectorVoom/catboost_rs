@@ -61,7 +61,7 @@
 ### Advanced Feature Types
 
 - [ ] **FEAT-01**: Text features — tokenization → BoW, NaiveBayes, BM25 calcers
-- [ ] **FEAT-02**: Embedding features — LDA, KNN calcers
+- [x] **FEAT-02**: Embedding features — LDA, KNN calcers
 - [ ] **FEAT-03**: Monotone constraints (per-feature +1/-1/0)
 - [ ] **FEAT-04**: Feature penalties / per-object penalties
 - [ ] **FEAT-05**: Feature selection — recursive by PredictionValuesChange / LossFunctionChange / ShapValues
