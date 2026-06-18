@@ -711,6 +711,15 @@ fn shap_recurse_non_symmetric(
     let mut new_zero_paths_fraction = 1.0_f64;
     let mut new_one_paths_fraction = 1.0_f64;
 
+    // A pure-leaf node carries a placeholder `Float { feature: 0, .. }` split
+    // (its step entry is `(0, 0)`); short-circuit on that sentinel BEFORE reading
+    // the split feature so the placeholder is never mistaken for real feature 0
+    // (WR-04). Behaviour-preserving: a `(0, 0)` node halts on both sides, so the
+    // descent below was already a no-op for it.
+    if matches!(tree.step_nodes.get(node_idx), Some(&(0, 0))) {
+        return;
+    }
+
     // This node's split combination class (numeric-only == float-feature index);
     // a CTR / pure-leaf node has none — stop descending.
     let Some(combination_class) = tree

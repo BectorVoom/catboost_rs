@@ -436,6 +436,15 @@ fn interaction_dfs(
         }
     }
 
+    // A pure-leaf node carries a placeholder `Float { feature: 0, .. }` split
+    // (its step entry is `(0, 0)`); short-circuit on that sentinel BEFORE reading
+    // the split feature so the placeholder is never mistaken for real feature 0
+    // (WR-04). Behaviour-preserving: a `(0, 0)` node has both diffs zero, so the
+    // descent loop below was already a no-op for it.
+    if matches!(tree.step_nodes.get(node_idx), Some(&(0, 0))) {
+        return;
+    }
+
     // The node's own split feature (skip a CTR split — no float-feature index).
     let Some(feature_idx) = tree
         .tree_splits
