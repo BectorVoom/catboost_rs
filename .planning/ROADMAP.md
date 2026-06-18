@@ -503,7 +503,7 @@ Plans:
 
 **Wave 1** — Gate A (symmetric features, rides existing oblivious grower)
 
-- [ ] 06.6-01-PLAN.md — Feature/per-object penalties (FEAT-04): feature_weights (multiplicative) + first_feature_use/per_object (subtractive PenalizeBestSplits) on the oblivious grower, oracle ≤1e-5
+- [x] 06.6-01-PLAN.md — Feature/per-object penalties (FEAT-04): feature_weights (multiplicative) + first_feature_use/per_object (subtractive PenalizeBestSplits) on the oblivious grower, oracle ≤1e-5
 
 **Wave 2** *(blocked on 06.6-01 — shares boosting.rs)*
 

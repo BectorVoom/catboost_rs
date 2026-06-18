@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
+status: executing
 stopped_at: Phase 6.6 context gathered
-last_updated: "2026-06-18T07:57:33.607Z"
-last_activity: 2026-06-18 -- Phase 06.5 marked complete
+last_updated: "2026-06-18T08:22:50.443Z"
+last_activity: 2026-06-18 -- Phase 06.6 execution started
 progress:
   total_phases: 14
   completed_phases: 10
-  total_plans: 82
-  completed_plans: 82
+  total_plans: 90
+  completed_plans: 83
   percent: 71
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 06.5 — text-and-embedding-features
+**Current focus:** Phase 06.6 — advanced-features-and-non-symmetric-trees
 
 ## Current Position
 
-Phase: 06.5 — COMPLETE
-Plan: 9 of 9 complete (06.5-09 next)
-Status: Phase 06.5 complete
-Last activity: 2026-06-18 -- Phase 06.5 marked complete
+Phase: 06.6 (advanced-features-and-non-symmetric-trees) — EXECUTING
+Plan: 2 of 8
+Status: Ready to execute
+Last activity: 2026-06-18 -- Phase 06.6 execution started
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -124,6 +124,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.5 P05 | 6h | 3 tasks | 14 files |
 | Phase 06.5 P06 | ~50min | 2 tasks | 8 files |
 | Phase 06.5 P08 | ~3h 5m | 2 tasks | 2 files |
+| Phase 06.6 P01 | 20min | 2 tasks | 42 files |
 
 ## Accumulated Context
 
@@ -267,6 +268,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 06.5-02: oracle reads instrumented JSON dumps directly (no model.json for text models); OLB resolved data-dependently (16-row corpus -> 1)
 - [Phase ?]: 06.5-05: LDA divergence is upstream vendored-CLAPACK ssyev_ non-reference iterate; hand-roll-f32 reference-faithful; per-stage oracle byte-identical via binarization stability; PROJECTION_TOL=6e-2 raw-projection-only
 - [Phase ?]: 06.5-06 KNN: brute-force-exact L2 k-NN (spike 0/64 neighbor-id mismatches vs instrumented HNSW dump; A5 degenerate-to-exact) -> bit-exact integer class-vote feature -> byte-identical per-stage model. NO HNSW crate (A2/D-05), NO documented tolerance (ids EXACT), NO #[ignore]. FEAT-02 complete
+- [Phase ?]: 06.6-01: FEAT-04 penalties wired into the oblivious grower via an optional FeaturePenalties context gated on non-empty params (default path byte-identical); oracle-locked <=1e-5 vs catboost 1.2.10
 
 ### Pending Todos
 
@@ -307,7 +309,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-18T07:12:51.789Z
+Last session: 2026-06-18T08:22:31.523Z
 Stopped at: Phase 6.6 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
