@@ -107,7 +107,9 @@ fn cholesky_lower(b: &[f32], dim: usize) -> CbResult<Vec<f32>> {
                 sum -= lik * ljk;
             }
             if i == j {
-                if sum <= 0.0 {
+                // `!(sum > 0.0)` also rejects non-finite (NaN/inf) pivots, which
+                // `sum <= 0.0` silently lets through (NaN <= 0.0 is false) (CR-01).
+                if !(sum > 0.0) {
                     return Err(CbError::OutOfRange(format!(
                         "cholesky: non-SPD pivot {sum} at diagonal {i}"
                     )));

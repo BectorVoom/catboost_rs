@@ -212,6 +212,14 @@ impl IncrementalCloud {
 /// # Errors
 /// [`CbError::OutOfRange`] if any cloud's dimension disagrees with `dim`.
 pub fn total_scatter(clouds: &[IncrementalCloud], size: f32, dim: usize) -> CbResult<Vec<f32>> {
+    if !(size > 0.0) {
+        // catches 0.0, -0.0, and NaN; an unguarded `total_size() / size` would
+        // otherwise produce inf/NaN weights that silently bypass the Cholesky
+        // SPD guard and flow into the eigensolve (CR-01).
+        return Err(CbError::Degenerate(format!(
+            "total_scatter: non-positive size {size}"
+        )));
+    }
     let mut result = vec![0.0f32; dim.saturating_mul(dim)];
     let mut total_mean = vec![0.0f32; dim];
     for cloud in clouds {
@@ -264,6 +272,13 @@ pub fn between_matrix(
     dim: usize,
     reg: f32,
 ) -> CbResult<Vec<f32>> {
+    if !(size > 0.0) {
+        // catches 0.0, -0.0, and NaN; guards the `total_size() / size`
+        // weight in the classification path against silent inf/NaN (CR-01).
+        return Err(CbError::Degenerate(format!(
+            "between_matrix: non-positive size {size}"
+        )));
+    }
     let n2 = dim.saturating_mul(dim);
     let mut between = vec![0.0f32; n2];
     if clouds.len() == 1 {
