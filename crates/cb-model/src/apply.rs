@@ -518,7 +518,15 @@ fn predict_raw_multi_cat(
             // DIMENSION-MAJOR per-tree `leaf_values` at `d * n_leaves + leaf`
             // (FEAT-06; empty for an oblivious model).
             contributions.extend(model.non_symmetric_trees.iter().map(|tree| {
-                let n_leaves = tree.leaf_values.len() / dim.max(1);
+                // A ragged per-tree buffer (`len % dim != 0`, only possible from a
+                // malformed loaded model) would make `n_leaves` a floor and
+                // mis-stride dimension d>0; contribute 0.0 instead of a
+                // plausible-but-wrong value (WR-02). Valid models are unaffected.
+                let n_leaves = if dim == 0 || tree.leaf_values.len() % dim != 0 {
+                    0
+                } else {
+                    tree.leaf_values.len() / dim
+                };
                 leaf_index_nonsym(model, tree, &row, &cats)
                     .and_then(|leaf| {
                         tree.leaf_values
