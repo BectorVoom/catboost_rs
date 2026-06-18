@@ -507,7 +507,7 @@ Plans:
 
 **Wave 2** *(blocked on 06.6-01 — shares boosting.rs)*
 
-- [ ] 06.6-02-PLAN.md — Monotone constraints OBLIVIOUS-ONLY (FEAT-03): verbatim isotonic (PAVA) leaf-delta projection + monotone_constraints param + typed-error guard for non-symmetric monotone & Region (escalated gaps), oracle ≤1e-5
+- [x] 06.6-02-PLAN.md — Monotone constraints OBLIVIOUS-ONLY (FEAT-03): verbatim isotonic (PAVA) leaf-delta projection (calc_monotonic_leaf_deltas + build_monotonic_linear_orders, transcribing monotonic_constraint_utils.cpp + CalcMonotonicLeafDeltasSimple) + monotone_constraints BoostParams param + validate_monotone_constraints typed-error guard — monotone_oracle_test ≤1e-5 (LeafValues/StagedApprox/Predictions vs catboost 1.2.10; fixture pins model_shrink_rate=0 to isolate the PAVA). Default path byte-identical (D-6.6-05). Non-symmetric-monotone + Region grow_policy guards DEFERRED to 06.6-04 (grow_policy not yet defined; commented TODO, no silent drop). Commits 5c2761c / fb40de4
 
 **Wave 3** — Gate B Wave-0 (non-symmetric engine contract)
 

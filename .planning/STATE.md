@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.6-03-PLAN.md
-last_updated: "2026-06-18T08:43:09.396Z"
+stopped_at: Completed 06.6-02-PLAN.md
+last_updated: "2026-06-18T09:00:51.000Z"
 last_activity: 2026-06-18 -- Phase 06.6 execution started
 progress:
   total_phases: 14
   completed_phases: 10
   total_plans: 90
-  completed_plans: 84
+  completed_plans: 85
   percent: 71
 ---
 
@@ -125,6 +125,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.5 P06 | ~50min | 2 tasks | 8 files |
 | Phase 06.5 P08 | ~3h 5m | 2 tasks | 2 files |
 | Phase 06.6 P01 | 20min | 2 tasks | 42 files |
+| Phase 06.6 P02 | ~15min | 2 tasks | 45 files |
 | Phase 06.6 P03 | ~70min | 2 tasks | 17 files |
 
 ## Accumulated Context
@@ -133,6 +134,8 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [06.6-02 FEAT-03 monotone constraints (oblivious) — COMPLETE, oracle ≤1e-5]: Monotone constraints (+1/-1/0 per float feature) ship as a VERBATIM isotonic (PAVA) leaf-delta projection. `cb_compute::calc_monotonic_leaf_deltas` + `build_monotonic_linear_orders` transcribe `monotonic_constraint_utils.cpp:4-143` (BuildMonotonicLinearOrdersOnLeafs bitmask order + CalcOneDimensionalIsotonicRegression level-set PAVA) + `approx_calcer.cpp:551-590` (CalcMonotonicLeafDeltasSimple) exactly; level-set averages use the weighted-mean accumulator (no raw fold, D-08). `BoostParams.monotone_constraints: Vec<i8>` + `monotone_constraints_default()` (empty) threaded into the DIAGONAL POINTWISE leaf branch via `tree_monotone_constraints` (GetTreeMonotoneConstraints) + `monotonic_leaf_isotonic_weights` (Gradient SumWeights+l2 / Newton -SumDer2+l2), AFTER compute_leaf_deltas and BEFORE normalize_leaf_values (curr==0, leaf_estimation_iterations==1), gated on non-empty+non-trivial constraints so the default path is byte-identical (D-6.6-05). cb-train forward-bit leaf_index (split i → bit 1<<i) verified == upstream currDepthBitMask. **TWO key findings (deviations):** (1) the oracle test lives in `cb-train/tests/` not `cb-compute/tests/` (cb-compute has no train entry point; matches FEAT-04 penalty_oracle placement); (2) CatBoost AUTO-enables `model_shrink_rate` (~0.01, a per-tree leaf decay) the moment monotone constraints are present — the fixture pins `model_shrink_rate=0` to ISOLATE the PAVA, and uses binding constraints `[-1,0,1,0]` (the initial `[1,0,-1,0]` was a no-op/vacuous on numeric_tiny). **Escalated gaps (D-6.6-07):** `validate_monotone_constraints` rejects malformed directions now; the `grow_policy == Region` and `monotone × {Lossguide,Depthwise}` typed-error guards are DEFERRED to Plan 06.6-04 (grow_policy does not exist yet — the do-NOT-invent-a-partial-enum directive), recorded as a commented `// TODO(06.6-04)` stub in monotone_oracle_test.rs (no silent drop) and in 06.6-04's acceptance criteria. Gates: cb-compute lib 185/185 (+8 PAVA unit tests), cb-train lib 228/228, monotone_oracle_test 2/2 (LeafValues/StagedApprox/Predictions ≤1e-5 + end-to-end non-increasing-in-feature-0 + typed-error guard), penalty + sampled oracles green (default byte-identical), `cargo check --workspace --tests` clean. With FEAT-04 (06.6-01), Gate-A SC-1 symmetric-features strand satisfied. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits 5c2761c (Task1 PAVA+param+guard) / fb40de4 (Task2 oracle+fixture).
 
 - [06.5-08 BM25 normalization investigation — DECISION PATH-A]: The open question 06.5-04 could not answer ("where does BM25 splits.npy ±1.24/-0.550486 come from when raw BM25 scores are O(1e-3)?") is RESOLVED by source reading + instrumented dump. Source: `base_text_feature_estimator.h:74-88` (raw O(1e-3) column) → `estimated_features.cpp:204-250` (`BestSplit` on raw values, NO transform) → `split.cpp:45-46` → `model.cpp:209` (border stored verbatim) — scale-preserving end to end. Instrumented `cb_instr_estimated_borders` dump: BM25 estimated-feature borders are O(1e-3) (`[0.000465…,…,0.005428…]`); `calcer_encoding` max=0.0064. The committed ±1.24 splits ALL carry `calcer_id=96AE6D4D` (default EMBEDDING calcer on `emb0`), NOT the BM25 text calcer `4559D4B0`; `model.cbm` has an `emb0` feature and won't load against a text-only pool. **PATH-A: there is NO BM25 normalization — the ±1.24 is a fixture mislabel (splits.npy frozen from a text+embedding pool records the embedding feature's borders).** 06.5-09 = fixture-correctness fix: regenerate text-only BM25 fixtures + per-stage oracle ≤1e-5 (the Rust seam already produces O(1e-3) borders). Vendored patch UNCOMMITTED (catboost-master/ untracked). gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits b51aa25 (source) / 1849b04 (dump+DECISION).
 - [06.5-01 Wave-0 ground-truth gate — COMPLETE]: Rebuilt the instrumented catboost 1.2.10 trainer (sudo-free re-provision into a cleared `/tmp`, full Release build RC=0) with **7 env-gated `CB_INSTRUMENT_LOG` hooks** across the text+embedding pipeline: `token_stream` (tokenizer.cpp::Tokenize), `dict_ids` (dictionary_builder.cpp::FinishBuilding, count-DESC/token-ASC sort), `ttext` (text.h::TText ctor), `calcer_encoding` + `online_order` (base_text_feature_estimator.h), `lda_projection` (lda.cpp::CalculateProjection), `knn_neighbors` (knn.cpp::Compute). Smoke dump fires all 7 non-empty (union over BoW+NaiveBayes+BM25+LDA+KNN fits). **Header sink redefinition** fixed with `#ifndef CB_INSTR065_SINK_DEFINED` guard (base_text_feature_estimator.h transitively includes text.h in one TU). Vendored `catboost-master/` patches stay UNCOMMITTED (D-09/D-12 — whole tree untracked). **Per-stage fixtures frozen as `.npy` (splits/leaf_values/leaf_weights/staged/predictions) + `model.cbm`, NOT model.json** — upstream `model_exporter.cpp:152` forbids JSON export for text/embedding models; arrays come straight from the live single-thread trainer (`get_leaf_values`/`_get_tree_splits` border parse/`staged_predict`/`predict`), no fabrication. Corpus = 16 rows (< 1000) → `OccurrenceLowerBound` pinned to 1 (A4), asserted at gen time. 5 calcer fixture dirs (text_calcers/{BoW,NaiveBayes,BM25}, embedding_calcers/{LDA,KNN}) + D-01 text_tokenizer/ corpus (7 hook-category dumps) frozen, all config.json thread_count=1 / catboost_version=1.2.10. 3 Rule-1/3 auto-fixes (file-scope token_stream insert + `\"` quote mangle; header redefinition; whitespace-fragile online_order/calcer_encoding perl) — all in tooling, driver patterns corrected for idempotent re-runs. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits f411da4 (Task 1 hooks) / 0b1e4a4 (Task 2 fixtures). Wave 0 gate GREEN; unblocks Plans 02-07.
