@@ -450,7 +450,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 06.5-01-PLAN.md — Wave 0: re-provision + rebuild the instrumented catboost 1.2.10 trainer with text/embedding CB_INSTRUMENT_LOG hooks (token stream / dict ids / TText / calcer encodings / online order / LDA projection / KNN neighbors, D-07) + single-thread per-stage fixture corpora for all 5 calcers + the tokenizer D-01 corpus (autonomous: false)
+- [x] 06.5-01-PLAN.md — Wave 0: re-provision + rebuild the instrumented catboost 1.2.10 trainer with text/embedding CB_INSTRUMENT_LOG hooks (token stream / dict ids / TText / calcer encodings / online order / LDA projection / KNN neighbors, D-07) + single-thread per-stage fixture corpora for all 5 calcers + the tokenizer D-01 corpus — **COMPLETE** (f411da4/0b1e4a4): 7 env-gated hooks rebuilt RC=0, smoke dump fires all 7 categories non-empty; per-stage `.npy`+`model.cbm` fixtures (model.json export forbidden for text/embedding models) for BoW/NaiveBayes/BM25/LDA/KNN thread_count=1 + D-01 instrumented tokenizer corpus; corpus 16 rows → OLB pinned 1 (A4); vendored catboost-master/ patches UNCOMMITTED (D-09/D-12). Ground truth only — no parity assertion here; Wave 0 gate GREEN, unblocks Plans 02-07
 
 **Wave 2** *(blocked on 06.5-01 — D-01 GATE)*
 
