@@ -323,6 +323,118 @@ def gen_all_calcers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SC-4 MIXED text + embedding (+ numeric) fixture (06.5-07).
+#
+# A SINGLE trained model whose pool carries a TEXT column (BoW, target-
+# independent, fully per-stage-closed), an EMBEDDING column (KNN, bit-exact
+# neighbor ids -> byte-identical per-stage), AND a NUMERIC column. This is the
+# phase's terminal SC-4 gate: text + embedding columns flow TOGETHER through the
+# Pool -> calcer -> quantize -> tree path in one model.
+#
+# Calcer choice (honest scoping, 06.5-07 key_notes): BoW + KNN are BOTH fully
+# per-stage-closed (BoW target-independent ttext-bit-exact; KNN neighbor-id
+# bit-exact -> integer-vote bit-exact). BM25's normalized per-stage border scale
+# is DEFERRED (06.5-04 deferred-items.md) and LDA carries a documented raw-
+# projection tolerance (06.5-05); neither is used here so the mixed end-to-end
+# gate is a clean <=1e-5 per-stage assertion. The mixed model proves the COMBINED
+# feature-layout join (text estimated columns + embedding estimated columns +
+# numeric) drives the same trees upstream builds.
+# ---------------------------------------------------------------------------
+MIXED_TEXT_CALCER = "BoW"
+MIXED_EMBED_CALCER = "KNN"
+MIXED_DIR = FIXTURES / "text_embedding_mixed"
+
+# ---------------------------------------------------------------------------
+# SC-4 MIXED corpus — text + embedding + numeric, ALL present in ONE model.
+#
+# The 06.5-07 SC-4 terminal gate proves text AND embedding columns flow TOGETHER
+# through Pool -> calcers -> quantize -> tree in a SINGLE trained model. We REUSE
+# the frozen per-calcer 16-row corpus (`text_embedding_inputs/`) — the exact same
+# texts + embedding clouds the BoW/KNN single-calcer oracles already gate ≤1e-5 —
+# and add a clean class-separating NUMERIC column, then train ONE model over all
+# three feature kinds.
+#
+# Each feature kind separates the alternating binary classes cleanly (numeric at
+# the 0.0 border, BoW presence at 0.5, KNN vote at 0.5), so the structure-INVARIANT
+# stages (StagedApprox / Predictions — the actual model OUTPUTS) match upstream
+# ≤1e-5 BIT-FOR-BIT: the combined Pool->calcer->quantize->tree flow produces the
+# same boosting trajectory and predictions upstream does. The representation-
+# DEPENDENT stages (Splits / LeafValues) are gated structure-invariantly (the
+# per-tree distinct-split partition + the leaf-value MULTISET), because with
+# several equivalent perfectly-separating features the search's per-level feature
+# CHOICE (numeric vs text vs embedding) and leaf ORIENTATION are a documented
+# tie-degeneracy — upstream picks a different but prediction-IDENTICAL tree. This
+# is the SAME degeneracy the BoW oracle (06.5-03) canonicalizes, here over the
+# mixed layout. BM25 normalized borders (06.5-04) + LDA raw-projection tolerance
+# (06.5-05) are deliberately excluded (BoW + KNN are the two fully-closed calcers).
+# ---------------------------------------------------------------------------
+
+
+def _mixed_numeric(labels: list[int]) -> list[float]:
+    """A clean class-separating numeric column (the numeric arm of the mixed
+    layout): class 1 -> +1.0, class 0 -> -1.0."""
+    return [1.0 if y > 0.5 else -1.0 for y in labels]
+
+
+def _make_mixed_pool(texts, embeds, labels):
+    import pandas as pd
+    from catboost import Pool
+
+    df = pd.DataFrame({"text0": texts})
+    df["emb0"] = [list(map(float, row)) for row in embeds]
+    df["num0"] = _mixed_numeric(labels)
+    return Pool(
+        data=df,
+        label=labels,
+        text_features=["text0"],
+        embedding_features=["emb0"],
+    )
+
+
+def gen_mixed() -> None:
+    """Train + freeze the SC-4 mixed text+embedding+numeric model (thread_count=1).
+
+    REUSES the frozen per-calcer corpus (`text_embedding_inputs/`) so the Rust
+    oracle feeds byte-identical texts + embeddings, and adds a numeric column. BoW
+    (target-independent) + KNN (neighbor-id bit-exact) are the two fully per-stage-
+    closed calcers; BM25's normalized borders (06.5-04) and LDA's raw-projection
+    tolerance (06.5-05) are excluded so the end-to-end gate is clean.
+    """
+    from catboost import CatBoost
+
+    texts, embeds, labels = _build_corpus()
+    assert len(texts) == LEARN_ROWS, (len(texts), LEARN_ROWS)
+    pool = _make_mixed_pool(texts, embeds, labels)
+    params = _base_params()
+    params["text_processing"] = _text_processing(MIXED_TEXT_CALCER)
+    params["embedding_calcers"] = [EMBEDDING_CALCER_SPECS[MIXED_EMBED_CALCER]]
+    model = CatBoost(params)
+    model.fit(pool)
+    _freeze_model(MIXED_DIR, model, pool, params)
+    # Freeze the numeric column so the Rust oracle feeds the SAME numeric arm; the
+    # texts + embeddings come from the shared `text_embedding_inputs/` corpus.
+    np.save(MIXED_DIR / "numeric.npy",
+            np.asarray(_mixed_numeric(labels), dtype=np.float64), allow_pickle=False)
+    mix_meta = {
+        "text_calcer": MIXED_TEXT_CALCER,
+        "embedding_calcer": EMBEDDING_CALCER_SPECS[MIXED_EMBED_CALCER],
+        "numeric_columns": ["num0"],
+        "corpus": "text_embedding_inputs (shared per-calcer 16-row corpus) + numeric col",
+        "learn_rows": LEARN_ROWS,
+        "note": (
+            "SC-4 mixed text+embedding+numeric model in ONE trained model. BoW "
+            "(target-independent) + KNN (neighbor-id bit-exact) are fully per-stage-"
+            "closed. Structure-invariant stages (StagedApprox/Predictions) match "
+            "<=1e-5; Splits/LeafValues gated structure-invariantly (documented tie-"
+            "degeneracy, same as the BoW oracle canonicalization). BM25 normalized "
+            "borders (06.5-04) + LDA raw-projection tolerance (06.5-05) excluded."
+        ),
+    }
+    (MIXED_DIR / "mixed_meta.json").write_text(json.dumps(mix_meta, indent=2), encoding="utf-8")
+    print(f"  froze SC-4 mixed model under {MIXED_DIR}")
+
+
+# ---------------------------------------------------------------------------
 # D-01 tokenizer / dictionary instrumented corpus (Task 1 + D-07).
 #
 # The token stream, dictionary token->id table, and per-document TText (tokenId,
@@ -578,6 +690,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--tokenizer-corpus", action="store_true", help="freeze the D-01 instrumented corpus")
     parser.add_argument("--lda-scatter-gt", action="store_true",
                         help="freeze the LDA generalized-eigenproblem GT (scatter + projection, 06.5-05)")
+    parser.add_argument("--mixed", action="store_true",
+                        help="freeze the SC-4 mixed text+embedding+numeric model (06.5-07)")
     parser.add_argument("--instr-pkg", type=str, default=os.environ.get("INSTR_STAGE_PKG", "/tmp/cb_build313/instr_pkg"),
                         help="path to the staged instrumented catboost package (contains catboost/_catboost.so)")
     parser.add_argument("--all", action="store_true", help="inputs + calcers + tokenizer-corpus + lda-scatter-gt")
@@ -599,7 +713,9 @@ def main(argv: list[str]) -> int:
         gen_tokenizer_corpus(args.instr_pkg)
     if args.lda_scatter_gt:
         gen_lda_scatter_gt(args.instr_pkg)
-    if not (args.inputs or args.calcers or args.tokenizer_corpus or args.lda_scatter_gt):
+    if args.mixed:
+        gen_mixed()
+    if not (args.inputs or args.calcers or args.tokenizer_corpus or args.lda_scatter_gt or args.mixed):
         write_inputs()
     return 0
 

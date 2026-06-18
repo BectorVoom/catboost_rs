@@ -1,0 +1,56 @@
+{
+  "loss_function": "Logloss",
+  "iterations": 5,
+  "depth": 2,
+  "learning_rate": 0.3,
+  "leaf_estimation_iterations": 1,
+  "boosting_type": "Plain",
+  "bootstrap_type": "No",
+  "random_strength": 0,
+  "random_seed": 20260618,
+  "thread_count": 1,
+  "allow_writing_files": false,
+  "text_processing": {
+    "feature_processing": {
+      "default": [
+        {
+          "feature_calcers": [
+            "BoW"
+          ],
+          "dictionaries_names": [
+            "Bigram",
+            "Word"
+          ],
+          "tokenizers_names": [
+            "Space"
+          ]
+        }
+      ]
+    },
+    "dictionaries": [
+      {
+        "dictionary_id": "Word",
+        "gram_order": "1",
+        "occurrence_lower_bound": "1",
+        "max_dictionary_size": "50000"
+      },
+      {
+        "dictionary_id": "Bigram",
+        "gram_order": "2",
+        "occurrence_lower_bound": "1",
+        "max_dictionary_size": "50000"
+      }
+    ],
+    "tokenizers": [
+      {
+        "tokenizer_id": "Space",
+        "separator_type": "ByDelimiter",
+        "delimiter": " ",
+        "lowercasing": "true"
+      }
+    ]
+  },
+  "embedding_calcers": [
+    "KNN:k=3"
+  ]
+}

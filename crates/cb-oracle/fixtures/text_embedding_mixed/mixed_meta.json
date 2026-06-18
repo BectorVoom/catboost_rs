@@ -1,0 +1,10 @@
+{
+  "text_calcer": "BoW",
+  "embedding_calcer": "KNN:k=3",
+  "numeric_columns": [
+    "num0"
+  ],
+  "corpus": "text_embedding_inputs (shared per-calcer 16-row corpus) + numeric col",
+  "learn_rows": 16,
+  "note": "SC-4 mixed text+embedding+numeric model in ONE trained model. BoW (target-independent) + KNN (neighbor-id bit-exact) are fully per-stage-closed. Structure-invariant stages (StagedApprox/Predictions) match <=1e-5; Splits/LeafValues gated structure-invariantly (documented tie-degeneracy, same as the BoW oracle canonicalization). BM25 normalized borders (06.5-04) + LDA raw-projection tolerance (06.5-05) excluded."
+}
