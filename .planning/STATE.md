@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 06.5-07-PLAN.md
-last_updated: "2026-06-18T05:20:00.000Z"
-last_activity: "2026-06-18 -- 06.5-07 COMPLETE (SC-4 TERMINAL GATE): build_mixed_estimated_features joins numeric + BoW text + KNN embedding into ONE float-feature layout [numeric|text|embedding] through the EXISTING select_borders_greedy_logsum quantizer->tree (SC-4, no parallel quantizer; KNN offline whole-set Plain-tree estimate; inert-when-absent D-04). SC-4 mixed end-to-end oracle: StagedApprox + Predictions match upstream catboost 1.2.10 <=1e-5 BIT-FOR-BIT (text AND embedding flow together -> upstream's model); Splits/LeafValues gated structure-invariantly under a documented feature-selection tie (1 distinct split/tree + valid separating border; per-tree leaf-value MULTISET <=1e-5 -- magnitudes exact, only ambiguous leaf ORDER freed; upstream's own splits.npy shows the tie [0.0,0.0,0.5,0.0,0.0]). Mixed model scoped to BoW + KNN (the two fully per-stage-closed calcers); BM25 normalized borders (06.5-04) + LDA raw-projection tolerance (06.5-05) EXCLUDED. 5 oracle tests 0-ignored; cb-train lib 228 + cb-data 106 + cb-compute 176; D-04 no-text e2e unchanged; clippy-clean. FEAT-02 COMPLETE; FEAT-01 residual = BM25 per-stage normalized borders + general estimated-feature quantization-GRID parity (deferred to a trainer-normalization slice). Commits a20cd9b (orchestration) / 2be89ba (oracle+fixture)"
+status: completed
+stopped_at: Completed 06.5-05-PLAN.md
+last_updated: "2026-06-18T04:28:25.973Z"
+last_activity: "2026-06-18 -- 06.5-07 COMPLETE (SC-4 TERMINAL GATE): build_mixed_estimated_features joins numeric + BoW text + KNN embedding into ONE float-feature layout [numeric|text|embedding] through the EXISTING quantizer->tree (SC-4, no parallel quantizer; inert-when-absent D-04). SC-4 mixed end-to-end oracle: StagedApprox + Predictions <=1e-5 BIT-FOR-BIT (text AND embedding flow together -> upstream's model); Splits/LeafValues gated structure-invariantly under a documented feature-selection tie (per-tree leaf MULTISET <=1e-5, magnitudes exact). Mixed scoped to BoW + KNN (fully per-stage-closed); BM25 (06.5-04) + LDA tolerance (06.5-05) EXCLUDED. 5 oracle tests 0-ignored; cb-train 228 + cb-data 106 + cb-compute 176; D-04 unchanged. FEAT-01 residual = BM25 per-stage normalized borders + general estimated-feature quantization-GRID parity (future trainer-normalization slice). Commits a20cd9b / 2be89ba"
 progress:
   total_phases: 14
   completed_phases: 9
