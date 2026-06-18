@@ -247,15 +247,18 @@ fn naive_bayes_log_prob(
 
     // classTokensCount += TokenPrior * (NumSeenTokens + SEEN_TOKENS_PRIOR)
     // (naive_bayesian.cpp:23)
-    let mut class_tokens_count = class_tokens_count_base
+    let class_tokens_count_seen = class_tokens_count_base
         + state.token_prior * (state.num_seen_tokens + NAIVE_BAYES_SEEN_TOKENS_PRIOR) as f64;
 
     // Σ count (textLen) and Σ count·log(num) (the value increment), both in
     // upstream token-iteration order → sum_f64 (D-04). The unseen-word
-    // `classTokensCount += TokenPrior` is a running scalar (order-independent
-    // addition count), matching the upstream single accumulator.
+    // `classTokensCount += TokenPrior` is computed as `token_prior *
+    // unseen_count` from a counted set, which is exact and order-free — this
+    // avoids an order-dependent running scalar should `token_prior` ever become
+    // per-token (WR-07).
     let mut text_len_terms: Vec<f64> = Vec::with_capacity(text.len());
     let mut value_terms: Vec<f64> = Vec::with_capacity(text.len());
+    let mut unseen_count: u64 = 0;
     for pair in text.pairs() {
         let count = f64::from(pair.count);
         text_len_terms.push(count);
@@ -264,11 +267,12 @@ fn naive_bayes_log_prob(
         let mut num = state.token_prior;
         match freq_table.get(&pair.token) {
             Some(&freq) => num += freq as f64,
-            None => class_tokens_count += state.token_prior, // unseen-word adjust
+            None => unseen_count += 1, // unseen-word adjust (counted, summed once below)
         }
         // value += count * log(num)  (naive_bayesian.cpp:38)
         value_terms.push(count * num.ln());
     }
+    let class_tokens_count = class_tokens_count_seen + state.token_prior * unseen_count as f64;
 
     let text_len = sum_f64(&text_len_terms);
     // value = value_base + Σ count·log(num) - textLen·log(classTokensCount)
