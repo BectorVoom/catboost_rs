@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 6.5 context gathered
-last_updated: "2026-06-18T01:09:27.497Z"
-last_activity: "2026-06-18 -- 06.5-01 COMPLETE: instrumented trainer + 7 text/embedding hooks rebuilt RC=0; single-thread fixtures for 5 calcers + D-01 corpus frozen"
+stopped_at: Completed 06.5-03-PLAN.md (BoW calcer + SC-4 estimated-feature seam)
+last_updated: "2026-06-18T01:33:00.000Z"
+last_activity: "2026-06-18 -- 06.5-03 COMPLETE: BoW calcer + BiGram dictionary + SC-4 estimated-feature seam; BoW 4-stage oracle <=1e-5"
 progress:
   total_phases: 14
   completed_phases: 9
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.5 (text-and-embedding-features) — EXECUTING
-Plan: 3 of 7
+Plan: 4 of 7
 Status: Ready to execute
-Last activity: 2026-06-18 -- 06.5-01 COMPLETE: instrumented trainer + 7 text/embedding hooks rebuilt RC=0; single-thread fixtures for 5 calcers + D-01 corpus frozen
+Last activity: 2026-06-18 -- 06.5-03 COMPLETE: BoW calcer (bag_of_words_compute, bow.cpp:7-21) + BiGram dictionary (deferred from SC-1, ttext bit-exact ids 0..24) + SC-4 estimated-feature seam (build_bow_estimated_features: calcer floats -> EXISTING borders/quantize/tree); BoW 4-stage oracle <=1e-5 (Newton+Cosine, depth-2->depth-1 stored-form canonicalization); D-04 non-text byte-identical; cb-train lib 202 + cb-data lib 106 pass
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 

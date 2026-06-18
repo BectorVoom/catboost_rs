@@ -458,7 +458,7 @@ Plans:
 
 **Wave 3** *(blocked on 06.5-02)*
 
-- [ ] 06.5-03-PLAN.md — BoW (target-independent, simplest slice) + the SC-4 estimated-feature integration seam (estimated floats → existing borders/quantize/tree); BoW per-stage oracle ≤1e-5 (FEAT-01)
+- [x] 06.5-03-PLAN.md — BoW (target-independent, simplest slice) + the SC-4 estimated-feature integration seam (estimated floats → existing borders/quantize/tree); BoW per-stage oracle ≤1e-5 (FEAT-01) — COMPLETE: bag_of_words_compute + BiGram dictionary (deferred from SC-1, ttext bit-exact) + build_bow_estimated_features seam; 4-stage BoW oracle ≤1e-5 (Newton+Cosine, depth-2→depth-1 canonicalization); D-04 non-text path byte-identical; cb-train lib 202 + cb-data lib 106 pass
 
 **Wave 4** *(blocked on 06.5-03)*
 
