@@ -143,6 +143,13 @@ impl Dictionary {
 
     /// The reserved unknown-token id: `dictionary_size + StartTokenId`
     /// (`frequency_based_dictionary_impl.h:126`).
+    ///
+    /// NOTE (IN-05): for an empty dictionary (`len()==0`, `start_token_id==0`)
+    /// this is `0`, colliding with the id a single-entry dictionary would assign
+    /// its first token. The digitizer default policy is `Skip`, which never
+    /// emits this id, so no in-tree path is affected; `Insert` over an empty
+    /// dictionary is undefined and not used (it matches the upstream
+    /// `dictionary_size + StartTokenId` formula).
     #[must_use]
     pub fn unknown_token_id(&self) -> u32 {
         // saturating to preserve the no-panic contract on the (unreachable for

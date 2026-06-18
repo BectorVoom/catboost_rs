@@ -80,6 +80,11 @@ impl BigramDictionary {
 
     /// The reserved unknown-token id: `dictionary_size + StartTokenId`
     /// (`frequency_based_dictionary_impl.h:419-420`).
+    ///
+    /// NOTE (IN-05): for an empty dictionary this is `0`, colliding with the id
+    /// a single-entry dictionary would assign its first pair. The digitizer
+    /// default `Skip` policy never emits this id; `Insert` over an empty
+    /// dictionary is undefined and not used.
     #[must_use]
     pub fn unknown_token_id(&self) -> u32 {
         (self.pair_to_id.len() as u32).saturating_add(self.start_token_id)
