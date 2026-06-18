@@ -970,7 +970,7 @@ pub fn leaf_wise_grower(
                         id: usize,
                         bs: &LeafBestSplit|
      -> (usize, usize) {
-        let depth = node_depth[id] + 1;
+        let depth = node_depth.get(id).copied().unwrap_or(0) + 1;
         let left = new_node(
             nodes,
             node_split,
@@ -987,8 +987,12 @@ pub fn leaf_wise_grower(
             bs.right_docs.clone(),
             depth,
         );
-        nodes[id] = BuiltNode::Interior { split: bs.split, left, right };
-        node_split[id] = Some(bs.split);
+        if let Some(slot) = nodes.get_mut(id) {
+            *slot = BuiltNode::Interior { split: bs.split, left, right };
+        }
+        if let Some(slot) = node_split.get_mut(id) {
+            *slot = Some(bs.split);
+        }
         for &obj in &bs.left_docs {
             if let Some(o) = leaf_owner.get_mut(obj) {
                 *o = left;
@@ -1009,7 +1013,7 @@ pub fn leaf_wise_grower(
             for _cur_depth in 0..max_depth {
                 let mut next_level: Vec<usize> = Vec::new();
                 for &leaf in &current_level {
-                    let docs = node_docs[leaf].clone();
+                    let docs = node_docs.get(leaf).cloned().unwrap_or_default();
                     if let Some(bs) = best_split_for_leaf(
                         matrix,
                         &docs,
@@ -1087,12 +1091,15 @@ pub fn leaf_wise_grower(
                                node_docs: &[Vec<usize>],
                                node_depth: &[usize],
                                node: usize| {
-                if node_depth[node] >= max_depth {
+                if node_depth.get(node).copied().unwrap_or(0) >= max_depth {
                     return;
                 }
+                let Some(docs) = node_docs.get(node) else {
+                    return;
+                };
                 if let Some(bs) = best_split_for_leaf(
                     matrix,
-                    &node_docs[node],
+                    docs,
                     der1,
                     weight,
                     scaled_l2,
@@ -1152,7 +1159,9 @@ pub fn leaf_wise_grower(
                 // Interior nodes carry the `u32::MAX` interior sentinel explicitly
                 // (the init already covers it; this keeps the intent local to the
                 // arm and matches the cbm.rs:200 `distinct_leaves` filter — CR-02).
-                node_id_to_leaf_id[id] = u32::MAX;
+                if let Some(slot) = node_id_to_leaf_id.get_mut(id) {
+                    *slot = u32::MAX;
+                }
                 // step diffs are (child_id - this_id), the upstream
                 // `LeftSubtreeDiff` / `RightSubtreeDiff` offsets added to walk down.
                 // Children are registered after their parent, so both diffs are
@@ -1183,8 +1192,12 @@ pub fn leaf_wise_grower(
                 // (0,0)); reuse a zeroed Split so `splits` stays node-indexed.
                 splits.push(Split { feature: 0, border: 0.0 });
                 step_nodes.push((0, 0));
-                node_to_leaf[id] = Some(next_leaf_id);
-                node_id_to_leaf_id[id] = next_leaf_id;
+                if let Some(slot) = node_to_leaf.get_mut(id) {
+                    *slot = Some(next_leaf_id);
+                }
+                if let Some(slot) = node_id_to_leaf_id.get_mut(id) {
+                    *slot = next_leaf_id;
+                }
                 next_leaf_id += 1;
             }
         }

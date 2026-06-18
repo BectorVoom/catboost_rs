@@ -272,9 +272,11 @@ fn flatten_non_symmetric(root: &NonSymmetricNodeJson) -> Result<NonSymmetricTree
             }));
             step_nodes.push((0, 0));
             let leaf_id = leaf_values.len();
-            node_id_to_leaf_id[id] = u32::try_from(leaf_id).map_err(|_| {
-                ModelError::Deserialize("non-symmetric leaf id exceeds u32".to_owned())
-            })?;
+            if let Some(slot) = node_id_to_leaf_id.get_mut(id) {
+                *slot = u32::try_from(leaf_id).map_err(|_| {
+                    ModelError::Deserialize("non-symmetric leaf id exceeds u32".to_owned())
+                })?;
+            }
             leaf_values.push(value);
             leaf_weights.push(node.weight.unwrap_or(0.0));
         }

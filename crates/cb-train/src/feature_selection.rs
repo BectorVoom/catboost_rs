@@ -249,7 +249,7 @@ pub fn select_features<R: Runtime>(
 
         // ---- Build the candidate sub-matrix (retained columns, re-indexed) ----
         let local_to_global: Vec<usize> =
-            (0..n_features).filter(|&g| retained[g]).collect();
+            (0..n_features).filter(|&g| retained.get(g).copied().unwrap_or(false)).collect();
         let sub_values: Vec<Vec<f32>> = local_to_global
             .iter()
             .filter_map(|&g| feature_values.get(g).cloned())
@@ -323,7 +323,7 @@ pub fn select_features<R: Runtime>(
     // is reported — but run to mirror the upstream control flow when requested).
     if train_final_model {
         let local_to_global: Vec<usize> =
-            (0..n_features).filter(|&g| retained[g]).collect();
+            (0..n_features).filter(|&g| retained.get(g).copied().unwrap_or(false)).collect();
         let sub_values: Vec<Vec<f32>> = local_to_global
             .iter()
             .filter_map(|&g| feature_values.get(g).cloned())
