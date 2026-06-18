@@ -1,0 +1,50 @@
+{
+  "scenario": "monotone/increasing_decreasing",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "input_dataset": "numeric_tiny",
+  "loss_function": "RMSE",
+  "grow_policy": "SymmetricTree",
+  "monotone_constraints": [
+    -1,
+    0,
+    1,
+    0
+  ],
+  "params": {
+    "iterations": 5,
+    "learning_rate": 0.1,
+    "depth": 2,
+    "l2_leaf_reg": 3.0,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "leaf_estimation_iterations": 1,
+    "score_function": "L2",
+    "leaf_estimation_method": "Gradient",
+    "grow_policy": "SymmetricTree",
+    "random_seed": 0,
+    "thread_count": 1,
+    "boost_from_average": true,
+    "model_shrink_rate": 0,
+    "verbose": false,
+    "monotone_constraints": [
+      -1,
+      0,
+      1,
+      0
+    ]
+  },
+  "n_rows": 50,
+  "n_features": 4,
+  "n_iterations": 5,
+  "prediction_type": "RawFormulaVal",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw approximant)",
+  "monotone_note": "FEAT-03. monotone_constraints [+1/-1/0 per feature] is enforced as an isotonic (PAVA) projection over the per-leaf DELTAS during leaf estimation (CalcMonotonicLeafDeltasSimple, approx_calcer.cpp:551), AFTER the structure is built. The SPLITS are UNAFFECTED (a sanity lock); only the LEAF VALUES change vs an unconstrained model. Oblivious-only (SymmetricTree); upstream rejects monotone under non-symmetric policies."
+}
