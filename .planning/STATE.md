@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.5-08-PLAN.md
-last_updated: "2026-06-18T04:54:00.000Z"
-last_activity: 2026-06-18 -- Phase 06.5 execution started
+stopped_at: Completed 06.5-05-PLAN.md
+last_updated: "2026-06-18T05:49:11.902Z"
+last_activity: "2026-06-18 -- 06.5-08 BM25 normalization investigation: DECISION PATH-A (±1.24 = embedding feature mislabel, not BM25 normalization)"
 progress:
   total_phases: 14
-  completed_phases: 9
+  completed_phases: 10
   total_plans: 82
-  completed_plans: 81
-  percent: 65
+  completed_plans: 82
+  percent: 71
 ---
 
 # Project State
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.5 (text-and-embedding-features) — EXECUTING
-Plan: 8 of 9 complete (06.5-09 next)
-Status: Executing Phase 06.5
+Plan: 9 of 9 complete (06.5-09 next)
+Status: Ready to execute
 Last activity: 2026-06-18 -- 06.5-08 BM25 normalization investigation: DECISION PATH-A (±1.24 = embedding feature mislabel, not BM25 normalization)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
