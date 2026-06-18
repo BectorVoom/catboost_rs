@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06.6-05-PLAN.md
-last_updated: "2026-06-18T11:40:00.000Z"
-last_activity: 2026-06-18 -- 06.6-05 non-symmetric apply + full oracle GREEN (FEAT-06/SC-3 complete)
+stopped_at: Completed 06.6-06-PLAN.md
+last_updated: "2026-06-18T12:30:00.000Z"
+last_activity: 2026-06-18 -- 06.6-06 LossFunctionChange (MODEL-03/D-12) + non-symmetric PVC/Interaction oracle GREEN (D-6.6-10)
 progress:
   total_phases: 14
   completed_phases: 10
   total_plans: 90
-  completed_plans: 88
-  percent: 72
+  completed_plans: 89
+  percent: 73
 ---
 
 # Project State
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.6 (advanced-features-and-non-symmetric-trees) — EXECUTING
-Plan: 6 of 8
-Status: 06.6-05 COMPLETE — non-symmetric apply pointer-walk + full per-stage + .cbm/json round-trip oracle GREEN (FEAT-06 / SC-3 complete); next wave: 06.6-06/07 advanced fstr/SHAP
-Last activity: 2026-06-18 -- 06.6-05 non-symmetric apply + full oracle GREEN (FEAT-06/SC-3 complete)
+Plan: 7 of 8
+Status: 06.6-06 COMPLETE — LossFunctionChange (MODEL-03/D-12) oracle-locked ≤1e-5 + PVC/Interaction generalized to non-symmetric trees (D-6.6-10), oblivious arm byte-identical; next: 06.6-07 advanced SHAP (shap.rs)
+Last activity: 2026-06-18 -- 06.6-06 LossFunctionChange + non-symmetric PVC/Interaction oracle GREEN (D-6.6-10)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -129,6 +129,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.6 P03 | ~70min | 2 tasks | 17 files |
 | Phase 06.6 P04 | 95min | 3 tasks | 53 files |
 | Phase 06.6 P05 | ~55min | 2 tasks | 5 files |
+| Phase 06.6 P06 | ~40min | 2 tasks | 15 files |
 
 ## Accumulated Context
 
