@@ -1,0 +1,50 @@
+{
+  "artifacts": [
+    "oblivious_shap.npy",
+    "oblivious_shap_interaction.npy",
+    "oblivious_shap_interaction_shape.npy",
+    "prediction_diff.npy",
+    "sage_values.npy",
+    "binclf_X.npy",
+    "binclf_y.npy",
+    "non_symmetric_model.cbm",
+    "non_symmetric_model.json",
+    "non_symmetric_shap.npy",
+    "non_symmetric_shap_interaction.npy",
+    "non_symmetric_shap_interaction_shape.npy"
+  ],
+  "bias_slot_index": "last (n_feat+1 - 1); row-sum over j collapses to ShapValues",
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "non_symmetric_shap_interaction_shape": [
+    50,
+    5,
+    5
+  ],
+  "note": "06.6-07: ShapInteractionValues / PredictionDiff / SAGE (MODEL-05) + non-symmetric TreeSHAP (D-6.6-10). All vectors from catboost 1.2.10 get_feature_importance(...). Oblivious model = the binclf params; non-symmetric model = Depthwise max_depth=3. SAGE seed-pinned, deterministic (D-6.6-11 fallback a).",
+  "oblivious_shap_interaction_shape": [
+    50,
+    5,
+    5
+  ],
+  "prediction_diff": [
+    0.39670433253615955,
+    0.0,
+    0.0,
+    0.7934086650723191
+  ],
+  "sage_random_seed": 0,
+  "sage_same_seed_reproducible": true,
+  "sage_values": [
+    0.013780437519883067,
+    0.0,
+    0.0,
+    0.06357459243540979
+  ],
+  "scenario": "advanced_fstr",
+  "seed_non_symmetric": 42,
+  "seed_oblivious": 0,
+  "shap_interaction_rowsum_dev_non_symmetric": 0.0012967334853777063,
+  "shap_interaction_rowsum_dev_oblivious": 0.010368783317922962,
+  "thread_count": 1
+}

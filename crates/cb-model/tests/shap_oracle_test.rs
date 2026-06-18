@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use cb_model::{predict_raw, shap_values, Model, ModelSplit, ObliviousTree, Split};
+use cb_model::{load_cbm, predict_raw, shap_values, Model, ModelSplit, ObliviousTree, Split};
 use cb_oracle::{load_f64_vec, load_model_json, ModelJson};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
@@ -183,6 +183,49 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
         assert!(
             (total - pred).abs() <= TOL,
             "in-env local accuracy fails at obj {obj}: Σshap={total}, pred={pred}"
+        );
+    }
+}
+
+/// D-6.6-10: regular TreeSHAP on a NON-SYMMETRIC (Depthwise) model must
+/// reproduce upstream `get_feature_importance(type='ShapValues')` ≤1e-5, AND the
+/// local-accuracy invariant (`Σshap + bias == predict_raw`) must hold — the same
+/// strongest check the oblivious path satisfies. Uses the committed
+/// `advanced_fstr/non_symmetric_model.cbm` (carries the node graph + leaf
+/// weights). The existing oblivious cases above are UNCHANGED.
+#[test]
+fn non_symmetric_shap_matches_upstream_and_local_accuracy() {
+    let model = load_cbm(&fixture("advanced_fstr/non_symmetric_model.cbm"))
+        .expect("non_symmetric_model.cbm must load");
+    assert!(
+        !model.non_symmetric_trees.is_empty() && model.oblivious_trees.is_empty(),
+        "fixture must be a pure non-symmetric model"
+    );
+    let cols = load_feature_columns(); // numeric_tiny X (same inputs the model trained on)
+
+    let shap = shap_values(&model, &cols, N_FEATURES);
+    let flat: Vec<f64> = shap.iter().flat_map(|row| row.iter().copied()).collect();
+
+    let expected = load_f64_vec(&fixture("advanced_fstr/non_symmetric_shap.npy"))
+        .expect("non_symmetric_shap.npy must load");
+    assert_eq!(flat.len(), expected.len(), "non-symmetric SHAP length");
+    for (i, (&got, &want)) in flat.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() <= TOL,
+            "non-symmetric SHAP[{i}] diverges: got {got}, want {want} (|d|={})",
+            (got - want).abs()
+        );
+    }
+
+    // Local accuracy: Σ_columns row == predict_raw[obj].
+    let preds = predict_raw(&model, &cols);
+    assert_eq!(shap.len(), preds.len(), "one SHAP row per object");
+    for (obj, (row, &pred)) in shap.iter().zip(preds.iter()).enumerate() {
+        let total = cb_core::sum_f64(row);
+        assert!(
+            (total - pred).abs() <= TOL,
+            "non-symmetric local accuracy fails at obj {obj}: Σshap={total}, pred={pred} (|d|={})",
+            (total - pred).abs()
         );
     }
 }
