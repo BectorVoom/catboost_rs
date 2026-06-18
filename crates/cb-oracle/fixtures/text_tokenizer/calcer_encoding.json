@@ -1,0 +1,258 @@
+[
+  {
+    "event": "calcer_encoding",
+    "doc": 0,
+    "values": [
+      0.5
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 1,
+    "values": [
+      0.6810291409492493
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 2,
+    "values": [
+      0.2132255882024765
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 3,
+    "values": [
+      0.8586572408676147
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 4,
+    "values": [
+      0.029175784438848495
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 5,
+    "values": [
+      0.9959349632263184
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 6,
+    "values": [
+      0.002347375266253948
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 7,
+    "values": [
+      0.9986633658409119
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 8,
+    "values": [
+      0.0009445851901546121
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 9,
+    "values": [
+      0.9911479949951172
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 10,
+    "values": [
+      0.004866940900683403
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 11,
+    "values": [
+      0.9932307004928589
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 12,
+    "values": [
+      0.003944427240639925
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 13,
+    "values": [
+      0.9966728091239929
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 14,
+    "values": [
+      0.00018413645739201456
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 15,
+    "values": [
+      0.9998425245285034
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 0,
+    "values": [
+      0.5
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 1,
+    "values": [
+      0.6810291409492493
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 2,
+    "values": [
+      0.2132255882024765
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 3,
+    "values": [
+      0.8586572408676147
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 4,
+    "values": [
+      0.029175784438848495
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 5,
+    "values": [
+      0.9959349632263184
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 6,
+    "values": [
+      0.002347375266253948
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 7,
+    "values": [
+      0.9986633658409119
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 8,
+    "values": [
+      0.0009445851901546121
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 9,
+    "values": [
+      0.9911479949951172
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 10,
+    "values": [
+      0.004866940900683403
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 11,
+    "values": [
+      0.9932307004928589
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 12,
+    "values": [
+      0.003944427240639925
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 13,
+    "values": [
+      0.9966728091239929
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 14,
+    "values": [
+      0.00018413645739201456
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "calcer_encoding",
+    "doc": 15,
+    "values": [
+      0.9998425245285034
+    ],
+    "_calcer": "NaiveBayes"
+  }
+]

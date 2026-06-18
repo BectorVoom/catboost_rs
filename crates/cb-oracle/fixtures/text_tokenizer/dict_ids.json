@@ -1,0 +1,96 @@
+[
+  {
+    "event": "dict_ids",
+    "gram_order": 1,
+    "entries": [
+      {
+        "token": "bad",
+        "id": 0,
+        "count": 10
+      },
+      {
+        "token": "great",
+        "id": 1,
+        "count": 10
+      },
+      {
+        "token": "awful",
+        "id": 2,
+        "count": 9
+      },
+      {
+        "token": "good",
+        "id": 3,
+        "count": 9
+      },
+      {
+        "token": "film",
+        "id": 4,
+        "count": 6
+      },
+      {
+        "token": "movie",
+        "id": 5,
+        "count": 4
+      },
+      {
+        "token": "terrible",
+        "id": 6,
+        "count": 1
+      },
+      {
+        "token": "wonderful",
+        "id": 7,
+        "count": 1
+      }
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "dict_ids",
+    "gram_order": 1,
+    "entries": [
+      {
+        "token": "bad",
+        "id": 0,
+        "count": 10
+      },
+      {
+        "token": "great",
+        "id": 1,
+        "count": 10
+      },
+      {
+        "token": "awful",
+        "id": 2,
+        "count": 9
+      },
+      {
+        "token": "good",
+        "id": 3,
+        "count": 9
+      },
+      {
+        "token": "film",
+        "id": 4,
+        "count": 6
+      },
+      {
+        "token": "movie",
+        "id": 5,
+        "count": 4
+      },
+      {
+        "token": "terrible",
+        "id": 6,
+        "count": 1
+      },
+      {
+        "token": "wonderful",
+        "id": 7,
+        "count": 1
+      }
+    ],
+    "_calcer": "NaiveBayes"
+  }
+]

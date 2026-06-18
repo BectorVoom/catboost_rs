@@ -1,0 +1,16 @@
+{
+  "loss_function": "Logloss",
+  "iterations": 5,
+  "depth": 2,
+  "learning_rate": 0.3,
+  "leaf_estimation_iterations": 1,
+  "boosting_type": "Plain",
+  "bootstrap_type": "No",
+  "random_strength": 0,
+  "random_seed": 20260618,
+  "thread_count": 1,
+  "allow_writing_files": false,
+  "embedding_calcers": [
+    "KNN:k=3"
+  ]
+}

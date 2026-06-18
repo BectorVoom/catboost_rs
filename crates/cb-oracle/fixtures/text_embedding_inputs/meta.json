@@ -1,0 +1,39 @@
+{
+  "catboost_version": "1.2.10",
+  "learn_rows": 16,
+  "embed_dim": 4,
+  "random_seed": 20260618,
+  "occurrence_lower_bound_pinned": 1,
+  "occurrence_lower_bound_rule": "options_helper.cpp:394-401 poolSize<1000 ? 1 : 5; learn_rows=16 < 1000 -> 1",
+  "max_dictionary_size_pinned": 50000,
+  "tokenizer": "ByDelimiter(space) + lowercasing (D-02 defaults)",
+  "dictionaries": {
+    "BoW": [
+      "Bigram",
+      "Word"
+    ],
+    "NaiveBayes": [
+      "Word"
+    ],
+    "BM25": [
+      "Word"
+    ]
+  },
+  "embedding_calcer_specs": {
+    "LDA": "LDA:reg=0.05:likelihood=true",
+    "KNN": "KNN:k=3"
+  },
+  "pinned_params": {
+    "loss_function": "Logloss",
+    "iterations": 5,
+    "depth": 2,
+    "learning_rate": 0.3,
+    "leaf_estimation_iterations": 1,
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 20260618,
+    "thread_count": 1,
+    "allow_writing_files": false
+  }
+}

@@ -1,0 +1,878 @@
+[
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "movie"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "awful",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "film",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "movie",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "good",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "bad",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "great",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "awful",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "good",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "film",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "movie",
+      "great",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "movie",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "wonderful",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "terrible",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "movie"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "awful",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "film",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "movie",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "good",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "bad",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "great",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "awful",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "good",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "film",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "movie",
+      "great",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "movie",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "wonderful",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "terrible",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "movie"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "awful",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "film",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "movie",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "good",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "bad",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "great",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "awful",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "good",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "film",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "movie",
+      "great",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "movie",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "wonderful",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "terrible",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "movie"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "awful",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "film",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "movie",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "good",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "bad",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "great",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "awful",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "good",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "film",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "movie",
+      "great",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "movie",
+      "film"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "wonderful",
+      "good"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "terrible",
+      "awful"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "great"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "bad"
+    ],
+    "_calcer": "BoW"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "movie"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "awful",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "film",
+      "great"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "movie",
+      "bad"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "good",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "bad",
+      "awful"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "great",
+      "good"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "awful",
+      "bad"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "good",
+      "great"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "film",
+      "awful"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "movie",
+      "great",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "movie",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "wonderful",
+      "good"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "terrible",
+      "awful"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "great"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "bad"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "movie"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "awful",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "film",
+      "great"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "movie",
+      "bad"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "good",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "bad",
+      "awful"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "great",
+      "good"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "awful",
+      "bad"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "good",
+      "great"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "film",
+      "awful"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "movie",
+      "great",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "movie",
+      "film"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "great",
+      "wonderful",
+      "good"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "bad",
+      "terrible",
+      "awful"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "good",
+      "great",
+      "great"
+    ],
+    "_calcer": "NaiveBayes"
+  },
+  {
+    "event": "token_stream",
+    "tokens": [
+      "awful",
+      "bad",
+      "bad"
+    ],
+    "_calcer": "NaiveBayes"
+  }
+]
