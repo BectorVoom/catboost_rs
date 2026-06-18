@@ -134,11 +134,32 @@ def _build_corpus() -> tuple[list[str], list[list[float]], list[int]]:
 LEARN_ROWS = len(_POS_TEXTS) + len(_NEG_TEXTS)  # == 16, strictly < 1000 -> OLB=1
 
 
-def _make_pool(texts, embeds, labels):
+def _make_pool(texts, embeds, labels, *, text_only: bool = False):
+    """Build the learn pool.
+
+    `text_only=True` (the TEXT-calcer fixtures BoW/NaiveBayes/BM25) builds a pool
+    with ONLY the `text0` column — NO `emb0` embedding column. This is mandatory
+    for the text-calcer per-stage fixtures: including `emb0` adds the default
+    EMBEDDING calcer, whose well-separated ±1.0 clouds dominate the tree search and
+    cause the model to split on the EMBEDDING feature instead of the text calcer.
+    The frozen `splits.npy` then records the embedding feature's borders (±1.24 /
+    -0.550486) mislabeled as the text calcer's — the 06.5-04→06.5-08 "BM25
+    normalization" artifact (see BM25-NORMALIZATION-DECISION.md, PATH-A). With
+    `text_only=True` the model splits on the genuine O(1e-3) text-calcer feature.
+
+    `text_only=False` (the EMBEDDING-calcer fixtures LDA/KNN, and the legacy mixed
+    path) keeps both columns so the embedding calcer has its `emb0` input.
+    """
     import pandas as pd
     from catboost import Pool
 
     df = pd.DataFrame({"text0": texts})
+    if text_only:
+        return Pool(
+            data=df,
+            label=labels,
+            text_features=["text0"],
+        )
     df["emb0"] = [list(map(float, row)) for row in embeds]
     return Pool(
         data=df,
@@ -291,7 +312,10 @@ def gen_text_calcer(calcer: str) -> None:
     from catboost import CatBoost
 
     texts, embeds, labels = _build_corpus()
-    pool = _make_pool(texts, embeds, labels)
+    # TEXT-ONLY pool: no emb0. See _make_pool docstring + BM25-NORMALIZATION-DECISION.md
+    # (PATH-A). With emb0 present the embedding calcer dominates the split search and
+    # splits.npy records the embedding feature's borders, not the text calcer's.
+    pool = _make_pool(texts, embeds, labels, text_only=True)
     params = _base_params()
     params["text_processing"] = _text_processing(calcer)
     model = CatBoost(params)
