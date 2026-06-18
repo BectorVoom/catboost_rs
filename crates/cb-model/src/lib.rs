@@ -43,7 +43,7 @@ pub use predict::{
     apply_multiclass_prediction, apply_prediction_type, apply_ve_prediction_type, MultiClassKind,
     PredictionType,
 };
-pub use shap::shap_values;
+pub use shap::{prediction_diff, sage_values, shap_interaction_values, shap_values};
 
 // flatc --rust generated FlatBuffers bindings for the vendored upstream schema
 // (D-01). Generated with `flatc --rust --gen-all` so each committed file is
