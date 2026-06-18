@@ -31,6 +31,7 @@ mod nan_mode;
 mod pool;
 mod quantize;
 mod quantized_pool;
+pub mod text;
 mod weights;
 
 pub use borders::{penalty_maxsumlog, select_borders_greedy_logsum};
