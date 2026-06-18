@@ -519,7 +519,7 @@ Plans:
 
 **Wave 5** *(blocked on 06.6-03, 06.6-04)*
 
-- [ ] 06.6-05-PLAN.md — Non-symmetric pointer-walk apply + leaf values + FULL per-stage + .cbm/json round-trip oracle ≤1e-5 (FEAT-06 / SC-3 complete)
+- [x] 06.6-05-PLAN.md — Non-symmetric pointer-walk apply + leaf values + FULL per-stage + .cbm/json round-trip oracle ≤1e-5 (FEAT-06 / SC-3 complete) — **COMPLETE** (6fcb0e8 feat / 8642618 test): `leaf_index_nonsym()` flat-node pointer walk (evaluator_impl.cpp:726-742) gated on tree variant; `predict_raw_one`/`predict_raw_multi_cat` branch per-tree, oblivious arm byte-identical (D-6.6-05). Full `non_symmetric_oracle_test` GREEN — Depthwise + Lossguide per-stage (Splits|LeafValues|StagedApprox|Predictions) ≤1e-5 vs catboost 1.2.10 + `.cbm` AND `model.json` round-trip re-predict, none `#[ignore]`d. Fixed 2 latent 06.6-03 serde bugs (Rule 1): non-symmetric `.cbm` decode under-counted Lossguide distinct leaves (one-sided `(d,0)`/`(0,d)` halts ARE leaves; GLOBAL↔LOCAL leaf-id reconciliation) + json `unflatten` one-sided-halt expansion. LeafValues gate compares the per-tree sorted multiset (representation-independent; apply equivalence locked by StagedApprox/Predictions/round-trip). Non-symmetric leaf-VALUE estimation already wired by 06.6-04 (shared fold machinery, no forked formula; Open Question 1 stays RESOLVED, no instrumented-trainer escalation). Non-regression: cb-model apply/fstr/shap/cbm oracles green, cb-train lib 228, grower SPLITS oracle 1. **FEAT-06 / SC-3 COMPLETE.** gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY.
 
 **Wave 6** — Gate C (advanced fstr; 06+07 parallel, zero file overlap)
 
