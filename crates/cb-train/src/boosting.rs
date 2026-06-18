@@ -4013,6 +4013,11 @@ fn train_inner<R: Runtime>(
     if params.use_best_model {
         if let Some(best) = best_model.best_iteration() {
             trees.truncate(best + 1);
+            // Non-symmetric (Lossguide / Depthwise) models push every tree into
+            // `non_symmetric_trees` and leave `trees` empty; truncate that vector
+            // too so `use_best_model` is not a silent no-op there (WR-01). No-op
+            // when `non_symmetric_trees` is empty (oblivious models).
+            non_symmetric_trees.truncate(best + 1);
         }
     }
 
