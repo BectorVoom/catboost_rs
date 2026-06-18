@@ -462,7 +462,7 @@ Plans:
 
 **Wave 4** *(blocked on 06.5-03)*
 
-- [ ] 06.5-04-PLAN.md — NaiveBayes + BM25 (shared online-text seam, D-03 read-before-update prefix over the TFold learn permutation); per-stage + per-prefix oracles ≤1e-5 — completes FEAT-01 text calcers / SC-2
+- [x] 06.5-04-PLAN.md — NaiveBayes + BM25 (shared online-text seam, D-03 read-before-update prefix over the TFold learn permutation); per-stage + per-prefix oracles ≤1e-5 — **COMPLETE** (d53a7a1/8eeef44): NaiveBayes (naive_bayesian.cpp:14-63) + BM25 (bm25.cpp:12-83) calcer math + online_text_prefix read-before-update loop (mirror ctr/online.rs); ONLINE estimate feeds the Plain tree (NaiveBayes border 0.590515 matches online, not offline 0.5). NaiveBayes per-stage oracle ≤1e-5 (Splits/LeafValues/StagedApprox/Predictions) + per-prefix leakage-order anchors (no-leakage doc0=0.5 + head/tail prefix-boundary vs instrumented dump). BM25 calcer math bit-exact ≤1e-5 vs independent closed-form online ref + no-leakage anchor + SC-4 quantizer. D-04 byte-identical; cb-train lib 210 + cb-compute lib 151. **Deferred (deferred-items.md):** BM25 per-stage NORMALIZED-border scale (splits.npy ±1.24 vs raw O(1e-3)) + depth-2 [7,2,0,7] = catboost estimated-feature normalization + permutation averaging (trainer concern, NOT calcer math) → FEAT-01 NOT yet fully closed (BM25 per-stage normalized borders remain)
 
 **Wave 5** *(blocked on 06.5-04; autonomous: false — LDA landmine A1)*
 

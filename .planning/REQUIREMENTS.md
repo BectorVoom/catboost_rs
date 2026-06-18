@@ -172,7 +172,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | LOSS-07 | Phase 6.4 | Pending (Rust trait; Python callback bridge → Phase 8 per D-09) |
 | LOSS-08 | Phase 6.4 | Complete |
 | LOSS-09 | Phase 6.4 | Complete (06.4-01; 5 GPU-only fns self-oracled per D-6.4-06) |
-| FEAT-01 | Phase 6.5 | In Progress (06.5-01 Wave-0 ground truth: BoW/NaiveBayes/BM25 single-thread fixtures + D-01 instrumented corpus frozen; parity in Plans 02-04) |
+| FEAT-01 | Phase 6.5 | In Progress (06.5-02 tokenizer/dictionary/digitizer SC-1 bit-exact; 06.5-03 BoW per-stage ≤1e-5; 06.5-04 NaiveBayes per-stage ≤1e-5 + BM25 calcer math bit-exact ≤1e-5. REMAINING: BM25 per-stage NORMALIZED-border scale deferred to catboost trainer estimated-feature normalization — see 06.5 deferred-items.md) |
 | FEAT-02 | Phase 6.5 | In Progress (06.5-01 Wave-0 ground truth: LDA/KNN single-thread fixtures + instrumented projection/neighbor dumps frozen; parity in Plans 05-06) |
 | FEAT-03 | Phase 6.6 | Pending |
 | FEAT-04 | Phase 6.6 | Pending |
