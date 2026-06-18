@@ -483,6 +483,29 @@ if [ -f "${KNN}" ]; then
     fi
 fi
 
+# --- 3bis-h (06.5-08): estimated-feature value array + selected borders -------
+# Dumps the EXACT float array fed into NSplitSelection::BestSplit for each
+# estimated (text/embedding) feature column AND the borders BestSplit returns —
+# i.e. the pre-quantization estimated-feature values whose borders become
+# splits.npy. This is the decisive cross-check for the BM25 +-1.24 normalization
+# question (06.5-08): it proves whether the values BestSplit quantizes are the
+# raw O(1e-3) calcer column or some transformed/averaged scale.
+EST_FEAT="${CB_SRC}/catboost/private/libs/algo/estimated_features.cpp"
+if [ -f "${EST_FEAT}" ]; then
+    ensure_sink "${EST_FEAT}"
+    if ! grep -q 'cb_instr_estimated_borders' "${EST_FEAT}"; then
+        # Insert immediately AFTER the SetBorders(...) call that stores the
+        # BestSplit result, logging both valuesForQuantization (the input array)
+        # and quantization.Borders (the selected borders).
+        perl -0777 -pi -e '
+            s{(quantizedFeaturesInfo->SetBorders\(\s*TFloatFeatureIdx\(featureIdx\),\s*std::move\(quantization\.Borders\)\s*\);\n)}{$1                /* cb_instr_estimated_borders (06.5-08) */ if (std::getenv("CB_INSTRUMENT_LOG")) { const auto& cbBrd = quantizedFeaturesInfo->GetBorders(TFloatFeatureIdx(featureIdx)); std::string cbLine = std::string(R"J({"event":"estimated_borders","feature":)J") + std::to_string((long long)featureIdx) + R"J(,"n_values":)J" + std::to_string((long long)valuesForQuantization.size()) + R"J(,"values":[)J"; for (size_t cbI = 0; cbI < valuesForQuantization.size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)valuesForQuantization[cbI]); } cbLine += R"J(],"borders":[)J"; for (size_t cbI = 0; cbI < cbBrd.size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)cbBrd[cbI]); } cbLine += "]}"; CbInstrumentLog(cbLine); }\n}s;
+        ' "${EST_FEAT}" || step "  (estimated_borders hook not matched; recorded)"
+        grep -q 'cb_instr_estimated_borders' "${EST_FEAT}" \
+            && step "  patched estimated_borders hook into estimated_features.cpp" \
+            || step "  WARNING: estimated_borders hook did NOT apply (anchor shift)"
+    fi
+fi
+
 # --------------------------------------------------------------------------
 # STEP 4 — build_native.py --targets _catboost (clang-18 prefix + venv 3.13)
 # --------------------------------------------------------------------------
