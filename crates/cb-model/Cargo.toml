@@ -28,5 +28,11 @@ serde_json.workspace = true
 # Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the
 # apply / prediction-type parity integration tests.
 cb-oracle = { path = "../cb-oracle" }
+# Test-only edges (D-14/D-15): the grower→save→load round-trip oracle
+# (06.6-09) trains via cb-train, so it needs the CpuBackend runtime…
+cb-backend = { path = "../cb-backend" }
+# …and the Loss / LeafMethod / EScoreFunction enums for the BoostParams literal.
+# cb-train is already a NORMAL dependency above; these are dev-only.
+cb-compute = { path = "../cb-compute" }
 ndarray.workspace = true
 ndarray-npy.workspace = true
