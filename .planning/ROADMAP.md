@@ -494,10 +494,41 @@ Plans:
 
   1. Monotone constraints (per-feature +1/-1/0), feature penalties and per-object penalties match upstream ≤1e-5.
   2. Recursive feature selection by PredictionValuesChange / LossFunctionChange / ShapValues matches upstream.
-  3. Alternative grow policies Lossguide/Depthwise/Region produce true non-symmetric trees — full train + non-symmetric apply + `.cbm`/json round-trip oracle-locked ≤1e-5 (D-10; touches `cb-train` AND `cb-model`, wiring into the existing `TNonSymmetricTree*` bindings). Likely its own multi-wave structure.
+  3. Alternative grow policies Lossguide/Depthwise produce true non-symmetric trees — full train + non-symmetric apply + `.cbm`/json round-trip oracle-locked ≤1e-5 (D-10; touches `cb-train` AND `cb-model`, wiring into the existing `TNonSymmetricTree*` bindings; its own multi-wave gate). **Region is OUT OF SCOPE** (CPU-unimplemented upstream → no ground truth) and **non-symmetric monotone is OUT OF SCOPE** (upstream rejects it) — both recorded as escalated gaps and enforced by typed-error guards, not built (06.6-RESEARCH gate 1, D-6.6-07).
   4. Advanced fstr — ShapInteractionValues, PredictionDiff, SAGE — and the deferred MODEL-03 LossFunctionChange importance (D-12) match upstream ≤1e-5.
 
-**Plans**: TBD
+**Plans**: 8 plans in 7 waves (Gate A symmetric-features-first → Gate B non-symmetric engine multi-wave gate → Gate C advanced fstr → Gate D feature selection LAST, per D-6.6-01..03)
+
+Plans:
+
+**Wave 1** — Gate A (symmetric features, rides existing oblivious grower)
+
+- [ ] 06.6-01-PLAN.md — Feature/per-object penalties (FEAT-04): feature_weights (multiplicative) + first_feature_use/per_object (subtractive PenalizeBestSplits) on the oblivious grower, oracle ≤1e-5
+
+**Wave 2** *(blocked on 06.6-01 — shares boosting.rs)*
+
+- [ ] 06.6-02-PLAN.md — Monotone constraints OBLIVIOUS-ONLY (FEAT-03): verbatim isotonic (PAVA) leaf-delta projection + monotone_constraints param + typed-error guard for non-symmetric monotone & Region (escalated gaps), oracle ≤1e-5
+
+**Wave 3** — Gate B Wave-0 (non-symmetric engine contract)
+
+- [ ] 06.6-03-PLAN.md — Non-symmetric model variant + .cbm/json serde (wire existing TNonSymmetricTreeStepNode bindings) + distinct "trees" oracle parser + splits-first failing harness (FEAT-06 infra)
+
+**Wave 4** *(blocked on 06.6-02, 06.6-03)*
+
+- [ ] 06.6-04-PLAN.md — Unified policy-parameterized leaf-wise grower (Depthwise + Lossguide; Region out) + grow_policy dispatch + from_trained lift; SPLITS oracle-locked, SymmetricTree arm byte-identical (FEAT-06)
+
+**Wave 5** *(blocked on 06.6-03, 06.6-04)*
+
+- [ ] 06.6-05-PLAN.md — Non-symmetric pointer-walk apply + leaf values + FULL per-stage + .cbm/json round-trip oracle ≤1e-5 (FEAT-06 / SC-3 complete)
+
+**Wave 6** — Gate C (advanced fstr; 06+07 parallel, zero file overlap)
+
+- [ ] 06.6-06-PLAN.md — LossFunctionChange importance (completes MODEL-03/D-12) + non-symmetric PVC/Interaction recursion, oracle ≤1e-5 (≥1 non-symmetric case)
+- [ ] 06.6-07-PLAN.md — Non-symmetric TreeSHAP + ShapInteractionValues/PredictionDiff/SAGE (seed-match strict, no instrumentation), oracle ≤1e-5 (≥1 non-symmetric case) (MODEL-05 / SC-4 complete)
+
+**Wave 7** — Gate D (feature selection LAST, blocks on Gate C)
+
+- [ ] 06.6-08-PLAN.md — Recursive feature selection by ShapValues / PredictionValuesChange / LossFunctionChange (NEW cb-train module, no new crate), selected/eliminated set oracle (FEAT-05 / SC-2 complete)
 
 ### Phase 7: GPU Backends via CubeCL
 
