@@ -51,7 +51,19 @@ use crate::lda_linalg::{calculate_projection, sgemv_rowmajor};
 
 /// LDA default regularization (`embedding_feature_estimators.cpp`:reg default
 /// `0.00005`). The fixtures pin `reg=0.05`; the value is a constructor argument.
+///
+/// NOTE (IN-01): this constant documents the upstream default but has NO
+/// in-tree caller — `reg` is always passed explicitly. Do not assume it is the
+/// effective default; it is retained for parity reference only.
 pub const LDA_DEFAULT_REG: f32 = 0.000_05;
+
+/// [`IncrementalCloud`] flush schedule: while `BaseSize` is below this floor the
+/// buffer flushes on every vector (`lda.cpp:93-102` `AddVector` schedule). (IN-04)
+const INCREMENTAL_CLOUD_BASE_FLUSH_FLOOR: i64 = 128;
+
+/// [`IncrementalCloud`] flush schedule: once buffered, flush when `AdditionalSize`
+/// reaches this batch size (`lda.cpp:93-102` `AddVector` schedule). (IN-04)
+const INCREMENTAL_CLOUD_ADDITIONAL_FLUSH_BATCH: i64 = 32;
 
 /// Per-class incremental scatter accumulator — the [`IncrementalCloud`] analog
 /// (`lda.h:13-35`, `lda.cpp:93-129`).
@@ -134,7 +146,9 @@ impl IncrementalCloud {
                 *slot += v;
             }
         }
-        if self.base_size < 128 || self.additional_size >= 32 {
+        if self.base_size < INCREMENTAL_CLOUD_BASE_FLUSH_FLOOR
+            || self.additional_size >= INCREMENTAL_CLOUD_ADDITIONAL_FLUSH_BATCH
+        {
             self.update();
         }
         Ok(())
