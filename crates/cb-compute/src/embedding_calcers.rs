@@ -691,10 +691,16 @@ impl KnnCalcer {
                         "KnnCalcer::compute: neighbor id {id} has no recorded class"
                     ))
                 })?;
-                let slot = result.get_mut(class.min(self.feature_count.saturating_sub(1)));
-                if let Some(s) = slot {
-                    *s += 1.0;
-                }
+                // Error on an out-of-range class rather than clamping it into the
+                // last slot, which would silently mis-attribute the vote on a
+                // parallel-array / num_classes desync (WR-02).
+                let slot = result.get_mut(class).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "KnnCalcer::compute: class {class} >= feature_count {}",
+                        self.feature_count
+                    ))
+                })?;
+                *slot += 1.0;
             }
         } else if !neighbors.is_empty() {
             let vals: Vec<f64> = neighbors
