@@ -45,7 +45,8 @@ use crate::candidates::tensor_ctr_candidates;
 use crate::tree::{
     check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_pairwise,
     greedy_tensor_search_oblivious_perturbed, greedy_tensor_search_oblivious_with_ctr, leaf_index,
-    CtrSplitSpec, FeatureMatrix, GrownTree, LevelKind, Perturbation, Split,
+    leaf_wise_grower, CtrSplitSpec, FeatureMatrix, GrownTree, LeafWisePolicy, LevelKind,
+    Perturbation, Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -77,6 +78,80 @@ pub enum EBoostingType {
     /// approximant is estimated on the BODY prefix and never depends on itself
     /// (`approx_calcer.cpp:566-600`, ORD-02).
     Ordered,
+}
+
+/// The tree grow policy (`EGrowPolicy`,
+/// `catboost/private/libs/options/enums.h:100`). Selects which tree-growth
+/// strategy [`train_inner`] dispatches to (FEAT-06, D-6.6-04):
+///
+/// - [`Self::SymmetricTree`] — the oblivious (symmetric) grower, the literal
+///   pre-6.6 path (byte-identical, D-6.6-05). The CPU default.
+/// - [`Self::Lossguide`] — a best-gain priority-queue leaf-wise grower producing a
+///   TRUE non-symmetric node graph (`GreedyTensorSearchLossguide`,
+///   `greedy_tensor_search.cpp:1806`).
+/// - [`Self::Depthwise`] — a level-order leaf-wise grower producing a non-symmetric
+///   node graph (`GreedyTensorSearchDepthwise`, `greedy_tensor_search.cpp:1509`).
+/// - [`Self::Region`] — present in the upstream enum for parity but UNIMPLEMENTED
+///   on the CPU path (escalated gap, D-6.6-04 "Region OUT"); rejected up front by
+///   [`validate_grow_policy`] with a typed [`CbError`] — there is no grower arm and
+///   no fabricated structure.
+///
+/// Pinned EXPLICITLY on [`BoostParams::grow_policy`] (never auto-selected, RESEARCH
+/// Pitfall 6); the vast majority of fixtures leave it at [`Self::SymmetricTree`] so
+/// the oblivious dispatch arm stays byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EGrowPolicy {
+    /// Oblivious (symmetric) growth — the pre-6.6 path, byte-identical (D-6.6-05).
+    #[default]
+    SymmetricTree,
+    /// Best-gain priority-queue leaf-wise growth (non-symmetric node graph).
+    Lossguide,
+    /// Level-order leaf-wise growth (non-symmetric node graph).
+    Depthwise,
+    /// Region growth — UNIMPLEMENTED on CPU (escalated gap, D-6.6-04); rejected by
+    /// [`validate_grow_policy`].
+    Region,
+}
+
+impl EGrowPolicy {
+    /// Whether this policy grows a NON-SYMMETRIC tree (Lossguide / Depthwise), as
+    /// opposed to the symmetric oblivious path. Region is non-symmetric in upstream
+    /// but rejected before any grower runs, so it is not classified here.
+    #[must_use]
+    pub fn is_non_symmetric(self) -> bool {
+        matches!(self, Self::Lossguide | Self::Depthwise)
+    }
+}
+
+/// The canonical default `grow_policy` ([`EGrowPolicy::SymmetricTree`], the CPU
+/// default — `oblivious_tree_options.cpp`). Pinned EXPLICITLY at every
+/// `BoostParams` construction site (RESEARCH Pitfall 6 — never auto-selected); the
+/// oblivious-only fixtures leave it here so the symmetric grower dispatch arm is
+/// byte-identical (D-6.6-05).
+#[must_use]
+pub fn grow_policy_default() -> EGrowPolicy {
+    EGrowPolicy::SymmetricTree
+}
+
+/// The canonical default `max_leaves` (`31`, upstream `MaxLeaves` /
+/// `oblivious_tree_options.cpp` `MaxLeavesCount` default). Pinned EXPLICITLY at
+/// every `BoostParams` construction site (never auto-selected). Consumed ONLY by
+/// the Lossguide grower (the priority queue stops once the structure reaches
+/// `max_leaves` leaves); Depthwise / SymmetricTree ignore it (they are bounded by
+/// `depth`).
+#[must_use]
+pub fn max_leaves_default() -> usize {
+    31
+}
+
+/// The canonical default `min_data_in_leaf` (`1`, upstream `MinDataInLeaf` /
+/// `oblivious_tree_options.cpp` default). Pinned EXPLICITLY at every `BoostParams`
+/// construction site. Consumed by the leaf-wise growers (a leaf with fewer than
+/// `min_data_in_leaf` documents is NOT split); the oblivious path leaves it at the
+/// default `1` (every leaf is splittable), so the symmetric path is byte-identical.
+#[must_use]
+pub fn min_data_in_leaf_default() -> usize {
+    1
 }
 
 /// Parameters for the plain boosting loop (the D-07 simplified isolating set).
@@ -289,6 +364,24 @@ pub struct BoostParams {
     /// as free (`0`). Pinned EXPLICITLY ([`monotone_constraints_default`]); only the
     /// monotone fixture sets a non-default vector.
     pub monotone_constraints: Vec<i8>,
+    /// The tree grow policy ([`EGrowPolicy`], `enums.h:100`, FEAT-06 / D-6.6-04).
+    /// [`EGrowPolicy::SymmetricTree`] (the default) dispatches to the literal
+    /// pre-6.6 oblivious grower (byte-identical, D-6.6-05); [`EGrowPolicy::Lossguide`]
+    /// / [`EGrowPolicy::Depthwise`] dispatch to the leaf-wise grower producing a TRUE
+    /// non-symmetric node graph; [`EGrowPolicy::Region`] is rejected up front
+    /// ([`validate_grow_policy`]). Pinned EXPLICITLY ([`grow_policy_default`]).
+    pub grow_policy: EGrowPolicy,
+    /// The maximum leaf count for the Lossguide grower (`max_leaves` / upstream
+    /// `MaxLeaves`, FEAT-06). The best-gain priority queue stops once the structure
+    /// reaches `max_leaves` leaves. Ignored by SymmetricTree / Depthwise (bounded by
+    /// `depth`). Pinned EXPLICITLY ([`max_leaves_default`] = `31`).
+    pub max_leaves: usize,
+    /// The minimum document count required to split a leaf (`min_data_in_leaf` /
+    /// upstream `MinDataInLeaf`, FEAT-06). A leaf with fewer than `min_data_in_leaf`
+    /// documents is NOT split by the leaf-wise growers. Pinned EXPLICITLY
+    /// ([`min_data_in_leaf_default`] = `1`, every leaf splittable — the symmetric
+    /// path is byte-identical at the default).
+    pub min_data_in_leaf: usize,
 }
 
 /// The canonical default `feature_weights` (EMPTY — every float feature weight is
@@ -694,12 +787,43 @@ pub struct ObliviousTree {
     pub leaf_weights: Vec<f64>,
 }
 
+/// One trained NON-SYMMETRIC (Lossguide / Depthwise) tree's STRUCTURE + leaf values
+/// (FEAT-06 / D-6.6-04). Mirrors the node-graph triple `cb_model::NonSymmetricTree`
+/// consumes: per-node `splits` (interior nodes carry the split; a terminal node's
+/// `step_nodes` entry is `(0, 0)`), `step_nodes`
+/// `(left_subtree_diff, right_subtree_diff)`, and `node_id_to_leaf_id`. The leaf
+/// VALUES + the apply pointer-walk are reconciled in 06.6-05; this plan locks the
+/// STRUCTURE (splits + node graph).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonSymmetricTree {
+    /// One split per node, in flat-node order (interior nodes only carry a
+    /// meaningful split; a leaf node's entry is a placeholder filtered by its
+    /// `(0, 0)` step entry).
+    pub splits: Vec<Split>,
+    /// Per-node `(left_subtree_diff, right_subtree_diff)` offsets
+    /// (`TNonSymmetricTreeStepNode`); `(0, 0)` marks a terminal node.
+    pub step_nodes: Vec<(u16, u16)>,
+    /// Per-node index into the distinct leaf list (`NonSymmetricNodeIdToLeafId`);
+    /// meaningful only for terminal nodes.
+    pub node_id_to_leaf_id: Vec<u32>,
+    /// Leaf values in distinct-leaf order (dimension-major for the multi-output
+    /// case, identical discipline to [`ObliviousTree`]).
+    pub leaf_values: Vec<f64>,
+    /// Per-leaf summed training-document weights, same order as `leaf_values`.
+    pub leaf_weights: Vec<f64>,
+}
+
 /// A trained plain-boosted model: the boosting-order trees plus the starting
 /// approx (`boost_from_average`) stored as the model bias.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     /// The oblivious trees in boosting (iteration) order.
     pub oblivious_trees: Vec<ObliviousTree>,
+    /// The non-symmetric (Lossguide / Depthwise) trees in boosting order (FEAT-06 /
+    /// D-6.6-04). EMPTY for every oblivious model (a model is EITHER all-oblivious or
+    /// all-non-symmetric — upstream never mixes grow policies), so the oblivious
+    /// lift / apply paths stay byte-identical (D-6.6-05).
+    pub non_symmetric_trees: Vec<NonSymmetricTree>,
     /// The starting approx / model bias.
     pub bias: f64,
     /// The number of output (approx) dimensions (D-6.2-01 / Plan 06.2-02). `1`
@@ -1182,6 +1306,43 @@ fn validate_monotone_constraints(monotone_constraints: &[i8]) -> CbResult<()> {
                  -1 (non-increasing), 0 (free), or +1 (non-decreasing)"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject unsupported `grow_policy` combinations up front (FEAT-06 / D-6.6-04,
+/// D-6.6-07 — the escalated gaps deferred by Plan 06.6-02, now reachable since
+/// `grow_policy` exists):
+///
+/// 1. [`EGrowPolicy::Region`] — UNIMPLEMENTED on the CPU path ("Region OUT",
+///    D-6.6-04). There is no Region grower arm; selecting it errors rather than
+///    silently falling back to another policy and fabricating a structure.
+/// 2. `monotone_constraints` × a NON-SYMMETRIC `grow_policy` ({Lossguide,
+///    Depthwise}) — upstream EXPLICITLY rejects monotone constraints under every
+///    non-symmetric grow policy (`monotonic_constraint_utils.h:42`,
+///    `CB_ENSURE_INTERNAL(monotoneConstraints.empty(), "...unsupported for
+///    non-symmetric trees yet")`). The monotone PAVA post-pass is wired ONLY into
+///    the oblivious leaf path (D-6.6-06); routing a non-empty `monotone_constraints`
+///    through the leaf-wise grower would silently DROP the constraint, so it is
+///    rejected with a typed error (D-6.6-07 — no fabricated output).
+///
+/// Both guards were DEFERRED by Plan 06.6-02 (the `grow_policy` enum did not yet
+/// exist); this is the enablement point Plan 06.6-04 owns.
+fn validate_grow_policy(grow_policy: EGrowPolicy, monotone_constraints: &[i8]) -> CbResult<()> {
+    if grow_policy == EGrowPolicy::Region {
+        return Err(CbError::OutOfRange(
+            "grow_policy=Region is not supported on the CPU training path \
+             (escalated gap, D-6.6-04 \"Region OUT\")"
+                .to_owned(),
+        ));
+    }
+    if grow_policy.is_non_symmetric() && !monotone_constraints.is_empty() {
+        return Err(CbError::OutOfRange(format!(
+            "monotone_constraints are unsupported for non-symmetric trees \
+             (grow_policy={grow_policy:?}); upstream rejects them \
+             (monotonic_constraint_utils.h:42). Use grow_policy=SymmetricTree for \
+             monotone constraints (D-6.6-07)."
+        )));
     }
     Ok(())
 }
@@ -1976,11 +2137,15 @@ fn train_inner<R: Runtime>(
     validate_leaf_method(&params.loss, params.leaf_method)?;
 
     // Reject malformed / unsupported monotone_constraints up front (FEAT-03 /
-    // D-6.6-07): each entry must be a valid direction {-1,0,+1}; the
-    // grow_policy-dependent rejections (non-symmetric × monotone, Region) are
-    // owned by Plan 06.6-04 once `grow_policy` lands (oblivious-only is the only
-    // reachable path today, so no fabricated output is possible).
+    // D-6.6-07): each entry must be a valid direction {-1,0,+1}.
     validate_monotone_constraints(&params.monotone_constraints)?;
+
+    // Reject unsupported grow_policy combinations up front (FEAT-06 / D-6.6-04):
+    // grow_policy=Region (CPU-unimplemented) and monotone_constraints × a
+    // non-symmetric grow_policy (upstream rejects them — the monotone PAVA is
+    // oblivious-only). These are the escalated-gap guards Plan 06.6-02 DEFERRED to
+    // this plan because the `grow_policy` enum did not exist until now.
+    validate_grow_policy(params.grow_policy, &params.monotone_constraints)?;
 
     // The multilabel losses (MultiLogloss / MultiCrossEntropy) carry a DIM-MAJOR
     // target of length `dim*n` (one label per dimension per object), so `n` cannot
@@ -2607,6 +2772,9 @@ fn train_inner<R: Runtime>(
 
     let n_leaves = 1usize << params.depth;
     let mut trees: Vec<ObliviousTree> = Vec::with_capacity(params.iterations);
+    // FEAT-06 / D-6.6-04: non-symmetric (Lossguide / Depthwise) trees accumulate here
+    // when `grow_policy` selects a leaf-wise grower. Empty for every oblivious model.
+    let mut non_symmetric_trees: Vec<NonSymmetricTree> = Vec::new();
 
     // Overfitting detection / use_best_model (TRAIN-06) + per-iteration eval-set
     // metric logging (TRAIN-07). The detector + best-model tracker consume the
@@ -3025,7 +3193,43 @@ fn train_inner<R: Runtime>(
         let iter_ctr_features: &[crate::ctr::CtrFeatureColumn] = structure_fold_columns
             .get(taken_fold)
             .map_or(materialized_ctr_features.as_slice(), Vec::as_slice);
-        let grown: GrownTree = if is_pairwise_scoring(&params.loss) {
+        // GROWER DISPATCH (FEAT-06 / D-6.6-04): grow_policy selects the tree-growth
+        // strategy. The SymmetricTree arm is the LITERAL pre-6.6 oblivious grower
+        // chain UNCHANGED (byte-identical, D-6.6-05); Lossguide / Depthwise dispatch
+        // to the policy-parameterized leaf-wise grower producing a TRUE non-symmetric
+        // node graph (the structure half of FEAT-06 — leaf VALUES + the apply
+        // pointer-walk land in 06.6-05). Region is rejected up front by
+        // `validate_grow_policy`, so it never reaches here.
+        let grown: GrownTree = match params.grow_policy {
+            EGrowPolicy::Lossguide | EGrowPolicy::Depthwise => {
+                let policy = if params.grow_policy == EGrowPolicy::Depthwise {
+                    LeafWisePolicy::Depthwise
+                } else {
+                    LeafWisePolicy::Lossguide
+                };
+                // The leaf-wise grower scores against the SAME perturbation-free
+                // whole-fold der/weights the oblivious plain path uses at
+                // random_strength=0 + bootstrap_type=No (the in-scope non-symmetric
+                // fixtures). Lock SPLITS first (Open Question 1); if the simplest
+                // Depthwise preflight diverges once this lands, ESCALATE to the
+                // instrumented trainer (D-6.6-11) — do NOT weaken.
+                leaf_wise_grower(
+                    policy,
+                    &matrix,
+                    &score_weighted_der1,
+                    &score_weights,
+                    scaled_l2,
+                    params.depth,
+                    params.max_leaves,
+                    params.min_data_in_leaf,
+                    n,
+                    params.score_function,
+                )?
+            }
+            // SymmetricTree (and the never-reached Region): the literal existing
+            // oblivious grower chain, UNCHANGED.
+            EGrowPolicy::SymmetricTree | EGrowPolicy::Region => {
+            if is_pairwise_scoring(&params.loss) {
             // PAIRWISE SPLIT-SCORING (LOSS-04, Plan 06.3-16): `*Pairwise` losses
             // (`IsPairwiseScoring`) score candidate splits through upstream's
             // dedicated `TPairwiseScoreCalcer` / `CalculatePairwiseScore`
@@ -3136,6 +3340,24 @@ fn train_inner<R: Runtime>(
                     )?
                 }
             }
+            }
+            }
+        };
+
+        // Per-tree leaf count: a non-symmetric leaf-wise tree has a DISTINCT leaf
+        // count (number of terminal nodes), NOT `2^depth`. Shadow `n_leaves` for the
+        // leaf-value estimation below so the reductions cover exactly this tree's
+        // leaves. For the oblivious path `grown.step_nodes` is empty and this is the
+        // unchanged `2^depth` (byte-identical, D-6.6-05).
+        let n_leaves: usize = if grown.step_nodes.is_empty() {
+            n_leaves
+        } else {
+            grown
+                .node_id_to_leaf_id
+                .iter()
+                .zip(grown.step_nodes.iter())
+                .filter(|(_, &(l, r))| l == 0 && r == 0)
+                .count()
         };
 
         // FEAT-04: mark this tree's float splits as "used" so subsequent trees no
@@ -3719,12 +3941,27 @@ fn train_inner<R: Runtime>(
             ctr_splits_for_tree(&ctr_candidates, &params.combinations_ctr_priors)
         };
 
-        trees.push(ObliviousTree {
-            splits: grown.splits,
-            ctr_splits,
-            leaf_values,
-            leaf_weights,
-        });
+        // FEAT-06 / D-6.6-04: a non-symmetric leaf-wise tree (Lossguide / Depthwise)
+        // is persisted into `non_symmetric_trees` carrying its node graph
+        // (`step_nodes` / `node_id_to_leaf_id`) + per-node `splits`; the oblivious
+        // path is byte-identical (empty `step_nodes` → `ObliviousTree`). A model is
+        // EITHER all-oblivious or all-non-symmetric, so only one vec is ever pushed.
+        if grown.step_nodes.is_empty() {
+            trees.push(ObliviousTree {
+                splits: grown.splits,
+                ctr_splits,
+                leaf_values,
+                leaf_weights,
+            });
+        } else {
+            non_symmetric_trees.push(NonSymmetricTree {
+                splits: grown.splits,
+                step_nodes: grown.step_nodes,
+                node_id_to_leaf_id: grown.node_id_to_leaf_id,
+                leaf_values,
+                leaf_weights,
+            });
+        }
 
         // Overfitting detection / use_best_model (TRAIN-06): once the tree is
         // grown, update EACH eval set's raw approximant with this tree's leaf
@@ -3835,6 +4072,7 @@ fn train_inner<R: Runtime>(
     Ok((
         Model {
             oblivious_trees: trees,
+            non_symmetric_trees,
             bias,
             approx_dimension,
             class_to_label,

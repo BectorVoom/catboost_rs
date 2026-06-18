@@ -110,6 +110,9 @@ fn isolating_params(monotone_constraints: Vec<i8>) -> BoostParams {
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
         monotone_constraints,
+        grow_policy: cb_train::grow_policy_default(),
+        max_leaves: cb_train::max_leaves_default(),
+        min_data_in_leaf: cb_train::min_data_in_leaf_default(),
     }
 }
 

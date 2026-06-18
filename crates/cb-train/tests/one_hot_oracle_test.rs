@@ -231,6 +231,9 @@ fn one_hot_predict_matches_oracle_locked_float_reference() {
         per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
         penalties_coefficient: cb_train::penalties_coefficient_default(),
         monotone_constraints: cb_train::monotone_constraints_default(),
+        grow_policy: cb_train::grow_policy_default(),
+        max_leaves: cb_train::max_leaves_default(),
+        min_data_in_leaf: cb_train::min_data_in_leaf_default(),
     };
     let mut float_staged = Vec::new();
     let float_model = train(

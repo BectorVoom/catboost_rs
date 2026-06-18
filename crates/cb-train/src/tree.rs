@@ -213,6 +213,23 @@ pub struct GrownTree {
     /// CTR levels interleave, and lets Plan 05-13 Task 2 rebuild `leaf_of` over the
     /// averaging-fold CTR column in the correct level order.
     pub level_kinds: Vec<LevelKind>,
+    /// Per-NODE `(left_subtree_diff, right_subtree_diff)` offsets for a TRUE
+    /// non-symmetric tree (FEAT-06 / D-6.6-04, `TNonSymmetricTreeStepNode`). EMPTY
+    /// for every oblivious / one-hot / ordered / CTR search (those leave the
+    /// `splits` + forward-bit `leaf_of` representation untouched, so existing
+    /// callers compile and behave unchanged — the empty-parallel-vector precedent of
+    /// `ctr_splits` / `level_kinds`). When NON-empty this `GrownTree` is a
+    /// non-symmetric node graph produced by [`leaf_wise_grower`]: `splits[i]` is the
+    /// split at node `i`, a `(0, 0)` entry marks a terminal (leaf) node, and an
+    /// interior node's chosen diff is ADDED to the current node index to reach the
+    /// next node. `cb_model::Model::from_trained` lifts this into
+    /// `TreeVariant::NonSymmetric`.
+    pub step_nodes: Vec<(u16, u16)>,
+    /// Per-NODE index into the distinct leaf list for a non-symmetric tree
+    /// (`NonSymmetricNodeIdToLeafId`). Only meaningful for terminal nodes (a
+    /// `(0, 0)` `step_nodes` entry). EMPTY for the oblivious searches. Same length
+    /// as `step_nodes` when populated.
+    pub node_id_to_leaf_id: Vec<u32>,
 }
 
 /// One level's chosen-split kind in [`GrownTree::level_kinds`] (ORD-05): a float
@@ -557,6 +574,8 @@ pub fn greedy_tensor_search_oblivious_perturbed(
         leaf_of,
         ctr_splits: Vec::new(),
         level_kinds: Vec::new(),
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
     })
 }
 
@@ -717,6 +736,455 @@ fn select_level_perturbed(
 
     chosen_split.ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+    })
+}
+
+// ===========================================================================
+// FEAT-06 leaf-wise grower (Depthwise + Lossguide) — TRUE non-symmetric trees
+// (D-6.6-04). ONE policy-parameterized core mirroring upstream's shared
+// leaf-wise scoring core (`leafwise_scoring.cpp`) + the two policy growers
+// (`GreedyTensorSearchDepthwise` :1509, `GreedyTensorSearchLossguide` :1806)
+// dispatched in `GreedyTensorSearch`. The split queue / expansion strategy is the
+// ONLY thing that differs by policy — the per-leaf candidate enumeration (float
+// feature ascending × border ascending), `score_candidate`-style scoring, and the
+// strict first-wins tie-break are REUSED verbatim from the oblivious path.
+// ===========================================================================
+
+/// The leaf-wise expansion strategy (FEAT-06). Maps from `EGrowPolicy`'s two
+/// non-symmetric arms at the dispatch site; `SymmetricTree` / `Region` never reach
+/// here (`SymmetricTree` dispatches to the literal oblivious grower, `Region` is
+/// rejected up front by `validate_grow_policy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafWisePolicy {
+    /// Level-order expansion (`GreedyTensorSearchDepthwise`): split every eligible
+    /// leaf at the current level before descending, bounded by `max_depth`.
+    Depthwise,
+    /// Best-gain priority-queue expansion (`GreedyTensorSearchLossguide`): pop the
+    /// highest-gain splittable leaf, split it, enqueue its children; stop when the
+    /// queue empties or the structure reaches `max_leaves` leaves.
+    Lossguide,
+}
+
+/// The best per-leaf split found by [`best_split_for_leaf`]: the chosen split and
+/// its GAIN (the 2-leaf split score minus the unsplit single-leaf score). `None`
+/// when the leaf cannot be split (too few docs, no candidate, or gain `< 1e-9`).
+struct LeafBestSplit {
+    split: Split,
+    gain: f64,
+    /// The left-child document indices (split FALSE: `value <= border`).
+    left_docs: Vec<usize>,
+    /// The right-child document indices (split TRUE: `value > border`).
+    right_docs: Vec<usize>,
+}
+
+/// The single-leaf unsplit L2 score over a document subset (`der1` / `weight`
+/// reduced into ONE leaf bucket), the baseline the per-leaf split gain subtracts.
+fn unsplit_leaf_score(
+    docs: &[usize],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    score_function: EScoreFunction,
+) -> f64 {
+    let leaf_of: Vec<usize> = vec![0; docs.len()];
+    let der1_sub: Vec<f64> = docs.iter().map(|&i| der1.get(i).copied().unwrap_or(0.0)).collect();
+    let weight_sub: Vec<f64> = docs.iter().map(|&i| weight.get(i).copied().unwrap_or(0.0)).collect();
+    let stats = reduce_leaf_stats(&leaf_of, &der1_sub, &weight_sub, 1);
+    split_score(score_function, &stats, scaled_l2)
+}
+
+/// Find the best split for ONE leaf's document subset (FEAT-06 shared leaf-wise
+/// scoring core). Enumerates candidates in the SAME upstream order the oblivious
+/// path uses (float feature ascending, border ascending), scores the 2-leaf
+/// `{value <= border, value > border}` partition restricted to this leaf's docs via
+/// the configured score calcer, and keeps the strict first-wins best
+/// ([`select_best_candidate`] semantics — strict `>`). The reported GAIN is
+/// `best_2leaf_score - unsplit_score`; the leaf is splittable only when
+/// `docs.len() >= min_data_in_leaf`, a candidate exists, and `gain >= 1e-9`
+/// (`greedy_tensor_search.cpp:1582,1635` — the shared `gain < 1e-9` cutoff).
+fn best_split_for_leaf(
+    matrix: &FeatureMatrix,
+    docs: &[usize],
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    min_data_in_leaf: usize,
+    score_function: EScoreFunction,
+) -> Option<LeafBestSplit> {
+    if docs.len() < min_data_in_leaf || docs.len() < 2 {
+        return None;
+    }
+    let baseline = unsplit_leaf_score(docs, der1, weight, scaled_l2, score_function);
+
+    // Restricted der1 / weight for this leaf's docs (object order preserved so the
+    // reduction order is deterministic).
+    let der1_sub: Vec<f64> = docs.iter().map(|&i| der1.get(i).copied().unwrap_or(0.0)).collect();
+    let weight_sub: Vec<f64> =
+        docs.iter().map(|&i| weight.get(i).copied().unwrap_or(0.0)).collect();
+
+    let mut best: Option<(Candidate, Vec<bool>)> = None;
+    let mut best_score = MINIMAL_SCORE;
+    // Candidate enumeration: float features ascending, borders ascending (the
+    // upstream `AddFloatFeatures` order the oblivious `select_level_plain` uses).
+    for feature in 0..matrix.n_features() {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        for &border in borders {
+            // 2-leaf partition restricted to this leaf's docs: bit 0 = passes test.
+            let passes: Vec<bool> =
+                docs.iter().map(|&obj| matrix.passes_float(feature, obj, border)).collect();
+            let leaf_of: Vec<usize> = passes.iter().map(|&p| usize::from(p)).collect();
+            let stats = reduce_leaf_stats(&leaf_of, &der1_sub, &weight_sub, 2);
+            let score = split_score(score_function, &stats, scaled_l2);
+            // STRICT `>` first-wins (Pitfall 1): the FIRST candidate reaching the
+            // running max wins; later equal-gain candidates do NOT replace it.
+            if score > best_score {
+                best_score = score;
+                best = Some((Candidate { feature, border, score }, passes));
+            }
+        }
+    }
+
+    let (cand, passes) = best?;
+    let gain = best_score - baseline;
+    if gain < 1e-9 {
+        return None;
+    }
+    // Partition the leaf's docs by the chosen split: FALSE (value <= border) →
+    // left, TRUE (value > border) → right. This is the SAME left/right convention
+    // upstream's `AddSplit` uses (left = test-false subtree, right = test-true).
+    let mut left_docs = Vec::new();
+    let mut right_docs = Vec::new();
+    for (&obj, &p) in docs.iter().zip(passes.iter()) {
+        if p {
+            right_docs.push(obj);
+        } else {
+            left_docs.push(obj);
+        }
+    }
+    Some(LeafBestSplit {
+        split: Split { feature: cand.feature, border: cand.border },
+        gain,
+        left_docs,
+        right_docs,
+    })
+}
+
+/// One internal or leaf node in the non-symmetric node graph under construction.
+enum BuiltNode {
+    /// An interior node: its split and the node ids of its left / right children.
+    Interior { split: Split, left: usize, right: usize },
+    /// A terminal (leaf) node. The distinct-leaf id is assigned in node order at
+    /// finalization (`node_to_leaf`), so the variant carries no payload.
+    Leaf,
+}
+
+/// Grow ONE non-symmetric tree with the leaf-wise grower (FEAT-06 / D-6.6-04).
+///
+/// `policy` selects the expansion strategy (the ONLY policy-dependent behaviour):
+///
+/// - [`LeafWisePolicy::Depthwise`] — level-order: split every eligible leaf at the
+///   current level (in order), descend, repeat for `0..max_depth`
+///   (`GreedyTensorSearchDepthwise`, `greedy_tensor_search.cpp:1509-1700`).
+/// - [`LeafWisePolicy::Lossguide`] — best-gain priority queue: pop the highest-gain
+///   splittable leaf, split it, enqueue its children's best splits; stop when the
+///   queue empties OR the structure reaches `max_leaves` leaves; each leaf is
+///   gated on `leaf_depth < max_depth` AND `gain >= 1e-9`
+///   (`greedy_tensor_search.cpp:1806-1938`). Queue penalties (FEAT-04) are applied
+///   at ENQUEUE time only and NEVER recomputed when a feature first becomes used —
+///   the upstream non-recompute is replicated exactly (Pitfall 4,
+///   `greedy_tensor_search.cpp:1875-1882`); since the in-scope leaf-wise fixtures
+///   carry NO feature penalties, the queue gain is the unpenalized split gain.
+///
+/// Both policies SHARE [`best_split_for_leaf`] (the candidate enumeration + scoring
+/// + strict first-wins core) — exactly upstream's one shared scoring core behind two
+/// policy growers. Returns a [`GrownTree`] whose non-symmetric fields (`splits` in
+/// node order, `step_nodes`, `node_id_to_leaf_id`) are populated and whose `leaf_of`
+/// maps each object to its DISTINCT-leaf index (`0..leaf_count`) for the leaf-value
+/// estimation (06.6-05 reconciles leaf VALUES + the apply pointer-walk).
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `max_depth > MAX_DEPTH`.
+/// - [`CbError::Degenerate`] if the root cannot be split at all (no candidate /
+///   gain below the cutoff), so no non-symmetric tree can be grown.
+pub fn leaf_wise_grower(
+    policy: LeafWisePolicy,
+    matrix: &FeatureMatrix,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    max_depth: usize,
+    max_leaves: usize,
+    min_data_in_leaf: usize,
+    n_objects: usize,
+    score_function: EScoreFunction,
+) -> CbResult<GrownTree> {
+    check_depth(max_depth)?;
+
+    // The flat node graph being built, in `AddSplit` order (root first). Each entry
+    // is finalized to a `BuiltNode` once its kind (interior vs leaf) is known.
+    let mut nodes: Vec<BuiltNode> = Vec::new();
+    // Per-node split (interior nodes only; leaf nodes get a placeholder filtered out
+    // by the (0,0) step entry). Indexed by node id.
+    let mut node_split: Vec<Option<Split>> = Vec::new();
+    // Per-node owning document subset, consumed when the node is split.
+    let mut node_docs: Vec<Vec<usize>> = Vec::new();
+    let mut node_depth: Vec<usize> = Vec::new();
+
+    let root_docs: Vec<usize> = (0..n_objects).collect();
+
+    // Register the root node (id 0).
+    let new_node = |nodes: &mut Vec<BuiltNode>,
+                    node_split: &mut Vec<Option<Split>>,
+                    node_docs: &mut Vec<Vec<usize>>,
+                    node_depth: &mut Vec<usize>,
+                    docs: Vec<usize>,
+                    depth: usize|
+     -> usize {
+        let id = nodes.len();
+        nodes.push(BuiltNode::Leaf); // provisional; promoted to Interior on split
+        node_split.push(None);
+        node_docs.push(docs);
+        node_depth.push(depth);
+        id
+    };
+
+    let root = new_node(
+        &mut nodes,
+        &mut node_split,
+        &mut node_docs,
+        &mut node_depth,
+        root_docs,
+        0,
+    );
+
+    // `leaf_owner[obj]` = the node id of the leaf object `obj` currently lands in.
+    let mut leaf_owner: Vec<usize> = vec![root; n_objects];
+
+    // Split node `id` (interior) given its best split, registering two children and
+    // routing its docs. Returns (left_child_id, right_child_id).
+    let do_split = |nodes: &mut Vec<BuiltNode>,
+                        node_split: &mut Vec<Option<Split>>,
+                        node_docs: &mut Vec<Vec<usize>>,
+                        node_depth: &mut Vec<usize>,
+                        leaf_owner: &mut [usize],
+                        id: usize,
+                        bs: &LeafBestSplit|
+     -> (usize, usize) {
+        let depth = node_depth[id] + 1;
+        let left = new_node(
+            nodes,
+            node_split,
+            node_docs,
+            node_depth,
+            bs.left_docs.clone(),
+            depth,
+        );
+        let right = new_node(
+            nodes,
+            node_split,
+            node_docs,
+            node_depth,
+            bs.right_docs.clone(),
+            depth,
+        );
+        nodes[id] = BuiltNode::Interior { split: bs.split, left, right };
+        node_split[id] = Some(bs.split);
+        for &obj in &bs.left_docs {
+            if let Some(o) = leaf_owner.get_mut(obj) {
+                *o = left;
+            }
+        }
+        for &obj in &bs.right_docs {
+            if let Some(o) = leaf_owner.get_mut(obj) {
+                *o = right;
+            }
+        }
+        (left, right)
+    };
+
+    match policy {
+        LeafWisePolicy::Depthwise => {
+            // Level-order: the current level's leaf node ids, oldest first.
+            let mut current_level: Vec<usize> = vec![root];
+            for _cur_depth in 0..max_depth {
+                let mut next_level: Vec<usize> = Vec::new();
+                for &leaf in &current_level {
+                    let docs = node_docs[leaf].clone();
+                    if let Some(bs) = best_split_for_leaf(
+                        matrix,
+                        &docs,
+                        der1,
+                        weight,
+                        scaled_l2,
+                        min_data_in_leaf,
+                        score_function,
+                    ) {
+                        let (l, r) = do_split(
+                            &mut nodes,
+                            &mut node_split,
+                            &mut node_docs,
+                            &mut node_depth,
+                            &mut leaf_owner,
+                            leaf,
+                            &bs,
+                        );
+                        next_level.push(l);
+                        next_level.push(r);
+                    }
+                    // gain < 1e-9 / too few docs → leaf stays terminal (continue).
+                }
+                if next_level.is_empty() {
+                    break;
+                }
+                current_level = next_level;
+            }
+        }
+        LeafWisePolicy::Lossguide => {
+            // Max-priority-queue of (gain, node_id, best_split). A BinaryHeap on an
+            // ordered (OrderedF64, seq) key gives best-gain-first with a stable
+            // first-enqueued tie-break (deterministic, matching the single-host
+            // queue order). `leaf_count` starts at 1 (the root leaf) and grows by 1
+            // per split.
+            use std::cmp::Ordering;
+            use std::collections::BinaryHeap;
+
+            struct QItem {
+                gain: f64,
+                seq: u64,
+                node: usize,
+                best: LeafBestSplit,
+            }
+            impl PartialEq for QItem {
+                fn eq(&self, other: &Self) -> bool {
+                    self.gain == other.gain && self.seq == other.seq
+                }
+            }
+            impl Eq for QItem {}
+            impl Ord for QItem {
+                fn cmp(&self, other: &Self) -> Ordering {
+                    // Higher gain first; on equal gain the EARLIER seq (enqueued
+                    // first) wins — so reverse seq ordering (smaller seq = greater).
+                    match self.gain.partial_cmp(&other.gain).unwrap_or(Ordering::Equal) {
+                        Ordering::Equal => other.seq.cmp(&self.seq),
+                        ord => ord,
+                    }
+                }
+            }
+            impl PartialOrd for QItem {
+                fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+
+            let mut heap: BinaryHeap<QItem> = BinaryHeap::new();
+            let mut seq: u64 = 0;
+            let mut leaf_count: usize = 1;
+
+            // Enqueue the root's best split (if any). A leaf is only considered when
+            // its depth < max_depth (the upstream `needSplit` gate).
+            let enqueue = |heap: &mut BinaryHeap<QItem>,
+                               seq: &mut u64,
+                               node_docs: &[Vec<usize>],
+                               node_depth: &[usize],
+                               node: usize| {
+                if node_depth[node] >= max_depth {
+                    return;
+                }
+                if let Some(bs) = best_split_for_leaf(
+                    matrix,
+                    &node_docs[node],
+                    der1,
+                    weight,
+                    scaled_l2,
+                    min_data_in_leaf,
+                    score_function,
+                ) {
+                    heap.push(QItem { gain: bs.gain, seq: *seq, node, best: bs });
+                    *seq += 1;
+                }
+            };
+
+            enqueue(&mut heap, &mut seq, &node_docs, &node_depth, root);
+
+            while let Some(item) = heap.pop() {
+                if leaf_count >= max_leaves {
+                    break;
+                }
+                let (l, r) = do_split(
+                    &mut nodes,
+                    &mut node_split,
+                    &mut node_docs,
+                    &mut node_depth,
+                    &mut leaf_owner,
+                    item.node,
+                    &item.best,
+                );
+                // One leaf became two: net +1 leaf.
+                leaf_count += 1;
+                enqueue(&mut heap, &mut seq, &node_docs, &node_depth, l);
+                enqueue(&mut heap, &mut seq, &node_docs, &node_depth, r);
+            }
+        }
+    }
+
+    // ── Finalize the flat node graph → step_nodes + node_id_to_leaf_id ──────────
+    // Assign distinct leaf ids in node-id order (terminal nodes only). `splits` is
+    // one entry per node (interior nodes carry their split; a terminal node carries
+    // a placeholder split filtered out by its (0,0) step entry, matching the
+    // `tree_splits` indexed-by-node contract in cb-model::NonSymmetricTree).
+    let node_count = nodes.len();
+    let mut step_nodes: Vec<(u16, u16)> = Vec::with_capacity(node_count);
+    let mut node_id_to_leaf_id: Vec<u32> = vec![0; node_count];
+    let mut splits: Vec<Split> = Vec::with_capacity(node_count);
+    let mut next_leaf_id: u32 = 0;
+    // Map node id → distinct leaf id for terminal nodes (assigned in node order).
+    let mut node_to_leaf: Vec<Option<u32>> = vec![None; node_count];
+    for (id, node) in nodes.iter().enumerate() {
+        match node {
+            BuiltNode::Interior { split, left, right } => {
+                splits.push(*split);
+                // step diffs are (child_id - this_id), the upstream
+                // `LeftSubtreeDiff` / `RightSubtreeDiff` offsets added to walk down.
+                let ld = (*left - id) as u16;
+                let rd = (*right - id) as u16;
+                step_nodes.push((ld, rd));
+            }
+            BuiltNode::Leaf => {
+                // Placeholder split for a leaf node (never read — its step entry is
+                // (0,0)); reuse a zeroed Split so `splits` stays node-indexed.
+                splits.push(Split { feature: 0, border: 0.0 });
+                step_nodes.push((0, 0));
+                node_to_leaf[id] = Some(next_leaf_id);
+                node_id_to_leaf_id[id] = next_leaf_id;
+                next_leaf_id += 1;
+            }
+        }
+    }
+
+    if next_leaf_id < 2 {
+        // The root never split → no non-symmetric tree (degenerate, matching the
+        // oblivious `Degenerate` contract for a level with no candidate split).
+        return Err(CbError::Degenerate(
+            "leaf-wise grower produced no split (root gain below the 1e-9 cutoff or \
+             too few documents)"
+                .to_owned(),
+        ));
+    }
+
+    // `leaf_of[obj]` = the DISTINCT leaf id object `obj` lands in (for leaf-value
+    // estimation). Every object's owning node is terminal by construction.
+    let leaf_of: Vec<usize> = leaf_owner
+        .iter()
+        .map(|&node| node_to_leaf.get(node).and_then(|o| *o).unwrap_or(0) as usize)
+        .collect();
+
+    Ok(GrownTree {
+        splits,
+        leaf_of,
+        ctr_splits: Vec::new(),
+        level_kinds: Vec::new(),
+        step_nodes,
+        node_id_to_leaf_id,
     })
 }
 
@@ -1004,6 +1472,8 @@ pub fn greedy_tensor_search_oblivious_ordered(
         leaf_of,
         ctr_splits: Vec::new(),
         level_kinds: Vec::new(),
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
     })
 }
 
@@ -1439,6 +1909,8 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
         leaf_of,
         ctr_splits,
         level_kinds,
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
     })
 }
 
@@ -1830,5 +2302,7 @@ pub fn greedy_tensor_search_oblivious_pairwise(
         leaf_of,
         ctr_splits: Vec::new(),
         level_kinds: Vec::new(),
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
     })
 }
