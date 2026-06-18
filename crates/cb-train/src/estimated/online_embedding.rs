@@ -44,7 +44,7 @@
 //! split border, so the model per-stage oracle is byte-identical). See
 //! `cb-oracle::lda_oracle_test` and `06.5-05-SUMMARY.md`.
 
-use cb_compute::{IncrementalCloud, LdaCalcer};
+use cb_compute::{IncrementalCloud, KnnCalcer, LdaCalcer};
 use cb_core::{CbError, CbResult};
 
 /// LDA projection-dimension default (`embedding_feature_estimators.cpp`:
@@ -241,5 +241,188 @@ pub fn online_lda_prefix(
     Ok(OnlineLdaPrefix {
         columns,
         projection_in_order,
+    })
+}
+
+// ===========================================================================
+// KNN online/offline embedding seam (06.5-06, brute-force-exact, D-03/D-04).
+// ===========================================================================
+//
+// KNN is an `IOnlineFeatureEstimator` exactly like LDA: a document's neighbor-vote
+// feature is computed from the prefix of EARLIER documents in the learn
+// permutation ONLY (read-before-update, D-03), THEN the current `(target,
+// embedding)` is inserted. The neighbor set is the spike-validated brute-force-
+// exact k-NN (`cb_compute::KnnCalcer`); NO third-party HNSW crate (A2/D-05).
+//
+// Width: classification -> `num_classes` per-class vote counts; regression -> 1
+// (neighbor target mean). For `boosting_type=Plain` the TREE SPLITS see the
+// OFFLINE whole-set estimate ([`offline_knn_features`]); the online prefix
+// ([`online_knn_prefix`]) feeds the ordered-boosting leaf path.
+
+/// The object-indexed online-KNN estimated feature columns plus the
+/// permutation-order per-prefix neighbor-id trace (the spike's oracle anchor).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnlineKnnPrefix {
+    /// One estimated feature column per output dimension, OBJECT-indexed
+    /// (`columns[f][doc]`), `f32`-valued.
+    pub columns: Vec<Vec<f32>>,
+    /// The per-document neighbor-id list in PERMUTATION order
+    /// (`neighbors_in_order[p]` is the k-NN id list for the document at learn-order
+    /// position `p`, computed over the prefix BEFORE its own insertion). This is the
+    /// exact surface the instrumented `knn_neighbors` dump captures.
+    pub neighbors_in_order: Vec<Vec<usize>>,
+}
+
+/// The KNN classification output width (`num_classes`) or regression width (`1`).
+#[must_use]
+pub fn knn_feature_count(num_classes: usize, is_classification: bool) -> usize {
+    if is_classification {
+        num_classes.max(1)
+    } else {
+        1
+    }
+}
+
+/// Fit the OFFLINE (whole-set) KNN feature and compute every document (the
+/// Plain-boosting estimate): insert EVERY learn document `(target, embedding)`,
+/// then compute each document's `k`-NN vote over the full inserted set (the
+/// document is its own nearest neighbor at distance 0, matching upstream's
+/// whole-set `Compute`).
+///
+/// - `embeddings[doc]` is object `doc`'s embedding vector (length `dim`).
+/// - `targets[doc]` is object `doc`'s target (class label for classification,
+///   regression target otherwise).
+/// - `num_classes` is the number of target classes (classification width).
+/// - `close_num` is the query `k` (`KNN:k=...`).
+/// - `is_classification` selects the vote-count vs mean arm.
+///
+/// Returns OBJECT-indexed columns (`columns[f][doc]`), width =
+/// [`knn_feature_count`].
+///
+/// # Errors
+/// [`CbError::Degenerate`] on length mismatch / empty input;
+/// [`CbError::OutOfRange`] (propagated) on a dimension mismatch.
+pub fn offline_knn_features(
+    embeddings: &[Vec<f32>],
+    targets: &[f32],
+    num_classes: usize,
+    close_num: usize,
+    is_classification: bool,
+) -> CbResult<Vec<Vec<f32>>> {
+    let n = embeddings.len();
+    if targets.len() != n {
+        return Err(CbError::Degenerate(
+            "offline_knn_features: embeddings / targets length mismatch".to_owned(),
+        ));
+    }
+    let Some(first) = embeddings.first() else {
+        return Err(CbError::Degenerate(
+            "offline_knn_features: empty embedding set".to_owned(),
+        ));
+    };
+    let dim = first.len();
+    let width = knn_feature_count(num_classes, is_classification);
+
+    let mut calcer = KnnCalcer::new(dim, close_num, is_classification, num_classes);
+    for (doc, embed) in embeddings.iter().enumerate() {
+        let Some(&target) = targets.get(doc) else {
+            continue;
+        };
+        calcer.update(target, embed)?;
+    }
+
+    let mut columns: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; width];
+    for (doc, embed) in embeddings.iter().enumerate() {
+        let feat = calcer.compute(embed)?;
+        for (f, &v) in feat.iter().enumerate() {
+            if let Some(col) = columns.get_mut(f) {
+                if let Some(slot) = col.get_mut(doc) {
+                    *slot = v;
+                }
+            }
+        }
+    }
+    Ok(columns)
+}
+
+/// Compute the online (ordered) KNN features over the learn `permutation` with the
+/// read-before-update prefix (D-03).
+///
+/// - `permutation[p]` is the object index at learn-order position `p` (the fold's
+///   `Fold::permutation`, NOT a fresh one).
+/// - `embeddings[doc]` / `targets[doc]` as in [`offline_knn_features`].
+///
+/// For each `p`: read `doc = permutation[p]`, compute its `k`-NN vote over the
+/// PREFIX of already-inserted documents (NOT including itself — leakage control),
+/// store it object-indexed AND record the neighbor-id list, THEN insert
+/// `(target, embedding)`.
+///
+/// The first document(s) have an empty prefix and so produce an all-zero feature
+/// with an empty neighbor list — exactly the leading `"neighbors":[]` rows the
+/// instrumented dump shows.
+///
+/// # Errors
+/// [`CbError::Degenerate`] on length mismatch / out-of-range permutation index;
+/// [`CbError::OutOfRange`] (propagated) on a dimension mismatch.
+pub fn online_knn_prefix(
+    permutation: &[i32],
+    embeddings: &[Vec<f32>],
+    targets: &[f32],
+    num_classes: usize,
+    close_num: usize,
+    is_classification: bool,
+) -> CbResult<OnlineKnnPrefix> {
+    let n = permutation.len();
+    if embeddings.len() != n || targets.len() != n {
+        return Err(CbError::Degenerate(
+            "online_knn_prefix: permutation / embeddings / targets length mismatch".to_owned(),
+        ));
+    }
+    let Some(first) = embeddings.first() else {
+        return Err(CbError::Degenerate(
+            "online_knn_prefix: empty embedding set".to_owned(),
+        ));
+    };
+    let dim = first.len();
+    let width = knn_feature_count(num_classes, is_classification);
+
+    let mut calcer = KnnCalcer::new(dim, close_num, is_classification, num_classes);
+    let mut columns: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; width];
+    let mut neighbors_in_order: Vec<Vec<usize>> = Vec::with_capacity(n);
+
+    for &doc_i in permutation {
+        let doc = doc_i as usize;
+        let Some(embed) = embeddings.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_knn_prefix: permutation index out of range for embeddings".to_owned(),
+            ));
+        };
+        let Some(&target) = targets.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_knn_prefix: permutation index out of range for targets".to_owned(),
+            ));
+        };
+
+        // COMPUTE from the prefix-inserted vectors (read-before-update, D-03). The
+        // neighbor ids here are PREFIX-LOCAL insertion ids (0..prefix_len), exactly
+        // as the instrumented `knn_neighbors` dump records them.
+        let neighbors = calcer.neighbors(embed)?;
+        let feat = calcer.compute(embed)?;
+        for (f, &v) in feat.iter().enumerate() {
+            if let Some(col) = columns.get_mut(f) {
+                if let Some(slot) = col.get_mut(doc) {
+                    *slot = v;
+                }
+            }
+        }
+        neighbors_in_order.push(neighbors);
+
+        // THEN INSERT the current document (its own vector + target).
+        calcer.update(target, embed)?;
+    }
+
+    Ok(OnlineKnnPrefix {
+        columns,
+        neighbors_in_order,
     })
 }

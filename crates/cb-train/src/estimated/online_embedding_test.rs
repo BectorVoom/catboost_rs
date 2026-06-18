@@ -6,7 +6,8 @@
 //! NUMERIC parity vs upstream is gated in `cb-oracle::lda_oracle_test`.
 
 use crate::estimated::online_embedding::{
-    lda_projection_dim, offline_lda_features, online_lda_prefix,
+    knn_feature_count, lda_projection_dim, offline_knn_features, offline_lda_features,
+    online_knn_prefix, online_lda_prefix,
 };
 
 const DIM: usize = 4;
@@ -111,4 +112,103 @@ fn offline_rejects_length_mismatch() {
     let (emb, _lab) = corpus();
     let short = vec![1usize; emb.len() - 1];
     assert!(offline_lda_features(&emb, &short, 2, REG).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// KNN online/offline embedding seam (06.5-06).
+// ---------------------------------------------------------------------------
+
+const KNN_K: usize = 3;
+
+/// Targets as `f32` class labels (the corpus labels widened).
+fn knn_targets() -> Vec<f32> {
+    let (_emb, lab) = corpus();
+    lab.iter().map(|&c| c as f32).collect()
+}
+
+#[test]
+fn knn_feature_count_clf_is_classes_reg_is_one() {
+    assert_eq!(knn_feature_count(2, true), 2);
+    assert_eq!(knn_feature_count(5, true), 5);
+    assert_eq!(knn_feature_count(2, false), 1);
+}
+
+#[test]
+fn offline_knn_whole_set_separates_classes_at_border() {
+    // Plain whole-set: class0 vote perfectly separates the two clouds at 0.5.
+    let (emb, lab) = corpus();
+    let targets = knn_targets();
+    let cols = offline_knn_features(&emb, &targets, 2, KNN_K, true).expect("offline ok");
+    assert_eq!(cols.len(), 2, "width = num_classes");
+    let class0 = cols.first().expect("class0 col");
+    for (i, &v) in class0.iter().enumerate() {
+        if lab[i] == 0 {
+            assert!(v > 0.5, "doc{i} class0 vote {v} > 0.5");
+        } else {
+            assert!(v < 0.5, "doc{i} class0 vote {v} < 0.5");
+        }
+    }
+}
+
+#[test]
+fn online_knn_first_doc_has_empty_neighbors_and_zero_feature() {
+    // Identity permutation: position 0 is object 0 with an empty prefix.
+    let (emb, _lab) = corpus();
+    let targets = knn_targets();
+    let perm: Vec<i32> = (0..emb.len() as i32).collect();
+    let out = online_knn_prefix(&perm, &emb, &targets, 2, KNN_K, true).expect("online ok");
+    assert_eq!(out.neighbors_in_order.len(), emb.len());
+    assert!(
+        out.neighbors_in_order.first().expect("first").is_empty(),
+        "first doc has no prefix neighbors"
+    );
+    // doc0's feature (object-indexed) is all-zero (no votes).
+    let c0 = out.columns.first().expect("col0").first().copied();
+    let c1 = out.columns.get(1).and_then(|c| c.first().copied());
+    assert_eq!(c0, Some(0.0));
+    assert_eq!(c1, Some(0.0));
+}
+
+#[test]
+fn online_knn_neighbor_ids_match_instrumented_prefix_pattern() {
+    // The read-before-update prefix neighbor ids must follow the dump:
+    //  doc1->[0], doc2->[0,1], doc3->[1,0,2], doc4->[2,0,3], doc5->[1,3,0] (k=3).
+    let (emb, _lab) = corpus();
+    let targets = knn_targets();
+    let perm: Vec<i32> = (0..emb.len() as i32).collect();
+    let out = online_knn_prefix(&perm, &emb, &targets, 2, KNN_K, true).expect("online ok");
+    let nb = &out.neighbors_in_order;
+    assert_eq!(nb.first().expect("0"), &Vec::<usize>::new());
+    assert_eq!(nb.get(1).expect("1"), &vec![0]);
+    assert_eq!(nb.get(2).expect("2"), &vec![0, 1]);
+    assert_eq!(nb.get(3).expect("3"), &vec![1, 0, 2]);
+    assert_eq!(nb.get(4).expect("4"), &vec![2, 0, 3]);
+    assert_eq!(nb.get(5).expect("5"), &vec![1, 3, 0]);
+}
+
+#[test]
+fn online_knn_regression_mean_width_one() {
+    let (emb, _lab) = corpus();
+    let targets: Vec<f32> = (0..emb.len()).map(|i| i as f32).collect();
+    let perm: Vec<i32> = (0..emb.len() as i32).collect();
+    let out = online_knn_prefix(&perm, &emb, &targets, 2, KNN_K, false).expect("online ok");
+    assert_eq!(out.columns.len(), 1, "regression width = 1");
+}
+
+#[test]
+fn online_knn_rejects_out_of_range_permutation() {
+    let (emb, _lab) = corpus();
+    let targets = knn_targets();
+    let mut perm: Vec<i32> = (0..emb.len() as i32).collect();
+    if let Some(slot) = perm.first_mut() {
+        *slot = 999;
+    }
+    assert!(online_knn_prefix(&perm, &emb, &targets, 2, KNN_K, true).is_err());
+}
+
+#[test]
+fn offline_knn_rejects_length_mismatch() {
+    let (emb, _lab) = corpus();
+    let short = vec![0.0_f32; emb.len() - 1];
+    assert!(offline_knn_features(&emb, &short, 2, KNN_K, true).is_err());
 }

@@ -30,3 +30,11 @@
   StagedApprox/Predictions ≤1e-5) because its online column's split border (0.590515) and clean 8/8
   separation are robust to the normalization. The BM25 NORMALIZED per-stage borders are deferred to
   the trainer estimated-feature-normalization work (a follow-on slice / Phase 6.6 trainer concern).
+
+## Out-of-scope pre-existing dead const (06.5-06)
+
+- **`crates/cb-train/src/estimated/online_embedding_test.rs:13`** — `const DIM: usize = 4;`
+  emits a `dead_code` warning (`DIM` is never referenced). It was introduced UNUSED by plan
+  06.5-05 (commit `4c194ae`), NOT by 06.5-06. Out of scope per the SCOPE BOUNDARY rule (pre-
+  existing, not caused by this plan's KNN additions). Warning-only (not a denied lint); does not
+  affect the build or any test. Left untouched.

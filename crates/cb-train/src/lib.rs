@@ -55,7 +55,8 @@ pub use estimated::online_text::{
     offline_text_features, online_text_prefix, OnlineTextCalcer, OnlineTextPrefix,
 };
 pub use estimated::online_embedding::{
-    lda_projection_dim, offline_lda_features, online_lda_prefix, OnlineLdaPrefix,
+    knn_feature_count, lda_projection_dim, offline_knn_features, offline_lda_features,
+    online_knn_prefix, online_lda_prefix, OnlineKnnPrefix, OnlineLdaPrefix,
 };
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
