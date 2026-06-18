@@ -413,18 +413,10 @@ if [ -f "${BTFE}" ]; then
     if ! grep -q 'cb_instr_calcer_encoding' "${BTFE}"; then
         # calcer_encoding: insert AFTER the unique `featureCalcer.Compute(text,
         # outputFeaturesIterator);` line; read back the column-major row just written.
-        perl -pi -e '
-            print;
-            $_ = "";
-            if (!$cb_ce_done && $cb_prev =~ /^(\s*)featureCalcer\.Compute\(text, outputFeaturesIterator\);\s*$/) {
-                my $ind = $1;
-                $_ = $ind . q{/* cb_instr_calcer_encoding (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { const ui32 cbFC = featureCalcer.FeatureCount(); std::string cbLine = std::string(R"J({"event":"calcer_encoding","doc":)J") + std::to_string((long long)docId) + R"J(,"values":[)J"; for (ui32 cbF = 0; cbF < cbFC; ++cbF) { if (cbF) cbLine += ","; cbLine += CbInstr065Fmt17((double)features[cbF * docCount + docId]); } cbLine += "]}"; CbInstr065Log(cbLine); }} . "\n";
-                $cb_ce_done = 1;
-            }
-            $cb_prev = $_ ne "" ? "" : $cb_prev;
-        ' -e 'BEGIN{$cb_prev=""} { }' "${BTFE}" 2>/dev/null || true
-        # The two-pass prev-line trick above is brittle in -pi; use a deterministic
-        # awk insertion instead (single unique anchor line).
+        # WR-06: the former two-pass `perl -pi` prev-line trick was dead (its
+        # $cb_prev regex could never match) yet still rewrote the file in place on
+        # every run. Removed in favor of the single deterministic awk insertion
+        # below, which is the documented working path.
         if ! grep -q 'cb_instr_calcer_encoding' "${BTFE}"; then
             tmp_ce="$(mktemp)"
             awk '
