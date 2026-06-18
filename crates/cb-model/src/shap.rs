@@ -1017,33 +1017,212 @@ pub fn shap_interaction_values(
         .collect()
 }
 
-/// `PredictionDiff` (MODEL-05): for a pair of objects, the absolute per-feature
-/// contribution to the difference in their raw predictions, computed from the
-/// difference of their SHAP rows. `get_feature_importance(type='PredictionDiff',
-/// data=X[:2])` takes exactly two objects and returns `|shap[0][f] − shap[1][f]|`
-/// per feature `f` (the bias term cancels). `cols` must carry exactly two objects.
+/// Per-tree per-feature `floatFeatureImpact[featureIdx][borderSlot]` for one
+/// oblivious document (`CalcObliviousIndicatorCoefficients`,
+/// `compare_documents.cpp:12-46`). For each tree, at each depth-bit split, flip
+/// the document's leaf bit; the leaf-value difference is attributed to the split
+/// feature at the border slot `borderIdxForSplit + ((flippedLeaf >> depth) & 1)`.
+/// `border_idx_for_split[(tree, depth)]` is the split's border index within its
+/// feature; `impact[f]` has `borders[f].len() + 1` slots.
+fn oblivious_indicator_coefficients(
+    model: &Model,
+    float_splits: &[Vec<crate::Split>],
+    doc_leaf_idxes: &[usize],
+    border_idx_for_split: &[Vec<usize>],
+) -> Vec<Vec<f64>> {
+    let mut impact: Vec<Vec<f64>> = model
+        .float_feature_borders
+        .iter()
+        .map(|b| vec![0.0_f64; b.len() + 1])
+        .collect();
+
+    for (tree_id, tree) in model.oblivious_trees.iter().enumerate() {
+        let splits = match float_splits.get(tree_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let tree_depth = splits.len();
+        let leaf_idx = doc_leaf_idxes.get(tree_id).copied().unwrap_or(0);
+        let leaf_value = tree.leaf_values.get(leaf_idx).copied().unwrap_or(0.0);
+
+        for depth_idx in 0..tree_depth {
+            let flipped = leaf_idx ^ (1usize << depth_idx);
+            let diff = tree.leaf_values.get(flipped).copied().unwrap_or(0.0) - leaf_value;
+            if diff.abs() < 1e-12 {
+                continue;
+            }
+            // The split feature at this depth: bit `depth_idx` is split
+            // `splits[depth_idx]` (forward-bit order).
+            let Some(split) = splits.get(depth_idx) else {
+                continue;
+            };
+            let feature_idx = split.feature;
+            let base = border_idx_for_split
+                .get(tree_id)
+                .and_then(|r| r.get(depth_idx))
+                .copied()
+                .unwrap_or(0);
+            let slot = base + ((flipped >> depth_idx) & 1);
+            if let Some(row) = impact.get_mut(feature_idx) {
+                if let Some(cell) = row.get_mut(slot) {
+                    *cell += diff;
+                }
+            }
+        }
+    }
+    impact
+}
+
+/// `GetPredictionDiffSingle` (`compare_documents.cpp:125-163`): from the per-split
+/// impact coefficients, the per-feature max cumulative prediction change in the
+/// `try_increase` direction. Scans border slots below the document's bucket
+/// downward and above it upward, accumulating `diff` and tracking the maximum
+/// magnitude that moves the prediction the desired way.
+fn prediction_diff_single(
+    model: &Model,
+    impact: &[Vec<f64>],
+    doc_borders: &[usize],
+    try_increase: bool,
+) -> Vec<f64> {
+    let mut out = vec![0.0_f64; model.float_feature_borders.len()];
+    for feature_idx in 0..model.float_feature_borders.len() {
+        let row = match impact.get(feature_idx) {
+            Some(r) => r,
+            None => continue,
+        };
+        let bucket = doc_borders.get(feature_idx).copied().unwrap_or(0);
+
+        let mut diff = 0.0_f64;
+        // for (splitIdx = bucket - 1; splitIdx >= 0; --splitIdx)
+        for split_idx in (0..bucket).rev() {
+            diff += row.get(split_idx).copied().unwrap_or(0.0);
+            if (try_increase && diff > 0.0) || (!try_increase && diff < 0.0) {
+                if let Some(slot) = out.get_mut(feature_idx) {
+                    *slot = slot.max(diff.abs());
+                }
+            }
+        }
+        diff = 0.0;
+        // for (splitIdx = bucket + 1; splitIdx < row.len(); ++splitIdx)
+        for split_idx in (bucket + 1)..row.len() {
+            diff += row.get(split_idx).copied().unwrap_or(0.0);
+            if (try_increase && diff > 0.0) || (!try_increase && diff < 0.0) {
+                if let Some(slot) = out.get_mut(feature_idx) {
+                    *slot = slot.max(diff.abs());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `PredictionDiff` (MODEL-05; `compare_documents.cpp:165-249`): for exactly TWO
+/// objects, the per-feature impact on the difference of their RAW predictions —
+/// NOT a SHAP quantity. For each document the per-split leaf-value indicator
+/// coefficients are accumulated across border slots and the maximum cumulative
+/// change toward the other document's prediction is taken (`GetPredictionDiffSingle`);
+/// the final per-feature value is `|impact[0][f] + impact[1][f]|`. Oblivious,
+/// numeric-only models (the supported surface — `CB_ENSURE` num-cat-features==0,
+/// dim==1). `cols` must carry exactly two objects.
 #[must_use]
 pub fn prediction_diff(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<f64> {
-    let shap = shap_values_fixed(model, cols, n_features, None);
-    let row0 = shap.first();
-    let row1 = shap.get(1);
+    let float_splits: Vec<Vec<crate::Split>> =
+        model.oblivious_trees.iter().map(|t| float_splits_of(&t.splits)).collect();
+
+    // Document feature rows + their per-feature bucket (= # borders exceeded).
+    let object_count = cols.first().map_or(0, Vec::len).min(2);
+    let rows: Vec<Vec<f32>> = (0..object_count)
+        .map(|obj| cols.iter().map(|c| c.get(obj).copied().unwrap_or(f32::NAN)).collect())
+        .collect();
+    let doc_borders: Vec<Vec<usize>> = rows
+        .iter()
+        .map(|row| {
+            model
+                .float_feature_borders
+                .iter()
+                .enumerate()
+                .map(|(f, borders)| {
+                    let v = row.get(f).copied().unwrap_or(f32::NAN);
+                    borders.iter().filter(|&&b| f64::from(v) > b).count()
+                })
+                .collect()
+        })
+        .collect();
+
+    // border_idx_for_split[(tree, depth)] = the split's border index within its
+    // feature (matching it to feature.Borders by value).
+    let border_idx_for_split: Vec<Vec<usize>> = float_splits
+        .iter()
+        .map(|splits| {
+            splits
+                .iter()
+                .map(|split| {
+                    model
+                        .float_feature_borders
+                        .get(split.feature)
+                        .and_then(|borders| {
+                            borders.iter().position(|&b| (b - split.border).abs() < 1e-15)
+                        })
+                        .unwrap_or(0)
+                })
+                .collect()
+        })
+        .collect();
+
+    let doc_leaf_idxes: Vec<Vec<usize>> = rows
+        .iter()
+        .map(|row| float_splits.iter().map(|s| document_leaf_index(s, row)).collect())
+        .collect();
+
+    let preds = crate::predict_raw(model, cols);
+
+    let impacts: Vec<Vec<f64>> = (0..object_count)
+        .map(|idx| {
+            let leaf_idxes = doc_leaf_idxes.get(idx).cloned().unwrap_or_default();
+            let impact =
+                oblivious_indicator_coefficients(model, &float_splits, &leaf_idxes, &border_idx_for_split);
+            let other = idx ^ 1;
+            let try_increase = preds.get(idx).copied().unwrap_or(0.0)
+                - preds.get(other).copied().unwrap_or(0.0)
+                < 0.0;
+            let borders = doc_borders.get(idx).cloned().unwrap_or_default();
+            prediction_diff_single(model, &impact, &borders, try_increase)
+        })
+        .collect();
+
     (0..n_features)
         .map(|f| {
-            let a = row0.and_then(|r| r.get(f)).copied().unwrap_or(0.0);
-            let b = row1.and_then(|r| r.get(f)).copied().unwrap_or(0.0);
-            (a - b).abs()
+            let a = impacts.first().and_then(|r| r.get(f)).copied().unwrap_or(0.0);
+            let b = impacts.get(1).and_then(|r| r.get(f)).copied().unwrap_or(0.0);
+            (a + b).abs()
         })
         .collect()
 }
 
-/// `SageValues` (MODEL-05; D-6.6-11 fallback (a) — seed-match strict through the
-/// Python-API-defined spec). SAGE (Shapley Additive Global Explanations) is the
-/// global counterpart of SHAP: the marginal contribution of each feature to the
-/// model's mean prediction. For a deterministic, seed-pinned model the upstream
-/// `get_feature_importance(type='SageValues')` reduces to the global aggregate of
-/// the local SHAP attributions — the mean absolute per-feature SHAP contribution
-/// across all objects (reproducible per seed, RESEARCH gate 2). Reductions route
-/// through [`cb_core::sum_f64`] (D-08).
+/// `SageValues` (MODEL-05; **D-6.6-11 fallback (b)** — documented structural
+/// oracle, NOT seed-match strict).
+///
+/// SAGE (Shapley Additive Global Explanations) is the global feature-importance
+/// counterpart of SHAP: per feature, the marginal contribution to the model's
+/// mean loss reduction. Upstream `CalcSageValues` (`sage_values.cpp:343-427`) is a
+/// genuine **Monte-Carlo** estimator: a hard-coded `TRestorableFastRng64(228)`
+/// drives (i) a `PartialShuffle` batch draw, (ii) a feature `Shuffle`
+/// permutation, (iii) a `MarginalImputer` that samples reference values for
+/// "disabled" features, and (iv) a `MetricsPlotCalcer` Logloss over the imputed
+/// batch — averaged over `nSamples` iterations with a confidence-interval
+/// convergence check. RESEARCH gate 2 confirmed this is *Python-level*
+/// deterministic + seed-reproducible, but bit-exact reproduction in an
+/// independent Rust implementation requires transcribing the entire
+/// `TReallyFastRng64` + `Shuffle`/`PartialShuffle` + imputer + metric subsystem,
+/// none of which exposes a Python-validatable intermediate. That is an
+/// architectural-magnitude effort outside this plan's scope, so per the
+/// pre-authorized D-6.6-11 fallback (b) the Rust `sage_values` ships a
+/// **deterministic structural surrogate** — the mean absolute per-feature SHAP
+/// contribution (the closed-form global SHAP aggregate, the same Shapley basis
+/// SAGE estimates) — with a STRUCTURAL oracle (shape, finiteness, determinism,
+/// non-negativity) rather than a ≤1e-5 value oracle. The seed-match `≤1e-5` SAGE
+/// value oracle is deferred to a future plan that transcribes the upstream RNG
+/// subsystem. Reductions route through [`cb_core::sum_f64`] (D-08).
 #[must_use]
 pub fn sage_values(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<f64> {
     let shap = shap_values_fixed(model, cols, n_features, None);
