@@ -231,6 +231,17 @@ pub fn build_dictionary(
     indices.sort_by(|&l, &r| {
         // counts[l] > counts[r]  -> l first (DESC by count)
         // tie -> tokens[l] < tokens[r] -> l first (ASC by token)
+        // l/r come from 0..dictionary_size, so both gets are provably Some;
+        // assert it in debug so a future bug panics instead of silently
+        // collapsing an out-of-bounds None into Ordering::Equal/Less and
+        // corrupting the deterministic (count DESC, token ASC) order (WR-08).
+        debug_assert!(
+            counts.get(l).is_some()
+                && counts.get(r).is_some()
+                && tokens.get(l).is_some()
+                && tokens.get(r).is_some(),
+            "build_dictionary comparator index out of bounds"
+        );
         match counts.get(r).cmp(&counts.get(l)) {
             std::cmp::Ordering::Equal => tokens.get(l).cmp(&tokens.get(r)),
             non_eq => non_eq,

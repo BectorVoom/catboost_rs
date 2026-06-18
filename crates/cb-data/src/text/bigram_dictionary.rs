@@ -179,9 +179,22 @@ pub fn build_bigram_dictionary(
     // constituent token strings gram-by-gram ascending: first tokens, then (on a
     // first-token tie) second tokens — exactly tuple-ordering on (first, second).
     let mut indices: Vec<usize> = (0..dictionary_size).collect();
-    indices.sort_by(|&l, &r| match counts.get(r).cmp(&counts.get(l)) {
-        std::cmp::Ordering::Equal => pairs.get(l).cmp(&pairs.get(r)),
-        non_eq => non_eq,
+    indices.sort_by(|&l, &r| {
+        // l/r come from 0..dictionary_size, so both gets are provably Some;
+        // assert it in debug so a future bug panics instead of silently
+        // collapsing an out-of-bounds None into Ordering::Equal/Less and
+        // corrupting the deterministic (count DESC, ngram ASC) order (WR-08).
+        debug_assert!(
+            counts.get(l).is_some()
+                && counts.get(r).is_some()
+                && pairs.get(l).is_some()
+                && pairs.get(r).is_some(),
+            "build_bigram_dictionary comparator index out of bounds"
+        );
+        match counts.get(r).cmp(&counts.get(l)) {
+            std::cmp::Ordering::Equal => pairs.get(l).cmp(&pairs.get(r)),
+            non_eq => non_eq,
+        }
     });
 
     // Step 4: truncate to min(size, MaxDictionarySize).
