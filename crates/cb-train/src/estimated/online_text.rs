@@ -80,6 +80,14 @@ pub fn offline_text_features(
     num_classes: usize,
 ) -> CbResult<Vec<Vec<f32>>> {
     let n = texts.len();
+    if num_classes == 0 {
+        // Without this guard, an empty `texts` would return a width-1 all-zero
+        // column set with no error (a silently-wrong shape for a zero-class
+        // request), matching the bm25_compute/naive_bayes_compute precondition (WR-03).
+        return Err(CbError::Degenerate(
+            "offline_text_features: zero classes".to_owned(),
+        ));
+    }
     if classes.len() != n {
         return Err(CbError::Degenerate(
             "offline_text_features: texts / classes length mismatch".to_owned(),
