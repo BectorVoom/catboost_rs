@@ -42,6 +42,7 @@ use cb_data::text::dictionary::{
 use cb_data::text::digitizer::{digitize_column, digitize_column_bigram};
 use cb_data::text::tokenizer::{tokenize, TokenizerOptions};
 
+use crate::estimated::online_embedding::offline_knn_features;
 use crate::estimated::online_text::{online_text_prefix, OnlineTextCalcer, OnlineTextPrefix};
 
 /// The BoW estimated feature columns plus their selected split borders, in the
@@ -305,5 +306,177 @@ pub fn build_online_text_estimated_features(
         columns,
         borders,
         encoding_in_order,
+    })
+}
+
+// ===========================================================================
+// SC-4 MIXED text + embedding + numeric feature-layout orchestration (06.5-07).
+// ===========================================================================
+
+/// The COMBINED feature layout for a mixed text + embedding (+ numeric) pool —
+/// the terminal SC-4 join. The estimated text columns (BoW), the estimated
+/// embedding columns (KNN), and the existing numeric columns are appended into a
+/// single float-feature layout in the documented upstream block order, each block
+/// quantized through the UNCHANGED [`cb_data::select_borders_greedy_logsum`]
+/// quantizer (NO parallel quantizer, SC-4). The result feeds straight into
+/// [`crate::train`].
+///
+/// # Block order (load-bearing)
+///
+/// The layout is emitted as `[ numeric block | text BoW block | embedding KNN
+/// block ]`. Upstream appends the ESTIMATED features AFTER the raw
+/// numeric/categorical features (`estimated_features.cpp` joins the estimated
+/// layout onto the existing quantized objects), and within the estimated layout
+/// the text estimators precede the embedding estimators (text feature ids are
+/// registered before embedding feature ids). Each block is internally ascending
+/// in its own active-id / projection order (the per-calcer order from Plans
+/// 03/06).
+///
+/// Because every column in this mixed corpus PERFECTLY separates the two classes
+/// (numeric at the 0.0 border, BoW words at the 0.5 presence border, KNN at the
+/// 0.5 integer-vote border), the per-stage Splits/LeafValues/StagedApprox/
+/// Predictions are invariant to WHICH separating feature the search selects at a
+/// given level — the SC-4 oracle gates the combined layout end-to-end regardless.
+///
+/// # Inert when absent (D-04 byte-identical)
+///
+/// Empty `texts` AND empty `embeddings` AND empty `numeric` yields an empty
+/// layout; with only numeric columns present the text/embedding blocks are empty
+/// and the existing numeric training path is byte-for-byte unchanged (the
+/// estimated-feature path is inert).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MixedEstimatedFeatures {
+    /// The combined float-feature columns, column-major (`columns[f][doc]`),
+    /// `f32`-valued. Order: numeric block, then BoW text block, then KNN embedding
+    /// block.
+    pub columns: Vec<Vec<f32>>,
+    /// Split borders for each column in [`Self::columns`], SAME order, selected
+    /// via the existing quantizer (SC-4).
+    pub borders: Vec<Vec<f64>>,
+    /// Number of leading NUMERIC columns (block 0).
+    pub numeric_feature_count: usize,
+    /// Number of BoW TEXT columns (block 1; BiGram block then Word block within).
+    pub text_feature_count: usize,
+    /// Number of KNN EMBEDDING columns (block 2; classification width =
+    /// `num_classes`).
+    pub embedding_feature_count: usize,
+}
+
+/// Build the COMBINED mixed text + embedding + numeric estimated-feature layout
+/// for a single trained model (SC-4 terminal join, 06.5-07).
+///
+/// - `numeric[c][doc]` is the existing numeric column `c` for object `doc`
+///   (already `f32`, no estimation — joined directly, quantized by the existing
+///   quantizer). Pass an empty slice for a no-numeric pool.
+/// - `texts[doc]` is object `doc`'s raw text (length `n_docs`); empty slice ->
+///   no text block (inert, D-04). The BoW calcer (target-INDEPENDENT) builds the
+///   BiGram + Word dictionaries ONCE and emits one binary-presence column per
+///   active token id (the Plan-03 seam).
+/// - `embeddings[doc]` is object `doc`'s embedding vector; empty slice -> no
+///   embedding block. The KNN calcer (Plan-06, brute-force-exact) emits the
+///   OFFLINE whole-set per-class vote columns — the Plain-mode estimate that feeds
+///   the tree splits (06.5-06 decision).
+/// - `targets[doc]` is object `doc`'s class label (for the KNN vote arm).
+/// - `num_classes` is the target class count (KNN classification width).
+/// - `close_num` is the KNN query `k` (`KNN:k=...`).
+/// - `tokenizer_options` pins the D-02 tokenization; `max_borders` is the
+///   per-feature border budget for the existing quantizer.
+///
+/// All three blocks flow through the UNCHANGED quantizer; NO parallel quantizer
+/// and NO Pool schema change (SC-4). BoW + KNN are the two FULLY per-stage-closed
+/// calcers (BoW target-independent; KNN neighbor-id bit-exact); BM25's normalized
+/// per-stage borders (06.5-04 deferred) and LDA's documented raw-projection
+/// tolerance (06.5-05) are deliberately NOT part of the mixed end-to-end gate so
+/// the SC-4 oracle is a clean ≤1e-5 per-stage assertion.
+///
+/// # Errors
+/// [`CbError::Degenerate`] on a `texts`/`embeddings`/`targets`/`numeric` length
+/// mismatch, or a propagated calcer error.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mixed_estimated_features(
+    numeric: &[Vec<f32>],
+    texts: &[String],
+    embeddings: &[Vec<f32>],
+    targets: &[f32],
+    num_classes: usize,
+    close_num: usize,
+    tokenizer_options: &TokenizerOptions,
+    max_borders: usize,
+) -> CbResult<MixedEstimatedFeatures> {
+    // Determine n_docs from whichever block is present (numeric, text, embedding).
+    let n_docs = if let Some(col) = numeric.first() {
+        col.len()
+    } else if !texts.is_empty() {
+        texts.len()
+    } else {
+        embeddings.len()
+    };
+
+    // Inert when absent (D-04): nothing present -> empty layout.
+    if n_docs == 0 {
+        return Ok(MixedEstimatedFeatures::default());
+    }
+
+    // ---- Block 0: NUMERIC (existing columns, joined directly). ----
+    let mut columns: Vec<Vec<f32>> = Vec::new();
+    let mut numeric_feature_count = 0usize;
+    for col in numeric {
+        if col.len() != n_docs {
+            return Err(CbError::Degenerate(
+                "mixed features: numeric column length != n_docs".to_owned(),
+            ));
+        }
+        columns.push(col.clone());
+        numeric_feature_count += 1;
+    }
+
+    // ---- Block 1: TEXT (BoW, target-independent, Plan-03 seam). ----
+    let mut text_feature_count = 0usize;
+    if !texts.is_empty() {
+        if texts.len() != n_docs {
+            return Err(CbError::Degenerate(
+                "mixed features: texts length != n_docs".to_owned(),
+            ));
+        }
+        let bow = build_bow_estimated_features(texts, tokenizer_options, max_borders)?;
+        text_feature_count = bow.columns.len();
+        columns.extend(bow.columns);
+    }
+
+    // ---- Block 2: EMBEDDING (KNN, OFFLINE whole-set, Plan-06 seam). ----
+    let mut embedding_feature_count = 0usize;
+    if !embeddings.is_empty() {
+        if embeddings.len() != n_docs {
+            return Err(CbError::Degenerate(
+                "mixed features: embeddings length != n_docs".to_owned(),
+            ));
+        }
+        if targets.len() != n_docs {
+            return Err(CbError::Degenerate(
+                "mixed features: targets length != n_docs".to_owned(),
+            ));
+        }
+        let knn = offline_knn_features(embeddings, targets, num_classes, close_num, true)?;
+        embedding_feature_count = knn.len();
+        columns.extend(knn);
+    }
+
+    // Select borders for EVERY column through the EXISTING quantizer (SC-4 — no
+    // parallel quantizer). Numeric / BoW-presence / KNN-vote columns all share the
+    // same greedy-logsum border selection.
+    let borders: Vec<Vec<f64>> = columns
+        .iter()
+        .map(|col| {
+            let as_f64: Vec<f64> = col.iter().map(|&v| f64::from(v)).collect();
+            select_borders_greedy_logsum(&as_f64, max_borders, false)
+        })
+        .collect();
+
+    Ok(MixedEstimatedFeatures {
+        columns,
+        borders,
+        numeric_feature_count,
+        text_feature_count,
+        embedding_feature_count,
     })
 }

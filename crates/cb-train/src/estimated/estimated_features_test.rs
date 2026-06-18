@@ -8,7 +8,7 @@
 
 use cb_data::text::tokenizer::TokenizerOptions;
 
-use super::estimated_features::build_bow_estimated_features;
+use super::estimated_features::{build_bow_estimated_features, build_mixed_estimated_features};
 
 /// The frozen FEAT-01 corpus (mirrors
 /// `fixtures/text_embedding_inputs/texts.json`).
@@ -116,4 +116,142 @@ fn bow_word_block_presence_matches_unigram_dictionary() {
             "word feature {word_id} presence for doc 0 mismatch"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// SC-4 mixed text + embedding + numeric orchestration (06.5-07).
+// ---------------------------------------------------------------------------
+
+/// The frozen FEAT-01/02 binary labels (object order, mirrors `labels.npy`).
+fn labels() -> Vec<f32> {
+    // Interleaved class 1 / class 0 (pos/neg) over the 16-row corpus.
+    (0..16).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect()
+}
+
+/// A clean class-separating numeric column (mirrors `numeric.npy`): +1 / -1.
+fn numeric_col() -> Vec<f32> {
+    labels().iter().map(|&y| if y > 0.5 { 1.0 } else { -1.0 }).collect()
+}
+
+/// Two well-separated embedding clouds, one per class (signal for KNN votes).
+fn embeddings() -> Vec<Vec<f32>> {
+    labels()
+        .iter()
+        .map(|&y| {
+            if y > 0.5 {
+                vec![1.0, 1.0, -1.0, -1.0]
+            } else {
+                vec![-1.0, -1.0, 1.0, 1.0]
+            }
+        })
+        .collect()
+}
+
+/// Mixed inert when absent (D-04): no numeric, no text, no embeddings -> empty.
+#[test]
+fn mixed_empty_yields_no_features() {
+    let feats = build_mixed_estimated_features(
+        &[],
+        &[],
+        &[],
+        &[],
+        2,
+        3,
+        &TokenizerOptions::default(),
+        254,
+    )
+    .expect("empty mixed ok");
+    assert!(feats.columns.is_empty());
+    assert!(feats.borders.is_empty());
+    assert_eq!(feats.numeric_feature_count, 0);
+    assert_eq!(feats.text_feature_count, 0);
+    assert_eq!(feats.embedding_feature_count, 0);
+}
+
+/// Numeric-only pool: the estimated path is inert; only the numeric block exists,
+/// joined directly + quantized (D-04 — the existing numeric path is unchanged).
+#[test]
+fn mixed_numeric_only_is_inert_estimated_path() {
+    let num = numeric_col();
+    let feats = build_mixed_estimated_features(
+        &[num.clone()],
+        &[],
+        &[],
+        &labels(),
+        2,
+        3,
+        &TokenizerOptions::default(),
+        254,
+    )
+    .expect("numeric-only mixed ok");
+    assert_eq!(feats.numeric_feature_count, 1);
+    assert_eq!(feats.text_feature_count, 0);
+    assert_eq!(feats.embedding_feature_count, 0);
+    assert_eq!(feats.columns.len(), 1);
+    // The numeric column is passed through verbatim.
+    assert_eq!(feats.columns[0], num);
+    // A clean +1/-1 column quantizes to a single border at 0.0.
+    assert_eq!(feats.borders[0].len(), 1);
+    assert!((feats.borders[0][0] - 0.0).abs() <= 1e-9);
+}
+
+/// Mixed block layout: numeric block first, then BoW text block, then KNN
+/// embedding block — counts and total width add up, all columns span n_docs.
+#[test]
+fn mixed_block_layout_order_and_counts() {
+    let num = numeric_col();
+    let feats = build_mixed_estimated_features(
+        &[num],
+        &corpus(),
+        &embeddings(),
+        &labels(),
+        2,
+        3,
+        &TokenizerOptions::default(),
+        254,
+    )
+    .expect("mixed ok");
+    // 1 numeric + (25 BiGram + 8 Word = 33) BoW + 2 KNN class-vote columns.
+    assert_eq!(feats.numeric_feature_count, 1);
+    assert_eq!(feats.text_feature_count, 33);
+    assert_eq!(feats.embedding_feature_count, 2);
+    let total = feats.numeric_feature_count + feats.text_feature_count + feats.embedding_feature_count;
+    assert_eq!(feats.columns.len(), total);
+    assert_eq!(feats.borders.len(), total);
+
+    let n = corpus().len();
+    for col in &feats.columns {
+        assert_eq!(col.len(), n, "every mixed column spans all documents");
+    }
+
+    // Block 0 is the numeric column (verbatim, ±1).
+    assert_eq!(feats.columns[0], numeric_col());
+
+    // The KNN block (last 2 columns) holds integer per-class vote counts summing
+    // to k (=3) per document.
+    let knn_base = feats.numeric_feature_count + feats.text_feature_count;
+    for doc in 0..n {
+        let v0 = feats.columns[knn_base][doc];
+        let v1 = feats.columns[knn_base + 1][doc];
+        assert!((v0 + v1 - 3.0).abs() < 1e-6, "doc{doc} KNN votes sum to k");
+        assert_eq!(v0.fract(), 0.0, "doc{doc} KNN class0 vote is an integer count");
+    }
+}
+
+/// Length-mismatch robustness: a numeric column shorter than the text column is
+/// rejected with a typed error (no panic — V5/INFRA-02).
+#[test]
+fn mixed_rejects_length_mismatch() {
+    let short_num = vec![1.0_f32; 3];
+    let res = build_mixed_estimated_features(
+        &[short_num],
+        &corpus(),
+        &embeddings(),
+        &labels(),
+        2,
+        3,
+        &TokenizerOptions::default(),
+        254,
+    );
+    assert!(res.is_err(), "mismatched numeric column must be rejected");
 }

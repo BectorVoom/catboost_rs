@@ -48,7 +48,8 @@ pub use ctr::{
     SIMPLE_CLASSES_COUNT,
 };
 pub use estimated::estimated_features::{
-    build_bow_estimated_features, build_online_text_estimated_features, BowEstimatedFeatures,
+    build_bow_estimated_features, build_mixed_estimated_features,
+    build_online_text_estimated_features, BowEstimatedFeatures, MixedEstimatedFeatures,
     OnlineTextEstimatedFeatures,
 };
 pub use estimated::online_text::{
