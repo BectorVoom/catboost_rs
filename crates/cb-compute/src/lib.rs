@@ -69,7 +69,11 @@ pub use score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
     multi_dim_split_score, random_score_instance, score_st_dev, MINIMAL_SCORE,
 };
-pub use text_calcers::bag_of_words_compute;
+pub use text_calcers::{
+    bag_of_words_compute, bm25_compute, naive_bayes_compute, Bm25State, NaiveBayesState,
+    BM25_DEFAULT_B, BM25_DEFAULT_K, BM25_DEFAULT_TRUNCATE_BORDER, NAIVE_BAYES_DEFAULT_PRIOR,
+    NAIVE_BAYES_SEEN_TOKENS_PRIOR,
+};
 
 #[cfg(test)]
 mod histogram_test;
