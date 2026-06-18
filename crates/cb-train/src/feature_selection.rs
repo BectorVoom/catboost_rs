@@ -310,6 +310,19 @@ pub fn select_features<R: Runtime>(
         }
     }
 
+    // Invariant: the rounded elimination schedule must have removed exactly
+    // `n_to_eliminate_total` features. A rounding shortfall on adversarial
+    // cardinalities would otherwise silently return MORE survivors than
+    // requested; surface it as a typed error instead (WR-05). The in-scope
+    // oracle fixture meets the budget exactly, so this passes for it.
+    if eliminated_features.len() != n_to_eliminate_total {
+        return Err(CbError::Degenerate(format!(
+            "feature-selection schedule eliminated {} of {} (rounding shortfall)",
+            eliminated_features.len(),
+            n_to_eliminate_total
+        )));
+    }
+
     // Survivors among features_for_select, ascending (matches the sorted
     // `selectSet.Features` -> `summary.SelectedFeatures`).
     let mut selected_features: Vec<usize> = features_for_select
