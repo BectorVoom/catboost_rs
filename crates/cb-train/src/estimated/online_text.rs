@@ -216,16 +216,16 @@ pub fn online_text_prefix(
     let mut columns: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; width];
     let mut encoding_in_order: Vec<Vec<f64>> = Vec::with_capacity(n);
 
-    // Carry the accumulating prefix state for whichever calcer is active. Exactly
-    // one of these is `Some`; the other stays `None`. (Two narrow Options keep the
-    // state strongly typed without a trait object.)
-    let mut nb_state = match calcer {
-        OnlineTextCalcer::NaiveBayes => Some(NaiveBayesState::new(num_classes)),
-        OnlineTextCalcer::Bm25 => None,
-    };
-    let mut bm_state = match calcer {
-        OnlineTextCalcer::Bm25 => Some(Bm25State::new(num_classes)),
-        OnlineTextCalcer::NaiveBayes => None,
+    // Carry the accumulating prefix state for whichever calcer is active. An enum
+    // makes the invalid (both-None / both-Some) states unrepresentable, removing
+    // the per-iteration `Degenerate("missing ... state")` guards (IN-03).
+    enum ActiveState {
+        NaiveBayes(NaiveBayesState),
+        Bm25(Bm25State),
+    }
+    let mut active = match calcer {
+        OnlineTextCalcer::NaiveBayes => ActiveState::NaiveBayes(NaiveBayesState::new(num_classes)),
+        OnlineTextCalcer::Bm25 => ActiveState::Bm25(Bm25State::new(num_classes)),
     };
 
     for &doc_i in permutation {
@@ -242,19 +242,9 @@ pub fn online_text_prefix(
         };
 
         // COMPUTE from the prefix state (read-before-update, D-03).
-        let encoding: Vec<f64> = match calcer {
-            OnlineTextCalcer::NaiveBayes => {
-                let state = nb_state.as_ref().ok_or_else(|| {
-                    CbError::Degenerate("online_text_prefix: missing NaiveBayes state".to_owned())
-                })?;
-                naive_bayes_compute(state, text)?
-            }
-            OnlineTextCalcer::Bm25 => {
-                let state = bm_state.as_ref().ok_or_else(|| {
-                    CbError::Degenerate("online_text_prefix: missing BM25 state".to_owned())
-                })?;
-                bm25_compute(state, text)?
-            }
+        let encoding: Vec<f64> = match &active {
+            ActiveState::NaiveBayes(state) => naive_bayes_compute(state, text)?,
+            ActiveState::Bm25(state) => bm25_compute(state, text)?,
         };
 
         // Scatter the encoding OBJECT-indexed into the columns.
@@ -268,17 +258,9 @@ pub fn online_text_prefix(
         encoding_in_order.push(encoding);
 
         // THEN UPDATE with this document's label/text (learn set).
-        match calcer {
-            OnlineTextCalcer::NaiveBayes => {
-                if let Some(state) = nb_state.as_mut() {
-                    state.update(class, text);
-                }
-            }
-            OnlineTextCalcer::Bm25 => {
-                if let Some(state) = bm_state.as_mut() {
-                    state.update(class, text);
-                }
-            }
+        match &mut active {
+            ActiveState::NaiveBayes(state) => state.update(class, text),
+            ActiveState::Bm25(state) => state.update(class, text),
         }
     }
 
