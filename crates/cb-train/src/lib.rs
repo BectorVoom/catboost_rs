@@ -19,6 +19,7 @@ mod boosting;
 mod candidates;
 mod ctr;
 mod estimated;
+mod feature_selection;
 mod fold;
 mod metrics;
 mod overfit;
@@ -58,6 +59,9 @@ pub use estimated::online_text::{
 pub use estimated::online_embedding::{
     knn_feature_count, lda_projection_dim, offline_knn_features, offline_lda_features,
     online_knn_prefix, online_lda_prefix, OnlineKnnPrefix, OnlineLdaPrefix,
+};
+pub use feature_selection::{
+    select_features, EFeaturesSelectionAlgorithm, FeatureSelectionResult, ImportanceRanker,
 };
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
