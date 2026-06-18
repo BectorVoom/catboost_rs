@@ -1,0 +1,24 @@
+{
+  "catboost_version": "1.2.10",
+  "grow_policy": "Depthwise",
+  "params": {
+    "iterations": 2,
+    "learning_rate": 0.3,
+    "loss_function": "RMSE",
+    "grow_policy": "Depthwise",
+    "max_depth": 2,
+    "random_strength": 0,
+    "bootstrap_type": "No",
+    "thread_count": 1,
+    "random_seed": 42,
+    "feature_border_type": "GreedyLogSum",
+    "border_count": 32,
+    "leaf_estimation_iterations": 1,
+    "boost_from_average": false,
+    "allow_writing_files": false
+  },
+  "n_objects": 48,
+  "n_features": 2,
+  "seed": 42,
+  "note": "offline-generated from .venv catboost 1.2.10; SIMPLEST-Depthwise SPLITS preflight (FEAT-06, RESEARCH Open Question 1). All confounds (random_strength, bootstrap, CTR, threading, boost_from_average) pinned OFF to isolate the level-order draw stream. ESCALATE (D-6.6-11) to /tmp/cb_build313 instrumented trainer on divergence; never weaken."
+}

@@ -151,6 +151,69 @@ fn assert_non_symmetric_oracle(scenario: &str) {
     );
 }
 
+/// SPLITS-only preflight for the SIMPLEST possible Depthwise fixture
+/// (06.6-04 Task 1, RESEARCH §"Open Questions (RESOLVED)" Q1).
+///
+/// This is the FIRST hard non-symmetric gate and is deliberately authored BEFORE
+/// the leaf-wise grower (06.6-04 Task 2) lands, so any draw-stream divergence is
+/// caught the instant the grower is wired — not mid-grower. The fixture
+/// (`non_symmetric/depthwise_simplest/`, generated offline from catboost 1.2.10 by
+/// `gen_depthwise_simplest_fixture.py`) pins EVERY confound OFF — `random_strength=0`,
+/// `bootstrap_type='No'`, NO categorical features (no CTR), `thread_count=1`,
+/// `boost_from_average=False`, a pinned seed, and the SMALLEST non-trivial
+/// `max_depth=2` — so the ONLY thing that can make our SPLITS differ from upstream
+/// is the Depthwise level-order expansion / candidate-enumeration draw stream
+/// (RESEARCH Open Question 1).
+///
+/// Until the grower lands the loaded `.cbm` carries the upstream structure, so this
+/// asserts the structural decode contract; once 06.6-04 Task 2/3 wire the grower
+/// and the train→lift path, the SAME assertion locks our grower's SPLITS.
+///
+/// ESCALATION FALLBACK (D-6.6-11, escalate-don't-weaken): if this preflight diverges
+/// once the grower lands, the non-symmetric draw stream differs from upstream. The
+/// resolution is to ESCALATE to the persistent instrumented trainer
+/// (`/tmp/cb_build313` + clang-18; see RESEARCH §Environment Availability and the
+/// memory note "instrumented trainer toolchain persists") to capture the exact
+/// upstream draw order. NEVER loosen the tolerance, NEVER `#[ignore]` this test,
+/// NEVER fabricate splits. This empirical preflight is the early-warning realization
+/// of RESEARCH Open Question 1.
+#[test]
+fn depthwise_simplest_splits() {
+    let scenario = "depthwise_simplest";
+    let mj: ModelJson = load_model_json(&fixture(&format!("non_symmetric/{scenario}/model.json")))
+        .unwrap_or_else(|e| panic!("{scenario}/model.json must load: {e:?}"));
+    assert!(
+        mj.is_non_symmetric(),
+        "{scenario} fixture must be a non-symmetric (`trees`) model (Pitfall 3)"
+    );
+
+    let model = load_cbm(&fixture(&format!("non_symmetric/{scenario}/model.cbm")))
+        .unwrap_or_else(|e| panic!("{scenario}/model.cbm must load: {e:?}"));
+    assert!(
+        !model.non_symmetric_trees.is_empty(),
+        "{scenario} .cbm must decode into non_symmetric_trees"
+    );
+
+    // SPLITS FIRST (the first hard lock, Open Question 1): the interior-node split
+    // borders must match the upstream model.json borders, tree-for-tree.
+    let expected_splits = mj
+        .non_symmetric_split_borders()
+        .unwrap_or_else(|e| panic!("{scenario} split borders must extract: {e:?}"));
+    let actual_splits: Vec<f64> = model
+        .non_symmetric_trees
+        .iter()
+        .flat_map(|t| {
+            t.tree_splits
+                .iter()
+                .zip(t.step_nodes.iter())
+                .filter(|(_, &(l, r))| !(l == 0 && r == 0))
+                .filter_map(|(s, _)| s.as_float().map(|f| f.border))
+        })
+        .collect();
+    compare_stage(Stage::Splits, &expected_splits, &actual_splits)
+        .unwrap_or_else(|e| panic!("{scenario} SPLITS stage diverged: {e:?}"));
+}
+
 #[test]
 fn depthwise_non_symmetric_oracle_splits_first() {
     assert_non_symmetric_oracle("depthwise");
