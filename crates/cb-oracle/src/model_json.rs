@@ -418,6 +418,29 @@ impl ModelJson {
         Ok(out)
     }
 
+    /// Per-tree non-symmetric leaf values as a nested `Vec<Vec<f64>>` (one inner
+    /// vector per tree, in the JSON pre-order leaf-visitation order). The
+    /// `Stage::LeafValues` gate compares the SORTED multiset of each tree's values
+    /// (FEAT-06, 06.6-05 reconciliation), because the upstream `.cbm` flat
+    /// `LeafValues` and the `model.json` nested `"trees"` form store the SAME
+    /// distinct leaf values in DIFFERENT physical orders AND with structurally
+    /// different node graphs (the json fully expands every leaf into its own
+    /// `(0, 0)` node; the `.cbm` compresses one-sided halts into `(d, 0)` /
+    /// `(0, d)` nodes). The value MULTISET is the representation-independent
+    /// invariant — identical iff the two models carry the same leaf values — while
+    /// the per-object apply equivalence is locked separately by the
+    /// `Stage::StagedApprox` / `Stage::Predictions` gates (the same "node order is
+    /// a representation detail" decision 06.6-04 made for `Stage::Splits`).
+    ///
+    /// # Errors
+    /// [`OracleError::MalformedModel`] from flattening.
+    pub fn non_symmetric_leaf_values_per_tree(&self) -> Result<Vec<Vec<f64>>, OracleError> {
+        self.non_symmetric_flat_trees()?
+            .into_iter()
+            .map(|t| Ok(t.leaf_values))
+            .collect()
+    }
+
     /// Per-tree leaf weights as a nested `Vec<Vec<f64>>` (one inner vector per
     /// tree, RESEARCH Pitfall 2). Trees whose fixture predates the
     /// `leaf_weights` regeneration yield an empty inner vector (the

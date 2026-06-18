@@ -158,6 +158,10 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     // all-oblivious or all-non-symmetric (upstream never mixes policies).
     if !model.non_symmetric_trees.is_empty() {
         let mut node_offset: i32 = 0;
+        // Running flat-LeafValues cursor (value units) — the GLOBAL base each
+        // tree's LOCAL leaf ids re-globalize against (the inverse of the decode
+        // localization). `value_base` advances by `distinct_leaves * dim` per tree.
+        let mut value_base: usize = 0;
         for tree in &model.non_symmetric_trees {
             let node_count = i32::try_from(tree.tree_splits.len()).map_err(|_| {
                 ModelError::SchemaVersion("non-symmetric node count exceeds i32".to_owned())
@@ -169,9 +173,9 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
             })?;
 
             for (idx, split) in tree.tree_splits.iter().enumerate() {
-                let is_leaf = matches!(tree.step_nodes.get(idx), Some(&(0, 0)) | None);
-                if is_leaf {
-                    // Leaf nodes serialize a filler global split index `0`
+                let is_pure_leaf = matches!(tree.step_nodes.get(idx), Some(&(0, 0)) | None);
+                if is_pure_leaf {
+                    // Pure leaf nodes serialize a filler global split index `0`
                     // (verified upstream layout); the apply walk never reads it.
                     tree_splits.push(0);
                 } else if let Some(float_split) = split.as_float() {
@@ -184,14 +188,31 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
                 non_symmetric_step_nodes
                     .push(TNonSymmetricTreeStepNode::new(left_diff, right_diff));
             }
-            non_symmetric_node_ids.extend_from_slice(&tree.node_id_to_leaf_id);
 
-            // Distinct leaves = count of terminal (0,0) step nodes.
+            // Distinct leaves = count of nodes carrying a VALID (non-`u32::MAX`)
+            // leaf id (halt points, including one-sided `(d, 0)` / `(0, d)` nodes —
+            // `evaluator_impl.cpp:738` halts whenever the chosen diff is 0). The
+            // decode stores these ids LOCAL (0-based per tree); re-globalize each to
+            // the flat `LeafValues` index `value_base + local_leaf * dim`.
             let distinct_leaves = tree
-                .step_nodes
+                .node_id_to_leaf_id
                 .iter()
-                .filter(|&&(l, r)| l == 0 && r == 0)
+                .filter(|&&id| id != u32::MAX)
                 .count();
+            for &local_id in &tree.node_id_to_leaf_id {
+                if local_id == u32::MAX {
+                    non_symmetric_node_ids.push(u32::MAX);
+                } else {
+                    let global = value_base
+                        + (local_id as usize).saturating_mul(dim.max(1));
+                    non_symmetric_node_ids.push(u32::try_from(global).map_err(|_| {
+                        ModelError::SchemaVersion(
+                            "non-symmetric global leaf id exceeds u32".to_owned(),
+                        )
+                    })?);
+                }
+            }
+
             let n_leaves = if dim == 0 { 0 } else { distinct_leaves };
             for l in 0..n_leaves {
                 for d in 0..dim {
@@ -205,6 +226,7 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
                 }
             }
             leaf_weights.extend_from_slice(&tree.leaf_weights);
+            value_base = value_base.saturating_add(n_leaves.saturating_mul(dim.max(1)));
         }
     }
 
@@ -682,8 +704,16 @@ fn reconstruct_non_symmetric(
 
     let mut out = Vec::with_capacity(tree_sizes.len());
     let mut node_cursor: usize = 0;
-    let mut value_cursor: usize = 0; // stride: distinct_leaves * dim
-    let mut weight_cursor: usize = 0; // stride: distinct_leaves
+    // The non-symmetric `NonSymmetricNodeIdToLeafId` entries are GLOBAL indices
+    // into the FLAT, LEAF-MAJOR `LeafValues` array (`evaluator_impl.cpp:742-751`:
+    // `firstValueIdx = NodeIdToLeafId[index]; result += LeafValues[firstValueIdx
+    // + classId]`), so they are value-unit indices (`leaf_index * dim`). We slice
+    // each tree's leaves out of that flat array and LOCALIZE the per-node leaf id
+    // to a 0-based LEAF index within the tree (`(global - value_base) / dim`), so
+    // the per-tree `node_id_to_leaf_id` indexes the per-tree un-transposed
+    // DIMENSION-MAJOR `leaf_values` directly at apply time.
+    let mut value_cursor: usize = 0; // start of this tree in flat LeafValues (value units)
+    let mut weight_cursor: usize = 0; // start of this tree in LeafWeights (leaf units)
 
     for ti in 0..tree_sizes.len() {
         let node_count = usize::try_from(tree_sizes.get(ti)).map_err(|_| {
@@ -693,7 +723,16 @@ fn reconstruct_non_symmetric(
         let mut node_splits: Vec<crate::ModelSplit> = Vec::with_capacity(node_count);
         let mut node_steps: Vec<(u16, u16)> = Vec::with_capacity(node_count);
         let mut node_leaf_ids: Vec<u32> = Vec::with_capacity(node_count);
+        // A node is a HALT point (carries a real leaf value) when EITHER subtree
+        // diff is 0 (`evaluator_impl.cpp:738` halts when the chosen `diff == 0`),
+        // i.e. a node with a one-sided `(d, 0)` / `(0, d)` step still terminates
+        // the walk on the zero side. Such a node has a VALID (non-`u32::MAX`)
+        // `NonSymmetricNodeIdToLeafId` slot. The number of distinct leaf slots in
+        // this tree is the count of valid entries.
         let mut distinct_leaves: usize = 0;
+        // Track the tree's leaf-id span so we can validate contiguity and derive
+        // the local 0-based leaf index.
+        let mut min_global_value: Option<usize> = None;
 
         for off in 0..node_count {
             let global_node = node_cursor.checked_add(off).ok_or_else(|| {
@@ -712,12 +751,25 @@ fn reconstruct_non_symmetric(
             node_steps.push((left_diff, right_diff));
 
             let raw_leaf_id = node_id_to_leaf_id.get(global_node);
-            node_leaf_ids.push(raw_leaf_id);
-            let is_leaf = left_diff == 0 && right_diff == 0;
-            if is_leaf {
+            // A `u32::MAX` slot marks a pure-interior node (both subtrees non-zero):
+            // the walk can never halt there, so it carries no leaf value. Any other
+            // value is a GLOBAL flat-LeafValues index (value units).
+            let is_halt_node = raw_leaf_id != u32::MAX;
+            if is_halt_node {
                 distinct_leaves = distinct_leaves.saturating_add(1);
-                // A leaf node stores a filler split (global index `0` upstream);
-                // the apply walk never reads it. Keep a sentinel placeholder.
+                let gv = usize::try_from(raw_leaf_id).map_err(|_| {
+                    ModelError::Deserialize("non-symmetric leaf id exceeds usize".to_owned())
+                })?;
+                min_global_value =
+                    Some(min_global_value.map_or(gv, |m: usize| m.min(gv)));
+            }
+
+            // Every node carries a split slot. A halt node MAY also be interior on
+            // its non-zero side (a `(d, 0)` node both halts-right and branches-left),
+            // so we decode the split for ANY node whose declared split index is a
+            // valid bin; a pure leaf (no real split) keeps a sentinel placeholder.
+            let is_pure_leaf = left_diff == 0 && right_diff == 0;
+            if is_pure_leaf {
                 node_splits.push(crate::ModelSplit::Float(Split {
                     feature: 0,
                     border: f64::NEG_INFINITY,
@@ -739,6 +791,35 @@ fn reconstruct_non_symmetric(
             }
         }
         node_cursor = node_cursor.saturating_add(node_count);
+
+        // The tree's leaf values occupy `distinct_leaves * dim` flat slots starting
+        // at the running `value_cursor` (the leaf-major flat layout). Localize each
+        // node's GLOBAL value index to a 0-based LEAF index within this tree:
+        // `local_leaf = (global_value - value_base) / dim`. The flat array is
+        // contiguous per tree, so the minimum observed global value MUST equal the
+        // running cursor (validated below).
+        let value_base = min_global_value.unwrap_or(value_cursor);
+        if value_base != value_cursor {
+            return Err(ModelError::Deserialize(format!(
+                "non-symmetric tree {ti} leaf-id base {value_base} does not match \
+                 expected flat-LeafValues cursor {value_cursor}"
+            )));
+        }
+        // Build the LOCAL per-node leaf ids (0-based leaf index within the tree;
+        // `u32::MAX` for pure-interior nodes that never halt).
+        for off in 0..node_count {
+            let global_node = node_cursor.saturating_sub(node_count).saturating_add(off);
+            let raw_leaf_id = node_id_to_leaf_id.get(global_node);
+            if raw_leaf_id == u32::MAX {
+                node_leaf_ids.push(u32::MAX);
+            } else {
+                let gv = usize::try_from(raw_leaf_id).unwrap_or(0);
+                let local_leaf = gv.saturating_sub(value_base) / dim.max(1);
+                node_leaf_ids.push(u32::try_from(local_leaf).map_err(|_| {
+                    ModelError::Deserialize("local non-symmetric leaf id exceeds u32".to_owned())
+                })?);
+            }
+        }
 
         // Slice this tree's leaves (un-transpose LEAF-MAJOR → DIMENSION-MAJOR).
         let (tree_values, tree_weights) = read_tree_leaves(

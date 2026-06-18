@@ -214,16 +214,74 @@ fn leaf_index_for(model: &Model, tree: &crate::ObliviousTree, features: &[f32], 
     leaf_index(&passes)
 }
 
-/// Apply every oblivious tree to one object and accumulate `bias + Σ_trees
-/// leaf_values[leaf]` (Steps B + C). The per-tree leaf contributions are summed
-/// host-side through [`sum_f64`] (D-08); `bias` is added exactly once afterward
-/// (RESEARCH Pitfall 6).
+/// The flat-node pointer-walk leaf index of one object in one NON-SYMMETRIC
+/// (Lossguide / Depthwise) tree (FEAT-06, RESEARCH Pattern 1, transcribing
+/// `evaluator_impl.cpp:726-742`).
+///
+/// Starts at the tree-local node `0`, and at each node takes
+/// `diff = passes_split(node) ? right_subtree_diff : left_subtree_diff`, advances
+/// `index = index + diff` (i64 arithmetic — T-06.6-13), and HALTS as soon as the
+/// chosen `diff == 0` (the `TerminalMarker`; a one-sided `(d, 0)` / `(0, d)` node
+/// halts on its zero side). The halted node's per-node `node_id_to_leaf_id` entry
+/// (LOCAL, 0-based within this tree — see the decode in `cbm.rs`) is the leaf
+/// index returned. Returns `None` for a malformed graph (out-of-range index,
+/// missing split, an interior `u32::MAX` leaf slot, or a non-terminating walk),
+/// so the caller contributes `0.0` rather than panicking (T-06.6-12 — no OOB, no
+/// infinite loop on crafted input).
+///
+/// ALL node access is checked `.get` (`indexing_slicing` deny); the walk is bounded
+/// by `node_count` iterations so a cyclic / escaping graph cannot loop forever.
+fn leaf_index_nonsym(
+    model: &Model,
+    tree: &crate::NonSymmetricTree,
+    features: &[f32],
+    cat_values: &[String],
+) -> Option<usize> {
+    let node_count = tree.step_nodes.len();
+    let mut index: i64 = 0;
+    // Hard upper bound: a valid walk visits each node at most once, so more than
+    // `node_count` steps means a cyclic / malformed graph — reject (no infinite
+    // loop, T-06.6-12).
+    for _ in 0..=node_count {
+        let idx = usize::try_from(index).ok()?;
+        // Validate index < node_count via checked `.get` (T-06.6-13).
+        let &(left_diff, right_diff) = tree.step_nodes.get(idx)?;
+        let split = tree.tree_splits.get(idx)?;
+        let diff: i64 = if passes_split(model, split, features, cat_values) {
+            i64::from(right_diff)
+        } else {
+            i64::from(left_diff)
+        };
+        index = index.checked_add(diff)?;
+        if diff == 0 {
+            // Halt: read this node's LOCAL leaf id (a `u32::MAX` here marks a
+            // pure-interior node that should never be a halt point → malformed).
+            let leaf_id = *tree.node_id_to_leaf_id.get(idx)?;
+            if leaf_id == u32::MAX {
+                return None;
+            }
+            return usize::try_from(leaf_id).ok();
+        }
+    }
+    None
+}
+
+/// Apply every tree to one object and accumulate `bias + Σ_trees
+/// leaf_values[leaf]` (Steps B + C), branching per-tree on the model's tree
+/// VARIANT (D-6.6-05): an oblivious model walks `oblivious_trees` via the EXISTING
+/// forward-bit-order [`leaf_index_for`] (BYTE-IDENTICAL); a non-symmetric model
+/// walks `non_symmetric_trees` via the pointer-walk [`leaf_index_nonsym`]. A model
+/// is EITHER all-oblivious or all-non-symmetric, so exactly one loop contributes.
+///
+/// The per-tree leaf contributions are summed host-side through [`sum_f64`] (D-08);
+/// `bias` is added exactly once afterward (RESEARCH Pitfall 6).
 ///
 /// `features` is the object's contiguous float-feature row; `cat_values` its raw
 /// categorical values (empty for the numeric-only apply path, where no CTR split
 /// is ever evaluated — the `ModelSplit::Float` path is byte-for-byte unchanged).
 fn predict_raw_one(model: &Model, features: &[f32], cat_values: &[String]) -> f64 {
-    let leaf_contributions: Vec<f64> = model
+    // Oblivious arm: the existing forward-bit-order path, BYTE-IDENTICAL (D-6.6-05).
+    let oblivious: Vec<f64> = model
         .oblivious_trees
         .iter()
         .map(|tree| {
@@ -234,8 +292,19 @@ fn predict_raw_one(model: &Model, features: &[f32], cat_values: &[String]) -> f6
             tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
         })
         .collect();
+    // Non-symmetric arm: the flat-node pointer-walk (FEAT-06). Empty for an
+    // oblivious model, so this contributes nothing there.
+    let non_symmetric: Vec<f64> = model
+        .non_symmetric_trees
+        .iter()
+        .map(|tree| {
+            leaf_index_nonsym(model, tree, features, cat_values)
+                .and_then(|leaf| tree.leaf_values.get(leaf).copied())
+                .unwrap_or(0.0)
+        })
+        .collect();
     // Σ_trees via the order-locked sum (D-08), THEN + bias exactly once.
-    model.bias + sum_f64(&leaf_contributions)
+    model.bias + sum_f64(&oblivious) + sum_f64(&non_symmetric)
 }
 
 /// Apply `model` to a numeric feature view, returning the per-object
@@ -427,8 +496,10 @@ fn predict_raw_multi_cat(
 
         // Per dimension, accumulate this object's per-tree leaf values through the
         // order-locked sum (D-08), then the seeded `bias` already holds the +bias.
+        // A model is EITHER all-oblivious or all-non-symmetric, so exactly one of
+        // the two arms contributes (D-6.6-05); the oblivious arm is byte-identical.
         for d in 0..dim {
-            let contributions: Vec<f64> = model
+            let mut contributions: Vec<f64> = model
                 .oblivious_trees
                 .iter()
                 .map(|tree| {
@@ -443,6 +514,19 @@ fn predict_raw_multi_cat(
                         .unwrap_or(0.0)
                 })
                 .collect();
+            // Non-symmetric arm: the flat-node pointer-walk, reading the
+            // DIMENSION-MAJOR per-tree `leaf_values` at `d * n_leaves + leaf`
+            // (FEAT-06; empty for an oblivious model).
+            contributions.extend(model.non_symmetric_trees.iter().map(|tree| {
+                let n_leaves = tree.leaf_values.len() / dim.max(1);
+                leaf_index_nonsym(model, tree, &row, &cats)
+                    .and_then(|leaf| {
+                        tree.leaf_values
+                            .get(d.saturating_mul(n_leaves).saturating_add(leaf))
+                            .copied()
+                    })
+                    .unwrap_or(0.0)
+            }));
             if let Some(slot) = out.get_mut(d.saturating_mul(n).saturating_add(obj)) {
                 *slot += sum_f64(&contributions);
             }

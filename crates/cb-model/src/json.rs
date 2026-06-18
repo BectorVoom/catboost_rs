@@ -331,41 +331,58 @@ fn collect_preorder<'a>(
 /// emitted as a zero leaf rather than panicking — the EXPORT path never trusts a
 /// hostile in-memory model into an OOB index (the loader is the validating side).
 fn unflatten_non_symmetric(tree: &NonSymmetricTree) -> NonSymmetricNodeJson {
+    // A synthetic LEAF node carrying the value/weight at this node's LOCAL leaf id.
+    // Used both for pure `(0, 0)` leaves AND for the halting side of a one-sided
+    // `(d, 0)` / `(0, d)` node (the `.cbm` compresses one-sided halts; the nested
+    // json form must EXPAND them into a real leaf child, since a json node cannot
+    // be both a leaf and an interior split, RESEARCH Pitfall 3).
+    fn leaf_at(tree: &NonSymmetricTree, id: usize) -> NonSymmetricNodeJson {
+        let leaf_id = tree.node_id_to_leaf_id.get(id).map_or(0usize, |&l| l as usize);
+        NonSymmetricNodeJson {
+            split: None,
+            left: None,
+            right: None,
+            value: Some(tree.leaf_values.get(leaf_id).copied().unwrap_or(0.0)),
+            weight: Some(tree.leaf_weights.get(leaf_id).copied().unwrap_or(0.0)),
+        }
+    }
+
     fn build(tree: &NonSymmetricTree, id: usize, depth: usize) -> NonSymmetricNodeJson {
-        let leaf = |tree: &NonSymmetricTree, id: usize| -> NonSymmetricNodeJson {
-            let leaf_id = tree
-                .node_id_to_leaf_id
-                .get(id)
-                .map_or(0usize, |&l| l as usize);
-            NonSymmetricNodeJson {
-                split: None,
-                left: None,
-                right: None,
-                value: Some(tree.leaf_values.get(leaf_id).copied().unwrap_or(0.0)),
-                weight: Some(tree.leaf_weights.get(leaf_id).copied().unwrap_or(0.0)),
-            }
-        };
         if depth > MAX_NON_SYMMETRIC_DEPTH {
-            return leaf(tree, id);
+            return leaf_at(tree, id);
         }
         match tree.step_nodes.get(id) {
-            Some(&(0, 0)) | None => leaf(tree, id),
+            // Pure leaf (both diffs 0): the walk halts here unconditionally.
+            Some(&(0, 0)) | None => leaf_at(tree, id),
             Some(&(left_diff, right_diff)) => {
-                let split = tree.tree_splits.get(id).and_then(ModelSplit::as_float);
-                let Some(split) = split else {
-                    return leaf(tree, id);
+                let Some(split) = tree.tree_splits.get(id).and_then(ModelSplit::as_float) else {
+                    return leaf_at(tree, id);
                 };
-                let left_id = id.saturating_add(left_diff as usize);
-                let right_id = id.saturating_add(right_diff as usize);
+                let split_json = SplitJson {
+                    border: split.border,
+                    float_feature_index: i64::try_from(split.feature).unwrap_or(i64::MAX),
+                    split_index: i64::try_from(id).unwrap_or(i64::MAX),
+                    split_type: "FloatFeature".to_owned(),
+                };
+                // The apply walk takes `diff = passes ? right_diff : left_diff`,
+                // advances `id += diff`, and HALTS when the chosen diff is `0`,
+                // reading THIS node's leaf id. So a `0` diff on a side means that
+                // side's child IS this node's leaf (a synthetic expanded leaf in the
+                // nested form); a non-zero diff descends to `id + diff`.
+                let left_child = if left_diff == 0 {
+                    leaf_at(tree, id)
+                } else {
+                    build(tree, id.saturating_add(left_diff as usize), depth + 1)
+                };
+                let right_child = if right_diff == 0 {
+                    leaf_at(tree, id)
+                } else {
+                    build(tree, id.saturating_add(right_diff as usize), depth + 1)
+                };
                 NonSymmetricNodeJson {
-                    split: Some(SplitJson {
-                        border: split.border,
-                        float_feature_index: i64::try_from(split.feature).unwrap_or(i64::MAX),
-                        split_index: i64::try_from(id).unwrap_or(i64::MAX),
-                        split_type: "FloatFeature".to_owned(),
-                    }),
-                    left: Some(Box::new(build(tree, left_id, depth + 1))),
-                    right: Some(Box::new(build(tree, right_id, depth + 1))),
+                    split: Some(split_json),
+                    left: Some(Box::new(left_child)),
+                    right: Some(Box::new(right_child)),
                     value: None,
                     weight: None,
                 }
