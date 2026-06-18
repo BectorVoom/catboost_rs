@@ -152,6 +152,14 @@ AC="${CB_SRC}/catboost/private/libs/algo/approx_calcer.cpp"
 YR="${CB_SRC}/catboost/private/libs/algo/yetirank_helpers.cpp"
 EF="${CB_SRC}/catboost/private/libs/algo_helpers/error_functions.cpp"
 
+# --- Phase 06.5 (Plan 06.5-01): text & embedding pipeline hook targets ---
+TOK="${CB_SRC}/catboost/private/libs/text_processing/tokenizer.cpp"
+DICT="${CB_SRC}/library/cpp/text_processing/dictionary/dictionary_builder.cpp"
+TXTH="${CB_SRC}/catboost/private/libs/data_types/text.h"
+BTFE="${CB_SRC}/catboost/private/libs/feature_estimator/base_text_feature_estimator.h"
+LDA="${CB_SRC}/catboost/private/libs/embedding_features/lda.cpp"
+KNN="${CB_SRC}/catboost/private/libs/embedding_features/knn.cpp"
+
 # Inert-when-unset sink helper, written to a temp FILE (never passed through
 # `awk -v`, which mangles backslash escapes — the 06.3-10 Task-1 RULE-1 bug).
 SINK_FILE="$(mktemp /tmp/cb_sink.XXXXXX.cpp)"
@@ -276,6 +284,183 @@ if [ -f "${EF}" ]; then
     fi
 else
     step "  (algo_helpers/error_functions.cpp absent — StochasticRank noise hook skipped)"
+fi
+
+# --------------------------------------------------------------------------
+# STEP 3bis — Phase 06.5 (Plan 06.5-01) text & embedding pipeline hooks
+#   7 env-gated (CB_INSTRUMENT_LOG-only, no-op when unset) JSONL surfaces:
+#     token_stream    tokenizer.cpp::Tokenize           per-text post-split token list
+#     dict_ids        dictionary_builder.cpp::Finish    per-dict (token-string -> id, count)
+#     ttext           text.h::TText(TVector<ui32>&&)     per-document (tokenId,count) RLE list
+#     calcer_encoding base_text_feature_estimator.h      per-document per-calcer encoding row
+#     online_order    base_text_feature_estimator.h      learnPermutation visiting order
+#     lda_projection  lda.cpp::CalculateProjection       LDA projection matrix
+#     knn_neighbors   knn.cpp::Compute                   KNN per-query neighbor id list
+#
+#   .cpp targets (tokenizer/dict/lda/knn) reuse the CbInstrumentLog sink. The two
+#   HEADER targets (text.h, base_text_feature_estimator.h) cannot rely on the sink
+#   TU helper being in scope, so they emit through a SELF-CONTAINED inline
+#   env-gated std::fopen-append lambda (CbInstr065*) — identical no-op-when-unset
+#   semantics, 17-sig-digit floats via %.17g.
+# --------------------------------------------------------------------------
+step "STEP 3bis: text/embedding pipeline hooks (06.5-01)"
+
+# 3bis-a. token_stream — post-split/post-lowercase token list per text (tokenizer.cpp).
+if [ -f "${TOK}" ]; then
+    ensure_sink "${TOK}"
+    if ! grep -q 'cb_instr_tokstream' "${TOK}"; then
+        # Hook the end of Tokenize(): the View holds the final token sequence in both
+        # NeedToModifyTokens branches. Emit a JSON array of the token strings, INSIDE
+        # the function (before its closing brace). The JSON quote chars are written as
+        # raw-string literals R"J(")J" — a `\"`-escaped form is mangled by perl's
+        # single-quote -e into a bare `"""` (06.5-01 RULE-1 fix #1: file-scope insert +
+        # mangled quotes both produced "expected unqualified-id").
+        perl -0777 -pi -e '
+            s{(        TokenizerImpl\.TokenizeWithoutCopy\(inputString, &tokens->View\);\n    \}\n)\}}{$1    /* cb_instr_tokstream (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"token_stream","tokens":[)J"); for (size_t cbI = 0; cbI < tokens->View.size(); ++cbI) { if (cbI) cbLine += ","; std::string cbT(tokens->View[cbI].data(), tokens->View[cbI].size()); std::string cbEsc; for (char cbC : cbT) { if (cbC == 92 || cbC == 34) { cbEsc += 92; } cbEsc += cbC; } cbLine += std::string(R"J(")J") + cbEsc + R"J(")J"; } cbLine += "]}"; CbInstrumentLog(cbLine); }\n}}s;
+        ' "${TOK}" || step "  (token_stream hook not matched; recorded)"
+        grep -q 'cb_instr_tokstream' "${TOK}" \
+            && step "  patched token_stream hook into tokenizer.cpp" \
+            || step "  (token_stream hook NOT applied — anchor missing; recorded)"
+    fi
+fi
+
+# 3bis-b. dict_ids — (token-string -> id, count) per dictionary after sort/filter/truncate.
+if [ -f "${DICT}" ]; then
+    ensure_sink "${DICT}"
+    if ! grep -q 'cb_instr_dictids' "${DICT}"; then
+        # In TUnigramDictionaryBuilderImpl::FinishBuilding, the sorted/truncated loop
+        # assigns globalTokenId in (count DESC, token ASC) order. Emit the full table
+        # right after the assign loop (before IdToToken reserve).
+        perl -0777 -pi -e '
+            s{(        TokenToId\.emplace\(tokens\[indices\[i\]\], globalTokenId\+\+\);\n            IdToCount\.emplace_back\(counts\[indices\[i\]\]\);\n        \}\n)}{$1        /* cb_instr_dictids (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"dict_ids","gram_order":)J") + std::to_string((long long)DictionaryOptions.GramOrder) + R"J(,"entries":[)J"; for (ui32 cbI = 0; cbI < finalDictonarySize; ++cbI) { if (cbI) cbLine += ","; std::string cbT(tokens[indices[cbI]].data(), tokens[indices[cbI]].size()); std::string cbEsc; for (char cbC : cbT) { if (cbC == 92 || cbC == 34) { cbEsc += 92; } cbEsc += cbC; } cbLine += std::string(R"J({"token":")J") + cbEsc + R"J(","id":)J" + std::to_string((long long)(DictionaryOptions.StartTokenId + cbI)) + R"J(,"count":)J" + std::to_string((unsigned long long)counts[indices[cbI]]) + "}"; } cbLine += "]}"; CbInstrumentLog(cbLine); }\n}s;
+        ' "${DICT}" || step "  (dict_ids hook not matched; recorded)"
+        step "  patched dict_ids hook into dictionary_builder.cpp"
+    fi
+fi
+
+# Self-contained inline sink for HEADER targets (no TU helper in scope).
+# Idempotent: only inserted once per header, right after the first #include block.
+# The sink body is wrapped in an #ifndef CB_INSTR065_SINK_DEFINED include guard:
+# base_text_feature_estimator.h transitively includes text.h in the SAME TU, so
+# WITHOUT the guard the two anonymous-namespace definitions collide ("redefinition
+# of CbInstr065Log" — 06.5-01 RULE-1 fix #2). The guard yields exactly one
+# definition per TU regardless of how many sink-carrying headers it pulls in.
+ensure_header_sink() {
+    local file="$1"
+    [ -f "${file}" ] || fail "STEP 3bis header target missing: ${file}"
+    if grep -q 'CbInstr065Log' "${file}"; then
+        step "  header sink already present in $(basename "${file}") — skipping"
+        return 0
+    fi
+    local tmp; tmp="$(mktemp)"
+    awk '
+        BEGIN { inserted=0 }
+        {
+            print
+            if (!inserted && $0 ~ /^#include/) {
+                # insert immediately after the FIRST include — valid C++ TU-wide.
+                print "// === CB_INSTRUMENT_LOG header sink (06.5-01, env-gated, inert when unset) ==="
+                print "#ifndef CB_INSTR065_SINK_DEFINED"
+                print "#define CB_INSTR065_SINK_DEFINED"
+                print "#include <cstdio>"
+                print "#include <cstdlib>"
+                print "#include <string>"
+                print "namespace { inline void CbInstr065Log(const std::string& cbLine) {"
+                print "    const char* cbPath = std::getenv(\"CB_INSTRUMENT_LOG\");"
+                print "    if (cbPath == nullptr) { return; }"
+                print "    std::FILE* cbF = std::fopen(cbPath, \"a\");"
+                print "    if (cbF != nullptr) { std::fputs(cbLine.c_str(), cbF); std::fputc(10, cbF); std::fclose(cbF); }"
+                print "} inline std::string CbInstr065Fmt17(double v) { char b[64]; std::snprintf(b, sizeof(b), \"%.17g\", v); return std::string(b); } }"
+                print "#endif"
+                print "// === end CB_INSTRUMENT_LOG header sink ==="
+                inserted=1
+            }
+        }
+    ' "${file}" > "${tmp}" && mv "${tmp}" "${file}"
+    step "  inserted header sink into $(basename "${file}")"
+}
+
+# 3bis-c. ttext — per-document (tokenId,count) list (text.h TText constructor).
+if [ -f "${TXTH}" ]; then
+    ensure_header_sink "${TXTH}"
+    if ! grep -q 'cb_instr_ttext' "${TXTH}"; then
+        # Hook the end of TText(TVector<ui32>&&): TokenToCount now holds the sorted RLE.
+        perl -0777 -pi -e '
+            s{(        TText\(TVector<ui32>&& tokenIds\) \{\n            Sort\(tokenIds\);\n            for \(const auto& tokenId : tokenIds\) \{\n                if \(TokenToCount\.empty\(\) \|\| TokenToCount\.back\(\)\.Token\(\) != tokenId\) \{\n                    TokenToCount\.push_back\(TTokenToCountPair\{TTokenId\(tokenId\), 1\}\);\n                \} else \{\n                    TokenToCount\.back\(\)\.IncreaseCount\(\);\n                \}\n            \}\n        \})}{        TText(TVector<ui32>&& tokenIds) {\n            Sort(tokenIds);\n            for (const auto& tokenId : tokenIds) {\n                if (TokenToCount.empty() || TokenToCount.back().Token() != tokenId) {\n                    TokenToCount.push_back(TTokenToCountPair{TTokenId(tokenId), 1});\n                } else {\n                    TokenToCount.back().IncreaseCount();\n                }\n            }\n            /* cb_instr_ttext (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"ttext","pairs":[)J"); for (size_t cbI = 0; cbI < TokenToCount.size(); ++cbI) { if (cbI) cbLine += ","; cbLine += std::string("[") + std::to_string((long long)(ui32)TokenToCount[cbI].Token()) + "," + std::to_string((long long)TokenToCount[cbI].Count()) + "]"; } cbLine += "]}"; CbInstr065Log(cbLine); }\n        }}s;
+        ' "${TXTH}" || step "  (ttext hook not matched; recorded)"
+        step "  patched ttext hook into text.h"
+    fi
+fi
+
+# 3bis-d + 3bis-e. calcer_encoding + online_order (base_text_feature_estimator.h).
+if [ -f "${BTFE}" ]; then
+    ensure_header_sink "${BTFE}"
+    if ! grep -q 'cb_instr_online_order' "${BTFE}"; then
+        # online_order: insert the dump on its own line immediately BEFORE the unique
+        # `for (ui64 line : learnPermutation) {` loop header. Single-line anchor (the
+        # multi-line slurp pattern was whitespace-fragile — 06.5-01 RULE-1 fix).
+        perl -pi -e '
+            if (!$cb_oo_done && /^(\s*)for \(ui64 line : learnPermutation\) \{\s*$/) {
+                my $ind = $1;
+                print $ind . q{/* cb_instr_online_order (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbOrd = std::string(R"J({"event":"online_order","perm":[)J"); for (size_t cbI = 0; cbI < learnPermutation.size(); ++cbI) { if (cbI) cbOrd += ","; cbOrd += std::to_string((long long)learnPermutation[cbI]); } cbOrd += "]}"; CbInstr065Log(cbOrd); }} . "\n";
+                $cb_oo_done = 1;
+            }
+        ' "${BTFE}" || step "  (online_order hook not matched; recorded)"
+        grep -q 'cb_instr_online_order' "${BTFE}" \
+            && step "  patched online_order hook into base_text_feature_estimator.h" \
+            || step "  (online_order hook NOT applied — anchor missing; recorded)"
+    fi
+    if ! grep -q 'cb_instr_calcer_encoding' "${BTFE}"; then
+        # calcer_encoding: insert AFTER the unique `featureCalcer.Compute(text,
+        # outputFeaturesIterator);` line; read back the column-major row just written.
+        perl -pi -e '
+            print;
+            $_ = "";
+            if (!$cb_ce_done && $cb_prev =~ /^(\s*)featureCalcer\.Compute\(text, outputFeaturesIterator\);\s*$/) {
+                my $ind = $1;
+                $_ = $ind . q{/* cb_instr_calcer_encoding (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { const ui32 cbFC = featureCalcer.FeatureCount(); std::string cbLine = std::string(R"J({"event":"calcer_encoding","doc":)J") + std::to_string((long long)docId) + R"J(,"values":[)J"; for (ui32 cbF = 0; cbF < cbFC; ++cbF) { if (cbF) cbLine += ","; cbLine += CbInstr065Fmt17((double)features[cbF * docCount + docId]); } cbLine += "]}"; CbInstr065Log(cbLine); }} . "\n";
+                $cb_ce_done = 1;
+            }
+            $cb_prev = $_ ne "" ? "" : $cb_prev;
+        ' -e 'BEGIN{$cb_prev=""} { }' "${BTFE}" 2>/dev/null || true
+        # The two-pass prev-line trick above is brittle in -pi; use a deterministic
+        # awk insertion instead (single unique anchor line).
+        if ! grep -q 'cb_instr_calcer_encoding' "${BTFE}"; then
+            tmp_ce="$(mktemp)"
+            awk '
+                { print }
+                /^[[:space:]]*featureCalcer\.Compute\(text, outputFeaturesIterator\);[[:space:]]*$/ && !done {
+                    print "            /* cb_instr_calcer_encoding (06.5-01) */ if (std::getenv(\"CB_INSTRUMENT_LOG\")) { const ui32 cbFC = featureCalcer.FeatureCount(); std::string cbLine = std::string(R\"J({\"event\":\"calcer_encoding\",\"doc\":)J\") + std::to_string((long long)docId) + R\"J(,\"values\":[)J\"; for (ui32 cbF = 0; cbF < cbFC; ++cbF) { if (cbF) cbLine += \",\"; cbLine += CbInstr065Fmt17((double)features[cbF * docCount + docId]); } cbLine += \"]}\"; CbInstr065Log(cbLine); }"
+                    done=1
+                }
+            ' "${BTFE}" > "${tmp_ce}" && mv "${tmp_ce}" "${BTFE}"
+        fi
+        grep -q 'cb_instr_calcer_encoding' "${BTFE}" \
+            && step "  patched calcer_encoding hook into base_text_feature_estimator.h" \
+            || step "  (calcer_encoding hook NOT applied — anchor missing; recorded)"
+    fi
+fi
+
+# 3bis-f. lda_projection — LDA projection matrix (lda.cpp::CalculateProjection).
+if [ -f "${LDA}" ]; then
+    ensure_sink "${LDA}"
+    if ! grep -q 'cb_instr_lda_proj' "${LDA}"; then
+        perl -0777 -pi -e '
+            s{(        std::copy\(scatterTotal->end\(\) - projectionMatrix->size\(\), scatterTotal->end\(\), projectionMatrix->begin\(\)\);\n)}{$1        /* cb_instr_lda_proj (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"lda_projection","dim":)J") + std::to_string((long long)dim) + R"J(,"matrix":[)J"; for (size_t cbI = 0; cbI < projectionMatrix->size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)(*projectionMatrix)[cbI]); } cbLine += R"J(],"eigenvalues":[)J"; for (size_t cbI = 0; cbI < eigenValues->size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)(*eigenValues)[cbI]); } cbLine += "]}"; CbInstrumentLog(cbLine); }\n}s;
+        ' "${LDA}" || step "  (lda_projection hook not matched; recorded)"
+        step "  patched lda_projection hook into lda.cpp"
+    fi
+fi
+
+# 3bis-g. knn_neighbors — per-query neighbor id list (knn.cpp::Compute).
+if [ -f "${KNN}" ]; then
+    ensure_sink "${KNN}"
+    if ! grep -q 'cb_instr_knn_neighbors' "${KNN}"; then
+        perl -0777 -pi -e '
+            s{(        auto neighbors = Cloud->GetNearestNeighbors\(embed\.data\(\), CloseNum\);\n)}{$1        /* cb_instr_knn_neighbors (06.5-01) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"knn_neighbors","k":)J") + std::to_string((long long)CloseNum) + R"J(,"neighbors":[)J"; for (size_t cbI = 0; cbI < neighbors.size(); ++cbI) { if (cbI) cbLine += ","; cbLine += std::to_string((long long)neighbors[cbI]); } cbLine += "]}"; CbInstrumentLog(cbLine); }\n}s;
+        ' "${KNN}" || step "  (knn_neighbors hook not matched; recorded)"
+        step "  patched knn_neighbors hook into knn.cpp"
+    fi
 fi
 
 # --------------------------------------------------------------------------
