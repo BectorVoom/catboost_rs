@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use cb_backend::CpuBackend;
 use cb_compute::{
-    CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, LeafMethod, Loss,
+    CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
+    LeafMethod, Loss,
 };
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
 use cb_train::{
@@ -72,6 +73,7 @@ pub struct CatBoostBuilder {
     bagging_temperature: f32,
     random_seed: u64,
     border_count: usize,
+    score_function: EScoreFunction,
 }
 
 impl Default for CatBoostBuilder {
@@ -102,6 +104,7 @@ impl CatBoostBuilder {
             bagging_temperature: 0.0,
             random_seed: 0,
             border_count: QuantizeParams::default().border_count,
+            score_function: score_function_default(),
         }
     }
 
@@ -232,6 +235,15 @@ impl CatBoostBuilder {
         self
     }
 
+    /// Split-score function (`score_function`). [`EScoreFunction::Cosine`] is the
+    /// catboost CPU default; [`EScoreFunction::L2`] is the variance-reduction
+    /// alternative used by the upstream `model_serde/*` oracle fixtures.
+    #[must_use]
+    pub fn score_function(mut self, score_function: EScoreFunction) -> Self {
+        self.score_function = score_function;
+        self
+    }
+
     /// Map the builder fields onto the internal [`BoostParams`]. The
     /// overfitting-detector / `use_best_model` / `eval_metric` controls are off
     /// (the Phase-4 first-slice surface does not expose an eval set through the
@@ -281,9 +293,11 @@ impl CatBoostBuilder {
             max_ctr_complexity: max_ctr_complexity_default(),
             combinations_ctr: combinations_ctr_default(),
             combinations_ctr_priors: combinations_ctr_priors_default(),
-            // catboost CPU default split-score function (Cosine,
-            // oblivious_tree_options.cpp:22); the facade does not surface it.
-            score_function: score_function_default(),
+            // Split-score function (`score_function`). The facade now surfaces
+            // this via `.score_function()`, defaulting to the catboost CPU
+            // default (Cosine, oblivious_tree_options.cpp:22) through
+            // `score_function_default()` in `new()`.
+            score_function: self.score_function,
             has_time: has_time_default(),
             feature_weights: cb_train::feature_weights_default(),
             first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),

@@ -31,9 +31,11 @@ pub use model::Model;
 // without reaching into the internal crates.
 pub use cb_model::{FeatureImportanceType, PredictionType};
 
-// Re-export the loss / leaf-method / bootstrap knobs the Builder consumes, so a
-// caller configures a run entirely through the published crate.
-pub use cb_compute::{LeafMethod, Loss};
+// Re-export the loss / leaf-method / score-function / bootstrap knobs the
+// Builder consumes, so a caller configures a run entirely through the published
+// crate. `EScoreFunction` drives `.score_function()` (Cosine = catboost CPU
+// default, L2 = variance-reduction alternative).
+pub use cb_compute::{EScoreFunction, LeafMethod, Loss};
 pub use cb_train::EBootstrapType;
 
 // Re-export the Pool ingestion surface (the `fit`/predict input) from the
