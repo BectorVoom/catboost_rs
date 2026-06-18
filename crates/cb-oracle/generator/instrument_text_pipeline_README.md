@@ -22,6 +22,8 @@ committed.
 | d | `calcer_encoding` | `catboost/private/libs/feature_estimator/base_text_feature_estimator.h` | `Compute(...)` (after `featureCalcer.Compute`) | per-document per-calcer feature row (column-major read-back) |
 | e | `online_order` | `catboost/private/libs/feature_estimator/base_text_feature_estimator.h` | `ComputeOnlineFeatures(...)` (before the learn-perm loop) | learn-permutation visiting order (D-03 leakage control) |
 | f | `lda_projection` | `catboost/private/libs/embedding_features/lda.cpp` | `CalculateProjection(...)` (after trailing-rows copy) | LDA projection matrix + eigenvalues (Pitfall 1, f32 LAPACK) |
+| f2 | `lda_scatter` | `catboost/private/libs/embedding_features/lda.cpp` | `CalculateProjection(...)` (BEFORE `ssygst_`) | regularized betweenMatrix B (`scatter_inner`) + totalScatter A (`scatter_total`) — the EXACT generalized-eigenproblem inputs, captured before `ssygst_` mutates them (06.5-05 re-measure) |
+| f3 | `lda_project` | `catboost/private/libs/embedding_features/lda.cpp` | `TLinearDACalcer::Compute(...)` (before `ForEachActiveFeature`) | per-document projected feature row (`cblas_sgemv` projection + per-class likelihoods) (06.5-05 re-measure) |
 | g | `knn_neighbors` | `catboost/private/libs/embedding_features/knn.cpp` | `TKNNCalcer::Compute(...)` (after `GetNearestNeighbors`) | per-query HNSW neighbor id list (Pitfall 2) |
 
 The verbatim hook bodies and the JSONL schema are documented in
@@ -37,6 +39,8 @@ patch logic lives in `build_instrumented_trainer.sh` **STEP 3bis**.
 {"event":"online_order","perm":[0,2,4]}
 {"event":"calcer_encoding","doc":3,"values":[0.0,1.0]}
 {"event":"lda_projection","dim":4,"matrix":[],"eigenvalues":[]}
+{"event":"lda_scatter","dim":4,"scatter_inner":[],"scatter_total":[]}
+{"event":"lda_project","proj_dim":1,"total_dim":4,"values":[]}
 {"event":"knn_neighbors","k":5,"neighbors":[1,3,0,2,4]}
 ```
 
@@ -99,3 +103,47 @@ if any is missing.
 3. **online_order / calcer_encoding** — the multi-line `perl -0777` slurp patterns
    were whitespace-fragile and silently did not substitute. Fixed: deterministic
    single-line-anchor inserts (and an `awk` fallback for calcer_encoding).
+4. **lda final-link skip (06.5-05)** — after editing `lda.cpp`, the incremental
+   `ninja _catboost` recompiled `lda.cpp.o` and re-archived the `.global.a` but did
+   **not** relink `lib_catboost.so`: in this build the `*.global.a` whole-archive
+   libs are tracked as *order-only* deps (`|`) of the `.so` link edge, so a changed
+   `.o` does not trigger the relink. Fix: `rm -f catboost/python-package/catboost/lib_catboost.so`
+   then `ninja catboost/python-package/catboost/lib_catboost.so` to force the link,
+   and re-stage into `instr_pkg/catboost/_catboost.so`. (Without this the smoke fit
+   silently runs the STALE trainer — the new `lda_scatter`/`lda_project` events never
+   fire.)
+
+## LDA re-instrument-and-re-measure (06.5-05)
+
+The Plan-01 `lda_projection` hook alone could not localize the hand-roll-f32
+divergence, so 06.5-05 added the `lda_scatter` (eigenproblem inputs) and
+`lda_project` (per-document projection) hooks and re-measured. **Freeze the GT** with:
+
+```sh
+.venv/bin/python crates/cb-oracle/generator/gen_text_embedding_fixtures.py \
+    --lda-scatter-gt --instr-pkg /tmp/cb_build313/instr_pkg
+#   -> fixtures/embedding_calcers/LDA/scatter_projection_gt.json
+```
+
+**Re-measurement result (definitive):**
+
+| What | Hand-roll f32 | f64 scipy | f32 reference LAPACK (`ssygv`) | Upstream dump |
+|------|---------------|-----------|-------------------------------|---------------|
+| `scatter_inner` (B) vs upstream | **≤4.66e-10** | — | — | (reference) |
+| `scatter_total` (A) vs upstream | **0** | — | — | (reference) |
+| dominant eigenvalue | 38.45 | 38.45 | 38.45 | **376.67** |
+| dominant eigenvector | `[0.597,0.563,-0.439,-0.365]` | same | same | `[0.637,0.514,-0.455,-0.351]` |
+| projection max-abs err vs upstream | 4.9e-2 | 4.9e-2 | 4.9e-2 | (reference) |
+| per-document projected-feature max-abs err vs upstream | **3.9e-2** | — | — | (reference) |
+
+**Localization:** the scatter construction is bit-faithful (B≤4.66e-10, A=0). The
+divergence is entirely in the eigensolve. The hand-roll matches **both** f64 scipy
+**and** f32 reference LAPACK `ssygv`. The upstream vendored-CLAPACK `ssyev_` dump
+reports a dominant eigenvalue (376.67) that is **inconsistent with its own
+eigenvector** (the eigenvector's Rayleigh quotient on the reduced matrix is 38.28,
+and `||A_reduced·v − 376.67·v|| = 338`), and the eigenvector is 4.9e-2 away from the
+reference dominant eigenvector. The per-flush eigenvalue ratio is non-constant
+(20.0, 10.1, 9.6, 9.8), ruling out a fixed rescale. **Conclusion:** exact f32
+reproduction of upstream's specific CLAPACK `ssyev_` iterate is not achievable by a
+reference-faithful eigensolver — this is a documented-tolerance escalation candidate
+(see `06.5-05-SUMMARY.md`).

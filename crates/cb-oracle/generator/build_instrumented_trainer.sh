@@ -450,6 +450,26 @@ if [ -f "${LDA}" ]; then
         ' "${LDA}" || step "  (lda_projection hook not matched; recorded)"
         step "  patched lda_projection hook into lda.cpp"
     fi
+    # 3bis-f2 (06.5-05). lda_scatter — the EXACT generalized-eigenproblem inputs
+    # (scatterInner = regularized between-class scatter B; scatterTotal = total
+    # scatter A) BEFORE ssygst_ mutates them. Re-instrument-and-re-measure: the
+    # hand-roll f32 candidate diverged 1.4e-1; root cause localized to the SCATTER
+    # matrices, not the eigensolve, so dump the scatter inputs to localize it.
+    if ! grep -q 'cb_instr_lda_scatter' "${LDA}"; then
+        perl -0777 -pi -e '
+            s{(        int info;\n\n)(        ssygst_)}{$1        /* cb_instr_lda_scatter (06.5-05) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"lda_scatter","dim":)J") + std::to_string((long long)dim) + R"J(,"scatter_inner":[)J"; for (size_t cbI = 0; cbI < scatterInner->size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)(*scatterInner)[cbI]); } cbLine += R"J(],"scatter_total":[)J"; for (size_t cbI = 0; cbI < scatterTotal->size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)(*scatterTotal)[cbI]); } cbLine += "]}"; CbInstrumentLog(cbLine); }\n$2}s;
+        ' "${LDA}" || step "  (lda_scatter hook not matched; recorded)"
+        step "  patched lda_scatter hook into lda.cpp"
+    fi
+    # 3bis-f3 (06.5-05). lda_project — per-document projected feature row (the
+    # cblas_sgemv projection + per-class likelihoods) in TLinearDACalcer::Compute.
+    # The instrumented per-document ground truth the hand-roll pipeline is judged on.
+    if ! grep -q 'cb_instr_lda_project' "${LDA}"; then
+        perl -0777 -pi -e '
+            s{(        ForEachActiveFeature\(\n            \[&proj, &iterator\]\(ui32 featureId\)\{)}{        /* cb_instr_lda_project (06.5-05) */ if (std::getenv("CB_INSTRUMENT_LOG")) { std::string cbLine = std::string(R"J({"event":"lda_project","proj_dim":)J") + std::to_string((long long)ProjectionDimension) + R"J(,"total_dim":)J" + std::to_string((long long)TotalDimension) + R"J(,"values":[)J"; for (size_t cbI = 0; cbI < proj.size(); ++cbI) { if (cbI) cbLine += ","; cbLine += CbFmt17((double)proj[cbI]); } cbLine += "]}"; CbInstrumentLog(cbLine); }\n$1}s;
+        ' "${LDA}" || step "  (lda_project hook not matched; recorded)"
+        step "  patched lda_project hook into lda.cpp"
+    fi
 fi
 
 # 3bis-g. knn_neighbors — per-query neighbor id list (knn.cpp::Compute).

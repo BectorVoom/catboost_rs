@@ -453,14 +453,134 @@ def gen_tokenizer_corpus(instr_pkg: str) -> None:
         )
 
 
+_LDA_FIT_SNIPPET = r'''
+import json, sys
+import numpy as np
+import pandas as pd
+from catboost import Pool, CatBoost
+
+embeds = json.load(open(sys.argv[1]))
+labels = json.load(open(sys.argv[2]))
+params = json.load(open(sys.argv[3]))
+texts = json.load(open(sys.argv[4]))
+df = pd.DataFrame({"text0": texts})
+df["emb0"] = [list(map(float, r)) for r in embeds]
+pool = Pool(data=df, label=labels, text_features=["text0"], embedding_features=["emb0"])
+model = CatBoost(params)
+model.fit(pool)
+print("LDA_INSTR_FIT_OK trees", model.tree_count_)
+'''
+
+
+def gen_lda_scatter_gt(instr_pkg: str) -> None:
+    """Capture + freeze the LDA generalized-eigenproblem ground truth (06.5-05).
+
+    Extends the Plan-01 ``lda_projection`` hook with the EXACT scatter inputs
+    (``lda_scatter``: regularized betweenMatrix B + totalScatter A, captured BEFORE
+    ``ssygst_`` mutates them) so the hand-rolled f32 eigensolver can be re-measured
+    against the upstream eigensolve in isolation from the scatter construction.
+
+    The frozen GT lives at ``fixtures/embedding_calcers/LDA/scatter_projection_gt.json``.
+    Single-thread (thread_count=1) — see _base_params().
+    """
+    instr_pkg_path = Path(instr_pkg)
+    so = instr_pkg_path / "catboost" / "_catboost.so"
+    if not so.exists():
+        raise SystemExit(
+            f"instrumented trainer not found at {so}; run build_instrumented_trainer.sh "
+            "first (it now patches the lda_scatter + lda_project hooks too)."
+        )
+    if not (INPUTS_DIR / "meta.json").exists():
+        write_inputs()
+    texts, embeds, labels = _build_corpus()
+    venv_py = str((GENERATOR_DIR.parent.parent.parent / ".venv" / "bin" / "python"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpd = Path(tmp)
+        (tmpd / "embeds.json").write_text(json.dumps(embeds), encoding="utf-8")
+        (tmpd / "labels.json").write_text(json.dumps(labels), encoding="utf-8")
+        (tmpd / "texts.json").write_text(json.dumps(texts), encoding="utf-8")
+        params = _base_params()
+        params["embedding_calcers"] = [EMBEDDING_CALCER_SPECS["LDA"]]
+        (tmpd / "params.json").write_text(json.dumps(params), encoding="utf-8")
+        fit_script = tmpd / "lda_fit.py"
+        fit_script.write_text(_LDA_FIT_SNIPPET, encoding="utf-8")
+        log_path = tmpd / "lda_instr.jsonl"
+        env = dict(os.environ)
+        env["CB_INSTRUMENT_LOG"] = str(log_path)
+        env["PYTHONPATH"] = str(instr_pkg_path)
+        proc = subprocess.run(
+            [venv_py, str(fit_script), str(tmpd / "embeds.json"),
+             str(tmpd / "labels.json"), str(tmpd / "params.json"), str(tmpd / "texts.json")],
+            env=env, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise SystemExit(f"instrumented LDA fit failed (rc={proc.returncode}):\n{proc.stderr[-2000:]}")
+        print("  instrumented LDA fit:", proc.stdout.strip())
+        scat: list[dict] = []
+        proj: list[dict] = []
+        with open(log_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("event") == "lda_scatter":
+                    scat.append(obj)
+                elif obj.get("event") == "lda_projection":
+                    proj.append(obj)
+
+    # Escalate-don't-weaken: the scatter + projection dumps MUST be present.
+    if not scat or not proj:
+        raise SystemExit(
+            "LDA scatter GT INCOMPLETE — lda_scatter / lda_projection events missing. "
+            f"(scatter={len(scat)}, projection={len(proj)}). The instrumented trainer did "
+            "not emit them; rebuild via build_instrumented_trainer.sh (it applies the "
+            "lda_scatter + lda_project hooks). Do NOT fabricate."
+        )
+    final_s, final_p = scat[-1], proj[-1]
+    gt = {
+        "source": "instrumented catboost 1.2.10 trainer (D-07/D-09), CB_INSTRUMENT_LOG; "
+                  "LDA reg=0.05 likelihood=true; thread_count=1",
+        "corpus": "text_embedding_inputs (16 rows, EMBED_DIM=4, binary)",
+        "dim": final_s["dim"],
+        "reg_param": 0.05,
+        "final_flush_scatter_inner": final_s["scatter_inner"],
+        "final_flush_scatter_total": final_s["scatter_total"],
+        "final_projection_matrix": final_p["matrix"],
+        "final_eigenvalues": final_p["eigenvalues"],
+        "n_flushes": len(scat),
+        "note": (
+            "scatter_inner = regularized betweenMatrix (B), scatter_total = totalScatter (A), "
+            "captured BEFORE ssygst_ mutates them in place. projection = trailing-rows copy of "
+            "the ssyev_ output (the reduced-problem dominant eigenvector, NOT back-transformed). "
+            "RE-MEASUREMENT (06.5-05): the hand-rolled f32 scatter matches B/A to <=5e-10/0, and "
+            "the hand-rolled eigensolve matches BOTH f64 scipy AND f32 reference LAPACK ssygv "
+            "(dominant eigenvalue 38.45, eigvec [0.597,0.563,-0.439,-0.365]); but the upstream "
+            "vendored-CLAPACK ssyev_ dump reports a dominant eigenvalue (376.67) inconsistent with "
+            "its own eigenvector (Rayleigh quotient 38.28) and an eigenvector 4.9e-2 away from "
+            "reference. See 06.5-05-SUMMARY divergence report."
+        ),
+    }
+    out = EMBEDDING_CALCERS_DIR / "LDA" / "scatter_projection_gt.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(gt, indent=2), encoding="utf-8")
+    print(f"  froze LDA scatter+projection GT under {out} ({len(scat)} flushes)")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", action="store_true", help="write corpus inputs only")
     parser.add_argument("--calcers", action="store_true", help="generate all 5 calcer fixtures")
     parser.add_argument("--tokenizer-corpus", action="store_true", help="freeze the D-01 instrumented corpus")
+    parser.add_argument("--lda-scatter-gt", action="store_true",
+                        help="freeze the LDA generalized-eigenproblem GT (scatter + projection, 06.5-05)")
     parser.add_argument("--instr-pkg", type=str, default=os.environ.get("INSTR_STAGE_PKG", "/tmp/cb_build313/instr_pkg"),
                         help="path to the staged instrumented catboost package (contains catboost/_catboost.so)")
-    parser.add_argument("--all", action="store_true", help="inputs + calcers + tokenizer-corpus")
+    parser.add_argument("--all", action="store_true", help="inputs + calcers + tokenizer-corpus + lda-scatter-gt")
     args = parser.parse_args(argv)
 
     FIXTURES.mkdir(parents=True, exist_ok=True)
@@ -469,6 +589,7 @@ def main(argv: list[str]) -> int:
         write_inputs()
         gen_all_calcers()
         gen_tokenizer_corpus(args.instr_pkg)
+        gen_lda_scatter_gt(args.instr_pkg)
         return 0
     if args.inputs:
         write_inputs()
@@ -476,7 +597,9 @@ def main(argv: list[str]) -> int:
         gen_all_calcers()
     if args.tokenizer_corpus:
         gen_tokenizer_corpus(args.instr_pkg)
-    if not (args.inputs or args.calcers or args.tokenizer_corpus):
+    if args.lda_scatter_gt:
+        gen_lda_scatter_gt(args.instr_pkg)
+    if not (args.inputs or args.calcers or args.tokenizer_corpus or args.lda_scatter_gt):
         write_inputs()
     return 0
 

@@ -1,0 +1,56 @@
+{
+  "source": "instrumented catboost 1.2.10 trainer (D-07/D-09), CB_INSTRUMENT_LOG; LDA reg=0.05 likelihood=true; thread_count=1",
+  "corpus": "text_embedding_inputs (16 rows, EMBED_DIM=4, binary)",
+  "dim": 4,
+  "reg_param": 0.05,
+  "final_flush_scatter_inner": [
+    0.08977694809436798,
+    -0.008402512408792973,
+    -0.007163579575717449,
+    0.002264200011268258,
+    -0.008402512408792973,
+    0.12173843383789062,
+    -0.006083576008677483,
+    -0.02397523634135723,
+    -0.007163578644394875,
+    -0.006083576008677483,
+    0.09581366181373596,
+    0.006580251269042492,
+    0.0022642009425908327,
+    -0.02397523634135723,
+    0.006580251269042492,
+    0.10182788968086243
+  ],
+  "final_flush_scatter_total": [
+    1.232080101966858,
+    1.2323991060256958,
+    -1.105136513710022,
+    -1.067922592163086,
+    1.2323991060256958,
+    1.2327182292938232,
+    -1.1054227352142334,
+    -1.0681991577148438,
+    -1.105136513710022,
+    -1.1054227352142334,
+    0.9912723302841187,
+    0.957892656326294,
+    -1.067922592163086,
+    -1.0681991577148438,
+    0.957892656326294,
+    0.9256369471549988
+  ],
+  "final_projection_matrix": [
+    0.6370540261268616,
+    0.5138921141624451,
+    -0.4551563560962677,
+    -0.3505847752094269
+  ],
+  "final_eigenvalues": [
+    -1.7654769180808216e-05,
+    1.7357440810883418e-05,
+    2.7000207410310395e-05,
+    376.66632080078125
+  ],
+  "n_flushes": 10,
+  "note": "scatter_inner = regularized betweenMatrix (B), scatter_total = totalScatter (A), captured BEFORE ssygst_ mutates them in place. projection = trailing-rows copy of the ssyev_ output (the reduced-problem dominant eigenvector, NOT back-transformed). RE-MEASUREMENT (06.5-05): the hand-rolled f32 scatter matches B/A to <=5e-10/0, and the hand-rolled eigensolve matches BOTH f64 scipy AND f32 reference LAPACK ssygv (dominant eigenvalue 38.45, eigvec [0.597,0.563,-0.439,-0.365]); but the upstream vendored-CLAPACK ssyev_ dump reports a dominant eigenvalue (376.67) inconsistent with its own eigenvector (Rayleigh quotient 38.28) and an eigenvector 4.9e-2 away from reference. See 06.5-05-SUMMARY divergence report."
+}

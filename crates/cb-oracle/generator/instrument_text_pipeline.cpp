@@ -36,6 +36,8 @@
 //   {"event":"online_order","perm":[0,2,4,...]}                   // learn permutation visiting order
 //   {"event":"calcer_encoding","doc":3,"values":[0.0, 1.0, ...]}  // per-document calcer feature row
 //   {"event":"lda_projection","dim":4,"matrix":[...],"eigenvalues":[...]}
+//   {"event":"lda_scatter","dim":4,"scatter_inner":[...],"scatter_total":[...]}  // 06.5-05 eigenproblem inputs
+//   {"event":"lda_project","proj_dim":1,"total_dim":4,"values":[...]}            // 06.5-05 per-doc projection
 //   {"event":"knn_neighbors","k":5,"neighbors":[1,3,0,2,4]}       // per-query neighbor ids
 //
 // HOOK INSERTION POINTS (file : symbol : what is captured)
@@ -72,6 +74,18 @@
 //     CalculateProjection(...) — after the trailing-rows copy into
 //     projectionMatrix; captures the LDA projection matrix + eigenvalues
 //     (Pitfall 1 — the f32 LAPACK ssygst_/ssyev_ result).
+//
+// (f2) lda_scatter (06.5-05)
+//     catboost/private/libs/embedding_features/lda.cpp
+//     CalculateProjection(...) — BEFORE ssygst_ mutates the matrices in place;
+//     captures scatter_inner (regularized betweenMatrix B) + scatter_total
+//     (totalScatter A), the EXACT generalized-eigenproblem inputs. Lets the
+//     hand-roll-f32 eigensolve be re-measured in isolation from the scatter build.
+//
+// (f3) lda_project (06.5-05)
+//     catboost/private/libs/embedding_features/lda.cpp
+//     TLinearDACalcer::Compute(...) — before ForEachActiveFeature; captures the
+//     per-document projected feature row (cblas_sgemv projection + likelihoods).
 //
 // (g) knn_neighbors
 //     catboost/private/libs/embedding_features/knn.cpp

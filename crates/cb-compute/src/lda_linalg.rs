@@ -2,6 +2,23 @@
 //! generalized symmetric eigensolver that back the LinearDA embedding calcer
 //! (FEAT-02). This is the **spike candidate** produced by Plan 06.5-05 Task 1.
 //!
+//! # Re-measurement status (06.5-05, instrumented re-measure)
+//!
+//! This eigensolver is **reference-faithful**: on the bit-matched upstream scatter
+//! inputs (`lda_scatter` dump) it reproduces **both** f64 scipy `eigh` **and** f32
+//! reference LAPACK `ssygv` to ~6 digits (dominant eigenvalue 38.45, dominant
+//! eigenvector `[0.597,0.563,-0.439,-0.365]`). The hand-rolled scatter construction
+//! is also bit-faithful (`scatter_inner` ≤4.66e-10, `scatter_total` 0 vs upstream).
+//!
+//! However, the upstream **vendored-CLAPACK `ssyev_`** dump
+//! (`fixtures/embedding_calcers/LDA/scatter_projection_gt.json`) reports a dominant
+//! eigenvalue (376.67) inconsistent with its own eigenvector (Rayleigh quotient
+//! 38.28; `||A_reduced·v − 376.67·v|| = 338`) and an eigenvector 4.9e-2 away from
+//! the reference dominant eigenvector, yielding a per-document projected-feature
+//! divergence of 3.9e-2 — above the ≤1e-5 bar. This divergence is therefore a
+//! **documented-tolerance escalation candidate**, NOT a transcription bug in this
+//! module. See `06.5-05-SUMMARY.md` and `instrument_text_pipeline_README.md`.
+//!
 //! # Source of truth (D-04)
 //!
 //! Transcribed from
