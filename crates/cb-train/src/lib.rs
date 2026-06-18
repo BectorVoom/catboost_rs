@@ -47,7 +47,13 @@ pub use ctr::{
     OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior, TCtrHistory, TCtrMeanHistory,
     SIMPLE_CLASSES_COUNT,
 };
-pub use estimated::estimated_features::{build_bow_estimated_features, BowEstimatedFeatures};
+pub use estimated::estimated_features::{
+    build_bow_estimated_features, build_online_text_estimated_features, BowEstimatedFeatures,
+    OnlineTextEstimatedFeatures,
+};
+pub use estimated::online_text::{
+    offline_text_features, online_text_prefix, OnlineTextCalcer, OnlineTextPrefix,
+};
 pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
     plain_fold_body_tail, select_min_batch_size, select_tail_size, Fold,

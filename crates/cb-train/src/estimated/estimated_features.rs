@@ -42,6 +42,8 @@ use cb_data::text::dictionary::{
 use cb_data::text::digitizer::{digitize_column, digitize_column_bigram};
 use cb_data::text::tokenizer::{tokenize, TokenizerOptions};
 
+use crate::estimated::online_text::{online_text_prefix, OnlineTextCalcer, OnlineTextPrefix};
+
 /// The BoW estimated feature columns plus their selected split borders, in the
 /// canonical BiGram-block-then-Word-block order, ready to append to the
 /// float-feature layout and hand to [`crate::train`].
@@ -170,5 +172,138 @@ pub fn build_bow_estimated_features(
         borders,
         bigram_feature_count,
         word_feature_count,
+    })
+}
+
+/// The text estimated feature columns plus their selected split borders, for a
+/// target-AWARE calcer (NaiveBayes or BM25). The columns are OBJECT-indexed `f32`
+/// and join the float-feature layout exactly like [`BowEstimatedFeatures`].
+///
+/// # The ONLINE estimate feeds the tree (D-03)
+///
+/// [`Self::columns`] / [`Self::borders`] are the ONLINE read-before-update prefix
+/// estimate (`ComputeOnlineFeatures`, `base_text_feature_estimator.h:74-79`) —
+/// the leakage-controlled estimated feature upstream builds the
+/// `boosting_type=Plain` TREE on (confirmed by the NaiveBayes per-stage oracle:
+/// its split border 0.590515 matches the online column, not the offline whole-set
+/// column whose border is 0.5). [`Self::encoding_in_order`] is the SAME estimate
+/// in permutation-visiting order — the per-prefix leakage-order anchor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OnlineTextEstimatedFeatures {
+    /// ONLINE read-before-update estimate, one column per active calcer feature,
+    /// OBJECT-indexed column-major (`columns[f][doc]`), `f32`-valued (Pitfall 6).
+    /// Width = the calcer's `BaseFeatureCount(numClasses)`. The Plain-tree
+    /// estimated feature.
+    pub columns: Vec<Vec<f32>>,
+    /// Split borders for each column in [`Self::columns`], in the SAME order
+    /// (selected via the existing `select_borders_greedy_logsum`, SC-4).
+    pub borders: Vec<Vec<f64>>,
+    /// The ONLINE per-document encoding in PERMUTATION order (the D-03
+    /// read-before-update prefix — the per-prefix leakage-order anchor; see
+    /// [`OnlineTextPrefix::encoding_in_order`]).
+    pub encoding_in_order: Vec<Vec<f64>>,
+}
+
+/// Build the online-text (NaiveBayes/BM25) estimated feature columns for a single
+/// raw text column, with the read-before-update prefix over the learn
+/// `permutation` (D-03 leakage control).
+///
+/// The Word dictionary is built ONCE over the learn corpus (offline,
+/// target-independent — the dictionary is NOT per-fold; only the online calcer
+/// state is). Each document is digitized against it, then the online prefix loop
+/// ([`online_text_prefix`]) computes each document's encoding from the prefix
+/// state accumulated from EARLIER permutation positions only, before updating the
+/// state with that document's class. The resulting OBJECT-indexed columns flow
+/// through the UNCHANGED [`cb_data::select_borders_greedy_logsum`] quantizer
+/// (SC-4 — no parallel quantizer).
+///
+/// `texts` is the per-document raw text (length `n_docs`); `classes[doc]` is
+/// object `doc`'s binarized class in `[0, num_classes)`; `permutation[p]` is the
+/// object at learn-order position `p` (the fold's `Fold::permutation`).
+/// `tokenizer_options` pins the D-02 ByDelimiter(space)+lowercase tokenization;
+/// `max_borders` is the per-feature border budget for the existing quantizer.
+///
+/// The `OccurrenceLowerBound` is resolved data-dependently from `texts.len()`
+/// (A4) — never hard-coded. The NaiveBayes/BM25 fixtures use the Word dictionary
+/// ONLY (no BiGram), `StartTokenId = 0`.
+///
+/// # Inert when absent (D-04 byte-identical)
+///
+/// An empty text column yields no estimated columns and no borders.
+///
+/// # Errors
+///
+/// [`CbError::Degenerate`] if `classes` / `permutation` length-mismatch `texts`,
+/// or the online prefix / compute fails.
+pub fn build_online_text_estimated_features(
+    calcer: OnlineTextCalcer,
+    texts: &[String],
+    classes: &[usize],
+    permutation: &[i32],
+    num_classes: usize,
+    tokenizer_options: &TokenizerOptions,
+    max_borders: usize,
+) -> CbResult<OnlineTextEstimatedFeatures> {
+    // Inert when absent (D-04).
+    if texts.is_empty() {
+        return Ok(OnlineTextEstimatedFeatures::default());
+    }
+
+    let n_docs = texts.len();
+    if classes.len() != n_docs {
+        return Err(CbError::Degenerate(
+            "online text features: classes length != texts length".to_owned(),
+        ));
+    }
+    if permutation.len() != n_docs {
+        return Err(CbError::Degenerate(
+            "online text features: permutation length != texts length".to_owned(),
+        ));
+    }
+
+    // Build the Word dictionary ONCE (offline, target-independent). The
+    // NaiveBayes/BM25 fixtures use the Word dictionary only.
+    let tokenized: Vec<Vec<String>> = texts
+        .iter()
+        .map(|t| tokenize(t, tokenizer_options))
+        .collect();
+    let olb = resolve_occurrence_lower_bound(n_docs);
+    let dict_options = DictionaryOptions {
+        occurrence_lower_bound: olb,
+        max_dictionary_size: Some(DEFAULT_MAX_DICTIONARY_SIZE),
+        start_token_id: 0,
+    };
+    let (word_dict, _word_entries) = build_dictionary(&tokenized, &dict_options);
+
+    // Digitize every document against the Word dictionary (one TText per doc).
+    let word_texts = digitize_column(texts, tokenizer_options, &word_dict);
+
+    // The ONLINE read-before-update prefix (D-03 leakage control) — the ordered
+    // estimated feature that feeds the Plain-mode TREE. Upstream computes the
+    // estimated text feature ONLINE over the learn permutation
+    // (`ComputeOnlineFeatures`, base_text_feature_estimator.h:74-79); the
+    // NaiveBayes per-stage oracle confirms this (its split border 0.590515 matches
+    // the ONLINE column, NOT the offline whole-set column whose border is 0.5).
+    // `encoding_in_order` is the same estimate in permutation order (the
+    // per-prefix leakage-order anchor).
+    let OnlineTextPrefix {
+        columns,
+        encoding_in_order,
+    } = online_text_prefix(calcer, permutation, &word_texts, classes, num_classes)?;
+
+    // Select borders for each estimated column through the EXISTING quantizer
+    // (SC-4 — NO parallel quantizer).
+    let borders: Vec<Vec<f64>> = columns
+        .iter()
+        .map(|col| {
+            let as_f64: Vec<f64> = col.iter().map(|&v| f64::from(v)).collect();
+            select_borders_greedy_logsum(&as_f64, max_borders, false)
+        })
+        .collect();
+
+    Ok(OnlineTextEstimatedFeatures {
+        columns,
+        borders,
+        encoding_in_order,
     })
 }

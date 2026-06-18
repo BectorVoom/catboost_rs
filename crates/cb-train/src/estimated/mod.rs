@@ -20,9 +20,16 @@
 //! Mirrors `cb-train::ctr/mod.rs` (`#[path = ...]` submodules + sibling
 //! `_test.rs`; INFRA-06 source/test separation).
 
+#[path = "online_text.rs"]
+pub mod online_text;
+
 #[path = "estimated_features.rs"]
 pub mod estimated_features;
 
 #[cfg(test)]
 #[path = "estimated_features_test.rs"]
 mod estimated_features_test;
+
+#[cfg(test)]
+#[path = "online_text_test.rs"]
+mod online_text_test;
