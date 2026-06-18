@@ -64,7 +64,7 @@
 - [x] **FEAT-02**: Embedding features — LDA, KNN calcers
 - [x] **FEAT-03**: Monotone constraints (per-feature +1/-1/0)
 - [x] **FEAT-04**: Feature penalties / per-object penalties
-- [ ] **FEAT-05**: Feature selection — recursive by PredictionValuesChange / LossFunctionChange / ShapValues
+- [x] **FEAT-05**: Feature selection — recursive by PredictionValuesChange / LossFunctionChange / ShapValues
 - [x] **FEAT-06**: Alternative grow policies — Lossguide, Depthwise, Region
 
 ### Model, Serialization & Explainability
@@ -176,7 +176,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | FEAT-02 | Phase 6.5 | Complete (06.5-05 LDA per-stage parity via binarization stability + documented raw-projection tolerance; 06.5-06 KNN neighbor-id bit-exact → integer-vote bit-exact → byte-identical per-stage; 06.5-07 SC-4 mixed text+embedding end-to-end re-exercises KNN: StagedApprox + Predictions ≤1e-5 bit-for-bit) |
 | FEAT-03 | Phase 6.6 | Complete (06.6-02) |
 | FEAT-04 | Phase 6.6 | Complete |
-| FEAT-05 | Phase 6.6 | Pending |
+| FEAT-05 | Phase 6.6 | Complete |
 | FEAT-06 | Phase 6.6 | Complete |
 | MODEL-05 | Phase 6.6 | Complete |
 | GPU-01 | Phase 7 | Pending |

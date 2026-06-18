@@ -24,7 +24,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 6.3: Ranking Losses & Metrics** - LOSS-04, LOSS-05 over group_id/subgroup_id/pairs; C++ instrumentation for randomized losses (completed 2026-06-17)
   - [x] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8) (completed 2026-06-18)
   - [x] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first (SC-2 BM25 per-stage CLOSED via 06.5-09 PATH-A fixture-correctness fix)
-  - [ ] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine
+  - [x] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine (completed 2026-06-18)
 - [ ] **Phase 7: GPU Backends via CubeCL** - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, documented GPU tolerance
 - [ ] **Phase 8: Python Bindings, Dual API & Packaging** - PyO3 dual sklearn + CatBoost-native API, NumPy/Pandas/Arrow/Polars input, per-backend wheels
 
@@ -528,7 +528,7 @@ Plans:
 
 **Wave 7** — Gate D (feature selection LAST, blocks on Gate C)
 
-- [ ] 06.6-08-PLAN.md — Recursive feature selection by ShapValues / PredictionValuesChange / LossFunctionChange (NEW cb-train module, no new crate), selected/eliminated set oracle (FEAT-05 / SC-2 complete)
+- [x] 06.6-08-PLAN.md — Recursive feature selection by ShapValues / PredictionValuesChange / LossFunctionChange (NEW cb-train module, no new crate), selected/eliminated set oracle (FEAT-05 / SC-2 complete)
 
 ### Phase 7: GPU Backends via CubeCL
 

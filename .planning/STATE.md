@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Completed 06.6-07-PLAN.md
-last_updated: "2026-06-18T10:13:44.362Z"
+last_updated: "2026-06-18T10:25:09.162Z"
 last_activity: 2026-06-18 -- 06.6-06 LossFunctionChange + non-symmetric PVC/Interaction oracle GREEN (D-6.6-10)
 progress:
   total_phases: 14
-  completed_phases: 10
+  completed_phases: 11
   total_plans: 90
-  completed_plans: 89
-  percent: 71
+  completed_plans: 90
+  percent: 79
 ---
 
 # Project State
@@ -131,6 +131,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.6 P05 | ~55min | 2 tasks | 5 files |
 | Phase 06.6 P06 | ~40min | 2 tasks | 15 files |
 | Phase 06.6 P07 | 70min | 2 tasks | 17 files |
+| Phase 06.6 P08 | 35min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -283,6 +284,8 @@ Recent decisions affecting current work:
 - [Phase 06.6]: 06.6-07: ShapInteractionValues bias slot = last index (reverse-mapped); interactions via FixedOn/FixedOff SHAP re-runs
 - [Phase 06.6]: 06.6-07: PredictionDiff is the compare_documents.cpp indicator-coefficient algorithm (NOT SHAP); oracle-locked <=1e-5
 - [Phase 06.6]: 06.6-07: SAGE seed-match infeasible in scope -> deterministic structural surrogate per D-6.6-11 fallback (b); value oracle deferred
+- [Phase ?]: 06.6-08: select_features (FEAT-05) recursive-elimination loop in cb-train source consumes cb-model importances via an injected ImportanceRanker callback to avoid the cb-model->cb-train build-graph cycle (D-6.6-03 modules over crates); oracle injects the real shap_values/prediction_values_change as cycle-exempt dev-deps
+- [Phase ?]: 06.6-08: feature_selection partition oracle is DISCRETE set/order equality; ShapValues + PVC backends both selected={0,1} eliminated=[2,3] vs catboost 1.2.10
 
 ### Pending Todos
 
@@ -323,7 +326,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-18T10:13:44.355Z
+Last session: 2026-06-18T10:25:02.248Z
 Stopped at: Completed 06.6-07-PLAN.md
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
