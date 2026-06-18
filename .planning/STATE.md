@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Completed 06.5-05-PLAN.md
-last_updated: "2026-06-18T04:28:25.973Z"
-last_activity: "2026-06-18 -- 06.5-07 COMPLETE (SC-4 TERMINAL GATE): build_mixed_estimated_features joins numeric + BoW text + KNN embedding into ONE float-feature layout [numeric|text|embedding] through the EXISTING quantizer->tree (SC-4, no parallel quantizer; inert-when-absent D-04). SC-4 mixed end-to-end oracle: StagedApprox + Predictions <=1e-5 BIT-FOR-BIT (text AND embedding flow together -> upstream's model); Splits/LeafValues gated structure-invariantly under a documented feature-selection tie (per-tree leaf MULTISET <=1e-5, magnitudes exact). Mixed scoped to BoW + KNN (fully per-stage-closed); BM25 (06.5-04) + LDA tolerance (06.5-05) EXCLUDED. 5 oracle tests 0-ignored; cb-train 228 + cb-data 106 + cb-compute 176; D-04 unchanged. FEAT-01 residual = BM25 per-stage normalized borders + general estimated-feature quantization-GRID parity (future trainer-normalization slice). Commits a20cd9b / 2be89ba"
+status: executing
+stopped_at: Completed 06.5-08-PLAN.md
+last_updated: "2026-06-18T04:54:00.000Z"
+last_activity: 2026-06-18 -- Phase 06.5 execution started
 progress:
   total_phases: 14
   completed_phases: 9
-  total_plans: 80
-  completed_plans: 80
+  total_plans: 82
+  completed_plans: 81
   percent: 65
 ---
 
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 06.5 (text-and-embedding-features) — EXECUTING (all 7 plans complete; awaiting phase verification)
-Plan: 7 of 7 — COMPLETE
-Status: Phase plans done; FEAT-02 closed, FEAT-01 has the BM25 normalized-border residual
-Last activity: 2026-06-18 -- 06.5-07 COMPLETE (SC-4 TERMINAL GATE): build_mixed_estimated_features joins numeric + BoW text + KNN embedding into ONE float-feature layout [numeric|text|embedding] through the EXISTING quantizer->tree (SC-4, no parallel quantizer; inert-when-absent D-04). SC-4 mixed end-to-end oracle: StagedApprox + Predictions <=1e-5 BIT-FOR-BIT (text AND embedding flow together -> upstream's model); Splits/LeafValues gated structure-invariantly under a documented feature-selection tie (per-tree leaf MULTISET <=1e-5, magnitudes exact). Mixed scoped to BoW + KNN (fully per-stage-closed); BM25 (06.5-04) + LDA tolerance (06.5-05) EXCLUDED. 5 oracle tests 0-ignored; cb-train 228 + cb-data 106 + cb-compute 176; D-04 unchanged. FEAT-01 residual = BM25 per-stage normalized borders + general estimated-feature quantization-GRID parity (future trainer-normalization slice). Commits a20cd9b / 2be89ba
+Phase: 06.5 (text-and-embedding-features) — EXECUTING
+Plan: 8 of 9 complete (06.5-09 next)
+Status: Executing Phase 06.5
+Last activity: 2026-06-18 -- 06.5-08 BM25 normalization investigation: DECISION PATH-A (±1.24 = embedding feature mislabel, not BM25 normalization)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -123,6 +123,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.5 P04 | ~27min | 2 tasks | 11 files |
 | Phase 06.5 P05 | 6h | 3 tasks | 14 files |
 | Phase 06.5 P06 | ~50min | 2 tasks | 8 files |
+| Phase 06.5 P08 | ~3h 5m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -131,6 +132,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [06.5-08 BM25 normalization investigation — DECISION PATH-A]: The open question 06.5-04 could not answer ("where does BM25 splits.npy ±1.24/-0.550486 come from when raw BM25 scores are O(1e-3)?") is RESOLVED by source reading + instrumented dump. Source: `base_text_feature_estimator.h:74-88` (raw O(1e-3) column) → `estimated_features.cpp:204-250` (`BestSplit` on raw values, NO transform) → `split.cpp:45-46` → `model.cpp:209` (border stored verbatim) — scale-preserving end to end. Instrumented `cb_instr_estimated_borders` dump: BM25 estimated-feature borders are O(1e-3) (`[0.000465…,…,0.005428…]`); `calcer_encoding` max=0.0064. The committed ±1.24 splits ALL carry `calcer_id=96AE6D4D` (default EMBEDDING calcer on `emb0`), NOT the BM25 text calcer `4559D4B0`; `model.cbm` has an `emb0` feature and won't load against a text-only pool. **PATH-A: there is NO BM25 normalization — the ±1.24 is a fixture mislabel (splits.npy frozen from a text+embedding pool records the embedding feature's borders).** 06.5-09 = fixture-correctness fix: regenerate text-only BM25 fixtures + per-stage oracle ≤1e-5 (the Rust seam already produces O(1e-3) borders). Vendored patch UNCOMMITTED (catboost-master/ untracked). gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits b51aa25 (source) / 1849b04 (dump+DECISION).
 - [06.5-01 Wave-0 ground-truth gate — COMPLETE]: Rebuilt the instrumented catboost 1.2.10 trainer (sudo-free re-provision into a cleared `/tmp`, full Release build RC=0) with **7 env-gated `CB_INSTRUMENT_LOG` hooks** across the text+embedding pipeline: `token_stream` (tokenizer.cpp::Tokenize), `dict_ids` (dictionary_builder.cpp::FinishBuilding, count-DESC/token-ASC sort), `ttext` (text.h::TText ctor), `calcer_encoding` + `online_order` (base_text_feature_estimator.h), `lda_projection` (lda.cpp::CalculateProjection), `knn_neighbors` (knn.cpp::Compute). Smoke dump fires all 7 non-empty (union over BoW+NaiveBayes+BM25+LDA+KNN fits). **Header sink redefinition** fixed with `#ifndef CB_INSTR065_SINK_DEFINED` guard (base_text_feature_estimator.h transitively includes text.h in one TU). Vendored `catboost-master/` patches stay UNCOMMITTED (D-09/D-12 — whole tree untracked). **Per-stage fixtures frozen as `.npy` (splits/leaf_values/leaf_weights/staged/predictions) + `model.cbm`, NOT model.json** — upstream `model_exporter.cpp:152` forbids JSON export for text/embedding models; arrays come straight from the live single-thread trainer (`get_leaf_values`/`_get_tree_splits` border parse/`staged_predict`/`predict`), no fabrication. Corpus = 16 rows (< 1000) → `OccurrenceLowerBound` pinned to 1 (A4), asserted at gen time. 5 calcer fixture dirs (text_calcers/{BoW,NaiveBayes,BM25}, embedding_calcers/{LDA,KNN}) + D-01 text_tokenizer/ corpus (7 hook-category dumps) frozen, all config.json thread_count=1 / catboost_version=1.2.10. 3 Rule-1/3 auto-fixes (file-scope token_stream insert + `\"` quote mangle; header redefinition; whitespace-fragile online_order/calcer_encoding perl) — all in tooling, driver patterns corrected for idempotent re-runs. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits f411da4 (Task 1 hooks) / 0b1e4a4 (Task 2 fixtures). Wave 0 gate GREEN; unblocks Plans 02-07.
 
 - [06.4-01 Wave-A LOSS-09 — 5 GPU-only score functions self-oracled, COMPLETE]: Added `EScoreFunction::{SolarL2,NewtonL2,NewtonCosine,LOOL2,SatL2}` (unit variants — `Copy+Eq+Default` retained, NO regression) + 5 `multi_dim_split_score` arms (`score.rs`). SolarL2/LOOL2/SatL2 are first-order per-leaf scalars transcribed verbatim from `score_calcers.cuh:22-24/83-87/114-117`, folded through `cb_core::sum_f64` (D-08; helpers `solar_l2_terms`/`loo_l2_terms`/`sat_l2_terms`). NewtonL2 reuses the L2 arm VERBATIM, NewtonCosine reuses the Cosine arm VERBATIM (`pointwise_scores.cu:504-521`) — the second-order distinction is the FILL, not the math. **NEW histogram primitive `reduce_leaf_stats_newton`** (`histogram.rs`, exported): `sum_weight` slot carries the summed POSITIVE hessian `Σ(-der2*weight)` (der2≤0 → negated, Pitfall 2); `LeafStats` struct UNCHANGED; reuses `reduce_leaf_der2` fold. `tree.rs::split_score` now dispatches all 7 variants (Cosine/L2 stay on the dedicated scalar calcers — byte-identical hot path; the 5 new route through the dim=1 multi-dim seam, D-6.4-03 single code path). **D-6.4-06 WEAKENED ORACLE (NON-NEGOTIABLE):** these 5 are GPU-only upstream (CPU rejects at `oblivious_tree_options.cpp:146`); NO upstream-CPU training ground truth → transcribe-then-self-oracle (Rust vs hand-computed CUDA arithmetic, ≤1e-12 machine-eps), NOT a ≤1e-5-vs-upstream lock; caveat stated verbatim in the test file doc-comment. **Scope decision:** live-search der2 threading for Newton* into the PLAIN boosting greedy-search is DEFERRED to the Phase-7 GPU path (these fns are unreachable/non-oracle-able on CPU; threading der2 through the der1/weight-only search chain would be untestable scaffolding risking the Cosine/L2 lock); the reusable Newton FILL primitive + 7-variant dispatch are shipped. Gates: cb-compute 133 lib (+2 newton) + 9 `score_functions_test` int; cb-train 194 lib + all oracles green (05-19 Task A L2-vs-Cosine split lock UNREGRESSED, Pitfall 3); clippy 0 indexing_slicing/unwrap_used; D-08 grep clean. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Commits 59657ea (RED) / 79cef4c (GREEN variants+arms) / d07ad66 (Newton fill + dispatch).
