@@ -470,7 +470,7 @@ Plans:
 
 **Wave 6** *(blocked on 06.5-05; autonomous: false — KNN landmine A2, highest risk)*
 
-- [ ] 06.5-06-PLAN.md — KNN (last/highest-risk): instrumented per-query neighbor-id SPIKE → exact online_hnsw hand-port vs brute-force-exact L2 (NEVER a third-party HNSW crate) → neighbor-vote calcer; KNN per-stage + neighbor-id oracle ≤1e-5 or human-signed-off tolerance — completes FEAT-02 / SC-3
+- [x] 06.5-06-PLAN.md — KNN (last/highest-risk): instrumented per-query neighbor-id SPIKE → exact online_hnsw hand-port vs brute-force-exact L2 (NEVER a third-party HNSW crate) → neighbor-vote calcer; KNN per-stage + neighbor-id oracle ≤1e-5 or human-signed-off tolerance — completes FEAT-02 / SC-3
 
 **Wave 7** *(blocked on 06.5-04 + 06.5-06)*
 

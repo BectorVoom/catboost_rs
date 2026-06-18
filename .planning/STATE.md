@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 06.5-05-PLAN.md
-last_updated: "2026-06-18T03:22:21.623Z"
+last_updated: "2026-06-18T03:39:25.651Z"
 last_activity: "2026-06-18 -- 06.5-04 COMPLETE: NaiveBayes (naive_bayesian.cpp:14-63, LogProb+Softmax, priors 0.5, width numClasses>2?numClasses:1) + BM25 (bm25.cpp:12-83, IDF+saturation, k=1.5/b=0.75/truncate=1e-3, width numClasses) as IOnlineFeatureEstimators over the TFold learn permutation with the read-before-update prefix (D-03, mirrors ctr/online.rs); the ONLINE estimate feeds the Plain tree (NaiveBayes split border 0.590515 matches online, NOT offline 0.5). NaiveBayes per-stage oracle <=1e-5 (Splits/LeafValues/StagedApprox/Predictions) + per-prefix leakage-order anchors (no-leakage doc0=0.5 + head/tail prefix-boundary vs instrumented dump). BM25 calcer math bit-exact <=1e-5 vs independent closed-form online ref + no-leakage anchor + SC-4 quantizer; BM25 per-stage NORMALIZED-border scale (splits.npy +-1.24 vs raw O(1e-3)) + depth-2 [7,2,0,7] from catboost permutation averaging DEFERRED (trainer normalization, not calcer math; deferred-items.md). D-04 non-text byte-identical (BoW + e2e oracles unchanged). cb-train lib 210 + cb-compute lib 151 pass; new lib files clippy-clean. Commits d53a7a1 (Task1 math) / 8eeef44 (Task2 prefix+oracles)"
 progress:
   total_phases: 14
   completed_phases: 9
   total_plans: 80
-  completed_plans: 78
+  completed_plans: 79
   percent: 64
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 06.5 (text-and-embedding-features) — EXECUTING
-Plan: 6 of 7
+Plan: 7 of 7
 Status: Ready to execute
 Last activity: 2026-06-18 -- 06.5-04 COMPLETE: NaiveBayes (naive_bayesian.cpp:14-63, LogProb+Softmax, priors 0.5, width numClasses>2?numClasses:1) + BM25 (bm25.cpp:12-83, IDF+saturation, k=1.5/b=0.75/truncate=1e-3, width numClasses) as IOnlineFeatureEstimators over the TFold learn permutation with the read-before-update prefix (D-03, mirrors ctr/online.rs); the ONLINE estimate feeds the Plain tree (NaiveBayes split border 0.590515 matches online, NOT offline 0.5). NaiveBayes per-stage oracle <=1e-5 (Splits/LeafValues/StagedApprox/Predictions) + per-prefix leakage-order anchors (no-leakage doc0=0.5 + head/tail prefix-boundary vs instrumented dump). BM25 calcer math bit-exact <=1e-5 vs independent closed-form online ref + no-leakage anchor + SC-4 quantizer; BM25 per-stage NORMALIZED-border scale (splits.npy +-1.24 vs raw O(1e-3)) + depth-2 [7,2,0,7] from catboost permutation averaging DEFERRED (trainer normalization, not calcer math; deferred-items.md). D-04 non-text byte-identical (BoW + e2e oracles unchanged). cb-train lib 210 + cb-compute lib 151 pass; new lib files clippy-clean. Commits d53a7a1 (Task1 math) / 8eeef44 (Task2 prefix+oracles)
 
@@ -122,6 +122,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.5 P03 | ~22min | 2 tasks | 14 files |
 | Phase 06.5 P04 | ~27min | 2 tasks | 11 files |
 | Phase 06.5 P05 | 6h | 3 tasks | 14 files |
+| Phase 06.5 P06 | ~50min | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -263,6 +264,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 06.5-02: SC-1 ttext gate asserted on NaiveBayes (Word unigram) path; BoW ttext is BiGram (ids to 24), deferred to BoW calcer slice
 - [Phase ?]: 06.5-02: oracle reads instrumented JSON dumps directly (no model.json for text models); OLB resolved data-dependently (16-row corpus -> 1)
 - [Phase ?]: 06.5-05: LDA divergence is upstream vendored-CLAPACK ssyev_ non-reference iterate; hand-roll-f32 reference-faithful; per-stage oracle byte-identical via binarization stability; PROJECTION_TOL=6e-2 raw-projection-only
+- [Phase ?]: 06.5-06 KNN: brute-force-exact L2 k-NN (spike 0/64 neighbor-id mismatches vs instrumented HNSW dump; A5 degenerate-to-exact) -> bit-exact integer class-vote feature -> byte-identical per-stage model. NO HNSW crate (A2/D-05), NO documented tolerance (ids EXACT), NO #[ignore]. FEAT-02 complete
 
 ### Pending Todos
 
@@ -303,7 +305,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-18T03:22:21.617Z
+Last session: 2026-06-18T03:39:19.326Z
 Stopped at: Completed 06.5-05-PLAN.md
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
