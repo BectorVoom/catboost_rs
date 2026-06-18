@@ -71,6 +71,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
         .collect();
     Model {
         oblivious_trees,
+        non_symmetric_trees: Vec::new(),
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
@@ -159,6 +160,7 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
     };
     let model = Model {
         oblivious_trees: vec![tree0, tree1],
+        non_symmetric_trees: Vec::new(),
         bias: 0.123,
         float_feature_borders: vec![vec![0.5, 2.5], vec![0.5, 1.5]],
         ctr_data: None,

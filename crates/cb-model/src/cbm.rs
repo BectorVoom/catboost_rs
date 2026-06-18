@@ -50,9 +50,9 @@ use flatbuffers::FlatBufferBuilder;
 use crate::error::ModelError;
 use crate::model_generated::ncat_boost_fbs::{
     root_as_tmodel_core, TFloatFeature, TFloatFeatureArgs, TKeyValue, TKeyValueArgs, TModelCore,
-    TModelCoreArgs, TModelTrees, TModelTreesArgs,
+    TModelCoreArgs, TModelTrees, TModelTreesArgs, TNonSymmetricTreeStepNode,
 };
-use crate::{Model, ObliviousTree, Split};
+use crate::{Model, NonSymmetricTree, ObliviousTree, Split};
 
 /// The `.cbm` model-file descriptor magic (`model.cpp:41,49-51`).
 pub const CBM1: &[u8; 4] = b"CBM1";
@@ -146,6 +146,67 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     let mut tree_start_offsets: Vec<i32> = Vec::new();
     let mut leaf_values: Vec<f64> = Vec::new();
     let mut leaf_weights: Vec<f64> = Vec::new();
+    // Non-symmetric flat-node vectors (FEAT-06 / D-6.6-05); EMPTY for an oblivious
+    // model so the symmetric wire bytes stay byte-identical (the FlatBuffers
+    // builder omits an empty `None` vector → no `NonSymmetric*` table fields).
+    let mut non_symmetric_step_nodes: Vec<TNonSymmetricTreeStepNode> = Vec::new();
+    let mut non_symmetric_node_ids: Vec<u32> = Vec::new();
+
+    // Non-symmetric model: serialize the per-NODE flat triple (TreeSplits per
+    // node, NonSymmetricStepNodes, NonSymmetricNodeIdToLeafId) + the flat leaf
+    // arrays. TreeSizes counts NODES (not splits) here. A model is EITHER
+    // all-oblivious or all-non-symmetric (upstream never mixes policies).
+    if !model.non_symmetric_trees.is_empty() {
+        let mut node_offset: i32 = 0;
+        for tree in &model.non_symmetric_trees {
+            let node_count = i32::try_from(tree.tree_splits.len()).map_err(|_| {
+                ModelError::SchemaVersion("non-symmetric node count exceeds i32".to_owned())
+            })?;
+            tree_start_offsets.push(node_offset);
+            tree_sizes.push(node_count);
+            node_offset = node_offset.checked_add(node_count).ok_or_else(|| {
+                ModelError::SchemaVersion("cumulative non-symmetric node offset overflow".to_owned())
+            })?;
+
+            for (idx, split) in tree.tree_splits.iter().enumerate() {
+                let is_leaf = matches!(tree.step_nodes.get(idx), Some(&(0, 0)) | None);
+                if is_leaf {
+                    // Leaf nodes serialize a filler global split index `0`
+                    // (verified upstream layout); the apply walk never reads it.
+                    tree_splits.push(0);
+                } else if let Some(float_split) = split.as_float() {
+                    tree_splits.push(split_to_global_index(float_split, &bins)?);
+                } else {
+                    tree_splits.push(0);
+                }
+            }
+            for &(left_diff, right_diff) in &tree.step_nodes {
+                non_symmetric_step_nodes
+                    .push(TNonSymmetricTreeStepNode::new(left_diff, right_diff));
+            }
+            non_symmetric_node_ids.extend_from_slice(&tree.node_id_to_leaf_id);
+
+            // Distinct leaves = count of terminal (0,0) step nodes.
+            let distinct_leaves = tree
+                .step_nodes
+                .iter()
+                .filter(|&&(l, r)| l == 0 && r == 0)
+                .count();
+            let n_leaves = if dim == 0 { 0 } else { distinct_leaves };
+            for l in 0..n_leaves {
+                for d in 0..dim {
+                    let v = tree.leaf_values.get(d * n_leaves + l).copied().ok_or_else(|| {
+                        ModelError::SchemaVersion(
+                            "non-symmetric leaf_values length is not a multiple of approx_dimension"
+                                .to_owned(),
+                        )
+                    })?;
+                    leaf_values.push(v);
+                }
+            }
+            leaf_weights.extend_from_slice(&tree.leaf_weights);
+        }
+    }
 
     let mut split_offset: i32 = 0;
     for tree in &model.oblivious_trees {
@@ -218,6 +279,18 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     let tree_start_offsets_vec = fbb.create_vector(&tree_start_offsets);
     let leaf_values_vec = fbb.create_vector(&leaf_values);
     let leaf_weights_vec = fbb.create_vector(&leaf_weights);
+    // Non-symmetric vectors — `None` for an oblivious model so the wire bytes
+    // stay byte-identical (the table fields are simply absent, D-6.6-05).
+    let non_symmetric_step_nodes_vec = if non_symmetric_step_nodes.is_empty() {
+        None
+    } else {
+        Some(fbb.create_vector(&non_symmetric_step_nodes))
+    };
+    let non_symmetric_node_ids_vec = if non_symmetric_node_ids.is_empty() {
+        None
+    } else {
+        Some(fbb.create_vector(&non_symmetric_node_ids))
+    };
 
     let approx_dimension = i32::try_from(dim).map_err(|_| {
         ModelError::SchemaVersion("approx_dimension exceeds i32 range".to_owned())
@@ -232,6 +305,8 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
             FloatFeatures: Some(float_features),
             LeafValues: Some(leaf_values_vec),
             LeafWeights: Some(leaf_weights_vec),
+            NonSymmetricStepNodes: non_symmetric_step_nodes_vec,
+            NonSymmetricNodeIdToLeafId: non_symmetric_node_ids_vec,
             Scale: 1.0,
             Bias: model.bias,
             ..TModelTreesArgs::default()
@@ -415,6 +490,29 @@ fn reconstruct_model(trees: &TModelTrees, class_to_label: Vec<f64>) -> Result<Mo
     // / unset) means the scalar default `1`.
     let dim = usize::try_from(trees.ApproxDimension()).unwrap_or(1).max(1);
 
+    // Non-symmetric model (FEAT-06 / D-6.6-05): when `NonSymmetricStepNodes` is
+    // present AND NON-EMPTY, `TreeSizes` counts NODES (not splits), so the
+    // oblivious `2^size` leaf decode below would be WRONG — take the dedicated
+    // flat-node decode and return early. An oblivious upstream `.cbm` carries an
+    // EMPTY `NonSymmetricStepNodes` vector (`Some([])`, NOT `None` — verified
+    // catboost 1.2.10), so it falls through to the byte-identical symmetric path.
+    if trees
+        .NonSymmetricStepNodes()
+        .is_some_and(|v| !v.is_empty())
+    {
+        let non_symmetric_trees =
+            reconstruct_non_symmetric(trees, &bins, &leaf_values, leaf_weights.as_ref(), dim)?;
+        return Ok(Model {
+            oblivious_trees: Vec::new(),
+            non_symmetric_trees,
+            bias: read_bias(trees),
+            float_feature_borders,
+            ctr_data: None,
+            approx_dimension: dim,
+            class_to_label,
+        });
+    }
+
     let mut oblivious_trees = Vec::with_capacity(tree_sizes.len());
     let mut split_cursor: usize = 0;
     // Separate cursors: `value_cursor` strides the LEAF-MAJOR `LeafValues` by
@@ -480,6 +578,9 @@ fn reconstruct_model(trees: &TModelTrees, class_to_label: Vec<f64>) -> Result<Mo
 
     Ok(Model {
         oblivious_trees,
+        // Oblivious models carry no non-symmetric trees (the non-symmetric `.cbm`
+        // is handled by the early return above, D-6.6-05).
+        non_symmetric_trees: Vec::new(),
         bias: read_bias(trees),
         float_feature_borders,
         ctr_data: None,
@@ -534,6 +635,132 @@ fn read_float_feature_borders(trees: &TModelTrees) -> Result<Vec<Vec<f64>>, Mode
             *slot = borders;
         }
     }
+    Ok(out)
+}
+
+/// Reconstruct the non-symmetric (Lossguide / Depthwise) trees from a verified
+/// `TModelTrees` (FEAT-06 / D-6.6-05). Returns an EMPTY vector for an oblivious
+/// model (the `NonSymmetricStepNodes` / `NonSymmetricNodeIdToLeafId` vectors are
+/// absent), so the symmetric read path is byte-identical (Pitfall — branch on
+/// presence). A model is EITHER all-oblivious or all-non-symmetric.
+///
+/// Per-tree NODE count comes from `TreeSizes` / `TreeStartOffsets` (which, for a
+/// non-symmetric model, count NODES not splits); per-node global split indices
+/// come from `TreeSplits`; `(left_diff, right_diff)` from `NonSymmetricStepNodes`;
+/// per-node leaf ids from `NonSymmetricNodeIdToLeafId`. The flat `LeafValues` /
+/// `LeafWeights` arrays are sliced per tree by the distinct leaf count (the
+/// number of non-`u32::MAX` node-id entries), un-transposed LEAF-MAJOR →
+/// DIMENSION-MAJOR identically to the oblivious path (Pitfall 6).
+///
+/// # Errors
+/// [`ModelError::Deserialize`] on any out-of-bounds index / ragged length
+/// (T-06.6-06 — every read is checked; nothing panics, no OOB).
+fn reconstruct_non_symmetric(
+    trees: &TModelTrees,
+    bins: &[BinFeature],
+    leaf_values: &flatbuffers::Vector<f64>,
+    leaf_weights: Option<&flatbuffers::Vector<f64>>,
+    dim: usize,
+) -> Result<Vec<NonSymmetricTree>, ModelError> {
+    // An oblivious `.cbm` carries an EMPTY `NonSymmetricStepNodes` (`Some([])`),
+    // not `None`; treat both as "no non-symmetric trees" (byte-identical path).
+    let step_nodes = match trees.NonSymmetricStepNodes() {
+        Some(v) if !v.is_empty() => v,
+        _ => return Ok(Vec::new()),
+    };
+    let node_id_to_leaf_id = trees.NonSymmetricNodeIdToLeafId().ok_or_else(|| {
+        ModelError::Deserialize(
+            "NonSymmetricStepNodes present but NonSymmetricNodeIdToLeafId missing".to_owned(),
+        )
+    })?;
+    let tree_splits = trees
+        .TreeSplits()
+        .ok_or_else(|| ModelError::Deserialize("missing TreeSplits".to_owned()))?;
+    let tree_sizes = trees
+        .TreeSizes()
+        .ok_or_else(|| ModelError::Deserialize("missing TreeSizes".to_owned()))?;
+
+    let mut out = Vec::with_capacity(tree_sizes.len());
+    let mut node_cursor: usize = 0;
+    let mut value_cursor: usize = 0; // stride: distinct_leaves * dim
+    let mut weight_cursor: usize = 0; // stride: distinct_leaves
+
+    for ti in 0..tree_sizes.len() {
+        let node_count = usize::try_from(tree_sizes.get(ti)).map_err(|_| {
+            ModelError::Deserialize("negative non-symmetric tree node count".to_owned())
+        })?;
+
+        let mut node_splits: Vec<crate::ModelSplit> = Vec::with_capacity(node_count);
+        let mut node_steps: Vec<(u16, u16)> = Vec::with_capacity(node_count);
+        let mut node_leaf_ids: Vec<u32> = Vec::with_capacity(node_count);
+        let mut distinct_leaves: usize = 0;
+
+        for off in 0..node_count {
+            let global_node = node_cursor.checked_add(off).ok_or_else(|| {
+                ModelError::Deserialize("non-symmetric node cursor overflow".to_owned())
+            })?;
+            if global_node >= step_nodes.len()
+                || global_node >= node_id_to_leaf_id.len()
+                || global_node >= tree_splits.len()
+            {
+                return Err(ModelError::Deserialize(
+                    "non-symmetric node arrays shorter than declared tree sizes".to_owned(),
+                ));
+            }
+            let sn = step_nodes.get(global_node);
+            let (left_diff, right_diff) = (sn.LeftSubtreeDiff(), sn.RightSubtreeDiff());
+            node_steps.push((left_diff, right_diff));
+
+            let raw_leaf_id = node_id_to_leaf_id.get(global_node);
+            node_leaf_ids.push(raw_leaf_id);
+            let is_leaf = left_diff == 0 && right_diff == 0;
+            if is_leaf {
+                distinct_leaves = distinct_leaves.saturating_add(1);
+                // A leaf node stores a filler split (global index `0` upstream);
+                // the apply walk never reads it. Keep a sentinel placeholder.
+                node_splits.push(crate::ModelSplit::Float(Split {
+                    feature: 0,
+                    border: f64::NEG_INFINITY,
+                }));
+            } else {
+                let gidx = usize::try_from(tree_splits.get(global_node)).map_err(|_| {
+                    ModelError::Deserialize("negative non-symmetric split index".to_owned())
+                })?;
+                let bin = bins.get(gidx).ok_or_else(|| {
+                    ModelError::Deserialize(format!(
+                        "non-symmetric global split index {gidx} out of range (bins: {})",
+                        bins.len()
+                    ))
+                })?;
+                node_splits.push(crate::ModelSplit::Float(Split {
+                    feature: bin.feature,
+                    border: bin.border,
+                }));
+            }
+        }
+        node_cursor = node_cursor.saturating_add(node_count);
+
+        // Slice this tree's leaves (un-transpose LEAF-MAJOR → DIMENSION-MAJOR).
+        let (tree_values, tree_weights) = read_tree_leaves(
+            leaf_values,
+            leaf_weights,
+            value_cursor,
+            weight_cursor,
+            distinct_leaves,
+            dim,
+        )?;
+        value_cursor = value_cursor.saturating_add(distinct_leaves.saturating_mul(dim));
+        weight_cursor = weight_cursor.saturating_add(distinct_leaves);
+
+        out.push(NonSymmetricTree {
+            tree_splits: node_splits,
+            step_nodes: node_steps,
+            node_id_to_leaf_id: node_leaf_ids,
+            leaf_values: tree_values,
+            leaf_weights: tree_weights,
+        });
+    }
+
     Ok(out)
 }
 

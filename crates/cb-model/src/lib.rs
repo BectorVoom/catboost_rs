@@ -34,7 +34,9 @@ pub use ctr_data::{
 pub use error::ModelError;
 pub use fstr::{interaction, prediction_values_change, FeatureImportanceType};
 pub use json::{decode_json, load_json, save_json};
-pub use model::{CtrSplit, Model, ModelSplit, ObliviousTree, Split};
+pub use model::{
+    CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, Split, TreeVariant,
+};
 pub use predict::{
     apply_multiclass_prediction, apply_prediction_type, apply_ve_prediction_type, MultiClassKind,
     PredictionType,

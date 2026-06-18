@@ -32,6 +32,7 @@ fn one_split_tree(feature: usize, border: f64, leaf_values: Vec<f64>) -> Oblivio
 fn scalar_model(border: f64, lo: f64, hi: f64, bias: f64) -> Model {
     Model {
         oblivious_trees: vec![one_split_tree(0, border, vec![lo, hi])],
+        non_symmetric_trees: Vec::new(),
         bias,
         float_feature_borders: vec![vec![border]],
         ctr_data: None,
@@ -70,6 +71,7 @@ fn dim1_byte_identical_empty_and_biasonly() {
     // on both paths.
     let model = Model {
         oblivious_trees: Vec::new(),
+        non_symmetric_trees: Vec::new(),
         bias: -0.75,
         float_feature_borders: vec![vec![0.5]],
         ctr_data: None,
@@ -94,6 +96,7 @@ fn multi_dim_accumulation_dim_major_output() {
     let bias = 1.0;
     let model = Model {
         oblivious_trees: vec![one_split_tree(0, 0.5, leaf_values)],
+        non_symmetric_trees: Vec::new(),
         bias,
         float_feature_borders: vec![vec![0.5]],
         ctr_data: None,
@@ -134,6 +137,7 @@ fn out_of_range_leaf_contributes_zero_no_panic() {
     let bias = 0.5;
     let model = Model {
         oblivious_trees: vec![one_split_tree(0, 0.5, leaf_values)],
+        non_symmetric_trees: Vec::new(),
         bias,
         float_feature_borders: vec![vec![0.5]],
         ctr_data: None,

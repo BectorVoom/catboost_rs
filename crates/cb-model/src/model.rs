@@ -97,6 +97,96 @@ impl ModelSplit {
     }
 }
 
+/// One non-symmetric (Lossguide / Depthwise) tree in the canonical model
+/// (FEAT-06 / D-6.6-05). Mirrors the upstream flat-node serialization triple
+/// (`TreeSplits` per-node + `NonSymmetricStepNodes {LeftSubtreeDiff,
+/// RightSubtreeDiff}` + `NonSymmetricNodeIdToLeafId`, `model.cpp:111-165`),
+/// reusing the existing `TNonSymmetricTreeStepNode` FlatBuffers bindings.
+///
+/// The apply path (06.6-05) is a pointer-walk: start at node `0`, at each node
+/// take `diff = (binarized_value >= split_idx) ? right_subtree_diff :
+/// left_subtree_diff`, advance `index += diff`, stop when `diff == 0` (a leaf),
+/// then `leaf = node_id_to_leaf_id[index]` (RESEARCH Pattern 1). The oblivious
+/// arm is left BYTE-IDENTICAL — this is a SEPARATE variant, NOT a refactor of
+/// the symmetric traversal (D-6.6-05).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonSymmetricTree {
+    /// One split per node, in flat-node order. Each node's split is EITHER a
+    /// float threshold ([`ModelSplit::Float`]) OR a CTR test ([`ModelSplit::Ctr`]),
+    /// mirroring [`ObliviousTree::splits`]. A pure leaf node carries no split,
+    /// so `tree_splits` is indexed by NODE id and only INTERIOR nodes hold a
+    /// meaningful split (a leaf's `step_nodes` entry is `(0, 0)`).
+    pub tree_splits: Vec<ModelSplit>,
+    /// Per-node `(left_subtree_diff, right_subtree_diff)` offsets matching
+    /// `TNonSymmetricTreeStepNode`. A `(0, 0)` entry marks a terminal (leaf)
+    /// node — the walk stops there. For an interior node the chosen diff is
+    /// ADDED to the current node index to reach the next node.
+    pub step_nodes: Vec<(u16, u16)>,
+    /// Per-node index into the flat `leaf_values` (`NonSymmetricNodeIdToLeafId`).
+    /// Only meaningful for terminal nodes (a `(0, 0)` `step_nodes` entry); the
+    /// apply walk reads `node_id_to_leaf_id[index]` once it halts.
+    pub node_id_to_leaf_id: Vec<u32>,
+    /// Leaf values in flat node-graph leaf order (DIMENSION-MAJOR for the
+    /// multi-output case, identical layout discipline to [`ObliviousTree`]).
+    pub leaf_values: Vec<f64>,
+    /// Per-leaf summed training-document weights, same length / order as the
+    /// distinct leaf values (RESEARCH Pitfall 1).
+    pub leaf_weights: Vec<f64>,
+}
+
+/// A tree in the canonical model: EITHER an oblivious (symmetric) tree OR a
+/// non-symmetric (Lossguide / Depthwise) tree (FEAT-06 / D-6.6-05). Every tree
+/// consumer (apply / SHAP / fstr / serialize) matches this enum exhaustively so
+/// the non-symmetric arm can never be silently dropped, and the oblivious arm
+/// stays byte-identical to the pre-6.6 path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TreeVariant {
+    /// A symmetric oblivious tree (the pre-6.6 path, BYTE-IDENTICAL).
+    Oblivious(ObliviousTree),
+    /// A non-symmetric (Lossguide / Depthwise) tree.
+    NonSymmetric(NonSymmetricTree),
+}
+
+impl TreeVariant {
+    /// The oblivious tree if this is an [`TreeVariant::Oblivious`], else `None`.
+    #[must_use]
+    pub fn as_oblivious(&self) -> Option<&ObliviousTree> {
+        match self {
+            Self::Oblivious(t) => Some(t),
+            Self::NonSymmetric(_) => None,
+        }
+    }
+
+    /// The non-symmetric tree if this is an [`TreeVariant::NonSymmetric`], else
+    /// `None`.
+    #[must_use]
+    pub fn as_non_symmetric(&self) -> Option<&NonSymmetricTree> {
+        match self {
+            Self::NonSymmetric(t) => Some(t),
+            Self::Oblivious(_) => None,
+        }
+    }
+
+    /// This tree's leaf values (forward-bit order for oblivious, flat-node leaf
+    /// order for non-symmetric).
+    #[must_use]
+    pub fn leaf_values(&self) -> &[f64] {
+        match self {
+            Self::Oblivious(t) => &t.leaf_values,
+            Self::NonSymmetric(t) => &t.leaf_values,
+        }
+    }
+
+    /// This tree's per-leaf weights (RESEARCH Pitfall 1).
+    #[must_use]
+    pub fn leaf_weights(&self) -> &[f64] {
+        match self {
+            Self::Oblivious(t) => &t.leaf_weights,
+            Self::NonSymmetric(t) => &t.leaf_weights,
+        }
+    }
+}
+
 /// One oblivious (symmetric) tree in the canonical model: the ordered splits, the
 /// per-leaf values (already `learning_rate`-scaled, matching upstream
 /// `model.json`), and the per-leaf summed training-document weights
@@ -124,6 +214,13 @@ pub struct ObliviousTree {
 pub struct Model {
     /// The oblivious trees in boosting (iteration) order.
     pub oblivious_trees: Vec<ObliviousTree>,
+    /// The non-symmetric (Lossguide / Depthwise) trees in boosting order
+    /// (FEAT-06 / D-6.6-05). EMPTY for every pre-6.6 symmetric model, so the
+    /// oblivious `.cbm` / json / apply paths stay byte-identical (a model is
+    /// EITHER all-oblivious or all-non-symmetric — upstream never mixes grow
+    /// policies within one model). The grower (06.6-04) populates this; the
+    /// pointer-walk apply (06.6-05) consumes it.
+    pub non_symmetric_trees: Vec<NonSymmetricTree>,
     /// The starting approx / model bias.
     pub bias: f64,
     /// Per-float-feature ascending candidate borders (`float_feature_borders[f]`
@@ -202,6 +299,9 @@ impl Model {
             .collect();
         Self {
             oblivious_trees,
+            // The trainer-lift path produces only symmetric trees this wave; the
+            // non-symmetric grower (06.6-04) lifts into `non_symmetric_trees`.
+            non_symmetric_trees: Vec::new(),
             bias: trained.bias,
             float_feature_borders,
             ctr_data: None,
