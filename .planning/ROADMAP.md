@@ -515,7 +515,7 @@ Plans:
 
 **Wave 4** *(blocked on 06.6-02, 06.6-03)*
 
-- [ ] 06.6-04-PLAN.md — Unified policy-parameterized leaf-wise grower (Depthwise + Lossguide; Region out) + grow_policy dispatch + from_trained lift; SPLITS oracle-locked, SymmetricTree arm byte-identical (FEAT-06)
+- [x] 06.6-04-PLAN.md — Unified policy-parameterized leaf-wise grower (Depthwise + Lossguide; Region out) + grow_policy dispatch + from_trained lift; SPLITS oracle-locked, SymmetricTree arm byte-identical (FEAT-06)
 
 **Wave 5** *(blocked on 06.6-03, 06.6-04)*
 
