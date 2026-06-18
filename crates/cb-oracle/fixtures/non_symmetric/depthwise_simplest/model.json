@@ -8,8 +8,7 @@
               [
                 0.18058998882770538,
                 0.44028306007385254,
-                0.65408933162689209,
-                0.75142496824264526
+                0.46281838417053223
               ],
             "feature_id":"",
             "feature_index":0,
@@ -33,7 +32,7 @@
   "model_info":
     {
       "catboost_version_info":"Git info:\n    Commit: b1bd2a6d77219e82a1acfcedfccb8e6f6c1ee084\n    Branch: tags/v1.2.10\n    Author: akhropov <akhropov@yandex-team.com>\n    Summary: CatBoost release 1.2.10. commit_hash:f8e0038b19555d36a9ba7b81b6730254b352960d\n    git-svn info:\n    Last Changed Rev: 9293085\n\nOther info:\n    Build by: Unknown user\n    Top src dir: /src/catboost\n",
-      "model_guid":"3f279725-8bae9564-7126c1f9-fc9b34ca",
+      "model_guid":"b26fa472-78272f1c-815891b6-1eebea44",
       "output_options":"{\"name\":\"experiment\",\"verbose\":1,\"test_error_log\":\"test_error.tsv\",\"json_log\":\"catboost_training.json\",\"result_model_file\":\"model\",\"roc_file\":\"\",\"eval_file_name\":\"\",\"use_best_model\":false,\"allow_writing_files\":false,\"prediction_type\":[\"RawFormulaVal\"],\"fstr_internal_file\":\"\",\"output_columns\":[\"SampleId\",\"RawFormulaVal\",\"Label\"],\"snapshot_interval\":600,\"time_left_log\":\"time_left.tsv\",\"fstr_type\":\"FeatureImportance\",\"profile_log\":\"catboost_profile.log\",\"train_dir\":\"catboost_info\",\"learn_error_log\":\"learn_error.tsv\",\"training_options_file\":\"\",\"snapshot_file\":\"experiment.cbsnapshot\",\"save_snapshot\":false,\"model_format\":[\"CatboostBinary\"],\"final_feature_calcer_computation_mode\":\"Default\",\"metric_period\":1,\"output_borders\":\"\",\"final_ctr_computation_mode\":\"Default\",\"best_model_min_trees\":1,\"fstr_regular_file\":\"\"}",
       "params":
         {
@@ -302,6 +301,7 @@
               "loss_function":"RMSE",
               "random_seed":42,
               "random_strength":0,
+              "score_function":"L2",
               "thread_count":1
             },
           "logging_level":"Verbose",
@@ -390,12 +390,12 @@
               "random_strength":0,
               "rsm":1,
               "sampling_frequency":"PerTree",
-              "score_function":"Cosine",
+              "score_function":"L2",
               "sparse_features_conflict_fraction":0
             }
         },
-      "train_finish_time":"2026-06-18T09:07:30Z",
-      "training":"{\"metrics\":{\"learn_best_error\":{\"RMSE\":0.4905168836945314},\"test_metrics_history\":[],\"learn_metrics_history\":[{\"RMSE\":0.6255512438249667},{\"RMSE\":0.4905168836945314}],\"test_best_error\":[]}}"
+      "train_finish_time":"2026-06-18T09:24:26Z",
+      "training":"{\"metrics\":{\"learn_best_error\":{\"RMSE\":0.4861631149964512},\"test_metrics_history\":[],\"learn_metrics_history\":[{\"RMSE\":0.6229116619475122},{\"RMSE\":0.4861631149964512}],\"test_best_error\":[]}}"
     },
   "scale_and_bias":
     [
@@ -429,23 +429,8 @@
           },
         "right":
           {
-            "left":
-              {
-                "value":0.16445454331342241,
-                "weight":11
-              },
-            "right":
-              {
-                "value":0.29447028274361237,
-                "weight":18
-              },
-            "split":
-              {
-                "border":0.65408933162689209,
-                "float_feature_index":0,
-                "split_index":2,
-                "split_type":"FloatFeature"
-              }
+            "value":0.26519498575011791,
+            "weight":29
           },
         "split":
           {
@@ -460,47 +445,32 @@
           {
             "left":
               {
-                "value":0.042437821246619885,
-                "weight":6
+                "value":0.054405068008092083,
+                "weight":8
               },
             "right":
               {
-                "value":-0.041149124746406356,
-                "weight":13
+                "value":-0.035866293838014096,
+                "weight":14
               },
             "split":
               {
                 "border":0.39370405673980713,
                 "float_feature_index":1,
-                "split_index":4,
+                "split_index":3,
                 "split_type":"FloatFeature"
               }
           },
         "right":
           {
-            "left":
-              {
-                "value":0.15415970007953253,
-                "weight":18
-              },
-            "right":
-              {
-                "value":0.22257473127374017,
-                "weight":11
-              },
-            "split":
-              {
-                "border":0.75142496824264526,
-                "float_feature_index":0,
-                "split_index":3,
-                "split_type":"FloatFeature"
-              }
+            "value":0.20392650754249333,
+            "weight":26
           },
         "split":
           {
-            "border":0.44028306007385254,
+            "border":0.46281838417053223,
             "float_feature_index":0,
-            "split_index":1,
+            "split_index":2,
             "split_type":"FloatFeature"
           }
       }

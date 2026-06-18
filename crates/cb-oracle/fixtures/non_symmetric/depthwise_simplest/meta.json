@@ -15,6 +15,7 @@
     "border_count": 32,
     "leaf_estimation_iterations": 1,
     "boost_from_average": false,
+    "score_function": "L2",
     "allow_writing_files": false
   },
   "n_objects": 48,

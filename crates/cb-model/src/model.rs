@@ -297,11 +297,33 @@ impl Model {
                 }
             })
             .collect();
+        // FEAT-06 / D-6.6-04: lift the non-symmetric grower output into
+        // `TreeVariant::NonSymmetric`-shaped `NonSymmetricTree`s, mapping the
+        // per-node float splits to `ModelSplit::Float` exactly as the oblivious lift
+        // does and carrying the node graph (`step_nodes` / `node_id_to_leaf_id`)
+        // verbatim. A model is EITHER all-oblivious or all-non-symmetric, so for an
+        // oblivious model `trained.non_symmetric_trees` is empty and this is a no-op
+        // (the oblivious lift path above stays byte-identical, D-6.6-05). Leaf VALUES
+        // + the apply pointer-walk round-trip land in 06.6-05; this plan lifts the
+        // STRUCTURE (per-node splits + node graph).
+        let non_symmetric_trees = trained
+            .non_symmetric_trees
+            .iter()
+            .map(|t| {
+                let tree_splits: Vec<ModelSplit> =
+                    t.splits.iter().map(|s| ModelSplit::Float(*s)).collect();
+                NonSymmetricTree {
+                    tree_splits,
+                    step_nodes: t.step_nodes.clone(),
+                    node_id_to_leaf_id: t.node_id_to_leaf_id.clone(),
+                    leaf_values: t.leaf_values.clone(),
+                    leaf_weights: t.leaf_weights.clone(),
+                }
+            })
+            .collect();
         Self {
             oblivious_trees,
-            // The trainer-lift path produces only symmetric trees this wave; the
-            // non-symmetric grower (06.6-04) lifts into `non_symmetric_trees`.
-            non_symmetric_trees: Vec::new(),
+            non_symmetric_trees,
             bias: trained.bias,
             float_feature_borders,
             ctr_data: None,

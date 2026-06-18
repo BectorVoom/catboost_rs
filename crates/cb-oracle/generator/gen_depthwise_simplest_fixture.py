@@ -76,6 +76,10 @@ PARAMS = {
     "border_count": 32,
     "leaf_estimation_iterations": 1,
     "boost_from_average": False,
+    # Pin the split-score function to L2 (the first-slice simplest math). CatBoost
+    # defaults to Cosine; cb-train's leaf-wise grower oracle pins L2, so the fixture
+    # MUST pin it too (memory note "cb-train uses L2 but catboost defaults Cosine").
+    "score_function": "L2",
     "allow_writing_files": False,
 }
 
@@ -109,6 +113,7 @@ def main() -> None:
     )
 
     np.save(out_dir / "X.npy", X)
+    np.save(out_dir / "y.npy", y)
 
     staged = np.array(
         list(model.staged_predict(pool, prediction_type="RawFormulaVal")),

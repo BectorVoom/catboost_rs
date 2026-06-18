@@ -43,7 +43,9 @@ use cb_backend::CpuBackend;
 use cb_compute::{LeafMethod, Loss};
 use cb_model::{predict_raw, Model as CbModel};
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, Stage};
-use cb_train::{train, BoostParams, EBootstrapType, EOverfittingDetectorType, Model};
+use cb_train::{
+    train, BoostParams, EBootstrapType, EGrowPolicy, EOverfittingDetectorType, Model,
+};
 use ndarray::Array2;
 use ndarray_npy::read_npy;
 
@@ -216,23 +218,13 @@ fn monotone_oracle_increasing_decreasing() {
 /// entry (not in {-1, 0, +1}) is rejected with a typed [`cb_train::CbError`] —
 /// no fabricated output. This is the SELF-CONTAINED guard reachable today.
 ///
-/// DEFERRED to Plan 06.6-04 (Task 3) — DO NOT silently drop:
-///   * the `monotone_constraints` × `grow_policy ∈ {Lossguide, Depthwise}` typed-error
-///     guard assertion, and
-///   * the `grow_policy == Region` typed-error guard assertion.
-///
-/// Both depend on the `grow_policy` enum/field, which does NOT exist until Plan
-/// 06.6-04 (the plan's do-NOT-invent-a-partial-enum directive). Plan 06.6-04
-/// (Task 3) OWNS adding `grow_policy` and ENABLING those assertions in THIS file
-/// the moment the field lands — see 06.6-04's `files_modified` + acceptance
-/// criteria. Until then, monotone routes ONLY through the oblivious (SymmetricTree)
-/// grower, so the unsupported combinations are unconstructable and no fabricated
-/// output is possible.
-// TODO(06.6-04): enable these two assertions once `grow_policy` exists:
-//   let p = isolating_params(vec![1, 0, -1, 0]); p.grow_policy = GrowPolicy::Lossguide;
-//   assert!(matches!(train(...&p...), Err(CbError::...)));   // non-symmetric × monotone
-//   let p = isolating_params(vec![]);          p.grow_policy = GrowPolicy::Region;
-//   assert!(matches!(train(...&p...), Err(CbError::...)));   // Region escalated gap
+/// ENABLED by Plan 06.6-04 (Task 3) — the two guard assertions DEFERRED by Plan
+/// 06.6-02 (because `grow_policy` did not yet exist) are now reachable since
+/// `grow_policy` lands in 06.6-04 Task 2. The monotone × non-symmetric and Region
+/// typed-error rejections are asserted in
+/// [`monotone_non_symmetric_and_region_are_typed_errors`]. No fabricated
+/// non-symmetric-monotone fixture (no upstream ground truth — D-6.6-07); only the
+/// typed-error rejection is asserted.
 #[test]
 fn monotone_invalid_constraint_is_typed_error() {
     let columns = load_feature_columns();
@@ -246,5 +238,53 @@ fn monotone_invalid_constraint_is_typed_error() {
     assert!(
         result.is_err(),
         "an invalid monotone_constraints entry must be rejected with a typed error"
+    );
+}
+
+/// FEAT-03 / FEAT-06 escalated-gap guards (D-6.6-07), ENABLED here once `grow_policy`
+/// lands (06.6-04 Task 2). Two unsupported combinations must be rejected up front
+/// with a typed [`cb_train::CbError`] — never a trained model, never fabricated
+/// output:
+///
+///   1. `monotone_constraints` × a NON-SYMMETRIC `grow_policy` ({Lossguide,
+///      Depthwise}). Upstream EXPLICITLY rejects monotone constraints under every
+///      non-symmetric grow policy (`monotonic_constraint_utils.h:42`); the monotone
+///      PAVA post-pass is oblivious-only (D-6.6-06), so routing a non-empty
+///      `monotone_constraints` through the leaf-wise grower would silently DROP the
+///      constraint. The guard rejects it instead.
+///   2. `grow_policy == Region` — UNIMPLEMENTED on the CPU path (escalated gap,
+///      D-6.6-04 "Region OUT"); there is no Region grower arm.
+///
+/// These were a commented `// TODO(06.6-04)` stub in this file under Plan 06.6-02
+/// (the `grow_policy` enum did not exist yet); 06.6-04 OWNS enabling them. The
+/// self-contained Region guard + the malformed-direction guard
+/// ([`monotone_invalid_constraint_is_typed_error`]) stay intact.
+#[test]
+fn monotone_non_symmetric_and_region_are_typed_errors() {
+    let columns = load_feature_columns();
+    let target = load_target();
+    let borders: Vec<Vec<f64>> = vec![vec![0.0]; columns.len()];
+
+    // (1) monotone_constraints × non-symmetric grow_policy → typed error. Test BOTH
+    //     non-symmetric policies (Lossguide AND Depthwise).
+    for policy in [EGrowPolicy::Lossguide, EGrowPolicy::Depthwise] {
+        let mut params = isolating_params(vec![-1, 0, 1, 0]);
+        params.grow_policy = policy;
+        let result = train(&CpuBackend, &columns, &borders, &target, &[], &params, None);
+        assert!(
+            result.is_err(),
+            "monotone_constraints under grow_policy={policy:?} must be rejected with a \
+             typed error (monotonic_constraint_utils.h:42, D-6.6-07)"
+        );
+    }
+
+    // (2) grow_policy=Region → typed error (CPU-unimplemented escalated gap). Empty
+    //     monotone_constraints so ONLY the Region rejection is exercised.
+    let mut params = isolating_params(vec![]);
+    params.grow_policy = EGrowPolicy::Region;
+    let result = train(&CpuBackend, &columns, &borders, &target, &[], &params, None);
+    assert!(
+        result.is_err(),
+        "grow_policy=Region must be rejected with a typed error (D-6.6-04 \"Region OUT\")"
     );
 }
