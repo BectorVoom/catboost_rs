@@ -32,7 +32,9 @@ pub use ctr_data::{
     CtrValueTable, ECtrType, Prior,
 };
 pub use error::ModelError;
-pub use fstr::{interaction, prediction_values_change, FeatureImportanceType};
+pub use fstr::{
+    interaction, loss_function_change, prediction_values_change, FeatureImportanceType,
+};
 pub use json::{decode_json, load_json, save_json};
 pub use model::{
     CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, Split, TreeVariant,
