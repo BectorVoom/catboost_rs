@@ -129,7 +129,11 @@ impl Model {
     /// the second index unused (set to the same feature index);
     /// [`FeatureImportanceType::Interaction`] returns the descending-sorted
     /// `(feature_a, feature_b, score)` pairs. Both share one return shape so a
-    /// single method covers the D-07 importance surface.
+    /// single method covers the structure-only D-07 importance surface.
+    ///
+    /// [`FeatureImportanceType::LossFunctionChange`] needs a dataset (features +
+    /// labels) and is NOT available through this data-free method — it returns an
+    /// empty vector here; use [`Model::feature_importance_with_data`] instead.
     #[must_use]
     pub fn feature_importance(
         &self,
@@ -142,6 +146,48 @@ impl Model {
                 .map(|(feature, score)| (feature, feature, score))
                 .collect(),
             FeatureImportanceType::Interaction => interaction(&self.inner),
+            // LossFunctionChange requires labels; not serviceable without a Pool.
+            FeatureImportanceType::LossFunctionChange => Vec::new(),
+        }
+    }
+
+    /// Compute a feature-importance vector for the requested
+    /// [`FeatureImportanceType`] using a dataset (MODEL-03 / D-12; D-6.6-09).
+    ///
+    /// This is the data-bearing companion to [`Model::feature_importance`]. It is
+    /// the ONLY way to obtain [`FeatureImportanceType::LossFunctionChange`], which
+    /// re-evaluates the objective metric with each feature's per-document SHAP
+    /// contribution removed; the result is `(feature, feature, score)` tuples in
+    /// feature-index order. The structure-only variants
+    /// ([`FeatureImportanceType::PredictionValuesChange`] /
+    /// [`FeatureImportanceType::Interaction`]) ignore the dataset and delegate to
+    /// [`Model::feature_importance`].
+    ///
+    /// # Errors
+    /// [`CatBoostError`] if the pool's feature columns cannot be projected.
+    pub fn feature_importance_with_data(
+        &self,
+        importance_type: FeatureImportanceType,
+        pool: &Pool,
+    ) -> Result<Vec<(usize, usize, f64)>, CatBoostError> {
+        match importance_type {
+            FeatureImportanceType::PredictionValuesChange
+            | FeatureImportanceType::Interaction => Ok(self.feature_importance(importance_type)),
+            FeatureImportanceType::LossFunctionChange => {
+                let columns = self.feature_columns(pool)?;
+                let labels = pool.label().to_vec();
+                let scores = cb_model::loss_function_change(
+                    &self.inner,
+                    &columns,
+                    &labels,
+                    self.n_float_features(),
+                );
+                Ok(scores
+                    .into_iter()
+                    .enumerate()
+                    .map(|(feature, score)| (feature, feature, score))
+                    .collect())
+            }
         }
     }
 

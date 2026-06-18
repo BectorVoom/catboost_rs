@@ -1,0 +1,4 @@
+# Plan 06.6-06 fixture marker (D-6.6-09 / D-6.6-10).
+# The runnable fixtures (oracle npy vectors, binclf X/y, the non-symmetric .cbm/json,
+# and the offline generator gen_fixtures.py) live under
+# crates/cb-oracle/fixtures/fstr_loss_change/ where the test fixture() helper resolves them.

@@ -1,0 +1,54 @@
+{
+  "artifacts": [
+    "oblivious_loss_function_change.npy",
+    "binclf_X.npy",
+    "binclf_y.npy",
+    "non_symmetric_model.cbm",
+    "non_symmetric_model.json",
+    "non_symmetric_pvc.npy",
+    "non_symmetric_interaction.npy",
+    "non_symmetric_loss_function_change.npy"
+  ],
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "non_symmetric_interaction": [
+    [
+      0.0,
+      3.0,
+      64.65405595423682
+    ],
+    [
+      0.0,
+      1.0,
+      26.683095696754194
+    ],
+    [
+      1.0,
+      3.0,
+      8.662848349008975
+    ]
+  ],
+  "non_symmetric_loss_function_change": [
+    0.02869356909635712,
+    0.011652415179523312,
+    0.0,
+    0.1496451097662519
+  ],
+  "non_symmetric_pvc": [
+    18.42376760324687,
+    5.401325827213403,
+    0.0,
+    76.17490656953973
+  ],
+  "note": "06.6-06: LossFunctionChange (MODEL-03/D-12) + non-symmetric PVC/Interaction (D-6.6-10). All vectors from catboost 1.2.10 get_feature_importance(...). Oblivious model = the binclf params; non-symmetric model = Depthwise max_depth=3.",
+  "oblivious_loss_function_change": [
+    0.013190765002674132,
+    0.0,
+    0.0,
+    0.06321635368335143
+  ],
+  "scenario": "fstr_loss_change",
+  "seed_non_symmetric": 42,
+  "seed_oblivious": 0,
+  "thread_count": 1
+}
