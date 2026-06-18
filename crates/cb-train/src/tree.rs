@@ -1134,7 +1134,13 @@ pub fn leaf_wise_grower(
     // `tree_splits` indexed-by-node contract in cb-model::NonSymmetricTree).
     let node_count = nodes.len();
     let mut step_nodes: Vec<(u16, u16)> = Vec::with_capacity(node_count);
-    let mut node_id_to_leaf_id: Vec<u32> = vec![0; node_count];
+    // `u32::MAX` is the INTERIOR-node sentinel, matching the cbm serializer's
+    // `distinct_leaves` filter (cbm.rs:200 counts only ids `!= u32::MAX` as real
+    // leaves). Interior slots stay at this sentinel; only `BuiltNode::Leaf` arms
+    // overwrite their slot with a real distinct leaf id. Without this, interior
+    // nodes default to `0`, get mis-counted as leaves, and `save_cbm` fails with
+    // `ModelError::SchemaVersion` (CR-02).
+    let mut node_id_to_leaf_id: Vec<u32> = vec![u32::MAX; node_count];
     let mut splits: Vec<Split> = Vec::with_capacity(node_count);
     let mut next_leaf_id: u32 = 0;
     // Map node id → distinct leaf id for terminal nodes (assigned in node order).
@@ -1143,10 +1149,33 @@ pub fn leaf_wise_grower(
         match node {
             BuiltNode::Interior { split, left, right } => {
                 splits.push(*split);
+                // Interior nodes carry the `u32::MAX` interior sentinel explicitly
+                // (the init already covers it; this keeps the intent local to the
+                // arm and matches the cbm.rs:200 `distinct_leaves` filter — CR-02).
+                node_id_to_leaf_id[id] = u32::MAX;
                 // step diffs are (child_id - this_id), the upstream
                 // `LeftSubtreeDiff` / `RightSubtreeDiff` offsets added to walk down.
-                let ld = (*left - id) as u16;
-                let rd = (*right - id) as u16;
+                // Children are registered after their parent, so both diffs are
+                // positive. Convert via checked `u16::try_from` (NOT a bare
+                // `as u16`) so an out-of-u16-range diff at extreme `max_depth`
+                // surfaces as a typed `CbError::OutOfRange` instead of silently
+                // truncating the topology (CR-01).
+                let ld = u16::try_from(*left - id).map_err(|_| {
+                    CbError::OutOfRange(format!(
+                        "non-symmetric step-node child diff {} at node {} exceeds \
+                         u16 range (max_depth too large for the flat node encoding)",
+                        *left - id,
+                        id
+                    ))
+                })?;
+                let rd = u16::try_from(*right - id).map_err(|_| {
+                    CbError::OutOfRange(format!(
+                        "non-symmetric step-node child diff {} at node {} exceeds \
+                         u16 range (max_depth too large for the flat node encoding)",
+                        *right - id,
+                        id
+                    ))
+                })?;
                 step_nodes.push((ld, rd));
             }
             BuiltNode::Leaf => {
