@@ -20,6 +20,7 @@
 
 mod custom;
 mod histogram;
+mod lda_linalg;
 mod leaf;
 mod loss;
 mod pairwise_scoring;
@@ -33,6 +34,9 @@ pub use custom::{
 };
 pub use histogram::{
     collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
+};
+pub use lda_linalg::{
+    calculate_projection, jacobi_symmetric_eig, reduce_generalized, sgemv_rowmajor, SymmetricEig,
 };
 pub use leaf::{
     calc_average, exact_leaf_delta, gradient_leaf_delta, logcosh_exact_leaf_delta,
@@ -77,6 +81,8 @@ pub use text_calcers::{
 
 #[cfg(test)]
 mod histogram_test;
+#[cfg(test)]
+mod lda_linalg_test;
 #[cfg(test)]
 mod leaf_test;
 #[cfg(test)]
