@@ -497,7 +497,7 @@ Plans:
   3. Alternative grow policies Lossguide/Depthwise produce true non-symmetric trees — full train + non-symmetric apply + `.cbm`/json round-trip oracle-locked ≤1e-5 (D-10; touches `cb-train` AND `cb-model`, wiring into the existing `TNonSymmetricTree*` bindings; its own multi-wave gate). **Region is OUT OF SCOPE** (CPU-unimplemented upstream → no ground truth) and **non-symmetric monotone is OUT OF SCOPE** (upstream rejects it) — both recorded as escalated gaps and enforced by typed-error guards, not built (06.6-RESEARCH gate 1, D-6.6-07).
   4. Advanced fstr — ShapInteractionValues, PredictionDiff, SAGE — and the deferred MODEL-03 LossFunctionChange importance (D-12) match upstream ≤1e-5.
 
-**Plans**: 8 plans in 7 waves (Gate A symmetric-features-first → Gate B non-symmetric engine multi-wave gate → Gate C advanced fstr → Gate D feature selection LAST, per D-6.6-01..03)
+**Plans**: 8 plans in 7 waves + 1 gap-closure plan (Gate A symmetric-features-first → Gate B non-symmetric engine multi-wave gate → Gate C advanced fstr → Gate D feature selection LAST, per D-6.6-01..03; gap-closure 06.6-09 closes the SC-3 grower→save→load→predict gap)
 
 Plans:
 
@@ -529,6 +529,10 @@ Plans:
 **Wave 7** — Gate D (feature selection LAST, blocks on Gate C)
 
 - [x] 06.6-08-PLAN.md — Recursive feature selection by ShapValues / PredictionValuesChange / LossFunctionChange (NEW cb-train module, no new crate), selected/eliminated set oracle (FEAT-05 / SC-2 complete)
+
+**Wave 8** — Gap closure (verification gaps_found 4/5, SC-3 partial)
+
+- [ ] 06.6-09-PLAN.md — Close CR-02 sentinel mismatch: leaf_wise_grower finalization inits node_id_to_leaf_id to u32::MAX (interior sentinel) + checked u16::try_from step-node diffs (CR-01); NEW cb-model oracle test trains a non-symmetric model via the Rust grower → save_cbm → load_cbm → predict ≤1e-5 (FEAT-06 / SC-3 grower→save→load→predict complete)
 
 ### Phase 7: GPU Backends via CubeCL
 
