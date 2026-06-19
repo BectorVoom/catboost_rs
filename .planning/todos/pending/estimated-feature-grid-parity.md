@@ -24,12 +24,41 @@ area: cb-train estimated-feature quantization / serialization
   unchanged quantizer stores `0.5`. KNN stored-border hard gate passes exactly; XOR fixture
   added with both estimated features load-bearing.
 - **Residual (gate NOT relaxed — no `#[ignore]`, no weakened tolerance):** the XOR per-stage
-  in-order parity exposes a *deeper* learn-permutation divergence the degenerate SC-4 corpus
-  masked — the online estimated-column per-doc values use the identity permutation in Rust vs
-  upstream's fold learn permutation (e.g. predictions[0] `0.0238` vs `−0.1480`). Closing it
-  requires threading the estimated-feature learn permutation through the `build_mixed → train`
-  seam (Rule-4 architectural; same fold-cycling subsystem as 05-17/05-19; ideally with the
-  instrumented trainer). Pinned by an honest residual test that trips when the follow-up lands.
+  in-order parity is OPEN. The KNN stored-border VALUE (0.5) is closed; per-stage is not.
+
+### CORRECTION (2026-06-19, second pass — the "thread the permutation" fix is DISPROVEN)
+
+The earlier note guessed the residual was just "Rust uses the identity permutation; thread
+the averaging-fold learn permutation." **An empirical search disproved that.** Building the
+pre-baked online KNN column over every plausible learn permutation —
+`identity`, `S = create_shuffled_indices(n,seed)`, `Q = averaging_ctr_permutation(n,lf,seed)`
+for `lf∈{1,2,3}`, `permutations(n,4,seed)[0..3]`, the `S∘perm` compositions, and all their
+inverses — and training, the BEST max|pred−upstream| was **~0.32** (need ≤1e-5). Re-applying
+the online-trained trees to the OFFLINE columns (next hypothesis) also floored at ~0.32. So a
+column/permutation swap **cannot** close per-stage parity.
+
+**The true (deeper) root cause — three coupled gaps the degenerate SC-4 corpus masked:**
+1. **Train-vs-apply feature-source split.** Upstream builds tree STRUCTURE + LEAF VALUES on the
+   per-fold **ONLINE** estimated features (leakage-controlled), but the fixture's `staged.npy`
+   /`predictions.npy` are `model.staged_predict`/`model.predict` on the pool — i.e. the trees
+   **re-applied to the OFFLINE (application) estimated features** (`data.cpp:537`
+   `EstimatedObjectsData`, `learnPermutation = Nothing()`). Rust's `train()` uses ONE pre-baked
+   column for BOTH, so neither online nor offline alone (nor online-train+offline-apply) matches.
+2. **Multi-permutation fold averaging.** `permutation_count = 4` → upstream AVERAGES the
+   estimated-feature-driven leaf values over multiple permutation folds. The recurring IDENTICAL
+   `0.324` across many distinct single permutations shows the single-fold Rust model sits a fixed
+   structural distance from upstream regardless of which one permutation is chosen — the gap is the
+   averaging, not the choice.
+3. **Online features are per-iteration dynamic.** A single static pre-baked column cannot capture
+   the ordered/averaging-fold dynamics upstream evolves across boosting iterations.
+
+**Therefore closing per-stage parity is a CORE BOOSTING-LOOP change, not a `build_mixed` tweak:**
+thread SEPARATE online (per-fold, structure+leaves) and offline (application, predictions)
+estimated-feature column sets through `train()`/predict, AND reproduce the multi-permutation
+fold averaging of estimated-feature leaf values. This is multi-day architectural work touching
+the core training loop with regression risk to the entire oracle suite; the instrumented trainer
+should confirm the exact per-fold online columns + averaging weights before implementation.
+The honest residual test (`xor_oracle_per_stage_residual_…`) stays RED-on-success and is the gate.
 
 ---
 

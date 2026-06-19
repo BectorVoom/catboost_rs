@@ -603,25 +603,38 @@ fn xor_oracle_both_estimated_features_are_load_bearing() {
 // load-bearing, proven above), so it is the correct HARD gate for full per-stage
 // parity.
 //
-// One deeper divergence surfaces under XOR that the degenerate SC-4 corpus masked:
-// the ONLINE estimated-feature column's PER-DOCUMENT values depend on the LEARN
-// PERMUTATION (read-before-update order). `build_mixed_estimated_features` computes
-// the online column over the IDENTITY permutation, while upstream computes it over
-// the structure-search fold's learn permutation (`estimated_features.cpp:472-478`
-// `ComputeOnlineFeatures(*learnPermutation, ...)`). The distinct-value SET is
-// permutation-invariant ({0,1,2} -> borders {0.5,1.5}, so the STORED border 0.5 is
-// exact), but the per-doc PARTITION differs, so StagedApprox/Predictions and the
-// in-order Splits diverge (first split divergence: tree-index border 0.5 vs 1.5;
-// predictions[0] 0.0238 vs Rust-identity -0.1480).
+// A deeper divergence surfaces under XOR that the degenerate SC-4 corpus masked.
+// NOTE (2026-06-19 second-pass): the first guess — "just thread the averaging-fold
+// learn permutation into the pre-baked online column" — was EMPIRICALLY DISPROVEN.
+// Building the online KNN column over every plausible learn permutation (identity,
+// S = create_shuffled_indices, Q = averaging_ctr_permutation(lf=1..3),
+// permutations(n,4,seed)[0..3], the S∘perm compositions and all inverses), training,
+// AND re-applying the trees to the OFFLINE columns, floors at max|pred−upstream| ≈
+// 0.32 (need ≤1e-5). The recurring IDENTICAL ~0.324 across distinct permutations
+// shows the single-fold Rust model sits a fixed structural distance from upstream
+// regardless of which one permutation is chosen.
 //
-// This is NOT a border-algorithm regression and NOT relaxable here: closing it
-// requires threading the exact estimated-feature learn permutation (the same
-// fold-cycling subsystem reverse-engineered for CTRs in 05-17/05-19) through the
-// `build_mixed_estimated_features` -> `train` seam, which is an architectural
-// change beyond this quick task. The residual is recorded precisely below and the
-// frozen upstream XOR fixture + generator `--xor` arm are committed so the
+// The TRUE root cause is three coupled, architectural gaps:
+//   (1) Train-vs-apply source split: upstream builds STRUCTURE + LEAF VALUES on the
+//       per-fold ONLINE estimated features, but staged.npy/predictions.npy are
+//       model.staged_predict/predict on the pool — the trees re-applied to the
+//       OFFLINE (application) estimated features (`data.cpp:537` EstimatedObjectsData,
+//       learnPermutation = Nothing). Rust's `train()` uses ONE pre-baked column for
+//       both, so neither online, offline, nor online-train+offline-apply matches.
+//   (2) Multi-permutation fold averaging: permutation_count = 4 averages the
+//       estimated-feature-driven leaf values over folds (the source of the fixed
+//       0.324 gap above).
+//   (3) Online features are per-iteration dynamic; a single static column cannot
+//       capture the averaging-fold dynamics across boosting iterations.
+//
+// Closing per-stage parity is therefore a CORE BOOSTING-LOOP change — thread SEPARATE
+// online (structure+leaves) and offline (apply) estimated-feature column sets through
+// `train()`/predict AND reproduce the multi-permutation fold averaging — NOT a
+// `build_mixed_estimated_features` permutation tweak. The residual is recorded
+// precisely below; the frozen XOR fixture + generator `--xor` arm are committed so the
 // follow-up plan flips this assertion to a full per-stage ≤1e-5 / in-order gate
-// WITHOUT regenerating anything.
+// WITHOUT regenerating anything. Full writeup:
+// `.planning/todos/pending/estimated-feature-grid-parity.md`.
 //
 // The assertion here is HONEST (no ignored tests, no weakened tolerance, no leaf-order
 // relaxation): it asserts the EXACT, documented residual — that the identity-perm
