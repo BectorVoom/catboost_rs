@@ -10,7 +10,6 @@ use crate::estimated::online_embedding::{
     online_knn_prefix, online_lda_prefix,
 };
 
-const DIM: usize = 4;
 const REG: f32 = 0.05;
 
 #[rustfmt::skip]
