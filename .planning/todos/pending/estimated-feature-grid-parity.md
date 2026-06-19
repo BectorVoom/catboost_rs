@@ -5,10 +5,18 @@ priority: medium
 status: pending
 origin: Phase 06.5 (deferred in 06.5-07, confirmed still-open after 06.5-08/09)
 blocks: nothing (non-blocking — FEAT-01/FEAT-02/SC-1..SC-4 all closed ≤1e-5)
-area: cb-train estimated-feature quantization / serialization
+area: cb-train estimated-feature KNN calcer (online HNSW port) — NOT quantization/serialization
 ---
 
 # Estimated-feature stored-border grid parity
+
+> **TL;DR (2026-06-19, instrumented-trainer verdict — read the "DEFINITIVE ROOT CAUSE" section
+> below):** This is NOT a quantization/serialization or boosting-loop issue. The XOR per-stage
+> residual is blocked by ONE thing: upstream's KNN estimated-feature calcer uses **online HNSW**
+> (approximate NN), while the Rust calcer is brute-force-EXACT (A2/D-05 deferred the HNSW crate).
+> They return different neighbors on the XOR corpus → columns diverge. Closing it = **port
+> `library/cpp/online_hnsw` (~936 LOC) to Rust bit-for-bit**, its own focused phase. The
+> stored-border VALUE (0.5) and the boosting-loop ordering are already understood/easy.
 
 ## Progress — quick task 260619-cpr (2026-06-19)
 
@@ -55,10 +63,55 @@ column/permutation swap **cannot** close per-stage parity.
 **Therefore closing per-stage parity is a CORE BOOSTING-LOOP change, not a `build_mixed` tweak:**
 thread SEPARATE online (per-fold, structure+leaves) and offline (application, predictions)
 estimated-feature column sets through `train()`/predict, AND reproduce the multi-permutation
-fold averaging of estimated-feature leaf values. This is multi-day architectural work touching
-the core training loop with regression risk to the entire oracle suite; the instrumented trainer
-should confirm the exact per-fold online columns + averaging weights before implementation.
-The honest residual test (`xor_oracle_per_stage_residual_…`) stays RED-on-success and is the gate.
+fold averaging of estimated-feature leaf values.
+
+### DEFINITIVE ROOT CAUSE (2026-06-19, fourth pass — INSTRUMENTED TRAINER, this supersedes all above)
+
+The earlier "structure-fold cycling + averaging fold `Q(lf=3)`" recipe was a hypothesis from
+offline diagnostics and is **DISPROVEN** by the instrumented catboost 1.2.10 trainer (rebuilt this
+session; faithful — reproduces the XOR predictions bit-identical, `max|diff| = 0.0`). The dump
+(`/tmp/xor_instr.jsonl`, events `est_call`/`est_col`/`structure_fold`/`tree_struct`/`leaf_indices`/
+`leaf_partition`/`knn_neighbors`) shows:
+
+1. **NO structure-fold cycling.** `structure_fold` logs `fold_count=1, taken_fold=0` for EVERY
+   iteration. Plain + no CTRs ⇒ `permutation_needed_for_learning=false` ⇒ `learning_fold_count=1`.
+   The boosting-loop rework (per-fold cycling) was the WRONG premise — reverted.
+2. **The online estimated column is a SINGLE static column over `S`** (not `Q`). Both online
+   `est_call`s use the IDENTITY fold permutation over the S-shuffled learn data
+   (`fold_cc … "before_averaging" … "is_permuted":0` — the averaging fold is NOT permuted without
+   CTRs/ordered), i.e. original-object visiting order = `S = create_shuffled_indices(n, seed)`.
+   Structure + leaves + approx all use this one column; predictions apply the OFFLINE column.
+   So the boosting-loop part is SIMPLE (single online-over-`S` column for training + offline
+   post-hoc apply — NO `train_inner` change, NO cycling, NO folded machinery).
+3. **THE REAL BLOCKER — upstream's KNN calcer is ONLINE HNSW, not exact kNN.**
+   `knn.cpp:42` / `knn.h:17,109`: `TOnlineHnswDenseVectorIndex<float, TL2SqrDistance<float>>`,
+   `GetNearestNeighbors<…NOnlineHnsw…>(embed, knum, /*searchNeighborhoodSize*/300, …)`,
+   built with `TOnlineHnswBuildOptions({CloseNum=k, 300})`. The incremental HNSW graph returns
+   **APPROXIMATE** neighbors. Concrete evidence from `knn_neighbors`: for cloud-B query doc6 over
+   prefix `{14,15,0,7,4}`, the exact 3-NN are `{0,2,4}` (all cloud-B = the Rust brute-force result),
+   but upstream's HNSW returns `{1,3,4}` (two cloud-A — wrong-vs-exact). My/upstream prefix
+   neighbors agree for p0–p4 (as sets) and DIVERGE from p5 on. The Rust KNN is brute-force-EXACT
+   (Phase 6.5 **A2/D-05: "no third-party HNSW crate"**), so it CANNOT reproduce upstream's
+   approximate-HNSW neighbors → the online + offline KNN columns diverge → per-stage parity fails.
+   (There is also a class-vote-order flip: upstream feat0 = class-1 vote, Rust `[class0,class1]`.)
+
+**Conclusion: closing the XOR per-stage ≤1e-5 gate requires porting upstream's online HNSW
+(`library/cpp/online_hnsw`, ~936 LOC: dynamic dense graph + incremental insert + HNSW search,
+`TL2SqrDistance`, RNG-driven graph construction) to Rust bit-for-bit.** This is a deliberately
+deferred dependency (A2/D-05) and is realistically its OWN focused phase, NOT a continuation of
+this todo. It is the dominant blocker; the boosting-loop / column-ordering parts are easy once the
+KNN columns match upstream.
+
+**Instrumented trainer (rebuild recipe for the HNSW work):** clang-18+lld-18 via `apt-get download`
++ `dpkg -x` to `/tmp/clang18_prefix`; conan/ninja/cython via `uv` (persist in `~/.local/bin`);
+`build/build_native.py --targets _catboost --cmake-{target,build}-toolchain build/toolchains/clang.toolchain`
+→ `lib_catboost.so`; copy to `/tmp/cb_instr_pkg/catboost/_catboost.so`, run with
+`PYTHONPATH=/tmp/cb_instr_pkg CB_INSTRUMENT_LOG=… LD_LIBRARY_PATH=/tmp/clang18_prefix/usr/lib/...`.
+`estimated_features.cpp` carries an added `est_col`/`est_call` dump (full per-object estimated
+columns + per-call online/offline + fold perm); `/tmp/run_xor_instr.py` is the XOR fit script.
+
+The honest residual test (`xor_oracle_per_stage_residual_…`) stays RED-on-success until the HNSW
+port lands. The `text_embedding_xor/` fixture is frozen and ready; no regeneration needed.
 
 ---
 
