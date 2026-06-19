@@ -10,6 +10,29 @@ area: cb-train estimated-feature quantization / serialization
 
 # Estimated-feature stored-border grid parity
 
+## Progress — quick task 260619-cpr (2026-06-19)
+
+**Partially closed; narrowed residual remains (this todo stays open).** See
+`.planning/quick/260619-cpr-estimated-feature-stored-border-value-qu/260619-cpr-SUMMARY.md`.
+
+- **Root cause found:** the `0.5` vs `1.5` divergence is a column-VALUE divergence, NOT a
+  border-algorithm gap. Upstream KNN is an `IOnlineFeatureEstimator` fed the online
+  read-before-update estimate → vote distribution `{0,1,…,k}` (first border `0.5`); Rust
+  used the offline whole-set estimate → `{0,k}` (border `k/2 = 1.5`). `select_borders_greedy_logsum`
+  is upstream-exact and was left unchanged.
+- **Fixed:** KNN block now routes through `online_knn_prefix` via `embedding_online`; the
+  unchanged quantizer stores `0.5`. KNN stored-border hard gate passes exactly; XOR fixture
+  added with both estimated features load-bearing.
+- **Residual (gate NOT relaxed — no `#[ignore]`, no weakened tolerance):** the XOR per-stage
+  in-order parity exposes a *deeper* learn-permutation divergence the degenerate SC-4 corpus
+  masked — the online estimated-column per-doc values use the identity permutation in Rust vs
+  upstream's fold learn permutation (e.g. predictions[0] `0.0238` vs `−0.1480`). Closing it
+  requires threading the estimated-feature learn permutation through the `build_mixed → train`
+  seam (Rule-4 architectural; same fold-cycling subsystem as 05-17/05-19; ideally with the
+  instrumented trainer). Pinned by an honest residual test that trips when the follow-up lands.
+
+---
+
 The exact border **values** upstream catboost 1.2.10 stores for *estimated* (text /
 embedding) feature columns do not bit-match the Rust-selected grid, even though
 trained-model **predictions still match ≤1e-5**. Phase 06.5 closed the calcer math

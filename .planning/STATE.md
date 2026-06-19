@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 Phase: 07
 Plan: Not started
 Status: Executing Phase 06.6 — 06.6-09 gap-closure COMPLETE
-Last activity: 2026-06-19 - Completed quick task 260619-bac: fix builder_oracle_test score-function mismatch
+Last activity: 2026-06-19 - Completed quick task 260619-cpr: estimated-feature stored-border-VALUE grid parity (KNN border now 0.5; per-stage permutation residual scoped)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -322,6 +322,7 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260619-bac | Fix builder_oracle_test score-function mismatch — expose `.score_function()` on CatBoostBuilder (default stays Cosine), re-export `EScoreFunction`, test opts into L2, fix false borders docstring. Both legs now pass ≤1e-5. | 2026-06-19 | 3ff254d | [260619-bac-fix-builder-oracle-test-score-function-m](./quick/260619-bac-fix-builder-oracle-test-score-function-m/) |
+| 260619-cpr | Estimated-feature stored-border-VALUE grid parity (Phase 06.5 deferral). Root cause: upstream KNN is an online estimator → vote distribution {0..k} (border 0.5); Rust used offline {0,k} (border 1.5). Fix: route KNN block through `online_knn_prefix` via `embedding_online`; unchanged quantizer now stores **0.5**. XOR hard fixture added; KNN stored-border gate exact + both features load-bearing. **Residual (gate NOT relaxed):** XOR per-stage in-order parity exposes a deeper learn-permutation divergence (per-doc online column uses identity vs upstream fold perm) — pinned by an honest residual test, scoped follow-up to thread the estimated-feature learn permutation through `build_mixed → train`. | 2026-06-19 | e739f81 | [260619-cpr-estimated-feature-stored-border-value-qu](./quick/260619-cpr-estimated-feature-stored-border-value-qu/) |
 
 ## Deferred Items
 
