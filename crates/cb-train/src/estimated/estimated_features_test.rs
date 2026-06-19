@@ -157,6 +157,7 @@ fn mixed_empty_yields_no_features() {
         &[],
         2,
         3,
+        false,
         &TokenizerOptions::default(),
         254,
     )
@@ -180,6 +181,7 @@ fn mixed_numeric_only_is_inert_estimated_path() {
         &labels(),
         2,
         3,
+        false,
         &TokenizerOptions::default(),
         254,
     )
@@ -207,6 +209,7 @@ fn mixed_block_layout_order_and_counts() {
         &labels(),
         2,
         3,
+        false,
         &TokenizerOptions::default(),
         254,
     )
@@ -250,8 +253,147 @@ fn mixed_rejects_length_mismatch() {
         &labels(),
         2,
         3,
+        false,
         &TokenizerOptions::default(),
         254,
     );
     assert!(res.is_err(), "mismatched numeric column must be rejected");
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-01 residual: the KNN estimated-feature stored-border-VALUE root cause.
+//
+// The stored-border divergence (upstream 0.5 vs Rust-offline 1.5) is a column-
+// VALUE divergence, NOT a border-algorithm divergence: `select_borders_greedy_
+// logsum` is UNCHANGED. Upstream's KNN is an `IOnlineFeatureEstimator`, so the
+// border-computing visitor is fed the ONLINE read-before-update prefix estimate
+// (`estimated_features.cpp:472-478 ComputeOnlineFeatures(*learnPermutation,...)`),
+// whose vote-count column has distinct values {0,1,…,k} -> first greedy-logsum
+// border 0.5. The OFFLINE whole-set estimate inserts every doc first (each doc is
+// its own neighbor), so a perfectly-separated k=3 cloud yields distinct values
+// {0,k} -> border k/2 (1.5). These tests pin BOTH distributions through the SAME
+// unchanged quantizer.
+// ---------------------------------------------------------------------------
+
+/// Distinct values of a column, sorted ascending (helper).
+fn distinct_sorted(col: &[f32]) -> Vec<f32> {
+    let mut v: Vec<f32> = col.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    v.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
+    v
+}
+
+/// OFFLINE KNN block: a perfectly-separated k=3 cloud gives each document 3
+/// same-class neighbors (the doc is its own neighbor at distance 0), so the
+/// per-class vote column's distinct values are {0, 3} and the UNCHANGED quantizer
+/// emits the single border 1.5 (= 3/2). This is the column-VALUE distribution that
+/// does NOT match upstream's stored border.
+#[test]
+fn offline_knn_block_distinct_is_zero_k_border_is_half_k() {
+    let feats = build_mixed_estimated_features(
+        &[],
+        &[],
+        &embeddings(),
+        &labels(),
+        2,
+        3,
+        false, // OFFLINE whole-set estimate
+        &TokenizerOptions::default(),
+        254,
+    )
+    .expect("offline mixed ok");
+    assert_eq!(feats.embedding_feature_count, 2, "two class-vote columns");
+    let knn_base = feats.numeric_feature_count + feats.text_feature_count;
+    for f in knn_base..feats.columns.len() {
+        let dv = distinct_sorted(&feats.columns[f]);
+        assert_eq!(dv, vec![0.0_f32, 3.0_f32], "offline KNN col {f} distinct = {{0, k}}");
+        // The UNCHANGED greedy-logsum quantizer over {0,3} -> single border 1.5.
+        assert_eq!(feats.borders[f].len(), 1, "offline KNN col {f}: one border");
+        assert!(
+            (feats.borders[f][0] - 1.5).abs() <= 1e-9,
+            "offline KNN col {f} border must be 1.5 (= k/2), got {}",
+            feats.borders[f][0]
+        );
+    }
+}
+
+/// ONLINE KNN block (upstream border source): the read-before-update prefix
+/// estimate over the identity learn permutation gives early-prefix documents
+/// `< k` (or mixed-class) neighbors, so the per-class vote column's distinct
+/// values are {0, 1, 2, 3} and the UNCHANGED greedy-logsum quantizer's FIRST
+/// border is 0.5 — EXACTLY upstream's stored KNN border. The fix moves the stored
+/// border VALUE from 1.5 to 0.5 by changing the COLUMN VALUES only; the binarizer
+/// is byte-identical to the offline path.
+#[test]
+fn online_knn_block_distinct_is_zero_to_k_first_border_is_half() {
+    let feats = build_mixed_estimated_features(
+        &[],
+        &[],
+        &embeddings(),
+        &labels(),
+        2,
+        3,
+        true, // ONLINE read-before-update estimate (upstream border source)
+        &TokenizerOptions::default(),
+        254,
+    )
+    .expect("online mixed ok");
+    assert_eq!(feats.embedding_feature_count, 2, "two class-vote columns");
+    let knn_base = feats.numeric_feature_count + feats.text_feature_count;
+    for f in knn_base..feats.columns.len() {
+        let dv = distinct_sorted(&feats.columns[f]);
+        // The separated cloud's online distinct set is {0,1,2,3} (permutation-
+        // invariant in its SET); at minimum it contains 0 and 1 so the lowest
+        // border is 0.5.
+        assert!(
+            dv.contains(&0.0) && dv.contains(&1.0),
+            "online KNN col {f} distinct {dv:?} contains 0 and 1 (-> border 0.5)"
+        );
+        assert!(
+            !feats.borders[f].is_empty(),
+            "online KNN col {f}: a non-degenerate column gets a border"
+        );
+        // The FIRST greedy-logsum border is the {0,1} midpoint = 0.5, which is
+        // upstream's stored KNN border (estimated_features.cpp ComputeOnlineFeatures).
+        assert!(
+            (feats.borders[f][0] - 0.5).abs() <= 1e-9,
+            "online KNN col {f} first border must be 0.5 (upstream stored), got {}",
+            feats.borders[f][0]
+        );
+    }
+}
+
+/// The binarizer is byte-identical across the two modes — ONLY the column VALUES
+/// differ (the column-VALUE root cause). The BoW text block (identical in both
+/// modes) borders at 0.5 regardless, confirming the quantizer itself is unchanged
+/// and the KNN border move is purely a column-value effect.
+#[test]
+fn online_vs_offline_differ_only_in_embedding_column_values() {
+    let off = build_mixed_estimated_features(
+        &[numeric_col()], &corpus(), &embeddings(), &labels(), 2, 3, false,
+        &TokenizerOptions::default(), 254,
+    )
+    .expect("offline mixed ok");
+    let on = build_mixed_estimated_features(
+        &[numeric_col()], &corpus(), &embeddings(), &labels(), 2, 3, true,
+        &TokenizerOptions::default(), 254,
+    )
+    .expect("online mixed ok");
+    // Numeric + text blocks (and their borders) are byte-identical across modes.
+    assert_eq!(off.numeric_feature_count, on.numeric_feature_count);
+    assert_eq!(off.text_feature_count, on.text_feature_count);
+    let shared = off.numeric_feature_count + off.text_feature_count;
+    for f in 0..shared {
+        assert_eq!(off.columns[f], on.columns[f], "shared col {f} identical");
+        assert_eq!(off.borders[f], on.borders[f], "shared border {f} identical");
+    }
+    // Only the embedding block's COLUMN VALUES move (offline {0,k} vs online {0..k}).
+    let knn_base = shared;
+    let mut any_diff = false;
+    for f in knn_base..off.columns.len() {
+        if off.columns[f] != on.columns[f] {
+            any_diff = true;
+        }
+    }
+    assert!(any_diff, "the KNN block column values differ between online and offline");
 }

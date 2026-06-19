@@ -175,6 +175,12 @@ fn train_mixed() -> (CbTrainModel, MixedEstimatedFeatures, Vec<f64>) {
         &targets,
         NUM_CLASSES,
         MODEL_K,
+        // OFFLINE whole-set KNN estimate: the existing SC-4 corpus is degenerate
+        // (every feature separates the classes), so the KNN block is not the
+        // load-bearing split and the structure-invariant prediction gate holds.
+        // The ONLINE (upstream stored-border = 0.5) path is gated by the XOR
+        // oracle, where the KNN feature is unambiguously load-bearing.
+        false,
         &TokenizerOptions::default(),
         254,
     )

@@ -42,7 +42,7 @@ use cb_data::text::dictionary::{
 use cb_data::text::digitizer::{digitize_column, digitize_column_bigram};
 use cb_data::text::tokenizer::{tokenize, TokenizerOptions};
 
-use crate::estimated::online_embedding::offline_knn_features;
+use crate::estimated::online_embedding::{offline_knn_features, online_knn_prefix};
 use crate::estimated::online_text::{online_text_prefix, OnlineTextCalcer, OnlineTextPrefix};
 
 /// The BoW estimated feature columns plus their selected split borders, in the
@@ -373,12 +373,28 @@ pub struct MixedEstimatedFeatures {
 ///   BiGram + Word dictionaries ONCE and emits one binary-presence column per
 ///   active token id (the Plan-03 seam).
 /// - `embeddings[doc]` is object `doc`'s embedding vector; empty slice -> no
-///   embedding block. The KNN calcer (Plan-06, brute-force-exact) emits the
-///   OFFLINE whole-set per-class vote columns — the Plain-mode estimate that feeds
-///   the tree splits (06.5-06 decision).
+///   embedding block. The KNN calcer (Plan-06, brute-force-exact) emits per-class
+///   vote columns. Two source modes (selected by `embedding_online`):
+///   * `embedding_online = false` — the OFFLINE whole-set per-class vote columns
+///     (every document inserted first, so each is its own nearest neighbor at
+///     distance 0). For a perfectly-separated k=3 corpus this yields a `{0, k}`
+///     vote distribution whose greedy-logsum border is `k/2` (e.g. 1.5).
+///   * `embedding_online = true` — the ONLINE read-before-update prefix estimate
+///     over the IDENTITY learn permutation (`online_knn_prefix`), which is the
+///     surface upstream's KNN `IOnlineFeatureEstimator` feeds to the
+///     border-computing visitor (`estimated_features.cpp:472-478`
+///     `ComputeOnlineFeatures(*learnPermutation, ...)`). Early-prefix documents see
+///     `< k` (or mixed-class) neighbors, so the vote column's distinct-value
+///     distribution is `{0, 1, …, k}` and the FIRST greedy-logsum border is `0.5`
+///     — exactly upstream's stored KNN border. The binarizer
+///     (`select_borders_greedy_logsum`) is UNCHANGED; only the column VALUES
+///     differ (the column-VALUE root cause, FEAT-01 residual). The distinct-value
+///     SET is permutation-INVARIANT for a separated cloud, so identity suffices.
 /// - `targets[doc]` is object `doc`'s class label (for the KNN vote arm).
 /// - `num_classes` is the target class count (KNN classification width).
 /// - `close_num` is the KNN query `k` (`KNN:k=...`).
+/// - `embedding_online` selects the ONLINE (upstream border source) vs OFFLINE
+///   KNN estimate (see above).
 /// - `tokenizer_options` pins the D-02 tokenization; `max_borders` is the
 ///   per-feature border budget for the existing quantizer.
 ///
@@ -400,6 +416,7 @@ pub fn build_mixed_estimated_features(
     targets: &[f32],
     num_classes: usize,
     close_num: usize,
+    embedding_online: bool,
     tokenizer_options: &TokenizerOptions,
     max_borders: usize,
 ) -> CbResult<MixedEstimatedFeatures> {
@@ -456,7 +473,19 @@ pub fn build_mixed_estimated_features(
                 "mixed features: targets length != n_docs".to_owned(),
             ));
         }
-        let knn = offline_knn_features(embeddings, targets, num_classes, close_num, true)?;
+        // ONLINE (upstream border source) vs OFFLINE whole-set KNN estimate. The
+        // ONLINE read-before-update column over the IDENTITY learn permutation is
+        // the surface upstream's KNN `IOnlineFeatureEstimator` feeds to the
+        // border-computing visitor (`estimated_features.cpp:472-478`), so its
+        // distinct-value distribution `{0,1,…,k}` reproduces upstream's stored
+        // KNN border (0.5). The OFFLINE whole-set column (`{0,k}` -> border k/2)
+        // is retained for the existing degenerate SC-4 path.
+        let knn = if embedding_online {
+            let perm: Vec<i32> = (0..n_docs as i32).collect();
+            online_knn_prefix(&perm, embeddings, targets, num_classes, close_num, true)?.columns
+        } else {
+            offline_knn_features(embeddings, targets, num_classes, close_num, true)?
+        };
         embedding_feature_count = knn.len();
         columns.extend(knn);
     }
