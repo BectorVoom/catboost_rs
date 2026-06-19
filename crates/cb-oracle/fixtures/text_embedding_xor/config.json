@@ -1,0 +1,5 @@
+{
+  "seed": 20260618,
+  "catboost_version": "1.2.10",
+  "thread_count": 1
+}

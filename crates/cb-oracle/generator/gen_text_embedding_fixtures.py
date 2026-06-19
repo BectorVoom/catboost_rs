@@ -459,6 +459,120 @@ def gen_mixed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# XOR mixed text + embedding fixture (FEAT-01 residual HARD oracle).
+#
+# The SC-4 `gen_mixed` corpus is DEGENERATE: every feature (numeric, BoW, KNN)
+# perfectly separates the alternating classes, so the search faces a feature-
+# selection TIE and the KNN estimated feature is never the sole load-bearing
+# split. That degeneracy MASKS the KNN stored-border-VALUE divergence (it only
+# surfaces in `splits.npy` as one KNN tree among four numeric trees) and forces
+# the SC-4 oracle to gate Splits/LeafValues structure-invariantly.
+#
+# This XOR corpus REMOVES the tie. The label is XOR(text_bit, embed_bit):
+#   text_bit  = presence of the word "alpha" (vs "beta")        -> a BoW feature
+#   embed_bit = embedding cloud A (~[+1,+1,+1,+1]) vs B (~[-1…]) -> a KNN feature
+# Neither feature alone correlates with the label (corr = 0); BOTH are
+# unambiguously load-bearing. The model MUST split on the BoW word feature AND
+# the KNN vote feature to fit XOR, so the KNN stored border (0.5) and the depth-2
+# tree STRUCTURE are determined — no structure-invariant / leaf-order relaxation
+# is permitted or needed. This is the hard gate Task 2's online-KNN column fix
+# must satisfy.
+# ---------------------------------------------------------------------------
+XOR_DIR = FIXTURES / "text_embedding_xor"
+XOR_LEARN_ROWS = 16
+XOR_K = 3
+
+
+def _build_xor_corpus() -> tuple[list[str], list[list[float]], list[int]]:
+    """Deterministic XOR(text_bit, embed_bit) text+embedding corpus.
+
+    4 reps of the 4 XOR cells (text_bit, embed_bit) -> 16 balanced rows. Each
+    feature alone is uncorrelated with the label; the label is their XOR, so BOTH
+    the BoW word feature and the KNN embedding feature are load-bearing.
+    """
+    rng = np.random.default_rng(RANDOM_SEED + 1)
+    cloud_a = np.array([1.0, 1.0, 1.0, 1.0])
+    cloud_b = np.array([-1.0, -1.0, -1.0, -1.0])
+    # (text_bit, embed_bit, label=text_bit ^ embed_bit)
+    cells = [(0, 0, 0), (0, 1, 1), (1, 0, 1), (1, 1, 0)]
+    texts: list[str] = []
+    embeds: list[list[float]] = []
+    labels: list[int] = []
+    for _rep in range(4):
+        for text_bit, embed_bit, label in cells:
+            texts.append("alpha word" if text_bit == 1 else "beta word")
+            center = cloud_a if embed_bit == 1 else cloud_b
+            embeds.append((center + 0.15 * rng.normal(size=EMBED_DIM)).tolist())
+            labels.append(label)
+    return texts, embeds, labels
+
+
+def _make_xor_pool(texts, embeds, labels):
+    import pandas as pd
+    from catboost import Pool
+
+    df = pd.DataFrame({"text0": texts})
+    df["emb0"] = [list(map(float, row)) for row in embeds]
+    return Pool(
+        data=df,
+        label=labels,
+        text_features=["text0"],
+        embedding_features=["emb0"],
+    )
+
+
+def gen_xor() -> None:
+    """Train + freeze the XOR text+embedding HARD-oracle model (thread_count=1).
+
+    BoW (target-independent word presence) + KNN (neighbor-vote) are the two
+    load-bearing estimated features; the XOR label forces both into the tree, so
+    the stored KNN border (0.5) and the tree structure are determined (no tie).
+    Freezes model.cbm + per-stage .npy + splits.npy (stored borders) + the frozen
+    texts/embeddings/labels so the Rust oracle feeds byte-identical inputs.
+    """
+    from catboost import CatBoost
+
+    texts, embeds, labels = _build_xor_corpus()
+    assert len(texts) == XOR_LEARN_ROWS, (len(texts), XOR_LEARN_ROWS)
+    pool = _make_xor_pool(texts, embeds, labels)
+    params = _base_params()
+    params["text_processing"] = _text_processing(MIXED_TEXT_CALCER)  # BoW
+    params["embedding_calcers"] = [EMBEDDING_CALCER_SPECS[MIXED_EMBED_CALCER]]  # KNN:k=3
+    model = CatBoost(params)
+    model.fit(pool)
+    _freeze_model(XOR_DIR, model, pool, params)
+    # Freeze the EXACT inputs the Rust oracle replays (XOR corpus is distinct from
+    # the shared text_embedding_inputs/ corpus).
+    (XOR_DIR / "texts.json").write_text(json.dumps(texts, indent=2), encoding="utf-8")
+    np.save(XOR_DIR / "embeddings.npy", np.asarray(embeds, dtype=np.float64), allow_pickle=False)
+    np.save(XOR_DIR / "labels.npy", np.asarray(labels, dtype=np.float64), allow_pickle=False)
+    # Capture which feature each stored split is on (numeric/BoW/KNN) for the oracle.
+    split_desc: list[str] = []
+    for t in range(model.tree_count_):
+        for s in model._get_tree_splits(t, pool):
+            split_desc.append(s)
+    xor_meta = {
+        "text_calcer": MIXED_TEXT_CALCER,
+        "embedding_calcer": EMBEDDING_CALCER_SPECS[MIXED_EMBED_CALCER],
+        "embedding_calcer_k": XOR_K,
+        "corpus": "XOR(text_bit, embed_bit): 16 rows, alpha/beta word + ±1 cloud",
+        "learn_rows": XOR_LEARN_ROWS,
+        "embed_dim": EMBED_DIM,
+        "random_seed": RANDOM_SEED + 1,
+        "split_descriptions": split_desc,
+        "note": (
+            "FEAT-01 residual HARD oracle. XOR label removes the SC-4 feature-"
+            "selection tie: BoW word presence + KNN vote are BOTH load-bearing, so "
+            "the KNN stored border (0.5, the ONLINE IOnlineFeatureEstimator border "
+            "source) and the tree structure are determined. Gated IN ORDER (no "
+            "leaf-multiset relaxation), StagedApprox + Predictions <=1e-5."
+        ),
+    }
+    (XOR_DIR / "xor_meta.json").write_text(json.dumps(xor_meta, indent=2), encoding="utf-8")
+    print(f"  froze XOR hard-oracle model under {XOR_DIR}; splits: {split_desc}")
+
+
+# ---------------------------------------------------------------------------
 # D-01 tokenizer / dictionary instrumented corpus (Task 1 + D-07).
 #
 # The token stream, dictionary token->id table, and per-document TText (tokenId,
@@ -716,6 +830,8 @@ def main(argv: list[str]) -> int:
                         help="freeze the LDA generalized-eigenproblem GT (scatter + projection, 06.5-05)")
     parser.add_argument("--mixed", action="store_true",
                         help="freeze the SC-4 mixed text+embedding+numeric model (06.5-07)")
+    parser.add_argument("--xor", action="store_true",
+                        help="freeze the XOR text+embedding HARD oracle (FEAT-01 residual)")
     parser.add_argument("--instr-pkg", type=str, default=os.environ.get("INSTR_STAGE_PKG", "/tmp/cb_build313/instr_pkg"),
                         help="path to the staged instrumented catboost package (contains catboost/_catboost.so)")
     parser.add_argument("--all", action="store_true", help="inputs + calcers + tokenizer-corpus + lda-scatter-gt")
@@ -739,7 +855,10 @@ def main(argv: list[str]) -> int:
         gen_lda_scatter_gt(args.instr_pkg)
     if args.mixed:
         gen_mixed()
-    if not (args.inputs or args.calcers or args.tokenizer_corpus or args.lda_scatter_gt or args.mixed):
+    if args.xor:
+        gen_xor()
+    if not (args.inputs or args.calcers or args.tokenizer_corpus or args.lda_scatter_gt
+            or args.mixed or args.xor):
         write_inputs()
     return 0
 

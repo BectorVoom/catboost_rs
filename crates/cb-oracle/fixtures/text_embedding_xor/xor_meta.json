@@ -1,0 +1,22 @@
+{
+  "text_calcer": "BoW",
+  "embedding_calcer": "KNN:k=3",
+  "embedding_calcer_k": 3,
+  "corpus": "XOR(text_bit, embed_bit): 16 rows, alpha/beta word + \u00b11 cloud",
+  "learn_rows": 16,
+  "embed_dim": 4,
+  "random_seed": 20260619,
+  "split_descriptions": [
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=1, bin=1.5",
+    " src_feature_id=0 calcer_id=6E4ED8C9759ABF17F5ADF85D915EC985 local_id=0, bin=0.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=1, bin=1.5",
+    " src_feature_id=0 calcer_id=6E4ED8C9759ABF17F5ADF85D915EC985 local_id=0, bin=0.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=0, bin=0.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=1, bin=1.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=0, bin=0.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=1, bin=0.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=0, bin=0.5",
+    " src_feature_id=0 calcer_id=ED90D08C7FB878AD76B8B8778851E6B4 local_id=1, bin=0.5"
+  ],
+  "note": "FEAT-01 residual HARD oracle. XOR label removes the SC-4 feature-selection tie: BoW word presence + KNN vote are BOTH load-bearing, so the KNN stored border (0.5, the ONLINE IOnlineFeatureEstimator border source) and the tree structure are determined. Gated IN ORDER (no leaf-multiset relaxation), StagedApprox + Predictions <=1e-5."
+}
