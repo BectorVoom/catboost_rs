@@ -33,8 +33,12 @@ jobs:
       - name: cb-backend feature-gate build (cuda)
         run: cargo build -p cb-backend --no-default-features --features cuda
 
-      - name: cb-backend feature-gate build (rocm)
-        run: cargo build -p cb-backend --no-default-features --features rocm
+      # NOTE: the `rocm` feature is deliberately NOT built or tested in CI.
+      # Since Phase 7.1 the rocm arm pulls in cubecl-hip-sys and requires the
+      # HIP/ROCm toolchain + an AMD GPU, which GitHub runners do not have. Per
+      # GPU-03 / Phase 7.6 D-06, rocm is the authoritative GPU gate validated
+      # LOCALLY/manually in-env on gfx1100 only — never in GitHub Actions:
+      #   cargo test -p cb-backend --no-default-features --features rocm -- --nocapture
 
       # Production lint gate. `--lib` scope is the Pitfall-1 convention chosen in
       # Task 1: restriction lints are denied for library code; test code is
