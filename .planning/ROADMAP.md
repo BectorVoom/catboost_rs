@@ -696,7 +696,7 @@ Plans:
 
 **Wave 2** *(blocked on 07.5-01)*
 
-- [ ] 07.5-02-PLAN.md — Scan/update bridge (deferred ScanPointwiseHistograms, D-7.5-03): per-feature bin-axis prefix-sum reusing block_scan_kernel -> cumulative left-of-border leaf stats, self-oracled; <=CUBE_DIM-bins scope + explicit cross-cube-carry follow-up
+- [x] 07.5-02-PLAN.md — Scan/update bridge (deferred ScanPointwiseHistograms, D-7.5-03): per-feature bin-axis prefix-sum reusing block_scan_kernel -> cumulative left-of-border leaf stats, self-oracled; <=CUBE_DIM-bins scope + explicit cross-cube-carry follow-up
 
 **Wave 3** *(blocked on 07.5-01, 07.5-02)*
 

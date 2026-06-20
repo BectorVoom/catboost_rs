@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 07.5-01-PLAN.md
-last_updated: "2026-06-20T14:04:36.316Z"
+last_updated: "2026-06-20T14:14:50.874Z"
 last_activity: 2026-06-20 -- Phase 07.5 execution started
 progress:
   total_phases: 20
   completed_phases: 15
   total_plans: 111
-  completed_plans: 106
+  completed_plans: 107
   percent: 75
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 07.5 (Score/Split Selection & On-Device Tree-Grow Loop) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-06-20 -- Phase 07.5 execution started
 
@@ -151,6 +151,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.4-pairwise-histogram-family P04 | 12min | 2 tasks | 3 files |
 | Phase 07.4-pairwise-histogram-family P05 | 6min | 2 tasks | 1 file |
 | Phase 07.5 P01 | 12min | 2 tasks | 3 files |
+| Phase 07.5 P02 | 5min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -326,6 +327,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07.5-01: L2 split score transcribed verbatim from FROZEN cb-compute l2_split_score + calc_average, f64 device-channel fold (D-03)
 - [Phase ?]: 07.5-01: device argmin lowest-(feature,bin)-index tie-break == CPU select_best_candidate strict-first-wins; structure parity exact on rocm gfx1100
 - [Phase ?]: 07.5-01: transcribed select_best_candidate inline (not cb-train import) — dev-dep forced cb-backend/cpu via feature unification, breaking GPU SelectedRuntime
+- [Phase ?]: 07.5-02: scan/update bridge reuses block_scan_kernel verbatim (one cube per feature/channel); FILL->scan seam consumes the FROZEN 7.3 handle in place; n_bins>CUBE_DIM is a typed error (tracked cross-cube-carry follow-up)
 
 ### Pending Todos
 
@@ -373,7 +375,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T14:04:36.308Z
+Last session: 2026-06-20T14:14:44.999Z
 Stopped at: Completed 07.5-01-PLAN.md
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
