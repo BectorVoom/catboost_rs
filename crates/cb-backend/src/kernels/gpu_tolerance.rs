@@ -140,6 +140,22 @@ fn expected_atomic_finalize_path() -> AtomicFinalizePath {
     }
 }
 
+/// True when a GPU backend feature is active, i.e. `SelectedRuntime` resolves to a
+/// real device runtime. The WR-01 anti-false-pass guard for the tests that have no
+/// `AtomicFinalizePath` return to assert against (Tests A and C): the module is only
+/// meaningful on a GPU backend — under the default `cpu` feature every
+/// `max_divergence` collapses to a CPU-vs-CPU comparison that is bit-exact (0.0) and
+/// would silently PASS while measuring nothing (the fake-validation outcome the
+/// module exists to prevent, T-07.6-01). Tests A/C call this and SKIP (early-return
+/// with a printed notice) under `cpu` rather than emitting a fake `[GPU-06 EVIDENCE]`
+/// line — a skip stays green under `cargo test --workspace` (default `cpu`) without
+/// claiming a measurement that never ran. The check is on the active backend feature
+/// (not the device-advertised atomic capability) so it stays correct on gfx1100,
+/// where `HostSumFallback` is the LEGITIMATE GPU reduce path.
+fn gpu_backend_active() -> bool {
+    cfg!(any(feature = "rocm", feature = "cuda", feature = "wgpu"))
+}
+
 // ===========================================================================
 // Inline CPU references (TRANSCRIBED — never import cb-train, T-07.6-02). Each is
 // the FROZEN ordered-host reference for one kernel family, folded through
@@ -466,6 +482,15 @@ fn cpu_best_stump(
 /// feed Plan 02's epsilon proposal.
 #[test]
 fn gpu06_per_family_aggregation_reports_evidence() {
+    // WR-01: under the cpu backend this would be a CPU-vs-CPU false-pass — SKIP
+    // (not a silent fake measurement, not a panic that reddens `cargo test --workspace`).
+    if !gpu_backend_active() {
+        eprintln!(
+            "[GPU-06] SKIP gpu06_per_family_aggregation: cpu backend active — \
+             measurement requires a GPU feature (--no-default-features --features rocm)."
+        );
+        return;
+    }
     let n_features = 2usize;
     let n_bins = 32usize;
     let l2 = 3.0_f64;
@@ -681,6 +706,15 @@ const LEAF_BOUND: f64 = TOL_BOUND_F64;
 /// the STRICT bar, leaf VALUES are REPORTED (the GPU-06 epsilon is Plan 02's job).
 #[test]
 fn gpu06_end_to_end_leaf_values_report_evidence() {
+    // WR-01: under the cpu backend this would be a CPU-vs-CPU false-pass — SKIP
+    // (not a silent fake measurement, not a panic that reddens `cargo test --workspace`).
+    if !gpu_backend_active() {
+        eprintln!(
+            "[GPU-06] SKIP gpu06_end_to_end_leaf_values: cpu backend active — \
+             measurement requires a GPU feature (--no-default-features --features rocm)."
+        );
+        return;
+    }
     let n_features = 3usize;
     let n_bins = 32usize;
     let depth = 1usize; // the MVP vertical slice (the strict O(1)-per-level device path)
