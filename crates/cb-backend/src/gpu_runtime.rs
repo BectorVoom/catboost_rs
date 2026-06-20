@@ -62,6 +62,18 @@ pub enum AtomicFinalizePath {
 /// literal in any reduction stride (D-09).
 const CUBE_DIM: usize = 32;
 
+/// CR-02 guard: the launch-geometry cube width MUST NOT exceed the kernels'
+/// comptime `SharedMemory` allocation ([`crate::kernels::BLOCK_REDUCE_SHMEM`]).
+/// The fallback tree-reduce writes `shared[tid]` for every unit `tid in
+/// 0..CUBE_DIM_X`, so a launch wider than the allocation would write out of
+/// bounds device-side (UB). Coupling the two constants here makes any future
+/// drift a COMPILE error rather than a silent OOB write.
+const _: () = assert!(
+    CUBE_DIM <= crate::kernels::BLOCK_REDUCE_SHMEM,
+    "CUBE_DIM (launch width) exceeds BLOCK_REDUCE_SHMEM (shared-mem allocation) — \
+     a wider launch would write past the kernels' SharedMemory (device-side OOB)"
+);
+
 /// Reduce `input` to its sum on the compile-time [`SelectedRuntime`], returning
 /// the per-cube PARTIAL sums (the host finalizes the across-cube fold via
 /// `cb-core::sum_f64` — the default atomic-free finalize, Open Q1).
@@ -142,11 +154,24 @@ pub fn launch_block_scan_f64(input: &[f64], inclusive: bool) -> CbResult<Vec<f64
     if n == 0 {
         return Ok(Vec::new());
     }
+    // CR-01: `block_scan_kernel` scans only WITHIN a single cube; the cross-cube
+    // running carry is the documented 7.2/7.3 forward dependency (Open Q2). Launching
+    // `ceil(n/CUBE_DIM)` cubes for `n > CUBE_DIM` would return WRONG prefix sums
+    // (each cube restarts from 0, ignoring earlier cubes' running total) while
+    // reporting `Ok` — a silent wrong result. Enforce the documented single-cube
+    // precondition with a typed error until the cross-cube carry lands.
+    if n > CUBE_DIM {
+        return Err(CbError::Degenerate(format!(
+            "launch_block_scan_f64 supports n <= {CUBE_DIM} until the cross-cube carry \
+             lands (Open Q2, 7.2/7.3); got n = {n}"
+        )));
+    }
 
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    // n <= CUBE_DIM (guarded above), so this is always a single cube.
     let num_cubes = n.div_ceil(CUBE_DIM).max(1);
     // The scan output is per-element (same length as the input), NOT one slot per
     // cube — a scan is not a reduction.

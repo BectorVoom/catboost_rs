@@ -19,7 +19,7 @@ use cubecl::prelude::*;
 /// bound on the per-cube plane count (plane carry). This is the ONE permitted `32`
 /// (the launch-geometry / shared-memory size) — NOT a wave/warp-size literal in any
 /// reduction STRIDE (the strides derive from `CUBE_DIM_X` / `PLANE_DIM`, D-09).
-const BLOCK_REDUCE_SHMEM: usize = 32;
+pub(crate) const BLOCK_REDUCE_SHMEM: usize = 32;
 
 /// First-order RMSE gradient kernel: `der1[i] = target[i] - approx[i]`.
 ///
