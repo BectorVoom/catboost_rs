@@ -9,6 +9,23 @@
 //! and the block inclusive/exclusive prefix-scan ([`launch_block_scan_f64`], used
 //! by the `kernels::scan` rocm self-oracle, GPU-01 scan / D-7.1-06).
 //!
+//! # Module contents (WR-03 — actual surface, broader than 7.1 reduce/scan)
+//!
+//! This module has grown to host THREE phases' device-launch seams (a single-
+//! responsibility split into `gpu_runtime/der.rs` + `gpu_runtime/histogram.rs` is
+//! the planned follow-up; until then this doc is the authoritative inventory):
+//!
+//! - **Phase 7.1 reduce/scan primitives** (this file's original scope):
+//!   [`launch_block_reduce_f64`], [`launch_block_reduce_atomic_f64`],
+//!   [`launch_block_scan_f64`], [`AtomicFinalizePath`].
+//! - **Phase 7.2 der seam** (device-resident der1/der2): `DerBinaryKernel`,
+//!   `DerUnaryKernel`, `DerParamKernel` and the six `launch_der_*` helpers.
+//! - **Phase 7.3 pointwise-histogram seam**: `launch_pointwise_hist2*` and
+//!   `read_binsums_f64`.
+//!
+//! The `kernels::{...}` import below therefore pulls in kernels for all three
+//! seams, not only the 7.1 reduce/scan pair.
+//!
 //! # Reduction contract (D-7.1-05 / Open Q1)
 //!
 //! [`block_reduce_kernel`] folds each cube's slice into ONE partial; this helper
