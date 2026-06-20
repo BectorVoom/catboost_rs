@@ -934,17 +934,35 @@ fn launch_pointwise_hist2_into(
         return Ok(client.empty(0));
     }
 
-    // The 8-bit non-binary fill is selected host-side (mirroring the upstream
-    // `pointwise_kernels.cpp` `DISPATCH_ONE_BYTE(..., 8)` shape); Plans B/C/D extend
-    // this dispatch to 5/6/7-bit (same kernel, different comptime `bits`) and to the
-    // half-byte/binary families (separate kernels — D-7.3-02).
-    let bits: u32 = HIST_MAX_BITS; // 8-bit; n_bins must equal 1 << bits for this path.
-    if n_bins != (1usize << bits) {
-        return Err(CbError::Degenerate(format!(
-            "pointwise_hist2 8-bit fill expects n_bins == {} (1 << {bits}), got {n_bins}",
-            1usize << bits
-        )));
-    }
+    // One-byte non-binary bit-width selection (Plan B — D-7.3-02). The bit-count is
+    // chosen HOST-SIDE from the feature group's border count `n_bins`, mirroring
+    // upstream `pointwise_kernels.cpp`'s `DISPATCH_ONE_BYTE(..., 5/6/7/8)` (a `b`-bit
+    // group has exactly `1 << b` bins). The selected `bits` is passed as the SAME
+    // `#[comptime]` arg of the SAME `pointwise_hist2_nonbinary_kernel` (the FROZEN Plan
+    // A kernel + binSums seam, reused UNCHANGED) — the comptime value drives the
+    // histogram line size / used-prefix at JIT time, so there is NO runtime bit-count
+    // branch in the device hot loop (the 7.1 `use_plane`/`inclusive` comptime pattern).
+    // `n_bins` MUST equal `1 << bits` for a one-byte non-binary group; anything else
+    // (not a power of two in the 5..=8 range) is not this family — surface a typed error
+    // rather than launch a malformed line size (half-byte/binary are separate kernels,
+    // Plans C/D). Half-byte (<5-bit, e.g. n_bins <= 16) is explicitly NOT routed here.
+    let bits: u32 = match n_bins {
+        32 => 5,
+        64 => 6,
+        128 => 7,
+        256 => 8,
+        _ => {
+            return Err(CbError::Degenerate(format!(
+                "pointwise_hist2 one-byte non-binary fill expects n_bins in {{32,64,128,256}} \
+                 (1 << bits for bits in 5..=8), got {n_bins}"
+            )));
+        }
+    };
+    // Defence-in-depth: the selected bits must stay within the comptime worst-case
+    // shared-histogram allocation (`2 * (1 << bits) <= HIST_SHMEM`, guarded by the
+    // module-level `const _: () = assert!(...)` over HIST_MAX_BITS). T-07.3-07: the
+    // used prefix `2 * (1 << bits)` can never exceed the 8-bit allocation here.
+    debug_assert!(bits <= HIST_MAX_BITS);
 
     let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
     let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));

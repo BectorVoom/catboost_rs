@@ -566,9 +566,15 @@ pub fn histogram_scatter_kernel<F: Float>(
 ///
 /// (the single-tree collapse of `ShiftPartAndBinSumsPtr`: `histLineSize = 2 *
 /// totalBinFeatures`, `part = fold = 0`, `FirstFoldIndex = 0` — see the module doc of
-/// `kernels/pointwise_hist.rs`). `n_bins = 1 << bits` is passed as the comptime
-/// `bins` count so Plans B/C/D reuse this kernel at 5/6/7-bit via the SAME `bits` arg
-/// (D-7.3-02), with no runtime branch.
+/// `kernels/pointwise_hist.rs`). `n_bins = 1 << bits` is derived at COMPTIME from the
+/// `bits` arg, so the SAME kernel covers the whole one-byte non-binary family —
+/// 5/6/7/8-bit — selected host-side per the feature group's border count (Plan B
+/// landed 5/6/7 over the Plan A 8-bit; D-7.3-02), with NO runtime bit-count branch
+/// (the comptime value is resolved at JIT time, mirroring the 7.1 `use_plane` pattern).
+/// The histogram line size (`feature * n_bins`) and the used shared/global prefix
+/// (`2 * (1 << bits)` cells per feature) both derive from `bits` at comptime; the
+/// `HIST_SHMEM` allocation stays the fixed 8-bit worst case (only the USED prefix
+/// shrinks for the narrower widths).
 ///
 /// # In-kernel atomic merge (D-03 / D-7.3-03)
 ///
