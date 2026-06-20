@@ -331,6 +331,27 @@ pub fn launch_der_binary_handle(
     target: &[f64],
     kernel: DerBinaryKernel,
 ) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_der_binary_into(&client, approx, target, kernel)
+}
+
+/// The ONE der launch geometry (IN-02 — one place, not duplicated per public
+/// entry point). Transfers `approx`/`target` onto `client`, launches the selected
+/// der kernel, and returns the der1 output Handle WITHOUT reading it back. The
+/// caller owns the `client` lifecycle so a read-back (the self-oracle wrapper)
+/// uses the SAME client that allocated the handle — a CubeCL Handle is bound to its
+/// originating client's memory allocator/stream, and reading it through a second,
+/// freshly-constructed client violates a `slice::from_raw_parts` precondition in the
+/// HIP IO controller (the canonical CubeCL idiom keeps one client per op through
+/// read-back; basic-operations manual). Both the handle-returning public fn and the
+/// host-readback wrapper route through here, so the launch geometry stays single.
+fn launch_der_binary_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx: &[f64],
+    target: &[f64],
+    kernel: DerBinaryKernel,
+) -> CbResult<Handle> {
     let n = approx.len();
     // Shape guard: the kernel reads `approx[i]` and `target[i]` for the same `i`,
     // so a mismatched length would read out of bounds on the device. Surface it as
@@ -342,9 +363,6 @@ pub fn launch_der_binary_handle(
             actual: target.len(),
         });
     }
-
-    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
-    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
     // Empty input: hand back a zero-length device handle (no launch), mirroring the
     // reduce/scan empty short-circuit. 7.3 still receives a valid (empty) der handle.
@@ -367,7 +385,7 @@ pub fn launch_der_binary_handle(
 
     match kernel {
         DerBinaryKernel::RmseGradient => gradient_kernel::launch::<f64, SelectedRuntime>(
-            &client,
+            client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
@@ -381,17 +399,18 @@ pub fn launch_der_binary_handle(
     Ok(out_handle)
 }
 
-/// Host-readback wrapper over [`launch_der_binary_handle`]: launch the der1 kernel
+/// Host-readback wrapper over the der launch: launch the der1 kernel
 /// device-resident, then read the handle back to a host `Vec<f64>`. This is the
 /// seam the all-backend self-oracle exercises (it compares the device der1 to the
 /// `cb-compute::loss` CPU baseline); it is NOT the histogram hand-off path (that is
-/// the handle-returning fn above, which never reads back).
+/// [`launch_der_binary_handle`], which never reads back).
 ///
-/// The launch geometry lives in ONE place ([`launch_der_binary_handle`]); this
-/// wrapper only reconstructs the client to read the returned handle (the per-call
-/// client construction is cheap and the handle stays valid for the read on the same
-/// runtime). A device read-back failure surfaces as [`CbError::Degenerate`] (WR-05),
-/// never a silent all-zero buffer masquerading as a valid derivative.
+/// The launch geometry lives in ONE place ([`launch_der_binary_into`]); this wrapper
+/// constructs the client ONCE and uses that SAME client for both the launch and the
+/// read-back, so the handle is read by the client that allocated it (required — see
+/// [`launch_der_binary_into`]). A device read-back failure surfaces as
+/// [`CbError::Degenerate`] (WR-05), never a silent all-zero buffer masquerading as a
+/// valid derivative.
 pub fn launch_der_binary(
     approx: &[f64],
     target: &[f64],
@@ -400,10 +419,11 @@ pub fn launch_der_binary(
     if approx.is_empty() {
         return Ok(Vec::new());
     }
-    let handle = launch_der_binary_handle(approx, target, kernel)?;
 
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let handle = launch_der_binary_into(&client, approx, target, kernel)?;
 
     let bytes = client
         .read_one(handle)

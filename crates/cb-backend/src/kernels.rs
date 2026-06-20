@@ -867,3 +867,12 @@ mod scan;
 // as `gradient` above (the harness names `cubecl::cpu::CpuRuntime`).
 #[cfg(all(test, feature = "cpu"))]
 mod scatter;
+
+// Device-resident RMSE der self-oracle (GPU-01 der, Phase 7.2): the GPU der1 over
+// `SelectedRuntime` vs the `cb-compute::loss` CPU baseline, plus the SC-3
+// device-residency hand-off assertion, live in `kernels/gradient_gpu.rs`, mounted
+// at `kernels::gradient_gpu`. UNLIKE the cpu-only `gradient` spike above, it runs
+// over the generic `SelectedRuntime`, so it builds/runs under EVERY backend (the
+// rocm in-env oracle + wgpu host run).
+#[cfg(test)]
+mod gradient_gpu;
