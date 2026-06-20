@@ -661,6 +661,123 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
     }
 }
 
+/// Comptime number of half-byte (4-bit) bins: `1 << 4 = 16`. This is the half-byte
+/// family's FIXED histogram line size (NOT a comptime `bits` arg like the non-binary
+/// kernel) — upstream `pointwise_hist2_half_byte_template.cuh`'s `TPointHistHalfByte`
+/// is structurally a 16-entry working histogram (`offset = (bins >> ...) & 15`,
+/// `HIST_SIZE = 16 * BlockSize`). It is a bin COUNT, NOT a wave/warp-size literal in
+/// any stride (D-09). Held `usize` for the (feature, bin) index arithmetic.
+pub(crate) const HALF_BYTE_BINS: usize = 16;
+
+/// 2-channel pointwise histogram fill — the **half-byte (4-bit)** `ComputeHist2HalfByte`
+/// analog (Phase 7.3, GPU-01 histogram slice; D-7.3-01..05). A SEPARATE `#[cube]`
+/// kernel family from [`pointwise_hist2_nonbinary_kernel`] (D-7.3-02 — half-byte is
+/// structurally distinct, NOT a comptime `bits` case of the non-binary kernel): it
+/// mirrors upstream `pointwise_hist2_half_byte_template.cuh`'s `TPointHistHalfByte`,
+/// whose working histogram is a FIXED 16-entry (4-bit) line (`HIST_SIZE = 16 *
+/// BlockSize`, `offset = (bins >> ...) & 15`) — distinct from the non-binary kernel's
+/// runtime-`bits`-driven `1 << bits` line size and its per-object direct-global merge.
+///
+/// For every (feature, bin) it accumulates two interleaved channels: channel 0 = Σ der1
+/// ("target"), channel 1 = Σ weight, written into the global `bin_sums` buffer at the
+/// SAME FROZEN layout index as the non-binary kernel (the seam stays byte-identical —
+/// D-7.3-01 / Pitfall 2), with `n_bins = HALF_BYTE_BINS = 16`:
+///
+/// ```text
+/// index(feature, bin, channel) = (feature * 16 + bin) * 2 + channel
+/// ```
+///
+/// (the single-tree collapse of `ShiftPartAndBinSumsPtr`, `part = fold = 0`,
+/// `FirstFoldIndex = 0` — see the module doc of `kernels/pointwise_hist.rs`).
+///
+/// # Structurally-distinct half-byte layout (D-7.3-02)
+///
+/// The half-byte structural distinctness vs the non-binary family is encoded by the
+/// FIXED comptime 16-bin line and the half-byte 4-bit bin DECOMPOSITION: upstream packs
+/// several half-byte features in one `ci` word and extracts each 4-bit nibble via
+/// `(bins >> (28 - 4*i)) & 15`; here each feature's quantized bin is masked to its 4
+/// bits (`bin & 15`, mirroring the `& 15` nibble select) and routed to one of the 16
+/// half-byte bins. The line size is the comptime [`HALF_BYTE_BINS`] (`1 << 4`) — NOT a
+/// runtime `bits` arg like [`pointwise_hist2_nonbinary_kernel`] (`1 << bits`, bits in
+/// 5..=8) — so this is a genuinely SEPARATE kernel family (the plan's D-7.3-02
+/// requirement), not a comptime case of the non-binary kernel. The nibble mask and the
+/// 16-bin line are the half-byte family's structural signature.
+///
+/// # In-kernel atomic merge (D-03 / D-7.3-03)
+///
+/// `bin_sums: &Array<Atomic<F>>` is the GLOBAL histogram; each thread `fetch_add`s its
+/// per-object contribution directly into the global cell — the genuine D-03 in-kernel
+/// atomic merge (the same direct-global-atomic MVP fill Plan A chose for the non-binary
+/// family; upstream's per-block shared-memory `TPointHistHalfByte` working histogram +
+/// the `BLOCKS_PER_FEATURE > 1 ? atomicAdd : WriteThrough` merge guard is the additive
+/// PERFORMANCE refinement over this same atomic-merge STRUCTURE — it pre-reduces within
+/// a block — reserved as a follow-up, [`HIST_SHMEM`] kept for it). Because many threads
+/// contribute to the same cell, the cross-thread accumulation ORDER is
+/// non-deterministic — the accepted D-03 source of run-to-run float-order variance,
+/// REPORTED (not signed off) by the `kernels::pointwise_hist` oracle (the GPU-06
+/// epsilon is 7.6's job).
+///
+/// # Wave-size policy (D-09)
+///
+/// The per-object loop strides by the TOTAL thread count `CUBE_COUNT * CUBE_DIM` (a
+/// grid-stride loop) — derived from the launch topology intrinsics, NEVER a literal
+/// 32/64. No `& 31`/`tiled_partition<32>`/`512 * (threadIdx/32)` warp-tile construct
+/// appears (upstream's `SliceOffset`/`SyncTile` warp partitioning is replaced by the
+/// wave-agnostic grid-stride loop + global atomic merge). The bin index comes from the
+/// masked 4-bit `cindex` value, not a warp-lane partition. Generic over `F: Float`
+/// (AGENTS.md generics-float). Every device read is under a bounds guard (`i <
+/// indices.len()`). if-as-STATEMENT only (CubeCL conditionals manual).
+///
+/// `der1`/`weight` are length `n` (per object, object order). `cindex` is the quantized
+/// bin matrix laid out feature-major (`cindex[feature * n + obj]`). `indices` (length
+/// `n`) is the object visiting order. `n_features` is a runtime `u32` scalar; the
+/// 16-bin line size is the comptime [`HALF_BYTE_BINS`] (no runtime bit-count branch).
+#[cube(launch)]
+pub fn pointwise_hist2_half_byte_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    cindex: &Array<u32>,
+    indices: &Array<u32>,
+    bin_sums: &Array<Atomic<F>>,
+    n_features: u32,
+) {
+    // FIXED 16-bin (4-bit) line — the comptime HALF_BYTE_BINS (NOT a runtime `bits`
+    // value): the structural mark of the half-byte family (`TPointHistHalfByte` is a
+    // 16-entry working histogram). Held `usize` for the (feature, bin) index math.
+    let n_bins = comptime!(HALF_BYTE_BINS);
+    // 4-bit nibble mask (upstream `& 15` half-byte bin select). Applied to the raw
+    // `cindex` `u32` value before the `usize` index cast.
+    let nibble_mask = comptime!((HALF_BYTE_BINS as u32) - 1u32);
+
+    let n = indices.len();
+    let n_features_usize = n_features as usize;
+
+    // Grid-stride loop over the object-visiting order; stride = total thread count
+    // (CUBE_COUNT * CUBE_DIM) — topology-derived, never a literal 32/64 (D-09).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < n {
+        let obj = indices[i] as usize;
+        let d = der1[obj];
+        let w = weight[obj];
+
+        let mut feature = 0usize;
+        while feature < n_features_usize {
+            // Half-byte 4-bit nibble select (upstream `(bins >> ...) & 15`): mask the
+            // quantized bin to its 4 bits, routing it to one of the 16 half-byte bins.
+            let bin = (cindex[feature * n + obj] & nibble_mask) as usize;
+            let cell = (feature * n_bins + bin) * 2usize;
+            // channel 0 = Σ der1, channel 1 = Σ weight (in-kernel atomic merge, D-03)
+            // into the FROZEN binSums layout (byte-identical to the non-binary seam).
+            bin_sums[cell].fetch_add(d);
+            bin_sums[cell + 1usize].fetch_add(w);
+            feature += 1usize;
+        }
+
+        i += stride;
+    }
+}
+
 /// Block-level sum reduction (the Phase-7.1 device primitive, D-7.1-04..09;
 /// GPU-01 reduce). Each cube folds its `CUBE_DIM`-wide slice of `input` into a
 /// SINGLE partial written to `output[CUBE_POS]`; the host finalizes the across-cube

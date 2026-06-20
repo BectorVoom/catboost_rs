@@ -41,7 +41,7 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    pointwise_hist2_nonbinary_kernel, quantile_gradient_kernel,
+    pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel, quantile_gradient_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -932,6 +932,73 @@ fn launch_pointwise_hist2_into(
     // 7.5 still receives a valid (empty) histogram handle.
     if n == 0 || n_features == 0 || n_bins == 0 {
         return Ok(client.empty(0));
+    }
+
+    // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in
+    // every fill kernel handles any surplus via the total-thread-count stride). Shared
+    // by the half-byte branch below and the non-binary branch (IN-02 — one geometry).
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // Half-byte (4-bit) family branch (Plan C — D-7.3-02). A border count of
+    // `HALF_BYTE_BINS == 16` selects the SEPARATE `pointwise_hist2_half_byte_kernel`
+    // (NOT a comptime case of the non-binary kernel): upstream's half-byte path
+    // (`pointwise_hist2_half_byte_template.cuh`) is a structurally distinct kernel
+    // family (16-bin working histogram + nibble decomposition), so we dispatch to its
+    // own kernel here, mirroring `pointwise_kernels.cpp`'s `HalfByteFeatures ->
+    // ComputeHist2HalfByte` dispatch. It writes the SAME FROZEN binSums layout
+    // `(feature * 16 + bin) * 2 + channel` through this UNCHANGED seam (the seam stays
+    // byte-identical — D-7.3-01). The same channel-float dispatch applies (f64 on
+    // rocm/cuda/cpu, f32 on wgpu — RESEARCH A1). NO read-back here (SC-3 / Pitfall 5).
+    if n_bins == crate::kernels::HALF_BYTE_BINS {
+        let bin_sums_len = hist2_binsums_len(n_bins, n_features);
+        let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+        let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+        #[cfg(feature = "wgpu")]
+        {
+            let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
+            let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
+            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
+            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
+            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
+            pointwise_hist2_half_byte_kernel::launch::<f32, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+                n_features as u32,
+            );
+            return Ok(h);
+        }
+
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
+            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
+            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+            pointwise_hist2_half_byte_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+                n_features as u32,
+            );
+            return Ok(h);
+        }
     }
 
     // One-byte non-binary bit-width selection (Plan B — D-7.3-02). The bit-count is
