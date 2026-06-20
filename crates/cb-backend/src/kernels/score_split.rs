@@ -79,7 +79,14 @@ const SCORE_BOUND: f64 = 1e-9;
 /// (a mismatch truncates to the shorter slice rather than panicking with an opaque OOB
 /// index).
 fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
-    debug_assert_eq!(device.len(), baseline.len());
+    // Unconditional length check (WR-06): a `debug_assert_eq!` is compiled out under
+    // the release profile, so a truncated device read-back would silently compare only
+    // the common prefix and report a spuriously low divergence — masking the fault.
+    // Returning a sentinel `f64::INFINITY` divergence on mismatch guarantees any caller
+    // threshold check fails loudly instead.
+    if device.len() != baseline.len() {
+        return (f64::INFINITY, f64::INFINITY);
+    }
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
     for (&d, &b) in device.iter().zip(baseline) {

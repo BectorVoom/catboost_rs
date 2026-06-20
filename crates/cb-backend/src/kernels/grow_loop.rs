@@ -58,7 +58,13 @@ const LEAF_BOUND: f64 = 1e-9;
 /// Max abs / rel divergence over two equal-length buffers (the `score_split`/`pointwise_hist`
 /// reporter shape — REPORT-not-sign-off, D-7.5-05).
 fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
-    debug_assert_eq!(device.len(), baseline.len());
+    // Unconditional length check (WR-06): `debug_assert_eq!` is compiled out under
+    // release, so a truncated device buffer would silently compare only the prefix and
+    // report a spuriously low divergence. A length mismatch yields a sentinel infinite
+    // divergence so any caller threshold check fails loudly.
+    if device.len() != baseline.len() {
+        return (f64::INFINITY, f64::INFINITY);
+    }
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
     for (&d, &b) in device.iter().zip(baseline) {
