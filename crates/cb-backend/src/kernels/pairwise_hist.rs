@@ -76,6 +76,7 @@ use cb_core::sum_f64;
 
 use crate::gpu_runtime::{
     launch_pairwise_hist, launch_pairwise_hist_8bit, launch_pairwise_hist_8bit_handle,
+    launch_pairwise_hist_half_byte, launch_pairwise_hist_half_byte_handle,
     launch_pairwise_hist_handle,
 };
 
@@ -404,6 +405,92 @@ fn eightbit_atomics() {
         assert!(
             rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
             "8-bit-atomics device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+        );
+    }
+}
+
+#[test]
+fn half_byte() {
+    // The half-byte (4-bit, 16-bin) pairwise fill self-oracle (D-7.4-02 — the structurally
+    // DISTINCT half-byte family; upstream `pairwise_hist_half_byte.cu`). The half-byte line
+    // is a FIXED 16-bin (4-bit) histogram (the comptime `HALF_BYTE_BINS` precedent from the
+    // shipped 7.3 half-byte kernel, NOT a runtime `bits` arg), and the family takes NO
+    // one-hot overlay upstream (there is no `pairwise_hist_half_byte_one_hot.cu`). It is a
+    // SEPARATE `#[cube]` symbol with a SEPARATE launch arm — exercised here through
+    // `launch_pairwise_hist_half_byte`.
+    //
+    // The device 4-channel histogram (n_bins = 16) must match the ordered host reference
+    // within the REPORTED bound over the edge cases n_pairs=0 (empty, NO launch/read-back),
+    // n_pairs=1, n_pairs=37 (non-cube-multiple), and large N. The reported max abs/rel
+    // divergence is printed (REPORT-not-sign-off, D-7.4-05).
+    let n_features = 2usize;
+    let n_objects = 64usize; // > 16 so bins span the full 4-bit range
+    let n_bins = 16usize; // HALF_BYTE_BINS — the distinct half-byte line size
+    // The half-byte family has no one-hot overlay; the host reference is the non-one-hot
+    // Compare path (the kernel hard-codes it).
+    let one_hot = false;
+
+    // Empty (n_pairs=0): NO launch, NO read-back (Pitfall 5).
+    {
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, 0);
+        let device =
+            launch_pairwise_hist_half_byte(&pi, &pj, &pw, &cindex, n_objects, n_bins, n_features)
+                .unwrap();
+        assert!(
+            device.is_empty(),
+            "empty input must yield an empty half-byte pairwise histogram (no launch)"
+        );
+    }
+
+    for &n_pairs in &[1usize, 37usize, 10_000usize] {
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+        let device =
+            launch_pairwise_hist_half_byte(&pi, &pj, &pw, &cindex, n_objects, n_bins, n_features)
+                .unwrap();
+        let baseline = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        );
+
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "device binSums length must equal the host-reference 4-channel layout (half-byte, n_pairs={n_pairs})"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[pair_hist half-byte f64 n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+        );
+        assert!(
+            rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+            "half-byte pairwise hist (n_pairs={n_pairs}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+        );
+    }
+
+    // Device-residency hand-off (SC-3): the half-byte handle arm returns the 4-channel
+    // binSums as a device HANDLE with NO host fold on the seam; read it back ONCE here.
+    {
+        let n_pairs = 50usize;
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+        let handle = launch_pairwise_hist_half_byte_handle(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features,
+        )
+        .unwrap();
+        let device = read_pair_handle(handle);
+        let baseline = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        );
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "half-byte binSums handle length must equal the host-reference 4-channel layout length"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[pair_hist half-byte handoff n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+        );
+        assert!(
+            rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+            "half-byte device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
         );
     }
 }
