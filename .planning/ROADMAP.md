@@ -25,7 +25,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 6.4: Score Functions, Uncertainty & Custom Objectives** - LOSS-09, LOSS-08, LOSS-06 uncertainty types, LOSS-07 Rust trait (Python callback → Phase 8) (completed 2026-06-18)
   - [x] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first (SC-2 BM25 per-stage CLOSED via 06.5-09 PATH-A fixture-correctness fix)
   - [x] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine (completed 2026-06-18)
-- [ ] **Phase 7: GPU Backends via CubeCL** (umbrella — split into 7.1–7.6) - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, full structural parity with `catboost/cuda/`, documented GPU tolerance
+- [x] **Phase 7: GPU Backends via CubeCL** (umbrella — split into 7.1–7.6) - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, full structural parity with `catboost/cuda/`, documented GPU tolerance — **COMPLETE** (all sub-phases 7.1–7.6 closed; GPU-01..06 satisfied; ε=1e-4 signed off vs Rust CPU path)
   - [x] **Phase 7.1: GPU Backend Runtime & Device Primitives** - GPU-02/04/05 + GPU-01 scan/reductions; cfg-gated `SelectedRuntime`, device memory, wave-agnostic scan/reduction primitives (completed 2026-06-20)
   - [x] **Phase 7.2: On-Device Gradient/Hessian & Targets** - GPU-01 grad/hess; port `targets/` derivative computation device-resident (completed 2026-06-20)
   - [x] **Phase 7.3: Pointwise Histogram Family** - GPU-01 hist; `pointwise_hist2_*` incl. 5/6/7/8-bit, half-byte, binary variants (completed 2026-06-20)
