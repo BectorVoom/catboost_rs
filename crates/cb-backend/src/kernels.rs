@@ -2734,6 +2734,14 @@ mod pairwise_hist;
 // `pointwise_hist`/`pairwise_hist` it runs over the generic `SelectedRuntime`, so it
 // builds/runs under EVERY backend (the rocm in-env oracle on gfx1100 + the wgpu host run
 // + cuda compile-only). REPORTS divergence; the GPU-06 epsilon is 7.6's job.
+// IN-04: shared `#[cfg(test)]` fixture-construction primitives composed by the Phase 7.5
+// cross-oracle modules `score_split` and `grow_loop`. Factors ONLY the genuinely-shared
+// per-channel construction (the centred ramp, the mod-5 weight, the feature-major cindex,
+// the identity indices, the competitor-pair list); each builder still emits byte-identical
+// oracle inputs. Lives in `kernels/test_fixtures.rs`, mounted at `kernels::test_fixtures`.
+#[cfg(test)]
+mod test_fixtures;
+
 #[cfg(test)]
 mod score_split;
 

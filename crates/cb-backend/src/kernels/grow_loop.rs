@@ -103,20 +103,12 @@ fn make_fixture(
     n_features: usize,
     n_bins: usize,
 ) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
-    let der1: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
-    let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
-    let mut cindex = vec![0u32; n_features * n];
-    for feature in 0..n_features {
-        for obj in 0..n {
-            let bin = if feature == 0 {
-                ((obj * n_bins) / n.max(1)).min(n_bins - 1)
-            } else {
-                (obj * (feature + 2) + feature) % n_bins
-            };
-            cindex[feature * n + obj] = bin as u32;
-        }
-    }
-    let indices: Vec<u32> = (0..n as u32).collect();
+    // IN-04: composed from the shared `kernels::test_fixtures` primitives — byte-identical
+    // to the prior inlined construction (the der1-based grow-loop / partition fixture).
+    let der1 = crate::kernels::test_fixtures::ramp_centred(n);
+    let weight = crate::kernels::test_fixtures::weight_mod5(n);
+    let cindex = crate::kernels::test_fixtures::cindex_feature_major(n, n_features, n_bins);
+    let indices = crate::kernels::test_fixtures::indices_identity(n);
     (der1, weight, cindex, indices)
 }
 
@@ -722,22 +714,15 @@ mod multi_tree {
         n_features: usize,
         n_bins: usize,
     ) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
-        // A clear monotone target ramp (centred) — feature 0's bins track it, so the
-        // greedy stump split on feature 0 is unambiguous and stable across iterations.
-        let target: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
-        let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
-        let mut cindex = vec![0u32; n_features * n];
-        for feature in 0..n_features {
-            for obj in 0..n {
-                let bin = if feature == 0 {
-                    ((obj * n_bins) / n.max(1)).min(n_bins - 1)
-                } else {
-                    (obj * (feature + 2) + feature) % n_bins
-                };
-                cindex[feature * n + obj] = bin as u32;
-            }
-        }
-        let indices: Vec<u32> = (0..n as u32).collect();
+        // IN-04: composed from the shared `kernels::test_fixtures` primitives —
+        // byte-identical to the prior inlined construction. The first channel is a clear
+        // monotone centred TARGET ramp (the boosting input, NOT a der1) — feature 0's bins
+        // track it, so the greedy stump split on feature 0 is unambiguous and stable across
+        // iterations; other features get a deterministic lower-gain spread.
+        let target = crate::kernels::test_fixtures::ramp_centred(n);
+        let weight = crate::kernels::test_fixtures::weight_mod5(n);
+        let cindex = crate::kernels::test_fixtures::cindex_feature_major(n, n_features, n_bins);
+        let indices = crate::kernels::test_fixtures::indices_identity(n);
         (target, weight, cindex, indices)
     }
 
@@ -996,30 +981,15 @@ mod pairwise {
         n_features: usize,
         n_bins: usize,
     ) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u32>, Vec<f64>, Vec<u32>, Vec<u32>) {
-        let der1: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
-        let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
-        let mut cindex = vec![0u32; n_features * n];
-        for feature in 0..n_features {
-            for obj in 0..n {
-                let bin = if feature == 0 {
-                    ((obj * n_bins) / n.max(1)).min(n_bins - 1)
-                } else {
-                    (obj * (feature + 2) + feature) % n_bins
-                };
-                cindex[feature * n + obj] = bin as u32;
-            }
-        }
-        let mut pair_i: Vec<u32> = Vec::new();
-        let mut pair_j: Vec<u32> = Vec::new();
-        let mut pair_weight: Vec<f64> = Vec::new();
-        for w in 0..n {
-            for l in (w + 1)..(w + 4).min(n) {
-                pair_i.push(w as u32);
-                pair_j.push(l as u32);
-                pair_weight.push(0.5 + ((w + l) % 5) as f64 * 0.25);
-            }
-        }
-        let indices: Vec<u32> = (0..n as u32).collect();
+        // IN-04: composed from the shared `kernels::test_fixtures` primitives —
+        // byte-identical to the prior inlined construction. der1 = centred ramp, mod-5
+        // weight, feature-major cindex (feature 0 monotone), the sliding-window
+        // competitor-pair list, identity indices.
+        let der1 = crate::kernels::test_fixtures::ramp_centred(n);
+        let weight = crate::kernels::test_fixtures::weight_mod5(n);
+        let cindex = crate::kernels::test_fixtures::cindex_feature_major(n, n_features, n_bins);
+        let (pair_i, pair_j, pair_weight) = crate::kernels::test_fixtures::competitor_pairs(n);
+        let indices = crate::kernels::test_fixtures::indices_identity(n);
         (der1, weight, pair_i, pair_j, pair_weight, cindex, indices)
     }
 

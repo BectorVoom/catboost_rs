@@ -135,28 +135,17 @@ fn make_score_fixture(
     n_features: usize,
     n_bins: usize,
 ) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
-    // der1: a smooth ramp through zero so a mid-range border separates negative from
-    // positive contributions (a high-gain split).
-    let der1: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
-    // Non-trivial weights (never all-1) so the weight channel / denominator is a real
-    // sum.
-    let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
-    // Feature-major cindex: feature 0 spreads bins monotonically with the object index
-    // (so the der1 ramp aligns with the bin axis → a clear high-gain border), other
-    // features get a different deterministic spread (lower gain).
-    let mut cindex = vec![0u32; n_features * n];
-    for feature in 0..n_features {
-        for obj in 0..n {
-            let bin = if feature == 0 {
-                // monotone with obj → aligns with the der1 ramp (clear best feature)
-                ((obj * n_bins) / n.max(1)).min(n_bins - 1)
-            } else {
-                (obj * (feature + 2) + feature) % n_bins
-            };
-            cindex[feature * n + obj] = bin as u32;
-        }
-    }
-    let indices: Vec<u32> = (0..n as u32).collect();
+    // IN-04: composed from the shared `kernels::test_fixtures` primitives — byte-identical
+    // to the prior inlined construction.
+    // der1: the centred ramp through zero so a mid-range border separates negative from
+    // positive contributions (a high-gain split). Non-trivial weights (never all-1) so the
+    // weight channel / denominator is a real sum. Feature-major cindex: feature 0 climbs
+    // monotonically with the object index (aligns the der1 ramp with the bin axis → a clear
+    // high-gain border), other features get a deterministic lower-gain spread.
+    let der1 = crate::kernels::test_fixtures::ramp_centred(n);
+    let weight = crate::kernels::test_fixtures::weight_mod5(n);
+    let cindex = crate::kernels::test_fixtures::cindex_feature_major(n, n_features, n_bins);
+    let indices = crate::kernels::test_fixtures::indices_identity(n);
     (der1, weight, cindex, indices)
 }
 
@@ -887,34 +876,19 @@ mod pairwise {
         n_features: usize,
         n_bins: usize,
     ) -> (Vec<f64>, Vec<u32>, Vec<u32>, Vec<f64>, Vec<u32>, Vec<u32>) {
-        // Pairwise-weighted der1: a smooth ramp through zero (a clear pairwise gradient).
-        let der1: Vec<f64> = (0..n_objects)
-            .map(|k| (k as f64) - (n_objects as f64) / 2.0)
-            .collect();
-        let mut cindex = vec![0u32; n_features * n_objects];
-        for feature in 0..n_features {
-            for obj in 0..n_objects {
-                let bin = if feature == 0 {
-                    ((obj * n_bins) / n_objects.max(1)).min(n_bins - 1)
-                } else {
-                    (obj * (feature + 2) + feature) % n_bins
-                };
-                cindex[feature * n_objects + obj] = bin as u32;
-            }
-        }
-        // Global pairs (winner, loser): consecutive objects within a sliding window form
-        // winner→loser competitor pairs (the ranking adjacency), non-trivial weights.
-        let mut pair_i: Vec<u32> = Vec::new();
-        let mut pair_j: Vec<u32> = Vec::new();
-        let mut pair_weight: Vec<f64> = Vec::new();
-        for w in 0..n_objects {
-            for l in (w + 1)..(w + 4).min(n_objects) {
-                pair_i.push(w as u32);
-                pair_j.push(l as u32);
-                pair_weight.push(0.5 + ((w + l) % 5) as f64 * 0.25);
-            }
-        }
-        let indices: Vec<u32> = (0..n_objects as u32).collect();
+        // IN-04: composed from the shared `kernels::test_fixtures` primitives —
+        // byte-identical to the prior inlined construction (NO weight channel here).
+        // Pairwise-weighted der1: the centred ramp through zero (a clear pairwise
+        // gradient). Feature-major cindex: feature 0 climbs monotonically (a clear
+        // pairwise-gain border), other features get a deterministic spread. Global pairs:
+        // consecutive objects within a sliding window form winner→loser competitor pairs
+        // (the ranking adjacency) with non-trivial weights.
+        let der1 = crate::kernels::test_fixtures::ramp_centred(n_objects);
+        let cindex =
+            crate::kernels::test_fixtures::cindex_feature_major(n_objects, n_features, n_bins);
+        let (pair_i, pair_j, pair_weight) =
+            crate::kernels::test_fixtures::competitor_pairs(n_objects);
+        let indices = crate::kernels::test_fixtures::indices_identity(n_objects);
         (der1, pair_i, pair_j, pair_weight, cindex, indices)
     }
 
