@@ -31,7 +31,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 7.3: Pointwise Histogram Family** - GPU-01 hist; `pointwise_hist2_*` incl. 5/6/7/8-bit, half-byte, binary variants (completed 2026-06-20)
   - [x] **Phase 7.4: Pairwise Histogram Family** - GPU-01 hist; `pairwise_hist_*` incl. 8-bit atomics and one-hot variants (completed 2026-06-20)
   - [x] **Phase 7.5: Score/Split Selection & On-Device Tree-Grow Loop** - GPU-01 close; score calcers + split selection + full device-resident grow loop (D-05) (completed 2026-06-20)
-  - [ ] **Phase 7.6: GPU Tolerance, rocm Validation & Sign-off** - GPU-03/06; empirical epsilon vs Rust CPU path, rocm oracle gate, user sign-off
+  - [x] **Phase 7.6: GPU Tolerance, rocm Validation & Sign-off** - GPU-03/06; empirical epsilon vs Rust CPU path, rocm oracle gate, user sign-off — **COMPLETE** (ε=1e-4 signed off; rocm 75/0 green in-env; GPU-03/06 closed)
 - [ ] **Phase 8: Python Bindings, Dual API & Packaging** - PyO3 dual sklearn + CatBoost-native API, NumPy/Pandas/Arrow/Polars input, per-backend wheels
 
 ## Phase Details
@@ -737,7 +737,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1; has human checkpoints — autonomous: false)*
 
-- [ ] 07.6-02-PLAN.md — Run full rocm suite green in-env (GPU-03 gate, never in CI) + propose concrete epsilon & obtain HARD HUMAN sign-off (D-7.6-07) + write 07.6-GPU-TOLERANCE.md (signed-off ε, vs-Rust-CPU-path, wave32 scope/wave64 gap) + flip REQUIREMENTS GPU-03/GPU-06
+- [x] 07.6-02-PLAN.md — Run full rocm suite green in-env (GPU-03 gate, never in CI) + propose concrete epsilon & obtain HARD HUMAN sign-off (D-7.6-07) + write 07.6-GPU-TOLERANCE.md (signed-off ε, vs-Rust-CPU-path, wave32 scope/wave64 gap) + flip REQUIREMENTS GPU-03/GPU-06 — **COMPLETE** (commit a6d65e1): user signed off **ε=1e-4** (vs Rust CPU path, D-04 — one clean order looser than CPU 1e-5, ~5 orders above global observed max 7.451e-9). 07.6-GPU-TOLERANCE.md (150 lines) records signed-off ε + derivation, bit-exact-vs-conservative tension, vs-Rust-CPU-path framing, wave32 scope + explicit wave64 (CDNA/MI) gap (D-09), rocm-only/never-CI gate policy (D-06) + authoritative `cargo test -p cb-backend --no-default-features --features rocm`, wgpu/cuda compile-gated stubs (D-07), per-family evidence table incl. end-to-end leaf-value rows (D-7.6-03). **rocm suite 75 passed / 0 failed in-env on gfx1100; wgpu+cuda build RC=0; no rocm in `.github/`** — all orchestrator/human-discharged (verifier subagent has no GPU, D-06). REQUIREMENTS GPU-03 → Complete (Phase 7.6); GPU-06 → Complete, ε=1e-4, vs Rust CPU path. **Phase 7 umbrella's last two requirements CLOSE.** gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY.
 
 ### Phase 8: Python Bindings, Dual API & Packaging
 

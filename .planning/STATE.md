@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 7.6 context gathered
-last_updated: "2026-06-20T22:11:04.749Z"
-last_activity: 2026-06-20 -- Phase 7.6 execution started
+stopped_at: 07.6-02 COMPLETE — GPU-06 ε=1e-4 signed off + GPU-03 gate closed (Phase 7 umbrella closed)
+last_updated: "2026-06-21T00:00:00.000Z"
+last_activity: 2026-06-21 -- 07.6-02 COMPLETE (GPU-03/06 closed)
 progress:
   total_phases: 20
   completed_phases: 16
   total_plans: 113
-  completed_plans: 112
-  percent: 80
+  completed_plans: 113
+  percent: 81
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 7.6 (gpu-tolerance-rocm-validation-sign-off) — EXECUTING
-Plan: 2 of 2
-Status: Ready to execute
-Last activity: 2026-06-20 -- Phase 7.6 execution started
+Phase: 7.6 (gpu-tolerance-rocm-validation-sign-off) — ALL PLANS COMPLETE (pending phase verification)
+Plan: 2 of 2 — COMPLETE
+Status: Phase 7.6 plans done; GPU-03/GPU-06 closed, Phase 7 umbrella closed
+Last activity: 2026-06-21 -- 07.6-02 COMPLETE (GPU-06 ε=1e-4 signed off; GPU-03 rocm gate closed)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -386,8 +386,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T22:10:52.773Z
-Stopped at: Phase 7.6 context gathered
+Last session: 2026-06-21T00:00:00.000Z
+Stopped at: 07.6-02 COMPLETE (commit a6d65e1 Task 3) — GPU-06 epsilon SIGNED OFF + GPU-03 rocm gate CLOSED; the Phase 7 umbrella's last two open requirements close. User signed off **ε=1e-4** (vs the Rust CPU path, D-04 — one clean order looser than the CPU 1e-5 bar, ~5 orders above the global observed max divergence of 7.451e-9 from the score_split family; every other measured family bit-exact 0.000e0; 3σ run-to-run variance = 0.0). NEW `07.6-GPU-TOLERANCE.md` (150 lines) records: signed-off ε + derivation (roundUp over observed_max+3σ, D-7.6-04) + the deliberately-preserved bit-exact-vs-conservative tension (D-04 mandates looser-than-1e-5 despite ~bit-exact observations: headroom for unmeasured losses / atomic contention / wave64); vs-Rust-CPU-path-NOT-C++-oracle framing (D-04); wave32-native scope on gfx1100 + explicit wave64 (CDNA/MI) gap NOT closed (D-09); rocm-only/never-CI gate policy (D-06) + authoritative `cargo test -p cb-backend --no-default-features --features rocm`, wgpu/cuda compile-gated stubs (D-07); single-global-ε-is-the-gate per-family evidence table (D-7.6-03) incl. end-to-end leaf-value rows (7.5 REPORTED → now SIGNED OFF). Tasks 1+2 (blocking-human checkpoints) discharged by orchestrator/human IN-ENV before this continuation: rocm suite **75 passed / 0 failed** on gfx1100, wgpu+cuda build RC=0, stale rocm CI step REMOVED this session (commit 70a046d), no `features rocm` under `.github/`. A verifier subagent has NO GPU → the rocm run + epsilon sign-off are orchestrator/human-discharged, NOT by a subagent (D-06). REQUIREMENTS GPU-03 → Complete (Phase 7.6); GPU-06 → Complete, ε=1e-4, vs Rust CPU path. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: Phase 7.6 verification / Phase 7 umbrella close-out. Resume file: .planning/phases/07.6-gpu-tolerance-rocm-validation-sign-off/07.6-02-SUMMARY.md.
+Stopped at (prior): Phase 7.6 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
 Stopped at (prior): 06.3-02 COMPLETE (commits f42e3e6 Task1 / 6b208dd Task2) — QueryRMSE + QuerySoftMax, the first two deterministic querywise ranking losses, trained end-to-end on the grouped seam ≤1e-5 vs catboost 1.2.10. Task1: loss.rs queryrmse_der/querysoftmax_der per-object inner formulas (weight folded in); runtime.rs Loss::QueryRmse + Loss::QuerySoftMax{lambda,beta} (validate rejects lambda<0/beta≤0; defaults 0.01/1.0); ranking_der.rs wired arms — QueryRMSE per-group queryAvrg via sum_f64, QuerySoftMax max-shifted softmax der with sumWTargets≤0/weight≤0 guards; exhaustive-match arms added in cb-backend cpu_runtime + cb-train metrics/boosting + 3 cb-train oracle test files (workspace check --tests GREEN — the prior attempt's non-exhaustive cb-backend arm is closed). 11 new unit tests. Task2: boosting der-site branches on is_grouped_loss → compute_gradients_grouped over a per-fit QueryInfo view; train_ranking entry + RankingData; queryrmse/querysoftmax per-stage oracles gate Splits/LeafValues/StagedApprox/Predictions ≤1e-5 (Cosine score; QueryRMSE=Newton leaf, QuerySoftMax=Gradient leaf per fixture model.json); QuerySoftMax fixture frozen OFFLINE. Gates: cb-compute 102/102, full cb-train suite 0 failures (154 lib + all oracles incl. D-04 no-regression). NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 06.3-03 (PairLogit + LambdaMart, Wave B pairwise). Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-02-SUMMARY.md.
