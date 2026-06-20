@@ -41,7 +41,8 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel, quantile_gradient_kernel,
+    pointwise_hist2_binary_kernel, pointwise_hist2_half_byte_kernel,
+    pointwise_hist2_nonbinary_kernel, quantile_gradient_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -944,6 +945,62 @@ fn launch_pointwise_hist2_into(
         y: 1,
         z: 1,
     };
+
+    // Binary (1-bit) family branch (Plan D — D-7.3-02). A border count of
+    // `BINARY_BINS == 2` selects the SEPARATE `pointwise_hist2_binary_kernel` (NOT a
+    // comptime case of the non-binary kernel, NOR the half-byte kernel): upstream's binary
+    // path (`pointwise_hist2_binary.cu`'s `ComputeHist2Binary`) is a structurally distinct
+    // kernel family (2-bucket split-bit decomposition), so we dispatch to its own kernel
+    // here, mirroring `pointwise_kernels.cpp`'s `BinaryFeatures -> ComputeHist2Binary`
+    // dispatch. It writes the SAME FROZEN binSums layout `(feature * 2 + bin) * 2 +
+    // channel` through this UNCHANGED seam (the seam stays byte-identical — D-7.3-01). The
+    // same channel-float dispatch applies (f64 on rocm/cuda/cpu, f32 on wgpu — RESEARCH
+    // A1). NO read-back here (SC-3 / Pitfall 5).
+    if n_bins == crate::kernels::BINARY_BINS {
+        let bin_sums_len = hist2_binsums_len(n_bins, n_features);
+        let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+        let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+        #[cfg(feature = "wgpu")]
+        {
+            let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
+            let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
+            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
+            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
+            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
+            pointwise_hist2_binary_kernel::launch::<f32, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+                n_features as u32,
+            );
+            return Ok(h);
+        }
+
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
+            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
+            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+            pointwise_hist2_binary_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+                n_features as u32,
+            );
+            return Ok(h);
+        }
+    }
 
     // Half-byte (4-bit) family branch (Plan C — D-7.3-02). A border count of
     // `HALF_BYTE_BINS == 16` selects the SEPARATE `pointwise_hist2_half_byte_kernel`
