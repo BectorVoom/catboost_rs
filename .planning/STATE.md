@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 07.5-01-PLAN.md
-last_updated: "2026-06-20T18:16:19.848Z"
-last_activity: 2026-06-21 -- Phase 07.5 Plan 03 (Task 2) complete
+stopped_at: Completed 07.5-06-PLAN.md
+last_updated: "2026-06-20T18:30:00.000Z"
+last_activity: 2026-06-20 -- Phase 07.5 Plan 06 complete (pairwise split scorer + ranking grow-loop, GPU-01 kernel surface CLOSED)
 progress:
   total_phases: 20
   completed_phases: 15
   total_plans: 111
-  completed_plans: 110
-  percent: 75
+  completed_plans: 111
+  percent: 76
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 07.5 (Score/Split Selection & On-Device Tree-Grow Loop) — EXECUTING
-Plan: 6 of 6
-Status: Ready to execute (03 complete — host-light single-tree grow loop landed, SC-3 structure parity GREEN on gfx1100)
-Last activity: 2026-06-21 -- Phase 07.5 Plan 03 (Task 2) complete
+Phase: 07.5 (Score/Split Selection & On-Device Tree-Grow Loop) — ALL PLANS COMPLETE (ready for verification)
+Plan: 6 of 6 — COMPLETE
+Status: 07.5-06 complete — the PAIRWISE split scorer + ranking/PairLogit grow-loop landed; STRUCTURE EXACT + score/scan/leaf bit-exact (0.000e0) on gfx1100. GPU-01 kernel surface CLOSED (all scorers L2/Cosine/Solar/LOO/Sat + pairwise + the full device-resident grow loop exist). Next: phase verification.
+Last activity: 2026-06-20 -- Phase 07.5 Plan 06 (Tasks 1-2) complete
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
