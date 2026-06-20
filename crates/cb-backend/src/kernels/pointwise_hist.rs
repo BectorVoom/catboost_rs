@@ -298,6 +298,67 @@ fn handoff() {
 }
 
 #[test]
+fn nonbinary_bits() {
+    // The 5/6/7-bit non-binary fill self-oracle (Plan B): the SAME
+    // `pointwise_hist2_nonbinary_kernel` selected through the comptime `bits` arg —
+    // no new kernel family, no runtime bit-count branch (D-7.3-02). For each bit-width
+    // the device 2-channel histogram must match the ORDERED host reference within the
+    // REPORTED bound, exercised at the matching border count `(1 << bits)` over the
+    // edge cases n=1 / n=37 (non-cube-multiple) / large N, plus the empty
+    // short-circuit. An 8-bit pass is kept as a regression anchor so the slice
+    // generalization cannot silently break the Plan A path. The per-bit max abs/rel
+    // divergence + the AtomicFinalizePath are REPORTED, not signed off (D-7.3-04 —
+    // the GPU-06 epsilon is 7.6's job).
+    let n_features = 2usize;
+
+    // {5,6,7} are the new Plan B cases; 8 is the Plan A regression anchor. The border
+    // (bin) count is `1 << bits` per bit-width, mirroring upstream
+    // `pointwise_kernels.cpp`'s `DISPATCH_ONE_BYTE(..., 5/6/7/8)` (a `b`-bit feature
+    // group has up to `1 << b` borders).
+    for &bits in &[5u32, 6u32, 7u32, 8u32] {
+        let n_bins = 1usize << bits;
+
+        // Empty (n=0): NO launch, NO read-back (Pitfall 5) at every bit-width.
+        {
+            let (der1, weight, cindex, indices) = make_fixture_f64(0, n_features, n_bins);
+            let (device, path) =
+                launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features)
+                    .unwrap();
+            println!("[hist2 {bits}bit n=0] REPORTED AtomicFinalizePath={path:?}");
+            assert!(
+                device.is_empty(),
+                "empty input must yield an empty histogram (no launch) at bits={bits}"
+            );
+        }
+
+        // n=1, n=37 (non-cube-multiple), large N: device vs ordered host reference,
+        // each at the bit-width's `(1 << bits)` border count.
+        for &n in &[1usize, 37usize, 10_000usize] {
+            let (der1, weight, cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+            let (device, path) =
+                launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features)
+                    .unwrap();
+            let baseline =
+                host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+
+            assert_eq!(
+                device.len(),
+                baseline.len(),
+                "device binSums length must equal the host-reference layout length (bits={bits}, n={n})"
+            );
+            let (abs, rel) = max_divergence(&device, &baseline);
+            println!(
+                "[hist2 {bits}bit f64 n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} AtomicFinalizePath={path:?}"
+            );
+            assert!(
+                rel <= HIST_BOUND || abs <= HIST_BOUND,
+                "{bits}-bit hist2 (n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
+            );
+        }
+    }
+}
+
+#[test]
 fn length_mismatch_is_typed_error() {
     // T-07.3-01: mismatched der1/weight/cindex/indices lengths must surface a typed
     // `CbError::LengthMismatch` BEFORE any launch (a host-side guard), never an OOB
