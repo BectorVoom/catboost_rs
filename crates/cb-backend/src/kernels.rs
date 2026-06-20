@@ -1280,6 +1280,120 @@ pub fn pairwise_hist_half_byte_kernel<F: Float>(
     }
 }
 
+/// The binary (1-bit, 2-bin) pairwise histogram fill — upstream's structurally DISTINCT
+/// `pairwise_hist_binary.cu::ComputePairwiseHistogramBinary` family (D-7.4-02). The binary
+/// path packs several 1-bit features per `ci` word; upstream extracts a 4-bit nibble and
+/// builds the 2x2 cross-product `(invBin1 & invBin2) | ((invBin1 & bin2) << 8) | ((bin1 &
+/// invBin2) << 16) | ((bin1 & bin2) << 24)` over the warp tile. Reduced to per-pair
+/// accumulation semantics that 2x2 `(i leq/ge) x (j leq/ge)` decomposition is EXACTLY the
+/// non-one-hot `Compare(bin1,bin2)->histId` predicate the other families use (the self-oracle
+/// validates this bit-exact). Its working histogram is a FIXED 2-entry (1-bit) line — a bin
+/// COUNT, NOT a warp literal (D-09). It is kept a SEPARATE `#[cube]` symbol with a SEPARATE
+/// launch arm to preserve structural parity with upstream's separate `.cu` — the MVP body is
+/// the non-binary kernel with `n_bins` fixed at `2` and the read bins masked to the bit
+/// (`& 1`, the shipped 7.3 binary precedent at `pointwise_hist2_binary_kernel`).
+///
+/// # No one-hot overlay (RESEARCH Pattern 2)
+///
+/// The binary family takes NO `one_hot` arg: upstream has no `pairwise_hist_binary_one_hot.cu`.
+/// This kernel ALWAYS uses the non-one-hot `Compare` predicate `(bin1 >= bin2) == flag` (the
+/// flag-collapsed `(ge, gt)` writes), exactly the `else`-branch of
+/// [`pairwise_hist_nonbinary_kernel`].
+///
+/// # FROZEN 4-channel WEIGHT-ONLY layout (reused unchanged from Plan A — D-7.4-03)
+///
+/// The binary family reuses the Plan A FROZEN 4-channel weight-only `binSums` layout VERBATIM
+/// (never `* 2` — Pitfall 2); the only differences from [`pairwise_hist_nonbinary_kernel`] are
+/// the comptime `n_bins = 2` (so the buffer length is `n_features * 2 * 4`), the bit mask on
+/// the read bins, and the absence of the one-hot branch:
+///
+/// ```text
+/// index(feature, bin, histId) = (feature * 2 + bin) * 4 + histId,  histId in {0,1,2,3}
+/// non-one-hot, pair (b1, b2, w):  ge = (b1>=b2), gt = (b1>b2)
+///   bin b1, histId 2*ge+0 += w;   bin b1, histId 2*gt+0 += w;
+///   bin b2, histId 2*ge+1 += w;   bin b2, histId 2*gt+1 += w;
+/// ```
+///
+/// # Stride discipline (Pitfall 3) + bounds (D-09)
+///
+/// `pair_i`/`pair_j` hold OBJECT ids; the cindex stride is over OBJECTS (`n_objects`, a
+/// runtime scalar), NOT `n_pairs` — `bin = cindex[feature * n_objects + obj]`. The grid-stride
+/// is the total thread count (`CUBE_COUNT * CUBE_DIM`), never a literal 32/64 (D-09 — the
+/// 2-bin line is a bin COUNT, not a warp literal). The bit mask (`& 1`) additionally bounds
+/// the bin into `0..2` structurally; Bin/object VALUE ranges are also validated HOST-SIDE in
+/// `launch_pairwise_hist_binary_into` before launch. Generic over `F: Float` (AGENTS.md
+/// generics-float). if-as-STATEMENT only (CubeCL conditionals manual).
+#[cube(launch)]
+pub fn pairwise_hist_binary_kernel<F: Float>(
+    pair_i: &Array<u32>,
+    pair_j: &Array<u32>,
+    pair_weight: &Array<F>,
+    cindex: &Array<u32>,
+    bin_sums: &Array<Atomic<F>>,
+    n_features: u32,
+    n_objects: u32,
+) {
+    // FIXED 2-bin (1-bit) line — a bin COUNT, NOT a runtime `bits` value or warp literal
+    // (D-09): the structural mark of the binary family. Held `usize` for the (feature, bin)
+    // index math.
+    let n_bins = comptime!(2usize);
+    // 1-bit mask (upstream binary bin select). Applied to the raw `cindex` `u32` value before
+    // the `usize` index cast.
+    let bit_mask = comptime!(1u32);
+    // n_pairs (the loop bound) is the per-pair value count; the cindex stride is n_objects
+    // (Pitfall 3 — NEVER n_pairs).
+    let n_pairs = pair_weight.len();
+    let n_features_usize = n_features as usize;
+    let n_objects_usize = n_objects as usize;
+
+    // Grid-stride loop over PAIRS; stride = total thread count (CUBE_COUNT * CUBE_DIM) —
+    // topology-derived, never a literal 32/64 (D-09). Each unit processes pairs ABSOLUTE_POS,
+    // ABSOLUTE_POS + stride, … so a launch narrower than n_pairs still covers every pair
+    // (idle-guard `p < n_pairs`).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut p = ABSOLUTE_POS;
+    while p < n_pairs {
+        let oi = pair_i[p] as usize;
+        let oj = pair_j[p] as usize;
+        let w = pair_weight[p];
+
+        let mut feature = 0usize;
+        while feature < n_features_usize {
+            // Two bins per (pair, feature): the quantized bins of the two paired objects,
+            // masked to the 1-bit value (upstream binary bin select). cindex stride is OBJECTS
+            // (Pitfall 3).
+            let b1 = (cindex[feature * n_objects_usize + oi] & bit_mask) as usize;
+            let b2 = (cindex[feature * n_objects_usize + oj] & bit_mask) as usize;
+
+            // Non-one-hot Compare -> histId channel selection (the binary family has no one-hot
+            // overlay). ge = (b1>=b2), gt = (b1>b2); the two flag-collapsed writes per bin land
+            // in histId 2*ge+isSecondBin and 2*gt+isSecondBin. This is the per-pair reduction
+            // of upstream's 2x2 `(invBin1&invBin2)|...` cross-product. if-as-STATEMENT only.
+            let base = (feature * n_bins) * 4usize;
+            let mut ge = 0usize;
+            if b1 >= b2 {
+                ge = 1usize;
+            }
+            let mut gt = 0usize;
+            if b1 > b2 {
+                gt = 1usize;
+            }
+            // bin b1 (isSecondBin = 0)
+            let b1_base = base + b1 * 4usize;
+            bin_sums[b1_base + 2usize * ge].fetch_add(w);
+            bin_sums[b1_base + 2usize * gt].fetch_add(w);
+            // bin b2 (isSecondBin = 1)
+            let b2_base = base + b2 * 4usize;
+            bin_sums[b2_base + 2usize * ge + 1usize].fetch_add(w);
+            bin_sums[b2_base + 2usize * gt + 1usize].fetch_add(w);
+
+            feature += 1usize;
+        }
+
+        p += stride;
+    }
+}
+
 /// Block-level sum reduction (the Phase-7.1 device primitive, D-7.1-04..09;
 /// GPU-01 reduce). Each cube folds its `CUBE_DIM`-wide slice of `input` into a
 /// SINGLE partial written to `output[CUBE_POS]`; the host finalizes the across-cube

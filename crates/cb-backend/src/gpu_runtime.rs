@@ -59,8 +59,8 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    pairwise_hist_8bit_atomics_kernel, pairwise_hist_half_byte_kernel,
-    pairwise_hist_nonbinary_kernel,
+    pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
+    pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
     quantile_gradient_kernel,
@@ -2082,6 +2082,216 @@ pub fn launch_pairwise_hist_half_byte(
     }
 
     let handle = launch_pairwise_hist_half_byte_into(
+        &client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features,
+    )?;
+
+    read_pair_binsums_f64(&client, handle)
+}
+
+/// Launch the binary (1-bit, 2-bin) pairwise histogram fill device-resident and return the
+/// 4-channel `binSums` Handle WITHOUT reading it back (the SC-3 / D-7.4-03 hand-off path).
+/// This is the SEPARATE launch arm for the structurally DISTINCT binary family (D-7.4-02 —
+/// upstream `pairwise_hist_binary.cu`): the histogram line is a FIXED 2-bin (1-bit) line (a
+/// bin COUNT, NOT a warp literal), and the family takes NO one-hot overlay upstream (there is
+/// no `pairwise_hist_binary_one_hot.cu`). It reuses the Plan A FROZEN 4-channel layout
+/// ([`pair_hist_binsums_len`], index `(feature * n_bins + bin) * 4 + histId`), the guard
+/// block, the backend-dispatched channel, the empty short-circuit, and the no-readback seam
+/// UNCHANGED — the only differences are `n_bins = 2` (validated below) and the dispatched
+/// kernel symbol.
+///
+/// `n_bins` MUST be `2` (the binary line size); anything else is rejected with
+/// [`CbError::Degenerate`]. There is no `one_hot` parameter (the binary family has no one-hot
+/// overlay). Inputs, guards, and the empty/typed-error semantics match
+/// [`launch_pairwise_hist_handle`] (see its docs). No `unwrap`/`expect`/`panic`/indexing in
+/// this production helper.
+pub fn launch_pairwise_hist_binary_handle(
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_pairwise_hist_binary_into(
+        &client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features,
+    )
+}
+
+/// The ONE binary pairwise launch geometry (IN-02 — one place). Clones
+/// [`launch_pairwise_hist_into`] with `n_bins` pinned to `2` and dispatches
+/// [`pairwise_hist_binary_kernel`] (fixed 2-bin line, bit-masked bins, no one-hot). Reuses the
+/// Plan A guard block, the 4-channel layout, the backend-dispatched channel, and the
+/// no-readback seam unchanged. The caller owns the `client` lifecycle so a read-back uses the
+/// SAME client that allocated the handle.
+fn launch_pairwise_hist_binary_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Handle> {
+    let n_pairs = pair_i.len();
+
+    // Shape guards (T-07.4-15): identical to the non-binary/8-bit/half-byte arms — a mismatch
+    // would read out of bounds on the device. Surface a typed error BEFORE launch (no panic).
+    if pair_j.len() != n_pairs {
+        return Err(CbError::LengthMismatch {
+            column: "pair_j".to_owned(),
+            expected: n_pairs,
+            actual: pair_j.len(),
+        });
+    }
+    if pair_weight.len() != n_pairs {
+        return Err(CbError::LengthMismatch {
+            column: "pair_weight".to_owned(),
+            expected: n_pairs,
+            actual: pair_weight.len(),
+        });
+    }
+
+    // Overflow guards FIRST. Reuse the checked cindex stride for the length guard below,
+    // never re-multiplying.
+    let cindex_stride = n_features.checked_mul(n_objects).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_objects ({n_objects}) overflows usize (cindex stride)"
+        ))
+    })?;
+    if pair_hist_binsums_len_checked(n_bins, n_features).is_none() {
+        return Err(CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {PAIR_HIST_CHANNELS} overflows usize (binSums length)"
+        )));
+    }
+
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+
+    // Value-range guards (T-07.4-15): BOTH pair endpoints index cindex (Pitfall 3); every
+    // cindex bin must fit the 2-bin line (the kernel masks to the bit, but the host reference
+    // indexes RAW, so the value-range guard keeps the two in lock-step).
+    if let Some(&bad) = pair_i.iter().find(|&&ix| (ix as usize) >= n_objects) {
+        return Err(CbError::OutOfRange(format!(
+            "pair_i value {bad} >= n_objects ({n_objects}); object id would read cindex out of bounds"
+        )));
+    }
+    if let Some(&bad) = pair_j.iter().find(|&&ix| (ix as usize) >= n_objects) {
+        return Err(CbError::OutOfRange(format!(
+            "pair_j value {bad} >= n_objects ({n_objects}); object id would read cindex out of bounds"
+        )));
+    }
+    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
+        return Err(CbError::OutOfRange(format!(
+            "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
+        )));
+    }
+
+    // Empty fill: hand back a zero-length handle (no launch, no read-back — Pitfall 5).
+    if n_pairs == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // The binary family is defined for the 2-bin line ONLY (n_bins == 2); anything else is not
+    // this family.
+    if n_bins != 2 {
+        return Err(CbError::Degenerate(format!(
+            "pairwise_hist binary fill expects n_bins == 2 (1 << 1), got n_bins={n_bins}"
+        )));
+    }
+
+    // Launch geometry: enough cubes to cover `n_pairs` (the grid-stride loop handles any
+    // surplus via the total-thread-count stride).
+    let num_cubes = n_pairs.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    let bin_sums_len = pair_hist_binsums_len(n_bins, n_features);
+    let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+    let pair_i_handle = client.create(cubecl::bytes::Bytes::from_elems(pair_i.to_vec()));
+    let pair_j_handle = client.create(cubecl::bytes::Bytes::from_elems(pair_j.to_vec()));
+
+    // Channel float-type dispatch (RESEARCH A1 / Pitfall 1): f64 on rocm/cuda/cpu, f32 on wgpu
+    // (WGSL has no f64 atomics — read back and UPCAST). Reused VERBATIM from the
+    // non-binary/8-bit/half-byte arms. NO read-back here (SC-3 / Pitfall 5).
+    #[cfg(feature = "wgpu")]
+    {
+        let weight_f32: Vec<f32> = pair_weight.iter().map(|&v| v as f32).collect();
+        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
+        pairwise_hist_binary_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(pair_i_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(pair_j_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(weight_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+            n_features as u32,
+            n_objects as u32,
+        );
+        Ok(h)
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(pair_weight.to_vec()));
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+        pairwise_hist_binary_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(pair_i_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(pair_j_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(weight_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+            n_features as u32,
+            n_objects as u32,
+        );
+        Ok(h)
+    }
+}
+
+/// Host-readback wrapper over the binary pairwise-histogram fill: launch device-resident, then
+/// read the 4-channel `binSums` handle back to a host `Vec<f64>`. This is the seam the
+/// all-backend self-oracle exercises; it is NOT the histogram hand-off path (that is
+/// [`launch_pairwise_hist_binary_handle`], which never reads back).
+///
+/// The launch geometry lives in ONE place ([`launch_pairwise_hist_binary_into`]); this wrapper
+/// constructs the client ONCE and uses that SAME client for both the launch and the read-back.
+/// A device read-back failure surfaces [`CbError::Degenerate`], never a silent all-zero
+/// buffer. Empty input returns an empty `Vec` (no launch).
+pub fn launch_pairwise_hist_binary(
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Vec<f64>> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    if pair_i.is_empty() || n_features == 0 || n_bins == 0 {
+        return Ok(Vec::new());
+    }
+
+    let handle = launch_pairwise_hist_binary_into(
         &client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features,
     )?;
 
