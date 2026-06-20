@@ -2293,9 +2293,15 @@ pub fn partition_split_kernel<F: Float>(
 /// so the atomic store cannot address `part_stats` out of bounds. if-as-STATEMENT only.
 ///
 /// `der1` (UNWEIGHTED, the 7.2 seam contract) / `weight` are length `n` (per object,
-/// object order). `leaf_of` (length `n`) is the per-object partition (`0..n_parts`).
-/// `indices` (length `n`) is the object visiting order. `part_stats` is length
-/// `n_parts * 2` (zero-initialised by the host), channel 0 = Σ der1, channel 1 = Σ weight.
+/// object order). `leaf_of` (length `n`) is the per-object partition (`0..n_parts`),
+/// produced DEVICE-SIDE by `partition_split_kernel` and consumed here WITHOUT a host
+/// read-back/re-validation. Because the host therefore cannot vouch for the partition
+/// VALUE range (WR-04), the atomic store is guarded in-kernel by `part * 2 + 1 <
+/// part_stats.len()` (matching the scan kernel's `cell < bin_sums.len()` precedent) so a
+/// drifting `leaf_of` — e.g. a future depth>1 partition that mis-numbers a leaf — can
+/// never address `part_stats` out of bounds (which would be a device-atomic UB). `indices`
+/// (length `n`) is the object visiting order. `part_stats` is length `n_parts * 2`
+/// (zero-initialised by the host), channel 0 = Σ der1, channel 1 = Σ weight.
 #[cube(launch)]
 pub fn partition_update_kernel<F: Float>(
     der1: &Array<F>,
@@ -2316,10 +2322,15 @@ pub fn partition_update_kernel<F: Float>(
         let d = der1[obj];
         let w = weight[obj];
         // In-kernel atomic merge (D-03): the per-partition Σ der1 / Σ weight, folded
-        // device-resident. The host validated `part < n_parts` (so `part * 2 + 1` is in
-        // bounds) before launch.
-        part_stats[part * 2usize].fetch_add(d);
-        part_stats[part * 2usize + 1usize].fetch_add(w);
+        // device-resident. `leaf_of` is DEVICE-PRODUCED (no host read-back), so guard the
+        // partition VALUE range in-kernel (WR-04) instead of relying on a host check that
+        // never runs — `part * 2 + 1 < part_stats.len()` ensures BOTH channel stores are
+        // in bounds (matching the scan kernel's `cell < bin_sums.len()` precedent).
+        // if-as-STATEMENT only.
+        if part * 2usize + 1usize < part_stats.len() {
+            part_stats[part * 2usize].fetch_add(d);
+            part_stats[part * 2usize + 1usize].fetch_add(w);
+        }
         i += stride;
     }
 }
