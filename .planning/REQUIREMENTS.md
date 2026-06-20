@@ -80,7 +80,7 @@
 
 - [x] **GPU-01**: CubeCL compute kernels generic over `R: Runtime` and `F: Float` — histogram, gradient/hessian, scan, reductions
 - [x] **GPU-02**: Compile-time backend selection via Cargo features (`cpu`/`wgpu`/`cuda`/`rocm`) through a single `cfg`-gated type alias — zero runtime dispatch
-- [ ] **GPU-03**: `rocm`/HIP backend validated on AMD hardware (wavefront-64 safe); GPU tests run on `rocm`
+- [x] **GPU-03**: `rocm`/HIP backend validated on AMD hardware (wavefront-64 safe); GPU tests run on `rocm`
 - [x] **GPU-04**: `wgpu` backend for dev machines without ROCm/CUDA
 - [x] **GPU-05**: `cuda` backend — compile-gated, untested locally
 - [x] **GPU-06**: Documented GPU tolerance — `rocm` results within a separately-stated epsilon vs the Rust CPU path (with sign-off)
@@ -181,10 +181,10 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | MODEL-05 | Phase 6.6 | Complete |
 | GPU-01 | Phase 7.1–7.5 | Pending (scan/reductions 7.1, grad/hess 7.2, pointwise hist 7.3, pairwise hist 7.4, on-device loop close 7.5) |
 | GPU-02 | Phase 7.1 | Complete |
-| GPU-03 | Phase 7.6 | Pending (incremental rocm validation each sub-phase; formal gate + sign-off 7.6) |
+| GPU-03 | Phase 7.6 | Complete (Phase 7.6) |
 | GPU-04 | Phase 7.1 | Complete |
 | GPU-05 | Phase 7.1 | Complete |
-| GPU-06 | Phase 7.6 | Complete |
+| GPU-06 | Phase 7.6 | Complete (Phase 7.6) — ε=1e-4, vs Rust CPU path |
 | PYAPI-01 | Phase 8 | Pending |
 | PYAPI-02 | Phase 8 | Pending |
 | PYAPI-03 | Phase 8 | Pending |
