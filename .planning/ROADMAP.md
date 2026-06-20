@@ -651,7 +651,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 07.4-01-PLAN.md — Wave 1: non-binary 5/6/7-bit pairwise fill + FROZEN 4-channel weight-only binSums layout + pairs/per-pair-weight device seam + self-oracle harness + PairLogitPairwise fixture (GPU-01, SC-1, SC-2)
+- [x] 07.4-01-PLAN.md — Wave 1: non-binary 5/6/7-bit pairwise fill + FROZEN 4-channel weight-only binSums layout + pairs/per-pair-weight device seam + self-oracle harness + PairLogitPairwise fixture (GPU-01, SC-1, SC-2) — **COMPLETE** (ae22f81 RED / c2ed115 GREEN): `pairwise_hist_nonbinary_kernel<F>` (#[cube(launch)], comptime bits {5,6,7} + comptime one_hot) grid-strides over PAIRS, two bins per (pair,feature) with cindex stride over OBJECTS (Pitfall 3), 4-channel atomic merge `(feature*n_bins+bin)*4+histId` (NEVER *2). The genuinely-new Compare->histId mapping (A6) distilled from upstream AddPair+merge to clean per-pair semantics: ge=(b1>=b2), gt=(b1>b2) → bin b1 {2*ge,2*gt}, bin b2 {2*ge+1,2*gt+1}, each +=w. FROZEN 4-channel weight-only seam: `launch_pairwise_hist_handle`/`_into` (no readback) + `launch_pairwise_hist` + `read_pair_binsums_f64` + `pair_hist_binsums_len(_checked)` + `PAIR_HIST_CHANNELS=4`; pairs = two parallel u32 arrays (D-7.4-03). New self-oracle `kernels/pairwise_hist.rs` (host_reference via cb_core::sum_f64, shared add_pair_contrib). **rocm gfx1100: nonbinary_bits/handoff BIT-EXACT (0.0) bits 5/6/7 × n_pairs 1/37/10000; pairlogit_fixture (SC-2) 1.4e-14; 5/5 green.** wgpu host run + cuda compile-only green. SC-4 held (cb-compute cubecl 0, cb-core/cb-model byte-unchanged); no warp/tile literal, no *2. NO deviations. Forward deps to 7.5 (scan/update + multi-part offset) / 7.6 (epsilon).
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
