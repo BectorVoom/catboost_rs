@@ -200,3 +200,15 @@ fn block_scan_edge_case_single_element() {
     );
     println!("[scan f64 n=1] inclusive={} exclusive={}", incl[0], excl[0]);
 }
+
+#[test]
+fn block_scan_empty_input_short_circuits() {
+    // IN-05: exercise the PRODUCTION empty short-circuit
+    // (`launch_block_scan_f64` returns `Ok(vec![])` without launching a kernel) for
+    // both the inclusive and exclusive comptime flags.
+    let empty: Vec<f64> = Vec::new();
+    let incl = crate::gpu_runtime::launch_block_scan_f64(&empty, true).unwrap();
+    assert!(incl.is_empty(), "launch_block_scan_f64(&[], true) must return Ok(vec![])");
+    let excl = crate::gpu_runtime::launch_block_scan_f64(&empty, false).unwrap();
+    assert!(excl.is_empty(), "launch_block_scan_f64(&[], false) must return Ok(vec![])");
+}

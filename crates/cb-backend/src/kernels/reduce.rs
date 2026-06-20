@@ -213,6 +213,12 @@ fn block_reduce_edge_cases() {
         let empty: Vec<f64> = Vec::new();
         let baseline = cb_core::sum_f64(&empty);
         assert_eq!(baseline, 0.0, "empty baseline must be 0.0");
+
+        // IN-05: exercise the PRODUCTION empty short-circuit, not only the host
+        // baseline. `launch_block_reduce_f64(&[])` must return `Ok(vec![])` without
+        // touching the device.
+        let out = crate::gpu_runtime::launch_block_reduce_f64(&empty).unwrap();
+        assert!(out.is_empty(), "launch_block_reduce_f64(&[]) must return Ok(vec![])");
     }
 
     // n = 1 -> sum equals the single element.
