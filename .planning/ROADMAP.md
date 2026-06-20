@@ -686,8 +686,35 @@ Plans:
   3. A complete GPU-trained tree/model matches the Rust CPU-trained result within the reported GPU tolerance on representative fixtures (per-tree structure + leaf values).
   4. Validated on `rocm`; `cb-core`/`cb-model`/`cb-compute` unchanged from Phase 3–6 form.
 
-**Plans**: TBD
-**Research flag**: NEEDS DEEPER RESEARCH — device-resident loop orchestration in CubeCL (kernel launch graph, persistent device buffers) vs upstream CUDA's host-light train loop; non-determinism budget from D-03 atomics across a full multi-tree run.
+**Plans**: 6 plans in 6 waves (strict chain — all plans touch the same cb-backend files; narrowest-first per D-7.5-01/02)
+
+Plans:
+
+**Wave 1**
+
+- [ ] 07.5-01-PLAN.md — Pointwise L2 score calcer + deterministic on-device split argmin (lowest-index tie-break == select_best_candidate) over the FROZEN 7.3 handle; kernels/score_split.rs self-oracle vs cb-compute/score.rs + cb-train/tree.rs
+
+**Wave 2** *(blocked on 07.5-01)*
+
+- [ ] 07.5-02-PLAN.md — Scan/update bridge (deferred ScanPointwiseHistograms, D-7.5-03): per-feature bin-axis prefix-sum reusing block_scan_kernel -> cumulative left-of-border leaf stats, self-oracled; <=CUBE_DIM-bins scope + explicit cross-cube-carry follow-up
+
+**Wave 3** *(blocked on 07.5-01, 07.5-02)*
+
+- [ ] 07.5-03-PLAN.md — Full single-tree device-resident grow loop (D-05): grow_oblivious_tree host-light driver (fill->scan->score+argmin->O(1) BestSplit read-back->partition-split/update, one client) + partition kernels (forward-bit leaf convention == leaf_index); kernels/grow_loop.rs cross-oracle, STRUCTURE exact / leaf values REPORTED
+
+**Wave 4** *(blocked on 07.5-03)*
+
+- [ ] 07.5-04-PLAN.md — Multi-tree boosting pass: grow_boosting_pass device-resident loop (device-side der recompute + persistent-buffer reuse); per-tree structure exact vs CPU, leaf values + the D-7.5-06 argmax-flip boundary REPORTED
+
+**Wave 5** *(blocked on 07.5-01, 07.5-03)*
+
+- [ ] 07.5-05-PLAN.md — Cosine/NewtonCosine + SolarL2/LOOL2/SatL2 comptime score arms (transcribed from score.rs, f64 fold, guards verbatim), per-calcer self-oracle + a Cosine grow-loop structure check (Cosine = primary path)
+
+**Wave 6** *(blocked on 07.5-02, 07.5-03)*
+
+- [ ] 07.5-06-PLAN.md — Pairwise split scorer (split_pairwise: per-leaf linear-system build from the 7.4 4-channel handle + Cholesky solve == calculate_pairwise_score) + pairwise scan/update + a ranking/PairLogit fixture grows a matching tree; CLOSES the GPU-01 kernel surface
+
+**Research flag (RESOLVED in 07.5-RESEARCH.md)**: device-resident loop orchestration in CubeCL realized as a thin host-light driver mirroring upstream oblivious_tree_doc_parallel_structure_searcher.cpp — per-level O(1) ~16-byte BestSplit read-back, bulk data device-resident (NOT a host hybrid); non-determinism budget (D-7.5-06) handled via f64 finalization + stable lowest-index tie-break, with the argmax-flip boundary REPORTED (epsilon signed off in 7.6).
 
 ### Phase 7.6: GPU Tolerance, rocm Validation & Sign-off
 
