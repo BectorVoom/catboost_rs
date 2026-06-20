@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 07.2-02-PLAN.md
-last_updated: "2026-06-20T07:30:00.000Z"
-last_activity: 2026-06-20 -- 07.2-02 on-device Logloss/CrossEntropy + Quantile/MAE der families COMPLETE
+stopped_at: Completed 07.2-03-PLAN.md
+last_updated: "2026-06-20T06:58:18.000Z"
+last_activity: 2026-06-20 -- 07.2-03 on-device Focal der + full-family device-residency hand-off lock COMPLETE (Phase 7.2 done)
 progress:
   total_phases: 20
   completed_phases: 12
   total_plans: 96
-  completed_plans: 95
-  percent: 60
+  completed_plans: 96
+  percent: 61
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 7.2 (On-Device Gradient/Hessian & Targets) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 7.2 (07.2-01 + 07.2-02 COMPLETE; 07.2-03 Focal next)
-Last activity: 2026-06-20 -- 07.2-02 on-device Logloss/CrossEntropy + Quantile/MAE der families COMPLETE (GPU-01: Logloss/CE der1 via DerBinaryKernel::LoglossGradient + der2 via new DerUnaryKernel/launch_der_unary single-input hessian seam; Quantile/MAE der1 via new DerParamKernel/launch_der_param parametric launch (alpha/delta as length-1 Array<F>) + const-0 der2 handle; rocm gfx1100 self-oracle 15/15 green, divergence 0.0 for quantile/mae/crossentropy and <=1e-14 for logloss; wgpu+cuda build RC=0; SC-4 holds; commits 7add20e + 4047854)
+Phase: 7.2 (On-Device Gradient/Hessian & Targets) — ALL PLANS COMPLETE (3 of 3)
+Plan: 3 of 3 (COMPLETE)
+Status: Phase 7.2 plans 01+02+03 all COMPLETE — GPU-01 grad/hess + targets slice closed; ready for phase verification
+Last activity: 2026-06-20 -- 07.2-03 on-device Focal der + full-family device-residency hand-off lock COMPLETE (GPU-01: Focal der1 via DerParamKernel::FocalGradient + der2 via DerParamKernel::FocalHessian — the two-kernel parametric family, alpha/gamma as length-1 Array<F>, reusing the authored focal_gradient_kernel/focal_hessian_kernel; full-family all_losses_device_resident_handoff lock proves RMSE/Logloss-CE/Quantile-MAE/Focal all hand 7.3 der1+der2 device HANDLES with no host fold (SC-3); SC-4 holds — cb-compute cubecl-free (cargo tree==0), cb-core/cb-model byte-unchanged; rocm gfx1100 self-oracle 23/23 green, Focal divergence <=~1e-8 (most ~1e-14), finite on ±40 saturated logits; wgpu+cuda build RC=0; commits 2de0dbf + 4b817ae)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -138,6 +138,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.1 P02 | 6m | 2 tasks | 4 files |
 | Phase 07.2 P01 | ~18m | 2 tasks | 3 files |
 | Phase 07.2 P02 | ~17m | 2 tasks | 2 files |
+| Phase 07.2 P03 | ~4m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -146,6 +147,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [07.2-03 on-device Focal der + full-family device-residency hand-off lock — COMPLETE, Phase 7.2 CLOSED]: The third and final MVP vertical slice extends the Plan-02 parametric der seam to the **Focal** two-kernel family and locks the full device-residency contract for 7.3. **Focal:** `DerParamKernel::FocalGradient` der1 (reuses the authored `focal_gradient_kernel`) + `DerParamKernel::FocalHessian` der2 (reuses `focal_hessian_kernel`) — both parametric on `(alpha, gamma)` as length-1 `Array<F>` device buffers built via the non-panicking `param_pair()` accessor (`CbError::Degenerate` on a malformed slice, D-13), both on the SINGLE `launch_der_param_into` geometry (no new launch geometry, no `read_one` on either handle path). Focal der2 is the ONLY in-scope der2 that is a real hessian kernel (Quantile/MAE der2 = const 0.0, RMSE der2 = const -1.0). The kernels clamp `p` to `[1e-13, 1-1e-13]` so saturated logits cannot NaN (T-04-02-02 / T-07.2-07). **Full-family lock:** `all_losses_device_resident_handoff` proves every in-scope family (RMSE via `launch_der_binary_handle` + `const_der_handle(-1.0)`; Logloss/CE via `launch_der_binary_handle` + `launch_der_unary_handle`; Quantile/MAE via `launch_der_param_handle` + `const_der_handle(0.0)`; Focal via TWO `launch_der_param_handle`) hands 7.3 der1+der2 device HANDLES with NO host fold on the seam (handle-in → handles-out, SC-3 / D-7.2-04); the single read-back per handle is deferred to the test end and oracle-checked; handles are UNWEIGHTED (weight folded downstream by `histogram_scatter_kernel`, Open Q1). **SC-4:** `cb_compute_is_cubecl_free` documents the structural gate; `cargo tree -e features -p cb-compute | grep -ci cubecl` == 0; cb-compute/cb-core/cb-model BYTE-UNCHANGED (`git diff --stat` empty, loss.rs/lib.rs blob hashes match pre-plan baseline). rocm gfx1100 self-oracle 23/23 GREEN (6 new Focal tests: f32/f64 der1+der2, saturated-logit no-NaN on ±40, empty/n=1/large-N), Focal divergence <=~1e-8 (most ~1e-14); wgpu + cuda build RC=0 (compile-only). **NO deviations** — Plan-01/02 HIP handle-lifecycle fixes reused by construction. All four in-scope pointwise der families (RMSE, Logloss/CE, Quantile/MAE, Focal) now compute device-resident — GPU-01 grad/hess + targets slice CLOSED; Phase 7.2 ready for verification. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits 2de0dbf (Task1 Focal) / 4b817ae (Task2 hand-off lock + SC-4).
 - [07.2-02 on-device Logloss/CrossEntropy + Quantile/MAE der families — COMPLETE, GPU-01 second vertical slice]: Additively extended the Plan-01 der seam to two more pointwise families, all device-resident over `SelectedRuntime` and returned as UNWEIGHTED device Handles (A1; weight folded downstream by 7.3). **Logloss/CrossEntropy:** `DerBinaryKernel::LoglossGradient` der1 (reuses `logloss_gradient_kernel`) + the NEW single-input hessian seam `DerUnaryKernel`/`launch_der_unary_handle`/`launch_der_unary`/`launch_der_unary_into` der2 (reuses `logloss_hessian_kernel`, target-independent `-p*(1-p)`). Logloss AND CrossEntropy route to the SAME kernels (Pitfall 6 / D-09) — explicit reuse oracle 0.0 divergence vs `cross_entropy_der1`. **Quantile/MAE:** the NEW parametric seam `DerParamKernel`/`launch_der_param_handle`/`launch_der_param`/`launch_der_param_into` der1 (reuses `quantile_gradient_kernel`), passing `alpha`/`delta` as length-1 `Array<F>` device buffers (the `launch_quantile_f64` precedent, `SelectedRuntime` swapped in) to stay generics-float; params read via non-panicking `param_pair()` -> `CbError::Degenerate` (D-13, no indexing/panic). MAE routes through `QuantileGradient` at `(QUANTILE_ALPHA, QUANTILE_DELTA)` (WR-04 — no MAE kernel), bit-identical to `mae_der1`==`quantile_der1{0.5,1e-6}`. Quantile/MAE der2 = 0.0 via the Plan-01 `const_der_handle(0.0,n)` (Pitfall 5 — no quantile hessian kernel), oracle-checked all-0.0 == `quantile_der2`/`mae_der2`. 10 new self-oracle tests (gradient_gpu suite 15 total): rocm gfx1100 15/15 GREEN, REPORTED divergence 0.0 for quantile/mae/crossentropy and <=1e-14 for logloss (D-7.2-06: report, NOT sign-off the GPU-06 epsilon — 7.6's job). **NO deviations** — the Plan-01 HIP handle-lifecycle fixes (same-client `_into`, empty short-circuit) are reused by the new seams by construction, so neither hazard recurred. wgpu + cuda build RC=0; SC-4: cb-compute cubecl-free, cb-core/cb-model byte-unchanged. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits 7add20e (Task1 logloss) / 4047854 (Task2 quantile/mae).
 - [07.2-01 on-device RMSE der seam — COMPLETE, GPU-01 first vertical slice]: RMSE der1/der2 now run device-resident over the compile-time `SelectedRuntime` (rocm/wgpu/cuda/cpu) and are returned as device buffer HANDLES with NO host fold (SC-3 / D-7.2-04). `gpu_runtime.rs` gains `DerBinaryKernel` (RmseGradient arm), `launch_der_binary_handle` (Handle, no read-back — the 7.3 histogram hand-off seam), `launch_der_binary` (host-readback wrapper, self-oracle only), `const_der_handle` (RMSE der2 = -1.0 const device buffer), and a private single-geometry `launch_der_binary_into(client,...)`. The authored `gradient_kernel` is REUSED unchanged (D-7.2-03). **Task-1 contract (pre-approved):** UNWEIGHTED der handles; the per-object weight is folded DOWNSTREAM by the 7.3 `histogram_scatter_kernel` (`contrib[i]=der1[i]*weight[i]`), NOT in-kernel — so the der is byte-identical in structure to the `cb-compute::loss` baseline. New all-backend self-oracle `kernels/gradient_gpu.rs` (mounted `#[cfg(test)] mod gradient_gpu`, like reduce/scan): RMSE der1 vs `cb_compute::rmse_der1`/`rmse_der2`, fixtures f64 n=37 / f32 n=64 / edge (empty,n=1,large-N=10k) / device-residency hand-off — rocm gfx1100 4/4 GREEN with REPORTED max abs/rel divergence **0.0e0** for every fixture (D-7.2-06: report, NOT sign-off the GPU-06 epsilon — 7.6's job). **TWO Rule-1 deviations (HIP handle-lifecycle):** (1) the readback wrapper MUST launch and read with the SAME client — a CubeCL Handle is bound to its originating client's allocator/stream; reading via a second freshly-built client aborted the HIP IO controller (`slice::from_raw_parts requires the pointer to be aligned and non-null`); fixed by `launch_der_binary_into(client,...)`. (2) empty (0-length) device handles are NEVER read back — `read_one` on an empty HIP buffer hits the SAME null-pointer precondition; the empty oracle case asserts `const_der_handle(-1.0,0).is_ok()` (constructs) WITHOUT reading. CubeCL guideline consulted (`Cubecl_basic_operations.md` canonical one-client launch+read) before fixing, per AGENTS.md. wgpu + cuda build RC=0; SC-4 structural: cb-compute stays cubecl-free (`cargo tree -e features -p cb-compute` clean), cb-compute/cb-core/cb-model BYTE-UNCHANGED. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits 1c5cc90 (Task2 seam) / a8f0f7a (Task3 oracle + Rule-1 fixes).
 
