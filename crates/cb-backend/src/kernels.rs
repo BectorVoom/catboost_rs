@@ -2677,3 +2677,19 @@ mod score_split;
 // REPORTED (the GPU-06 epsilon is 7.6's job).
 #[cfg(test)]
 mod grow_loop;
+
+// GPU-06 tolerance MEASUREMENT harness (Phase 7.6 Plan 01 — the EVIDENCE roll-up the
+// epsilon sign-off in Plan 02 consumes): aggregates the existing per-kernel-family
+// divergence comparisons (der/hess, pointwise hist, pairwise hist, score/split,
+// reduce) into one `[GPU-06 EVIDENCE]` line per family, adds an N≥30 run-to-run
+// variance loop with stddev + an `observed_max + 3σ` headroom term, and measures the
+// end-to-end GPU-vs-CPU model leaf values (the 7.5 REPORTED-not-signed-off numbers).
+// Adds NO new kernel — it COMPOSES the sibling oracles over the generic
+// `SelectedRuntime` (the rocm in-env oracle on gfx1100 + the wgpu host run + cuda/cpu
+// compile). NEVER imports `cb-train` (feature-unification landmine — would activate
+// `cb-backend/cpu` alongside `rocm` and fake a 0.0 divergence); every CPU reference is
+// transcribed INLINE, `cb_compute`/`cb_core` read-only. Lives in
+// `kernels/gpu_tolerance.rs`, mounted at `kernels::gpu_tolerance`. REPORTS divergence;
+// the GPU-06 epsilon is signed off in Plan 02, NOT hard-coded here.
+#[cfg(test)]
+mod gpu_tolerance;
