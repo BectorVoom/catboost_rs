@@ -20,8 +20,8 @@
 use cubecl::prelude::*;
 
 use crate::gpu_runtime::{
-    const_der_handle, launch_der_binary, launch_der_binary_handle, launch_der_unary,
-    DerBinaryKernel, DerUnaryKernel,
+    const_der_handle, launch_der_binary, launch_der_binary_handle, launch_der_param,
+    launch_der_unary, DerBinaryKernel, DerParamKernel, DerUnaryKernel,
 };
 
 /// Compare the device der (cast to f64) to the CPU baseline element-wise, returning
@@ -393,5 +393,197 @@ fn logloss_der_edge_cases() {
         let (a2, r2) = max_divergence(&der2, &base2);
         println!("[der logloss-hess f64 n=10000] REPORTED der2 max abs_div={a2:.3e} rel_div={r2:.3e}");
         assert!(r2 <= 1e-9 || a2 <= 1e-9, "logloss der2 (large-N) diverged: abs={a2:.3e} rel={r2:.3e}");
+    }
+}
+
+// ===========================================================================
+// Task 2 (Plan 07.2-02): Quantile / MAE der1 (parametric launch, alpha/delta as
+// length-1 Array<F>) + constant-0 der2 handle self-oracle vs the
+// `cb-compute::loss` baseline.
+//
+// MAE routes through the SAME quantile kernel at (QUANTILE_ALPHA, QUANTILE_DELTA)
+// (WR-04 / Pitfall 5) — no duplicate MAE kernel, so MAE == Quantile{0.5, 1e-6} is
+// bit-identical by construction. der2 is the constant-0 device handle (no
+// quantile_hessian_kernel exists — Pitfall 5).
+// ===========================================================================
+
+/// `cb-compute::quantile_der1` baseline at `(alpha, delta)`, computed elementwise.
+fn quantile_der1_baseline(approx: &[f64], target: &[f64], alpha: f64, delta: f64) -> Vec<f64> {
+    approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::quantile_der1(a, t, alpha, delta))
+        .collect()
+}
+
+#[test]
+fn quantile_der1_matches_cpu_baseline_f64_non_cube_multiple() {
+    // n=37 (non-cube-multiple) exercises the idle guard. alpha=0.7 (asymmetric)
+    // distinguishes the pinball arms: val>0 -> +0.7, val<0 -> -(1-0.7)=-0.3,
+    // |val|<delta -> 0. delta=0.01 makes a few residuals land in the deadzone.
+    let alpha = 0.7_f64;
+    let delta = 0.01_f64;
+    let approx: Vec<f64> = (0..37).map(|k| f64::from(k) * 0.13 - 2.0).collect();
+    // Cross approx so some residuals are +, some -, and a few near-zero (deadzone).
+    let target: Vec<f64> = (0..37).map(|k| f64::from(k) * 0.13 - 2.0 + ((k % 3) as f64 - 1.0) * 0.005).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::QuantileGradient,
+        &[alpha, delta],
+    )
+    .unwrap();
+    let baseline = quantile_der1_baseline(&approx, &target, alpha, delta);
+
+    assert_eq!(device.len(), approx.len(), "der1 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der quantile a=0.7 f64 n=37] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-9 || abs <= 1e-9,
+        "f64 Quantile der1 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn quantile_der1_matches_cpu_baseline_f32() {
+    let alpha = 0.3_f64;
+    let delta = 0.02_f64;
+    let approx_f32: Vec<f32> = (0..64).map(|k| (k as f32) * 0.1 - 3.0).collect();
+    let target_f32: Vec<f32> = (0..64).map(|k| (k as f32) * 0.1 - 3.0 + ((k % 5) as f32 - 2.0) * 0.01).collect();
+    let approx: Vec<f64> = approx_f32.iter().map(|&v| f64::from(v)).collect();
+    let target: Vec<f64> = target_f32.iter().map(|&v| f64::from(v)).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::QuantileGradient,
+        &[alpha, delta],
+    )
+    .unwrap();
+    let baseline = quantile_der1_baseline(&approx, &target, alpha, delta);
+
+    assert_eq!(device.len(), approx.len(), "der1 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der quantile a=0.3 f32 n=64] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-3 || abs <= 1e-3,
+        "f32 Quantile der1 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn mae_equals_quantile_half() {
+    // WR-04 / Pitfall 5: MAE routes through the quantile kernel at
+    // (QUANTILE_ALPHA=0.5, QUANTILE_DELTA=1e-6). The device der1 must match BOTH
+    // `cb_compute::mae_der1` AND `cb_compute::quantile_der1` at those params —
+    // bit-identical by construction (no separate MAE kernel).
+    let approx: Vec<f64> = (0..50).map(|k| f64::from(k) * 0.21 - 5.0).collect();
+    let target: Vec<f64> = (0..50).map(|k| f64::from(k) * 0.19 - 4.5).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::QuantileGradient,
+        &[cb_compute::QUANTILE_ALPHA, cb_compute::QUANTILE_DELTA],
+    )
+    .unwrap();
+
+    let mae_baseline: Vec<f64> = approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::mae_der1(a, t))
+        .collect();
+    let quantile_baseline = quantile_der1_baseline(
+        &approx,
+        &target,
+        cb_compute::QUANTILE_ALPHA,
+        cb_compute::QUANTILE_DELTA,
+    );
+
+    assert_eq!(device.len(), approx.len());
+    let (abs_mae, rel_mae) = max_divergence(&device, &mae_baseline);
+    println!("[der mae==quantile{{0.5}} f64 n=50] REPORTED vs mae max abs_div={abs_mae:.3e} rel_div={rel_mae:.3e}");
+    assert!(
+        rel_mae <= 1e-9 || abs_mae <= 1e-9,
+        "device der1 at (0.5,1e-6) != cb_compute::mae_der1: abs={abs_mae:.3e} rel={rel_mae:.3e}"
+    );
+    // MAE and Quantile{0.5} baselines are themselves bit-identical (mae_der1
+    // delegates to quantile_der1), so the device der1 matching one matches both.
+    assert_eq!(
+        mae_baseline, quantile_baseline,
+        "cb_compute::mae_der1 must be bit-identical to quantile_der1{{0.5,1e-6}} (WR-04)"
+    );
+}
+
+#[test]
+fn quantile_der2_zero_handle() {
+    // Pitfall 5: Quantile/MAE der2 == 0 (there is NO quantile_hessian_kernel). The
+    // der2 device handle is `const_der_handle(0.0, n)`; read it back ONCE here and
+    // assert it equals `cb_compute::quantile_der2`/`mae_der2` (both constant 0.0).
+    let n = 50usize;
+    let approx: Vec<f64> = (0..n).map(|k| (k as f64) * 0.21 - 5.0).collect();
+    let target: Vec<f64> = (0..n).map(|k| (k as f64) * 0.19 - 4.5).collect();
+
+    let der2_handle = const_der_handle(0.0, n).unwrap();
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+    let bytes = client.read_one(der2_handle).unwrap();
+    let der2_host = bytemuck::cast_slice::<u8, f64>(&bytes).to_vec();
+
+    assert_eq!(der2_host.len(), n, "der2 const handle length must equal n");
+    for (i, &v) in der2_host.iter().enumerate() {
+        let q = cb_compute::quantile_der2(
+            approx[i],
+            target[i],
+            cb_compute::QUANTILE_ALPHA,
+            cb_compute::QUANTILE_DELTA,
+        );
+        let m = cb_compute::mae_der2(approx[i], target[i]);
+        assert_eq!(v, 0.0, "quantile der2 const handle slot {i} must be 0.0");
+        assert_eq!(v, q, "der2 slot {i} must equal cb_compute::quantile_der2 = {q}");
+        assert_eq!(v, m, "der2 slot {i} must equal cb_compute::mae_der2 = {m}");
+    }
+}
+
+#[test]
+fn quantile_der_edge_cases() {
+    let alpha = 0.6_f64;
+    let delta = 1e-6_f64;
+    // Empty: the param wrapper short-circuits to empty (no launch). The const-der2
+    // handle CONSTRUCTS for n=0 without a read-back of the empty buffer.
+    {
+        let approx: Vec<f64> = Vec::new();
+        let target: Vec<f64> = Vec::new();
+        let der1 = launch_der_param(&approx, &target, DerParamKernel::QuantileGradient, &[alpha, delta]).unwrap();
+        assert!(der1.is_empty(), "empty input must yield an empty quantile der1 (no launch)");
+        assert!(
+            const_der_handle(0.0, 0).is_ok(),
+            "empty der2 const handle must construct (no read-back of an empty buffer)"
+        );
+    }
+
+    // n=1: a single object.
+    {
+        let approx = vec![1.0_f64];
+        let target = vec![3.0_f64]; // val=+2 > delta -> alpha
+        let der1 = launch_der_param(&approx, &target, DerParamKernel::QuantileGradient, &[alpha, delta]).unwrap();
+        let base = quantile_der1_baseline(&approx, &target, alpha, delta);
+        let (a, r) = max_divergence(&der1, &base);
+        println!("[der quantile f64 n=1] REPORTED max abs_div={a:.3e} rel_div={r:.3e}");
+        assert!(r <= 1e-9 || a <= 1e-9, "quantile der1 (n=1) diverged: abs={a:.3e} rel={r:.3e}");
+    }
+
+    // Large N: many independent cubes.
+    {
+        let n = 10_000usize;
+        let approx: Vec<f64> = (0..n).map(|k| (k as f64) * 0.001 - 5.0).collect();
+        let target: Vec<f64> = (0..n).map(|k| (k as f64) * 0.0011 - 5.5).collect();
+        let der1 = launch_der_param(&approx, &target, DerParamKernel::QuantileGradient, &[alpha, delta]).unwrap();
+        let base = quantile_der1_baseline(&approx, &target, alpha, delta);
+        assert_eq!(der1.len(), n, "large-N quantile der1 length must equal n");
+        let (a, r) = max_divergence(&der1, &base);
+        println!("[der quantile f64 n=10000] REPORTED max abs_div={a:.3e} rel_div={r:.3e}");
+        assert!(r <= 1e-9 || a <= 1e-9, "quantile der1 (large-N) diverged: abs={a:.3e} rel={r:.3e}");
     }
 }

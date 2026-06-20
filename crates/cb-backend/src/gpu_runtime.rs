@@ -40,7 +40,7 @@ use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, gradient_kernel,
-    logloss_gradient_kernel, logloss_hessian_kernel,
+    logloss_gradient_kernel, logloss_hessian_kernel, quantile_gradient_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -555,9 +555,165 @@ pub fn launch_der_unary(approx: &[f64], kernel: DerUnaryKernel) -> CbResult<Vec<
     Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
+/// Which PARAMETRIC elementwise der kernel the device-resident der seam launches
+/// (Phase 7.2, GPU-01 der). The parametric family carries one or more scalar loss
+/// parameters passed as length-1 `Array<F>` device buffers read at index 0 — NOT
+/// scalar kernel args — to keep the kernels fully generic over `F: Float` (AGENTS.md
+/// generics-float; the `launch_quantile_f64` / `launch_focal_f64` precedent: a
+/// generic scalar arg would force the non-generic `F: ScalarArgType` bound).
+///
+/// All arms produce UNWEIGHTED der1 — byte-identical in structure to the
+/// `cb-compute::loss` baseline (D-7.2-01/02). The per-object weight is folded
+/// DOWNSTREAM by the 7.3 histogram kernels, NOT here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerParamKernel {
+    /// Quantile{alpha, delta} first derivative (the reused
+    /// [`quantile_gradient_kernel`], D-7.2-03 — no new math): with `val = target -
+    /// approx`, `der1 = |val| < delta ? 0 : (val > 0 ? alpha : -(1-alpha))`. The
+    /// params are `[alpha, delta]`. MAE routes through THIS arm at
+    /// `(QUANTILE_ALPHA, QUANTILE_DELTA)` (WR-04 — no separate MAE kernel), so MAE
+    /// and Quantile{0.5, 1e-6} are bit-identical. Its der2 is the constant `0.0`,
+    /// produced by [`const_der_handle`] (Pitfall 5 — there is no quantile hessian
+    /// kernel).
+    QuantileGradient,
+}
+
+/// Read the two-element `[alpha, delta]` (or `[param0, param1]`) param slice without
+/// indexing (D-13 — no production indexing/panic). A malformed slice (fewer than the
+/// kernel's required params) surfaces a typed [`CbError::Degenerate`], never a panic.
+fn param_pair(params: &[f64], who: &str) -> CbResult<(f64, f64)> {
+    let p0 = params.first().copied().ok_or_else(|| {
+        CbError::Degenerate(format!("{who}: missing parameter 0 (param slice was empty)"))
+    })?;
+    let p1 = params.get(1).copied().ok_or_else(|| {
+        CbError::Degenerate(format!(
+            "{who}: missing parameter 1 (param slice had {} elements, need 2)",
+            params.len()
+        ))
+    })?;
+    Ok((p0, p1))
+}
+
+/// Launch a PARAMETRIC elementwise der1 kernel on the compile-time
+/// [`SelectedRuntime`] and return the der1 as a DEVICE BUFFER HANDLE — WITHOUT
+/// reading it back (SC-3 / D-7.2-04 / Pitfall 2). This is the device-residency
+/// hand-off seam for the parametric losses (Quantile/MAE; Focal in Plan 03): the
+/// returned handle stays on-device for the 7.3 histogram kernels.
+///
+/// The loss params pass as length-1 `Array<F>` device buffers (read at index 0) —
+/// the `launch_quantile_f64` precedent — keeping the kernel generic over `F: Float`.
+/// A malformed `params` slice surfaces [`CbError::Degenerate`] (no panic/indexing,
+/// D-13). The empty input short-circuits to a zero-length device handle (no launch).
+/// NO `read_one` on this path.
+pub fn launch_der_param_handle(
+    approx: &[f64],
+    target: &[f64],
+    kernel: DerParamKernel,
+    params: &[f64],
+) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_der_param_into(&client, approx, target, kernel, params)
+}
+
+/// The ONE parametric-der launch geometry (IN-02 — one place). Transfers
+/// `approx`/`target` and the length-1 param buffers onto `client`, launches the
+/// selected param der kernel, and returns the output Handle WITHOUT reading it back.
+/// The caller owns the `client` lifecycle so a read-back (the self-oracle wrapper)
+/// uses the SAME client that allocated the handle (see [`launch_der_binary_into`]).
+fn launch_der_param_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx: &[f64],
+    target: &[f64],
+    kernel: DerParamKernel,
+    params: &[f64],
+) -> CbResult<Handle> {
+    let n = approx.len();
+    // Shape guard: the kernel reads `approx[i]` and `target[i]` for the same `i`.
+    if target.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "target".to_owned(),
+            expected: n,
+            actual: target.len(),
+        });
+    }
+
+    // Empty input: hand back a zero-length device handle (no launch).
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
+    let out_handle = client.empty(n * std::mem::size_of::<f64>());
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    match kernel {
+        DerParamKernel::QuantileGradient => {
+            // `[alpha, delta]` — read without indexing (D-13). The length-1 device
+            // buffers mirror `launch_quantile_f64` exactly (SelectedRuntime swapped in).
+            let (alpha, delta) = param_pair(params, "QuantileGradient")?;
+            let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+            let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
+            quantile_gradient_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                // Clone so the original output handle stays returnable (SC-3, no read).
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+                unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+                unsafe { ArrayArg::from_raw_parts(delta_handle, 1) },
+            );
+        }
+    }
+
+    Ok(out_handle)
+}
+
+/// Host-readback wrapper over the parametric der launch: launch the param der1
+/// kernel device-resident, then read the handle back to a host `Vec<f64>`. This is
+/// the seam the all-backend self-oracle exercises; it is NOT the histogram hand-off
+/// path (that is [`launch_der_param_handle`], which never reads back).
+///
+/// The launch geometry lives in ONE place ([`launch_der_param_into`]); this wrapper
+/// constructs the client ONCE and uses that SAME client for both the launch and the
+/// read-back. A device read-back failure surfaces as [`CbError::Degenerate`]
+/// (WR-05). A malformed `params` slice surfaces [`CbError::Degenerate`] too (no
+/// indexing/panic, D-13).
+pub fn launch_der_param(
+    approx: &[f64],
+    target: &[f64],
+    kernel: DerParamKernel,
+    params: &[f64],
+) -> CbResult<Vec<f64>> {
+    if approx.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let handle = launch_der_param_into(&client, approx, target, kernel, params)?;
+
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+}
+
 /// Build a length-`n` device buffer HANDLE filled with the constant `value`, for
 /// the CONSTANT-der2 losses that have no hessian kernel (RMSE der2 = `-1.0`;
-/// Quantile/MAE der2 = `0.0`, added Plan 02). The 7.3 histogram seam still receives
+/// Quantile/MAE der2 = `0.0` — the [`DerParamKernel::QuantileGradient`] der2,
+/// Pitfall 5: there is no quantile hessian kernel). The 7.3 histogram seam still receives
 /// a der2 HANDLE for these losses (Pitfall 5) — there is NO `rmse_hessian_kernel`
 /// to launch; the constant is materialized host-side and uploaded once.
 ///
