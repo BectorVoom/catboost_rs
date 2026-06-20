@@ -41,7 +41,7 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    quantile_gradient_kernel,
+    pointwise_hist2_nonbinary_kernel, quantile_gradient_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -78,6 +78,21 @@ const _: () = assert!(
     "CUBE_DIM (launch width) exceeds BLOCK_REDUCE_SHMEM (shared-mem allocation) — \
      a wider launch would write past the kernels' SharedMemory (device-side OOB)"
 );
+
+/// Pointwise-histogram geometry guard (Phase 7.3 / Pitfall 3): the 8-bit non-binary
+/// fill's worst-case used prefix is `2 channels * (1 << 8) bins = 512`, which MUST
+/// fit the kernels' [`crate::kernels::HIST_SHMEM`] worst-case allocation. Coupling the
+/// two here makes any future drift (e.g. raising the max bit-width) a COMPILE error
+/// rather than a silent device-side OOB on the shared-mem follow-up path.
+const _: () = assert!(
+    2 * (1usize << HIST_MAX_BITS) <= crate::kernels::HIST_SHMEM,
+    "2 * (1 << HIST_MAX_BITS) exceeds HIST_SHMEM (the per-block histogram allocation) — \
+     a wider bit-width would overflow the kernels' worst-case SharedMemory reservation"
+);
+
+/// The maximum one-byte non-binary bit-width this phase fills (8-bit; Plans B/C/D
+/// extend the SAME kernel to 5/6/7-bit via the comptime `bits` arg, all <= this).
+const HIST_MAX_BITS: u32 = 8;
 
 /// Reduce `input` to its sum on the compile-time [`SelectedRuntime`], returning
 /// the per-cube PARTIAL sums (the host finalizes the across-cube fold via
@@ -778,4 +793,250 @@ pub fn const_der_handle(value: f64, n: usize) -> CbResult<Handle> {
         return Ok(client.empty(0));
     }
     Ok(client.create(cubecl::bytes::Bytes::from_elems(vec![value; n])))
+}
+
+// ===========================================================================
+// Phase 7.3 — the device-resident 2-channel pointwise histogram FILL seam
+// (GPU-01 histogram slice). The 8-bit non-binary `ComputeHist2NonBinary<8>` analog:
+// der1(UNWEIGHTED)/weight + cindex/indices in -> `binSums` device handle out, NO host
+// round-trip (D-7.3-05). The FROZEN `binSums` layout + the der-handle-in ->
+// binSums-handle-out seam this defines are reused UNCHANGED by Plans B/C/D and the
+// 7.5 score/split consumer.
+// ===========================================================================
+
+/// The number of channels in a `hist2` cell (Σ der1, Σ weight) — the `* 2` in the
+/// FROZEN interleaved `binSums` index. Naming the `2` removes the magic literal from
+/// the layout arithmetic (it is the channel count, NOT a stride/warp literal — D-09).
+const HIST_CHANNELS: usize = 2;
+
+/// Compute the FROZEN `binSums` buffer length for the single-tree fill:
+/// `histLineSize * 2 = (2 * totalBinFeatures) ... ` collapses, for `partCount =
+/// foldCount = 1` and a single feature group with `FirstFoldIndex = 0`, to
+/// `n_features * n_bins * HIST_CHANNELS` floats (the host-reference layout the
+/// `kernels::pointwise_hist` oracle indexes cell-for-cell). See
+/// [`launch_pointwise_hist2_handle`] for the full index formula.
+#[inline]
+fn hist2_binsums_len(n_bins: usize, n_features: usize) -> usize {
+    n_features * n_bins * HIST_CHANNELS
+}
+
+/// Fill the device-resident 2-channel pointwise histogram (8-bit non-binary) on the
+/// compile-time [`SelectedRuntime`] and return `binSums` as a DEVICE BUFFER HANDLE —
+/// WITHOUT reading it back (SC-3 / D-7.3-05 / Pitfall 2/5). This is the load-bearing
+/// hand-off seam the 7.5 score/split path plugs into: the returned histogram handle
+/// stays on-device, consumed with no host round-trip.
+///
+/// # FROZEN `binSums` device-handle layout (D-7.3-01 / Pitfall 2)
+///
+/// The histogram is a flat `[partCount * foldCount * histLineSize]`-floats buffer with
+/// the 2 channels (target, weight) interleaved per (feature, bin):
+///
+/// ```text
+/// histLineSize = HIST_CHANNELS * totalBinFeatures             (totalBinFeatures = n_features * n_bins)
+/// index(part, fold, feature, bin, channel) =
+///     (GetHistogramOffset(part, fold) * histLineSize
+///      + (FirstFoldIndex(feature) + bin)) * HIST_CHANNELS + channel
+/// ```
+///
+/// mirroring upstream `split_properties_helpers.cuh::ShiftPartAndBinSumsPtr` +
+/// `pointwise_hist2_one_byte_templ.cuh:132-145` (`... * 2 + w`). This phase delivers
+/// the SINGLE-TREE fill: `partCount = foldCount = 1`, `GetHistogramOffset(0, 0) = 0`,
+/// one feature group with `FirstFoldIndex = 0`, so the index collapses to the
+/// kernel's write index `(feature * n_bins + bin) * HIST_CHANNELS + channel` and the
+/// buffer length is [`hist2_binsums_len`]. The `fullPass = false` multi-part offset
+/// (`ShiftPartAndBinSumsPtr`'s else-branch) is a 7.5 FORWARD DEPENDENCY (RESEARCH A2),
+/// NOT filled here — documented, not silently cut. This layout is FROZEN across Plans
+/// B/C/D and the 7.5 seam.
+///
+/// # Inputs (D-7.3-05)
+///
+/// `der1` (UNWEIGHTED, the 7.2 seam contract), `weight` (folded HERE as channel 1),
+/// both length `n` in object order; `cindex` (length `n_features * n`, feature-major:
+/// `cindex[feature * n + obj]` is object `obj`'s quantized bin for `feature`);
+/// `indices` (length `n`, the object visiting order). `n_bins` is `1 << bits` (8-bit
+/// -> 256 here); `n_features` is the feature-group width.
+///
+/// # Atomic merge (D-03 / Pitfall 1)
+///
+/// The cross-thread merge into `binSums` is the in-kernel `Atomic<F>::fetch_add` path
+/// when the device advertises the needed atomic-add support (the f64-atomic gate, the
+/// 7.1 `AtomicFinalizePath` pattern), else a documented host-sum fallback — both
+/// REPORTED by [`launch_pointwise_hist2`], not signed off (7.6). On the handle path
+/// the in-kernel atomic always runs (a handle cannot host-sum without a read-back);
+/// the f32-channel/f64-finalize tradeoff (RESEARCH A1) is recorded in the readback
+/// wrapper's report.
+///
+/// Empty input (`n == 0` or `n_features == 0` or `n_bins == 0`) short-circuits to a
+/// zero-length handle with NO launch and NO read-back (Pitfall 5). Mismatched
+/// der1/weight/cindex/indices lengths surface [`CbError::LengthMismatch`] BEFORE
+/// launch (T-07.3-01). No `unwrap`/`expect`/`panic`/indexing in this production helper
+/// (workspace lints + D-13).
+pub fn launch_pointwise_hist2_handle(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_pointwise_hist2_into(&client, der1, weight, cindex, indices, n_bins, n_features)
+}
+
+/// The ONE pointwise-histogram launch geometry (IN-02 — one place, not duplicated per
+/// public entry point). Transfers `der1`/`weight`/`cindex`/`indices` onto `client`,
+/// zero-initialises the `binSums` buffer, launches the 8-bit non-binary fill kernel,
+/// and returns the `binSums` Handle WITHOUT reading it back. The caller owns the
+/// `client` lifecycle so a read-back (the self-oracle wrapper) uses the SAME client
+/// that allocated the handle — a CubeCL Handle is bound to its originating client (see
+/// [`launch_der_binary_into`] for the full rationale).
+fn launch_pointwise_hist2_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Handle> {
+    let n = der1.len();
+
+    // Shape guards (T-07.3-01): the kernel reads der1[obj]/weight[obj] for the same
+    // object, cindex[feature * n + obj] for each feature, and walks `indices` (length
+    // n). A mismatch would read out of bounds on the device — surface a typed error
+    // BEFORE launching a malformed kernel (no panic).
+    if weight.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "weight".to_owned(),
+            expected: n,
+            actual: weight.len(),
+        });
+    }
+    if indices.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "indices".to_owned(),
+            expected: n,
+            actual: indices.len(),
+        });
+    }
+    if cindex.len() != n_features * n {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: n_features * n,
+            actual: cindex.len(),
+        });
+    }
+
+    // Empty fill: hand back a zero-length handle (no launch, no read-back — Pitfall 5).
+    // 7.5 still receives a valid (empty) histogram handle.
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // The 8-bit non-binary fill is selected host-side (mirroring the upstream
+    // `pointwise_kernels.cpp` `DISPATCH_ONE_BYTE(..., 8)` shape); Plans B/C/D extend
+    // this dispatch to 5/6/7-bit (same kernel, different comptime `bits`) and to the
+    // half-byte/binary families (separate kernels — D-7.3-02).
+    let bits: u32 = HIST_MAX_BITS; // 8-bit; n_bins must equal 1 << bits for this path.
+    if n_bins != (1usize << bits) {
+        return Err(CbError::Degenerate(format!(
+            "pointwise_hist2 8-bit fill expects n_bins == {} (1 << {bits}), got {n_bins}",
+            1usize << bits
+        )));
+    }
+
+    let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
+    let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
+    let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+    let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+    // The binSums accumulator is zero-initialized so the in-kernel `fetch_add`s
+    // accumulate from 0.0 (the additive identity). Length = the FROZEN layout length.
+    let bin_sums_len = hist2_binsums_len(n_bins, n_features);
+    let bin_sums_handle =
+        client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+
+    // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in the
+    // kernel handles any surplus via the total-thread-count stride — never a literal).
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    pointwise_hist2_nonbinary_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+        unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+        // The atomic accumulator binds the same f64 storage as a plain buffer (the
+        // `block_reduce_atomic_kernel` precedent); `clone` so the original stays
+        // returnable on-device. NO `read_one` here (SC-3).
+        unsafe { ArrayArg::from_raw_parts(bin_sums_handle.clone(), bin_sums_len) },
+        n_features as u32,
+        bits,
+    );
+
+    Ok(bin_sums_handle)
+}
+
+/// Host-readback wrapper over the pointwise-histogram fill: launch the 8-bit
+/// non-binary fill device-resident, then read the `binSums` handle back to a host
+/// `Vec<f64>` AND report which [`AtomicFinalizePath`] the merge took. This is the seam
+/// the all-backend self-oracle exercises (it compares the device histogram to the
+/// ordered host reference); it is NOT the histogram hand-off path (that is
+/// [`launch_pointwise_hist2_handle`], which never reads back).
+///
+/// The launch geometry lives in ONE place ([`launch_pointwise_hist2_into`]); this
+/// wrapper constructs the client ONCE and uses that SAME client for both the launch
+/// and the read-back, so the handle is read by the client that allocated it (required
+/// — see [`launch_der_binary_into`]). A device read-back failure surfaces as
+/// [`CbError::Degenerate`] (WR-05), never a silent all-zero buffer masquerading as a
+/// valid histogram.
+///
+/// The reported [`AtomicFinalizePath`] records whether the device advertised the
+/// f64-atomic-add support the in-kernel merge relies on
+/// ([`AtomicFinalizePath::InKernelAtomicF64`]) or not
+/// ([`AtomicFinalizePath::HostSumFallback`] — informational on this path, since the
+/// kernel always ran the in-kernel atomic; the report surfaces the capability for the
+/// 7.6 epsilon sign-off and the RESEARCH A1 f32/f64 decision). REPORT-not-sign-off.
+pub fn launch_pointwise_hist2(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<(Vec<f64>, AtomicFinalizePath)> {
+    if der1.is_empty() || n_features == 0 || n_bins == 0 {
+        return Ok((Vec::new(), AtomicFinalizePath::HostSumFallback));
+    }
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    // Report the atomic capability the in-kernel merge depends on (Pitfall 1 / D-03):
+    // gfx1100 advertises f32 atomic-add natively; f64 is optional. The fill kernel runs
+    // the in-kernel atomic regardless (the handle path cannot host-sum without a
+    // read-back); this report records which atomic support the device offers, for the
+    // 7.6 epsilon sign-off + the RESEARCH A1 f32/f64 channel decision.
+    let path = if device_supports_f64_atomic_add(&client) {
+        AtomicFinalizePath::InKernelAtomicF64
+    } else {
+        AtomicFinalizePath::HostSumFallback
+    };
+
+    let handle =
+        launch_pointwise_hist2_into(&client, der1, weight, cindex, indices, n_bins, n_features)?;
+
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    Ok((bytemuck::cast_slice::<u8, f64>(&bytes).to_vec(), path))
 }

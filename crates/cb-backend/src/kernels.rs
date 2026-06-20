@@ -21,6 +21,17 @@ use cubecl::prelude::*;
 /// reduction STRIDE (the strides derive from `CUBE_DIM_X` / `PLANE_DIM`, D-09).
 pub(crate) const BLOCK_REDUCE_SHMEM: usize = 32;
 
+/// Comptime worst-case `SharedMemory` size for the per-block 2-channel pointwise
+/// histogram (Phase 7.3 / Pitfall 3 — the size MUST be a compile-time `usize` const,
+/// not a runtime/topology value). It is the 8-bit worst case: `2 channels * (1 <<
+/// 8) bins = 512`, the upper bound across the one-byte non-binary bit-widths (5/6/7/8
+/// — the comptime `bits` arg selects the USED PREFIX `2 * (1 << bits)` of this
+/// allocation, mirroring upstream `pointwise_hist2_one_byte_templ.cuh`'s worst-case
+/// `__shared__ float counters[...]` sizing). This is a shared-memory SIZE (the
+/// allocation), NOT a wave/warp-size literal in any stride (D-09) — the analog of
+/// [`BLOCK_REDUCE_SHMEM`].
+pub(crate) const HIST_SHMEM: usize = 2 * (1 << 8);
+
 /// First-order RMSE gradient kernel: `der1[i] = target[i] - approx[i]`.
 ///
 /// CatBoost's RMSE first derivative for object `i` is `target[i] - approx[i]`
@@ -541,6 +552,106 @@ pub fn histogram_scatter_kernel<F: Float>(
 ) {
     if ABSOLUTE_POS < der1.len() {
         contrib[ABSOLUTE_POS] = der1[ABSOLUTE_POS] * weight[ABSOLUTE_POS];
+    }
+}
+
+/// 2-channel pointwise histogram fill — the 8-bit non-binary `ComputeHist2NonBinary`
+/// analog (Phase 7.3, GPU-01 histogram slice; D-7.3-01..05). For every (feature, bin)
+/// it accumulates two interleaved channels: channel 0 = Σ der1 ("target"), channel 1
+/// = Σ weight, written into the global `bin_sums` buffer at the FROZEN layout index
+///
+/// ```text
+/// index(feature, bin, channel) = (feature * n_bins + bin) * 2 + channel
+/// ```
+///
+/// (the single-tree collapse of `ShiftPartAndBinSumsPtr`: `histLineSize = 2 *
+/// totalBinFeatures`, `part = fold = 0`, `FirstFoldIndex = 0` — see the module doc of
+/// `kernels/pointwise_hist.rs`). `n_bins = 1 << bits` is passed as the comptime
+/// `bins` count so Plans B/C/D reuse this kernel at 5/6/7-bit via the SAME `bits` arg
+/// (D-7.3-02), with no runtime branch.
+///
+/// # In-kernel atomic merge (D-03 / D-7.3-03)
+///
+/// `bin_sums: &Array<Atomic<F>>` is the GLOBAL histogram; each thread `fetch_add`s its
+/// per-object contribution directly into the global cell (the genuine D-03 in-kernel
+/// atomic merge — the `block_reduce_atomic_kernel` `acc[0].fetch_add(...)` primitive
+/// generalized to a (feature, bin, channel)-indexed buffer). Because many threads
+/// contribute to the same cell, the cross-thread accumulation ORDER is
+/// non-deterministic — the accepted D-03 source of run-to-run float-order variance,
+/// REPORTED (not signed off) by the `kernels::pointwise_hist` oracle (GPU-06 epsilon
+/// is 7.6's job). Upstream's per-block shared-memory working histogram + the
+/// `BLOCKS_PER_FEATURE > 1 ? atomicAdd : WriteThrough` merge guard is a PERFORMANCE
+/// refinement over this same atomic-merge STRUCTURE (it reduces global-atomic traffic
+/// by pre-reducing within a block); the MVP fill uses the direct global atomic merge,
+/// which is structurally faithful (D-01) and provably correct — the shared-mem
+/// pre-reduction is an additive perf follow-up (RESEARCH Open Q3). The comptime
+/// [`HIST_SHMEM`] worst-case size is reserved for that follow-up.
+///
+/// # Wave-size policy (D-09)
+///
+/// The per-object loop strides by the TOTAL thread count `CUBE_COUNT_X * CUBE_DIM_X`
+/// (a grid-stride loop) — derived from the launch topology intrinsics, NEVER a literal
+/// 32/64. No `& 31`/`tiled_partition<32>` appears: the bin index comes from
+/// `cindex[feature * n + indices[i]]`, not a warp-lane partition. Generic over `F:
+/// Float` (AGENTS.md generics-float). Every device read is under a bounds guard
+/// (`i < indices.len()`) so a non-cube-multiple object count stays correct
+/// (T-7.1-01). if-as-STATEMENT only (CubeCL conditionals manual).
+///
+/// `der1`/`weight` are length `n` (per object, object order). `cindex` is the
+/// quantized bin matrix laid out feature-major (`cindex[feature * n + obj]`).
+/// `indices` (length `n`) is the object visiting order. `n` and `n_features` are
+/// passed as comptime so the bounds and the feature loop are JIT-resolved.
+#[cube(launch)]
+pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    cindex: &Array<u32>,
+    indices: &Array<u32>,
+    bin_sums: &Array<Atomic<F>>,
+    n_features: u32,
+    #[comptime] bits: u32,
+) {
+    // n_bins = 1 << bits (comptime; the USED prefix of the HIST_SHMEM worst case).
+    // Held as `usize` because it participates in the (feature, bin) index arithmetic
+    // (cubecl array indexers are `usize` — `Cubecl_shared_memory.md` Indexing Safety).
+    let n_bins = comptime!((1u32 << bits) as usize);
+    // n (object count) and the feature-major cindex stride are derived from the input
+    // lengths — no comptime `n` arg needed (the bounds and stride are runtime values
+    // from the device arrays, exactly like the elementwise kernels' `approx.len()`).
+    // `indices.len()` is `usize`, so all index arithmetic below stays in `usize`; the
+    // `u32` values read from `cindex`/`indices` are cast to `usize` at the index site.
+    let n = indices.len();
+    let n_features_usize = n_features as usize;
+
+    // Grid-stride loop over the object-visiting order. The stride is the total thread
+    // count (CUBE_COUNT * CUBE_DIM) — a topology-derived value, NEVER a literal 32/64
+    // (D-09). Each unit processes objects ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a
+    // launch narrower than `n` still covers every object (T-7.1-01). `ABSOLUTE_POS` and
+    // `CUBE_COUNT` are `usize` intrinsics; `CUBE_DIM` is `u32` — cast it once to keep
+    // the stride arithmetic in `usize`.
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < n {
+        // Bounds guard (T-7.1-01); `indices` is length n, indexed directly like the
+        // elementwise kernels (`approx[ABSOLUTE_POS]`). The bin/object VALUES are `u32`
+        // (from the `&Array<u32>` inputs); cast them to `usize` for the index math.
+        let obj = indices[i] as usize;
+        let d = der1[obj];
+        let w = weight[obj];
+
+        // For each feature, read the object's quantized bin and atomic-merge both
+        // channels into the global histogram at the FROZEN interleaved index.
+        let mut feature = 0usize;
+        while feature < n_features_usize {
+            let bin = cindex[feature * n + obj] as usize;
+            let cell = (feature * n_bins + bin) * 2usize;
+            // channel 0 = Σ der1, channel 1 = Σ weight (in-kernel atomic, D-03).
+            bin_sums[cell].fetch_add(d);
+            bin_sums[cell + 1usize].fetch_add(w);
+            feature += 1usize;
+        }
+
+        i += stride;
     }
 }
 
