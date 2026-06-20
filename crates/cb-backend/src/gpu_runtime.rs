@@ -62,6 +62,7 @@ use crate::kernels::{
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
     pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
+    partition_split_kernel, partition_update_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
     quantile_gradient_kernel, scan_update_pointwise_kernel, SCORE_FN_L2,
@@ -1755,6 +1756,226 @@ fn launch_scan_update_pointwise_into(
     // the FROZEN binSums read-back path (same layout). A read-back failure surfaces as
     // CbError::Degenerate, never a silent zero buffer (WR-05 / T-07.5-02-04).
     read_binsums_f64(client, cumulative_handle)
+}
+
+// ===========================================================================
+// Phase 7.5 Plan C — the device-resident partition split + partition update seams, and
+// the host-light single-tree grow loop driver (GPU-01 grow-loop slice; D-7.5-02 / D-05).
+// The partition split (forward-bit doc-routing reorder == `cb_train::leaf_index`) and
+// partition update (per-partition Σ der1 / Σ weight reduce == upstream
+// `UpdatePartitionProps`) stay ENTIRELY device-resident: handle-in / handle-out, NO
+// `read_one` on the bulk routing (D-05). The grow loop threads ONE `ComputeClient`
+// through the whole tree, reading back ONLY the O(1) BestSplit descriptor per level and
+// the final `2^depth` part-stats — never the full histogram/partition buffer (the
+// forbidden host hybrid). Cross-oracled in `kernels/grow_loop.rs` against an INLINE
+// transcription of `cb_train::greedy_tensor_search_oblivious`/`leaf_index` + the
+// read-only `cb_compute::calc_average` leaf formula.
+// ===========================================================================
+
+/// Upload a host der1/weight float column onto `client` as a device handle, casting to
+/// the channel float type (f32 on wgpu, f64 elsewhere — RESEARCH A1). Used by the grow
+/// loop to materialize the resident der1/weight/cumulative buffers ONCE per tree. The
+/// empty case short-circuits to a zero-length handle (Pitfall 5).
+pub(crate) fn upload_channel_floats(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    values: &[f64],
+) -> Handle {
+    if values.is_empty() {
+        return client.empty(0);
+    }
+    #[cfg(feature = "wgpu")]
+    {
+        let v: Vec<f32> = values.iter().map(|&x| x as f32).collect();
+        client.create(cubecl::bytes::Bytes::from_elems(v))
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        client.create(cubecl::bytes::Bytes::from_elems(values.to_vec()))
+    }
+}
+
+/// Read a device part-stats handle (channel float type) back to a host `Vec<f64>`,
+/// UPCASTING the f32 channel on wgpu (RESEARCH A1) — the part-stats sibling of
+/// [`read_binsums_f64`]/[`read_scores_f64`]. A read-back failure surfaces
+/// [`CbError::Degenerate`] (WR-05), never a silent zero buffer.
+pub(crate) fn read_part_stats_f64(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+) -> CbResult<Vec<f64>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("part-stats read-back failed: {e:?}")))?;
+    #[cfg(feature = "wgpu")]
+    {
+        Ok(bytemuck::cast_slice::<u8, f32>(&bytes)
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect())
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+    }
+}
+
+/// Read a device `u32` handle (the partition `leaf_of`) back to a host `Vec<u32>`. A
+/// read-back failure surfaces [`CbError::Degenerate`] (WR-05). Used by the cross-oracle
+/// to validate the device per-object leaf assignment against `cb_train::leaf_index`; the
+/// grow loop itself never reads the bulk routing back (D-05) — this is the test seam.
+pub(crate) fn read_u32_handle(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+) -> CbResult<Vec<u32>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("u32 handle read-back failed: {e:?}")))?;
+    Ok(bytemuck::cast_slice::<u8, u32>(&bytes).to_vec())
+}
+
+/// Apply ONE split's forward-bit doc-routing reorder device-resident: returns a NEW
+/// `leaf_of` handle with bit `level_bit` set for every object whose quantized bin on
+/// `feature` is `> bin` (== `cb_train::leaf_index`'s `idx |= 1 << i`, Pitfall 6). The
+/// bulk routing stays device-resident — NO `read_one` here (D-05). The caller threads
+/// ONE `&client`; `der1` (resident handle), `cindex`/`indices`/`leaf_of` are device
+/// handles bound to that client.
+///
+/// `n` is the object count; `cindex_stride` is `n_features * n` (the resident cindex
+/// length). `feature`/`bin` are the chosen split; `level_bit` is the level's leaf bit.
+/// Mismatched/degenerate dimensions and a `feature`/`bin` out of range surface a typed
+/// [`CbError`] BEFORE launch (the host validated the VALUE ranges on upload). Empty
+/// (`n == 0`) returns a zero-length handle with NO launch (Pitfall 5). No
+/// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_split_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: Handle,
+    cindex: Handle,
+    indices: Handle,
+    leaf_of: Handle,
+    n: usize,
+    cindex_stride: usize,
+    feature: u32,
+    bin: u32,
+    level_bit: u32,
+) -> CbResult<Handle> {
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The new leaf_of starts as a fresh device buffer (the kernel writes every object it
+    // strides; idle lanes write nothing, but every object is covered by the grid-stride).
+    let new_leaf_of = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
+
+    #[cfg(feature = "wgpu")]
+    partition_split_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex, cindex_stride) },
+        unsafe { ArrayArg::from_raw_parts(indices, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+        unsafe { ArrayArg::from_raw_parts(new_leaf_of.clone(), n) },
+        feature,
+        bin,
+        level_bit,
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    partition_split_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex, cindex_stride) },
+        unsafe { ArrayArg::from_raw_parts(indices, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+        unsafe { ArrayArg::from_raw_parts(new_leaf_of.clone(), n) },
+        feature,
+        bin,
+        level_bit,
+    );
+
+    Ok(new_leaf_of)
+}
+
+/// Recompute the per-partition `Σ der1` / `Σ weight` device-resident after a split:
+/// returns a NEW `part_stats` handle of length `n_parts * 2` (channel 0 = Σ der1,
+/// channel 1 = Σ weight) reduced over the resident `leaf_of` partition via the in-kernel
+/// atomic merge (D-03). The bulk routing stays device-resident — NO `read_one` here
+/// (D-05); the grow loop reads back the part-stats ONCE at the leaves.
+///
+/// `n` is the object count; `n_parts` is `2^level` (the current partition count). The
+/// host validated `leaf_of[obj] < n_parts` on upload so the atomic store stays in bounds.
+/// `n_parts * 2` overflow surfaces a typed [`CbError::OutOfRange`]. Empty (`n == 0` or
+/// `n_parts == 0`) returns a zero-length handle with NO launch (Pitfall 5). No
+/// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+pub(crate) fn launch_partition_update_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: Handle,
+    weight: Handle,
+    indices: Handle,
+    leaf_of: Handle,
+    n: usize,
+    n_parts: usize,
+) -> CbResult<Handle> {
+    if n == 0 || n_parts == 0 {
+        return Ok(client.empty(0));
+    }
+
+    let part_stats_len = n_parts.checked_mul(2).ok_or_else(|| {
+        CbError::OutOfRange(format!("n_parts ({n_parts}) * 2 overflows usize (part-stats length)"))
+    })?;
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    #[cfg(feature = "wgpu")]
+    let part_stats = {
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; part_stats_len]));
+        partition_update_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(der1, n) },
+            unsafe { ArrayArg::from_raw_parts(weight, n) },
+            unsafe { ArrayArg::from_raw_parts(indices, n) },
+            unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+        );
+        h
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let part_stats = {
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; part_stats_len]));
+        partition_update_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(der1, n) },
+            unsafe { ArrayArg::from_raw_parts(weight, n) },
+            unsafe { ArrayArg::from_raw_parts(indices, n) },
+            unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+        );
+        h
+    };
+
+    Ok(part_stats)
 }
 
 // ===========================================================================

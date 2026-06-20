@@ -2057,6 +2057,139 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     }
 }
 
+/// Device-resident **partition split** — the per-object doc-routing reorder that
+/// extends the current per-object leaf assignment by ONE level (GPU-01 grow-loop
+/// slice, Phase 7.5 Plan C; D-7.5-02). Mirrors upstream `TSubsetsHelper::Split`'s
+/// in-place subset reorder, but expressed as a forward-bit leaf-index update so it
+/// matches the CPU `cb_train::leaf_index` convention EXACTLY (Pitfall 6,
+/// parity-critical: an off-by-one in the bit order silently permutes leaves).
+///
+/// # Forward-bit leaf convention (parity-critical, Pitfall 6)
+///
+/// For the split chosen at level `d` on `(feature, bin)`, every object whose
+/// quantized bin on `feature` is STRICTLY GREATER than `bin` "passes" the split and
+/// gets bit `d` set: `new_leaf_of[obj] = leaf_of[obj] | (pass ? (1 << level_bit) :
+/// 0)`. This is `idx |= 1usize << i` from `cb_train::leaf_index` (`tree.rs:272-280`)
+/// with `i == level_bit == d`. The `> bin` test mirrors the cross-oracle's CPU
+/// `value > border` split mapped onto the quantized bin axis (border `b` ↔ bin > b),
+/// so the device leaf assignment is bit-identical to the CPU `assign_leaves`/`leaf_index`.
+///
+/// The routing stays ENTIRELY device-resident: `leaf_of` (in) and `new_leaf_of` (out)
+/// are device handles; the bulk doc-routing is NEVER read back to host (D-05). Only
+/// the O(1) `(feature, bin)` decision crosses host→device as the launch scalars.
+///
+/// # Wave-size policy (D-09) / generics-float (AGENTS.md)
+///
+/// The per-object loop is a grid-stride loop over the total thread count
+/// (`CUBE_COUNT * CUBE_DIM`), a topology-derived value — NEVER a literal 32/64. The
+/// kernel is generic over `F: Float` (AGENTS.md generics-float): the resident der1
+/// handle is threaded in as `&Array<F>` so the SAME persistent float buffer the grow
+/// loop already holds is bound without a fresh upload; the routing itself reads only
+/// the integer `cindex` (a `_ = der1.len()` keeps the generic real without a value
+/// read). Every device read is under a POSITION bounds guard; the `feature`/`bin`/
+/// object VALUE ranges are validated HOST-SIDE before launch. if-as-STATEMENT only
+/// (CubeCL conditionals manual).
+///
+/// `leaf_of`/`new_leaf_of` are length `n` (per object, object order). `cindex` is the
+/// quantized bin matrix laid out feature-major (`cindex[feature * n + obj]`).
+/// `indices` (length `n`) is the object visiting order. `feature`/`bin`/`level_bit`
+/// are the chosen split's feature index, split border (bin), and the level's leaf bit.
+#[cube(launch)]
+pub fn partition_split_kernel<F: Float>(
+    der1: &Array<F>,
+    cindex: &Array<u32>,
+    indices: &Array<u32>,
+    leaf_of: &Array<u32>,
+    new_leaf_of: &mut Array<u32>,
+    feature: u32,
+    bin: u32,
+    level_bit: u32,
+) {
+    // Keep the `F: Float` generic real (AGENTS.md generics-float) while routing on the
+    // integer bin axis only — the resident der1 handle is threaded but not value-read
+    // here (the split decision is purely on the quantized bins).
+    let _ = der1.len();
+
+    let n = indices.len();
+
+    // Grid-stride loop over the object-visiting order (the stride is the total thread
+    // count CUBE_COUNT * CUBE_DIM — a topology value, NEVER a literal 32/64, D-09).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < n {
+        let obj = indices[i] as usize;
+        // The feature-major cindex stride is `feature * n + obj` (n == indices.len()):
+        // the SAME layout the histogram fill reads.
+        let cell = (feature as usize) * n + obj;
+        let mut new_leaf = leaf_of[obj];
+        // Forward-bit: object passes (gets bit `level_bit`) iff its bin > the border.
+        if cindex[cell] > bin {
+            new_leaf = new_leaf | (1u32 << level_bit);
+        }
+        new_leaf_of[obj] = new_leaf;
+        i += stride;
+    }
+}
+
+/// Device-resident **partition update** — the per-partition `Σ der1` / `Σ weight`
+/// reduce after a split (GPU-01 grow-loop slice, Phase 7.5 Plan C; D-7.5-02). Mirrors
+/// upstream `UpdatePartitionProps` / `PartitionUpdateImpl` (`pointwise_scores.cu:624-697`):
+/// recompute each new leaf's summed first-derivative and summed weight so the leaf
+/// values can be estimated from the device-resident partition without re-reading the
+/// full doc routing to host.
+///
+/// # Per-partition reduce (D-03 in-kernel atomic + f64 finalize)
+///
+/// Each object atomic-adds its `(der1[obj], weight[obj])` into its partition's two
+/// channels of the global `part_stats` buffer at `part_stats[leaf_of[obj] * 2 + 0]`
+/// (Σ der1) and `part_stats[leaf_of[obj] * 2 + 1]` (Σ weight). The cross-thread merge
+/// is ALWAYS the in-kernel `Atomic<F>::fetch_add` (the `block_reduce_atomic_kernel`
+/// `acc[0].fetch_add(...)` primitive generalized to a per-partition-indexed buffer,
+/// D-03); the accumulation ORDER is non-deterministic (the accepted D-03 float-order
+/// variance, REPORTED not signed off). The channel float type is f64 on rocm/cuda/cpu
+/// and f32 on wgpu (RESEARCH A1), matching the histogram channel. ALWAYS runs the
+/// in-kernel atomic — never a host-fallback selector mid-loop (Pitfall 4).
+///
+/// # Wave-size policy (D-09) / generics-float (AGENTS.md)
+///
+/// The per-object loop is a grid-stride loop over the total thread count
+/// (`CUBE_COUNT * CUBE_DIM`) — NEVER a literal 32/64. Generic over `F: Float`
+/// (AGENTS.md generics-float). Every device read is under a POSITION bounds guard; the
+/// `leaf_of` partition VALUE range (`< n_parts`) is validated HOST-SIDE before launch
+/// so the atomic store cannot address `part_stats` out of bounds. if-as-STATEMENT only.
+///
+/// `der1` (UNWEIGHTED, the 7.2 seam contract) / `weight` are length `n` (per object,
+/// object order). `leaf_of` (length `n`) is the per-object partition (`0..n_parts`).
+/// `indices` (length `n`) is the object visiting order. `part_stats` is length
+/// `n_parts * 2` (zero-initialised by the host), channel 0 = Σ der1, channel 1 = Σ weight.
+#[cube(launch)]
+pub fn partition_update_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    indices: &Array<u32>,
+    leaf_of: &Array<u32>,
+    part_stats: &Array<Atomic<F>>,
+) {
+    let n = indices.len();
+
+    // Grid-stride loop over the object-visiting order (stride == total thread count,
+    // a topology value — NEVER a literal 32/64, D-09).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < n {
+        let obj = indices[i] as usize;
+        let part = leaf_of[obj] as usize;
+        let d = der1[obj];
+        let w = weight[obj];
+        // In-kernel atomic merge (D-03): the per-partition Σ der1 / Σ weight, folded
+        // device-resident. The host validated `part < n_parts` (so `part * 2 + 1` is in
+        // bounds) before launch.
+        part_stats[part * 2usize].fetch_add(d);
+        part_stats[part * 2usize + 1usize].fetch_add(w);
+        i += stride;
+    }
+}
+
 #[cfg(test)]
 mod gradient_gpu;
 
@@ -2097,3 +2230,20 @@ mod pairwise_hist;
 // + cuda compile-only). REPORTS divergence; the GPU-06 epsilon is 7.6's job.
 #[cfg(test)]
 mod score_split;
+
+// Device-resident host-light single-tree grow-loop cross-oracle (GPU-01 grow-loop
+// slice, Phase 7.5 Plan C — the integration SIBLING of `score_split`): the GPU
+// `grow_oblivious_tree` driver (fill→scan→score+argmin→ONE O(1) BestSplit read-back→
+// partition-split→partition-update per level, then ONE 2^depth part-stats read-back at
+// the leaves) over `SelectedRuntime`, cross-oracled against a FROZEN-CPU-reference
+// transcription of `cb_train::greedy_tensor_search_oblivious` + `cb_train::leaf_index`
+// (transcribed INLINE — never importing cb-train, the Plan-A feature-unification
+// landmine) and `cb_compute::calc_average` (imported read-only) for leaf values. The
+// `partition_split_kernel` / `partition_update_kernel` doc-routing/reduce primitives are
+// exercised here too. Lives in `kernels/grow_loop.rs`, mounted at `kernels::grow_loop`.
+// Like `score_split`/`pointwise_hist` it runs over the generic `SelectedRuntime`, so it
+// builds/runs under EVERY backend (the rocm in-env oracle on gfx1100 + the wgpu host run
+// + cuda compile-only). STRUCTURE is the STRICT bar (asserted EXACT); leaf VALUES are
+// REPORTED (the GPU-06 epsilon is 7.6's job).
+#[cfg(test)]
+mod grow_loop;
