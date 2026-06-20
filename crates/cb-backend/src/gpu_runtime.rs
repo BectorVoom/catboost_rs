@@ -946,16 +946,12 @@ fn launch_pointwise_hist2_into(
         )));
     }
 
-    let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
-    let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
     let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
     let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
 
     // The binSums accumulator is zero-initialized so the in-kernel `fetch_add`s
     // accumulate from 0.0 (the additive identity). Length = the FROZEN layout length.
     let bin_sums_len = hist2_binsums_len(n_bins, n_features);
-    let bin_sums_handle =
-        client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
 
     // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in the
     // kernel handles any surplus via the total-thread-count stride — never a literal).
@@ -967,23 +963,87 @@ fn launch_pointwise_hist2_into(
         z: 1,
     };
 
-    pointwise_hist2_nonbinary_kernel::launch::<f64, SelectedRuntime>(
-        client,
-        count,
-        dim,
-        unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-        unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-        unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
-        unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-        // The atomic accumulator binds the same f64 storage as a plain buffer (the
-        // `block_reduce_atomic_kernel` precedent); `clone` so the original stays
-        // returnable on-device. NO `read_one` here (SC-3).
-        unsafe { ArrayArg::from_raw_parts(bin_sums_handle.clone(), bin_sums_len) },
-        n_features as u32,
-        bits,
-    );
+    // Channel float-type dispatch (RESEARCH A1 / Pitfall 1). The in-kernel atomic
+    // merge needs `Atomic<F>::fetch_add` device-side. HIP (rocm) and CUDA support /
+    // emulate the f64 atomic add, so the histogram channel is f64 there (the project's
+    // f64-finalization preference, D-03). wgpu's WGSL has NO f64 atomics at all (the
+    // capability is genuinely absent, not just unadvertised), so the wgpu arm uses an
+    // f32 channel — upstream-faithful `atomicAdd(float*)`, natively supported — read
+    // back and UPCAST to f64. The buffer length (the FROZEN layout) is channel-type
+    // independent; only the element width differs, transparently to the 7.5 seam which
+    // reads the handle through this same crate. The der1/weight inputs are cast to the
+    // channel type at upload. `bytes::from_elems` keeps the buffer byte-typed.
+    #[cfg(feature = "wgpu")]
+    let bin_sums_handle = {
+        let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
+        let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
+        let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
+        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
+        pointwise_hist2_nonbinary_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+            unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+            n_features as u32,
+            bits,
+        );
+        h
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let bin_sums_handle = {
+        let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
+        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+        pointwise_hist2_nonbinary_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+            unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+            // The atomic accumulator binds the same f64 storage as a plain buffer (the
+            // `block_reduce_atomic_kernel` precedent); `clone` so the original stays
+            // returnable on-device. NO `read_one` here (SC-3).
+            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+            n_features as u32,
+            bits,
+        );
+        h
+    };
 
     Ok(bin_sums_handle)
+}
+
+/// Read a `binSums` device handle back to a host `Vec<f64>`, transparently UPCASTING
+/// the f32 channel on the wgpu arm (RESEARCH A1) and reading the f64 channel directly
+/// elsewhere. Centralizes the channel-type read so both the readback wrapper and the
+/// `kernels::pointwise_hist` oracle observe the SAME f64 layout regardless of backend.
+/// A read-back failure surfaces [`CbError::Degenerate`] (WR-05).
+fn read_binsums_f64(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+) -> CbResult<Vec<f64>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    #[cfg(feature = "wgpu")]
+    {
+        Ok(bytemuck::cast_slice::<u8, f32>(&bytes)
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect())
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+    }
 }
 
 /// Host-readback wrapper over the pointwise-histogram fill: launch the 8-bit
@@ -1021,11 +1081,14 @@ pub fn launch_pointwise_hist2(
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
-    // Report the atomic capability the in-kernel merge depends on (Pitfall 1 / D-03):
-    // gfx1100 advertises f32 atomic-add natively; f64 is optional. The fill kernel runs
-    // the in-kernel atomic regardless (the handle path cannot host-sum without a
-    // read-back); this report records which atomic support the device offers, for the
-    // 7.6 epsilon sign-off + the RESEARCH A1 f32/f64 channel decision.
+    // Report the atomic capability the in-kernel merge depends on (Pitfall 1 / D-03 /
+    // RESEARCH A1). The dispatch in `launch_pointwise_hist2_into` uses an f64 channel
+    // on rocm/cuda/cpu (HIP/CUDA support or emulate the f64 atomic add) and an f32
+    // channel on wgpu (WGSL has no f64 atomics). `device_supports_f64_atomic_add` is
+    // the cubecl capability query: on gfx1100 it returns false (HIP does not ADVERTISE
+    // f64 atomic-add even though it runs it), so this report is informational, not a
+    // hard gate — it surfaces the device-advertised capability for the 7.6 epsilon
+    // sign-off. The actual channel width is the compile-time backend choice above.
     let path = if device_supports_f64_atomic_add(&client) {
         AtomicFinalizePath::InKernelAtomicF64
     } else {
@@ -1035,8 +1098,6 @@ pub fn launch_pointwise_hist2(
     let handle =
         launch_pointwise_hist2_into(&client, der1, weight, cindex, indices, n_bins, n_features)?;
 
-    let bytes = client
-        .read_one(handle)
-        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
-    Ok((bytemuck::cast_slice::<u8, f64>(&bytes).to_vec(), path))
+    let device_hist = read_binsums_f64(&client, handle)?;
+    Ok((device_hist, path))
 }

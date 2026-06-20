@@ -54,6 +54,16 @@ use cb_core::sum_f64;
 
 use crate::gpu_runtime::{launch_pointwise_hist2, launch_pointwise_hist2_handle, AtomicFinalizePath};
 
+/// The asserted run-stable divergence bound for the device histogram channel. The
+/// device channel is f64 on rocm/cuda/cpu (HIP/CUDA support/emulate the f64 atomic
+/// add) and f32 on wgpu (WGSL has no f64 atomics — RESEARCH A1), so the bound is the
+/// f32 magnitude (~1e-3) under `wgpu` and the f64 magnitude (~1e-9) elsewhere. This is
+/// a REPORTED run-stable bound, NOT the GPU-06 epsilon (7.6's job).
+#[cfg(feature = "wgpu")]
+const HIST_BOUND: f64 = 1e-3;
+#[cfg(not(feature = "wgpu"))]
+const HIST_BOUND: f64 = 1e-9;
+
 /// Compare the device histogram (cast to f64) to the host reference element-wise,
 /// returning the max abs and max rel divergence over the buffer. Cloned verbatim
 /// from the `kernels::gradient_gpu` reporter (REPORT-not-sign-off, D-7.3-04).
@@ -159,7 +169,16 @@ fn read_handle_f64(h: cubecl::server::Handle) -> Vec<f64> {
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
     let bytes = client.read_one(h).unwrap();
-    bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    // The channel is f32 on wgpu (RESEARCH A1) and f64 elsewhere — upcast to f64 so the
+    // oracle compares against the f64 host reference uniformly.
+    #[cfg(feature = "wgpu")]
+    {
+        bytemuck::cast_slice::<u8, f32>(&bytes).iter().map(|&v| f64::from(v)).collect()
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    }
 }
 
 #[test]
@@ -199,8 +218,8 @@ fn nonbinary_8bit() {
             "[hist2 8bit f64 n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} AtomicFinalizePath={path:?}"
         );
         assert!(
-            rel <= 1e-9 || abs <= 1e-9,
-            "f64 8-bit hist2 (n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e}"
+            rel <= HIST_BOUND || abs <= HIST_BOUND,
+            "8-bit hist2 (n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
         );
     }
 }
@@ -264,8 +283,8 @@ fn handoff() {
     let (abs, rel) = max_divergence(&device, &baseline);
     println!("[hist2 8bit handoff n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
     assert!(
-        rel <= 1e-9 || abs <= 1e-9,
-        "device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e}"
+        rel <= HIST_BOUND || abs <= HIST_BOUND,
+        "device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
     );
 
     // Empty hand-off: the handle wrapper returns a zero-length handle with NO launch
