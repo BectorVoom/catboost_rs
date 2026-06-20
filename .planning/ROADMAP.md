@@ -615,12 +615,23 @@ Plans:
   3. Kernels are wave-size-agnostic (no warp-size constants; pass on wave32-native gfx1100, D-09) and generic-float (no hard-coded float types, per AGENTS.md).
   4. Validated on `rocm`; the additive boundary holds (`cb-compute` cubecl-free; `cb-core`/`cb-model` unchanged).
 
-**Plans**: 4 plans
-Plans:
+**Plans**: 4 plansPlans:
+**Wave 1**
+
 - [ ] 07.3-01-PLAN.md — Device seam + 8-bit non-binary hist2 fill (freeze binSums layout + der-handle-in/handle-out seam + atomic merge + self-oracle harness)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 07.3-02-PLAN.md — 5/6/7-bit non-binary via comptime `bits` on the same kernel + self-oracle
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 07.3-03-PLAN.md — Half-byte (4-bit) hist2 fill (distinct kernel family) + self-oracle
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 07.3-04-PLAN.md — Binary (1-bit) hist2 fill (distinct kernel family) + whole-family rocm suite (SC-1 close)
+
 **Research flag**: NEEDS DEEPER RESEARCH — histogram atomic-add coverage and shared-memory model in `cubecl-hip`; bit-width specialization strategy in CubeCL (`comptime`/generics) vs the CUDA template variants.
 
 ### Phase 7.4: Pairwise Histogram Family
