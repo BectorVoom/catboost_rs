@@ -74,7 +74,10 @@ use cubecl::prelude::*;
 
 use cb_core::sum_f64;
 
-use crate::gpu_runtime::{launch_pairwise_hist, launch_pairwise_hist_handle};
+use crate::gpu_runtime::{
+    launch_pairwise_hist, launch_pairwise_hist_8bit, launch_pairwise_hist_8bit_handle,
+    launch_pairwise_hist_handle,
+};
 
 /// The asserted run-stable divergence bound for the device histogram channel. The
 /// device channel is f64 on rocm/cuda/cpu (HIP/CUDA support/emulate the f64 atomic add)
@@ -316,6 +319,92 @@ fn nonbinary_bits() {
                 "{bits}-bit pairwise hist (n_pairs={n_pairs}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
             );
         }
+    }
+}
+
+#[test]
+fn eightbit_atomics() {
+    // The 8-bit-atomics pairwise fill self-oracle (D-7.4-02 — the structurally DISTINCT
+    // global-atomics family; upstream `pairwise_hist_one_byte_8bit_atomics.cuh`). At 8 bits
+    // a 256-bin x 4-channel line does not fit the per-block shared-memory budget, so
+    // upstream accumulates via TRUE GLOBAL ATOMICS; the MVP mirrors the non-binary kernel
+    // body with `bits = 8` always using direct global `Atomic<F>::fetch_add` (upstream's
+    // per-thread CachedBins cache is a documented perf follow-up over the SAME atomic
+    // structure). It is a SEPARATE `#[cube]` symbol with a SEPARATE launch arm — exercised
+    // here through `launch_pairwise_hist_8bit`.
+    //
+    // The device 4-channel histogram (n_bins = 256) must match the ordered host reference
+    // within the REPORTED bound over the edge cases n_pairs=0 (empty, NO launch/read-back),
+    // n_pairs=1, n_pairs=37 (non-cube-multiple), and large N. The reported max abs/rel
+    // divergence is printed (REPORT-not-sign-off, D-7.4-05).
+    let n_features = 2usize;
+    let n_objects = 300usize; // > 256 so bins span the full 8-bit range
+    let one_hot = false;
+    let bits = 8u32;
+    let n_bins = 1usize << bits; // 256 — the distinct 8-bit-atomics line size
+
+    // Empty (n_pairs=0): NO launch, NO read-back (Pitfall 5).
+    {
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, 0);
+        let device =
+            launch_pairwise_hist_8bit(&pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot)
+                .unwrap();
+        assert!(
+            device.is_empty(),
+            "empty input must yield an empty 8-bit-atomics pairwise histogram (no launch)"
+        );
+    }
+
+    for &n_pairs in &[1usize, 37usize, 10_000usize] {
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+        let device =
+            launch_pairwise_hist_8bit(&pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot)
+                .unwrap();
+        let baseline = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        );
+
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "device binSums length must equal the host-reference 4-channel layout (8-bit, n_pairs={n_pairs})"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[pair_hist 8bit-atomics f64 n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+        );
+        assert!(
+            rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+            "8-bit-atomics pairwise hist (n_pairs={n_pairs}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+        );
+    }
+
+    // Device-residency hand-off (SC-3): the 8-bit handle arm returns the 4-channel binSums
+    // as a device HANDLE with NO host fold on the seam; read it back ONCE here.
+    {
+        let n_pairs = 50usize;
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+        let handle = launch_pairwise_hist_8bit_handle(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        )
+        .unwrap();
+        let device = read_pair_handle(handle);
+        let baseline = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        );
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "8-bit binSums handle length must equal the host-reference 4-channel layout length"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[pair_hist 8bit-atomics handoff n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+        );
+        assert!(
+            rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+            "8-bit-atomics device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+        );
     }
 }
 
