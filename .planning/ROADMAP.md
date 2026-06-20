@@ -708,7 +708,7 @@ Plans:
 
 **Wave 5** *(blocked on 07.5-01, 07.5-03)*
 
-- [ ] 07.5-05-PLAN.md — Cosine/NewtonCosine + SolarL2/LOOL2/SatL2 comptime score arms (transcribed from score.rs, f64 fold, guards verbatim), per-calcer self-oracle + a Cosine grow-loop structure check (Cosine = primary path)
+- [x] 07.5-05-PLAN.md — Cosine/NewtonCosine + SolarL2/LOOL2/SatL2 comptime score arms (transcribed from score.rs, f64 fold, guards verbatim), per-calcer self-oracle + a Cosine grow-loop structure check (Cosine = primary path)
 
 **Wave 6** *(blocked on 07.5-02, 07.5-03)*
 

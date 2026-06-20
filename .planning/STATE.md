@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Completed 07.5-01-PLAN.md
-last_updated: "2026-06-20T18:05:25.157Z"
+last_updated: "2026-06-20T18:16:19.848Z"
 last_activity: 2026-06-21 -- Phase 07.5 Plan 03 (Task 2) complete
 progress:
   total_phases: 20
   completed_phases: 15
   total_plans: 111
-  completed_plans: 109
+  completed_plans: 110
   percent: 75
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 07.5 (Score/Split Selection & On-Device Tree-Grow Loop) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute (03 complete — host-light single-tree grow loop landed, SC-3 structure parity GREEN on gfx1100)
 Last activity: 2026-06-21 -- Phase 07.5 Plan 03 (Task 2) complete
 
@@ -154,6 +154,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.5 P02 | 5min | 2 tasks | 3 files |
 | Phase 07.5 P03 | 40min | 2 tasks | 3 files |
 | Phase 07.5 P04 | ~5m | 2 tasks | 2 files |
+| Phase 07.5 P05 | 6min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -334,6 +335,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07.5-02: scan/update bridge reuses block_scan_kernel verbatim (one cube per feature/channel); FILL->scan seam consumes the FROZEN 7.3 handle in place; n_bins>CUBE_DIM is a typed error (tracked cross-cube-carry follow-up)
 - [Phase ?]: 07.5-04: grow_boosting_pass loops grow_oblivious_tree over a Plain-boosting run, ONE client; der1 recomputed device-side via 7.2 seam read once/tree; approx updated from already-read-back leaf_of+lr-scaled leaf_values (no new bulk crossing, D-05)
 - [Phase ?]: 07.5-04: D-7.5-06 budget characterized on clear-margin fixture — per-tree structure EXACT + stable run-to-run (4x5 trees), max leaf-value div 6.6e-13, NO argmax-flip; REPORTED not signed off (7.6 owns epsilon)
+- [Phase ?]: 07.5-05: 5 device score-calcer arms (L2+Cosine/Solar/LOO/Sat) on one find_optimal_split_kernel comptime selector; transcribed verbatim from cb-compute score.rs, f64 fold; rocm gfx1100 STRUCTURE-exact every fn, scores ~2e-16 (Cosine)/0.0 (Solar/LOO/Sat)
 
 ### Pending Todos
 
@@ -381,7 +383,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T18:05:04.181Z
+Last session: 2026-06-20T18:16:08.943Z
 Stopped at: Completed 07.5-01-PLAN.md
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
