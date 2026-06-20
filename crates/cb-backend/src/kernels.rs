@@ -2109,6 +2109,18 @@ pub fn find_optimal_split_kernel<F: Float>(
 /// [`crate::gpu_runtime::launch_scan_update_pointwise`] enforces the precondition
 /// with a typed error (the EXPLICIT tracked forward dependency — NOT a silent cut).
 ///
+/// # Precondition — `bin_sums` validity (IN-05)
+///
+/// This kernel consumes an ALREADY-FILLED `bin_sums` device handle and does NOT
+/// re-validate the quantized-bin (`cindex`) value range itself. Its correctness relies
+/// IMPLICITLY on the producing fill path having range-guarded `cindex` before populating
+/// `bin_sums` (the `cindex` value-range guards in
+/// [`crate::gpu_runtime::launch_scan_update_pointwise_into`], which fills then scans in
+/// one place). Any FUTURE caller that supplies an EXTERNALLY-produced `bin_sums` (one not
+/// built through that guarded fill path) MUST enforce the same `cindex < n_bins` /
+/// layout-length preconditions before calling this kernel — otherwise a malformed
+/// `bin_sums` would be prefix-summed verbatim into a wrong cumulative buffer.
+///
 /// Generic over `F: Float` (AGENTS.md generics-float). Every device read/write is
 /// under a POSITION bounds guard. if-as-STATEMENT only (CubeCL conditionals manual).
 #[cube(launch)]
