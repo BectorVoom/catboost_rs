@@ -26,7 +26,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 6.5: Text & Embedding Features** - FEAT-01, FEAT-02; tokenizer parity first (SC-2 BM25 per-stage CLOSED via 06.5-09 PATH-A fixture-correctness fix)
   - [x] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine (completed 2026-06-18)
 - [ ] **Phase 7: GPU Backends via CubeCL** (umbrella — split into 7.1–7.6) - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, full structural parity with `catboost/cuda/`, documented GPU tolerance
-  - [ ] **Phase 7.1: GPU Backend Runtime & Device Primitives** - GPU-02/04/05 + GPU-01 scan/reductions; cfg-gated `SelectedRuntime`, device memory, wave-agnostic scan/reduction primitives
+  - [x] **Phase 7.1: GPU Backend Runtime & Device Primitives** - GPU-02/04/05 + GPU-01 scan/reductions; cfg-gated `SelectedRuntime`, device memory, wave-agnostic scan/reduction primitives (completed 2026-06-20)
   - [ ] **Phase 7.2: On-Device Gradient/Hessian & Targets** - GPU-01 grad/hess; port `targets/` derivative computation device-resident
   - [ ] **Phase 7.3: Pointwise Histogram Family** - GPU-01 hist; `pointwise_hist2_*` incl. 5/6/7/8-bit, half-byte, binary variants
   - [ ] **Phase 7.4: Pairwise Histogram Family** - GPU-01 hist; `pairwise_hist_*` incl. 8-bit atomics and one-hot variants
@@ -571,7 +571,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 07.1-02-PLAN.md — block_scan_kernel (inclusive/exclusive) + rocm scan self-oracle; in-kernel atomic-finalize reduce variant (D-03) with reported run-to-run variance (GPU-01 scan)
+- [x] 07.1-02-PLAN.md — block_scan_kernel (inclusive/exclusive) + rocm scan self-oracle; in-kernel atomic-finalize reduce variant (D-03) with reported run-to-run variance (GPU-01 scan)
 
 **Research flag** (RESOLVED in 07.1-RESEARCH.md): cubecl-hip version skew is cosmetic (re-pin `cubecl-hip-sys =7.1.5280200`; sys build.rs auto-detects HIP patch from hipconfig); plane ops present at cubecl 0.10.0 (`plane_sum`/`plane_inclusive_sum`) with comptime shared-mem fallback for wave-agnostic reductions.
 
