@@ -68,15 +68,16 @@ const HIST_BOUND: f64 = 1e-9;
 /// returning the max abs and max rel divergence over the buffer. Cloned verbatim
 /// from the `kernels::gradient_gpu` reporter (REPORT-not-sign-off, D-7.3-04).
 fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
+    // IN-03: make the length precondition explicit (every caller already asserts equal
+    // lengths). Zipping the two slices removes the implicit coupling — a length mismatch
+    // truncates to the shorter slice rather than panicking with an opaque OOB index, and
+    // the debug_assert documents the contract loudly in debug builds.
+    debug_assert_eq!(device.len(), baseline.len());
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
-    for i in 0..baseline.len() {
-        let abs = (device[i] - baseline[i]).abs();
-        let rel = if baseline[i].abs() > 0.0 {
-            abs / baseline[i].abs()
-        } else {
-            abs
-        };
+    for (&d, &b) in device.iter().zip(baseline) {
+        let abs = (d - b).abs();
+        let rel = if b.abs() > 0.0 { abs / b.abs() } else { abs };
         max_abs = max_abs.max(abs);
         max_rel = max_rel.max(rel);
     }
