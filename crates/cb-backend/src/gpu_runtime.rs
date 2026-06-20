@@ -11,9 +11,10 @@
 //!
 //! # Module contents (WR-03 — actual surface, broader than 7.1 reduce/scan)
 //!
-//! This module has grown to host THREE phases' device-launch seams (a single-
-//! responsibility split into `gpu_runtime/der.rs` + `gpu_runtime/histogram.rs` is
-//! the planned follow-up; until then this doc is the authoritative inventory):
+//! This module has grown to host THREE phases' device-launch seams. A single-
+//! responsibility split into `gpu_runtime/{der,histogram}.rs` is an EXPLICIT tracked
+//! follow-up (IN-03) — scheduled as dedicated refactor work, NOT an open-ended
+//! "someday"; until that split lands this doc is the authoritative inventory:
 //!
 //! - **Phase 7.1 reduce/scan primitives** (this file's original scope):
 //!   [`launch_block_reduce_f64`], [`launch_block_reduce_atomic_f64`],
