@@ -634,6 +634,114 @@ pub fn block_reduce_kernel<F: Float>(
     }
 }
 
+/// Block-level inclusive/exclusive prefix-scan (the Phase-7.1 device primitive,
+/// D-7.1-06; GPU-01 scan). Each unit reads `input[ABSOLUTE_POS]` (bounds-guarded,
+/// zero-padded out-of-range) and writes the running prefix-sum to
+/// `output[ABSOLUTE_POS]`. The `#[comptime] inclusive` flag selects the
+/// CatBoost-CUDA `InplaceInclusiveScan` semantics (running total includes self)
+/// vs the exclusive variant (sum of strictly-prior elements; `output[0] == 0`).
+///
+/// Structural parity (D-01): the cross-plane carry is a shared-memory
+/// Hillis-Steele stride-doubling scan (`s = 1,2,4,…` with `sync_cube()` between
+/// stages over per-plane partials), mirroring
+/// `cuda_util/kernel/inplace_scan.cuh::InplaceInclusiveScan`. The within-plane
+/// segment uses `plane_inclusive_sum` / `plane_exclusive_sum`, so the wave-level
+/// prefix is expressed through CubeCL plane ops with NO warp/wave-size literal in
+/// any stride (D-09 / D-7.1-08): the plane width is `PLANE_DIM` and the carry
+/// stride loop runs over the per-plane count derived from `CUBE_DIM_X` / `PLANE_DIM`.
+///
+/// SCOPE (RESEARCH Open Q2): this kernel is correct WITHIN a single cube
+/// (N ≤ CUBE_DIM — exactly one plane on wave32 gfx1100, where the cross-plane
+/// carry collapses to the identity). The CROSS-CUBE carry (adding each cube's
+/// running offset to the next) is NOT performed here and is the first forward
+/// dependency for 7.2/7.3 (documented in the Plan-02 SUMMARY — NOT a silent scope
+/// cut). The launch helper [`crate::gpu_runtime::launch_block_scan_f64`] and the
+/// `kernels::scan` oracle therefore exercise N ≤ CUBE_DIM.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float — no hard-coded float type).
+/// `SharedMemory::new` SIZE is the comptime [`BLOCK_REDUCE_SHMEM`] `usize` const
+/// (Pitfall 3 — a runtime/topology size will not compile); it holds one slot per
+/// plane (an upper bound at CUBE_DIM units). Uses the if-as-STATEMENT pattern only
+/// (CubeCL conditionals manual — never if-as-expression).
+#[cube(launch)]
+pub fn block_scan_kernel<F: Float>(
+    input: &Array<F>,
+    output: &mut Array<F>,
+    #[comptime] inclusive: bool,
+) {
+    let tid = UNIT_POS;
+
+    // Load this unit's element, zero-padding idle out-of-range lanes
+    // (if-as-STATEMENT: init to 0, overwrite inside the bounds guard, T-7.1-01).
+    let mut val = F::new(0.0);
+    if ABSOLUTE_POS < input.len() {
+        val = input[ABSOLUTE_POS];
+    }
+
+    // 1) Within-plane prefix via wave-agnostic plane ops (width = PLANE_DIM, never
+    //    a literal). `scanned` is this unit's prefix WITHIN its own plane; `incl`
+    //    is the plane-inclusive prefix (always includes self), used both to derive
+    //    each plane's total and — for the exclusive request — to recover the
+    //    inclusive value needed to seed the per-plane partial.
+    let scanned_in_plane = plane_inclusive_sum(val);
+    let mut scanned = scanned_in_plane;
+    if !inclusive {
+        scanned = plane_exclusive_sum(val);
+    }
+
+    // 2) Cross-plane carry (Hillis-Steele over per-plane inclusive totals — the
+    //    `InplaceInclusiveScan` structure). The LAST unit of each plane holds that
+    //    plane's inclusive total (`scanned_in_plane`); write it into a per-plane
+    //    shared slot keyed by PLANE_POS.
+    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
+        partials[PLANE_POS as usize] = scanned_in_plane;
+    }
+    sync_cube();
+
+    // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on wave32
+    // at CUBE_DIM 32 — the carry below then adds nothing). The stride loop derives
+    // its bound from CUBE_DIM_X / PLANE_DIM, NOT a literal 32/64 (D-09).
+    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+
+    // Hillis-Steele INCLUSIVE scan over the per-plane partials (mirrors
+    // `inplace_scan.cuh`'s `val += data[tid - s]`, `s = 1,2,4,…`, `sync_cube()`
+    // between stages). Only the first `num_planes` slots participate; one unit
+    // (tid == its plane index) owns each slot.
+    let mut s = 1u32;
+    while s < num_planes {
+        let mut add = F::new(0.0);
+        // tid drives a slot iff tid < num_planes and tid >= s.
+        if tid < num_planes {
+            if tid >= s {
+                add = partials[(tid - s) as usize];
+            }
+        }
+        sync_cube();
+        if tid < num_planes {
+            if tid >= s {
+                partials[tid as usize] += add;
+            }
+        }
+        sync_cube();
+        s *= 2u32;
+    }
+
+    // 3) Each plane's EXCLUSIVE carry = inclusive-scan of partials, shifted by one
+    //    plane (carry for plane p = sum of all strictly-prior planes' totals).
+    //    PLANE_POS == 0 has zero carry; otherwise carry = partials[PLANE_POS - 1].
+    let mut carry = F::new(0.0);
+    if PLANE_POS >= 1u32 {
+        carry = partials[(PLANE_POS - 1u32) as usize];
+    }
+    sync_cube();
+
+    let result = scanned + carry;
+    if ABSOLUTE_POS < input.len() {
+        output[ABSOLUTE_POS] = result;
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -650,6 +758,14 @@ mod gradient;
 // so it builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod reduce;
+
+// Block-scan primitive oracle (source/test separation): the inclusive/exclusive
+// prefix-sum self-oracle vs a Rust CPU prefix-sum lives in `kernels/scan.rs`,
+// mounted at `kernels::scan` so `cargo test -p cb-backend ... kernels::scan`
+// selects it (GPU-01 scan). Runs over the generic `SelectedRuntime`, so it
+// builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
+#[cfg(test)]
+mod scan;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
