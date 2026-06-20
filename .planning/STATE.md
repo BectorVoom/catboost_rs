@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: 07.6-02 COMPLETE — GPU-06 ε=1e-4 signed off + GPU-03 gate closed (Phase 7 umbrella closed)
-last_updated: "2026-06-21T00:00:00.000Z"
-last_activity: 2026-06-21 -- 07.6-02 COMPLETE (GPU-03/06 closed)
+status: completed
+stopped_at: "07.6-02 COMPLETE (commit a6d65e1 Task 3) — GPU-06 epsilon SIGNED OFF + GPU-03 rocm gate CLOSED; the Phase 7 umbrella's last two open requirements close. User signed off **ε=1e-4** (vs the Rust CPU path, D-04 — one clean order looser than the CPU 1e-5 bar, ~5 orders above the global observed max divergence of 7.451e-9 from the score_split family; every other measured family bit-exact 0.000e0; 3σ run-to-run variance = 0.0). NEW `07.6-GPU-TOLERANCE.md` (150 lines) records: signed-off ε + derivation (roundUp over observed_max+3σ, D-7.6-04) + the deliberately-preserved bit-exact-vs-conservative tension (D-04 mandates looser-than-1e-5 despite ~bit-exact observations: headroom for unmeasured losses / atomic contention / wave64); vs-Rust-CPU-path-NOT-C++-oracle framing (D-04); wave32-native scope on gfx1100 + explicit wave64 (CDNA/MI) gap NOT closed (D-09); rocm-only/never-CI gate policy (D-06) + authoritative `cargo test -p cb-backend --no-default-features --features rocm`, wgpu/cuda compile-gated stubs (D-07); single-global-ε-is-the-gate per-family evidence table (D-7.6-03) incl. end-to-end leaf-value rows (7.5 REPORTED → now SIGNED OFF). Tasks 1+2 (blocking-human checkpoints) discharged by orchestrator/human IN-ENV before this continuation: rocm suite **75 passed / 0 failed** on gfx1100, wgpu+cuda build RC=0, stale rocm CI step REMOVED this session (commit 70a046d), no `features rocm` under `.github/`. A verifier subagent has NO GPU → the rocm run + epsilon sign-off are orchestrator/human-discharged, NOT by a subagent (D-06). REQUIREMENTS GPU-03 → Complete (Phase 7.6); GPU-06 → Complete, ε=1e-4, vs Rust CPU path. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: Phase 7.6 verification / Phase 7 umbrella close-out. Resume file: .planning/phases/07.6-gpu-tolerance-rocm-validation-sign-off/07.6-02-SUMMARY.md."
+last_updated: "2026-06-20T22:31:55.859Z"
+last_activity: 2026-06-20
 progress:
   total_phases: 20
-  completed_phases: 16
+  completed_phases: 17
   total_plans: 113
   completed_plans: 113
-  percent: 81
+  percent: 85
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 7.6 (gpu-tolerance-rocm-validation-sign-off) — ALL PLANS COMPLETE (pending phase verification)
-Plan: 2 of 2 — COMPLETE
+Phase: 8
+Plan: Not started
 Status: Phase 7.6 plans done; GPU-03/GPU-06 closed, Phase 7 umbrella closed
-Last activity: 2026-06-21 -- 07.6-02 COMPLETE (GPU-06 ε=1e-4 signed off; GPU-03 rocm gate closed)
+Last activity: 2026-06-20
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -36,7 +36,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 **Velocity:**
 
-- Total plans completed: 55
+- Total plans completed: 57
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -55,6 +55,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | 7.4 | 3 | ~45 min | ~15 min |
 | 07.4 | 5 | - | - |
 | 07.5 | 6 | - | - |
+| 7.6 | 2 | - | - |
 
 **Recent Trend:**
 
