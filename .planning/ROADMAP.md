@@ -567,7 +567,7 @@ Plans:
 **Plans**: 2 plans (2 waves)
 **Wave 1**
 
-- [ ] 07.1-01-PLAN.md — Wire all four `SelectedRuntime` arms + re-pin cubecl-hip-sys + per-backend cubecl feature map; block_reduce_kernel + launch_block_reduce_f64 + rocm reduce self-oracle (GPU-02/04/05, GPU-01 reduce)
+- [x] 07.1-01-PLAN.md — Wire all four `SelectedRuntime` arms + re-pin cubecl-hip-sys + per-backend cubecl feature map; block_reduce_kernel + launch_block_reduce_f64 + rocm reduce self-oracle (GPU-02/04/05, GPU-01 reduce)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 

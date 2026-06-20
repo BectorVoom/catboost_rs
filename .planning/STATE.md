@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 7.1 context gathered
-last_updated: "2026-06-20T01:46:11.155Z"
-last_activity: "2026-06-19 - 260619-cpr per-stage residual: rebuilt the instrumented catboost trainer and found the DEFINITIVE root cause — upstream KNN estimated-feature calcer is ONLINE HNSW (approximate), Rust is brute-force-exact (A2/D-05). Disproved the boosting-loop/cycling hypothesis (fold_count=1; single online-over-S column); reverted that machinery (suite green). Blocker = port library/cpp/online_hnsw (~936 LOC). Todo + STATE updated; no production code change."
+last_updated: "2026-06-20T02:59:58.636Z"
+last_activity: 2026-06-20 -- Phase 07.1 execution started
 progress:
   total_phases: 20
   completed_phases: 11
-  total_plans: 91
-  completed_plans: 91
+  total_plans: 93
+  completed_plans: 92
   percent: 55
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 06.6 — advanced-features-and-non-symmetric-trees
+**Current focus:** Phase 07.1 — gpu-backend-runtime-device-primitives
 
 ## Current Position
 
-Phase: 07
-Plan: Not started
+Phase: 07.1 (gpu-backend-runtime-device-primitives) — EXECUTING
+Plan: 2 of 2
 Status: Ready to execute
-Last activity: 2026-06-19 - 260619-cpr per-stage residual: rebuilt the instrumented catboost trainer and found the DEFINITIVE root cause — upstream KNN estimated-feature calcer is ONLINE HNSW (approximate), Rust is brute-force-exact (A2/D-05). Disproved the boosting-loop/cycling hypothesis (fold_count=1; single online-over-S column); reverted that machinery (suite green). Blocker = port library/cpp/online_hnsw (~936 LOC). Todo + STATE updated; no production code change.
+Last activity: 2026-06-20 -- Phase 07.1 execution started
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -133,6 +133,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.6 P06 | ~40min | 2 tasks | 15 files |
 | Phase 06.6 P07 | 70min | 2 tasks | 17 files |
 | Phase 06.6 P08 | 35min | 2 tasks | 9 files |
+| Phase 07.1 P01 | 1h 8m | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -287,6 +288,8 @@ Recent decisions affecting current work:
 - [Phase 06.6]: 06.6-07: SAGE seed-match infeasible in scope -> deterministic structural surrogate per D-6.6-11 fallback (b); value oracle deferred
 - [Phase ?]: 06.6-08: select_features (FEAT-05) recursive-elimination loop in cb-train source consumes cb-model importances via an injected ImportanceRanker callback to avoid the cb-model->cb-train build-graph cycle (D-6.6-03 modules over crates); oracle injects the real shap_values/prediction_values_change as cycle-exempt dev-deps
 - [Phase ?]: 06.6-08: feature_selection partition oracle is DISCRETE set/order equality; ShapValues + PVC backends both selected={0,1} eliminated=[2,3] vs catboost 1.2.10
+- [Phase ?]: 07.1-01: GPU SelectedRuntime arms wired (wgpu/cuda/rocm -> WgpuRuntime/CudaRuntime/HipRuntime); cpu-free rocm build via cb-backend feature->cubecl facade mapping; cubecl-hip-sys re-pinned =7.1.5280200
+- [Phase ?]: 07.1-01: block_reduce_kernel ships atomic-free finalize (host cb-core::sum_f64 over per-cube partials); atomic-finalize + block_scan deferred to Plan 02. rocm oracle green on gfx1100, max rel_div 9.6e-14 (reported, not GPU-06-signed-off)
 
 ### Pending Todos
 
@@ -334,7 +337,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T01:20:48.788Z
+Last session: 2026-06-20T02:59:41.019Z
 Stopped at: Phase 7.1 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
