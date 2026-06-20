@@ -1853,9 +1853,14 @@ pub fn find_optimal_split_kernel<F: Float>(
     let lambda = scaled_l2[0usize];
 
     // The minimal-score sentinel any finite candidate must beat (the
-    // `score.rs::MINIMAL_SCORE` = f64::lowest() analogue). `f32::MIN` is well below any
-    // realistic L2 score and is representable in both the f32 (wgpu) and f64 channels.
-    let minimal_score = F::new(f32::MIN);
+    // `score.rs::MINIMAL_SCORE` = `f64::NEG_INFINITY` analogue). It MUST be `-inf`, not
+    // the finite `f32::MIN` (WR-01): L2/Cosine scores are >=0 so any finite seed works,
+    // but SolarL2/LOOL2/SatL2 produce strictly NEGATIVE terms and a candidate more
+    // negative than `f32::MIN` would fail `score > my_gain`, keep `my_idx = n_candidates`,
+    // and be discarded by the host — a device-vs-CPU argmin disagreement. `-inf` casts to
+    // `-inf` in both the f32 (wgpu) and f64 channels, so EVERY finite candidate wins on
+    // the first strict-greater compare, matching the CPU oracle's `f64::NEG_INFINITY`.
+    let minimal_score = F::new(f32::NEG_INFINITY);
 
     // This thread's running best over the candidates it strides through. `best_c` is the
     // candidate index (== feature * n_bins + bin); ties keep the LOWER index, so seed it
@@ -2567,9 +2572,13 @@ pub fn select_best_split_kernel<F: Float>(
     let n_candidates_usize = n_candidates as usize;
 
     // The minimal-score sentinel any finite candidate must beat (the
-    // `score.rs::MINIMAL_SCORE` analogue). `f32::MIN` is well below any realistic
-    // pairwise score and is representable in both the f32 (wgpu) and f64 channels.
-    let minimal_score = F::new(f32::MIN);
+    // `score.rs::MINIMAL_SCORE` = `f64::NEG_INFINITY` analogue). It MUST be `-inf`, not
+    // the finite `f32::MIN` (WR-01): a pairwise candidate score more negative than
+    // `f32::MIN` would fail `g > my_gain`, keep `my_idx = n_candidates`, and be discarded
+    // by the host — a device-vs-CPU argmin disagreement. `-inf` casts to `-inf` in both
+    // the f32 (wgpu) and f64 channels, so EVERY finite candidate wins on the first
+    // strict-greater compare, matching the CPU oracle's `f64::NEG_INFINITY`.
+    let minimal_score = F::new(f32::NEG_INFINITY);
 
     // This thread's running best over the candidates it strides through. `my_idx` is the
     // candidate index; ties keep the LOWER index, so seed it to the max so any real
