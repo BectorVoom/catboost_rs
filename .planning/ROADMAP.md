@@ -29,7 +29,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 7.1: GPU Backend Runtime & Device Primitives** - GPU-02/04/05 + GPU-01 scan/reductions; cfg-gated `SelectedRuntime`, device memory, wave-agnostic scan/reduction primitives (completed 2026-06-20)
   - [x] **Phase 7.2: On-Device Gradient/Hessian & Targets** - GPU-01 grad/hess; port `targets/` derivative computation device-resident (completed 2026-06-20)
   - [x] **Phase 7.3: Pointwise Histogram Family** - GPU-01 hist; `pointwise_hist2_*` incl. 5/6/7/8-bit, half-byte, binary variants (completed 2026-06-20)
-  - [ ] **Phase 7.4: Pairwise Histogram Family** - GPU-01 hist; `pairwise_hist_*` incl. 8-bit atomics and one-hot variants
+  - [x] **Phase 7.4: Pairwise Histogram Family** - GPU-01 hist; `pairwise_hist_*` incl. 8-bit atomics and one-hot variants (completed 2026-06-20)
   - [ ] **Phase 7.5: Score/Split Selection & On-Device Tree-Grow Loop** - GPU-01 close; score calcers + split selection + full device-resident grow loop (D-05)
   - [ ] **Phase 7.6: GPU Tolerance, rocm Validation & Sign-off** - GPU-03/06; empirical epsilon vs Rust CPU path, rocm oracle gate, user sign-off
 - [ ] **Phase 8: Python Bindings, Dual API & Packaging** - PyO3 dual sklearn + CatBoost-native API, NumPy/Pandas/Arrow/Polars input, per-backend wheels
