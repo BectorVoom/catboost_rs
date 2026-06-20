@@ -588,7 +588,19 @@ Plans:
   3. Outputs stay device-resident and are consumable directly by the histogram kernels (no host fold inserted between derivatives and histograms).
   4. Validated on `rocm` (gfx1100); `cb-core`/`cb-model`/`cb-compute` unchanged.
 
-**Plans**: TBD
+**Plans**: 3 plans in 3 waves (each wave delivers an additive device-resident der vertical slice on a shared seam)
+
+**Wave 1**
+
+- [ ] 07.2-01-PLAN.md — Generalize the der launch seam over SelectedRuntime + RMSE der1/der2 device-resident handle hand-off + RMSE self-oracle on rocm (checkpoint: confirm der/weight handle contract for 7.3 first)
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 07.2-02-PLAN.md — Logloss/CrossEntropy (der1 + hessian kernel) and Quantile/MAE (parametric launch, der2≡0 handle) der families on the seam + self-oracles
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 07.2-03-PLAN.md — Focal der1/der2 (two-kernel parametric) on the seam + full-family device-residency hand-off lock + SC-4 structural assertion
 
 ### Phase 7.3: Pointwise Histogram Family
 
