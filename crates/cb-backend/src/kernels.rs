@@ -1208,7 +1208,10 @@ pub fn block_scan_kernel<F: Float>(
     if PLANE_POS >= 1u32 {
         carry = partials[(PLANE_POS - 1u32) as usize];
     }
-    sync_cube();
+    // IN-01: no post-read `sync_cube()` here — the barrier this read depends on is the
+    // trailing sync of the Hillis-Steele loop above; a barrier AFTER the read
+    // synchronizes nothing relevant to `carry` and is a needless cube-wide barrier on
+    // the scan hot path.
 
     let result = scanned + carry;
     if ABSOLUTE_POS < input.len() {
