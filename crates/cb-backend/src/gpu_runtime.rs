@@ -32,13 +32,28 @@
 //! a silent all-zero buffer that would masquerade as a valid reduction. No
 //! `unwrap`/`expect`/`panic`/indexing in this production file (workspace lints + D-13).
 
-use cubecl::features::Plane;
+use cubecl::features::{AtomicUsage, Plane};
 use cubecl::prelude::*;
 
 use cb_core::{CbError, CbResult};
 
-use crate::kernels::{block_reduce_kernel, block_scan_kernel};
+use crate::kernels::{block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel};
 use crate::SelectedRuntime;
+
+/// Which cross-cube finalize path the atomic-reduce helper actually ran. The f64
+/// in-kernel atomic add is not guaranteed on every backend (Pitfall 4 — HIP
+/// supports f32 natively, f64 is emulated/optional; wgpu needs an atomic-float
+/// extension), so the helper queries the device capability and reports the path it
+/// took rather than crashing or silently producing a wrong result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicFinalizePath {
+    /// f64 in-kernel `Atomic::fetch_add` cross-cube finalize ran (the D-03 path).
+    InKernelAtomicF64,
+    /// The device lacks f64 atomic-add; the portable Plan-01 shared-mem-partial +
+    /// host `cb-core::sum_f64` finalize ran instead (documented fallback, NOT a
+    /// silent drop).
+    HostSumFallback,
+}
 
 /// Launch geometry: threads per cube (the cube `x` dimension), shared with the
 /// `cpu_runtime.rs` launch helpers (IN-02 — one place, not repeated per helper).
@@ -159,4 +174,93 @@ pub fn launch_block_scan_f64(input: &[f64], inclusive: bool) -> CbResult<Vec<f64
         .read_one(out_handle)
         .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
     Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+}
+
+/// Does the device support f64 in-kernel atomic-add? Drives the HOST choice between
+/// the D-03 in-kernel-atomic finalize and the portable host-sum fallback (Pitfall
+/// 4). Generic over the runtime (`ComputeClient<R>` is parameterized by the
+/// `Runtime`, not its `Server`/`Channel`); mirrors the cubecl
+/// `runtime_tests/atomic.rs::supports_feature` capability query.
+fn device_supports_f64_atomic_add<R: cubecl::Runtime>(
+    client: &cubecl::client::ComputeClient<R>,
+) -> bool {
+    let ty = <Atomic<f64> as CubePrimitive>::as_type_native_unchecked();
+    client
+        .properties()
+        .atomic_type_usage(ty)
+        .contains(AtomicUsage::Add)
+}
+
+/// Reduce `input` to a SINGLE scalar sum on the compile-time [`SelectedRuntime`]
+/// using the D-03 IN-KERNEL ATOMIC finalize (D-7.1-07) — the cross-cube sum is
+/// performed on-device via `Atomic::fetch_add`, NOT by the host.
+///
+/// Returns `(sum, path)` where `path` records which finalize actually ran. When the
+/// device advertises f64 atomic-add ([`AtomicFinalizePath::InKernelAtomicF64`]) the
+/// atomic kernel runs and the cross-cube summation ORDER is non-deterministic (the
+/// accepted D-03 source of run-to-run float-order variance — T-7.1-05). When the
+/// device LACKS f64 atomic-add the helper falls back to the portable Plan-01
+/// shared-mem-partial + host `cb-core::sum_f64` finalize
+/// ([`AtomicFinalizePath::HostSumFallback`]) — a DOCUMENTED fallback, never a silent
+/// drop of the atomic variant.
+///
+/// The empty input short-circuits to `(0.0, HostSumFallback)`. A device read-back
+/// failure surfaces as [`CbError::Degenerate`] (WR-05). No
+/// `unwrap`/`expect`/`panic`/indexing in this production helper (workspace lints +
+/// D-13). The atomic path uses no wave/warp-size literal (the intra-cube fold reuses
+/// the wave-agnostic plane / `CUBE_DIM_X`-strided shared-mem reduce, D-09).
+pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFinalizePath)> {
+    let n = input.len();
+    if n == 0 {
+        return Ok((0.0, AtomicFinalizePath::HostSumFallback));
+    }
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    // Pitfall 4: if the backend lacks f64 atomic-add, take the portable host-sum
+    // fallback (the Plan-01 atomic-free path) and REPORT it — do not crash, do not
+    // silently produce a wrong result.
+    if !device_supports_f64_atomic_add(&client) {
+        let partials = launch_block_reduce_f64(input)?;
+        let sum = cb_core::sum_f64(&partials);
+        return Ok((sum, AtomicFinalizePath::HostSumFallback));
+    }
+
+    let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+
+    // The accumulator is a single f64 slot, zero-initialized so the in-kernel
+    // `fetch_add`s accumulate from 0.0 (the additive identity).
+    let acc_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64]));
+
+    let use_plane = client.features().plane.contains(Plane::Ops);
+
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    block_reduce_atomic_kernel::launch::<f64, SelectedRuntime>(
+        &client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(in_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), 1) },
+        use_plane,
+    );
+
+    let bytes = client
+        .read_one(acc_handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    let scalars = bytemuck::cast_slice::<u8, f64>(&bytes);
+    // The accumulator is length-1; surface a malformed read-back as a typed error
+    // rather than indexing (D-13 — no production indexing).
+    let sum = scalars
+        .first()
+        .copied()
+        .ok_or_else(|| CbError::Degenerate("atomic accumulator read-back was empty".to_string()))?;
+    Ok((sum, AtomicFinalizePath::InKernelAtomicF64))
 }

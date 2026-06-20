@@ -183,3 +183,71 @@ fn block_reduce_edge_cases() {
         );
     }
 }
+
+/// Atomic-finalize reduce variant (D-03 / D-7.1-07): the in-kernel `Atomic::fetch_add`
+/// cross-cube finalize must match `cb-core::sum_f64`, and — because the cross-cube
+/// summation ORDER is non-deterministic — the oracle runs it MANY times to OBSERVE
+/// and report the run-to-run variance. The reported variance / divergence is
+/// informational ONLY: the GPU-06 epsilon is signed off in Phase 7.6, NOT here.
+///
+/// This exercises [`crate::gpu_runtime::launch_block_reduce_atomic_f64`], which
+/// reports WHICH finalize ran (in-kernel f64 atomic vs the documented host-sum
+/// fallback when the backend lacks f64 atomic-add — Pitfall 4). The chosen path is
+/// printed so the SUMMARY can record it (NOT a silent omission).
+#[test]
+fn block_reduce_atomic_finalize_matches_cpu_sum_and_reports_variance() {
+    use crate::gpu_runtime::{launch_block_reduce_atomic_f64, AtomicFinalizePath};
+
+    // Multi-cube input (300 elements -> ~10 cubes at CUBE_DIM 32) so several cubes
+    // race to fetch_add into the single accumulator — the setup that exposes any
+    // cross-cube order non-determinism.
+    let input: Vec<f64> = (0..300).map(|k| ((k % 23) as f64) - 11.0 + 0.125 * (k as f64)).collect();
+    let baseline = cb_core::sum_f64(&input);
+
+    // Run the atomic finalize repeatedly and collect the device sums.
+    let runs = 32;
+    let mut sums: Vec<f64> = Vec::with_capacity(runs);
+    let mut path = AtomicFinalizePath::HostSumFallback;
+    for _ in 0..runs {
+        let (sum, p) = launch_block_reduce_atomic_f64(&input).unwrap();
+        sums.push(sum);
+        path = p;
+    }
+
+    // Observe the run-to-run spread (the D-03 non-determinism signal).
+    let mut min_sum = sums[0];
+    let mut max_sum = sums[0];
+    let mut max_abs = 0.0_f64;
+    let mut max_rel = 0.0_f64;
+    for &s in &sums {
+        min_sum = min_sum.min(s);
+        max_sum = max_sum.max(s);
+        let abs = (s - baseline).abs();
+        let rel = if baseline.abs() > 0.0 {
+            abs / baseline.abs()
+        } else {
+            abs
+        };
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+    }
+    let variance_spread = max_sum - min_sum;
+
+    println!(
+        "[reduce atomic-finalize] path={path:?} runs={runs} baseline={baseline} \
+         min={min_sum} max={max_sum} run_to_run_spread={variance_spread:.3e} \
+         REPORTED max abs_div={max_abs:.3e} max rel_div={max_rel:.3e}"
+    );
+    println!(
+        "[reduce atomic-finalize] NOTE: run-to-run spread is the accepted D-03 \
+         in-kernel-atomic non-determinism (T-7.1-05); the GPU-06 epsilon is signed \
+         off in Phase 7.6, NOT here."
+    );
+
+    // The atomic finalize must still land on the CPU baseline within a generous,
+    // run-stable bound that catches a wrong fold without pinning the GPU-06 epsilon.
+    assert!(
+        max_rel <= 1e-9 || max_abs <= 1e-9,
+        "atomic-finalize reduce diverged too far from baseline: abs={max_abs:.3e} rel={max_rel:.3e}"
+    );
+}

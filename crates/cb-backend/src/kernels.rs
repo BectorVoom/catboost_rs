@@ -634,6 +634,101 @@ pub fn block_reduce_kernel<F: Float>(
     }
 }
 
+/// Block-level sum reduction with IN-KERNEL ATOMIC FINALIZE (D-03 / D-7.1-07; the
+/// CUDA in-kernel-atomic reduction structure — Plan 02's second half of the reduce
+/// primitive). Each cube folds its `CUBE_DIM`-wide slice into ONE partial (the SAME
+/// wave-agnostic plane / shared-mem fold as [`block_reduce_kernel`]), then the
+/// cube's representative unit (`UNIT_POS == 0`) `fetch_add`s that partial into a
+/// length-1 global `Atomic<F>` accumulator (`acc[0]`). The cross-cube summation
+/// ORDER is therefore non-deterministic (the hardware schedules the cubes' atomic
+/// adds in an arbitrary order) — this matches CUDA's in-kernel atomic adds (D-03)
+/// and the resulting run-to-run float-order variance is REPORTED by the
+/// `kernels::reduce` oracle, NOT signed off here (the GPU-06 epsilon is 7.6's job —
+/// D-7.1-07).
+///
+/// This is a SIBLING kernel to [`block_reduce_kernel`]: the Plan-01 atomic-free
+/// finalize (one partial per cube + host `cb-core::sum_f64`) remains the portable
+/// DEFAULT (Pitfall 4 — f64 atomic-add may be unsupported/slow on some backends;
+/// the host gates this atomic path behind a `client.properties().atomic_type_usage`
+/// capability check and falls back to the atomic-free helper when absent —
+/// [`crate::gpu_runtime::launch_block_reduce_atomic_f64`]). Keeping it separate
+/// means the default reduce path is byte-for-byte unchanged.
+///
+/// Wave-size-agnostic (D-09): the intra-cube fold uses `plane_sum` over `PLANE_DIM`
+/// (plane path) or a `CUBE_DIM_X`-strided shared-mem tree-reduce (fallback) —
+/// NEVER a literal 32/64 in any stride. `use_plane` is the `#[comptime]` flag
+/// resolved host-side. Generic over `F: Float` (AGENTS.md generics-float). The
+/// `SharedMemory::new` SIZE is the comptime [`BLOCK_REDUCE_SHMEM`] `usize` const
+/// (Pitfall 3). Out-of-range lanes zero-padded under the `ABSOLUTE_POS <
+/// input.len()` bounds guard (T-7.1-01). if-as-STATEMENT only.
+///
+/// NOTE on `&Array<Atomic<F>>`: the atomic accumulator is bound as a length-1
+/// array; the underlying storage is plain `F`, so the host reads it back with the
+/// same `bytemuck::cast_slice::<u8, F>` path as a non-atomic buffer (cubecl
+/// `runtime_tests/atomic.rs` precedent). `fetch_add` takes `&self`, so the array is
+/// `&Array<Atomic<F>>` (the per-element atomic provides interior mutability).
+#[cube(launch)]
+pub fn block_reduce_atomic_kernel<F: Float>(
+    input: &Array<F>,
+    acc: &Array<Atomic<F>>,
+    #[comptime] use_plane: bool,
+) {
+    let tid = UNIT_POS;
+
+    // Load this unit's element, zero-padding idle out-of-range lanes (T-7.1-01).
+    let mut val = F::new(0.0);
+    if ABSOLUTE_POS < input.len() {
+        val = input[ABSOLUTE_POS];
+    }
+
+    // Intra-cube fold into a single per-cube partial held by unit 0 — identical
+    // structure to `block_reduce_kernel`, but the finalize differs (atomic add into
+    // a global accumulator instead of writing one slot per cube).
+    let mut cube_partial = F::new(0.0);
+    if use_plane {
+        let plane_total = plane_sum(val);
+        let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+        if UNIT_POS_PLANE == 0u32 {
+            partials[PLANE_POS as usize] = plane_total;
+        }
+        sync_cube();
+        if tid == 0u32 {
+            let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+            let mut sum = F::new(0.0);
+            let mut p = 0u32;
+            while p < num_planes {
+                sum += partials[p as usize];
+                p += 1u32;
+            }
+            cube_partial = sum;
+        }
+    } else {
+        let mut shared = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+        shared[tid as usize] = val;
+        sync_cube();
+        let mut s = CUBE_DIM_X / 2u32;
+        while s > 0u32 {
+            if tid < s {
+                let v = shared[(tid + s) as usize];
+                shared[tid as usize] += v;
+            }
+            sync_cube();
+            s /= 2u32;
+        }
+        if tid == 0u32 {
+            cube_partial = shared[0usize];
+        }
+    }
+
+    // In-kernel atomic finalize (D-03): the cube's representative adds its partial
+    // into the single global accumulator. The order across cubes is
+    // non-deterministic — the documented, accepted D-03 source of run-to-run
+    // float-order variance (T-7.1-05).
+    if tid == 0u32 {
+        acc[0].fetch_add(cube_partial);
+    }
+}
+
 /// Block-level inclusive/exclusive prefix-scan (the Phase-7.1 device primitive,
 /// D-7.1-06; GPU-01 scan). Each unit reads `input[ABSOLUTE_POS]` (bounds-guarded,
 /// zero-padded out-of-range) and writes the running prefix-sum to
