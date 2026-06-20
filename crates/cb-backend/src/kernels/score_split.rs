@@ -504,10 +504,13 @@ mod scan {
         // The device scan/update over the FROZEN 7.3 binSums handle must produce
         // per-(feature, bin) cumulative (Σder, Σweight) equal to the host ORDERED
         // prefix-sum (folded via sum_f64 over ascending bins) within the REPORTED
-        // bound. REPORTED, not signed off (D-7.5-05). Edge cases: n_bins=1, n_bins=2
-        // (binary family), n_bins=16 (half-byte), n_bins=CUBE_DIM=32 (the single-cube
-        // boundary, RESEARCH A1), multiple features, and the empty short-circuit
-        // (no read-back of a 0-len handle, Pitfall 3/5).
+        // bound. REPORTED, not signed off (D-7.5-05). The n_bins values are the FROZEN
+        // 7.3 FILL families that fit the single-cube scan precondition (n_bins <=
+        // CUBE_DIM = 32, RESEARCH A1): 2 (binary), 16 (half-byte), 32 (5-bit non-binary
+        // — the single-cube boundary). Larger families (64/128/256) need the cross-cube
+        // carry and are covered by the typed-error scope guard below. Plus multiple
+        // features and the empty short-circuit (no read-back of a 0-len handle,
+        // Pitfall 3/5).
         let l2 = 3.0_f64; // unused by scan; kept to mirror the score harness shape
 
         // Empty (n=0): NO launch, NO read-back of a 0-len handle. The seam returns an
@@ -528,10 +531,11 @@ mod scan {
             );
         }
 
-        // n_bins from {1, 2, 16, 32}: 1 (degenerate single border), 2 (binary), 16
-        // (half-byte), 32 (== CUBE_DIM, the single-cube scan boundary). make_score_fixture
-        // already keeps every cindex bin < n_bins.
-        for &n_bins in &[1usize, 2usize, 16usize, 32usize] {
+        // n_bins from {2, 16, 32}: 2 (binary family), 16 (half-byte family), 32 (5-bit
+        // non-binary == CUBE_DIM, the single-cube scan boundary). These are exactly the
+        // FROZEN 7.3 FILL families with n_bins <= CUBE_DIM. make_score_fixture already
+        // keeps every cindex bin < n_bins.
+        for &n_bins in &[2usize, 16usize, 32usize] {
             for &n_features in &[1usize, 3usize] {
                 for &n in &[1usize, 37usize, 1000usize] {
                     let (der1, weight, cindex, indices) =

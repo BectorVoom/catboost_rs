@@ -64,7 +64,7 @@ use crate::kernels::{
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
-    quantile_gradient_kernel, SCORE_FN_L2,
+    quantile_gradient_kernel, scan_update_pointwise_kernel, SCORE_FN_L2,
 };
 use crate::SelectedRuntime;
 
@@ -1579,6 +1579,182 @@ fn read_scores_f64(
     {
         Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
     }
+}
+
+// ===========================================================================
+// Phase 7.5 Plan B — the device-resident pointwise scan/update bridge (GPU-01
+// scan-update slice; D-7.5-03 — the `ScanPointwiseHistograms` /
+// `UpdatePointwiseHistograms` transform 7.3 explicitly deferred). It consumes the
+// FROZEN 7.3 2-channel histogram handle IN PLACE (NO host round-trip inserted at the
+// FILL->scan seam, D-7.5-03), turning per-bin (Σ der1, Σ weight) into cumulative
+// "left-of-border" leaf stats (an inclusive prefix-sum over the per-feature bin axis)
+// the Plan-A scorer consumes (`left = scan[b]`, `right = total - scan[b]`). The bulk
+// histogram never leaves the device; only the cumulative result is read back ONCE as
+// the self-oracle observation (the analog of the histogram oracle reading binSums
+// back once). Cross-oracled in `kernels/score_split.rs::scan` against the host ordered
+// `sum_f64` prefix reference. SCOPE: n_bins <= CUBE_DIM (single-cube scan
+// precondition); n_bins > CUBE_DIM surfaces a typed error (the EXPLICIT tracked
+// cross-cube-carry forward dependency, RESEARCH A1 / Open Q1).
+// ===========================================================================
+
+/// Fill the FROZEN 7.3 device-resident 2-channel histogram, then run the
+/// device-resident **scan/update** that turns it into cumulative "left-of-border"
+/// leaf stats, returning the cumulative buffer as a host `Vec<f64>` (the self-oracle
+/// observation, length `n_features * n_bins * 2`, flat `(feature * n_bins + bin) * 2 +
+/// channel` order — the SAME FROZEN layout the histogram uses).
+///
+/// The histogram is filled with [`launch_pointwise_hist2_into`] (the FROZEN 7.3 seam)
+/// and the `binSums` Handle is consumed IN PLACE by [`scan_update_pointwise_kernel`] —
+/// the bulk histogram NEVER crosses to the host at the FILL->scan seam (D-7.5-03 /
+/// D-05). For each feature `f`, channel `c`, border `b` the output cell holds the
+/// INCLUSIVE prefix `Σ_{bin=0}^{b} binSums[(f, bin, c)]`, so a candidate at border `b`
+/// reads `left = cumulative[b]`, `right = cumulative[n_bins - 1] - cumulative[b]`.
+///
+/// `der1` (UNWEIGHTED, the 7.2 seam contract) / `weight` (channel 1), length `n`;
+/// `cindex` (feature-major quantized bins), length `n_features * n`; `indices` (object
+/// visiting order), length `n`; `n_bins` is the per-feature border count.
+///
+/// Empty input (`n == 0` / `n_features == 0` / `n_bins == 0`) short-circuits to
+/// `Vec::new()` with NO launch and NO read-back of a 0-length handle (Pitfall 3/5).
+/// Mismatched input lengths / out-of-range bin/object values surface a typed
+/// [`CbError`] BEFORE launch (the FROZEN 7.3 guards in `launch_pointwise_hist2_into`).
+///
+/// SCOPE GUARD (RESEARCH A1 / Open Q1): `n_bins > CUBE_DIM` surfaces a typed
+/// [`CbError::OutOfRange`] — the single-cube `scan_update_pointwise_kernel` (which
+/// reuses `block_scan_kernel`) cannot carry across cubes, and the cross-cube carry for
+/// 8-bit (256-bin) features is the EXPLICIT tracked forward dependency (recorded in the
+/// 07.5-02 SUMMARY — NOT a silent truncation). No `unwrap`/`expect`/`panic`/indexing in
+/// this production helper (workspace lints + D-13).
+pub fn launch_scan_update_pointwise(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Vec<f64>> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_scan_update_pointwise_into(&client, der1, weight, cindex, indices, n_bins, n_features)
+}
+
+/// The ONE scan/update launch geometry (the histogram-seam IN-02 precedent — one
+/// place). Fills the device histogram, launches the scan/update kernel consuming that
+/// handle IN PLACE, and reads back the cumulative buffer. The caller owns the `client`
+/// lifecycle so the read-back uses the SAME client that allocated the handles (a CubeCL
+/// Handle is bound to its originating client — see [`launch_der_binary_into`]).
+fn launch_scan_update_pointwise_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Vec<f64>> {
+    let n = der1.len();
+
+    // Empty short-circuit FIRST (Pitfall 3/5): no histogram, no launch, no 0-len read.
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(Vec::new());
+    }
+
+    // SCOPE GUARD (RESEARCH A1 / Open Q1): the single-cube scan_update_pointwise_kernel
+    // (reusing block_scan_kernel) is correct only for n_bins <= CUBE_DIM. Launching it
+    // for n_bins > CUBE_DIM would scan only the first CUBE_DIM bins per (feature,
+    // channel) and silently return a WRONG prefix for the rest — reject with a typed
+    // error until the cross-cube carry (the tracked 7.2/7.3 forward dependency) lands.
+    if n_bins > CUBE_DIM {
+        return Err(CbError::OutOfRange(format!(
+            "launch_scan_update_pointwise supports n_bins <= {CUBE_DIM} until the \
+             cross-cube scan carry lands (RESEARCH A1 / Open Q1, the tracked 7.2/7.3 \
+             forward dependency for 8-bit/256-bin features); got n_bins = {n_bins}"
+        )));
+    }
+
+    // Cumulative-buffer length overflow guard (T-07.5-02-02): the output length and the
+    // kernel's cell index are products of caller-supplied dimensions. Reject a degenerate
+    // dimension with a typed range error BEFORE forming the product unchecked (a wrapping
+    // multiply would address the wrong cell; a debug build would panic). REUSE the FROZEN
+    // 7.3 checked length helper so the cumulative buffer matches the binSums layout exactly.
+    let cumulative_len = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize \
+             (cumulative length)"
+        ))
+    })?;
+
+    // The kernel needs n_bins as a u32 (one unit per bin within a single cube). Bound it
+    // so the cast cannot silently truncate a degenerate dimension (n_bins <= CUBE_DIM is
+    // already guaranteed above, so this never actually fails, but the guard keeps the
+    // "typed error, never truncate" contract uniform with the other seams).
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel bin axis)"))
+    })?;
+
+    // Number of (feature, channel) scan axes = n_features * HIST_CHANNELS, each scanned
+    // by ONE cube. Guard the cube-count product against overflow before the cast.
+    let num_cubes = n_features.checked_mul(HIST_CHANNELS).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * {HIST_CHANNELS} overflows usize (scan cube count)"
+        ))
+    })?;
+    let num_cubes_u32 = u32::try_from(num_cubes).map_err(|_| {
+        CbError::OutOfRange(format!("scan cube count ({num_cubes}) exceeds u32"))
+    })?;
+
+    // Fill the FROZEN 7.3 device-resident 2-channel histogram (this runs the FROZEN
+    // length / value-range guards on der1/weight/cindex/indices BEFORE any launch, and
+    // returns a device HANDLE with NO read-back). The bulk histogram stays device-resident.
+    let bin_sums = launch_pointwise_hist2_into(client, der1, weight, cindex, indices, n_bins, n_features)?;
+
+    // Launch geometry: ONE cube of CUBE_DIM units per (feature, channel) scan axis. The
+    // kernel decodes feature = CUBE_POS / 2, channel = CUBE_POS % 2, and scans n_bins
+    // (<= CUBE_DIM) bins via the single-cube block-scan mechanism.
+    let count = CubeCount::Static(num_cubes_u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The cumulative output buffer matches the FROZEN binSums layout / channel float
+    // type: f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1) — read back and UPCAST to
+    // f64 via read_binsums_f64. Zero-initialised (the kernel writes every real bin cell).
+    #[cfg(feature = "wgpu")]
+    let cumulative_handle = {
+        let cumulative_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; cumulative_len]));
+        scan_update_pointwise_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
+            unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
+            n_bins_u32,
+        );
+        cumulative_h
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let cumulative_handle = {
+        let cumulative_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; cumulative_len]));
+        scan_update_pointwise_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
+            unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
+            n_bins_u32,
+        );
+        cumulative_h
+    };
+
+    // Read back the cumulative buffer (UPCAST f32->f64 on wgpu, direct f64 elsewhere) via
+    // the FROZEN binSums read-back path (same layout). A read-back failure surfaces as
+    // CbError::Degenerate, never a silent zero buffer (WR-05 / T-07.5-02-04).
+    read_binsums_f64(client, cumulative_handle)
 }
 
 // ===========================================================================

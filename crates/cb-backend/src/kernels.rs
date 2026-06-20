@@ -1935,6 +1935,128 @@ pub fn find_optimal_split_kernel<F: Float>(
     }
 }
 
+/// Device-resident **scan/update** over the FROZEN 7.3 device-resident 2-channel
+/// histogram handle (GPU-01 scan-update slice, Phase 7.5 Plan B; D-7.5-03 — the
+/// `ScanPointwiseHistograms` / `UpdatePointwiseHistograms` transform 7.3 deferred).
+///
+/// It turns the per-bin `(Σ der1, Σ weight)` histogram into cumulative
+/// "left-of-border" leaf stats: for each feature `f`, channel `c`, and border `b`,
+/// `cumulative[(f * n_bins + b) * 2 + c] = Σ_{bin = 0}^{b} bin_sums[(f, bin, c)]`
+/// (an INCLUSIVE prefix-sum over the per-feature bin axis). A candidate split at
+/// border `b` then reads `left = cumulative[b]`, `right = cumulative[n_bins - 1] -
+/// cumulative[b]` — the upstream `FindOptimalSplitSingleFoldImpl` convention
+/// (`pointwise_scores.cu:259-263`, `weightRight = part.Weight - weightLeft`). The
+/// output is therefore directly consumable by the Plan-A scorer.
+///
+/// # Launch geometry / reuse of the block-scan mechanism
+///
+/// ONE cube per `(feature, channel)` pair: `CUBE_POS` decodes `feature = CUBE_POS /
+/// 2`, `channel = CUBE_POS % 2`. Within the cube each unit `UNIT_POS` owns one bin
+/// `0..n_bins` and reads that bin's channel value from the FROZEN 2-channel layout
+/// `(feature * n_bins + bin) * 2 + channel`. The prefix-sum itself REUSES the exact
+/// wave-agnostic single-cube scan mechanism of [`block_scan_kernel`] VERBATIM (the
+/// within-plane `plane_inclusive_sum` + the Hillis-Steele cross-plane carry over
+/// per-plane partials), so the bin axis is scanned with NO hand-rolled scan and NO
+/// warp/wave-size literal in any stride (D-09 — strides derive from `CUBE_DIM_X` /
+/// `PLANE_DIM`). The `#[comptime] inclusive` flag is fixed to `true` here (the
+/// "left of and INCLUDING border b" cumulative the scorer needs).
+///
+/// # SCOPE (RESEARCH A1 / Open Q1) — single-cube precondition
+///
+/// Like the underlying `block_scan_kernel`, this is correct only for `n_bins <=
+/// CUBE_DIM` (exactly one plane on wave32 gfx1100, where the cross-plane carry
+/// collapses to the identity). The CROSS-CUBE carry for `n_bins > CUBE_DIM` (8-bit,
+/// 256-bin features) is NOT performed here; the host seam
+/// [`crate::gpu_runtime::launch_scan_update_pointwise`] enforces the precondition
+/// with a typed error (the EXPLICIT tracked forward dependency — NOT a silent cut).
+///
+/// Generic over `F: Float` (AGENTS.md generics-float). Every device read/write is
+/// under a POSITION bounds guard. if-as-STATEMENT only (CubeCL conditionals manual).
+#[cube(launch)]
+pub fn scan_update_pointwise_kernel<F: Float>(
+    bin_sums: &Array<F>,
+    cumulative: &mut Array<F>,
+    n_bins: u32,
+) {
+    let tid = UNIT_POS;
+    let n_bins_usize = n_bins as usize;
+
+    // Decode which (feature, channel) axis this cube scans. Two channels per feature
+    // (channel 0 = Σ der1, channel 1 = Σ weight), so cube `k` handles feature `k / 2`,
+    // channel `k % 2`. The flat cell index in the FROZEN 2-channel layout is
+    // `(feature * n_bins + bin) * 2 + channel`.
+    let feature = CUBE_POS / 2usize;
+    let channel = CUBE_POS % 2usize;
+
+    // Load this unit's bin value for the (feature, channel) axis, zero-padding idle
+    // out-of-range lanes (this cube has CUBE_DIM units; only the first n_bins own a
+    // bin). if-as-STATEMENT: init to 0, overwrite inside the bounds guard.
+    let mut val = F::new(0.0);
+    if tid < n_bins {
+        let cell = (feature * n_bins_usize + tid as usize) * 2usize + channel;
+        if cell < bin_sums.len() {
+            val = bin_sums[cell];
+        }
+    }
+
+    // --- Inclusive prefix-sum over the bin axis, REUSING the block_scan_kernel
+    //     mechanism VERBATIM (within-plane plane scan + Hillis-Steele cross-plane
+    //     carry over per-plane partials). inclusive = true (cumulative includes self).
+
+    // 1) Within-plane inclusive prefix (width = PLANE_DIM, never a literal).
+    let scanned_in_plane = plane_inclusive_sum(val);
+    let scanned = scanned_in_plane;
+
+    // 2) Cross-plane carry: the LAST unit of each plane writes that plane's inclusive
+    //    total into a per-plane shared slot keyed by PLANE_POS.
+    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
+        partials[PLANE_POS as usize] = scanned_in_plane;
+    }
+    sync_cube();
+
+    // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on wave32 at
+    // CUBE_DIM 32 — the carry below then adds nothing). The stride bound derives from
+    // CUBE_DIM_X / PLANE_DIM, NOT a literal 32/64 (D-09).
+    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+
+    // Hillis-Steele inclusive scan over the per-plane partials.
+    let mut s = 1u32;
+    while s < num_planes {
+        let mut add = F::new(0.0);
+        if tid < num_planes {
+            if tid >= s {
+                add = partials[(tid - s) as usize];
+            }
+        }
+        sync_cube();
+        if tid < num_planes {
+            if tid >= s {
+                partials[tid as usize] += add;
+            }
+        }
+        sync_cube();
+        s *= 2u32;
+    }
+
+    // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
+    let mut carry = F::new(0.0);
+    if PLANE_POS >= 1u32 {
+        carry = partials[(PLANE_POS - 1u32) as usize];
+    }
+
+    let result = scanned + carry;
+
+    // Write the inclusive cumulative for this (feature, channel, bin) back into the
+    // FROZEN 2-channel layout (only the n_bins real bins; idle lanes write nothing).
+    if tid < n_bins {
+        let out_cell = (feature * n_bins_usize + tid as usize) * 2usize + channel;
+        if out_cell < cumulative.len() {
+            cumulative[out_cell] = result;
+        }
+    }
+}
+
 #[cfg(test)]
 mod gradient_gpu;
 
