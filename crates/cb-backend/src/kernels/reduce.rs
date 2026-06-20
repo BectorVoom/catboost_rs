@@ -17,7 +17,7 @@
 use cubecl::features::Plane;
 use cubecl::prelude::*;
 
-use crate::kernels::block_reduce_kernel;
+use crate::kernels::{block_reduce_atomic_kernel, block_reduce_kernel};
 
 /// Launch `block_reduce_kernel::<F>` on the selected runtime and read back the
 /// per-cube partial sums. `use_plane` is passed explicitly so a test can drive
@@ -50,6 +50,45 @@ where
 
     let bytes = client.read_one(out_handle).unwrap();
     bytemuck::cast_slice::<u8, F>(&bytes).to_vec()
+}
+
+/// Launch `block_reduce_atomic_kernel::<F>` DIRECTLY on the selected runtime and
+/// read back the single in-kernel `Atomic::fetch_add` accumulator (WR-01). This
+/// bypasses the capability gate in
+/// [`crate::gpu_runtime::launch_block_reduce_atomic_f64`] (which routes to the
+/// host-sum fallback whenever the device does not ADVERTISE f64 atomic-add) so the
+/// atomic kernel is actually executed on gfx1100 — where HIP runs f64 atomics even
+/// though it does not advertise them. `use_plane` selects the intra-cube fold path
+/// exactly as `run_reduce` does for the non-atomic kernel.
+fn run_atomic_reduce<F>(input: &[F], use_plane: bool) -> F
+where
+    F: Float + CubeElement + bytemuck::Pod,
+{
+    let n = input.len();
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+
+    let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    let num_cubes = n.div_ceil(32usize).max(1);
+    // Zero-initialized length-1 accumulator: the in-kernel `fetch_add`s accumulate
+    // from the additive identity.
+    let acc_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![F::new(0.0)]));
+
+    block_reduce_atomic_kernel::launch::<F, crate::SelectedRuntime>(
+        &client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim {
+            x: 32u32,
+            y: 1,
+            z: 1,
+        },
+        unsafe { ArrayArg::from_raw_parts(in_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), 1) },
+        use_plane,
+    );
+
+    let bytes = client.read_one(acc_handle).unwrap();
+    bytemuck::cast_slice::<u8, F>(&bytes)[0]
 }
 
 /// Does the selected runtime's device advertise plane (subgroup) ops? Drives which
@@ -250,4 +289,56 @@ fn block_reduce_atomic_finalize_matches_cpu_sum_and_reports_variance() {
         max_rel <= 1e-9 || max_abs <= 1e-9,
         "atomic-finalize reduce diverged too far from baseline: abs={max_abs:.3e} rel={max_rel:.3e}"
     );
+}
+
+/// Drive `block_reduce_atomic_kernel` DIRECTLY (WR-01), bypassing the capability
+/// gate that routes the production helper to the host-sum fallback on gfx1100
+/// (where HIP does not ADVERTISE f64 atomic-add but DOES run it). This is the test
+/// that actually EXERCISES the in-kernel `acc[0].fetch_add(cube_partial)` cross-cube
+/// finalize — the headline deliverable of commit 4916c8e — on the in-env hardware,
+/// regardless of the advertised capability. Without this, the gated oracle takes the
+/// deterministic host-sum branch and the atomic kernel is never launched in-env.
+#[test]
+fn block_reduce_atomic_kernel_direct_matches_cpu_sum() {
+    // Multi-cube input (300 elements -> ~10 cubes at CUBE_DIM 32) so several cubes
+    // race to fetch_add into the single accumulator — the setup that drives the
+    // cross-cube atomic finalize.
+    let input: Vec<f64> = (0..300).map(|k| ((k % 23) as f64) - 11.0 + 0.125 * (k as f64)).collect();
+    let baseline = cb_core::sum_f64(&input);
+
+    let has_plane = device_has_plane();
+    let mut paths: Vec<bool> = vec![false];
+    if has_plane {
+        paths.push(true);
+    }
+
+    // Run the atomic kernel repeatedly so the run-to-run spread (the D-03 cross-cube
+    // order non-determinism) is observed on the path that ACTUALLY launches the
+    // kernel, not the host-sum fallback.
+    let runs = 32;
+    for &use_plane in &paths {
+        let mut min_sum = f64::INFINITY;
+        let mut max_sum = f64::NEG_INFINITY;
+        let mut max_abs = 0.0_f64;
+        let mut max_rel = 0.0_f64;
+        for _ in 0..runs {
+            let sum = run_atomic_reduce(&input, use_plane);
+            min_sum = min_sum.min(sum);
+            max_sum = max_sum.max(sum);
+            let abs = (sum - baseline).abs();
+            let rel = if baseline.abs() > 0.0 { abs / baseline.abs() } else { abs };
+            max_abs = max_abs.max(abs);
+            max_rel = max_rel.max(rel);
+        }
+        let spread = max_sum - min_sum;
+        println!(
+            "[reduce atomic-kernel DIRECT] use_plane={use_plane} runs={runs} baseline={baseline} \
+             min={min_sum} max={max_sum} run_to_run_spread={spread:.3e} \
+             REPORTED max abs_div={max_abs:.3e} max rel_div={max_rel:.3e}"
+        );
+        assert!(
+            max_rel <= 1e-9 || max_abs <= 1e-9,
+            "direct atomic-kernel reduce diverged too far (use_plane={use_plane}): abs={max_abs:.3e} rel={max_rel:.3e}"
+        );
+    }
 }
