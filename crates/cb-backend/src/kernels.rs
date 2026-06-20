@@ -1048,6 +1048,124 @@ pub fn pairwise_hist_nonbinary_kernel<F: Float>(
     }
 }
 
+/// The 8-bit-atomics pairwise histogram fill — upstream's structurally DISTINCT
+/// `pairwise_hist_one_byte_8bit_atomics.cuh::ComputePairwiseHistogramOneByte8BitAtomics`
+/// family (D-7.4-02). At 8 bits a 256-bin x 4-channel histogram line does NOT fit the
+/// per-block shared-memory budget the sub-8-bit paths use, so upstream accumulates via
+/// TRUE GLOBAL ATOMICS (a per-thread `CachedBinsLeq/Ge` run flushed with global
+/// `atomicAdd`). This is kept a SEPARATE `#[cube]` symbol with a SEPARATE launch arm to
+/// preserve structural parity with upstream's separate `.cu` — even though the MVP body
+/// is exactly the non-binary kernel with `bits` fixed at 8 and `n_bins = 256`, ALWAYS
+/// using the direct per-pair global `Atomic<F>::fetch_add` the shipped 7.3 MVP already
+/// uses for every width (RESEARCH Pattern 3 / A2). Upstream's per-thread cached-bin run
+/// is a documented PERF FOLLOW-UP over the SAME atomic structure, not semantics.
+///
+/// # FROZEN 4-channel WEIGHT-ONLY layout (reused unchanged from Plan A — D-7.4-03)
+///
+/// The 8-bit family reuses the Plan A FROZEN 4-channel weight-only `binSums` layout
+/// VERBATIM (never `* 2` — Pitfall 2); the only difference from
+/// [`pairwise_hist_nonbinary_kernel`] is the comptime `n_bins = 256` (so the buffer
+/// length is `n_features * 256 * 4`) and that this family ALWAYS uses direct global
+/// atomics (the sub-8-bit shared-mem pre-reduce never applies here):
+///
+/// ```text
+/// index(feature, bin, histId) = (feature * 256 + bin) * 4 + histId,  histId in {0,1,2,3}
+/// non-one-hot, pair (b1, b2, w):  ge = (b1>=b2), gt = (b1>b2)
+///   bin b1, histId 2*ge+0 += w;   bin b1, histId 2*gt+0 += w;
+///   bin b2, histId 2*ge+1 += w;   bin b2, histId 2*gt+1 += w;
+/// ```
+///
+/// # Stride discipline (Pitfall 3) + bounds (D-09)
+///
+/// `pair_i`/`pair_j` hold OBJECT ids; the cindex stride is over OBJECTS (`n_objects`, a
+/// runtime scalar), NOT `n_pairs` — `bin = cindex[feature * n_objects + obj]`. The
+/// grid-stride is the total thread count (`CUBE_COUNT * CUBE_DIM`), never a literal
+/// 32/64 (D-09). Bin/object VALUE ranges are validated HOST-SIDE in
+/// `launch_pairwise_hist_8bit_into` (T-07.4-07/08) before launch. Generic over
+/// `F: Float` (AGENTS.md generics-float). if-as-STATEMENT only (CubeCL conditionals
+/// manual).
+#[cube(launch)]
+pub fn pairwise_hist_8bit_atomics_kernel<F: Float>(
+    pair_i: &Array<u32>,
+    pair_j: &Array<u32>,
+    pair_weight: &Array<F>,
+    cindex: &Array<u32>,
+    bin_sums: &Array<Atomic<F>>,
+    n_features: u32,
+    n_objects: u32,
+    #[comptime] one_hot: bool,
+) {
+    // n_bins fixed at 256 (the 8-bit-atomics line size — comptime). Held `usize` for the
+    // (feature, bin) index math.
+    let n_bins = comptime!(256usize);
+    // n_pairs (the loop bound) is the per-pair value count; the cindex stride is
+    // n_objects (Pitfall 3 — NEVER n_pairs).
+    let n_pairs = pair_weight.len();
+    let n_features_usize = n_features as usize;
+    let n_objects_usize = n_objects as usize;
+
+    // Grid-stride loop over PAIRS; stride = total thread count (CUBE_COUNT * CUBE_DIM)
+    // — topology-derived, never a literal 32/64 (D-09). Each unit processes pairs
+    // ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch narrower than n_pairs still
+    // covers every pair (idle-guard `p < n_pairs`).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut p = ABSOLUTE_POS;
+    while p < n_pairs {
+        let oi = pair_i[p] as usize;
+        let oj = pair_j[p] as usize;
+        let w = pair_weight[p];
+
+        let mut feature = 0usize;
+        while feature < n_features_usize {
+            // Two bins per (pair, feature): the quantized bins of the two paired objects,
+            // read RAW (range-guarded host-side). cindex stride is OBJECTS (Pitfall 3).
+            let b1 = cindex[feature * n_objects_usize + oi] as usize;
+            let b2 = cindex[feature * n_objects_usize + oj] as usize;
+
+            // Direct global atomics ALWAYS (the 8-bit line exceeds the shared-mem budget —
+            // D-7.4-02/04). The per-pair Compare -> histId channel selection is identical
+            // to the non-binary kernel. if-as-STATEMENT only.
+            let base = (feature * n_bins) * 4usize;
+            if one_hot {
+                // One-hot Compare = (bin1 == bin2). Threaded now; refined by Plan E.
+                let mut is_ge = 1usize; // predicate false (b1 != b2) -> Ge slot
+                if b1 == b2 {
+                    is_ge = 0usize;
+                }
+                let cell1 = base + b1 * 4usize + 2usize * is_ge;
+                let cell2 = base + b2 * 4usize + 2usize * is_ge + 1usize;
+                bin_sums[cell1].fetch_add(w);
+                bin_sums[cell1].fetch_add(w);
+                bin_sums[cell2].fetch_add(w);
+                bin_sums[cell2].fetch_add(w);
+            } else {
+                // Non-one-hot: ge = (b1>=b2), gt = (b1>b2). The two flag-collapsed writes
+                // per bin land in histId 2*ge+isSecondBin and 2*gt+isSecondBin.
+                let mut ge = 0usize;
+                if b1 >= b2 {
+                    ge = 1usize;
+                }
+                let mut gt = 0usize;
+                if b1 > b2 {
+                    gt = 1usize;
+                }
+                // bin b1 (isSecondBin = 0)
+                let b1_base = base + b1 * 4usize;
+                bin_sums[b1_base + 2usize * ge].fetch_add(w);
+                bin_sums[b1_base + 2usize * gt].fetch_add(w);
+                // bin b2 (isSecondBin = 1)
+                let b2_base = base + b2 * 4usize;
+                bin_sums[b2_base + 2usize * ge + 1usize].fetch_add(w);
+                bin_sums[b2_base + 2usize * gt + 1usize].fetch_add(w);
+            }
+
+            feature += 1usize;
+        }
+
+        p += stride;
+    }
+}
+
 /// Block-level sum reduction (the Phase-7.1 device primitive, D-7.1-04..09;
 /// GPU-01 reduce). Each cube folds its `CUBE_DIM`-wide slice of `input` into a
 /// SINGLE partial written to `output[CUBE_POS]`; the host finalizes the across-cube
