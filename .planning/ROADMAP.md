@@ -692,7 +692,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 07.5-01-PLAN.md — Pointwise L2 score calcer + deterministic on-device split argmin (lowest-index tie-break == select_best_candidate) over the FROZEN 7.3 handle; kernels/score_split.rs self-oracle vs cb-compute/score.rs + cb-train/tree.rs
+- [x] 07.5-01-PLAN.md — Pointwise L2 score calcer + deterministic on-device split argmin (lowest-index tie-break == select_best_candidate) over the FROZEN 7.3 handle; kernels/score_split.rs self-oracle vs cb-compute/score.rs + cb-train/tree.rs
 
 **Wave 2** *(blocked on 07.5-01)*
 
