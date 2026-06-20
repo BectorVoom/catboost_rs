@@ -26,18 +26,22 @@ use crate::gpu_runtime::{
 };
 
 /// Compare the device der (cast to f64) to the CPU baseline element-wise, returning
-/// the max abs and max rel divergence over the vector. Copied verbatim from the
-/// `kernels::scan` reporter (REPORT-not-sign-off, D-7.2-06).
+/// the max abs and max rel divergence over the vector. Matches the hardened
+/// `kernels::scan`/`kernels::reduce` reporters (IN-02/IN-03): zip the two slices so a
+/// `device.len() < baseline.len()` mismatch surfaces a clear length precondition
+/// instead of an opaque index-out-of-bounds panic (WR-03). REPORT-not-sign-off,
+/// D-7.2-06.
 fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
+    assert_eq!(
+        device.len(),
+        baseline.len(),
+        "max_divergence requires equal-length slices"
+    );
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
-    for i in 0..baseline.len() {
-        let abs = (device[i] - baseline[i]).abs();
-        let rel = if baseline[i].abs() > 0.0 {
-            abs / baseline[i].abs()
-        } else {
-            abs
-        };
+    for (&d, &b) in device.iter().zip(baseline) {
+        let abs = (d - b).abs();
+        let rel = if b.abs() > 0.0 { abs / b.abs() } else { abs };
         max_abs = max_abs.max(abs);
         max_rel = max_rel.max(rel);
     }
