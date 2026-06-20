@@ -876,3 +876,14 @@ mod scatter;
 // rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod gradient_gpu;
+
+// Device-resident 2-channel pointwise histogram self-oracle (GPU-01 histogram slice,
+// Phase 7.3): the GPU `pointwise_hist2` 8-bit non-binary fill over `SelectedRuntime`
+// vs an ORDERED host-reference 2-channel histogram (`cb-core::sum_f64` leaf->bin
+// generalization), plus the D-7.3-05 device-residency hand-off assertion, live in
+// `kernels/pointwise_hist.rs`, mounted at `kernels::pointwise_hist`. Like
+// `gradient_gpu` (and UNLIKE the cpu-only `gradient`/`scatter` spikes), it runs over
+// the generic `SelectedRuntime`, so it builds/runs under EVERY backend (the rocm
+// in-env oracle on gfx1100 + the wgpu host run + cuda compile-only).
+#[cfg(test)]
+mod pointwise_hist;
