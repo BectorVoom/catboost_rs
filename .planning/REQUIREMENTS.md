@@ -83,7 +83,7 @@
 - [ ] **GPU-03**: `rocm`/HIP backend validated on AMD hardware (wavefront-64 safe); GPU tests run on `rocm`
 - [x] **GPU-04**: `wgpu` backend for dev machines without ROCm/CUDA
 - [x] **GPU-05**: `cuda` backend — compile-gated, untested locally
-- [ ] **GPU-06**: Documented GPU tolerance — `rocm` results within a separately-stated epsilon vs the Rust CPU path (with sign-off)
+- [x] **GPU-06**: Documented GPU tolerance — `rocm` results within a separately-stated epsilon vs the Rust CPU path (with sign-off)
 
 ### Rust Public API
 
@@ -184,7 +184,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | GPU-03 | Phase 7.6 | Pending (incremental rocm validation each sub-phase; formal gate + sign-off 7.6) |
 | GPU-04 | Phase 7.1 | Complete |
 | GPU-05 | Phase 7.1 | Complete |
-| GPU-06 | Phase 7.6 | Pending |
+| GPU-06 | Phase 7.6 | Complete |
 | PYAPI-01 | Phase 8 | Pending |
 | PYAPI-02 | Phase 8 | Pending |
 | PYAPI-03 | Phase 8 | Pending |

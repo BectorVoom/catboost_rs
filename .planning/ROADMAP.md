@@ -733,7 +733,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 07.6-01-PLAN.md — GPU-06 measurement harness: new `#[cfg(test)] mod gpu_tolerance.rs` aggregating per-family divergence + N>=30 variance with stddev + observed_max+3σ + end-to-end GPU-vs-CPU leaf-value measurement (structure exact, leaf values REPORTED); emits [GPU-06 EVIDENCE] on rocm gfx1100
+- [x] 07.6-01-PLAN.md — GPU-06 measurement harness: new `#[cfg(test)] mod gpu_tolerance.rs` aggregating per-family divergence + N>=30 variance with stddev + observed_max+3σ + end-to-end GPU-vs-CPU leaf-value measurement (structure exact, leaf values REPORTED); emits [GPU-06 EVIDENCE] on rocm gfx1100
 
 **Wave 2** *(blocked on Wave 1; has human checkpoints — autonomous: false)*
 

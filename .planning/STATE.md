@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
+status: executing
 stopped_at: Phase 7.6 context gathered
-last_updated: "2026-06-20T21:57:34.049Z"
-last_activity: 2026-06-20 -- Phase 7.6 planning complete
+last_updated: "2026-06-20T22:11:04.749Z"
+last_activity: 2026-06-20 -- Phase 7.6 execution started
 progress:
   total_phases: 20
   completed_phases: 16
-  total_plans: 111
-  completed_plans: 111
+  total_plans: 113
+  completed_plans: 112
   percent: 80
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 07.5 — Score/Split Selection & On-Device Tree-Grow Loop
+**Current focus:** Phase 7.6 — gpu-tolerance-rocm-validation-sign-off
 
 ## Current Position
 
-Phase: 7.6
-Plan: Not started
-Status: 07.5-06 complete — the PAIRWISE split scorer + ranking/PairLogit grow-loop landed; STRUCTURE EXACT + score/scan/leaf bit-exact (0.000e0) on gfx1100. GPU-01 kernel surface CLOSED (all scorers L2/Cosine/Solar/LOO/Sat + pairwise + the full device-resident grow loop exist). Next: phase verification.
-Last activity: 2026-06-20 -- Phase 7.6 planning complete
+Phase: 7.6 (gpu-tolerance-rocm-validation-sign-off) — EXECUTING
+Plan: 2 of 2
+Status: Ready to execute
+Last activity: 2026-06-20 -- Phase 7.6 execution started
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -156,6 +156,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.5 P03 | 40min | 2 tasks | 3 files |
 | Phase 07.5 P04 | ~5m | 2 tasks | 2 files |
 | Phase 07.5 P05 | 6min | 2 tasks | 4 files |
+| Phase 07.6 P01 | 25 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -337,6 +338,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07.5-04: grow_boosting_pass loops grow_oblivious_tree over a Plain-boosting run, ONE client; der1 recomputed device-side via 7.2 seam read once/tree; approx updated from already-read-back leaf_of+lr-scaled leaf_values (no new bulk crossing, D-05)
 - [Phase ?]: 07.5-04: D-7.5-06 budget characterized on clear-margin fixture — per-tree structure EXACT + stable run-to-run (4x5 trees), max leaf-value div 6.6e-13, NO argmax-flip; REPORTED not signed off (7.6 owns epsilon)
 - [Phase ?]: 07.5-05: 5 device score-calcer arms (L2+Cosine/Solar/LOO/Sat) on one find_optimal_split_kernel comptime selector; transcribed verbatim from cb-compute score.rs, f64 fold; rocm gfx1100 STRUCTURE-exact every fn, scores ~2e-16 (Cosine)/0.0 (Solar/LOO/Sat)
+- [Phase ?]: 07.6-01: GPU-06 evidence harness, 6 families, score_split non-zero abs=7.451e-9, rocm 3/3 PASS gfx1100
 
 ### Pending Todos
 
@@ -384,7 +386,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T21:35:59.502Z
+Last session: 2026-06-20T22:10:52.773Z
 Stopped at: Phase 7.6 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
