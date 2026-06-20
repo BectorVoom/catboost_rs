@@ -498,6 +498,17 @@ pub fn launch_der_binary(
     target: &[f64],
     kernel: DerBinaryKernel,
 ) -> CbResult<Vec<f64>> {
+    // Validate length BEFORE the empty short-circuit so this readback wrapper and the
+    // sibling `*_into`/`*_handle` entry points agree on the malformed-input contract
+    // (WR-01): a (empty-approx, non-empty-target) input must reject, not silently
+    // return `Ok([])`. Mirrors the shape guard in `launch_der_binary_into`.
+    if target.len() != approx.len() {
+        return Err(CbError::LengthMismatch {
+            column: "target".to_owned(),
+            expected: approx.len(),
+            actual: target.len(),
+        });
+    }
     if approx.is_empty() {
         return Ok(Vec::new());
     }
@@ -810,6 +821,17 @@ pub fn launch_der_param(
     kernel: DerParamKernel,
     params: &[f64],
 ) -> CbResult<Vec<f64>> {
+    // Validate length BEFORE the empty short-circuit so this readback wrapper and the
+    // sibling `*_into`/`*_handle` entry points agree on the malformed-input contract
+    // (WR-01): a (empty-approx, non-empty-target) input must reject, not silently
+    // return `Ok([])`. Mirrors the shape guard in `launch_der_param_into`.
+    if target.len() != approx.len() {
+        return Err(CbError::LengthMismatch {
+            column: "target".to_owned(),
+            expected: approx.len(),
+            actual: target.len(),
+        });
+    }
     if approx.is_empty() {
         return Ok(Vec::new());
     }
