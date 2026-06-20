@@ -1770,6 +1770,94 @@ pub(crate) const SCORE_FN_SAT_L2: u32 = 4;
 /// is a shared-memory SIZE, NOT a wave/warp-size literal in any stride (D-09).
 pub(crate) const ARGMIN_SHMEM: usize = BLOCK_REDUCE_SHMEM;
 
+/// Per-leaf `calc_average` — the FROZEN `cb-compute/src/leaf.rs::calc_average` `count > 0`
+/// guard transcribed VERBATIM: `avg = weight > 0 ? sum / (weight + lambda) : 0`. Used by
+/// the L2 and Cosine arms of [`find_optimal_split_kernel`] (numerator avg and the Cosine
+/// denominator `avg²·weight`). Pure device helper (no runtime branch beyond the guard);
+/// inlined at JIT, so the monomorphized kernel body is byte-identical to the prior
+/// hand-inlined arms (IN-02 behavior-preserving extraction). `if`-as-statement only.
+#[cube]
+fn cb_leaf_avg<F: Float>(sum: F, w: F, lambda: F) -> F {
+    let mut avg = F::new(0.0);
+    if w > F::new(0.0) {
+        avg = sum / (w + lambda);
+    }
+    avg
+}
+
+/// The per-leaf ADDITIVE score contribution for the comptime-selected calcer (IN-02:
+/// the shared per-leaf term that replaces the five copy-pasted arms of
+/// [`find_optimal_split_kernel`]). Given ONE leaf's `(Σ der1, Σ weight)` it returns that
+/// leaf's contribution to the split score; the kernel calls it twice (left then right)
+/// and sums in the SAME left-then-right order the prior inlined arms used, so the
+/// monomorphized result is identical.
+///
+/// Each `if score_fn == comptime!(...)` is resolved at JIT (RESEARCH Pattern 1), so the
+/// caller carries NO runtime score-fn branch. Every arm is transcribed VERBATIM from the
+/// FROZEN CPU oracle `cb-compute/src/score.rs` (the citations live on the kernel doc):
+/// - L2 / Cosine: `avg·sum` where `avg = calc_average` (the Cosine numerator is the SAME
+///   `avg·sum`; the Cosine denominator is folded in the kernel via [`cb_leaf_avg`]).
+/// - SolarL2: `w > 1e-20 ? (-sum²)·(1 + 2·ln(w+1))/w : 0` (no scaled_l2).
+/// - LOOL2: `adjust = w>1 ? w/(w-1) : 0; adjust²·(-sum²)/w` guarded `w>0` (no scaled_l2).
+/// - SatL2: `adjust = w>2 ? w(w-2)/(w²-3w+1) : 0; adjust²·(-sum²)/w` guarded `w>0`.
+///
+/// `if`-as-statement only (CubeCL conditionals). Generic over `F: Float` (AGENTS.md
+/// generics-float — no hard-coded float type).
+#[cube]
+fn cb_leaf_score_term<F: Float>(sum: F, w: F, lambda: F, #[comptime] score_fn: u32) -> F {
+    let mut term = F::new(0.0);
+
+    // --- L2 / Cosine numerator: avg·sum, avg = calc_average (count>0 guard).
+    if score_fn == comptime!(SCORE_FN_L2) {
+        let avg = cb_leaf_avg::<F>(sum, w, lambda);
+        term = avg * sum;
+    }
+    if score_fn == comptime!(SCORE_FN_COSINE) {
+        let avg = cb_leaf_avg::<F>(sum, w, lambda);
+        term = avg * sum;
+    }
+
+    // --- SolarL2: weight>1e-20 ? (-sum*sum)*(1 + 2*ln(weight+1))/weight : 0. NO scaled_l2.
+    if score_fn == comptime!(SCORE_FN_SOLAR_L2) {
+        if w > F::new(1e-20) {
+            let one = F::new(1.0);
+            let two = F::new(2.0);
+            term = (-sum * sum) * (one + two * F::ln(w + one)) / w;
+        }
+    }
+
+    // --- LOOL2: adjust = weight>1 ? weight/(weight-1) : 0; adjust*=adjust;
+    //     weight>0 ? adjust*(-sum*sum)/weight : 0. NO scaled_l2.
+    if score_fn == comptime!(SCORE_FN_LOO_L2) {
+        let one = F::new(1.0);
+        let mut adjust = F::new(0.0);
+        if w > one {
+            adjust = w / (w - one);
+        }
+        adjust = adjust * adjust;
+        if w > F::new(0.0) {
+            term = adjust * (-sum * sum) / w;
+        }
+    }
+
+    // --- SatL2: adjust = weight>2 ? weight*(weight-2)/(weight²-3*weight+1) : 0;
+    //     weight>0 ? adjust*(-sum*sum)/weight : 0. NO scaled_l2.
+    if score_fn == comptime!(SCORE_FN_SAT_L2) {
+        let two = F::new(2.0);
+        let three = F::new(3.0);
+        let one = F::new(1.0);
+        let mut adjust = F::new(0.0);
+        if w > two {
+            adjust = w * (w - two) / (w * w - three * w + one);
+        }
+        if w > F::new(0.0) {
+            term = adjust * (-sum * sum) / w;
+        }
+    }
+
+    term
+}
+
 /// Device-resident **pointwise L2 split score + deterministic split argmin** over the
 /// FROZEN 7.3 device-resident 2-channel histogram handle (GPU-01 score/split slice,
 /// Phase 7.5 Plan A; D-7.5-01/05/06). The `#[comptime] score_fn` selects the score
@@ -1917,118 +2005,46 @@ pub fn find_optimal_split_kernel<F: Float>(
         // f64 device channel (D-03; f32 only on wgpu, matching the histogram channel).
         let mut score = F::new(0.0);
 
-        // --- L2 (SCORE_FN_L2): avg = count>0 ? sum/(count + scaled_l2) : 0; score += avg*sum
-        // (leaf.rs::calc_average + score.rs::add_leaf_plain/l2_split_score). The `count > 0`
-        // guard mirrors calc_average exactly (no div-by-zero / NaN).
+        // IN-02: the five copy-pasted comptime calcer arms are factored into the shared
+        // per-leaf [`cb_leaf_score_term`] (the additive leaf contribution for the
+        // comptime-selected calcer) called once per leaf in the SAME left-then-right
+        // order the prior inlined arms summed, plus — for Cosine ONLY — the seeded
+        // `avg²·weight` denominator folded here via [`cb_leaf_avg`]. The
+        // `#[comptime] score_fn` is resolved at JIT, so the monomorphized body computes
+        // the IDENTICAL value the hand-inlined arms did (behavior-preserving extraction).
+
+        // L2 numerator (== whole L2 score) / Solar / LOO / Sat (their whole score) and the
+        // Cosine NUMERATOR all reduce to `term(left) + term(right)` in left-then-right order.
+        let left_term = cb_leaf_score_term::<F>(left_sum, left_w, lambda, score_fn);
+        let right_term = cb_leaf_score_term::<F>(right_sum, right_w, lambda, score_fn);
+        let folded = left_term + right_term;
+
         if score_fn == comptime!(SCORE_FN_L2) {
-            let mut left_avg = F::new(0.0);
-            if left_w > F::new(0.0) {
-                left_avg = left_sum / (left_w + lambda);
-            }
-            let mut right_avg = F::new(0.0);
-            if right_w > F::new(0.0) {
-                right_avg = right_sum / (right_w + lambda);
-            }
-            score = left_avg * left_sum + right_avg * right_sum;
+            score = folded;
+        }
+        if score_fn == comptime!(SCORE_FN_SOLAR_L2) {
+            score = folded;
+        }
+        if score_fn == comptime!(SCORE_FN_LOO_L2) {
+            score = folded;
+        }
+        if score_fn == comptime!(SCORE_FN_SAT_L2) {
+            score = folded;
         }
 
-        // --- Cosine / NewtonCosine (SCORE_FN_COSINE): the numerator is the SAME L2 fold
-        // (Σ avg·sum), the denominator is the seeded `1e-100 + Σ avg²·weight` with the
-        // `1e-100` as the FIRST summand (score.rs:76-84, the seed-first accumulation order
-        // matching the CPU), then `score = num / sqrt(den)`. The `count > 0` (here
-        // `weight > 0`) guard mirrors calc_average. NewtonCosine reuses this VERBATIM
-        // (pointwise_scores.cu:512-521).
+        // --- Cosine / NewtonCosine (SCORE_FN_COSINE): numerator = the SAME `folded`
+        // L2 fold (Σ avg·sum); denominator = seeded `1e-100 + Σ avg²·weight` with the
+        // `1e-100` as the FIRST summand (score.rs:76-84, the seed-first accumulation
+        // order matching the CPU), then `score = num / sqrt(den)`. `avg` reuses
+        // `cb_leaf_avg` (the SAME `count>0`-guarded `calc_average`), in the SAME
+        // left-then-right leaf order, so the value is byte-identical to the prior arm.
         if score_fn == comptime!(SCORE_FN_COSINE) {
-            let mut left_avg = F::new(0.0);
-            if left_w > F::new(0.0) {
-                left_avg = left_sum / (left_w + lambda);
-            }
-            let mut right_avg = F::new(0.0);
-            if right_w > F::new(0.0) {
-                right_avg = right_sum / (right_w + lambda);
-            }
-            let numerator = left_avg * left_sum + right_avg * right_sum;
-            // Denominator: 1e-100 seed FIRST (score.rs:78), then avg²·weight per leaf in
-            // the SAME left-then-right leaf order the numerator accumulates.
+            let left_avg = cb_leaf_avg::<F>(left_sum, left_w, lambda);
+            let right_avg = cb_leaf_avg::<F>(right_sum, right_w, lambda);
             let mut denominator = F::new(1e-100);
             denominator += left_avg * left_avg * left_w;
             denominator += right_avg * right_avg * right_w;
-            score = numerator / denominator.sqrt();
-        }
-
-        // --- SolarL2 (SCORE_FN_SOLAR_L2): per-leaf
-        // `weight > 1e-20 ? (-sum*sum)*(1 + 2*ln(weight + 1))/weight : 0`
-        // (score.rs:182-197, score_calcers.cuh:22-24). NO scaled_l2 (IN-04). Summed over
-        // the two leaves in left-then-right order. `(weight + 1).ln()` transcribed exactly
-        // (NOT log1p) so the f64 fold matches the CPU.
-        if score_fn == comptime!(SCORE_FN_SOLAR_L2) {
-            let mut left_term = F::new(0.0);
-            if left_w > F::new(1e-20) {
-                let one = F::new(1.0);
-                let two = F::new(2.0);
-                left_term = (-left_sum * left_sum) * (one + two * F::ln(left_w + one)) / left_w;
-            }
-            let mut right_term = F::new(0.0);
-            if right_w > F::new(1e-20) {
-                let one = F::new(1.0);
-                let two = F::new(2.0);
-                right_term = (-right_sum * right_sum) * (one + two * F::ln(right_w + one)) / right_w;
-            }
-            score = left_term + right_term;
-        }
-
-        // --- LOOL2 (SCORE_FN_LOO_L2): per-leaf
-        // `adjust = weight>1 ? weight/(weight-1) : 0; adjust*=adjust;
-        //  weight>0 ? adjust*(-sum*sum)/weight : 0` (score.rs:202-223,
-        // score_calcers.cuh:83-87). NO scaled_l2 (IN-04). Summed over the two leaves.
-        if score_fn == comptime!(SCORE_FN_LOO_L2) {
-            let one = F::new(1.0);
-            let mut left_adjust = F::new(0.0);
-            if left_w > one {
-                left_adjust = left_w / (left_w - one);
-            }
-            left_adjust = left_adjust * left_adjust;
-            let mut left_term = F::new(0.0);
-            if left_w > F::new(0.0) {
-                left_term = left_adjust * (-left_sum * left_sum) / left_w;
-            }
-            let mut right_adjust = F::new(0.0);
-            if right_w > one {
-                right_adjust = right_w / (right_w - one);
-            }
-            right_adjust = right_adjust * right_adjust;
-            let mut right_term = F::new(0.0);
-            if right_w > F::new(0.0) {
-                right_term = right_adjust * (-right_sum * right_sum) / right_w;
-            }
-            score = left_term + right_term;
-        }
-
-        // --- SatL2 (SCORE_FN_SAT_L2): per-leaf
-        // `adjust = weight>2 ? weight*(weight-2)/(weight²-3*weight+1) : 0;
-        //  weight>0 ? adjust*(-sum*sum)/weight : 0` (score.rs:228-247,
-        // score_calcers.cuh:114-117). NO scaled_l2 (IN-04). Summed over the two leaves.
-        if score_fn == comptime!(SCORE_FN_SAT_L2) {
-            let two = F::new(2.0);
-            let three = F::new(3.0);
-            let one = F::new(1.0);
-            let mut left_adjust = F::new(0.0);
-            if left_w > two {
-                left_adjust = left_w * (left_w - two) / (left_w * left_w - three * left_w + one);
-            }
-            let mut left_term = F::new(0.0);
-            if left_w > F::new(0.0) {
-                left_term = left_adjust * (-left_sum * left_sum) / left_w;
-            }
-            let mut right_adjust = F::new(0.0);
-            if right_w > two {
-                right_adjust = right_w * (right_w - two) / (right_w * right_w - three * right_w + one);
-            }
-            let mut right_term = F::new(0.0);
-            if right_w > F::new(0.0) {
-                right_term = right_adjust * (-right_sum * right_sum) / right_w;
-            }
-            score = left_term + right_term;
+            score = folded / denominator.sqrt();
         }
 
         scores[c] = score;
