@@ -622,7 +622,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 07.3-02-PLAN.md — 5/6/7-bit non-binary via comptime `bits` on the same kernel + self-oracle
+- [x] 07.3-02-PLAN.md — 5/6/7-bit non-binary via comptime `bits` on the same kernel + self-oracle
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
