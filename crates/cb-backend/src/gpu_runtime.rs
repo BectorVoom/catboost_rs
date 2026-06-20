@@ -938,10 +938,32 @@ fn launch_pointwise_hist2_into(
             actual: indices.len(),
         });
     }
-    if cindex.len() != n_features * n {
+
+    // Overflow guards (WR-04) FIRST — before any unchecked product is formed (WR-01).
+    // The cindex stride `n_features * n` and the binSums length
+    // `n_features * n_bins * HIST_CHANNELS` are products of unbounded caller-supplied
+    // dimensions. A wrapping `usize` multiply would silently address the wrong cell (no
+    // fault, wrong histogram); a debug build would panic on multiply overflow, violating
+    // the "no panic in this production helper" contract. Reject a degenerate dimension
+    // with a typed range error BEFORE the product is ever computed unchecked, then REUSE
+    // the checked product for the length guard below (never re-multiplying) — so the
+    // "reject overflow with a typed error, never wrap" contract holds at the seam.
+    let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
+        ))
+    })?;
+    if hist2_binsums_len_checked(n_bins, n_features).is_none() {
+        return Err(CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (binSums length)"
+        )));
+    }
+
+    // Now the cindex length guard uses the already-checked product, never re-multiplying.
+    if cindex.len() != cindex_stride {
         return Err(CbError::LengthMismatch {
             column: "cindex".to_owned(),
-            expected: n_features * n,
+            expected: cindex_stride,
             actual: cindex.len(),
         });
     }
@@ -966,22 +988,6 @@ fn launch_pointwise_hist2_into(
     if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
         return Err(CbError::OutOfRange(format!(
             "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
-        )));
-    }
-
-    // Overflow guards (WR-04): the cindex stride `n_features * n` and the binSums length
-    // `n_features * n_bins * HIST_CHANNELS` are products of unbounded caller-supplied
-    // dimensions. A wrapping `usize` multiply would silently address the wrong cell (no
-    // fault, wrong histogram). Reject a degenerate dimension with a typed range error
-    // rather than wrapping — so the "no silent wrong result" contract holds at the seam.
-    if n_features.checked_mul(n).is_none() {
-        return Err(CbError::OutOfRange(format!(
-            "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
-        )));
-    }
-    if hist2_binsums_len_checked(n_bins, n_features).is_none() {
-        return Err(CbError::OutOfRange(format!(
-            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (binSums length)"
         )));
     }
 
@@ -1030,7 +1036,7 @@ fn launch_pointwise_hist2_into(
                 dim,
                 unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
                 unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                 n_features as u32,
@@ -1049,7 +1055,7 @@ fn launch_pointwise_hist2_into(
                 dim,
                 unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
                 unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                 n_features as u32,
@@ -1086,7 +1092,7 @@ fn launch_pointwise_hist2_into(
                 dim,
                 unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
                 unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                 n_features as u32,
@@ -1105,7 +1111,7 @@ fn launch_pointwise_hist2_into(
                 dim,
                 unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
                 unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                 n_features as u32,
@@ -1184,7 +1190,7 @@ fn launch_pointwise_hist2_into(
             dim,
             unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
             unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
             unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
@@ -1204,7 +1210,7 @@ fn launch_pointwise_hist2_into(
             dim,
             unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
             unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(cindex_handle, n_features * n) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
             unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
             // The atomic accumulator binds the same f64 storage as a plain buffer (the
             // `block_reduce_atomic_kernel` precedent); `clone` so the original stays
