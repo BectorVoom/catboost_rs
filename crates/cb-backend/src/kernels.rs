@@ -1269,3 +1269,16 @@ mod gradient_gpu;
 // in-env oracle on gfx1100 + the wgpu host run + cuda compile-only).
 #[cfg(test)]
 mod pointwise_hist;
+
+// Device-resident 4-channel WEIGHT-ONLY pairwise histogram self-oracle (GPU-01
+// histogram slice, Phase 7.4 — the pairwise SIBLING of `pointwise_hist`): the GPU
+// `pairwise_hist` non-binary fill (comptime `bits` in {5,6,7}) over `SelectedRuntime`
+// vs an ORDERED host-reference 4-channel pairwise histogram (`cb-core::sum_f64`
+// per-pair generalization), plus the D-7.4-03 device-residency hand-off assertion and
+// the SC-2 PairLogitPairwise fixture, live in `kernels/pairwise_hist.rs`, mounted at
+// `kernels::pairwise_hist`. Like `pointwise_hist`/`gradient_gpu` (and UNLIKE the
+// cpu-only `gradient`/`scatter` spikes), it runs over the generic `SelectedRuntime`, so
+// it builds/runs under EVERY backend (the rocm in-env oracle on gfx1100 + the wgpu host
+// run + cuda compile-only).
+#[cfg(test)]
+mod pairwise_hist;
