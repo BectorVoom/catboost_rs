@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
+status: verifying
 stopped_at: Phase 7.3 context gathered
-last_updated: "2026-06-20T08:21:00.194Z"
+last_updated: "2026-06-20T08:28:52.410Z"
 last_activity: 2026-06-20 -- Phase 07.3 execution started
 progress:
   total_phases: 20
-  completed_phases: 13
+  completed_phases: 14
   total_plans: 100
-  completed_plans: 99
-  percent: 65
+  completed_plans: 100
+  percent: 70
 ---
 
 # Project State
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 Phase: 07.3 (Pointwise Histogram Family) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-20 -- Phase 07.3 execution started
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
@@ -143,6 +143,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.3 P01 | 38min | 3 tasks | 3 files |
 | Phase 07.3 P02 | 18min | 3 tasks | 3 files |
 | Phase 07.3 P03 | 5min | 3 tasks | 3 files |
+| Phase 07.3 P04 | 2min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -308,6 +309,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07.3-01: FROZEN binSums layout (feature*n_bins+bin)*2+channel + der-handle-in/binSums-handle-out seam locked for Plans B/C/D + 7.5; histogram channel f64 on rocm/cuda/cpu, f32 on wgpu (WGSL has no f64 atomics, RESEARCH A1); MVP uses direct global Atomic fetch_add merge (shared-mem pre-reduce deferred as perf follow-up)
 - [Phase ?]: 07.3-02: one-byte non-binary hist bit-width is a host-selected #[comptime] arg (bits from n_bins {32,64,128,256}, DISPATCH_ONE_BYTE shape) on the SAME Plan A kernel — no runtime branch, FROZEN binSums seam reused
 - [Phase ?]: Half-byte (4-bit) pointwise-hist is a SEPARATE #[cube] kernel family (fixed comptime 16-bin line + 4-bit nibble decomposition), routed by an n_bins==16 host-dispatch branch into the FROZEN binSums seam, reused byte-identical (07.3-03 / D-7.3-02)
+- [Phase ?]: 07.3-04: binary (1-bit) pointwise_hist2 is a SEPARATE #[cube] kernel family (BINARY_BINS=2 + 1-bit split mask) routed by n_bins==2 dispatch into the FROZEN binSums seam; whole_family rocm assertion closes SC-1 (full pointwise_hist2 family runs on rocm through one seam)
 
 ### Pending Todos
 
@@ -355,7 +357,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T08:20:54.194Z
+Last session: 2026-06-20T08:28:40.976Z
 Stopped at: Phase 7.3 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
