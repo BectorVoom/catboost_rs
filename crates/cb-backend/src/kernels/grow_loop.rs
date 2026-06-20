@@ -498,3 +498,287 @@ mod single_tree {
         );
     }
 }
+
+// ===========================================================================
+// Multi-tree cross-oracle (Phase 7.5 Plan 04; SC-3 / D-7.5-06): run a full multi-tree
+// Plain-boosting pass device-resident via `grow_boosting_pass` and assert EVERY tree's
+// STRUCTURE (the split `(feature, bin)` sequence AND the per-object `leaf_of`) matches
+// the inline CPU multi-tree Plain-boosting reference EXACTLY across the WHOLE run (the
+// strict bar — atomic-order jitter must NOT flip a split on the clear-gain-margin
+// fixture). Per-tree leaf-value divergence vs `cb_compute::calc_average` is REPORTED
+// (NOT the GPU-06 epsilon — 7.6's job). An N-run stability check REPORTS whether per-tree
+// structure is stable run-to-run; an observed argmax-flip on a near-tie is the D-7.5-06
+// boundary to REPORT, never to sign off here.
+//
+// The CPU reference is the EXACT device convention transcribed inline (the D-7.5-04
+// boundary — do NOT import `cb-train`): start approx all-zero, per iteration der1 =
+// `target - approx` (RMSE gradient, `cb_compute::loss::rmse_der1`), grow the depth-1
+// stump via `cpu_best_stump` over der1, leaf delta `calc_average(Σder1, Σweight,
+// scaled_l2)`, leaf value `learning_rate * delta`, then `approx[i] += leaf_value[leaf(i)]`
+// (`cb_train::boosting` boosting.rs:9-16). der2 is the constant `-1.0` (folded; the L2
+// score uses Σ der1 / Σ weight, not the Newton hessian — MVP).
+// ===========================================================================
+
+mod multi_tree {
+    use super::*;
+    use crate::gpu_runtime::{grow_boosting_pass, GrownModel};
+
+    /// The per-tree L2 scaling — `cb_compute::scale_l2_reg(l2, Σweight, n)` (the SAME
+    /// scaling the device leaf-value step and the CPU reference both consume).
+    fn scaled_l2_for(weight: &[f64], n: usize, l2: f64) -> f64 {
+        let sum_w = sum_f64(weight);
+        cb_compute::scale_l2_reg(l2, sum_w, n)
+    }
+
+    /// A clear-gain-margin multi-tree REGRESSION fixture (target-based, the boosting
+    /// input — NOT the der1-based `make_fixture`). Feature 0's bins climb monotonically
+    /// with the object index AND the target ramps with the object index, so feature 0
+    /// carries a clear, stable best border every boosting iteration (the residual stays
+    /// monotone-ish in feature 0). Other features get a deterministic lower-gain spread.
+    /// Returns `(target, weight, cindex, indices)` in the FROZEN feature-major layout
+    /// (`cindex[feature * n + obj]`).
+    fn make_boosting_fixture(
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
+        // A clear monotone target ramp (centred) — feature 0's bins track it, so the
+        // greedy stump split on feature 0 is unambiguous and stable across iterations.
+        let target: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
+        let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
+        let mut cindex = vec![0u32; n_features * n];
+        for feature in 0..n_features {
+            for obj in 0..n {
+                let bin = if feature == 0 {
+                    ((obj * n_bins) / n.max(1)).min(n_bins - 1)
+                } else {
+                    (obj * (feature + 2) + feature) % n_bins
+                };
+                cindex[feature * n + obj] = bin as u32;
+            }
+        }
+        let indices: Vec<u32> = (0..n as u32).collect();
+        (target, weight, cindex, indices)
+    }
+
+    /// The CPU multi-tree Plain-boosting reference (inline transcription, NOT imported):
+    /// returns the per-tree `(split, leaf_of, leaf_values)` over the whole run, mirroring
+    /// the device `grow_boosting_pass` convention EXACTLY. Depth-1 (the MVP scope, same as
+    /// `grow_oblivious_tree`): one stump per tree.
+    fn cpu_boosting_pass(
+        target: &[f64],
+        weight: &[f64],
+        cindex: &[u32],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        iterations: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+    ) -> Vec<((usize, usize), Vec<u32>, Vec<f64>)> {
+        let mut approx = vec![0.0_f64; n];
+        let mut out: Vec<((usize, usize), Vec<u32>, Vec<f64>)> = Vec::with_capacity(iterations);
+        for _iter in 0..iterations {
+            // Residual gradient der1 = target - approx (RMSE, cb_compute::loss::rmse_der1).
+            let der1: Vec<f64> = (0..n).map(|i| cb_compute::rmse_der1(approx[i], target[i])).collect();
+
+            // Greedy depth-1 stump over the current residual (strict first-wins).
+            let split = cpu_best_stump(&der1, weight, cindex, n, n_features, n_bins, scaled_l2)
+                .expect("CPU reference must find a candidate split each iteration");
+            let (feature, bin) = split;
+
+            // Forward-bit leaf_of over the chosen stump (== cpu_leaf_index, Pitfall 6).
+            let leaf_of: Vec<u32> = (0..n)
+                .map(|obj| {
+                    let passes = [(cindex[feature * n + obj] as usize) > bin];
+                    cpu_leaf_index(&passes) as u32
+                })
+                .collect();
+
+            // Per-leaf delta via calc_average over der1 (ordered sum_f64), scaled by lr.
+            let n_leaves = 2usize; // depth == 1
+            let mut leaf_values = vec![0.0_f64; n_leaves];
+            for leaf in 0..n_leaves {
+                let mut der_seg: Vec<f64> = Vec::new();
+                let mut w_seg: Vec<f64> = Vec::new();
+                for obj in 0..n {
+                    if leaf_of[obj] as usize == leaf {
+                        der_seg.push(der1[obj]);
+                        w_seg.push(weight[obj]);
+                    }
+                }
+                let delta = cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+                leaf_values[leaf] = learning_rate * delta;
+            }
+
+            // Update the running approx (approx[i] += leaf_value[leaf(i)]).
+            for obj in 0..n {
+                approx[obj] += leaf_values[leaf_of[obj] as usize];
+            }
+
+            out.push((split, leaf_of, leaf_values));
+        }
+        out
+    }
+
+    /// Run `grow_boosting_pass` (device) and the inline CPU multi-tree Plain-boosting
+    /// reference on the SAME clear-gain-margin fixture/seed/params (f32 + f64 channel via
+    /// `SelectedRuntime`, several iterations); assert EVERY tree's split `(feature, bin)`
+    /// + per-object `leaf_of` matches the CPU reference EXACTLY (the SC-3 strict bar
+    /// across the whole run); REPORT the per-tree + aggregate leaf-value divergence.
+    #[test]
+    fn matches_cpu_multi_tree_boosting() {
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 1usize;
+        let l2 = 3.0_f64;
+        let iterations = 5usize;
+        let learning_rate = 0.3_f64;
+
+        for &n in &[1usize, 37usize, 1000usize] {
+            let (target, weight, cindex, indices) = make_boosting_fixture(n, n_features, n_bins);
+            let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+            // Device: the full multi-tree boosting pass over SelectedRuntime.
+            let model: GrownModel = grow_boosting_pass(
+                &target, &weight, &cindex, &indices, n_bins, n_features, iterations,
+                learning_rate, depth, scaled_l2,
+            )
+            .expect("grow_boosting_pass must succeed on the clear-margin fixture");
+
+            // CPU multi-tree reference on the SAME fixture/params.
+            let cpu = cpu_boosting_pass(
+                &target, &weight, &cindex, n, n_features, n_bins, iterations, learning_rate,
+                scaled_l2,
+            );
+
+            assert_eq!(
+                model.iterations(),
+                iterations,
+                "device model must have exactly `iterations` trees (n={n})"
+            );
+            assert_eq!(
+                cpu.len(),
+                iterations,
+                "CPU reference must produce `iterations` trees (n={n})"
+            );
+
+            let mut run_abs = 0.0_f64;
+            let mut run_rel = 0.0_f64;
+            for (k, (dev_tree, (cpu_split, cpu_leaf_of, cpu_leaf_values))) in
+                model.trees.iter().zip(cpu.iter()).enumerate()
+            {
+                // (A) STRUCTURE — the split (feature, bin) must match EXACTLY (this tree).
+                assert_eq!(
+                    dev_tree.splits.len(),
+                    depth,
+                    "device tree {k} must have exactly `depth` splits (n={n})"
+                );
+                let (dev_feat, dev_bin) = dev_tree.splits[0];
+                assert_eq!(
+                    (dev_feat as usize, dev_bin as usize),
+                    *cpu_split,
+                    "device tree {k} split must match CPU multi-tree first-wins (n={n}): \
+                     device=({dev_feat}, {dev_bin}) cpu={cpu_split:?}"
+                );
+
+                // (B) STRUCTURE — per-object leaf_of must equal the CPU leaf_of EXACTLY.
+                assert_eq!(
+                    &dev_tree.leaf_of, cpu_leaf_of,
+                    "device tree {k} leaf_of must equal CPU forward-bit leaf_index (n={n})"
+                );
+
+                // (C) LEAF VALUES — REPORTED divergence (NOT signed off — 7.6 owns the
+                //     epsilon, D-7.5-05). The device leaf values are already lr-scaled.
+                assert_eq!(
+                    dev_tree.leaf_values.len(),
+                    cpu_leaf_values.len(),
+                    "device tree {k} leaf_values length must equal n_leaves (n={n})"
+                );
+                let (abs, rel) = max_divergence(&dev_tree.leaf_values, cpu_leaf_values);
+                run_abs = run_abs.max(abs);
+                run_rel = run_rel.max(rel);
+                println!(
+                    "[multi_tree n={n} tree={k}] STRUCTURE match: split={cpu_split:?}; REPORTED \
+                     leaf-value max abs_div={abs:.3e} rel_div={rel:.3e}"
+                );
+            }
+            println!(
+                "[multi_tree n={n}] AGGREGATE REPORTED leaf-value divergence over {iterations} \
+                 trees: max abs_div={run_abs:.3e} rel_div={run_rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+            assert!(
+                run_rel <= LEAF_BOUND || run_abs <= LEAF_BOUND,
+                "device multi-tree leaf values (n={n}) diverged beyond the REPORTED bound: \
+                 abs={run_abs:.3e} rel={run_rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+        }
+    }
+
+    /// The D-7.5-06 non-determinism budget: re-run `grow_boosting_pass` N times on the
+    /// clear-gain-margin fixture and REPORT whether per-tree STRUCTURE (every tree's
+    /// split + leaf_of) is stable run-to-run. On the clear-margin fixture atomic-order
+    /// jitter must NOT flip a split (structure stays exact); if a flip IS observed it is
+    /// the REPORTED D-7.5-06 boundary (characterize — do NOT fail the suite on a
+    /// documented flip, do NOT sign off an epsilon — 7.6's job). Also REPORTS the max
+    /// run-to-run leaf-value drift.
+    #[test]
+    fn run_to_run_structure_stability_reported() {
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 1usize;
+        let l2 = 3.0_f64;
+        let iterations = 5usize;
+        let learning_rate = 0.3_f64;
+        let n = 1000usize;
+        let runs = 4usize;
+
+        let (target, weight, cindex, indices) = make_boosting_fixture(n, n_features, n_bins);
+        let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+        // Run the pass `runs` times; the first run is the structure baseline.
+        let mut models: Vec<GrownModel> = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let m = grow_boosting_pass(
+                &target, &weight, &cindex, &indices, n_bins, n_features, iterations,
+                learning_rate, depth, scaled_l2,
+            )
+            .expect("grow_boosting_pass must succeed");
+            models.push(m);
+        }
+
+        let baseline = &models[0];
+        let mut structure_stable = true;
+        let mut max_value_drift = 0.0_f64;
+        for (r, m) in models.iter().enumerate().skip(1) {
+            for (k, (bt, mt)) in baseline.trees.iter().zip(m.trees.iter()).enumerate() {
+                // STRUCTURE stability: split + leaf_of must be identical run-to-run on the
+                // clear-margin fixture. A divergence is the REPORTED argmax-flip boundary.
+                if bt.splits != mt.splits || bt.leaf_of != mt.leaf_of {
+                    structure_stable = false;
+                    println!(
+                        "[multi_tree D-7.5-06] REPORTED argmax-flip: run {r} tree {k} structure \
+                         differs from baseline (split base={:?} run={:?})",
+                        bt.splits, mt.splits
+                    );
+                }
+                let (abs, _rel) = max_divergence(&mt.leaf_values, &bt.leaf_values);
+                max_value_drift = max_value_drift.max(abs);
+            }
+        }
+
+        println!(
+            "[multi_tree D-7.5-06] REPORTED run-to-run structure_stable={structure_stable} over \
+             {runs} runs x {iterations} trees (n={n}); max run-to-run leaf-value drift={max_value_drift:.3e}"
+        );
+        // The clear-margin fixture is engineered so structure stays exact (Pitfall 2): a
+        // flip here would be the D-7.5-06 boundary REPORTED above. We assert structure
+        // stability on the clear-margin fixture (the strict SC-3 bar) — if this ever fails,
+        // the printed REPORT is the 7.6 epsilon input, NOT a sign-off here.
+        assert!(
+            structure_stable,
+            "clear-gain-margin multi-tree structure must be stable run-to-run (any flip is the \
+             REPORTED D-7.5-06 boundary above — characterize in 7.6, do not mask)"
+        );
+    }
+}
