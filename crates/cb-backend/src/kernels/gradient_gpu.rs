@@ -19,7 +19,10 @@
 
 use cubecl::prelude::*;
 
-use crate::gpu_runtime::{const_der_handle, launch_der_binary, launch_der_binary_handle, DerBinaryKernel};
+use crate::gpu_runtime::{
+    const_der_handle, launch_der_binary, launch_der_binary_handle, launch_der_unary,
+    DerBinaryKernel, DerUnaryKernel,
+};
 
 /// Compare the device der (cast to f64) to the CPU baseline element-wise, returning
 /// the max abs and max rel divergence over the vector. Copied verbatim from the
@@ -196,5 +199,199 @@ fn rmse_der_device_resident_handoff() {
             v, baseline,
             "der2 const handle slot {i} = {v}, expected cb_compute::rmse_der2 = {baseline}"
         );
+    }
+}
+
+// ===========================================================================
+// Task 1 (Plan 07.2-02): Logloss / CrossEntropy der1 (binary launch) + der2
+// (unary hessian launch) self-oracle vs the `cb-compute::loss` baseline.
+//
+// Logloss and CrossEntropy share the EXACT der path (Pitfall 6 / D-09): the SAME
+// `DerBinaryKernel::LoglossGradient` (der1) and `DerUnaryKernel::LoglossHessian`
+// (der2) serve both — there is no separate CrossEntropy kernel. The fixtures use
+// logit-shaped approx (a spread that exercises the sigmoid, including a few
+// saturated logits) and 0/1 targets.
+// ===========================================================================
+
+/// `cb-compute::logloss_der1` baseline (== `cross_entropy_der1`, the shared
+/// sigmoid-gradient): `target - sigmoid(approx)`, computed elementwise.
+fn logloss_der1_baseline(approx: &[f64], target: &[f64]) -> Vec<f64> {
+    approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::logloss_der1(a, t))
+        .collect()
+}
+
+/// `cb-compute::logloss_der2` baseline (== `cross_entropy_der2`): `-p*(1-p)` with
+/// `p = sigmoid(approx)`, computed elementwise. der2 is independent of `target`.
+fn logloss_der2_baseline(approx: &[f64], target: &[f64]) -> Vec<f64> {
+    approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::logloss_der2(a, t))
+        .collect()
+}
+
+#[test]
+fn logloss_der1_matches_cpu_baseline_f64_non_cube_multiple() {
+    // n=37 (non-cube-multiple) exercises the `if ABSOLUTE_POS < approx.len()`
+    // idle-guard path in `logloss_gradient_kernel` (Pitfall 4). The approx spread
+    // -4.5..+4.5 includes near-saturated logits (sigmoid -> ~0 / ~1).
+    let approx: Vec<f64> = (0..37).map(|k| f64::from(k) * 0.25 - 4.5).collect();
+    // Alternating 0/1 binary labels.
+    let target: Vec<f64> = (0..37).map(|k| f64::from(k % 2)).collect();
+
+    let device = launch_der_binary(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+    let baseline = logloss_der1_baseline(&approx, &target);
+
+    assert_eq!(device.len(), approx.len(), "der1 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der logloss f64 n=37] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-9 || abs <= 1e-9,
+        "f64 Logloss der1 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn logloss_der1_matches_cpu_baseline_f32() {
+    // f32-magnitude logits cast to f64 at the seam (the seam is f64-typed). A
+    // generous f32 relative bound catches a wrong der without pinning the epsilon.
+    let approx_f32: Vec<f32> = (0..64).map(|k| (k as f32) * 0.15 - 5.0).collect();
+    let target_f32: Vec<f32> = (0..64).map(|k| (k % 2) as f32).collect();
+    let approx: Vec<f64> = approx_f32.iter().map(|&v| f64::from(v)).collect();
+    let target: Vec<f64> = target_f32.iter().map(|&v| f64::from(v)).collect();
+
+    let device = launch_der_binary(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+    let baseline = logloss_der1_baseline(&approx, &target);
+
+    assert_eq!(device.len(), approx.len(), "der1 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der logloss f32 n=64] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-3 || abs <= 1e-3,
+        "f32 Logloss der1 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn crossentropy_reuses_logloss_kernel() {
+    // Pitfall 6 / D-09: CrossEntropy reuses the EXACT logloss der path. The SAME
+    // `DerBinaryKernel::LoglossGradient` launch must match `cross_entropy_der1`
+    // (which itself delegates to `logloss_der1`). CrossEntropy admits soft targets
+    // in [0,1], so the fixture uses a few probabilistic labels too.
+    let approx: Vec<f64> = (0..40).map(|k| f64::from(k) * 0.2 - 4.0).collect();
+    let target: Vec<f64> = (0..40)
+        .map(|k| match k % 4 {
+            0 => 0.0,
+            1 => 1.0,
+            2 => 0.25,
+            _ => 0.75,
+        })
+        .collect();
+
+    let device = launch_der_binary(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+    let baseline: Vec<f64> = approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::cross_entropy_der1(a, t))
+        .collect();
+
+    assert_eq!(device.len(), approx.len(), "der1 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der crossentropy f64 n=40] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-9 || abs <= 1e-9,
+        "CrossEntropy der1 (reusing the logloss kernel) diverged: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn logloss_der2_matches_cpu_baseline_f64() {
+    // der2 = -p*(1-p) via the SINGLE-input `launch_der_unary` hessian seam (the
+    // hessian takes only `approx`). n=37 exercises the idle guard.
+    let approx: Vec<f64> = (0..37).map(|k| f64::from(k) * 0.25 - 4.5).collect();
+    let target: Vec<f64> = (0..37).map(|k| f64::from(k % 2)).collect();
+
+    let device = launch_der_unary(&approx, DerUnaryKernel::LoglossHessian).unwrap();
+    let baseline = logloss_der2_baseline(&approx, &target);
+
+    assert_eq!(device.len(), approx.len(), "der2 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der logloss-hess f64 n=37] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-9 || abs <= 1e-9,
+        "f64 Logloss der2 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn logloss_der2_matches_cpu_baseline_f32() {
+    let approx_f32: Vec<f32> = (0..64).map(|k| (k as f32) * 0.15 - 5.0).collect();
+    let approx: Vec<f64> = approx_f32.iter().map(|&v| f64::from(v)).collect();
+    // der2 is target-independent; pass a dummy 0/1 vector for the baseline shape.
+    let target: Vec<f64> = (0..64).map(|k| f64::from(k % 2)).collect();
+
+    let device = launch_der_unary(&approx, DerUnaryKernel::LoglossHessian).unwrap();
+    let baseline = logloss_der2_baseline(&approx, &target);
+
+    assert_eq!(device.len(), approx.len(), "der2 length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der logloss-hess f32 n=64] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-3 || abs <= 1e-3,
+        "f32 Logloss der2 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn logloss_der_edge_cases() {
+    // Empty: the der1 binary wrapper short-circuits to empty (no launch); the der2
+    // unary wrapper likewise. Neither reads back an empty device buffer.
+    {
+        let approx: Vec<f64> = Vec::new();
+        let target: Vec<f64> = Vec::new();
+        let der1 = launch_der_binary(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+        assert!(der1.is_empty(), "empty input must yield an empty logloss der1 (no launch)");
+        let der2 = launch_der_unary(&approx, DerUnaryKernel::LoglossHessian).unwrap();
+        assert!(der2.is_empty(), "empty input must yield an empty logloss der2 (no launch)");
+    }
+
+    // n=1: a single object, one thread.
+    {
+        let approx = vec![0.75_f64];
+        let target = vec![1.0_f64];
+        let der1 = launch_der_binary(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+        let base1 = logloss_der1_baseline(&approx, &target);
+        let (a1, r1) = max_divergence(&der1, &base1);
+        println!("[der logloss f64 n=1] REPORTED der1 max abs_div={a1:.3e} rel_div={r1:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "logloss der1 (n=1) diverged: abs={a1:.3e} rel={r1:.3e}");
+
+        let der2 = launch_der_unary(&approx, DerUnaryKernel::LoglossHessian).unwrap();
+        let base2 = logloss_der2_baseline(&approx, &target);
+        let (a2, r2) = max_divergence(&der2, &base2);
+        println!("[der logloss-hess f64 n=1] REPORTED der2 max abs_div={a2:.3e} rel_div={r2:.3e}");
+        assert!(r2 <= 1e-9 || a2 <= 1e-9, "logloss der2 (n=1) diverged: abs={a2:.3e} rel={r2:.3e}");
+    }
+
+    // Large N: many independent cubes (10_000 >> CUBE_DIM=32).
+    {
+        let n = 10_000usize;
+        let approx: Vec<f64> = (0..n).map(|k| (k as f64) * 0.001 - 5.0).collect();
+        let target: Vec<f64> = (0..n).map(|k| f64::from((k % 2) as u32)).collect();
+        let der1 = launch_der_binary(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+        let base1 = logloss_der1_baseline(&approx, &target);
+        assert_eq!(der1.len(), n, "large-N logloss der1 length must equal n");
+        let (a1, r1) = max_divergence(&der1, &base1);
+        println!("[der logloss f64 n=10000] REPORTED der1 max abs_div={a1:.3e} rel_div={r1:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "logloss der1 (large-N) diverged: abs={a1:.3e} rel={r1:.3e}");
+
+        let der2 = launch_der_unary(&approx, DerUnaryKernel::LoglossHessian).unwrap();
+        let base2 = logloss_der2_baseline(&approx, &target);
+        assert_eq!(der2.len(), n, "large-N logloss der2 length must equal n");
+        let (a2, r2) = max_divergence(&der2, &base2);
+        println!("[der logloss-hess f64 n=10000] REPORTED der2 max abs_div={a2:.3e} rel_div={r2:.3e}");
+        assert!(r2 <= 1e-9 || a2 <= 1e-9, "logloss der2 (large-N) diverged: abs={a2:.3e} rel={r2:.3e}");
     }
 }

@@ -40,6 +40,7 @@ use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, gradient_kernel,
+    logloss_gradient_kernel, logloss_hessian_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -311,6 +312,13 @@ pub enum DerBinaryKernel {
     /// [`gradient_kernel`], D-7.2-03 — no new math). Its der2 is the constant
     /// `-1.0`, produced by [`const_der_handle`] (no kernel).
     RmseGradient,
+    /// Logloss / CrossEntropy first derivative `der1[i] = target[i] -
+    /// sigmoid(approx[i])` (the reused [`logloss_gradient_kernel`], D-7.2-03 — no
+    /// new math). Logloss AND CrossEntropy route to THIS one arm (Pitfall 6 / D-09):
+    /// the Rust seam collapses both to the same sigmoid-gradient kernel (there is no
+    /// separate CrossEntropy kernel). Its der2 is the (single-input) hessian
+    /// [`DerUnaryKernel::LoglossHessian`].
+    LoglossGradient,
 }
 
 /// Launch an elementwise binary der1 kernel on the compile-time
@@ -383,6 +391,10 @@ fn launch_der_binary_into(
         z: 1,
     };
 
+    // `from_raw_parts` consumes the handle; clone the output so the original stays
+    // returnable on-device (the 7.1 idiom). NO `read_one` here (SC-3). The
+    // approx/target input handles are also consumed by `from_raw_parts`, so each
+    // launch arm rebuilds them from the already-uploaded `*_handle.clone()`.
     match kernel {
         DerBinaryKernel::RmseGradient => gradient_kernel::launch::<f64, SelectedRuntime>(
             client,
@@ -390,8 +402,14 @@ fn launch_der_binary_into(
             dim,
             unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
             unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-            // `from_raw_parts` consumes the handle; clone so the original stays
-            // returnable on-device (the 7.1 idiom). NO `read_one` here (SC-3).
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        ),
+        DerBinaryKernel::LoglossGradient => logloss_gradient_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
             unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
         ),
     }
@@ -424,6 +442,112 @@ pub fn launch_der_binary(
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
     let handle = launch_der_binary_into(&client, approx, target, kernel)?;
+
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+}
+
+/// Which elementwise UNARY (single-input) `approx -> der` kernel the device-resident
+/// der seam launches (Phase 7.2, GPU-01 der). Unlike [`DerBinaryKernel`], the unary
+/// family reads only `approx` (no `target`) — the Logloss/CrossEntropy hessian
+/// `der2[i] = -p*(1-p)` with `p = sigmoid(approx[i])` is target-independent
+/// (`logloss_hessian_kernel`). This is the seam shape for any single-input
+/// derivative; Plans 03+ add arms on this SAME geometry.
+///
+/// All arms produce UNWEIGHTED der2 — byte-identical in structure to the
+/// `cb-compute::loss` baseline the self-oracle compares against (D-7.2-01/02). The
+/// per-object weight is folded DOWNSTREAM by the 7.3 histogram kernels, NOT here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerUnaryKernel {
+    /// Logloss / CrossEntropy second derivative `der2[i] = -p*(1-p)`, `p =
+    /// sigmoid(approx[i])` (the reused [`logloss_hessian_kernel`], D-7.2-03 — no new
+    /// math). Logloss AND CrossEntropy share it (Pitfall 6 / D-09).
+    LoglossHessian,
+}
+
+/// Launch an elementwise UNARY (single-input) der kernel on the compile-time
+/// [`SelectedRuntime`] and return the der as a DEVICE BUFFER HANDLE — WITHOUT
+/// reading it back (SC-3 / D-7.2-04 / Pitfall 2). This is the device-residency
+/// hand-off seam for the single-input hessians (Logloss/CrossEntropy der2): the
+/// returned handle stays on-device for the 7.3 histogram kernels.
+///
+/// Mirrors [`launch_der_binary_handle`] but with a SINGLE input array (`approx`);
+/// the hessian takes no `target`. The empty input short-circuits to a zero-length
+/// device handle (no launch). NO `read_one` on this path. No
+/// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+pub fn launch_der_unary_handle(approx: &[f64], kernel: DerUnaryKernel) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_der_unary_into(&client, approx, kernel)
+}
+
+/// The ONE unary-der launch geometry (IN-02 — one place). Transfers `approx` onto
+/// `client`, launches the selected single-input der kernel, and returns the output
+/// Handle WITHOUT reading it back. The caller owns the `client` lifecycle so a
+/// read-back (the self-oracle wrapper) uses the SAME client that allocated the
+/// handle — a CubeCL Handle is bound to its originating client (see
+/// [`launch_der_binary_into`] for the full rationale).
+fn launch_der_unary_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx: &[f64],
+    kernel: DerUnaryKernel,
+) -> CbResult<Handle> {
+    let n = approx.len();
+
+    // Empty input: hand back a zero-length device handle (no launch), mirroring the
+    // binary short-circuit. 7.3 still receives a valid (empty) der handle.
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    // The der output is per-element (length `n`), NOT one slot per cube.
+    let out_handle = client.empty(n * std::mem::size_of::<f64>());
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    match kernel {
+        DerUnaryKernel::LoglossHessian => logloss_hessian_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+            // Clone so the original output handle stays returnable (the 7.1 idiom).
+            // NO `read_one` here (SC-3).
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        ),
+    }
+
+    Ok(out_handle)
+}
+
+/// Host-readback wrapper over the unary der launch: launch the single-input der
+/// kernel device-resident, then read the handle back to a host `Vec<f64>`. This is
+/// the seam the all-backend self-oracle exercises (it compares the device der2 to
+/// the `cb-compute::loss` CPU baseline); it is NOT the histogram hand-off path
+/// (that is [`launch_der_unary_handle`], which never reads back).
+///
+/// The launch geometry lives in ONE place ([`launch_der_unary_into`]); this wrapper
+/// constructs the client ONCE and uses that SAME client for both the launch and the
+/// read-back. A device read-back failure surfaces as [`CbError::Degenerate`]
+/// (WR-05), never a silent all-zero buffer masquerading as a valid derivative.
+pub fn launch_der_unary(approx: &[f64], kernel: DerUnaryKernel) -> CbResult<Vec<f64>> {
+    if approx.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let handle = launch_der_unary_into(&client, approx, kernel)?;
 
     let bytes = client
         .read_one(handle)
