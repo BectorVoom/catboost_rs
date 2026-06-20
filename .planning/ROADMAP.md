@@ -647,7 +647,14 @@ Plans:
   3. Kernels are wave-size-agnostic and generic-float; the bit-width/one-hot specializations match the upstream variant set (D-02 scope).
   4. Validated on `rocm`; additive boundary holds.
 
-**Plans**: TBD
+**Plans**: 5 plans in 5 waves (strict A->E chain — Plan A freezes the 4-channel weight-only binSums layout + pair seam; B/C/D extend independent bit-width families; E overlays one-hot)
+
+Plans:
+- [ ] 07.4-01-PLAN.md — Wave 1: non-binary 5/6/7-bit pairwise fill + FROZEN 4-channel weight-only binSums layout + pairs/per-pair-weight device seam + self-oracle harness + PairLogitPairwise fixture (GPU-01, SC-1, SC-2)
+- [ ] 07.4-02-PLAN.md — Wave 2: 8-bit-atomics distinct global-atomics family + self-oracle (GPU-01, SC-1)
+- [ ] 07.4-03-PLAN.md — Wave 3: half-byte (16-bin) pairwise fill + self-oracle (GPU-01, SC-1)
+- [ ] 07.4-04-PLAN.md — Wave 4: binary (2-bin) pairwise fill + self-oracle (GPU-01, SC-1)
+- [ ] 07.4-05-PLAN.md — Wave 5: one-hot comptime overlay on 5/6/7/8-bit + self-oracle (closes SC-1 variant set + SC-3)
 
 ### Phase 7.5: Score/Split Selection & On-Device Tree-Grow Loop
 
