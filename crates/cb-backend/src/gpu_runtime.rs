@@ -876,13 +876,14 @@ fn hist2_binsums_len_checked(n_bins: usize, n_features: usize) -> Option<usize> 
 ///
 /// # Atomic merge (D-03 / Pitfall 1)
 ///
-/// The cross-thread merge into `binSums` is the in-kernel `Atomic<F>::fetch_add` path
-/// when the device advertises the needed atomic-add support (the f64-atomic gate, the
-/// 7.1 `AtomicFinalizePath` pattern), else a documented host-sum fallback — both
-/// REPORTED by [`launch_pointwise_hist2`], not signed off (7.6). On the handle path
-/// the in-kernel atomic always runs (a handle cannot host-sum without a read-back);
-/// the f32-channel/f64-finalize tradeoff (RESEARCH A1) is recorded in the readback
-/// wrapper's report.
+/// The cross-thread merge into `binSums` is ALWAYS the in-kernel `Atomic<F>::fetch_add`
+/// (a handle cannot host-sum without a read-back). The only capability adaptation is the
+/// channel float type: f64 on rocm/cuda/cpu, f32 on wgpu (WGSL has no f64 atomics —
+/// RESEARCH A1). The [`AtomicFinalizePath`] reported by [`launch_pointwise_hist2`] is
+/// INFORMATIONAL (the device's advertised f64-atomic capability, for the 7.6 epsilon
+/// sign-off), NOT a selector — unlike the 7.1 reduce helper
+/// ([`launch_block_reduce_atomic_f64`]) there is no host-sum fallback on this path; the
+/// kernel always runs the in-kernel atomic regardless of advertised capability.
 ///
 /// Empty input (`n == 0` or `n_features == 0` or `n_bins == 0`) short-circuits to a
 /// zero-length handle with NO launch and NO read-back (Pitfall 5). Mismatched
@@ -985,6 +986,12 @@ fn launch_pointwise_hist2_into(
     }
     // Every `cindex` bin must fit the dispatched line size (`n_bins`); a value >= n_bins
     // would write `bin_sums` out of bounds in the non-binary path (which does not mask).
+    // This guard is applied UNIFORMLY across all families (IN-04): the binary (`& 1`) and
+    // half-byte (`& 15`) kernels would tolerate larger raw values via masking, but we
+    // intentionally hold them to the SAME `< n_bins` bound. That keeps the host reference
+    // — which does NOT mask — bit-exact with the device for every family (stricter than
+    // strictly necessary for the masked paths, never UB). Relax to mask-aware per-family
+    // bounds only if a caller ever needs raw multi-bit cindex on a masked feature.
     if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
         return Err(CbError::OutOfRange(format!(
             "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
@@ -1144,11 +1151,11 @@ fn launch_pointwise_hist2_into(
             )));
         }
     };
-    // Defence-in-depth: the selected bits must stay within the comptime worst-case
-    // shared-histogram allocation (`2 * (1 << bits) <= HIST_SHMEM`, guarded by the
-    // module-level `const _: () = assert!(...)` over HIST_MAX_BITS). T-07.3-07: the
-    // used prefix `2 * (1 << bits)` can never exceed the 8-bit allocation here.
-    debug_assert!(bits <= HIST_MAX_BITS);
+    // Invariant (IN-01): `bits` is one of {5,6,7,8} from the match arms above and
+    // `HIST_MAX_BITS == 8`, so `bits <= HIST_MAX_BITS` is a compile-time fact already
+    // enforced by the module-level `const _: () = assert!(2 * (1 << HIST_MAX_BITS) <=
+    // HIST_SHMEM)`. The used prefix `2 * (1 << bits)` can never exceed the 8-bit
+    // shared-histogram allocation here — no runtime assert is needed.
 
     let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
     let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
@@ -1157,15 +1164,9 @@ fn launch_pointwise_hist2_into(
     // accumulate from 0.0 (the additive identity). Length = the FROZEN layout length.
     let bin_sums_len = hist2_binsums_len(n_bins, n_features);
 
-    // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in the
-    // kernel handles any surplus via the total-thread-count stride — never a literal).
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: CUBE_DIM as u32,
-        y: 1,
-        z: 1,
-    };
+    // Launch geometry (IN-02): reuse the single `count`/`dim` already computed above and
+    // shared with the binary/half-byte branches — there is exactly ONE geometry, not a
+    // per-branch recomputation.
 
     // Channel float-type dispatch (RESEARCH A1 / Pitfall 1). The in-kernel atomic
     // merge needs `Atomic<F>::fetch_add` device-side. HIP (rocm) and CUDA support /
