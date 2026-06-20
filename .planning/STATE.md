@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 07.5-01-PLAN.md
-last_updated: "2026-06-20T14:14:50.874Z"
-last_activity: 2026-06-20 -- Phase 07.5 execution started
+stopped_at: Completed 07.5-03-PLAN.md
+last_updated: "2026-06-21T00:00:00.000Z"
+last_activity: 2026-06-21 -- Phase 07.5 Plan 03 (Task 2) complete: host-light single-tree grow loop GREEN on rocm
 progress:
   total_phases: 20
   completed_phases: 15
   total_plans: 111
-  completed_plans: 107
+  completed_plans: 108
   percent: 75
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 07.5 (Score/Split Selection & On-Device Tree-Grow Loop) — EXECUTING
-Plan: 3 of 6
-Status: Ready to execute
-Last activity: 2026-06-20 -- Phase 07.5 execution started
+Plan: 4 of 6
+Status: Ready to execute (03 complete — host-light single-tree grow loop landed, SC-3 structure parity GREEN on gfx1100)
+Last activity: 2026-06-21 -- Phase 07.5 Plan 03 (Task 2) complete
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -152,6 +152,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.4-pairwise-histogram-family P05 | 6min | 2 tasks | 1 file |
 | Phase 07.5 P01 | 12min | 2 tasks | 3 files |
 | Phase 07.5 P02 | 5min | 2 tasks | 3 files |
+| Phase 07.5 P03 | 40min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -159,6 +160,8 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [07.5-03 host-light single-tree grow loop — COMPLETE; SC-3 structure parity GREEN]: `grow_oblivious_tree` (+ private `_into`) in gpu_runtime.rs is the host-light per-depth device-resident driver (D-05 / D-7.5-02) mirroring `oblivious_tree_doc_parallel_structure_searcher.cpp:63-158`: per level fill (FROZEN 7.3) → score+deterministic argmin (Plan A `launch_find_optimal_split_pointwise_into`) → ONE O(1) `BestSplit` read-back → host integer split decision (strict first-wins) → `partition_split` (forward-bit, Task 1) → `partition_update` (Task 1), over persistent handles threaded through ONE ComputeClient; at the leaves ONE 2^depth part-stats read-back + host leaf values via `cb_compute::calc_average`. `GrownTree` = splits + per-object leaf_of + leaf_values + part_stats. **MVP scope = depth==1 (single split / stump):** at level 0 the FROZEN 7.3 whole-dataset (partCount==1) histogram score IS the EXACT CPU level-0 score, so the O(1)-per-level read-back holds by construction; **depth>1 surfaces a typed `CbError::OutOfRange` naming the partition-aware (fullPass=false) histogram as the EXPLICIT tracked forward dependency** (RESEARCH A2 / 07.5-04) — NOT a mislabeled stump. Structure cross-oracle is INLINE (cpu_stump_score + cpu_best_stump, transcribed from cb_compute L2 semantics + select_best_candidate strict-first-wins; NEVER imports cb-train — the D-7.5-04 / Plan-A landmine). **rocm gfx1100: `single_tree::matches_cpu_greedy_search` GREEN for n in {1,37,1000} — STRUCTURE EXACT (device split == CPU greedy first-wins; per-object leaf_of == leaf_index), leaf-value divergence REPORTED abs=0.0 rel=0.0 (<1e-9, NOT signed off — 7.6 owns the epsilon).** `depth_gt_one_is_tracked_forward_dependency` pins the typed scope error. cuda + wgpu build clean; SC-4 cb-compute cubecl==0; cb-core/cb-model/cb-compute/cb-train byte-unchanged. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commit b400e0a (feat, GREEN).
 
 - [07.4-05 one-hot comptime overlay on 5/6/7/8-bit — COMPLETE; SC-1 variant set + SC-3 CLOSED]: The one-hot variant of the 5/6/7-bit non-binary + 8-bit-atomics pairwise families now runs device-resident on rocm via the EXISTING `#[comptime] one_hot: bool` overlay — the JIT-pruned `Compare`-predicate swap `(bin1 >= bin2) == flag` → `bin1 == bin2` (upstream's `TCmpBinsOneByteTrait<OneHotPass>` template-bool; split_properties_helpers.cuh:261, confirmed `IsOneHot ? bin1==bin2 : bin1>=bin2==flag`). **One-hot is NOT a new kernel — Plans A/B already plumbed the comptime flag through both `pairwise_hist_nonbinary_kernel` AND `pairwise_hist_8bit_atomics_kernel` (the `if one_hot { hist_id from bin1==bin2 } else { (b1>=b2)==flag }` STATEMENT, JIT-pruned, zero device divergence) AND through `launch_pairwise_hist_handle`/`launch_pairwise_hist_8bit_handle`.** So this plan was CONFIRM-AND-ORACLE: the flag was already a real comptime parameter, the kernel/launch path needed zero changes, the new test went GREEN immediately. New `one_hot` self-oracle in `kernels/pairwise_hist.rs`: bits {5,6,7} + 8-bit, one_hot=true vs `host_reference_pairwise_hist(one_hot=true)` (IDENTICAL predicate via the shared `add_pair_contrib`), edge cases empty (NO launch/read-back)/n_pairs 1/37/10000, PLUS the SWAP sub-assertion (T-07.4-21): one_hot=true vs false on a bin1!=bin2 fixture yield DIFFERENT device histograms (abs diff 48.0) AND different HOST references, each device run matching its own host ref — a comptime flag that silently does nothing fails. Half-byte/binary helpers take NO one_hot arg and are NOT called by the one_hot test (no upstream `*_one_hot.cu` for them — RESEARCH Pattern 2). **rocm gfx1100: one_hot BIT-EXACT (abs=0.0 rel=0.0) for ALL 5/6/7/8-bit one-hot variants; the FULL pairwise suite (nonbinary_bits/eightbit_atomics/half_byte/binary/one_hot/handoff/pairlogit_fixture + length_mismatch/out_of_range) 9/9 GREEN together → SC-1 variant set CLOSED.** wgpu build+host run GREEN (f32 channel, also bit-exact, swap diff 48.0), cuda compile-only GREEN. **SC-3 held:** no warp/tile literal in any of the 4 pairwise kernels (the only 32/64 are explanatory comments), `* 4usize` channel indexing never `* 2`, every pairwise kernel `<F: Float>`. **SC-4 held:** cb-compute cubecl count 0, cb-compute/cb-core/cb-model byte-unchanged. **NO deviations** — Task 2 made no file changes (harness cross-backend by construction over SelectedRuntime, matching Plans A/B/C/D). The GPU-01 pairwise-histogram FILL slice is now COMPLETE (full upstream variant set device-resident); 7.5 consumes the FROZEN 4-channel handle (scan/update/split scorer + grow loop) next. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commit bff2b38 (test, GREEN — kernel/launch overlay pre-existed from Plans A/B).
 - [07.4-03 half-byte distinct pairwise hist family + launch arm — COMPLETE]: The structurally DISTINCT half-byte (4-bit, 16-bin) pairwise histogram family (D-7.4-02; upstream `pairwise_hist_half_byte.cu::ComputePairwiseHistogramHalfByte`) now runs device-resident, reusing the Plan A FROZEN 4-channel layout + seam + harness UNCHANGED and mirroring the Plan B distinct-family pattern. `kernels.rs` gains `pairwise_hist_half_byte_kernel<F>` (#[cube(launch)], `n_bins = comptime!(HALF_BYTE_BINS)` = 16 fixed, read bins masked to the nibble `& comptime!((HALF_BYTE_BINS as u32) - 1)`, **NO `one_hot` arg** — upstream has no `pairwise_hist_half_byte_one_hot.cu`, RESEARCH Pattern 2): a SEPARATE symbol next to `pairwise_hist_nonbinary_kernel` + `pairwise_hist_8bit_atomics_kernel` (count=3 distinct fns), grid-stride over PAIRS, two bins per (pair,feature) from `cindex[feature*n_objects+obj]` (Pitfall 3), direct global `Atomic<F>::fetch_add` into `(feature*16+bin)*4+histId` over the non-one-hot Compare path (`ge=(b1>=b2)`, `gt=(b1>b2)` → bin b1 histId {2*ge,2*gt}, bin b2 histId {2*ge+1,2*gt+1}). **MVP body equals the non-binary kernel's non-one-hot branch with n_bins fixed at 16 + the nibble mask.** `gpu_runtime.rs` gains `launch_pairwise_hist_half_byte_handle`/`_into` (no readback seam, no `one_hot` param) + `launch_pairwise_hist_half_byte` readback wrapper — clones of the Plan B 8-bit arm with `n_bins` pinned to `HALF_BYTE_BINS` (validated `n_bins == HALF_BYTE_BINS` → `CbError::Degenerate` otherwise), reusing `pair_hist_binsums_len`, the full guard block (LengthMismatch / OutOfRange / `checked_mul` overflow / value-range / empty short-circuit), the backend-dispatched f64/f32 channel, and `read_pair_binsums_f64` UNCHANGED. New `half_byte` self-oracle (n_bins=16, n_objects=64 so bins span the full 4-bit range): empty (no launch/read-back), n_pairs 1/37/10000, device-resident hand-off — asserts against `host_reference_pairwise_hist(..., n_bins=16, one_hot=false)`, REPORTS divergence. **rocm gfx1100: half_byte BIT-EXACT (abs=0.0 rel=0.0) for n_pairs 1/37/10000 + handoff(50); GREEN.** wgpu build+host run GREEN (f32, also 0.0 on host fixture), cuda compile-only GREEN. **SC-4 held:** cb-compute cubecl count 0, cb-compute/cb-core/cb-model byte-unchanged. **D-09/Pitfall 2/4:** no warp/tile literal in any stride (the 32/64 occurrences are explanatory comments); `* 4usize` indexing (never `* 2`); kernel `<F: Float>`. **NO deviations** — Task 2 made no file changes (harness cross-backend by construction over SelectedRuntime, matching Plan A's Task 3 / Plan B's Task 2). The distinct-family pattern is now applied a THIRD time (non-binary → 8-bit → half-byte), ready for Plan D (binary, 2-bin). The one-hot overlay fold remains Plan E's job; half-byte deliberately omits it. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits bba7632 (Task1 RED scaffold) / 775bb50 (Task1 kernel+arm GREEN).
