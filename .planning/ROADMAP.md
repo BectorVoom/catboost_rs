@@ -27,7 +27,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   - [x] **Phase 6.6: Advanced Features & Non-Symmetric Trees** - FEAT-03/04/05/06, MODEL-05, MODEL-03 LossFunctionChange (D-12); second tree engine (completed 2026-06-18)
 - [ ] **Phase 7: GPU Backends via CubeCL** (umbrella — split into 7.1–7.6) - `rocm`/`wgpu`/`cuda` kernels on the locked generic boundary, full structural parity with `catboost/cuda/`, documented GPU tolerance
   - [x] **Phase 7.1: GPU Backend Runtime & Device Primitives** - GPU-02/04/05 + GPU-01 scan/reductions; cfg-gated `SelectedRuntime`, device memory, wave-agnostic scan/reduction primitives (completed 2026-06-20)
-  - [ ] **Phase 7.2: On-Device Gradient/Hessian & Targets** - GPU-01 grad/hess; port `targets/` derivative computation device-resident
+  - [x] **Phase 7.2: On-Device Gradient/Hessian & Targets** - GPU-01 grad/hess; port `targets/` derivative computation device-resident (completed 2026-06-20)
   - [ ] **Phase 7.3: Pointwise Histogram Family** - GPU-01 hist; `pointwise_hist2_*` incl. 5/6/7/8-bit, half-byte, binary variants
   - [ ] **Phase 7.4: Pairwise Histogram Family** - GPU-01 hist; `pairwise_hist_*` incl. 8-bit atomics and one-hot variants
   - [ ] **Phase 7.5: Score/Split Selection & On-Device Tree-Grow Loop** - GPU-01 close; score calcers + split selection + full device-resident grow loop (D-05)

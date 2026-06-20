@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 07.2-03-PLAN.md
-last_updated: "2026-06-20T06:58:18.000Z"
-last_activity: 2026-06-20 -- 07.2-03 on-device Focal der + full-family device-residency hand-off lock COMPLETE (Phase 7.2 done)
+status: verifying
+stopped_at: Phase 7.2 context gathered
+last_updated: "2026-06-20T07:11:43.352Z"
+last_activity: 2026-06-20
 progress:
   total_phases: 20
-  completed_phases: 12
+  completed_phases: 13
   total_plans: 96
   completed_plans: 96
-  percent: 61
+  percent: 65
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 7.2 (On-Device Gradient/Hessian & Targets) — ALL PLANS COMPLETE (3 of 3)
-Plan: 3 of 3 (COMPLETE)
+Phase: 7.3 of 3 (pointwise histogram family)
+Plan: Not started
 Status: Phase 7.2 plans 01+02+03 all COMPLETE — GPU-01 grad/hess + targets slice closed; ready for phase verification
-Last activity: 2026-06-20 -- 07.2-03 on-device Focal der + full-family device-residency hand-off lock COMPLETE (GPU-01: Focal der1 via DerParamKernel::FocalGradient + der2 via DerParamKernel::FocalHessian — the two-kernel parametric family, alpha/gamma as length-1 Array<F>, reusing the authored focal_gradient_kernel/focal_hessian_kernel; full-family all_losses_device_resident_handoff lock proves RMSE/Logloss-CE/Quantile-MAE/Focal all hand 7.3 der1+der2 device HANDLES with no host fold (SC-3); SC-4 holds — cb-compute cubecl-free (cargo tree==0), cb-core/cb-model byte-unchanged; rocm gfx1100 self-oracle 23/23 green, Focal divergence <=~1e-8 (most ~1e-14), finite on ±40 saturated logits; wgpu+cuda build RC=0; commits 2de0dbf + 4b817ae)
+Last activity: 2026-06-20
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -36,7 +36,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 **Velocity:**
 
-- Total plans completed: 37
+- Total plans completed: 40
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -50,6 +50,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | 06.3 | 2 | ~75 min | ~38 min |
 | 06.6 | 9 | - | - |
 | 07.1 | 2 | - | - |
+| 7.2 | 3 | - | - |
 
 **Recent Trend:**
 
