@@ -189,6 +189,77 @@ fn cpu_best_stump(
     best
 }
 
+/// The whole-dataset **Cosine** score of ONE binary split `(feature, bin)` over the
+/// fixture — the depth-1 stump score under the catboost DEFAULT score function,
+/// TRANSCRIBED from the FROZEN `cb_compute::cosine_split_score` (`score.rs:73-85`) over
+/// the SAME left/right leaf partition as [`cpu_stump_score`] (forward-bit
+/// `cindex[feature * n + obj] > bin`, == the device `partition_split`). Each side's
+/// Σ der1 / Σ weight is folded in ASCENDING OBJECT ORDER via `sum_f64` (D-08). This is
+/// the inline transcription the D-7.5-04 boundary mandates (do NOT import `cb-train`);
+/// the SCORE oracle `cosine_split_score` is read-only from `cb-compute` (already a dep).
+fn cpu_stump_score_cosine(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    feature: usize,
+    bin: usize,
+    scaled_l2: f64,
+) -> f64 {
+    let mut left_der: Vec<f64> = Vec::new();
+    let mut left_w: Vec<f64> = Vec::new();
+    let mut right_der: Vec<f64> = Vec::new();
+    let mut right_w: Vec<f64> = Vec::new();
+    for obj in 0..n {
+        if (cindex[feature * n + obj] as usize) > bin {
+            right_der.push(der1[obj]);
+            right_w.push(weight[obj]);
+        } else {
+            left_der.push(der1[obj]);
+            left_w.push(weight[obj]);
+        }
+    }
+    let left = cb_compute::LeafStats {
+        sum_weighted_delta: sum_f64(&left_der),
+        sum_weight: sum_f64(&left_w),
+    };
+    let right = cb_compute::LeafStats {
+        sum_weighted_delta: sum_f64(&right_der),
+        sum_weight: sum_f64(&right_w),
+    };
+    // Cosine score = num / sqrt(1e-100 + Σ avg²·weight) (cosine_split_score:73-85).
+    cb_compute::cosine_split_score(&[left, right], scaled_l2)
+}
+
+/// The inline CPU greedy LEVEL-0 search under the **Cosine** score function — the
+/// strict-first-wins Cosine argmax over the candidates in ascending `(feature, bin)`
+/// order (the Cosine sibling of [`cpu_best_stump`]; `tree.rs:291-302` with the score fn
+/// set to Cosine, the catboost default). Strict `>` (NOT `>=`) — the load-bearing
+/// first-wins tie-break (Pitfall 1). Mirrors the device's lowest-`(feature, bin)`-index
+/// tie-break so the two agree on a near-tie (Pattern 4).
+fn cpu_best_stump_cosine(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    n_features: usize,
+    n_bins: usize,
+    scaled_l2: f64,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for feature in 0..n_features {
+        for bin in 0..n_bins {
+            let score = cpu_stump_score_cosine(der1, weight, cindex, n, feature, bin, scaled_l2);
+            if score > best_score {
+                best_score = score;
+                best = Some((feature, bin));
+            }
+        }
+    }
+    best
+}
+
 // ===========================================================================
 // Partition primitives self-oracle (Phase 7.5 Plan C, Task 1): the device
 // `partition_split_kernel` forward-bit doc-routing reorder must match the CPU
@@ -472,6 +543,98 @@ mod single_tree {
             assert!(
                 rel <= LEAF_BOUND || abs <= LEAF_BOUND,
                 "device leaf values (n={n}) diverged beyond the REPORTED bound: \
+                 abs={abs:.3e} rel={rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+        }
+    }
+
+    /// Grow a depth-1 oblivious tree with `score_fn = Cosine` (the catboost DEFAULT score
+    /// function, a PRIMARY path alongside L2 — D-7.5-01) on the clear-gain-margin fixture
+    /// and assert the device STRUCTURE matches the inline CPU **Cosine** greedy search
+    /// EXACTLY (split `(feature, bin)` + per-object `leaf_of` == `leaf_index`), then REPORT
+    /// the leaf-value divergence vs `cb_compute::calc_average` (leaf values are computed the
+    /// SAME way regardless of score fn — the score fn only drives the split SELECTION). The
+    /// device argmin under Cosine must pick the SAME split as `cpu_best_stump_cosine`; a
+    /// mismatch is the REPORTED tolerance boundary, never signed off (7.6's epsilon).
+    #[test]
+    fn cosine_matches_cpu_cosine_greedy_search() {
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 1usize;
+        let l2 = 3.0_f64;
+
+        for &n in &[1usize, 37usize, 1000usize] {
+            let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+            let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+            // Device: grow the tree host-light over SelectedRuntime with the Cosine arm.
+            let tree = grow_oblivious_tree(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2,
+                crate::kernels::SCORE_FN_COSINE,
+            )
+            .expect("grow_oblivious_tree (Cosine) must succeed on the clear-margin fixture");
+
+            // CPU reference: the strict-first-wins level-0 stump under the COSINE score fn.
+            let cpu_split =
+                cpu_best_stump_cosine(&der1, &weight, &cindex, n, n_features, n_bins, scaled_l2)
+                    .expect("CPU Cosine reference must find a candidate split");
+
+            // (A) STRUCTURE — the split (feature, bin) must match the CPU Cosine reference EXACTLY.
+            assert_eq!(
+                tree.splits.len(),
+                depth,
+                "device Cosine tree must have exactly `depth` splits (n={n})"
+            );
+            let (dev_feat, dev_bin) = tree.splits[0];
+            assert_eq!(
+                (dev_feat as usize, dev_bin as usize),
+                cpu_split,
+                "device Cosine split (feature, bin) must match CPU Cosine greedy first-wins \
+                 (n={n}): device=({dev_feat}, {dev_bin}) cpu={cpu_split:?}"
+            );
+
+            // (B) STRUCTURE — per-object leaf_of must equal CPU leaf_index over the SAME split.
+            let (cpu_feature, cpu_bin) = cpu_split;
+            let cpu_leaf_of: Vec<u32> = (0..n)
+                .map(|obj| {
+                    let passes = [(cindex[cpu_feature * n + obj] as usize) > cpu_bin];
+                    cpu_leaf_index(&passes) as u32
+                })
+                .collect();
+            assert_eq!(
+                tree.leaf_of, cpu_leaf_of,
+                "device Cosine leaf_of must equal CPU leaf_index forward-bit (n={n})"
+            );
+
+            // (C) LEAF VALUES — REPORTED divergence vs CPU calc_average over the SAME leaf
+            //     partition (leaf values are score-fn-independent; NOT signed off — 7.6's epsilon).
+            let n_leaves = 1usize << depth;
+            let mut cpu_leaf_values = vec![0.0_f64; n_leaves];
+            for leaf in 0..n_leaves {
+                let mut der_seg: Vec<f64> = Vec::new();
+                let mut w_seg: Vec<f64> = Vec::new();
+                for obj in 0..n {
+                    if cpu_leaf_of[obj] as usize == leaf {
+                        der_seg.push(der1[obj]);
+                        w_seg.push(weight[obj]);
+                    }
+                }
+                cpu_leaf_values[leaf] =
+                    cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+            }
+            assert_eq!(
+                tree.leaf_values.len(),
+                cpu_leaf_values.len(),
+                "device Cosine leaf_values length must equal n_leaves (n={n})"
+            );
+            let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
+            println!(
+                "[cosine_single_tree n={n}] STRUCTURE match: split={cpu_split:?}; REPORTED \
+                 leaf-value max abs_div={abs:.3e} rel_div={rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+            assert!(
+                rel <= LEAF_BOUND || abs <= LEAF_BOUND,
+                "device Cosine leaf values (n={n}) diverged beyond the REPORTED bound: \
                  abs={abs:.3e} rel={rel:.3e} (bound={LEAF_BOUND:.0e})"
             );
         }
