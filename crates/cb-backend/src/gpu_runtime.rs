@@ -365,12 +365,18 @@ pub fn launch_der_binary_handle(
 /// entry point). Transfers `approx`/`target` onto `client`, launches the selected
 /// der kernel, and returns the der1 output Handle WITHOUT reading it back. The
 /// caller owns the `client` lifecycle so a read-back (the self-oracle wrapper)
-/// uses the SAME client that allocated the handle — a CubeCL Handle is bound to its
-/// originating client's memory allocator/stream, and reading it through a second,
-/// freshly-constructed client violates a `slice::from_raw_parts` precondition in the
-/// HIP IO controller (the canonical CubeCL idiom keeps one client per op through
-/// read-back; basic-operations manual). Both the handle-returning public fn and the
-/// host-readback wrapper route through here, so the launch geometry stays single.
+/// uses the SAME client that allocated the handle — the canonical CubeCL idiom keeps
+/// one client per op through read-back (basic-operations manual). This is the SAFE,
+/// recommended pattern; it is what the production hand-off path does and never reads
+/// the handle back at all. (Note on the test harnesses: re-resolving the client via
+/// `Runtime::client(&device)` for the SAME runtime/device returns the cached global
+/// client from CubeCL's per-device pool, NOT a foreign allocator — so the oracle
+/// read-back wrappers that "construct a fresh client" actually share this client's
+/// allocator/stream; see `kernels/pointwise_hist.rs::read_handle_f64`. The hazard to
+/// avoid is reading a handle through a client of a DIFFERENT device/runtime, which
+/// would violate a `slice::from_raw_parts` precondition in the HIP IO controller.)
+/// Both the handle-returning public fn and the host-readback wrapper route through
+/// here, so the launch geometry stays single.
 fn launch_der_binary_into(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx: &[f64],
@@ -821,6 +827,17 @@ fn hist2_binsums_len(n_bins: usize, n_features: usize) -> usize {
     n_features * n_bins * HIST_CHANNELS
 }
 
+/// Overflow-checked companion to [`hist2_binsums_len`] (WR-04). Returns `None` if
+/// `n_features * n_bins * HIST_CHANNELS` overflows `usize`, so the host seam can reject a
+/// degenerate dimension with a typed range error instead of wrapping silently. Kept next
+/// to [`hist2_binsums_len`] so the two stay in lockstep on the FROZEN layout arithmetic.
+#[inline]
+fn hist2_binsums_len_checked(n_bins: usize, n_features: usize) -> Option<usize> {
+    n_features
+        .checked_mul(n_bins)
+        .and_then(|v| v.checked_mul(HIST_CHANNELS))
+}
+
 /// Fill the device-resident 2-channel pointwise histogram (8-bit non-binary) on the
 /// compile-time [`SelectedRuntime`] and return `binSums` as a DEVICE BUFFER HANDLE —
 /// WITHOUT reading it back (SC-3 / D-7.3-05 / Pitfall 2/5). This is the load-bearing
@@ -927,6 +944,45 @@ fn launch_pointwise_hist2_into(
             expected: n_features * n,
             actual: cindex.len(),
         });
+    }
+
+    // Value-range guards (CR-01): the length guards above bound only the buffer
+    // *positions*; the *values* inside `indices` and `cindex` drive unchecked device
+    // array indices. Validate them HOST-SIDE so a malformed object id or bin surfaces a
+    // typed `CbError::OutOfRange` rather than an out-of-bounds device read/store (UB).
+    // This makes the "typed error, not UB" contract hold UNIFORMLY across the non-binary,
+    // half-byte, and binary families — the non-binary kernel does NOT mask its bin, so it
+    // relies entirely on this guard (WR-01).
+    //
+    // Object ids (`indices[i]`) index der1[obj]/weight[obj]/cindex[feature*n+obj]; a value
+    // >= n would read those buffers out of bounds on the device.
+    if let Some(&bad) = indices.iter().find(|&&ix| (ix as usize) >= n) {
+        return Err(CbError::OutOfRange(format!(
+            "indices value {bad} >= n ({n}); object id would read der1/cindex out of bounds"
+        )));
+    }
+    // Every `cindex` bin must fit the dispatched line size (`n_bins`); a value >= n_bins
+    // would write `bin_sums` out of bounds in the non-binary path (which does not mask).
+    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
+        return Err(CbError::OutOfRange(format!(
+            "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
+        )));
+    }
+
+    // Overflow guards (WR-04): the cindex stride `n_features * n` and the binSums length
+    // `n_features * n_bins * HIST_CHANNELS` are products of unbounded caller-supplied
+    // dimensions. A wrapping `usize` multiply would silently address the wrong cell (no
+    // fault, wrong histogram). Reject a degenerate dimension with a typed range error
+    // rather than wrapping — so the "no silent wrong result" contract holds at the seam.
+    if n_features.checked_mul(n).is_none() {
+        return Err(CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
+        )));
+    }
+    if hist2_binsums_len_checked(n_bins, n_features).is_none() {
+        return Err(CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (binSums length)"
+        )));
     }
 
     // Empty fill: hand back a zero-length handle (no launch, no read-back — Pitfall 5).

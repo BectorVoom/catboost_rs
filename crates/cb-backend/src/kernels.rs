@@ -599,9 +599,13 @@ pub fn histogram_scatter_kernel<F: Float>(
 /// (a grid-stride loop) — derived from the launch topology intrinsics, NEVER a literal
 /// 32/64. No `& 31`/`tiled_partition<32>` appears: the bin index comes from
 /// `cindex[feature * n + indices[i]]`, not a warp-lane partition. Generic over `F:
-/// Float` (AGENTS.md generics-float). Every device read is under a bounds guard
-/// (`i < indices.len()`) so a non-cube-multiple object count stays correct
-/// (T-7.1-01). if-as-STATEMENT only (CubeCL conditionals manual).
+/// Float` (AGENTS.md generics-float). Every device read is under a POSITION bounds
+/// guard (`i < indices.len()`) so a non-cube-multiple object count stays correct
+/// (T-7.1-01). The VALUE-derived reads (`indices[i]` as an object id, `cindex[...]`
+/// as a bin) are NOT guarded in-kernel; their ranges are validated HOST-SIDE in
+/// `launch_pointwise_hist2_into` (CR-01) before launch, which is what keeps a
+/// malformed object id / bin from faulting on the device. if-as-STATEMENT only
+/// (CubeCL conditionals manual).
 ///
 /// `der1`/`weight` are length `n` (per object, object order). `cindex` is the
 /// quantized bin matrix laid out feature-major (`cindex[feature * n + obj]`).
@@ -649,6 +653,14 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
         // channels into the global histogram at the FROZEN interleaved index.
         let mut feature = 0usize;
         while feature < n_features_usize {
+            // The non-binary bin is read RAW — intentionally NOT masked (WR-01). Masking
+            // an up-to-8-bit value to 8 bits is a no-op, so it cannot be the kernel's
+            // safety net; instead this family relies on the host-side range guard in
+            // `launch_pointwise_hist2_into` (CR-01), which rejects any `cindex` value
+            // >= n_bins BEFORE launch. The half-byte/binary kernels mask (`& 15`/`& 1`)
+            // because their nibble/bit decomposition makes the mask structurally
+            // meaningful; here it would not be. The divergence is deliberate, not an
+            // oversight.
             let bin = cindex[feature * n + obj] as usize;
             let cell = (feature * n_bins + bin) * 2usize;
             // channel 0 = Σ der1, channel 1 = Σ weight (in-kernel atomic, D-03).
@@ -725,8 +737,11 @@ pub(crate) const HALF_BYTE_BINS: usize = 16;
 /// appears (upstream's `SliceOffset`/`SyncTile` warp partitioning is replaced by the
 /// wave-agnostic grid-stride loop + global atomic merge). The bin index comes from the
 /// masked 4-bit `cindex` value, not a warp-lane partition. Generic over `F: Float`
-/// (AGENTS.md generics-float). Every device read is under a bounds guard (`i <
-/// indices.len()`). if-as-STATEMENT only (CubeCL conditionals manual).
+/// (AGENTS.md generics-float). Every device read is under a POSITION bounds guard (`i <
+/// indices.len()`); the VALUE ranges (`indices[i]` object id, `cindex[...]` bin) are
+/// validated HOST-SIDE in `launch_pointwise_hist2_into` (CR-01) before launch — the
+/// 4-bit nibble mask (`& 15`) additionally bounds the bin structurally here.
+/// if-as-STATEMENT only (CubeCL conditionals manual).
 ///
 /// `der1`/`weight` are length `n` (per object, object order). `cindex` is the quantized
 /// bin matrix laid out feature-major (`cindex[feature * n + obj]`). `indices` (length
@@ -844,8 +859,11 @@ pub(crate) const BINARY_BINS: usize = 2;
 /// appears (upstream's `threadIdx.x & 1` channel select + warp partitioning is replaced
 /// by the wave-agnostic grid-stride loop + global atomic merge). The bin index comes from
 /// the masked 1-bit `cindex` value, not a warp-lane partition. Generic over `F: Float`
-/// (AGENTS.md generics-float). Every device read is under a bounds guard (`i <
-/// indices.len()`). if-as-STATEMENT only (CubeCL conditionals manual).
+/// (AGENTS.md generics-float). Every device read is under a POSITION bounds guard (`i <
+/// indices.len()`); the VALUE ranges (`indices[i]` object id, `cindex[...]` bin) are
+/// validated HOST-SIDE in `launch_pointwise_hist2_into` (CR-01) before launch — the
+/// 1-bit mask (`& 1`) additionally bounds the bin structurally here. if-as-STATEMENT
+/// only (CubeCL conditionals manual).
 ///
 /// `der1`/`weight` are length `n` (per object, object order). `cindex` is the quantized
 /// bin matrix laid out feature-major (`cindex[feature * n + obj]`). `indices` (length
