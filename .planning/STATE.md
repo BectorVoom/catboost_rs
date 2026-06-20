@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
+status: executing
 stopped_at: Phase 7.3 context gathered
-last_updated: "2026-06-20T07:46:41.903Z"
-last_activity: 2026-06-20 -- Phase 7.3 planning complete
+last_updated: "2026-06-20T08:03:17.651Z"
+last_activity: 2026-06-20 -- Phase 07.3 execution started
 progress:
   total_phases: 20
   completed_phases: 13
-  total_plans: 96
-  completed_plans: 96
+  total_plans: 100
+  completed_plans: 97
   percent: 65
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 7.2 — On-Device Gradient/Hessian & Targets
+**Current focus:** Phase 07.3 — Pointwise Histogram Family
 
 ## Current Position
 
-Phase: 7.3 of 3 (pointwise histogram family)
-Plan: Not started
-Status: Phase 7.2 plans 01+02+03 all COMPLETE — GPU-01 grad/hess + targets slice closed; ready for phase verification
-Last activity: 2026-06-20 -- Phase 7.3 planning complete
+Phase: 07.3 (Pointwise Histogram Family) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-06-20 -- Phase 07.3 execution started
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -140,6 +140,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.2 P01 | ~18m | 2 tasks | 3 files |
 | Phase 07.2 P02 | ~17m | 2 tasks | 2 files |
 | Phase 07.2 P03 | ~4m | 2 tasks | 2 files |
+| Phase 07.3 P01 | 38min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -302,6 +303,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07.1-01: block_reduce_kernel ships atomic-free finalize (host cb-core::sum_f64 over per-cube partials); atomic-finalize + block_scan deferred to Plan 02. rocm oracle green on gfx1100, max rel_div 9.6e-14 (reported, not GPU-06-signed-off)
 - [Phase ?]: 07.1-02: block_scan_kernel scoped single-cube (N<=CUBE_DIM); cross-cube scan carry is the first forward dependency for 7.2/7.3 (Open Q2), documented not silently cut
 - [Phase ?]: 07.1-02 (Open Q1 RESOLVED): gfx1100/HIP at cubecl 0.10.0 lacks f64 atomic-add -> launch_block_reduce_atomic_f64 ran the documented HostSumFallback; D-03 atomic structure implemented+gated, real non-determinism sign-off -> 7.6
+- [Phase ?]: 07.3-01: FROZEN binSums layout (feature*n_bins+bin)*2+channel + der-handle-in/binSums-handle-out seam locked for Plans B/C/D + 7.5; histogram channel f64 on rocm/cuda/cpu, f32 on wgpu (WGSL has no f64 atomics, RESEARCH A1); MVP uses direct global Atomic fetch_add merge (shared-mem pre-reduce deferred as perf follow-up)
 
 ### Pending Todos
 
@@ -349,7 +351,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-20T07:21:10.485Z
+Last session: 2026-06-20T08:03:00.824Z
 Stopped at: Phase 7.3 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.

@@ -618,7 +618,7 @@ Plans:
 **Plans**: 4 plansPlans:
 **Wave 1**
 
-- [ ] 07.3-01-PLAN.md — Device seam + 8-bit non-binary hist2 fill (freeze binSums layout + der-handle-in/handle-out seam + atomic merge + self-oracle harness)
+- [x] 07.3-01-PLAN.md — Device seam + 8-bit non-binary hist2 fill (freeze binSums layout + der-handle-in/handle-out seam + atomic merge + self-oracle harness)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
