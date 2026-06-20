@@ -700,6 +700,186 @@ fn pairlogit_fixture() {
 }
 
 #[test]
+fn one_hot() {
+    // The one-hot overlay self-oracle (D-7.4-02 / SC-1 / SC-3): the COMPTIME `one_hot`
+    // predicate swap on the EXISTING non-binary (5/6/7-bit) and 8-bit-atomics kernels —
+    // upstream's `TCmpBinsOneByteTrait<OneHotPass>` template-bool whose `Compare` is
+    // `bin1 == bin2` instead of `(bin1 >= bin2) == flag` (split_properties_helpers.cuh:261).
+    // One-hot is NOT a separate hand-written kernel per width; it is one extra
+    // `#[comptime] one_hot: bool` flag on `pairwise_hist_nonbinary_kernel` /
+    // `pairwise_hist_8bit_atomics_kernel`, JIT-pruned with zero device divergence
+    // (RESEARCH Pattern 2). The half-byte/binary helpers take NO one_hot arg and are NOT
+    // called here (upstream has no `*_one_hot.cu` for them).
+    //
+    // The device 4-channel histogram with `one_hot = true` must match
+    // `host_reference_pairwise_hist(..., one_hot = true)` — the host reference uses the
+    // IDENTICAL one-hot Compare predicate via `add_pair_contrib` — within the REPORTED
+    // bound over the edge cases n_pairs=0 (empty, NO launch/read-back), n_pairs=1,
+    // n_pairs=37 (non-cube-multiple), and large N, for each of bits {5,6,7} and the 8-bit
+    // family. A flag that does NOTHING (silently equal to the non-one-hot path) is caught
+    // by the final sub-assertion: a one_hot=true vs one_hot=false run on a fixture where
+    // bin1 != bin2 occurs MUST yield different histograms (T-07.4-21).
+    let n_features = 2usize;
+
+    // --- 5/6/7-bit non-binary one-hot overlay ---
+    {
+        let n_objects = 64usize;
+        for &bits in &[5u32, 6u32, 7u32] {
+            let n_bins = 1usize << bits;
+
+            // Empty (n_pairs=0): NO launch, NO read-back (Pitfall 5).
+            {
+                let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, 0);
+                let device = launch_pairwise_hist(
+                    &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, bits, true,
+                )
+                .unwrap();
+                assert!(
+                    device.is_empty(),
+                    "empty one-hot input must yield an empty pairwise histogram (no launch) at bits={bits}"
+                );
+            }
+
+            for &n_pairs in &[1usize, 37usize, 10_000usize] {
+                let (pi, pj, pw, cindex) =
+                    make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+                let device = launch_pairwise_hist(
+                    &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, bits, true,
+                )
+                .unwrap();
+                let baseline = host_reference_pairwise_hist(
+                    &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, true,
+                );
+                assert_eq!(
+                    device.len(),
+                    baseline.len(),
+                    "one-hot device binSums length must equal the host-reference 4-channel layout (bits={bits}, n_pairs={n_pairs})"
+                );
+                let (abs, rel) = max_divergence(&device, &baseline);
+                println!(
+                    "[pair_hist one_hot {bits}bit f64 n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+                );
+                assert!(
+                    rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+                    "{bits}-bit one-hot pairwise hist (n_pairs={n_pairs}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+                );
+            }
+        }
+    }
+
+    // --- 8-bit-atomics one-hot overlay ---
+    {
+        let n_objects = 300usize; // > 256 so bins span the full 8-bit range
+        let n_bins = 256usize;
+
+        // Empty (n_pairs=0): NO launch, NO read-back.
+        {
+            let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, 0);
+            let device = launch_pairwise_hist_8bit(
+                &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, true,
+            )
+            .unwrap();
+            assert!(
+                device.is_empty(),
+                "empty one-hot input must yield an empty 8-bit-atomics pairwise histogram (no launch)"
+            );
+        }
+
+        for &n_pairs in &[1usize, 37usize, 10_000usize] {
+            let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+            let device = launch_pairwise_hist_8bit(
+                &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, true,
+            )
+            .unwrap();
+            let baseline = host_reference_pairwise_hist(
+                &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, true,
+            );
+            assert_eq!(
+                device.len(),
+                baseline.len(),
+                "one-hot 8-bit device binSums length must equal the host-reference 4-channel layout (n_pairs={n_pairs})"
+            );
+            let (abs, rel) = max_divergence(&device, &baseline);
+            println!(
+                "[pair_hist one_hot 8bit-atomics f64 n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+            );
+            assert!(
+                rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+                "8-bit-atomics one-hot pairwise hist (n_pairs={n_pairs}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+            );
+        }
+    }
+
+    // --- The predicate ACTUALLY swaps (T-07.4-21): one_hot=true vs one_hot=false on a
+    // fixture where bin1 != bin2 occurs MUST produce different histograms, and each must
+    // match its OWN host reference. A comptime flag that silently does nothing fails here.
+    {
+        let n_objects = 64usize;
+        let bits = 5u32;
+        let n_bins = 1usize << bits;
+        let n_pairs = 200usize; // large enough that bin1 != bin2 occurs across the fixture
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+
+        // Sanity: the fixture must contain at least one pair with bin1 != bin2 for feature
+        // 0, otherwise the swap is vacuously untestable.
+        let has_unequal = (0..n_pairs).any(|p| {
+            let oi = pi[p] as usize;
+            let oj = pj[p] as usize;
+            cindex[oi] != cindex[oj]
+        });
+        assert!(
+            has_unequal,
+            "one_hot swap test requires a fixture with at least one bin1 != bin2 pair"
+        );
+
+        let dev_one_hot = launch_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, bits, true,
+        )
+        .unwrap();
+        let dev_non_one_hot = launch_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, bits, false,
+        )
+        .unwrap();
+
+        // Each device run matches its OWN host reference (so neither is just garbage).
+        let ref_one_hot = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, true,
+        );
+        let ref_non_one_hot = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, false,
+        );
+        let (abs_oh, rel_oh) = max_divergence(&dev_one_hot, &ref_one_hot);
+        let (abs_no, rel_no) = max_divergence(&dev_non_one_hot, &ref_non_one_hot);
+        assert!(
+            rel_oh <= PAIR_HIST_BOUND || abs_oh <= PAIR_HIST_BOUND,
+            "one_hot=true device run must match its host reference: abs={abs_oh:.3e} rel={rel_oh:.3e}"
+        );
+        assert!(
+            rel_no <= PAIR_HIST_BOUND || abs_no <= PAIR_HIST_BOUND,
+            "one_hot=false device run must match its host reference: abs={abs_no:.3e} rel={rel_no:.3e}"
+        );
+
+        // The two HOST references differ (the predicate swap changes the channel mapping)
+        // — proving the test fixture actually exercises the swap, independent of the GPU.
+        let (ref_abs, _ref_rel) = max_divergence(&ref_one_hot, &ref_non_one_hot);
+        assert!(
+            ref_abs > PAIR_HIST_BOUND,
+            "the one-hot vs non-one-hot HOST references must differ on a bin1!=bin2 fixture (ref_abs={ref_abs:.3e}) — otherwise the swap is untestable"
+        );
+
+        // The two DEVICE histograms differ (the comptime flag is not a no-op).
+        let (dev_abs, _dev_rel) = max_divergence(&dev_one_hot, &dev_non_one_hot);
+        println!(
+            "[pair_hist one_hot SWAP 5bit n_pairs={n_pairs}] one_hot vs non-one-hot device max abs diff={dev_abs:.3e}"
+        );
+        assert!(
+            dev_abs > PAIR_HIST_BOUND,
+            "one_hot=true and one_hot=false device histograms must DIFFER on a bin1!=bin2 fixture (dev_abs={dev_abs:.3e}) — a comptime flag that does nothing fails here"
+        );
+    }
+}
+
+#[test]
 fn length_mismatch_is_typed_error() {
     // T-07.4-01: mismatched pair_i/pair_j/pair_weight/cindex lengths must surface a typed
     // `CbError::LengthMismatch` BEFORE any launch (a host-side guard), never an OOB device
