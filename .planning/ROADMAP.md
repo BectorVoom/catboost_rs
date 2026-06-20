@@ -592,7 +592,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 07.2-01-PLAN.md — Generalize the der launch seam over SelectedRuntime + RMSE der1/der2 device-resident handle hand-off + RMSE self-oracle on rocm (checkpoint: confirm der/weight handle contract for 7.3 first)
+- [x] 07.2-01-PLAN.md — Generalize the der launch seam over SelectedRuntime + RMSE der1/der2 device-resident handle hand-off + RMSE self-oracle on rocm (checkpoint: confirm der/weight handle contract for 7.3 first) — **COMPLETE** (1c5cc90 seam / a8f0f7a oracle): `DerBinaryKernel`+`launch_der_binary_handle` (Handle, no read-back — the 7.3 hand-off seam)+`launch_der_binary` (host-readback wrapper)+`const_der_handle` (RMSE der2=-1.0) in `gpu_runtime.rs`; reuses the authored `gradient_kernel` unchanged (D-7.2-03). Task-1 contract APPROVED: UNWEIGHTED der handles, weight folded downstream by 7.3 `histogram_scatter_kernel`. New all-backend `kernels/gradient_gpu.rs` self-oracle (f64 n=37 / f32 n=64 / edge empty,n=1,large-N / device-residency hand-off) — rocm gfx1100 4/4 GREEN, REPORTED divergence 0.0e0 (D-7.2-06: report, not sign-off the GPU-06 epsilon). TWO Rule-1 HIP handle-lifecycle fixes (same-client launch+read; never read empty handles). wgpu+cuda build RC=0; SC-4: cb-compute cubecl-free + cb-compute/cb-core/cb-model byte-unchanged. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY.
 
 **Wave 2** *(blocked on Wave 1)*
 

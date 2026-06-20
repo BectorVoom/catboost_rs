@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 7.2 context gathered
-last_updated: "2026-06-20T06:29:40.591Z"
-last_activity: 2026-06-20 -- Phase 7.2 planning complete
+stopped_at: Completed 07.2-01-PLAN.md
+last_updated: "2026-06-20T07:10:00.000Z"
+last_activity: 2026-06-20 -- 07.2-01 on-device RMSE der seam COMPLETE
 progress:
   total_phases: 20
   completed_phases: 12
-  total_plans: 93
-  completed_plans: 93
+  total_plans: 96
+  completed_plans: 94
   percent: 60
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 07.1 — gpu-backend-runtime-device-primitives
+**Current focus:** Phase 7.2 — On-Device Gradient/Hessian & Targets
 
 ## Current Position
 
-Phase: 7.2
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-06-20 -- Phase 7.2 planning complete
+Phase: 7.2 (On-Device Gradient/Hessian & Targets) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 7.2 (07.2-01 COMPLETE)
+Last activity: 2026-06-20 -- 07.2-01 on-device RMSE der seam COMPLETE (GPU-01: RMSE der1/der2 device-resident over SelectedRuntime, unweighted device Handles hand-off seam, rocm gfx1100 self-oracle 4/4 green 0.0e0 divergence; commits 1c5cc90 + a8f0f7a)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -136,6 +136,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 06.6 P08 | 35min | 2 tasks | 9 files |
 | Phase 07.1 P01 | 1h 8m | 2 tasks | 7 files |
 | Phase 07.1 P02 | 6m | 2 tasks | 4 files |
+| Phase 07.2 P01 | ~18m | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -143,6 +144,8 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [07.2-01 on-device RMSE der seam — COMPLETE, GPU-01 first vertical slice]: RMSE der1/der2 now run device-resident over the compile-time `SelectedRuntime` (rocm/wgpu/cuda/cpu) and are returned as device buffer HANDLES with NO host fold (SC-3 / D-7.2-04). `gpu_runtime.rs` gains `DerBinaryKernel` (RmseGradient arm), `launch_der_binary_handle` (Handle, no read-back — the 7.3 histogram hand-off seam), `launch_der_binary` (host-readback wrapper, self-oracle only), `const_der_handle` (RMSE der2 = -1.0 const device buffer), and a private single-geometry `launch_der_binary_into(client,...)`. The authored `gradient_kernel` is REUSED unchanged (D-7.2-03). **Task-1 contract (pre-approved):** UNWEIGHTED der handles; the per-object weight is folded DOWNSTREAM by the 7.3 `histogram_scatter_kernel` (`contrib[i]=der1[i]*weight[i]`), NOT in-kernel — so the der is byte-identical in structure to the `cb-compute::loss` baseline. New all-backend self-oracle `kernels/gradient_gpu.rs` (mounted `#[cfg(test)] mod gradient_gpu`, like reduce/scan): RMSE der1 vs `cb_compute::rmse_der1`/`rmse_der2`, fixtures f64 n=37 / f32 n=64 / edge (empty,n=1,large-N=10k) / device-residency hand-off — rocm gfx1100 4/4 GREEN with REPORTED max abs/rel divergence **0.0e0** for every fixture (D-7.2-06: report, NOT sign-off the GPU-06 epsilon — 7.6's job). **TWO Rule-1 deviations (HIP handle-lifecycle):** (1) the readback wrapper MUST launch and read with the SAME client — a CubeCL Handle is bound to its originating client's allocator/stream; reading via a second freshly-built client aborted the HIP IO controller (`slice::from_raw_parts requires the pointer to be aligned and non-null`); fixed by `launch_der_binary_into(client,...)`. (2) empty (0-length) device handles are NEVER read back — `read_one` on an empty HIP buffer hits the SAME null-pointer precondition; the empty oracle case asserts `const_der_handle(-1.0,0).is_ok()` (constructs) WITHOUT reading. CubeCL guideline consulted (`Cubecl_basic_operations.md` canonical one-client launch+read) before fixing, per AGENTS.md. wgpu + cuda build RC=0; SC-4 structural: cb-compute stays cubecl-free (`cargo tree -e features -p cb-compute` clean), cb-compute/cb-core/cb-model BYTE-UNCHANGED. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits 1c5cc90 (Task2 seam) / a8f0f7a (Task3 oracle + Rule-1 fixes).
 
 - [06.6-02 FEAT-03 monotone constraints (oblivious) — COMPLETE, oracle ≤1e-5]: Monotone constraints (+1/-1/0 per float feature) ship as a VERBATIM isotonic (PAVA) leaf-delta projection. `cb_compute::calc_monotonic_leaf_deltas` + `build_monotonic_linear_orders` transcribe `monotonic_constraint_utils.cpp:4-143` (BuildMonotonicLinearOrdersOnLeafs bitmask order + CalcOneDimensionalIsotonicRegression level-set PAVA) + `approx_calcer.cpp:551-590` (CalcMonotonicLeafDeltasSimple) exactly; level-set averages use the weighted-mean accumulator (no raw fold, D-08). `BoostParams.monotone_constraints: Vec<i8>` + `monotone_constraints_default()` (empty) threaded into the DIAGONAL POINTWISE leaf branch via `tree_monotone_constraints` (GetTreeMonotoneConstraints) + `monotonic_leaf_isotonic_weights` (Gradient SumWeights+l2 / Newton -SumDer2+l2), AFTER compute_leaf_deltas and BEFORE normalize_leaf_values (curr==0, leaf_estimation_iterations==1), gated on non-empty+non-trivial constraints so the default path is byte-identical (D-6.6-05). cb-train forward-bit leaf_index (split i → bit 1<<i) verified == upstream currDepthBitMask. **TWO key findings (deviations):** (1) the oracle test lives in `cb-train/tests/` not `cb-compute/tests/` (cb-compute has no train entry point; matches FEAT-04 penalty_oracle placement); (2) CatBoost AUTO-enables `model_shrink_rate` (~0.01, a per-tree leaf decay) the moment monotone constraints are present — the fixture pins `model_shrink_rate=0` to ISOLATE the PAVA, and uses binding constraints `[-1,0,1,0]` (the initial `[1,0,-1,0]` was a no-op/vacuous on numeric_tiny). **Escalated gaps (D-6.6-07):** `validate_monotone_constraints` rejects malformed directions now; the `grow_policy == Region` and `monotone × {Lossguide,Depthwise}` typed-error guards are DEFERRED to Plan 06.6-04 (grow_policy does not exist yet — the do-NOT-invent-a-partial-enum directive), recorded as a commented `// TODO(06.6-04)` stub in monotone_oracle_test.rs (no silent drop) and in 06.6-04's acceptance criteria. Gates: cb-compute lib 185/185 (+8 PAVA unit tests), cb-train lib 228/228, monotone_oracle_test 2/2 (LeafValues/StagedApprox/Predictions ≤1e-5 + end-to-end non-increasing-in-feature-0 + typed-error guard), penalty + sampled oracles green (default byte-identical), `cargo check --workspace --tests` clean. With FEAT-04 (06.6-01), Gate-A SC-1 symmetric-features strand satisfied. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commits 5c2761c (Task1 PAVA+param+guard) / fb40de4 (Task2 oracle+fixture).
 
