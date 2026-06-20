@@ -704,7 +704,7 @@ Plans:
 
 **Wave 4** *(blocked on 07.5-03)*
 
-- [ ] 07.5-04-PLAN.md — Multi-tree boosting pass: grow_boosting_pass device-resident loop (device-side der recompute + persistent-buffer reuse); per-tree structure exact vs CPU, leaf values + the D-7.5-06 argmax-flip boundary REPORTED
+- [x] 07.5-04-PLAN.md — Multi-tree boosting pass: grow_boosting_pass device-resident loop (device-side der recompute + persistent-buffer reuse); per-tree structure exact vs CPU, leaf values + the D-7.5-06 argmax-flip boundary REPORTED
 
 **Wave 5** *(blocked on 07.5-01, 07.5-03)*
 
