@@ -947,3 +947,244 @@ mod multi_tree {
         );
     }
 }
+
+// ===========================================================================
+// Pairwise grow-loop cross-oracle (Phase 7.5 Plan 06; SC-3 — the GPU-01 final slice):
+// grow ONE oblivious tree device-resident via `grow_oblivious_tree_pairwise` on a
+// ranking/PairLogit fixture (the FROZEN 7.4 4-channel pairwise fill + the pairwise split
+// scorer path) and assert its STRUCTURE — the split `(feature, bin)` sequence AND the
+// per-object `leaf_of` — matches the INLINE CPU pairwise grow reference EXACTLY (the
+// strict bar). The CPU reference is the depth-1 transcription of
+// `cb_train::greedy_tensor_search_oblivious_pairwise` / `select_level_pairwise`
+// (`tree.rs:2240-2350`), built on the FROZEN read-only `cb_compute` pairwise scorer
+// (`compute_der_sums` / `compute_pair_weight_statistics` / `calculate_pairwise_score`) —
+// NOT imported from cb-train (the Plan-A landmine). Leaf-value divergence vs
+// `cb_compute::calc_average` is REPORTED (NOT the GPU-06 epsilon — 7.6's job).
+// ===========================================================================
+
+mod pairwise {
+    use super::*;
+    use crate::gpu_runtime::grow_oblivious_tree_pairwise;
+    use cb_compute::{
+        calculate_pairwise_score, compute_der_sums, compute_pair_weight_statistics,
+    };
+
+    /// A ranking/PairLogit fixture: `n` objects over `n_features` quantized features
+    /// (`n_bins` bins each, feature-major cindex), a pairwise-weighted `der1`, and a global
+    /// competitor pair list with non-trivial weights (winner→loser within a sliding
+    /// window — the ranking adjacency). Feature 0's bins climb monotonically with the
+    /// object index so a mid-range border carves a clear pairwise-gain split. Returns
+    /// `(der1, weight, pair_i, pair_j, pair_weight, cindex, indices)`.
+    #[allow(clippy::type_complexity)]
+    fn make_ranking_fixture(
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u32>, Vec<f64>, Vec<u32>, Vec<u32>) {
+        let der1: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
+        let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
+        let mut cindex = vec![0u32; n_features * n];
+        for feature in 0..n_features {
+            for obj in 0..n {
+                let bin = if feature == 0 {
+                    ((obj * n_bins) / n.max(1)).min(n_bins - 1)
+                } else {
+                    (obj * (feature + 2) + feature) % n_bins
+                };
+                cindex[feature * n + obj] = bin as u32;
+            }
+        }
+        let mut pair_i: Vec<u32> = Vec::new();
+        let mut pair_j: Vec<u32> = Vec::new();
+        let mut pair_weight: Vec<f64> = Vec::new();
+        for w in 0..n {
+            for l in (w + 1)..(w + 4).min(n) {
+                pair_i.push(w as u32);
+                pair_j.push(l as u32);
+                pair_weight.push(0.5 + ((w + l) % 5) as f64 * 0.25);
+            }
+        }
+        let indices: Vec<u32> = (0..n as u32).collect();
+        (der1, weight, pair_i, pair_j, pair_weight, cindex, indices)
+    }
+
+    /// The INLINE CPU pairwise LEVEL-0 grow reference — the strict-first-wins pairwise
+    /// argmax over the candidates in ascending `(feature, border)` order, TRANSCRIBED from
+    /// `cb_train::select_level_pairwise` (`tree.rs:2240-2287`) over the FROZEN read-only
+    /// `cb_compute` pairwise scorer (leaf_count == 1, the root). Returns the chosen
+    /// `(feature, border)` or `None`. Strict `>` (first-wins) == `select_best_candidate`.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_best_pairwise_stump(
+        der1: &[f64],
+        pair_i: &[u32],
+        pair_j: &[u32],
+        pair_weight: &[f64],
+        cindex: &[u32],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        l2_diag_reg: f64,
+        prior_reg: f64,
+    ) -> Option<(usize, usize)> {
+        let leaf_count = 1usize;
+        let bucket_count = n_bins;
+        let n_splits = bucket_count - 1;
+        let leaf_of = vec![0usize; n];
+        let pairs: Vec<(usize, usize, f64)> = pair_i
+            .iter()
+            .zip(pair_j.iter())
+            .zip(pair_weight.iter())
+            .map(|((&i, &j), &w)| (i as usize, j as usize, w))
+            .collect();
+
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for feature in 0..n_features {
+            let bucket_of: Vec<usize> = (0..n)
+                .map(|obj| cindex[feature * n + obj] as usize)
+                .collect();
+            let der_sums =
+                compute_der_sums(der1, leaf_count, bucket_count, &leaf_of, &bucket_of)
+                    .expect("compute_der_sums must succeed");
+            let pws = compute_pair_weight_statistics(
+                &pairs, leaf_count, bucket_count, &leaf_of, &bucket_of,
+            )
+            .expect("compute_pair_weight_statistics must succeed");
+            let scores = calculate_pairwise_score(
+                &der_sums, &pws, bucket_count, l2_diag_reg, prior_reg,
+            )
+            .expect("calculate_pairwise_score must succeed");
+            // Border-ascending enumeration; strict first-wins (== select_best_candidate).
+            for border in 0..n_splits {
+                let s = scores.get(border).copied().unwrap_or(f64::NEG_INFINITY);
+                if s > best_score {
+                    best_score = s;
+                    best = Some((feature, border));
+                }
+            }
+        }
+        best
+    }
+
+    /// Grow a depth-1 pairwise oblivious tree (the MVP vertical slice) on the
+    /// ranking/PairLogit fixture via the device pairwise fill + pairwise split scorer path,
+    /// and assert the device STRUCTURE matches the inline CPU pairwise grow reference
+    /// EXACTLY (split `(feature, border)` + per-object `leaf_of` == `leaf_index`), then
+    /// REPORT the leaf-value divergence vs `cb_compute::calc_average`. This closes GPU-01.
+    #[test]
+    fn matches_cpu_pairwise_grow() {
+        let n_features = 3usize;
+        let n_bins = 32usize; // 5-bit, <= CUBE_DIM
+        let depth = 1usize;
+        let l2_diag_reg = 3.0_f64;
+        let prior_reg = 0.1_f64;
+
+        for &n in &[8usize, 37usize, 200usize] {
+            let (der1, weight, pi, pj, pw, cindex, indices) =
+                make_ranking_fixture(n, n_features, n_bins);
+            // The leaf-value scaling (the SAME scale_l2_reg the device leaf step consumes).
+            let scaled_l2 = {
+                let sum_w = sum_f64(&weight);
+                cb_compute::scale_l2_reg(l2_diag_reg, sum_w, n)
+            };
+
+            // Device: grow the pairwise tree host-light over SelectedRuntime.
+            let tree = grow_oblivious_tree_pairwise(
+                &der1, &weight, &pi, &pj, &pw, &cindex, &indices, n_bins, n_features, depth,
+                l2_diag_reg, prior_reg, scaled_l2, false,
+            )
+            .expect("grow_oblivious_tree_pairwise must succeed on the ranking fixture");
+
+            // CPU reference: the strict-first-wins level-0 pairwise stump (inline).
+            let cpu_split = cpu_best_pairwise_stump(
+                &der1, &pi, &pj, &pw, &cindex, n, n_features, n_bins, l2_diag_reg, prior_reg,
+            )
+            .expect("CPU pairwise reference must find a candidate split");
+
+            // (A) STRUCTURE — the split (feature, border) sequence must match EXACTLY.
+            assert_eq!(
+                tree.splits.len(),
+                depth,
+                "device pairwise tree must have exactly `depth` splits (n={n})"
+            );
+            let (dev_feat, dev_bin) = tree.splits[0];
+            assert_eq!(
+                (dev_feat as usize, dev_bin as usize),
+                cpu_split,
+                "device pairwise split (feature, border) must match CPU pairwise first-wins \
+                 (n={n}): device=({dev_feat}, {dev_bin}) cpu={cpu_split:?}"
+            );
+
+            // (B) STRUCTURE — per-object leaf_of must equal CPU leaf_index forward-bit.
+            let (cpu_feature, cpu_bin) = cpu_split;
+            let cpu_leaf_of: Vec<u32> = (0..n)
+                .map(|obj| {
+                    let passes = [(cindex[cpu_feature * n + obj] as usize) > cpu_bin];
+                    cpu_leaf_index(&passes) as u32
+                })
+                .collect();
+            assert_eq!(
+                tree.leaf_of, cpu_leaf_of,
+                "device pairwise leaf_of must equal CPU leaf_index forward-bit (n={n})"
+            );
+
+            // (C) LEAF VALUES — REPORTED divergence vs CPU calc_average over the SAME leaf
+            //     partition (NOT signed off — 7.6 owns the epsilon, D-7.5-05).
+            let n_leaves = 1usize << depth;
+            let mut cpu_leaf_values = vec![0.0_f64; n_leaves];
+            for leaf in 0..n_leaves {
+                let mut der_seg: Vec<f64> = Vec::new();
+                let mut w_seg: Vec<f64> = Vec::new();
+                for obj in 0..n {
+                    if cpu_leaf_of[obj] as usize == leaf {
+                        der_seg.push(der1[obj]);
+                        w_seg.push(weight[obj]);
+                    }
+                }
+                cpu_leaf_values[leaf] =
+                    cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+            }
+            assert_eq!(
+                tree.leaf_values.len(),
+                cpu_leaf_values.len(),
+                "device pairwise leaf_values length must equal n_leaves (n={n})"
+            );
+            let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
+            println!(
+                "[pairwise_grow n={n}] STRUCTURE match: split={cpu_split:?}; REPORTED leaf-value \
+                 max abs_div={abs:.3e} rel_div={rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+            assert!(
+                rel <= LEAF_BOUND || abs <= LEAF_BOUND,
+                "device pairwise leaf values (n={n}) diverged beyond the REPORTED bound: \
+                 abs={abs:.3e} rel={rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+        }
+    }
+
+    /// `depth > 1` surfaces the typed `CbError::OutOfRange` documenting the partition-aware
+    /// pairwise-assembly forward dependency — NOT a silently-mislabeled stump.
+    #[test]
+    fn depth_gt_one_is_tracked_forward_dependency() {
+        let n_features = 2usize;
+        let n_bins = 32usize;
+        let n = 40usize;
+        let (der1, weight, pi, pj, pw, cindex, indices) =
+            make_ranking_fixture(n, n_features, n_bins);
+        let scaled_l2 = {
+            let sum_w = sum_f64(&weight);
+            cb_compute::scale_l2_reg(3.0, sum_w, n)
+        };
+
+        let err = grow_oblivious_tree_pairwise(
+            &der1, &weight, &pi, &pj, &pw, &cindex, &indices, n_bins, n_features, 2, 3.0, 0.1,
+            scaled_l2, false,
+        )
+        .expect_err("depth > 1 must surface a typed forward-dependency error, not a stump");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("depth") && msg.contains("forward dependency"),
+            "depth>1 error must name the partition-aware pairwise-assembly forward dependency: {msg}"
+        );
+    }
+}

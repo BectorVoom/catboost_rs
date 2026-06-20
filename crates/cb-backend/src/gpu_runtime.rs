@@ -4166,3 +4166,235 @@ fn select_best_split_over_scores(
         Ok(None)
     }
 }
+
+/// Grow ONE oblivious tree device-resident over the compile-time [`SelectedRuntime`]
+/// using the PAIRWISE split scorer path (GPU-01 ranking slice). The pairwise sibling of
+/// [`grow_oblivious_tree`]: per level it chains the FROZEN 7.4 4-channel pairwise fill +
+/// the device der-sum scatter -> [`launch_pairwise_split_score`] (the per-leaf
+/// linear-system build + the host Cholesky solve, RESEARCH Open Q3) -> ONE O(1)
+/// [`BestSplit`] read-back -> the host integer split decision -> the loss-agnostic Plan-C
+/// [`launch_partition_split_into`] (forward-bit doc-routing) -> [`launch_partition_update_into`]
+/// (per-partition Σ der1 / Σ weight reduce), over persistent device handles threaded
+/// through ONE `ComputeClient`. At the leaves it reads back ONLY the `2^depth` part-stats
+/// and computes leaf values via the FROZEN `cb_compute::calc_average`. The bulk pairwise
+/// histogram / partition / doc-routing NEVER crosses to host per level (D-05).
+///
+/// # MVP scope (depth == 1) — the partition-aware forward dependency
+///
+/// The MVP grows a depth-1 pairwise stump (leaf_count == 1 at level 0, the root) — the
+/// genuinely-complete vertical slice consistent with 07.5-03/04/05. The pairwise scorer's
+/// per-leaf system is `2*leaf_count == 2` at the root. A `depth > 1` tree scores each
+/// level over the CURRENT 2^level partitions (the partition-aware der-sum + pair-weight
+/// assembly), the SAME forward dependency the pointwise [`grow_oblivious_tree`] surfaces;
+/// `depth > 1` returns a typed [`CbError::OutOfRange`] until it lands (documented, NOT
+/// silently cut). PairLogit/ranking, foldCount == 1, Plain.
+///
+/// # Inputs
+///
+/// `der1` (the pairwise-weighted first derivative, length `n`), `weight` (channel 1,
+/// length `n`), `pair_i`/`pair_j`/`pair_weight` (the global competitor pairs), `cindex`
+/// (feature-major quantized bins, length `n_features * n`), `indices` (object visiting
+/// order, length `n`), `n_bins` (`1 << bits`, bits in {5,6,7}), `n_features`, `depth`,
+/// `l2_diag_reg` (raw `l2_leaf_reg`), `pairwise_bucket_weight_prior_reg`
+/// (`bayesian_matrix_reg`, default `0.1`), `scaled_l2` (the per-tree leaf-value scaling),
+/// `one_hot`.
+///
+/// # Errors
+///
+/// [`CbError::OutOfRange`] if `depth > 1` or a dimension overflows; [`CbError::Degenerate`]
+/// if a level finds no candidate split or a read-back fails (never a silent zero buffer);
+/// the FROZEN 7.4 guards (via the fill / score / partition launches). No
+/// `unwrap`/`expect`/`panic`/indexing.
+#[allow(clippy::too_many_arguments)]
+pub fn grow_oblivious_tree_pairwise(
+    der1: &[f64],
+    weight: &[f64],
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    depth: usize,
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    scaled_l2: f64,
+    one_hot: bool,
+) -> CbResult<GrownTree> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    grow_oblivious_tree_pairwise_into(
+        &client,
+        der1,
+        weight,
+        pair_i,
+        pair_j,
+        pair_weight,
+        cindex,
+        indices,
+        n_bins,
+        n_features,
+        depth,
+        l2_diag_reg,
+        pairwise_bucket_weight_prior_reg,
+        scaled_l2,
+        one_hot,
+    )
+}
+
+/// The ONE pairwise grow-loop geometry (IN-02 — one place). Uploads the resident
+/// der1/weight/cindex/indices/leaf_of handles ONCE onto `client`, runs the per-depth
+/// pairwise launch chain over those persistent handles, and reads back ONLY the O(1)
+/// BestSplit per level + the final `2^depth` part-stats. The caller owns the `client`
+/// lifecycle so every read-back uses the SAME client that allocated the handles.
+#[allow(clippy::too_many_arguments)]
+fn grow_oblivious_tree_pairwise_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    weight: &[f64],
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    depth: usize,
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    scaled_l2: f64,
+    one_hot: bool,
+) -> CbResult<GrownTree> {
+    let n = der1.len();
+
+    // Empty short-circuit (Pitfall 3/5).
+    if n == 0 || n_features == 0 || n_bins == 0 || depth == 0 {
+        return Ok(GrownTree {
+            splits: Vec::new(),
+            leaf_of: vec![0u32; n],
+            leaf_values: Vec::new(),
+            part_stats: Vec::new(),
+        });
+    }
+
+    // MVP scope guard: the depth-1 pairwise stump scores over the single root leaf
+    // (leaf_count == 1). A depth>1 level scores over 2^level partitions (the
+    // partition-aware der-sum + pair-weight assembly) — the EXPLICIT tracked forward
+    // dependency (the SAME class as the pointwise grow loop's depth>1 guard). Reject with
+    // a typed error rather than fabricating a wrong-structure deep tree.
+    if depth > 1 {
+        return Err(CbError::OutOfRange(format!(
+            "grow_oblivious_tree_pairwise supports depth <= 1 until the partition-aware \
+             (per-leaf, leaf_count > 1) pairwise der-sum + pair-weight assembly lands (the \
+             depth-1 stump scores the single root leaf; a depth>1 level scores over 2^level \
+             partitions — the EXPLICIT tracked forward dependency); got depth = {depth}"
+        )));
+    }
+
+    // 2^depth leaf count, overflow-checked.
+    let n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+
+    let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
+        CbError::OutOfRange(format!("n_features ({n_features}) * n ({n}) overflows usize"))
+    })?;
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+
+    // Resident device handles uploaded ONCE (the D-05 persistent-buffer contract).
+    let der1_h = upload_channel_floats(client, der1);
+    let weight_h = upload_channel_floats(client, weight);
+    let cindex_h = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+    let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
+
+    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+
+    for level in 0..depth {
+        // (1) Device pairwise fill + der-sum scatter + score + deterministic argmax over
+        //     the CURRENT (root) partition. The bulk 4-channel histogram + der-sum scatter
+        //     stay device-resident IN the score launch; only the O(1) BestSplit crosses back.
+        let scored = launch_pairwise_split_score_into(
+            client,
+            der1,
+            pair_i,
+            pair_j,
+            pair_weight,
+            cindex,
+            indices,
+            n_bins,
+            n_features,
+            l2_diag_reg,
+            pairwise_bucket_weight_prior_reg,
+            one_hot,
+        )?;
+
+        // (2) The O(1) host integer split decision. No candidate -> a degenerate dataset.
+        let split = scored.best.ok_or_else(|| {
+            CbError::Degenerate(format!(
+                "grow_oblivious_tree_pairwise level {level}: no candidate split (degenerate)"
+            ))
+        })?;
+        splits.push((split.feature_id, split.bin_id));
+
+        // (3) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
+        //     `leaf_index` convention) — IN-PLACE on device, NO read-back here (D-05).
+        leaf_of_h = launch_partition_split_into(
+            client,
+            der1_h.clone(),
+            cindex_h.clone(),
+            indices_h.clone(),
+            leaf_of_h,
+            n,
+            cindex_stride,
+            split.feature_id,
+            split.bin_id,
+            level as u32,
+        )?;
+    }
+
+    // (4) Device partition-update: the per-partition Σ der1 / Σ weight reduce over the
+    //     final 2^depth partitions, device-resident.
+    let part_stats_h = launch_partition_update_into(
+        client,
+        der1_h.clone(),
+        weight_h.clone(),
+        indices_h.clone(),
+        leaf_of_h.clone(),
+        n,
+        n_leaves,
+    )?;
+
+    // (5) ONE read-back of the 2^depth part-stats (the ONLY bulk-data crossing besides the
+    //     O(1) per-level BestSplit — D-05). A read-back failure surfaces CbError::Degenerate.
+    let part_stats = read_part_stats_f64(client, part_stats_h)?;
+
+    // (6) Host leaf values via the FROZEN cb_compute::calc_average formula (count>0 guard).
+    let mut leaf_values = vec![0.0_f64; n_leaves];
+    for leaf in 0..n_leaves {
+        let sum = part_stats.get(leaf * 2).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 2 + 1).copied().unwrap_or(0.0);
+        if let Some(slot) = leaf_values.get_mut(leaf) {
+            *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
+        }
+    }
+
+    // (7) The per-object leaf assignment (the SC-3 structure observation): the grow loop
+    //     never reads the bulk routing back (D-05); this single read-back at the END is
+    //     the oracle seam (the same crossing class as the final part-stats).
+    let leaf_of = read_u32_handle(client, leaf_of_h)?;
+
+    Ok(GrownTree {
+        splits,
+        leaf_of,
+        leaf_values,
+        part_stats,
+    })
+}
