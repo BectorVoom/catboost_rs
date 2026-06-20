@@ -19,6 +19,13 @@ use cubecl::prelude::*;
 /// bound on the per-cube plane count (plane carry). This is the ONE permitted `32`
 /// (the launch-geometry / shared-memory size) — NOT a wave/warp-size literal in any
 /// reduction STRIDE (the strides derive from `CUBE_DIM_X` / `PLANE_DIM`, D-09).
+///
+/// PRECONDITION (WR-04): the launch cube width (`CUBE_DIM` in `gpu_runtime.rs`) MUST
+/// be a power of two. The fallback tree-reduce below halves its stride
+/// (`s = CUBE_DIM_X / 2; ...; s /= 2`), which only covers every element when the
+/// width is a power of two; a non-power-of-two width silently drops the top
+/// element(s). `gpu_runtime.rs` enforces this with a `const _: () =
+/// assert!(CUBE_DIM.is_power_of_two())` guard so any drift is a compile error.
 pub(crate) const BLOCK_REDUCE_SHMEM: usize = 32;
 
 /// Comptime worst-case `SharedMemory` size for the per-block 2-channel pointwise

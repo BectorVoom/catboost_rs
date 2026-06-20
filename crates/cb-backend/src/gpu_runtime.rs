@@ -97,6 +97,19 @@ const _: () = assert!(
      a wider launch would write past the kernels' SharedMemory (device-side OOB)"
 );
 
+/// WR-04 guard: the shared-mem tree-reduce in [`crate::kernels::block_reduce_kernel`]
+/// and [`crate::kernels::block_reduce_atomic_kernel`] halves the stride
+/// (`s = CUBE_DIM_X / 2; ...; s /= 2`), which only covers EVERY element when the cube
+/// width is a power of two. For a non-power-of-two `CUBE_DIM` the integer-halved
+/// stride never reaches the top element(s), silently dropping them from the sum.
+/// Coupling the precondition here makes any future launch-geometry change to a
+/// non-power-of-two width a COMPILE error rather than a silent wrong reduction.
+const _: () = assert!(
+    CUBE_DIM.is_power_of_two(),
+    "CUBE_DIM (launch width) must be a power of two — the shared-mem tree-reduce \
+     halves its stride and would silently drop the top element(s) otherwise"
+);
+
 /// Pointwise-histogram geometry guard (Phase 7.3 / Pitfall 3): the 8-bit non-binary
 /// fill's worst-case used prefix is `2 channels * (1 << 8) bins = 512`, which MUST
 /// fit the kernels' [`crate::kernels::HIST_SHMEM`] worst-case allocation. Coupling the
