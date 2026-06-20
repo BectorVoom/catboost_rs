@@ -19,6 +19,22 @@ use cubecl::prelude::*;
 
 use crate::kernels::{block_reduce_atomic_kernel, block_reduce_kernel};
 
+// IN-03: the "generous, run-stable" oracle bounds, hoisted into named consts shared
+// across this module's assertions so the Phase-7.6 epsilon sign-off edits ONE place
+// (and so the reduce and scan oracles cannot drift apart). These are NOT the final
+// GPU-06 epsilon — they only catch a wrong fold without pinning the signed-off bound.
+
+/// Generous relative bound for an f32 device sum vs the f64 CPU baseline.
+const F32_REL_TOL: f64 = 1e-3;
+/// Generous absolute bound for an f32 device sum vs the f64 CPU baseline.
+const F32_ABS_TOL: f64 = 1e-3;
+/// Generous relative bound for an f64 device sum vs the f64 CPU baseline.
+const F64_REL_TOL: f64 = 1e-9;
+/// Tight absolute bound for the small/exact f64 cases (n=1).
+const F64_ABS_TOL_TIGHT: f64 = 1e-12;
+/// Looser absolute bound for the large-N f64 accumulation case.
+const F64_ABS_TOL_LARGE_N: f64 = 1e-6;
+
 /// Launch `block_reduce_kernel::<F>` on the selected runtime and read back the
 /// per-cube partial sums. `use_plane` is passed explicitly so a test can drive
 /// EITHER path regardless of the hardware capability (the fallback is always valid;
@@ -157,7 +173,7 @@ fn block_reduce_matches_cpu_sum_f32() {
         // f32 device sum vs f64 baseline: a generous, run-stable relative bound that
         // catches a wrong fold without pinning the GPU-06 epsilon (7.6's job).
         assert!(
-            rel <= 1e-3 || abs <= 1e-3,
+            rel <= F32_REL_TOL || abs <= F32_ABS_TOL,
             "f32 reduce diverged too far (use_plane={use_plane}): abs={abs:.3e} rel={rel:.3e}"
         );
     }
@@ -180,7 +196,7 @@ fn block_reduce_matches_cpu_sum_f64_non_cube_multiple() {
             "[reduce f64 n=37] use_plane={use_plane} device_sum={dev} baseline={base} abs_div={abs:.3e} rel_div={rel:.3e}"
         );
         assert!(
-            rel <= 1e-9 || abs <= 1e-9,
+            rel <= F64_REL_TOL || abs <= F64_REL_TOL,
             "f64 reduce diverged too far (use_plane={use_plane}): abs={abs:.3e} rel={rel:.3e}"
         );
     }
@@ -204,10 +220,10 @@ fn block_reduce_edge_cases() {
         let input = vec![42.5_f64];
         let (dev, base, abs, _rel) = oracle_f64(&input, false);
         println!("[reduce f64 n=1] device_sum={dev} baseline={base} abs_div={abs:.3e}");
-        assert!(abs <= 1e-12, "n=1 reduce mismatch: abs={abs:.3e}");
+        assert!(abs <= F64_ABS_TOL_TIGHT, "n=1 reduce mismatch: abs={abs:.3e}");
         if has_plane {
             let (_d, _b, abs_p, _r) = oracle_f64(&input, true);
-            assert!(abs_p <= 1e-12, "n=1 plane reduce mismatch: abs={abs_p:.3e}");
+            assert!(abs_p <= F64_ABS_TOL_TIGHT, "n=1 plane reduce mismatch: abs={abs_p:.3e}");
         }
     }
 
@@ -217,7 +233,7 @@ fn block_reduce_edge_cases() {
         let (dev, base, abs, rel) = oracle_f64(&input, false);
         println!("[reduce f64 N=100000] device_sum={dev} baseline={base} abs_div={abs:.3e} rel_div={rel:.3e}");
         assert!(
-            rel <= 1e-9 || abs <= 1e-6,
+            rel <= F64_REL_TOL || abs <= F64_ABS_TOL_LARGE_N,
             "large-N reduce diverged too far: abs={abs:.3e} rel={rel:.3e}"
         );
     }
@@ -314,7 +330,7 @@ fn block_reduce_atomic_finalize_matches_cpu_sum_and_reports_variance() {
     // The atomic finalize must still land on the CPU baseline within a generous,
     // run-stable bound that catches a wrong fold without pinning the GPU-06 epsilon.
     assert!(
-        max_rel <= 1e-9 || max_abs <= 1e-9,
+        max_rel <= F64_REL_TOL || max_abs <= F64_REL_TOL,
         "atomic-finalize reduce diverged too far from baseline: abs={max_abs:.3e} rel={max_rel:.3e}"
     );
 }
@@ -365,7 +381,7 @@ fn block_reduce_atomic_kernel_direct_matches_cpu_sum() {
              REPORTED max abs_div={max_abs:.3e} max rel_div={max_rel:.3e}"
         );
         assert!(
-            max_rel <= 1e-9 || max_abs <= 1e-9,
+            max_rel <= F64_REL_TOL || max_abs <= F64_REL_TOL,
             "direct atomic-kernel reduce diverged too far (use_plane={use_plane}): abs={max_abs:.3e} rel={max_rel:.3e}"
         );
     }

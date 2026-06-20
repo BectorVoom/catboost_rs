@@ -27,6 +27,20 @@ use crate::kernels::block_scan_kernel;
 /// cube (N <= CUBE_DIM, Open Q2), so a single static cube is launched.
 const CUBE_DIM: usize = 32;
 
+// IN-03: the "generous, run-stable" oracle bounds, hoisted into named consts shared
+// across this module's assertions so the Phase-7.6 epsilon sign-off edits ONE place
+// (and so the reduce and scan oracles cannot drift apart). These are NOT the final
+// GPU-06 epsilon — they only catch a wrong scan without pinning the signed-off bound.
+
+/// Generous relative bound for an f32 device scan vs the f64 CPU baseline.
+const F32_REL_TOL: f64 = 1e-3;
+/// Generous absolute bound for an f32 device scan vs the f64 CPU baseline.
+const F32_ABS_TOL: f64 = 1e-3;
+/// Generous relative bound for an f64 device scan vs the f64 CPU baseline.
+const F64_REL_TOL: f64 = 1e-9;
+/// Tight absolute bound for the small/exact f64 cases (n=1, exclusive scan[0] == 0).
+const F64_ABS_TOL_TIGHT: f64 = 1e-12;
+
 /// Launch `block_scan_kernel::<F>` on the selected runtime and read back the
 /// per-element prefix-scan. `inclusive` is passed through as the kernel's comptime
 /// flag. The output is the SAME length as the input (a scan is not a reduction).
@@ -117,7 +131,7 @@ fn block_scan_inclusive_matches_cpu_prefix_sum_f64() {
     let (abs, rel) = max_divergence(&device, &baseline);
     println!("[scan f64 inclusive n=24] max abs_div={abs:.3e} rel_div={rel:.3e}");
     assert!(
-        rel <= 1e-9 || abs <= 1e-9,
+        rel <= F64_REL_TOL || abs <= F64_REL_TOL,
         "f64 inclusive scan diverged too far: abs={abs:.3e} rel={rel:.3e}"
     );
 }
@@ -132,14 +146,14 @@ fn block_scan_exclusive_matches_cpu_prefix_sum_f64() {
     assert_eq!(device.len(), input.len());
     // Exclusive scan: the first element MUST be exactly 0 (sum of nothing prior).
     assert!(
-        device[0].abs() <= 1e-12,
+        device[0].abs() <= F64_ABS_TOL_TIGHT,
         "exclusive scan[0] must be 0.0, got {}",
         device[0]
     );
     let (abs, rel) = max_divergence(&device, &baseline);
     println!("[scan f64 exclusive n=24] device[0]={} max abs_div={abs:.3e} rel_div={rel:.3e}", device[0]);
     assert!(
-        rel <= 1e-9 || abs <= 1e-9,
+        rel <= F64_REL_TOL || abs <= F64_REL_TOL,
         "f64 exclusive scan diverged too far: abs={abs:.3e} rel={rel:.3e}"
     );
 }
@@ -158,7 +172,7 @@ fn block_scan_inclusive_matches_cpu_prefix_sum_f32() {
     println!("[scan f32 inclusive n=30] max abs_div={abs:.3e} rel_div={rel:.3e}");
     // f32 device scan vs f64 baseline: a generous, run-stable relative bound.
     assert!(
-        rel <= 1e-3 || abs <= 1e-3,
+        rel <= F32_REL_TOL || abs <= F32_ABS_TOL,
         "f32 inclusive scan diverged too far: abs={abs:.3e} rel={rel:.3e}"
     );
 }
@@ -171,7 +185,7 @@ fn block_scan_edge_case_single_element() {
     let incl = run_scan(&input, true);
     assert_eq!(incl.len(), 1);
     assert!(
-        (incl[0] - 42.5).abs() <= 1e-12,
+        (incl[0] - 42.5).abs() <= F64_ABS_TOL_TIGHT,
         "n=1 inclusive scan must be [x]={}, got {}",
         42.5,
         incl[0]
@@ -180,7 +194,7 @@ fn block_scan_edge_case_single_element() {
     let excl = run_scan(&input, false);
     assert_eq!(excl.len(), 1);
     assert!(
-        excl[0].abs() <= 1e-12,
+        excl[0].abs() <= F64_ABS_TOL_TIGHT,
         "n=1 exclusive scan must be [0], got {}",
         excl[0]
     );
