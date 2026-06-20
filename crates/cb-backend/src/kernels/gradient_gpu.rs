@@ -21,7 +21,8 @@ use cubecl::prelude::*;
 
 use crate::gpu_runtime::{
     const_der_handle, launch_der_binary, launch_der_binary_handle, launch_der_param,
-    launch_der_unary, DerBinaryKernel, DerParamKernel, DerUnaryKernel,
+    launch_der_param_handle, launch_der_unary, launch_der_unary_handle, DerBinaryKernel,
+    DerParamKernel, DerUnaryKernel,
 };
 
 /// Compare the device der (cast to f64) to the CPU baseline element-wise, returning
@@ -585,5 +586,237 @@ fn quantile_der_edge_cases() {
         let (a, r) = max_divergence(&der1, &base);
         println!("[der quantile f64 n=10000] REPORTED max abs_div={a:.3e} rel_div={r:.3e}");
         assert!(r <= 1e-9 || a <= 1e-9, "quantile der1 (large-N) diverged: abs={a:.3e} rel={r:.3e}");
+    }
+}
+
+// ===========================================================================
+// Task 1 (Plan 07.2-03): Focal der1 (parametric, alpha/gamma as length-1
+// Array<F>) + der2 (parametric hessian, SAME params) self-oracle vs the
+// `cb-compute::loss` baseline. Focal is the TWO-kernel parametric family:
+// `focal_gradient_kernel` (der1) AND `focal_hessian_kernel` (der2), BOTH
+// launched through the Plan-02 `DerParamKernel` parametric seam — no new launch
+// geometry. The kernels already clamp `p` to `[1e-13, 1-1e-13]` so a saturated
+// logit cannot produce NaN (T-04-02-02). der1/der2 stay UNWEIGHTED (A1).
+// ===========================================================================
+
+/// `cb-compute::focal_der1` baseline at `(alpha, gamma)`, computed elementwise.
+fn focal_der1_baseline(approx: &[f64], target: &[f64], alpha: f64, gamma: f64) -> Vec<f64> {
+    approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::focal_der1(a, t, alpha, gamma))
+        .collect()
+}
+
+/// `cb-compute::focal_der2` baseline at `(alpha, gamma)`, computed elementwise.
+fn focal_der2_baseline(approx: &[f64], target: &[f64], alpha: f64, gamma: f64) -> Vec<f64> {
+    approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| cb_compute::focal_der2(a, t, alpha, gamma))
+        .collect()
+}
+
+#[test]
+fn focal_der1_matches_cpu_baseline_f64_non_cube_multiple() {
+    // n=37 (non-cube-multiple) exercises the `if ABSOLUTE_POS < approx.len()`
+    // idle-guard path in `focal_gradient_kernel`. (alpha=0.25, gamma=2.0) are the
+    // common Focal defaults. The approx spread -4.5..+4.5 exercises the sigmoid
+    // (including near-saturated logits); 0/1 targets exercise BOTH at/pt label
+    // branches.
+    let alpha = 0.25_f64;
+    let gamma = 2.0_f64;
+    let approx: Vec<f64> = (0..37).map(|k| f64::from(k) * 0.25 - 4.5).collect();
+    let target: Vec<f64> = (0..37).map(|k| f64::from(k % 2)).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::FocalGradient,
+        &[alpha, gamma],
+    )
+    .unwrap();
+    let baseline = focal_der1_baseline(&approx, &target, alpha, gamma);
+
+    assert_eq!(device.len(), approx.len(), "focal der1 length must equal input length");
+    assert!(device.iter().all(|v| v.is_finite()), "focal der1 must be finite (clamp holds)");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der focal a=0.25 g=2.0 f64 n=37] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-9 || abs <= 1e-9,
+        "f64 Focal der1 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn focal_der1_matches_cpu_baseline_f32() {
+    // f32-magnitude logits cast to f64 at the seam. A generous f32 relative bound
+    // (~1e-3) catches a wrong der without pinning the GPU-06 epsilon.
+    let alpha = 0.5_f64;
+    let gamma = 1.0_f64;
+    let approx_f32: Vec<f32> = (0..64).map(|k| (k as f32) * 0.15 - 5.0).collect();
+    let target_f32: Vec<f32> = (0..64).map(|k| (k % 2) as f32).collect();
+    let approx: Vec<f64> = approx_f32.iter().map(|&v| f64::from(v)).collect();
+    let target: Vec<f64> = target_f32.iter().map(|&v| f64::from(v)).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::FocalGradient,
+        &[alpha, gamma],
+    )
+    .unwrap();
+    let baseline = focal_der1_baseline(&approx, &target, alpha, gamma);
+
+    assert_eq!(device.len(), approx.len(), "focal der1 length must equal input length");
+    assert!(device.iter().all(|v| v.is_finite()), "focal der1 must be finite (clamp holds)");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der focal a=0.5 g=1.0 f32 n=64] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-3 || abs <= 1e-3,
+        "f32 Focal der1 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn focal_der2_matches_cpu_baseline_f64() {
+    // der2 via the SECOND focal kernel (`focal_hessian_kernel`) through the SAME
+    // `DerParamKernel::FocalHessian` parametric seam. n=37 exercises the idle guard.
+    let alpha = 0.25_f64;
+    let gamma = 2.0_f64;
+    let approx: Vec<f64> = (0..37).map(|k| f64::from(k) * 0.25 - 4.5).collect();
+    let target: Vec<f64> = (0..37).map(|k| f64::from(k % 2)).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::FocalHessian,
+        &[alpha, gamma],
+    )
+    .unwrap();
+    let baseline = focal_der2_baseline(&approx, &target, alpha, gamma);
+
+    assert_eq!(device.len(), approx.len(), "focal der2 length must equal input length");
+    assert!(device.iter().all(|v| v.is_finite()), "focal der2 must be finite (clamp holds)");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der focal-hess a=0.25 g=2.0 f64 n=37] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-9 || abs <= 1e-9,
+        "f64 Focal der2 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn focal_der2_matches_cpu_baseline_f32() {
+    let alpha = 0.5_f64;
+    let gamma = 1.0_f64;
+    let approx_f32: Vec<f32> = (0..64).map(|k| (k as f32) * 0.15 - 5.0).collect();
+    let target_f32: Vec<f32> = (0..64).map(|k| (k % 2) as f32).collect();
+    let approx: Vec<f64> = approx_f32.iter().map(|&v| f64::from(v)).collect();
+    let target: Vec<f64> = target_f32.iter().map(|&v| f64::from(v)).collect();
+
+    let device = launch_der_param(
+        &approx,
+        &target,
+        DerParamKernel::FocalHessian,
+        &[alpha, gamma],
+    )
+    .unwrap();
+    let baseline = focal_der2_baseline(&approx, &target, alpha, gamma);
+
+    assert_eq!(device.len(), approx.len(), "focal der2 length must equal input length");
+    assert!(device.iter().all(|v| v.is_finite()), "focal der2 must be finite (clamp holds)");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[der focal-hess a=0.5 g=1.0 f32 n=64] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= 1e-3 || abs <= 1e-3,
+        "f32 Focal der2 diverged too far: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn focal_der_saturated_logit_no_nan() {
+    // T-07.2-07 / T-04-02-02: saturated logits (±40) would drive sigmoid to ~0 / ~1,
+    // making `ln(pt)` / `powf(1-pt, gamma)` blow up to NaN/-inf WITHOUT the clamp.
+    // The kernels clamp `p` to `[1e-13, 1-1e-13]` before `ln`/`powf`, so der1/der2
+    // MUST be finite. Also assert they match the (identically-clamped) cb-compute
+    // baseline.
+    let alpha = 0.25_f64;
+    let gamma = 2.0_f64;
+    // Mix saturated (+/-40) and moderate logits, both labels.
+    let approx: Vec<f64> = vec![
+        -40.0, 40.0, -40.0, 40.0, -3.0, 3.0, 0.0, -1.5, 2.5, -40.0, 40.0, 0.5,
+    ];
+    let target: Vec<f64> = vec![0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+
+    let der1 = launch_der_param(&approx, &target, DerParamKernel::FocalGradient, &[alpha, gamma]).unwrap();
+    let der2 = launch_der_param(&approx, &target, DerParamKernel::FocalHessian, &[alpha, gamma]).unwrap();
+
+    assert!(
+        der1.iter().all(|v| v.is_finite()),
+        "saturated-logit focal der1 must be finite (clamp holds): {der1:?}"
+    );
+    assert!(
+        der2.iter().all(|v| v.is_finite()),
+        "saturated-logit focal der2 must be finite (clamp holds): {der2:?}"
+    );
+
+    let base1 = focal_der1_baseline(&approx, &target, alpha, gamma);
+    let base2 = focal_der2_baseline(&approx, &target, alpha, gamma);
+    let (a1, r1) = max_divergence(&der1, &base1);
+    let (a2, r2) = max_divergence(&der2, &base2);
+    println!("[der focal saturated der1] REPORTED max abs_div={a1:.3e} rel_div={r1:.3e}");
+    println!("[der focal saturated der2] REPORTED max abs_div={a2:.3e} rel_div={r2:.3e}");
+    assert!(r1 <= 1e-9 || a1 <= 1e-9, "saturated focal der1 diverged: abs={a1:.3e} rel={r1:.3e}");
+    assert!(r2 <= 1e-9 || a2 <= 1e-9, "saturated focal der2 diverged: abs={a2:.3e} rel={r2:.3e}");
+}
+
+#[test]
+fn focal_der_edge_cases() {
+    let alpha = 0.25_f64;
+    let gamma = 2.0_f64;
+
+    // Empty: both parametric wrappers short-circuit to empty (no launch); neither
+    // reads back an empty device buffer.
+    {
+        let approx: Vec<f64> = Vec::new();
+        let target: Vec<f64> = Vec::new();
+        let der1 = launch_der_param(&approx, &target, DerParamKernel::FocalGradient, &[alpha, gamma]).unwrap();
+        let der2 = launch_der_param(&approx, &target, DerParamKernel::FocalHessian, &[alpha, gamma]).unwrap();
+        assert!(der1.is_empty(), "empty input must yield an empty focal der1 (no launch)");
+        assert!(der2.is_empty(), "empty input must yield an empty focal der2 (no launch)");
+    }
+
+    // n=1: a single object, one thread. target=1 selects the at=alpha/pt=p branch.
+    {
+        let approx = vec![0.75_f64];
+        let target = vec![1.0_f64];
+        let der1 = launch_der_param(&approx, &target, DerParamKernel::FocalGradient, &[alpha, gamma]).unwrap();
+        let der2 = launch_der_param(&approx, &target, DerParamKernel::FocalHessian, &[alpha, gamma]).unwrap();
+        let b1 = focal_der1_baseline(&approx, &target, alpha, gamma);
+        let b2 = focal_der2_baseline(&approx, &target, alpha, gamma);
+        let (a1, r1) = max_divergence(&der1, &b1);
+        let (a2, r2) = max_divergence(&der2, &b2);
+        println!("[der focal f64 n=1] REPORTED der1 abs={a1:.3e} rel={r1:.3e} | der2 abs={a2:.3e} rel={r2:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "focal der1 (n=1) diverged: abs={a1:.3e} rel={r1:.3e}");
+        assert!(r2 <= 1e-9 || a2 <= 1e-9, "focal der2 (n=1) diverged: abs={a2:.3e} rel={r2:.3e}");
+    }
+
+    // Large N: many independent cubes (10_000 >> CUBE_DIM=32). Both labels mixed.
+    {
+        let n = 10_000usize;
+        let approx: Vec<f64> = (0..n).map(|k| (k as f64) * 0.001 - 5.0).collect();
+        let target: Vec<f64> = (0..n).map(|k| f64::from((k % 2) as u32)).collect();
+        let der1 = launch_der_param(&approx, &target, DerParamKernel::FocalGradient, &[alpha, gamma]).unwrap();
+        let der2 = launch_der_param(&approx, &target, DerParamKernel::FocalHessian, &[alpha, gamma]).unwrap();
+        let b1 = focal_der1_baseline(&approx, &target, alpha, gamma);
+        let b2 = focal_der2_baseline(&approx, &target, alpha, gamma);
+        assert_eq!(der1.len(), n, "large-N focal der1 length must equal n");
+        assert_eq!(der2.len(), n, "large-N focal der2 length must equal n");
+        let (a1, r1) = max_divergence(&der1, &b1);
+        let (a2, r2) = max_divergence(&der2, &b2);
+        println!("[der focal f64 n=10000] REPORTED der1 abs={a1:.3e} rel={r1:.3e} | der2 abs={a2:.3e} rel={r2:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "focal der1 (large-N) diverged: abs={a1:.3e} rel={r1:.3e}");
+        assert!(r2 <= 1e-9 || a2 <= 1e-9, "focal der2 (large-N) diverged: abs={a2:.3e} rel={r2:.3e}");
     }
 }

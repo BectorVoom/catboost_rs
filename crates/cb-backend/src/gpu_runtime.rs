@@ -39,8 +39,9 @@ use cubecl::server::Handle;
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
-    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, gradient_kernel,
-    logloss_gradient_kernel, logloss_hessian_kernel, quantile_gradient_kernel,
+    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
+    focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
+    quantile_gradient_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -576,6 +577,22 @@ pub enum DerParamKernel {
     /// produced by [`const_der_handle`] (Pitfall 5 — there is no quantile hessian
     /// kernel).
     QuantileGradient,
+    /// Focal{alpha, gamma} FIRST derivative (the reused [`focal_gradient_kernel`],
+    /// D-7.2-03 — no new math): `p = clamp(sigmoid(approx), 1e-13, 1-1e-13)`; with
+    /// `at`/`pt` selected by the binary label and `y = 2*target - 1`, `der1 = -(at*y*
+    /// pow(1-pt, gamma) * (gamma*pt*ln(pt) + pt - 1))`. The params are `[alpha,
+    /// gamma]`. Unlike Quantile, Focal is a TWO-kernel family — its der2 is
+    /// [`DerParamKernel::FocalHessian`] (a real hessian kernel, NOT a constant). The
+    /// kernel clamps `p` so a saturated logit cannot produce `NaN` (T-04-02-02 /
+    /// T-07.2-07).
+    FocalGradient,
+    /// Focal{alpha, gamma} SECOND derivative (the reused [`focal_hessian_kernel`],
+    /// D-7.2-03 — no new math): the analytic hessian of [`Self::FocalGradient`]
+    /// (`u*dv + du*v` chain, `error_functions.h:1684-1709`). Same `[alpha, gamma]`
+    /// params, same length-1 `Array<F>` discipline, same `p` clamp (T-04-02-02). This
+    /// is the SECOND kernel of the Focal two-kernel family; both run through this ONE
+    /// parametric seam (no new launch geometry).
+    FocalHessian,
 }
 
 /// Read the two-element `[alpha, delta]` (or `[param0, param1]`) param slice without
@@ -672,6 +689,41 @@ fn launch_der_param_into(
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
                 unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
                 unsafe { ArrayArg::from_raw_parts(delta_handle, 1) },
+            );
+        }
+        DerParamKernel::FocalGradient => {
+            // `[alpha, gamma]` — read without indexing (D-13). The length-1 device
+            // buffers mirror the `launch_focal_f64` precedent (SelectedRuntime swapped
+            // in). The kernel clamps `p` so a saturated logit cannot produce NaN.
+            let (alpha, gamma) = param_pair(params, "FocalGradient")?;
+            let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+            let gamma_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![gamma]));
+            focal_gradient_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                // Clone so the original output handle stays returnable (SC-3, no read).
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+                unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+                unsafe { ArrayArg::from_raw_parts(gamma_handle, 1) },
+            );
+        }
+        DerParamKernel::FocalHessian => {
+            // The SECOND Focal kernel (der2), identical arg shape to FocalGradient.
+            let (alpha, gamma) = param_pair(params, "FocalHessian")?;
+            let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+            let gamma_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![gamma]));
+            focal_hessian_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+                unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+                unsafe { ArrayArg::from_raw_parts(gamma_handle, 1) },
             );
         }
     }
