@@ -1089,6 +1089,71 @@ fn launch_pointwise_hist2_into(
         z: 1,
     };
 
+    // IN-02: the per-family upload + zero-init + channel-float `#[cfg]` split + launch +
+    // `return Ok(h)` boilerplate is IDENTICAL across the binary / half-byte / non-binary
+    // arms (they differ only in the kernel launcher and, for non-binary, a trailing
+    // `bits` comptime arg). Extract it into ONE macro so the channel-float split (f64 on
+    // rocm/cuda/cpu, f32 on wgpu — RESEARCH A1) and the zero-init live in exactly one
+    // place; a fix to the channel dispatch or the zero-init is then applied once, not
+    // three times. The macro captures `client`/`count`/`dim`/`n`/`cindex`/`indices`/
+    // `der1`/`weight`/`cindex_stride`/`n_features`/`n_bins` from the enclosing scope and
+    // takes the kernel launcher path plus any trailing comptime launch args. It zero-
+    // initialises `binSums` so the in-kernel `fetch_add`s accumulate from 0.0, casts the
+    // der1/weight inputs to the channel type at upload, and returns the `binSums` Handle
+    // WITHOUT a read-back (SC-3 / Pitfall 5). `from_raw_parts` consumes each input handle;
+    // the output is cloned so the original stays returnable on-device.
+    macro_rules! launch_hist2_family {
+        ($kernel:ident $(, $extra:expr )* $(,)?) => {{
+            let bin_sums_len = hist2_binsums_len(n_bins, n_features);
+            let cindex_handle =
+                client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+            let indices_handle =
+                client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+            #[cfg(feature = "wgpu")]
+            {
+                let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
+                let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
+                let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
+                let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
+                let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
+                $kernel::launch::<f32, SelectedRuntime>(
+                    client,
+                    count,
+                    dim,
+                    unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+                    unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+                    n_features as u32,
+                    $( $extra, )*
+                );
+                return Ok(h);
+            }
+
+            #[cfg(not(feature = "wgpu"))]
+            {
+                let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
+                let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
+                let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+                $kernel::launch::<f64, SelectedRuntime>(
+                    client,
+                    count,
+                    dim,
+                    unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+                    unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+                    n_features as u32,
+                    $( $extra, )*
+                );
+                return Ok(h);
+            }
+        }};
+    }
+
     // Binary (1-bit) family branch (Plan D — D-7.3-02). A border count of
     // `BINARY_BINS == 2` selects the SEPARATE `pointwise_hist2_binary_kernel` (NOT a
     // comptime case of the non-binary kernel, NOR the half-byte kernel): upstream's binary
@@ -1100,49 +1165,7 @@ fn launch_pointwise_hist2_into(
     // same channel-float dispatch applies (f64 on rocm/cuda/cpu, f32 on wgpu — RESEARCH
     // A1). NO read-back here (SC-3 / Pitfall 5).
     if n_bins == crate::kernels::BINARY_BINS {
-        let bin_sums_len = hist2_binsums_len(n_bins, n_features);
-        let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
-        let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
-
-        #[cfg(feature = "wgpu")]
-        {
-            let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
-            let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
-            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
-            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
-            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
-            pointwise_hist2_binary_kernel::launch::<f32, SelectedRuntime>(
-                client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
-                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
-                n_features as u32,
-            );
-            return Ok(h);
-        }
-
-        #[cfg(not(feature = "wgpu"))]
-        {
-            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
-            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
-            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
-            pointwise_hist2_binary_kernel::launch::<f64, SelectedRuntime>(
-                client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
-                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
-                n_features as u32,
-            );
-            return Ok(h);
-        }
+        launch_hist2_family!(pointwise_hist2_binary_kernel);
     }
 
     // Half-byte (4-bit) family branch (Plan C — D-7.3-02). A border count of
@@ -1156,49 +1179,7 @@ fn launch_pointwise_hist2_into(
     // byte-identical — D-7.3-01). The same channel-float dispatch applies (f64 on
     // rocm/cuda/cpu, f32 on wgpu — RESEARCH A1). NO read-back here (SC-3 / Pitfall 5).
     if n_bins == crate::kernels::HALF_BYTE_BINS {
-        let bin_sums_len = hist2_binsums_len(n_bins, n_features);
-        let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
-        let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
-
-        #[cfg(feature = "wgpu")]
-        {
-            let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
-            let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
-            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
-            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
-            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
-            pointwise_hist2_half_byte_kernel::launch::<f32, SelectedRuntime>(
-                client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
-                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
-                n_features as u32,
-            );
-            return Ok(h);
-        }
-
-        #[cfg(not(feature = "wgpu"))]
-        {
-            let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
-            let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
-            let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
-            pointwise_hist2_half_byte_kernel::launch::<f64, SelectedRuntime>(
-                client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
-                unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
-                n_features as u32,
-            );
-            return Ok(h);
-        }
+        launch_hist2_family!(pointwise_hist2_half_byte_kernel);
     }
 
     // One-byte non-binary bit-width selection (Plan B — D-7.3-02). The bit-count is
@@ -1231,73 +1212,23 @@ fn launch_pointwise_hist2_into(
     // HIST_SHMEM)`. The used prefix `2 * (1 << bits)` can never exceed the 8-bit
     // shared-histogram allocation here — no runtime assert is needed.
 
-    let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
-    let indices_handle = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
-
-    // The binSums accumulator is zero-initialized so the in-kernel `fetch_add`s
-    // accumulate from 0.0 (the additive identity). Length = the FROZEN layout length.
-    let bin_sums_len = hist2_binsums_len(n_bins, n_features);
-
-    // Launch geometry (IN-02): reuse the single `count`/`dim` already computed above and
-    // shared with the binary/half-byte branches — there is exactly ONE geometry, not a
-    // per-branch recomputation.
-
-    // Channel float-type dispatch (RESEARCH A1 / Pitfall 1). The in-kernel atomic
-    // merge needs `Atomic<F>::fetch_add` device-side. HIP (rocm) and CUDA support /
-    // emulate the f64 atomic add, so the histogram channel is f64 there (the project's
-    // f64-finalization preference, D-03). wgpu's WGSL has NO f64 atomics at all (the
-    // capability is genuinely absent, not just unadvertised), so the wgpu arm uses an
-    // f32 channel — upstream-faithful `atomicAdd(float*)`, natively supported — read
-    // back and UPCAST to f64. The buffer length (the FROZEN layout) is channel-type
-    // independent; only the element width differs, transparently to the 7.5 seam which
-    // reads the handle through this same crate. The der1/weight inputs are cast to the
-    // channel type at upload. `bytes::from_elems` keeps the buffer byte-typed.
-    #[cfg(feature = "wgpu")]
-    let bin_sums_handle = {
-        let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
-        let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
-        let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
-        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
-        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
-        pointwise_hist2_nonbinary_kernel::launch::<f32, SelectedRuntime>(
-            client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
-            unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
-            n_features as u32,
-            bits,
-        );
-        h
-    };
-
-    #[cfg(not(feature = "wgpu"))]
-    let bin_sums_handle = {
-        let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
-        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
-        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
-        pointwise_hist2_nonbinary_kernel::launch::<f64, SelectedRuntime>(
-            client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
-            unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
-            // The atomic accumulator binds the same f64 storage as a plain buffer (the
-            // `block_reduce_atomic_kernel` precedent); `clone` so the original stays
-            // returnable on-device. NO `read_one` here (SC-3).
-            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
-            n_features as u32,
-            bits,
-        );
-        h
-    };
-
-    Ok(bin_sums_handle)
+    // Channel float-type dispatch (RESEARCH A1 / Pitfall 1) + upload + zero-init + launch
+    // are handled by the shared `launch_hist2_family!` macro (IN-02 — one place): the
+    // in-kernel atomic merge needs `Atomic<F>::fetch_add` device-side; HIP (rocm) and CUDA
+    // support / emulate the f64 atomic add, so the channel is f64 there (D-03), while
+    // wgpu's WGSL has NO f64 atomics, so the wgpu arm uses an f32 channel (read back and
+    // UPCAST to f64). The buffer length (the FROZEN layout) is channel-type independent.
+    // The non-binary arm passes the host-selected `bits` comptime arg (the only structural
+    // difference from the binary/half-byte arms). NO read-back here (SC-3 / Pitfall 5).
+    // The macro `return`s the `binSums` handle from whichever channel `#[cfg]` arm is
+    // compiled (exactly one is always active), so control never reaches the trailing
+    // `unreachable!()` below — it only satisfies the type checker (the macro expands to a
+    // `()`-typed statement, not the function's `CbResult<Handle>` tail).
+    launch_hist2_family!(pointwise_hist2_nonbinary_kernel, bits);
+    #[allow(unreachable_code)]
+    {
+        unreachable!("launch_hist2_family! returns the binSums handle from a channel #[cfg] arm")
+    }
 }
 
 /// Read a `binSums` device handle back to a host `Vec<f64>`, transparently UPCASTING
