@@ -565,8 +565,14 @@ Plans:
   4. The primitives self-oracle against the Rust CPU path on representative inputs (tolerance reported, not yet the signed-off GPU-06 epsilon — that lands in 7.6).
 
 **Plans**: 2 plans (2 waves)
+**Wave 1**
+
 - [ ] 07.1-01-PLAN.md — Wire all four `SelectedRuntime` arms + re-pin cubecl-hip-sys + per-backend cubecl feature map; block_reduce_kernel + launch_block_reduce_f64 + rocm reduce self-oracle (GPU-02/04/05, GPU-01 reduce)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 07.1-02-PLAN.md — block_scan_kernel (inclusive/exclusive) + rocm scan self-oracle; in-kernel atomic-finalize reduce variant (D-03) with reported run-to-run variance (GPU-01 scan)
+
 **Research flag** (RESOLVED in 07.1-RESEARCH.md): cubecl-hip version skew is cosmetic (re-pin `cubecl-hip-sys =7.1.5280200`; sys build.rs auto-detects HIP patch from hipconfig); plane ops present at cubecl 0.10.0 (`plane_sum`/`plane_inclusive_sum`) with comptime shared-mem fallback for wave-agnostic reductions.
 
 ### Phase 7.2: On-Device Gradient/Hessian & Targets
