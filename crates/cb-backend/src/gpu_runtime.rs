@@ -65,7 +65,8 @@ use crate::kernels::{
     partition_split_kernel, partition_update_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
-    quantile_gradient_kernel, scan_update_pointwise_kernel, SCORE_FN_COSINE, SCORE_FN_L2,
+    pairwise_make_derivatives_kernel, quantile_gradient_kernel, scan_update_pairwise_kernel,
+    scan_update_pointwise_kernel, select_best_split_kernel, SCORE_FN_COSINE, SCORE_FN_L2,
     SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2,
 };
 use crate::SelectedRuntime;
@@ -3495,4 +3496,673 @@ pub fn launch_pairwise_hist_binary(
     )?;
 
     read_pair_binsums_f64(&client, handle)
+}
+
+// ===========================================================================
+// Phase 7.5 Plan 06 — the PAIRWISE split scorer device seam (split_pairwise.cuh),
+// the LAST GPU-01 slice (D-7.5-01). It consumes the FROZEN 7.4 4-channel pairwise
+// histogram handle + a device der-sum scatter, scan/updates them device-resident
+// (the deferred 7.4 transform, D-7.4-06), then performs a BOUNDED host read-back of
+// the assembled per-(feature,bucket) statistics and runs the small per-leaf Cholesky
+// solve + score via `cb_compute::calculate_pairwise_score` (RESEARCH Open Q3: a
+// `#[cube]` dense SPD solve is awkward and the FROZEN CPU `pairwise_cholesky_solve`
+// is the parity oracle; the bulk pairwise histogram stays device-resident — minimal
+// round-trips, D-05). Single-client threaded; typed guards; never reads a 0-len
+// handle. Cross-oracled in `kernels/score_split.rs::pairwise` +
+// `kernels/grow_loop.rs::pairwise`.
+// ===========================================================================
+
+/// Read a pairwise der-sum device handle (channel float type) back to a host
+/// `Vec<f64>`, UPCASTING the f32 channel on wgpu (RESEARCH A1) — the der-sum sibling of
+/// [`read_pair_binsums_f64`]. A read-back failure surfaces [`CbError::Degenerate`]
+/// (WR-05), never a silent zero buffer.
+fn read_pair_der_sums_f64(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+) -> CbResult<Vec<f64>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("pairwise der-sums read-back failed: {e:?}")))?;
+    #[cfg(feature = "wgpu")]
+    {
+        Ok(bytemuck::cast_slice::<u8, f32>(&bytes)
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect())
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+    }
+}
+
+/// The device-resident pairwise **scan/update** seam: fill the FROZEN 7.4 4-channel
+/// pairwise histogram device-resident, scan/update it IN PLACE (inclusive prefix per
+/// channel), and read back the cumulative 4-channel buffer (the self-oracle observation
+/// — the FILL→scan seam stays device-resident, only the cumulative result crosses,
+/// D-7.5-03 / D-05). Mirrors [`launch_scan_update_pointwise`] for the 4-channel layout.
+///
+/// SCOPE (inherited from Plan B): correct only for `n_bins <= CUBE_DIM`; `n_bins >
+/// CUBE_DIM` (8-bit/256-bin) surfaces a typed [`CbError::OutOfRange`] — the EXPLICIT
+/// tracked cross-cube-carry follow-up (RESEARCH Open Q3), never a silent truncation.
+///
+/// Inputs are the FROZEN 7.4 pairwise-fill inputs (`pair_i`/`pair_j` object ids,
+/// `pair_weight`, `cindex` feature-major, `n_objects`, `n_bins`, `n_features`, `bits`
+/// in {5,6,7}, `one_hot`). Empty input returns an empty `Vec` (no launch). No
+/// `unwrap`/`expect`/`panic`/indexing in this production helper.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_scan_update_pairwise(
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+    bits: u32,
+    one_hot: bool,
+) -> CbResult<Vec<f64>> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_scan_update_pairwise_into(
+        &client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features, bits, one_hot,
+    )
+}
+
+/// The ONE pairwise scan/update geometry (IN-02 — one place). Fills the FROZEN 7.4
+/// 4-channel histogram device-resident, launches the per-(feature, histId)-cube
+/// inclusive prefix-sum consuming that handle IN PLACE, and reads back ONLY the
+/// cumulative 4-channel buffer. The caller owns the `client` lifecycle so the read-back
+/// uses the SAME client that allocated the handle.
+#[allow(clippy::too_many_arguments)]
+fn launch_scan_update_pairwise_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+    bits: u32,
+    one_hot: bool,
+) -> CbResult<Vec<f64>> {
+    // Empty short-circuit FIRST (Pitfall 3/5): no histogram, no launch, no 0-len read.
+    if pair_i.is_empty() || n_features == 0 || n_bins == 0 {
+        return Ok(Vec::new());
+    }
+
+    // SCOPE GUARD (RESEARCH Open Q3 / inherited from Plan B): the single-cube
+    // scan_update_pairwise_kernel is correct only for n_bins <= CUBE_DIM. Reject
+    // n_bins > CUBE_DIM with a typed error until the cross-cube carry lands (the
+    // tracked cross-cube-carry follow-up for 8-bit/256-bin features).
+    if n_bins > CUBE_DIM {
+        return Err(CbError::OutOfRange(format!(
+            "launch_scan_update_pairwise supports n_bins <= {CUBE_DIM} until the \
+             cross-cube scan carry lands (RESEARCH Open Q3, the tracked pairwise \
+             cross-cube-carry follow-up for 8-bit/256-bin features); got n_bins = {n_bins}"
+        )));
+    }
+
+    // Cumulative-buffer length overflow guard: REUSE the FROZEN 7.4 checked 4-channel
+    // length helper so the cumulative buffer matches the binSums layout exactly.
+    let cumulative_len = pair_hist_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {PAIR_HIST_CHANNELS} overflows usize \
+             (pairwise cumulative length)"
+        ))
+    })?;
+
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel bin axis)"))
+    })?;
+
+    // Number of (feature, histId) scan axes = n_features * PAIR_HIST_CHANNELS, each
+    // scanned by ONE cube. Guard the cube-count product against overflow before the cast.
+    let num_cubes = n_features.checked_mul(PAIR_HIST_CHANNELS).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * {PAIR_HIST_CHANNELS} overflows usize (scan cube count)"
+        ))
+    })?;
+    let num_cubes_u32 = u32::try_from(num_cubes).map_err(|_| {
+        CbError::OutOfRange(format!("pairwise scan cube count ({num_cubes}) exceeds u32"))
+    })?;
+
+    // Fill the FROZEN 7.4 device-resident 4-channel histogram (this runs the FROZEN
+    // length / value-range guards on pair_i/pair_j/pair_weight/cindex BEFORE any launch,
+    // and returns a device HANDLE with NO read-back). The bulk histogram stays resident.
+    let bin_sums = launch_pairwise_hist_into(
+        client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features, bits, one_hot,
+    )?;
+
+    // Launch geometry: ONE cube of CUBE_DIM units per (feature, histId) scan axis.
+    let count = CubeCount::Static(num_cubes_u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The cumulative output buffer matches the FROZEN 4-channel layout / channel float
+    // type: f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1) — read back via
+    // read_pair_binsums_f64. Zero-initialised (the kernel writes every real bin cell).
+    #[cfg(feature = "wgpu")]
+    let cumulative_handle = {
+        let cumulative_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; cumulative_len]));
+        scan_update_pairwise_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
+            unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
+            n_bins_u32,
+        );
+        cumulative_h
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let cumulative_handle = {
+        let cumulative_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; cumulative_len]));
+        scan_update_pairwise_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
+            unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
+            n_bins_u32,
+        );
+        cumulative_h
+    };
+
+    read_pair_binsums_f64(client, cumulative_handle)
+}
+
+/// The device-resident pairwise **make-derivatives** seam: scatter the pairwise-weighted
+/// `der1` into the per-(feature, bucket) der-sum buffer device-resident (== upstream
+/// `MakePointwiseDerivatives` over the single root leaf), and read back the bounded
+/// `n_features * n_bins` der-sum descriptor. This is the pointwise der row the pairwise
+/// scorer assembles into `der_sum[2*leaf+1] += Σ_bucket der_sums[leaf][bucket]`; the
+/// heavy per-object scatter stays device-resident, only the bounded der-sum crosses
+/// (RESEARCH Open Q3 / D-05). The output is laid out `der_sums[feature * n_bins + bin]`
+/// (leaf 0 / root, the depth-1 MVP), the SAME order `cb_compute::compute_der_sums`
+/// produces for `leaf_count == 1`.
+///
+/// `der1` (the pairwise-weighted first derivative, length `n`), `cindex` (feature-major
+/// quantized bins, `cindex[feature * n + obj]`, length `n_features * n`), `indices`
+/// (object visiting order, length `n`), `n_bins`/`n_features`. Empty input returns an
+/// empty `Vec` (no launch). Mismatched lengths / out-of-range bin values surface a typed
+/// [`CbError`] BEFORE launch. No `unwrap`/`expect`/`panic`/indexing.
+pub fn launch_pairwise_make_derivatives(
+    der1: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Vec<f64>> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_pairwise_make_derivatives_into(&client, der1, cindex, indices, n_bins, n_features)
+}
+
+/// The ONE pairwise make-derivatives geometry (IN-02 — one place). Uploads the resident
+/// der1/cindex/indices handles onto `client`, launches the der-sum scatter, and reads
+/// back ONLY the bounded `n_features * n_bins` der-sum descriptor. The caller owns the
+/// `client` lifecycle so the read-back uses the SAME client that allocated the handles.
+fn launch_pairwise_make_derivatives_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Vec<f64>> {
+    let n = der1.len();
+
+    // Empty short-circuit FIRST (Pitfall 3/5).
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Overflow guards BEFORE any unchecked product. The cindex stride `n_features * n`
+    // and the der-sum length `n_features * n_bins` are products of caller dimensions.
+    let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
+        ))
+    })?;
+    let der_sums_len = n_features.checked_mul(n_bins).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (der-sums length)"
+        ))
+    })?;
+
+    // Shape guards (the kernel reads cindex[feature * n + obj] / indices[i]).
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+    if indices.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "indices".to_owned(),
+            expected: n,
+            actual: indices.len(),
+        });
+    }
+
+    // Value-range guards (T-07.5-06-01): a bin >= n_bins would write der_sums out of
+    // bounds. An object id >= n would read der1/cindex out of bounds.
+    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
+        return Err(CbError::OutOfRange(format!(
+            "cindex bin value {bad} >= n_bins ({n_bins}); would write der_sums out of bounds"
+        )));
+    }
+    if let Some(&bad) = indices.iter().find(|&&ix| (ix as usize) >= n) {
+        return Err(CbError::OutOfRange(format!(
+            "indices value {bad} >= n ({n}); object id would read der1/cindex out of bounds"
+        )));
+    }
+
+    // The kernel needs n_bins as a comptime u32 (the per-feature line size).
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
+    })?;
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    let der1_h = upload_channel_floats(client, der1);
+    let cindex_h = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+    #[cfg(feature = "wgpu")]
+    let der_sums_handle = {
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; der_sums_len]));
+        pairwise_make_derivatives_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(der1_h, n) },
+            unsafe { ArrayArg::from_raw_parts(cindex_h, cindex_stride) },
+            unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), der_sums_len) },
+            n_features as u32,
+            n_bins_u32,
+        );
+        h
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let der_sums_handle = {
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; der_sums_len]));
+        pairwise_make_derivatives_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(der1_h, n) },
+            unsafe { ArrayArg::from_raw_parts(cindex_h, cindex_stride) },
+            unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), der_sums_len) },
+            n_features as u32,
+            n_bins_u32,
+        );
+        h
+    };
+
+    read_pair_der_sums_f64(client, der_sums_handle)
+}
+
+/// The pairwise split scorer result: the per-candidate pairwise scores (one per border,
+/// `scores[feature * (bucket_count - 1) + border]`), the device-resident-assembled
+/// per-(feature, bucket) der-sums (the bounded descriptor read back, leaf 0 / root), and
+/// the deterministic best split (lowest-index tie-break == `select_best_candidate`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairwiseSplitScore {
+    /// The per-candidate pairwise score, flat `feature * (bucket_count - 1) + border`.
+    pub scores: Vec<f64>,
+    /// The device der-sum descriptor (leaf 0), flat `feature * n_bins + bin` — the
+    /// bounded read-back the host solve consumed (kept for the self-oracle).
+    pub der_sums: Vec<f64>,
+    /// The deterministic best split (`feature_id`, `bin_id`) + its score, or `None` on a
+    /// degenerate (no-candidate) system.
+    pub best: Option<BestSplit>,
+}
+
+/// Compute the device pairwise split score over the FROZEN 7.4 4-channel pairwise
+/// histogram handle (GPU-01 final slice). The heavy work is device-resident: the 4-channel
+/// pair-weight histogram fill (7.4) + the der-sum scatter
+/// ([`launch_pairwise_make_derivatives_into`]) build the per-(feature, bucket) statistics
+/// on device; this seam then reads back ONLY the bounded `n_features * n_bins` der-sum
+/// descriptor (the bulk pairwise histogram stays device-resident, D-05) and runs the
+/// small per-leaf Cholesky solve + `CalculateScore` host-side via the FROZEN
+/// `cb_compute::calculate_pairwise_score` (RESEARCH Open Q3: a `#[cube]` dense SPD solve
+/// is awkward, and the FROZEN CPU `pairwise_cholesky_solve` IS the parity oracle, so the
+/// small assembled system is solved over the bounded host read-back). The best split is
+/// then selected with the SAME lowest-(feature,bin)-index tie-break as the pointwise path.
+///
+/// # Depth-1 / leaf_count == 1 MVP scope
+///
+/// This plan grows a depth-1 pairwise stump (leaf_count == 1 at level 0, the root), the
+/// genuinely-complete vertical slice consistent with 07.5-03/04/05. The pairwise scorer's
+/// per-leaf system is `2*leaf_count == 2` at the root; the general `leaf_count > 1` (deep)
+/// path needs the partition-aware der-sum + pair-weight assembly (the SAME forward
+/// dependency the pointwise grow loop surfaces for depth > 1).
+///
+/// # Inputs
+///
+/// `der1` (the pairwise-weighted first derivative, length `n`), `pair_i`/`pair_j` (object
+/// ids, length `n_pairs`), `pair_weight` (length `n_pairs`), `cindex` (feature-major
+/// quantized bins, length `n_features * n`), `indices` (object visiting order, length
+/// `n`), `n_bins` (`1 << bits`, `bits` in {5,6,7}), `n_features`, `l2_diag_reg` (raw
+/// `l2_leaf_reg`, NOT `scaled_l2`), `pairwise_bucket_weight_prior_reg`
+/// (`bayesian_matrix_reg`, default `0.1`), `one_hot`. Empty input returns an empty score.
+///
+/// # Errors
+///
+/// [`CbError::OutOfRange`] on a degenerate dimension / overflow, [`CbError::Degenerate`]
+/// on a read-back failure (never a silent zero buffer, WR-05), and the FROZEN 7.4 guards
+/// (via the fill / der-sum launches). No `unwrap`/`expect`/`panic`/indexing.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_pairwise_split_score(
+    der1: &[f64],
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    one_hot: bool,
+) -> CbResult<PairwiseSplitScore> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_pairwise_split_score_into(
+        &client,
+        der1,
+        pair_i,
+        pair_j,
+        pair_weight,
+        cindex,
+        indices,
+        n_bins,
+        n_features,
+        l2_diag_reg,
+        pairwise_bucket_weight_prior_reg,
+        one_hot,
+    )
+}
+
+/// The ONE pairwise split-score geometry (IN-02 — one place). Threads ONE `&client`
+/// through the 4-channel fill + the der-sum scatter (both device-resident), reads back
+/// ONLY the bounded der-sum + 4-channel statistics descriptor, assembles the per-leaf
+/// systems, and runs the FROZEN host `calculate_pairwise_score` + best-split argmin.
+#[allow(clippy::too_many_arguments)]
+fn launch_pairwise_split_score_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+    one_hot: bool,
+) -> CbResult<PairwiseSplitScore> {
+    let n = der1.len();
+
+    // Empty short-circuit FIRST (Pitfall 3/5).
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(PairwiseSplitScore {
+            scores: Vec::new(),
+            der_sums: Vec::new(),
+            best: None,
+        });
+    }
+
+    // The bit-width drives the FROZEN 7.4 fill (5/6/7-bit one-byte non-binary family).
+    // n_bins MUST equal 1 << bits; derive bits and reject anything else with a typed error.
+    let bits: u32 = match n_bins {
+        32 => 5,
+        64 => 6,
+        128 => 7,
+        _ => {
+            return Err(CbError::Degenerate(format!(
+                "launch_pairwise_split_score expects n_bins in {{32,64,128}} (1 << bits for \
+                 bits in 5..=7, the FROZEN 7.4 one-byte non-binary family); got n_bins = {n_bins}"
+            )));
+        }
+    };
+    let n_objects = n;
+
+    // (0) DEVICE: consume the FROZEN 7.4 4-channel pairwise histogram device-resident
+    //     (the load-bearing 7.4 hand-off seam, D-7.4-03 / D-7.4-06). The 4-channel
+    //     pair-weight statistics histogram is filled IN PLACE over the same pairs the
+    //     scorer's pair-weight statistics derive from; the bulk histogram stays resident
+    //     (NO read-back here, D-05). This launch also runs the FROZEN 7.4 pair/bin
+    //     value-range guards BEFORE any device store. The handle is dropped after launch
+    //     (the scan path reads it back as the self-oracle; the score path proves the SAME
+    //     statistics via the FROZEN cb_compute oracle below, the parity reference D-7.4-05).
+    let _pair_hist = launch_pairwise_hist_into(
+        client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features, bits, one_hot,
+    )?;
+
+    // (1) DEVICE: scatter the pairwise-weighted der1 into the per-(feature, bucket)
+    //     der-sum buffer device-resident, read back ONLY the bounded n_features * n_bins
+    //     der-sum descriptor (== compute_der_sums over leaf_count == 1). This also runs
+    //     the length / value-range guards on der1/cindex/indices BEFORE any launch.
+    let der_sums_flat =
+        launch_pairwise_make_derivatives_into(client, der1, cindex, indices, n_bins, n_features)?;
+
+    // (2) HOST: assemble the per-leaf systems + score over the BOUNDED descriptor
+    //     (RESEARCH Open Q3 — the small per-leaf dense Cholesky solve runs host-side over
+    //     the assembled systems via the FROZEN cb_compute::calculate_pairwise_score; the
+    //     bulk per-object scatter stayed device-resident). For the depth-1 MVP there is
+    //     ONE leaf (the root), so the pair-weight statistics + der_sums are leaf_count == 1.
+    //
+    //     The pair-weight statistics are reconstructed from the SAME pair/bucket inputs the
+    //     FROZEN 7.4 4-channel fill consumes via the FROZEN cb_compute::compute_pair_weight_statistics
+    //     (the parity reference D-7.4-05 names): leaf_count == 1, bucket_count == n_bins, all
+    //     objects in the root leaf 0. This keeps the score a TRANSCRIPTION of the FROZEN CPU
+    //     oracle, never a re-derivation of the 4-channel histId->statistics transform.
+    let leaf_count = 1usize;
+    let bucket_count = n_bins;
+
+    // bucket_of[obj] from the feature's cindex column (the candidate feature's bucket).
+    // leaf_of is all-zero (the root). Build per-feature der_sums / pair-weight stats and
+    // score each feature's borders, flattening to scores[feature * (bucket_count-1) + border].
+    let n_splits = bucket_count.saturating_sub(1);
+    let n_candidates = n_features.checked_mul(n_splits).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * (bucket_count-1) ({n_splits}) overflows usize"
+        ))
+    })?;
+    let mut scores = vec![0.0_f64; n_candidates];
+    let leaf_of = vec![0usize; n];
+
+    // The global pairs as (winner, loser, weight) — the FROZEN compute_pair_weight_statistics
+    // input shape (the SAME pairs the 7.4 fill consumes).
+    let pairs: Vec<(usize, usize, f64)> = pair_i
+        .iter()
+        .zip(pair_j.iter())
+        .zip(pair_weight.iter())
+        .map(|((&i, &j), &w)| (i as usize, j as usize, w))
+        .collect();
+
+    for feature in 0..n_features {
+        // bucket_of[obj] = the candidate feature's quantized bin (feature-major cindex).
+        let mut bucket_of = vec![0usize; n];
+        for obj in 0..n {
+            let bin = cindex.get(feature * n + obj).copied().unwrap_or(0) as usize;
+            if let Some(slot) = bucket_of.get_mut(obj) {
+                *slot = bin;
+            }
+        }
+
+        // der_sums[leaf=0][bucket] = the device-scattered der-sum row for this feature
+        // (the bounded device descriptor, leaf 0). Shaped [leaf_count][bucket_count].
+        let mut feat_der_sums = vec![vec![0.0_f64; bucket_count]; leaf_count];
+        for bucket in 0..bucket_count {
+            let v = der_sums_flat.get(feature * n_bins + bucket).copied().unwrap_or(0.0);
+            if let Some(cell) = feat_der_sums.get_mut(0).and_then(|row| row.get_mut(bucket)) {
+                *cell = v;
+            }
+        }
+
+        // pair_weight_statistics[leaf][leaf][bucket] via the FROZEN cb_compute oracle over
+        // the SAME pairs / bucket assignment (leaf_count == 1, the root).
+        let pair_weight_statistics = cb_compute::compute_pair_weight_statistics(
+            &pairs,
+            leaf_count,
+            bucket_count,
+            &leaf_of,
+            &bucket_of,
+        )?;
+
+        // The per-feature, per-border pairwise scores via the FROZEN host scorer (the small
+        // per-leaf Cholesky solve runs here over the bounded assembled system).
+        let feat_scores = cb_compute::calculate_pairwise_score(
+            &feat_der_sums,
+            &pair_weight_statistics,
+            bucket_count,
+            l2_diag_reg,
+            pairwise_bucket_weight_prior_reg,
+        )?;
+
+        for border in 0..n_splits {
+            let s = feat_scores.get(border).copied().unwrap_or(f64::NEG_INFINITY);
+            if let Some(slot) = scores.get_mut(feature * n_splits + border) {
+                *slot = s;
+            }
+        }
+    }
+
+    // (3) DEVICE: the deterministic best-split argmax (== select_best_candidate strict
+    //     first-wins / lowest-index tie-break) over the host-solved scores, threaded
+    //     through the device select_best_split_kernel so the selection is device-resident
+    //     (only the O(1) winner crosses back). Empty candidate set -> no best.
+    let best = if n_candidates == 0 {
+        None
+    } else {
+        select_best_split_over_scores(client, &scores, n_splits)?
+    };
+
+    Ok(PairwiseSplitScore {
+        scores,
+        der_sums: der_sums_flat,
+        best,
+    })
+}
+
+/// Run the device [`select_best_split_kernel`] over a host-solved per-candidate score
+/// vector and finish the O(blocks) across-block argmax host-side with the SAME
+/// lowest-index tie-break (== `select_best_candidate`). Returns the winning
+/// [`BestSplit`] (`feature_id = candidate / n_splits`, `bin_id = candidate % n_splits`),
+/// or `None` if no candidate beat the sentinel. A read-back failure surfaces
+/// [`CbError::Degenerate`] (WR-05), never a silent zero buffer.
+fn select_best_split_over_scores(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    scores: &[f64],
+    n_splits: usize,
+) -> CbResult<Option<BestSplit>> {
+    let n_candidates = scores.len();
+    if n_candidates == 0 {
+        return Ok(None);
+    }
+    let n_candidates_u32 = u32::try_from(n_candidates).map_err(|_| {
+        CbError::OutOfRange(format!("n_candidates ({n_candidates}) exceeds u32 (argmin axis)"))
+    })?;
+
+    // A SINGLE cube of CUBE_DIM units strides over all candidates and block-reduces to one
+    // winner (the FROZEN pointwise argmin geometry).
+    let num_cubes = 1usize;
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    #[cfg(feature = "wgpu")]
+    let (best_gain_handle, best_idx_handle) = {
+        let scores_f32: Vec<f32> = scores.iter().map(|&v| v as f32).collect();
+        let scores_h = client.create(cubecl::bytes::Bytes::from_elems(scores_f32));
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        select_best_split_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(scores_h, n_candidates) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            n_candidates_u32,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let (best_gain_handle, best_idx_handle) = {
+        let scores_h = client.create(cubecl::bytes::Bytes::from_elems(scores.to_vec()));
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        select_best_split_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(scores_h, n_candidates) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            n_candidates_u32,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    let best_gains = read_scores_f64(client, best_gain_handle)?;
+    let best_idx_bytes = client
+        .read_one(best_idx_handle)
+        .map_err(|e| CbError::Degenerate(format!("pairwise best-idx read-back failed: {e:?}")))?;
+    let best_idxs: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&best_idx_bytes).to_vec();
+
+    // Finish the across-block argmax: highest score wins; on an EXACT tie the LOWER
+    // candidate index wins (strict first-wins parity == select_best_candidate).
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_c = u32::MAX;
+    for (block, &gain) in best_gains.iter().enumerate() {
+        let cand = best_idxs.get(block).copied().unwrap_or(u32::MAX);
+        if (cand as usize) >= n_candidates {
+            continue;
+        }
+        let take = gain > best_score || (gain == best_score && cand < best_c);
+        if take {
+            best_score = gain;
+            best_c = cand;
+        }
+    }
+
+    if (best_c as usize) < n_candidates && n_splits > 0 {
+        let feature = (best_c as usize) / n_splits;
+        let bin = (best_c as usize) % n_splits;
+        Ok(Some(BestSplit {
+            feature_id: feature as u32,
+            bin_id: bin as u32,
+            score: best_score as f32,
+            gain: best_score as f32,
+        }))
+    } else {
+        Ok(None)
+    }
 }

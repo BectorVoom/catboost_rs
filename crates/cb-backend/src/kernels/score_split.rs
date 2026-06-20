@@ -839,3 +839,356 @@ mod variants {
         }
     }
 }
+
+// ===========================================================================
+// Phase 7.5 Plan 06 — the PAIRWISE split scorer self-oracle (GPU-01 final slice;
+// D-7.5-01). The device pairwise split score (the per-leaf linear-system build from
+// the FROZEN 7.4 4-channel handle + the device der-sum scatter + the host Cholesky
+// solve, RESEARCH Open Q3) must match `cb_compute::calculate_pairwise_score` over the
+// SAME leaf systems within the REPORTED tolerance, and the pairwise scan/update over
+// the 4-channel handle must match the host ordered reference. cb-compute is already a
+// dep, so the pairwise fns are called DIRECTLY as the read-only oracle (NO cb-train
+// dep — the Plan-A landmine). SCOPE: depth-1 / leaf_count == 1 (the root), <= CUBE_DIM
+// bins; the cross-cube-carry follow-up is asserted to surface a typed error.
+// ===========================================================================
+
+mod pairwise {
+    use super::*;
+    use crate::gpu_runtime::{launch_pairwise_split_score, launch_scan_update_pairwise};
+    use cb_compute::{calculate_pairwise_score, compute_pair_weight_statistics};
+
+    /// Build a deterministic pairwise/ranking fixture: `n_objects` objects over
+    /// `n_features` quantized features (`n_bins` bins each, feature-major cindex), a
+    /// per-object pairwise-weighted `der1`, and a global pair list with non-trivial
+    /// weights (the PairLogit/ranking shape: within-group winner→loser pairs). Feature 0's
+    /// bins climb monotonically with the object index so a mid-range border carves a clear
+    /// pairwise-gain split; other features get a different deterministic spread. Returns
+    /// `(der1, pair_i, pair_j, pair_weight, cindex, indices)`.
+    #[allow(clippy::type_complexity)]
+    fn make_pairwise_fixture(
+        n_objects: usize,
+        n_features: usize,
+        n_bins: usize,
+    ) -> (Vec<f64>, Vec<u32>, Vec<u32>, Vec<f64>, Vec<u32>, Vec<u32>) {
+        // Pairwise-weighted der1: a smooth ramp through zero (a clear pairwise gradient).
+        let der1: Vec<f64> = (0..n_objects)
+            .map(|k| (k as f64) - (n_objects as f64) / 2.0)
+            .collect();
+        let mut cindex = vec![0u32; n_features * n_objects];
+        for feature in 0..n_features {
+            for obj in 0..n_objects {
+                let bin = if feature == 0 {
+                    ((obj * n_bins) / n_objects.max(1)).min(n_bins - 1)
+                } else {
+                    (obj * (feature + 2) + feature) % n_bins
+                };
+                cindex[feature * n_objects + obj] = bin as u32;
+            }
+        }
+        // Global pairs (winner, loser): consecutive objects within a sliding window form
+        // winner→loser competitor pairs (the ranking adjacency), non-trivial weights.
+        let mut pair_i: Vec<u32> = Vec::new();
+        let mut pair_j: Vec<u32> = Vec::new();
+        let mut pair_weight: Vec<f64> = Vec::new();
+        for w in 0..n_objects {
+            for l in (w + 1)..(w + 4).min(n_objects) {
+                pair_i.push(w as u32);
+                pair_j.push(l as u32);
+                pair_weight.push(0.5 + ((w + l) % 5) as f64 * 0.25);
+            }
+        }
+        let indices: Vec<u32> = (0..n_objects as u32).collect();
+        (der1, pair_i, pair_j, pair_weight, cindex, indices)
+    }
+
+    /// The ORDERED host reference cumulative 4-channel pairwise histogram — the parity
+    /// baseline the device pairwise scan/update is REPORTED against. Reconstructs the raw
+    /// 4-channel pairwise histogram from the global pairs (the `Compare -> histId` mapping
+    /// distilled in the FROZEN 7.4 kernel), then folds each (feature, histId) channel's
+    /// bin axis into an inclusive prefix in ASCENDING bin order via [`sum_f64`]. Layout is
+    /// the FROZEN `(feature * n_bins + bin) * 4 + histId` order.
+    fn host_reference_pairwise_cumulative(
+        pair_i: &[u32],
+        pair_j: &[u32],
+        pair_weight: &[f64],
+        cindex: &[u32],
+        n_objects: usize,
+        n_bins: usize,
+        n_features: usize,
+    ) -> Vec<f64> {
+        // Raw 4-channel histogram: per (feature, bin, histId) gather the per-pair weights
+        // in ascending pair order and fold via sum_f64 (the SAME ordered fold the 7.4
+        // oracle uses). histId = 2 * isGe + isSecondBin (b1 -> {0,2}, b2 -> {1,3}).
+        let cells = n_features * n_bins * 4;
+        let mut contrib: Vec<Vec<f64>> = vec![Vec::new(); cells];
+        for (p, &w) in pair_weight.iter().enumerate() {
+            let oi = pair_i[p] as usize;
+            let oj = pair_j[p] as usize;
+            for feature in 0..n_features {
+                let b1 = cindex[feature * n_objects + oi] as usize;
+                let b2 = cindex[feature * n_objects + oj] as usize;
+                let ge = usize::from(b1 >= b2);
+                let gt = usize::from(b1 > b2);
+                let base = (feature * n_bins) * 4;
+                // bin b1 (isSecondBin = 0): histId 2*ge+0 and 2*gt+0.
+                contrib[base + b1 * 4 + 2 * ge].push(w);
+                contrib[base + b1 * 4 + 2 * gt].push(w);
+                // bin b2 (isSecondBin = 1): histId 2*ge+1 and 2*gt+1.
+                contrib[base + b2 * 4 + 2 * ge + 1].push(w);
+                contrib[base + b2 * 4 + 2 * gt + 1].push(w);
+            }
+        }
+        let raw: Vec<f64> = contrib.iter().map(|c| sum_f64(c)).collect();
+
+        // Inclusive prefix per (feature, histId) channel over the bin axis (sum_f64).
+        let mut cumulative = vec![0.0_f64; cells];
+        for feature in 0..n_features {
+            for hist_id in 0..4 {
+                let mut acc: Vec<f64> = Vec::with_capacity(n_bins);
+                for bin in 0..n_bins {
+                    let cell = (feature * n_bins + bin) * 4 + hist_id;
+                    acc.push(raw[cell]);
+                    cumulative[cell] = sum_f64(&acc);
+                }
+            }
+        }
+        cumulative
+    }
+
+    /// The host pairwise score baseline over the SAME leaf systems the device path
+    /// assembles: leaf_count == 1 (the root), per feature build `der_sums[0][bucket]` from
+    /// the per-object der1 (`compute_der_sums`) + `pair_weight_statistics[0][0][bucket]`
+    /// (`compute_pair_weight_statistics`) over the global pairs, then
+    /// `calculate_pairwise_score`. Flat `feature * (bucket_count-1) + border`.
+    #[allow(clippy::too_many_arguments)]
+    fn host_reference_pairwise_scores(
+        der1: &[f64],
+        pair_i: &[u32],
+        pair_j: &[u32],
+        pair_weight: &[f64],
+        cindex: &[u32],
+        n_objects: usize,
+        n_bins: usize,
+        n_features: usize,
+        l2_diag_reg: f64,
+        prior_reg: f64,
+    ) -> Vec<f64> {
+        let leaf_count = 1usize;
+        let bucket_count = n_bins;
+        let n_splits = bucket_count - 1;
+        let leaf_of = vec![0usize; n_objects];
+        let pairs: Vec<(usize, usize, f64)> = pair_i
+            .iter()
+            .zip(pair_j.iter())
+            .zip(pair_weight.iter())
+            .map(|((&i, &j), &w)| (i as usize, j as usize, w))
+            .collect();
+        let mut scores = vec![0.0_f64; n_features * n_splits];
+        for feature in 0..n_features {
+            let bucket_of: Vec<usize> = (0..n_objects)
+                .map(|obj| cindex[feature * n_objects + obj] as usize)
+                .collect();
+            let der_sums = cb_compute::compute_der_sums(
+                der1, leaf_count, bucket_count, &leaf_of, &bucket_of,
+            )
+            .expect("compute_der_sums must succeed on the in-range fixture");
+            let pws =
+                compute_pair_weight_statistics(&pairs, leaf_count, bucket_count, &leaf_of, &bucket_of)
+                    .expect("compute_pair_weight_statistics must succeed");
+            let feat_scores = calculate_pairwise_score(
+                &der_sums, &pws, bucket_count, l2_diag_reg, prior_reg,
+            )
+            .expect("calculate_pairwise_score must succeed");
+            for border in 0..n_splits {
+                scores[feature * n_splits + border] = feat_scores[border];
+            }
+        }
+        scores
+    }
+
+    /// The strict first-wins argmax over a flat per-candidate `feature * n_splits + border`
+    /// score vector (ascending feature, ascending border), == `select_best_candidate`.
+    fn reference_best_pairwise(
+        scores: &[f64],
+        n_features: usize,
+        n_splits: usize,
+    ) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for feature in 0..n_features {
+            for border in 0..n_splits {
+                let s = scores.get(feature * n_splits + border).copied().unwrap_or(f64::NEG_INFINITY);
+                if s > best_score {
+                    best_score = s;
+                    best = Some((feature, border));
+                }
+            }
+        }
+        best
+    }
+
+    /// The device pairwise split score (linear-system build from the FROZEN 7.4 4-channel
+    /// handle + the device der-sum scatter + the host Cholesky solve) must match
+    /// `cb_compute::calculate_pairwise_score` over the SAME leaf systems within the
+    /// REPORTED tolerance, AND the device argmax must pick the SAME (feature, border) as
+    /// the CPU pairwise reference EXACTLY (the strict STRUCTURE bar, SC-3). The device
+    /// der-sum descriptor must match `compute_der_sums` (the bounded device scatter).
+    #[test]
+    fn score_matches_cpu_oracle() {
+        let n_features = 3usize;
+        let n_bins = 32usize; // 5-bit one-byte non-binary family, <= CUBE_DIM
+        let l2_diag_reg = 3.0_f64;
+        let prior_reg = 0.1_f64;
+
+        // Empty short-circuit: no objects -> empty score, no panic.
+        {
+            let (der1, pi, pj, pw, cindex, indices) = make_pairwise_fixture(0, n_features, n_bins);
+            let out = launch_pairwise_split_score(
+                &der1, &pi, &pj, &pw, &cindex, &indices, n_bins, n_features, l2_diag_reg, prior_reg,
+                false,
+            )
+            .expect("empty pairwise score must short-circuit, not panic");
+            assert!(out.scores.is_empty(), "empty fixture -> empty scores");
+            assert!(out.best.is_none(), "empty fixture -> no best split");
+        }
+
+        for &n in &[8usize, 37usize, 200usize] {
+            let (der1, pi, pj, pw, cindex, indices) =
+                make_pairwise_fixture(n, n_features, n_bins);
+
+            let out = launch_pairwise_split_score(
+                &der1, &pi, &pj, &pw, &cindex, &indices, n_bins, n_features, l2_diag_reg,
+                prior_reg, false,
+            )
+            .expect("pairwise split score must succeed on the in-range fixture");
+
+            // (A) Device der-sum descriptor == compute_der_sums (leaf 0), per feature.
+            let leaf_of = vec![0usize; n];
+            for feature in 0..n_features {
+                let bucket_of: Vec<usize> = (0..n)
+                    .map(|obj| cindex[feature * n + obj] as usize)
+                    .collect();
+                let cpu_der = cb_compute::compute_der_sums(&der1, 1, n_bins, &leaf_of, &bucket_of)
+                    .expect("compute_der_sums must succeed");
+                for bucket in 0..n_bins {
+                    let dev = out.der_sums.get(feature * n_bins + bucket).copied().unwrap_or(0.0);
+                    let cpu = cpu_der[0][bucket];
+                    let abs = (dev - cpu).abs();
+                    assert!(
+                        abs <= SCORE_BOUND,
+                        "[pairwise n={n} f={feature} b={bucket}] device der-sum {dev} != CPU {cpu} \
+                         (abs={abs:.3e} bound={SCORE_BOUND:.0e})"
+                    );
+                }
+            }
+
+            // (B) SCORE — device per-candidate score == host calculate_pairwise_score
+            //     within the REPORTED tolerance.
+            let baseline = host_reference_pairwise_scores(
+                &der1, &pi, &pj, &pw, &cindex, n, n_bins, n_features, l2_diag_reg, prior_reg,
+            );
+            assert_eq!(
+                out.scores.len(),
+                baseline.len(),
+                "device pairwise score length must equal n_features * (n_bins-1) (n={n})"
+            );
+            let (abs, rel) = max_divergence(&out.scores, &baseline);
+            println!(
+                "[pairwise score n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} \
+                 (bound={SCORE_BOUND:.0e})"
+            );
+            assert!(
+                rel <= SCORE_BOUND || abs <= SCORE_BOUND,
+                "[pairwise score n={n}] device pairwise score diverged from calculate_pairwise_score: \
+                 abs={abs:.3e} rel={rel:.3e} (bound={SCORE_BOUND:.0e})"
+            );
+
+            // (C) STRUCTURE (the strict SC-3 bar) — device argmax == CPU pairwise winner.
+            let n_splits = n_bins - 1;
+            let cpu_winner = reference_best_pairwise(&baseline, n_features, n_splits);
+            let dev_winner = out
+                .best
+                .as_ref()
+                .map(|b| (b.feature_id as usize, b.bin_id as usize));
+            assert_eq!(
+                dev_winner, cpu_winner,
+                "[pairwise n={n}] device best split must equal the CPU pairwise first-wins winner: \
+                 device={dev_winner:?} cpu={cpu_winner:?}"
+            );
+
+            // Guard: no candidate score is NaN (a degenerate SPD solve falls back to 0.0).
+            for (c, &s) in out.scores.iter().enumerate() {
+                assert!(
+                    s.is_finite(),
+                    "[pairwise n={n}] candidate {c} score is non-finite ({s}) — a Cholesky guard \
+                     was not transcribed verbatim"
+                );
+            }
+        }
+    }
+
+    /// The device pairwise scan/update over the FROZEN 7.4 4-channel handle must match the
+    /// host ordered cumulative 4-channel reference within the REPORTED tolerance, AND
+    /// `n_bins > CUBE_DIM` must surface the typed cross-cube-carry follow-up error (NOT a
+    /// silent truncated prefix).
+    #[test]
+    fn scan_matches_reference() {
+        let n_features = 2usize;
+        let n_objects = 60usize;
+
+        // Empty short-circuit.
+        {
+            let (_der1, pi, pj, pw, cindex, _idx) = make_pairwise_fixture(0, n_features, 32);
+            let cumulative = launch_scan_update_pairwise(
+                &pi, &pj, &pw, &cindex, 0, 32, n_features, 5, false,
+            )
+            .expect("empty pairwise scan must short-circuit");
+            assert!(cumulative.is_empty(), "empty fixture -> empty cumulative");
+        }
+
+        // <= CUBE_DIM bins: the device cumulative matches the host ordered reference.
+        for &(n_bins, bits) in &[(32usize, 5u32)] {
+            let (_der1, pi, pj, pw, cindex, _idx) =
+                make_pairwise_fixture(n_objects, n_features, n_bins);
+            let cumulative = launch_scan_update_pairwise(
+                &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, bits, false,
+            )
+            .expect("pairwise scan/update must succeed");
+
+            let baseline = host_reference_pairwise_cumulative(
+                &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features,
+            );
+            assert_eq!(
+                cumulative.len(),
+                baseline.len(),
+                "device cumulative length must equal n_features * n_bins * 4 (n_bins={n_bins})"
+            );
+            let (abs, rel) = max_divergence(&cumulative, &baseline);
+            println!(
+                "[pairwise scan n_bins={n_bins}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} \
+                 (bound={SCORE_BOUND:.0e})"
+            );
+            assert!(
+                rel <= SCORE_BOUND || abs <= SCORE_BOUND,
+                "[pairwise scan n_bins={n_bins}] device cumulative diverged from the host ordered \
+                 reference: abs={abs:.3e} rel={rel:.3e} (bound={SCORE_BOUND:.0e})"
+            );
+        }
+
+        // > CUBE_DIM bins: the typed cross-cube-carry follow-up guard.
+        {
+            let n_bins = 64usize; // > CUBE_DIM = 32 (6-bit), bits = 6
+            let (_der1, pi, pj, pw, cindex, _idx) =
+                make_pairwise_fixture(n_objects, n_features, n_bins);
+            let err = launch_scan_update_pairwise(
+                &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, 6, false,
+            )
+            .expect_err("n_bins > CUBE_DIM must surface a typed cross-cube-carry error");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("cross-cube") && msg.contains("n_bins"),
+                "the >CUBE_DIM error must name the cross-cube-carry follow-up: {msg}"
+            );
+        }
+    }
+}

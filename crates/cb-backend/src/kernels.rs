@@ -2324,6 +2324,302 @@ pub fn partition_update_kernel<F: Float>(
     }
 }
 
+// ===========================================================================
+// Phase 7.5 Plan 06 — the PAIRWISE split scorer (split_pairwise.cuh), the
+// genuinely-new structurally-heaviest piece (Pitfall 5), sequenced LAST per
+// D-7.5-01. It closes the GPU-01 kernel surface: the per-leaf linear-system build
+// from the FROZEN 7.4 4-channel pairwise histogram + the der-sum scatter
+// (== upstream `MakePairwiseDerivatives` / `MakePointwiseDerivatives`), the
+// pairwise scan/update over the 4-channel handle (D-7.4-06 deferred-from-7.4),
+// and the deterministic best-split argmin (== `SelectBestSplit`). The small
+// per-leaf dense Cholesky solve + the `CalculateScore` fold run host-side over the
+// BOUNDED assembled per-(feature,bucket) statistics (RESEARCH Open Q3: a
+// `#[cube]` dense SPD solve is awkward and the FROZEN CPU
+// `cb_compute::pairwise_cholesky_solve` is the parity oracle), so the bulk
+// pairwise histogram stays device-resident and only the assembled
+// `O(n_features * bucket_count)` der-sum + pair-weight statistics descriptor
+// crosses to host (minimal round-trips, D-05). See
+// `crates/cb-backend/src/gpu_runtime.rs::launch_pairwise_split_score`.
+// ===========================================================================
+
+/// 4-channel pairwise **scan/update** — the post-fill transform deferred from 7.4
+/// (`UpdatePairwiseHistograms`/`ScanPairwiseHistograms`, D-7.4-06) over the FROZEN
+/// 4-channel `(feature * n_bins + bin) * 4 + histId` layout. The pairwise sibling of
+/// [`scan_update_pointwise_kernel`]: where the pointwise scan does an inclusive
+/// prefix over the 2-channel (Σ der1, Σ weight) bin axis, this does the SAME
+/// wave-agnostic inclusive prefix over EACH of the 4 weight-only channels
+/// (`histId in {0,1,2,3}`) so the scorer can read cumulative "left-of-border" pair
+/// weights per channel.
+///
+/// # Reuse of the block-scan mechanism (VERBATIM, D-09)
+///
+/// ONE cube per `(feature, histId)` pair: `CUBE_POS` decodes `feature = CUBE_POS /
+/// 4`, `histId = CUBE_POS % 4`. Within the cube each unit `UNIT_POS` owns one bin
+/// `0..n_bins` and reads that bin's channel from `(feature * n_bins + bin) * 4 +
+/// histId`. The prefix-sum REUSES the exact wave-agnostic single-cube scan mechanism
+/// of [`block_scan_kernel`] / [`scan_update_pointwise_kernel`] VERBATIM (the
+/// within-plane `plane_inclusive_sum` + the Hillis-Steele cross-plane carry over
+/// per-plane partials), so NO hand-rolled scan and NO warp/wave-size literal in any
+/// stride (D-09 — strides derive from `CUBE_DIM_X` / `PLANE_DIM`). `inclusive = true`.
+///
+/// # SCOPE (RESEARCH Open Q3 / inherited from Plan B) — single-cube precondition
+///
+/// Like the underlying `block_scan_kernel`, this is correct only for `n_bins <=
+/// CUBE_DIM` (one plane on wave32 gfx1100, where the cross-plane carry collapses to
+/// the identity). The CROSS-CUBE carry for `n_bins > CUBE_DIM` (8-bit, 256-bin
+/// features) is NOT performed here; the host seam
+/// [`crate::gpu_runtime::launch_scan_update_pairwise`] enforces the precondition with
+/// a typed error (the EXPLICIT tracked cross-cube-carry follow-up — NOT a silent cut).
+///
+/// Generic over `F: Float` (AGENTS.md generics-float). Every device read/write is
+/// under a POSITION bounds guard. if-as-STATEMENT only (CubeCL conditionals manual).
+#[cube(launch)]
+pub fn scan_update_pairwise_kernel<F: Float>(
+    bin_sums: &Array<F>,
+    cumulative: &mut Array<F>,
+    n_bins: u32,
+) {
+    let tid = UNIT_POS;
+    let n_bins_usize = n_bins as usize;
+
+    // Decode which (feature, histId) axis this cube scans. Four channels per feature
+    // (the FROZEN 4-channel pairwise layout), so cube `k` handles feature `k / 4`,
+    // histId `k % 4`. The flat cell index is `(feature * n_bins + bin) * 4 + histId`.
+    let feature = CUBE_POS / 4usize;
+    let hist_id = CUBE_POS % 4usize;
+
+    // Load this unit's bin value for the (feature, histId) axis, zero-padding idle
+    // out-of-range lanes (this cube has CUBE_DIM units; only the first n_bins own a
+    // bin). if-as-STATEMENT: init to 0, overwrite inside the bounds guard.
+    let mut val = F::new(0.0);
+    if tid < n_bins {
+        let cell = (feature * n_bins_usize + tid as usize) * 4usize + hist_id;
+        if cell < bin_sums.len() {
+            val = bin_sums[cell];
+        }
+    }
+
+    // --- Inclusive prefix-sum over the bin axis, REUSING the block_scan_kernel
+    //     mechanism VERBATIM (within-plane plane scan + Hillis-Steele cross-plane
+    //     carry over per-plane partials). inclusive = true (cumulative includes self).
+
+    // 1) Within-plane inclusive prefix (width = PLANE_DIM, never a literal).
+    let scanned_in_plane = plane_inclusive_sum(val);
+    let scanned = scanned_in_plane;
+
+    // 2) Cross-plane carry: the LAST unit of each plane writes that plane's inclusive
+    //    total into a per-plane shared slot keyed by PLANE_POS.
+    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
+        partials[PLANE_POS as usize] = scanned_in_plane;
+    }
+    sync_cube();
+
+    // Number of planes = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on wave32 at CUBE_DIM 32 —
+    // the carry below then adds nothing). The stride bound derives from CUBE_DIM_X /
+    // PLANE_DIM, NOT a literal 32/64 (D-09).
+    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+
+    // Hillis-Steele inclusive scan over the per-plane partials.
+    let mut s = 1u32;
+    while s < num_planes {
+        let mut add = F::new(0.0);
+        if tid < num_planes {
+            if tid >= s {
+                add = partials[(tid - s) as usize];
+            }
+        }
+        sync_cube();
+        if tid < num_planes {
+            if tid >= s {
+                partials[tid as usize] += add;
+            }
+        }
+        sync_cube();
+        s *= 2u32;
+    }
+
+    // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
+    let mut carry = F::new(0.0);
+    if PLANE_POS >= 1u32 {
+        carry = partials[(PLANE_POS - 1u32) as usize];
+    }
+
+    let result = scanned + carry;
+
+    // Write the inclusive cumulative for this (feature, histId, bin) back into the
+    // FROZEN 4-channel layout (only the n_bins real bins; idle lanes write nothing).
+    if tid < n_bins {
+        let out_cell = (feature * n_bins_usize + tid as usize) * 4usize + hist_id;
+        if out_cell < cumulative.len() {
+            cumulative[out_cell] = result;
+        }
+    }
+}
+
+/// **Pairwise make-derivatives** — the per-(feature, bucket) der-sum scatter that
+/// builds the pointwise der portion of the pairwise linear system (== upstream
+/// `MakePointwiseDerivatives` over the single root leaf, the per-leaf system row the
+/// pairwise scorer's `der_sum[2*leaf+1] += Σ_bucket der_sums[leaf][bucket]` consumes;
+/// `split_pairwise.cuh:11-18`). For the depth-1 MVP there is ONE leaf (the root), so
+/// this scatters every object's pairwise-weighted `der1[obj]` into its feature bucket:
+/// `der_sums[feature * n_bins + bin] += der1[obj]`, bin = `cindex[feature * n + obj]`.
+///
+/// This is the device twin of the host `cb_compute::compute_der_sums` (it produces the
+/// SAME `der_sums[leaf=0][bucket]` row, flattened per feature) — the heavy per-object
+/// scatter stays on device (D-03 in-kernel atomic), and only the bounded
+/// `n_features * n_bins` der-sum descriptor crosses to host for the small per-leaf
+/// Cholesky solve (RESEARCH Open Q3). The 4-channel pair-weight statistics come from
+/// the FROZEN 7.4 fill ([`pairwise_hist_nonbinary_kernel`]); this kernel adds the
+/// pointwise der row.
+///
+/// # Per-bucket reduce (D-03 in-kernel atomic + f64 finalize)
+///
+/// Each object atomic-adds its `der1[obj]` into `der_sums[feature * n_bins + bin]` for
+/// every feature. The cross-thread merge is ALWAYS the in-kernel `Atomic<F>::fetch_add`
+/// (D-03); the channel float type is f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1).
+///
+/// # Wave-size policy (D-09) / generics-float (AGENTS.md)
+///
+/// The per-object loop is a grid-stride loop over the total thread count
+/// (`CUBE_COUNT * CUBE_DIM`) — NEVER a literal 32/64. Generic over `F: Float`. Every
+/// device read is under a POSITION bounds guard; the bin/object VALUE ranges are
+/// validated HOST-SIDE before launch. if-as-STATEMENT only.
+///
+/// `der1` (the pairwise-weighted first derivative, length `n`), `cindex` (feature-major
+/// quantized bins, `cindex[feature * n + obj]`, length `n_features * n`), `indices`
+/// (object visiting order, length `n`), `der_sums` (length `n_features * n_bins`,
+/// zero-initialised). `n_features` the feature-group width.
+#[cube(launch)]
+pub fn pairwise_make_derivatives_kernel<F: Float>(
+    der1: &Array<F>,
+    cindex: &Array<u32>,
+    indices: &Array<u32>,
+    der_sums: &mut Array<Atomic<F>>,
+    n_features: u32,
+    #[comptime] n_bins: u32,
+) {
+    let n = indices.len();
+    let n_bins_usize = n_bins as usize;
+    let n_features_usize = n_features as usize;
+
+    // Grid-stride loop over the object-visiting order (stride == total thread count,
+    // a topology value — NEVER a literal 32/64, D-09).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < n {
+        let obj = indices[i] as usize;
+        let d = der1[obj];
+        let mut feature = 0usize;
+        while feature < n_features_usize {
+            // The feature-major cindex stride is `feature * n + obj` (n == indices.len()).
+            let bin = cindex[feature * n + obj] as usize;
+            // der_sums[feature * n_bins + bin] += der1[obj] (per-leaf=root row scatter,
+            // == compute_der_sums for leaf_count==1). The host validated bin < n_bins.
+            let cell = feature * n_bins_usize + bin;
+            der_sums[cell].fetch_add(d);
+            feature += 1usize;
+        }
+        i += stride;
+    }
+}
+
+/// Comptime `SharedMemory` size for the [`select_best_split_kernel`] argmin tree —
+/// the SAME `BLOCK_REDUCE_SHMEM` (== `CUBE_DIM`) the [`find_optimal_split_kernel`]
+/// argmin uses ([`ARGMIN_SHMEM`]). One shared slot per unit. NOT a wave/warp-size
+/// literal in any stride (D-09).
+pub(crate) const PAIRWISE_ARGMIN_SHMEM: usize = BLOCK_REDUCE_SHMEM;
+
+/// **Select best split** — the deterministic argmax over the host-solved pairwise
+/// scores with the SAME lowest-(candidate)-index tie-break as [`find_optimal_split_kernel`]
+/// (== upstream `SelectBestSplit`, `split_pairwise.cuh:27-31`). The pairwise scores are
+/// solved host-side (the small per-leaf Cholesky; RESEARCH Open Q3) and uploaded as a
+/// per-candidate `scores` array (`scores[feature * (bucket_count-1) + border]`); this
+/// kernel reduces them to ONE best `(candidate-index, score)` per cube via the
+/// wave-agnostic shared-mem tree-reduce, mirroring the `find_optimal_split_kernel`
+/// argmin VERBATIM. Threading the argmin through a device kernel keeps the
+/// best-candidate selection device-resident (only the O(1) winner descriptor crosses
+/// back), structurally matching `SelectBestSplit`.
+///
+/// `n_candidates` is the total scored candidate count (`n_features * (bucket_count-1)`).
+/// `best_gain`/`best_idx` carry one winner per cube (length = cube count). Ties keep the
+/// LOWER candidate index (strict-`>` first-wins, == `select_best_candidate`). Generic
+/// over `F: Float`. if-as-STATEMENT only. Every shared/global access is bounds-guarded.
+#[cube(launch)]
+pub fn select_best_split_kernel<F: Float>(
+    scores: &Array<F>,
+    best_gain: &mut Array<F>,
+    best_idx: &mut Array<u32>,
+    n_candidates: u32,
+) {
+    let tid = UNIT_POS;
+    let n_candidates_usize = n_candidates as usize;
+
+    // The minimal-score sentinel any finite candidate must beat (the
+    // `score.rs::MINIMAL_SCORE` analogue). `f32::MIN` is well below any realistic
+    // pairwise score and is representable in both the f32 (wgpu) and f64 channels.
+    let minimal_score = F::new(f32::MIN);
+
+    // This thread's running best over the candidates it strides through. `my_idx` is the
+    // candidate index; ties keep the LOWER index, so seed it to the max so any real
+    // candidate replaces it on the first strict-greater compare.
+    let mut my_gain = minimal_score;
+    let mut my_idx = n_candidates;
+
+    // Grid-stride over candidates (D-09: the stride is CUBE_DIM_X, a topology value).
+    let mut c = tid as usize;
+    while c < n_candidates_usize {
+        let g = scores[c];
+        // STRICT `>` (first-wins on equal score, ascending candidate index).
+        if g > my_gain {
+            my_gain = g;
+            my_idx = c as u32;
+        }
+        c += CUBE_DIM_X as usize;
+    }
+
+    // Shared-mem tree-reduce argmax with the lowest-index tie-break (mirrors the
+    // find_optimal_split_kernel argmin VERBATIM). SIZE is the comptime
+    // PAIRWISE_ARGMIN_SHMEM; the stride starts at CUBE_DIM_X / 2 and halves.
+    let mut sh_gain = SharedMemory::<F>::new(PAIRWISE_ARGMIN_SHMEM);
+    let mut sh_idx = SharedMemory::<u32>::new(PAIRWISE_ARGMIN_SHMEM);
+    sh_gain[tid as usize] = my_gain;
+    sh_idx[tid as usize] = my_idx;
+    sync_cube();
+
+    let mut step = CUBE_DIM_X / 2u32;
+    while step >= 1u32 {
+        if tid < step {
+            let other_gain = sh_gain[(tid + step) as usize];
+            let other_idx = sh_idx[(tid + step) as usize];
+            let cur_gain = sh_gain[tid as usize];
+            let cur_idx = sh_idx[tid as usize];
+            // Higher gain wins; on an EXACT tie the LOWER candidate index wins.
+            let mut take = false;
+            if other_gain > cur_gain {
+                take = true;
+            }
+            if other_gain == cur_gain {
+                if other_idx < cur_idx {
+                    take = true;
+                }
+            }
+            if take {
+                sh_gain[tid as usize] = other_gain;
+                sh_idx[tid as usize] = other_idx;
+            }
+        }
+        sync_cube();
+        step /= 2u32;
+    }
+
+    // Unit 0 writes this cube's winner.
+    if tid == 0u32 {
+        best_gain[CUBE_POS] = sh_gain[0usize];
+        best_idx[CUBE_POS] = sh_idx[0usize];
+    }
+}
+
 #[cfg(test)]
 mod gradient_gpu;
 
