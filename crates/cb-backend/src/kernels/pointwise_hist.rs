@@ -121,6 +121,17 @@ fn host_reference_hist2(
         for &obj in indices.iter() {
             let obj = obj as usize;
             let bin = cindex[feature * n + obj] as usize;
+            // WR-02: the reference indexes `delta_members[feature * n_bins + bin]` RAW,
+            // so it REQUIRES every bin to be in `0..n_bins` (the host-side range guard in
+            // `launch_pointwise_hist2_into` enforces the same invariant for the kernels).
+            // Assert it here so the oracle cannot silently diverge from the masking
+            // kernels on an out-of-range bin — instead of indexing out of bounds, it
+            // surfaces a clear assertion in the test harness.
+            assert!(
+                bin < n_bins,
+                "host_reference_hist2 requires in-range bins: bin {bin} >= n_bins {n_bins} \
+                 (feature {feature}, obj {obj})"
+            );
             let cell = feature * n_bins + bin;
             delta_members[cell].push(der1[obj]);
             weight_members[cell].push(weight[obj]);
@@ -167,8 +178,15 @@ fn make_fixture_f64(n: usize, n_features: usize, n_bins: usize) -> (Vec<f64>, Ve
 /// reports support, else the host-sum fallback already produced f64).
 fn read_handle_f64(h: cubecl::server::Handle) -> Vec<f64> {
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    // WR-03: re-resolving the client via `Runtime::client(&device)` for the SAME
+    // runtime/device does NOT construct a foreign allocator — CubeCL caches one client
+    // per device in a global pool, so this returns the SAME client (allocator/stream)
+    // that the seam used to allocate `h`. The cross-client hazard the production seam
+    // comment warns about (`launch_der_binary_into`) is reading a handle through a client
+    // of a DIFFERENT device/runtime; that is not happening here. This is the established
+    // read-back pattern shared by the reduce/scan/gradient_gpu oracles.
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let bytes = client.read_one(h).unwrap();
+    let bytes = client.read_one(h).expect("hand-off handle read-back failed");
     // The channel is f32 on wgpu (RESEARCH A1) and f64 elsewhere — upcast to f64 so the
     // oracle compares against the f64 host reference uniformly.
     #[cfg(feature = "wgpu")]
@@ -599,4 +617,41 @@ fn length_mismatch_is_typed_error() {
     // The AtomicFinalizePath enum is part of the reported seam surface (suppress the
     // unused-import lint when the path constants are not otherwise named in a build).
     let _ = AtomicFinalizePath::HostSumFallback;
+}
+
+#[test]
+fn out_of_range_value_is_typed_error() {
+    // CR-01: the length guards bound only buffer POSITIONS; the VALUES inside `cindex`
+    // (the bin) and `indices` (the object id) drive unchecked device array indices. A
+    // malformed value must surface a typed `CbError::OutOfRange` BEFORE any launch (a
+    // host-side guard), never an OOB device read/store. Mirrors
+    // `length_mismatch_is_typed_error`. (Test-only assertion that the production guard
+    // fires.)
+    let n_features = 2usize;
+    let n_bins = 256usize;
+    let n = 16usize;
+
+    // (a) Out-of-range `cindex` bin value: a single bin == n_bins (>= n_bins) would write
+    // bin_sums out of bounds in the non-binary path (which does not mask).
+    {
+        let (der1, weight, mut cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+        cindex[0] = n_bins as u32; // exactly n_bins -> out of the valid 0..n_bins range
+        let err = launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+        assert!(
+            matches!(err, Err(cb_core::CbError::OutOfRange(_))),
+            "out-of-range cindex bin must surface CbError::OutOfRange, got {err:?}"
+        );
+    }
+
+    // (b) Out-of-range `indices` object id: a single entry == n (>= n) would read
+    // der1[obj]/weight[obj]/cindex[feature*n+obj] out of bounds on the device.
+    {
+        let (der1, weight, cindex, mut indices) = make_fixture_f64(n, n_features, n_bins);
+        indices[0] = n as u32; // exactly n -> out of the valid 0..n range
+        let err = launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+        assert!(
+            matches!(err, Err(cb_core::CbError::OutOfRange(_))),
+            "out-of-range indices object id must surface CbError::OutOfRange, got {err:?}"
+        );
+    }
 }
