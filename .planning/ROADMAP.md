@@ -663,7 +663,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 07.4-04-PLAN.md — Wave 4: binary (2-bin) pairwise fill + self-oracle (GPU-01, SC-1)
+- [x] 07.4-04-PLAN.md — Wave 4: binary (2-bin) pairwise fill + self-oracle (GPU-01, SC-1)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
