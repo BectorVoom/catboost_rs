@@ -2245,6 +2245,250 @@ fn grow_oblivious_tree_into(
 }
 
 // ===========================================================================
+// Phase 7.5 Plan 04 — the device-resident MULTI-TREE Plain-boosting pass (GPU-01
+// grow-loop slice; D-7.5-06 non-determinism budget). Loops `grow_oblivious_tree`
+// (Plan C) over a full Plain-boosting run device-resident: each tree's leaf updates
+// feed the next tree's residuals, with der1 recomputed DEVICE-SIDE between trees via
+// the 7.2 der seam (`launch_der_binary_into` RMSE gradient), over ONE `ComputeClient`
+// threaded through the whole run. Mirrors the CPU `cb_train::boosting` Plain skeleton
+// (`boosting.rs:9-16`): per iteration `compute_gradients(approx, target)` -> grow one
+// oblivious tree -> leaf delta `calc_average` -> store `learning_rate * delta` ->
+// `approx[i] += leaf_value[leaf(i)]`. MVP: Plain boosting, foldCount == 1, symmetric
+// oblivious, RMSE/L2 (ordered / non-symmetric OUT of scope).
+// ===========================================================================
+
+/// The output of [`grow_boosting_pass`]: the per-tree grown structure + values of a
+/// full multi-tree Plain-boosting run. `trees[k]` is the `k`-th boosting iteration's
+/// [`GrownTree`] (its `leaf_values` already scaled by `learning_rate` — the stored
+/// `model.json` `leaf_values` convention, `cb_train::boosting` `boosting.rs:15-16`).
+/// `iterations` is `trees.len()`; `learning_rate` is the per-tree leaf-value scale.
+///
+/// This is the SC-3 structure observation surface for the multi-tree cross-oracle:
+/// EVERY tree's `splits` + `leaf_of` is asserted against the CPU multi-tree reference
+/// EXACTLY across the whole run, and the per-tree `leaf_values` divergence is REPORTED
+/// (the D-7.5-06 non-determinism budget — NOT the GPU-06 epsilon, 7.6's job).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrownModel {
+    /// The per-iteration grown trees (each tree's `leaf_values` already `learning_rate`-scaled).
+    pub trees: Vec<GrownTree>,
+    /// The per-tree leaf-value scale applied per iteration.
+    pub learning_rate: f64,
+}
+
+impl GrownModel {
+    /// The boosting iteration count (`trees.len()`).
+    #[must_use]
+    pub fn iterations(&self) -> usize {
+        self.trees.len()
+    }
+}
+
+/// Run a full MULTI-TREE Plain-boosting pass device-resident over the compile-time
+/// [`SelectedRuntime`], returning the per-iteration grown trees ([`GrownModel`]). The
+/// genuinely-new multi-iteration driver (D-05 / D-7.5-06): it loops
+/// [`grow_oblivious_tree_into`] (Plan C) over `iterations`, threading ONE
+/// `ComputeClient` through the whole run; between trees it recomputes the running
+/// residual gradient `der1` DEVICE-SIDE via the 7.2 der seam
+/// ([`launch_der_binary_into`], [`DerBinaryKernel::RmseGradient`] = `target - approx`),
+/// after updating the running per-object approx from the just-grown tree
+/// (`approx[i] += learning_rate * leaf_value[leaf_of[i]]`, the
+/// `cb_train::boosting` Plain convention). The per-tree leaf values are scaled by
+/// `learning_rate` in place (the stored `model.json` `leaf_values` convention).
+///
+/// # Inputs
+///
+/// `target` (the regression label, length `n`); `weight` (the per-object weight,
+/// channel 1, length `n` — folded downstream by the 7.3 histogram, the 7.2 UNWEIGHTED
+/// der contract); `cindex` (feature-major quantized bins, length `n_features * n`:
+/// `cindex[feature * n + obj]`); `indices` (object visiting order, length `n`);
+/// `n_bins` the per-feature border count; `n_features` the feature-group width;
+/// `iterations` the boosting-iteration count; `learning_rate` the per-tree leaf-value
+/// scale; `depth` the per-tree depth (MVP `depth == 1`); `scaled_l2` the per-tree
+/// `cb_compute::scale_l2_reg` output.
+///
+/// The starting approx is all-zero (the RMSE-from-zero MVP — `boost_from_average` /
+/// the target-mean bias is OUT of scope, the cross-oracle uses the SAME zero start);
+/// the initial der1 is therefore `target - 0 = target`.
+///
+/// # MVP scope and the depth>1 forward dependency
+///
+/// Plain boosting, `foldCount == 1`, symmetric oblivious, RMSE/L2. Each tree is grown
+/// by [`grow_oblivious_tree_into`], which itself supports `depth == 1` and surfaces a
+/// typed [`CbError::OutOfRange`] for `depth > 1` (the partition-aware-histogram forward
+/// dependency, documented in [`grow_oblivious_tree`]). The der recompute between trees
+/// runs device-side via the 7.2 seam; the recomputed der1 is read back once per tree —
+/// the SAME crossing class as the existing per-tree `leaf_of` / part-stats read-backs
+/// (D-05: no bulk histogram / partition / doc-routing crosses, only the O(1)/leaf
+/// data). der2 for RMSE is the constant `-1.0` ([`const_der_handle`]) — not materialized
+/// here (the L2 score path uses Σ der1 / Σ weight, the Newton der2 is the
+/// per-partition-histogram score follow-up, RESEARCH).
+///
+/// # Errors
+///
+/// - [`CbError::LengthMismatch`] if `weight`/`cindex` lengths disagree with `target`/`n`.
+/// - [`CbError::OutOfRange`] on `iterations`/leaf bookkeeping overflow, or `depth > 1`
+///   (propagated from [`grow_oblivious_tree_into`]).
+/// - [`CbError::Degenerate`] if a tree finds no candidate split, or any device read-back
+///   (the per-tree der recompute, leaf_of, or part-stats) fails — never a silent zero
+///   buffer (WR-05 / T-07.5-04-04).
+///
+/// No `unwrap`/`expect`/`panic`/indexing in this production driver (workspace lints +
+/// D-13). Threads ONE `&client` through the whole run (Pitfall 3 / T-07.5-04-03); never
+/// reads a 0-len handle.
+#[allow(clippy::too_many_arguments)]
+pub fn grow_boosting_pass(
+    target: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    iterations: usize,
+    learning_rate: f64,
+    depth: usize,
+    scaled_l2: f64,
+) -> CbResult<GrownModel> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    grow_boosting_pass_into(
+        &client, target, weight, cindex, indices, n_bins, n_features, iterations,
+        learning_rate, depth, scaled_l2,
+    )
+}
+
+/// The ONE multi-tree boosting-pass geometry (the histogram-seam IN-02 precedent — one
+/// place). Threads ONE `client` through every iteration: per tree it grows one
+/// [`grow_oblivious_tree_into`] over the running residual `der1`, scales the tree's
+/// leaf values by `learning_rate`, updates the running per-object approx from the
+/// tree's `leaf_of` + (scaled) `leaf_values`, and recomputes `der1` DEVICE-SIDE on the
+/// SAME client via the 7.2 der seam for the next iteration. The caller owns the
+/// `client` lifecycle so every device read-back uses the SAME client that allocated the
+/// handles (a CubeCL Handle is bound to its originating client — Pitfall 3 / see
+/// [`launch_der_binary_into`]).
+#[allow(clippy::too_many_arguments)]
+fn grow_boosting_pass_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    target: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    iterations: usize,
+    learning_rate: f64,
+    depth: usize,
+    scaled_l2: f64,
+) -> CbResult<GrownModel> {
+    let n = target.len();
+
+    // Shape guards (T-07.5-04-01): every per-object input must agree on `n` so the
+    // residual / approx update and the per-tree launches stay in bounds. Surface a typed
+    // error rather than launching a malformed kernel (no panic).
+    if weight.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "weight".to_owned(),
+            expected: n,
+            actual: weight.len(),
+        });
+    }
+
+    // Empty short-circuit (Pitfall 3/5): no objects / no iterations / no candidates ->
+    // an empty model. Never read a 0-len handle.
+    if n == 0 || n_features == 0 || n_bins == 0 || iterations == 0 || depth == 0 {
+        return Ok(GrownModel {
+            trees: Vec::new(),
+            learning_rate,
+        });
+    }
+
+    // Leaf-bookkeeping overflow guard (T-07.5-04-02): the running approx update indexes
+    // `leaf_values[leaf_of[obj]]` with `leaf_of[obj] < 2^depth`. Reject a degenerate
+    // depth before the per-tree loop forms the product unchecked. (`grow_oblivious_tree_into`
+    // re-checks per tree, but pin it here so the bound holds for the whole pass.)
+    let _n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+
+    // The running per-object approx (starts all-zero — the RMSE-from-zero MVP; the
+    // target-mean bias / boost_from_average is OUT of scope, the cross-oracle uses the
+    // SAME zero start). The initial residual der1 is therefore `target - 0 = target`.
+    let mut approx = vec![0.0_f64; n];
+
+    // The running residual gradient feeding the NEXT tree. Iteration 0 sees the initial
+    // residual (target, from the zero approx); each subsequent iteration recomputes it
+    // device-side via the 7.2 der seam after the approx update.
+    let mut der1: Vec<f64> = target.to_vec();
+
+    let mut trees: Vec<GrownTree> = Vec::with_capacity(iterations);
+
+    for _iter in 0..iterations {
+        // (1) Grow ONE oblivious tree over the CURRENT residual der1 (host-light, Plan C)
+        //     on the threaded client. The bulk histogram / partition / doc-routing stays
+        //     device-resident inside this call; only the O(1) BestSplit per level + the
+        //     2^depth part-stats + leaf_of cross back (the existing D-05 crossings).
+        let mut tree = grow_oblivious_tree_into(
+            client, &der1, weight, cindex, indices, n_bins, n_features, depth, scaled_l2,
+        )?;
+
+        // (2) Scale the tree's leaf values by `learning_rate` in place — the stored
+        //     `model.json` `leaf_values` convention (`cb_train::boosting` boosting.rs:15-16:
+        //     store `learning_rate * delta` as the leaf value). The unscaled
+        //     `calc_average` delta is the GrownTree's leaf_values; scale it here so the
+        //     model carries the per-tree contribution actually added to the approx.
+        for v in tree.leaf_values.iter_mut() {
+            *v *= learning_rate;
+        }
+
+        // (3) Update the running per-object approx from the just-grown tree
+        //     (`approx[i] += leaf_value[leaf_of[i]]`, the Plain convention). This reuses
+        //     the tree's ALREADY-read-back leaf_of + (scaled) leaf_values — NO new bulk
+        //     crossing (D-05). A leaf index out of range is impossible by construction
+        //     (leaf_of[obj] < 2^depth), but read without indexing (D-13).
+        for (obj, slot) in approx.iter_mut().enumerate() {
+            if let Some(&leaf) = tree.leaf_of.get(obj) {
+                if let Some(&v) = tree.leaf_values.get(leaf as usize) {
+                    *slot += v;
+                }
+            }
+        }
+
+        trees.push(tree);
+
+        // (4) Recompute the running residual der1 DEVICE-SIDE for the NEXT iteration via
+        //     the 7.2 der seam (RMSE gradient `der1 = target - approx`), on the SAME
+        //     client. Skip the final iteration (no next tree needs it). The der is read
+        //     back once — the SAME crossing class as the per-tree leaf_of / part-stats
+        //     read-backs (D-05). A read-back failure surfaces CbError::Degenerate (WR-05 /
+        //     T-07.5-04-04), never a silent zero buffer.
+        if _iter + 1 < iterations {
+            let der1_h = launch_der_binary_into(client, &approx, target, DerBinaryKernel::RmseGradient)?;
+            let bytes = client.read_one(der1_h).map_err(|e| {
+                CbError::Degenerate(format!(
+                    "boosting-pass der1 recompute read-back failed (iter {_iter}): {e:?}"
+                ))
+            })?;
+            // The der kernel output is f64 on rocm/cuda/cpu; on wgpu the elementwise der
+            // kernel still launches over f64 inputs/outputs (it uploads the f64 approx/
+            // target and writes an f64 out_handle — see `launch_der_binary_into`).
+            der1 = bytemuck::cast_slice::<u8, f64>(&bytes).to_vec();
+            // Defensive length guard (T-07.5-04-04): a truncated read-back must not feed a
+            // mis-sized residual into the next tree's launch. Surface it, never pad/zero.
+            if der1.len() != n {
+                return Err(CbError::Degenerate(format!(
+                    "boosting-pass der1 recompute returned {} elements, expected {n} (iter {_iter})",
+                    der1.len()
+                )));
+            }
+        }
+    }
+
+    Ok(GrownModel {
+        trees,
+        learning_rate,
+    })
+}
+
+// ===========================================================================
 // Phase 7.4 — the device-resident 4-channel WEIGHT-ONLY pairwise histogram FILL seam
 // (GPU-01 histogram slice). The general one-byte non-binary
 // `ComputePairwiseHistogramOneByte{5,6,7}Bits` analog: pair_i/pair_j (= `uint2* pairs`)
