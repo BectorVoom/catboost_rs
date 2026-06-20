@@ -34,10 +34,13 @@
 
 use cubecl::features::{AtomicUsage, Plane};
 use cubecl::prelude::*;
+use cubecl::server::Handle;
 
 use cb_core::{CbError, CbResult};
 
-use crate::kernels::{block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel};
+use crate::kernels::{
+    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, gradient_kernel,
+};
 use crate::SelectedRuntime;
 
 /// Which cross-cube finalize path the atomic-reduce helper actually ran. The f64
@@ -288,4 +291,139 @@ pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFin
         .copied()
         .ok_or_else(|| CbError::Degenerate("atomic accumulator read-back was empty".to_string()))?;
     Ok((sum, AtomicFinalizePath::InKernelAtomicF64))
+}
+
+/// Which elementwise binary `(approx, target) -> der1` kernel the device-resident
+/// der seam launches (Phase 7.2, GPU-01 der). This is the GPU analog of the
+/// `cpu_runtime::BinaryKernel` selector, but constrained to the elementwise der
+/// family the on-device residency seam carries: it starts with the RMSE gradient
+/// (`target - approx`); `LoglossGradient` and the parametric/unary arms are added
+/// in Plans 02/03 on this SAME seam (no new launch geometry per arm).
+///
+/// All arms produce UNWEIGHTED der1 — byte-identical in structure to the
+/// `cb-compute::loss` baseline the self-oracle compares against (D-7.2-01/02,
+/// approved Task-1 contract). The per-object weight is folded DOWNSTREAM by the
+/// 7.3 `histogram_scatter_kernel` (`contrib[i] = der1[i] * weight[i]`), NOT in
+/// this kernel: the seam hands 7.3 the unweighted der1 handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerBinaryKernel {
+    /// RMSE first derivative `der1[i] = target[i] - approx[i]` (the reused
+    /// [`gradient_kernel`], D-7.2-03 — no new math). Its der2 is the constant
+    /// `-1.0`, produced by [`const_der_handle`] (no kernel).
+    RmseGradient,
+}
+
+/// Launch an elementwise binary der1 kernel on the compile-time
+/// [`SelectedRuntime`] and return the der1 as a DEVICE BUFFER HANDLE — WITHOUT
+/// reading it back to the host (SC-3 / D-7.2-04 / Pitfall 2). This is the
+/// device-residency hand-off seam the 7.3 histogram kernels plug into: the
+/// returned der1 handle stays on-device and is multiplied by the weight handle
+/// downstream by `histogram_scatter_kernel`, never folded here.
+///
+/// Mirrors [`launch_block_reduce_f64`]'s per-call client + `Bytes::from_elems`
+/// host->device transfer + `ArrayArg::from_raw_parts` launch shape EXACTLY, but
+/// the output is per-ELEMENT (length `n`, NOT one slot per cube — a der is not a
+/// reduction). The empty input short-circuits to a zero-length device handle
+/// (no launch). NO `read_one` on this path. No `unwrap`/`expect`/`panic`/indexing
+/// (workspace lints + D-13).
+pub fn launch_der_binary_handle(
+    approx: &[f64],
+    target: &[f64],
+    kernel: DerBinaryKernel,
+) -> CbResult<Handle> {
+    let n = approx.len();
+    // Shape guard: the kernel reads `approx[i]` and `target[i]` for the same `i`,
+    // so a mismatched length would read out of bounds on the device. Surface it as
+    // a typed error (no panic) rather than launching a malformed kernel.
+    if target.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "target".to_owned(),
+            expected: n,
+            actual: target.len(),
+        });
+    }
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    // Empty input: hand back a zero-length device handle (no launch), mirroring the
+    // reduce/scan empty short-circuit. 7.3 still receives a valid (empty) der handle.
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
+    // The der output is per-element (length `n`), NOT one slot per cube.
+    let out_handle = client.empty(n * std::mem::size_of::<f64>());
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    match kernel {
+        DerBinaryKernel::RmseGradient => gradient_kernel::launch::<f64, SelectedRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
+            // `from_raw_parts` consumes the handle; clone so the original stays
+            // returnable on-device (the 7.1 idiom). NO `read_one` here (SC-3).
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        ),
+    }
+
+    Ok(out_handle)
+}
+
+/// Host-readback wrapper over [`launch_der_binary_handle`]: launch the der1 kernel
+/// device-resident, then read the handle back to a host `Vec<f64>`. This is the
+/// seam the all-backend self-oracle exercises (it compares the device der1 to the
+/// `cb-compute::loss` CPU baseline); it is NOT the histogram hand-off path (that is
+/// the handle-returning fn above, which never reads back).
+///
+/// The launch geometry lives in ONE place ([`launch_der_binary_handle`]); this
+/// wrapper only reconstructs the client to read the returned handle (the per-call
+/// client construction is cheap and the handle stays valid for the read on the same
+/// runtime). A device read-back failure surfaces as [`CbError::Degenerate`] (WR-05),
+/// never a silent all-zero buffer masquerading as a valid derivative.
+pub fn launch_der_binary(
+    approx: &[f64],
+    target: &[f64],
+    kernel: DerBinaryKernel,
+) -> CbResult<Vec<f64>> {
+    if approx.is_empty() {
+        return Ok(Vec::new());
+    }
+    let handle = launch_der_binary_handle(approx, target, kernel)?;
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+}
+
+/// Build a length-`n` device buffer HANDLE filled with the constant `value`, for
+/// the CONSTANT-der2 losses that have no hessian kernel (RMSE der2 = `-1.0`;
+/// Quantile/MAE der2 = `0.0`, added Plan 02). The 7.3 histogram seam still receives
+/// a der2 HANDLE for these losses (Pitfall 5) — there is NO `rmse_hessian_kernel`
+/// to launch; the constant is materialized host-side and uploaded once.
+///
+/// The empty case short-circuits to a zero-length handle (no allocation churn). No
+/// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+pub fn const_der_handle(value: f64, n: usize) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+    Ok(client.create(cubecl::bytes::Bytes::from_elems(vec![value; n])))
 }
