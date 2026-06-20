@@ -59,8 +59,9 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
-    pointwise_hist2_binary_kernel, pointwise_hist2_half_byte_kernel,
-    pointwise_hist2_nonbinary_kernel, quantile_gradient_kernel,
+    pairwise_hist_nonbinary_kernel, pointwise_hist2_binary_kernel,
+    pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
+    quantile_gradient_kernel,
 };
 use crate::SelectedRuntime;
 
@@ -1319,4 +1320,340 @@ pub fn launch_pointwise_hist2(
 
     let device_hist = read_binsums_f64(&client, handle)?;
     Ok((device_hist, path))
+}
+
+// ===========================================================================
+// Phase 7.4 — the device-resident 4-channel WEIGHT-ONLY pairwise histogram FILL seam
+// (GPU-01 histogram slice). The general one-byte non-binary
+// `ComputePairwiseHistogramOneByte{5,6,7}Bits` analog: pair_i/pair_j (= `uint2* pairs`)
+// + per-pair weight + cindex in -> 4-channel `binSums` device handle out, NO host
+// round-trip (D-7.4-03). DISTINCT from the 7.2/7.3 der1/der2/pointwise seam: NO der1
+// input, and the histogram is 4-channel weight-only (histId in {0,1,2,3}), NEVER the
+// 7.3 2-channel der1/weight layout. The FROZEN 4-channel layout + the
+// pair-handles-in -> binSums-handle-out seam this defines are reused UNCHANGED by Plans
+// B/C/D/E and the 7.5 pairwise score/split consumer.
+// ===========================================================================
+
+/// The number of channels in a pairwise-histogram cell — the `* 4` in the FROZEN
+/// pairwise `binSums` index (`histId in {0,1,2,3}`). Naming the `4` removes the magic
+/// literal from the layout arithmetic (it is the channel count, NOT a stride/warp
+/// literal — D-09). **This is 4, NEVER 2** (the 7.3 pointwise channel count) — Pitfall 2.
+pub(crate) const PAIR_HIST_CHANNELS: usize = 4;
+
+/// Compute the FROZEN pairwise `binSums` buffer length for the single-tree fill:
+/// `histLineSize = PAIR_HIST_CHANNELS * totalBinFeatures` collapses, for `part = fold =
+/// 0` and a single feature group with `FirstFoldIndex = 0`, to
+/// `n_features * n_bins * PAIR_HIST_CHANNELS` floats. See [`launch_pairwise_hist_handle`]
+/// for the full index formula.
+#[inline]
+fn pair_hist_binsums_len(n_bins: usize, n_features: usize) -> usize {
+    n_features * n_bins * PAIR_HIST_CHANNELS
+}
+
+/// Overflow-checked companion to [`pair_hist_binsums_len`]. Returns `None` if
+/// `n_features * n_bins * PAIR_HIST_CHANNELS` overflows `usize`, so the host seam can
+/// reject a degenerate dimension with a typed range error instead of wrapping silently.
+#[inline]
+fn pair_hist_binsums_len_checked(n_bins: usize, n_features: usize) -> Option<usize> {
+    n_features
+        .checked_mul(n_bins)
+        .and_then(|v| v.checked_mul(PAIR_HIST_CHANNELS))
+}
+
+/// Fill the device-resident 4-channel WEIGHT-ONLY pairwise histogram (5/6/7-bit
+/// non-binary) on the compile-time [`SelectedRuntime`] and return `binSums` as a DEVICE
+/// BUFFER HANDLE — WITHOUT reading it back (SC-3 / D-7.4-03 / Pitfall 2/5). This is the
+/// load-bearing hand-off seam the 7.5 pairwise score/split path plugs into: the returned
+/// histogram handle stays on-device, consumed with no host round-trip.
+///
+/// # FROZEN pairwise `binSums` device-handle layout (D-7.4-03 / Pitfall 2)
+///
+/// The histogram is a flat `[partCount * histLineSize]`-floats buffer with the 4
+/// weight-only channels (`histId in {0,1,2,3}`) interleaved per (feature, bin):
+///
+/// ```text
+/// histLineSize = PAIR_HIST_CHANNELS * totalBinFeatures      (totalBinFeatures = n_features * n_bins)
+/// index(feature, bin, histId) = (feature * n_bins + bin) * PAIR_HIST_CHANNELS + histId
+/// ```
+///
+/// mirroring upstream `pairwise_hist_one_byte_5bit.cuh:255-256` (`4 * (maxFoldCount * f
+/// + fold) + histId`) + `split_properties_helpers.cuh`'s `Compare` predicate. This
+/// phase delivers the SINGLE-TREE fill: `partCount = foldCount = 1`, one feature group
+/// with `FirstFoldIndex = 0`, so the index collapses to the kernel's write index and
+/// the buffer length is [`pair_hist_binsums_len`]. The `fullPass = false` multi-part
+/// offset (`ShiftPartAndBinSumsPtr`'s else-branch) and the `BuildBinaryFeatureHistograms`
+/// transform are 7.5 FORWARD DEPENDENCIES (RESEARCH Open Q3), NOT filled here —
+/// documented, not silently cut. This raw 4-channel fill is what 7.5 reduces. This
+/// layout is FROZEN across Plans B/C/D/E and the 7.5 seam. **Anti-pattern: any `* 2`
+/// here silently breaks the 7.5 seam (Pitfall 2) — the buffer is ALWAYS `* 4`.**
+///
+/// # Inputs (D-7.4-03)
+///
+/// `pair_i`/`pair_j` (two parallel `u32` arrays = upstream `uint2* pairs`, length
+/// `n_pairs`, OBJECT ids), `pair_weight` (the ONLY per-pair value — NO der1, length
+/// `n_pairs`); `cindex` (length `n_features * n_objects`, feature-major:
+/// `cindex[feature * n_objects + obj]` is object `obj`'s quantized bin for `feature` —
+/// stride over OBJECTS, NOT pairs, Pitfall 3); `n_objects` the object count; `n_bins`
+/// is `1 << bits`; `n_features` the feature-group width; `bits` in {5,6,7}; `one_hot`
+/// threaded for Plan E.
+///
+/// # Atomic merge (D-03 / Pitfall 1)
+///
+/// The cross-thread merge into `binSums` is ALWAYS the in-kernel `Atomic<F>::fetch_add`.
+/// The only capability adaptation is the channel float type: f64 on rocm/cuda/cpu, f32
+/// on wgpu (WGSL has no f64 atomics — RESEARCH A1).
+///
+/// Empty input (`n_pairs == 0` or `n_features == 0` or `n_bins == 0`) short-circuits to
+/// a zero-length handle with NO launch and NO read-back (Pitfall 5). Mismatched
+/// pair_i/pair_j/pair_weight/cindex lengths surface [`CbError::LengthMismatch`] BEFORE
+/// launch (T-07.4-01); out-of-range pair ids / bins surface [`CbError::OutOfRange`]
+/// (T-07.4-02). No `unwrap`/`expect`/`panic`/indexing in this production helper.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_pairwise_hist_handle(
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+    bits: u32,
+    one_hot: bool,
+) -> CbResult<Handle> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_pairwise_hist_into(
+        &client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features, bits, one_hot,
+    )
+}
+
+/// The ONE pairwise-histogram launch geometry (IN-02 — one place, not duplicated per
+/// public entry point). Transfers `pair_i`/`pair_j`/`pair_weight`/`cindex` onto
+/// `client`, zero-initialises the 4-channel `binSums` buffer, launches the non-binary
+/// pairwise fill kernel, and returns the `binSums` Handle WITHOUT reading it back. The
+/// caller owns the `client` lifecycle so a read-back (the self-oracle wrapper) uses the
+/// SAME client that allocated the handle — a CubeCL Handle is bound to its originating
+/// client.
+#[allow(clippy::too_many_arguments)]
+fn launch_pairwise_hist_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+    bits: u32,
+    one_hot: bool,
+) -> CbResult<Handle> {
+    let n_pairs = pair_i.len();
+
+    // Shape guards (T-07.4-01): the kernel reads pair_i[p]/pair_j[p]/pair_weight[p] for
+    // each pair, and cindex[feature * n_objects + obj] for each feature. A mismatch would
+    // read out of bounds on the device — surface a typed error BEFORE launch (no panic).
+    if pair_j.len() != n_pairs {
+        return Err(CbError::LengthMismatch {
+            column: "pair_j".to_owned(),
+            expected: n_pairs,
+            actual: pair_j.len(),
+        });
+    }
+    if pair_weight.len() != n_pairs {
+        return Err(CbError::LengthMismatch {
+            column: "pair_weight".to_owned(),
+            expected: n_pairs,
+            actual: pair_weight.len(),
+        });
+    }
+
+    // Overflow guards FIRST — before any unchecked product is formed. The cindex stride
+    // `n_features * n_objects` and the binSums length `n_features * n_bins * 4` are
+    // products of unbounded caller-supplied dimensions. Reject a degenerate dimension
+    // with a typed range error BEFORE the product is ever computed unchecked, then REUSE
+    // the checked product for the length guard below (never re-multiplying).
+    let cindex_stride = n_features.checked_mul(n_objects).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_objects ({n_objects}) overflows usize (cindex stride)"
+        ))
+    })?;
+    if pair_hist_binsums_len_checked(n_bins, n_features).is_none() {
+        return Err(CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {PAIR_HIST_CHANNELS} overflows usize (binSums length)"
+        )));
+    }
+
+    // Now the cindex length guard uses the already-checked product, never re-multiplying.
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+
+    // Value-range guards (T-07.4-02): the length guards above bound only buffer
+    // *positions*; the *values* inside pair_i/pair_j (object ids) and cindex (bins) drive
+    // unchecked device array indices. Validate them HOST-SIDE so a malformed object id or
+    // bin surfaces a typed `CbError::OutOfRange` rather than an out-of-bounds device
+    // read/store (UB). BOTH pair endpoints index cindex (Pitfall 3).
+    if let Some(&bad) = pair_i.iter().find(|&&ix| (ix as usize) >= n_objects) {
+        return Err(CbError::OutOfRange(format!(
+            "pair_i value {bad} >= n_objects ({n_objects}); object id would read cindex out of bounds"
+        )));
+    }
+    if let Some(&bad) = pair_j.iter().find(|&&ix| (ix as usize) >= n_objects) {
+        return Err(CbError::OutOfRange(format!(
+            "pair_j value {bad} >= n_objects ({n_objects}); object id would read cindex out of bounds"
+        )));
+    }
+    // Every cindex bin must fit the dispatched line size (`n_bins`); a value >= n_bins
+    // would write `bin_sums` out of bounds (the non-binary kernel does not mask).
+    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
+        return Err(CbError::OutOfRange(format!(
+            "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
+        )));
+    }
+
+    // Empty fill: hand back a zero-length handle (no launch, no read-back — Pitfall 5).
+    // 7.5 still receives a valid (empty) histogram handle.
+    if n_pairs == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // Validate the bit-width belongs to the one-byte non-binary family (5/6/7-bit). The
+    // border count `n_bins` MUST equal `1 << bits`; anything else is not this family.
+    if bits < 5 || bits > 7 || n_bins != (1usize << bits) {
+        return Err(CbError::Degenerate(format!(
+            "pairwise_hist non-binary fill expects bits in {{5,6,7}} with n_bins == 1 << bits, \
+             got bits={bits} n_bins={n_bins}"
+        )));
+    }
+
+    // Launch geometry: enough cubes to cover `n_pairs` (the grid-stride loop handles any
+    // surplus via the total-thread-count stride).
+    let num_cubes = n_pairs.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    let bin_sums_len = pair_hist_binsums_len(n_bins, n_features);
+    let cindex_handle = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+    let pair_i_handle = client.create(cubecl::bytes::Bytes::from_elems(pair_i.to_vec()));
+    let pair_j_handle = client.create(cubecl::bytes::Bytes::from_elems(pair_j.to_vec()));
+
+    // Channel float-type dispatch (RESEARCH A1 / Pitfall 1): the in-kernel atomic merge
+    // needs `Atomic<F>::fetch_add` device-side; HIP (rocm) and CUDA support / emulate the
+    // f64 atomic add, so the channel is f64 there (D-03), while wgpu's WGSL has NO f64
+    // atomics, so the wgpu arm uses an f32 channel (read back and UPCAST to f64). The
+    // buffer length (the FROZEN 4-channel layout) is channel-type independent. NO
+    // read-back here (SC-3 / Pitfall 5). `from_raw_parts` consumes each input handle; the
+    // output is cloned so the original stays returnable on-device.
+    #[cfg(feature = "wgpu")]
+    {
+        let weight_f32: Vec<f32> = pair_weight.iter().map(|&v| v as f32).collect();
+        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
+        pairwise_hist_nonbinary_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(pair_i_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(pair_j_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(weight_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+            n_features as u32,
+            n_objects as u32,
+            bits,
+            one_hot,
+        );
+        Ok(h)
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(pair_weight.to_vec()));
+        let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
+        pairwise_hist_nonbinary_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(pair_i_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(pair_j_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(weight_handle, n_pairs) },
+            unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+            unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
+            n_features as u32,
+            n_objects as u32,
+            bits,
+            one_hot,
+        );
+        Ok(h)
+    }
+}
+
+/// Read a pairwise `binSums` device handle back to a host `Vec<f64>`, transparently
+/// UPCASTING the f32 channel on the wgpu arm (RESEARCH A1) and reading the f64 channel
+/// directly elsewhere. Centralizes the channel-type read so both the readback wrapper
+/// and the `kernels::pairwise_hist` oracle observe the SAME f64 layout regardless of
+/// backend. A read-back failure surfaces [`CbError::Degenerate`].
+fn read_pair_binsums_f64(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+) -> CbResult<Vec<f64>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    #[cfg(feature = "wgpu")]
+    {
+        Ok(bytemuck::cast_slice::<u8, f32>(&bytes)
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect())
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+    }
+}
+
+/// Host-readback wrapper over the pairwise-histogram fill: launch the non-binary fill
+/// device-resident, then read the 4-channel `binSums` handle back to a host `Vec<f64>`.
+/// This is the seam the all-backend self-oracle exercises (it compares the device
+/// histogram to the ordered host reference); it is NOT the histogram hand-off path (that
+/// is [`launch_pairwise_hist_handle`], which never reads back).
+///
+/// The launch geometry lives in ONE place ([`launch_pairwise_hist_into`]); this wrapper
+/// constructs the client ONCE and uses that SAME client for both the launch and the
+/// read-back, so the handle is read by the client that allocated it. A device read-back
+/// failure surfaces as [`CbError::Degenerate`], never a silent all-zero buffer
+/// masquerading as a valid histogram. Empty input returns an empty `Vec` (no launch).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_pairwise_hist(
+    pair_i: &[u32],
+    pair_j: &[u32],
+    pair_weight: &[f64],
+    cindex: &[u32],
+    n_objects: usize,
+    n_bins: usize,
+    n_features: usize,
+    bits: u32,
+    one_hot: bool,
+) -> CbResult<Vec<f64>> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    if pair_i.is_empty() || n_features == 0 || n_bins == 0 {
+        return Ok(Vec::new());
+    }
+
+    let handle = launch_pairwise_hist_into(
+        &client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features, bits, one_hot,
+    )?;
+
+    read_pair_binsums_f64(&client, handle)
 }
