@@ -114,11 +114,80 @@ fn make_fixture(
     (der1, weight, cindex, indices)
 }
 
-// NOTE (Task 2): the inline whole-dataset L2 score reference + the strict-first-wins CPU
-// greedy-search transcription (mirroring `cb_train::greedy_tensor_search_oblivious` +
-// `select_best_candidate`) and the `cb_compute::calc_average` leaf-value oracle land with
-// the `single_tree` cross-oracle below (it imports `cb_compute::{l2_split_score,
-// calc_average, scale_l2_reg, LeafStats}` at that point).
+/// The whole-dataset L2 score of ONE binary split `(feature, bin)` over the fixture —
+/// the depth-1 stump score, TRANSCRIBED from the FROZEN
+/// `cb_compute::{l2_split_score, LeafStats}` semantics (`score.rs:39-55`) + the leaf
+/// partition `cindex[feature * n + obj] > bin` (forward-bit, == the device
+/// `partition_split` test). LEFT leaf = bins `0..=bin`, RIGHT leaf = bins `bin+1..`.
+/// Each side's Σ der1 / Σ weight is folded in ASCENDING OBJECT ORDER via `sum_f64`
+/// (NEVER naive `.sum()`, D-08), matching `cb_compute::reduce_leaf_stats`. This is the
+/// inline transcription the D-7.5-04 boundary mandates (do NOT import `cb-train`).
+fn cpu_stump_score(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    feature: usize,
+    bin: usize,
+    scaled_l2: f64,
+) -> f64 {
+    let mut left_der: Vec<f64> = Vec::new();
+    let mut left_w: Vec<f64> = Vec::new();
+    let mut right_der: Vec<f64> = Vec::new();
+    let mut right_w: Vec<f64> = Vec::new();
+    for obj in 0..n {
+        // Forward-bit pass test == the device `partition_split_kernel` (`cindex > bin`).
+        if (cindex[feature * n + obj] as usize) > bin {
+            right_der.push(der1[obj]);
+            right_w.push(weight[obj]);
+        } else {
+            left_der.push(der1[obj]);
+            left_w.push(weight[obj]);
+        }
+    }
+    let left = cb_compute::LeafStats {
+        sum_weighted_delta: sum_f64(&left_der),
+        sum_weight: sum_f64(&left_w),
+    };
+    let right = cb_compute::LeafStats {
+        sum_weighted_delta: sum_f64(&right_der),
+        sum_weight: sum_f64(&right_w),
+    };
+    // L2 score = Σ add_leaf_plain(leaf) over the two leaves (l2_split_score:49-55).
+    cb_compute::l2_split_score(&[left, right], scaled_l2)
+}
+
+/// The inline CPU greedy LEVEL-0 search — the strict-first-wins L2 argmax over the
+/// candidates in upstream ascending `(feature, bin)` order, TRANSCRIBED from
+/// `cb_train::greedy_tensor_search_oblivious` + `cb_train::select_best_candidate`
+/// (`tree.rs:291-302`, `:486-643`): iterate features ascending, bins ascending, keep the
+/// FIRST candidate whose score STRICTLY exceeds the running best (strict `>`, NOT `>=` —
+/// the load-bearing first-wins tie-break, Pitfall 1). Returns the chosen `(feature, bin)`
+/// or `None` if no candidate exists. Mirrors the device's lowest-`(feature, bin)`-index
+/// tie-break so the two agree on a near-tie (Pattern 4).
+fn cpu_best_stump(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    n_features: usize,
+    n_bins: usize,
+    scaled_l2: f64,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for feature in 0..n_features {
+        for bin in 0..n_bins {
+            let score = cpu_stump_score(der1, weight, cindex, n, feature, bin, scaled_l2);
+            // STRICT `>` (first-wins on equal score, ascending (feature, bin) order).
+            if score > best_score {
+                best_score = score;
+                best = Some((feature, bin));
+            }
+        }
+    }
+    best
+}
 
 // ===========================================================================
 // Partition primitives self-oracle (Phase 7.5 Plan C, Task 1): the device
@@ -291,5 +360,141 @@ mod partition {
                  (bound={LEAF_BOUND:.0e})"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Single-tree cross-oracle (Phase 7.5 Plan C, Task 2; SC-3): grow ONE oblivious tree
+// device-resident via `grow_oblivious_tree` and assert its STRUCTURE (the split
+// `(feature, bin)` sequence AND the per-object `leaf_of`) matches the inline CPU
+// greedy-search transcription (`cb_train::greedy_tensor_search_oblivious` /
+// `leaf_index`) EXACTLY — the strict bar. Leaf-value divergence vs
+// `cb_compute::calc_average` is REPORTED within the run-stable bound (NOT the GPU-06
+// epsilon — 7.6's job). The loop is host-light: only the O(1) BestSplit per level + ONE
+// 2^depth part-stats read-back cross host<->device (D-05, enforced by construction in
+// `grow_oblivious_tree`).
+// ===========================================================================
+
+mod single_tree {
+    use super::*;
+    use crate::gpu_runtime::grow_oblivious_tree;
+
+    /// The per-tree L2 scaling — `cb_compute::scale_l2_reg(l2, Σweight, n)`. For the
+    /// fixture's per-object weights this is the FROZEN per-tree scaling the CPU oracle
+    /// and the device leaf-value step both consume.
+    fn scaled_l2_for(weight: &[f64], n: usize, l2: f64) -> f64 {
+        let sum_w = sum_f64(weight);
+        cb_compute::scale_l2_reg(l2, sum_w, n)
+    }
+
+    /// Grow a depth-1 oblivious tree (the MVP vertical slice: one split / stump, the
+    /// strict O(1)-per-level device-resident path) on the clear-gain-margin fixture and
+    /// assert the device STRUCTURE matches the inline CPU greedy search EXACTLY (split
+    /// `(feature, bin)` + per-object `leaf_of` == `leaf_index`), then REPORT the
+    /// leaf-value divergence vs `cb_compute::calc_average`. f64 channel (rocm/cuda/cpu)
+    /// and f32 channel (wgpu) both run over `SelectedRuntime`.
+    #[test]
+    fn matches_cpu_greedy_search() {
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 1usize;
+        let l2 = 3.0_f64;
+
+        for &n in &[1usize, 37usize, 1000usize] {
+            let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+            let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+            // Device: grow the tree host-light over SelectedRuntime.
+            let tree = grow_oblivious_tree(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2,
+            )
+            .expect("grow_oblivious_tree must succeed on the clear-margin fixture");
+
+            // CPU reference: the strict-first-wins level-0 stump (inline transcription).
+            let cpu_split = cpu_best_stump(&der1, &weight, &cindex, n, n_features, n_bins, scaled_l2)
+                .expect("CPU reference must find a candidate split");
+
+            // (A) STRUCTURE — the split (feature, bin) sequence must match EXACTLY.
+            assert_eq!(
+                tree.splits.len(),
+                depth,
+                "device tree must have exactly `depth` splits (n={n})"
+            );
+            let (dev_feat, dev_bin) = tree.splits[0];
+            assert_eq!(
+                (dev_feat as usize, dev_bin as usize),
+                cpu_split,
+                "device split (feature, bin) must match CPU greedy first-wins (n={n}): \
+                 device=({dev_feat}, {dev_bin}) cpu={cpu_split:?}"
+            );
+
+            // (B) STRUCTURE — per-object leaf_of must equal CPU leaf_index over the SAME
+            //     split (forward-bit, Pitfall 6) for EVERY object.
+            let (cpu_feature, cpu_bin) = cpu_split;
+            let cpu_leaf_of: Vec<u32> = (0..n)
+                .map(|obj| {
+                    let passes = [(cindex[cpu_feature * n + obj] as usize) > cpu_bin];
+                    cpu_leaf_index(&passes) as u32
+                })
+                .collect();
+            assert_eq!(
+                tree.leaf_of, cpu_leaf_of,
+                "device leaf_of must equal CPU leaf_index forward-bit (n={n})"
+            );
+
+            // (C) LEAF VALUES — REPORTED divergence vs the CPU calc_average over the SAME
+            //     leaf partition (NOT signed off — 7.6 owns the epsilon, D-7.5-05).
+            let n_leaves = 1usize << depth;
+            let mut cpu_leaf_values = vec![0.0_f64; n_leaves];
+            for leaf in 0..n_leaves {
+                let mut der_seg: Vec<f64> = Vec::new();
+                let mut w_seg: Vec<f64> = Vec::new();
+                for obj in 0..n {
+                    if cpu_leaf_of[obj] as usize == leaf {
+                        der_seg.push(der1[obj]);
+                        w_seg.push(weight[obj]);
+                    }
+                }
+                cpu_leaf_values[leaf] =
+                    cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+            }
+            assert_eq!(
+                tree.leaf_values.len(),
+                cpu_leaf_values.len(),
+                "device leaf_values length must equal n_leaves (n={n})"
+            );
+            let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
+            println!(
+                "[single_tree n={n}] STRUCTURE match: split={cpu_split:?}; REPORTED leaf-value \
+                 max abs_div={abs:.3e} rel_div={rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+            assert!(
+                rel <= LEAF_BOUND || abs <= LEAF_BOUND,
+                "device leaf values (n={n}) diverged beyond the REPORTED bound: \
+                 abs={abs:.3e} rel={rel:.3e} (bound={LEAF_BOUND:.0e})"
+            );
+        }
+    }
+
+    /// `depth > 1` surfaces the typed `CbError::OutOfRange` documenting the
+    /// partition-aware-histogram forward dependency — NOT a silently-mislabeled stump.
+    #[test]
+    fn depth_gt_one_is_tracked_forward_dependency() {
+        let n_features = 2usize;
+        let n_bins = 16usize;
+        let n = 50usize;
+        let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+        let scaled_l2 = scaled_l2_for(&weight, n, 3.0);
+
+        let err = grow_oblivious_tree(
+            &der1, &weight, &cindex, &indices, n_bins, n_features, 2, scaled_l2,
+        )
+        .expect_err("depth > 1 must surface a typed forward-dependency error, not a stump");
+        // It must be the OutOfRange forward-dependency guard (not a panic / wrong tree).
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("depth") && msg.contains("forward dependency"),
+            "depth>1 error must name the partition-aware-histogram forward dependency: {msg}"
+        );
     }
 }

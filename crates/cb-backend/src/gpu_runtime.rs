@@ -1978,6 +1978,272 @@ pub(crate) fn launch_partition_update_into(
     Ok(part_stats)
 }
 
+/// The output of [`grow_oblivious_tree`]: the per-level chosen splits, the per-object
+/// leaf assignment (`leaf_of`, the SC-3 structure observation), and the per-leaf values.
+///
+/// `splits[level] = (feature, bin)` is the level's chosen split in FORWARD-bit order
+/// (split `level` -> leaf bit `level`, matching `cb_train::leaf_index`). `leaf_of[obj]`
+/// is object `obj`'s final leaf index (`0..2^depth`). `leaf_values[leaf]` is the
+/// `cb_compute::calc_average`-estimated value of leaf `leaf` over the read-back
+/// `2^depth` part-stats. `part_stats` is the raw `[Σ der1, Σ weight]`-per-leaf buffer
+/// (length `2^depth * 2`) the leaf values were estimated from (kept for the oracle's
+/// leaf-value divergence report).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrownTree {
+    /// The per-level chosen `(feature, bin)` split sequence (FORWARD-bit order).
+    pub splits: Vec<(u32, u32)>,
+    /// The per-object final leaf index (`0..2^depth`) — the SC-3 structure observation.
+    pub leaf_of: Vec<u32>,
+    /// The per-leaf estimated value (`calc_average(Σ der1, Σ weight, scaled_l2)`).
+    pub leaf_values: Vec<f64>,
+    /// The raw read-back `[Σ der1, Σ weight]`-per-leaf part-stats (length `2^depth * 2`).
+    pub part_stats: Vec<f64>,
+}
+
+// ===========================================================================
+// Phase 7.5 Plan C — the host-light single-tree grow loop driver (GPU-01 grow-loop
+// slice; D-7.5-02 / D-05). Mirrors upstream
+// `oblivious_tree_doc_parallel_structure_searcher.cpp:63-158` and the CPU
+// `greedy_tensor_search_oblivious_perturbed` per-level skeleton: per depth fill (7.3)
+// -> scan/update (Plan B, implicit in the score kernel's left/right fold) -> score +
+// deterministic argmin (Plan A) -> ONE O(1) BestSplit read-back -> host integer split
+// decision (strict first-wins / lowest-(feature,bin) tie-break == `select_best_candidate`)
+// -> partition-split (forward-bit) -> partition-update, over persistent device buffers
+// threaded through ONE `ComputeClient`, then at the leaves ONE read-back of the
+// `2^depth` part-stats and host leaf values via `cb_compute::calc_average`. The bulk
+// histogram / partition / doc-routing stays device-resident across launches; reading
+// the full histogram/partition buffer to host per level is the FORBIDDEN D-05 hybrid.
+// ===========================================================================
+
+/// Grow ONE oblivious tree device-resident over the compile-time [`SelectedRuntime`],
+/// returning the chosen split sequence + per-object leaf assignment + per-leaf values
+/// ([`GrownTree`]). The genuinely-new host-light driver (D-05 / D-7.5-02): per level it
+/// chains the FROZEN 7.3 histogram fill -> the Plan-A device score + deterministic argmin
+/// -> ONE O(1) [`BestSplit`] read-back -> the host integer split decision -> the Plan-C
+/// device `partition_split` (forward-bit doc-routing) -> the Plan-C device
+/// `partition_update` (per-partition Σ der1 / Σ weight reduce), over persistent device
+/// handles threaded through ONE `ComputeClient`. At the leaves it reads back ONLY the
+/// `2^depth` part-stats and computes leaf values via the FROZEN
+/// `cb_compute::calc_average` formula. The bulk histogram / partition / doc-routing NEVER
+/// crosses to host per level (the FORBIDDEN D-05 host hybrid).
+///
+/// # Inputs
+///
+/// `der1` (UNWEIGHTED, the 7.2 seam contract) / `weight` (channel 1), length `n` in
+/// object order; `cindex` (feature-major quantized bins, length `n_features * n`:
+/// `cindex[feature * n + obj]`); `indices` (object visiting order, length `n`); `n_bins`
+/// is the per-feature border count (`1 << bits`); `n_features` the feature-group width;
+/// `depth` the tree depth; `scaled_l2` the per-tree `cb_compute::scale_l2_reg` output.
+///
+/// # MVP scope (depth == 1) and the depth>1 forward dependency
+///
+/// The MVP grows a depth-1 oblivious tree (a single split / stump) — the genuinely
+/// complete vertical slice the existing kernels support EXACTLY with the strict
+/// O(1)-per-level read-back: level 0 has ONE partition (the root), so the whole-dataset
+/// [`launch_find_optimal_split_pointwise_into`] stump score IS the exact CPU level-0
+/// score, the O(1) [`BestSplit`] read-back is the only crossing, then one
+/// `partition_split` + `partition_update` + the final 2-leaf part-stats read-back. A
+/// `depth > 1` tree scores each level's candidate over the CURRENT 2^level partitions
+/// (the per-partition / `fullPass = false` histogram, upstream `SubmitCompute(subsets,
+/// ...)`); that partition-aware histogram is the EXPLICIT tracked forward dependency
+/// (the FROZEN 7.3 fill is whole-dataset / `partCount = 1`, documented in
+/// [`launch_pointwise_hist2_handle`]). `depth > 1` surfaces a typed
+/// [`CbError::OutOfRange`] until the partition-aware fill lands — documented, NOT
+/// silently cut, and NOT a wrong-structure stump score masquerading as a deep tree.
+///
+/// # Errors
+///
+/// - [`CbError::OutOfRange`] if `depth > 1` (the partition-aware-histogram forward
+///   dependency), or if `2^depth * 2` / `n_features * n_bins` overflows `usize`.
+/// - [`CbError::Degenerate`] if a level finds no candidate split, or any device
+///   read-back fails (never a silent zero buffer, WR-05 / T-07.5-03-04).
+/// - the FROZEN 7.3 length / value-range guards (via the score / partition launches).
+///
+/// No `unwrap`/`expect`/`panic`/indexing in this production driver (workspace lints +
+/// D-13). Threads ONE `&client` through the whole tree (Pitfall 3); never reads a 0-len
+/// handle.
+#[allow(clippy::too_many_arguments)]
+pub fn grow_oblivious_tree(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    depth: usize,
+    scaled_l2: f64,
+) -> CbResult<GrownTree> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    grow_oblivious_tree_into(
+        &client, der1, weight, cindex, indices, n_bins, n_features, depth, scaled_l2,
+    )
+}
+
+/// The ONE grow-loop geometry (the histogram-seam IN-02 precedent — one place). Uploads
+/// the resident der1/weight/cindex/indices/leaf_of handles ONCE onto `client`, runs the
+/// per-depth launch chain over those persistent handles, and reads back ONLY the O(1)
+/// BestSplit per level + the final `2^depth` part-stats. The caller owns the `client`
+/// lifecycle so every read-back uses the SAME client that allocated the handles (a
+/// CubeCL Handle is bound to its originating client — Pitfall 3 / see
+/// [`launch_der_binary_into`]).
+#[allow(clippy::too_many_arguments)]
+fn grow_oblivious_tree_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    depth: usize,
+    scaled_l2: f64,
+) -> CbResult<GrownTree> {
+    let n = der1.len();
+
+    // Empty short-circuit (Pitfall 3/5): no objects / no candidates -> an empty tree.
+    if n == 0 || n_features == 0 || n_bins == 0 || depth == 0 {
+        return Ok(GrownTree {
+            splits: Vec::new(),
+            leaf_of: vec![0u32; n],
+            leaf_values: Vec::new(),
+            part_stats: Vec::new(),
+        });
+    }
+
+    // MVP scope guard (the partition-aware-histogram forward dependency): the FROZEN 7.3
+    // fill is whole-dataset (partCount == 1), so a single whole-dataset stump score is the
+    // EXACT CPU level-0 score but NOT the per-partition level-L>0 score. Reject depth>1
+    // with a typed error rather than silently scoring a stump and mislabeling it a deep
+    // tree (which would be a wrong-structure fabrication). Documented, not cut.
+    if depth > 1 {
+        return Err(CbError::OutOfRange(format!(
+            "grow_oblivious_tree supports depth <= 1 until the per-partition \
+             (fullPass = false) histogram fill lands (the FROZEN 7.3 whole-dataset fill \
+             scores a single binary partition; a depth>1 level scores over 2^level \
+             partitions — the EXPLICIT tracked forward dependency, RESEARCH A2); got \
+             depth = {depth}"
+        )));
+    }
+
+    // 2^depth leaf count, overflow-checked (T-07.5-03-02): the part-stats buffer length and
+    // the leaf-value loop bound are derived from this. checked_shl rejects a degenerate
+    // depth before forming the product unchecked.
+    let n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+
+    // The resident cindex stride (feature-major) and its overflow guard (the partition
+    // split reads cindex[feature * n + obj]).
+    let cindex_stride = n_features
+        .checked_mul(n)
+        .ok_or_else(|| CbError::OutOfRange(format!("n_features ({n_features}) * n ({n}) overflows usize")))?;
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+
+    // Resident device handles uploaded ONCE (the D-05 persistent-buffer contract: one
+    // client, buffers live across the whole tree's launches). der1/weight are channel-typed
+    // (f32 on wgpu, f64 elsewhere); cindex/indices are u32; leaf_of starts all-zero (every
+    // object in the root partition 0).
+    let der1_h = upload_channel_floats(client, der1);
+    let weight_h = upload_channel_floats(client, weight);
+    let cindex_h = client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+    let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
+
+    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+
+    // The host-light per-depth loop (upstream :63-158). For the MVP depth == 1 this runs
+    // once over the whole dataset (the single root partition); the loop is kept so the
+    // partition-aware depth>1 path slots in at the per-level score step unchanged.
+    for level in 0..depth {
+        // (1) Device fill + score + deterministic argmin over the CURRENT partition. For
+        //     level 0 (one partition) this is the whole-dataset stump score over the
+        //     resident der1/weight/cindex/indices — the EXACT CPU level-0 score. The bulk
+        //     histogram stays device-resident IN the score launch; only the O(1) BestSplit
+        //     descriptor crosses back (the score kernel's per-candidate vector is the Plan-A
+        //     self-oracle observation, not read here in the driver — D-05).
+        let (best, _scores) = launch_find_optimal_split_pointwise_into(
+            client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2,
+        )?;
+
+        // (2) The O(1) host integer split decision. A level with no candidate at all is a
+        //     degenerate dataset (no feature has any bin) — surface a typed error rather
+        //     than fabricating a split (T-07.5-03-04).
+        let split = best.ok_or_else(|| {
+            CbError::Degenerate(format!(
+                "grow_oblivious_tree level {level}: no candidate split (degenerate histogram)"
+            ))
+        })?;
+        splits.push((split.feature_id, split.bin_id));
+
+        // (3) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
+        //     `leaf_index` convention, Pitfall 6) — IN-PLACE on device, NO read-back here
+        //     (D-05). The resident handles are cloned (a CubeCL Handle is a ref-counted
+        //     buffer binding; cloning shares the device buffer, it does NOT copy).
+        leaf_of_h = launch_partition_split_into(
+            client,
+            der1_h.clone(),
+            cindex_h.clone(),
+            indices_h.clone(),
+            leaf_of_h,
+            n,
+            cindex_stride,
+            split.feature_id,
+            split.bin_id,
+            level as u32,
+        )?;
+    }
+
+    // (4) Device partition-update: the per-partition Σ der1 / Σ weight reduce over the
+    //     final 2^depth partitions (upstream `UpdatePartitionProps`), device-resident.
+    let part_stats_h = launch_partition_update_into(
+        client,
+        der1_h.clone(),
+        weight_h.clone(),
+        indices_h.clone(),
+        leaf_of_h.clone(),
+        n,
+        n_leaves,
+    )?;
+
+    // (5) The leaves: ONE read-back of the 2^depth part-stats (the ONLY bulk-data crossing
+    //     besides the O(1) per-level BestSplit — D-05). A read-back failure surfaces
+    //     CbError::Degenerate, never a silent zero buffer (WR-05 / T-07.5-03-04).
+    let part_stats = read_part_stats_f64(client, part_stats_h)?;
+
+    // (6) Host leaf values via the FROZEN cb_compute::calc_average formula (leaf.rs:83-89):
+    //     mu = count > 0 ? Σder1 / (Σweight + scaled_l2) : 0.0 (the count>0 guard transcribed,
+    //     T-07.5-03-06 — no NaN/Inf from an empty leaf). part_stats is [Σder1, Σweight] per
+    //     leaf in leaf-index order.
+    let mut leaf_values = vec![0.0_f64; n_leaves];
+    for leaf in 0..n_leaves {
+        let sum = part_stats.get(leaf * 2).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 2 + 1).copied().unwrap_or(0.0);
+        if let Some(slot) = leaf_values.get_mut(leaf) {
+            *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
+        }
+    }
+
+    // (7) The per-object leaf assignment (the SC-3 structure observation): the grow loop
+    //     itself never reads the bulk routing back (D-05); this single read-back at the
+    //     END is the oracle seam (the same crossing class as the final part-stats). A
+    //     read-back failure surfaces CbError::Degenerate (WR-05).
+    let leaf_of = read_u32_handle(client, leaf_of_h)?;
+
+    Ok(GrownTree {
+        splits,
+        leaf_of,
+        leaf_values,
+        part_stats,
+    })
+}
+
 // ===========================================================================
 // Phase 7.4 — the device-resident 4-channel WEIGHT-ONLY pairwise histogram FILL seam
 // (GPU-01 histogram slice). The general one-byte non-binary
