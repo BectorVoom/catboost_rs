@@ -33,15 +33,26 @@
 //!
 //! # D-7.5-04 boundary
 //!
-//! `cb_compute` (a normal dep) and `cb_train` (a TEST-ONLY dev-dep) are imported
-//! READ-ONLY as parity oracles; this file never modifies them and the cubecl-coupled
-//! production paths never import `cb_train`.
+//! `cb_compute` (a normal dep) is imported READ-ONLY as the SCORE parity oracle
+//! (`l2_split_score` / `scale_l2_reg` / `LeafStats`). The SPLIT-WINNER oracle —
+//! `cb_train::select_best_candidate`'s strict-first-wins / lowest-(feature,bin)-index
+//! tie-break — is TRANSCRIBED VERBATIM here as [`reference_best_split`] (cited from the
+//! FROZEN `cb-train/src/tree.rs:291-302`) rather than imported. Importing `cb-train`
+//! would pull its `cb-backend = {path}` (default = `cpu`) dependency into the test build
+//! graph, and cargo feature unification would then activate `cb-backend/cpu` ALONGSIDE
+//! the requested `rocm`/`wgpu`/`cuda` feature — `SelectedRuntime` would resolve to the
+//! CpuRuntime (cpu wins the mutual-exclusion cfg chain), which lacks `Atomic<f64>`/
+//! `Atomic<f32>` and cannot run the histogram fill at all. Transcribing the tiny,
+//! frozen, well-documented strict-`>` algorithm in the test file (the SAME pattern
+//! `host_reference_hist2` uses to GENERALIZE a frozen `cb-compute` reduction without
+//! importing it) keeps `cb-backend`'s backend selection pristine while cross-oracling
+//! against the EXACT documented CPU semantics. (Deviation from the literal plan, which
+//! said `use cb_train::select_best_candidate` — see the 07.5-01 SUMMARY.)
 
 use cubecl::prelude::*;
 
 use cb_compute::{l2_split_score, scale_l2_reg, LeafStats};
 use cb_core::sum_f64;
-use cb_train::{select_best_candidate, Candidate};
 
 use crate::gpu_runtime::{launch_find_optimal_split_pointwise, BestSplit};
 
@@ -190,30 +201,38 @@ fn host_reference_scores(
     scores
 }
 
-/// The CPU split winner over the SAME ascending `(feature, bin)` candidate order, via
-/// the FROZEN [`select_best_candidate`] (strict first-wins / lowest-index tie-break).
-/// Builds a `Candidate { feature, border, score }` per `(feature, bin)` in ascending
-/// order (feature outer, bin inner) — the SAME order the device kernel enumerates and
-/// the SAME order `host_reference_scores` flattens — so the CPU strict-`>` first-wins
-/// resolves a tie to the lowest `(feature, bin)` index, which the device argmin must
-/// equal. Returns the winning `(feature, bin)` pair, or `None` if there are no
-/// candidates.
-fn cpu_best_split(scores: &[f64], n_bins: usize, n_features: usize) -> Option<(usize, usize)> {
-    let mut candidates: Vec<Candidate> = Vec::with_capacity(n_features * n_bins);
+/// The CPU split winner over the ascending `(feature, bin)` candidate order, with the
+/// strict-first-wins / lowest-`(feature, bin)`-index tie-break — TRANSCRIBED VERBATIM
+/// from the FROZEN `cb-train/src/tree.rs::select_best_candidate` (`:291-302`):
+///
+/// ```text
+/// best = MINIMAL_SCORE; winner = None;
+/// for candidate in candidates (ascending feature, then ascending bin):
+///     if candidate.score > best { best = candidate.score; winner = candidate; }   // STRICT `>`
+/// ```
+///
+/// Strict `>` is load-bearing (a `>=` would pick the LATER equal-gain candidate and
+/// diverge — `tree.rs:295` Pitfall 1): the FIRST candidate that strictly exceeds the
+/// running best wins, so on an EXACT tie the LOWEST `(feature, bin)` index is kept. The
+/// candidates are enumerated feature-outer / bin-inner — the SAME order the device kernel
+/// indexes `feature * n_bins + bin` and the SAME order `host_reference_scores` flattens —
+/// so the device lowest-index tie-break must agree. Returns the winning `(feature, bin)`
+/// pair, or `None` if there are no candidates. `MINIMAL_SCORE` is `f64::NEG_INFINITY`
+/// (the `tree.rs` sentinel any finite score beats).
+fn reference_best_split(scores: &[f64], n_bins: usize, n_features: usize) -> Option<(usize, usize)> {
+    let mut best_score = f64::NEG_INFINITY;
+    let mut winner: Option<(usize, usize)> = None;
     for feature in 0..n_features {
         for border in 0..n_bins {
-            candidates.push(Candidate {
-                feature,
-                // `border` here is the integer bin index used as the candidate key; the
-                // float `border` value is irrelevant to the score/argmin parity (the
-                // score is supplied directly), so encode the bin index as the border so
-                // the winning candidate carries its bin back.
-                border: border as f64,
-                score: scores[feature * n_bins + border],
-            });
+            let score = scores[feature * n_bins + border];
+            // STRICT `>` (NOT `>=`): first-wins on equal gain → lowest (feature,bin) index.
+            if score > best_score {
+                best_score = score;
+                winner = Some((feature, border));
+            }
         }
     }
-    select_best_candidate(&candidates).map(|c| (c.feature, c.border as usize))
+    winner
 }
 
 #[test]
@@ -271,5 +290,105 @@ fn score_l2_matches_cpu_oracle() {
             rel <= SCORE_BOUND || abs <= SCORE_BOUND,
             "device L2 split score (n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={SCORE_BOUND:.0e})"
         );
+    }
+}
+
+#[test]
+fn argmin_clear_margin_matches_select_best_candidate() {
+    // STRUCTURE is the STRICT bar (D-7.5-06): on a CLEAR-gain-margin fixture the device
+    // argmin MUST pick the EXACT same (feature, bin) as the FROZEN CPU
+    // `select_best_candidate` over the SAME ascending (feature, bin) candidate order. The
+    // make_score_fixture feature 0 aligns its bins with the der1 ramp, giving feature 0 a
+    // clear best border (no near-tie), so f64 atomic jitter cannot flip the winner.
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let l2 = 3.0_f64;
+
+    for &n in &[1usize, 37usize, 10_000usize] {
+        let (der1, weight, cindex, indices) = make_score_fixture(n, n_features, n_bins);
+        let total_w: f64 = sum_f64(&weight);
+        let scaled_l2 = scale_l2_reg(l2, total_w, n);
+        let (best, dev_scores) = launch_find_optimal_split_pointwise(
+            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+        )
+        .unwrap();
+        let baseline_scores = host_reference_scores(
+            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+        );
+        let cpu_winner = reference_best_split(&baseline_scores, n_bins, n_features);
+
+        // Use the DEVICE scores to drive the CPU oracle's argmin too, so the comparison
+        // isolates the argmin tie-break logic from the (separately-bounded) score
+        // divergence: the device winner must equal select_best_candidate over the device
+        // scores AND match the CPU-score winner on a clear margin.
+        let dev_winner_via_cpu_argmin = reference_best_split(&dev_scores, n_bins, n_features);
+
+        let dev = best.map(|b| (b.feature_id as usize, b.bin_id as usize));
+        println!(
+            "[argmin clear n={n}] REPORTED device={dev:?} cpu(dev-scores)={dev_winner_via_cpu_argmin:?} cpu(host-scores)={cpu_winner:?}"
+        );
+        assert_eq!(
+            dev, dev_winner_via_cpu_argmin,
+            "device argmin must equal select_best_candidate over the SAME device scores (n={n})"
+        );
+        assert_eq!(
+            dev, cpu_winner,
+            "device winner must equal the CPU winner on a clear-gain-margin fixture (n={n})"
+        );
+    }
+}
+
+#[test]
+fn argmin_lowest_index_tie_break_matches_select_best_candidate() {
+    // The deliberate-tie fixture (Pitfall 1/2): TWO candidates with EXACTLY equal gain.
+    // The device argmin's lowest-(feature,bin)-index tie-break must keep the SAME winner
+    // as the CPU strict-`>` first-wins over ascending (feature, bin) order — the LOWER
+    // index. Build a histogram-equivalent fixture where two features are identical (so
+    // their best borders carry identical gain): the lower feature index must win.
+    let n_features = 2usize;
+    let n_bins = 32usize;
+    let l2 = 1.0_f64;
+    let n = 64usize;
+
+    // Two IDENTICAL features (same der1 contribution per bin) → their per-border scores
+    // are bit-identical, so the best border of feature 0 and feature 1 tie EXACTLY. The
+    // CPU first-wins (ascending feature) keeps feature 0; the device lowest-index tie-break
+    // must agree.
+    let der1: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
+    let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
+    let mut cindex = vec![0u32; n_features * n];
+    for obj in 0..n {
+        let bin = ((obj * n_bins) / n).min(n_bins - 1) as u32;
+        // feature 0 and feature 1 get the IDENTICAL bin assignment per object.
+        cindex[0 * n + obj] = bin;
+        cindex[1 * n + obj] = bin;
+    }
+    let indices: Vec<u32> = (0..n as u32).collect();
+
+    let total_w: f64 = sum_f64(&weight);
+    let scaled_l2 = scale_l2_reg(l2, total_w, n);
+
+    let (best, dev_scores) = launch_find_optimal_split_pointwise(
+        &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+    )
+    .unwrap();
+    let baseline_scores =
+        host_reference_scores(&der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2);
+    let cpu_winner = reference_best_split(&baseline_scores, n_bins, n_features);
+    let dev_winner_via_cpu_argmin = reference_best_split(&dev_scores, n_bins, n_features);
+
+    let dev = best.map(|b| (b.feature_id as usize, b.bin_id as usize));
+    println!(
+        "[argmin tie] REPORTED device={dev:?} cpu(dev-scores)={dev_winner_via_cpu_argmin:?} cpu(host-scores)={cpu_winner:?}"
+    );
+    // The tie-break MUST resolve to the lower feature index (feature 0).
+    assert_eq!(
+        dev, dev_winner_via_cpu_argmin,
+        "device argmin tie-break must equal select_best_candidate over the SAME device scores"
+    );
+    if let Some((f, _)) = dev {
+        assert_eq!(f, 0, "the lowest-(feature,bin)-index tie-break must keep feature 0 on an exact tie");
+    } else {
+        panic!("a non-empty tie fixture must yield a best split");
     }
 }

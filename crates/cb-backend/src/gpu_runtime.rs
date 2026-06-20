@@ -57,13 +57,14 @@ use cubecl::server::Handle;
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
-    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, focal_gradient_kernel,
+    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
+    focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
     pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
-    quantile_gradient_kernel,
+    quantile_gradient_kernel, SCORE_FN_L2,
 };
 use crate::SelectedRuntime;
 
@@ -1322,6 +1323,262 @@ pub fn launch_pointwise_hist2(
 
     let device_hist = read_binsums_f64(&client, handle)?;
     Ok((device_hist, path))
+}
+
+// ===========================================================================
+// Phase 7.5 Plan A — the device-resident pointwise L2 split-SCORE + split-ARGMIN seam
+// (GPU-01 score/split slice). Consumes the FROZEN 7.3 2-channel histogram handle in
+// place (NO host round-trip of the histogram, D-05), computes the per-candidate L2 split
+// score device-resident, and finishes the deterministic argmin (lowest-(feature,bin)-
+// index tie-break) so the chosen split matches the CPU `select_best_candidate` exactly.
+// Only the small per-candidate score buffer (the self-oracle observation) and the
+// O(blocks) per-block winner descriptor cross host<->device; the bulk histogram never
+// leaves the device. Cross-oracled in `kernels/score_split.rs` against the FROZEN CPU
+// references `cb-compute/src/score.rs::l2_split_score` + `cb-train/src/tree.rs::
+// select_best_candidate`.
+// ===========================================================================
+
+/// The O(1) best-split descriptor read back per level (upstream `TBestSplitProperties`
+/// analogue, `pointwise_scores.cu:303-309`): the chosen `(feature, bin)` split, its
+/// L2 score, and its gain. `#[repr(C)]` 16-byte POD so the device-written / host-read
+/// bytes reinterpret with `bytemuck::cast_slice` with no padding surprises (the
+/// `gpu_runtime.rs` read-back idiom). For Plan A `score == gain` (the L2 split score IS
+/// the gain to maximize); the two fields are kept distinct for the Cosine/variant arms
+/// (Plan E) and the upstream descriptor shape.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BestSplit {
+    /// The winning candidate's feature index.
+    pub feature_id: u32,
+    /// The winning candidate's split border (bin index).
+    pub bin_id: u32,
+    /// The winning candidate's L2 split score.
+    pub score: f32,
+    /// The winning candidate's gain (== `score` for the L2 arm).
+    pub gain: f32,
+}
+
+/// Fill the FROZEN 7.3 device-resident 2-channel histogram, then compute the
+/// pointwise **L2 split score per candidate** and the **best `(feature, bin)` split**
+/// device-resident on the compile-time [`SelectedRuntime`], returning
+/// `(best_split, per_candidate_scores)`.
+///
+/// The histogram is filled with [`launch_pointwise_hist2_into`] (the FROZEN 7.3 seam)
+/// and consumed IN PLACE by [`find_optimal_split_kernel`] — the bulk histogram NEVER
+/// crosses to the host (D-05 / D-7.5-05). The per-candidate score vector (length
+/// `n_features * n_bins`, flat order `feature * n_bins + bin`) is read back as the
+/// self-oracle observation (the analog of reading `binSums` back ONCE in the histogram
+/// oracle); the across-block argmin is finished host-side over the small O(blocks)
+/// per-block winner array with the SAME lowest-`(feature, bin)`-index tie-break the
+/// kernel uses, so the chosen split equals `cb_train::select_best_candidate` over the
+/// ascending `(feature, bin)` order (Pitfall 1 / RESEARCH Pattern 4).
+///
+/// `der1` (UNWEIGHTED, the 7.2 seam contract) / `weight` (channel 1), length `n`;
+/// `cindex` (feature-major quantized bins), length `n_features * n`; `indices` (object
+/// visiting order), length `n`; `n_bins` is `1 << bits`; `scaled_l2` is the per-tree
+/// `scale_l2_reg` output.
+///
+/// Empty input (`n == 0` / `n_features == 0` / `n_bins == 0`) short-circuits to
+/// `(None, Vec::new())` with NO launch and NO read-back of a 0-length handle (Pitfall
+/// 3/5). Mismatched input lengths / out-of-range bin/object values surface a typed
+/// [`CbError`] BEFORE launch (the FROZEN 7.3 guards in `launch_pointwise_hist2_into`).
+/// No `unwrap`/`expect`/`panic`/indexing in this production helper (workspace lints +
+/// D-13).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_find_optimal_split_pointwise(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    scaled_l2: f64,
+) -> CbResult<(Option<BestSplit>, Vec<f64>)> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    launch_find_optimal_split_pointwise_into(
+        &client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2,
+    )
+}
+
+/// The ONE score/split launch geometry (the histogram-seam IN-02 precedent — one place).
+/// Fills the device histogram, launches the score/argmin kernel consuming that handle,
+/// reads back the per-candidate scores + the per-block winners, and finishes the
+/// host-side argmin. The caller owns the `client` lifecycle so every read-back uses the
+/// SAME client that allocated the handles (a CubeCL Handle is bound to its originating
+/// client — see [`launch_der_binary_into`]).
+#[allow(clippy::too_many_arguments)]
+fn launch_find_optimal_split_pointwise_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    scaled_l2: f64,
+) -> CbResult<(Option<BestSplit>, Vec<f64>)> {
+    let n = der1.len();
+
+    // Empty short-circuit FIRST (Pitfall 3/5): no histogram, no launch, no 0-len read.
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok((None, Vec::new()));
+    }
+
+    // Candidate-count overflow guard (T-07.5-01-02): the per-candidate score buffer and
+    // the kernel's candidate index math are products of caller-supplied dimensions. Reject
+    // a degenerate dimension with a typed range error BEFORE forming the product unchecked
+    // (a wrapping multiply would address the wrong cell; a debug build would panic).
+    let n_candidates = n_features.checked_mul(n_bins).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (candidate count)"
+        ))
+    })?;
+
+    // Only the L2 arm exists this plan (D-7.5-01); a non-32/64/128/256 n_bins would not be
+    // a one-byte non-binary feature group either, but the histogram fill (below) already
+    // rejects that. The score kernel needs n_bins as a comptime u32; bound it to u32 here
+    // so the cast cannot silently truncate a degenerate dimension.
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
+    })?;
+
+    // Fill the FROZEN 7.3 device-resident 2-channel histogram (this also runs the FROZEN
+    // length / value-range guards on der1/weight/cindex/indices BEFORE any launch, and
+    // returns a device HANDLE with NO read-back). The bulk histogram stays device-resident.
+    let bin_sums = launch_pointwise_hist2_into(client, der1, weight, cindex, indices, n_bins, n_features)?;
+
+    // Launch geometry: a SINGLE cube of CUBE_DIM units strides over all candidates and
+    // block-reduces to one winner. (A multi-cube grid is a perf follow-up; one cube keeps
+    // the across-block argmin trivial while staying device-resident.) The shared-mem argmin
+    // size is the comptime ARGMIN_SHMEM == CUBE_DIM (Pitfall 3).
+    let num_cubes = 1usize;
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The score / argmin output buffers. `scores` is the per-candidate L2 score (the
+    // self-oracle observation); `best_gain`/`best_idx` carry one winner per cube. They are
+    // zero-initialised (the kernel writes every candidate it strides; the block-reduce
+    // writes the per-cube winner). The channel float type matches the histogram channel:
+    // f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1) — read back and UPCAST to f64.
+    let bin_sums_len = hist2_binsums_len(n_bins, n_features);
+
+    #[cfg(feature = "wgpu")]
+    let (scores_handle, best_gain_handle, best_idx_handle) = {
+        let scores_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; n_candidates]));
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2 as f32]));
+        find_optimal_split_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(scores_h.clone(), n_candidates) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            n_features as u32,
+            n_bins_u32,
+            SCORE_FN_L2,
+        );
+        (scores_h, best_gain_h, best_idx_h)
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let (scores_handle, best_gain_handle, best_idx_handle) = {
+        let scores_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; n_candidates]));
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2]));
+        find_optimal_split_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(scores_h.clone(), n_candidates) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            n_features as u32,
+            n_bins_u32,
+            SCORE_FN_L2,
+        );
+        (scores_h, best_gain_h, best_idx_h)
+    };
+
+    // Read back the per-candidate scores (UPCAST f32->f64 on wgpu). A read-back failure
+    // surfaces as CbError::Degenerate, never a silent zero buffer (WR-05 / T-07.5-01-04).
+    let scores = read_scores_f64(client, scores_handle)?;
+
+    // Read back the O(blocks) per-block winner descriptors (gain + candidate index) and
+    // finish the across-block argmin host-side with the SAME lowest-index tie-break the
+    // kernel uses. This is the ONLY O(1)-class crossing for the split decision (D-05).
+    let best_gains = read_scores_f64(client, best_gain_handle)?;
+    let best_idx_bytes = client
+        .read_one(best_idx_handle)
+        .map_err(|e| CbError::Degenerate(format!("best-idx read-back failed: {e:?}")))?;
+    let best_idxs: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&best_idx_bytes).to_vec();
+
+    // Finish the across-block argmin: highest gain wins; on an EXACT tie the LOWER
+    // candidate index wins (strict first-wins parity). For a single cube this is the one
+    // winner, but the loop keeps the contract for a future multi-cube grid.
+    let mut best: Option<BestSplit> = None;
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut best_c = u32::MAX;
+    for (block, &gain) in best_gains.iter().enumerate() {
+        let cand = best_idxs.get(block).copied().unwrap_or(u32::MAX);
+        // Skip a block that found no candidate (cand == n_candidates sentinel).
+        if (cand as usize) >= n_candidates {
+            continue;
+        }
+        let take = gain > best_gain || (gain == best_gain && cand < best_c);
+        if take {
+            best_gain = gain;
+            best_c = cand;
+        }
+    }
+    if (best_c as usize) < n_candidates {
+        let feature = (best_c as usize) / n_bins;
+        let bin = (best_c as usize) % n_bins;
+        let score = scores.get(best_c as usize).copied().unwrap_or(best_gain);
+        best = Some(BestSplit {
+            feature_id: feature as u32,
+            bin_id: bin as u32,
+            score: score as f32,
+            gain: best_gain as f32,
+        });
+    }
+
+    Ok((best, scores))
+}
+
+/// Read a device score handle back to a host `Vec<f64>`, UPCASTING the f32 channel on
+/// the wgpu arm (RESEARCH A1) and reading the f64 channel directly elsewhere — the score
+/// sibling of [`read_binsums_f64`]. A read-back failure surfaces [`CbError::Degenerate`]
+/// (WR-05), never a silent zero buffer.
+fn read_scores_f64(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+) -> CbResult<Vec<f64>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL score read-back failed: {e:?}")))?;
+    #[cfg(feature = "wgpu")]
+    {
+        Ok(bytemuck::cast_slice::<u8, f32>(&bytes)
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect())
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+    }
 }
 
 // ===========================================================================

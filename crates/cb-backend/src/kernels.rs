@@ -1727,6 +1727,214 @@ mod scatter;
 // at `kernels::gradient_gpu`. UNLIKE the cpu-only `gradient` spike above, it runs
 // over the generic `SelectedRuntime`, so it builds/runs under EVERY backend (the
 // rocm in-env oracle + wgpu host run).
+/// Comptime score-function selector for [`find_optimal_split_kernel`] (the 7.1
+/// `use_plane` / 7.3 comptime-`bits` precedent): the per-leaf `AddLeaf` arithmetic is
+/// monomorphized at JIT time so there is NO runtime score-function branch in the inner
+/// leaf loop (RESEARCH Pattern 1). Plan A (Phase 7.5) implements ONLY the L2 arm
+/// ([`SCORE_FN_L2`]); the Cosine/Solar/LOO/Sat arms ride the SAME kernel and land in
+/// Plan E (their selector values are reserved here, NOT yet implemented).
+pub(crate) const SCORE_FN_L2: u32 = 0;
+
+/// Comptime shared-memory size for [`find_optimal_split_kernel`]'s block-reduce argmin
+/// (Pitfall 3 — a compile-time `usize` const, never a runtime/topology value). It holds
+/// one `(gain, candidate-index)` slot per unit at the launch cube width, so it equals
+/// [`BLOCK_REDUCE_SHMEM`] (the same `CUBE_DIM` allocation the reduce kernels use). This
+/// is a shared-memory SIZE, NOT a wave/warp-size literal in any stride (D-09).
+pub(crate) const ARGMIN_SHMEM: usize = BLOCK_REDUCE_SHMEM;
+
+/// Device-resident **pointwise L2 split score + deterministic split argmin** over the
+/// FROZEN 7.3 device-resident 2-channel histogram handle (GPU-01 score/split slice,
+/// Phase 7.5 Plan A; D-7.5-01/05/06). The `#[comptime] score_fn` selects the score
+/// calcer (ONLY [`SCORE_FN_L2`] this plan; Cosine/Solar/LOO/Sat reserved for Plan E).
+///
+/// # Inputs / layout
+///
+/// `bin_sums` is the FROZEN 7.3 2-channel histogram (read-only, device-resident, NO
+/// host round-trip): cell index `(feature * n_bins + bin) * 2 + channel`, channel 0 =
+/// Σ der1, channel 1 = Σ weight (the layout `pointwise_hist2_nonbinary_kernel` writes).
+/// `scaled_l2` is the per-tree `scale_l2_reg` output (the L2 regularizer). The candidate
+/// enumeration order is ascending `(feature, bin)` flattened as `feature * n_bins + bin`
+/// — the SAME order the CPU `cb_train::select_best_candidate` `Candidate` vector uses,
+/// so the tie-break agrees (RESEARCH Pattern 4 / A4).
+///
+/// # Score fold (D-03 f64-finalize, Pitfall 4 of 7.5)
+///
+/// For each candidate `(feature, border)` the split produces a LEFT leaf (bins
+/// `0..=border`) and a RIGHT leaf (bins `border+1..n_bins`). The per-bin
+/// `(Σ der1, Σ weight)` are folded — IN f64 (`F::Float` widened to `f64` via a running
+/// `f64` accumulator is NOT expressible generically here; instead the device channel is
+/// f64 on rocm/cuda/cpu and f32 on wgpu, matching the histogram channel, so `F` IS the
+/// finalize type) — into `left`/`right` [`cb_compute::LeafStats`], then the L2 score is
+/// transcribed VERBATIM from the FROZEN oracle `cb-compute/src/score.rs::l2_split_score`
+/// + `cb-compute/src/leaf.rs::calc_average`:
+///
+/// ```text
+/// avg(sum, weight) = weight + scaled_l2 > 0 ? sum / (weight + scaled_l2) : 0   // calc_average (count>0 guard)
+/// add_leaf_plain(leaf) = avg(leaf.sum, leaf.weight) * leaf.sum                  // score.rs:39-42
+/// score = add_leaf_plain(left) + add_leaf_plain(right)                          // l2_split_score:49-55
+/// ```
+///
+/// The `count > 0` guard (transcribed from `calc_average`) means a degenerate (empty)
+/// leaf contributes 0.0 — no division by zero, no NaN/Inf (Security V5 / T-07.5-01-05).
+/// A higher score is a better split.
+///
+/// # Deterministic argmin (Pitfall 1 / RESEARCH Pattern 4)
+///
+/// Each thread keeps a running best `(gain, candidate-index)` over the candidates it
+/// strides through, then the cube block-reduces those locals: on `gain[a] == gain[b]`
+/// it keeps the LOWER candidate index (== ascending `(feature, bin)`), which equals the
+/// CPU strict-`>` first-wins over the same order (`select_best_candidate`,
+/// `tree.rs:291-302`; upstream `pointwise_scores.cu:140-141`). One `(best_gain,
+/// best_idx)` pair is written per cube (block). The block-reduce is the wave-agnostic
+/// `CUBE_DIM_X`-strided shared-mem tree (D-09 — no warp/wave-size literal in the stride;
+/// `ARGMIN_SHMEM` is the comptime allocation size).
+///
+/// # Outputs (no host round-trip of the histogram — D-05)
+///
+/// `scores` (length `n_features * n_bins`) receives the per-candidate L2 score (the
+/// self-oracle observation, the analog of `pointwise_hist` reading binSums back ONCE).
+/// `best_gain` / `best_idx` (length = the cube count) receive one block winner each; the
+/// host finishes the across-block argmin over this small O(blocks) array with the SAME
+/// lowest-index tie-break and reads ONLY this descriptor back (D-05). The bulk histogram
+/// never leaves the device.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float — no hard-coded float type). Every
+/// device read is under a POSITION bounds guard; the candidate/feature/bin VALUE ranges
+/// are validated HOST-SIDE in `launch_find_optimal_split_pointwise_into` before launch.
+/// if-as-STATEMENT only (CubeCL conditionals manual). `MINIMAL_SCORE` sentinel
+/// (`f64::NEG_INFINITY` analogue) is `F::new(f32::MIN as f64)` so any finite score wins.
+#[cube(launch)]
+pub fn find_optimal_split_kernel<F: Float>(
+    bin_sums: &Array<F>,
+    scores: &mut Array<F>,
+    best_gain: &mut Array<F>,
+    best_idx: &mut Array<u32>,
+    scaled_l2: &Array<F>,
+    n_features: u32,
+    #[comptime] n_bins: u32,
+    #[comptime] score_fn: u32,
+) {
+    let tid = UNIT_POS;
+    let n_bins_usize = n_bins as usize;
+    let n_features_usize = n_features as usize;
+    let n_candidates = n_features_usize * n_bins_usize;
+
+    // The per-tree L2 regularizer is passed as a length-1 device array (the codebase
+    // passes float values through `Array<F>`, never as a generic-`F` launch scalar — a
+    // `#[cube(launch)]` scalar must be a concrete `CubeElement`, not the generic `F`).
+    let lambda = scaled_l2[0usize];
+
+    // The minimal-score sentinel any finite candidate must beat (the
+    // `score.rs::MINIMAL_SCORE` = f64::lowest() analogue). `f32::MIN` is well below any
+    // realistic L2 score and is representable in both the f32 (wgpu) and f64 channels.
+    let minimal_score = F::new(f32::MIN);
+
+    // This thread's running best over the candidates it strides through. `best_c` is the
+    // candidate index (== feature * n_bins + bin); ties keep the LOWER index, so seed it
+    // to the max so any real candidate replaces it on the first strict-greater compare.
+    let mut my_gain = minimal_score;
+    let mut my_idx = n_candidates as u32;
+
+    // Grid-stride over candidates (D-09: the stride is the cube width CUBE_DIM_X, a
+    // topology value, never a literal). Each candidate is one (feature, border) split.
+    let mut c = tid as usize;
+    while c < n_candidates {
+        let feature = c / n_bins_usize;
+        let border = c % n_bins_usize;
+
+        // Fold the feature's bins into LEFT (bins 0..=border) / RIGHT (bins
+        // border+1..n_bins) leaf stats, reading the FROZEN 2-channel histogram in place.
+        let mut left_sum = F::new(0.0);
+        let mut left_w = F::new(0.0);
+        let mut right_sum = F::new(0.0);
+        let mut right_w = F::new(0.0);
+        let mut bin = 0usize;
+        while bin < n_bins_usize {
+            let cell = (feature * n_bins_usize + bin) * 2usize;
+            let d = bin_sums[cell];
+            let w = bin_sums[cell + 1usize];
+            if bin <= border {
+                left_sum += d;
+                left_w += w;
+            } else {
+                right_sum += d;
+                right_w += w;
+            }
+            bin += 1usize;
+        }
+
+        // L2 score: avg = count>0 ? sum/(count + scaled_l2) : 0; score += avg*sum
+        // (transcribed from leaf.rs::calc_average + score.rs::add_leaf_plain/l2_split_score).
+        // The `count > 0` guard mirrors calc_average exactly (no div-by-zero / NaN).
+        let mut score = F::new(0.0);
+        if score_fn == comptime!(SCORE_FN_L2) {
+            let mut left_avg = F::new(0.0);
+            if left_w > F::new(0.0) {
+                left_avg = left_sum / (left_w + lambda);
+            }
+            let mut right_avg = F::new(0.0);
+            if right_w > F::new(0.0) {
+                right_avg = right_sum / (right_w + lambda);
+            }
+            score = left_avg * left_sum + right_avg * right_sum;
+        }
+
+        scores[c] = score;
+
+        // Update this thread's running best with the strict-first-wins / lowest-index
+        // tie-break: take the candidate only if its score STRICTLY exceeds the running
+        // best (a later equal-gain candidate never displaces an earlier one → lowest
+        // index wins on a tie, matching select_best_candidate's strict `>`).
+        if score > my_gain {
+            my_gain = score;
+            my_idx = c as u32;
+        }
+
+        c += CUBE_DIM_X as usize;
+    }
+
+    // Block-reduce the per-thread bests into ONE (gain, candidate-index) winner for the
+    // cube, with the lowest-index tie-break. Wave-agnostic shared-mem tree (D-09): the
+    // SIZE is the comptime ARGMIN_SHMEM; the stride starts at CUBE_DIM_X / 2 (the runtime
+    // cube width), never a literal 32/64.
+    let mut sh_gain = SharedMemory::<F>::new(ARGMIN_SHMEM);
+    let mut sh_idx = SharedMemory::<u32>::new(ARGMIN_SHMEM);
+    sh_gain[tid as usize] = my_gain;
+    sh_idx[tid as usize] = my_idx;
+    sync_cube();
+
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let other_gain = sh_gain[(tid + s) as usize];
+            let other_idx = sh_idx[(tid + s) as usize];
+            let cur_gain = sh_gain[tid as usize];
+            let cur_idx = sh_idx[tid as usize];
+            // Keep the higher gain; on an EXACT tie keep the LOWER candidate index
+            // (== lowest (feature, bin) — strict first-wins parity, Pitfall 1).
+            let mut take_other = false;
+            if other_gain > cur_gain {
+                take_other = true;
+            } else if other_gain == cur_gain {
+                if other_idx < cur_idx {
+                    take_other = true;
+                }
+            }
+            if take_other {
+                sh_gain[tid as usize] = other_gain;
+                sh_idx[tid as usize] = other_idx;
+            }
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+
+    if tid == 0u32 {
+        best_gain[CUBE_POS] = sh_gain[0usize];
+        best_idx[CUBE_POS] = sh_idx[0usize];
+    }
+}
+
 #[cfg(test)]
 mod gradient_gpu;
 
