@@ -18,9 +18,13 @@
 #[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
 pub mod kernels;
 
-// `gpu_runtime` (the Phase-7.1 generic launch helpers over `SelectedRuntime`,
-// D-7.1-04) is mounted in Task 2 alongside its file + the reduce kernel/oracle,
-// with the same all-backend gate predicate as `kernels` above.
+/// Generic device launch helpers over [`SelectedRuntime`] (D-7.1-04). Mirrors
+/// `cpu_runtime.rs`'s per-call client/transfer/read-back shell but is parameterized
+/// over the selected runtime, so the SAME launch path serves cpu/wgpu/cuda/rocm.
+/// Hosts `launch_block_reduce_f64` (the Phase-7.1 reduce primitive). Mounted under
+/// every backend (D-7.1-01) with the same all-backend gate as `kernels`.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub mod gpu_runtime;
 
 /// The CubeCL `CpuRuntime` as `cb-compute`'s abstract `Runtime` (D-01/D-03):
 /// launches the elementwise `#[cube]` kernels and returns UN-reduced per-object

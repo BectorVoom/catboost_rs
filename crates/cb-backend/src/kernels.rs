@@ -12,6 +12,15 @@
 
 use cubecl::prelude::*;
 
+/// Comptime `SharedMemory` size for [`block_reduce_kernel`] (Pitfall 3 — the size
+/// MUST be a compile-time `usize` const, not a runtime/topology value). It equals
+/// the launch-geometry cube width (`CUBE_DIM = 32` in `gpu_runtime.rs` /
+/// `cpu_runtime.rs`): one shared slot per unit (fallback tree-reduce) and an upper
+/// bound on the per-cube plane count (plane carry). This is the ONE permitted `32`
+/// (the launch-geometry / shared-memory size) — NOT a wave/warp-size literal in any
+/// reduction STRIDE (the strides derive from `CUBE_DIM_X` / `PLANE_DIM`, D-09).
+const BLOCK_REDUCE_SHMEM: usize = 32;
+
 /// First-order RMSE gradient kernel: `der1[i] = target[i] - approx[i]`.
 ///
 /// CatBoost's RMSE first derivative for object `i` is `target[i] - approx[i]`
@@ -535,14 +544,115 @@ pub fn histogram_scatter_kernel<F: Float>(
     }
 }
 
+/// Block-level sum reduction (the Phase-7.1 device primitive, D-7.1-04..09;
+/// GPU-01 reduce). Each cube folds its `CUBE_DIM`-wide slice of `input` into a
+/// SINGLE partial written to `output[CUBE_POS]`; the host finalizes the across-cube
+/// sum via `cb-core::sum_f64` (the default atomic-free finalize — Open Q1; the
+/// in-kernel atomic-finalize variant is Plan 02, NOT here). UNLIKE the elementwise
+/// loss kernels above (D-02), this kernel DOES reduce on-device — but only the
+/// intra-cube fold, leaving the parity-critical final sum to the frozen host order.
+///
+/// Wave-size-agnostic (D-09 / D-7.1-08): the `use_plane` path folds via
+/// `plane_sum` over `PLANE_DIM` (the runtime plane width — NEVER a literal 32/64),
+/// combining per-plane partials in shared memory keyed by `PLANE_POS` when a cube
+/// spans more than one plane. The fallback path (no `Plane::Ops` capability) is a
+/// `SharedMemory`-backed tree reduction whose stride derives from `CUBE_DIM_X`
+/// (again no warp-size literal). `use_plane` is a `#[comptime]` flag resolved ONCE
+/// host-side from `client.features().plane.contains(Plane::Ops)`, so the unused
+/// branch is pruned at JIT time with zero device divergence (comptime
+/// specialization manual). Mirrors the structure of upstream
+/// `cuda_util/kernel/reduce.cuh::FastInBlockReduce` (shared-mem tree-reduce down to
+/// plane width, then a plane reduction) — D-01 structural parity.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float — no hard-coded float type).
+/// Out-of-range lanes are zero-padded (`F::new(0.0)`) under the
+/// `ABSOLUTE_POS < input.len()` bounds guard (T-7.1-01) so a non-multiple-of-cube
+/// length stays correct. The `SharedMemory::new` SIZE is the comptime
+/// [`BLOCK_REDUCE_SHMEM`] `usize` const (Pitfall 3 — a runtime/topology size will
+/// not compile); the reduction STRIDE is `CUBE_DIM_X` / `PLANE_DIM`, never a
+/// literal. Uses the if-as-STATEMENT pattern only (CubeCL conditionals manual).
+#[cube(launch)]
+pub fn block_reduce_kernel<F: Float>(
+    input: &Array<F>,
+    output: &mut Array<F>,
+    #[comptime] use_plane: bool,
+) {
+    let tid = UNIT_POS;
+
+    // Load this unit's element, zero-padding the idle out-of-range lanes
+    // (if-as-STATEMENT: init to 0, overwrite inside the bounds guard).
+    let mut acc = F::new(0.0);
+    if ABSOLUTE_POS < input.len() {
+        acc = input[ABSOLUTE_POS];
+    }
+
+    if use_plane {
+        // Wave-agnostic plane fold: `plane_sum` gives EVERY unit its plane-wide
+        // sum (width = PLANE_DIM, never a literal). When the cube spans more than
+        // one plane (CUBE_DIM > PLANE_DIM), each plane's representative writes its
+        // plane total into shared memory keyed by PLANE_POS, then unit 0 folds the
+        // per-plane partials. The shared array is sized to the comptime CUBE_DIM
+        // (an upper bound on the plane count — Pitfall 3).
+        let plane_total = plane_sum(acc);
+        let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+        if UNIT_POS_PLANE == 0u32 {
+            partials[PLANE_POS as usize] = plane_total;
+        }
+        sync_cube();
+        if tid == 0u32 {
+            // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM). Fold the
+            // per-plane partials sequentially (the count is small: 1 on wave32 at
+            // CUBE_DIM 32). The loop bound derives from PLANE_DIM, not a literal.
+            let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+            let mut sum = F::new(0.0);
+            let mut p = 0u32;
+            while p < num_planes {
+                sum += partials[p as usize];
+                p += 1u32;
+            }
+            output[CUBE_POS] = sum;
+        }
+    } else {
+        // Fallback: shared-memory tree reduction (cubecl_reduce_sum.md). The array
+        // SIZE is the comptime CUBE_DIM const; the stride starts at CUBE_DIM_X / 2
+        // (the runtime cube width) — NEVER a literal 32/64 (D-09).
+        let mut shared = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+        shared[tid as usize] = acc;
+        sync_cube();
+        let mut s = CUBE_DIM_X / 2u32;
+        while s > 0u32 {
+            if tid < s {
+                let v = shared[(tid + s) as usize];
+                shared[tid as usize] += v;
+            }
+            sync_cube();
+            s /= 2u32;
+        }
+        if tid == 0u32 {
+            output[CUBE_POS] = shared[0usize];
+        }
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
-// selects them.
-#[cfg(test)]
+// selects them. These spike harnesses hard-code `cubecl::cpu::CpuRuntime`, so the
+// mount stays cpu-only (the `kernels` module now compiles under every backend, but
+// these CPU-specific tests must not — they reference the cpu runtime by name).
+#[cfg(all(test, feature = "cpu"))]
 mod gradient;
 
-// Histogram-scatter kernel tests (source/test separation): assertions live in
-// `kernels/scatter.rs`, mounted at `kernels::scatter`.
+// Block-reduce primitive oracle (source/test separation): the self-oracle vs
+// `cb-core::sum_f64` lives in `kernels/reduce.rs`, mounted at `kernels::reduce`
+// so `cargo test -p cb-backend ... kernels::reduce` selects it (D-7.1-09). UNLIKE
+// the cpu-only spike harnesses above, it runs over the generic `SelectedRuntime`,
+// so it builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
+mod reduce;
+
+// Histogram-scatter kernel tests (source/test separation): assertions live in
+// `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
+// as `gradient` above (the harness names `cubecl::cpu::CpuRuntime`).
+#[cfg(all(test, feature = "cpu"))]
 mod scatter;
