@@ -4137,18 +4137,31 @@ fn select_best_split_over_scores(
         .map_err(|e| CbError::Degenerate(format!("pairwise best-idx read-back failed: {e:?}")))?;
     let best_idxs: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&best_idx_bytes).to_vec();
 
-    // Finish the across-block argmax: highest score wins; on an EXACT tie the LOWER
-    // candidate index wins (strict first-wins parity == select_best_candidate).
+    // Finish the across-block argmax. The device reduce (run in f32 on wgpu,
+    // gpu_runtime.rs:4101) only nominates each block's winning candidate INDEX; the
+    // actual comparison and tie-break MUST use the exact host-resident f64 `scores`
+    // (WR-03 / IN-01), never the f32-collapsed device `gain`. Two host-distinct f64
+    // scores can collapse to one f32 tie on-device and then resolve by index, picking a
+    // different split than the CPU oracle's strict-`>` over f64. Re-resolving over f64
+    // `scores` here removes that near-tie flip risk; `best_gains` is intentionally not
+    // read for the comparison (it stays the device round-trip's structural artifact).
+    // Highest score wins; on an EXACT f64 tie the LOWER candidate index wins (strict
+    // first-wins parity == select_best_candidate).
+    let _ = &best_gains; // device-reduced gains: structural artifact only (see WR-03).
     let mut best_score = f64::NEG_INFINITY;
     let mut best_c = u32::MAX;
-    for (block, &gain) in best_gains.iter().enumerate() {
-        let cand = best_idxs.get(block).copied().unwrap_or(u32::MAX);
+    for &cand in best_idxs.iter() {
         if (cand as usize) >= n_candidates {
             continue;
         }
-        let take = gain > best_score || (gain == best_score && cand < best_c);
+        // Exact host f64 score for this nominated candidate.
+        let score = match scores.get(cand as usize) {
+            Some(&s) => s,
+            None => continue,
+        };
+        let take = score > best_score || (score == best_score && cand < best_c);
         if take {
-            best_score = gain;
+            best_score = score;
             best_c = cand;
         }
     }
