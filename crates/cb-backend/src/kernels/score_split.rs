@@ -54,7 +54,9 @@ use cubecl::prelude::*;
 use cb_compute::{l2_split_score, scale_l2_reg, LeafStats};
 use cb_core::sum_f64;
 
-use crate::gpu_runtime::{launch_find_optimal_split_pointwise, BestSplit};
+use crate::gpu_runtime::{
+    launch_find_optimal_split_pointwise, launch_scan_update_pointwise, BestSplit,
+};
 
 /// The asserted run-stable SCORE divergence bound for the device L2 split score. The
 /// device score fold is f64 on rocm/cuda/cpu (HIP/CUDA support/emulate the f64 atomic
@@ -390,5 +392,202 @@ fn argmin_lowest_index_tie_break_matches_select_best_candidate() {
         assert_eq!(f, 0, "the lowest-(feature,bin)-index tie-break must keep feature 0 on an exact tie");
     } else {
         panic!("a non-empty tie fixture must yield a best split");
+    }
+}
+
+// ===========================================================================
+// scan/update bridge self-oracle (Phase 7.5 Plan B, GPU-01 scan-update slice;
+// D-7.5-03). The deferred 7.3 `ScanPointwiseHistograms`/`UpdatePointwiseHistograms`
+// transform: the FROZEN 7.3 2-channel per-bin (Σder, Σweight) histogram handle is
+// turned, device-resident (NO host round-trip at the FILL->scan seam, D-7.5-03),
+// into cumulative "left-of-border" leaf stats so a candidate split at border `b`
+// reads `left = scan[b]`, `right = total - scan[b]` (the
+// `FindOptimalSplitSingleFoldImpl` convention, `pointwise_scores.cu:259-263`). The
+// device cumulative output must match the host ORDERED prefix-sum folded through
+// [`sum_f64`] over the same ascending bin order (the SAME single sanctioned ordered
+// reduction the histogram oracle uses), within a REPORTED f64 bound — NOT signed off
+// (the GPU-06 epsilon is 7.6's job, D-7.5-05). SCOPE: <= CUBE_DIM bins per feature
+// (the single-cube scan precondition the underlying `block_scan_kernel` enforces,
+// RESEARCH A1 / Open Q1); the >CUBE_DIM cross-cube carry is an EXPLICIT tracked
+// forward dependency (asserted to surface a typed error here, recorded in the
+// SUMMARY — NOT a silent cut).
+// ===========================================================================
+
+mod scan {
+    use super::*;
+
+    /// The asserted run-stable cumulative-scan divergence bound: f32 magnitude
+    /// (~1e-3) on wgpu (no f64 channel), f64 magnitude (~1e-9) elsewhere — the SAME
+    /// channel-driven split as [`super::SCORE_BOUND`]. REPORTED, not the GPU-06
+    /// epsilon (7.6's job).
+    #[cfg(feature = "wgpu")]
+    const SCAN_BOUND: f64 = 1e-3;
+    #[cfg(not(feature = "wgpu"))]
+    const SCAN_BOUND: f64 = 1e-9;
+
+    /// The ORDERED host reference per-(feature, bin) cumulative "left-of-border" leaf
+    /// stats — the parity baseline the device scan/update output is REPORTED against
+    /// (D-7.5-05). It reconstructs the FROZEN 7.3 2-channel binSums the device fills
+    /// (via [`super::host_reference_scores`]'s sibling fold) and folds each feature's
+    /// per-bin channel cumulatively in ASCENDING bin order through [`sum_f64`] (the
+    /// single sanctioned ordered reduction, D-08): for each feature `f`, channel `c`,
+    /// and border `b`,
+    ///
+    /// ```text
+    /// cumulative[(f * n_bins + b) * 2 + c] = sum_f64( binSums[(f,0,c)] .. binSums[(f,b,c)] )
+    /// ```
+    ///
+    /// (an INCLUSIVE prefix over bins `0..=b`). A candidate at border `b` reads
+    /// `left = cumulative[b]`, `right = cumulative[n_bins-1] - cumulative[b]` — the
+    /// `FindOptimalSplitSingleFoldImpl` convention. Returns a flat `Vec<f64>` of length
+    /// `n_features * n_bins * 2`, the SAME `(feature * n_bins + bin) * 2 + channel`
+    /// layout the FROZEN handle uses. This GENERALIZES the cumulative reduction in the
+    /// `cb-backend` test file WITHOUT modifying any frozen `cb-compute`/`cb-core`
+    /// baseline (SC-4).
+    fn host_reference_cumulative(
+        binsums: &[f64],
+        n_bins: usize,
+        n_features: usize,
+    ) -> Vec<f64> {
+        let mut cumulative = vec![0.0_f64; n_features * n_bins * 2];
+        for feature in 0..n_features {
+            for channel in 0..2usize {
+                for border in 0..n_bins {
+                    // Fold bins 0..=border for this (feature, channel) in ascending
+                    // bin order via the ordered sum_f64 (NEVER a naive `.sum()`, D-08).
+                    let mut segment: Vec<f64> = Vec::with_capacity(border + 1);
+                    for bin in 0..=border {
+                        segment.push(binsums[(feature * n_bins + bin) * 2 + channel]);
+                    }
+                    cumulative[(feature * n_bins + border) * 2 + channel] = sum_f64(&segment);
+                }
+            }
+        }
+        cumulative
+    }
+
+    /// Reconstruct the FROZEN 7.3 binSums the device scan/update consumes, on the host,
+    /// by folding the fixture's per-object (der1, weight) into each (feature, bin) cell
+    /// in ascending object order through [`sum_f64`] — the SAME ordered host-reference
+    /// shape `kernels::pointwise_hist::host_reference_hist2` uses, reproduced HERE so
+    /// the scan baseline does not depend on a device read-back of the histogram.
+    fn host_reference_binsums(
+        der1: &[f64],
+        weight: &[f64],
+        cindex: &[u32],
+        indices: &[u32],
+        n_bins: usize,
+        n_features: usize,
+    ) -> Vec<f64> {
+        let n = der1.len();
+        let mut binsums = vec![0.0_f64; n_features * n_bins * 2];
+        for feature in 0..n_features {
+            for bin in 0..n_bins {
+                let mut der_seg: Vec<f64> = Vec::new();
+                let mut w_seg: Vec<f64> = Vec::new();
+                for &obj in indices.iter() {
+                    let obj = obj as usize;
+                    if cindex[feature * n + obj] as usize == bin {
+                        der_seg.push(der1[obj]);
+                        w_seg.push(weight[obj]);
+                    }
+                }
+                binsums[(feature * n_bins + bin) * 2] = sum_f64(&der_seg);
+                binsums[(feature * n_bins + bin) * 2 + 1] = sum_f64(&w_seg);
+            }
+        }
+        binsums
+    }
+
+    #[test]
+    fn cumulative_matches_host_ordered_reference() {
+        // The device scan/update over the FROZEN 7.3 binSums handle must produce
+        // per-(feature, bin) cumulative (Σder, Σweight) equal to the host ORDERED
+        // prefix-sum (folded via sum_f64 over ascending bins) within the REPORTED
+        // bound. REPORTED, not signed off (D-7.5-05). Edge cases: n_bins=1, n_bins=2
+        // (binary family), n_bins=16 (half-byte), n_bins=CUBE_DIM=32 (the single-cube
+        // boundary, RESEARCH A1), multiple features, and the empty short-circuit
+        // (no read-back of a 0-len handle, Pitfall 3/5).
+        let l2 = 3.0_f64; // unused by scan; kept to mirror the score harness shape
+
+        // Empty (n=0): NO launch, NO read-back of a 0-len handle. The seam returns an
+        // empty cumulative buffer; assert it constructs without faulting.
+        {
+            let n_features = 2usize;
+            let n_bins = 32usize;
+            let (der1, weight, cindex, indices) = make_score_fixture(0, n_features, n_bins);
+            let _ = l2;
+            let res = launch_scan_update_pointwise(
+                &der1, &weight, &cindex, &indices, n_bins, n_features,
+            );
+            assert!(res.is_ok(), "empty scan/update must construct without faulting");
+            let cumulative = res.unwrap();
+            assert!(
+                cumulative.is_empty(),
+                "empty input must yield an empty cumulative buffer"
+            );
+        }
+
+        // n_bins from {1, 2, 16, 32}: 1 (degenerate single border), 2 (binary), 16
+        // (half-byte), 32 (== CUBE_DIM, the single-cube scan boundary). make_score_fixture
+        // already keeps every cindex bin < n_bins.
+        for &n_bins in &[1usize, 2usize, 16usize, 32usize] {
+            for &n_features in &[1usize, 3usize] {
+                for &n in &[1usize, 37usize, 1000usize] {
+                    let (der1, weight, cindex, indices) =
+                        make_score_fixture(n, n_features, n_bins);
+
+                    let cumulative = launch_scan_update_pointwise(
+                        &der1, &weight, &cindex, &indices, n_bins, n_features,
+                    )
+                    .unwrap();
+
+                    let binsums = host_reference_binsums(
+                        &der1, &weight, &cindex, &indices, n_bins, n_features,
+                    );
+                    let baseline = host_reference_cumulative(&binsums, n_bins, n_features);
+
+                    assert_eq!(
+                        cumulative.len(),
+                        baseline.len(),
+                        "device cumulative length must equal the host-reference layout \
+                         (n={n} n_bins={n_bins} n_features={n_features})"
+                    );
+                    let (abs, rel) = max_divergence(&cumulative, &baseline);
+                    println!(
+                        "[scan n={n} n_bins={n_bins} n_features={n_features}] REPORTED \
+                         max abs_div={abs:.3e} rel_div={rel:.3e} (bound={SCAN_BOUND:.0e})"
+                    );
+                    assert!(
+                        rel <= SCAN_BOUND || abs <= SCAN_BOUND,
+                        "device scan/update cumulative (n={n} n_bins={n_bins} \
+                         n_features={n_features}) diverged too far: abs={abs:.3e} \
+                         rel={rel:.3e} (bound={SCAN_BOUND:.0e})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn over_cube_dim_bins_is_typed_error_not_silent_truncation() {
+        // SCOPE GUARD (RESEARCH A1 / Open Q1): the underlying single-cube
+        // `block_scan_kernel` is correct only for n_bins <= CUBE_DIM. A feature with
+        // MORE bins than CUBE_DIM (e.g. an 8-bit 256-bin feature) needs the cross-cube
+        // scan carry — the EXPLICIT tracked forward dependency. Until it lands, the seam
+        // MUST surface a TYPED error rather than silently truncate / return a wrong
+        // prefix. Use n_bins = 64 (> CUBE_DIM = 32): make_score_fixture keeps bins < 64,
+        // so the ONLY rejection is the scan precondition, not a value-range guard.
+        let n_features = 2usize;
+        let n_bins = 64usize; // > CUBE_DIM (32)
+        let n = 50usize;
+        let (der1, weight, cindex, indices) = make_score_fixture(n, n_features, n_bins);
+        let res =
+            launch_scan_update_pointwise(&der1, &weight, &cindex, &indices, n_bins, n_features);
+        assert!(
+            res.is_err(),
+            "n_bins ({n_bins}) > CUBE_DIM must surface a typed error (cross-cube carry \
+             is the tracked forward dependency), NOT a silent wrong scan"
+        );
     }
 }
