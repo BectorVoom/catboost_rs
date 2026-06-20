@@ -359,6 +359,88 @@ fn nonbinary_bits() {
 }
 
 #[test]
+fn half_byte() {
+    // The half-byte (4-bit) fill self-oracle (Plan C — D-7.3-02/03/04): the SEPARATE
+    // `pointwise_hist2_half_byte_kernel` family (NOT a comptime case of the non-binary
+    // kernel) selected host-side from the half-byte border count `n_bins == 16`. Its
+    // shared-memory layout / load-unroll structurally mirror upstream
+    // `pointwise_hist2_half_byte_template.cuh` (the 16-bin TPointHistHalfByte working
+    // histogram), but it writes the SAME FROZEN binSums layout
+    // `(feature * 16 + bin) * 2 + channel` through the UNCHANGED der-handle-in ->
+    // binSums-handle-out seam (the seam stays byte-identical — D-7.3-01 / Pitfall 2).
+    //
+    // For the 4-bit width the device 2-channel histogram must match the ORDERED host
+    // reference within the REPORTED bound, exercised at the 16-bin border count over
+    // the edge cases n=1 / n=37 (non-cube-multiple) / large N, plus the empty
+    // short-circuit. The Plan A `host_reference_hist2` / `max_divergence` /
+    // `make_fixture_f64` harness is reused verbatim (the host reference is generic over
+    // `n_bins`, so 16 needs no new reference). The per-fixture max abs/rel divergence +
+    // the AtomicFinalizePath are REPORTED, not signed off (D-7.3-04 — the GPU-06
+    // epsilon is 7.6's job).
+    let n_features = 2usize;
+    let n_bins = 16usize; // 4-bit half-byte -> 1 << 4
+
+    // Empty (n=0): NO launch, NO read-back (Pitfall 5) on the half-byte path too.
+    {
+        let (der1, weight, cindex, indices) = make_fixture_f64(0, n_features, n_bins);
+        let (device, path) =
+            launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features).unwrap();
+        println!("[hist2 half_byte n=0] REPORTED AtomicFinalizePath={path:?}");
+        assert!(
+            device.is_empty(),
+            "empty input must yield an empty half-byte histogram (no launch)"
+        );
+    }
+
+    // n=1, n=37 (non-cube-multiple), large N: device vs ordered host reference, at the
+    // 16-bin half-byte border count, through the readback wrapper.
+    for &n in &[1usize, 37usize, 10_000usize] {
+        let (der1, weight, cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+        let (device, path) =
+            launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features).unwrap();
+        let baseline = host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "device half-byte binSums length must equal the host-reference layout length (n={n})"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[hist2 half_byte f64 n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} AtomicFinalizePath={path:?}"
+        );
+        assert!(
+            rel <= HIST_BOUND || abs <= HIST_BOUND,
+            "half-byte hist2 (n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
+        );
+    }
+
+    // Device-residency hand-off on the half-byte family: der/weight/cindex/indices
+    // handles in -> `launch_pointwise_hist2_handle` returns the half-byte `binSums` as a
+    // device HANDLE with NO host fold on the seam (D-7.3-05). Read back ONCE here only.
+    {
+        let n = 50usize;
+        let (der1, weight, cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+        let bin_sums_handle =
+            launch_pointwise_hist2_handle(&der1, &weight, &cindex, &indices, n_bins, n_features)
+                .unwrap();
+        let device = read_handle_f64(bin_sums_handle);
+        let baseline = host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "half-byte binSums handle length must equal the host-reference layout length"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!("[hist2 half_byte handoff n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+        assert!(
+            rel <= HIST_BOUND || abs <= HIST_BOUND,
+            "device-resident half-byte binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
+        );
+    }
+}
+
+#[test]
 fn length_mismatch_is_typed_error() {
     // T-07.3-01: mismatched der1/weight/cindex/indices lengths must surface a typed
     // `CbError::LengthMismatch` BEFORE any launch (a host-side guard), never an OOB
