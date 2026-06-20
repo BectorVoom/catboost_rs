@@ -86,15 +86,19 @@ fn cpu_exclusive_scan(input: &[f64]) -> Vec<f64> {
 /// Compare the device scan (cast to f64) to the CPU baseline element-wise,
 /// returning the max abs and max rel divergence over the vector.
 fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
+    // IN-02: zip the two slices so the equal-length precondition is structural (and
+    // consistent with the already-hardened sibling, commit 252c33a / IN-03 in 07.3)
+    // rather than relying on `device[i]` not panicking when `device` is shorter.
+    debug_assert_eq!(
+        device.len(),
+        baseline.len(),
+        "max_divergence requires device and baseline to be equal length"
+    );
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
-    for i in 0..baseline.len() {
-        let abs = (device[i] - baseline[i]).abs();
-        let rel = if baseline[i].abs() > 0.0 {
-            abs / baseline[i].abs()
-        } else {
-            abs
-        };
+    for (d, b) in device.iter().zip(baseline) {
+        let abs = (d - b).abs();
+        let rel = if b.abs() > 0.0 { abs / b.abs() } else { abs };
         max_abs = max_abs.max(abs);
         max_rel = max_rel.max(rel);
     }
