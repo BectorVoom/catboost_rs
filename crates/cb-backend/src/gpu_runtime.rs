@@ -1610,6 +1610,18 @@ fn launch_find_optimal_split_pointwise_into(
         if (cand as usize) >= n_candidates {
             continue;
         }
+        // WR-05: the trailing `border == n_bins - 1` candidate is the no-op (all bins
+        // LEFT / none RIGHT) split that upstream and the pairwise path never enumerate.
+        // The device kernel already excludes it from its argmin (see the `border <
+        // n_bins - 1` guard in `find_optimal_split_kernel`), so a winning `cand` should
+        // never decode to that border; this host-side guard is the EXACT-lockstep belt
+        // to the kernel skip (and to `reference_best_split`'s host-oracle skip) so a
+        // future multi-cube grid or any block descriptor can never promote the no-op
+        // split. The per-candidate `scores` buffer still carries every border's value
+        // (geometry unchanged), only the WINNER decode excludes the trailing one.
+        if (cand as usize) % n_bins == n_bins - 1 {
+            continue;
+        }
         let take = gain > best_gain || (gain == best_gain && cand < best_c);
         if take {
             best_gain = gain;

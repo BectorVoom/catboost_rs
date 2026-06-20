@@ -235,7 +235,17 @@ fn reference_best_split(scores: &[f64], n_bins: usize, n_features: usize) -> Opt
     let mut best_score = f64::NEG_INFINITY;
     let mut winner: Option<(usize, usize)> = None;
     for feature in 0..n_features {
-        for border in 0..n_bins {
+        // WR-05: enumerate only `0..n_bins - 1` real split borders. The trailing
+        // `border == n_bins - 1` candidate places ALL bins LEFT / none RIGHT — a no-op
+        // (non-split) that upstream and the pairwise path (`n_splits = n_bins - 1`) never
+        // consider, and that the device kernel + the host winner decode in `gpu_runtime`
+        // now also exclude in EXACT lockstep. `scores` still HOLDS the trailing border's
+        // value (`host_reference_scores` fills every border, matching the device
+        // `scores` buffer geometry element-for-element for `max_divergence`); only this
+        // WINNER decode skips it. `n_bins == 0` is impossible here (caller-guarded);
+        // `n_bins == 1` yields an empty real-split range → no winner, which is correct.
+        let last_real = n_bins.saturating_sub(1);
+        for border in 0..last_real {
             let score = scores[feature * n_bins + border];
             // STRICT `>` (NOT `>=`): first-wins on equal gain → lowest (feature,bin) index.
             if score > best_score {

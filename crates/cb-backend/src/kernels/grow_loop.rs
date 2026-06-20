@@ -183,7 +183,12 @@ fn cpu_best_stump(
     let mut best: Option<(usize, usize)> = None;
     let mut best_score = f64::NEG_INFINITY;
     for feature in 0..n_features {
-        for bin in 0..n_bins {
+        // WR-05: enumerate only `0..n_bins - 1` real split borders, in EXACT lockstep
+        // with the device `find_optimal_split_kernel` argmin guard (`border < n_bins -
+        // 1`) and the `gpu_runtime` host winner decode. The trailing `bin == n_bins - 1`
+        // is the no-op (all-LEFT) non-split upstream never enumerates.
+        let last_real = n_bins.saturating_sub(1);
+        for bin in 0..last_real {
             let score = cpu_stump_score(der1, weight, cindex, n, feature, bin, scaled_l2);
             // STRICT `>` (first-wins on equal score, ascending (feature, bin) order).
             if score > best_score {
@@ -255,7 +260,11 @@ fn cpu_best_stump_cosine(
     let mut best: Option<(usize, usize)> = None;
     let mut best_score = f64::NEG_INFINITY;
     for feature in 0..n_features {
-        for bin in 0..n_bins {
+        // WR-05: enumerate only `0..n_bins - 1` real split borders (lockstep with the
+        // device argmin guard and the L2 sibling `cpu_best_stump`); the trailing border
+        // is the no-op non-split upstream never enumerates.
+        let last_real = n_bins.saturating_sub(1);
+        for bin in 0..last_real {
             let score = cpu_stump_score_cosine(der1, weight, cindex, n, feature, bin, scaled_l2);
             if score > best_score {
                 best_score = score;

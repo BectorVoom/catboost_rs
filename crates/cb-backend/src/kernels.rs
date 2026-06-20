@@ -1829,8 +1829,21 @@ pub(crate) const ARGMIN_SHMEM: usize = BLOCK_REDUCE_SHMEM;
 /// Generic over `F: Float` (AGENTS.md generics-float — no hard-coded float type). Every
 /// device read is under a POSITION bounds guard; the candidate/feature/bin VALUE ranges
 /// are validated HOST-SIDE in `launch_find_optimal_split_pointwise_into` before launch.
-/// if-as-STATEMENT only (CubeCL conditionals manual). `MINIMAL_SCORE` sentinel
-/// (`f64::NEG_INFINITY` analogue) is `F::new(f32::MIN as f64)` so any finite score wins.
+/// if-as-STATEMENT only (CubeCL conditionals manual). The `MINIMAL_SCORE` sentinel
+/// (`f64::NEG_INFINITY` analogue, matching the CPU oracle) is `F::new(f32::NEG_INFINITY)`
+/// so any finite candidate wins on the first strict-greater compare (WR-01).
+///
+/// # Real split borders only (WR-05)
+///
+/// A candidate's `border` ranges `0..n_bins`, but the trailing `border == n_bins - 1`
+/// puts ALL bins in the LEFT leaf / none in the RIGHT — a no-op (non-split) that upstream
+/// and the pairwise path (`n_splits = n_bins - 1`) never enumerate. The per-candidate
+/// `scores[c]` slot for that border IS still written (so the buffer geometry stays
+/// `n_features * n_bins` and the element-wise oracle compare is unchanged — no `-inf`
+/// sentinel that would NaN under that compare), but it is EXCLUDED from the argmin
+/// (`border < n_bins - 1` guard). The host winner decode (`gpu_runtime`) and the host
+/// reference winner (`score_split::reference_best_split`, `grow_loop::cpu_best_stump*`)
+/// skip the SAME trailing border in EXACT lockstep, so device and CPU oracle agree.
 #[cube(launch)]
 pub fn find_optimal_split_kernel<F: Float>(
     bin_sums: &Array<F>,
@@ -2024,9 +2037,24 @@ pub fn find_optimal_split_kernel<F: Float>(
         // tie-break: take the candidate only if its score STRICTLY exceeds the running
         // best (a later equal-gain candidate never displaces an earlier one → lowest
         // index wins on a tie, matching select_best_candidate's strict `>`).
-        if score > my_gain {
-            my_gain = score;
-            my_idx = c as u32;
+        //
+        // WR-05: the trailing `border == n_bins - 1` candidate puts ALL bins in the LEFT
+        // leaf / NONE in the RIGHT leaf — a NON-SPLIT (no-op) that upstream and the
+        // pairwise path (which uses `n_splits = n_bins - 1`) NEVER enumerate as a real
+        // split. It must NOT be argmin-eligible. We still WRITE `scores[c]` for that slot
+        // (so the per-candidate `scores` buffer geometry stays `n_features * n_bins` —
+        // buffer allocation, the `feature * n_bins + bin` index decode, and the
+        // element-wise `max_divergence` oracle compare are all unchanged, and no `-inf`
+        // sentinel that would produce NaN under that compare is introduced) but we SKIP
+        // the argmin update for it. The host reference winner decode
+        // (`reference_best_split` in `score_split.rs`) and the host winner decode
+        // (`gpu_runtime.rs`) skip the SAME trailing border in EXACT lockstep, so device
+        // and CPU oracle agree on a real (`border < n_bins - 1`) split.
+        if border < n_bins_usize - 1usize {
+            if score > my_gain {
+                my_gain = score;
+                my_idx = c as u32;
+            }
         }
 
         c += CUBE_DIM_X as usize;
