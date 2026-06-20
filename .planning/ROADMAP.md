@@ -626,7 +626,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 07.3-03-PLAN.md — Half-byte (4-bit) hist2 fill (distinct kernel family) + self-oracle
+- [x] 07.3-03-PLAN.md — Half-byte (4-bit) hist2 fill (distinct kernel family) + self-oracle
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
