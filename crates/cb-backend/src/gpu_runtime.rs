@@ -255,6 +255,17 @@ fn device_supports_f64_atomic_add<R: cubecl::Runtime>(
 /// `unwrap`/`expect`/`panic`/indexing in this production helper (workspace lints +
 /// D-13). The atomic path uses no wave/warp-size literal (the intra-cube fold reuses
 /// the wave-agnostic plane / `CUBE_DIM_X`-strided shared-mem reduce, D-09).
+///
+/// # Caller contract (WR-02 — best-effort atomic, NOT guaranteed atomic)
+///
+/// This is a BEST-EFFORT atomic helper: on a device that does not advertise f64
+/// atomic-add it returns a DETERMINISTIC host sum via the `HostSumFallback` branch.
+/// Callers that require the in-kernel atomic finalize (e.g. to observe the D-03
+/// cross-cube non-determinism) MUST inspect the returned [`AtomicFinalizePath`] and
+/// must NOT discard it with `let (sum, _) = ...` — doing so silently accepts the
+/// deterministic fallback. The `kernels::reduce` oracle asserts the returned path
+/// matches the device's advertised capability so this substitution cannot pass
+/// unnoticed in-env.
 pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFinalizePath)> {
     let n = input.len();
     if n == 0 {

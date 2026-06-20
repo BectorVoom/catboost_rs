@@ -283,6 +283,34 @@ fn block_reduce_atomic_finalize_matches_cpu_sum_and_reports_variance() {
          off in Phase 7.6, NOT here."
     );
 
+    // WR-02: the helper returns `(f64, AtomicFinalizePath)` and its `HostSumFallback`
+    // branch silently substitutes a DETERMINISTIC host sum for the "atomic" entry
+    // point. Assert that the returned path is consistent with what the device's f64
+    // atomic-add capability ACTUALLY advertises, so a silent atomic-to-deterministic
+    // mode switch on a device that is EXPECTED to support atomics surfaces as a
+    // failure rather than passing silently. On gfx1100 HIP does not advertise f64
+    // atomic-add, so `HostSumFallback` is the consistent (expected) path here.
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+    let advertises_atomic = {
+        let ty = <cubecl::prelude::Atomic<f64> as CubePrimitive>::as_type_native_unchecked();
+        client
+            .properties()
+            .atomic_type_usage(ty)
+            .contains(cubecl::features::AtomicUsage::Add)
+    };
+    let expected_path = if advertises_atomic {
+        AtomicFinalizePath::InKernelAtomicF64
+    } else {
+        AtomicFinalizePath::HostSumFallback
+    };
+    assert_eq!(
+        path, expected_path,
+        "launch_block_reduce_atomic_f64 returned {path:?} but the device advertises \
+         f64 atomic-add = {advertises_atomic} (expected {expected_path:?}) — a silent \
+         atomic-to-deterministic mode switch would otherwise pass unnoticed (WR-02)"
+    );
+
     // The atomic finalize must still land on the CPU baseline within a generous,
     // run-stable bound that catches a wrong fold without pinning the GPU-06 epsilon.
     assert!(
