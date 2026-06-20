@@ -848,10 +848,11 @@ fn all_losses_device_resident_handoff() {
     let approx: Vec<f64> = (0..n).map(|k| f64::from(k as u32) * 0.18 - 4.5).collect();
     let target: Vec<f64> = (0..n).map(|k| f64::from((k % 2) as u32)).collect();
 
-    // ONE client constructs all the read-backs (test-only); each handle is allocated
-    // by its launch helper's own internal client, but the handle VALUES are read here
-    // after each launch completes.
-    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    // The read-backs are the ONLY host folds in this whole test, and they all happen
+    // AFTER every launch helper returned a handle (proving the seam is handle-in ->
+    // handles-out for all four families). Each handle is allocated by its launch
+    // helper's own internal client; the `read_handle` helper below builds its own
+    // device/client for the read-back, so no top-level `device` binding is needed.
 
     // Small read-back helper: a handle is read back ONCE (test-only) through a fresh
     // client of the SAME runtime. (Production never does this on the seam.)
@@ -929,12 +930,6 @@ fn all_losses_device_resident_handoff() {
         assert!(r1 <= 1e-9 || a1 <= 1e-9, "Focal der1 handoff diverged: abs={a1:.3e} rel={r1:.3e}");
         assert!(r2 <= 1e-9 || a2 <= 1e-9, "Focal der2 handoff diverged: abs={a2:.3e} rel={r2:.3e}");
     }
-
-    // The `device` binding above documents the single-runtime hand-off surface; the
-    // read-backs are the ONLY host folds in this whole test, and they all happen
-    // AFTER every launch helper returned a handle (proving the seam is handle-in ->
-    // handles-out for all four families).
-    let _ = device;
 }
 
 #[test]
