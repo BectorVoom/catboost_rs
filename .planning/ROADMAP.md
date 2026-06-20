@@ -729,7 +729,15 @@ Plans:
   3. The `rocm` GPU test suite runs locally/manually in-env on gfx1100 and is the authoritative GPU gate — **never run in GitHub Actions** (standing ROCm CI constraint, D-06); `wgpu`/`cuda` remain compile-gated stubs, not validation gates (D-07).
   4. The wave32-native validation scope is documented: wave-size-agnostic correctness is validated on gfx1100 (wave32); literal wave64 (CDNA/MI-series) execution remains an explicit documented gap, not closed by this phase (D-09).
 
-**Plans**: TBD
+**Plans**: 2 plans (2 waves)
+
+**Wave 1**
+
+- [ ] 07.6-01-PLAN.md — GPU-06 measurement harness: new `#[cfg(test)] mod gpu_tolerance.rs` aggregating per-family divergence + N>=30 variance with stddev + observed_max+3σ + end-to-end GPU-vs-CPU leaf-value measurement (structure exact, leaf values REPORTED); emits [GPU-06 EVIDENCE] on rocm gfx1100
+
+**Wave 2** *(blocked on Wave 1; has human checkpoints — autonomous: false)*
+
+- [ ] 07.6-02-PLAN.md — Run full rocm suite green in-env (GPU-03 gate, never in CI) + propose concrete epsilon & obtain HARD HUMAN sign-off (D-7.6-07) + write 07.6-GPU-TOLERANCE.md (signed-off ε, vs-Rust-CPU-path, wave32 scope/wave64 gap) + flip REQUIREMENTS GPU-03/GPU-06
 
 ### Phase 8: Python Bindings, Dual API & Packaging
 
