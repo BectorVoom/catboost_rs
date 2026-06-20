@@ -10,8 +10,10 @@ workspace = true
 [dependencies]
 # D-02: cb-backend is the SINGLE feature-gated runtime-alias owner. As of Phase 3
 # (D-01) the `cpu` arm stands up the real CubeCL CPU runtime here — `cubecl` and
-# `bytemuck` live in THIS crate ONLY (D-03 keeps `cb-compute` cubecl-free). The
-# `wgpu`/`cuda`/`rocm` arms remain inert placeholders until Phase 7.
+# `bytemuck` live in THIS crate ONLY (D-03 keeps `cb-compute` cubecl-free). As of
+# Phase 7.1 (D-7.1-01) the `wgpu`/`cuda`/`rocm` arms resolve to real CubeCL runtimes
+# (`WgpuRuntime`/`CudaRuntime`/`HipRuntime`) — see `lib.rs` `SelectedRuntime` — and
+# are no longer inert placeholders.
 # NO per-backend crates. NOTE: `anyhow` is intentionally absent (D-14 structural
 # ban). Do not add it.
 cubecl.workspace = true
