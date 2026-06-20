@@ -621,6 +621,7 @@ dependencies = [
  "bytemuck",
  "cb-compute",
  "cb-core",
+ "cb-train",
  "cubecl",
 ]
 

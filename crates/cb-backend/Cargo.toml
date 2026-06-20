@@ -36,3 +36,16 @@ cpu = ["cubecl/cpu"]
 wgpu = ["cubecl/wgpu"]
 cuda = ["cubecl/cuda"]
 rocm = ["cubecl/hip"]
+
+[dev-dependencies]
+# D-7.5-04 read-only CPU cross-oracle: the Phase-7.5 score/split self-oracle
+# (`kernels/score_split.rs`) compares the device argmin against `cb-train`'s
+# `select_best_candidate` (strict first-wins / lowest-index tie-break) over an
+# ascending (feature, bin) `Candidate` vector. `cb-train` is a TEST-ONLY (dev)
+# dependency here — it is NEVER linked into the normal `cb-backend` build graph, so
+# the SC-4 boundary (cubecl stays in `cb-backend`; `cb-train` stays cubecl-free) is
+# preserved. The build graph has a normal `cb-train -> cb-backend` edge, so this
+# dev edge forms a cargo-permitted dev-dependency cycle (the exact pattern
+# `cb-train`'s own `cb-model` dev-dep uses): dev-dependency cycles are allowed
+# because they never affect the production link.
+cb-train = { path = "../cb-train" }

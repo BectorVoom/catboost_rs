@@ -1753,3 +1753,17 @@ mod pointwise_hist;
 // run + cuda compile-only).
 #[cfg(test)]
 mod pairwise_hist;
+
+// Device-resident pointwise L2 split-score + deterministic split-argmin self-oracle
+// (GPU-01 score/split slice, Phase 7.5 Plan A — the scorer SIBLING of `pointwise_hist`):
+// the GPU `find_optimal_split_kernel` (L2 arm) over `SelectedRuntime`, computing the
+// per-(feature,bin) L2 split score from the FROZEN 7.3 device-resident 2-channel
+// histogram and a deterministic block-reduce argmin (lowest-index tie-break), is
+// cross-oracled against the FROZEN CPU references `cb_compute::l2_split_score` (score)
+// and `cb_train::select_best_candidate` (winner / strict first-wins). Lives in
+// `kernels/score_split.rs`, mounted at `kernels::score_split`. Like
+// `pointwise_hist`/`pairwise_hist` it runs over the generic `SelectedRuntime`, so it
+// builds/runs under EVERY backend (the rocm in-env oracle on gfx1100 + the wgpu host run
+// + cuda compile-only). REPORTS divergence; the GPU-06 epsilon is 7.6's job.
+#[cfg(test)]
+mod score_split;
