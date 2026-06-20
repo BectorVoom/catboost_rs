@@ -54,7 +54,7 @@ use cubecl::prelude::*;
 use cb_core::sum_f64;
 
 use crate::gpu_runtime::{
-    launch_block_reduce_atomic_f64, launch_der_binary, launch_der_unary,
+    grow_oblivious_tree, launch_block_reduce_atomic_f64, launch_der_binary, launch_der_unary,
     launch_find_optimal_split_pointwise, launch_pairwise_hist, launch_pointwise_hist2,
     AtomicFinalizePath, DerBinaryKernel, DerUnaryKernel,
 };
@@ -381,6 +381,80 @@ fn make_pair_fixture(
     (pair_i, pair_j, pair_weight, cindex)
 }
 
+/// The FORWARD-bit leaf index (`grow_loop.rs:77-85`): split `i` → bit `i`. The
+/// parity-critical convention `partition_split_kernel` replicates (Pitfall 6).
+fn cpu_leaf_index(passes: &[bool]) -> usize {
+    let mut idx = 0usize;
+    for (i, &p) in passes.iter().enumerate() {
+        if p {
+            idx |= 1usize << i;
+        }
+    }
+    idx
+}
+
+/// The inline CPU L2 stump score of ONE `(feature, bin)` split (`grow_loop.rs:125-158`),
+/// forward-bit partition `cindex > bin`, each side folded through `sum_f64` (D-08).
+fn cpu_stump_score(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    feature: usize,
+    bin: usize,
+    scaled_l2: f64,
+) -> f64 {
+    let mut left_der: Vec<f64> = Vec::new();
+    let mut left_w: Vec<f64> = Vec::new();
+    let mut right_der: Vec<f64> = Vec::new();
+    let mut right_w: Vec<f64> = Vec::new();
+    for obj in 0..n {
+        if (cindex[feature * n + obj] as usize) > bin {
+            right_der.push(der1[obj]);
+            right_w.push(weight[obj]);
+        } else {
+            left_der.push(der1[obj]);
+            left_w.push(weight[obj]);
+        }
+    }
+    let left = cb_compute::LeafStats {
+        sum_weighted_delta: sum_f64(&left_der),
+        sum_weight: sum_f64(&left_w),
+    };
+    let right = cb_compute::LeafStats {
+        sum_weighted_delta: sum_f64(&right_der),
+        sum_weight: sum_f64(&right_w),
+    };
+    cb_compute::l2_split_score(&[left, right], scaled_l2)
+}
+
+/// The inline CPU greedy LEVEL-0 search — strict-first-wins L2 argmax in ascending
+/// `(feature, bin)` order (`grow_loop.rs:168-190`, STRICT `>` tie-break — the
+/// load-bearing first-wins / lowest-index rule, Pitfall 1). TRANSCRIBED inline (never
+/// `cb-train`). Returns the chosen `(feature, bin)` or `None`.
+fn cpu_best_stump(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    n_features: usize,
+    n_bins: usize,
+    scaled_l2: f64,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for feature in 0..n_features {
+        for bin in 0..n_bins {
+            let score = cpu_stump_score(der1, weight, cindex, n, feature, bin, scaled_l2);
+            if score > best_score {
+                best_score = score;
+                best = Some((feature, bin));
+            }
+        }
+    }
+    best
+}
+
 // ===========================================================================
 // Task 1 — Test A: the per-family aggregation evidence roll-up.
 // ===========================================================================
@@ -584,4 +658,115 @@ fn gpu06_variance_with_stddev_reports_evidence() {
         max_rel <= TOL_BOUND_F64 || max_abs <= TOL_BOUND_F64,
         "atomic-finalize reduce diverged too far from baseline: abs={max_abs:.3e} rel={max_rel:.3e}"
     );
+}
+
+// ===========================================================================
+// Task 2 — Test C: end-to-end GPU-vs-CPU leaf-value measurement (structure EXACT,
+// leaf values REPORTED into the evidence roll-up).
+// ===========================================================================
+
+/// The run-stable leaf-VALUE divergence bound, the SAME channel-driven value as
+/// `grow_loop::LEAF_BOUND` (f32 ~1e-3 on wgpu, f64 ~1e-9 elsewhere): REPORTED, NOT the
+/// GPU-06 epsilon. Aliased to [`TOL_BOUND_F64`] so the module edits ONE place.
+const LEAF_BOUND: f64 = TOL_BOUND_F64;
+
+/// Drive `grow_oblivious_tree` over `SelectedRuntime` on the LARGEST-N multi-cube
+/// fixture (n=10000 — maximizing cross-cube atomic contention for the variance/headroom
+/// story, D-7.6-01), assert the tree STRUCTURE matches the inline CPU greedy
+/// first-wins search EXACTLY (split `(feature, bin)` sequence + per-object `leaf_of` ==
+/// `leaf_index`), then REPORT the leaf-value `(abs, rel)` divergence vs
+/// `cb_compute::calc_average` over the SAME partition. These are the numbers Phase 7.5
+/// left REPORTED-not-signed-off (07.5-03/04/06) — the fresh measurement target for the
+/// gate. Modeled on `grow_loop.rs:467-549` (`matches_cpu_greedy_search`); STRUCTURE is
+/// the STRICT bar, leaf VALUES are REPORTED (the GPU-06 epsilon is Plan 02's job).
+#[test]
+fn gpu06_end_to_end_leaf_values_report_evidence() {
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let depth = 1usize; // the MVP vertical slice (the strict O(1)-per-level device path)
+    let l2 = 3.0_f64;
+
+    // Prefer the largest-N multi-cube fixture (n=10000 >> CUBE_DIM=32 → many cubes race
+    // into the cross-cube finalize, the atomic-contention setup). n=1000 is included so
+    // the evidence covers more than one scale.
+    for &n in &[1000usize, 10_000usize] {
+        let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+
+        // The per-tree L2 scaling — cb_compute::scale_l2_reg(l2, Σweight, n) — the FROZEN
+        // scaling the CPU oracle and the device leaf-value step both consume.
+        let sum_w = sum_f64(&weight);
+        let scaled_l2 = cb_compute::scale_l2_reg(l2, sum_w, n);
+
+        // Device: grow the tree host-light over SelectedRuntime (the rocm arm in-env).
+        let tree = grow_oblivious_tree(
+            &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2,
+            crate::kernels::SCORE_FN_L2,
+        )
+        .expect("grow_oblivious_tree must succeed on the clear-margin fixture");
+
+        // CPU reference: the strict-first-wins level-0 stump (inline transcription).
+        let cpu_split = cpu_best_stump(&der1, &weight, &cindex, n, n_features, n_bins, scaled_l2)
+            .expect("CPU reference must find a candidate split");
+
+        // (A) STRUCTURE — the split (feature, bin) sequence must match EXACTLY.
+        assert_eq!(
+            tree.splits.len(),
+            depth,
+            "device tree must have exactly `depth` splits (n={n})"
+        );
+        let (dev_feat, dev_bin) = tree.splits[0];
+        assert_eq!(
+            (dev_feat as usize, dev_bin as usize),
+            cpu_split,
+            "device split (feature, bin) must match CPU greedy first-wins (n={n}): \
+             device=({dev_feat}, {dev_bin}) cpu={cpu_split:?}"
+        );
+
+        // (B) STRUCTURE — per-object leaf_of must equal CPU leaf_index over the SAME
+        //     split (forward-bit, Pitfall 6) for EVERY object.
+        let (cpu_feature, cpu_bin) = cpu_split;
+        let cpu_leaf_of: Vec<u32> = (0..n)
+            .map(|obj| {
+                let passes = [(cindex[cpu_feature * n + obj] as usize) > cpu_bin];
+                cpu_leaf_index(&passes) as u32
+            })
+            .collect();
+        assert_eq!(
+            tree.leaf_of, cpu_leaf_of,
+            "device leaf_of must equal CPU leaf_index forward-bit (n={n})"
+        );
+
+        // (C) LEAF VALUES — REPORTED divergence vs cb_compute::calc_average over the SAME
+        //     leaf partition (NOT signed off — Plan 02 owns the epsilon).
+        let n_leaves = 1usize << depth;
+        let mut cpu_leaf_values = vec![0.0_f64; n_leaves];
+        for (leaf, slot) in cpu_leaf_values.iter_mut().enumerate() {
+            let mut der_seg: Vec<f64> = Vec::new();
+            let mut w_seg: Vec<f64> = Vec::new();
+            for obj in 0..n {
+                if cpu_leaf_of[obj] as usize == leaf {
+                    der_seg.push(der1[obj]);
+                    w_seg.push(weight[obj]);
+                }
+            }
+            *slot = cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+        }
+        assert_eq!(
+            tree.leaf_values.len(),
+            cpu_leaf_values.len(),
+            "device leaf_values length must equal n_leaves (n={n})"
+        );
+        let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
+        println!(
+            "[GPU-06 EVIDENCE] family=end_to_end_leaf_values channel=f64(rocm/gfx1100) n={n} \
+             split={cpu_split:?} structure=EXACT observed_max_abs={abs:.3e} \
+             observed_max_rel={rel:.3e} observed_max_plus_3sigma={abs:.3e} \
+             AtomicFinalizePath=device-resident-grow-loop (bound={LEAF_BOUND:.0e})"
+        );
+        assert!(
+            rel <= LEAF_BOUND || abs <= LEAF_BOUND,
+            "device leaf values (n={n}) diverged beyond the REPORTED bound: \
+             abs={abs:.3e} rel={rel:.3e} (bound={LEAF_BOUND:.0e})"
+        );
+    }
 }
