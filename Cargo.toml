@@ -30,6 +30,10 @@ polars      = { version = "0.54.4", default-features = false, features = ["dtype
 # Phase-3 CubeCL CPU compute seam (D-01/D-03). Wired into `cb-backend` ONLY —
 # never into `cb-compute` (D-03 keeps the generic boundary cubecl-free). Versions
 # confirmed via `cargo search` (cubecl 0.10.0; bytemuck 1.x floor) and the CubeCL
-# manual (`features=["cpu"]`, `bytemuck` for host<->device transfer).
-cubecl      = { version = "0.10.0", features = ["cpu"] }
+# manual (`bytemuck` for host<->device transfer).
+# Phase-7.1 (D-7.1-02 / RESEARCH Pitfall 1): the per-backend cubecl facade
+# feature (cpu/wgpu/cuda/hip) is selected in `cb-backend`'s feature table, NOT
+# pinned here — an unconditional `features=["cpu"]` would force `cpu` onto every
+# consumer via feature unification and defeat a cpu-free `--features rocm` build.
+cubecl      = { version = "0.10.0" }
 bytemuck    = { version = "1", features = ["extern_crate_std"] }

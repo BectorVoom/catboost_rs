@@ -22,10 +22,15 @@ cb-compute = { path = "../cb-compute" }
 cb-core = { path = "../cb-core" }
 
 [features]
-# Compile-time backend selection only — NO runtime dispatch (D-02). All arms are
-# inert placeholders in Phase 1.
+# Compile-time backend selection only — NO runtime dispatch (D-02). Each backend
+# feature forwards to its cubecl facade feature (D-7.1-02 / RESEARCH Pitfall 1):
+# selection lives HERE, not on the workspace cubecl pin, so a
+# `--no-default-features --features rocm` build is cpu-free (pulls only cubecl/hip).
+# NOTE: rocm -> `cubecl/hip` (the cubecl facade names the AMD/ROCm runtime `hip`).
+# Do NOT add `cubecl-hip-sys/hip_xxx` here — the sys build.rs auto-detects the HIP
+# patch from `hipconfig` and panics on manual feature pinning (RESEARCH Pitfall 2).
 default = ["cpu"]
-cpu = []
-wgpu = []
-cuda = []
-rocm = []
+cpu = ["cubecl/cpu"]
+wgpu = ["cubecl/wgpu"]
+cuda = ["cubecl/cuda"]
+rocm = ["cubecl/hip"]
