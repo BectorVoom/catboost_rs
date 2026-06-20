@@ -76,6 +76,7 @@ use cb_core::sum_f64;
 
 use crate::gpu_runtime::{
     launch_pairwise_hist, launch_pairwise_hist_8bit, launch_pairwise_hist_8bit_handle,
+    launch_pairwise_hist_binary, launch_pairwise_hist_binary_handle,
     launch_pairwise_hist_half_byte, launch_pairwise_hist_half_byte_handle,
     launch_pairwise_hist_handle,
 };
@@ -491,6 +492,93 @@ fn half_byte() {
         assert!(
             rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
             "half-byte device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+        );
+    }
+}
+
+#[test]
+fn binary() {
+    // The binary (1-bit, 2-bin) pairwise fill self-oracle (D-7.4-02 — the structurally
+    // DISTINCT binary family; upstream `pairwise_hist_binary.cu`). The binary line is a
+    // FIXED 2-bin (1-bit) histogram (a bin COUNT, NOT a warp literal), and the family takes
+    // NO one-hot overlay upstream (there is no `pairwise_hist_binary_one_hot.cu`). It is a
+    // SEPARATE `#[cube]` symbol with a SEPARATE launch arm — exercised here through
+    // `launch_pairwise_hist_binary`. The upstream 2x2 `(invBin1&invBin2)|...` channel
+    // decomposition reduces to the SAME non-one-hot `Compare(bin1,bin2)->histId` predicate
+    // the other families use (validated bit-exact by this oracle).
+    //
+    // The device 4-channel histogram (n_bins = 2) must match the ordered host reference
+    // within the REPORTED bound over the edge cases n_pairs=0 (empty, NO launch/read-back),
+    // n_pairs=1, n_pairs=37 (non-cube-multiple), and large N. The reported max abs/rel
+    // divergence is printed (REPORT-not-sign-off, D-7.4-05).
+    let n_features = 2usize;
+    let n_objects = 8usize; // bins are masked to {0,1}; n_objects only sizes the cindex stride
+    let n_bins = 2usize; // the distinct binary line size (1 << 1)
+    // The binary family has no one-hot overlay; the host reference is the non-one-hot
+    // Compare path (the kernel hard-codes it).
+    let one_hot = false;
+
+    // Empty (n_pairs=0): NO launch, NO read-back (Pitfall 5).
+    {
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, 0);
+        let device =
+            launch_pairwise_hist_binary(&pi, &pj, &pw, &cindex, n_objects, n_bins, n_features)
+                .unwrap();
+        assert!(
+            device.is_empty(),
+            "empty input must yield an empty binary pairwise histogram (no launch)"
+        );
+    }
+
+    for &n_pairs in &[1usize, 37usize, 10_000usize] {
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+        let device =
+            launch_pairwise_hist_binary(&pi, &pj, &pw, &cindex, n_objects, n_bins, n_features)
+                .unwrap();
+        let baseline = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        );
+
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "device binSums length must equal the host-reference 4-channel layout (binary, n_pairs={n_pairs})"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[pair_hist binary f64 n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+        );
+        assert!(
+            rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+            "binary pairwise hist (n_pairs={n_pairs}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
+        );
+    }
+
+    // Device-residency hand-off (SC-3): the binary handle arm returns the 4-channel
+    // binSums as a device HANDLE with NO host fold on the seam; read it back ONCE here.
+    {
+        let n_pairs = 50usize;
+        let (pi, pj, pw, cindex) = make_pair_fixture(n_objects, n_features, n_bins, n_pairs);
+        let handle = launch_pairwise_hist_binary_handle(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features,
+        )
+        .unwrap();
+        let device = read_pair_handle(handle);
+        let baseline = host_reference_pairwise_hist(
+            &pi, &pj, &pw, &cindex, n_objects, n_bins, n_features, one_hot,
+        );
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "binary binSums handle length must equal the host-reference 4-channel layout length"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[pair_hist binary handoff n_pairs={n_pairs}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}"
+        );
+        assert!(
+            rel <= PAIR_HIST_BOUND || abs <= PAIR_HIST_BOUND,
+            "binary device-resident binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={PAIR_HIST_BOUND:.0e})"
         );
     }
 }
