@@ -407,6 +407,7 @@ mod single_tree {
             // Device: grow the tree host-light over SelectedRuntime.
             let tree = grow_oblivious_tree(
                 &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2,
+                crate::kernels::SCORE_FN_L2,
             )
             .expect("grow_oblivious_tree must succeed on the clear-margin fixture");
 
@@ -488,6 +489,7 @@ mod single_tree {
 
         let err = grow_oblivious_tree(
             &der1, &weight, &cindex, &indices, n_bins, n_features, 2, scaled_l2,
+            crate::kernels::SCORE_FN_L2,
         )
         .expect_err("depth > 1 must surface a typed forward-dependency error, not a stump");
         // It must be the OutOfRange forward-dependency guard (not a panic / wrong tree).

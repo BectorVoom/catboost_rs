@@ -65,7 +65,8 @@ use crate::kernels::{
     partition_split_kernel, partition_update_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
-    quantile_gradient_kernel, scan_update_pointwise_kernel, SCORE_FN_L2,
+    quantile_gradient_kernel, scan_update_pointwise_kernel, SCORE_FN_COSINE, SCORE_FN_L2,
+    SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2,
 };
 use crate::SelectedRuntime;
 
@@ -1385,6 +1386,12 @@ pub struct BestSplit {
 /// [`CbError`] BEFORE launch (the FROZEN 7.3 guards in `launch_pointwise_hist2_into`).
 /// No `unwrap`/`expect`/`panic`/indexing in this production helper (workspace lints +
 /// D-13).
+///
+/// `score_fn` selects the comptime score calcer arm of [`find_optimal_split_kernel`]:
+/// [`SCORE_FN_L2`] (Plan A), or the Plan-E [`SCORE_FN_COSINE`] /
+/// [`SCORE_FN_SOLAR_L2`] / [`SCORE_FN_LOO_L2`] / [`SCORE_FN_SAT_L2`] — each transcribed
+/// VERBATIM from the FROZEN `cb-compute/src/score.rs`. An unknown `score_fn` surfaces a
+/// typed [`CbError::OutOfRange`] BEFORE launch (no silent wrong-arm dispatch).
 #[allow(clippy::too_many_arguments)]
 pub fn launch_find_optimal_split_pointwise(
     der1: &[f64],
@@ -1394,11 +1401,12 @@ pub fn launch_find_optimal_split_pointwise(
     n_bins: usize,
     n_features: usize,
     scaled_l2: f64,
+    score_fn: u32,
 ) -> CbResult<(Option<BestSplit>, Vec<f64>)> {
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
     launch_find_optimal_split_pointwise_into(
-        &client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2,
+        &client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2, score_fn,
     )
 }
 
@@ -1418,8 +1426,24 @@ fn launch_find_optimal_split_pointwise_into(
     n_bins: usize,
     n_features: usize,
     scaled_l2: f64,
+    score_fn: u32,
 ) -> CbResult<(Option<BestSplit>, Vec<f64>)> {
     let n = der1.len();
+
+    // Reject an unknown score-fn selector BEFORE any launch (no silent wrong-arm
+    // dispatch / no garbage score buffer). The kernel only monomorphizes the five
+    // transcribed arms; an out-of-range selector is a caller bug, surfaced typed.
+    if score_fn != SCORE_FN_L2
+        && score_fn != SCORE_FN_COSINE
+        && score_fn != SCORE_FN_SOLAR_L2
+        && score_fn != SCORE_FN_LOO_L2
+        && score_fn != SCORE_FN_SAT_L2
+    {
+        return Err(CbError::OutOfRange(format!(
+            "unknown score_fn selector ({score_fn}); expected one of \
+             L2/Cosine/SolarL2/LOOL2/SatL2"
+        )));
+    }
 
     // Empty short-circuit FIRST (Pitfall 3/5): no histogram, no launch, no 0-len read.
     if n == 0 || n_features == 0 || n_bins == 0 {
@@ -1485,7 +1509,7 @@ fn launch_find_optimal_split_pointwise_into(
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_features as u32,
             n_bins_u32,
-            SCORE_FN_L2,
+            score_fn,
         );
         (scores_h, best_gain_h, best_idx_h)
     };
@@ -1507,7 +1531,7 @@ fn launch_find_optimal_split_pointwise_into(
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_features as u32,
             n_bins_u32,
-            SCORE_FN_L2,
+            score_fn,
         );
         (scores_h, best_gain_h, best_idx_h)
     };
@@ -2062,6 +2086,12 @@ pub struct GrownTree {
 /// No `unwrap`/`expect`/`panic`/indexing in this production driver (workspace lints +
 /// D-13). Threads ONE `&client` through the whole tree (Pitfall 3); never reads a 0-len
 /// handle.
+///
+/// `score_fn` selects the per-level split-score calcer ([`SCORE_FN_L2`] /
+/// [`SCORE_FN_COSINE`] / [`SCORE_FN_SOLAR_L2`] / [`SCORE_FN_LOO_L2`] /
+/// [`SCORE_FN_SAT_L2`]) — Cosine is a primary path alongside L2 (D-7.5-01). It is
+/// forwarded verbatim to [`launch_find_optimal_split_pointwise_into`], which rejects an
+/// unknown selector with a typed error before launch.
 #[allow(clippy::too_many_arguments)]
 pub fn grow_oblivious_tree(
     der1: &[f64],
@@ -2072,11 +2102,12 @@ pub fn grow_oblivious_tree(
     n_features: usize,
     depth: usize,
     scaled_l2: f64,
+    score_fn: u32,
 ) -> CbResult<GrownTree> {
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
     grow_oblivious_tree_into(
-        &client, der1, weight, cindex, indices, n_bins, n_features, depth, scaled_l2,
+        &client, der1, weight, cindex, indices, n_bins, n_features, depth, scaled_l2, score_fn,
     )
 }
 
@@ -2098,6 +2129,7 @@ fn grow_oblivious_tree_into(
     n_features: usize,
     depth: usize,
     scaled_l2: f64,
+    score_fn: u32,
 ) -> CbResult<GrownTree> {
     let n = der1.len();
 
@@ -2169,7 +2201,7 @@ fn grow_oblivious_tree_into(
         //     descriptor crosses back (the score kernel's per-candidate vector is the Plan-A
         //     self-oracle observation, not read here in the driver — D-05).
         let (best, _scores) = launch_find_optimal_split_pointwise_into(
-            client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2,
+            client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2, score_fn,
         )?;
 
         // (2) The O(1) host integer split decision. A level with no candidate at all is a
@@ -2426,8 +2458,11 @@ fn grow_boosting_pass_into(
         //     on the threaded client. The bulk histogram / partition / doc-routing stays
         //     device-resident inside this call; only the O(1) BestSplit per level + the
         //     2^depth part-stats + leaf_of cross back (the existing D-05 crossings).
+        // The multi-tree Plain-boosting pass scores with L2 (Plan 04 scope); the
+        // Cosine/Solar/LOO/Sat arms are exercised single-tree in Plan E.
         let mut tree = grow_oblivious_tree_into(
             client, &der1, weight, cindex, indices, n_bins, n_features, depth, scaled_l2,
+            SCORE_FN_L2,
         )?;
 
         // (2) Scale the tree's leaf values by `learning_rate` in place — the stored

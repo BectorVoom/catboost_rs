@@ -57,6 +57,9 @@ use cb_core::sum_f64;
 use crate::gpu_runtime::{
     launch_find_optimal_split_pointwise, launch_scan_update_pointwise, BestSplit,
 };
+use crate::kernels::{
+    SCORE_FN_COSINE, SCORE_FN_L2, SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2,
+};
 
 /// The asserted run-stable SCORE divergence bound for the device L2 split score. The
 /// device score fold is f64 on rocm/cuda/cpu (HIP/CUDA support/emulate the f64 atomic
@@ -257,7 +260,7 @@ fn score_l2_matches_cpu_oracle() {
         let (der1, weight, cindex, indices) = make_score_fixture(0, n_features, n_bins);
         let scaled_l2 = scale_l2_reg(l2, 0.0, 0);
         let res = launch_find_optimal_split_pointwise(
-            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, SCORE_FN_L2,
         );
         assert!(res.is_ok(), "empty score/split must construct without faulting");
         let (best, dev_scores) = res.unwrap();
@@ -273,7 +276,7 @@ fn score_l2_matches_cpu_oracle() {
         let total_w: f64 = sum_f64(&weight);
         let scaled_l2 = scale_l2_reg(l2, total_w, n);
         let (_best, dev_scores) = launch_find_optimal_split_pointwise(
-            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, SCORE_FN_L2,
         )
         .unwrap();
         let baseline = host_reference_scores(
@@ -311,7 +314,7 @@ fn argmin_clear_margin_matches_select_best_candidate() {
         let total_w: f64 = sum_f64(&weight);
         let scaled_l2 = scale_l2_reg(l2, total_w, n);
         let (best, dev_scores) = launch_find_optimal_split_pointwise(
-            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+            &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, SCORE_FN_L2,
         )
         .unwrap();
         let baseline_scores = host_reference_scores(
@@ -371,7 +374,7 @@ fn argmin_lowest_index_tie_break_matches_select_best_candidate() {
     let scaled_l2 = scale_l2_reg(l2, total_w, n);
 
     let (best, dev_scores) = launch_find_optimal_split_pointwise(
-        &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2,
+        &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, SCORE_FN_L2,
     )
     .unwrap();
     let baseline_scores =
@@ -593,5 +596,246 @@ mod scan {
             "n_bins ({n_bins}) > CUBE_DIM must surface a typed error (cross-cube carry \
              is the tracked forward dependency), NOT a silent wrong scan"
         );
+    }
+}
+
+// ===========================================================================
+// Score-CALCER FAMILY self-oracle (Phase 7.5 Plan E, GPU-01 score variants; D-7.5-01).
+// The `find_optimal_split_kernel` comptime `score_fn` selector gains the
+// Cosine/NewtonCosine, SolarL2, LOOL2, and SatL2 arms ALONGSIDE the Plan-A L2 arm.
+// Each device arm's per-candidate score is cross-oracled against its FROZEN
+// `cb-compute/src/score.rs` reference over the SAME reduced `LeafStats`:
+//   - Cosine -> `cb_compute::cosine_split_score`
+//   - Solar/LOO/Sat -> `cb_compute::multi_dim_split_score(EScoreFunction::{SolarL2,
+//     LOOL2,SatL2}, ...)` (the SINGLE-dimension dispatch; the two left/right leaves are
+//     one dimension's per-leaf stats)
+// within a REPORTED (not signed-off, D-7.5-05) f64 tolerance, AND the device argmin
+// under each fn picks the SAME (feature, bin) as the CPU reference over the same fn
+// (STRUCTURE, the strict D-7.5-06 bar). Degenerate-leaf fixtures exercise every guard
+// (Cosine 1e-100 seed; Solar weight>1e-20; LOO weight>1/weight>0; Sat weight>2/weight>0)
+// — the device must yield 0.0/finite, never NaN/Inf (T-07.5-05-01).
+//
+// D-7.5-04 boundary: `cb_compute` is the READ-ONLY oracle (already a dep); `cb-train` is
+// NOT imported (the Plan-A feature-unification landmine). The split-winner reference is
+// the inline `reference_best_split` (transcribed from `tree.rs:291-302`).
+// ===========================================================================
+
+mod variants {
+    use super::*;
+    use cb_compute::{cosine_split_score, multi_dim_split_score, EScoreFunction};
+
+    /// The ORDERED host reference per-(feature, bin) split SCORE under an arbitrary score
+    /// FUNCTION — the variant sibling of [`super::host_reference_scores`]. It reduces each
+    /// feature's objects into a LEFT leaf (bin <= border) and a RIGHT leaf (bin > border)
+    /// in ascending object order via [`sum_f64`] (the single sanctioned ordered reduction),
+    /// builds the two [`LeafStats`], and dispatches to the matching FROZEN `cb-compute`
+    /// oracle: Cosine -> `cosine_split_score`; Solar/LOO/Sat -> `multi_dim_split_score`
+    /// with the two leaves as ONE dimension's per-leaf stats (the dim=1 dispatch the device
+    /// scalar kernel mirrors). Returns a flat `Vec<f64>` indexed `feature * n_bins + bin`
+    /// (the SAME candidate enumeration order the device kernel uses).
+    fn host_reference_variant_scores(
+        der1: &[f64],
+        weight: &[f64],
+        cindex: &[u32],
+        indices: &[u32],
+        n_bins: usize,
+        n_features: usize,
+        scaled_l2: f64,
+        score_fn: EScoreFunction,
+    ) -> Vec<f64> {
+        let n = der1.len();
+        let mut scores = vec![0.0_f64; n_features * n_bins];
+        for feature in 0..n_features {
+            for border in 0..n_bins {
+                let mut left_der: Vec<f64> = Vec::new();
+                let mut left_w: Vec<f64> = Vec::new();
+                let mut right_der: Vec<f64> = Vec::new();
+                let mut right_w: Vec<f64> = Vec::new();
+                for &obj in indices.iter() {
+                    let obj = obj as usize;
+                    let bin = cindex[feature * n + obj] as usize;
+                    if bin <= border {
+                        left_der.push(der1[obj]);
+                        left_w.push(weight[obj]);
+                    } else {
+                        right_der.push(der1[obj]);
+                        right_w.push(weight[obj]);
+                    }
+                }
+                let left = LeafStats {
+                    sum_weighted_delta: sum_f64(&left_der),
+                    sum_weight: sum_f64(&left_w),
+                };
+                let right = LeafStats {
+                    sum_weighted_delta: sum_f64(&right_der),
+                    sum_weight: sum_f64(&right_w),
+                };
+                let s = match score_fn {
+                    EScoreFunction::Cosine | EScoreFunction::NewtonCosine => {
+                        cosine_split_score(&[left, right], scaled_l2)
+                    }
+                    other => {
+                        // Solar/LOO/Sat (and L2) ride multi_dim_split_score with the two
+                        // leaves as a single dimension's per-leaf stats (dim=1).
+                        multi_dim_split_score(other, &[vec![left, right]], scaled_l2)
+                    }
+                };
+                scores[feature * n_bins + border] = s;
+            }
+        }
+        scores
+    }
+
+    /// Run ONE score-function arm over the clear-margin fixture for n in {1, 37, 10_000},
+    /// asserting (1) the device per-candidate score matches the matching `cb-compute`
+    /// oracle within the REPORTED [`super::SCORE_BOUND`], and (2) the device argmin picks
+    /// the SAME (feature, bin) as the CPU reference over the SAME fn (the strict STRUCTURE
+    /// bar). `score_fn_sel` is the kernel comptime selector; `oracle_fn` is its
+    /// `cb-compute` reference.
+    fn assert_arm_matches_oracle(
+        label: &str,
+        score_fn_sel: u32,
+        oracle_fn: EScoreFunction,
+    ) {
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let l2 = 3.0_f64;
+
+        for &n in &[1usize, 37usize, 10_000usize] {
+            let (der1, weight, cindex, indices) = make_score_fixture(n, n_features, n_bins);
+            let total_w: f64 = sum_f64(&weight);
+            let scaled_l2 = scale_l2_reg(l2, total_w, n);
+
+            let (best, dev_scores) = launch_find_optimal_split_pointwise(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, score_fn_sel,
+            )
+            .unwrap();
+
+            let baseline = host_reference_variant_scores(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, oracle_fn,
+            );
+            assert_eq!(
+                dev_scores.len(),
+                baseline.len(),
+                "[{label} n={n}] device per-candidate score length must equal the host-reference layout"
+            );
+
+            // No NaN/Inf on any candidate (the guard transcription must hold, T-07.5-05-01).
+            for (c, &s) in dev_scores.iter().enumerate() {
+                assert!(
+                    s.is_finite(),
+                    "[{label} n={n}] device score at candidate {c} is non-finite ({s}) — a guard \
+                     (seed / weight threshold) was not transcribed"
+                );
+            }
+
+            let (abs, rel) = max_divergence(&dev_scores, &baseline);
+            println!(
+                "[{label} n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} (bound={SCORE_BOUND:.0e})"
+            );
+            assert!(
+                rel <= SCORE_BOUND || abs <= SCORE_BOUND,
+                "[{label} n={n}] device {label} split score diverged too far: abs={abs:.3e} \
+                 rel={rel:.3e} (bound={SCORE_BOUND:.0e})"
+            );
+
+            // STRUCTURE (the strict bar): the device argmin under this fn must pick the SAME
+            // (feature, bin) as the CPU reference over the SAME fn's scores. Drive the CPU
+            // argmin with the DEVICE scores to isolate the tie-break from the score
+            // divergence, then confirm it agrees with the CPU-score winner on the clear
+            // margin (make_score_fixture has a clear best feature-0 border).
+            let cpu_winner = reference_best_split(&baseline, n_bins, n_features);
+            let dev_winner_via_cpu_argmin = reference_best_split(&dev_scores, n_bins, n_features);
+            let dev = best.map(|b| (b.feature_id as usize, b.bin_id as usize));
+            println!(
+                "[{label} argmin n={n}] REPORTED device={dev:?} cpu(dev-scores)={dev_winner_via_cpu_argmin:?} cpu(host-scores)={cpu_winner:?}"
+            );
+            assert_eq!(
+                dev, dev_winner_via_cpu_argmin,
+                "[{label} n={n}] device argmin must equal select_best_candidate over the SAME device scores"
+            );
+            assert_eq!(
+                dev, cpu_winner,
+                "[{label} n={n}] device winner must equal the CPU winner under the SAME score fn on a clear margin"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_matches_cpu_oracle() {
+        // Cosine (the catboost DEFAULT score fn): device num/sqrt(den) with the 1e-100 seed
+        // as the FIRST denominator summand (score.rs:78) must match cb_compute::cosine_split_score.
+        assert_arm_matches_oracle("cosine", SCORE_FN_COSINE, EScoreFunction::Cosine);
+    }
+
+    #[test]
+    fn solar_matches_cpu_oracle() {
+        // SolarL2: weight>1e-20 ? (-sum*sum)*(1+2*ln(weight+1))/weight : 0 (NO scaled_l2, IN-04).
+        assert_arm_matches_oracle("solar", SCORE_FN_SOLAR_L2, EScoreFunction::SolarL2);
+    }
+
+    #[test]
+    fn loo_matches_cpu_oracle() {
+        // LOOL2: adjust=weight>1?weight/(weight-1):0; adjust²; weight>0?adjust*(-sum*sum)/weight:0.
+        assert_arm_matches_oracle("loo", SCORE_FN_LOO_L2, EScoreFunction::LOOL2);
+    }
+
+    #[test]
+    fn sat_matches_cpu_oracle() {
+        // SatL2: adjust=weight>2?weight*(weight-2)/(weight²-3*weight+1):0; weight>0?adjust*(-sum*sum)/weight:0.
+        assert_arm_matches_oracle("sat", SCORE_FN_SAT_L2, EScoreFunction::SatL2);
+    }
+
+    #[test]
+    fn degenerate_leaf_guards_yield_finite_not_nan() {
+        // The guard ladders (Cosine 1e-100 seed; Solar weight>1e-20; LOO weight>1/weight>0;
+        // Sat weight>2/weight>0) must yield FINITE scores (0.0 on a degenerate leaf), never
+        // NaN/Inf (T-07.5-05-01). Build a fixture where MANY borders carve an empty / tiny /
+        // single-object leaf: n is small and weights are tiny so the weight thresholds
+        // (1e-20, 1, 2) straddle real leaves. Every candidate score under every arm must be
+        // finite, and must equal the cb-compute oracle (which guards identically).
+        let n_features = 2usize;
+        let n_bins = 32usize;
+        let l2 = 0.0_f64; // exercise the seed/threshold guards without L2 masking the den
+
+        // n=3 with TINY weights (< 1, so LOO's weight>1 guard and Sat's weight>2 guard fire
+        // on most leaves) — and an empty-leaf border (border 0 with no object in bin 0 for
+        // some features). make_score_fixture spreads bins so several borders empty a side.
+        let n = 3usize;
+        let (der1, _w, cindex, indices) = make_score_fixture(n, n_features, n_bins);
+        // Override weights to tiny values so the weight-threshold guards are exercised.
+        let weight: Vec<f64> = (0..n).map(|k| 0.3 + (k as f64) * 0.2).collect(); // 0.3, 0.5, 0.7 (all < 1)
+        let total_w: f64 = sum_f64(&weight);
+        let scaled_l2 = scale_l2_reg(l2, total_w, n);
+
+        for &(label, sel, oracle) in &[
+            ("cosine", SCORE_FN_COSINE, EScoreFunction::Cosine),
+            ("solar", SCORE_FN_SOLAR_L2, EScoreFunction::SolarL2),
+            ("loo", SCORE_FN_LOO_L2, EScoreFunction::LOOL2),
+            ("sat", SCORE_FN_SAT_L2, EScoreFunction::SatL2),
+        ] {
+            let (_best, dev_scores) = launch_find_optimal_split_pointwise(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, sel,
+            )
+            .unwrap();
+            for (c, &s) in dev_scores.iter().enumerate() {
+                assert!(
+                    s.is_finite(),
+                    "[{label} degenerate] candidate {c} score is non-finite ({s}) — a guard was not transcribed verbatim"
+                );
+            }
+            let baseline = host_reference_variant_scores(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2, oracle,
+            );
+            let (abs, rel) = max_divergence(&dev_scores, &baseline);
+            println!(
+                "[{label} degenerate] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} (bound={SCORE_BOUND:.0e})"
+            );
+            assert!(
+                rel <= SCORE_BOUND || abs <= SCORE_BOUND,
+                "[{label} degenerate] device score diverged from the guard-identical oracle: \
+                 abs={abs:.3e} rel={rel:.3e} (bound={SCORE_BOUND:.0e})"
+            );
+        }
     }
 }
