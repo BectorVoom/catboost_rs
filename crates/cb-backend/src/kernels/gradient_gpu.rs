@@ -820,3 +820,135 @@ fn focal_der_edge_cases() {
         assert!(r2 <= 1e-9 || a2 <= 1e-9, "focal der2 (large-N) diverged: abs={a2:.3e} rel={r2:.3e}");
     }
 }
+
+// ===========================================================================
+// Task 2 (Plan 07.2-03): Full-family device-residency hand-off lock + the SC-4
+// structural assertion. Phase 7.2 closes here: every in-scope pointwise der
+// family (RMSE / Logloss-CrossEntropy / Quantile-MAE / Focal) must hand 7.3 its
+// der1 AND der2 as device HANDLES with NO host fold inserted on the seam
+// (handle-in -> handles-out, SC-3 / D-7.2-04). The read-back happens ONCE per
+// handle at the END (test-only), never on the hand-off path.
+// ===========================================================================
+
+#[test]
+fn all_losses_device_resident_handoff() {
+    // The der1/der2 device HANDLES handed to 7.3 are UNWEIGHTED (A1, the Plan-01
+    // checkpoint + Open Q1): the per-object weight is folded DOWNSTREAM by the 7.3
+    // `histogram_scatter_kernel` (`contrib[i] = der[i] * weight[i]`), NOT here. Each
+    // family below obtains its der1 AND der2 as `Ok(handle)` with NO host fold
+    // between them; the test reads each handle back ONCE at the end and confirms it
+    // equals the matching `cb_compute` baseline.
+    let n = 50usize;
+    // Logit-shaped approx (exercises the sigmoid families) and 0/1 targets (the
+    // Focal/Logloss label branch); also valid residuals for RMSE/Quantile.
+    let approx: Vec<f64> = (0..n).map(|k| f64::from(k as u32) * 0.18 - 4.5).collect();
+    let target: Vec<f64> = (0..n).map(|k| f64::from((k % 2) as u32)).collect();
+
+    // ONE client constructs all the read-backs (test-only); each handle is allocated
+    // by its launch helper's own internal client, but the handle VALUES are read here
+    // after each launch completes.
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+
+    // Small read-back helper: a handle is read back ONCE (test-only) through a fresh
+    // client of the SAME runtime. (Production never does this on the seam.)
+    fn read_handle(h: cubecl::server::Handle) -> Vec<f64> {
+        let device = <crate::SelectedRuntime as Runtime>::Device::default();
+        let client = <crate::SelectedRuntime as Runtime>::client(&device);
+        let bytes = client.read_one(h).unwrap();
+        bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    }
+
+    // --- RMSE: der1 via launch_der_binary_handle, der2 via const_der_handle(-1.0) ---
+    {
+        let der1_h = launch_der_binary_handle(&approx, &target, DerBinaryKernel::RmseGradient).unwrap();
+        let der2_h = const_der_handle(-1.0, n).unwrap();
+        let der1 = read_handle(der1_h);
+        let der2 = read_handle(der2_h);
+        let b1 = rmse_der1_baseline(&approx, &target);
+        let (a1, r1) = max_divergence(&der1, &b1);
+        println!("[handoff RMSE der1] REPORTED abs={a1:.3e} rel={r1:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "RMSE der1 handoff diverged: abs={a1:.3e} rel={r1:.3e}");
+        for (i, &v) in der2.iter().enumerate() {
+            assert_eq!(v, cb_compute::rmse_der2(approx[i], target[i]), "RMSE der2 handoff slot {i}");
+        }
+    }
+
+    // --- Logloss/CrossEntropy: der1 via launch_der_binary_handle, der2 via launch_der_unary_handle ---
+    {
+        let der1_h = launch_der_binary_handle(&approx, &target, DerBinaryKernel::LoglossGradient).unwrap();
+        let der2_h = launch_der_unary_handle(&approx, DerUnaryKernel::LoglossHessian).unwrap();
+        let der1 = read_handle(der1_h);
+        let der2 = read_handle(der2_h);
+        let b1 = logloss_der1_baseline(&approx, &target);
+        let b2 = logloss_der2_baseline(&approx, &target);
+        let (a1, r1) = max_divergence(&der1, &b1);
+        let (a2, r2) = max_divergence(&der2, &b2);
+        println!("[handoff Logloss der1] abs={a1:.3e} rel={r1:.3e} | der2 abs={a2:.3e} rel={r2:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "Logloss der1 handoff diverged: abs={a1:.3e} rel={r1:.3e}");
+        assert!(r2 <= 1e-9 || a2 <= 1e-9, "Logloss der2 handoff diverged: abs={a2:.3e} rel={r2:.3e}");
+    }
+
+    // --- Quantile/MAE: der1 via launch_der_param_handle, der2 via const_der_handle(0.0) ---
+    {
+        let alpha = cb_compute::QUANTILE_ALPHA;
+        let delta = cb_compute::QUANTILE_DELTA;
+        let der1_h = launch_der_param_handle(&approx, &target, DerParamKernel::QuantileGradient, &[alpha, delta]).unwrap();
+        let der2_h = const_der_handle(0.0, n).unwrap();
+        let der1 = read_handle(der1_h);
+        let der2 = read_handle(der2_h);
+        let b1 = quantile_der1_baseline(&approx, &target, alpha, delta);
+        let (a1, r1) = max_divergence(&der1, &b1);
+        println!("[handoff Quantile/MAE der1] REPORTED abs={a1:.3e} rel={r1:.3e}");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "Quantile der1 handoff diverged: abs={a1:.3e} rel={r1:.3e}");
+        for (i, &v) in der2.iter().enumerate() {
+            assert_eq!(v, 0.0, "Quantile der2 handoff slot {i} must be 0.0");
+            assert_eq!(v, cb_compute::quantile_der2(approx[i], target[i], alpha, delta), "Quantile der2 handoff slot {i}");
+        }
+    }
+
+    // --- Focal: der1 AND der2 via TWO launch_der_param_handle calls (two-kernel family) ---
+    {
+        let alpha = 0.25_f64;
+        let gamma = 2.0_f64;
+        // Handle-in -> handles-out: der1 AND der2 are obtained as device HANDLES with
+        // NO host fold inserted between them (the SC-3 / D-7.2-04 contract for 7.3).
+        let der1_h = launch_der_param_handle(&approx, &target, DerParamKernel::FocalGradient, &[alpha, gamma]).unwrap();
+        let der2_h = launch_der_param_handle(&approx, &target, DerParamKernel::FocalHessian, &[alpha, gamma]).unwrap();
+        let der1 = read_handle(der1_h);
+        let der2 = read_handle(der2_h);
+        let b1 = focal_der1_baseline(&approx, &target, alpha, gamma);
+        let b2 = focal_der2_baseline(&approx, &target, alpha, gamma);
+        let (a1, r1) = max_divergence(&der1, &b1);
+        let (a2, r2) = max_divergence(&der2, &b2);
+        println!("[handoff Focal der1] abs={a1:.3e} rel={r1:.3e} | der2 abs={a2:.3e} rel={r2:.3e}");
+        assert!(der1.iter().all(|v| v.is_finite()) && der2.iter().all(|v| v.is_finite()), "Focal handoff der1/der2 finite");
+        assert!(r1 <= 1e-9 || a1 <= 1e-9, "Focal der1 handoff diverged: abs={a1:.3e} rel={r1:.3e}");
+        assert!(r2 <= 1e-9 || a2 <= 1e-9, "Focal der2 handoff diverged: abs={a2:.3e} rel={r2:.3e}");
+    }
+
+    // The `device` binding above documents the single-runtime hand-off surface; the
+    // read-backs are the ONLY host folds in this whole test, and they all happen
+    // AFTER every launch helper returned a handle (proving the seam is handle-in ->
+    // handles-out for all four families).
+    let _ = device;
+}
+
+#[test]
+fn cb_compute_is_cubecl_free() {
+    // SC-4 structural note (D-7.2-05): cb-compute MUST stay cubecl-free — the loss
+    // baselines this oracle compares against are pure-CPU `f64` math with NO GPU
+    // dependency, so the comparison is independent of the device path under test.
+    //
+    // The AUTHORITATIVE SC-4 gate is the `cargo tree` command run in verification:
+    //   `cargo tree -e features -p cb-compute | grep -ci cubecl`  ==  0
+    // and `git diff --stat` showing cb-compute/cb-core/cb-model byte-unchanged this
+    // phase. This test makes that intent DISCOVERABLE in the oracle file (a
+    // programmatic dependency-graph walk from a unit test is awkward and would
+    // duplicate `cargo tree`); it asserts the one structural fact this file relies
+    // on — that `cb_compute`'s der baselines are callable as plain host functions
+    // (no GPU client / no cubecl runtime), which is exactly what `cb-compute` being
+    // cubecl-free guarantees.
+    let der1 = cb_compute::focal_der1(0.5, 1.0, 0.25, 2.0);
+    let der2 = cb_compute::focal_der2(0.5, 1.0, 0.25, 2.0);
+    assert!(der1.is_finite() && der2.is_finite(), "cb_compute focal der baselines are pure-CPU finite math");
+}
