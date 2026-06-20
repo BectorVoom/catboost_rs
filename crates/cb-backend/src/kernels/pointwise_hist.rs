@@ -441,6 +441,144 @@ fn half_byte() {
 }
 
 #[test]
+fn binary() {
+    // The binary (1-bit) fill self-oracle (Plan D — D-7.3-02/03/04): the SEPARATE
+    // `pointwise_hist2_binary_kernel` family (NOT a comptime case of the non-binary or
+    // half-byte kernels) selected host-side from the binary border count `n_bins == 2`.
+    // It structurally mirrors upstream `pointwise_hist2_binary.cu`'s `ComputeHist2Binary`
+    // (the binary `TPointHistHalfByte`-based decomposition collapsed to 2 bins, bit 0/1),
+    // but it writes the SAME FROZEN binSums layout `(feature * 2 + bin) * 2 + channel`
+    // through the UNCHANGED der-handle-in -> binSums-handle-out seam (the seam stays
+    // byte-identical — D-7.3-01 / Pitfall 2), with `n_bins = 2`.
+    //
+    // For the 1-bit width the device 2-channel histogram must match the ORDERED host
+    // reference within the REPORTED bound, exercised at the 2-bin border count over the
+    // edge cases n=1 / n=37 (non-cube-multiple) / large N, plus the empty short-circuit.
+    // The Plan A `host_reference_hist2` / `max_divergence` / `make_fixture_f64` harness
+    // is reused verbatim (the host reference is generic over `n_bins`, so 2 needs no new
+    // reference). The per-fixture max abs/rel divergence + the AtomicFinalizePath are
+    // REPORTED, not signed off (D-7.3-04 — the GPU-06 epsilon is 7.6's job).
+    let n_features = 2usize;
+    let n_bins = 2usize; // 1-bit binary -> bit 0/1
+
+    // Empty (n=0): NO launch, NO read-back (Pitfall 5) on the binary path too.
+    {
+        let (der1, weight, cindex, indices) = make_fixture_f64(0, n_features, n_bins);
+        let (device, path) =
+            launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features).unwrap();
+        println!("[hist2 binary n=0] REPORTED AtomicFinalizePath={path:?}");
+        assert!(
+            device.is_empty(),
+            "empty input must yield an empty binary histogram (no launch)"
+        );
+    }
+
+    // n=1, n=37 (non-cube-multiple), large N: device vs ordered host reference, at the
+    // 2-bin binary border count, through the readback wrapper.
+    for &n in &[1usize, 37usize, 10_000usize] {
+        let (der1, weight, cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+        let (device, path) =
+            launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features).unwrap();
+        let baseline = host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "device binary binSums length must equal the host-reference layout length (n={n})"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!(
+            "[hist2 binary f64 n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} AtomicFinalizePath={path:?}"
+        );
+        assert!(
+            rel <= HIST_BOUND || abs <= HIST_BOUND,
+            "binary hist2 (n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
+        );
+    }
+
+    // Device-residency hand-off on the binary family: der/weight/cindex/indices handles
+    // in -> `launch_pointwise_hist2_handle` returns the binary `binSums` as a device
+    // HANDLE with NO host fold on the seam (D-7.3-05). Read back ONCE here only.
+    {
+        let n = 50usize;
+        let (der1, weight, cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+        let bin_sums_handle =
+            launch_pointwise_hist2_handle(&der1, &weight, &cindex, &indices, n_bins, n_features)
+                .unwrap();
+        let device = read_handle_f64(bin_sums_handle);
+        let baseline = host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+        assert_eq!(
+            device.len(),
+            baseline.len(),
+            "binary binSums handle length must equal the host-reference layout length"
+        );
+        let (abs, rel) = max_divergence(&device, &baseline);
+        println!("[hist2 binary handoff n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e}");
+        assert!(
+            rel <= HIST_BOUND || abs <= HIST_BOUND,
+            "device-resident binary binSums handle diverged from the host reference: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
+        );
+    }
+}
+
+/// The whole-family rocm regression assertion (SC-1 close): runs ALL the pointwise
+/// histogram variants — general 8-bit non-binary, 5/6/7-bit non-binary, half-byte
+/// (4-bit), and binary (1-bit) — through the SINGLE frozen seam in one pass, proving the
+/// full `pointwise_hist2` family fills the device-resident 2-channel histogram on rocm
+/// and matches the ordered host reference within the REPORTED bound. This is the phase's
+/// headline gate (D-7.3-01): with binary landed, the variant set is complete. It reuses
+/// the Plan A `host_reference_hist2` / `max_divergence` / `make_fixture_f64` harness
+/// verbatim; each variant is the host-dispatch border count (`n_bins`) the seam routes to
+/// its kernel family (binary=2, half-byte=16, non-binary 5/6/7/8-bit=32/64/128/256).
+#[test]
+fn whole_family() {
+    let n_features = 2usize;
+    // Every covered border count -> the kernel family the frozen seam dispatches to:
+    //   2   -> pointwise_hist2_binary_kernel      (1-bit, Plan D)
+    //   16  -> pointwise_hist2_half_byte_kernel    (4-bit, Plan C)
+    //   32  -> pointwise_hist2_nonbinary_kernel(5) (5-bit, Plan B)
+    //   64  -> pointwise_hist2_nonbinary_kernel(6) (6-bit, Plan B)
+    //   128 -> pointwise_hist2_nonbinary_kernel(7) (7-bit, Plan B)
+    //   256 -> pointwise_hist2_nonbinary_kernel(8) (8-bit, Plan A)
+    for &n_bins in &[2usize, 16, 32, 64, 128, 256] {
+        // Empty short-circuit on every family (Pitfall 5).
+        {
+            let (der1, weight, cindex, indices) = make_fixture_f64(0, n_features, n_bins);
+            let (device, _path) =
+                launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features)
+                    .unwrap();
+            assert!(
+                device.is_empty(),
+                "empty input must yield an empty histogram for n_bins={n_bins} (no launch)"
+            );
+        }
+
+        // n=1 / n=37 (non-cube-multiple) / large N: device vs ordered host reference.
+        for &n in &[1usize, 37usize, 10_000usize] {
+            let (der1, weight, cindex, indices) = make_fixture_f64(n, n_features, n_bins);
+            let (device, path) =
+                launch_pointwise_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features)
+                    .unwrap();
+            let baseline =
+                host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
+            assert_eq!(
+                device.len(),
+                baseline.len(),
+                "whole-family device binSums length must match the host layout (n_bins={n_bins} n={n})"
+            );
+            let (abs, rel) = max_divergence(&device, &baseline);
+            println!(
+                "[hist2 whole_family n_bins={n_bins} n={n}] REPORTED max abs_div={abs:.3e} rel_div={rel:.3e} AtomicFinalizePath={path:?}"
+            );
+            assert!(
+                rel <= HIST_BOUND || abs <= HIST_BOUND,
+                "whole-family hist2 (n_bins={n_bins} n={n}) diverged too far: abs={abs:.3e} rel={rel:.3e} (bound={HIST_BOUND:.0e})"
+            );
+        }
+    }
+}
+
+#[test]
 fn length_mismatch_is_typed_error() {
     // T-07.3-01: mismatched der1/weight/cindex/indices lengths must surface a typed
     // `CbError::LengthMismatch` BEFORE any launch (a host-side guard), never an OOB
