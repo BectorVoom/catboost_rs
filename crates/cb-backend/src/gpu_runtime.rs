@@ -70,12 +70,23 @@ use crate::SelectedRuntime;
 /// took rather than crashing or silently producing a wrong result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicFinalizePath {
-    /// f64 in-kernel `Atomic::fetch_add` cross-cube finalize ran (the D-03 path).
+    /// f64 in-kernel `Atomic::fetch_add` cross-cube finalize ran AND the device
+    /// advertised f64 atomic-add support (the D-03 path).
     InKernelAtomicF64,
     /// The device lacks f64 atomic-add; the portable Plan-01 shared-mem-partial +
     /// host `cb-core::sum_f64` finalize ran instead (documented fallback, NOT a
-    /// silent drop).
+    /// silent drop). This is the GENUINE host-sum path — a consumer that inspects for
+    /// it to confirm a deterministic host sum occurred (the contract
+    /// [`launch_block_reduce_atomic_f64`] honors) can rely on this meaning.
     HostSumFallback,
+    /// The in-kernel f64 atomic merge ran on-device even though the device did NOT
+    /// ADVERTISE f64 atomic-add (WR-02). On HIP/gfx1100 the f64 atomic executes but
+    /// `device_supports_f64_atomic_add` returns `false`; the histogram seam still
+    /// finalizes entirely on-device via the kernel atomic. This is distinct from
+    /// [`HostSumFallback`] (no host sum ran) and informational — it surfaces the
+    /// device-advertised capability bit for the 7.6 epsilon sign-off WITHOUT claiming
+    /// a host-sum fallback that never occurred.
+    InKernelAtomicF64Unadvertised,
 }
 
 /// Launch geometry: threads per cube (the cube `x` dimension), shared with the
@@ -1328,12 +1339,15 @@ fn read_binsums_f64(
 /// [`CbError::Degenerate`] (WR-05), never a silent all-zero buffer masquerading as a
 /// valid histogram.
 ///
-/// The reported [`AtomicFinalizePath`] records whether the device advertised the
+/// The reported [`AtomicFinalizePath`] records whether the device ADVERTISED the
 /// f64-atomic-add support the in-kernel merge relies on
-/// ([`AtomicFinalizePath::InKernelAtomicF64`]) or not
-/// ([`AtomicFinalizePath::HostSumFallback`] — informational on this path, since the
-/// kernel always ran the in-kernel atomic; the report surfaces the capability for the
-/// 7.6 epsilon sign-off and the RESEARCH A1 f32/f64 decision). REPORT-not-sign-off.
+/// ([`AtomicFinalizePath::InKernelAtomicF64`]) or ran the in-kernel atomic WITHOUT the
+/// device advertising it ([`AtomicFinalizePath::InKernelAtomicF64Unadvertised`] — the
+/// gfx1100 case). This path NEVER returns [`AtomicFinalizePath::HostSumFallback`]: the
+/// in-kernel atomic merge always runs (there is no host-sum fallback here), so reporting
+/// `HostSumFallback` would falsely claim a deterministic host sum occurred (WR-02). The
+/// report surfaces the device-advertised capability for the 7.6 epsilon sign-off and the
+/// RESEARCH A1 f32/f64 decision. REPORT-not-sign-off.
 pub fn launch_pointwise_hist2(
     der1: &[f64],
     weight: &[f64],
@@ -1342,10 +1356,6 @@ pub fn launch_pointwise_hist2(
     n_bins: usize,
     n_features: usize,
 ) -> CbResult<(Vec<f64>, AtomicFinalizePath)> {
-    if der1.is_empty() || n_features == 0 || n_bins == 0 {
-        return Ok((Vec::new(), AtomicFinalizePath::HostSumFallback));
-    }
-
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
@@ -1357,11 +1367,20 @@ pub fn launch_pointwise_hist2(
     // f64 atomic-add even though it runs it), so this report is informational, not a
     // hard gate — it surfaces the device-advertised capability for the 7.6 epsilon
     // sign-off. The actual channel width is the compile-time backend choice above.
+    //
+    // WR-02: NEVER report `HostSumFallback` here — the in-kernel atomic ALWAYS runs on
+    // this path (no host sum), so the unadvertised case is `InKernelAtomicF64Unadvertised`,
+    // NOT `HostSumFallback` (which would collide with the reduce helper's genuine
+    // host-sum semantics).
     let path = if device_supports_f64_atomic_add(&client) {
         AtomicFinalizePath::InKernelAtomicF64
     } else {
-        AtomicFinalizePath::HostSumFallback
+        AtomicFinalizePath::InKernelAtomicF64Unadvertised
     };
+
+    if der1.is_empty() || n_features == 0 || n_bins == 0 {
+        return Ok((Vec::new(), path));
+    }
 
     let handle =
         launch_pointwise_hist2_into(&client, der1, weight, cindex, indices, n_bins, n_features)?;
