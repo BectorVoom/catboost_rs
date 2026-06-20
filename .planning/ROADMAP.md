@@ -596,7 +596,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 07.2-02-PLAN.md — Logloss/CrossEntropy (der1 + hessian kernel) and Quantile/MAE (parametric launch, der2≡0 handle) der families on the seam + self-oracles
+- [x] 07.2-02-PLAN.md — Logloss/CrossEntropy (der1 + hessian kernel) and Quantile/MAE (parametric launch, der2≡0 handle) der families on the seam + self-oracles — **COMPLETE** (7add20e logloss / 4047854 quantile-mae): added `DerBinaryKernel::LoglossGradient` (der1, reuses `logloss_gradient_kernel`; Logloss AND CrossEntropy — Pitfall 6/D-09) + the NEW single-input hessian seam `DerUnaryKernel`/`launch_der_unary_handle`/`launch_der_unary` (der2, reuses `logloss_hessian_kernel`) + the NEW parametric seam `DerParamKernel`/`launch_der_param_handle`/`launch_der_param` (Quantile/MAE der1, reuses `quantile_gradient_kernel`; alpha/delta as length-1 `Array<F>`, non-panicking `param_pair()`->`CbError::Degenerate`). MAE==Quantile{0.5,1e-6} bit-identical (WR-04, no MAE kernel); Quantile/MAE der2=0.0 via `const_der_handle` (Pitfall 5). 10 new self-oracle tests (gradient_gpu 15 total) — rocm gfx1100 15/15 GREEN, REPORTED divergence 0.0 (quantile/mae/crossentropy) / <=1e-14 (logloss) (D-7.2-06). UNWEIGHTED der handles (A1). NO deviations (Plan-01 HIP handle-lifecycle fixes reused by construction). wgpu+cuda build RC=0; SC-4: cb-compute cubecl-free + cb-core/cb-model byte-unchanged. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY.
 
 **Wave 3** *(blocked on Wave 2)*
 
