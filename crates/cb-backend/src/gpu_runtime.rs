@@ -437,6 +437,10 @@ pub fn launch_der_binary_handle(
 /// would violate a `slice::from_raw_parts` precondition in the HIP IO controller.)
 /// Both the handle-returning public fn and the host-readback wrapper route through
 /// here, so the launch geometry stays single.
+// Under wgpu the body early-returns the WR-02 typed reject before touching the launch
+// args, so they read as unused and the f64 launch below is dead — on that cfg only (the
+// args ARE used and the launch IS reached on every other backend).
+#[cfg_attr(feature = "wgpu", allow(unused_variables, unreachable_code))]
 fn launch_der_binary_into(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx: &[f64],
@@ -459,6 +463,22 @@ fn launch_der_binary_into(
     // reduce/scan empty short-circuit. 7.3 still receives a valid (empty) der handle.
     if n == 0 {
         return Ok(client.empty(0));
+    }
+
+    // WR-02: the whole der seam (handle layout, the `out_handle = empty(n *
+    // size_of::<f64>())` below, the `cast_slice::<u8, f64>` read-backs, and the
+    // `grow_boosting_pass_into` f64 read-back) is f64-typed. WGSL has no `f64` type, so a
+    // genuine wgpu backend cannot JIT this `launch::<f64, _>`. Reject it with a typed
+    // error here (the reviewer-sanctioned typed-reject alternative) rather than letting
+    // it surface as an opaque JIT crash. The in-env rocm/cuda/cpu f64 path is unaffected.
+    // (The wgpu-only dead f64 launch below is allowed at the fn-level cfg_attr.)
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(CbError::OutOfRange(
+            "binary der seam requires an f64 device channel; the wgpu backend has no f64 \
+             type (WR-02). Use the rocm/cuda/cpu backend for derivative computation."
+                .to_owned(),
+        ));
     }
 
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
@@ -583,6 +603,9 @@ pub fn launch_der_unary_handle(approx: &[f64], kernel: DerUnaryKernel) -> CbResu
 /// read-back (the self-oracle wrapper) uses the SAME client that allocated the
 /// handle — a CubeCL Handle is bound to its originating client (see
 /// [`launch_der_binary_into`] for the full rationale).
+// See `launch_der_binary_into`: wgpu early-returns the WR-02 typed reject, so the launch
+// args read as unused and the f64 launch below is dead on that cfg only.
+#[cfg_attr(feature = "wgpu", allow(unused_variables, unreachable_code))]
 fn launch_der_unary_into(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx: &[f64],
@@ -594,6 +617,17 @@ fn launch_der_unary_into(
     // binary short-circuit. 7.3 still receives a valid (empty) der handle.
     if n == 0 {
         return Ok(client.empty(0));
+    }
+
+    // WR-02: f64-typed seam (see `launch_der_binary_into`); WGSL has no f64 type, so a
+    // genuine wgpu backend cannot JIT this. Typed-reject rather than an opaque JIT crash.
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(CbError::OutOfRange(
+            "unary der seam requires an f64 device channel; the wgpu backend has no f64 \
+             type (WR-02). Use the rocm/cuda/cpu backend for derivative computation."
+                .to_owned(),
+        ));
     }
 
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
@@ -731,6 +765,9 @@ pub fn launch_der_param_handle(
 /// selected param der kernel, and returns the output Handle WITHOUT reading it back.
 /// The caller owns the `client` lifecycle so a read-back (the self-oracle wrapper)
 /// uses the SAME client that allocated the handle (see [`launch_der_binary_into`]).
+// See `launch_der_binary_into`: wgpu early-returns the WR-02 typed reject, so the launch
+// args read as unused and the f64 launch below is dead on that cfg only.
+#[cfg_attr(feature = "wgpu", allow(unused_variables, unreachable_code))]
 fn launch_der_param_into(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx: &[f64],
@@ -751,6 +788,17 @@ fn launch_der_param_into(
     // Empty input: hand back a zero-length device handle (no launch).
     if n == 0 {
         return Ok(client.empty(0));
+    }
+
+    // WR-02: f64-typed seam (see `launch_der_binary_into`); WGSL has no f64 type, so a
+    // genuine wgpu backend cannot JIT this. Typed-reject rather than an opaque JIT crash.
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(CbError::OutOfRange(
+            "parametric der seam requires an f64 device channel; the wgpu backend has no \
+             f64 type (WR-02). Use the rocm/cuda/cpu backend for derivative computation."
+                .to_owned(),
+        ));
     }
 
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
