@@ -540,7 +540,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         println!(
             "[GPU-06 EVIDENCE] family=der_hess channel={channel} \
              observed_max_abs={observed_max_abs:.3e} observed_max_rel={observed_max_rel:.3e} \
-             stddev=n/a(single-shot) observed_max_plus_3sigma={observed_max_abs:.3e} \
+             stddev=n/a(single-shot) observed_max_no_sigma={observed_max_abs:.3e} \
              AtomicFinalizePath=n/a(elementwise)"
         );
         assert!(
@@ -560,7 +560,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         println!(
             "[GPU-06 EVIDENCE] family=pointwise_hist channel={channel} \
              observed_max_abs={abs:.3e} observed_max_rel={rel:.3e} stddev=n/a(single-shot) \
-             observed_max_plus_3sigma={abs:.3e} AtomicFinalizePath={path:?}"
+             observed_max_no_sigma={abs:.3e} AtomicFinalizePath={path:?}"
         );
         assert!(
             rel <= TOL_BOUND_F64 || abs <= TOL_BOUND_F64,
@@ -586,7 +586,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         println!(
             "[GPU-06 EVIDENCE] family=pairwise_hist channel={channel} \
              observed_max_abs={abs:.3e} observed_max_rel={rel:.3e} stddev=n/a(single-shot) \
-             observed_max_plus_3sigma={abs:.3e} AtomicFinalizePath=in-kernel(global)"
+             observed_max_no_sigma={abs:.3e} AtomicFinalizePath=in-kernel(global)"
         );
         assert!(
             rel <= TOL_BOUND_F64 || abs <= TOL_BOUND_F64,
@@ -611,7 +611,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         println!(
             "[GPU-06 EVIDENCE] family=score_split channel={channel} \
              observed_max_abs={abs:.3e} observed_max_rel={rel:.3e} stddev=n/a(single-shot) \
-             observed_max_plus_3sigma={abs:.3e} AtomicFinalizePath=n/a(device-resident-score)"
+             observed_max_no_sigma={abs:.3e} AtomicFinalizePath=n/a(device-resident-score)"
         );
         assert!(
             rel <= TOL_BOUND_F64 || abs <= TOL_BOUND_F64,
@@ -835,7 +835,7 @@ fn gpu06_end_to_end_leaf_values_report_evidence() {
         println!(
             "[GPU-06 EVIDENCE] family=end_to_end_leaf_values channel={channel} n={n} \
              split={cpu_split:?} structure=EXACT observed_max_abs={abs:.3e} \
-             observed_max_rel={rel:.3e} observed_max_plus_3sigma={abs:.3e} \
+             observed_max_rel={rel:.3e} observed_max_no_sigma={abs:.3e} \
              AtomicFinalizePath=device-resident-grow-loop (bound={LEAF_BOUND:.0e})"
         );
         assert!(
