@@ -402,25 +402,25 @@ fn make_pair_fixture(
     n_bins: usize,
     n_pairs: usize,
 ) -> (Vec<u32>, Vec<u32>, Vec<f64>, Vec<u32>) {
+    // IN-02: this fixture builder is only ever called with non-empty dimensions
+    // (the sole caller passes n_objects=1000, n_bins=32). Document that precondition
+    // instead of carrying dead zero-guard fallbacks that no caller can reach.
+    debug_assert!(
+        n_objects > 0 && n_bins > 0,
+        "make_pair_fixture requires non-empty n_objects and n_bins (got {n_objects}, {n_bins})"
+    );
     let mut pair_i = vec![0u32; n_pairs];
     let mut pair_j = vec![0u32; n_pairs];
     let mut pair_weight = vec![0.0_f64; n_pairs];
     for p in 0..n_pairs {
-        let oi = if n_objects == 0 { 0 } else { (p * 3 + 1) % n_objects };
-        let oj = if n_objects == 0 { 0 } else { (p * 7 + 2) % n_objects };
-        pair_i[p] = oi as u32;
-        pair_j[p] = oj as u32;
+        pair_i[p] = ((p * 3 + 1) % n_objects) as u32;
+        pair_j[p] = ((p * 7 + 2) % n_objects) as u32;
         pair_weight[p] = 0.5 + ((p % 11) as f64) * 0.25;
     }
     let mut cindex = vec![0u32; n_features * n_objects];
     for feature in 0..n_features {
         for obj in 0..n_objects {
-            let bin = if n_bins == 0 {
-                0
-            } else {
-                ((obj * (feature + 1) + feature) % n_bins) as u32
-            };
-            cindex[feature * n_objects + obj] = bin;
+            cindex[feature * n_objects + obj] = ((obj * (feature + 1) + feature) % n_bins) as u32;
         }
     }
     (pair_i, pair_j, pair_weight, cindex)
