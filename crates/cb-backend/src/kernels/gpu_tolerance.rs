@@ -80,10 +80,17 @@ const TOL_BOUND_F64: f64 = 1e-3;
 const TOL_BOUND_F32: f64 = 1e-3;
 
 /// Compare the device result (cast to f64) to the CPU baseline element-wise,
-/// returning the max abs and max rel divergence over the vector. Copied VERBATIM from
-/// `gradient_gpu.rs:34-49` (the canonical abs/rel reporter — IN-02/IN-03): zip the two
-/// slices so a length mismatch surfaces a clear precondition instead of an opaque
-/// index-out-of-bounds panic (WR-03). REPORT-not-sign-off (D-7.6-02).
+/// returning the max abs and max rel divergence over the vector. Adapted from
+/// `gradient_gpu.rs:34-49` (the canonical abs/rel reporter): zip the two slices so a
+/// length mismatch surfaces a clear precondition instead of an opaque
+/// index-out-of-bounds panic. REPORT-not-sign-off (D-7.6-02).
+///
+/// WR-03: when the baseline element is exactly `0.0` the relative metric is undefined,
+/// so it contributes `0.0` to `max_rel` rather than the ABSOLUTE divergence — the
+/// score-split / leaf-value families legitimately produce `0.0` baselines (empty
+/// leaves, the centred der ramp crossing zero), and feeding an absolute number into
+/// the relative accumulator would silently mix units in the very number the phase
+/// exists to produce. `max_abs` already covers the zero-baseline divergence.
 fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
     assert_eq!(
         device.len(),
@@ -94,7 +101,8 @@ fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
     let mut max_rel = 0.0_f64;
     for (&d, &b) in device.iter().zip(baseline) {
         let abs = (d - b).abs();
-        let rel = if b.abs() > 0.0 { abs / b.abs() } else { abs };
+        // WR-03: keep max_rel purely relative; do not pollute it with abs at zero baseline.
+        let rel = if b.abs() > 0.0 { abs / b.abs() } else { 0.0 };
         max_abs = max_abs.max(abs);
         max_rel = max_rel.max(rel);
     }
