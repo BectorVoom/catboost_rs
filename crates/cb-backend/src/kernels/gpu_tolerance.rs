@@ -596,6 +596,27 @@ fn gpu06_per_family_aggregation_reports_evidence() {
             rel <= TOL_BOUND_F64 || abs <= TOL_BOUND_F64,
             "pairwise_hist diverged beyond the run-stable bound: abs={abs:.3e} rel={rel:.3e}"
         );
+
+        // IN-03: exercise the one-hot branch of add_pair_contrib / the kernel so the
+        // host reference's one-hot transcription is measured (not just dead code). Same
+        // fixture, one_hot=true on BOTH the launch and the host reference.
+        let dev_hist_oh = launch_pairwise_hist(
+            &pair_i, &pair_j, &pair_weight, &cindex, n_objects, n_bins, n_features, bits, true,
+        )
+        .unwrap();
+        let base_hist_oh = host_reference_pairwise_hist(
+            &pair_i, &pair_j, &pair_weight, &cindex, n_objects, n_bins, n_features, true,
+        );
+        let (abs_oh, rel_oh) = max_divergence(&dev_hist_oh, &base_hist_oh);
+        println!(
+            "[GPU-06 EVIDENCE] family=pairwise_hist(one_hot) channel={channel} \
+             observed_max_abs={abs_oh:.3e} observed_max_rel={rel_oh:.3e} stddev=n/a(single-shot) \
+             observed_max_no_sigma={abs_oh:.3e} AtomicFinalizePath=in-kernel(global)"
+        );
+        assert!(
+            rel_oh <= TOL_BOUND_F64 || abs_oh <= TOL_BOUND_F64,
+            "pairwise_hist(one_hot) diverged beyond the run-stable bound: abs={abs_oh:.3e} rel={rel_oh:.3e}"
+        );
     }
 
     // --- family = score_split: per-candidate L2 split score over SelectedRuntime ---
