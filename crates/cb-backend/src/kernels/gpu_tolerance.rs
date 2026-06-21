@@ -26,8 +26,8 @@
 //!
 //! # REPORT, not sign-off
 //!
-//! The asserted [`TOL_BOUND_F64`] / [`TOL_BOUND_F32`] are generous, run-stable
-//! BOUNDS that catch a WRONG result without pinning the final epsilon. They are NOT
+//! The asserted [`TOL_BOUND_F64`] is a generous, run-stable
+//! BOUND that catches a WRONG result without pinning the final epsilon. It is NOT
 //! the GPU-06 epsilon — that is Plan 02's signed-off DOCUMENTED number, never a test
 //! constant (D-7.6-02 / the precedent set by `reduce.rs` / `gradient_gpu.rs` /
 //! `pointwise_hist.rs`). The `observed_max + 3σ` headroom term emitted here is the
@@ -74,10 +74,6 @@ const TOL_BOUND_F64: f64 = 1e-9;
 /// run-stable bound is the f32 magnitude. Same REPORT-not-epsilon caveat.
 #[cfg(feature = "wgpu")]
 const TOL_BOUND_F64: f64 = 1e-3;
-
-/// The f32-magnitude run-stable bound (used for the der/hess f32-fixture family and
-/// the wgpu channel). REPORTED, NOT the epsilon.
-const TOL_BOUND_F32: f64 = 1e-3;
 
 /// Compare the device result (cast to f64) to the CPU baseline element-wise,
 /// returning the max abs and max rel divergence over the vector. Adapted from
@@ -626,10 +622,6 @@ fn gpu06_per_family_aggregation_reports_evidence() {
             "score_split diverged beyond the run-stable bound: abs={abs:.3e} rel={rel:.3e}"
         );
     }
-
-    // The f32 bound is referenced so the wgpu channel's looser magnitude is documented
-    // alongside the f64 channel (the evidence consumer reads both — REPORT-not-epsilon).
-    let _ = TOL_BOUND_F32;
 }
 
 // ===========================================================================
