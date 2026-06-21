@@ -1918,8 +1918,9 @@ fn cb_leaf_score_term<F: Float>(sum: F, w: F, lambda: F, #[comptime] score_fn: u
 /// device read is under a POSITION bounds guard; the candidate/feature/bin VALUE ranges
 /// are validated HOST-SIDE in `launch_find_optimal_split_pointwise_into` before launch.
 /// if-as-STATEMENT only (CubeCL conditionals manual). The `MINIMAL_SCORE` sentinel
-/// (`f64::NEG_INFINITY` analogue, matching the CPU oracle) is `F::new(f32::NEG_INFINITY)`
-/// so any finite candidate wins on the first strict-greater compare (WR-01).
+/// (`f64::NEG_INFINITY` analogue, matching the CPU oracle) is `F::new(f32::MIN)` — the
+/// HIP-safe finite stand-in for `-inf` (a literal `-inf` fails the gfx1100 JIT, WR-01) —
+/// so any real candidate wins on the first strict-greater compare.
 ///
 /// # Real split borders only (WR-05)
 ///
@@ -1953,15 +1954,22 @@ pub fn find_optimal_split_kernel<F: Float>(
     // `#[cube(launch)]` scalar must be a concrete `CubeElement`, not the generic `F`).
     let lambda = scaled_l2[0usize];
 
-    // The minimal-score sentinel any finite candidate must beat (the
-    // `score.rs::MINIMAL_SCORE` = `f64::NEG_INFINITY` analogue). It MUST be `-inf`, not
-    // the finite `f32::MIN` (WR-01): L2/Cosine scores are >=0 so any finite seed works,
-    // but SolarL2/LOOL2/SatL2 produce strictly NEGATIVE terms and a candidate more
-    // negative than `f32::MIN` would fail `score > my_gain`, keep `my_idx = n_candidates`,
-    // and be discarded by the host — a device-vs-CPU argmin disagreement. `-inf` casts to
-    // `-inf` in both the f32 (wgpu) and f64 channels, so EVERY finite candidate wins on
-    // the first strict-greater compare, matching the CPU oracle's `f64::NEG_INFINITY`.
-    let minimal_score = F::new(f32::NEG_INFINITY);
+    // The minimal-score sentinel any real candidate must beat (the
+    // `score.rs::MINIMAL_SCORE` = `f64::NEG_INFINITY` analogue). It must be more negative
+    // than (a) every realizable split score, so EVERY candidate wins the per-thread loop's
+    // first strict-greater compare, AND (b) every other lane's gain, so an unseen lane
+    // (still holding this seed) always LOSES the shared-memory reduction below. The finite
+    // `f32::MIN` (~-3.4e38) satisfies both: L2/Cosine scores are >=0, and SolarL2/LOOL2/
+    // SatL2 terms are gradient-derived and bounded — never anywhere near -3.4e38 — so this
+    // is behaviorally identical to `f64::NEG_INFINITY` for all reachable inputs.
+    //
+    // WR-01 (rocm re-confirm): a literal `-inf` (`F::new(f32::NEG_INFINITY)`) is NOT usable
+    // here — CubeCL emits a bare `double(-inf)` literal that the HIP/comgr compiler rejects
+    // on gfx1100 (`error: use of undeclared identifier 'inf'`), failing the kernel JIT for
+    // all calcers. The finite `f32::MIN` is the HIP-safe sentinel; closing the (unreachable)
+    // sub-`f32::MIN` tail would require threading a per-lane "seen" flag through the
+    // reduction, deferred as it has no reachable effect.
+    let minimal_score = F::new(f32::MIN);
 
     // This thread's running best over the candidates it strides through. `best_c` is the
     // candidate index (== feature * n_bins + bin); ties keep the LOWER index, so seed it
@@ -2627,14 +2635,18 @@ pub fn select_best_split_kernel<F: Float>(
     let tid = UNIT_POS;
     let n_candidates_usize = n_candidates as usize;
 
-    // The minimal-score sentinel any finite candidate must beat (the
-    // `score.rs::MINIMAL_SCORE` = `f64::NEG_INFINITY` analogue). It MUST be `-inf`, not
-    // the finite `f32::MIN` (WR-01): a pairwise candidate score more negative than
-    // `f32::MIN` would fail `g > my_gain`, keep `my_idx = n_candidates`, and be discarded
-    // by the host — a device-vs-CPU argmin disagreement. `-inf` casts to `-inf` in both
-    // the f32 (wgpu) and f64 channels, so EVERY finite candidate wins on the first
-    // strict-greater compare, matching the CPU oracle's `f64::NEG_INFINITY`.
-    let minimal_score = F::new(f32::NEG_INFINITY);
+    // The minimal-score sentinel any real candidate must beat (the
+    // `score.rs::MINIMAL_SCORE` = `f64::NEG_INFINITY` analogue). It must be more negative
+    // than every realizable pairwise score (so each candidate wins the first strict-greater
+    // compare) AND than every other lane's gain (so an unseen lane loses the reduction). The
+    // finite `f32::MIN` (~-3.4e38) satisfies both for gradient-derived scores, identical to
+    // `f64::NEG_INFINITY` for all reachable inputs.
+    //
+    // WR-01 (rocm re-confirm): a literal `-inf` (`F::new(f32::NEG_INFINITY)`) is NOT usable —
+    // CubeCL emits `double(-inf)`, which the HIP/comgr compiler rejects on gfx1100
+    // (`use of undeclared identifier 'inf'`), failing the kernel JIT. `f32::MIN` is the
+    // HIP-safe sentinel.
+    let minimal_score = F::new(f32::MIN);
 
     // This thread's running best over the candidates it strides through. `my_idx` is the
     // candidate index; ties keep the LOWER index, so seed it to the max so any real
