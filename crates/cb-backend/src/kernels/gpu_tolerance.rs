@@ -156,6 +156,31 @@ fn gpu_backend_active() -> bool {
     cfg!(any(feature = "rocm", feature = "cuda", feature = "wgpu"))
 }
 
+/// The OBSERVED device channel label for the `[GPU-06 EVIDENCE]` lines (WR-01).
+/// Derived from the active backend feature + channel width so the printed channel
+/// reflects what was actually measured: hardcoding `f64(rocm/gfx1100)` defeated the
+/// module-doc rationale (lines 24-25 — "so a wrong channel is visible in the
+/// output"), since a wgpu host run measures an f32 channel yet would print the rocm
+/// f64 literal. Now a wrong channel surfaces in the output.
+fn channel_label() -> &'static str {
+    #[cfg(feature = "rocm")]
+    {
+        return "f64(rocm/gfx1100)";
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return "f64(cuda)";
+    }
+    #[cfg(feature = "wgpu")]
+    {
+        return "f32(wgpu)";
+    }
+    #[allow(unreachable_code)]
+    {
+        "f64(cpu-fallback)"
+    }
+}
+
 // ===========================================================================
 // Inline CPU references (TRANSCRIBED — never import cb-train, T-07.6-02). Each is
 // the FROZEN ordered-host reference for one kernel family, folded through
@@ -494,6 +519,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
     let n_features = 2usize;
     let n_bins = 32usize;
     let l2 = 3.0_f64;
+    let channel = channel_label(); // WR-01: the OBSERVED channel, not a literal.
 
     // --- family = der_hess: RMSE der1 + Logloss der2 over SelectedRuntime ---
     {
@@ -512,7 +538,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         let observed_max_abs = abs1.max(abs2);
         let observed_max_rel = rel1.max(rel2);
         println!(
-            "[GPU-06 EVIDENCE] family=der_hess channel=f64(rocm/gfx1100) \
+            "[GPU-06 EVIDENCE] family=der_hess channel={channel} \
              observed_max_abs={observed_max_abs:.3e} observed_max_rel={observed_max_rel:.3e} \
              stddev=n/a(single-shot) observed_max_plus_3sigma={observed_max_abs:.3e} \
              AtomicFinalizePath=n/a(elementwise)"
@@ -532,7 +558,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         let base_hist = host_reference_hist2(&der1, &weight, &cindex, &indices, n_bins, n_features);
         let (abs, rel) = max_divergence(&dev_hist, &base_hist);
         println!(
-            "[GPU-06 EVIDENCE] family=pointwise_hist channel=f64(rocm/gfx1100) \
+            "[GPU-06 EVIDENCE] family=pointwise_hist channel={channel} \
              observed_max_abs={abs:.3e} observed_max_rel={rel:.3e} stddev=n/a(single-shot) \
              observed_max_plus_3sigma={abs:.3e} AtomicFinalizePath={path:?}"
         );
@@ -558,7 +584,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
         );
         let (abs, rel) = max_divergence(&dev_hist, &base_hist);
         println!(
-            "[GPU-06 EVIDENCE] family=pairwise_hist channel=f64(rocm/gfx1100) \
+            "[GPU-06 EVIDENCE] family=pairwise_hist channel={channel} \
              observed_max_abs={abs:.3e} observed_max_rel={rel:.3e} stddev=n/a(single-shot) \
              observed_max_plus_3sigma={abs:.3e} AtomicFinalizePath=in-kernel(global)"
         );
@@ -583,7 +609,7 @@ fn gpu06_per_family_aggregation_reports_evidence() {
             host_reference_scores(&der1, &weight, &cindex, &indices, n_bins, n_features, scaled_l2);
         let (abs, rel) = max_divergence(&dev_scores, &base_scores);
         println!(
-            "[GPU-06 EVIDENCE] family=score_split channel=f64(rocm/gfx1100) \
+            "[GPU-06 EVIDENCE] family=score_split channel={channel} \
              observed_max_abs={abs:.3e} observed_max_rel={rel:.3e} stddev=n/a(single-shot) \
              observed_max_plus_3sigma={abs:.3e} AtomicFinalizePath=n/a(device-resident-score)"
         );
@@ -665,8 +691,9 @@ fn gpu06_variance_with_stddev_reports_evidence() {
     let (mean, variance, stddev) = mean_variance_stddev(&sums);
     let headroom_input = max_abs + 3.0 * stddev;
 
+    let channel = channel_label(); // WR-01: the OBSERVED channel, not a literal.
     println!(
-        "[GPU-06 EVIDENCE] family=reduce channel=f64(rocm/gfx1100) runs={runs} baseline={baseline} \
+        "[GPU-06 EVIDENCE] family=reduce channel={channel} runs={runs} baseline={baseline} \
          mean={mean} variance={variance:.3e} stddev={stddev:.3e} \
          observed_max_abs={max_abs:.3e} observed_max_rel={max_rel:.3e} \
          run_to_run_spread={variance_spread:.3e} observed_max_plus_3sigma={headroom_input:.3e} \
@@ -732,6 +759,7 @@ fn gpu06_end_to_end_leaf_values_report_evidence() {
     let n_bins = 32usize;
     let depth = 1usize; // the MVP vertical slice (the strict O(1)-per-level device path)
     let l2 = 3.0_f64;
+    let channel = channel_label(); // WR-01: the OBSERVED channel, not a literal.
 
     // Prefer the largest-N multi-cube fixture (n=10000 >> CUBE_DIM=32 → many cubes race
     // into the cross-cube finalize, the atomic-contention setup). n=1000 is included so
@@ -805,7 +833,7 @@ fn gpu06_end_to_end_leaf_values_report_evidence() {
         );
         let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
         println!(
-            "[GPU-06 EVIDENCE] family=end_to_end_leaf_values channel=f64(rocm/gfx1100) n={n} \
+            "[GPU-06 EVIDENCE] family=end_to_end_leaf_values channel={channel} n={n} \
              split={cpu_split:?} structure=EXACT observed_max_abs={abs:.3e} \
              observed_max_rel={rel:.3e} observed_max_plus_3sigma={abs:.3e} \
              AtomicFinalizePath=device-resident-grow-loop (bound={LEAF_BOUND:.0e})"
