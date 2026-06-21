@@ -610,6 +610,19 @@ fn gpu06_per_family_aggregation_reports_evidence() {
 /// counted as passed) FAILS rather than passing as a fake 0.0 divergence (T-07.6-03).
 #[test]
 fn gpu06_variance_with_stddev_reports_evidence() {
+    // CR-01 / WR-01: under the cpu backend the reduce loop takes the HostSumFallback
+    // branch on every run, so max_abs == max_rel == stddev == 0.0 and the WR-02
+    // path-consistency guard (which also resolves to HostSumFallback on cpu) passes —
+    // a green, fake `rocm/gfx1100` evidence line that measured CPU-vs-CPU. SKIP (the
+    // same anti-false-pass guard Tests A/C use); the WR-02 assertion below stays a
+    // valuable real-GPU check but is NOT a substitute for the skip.
+    if !gpu_backend_active() {
+        eprintln!(
+            "[GPU-06] SKIP gpu06_variance_with_stddev: cpu backend active — \
+             measurement requires a GPU feature (--no-default-features --features rocm)."
+        );
+        return;
+    }
     // Multi-cube input (300 elements -> ~10 cubes at CUBE_DIM 32) so several cubes
     // race to fetch_add into the single accumulator — the cross-cube non-determinism
     // setup (reduce.rs:262-265).
