@@ -172,12 +172,13 @@ def test_pool_length_mismatch_rejected(toy):
 
     x, y = toy
     short_label = y[:-1]  # one fewer label than rows
-    pool = catboost_rs.Pool(x, label=short_label)
-    model = catboost_rs.CatBoostRegressor(iterations=5)
-    # Length validation is inherited from OwnedColumns::into_pool(), surfaced as a
-    # CatBoostValueError — not re-implemented in the binding.
+    # A label shorter than the feature matrix is rejected as a CatBoostValueError.
+    # The label-vs-rows check fires fail-fast at the shared ingest seam (it carries
+    # the same typed error as OwnedColumns::into_pool()'s length check) — the
+    # binding never re-implements the length check, and never indexes unchecked
+    # (threat T-08-11).
     with pytest.raises(catboost_rs.CatBoostValueError):
-        model.fit(pool)
+        catboost_rs.Pool(x, label=short_label)
 
 
 def test_pool_from_arrow(toy):

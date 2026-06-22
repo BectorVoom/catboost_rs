@@ -60,7 +60,11 @@ def test_predict_before_fit_raises(toy_regression):
 
 
 def test_float64_rejected(toy_regression):
-    """A float64 X is rejected (D-12: no silent precision coercion)."""
+    """A float64 X is rejected (D-12: no silent precision coercion).
+
+    Since 08-03 the ingest path raises the typed ``CatBoostValueError`` (a
+    subclass of ``CatBoostError``) instead of the bare stdlib ``ValueError``.
+    """
     import catboost_rs
 
     x, y = toy_regression
@@ -68,6 +72,6 @@ def test_float64_rejected(toy_regression):
     raised = False
     try:
         model.fit(x.astype(np.float64), y)
-    except ValueError:
+    except catboost_rs.CatBoostValueError:
         raised = True
     assert raised

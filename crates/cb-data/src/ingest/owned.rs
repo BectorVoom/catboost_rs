@@ -101,6 +101,21 @@ impl OwnedColumns {
         self
     }
 
+    /// The float-feature matrix shape as `(n_rows, n_cols)`, read directly from
+    /// the float columns WITHOUT triggering length validation.
+    ///
+    /// `n_cols` is the number of float feature columns; `n_rows` is the length of
+    /// the first column (0 when there are no float features). This is the cheap
+    /// shape accessor the Python `Pool` getters (`num_row` / `num_col`) use so a
+    /// `Pool` can report its shape before (or independently of) the
+    /// `into_pool()` length check.
+    #[must_use]
+    pub fn feature_shape(&self) -> (usize, usize) {
+        let n_cols = self.float_features.len();
+        let n_rows = self.float_features.first().map_or(0, Vec::len);
+        (n_rows, n_cols)
+    }
+
     /// The reference object count (`n_rows`) every column must match.
     ///
     /// Derived from the first non-empty signal in a fixed precedence order
