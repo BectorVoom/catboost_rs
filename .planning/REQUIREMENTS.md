@@ -95,9 +95,9 @@
 - [ ] **PYAPI-01**: PyO3 + maturin per-backend wheels (`cpu` + `rocm` minimum), `abi3-py312`, Python ≥ 3.12
 - [ ] **PYAPI-02**: scikit-learn compatible API — `fit`/`predict`/`predict_proba`/`score`/`get_params`/`set_params`; passes `check_estimator`
 - [x] **PYAPI-03**: CatBoost-native API — `Pool`, `CatBoostClassifier`/`Regressor`/`Ranker`, full parameter-name parity and default values
-- [ ] **PYAPI-04**: Python input — NumPy, Pandas, Arrow, Polars with dtype/contiguity validation
+- [x] **PYAPI-04**: Python input — NumPy, Pandas, Arrow, Polars with dtype/contiguity validation
 - [x] **PYAPI-05**: Typed `thiserror` → specific Python exception mapping with actionable messages
-- [ ] **PYAPI-06**: Free-threaded-aware design — no GIL reliance for buffer safety (copy/quantize under GIL before release)
+- [x] **PYAPI-06**: Free-threaded-aware design — no GIL reliance for buffer safety (copy/quantize under GIL before release)
 
 ## v2 Requirements
 
@@ -190,7 +190,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | PYAPI-03 | Phase 8 | In progress (08-01: CatBoostRegressor fit/predict; full param parity + clf/ranker → 08-02/08-04) |
 | PYAPI-04 | Phase 8 | In progress (08-01: NumPy float32 ingest + dtype/contiguity reject; Pandas/Arrow/Polars → 08-03) |
 | PYAPI-05 | Phase 8 | Complete |
-| PYAPI-06 | Phase 8 | Pending |
+| PYAPI-06 | Phase 8 | Complete |
 
 **Coverage:**
 

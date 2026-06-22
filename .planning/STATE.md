@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-02-PLAN.md
-last_updated: "2026-06-22T22:38:06.334Z"
+last_updated: "2026-06-22T22:55:38.036Z"
 last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 7
-  completed_plans: 2
+  completed_plans: 3
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
-Plan: 3 of 7 (08-01 COMPLETE)
+Plan: 4 of 7 (08-01 COMPLETE)
 Status: Ready to execute
 Last activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 
@@ -160,6 +160,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.6 P01 | 25 | 2 tasks | 2 files |
 | Phase 08 P01 | ~75min | 3 tasks (1 decision + 2 impl) | 12 files |
 | Phase 08 P02 | 40min | 2 tasks | 6 files |
+| Phase 08 P03 | 12min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -347,6 +348,8 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-02: orphan rule (E0117) — local PyCbError newtype + to_pyerr free fn instead of impl From<facade error> for PyErr (both foreign)
 - [Phase 08]: 08-02: NotFittedError needs 2 bases (CatBoostError+ValueError); built dynamically via type(name,bases,{}) since create_exception! is single-parent
 - [Phase 08]: 08-02: D-07 registry = 119 upstream params, 23 IMPLEMENTED (incl aliases) / 96 KNOWN_NOT_YET parity gaps; validated at fit() not __init__
+- [Phase ?]: 08-03: Arrow Python path validates Float32 (reads Float32Array directly from pyo3-arrow RecordBatch), NOT cb-data Float64-only ArrowColumns adapter
+- [Phase ?]: 08-03: own-before-detach chokepoint is data_to_pool (fit/predict) + Pool::to_pool — only owned &Pool crosses py.detach (PYAPI-06 code property)
 
 ### Pending Todos
 
@@ -394,7 +397,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T22:38:06.328Z
+Last session: 2026-06-22T22:55:38.030Z
 Stopped at: Completed 08-02-PLAN.md
 Stopped at (prior): Phase 8 context gathered
 Stopped at (prior): Phase 7.6 context gathered

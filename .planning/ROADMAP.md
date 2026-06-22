@@ -4,7 +4,7 @@
 **Mode:** mvp
 **Depends on**: Phase 7
 **Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAPI-06
-**Plans:** 2/7 plans executed
+**Plans:** 3/7 plans executed
 Plans:
 **Wave 1**
 
@@ -16,7 +16,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 08-03-PLAN.md — Multi-source ingestion (NumPy/Pandas/Arrow/Polars) + strict validation + own-before-detach + native Pool (PYAPI-04/06/03; D-10/D-11/D-12)
+- [x] 08-03-PLAN.md — Multi-source ingestion (NumPy/Pandas/Arrow/Polars) + strict validation + own-before-detach + native Pool (PYAPI-04/06/03; D-10/D-11/D-12)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
