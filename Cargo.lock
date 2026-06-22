@@ -623,6 +623,7 @@ dependencies = [
 name = "catboost-rs-py"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "catboost-rs",
  "cb-core",
  "cb-data",

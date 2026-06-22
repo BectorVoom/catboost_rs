@@ -14,7 +14,7 @@ use pyo3::types::PyDict;
 
 use crate::errors::{not_fitted_err, to_pyerr, CatBoostValueError};
 use crate::estimator::{fit_pool, EstimatorBase};
-use crate::ingest_py::numpy_to_owned;
+use crate::ingest_py::ingest_to_owned;
 use crate::params::{make_builder, validate_params};
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
@@ -60,7 +60,10 @@ impl CatBoostRegressor {
         // (threat T-08-05).
         validate_params(&slf.base.params)?;
         // --- GIL HELD: own the input before any detach (D-11) ---
-        let owned = numpy_to_owned(x, Some(y))?;
+        // ingest_to_owned dispatches on the Python type (NumPy / Pandas / Arrow /
+        // Polars) and COPIES every buffer into owned columns before returning, so
+        // the py.detach below never sees a live Python-buffer borrow (PYAPI-06).
+        let owned = ingest_to_owned(py, x, Some(y), None)?;
         let builder = make_builder(&slf.base.params, py)?;
         // into_pool() inherits cb-data's length/range validation; map its typed
         // error to a ValueError placeholder (typed taxonomy: 08-02).
@@ -94,7 +97,7 @@ impl CatBoostRegressor {
             )
         })?;
         // --- GIL HELD: own the input before any detach (D-11) ---
-        let owned = numpy_to_owned(x, None)?;
+        let owned = ingest_to_owned(py, x, None, None)?;
         let pool = owned
             .into_pool()
             .map_err(|e| CatBoostValueError::new_err(e.to_string()))?;

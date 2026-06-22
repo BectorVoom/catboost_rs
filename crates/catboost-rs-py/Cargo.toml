@@ -29,6 +29,10 @@ pyo3-arrow = "0.19.0"
 # [features] passthrough, so `--no-default-features --features rocm` is cpu-free.
 catboost-rs = { path = "../catboost-rs", default-features = false }
 cb-data = { path = "../cb-data" }
+# The `arrow` umbrella crate (workspace-pinned 59.0.0, the SAME version pyo3-arrow
+# 0.19 links) so the Arrow/Polars ingest path can validate dtype/null_count and
+# copy Float32 columns out of the RecordBatch `pyo3_arrow::PyTable` yields.
+arrow.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
