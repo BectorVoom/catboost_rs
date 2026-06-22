@@ -4,7 +4,7 @@
 **Mode:** mvp
 **Depends on**: Phase 7
 **Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAPI-06
-**Plans:** 3/7 plans executed
+**Plans:** 4/7 plans executed
 Plans:
 **Wave 1**
 
@@ -20,7 +20,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 08-04-PLAN.md — CatBoostClassifier + CatBoostRanker + Python-surface oracle parity ≤1e-5 (PYAPI-03; D-01)
+- [x] 08-04-PLAN.md — CatBoostClassifier + CatBoostRanker + Python-surface oracle parity ≤1e-5 (PYAPI-03; D-01)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 

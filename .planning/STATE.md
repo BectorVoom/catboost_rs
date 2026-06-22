@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-02-PLAN.md
-last_updated: "2026-06-22T22:55:38.036Z"
+last_updated: "2026-06-22T23:05:37.333Z"
 last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 7
-  completed_plans: 3
+  completed_plans: 4
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
-Plan: 4 of 7 (08-01 COMPLETE)
+Plan: 5 of 7 (08-01 COMPLETE)
 Status: Ready to execute
 Last activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 
@@ -161,6 +161,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 08 P01 | ~75min | 3 tasks (1 decision + 2 impl) | 12 files |
 | Phase 08 P02 | 40min | 2 tasks | 6 files |
 | Phase 08 P03 | 12min | 2 tasks | 9 files |
+| Phase 08 P04 | 5min | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -350,6 +351,7 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-02: D-07 registry = 119 upstream params, 23 IMPLEMENTED (incl aliases) / 96 KNOWN_NOT_YET parity gaps; validated at fit() not __init__
 - [Phase ?]: 08-03: Arrow Python path validates Float32 (reads Float32Array directly from pyo3-arrow RecordBatch), NOT cb-data Float64-only ArrowColumns adapter
 - [Phase ?]: 08-03: own-before-detach chokepoint is data_to_pool (fit/predict) + Pool::to_pool — only owned &Pool crosses py.detach (PYAPI-06 code property)
+- [Phase ?]: 08-04: predict_proba=(n,2) [P(c0),P(c1)]; classifier defaults loss to Logloss (D-05); load_model = single deterministic Python oracle path, bit-exact vs catboost 1.2.10 model_serde fixtures
 
 ### Pending Todos
 
@@ -397,7 +399,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T22:55:38.030Z
+Last session: 2026-06-22T23:05:20.897Z
 Stopped at: Completed 08-02-PLAN.md
 Stopped at (prior): Phase 8 context gathered
 Stopped at (prior): Phase 7.6 context gathered
