@@ -29,7 +29,17 @@ pub use regressor::CatBoostRegressor;
 /// The `catboost_rs` Python module (D-09 import name; `module-name` in
 /// `pyproject.toml`). Plan 08-01 registers only [`CatBoostRegressor`]; the
 /// classifier / ranker / `Pool` and the exception taxonomy land in later plans.
-#[pymodule]
+///
+/// `gil_used = false` (PyO3 0.29, PYAPI-06): declares this module
+/// free-threaded-aware. The contract is upheld by the **own-before-detach**
+/// discipline (08-03 / D-11) — every Python buffer is copied into Rust-owned
+/// `OwnedColumns` *before* the GIL is released, so no borrow into a live Python
+/// buffer ever survives a `Python::detach`. Without this flag, importing the
+/// module on a free-threaded interpreter (`python3.13t`) would silently
+/// re-enable the GIL with a warning. The one documented exception is the
+/// custom-loss / custom-metric callback path, which re-enters Python during
+/// compute via per-call `Python::attach` (serialized) — see `FREE_THREADING.md`.
+#[pymodule(gil_used = false)]
 fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CatBoostRegressor>()?;
     // PYAPI-03 native classifier + ranker (the CatBoost-mirror estimator trio).
