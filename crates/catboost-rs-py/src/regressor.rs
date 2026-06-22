@@ -7,12 +7,14 @@
 //! `set_params` / `__sklearn_tags__` / clone / `NotFittedError`), the classifier
 //! / ranker, param validation, and the typed error taxonomy land in later plans.
 
-use numpy::{PyArray1, ToPyArray};
+use numpy::{PyArray1, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::errors::{not_fitted_err, PyCbError};
-use crate::estimator::{data_to_pool, fit_pool, load_model_path, EstimatorBase};
+use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
+use crate::estimator::{
+    build_sklearn_tags, data_to_pool, fit_pool, load_model_path, r2_score, EstimatorBase,
+};
 use crate::params::{make_builder, validate_params};
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
@@ -110,4 +112,94 @@ impl CatBoostRegressor {
         let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         Ok(preds.to_pyarray(py))
     }
+
+    /// Return the verbatim constructor kwargs (sklearn `get_params`). `deep` is
+    /// accepted for signature parity (no nested estimators). Enables
+    /// `sklearn.base.clone` and `GridSearchCV` (T-08-15).
+    ///
+    /// # Errors
+    /// Propagates any failure building the params dict.
+    #[pyo3(signature = (deep = None))]
+    fn get_params<'py>(
+        &self,
+        py: Python<'py>,
+        deep: Option<bool>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.base.get_params(py, deep)
+    }
+
+    /// Merge `**params` into the verbatim store and return `self` (sklearn
+    /// `set_params` chaining). No validation here — that stays at `fit` (D-06).
+    ///
+    /// # Errors
+    /// Propagates any failure extracting a param key.
+    #[pyo3(signature = (**params))]
+    fn set_params(
+        mut slf: PyRefMut<'_, Self>,
+        params: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<Self>> {
+        slf.base.set_params(params)?;
+        Ok(slf.into())
+    }
+
+    /// The sklearn ≥1.6 `Tags` dataclass marking this as a `"regressor"`
+    /// (RESEARCH Pitfall 5). Read by modern `check_estimator`.
+    ///
+    /// # Errors
+    /// Propagates any failure constructing the `Tags` dataclass.
+    fn __sklearn_tags__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        build_sklearn_tags(py, "regressor")
+    }
+
+    /// sklearn estimator-type marker (`"regressor"`) read by some older sklearn
+    /// dispatch paths alongside `__sklearn_tags__`.
+    #[classattr]
+    fn _estimator_type() -> &'static str {
+        "regressor"
+    }
+
+    /// `True` once `fit`/`load_model` has populated the model. Exposed so sklearn's
+    /// `check_is_fitted` (and users) can introspect the fitted state.
+    #[getter]
+    fn is_fitted(&self) -> bool {
+        self.base.is_fitted()
+    }
+
+    /// R² score of `predict(X)` vs `y` (the sklearn `RegressorMixin.score`
+    /// default). `y` is a C-contiguous float32 1-D NumPy array.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on a bad `y` dtype/layout
+    /// or a length mismatch; the typed taxonomy on a prediction failure.
+    fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>) -> PyResult<f64> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostRegressor is not fitted yet; call `fit` before `score`",
+            )
+        })?;
+        let pool = data_to_pool(py, x, None)?;
+        let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
+        let y_true = y_to_vec(y)?;
+        if y_true.len() != preds.len() {
+            return Err(CatBoostValueError::new_err(format!(
+                "y length ({}) does not match X row count ({})",
+                y_true.len(),
+                preds.len()
+            )));
+        }
+        Ok(r2_score(&y_true, &preds))
+    }
+}
+
+/// Read a C-contiguous float32 1-D NumPy array into an owned `Vec<f64>` (the
+/// `score` true-label contract; mirrors the strict D-12 ingest rule).
+///
+/// # Errors
+/// [`CatBoostValueError`] if `y` is not a C-contiguous 1-D float32 array.
+pub(crate) fn y_to_vec(y: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+    let arr: PyReadonlyArray1<f32> = y.extract().map_err(|_| {
+        CatBoostValueError::new_err("y must be a 1-D float32 NumPy array; pass `y.astype(np.float32)`")
+    })?;
+    Ok(arr.as_array().iter().map(|&v| f64::from(v)).collect())
 }

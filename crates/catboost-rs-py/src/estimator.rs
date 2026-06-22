@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use catboost_rs::{CatBoostBuilder, CatBoostError, IngestSource, Model, Pool};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -57,6 +58,130 @@ impl EstimatorBase {
             model: Some(model),
         }
     }
+
+    /// Return the verbatim constructor kwargs as a fresh `dict` (the sklearn
+    /// `get_params` contract). The store is keyed by the EXACT name the user passed
+    /// (D-06), so `set_params(**get_params())` is an identity round-trip and
+    /// `sklearn.base.clone` (which does `__init__(**get_params())`) reconstructs an
+    /// equal-params unfitted estimator (T-08-15). `deep` is accepted for sklearn
+    /// signature parity; there are no nested sub-estimators, so it is a no-op.
+    ///
+    /// # Errors
+    /// Propagates any failure cloning a stored value into the new dict.
+    pub(crate) fn get_params<'py>(
+        &self,
+        py: Python<'py>,
+        _deep: Option<bool>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (name, value) in &self.params {
+            dict.set_item(name, value.bind(py))?;
+        }
+        Ok(dict)
+    }
+
+    /// Merge `**params` into the verbatim store (the sklearn `set_params`
+    /// contract). Each key overwrites verbatim; no validation or coercion happens
+    /// here (validation stays at `fit`, D-06). Keys NOT already present are still
+    /// accepted (sklearn's `set_params` allows setting any valid `__init__` param).
+    ///
+    /// # Errors
+    /// Propagates any failure extracting a key as a string.
+    pub(crate) fn set_params(&mut self, params: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        if let Some(dict) = params {
+            for (key, value) in dict.iter() {
+                let name: String = key.extract()?;
+                self.params.insert(name, value.unbind());
+            }
+        }
+        Ok(())
+    }
+
+    /// `true` once `fit` (or `load_model`) has populated the model handle.
+    #[must_use]
+    pub(crate) fn is_fitted(&self) -> bool {
+        self.model.is_some()
+    }
+}
+
+/// Build the sklearn ≥1.6 `Tags` dataclass for an estimator of `estimator_type`
+/// (`"classifier"` | `"regressor"`). sklearn 1.6 replaced the old `_get_tags()`
+/// dict with the `__sklearn_tags__()` dataclass (RESEARCH Pitfall 5); modern
+/// `check_estimator` reads `estimator_type` and the per-kind sub-tags off this
+/// object. We construct it by calling into Python (`sklearn.utils.Tags` +
+/// `TargetTags`/`ClassifierTags`/`RegressorTags`/`InputTags`) so we always match
+/// the installed sklearn's exact dataclass shape rather than hard-coding fields.
+///
+/// `required=True` on the target tags marks the estimators as supervised (both
+/// the classifier and regressor require `y` at fit). The Ranker presents with the
+/// regressor-like `"regressor"` tag set (continuous score output) per RESEARCH
+/// Open Q2; it is EXCLUDED from the `check_estimator` gate (Task 2).
+///
+/// # Errors
+/// Propagates any failure importing `sklearn.utils` or constructing the dataclass.
+pub(crate) fn build_sklearn_tags<'py>(
+    py: Python<'py>,
+    estimator_type: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let utils = py.import(intern!(py, "sklearn.utils"))?;
+    let tags_cls = utils.getattr(intern!(py, "Tags"))?;
+    let target_tags = utils
+        .getattr(intern!(py, "TargetTags"))?
+        .call1((true,))?; // TargetTags(required=True)
+    let input_tags = utils.getattr(intern!(py, "InputTags"))?.call0()?;
+
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(intern!(py, "estimator_type"), estimator_type)?;
+    kwargs.set_item(intern!(py, "target_tags"), target_tags)?;
+    kwargs.set_item(intern!(py, "input_tags"), input_tags)?;
+    if estimator_type == "classifier" {
+        let clf = utils.getattr(intern!(py, "ClassifierTags"))?.call0()?;
+        kwargs.set_item(intern!(py, "classifier_tags"), clf)?;
+    } else {
+        let reg = utils.getattr(intern!(py, "RegressorTags"))?.call0()?;
+        kwargs.set_item(intern!(py, "regressor_tags"), reg)?;
+    }
+    tags_cls.call((), Some(&kwargs))
+}
+
+/// Coefficient of determination R² of `pred` vs the true `y` (the sklearn
+/// `RegressorMixin.score` default). `R² = 1 - SS_res / SS_tot`; when `SS_tot == 0`
+/// (constant `y`) sklearn returns `0.0` for a non-perfect fit, `1.0` for a perfect
+/// one — mirror that.
+#[must_use]
+pub(crate) fn r2_score(y: &[f64], pred: &[f64]) -> f64 {
+    let n = y.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = y.iter().sum::<f64>() / n as f64;
+    let ss_tot: f64 = y.iter().map(|v| (v - mean).powi(2)).sum();
+    let ss_res: f64 = y
+        .iter()
+        .zip(pred.iter())
+        .map(|(t, p)| (t - p).powi(2))
+        .sum();
+    if ss_tot == 0.0 {
+        return if ss_res == 0.0 { 1.0 } else { 0.0 };
+    }
+    1.0 - ss_res / ss_tot
+}
+
+/// Mean accuracy of class predictions vs `y` (the sklearn
+/// `ClassifierMixin.score` default). Labels are compared after rounding the
+/// f64 predictions to the nearest integer (the classifier emits `0.0`/`1.0`).
+#[must_use]
+pub(crate) fn accuracy_score(y: &[f64], pred: &[f64]) -> f64 {
+    let n = y.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let correct = y
+        .iter()
+        .zip(pred.iter())
+        .filter(|(t, p)| (t.round() - p.round()).abs() < f64::EPSILON)
+        .count();
+    correct as f64 / n as f64
 }
 
 /// Build a [`CatBoostBuilder`] from the params and fit it on an OWNED pool. The

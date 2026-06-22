@@ -18,9 +18,12 @@ use numpy::{PyArray1, PyArray2, ToPyArray};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::errors::{not_fitted_err, PyCbError};
-use crate::estimator::{data_to_pool, fit_pool, load_model_path, EstimatorBase};
+use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
+use crate::estimator::{
+    accuracy_score, build_sklearn_tags, data_to_pool, fit_pool, load_model_path, EstimatorBase,
+};
 use crate::params::{make_builder, validate_params};
+use crate::regressor::y_to_vec;
 
 /// CatBoost-mirror classifier (sklearn-compatible). Reuses the shared estimator
 /// base, param registry, and ingestion; defaults to `Logloss` and exposes
@@ -144,5 +147,81 @@ impl CatBoostClassifier {
         Ok(Self {
             base: EstimatorBase::from_model(model),
         })
+    }
+
+    /// Return the verbatim constructor kwargs (sklearn `get_params`). Enables
+    /// `sklearn.base.clone` / `GridSearchCV` (T-08-15).
+    ///
+    /// # Errors
+    /// Propagates any failure building the params dict.
+    #[pyo3(signature = (deep = None))]
+    fn get_params<'py>(
+        &self,
+        py: Python<'py>,
+        deep: Option<bool>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.base.get_params(py, deep)
+    }
+
+    /// Merge `**params` into the verbatim store and return `self` (sklearn
+    /// `set_params` chaining). Validation stays at `fit` (D-06).
+    ///
+    /// # Errors
+    /// Propagates any failure extracting a param key.
+    #[pyo3(signature = (**params))]
+    fn set_params(
+        mut slf: PyRefMut<'_, Self>,
+        params: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<Self>> {
+        slf.base.set_params(params)?;
+        Ok(slf.into())
+    }
+
+    /// The sklearn ≥1.6 `Tags` dataclass marking this as a `"classifier"`.
+    ///
+    /// # Errors
+    /// Propagates any failure constructing the `Tags` dataclass.
+    fn __sklearn_tags__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        build_sklearn_tags(py, "classifier")
+    }
+
+    /// sklearn estimator-type marker (`"classifier"`).
+    #[classattr]
+    fn _estimator_type() -> &'static str {
+        "classifier"
+    }
+
+    /// `True` once `fit`/`load_model` has populated the model.
+    #[getter]
+    fn is_fitted(&self) -> bool {
+        self.base.is_fitted()
+    }
+
+    /// Mean accuracy of `predict(X)` vs `y` (the sklearn `ClassifierMixin.score`
+    /// default). `y` is a C-contiguous float32 1-D NumPy array.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on a bad `y` dtype/layout
+    /// or a length mismatch; the typed taxonomy on a prediction failure.
+    fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>) -> PyResult<f64> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostClassifier is not fitted yet; call `fit` before `score`",
+            )
+        })?;
+        let pool = data_to_pool(py, x, None)?;
+        let preds = py
+            .detach(|| model.predict_with(&pool, PredictionType::Class))
+            .map_err(PyCbError)?;
+        let y_true = y_to_vec(y)?;
+        if y_true.len() != preds.len() {
+            return Err(CatBoostValueError::new_err(format!(
+                "y length ({}) does not match X row count ({})",
+                y_true.len(),
+                preds.len()
+            )));
+        }
+        Ok(accuracy_score(&y_true, &preds))
     }
 }

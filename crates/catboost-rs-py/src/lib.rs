@@ -52,4 +52,6 @@ mod ingest_py_test;
 #[cfg(test)]
 mod errors_test;
 #[cfg(test)]
+mod estimator_test;
+#[cfg(test)]
 mod params_test;

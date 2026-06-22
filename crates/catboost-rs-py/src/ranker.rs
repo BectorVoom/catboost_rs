@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
-use crate::estimator::{data_to_pool, fit_pool, EstimatorBase};
+use crate::estimator::{build_sklearn_tags, data_to_pool, fit_pool, EstimatorBase};
 use crate::params::{make_builder, validate_params};
 
 /// CatBoost-mirror ranker. Reuses the shared estimator base, param registry, and
@@ -100,5 +100,59 @@ impl CatBoostRanker {
         let pool = data_to_pool(py, x, None)?;
         let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         Ok(preds.to_pyarray(py))
+    }
+
+    /// Return the verbatim constructor kwargs (sklearn `get_params`). Enables
+    /// `sklearn.base.clone` / `GridSearchCV` even though the ranker is excluded
+    /// from the structural `check_estimator` gate (Task 2, RESEARCH Open Q2).
+    ///
+    /// # Errors
+    /// Propagates any failure building the params dict.
+    #[pyo3(signature = (deep = None))]
+    fn get_params<'py>(
+        &self,
+        py: Python<'py>,
+        deep: Option<bool>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.base.get_params(py, deep)
+    }
+
+    /// Merge `**params` into the verbatim store and return `self`. Validation stays
+    /// at `fit` (D-06).
+    ///
+    /// # Errors
+    /// Propagates any failure extracting a param key.
+    #[pyo3(signature = (**params))]
+    fn set_params(
+        mut slf: PyRefMut<'_, Self>,
+        params: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<Self>> {
+        slf.base.set_params(params)?;
+        Ok(slf.into())
+    }
+
+    /// The sklearn ≥1.6 `Tags` dataclass. sklearn has no native ranker estimator
+    /// type, so the ranker presents with the regressor-like `"regressor"` tag set
+    /// (continuous per-object score output) per RESEARCH Open Q2. It is EXCLUDED
+    /// from the structural `check_estimator` gate (no native sklearn ranker
+    /// contract to satisfy), documented in `test_check_estimator.py`.
+    ///
+    /// # Errors
+    /// Propagates any failure constructing the `Tags` dataclass.
+    fn __sklearn_tags__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        build_sklearn_tags(py, "regressor")
+    }
+
+    /// sklearn estimator-type marker. The ranker presents regressor-like
+    /// (continuous score) per RESEARCH Open Q2.
+    #[classattr]
+    fn _estimator_type() -> &'static str {
+        "regressor"
+    }
+
+    /// `True` once `fit` has populated the model.
+    #[getter]
+    fn is_fitted(&self) -> bool {
+        self.base.is_fitted()
     }
 }
