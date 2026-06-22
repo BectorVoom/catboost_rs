@@ -24,7 +24,7 @@ use crate::params::{make_builder, validate_params};
 /// CatBoost-mirror ranker. Reuses the shared estimator base, param registry, and
 /// ingestion; requires a `group_id`-bearing `Pool` at `fit` and returns raw
 /// ranking scores at `predict`.
-#[pyclass(name = "CatBoostRanker", subclass)]
+#[pyclass(name = "CatBoostRanker", subclass, dict)]
 pub struct CatBoostRanker {
     base: EstimatorBase,
 }
@@ -153,6 +153,11 @@ impl CatBoostRanker {
     /// `True` once `fit` has populated the model.
     #[getter]
     fn is_fitted(&self) -> bool {
+        self.base.is_fitted()
+    }
+
+    /// sklearn's fitted-state hook (the fitted model is an opaque Rust field).
+    fn __sklearn_is_fitted__(&self) -> bool {
         self.base.is_fitted()
     }
 }

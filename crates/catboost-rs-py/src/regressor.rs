@@ -20,7 +20,7 @@ use crate::params::{make_builder, validate_params};
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
 /// thinnest `__init__` / `fit` / `predict` path; the full sklearn contract and
 /// param surface land in later plans.
-#[pyclass(name = "CatBoostRegressor", subclass)]
+#[pyclass(name = "CatBoostRegressor", subclass, dict)]
 pub struct CatBoostRegressor {
     base: EstimatorBase,
 }
@@ -162,6 +162,14 @@ impl CatBoostRegressor {
     /// `check_is_fitted` (and users) can introspect the fitted state.
     #[getter]
     fn is_fitted(&self) -> bool {
+        self.base.is_fitted()
+    }
+
+    /// sklearn's fitted-state hook. Because the fitted model lives in an opaque
+    /// Rust field (not a trailing-underscore Python attribute), `check_is_fitted`
+    /// cannot detect it by attribute scan; this method is the documented escape
+    /// hatch sklearn uses instead.
+    fn __sklearn_is_fitted__(&self) -> bool {
         self.base.is_fitted()
     }
 

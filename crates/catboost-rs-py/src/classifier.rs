@@ -28,7 +28,7 @@ use crate::regressor::y_to_vec;
 /// CatBoost-mirror classifier (sklearn-compatible). Reuses the shared estimator
 /// base, param registry, and ingestion; defaults to `Logloss` and exposes
 /// `predict` (class labels) + `predict_proba` (`(n, 2)` probabilities).
-#[pyclass(name = "CatBoostClassifier", subclass)]
+#[pyclass(name = "CatBoostClassifier", subclass, dict)]
 pub struct CatBoostClassifier {
     base: EstimatorBase,
 }
@@ -194,6 +194,12 @@ impl CatBoostClassifier {
     /// `True` once `fit`/`load_model` has populated the model.
     #[getter]
     fn is_fitted(&self) -> bool {
+        self.base.is_fitted()
+    }
+
+    /// sklearn's fitted-state hook (the fitted model is an opaque Rust field, not a
+    /// trailing-underscore attribute `check_is_fitted` can scan).
+    fn __sklearn_is_fitted__(&self) -> bool {
         self.base.is_fitted()
     }
 
