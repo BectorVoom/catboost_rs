@@ -1,0 +1,52 @@
+# ROCm distribution config for the two-distribution model (D-08 / D-09).
+#
+# This is the `catboost-rs-rocm` PyPI distribution: a SEPARATE distribution from
+# the cpu `catboost-rs` (pyproject.toml), because PyPI accepts only one binary
+# wheel per name+version+platform and the cpu/rocm `.so`s are different artifacts.
+# The import name stays `catboost_rs` (D-09) — both distributions install the same
+# module; they are MUTUALLY EXCLUSIVE (see PACKAGING.md, Pitfall 4).
+#
+# Build IN-ENV ONLY (gfx1100 / ROCm 7.1) — NEVER in GitHub Actions (D-06, carried
+# from Phase 7). The rocm arm links cubecl-hip-sys and needs the HIP toolchain.
+#
+# Build command (cpu-free per the 08-01 feature wiring):
+#   cd crates/catboost-rs-py
+#   maturin build --no-default-features --features rocm --release
+#
+# To build the rocm distribution under its own name, point maturin at this file
+# (maturin reads pyproject.toml by name, so swap/copy this in for the rocm build,
+# e.g. `cp pyproject-rocm.toml pyproject.toml` in a clean checkout, or use a
+# build wrapper). The Cargo manifest is shared (crates/catboost-rs-py/Cargo.toml);
+# only the [project].name and the absence of the [rocm] extra differ from the cpu
+# pyproject.
+
+[build-system]
+requires = ["maturin>=1.9.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+# Separate distribution name (D-08). `catboost-rs[rocm]` (cpu pyproject) depends
+# on THIS distribution.
+name = "catboost-rs-rocm"
+version = "0.1.0"
+description = "Rust-native CatBoost (ROCm/HIP backend) — scikit-learn-compatible and CatBoost-native Python bindings"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: GPU",
+]
+
+# No [rocm] extra here: this IS the rocm distribution. Installing it alongside the
+# cpu `catboost-rs` is forbidden (both expose `catboost_rs`; see PACKAGING.md).
+
+[tool.maturin]
+# Same import name as the cpu distribution (D-09).
+module-name = "catboost_rs"
+# extension-module is wheel-only (same rationale as the cpu pyproject). The rocm
+# backend is selected via the Cargo `rocm` feature on the maturin command line
+# (`--no-default-features --features rocm`), NOT here, so the build stays cpu-free.
+features = ["pyo3/extension-module"]
