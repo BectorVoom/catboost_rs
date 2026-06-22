@@ -7,12 +7,25 @@ description = "Gradient-boosting training loop for catboost-rs (realized in Phas
 [lints]
 workspace = true
 
+[features]
+# Backend-selection passthrough (Phase 8): forward each backend feature to
+# `cb-backend`'s `cubecl/<facade>` arms. `cb-backend` is pulled with
+# `default-features = false` below so a `--no-default-features --features rocm`
+# build does NOT unify cpu in via cb-train (feature-unification landmine).
+default = ["cpu"]
+cpu = ["cb-backend/cpu"]
+rocm = ["cb-backend/rocm"]
+wgpu = ["cb-backend/wgpu"]
+cuda = ["cb-backend/cuda"]
+
 [dependencies]
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
 cb-core = { path = "../cb-core" }
 cb-data = { path = "../cb-data" }
 cb-compute = { path = "../cb-compute" }
-cb-backend = { path = "../cb-backend" }
+# default-features = false: backend selection is forwarded through the [features]
+# block above, never pinned to cpu via cb-backend's own default (Phase 8).
+cb-backend = { path = "../cb-backend", default-features = false }
 
 [dev-dependencies]
 # Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the

@@ -7,15 +7,31 @@ description = "Published Builder-pattern facade for catboost-rs (realized in Pha
 [lints]
 workspace = true
 
+[features]
+# Backend-selection passthrough (Phase 8): the facade forwards each backend
+# feature to `cb-backend`'s `cubecl/<facade>` arms so a downstream consumer (the
+# PyO3 binding crate) can select the backend WITHOUT pinning cpu unconditionally.
+# Selection lives in the leaf consumer + here, never on the workspace cubecl pin,
+# so `--no-default-features --features rocm` stays cpu-free (feature-unification
+# landmine, cb-backend Cargo.toml lines 26-38).
+default = ["cpu"]
+cpu = ["cb-backend/cpu", "cb-train/cpu", "cb-model/cpu"]
+rocm = ["cb-backend/rocm", "cb-train/rocm", "cb-model/rocm"]
+wgpu = ["cb-backend/wgpu", "cb-train/wgpu", "cb-model/wgpu"]
+cuda = ["cb-backend/cuda", "cb-train/cuda", "cb-model/cuda"]
+
 [dependencies]
 # D-15 default: the published facade is treated as a thiserror-only LIBRARY —
 # `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
 cb-core = { path = "../cb-core" }
 cb-data = { path = "../cb-data" }
 cb-compute = { path = "../cb-compute" }
-cb-backend = { path = "../cb-backend" }
-cb-train = { path = "../cb-train" }
-cb-model = { path = "../cb-model" }
+# default-features = false on the backend-bearing deps: selection flows ONLY
+# through the [features] passthrough above, so `--no-default-features --features
+# rocm` stays cpu-free (feature-unification landmine, Phase 8).
+cb-backend = { path = "../cb-backend", default-features = false }
+cb-train = { path = "../cb-train", default-features = false }
+cb-model = { path = "../cb-model", default-features = false }
 thiserror.workspace = true
 
 [dev-dependencies]

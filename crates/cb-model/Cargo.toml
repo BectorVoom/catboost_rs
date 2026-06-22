@@ -7,10 +7,23 @@ description = "Model serialization and SHAP for catboost-rs (realized in Phase 4
 [lints]
 workspace = true
 
+[features]
+# Backend-selection passthrough (Phase 8): forward to `cb-train`, which forwards
+# to `cb-backend`. `cb-train` is pulled with `default-features = false` below so a
+# `--no-default-features --features rocm` build does NOT unify cpu in via cb-model
+# (feature-unification landmine).
+default = ["cpu"]
+cpu = ["cb-train/cpu"]
+rocm = ["cb-train/rocm"]
+wgpu = ["cb-train/wgpu"]
+cuda = ["cb-train/cuda"]
+
 [dependencies]
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
 cb-core = { path = "../cb-core" }
-cb-train = { path = "../cb-train" }
+# default-features = false: backend selection is forwarded through the [features]
+# block above, never pinned to cpu via cb-train's own default (Phase 8).
+cb-train = { path = "../cb-train", default-features = false }
 # Categorical hashing single source (calc_cat_feature_hash) for CTR projection
 # at inference — NEVER a model's stored ctr_data hash_map (D Carried-Forward).
 cb-data = { path = "../cb-data" }

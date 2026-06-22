@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "catboost-rs"
+version = "0.1.0"
+description = "Rust-native CatBoost — scikit-learn-compatible and CatBoost-native Python bindings"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+# D-08 realization (A3, confirmed Task 1): PyPI accepts one binary wheel per
+# name+version+platform, so the rocm backend ships as a SEPARATE distribution
+# `catboost-rs-rocm`. The `[rocm]` extra pulls it; both wheels expose the
+# `catboost_rs` import name and MUST NOT be installed simultaneously.
+rocm = ["catboost-rs-rocm"]
+
+[tool.maturin]
+# Import name is `catboost_rs` (D-09) — no shadowing of the real `catboost`.
+module-name = "catboost_rs"
+features = ["pyo3/extension-module"]

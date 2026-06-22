@@ -1,0 +1,33 @@
+[package]
+name = "catboost-rs-py"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 binding crate exposing the catboost-rs facade as the `catboost_rs` Python module (Phase 8)"
+
+[lints]
+workspace = true
+
+[lib]
+# cdylib for the Python extension wheel; rlib so the Rust `*_test.rs` unit tests
+# can link the crate. (PATTERNS / RESEARCH Standard Stack.)
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PyO3-org stack pinned & legitimacy-audited (RESEARCH Package Legitimacy Audit).
+pyo3 = { version = "0.29.0", features = ["abi3-py312", "extension-module"] }
+numpy = "0.29.0"
+pyo3-arrow = "0.19.0"
+# default-features = false: backend selection flows ONLY through this crate's
+# [features] passthrough, so `--no-default-features --features rocm` is cpu-free.
+catboost-rs = { path = "../catboost-rs", default-features = false }
+cb-data = { path = "../cb-data" }
+thiserror.workspace = true
+
+[features]
+# Compile-time backend selection only — forward to the facade passthrough, which
+# forwards to cb-backend's `cubecl/<facade>` arms. NEVER pin `cpu` unconditionally
+# (the backend-feature-unification landmine): an unconditional cpu dep would force
+# cpu onto a `--no-default-features --features rocm` build via feature unification.
+default = ["cpu"]
+cpu = ["catboost-rs/cpu"]
+rocm = ["catboost-rs/rocm"]

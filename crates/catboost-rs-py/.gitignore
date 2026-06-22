@@ -1,0 +1,5 @@
+# Test venv (Phase 8 Wave-0 setup; recreate with the recipe in 08-01-SUMMARY.md)
+.venv-py8/
+# maturin build artifacts
+target/
+*.so
