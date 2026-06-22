@@ -31,6 +31,13 @@ catboost-rs = { path = "../catboost-rs", default-features = false }
 cb-data = { path = "../cb-data" }
 thiserror.workspace = true
 
+[dev-dependencies]
+# Used only by `errors_test.rs` to construct the `CbError` / `ModelError` payloads
+# that drive the `Train` / `Model` facade-error variants through `to_pyerr`
+# (these internal error crates are NOT re-exported by the facade).
+cb-core = { path = "../cb-core" }
+cb-model = { path = "../cb-model" }
+
 [features]
 # Compile-time backend selection only — forward to the facade passthrough, which
 # forwards to cb-backend's `cubecl/<facade>` arms. NEVER pin `cpu` unconditionally

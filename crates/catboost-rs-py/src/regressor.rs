@@ -9,11 +9,11 @@
 
 use catboost_rs::IngestSource;
 use numpy::{PyArray1, ToPyArray};
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::estimator::{fit_pool, to_pyerr, EstimatorBase};
+use crate::errors::{not_fitted_err, to_pyerr, CatBoostValueError};
+use crate::estimator::{fit_pool, EstimatorBase};
 use crate::ingest_py::numpy_to_owned;
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
@@ -60,11 +60,11 @@ impl CatBoostRegressor {
         // error to a ValueError placeholder (typed taxonomy: 08-02).
         let pool = owned
             .into_pool()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| CatBoostValueError::new_err(e.to_string()))?;
         // --- owned/quantized data only: safe to release the GIL ---
         let model = py
             .detach(|| fit_pool(builder, &pool))
-            .map_err(to_pyerr)?;
+            .map_err(|e| to_pyerr(&e))?;
         slf.base.model = Some(model);
         Ok(slf.into())
     }
@@ -82,7 +82,8 @@ impl CatBoostRegressor {
         x: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let model = self.base.model.as_ref().ok_or_else(|| {
-            PyValueError::new_err(
+            not_fitted_err(
+                py,
                 "this CatBoostRegressor is not fitted yet; call `fit` before `predict`",
             )
         })?;
@@ -90,10 +91,10 @@ impl CatBoostRegressor {
         let owned = numpy_to_owned(x, None)?;
         let pool = owned
             .into_pool()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| CatBoostValueError::new_err(e.to_string()))?;
         let preds = py
             .detach(|| model.predict(&pool))
-            .map_err(to_pyerr)?;
+            .map_err(|e| to_pyerr(&e))?;
         Ok(preds.to_pyarray(py))
     }
 }

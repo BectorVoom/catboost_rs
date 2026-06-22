@@ -12,6 +12,7 @@
 
 use pyo3::prelude::*;
 
+mod errors;
 mod estimator;
 mod ingest_py;
 mod regressor;
@@ -22,8 +23,11 @@ pub use regressor::CatBoostRegressor;
 /// `pyproject.toml`). Plan 08-01 registers only [`CatBoostRegressor`]; the
 /// classifier / ranker / `Pool` and the exception taxonomy land in later plans.
 #[pymodule]
-fn catboost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CatBoostRegressor>()?;
+    // PYAPI-05 typed-exception taxonomy (CatBoostError base + Parameter/Value/
+    // NotFitted subclasses), importable as `catboost_rs.<Name>`.
+    errors::register(py, m)?;
     Ok(())
 }
 
@@ -31,3 +35,5 @@ fn catboost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // root, mirroring the facade crate's `#[cfg(test)] mod error_test;` idiom.
 #[cfg(test)]
 mod ingest_py_test;
+#[cfg(test)]
+mod errors_test;

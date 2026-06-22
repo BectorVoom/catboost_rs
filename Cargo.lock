@@ -624,7 +624,9 @@ name = "catboost-rs-py"
 version = "0.1.0"
 dependencies = [
  "catboost-rs",
+ "cb-core",
  "cb-data",
+ "cb-model",
  "numpy",
  "pyo3",
  "pyo3-arrow",

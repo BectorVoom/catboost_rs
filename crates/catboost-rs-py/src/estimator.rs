@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 
 use catboost_rs::{CatBoostBuilder, CatBoostError, Model, Pool};
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -82,8 +81,8 @@ impl EstimatorBase {
     /// are ignored in this slice (full validation: 08-02).
     ///
     /// # Errors
-    /// [`PyValueError`] if a smoke param is present but not the expected numeric
-    /// type.
+    /// A `PyTypeError`/`PyValueError` (via `extract`) if a smoke param is present
+    /// but not the expected numeric type.
     pub(crate) fn make_builder(&self, py: Python<'_>) -> PyResult<CatBoostBuilder> {
         let _ = &SMOKE_PARAMS; // documents the read set; alias/registry is 08-02.
         let mut builder = CatBoostBuilder::new();
@@ -108,18 +107,11 @@ impl EstimatorBase {
 
 /// Build a [`CatBoostBuilder`] from the params and fit it on an OWNED pool. The
 /// caller is expected to invoke this under `py.detach` (the `pool` is owned, so
-/// no Python buffer borrow is alive — D-11). Maps [`CatBoostError`] to a `PyErr`
-/// (the typed taxonomy lands in 08-02).
+/// no Python buffer borrow is alive — D-11). Returns the typed facade
+/// [`CatBoostError`]; the caller maps it via `errors::to_pyerr` (PYAPI-05).
 ///
 /// # Errors
-/// Returns the training error as a [`PyValueError`] placeholder (the typed
-/// `CatBoostError` Python exception lands in 08-02).
+/// Returns the facade [`CatBoostError`] training error.
 pub(crate) fn fit_pool(builder: CatBoostBuilder, pool: &Pool) -> Result<Model, CatBoostError> {
     builder.fit(pool)
-}
-
-/// Map a facade [`CatBoostError`] to a Python exception. Placeholder mapping for
-/// the 08-01 slice; the full one-variant-per-exception taxonomy is 08-02.
-pub(crate) fn to_pyerr(err: CatBoostError) -> PyErr {
-    PyValueError::new_err(err.to_string())
 }
