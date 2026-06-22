@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 mod errors;
 mod estimator;
 mod ingest_py;
+mod params;
 mod regressor;
 
 pub use regressor::CatBoostRegressor;
@@ -28,6 +29,8 @@ fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // PYAPI-05 typed-exception taxonomy (CatBoostError base + Parameter/Value/
     // NotFitted subclasses), importable as `catboost_rs.<Name>`.
     errors::register(py, m)?;
+    // D-07 registry introspection helper for the param-coverage test.
+    m.add_function(wrap_pyfunction!(params::_param_status, m)?)?;
     Ok(())
 }
 
@@ -37,3 +40,5 @@ fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod ingest_py_test;
 #[cfg(test)]
 mod errors_test;
+#[cfg(test)]
+mod params_test;

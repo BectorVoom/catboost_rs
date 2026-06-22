@@ -15,6 +15,7 @@ use pyo3::types::PyDict;
 use crate::errors::{not_fitted_err, to_pyerr, CatBoostValueError};
 use crate::estimator::{fit_pool, EstimatorBase};
 use crate::ingest_py::numpy_to_owned;
+use crate::params::{make_builder, validate_params};
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
 /// thinnest `__init__` / `fit` / `predict` path; the full sklearn contract and
@@ -53,9 +54,14 @@ impl CatBoostRegressor {
         x: &Bound<'_, PyAny>,
         y: &Bound<'_, PyAny>,
     ) -> PyResult<Py<Self>> {
+        // Validate kwargs against the D-07 registry BEFORE ingest (D-06): reject
+        // known-not-yet (parity gap) and unknown (typo) params with a typed
+        // CatBoostParameterError, so no unsupported param is silently ignored
+        // (threat T-08-05).
+        validate_params(&slf.base.params)?;
         // --- GIL HELD: own the input before any detach (D-11) ---
         let owned = numpy_to_owned(x, Some(y))?;
-        let builder = slf.base.make_builder(py)?;
+        let builder = make_builder(&slf.base.params, py)?;
         // into_pool() inherits cb-data's length/range validation; map its typed
         // error to a ValueError placeholder (typed taxonomy: 08-02).
         let pool = owned

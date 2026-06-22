@@ -1,26 +1,16 @@
-//! Shared estimator base logic for the 08-01 walking-skeleton slice.
+//! Shared estimator base logic: the verbatim kwargs store (D-06) + the fitted
+//! model handle.
 //!
-//! Stores constructor kwargs verbatim (D-06: NO work / validation / coercion in
-//! `__init__`) and maps the five smoke parameters onto the Rust-only
-//! [`CatBoostBuilder`] at `fit()` time. The full param-vocabulary registry, alias
-//! handling, and unknown/unsupported-param rejection (D-05 / D-07) land in plan
-//! 08-02 — here unknown keys are ignored for the smoke.
+//! `__init__` stores constructor kwargs verbatim (D-06: NO work / validation /
+//! coercion). The param-vocabulary registry, alias handling, the
+//! kwargs -> [`CatBoostBuilder`] map, and unknown/unsupported-param rejection
+//! (D-05 / D-07) live in [`crate::params`] and run at `fit()` time.
 
 use std::collections::BTreeMap;
 
 use catboost_rs::{CatBoostBuilder, CatBoostError, Model, Pool};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-
-/// The smoke parameters the 08-01 slice reads off the verbatim kwargs store.
-/// Everything else is ignored here (full registry: 08-02).
-const SMOKE_PARAMS: [&str; 5] = [
-    "iterations",
-    "depth",
-    "learning_rate",
-    "l2_leaf_reg",
-    "random_seed",
-];
 
 /// Shared estimator state: kwargs stored verbatim (D-06) + the fitted model
 /// (`None` until `fit` runs — the not-fitted sentinel; the typed `NotFittedError`
@@ -51,57 +41,6 @@ impl EstimatorBase {
             params,
             model: None,
         })
-    }
-
-    /// Read a stored param as `f64`, if present and numeric.
-    fn get_f64(&self, py: Python<'_>, name: &str) -> PyResult<Option<f64>> {
-        match self.params.get(name) {
-            Some(v) => Ok(Some(v.bind(py).extract::<f64>()?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Read a stored param as `usize`, if present and integral.
-    fn get_usize(&self, py: Python<'_>, name: &str) -> PyResult<Option<usize>> {
-        match self.params.get(name) {
-            Some(v) => Ok(Some(v.bind(py).extract::<usize>()?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Read a stored param as `u64`, if present and integral.
-    fn get_u64(&self, py: Python<'_>, name: &str) -> PyResult<Option<u64>> {
-        match self.params.get(name) {
-            Some(v) => Ok(Some(v.bind(py).extract::<u64>()?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Construct a [`CatBoostBuilder`] from the stored smoke params. Unknown keys
-    /// are ignored in this slice (full validation: 08-02).
-    ///
-    /// # Errors
-    /// A `PyTypeError`/`PyValueError` (via `extract`) if a smoke param is present
-    /// but not the expected numeric type.
-    pub(crate) fn make_builder(&self, py: Python<'_>) -> PyResult<CatBoostBuilder> {
-        let _ = &SMOKE_PARAMS; // documents the read set; alias/registry is 08-02.
-        let mut builder = CatBoostBuilder::new();
-        if let Some(iterations) = self.get_usize(py, "iterations")? {
-            builder = builder.iterations(iterations);
-        }
-        if let Some(depth) = self.get_usize(py, "depth")? {
-            builder = builder.depth(depth);
-        }
-        if let Some(learning_rate) = self.get_f64(py, "learning_rate")? {
-            builder = builder.learning_rate(learning_rate);
-        }
-        if let Some(l2_leaf_reg) = self.get_f64(py, "l2_leaf_reg")? {
-            builder = builder.l2_leaf_reg(l2_leaf_reg);
-        }
-        if let Some(random_seed) = self.get_u64(py, "random_seed")? {
-            builder = builder.random_seed(random_seed);
-        }
-        Ok(builder)
     }
 }
 
