@@ -1,0 +1,148 @@
+//! `CatBoostClassifier` — the classification arm of the native estimator trio
+//! (08-04, PYAPI-03).
+//!
+//! Mirrors [`crate::regressor::CatBoostRegressor`]'s store-verbatim / validate /
+//! ingest / detach / fit structure (the shared base lives in
+//! [`crate::estimator`]), differing in two ways:
+//!
+//! 1. **Default loss.** When the user does NOT pass `loss_function` / `objective`,
+//!    the classifier defaults to a CLASSIFICATION loss (`Logloss`) — the loss
+//!    SELECTS the task (D-05). A regressor would default to `RMSE`.
+//! 2. **Prediction surface.** `predict` returns CLASS LABELS (`(n,)`, via
+//!    [`PredictionType::Class`]); `predict_proba` returns CLASS PROBABILITIES
+//!    shaped `(n, 2)` (`[class-0, class-1]` per object, via
+//!    [`PredictionType::Probability`]) — the upstream binary convention.
+
+use catboost_rs::{Loss, PredictionType};
+use numpy::{PyArray1, PyArray2, ToPyArray};
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+use crate::errors::{not_fitted_err, PyCbError};
+use crate::estimator::{data_to_pool, fit_pool, load_model_path, EstimatorBase};
+use crate::params::{make_builder, validate_params};
+
+/// CatBoost-mirror classifier (sklearn-compatible). Reuses the shared estimator
+/// base, param registry, and ingestion; defaults to `Logloss` and exposes
+/// `predict` (class labels) + `predict_proba` (`(n, 2)` probabilities).
+#[pyclass(name = "CatBoostClassifier", subclass)]
+pub struct CatBoostClassifier {
+    base: EstimatorBase,
+}
+
+#[pymethods]
+impl CatBoostClassifier {
+    /// Store every kwarg verbatim (D-06: NO work in `__init__`). Validation and
+    /// the classification-default loss fire at `fit()` time.
+    #[new]
+    #[pyo3(signature = (**kwargs))]
+    fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        Ok(Self {
+            base: EstimatorBase::from_kwargs(kwargs)?,
+        })
+    }
+
+    /// Fit on a C-contiguous float32 NumPy `X` `(n, k)` (or a native `Pool`) and
+    /// a binary `y` `(n,)`.
+    ///
+    /// Validates kwargs (D-07 registry), ingests + OWNS the input under the GIL
+    /// (D-11), then releases the GIL (`py.detach`) for training. When the user did
+    /// not set `loss_function` / `objective`, the builder's loss is overridden to
+    /// `Logloss` (a classification loss) so the model is a classifier (D-05).
+    ///
+    /// # Errors
+    /// `CatBoostParameterError` on an unknown / unsupported kwarg;
+    /// `CatBoostValueError` on a dtype / layout / shape mismatch (D-12); the typed
+    /// taxonomy on a training failure (08-02 / PYAPI-05).
+    #[pyo3(signature = (x, y = None))]
+    fn fit(
+        mut slf: PyRefMut<'_, Self>,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<Self>> {
+        validate_params(&slf.base.params)?;
+        let pool = data_to_pool(py, x, y)?;
+        let mut builder = make_builder(&slf.base.params, py)?;
+        // The classifier defaults to a CLASSIFICATION loss (D-05). Only override
+        // when the user supplied neither the canonical name nor its alias, so an
+        // explicit `loss_function="CrossEntropy"` (etc.) is honored.
+        if !slf.base.params.contains_key("loss_function") && !slf.base.params.contains_key("objective")
+        {
+            builder = builder.loss(Loss::Logloss);
+        }
+        let model = py.detach(|| fit_pool(builder, &pool)).map_err(PyCbError)?;
+        slf.base.model = Some(model);
+        Ok(slf.into())
+    }
+
+    /// Predict CLASS LABELS for a C-contiguous float32 NumPy `X` `(n, k)` (or a
+    /// native `Pool`). Returns a NumPy `float64` array of length `n` carrying the
+    /// predicted class (`0.0` / `1.0`) via [`PredictionType::Class`].
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on a dtype / layout /
+    /// feature mismatch; the typed taxonomy on a prediction failure.
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostClassifier is not fitted yet; call `fit` before `predict`",
+            )
+        })?;
+        let pool = data_to_pool(py, x, None)?;
+        let preds = py
+            .detach(|| model.predict_with(&pool, PredictionType::Class))
+            .map_err(PyCbError)?;
+        Ok(preds.to_pyarray(py))
+    }
+
+    /// Predict CLASS PROBABILITIES for a C-contiguous float32 NumPy `X` `(n, k)`
+    /// (or a native `Pool`). Returns a NumPy `float64` array shaped `(n, 2)` with
+    /// `[P(class 0), P(class 1)]` per row (the upstream binary convention) via
+    /// [`PredictionType::Probability`].
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on a dtype / layout /
+    /// feature mismatch; the typed taxonomy on a prediction failure.
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostClassifier is not fitted yet; call `fit` before `predict_proba`",
+            )
+        })?;
+        let pool = data_to_pool(py, x, None)?;
+        // The facade returns the two-column probability output flattened row-major
+        // (`[class-0, class-1]` per object). Reshape to `(n, 2)` for the upstream
+        // binary convention.
+        let flat = py
+            .detach(|| model.predict_with(&pool, PredictionType::Probability))
+            .map_err(PyCbError)?;
+        let rows: Vec<Vec<f64>> = flat.chunks_exact(2).map(<[f64]>::to_vec).collect();
+        Ok(PyArray2::from_vec2(py, &rows)?)
+    }
+
+    /// Load a reference model from a `.cbm` (or `.json`) file into a fitted
+    /// `CatBoostClassifier` WITHOUT training (mirrors upstream `load_model`). The
+    /// returned estimator's `model` is `Some(loaded)`; this is the single
+    /// deterministic oracle path (RESEARCH Open Q3, Path (a)).
+    ///
+    /// # Errors
+    /// `CatBoostValueError` on a malformed / unreadable model file (T-08-12).
+    #[staticmethod]
+    fn load_model(path: &str) -> PyResult<Self> {
+        let model = load_model_path(path)?;
+        Ok(Self {
+            base: EstimatorBase::from_model(model),
+        })
+    }
+}

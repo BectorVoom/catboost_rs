@@ -7,14 +7,12 @@
 //! `set_params` / `__sklearn_tags__` / clone / `NotFittedError`), the classifier
 //! / ranker, param validation, and the typed error taxonomy land in later plans.
 
-use catboost_rs::{IngestSource, Pool};
 use numpy::{PyArray1, ToPyArray};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::errors::{not_fitted_err, to_pyerr, CatBoostValueError};
-use crate::estimator::{fit_pool, EstimatorBase};
-use crate::ingest_py::ingest_to_owned;
+use crate::errors::{not_fitted_err, PyCbError};
+use crate::estimator::{data_to_pool, fit_pool, load_model_path, EstimatorBase};
 use crate::params::{make_builder, validate_params};
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
@@ -68,11 +66,24 @@ impl CatBoostRegressor {
         let pool = data_to_pool(py, x, y)?;
         let builder = make_builder(&slf.base.params, py)?;
         // --- owned/quantized data only: safe to release the GIL ---
-        let model = py
-            .detach(|| fit_pool(builder, &pool))
-            .map_err(|e| to_pyerr(&e))?;
+        let model = py.detach(|| fit_pool(builder, &pool)).map_err(PyCbError)?;
         slf.base.model = Some(model);
         Ok(slf.into())
+    }
+
+    /// Load a reference model from a `.cbm` (or `.json`) file into a fitted
+    /// `CatBoostRegressor` WITHOUT training (mirrors upstream `load_model`). The
+    /// returned estimator's `model` is `Some(loaded)`; this is the single
+    /// deterministic oracle path (RESEARCH Open Q3, Path (a)).
+    ///
+    /// # Errors
+    /// `CatBoostValueError` on a malformed / unreadable model file (T-08-12).
+    #[staticmethod]
+    fn load_model(path: &str) -> PyResult<Self> {
+        let model = load_model_path(path)?;
+        Ok(Self {
+            base: EstimatorBase::from_model(model),
+        })
     }
 
     /// Predict raw model scores for a C-contiguous float32 NumPy `X` `(n, k)`.
@@ -96,32 +107,7 @@ impl CatBoostRegressor {
         // --- GIL HELD: own the input before any detach (D-11) ---
         // Accept a framework object OR a native Pool, same as fit.
         let pool = data_to_pool(py, x, None)?;
-        let preds = py
-            .detach(|| model.predict(&pool))
-            .map_err(|e| to_pyerr(&e))?;
+        let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         Ok(preds.to_pyarray(py))
     }
-}
-
-/// Build a facade [`Pool`] from `x` (+ optional `y`), accepting EITHER a native
-/// [`crate::pool::Pool`] OR a framework object (NumPy / Pandas / Arrow / Polars).
-///
-/// When `x` is a `Pool`, its inherited `into_pool()` validation runs (and any `y`
-/// is ignored — the Pool already carries its label). Otherwise `x`/`y` route
-/// through the shared ingest adapter. In both cases the result is fully owned, so
-/// the caller may `py.detach()` immediately (D-11 / PYAPI-06).
-///
-/// # Errors
-/// [`CatBoostValueError`] on any dtype / layout / length / nullability failure.
-fn data_to_pool(
-    py: Python<'_>,
-    x: &Bound<'_, PyAny>,
-    y: Option<&Bound<'_, PyAny>>,
-) -> PyResult<Pool> {
-    if let Ok(pool_ref) = x.cast::<crate::pool::Pool>() {
-        return pool_ref.borrow().to_pool();
-    }
-    ingest_to_owned(py, x, y, None)?
-        .into_pool()
-        .map_err(|e| CatBoostValueError::new_err(e.to_string()))
 }

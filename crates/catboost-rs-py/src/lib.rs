@@ -12,14 +12,18 @@
 
 use pyo3::prelude::*;
 
+mod classifier;
 mod errors;
 mod estimator;
 mod ingest_py;
 mod params;
 mod pool;
+mod ranker;
 mod regressor;
 
+pub use classifier::CatBoostClassifier;
 pub use pool::Pool;
+pub use ranker::CatBoostRanker;
 pub use regressor::CatBoostRegressor;
 
 /// The `catboost_rs` Python module (D-09 import name; `module-name` in
@@ -28,6 +32,9 @@ pub use regressor::CatBoostRegressor;
 #[pymodule]
 fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CatBoostRegressor>()?;
+    // PYAPI-03 native classifier + ranker (the CatBoost-mirror estimator trio).
+    m.add_class::<CatBoostClassifier>()?;
+    m.add_class::<CatBoostRanker>()?;
     // PYAPI-03 native Pool — a user can pass an explicit Pool to fit/predict.
     m.add_class::<Pool>()?;
     // PYAPI-05 typed-exception taxonomy (CatBoostError base + Parameter/Value/
