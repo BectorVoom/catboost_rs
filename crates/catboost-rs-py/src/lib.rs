@@ -12,10 +12,22 @@
 
 use pyo3::prelude::*;
 
+mod estimator;
+mod ingest_py;
+mod regressor;
+
+pub use regressor::CatBoostRegressor;
+
 /// The `catboost_rs` Python module (D-09 import name; `module-name` in
-/// `pyproject.toml`). Plan 08-01 Task 2 stands up the empty module; Task 3
-/// registers [`CatBoostRegressor`].
+/// `pyproject.toml`). Plan 08-01 registers only [`CatBoostRegressor`]; the
+/// classifier / ranker / `Pool` and the exception taxonomy land in later plans.
 #[pymodule]
-fn catboost_rs(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn catboost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<CatBoostRegressor>()?;
     Ok(())
 }
+
+// Source/test separation (CLAUDE.md): `*_test` modules are declared at the crate
+// root, mirroring the facade crate's `#[cfg(test)] mod error_test;` idiom.
+#[cfg(test)]
+mod ingest_py_test;

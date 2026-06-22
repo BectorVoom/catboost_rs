@@ -14,7 +14,15 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # PyO3-org stack pinned & legitimacy-audited (RESEARCH Package Legitimacy Audit).
-pyo3 = { version = "0.29.0", features = ["abi3-py312", "extension-module"] }
+# `extension-module` is NOT enabled unconditionally here: it suppresses linking
+# libpython, which breaks `cargo test` (no Python symbols at test link time). The
+# wheel build turns it on via pyproject `[tool.maturin] features =
+# ["pyo3/extension-module"]`; `cargo test` links libpython normally.
+# `auto-initialize` lets the Rust `*_test.rs` unit tests boot the interpreter for
+# `Python::attach`. It is inert under the wheel build (maturin enables
+# `extension-module`, which takes precedence and links against the host
+# interpreter rather than initializing one).
+pyo3 = { version = "0.29.0", features = ["abi3-py312", "auto-initialize"] }
 numpy = "0.29.0"
 pyo3-arrow = "0.19.0"
 # default-features = false: backend selection flows ONLY through this crate's
