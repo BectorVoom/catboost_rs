@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 08-02-PLAN.md
-last_updated: "2026-06-22T23:19:58.588Z"
-last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
+stopped_at: Completed 08-06-PLAN.md
+last_updated: "2026-06-23T00:00:00.000Z"
+last_activity: 2026-06-23 -- 08-06 COMPLETE (PYAPI-06 free-threaded-aware: gil_used=false + buffer-safety test + FREE_THREADING.md; free-threaded RUN scoped-deferred, no python3.13t in-env)
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 7
-  completed_plans: 5
+  completed_plans: 6
   percent: 0
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
-Plan: 6 of 7 (08-01 COMPLETE)
-Status: Ready to execute
-Last activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
+Plan: 7 of 7 (08-01..08-06 COMPLETE)
+Status: Ready to execute 08-07
+Last activity: 2026-06-23 -- 08-06 COMPLETE (PYAPI-06 free-threaded-aware design)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -402,8 +402,10 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T23:19:40.671Z
-Stopped at: Completed 08-02-PLAN.md
+Last session: 2026-06-23T00:00:00.000Z
+Stopped at: Completed 08-06-PLAN.md
+Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
+Stopped at (prior): Completed 08-02-PLAN.md
 Stopped at (prior): Phase 8 context gathered
 Stopped at (prior): Phase 7.6 context gathered
 Stopped at (prior): Phase 6.5 context gathered
