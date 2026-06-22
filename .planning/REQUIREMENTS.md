@@ -185,10 +185,10 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | GPU-04 | Phase 7.1 | Complete |
 | GPU-05 | Phase 7.1 | Complete |
 | GPU-06 | Phase 7.6 | Complete (Phase 7.6) — ε=1e-4, vs Rust CPU path |
-| PYAPI-01 | Phase 8 | Pending |
+| PYAPI-01 | Phase 8 | In progress (08-01: cdylib + maturin abi3-py312 builds, cpu/rocm feature passthrough; wheel matrix → 08-07) |
 | PYAPI-02 | Phase 8 | Pending |
-| PYAPI-03 | Phase 8 | Pending |
-| PYAPI-04 | Phase 8 | Pending |
+| PYAPI-03 | Phase 8 | In progress (08-01: CatBoostRegressor fit/predict; full param parity + clf/ranker → 08-02/08-04) |
+| PYAPI-04 | Phase 8 | In progress (08-01: NumPy float32 ingest + dtype/contiguity reject; Pandas/Arrow/Polars → 08-03) |
 | PYAPI-05 | Phase 8 | Pending |
 | PYAPI-06 | Phase 8 | Pending |
 

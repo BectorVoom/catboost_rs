@@ -8,7 +8,7 @@
 Plans:
 **Wave 1**
 
-- [ ] 08-01-PLAN.md — Walking skeleton: scaffold the PyO3 crate + facade feature passthrough + test venv + thinnest CatBoostRegressor.fit(numpy).predict() end-to-end (PYAPI-01/03/04)
+- [x] 08-01-PLAN.md — Walking skeleton: scaffold the PyO3 crate + facade feature passthrough + test venv + thinnest CatBoostRegressor.fit(numpy).predict() end-to-end (PYAPI-01/03/04) — COMPLETE (commits 1526805 / 9b16c4c; Rust 4/4 + pytest 5/5 green; cpu-free rocm verified)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 

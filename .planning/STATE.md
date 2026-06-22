@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Phase 8 context gathered
-last_updated: "2026-06-21T11:27:18.086Z"
-last_activity: 2026-06-21 -- Phase 08 planning complete
+status: executing
+stopped_at: 08-01 COMPLETE
+last_updated: "2026-06-23T00:00:00.000Z"
+last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE
 progress:
-  total_phases: 20
-  completed_phases: 17
-  total_plans: 113
-  completed_plans: 113
-  percent: 85
+  total_phases: 1
+  completed_phases: 0
+  total_plans: 7
+  completed_plans: 1
+  percent: 14
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 7.6 — gpu-tolerance-rocm-validation-sign-off
+**Current focus:** Phase 08 — python-bindings-dual-api-packaging
 
 ## Current Position
 
-Phase: 8
-Plan: Not started
-Status: Phase 7.6 plans done; GPU-03/GPU-06 closed, Phase 7 umbrella closed
-Last activity: 2026-06-21 -- Phase 08 planning complete
+Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
+Plan: 2 of 7 (08-01 COMPLETE)
+Status: Executing Phase 08
+Last activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
 
@@ -158,6 +158,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.5 P04 | ~5m | 2 tasks | 2 files |
 | Phase 07.5 P05 | 6min | 2 tasks | 4 files |
 | Phase 07.6 P01 | 25 | 2 tasks | 2 files |
+| Phase 08 P01 | ~75min | 3 tasks (1 decision + 2 impl) | 12 files |
 
 ## Accumulated Context
 
@@ -165,6 +166,8 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [08-01 walking skeleton — COMPLETE; PYAPI-01/03/04, commits 1526805 (scaffold) / 9b16c4c (regressor)]: The Phase-8 vertical slice is PROVEN — `import catboost_rs; CatBoostRegressor(iterations=10,depth=3).fit(X32,y32).predict(X32)` returns a finite NumPy float64 array through the REAL `CatBoostBuilder::fit`/`Model::predict` (not a stub). New `crates/catboost-rs-py` cdylib+rlib (pyo3 0.29 abi3-py312, numpy 0.29, pyo3-arrow 0.19). **Task-1 packaging decision AUTO-RESOLVED to `approve-research-default`** (A2 abi3-py312 cpu wheel primary + free-threaded wheel DEFERRED + PYAPI-06 as code property; A3 two distributions catboost-rs + catboost-rs-rocm with `[rocm]` extra; pyo3-arrow 0.19 pin) — `auto_advance` false but the decision is pre-locked by CONTEXT Deferred Ideas and affects only 08-07's wheel matrix, not 08-01 code; re-confirm with user before first wheel publish. **LANDMINE EXTENDED (Rule-3 deviation):** the cpu-free-rocm feature passthrough needed `default-features=false` + a `[features]` block on THREE crates (cb-train, cb-model, AND the facade) — not just the facade as the plan anticipated — because cb-train (facade normal dep) and cb-model (facade normal dep, depends on cb-train) both pulled cb-backend/cb-train default cpu; verified `cargo tree -p catboost-rs-py --features rocm` now cpu-free (pulls cubecl-hip). **PyO3 build gotcha:** `extension-module` is wheel-only via pyproject (NOT unconditional in Cargo.toml — it breaks `cargo test` libpython linking); added `auto-initialize` for the Rust test interpreter. Own-before-detach (D-11) in place at ingest call sites; `gil_used=false` deferred to 08-06. Test venv `.venv-py8` (maturin 1.14.1 + sklearn 1.9.0 + numpy/pandas/pyarrow/polars/pytest). Rust 4/4 + pytest 5/5 GREEN. STUBS (plan-scheduled): error-mapping→PyValueError placeholder (08-02/05), 5-smoke-param-only registry (08-02), NumPy-only ingest (08-03), no sklearn glue (08-05). PRE-EXISTING out-of-scope: root disk ~100% (reclaimed 51GB from stale target/debug/deps oracle binaries); maturin defaults to project `.venv` unless `VIRTUAL_ENV` set. gsd-tools CLI ABSENT → STATE/ROADMAP/REQUIREMENTS updated MANUALLY. Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-01-SUMMARY.md. NEXT: 08-02.
 
 - [07.5-03 host-light single-tree grow loop — COMPLETE; SC-3 structure parity GREEN]: `grow_oblivious_tree` (+ private `_into`) in gpu_runtime.rs is the host-light per-depth device-resident driver (D-05 / D-7.5-02) mirroring `oblivious_tree_doc_parallel_structure_searcher.cpp:63-158`: per level fill (FROZEN 7.3) → score+deterministic argmin (Plan A `launch_find_optimal_split_pointwise_into`) → ONE O(1) `BestSplit` read-back → host integer split decision (strict first-wins) → `partition_split` (forward-bit, Task 1) → `partition_update` (Task 1), over persistent handles threaded through ONE ComputeClient; at the leaves ONE 2^depth part-stats read-back + host leaf values via `cb_compute::calc_average`. `GrownTree` = splits + per-object leaf_of + leaf_values + part_stats. **MVP scope = depth==1 (single split / stump):** at level 0 the FROZEN 7.3 whole-dataset (partCount==1) histogram score IS the EXACT CPU level-0 score, so the O(1)-per-level read-back holds by construction; **depth>1 surfaces a typed `CbError::OutOfRange` naming the partition-aware (fullPass=false) histogram as the EXPLICIT tracked forward dependency** (RESEARCH A2 / 07.5-04) — NOT a mislabeled stump. Structure cross-oracle is INLINE (cpu_stump_score + cpu_best_stump, transcribed from cb_compute L2 semantics + select_best_candidate strict-first-wins; NEVER imports cb-train — the D-7.5-04 / Plan-A landmine). **rocm gfx1100: `single_tree::matches_cpu_greedy_search` GREEN for n in {1,37,1000} — STRUCTURE EXACT (device split == CPU greedy first-wins; per-object leaf_of == leaf_index), leaf-value divergence REPORTED abs=0.0 rel=0.0 (<1e-9, NOT signed off — 7.6 owns the epsilon).** `depth_gt_one_is_tracked_forward_dependency` pins the typed scope error. cuda + wgpu build clean; SC-4 cb-compute cubecl==0; cb-core/cb-model/cb-compute/cb-train byte-unchanged. gsd-tools CLI ABSENT → STATE/ROADMAP updated MANUALLY. Commit b400e0a (feat, GREEN).
 
@@ -387,8 +390,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-21T06:26:28.590Z
-Stopped at: Phase 8 context gathered
+Last session: 2026-06-23T00:00:00.000Z
+Stopped at: 08-01 COMPLETE (commits 1526805 scaffold / 9b16c4c regressor) — Phase-8 walking skeleton: CatBoostRegressor fit/predict end-to-end over NumPy through the real facade; cpu-free rocm passthrough across cb-train/cb-model/facade; .venv-py8 test venv; PYAPI-01/03/04 done; Rust 4/4 + pytest 5/5 green. Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-01-SUMMARY.md. NEXT: 08-02.
+Stopped at (prior): Phase 8 context gathered
 Stopped at (prior): Phase 7.6 context gathered
 Stopped at (prior): Phase 6.5 context gathered
 Stopped at (prior): 06.3-05 COMPLETE (commits 086550d Task1 / 274fbb9 Task2) — LOSS-05 Wave D, the nine ranking metrics NDCG/DCG/MAP/MRR/ERR/PFound/PrecisionAt/RecallAt/QueryAUC land as EVAL-ONLY on a widened `EvalMetric::eval_grouped` sibling seam (D-6.3-05); flat eval byte-identical (D-04). Gates: unit 19/19 + 33/33, oracle 18/18, cb-train lib 173/173, D-04 no-regression green. LOSS-05 / SC-2 CLOSED. Resume file: .planning/phases/06.3-ranking-losses-and-metrics/06.3-05-SUMMARY.md.
