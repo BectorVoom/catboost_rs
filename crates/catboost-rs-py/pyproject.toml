@@ -25,4 +25,9 @@ rocm = ["catboost-rs-rocm"]
 [tool.maturin]
 # Import name is `catboost_rs` (D-09) — no shadowing of the real `catboost`.
 module-name = "catboost_rs"
+# `extension-module` is wheel-only (suppresses libpython linking, which would
+# break `cargo test`); it lives here, not in the crate's unconditional pyo3
+# deps. The abi3-py312 limited-API tag comes from the `pyo3` `abi3-py312` Cargo
+# feature (Cargo.toml) — one wheel covers CPython 3.12/3.13/3.14 GIL builds
+# (PYAPI-01 primary deliverable). See PACKAGING.md.
 features = ["pyo3/extension-module"]

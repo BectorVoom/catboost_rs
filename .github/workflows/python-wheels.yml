@@ -1,0 +1,67 @@
+name: Python wheels
+
+# Builds the PYAPI-01 primary deliverable: the abi3-py312 CPU wheel for the
+# `catboost-rs` distribution (one wheel covers CPython 3.12/3.13/3.14 GIL
+# builds). This workflow builds the CPU wheel ONLY.
+#
+# NOTE: the ROCm wheel (`catboost-rs-rocm` distribution) is NEVER built here.
+# Since Phase 7 (GPU-03 / Phase 7.6 D-06) the rocm arm pulls in cubecl-hip-sys
+# and requires the HIP/ROCm toolchain + an AMD GPU, which GitHub runners do not
+# have. The rocm wheel is the authoritative GPU artifact built LOCALLY/manually
+# in-env on gfx1100 only — never in GitHub Actions. See
+# crates/catboost-rs-py/PACKAGING.md (two-distribution model, build/publish split).
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-abi3-wheel:
+    name: CPU abi3-py312 wheel (build + import smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # abi3-py312 floor: build against 3.12, the resulting wheel installs on any
+      # CPython >= 3.12 (GIL). One wheel, all minor versions.
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Honors rust-toolchain.toml (stable channel).
+      - name: Install Rust toolchain
+        run: rustup show
+
+      # maturin[patchelf] so the manylinux .so rpath is set on the distributable
+      # wheel (08-01 noted the missing-patchelf warning).
+      - name: Install maturin
+        run: python -m pip install "maturin[patchelf]>=1.9.4,<2.0"
+
+      # Build the CPU wheel ONLY. --features cpu forwards through the 08-01
+      # passthrough; abi3 comes from the pyo3 abi3-py312 Cargo feature.
+      - name: Build cpu abi3-py312 wheel
+        working-directory: crates/catboost-rs-py
+        run: maturin build --features cpu --release
+
+      # The wheel tag MUST contain `abi3` — proves the limited-API build.
+      - name: Assert abi3 wheel tag
+        run: |
+          set -euo pipefail
+          ls target/wheels/*abi3*.whl
+          test "$(ls target/wheels/*abi3*.whl 2>/dev/null | grep -c abi3)" -ge 1
+
+      # Fresh-venv install + import smoke: `import catboost_rs` resolves and
+      # exposes CatBoostRegressor.
+      - name: Import smoke (fresh venv)
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/pip install target/wheels/*abi3*.whl
+          /tmp/wheel-smoke/bin/python -c "import catboost_rs; catboost_rs.CatBoostRegressor; print('import OK:', catboost_rs.__name__)"
+
+      - name: Upload cpu wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: catboost-rs-cpu-abi3-wheel
+          path: target/wheels/*abi3*.whl
