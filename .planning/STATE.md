@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: 08-01 COMPLETE
-last_updated: "2026-06-23T00:00:00.000Z"
-last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE
+stopped_at: Completed 08-02-PLAN.md
+last_updated: "2026-06-22T22:38:06.334Z"
+last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 7
-  completed_plans: 1
-  percent: 14
+  completed_plans: 2
+  percent: 0
 ---
 
 # Project State
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
-Plan: 2 of 7 (08-01 COMPLETE)
-Status: Executing Phase 08
+Plan: 3 of 7 (08-01 COMPLETE)
+Status: Ready to execute
 Last activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 
 Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
@@ -159,6 +159,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 07.5 P05 | 6min | 2 tasks | 4 files |
 | Phase 07.6 P01 | 25 | 2 tasks | 2 files |
 | Phase 08 P01 | ~75min | 3 tasks (1 decision + 2 impl) | 12 files |
+| Phase 08 P02 | 40min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -343,6 +344,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 07.5-04: D-7.5-06 budget characterized on clear-margin fixture — per-tree structure EXACT + stable run-to-run (4x5 trees), max leaf-value div 6.6e-13, NO argmax-flip; REPORTED not signed off (7.6 owns epsilon)
 - [Phase ?]: 07.5-05: 5 device score-calcer arms (L2+Cosine/Solar/LOO/Sat) on one find_optimal_split_kernel comptime selector; transcribed verbatim from cb-compute score.rs, f64 fold; rocm gfx1100 STRUCTURE-exact every fn, scores ~2e-16 (Cosine)/0.0 (Solar/LOO/Sat)
 - [Phase ?]: 07.6-01: GPU-06 evidence harness, 6 families, score_split non-zero abs=7.451e-9, rocm 3/3 PASS gfx1100
+- [Phase 08]: 08-02: orphan rule (E0117) — local PyCbError newtype + to_pyerr free fn instead of impl From<facade error> for PyErr (both foreign)
+- [Phase 08]: 08-02: NotFittedError needs 2 bases (CatBoostError+ValueError); built dynamically via type(name,bases,{}) since create_exception! is single-parent
+- [Phase 08]: 08-02: D-07 registry = 119 upstream params, 23 IMPLEMENTED (incl aliases) / 96 KNOWN_NOT_YET parity gaps; validated at fit() not __init__
 
 ### Pending Todos
 
@@ -390,8 +394,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T00:00:00.000Z
-Stopped at: 08-01 COMPLETE (commits 1526805 scaffold / 9b16c4c regressor) — Phase-8 walking skeleton: CatBoostRegressor fit/predict end-to-end over NumPy through the real facade; cpu-free rocm passthrough across cb-train/cb-model/facade; .venv-py8 test venv; PYAPI-01/03/04 done; Rust 4/4 + pytest 5/5 green. Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-01-SUMMARY.md. NEXT: 08-02.
+Last session: 2026-06-22T22:38:06.328Z
+Stopped at: Completed 08-02-PLAN.md
 Stopped at (prior): Phase 8 context gathered
 Stopped at (prior): Phase 7.6 context gathered
 Stopped at (prior): Phase 6.5 context gathered

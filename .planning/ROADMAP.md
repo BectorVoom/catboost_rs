@@ -4,7 +4,7 @@
 **Mode:** mvp
 **Depends on**: Phase 7
 **Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAPI-06
-**Plans:** 7 plans
+**Plans:** 2/7 plans executed
 Plans:
 **Wave 1**
 
@@ -12,7 +12,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 08-02-PLAN.md — Typed exception taxonomy + full param-vocabulary registry validating at fit() (PYAPI-05, PYAPI-03; D-05/D-06/D-07)
+- [x] 08-02-PLAN.md — Typed exception taxonomy + full param-vocabulary registry validating at fit() (PYAPI-05, PYAPI-03; D-05/D-06/D-07)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
