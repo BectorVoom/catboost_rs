@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-06-PLAN.md
-last_updated: "2026-06-23T00:00:00.000Z"
-last_activity: 2026-06-23 -- 08-06 COMPLETE (PYAPI-06 free-threaded-aware: gil_used=false + buffer-safety test + FREE_THREADING.md; free-threaded RUN scoped-deferred, no python3.13t in-env)
+last_updated: "2026-06-22T23:50:16.184Z"
+last_activity: 2026-06-23 -- 08-06 COMPLETE (PYAPI-06 free-threaded-aware design)
 progress:
   total_phases: 1
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 7
-  completed_plans: 6
-  percent: 0
+  completed_plans: 7
+  percent: 100
 ---
 
 # Project State
@@ -384,6 +384,7 @@ None yet.
 - **RESOLVED — Plan 05-08/05-10 (GAP 1, ORD-02) (2026-06-14).** The ordered split-scoring subsystem (05-08) + train() wiring (05-10) landed and the FULL multi-tree ordered_boost_e2e oracle now passes ≤1e-5 vs upstream catboost 1.2.10 (commit 301f54c). ORD-02 e2e CLOSED. Original under-scope analysis retained below for history:
 - **(history) BLOCKED — Plan 05-08 (GAP 1, ORD-02) under-scoped; re-scope required (2026-06-14).** Executor analysis (grounded in upstream catboost 1.2.10 `approx_calcer.cpp`/`greedy_tensor_search.cpp` + empirical run: ordered vs plain predictions differ max 0.70 on the e2e config) found the plan's two must-haves are in tension. Upstream ordered boosting differs from Plain in the **tree STRUCTURE** — splits are scored on per-segment ordered derivatives across the learning fold's `BodyTailArr` (multi-segment histogram score reduction), recomputed each iteration via `UpdateApproxDeltasHistoricallyImpl` (= our `ordered_approx_delta_simple`). Final leaf values still come from `CalcLeafValuesSimple` on the averaging fold (same as Plain). `tree.rs` has **NO ordered/body-tail-segment split-scoring path**, so wiring `ordered_approx_delta_simple` into the leaf-update alone reproduces Plain tree structure with a perturbed leaf-update — fails the ≤1e-5-vs-upstream oracle. True ORD-02 parity needs a NEW ordered split-scoring subsystem in `tree.rs` (per-learning-fold `BodyTailArr` state, per-segment ordered-derivative recompute, cross-segment histogram score), comparable in size to the Plain tree-search and entangled with the D-11 multi-tree RNG residual. **User decision (2026-06-14): re-scope via `/gsd-plan-phase 5 --gaps`.** No commits made; tree clean. 05-09 (tensor CTR wiring) depends on 05-08 → also blocked.
 - 06.3-13: PairLogitPairwise per-stage oracle still #[ignore]'d (escalate-don't-weaken) — true gap is split-selection needing the pairwise split-scorer TPairwiseScoreCalcer (pairwise_scoring.cpp), a new subsystem (Rule 4); diverges tree0 split1 f0 vs f1
+- 08-07 Task 2: rocm wheel BUILD blocked (Rule 4 architectural) — facade fit() hardwired to cb_backend::CpuBackend (only cb-compute::Runtime impl, cfg(feature=cpu)); catboost-rs does not compile under --features rocm. Decision needed before any rocm wheel can build.
 
 ### Quick Tasks Completed
 
@@ -402,7 +403,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T00:00:00.000Z
+Last session: 2026-06-22T23:50:11.652Z
 Stopped at: Completed 08-06-PLAN.md
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
 Stopped at (prior): Completed 08-02-PLAN.md
