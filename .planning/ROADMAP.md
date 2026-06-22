@@ -4,7 +4,7 @@
 **Mode:** mvp
 **Depends on**: Phase 7
 **Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAPI-06
-**Plans:** 4/7 plans executed
+**Plans:** 5/7 plans executed
 Plans:
 **Wave 1**
 
@@ -24,7 +24,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 08-05-PLAN.md — sklearn contract (get/set_params, __sklearn_tags__, clone, NotFitted) + check_estimator gate with documented-skip allowlist (PYAPI-02; D-03/D-04)
+- [x] 08-05-PLAN.md — sklearn contract (get/set_params, __sklearn_tags__, clone, NotFitted) + check_estimator gate with documented-skip allowlist (PYAPI-02; D-03/D-04)
 
 **Wave 6** *(blocked on Wave 5 completion)*
 

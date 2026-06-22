@@ -93,7 +93,7 @@
 ### Python Bindings & Packaging
 
 - [ ] **PYAPI-01**: PyO3 + maturin per-backend wheels (`cpu` + `rocm` minimum), `abi3-py312`, Python ≥ 3.12
-- [ ] **PYAPI-02**: scikit-learn compatible API — `fit`/`predict`/`predict_proba`/`score`/`get_params`/`set_params`; passes `check_estimator`
+- [x] **PYAPI-02**: scikit-learn compatible API — `fit`/`predict`/`predict_proba`/`score`/`get_params`/`set_params`; passes `check_estimator`
 - [x] **PYAPI-03**: CatBoost-native API — `Pool`, `CatBoostClassifier`/`Regressor`/`Ranker`, full parameter-name parity and default values
 - [x] **PYAPI-04**: Python input — NumPy, Pandas, Arrow, Polars with dtype/contiguity validation
 - [x] **PYAPI-05**: Typed `thiserror` → specific Python exception mapping with actionable messages
@@ -186,7 +186,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | GPU-05 | Phase 7.1 | Complete |
 | GPU-06 | Phase 7.6 | Complete (Phase 7.6) — ε=1e-4, vs Rust CPU path |
 | PYAPI-01 | Phase 8 | In progress (08-01: cdylib + maturin abi3-py312 builds, cpu/rocm feature passthrough; wheel matrix → 08-07) |
-| PYAPI-02 | Phase 8 | Pending |
+| PYAPI-02 | Phase 8 | Complete |
 | PYAPI-03 | Phase 8 | In progress (08-01: CatBoostRegressor fit/predict; full param parity + clf/ranker → 08-02/08-04) |
 | PYAPI-04 | Phase 8 | In progress (08-01: NumPy float32 ingest + dtype/contiguity reject; Pandas/Arrow/Polars → 08-03) |
 | PYAPI-05 | Phase 8 | Complete |

@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-02-PLAN.md
-last_updated: "2026-06-22T23:05:37.333Z"
+last_updated: "2026-06-22T23:19:58.588Z"
 last_activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 7
-  completed_plans: 4
+  completed_plans: 5
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
-Plan: 5 of 7 (08-01 COMPLETE)
+Plan: 6 of 7 (08-01 COMPLETE)
 Status: Ready to execute
 Last activity: 2026-06-23 -- 08-01 walking skeleton COMPLETE (CatBoostRegressor fit/predict end-to-end over NumPy; cpu-free rocm passthrough; PYAPI-01/03/04)
 
@@ -162,6 +162,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 08 P02 | 40min | 2 tasks | 6 files |
 | Phase 08 P03 | 12min | 2 tasks | 9 files |
 | Phase 08 P04 | 5min | 2 tasks | 8 files |
+| Phase 08 P05 | ~25min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -352,6 +353,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 08-03: Arrow Python path validates Float32 (reads Float32Array directly from pyo3-arrow RecordBatch), NOT cb-data Float64-only ArrowColumns adapter
 - [Phase ?]: 08-03: own-before-detach chokepoint is data_to_pool (fit/predict) + Pool::to_pool — only owned &Pool crosses py.detach (PYAPI-06 code property)
 - [Phase ?]: 08-04: predict_proba=(n,2) [P(c0),P(c1)]; classifier defaults loss to Logloss (D-05); load_model = single deterministic Python oracle path, bit-exact vs catboost 1.2.10 model_serde fixtures
+- [Phase ?]: 08-05: CatBoostRanker presents regressor-like __sklearn_tags__ but is EXCLUDED from check_estimator gate (no native sklearn ranker contract)
+- [Phase ?]: 08-05: NotFittedError stays binding-local (CatBoostError+ValueError, not sklearn's) to avoid hard sklearn runtime dep; check_estimators_unfitted is in the documented xfail allowlist
 
 ### Pending Todos
 
@@ -399,7 +402,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T23:05:20.897Z
+Last session: 2026-06-22T23:19:40.671Z
 Stopped at: Completed 08-02-PLAN.md
 Stopped at (prior): Phase 8 context gathered
 Stopped at (prior): Phase 7.6 context gathered
