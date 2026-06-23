@@ -19,6 +19,26 @@
 # build wrapper). The Cargo manifest is shared (crates/catboost-rs-py/Cargo.toml);
 # only the [project].name and the absence of the [rocm] extra differ from the cpu
 # pyproject.
+#
+# Build-host note (08-08): maturin's wheel-repair step bundles the HIP shared libs
+# via `patchelf` — install it first (`pip install patchelf` into the build venv) or
+# the build fails at "Failed to execute 'patchelf'".
+#
+# RUNTIME note (08-08, validated in-env on gfx1100 / ROCm 7.1.1): the cubecl-hip
+# JIT (`libhiprtc`) resolves its companion comgr/LLVM bitcode via the ROCm install
+# path at kernel-compile time. The wheel-bundled `libhiprtc` is patchelf-renamed and
+# loses that resolution, so a GPU `fit()` JIT-compiling a `#[cube]` der kernel
+# segfaults inside `HipContext::compile_kernel` (a null JIT-log strlen). Run the
+# rocm wheel against the SYSTEM ROCm libs so the JIT finds its data files:
+#
+#   ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
+#   LD_PRELOAD=/opt/rocm/lib/libhiprtc.so.7:/opt/rocm/lib/libamdhip64.so.7 \
+#   python -c "import catboost_rs; ..."
+#
+# This is a wheel-runtime environment requirement (the rocm wheel is an in-env
+# artifact, D-06), NOT a code defect: the same kernels JIT cleanly under
+# `cargo test --features rocm`. Bundling the comgr bitcode tree into the wheel (so
+# the LD_PRELOAD is unnecessary) is a forward packaging task.
 
 [build-system]
 requires = ["maturin>=1.9.4,<2.0"]
