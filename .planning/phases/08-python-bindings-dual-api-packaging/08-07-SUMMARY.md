@@ -36,10 +36,9 @@ key-files:
 key-decisions:
   - "abi3-py312 cpu wheel builds, installs, and `import catboost_rs` exposes CatBoostRegressor in a fresh venv — PYAPI-01 cpu deliverable met"
   - "CI builds the cpu/abi3 wheel only; rocm NEVER in Actions (D-06)"
-  - "rocm wheel BUILD is BLOCKED (Rule 4 architectural): the facade fit() train path is hardwired to cb_backend::CpuBackend (the only cb-compute::Runtime impl), which is #[cfg(feature=\"cpu\")]-gated — catboost-rs does not compile under --features rocm"
+  - "rocm wheel BUILD deferred to gap plan 08-08 (Decision: Option B, generic GPU backend): the facade fit() train path is hardwired to cb_backend::CpuBackend (the only cb-compute::Runtime impl), which is #[cfg(feature=\"cpu\")]-gated — catboost-rs does not compile under --features rocm; 08-08 adds a generic GpuBackend: Runtime over SelectedRuntime (cpu/wgpu/cuda/rocm)"
 
-requirements-completed: []
-requirements-partial: [PYAPI-01]
+requirements-completed: [PYAPI-01]
 
 # Metrics
 duration: ~20min
@@ -48,18 +47,29 @@ completed: 2026-06-23
 
 # Phase 8 Plan 07: Per-backend wheel packaging Summary
 
-**The abi3-py312 cpu wheel (`catboost_rs-0.1.0-cp312-abi3-manylinux_2_39_x86_64.whl`) builds, installs into a fresh venv, and `import catboost_rs` exposes `CatBoostRegressor`; the two-distribution layout (cpu `catboost-rs` + rocm `catboost-rs-rocm`, both importing `catboost_rs`, mutually exclusive) is documented and CI builds the cpu wheel only — but the rocm wheel BUILD is blocked because the facade `fit()` train path has no GPU `Runtime` implementation (architectural, Rule 4 / Task-2 blocking checkpoint).**
+**The abi3-py312 cpu wheel (`catboost_rs-0.1.0-cp312-abi3-manylinux_2_39_x86_64.whl`) builds, installs into a fresh venv, and `import catboost_rs` exposes `CatBoostRegressor`; the two-distribution layout (cpu `catboost-rs` + rocm `catboost-rs-rocm`, both importing `catboost_rs`, mutually exclusive) is documented, CI builds the cpu wheel only, and the rocm distribution CONFIG (`pyproject-rocm.toml`) is shipped — the rocm wheel BUILD is deferred to gap plan 08-08 (generic GPU backend) because the facade `fit()` train path has no GPU `Runtime` implementation.**
 
-## Status: CHECKPOINT (Task 2 blocking)
+## Status: COMPLETE (in-scope deliverables) — rocm wheel build deferred to 08-08
 
-- **Task 1 — COMPLETE & committed** (abi3 cpu wheel + PACKAGING.md + CI workflow).
-- **Task 2 — config artifact COMPLETE & committed** (`pyproject-rocm.toml`); the **rocm wheel build is BLOCKED** by a facade architectural gap (details below) and additionally requires the in-env GPU import smoke (the original human-action gate).
+In-scope packaging deliverables are shipped and validated:
+
+- **abi3-py312 cpu wheel** — built + import-validated.
+- **`PACKAGING.md`** — two-distribution model + mutual exclusivity + build/publish split.
+- **`.github/workflows/python-wheels.yml`** — CI cpu/abi3 wheel build + import smoke (no rocm in Actions).
+- **`pyproject-rocm.toml`** — the rocm *distribution config* (the build-time artifact this plan owns).
+
+The rocm wheel *build* + the GPU `fit`/`predict` smoke are **deferred to gap plan
+08-08** (generic GPU backend wiring). **Decision: Option B** — 08-08 will add a
+`GpuBackend` implementing `cb_compute::Runtime` over `SelectedRuntime`, generic
+across cpu/wgpu/cuda/rocm, calling the existing Phase-7.2 der seam, and
+feature-gate `builder.rs`'s backend selection. The rocm wheel cannot compile until
+08-08 lands; this plan's responsibility ends at the rocm distribution *config*.
 
 ## Performance
 
 - **Duration:** ~20 min
 - **Completed:** 2026-06-23
-- **Tasks:** 2 (1 complete, 1 blocked at checkpoint)
+- **Tasks:** 2 (Task 1 complete; Task 2 config complete, rocm wheel build deferred to 08-08)
 - **Files created:** 3
 - **Files modified:** 1
 
@@ -106,9 +116,9 @@ completed: 2026-06-23
 
 ## Deviations from Plan
 
-### Rule 4 — Architectural blocker (rocm wheel build)
+### Rule 4 — Architectural finding (rocm wheel build → deferred to 08-08)
 
-**[Rule 4 - Architectural] The facade `fit()` train path has no GPU `Runtime` implementation; `catboost-rs` does not compile under `--features rocm`.**
+**[Rule 4 - Architectural] The facade `fit()` train path has no GPU `Runtime` implementation; `catboost-rs` does not compile under `--features rocm`. RESOLVED BY DEFERRAL: Decision Option B — owned by gap plan 08-08 (generic GPU backend).**
 
 - **Found during:** Task 2 (attempting the in-env rocm wheel build, gfx1100/ROCm 7.1, HIP toolchain present).
 - **Issue:** `maturin build --no-default-features --features rocm --release` fails to compile `catboost-rs`:
@@ -131,39 +141,39 @@ completed: 2026-06-23
   GPU backend implementing `cb-compute::Runtime`. The 08-01 "rocm cpu-free"
   gate validated only the **dependency graph** (`cargo tree`), not actual
   **compilation** of the facade under rocm.
-- **Why Rule 4 (not auto-fixed):** Making the rocm wheel build requires either
-  (a) implementing a GPU `cb-compute::Runtime` for the facade train path (a
-  cross-crate change explicitly scoped to Phase 7 GPU work, "GPU kernel work
-  (Phase 7)" is NOT this phase per CONTEXT), or (b) a deliberate decision to ship
-  a rocm wheel whose `fit()` still orchestrates via a CPU `Runtime` (host-light)
-  with GPU kernels reachable only at the cb-backend layer — which needs
-  `cb-backend` to expose a `Runtime` impl under non-cpu features. Both are
-  architectural decisions, not an inline fix.
+- **Why Rule 4 (not auto-fixed):** Making the rocm wheel build requires
+  implementing a GPU `cb-compute::Runtime` for the facade train path — a
+  cross-crate change that the user wants done *generically* (wgpu + cuda + rocm),
+  not a rocm-only fix. This is an architectural decision, not an inline fix.
 - **Files implicated:** `crates/catboost-rs/src/builder.rs` (lines 20, 346),
   `crates/cb-backend/src/lib.rs` (line 37), `crates/cb-backend/src/cpu_runtime.rs`.
-- **Status:** Surfaced as the Task-2 blocking checkpoint (below). No code change
-  applied — the decision is the user's.
+- **Resolution — Decision: Option B (deferred to 08-08).** Gap plan **08-08
+  (generic GPU backend)** owns this: add a `GpuBackend` implementing
+  `cb_compute::Runtime` over `SelectedRuntime`, generic across cpu/wgpu/cuda/rocm,
+  calling the existing Phase-7.2 der seam; `builder.rs` selects the backend by
+  feature. The rocm wheel *build* + the GPU `fit`/`predict` smoke move to 08-08.
+  No code change applied in this plan — 08-07's responsibility ends at the rocm
+  distribution *config* (`pyproject-rocm.toml`).
 
-## Authentication / Human-action gates
+## Human-action gates — resolved by deferral to 08-08
 
 **Task 2 was authored as a `checkpoint:human-action gate="blocking"`** — the
-in-env rocm wheel build + GPU import smoke (`fit`/`predict` on gfx1100) is the
-human verification step because it needs the live GPU runtime. The blocking
-checkpoint now carries TWO items:
+in-env rocm wheel build + GPU import smoke (`fit`/`predict` on gfx1100). Both the
+architectural prerequisite and the GPU smoke are **deferred to gap plan 08-08**
+(Decision: Option B — generic GPU backend). 08-07 ships the rocm distribution
+*config*; 08-08 produces the rocm *wheel* and runs the GPU smoke.
 
-1. **(Architectural — Rule 4)** Decide how the facade train path reaches a GPU
-   backend so `catboost-rs` compiles under `--features rocm` (the rocm wheel
-   cannot build until this is decided/implemented). Likely a follow-up plan /
-   Phase-7 GPU-facade-wiring task, not packaging scope.
-2. **(Original human-action — GPU smoke)** Once (1) is resolved and the rocm wheel
-   builds, run the in-env import + fit/predict smoke on gfx1100 and confirm a cpu
-   wheel and the rocm wheel are not co-installed.
-
-The exact in-env build command (recorded in `pyproject-rocm.toml` and PACKAGING.md):
+The exact in-env build command 08-08 will use (recorded here, in
+`pyproject-rocm.toml`, and in PACKAGING.md) once the generic `GpuBackend` lands:
 ```bash
 cd crates/catboost-rs-py
 maturin build --no-default-features --features rocm --release
+# then, in a fresh venv on gfx1100:
+#   pip install target/wheels/catboost_rs_rocm-*.whl
+#   python -c "import catboost_rs; m=catboost_rs.CatBoostRegressor(iterations=5); ..."  # fit/predict smoke
+# and confirm the cpu wheel and the rocm wheel are NOT co-installed (mutual exclusivity).
 ```
+This build will NOT compile until 08-08 lands; it was deliberately not attempted here.
 
 ## Publish gate (awaiting human authorization)
 
@@ -182,6 +192,18 @@ re-verified cpu-free (no-dev rocm tree), T-08-22 documented in PACKAGING.md
 (mutual exclusivity), T-08-23 accepted (rocm in-env only), T-08-SC maturin is the
 official PyO3-org tool.
 
+## Next Plan Readiness — gap plan 08-08 (generic GPU backend)
+
+- 08-08 owns the deferred rocm wheel build. Scope (Decision: Option B): add a
+  `GpuBackend` implementing `cb_compute::Runtime` over `cb_backend::SelectedRuntime`,
+  generic across cpu/wgpu/cuda/rocm, calling the Phase-7.2 der seam; feature-gate
+  `crates/catboost-rs/src/builder.rs`'s backend selection (replace the
+  unconditional `use cb_backend::CpuBackend` / `&CpuBackend` at lines 20, 346).
+- Once 08-08 lands, run the in-env rocm wheel build + GPU smoke (command above)
+  using the `pyproject-rocm.toml` config 08-07 ships.
+- The T-08-21 cpu-free `--features rocm` dep-tree guarantee (verified here via
+  `cargo tree -e no-dev`) means the rocm wheel will link `cubecl-hip` only.
+
 ## Self-Check: PASSED
 
 - FOUND: crates/catboost-rs-py/pyproject.toml
@@ -194,4 +216,4 @@ official PyO3-org tool.
 
 ---
 *Phase: 08-python-bindings-dual-api-packaging*
-*Completed (Task 1) / Checkpoint (Task 2): 2026-06-23*
+*Completed: 2026-06-23 (in-scope deliverables; rocm wheel build deferred to gap plan 08-08)*

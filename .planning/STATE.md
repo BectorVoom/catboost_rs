@@ -4,7 +4,7 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-06-PLAN.md
-last_updated: "2026-06-22T23:50:16.184Z"
+last_updated: "2026-06-23T00:02:15.150Z"
 last_activity: 2026-06-23 -- 08-06 COMPLETE (PYAPI-06 free-threaded-aware design)
 progress:
   total_phases: 1
@@ -163,6 +163,7 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 | Phase 08 P03 | 12min | 2 tasks | 9 files |
 | Phase 08 P04 | 5min | 2 tasks | 8 files |
 | Phase 08 P05 | ~25min | 2 tasks | 7 files |
+| Phase 08 P07 | 20min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -355,6 +356,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 08-04: predict_proba=(n,2) [P(c0),P(c1)]; classifier defaults loss to Logloss (D-05); load_model = single deterministic Python oracle path, bit-exact vs catboost 1.2.10 model_serde fixtures
 - [Phase ?]: 08-05: CatBoostRanker presents regressor-like __sklearn_tags__ but is EXCLUDED from check_estimator gate (no native sklearn ranker contract)
 - [Phase ?]: 08-05: NotFittedError stays binding-local (CatBoostError+ValueError, not sklearn's) to avoid hard sklearn runtime dep; check_estimators_unfitted is in the documented xfail allowlist
+- [Phase ?]: 08-07: rocm wheel BUILD deferred to gap plan 08-08 (Option B, generic GpuBackend: cb_compute::Runtime over SelectedRuntime for cpu/wgpu/cuda/rocm); 08-07 ships rocm distribution config + cpu/abi3 wheel + PACKAGING + CI
 
 ### Pending Todos
 
@@ -384,7 +386,7 @@ None yet.
 - **RESOLVED — Plan 05-08/05-10 (GAP 1, ORD-02) (2026-06-14).** The ordered split-scoring subsystem (05-08) + train() wiring (05-10) landed and the FULL multi-tree ordered_boost_e2e oracle now passes ≤1e-5 vs upstream catboost 1.2.10 (commit 301f54c). ORD-02 e2e CLOSED. Original under-scope analysis retained below for history:
 - **(history) BLOCKED — Plan 05-08 (GAP 1, ORD-02) under-scoped; re-scope required (2026-06-14).** Executor analysis (grounded in upstream catboost 1.2.10 `approx_calcer.cpp`/`greedy_tensor_search.cpp` + empirical run: ordered vs plain predictions differ max 0.70 on the e2e config) found the plan's two must-haves are in tension. Upstream ordered boosting differs from Plain in the **tree STRUCTURE** — splits are scored on per-segment ordered derivatives across the learning fold's `BodyTailArr` (multi-segment histogram score reduction), recomputed each iteration via `UpdateApproxDeltasHistoricallyImpl` (= our `ordered_approx_delta_simple`). Final leaf values still come from `CalcLeafValuesSimple` on the averaging fold (same as Plain). `tree.rs` has **NO ordered/body-tail-segment split-scoring path**, so wiring `ordered_approx_delta_simple` into the leaf-update alone reproduces Plain tree structure with a perturbed leaf-update — fails the ≤1e-5-vs-upstream oracle. True ORD-02 parity needs a NEW ordered split-scoring subsystem in `tree.rs` (per-learning-fold `BodyTailArr` state, per-segment ordered-derivative recompute, cross-segment histogram score), comparable in size to the Plain tree-search and entangled with the D-11 multi-tree RNG residual. **User decision (2026-06-14): re-scope via `/gsd-plan-phase 5 --gaps`.** No commits made; tree clean. 05-09 (tensor CTR wiring) depends on 05-08 → also blocked.
 - 06.3-13: PairLogitPairwise per-stage oracle still #[ignore]'d (escalate-don't-weaken) — true gap is split-selection needing the pairwise split-scorer TPairwiseScoreCalcer (pairwise_scoring.cpp), a new subsystem (Rule 4); diverges tree0 split1 f0 vs f1
-- 08-07 Task 2: rocm wheel BUILD blocked (Rule 4 architectural) — facade fit() hardwired to cb_backend::CpuBackend (only cb-compute::Runtime impl, cfg(feature=cpu)); catboost-rs does not compile under --features rocm. Decision needed before any rocm wheel can build.
+- **RESOLVED (deferred) — 08-07 Task 2: rocm wheel BUILD (Rule 4 architectural).** Facade fit() hardwired to cb_backend::CpuBackend (only cb-compute::Runtime impl, cfg(feature=cpu)); catboost-rs does not compile under --features rocm. **Decision: Option B — owned by gap plan 08-08 (generic GPU backend):** add a `GpuBackend` implementing `cb_compute::Runtime` over `SelectedRuntime`, generic across cpu/wgpu/cuda/rocm, calling the Phase-7.2 der seam; feature-gate builder.rs backend selection (lines 20, 346). 08-07 shipped the rocm distribution CONFIG (`pyproject-rocm.toml`) + cpu/abi3 wheel + PACKAGING + CI; the rocm wheel build + GPU smoke move to 08-08. **08-08 is a PENDING gap-closure plan.**
 
 ### Quick Tasks Completed
 
