@@ -273,8 +273,12 @@ fn closest_match(name: &str) -> &'static str {
         .iter()
         .copied()
         .chain(alias_names)
+        // VOCABULARY is a non-empty `const`, so `min_by_key` always yields `Some`.
+        // `expect` documents that invariant honestly (IN-02) rather than the
+        // previous `.unwrap_or("iterations")`, whose dead "iterations" default would
+        // have been a misleading typo suggestion for an unrelated name if it fired.
         .min_by_key(|cand| levenshtein(name, cand))
-        .unwrap_or("iterations")
+        .expect("VOCABULARY is a non-empty const, so the closest match always exists")
 }
 
 /// Validate every user kwarg against the registry BEFORE ingest (D-06). Resolves
