@@ -130,6 +130,23 @@ impl CatBoostClassifier {
         let flat = py
             .detach(|| model.predict_with(&pool, PredictionType::Probability))
             .map_err(PyCbError)?;
+        // The (n, 2) contract requires an even flat length. Assert it rather than
+        // silently truncating a trailing element via `chunks_exact` (WR-01): a
+        // single-column or otherwise odd output is a model/contract violation, not
+        // something to drop the last object's probabilities over.
+        if flat.len() % 2 != 0 {
+            return Err(CatBoostValueError::new_err(format!(
+                "probability output length {} is not divisible by 2 (expected an (n, 2) \
+                 row-major buffer of [P(class 0), P(class 1)] pairs)",
+                flat.len()
+            )));
+        }
+        // Empty input: `PyArray2::from_vec2` on an empty `rows` yields shape (0, 0),
+        // violating the (n, 2) column-count contract downstream consumers rely on
+        // (np.concatenate / vstack). Construct an explicit (0, 2) array (WR-02).
+        if flat.is_empty() {
+            return Ok(PyArray2::zeros(py, [0, 2], false));
+        }
         let rows: Vec<Vec<f64>> = flat.chunks_exact(2).map(<[f64]>::to_vec).collect();
         Ok(PyArray2::from_vec2(py, &rows)?)
     }
