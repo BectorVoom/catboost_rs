@@ -35,8 +35,8 @@ use cb_compute::{Derivatives, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA};
 use cb_core::{CbError, CbResult};
 
 use crate::gpu_runtime::{
-    const_der_handle, launch_der_binary, launch_der_param, launch_der_unary, DerBinaryKernel,
-    DerParamKernel, DerUnaryKernel,
+    launch_der_binary, launch_der_param, launch_der_unary, DerBinaryKernel, DerParamKernel,
+    DerUnaryKernel,
 };
 
 /// The CubeCL GPU runtime as `cb-compute`'s [`Runtime`], generic over
@@ -46,23 +46,21 @@ use crate::gpu_runtime::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpuBackend;
 
-/// Read a length-`n` device handle back to a host `Vec<f64>` for the CONSTANT-der2
-/// losses (RMSE der2 = `-1.0`, Quantile/MAE der2 = `0.0`). [`const_der_handle`]
-/// produces the on-device buffer; this reads it back through the SAME client/device
-/// the seam allocated it on (the canonical CubeCL read-back idiom — see
-/// `der_seams.rs`). A device read-back failure surfaces as [`CbError::Degenerate`]
-/// (WR-05), never a silent all-zero buffer masquerading as a valid derivative.
+/// Host-materialize a length-`n` constant der2 buffer for the CONSTANT-der2 losses
+/// (RMSE der2 = `-1.0`, Quantile/MAE der2 = `0.0`).
 ///
-/// Mirrors the host-side `vec![value; n]` the CpuBackend uses for these losses, but
-/// materializes it through the device handle so the GPU path stays on the seam.
+/// The constant der2 has NO GPU kernel and its value is identical on host and
+/// device, so it is materialized directly as `vec![value; n]` — mirroring the
+/// host-side `vec![value; n]` the CpuBackend uses for these losses. The 08-08 GPU
+/// path folds der2 in the host loop (the on-device `const_der_handle` buffer is for
+/// the 7.3 histogram hand-off, which 08-08 does not use), so no device round-trip
+/// is performed here: the previous `const_der_handle` call (WR-07) allocated and
+/// immediately discarded a device buffer without ever reading it back, doing no
+/// validation and wasting a device allocation per call.
 fn const_der_host(value: f64, n: usize) -> CbResult<Vec<f64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    // The constant der2 has no kernel; the value is identical on host and device, so
-    // materialize it directly (the `const_der_handle` device buffer is for the 7.3
-    // histogram hand-off, which 08-08 does not use — the host loop folds der2).
-    let _ = const_der_handle(value, n)?;
     Ok(vec![value; n])
 }
 
