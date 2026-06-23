@@ -206,6 +206,21 @@ pub(crate) fn fit_pool(builder: CatBoostBuilder, pool: &Pool) -> Result<Model, C
 /// through the shared ingest adapter. In both cases the result is fully owned, so
 /// the caller may `py.detach()` immediately (D-11 / PYAPI-06).
 ///
+/// # Error-surface asymmetry (WR-04)
+///
+/// The two input kinds validate at DIFFERENT points, by design:
+/// - A NumPy / Pandas / Arrow / Polars `x` runs the strict D-12 input checks
+///   (float32 / contiguity / nullability) eagerly during ingestion here.
+/// - A native `Pool` already had those checks run at its OWN construction, so the
+///   fast-path runs only `OwnedColumns::into_pool()`'s length check. A
+///   feature-width mismatch against the fitted model is therefore NOT caught here;
+///   it surfaces later as the facade's `FeatureMismatch` inside `predict_with`
+///   (still a typed error, just raised deeper in the call stack).
+///
+/// Additionally, on the `Pool` fast-path the `y` argument is IGNORED — the `Pool`
+/// already carries its own label, so a `y` passed alongside a `Pool` is silently
+/// dropped (the Pool is the single source of truth).
+///
 /// # Errors
 /// [`CatBoostValueError`] on any dtype / layout / length / nullability failure.
 pub(crate) fn data_to_pool(
@@ -214,6 +229,9 @@ pub(crate) fn data_to_pool(
     y: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Pool> {
     if let Ok(pool_ref) = x.cast::<crate::pool::Pool>() {
+        // Pool fast-path (WR-04): `y` is intentionally ignored (the Pool carries its
+        // own label) and only the inherited length check runs here — a feature-width
+        // mismatch defers to the facade's `FeatureMismatch` inside `predict_with`.
         return pool_ref.borrow().to_pool();
     }
     ingest_to_owned(py, x, y, None)?
