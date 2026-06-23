@@ -66,6 +66,7 @@
 - [x] **FEAT-04**: Feature penalties / per-object penalties
 - [x] **FEAT-05**: Feature selection — recursive by PredictionValuesChange / LossFunctionChange / ShapValues
 - [x] **FEAT-06**: Alternative grow policies — Lossguide, Depthwise, Region
+- [ ] **FEAT-07**: Online-HNSW estimated-feature neighbor parity — port `library/cpp/online_hnsw/base` to Rust bit-for-bit (dynamic dense graph + incremental insert + HNSW search, `TL2SqrDistance<float>`, RNG-driven construction) so both the online incremental (`TKNNUpdatableCloud`) and offline whole-set (`TKNNCloud`) KNN calcer paths return upstream-identical neighbor IDs, closing the XOR per-stage ≤1e-5 gate the brute-force-exact calcer (6.5 A2/D-05) cannot
 
 ### Model, Serialization & Explainability
 
@@ -178,6 +179,7 @@ Each v1 requirement maps to exactly one phase. See `.planning/ROADMAP.md` for ph
 | FEAT-04 | Phase 6.6 | Complete |
 | FEAT-05 | Phase 6.6 | Complete |
 | FEAT-06 | Phase 6.6 | Complete |
+| FEAT-07 | Phase 9 | Pending (online HNSW port — A2/D-05 deferred dep promoted to its own phase; gate = frozen text_embedding_xor/ fixture + xor_oracle_per_stage_residual_… flipped to passing ≤1e-5, KNN border serializes 0.5, no #[ignore]/no weakened tolerance) |
 | MODEL-05 | Phase 6.6 | Complete |
 | GPU-01 | Phase 7.1–7.5 | Pending (scan/reductions 7.1, grad/hess 7.2, pointwise hist 7.3, pairwise hist 7.4, on-device loop close 7.5) |
 | GPU-02 | Phase 7.1 | Complete |

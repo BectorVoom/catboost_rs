@@ -30,3 +30,38 @@ Plans:
 
 - [x] 08-06-PLAN.md — Free-threaded-aware design: gil_used=false + multi-thread buffer-safety test (3.13t) + caveat docs (PYAPI-06) — COMPLETE (commits 733546f Task1 / fedf1b3 Task2; #[pymodule(gil_used = false)] backed by 08-03 own-before-detach; test SKIPs cleanly on the GIL venv; FREE_THREADING.md documents abi3⊥free-threaded wheel deferral + custom_loss GIL-reentry caveat. SCOPED DEFERRAL: no python3.13t in-env -> concurrent free-threaded RUN deferred; PYAPI-06 code-property-validated. Gates: maturin abi3-py312 OK; pytest 73 passed/5 skipped/79 xfailed; cargo 29/29)
 - [x] 08-07-PLAN.md — Packaging: abi3-py312 cpu wheel + in-env rocm wheel under the two-distribution layout (PYAPI-01; D-08/D-09)
+
+### Phase 9: Online HNSW Estimated-Feature Parity
+
+**Goal**: Port `catboost-master/library/cpp/online_hnsw/base` to Rust bit-for-bit so the KNN estimated-feature calcer returns upstream-identical neighbor sets, closing the XOR per-stage ≤1e-5 oracle gate that the brute-force-exact calcer (Phase 6.5 A2/D-05) cannot.
+**Mode:** standard
+**Depends on**: Phase 6.5 (estimated-feature calcer + frozen `text_embedding_xor/` fixture)
+**Requirements**: FEAT-07
+**Plans:** 0 plans
+
+**Scope:**
+
+1. Port the dynamic dense graph + incremental insert + HNSW search bit-for-bit from `online_hnsw/base/`:
+   - `dynamic_dense_graph.{h,cpp}`, `item_storage_index.{h,cpp}`, `index_base.{h,cpp}`, `build_options.{h,cpp}`, `index_data.h`, `index_reader/writer.{h,cpp}`, `index_snapshot_data.h`
+   - Build options default to `MaxNeighbors=32`, `SearchNeighborhoodSize=300`, `LevelSizeDecay/NumVertices = AUTO_SELECT(0)`; calcer constructs with `CloseNum=k` and search size `300`.
+   - Distance: `TL2SqrDistance<float>` (squared L2), `float` vectors.
+2. **Replicate the construction RNG exactly** — upstream drives graph build (neighbor selection / level assignment) from its own RNG; bit-exact neighbors require reproducing the seed source and draw order. This is the crux.
+3. Wire both calcer flavors at the seam (`cb-train/src/estimated/online_embedding.rs`, `estimated_features.rs`): the online incremental `AddItem`→`GetNearestNeighbors` path (tree structure+leaves) and the offline whole-set apply path (predictions).
+4. Flip the existing RED-on-success gate (`xor_oracle_per_stage_residual_…`) to a passing ≤1e-5 oracle; the `text_embedding_xor/` fixture is frozen — no regeneration.
+
+**Success Criteria:**
+
+- **SC-1** — Rust HNSW returns upstream-identical neighbor IDs on the instrumented `knn_neighbors` evidence corpus (e.g. cloud-B query doc6 over prefix `{14,15,0,7,4}` yields upstream's `{1,3,4}`, not the exact `{0,2,4}`); divergence-from-exact reproduced, not merely "close".
+- **SC-2** — Both the online (`TKNNUpdatableCloud`) and offline (`TKNNCloud`) paths match upstream neighbor IDs bit-for-bit across the full XOR corpus.
+- **SC-3** — The non-degenerate XOR text+embedding+numeric corpus: StagedApprox + Predictions ≤1e-5 vs upstream, with **no** structure-invariant leaf-order relaxation and the KNN vote border serializing as `0.5` (not `1.5`).
+- **SC-4** — The honest oracle test passes with no `#[ignore]` and no weakened tolerance; class-vote ordering matches upstream (feat0 = class-1 vote).
+
+**Notes / risks:**
+
+- The bit-exact dependency is the **RNG-driven build order** — replicate the seed and draw sequence first; make this an explicit gray area in `/gsd-discuss-phase`.
+- Reference only the vendored C++ (`library/cpp/online_hnsw/base/` + `private/libs/embedding_features/knn.{h,cpp}`). Do **not** use sklearn-ann / annoy / faiss / nmslib — different ANN algorithms cannot be bit-matched.
+- Instrumented trainer rebuild recipe (for evidence diffing) is in `.planning/todos/pending/estimated-feature-grid-parity.md` and the `catboost-instrumented-trainer-build` memory. Port surface is 832 LOC across `online_hnsw/base/` plus the `knn.{h,cpp}` call site.
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 9 to break down)

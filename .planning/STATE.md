@@ -168,6 +168,10 @@ Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 
 
 ## Accumulated Context
 
+### Roadmap Evolution
+
+- Phase 9 added: Online HNSW estimated-feature parity (FEAT-07) — bit-exact port of `library/cpp/online_hnsw/base` (832 LOC). Promotes the A2/D-05 deferred HNSW dependency (root cause of the `estimated-feature-grid-parity` todo's XOR per-stage residual) from a non-blocking todo to its own standard-mode phase. Reference is the vendored C++ only; sklearn-ann rejected (wraps annoy/faiss/nmslib — different ANN algorithms, cannot be bit-matched).
+
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.
