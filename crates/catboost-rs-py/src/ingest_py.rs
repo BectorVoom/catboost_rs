@@ -56,7 +56,7 @@ pub(crate) fn ingest_to_owned(
 ) -> PyResult<OwnedColumns> {
     // 1. Arrow PyCapsule interface (pyarrow Table OR Polars DataFrame share it).
     if has_arrow_capsule(py, x)? {
-        return arrow_to_owned(py, x, y, cat_features);
+        return arrow_to_owned(x, y, cat_features);
     }
     // 2. Pandas DataFrame (duck-typed: a NumPy ndarray has none of these).
     if is_pandas_dataframe(py, x)? {
@@ -328,7 +328,6 @@ fn pandas_n_rows(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<usize> {
 /// path), if any column is not Float32, carries a null, or if the table cannot be
 /// imported via the Arrow C Data Interface.
 fn arrow_to_owned(
-    _py: Python<'_>,
     x: &Bound<'_, PyAny>,
     y: Option<&Bound<'_, PyAny>>,
     cat_features: Option<&[usize]>,
