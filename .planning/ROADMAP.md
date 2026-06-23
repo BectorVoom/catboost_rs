@@ -4,7 +4,7 @@
 **Mode:** mvp
 **Depends on**: Phase 7
 **Requirements**: PYAPI-01, PYAPI-02, PYAPI-03, PYAPI-04, PYAPI-05, PYAPI-06
-**Plans:** 7/7 plans complete
+**Plans:** 8/8 plans complete
 Plans:
 **Wave 1**
 
