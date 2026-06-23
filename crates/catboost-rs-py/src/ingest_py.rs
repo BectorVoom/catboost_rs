@@ -193,9 +193,20 @@ fn label_to_owned(y: Option<&Bound<'_, PyAny>>, n_rows: usize) -> PyResult<Vec<f
 /// `cat_features` suggestion (threat T-08-10). Everything is owned before
 /// returning (D-11).
 ///
+/// [`OwnedColumns`] stores float and categorical features as two SEPARATE blocks
+/// with no per-original-index column ordering. To keep `cat_features` indices (and
+/// every other positional contract — `ignored_features`, monotone constraints,
+/// feature weights, SHAP attribution, `feature_names_`) meaningful, categorical
+/// columns MUST be trailing: every declared categorical index must be greater than
+/// every numeric index. An interleaved categorical column (one sitting BETWEEN
+/// numeric columns) would silently reorder the surviving numeric features relative
+/// to their source positions, corrupting feature alignment (CR-01). Rather than
+/// reorder silently, such a frame is rejected with an actionable error.
+///
 /// # Errors
 /// [`CatBoostValueError`] if an object/string column is present without being
-/// listed in `cat_features`, or on any label-contract violation.
+/// listed in `cat_features`, if a declared categorical column is interleaved
+/// between numeric columns, or on any label-contract violation.
 fn pandas_to_owned(
     py: Python<'_>,
     df: &Bound<'_, PyAny>,
@@ -212,13 +223,34 @@ fn pandas_to_owned(
     let dtypes = df.getattr(intern!(py, "dtypes"))?;
     let mut numeric_names: Vec<Bound<'_, PyAny>> = Vec::new();
     let mut cat_names: Vec<Bound<'_, PyAny>> = Vec::new();
+    // Track whether a categorical column has been seen yet so an interleaved
+    // numeric-after-categorical column (i.e. a non-trailing categorical block) is
+    // rejected rather than silently reordered (CR-01).
+    let mut seen_cat = false;
 
     for idx in 0..n_cols {
         let col_name = columns.get_item(idx)?;
         let is_cat = cats.contains(&idx);
         if is_cat {
+            seen_cat = true;
             cat_names.push(col_name);
             continue;
+        }
+        if seen_cat {
+            // A numeric column AFTER a categorical column means the categorical
+            // block is interleaved, not trailing. Splitting into independent
+            // float/cat blocks here would collapse the surviving numeric columns
+            // to new positions and scramble every positional feature contract
+            // (CR-01) — reject instead of silently reordering.
+            return Err(CatBoostValueError::new_err(format!(
+                "categorical columns must be trailing: column index {idx} ('{}') is \
+                 numeric but appears AFTER a categorical column listed in \
+                 `cat_features`. catboost-rs ingestion preserves positional feature \
+                 indices, so reorder the DataFrame to place all `cat_features` \
+                 columns last (ordered numeric/categorical interleaving is not yet \
+                 supported)",
+                col_name.str()?,
+            )));
         }
         // dtype.kind in {b,i,u,f} is numeric; otherwise it is object/other.
         let dtype = dtypes.get_item(&col_name)?;
@@ -284,20 +316,34 @@ fn pandas_n_rows(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<usize> {
 ///
 /// Each feature column is validated to be Arrow `Float32` with `null_count == 0`
 /// (D-12 / threat T-08-10) and copied (cast f32 -> f64) into an owned column;
-/// nothing borrows the capsule after this function returns (D-11). `cat_features`
-/// is accepted for signature parity but Arrow/Polars categorical columns are not
-/// yet ingested (a non-Float32 column is rejected) — declared-categorical Arrow
-/// columns land in a later plan.
+/// nothing borrows the capsule after this function returns (D-11). Arrow/Polars
+/// categorical columns are not yet ingested, so a non-empty `cat_features` is
+/// REJECTED (rather than silently dropped) — this keeps the Arrow path consistent
+/// with the Pandas path, where the same logical DataFrame must yield the same
+/// feature set regardless of source (CR-01). Declared-categorical Arrow columns
+/// land in a later plan.
 ///
 /// # Errors
-/// [`CatBoostValueError`] if any column is not Float32, carries a null, or if the
-/// table cannot be imported via the Arrow C Data Interface.
+/// [`CatBoostValueError`] if `cat_features` is non-empty (unsupported on the Arrow
+/// path), if any column is not Float32, carries a null, or if the table cannot be
+/// imported via the Arrow C Data Interface.
 fn arrow_to_owned(
     _py: Python<'_>,
     x: &Bound<'_, PyAny>,
     y: Option<&Bound<'_, PyAny>>,
-    _cat_features: Option<&[usize]>,
+    cat_features: Option<&[usize]>,
 ) -> PyResult<OwnedColumns> {
+    // Reject (do not silently drop) declared categorical columns on the Arrow path
+    // so an Arrow/Polars table and the equivalent Pandas DataFrame never diverge in
+    // their feature set (CR-01 consistency).
+    if cat_features.is_some_and(|c| !c.is_empty()) {
+        return Err(CatBoostValueError::new_err(
+            "cat_features is not yet supported on the Arrow/Polars ingest path; \
+             categorical Arrow/Polars columns are not yet ingested (convert to a \
+             Pandas DataFrame with trailing categorical columns, or cast the columns \
+             to Float32)",
+        ));
+    }
     // Import via the Arrow PyCapsule C Data Interface (pyo3-arrow handles capsule
     // lifetime). AnyRecordBatch::FromPyObject accepts anything with
     // __arrow_c_stream__ / __arrow_c_array__ (pyarrow Table and Polars DataFrame).
