@@ -13,12 +13,14 @@
 #   cd crates/catboost-rs-py
 #   maturin build --no-default-features --features rocm --release
 #
-# To build the rocm distribution under its own name, point maturin at this file
-# (maturin reads pyproject.toml by name, so swap/copy this in for the rocm build,
-# e.g. `cp pyproject-rocm.toml pyproject.toml` in a clean checkout, or use a
-# build wrapper). The Cargo manifest is shared (crates/catboost-rs-py/Cargo.toml);
-# only the [project].name and the absence of the [rocm] extra differ from the cpu
-# pyproject.
+# To build the rocm distribution under its own name, use the build wrapper
+# `build-rocm-wheel.sh` (IN-04): it swaps this file in for pyproject.toml
+# transactionally and ALWAYS restores the original on exit, so a half-applied
+# `cp pyproject-rocm.toml pyproject.toml` swap can never persist in the checkout and
+# mis-name the wheel. Run:
+#   crates/catboost-rs-py/build-rocm-wheel.sh
+# The Cargo manifest is shared (crates/catboost-rs-py/Cargo.toml); only the
+# [project].name and the absence of the [rocm] extra differ from the cpu pyproject.
 #
 # Build-host note (08-08): maturin's wheel-repair step bundles the HIP shared libs
 # via `patchelf` — install it first (`pip install patchelf` into the build venv) or
