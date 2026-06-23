@@ -176,10 +176,19 @@ pub(crate) fn accuracy_score(y: &[f64], pred: &[f64]) -> f64 {
     if n == 0 {
         return 0.0;
     }
+    // Compare the rounded labels as integers (the intent is integer equality).
+    // The previous `< f64::EPSILON` form was correct only for 0.0/1.0 binary
+    // labels — EPSILON (~2.2e-16) is the representable gap near 1.0, so equal
+    // integer-valued f64s with magnitude > ~2 could compare unequal, and it is a
+    // latent bug for multiclass labels (WR-06). A non-finite (NaN) rounded value
+    // never matches (the `i64` guard short-circuits via the finite check).
     let correct = y
         .iter()
         .zip(pred.iter())
-        .filter(|(t, p)| (t.round() - p.round()).abs() < f64::EPSILON)
+        .filter(|(t, p)| {
+            let (tr, pr) = (t.round(), p.round());
+            tr.is_finite() && pr.is_finite() && (tr as i64) == (pr as i64)
+        })
         .count();
     correct as f64 / n as f64
 }
