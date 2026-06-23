@@ -39,6 +39,23 @@ pub use cpu_runtime::CpuBackend;
 #[cfg(all(test, feature = "cpu"))]
 mod cpu_runtime_test;
 
+/// The single zero-sized [`gpu_backend::GpuBackend`] implementing `cb-compute`'s
+/// abstract `Runtime` GENERICALLY over [`SelectedRuntime`] (08-08): ONE impl serves
+/// wgpu/cuda/rocm via the Phase-7.2 der seam, mirroring the cpu-gated `CpuBackend`
+/// export above. Gated to the three GPU backends (never cpu) so the facade can
+/// select `GpuBackend` under a non-cpu build with no cpu-only symbol referenced.
+#[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
+mod gpu_backend;
+
+#[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub use gpu_backend::GpuBackend;
+
+#[cfg(all(
+    test,
+    any(feature = "wgpu", feature = "cuda", feature = "rocm")
+))]
+mod gpu_backend_test;
+
 /// Compile-time-selected runtime alias. One `cfg` arm per backend feature. Under
 /// `cpu` this is CubeCL's `CpuRuntime` (D-01); the GPU arms replace `()` in
 /// Phase 7. Selection is purely compile-time (D-02) — no runtime `match`.

@@ -50,3 +50,7 @@ cb-model = { path = "../cb-model" }
 default = ["cpu"]
 cpu = ["catboost-rs/cpu"]
 rocm = ["catboost-rs/rocm"]
+# 08-08: wgpu/cuda passthrough alongside cpu/rocm so the generic GpuBackend is
+# selectable for all three GPU backends through the facade (cpu-free under each).
+wgpu = ["catboost-rs/wgpu"]
+cuda = ["catboost-rs/cuda"]

@@ -17,7 +17,14 @@
 
 use std::sync::Arc;
 
+// Compile-time backend selection (08-08): the facade picks `CpuBackend` under
+// `cpu` and the generic `GpuBackend` under any of wgpu/cuda/rocm, so no cpu-only
+// symbol is named under a non-cpu build. Both implement `cb_compute::Runtime`, the
+// only bound `cb_train::train<R: Runtime>` requires.
+#[cfg(feature = "cpu")]
 use cb_backend::CpuBackend;
+#[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
+use cb_backend::GpuBackend;
 use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
     LeafMethod, Loss,
@@ -342,8 +349,15 @@ impl CatBoostBuilder {
             .collect();
 
         let params = self.boost_params();
+        // Compile-time backend selection (08-08): exactly one feature is active, so
+        // exactly one `backend` binding is in scope. `train` is already generic over
+        // `R: Runtime`, so it accepts either zero-sized backend with no other change.
+        #[cfg(feature = "cpu")]
+        let backend = CpuBackend;
+        #[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
+        let backend = GpuBackend;
         let trained = train(
-            &CpuBackend,
+            &backend,
             &feature_values,
             &feature_borders,
             pool.label(),
