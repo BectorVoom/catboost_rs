@@ -101,18 +101,27 @@ impl OwnedColumns {
         self
     }
 
-    /// The float-feature matrix shape as `(n_rows, n_cols)`, read directly from
-    /// the float columns WITHOUT triggering length validation.
+    /// The feature shape as `(n_rows, n_cols)`, read directly from the feature
+    /// columns WITHOUT triggering length validation.
     ///
-    /// `n_cols` is the number of float feature columns; `n_rows` is the length of
-    /// the first column (0 when there are no float features). This is the cheap
-    /// shape accessor the Python `Pool` getters (`num_row` / `num_col`) use so a
-    /// `Pool` can report its shape before (or independently of) the
+    /// `n_cols` is the number of float feature columns; `n_rows` is the row count.
+    /// The row count is derived from the FIRST feature kind that has a column —
+    /// float, then cat, then text, then embedding — so an all-categorical frame
+    /// (no float columns) reports its TRUE row count rather than 0 (IN-01). This is
+    /// the cheap shape accessor the Python `Pool` getters (`num_row` / `num_col`)
+    /// use so a `Pool` can report its shape before (or independently of) the
     /// `into_pool()` length check.
     #[must_use]
     pub fn feature_shape(&self) -> (usize, usize) {
         let n_cols = self.float_features.len();
-        let n_rows = self.float_features.first().map_or(0, Vec::len);
+        let n_rows = self
+            .float_features
+            .first()
+            .map(Vec::len)
+            .or_else(|| self.cat_features.first().map(Vec::len))
+            .or_else(|| self.text_features.first().map(Vec::len))
+            .or_else(|| self.embedding_features.first().map(Vec::len))
+            .unwrap_or(0);
         (n_rows, n_cols)
     }
 
