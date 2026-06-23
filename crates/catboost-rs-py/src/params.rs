@@ -409,41 +409,82 @@ fn parse_leaf_method(name: &str) -> PyResult<LeafMethod> {
     }
 }
 
+/// Reject a numeric param whose VALUE is outside its valid domain (WR-05) with a
+/// `CatBoostParameterError` naming the param and value, BEFORE it reaches the
+/// builder/train loop. Param-name validation ([`validate_params`]) only checks the
+/// kwarg is in the vocabulary; this guards the VALUE so nonsensical numerics
+/// (`iterations=0`, `depth=0`, `learning_rate=-1.0`, `subsample=5.0`,
+/// `l2_leaf_reg=-3.0`) surface a clear error at the offending param rather than a
+/// degenerate model or a low-level error far downstream (mirrors upstream
+/// CatBoost's at-construction range checks). A non-finite value (NaN/inf) is also
+/// rejected.
+fn check_range(name: &str, value: f64, lo: f64, hi: f64, lo_inclusive: bool) -> PyResult<()> {
+    let lo_ok = if lo_inclusive { value >= lo } else { value > lo };
+    if value.is_finite() && lo_ok && value <= hi {
+        Ok(())
+    } else {
+        let lo_bracket = if lo_inclusive { "[" } else { "(" };
+        Err(CatBoostParameterError::new_err(format!(
+            "parameter `{name}` = {value} is out of range; expected {lo_bracket}{lo}, {hi}]"
+        )))
+    }
+}
+
 /// Build a [`CatBoostBuilder`] from the validated params, applying every
 /// IMPLEMENTED param (alias-resolved) with the correct type extraction. The
 /// caller MUST have run [`validate_params`] first (so only IMPLEMENTED params are
 /// present among the recognized set; KnownNotYet/UNKNOWN already rejected).
 ///
+/// Bounded numeric params are additionally RANGE-validated here (WR-05) so an
+/// out-of-domain value (e.g. `iterations=0`, `learning_rate=-1.0`,
+/// `subsample=5.0`) is rejected with a clear `CatBoostParameterError` before it
+/// reaches the train loop.
+///
 /// # Errors
 /// A `PyTypeError`/`PyValueError` (via `extract`) if a param value has the wrong
-/// type, or a `CatBoostParameterError` for an unsupported enum string.
+/// type, a `CatBoostParameterError` for an unsupported enum string, or a
+/// `CatBoostParameterError` for a numeric value outside its valid domain.
 pub(crate) fn make_builder(
     params: &BTreeMap<String, Py<PyAny>>,
     py: Python<'_>,
 ) -> PyResult<CatBoostBuilder> {
     let mut builder = CatBoostBuilder::new();
     if let Some(v) = get_with_aliases::<usize>(params, py, "iterations")? {
+        // iterations >= 1 (an empty ensemble trains nothing).
+        check_range("iterations", v as f64, 1.0, f64::INFINITY, true)?;
         builder = builder.iterations(v);
     }
     if let Some(v) = get_with_aliases::<usize>(params, py, "depth")? {
+        // depth in [1, 16] (upstream caps oblivious-tree depth at 16).
+        check_range("depth", v as f64, 1.0, 16.0, true)?;
         builder = builder.depth(v);
     }
     if let Some(v) = get_with_aliases::<f64>(params, py, "learning_rate")? {
+        // 0 < learning_rate <= 1.
+        check_range("learning_rate", v, 0.0, 1.0, false)?;
         builder = builder.learning_rate(v);
     }
     if let Some(v) = get_with_aliases::<f64>(params, py, "l2_leaf_reg")? {
+        // l2_leaf_reg >= 0.
+        check_range("l2_leaf_reg", v, 0.0, f64::INFINITY, true)?;
         builder = builder.l2_leaf_reg(v);
     }
     if let Some(v) = get_with_aliases::<f64>(params, py, "random_strength")? {
+        // random_strength >= 0.
+        check_range("random_strength", v, 0.0, f64::INFINITY, true)?;
         builder = builder.random_strength(v);
     }
     if let Some(v) = get_with_aliases::<u64>(params, py, "random_seed")? {
         builder = builder.random_seed(v);
     }
     if let Some(v) = get_with_aliases::<usize>(params, py, "border_count")? {
+        // border_count in [1, 65535] (upstream limit).
+        check_range("border_count", v as f64, 1.0, 65535.0, true)?;
         builder = builder.border_count(v);
     }
     if let Some(v) = get_with_aliases::<f64>(params, py, "subsample")? {
+        // 0 < subsample <= 1.
+        check_range("subsample", v, 0.0, 1.0, false)?;
         builder = builder.subsample(v);
     }
     if let Some(v) = get_with_aliases::<f32>(params, py, "bagging_temperature")? {
