@@ -40,7 +40,10 @@ thiserror.workspace = true
 # that drive the `Train` / `Model` facade-error variants through `to_pyerr`
 # (these internal error crates are NOT re-exported by the facade).
 cb-core = { path = "../cb-core" }
-cb-model = { path = "../cb-model" }
+# default-features = false: prevents this dev-dep re-enabling cb-backend's default
+# `cpu` (via cb-model -> cb-train -> cb-backend) and unifying cpu+rocm under a
+# workspace `cargo test --features rocm` (WR-03 feature-unification landmine).
+cb-model = { path = "../cb-model", default-features = false }
 
 [features]
 # Compile-time backend selection only — forward to the facade passthrough, which

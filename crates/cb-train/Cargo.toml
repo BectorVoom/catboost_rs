@@ -36,7 +36,10 @@ cb-oracle = { path = "../cb-oracle" }
 # A DEV-dependency ONLY — the normal cb-train build graph never links cb-model
 # (cb-model depends on cb-train in the build graph; dev-deps are exempt from the
 # cycle and compiled solely for the integration test, no runtime cycle).
-cb-model = { path = "../cb-model" }
+# default-features = false: prevents this dev-dep re-enabling cb-backend's default
+# `cpu` (via cb-model -> cb-train -> cb-backend) and unifying cpu+rocm under a
+# workspace `cargo test --features rocm` (WR-03 feature-unification landmine).
+cb-model = { path = "../cb-model", default-features = false }
 approx.workspace = true
 ndarray.workspace = true
 ndarray-npy.workspace = true

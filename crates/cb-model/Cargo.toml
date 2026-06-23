@@ -43,7 +43,12 @@ serde_json.workspace = true
 cb-oracle = { path = "../cb-oracle" }
 # Test-only edges (D-14/D-15): the grower→save→load round-trip oracle
 # (06.6-09) trains via cb-train, so it needs the CpuBackend runtime…
-cb-backend = { path = "../cb-backend" }
+# default-features = false: a dev-dep that re-enabled cb-backend's default `cpu`
+# feature would, under a workspace `cargo test --features rocm`, unify BOTH cpu and
+# rocm into the build graph and silently force SelectedRuntime back to CpuRuntime
+# (WR-03 / the feature-unification landmine). The backend is selected through this
+# crate's own [features] passthrough instead.
+cb-backend = { path = "../cb-backend", default-features = false }
 # …and the Loss / LeafMethod / EScoreFunction enums for the BoostParams literal.
 # cb-train is already a NORMAL dependency above; these are dev-only.
 cb-compute = { path = "../cb-compute" }

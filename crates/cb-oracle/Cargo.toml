@@ -7,6 +7,21 @@ description = "Oracle parity harness: read committed fixtures and compare to act
 [lints]
 workspace = true
 
+[features]
+# Backend-selection passthrough for the test graph (WR-03). The oracle's own
+# integration tests need a backend runtime (CpuBackend) at TEST time, but the
+# backend-bearing dev-deps below are pinned `default-features = false` so a
+# workspace `cargo test --features rocm` does NOT unify cpu in via cb-oracle. This
+# block re-supplies the choice explicitly: per-crate `cargo test -p cb-oracle` gets
+# cpu via this default; `--features rocm` selects rocm WITHOUT cpu. (cb-backend is a
+# dev-dependency, so these feature edges resolve only for the test/bench targets,
+# never the published cb-oracle library — keeping the library backend-free.)
+default = ["cpu"]
+cpu = ["cb-backend/cpu", "cb-train/cpu"]
+rocm = ["cb-backend/rocm", "cb-train/rocm"]
+wgpu = ["cb-backend/wgpu", "cb-train/wgpu"]
+cuda = ["cb-backend/cuda", "cb-train/cuda"]
+
 [dependencies]
 thiserror.workspace = true
 ndarray.workspace = true
@@ -30,6 +45,10 @@ cb-data = { path = "../cb-data" }
 # fixtures. Dev-dependencies only (the cb-oracle library depends on none of
 # them); cb-train already dev-depends on cb-oracle, and Cargo permits
 # dev-dependency cycles.
-cb-train = { path = "../cb-train" }
+# default-features = false on the backend-bearing dev-deps (cb-train -> cb-backend,
+# and cb-backend itself): re-enabling cb-backend's default `cpu` here would unify
+# cpu+rocm under a workspace `cargo test --features rocm` and silently force
+# SelectedRuntime back to CpuRuntime (WR-03 feature-unification landmine).
+cb-train = { path = "../cb-train", default-features = false }
 cb-compute = { path = "../cb-compute" }
-cb-backend = { path = "../cb-backend" }
+cb-backend = { path = "../cb-backend", default-features = false }
