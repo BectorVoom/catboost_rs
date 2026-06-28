@@ -62,7 +62,13 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   3. **Speed check (BENCH-02, standing):** the depth-1 device fit is timed on Kaggle CUDA and reported as device path vs the host-CPU baseline — the harness reports BOTH correctness ≤1e-5 AND wall-clock for this phase's kernels — establishing the per-phase speed-check discipline enforced from here to the last phase (vs official CatBoost GPU where a comparable depth-1 config exists).
   4. The quantized feature matrix uploads exactly once per `fit()` (no per-tree re-upload), gradients/approx stay device-resident across iterations, the per-tree `der1` host read-back is eliminated, and only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (D-05).
   5. An uncovered case (e.g. depth>1) returns `Ok(None)` and falls back to the host CPU grower, producing the same prediction as a pure-CPU fit; the CPU/host training path is byte-unchanged (D-04 no-regression — the full existing CPU oracle suite stays green), and the reduction-determinism strategy is spiked (fixed-point i64 atomics vs private-histogram merge vs two-pass segmented reduce) with a recommendation documented to feed Phase 11's histogram kernel.
-**Plans**: TBD
+**Plans**: 6 plans
+- [ ] 10-01-PLAN.md — GPUT-01 Runtime grow-tree seam + DeviceGrownTree (cb-compute, default-impl, host-typed) [wave 1]
+- [ ] 10-02-PLAN.md — GPUT-01 wiring: per-fit device-grow branch + bin_id→border join in train_inner, CPU fallback byte-unchanged (cb-train) [wave 2]
+- [ ] 10-03-PLAN.md — GPUT-02 GpuTrainSession (one client + upload-once) + per-fit coverage gate (cb-backend) [wave 2]
+- [ ] 10-04-PLAN.md — GPUT-03 residency: apply_leaf_delta kernel + resident grow, eliminate per-tree der1 read-back; depth-1 device grow (cb-backend) [wave 3]
+- [ ] 10-05-PLAN.md — GPUT-04 depth-1 RMSE+Logloss oracle fixtures + BENCH-01/02 Kaggle CUDA correctness+speed harness (bench/) [wave 4]
+- [ ] 10-06-PLAN.md — reduction-determinism spike (3 candidate kernels, err+ms) → SPIKE-REDUCTION.md (cb-backend, independent) [wave 1]
 **UI hint**: no
 **Notes**: The `Runtime` seam adds three default-impl methods (`begin_device_training`, `grow_tree_on_device → CbResult<Option<DeviceGrownTree>>`, `end_device_training`) with CubeCL-free host-typed signatures — mirrors the established `Derivatives` seam. `GpuTrainSession` (new, `cb-backend`-internal) owns one `ComputeClient` + all persistent handles, owned by `GpuBackend` via `RefCell<Option<…>>`. The Kaggle CUDA harness is the new foundational piece and measures correctness AND speed from the start (the `benchmark.py`/maturin `--features cuda` wheel pattern, run on a notebook the user executes — human-gated): verify the CUDA backend is active (`nvidia-smi`), warm one untimed fit, re-run the depth-1 oracle on CUDA before trusting any speed number. **BENCH-02 is a standing per-phase speed check** — mapped here because it is first established here, but enforced in EVERY phase 10→13 (analogous to GPUT-14's ε=1e-4 gate being mapped to Phase 11 yet enforced onward): no phase's GPU kernels are done without a recorded Kaggle CUDA speed measurement. Landmines: no `cb-train` dep in `cb-backend`; `f32::MIN` sentinel (no `-inf` in `#[cube]`, for ROCm-smoke portability); deterministic reduction strategy still required even though CUDA has f64 atomic-add. Architecture fully specified — mirrors Phase 7-8 patterns.
 
@@ -110,7 +116,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. Seam + Residency + Depth-1 + Kaggle CUDA Oracle & Speed Harness | 0/TBD | Not started | - |
+| 10. Seam + Residency + Depth-1 + Kaggle CUDA Oracle & Speed Harness | 0/6 | Planned | - |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 0/TBD | Not started | - |
 | 12. GPU Coverage Expansion | 0/TBD | Not started | - |
 | 13. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
