@@ -10,6 +10,19 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 
 A memory-efficient, Rust-native CatBoost implementation that achieves verifiable feature parity with the original (oracle-tested to within 10⁻⁵), embeddable directly in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
 
+## Current Milestone: v1.1 GPU Performance
+
+**Goal:** Full CUDA device-resident training parity — move the entire boosting inner loop onto the GPU (not just derivatives), reaching speed parity with official CatBoost GPU while preserving ≤1e-5 correctness.
+
+**Target features:**
+- A `Runtime` trait seam for on-device tree growth — wire the existing-but-unused `grow_boosting_pass` (`crates/cb-backend/src/gpu_runtime/mod.rs:1890`) into `cb_train::train`
+- Device-resident histogram build, split scoring, BestSplit, partition/leaf-assignment, and leaf-value computation
+- Extend the depth-1 MVP grower → depth>1, Newton der2, CTR, pairwise, ordered boosting, multiclass
+- Keep training data device-resident across iterations (no per-tree re-upload)
+- Speed benchmark harness vs official CatBoost GPU on a Kaggle CUDA notebook
+
+**Key context:** Correctness is developed + validated in-env on AMD/ROCm (CubeCL kernels are portable cuda/rocm/wgpu from one source); the head-to-head **speed** benchmark vs official CatBoost runs on CUDA via a Kaggle notebook (no NVIDIA in-env). Root-cause analysis of the >20× gap: `.planning/notes/gpu-training-host-light-root-cause.md`. **Landmine:** never add a `cb-train` dependency to `cb-backend` — feature unification breaks the rocm runtime; transcribe CPU references inline.
+
 ## Requirements
 
 ### Validated
