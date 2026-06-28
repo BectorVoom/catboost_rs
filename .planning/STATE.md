@@ -2,9 +2,12 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: GPU Performance
+current_phase: 10
 status: planning
-last_updated: "2026-06-28T12:30:00.000Z"
+stopped_at: Phase 10 context gathered
+last_updated: "2026-06-28T21:24:51.260Z"
 last_activity: 2026-06-28
+last_activity_desc: "v1.1 ROADMAP revised AGAIN: speed is now checked for EVERY GPU (CUDA) kernel in EVERY phase 10→13, not concentrated in Phase 13. BENCH-01's Phase-10 harness measures BOTH correctness AND wall-clock speed from the start; a Kaggle CUDA speed-check success criterion was added to every phase (P10 depth-1 device-vs-CPU; P11 depth-6 RMSE+Logloss device-vs-CPU-vs-official-CatBoost-GPU; P12 each coverage family timed as it lands; P13 comprehensive aggregate). BENCH-02 became a STANDING per-phase speed check mapped to Phase 10 (first established) but enforced 10→13, mirroring the GPUT-14 standing-gate pattern; Phase 13 reframed as the COMPREHENSIVE FINAL speed-parity sign-off (BENCH-03) that AGGREGATES the per-phase checks. Traceability re-mapped: Phase 10 = GPUT-01..04 + BENCH-01 + BENCH-02 (6); Phase 11 = GPUT-05/06/07/08/14 (5); Phase 12 = GPUT-09..13 (5); Phase 13 = BENCH-03 (1). 17/17 mapped, no orphans/duplicates."
 progress:
   total_phases: 4
   completed_phases: 0
@@ -421,8 +424,8 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-06-28
-Stopped at: v1.1 GPU Performance roadmap created — ROADMAP.md (Phases 10–13), REQUIREMENTS.md traceability (17/17 Pending), STATE.md updated. NEXT: /gsd-plan-phase 10 (or /gsd-discuss-phase 10). Resume file: .planning/ROADMAP.md.
+Last session: 2026-06-28T21:24:51.252Z
+Stopped at: Phase 10 context gathered
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
 Stopped at (prior): Completed 08-02-PLAN.md
@@ -441,7 +444,7 @@ Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
-Resume file: .planning/phases/09-online-hnsw-estimated-feature-parity/09-CONTEXT.md
+Resume file: .planning/phases/10-coarse-runtime-grow-tree-seam-gputrainsession-residency-wire/10-CONTEXT.md
 
 ## Operator Next Steps
 
