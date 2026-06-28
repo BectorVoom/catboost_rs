@@ -77,13 +77,18 @@ CTR, pairwise/ranking, multiclass, ordered boosting, the comprehensive final spe
 ### Depth-1 oracle configs + speed framing (GPUT-04 / BENCH-02)
 - **D-10-08:** Oracle BOTH **RMSE and Logloss** depth-1 (Plain, fold_count=1) ≤1e-5 on
   Kaggle CUDA — SC1 names both; exercises the der1 path AND the Logloss der seam.
-- **D-10-09:** **Depth-1 device fit MUST beat (≥) the CPU wall-clock**, not merely be
-  reported as-is. The user explicitly rejected the "depth-1 is launch-bound, accept
-  device≈/slower" framing. **Implication (firm):** Phase 10 therefore carries a
-  launch-overhead-reduction obligation beyond the bare success criteria — depth-1 is
-  kernel-launch-bound, so beating CPU likely requires fused/batched kernel launches and/or a
-  persistent grow kernel, plus per-fit residency (already required) so no upload/readback
-  dominates. This is a Phase-10 deliverable, not deferred.
+- **D-10-09:** **Depth-1 device fit MUST beat (≥) the CPU wall-clock** — but the speed gate
+  is measured on a **large-n dataset (~10⁵–10⁶ rows)**, NOT the small correctness fixture.
+  **RESOLVED 2026-06-29 (post-research escalation):** research established that device≥CPU at
+  depth-1 is physically infeasible at small n (1000×20 — launch latency exceeds total CPU
+  work) but achievable at large n where the O(n·features) histogram amortizes launch latency.
+  Per the user's escalation decision, the planner pins the BENCH-02 depth-1 **speed gate to a
+  large-n dataset** while the ≤1e-5 **correctness oracle** still runs on the small
+  deterministic fixture. This honors the "device must win" intent without promising the
+  impossible. Phase 10 still carries the residency obligation (per-fit upload-once,
+  approx/der1 device-resident, der1 read-back eliminated) so no upload/readback dominates the
+  large-n measurement; aggressive depth-1 launch-fusion is NOT required to clear the bar at
+  large n.
 - **D-10-10:** Speed is measured device vs CPU. Baseline = both in-env CPU (dev iteration)
   AND a CPU run on the SAME Kaggle hardware (apples-to-apples for the official number), plus
   vs official CatBoost GPU where a comparable depth-1 config exists.
