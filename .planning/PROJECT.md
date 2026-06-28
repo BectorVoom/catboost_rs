@@ -16,27 +16,24 @@ A memory-efficient, Rust-native CatBoost implementation that achieves verifiable
 
 <!-- Shipped and confirmed valuable. -->
 
-- CPU gradient-boosting training core — plain boosting, symmetric oblivious trees, four leaf-estimation methods (Gradient/Newton/Exact/Simple), bootstrap/sampling, regularization (`l2_leaf_reg`/`random_strength`/`bagging_temperature`), overfitting detection / early stopping, per-iteration eval-set metrics, and automatic learning-rate selection — all oracle-locked vs upstream CatBoost ≤10⁻⁵. _Validated in Phase 3 (TRAIN-01–08); CR-01 random_strength+sampling parity break closed in gap-closure plan 03-08._
+- ✓ CPU gradient-boosting training core — plain + ordered boosting, symmetric oblivious + non-symmetric trees, four leaf-estimation methods (Gradient/Newton/Exact/Simple), bootstrap/sampling, regularization (`l2_leaf_reg`/`random_strength`/`bagging_temperature`), overfitting detection / early stopping, per-iteration eval-set metrics, automatic learning-rate selection — oracle-locked ≤10⁻⁵ — v1.0 (Phases 3–5)
+- ✓ Full loss / metric matrix — regression, binary, multiclass/multilabel, six ranking losses (YetiRank(/Pairwise), PairLogit(/Pairwise), QueryRMSE, QuerySoftMax, LambdaMart, StochasticRank), ranking metrics, score functions, uncertainty estimation — oracle-locked ≤10⁻⁵ — v1.0 (Phase 6.1–6.4)
+- ✓ Categorical handling — ordered target statistics / CTR, one-hot, feature combinations (tensor CTRs) — v1.0 (Phase 5)
+- ✓ Text and embedding feature support — BoW/NaiveBayes/BM25, LDA, KNN vote (brute-force-exact; see HNSW gap below) — v1.0 (Phase 6.5)
+- ✓ SHAP value computation — v1.0 (Phase 4/6.6)
+- ✓ Model serialization — `.cbm`/`.json` save/load, cross-version reproduce ≤10⁻⁵ — v1.0 (Phase 4)
+- ✓ Multi-backend GPU execution via CubeCL — `cuda`/`rocm`/`wgpu`/`cpu` Cargo-feature-switched, generic runtime (no dispatch overhead), **structural** parity (rocm-validated, ε=1e-4 vs CPU) — v1.0 (Phase 7)
+- ✓ Rust Builder-pattern API — v1.0
+- ✓ Python bindings (PyO3 + maturin) — dual sklearn + CatBoost-native surface, NumPy/Pandas/Arrow/Polars ingest, per-backend wheels — v1.0 (Phase 8)
+- ✓ Modular feature-gated Cargo workspace — v1.0 (Phase 1)
+- ✓ Oracle test suite + rocm GPU test execution — v1.0
 
 ### Active
 
-<!-- Current scope. Building toward these. v1 target = full feature parity. -->
+<!-- Carried forward from v1.0. The current milestone's scope is in "## Current Milestone" below. -->
 
-- [ ] Gradient boosting training and prediction — classification, regression, and ranking
-- [ ] Categorical feature handling — target/ordered encoding, ordered boosting
-- [ ] Text and embedding feature support
-- [ ] SHAP value computation (feature importance / explanations)
-- [ ] Model serialization — save/load with cross-version compatibility
-- [ ] Multi-backend GPU execution via CubeCL — `cuda`, `rocm`, `wgpu`, plus `cpu`, switched by Cargo feature
-- [ ] CubeCL runtime parameterized via generics for flexible backend switching with no runtime dispatch overhead
-- [ ] Rust API using the Builder pattern
-- [ ] Python bindings via PyO3 + maturin — per-backend wheels (e.g. `catboost-rs-rocm`)
-- [ ] Python API: scikit-learn compatible (fit/predict/predict_proba/score)
-- [ ] Python API: CatBoost-native (Pool, CatBoostClassifier/Regressor parameter parity)
-- [ ] Python input support: NumPy, Pandas, and Arrow/Polars
-- [ ] Modular Cargo workspace — feature-gated backend crates, clear separation of responsibilities
-- [ ] Oracle test suite — random inputs validated against original CatBoost outputs, absolute error ≤ 10⁻⁵
-- [ ] GPU test execution on the `rocm` backend
+- [ ] **GPU performance parity** — GPU training shipped as a derivatives-only MVP; the tree-growth inner loop still runs host-side (>20× slower than official CatBoost GPU). Move the full inner loop on-device. _(Next milestone — see Current Milestone)_
+- [ ] **FEAT-07** — KNN estimated-feature bit-exact parity via an online-HNSW port (~832 LOC); shipped with brute-force-exact calcer that diverges from upstream's approximate HNSW. _(Deferred backlog — Phase 9)_
 
 ### Out of Scope
 
@@ -74,14 +71,14 @@ A memory-efficient, Rust-native CatBoost implementation that achieves verifiable
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Full CatBoost feature parity as v1 target | User wants a true drop-in replacement, not a subset | — Pending |
-| CubeCL for GPU kernels with generic runtime | Rust-native abstraction spanning cuda/rocm/wgpu in one codebase, zero-cost backend switching via generics | — Pending |
-| PyO3 + maturin (no CAPI) | Simplest correct Rust→Python path; avoids an unsafe C ABI layer; enables per-backend wheels | — Pending |
-| Dual Python API (sklearn + CatBoost-native) | Maximizes compatibility — drop into sklearn pipelines AND migrate existing CatBoost code unchanged | — Pending |
-| Feature-gated backend crates | Users compile/install only what their hardware supports | — Pending |
-| Oracle testing vs original CatBoost outputs | Proves algorithmic parity with the reference, not just internal self-consistency | — Pending |
-| thiserror + anyhow error strategy | thiserror for clean library API errors; anyhow for ergonomic propagation at bindings/app level | — Pending |
-| Vendored catboost-master as reference + oracle | Single source of truth for both algorithm behavior and expected test values | — Pending |
+| Full CatBoost feature parity as v1 target | User wants a true drop-in replacement, not a subset | ✓ Good (v1.0) |
+| CubeCL for GPU kernels with generic runtime | Rust-native abstraction spanning cuda/rocm/wgpu in one codebase, zero-cost backend switching via generics | ✓ Good (v1.0) |
+| PyO3 + maturin (no CAPI) | Simplest correct Rust→Python path; avoids an unsafe C ABI layer; enables per-backend wheels | ✓ Good (v1.0) |
+| Dual Python API (sklearn + CatBoost-native) | Maximizes compatibility — drop into sklearn pipelines AND migrate existing CatBoost code unchanged | ✓ Good (v1.0) |
+| Feature-gated backend crates | Users compile/install only what their hardware supports | ✓ Good (v1.0) |
+| Oracle testing vs original CatBoost outputs | Proves algorithmic parity with the reference, not just internal self-consistency | ✓ Good (v1.0) |
+| thiserror + anyhow error strategy | thiserror for clean library API errors; anyhow for ergonomic propagation at bindings/app level | ✓ Good (v1.0) |
+| Vendored catboost-master as reference + oracle | Single source of truth for both algorithm behavior and expected test values | ✓ Good (v1.0) |
 
 ## Evolution
 
@@ -101,4 +98,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-13 after Phase 3 (CPU Training Core) completion*
+*Last updated: 2026-06-28 after v1.0 Core Parity milestone completion*

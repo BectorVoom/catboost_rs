@@ -2,10 +2,12 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
+current_phase: 0
+status: Awaiting next milestone
 stopped_at: Phase 9 context gathered
-last_updated: "2026-06-23T07:18:59.255Z"
-last_activity: 2026-06-23 -- 08-06 COMPLETE (PYAPI-06 free-threaded-aware design)
+last_updated: "2026-06-28T11:37:44.853Z"
+last_activity: 2026-06-28
+last_activity_desc: Milestone v1.0 completed and archived
 progress:
   total_phases: 2
   completed_phases: 1
@@ -25,12 +27,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 08 (python-bindings-dual-api-packaging) — EXECUTING
-Plan: 7 of 7 (08-01..08-06 COMPLETE)
-Status: Ready to execute 08-07
-Last activity: 2026-06-23 - Quick task 260623-mph (verify-only): confirmed builder_oracle_test score-function fix already shipped (260619-bac), test 2/2 green; corrected stale memory
-
-Progress: [##############] Phase 6.3 gap-closure: 06.3-06/07/08/09/11 COMPLETE; 06.3-10 GO; 06.3-14 YetiRank end-to-end CLOSED; 06.3-15 pairwise split-scorer enabler COMPLETE; 06.3-16 PairLogitPairwise oracle CLOSED (LOSS-04 gap #1); 06.3-17 YetiRankPairwise end-to-end oracle CLOSED (LOSS-04 gap #2, WR-02 root cause fixed) (7 of 14 top-level phases complete)
+Phase: Milestone v1.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-28 — Milestone v1.0 completed and archived
 
 ## Performance Metrics
 
@@ -405,11 +405,21 @@ None yet.
 
 ## Deferred Items
 
-Items acknowledged and carried forward from previous milestone close:
+Items acknowledged and carried forward at the v1.0 Core Parity milestone close (2026-06-28):
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| *(none)* | | | |
+| verification | Phase 01 — 01-VERIFICATION.md | human_needed | v1.0 close |
+| verification | Phase 02 — 02-VERIFICATION.md | human_needed | v1.0 close |
+| verification | Phase 06.1 — 06.1-VERIFICATION.md | human_needed | v1.0 close |
+| verification | Phase 08 — 08-VERIFICATION.md (free-threaded run needs python3.13t) | human_needed | v1.0 close |
+| uat | Phase 01 — 01-UAT.md | testing (1 pending) | v1.0 close |
+| uat | Phase 02 — 02-UAT.md | testing (1 pending) | v1.0 close |
+| uat | Phase 05 — 05-UAT.md | partial | v1.0 close |
+| uat | Phase 08 — 08-UAT.md | testing (1 pending) | v1.0 close |
+| quick_task | 260619-bac-fix-builder-oracle-test-score-function-m (already shipped per 260623-mph) | resolved-stale | v1.0 close |
+| quick_task | 260619-cpr-estimated-feature-stored-border-value-qu (subsumed by FEAT-07 HNSW) | superseded | v1.0 close |
+| todo | estimated-feature-grid-parity.md — FEAT-07 online-HNSW port (Phase 9) | pending | v1.0 close |
 
 ## Session Continuity
 
@@ -433,3 +443,7 @@ Stopped at (prior): context exhaustion at 75% (2026-06-15)
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
 Resume file: .planning/phases/09-online-hnsw-estimated-feature-parity/09-CONTEXT.md
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone

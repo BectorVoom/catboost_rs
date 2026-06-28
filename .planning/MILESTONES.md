@@ -1,0 +1,26 @@
+# Milestones
+
+## v1.0 Core Parity (Shipped: 2026-06-28)
+
+**Scope:** Phases 1–8 (the full CPU parity surface). The archived `milestones/v1.0-ROADMAP.md` reflects only Phases 8–9 because earlier phases were trimmed from the live ROADMAP as they completed; the authoritative per-requirement record is `milestones/v1.0-REQUIREMENTS.md` (61/62 v1 requirements complete).
+
+**Delivered:** A Rust-native CatBoost with oracle-locked (≤1e-5) parity across the CPU training core (plain + ordered boosting, oblivious + non-symmetric trees, four leaf-estimation methods, bootstrap/sampling, regularization, overfitting detection), the full loss/metric/feature matrix (regression, binary, multiclass/multilabel, six ranking losses, text/embedding features, CTR/categoricals, SHAP, score functions, uncertainty), model save/load, a Rust Builder API, GPU **structural** parity via CubeCL (cuda/rocm/wgpu, rocm-validated, ε=1e-4 vs CPU), and a dual-surface (sklearn + CatBoost-native) PyO3/maturin Python binding with per-backend wheels.
+
+### Known Gaps (carried forward)
+
+- **FEAT-07** — KNN estimated-feature bit-exact parity requires an online-HNSW port (~832 LOC C++); shipped with a brute-force-exact calcer that diverges from upstream's approximate HNSW. Carried as **Phase 9** planning context (deferred backlog, to be re-surfaced as its own milestone).
+- **GPU performance parity** — GPU shipped as a *derivatives-only* MVP; the tree-growth inner loop still runs on the host CPU (>20× slower than official CatBoost GPU). This is **new scope** addressed by the next milestone, not a v1.0 regression. See `.planning/notes/gpu-training-host-light-root-cause.md`.
+
+**Known deferred items at close:** 11 (see STATE.md → Deferred Items) — 4 UAT gaps, 4 human-needed verification sign-offs (incl. Phase 8 free-threaded run needing python3.13t), 2 quick tasks, 1 pending todo (the FEAT-07 HNSW work).
+
+**Key accomplishments (Phase 8 — Python bindings, the final v1.0 phase):**
+
+- A real `CatBoostRegressor().fit(X32, y32).predict(X32)` travels the entire NumPy -> OwnedColumns -> CatBoostBuilder::fit -> Model::predict -> NumPy boundary through the live catboost-rs facade, packaged as a maturin abi3-py312 cdylib that builds cpu-free under `--features rocm`.
+- The binding is now honest about what it supports: every facade `CatBoostError` variant maps to a specific catchable Python exception (PYAPI-05), and the full 119-param upstream vocabulary is validated at `fit()` (D-06) so a known-but-unimplemented param (`nan_mode`) is rejected as a parity gap, a typo (`iteratons`) suggests `iterations`, and sklearn aliases (`n_estimators`/`max_depth`/`reg_lambda`) resolve.
+- A user can now fit/predict from a NumPy array, a Pandas DataFrame, a pyarrow Table, or a Polars DataFrame — all converging on the existing `OwnedColumns::into_pool()` seam with equal predictions for equal data — while float64 / non-contiguous / ambiguous-object / nullable inputs are rejected with an actionable `CatBoostValueError`, every buffer is copied into owned Rust memory before any GIL release (PYAPI-06 as a code property), and a native `Pool(data, label, cat_features=...)` mirrors upstream `Pool.__init__`.
+- A user can now fit a `CatBoostClassifier` (defaulting to Logloss) and get `(n,)` class labels + `(n,2)` probabilities, fit a `CatBoostRanker` on a `group_id` `Pool` and get `(n,)` ranking scores (with a group-less dataset rejected by an actionable `CatBoostValueError`), and the whole Python surface is parity-locked: `CatBoostRegressor`/`CatBoostClassifier.load_model(path)` load the offline catboost 1.2.10 reference `.cbm`/`.json` and reproduce its predictions to within 1e-5 (observed bit-exact) — hermetically, with no live `catboost` import and no re-fit fallback.
+- The CatBoost-native estimators are now drop-in scikit-learn estimators: `get_params`/`set_params` round-trip the verbatim kwargs exactly (so `sklearn.base.clone`, `Pipeline`, and `GridSearchCV` work), `__sklearn_tags__` returns the sklearn >=1.6 `Tags` dataclass with the right `estimator_type`, predict-before-fit raises a `NotFittedError` (a `ValueError`), and sklearn's authoritative `check_estimator` passes every STRUCTURAL check while the dtype/contiguity/sparse checks are an explicit, enumerated, per-check-justified `xfail` allowlist (D-04) — not a blanket skip, so any NEW non-allowlisted contract regression fails the gate.
+- `#[pymodule(gil_used = false)]` declared and backed by the 08-03 own-before-detach discipline, with a concurrent fit/predict buffer-safety test (GIL-build skip-guarded) and a FREE_THREADING.md documenting the abi3-vs-free-threaded wheel deferral and the custom-loss GIL-reentry caveat.
+- The abi3-py312 cpu wheel (`catboost_rs-0.1.0-cp312-abi3-manylinux_2_39_x86_64.whl`) builds, installs into a fresh venv, and `import catboost_rs` exposes `CatBoostRegressor`; the two-distribution layout (cpu `catboost-rs` + rocm `catboost-rs-rocm`, both importing `catboost_rs`, mutually exclusive) is documented, CI builds the cpu wheel only, and the rocm distribution CONFIG (`pyproject-rocm.toml`) is shipped — the rocm wheel BUILD is deferred to gap plan 08-08 (generic GPU backend) because the facade `fit()` train path has no GPU `Runtime` implementation.
+
+---
