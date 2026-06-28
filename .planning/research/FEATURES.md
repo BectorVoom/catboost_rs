@@ -1,244 +1,180 @@
 # Feature Research
 
-**Domain:** Gradient boosting ML library (full Rust rewrite of CatBoost, parity target)
-**Researched:** 2026-06-13
-**Confidence:** HIGH (grounded in vendored CatBoost C++ source at `catboost-master/`)
+**Domain:** Device-resident GPU gradient-boosting training (CatBoost CUDA parity) for catboost-rs v1.1
+**Researched:** 2026-06-28
+**Confidence:** HIGH (grounded in vendored `catboost-master/catboost/cuda/` + read of the existing Rust kernels/grow loop)
 
-## Scope Note
+## Scope
 
-v1 target is **full feature parity** with CatBoost. "Table stakes" here means *parity-critical core* — the things a CatBoost user assumes work identically. "Differentiators" are CatBoost's *signature* algorithmic capabilities that distinguish it from XGBoost/LightGBM and are the reason someone picks CatBoost at all (so they are also parity-critical, but called out separately because they drive the architecture). "Anti-features" are surfaces the project has *explicitly excluded* (per `.planning/PROJECT.md` Out of Scope).
+This milestone moves the **tree-growth inner loop** onto the GPU. v1.0 already ships a derivatives-only GPU MVP: `der1`/`der2` run on device (Phase 7.2 der seam, `gpu_runtime/der_seams.rs`) but histogram → score → split → partition → leaf-value all run on the host CPU (`cb-train/src/tree.rs`), so a GPU run is **slower than pure CPU** (>20× vs official CatBoost GPU). Phase 7.5 built a device-resident `grow_boosting_pass` (`cb-backend/src/gpu_runtime/mod.rs:1890`) that is **depth-1 only and never wired** into `cb_train::train`. The features below are the on-device pipeline stages needed to close that gap.
 
-All feature names and enum values below are verified against the vendored source:
-- Loss/metric surface: `catboost/private/libs/options/enums.h` → `enum class ELossFunction` (90+ values)
-- Categorical CTR: `catboost/private/libs/ctr_description/ctr_type.h`, `options/cat_feature_options.h`
-- Boosting mode: `options/enums.h` → `enum EBoostingType { Ordered, Plain }`
-- Text/embedding calcers: `enum class EFeatureCalcerType { BoW, NaiveBayes, BM25, LDA, KNN }`
-- Model export: `libs/model/enums.h` → `enum class EModelType { CatboostBinary, AppleCoreML, Cpp, Python, Json, Onnx, Pmml, CPUSnapshot }`
-- Fstr: `enum class EFstrType { PredictionValuesChange, LossFunctionChange, ShapValues, ShapInteractionValues, Interaction, PredictionDiff, SageValues, ... }`
+**Upstream reference structure** (the device-resident pipeline this mirrors):
+- Storage/docBins — `gpu_data/compressed_index.h` (`TSharedCompressedIndex` / `TCompressedDataSet`), `gpu_data/gpu_structures.h` (`TCFeature`, `TDataPartition`, `TPartitionStatistics`).
+- The inner loop — `methods/oblivious_tree_doc_parallel_structure_searcher.cpp::FitImpl` (the canonical per-depth `histogram → AllReduce partStats → ComputeOptimalSplit → ReadOptimalSplit → Split` loop, lines 62-160).
+- Histograms — `methods/histograms_helper.h` (`TComputeHistogramsHelper::Compute`, the `BuildFromScratch`/subtraction trick).
+- Score/split — `methods/pointwise_scores_calcer.h` (`SubmitCompute`/`ComputeOptimalSplit`/`ReadOptimalSplit`).
+- Partition — `methods/pointwise_optimization_subsets.h` (`TSubsetsHelper::Split` = `UpdateBins` + `ReorderBins` + `UpdatePartitionStats`).
+- Leaf values — `methods/leaves_estimation/` (`EstimateLeaves` Simple = `Sum/(Weight+L2Reg)`; `pointwise_oracle.h` + `descent_helpers.h::TNewtonLikeWalker` for Newton).
+- Boosting loop / residency — `methods/doc_parallel_boosting.h` (`TDocParallelDataSetsHolder` keeps the compressed index + cursors device-resident for the whole run).
 
 ## Feature Landscape
 
-### Table Stakes (Parity-Critical Core)
+### Table Stakes (Required for Speed Parity)
 
-Features a CatBoost user assumes work identically. Missing/divergent = not a drop-in replacement.
+Without **all** of these device-resident, a GPU run cannot beat CPU — the host work and per-tree crossings dominate. These are the non-negotiable v1.1 deliverables.
 
 | Feature | Why Expected | Complexity | Notes |
 |---------|--------------|------------|-------|
-| Symmetric (oblivious) decision trees | The core CatBoost tree structure; same split + threshold across a whole tree level | HIGH | `EGrowPolicy::SymmetricTree` (default). Underpins **everything** — model format, fast SIMD inference, leaf indexing are all built around it. Must be the first tree primitive built. |
-| Gradient boosting train loop (CPU) | Core of the library | HIGH | Iterative additive trees; `learning_rate`, `iterations`, `depth`. Leaf estimation via `ELeavesEstimation { Gradient, Newton, Exact, Simple }`. |
-| Binary classification (Logloss, CrossEntropy) | Most common use case | MEDIUM | `Logloss`, `CrossEntropy`, `Focal`, `CtrFactor`. Sigmoid + probability output. |
-| Multiclass classification | Standard | MEDIUM-HIGH | `MultiClass` (softmax), `MultiClassOneVsAll`. Multi-dim leaf values; `MultiLogloss`/`MultiCrossEntropy` for multilabel. |
-| Regression | Standard | MEDIUM | `RMSE`, `MAE`, `Quantile`, `MultiQuantile`, `LogCosh`, `Huber`, `Poisson`, `Tweedie`, `MAPE`, `MSLE`, `Lq`, `Expectile`, `LogLinQuantile`, `MedianAbsoluteError`, `SMAPE`, `RMSPE`, `Cox`, `MultiRMSE`. |
-| Pool abstraction (data input) | Native CatBoost API; required for drop-in | HIGH | Holds features (float/cat/text/embedding), label, weights, group_id, subgroup_id, pairs, baseline. Quantized + raw variants (`libs/data/`, `private/libs/quantization/`). Memory-efficiency mandate makes the quantized representation central. |
-| Feature quantization (binarization) | Speed + the way splits are chosen | HIGH | `TBinarizationOptions`, border selection methods, `border_count`. Pre-binning floats into bucket indices. Inputs feed every tree split. |
-| Missing value handling | Real datasets have NaNs | LOW-MEDIUM | `ENanMode { Min, Max, Forbidden }` — NaN routed to min/max bucket or rejected. |
-| Feature/object weights, class weights | Standard training control | LOW | Per-object `weight`, per-class weights, `EAutoClassWeightsType { Balanced, SqrtBalanced, None }`. |
-| Overfitting detection / early stopping | Expected default behavior | MEDIUM | `EOverfittingDetectorType { None, Wilcoxon, IncToDec, Iter }`, `od_pval`, `od_wait`, `use_best_model`. (`libs/overfitting_detector/`) |
-| Eval set / validation metrics during training | Standard monitoring | MEDIUM | Multiple eval sets, `eval_metric`, custom metric list, per-iteration metric logging. (`libs/metrics/`) |
-| Prediction types | Drop-in API parity | LOW-MEDIUM | `EPredictionType { Probability, LogProbability, Class, RawFormulaVal, Exponent, RMSEWithUncertainty, VirtEnsembles, TotalUncertainty }`. |
-| Feature importance | Users expect `get_feature_importance()` | MEDIUM | `EFstrType::PredictionValuesChange` (default), `LossFunctionChange`, `Interaction`. (`libs/fstr/`) |
-| SHAP values | Now table stakes for any GBM | HIGH | `EFstrType::ShapValues`; `EShapCalcType { Regular, Approximate, Exact }`. CatBoost has an exact poly-time SHAP for trees. |
-| Model serialization (native .cbm) | Save/load a trained model | HIGH | FlatBuffers-based binary format (`libs/model/flatbuffers/`). Cross-version compatibility is a PROJECT requirement. |
-| Model load/predict (inference) | Already partially present in vendored Rust crate | MEDIUM | The existing `catboost`/`catboost-sys` crates do inference via FFI; the rewrite reimplements this natively in Rust. |
-| Bootstrap / sampling | Standard regularization | MEDIUM | `EBootstrapType { Poisson, Bayesian, Bernoulli, MVS, No }`, `subsample`, `ESamplingUnit { Object, Group }`. |
-| L2 regularization, random strength | Standard regularization | LOW | `l2_leaf_reg`, `random_strength`, `bagging_temperature`. |
-| Learning-rate schedule / auto LR | Expected ergonomics | LOW | Auto learning-rate selection from dataset size; constant + decay support. |
-| sklearn-compatible Python API | PROJECT requirement | MEDIUM | `fit`/`predict`/`predict_proba`/`score`; `CatBoostClassifier`, `CatBoostRegressor`, `CatBoostRanker`, `CatBoost`. |
-| CatBoost-native Python API | PROJECT requirement | MEDIUM-HIGH | `Pool`, full CatBoost parameter-name parity. Verified classes in `python-package/catboost/core.py`. |
-| Python input: NumPy / Pandas / Arrow / Polars | PROJECT requirement | MEDIUM | Zero-copy ingestion where possible; Arrow path exists in upstream (`python-package/catboost/arrow.cpp`). |
+| **`Runtime` grow-tree trait seam** | The boosting loop (`cb_train::train::<R: Runtime>`) is generic over `Runtime` but the trait (`cb-compute/src/runtime.rs:897`) only exposes `compute_gradients`; there is no seam to "grow a tree on device", so `fit()` always falls through to the CPU growers. This is *the* integration gap. | **S** | Add `grow_tree`/`grow_boosting_pass` to the `cb-compute` `Runtime` trait. CPU backend delegates to existing `tree.rs` growers; GPU backend calls `grow_boosting_pass`. **Landmine:** `cb-backend` must NOT depend on `cb-train` (feature unification breaks rocm runtime) — the trait + model types live in `cb-compute`/`cb-core`, transcribe CPU refs inline. |
+| **Wire depth-1 device grow loop** | `grow_boosting_pass` already does device histogram+score+split+partition+leaf for depth-1 RMSE/L2 and is correctness-validated on rocm — it is only called from tests. Wiring it is the first measurable win. | **S** | Pure integration; no new kernels. Reuses scatter/scan/reduce/pointwise_hist/score_split/partition kernels. Gated to its MVP envelope (depth=1, Plain, foldCount=1, RMSE) with a typed fallback to CPU otherwise. |
+| **Device-resident quantized storage (docBins / compressed index)** | Upstream `TSharedCompressedIndex` holds a feature-major quantized `cindex` device-resident for the **entire** training run (`doc_parallel_dataset.h`). Re-uploading per tree negates the speedup. | **M** | Rust already uses the feature-major `cindex[feature*n+obj]` layout and uploads it once *per `grow_oblivious_tree_into` call* (mod.rs:1706) — but that call is per-tree, so it re-uploads every iteration. Lift the upload above the iteration loop; keep the handle resident across all trees. Upstream `TCFeature{Offset,Mask,Shift,FirstFoldIndex,Folds}` packs multiple features per `ui32` word — the Rust layout is one feature per word (simpler, more memory; acceptable). |
+| **Partition-aware histograms (`fullPass=false` / depth>1)** | The current pointwise/pairwise fill is **whole-dataset, single-partition** (`partCount=1`). A depth-L level must build histograms over `2^L` partitions. This is the explicit blocker that makes `grow_oblivious_tree_into` reject `depth>1` (mod.rs:1670). | **L** | Extend Phase 7.3 `pointwise_hist` (2-channel) and the partition kernels so the fill is keyed by `leaf_of[obj]` into `2^level` partition slots. Upstream `ComputeHistogram2` (histograms_helper.h) accumulates `(1<<CurrentBit)*FoldCount*features*2` floats. **The single largest feature in the milestone.** |
+| **Histogram subtraction trick** | Upstream computes the histogram for only the **smaller** child and derives the sibling by subtraction from the parent (`histograms_helper.h` `BuildFromScratch`/`CurrentBit` logic). Halves histogram work at every level — without it depth>1 is ~2× slower than parity. | **M** | Requires keeping the parent-level histogram resident and a per-leaf subtract pass. Depends on partition-aware histograms landing first. |
+| **Device BestSplit selection (already built, must stay O(1)-crossing)** | Upstream scores all `(feature,bin)` candidates on device and reduces to one `TBestSplitProperties` per device, reading back only that descriptor (`pointwise_scores_calcer.h` `ComputeOptimalSplit`/`ReadOptimalSplit`; FitImpl `TakeBest`). | **S** (exists) | Rust `score_split.rs` (7.5) already does L2/Cosine/Solar/LOO/Sat scoring + deterministic argmin returning an O(blocks) `BestSplit[]`. Keep the contract: only the O(1) split + the `2^depth` part-stats cross host↔device per level (the D-05 crossing class). |
+| **Device partition / leaf-assignment update** | After picking a split, upstream routes docs into child partitions and reorders indices so each partition is contiguous (`TSubsetsHelper::Split` = `UpdateBins`+`ReorderBins`+`UpdatePartitionStats`). Contiguity is what makes the next level's partition histograms cheap. | **M** | Rust has `launch_partition_split_into` (forward-bit doc-routing) + `launch_partition_update_into` for depth-1. Depth>1 needs the **reorder** so partitions are contiguous (`TDataPartition{Offset,Size}`), not just a per-object leaf tag. Co-dependent with partition-aware histograms. |
+| **Gradient leaf values from part-stats (Simple/Gradient method)** | `EstimateLeaves` (structure_searcher.cpp:175) = `Sum/(Weight+L2Reg)` per leaf — the default `ELeavesEstimation::Simple`/Gradient path, computed from the `2^depth` part-stats. | **S** (exists) | Rust already reads back `2^depth` part-stats and computes `Σder1/(Σweight+scaled_l2)` on host (mod.rs:1769). Matches `cb_compute::calc_average`. Keep as-is. |
+| **Keep gradients/approx device-resident across iterations** | Upstream keeps the approx **cursor** and recomputes gradients on device each iteration; only metric scalars cross (`doc_parallel_boosting.h`). | **M** | `grow_boosting_pass` already recomputes der1 device-side via the 7.2 seam but reads it back **per tree** (mod.rs:2018) and re-uploads approx. Keep approx + der as resident handles updated in place across iterations; cross only when the host needs a metric / early-stopping check. |
 
-### Differentiators (CatBoost Signature Capabilities)
+### Differentiators (Higher Parity / Broader Coverage)
 
-These are *why CatBoost exists* and are still parity-critical, but they drive the architecture and are the hardest/most novel pieces to replicate exactly.
+These extend the device path beyond the simplest case. Each is independently shippable after the table-stakes depth>1 path lands. Order them by how many real workloads they unblock.
 
 | Feature | Value Proposition | Complexity | Notes |
 |---------|-------------------|------------|-------|
-| **Ordered boosting** | The flagship anti-leakage algorithm; reduces prediction shift / target leakage | VERY HIGH | `EBoostingType::Ordered` vs `Plain`. Maintains multiple models over random permutations so each example's gradient uses only "past" examples. Hardest correctness target for oracle parity; deeply coupled to permutation machinery and CTR computation. |
-| **Ordered target statistics (ordered CTR)** | Leakage-free categorical encoding — CatBoost's defining feature | VERY HIGH | `ECtrType { Borders, Buckets, BinarizedTargetMeanValue, FloatTargetMeanValue, Counter, FeatureFreq }` with priors. Uses the same permutation as ordered boosting. (`private/libs/ctr_description/`, `options/cat_feature_options.h`) |
-| **Feature combinations (tensor CTRs)** | Automatic categorical crosses encoded as CTRs | VERY HIGH | `SimpleCtrs`, `CombinationCtrs`, `PerFeatureCtrs`, `MaxTensorComplexity`. Combinatorial growth controlled by `max_ctr_complexity`. Inflates model size + inference complexity. |
-| **One-hot for low-cardinality categoricals** | Avoids CTR overhead when categories are few | LOW-MEDIUM | `OneHotMaxSize` / `one_hot_max_size` threshold — categoricals with ≤ N values use one-hot splits instead of CTRs. |
-| **Native categorical handling end-to-end** | No manual encoding needed by the user | HIGH | String categoricals hashed (`libs/cat_feature/`); combined CTR + one-hot pipeline. A major DX advantage over XGBoost/LightGBM. |
-| **Text features** | Built-in NLP without external preprocessing | HIGH | Tokenization → `EFeatureCalcerType { BoW, NaiveBayes, BM25 }`; `text_processing` / dictionary config (`private/libs/text_features/`, `text_processing/`, `options/text_processing_options.h`). |
-| **Embedding features** | Use precomputed vectors directly | HIGH | `EFeatureCalcerType { LDA, KNN }` over embedding columns (`private/libs/embedding_features/` — `lda.h`, `knn.h`). |
-| **Ranking (pairwise + listwise)** | First-class learning-to-rank | HIGH | `YetiRank`, `YetiRankPairwise`, `PairLogit`, `PairLogitPairwise`, `QueryRMSE`, `QuerySoftMax`, `QueryCrossEntropy`, `LambdaMart`, `StochasticRank`, `StochasticFilter`, `GroupQuantile`. Needs group_id/subgroup_id + pairs in Pool. Ranking metrics: `NDCG`, `DCG`, `MAP`, `MRR`, `ERR`, `PFound`, `PrecisionAt`, `RecallAt`, `QueryAUC`. |
-| **Uncertainty estimation** | Probabilistic predictions, rare in GBMs | MEDIUM-HIGH | `RMSEWithUncertainty`, virtual ensembles (`VirtEnsembles`, `TotalUncertainty` prediction types). |
-| **Multi-permutation machinery** | Underlies ordered boosting + ordered CTR | VERY HIGH | Shared infrastructure (`fold_count` permutations). Build once; both signature features depend on it. |
-| **Grow policies beyond symmetric** | Flexibility for non-oblivious trees | HIGH | `EGrowPolicy { SymmetricTree, Lossguide, Depthwise, Region }`. Lossguide/Depthwise diverge from the oblivious structure and complicate the model format. |
-| **Score functions** | Split-scoring variants | MEDIUM | `EScoreFunction { SolarL2, Cosine, NewtonL2, NewtonCosine, LOOL2, SatL2, L2 }`. |
-| **Custom objectives / metrics** | Extensibility | HIGH | `PythonUserDefinedPerObject`, `PythonUserDefinedMultiTarget`, `UserPerObjMetric`, `UserQuerywiseMetric`. In Rust: a trait + Python callback bridge via PyO3. |
-| **Monotone constraints** | Enforce monotonic feature→prediction | MEDIUM | `options/monotone_constraints.h`; per-feature +1/-1/0. |
-| **Feature penalties / per-object penalties** | Cost-aware feature use | MEDIUM | `options/feature_penalties_options.h`. |
-| **GPU training via CubeCL** | PROJECT differentiator vs upstream (upstream is CUDA-only) | VERY HIGH | Multi-backend (`cuda`/`rocm`/`wgpu`/`cpu`) at compile time via Cargo features + generic CubeCL runtime. Upstream `catboost/cuda/` is the algorithmic reference. See dependency notes — feature set differs from CPU. |
-| **SHAP interaction values + advanced fstr** | Deep explainability | HIGH | `ShapInteractionValues`, `PredictionDiff`, `SageValues`, `InternalInteraction`, `Interaction`. |
-| **Feature selection** | Automated feature pruning | MEDIUM | `EFeaturesSelectionAlgorithm { RecursiveByPredictionValuesChange, RecursiveByLossFunctionChange, RecursiveByShapValues }`, grouping `Individual` / `ByTags` (`libs/features_selection/`). |
+| **Newton der2 leaf estimation on device** | The default for Logloss/multiclass is `ELeavesEstimation::Newton`, not Simple — a separate refit (`TObliviousTreeLeavesEstimator` + `TNewtonLikeWalker`, `leaves_estimation/`) running several der/der2 passes per tree over the fixed structure. Without it, classification leaf values diverge. | **L** | Needs a device der2 accumulation per leaf + the backtracking-line-search descent (`descent_helpers.h`). Reuses the 7.2 der2 handles (`launch_der_unary_handle` LoglossHessian). Structure search still uses gradient/Newton-at-zero for the *weak target*; leaf refit is the second stage. |
+| **Second-order weak-target / score functions (Cosine default)** | `IsSecondOrderScoreFunction(ScoreFunction)` selects `NewtonAtZero` vs `GradientAtZero` for the weak target (structure_searcher.cpp `ComputeWeakTarget`). GPU's **default ScoreFunction is Cosine** (second-order), not L2 — a known parity gap (memory `cb-train-uses-l2-but-catboost-defaults-cosine`). | **M** | `score_split.rs` already has the Cosine/Solar/LOO/Sat arms as comptime kernels; wire the weak-target der2 channel into the device histogram so Cosine scores match. Flag: the depth-1 `grow_boosting_pass` MVP scores L2 only. |
+| **Bootstrap / sampling on device** | Upstream runs `TBootstrap<TStripeMapping>` (Bayesian/Bernoulli/MVS/Poisson) on device each tree (`gpu_data/bootstrap.h`, structure_searcher `ComputeWeakTarget`). Sampling on host would force a per-tree weight crossing. | **M** | Reuses the resident der/weight handles; a per-object multiplier kernel. Needed for any non-default `bootstrap_type`/`subsample`. |
+| **Random-strength score noise on device** | `ComputeScoreStdDev` + `random.NextUniformL()` add per-candidate noise to scores (structure_searcher; `random_score_helper.h`). Affects which split wins — must match for parity with `random_strength>0`. | **S** | The score kernel already takes a `scoreStdDevMult`; thread the per-tree RNG seed (the existing per-tree seeder from Phase 6.3 StochasticRank is the precedent). |
+| **CTR / permutation-dependent features on device** | Upstream runs a **second** score calcer over permutation-dependent (CTR) features (`simpleCtrScoreCalcer` in FitImpl; `gpu_data/batch_binarized_ctr_calcer.h`, `ctrs/`). Categorical workloads are CatBoost's headline use case. | **L** | Large. CTR values are computed on device per permutation and fed as extra feature columns into the same histogram/score path. Defer until the numeric depth>1 path is solid. |
+| **Pairwise / ranking device path** | Phase 7.4 already built the 4-channel **weight-only** pairwise histogram (`pairwise_hist.rs`) + a pairwise scorer; upstream `methods/pairwise_oblivious_trees/` + `pairwise_kernels.h` complete the loop. Unblocks YetiRankPairwise/PairLogitPairwise on GPU. | **L** | Reuses 7.4 kernels but needs the pairwise partition + leaves oracle (`leaves_estimation/pairwise_oracle.h`). Independent track from the pointwise depth>1 work. |
+| **Multiclass device path** | `targets/multiclass_targets.cpp` + `multiclass_kernels.h`; the approx becomes dimension-major (`approx_dimension > 1`). The der seam is already N-dim-aware (Phase 6.2, `compute_gradients` dimension-major). | **L** | Histogram/score/leaf all gain a dimension axis. Newton leaf estimation here is block-diagonal (`HessianBlockSize`). Defer to last. |
+| **Ordered boosting on device** | Plain boosting = `doc_parallel_boosting.h` (one cursor); **Ordered** = `dynamic_boosting.h` with multiple permutation cursors. CatBoost's anti-overfitting signature. | **L** | Multiple device-resident approx cursors + per-permutation gradient recompute. Heaviest residency cost. Defer; Plain covers most speed-benchmark scenarios. |
 
-### Anti-Features (Explicitly Excluded — per PROJECT.md Out of Scope)
+### Anti-Features (Avoid)
 
-These exist in upstream CatBoost but are deliberately NOT being built. Documented to prevent scope re-creep.
-
-| Feature | Why Requested | Why Problematic (for this project) | Alternative |
-|---------|---------------|-------------------------------------|-------------|
-| C API / C FFI layer (`libs/model_interface/c_api.h`) | Upstream's universal binding surface | PROJECT mandates PyO3 direct bindings only; an extra unsafe C ABI is redundant and a maintenance burden | PyO3 bindings call native Rust directly |
-| R bindings (`R-package/`) | Upstream supports R | Out of scope: "Rust and Python only for this milestone" | None this milestone |
-| CLI application (`catboost/app/`) | Upstream ships a `catboost` CLI | Out of scope: Rust + Python only | Use the Rust/Python APIs |
-| JVM / Scala, .NET, Node.js bindings | Upstream ships them | Out of scope: Rust + Python only | None this milestone |
-| Model export to CoreML / ONNX / PMML / C++ / Python source | Upstream `EModelType` supports them | Not needed for a drop-in CatBoost replacement; large surface, low value here | Native `.cbm` (CatboostBinary) + JSON for interop; defer others |
-| Mobile / embedded targets (`CMakeLists.android-*`) | Upstream cross-compiles to Android/ARM mobile | Out of scope: desktop + server only | x86_64 / aarch64 server-class targets |
-| Real-time / online / streaming training | Sometimes requested | Out of scope: batch training only | Batch retrain |
-| Distributed multi-node training (`private/libs/distributed/`) | Upstream supports it | Not in active scope; very high complexity, low priority for v1 | Single-node CPU/GPU |
-| CUDA-direct GPU inference (`EnableGPUEvaluation`) | Upstream C API path | Replaced by CubeCL strategy; the upstream CUDA inference path is not the chosen abstraction | CubeCL multi-backend kernels |
-| MonoForest / model analysis tooling, dataset statistics CLI | Upstream extras | Peripheral to a drop-in library; defer | Defer to v2+ if demanded |
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| **Per-tree re-upload of the compressed index** | It is what `grow_oblivious_tree_into` does today (mod.rs:1706) and is the path of least resistance when wiring. | Re-uploading `n_features*n` u32 every iteration is a host↔device bulk crossing per tree — it negates the entire speedup and can leave GPU slower than CPU. | Upload once above the iteration loop; keep the handle resident (upstream `TDocParallelDataSetsHolder`). |
+| **Reading histograms / partitions / per-doc leaf tags back to host** | Easy to debug; lets you reuse the host scorer. | Bulk per-doc/per-bin crossings every level are the dominant cost. Upstream crosses only the O(1) `TBestSplitProperties` + the `2^depth` `TPartitionStatistics`. | Enforce the D-05 crossing contract: only the O(1) split descriptor + `2^depth` part-stats leave the device per level. |
+| **Chasing bit-exact f64 ≤1e-5 on GPU** | The CPU parity bar is ≤1e-5; reflex is to hold GPU to it. | Upstream GPU uses `float` (f32) histograms/scores/cursors throughout (`TStripeBuffer<float>`). Demanding f64 bit-exactness fights the hardware and the reference itself; gfx1100 has no f64 atomic-add (Phase 7.6 used a host-sum fallback). | Sign off **ε=1e-4 vs the Rust CPU path** as Phase 7.6 already did (memory `phase76-gpu-tolerance-signoff-outcome`); validate correctness on rocm in-env, benchmark **speed** on CUDA/Kaggle. |
+| **Feature-parallel layout** | Upstream ships both feature-parallel (`feature_layout_feature_parallel.h`) and doc-parallel layouts. | Feature-parallel is the legacy single-GPU mode; doc-parallel (`TDocParallelLayout`) is the modern default and matches the Rust per-object layout. Building both doubles surface area for no benefit on single-GPU. | Implement **doc-parallel only** (`TDocParallelObliviousTree`). |
+| **Adding a `cb-train` dependency to `cb-backend`** | The CPU growers in `tree.rs` are the obvious reference to call directly. | Cargo feature unification across `cb-train` + `cb-backend` breaks the rocm runtime build (memory `phase75-grow-loop-outcome`). | Put the grow-tree trait + model types in `cb-compute`/`cb-core`; **transcribe** the needed CPU reference logic inline into `cb-backend`. |
+| **Multi-GPU / `TStripeMapping` distribution** | Upstream's whole GPU stack is built around `TStripeMapping` (multi-device). | Out of scope (PROJECT.md: desktop/server single-GPU); the distributed `AllReduce`/`ReduceScatter` plumbing is enormous and untestable in-env. | Single-device: the `AllReduce` in FitImpl collapses to identity. |
 
 ## Feature Dependencies
 
 ```
-Symmetric (oblivious) trees
-    └──underpins──> Native model format (.cbm / FlatBuffers)
-    └──underpins──> Fast inference (load/predict)
-    └──underpins──> Feature importance / SHAP (tree-structure traversal)
+[Runtime grow-tree trait seam]                 (S, foundation)
+    └──enables──> [Wire depth-1 device grow loop]   (S, first win)
+                       └──requires──> [Device-resident compressed index across iters]  (M)
+                       └──requires──> [Keep gradients/approx device-resident]          (M)
 
-Feature quantization (binarization)
-    └──required-by──> Tree split search
-    └──required-by──> GPU training (quantized buckets are the GPU data layout)
+[Partition-aware histograms (fullPass=false)]   (L, the keystone)
+    ├──requires──> [Device partition update + reorder (contiguous partitions)]  (M)
+    ├──enables───> [depth>1 trees]
+    └──enables───> [Histogram subtraction trick]    (M)
 
-Pool abstraction
-    └──required-by──> ALL training & inference (data carrier)
-    └──carries──> group_id/subgroup_id/pairs ──required-by──> Ranking losses
-    └──carries──> cat/text/embedding columns ──required-by──> CTR / text / embedding calcers
+[depth>1 path]
+    └──enables──> [Newton der2 leaf estimation]      (L)
+    └──enables──> [Second-order score fns / Cosine]  (M)
+    └──enables──> [Bootstrap on device]              (M)  ──> [Random-strength noise] (S)
+    └──enables──> [CTR on device]                    (L)
+    └──enables──> [Multiclass / Ordered]             (L)
 
-Multi-permutation machinery (fold permutations)
-    └──required-by──> Ordered boosting (EBoostingType::Ordered)
-    └──required-by──> Ordered target statistics (ordered CTR)
-
-Ordered target statistics (CTR)
-    └──requires──> Categorical hashing (libs/cat_feature)
-    └──requires──> Target/label data (CtrsNeedTargetData)
-    └──enhanced-by──> Feature combinations (tensor CTRs)
-    └──alternative──> One-hot (one_hot_max_size threshold) for low cardinality
-
-Gradient boosting train loop
-    └──requires──> Quantization + Trees + Loss/gradient functions + Leaf estimation
-    └──enhanced-by──> Bootstrap/sampling, L2 reg, overfitting detector
-
-Loss functions (ELossFunction)
-    └──determine──> gradient/hessian + leaf estimation + default eval metric
-
-SHAP / fstr
-    └──requires──> trained model + tree structure
-    └──ShapValues required-by──> RecursiveByShapValues feature selection
-
-GPU training (CubeCL)
-    └──requires──> quantized Pool data layout + generic-float kernels
-    └──reuses──> same loss/tree algorithms as CPU (parity must hold across backends)
-
-Python API (PyO3)
-    └──requires──> stable native Rust API (Builder pattern) first
-    └──sklearn + CatBoost-native──> both wrap the same core
+[Pairwise 7.4 kernels] ──independent track──> [Pairwise/ranking device path]  (L)
 ```
 
 ### Dependency Notes
 
-- **Symmetric trees underpin everything.** The oblivious-tree structure dictates the model serialization format, the SIMD-friendly inference path, and how SHAP/importance traverse the model. Build this primitive first; it has no upstream dependency but everything depends on it.
-- **Quantization gates both CPU split search and GPU data layout.** GPU kernels consume the quantized bucket representation, so quantization must be stable before serious GPU work.
-- **Multi-permutation machinery is the shared root of both signature features.** Ordered boosting and ordered CTR both consume the same fold-permutation infrastructure. Build it once, validate it, then layer both features on top.
-- **Ordered CTR requires target data and categorical hashing.** `CtrsNeedTargetData` gates CTR computation; string categoricals must be hashed first (`libs/cat_feature/`).
-- **Ranking requires Pool group/pair metadata.** YetiRank/PairLogit/QueryRMSE need group_id, subgroup_id, and pairs carried by the Pool — Pool must support these columns before ranking losses land.
-- **Python API depends on a stable Rust core.** Both the sklearn-compatible and CatBoost-native surfaces wrap the same Rust engine, so the Builder-pattern Rust API should stabilize first.
-- **GPU vs CPU feature parity is a constraint, not just a feature.** Upstream historically has feature gaps between CPU and GPU (e.g., some CTR types like `FeatureFreq` are GPU-only per source comments; certain losses/options are CPU-only — see `TCpuOnlyOption`/`TGpuOnlyOption` in `cat_feature_options.h`). The rewrite must decide per-feature which backends support it; oracle parity (≤1e-5) must hold on whatever backends claim support.
+- **Everything requires the trait seam first:** until `Runtime` exposes a grow-tree method, no device grow loop is reachable from `fit()` — this is the documented "design error" in the root-cause note.
+- **Partition-aware histograms are the keystone:** depth>1, the subtraction trick, and (transitively) Newton/CTR/multiclass all sit behind the `fullPass=false` per-partition fill. It is the single highest-leverage piece of new kernel work.
+- **Partition update and partition histograms are co-dependent:** the histogram fill needs partitions to be *contiguous* (the `ReorderBins` step), so the depth>1 partition update must reorder indices, not just tag leaves.
+- **Pairwise is an independent track:** it reuses the 7.4 pairwise histogram but has its own scorer/partition/leaves-oracle; it does not depend on the pointwise depth>1 work and can proceed in parallel.
 
 ## MVP Definition
 
-Given the full-parity v1 target, "MVP" here = the minimal vertical slice that proves the architecture before fanning out across the full loss/feature matrix.
+### Launch With (v1.1 core — the "GPU is actually faster" milestone)
 
-### Launch With (v1 core slice)
+- [ ] `Runtime` grow-tree trait seam in `cb-compute` — without it nothing is reachable.
+- [ ] Wire depth-1 `grow_boosting_pass` into `cb_train::train` with a typed CPU fallback outside its envelope — first measurable speed win, proves the seam.
+- [ ] Compressed index uploaded once, resident across all iterations — removes the per-tree bulk re-upload anti-feature.
+- [ ] Gradients/approx resident across iterations — removes the per-tree der read-back.
+- [ ] Partition-aware histograms (`fullPass=false`) + contiguous partition update → **depth>1 trees** — the real workloads need depth 6.
+- [ ] Histogram subtraction trick — needed to actually reach parity speed at depth>1.
+- [ ] ε=1e-4-vs-CPU correctness sign-off on rocm in-env + a speed benchmark harness vs official CatBoost GPU on a CUDA/Kaggle notebook.
 
-- [ ] Symmetric oblivious trees + native `.cbm` (FlatBuffers) load/predict — the structural foundation
-- [ ] Feature quantization (float binarization, border selection)
-- [ ] Pool abstraction (float + cat + label + weights + group_id/pairs scaffolding)
-- [ ] Plain boosting train loop with Logloss + RMSE (binary clf + regression)
-- [ ] **Ordered boosting** + **ordered CTR** + one-hot threshold + feature combinations — the signature slice; without these it is not CatBoost
-- [ ] Overfitting detector + early stopping + eval-set metrics
-- [ ] Feature importance + SHAP values (Regular)
-- [ ] Rust Builder API + PyO3 bindings (sklearn + CatBoost-native) for the above
-- [ ] Oracle test harness wiring (random inputs vs upstream, ≤1e-5)
+### Add After Validation (v1.x)
 
-### Add After Validation (v1.x — completes parity)
+- [ ] Newton der2 leaf estimation — trigger: classification benchmarks needed (Logloss default is Newton, not Simple).
+- [ ] Second-order/Cosine score function on device — trigger: matching CatBoost's *default* GPU split scores (closes the known L2-vs-Cosine parity gap).
+- [ ] Bootstrap + random-strength on device — trigger: non-default `subsample`/`bootstrap_type`/`random_strength`.
+- [ ] CTR / permutation-dependent features on device — trigger: categorical workloads (CatBoost's headline use case).
 
-- [ ] Full loss/metric matrix: multiclass, multilabel, all regression variants, quantile/Tweedie/Poisson/Huber/etc.
-- [ ] Ranking suite (YetiRank, PairLogit, QueryRMSE, LambdaMart) + ranking metrics
-- [ ] Text features (tokenization, BoW/NaiveBayes/BM25)
-- [ ] Embedding features (LDA, KNN calcers)
-- [ ] Alternative grow policies (Lossguide, Depthwise, Region)
-- [ ] GPU training via CubeCL (`rocm` first per test mandate, then `wgpu`/`cuda`)
-- [ ] Uncertainty estimation / virtual ensembles
-- [ ] Custom objectives/metrics (Rust trait + Python callback)
-- [ ] Monotone constraints, feature penalties, feature selection
-- [ ] SHAP interaction values + advanced fstr (LossFunctionChange, PredictionDiff, SAGE)
-- [ ] Arrow/Polars input paths, JSON model export
+### Future Consideration (v2+)
 
-### Future Consideration (v2+ / likely out of scope)
-
-- [ ] Distributed multi-node training — explicitly not in active scope
-- [ ] Additional model export formats (ONNX/CoreML/PMML/C++/Python source) — anti-features for now
-- [ ] MonoForest / model analysis tooling
+- [ ] Pairwise/ranking device path — defer unless ranking speed is a stated benchmark target (independent track, large).
+- [ ] Multiclass device path — defer; N-dim histogram/leaf expansion.
+- [ ] Ordered-boosting device path — defer; heaviest residency cost (multiple permutation cursors).
 
 ## Feature Prioritization Matrix
 
-| Feature | User Value | Implementation Cost | Priority |
+| Feature | User Value (speed) | Implementation Cost | Priority |
 |---------|------------|---------------------|----------|
-| Symmetric trees + `.cbm` load/predict | HIGH | HIGH | P1 |
-| Quantization | HIGH | HIGH | P1 |
-| Pool abstraction | HIGH | HIGH | P1 |
-| Plain boosting (Logloss, RMSE) | HIGH | HIGH | P1 |
-| Ordered boosting + ordered CTR + combinations | HIGH | VERY HIGH | P1 |
-| Overfitting detector / early stopping | HIGH | MEDIUM | P1 |
-| Feature importance + SHAP (Regular) | HIGH | HIGH | P1 |
-| Rust Builder API + PyO3 (sklearn + native) | HIGH | HIGH | P1 |
-| Oracle test harness | HIGH | MEDIUM | P1 |
-| Full loss/metric matrix (multiclass, regression variants) | HIGH | HIGH | P2 |
-| Ranking suite + ranking metrics | MEDIUM-HIGH | HIGH | P2 |
-| Text features | MEDIUM | HIGH | P2 |
-| Embedding features | MEDIUM | HIGH | P2 |
-| GPU training via CubeCL | HIGH | VERY HIGH | P2 |
-| Alt grow policies (Lossguide/Depthwise/Region) | MEDIUM | HIGH | P2 |
-| Uncertainty / virtual ensembles | MEDIUM | MEDIUM-HIGH | P2 |
-| Custom objectives/metrics | MEDIUM | HIGH | P2 |
-| Monotone constraints / penalties / feature selection | MEDIUM | MEDIUM | P3 |
-| SHAP interaction + advanced fstr | MEDIUM | HIGH | P3 |
-| Arrow/Polars input, JSON export | MEDIUM | MEDIUM | P3 |
-| Distributed training, extra export formats | LOW | VERY HIGH | P3 (likely excluded) |
+| Runtime grow-tree trait seam | HIGH | LOW | P1 |
+| Wire depth-1 grow loop | MEDIUM | LOW | P1 |
+| Compressed index resident across iters | HIGH | MEDIUM | P1 |
+| Gradients/approx resident across iters | HIGH | MEDIUM | P1 |
+| Partition-aware histograms (depth>1) | HIGH | HIGH | P1 |
+| Partition update + reorder (depth>1) | HIGH | MEDIUM | P1 |
+| Histogram subtraction trick | HIGH | MEDIUM | P1 |
+| Gradient leaf values (Simple) | HIGH | LOW (exists) | P1 |
+| Newton der2 leaf estimation | HIGH | HIGH | P2 |
+| Second-order / Cosine score fn | MEDIUM | MEDIUM | P2 |
+| Bootstrap on device | MEDIUM | MEDIUM | P2 |
+| Random-strength score noise | LOW | LOW | P2 |
+| CTR / perm-dependent features | HIGH | HIGH | P2 |
+| Pairwise / ranking device path | MEDIUM | HIGH | P3 |
+| Multiclass device path | MEDIUM | HIGH | P3 |
+| Ordered-boosting device path | MEDIUM | HIGH | P3 |
 
-**Priority key:**
-- P1: Must have for the v1 core slice (proves architecture + signature features)
-- P2: Required to reach full parity; add after the core slice is oracle-validated
-- P3: Parity tail / nice-to-have; some overlap with anti-features
+**Priority key:** P1 = required for the "GPU beats CPU" v1.1; P2 = add for broader parity once depth>1 is solid; P3 = defer.
 
-## Competitor Feature Analysis
+## Suggested Incremental Build Order
 
-| Feature | CatBoost (upstream, the oracle) | XGBoost / LightGBM | Our Approach |
-|---------|----------------------------------|--------------------|--------------|
-| Categorical handling | Native ordered CTR + one-hot + combinations | Manual encoding or basic native (LightGBM) | Replicate ordered CTR + combinations exactly (signature parity) |
-| Tree structure | Symmetric/oblivious by default | Depthwise/leafwise | Symmetric-first, then add Lossguide/Depthwise/Region for parity |
-| Anti-leakage | Ordered boosting (unique) | None | Replicate ordered boosting — the hardest oracle target |
-| Text/embedding | Built-in calcers | None / external | Replicate BoW/NaiveBayes/BM25 + LDA/KNN |
-| GPU | CUDA only | CUDA / OpenCL (LightGBM) | CubeCL multi-backend (cuda/rocm/wgpu) — a project differentiator over upstream |
-| Bindings | C API + Py/R/JVM/.NET/Node | Many | PyO3-only (no C API); Rust-native + Python (sklearn + CatBoost-native) |
-| Explainability | SHAP + interaction + SAGE | SHAP | SHAP (Regular) in v1; interaction/SAGE in tail |
+1. **Trait seam** (`cb-compute` `Runtime::grow_tree`) — CPU backend delegates to existing growers; GPU backend stubs to `grow_boosting_pass`. *(S)*
+2. **Wire depth-1** + typed CPU fallback; prove end-to-end on rocm and on the benchmark harness. *(S)*
+3. **Residency**: hoist the compressed-index upload above the iteration loop; keep approx/der resident across iterations. *(M)* — at this point depth-1 GPU should beat CPU.
+4. **Partition update + reorder → contiguous partitions** *(M)* and **partition-aware histograms (`fullPass=false`)** *(L)* together — unlocks **depth>1**.
+5. **Histogram subtraction trick** *(M)* — reach parity speed at depth 6.
+6. **Newton der2 leaf estimation** *(L)* + **second-order/Cosine score** *(M)* — classification + default-score parity.
+7. **Bootstrap + random-strength** *(M/S)* — sampling parity.
+8. **CTR on device** *(L)* — categorical workloads.
+9. **Pairwise** *(L, parallel track)*, then **multiclass** *(L)*, then **ordered boosting** *(L)*.
+
+## GPU-Only / Parity-Subtle Behaviors (flag for the planner)
+
+- **Score function default differs:** GPU default `ScoreFunction` is **Cosine** (second-order), CPU/host reference paths and the depth-1 MVP use **L2**. Known gap (memory `cb-train-uses-l2-but-catboost-defaults-cosine`); the weak target uses `NewtonAtZero` vs `GradientAtZero` accordingly.
+- **Two-stage leaf values:** structure search scores on gradient/Newton-**at-zero**; leaf values are a **separate refit** (`Simple`=mean, `Newton`=line-search descent). Don't conflate the split-scoring der with the leaf-value der.
+- **f32 on device:** upstream histograms/scores/cursors are `float`. Hold GPU to **ε=1e-4 vs the Rust CPU path** (Phase 7.6 precedent), not the CPU's ≤1e-5 bar. gfx1100 has no f64 atomic-add → host-sum fallback for parity-critical reductions.
+- **Correctness vs speed venues:** correctness is validated **in-env on AMD/ROCm** (CubeCL kernels are portable from one source); the head-to-head **speed** number must come from a **CUDA/Kaggle** run (no NVIDIA in-env).
+- **Crossing contract (D-05):** per level, only the O(1) `TBestSplitProperties` + the `2^depth` `TPartitionStatistics` may cross host↔device. Any bulk histogram/partition/per-doc read-back is a regression.
+- **Landmine:** never add a `cb-train` dependency to `cb-backend` (feature unification breaks the rocm runtime) — keep the grow-tree trait/model types in `cb-compute`/`cb-core` and transcribe CPU references inline.
 
 ## Sources
 
-- Vendored CatBoost C++ source (oracle + algorithmic reference): `catboost-master/`
-  - `catboost/private/libs/options/enums.h` — `ELossFunction`, `EBoostingType`, `EGrowPolicy`, `EBootstrapType`, `EScoreFunction`, `ELeavesEstimation`, `EOverfittingDetectorType`, `ENanMode`, `EPredictionType`, `EFeatureCalcerType`, `EFeaturesSelectionAlgorithm`, `EAutoClassWeightsType`, `ESamplingUnit` (HIGH confidence — read directly)
-  - `catboost/private/libs/ctr_description/ctr_type.h` — `ECtrType`
-  - `catboost/private/libs/options/cat_feature_options.h` — CTR descriptions, `OneHotMaxSize`, `MaxTensorComplexity`, CPU/GPU-only options
-  - `catboost/private/libs/embedding_features/{lda.h,knn.h}` — embedding calcers
-  - `catboost/libs/model/enums.h` — `EModelType` export formats
-  - `catboost/libs/fstr/`, `EFstrType` — feature importance / SHAP types
-  - `catboost/python-package/catboost/core.py` — `Pool`, `CatBoost`, `CatBoostClassifier/Regressor/Ranker`, `EShapCalcType`
-  - Lib layout: `catboost/libs/`, `catboost/private/libs/`, `catboost/cuda/`
-- Project scope/boundaries: `.planning/PROJECT.md` (Active + Out of Scope)
-- Component map: `.planning/codebase/ARCHITECTURE.md`, `.planning/codebase/STRUCTURE.md`
+- `catboost-master/catboost/cuda/methods/oblivious_tree_doc_parallel_structure_searcher.cpp` / `.h` — the canonical device inner loop (HIGH)
+- `catboost-master/catboost/cuda/methods/histograms_helper.h` — histogram compute + subtraction trick (HIGH)
+- `catboost-master/catboost/cuda/methods/pointwise_optimization_subsets.h` — partition update (`Split`/`UpdateBins`/`ReorderBins`) (HIGH)
+- `catboost-master/catboost/cuda/methods/pointwise_scores_calcer.h` — device BestSplit (HIGH)
+- `catboost-master/catboost/cuda/methods/leaves_estimation/` (`pointwise_oracle.h`, `descent_helpers.h`) — Simple vs Newton leaf values (HIGH)
+- `catboost-master/catboost/cuda/methods/doc_parallel_boosting.h` / `dynamic_boosting.h` — boosting loop, residency, Plain vs Ordered (HIGH)
+- `catboost-master/catboost/cuda/gpu_data/{compressed_index.h, gpu_structures.h}` — docBins layout, `TCFeature`/`TDataPartition`/`TPartitionStatistics` (HIGH)
+- `crates/cb-backend/src/gpu_runtime/mod.rs` (`grow_boosting_pass`, `grow_oblivious_tree_into`) — existing depth-1 device grow loop + MVP limits (HIGH)
+- `crates/cb-backend/src/gpu_runtime/der_seams.rs` — Phase 7.2 device der1/der2 seam (HIGH)
+- `crates/cb-backend/src/kernels/{pointwise_hist,pairwise_hist,score_split,scatter,scan,reduce}.rs` — existing Phase 7.3/7.4/7.5 kernels (HIGH)
+- `crates/cb-compute/src/runtime.rs` — the `Runtime` trait (the seam gap) (HIGH)
+- `.planning/notes/gpu-training-host-light-root-cause.md` — host-vs-device classification of the inner loop (HIGH)
 
 ---
-*Feature research for: gradient boosting ML library (CatBoost parity rewrite in Rust)*
-*Researched: 2026-06-13*
+*Feature research for: device-resident GPU gradient-boosting training (CatBoost CUDA parity)*
+*Researched: 2026-06-28*

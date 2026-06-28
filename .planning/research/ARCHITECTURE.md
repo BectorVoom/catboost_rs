@@ -1,321 +1,307 @@
 # Architecture Research
 
-**Domain:** Gradient-boosting ML library — modular Rust rewrite of CatBoost (Cargo workspace, CubeCL multi-backend GPU, dual PyO3 Python API)
-**Researched:** 2026-06-13
-**Confidence:** HIGH (derived from the vendored CatBoost C++ source tree at `catboost-master/` and the project-mandated CubeCL manual; both are curated, first-party references)
+**Domain:** Device-resident GPU gradient-boosting training (full inner loop on-device) integrated with a compile-time-generic `Runtime` seam
+**Researched:** 2026-06-28
+**Milestone:** v1.1 GPU Performance (supersedes the v1.0 ARCHITECTURE research)
+**Confidence:** HIGH (grounded in the existing catboost-rs code at `crates/cb-train` + `crates/cb-backend`, and the vendored upstream reference at `catboost-master/catboost/cuda/`)
 
-> Scope note: this is the **architecture dimension only** — crate decomposition, the CubeCL generic-runtime boundary, the CPU/GPU split, the memory-efficiency storage model, the PyO3 dual-API mapping, and the resulting build order. Algorithm specifics (CTR math, ordered boosting, SHAP) and library version pins live in STACK.md / FEATURES.md / PITFALLS.md.
+---
+
+## Executive Answer (the four sub-questions)
+
+1. **Runtime seam shape:** add ONE coarse, OPTIONAL trait method — `grow_tree_on_device(...)` returning a host-materialized tree descriptor — with a `default impl { Ok(None) }`. The boosting loop tries the device grower and falls back to the existing host growers when it returns `None`/unsupported. Do NOT add fine-grained per-stage seams (`build_histograms`/`score`/`partition`) to the trait: that would force the `Runtime` trait (in `cb-compute`) to speak in device-handle types, dragging CubeCL concepts across the `cb-train`/`cb-backend` boundary and re-opening the landmine. Fine-grained composition belongs INSIDE `cb-backend`, behind the coarse seam.
+2. **Device residency:** introduce a `cb-backend`-owned `GpuTrainSession` struct that owns ONE `ComputeClient` plus the persistent device handles (quantized features / compressed index, the running approx cursor, weights, partition/leaf-bins, partition-stats). It is created once per `fit()` and threaded through every iteration. The `Runtime` impl (`GpuBackend`) holds the session via interior mutability. Lifetime owner = the session, dropped at end of `fit()`.
+3. **Compose, don't rewrite:** the kernels already exist (`launch_pointwise_hist2`, `launch_find_optimal_split_pointwise`, `launch_scan_update_pointwise`, `launch_partition_split_into`, `launch_partition_update_into`, the pairwise family, the der seam) and a single-tree driver `grow_oblivious_tree_into` + a multi-tree driver `grow_boosting_pass_into` already chain them. The work is (a) wire `grow_boosting_pass` into `cb-train` behind the coarse seam, (b) convert the `*_into` helpers from host-slice arguments to PERSISTENT-HANDLE arguments so data stops re-uploading every level/tree, and (c) extend the depth-1 MVP to depth>1 via the partition-aware (`fullPass=false`) histogram.
+4. **Build order:** Phase 10 seam + wire depth-1 (residency refactor) → Phase 11 depth>1 partition-aware histogram + Newton der2 → Phase 12 CTR / pairwise / ordered / multiclass on-device → Phase 13 CUDA benchmark + ε sign-off.
 
 ---
 
 ## Standard Architecture
 
-### System Overview
+### Current state (v1.0 — derivatives-only GPU)
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│  PYTHON SURFACE  (two front-ends, one core)                            │
-│  ┌──────────────────────────┐   ┌──────────────────────────────────┐   │
-│  │ sklearn-compatible        │   │ CatBoost-native                  │   │
-│  │ fit/predict/predict_proba │   │ Pool, CatBoostClassifier/        │   │
-│  │ /score  (estimator API)   │   │ Regressor, native param names    │   │
-│  └────────────┬─────────────┘   └────────────────┬─────────────────┘   │
-│               └──────────────┬───────────────────┘                     │
-│                   crate: cb-python  (PyO3 + maturin)                    │
-└───────────────────────────────┬────────────────────────────────────────┘
-                                 │  pyclass wrappers → safe Rust calls
-                                 ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│  RUST PUBLIC API   crate: catboost-rs  (Builder pattern, re-exports)    │
-│  CatBoostBuilder → fit(&Pool) → Model → predict(&Pool)                  │
-└───────────────────────────────┬────────────────────────────────────────┘
-                                 ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│  BACKEND-AGNOSTIC CORE  (no GPU types leak here)                        │
-│  ┌────────────────┐  ┌──────────────────┐  ┌────────────────────────┐  │
-│  │ cb-data         │  │ cb-core           │  │ cb-model               │  │
-│  │ Pool, columns,  │  │ boosting loop,    │  │ tree/oblivious-tree    │  │
-│  │ quantization,   │  │ tree-build        │  │ structs, CTR tables,   │  │
-│  │ CTR cat-encode, │  │ orchestration,    │  │ serialize/deserialize  │  │
-│  │ Arrow/NumPy in  │  │ leaf estimation,  │  │ (.cbm + native fmt),   │  │
-│  │ (zero-copy)     │  │ loss/metric reg.  │  │ CPU eval / apply       │  │
-│  └────────┬────────┘  └─────────┬─────────┘  └───────────┬────────────┘  │
-│           │                     │ generic over <R: Runtime>             │
-│           └─────────────────────┼────────────────────────┘             │
-└─────────────────────────────────┼──────────────────────────────────────┘
-                                  │  trait Backend / ComputeClient<R>
-                                  ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│  BACKEND LAYER   crate: cb-compute   (CubeCL kernels, generic over R)   │
-│  histogram build · gradient/hessian · gradient pairs · partition scan   │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐                    │
-│  │ feat:cpu │ │feat:wgpu │ │feat:cuda │ │feat:rocm │   (Cargo features) │
-│  │CpuRuntime│ │WgpuRtime │ │CudaRtime │ │RocmRtime │                    │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘                    │
-└────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ cb-train  (generic boosting loop  train::<R: Runtime>)                 │
+│   per iteration:                                                       │
+│     runtime.compute_gradients(loss, approx, target)  ──► DEVICE        │
+│     ders.der1.clone()  ◄── read back to host (sync stall)             │
+│     greedy_tensor_search_oblivious_*  ──────────────► HOST  (~95%)     │
+│       histogram / score / BestSplit / partition / leaf-values         │
+└───────────────────────────────────┬──────────────────────────────────┘
+                                     │ Runtime trait (cb-compute)
+                                     │   fn compute_gradients(...)   ← only seam
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ cb-backend  GpuBackend : Runtime    (generic over SelectedRuntime)     │
+│   der1/der2 kernels via the Phase-7.2 der seam  ──► CubeCL ──► GPU     │
+│   UNWIRED: grow_oblivious_tree / grow_boosting_pass (tests only)       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Component Responsibilities (crate-level)
+### Target state (v1.1 — device-resident inner loop)
 
-| Crate | Responsibility (what it owns) | Backend-aware? | Mirrors CatBoost C++ |
-|-------|-------------------------------|----------------|----------------------|
-| `cb-data` | `Pool`/dataset, columnar + quantized feature storage, quantization (border selection), categorical CTR/perfect-hash encoding, exclusive-feature-bundling, zero-copy ingestion from NumPy/Arrow/Polars | No (CPU storage; produces compute-ready buffers) | `catboost/libs/data/` (`columns`, `quantization`, `quantized_features_info`, `ctrs`, `exclusive_feature_bundling`, `objects`) |
-| `cb-core` | Boosting loop, tree-building orchestration (oblivious-tree structure search), leaf-value estimation, bootstrap/sampling, loss + metric registry, ordered-boosting bookkeeping | Generic over `R: Runtime` (delegates compute to `cb-compute`) | `catboost/libs/train_lib/` + `catboost/cuda/methods/` (`oblivious_tree_structure_searcher`, `dynamic_boosting`, `leaves_estimation`) |
-| `cb-model` | Trained model representation (oblivious trees, splits, CTR value tables, scale & bias), serialization/deserialization (`.cbm` parity + native format), CPU inference/apply path | No (CPU apply; GPU eval optional later) | `catboost/libs/model/` (`model`, `ctr_data`, `eval_processing`, `flatbuffers`, `model/cpu`) |
-| `cb-compute` | All CubeCL kernels: histogram computation, gradient/hessian, gradient-pairs, partition/prefix scan, reductions. Exposes a thin backend-selection facade; kernels are generic over `R: Runtime` and `F: Float` | **Yes** — the only crate that names backend runtimes; feature-gated `cpu`/`wgpu`/`cuda`/`rocm` | `catboost/cuda/cuda_lib/`, `cuda/cuda_util/`, `cuda/methods/kernel/`, `cuda/gpu_data/` |
-| `catboost-rs` | Public Rust API: Builder pattern, re-exports `Pool`/`Model`, `thiserror` error enum, parameter struct. Selects backend via its own Cargo features that forward to `cb-compute` | Re-exports backend feature flags | `catboost/rust-package/src/` (greenfield equivalent of the safe wrapper) |
-| `cb-python` | PyO3 `#[pyclass]` wrappers, maturin packaging, both sklearn-estimator and CatBoost-native (`Pool`, `CatBoostClassifier/Regressor`) surfaces, `anyhow` at the boundary, per-backend wheels | Re-exports backend feature flags | `catboost/python-package/` (Cython `_catboost` + `core.py`) |
-| `cb-fstr` *(optional split)* | SHAP / feature-importance (can start as a module inside `cb-model`, promote to a crate if it grows) | No | `catboost/libs/fstr/` |
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ cb-train  (generic boosting loop  train::<R: Runtime>)                 │
+│   once:    runtime.begin_device_training(quantized, target, params)?   │
+│   per iter: if let Some(tree) = runtime.grow_tree_on_device(iter)? {   │
+│                 use tree   ──── DEVICE (histogram→score→split→leaf)    │
+│             } else { greedy_tensor_search_* host fallback }            │
+│   end:     runtime.end_device_training()                              │
+└───────────────────────────────────┬──────────────────────────────────┘
+                                     │ Runtime trait (cb-compute)
+                                     │   fn compute_gradients(...)        (unchanged)
+                                     │   fn grow_tree_on_device(...) -> Option<DeviceTree>
+                                     │   fn begin/end_device_training(...) default = no-op
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ cb-backend  GpuBackend : Runtime                                       │
+│   owns  GpuTrainSession { client, compressed_index_h, approx_h,        │
+│                           weight_h, bins_h, part_stats_h, der_h }      │
+│   grow_tree_on_device = grow_oblivious_tree_into over RESIDENT handles │
+│      ├─ launch_pointwise_hist2  (partition-aware, fullPass=false)      │
+│      ├─ launch_scan_update_pointwise                                   │
+│      ├─ launch_find_optimal_split_pointwise (O(1) BestSplit read-back) │
+│      ├─ launch_partition_split_into  (in-place doc routing)           │
+│      └─ launch_partition_update_into (per-leaf Σder/Σw read-back)      │
+│   data stays on GPU across ALL iterations; only O(1) leaf stats cross  │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-**Why these boundaries:** CatBoost's own tree cleanly separates `libs/data` (datasets + quantization), `libs/train_lib` (training orchestration), `libs/model` (model format + CPU apply), and `cuda/` (GPU kernels). We preserve that seam but invert one dependency: in C++ the GPU layer pulls in its own data structures (`cuda/gpu_data/`); in Rust we keep **one** backend-agnostic `cb-data` and push only the compute primitives into `cb-compute`, so the boosting orchestration in `cb-core` never branches on backend.
+### Component Responsibilities
+
+| Component | Responsibility | Status |
+|-----------|----------------|--------|
+| `Runtime` trait (`cb-compute/src/runtime.rs`) | Abstract compute seam the boosting loop drives. MUST stay free of CubeCL/handle types (D-03/D-04). | MODIFY — add coarse optional methods with default no-op impls |
+| `train_inner::<R>` (`cb-train/src/boosting.rs`) | Generic boosting loop; today always falls through to host growers. | MODIFY — try device seam, fall back to host |
+| host growers (`cb-train/src/tree.rs`) | `greedy_tensor_search_oblivious_*` — remain the CPU path + the fallback for unsupported device cases. | KEEP unchanged |
+| `GpuBackend` (`cb-backend/src/gpu_backend.rs`) | The `Runtime` impl; today only `compute_gradients`. | MODIFY — implement the coarse device-grow seam, own the session |
+| `GpuTrainSession` (NEW, `cb-backend`) | Owns the `ComputeClient` + all persistent device handles across iterations. | NEW |
+| `grow_boosting_pass_into` / `grow_oblivious_tree_into` (`cb-backend/src/gpu_runtime/mod.rs`) | Multi-tree + single-tree device drivers. Already exist; depth-1 MVP. | MODIFY — handle-resident args, depth>1 |
+| kernel launchers (`mod.rs`, `pairwise.rs`, `der_seams.rs`) | `#[cube]` launches: histogram, scan, score, partition split/update, der. | KEEP — add handle-accepting `*_into` variants |
+| `SelectedRuntime` alias (`cb-backend/src/lib.rs`) | Compile-time backend pick (cpu/wgpu/cuda/rocm). | KEEP |
 
 ---
 
-## Recommended Project Structure
+## The Runtime Seam Design (sub-question 1)
 
-```
-catboost_rs/                         # Cargo workspace root (virtual manifest)
-├── Cargo.toml                       # [workspace] members + shared deps/versions
-├── crates/
-│   ├── cb-data/                     # Pool, columns, quantization, CTR, ingestion
-│   │   ├── src/
-│   │   │   ├── pool.rs              # Pool: rows × typed columns + target/weights
-│   │   │   ├── columns.rs           # Float/Cat/Text/Embedding column storage
-│   │   │   ├── quantized.rs         # QuantizedPool: u8/u16 bin indices + borders
-│   │   │   ├── quantization.rs      # border selection (table-stakes algorithm)
-│   │   │   ├── ctr.rs               # categorical → numeric encoding tables
-│   │   │   ├── ingest_numpy.rs      # zero-copy from NumPy buffer protocol
-│   │   │   └── ingest_arrow.rs      # zero-copy from Arrow/Polars (bytemuck recast)
-│   │   └── tests/                   # separate test files (no inline mod tests)
-│   ├── cb-compute/                  # CubeCL kernels, generic over R: Runtime
-│   │   ├── src/
-│   │   │   ├── backend.rs           # Backend facade: select_runtime(), client init
-│   │   │   ├── histogram.rs         # #[cube(launch)] histogram kernel<F: Float>
-│   │   │   ├── gradients.rs         # gradient/hessian kernels<F: Float>
-│   │   │   ├── scan.rs              # partition / prefix-scan kernels
-│   │   │   └── reduce.rs            # reductions (leaf sums)
-│   │   └── tests/                   # GPU tests gated to rocm feature
-│   ├── cb-core/                     # boosting + tree-build orchestration
-│   │   ├── src/
-│   │   │   ├── boosting.rs          # the boosting loop (backend-agnostic)
-│   │   │   ├── tree_builder.rs      # oblivious-tree structure search
-│   │   │   ├── leaf_estimation.rs   # leaf value computation
-│   │   │   ├── loss/                # loss & metric registry (Logloss, RMSE, ...)
-│   │   │   └── sampling.rs          # bootstrap / ordered-boosting permutations
-│   │   └── tests/
-│   ├── cb-model/                    # model format + CPU apply + SHAP
-│   │   ├── src/
-│   │   │   ├── tree.rs              # oblivious tree + split representation
-│   │   │   ├── model.rs             # Model: trees + CTR tables + scale/bias
-│   │   │   ├── apply.rs             # CPU inference path
-│   │   │   ├── serialize.rs         # .cbm parity + native (serde) format
-│   │   │   └── fstr.rs              # SHAP / feature importance (or split crate)
-│   │   └── tests/
-│   ├── catboost-rs/                 # public Rust crate (Builder API, re-exports)
-│   │   ├── src/lib.rs               # CatBoostBuilder, re-export Pool/Model, errors
-│   │   └── tests/                   # oracle parity tests vs original CatBoost
-│   └── cb-python/                   # PyO3 + maturin
-│       ├── Cargo.toml               # cdylib; forwards backend features
-│       ├── pyproject.toml           # maturin build config
-│       └── src/lib.rs               # #[pymodule]: sklearn + native pyclasses
-└── .planning/
-```
+### Recommendation: a COARSE, OPTIONAL, host-typed seam
 
-### Structure Rationale
-
-- **One backend-agnostic core, one backend crate.** `cb-data`, `cb-core`, `cb-model` contain **zero** backend type names. The only crate that ever writes `WgpuRuntime`/`CudaRuntime`/`RocmRuntime`/`CpuRuntime` is `cb-compute`. This keeps the boosting loop and tree-building logic written once and prevents `#[cfg(feature = "cuda")]` from leaking across the codebase.
-- **`cb-data` is a leaf crate** (depends on nothing internal). Quantization and CTR encoding are pure CPU transforms that produce compute-ready bin buffers, so they sit below both `cb-core` and `cb-compute`.
-- **`cb-compute` depends only on CubeCL + `cb-data`'s buffer types** (or a tiny shared `cb-types` crate if circular pressure appears). It does not depend on `cb-core`; instead `cb-core` depends on `cb-compute` and drives it. This is the direction that makes the generic-runtime parameter flow naturally downhill.
-- **`cb-model` is independent of `cb-compute`** for the CPU apply path, so prediction works on any machine with no GPU toolchain. (GPU inference, if added later, becomes an optional dependency from `cb-model` on `cb-compute` — mirroring CatBoost's optional `EnableGPUEvaluation`.)
-- **Python and Rust public crates are thin.** They add ergonomics (Builder, pyclasses) and error-context conversion, nothing algorithmic. Both forward the same four backend Cargo features down to `cb-compute`, so a per-backend wheel is just a different feature selection at `maturin build` time.
-
----
-
-## Architectural Patterns
-
-### Pattern 1: Generic-Runtime Boundary (CubeCL zero-cost backend switching)
-
-**What:** The CPU/GPU choice is a **compile-time type parameter** `R: Runtime`, not a runtime `match`. Kernels are written once with `#[cube(launch)]` and are generic over the numeric float type `F: Float` (mandated by AGENTS.md: "Cubecl kernel need generics-float in this project"). The launch site is monomorphized per backend, so there is no dynamic dispatch and no vtable in the hot loop.
-
-**When to use:** Everywhere a compute primitive crosses into `cb-compute`. The boundary type is CubeCL's `Runtime` trait (and its associated `ComputeClient<R>` / `R::Device`).
-
-**Concrete boundary shape** (from the CubeCL manual, generics + matmul examples):
+Add to `cb_compute::Runtime` (all with default impls so `CpuBackend` and existing impls are untouched):
 
 ```rust
-// cb-compute/src/histogram.rs — kernel: generic over the FLOAT type only.
-use cubecl::prelude::*;
+// cb-compute/src/runtime.rs  — NO cubecl types appear here (D-03 preserved)
+pub trait Runtime {
+    fn compute_gradients(...) -> CbResult<Derivatives>;          // unchanged
+    fn compute_gradients_grouped(...) -> CbResult<Vec<Derivatives>>; // unchanged
 
-#[cube(launch)]
-pub fn histogram_kernel<F: Float>(
-    bins:  &Array<u32>,     // quantized feature bin indices
-    grads: &Array<F>,       // per-sample gradients
-    hist:  &mut Array<F>,   // output histogram (sum of grads per bin)
-) {
-    if ABSOLUTE_POS < bins.len() {
-        // atomic/segmented accumulate elided for brevity
-        hist[bins[ABSOLUTE_POS]] += grads[ABSOLUTE_POS];
-    }
-}
+    /// Open a device-resident training session: upload the quantized features +
+    /// target ONCE. Default = false (host-only backends ignore it).
+    fn begin_device_training(&self, _ctx: &DeviceTrainCtx) -> CbResult<bool> { Ok(false) }
 
-// The driver is generic over the RUNTIME. `cb-core` calls this; it never
-// mentions a concrete backend.
-pub fn build_histogram<R: Runtime, F: Float + CubeElement + bytemuck::Pod>(
-    client: &ComputeClient<R::Server, R::Channel>,
-    bins: ArrayHandleRef<R>,
-    grads: ArrayHandleRef<R>,
-    hist: ArrayHandleRef<R>,
-    n: usize,
-) {
-    histogram_kernel::launch::<F, R>(           // generic params order: <F, R>
-        client,
-        CubeCount::Static(/* groups */, 1, 1),
-        CubeDim { x: 256, y: 1, z: 1 },
-        bins.as_array_arg(1),
-        grads.as_array_arg(1),
-        hist.as_array_arg(1),
-    );
+    /// Grow ONE tree fully on device for `iter`, returning a HOST-materialized
+    /// tree descriptor. `Ok(None)` => "not supported, use the host grower"
+    /// (e.g. depth>1 before Phase 11, CTR/pairwise before Phase 12).
+    fn grow_tree_on_device(&self, _iter: usize) -> CbResult<Option<DeviceGrownTree>> { Ok(None) }
+
+    fn end_device_training(&self) -> CbResult<()> { Ok(()) }
 }
 ```
 
+`DeviceTrainCtx` and `DeviceGrownTree` are PLAIN host structs in `cb-compute` (Vec<f64>, Vec<u32>, `(feature,bin)` splits, leaf_values, leaf_of) — the SAME shape as the existing `GrownTree` in `cb-backend`, but defined in `cb-compute` so the trait signature stays handle-free. `cb-backend` converts its internal `GrownTree` → `cb_compute::DeviceGrownTree` at the seam boundary. This is exactly how `Derivatives` already crosses today (host `Vec<f64>`, no CubeCL leakage).
+
+### Why coarse, not fine-grained — the landmine analysis
+
+| Option | Trait surface | cb-train↔cb-backend coupling | Verdict |
+|--------|---------------|------------------------------|---------|
+| **Coarse `grow_tree_on_device()`** | One method returning a host struct | `cb-train` only ever sees `Vec`-shaped descriptors; device-handle lifetime stays 100% inside `cb-backend`. The boosting loop stays genuinely generic. | RECOMMENDED |
+| Fine-grained per-stage (`build_histograms`/`score`/`partition`/`update_leaves`) | 4–6 methods exchanging histograms/partitions | Either the trait speaks device-handle types (drags CubeCL into `cb-compute` → violates D-03, re-opens the landmine), OR every stage round-trips its histogram/partition to host as `Vec` (kills residency — the very thing we're fixing). The per-level loop control would also have to live in the generic `cb-train`, which then needs to know device-partition semantics. | REJECT |
+
+The host-light per-level chaining (histogram → scan → score → BestSplit → partition split → partition update) is INHERENTLY a tight device-resident loop where intermediate buffers must never leave the GPU. That loop already lives correctly inside `grow_oblivious_tree_into` in `cb-backend`. Exposing its internal stages through the `Runtime` trait would either leak handles upward (landmine) or force read-backs (defeats the purpose). The right seam wraps the WHOLE per-tree loop.
+
+**Fallback is first-class, not an afterthought.** `Ok(None)` from `grow_tree_on_device` lets the boosting loop transparently use the host grower for any case the device path doesn't cover yet (depth>1 pre-Phase-11, CTR/pairwise/ordered/multiclass pre-Phase-12, or any loss without a GPU der kernel). This is what makes the incremental build order safe — partial device coverage never breaks correctness, only speed.
+
+---
+
+## Device Residency Ownership Model (sub-question 2)
+
+### The problem today
+
+Even the EXISTING device driver re-uploads everything. `grow_oblivious_tree_into` uploads resident handles (`cindex_h`, `der1_h`, …) at `mod.rs:1704-1708` but then calls `launch_find_optimal_split_pointwise_into(client, der1, weight, cindex, indices, …)` with the **host slices** at `mod.rs:1722-1724` — so the score kernel re-uploads der1/weight/cindex/indices EVERY LEVEL. And `grow_boosting_pass_into` passes host `cindex`/`indices` into `grow_oblivious_tree_into` EVERY TREE (`mod.rs:1982-1985`), re-uploading the entire quantized feature matrix once per boosting iteration. Quantized features are immutable across the whole run, so this is pure waste — and the dominant residency bug to fix.
+
+### Recommendation: a `GpuTrainSession` owns the lifetime
+
 ```rust
-// cb-compute/src/backend.rs — the ONLY place backends are named.
-// Each is behind a Cargo feature so only one is compiled into a given wheel.
-#[cfg(feature = "wgpu")]  pub type SelectedRuntime = cubecl::wgpu::WgpuRuntime;
-#[cfg(feature = "cuda")]  pub type SelectedRuntime = cubecl::cuda::CudaRuntime;
-#[cfg(feature = "rocm")]  pub type SelectedRuntime = cubecl::rocm::RocmRuntime; // hip
-#[cfg(feature = "cpu")]   pub type SelectedRuntime = cubecl::cpu::CpuRuntime;
+// cb-backend (NEW) — owns one client + all cross-iteration device buffers
+pub struct GpuTrainSession {
+    client:            ComputeClient<SelectedRuntime>,
+    // immutable for the whole run (uploaded ONCE):
+    compressed_index_h: Handle,   // quantized feature-major bins (cindex)
+    indices_h:          Handle,   // object visiting order
+    target_h:           Handle,
+    weight_h:           Handle,
+    n: usize, n_features: usize, n_bins: usize,
+    // mutated in place per iteration:
+    approx_h:           Handle,   // the running cursor  (upstream TBoostingCursors)
+    der1_h:             Handle,   // recomputed device-side each tree
+    // mutated in place per level within a tree:
+    bins_h:             Handle,   // per-doc leaf assignment (upstream subsets.Bins)
+    part_stats_h:       Handle,   // per-leaf Σder/Σweight   (upstream PartitionStats)
+}
 ```
 
-`cb-core` is then generic — `fn fit<R: Runtime>(...)` — or, more ergonomically, the public `catboost-rs` crate fixes `R = cb_compute::SelectedRuntime` once, so end users never write a type parameter while the internals stay backend-polymorphic and testable against `CpuRuntime`.
+| Buffer | Lifetime | Mirrors upstream |
+|--------|----------|------------------|
+| `compressed_index_h`, `indices_h`, `target_h`, `weight_h` | whole `fit()` — uploaded once | `TDocParallelDataSet` compressed index (built once by `compressed_index_builder`) |
+| `approx_h` | whole `fit()` — updated in place each iteration | `TBoostingCursors::Cursors` (`TStripeBuffer<float>`) |
+| `der1_h` | recomputed device-side each tree from `approx_h` | per-iteration target derivative cursor |
+| `bins_h`, `part_stats_h` | reset per tree, mutated per level | `TOptimizationSubsets::{Bins, PartitionStats}` |
 
-**Trade-offs:** Monomorphization gives zero-cost dispatch and lets tests run the CPU runtime while production uses GPU, but it increases compile time and means a single binary embeds exactly one backend (intentional — matches the "per-backend wheel" requirement). `f64` parity vs `f32` GPU speed is a precision/perf tension flagged for STACK/PITFALLS (the 10⁻⁵ oracle tolerance likely forces `f64` in accumulation paths).
+**Owner of the lifetime:** the session is created in `begin_device_training` and dropped in `end_device_training` (or by `Drop` on the session). Because a CubeCL `Handle` is bound to the `ComputeClient` that allocated it (the "never read a 0-len handle / handle bound to its client" landmine from Phase 7.2/7.5), the session MUST hold the one client and thread `&self.client` through every launch — exactly the "thread ONE client" discipline `grow_*_into` already follows, lifted from per-tree scope to per-`fit()` scope.
 
-### Pattern 2: CPU/GPU split — agnostic orchestration, backend-specific primitives
+**Where it lives relative to `GpuBackend`:** `GpuBackend` is currently zero-sized. Give it interior-mutable ownership: `GpuBackend { session: RefCell<Option<GpuTrainSession>> }` (single-threaded `fit()`; `Runtime` methods take `&self`). `begin_device_training` fills it; `grow_tree_on_device` borrows it; `end_device_training` clears it. No `cb-train` types are involved — the session is 100% `cb-backend`-internal.
 
-**What:** Split the algorithm by *what is data-parallel and hot* vs *what is control flow*.
+### Cross-iteration data flow (per boosting iteration, target state)
 
-| Stays backend-agnostic (in `cb-core`/`cb-model`) | Pushed to backend kernels (in `cb-compute`) |
-|--------------------------------------------------|---------------------------------------------|
-| The boosting loop (iteration over trees) | Histogram computation (per-feature, per-bin sums) |
-| Tree-building orchestration / structure search control flow | Gradient & hessian computation |
-| Best-split selection *policy* (the loop that compares scores) | Per-bin score reduction feeding split selection |
-| Leaf-value estimation orchestration | Partition / prefix-scan over samples |
-| Loss/metric registry, parameter handling | Bootstrap weight generation, sampling permutation application |
-| Model assembly, serialization, CPU apply | (GPU apply optional, later) |
+```
+approx_h (resident) ──► der seam (RmseGradient) ──► der1_h (resident, device)   [NO read-back]
+der1_h + compressed_index_h + bins_h ──► per-level loop:
+    hist2(partition-aware) → scan_update → score → BestSplit  [O(1) read-back only]
+    → partition_split (bins_h in place) → partition_update (part_stats_h)
+part_stats_h ──► read back 2^depth leaf stats ──► calc_average ──► leaf_values   [O(1)]
+leaf_values + bins_h ──► update approx_h in place on device                      [NO read-back]
+```
 
-**Why:** This is exactly how CatBoost's `cuda/methods/` is organized — the `oblivious_tree_structure_searcher` drives the search while `histograms_helper` and the `kernel/` directory hold the device code. Keeping the *policy* on the host means the algorithm is written once; only the *number crunching* is duplicated across backends (and even that is a single generic kernel).
-
-### Pattern 3: Memory-efficiency — columnar, quantized, zero-copy
-
-**What:** Three reinforcing techniques, all first-class per the PROJECT memory constraint:
-
-1. **Columnar + quantized storage.** Float features are pre-binned into `u8` (≤256 borders) or `u16` bin indices in `cb-data::QuantizedPool`, not stored as `f32`. This is CatBoost's `quantized_features_info` / `packed_binary_features` model. Histogram kernels then read compact `u32`/`u8` bins instead of floats — less bandwidth, the dominant GBDT cost.
-2. **Zero-copy ingestion.** NumPy (buffer protocol) and Arrow/Polars (`ScalarBuffer`/contiguous `Buffer`) expose dense, aligned slices. Use `bytemuck::cast_slice` to reinterpret `&[T]` as `&[u8]` and hand straight to `cubecl::bytes::Bytes` → `client.create(...)` with no element-wise copy (the `ZERO_COPY_ARROW_CUBECL` pattern). On the Python side, accept NumPy arrays without round-tripping through Python lists.
-3. **Allocation discipline in the boosting loop.** Pre-allocate histogram/gradient buffers once and reuse them across iterations (arena/scratch buffers held by `cb-core`), rather than allocating per tree or per node. Mirrors CatBoost's `compressed_index` + reusable GPU buffers.
-
-**Trade-offs:** Zero-copy requires Pod/aligned, non-nullable, contiguous source columns; nullable Arrow arrays or Python object arrays must fall back to a validating copy path. Quantization is lossy by design (and is itself the oracle-sensitive border algorithm) — a correctness hot-spot for parity testing.
-
-### Pattern 4: Dual Python API over one Rust core (PyO3)
-
-**What:** `cb-python` exposes two `#[pymodule]` surfaces that both bottom out in the same `catboost-rs` calls:
-
-- **sklearn-compatible:** `CatBoostClassifier`/`CatBoostRegressor` implementing `fit(X, y)`, `predict(X)`, `predict_proba(X)`, `score(X, y)` — `X` accepted as NumPy/Pandas/Arrow, internally built into a `Pool`.
-- **CatBoost-native:** a `Pool` `#[pyclass]` and the same estimator classes accepting native parameter names (e.g. `iterations`, `depth`, `learning_rate`, `cat_features`), for drop-in migration.
-
-Both construct a `cb_data::Pool`, call `catboost_rs::CatBoostBuilder`, and return a `Model` pyclass. Errors are converted at this boundary: `thiserror` enums from the library become Python exceptions via `anyhow`-style context.
-
-**Trade-offs:** Two surfaces, one implementation — the only duplication is parameter-name mapping and the sklearn estimator contract glue. Per-backend wheels (`catboost-rs-rocm`, etc.) are produced by selecting the matching Cargo feature at `maturin build`.
+Per iteration, the ONLY host crossings are: the per-level `BestSplit` descriptor and the final `2^depth` leaf stats — the existing D-05 "host-light" contract, now sustained across the whole run instead of re-uploading the dataset each tree.
 
 ---
 
-## Data Flow
+## Composing With Existing Phase 7 Kernels (sub-question 3)
 
-The end-to-end path the roadmap should sequence components against:
+Everything needed is already built and rocm-validated. The integration is WIRING + a residency refactor, not new kernels.
 
-```
-INGEST            QUANTIZE           TRAIN                       SERIALIZE        PREDICT
-─────────         ─────────          ─────────                   ─────────        ─────────
-NumPy/Arrow  ─►  border select   ─►  boosting loop (cb-core)  ─► Model (cb-model) ─► load Model
-(zero-copy,      + bin to u8/u16     │  per iter:               ► .cbm / native     │
- cb-data)        + CTR encode        │   compute grad/hess ─┐    serialize          ▼
-   │             cat features        │   build histograms  ─┤                    apply on Pool
-   ▼             (cb-data)           │   (cb-compute @ R)   ─┘                    (CPU path,
- Pool ───────────► QuantizedPool ────┤   select splits (host)                     cb-model)
-                                     │   estimate leaves                          │
-                                     │   append oblivious tree                    ▼
-                                     └─► repeat × iterations                   scores → Python
-```
+| Existing asset | File:loc | Role in device-resident loop | Change needed |
+|----------------|----------|------------------------------|---------------|
+| `launch_pointwise_hist2[_into]` | `mod.rs:481/501` | per-level histogram fill | add partition-aware (`fullPass=false`) variant for depth>1 (Phase 11); add handle args |
+| `launch_scan_update_pointwise[_into]` | `mod.rs:1172/1190` | prefix-sum left/right fold | handle args |
+| `launch_find_optimal_split_pointwise[_into]` | `mod.rs:903/927` | score + deterministic argmin → `BestSplit` | handle args (stop re-uploading der1/cindex per level) |
+| `launch_partition_split_into` | `mod.rs:1392` | in-place forward-bit doc routing | already handle-based |
+| `launch_partition_update_into` | `mod.rs:1464` | per-leaf Σder/Σweight reduce | already handle-based |
+| der seam (`launch_der_binary_into`, …) | `der_seams.rs` | recompute der1 from approx on device | reuse verbatim |
+| `grow_oblivious_tree_into` | `mod.rs:1641` | single-tree host-light driver | residency refactor + depth>1 |
+| `grow_boosting_pass_into` | `mod.rs:1920` | multi-tree driver (already loops the above) | the basis of `grow_tree_on_device`; lift dataset upload out of the per-tree call |
+| pairwise family | `pairwise.rs` (hist/scan/score/`grow_oblivious_tree_pairwise`) | pairwise split scoring on device | wire in Phase 12 |
+| score calcers (L2/Cosine/Solar/LOO/Sat) | comptime in score launch | per-tree score function | already comptime-selected |
 
-**Direction is strictly left-to-right and downhill in the crate graph:** raw data enters `cb-data`, is reduced to a `QuantizedPool`, which `cb-core` consumes while delegating the hot numeric steps to `cb-compute<R>`; the result is a `cb-model::Model` that serializes and later applies independently of any backend.
+**Key refactor (the residency seam, the IN-02 "one geometry" precedent):** convert each `*_into` launcher to accept `Handle`s instead of `&[f64]`/`&[u32]`. The `_into` functions are the right layer — they already take `&client`; they just need to stop calling `client.create(...)` on caller data every invocation and instead receive the already-resident handle. The public host-slice wrappers (`launch_pointwise_hist2`, etc.) stay as thin "upload once then call `_into`" shims for the existing single-shot tests.
 
----
+### Upstream reference grounding (`catboost-master/catboost/cuda/`)
 
-## Build Order / Dependency Graph
+The vendored CUDA trainer validates this exact decomposition:
 
-Internal crate dependencies (arrows = "depends on"):
+- **`gpu_data/compressed_index.{h,cpp}` + `compressed_index_builder`** — the quantized feature matrix is compiled to a device-resident "compressed index" ONCE; the boosting loop never re-uploads it → our `compressed_index_h`.
+- **`methods/doc_parallel_boosting.h`** — `TBoostingCursors::Cursors` (`TStripeBuffer<float>`) is the device-resident running approx, updated in place each iteration; `DataSets` (the `TDocParallelDataSetsHolder`) persists across the whole fit → our `approx_h` + persistent dataset handles.
+- **`methods/pointwise_optimization_subsets.h`** — `TOptimizationSubsets { Partitions, PartitionStats, Bins }` is the device-resident partition state; `UpdateSubsetsStats` / `UpdateBins` mutate it per level → our `bins_h` + `part_stats_h` and the `partition_split`/`partition_update` launches.
+- **`methods/oblivious_tree_doc_parallel_structure_searcher.{h,cpp}`** — `ReadAndEstimateLeaves(parts)` reads back ONLY the `TPartitionStatistics` (the small per-leaf stats) and estimates leaves on host → our O(1) `part_stats` read-back + `calc_average`. Upstream proof that "host-light, read back only leaf stats" is the real CatBoost GPU design, not a shortcut.
+- **`methods/doc_parallel_pointwise_oblivious_tree.h`** — wraps the structure searcher as the weak learner the boosting loop calls per iteration → our coarse `grow_tree_on_device` seam.
 
-```
-cb-data  ◄────────────── cb-core ──────────► cb-compute ──► CubeCL
-   ▲                        │                    ▲
-   │                        ▼                    │ (feature: cpu/wgpu/cuda/rocm)
-   └──────────────────── cb-model               │
-                            ▲                    │
-                            │                    │
-                       catboost-rs ──────────────┘  (fixes R = SelectedRuntime)
-                            ▲
-                            │
-                        cb-python  (PyO3 + maturin)
-```
-
-**Suggested build order (each layer must exist before the next):**
-
-1. **Workspace skeleton + `cb-data`** — `Pool`, columnar storage, quantization, CTR cat-encoding, NumPy/Arrow ingestion. *Everything depends on data; nothing can be trained or tested without it.* No backend needed.
-2. **`cb-compute` with the `cpu` backend only** — establish the `R: Runtime` generic boundary and the core kernels (histogram, gradient/hessian, scan) against `CpuRuntime`. *Proving the generic boundary on CPU first de-risks the GPU work and gives a testable oracle target with no GPU hardware.*
-3. **`cb-core`** — boosting loop, tree-building orchestration, leaf estimation, loss registry — driving `cb-compute` over the generic runtime. End-to-end CPU training works here.
-4. **`cb-model`** — tree/model representation, serialization (`.cbm` parity), CPU apply. First full train→serialize→predict cycle; first oracle parity tests vs original CatBoost (≤ 10⁻⁵).
-5. **`catboost-rs`** — Builder-pattern public API and re-exports; thin layer over 1–4.
-6. **Additional backends in `cb-compute`** (`wgpu`, then `rocm` for GPU test execution, `cuda` last/untestable-locally) — purely adding `#[cfg]` runtime types and validating kernels; no changes to `cb-core`. *Deferred because the generic boundary (step 2) already abstracts them.*
-7. **`cb-python`** — PyO3 wrappers, dual sklearn + native API, maturin per-backend wheels. *Last, because it wraps the now-stable Rust API.*
-8. **SHAP / `cb-fstr`** — feature importance, built on the finished `cb-model` apply path. *Can run in parallel with step 6/7 once `cb-model` exists.*
-
-**Critical build-order implications for the roadmap:**
-- The **generic-runtime boundary must be designed in step 2**, not retrofitted — choosing the `R: Runtime` / `F: Float` signatures up front is what makes steps 6 a no-op for `cb-core`. Retrofitting genericity later forces a rewrite of the boosting loop.
-- **CPU backend before any GPU backend.** It is the oracle-test vehicle and needs no GPU toolchain. GPU (`rocm` for tests, `cuda` untestable locally) is additive.
-- **Quantization (step 1) and CTR encoding are oracle hot-spots** — they sit at the very bottom of the graph, so a parity bug there poisons everything above. Flag them for deep, early oracle testing.
-- **Python (step 7) is strictly downstream** of a stable `catboost-rs` API; do not start the PyO3 dual surface until the Rust Builder API is settled, or the binding glue will churn.
+Upstream is `TBoosting<TTarget, TWeakLearner>` templated over the weak learner — a COARSE "grow one tree" seam, NOT fine-grained histogram callbacks. This independently confirms the coarse-seam recommendation.
 
 ---
 
-## Anti-Patterns to Avoid
+## New vs Modified Components
 
-| Anti-pattern | Why it's wrong here | Do instead |
-|--------------|---------------------|------------|
-| `#[cfg(feature="cuda")]` branches scattered through `cb-core`/`cb-model` | Backend leaks into orchestration; defeats zero-cost generic switching; multiplies test matrix | Confine all backend type names to `cb-compute::backend`; keep core generic over `R: Runtime` |
-| Runtime `enum Backend { Cpu, Cuda, ... }` dispatch | Violates the PROJECT "no runtime switching, compile-time only" constraint; adds dispatch overhead in the hot loop | Compile-time `R: Runtime` type parameter, selected by Cargo feature |
-| Storing features as dense `f32` and quantizing on the fly | Wastes the dominant memory budget; re-binning per iteration is slow | Quantize once into `u8`/`u16` `QuantizedPool` in `cb-data` |
-| Element-wise copy of NumPy/Arrow into `Vec<f32>` before upload | Burns the memory-efficiency budget the project mandates | `bytemuck::cast_slice` → `cubecl::bytes::Bytes` zero-copy upload |
-| Per-iteration allocation of histogram/gradient buffers | Allocator churn dominates the boosting loop | Pre-allocate reusable scratch buffers owned by `cb-core` |
-| Coupling `cb-model` apply to `cb-compute` | Forces a GPU toolchain just to run prediction | Keep CPU apply self-contained in `cb-model`; make GPU eval an optional dependency added later |
-| Inline `#[cfg(test)] mod tests` in production source | Explicitly prohibited by AGENTS.md / PROJECT | Separate `tests/` files or `src/foo_test.rs`; GPU tests gated to `rocm` |
+**NEW**
+- `cb-backend`: `GpuTrainSession` (persistent device-handle owner).
+- `cb-compute`: `DeviceTrainCtx` + `DeviceGrownTree` plain host structs (seam DTOs).
+- `cb-backend`: partition-aware (`fullPass=false`) histogram launch for depth>1 (Phase 11).
+- Benchmark harness crate / example for the CUDA Kaggle run (Phase 13).
+
+**MODIFIED**
+- `cb-compute/src/runtime.rs`: add 3 default-impl trait methods (`begin_device_training`, `grow_tree_on_device`, `end_device_training`).
+- `cb-train/src/boosting.rs` (`train_inner`): try device seam → host fallback; call begin/end around the loop.
+- `cb-backend/src/gpu_backend.rs`: implement the seam, own the session.
+- `cb-backend/src/gpu_runtime/mod.rs`: `*_into` launchers take handles; `grow_oblivious_tree_into` depth>1; `grow_boosting_pass_into` becomes the session-driven driver.
+
+**UNCHANGED (KEEP)**
+- All `#[cube]` kernels (histogram/scan/score/partition/der) — wire, don't rewrite.
+- Host growers in `cb-train/src/tree.rs` — remain the CPU path and the device fallback.
+- `SelectedRuntime` compile-time selection; no runtime dispatch added.
+- The `compute_gradients` seam and every shipped CPU/N-dim oracle (D-04 no-regression).
 
 ---
 
-## Confidence Assessment
+## Anti-Patterns
 
-| Area | Confidence | Basis |
-|------|------------|-------|
-| Crate decomposition & boundaries | HIGH | Directly mirrors CatBoost's own `libs/data` / `train_lib` / `model` / `cuda` separation, verified by inspecting the vendored source tree |
-| CubeCL generic-runtime boundary | HIGH | CubeCL manual generics + matmul examples show the exact `<F, R>` launch signature and `Runtime`/`ComputeClient` types; AGENTS.md mandates generic-float kernels |
-| CPU/GPU split | HIGH | Maps 1:1 to `cuda/methods/` (host search vs `kernel/` device code) in the reference |
-| Memory-efficiency architecture | HIGH | Quantized columnar model from `libs/data/quantization`+`packed_binary_features`; zero-copy path documented in `ZERO_COPY_ARROW_CUBECL` |
-| Build order | HIGH | Derived from the internal dependency graph (data → compute → core → model → api → python) which is acyclic by construction |
-| Exact CubeCL backend type names (`RocmRuntime` vs HIP naming) and current CubeCL version API | MEDIUM | Manual examples use `WgpuRuntime`/`CpuRuntime`/`CudaRuntime`; exact rocm runtime path and current crate API should be pinned in STACK.md against the installed CubeCL version |
+### Anti-Pattern 1: Fine-grained per-stage trait methods
+**What people do:** expose `build_histograms()`, `score_splits()`, `partition()` on `Runtime` so the generic loop "orchestrates" the GPU.
+**Why it's wrong:** forces device handles (or per-stage read-backs) across the `cb-compute`/`cb-train`↔`cb-backend` boundary — either leaking CubeCL into `cb-compute` (violates D-03, re-opens the feature-unification landmine) or destroying residency. Upstream itself uses a coarse weak-learner template, not stage callbacks.
+**Do this instead:** one coarse `grow_tree_on_device` returning a host descriptor; keep the per-level chaining inside `cb-backend`.
+
+### Anti-Pattern 2: cb-backend depending on cb-train
+**What people do:** import host grower/leaf helpers from `cb-train` into the device driver to avoid duplication.
+**Why it's wrong:** the documented Phase-7.5 landmine — Cargo feature unification across the `cb-train`→`cb-backend` edge breaks the rocm runtime build.
+**Do this instead:** transcribe the needed CPU reference (e.g. `calc_average`, `select_best_candidate` tie-break) inline in `cb-backend`, as already done in `grow_oblivious_tree_into`. The seam DTOs live in `cb-compute` (the shared dependency both already use), never in `cb-train`.
+
+### Anti-Pattern 3: Re-uploading the dataset each tree/level
+**What people do:** pass host `&[u32]` cindex into the per-level/per-tree launches (the current `*_into` shape).
+**Why it's wrong:** the quantized feature matrix is immutable for the whole run; re-uploading it per level/tree dominates device traffic and partly explains why the GPU path can be slower than CPU.
+**Do this instead:** upload once into `GpuTrainSession`; thread the `Handle` through handle-based `*_into` variants.
+
+### Anti-Pattern 4: Reading the full histogram/partition to host
+**What people do:** read histograms back to host for "easier" split selection.
+**Why it's wrong:** that is the FORBIDDEN D-05 host hybrid; it reintroduces the read-back stall.
+**Do this instead:** keep histogram/partition device-resident; read back only the O(1) `BestSplit` descriptor and the `2^depth` leaf stats (the upstream `ReadAndEstimateLeaves` contract).
+
+### Anti-Pattern 5: Silent fallback / wrong-structure stump
+**What people do:** when depth>1 or a loss has no GPU path, quietly grow a stump or fall through to wrong math.
+**Why it's wrong:** fabricates a tree that fails the ≤1e-5 oracle invisibly (the existing driver already rejects depth>1 with a typed error for this reason — `mod.rs:1670-1678`).
+**Do this instead:** `grow_tree_on_device` returns `Ok(None)` → boosting loop uses the host grower (correct, just not yet accelerated). Explicit, oracle-safe partial coverage.
+
+---
+
+## Integration Points
+
+### Internal Boundaries
+
+| Boundary | Communication | Notes |
+|----------|---------------|-------|
+| `cb-train` ↔ `cb-compute` `Runtime` | host structs only (`Derivatives`, new `DeviceGrownTree`) | NO CubeCL types — the rule that keeps the loop generic |
+| `cb-compute` ↔ `cb-backend` | `cb-backend impl Runtime`; converts internal `GrownTree`→`DeviceGrownTree` | the only place device→host materialization happens |
+| `cb-backend` internal: session ↔ launchers | `Handle` threaded with one `&client` | handle bound to its client (Phase 7.2/7.5 landmine) |
+| `cb-backend` ↔ `cb-train` | **NONE — forbidden** | feature-unification landmine; transcribe CPU refs inline |
+
+### External / hardware
+
+| Surface | Pattern | Notes |
+|---------|---------|-------|
+| ROCm gfx1100 (in-env) | correctness dev + ≤1e-5 (ε=1e-4 per D-04) validation | CubeCL portable; all kernels already rocm-tested |
+| CUDA (Kaggle notebook) | head-to-head SPEED benchmark vs official CatBoost GPU | same `SelectedRuntime` source, `--features cuda`; no NVIDIA in-env |
+| wgpu | f32 channel fallback path | der/score launch over f32 on wgpu (existing) |
+
+---
+
+## Suggested Phase Build Order
+
+| Phase | Scope | Depends on | Exit criterion |
+|-------|-------|-----------|----------------|
+| **10 — Seam + wire depth-1** | Add the coarse `Runtime` seam (default no-op); `GpuTrainSession` residency (upload-once dataset, in-place approx/der); handle-ify `*_into`; wire `grow_boosting_pass` behind the seam for RMSE/Logloss depth-1. Host fallback for everything else. | existing kernels + drivers | depth-1 RMSE training runs fully on-device, dataset uploaded once, ≤1e-5 vs CPU on rocm; CPU/host paths byte-unchanged (D-04). |
+| **11 — depth>1 + Newton** | Partition-aware (`fullPass=false`) histogram fill so levels >0 score over `2^level` partitions; Newton der2 leaf values on device. | Phase 10 residency | depth>1 oblivious trees ≤1e-5; the depth>1 `OutOfRange` guard removed. |
+| **12 — CTR / pairwise / ordered / multiclass** | Wire the existing pairwise device family; on-device CTR columns; ordered-boosting segments; multiclass der/leaves. Each lands behind the same `Ok(None)`→fallback gate, flipped on as it passes oracle. | Phase 11 | each feature family ≤1e-5 on device or cleanly falls back. |
+| **13 — Benchmark + ε sign-off** | CUDA Kaggle head-to-head vs official CatBoost GPU; throughput report; final tolerance sign-off; close the >20× gap. | Phases 10–12 | documented speedup; ε signed off (D-04). |
+
+**Ordering rationale:** Phase 10 must establish residency + the seam first because it is the prerequisite for ANY speedup and de-risks the landmine boundary; depth>1 (11) is the single biggest correctness extension and needs the resident partition state from 10; the feature families (12) are independent and individually gated by the fallback, so they can land in any sub-order without breaking correctness; the benchmark (13) is meaningful only once the common path is on-device.
+
+---
 
 ## Sources
 
-- `catboost-master/catboost/libs/data/` (columns, quantization, quantized_features_info, ctrs, exclusive_feature_bundling, objects) — HIGH (vendored reference)
-- `catboost-master/catboost/libs/train_lib/`, `catboost/cuda/methods/`, `catboost/cuda/gpu_data/` — HIGH (vendored reference)
-- `catboost-master/catboost/libs/model/` (model, ctr_data, eval_processing, flatbuffers, cpu/) — HIGH (vendored reference)
-- `.planning/codebase/ARCHITECTURE.md`, `STRUCTURE.md`, `INTEGRATIONS.md` — HIGH (first-party codebase map)
-- CubeCL manual: `Cubecl_generics.md`, `cubecl_matmul_gemm_example.md`, `ZERO_COPY_ARROW_CUBECL.md` — HIGH (project-mandated reference)
-- `AGENTS.md`, `.planning/PROJECT.md` — HIGH (project constraints)
+- `catboost-rs` existing code (HIGH — direct read): `crates/cb-compute/src/runtime.rs:892-955`; `crates/cb-train/src/boosting.rs:1870,2101,2920-3008,3230-3345`; `crates/cb-backend/src/gpu_backend.rs`; `crates/cb-backend/src/gpu_runtime/mod.rs:481-2043` (`grow_oblivious_tree_into`, `grow_boosting_pass_into`, `launch_*_into`); `crates/cb-backend/src/gpu_runtime/pairwise.rs`, `der_seams.rs`; `crates/cb-backend/Cargo.toml`, `lib.rs`.
+- Vendored upstream CUDA trainer (HIGH — reference design): `catboost-master/catboost/cuda/gpu_data/compressed_index*.{h,cpp}`; `methods/doc_parallel_boosting.h` (`TBoostingCursors`, `TDocParallelDataSetsHolder`); `methods/pointwise_optimization_subsets.h` (`TOptimizationSubsets`/`Bins`/`PartitionStats`); `methods/oblivious_tree_doc_parallel_structure_searcher.{h,cpp}` (`ReadAndEstimateLeaves`); `methods/doc_parallel_pointwise_oblivious_tree.h`.
+- `.planning/notes/gpu-training-host-light-root-cause.md` (HIGH — the integration-gap analysis + landmine).
+- `.planning/PROJECT.md` v1.1 milestone scope (HIGH).
+
+---
+*Architecture research for: device-resident GPU boosting integration with a generic Runtime seam (v1.1)*
+*Researched: 2026-06-28*

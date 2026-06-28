@@ -1,290 +1,175 @@
 # Project Research Summary
 
-**Project:** catboost-rs
-**Domain:** Gradient-boosting ML library — full Rust rewrite of CatBoost, multi-backend GPU (CubeCL), dual PyO3 Python bindings, oracle-tested to ≤1e-5
-**Researched:** 2026-06-13
-**Confidence:** HIGH (grounded in vendored CatBoost C++ source, live crates.io version verification, and first-party CubeCL manual)
+**Project:** catboost-rs v1.1 GPU Performance
+**Domain:** Device-resident GPU gradient-boosting training (CubeCL) + speed-parity benchmarking vs official CatBoost GPU
+**Researched:** 2026-06-28
+**Confidence:** HIGH
 
 ## Executive Summary
 
-catboost-rs is one of the hardest categories of ML engineering project: a *numerically-exact rewrite* of a mature, heavily-optimized C++ trainer in a different language, on a different GPU framework, with a different binding layer. The dominant risk is not "will it work" but "will it match." Gradient boosting is a sequential, compounding algorithm — a single ULP divergence in quantization border placement propagates through every subsequent tree, making late-discovered parity failures very expensive to localize. The research consensus is unambiguous: **phase by oracle-passing vertical slices, narrowest first**; do not build multiple components simultaneously without intermediate oracle gates. The entire project architecture must be laid down — workspace, lint rules, oracle harness infrastructure, the RNG port, and the generic CubeCL `R: Runtime` boundary — before any algorithmic code is written.
+The v1.1 milestone is a wiring + residency + kernel-coverage problem, not a new-technology problem. All four research agents converged on the same diagnosis: the >20x gap exists because `grow_boosting_pass` (`cb-backend/src/gpu_runtime/mod.rs:1890`) is a rocm-validated, depth-1 device grow loop that is never called from `cb_train::train` — there is no `Runtime` trait seam for on-device tree growth, so every GPU fit falls through to the host CPU growers. The derivative kernels run on-device, but then their output is read back to host per tree so the host can run ~95% of training (histogram build, split scoring, BestSplit, partition update, leaf values). The result is slower than pure CPU. The fix is not a new crate or new algorithm; it is adding one coarse trait method to `cb_compute::Runtime` and wiring the existing driver into `cb_train::train`. CubeCL 0.10.0 already provides every primitive required: persistent buffer handles, device atomics, scan/reduce, lazy async dispatch, and per-block carry for the multi-block scan.
 
-The recommended stack has one critical version-coupling anchor: `rust-numpy 0.28` transitively pins `pyo3 = ^0.28` (use 0.28.3, not 0.29) and `ndarray = >=0.15, <=0.17` (use 0.17.2). These three versions must move together; any upgrade of one requires all three to be validated simultaneously. The CubeCL backend maps are equally load-bearing: `rocm` feature → `cubecl/hip` → `HipRuntime` (the concrete type is `cubecl::hip::HipRuntime`, not a `RocmRuntime`); `cuda` → `CudaRuntime`; `wgpu` → `WgpuRuntime`; `cpu` → `CpuRuntime`. Backend selection is purely compile-time via a single `cfg`-gated type alias in `cb-compute::backend` — no runtime dispatch anywhere.
+The recommended execution order is: Phase 10 adds the coarse `Runtime` seam + `GpuTrainSession` (a new `cb-backend`-owned struct that holds the `ComputeClient` and all persistent handles for the whole fit), wires depth-1, and hoists the quantized-feature-matrix upload above the iteration loop — this alone closes most of the gap for the simplest workloads. Phase 11 adds partition-aware histograms (`fullPass=false`) for depth>1 and Newton der2 leaf estimation — the single largest kernel extension, gating real workloads (depth 6, Logloss). Phase 12 extends GPU coverage behind the same `Ok(None)`→host-CPU fallback gate (CTR, pairwise, ordered boosting, multiclass) in any sub-order. Phase 13 runs the Kaggle CUDA head-to-head, but must re-run the correctness oracle on CUDA before trusting timing numbers.
 
-The two dominant risk areas are (1) floating-point summation order divergence across language and parallelism boundaries, and (2) the correctness of ordered boosting and ordered CTR, which are CatBoost's defining features and the hardest parity targets. Both require a specific mitigation posture from Phase 0: intermediate oracles at every stage boundary (quantization borders, per-tree splits, per-tree leaf values, raw approximants per iteration), a single audited reduction utility matching the C++ accumulator type and order, and a Rust port of CatBoost's exact PRNG (`TFastRng64`) oracle-validated at the bitstream level before any stochastic algorithm uses it. GPU parity against the C++ CPU oracle at 1e-5 is not achievable on principle; the realistic target is CPU path hits 1e-5 vs C++, GPU path hits a separately-stated looser tolerance vs the Rust CPU path.
+The central tensions that must be resolved early are: (1) reduction non-determinism vs the parity oracle — parallel atomics produce non-associative sums that compound over hundreds of trees and can flip splits, so the reduction strategy must be chosen in Phase 10/11 before the partition-aware histogram kernel is written (the `ε=1e-4 vs Rust CPU path` precedent from Phase 7.6 applies to GPU, not ≤1e-5); (2) the validation asymmetry — correctness is validated in-env on AMD/ROCm, but the head-to-head speed benchmark runs on CUDA (Kaggle), making the CUDA path effectively unchecked for correctness until the benchmark phase; (3) three repo-specific landmines that silently corrupt the build: never add `cb-train` as a dependency of `cb-backend` (Cargo feature unification breaks the rocm runtime), never use `-inf` float literals inside `#[cube]` kernels (HIP JIT reject on gfx1100, invisible to cpu/wgpu cargo check), and never read a `Handle` through a client other than the one that allocated it.
 
 ## Key Findings
 
 ### Recommended Stack
 
-The stack is anchored by three locked triads that must never be broken independently. First, the Python-boundary triad: `pyo3 0.28.3` + `numpy (rust-numpy) 0.28.0` + `ndarray 0.17.2` — rust-numpy is the pin anchor; bumping pyo3 to 0.29 breaks zero-copy NumPy interop until rust-numpy ships a compatible release. Second, the CubeCL backend triad: `cubecl 0.10.0` with `rocm` feature → `cubecl-hip` → `cubecl::hip::HipRuntime` for the GPU test path, `cpu` feature → `CpuRuntime` as the CI correctness and oracle vehicle. Third, the error-handling discipline: `thiserror 2.x` in every library crate, `anyhow 1.x` only in `catboost-py`, oracle harness, and bin targets — never in library public APIs.
+No new compute crates are needed. CubeCL 0.10.0 is already pinned in `Cargo.toml:38` and already exposes every required primitive. The additive additions are: optional `profile-tracy`/`tracing` features on the existing CubeCL dep (gated behind a `profiling` Cargo feature), `tracing-subscriber 0.3.x` as an optional dev dep, and `criterion 0.7.x` in `[dev-dependencies]` for Rust-side regression timing on ROCm. The Python benchmark harness uses `catboost==1.2.10` (already in `.venv`) and the existing `benchmark.py` pattern. The CUDA speed run requires a `--features cuda` wheel built via maturin and run on a Kaggle notebook — there is no NVIDIA in-env.
 
-**Core technologies:**
-- **Rust (≥ 1.85, edition 2024):** Implementation language; edition 2024 is the workspace default.
-- **cubecl 0.10.0:** Single `#[cube(launch)]` kernel compiles to every backend; `R: Runtime` generic selected by Cargo feature gives zero-cost switching via monomorphization. `rocm = ["hip"]` alias is load-bearing — the runtime type is `HipRuntime`.
-- **pyo3 0.28.3** (pinned, NOT 0.29): Rust↔Python boundary; `abi3-py312` gives a stable-ABI wheel per backend on CPython ≥ 3.12. Held at 0.28.x by rust-numpy dependency.
-- **maturin 1.14.0:** Builds per-backend wheels via `--features <backend>`.
-- **numpy (rust-numpy) 0.28.0:** Zero-copy NumPy↔ndarray; **the version-pin anchor** for the pyo3/ndarray triad.
-- **ndarray 0.17.2:** CPU numeric/array core; pinned at 0.17 by rust-numpy 0.28 range (`>=0.15, <=0.17`).
-- **thiserror 2.0.18 / anyhow 1.0.102:** Mandated error split; `thiserror` in library crates, `anyhow` at binding/application/test edge only.
-- **rayon 1.12.0:** CPU data-parallelism. Summation order must be deterministic (fixed chunk sizes, fixed reduction order) — `par_iter().sum()` is not parity-safe.
-- **proptest 1.11.0 / approx 0.5.1 / rstest 0.26.1:** Oracle test infrastructure; `assert_abs_diff_eq!(got, expected, epsilon = 1e-5)`.
-- **serde 1.0.228 + bincode 2.x:** Model serialization (verify bincode 3.x stability before adopting).
-- **bytemuck 1.25.0:** POD host↔device byte transfer; zero-copy Arrow/NumPy uploads via `cast_slice`.
-- **arrow 59.0.0** (with `pyarrow` feature), **polars 0.54.4**, **pyo3-polars 0.27.0** (tightly coupled to polars — bump together).
+**Core technologies (retain — do not re-add):**
+- `cubecl 0.10.0`: GPU kernel authoring + ComputeClient device memory/dispatch — already drives all Phase 7.x kernels; every residency primitive is in this version.
+- `SelectedRuntime` compile-time alias: zero-cost backend switching (cuda/rocm/wgpu/cpu) from one kernel source — must not be broken.
+- `bytemuck` (workspace-pinned): zero-copy host↔device byte casts for the O(1) per-level read-backs — already the established idiom.
+- `catboost==1.2.10` (Python, already in `.venv`): official GPU baseline for the Kaggle speed run.
+
+**New tooling (dev/profiling only):**
+- `cubecl` features `profile-tracy` + `tracing`: nanosecond GPU kernel/JIT/alloc profiling — gate behind a `profiling` Cargo feature, never in release build.
+- `criterion 0.7.x` (`[dev-dependencies]`): warm-run Rust benchmark statistics for ROCm relative-timing regression during development.
 
 ### Expected Features
 
-**Must have (table stakes — parity-critical core):**
-- Symmetric (oblivious) decision trees — underpins model format, SIMD inference, SHAP traversal; must be the first tree primitive built.
-- Feature quantization (`GreedyLogSum` border selection) — gates all downstream splits and GPU data layout.
-- Pool abstraction (float/cat/text/embedding columns, label, weights, group_id, pairs, baseline).
-- Plain boosting train loop — Logloss + RMSE as the first oracle targets.
-- Overfitting detection and early stopping.
-- Feature importance (`PredictionValuesChange`) and SHAP values (Regular).
-- Model serialization (native `.cbm` FlatBuffers format, cross-version compatible).
-- Rust Builder API + PyO3 dual Python API (sklearn-compatible + CatBoost-native Pool/parameter names).
-- Oracle test harness wired end-to-end before tree-building begins.
+**Must have (table stakes — the "GPU beats CPU" milestone, P1):**
+- `Runtime` grow-tree trait seam in `cb-compute` — without it no device grow loop is reachable from `fit()`; the entire milestone gate.
+- Wire depth-1 `grow_boosting_pass` into `cb_train::train` with a typed `Ok(None)`→host fallback.
+- Device-resident compressed index — upload the quantized feature matrix once above the iteration loop; eliminates the dominant PCIe re-copy.
+- Gradients/approx device-resident across iterations — eliminate the per-tree `der1` read-back and approx re-upload.
+- Partition-aware histograms (`fullPass=false`) + contiguous partition reorder — the keystone new kernel work; unlocks depth>1, and transitively Newton/CTR/multiclass. The single largest piece of the milestone.
+- Histogram subtraction trick — halves histogram work at every level; required for depth>1 to approach parity speed.
+- Correctness sign-off at ε=1e-4 vs Rust CPU path (Phase 7.6 precedent) and a benchmark harness vs official CatBoost GPU on Kaggle/CUDA.
 
-**Should have (signature differentiators — parity-critical, highest complexity):**
-- **Ordered boosting** (`EBoostingType::Ordered`) — CatBoost's defining anti-leakage algorithm; VERY HIGH complexity; the hardest oracle target.
-- **Ordered target statistics (ordered CTR)** — leakage-free categorical encoding; shares permutation machinery with ordered boosting.
-- **Feature combinations (tensor CTRs)** — automatic categorical crosses.
-- One-hot encoding for low-cardinality categoricals (`one_hot_max_size` threshold).
-- Full loss/metric matrix: multiclass, all regression variants (MAE, Quantile, LogCosh, Huber, Poisson, Tweedie, etc.).
-- Ranking: YetiRank, PairLogit, QueryRMSE, LambdaMart + NDCG, MAP, MRR.
-- Text features (BoW, NaiveBayes, BM25 calcers).
-- Embedding features (LDA, KNN calcers).
-- GPU training via CubeCL (`rocm` first, then `wgpu`/`cuda`).
-- Uncertainty estimation, custom objectives, monotone constraints, SHAP interaction values.
+**Should have (P2 — broader coverage once depth>1 is solid):**
+- Newton der2 leaf estimation on device — required for classification (Logloss default); reuses Phase 7.2 der2 handles.
+- Second-order/Cosine score function on device — GPU default is Cosine not L2 (known parity gap).
+- Bootstrap + random-strength noise on device — sampling parity for non-default `bootstrap_type`.
+- CTR / permutation-dependent features on device — categorical workloads; large, defer until numeric depth>1 is solid.
 
-**Defer (anti-features — explicitly out of scope per PROJECT.md):**
-- C API / C FFI layer, R/JVM/.NET/Node.js bindings, CLI application.
-- Model export to CoreML/ONNX/PMML/C++ source (defer; native `.cbm` + JSON for interop).
-- Distributed multi-node training, mobile/embedded, streaming training.
-- Alternative grow policies (Lossguide, Depthwise, Region) — defer after symmetric-tree core.
+**Defer (P3 / v2+):**
+- Pairwise/ranking device path, multiclass device path, ordered-boosting device path, multi-GPU.
+
+**Explicit anti-features (never build):**
+- Per-tree re-upload of the compressed index; bulk histogram/partition read-backs from device (only O(1) BestSplit + `2^depth` part-stats cross per level); chasing bit-exact f64 ≤1e-5 on GPU; `cb-train` dependency in `cb-backend`.
 
 ### Architecture Approach
 
-The architecture mirrors CatBoost's own `libs/data` / `train_lib` / `libs/model` / `cuda/` separation but inverts one dependency: a single backend-agnostic `cb-data` feeds both the training orchestrator and the compute layer, so `cb-core` never branches on backend. The key invariant: **only `cb-compute::backend` ever names a backend runtime type**. The public `catboost-rs` crate fixes `R = cb_compute::SelectedRuntime` once via a `cfg`-gated type alias; all other crates are generic over `R: Runtime` or fully backend-agnostic.
+One coarse optional `Runtime` seam: three default-impl methods added to `cb_compute::Runtime` (`begin_device_training`, `grow_tree_on_device` returning `CbResult<Option<DeviceGrownTree>>`, `end_device_training`). No CubeCL types appear in the trait signature — all arguments and return types are plain host structs in `cb-compute`, mirroring exactly how `Derivatives` already crosses the seam today. Fine-grained per-stage seams were explicitly rejected by all agents: they force either CubeCL handles across the boundary (violating D-03) or per-stage bulk read-backs (destroying residency). The upstream reference (`catboost-master/catboost/cuda/methods/doc_parallel_pointwise_oblivious_tree.h`) independently confirms the coarse-seam design — upstream uses a coarse weak-learner template, not stage callbacks.
 
-**Major components (in dependency/build order):**
-1. **`cb-data`** — `Pool`, `QuantizedPool` (`u8`/`u16` bin indices, columnar SoA), border selection, CTR encoding, zero-copy NumPy/Arrow/Polars ingestion. Leaf crate.
-2. **`cb-compute`** — CubeCL kernels generic over `R: Runtime` and `F: Float`; histogram, gradient/hessian, scan, reductions. The only crate naming backend types. Feature-gated `cpu`/`wgpu`/`cuda`/`rocm`.
-3. **`cb-core`** — Boosting loop, oblivious-tree structure search, leaf estimation, loss registry, bootstrap/sampling, ordered-boosting bookkeeping. Generic over `R: Runtime`; drives `cb-compute`.
-4. **`cb-model`** — Model representation, `.cbm` FlatBuffers serialization, CPU inference/apply, SHAP/fstr.
-5. **`catboost-rs`** — Public Rust Builder API, typed error enum. Fixes `R = SelectedRuntime`.
-6. **`cb-python`** — PyO3 wrappers, maturin packaging, dual sklearn + CatBoost-native surfaces, `anyhow` error conversion.
+**Major components:**
+1. `cb_compute::Runtime` trait (MODIFY) — three default-impl grow-tree methods; stays CubeCL-free; only change visible to `cb-train`.
+2. `GpuTrainSession` (NEW in `cb-backend`) — owns ONE `ComputeClient` + all persistent handles (`compressed_index_h`, `indices_h`, `target_h`, `weight_h`, `approx_h`, `der1_h`, `bins_h`, `part_stats_h`); created once per `fit()`, owned by `GpuBackend` via `RefCell<Option<GpuTrainSession>>`.
+3. `GpuBackend` (`cb-backend/src/gpu_backend.rs`) (MODIFY) — implement the seam, own the session, drive `grow_boosting_pass_into` over resident handles.
+4. `grow_boosting_pass_into` / `grow_oblivious_tree_into` (`cb-backend/src/gpu_runtime/mod.rs`) (MODIFY) — convert `*_into` launchers from host-slice args to handle-based args; add partition-aware histogram variant for depth>1.
+5. `train_inner::<R: Runtime>` (`cb-train/src/boosting.rs`) (MODIFY) — try device seam, fall back to host on `Ok(None)`; call begin/end around the loop.
+6. Host growers (`cb-train/src/tree.rs`) (KEEP UNCHANGED) — remain the CPU path and the device fallback.
+
+**Crossing contract (D-05, enforced per level):** only the O(1) `BestSplit` descriptor and the `2^depth` `TPartitionStatistics` cross host↔device per level; histogram, partition, per-doc routing stays device-resident.
 
 ### Critical Pitfalls
 
-1. **Parity as end-gate instead of per-stage invariant** — Intermediate oracles must exist at every stage boundary (borders, splits, leaf values, approx per iteration) before tree-building begins. A border divergence in tree 1 compounds across 1000 trees; without stage-level oracles there is no way to localize the failure.
-
-2. **Floating-point summation order divergence (the #1 parity killer)** — CatBoost accumulates in `double` with specific blocking/order (`TKahanAccumulator` in some paths). Rust's `.iter().sum()` and Rayon's `par_iter().sum()` produce different results. One audited reduction utility per stage matching C++ accumulator type and order must be the only way to sum in the codebase. Parallel reductions must use fixed chunk sizes and deterministic merge order.
-
-3. **Quantization / border-selection mismatch** — `GreedyLogSum` has subtle tie-breaking, NaN handling, and `<`/`<=` assignment semantics. Port only this algorithm for v1 and oracle-validate the exact border set per feature (including NaN/duplicate columns) before any downstream work.
-
-4. **Ordered boosting and CTR implemented subtly wrong** — The prefix boundary off-by-one reintroduces leakage silently; the model still trains plausibly. Sequence: plain-boosting oracle-passes first, then ordered; add per-object target-statistic intermediate oracle, not just final predictions.
-
-5. **RNG non-reproducibility** — CatBoost's `TFastRng64` (SplitMix/xorshift) produces permutations and sampling draws. Rust's `StdRng`/ChaCha produces a different bit sequence from the same seed. Port `TFastRng64` exactly and oracle-test the raw bitstream before any stochastic algorithm is written.
-
-6. **CPU vs GPU divergence beyond tolerance** — GPU float reductions (atomics ordering, FMA contraction, AMD wavefront-64 vs NVIDIA warp-32) make 1e-5 GPU-vs-C++-CPU parity structurally unachievable. Set the GPU target as: CPU hits 1e-5 vs C++; GPU hits a separately-stated looser tolerance vs Rust CPU. CubeCL ROCm/HIP backend is WIP with raw bindgen bindings — spike before Phase 6.
-
-7. **PyO3 zero-copy buffer lifetime / GIL safety** — Copy/quantize into Rust-owned storage under the GIL before releasing it for training. Never borrow a NumPy `&[f32]` across `Python::allow_threads`. Design for `Py_GIL_DISABLED` (free-threaded Python 3.13t+) from the start.
+1. **Inner loop left on host** — the exact v1.0 state; the `Runtime` seam is the fix; treat GPU train time ≥ CPU train time as a hard failure gate.
+2. **Per-tree/level blocking read-backs** — `read_one` inside the per-level loop drains the CubeCL queue; eliminate per-tree der read-back, enforce O(1) metadata crossings only.
+3. **Per-tree re-upload of training data** — re-uploading the immutable `cindex` per tree is the dominant discrete-GPU cost; `GpuTrainSession` hoists the upload once.
+4. **Non-deterministic float reduction breaks the parity oracle** — `atomicAdd` non-associativity compounds over hundreds of trees; the reduction strategy must be chosen before writing the partition-aware histogram kernel; hold GPU to `ε=1e-4 vs Rust CPU`, never widen silently.
+5. **f64 atomic-add unavailable on gfx1100/RDNA3** — falls back to `HostSumFallback`, destroying device residency on ROCm, invisible to cpu/wgpu cargo check; design the histogram reduction to be atomic-free.
+6. **HIP rejects `-inf` literals in `#[cube]` kernels** — use `f32::MIN` sentinel; add to every kernel-authoring checklist.
+7. **`cb-backend`→`cb-train` dependency landmine** — Cargo feature unification breaks ROCm backend selection; transcribe CPU reference logic inline, never add the edge.
+8. **CUDA correctness untested before timing** — CUDA path first executes on Kaggle; oracle re-run on CUDA is a blocking gate before quoting any speed number.
 
 ## Implications for Roadmap
 
-The forced build order: workspace + oracle infra → data layer + foundational primitives (quantization, RNG, reduction utilities) → CPU training core (plain boosting) → high-risk parity slice (ordered boosting + CTR) → full loss/feature matrix → GPU backends → Python bindings. CPU must be fully oracle-passing before GPU is touched. Python bindings come after the Rust Builder API is stable. Each phase must be oracle-passing before the next begins.
+### Phase 10: Coarse Seam + GpuTrainSession Residency + Wire Depth-1
 
-### Phase 0: Workspace, Infrastructure, and Oracle Harness
+**Rationale:** Everything else is blocked on the seam; the residency architecture must be established here because retrofitting it after depth>1 kernels are written is significantly harder; the `Ok(None)` fallback pattern must be established here so all subsequent phases land incrementally without breaking correctness.
 
-**Rationale:** Lint discipline and oracle infrastructure cannot be retrofitted; they must be the first commits (Pitfalls 1, 10, 12).
+**Delivers:** `Runtime` trait with three default-impl grow-tree methods (plain host types, no CubeCL in signature); `GpuTrainSession` with all persistent handles; `*_into` launchers converted to handle-based args; `grow_boosting_pass` wired for the MVP envelope (depth=1, Plain, fold_count=1, RMSE/Logloss) with `Ok(None)` fallback; per-tree `der1` read-back eliminated; approx device-resident across iterations. Oracle: depth-1 RMSE ≤1e-5 vs CPU on rocm in-env; CPU/host paths byte-unchanged (D-04).
 
-**Delivers:**
-- Cargo workspace skeleton with all crates stubbed; workspace `Cargo.toml` with all version pins
-- Lint configuration in library crates: `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::as_conversions)]`; CI check that `anyhow` is absent from core crate non-test code
-- Frozen oracle fixture infrastructure: pre-generated CatBoost reference outputs (`thread_count=1`, pinned seed + version); committed fixtures; no live CatBoost rebuild in PR CI
-- Intermediate oracle tooling: mechanism to compare borders-per-feature, per-tree split, leaf values, and raw approximants — not only final predictions
-- `TFastRng64` Rust port, bitstream-oracle-tested against the C++ generator for a fixed seed
+**Addresses features:** Runtime grow-tree seam, wire depth-1, compressed index resident, gradients/approx resident (all P1).
 
-**Avoids:** Pitfalls 1 (per-stage gates), 10 (oracle CI flakiness), 12 (error-boundary / no-unwrap from line 1)
+**Avoids pitfalls:** 1 (inner loop on host), 2 (blocking read-backs), 3 (per-tree re-upload), 7 (landmine).
 
-**Research flag:** Standard patterns; no per-phase research needed.
+**Research flag:** Standard patterns — seam shape fully specified; mirrors established `Derivatives` seam and `GpuBackend` patterns from Phases 7-8. Sub-task: spike the reduction-determinism strategy (fixed-point i64 atomics, private-histogram merge, or two-pass segmented reduce) in Phase 10 before Phase 11's histogram kernel is written.
 
-### Phase 1: Data Layer — Pool, Quantization, CTR Encoding
+### Phase 11: Depth>1 Partition-Aware Histograms + Newton Der2
 
-**Rationale:** `cb-data` is the leaf crate everything depends on. Quantization is the foundational oracle hot-spot — wrong borders poison every downstream tree (Pitfall 3). The ingestion model (copy-in for training, zero-copy for prediction) must be decided here to inform Phase 7's GIL-safety design (Pitfall 7).
+**Rationale:** Depth>1 is the keystone — depth 6 is the real-world default; the subtraction trick is required for parity speed at depth 6; Newton der2 is required for classification. Partition-aware histograms and contiguous partition reorder are co-dependent (histogram fill needs contiguous partitions) so they land together.
 
-**Delivers:**
-- `Pool`: float/cat/text/embedding columns, label, weights, group_id, pairs, baseline scaffolding
-- `QuantizedPool`: `u8`/`u16` bin index columnar SoA storage; pre-allocated buffers reused across rounds
-- `GreedyLogSum` border selection: per-feature border-set oracle-validated including NaN/duplicate columns; `NanMode` exact; `<`/`<=` assignment semantics correct
-- Categorical perfect-hash / CTR encoding table stubs (full ordered CTR in Phase 3)
-- Zero-copy NumPy ingestion (`bytemuck::cast_slice`); copy-in path for training
-- Arrow/Polars ingestion with contiguity + dtype validation
-- Single audited reduction utility matching C++ `double` accumulator and order
+**Delivers:** Partition-aware `pointwise_hist2` variant keyed by `leaf_of[obj]` into `2^level` slots; contiguous partition reorder (`TDataPartition{Offset,Size}` layout); histogram subtraction trick (parent-resident, sibling-by-subtraction); Newton der2 leaf estimation using Phase 7.2 der2 handles; chosen reduction-determinism strategy implemented. Oracle: depth>1 trees (RMSE + Logloss) ≤1e-4 vs CPU on rocm in-env.
 
-**Avoids:** Pitfalls 3 (border mismatch), 9 (SoA layout + borrow-checker strategy), 7 (GIL ingestion model)
+**Addresses features:** Partition-aware histograms/depth>1, partition reorder, histogram subtraction trick, Newton der2 leaf estimation, second-order/Cosine score (partial) — all P1/P2.
 
-**Research flag:** Standard patterns; `grid_creator.cpp` in vendored source is the reference.
+**Avoids pitfalls:** 4 (non-deterministic reduction), 5 (f64 atomic-add unavailable), 6 (HIP -inf sentinel).
 
-### Phase 2: CPU Training Core — Plain Boosting, Oblivious Trees, Leaf Estimation
+**Research flag:** Needs a focused spike on reduction-determinism strategy before the histogram kernel is written. Also verify the multi-block scan carry ("Open Q2" forward dependency in the CubeCL manual) against the vendored manual before implementing.
 
-**Rationale:** The generic `R: Runtime` + `F: Float` boundary must be designed here, not retrofitted. Plain boosting validates the core algorithm before the high-risk ordered algorithms are added (Pitfall 4 mitigation).
+### Phase 12: GPU Coverage Expansion (CTR / Pairwise / Ordered / Multiclass)
 
-**Delivers:**
-- `cb-compute` with `cpu` backend only: `#[cube(launch)]` histogram/gradient/scan/reduction kernels generic over `F: Float` and `R: Runtime`; `backend.rs` type alias (`SelectedRuntime = CpuRuntime`)
-- `cb-core`: boosting loop generic over `R: Runtime`; oblivious-tree structure search; leaf value estimation (Gradient, Newton, Exact); bootstrap/sampling; loss registry (Logloss, RMSE)
-- Overfitting detector, early stopping, eval-set metric logging
-- First end-to-end CPU train → predict cycle
-- Per-tree split and leaf-value intermediate oracles passing ≤1e-5 vs C++
+**Rationale:** Each feature family is independently shippable behind the `Ok(None)` fallback gate; they do not depend on each other. Recommended sub-order: bootstrap + random-strength (small, high-return), then CTR (headline use case), then pairwise (reuses Phase 7.4 kernels), then multiclass, then ordered boosting (heaviest residency). Each sub-feature lands when it passes ≤1e-4 oracle sign-off; users fall back to CPU otherwise.
 
-**Avoids:** Pitfalls 2 (audited reduction utility enforced throughout), 9 (SoA + `split_at_mut`; no `.clone()` in hot loop)
+**Delivers:** Feature-by-feature transition from `Ok(None)`→CPU-fallback to `Ok(Some(tree))`→device path; GPU coverage matrix documented.
 
-**Research flag:** Standard patterns; CubeCL generics manual covers the `R: Runtime` launch pattern.
+**Research flag:** CTR on device has the highest uncertainty — consider a targeted research spike on `batch_binarized_ctr_calcer.h` + `ctrs/` before planning that sub-task. Pairwise partition + leaves oracle (`leaves_estimation/pairwise_oracle.h`) is under-documented relative to the pointwise path.
 
-### Phase 3: Model Layer, Serialization, and Oracle Lock
+### Phase 13: Kaggle CUDA Benchmark + Correctness Re-Run + ε Sign-Off
 
-**Rationale:** Completes the first full vertical slice (train → serialize → predict) end-to-end oracle-passing before any widening. Serialization parity (loading a `.cbm` produced by upstream CatBoost) must be validated here.
+**Rationale:** Benchmark is only meaningful after depth>1 is device-resident. The CUDA path is untested for correctness until this phase — oracle re-run on CUDA is a blocking gate before any speed number is quoted.
 
-**Delivers:**
-- `cb-model`: oblivious tree + split representation, Model struct (trees + CTR tables + scale/bias)
-- `.cbm` FlatBuffers serialization/deserialization parity; round-trip tested; loading of reference upstream `.cbm` files validated
-- CPU inference/apply path (independent of `cb-compute`; no GPU toolchain required)
-- SHAP values (Regular `EShapCalcType`); feature importance (`PredictionValuesChange`)
-- `catboost-rs` public Builder API: `CatBoostBuilder::new().fit(&pool) -> Model`; typed error enum
-- Full end-to-end oracle: numeric-only binary classification and regression ≤1e-5 vs C++
+**Delivers:** CUDA oracle re-run (≤1e-4 vs Rust CPU) as blocking gate; fair head-to-head timing (warm-run, train-only, identical params/bins/data, single GPU); throughput report; final ε sign-off documentation (D-04); ROCm regression criterion bench confirming device-resident path beats pre-Phase-10 host-light.
 
-**Avoids:** Pitfall 1 (narrow vertical slice fully oracle-locked before widening), Pitfall 11 (narrowest-first before high-risk slice)
-
-**Research flag:** Standard patterns; FlatBuffers format is in the vendored source.
-
-### Phase 4: Ordered Boosting, Ordered CTR, and Categorical Features (High-Risk Parity Slice)
-
-**Rationale:** The highest-risk parity target. Ordered boosting and ordered CTR share the permutation machinery seeded by the `TFastRng64` port from Phase 0. A wrong prefix boundary reintroduces leakage silently. Requires the closest line-by-line reading of `approx_calcer.cpp` and `online_ctr.*`.
-
-**Delivers:**
-- Multi-permutation fold infrastructure (`fold_count` permutations, exact `TFold`-equivalent bookkeeping)
-- `EBoostingType::Ordered`: exact prefix boundary, exact prior formula `(sumTarget + prior) / (sumCount + priorWeight)`, per-object target-statistic intermediate oracle passing
-- Ordered CTR: `ECtrType { Borders, Buckets, BinarizedTargetMeanValue, FloatTargetMeanValue, Counter, FeatureFreq }` with priors
-- One-hot encoding (`one_hot_max_size` threshold)
-- Feature combinations (tensor CTRs): `SimpleCtrs`, `CombinationCtrs`; `max_ctr_complexity` control
-- Train metrics checked for leakage signatures (suspiciously good train metrics = prefix boundary bug)
-
-**Avoids:** Pitfall 4 (ordered boosting subtly wrong), Pitfall 5 (TFastRng64 already oracle-tested)
-
-**Research flag:** NEEDS DEEPER RESEARCH — the least-documented, most intricate algorithmic area. Before planning this phase, do a line-by-line read of `approx_calcer.cpp` + `online_ctr.*` and design the intermediate oracle schema (which per-object values to extract and compare) before writing any implementation code.
-
-### Phase 5: Full Loss and Feature Parity
-
-**Rationale:** With the core architecture oracle-locked, widening the loss/metric matrix and adding text/embedding/ranking is additive. Each new loss or feature type passes its own oracle before the next is added.
-
-**Delivers:**
-- Full loss matrix: multiclass, all regression variants (MAE, Quantile, LogCosh, Huber, Poisson, Tweedie, MAPE, MSLE, Lq, Expectile, etc.)
-- Ranking: YetiRank, PairLogit, QueryRMSE, LambdaMart, StochasticRank; NDCG, MAP, MRR, ERR; Pool group_id/subgroup_id/pairs
-- Text features: tokenization → BoW, NaiveBayes, BM25 calcers
-- Embedding features: LDA, KNN calcers
-- Uncertainty estimation: RMSEWithUncertainty, virtual ensembles
-- Advanced fstr: LossFunctionChange, ShapInteractionValues, PredictionDiff, SAGE
-- Monotone constraints, feature penalties, feature selection
-- Custom objectives/metrics (Rust trait + Python callback bridge)
-
-**Avoids:** Pitfall 11 (each feature type oracle-validated individually; no simultaneous multi-feature builds)
-
-**Research flag:** Standard patterns for each loss type; vendored source is the reference.
-
-### Phase 6: GPU Backends via CubeCL
-
-**Rationale:** GPU is purely additive on top of a fully oracle-passing CPU implementation. The generic `R: Runtime` boundary from Phase 2 means `cb-core` and `cb-model` require no changes. The GPU tolerance target is explicitly different from the CPU target — get sign-off before starting.
-
-**Delivers:**
-- `cb-compute` with `rocm` backend: all kernels validated on AMD hardware (wavefront-64; no warp-size assumptions; CubeCL plane/subgroup abstractions)
-- `wgpu` backend for dev machines without ROCm/CUDA
-- `cuda` backend: compile-gated, untested locally
-- Documented GPU tolerance: `rocm` results within a separately-stated epsilon vs Rust CPU path (not vs C++ CPU oracle)
-- `cubecl-hip-sys` HIP version matched to installed ROCm on the GPU test machine
-
-**Avoids:** Pitfall 6 (separate GPU tolerance, wavefront-64 correctness, CPU-first sequencing)
-
-**Research flag:** NEEDS DEEPER RESEARCH — CubeCL ROCm/HIP backend is explicitly WIP with raw bindgen bindings. Before planning: spike to confirm which CubeCL kernel patterns (histogram atomics, prefix scan, reduction) are functional on `rocm` at cubecl 0.10.0 vs known gaps; validate wavefront-64 reduction determinism; confirm `cubecl-hip-sys` HIP version requirements against the test machine.
-
-### Phase 7: Python Bindings, Dual API, and Packaging
-
-**Rationale:** Python bindings are strictly downstream of a stable `catboost-rs` Builder API. GIL-safety data layout decisions were made in Phase 1. The per-backend wheel matrix must be scoped explicitly to avoid combinatorial CI explosion.
-
-**Delivers:**
-- `cb-python`: `Pool`, `CatBoostClassifier`, `CatBoostRegressor`, `CatBoostRanker` pyclasses
-- sklearn-compatible API: `fit`, `predict`, `predict_proba`, `score`, `get_params`/`set_params`; `check_estimator` CI test
-- CatBoost-native API: full parameter-name parity with upstream, exact default values
-- NumPy/Pandas/Arrow/Polars input with dtype + contiguity validation
-- Typed `thiserror` → specific Python exception mapping with actionable messages
-- Per-backend wheels via `maturin build --release --features <backend>`; v1 matrix: `cpu` + `rocm` minimum
-- System-prerequisite documentation per wheel
-- Free-threaded-aware design: no GIL reliance for buffer safety
-
-**Avoids:** Pitfalls 7 (GIL/zero-copy safety), 8 (wheel/ABI matrix complexity)
-
-**Research flag:** NEEDS RESEARCH — confirm current PyO3/maturin `abi3`/`abi3t` status for Python 3.12–3.15 (PEP 803: `abi3t` only on 3.15+; free-threaded 3.12–3.14 requires version-specific wheels) before committing to an ABI strategy.
+**Research flag:** Standard patterns — protocol fully specified in STACK.md and PITFALLS.md. Execution checklist: verify CUDA backend active via `nvidia-smi`, warm one untimed fit, drain lazy CubeCL queue with a read-back/predict before stopping the clock, re-run oracle before timing.
 
 ### Phase Ordering Rationale
 
-- Workspace/infra before any algorithm: lint discipline and oracle infrastructure cannot be retrofitted.
-- Quantization and RNG before tree-building: foundational; bugs here poison everything above.
-- CPU backend before GPU: GPU is a performance layer on a correct algorithm; the generic `R: Runtime` boundary from Phase 2 makes GPU activation purely additive.
-- Plain boosting before ordered: establishes a clean oracle baseline; isolates the permutation complexity.
-- Rust API stable before Python bindings: Python is a thin wrapper; premature binding work churn when the Rust API is still changing.
-- Narrow vertical slices, oracle-passing, before widening: the only reliable sequencing for a numerically-exact rewrite.
+- Phase 10 is a strict prerequisite: the seam gates the device path; the residency architecture gates the speedup; the fallback pattern gates safe incremental coverage.
+- Phase 11 is the performance keystone: depth>1 (default depth 6) is the first workload where GPU can plausibly beat CPU; the subtraction trick is also required to approach parity speed.
+- Phase 12 is inherently parallel: each feature family is independently gated and deferrable; can be planned and executed in parallel sub-workstreams, or cut to bootstrap + CTR MVP if Phase 11 runs long.
+- Phase 13 cannot start until CUDA correctness is established; oracle re-run is not optional.
 
-### Research Flags Summary
+### Research Flags
 
-| Phase | Research Needed | Reason |
-|-------|----------------|--------|
-| Phase 0 | No | Standard workspace/tooling patterns |
-| Phase 1 | No | GreedyLogSum is in vendored source; standard data layout |
-| Phase 2 | No | CubeCL CPU backend is documented in the manual |
-| Phase 3 | No | FlatBuffers format is in vendored source |
-| Phase 4 | **YES — high priority** | Ordered boosting/CTR: least-documented, most intricate; line-by-line analysis + intermediate oracle design required before implementation |
-| Phase 5 | No | Each loss/feature type is additive; vendored source is the reference |
-| Phase 6 | **YES — high priority** | CubeCL ROCm/HIP WIP; wavefront-64 semantics; kernel coverage spike needed before writing any GPU code |
-| Phase 7 | **YES** | PyO3/maturin abi3t status evolving; free-threaded wheel support needs confirmation before ABI commitment |
+**Needs deeper research during planning:**
+- Phase 11 (reduction-determinism strategy): fixed-point i64 atomics vs private-histogram merge vs two-pass segmented reduce — must be spiked before the histogram kernel is written.
+- Phase 11 (multi-block scan carry): "Open Q2" in the CubeCL manual — verify against vendored docs before implementing.
+- Phase 12 (CTR on device): complex upstream `batch_binarized_ctr_calcer.h` pipeline warrants a targeted research sub-task.
+
+**Standard patterns (skip additional research):**
+- Phase 10 (seam + session): architecture fully specified; mirrors established patterns from Phases 7-8.
+- Phase 13 (benchmark harness): protocol fully specified; existing `benchmark.py` is the template.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | All versions live-verified against crates.io 2026-06-13; pyo3/numpy/ndarray triad verified from dependency metadata; CubeCL backend mapping verified from cubecl 0.10.0 feature graph and first-party manual |
-| Features | HIGH | Grounded in vendored CatBoost C++ source; enum values read directly from headers |
-| Architecture | HIGH | Crate decomposition mirrors CatBoost's own lib separation; CubeCL generic-runtime boundary verified from manual generics examples |
-| Pitfalls | HIGH (algorithmic/Rust), MEDIUM (GPU/bindings) | Numerical-parity pitfalls grounded in vendored source and float-reproducibility literature; CubeCL/ROCm specifics are MEDIUM (WIP, fast-moving); PyO3 free-threading ABI is MEDIUM (evolving PEP 779/803) |
+| Stack | HIGH | CubeCL 0.10.0 already in repo; all APIs verified against vendored manual and existing `gpu_runtime` code; no new compute crates needed. |
+| Features | HIGH | Grounded in direct read of `catboost-master/catboost/cuda/` upstream reference; dependency graph validated against existing Rust kernel surface. |
+| Architecture | HIGH | Coarse-seam + `GpuTrainSession` design independently confirmed by all three agents and by the upstream `TBoosting<TTarget, TWeakLearner>` template. |
+| Pitfalls | HIGH | Landmines 6 and 7 are in-repo validated (Phase 7.2/7.5/7.6 retrospectives); reduction non-determinism corroborated by GPU GBDT literature. |
 
-**Overall confidence:** HIGH for the CPU core path; MEDIUM for GPU and Python packaging details (both require per-phase research spikes before execution).
+**Overall confidence:** HIGH
 
 ### Gaps to Address
 
-- **CubeCL ROCm/HIP kernel trait coverage:** WIP `cubecl-hip` has partial trait/method support. Before Phase 6, spike to confirm histogram atomics, prefix scan, and reduction kernels are functional on `rocm` at cubecl 0.10.0; match `cubecl-hip-sys` to installed HIP version.
-- **GPU tolerance specification:** The exact epsilon for GPU-vs-Rust-CPU parity is unspecified. Before Phase 6, establish a concrete tolerance (e.g., 1e-4 or 1e-3) and get explicit sign-off.
-- **PyO3/maturin abi3t status:** PEP 803 targets Python 3.15+; for 3.12–3.14 free-threaded builds require version-specific wheels. Before Phase 7, confirm maturin's current support and scope the v1 Python version matrix.
-- **Ordered boosting intermediate oracle schema:** Before Phase 4, design the exact per-object intermediate values to extract from the C++ reference (from `approx_calcer.cpp` + `online_ctr.*`) and the comparison invariants.
-- **bincode 3.x stability:** 3.0.0 exists on crates.io but stability is unconfirmed. Before Phase 3 model serialization, verify or pin to bincode 2.x.
+- **Reduction-determinism strategy (Phase 11):** The right choice depends on gfx1100 performance characteristics only measurable by a targeted spike. Plan a spike sub-task in Phase 10 or as Phase 11 step 0.
+- **CUDA correctness before benchmark (Phase 13):** No pre-flight validation of CUDA-specific behavior before the benchmark phase; the oracle re-run on CUDA is designed to catch this; the `Ok(None)` fallback ensures CPU correctness as the safety net.
+- **Pairwise device path (Phase 12):** The pairwise partition + leaves oracle is less documented in this research; plan a targeted read of `leaves_estimation/pairwise_oracle.h` before implementation.
+- **Occupancy tuning per backend (Phase 12):** Cube/plane dim tuning for new kernel families is only measurable in-env; budget profiling time per new kernel family.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- Vendored CatBoost C++ source (`catboost-master/`) — `enums.h`, `ctr_type.h`, `cat_feature_options.h`, `grid_creator.cpp`, `approx_calcer.cpp`, `scoring.cpp`, `fold.cpp`, `learn_context.cpp`, `online_ctr.*`, `libs/data/`, `libs/model/`, `libs/fstr/`, `python-package/catboost/core.py`
-- crates.io live API (2026-06-13) — version verification for all pinned crates
-- crates.io dependency metadata — `numpy 0.28` → `pyo3 ^0.28`, `ndarray >=0.15,<=0.17`; cubecl 0.10.0 feature graph
-- CubeCL manual (`/home/user/Documents/workspace/cubecl_manual/manual/Cubecl/`) — `Cubecl_generics.md`, ROCm backend handling, `ZERO_COPY_ARROW_CUBECL.md`
-- `.planning/PROJECT.md`, `.planning/codebase/ARCHITECTURE.md`, `STACK.md`, `STRUCTURE.md`, `CONCERNS.md`, `TESTING.md`
+- In-repo: `crates/cb-backend/src/gpu_runtime/mod.rs` (grow loop, `*_into` launchers, depth-1 MVP), `crates/cb-backend/src/gpu_runtime/der_seams.rs`, `crates/cb-compute/src/runtime.rs`, `crates/cb-train/src/boosting.rs`, `crates/cb-backend/src/gpu_backend.rs`.
+- Upstream CUDA reference: `catboost-master/catboost/cuda/methods/oblivious_tree_doc_parallel_structure_searcher.{h,cpp}`, `methods/doc_parallel_boosting.h`, `methods/pointwise_optimization_subsets.h`, `methods/histograms_helper.h`, `methods/pointwise_scores_calcer.h`, `methods/leaves_estimation/`, `gpu_data/compressed_index.h`, `gpu_data/gpu_structures.h`.
+- CubeCL vendored manual: `11_launch_overhead_and_transfers.md`, `05_lazy_execution.md`, `08_atomic_contention.md`, `09_fixedpoint_atomics.md`, `10_grid_stride_occupancy.md`, `profiling_tools.md`, `Cubecl_plane.md`, `04_autotune_optimization.md`.
+- `.planning/notes/gpu-training-host-light-root-cause.md` — root-cause analysis of the >20x gap.
+- Project memory: `phase75-grow-loop-outcome`, `phase76-gpu-tolerance-signoff-outcome`, `cubecl-hip-no-inf-literal`, `phase8-python-bindings-outcome`.
 
 ### Secondary (MEDIUM confidence)
-- tracel-ai/cubecl + cubecl-hip-sys GitHub — ROCm/HIP WIP status; HIP-version-based binding scheme (since May 2025)
-- PyO3/rust-numpy releases — rust-numpy tracks PyO3 minor versions 1:1
-- PyO3 free-threading guide — Stable ABI unavailable for free-threaded builds; PEP 803 (abi3t, 3.15+)
-- Float reproducibility literature (IEEE/TOMS, arXiv:2408.05148) — non-associativity and parallel-reduction variability
-
-### Tertiary (LOW confidence, needs validation)
-- bincode 3.x stability — unverified; treat as LOW until confirmed before Phase 3
+- [XGBoost GPU docs — FP non-associativity in GPU ranking](https://xgboost.readthedocs.io/en/release_1.4.0/gpu/index.html)
+- [GPU-acceleration for Large-scale Tree Boosting (arXiv 1706.08359)](https://arxiv.org/pdf/1706.08359)
+- [Quantized Training of Gradient Boosting Decision Trees (arXiv 2207.09682)](https://arxiv.org/pdf/2207.09682)
+- [CatBoost GPU vs CPU benchmark methodology](https://github.com/catboost/benchmarks/blob/master/gpu_vs_cpu_training_speed/README.md)
 
 ---
-*Research completed: 2026-06-13*
+*Research completed: 2026-06-28*
 *Ready for roadmap: yes*
