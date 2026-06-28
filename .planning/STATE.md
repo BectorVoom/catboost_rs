@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: GPU Performance
 status: planning
-last_updated: "2026-06-28T11:43:32.438Z"
+last_updated: "2026-06-28T12:30:00.000Z"
 last_activity: 2026-06-28
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -24,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: Phase 10 — Coarse Runtime Grow-Tree Seam + GpuTrainSession Residency + Wire Depth-1 + Kaggle CUDA Oracle & Speed Harness (not started)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-06-28 — Milestone v1.1 started
+Status: Roadmap REVISED again (v1.1 GPU Performance — Phases 10–13, per-phase speed check); awaiting Phase 10 planning
+Last activity: 2026-06-28 — v1.1 ROADMAP revised AGAIN: speed is now checked for EVERY GPU (CUDA) kernel in EVERY phase 10→13, not concentrated in Phase 13. BENCH-01's Phase-10 harness measures BOTH correctness AND wall-clock speed from the start; a Kaggle CUDA speed-check success criterion was added to every phase (P10 depth-1 device-vs-CPU; P11 depth-6 RMSE+Logloss device-vs-CPU-vs-official-CatBoost-GPU; P12 each coverage family timed as it lands; P13 comprehensive aggregate). BENCH-02 became a STANDING per-phase speed check mapped to Phase 10 (first established) but enforced 10→13, mirroring the GPUT-14 standing-gate pattern; Phase 13 reframed as the COMPREHENSIVE FINAL speed-parity sign-off (BENCH-03) that AGGREGATES the per-phase checks. Traceability re-mapped: Phase 10 = GPUT-01..04 + BENCH-01 + BENCH-02 (6); Phase 11 = GPUT-05/06/07/08/14 (5); Phase 12 = GPUT-09..13 (5); Phase 13 = BENCH-03 (1). 17/17 mapped, no orphans/duplicates.
 
 ## Performance Metrics
 
@@ -167,6 +167,7 @@ Last activity: 2026-06-28 — Milestone v1.1 started
 
 ### Roadmap Evolution
 
+- v1.1 GPU Performance ROADMAP REVISED (2026-06-28): the validation strategy was changed so that **ALL GPU (CUDA) kernel oracles — correctness AND speed — run on a Kaggle CUDA notebook** as the single authoritative GPU oracle; the in-env AMD/ROCm GPU is now an OPTIONAL compile/smoke convenience, NOT a gate (the prior "validate correctness in-env on ROCm, benchmark speed on CUDA" asymmetry is gone). The reproducible **Kaggle CUDA oracle/test harness (BENCH-01) moved from Phase 13 into Phase 10** as a foundational deliverable so even the depth-1 device tree (GPUT-04) is correctness-tested on CUDA from the start. Every phase's GPU correctness success criteria now read "oracle-tested on Kaggle CUDA (≤1e-5 depth-1 / ε=1e-4 depth>1)" instead of "rocm in-env"; each Kaggle CUDA oracle run is a human-gated external step (the user runs the notebook). Re-mapping: Phase 10 = `Runtime` grow-tree seam + `GpuTrainSession` residency + depth-1 wire + Kaggle CUDA oracle harness (GPUT-01..04 + **BENCH-01**); Phase 11 = depth>1 partition-aware histograms + reduction-determinism + Newton der2 + Cosine score (GPUT-05/06/07/08) and the standing ε=1e-4/D-04 gate GPUT-14; Phase 12 = GPU coverage expansion behind the `Ok(None)` fallback — sampling/CTR/pairwise/multiclass/ordered (GPUT-09..13); Phase 13 = comprehensive Kaggle CUDA speed benchmark + parity sign-off building on the Phase-10 harness (BENCH-02/03). 17/17 requirements mapped, no orphans. v1.0 collapsed details + Phase 9 backlog preserved verbatim in ROADMAP.md. GPU parity bar = ε=1e-4 vs CPU (not ≤1e-5). Landmines updated: no `cb-train` dep in `cb-backend`; `f32::MIN` (no `-inf` in `#[cube]`) is now a portability nicety the ROCm smoke build catches; CUDA HAS f64 atomic-add (so atomic-free is a portability nicety, not a hard gate) BUT parallel-reduction DETERMINISM still governs ε=1e-4 parity, so a deterministic reduction is still required.
 - Phase 9 added: Online HNSW estimated-feature parity (FEAT-07) — bit-exact port of `library/cpp/online_hnsw/base` (832 LOC). Promotes the A2/D-05 deferred HNSW dependency (root cause of the `estimated-feature-grid-parity` todo's XOR per-stage residual) from a non-blocking todo to its own standard-mode phase. Reference is the vendored C++ only; sklearn-ann rejected (wraps annoy/faiss/nmslib — different ANN algorithms, cannot be bit-matched).
 
 ### Decisions
@@ -420,8 +421,9 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-06-23T07:18:59.249Z
-Stopped at: Phase 9 context gathered
+Last session: 2026-06-28
+Stopped at: v1.1 GPU Performance roadmap created — ROADMAP.md (Phases 10–13), REQUIREMENTS.md traceability (17/17 Pending), STATE.md updated. NEXT: /gsd-plan-phase 10 (or /gsd-discuss-phase 10). Resume file: .planning/ROADMAP.md.
+Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
 Stopped at (prior): Completed 08-02-PLAN.md
 Stopped at (prior): Phase 8 context gathered
@@ -443,4 +445,4 @@ Resume file: .planning/phases/09-online-hnsw-estimated-feature-parity/09-CONTEXT
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- v1.1 GPU Performance roadmap is created (Phases 10–13). Next: `/gsd-discuss-phase 10` then `/gsd-plan-phase 10` to begin the coarse `Runtime` seam + `GpuTrainSession` residency + depth-1 wire.
