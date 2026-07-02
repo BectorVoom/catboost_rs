@@ -4,10 +4,10 @@ milestone: v1.1
 milestone_name: GPU Performance
 current_phase: 10
 status: planning
-stopped_at: Phase 10 context gathered
-last_updated: "2026-06-28T21:24:51.260Z"
-last_activity: 2026-06-28
-last_activity_desc: "v1.1 ROADMAP revised AGAIN: speed is now checked for EVERY GPU (CUDA) kernel in EVERY phase 10→13, not concentrated in Phase 13. BENCH-01's Phase-10 harness measures BOTH correctness AND wall-clock speed from the start; a Kaggle CUDA speed-check success criterion was added to every phase (P10 depth-1 device-vs-CPU; P11 depth-6 RMSE+Logloss device-vs-CPU-vs-official-CatBoost-GPU; P12 each coverage family timed as it lands; P13 comprehensive aggregate). BENCH-02 became a STANDING per-phase speed check mapped to Phase 10 (first established) but enforced 10→13, mirroring the GPUT-14 standing-gate pattern; Phase 13 reframed as the COMPREHENSIVE FINAL speed-parity sign-off (BENCH-03) that AGGREGATES the per-phase checks. Traceability re-mapped: Phase 10 = GPUT-01..04 + BENCH-01 + BENCH-02 (6); Phase 11 = GPUT-05/06/07/08/14 (5); Phase 12 = GPUT-09..13 (5); Phase 13 = BENCH-03 (1). 17/17 mapped, no orphans/duplicates."
+stopped_at: v1.1 re-scoped against CATBOOST_CUDA_KERNELS_DESIGN.md — awaiting roadmap re-derivation
+last_updated: "2026-07-02T00:00:00.000Z"
+last_activity: 2026-07-02
+last_activity_desc: "v1.1 GPU Performance RE-SCOPED IN PLACE against CATBOOST_CUDA_KERNELS_DESIGN.md (the full upstream CUDA training-kernel map — 79 .cu + 77 .cuh, 9 dirs). Coverage expanded 17 → 25 requirements: +GPUT-15 (device-resident compressed index / cindex), +GPUT-16 (from-scratch CubeCL device-primitive library — scan/segmented-scan, reduce/reduce-by-key, radix sort + stable 1-bit reorder, fill/transform, compression, partition-update, stat-aggregation; NO CUB in CubeCL), +GPUT-17 (MVS sampling — CatBoost's default GPU sampler), +GPUT-18 (Depthwise/Lossguide/Region non-symmetric grow policies), +GPUT-19 (Exact weighted-quantile leaf estimation), +GPUT-20 (Langevin/SGLB noise), +GPUT-21 (batched pairwise Cholesky solver), +GPUT-22 (query/listwise ranking losses + query-grouping infra). GPUT-11 narrowed to PairLogit; GPUT-12 widened to multiclass/multi-target/uncertainty. PROJECT.md + REQUIREMENTS.md rewritten; stale Phase-10 draft plans cleared for regeneration; roadmap (Phases 10 onward) to be re-derived by gsd-roadmapper mapping all 25 reqs."
 progress:
   total_phases: 4
   completed_phases: 0
@@ -27,10 +27,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: Phase 10 — Coarse Runtime Grow-Tree Seam + GpuTrainSession Residency + Wire Depth-1 + Kaggle CUDA Oracle & Speed Harness (not started)
+Phase: Not started (re-defining requirements after v1.1 re-scope)
 Plan: —
-Status: Roadmap REVISED again (v1.1 GPU Performance — Phases 10–13, per-phase speed check); awaiting Phase 10 planning
-Last activity: 2026-06-28 — v1.1 ROADMAP revised AGAIN: speed is now checked for EVERY GPU (CUDA) kernel in EVERY phase 10→13, not concentrated in Phase 13. BENCH-01's Phase-10 harness measures BOTH correctness AND wall-clock speed from the start; a Kaggle CUDA speed-check success criterion was added to every phase (P10 depth-1 device-vs-CPU; P11 depth-6 RMSE+Logloss device-vs-CPU-vs-official-CatBoost-GPU; P12 each coverage family timed as it lands; P13 comprehensive aggregate). BENCH-02 became a STANDING per-phase speed check mapped to Phase 10 (first established) but enforced 10→13, mirroring the GPUT-14 standing-gate pattern; Phase 13 reframed as the COMPREHENSIVE FINAL speed-parity sign-off (BENCH-03) that AGGREGATES the per-phase checks. Traceability re-mapped: Phase 10 = GPUT-01..04 + BENCH-01 + BENCH-02 (6); Phase 11 = GPUT-05/06/07/08/14 (5); Phase 12 = GPUT-09..13 (5); Phase 13 = BENCH-03 (1). 17/17 mapped, no orphans/duplicates.
+Status: v1.1 GPU Performance re-scoped in place (17 → 25 requirements) against CATBOOST_CUDA_KERNELS_DESIGN.md; roadmap re-derivation pending
+Last activity: 2026-07-02 — v1.1 re-scoped against the full upstream CUDA kernel map. Added GPUT-15 (cindex residency), GPUT-16 (from-scratch CubeCL primitive library — no CUB), GPUT-17 (MVS sampling), GPUT-18 (Depthwise/Lossguide/Region grow policies), GPUT-19 (Exact leaf estimation), GPUT-20 (Langevin/SGLB), GPUT-21 (batched pairwise Cholesky solver), GPUT-22 (query/listwise ranking losses); narrowed GPUT-11 to PairLogit, widened GPUT-12 to multiclass/multi-target/uncertainty. PROJECT.md + REQUIREMENTS.md rewritten; stale Phase-10 draft plans cleared. Awaiting gsd-roadmapper to map all 25 reqs (GPUT-01..22 + BENCH-01..03) across the re-derived phases.
 
 ## Performance Metrics
 
