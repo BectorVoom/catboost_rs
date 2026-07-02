@@ -74,12 +74,37 @@
 
 ## Traceability
 
-*Re-mapped by the roadmapper during the 2026-07-02 re-scope. 25 requirements to map: GPUT-01..22 (22) + BENCH-01..03 (3).*
+*Re-mapped by the roadmapper during the 2026-07-02 re-scope. 25 requirements mapped across Phases 10–14: GPUT-01..22 (22) + BENCH-01..03 (3). 100% coverage, no orphans, no duplicates.*
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| _(populated by roadmap)_ | — | Pending |
+| GPUT-01 | Phase 10 | Pending |
+| GPUT-02 | Phase 10 | Pending |
+| GPUT-03 | Phase 10 | Pending |
+| GPUT-04 | Phase 10 | Pending |
+| GPUT-08 | Phase 10 | Pending |
+| GPUT-15 | Phase 10 | Pending |
+| GPUT-16 | Phase 10 | Pending |
+| BENCH-01 | Phase 10 | Pending |
+| BENCH-02 | Phase 10 (standing — enforced in every GPU phase 10→13) | Pending |
+| GPUT-05 | Phase 11 | Pending |
+| GPUT-06 | Phase 11 | Pending |
+| GPUT-07 | Phase 11 | Pending |
+| GPUT-14 | Phase 11 (standing — enforced onward through 13) | Pending |
+| GPUT-18 | Phase 12 | Pending |
+| GPUT-19 | Phase 12 | Pending |
+| GPUT-09 | Phase 12 | Pending |
+| GPUT-17 | Phase 12 | Pending |
+| GPUT-10 | Phase 12 | Pending |
+| GPUT-11 | Phase 13 | Pending |
+| GPUT-21 | Phase 13 | Pending |
+| GPUT-22 | Phase 13 | Pending |
+| GPUT-12 | Phase 13 | Pending |
+| GPUT-13 | Phase 13 | Pending |
+| GPUT-20 | Phase 13 | Pending |
+| BENCH-03 | Phase 14 | Pending |
 
 ---
 *Requirements defined: 2026-06-28 for milestone v1.1 GPU Performance*
-*Re-scoped in place: 2026-07-02 against `CATBOOST_CUDA_KERNELS_DESIGN.md` — added GPUT-15 (cindex residency), GPUT-16 (device-primitive library, no CUB), GPUT-17 (MVS sampling), GPUT-18 (non-symmetric grow policies), GPUT-19 (exact leaf estimation), GPUT-20 (Langevin/SGLB), GPUT-21 (batched pairwise Cholesky solver), GPUT-22 (query/listwise ranking losses); narrowed GPUT-11 to PairLogit; widened GPUT-12 to multiclass/multi-target/uncertainty. Traceability to be re-populated by the roadmapper.*
+*Re-scoped in place: 2026-07-02 against `CATBOOST_CUDA_KERNELS_DESIGN.md` — added GPUT-15 (cindex residency), GPUT-16 (device-primitive library, no CUB), GPUT-17 (MVS sampling), GPUT-18 (non-symmetric grow policies), GPUT-19 (exact leaf estimation), GPUT-20 (Langevin/SGLB), GPUT-21 (batched pairwise Cholesky solver), GPUT-22 (query/listwise ranking losses); narrowed GPUT-11 to PairLogit; widened GPUT-12 to multiclass/multi-target/uncertainty. Traceability re-populated across Phases 10–14 (5 phases).*
+</content>

@@ -4,12 +4,12 @@ milestone: v1.1
 milestone_name: GPU Performance
 current_phase: 10
 status: planning
-stopped_at: v1.1 re-scoped against CATBOOST_CUDA_KERNELS_DESIGN.md — awaiting roadmap re-derivation
+stopped_at: v1.1 roadmap RE-DERIVED (Phases 10–14) — all 25 reqs mapped; awaiting /gsd-discuss-phase 10
 last_updated: "2026-07-02T00:00:00.000Z"
 last_activity: 2026-07-02
 last_activity_desc: "v1.1 GPU Performance RE-SCOPED IN PLACE against CATBOOST_CUDA_KERNELS_DESIGN.md (the full upstream CUDA training-kernel map — 79 .cu + 77 .cuh, 9 dirs). Coverage expanded 17 → 25 requirements: +GPUT-15 (device-resident compressed index / cindex), +GPUT-16 (from-scratch CubeCL device-primitive library — scan/segmented-scan, reduce/reduce-by-key, radix sort + stable 1-bit reorder, fill/transform, compression, partition-update, stat-aggregation; NO CUB in CubeCL), +GPUT-17 (MVS sampling — CatBoost's default GPU sampler), +GPUT-18 (Depthwise/Lossguide/Region non-symmetric grow policies), +GPUT-19 (Exact weighted-quantile leaf estimation), +GPUT-20 (Langevin/SGLB noise), +GPUT-21 (batched pairwise Cholesky solver), +GPUT-22 (query/listwise ranking losses + query-grouping infra). GPUT-11 narrowed to PairLogit; GPUT-12 widened to multiclass/multi-target/uncertainty. PROJECT.md + REQUIREMENTS.md rewritten; stale Phase-10 draft plans cleared for regeneration; roadmap (Phases 10 onward) to be re-derived by gsd-roadmapper mapping all 25 reqs."
 progress:
-  total_phases: 4
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -27,9 +27,9 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: Not started (re-defining requirements after v1.1 re-scope)
+Phase: 10 (planning — not started)
 Plan: —
-Status: v1.1 GPU Performance re-scoped in place (17 → 25 requirements) against CATBOOST_CUDA_KERNELS_DESIGN.md; roadmap re-derivation pending
+Status: v1.1 GPU Performance roadmap RE-DERIVED in place (Phases 10–14). All 25 requirements (GPUT-01..22 + BENCH-01..03) mapped, 100% coverage, no orphans/duplicates. REQUIREMENTS.md traceability re-populated.
 Last activity: 2026-07-02 — v1.1 re-scoped against the full upstream CUDA kernel map. Added GPUT-15 (cindex residency), GPUT-16 (from-scratch CubeCL primitive library — no CUB), GPUT-17 (MVS sampling), GPUT-18 (Depthwise/Lossguide/Region grow policies), GPUT-19 (Exact leaf estimation), GPUT-20 (Langevin/SGLB), GPUT-21 (batched pairwise Cholesky solver), GPUT-22 (query/listwise ranking losses); narrowed GPUT-11 to PairLogit, widened GPUT-12 to multiclass/multi-target/uncertainty. PROJECT.md + REQUIREMENTS.md rewritten; stale Phase-10 draft plans cleared. Awaiting gsd-roadmapper to map all 25 reqs (GPUT-01..22 + BENCH-01..03) across the re-derived phases.
 
 ## Performance Metrics
@@ -170,6 +170,7 @@ Last activity: 2026-07-02 — v1.1 re-scoped against the full upstream CUDA kern
 
 ### Roadmap Evolution
 
+- v1.1 GPU Performance ROADMAP RE-DERIVED IN PLACE (2026-07-02) after the 17 → 25 requirement re-scope against `CATBOOST_CUDA_KERNELS_DESIGN.md`. Phase count grew 4 → 5 (Phases 10–14, one more than the prior 10–13). **Phase 10** became the foundations phase: seam (GPUT-01) + session residency (GPUT-02) + device-resident gradients/no-der1-readback (GPUT-03) + depth-1 oblivious device tree (GPUT-04) + Cosine GPU-default score (GPUT-08) + the from-scratch CubeCL device-primitive library (GPUT-16, no CUB — §6.1/§6.2) + device-resident compressed index (GPUT-15, §6.6a) + the Kaggle CUDA correctness+speed harness (BENCH-01) and the standing per-phase speed check (BENCH-02). **Phase 11** = depth>1 partition-aware histograms + subtraction trick + reduction determinism + Newton der2 (GPUT-05/06/07) and the operative standing ε=1e-4/D-04 gate GPUT-14. **Phase 12** = grow-policy/leaf-method/sampling/categorical coverage (GPUT-18 non-symmetric policies, GPUT-19 Exact leaf, GPUT-09 bootstrap, GPUT-17 MVS, GPUT-10 CTR). **Phase 13** = loss-family coverage (GPUT-11 PairLogit, GPUT-21 batched Cholesky solver, GPUT-22 query/listwise ranking, GPUT-12 multiclass/multi-target/uncertainty, GPUT-13 ordered, GPUT-20 Langevin). **Phase 14** = comprehensive final Kaggle CUDA speed-parity sign-off aggregating the per-phase BENCH-02 checks (BENCH-03). 25/25 requirements mapped, no orphans/duplicates; REQUIREMENTS.md traceability re-populated. GPUT-08 moved 11→10 (depth-1 needs the GPU-default score); coverage split into two phases (12/13) so neither is overloaded. v1.0 collapsed details + Phase 9 backlog preserved verbatim in ROADMAP.md. All standing landmines + Kaggle-CUDA-as-sole-oracle framing carried into every phase.
 - v1.1 GPU Performance ROADMAP REVISED (2026-06-28): the validation strategy was changed so that **ALL GPU (CUDA) kernel oracles — correctness AND speed — run on a Kaggle CUDA notebook** as the single authoritative GPU oracle; the in-env AMD/ROCm GPU is now an OPTIONAL compile/smoke convenience, NOT a gate (the prior "validate correctness in-env on ROCm, benchmark speed on CUDA" asymmetry is gone). The reproducible **Kaggle CUDA oracle/test harness (BENCH-01) moved from Phase 13 into Phase 10** as a foundational deliverable so even the depth-1 device tree (GPUT-04) is correctness-tested on CUDA from the start. Every phase's GPU correctness success criteria now read "oracle-tested on Kaggle CUDA (≤1e-5 depth-1 / ε=1e-4 depth>1)" instead of "rocm in-env"; each Kaggle CUDA oracle run is a human-gated external step (the user runs the notebook). Re-mapping: Phase 10 = `Runtime` grow-tree seam + `GpuTrainSession` residency + depth-1 wire + Kaggle CUDA oracle harness (GPUT-01..04 + **BENCH-01**); Phase 11 = depth>1 partition-aware histograms + reduction-determinism + Newton der2 + Cosine score (GPUT-05/06/07/08) and the standing ε=1e-4/D-04 gate GPUT-14; Phase 12 = GPU coverage expansion behind the `Ok(None)` fallback — sampling/CTR/pairwise/multiclass/ordered (GPUT-09..13); Phase 13 = comprehensive Kaggle CUDA speed benchmark + parity sign-off building on the Phase-10 harness (BENCH-02/03). 17/17 requirements mapped, no orphans. v1.0 collapsed details + Phase 9 backlog preserved verbatim in ROADMAP.md. GPU parity bar = ε=1e-4 vs CPU (not ≤1e-5). Landmines updated: no `cb-train` dep in `cb-backend`; `f32::MIN` (no `-inf` in `#[cube]`) is now a portability nicety the ROCm smoke build catches; CUDA HAS f64 atomic-add (so atomic-free is a portability nicety, not a hard gate) BUT parallel-reduction DETERMINISM still governs ε=1e-4 parity, so a deterministic reduction is still required.
 - Phase 9 added: Online HNSW estimated-feature parity (FEAT-07) — bit-exact port of `library/cpp/online_hnsw/base` (832 LOC). Promotes the A2/D-05 deferred HNSW dependency (root cause of the `estimated-feature-grid-parity` todo's XOR per-stage residual) from a non-blocking todo to its own standard-mode phase. Reference is the vendored C++ only; sklearn-ann rejected (wraps annoy/faiss/nmslib — different ANN algorithms, cannot be bit-matched).
 
@@ -448,4 +449,4 @@ Resume file: .planning/phases/10-coarse-runtime-grow-tree-seam-gputrainsession-r
 
 ## Operator Next Steps
 
-- v1.1 GPU Performance roadmap is created (Phases 10–13). Next: `/gsd-discuss-phase 10` then `/gsd-plan-phase 10` to begin the coarse `Runtime` seam + `GpuTrainSession` residency + depth-1 wire.
+- v1.1 GPU Performance roadmap RE-DERIVED (Phases 10–14; 25 reqs mapped). Phase 10 grew from the coarse seam into the foundations phase: it now also carries GPUT-16 (from-scratch CubeCL device-primitive library, no CUB), GPUT-15 (device-resident cindex), and GPUT-08 (Cosine GPU-default score) alongside the seam/residency/depth-1 wire + Kaggle CUDA harness. Coverage split into two phases: Phase 12 (grow-policy/leaf-method/sampling/CTR: GPUT-18/19/09/17/10) and Phase 13 (pairwise/ranking/multiclass/ordered/langevin: GPUT-11/21/22/12/13/20). Phase 14 = comprehensive final Kaggle CUDA speed sign-off (BENCH-03). Next: `/gsd-discuss-phase 10` then `/gsd-plan-phase 10`. NOTE: stale prior Phase-10 draft plans were cleared for regeneration; the 10-RESEARCH.md seam/residency/depth-1 architecture stays valid but re-plan must add GPUT-08/15/16 scope.
