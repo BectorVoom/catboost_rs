@@ -19,18 +19,18 @@
 ### GPU Device-Resident Training — Seam, Residency & Foundations (GPUT)
 
 - [x] **GPUT-01**: A `Runtime` grow-tree trait seam (`begin_device_training` / `grow_tree_on_device` returning `CbResult<Option<DeviceGrownTree>>` / `end_device_training`) exists in `cb-compute` with CubeCL-free host-typed signatures, and a `Ok(None)`→host-CPU fallback so any uncovered case stays correct.
-- [ ] **GPUT-02**: A `GpuTrainSession` (cb-backend-internal) owns one `ComputeClient` + all persistent device handles for the whole fit; the quantized feature matrix is uploaded once above the iteration loop (no per-tree re-upload).
-- [ ] **GPUT-03**: Gradients/approx stay device-resident across boosting iterations; the per-tree `der1` host read-back is eliminated; only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (D-05).
+- [x] **GPUT-02**: A `GpuTrainSession` (cb-backend-internal) owns one `ComputeClient` + all persistent device handles for the whole fit; the quantized feature matrix is uploaded once above the iteration loop (no per-tree re-upload).
+- [x] **GPUT-03**: Gradients/approx stay device-resident across boosting iterations; the per-tree `der1` host read-back is eliminated; only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (D-05).
 - [x] **GPUT-15**: A bit-packed device-resident **compressed index** (cindex) with `TCFeature` Offset/Shift/Mask/OneHot addressing is built and kept resident as the single input to every histogram kernel, matching the CPU quantized layout ≤1e-4, oracle-tested on Kaggle CUDA. (Borders stay host — CPU quantization is the ≤1e-5 reference per GPUT-02; only cindex packing/residency is the device deliverable. §6.6a `gpu_data/kernel/binarize.cu`, `WriteCompressedIndex`.)
 - [x] **GPUT-16**: A from-scratch **CubeCL-portable device-primitive library** — fill/transform (gather-scatter, vector arithmetic), full + segmented prefix scan, reduce / segmented-reduce / reduce-by-key, radix sort + stable single-bit reorder, bit-compression, `TDataPartition` offset/size update, and per-partition stat aggregation (`update_part_props`) — runs on device with a deterministic reduction, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (No CUB in CubeCL — these are real deliverables, not wrappers. §6.1 `cuda_util/kernel`, §6.2 `cuda_util/kernel/sort`.)
 
 ### GPU Device-Resident Training — Tree Growth & Scoring (GPUT)
 
-- [ ] **GPUT-04**: A depth-1 oblivious tree is grown fully on device (RMSE/Logloss, Plain boosting, fold_count=1) and matches the CPU path ≤1e-5, oracle-tested on Kaggle CUDA.
+- [x] **GPUT-04**: A depth-1 oblivious tree is grown fully on device (RMSE/Logloss, Plain boosting, fold_count=1) and matches the CPU path ≤1e-5, oracle-tested on Kaggle CUDA.
 - [ ] **GPUT-05**: Partition-aware histograms (`fullPass=false`) keyed by leaf, contiguous partition reorder, and the histogram subtraction trick support depth>1 oblivious trees on device.
 - [ ] **GPUT-06**: A chosen reduction-determinism strategy keeps device histogram/score reductions within ε=1e-4 of the CPU path across hundreds of trees, verified on Kaggle CUDA (CUDA has f64 atomic-add, but atomicAdd ordering is still non-deterministic, so a deterministic reduction is required).
 - [ ] **GPUT-07**: Newton der2 leaf estimation runs on device (required for classification / Logloss default).
-- [ ] **GPUT-08**: The Cosine / second-order score function (the GPU default) runs on device.
+- [x] **GPUT-08**: The Cosine / second-order score function (the GPU default) runs on device.
 - [ ] **GPUT-18**: The **Depthwise, Lossguide, and Region** grow policies — per-policy leaf selection (`ComputeOptimalSplitsRegion` / `ComputeOptimalSplit` + `SelectLeavesToSplit`) and region/non-symmetric tree leaf-value apply (`AddRegion` / `ComputeNonSymmetricDecisionTreeBins`) — run on device, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (GPUT-04/05 are SymmetricTree/oblivious only. §6.4, §6.6c.)
 - [ ] **GPUT-19**: **Exact** weighted-quantile leaf-value estimation (`exact_estimation`: needWeights = totalWeight·α, binary search over per-bin weight prefix sums) runs on device for Quantile/MAE/MAPE-family objectives, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (Distinct from the Newton path in GPUT-07. §6.3 `exact_estimation.{cu,cuh}`.)
 
@@ -79,10 +79,10 @@
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | GPUT-01 | Phase 10 | Complete |
-| GPUT-02 | Phase 10 | Pending |
-| GPUT-03 | Phase 10 | Pending |
-| GPUT-04 | Phase 10 | Pending |
-| GPUT-08 | Phase 10 | Pending |
+| GPUT-02 | Phase 10 | Complete |
+| GPUT-03 | Phase 10 | Complete |
+| GPUT-04 | Phase 10 | Complete |
+| GPUT-08 | Phase 10 | Complete |
 | GPUT-15 | Phase 10 | Complete |
 | GPUT-16 | Phase 10 | Complete |
 | BENCH-01 | Phase 10 | Pending |
