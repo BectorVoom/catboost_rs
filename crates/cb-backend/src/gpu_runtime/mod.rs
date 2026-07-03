@@ -65,9 +65,10 @@ use crate::kernels::{
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
     pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
-    partition_split_kernel, partition_update_kernel,
+    partition_hist2_nonbinary_kernel, partition_split_kernel, partition_update_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
+    subtract_histograms_kernel, REDUCE_FIXEDPOINT_SCALE_F64,
     pairwise_make_derivatives_kernel, quantile_gradient_kernel, scan_update_pairwise_kernel,
     scan_update_pointwise_kernel, select_best_split_kernel, SCORE_FN_COSINE, SCORE_FN_L2,
     SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2,
@@ -1589,6 +1590,343 @@ pub(crate) fn launch_partition_update_into(
     };
 
     Ok(part_stats)
+}
+
+// ===========================================================================
+// Phase 11 Plan 02 (GPUT-05 / GPUT-06) — host launch fns for the partition-aware
+// `pointwise_hist2` (`fullPass = false`, `2^level` leaf slots, fixed-point Atomic<u64>
+// accumulate) and the histogram SUBTRACTION trick (parent − smaller, weight-channel
+// max(0) clamp). Both validate ALL buffer sizing + VALUE ranges with `checked_*` →
+// typed `CbError` BEFORE launch (T-11-02-01/02). Cross-oracled in `kernels/grow_loop.rs`
+// against the CPU leaf-keyed scatter `cb_compute::reduce_leaf_stats`.
+// ===========================================================================
+
+/// Fill the device-resident partition-aware 2-channel pointwise histogram
+/// (`fullPass = false`) on the compile-time [`SelectedRuntime`] and return the
+/// FIXED-POINT `u64` `binSums` DEVICE BUFFER HANDLE — WITHOUT reading it back (the
+/// GPUT-05 depth>1 capability). `leaf_of[obj]` routes each object into its partition's
+/// histogram line, so the buffer holds `2^level` concatenated leaf slots
+/// (`n_parts * n_features * n_bins * HIST_CHANNELS` `u64` cells). The merge uses the
+/// LOCKED deterministic fixed-point `Atomic<u64>` path (GPUT-06); decode each cell as
+/// `(bits as i64) as f64 / 2^30` on read-back ([`read_fixedpoint_hist_f64`]).
+///
+/// # Buffer sizing + value-range guards (T-11-02-01/02)
+///
+/// `2^level` (`checked_shl`), the cindex stride `n_features * n` (`checked_mul`), the
+/// per-leaf line `n_features * n_bins * HIST_CHANNELS` ([`hist2_binsums_len_checked`]),
+/// and the total `per_leaf * 2^level` (`checked_mul`) are ALL overflow-checked →
+/// [`CbError::OutOfRange`] BEFORE any product is formed. `der1`/`weight`/`indices`/
+/// `leaf_of` length mismatches and any `indices[i] >= n`, `cindex bin >= n_bins`, or
+/// `leaf_of[obj] >= 2^level` surface a typed [`CbError`] BEFORE launch — so a
+/// device-side OOB store is impossible. Empty input short-circuits to a zero-length
+/// handle (no launch). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_hist2_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    leaf_of: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    level: u32,
+) -> CbResult<Handle> {
+    let n = der1.len();
+
+    // Shape guards.
+    if weight.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "weight".to_owned(),
+            expected: n,
+            actual: weight.len(),
+        });
+    }
+    if indices.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "indices".to_owned(),
+            expected: n,
+            actual: indices.len(),
+        });
+    }
+    if leaf_of.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "leaf_of".to_owned(),
+            expected: n,
+            actual: leaf_of.len(),
+        });
+    }
+
+    // Partition count `2^level` (checked shift — a `level >= usize::BITS` would wrap).
+    let n_parts = 1usize.checked_shl(level).ok_or_else(|| {
+        CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+    })?;
+
+    // Overflow guards FIRST — before any unchecked product is formed.
+    let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
+        ))
+    })?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let total = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
+        ))
+    })?;
+
+    // cindex length guard uses the already-checked product (never re-multiplying).
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+
+    // Value-range guards (T-11-02-01): the VALUES inside indices/cindex/leaf_of drive
+    // unchecked device array indices; validate them host-side so a malformed id/bin/leaf
+    // surfaces a typed error rather than an out-of-bounds device store (UB).
+    if let Some(&bad) = indices.iter().find(|&&ix| (ix as usize) >= n) {
+        return Err(CbError::OutOfRange(format!(
+            "indices value {bad} >= n ({n}); object id would read der1/cindex out of bounds"
+        )));
+    }
+    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
+        return Err(CbError::OutOfRange(format!(
+            "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
+        )));
+    }
+    if let Some(&bad) = leaf_of.iter().find(|&&p| (p as usize) >= n_parts) {
+        return Err(CbError::OutOfRange(format!(
+            "leaf_of value {bad} >= 2^level ({n_parts}); partition slot would write bin_sums out of bounds"
+        )));
+    }
+
+    // Empty fill: hand back a zero-length handle (no launch, no read-back).
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // Bit-width family selection (same host-side pick as the depth-1 seam).
+    let bits: u32 = match n_bins {
+        32 => 5,
+        64 => 6,
+        128 => 7,
+        256 => 8,
+        _ => {
+            return Err(CbError::Degenerate(format!(
+                "partition_hist2 one-byte non-binary fill expects n_bins in {{32,64,128,256}} \
+                 (1 << bits for bits in 5..=8), got {n_bins}"
+            )));
+        }
+    };
+
+    // Build the bit-packed grouped cindex + per-feature TCFeature table, upload the
+    // channel-typed der1/weight + packed words + (offsets, shifts, masks) + indices +
+    // leaf_of, then launch. All features share `n_bins` buckets (the value-range guard
+    // above rejected any bin >= n_bins, so `pack_cindex` masks each field losslessly).
+    let n_buckets_per_feature = vec![n_bins; n_features];
+    let packed = crate::gpu_runtime::cindex::pack_cindex(cindex, &n_buckets_per_feature, n)?;
+    let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+    let num_words = packed.words.len();
+
+    let der1_h = upload_channel_floats(client, der1);
+    let weight_h = upload_channel_floats(client, weight);
+    let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
+    let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
+    let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
+    let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+    let leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(leaf_of.to_vec()));
+
+    // Zero-initialised fixed-point u64 histogram (0u64 is the additive identity in two's
+    // complement too — manual §3). The kernel accumulates into it.
+    let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u64; total]));
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The der1/weight channel float type is f32 on wgpu, f64 elsewhere (RESEARCH A1); the
+    // fixed-point `Atomic<u64>` accumulator output is `u64` on both. (wgpu lacks u64
+    // atomics — the caller gates this path on the device's advertised capability.)
+    #[cfg(feature = "wgpu")]
+    partition_hist2_nonbinary_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1_h, n) },
+        unsafe { ArrayArg::from_raw_parts(weight_h, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_words_h, num_words) },
+        unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        n_features as u32,
+        bits,
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    partition_hist2_nonbinary_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1_h, n) },
+        unsafe { ArrayArg::from_raw_parts(weight_h, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_words_h, num_words) },
+        unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        n_features as u32,
+        bits,
+    );
+
+    Ok(out)
+}
+
+/// Derive the LARGER sibling's histogram device-resident via the SUBTRACTION trick:
+/// `bigger = parent − smaller` per fixed-point cell, clamping the `statId == 0`
+/// (weight/hessian) channel to `max(0)` (D-04, memory-lean — the smaller child is filled
+/// directly by [`launch_partition_hist2_into`], the larger is derived in O(bins)). Returns
+/// a fresh `u64` `bigger` handle of length `cells`. `parent`/`smaller` may be multi-slot
+/// buffers addressed at `parent_base`/`smaller_base` (the parent-resident slot + the
+/// directly-computed smaller sibling, selected by partition Size host-side); `cells` is
+/// one leaf line's length.
+///
+/// # Buffer-size guards (T-11-02-01/02)
+///
+/// `parent_base + cells <= parent_len`, `smaller_base + cells <= smaller_len`
+/// (`checked_add`), and the base/cells fit the `u32` device index range (`try_from`) —
+/// all validated → typed [`CbError`] BEFORE launch. `cells == 0` short-circuits to a
+/// zero-length handle. No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_subtract_histograms_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    parent: Handle,
+    parent_len: usize,
+    parent_base: usize,
+    smaller: Handle,
+    smaller_len: usize,
+    smaller_base: usize,
+    cells: usize,
+) -> CbResult<Handle> {
+    if cells == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // Slot-offset bounds: base + cells must not run past either source buffer.
+    let parent_end = parent_base.checked_add(cells).ok_or_else(|| {
+        CbError::OutOfRange(format!("parent_base ({parent_base}) + cells ({cells}) overflows usize"))
+    })?;
+    if parent_end > parent_len {
+        return Err(CbError::OutOfRange(format!(
+            "parent slot [{parent_base}, {parent_end}) exceeds parent buffer length {parent_len}"
+        )));
+    }
+    let smaller_end = smaller_base.checked_add(cells).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "smaller_base ({smaller_base}) + cells ({cells}) overflows usize"
+        ))
+    })?;
+    if smaller_end > smaller_len {
+        return Err(CbError::OutOfRange(format!(
+            "smaller slot [{smaller_base}, {smaller_end}) exceeds smaller buffer length {smaller_len}"
+        )));
+    }
+
+    // The kernel takes u32 base/cells scalars (device index domain).
+    let parent_base_u32 = u32::try_from(parent_base).map_err(|_| {
+        CbError::OutOfRange(format!("parent_base {parent_base} exceeds u32 device index range"))
+    })?;
+    let smaller_base_u32 = u32::try_from(smaller_base).map_err(|_| {
+        CbError::OutOfRange(format!("smaller_base {smaller_base} exceeds u32 device index range"))
+    })?;
+    let cells_u32 = u32::try_from(cells).map_err(|_| {
+        CbError::OutOfRange(format!("cells {cells} exceeds u32 device index range"))
+    })?;
+
+    let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u64; cells]));
+
+    let num_cubes = cells.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    #[cfg(feature = "wgpu")]
+    subtract_histograms_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(parent, parent_len) },
+        unsafe { ArrayArg::from_raw_parts(smaller, smaller_len) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), cells) },
+        parent_base_u32,
+        smaller_base_u32,
+        0u32,
+        cells_u32,
+        HIST_CHANNELS as u32,
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    subtract_histograms_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(parent, parent_len) },
+        unsafe { ArrayArg::from_raw_parts(smaller, smaller_len) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), cells) },
+        parent_base_u32,
+        smaller_base_u32,
+        0u32,
+        cells_u32,
+        HIST_CHANNELS as u32,
+    );
+
+    Ok(out)
+}
+
+/// Read a FIXED-POINT `u64` histogram handle back and DECODE each cell to `f64`
+/// (`(bits as i64) as f64 / 2^30` — CubeCL fixed-point-atomics manual §3), the
+/// deterministic-accumulator sibling of [`read_binsums_f64`]. `len` is the expected cell
+/// count. A read-back failure surfaces [`CbError::Degenerate`] (WR-05), never a silent
+/// zero buffer; a length mismatch surfaces [`CbError::LengthMismatch`].
+pub(crate) fn read_fixedpoint_hist_f64(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    handle: Handle,
+    len: usize,
+) -> CbResult<Vec<f64>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| CbError::Degenerate(format!("fixed-point hist read-back failed: {e:?}")))?;
+    let bits = bytemuck::cast_slice::<u8, u64>(&bytes);
+    if bits.len() != len {
+        return Err(CbError::LengthMismatch {
+            column: "fixedpoint_hist".to_owned(),
+            expected: len,
+            actual: bits.len(),
+        });
+    }
+    Ok(bits
+        .iter()
+        .map(|&b| (b as i64) as f64 / REDUCE_FIXEDPOINT_SCALE_F64)
+        .collect())
 }
 
 /// The output of [`grow_oblivious_tree`]: the per-level chosen splits, the per-object

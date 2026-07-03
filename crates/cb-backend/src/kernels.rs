@@ -3561,6 +3561,202 @@ pub fn partition_update_kernel<F: Float>(
 }
 
 // ===========================================================================
+// Phase 11 Plan 02 (GPUT-05 / GPUT-06) — the partition-aware `pointwise_hist2`
+// (`fullPass = false`) keyed by `leaf_of[obj]` into `2^level` leaf slots, the
+// histogram SUBTRACTION trick (parent − smaller, weight-channel max(0) clamp), and
+// the LOCKED deterministic fixed-point `Atomic<u64>` accumulator wired into the
+// histogram merge (the depth-1 fill's naked `fetch_add` is the non-deterministic
+// source GPUT-06 removes). The fixed-point scale is the LOCKED
+// `REDUCE_FIXEDPOINT_SCALE_F64` (k=30, SPIKE-REDUCTION §5b) — do NOT re-open the
+// reduce strategy. Cross-oracled in `kernels/grow_loop.rs` against the CPU leaf-keyed
+// scatter `cb_compute::reduce_leaf_stats`.
+// ===========================================================================
+
+/// Fixed-point ENCODE (`round(v · 2^30) → i64 → u64` bits — CubeCL fixed-point-atomics
+/// manual §2.2): quantize a float contribution onto the LOCKED `2^30` grid
+/// ([`REDUCE_FIXEDPOINT_SCALE_F64`]) so INTEGER atomic accumulation is EXACT and
+/// ORDER-INDEPENDENT (GPUT-06). The returned `u64` bits are the two's-complement `i64`
+/// reinterpretation — wrapping `u64` atomic add equals signed `i64` add, so histogram
+/// merge is deterministic regardless of the hardware contention schedule. Widen through
+/// f64 (the fixed-point accumulation precision, matching [`block_reduce_fixedpoint_kernel`]);
+/// generic over `F: Float` (AGENTS.md generics-float — the input channel type). No `-inf`
+/// literal (a `#[cube]` helper inlined at JIT, mirroring [`read_bin`]).
+#[cube]
+fn fixedpoint_encode<F: Float>(v: F) -> u64 {
+    let scaled = f64::cast_from(v) * REDUCE_FIXEDPOINT_SCALE_F64;
+    u64::cast_from(i64::cast_from(f64::round(scaled)))
+}
+
+/// Fixed-point DECODE (reinterpret `u64` bits as `i64`, scale back by `2^30`): the
+/// inverse of [`fixedpoint_encode`], returning the value in the working float `F`.
+/// `i64::cast_from(bits)` is the two's-complement reinterpret (same width);
+/// `f64::cast_from(i64)` the numeric widen; `F::cast_from(f64)` the channel narrow.
+/// Used by [`subtract_histograms_kernel`] to subtract two fixed-point cells in FLOAT
+/// space — upstream `SubstractHistogramsImpl` subtracts float `TBucketStats`, so the
+/// decode→subtract→encode round-trip stays bit-faithful for magnitudes below `2^53`
+/// (both operands are exact integer sums of quantized contributions). Generic over
+/// `F: Float`; no `-inf` literal.
+#[cube]
+fn fixedpoint_decode<F: Float>(bits: u64) -> F {
+    let v = f64::cast_from(i64::cast_from(bits)) / REDUCE_FIXEDPOINT_SCALE_F64;
+    F::cast_from(v)
+}
+
+/// Partition-aware 2-channel `pointwise_hist2` — the `fullPass = false` leaf-keyed
+/// variant of [`pointwise_hist2_nonbinary_kernel`] (upstream
+/// `pointwise_hist2_one_byte_templ.cuh` with `ShiftPartAndBinSumsPtr`'s multi-part
+/// offset; CATBOOST_CUDA_KERNELS_DESIGN §6.3/§6.4). It fills `2^level` leaf slots,
+/// routing each object into its partition's histogram line by `leaf_of[obj]` — the
+/// SAME `let part = leaf_of[obj] as usize;` gather as [`partition_update_kernel`] — so
+/// the flat write index carries the leaf/partition stride:
+///
+/// ```text
+/// leaf_stride = n_features * n_bins * HIST_CHANNELS
+/// cell(part, feature, bin, channel) =
+///     part * leaf_stride + (feature * n_bins + bin) * HIST_CHANNELS + channel
+/// ```
+///
+/// (upstream §6.4 leaf-wise tensor indexing `leafId * binFeatureCount * statCount + …`).
+/// `n_bins = 1 << bits` is COMPTIME (the same 5/6/7/8-bit non-binary family selected
+/// host-side per the feature group's border count — no runtime bit-count branch).
+///
+/// # Channel layout (11-PATTERNS Pattern 1 / A2)
+///
+/// **Channel 0 = Σ weight/hessian (statId 0), channel 1 = Σ der1** — the layout the
+/// subtraction trick's `max(0)` clamp keys on (statId==0 is the weight/hessian channel,
+/// upstream `SubstractHistogramsImpl`). The layout is parameterized by what the CALLER
+/// passes as `weight`/`der1`: the Logloss-Newton "channel-0-carries-Σder2" question (A2)
+/// is a caller choice pinned in Plan 04's Newton path + the depth-6 fixture, NOT decided
+/// here.
+///
+/// # Deterministic fixed-point accumulate (GPUT-06)
+///
+/// `bin_sums: &Array<Atomic<u64>>` is the GLOBAL fixed-point histogram. Each contribution
+/// is quantized via [`fixedpoint_encode`] (`round(v·2^30) → i64 → u64` bits) and
+/// integer-atomic-added — the LOCKED deterministic path (SPIKE-REDUCTION §5b) that
+/// REPLACES the depth-1 kernel's naked f64 `fetch_add` (the accepted non-deterministic
+/// source). Integer atomic add is exact and commutative, so the merge is
+/// order-independent — byte-identical run to run. The host decodes `(bits as i64) as f64
+/// / 2^30` on read-back. Capability-gated host-side on `Atomic<u64>` add: a backend that
+/// lacks it reports the downgrade via `AtomicFinalizePath` (never a silent switch).
+///
+/// # Wave-size policy (D-09) / generics-float (AGENTS.md)
+///
+/// The per-object loop is a grid-stride loop over the TOTAL thread count
+/// (`CUBE_COUNT * CUBE_DIM`) — NEVER a literal 32/64. Generic over `F: Float` (the input
+/// der1/weight channel). Bins are read through the ONE [`read_bin`] accessor over the
+/// bit-packed grouped cindex (T-10-15). Every position read is grid-stride-bounded; the
+/// VALUE ranges (`indices[i] < n`, bin `< n_bins`, `leaf_of[obj] < 2^level`) are
+/// validated HOST-SIDE in `launch_partition_hist2_into` before launch. No `-inf` literal;
+/// if-as-STATEMENT only.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn partition_hist2_nonbinary_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    cindex: &Array<u32>,
+    offsets: &Array<u32>,
+    shifts: &Array<u32>,
+    masks: &Array<u32>,
+    indices: &Array<u32>,
+    leaf_of: &Array<u32>,
+    bin_sums: &Array<Atomic<u64>>,
+    n_features: u32,
+    #[comptime] bits: u32,
+) {
+    // n_bins = 1 << bits (comptime); the (feature, bin) index arithmetic stays `usize`.
+    let n_bins = comptime!((1u32 << bits) as usize);
+    let n = indices.len();
+    let n_features_usize = n_features as usize;
+    // One full (feature, bin, channel) histogram line per partition slot (the leaf
+    // stride prepended to the FROZEN interleaved cell index — upstream §6.4 layout).
+    let leaf_stride = n_features_usize * n_bins * 2usize;
+
+    // Grid-stride loop over the object-visiting order (stride == total thread count,
+    // a topology value — NEVER a literal 32/64, D-09).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < n {
+        let obj_u = indices[i];
+        let obj = obj_u as usize;
+        // Partition routing (fullPass=false): same `leaf_of[obj]` gather as
+        // partition_update_kernel. The VALUE range (`< 2^level`) is host-validated so
+        // `part * leaf_stride` cannot address `bin_sums` out of bounds.
+        let part = leaf_of[obj] as usize;
+        let d = der1[obj];
+        let w = weight[obj];
+
+        let part_base = part * leaf_stride;
+        let mut feature = 0usize;
+        while feature < n_features_usize {
+            let bin =
+                read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature]) as usize;
+            let cell = part_base + (feature * n_bins + bin) * 2usize;
+            // channel 0 = Σ weight (statId 0), channel 1 = Σ der1. Fixed-point Atomic<u64>
+            // accumulate (GPUT-06): quantize each contribution, integer-atomic-add — exact
+            // + order-independent (deterministic), NOT a naked f64 fetch_add.
+            bin_sums[cell].fetch_add(fixedpoint_encode::<F>(w));
+            bin_sums[cell + 1usize].fetch_add(fixedpoint_encode::<F>(d));
+            feature += 1usize;
+        }
+
+        i += stride;
+    }
+}
+
+/// Histogram SUBTRACTION trick (upstream `histogram_utils` `SubstractHistogramsImpl`;
+/// CATBOOST_CUDA_KERNELS_DESIGN §1.4 identity, §5.5 Compute-smaller→Zero→Substract→Scan
+/// sequence): derive the larger sibling's histogram as `parent − smaller` per bin-cell,
+/// so only the SMALLER child is filled directly (Task-1 kernel) and the parent stays
+/// resident (D-04, memory-lean — approaches parity). A position-guarded elementwise
+/// `#[cube]` (mirrors [`apply_leaf_delta_kernel`]'s shape): one output cell per lane, no
+/// atomics, no cross-thread accumulation — so it is fully deterministic (order-independent
+/// by construction).
+///
+/// `parent` / `smaller` / `bigger` are fixed-point `u64` histogram buffers (possibly the
+/// SAME multi-slot buffer at different `*_base` slot offsets — the D-04 parent-slot
+/// reuse); `cells` is one leaf line's length (`n_features * n_bins * HIST_CHANNELS`);
+/// `channels` is `HIST_CHANNELS`. Each cell is decoded to float ([`fixedpoint_decode`]),
+/// subtracted (upstream subtracts float `TBucketStats`), then re-encoded. The
+/// **statId == 0 (weight/hessian) channel** — the cell index `≡ 0 (mod channels)` — is
+/// clamped to `max(., 0)`: omitting this underflow guard is the LANDMINE (tiny negative
+/// weights from float cancellation poison the score denominator, 11-PATTERNS Pattern 2).
+///
+/// Generic over `F: Float` (the working precision; AGENTS.md generics-float). Every access
+/// is under an `ABSOLUTE_POS < cells` position guard; the base offsets are host-validated
+/// (`*_base + cells <= buffer len`) before launch. No `-inf` literal; if-as-STATEMENT only.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn subtract_histograms_kernel<F: Float>(
+    parent: &Array<u64>,
+    smaller: &Array<u64>,
+    bigger: &mut Array<u64>,
+    parent_base: u32,
+    smaller_base: u32,
+    bigger_base: u32,
+    cells: u32,
+    channels: u32,
+) {
+    let c = ABSOLUTE_POS;
+    if c < cells as usize {
+        // Decode both fixed-point cells to the working float, subtract in float space
+        // (upstream SubstractHistogramsImpl operates on float TBucketStats).
+        let p = fixedpoint_decode::<F>(parent[parent_base as usize + c]);
+        let s = fixedpoint_decode::<F>(smaller[smaller_base as usize + c]);
+        let mut diff = p - s;
+        // statId==0 (weight/hessian) channel = cell index ≡ 0 (mod channels): clamp to
+        // >= 0 (the SubstractHistogramsImpl underflow guard; omitting it is the LANDMINE).
+        // if-as-STATEMENT only (CubeCL conditionals manual).
+        if c % (channels as usize) == 0usize {
+            if diff < F::new(0.0) {
+                diff = F::new(0.0);
+            }
+        }
+        bigger[bigger_base as usize + c] = fixedpoint_encode::<F>(diff);
+    }
+}
+
+// ===========================================================================
 // Phase 7.5 Plan 06 — the PAIRWISE split scorer (split_pairwise.cuh), the
 // genuinely-new structurally-heaviest piece (Pitfall 5), sequenced LAST per
 // D-7.5-01. It closes the GPU-01 kernel surface: the per-leaf linear-system build
