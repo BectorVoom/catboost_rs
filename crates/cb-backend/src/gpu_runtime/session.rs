@@ -168,6 +168,16 @@ impl GpuTrainSession {
             return Ok(None);
         }
 
+        // The device histogram fill (`hist2_launch_resident`) only dispatches these line
+        // sizes: BINARY_BINS (2), HALF_BYTE_BINS (16), and the non-binary {32,64,128,256}
+        // widths. Any other `n_bins` (e.g. the default 254-border quantization → n_bins=255)
+        // would commit the whole fit to the device (D-10-01 all-or-nothing) and then hard-fail
+        // at grow time. Decline to the byte-unchanged CPU grower (D-04) instead of a hard
+        // failure. Keep this set in sync with `hist2_launch_resident`'s dispatch.
+        if !matches!(n_bins, 2 | 16 | 32 | 64 | 128 | 256) {
+            return Ok(None);
+        }
+
         // --- Host-side validation (V5): the resident grow skips per-tree guards, so validate
         // the value ranges ONCE here (T-10-18 residency + the histogram value-range contract).
         let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
