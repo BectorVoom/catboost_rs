@@ -10,7 +10,9 @@
 //! Kernels are generic over `F: Float` (AGENTS.md generics-float rule) — no
 //! float type is hard-coded in a kernel signature.
 
+use cb_core::{CbError, CbResult};
 use cubecl::prelude::*;
+use cubecl::server::Handle;
 
 /// Comptime `SharedMemory` size for [`block_reduce_kernel`] (Pitfall 3 — the size
 /// MUST be a compile-time `usize` const, not a runtime/topology value). It equals
@@ -1688,6 +1690,229 @@ pub fn block_scan_kernel<F: Float>(
     if ABSOLUTE_POS < input.len() {
         output[ABSOLUTE_POS] = result;
     }
+}
+
+/// Launch-geometry cube width for the two-level [`full_scan`] (Plan 10-01, GPUT-16).
+/// It equals [`BLOCK_REDUCE_SHMEM`] (a power-of-two width = the shared-mem allocation
+/// each block-scan reuses); it is the launch-geometry const, NOT a wave/warp-size
+/// literal in any reduction stride (the strides derive from `CUBE_DIM_X` / `PLANE_DIM`,
+/// D-09).
+pub(crate) const SCAN_CUBE_DIM: usize = BLOCK_REDUCE_SHMEM;
+
+/// Per-block prefix scan that ALSO emits each block's total to `block_sums` — the
+/// first phase of the cross-cube two-level [`full_scan`] (GPUT-16; RESEARCH Open Q2:
+/// the single-cube [`block_scan_kernel`] carries no cross-cube offset). Each cube
+/// independently scans its own `CUBE_DIM`-wide slice (exactly the `block_scan_kernel`
+/// geometry) and writes `output[ABSOLUTE_POS]` = the WITHIN-BLOCK prefix (inclusive or
+/// exclusive per the `#[comptime]` flag). Independently of that flag, the last VALID
+/// unit of each block writes the block's INCLUSIVE total (`scanned_in_plane + carry`)
+/// to `block_sums[CUBE_POS]`, so phase 2 can exclusive-scan those totals into per-block
+/// offsets. The cross-cube offset add is phase 3 ([`add_block_offset_kernel`]).
+///
+/// Generic over `F: Float` (AGENTS.md generics-float). Every device read/write is under
+/// an `ABSOLUTE_POS < input.len()` bounds guard (T-10-01); no `-inf` literal (T-10-02);
+/// the `SharedMemory::new` SIZE is the comptime [`BLOCK_REDUCE_SHMEM`] const (Pitfall 3);
+/// the cross-plane carry stride derives from `CUBE_DIM_X` / `PLANE_DIM`, never a literal
+/// wave width (D-09). if-as-STATEMENT only.
+#[cube(launch)]
+pub fn block_scan_total_kernel<F: Float>(
+    input: &Array<F>,
+    output: &mut Array<F>,
+    block_sums: &mut Array<F>,
+    #[comptime] inclusive: bool,
+) {
+    let tid = UNIT_POS;
+    let n = input.len();
+
+    // Load this unit's element, zero-padding idle out-of-range lanes (T-10-01).
+    let mut val = F::new(0.0);
+    if ABSOLUTE_POS < n {
+        val = input[ABSOLUTE_POS];
+    }
+
+    // Within-plane prefix via wave-agnostic plane ops (width = PLANE_DIM, never a
+    // literal). `scanned_in_plane` is always the plane-INCLUSIVE prefix; `scanned` is
+    // the requested (inclusive/exclusive) variant.
+    let scanned_in_plane = plane_inclusive_sum(val);
+    let mut scanned = scanned_in_plane;
+    if !inclusive {
+        scanned = plane_exclusive_sum(val);
+    }
+
+    // Cross-plane carry (Hillis-Steele over per-plane inclusive totals) — identical
+    // structure to `block_scan_kernel`. The last unit of each plane writes that plane's
+    // inclusive total into a per-plane shared slot keyed by PLANE_POS.
+    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
+        partials[PLANE_POS as usize] = scanned_in_plane;
+    }
+    sync_cube();
+
+    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+    let mut s = 1u32;
+    while s < num_planes {
+        let mut add = F::new(0.0);
+        if tid < num_planes {
+            if tid >= s {
+                add = partials[(tid - s) as usize];
+            }
+        }
+        sync_cube();
+        if tid < num_planes {
+            if tid >= s {
+                partials[tid as usize] += add;
+            }
+        }
+        sync_cube();
+        s *= 2u32;
+    }
+
+    let mut carry = F::new(0.0);
+    if PLANE_POS >= 1u32 {
+        carry = partials[(PLANE_POS - 1u32) as usize];
+    }
+
+    let result = scanned + carry;
+    // The block's INCLUSIVE within-block prefix (flag-independent): its value at the
+    // last valid unit IS the block total consumed by phase 2.
+    let inclusive_val = scanned_in_plane + carry;
+
+    if ABSOLUTE_POS < n {
+        output[ABSOLUTE_POS] = result;
+    }
+
+    // The last VALID unit of each block writes the block total to block_sums[CUBE_POS].
+    // Two disjoint cases (same block, same semantics): a FULL block's last lane
+    // (`UNIT_POS == CUBE_DIM_X - 1`), and the final PARTIAL block's global-last lane
+    // (`ABSOLUTE_POS == n - 1`). `n >= 1` is guaranteed by the launcher (this kernel
+    // only runs when there is more than one block).
+    if ABSOLUTE_POS < n {
+        if UNIT_POS == CUBE_DIM_X - 1u32 {
+            block_sums[CUBE_POS as usize] = inclusive_val;
+        }
+    }
+    if ABSOLUTE_POS < n {
+        if ABSOLUTE_POS == n - 1usize {
+            block_sums[CUBE_POS as usize] = inclusive_val;
+        }
+    }
+}
+
+/// Phase 3 of the two-level [`full_scan`]: add each block's exclusive-scanned offset
+/// (`block_offsets[CUBE_POS]`, the running total of all PRIOR blocks) to every element
+/// of that block, turning the per-block prefixes from phase 1 into the global prefix.
+/// One write per lane, bounds-guarded; generic-float; no `-inf` literal. `CUBE_POS` is
+/// bounded by the launch geometry (`num_cubes` cubes) == `block_offsets.len()`.
+#[cube(launch)]
+pub fn add_block_offset_kernel<F: Float>(data: &mut Array<F>, block_offsets: &Array<F>) {
+    if ABSOLUTE_POS < data.len() {
+        let offset = block_offsets[CUBE_POS as usize];
+        data[ABSOLUTE_POS] += offset;
+    }
+}
+
+/// One recursion level of the two-level scan over resident device handles. Returns the
+/// handle holding the full prefix scan of `in_handle` (`n` elements) WITHOUT reading it
+/// back — every handle stays bound to the SAME `client` that allocated it (Pitfall 3).
+///
+/// - `num_cubes <= 1` (n <= [`SCAN_CUBE_DIM`]): single-cube base case via
+///   [`block_scan_kernel`] (the cross-cube carry collapses to identity).
+/// - otherwise: phase 1 [`block_scan_total_kernel`] (per-block scan + block totals),
+///   phase 2 = an EXCLUSIVE `full_scan_into` of the block totals (recurses until a
+///   single cube suffices — so arbitrary `n` is covered, not just `n <= SCAN_CUBE_DIM^2`),
+///   phase 3 [`add_block_offset_kernel`].
+///
+/// No `unwrap`/`expect`/`panic`/host indexing (workspace lints + D-13): a device
+/// read-back failure only surfaces at the top-level [`full_scan`].
+fn full_scan_into<F>(
+    client: &cubecl::client::ComputeClient<crate::SelectedRuntime>,
+    in_handle: Handle,
+    n: usize,
+    inclusive: bool,
+) -> CbResult<Handle>
+where
+    F: Float + CubeElement,
+{
+    let out_handle = client.empty(n * std::mem::size_of::<F>());
+    let num_cubes = n.div_ceil(SCAN_CUBE_DIM).max(1);
+    let dim = CubeDim {
+        x: SCAN_CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    if num_cubes <= 1 {
+        // Single-cube base case: n <= SCAN_CUBE_DIM, the documented `block_scan_kernel`
+        // scope where the whole scan fits one cube.
+        block_scan_kernel::launch::<F, crate::SelectedRuntime>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim,
+            unsafe { ArrayArg::from_raw_parts(in_handle, n) },
+            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            inclusive,
+        );
+        return Ok(out_handle);
+    }
+
+    // Phase 1: per-block scan + per-block totals.
+    let block_sums = client.empty(num_cubes * std::mem::size_of::<F>());
+    block_scan_total_kernel::launch::<F, crate::SelectedRuntime>(
+        client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        dim,
+        unsafe { ArrayArg::from_raw_parts(in_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        unsafe { ArrayArg::from_raw_parts(block_sums.clone(), num_cubes) },
+        inclusive,
+    );
+
+    // Phase 2: exclusive scan of the block totals → each block's additive offset
+    // (recurses; terminates once the totals fit a single cube).
+    let block_offsets = full_scan_into::<F>(client, block_sums, num_cubes, false)?;
+
+    // Phase 3: add each block's offset to its elements.
+    add_block_offset_kernel::launch::<F, crate::SelectedRuntime>(
+        client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        dim,
+        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+        unsafe { ArrayArg::from_raw_parts(block_offsets, num_cubes) },
+    );
+
+    Ok(out_handle)
+}
+
+/// Cross-cube two-level full prefix scan over the compile-time [`crate::SelectedRuntime`]
+/// (GPUT-16, RESEARCH Open Q2 — the generalization of the single-cube
+/// [`block_scan_kernel`] to arbitrary `n`). `inclusive` selects the inclusive
+/// (running total includes self) vs exclusive (`output[0] == 0`) variant; it threads
+/// through every recursion level as the `#[comptime]` flag. The output has the SAME
+/// length as the input (a scan is not a reduction).
+///
+/// The empty input short-circuits to an empty vec (no launch); `n = 1` returns `[x]`
+/// (inclusive) / `[0]` (exclusive) via the single-cube base case. A device read-back
+/// failure surfaces as [`CbError::Degenerate`] (never a silent zero buffer). No
+/// `unwrap`/`expect`/`panic`/host indexing (workspace lints + D-13).
+pub fn full_scan<F>(input: &[F], inclusive: bool) -> CbResult<Vec<F>>
+where
+    F: Float + CubeElement + bytemuck::Pod,
+{
+    let n = input.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let device = <crate::SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    let out_handle = full_scan_into::<F>(&client, in_handle, n, inclusive)?;
+
+    let bytes = client
+        .read_one(out_handle)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+    Ok(bytemuck::cast_slice::<u8, F>(&bytes).to_vec())
 }
 
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test

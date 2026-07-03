@@ -201,6 +201,110 @@ fn block_scan_edge_case_single_element() {
     println!("[scan f64 n=1] inclusive={} exclusive={}", incl[0], excl[0]);
 }
 
+// ===========================================================================
+// Plan 10-01 (GPUT-16): the CROSS-CUBE two-level `full_scan` — the generalization of
+// the single-cube `block_scan_kernel` above to `n >> CUBE_DIM`. These cases exercise
+// the phase-1 per-block scan + block totals, the recursive phase-2 exclusive scan of
+// block sums, and the phase-3 offset add against an inline SERIAL prefix reference
+// (D-02: no cb-train reach, no upstream fixture). Bounds are generous run-stable
+// values (NOT the signed-off GPU-06 epsilon).
+// ===========================================================================
+
+/// Generous relative bound for the LARGE-n f64 two-level scan vs the serial f64
+/// baseline (float reassociation across ~1e5 elements; still tiny — a wrong scan
+/// misses by orders of magnitude).
+const F64_REL_TOL_LARGE: f64 = 1e-6;
+/// Generous relative bound for the LARGE-n f32 two-level scan vs the f64 baseline.
+const F32_REL_TOL_LARGE: f64 = 1e-2;
+
+/// The Plan behaviour example, driven through the two-level `full_scan` entry point
+/// (n = 5 takes the single-cube base case, verifying `full_scan` on small input too).
+#[test]
+fn full_scan_behaviour_example_small() {
+    let input = vec![3.0_f64, 1.0, 4.0, 1.0, 5.0];
+
+    let incl = crate::kernels::full_scan(&input, true).unwrap();
+    assert_eq!(incl, vec![3.0, 4.0, 8.0, 9.0, 14.0], "inclusive scan of [3,1,4,1,5]");
+
+    let excl = crate::kernels::full_scan(&input, false).unwrap();
+    assert_eq!(excl, vec![0.0, 3.0, 4.0, 8.0, 9.0], "exclusive scan of [3,1,4,1,5]");
+}
+
+/// `full_scan` empty / n=1 edge cases short-circuit unchanged (Task 1 behaviour).
+#[test]
+fn full_scan_edge_cases() {
+    let empty: Vec<f64> = Vec::new();
+    assert!(crate::kernels::full_scan(&empty, true).unwrap().is_empty());
+    assert!(crate::kernels::full_scan(&empty, false).unwrap().is_empty());
+
+    let one = vec![42.5_f64];
+    let incl = crate::kernels::full_scan(&one, true).unwrap();
+    assert_eq!(incl.len(), 1);
+    assert!((incl[0] - 42.5).abs() <= F64_ABS_TOL_TIGHT, "n=1 inclusive = [x]");
+    let excl = crate::kernels::full_scan(&one, false).unwrap();
+    assert_eq!(excl.len(), 1);
+    assert!(excl[0].abs() <= F64_ABS_TOL_TIGHT, "n=1 exclusive = [0]");
+}
+
+/// n = 100_000 (>> CUBE_DIM = 32, ~3125 blocks): the two-level inclusive scan matches
+/// the inline serial prefix sum. Monotonic-positive input keeps the baseline away from
+/// zero so the relative bound is meaningful.
+#[test]
+fn full_scan_inclusive_matches_serial_large_n() {
+    let n = 100_000usize;
+    let input: Vec<f64> = (0..n).map(|k| 1.0 + ((k % 7) as f64) * 0.1).collect();
+
+    let device = crate::kernels::full_scan(&input, true).unwrap();
+    let baseline = cpu_inclusive_scan(&input);
+
+    assert_eq!(device.len(), n, "scan output length must equal input length");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[full_scan f64 inclusive n={n}] max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= F64_REL_TOL_LARGE,
+        "f64 inclusive two-level scan diverged too far at n={n}: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+/// n = 100_000 exclusive two-level scan vs the inline serial exclusive prefix.
+#[test]
+fn full_scan_exclusive_matches_serial_large_n() {
+    let n = 100_000usize;
+    let input: Vec<f64> = (0..n).map(|k| 1.0 + ((k % 7) as f64) * 0.1).collect();
+
+    let device = crate::kernels::full_scan(&input, false).unwrap();
+    let baseline = cpu_exclusive_scan(&input);
+
+    assert_eq!(device.len(), n);
+    assert!(device[0].abs() <= F64_ABS_TOL_TIGHT, "exclusive scan[0] must be 0.0");
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[full_scan f64 exclusive n={n}] max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= F64_REL_TOL_LARGE,
+        "f64 exclusive two-level scan diverged too far at n={n}: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+/// n = 100_000 f32 two-level inclusive scan vs the f64 baseline (generous f32 bound).
+#[test]
+fn full_scan_inclusive_f32_large_n() {
+    let n = 100_000usize;
+    let input: Vec<f32> = (0..n).map(|k| 1.0 + ((k % 7) as f32) * 0.1).collect();
+
+    let device_f32 = crate::kernels::full_scan(&input, true).unwrap();
+    let device: Vec<f64> = device_f32.iter().map(|&v| f64::from(v)).collect();
+    let input_f64: Vec<f64> = input.iter().map(|&v| f64::from(v)).collect();
+    let baseline = cpu_inclusive_scan(&input_f64);
+
+    assert_eq!(device.len(), n);
+    let (abs, rel) = max_divergence(&device, &baseline);
+    println!("[full_scan f32 inclusive n={n}] max abs_div={abs:.3e} rel_div={rel:.3e}");
+    assert!(
+        rel <= F32_REL_TOL_LARGE,
+        "f32 inclusive two-level scan diverged too far at n={n}: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
 #[test]
 fn block_scan_empty_input_short_circuits() {
     // IN-05: exercise the PRODUCTION empty short-circuit
