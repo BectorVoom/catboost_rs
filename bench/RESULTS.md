@@ -82,3 +82,51 @@ a filled copy of the template above here, then fills the `SPIKE-REDUCTION.md` §
 `err`/`ms` rows for reduce candidates (a)/(b)/(c) from the same run.
 
 Correctness gate: **TBD** · Speed (large n): **TBD**
+
+---
+
+## Phase 11 — depth-6 CUDA sign-off (GPUT-14 / GPUT-06 / BENCH-02)
+
+Phase 11 adds the **depth-6** partition-aware grow loop + Newton der2 leaf estimation. The
+authoritative gate is the depth-6 section of `bench/cuda_oracle.ipynb`, run on Kaggle CUDA.
+The **device bar is ε=1e-4** (standing GPUT-14 bar); the **CPU reference-of-record stays
+≤1e-5** (Plan 01 `expected_depth6_tree.json`, byte-unchanged — D-04). **Correctness is
+BLOCKING before any speed number.** ROCm in-env (Plans 02–04) is smoke-only, **not** the
+gate (in-env gfx1100 already shows structure bit-exact + zero run-to-run spread; Kaggle CUDA
+is the oracle of record).
+
+**All fields below are PENDING the human-gated Kaggle run — do NOT fabricate.** Fill them
+from the notebook's `PHASE 11 DEPTH-6 CUDA STRUCTURED REPORT` cell (correctness first).
+
+```
+### Run YYYY-MM-DD — phase 11 (depth-6), <GPU model>, CUDA <ver>, driver <ver>
+Signed-off-by: <name>
+
+Correctness gate (BLOCKING — device bar 1e-4 vs the Rust CPU path; CPU ref-of-record 1e-5):
+| Oracle (depth-6)                                    | Bar       | Result | max|err| |
+|-----------------------------------------------------|-----------|--------|----------|
+| Gate A: device 1-tree RMSE    vs CPU ref (base-free)| <=1e-4    | TBD    | TBD      |
+| Gate A: device 1-tree Logloss vs CPU ref (base-free)| <=1e-4    | TBD    | TBD      |
+| Gate B: device full-run RMSE    vs cpu-wheel preds  | <=1e-4    | TBD    | TBD      |
+| Gate B: device full-run Logloss vs cpu-wheel preds  | <=1e-4    | TBD    | TBD      |
+| Split-agreement oracle (CUDA grow-loop, per-level)  | exact     | TBD    | —        |
+| Per-tree run-to-run spread (first divergent prefix) | 0 spread  | TBD    | TBD      |
+GATE: TBD (PASS/FAIL)   first divergent tree (if any): TBD
+
+Speed (only if GATE PASSED — depth-6 SPEED_CONFIG ~1e6x50, warm-run/JIT-excluded, train-only):
+| Workload (depth-6, ITERS x n_rows x n_features)     | device (cuda) s | host-CPU s | CatBoost GPU s | device>=CPU? |
+|-----------------------------------------------------|-----------------|------------|----------------|--------------|
+| depth-6 RMSE,    200 x ~1e6 x 50                     | TBD             | TBD        | TBD            | TBD          |
+| depth-6 Logloss, 200 x ~1e6 x 50                     | TBD             | TBD        | TBD            | TBD          |
+Notes: host-CPU is a separate cpu-feature wheel run (compile-time features); CatBoost GPU is
+task_type='GPU' depth=6. Correctness blocks before any speed number is recorded.
+```
+
+### Phase 11 run (pending first Kaggle CUDA execution)
+
+_No authoritative Phase-11 depth-6 Kaggle CUDA run recorded yet._ A human runs the depth-6
+section of `bench/cuda_oracle.ipynb` on Kaggle CUDA, confirms the blocking ε=1e-4 gate for
+RMSE + Logloss and the per-tree diagnostic (no compounding split-flip drift), records the
+depth-6 speed numbers, and pastes a filled copy of the template above here.
+
+Correctness gate (depth-6): **TBD** · Speed (depth-6, large n): **TBD**
