@@ -2470,6 +2470,145 @@ fn grow_oblivious_tree_into(
     })
 }
 
+/// The single closed-form Newton leaf step (GPUT-07 / A1 — `leaf_estimation_iterations = 1`),
+/// TRANSCRIBED INLINE from `cb_compute::leaf::newton_leaf_delta` (leaf.rs:145-154) rather than
+/// imported (the D-7.5-04 boundary — keep cb-backend's cb-compute surface to the already-used
+/// `calc_average`/`scale_l2_reg`). `sum_der` is Σ der1 (channel 0, UNWEIGHTED — the numerator
+/// the RMSE arm also uses); `sum_der2` is Σ(der2·weight) (channel 2, the Newton hessian —
+/// NON-positive). The `denom == 0` guard is the 0/0 empty-leaf case only (never a NaN); every
+/// non-zero denominator divides verbatim. RMSE collapses: der2 = -1 ⇒ sum_der2 = -Σweight ⇒
+/// denom = Σweight + scaled_l2 ⇒ this == `calc_average` exactly (A3 / the Pitfall-2 collapse
+/// check). NO iterative walker, NO backtracking — a single closed-form step (A1/D-02).
+fn newton_leaf_delta(sum_der: f64, sum_der2: f64, scaled_l2: f64) -> f64 {
+    let denom = -sum_der2 + scaled_l2;
+    if denom == 0.0 {
+        0.0
+    } else {
+        sum_der / denom
+    }
+}
+
+/// Public wrapper over [`grow_oblivious_tree_newton_into`]: construct the client ONCE and grow
+/// a depth-`depth` oblivious tree with Newton der2 leaf estimation (GPUT-07 — the Logloss
+/// classification default). See [`grow_oblivious_tree`] for the RMSE (`calc_average`) sibling.
+#[allow(clippy::too_many_arguments)]
+pub fn grow_oblivious_tree_newton(
+    der1: &[f64],
+    der2: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    depth: usize,
+    scaled_l2: f64,
+    score_fn: u32,
+) -> CbResult<GrownTree> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    grow_oblivious_tree_newton_into(
+        &client, der1, der2, weight, cindex, indices, n_bins, n_features, depth, scaled_l2,
+        score_fn,
+    )
+}
+
+/// Grow a depth-`depth` oblivious tree with device-resident **Newton der2 leaf estimation**
+/// (GPUT-07 — the genuinely-new Logloss path; RMSE collapses to `calc_average`, see
+/// [`newton_leaf_delta`]).
+///
+/// The tree STRUCTURE (per-level split sequence + per-object `leaf_of`) is grown by
+/// [`grow_oblivious_tree_into`] — the split scoring is identical (Σ der1 / Σ weight, A2), so the
+/// structure is reused verbatim rather than duplicating the 130-line partition-aware level loop.
+/// Only the LEAF VALUES differ: this re-reduces the per-partition stats with the REAL per-object
+/// `der2` handle (the Phase 7.2 seam contract — [`DerUnaryKernel::LoglossHessian`] `-p(1-p)` for
+/// Logloss), so the Σ(der2·weight) channel-2 carries the true Newton hessian, then computes each
+/// leaf via the inline single-step [`newton_leaf_delta`] (`leaf_estimation_iterations = 1`, A1 —
+/// NO iterative walker / backtracking). The re-reduce is device-resident (`launch_partition_update_into`
+/// over re-uploaded resident handles on the SAME client); only the O(1) BestSplit per level + the
+/// final `2^depth` part-stats + the `leaf_of` cross host<->device (the SAME D-05 crossing class as
+/// the RMSE path).
+///
+/// `der2` (length `n`) is the per-object UNWEIGHTED second derivative (weight is folded in the
+/// reduce, A3). `score_fn` selects the split calcer (forwarded to the structure grow). Errors and
+/// the empty short-circuit mirror [`grow_oblivious_tree_into`]. No `unwrap`/`expect`/`panic`/
+/// indexing (workspace lints + D-13).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grow_oblivious_tree_newton_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: &[f64],
+    der2: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    indices: &[u32],
+    n_bins: usize,
+    n_features: usize,
+    depth: usize,
+    scaled_l2: f64,
+    score_fn: u32,
+) -> CbResult<GrownTree> {
+    let n = der1.len();
+
+    // der2 length must agree with n (the per-object hessian) — surface a typed error rather
+    // than launching a malformed reduce (no panic, D-13).
+    if der2.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "der2".to_owned(),
+            expected: n,
+            actual: der2.len(),
+        });
+    }
+
+    // (1) Grow the tree STRUCTURE (splits + leaf_of) via the shared partition-aware loop. Its
+    //     leaf_values (RMSE `calc_average`) and part_stats (der2 = -1 channel) are DISCARDED —
+    //     only the structure is reused (the split scoring is der2-independent, A2).
+    let structure = grow_oblivious_tree_into(
+        client, der1, weight, cindex, indices, n_bins, n_features, depth, scaled_l2, score_fn,
+    )?;
+
+    // Empty tree (no objects / no candidates): no leaves to estimate — hand back the structure.
+    if structure.splits.is_empty() && structure.leaf_values.is_empty() {
+        return Ok(structure);
+    }
+
+    let n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+
+    // (2) Re-reduce the per-partition stats with the REAL der2 (the Newton hessian channel).
+    //     Re-upload the resident handles on THIS client (Pitfall 3 — the der2 handle MUST be
+    //     bound to the same client as the reduce). leaf_of comes back from the structure grow
+    //     (the SAME D-05 crossing class); re-upload it to key the reduce device-side.
+    let der1_h = upload_channel_floats(client, der1);
+    let weight_h = upload_channel_floats(client, weight);
+    let der2_h = upload_channel_floats(client, der2);
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+    let leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(structure.leaf_of.clone()));
+
+    let part_stats_h = launch_partition_update_into(
+        client, der1_h, weight_h, der2_h, indices_h, leaf_of_h, n, n_leaves,
+    )?;
+    let part_stats = read_part_stats_f64(client, part_stats_h)?;
+
+    // (3) Newton leaf values via the inline single-step closed form (A1): channel 0 = Σder1,
+    //     channel 2 = Σ(der2·weight); leaf = Σder1 / (-Σ(der2·weight) + scaled_l2). Empty-leaf
+    //     denom==0 guard inside `newton_leaf_delta` (never a NaN).
+    let mut leaf_values = vec![0.0_f64; n_leaves];
+    for leaf in 0..n_leaves {
+        let sum_der = part_stats.get(leaf * 3).copied().unwrap_or(0.0);
+        let sum_der2 = part_stats.get(leaf * 3 + 2).copied().unwrap_or(0.0);
+        if let Some(slot) = leaf_values.get_mut(leaf) {
+            *slot = newton_leaf_delta(sum_der, sum_der2, scaled_l2);
+        }
+    }
+
+    Ok(GrownTree {
+        splits: structure.splits,
+        leaf_of: structure.leaf_of,
+        leaf_values,
+        part_stats,
+    })
+}
+
 /// GPUT-03: apply ONE tree's per-leaf delta to the running approx device-resident
 /// (`approx[i] += lr * leaf_values[leaf_of[i]]`) via [`apply_leaf_delta_kernel`], returning
 /// the UPDATED approx handle WITHOUT any n-length read-back. The running approx stays a
