@@ -1,0 +1,26 @@
+{
+  "config": {
+    "n_features": 10,
+    "n_rows": 2000,
+    "seed": 42
+  },
+  "l2": 3.0,
+  "learning_rate": 0.1,
+  "logloss": {
+    "best_bin": 19,
+    "best_border": 0.26687660181161127,
+    "best_feature": 7,
+    "leaf_left": -0.018271604938271607,
+    "leaf_right": 0.026801517067003795,
+    "score": 97.38217914501101
+  },
+  "n_bins": 32,
+  "rmse": {
+    "best_bin": 9,
+    "best_border": -0.45926557977994287,
+    "best_feature": 9,
+    "leaf_left": -0.2678901585751811,
+    "leaf_right": 0.11929475875556704,
+    "score": 6358.60100051832
+  }
+}

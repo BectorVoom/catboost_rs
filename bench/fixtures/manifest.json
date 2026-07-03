@@ -1,0 +1,36 @@
+{
+  "cindex_n_bins": 32,
+  "correctness_config": {
+    "n_features": 10,
+    "n_rows": 2000,
+    "seed": 42
+  },
+  "depth1_l2": 3.0,
+  "depth1_learning_rate": 0.1,
+  "generator": "bench/generator.py",
+  "note": "Only small-n correctness fixtures are committed; the large-n speed workload is regenerated from speed_config on the fly. A changed sha256 means the generator changed -- regenerate and re-review.",
+  "sha256": {
+    "X_small.npy": "b4a402c440c9dd7ac4f8492c958735a623ac0519b76de656f65971a2559ee4aa",
+    "cindex_small.npy": "7e31ef3fab612fedcb8d28ecb2c01c7ba19fb6f4bbfc86d2c939a0a52d6a6a86",
+    "expected_cindex_packed_f0_bits8.npy": "0323db47236d85d914bbc627d57b843264ed9866787bb383f3d4806af0f49d2a",
+    "expected_depth1_tree.json": "d07a67b283827f155dfb2463170ffd83e8816d2ece53013308d96cd86ea6d322",
+    "expected_exclusive_scan.npy": "5a554a10a782497d2383a168197ac7d0d0c3b77ebe01db6bdb09177f0f79834e",
+    "expected_inclusive_scan.npy": "f05a685c8400a292e260ce01dc804372f0ca4ce1b0c5ed18131cf3a65f910427",
+    "expected_reduce_by_key_keys.npy": "13f00e7bb2cd8bd0bb6b10f7f544211f9e1fb916222f247790400a7c4af475ef",
+    "expected_reduce_by_key_vals.npy": "732940335895e1ead97485d0aa31e9441c7e05c00aae027e28943cf2755f5541",
+    "expected_segmented_reduce.npy": "339c56a8724e9f1d41cc1898193e9a4d062c5a09b91c9336e28802245ba869bf",
+    "expected_segmented_scan.npy": "c27c4a27fca5c4d60e06d6ebf9ebfbef19730c6cbf401a40fce5d901c4e1bcc1",
+    "expected_sort_perm.npy": "7392262b72286afa601c035dc5ed5b7b3369856bb935b7372532830e988caf96",
+    "prim_keys.npy": "bf63c21857b14155e43d320917ae017424e0cf0b4e382b018ea1d20f808a67cc",
+    "prim_offsets.npy": "cd53daf51a3ef829bc253b703cd7eb2fa0b1a42070d66c597b8aa0f4e9581133",
+    "prim_seg_heads.npy": "9a68742f323a5570b87c20a6b249e417181be507138a2d7acb1c3e251bb84ec3",
+    "prim_values.npy": "f910d1e523f13bb0e817fa12482be7dbc4f9d513f0b48daf45d820c0627fa653",
+    "y_small_bin.npy": "abf60ad109df3b289a28c604559f73b9a93ccaa0c39ab80a1e184ce35f9befc8",
+    "y_small_reg.npy": "fb35dee617f68514bb3e2d4a90fb996a45b127caa3b0235abfb513359737a84a"
+  },
+  "speed_config": {
+    "n_features": 50,
+    "n_rows": 1000000,
+    "seed": 42
+  }
+}
