@@ -63,6 +63,8 @@ documentation/consistency issues round out the report.
 
 ### CR-01: Device grow path ignores `boost_from_average` — silently drops the model bias
 
+**Status:** FIXED (2026-07-03, commit 8957ed5) — Option (a) conservative CPU fallback: `device_host_eligible` now requires `bias == 0.0`. Regression test `device_declines_nonzero_starting_bias_boost_from_average` added (commit 128002b).
+
 **File:** `crates/cb-train/src/boosting.rs:2925-2938` (the `device_host_eligible` gate) and `crates/cb-backend/src/gpu_runtime/session.rs:213-248` (`GpuTrainSession::begin` — resident `approx_h` always initialized to all-zero)
 
 **Issue:**
@@ -147,6 +149,8 @@ let device_host_eligible = group_spans.is_none()
 ---
 
 ### CR-02: Device grow path always uses the Gradient leaf method — silently ignores `LeafMethod::Newton`
+
+**Status:** FIXED (2026-07-03, commit 1d111ce) — Option (a) conservative CPU fallback: `device_host_eligible` now requires `matches!(params.leaf_method, LeafMethod::Gradient | LeafMethod::Simple)`. Regression test `device_declines_newton_leaf_method_on_covered_loss` added (commit 128002b).
 
 **File:** `crates/cb-train/src/boosting.rs:2925-2938` (`device_host_eligible` — no `leaf_method` check), `crates/cb-backend/src/gpu_runtime/mod.rs:2082-2090` (`grow_oblivious_tree_resident`, always calls `cb_compute::calc_average`), `crates/cb-compute/src/runtime.rs:1012-1026` (`begin_device_training` signature carries no `leaf_method` parameter)
 
