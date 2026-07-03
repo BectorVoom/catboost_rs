@@ -1541,4 +1541,83 @@ mod partition_hist {
             );
         }
     }
+
+    /// GPUT-06 reduction-determinism self-oracle (Phase 11 Plan 03, Task 3): the depth>1
+    /// partition-aware histogram accumulator must produce BIT-IDENTICAL results run to run —
+    /// ZERO run-to-run spread — regardless of atomic-contention ordering. Launch the fill
+    /// `RUNS >= 32` times on the SAME input over the SAME client and assert every decoded cell
+    /// is bit-identical (`to_bits()` equality) across all launches.
+    ///
+    /// This is the in-env evidence for GPUT-06: the LOCKED deterministic fixed-point
+    /// `Atomic<u64>` accumulator (SPIKE-REDUCTION §5b) replaces the depth-1 kernel's naked f64
+    /// `fetch_add` — integer atomic add is exact and commutative, so the merge is
+    /// order-independent. The finalize path is the fixed-point `Atomic<u64>` path by
+    /// construction (the kernel has NO runtime fallback); a backend lacking `Atomic<u64>` add is
+    /// gated OUT host-side here (the explicit `AtomicFinalizePath`-style capability report — a
+    /// downgrade is surfaced as a SKIP, NEVER a silent switch to a non-deterministic path). The
+    /// across-hundreds-of-trees compounding check is discharged by the Kaggle per-tree spread
+    /// diagnostic (Plan 05); this proves the per-accumulator order-independence.
+    #[test]
+    fn partition_hist_reduce_zero_spread() {
+        if !u64_atomic_backend() {
+            println!(
+                "[11-03] SKIP partition_hist_reduce_zero_spread: active backend lacks Atomic<u64> \
+                 add (cpu/wgpu) — the fixed-point deterministic accumulator needs rocm/cuda"
+            );
+            return;
+        }
+
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let per_leaf = n_features * n_bins * CHANNELS;
+        let n = 1000usize;
+        let level = 6u32; // depth-6 slot count (64 partitions) — the maximal-contention case.
+        let n_parts = 1usize << level;
+        let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+
+        // A deterministic, SKEWED leaf_of over the 2^level partitions (unequal slot loads so
+        // atomic contention differs per slot — the worst case for accumulation order).
+        let leaf_of: Vec<u32> = (0..n)
+            .map(|o| ((o * 7 + o / 2 + 1) % n_parts) as u32)
+            .collect();
+
+        let device = <crate::SelectedRuntime as Runtime>::Device::default();
+        let client = <crate::SelectedRuntime as Runtime>::client(&device);
+
+        const RUNS: usize = 32;
+        let expected_len = n_parts * per_leaf;
+        let mut baseline: Option<Vec<f64>> = None;
+        for run in 0..RUNS {
+            let leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(leaf_of.clone()));
+            let hist_h = launch_partition_hist2_into(
+                &client, &der1, &weight, &cindex, &indices, leaf_of_h, n_bins, n_features, level,
+            )
+            .expect("partition_hist2 fill must launch");
+            let decoded = read_fixedpoint_hist_f64(&client, hist_h, expected_len)
+                .expect("read fixed-point hist");
+            assert_eq!(
+                decoded.len(),
+                expected_len,
+                "decoded histogram length must equal n_parts * per_leaf"
+            );
+            match &baseline {
+                None => baseline = Some(decoded),
+                Some(base) => {
+                    for (cell, (&d, &b)) in decoded.iter().zip(base.iter()).enumerate() {
+                        assert!(
+                            d.to_bits() == b.to_bits(),
+                            "GPUT-06 run-to-run SPREAD at run {run} cell {cell}: {d} != baseline \
+                             {b} — the depth>1 accumulator MUST be bit-identical (zero spread)"
+                        );
+                    }
+                }
+            }
+        }
+
+        println!(
+            "[11-03] partition_hist_reduce_zero_spread: {RUNS} launches BIT-IDENTICAL (zero \
+             run-to-run spread) over level={level} ({n_parts} partitions, n={n}) on gfx1100 — \
+             fixed-point Atomic<u64> finalize path (no silent downgrade), GPUT-06 in-env"
+        );
+    }
 }
