@@ -2675,7 +2675,11 @@ pub fn unpack_bins_kernel<F: Float>(
 /// device helper (`#[cube]`, inlined at JIT — mirrors [`unpack_bins_kernel`]).
 #[cube]
 pub(crate) fn read_bin(cindex: &Array<u32>, offset: u32, obj: u32, shift: u32, mask: u32) -> u32 {
-    let word = cindex[(offset + obj) as usize];
+    // IN-01: widen BEFORE adding so `offset + obj` is computed in the `usize` index
+    // domain (matching the `feature * n_bins + bin` cell arithmetic in the histogram
+    // consumers), not in `u32` where the sum could wrap before the cast. Not reachable
+    // today (needs a >4-billion-element `cindex`), but keeps the accessor overflow-safe.
+    let word = cindex[offset as usize + obj as usize];
     (word >> shift) & mask
 }
 
