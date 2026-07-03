@@ -1,8 +1,8 @@
 ---
 phase: 11
 slug: depth-1-partition-aware-histograms-reduction-determinism-new
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-07-03
 ---
@@ -39,16 +39,17 @@ created: 2026-07-03
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 11-01-xx | 01 | 1 | GPUT-05 | — / input-size validation | Host validates buffer sizing before device dispatch (no OOB) | unit (self-oracle) | `cargo test -p cb-backend --features rocm grow_loop` | ❌ W0 (extend `grow_loop.rs` depth>1) | ⬜ pending |
-| 11-01-xx | 01 | 1 | GPUT-05 | — | N/A | unit | `cargo test -p cb-backend --features rocm leaf_of_matches_cpu` | ✅ (depth-1; extend to depth-6) | ⬜ pending |
-| 11-02-xx | 02 | 2 | GPUT-06 | — | N/A | unit | `cargo test -p cb-backend --features rocm reduce` | ✅ (SPIKE-REDUCTION harness) | ⬜ pending |
-| 11-03-xx | 03 | 3 | GPUT-07 | — | N/A | unit | `cargo test -p cb-backend --features rocm newton` | ❌ W0 | ⬜ pending |
-| 11-03-xx | 03 | 3 | GPUT-07 | — | N/A | unit | `cargo test -p cb-compute leaf` | ✅ | ⬜ pending |
-| 11-04-xx | 04 | 4 | GPUT-14 | — | N/A | integration | Kaggle `bench/cuda_oracle.ipynb` (human-gated) | ❌ W0 (extend harness) | ⬜ pending |
-| 11-04-xx | 04 | 4 | GPUT-14 | — | N/A | integration | Kaggle harness per-tree split-agreement + spread diagnostic (D-05) | ❌ W0 | ⬜ pending |
-| 11-04-xx | 04 | 4 | BENCH-02 | — | N/A | benchmark | Kaggle harness speed cell (warm-run/JIT-excluded) → `bench/RESULTS.md` | ❌ W0 | ⬜ pending |
+| 11-01-xx | 01 | 1 | GPUT-05, GPUT-07 | — / input-size validation | Host validates buffer sizing before device dispatch (no OOB) | unit (fixture/oracle) | `cargo test -p cb-compute leaf` (depth-6 fixture + iterations=1 assert) | ❌ W0 (extend synthetic generator to depth-6 RMSE + Logloss) | ⬜ pending |
+| 11-02-xx | 02 | 2 | GPUT-05, GPUT-06 | — | Host validates buffer sizing before device dispatch (no OOB) | unit (self-oracle) | `cargo test -p cb-backend --features rocm grow_loop` (partition-aware hist + subtraction) | ❌ W0 (extend `grow_loop.rs` depth>1) | ⬜ pending |
+| 11-02-xx | 02 | 2 | GPUT-06 | — | N/A | unit | `cargo test -p cb-backend --features rocm reduce` (fixed-point Atomic<u64> accumulator, zero spread) | ✅ (SPIKE-REDUCTION harness) | ⬜ pending |
+| 11-03-xx | 03 | 3 | GPUT-05, GPUT-06 | — | N/A | unit | `cargo test -p cb-backend --features rocm leaf_of_matches_cpu` (depth-6 grow self-oracle + zero run-to-run spread) | ✅ (depth-1; extend to depth-6) | ⬜ pending |
+| 11-04-xx | 04 | 4 | GPUT-07 | — | N/A | unit | `cargo test -p cb-backend --features rocm newton` (Σder2 channel + `newton_leaf_delta` + `apply_leaf_delta`) | ❌ W0 | ⬜ pending |
+| 11-04-xx | 04 | 4 | GPUT-07 | — | N/A | unit | `cargo test -p cb-compute leaf` (`newton_leaf_delta` CPU oracle; RMSE der2=−1 collapse cross-check) | ✅ | ⬜ pending |
+| 11-05-xx | 05 | 5 | GPUT-14 | — | N/A | integration | Kaggle `bench/cuda_oracle.ipynb` — final-prediction ε=1e-4 over full depth-6 run (human-gated) | ❌ W0 (extend harness) | ⬜ pending |
+| 11-05-xx | 05 | 5 | GPUT-14, GPUT-06 | — | N/A | integration | Kaggle harness per-tree split-agreement + run-to-run spread diagnostic (D-05) | ❌ W0 | ⬜ pending |
+| 11-05-xx | 05 | 5 | BENCH-02 | — | N/A | benchmark | Kaggle harness speed cell (warm-run/JIT-excluded) → `bench/RESULTS.md` | ❌ W0 | ⬜ pending |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky. Task IDs are placeholders — the planner assigns concrete IDs.*
+*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky. Task IDs are placeholders — see each PLAN.md for concrete IDs.*
 
 ---
 
@@ -82,7 +83,7 @@ created: 2026-07-03
 - [ ] Sampling continuity: no 3 consecutive tasks without automated verify
 - [ ] Wave 0 covers all MISSING references
 - [ ] No watch-mode flags
-- [ ] Feedback latency < 60s (CPU path)
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] Feedback latency < 60s (CPU path)
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-07-03 (aligned to the committed 5-plan structure 11-01…11-05 after plan-checker review)
