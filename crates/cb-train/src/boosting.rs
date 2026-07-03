@@ -2936,6 +2936,16 @@ fn train_inner<R: Runtime>(
         && params.random_strength == 0.0
         && eval_sets.is_empty()
         && matrix.n_features() > 0
+        // WR-03: the device grow path sums the UNWEIGHTED der (`Σ der1`) into
+        // histogram channel 0 and estimates leaves via `calc_average(Σ der1,
+        // Σ weight, l2)` — object weight enters only the denominator, never the
+        // numerator. That matches the in-repo CPU path (cpu-vs-gpu agree) but NOT
+        // upstream CatBoost's `Σ w·der` (`TBucketStats::SumWeightedDelta`). Until
+        // weighted-der is wired through the histogram/leaf math, a genuinely
+        // weighted pool cannot meet the ≤1e-5 upstream-parity bar, so restrict the
+        // device path to uniform unit weights and let weighted pools fall back to
+        // the CPU grower (D-04).
+        && weights.iter().all(|&w| w == 1.0)
         // CR-01: the device session always seeds its resident approx to zero
         // (`GpuTrainSession::begin`), so a non-zero starting bias — e.g.
         // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must
