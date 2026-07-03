@@ -2091,6 +2091,62 @@ pub fn train_cat<R: Runtime>(
     )
 }
 
+/// Quantize the float design matrix into the device's feature-major cindex
+/// (`bins[feature * n + obj] = #borders the object's value strictly exceeds`) plus
+/// the uniform per-feature bin-line size (`n_bins = max_f(feature_borders[f].len())
+/// + 1`), for the GPUT-01 device grow seam ([`Runtime::begin_device_training`]).
+///
+/// The bin count is exactly the number of ascending borders `value > border`
+/// (the SAME test [`FeatureMatrix::passes_float`] applies), so the device split
+/// `quantized_bin > bin_id` is equivalent to the CPU `value >
+/// feature_borders[feature][bin_id]` — this is the round-trip guarantee behind the
+/// `bin_id -> border` join (Pattern 4) the device tree is folded through. Only the
+/// numeric float columns are quantized (the device path is gated off the cat / CTR
+/// configs). Uses checked `.get` only (no panic / raw index).
+fn quantize_feature_major(
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    n: usize,
+) -> (Vec<u32>, usize) {
+    let n_features = feature_values.len();
+    let mut bins = vec![0u32; n_features * n];
+    let mut n_bins = 0usize;
+    for f in 0..n_features {
+        let borders = feature_borders.get(f).map_or(&[][..], Vec::as_slice);
+        n_bins = n_bins.max(borders.len() + 1);
+        let col = feature_values.get(f).map_or(&[][..], Vec::as_slice);
+        for i in 0..n {
+            let v = col.get(i).copied().map_or(0.0_f64, f64::from);
+            let bin = borders.iter().filter(|&&b| v > b).count() as u32;
+            if let Some(slot) = bins.get_mut(f * n + i) {
+                *slot = bin;
+            }
+        }
+    }
+    (bins, n_bins)
+}
+
+/// RAII teardown for the GPUT-01 device training session (T-10-24): guarantees
+/// [`Runtime::end_device_training`] runs on EVERY exit path from [`train_inner`] —
+/// including the `?` error path — once [`Runtime::begin_device_training`] opened a
+/// session (`active == true`). Releasing the device-resident session is a
+/// best-effort teardown (the backend's `end` drops the session; the CPU default is
+/// a no-op returning `Ok(())`), so a teardown error is swallowed on `Drop` rather
+/// than masking the training result. When no session was opened (`active == false`,
+/// the CPU-fallback path) `Drop` is inert.
+struct DeviceSessionGuard<'r, R: Runtime> {
+    runtime: &'r R,
+    active: bool,
+}
+
+impl<R: Runtime> Drop for DeviceSessionGuard<'_, R> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.runtime.end_device_training();
+        }
+    }
+}
+
 /// The shared boosting loop body for the numeric ([`train_with_eval_sets`]) and
 /// cat-aware ([`train_cat`]) entry points. `cat_columns` is EMPTY for the numeric
 /// path (byte-identical to the pre-05-11 driver); a non-empty `cat_columns`
@@ -2847,7 +2903,188 @@ fn train_inner<R: Runtime>(
     let struct_fold_cycle =
         structure_fold_cycle(params.permutation_count, params.iterations, params.random_seed);
 
+    // ---------------------------------------------------------------------------
+    // GPUT-01 DEVICE GROW SEAM — per-fit all-or-nothing decision (D-10-01). Decide
+    // ONCE, before the tree loop, whether this WHOLE fit runs on the device grower
+    // or the byte-unchanged CPU grower (D-04). Two gates compose:
+    //
+    //   1. Host eligibility (`device_host_eligible`): excludes every config the
+    //      depth-1 device grower does NOT implement and that the backend seam
+    //      cannot see (ranking / ordered / CTR / penalties / monotone / multi-dim /
+    //      sampling / perturbation / eval-set). Those stay on the CPU path.
+    //   2. Backend coverage (`begin_device_training`): the finer gate the backend
+    //      owns (depth==1 / RMSE|Logloss|CrossEntropy / Plain / fold_count==1 /
+    //      supported score fn), returning Ok(false) to decline. On the default
+    //      CpuBackend this is ALWAYS Ok(false), so the CPU grower runs unchanged and
+    //      the per-iteration device branch below is inert (the D-04 invariant the
+    //      `cargo test -p cb-train` suite verifies).
+    //
+    // The decision is made ONCE here (not per tree): Ok(true) commits the whole fit
+    // to the device; a later Ok(None) from a covered fit is a mid-run mix and is
+    // rejected (T-10-23), never silently backfilled with a CPU tree.
+    let device_host_eligible = group_spans.is_none()
+        && ordered_learning_perm.is_none()
+        && materialized_ctr_features.is_empty()
+        && structure_fold_columns.iter().all(Vec::is_empty)
+        && !penalties_active
+        && params.monotone_constraints.is_empty()
+        && params.grow_policy == EGrowPolicy::SymmetricTree
+        && approx_dimension == 1
+        && !is_multiclass
+        && !is_multilabel
+        && matches!(params.bootstrap_type, EBootstrapType::No)
+        && params.random_strength == 0.0
+        && eval_sets.is_empty()
+        && matrix.n_features() > 0;
+
+    // The leaf-regularization is constant across the fit for the device-eligible
+    // config (fixed weights / n, no per-tree sampling), so it is computed ONCE and
+    // handed to `begin`, matching the CPU per-tree
+    // `scale_l2_reg(l2, sumAllWeights, n)`.
+    let device_scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
+    let (device_bins, device_n_bins) = if device_host_eligible {
+        quantize_feature_major(feature_values, feature_borders, n)
+    } else {
+        (Vec::new(), 0)
+    };
+    let device_active = if device_host_eligible && device_n_bins > 0 {
+        runtime.begin_device_training(
+            &params.loss,
+            params.depth,
+            matches!(params.boosting_type, EBoostingType::Plain),
+            /* fold_count = */ 1,
+            params.score_function,
+            &device_bins,
+            &weights,
+            n,
+            matrix.n_features(),
+            device_n_bins,
+            learning_rate,
+            device_scaled_l2,
+        )?
+    } else {
+        false
+    };
+    // Teardown on EVERY exit path (incl. the `?` error path), T-10-24. Inert when
+    // no session was opened (`device_active == false`).
+    let _device_guard = DeviceSessionGuard {
+        runtime,
+        active: device_active,
+    };
+
     for iter in 0..params.iterations {
+        // GPUT-01 DEVICE GROW BRANCH (D-10-01 per-fit all-or-nothing). When the fit
+        // committed to the device path at `begin` (`device_active`), grow THIS
+        // iteration's oblivious tree on the device seam and fold it into the Model
+        // IDENTICALLY to a CPU-grown tree (Task 2: the `bin_id -> border` join). The
+        // entire CPU body below is skipped (`continue`) and stays byte-unchanged for
+        // every non-device fit (D-04). `iter` is unused on this branch (the device
+        // grow is stateless per tree over the resident session); the CPU body reads
+        // it, so it is not a dead binding.
+        if device_active {
+            let _ = iter;
+            let dev_tree = runtime
+                .grow_tree_on_device(&approx, target)?
+                .ok_or_else(|| {
+                    // `begin` returned Ok(true): the whole fit is committed to the
+                    // device grower (D-10-01). Folding a CPU-grown tree here would MIX
+                    // device- and CPU-grown trees in one model (T-10-23) — reject it
+                    // with a typed error rather than silently corrupt the model.
+                    CbError::Degenerate(
+                        "device grow returned Ok(None) after begin_device_training \
+                         committed the fit to the device path; per-fit all-or-nothing \
+                         (D-10-01) forbids mixing a CPU-grown tree into a device-grown \
+                         model"
+                            .to_owned(),
+                    )
+                })?;
+
+            // Resolve each device split `(feature, bin_id)` to a Model `Split` via
+            // `border = feature_borders[feature][bin_id]` (Pattern 4 — the one
+            // non-obvious correctness join). Range-check `bin_id` against the
+            // feature's border count (T-10-22): an out-of-range index is a typed
+            // error, never a panic / raw index. `DeviceGrownTree.leaf_of` is NOT
+            // consumed (D-05 — empty in the production hot path).
+            let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
+            for &(feature, bin_id) in &dev_tree.splits {
+                let f = feature as usize;
+                let b = bin_id as usize;
+                let border = feature_borders
+                    .get(f)
+                    .and_then(|borders| borders.get(b))
+                    .copied()
+                    .ok_or_else(|| {
+                        CbError::OutOfRange(format!(
+                            "device split (feature {f}, bin_id {b}) is out of range for \
+                             feature_borders (feature count {}, feature border count {})",
+                            feature_borders.len(),
+                            feature_borders.get(f).map_or(0, Vec::len),
+                        ))
+                    })?;
+                device_splits.push(Split { feature: f, border });
+            }
+
+            // Per-object leaf assignment on the HOST from the resolved splits (D-05:
+            // the device does NOT cross the seam with an `n`-length `leaf_of`).
+            // This is the SAME `value > border` + forward-bit `leaf_index` the CPU
+            // oblivious path uses, so the folded partition is CPU-identical.
+            let device_leaf_of: Vec<usize> = (0..n)
+                .map(|obj| {
+                    let passes: Vec<bool> = device_splits
+                        .iter()
+                        .map(|s| {
+                            feature_values
+                                .get(s.feature)
+                                .and_then(|col| col.get(obj))
+                                .is_some_and(|&v| f64::from(v) > s.border)
+                        })
+                        .collect();
+                    leaf_index(&passes)
+                })
+                .collect();
+
+            // Leaf values: the device returns UN-scaled leaves (the 10-02 contract);
+            // cb-train applies the `learning_rate` shrinkage. RMSE / Logloss /
+            // CrossEntropy are non-pairwise, so `normalize_leaf_values` applies ONLY
+            // the lr scale (no weighted-mean centering) — byte-identical to the CPU
+            // `learning_rate * delta` store (D-04).
+            let mut device_leaf_values = dev_tree.leaf_values.clone();
+            let device_leaf_weights =
+                accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
+            normalize_leaf_values(
+                /* is_pairwise = */ false,
+                learning_rate,
+                &device_leaf_weights,
+                &mut device_leaf_values,
+                n_leaves,
+                /* approx_dimension = */ 1,
+            );
+
+            // Update approx: `approx[i] += leaf_values[leaf(i)]` (single dimension) —
+            // the SAME per-object accumulation the CPU path applies, so the staged
+            // approximant and the next tree's device derivatives stay CPU-consistent.
+            for (i, &leaf) in device_leaf_of.iter().enumerate() {
+                if let (Some(a), Some(&lv)) =
+                    (approx.get_mut(i), device_leaf_values.get(leaf))
+                {
+                    *a += lv;
+                }
+            }
+
+            // Record the staged approximant (raw value / logit) for this iteration.
+            if let Some(out) = staged_out.as_deref_mut() {
+                out.extend_from_slice(&approx);
+            }
+
+            trees.push(ObliviousTree {
+                splits: device_splits,
+                ctr_splits: Vec::new(),
+                leaf_values: device_leaf_values,
+                leaf_weights: device_leaf_weights,
+            });
+            continue;
+        }
+
         // 0. YetiRank / YetiRankPairwise (Wave C): RE-SAMPLE the per-group
         //    competitor adjacency from the CURRENT approx before the der
         //    (yetirank_helpers.cpp:347-393 — the pairs are recomputed each tree).
