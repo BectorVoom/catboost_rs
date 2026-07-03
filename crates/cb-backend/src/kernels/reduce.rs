@@ -17,7 +17,10 @@
 use cubecl::features::Plane;
 use cubecl::prelude::*;
 
-use crate::kernels::{block_reduce_atomic_kernel, block_reduce_kernel};
+use crate::kernels::{
+    block_reduce_atomic_kernel, block_reduce_kernel, full_scan_into, key_head_flag_kernel,
+    reduce_by_key_kernel, segment_offset_scatter_kernel, segmented_reduce_kernel,
+};
 
 // IN-03: the "generous, run-stable" oracle bounds, hoisted into named consts shared
 // across this module's assertions so the Phase-7.6 epsilon sign-off edits ONE place
@@ -391,4 +394,245 @@ fn block_reduce_atomic_kernel_direct_matches_cpu_sum() {
             "direct atomic-kernel reduce diverged too far (use_plane={use_plane}): abs={max_abs:.3e} rel={max_rel:.3e}"
         );
     }
+}
+
+// ===========================================================================
+// Reduce family self-oracles (GPUT-16, Plan 10-03): segmented-reduce +
+// reduce-by-key. The device output is checked against an INLINE serial CPU
+// reference (D-02 — no cb-train reach, no upstream fixture) baselined via
+// `cb_core::sum_f64` (the single sanctioned ordered reduction — never a naive
+// `.sum()`). Both primitives fold in f64 with a FIXED-ORDER tree reduce, so they
+// are deterministic; the asserted bounds are generous/run-stable (NOT the GPU-06
+// epsilon, which is signed off on Kaggle CUDA via 10-09).
+// ===========================================================================
+
+/// Launch `segmented_reduce_kernel::<F>` (one cube per segment) and read back the
+/// `num_segments` per-segment sums. `seg_offsets` has `num_segments + 1` entries.
+fn run_segmented_reduce<F>(input: &[F], seg_offsets: &[u32]) -> Vec<F>
+where
+    F: Float + CubeElement + bytemuck::Pod,
+{
+    let num_segments = seg_offsets.len() - 1;
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+
+    let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    let off_handle = client.create(cubecl::bytes::Bytes::from_elems(seg_offsets.to_vec()));
+    let out_handle = client.empty(num_segments * std::mem::size_of::<F>());
+
+    segmented_reduce_kernel::launch::<F, crate::SelectedRuntime>(
+        &client,
+        CubeCount::Static(num_segments as u32, 1, 1),
+        CubeDim { x: 32u32, y: 1, z: 1 },
+        unsafe { ArrayArg::from_raw_parts(in_handle, input.len()) },
+        unsafe { ArrayArg::from_raw_parts(off_handle, seg_offsets.len()) },
+        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), num_segments) },
+    );
+
+    let bytes = client.read_one(out_handle).unwrap();
+    bytemuck::cast_slice::<u8, F>(&bytes).to_vec()
+}
+
+/// Inline serial per-segment sum reference (D-02): each segment folded through
+/// `cb_core::sum_f64` in ascending order — the frozen host reduction.
+fn cpu_segmented_reduce(input: &[f64], seg_offsets: &[u32]) -> Vec<f64> {
+    (0..seg_offsets.len() - 1)
+        .map(|s| {
+            let a = seg_offsets[s] as usize;
+            let b = seg_offsets[s + 1] as usize;
+            cb_core::sum_f64(&input[a..b])
+        })
+        .collect()
+}
+
+/// Launch the on-device reduce-by-key pipeline: `key_head_flag_kernel` (phase 1) →
+/// exclusive `full_scan_into` of the flags (phase 2, the 10-01 scan reused for
+/// key-run detection) → `segment_offset_scatter_kernel` (phase 3, heads write their
+/// start into `seg_offsets`) → `reduce_by_key_kernel` (one cube per run). Returns the
+/// compacted `(keys, sums)` in key-run order. `num_segments` (a scalar count) is
+/// derived host-side; the boundary POSITIONS and the sums are computed on-device.
+fn run_reduce_by_key<F>(keys: &[u32], values: &[F]) -> (Vec<u32>, Vec<F>)
+where
+    F: Float + CubeElement + bytemuck::Pod,
+{
+    let n = keys.len();
+    assert_eq!(n, values.len(), "keys/values length mismatch");
+
+    // Distinct-key-run count (scalar; the positions are scattered on-device below).
+    let mut num_segments = 0usize;
+    for i in 0..n {
+        if i == 0 || keys[i] != keys[i - 1] {
+            num_segments += 1;
+        }
+    }
+
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+    let dim32 = CubeDim { x: 32u32, y: 1, z: 1 };
+    let n_cubes = n.div_ceil(32usize).max(1);
+
+    let keys_h = client.create(cubecl::bytes::Bytes::from_elems(keys.to_vec()));
+    let values_h = client.create(cubecl::bytes::Bytes::from_elems(values.to_vec()));
+
+    // Phase 1: key-head flags.
+    let flags_h = client.empty(n * std::mem::size_of::<F>());
+    key_head_flag_kernel::launch::<F, crate::SelectedRuntime>(
+        &client,
+        CubeCount::Static(n_cubes as u32, 1, 1),
+        dim32,
+        unsafe { ArrayArg::from_raw_parts(keys_h.clone(), n) },
+        unsafe { ArrayArg::from_raw_parts(flags_h.clone(), n) },
+    );
+
+    // Phase 2: exclusive scan of the flags → per-element segment index (10-01 reuse,
+    // device-resident — `flags_h` is cloned since `full_scan_into` consumes its input).
+    let seg_ids_h = full_scan_into::<F>(&client, flags_h.clone(), n, false).unwrap();
+
+    // Phase 3: scatter each head's position into `seg_offsets[seg_id]`. Init every slot
+    // to `n` so the trailing slot `[num_segments]` is `n`; heads overwrite `[0..num_segments]`.
+    let seg_offsets_h =
+        client.create(cubecl::bytes::Bytes::from_elems(vec![n as u32; num_segments + 1]));
+    segment_offset_scatter_kernel::launch::<F, crate::SelectedRuntime>(
+        &client,
+        CubeCount::Static(n_cubes as u32, 1, 1),
+        dim32,
+        unsafe { ArrayArg::from_raw_parts(flags_h, n) },
+        unsafe { ArrayArg::from_raw_parts(seg_ids_h, n) },
+        unsafe { ArrayArg::from_raw_parts(seg_offsets_h.clone(), num_segments + 1) },
+    );
+
+    // Phase 4: per-run key + f64 sum (one cube per run).
+    let out_keys_h = client.empty(num_segments * std::mem::size_of::<u32>());
+    let out_sums_h = client.empty(num_segments * std::mem::size_of::<F>());
+    reduce_by_key_kernel::launch::<F, crate::SelectedRuntime>(
+        &client,
+        CubeCount::Static(num_segments as u32, 1, 1),
+        dim32,
+        unsafe { ArrayArg::from_raw_parts(keys_h, n) },
+        unsafe { ArrayArg::from_raw_parts(values_h, n) },
+        unsafe { ArrayArg::from_raw_parts(seg_offsets_h, num_segments + 1) },
+        unsafe { ArrayArg::from_raw_parts(out_keys_h.clone(), num_segments) },
+        unsafe { ArrayArg::from_raw_parts(out_sums_h.clone(), num_segments) },
+    );
+
+    let keys_bytes = client.read_one(out_keys_h).unwrap();
+    let sums_bytes = client.read_one(out_sums_h).unwrap();
+    (
+        bytemuck::cast_slice::<u8, u32>(&keys_bytes).to_vec(),
+        bytemuck::cast_slice::<u8, F>(&sums_bytes).to_vec(),
+    )
+}
+
+/// Inline serial reduce-by-key reference (D-02): walk contiguous equal-key runs,
+/// summing each run's values through `cb_core::sum_f64` in ascending order.
+fn cpu_reduce_by_key(keys: &[u32], values: &[f64]) -> (Vec<u32>, Vec<f64>) {
+    let mut out_keys = Vec::new();
+    let mut out_sums = Vec::new();
+    let mut i = 0usize;
+    while i < keys.len() {
+        let k = keys[i];
+        let start = i;
+        while i < keys.len() && keys[i] == k {
+            i += 1;
+        }
+        out_keys.push(k);
+        out_sums.push(cb_core::sum_f64(&values[start..i]));
+    }
+    (out_keys, out_sums)
+}
+
+#[test]
+fn segmented_reduce_matches_serial() {
+    // Behaviour example (plan): values [1,2,3,4] with segment offsets {0,2,4} → [3, 7].
+    {
+        let input = vec![1.0_f64, 2.0, 3.0, 4.0];
+        let offsets = vec![0u32, 2, 4];
+        let dev = run_segmented_reduce(&input, &offsets);
+        assert_eq!(dev, vec![3.0_f64, 7.0], "behaviour example [3,7] mismatch");
+    }
+
+    // Larger, varied-size segments (several > CUBE_DIM=32 so the grid-stride intra-segment
+    // fold is exercised) in both f32 and f64.
+    let seg_sizes = [1usize, 5, 32, 33, 64, 100, 7, 50];
+    let mut offsets: Vec<u32> = vec![0];
+    let mut acc = 0u32;
+    for &sz in &seg_sizes {
+        acc += sz as u32;
+        offsets.push(acc);
+    }
+    let n = acc as usize;
+    let input_f64: Vec<f64> = (0..n).map(|k| ((k % 19) as f64) - 9.0 + 0.125 * (k as f64)).collect();
+    let input_f32: Vec<f32> = input_f64.iter().map(|&v| v as f32).collect();
+    let expected = cpu_segmented_reduce(&input_f64, &offsets);
+
+    let dev_f64 = run_segmented_reduce(&input_f64, &offsets);
+    for (s, (&d, &e)) in dev_f64.iter().zip(expected.iter()).enumerate() {
+        let abs = (d - e).abs();
+        let rel = if e.abs() > 0.0 { abs / e.abs() } else { abs };
+        assert!(
+            rel <= F64_REL_TOL || abs <= F64_ABS_TOL_LARGE_N,
+            "segmented-reduce f64 seg {s} diverged: dev={d} exp={e} abs={abs:.3e}"
+        );
+    }
+
+    let dev_f32 = run_segmented_reduce(&input_f32, &offsets);
+    for (s, (&d, &e)) in dev_f32.iter().zip(expected.iter()).enumerate() {
+        let abs = (f64::from(d) - e).abs();
+        let rel = if e.abs() > 0.0 { abs / e.abs() } else { abs };
+        assert!(
+            rel <= F32_REL_TOL || abs <= F32_ABS_TOL,
+            "segmented-reduce f32 seg {s} diverged: dev={d} exp={e} abs={abs:.3e}"
+        );
+    }
+    println!("[segmented-reduce] {} segments, n={n} — f32+f64 match serial", seg_sizes.len());
+}
+
+#[test]
+fn reduce_by_key_matches_serial() {
+    // Behaviour example (plan): keys [a,a,b,b,b] values [1,1,1,1,1] → keys [a,b] sums [2,3].
+    {
+        let keys = vec![7u32, 7, 3, 3, 3];
+        let values = vec![1.0_f64; 5];
+        let (dk, ds) = run_reduce_by_key(&keys, &values);
+        assert_eq!(dk, vec![7u32, 3], "behaviour example keys [a,b] mismatch");
+        assert_eq!(ds, vec![2.0_f64, 3.0], "behaviour example sums [2,3] mismatch");
+    }
+
+    // Larger multi-run case with runs longer than CUBE_DIM and mixed magnitudes (f64+f32).
+    let run_spec: [(u32, usize); 6] = [(10, 40), (20, 1), (30, 65), (10, 5), (40, 33), (55, 12)];
+    let mut keys: Vec<u32> = Vec::new();
+    let mut values_f64: Vec<f64> = Vec::new();
+    let mut ctr = 0usize;
+    for &(k, len) in &run_spec {
+        for _ in 0..len {
+            keys.push(k);
+            values_f64.push(((ctr % 13) as f64) - 6.0 + 0.25 * (ctr as f64));
+            ctr += 1;
+        }
+    }
+    let values_f32: Vec<f32> = values_f64.iter().map(|&v| v as f32).collect();
+    let (exp_keys, exp_sums) = cpu_reduce_by_key(&keys, &values_f64);
+
+    let (dk64, ds64) = run_reduce_by_key(&keys, &values_f64);
+    assert_eq!(dk64, exp_keys, "reduce-by-key f64 keys mismatch");
+    for (s, (&d, &e)) in ds64.iter().zip(exp_sums.iter()).enumerate() {
+        let abs = (d - e).abs();
+        let rel = if e.abs() > 0.0 { abs / e.abs() } else { abs };
+        assert!(
+            rel <= F64_REL_TOL || abs <= F64_ABS_TOL_LARGE_N,
+            "reduce-by-key f64 run {s} diverged: dev={d} exp={e} abs={abs:.3e}"
+        );
+    }
+
+    let (dk32, ds32) = run_reduce_by_key(&keys, &values_f32);
+    assert_eq!(dk32, exp_keys, "reduce-by-key f32 keys mismatch");
+    for (s, (&d, &e)) in ds32.iter().zip(exp_sums.iter()).enumerate() {
+        let abs = (f64::from(d) - e).abs();
+        let rel = if e.abs() > 0.0 { abs / e.abs() } else { abs };
+        assert!(
+            rel <= F32_REL_TOL || abs <= F32_ABS_TOL,
+            "reduce-by-key f32 run {s} diverged: dev={d} exp={e} abs={abs:.3e}"
+        );
+    }
+    println!("[reduce-by-key] {} runs — f32+f64 keys+sums match serial", run_spec.len());
 }

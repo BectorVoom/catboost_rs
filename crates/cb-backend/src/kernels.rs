@@ -1824,7 +1824,11 @@ pub fn add_block_offset_kernel<F: Float>(data: &mut Array<F>, block_offsets: &Ar
 ///
 /// No `unwrap`/`expect`/`panic`/host indexing (workspace lints + D-13): a device
 /// read-back failure only surfaces at the top-level [`full_scan`].
-fn full_scan_into<F>(
+///
+/// `pub(crate)` so the reduce-by-key launcher (`kernels/reduce.rs`, Plan 10-03) can
+/// reuse this two-level exclusive scan for on-device key-run detection (flags →
+/// per-element segment index) without a host round-trip through [`full_scan`].
+pub(crate) fn full_scan_into<F>(
     client: &cubecl::client::ComputeClient<crate::SelectedRuntime>,
     in_handle: Handle,
     n: usize,
@@ -2005,6 +2009,181 @@ pub fn segmented_scan_kernel<F: Float>(
 
     if ABSOLUTE_POS < n {
         output[ABSOLUTE_POS] = result;
+    }
+}
+
+// ===========================================================================
+// Reduce family (GPUT-16, Plan 10-03): segmented-reduce + reduce-by-key.
+// ---------------------------------------------------------------------------
+// Upstream analog: `catboost/cuda/cuda_util/kernel/reduce.cu`
+// `SegmentedReduce*PerSegment` (one block per segment, `meanSize<600` fast path)
+// and `ReduceByKey`. Structural analog in-tree: `block_reduce_kernel` (intra-cube
+// fold) + `block_scan_total_kernel`/`full_scan` (the 10-01 flag scan reused for
+// key-run detection). Every partial is accumulated in **f64** regardless of the
+// channel float type `F` (bounds float error — mirrors upstream `update_part_props`
+// `M=8` double re-accumulate; RESEARCH §Reduction), and the per-segment fold is a
+// FIXED-ORDER shared-memory tree reduce, so both primitives are DETERMINISTIC
+// (zero run-to-run spread) with no float atomics. Serial CPU self-oracles live in
+// `kernels/reduce.rs` (source/test separation).
+// ===========================================================================
+
+/// Segmented reduce (GPUT-16, Plan 10-03; upstream `SegmentedReducePerSegment`). One
+/// cube per segment: cube `CUBE_POS` sums `input[seg_offsets[CUBE_POS] ..
+/// seg_offsets[CUBE_POS + 1])` into `output[CUBE_POS]`. `seg_offsets` has
+/// `num_segments + 1` entries (the classic exclusive-prefix boundary array produced
+/// by the 10-01 scan / partitions primitives). An empty segment (`start == end`)
+/// yields `0`.
+///
+/// Accumulation is in **f64** regardless of `F` (each lane widens `input[i]` via
+/// `f64::cast_from` before folding); the intra-segment fold is a FIXED-ORDER
+/// `CUBE_DIM_X`-strided shared-memory tree reduce (deterministic — a fixed pairing,
+/// no atomics), then the f64 result is narrowed back to `F` for `output`.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float; integer offsets are `u32`).
+/// Every device access is under a bounds guard (T-10-01); no `-inf` literal
+/// (T-10-08); the `SharedMemory::new` SIZE is the comptime [`BLOCK_REDUCE_SHMEM`]
+/// const (Pitfall 3); the reduce stride derives from `CUBE_DIM_X`, never a literal
+/// wave width (D-09). if-as-STATEMENT only.
+#[cube(launch)]
+pub fn segmented_reduce_kernel<F: Float>(
+    input: &Array<F>,
+    seg_offsets: &Array<u32>,
+    output: &mut Array<F>,
+) {
+    let tid = UNIT_POS;
+    let seg = CUBE_POS;
+
+    // Segment bounds [start, end). `seg_offsets` has num_segments+1 entries, so
+    // reading `seg + 1` is in-bounds for every launched cube (CUBE_POS < num_segments).
+    let start = seg_offsets[seg];
+    let end = seg_offsets[seg + 1usize];
+
+    // Each lane folds a CUBE_DIM_X-strided slice of the segment in f64.
+    let mut acc = 0.0f64;
+    let mut i = start + tid;
+    while i < end {
+        acc += f64::cast_from(input[i as usize]);
+        i += CUBE_DIM_X;
+    }
+
+    // Fixed-order f64 shared-mem tree reduce (deterministic; stride from CUBE_DIM_X).
+    let mut shared = SharedMemory::<f64>::new(BLOCK_REDUCE_SHMEM);
+    shared[tid as usize] = acc;
+    sync_cube();
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let v = shared[(tid + s) as usize];
+            shared[tid as usize] += v;
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+    if tid == 0u32 {
+        output[seg] = F::cast_from(shared[0usize]);
+    }
+}
+
+/// Key-head flag kernel (reduce-by-key phase 1): `flags[i] = 1.0` iff element `i`
+/// STARTS a new key run (`i == 0` or `keys[i] != keys[i-1]`), else `0.0`. Feeds the
+/// 10-01 exclusive [`full_scan`] (phase 2) whose result is the segment index per
+/// element. Flags are exactly `0.0`/`1.0` (assigned, never accumulated), so the
+/// downstream `> 0.5` head test is exact. Generic over `F: Float` (the scan channel);
+/// keys are `u32`. One write per lane, bounds-guarded; no `-inf` literal.
+#[cube(launch)]
+pub fn key_head_flag_kernel<F: Float>(keys: &Array<u32>, flags: &mut Array<F>) {
+    let i = ABSOLUTE_POS;
+    if i < keys.len() {
+        let mut head = F::new(0.0);
+        if i == 0usize {
+            head = F::new(1.0);
+        } else {
+            if keys[i] != keys[i - 1usize] {
+                head = F::new(1.0);
+            }
+        }
+        flags[i] = head;
+    }
+}
+
+/// Segment-offset scatter kernel (reduce-by-key phase 3): every key-run HEAD writes
+/// its start position into `seg_offsets[seg_id]`, where `seg_id` is the exclusive
+/// flag-scan value at that head (its distinct-key index). Each head owns a distinct
+/// `seg_id`, so the writes never collide — deterministic. The trailing slot
+/// `seg_offsets[num_segments] = n` is host-initialized (see `kernels/reduce.rs`).
+/// `seg_ids` values are exact small integers held in `F` (sums of `0.0`/`1.0`), so
+/// `u32::cast_from` is exact. One write per lane, bounds-guarded; no `-inf` literal.
+#[cube(launch)]
+pub fn segment_offset_scatter_kernel<F: Float>(
+    flags: &Array<F>,
+    seg_ids: &Array<F>,
+    seg_offsets: &mut Array<u32>,
+) {
+    let i = ABSOLUTE_POS;
+    if i < flags.len() {
+        if flags[i] > F::new(0.5) {
+            let seg = u32::cast_from(seg_ids[i]);
+            seg_offsets[seg as usize] = i as u32;
+        }
+    }
+}
+
+/// reduce-by-key (GPUT-16, Plan 10-03; upstream `ReduceByKey`). Given `keys` sorted so
+/// equal keys form contiguous RUNS, plus the per-run `seg_offsets` derived on-device by
+/// [`key_head_flag_kernel`] -> exclusive [`full_scan`] -> [`segment_offset_scatter_kernel`],
+/// this emits one `(out_keys[seg], out_sums[seg])` per distinct key: `out_keys[seg]` is
+/// the run's key and `out_sums[seg]` is the f64 sum of its `values`.
+///
+/// Structurally identical fold to [`segmented_reduce_kernel`] (one cube per run, f64
+/// accumulation, fixed-order shared-mem tree reduce — DETERMINISTIC), but it ALSO writes
+/// the representative key so the result is a compacted key/sum pair list. Accumulation is
+/// in f64 regardless of `F`; the sum is narrowed to `F` on write.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float); keys/offsets are `u32`. Bounds-
+/// guarded (T-10-01); no `-inf` literal (T-10-08); `SharedMemory` SIZE is the comptime
+/// [`BLOCK_REDUCE_SHMEM`] const (Pitfall 3); reduce stride from `CUBE_DIM_X` (D-09).
+#[cube(launch)]
+pub fn reduce_by_key_kernel<F: Float>(
+    keys: &Array<u32>,
+    values: &Array<F>,
+    seg_offsets: &Array<u32>,
+    out_keys: &mut Array<u32>,
+    out_sums: &mut Array<F>,
+) {
+    let tid = UNIT_POS;
+    let seg = CUBE_POS;
+
+    let start = seg_offsets[seg];
+    let end = seg_offsets[seg + 1usize];
+
+    // Representative key of the run (its first element; runs are non-empty by
+    // construction — a head always has at least itself).
+    if tid == 0u32 {
+        out_keys[seg] = keys[start as usize];
+    }
+
+    // f64 fold of the run's values, CUBE_DIM_X-strided.
+    let mut acc = 0.0f64;
+    let mut i = start + tid;
+    while i < end {
+        acc += f64::cast_from(values[i as usize]);
+        i += CUBE_DIM_X;
+    }
+
+    let mut shared = SharedMemory::<f64>::new(BLOCK_REDUCE_SHMEM);
+    shared[tid as usize] = acc;
+    sync_cube();
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let v = shared[(tid + s) as usize];
+            shared[tid as usize] += v;
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+    if tid == 0u32 {
+        out_sums[seg] = F::cast_from(shared[0usize]);
     }
 }
 
