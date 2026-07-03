@@ -2611,6 +2611,74 @@ pub fn unpack_bins_kernel<F: Float>(
     }
 }
 
+// ===========================================================================
+// Plan 10-05 (GPUT-16): per-partition stat aggregation (`update_part_props`, upstream
+// `update_part_props.cu` `ComputeSum -> FastInBlockReduce -> SaveResults`,
+// CATBOOST_CUDA_KERNELS_DESIGN §6.1). Sums a stat channel (e.g. Σder1, Σweight) per
+// partition into the `2^depth` partition totals the depth-1 leaf-value step reads back.
+// It REUSES the 10-03 deterministic reduce winner: one cube per partition, f64
+// accumulation (upstream `M=8` double re-accumulate), fixed-order shared-memory tree
+// reduce (no float atomics ⇒ zero run-to-run spread, T-10-13). The ordered serial
+// self-oracle lives in `kernels/update_part_props.rs`.
+// ===========================================================================
+
+/// `update_part_props` (GPUT-16, Plan 10-05). Given `stat` laid out in partition-sorted
+/// object order and `part_offsets` (the `num_parts + 1` contiguous partition boundary
+/// array the 10-04 `update_partition_offsets`/`_sizes` primitives produce), cube
+/// `CUBE_POS` sums `stat[part_offsets[CUBE_POS] .. part_offsets[CUBE_POS + 1])` into
+/// `part_props[CUBE_POS]` — the per-partition Σstat. An empty partition (`start == end`)
+/// yields `0`.
+///
+/// This is the same DETERMINISTIC fold shipped by [`segmented_reduce_kernel`] (10-03
+/// winner): each lane widens `stat[i]` to **f64** (regardless of `F`) and folds a
+/// `CUBE_DIM_X`-strided slice, then a FIXED-ORDER shared-mem tree reduce (deterministic —
+/// fixed pairing, no atomics) combines the lanes; the f64 total is narrowed back to `F`
+/// for `part_props`. `SaveResults` writes the `2^depth` totals.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float; offsets are `u32`). Every device
+/// access is under a bounds guard (T-10-01); no `-inf` literal (T-10-14); `SharedMemory`
+/// SIZE is the comptime [`BLOCK_REDUCE_SHMEM`] const (Pitfall 3); the reduce stride
+/// derives from `CUBE_DIM_X`, never a literal wave width (D-09). if-as-STATEMENT only.
+#[cube(launch)]
+pub fn update_part_props_kernel<F: Float>(
+    stat: &Array<F>,
+    part_offsets: &Array<u32>,
+    part_props: &mut Array<F>,
+) {
+    let tid = UNIT_POS;
+    let part = CUBE_POS;
+
+    // Partition bounds [start, end). `part_offsets` has num_parts+1 entries, so reading
+    // `part + 1` is in-bounds for every launched cube (CUBE_POS < num_parts).
+    let start = part_offsets[part];
+    let end = part_offsets[part + 1usize];
+
+    // Each lane folds a CUBE_DIM_X-strided slice of the partition in f64.
+    let mut acc = 0.0f64;
+    let mut i = start + tid;
+    while i < end {
+        acc += f64::cast_from(stat[i as usize]);
+        i += CUBE_DIM_X;
+    }
+
+    // Fixed-order f64 shared-mem tree reduce (deterministic; stride from CUBE_DIM_X).
+    let mut shared = SharedMemory::<f64>::new(BLOCK_REDUCE_SHMEM);
+    shared[tid as usize] = acc;
+    sync_cube();
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let v = shared[(tid + s) as usize];
+            shared[tid as usize] += v;
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+    if tid == 0u32 {
+        part_props[part] = F::cast_from(shared[0usize]);
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -2676,6 +2744,15 @@ mod fill_transform;
 // builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod compression;
+
+// Per-partition stat aggregation oracle (source/test separation, Plan 10-05 GPUT-16):
+// the `update_part_props` per-partition Σstat self-oracle vs an inline ordered serial
+// per-partition sum (D-02, `cb_core::sum_f64` in ascending object order, every partition
+// id asserted in range) lives in `kernels/update_part_props.rs`, mounted at
+// `kernels::update_part_props`. Runs over the generic `SelectedRuntime`, so it
+// builds/runs under EVERY backend.
+#[cfg(test)]
+mod update_part_props;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
