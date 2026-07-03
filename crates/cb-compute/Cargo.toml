@@ -13,3 +13,9 @@ workspace = true
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.
 cb-core = { path = "../cb-core" }
 cb-data = { path = "../cb-data" }
+
+[dev-dependencies]
+# Test-only JSON reader for the depth-6 cross-check fixture (Plan 11-01 Task 2).
+# NOT a runtime dependency — cb-compute stays cubecl-free / anyhow-free (D-03/D-14);
+# dev-deps do not leak into the pure-generic production boundary.
+serde_json = { workspace = true }

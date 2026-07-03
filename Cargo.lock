@@ -650,6 +650,7 @@ version = "0.1.0"
 dependencies = [
  "cb-core",
  "cb-data",
+ "serde_json",
 ]
 
 [[package]]
