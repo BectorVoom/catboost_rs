@@ -2243,6 +2243,76 @@ pub fn block_reduce_fixedpoint_kernel<F: Float>(input: &Array<F>, acc: &Array<At
     }
 }
 
+// ===========================================================================
+// Plan 10-04 (GPUT-16): sort / reorder primitives — the stable single-bit reorder
+// (`reorder_one_bit`) and the LSD radix sort composed from it (upstream
+// `cuda_util/kernel/sort`, CATBOOST_CUDA_KERNELS_DESIGN §6.1/§6.2). Both consume the
+// 10-01 exclusive `full_scan` primitive; the self-oracles live in `kernels/sort.rs`.
+// ===========================================================================
+
+/// reorder_one_bit phase A: extract bit `bit` of each `u32` key into a `0.0`/`1.0`
+/// float flag (the additive-scan channel). `flags[i] = 1.0` iff `((keys[i]>>bit)&1) ==
+/// 1`, else `0.0`. The exact `0.0`/`1.0` values (assigned by branch, never
+/// accumulated) feed the 10-01 exclusive [`full_scan`] so the downstream
+/// `onesBefore[i]` prefix is exact for every `n <= 2^53`.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float; keys are `u32`, the runtime
+/// `bit` selector is `u32`). One write per lane, bounds-guarded (T-10-09); no `-inf`
+/// literal (T-10-10); if-as-STATEMENT only.
+#[cube(launch)]
+pub fn radix_bit_flag_kernel<F: Float>(keys: &Array<u32>, flags: &mut Array<F>, bit: u32) {
+    let i = ABSOLUTE_POS;
+    if i < keys.len() {
+        // Branch-assign the exact float flag (avoid a u32->F numeric cast).
+        let mut f = F::new(0.0);
+        if (keys[i] >> bit) & 1u32 == 1u32 {
+            f = F::new(1.0);
+        }
+        flags[i] = f;
+    }
+}
+
+/// reorder_one_bit phase C: the STABLE single-bit scatter (upstream `reorder_one_bit`,
+/// CATBOOST_CUDA_KERNELS_DESIGN §6.1). Given the current `keys` (+ paired `values`) and
+/// `ones_before` = the EXCLUSIVE scan of the bit flags (`ones_before[i]` = count of
+/// keys with `bit==1` strictly before `i`), each element is scattered to
+///
+/// ```text
+/// pos = (bit==0) ? zeroesBefore[i]              // = i - ones_before[i]
+///                : total_zeros + ones_before[i]
+/// ```
+///
+/// Zeros keep their relative order at the front, ones keep theirs after the last zero —
+/// STABLE within each group. `total_zeros` (the count of keys with `bit==0`) is passed
+/// as a runtime scalar; it is order-invariant, so the host computes it once per pass.
+/// Each source index maps to a DISTINCT destination, so the scatter is
+/// order-independent (no cross-lane `+=`; T-10-09).
+///
+/// Generic over `F: Float` (the scan channel); keys/values/positions are `u32`. Every
+/// device access is under a bounds guard (T-10-09); no `-inf` literal (T-10-10).
+#[cube(launch)]
+pub fn reorder_one_bit_scatter_kernel<F: Float>(
+    keys: &Array<u32>,
+    values: &Array<u32>,
+    ones_before: &Array<F>,
+    out_keys: &mut Array<u32>,
+    out_values: &mut Array<u32>,
+    bit: u32,
+    total_zeros: u32,
+) {
+    let i = ABSOLUTE_POS;
+    if i < keys.len() {
+        let ones_b = u32::cast_from(ones_before[i]);
+        // zeroesBefore[i] = i - ones_before[i] (exactly i-onesBefore zeros precede i).
+        let mut pos = (i as u32) - ones_b;
+        if (keys[i] >> bit) & 1u32 == 1u32 {
+            pos = total_zeros + ones_b;
+        }
+        out_keys[pos as usize] = keys[i];
+        out_values[pos as usize] = values[i];
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -2275,6 +2345,14 @@ mod scan;
 // builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod segmented_scan;
+
+// Sort/reorder primitive oracle (source/test separation, Plan 10-04 GPUT-16): the
+// stable single-bit reorder + LSD radix sort self-oracle vs inline serial stable
+// partition-by-bit / stable sort references (D-02) lives in `kernels/sort.rs`, mounted
+// at `kernels::sort`. Runs over the generic `SelectedRuntime`, so it builds/runs under
+// EVERY backend (the rocm in-env oracle + wgpu host run).
+#[cfg(test)]
+mod sort;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
