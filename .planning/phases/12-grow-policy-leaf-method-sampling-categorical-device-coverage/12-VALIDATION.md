@@ -1,10 +1,11 @@
 ---
 phase: 12
 slug: grow-policy-leaf-method-sampling-categorical-device-coverage
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-07-03
+approved: 2026-07-03
 ---
 
 # Phase 12 — Validation Strategy
@@ -74,11 +75,11 @@ created: 2026-07-03
 
 ## Validation Sign-Off
 
-- [ ] All tasks have a CPU self-oracle `<automated>` verify or a Wave 0 fixture dependency
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references (per-family frozen fixtures + CPU Region oracle)
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 180s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have a CPU self-oracle `<automated>` verify or a Wave 0 fixture dependency
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (per-family frozen fixtures + CPU Region oracle)
+- [x] No watch-mode flags
+- [x] Feedback latency < 180s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-07-03

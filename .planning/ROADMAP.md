@@ -144,14 +144,37 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 **Plans**: 9 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 12-01-PLAN.md — Device foundation: DeviceGrownTree non-sym fields + DeviceTrainConfig + session depth>1 relaxation (A3) (GPUT-18, Wave 1)
 - [ ] 12-02-PLAN.md — CPU Region path FIRST: grower + TreeVariant::Region + apply + json + validate_grow_policy lift + frozen ≤1e-5 oracle (GPUT-18, Wave 1)
-- [ ] 12-03-PLAN.md — W1 Depthwise/Lossguide device emission (nonsym_grow) + self-oracle + gate arm (GPUT-18, Wave 2)
-- [ ] 12-04-PLAN.md — W2b device Region path vs frozen CPU Region oracle + gate arm (GPUT-18, Wave 3)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 12-03-PLAN.md — W1 Depthwise/Lossguide device emission (nonsym_grow) + boosting.rs device-fold non-sym arm (NonSymmetricTree) + self-oracle + gate arm + end-to-end fit oracle (GPUT-18, Wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 12-04-PLAN.md — W2b device Region path + boosting.rs device-fold Region arm (RegionTree) vs frozen CPU Region oracle + gate arm + end-to-end fit oracle (GPUT-18, Wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 12-05-PLAN.md — W3 Exact weighted-quantile leaf + segmented-sort primitive (A1) + gate arm (GPUT-19, Wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 12-06-PLAN.md — W4 bootstrap + random-strength device RNG (pin-seed/freeze) + gate arm (GPUT-09, Wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 12-07-PLAN.md — W5 MVS per-block threshold + reweight (default GPU sampler) + gate arm (GPUT-17, Wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 12-08-PLAN.md — W6 CTR device port (ordered/one-hot/tensor) + CTR→cindex join + gate arm (GPUT-10, Wave 7)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
 - [ ] 12-09-PLAN.md — Kaggle CUDA ε=1e-4 sign-off + per-family BENCH-02 + SC-5 coverage matrix (human-gated, Wave 8)
 
 **UI hint**: no

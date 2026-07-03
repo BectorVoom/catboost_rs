@@ -320,22 +320,25 @@ leaf = bin                                                // leaf = depth reache
 | A5 | Feature-combination (tensor) CTRs reuse the same `ctrs/kernel` device math as single-feature CTRs, differing only in the projection/hash pre-step (`ctr_feature.rs` combined-projection). | CTR wave | If tensor CTRs need a distinct device hash/merge kernel (`MergeBinsKernel` layering), W6 surface grows. Highest-uncertainty; resolve against `ctr_feature.rs` + `batch_binarized_ctr_calcer.h`. | [ASSUMED]
 | A6 | BENCH-02 per-family speed checks reuse the Phase-10 synthetic generator + harness with no new benchmark infrastructure. | BENCH-02 | If a family needs a categorical-heavy synthetic dataset (CTR) the generator lacks, a small fixture-gen sub-task is added. | [ASSUMED]
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Segmented radix sort granularity for Exact/MVS**
    - What we know: Phase-10 `sort.rs` provides a stable radix sort (keys+values); `segmented_scan.rs` provides flag-segmented prefix sums; upstream `EstimateExact` calls `SegmentedRadixSort`.
    - What's unclear: whether the existing sort supports per-segment (per-leaf-bin) sorting or only whole-buffer, and whether MVS's per-block sort can reuse it.
    - Recommendation: audit `sort.rs` segmentation at the start of W3; if absent, add a segmented-radix-sort primitive sub-task shared by W3+W5 (small, high-reuse).
+   - **RESOLVED:** threaded into **Plan 05 Task 1** — the W3 start audits `sort.rs` segmentation and, if absent, adds the shared segmented-radix-sort primitive consumed by both Exact (Plan 05) and MVS (Plan 07).
 
 2. **`begin_device_training` config surface for sampling + CTR + exact**
    - What we know: today it takes loss/depth/plain/fold/score_fn/cindex/weight/dims/lr/l2.
    - What's unclear: how bootstrap_type/sample_rate/mvs_lambda, the pinned seed, the exact-leaf flag, and the CTR config (types, priors, projections, borders) reach the session — as new params vs a config struct.
    - Recommendation: introduce a small host-typed `DeviceTrainConfig`-style struct (plain, no cubecl) rather than growing the arg list per wave; keep the seam landmine-safe.
+   - **RESOLVED:** threaded into **Plan 01 Task 3** — a single plain host `DeviceTrainConfig` struct carries grow-policy/sampling/exact/CTR config across the seam; later waves widen config without growing the arg list.
 
 3. **CTR device residency vs the fold/permutation structure**
    - What we know: ordered CTR is permutation-dependent, resident across the permutation (D-06); the covered device regime today is Plain / fold_count==1.
    - What's unclear: whether device CTR needs >1 permutation/fold (learning folds) or stays single-permutation like the covered device regime.
    - Recommendation: scope W6 to the single-permutation covered regime first (matches the current device gate); defer multi-fold CTR if it appears, behind `Ok(None)`.
+   - **RESOLVED:** threaded into **Plan 08 Task 2** — device CTR is scoped to the single-permutation (Plain / fold_count==1) covered regime; any multi-fold CTR config stays `Ok(None)` (CPU fallback).
 
 ## Environment Availability
 
