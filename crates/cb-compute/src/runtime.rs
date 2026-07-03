@@ -913,6 +913,16 @@ pub struct Derivatives {
 ///   **empty** (length 0) so the `n`-length buffer never crosses the seam per
 ///   tree (D-05); it is populated to length `n` ONLY for the oracle structure
 ///   check that compares device vs. CPU leaf assignment.
+/// - `step_nodes` / `node_id_to_leaf_id`: the NON-SYMMETRIC node-graph carrier
+///   (Phase 12 Plan 01, GPUT-18) that mirrors `cb_train::tree::GrownTree`
+///   verbatim so the Plan-03 Depthwise/Lossguide fold arm and the Plan-04 Region
+///   fold arm in `cb_train::boosting` can materialize a `NonSymmetricTree` /
+///   `RegionTree` (NOT always an `ObliviousTree`). For the oblivious / depth>1
+///   symmetric path these vectors are **EMPTY** — the oblivious emission is
+///   byte-unchanged (D-04 no-regression); only the non-symmetric emission fills
+///   them. Like every other field these are PLAIN HOST types — no `cubecl` /
+///   `cb-backend` type may appear on this struct (T-10-04 feature-unification
+///   landmine: the seam must never pull a backend dep into `cb-train`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceGrownTree {
     /// Per-level chosen split as `(feature_index, bin_id)`; length = tree depth.
@@ -926,6 +936,18 @@ pub struct DeviceGrownTree {
     /// `n`-length buffer never crosses the seam per tree (D-05); length `n` only
     /// for the oracle structure check.
     pub leaf_of: Vec<u32>,
+    /// NON-SYMMETRIC node graph, `(left_subtree_diff, right_subtree_diff)` per
+    /// node (mirrors `cb_train::tree::GrownTree::step_nodes` verbatim, CR-01/02).
+    /// `(0, 0)` marks a terminal leaf. **EMPTY** for the oblivious / symmetric
+    /// path (that emission is byte-unchanged, D-04); ONLY the Plan-03 non-sym
+    /// device grow fills it. Plain host type — never a `cubecl` type.
+    pub step_nodes: Vec<(u16, u16)>,
+    /// NON-SYMMETRIC node → leaf id map (mirrors
+    /// `cb_train::tree::GrownTree::node_id_to_leaf_id` verbatim). `u32::MAX` marks
+    /// an interior node (the sentinel); any other value is that node's distinct
+    /// leaf id. **EMPTY** for the oblivious / symmetric path; ONLY the Plan-03
+    /// non-sym device grow fills it. Plain host type — never a `cubecl` type.
+    pub node_id_to_leaf_id: Vec<u32>,
 }
 
 pub trait Runtime {

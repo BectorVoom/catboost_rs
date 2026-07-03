@@ -363,6 +363,10 @@ impl GpuTrainSession {
             splits: tree.splits,
             leaf_values: tree.leaf_values,
             leaf_of: tree.leaf_of,
+            // Oblivious / symmetric emission: the non-symmetric node-graph carrier stays EMPTY
+            // (byte-unchanged, D-04). Only the Plan-03 non-sym device grow fills these.
+            step_nodes: Vec::new(),
+            node_id_to_leaf_id: Vec::new(),
         })
     }
 }
