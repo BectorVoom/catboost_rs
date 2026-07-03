@@ -2393,6 +2393,73 @@ pub fn update_partition_sizes_kernel<F: Float>(
     }
 }
 
+// ===========================================================================
+// Plan 10-04 (GPUT-16): fill / gather / vector-arithmetic transforms (upstream
+// `fill.cu` + `transform.cu`, CATBOOST_CUDA_KERNELS_DESIGN §6.1). Trivial
+// one-write-per-lane transforms (mirror [`histogram_scatter_kernel`]); their FULL
+// validation is transitive through the depth-1 tree + cindex (D-01), so the
+// `kernels/fill_transform.rs` self-oracle asserts elementwise equality on small inputs.
+// ===========================================================================
+
+/// `fill`: set every element of `buf` to the constant `value[0]` (upstream `fill.cu`
+/// `FillBuffer`). The constant is passed as a length-1 array (the `lambda_h` scalar
+/// precedent — a Float launch scalar as a resident length-1 handle). One write per lane,
+/// bounds-guarded (T-10-10); no `-inf` literal; generic-float.
+#[cube(launch)]
+pub fn fill_kernel<F: Float>(buf: &mut Array<F>, value: &Array<F>) {
+    if ABSOLUTE_POS < buf.len() {
+        buf[ABSOLUTE_POS] = value[0];
+    }
+}
+
+/// `gather`: `out[i] = src[idx[i]]` (upstream `transform.cu` gather). One indexed read
+/// + one write per lane, bounds-guarded (T-10-09/10 — every scatter/gather index access
+/// is guarded); no `-inf` literal; generic-float (indices are `u32`).
+#[cube(launch)]
+pub fn gather_kernel<F: Float>(src: &Array<F>, idx: &Array<u32>, out: &mut Array<F>) {
+    if ABSOLUTE_POS < out.len() {
+        let j = idx[ABSOLUTE_POS];
+        out[ABSOLUTE_POS] = src[j as usize];
+    }
+}
+
+/// Elementwise vector `add`: `out[i] = a[i] + b[i]` (upstream `transform.cu`
+/// AddVector). One write per lane, bounds-guarded; no `-inf` literal; generic-float.
+#[cube(launch)]
+pub fn vector_add_kernel<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+}
+
+/// Elementwise vector `sub`: `out[i] = a[i] - b[i]`. One write per lane, bounds-guarded;
+/// no `-inf` literal; generic-float.
+#[cube(launch)]
+pub fn vector_sub_kernel<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] - b[ABSOLUTE_POS];
+    }
+}
+
+/// Elementwise vector `mul`: `out[i] = a[i] * b[i]`. One write per lane, bounds-guarded;
+/// no `-inf` literal; generic-float.
+#[cube(launch)]
+pub fn vector_mul_kernel<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] * b[ABSOLUTE_POS];
+    }
+}
+
+/// Elementwise vector `div`: `out[i] = a[i] / b[i]` (caller guarantees non-zero
+/// divisors — the oracle uses non-zero `b`). One write per lane, bounds-guarded; no
+/// `-inf` literal; generic-float.
+#[cube(launch)]
+pub fn vector_div_kernel<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] / b[ABSOLUTE_POS];
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -2441,6 +2508,14 @@ mod sort;
 // `SelectedRuntime`, so it builds/runs under EVERY backend.
 #[cfg(test)]
 mod partitions;
+
+// Fill / gather / vector-arithmetic transform oracle (source/test separation, Plan
+// 10-04 GPUT-16): elementwise self-oracles vs inline serial references (D-02) live in
+// `kernels/fill_transform.rs`, mounted at `kernels::fill_transform`. Full validation is
+// transitive through the depth-1 tree + cindex (D-01). Runs over the generic
+// `SelectedRuntime`, so it builds/runs under EVERY backend.
+#[cfg(test)]
+mod fill_transform;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
