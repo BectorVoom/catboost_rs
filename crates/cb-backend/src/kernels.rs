@@ -2233,6 +2233,19 @@ pub fn reduce_by_key_kernel<F: Float>(
 /// gradient/hessian default from the CubeCL fixed-point-atomics manual §2.1). A
 /// power of two keeps `v * S` and `sum / S` exact mantissa shifts. Used by
 /// [`block_reduce_fixedpoint_kernel`] and its host read-back in `kernels/reduce.rs`.
+///
+/// # Fixed-point RANGE precondition (WR-04, Phase 11 review) — `|Σ| < 2^33`
+///
+/// The accumulator stores the two's-complement `i64` bits of `round(Σ · 2^30)` in an
+/// `Atomic<u64>`. The integer sum is EXACT only while `|Σ| · 2^30 < 2^63`, i.e. while
+/// `|Σ| < 2^33 ≈ 8.6e9`. This is a TIGHTER bound than the `2^53` float-exactness bound
+/// the decode doc mentions. Beyond `2^33` the wrapping `u64` add silently overflows the
+/// `i64` range into a sign-flipped value with no error and no saturation. For the
+/// committed workloads (correctness 2000×10; speed ~1e6×50 with O(1)–O(10) targets) every
+/// per-bin `Σ der1` / `Σ weight` stays far below `2^33`, so this is safe — but a very
+/// large-`n` or large-magnitude der1/weight fixture could cross the threshold undetected.
+/// A host-side pre-launch magnitude estimate (`n · max|der1| · 2^30 < i64::MAX`) or a
+/// smaller `k` would be required before running such a fixture.
 pub(crate) const REDUCE_FIXEDPOINT_SCALE_F64: f64 = 1_073_741_824.0; // 2^30
 
 /// Deterministic FIXED-POINT reduce finalize (Plan 10-03 Task 2, strategy (c); CubeCL
@@ -3530,6 +3543,21 @@ pub fn partition_split_kernel<F: Float>(
 /// `leaf_of` partition VALUE range (`< n_parts`) is validated HOST-SIDE before launch
 /// so the atomic store cannot address `part_stats` out of bounds. if-as-STATEMENT only.
 ///
+/// # Determinism SCOPE (WR-03, Phase 11 review) — leaf values are NOT bit-deterministic
+///
+/// This leaf-stat reduce merges with a NAKED float atomic (`Atomic<F>::fetch_add`), which
+/// is ORDER-DEPENDENT under contention. The Phase-11 fixed-point `Atomic<u64>`
+/// determinism guarantee (GPUT-06) applies to the HISTOGRAM FILL
+/// (`partition_hist2_nonbinary_kernel`) only, NOT to this kernel. Consequently tree
+/// STRUCTURE (splits + `leaf_of`, derived from the fixed-point histogram scoring) is
+/// run-to-run bit-identical, but the LEAF VALUES this kernel feeds — and therefore model
+/// PREDICTIONS — carry ulp-level run-to-run float-order variance. That variance stays far
+/// inside the ε=1e-4 GPU bar (it does not compound past tolerance over the tested tree
+/// counts), so it is NOT a correctness defect, but a STRICT bit-reproducibility claim for
+/// predictions is out of scope here. A future fixed-point `Atomic<u64>` encode/decode of
+/// the `d`/`w`/`h` channels (mirroring the histogram fill) would close the gap. See
+/// `bench/RESULTS.md` (the "reduction determinism" gate is scoped to structure).
+///
 /// `der1` (UNWEIGHTED, the 7.2 seam contract) / `weight` are length `n` (per object,
 /// object order). `leaf_of` (length `n`) is the per-object partition (`0..n_parts`),
 /// produced DEVICE-SIDE by `partition_split_kernel` and consumed here WITHOUT a host
@@ -3601,6 +3629,11 @@ pub fn partition_update_kernel<F: Float>(
 /// f64 (the fixed-point accumulation precision, matching [`block_reduce_fixedpoint_kernel`]);
 /// generic over `F: Float` (AGENTS.md generics-float — the input channel type). No `-inf`
 /// literal (a `#[cube]` helper inlined at JIT, mirroring [`read_bin`]).
+///
+/// RANGE precondition (WR-04): the accumulated per-bin sum must satisfy `|Σ| < 2^33` — see
+/// [`REDUCE_FIXEDPOINT_SCALE_F64`]. Beyond that the wrapping `u64` add silently overflows
+/// the `i64` range; there is no in-kernel guard (a `#[cube]` kernel cannot surface a typed
+/// error), so the caller owns the magnitude precondition.
 #[cube]
 fn fixedpoint_encode<F: Float>(v: F) -> u64 {
     let scaled = f64::cast_from(v) * REDUCE_FIXEDPOINT_SCALE_F64;

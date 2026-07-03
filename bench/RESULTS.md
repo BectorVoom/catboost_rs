@@ -95,6 +95,27 @@ BLOCKING before any speed number.** ROCm in-env (Plans 02–04) is smoke-only, *
 gate (in-env gfx1100 already shows structure bit-exact + zero run-to-run spread; Kaggle CUDA
 is the oracle of record).
 
+> **Determinism scope (WR-03, Phase 11 review).** The "zero run-to-run spread" / "0 spread"
+> gate is scoped to tree **STRUCTURE** (the per-level split `(feature, bin)` sequence and the
+> per-object `leaf_of`), which derives from the fixed-point `Atomic<u64>` histogram fill
+> (GPUT-06) and is therefore bit-identical run to run. **Leaf VALUES (and thus predictions)
+> are NOT bit-deterministic:** the leaf-stat reduce (`partition_update_kernel`) still merges
+> with a naked float atomic, so leaf values carry ulp-level run-to-run float-order variance.
+> That variance stays far inside the ε=1e-4 device bar (it does not compound past tolerance
+> over the tested tree counts), so it is not a correctness defect — but a strict
+> bit-reproducibility claim for predictions is out of scope until `partition_update_kernel`
+> is routed through the same fixed-point integer-atomic accumulate as the histogram fill. The
+> "Per-tree run-to-run spread" row below measures the first divergent STRUCTURE prefix.
+
+> **Fixed-point quantization headroom vs n (IN-03, Phase 11 review).** The device histogram
+> sums `Σ round(vᵢ·2^30)/2^30`, not the CPU `sum_f64(vᵢ)`: each per-object contribution is
+> rounded to the `2^30` grid before the integer atomic add. Per-term error is ≤ 2^-31, so
+> the per-bin error is bounded by `n·2^-31` (≈2.3e-7 at n=500, ≈4.7e-4 at n≈1e6). This is
+> comfortably inside the ε=1e-4 grow bar for the committed sizes, but the margin SHRINKS with
+> `n` and the full-run preds compound it across ~200 trees. No fixture change is required —
+> but the Kaggle per-tree diagnostic should track the effective histogram error vs `n` so the
+> 1e-4 margin at ~1e6 rows is CONFIRMED, not assumed.
+
 **All fields below are PENDING the human-gated Kaggle run — do NOT fabricate.** Fill them
 from the notebook's `PHASE 11 DEPTH-6 CUDA STRUCTURED REPORT` cell (correctness first).
 
