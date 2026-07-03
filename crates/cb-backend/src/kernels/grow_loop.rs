@@ -268,6 +268,86 @@ fn cpu_best_stump_cosine(
     best
 }
 
+/// The inline CPU greedy DEPTH-N oblivious search (Phase 11 Plan 03, GPUT-05) — the strict-
+/// first-wins argmax over the candidates in ascending `(feature, bin)` order, generalized from
+/// the depth-1 stumps ([`cpu_best_stump`] / [`cpu_best_stump_cosine`]) to a full depth-`depth`
+/// oblivious tree. Per level: score each candidate `(feature, bin)` by the chosen score fn
+/// (`SCORE_FN_COSINE` / `SCORE_FN_L2`) over ALL `2 * 2^level` resulting leaves (each current
+/// partition splits into left = `cindex <= bin` / right = `cindex > bin`, forward-bit), keep the
+/// FIRST candidate whose score STRICTLY exceeds the running best (Pitfall 1), then apply the
+/// forward-bit split `leaf_of |= (pass as u32) << level`. Returns `(splits, final leaf_of)`.
+///
+/// Each leaf's Σ der1 / Σ weight is folded in ASCENDING OBJECT ORDER via `sum_f64` (D-08); the
+/// leaves are ordered `[part0-left, part0-right, part1-left, part1-right, …]` — the SAME
+/// left-then-right per-partition order the device `find_optimal_split_partition_kernel`
+/// accumulates, so the two agree bit-for-bit up to the fixed-point rounding. This is the inline
+/// transcription the D-7.5-04 boundary mandates (do NOT import `cb-train`); the SCORE oracles
+/// `l2_split_score` / `cosine_split_score` are read-only from `cb-compute` (already a dep).
+fn cpu_greedy_oblivious(
+    der1: &[f64],
+    weight: &[f64],
+    cindex: &[u32],
+    n: usize,
+    n_features: usize,
+    n_bins: usize,
+    depth: usize,
+    scaled_l2: f64,
+    score_fn: u32,
+) -> (Vec<(usize, usize)>, Vec<u32>) {
+    let mut leaf_of = vec![0u32; n];
+    let mut splits: Vec<(usize, usize)> = Vec::with_capacity(depth);
+
+    for level in 0..depth {
+        let n_parts = 1usize << level;
+        let last_real = n_bins.saturating_sub(1);
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for feature in 0..n_features {
+            for bin in 0..last_real {
+                // Bucket each object into (partition, side) — side 0 = left (cindex <= bin),
+                // side 1 = right (cindex > bin, forward-bit pass).
+                let mut acc: Vec<(Vec<f64>, Vec<f64>)> =
+                    (0..n_parts * 2).map(|_| (Vec::new(), Vec::new())).collect();
+                for obj in 0..n {
+                    let part = leaf_of[obj] as usize;
+                    let pass = (cindex[feature * n + obj] as usize) > bin;
+                    let slot = part * 2 + usize::from(pass);
+                    acc[slot].0.push(der1[obj]);
+                    acc[slot].1.push(weight[obj]);
+                }
+                let leaves: Vec<cb_compute::LeafStats> = acc
+                    .iter()
+                    .map(|(d, w)| cb_compute::LeafStats {
+                        sum_weighted_delta: sum_f64(d),
+                        sum_weight: sum_f64(w),
+                    })
+                    .collect();
+                let score = if score_fn == crate::kernels::SCORE_FN_COSINE {
+                    cb_compute::cosine_split_score(&leaves, scaled_l2)
+                } else {
+                    cb_compute::l2_split_score(&leaves, scaled_l2)
+                };
+                if score > best_score {
+                    best_score = score;
+                    best = Some((feature, bin));
+                }
+            }
+        }
+
+        let (feature, bin) = best.expect("CPU depth-N reference must find a candidate at each level");
+        splits.push((feature, bin));
+        for obj in 0..n {
+            let pass = (cindex[feature * n + obj] as usize) > bin;
+            if pass {
+                leaf_of[obj] |= 1u32 << level;
+            }
+        }
+    }
+
+    (splits, leaf_of)
+}
+
 // ===========================================================================
 // Partition primitives self-oracle (Phase 7.5 Plan C, Task 1): the device
 // `partition_split_kernel` forward-bit doc-routing reorder must match the CPU
@@ -293,9 +373,12 @@ mod partition {
         for &n in &[1usize, 37usize, 1000usize] {
             let (der1, _weight, cindex, indices) = make_fixture(n, n_features, n_bins);
 
-            // A known split sequence: 3 levels on distinct features at mid-range borders.
-            // (feature, bin) per level; the CPU passes-test is `cindex bin > bin`.
-            let splits: Vec<(usize, usize)> = vec![(0, 15), (1, 10), (2, 20)];
+            // A known DEPTH-6 split sequence (Phase 11 Plan 03: extended from 3 to 6 levels for
+            // the 2^level slot addressing, Pitfall 6). (feature, bin) per level; the CPU
+            // passes-test is `cindex bin > bin`. Features cycle over the 3 available; borders
+            // vary so the forward-bit routing exercises all 6 leaf bits.
+            let splits: Vec<(usize, usize)> =
+                vec![(0, 15), (1, 10), (2, 20), (0, 7), (1, 22), (2, 4)];
 
             let device = <crate::SelectedRuntime as Runtime>::Device::default();
             let client = <crate::SelectedRuntime as Runtime>::client(&device);
@@ -648,27 +731,130 @@ mod single_tree {
         }
     }
 
-    /// `depth > 1` surfaces the typed `CbError::OutOfRange` documenting the
-    /// partition-aware-histogram forward dependency — NOT a silently-mislabeled stump.
+    /// GPUT-05 (Phase 11 Plan 03): `depth > 1` is now DEVICE-COVERED — the former typed
+    /// forward-dependency reject is GONE. A depth-2 tree grows WITHOUT error and produces the
+    /// right shape (2 splits, `2^2 = 4` leaf values). INVERTS the old
+    /// `depth_gt_one_is_tracked_forward_dependency` assertion (the depth-6 structure/value
+    /// parity is the `depth6_rmse_grow_matches_cpu` oracle below).
     #[test]
-    fn depth_gt_one_is_tracked_forward_dependency() {
+    fn depth_gt_one_is_device_covered() {
         let n_features = 2usize;
-        let n_bins = 16usize;
+        // n_bins in the partition-fill one-byte non-binary family {32,64,128,256} (GPUT-05 MVP;
+        // the half-byte/binary families for depth>1 are a follow-up).
+        let n_bins = 32usize;
         let n = 50usize;
         let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
         let scaled_l2 = scaled_l2_for(&weight, n, 3.0);
 
-        let err = grow_oblivious_tree(
+        let tree = grow_oblivious_tree(
             &der1, &weight, &cindex, &indices, n_bins, n_features, 2, scaled_l2,
             crate::kernels::SCORE_FN_L2,
         )
-        .expect_err("depth > 1 must surface a typed forward-dependency error, not a stump");
-        // It must be the OutOfRange forward-dependency guard (not a panic / wrong tree).
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("depth") && msg.contains("forward dependency"),
-            "depth>1 error must name the partition-aware-histogram forward dependency: {msg}"
+        .expect("depth > 1 must now grow on device (GPUT-05), not surface a reject");
+        assert_eq!(tree.splits.len(), 2, "a depth-2 tree must have exactly 2 splits");
+        assert_eq!(
+            tree.leaf_values.len(),
+            1usize << 2,
+            "a depth-2 tree must have 2^2 = 4 leaf values"
         );
+        assert_eq!(tree.leaf_of.len(), n, "leaf_of must be length n");
+        // Every object lands in one of the 4 leaves.
+        assert!(
+            tree.leaf_of.iter().all(|&p| (p as usize) < 4),
+            "every object's leaf must be < 2^depth (4)"
+        );
+    }
+
+    /// GPUT-05 depth-6 grow self-oracle (Phase 11 Plan 03): grow a full DEPTH-6 oblivious tree
+    /// on device from a deterministic RMSE fixture and assert its STRUCTURE matches the inline
+    /// CPU depth-N greedy search EXACTLY — the per-level split `(feature, bin)` sequence AND the
+    /// per-object `leaf_of` (== `cpu_leaf_index` over the full 6-level forward-bit sequence, the
+    /// 2^level slot addressing, Pitfall 6) — then REPORT the leaf-value divergence vs the CPU
+    /// `calc_average` reference within the ε=1e-4 GPU bar (D-04). Uses the catboost DEFAULT
+    /// Cosine score fn (the depth-6 fixture's pinned A2), so the device partition scorer and the
+    /// CPU `cosine_split_score` reference agree. Runs over `SelectedRuntime` (rocm in-env on
+    /// gfx1100; the fixed-point partition histogram path needs `Atomic<u64>` — skips on
+    /// cpu/wgpu, the Phase-7.6 WR-01 anti-false-pass convention).
+    #[test]
+    fn depth6_rmse_grow_matches_cpu() {
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11-03] SKIP depth6_rmse_grow_matches_cpu: active backend lacks Atomic<u64> add \
+                 (cpu/wgpu) — the fixed-point partition histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
+        const GROW_EPS: f64 = 1e-4;
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 6usize;
+        let l2 = 3.0_f64;
+        let score_fn = crate::kernels::SCORE_FN_COSINE;
+
+        // Enough objects to populate a non-trivial fraction of the 2^6 = 64 leaves.
+        for &n in &[200usize, 2000usize] {
+            let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+            let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+            // Device: grow the full depth-6 tree host-light over SelectedRuntime.
+            let tree = grow_oblivious_tree(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2, score_fn,
+            )
+            .expect("depth-6 grow_oblivious_tree must succeed on the clear-margin fixture");
+
+            // CPU reference: the strict-first-wins depth-6 greedy search under the Cosine score.
+            let (cpu_splits, cpu_leaf_of) =
+                cpu_greedy_oblivious(&der1, &weight, &cindex, n, n_features, n_bins, depth, scaled_l2, score_fn);
+
+            // (A) STRUCTURE — the full 6-level split (feature, bin) sequence must match EXACTLY.
+            assert_eq!(tree.splits.len(), depth, "device tree must have exactly depth splits (n={n})");
+            let device_splits: Vec<(usize, usize)> =
+                tree.splits.iter().map(|&(f, b)| (f as usize, b as usize)).collect();
+            assert_eq!(
+                device_splits, cpu_splits,
+                "device depth-6 split sequence must match CPU Cosine greedy first-wins (n={n}): \
+                 device={device_splits:?} cpu={cpu_splits:?}"
+            );
+
+            // (B) STRUCTURE — per-object leaf_of must equal CPU leaf_index over the SAME depth-6
+            //     forward-bit sequence for EVERY object (the 2^level slot addressing, Pitfall 6).
+            assert_eq!(
+                tree.leaf_of, cpu_leaf_of,
+                "device depth-6 leaf_of must equal CPU leaf_index forward-bit (n={n})"
+            );
+
+            // (C) LEAF VALUES — divergence vs CPU calc_average over the SAME 64-leaf partition,
+            //     within the ε=1e-4 GPU bar (leaf values are score-fn-independent).
+            let n_leaves = 1usize << depth;
+            let mut cpu_leaf_values = vec![0.0_f64; n_leaves];
+            for leaf in 0..n_leaves {
+                let mut der_seg: Vec<f64> = Vec::new();
+                let mut w_seg: Vec<f64> = Vec::new();
+                for obj in 0..n {
+                    if cpu_leaf_of[obj] as usize == leaf {
+                        der_seg.push(der1[obj]);
+                        w_seg.push(weight[obj]);
+                    }
+                }
+                cpu_leaf_values[leaf] =
+                    cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+            }
+            assert_eq!(
+                tree.leaf_values.len(),
+                cpu_leaf_values.len(),
+                "device depth-6 leaf_values length must equal n_leaves=64 (n={n})"
+            );
+            let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
+            println!(
+                "[depth6_grow n={n}] STRUCTURE match ({depth} splits, leaf_of exact); leaf-value \
+                 max abs_div={abs:.3e} rel_div={rel:.3e} (bar={GROW_EPS:.0e})"
+            );
+            assert!(
+                abs <= GROW_EPS || rel <= GROW_EPS,
+                "device depth-6 leaf values (n={n}) exceeded the ε=1e-4 bar: abs={abs:.3e} rel={rel:.3e}"
+            );
+        }
     }
 }
 
