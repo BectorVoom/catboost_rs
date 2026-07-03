@@ -423,6 +423,13 @@ pub use session::*;
 #[cfg(test)]
 mod session_residency;
 
+// Phase 12 Plan 01 (GPUT-18, A3 gap): the depth>1 device-grow self-oracle. The coverage gate
+// no longer force-declines depth>1 — a depth-6 Plain/fold1/RMSE config grows through the
+// Phase-11 partition-aware substrate and matches a direct `grow_oblivious_tree` call within
+// ε=1e-4; every still-uncovered config returns Ok(None). rocm in-env on gfx1100.
+#[cfg(test)]
+mod session_depth_gt1_test;
+
 // Phase 10-06 (GPUT-15): the bit-packed compressed index (cindex) builder — the
 // grouped `WriteCompressedIndex` layout + per-feature `TCFeature` table the histogram /
 // partition consumers read through the ONE `kernels::read_bin` accessor. `pub(crate)` so

@@ -307,9 +307,9 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
     }
 }
 
-/// The coverage gate (D-10-02): `begin` returns `None` (→ CPU fallback) for depth>1 /
+/// The coverage gate (D-10-02): `begin` returns `None` (→ CPU fallback) for depth==0 /
 /// non-RMSE-Logloss / non-Plain / fold_count>1 / unsupported score fn, and `Some` for the
-/// covered depth-1 RMSE/Logloss Plain fold-1 config.
+/// covered depth>=1 RMSE/Logloss Plain fold-1 config (Phase 12 Plan 01: depth>1 now covered).
 #[test]
 fn session_residency_coverage_gate_declines_uncovered() {
     let n = 37usize;
@@ -333,8 +333,12 @@ fn session_residency_coverage_gate_declines_uncovered() {
     assert!(open(&Loss::Logloss, 1, true, 1, EScoreFunction::Cosine), "Logloss depth1 must be covered");
     assert!(open(&Loss::CrossEntropy, 1, true, 1, EScoreFunction::L2), "CrossEntropy depth1 L2 must be covered");
 
+    // Phase 12 Plan 01 (GPUT-18, A3 gap): depth>1 is now DEVICE-COVERED (Phase-11 substrate);
+    // the former `depth>1 must decline` assertion is INVERTED — a depth-2 Plain/fold1/RMSE
+    // config now opens a session (the depth>1 grow self-oracle lives in session_depth_gt1_test).
+    assert!(open(&Loss::Rmse, 2, true, 1, EScoreFunction::Cosine), "depth>1 must now be covered");
+
     // Uncovered → None (CPU fallback).
-    assert!(!open(&Loss::Rmse, 2, true, 1, EScoreFunction::Cosine), "depth>1 must decline");
     assert!(!open(&Loss::Rmse, 1, false, 1, EScoreFunction::Cosine), "non-Plain (Ordered) must decline");
     assert!(!open(&Loss::Rmse, 1, true, 2, EScoreFunction::Cosine), "fold_count>1 must decline");
     assert!(!open(&Loss::Mae, 1, true, 1, EScoreFunction::Cosine), "non-RMSE/Logloss loss must decline");

@@ -25,8 +25,10 @@
 //! # Coverage gate (D-10-01/02)
 //!
 //! `begin` runs the classification where the session is created: it returns `None`
-//! (→ CPU fallback, D-04) unless `depth == 1` AND the loss is RMSE/Logloss/CrossEntropy AND
+//! (→ CPU fallback, D-04) unless `depth >= 1` AND the loss is RMSE/Logloss/CrossEntropy AND
 //! Plain boosting AND `fold_count == 1` AND the score function is one of the supported five.
+//! (Phase 12 Plan 01 / GPUT-18: depth>1 is device-covered via the Phase-11 partition-aware
+//! substrate — the former depth-1-only restriction is lifted.)
 //! Cosine is the depth-1 device default (GPUT-08), honored from the passed `EScoreFunction`.
 //!
 //! # Landmine (project memory)
@@ -121,7 +123,7 @@ fn map_der_kernel(loss: &Loss) -> Option<DerBinaryKernel> {
 
 impl GpuTrainSession {
     /// Open a device-resident training session, running the coverage gate (D-10-02). Returns
-    /// `Ok(None)` when the config is NOT covered (depth>1, non-RMSE/Logloss, non-Plain,
+    /// `Ok(None)` when the config is NOT covered (depth==0, non-RMSE/Logloss, non-Plain,
     /// fold_count>1, or an unsupported score function) so the caller falls back to the CPU
     /// path (D-04). When covered, it validates the quantized bins host-side, packs the
     /// cindex (10-06), and uploads ALL resident handles ONCE onto one client, initialising
@@ -149,9 +151,16 @@ impl GpuTrainSession {
         scaled_l2: f64,
     ) -> CbResult<Option<Self>> {
         // --- Coverage gate (D-10-02): classification lives where the session is created. ---
-        // The MVP device path grows a depth-1 Plain oblivious tree over a single fold with an
+        // The device path grows a depth>=1 Plain oblivious tree over a single fold with an
         // RMSE/Logloss loss and a supported score function; ANYTHING else declines to CPU.
-        if depth != 1 || !boosting_type_is_plain || fold_count != 1 {
+        //
+        // Phase 12 Plan 01 (GPUT-18, A3 gap): the former `depth != 1` force-decline is GONE —
+        // depth>1 is DEVICE-COVERED via the already-shipped Phase-11 partition-aware substrate
+        // (`grow_oblivious_tree_resident` loops `0..depth`, keying each level's fill on the
+        // resident `leaf_of` + the per-active-leaf score/argmin). Only the
+        // Plain/fold_count==1/covered-loss/score/n_bins guards remain; every still-uncovered
+        // config returns `Ok(None)` → the byte-unchanged CPU grower (D-10-01 all-or-nothing).
+        if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
             return Ok(None);
         }
         let der_kernel = match map_der_kernel(loss) {

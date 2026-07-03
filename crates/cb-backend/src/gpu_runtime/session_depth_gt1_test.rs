@@ -1,0 +1,226 @@
+//! Phase 12 Plan 01 (GPUT-18, A3 gap): the depth>1 device-grow self-oracle for
+//! [`crate::gpu_runtime::GpuTrainSession`]. Task 1 relaxed the coverage gate so a depth>1
+//! Plain/fold_count==1/RMSE/covered-score config now reaches the device grow through the
+//! already-shipped Phase-11 partition-aware substrate (`grow_oblivious_tree_resident` loops
+//! `0..depth`) instead of being force-declined to CPU. This test proves:
+//!
+//! 1. (structure) a depth-6 tree grown via the SESSION path (`begin` → `grow_one`) matches a
+//!    DIRECT [`crate::gpu_runtime::grow_oblivious_tree`] call over the SAME first-tree residual
+//!    (`der1 = rmse_der1(0, target)`) bit-for-bit on the integer `(feature, bin)` split
+//!    sequence AND the per-object `leaf_of`, with the leaf VALUES within the ε=1e-4 GPU bar;
+//! 2. (gate) depth>1 Plain/fold1/RMSE/Cosine now returns `Ok(Some(_))`, while every
+//!    still-uncovered config (non-Plain, fold_count>1, unmapped loss, depth==0) still returns
+//!    `Ok(None)` (D-10-01 all-or-nothing → the byte-unchanged CPU grower). The non-default
+//!    [`cb_compute::DeviceTrainConfig`] family-flag arm is added by Plan-01 Task 3.
+//!
+//! Source/test separation (CLAUDE.md / AGENTS.md): the session + grow driver are production
+//! code; ALL `#[test]` + `.unwrap()`/indexing live here. The structure oracle is the DIRECT
+//! device `grow_oblivious_tree` call (NOT a `cb-train` import — that would pull the landmine
+//! `cb-backend` default-`cpu` dep into the test build graph and break `SelectedRuntime` under
+//! rocm). The device grow needs `Atomic<u64>` (the fixed-point partition histogram) so the
+//! grow arm SKIPS on cpu/wgpu (the Phase-7.6 WR-01 anti-false-pass convention); the gate arm
+//! runs on every backend (it only classifies — it never grows). rocm in-env on gfx1100.
+
+#![cfg(not(feature = "wgpu"))]
+
+use cb_compute::{EScoreFunction, Loss};
+use cb_core::sum_f64;
+
+use crate::gpu_runtime::{grow_oblivious_tree, GpuTrainSession};
+use crate::kernels::SCORE_FN_COSINE;
+
+/// The ε=1e-4 GPU bar (D-04).
+const GROW_EPS: f64 = 1e-4;
+
+// Fixture builders — byte-identical to `session_residency` (the same clear-gain-margin fixture,
+// transcribed for source/test separation).
+
+/// Centred ramp `k - n/2` (the boosting target, monotone in the object index).
+fn ramp_centred(n: usize) -> Vec<f64> {
+    (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect()
+}
+
+/// Non-trivial per-object weight `0.5 + (k % 5) * 0.25` (never all-1).
+fn weight_mod5(n: usize) -> Vec<f64> {
+    (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect()
+}
+
+/// Feature-major quantized cindex: feature 0's bins climb monotonically with the object index
+/// (a clear best border), other features get a deterministic lower-gain spread.
+fn cindex_feature_major(n: usize, n_features: usize, n_bins: usize) -> Vec<u32> {
+    let mut cindex = vec![0u32; n_features * n];
+    for feature in 0..n_features {
+        for obj in 0..n {
+            let bin = if feature == 0 {
+                ((obj * n_bins) / n.max(1)).min(n_bins - 1)
+            } else {
+                (obj * (feature + 2) + feature) % n_bins
+            };
+            cindex[feature * n + obj] = bin as u32;
+        }
+    }
+    cindex
+}
+
+/// Max abs/rel divergence (informational + the ε assert).
+fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
+    let mut abs = 0.0_f64;
+    let mut rel = 0.0_f64;
+    for (&d, &b) in device.iter().zip(baseline.iter()) {
+        let a = (d - b).abs();
+        abs = abs.max(a);
+        let denom = b.abs().max(1e-12);
+        rel = rel.max(a / denom);
+    }
+    (abs, rel)
+}
+
+/// (Structure oracle) a depth-6 tree grown through the SESSION path must match a DIRECT
+/// `grow_oblivious_tree` call over the SAME first-tree residual bit-for-bit on the integer
+/// splits + `leaf_of`, with the leaf values within ε=1e-4. Needs `Atomic<u64>` (the fixed-point
+/// partition histogram) — SKIPS on cpu/wgpu, runs on rocm/cuda in-env.
+#[test]
+fn session_depth_gt1_grows_and_matches_direct() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[12-01] SKIP session_depth_gt1_grows_and_matches_direct: active backend lacks \
+             Atomic<u64> add (cpu/wgpu) — the depth>1 partition histogram path needs rocm/cuda"
+        );
+        return;
+    }
+
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let depth = 6usize;
+    let l2 = 3.0_f64;
+    let learning_rate = 0.3_f64;
+
+    for &n in &[200usize, 2000usize] {
+        let target = ramp_centred(n);
+        let weight = weight_mod5(n);
+        let cindex = cindex_feature_major(n, n_features, n_bins);
+        let scaled_l2 = cb_compute::scale_l2_reg(l2, sum_f64(&weight), n);
+
+        // Session path: open a DEPTH-6 covered session (the A3 gate relaxation), grow ONE tree.
+        // The session's first `grow_one` derives `der1 = rmse_der1(0, target)` from the resident
+        // zero-start approx, so the direct call below feeds that SAME residual.
+        let mut session = GpuTrainSession::begin(
+            &Loss::Rmse,
+            depth,
+            true, // Plain
+            1,    // fold_count
+            EScoreFunction::Cosine,
+            &cindex,
+            &weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+        )
+        .expect("begin must not error on a covered depth-6 config")
+        .expect("depth-6 Plain/fold1/RMSE/Cosine must now open a session (A3 gap closed)");
+
+        assert_eq!(session.n(), n, "session n must equal the fixture n (n={n})");
+
+        let dev_tree = session
+            .grow_one(&target)
+            .expect("depth-6 grow_one must succeed on the clear-margin fixture");
+
+        // Direct reference: `grow_oblivious_tree` over the SAME first-tree residual + Cosine.
+        let der1: Vec<f64> = (0..n).map(|i| cb_compute::rmse_der1(0.0, target[i])).collect();
+        let indices: Vec<u32> = (0..n as u32).collect();
+        let direct = grow_oblivious_tree(
+            &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2, SCORE_FN_COSINE,
+        )
+        .expect("direct depth-6 grow_oblivious_tree must succeed");
+
+        // (A) STRUCTURE — the full 6-level integer split sequence must match EXACTLY.
+        assert_eq!(
+            dev_tree.splits.len(),
+            depth,
+            "session depth-6 tree must have exactly {depth} splits (n={n})"
+        );
+        assert_eq!(
+            dev_tree.splits, direct.splits,
+            "session depth-6 split sequence must match the direct grow bit-for-bit (n={n}): \
+             session={:?} direct={:?}",
+            dev_tree.splits, direct.splits
+        );
+
+        // (B) STRUCTURE — per-object `leaf_of` must match EXACTLY.
+        assert_eq!(
+            dev_tree.leaf_of, direct.leaf_of,
+            "session depth-6 leaf_of must equal the direct grow leaf_of (n={n})"
+        );
+
+        // (C) LEAF VALUES — divergence within the ε=1e-4 GPU bar.
+        assert_eq!(
+            dev_tree.leaf_values.len(),
+            direct.leaf_values.len(),
+            "session depth-6 leaf_values length must equal 2^{depth} (n={n})"
+        );
+        let (abs, rel) = max_divergence(&dev_tree.leaf_values, &direct.leaf_values);
+        println!(
+            "[session_depth_gt1 n={n}] STRUCTURE match ({depth} splits, leaf_of exact); leaf-value \
+             max abs_div={abs:.3e} rel_div={rel:.3e} (bar={GROW_EPS:.0e})"
+        );
+        assert!(
+            abs <= GROW_EPS || rel <= GROW_EPS,
+            "session depth-6 leaf values (n={n}) exceeded the ε=1e-4 bar: abs={abs:.3e} rel={rel:.3e}"
+        );
+
+        drop(session);
+    }
+}
+
+/// (Gate) depth>1 Plain/fold1/RMSE/Cosine now opens a session; every still-uncovered config —
+/// non-Plain, fold_count>1, unmapped loss, depth==0 — still declines to `Ok(None)` (D-10-01
+/// all-or-nothing). Runs on EVERY backend (it only classifies at `begin` — it never grows), so
+/// no rocm skip. Plan-01 Task 3 extends this with the non-default `DeviceTrainConfig` arm.
+#[test]
+fn session_depth_gt1_gate_declines_uncovered() {
+    let n = 37usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let weight = weight_mod5(n);
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+    let lr = 0.3_f64;
+
+    let open = |depth: usize, plain: bool, folds: usize, loss: &Loss, sf: EScoreFunction| {
+        GpuTrainSession::begin(
+            loss, depth, plain, folds, sf, &cindex, &weight, n, n_features, n_bins, lr, scaled_l2,
+        )
+        .expect("begin must not error while classifying coverage")
+        .is_some()
+    };
+
+    // Covered: depth>1 Plain / fold1 / RMSE-or-Logloss / covered score (A3 gap closed).
+    assert!(
+        open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine),
+        "depth-6 Plain/fold1/RMSE/Cosine must now be covered"
+    );
+    assert!(
+        open(2, true, 1, &Loss::Logloss, EScoreFunction::Cosine),
+        "depth-2 Plain/fold1/Logloss/Cosine must now be covered"
+    );
+
+    // Still-uncovered → None (byte-unchanged CPU fallback).
+    assert!(
+        !open(6, false, 1, &Loss::Rmse, EScoreFunction::Cosine),
+        "non-Plain (Ordered) must decline even at depth>1"
+    );
+    assert!(
+        !open(6, true, 2, &Loss::Rmse, EScoreFunction::Cosine),
+        "fold_count>1 must decline even at depth>1"
+    );
+    assert!(
+        !open(6, true, 1, &Loss::Mae, EScoreFunction::Cosine),
+        "an unmapped loss must decline even at depth>1"
+    );
+    assert!(
+        !open(0, true, 1, &Loss::Rmse, EScoreFunction::Cosine),
+        "depth==0 (no tree to grow) must decline"
+    );
+}
