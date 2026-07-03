@@ -4290,6 +4290,15 @@ pub fn select_best_split_kernel<F: Float>(
 #[cfg(test)]
 mod gradient_gpu;
 
+// GPUT-18 (Phase 12 Plan 03, W1): the device Depthwise / Lossguide non-symmetric grow
+// driver — a PRODUCTION module composing `gpu_runtime::launch_find_optimal_split_pointwise`
+// per candidate leaf-node, transcribing `cb_train::tree::leaf_wise_grower`'s node-graph
+// bookkeeping inline (NEVER `use cb_train`, Pattern B). Emits plain host structs onto
+// `DeviceGrownTree` (`step_nodes` / `node_id_to_leaf_id` / per-node `splits` / leaf values).
+// Lives in `kernels/nonsym_grow.rs`; its serial CPU self-oracle vs `leaf_wise_grower` is the
+// sibling `kernels/nonsym_grow_test.rs`.
+pub(crate) mod nonsym_grow;
+
 // Bit-packed compressed index (cindex) bit-exact self-oracle (GPU-01 cindex slice,
 // Phase 10-06, GPUT-15): the host `gpu_runtime::cindex::pack_cindex` grouped packing +
 // the device `read_all_bins_kernel` (which reads every cell through the ONE
