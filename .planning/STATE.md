@@ -6,14 +6,14 @@ current_phase: 11
 current_phase_name: depth-1-partition-aware-histograms-reduction-determinism-new
 status: executing
 stopped_at: Phase 11 context gathered
-last_updated: "2026-07-03T08:04:08.451Z"
+last_updated: "2026-07-03T08:35:09.284Z"
 last_activity: 2026-07-03
 last_activity_desc: Phase 11 execution started
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 14
-  completed_plans: 11
+  completed_plans: 12
   percent: 20
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 11 (depth-1-partition-aware-histograms-reduction-determinism-new) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Last activity: 2026-07-03 — Phase 11 execution started
 
@@ -176,6 +176,7 @@ Last activity: 2026-07-03 — Phase 11 execution started
 | Phase 10 P09 | ~6min | 2 tasks | 6 files |
 | Phase 11 P01 | 20min | 2 tasks | 6 files |
 | Phase 11 P02 | 45min | 3 tasks | 3 files |
+| Phase 11 P03 | 60min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -449,7 +450,7 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-03T08:03:28.539Z
+Last session: 2026-07-03T08:34:48.620Z
 Stopped at: Phase 11 context gathered
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
