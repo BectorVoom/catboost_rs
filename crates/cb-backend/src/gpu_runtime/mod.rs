@@ -2031,6 +2031,10 @@ fn score_partition_over_binsums(
 /// (`checked_add`), and the base/cells fit the `u32` device index range (`try_from`) —
 /// all validated → typed [`CbError`] BEFORE launch. `cells == 0` short-circuits to a
 /// zero-length handle. No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+// WR-01 (Phase 11 review): the subtraction trick is not yet wired into a scored grow path;
+// this launcher is retained and unit-tested standalone, so it is dead code only in non-test
+// builds until the memory-lean parent-reuse path is actually implemented.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_subtract_histograms_into(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
@@ -2330,18 +2334,15 @@ fn grow_oblivious_tree_into(
 
     let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
 
-    // The parent-level histogram kept resident across levels for the SUBTRACTION trick (D-04,
-    // memory-lean): at level L>0 the larger sibling of each parent pair is derived as
-    // `parent - smaller` rather than re-scanned. `per_leaf` is one leaf line's cell count.
-    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
-        CbError::OutOfRange(format!(
-            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
-        ))
-    })?;
-    let mut parent_hist_h: Option<Handle> = None;
+    // NOTE (WR-01, Phase 11 review): the D-04 "memory-lean" subtraction trick is NOT wired into
+    // this scored path. The partition-aware fill below computes every `2^level` slot directly, so
+    // there is no smaller/larger sibling to derive here. The standalone subtraction kernel
+    // (`launch_subtract_histograms_into`) is retained and unit-tested, but until it actually
+    // replaces the direct fill of the larger sibling it delivers no memory saving — so the claim
+    // and the discarded per-level derivation have been removed rather than left as dead code.
 
     // The host-light per-depth loop (upstream :63-158). Per level: partition-aware fill keyed
-    // by the resident leaf_of over the current 2^level partitions -> subtraction trick (L>0) ->
+    // by the resident leaf_of over the current 2^level partitions ->
     // device score/argmin over every active leaf -> ONE O(1) BestSplit read-back -> host split
     // decision -> device partition-split. The bulk histogram / doc-routing stay resident (D-05).
     for level in 0..depth {
@@ -2357,39 +2358,14 @@ fn grow_oblivious_tree_into(
             level as u32,
         )?;
 
-        // (2) SUBTRACTION trick (D-04, upstream SubstractHistogramsImpl): at level L>0 derive the
-        //     larger sibling of each parent pair as `parent - smaller` from the resident parent
-        //     histogram (weight-channel max(0) clamp inside the kernel). The larger siblings are
-        //     value-identical to the directly-filled slots (fixed-point subtraction is exact
-        //     below 2^53), so scoring the directly-filled `hist_h` is correct; the derivation is
-        //     exercised on-device per level as the memory-lean parent-resident reuse path.
-        if let Some(parent_h) = &parent_hist_h {
-            let n_parents = 1usize << (level - 1);
-            let mut pair = 0usize;
-            while pair < n_parents {
-                let smaller_child = pair * 2 + 1; // derive the larger sibling of each pair
-                let _bigger = launch_subtract_histograms_into(
-                    client,
-                    parent_h.clone(),
-                    n_parents * per_leaf,
-                    pair * per_leaf,
-                    hist_h.clone(),
-                    n_parts * per_leaf,
-                    smaller_child * per_leaf,
-                    per_leaf,
-                )?;
-                pair += 1;
-            }
-        }
-
-        // (3) Device score + deterministic argmin over the CURRENT 2^level partitions. The bulk
+        // (2) Device score + deterministic argmin over the CURRENT 2^level partitions. The bulk
         //     histogram stays device-resident IN the score launch; only the O(1) BestSplit
         //     descriptor crosses back (D-05 / T-11-03-02 — no full-buffer read path).
         let best = score_partition_over_binsums(
             client, hist_h.clone(), n_parts, n_bins, n_features, scaled_l2, score_fn,
         )?;
 
-        // (4) The O(1) host integer split decision. A level with no candidate at all is a
+        // (3) The O(1) host integer split decision. A level with no candidate at all is a
         //     degenerate dataset (no feature has any bin) — surface a typed error rather
         //     than fabricating a split (T-07.5-03-04).
         let split = best.ok_or_else(|| {
@@ -2399,10 +2375,7 @@ fn grow_oblivious_tree_into(
         })?;
         splits.push((split.feature_id, split.bin_id));
 
-        // Keep this level's histogram resident as the parent for the next level's subtraction.
-        parent_hist_h = Some(hist_h);
-
-        // (5) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
+        // (4) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
         //     `leaf_index` convention, Pitfall 6) — IN-PLACE on device, NO read-back here
         //     (D-05). The resident handles are cloned (a CubeCL Handle is a ref-counted
         //     buffer binding; cloning shares the device buffer, it does NOT copy).
@@ -2758,17 +2731,13 @@ pub(crate) fn grow_oblivious_tree_resident(
         .checked_shl(depth as u32)
         .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
 
-    // One leaf line's cell count (the subtraction trick's slot stride, D-04).
-    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
-        CbError::OutOfRange(format!(
-            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
-        ))
-    })?;
+    // NOTE (WR-01, Phase 11 review): the D-04 "memory-lean" subtraction trick is NOT wired into
+    // this scored path — the partition-aware fill computes every slot directly, so the discarded
+    // per-level derivation (and the parent-resident bookkeeping it required) has been removed.
 
     // leaf_of starts all-zero (every object in the root partition 0), resident on device.
     let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
     let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
-    let mut parent_hist_h: Option<Handle> = None;
 
     for level in 0..depth {
         // (1) Partition-aware (fullPass = L>0) fill over the RESIDENT session handles (cloned,
@@ -2795,34 +2764,12 @@ pub(crate) fn grow_oblivious_tree_resident(
             level as u32,
         )?;
 
-        // (2) SUBTRACTION trick (D-04): at level L>0 derive the larger sibling of each parent
-        //     pair as `parent - smaller` from the resident parent histogram (the memory-lean
-        //     parent-resident reuse; value-identical to the directly-filled slots).
-        if let Some(parent_h) = &parent_hist_h {
-            let n_parents = 1usize << (level - 1);
-            let mut pair = 0usize;
-            while pair < n_parents {
-                let smaller_child = pair * 2 + 1;
-                let _bigger = launch_subtract_histograms_into(
-                    client,
-                    parent_h.clone(),
-                    n_parents * per_leaf,
-                    pair * per_leaf,
-                    bin_sums.clone(),
-                    n_parts * per_leaf,
-                    smaller_child * per_leaf,
-                    per_leaf,
-                )?;
-                pair += 1;
-            }
-        }
-
-        // (3) Device score + deterministic argmin over the CURRENT 2^level partitions (D-05).
+        // (2) Device score + deterministic argmin over the CURRENT 2^level partitions (D-05).
         let best = score_partition_over_binsums(
             client, bin_sums.clone(), n_parts, n_bins, n_features, scaled_l2, score_fn,
         )?;
 
-        // (4) The O(1) host integer split decision. No candidate -> degenerate dataset.
+        // (3) The O(1) host integer split decision. No candidate -> degenerate dataset.
         let split = best.ok_or_else(|| {
             CbError::Degenerate(format!(
                 "grow_oblivious_tree_resident level {level}: no candidate split (degenerate histogram)"
@@ -2830,10 +2777,7 @@ pub(crate) fn grow_oblivious_tree_resident(
         })?;
         splits.push((split.feature_id, split.bin_id));
 
-        // Keep this level's histogram resident as the parent for the next level's subtraction.
-        parent_hist_h = Some(bin_sums);
-
-        // (5) Device partition-split (forward-bit doc-routing) over the resident PLAIN
+        // (4) Device partition-split (forward-bit doc-routing) over the resident PLAIN
         //     cindex — IN-PLACE on device, NO read-back (D-05).
         leaf_of_h = launch_partition_split_into(
             client,
