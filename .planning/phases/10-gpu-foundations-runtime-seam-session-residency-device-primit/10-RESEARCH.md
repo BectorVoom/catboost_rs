@@ -521,22 +521,27 @@ fn read_bin(cindex: &Array<u32>, offset: u32, obj: u32, shift: u32, mask: u32) -
 | A7 | `maturin build --no-default-features --features cuda` produces a working Kaggle wheel (CUDA toolkit present on Kaggle GPU notebooks) | NEW-5 | If Kaggle's CUDA/driver mismatches CubeCL/cudarc, the wheel won't JIT — pin a known-good Kaggle image in the notebook |
 | A8 | CubeCL manual path is lowercase `/manual/cubecl/` (AGENTS.md/CONTEXT.md say `/Cubecl/`) | Sources | Agents following the documented capitalized path get "No such file"; the real path is lowercase `cubecl`, INDEX is `INDEX.md` [VERIFIED: filesystem this session] |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All three questions were resolved during planning (2026-07-03). Resolutions are carried in the finalized 9-plan decomposition; inline `RESOLVED:` markers below record the decision + plan reference for the audit trail.
 
 1. **Device vs host cindex packing (A2).**
    - What we know: borders stay host; the deliverable is packing + residency.
    - What's unclear: whether GPUT-15 requires an on-device `WriteCompressedIndex` kernel or accepts host-pack-then-upload-once.
    - Recommendation: host-pack + upload once is simplest and satisfies "device-resident cindex"; if the planner reads GPUT-15 as requiring the device packing kernel, it is still small (§6.6a `WriteCompressedIndex` blockSize=256). Decide in planning.
+   - **RESOLVED:** host-pack then upload-once (borders host) adopted as the GPUT-15 interpretation — `10-06-PLAN.md` Task 1 packs the bit-packed `TCFeature` layout on host and uploads once, documenting the decision in `cindex.rs`; the on-device `write_compressed_index` kernel is explicitly deferred unless parity requires it (surfaced as a documented assumption, not a silent drop).
 
 2. **Cosine depth-1 default: second-order vs first-order interaction (A1).**
    - What we know: the score kernel supports Cosine; leaves are first-order `calc_average` for Phase 10.
    - What's unclear: Cosine is a second-order *score* function; confirm the depth-1 path uses the Cosine SCORE for split selection while leaves stay first-order (Newton leaf = Phase 11) — these are independent choices and must both be pinned in the fixture.
    - Recommendation: Cosine score + first-order leaves for the depth-1 oracle; document the pairing explicitly so the ≤1e-5 comparison is method-consistent.
+   - **RESOLVED:** Cosine SCORE for split selection + first-order `calc_average` leaves, both pinned in the depth-1 fixture — `10-07-PLAN.md` Task 1 pins the pairing so the ≤1e-5 comparison is method-consistent (Newton leaves remain Phase 11).
 
 3. **Reduction winner per backend (D-03).**
    - What we know: fixed-point atomics (deterministic + higher precision) and HostSumFallback (already in-tree) are the leading candidates; gfx1100 lacks f64 atomic-add.
    - What's unclear: which wins on Kaggle CUDA for both variance and speed.
    - Recommendation: the spike measures and records per-backend viability; the winner ships as the library reduce (D-04). RESOLVED at spike time, not planning.
+   - **RESOLVED (deferred by design):** deliberately deferred to spike time — `10-03-PLAN.md` prototypes the top candidates, measures variance + speed on Kaggle CUDA, records the recommendation in `SPIKE-REDUCTION.md`, and the winner ships AS the reduce primitive (D-04, no throwaway). Not a planning-time decision.
 
 ## Environment Availability
 
