@@ -28,7 +28,7 @@
 
 - [x] **GPUT-04**: A depth-1 oblivious tree is grown fully on device (RMSE/Logloss, Plain boosting, fold_count=1) and matches the CPU path ≤1e-5, oracle-tested on Kaggle CUDA.
 - [x] **GPUT-05**: Partition-aware histograms (`fullPass=false`) keyed by leaf, contiguous partition reorder, and the histogram subtraction trick support depth>1 oblivious trees on device.
-- [ ] **GPUT-06**: A chosen reduction-determinism strategy keeps device histogram/score reductions within ε=1e-4 of the CPU path across hundreds of trees, verified on Kaggle CUDA (CUDA has f64 atomic-add, but atomicAdd ordering is still non-deterministic, so a deterministic reduction is required).
+- [x] **GPUT-06**: A chosen reduction-determinism strategy keeps device histogram/score reductions within ε=1e-4 of the CPU path across hundreds of trees, verified on Kaggle CUDA (CUDA has f64 atomic-add, but atomicAdd ordering is still non-deterministic, so a deterministic reduction is required).
 - [x] **GPUT-07**: Newton der2 leaf estimation runs on device (required for classification / Logloss default).
 - [x] **GPUT-08**: The Cosine / second-order score function (the GPU default) runs on device.
 - [ ] **GPUT-18**: The **Depthwise, Lossguide, and Region** grow policies — per-policy leaf selection (`ComputeOptimalSplitsRegion` / `ComputeOptimalSplit` + `SelectLeavesToSplit`) and region/non-symmetric tree leaf-value apply (`AddRegion` / `ComputeNonSymmetricDecisionTreeBins`) — run on device, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (GPUT-04/05 are SymmetricTree/oblivious only. §6.4, §6.6c.)
@@ -88,7 +88,7 @@
 | BENCH-01 | Phase 10 | Complete |
 | BENCH-02 | Phase 10 (standing — enforced in every GPU phase 10→13) | Complete |
 | GPUT-05 | Phase 11 | Complete |
-| GPUT-06 | Phase 11 | Pending |
+| GPUT-06 | Phase 11 | Complete |
 | GPUT-07 | Phase 11 | Complete |
 | GPUT-14 | Phase 11 (standing — enforced onward through 13) | Pending |
 | GPUT-18 | Phase 12 | Pending |

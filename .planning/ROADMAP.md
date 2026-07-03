@@ -117,10 +117,10 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   4. **Speed check (BENCH-02, standing):** depth-6 RMSE and Logloss device training is timed on Kaggle CUDA and reported as device path vs the host-CPU baseline AND vs official CatBoost GPU (warm-run/JIT-excluded, train-only) — this phase's keystone kernels (partition-aware histograms + subtraction trick + Newton der2) carry their own recorded CUDA speed measurement, not deferred to Phase 14.
   5. Every device-covered case to date holds ε=1e-4 vs the Rust CPU path **on Kaggle CUDA**, and the CPU/host training paths remain byte-unchanged (D-04) — the standing GPUT-14 gate, operative from here to the end of the milestone.
 
-**Plans**: 1/5 plans executed
+**Plans**: 2/5 plans executed
 
 - [x] 11-01-PLAN.md — Depth-6 synthetic fixture generator (D-03) + CPU oracle cross-check (Wave 1)
-- [ ] 11-02-PLAN.md — Partition-aware `fullPass=false` histogram + subtraction trick + deterministic fixed-point accumulator (GPUT-05/06, Wave 2)
+- [x] 11-02-PLAN.md — Partition-aware `fullPass=false` histogram + subtraction trick + deterministic fixed-point accumulator (GPUT-05/06, Wave 2)
 - [ ] 11-03-PLAN.md — Wire depth>1 into the grow loop + depth-6 grow self-oracle + zero-spread determinism check (GPUT-05/06, Wave 3)
 - [ ] 11-04-PLAN.md — Newton der2 leaf estimation (Σder2 channel, newton_leaf_delta, apply_leaf_delta refinement) (GPUT-07, Wave 4)
 - [ ] 11-05-PLAN.md — Kaggle CUDA harness: final-ε=1e-4 gate + per-tree diagnostic + BENCH-02 speed (GPUT-14/06/BENCH-02, Wave 5, human-gated)
@@ -182,7 +182,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
-| 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 1/5 | In Progress|  |
+| 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 2/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 0/TBD | Not started | - |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
