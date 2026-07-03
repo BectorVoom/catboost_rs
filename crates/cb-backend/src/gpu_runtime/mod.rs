@@ -1526,21 +1526,31 @@ pub(crate) fn launch_partition_split_into(
     Ok(new_leaf_of)
 }
 
-/// Recompute the per-partition `Σ der1` / `Σ weight` device-resident after a split:
-/// returns a NEW `part_stats` handle of length `n_parts * 2` (channel 0 = Σ der1,
-/// channel 1 = Σ weight) reduced over the resident `leaf_of` partition via the in-kernel
-/// atomic merge (D-03). The bulk routing stays device-resident — NO `read_one` here
-/// (D-05); the grow loop reads back the part-stats ONCE at the leaves.
+/// Recompute the per-partition `Σ der1` / `Σ weight` / `Σ (der2·weight)` device-resident
+/// after a split: returns a NEW `part_stats` handle of length `n_parts * 3` (channel 0 =
+/// Σ der1, channel 1 = Σ weight, channel 2 = Σ (der2·weight) — the GPUT-07 Newton hessian
+/// channel) reduced over the resident `leaf_of` partition via the in-kernel atomic merge
+/// (D-03). The bulk routing stays device-resident — NO `read_one` here (D-05); the grow
+/// loop reads back the part-stats ONCE at the leaves.
+///
+/// `der2` is the per-object UNWEIGHTED second derivative handle (the Phase 7.2 seam
+/// contract): [`DerUnaryKernel::LoglossHessian`] (`-p(1-p)`) for the Logloss/Newton arm,
+/// or the constant `-1.0` ([`const_der_handle`], via a resident `-1` upload) for the RMSE
+/// arm. The weight is folded IN-KERNEL as `der2·weight` (A3 landmine — matches
+/// `cb_compute::reduce_leaf_der2`). It MUST be bound to THIS `client` (a CubeCL Handle is
+/// bound to its allocating client — Pitfall 3); the RMSE `calc_average` arm ignores channel
+/// 2 but still supplies a valid `n`-length der2 handle so the launch is well-formed.
 ///
 /// `n` is the object count; `n_parts` is `2^level` (the current partition count). The
 /// host validated `leaf_of[obj] < n_parts` on upload so the atomic store stays in bounds.
-/// `n_parts * 2` overflow surfaces a typed [`CbError::OutOfRange`]. Empty (`n == 0` or
+/// `n_parts * 3` overflow surfaces a typed [`CbError::OutOfRange`]. Empty (`n == 0` or
 /// `n_parts == 0`) returns a zero-length handle with NO launch (Pitfall 5). No
 /// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
 pub(crate) fn launch_partition_update_into(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     der1: Handle,
     weight: Handle,
+    der2: Handle,
     indices: Handle,
     leaf_of: Handle,
     n: usize,
@@ -1550,8 +1560,8 @@ pub(crate) fn launch_partition_update_into(
         return Ok(client.empty(0));
     }
 
-    let part_stats_len = n_parts.checked_mul(2).ok_or_else(|| {
-        CbError::OutOfRange(format!("n_parts ({n_parts}) * 2 overflows usize (part-stats length)"))
+    let part_stats_len = n_parts.checked_mul(3).ok_or_else(|| {
+        CbError::OutOfRange(format!("n_parts ({n_parts}) * 3 overflows usize (part-stats length)"))
     })?;
 
     let num_cubes = n.div_ceil(CUBE_DIM).max(1);
@@ -1571,6 +1581,7 @@ pub(crate) fn launch_partition_update_into(
             dim,
             unsafe { ArrayArg::from_raw_parts(der1, n) },
             unsafe { ArrayArg::from_raw_parts(weight, n) },
+            unsafe { ArrayArg::from_raw_parts(der2, n) },
             unsafe { ArrayArg::from_raw_parts(indices, n) },
             unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
             unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
@@ -1587,6 +1598,7 @@ pub(crate) fn launch_partition_update_into(
             dim,
             unsafe { ArrayArg::from_raw_parts(der1, n) },
             unsafe { ArrayArg::from_raw_parts(weight, n) },
+            unsafe { ArrayArg::from_raw_parts(der2, n) },
             unsafe { ArrayArg::from_raw_parts(indices, n) },
             unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
             unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
@@ -2408,12 +2420,17 @@ fn grow_oblivious_tree_into(
         )?;
     }
 
-    // (4) Device partition-update: the per-partition Σ der1 / Σ weight reduce over the
-    //     final 2^depth partitions (upstream `UpdatePartitionProps`), device-resident.
+    // (4) Device partition-update: the per-partition Σ der1 / Σ weight / Σ(der2·weight) reduce
+    //     over the final 2^depth partitions (upstream `UpdatePartitionProps`), device-resident.
+    //     RMSE arm: der2 = const -1 (RMSE hessian), so the Σ(der2·weight) channel is -Σweight
+    //     and `newton_leaf_delta` collapses to `calc_average` (see step 6). The channel is
+    //     computed for symmetry with the Newton path but the RMSE leaf reads channels 0/1.
+    let der2_rmse_h = upload_channel_floats(client, &vec![-1.0_f64; n]);
     let part_stats_h = launch_partition_update_into(
         client,
         der1_h.clone(),
         weight_h.clone(),
+        der2_rmse_h,
         indices_h.clone(),
         leaf_of_h.clone(),
         n,
@@ -2427,12 +2444,13 @@ fn grow_oblivious_tree_into(
 
     // (6) Host leaf values via the FROZEN cb_compute::calc_average formula (leaf.rs:83-89):
     //     mu = count > 0 ? Σder1 / (Σweight + scaled_l2) : 0.0 (the count>0 guard transcribed,
-    //     T-07.5-03-06 — no NaN/Inf from an empty leaf). part_stats is [Σder1, Σweight] per
-    //     leaf in leaf-index order.
+    //     T-07.5-03-06 — no NaN/Inf from an empty leaf). part_stats is now stride-3
+    //     [Σder1, Σweight, Σ(der2·weight)] per leaf in leaf-index order; the RMSE arm reads
+    //     channels 0/1 (der2=−1 ⇒ `newton_leaf_delta` == `calc_average` exactly, GPUT-07).
     let mut leaf_values = vec![0.0_f64; n_leaves];
     for leaf in 0..n_leaves {
-        let sum = part_stats.get(leaf * 2).copied().unwrap_or(0.0);
-        let cnt = part_stats.get(leaf * 2 + 1).copied().unwrap_or(0.0);
+        let sum = part_stats.get(leaf * 3).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 3 + 1).copied().unwrap_or(0.0);
         if let Some(slot) = leaf_values.get_mut(leaf) {
             *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
         }
@@ -2693,11 +2711,16 @@ pub(crate) fn grow_oblivious_tree_resident(
     }
 
     // (4) Device partition-update -> ONE read-back of the 2^depth part-stats (the ONLY
-    //     bulk-data crossing besides the O(1) per-level BestSplit — D-05).
+    //     bulk-data crossing besides the O(1) per-level BestSplit — D-05). RMSE arm: der2 =
+    //     const -1 (the Σ(der2·weight) channel is computed but the calc_average leaf reads
+    //     channels 0/1; the Newton/Logloss leaf estimation is the dedicated
+    //     `grow_oblivious_tree_newton_into` path, GPUT-07).
+    let der2_rmse_h = upload_channel_floats(client, &vec![-1.0_f64; n]);
     let part_stats_h = launch_partition_update_into(
         client,
         der1_h.clone(),
         weight_h.clone(),
+        der2_rmse_h,
         indices_h.clone(),
         leaf_of_h.clone(),
         n,
@@ -2707,10 +2730,11 @@ pub(crate) fn grow_oblivious_tree_resident(
 
     // (5) Host leaf values via the FROZEN cb_compute::calc_average (UNSCALED delta — the
     //     10-02 DeviceGrownTree contract; the approx update below applies learning_rate).
+    //     part_stats is stride-3 [Σder1, Σweight, Σ(der2·weight)]; the RMSE arm reads 0/1.
     let mut leaf_values = vec![0.0_f64; n_leaves];
     for leaf in 0..n_leaves {
-        let sum = part_stats.get(leaf * 2).copied().unwrap_or(0.0);
-        let cnt = part_stats.get(leaf * 2 + 1).copied().unwrap_or(0.0);
+        let sum = part_stats.get(leaf * 3).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 3 + 1).copied().unwrap_or(0.0);
         if let Some(slot) = leaf_values.get_mut(leaf) {
             *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
         }

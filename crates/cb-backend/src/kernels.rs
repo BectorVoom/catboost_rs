@@ -3497,17 +3497,30 @@ pub fn partition_split_kernel<F: Float>(
 /// values can be estimated from the device-resident partition without re-reading the
 /// full doc routing to host.
 ///
-/// # Per-partition reduce (D-03 in-kernel atomic + f64 finalize)
+/// # Per-partition reduce (D-03 in-kernel atomic + f64 finalize) — 3-channel (GPUT-07)
 ///
-/// Each object atomic-adds its `(der1[obj], weight[obj])` into its partition's two
-/// channels of the global `part_stats` buffer at `part_stats[leaf_of[obj] * 2 + 0]`
-/// (Σ der1) and `part_stats[leaf_of[obj] * 2 + 1]` (Σ weight). The cross-thread merge
-/// is ALWAYS the in-kernel `Atomic<F>::fetch_add` (the `block_reduce_atomic_kernel`
-/// `acc[0].fetch_add(...)` primitive generalized to a per-partition-indexed buffer,
-/// D-03); the accumulation ORDER is non-deterministic (the accepted D-03 float-order
-/// variance, REPORTED not signed off). The channel float type is f64 on rocm/cuda/cpu
-/// and f32 on wgpu (RESEARCH A1), matching the histogram channel. ALWAYS runs the
-/// in-kernel atomic — never a host-fallback selector mid-loop (Pitfall 4).
+/// Each object atomic-adds its `(der1[obj], weight[obj], der2[obj]·weight[obj])` into its
+/// partition's THREE channels of the global `part_stats` buffer at
+/// `part_stats[leaf_of[obj] * 3 + 0]` (Σ der1), `part_stats[leaf_of[obj] * 3 + 1]`
+/// (Σ weight) and `part_stats[leaf_of[obj] * 3 + 2]` (Σ der2·weight — the Newton hessian
+/// channel, GPUT-07). The cross-thread merge is ALWAYS the in-kernel `Atomic<F>::fetch_add`
+/// (the `block_reduce_atomic_kernel` `acc[0].fetch_add(...)` primitive generalized to a
+/// per-partition-indexed buffer, D-03); the accumulation ORDER is non-deterministic (the
+/// accepted D-03 float-order variance, REPORTED not signed off). The channel float type is
+/// f64 on rocm/cuda/cpu and f32 on wgpu (RESEARCH A1), matching the histogram channel.
+/// ALWAYS runs the in-kernel atomic — never a host-fallback selector mid-loop (Pitfall 4).
+///
+/// # Σ(der2·weight) channel (GPUT-07 / A3 weight-folding LANDMINE)
+///
+/// `der2` is the per-object UNWEIGHTED second derivative (the Phase 7.2 seam contract:
+/// `LoglossHessian` = `-p(1-p)` for Logloss, the constant `-1.0` for RMSE — NON-positive).
+/// The weight is folded HERE, in this reduce, as `der2[obj] · weight[obj]` — matching the
+/// CPU oracle `cb_compute::reduce_leaf_der2`, which sums a host-precomputed `der2·weight`
+/// array. Getting the weight-fold wrong mis-scales the `-Σder2 + scaled_l2` Newton
+/// denominator (A3 / Pitfall 2), so the fold is pinned to the oracle's `der2·weight`
+/// convention. The `Σ der1` (channel 0) and `Σ weight` (channel 1) channels are UNCHANGED
+/// in value (the RMSE `calc_average` arm reads them verbatim at the `part*3` stride); only
+/// the extra channel-2 Newton hessian is new.
 ///
 /// # Wave-size policy (D-09) / generics-float (AGENTS.md)
 ///
@@ -3525,12 +3538,15 @@ pub fn partition_split_kernel<F: Float>(
 /// part_stats.len()` (matching the scan kernel's `cell < bin_sums.len()` precedent) so a
 /// drifting `leaf_of` — e.g. a future depth>1 partition that mis-numbers a leaf — can
 /// never address `part_stats` out of bounds (which would be a device-atomic UB). `indices`
-/// (length `n`) is the object visiting order. `part_stats` is length `n_parts * 2`
-/// (zero-initialised by the host), channel 0 = Σ der1, channel 1 = Σ weight.
+/// (length `n`) is the object visiting order. `der2` (length `n`) is the per-object
+/// UNWEIGHTED second derivative (folded with weight in-kernel). `part_stats` is length
+/// `n_parts * 3` (zero-initialised by the host): channel 0 = Σ der1, channel 1 = Σ weight,
+/// channel 2 = Σ (der2·weight) (the GPUT-07 Newton hessian channel).
 #[cube(launch)]
 pub fn partition_update_kernel<F: Float>(
     der1: &Array<F>,
     weight: &Array<F>,
+    der2: &Array<F>,
     indices: &Array<u32>,
     leaf_of: &Array<u32>,
     part_stats: &Array<Atomic<F>>,
@@ -3546,15 +3562,19 @@ pub fn partition_update_kernel<F: Float>(
         let part = leaf_of[obj] as usize;
         let d = der1[obj];
         let w = weight[obj];
-        // In-kernel atomic merge (D-03): the per-partition Σ der1 / Σ weight, folded
-        // device-resident. `leaf_of` is DEVICE-PRODUCED (no host read-back), so guard the
-        // partition VALUE range in-kernel (WR-04) instead of relying on a host check that
-        // never runs — `part * 2 + 1 < part_stats.len()` ensures BOTH channel stores are
+        // The Newton hessian channel folds weight HERE (A3 landmine): `der2·weight`,
+        // matching `cb_compute::reduce_leaf_der2`'s `der2·weight` convention exactly.
+        let h = der2[obj] * w;
+        // In-kernel atomic merge (D-03): the per-partition Σ der1 / Σ weight / Σ(der2·weight),
+        // folded device-resident. `leaf_of` is DEVICE-PRODUCED (no host read-back), so guard
+        // the partition VALUE range in-kernel (WR-04) instead of relying on a host check that
+        // never runs — `part * 3 + 2 < part_stats.len()` ensures ALL THREE channel stores are
         // in bounds (matching the scan kernel's `cell < bin_sums.len()` precedent).
         // if-as-STATEMENT only.
-        if part * 2usize + 1usize < part_stats.len() {
-            part_stats[part * 2usize].fetch_add(d);
-            part_stats[part * 2usize + 1usize].fetch_add(w);
+        if part * 3usize + 2usize < part_stats.len() {
+            part_stats[part * 3usize].fetch_add(d);
+            part_stats[part * 3usize + 1usize].fetch_add(w);
+            part_stats[part * 3usize + 2usize].fetch_add(h);
         }
         i += stride;
     }

@@ -1858,12 +1858,16 @@ fn grow_oblivious_tree_pairwise_into(
         )?;
     }
 
-    // (4) Device partition-update: the per-partition Σ der1 / Σ weight reduce over the
-    //     final 2^depth partitions, device-resident.
+    // (4) Device partition-update: the per-partition Σ der1 / Σ weight / Σ(der2·weight) reduce
+    //     over the final 2^depth partitions, device-resident. Pairwise leaf estimation uses
+    //     the `calc_average` (channels 0/1) arm — der2 = const -1 fills the (unused) hessian
+    //     channel so the 3-channel launch is well-formed (GPUT-07 stride-3 part-stats).
+    let der2_rmse_h = upload_channel_floats(client, &vec![-1.0_f64; n]);
     let part_stats_h = launch_partition_update_into(
         client,
         der1_h.clone(),
         weight_h.clone(),
+        der2_rmse_h,
         indices_h.clone(),
         leaf_of_h.clone(),
         n,
@@ -1875,10 +1879,11 @@ fn grow_oblivious_tree_pairwise_into(
     let part_stats = read_part_stats_f64(client, part_stats_h)?;
 
     // (6) Host leaf values via the FROZEN cb_compute::calc_average formula (count>0 guard).
+    //     part_stats is stride-3 [Σder1, Σweight, Σ(der2·weight)]; pairwise reads channels 0/1.
     let mut leaf_values = vec![0.0_f64; n_leaves];
     for leaf in 0..n_leaves {
-        let sum = part_stats.get(leaf * 2).copied().unwrap_or(0.0);
-        let cnt = part_stats.get(leaf * 2 + 1).copied().unwrap_or(0.0);
+        let sum = part_stats.get(leaf * 3).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 3 + 1).copied().unwrap_or(0.0);
         if let Some(slot) = leaf_values.get_mut(leaf) {
             *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
         }
