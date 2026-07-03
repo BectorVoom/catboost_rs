@@ -31,7 +31,7 @@
 - [x] **GPUT-06**: A chosen reduction-determinism strategy keeps device histogram/score reductions within ε=1e-4 of the CPU path across hundreds of trees, verified on Kaggle CUDA (CUDA has f64 atomic-add, but atomicAdd ordering is still non-deterministic, so a deterministic reduction is required).
 - [x] **GPUT-07**: Newton der2 leaf estimation runs on device (required for classification / Logloss default).
 - [x] **GPUT-08**: The Cosine / second-order score function (the GPU default) runs on device.
-- [ ] **GPUT-18**: The **Depthwise, Lossguide, and Region** grow policies — per-policy leaf selection (`ComputeOptimalSplitsRegion` / `ComputeOptimalSplit` + `SelectLeavesToSplit`) and region/non-symmetric tree leaf-value apply (`AddRegion` / `ComputeNonSymmetricDecisionTreeBins`) — run on device, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (GPUT-04/05 are SymmetricTree/oblivious only. §6.4, §6.6c.)
+- [x] **GPUT-18**: The **Depthwise, Lossguide, and Region** grow policies — per-policy leaf selection (`ComputeOptimalSplitsRegion` / `ComputeOptimalSplit` + `SelectLeavesToSplit`) and region/non-symmetric tree leaf-value apply (`AddRegion` / `ComputeNonSymmetricDecisionTreeBins`) — run on device, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (GPUT-04/05 are SymmetricTree/oblivious only. §6.4, §6.6c.)
 - [ ] **GPUT-19**: **Exact** weighted-quantile leaf-value estimation (`exact_estimation`: needWeights = totalWeight·α, binary search over per-bin weight prefix sums) runs on device for Quantile/MAE/MAPE-family objectives, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (Distinct from the Newton path in GPUT-07. §6.3 `exact_estimation.{cu,cuh}`.)
 
 ### GPU Device-Resident Training — Sampling, Losses & Coverage (GPUT)
@@ -91,7 +91,7 @@
 | GPUT-06 | Phase 11 | Complete |
 | GPUT-07 | Phase 11 | Complete |
 | GPUT-14 | Phase 11 (standing — enforced onward through 13) | Pending |
-| GPUT-18 | Phase 12 | Pending |
+| GPUT-18 | Phase 12 | Complete |
 | GPUT-19 | Phase 12 | Pending |
 | GPUT-09 | Phase 12 | Pending |
 | GPUT-17 | Phase 12 | Pending |
