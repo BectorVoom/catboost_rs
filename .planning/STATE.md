@@ -6,7 +6,7 @@ current_phase: 11
 current_phase_name: depth-1-partition-aware-histograms-reduction-determinism-new
 status: executing
 stopped_at: Phase 11 context gathered
-last_updated: "2026-07-03T08:03:38.598Z"
+last_updated: "2026-07-03T08:04:08.451Z"
 last_activity: 2026-07-03
 last_activity_desc: Phase 11 execution started
 progress:
@@ -388,6 +388,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 10-08: Device grow seam wired into cb-train boosting loop; per-fit all-or-nothing (D-10-01), Ok(None) after commit is a typed error (no CPU/device tree mixing)
 - [Phase ?]: 10-09: One seeded generator (D-06) sources BOTH the depth-1 <=1e-5 correctness fixture and the ~1e6x50 speed workload; correctness is a BLOCKING gate before any speed cell; D-10-09 (depth-1 device>=CPU only at large n) surfaced in RESULTS.md, no fabricated Kaggle numbers
 - [Phase ?]: 11-01: pinned A1 (leaf_estimation_iterations=1) and A2 (Cosine score, channel-0=sum_weight) as depth-6 fixture facts, asserted in the cb-compute cross-check to <=1e-5
+- [Phase ?]: 11-02: partition histogram channel-0 = weight/hessian (statId 0), channel-1 = der1; subtraction max(0) clamp keys on statId==0
+- [Phase ?]: 11-02: histogram subtraction in float (decode/subtract/encode), exact below 2^53, reuses only proven CubeCL ops (GPUT-06 fixed-point accumulator locked)
 
 ### Pending Todos
 
