@@ -144,6 +144,8 @@ fn device_seam_folds_depth1_tree_via_bin_border_join() {
         splits: vec![(0, 1)],
         leaf_values: vec![2.0, -3.0],
         leaf_of: Vec::new(),
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
     };
     let mock = DeviceMock {
         accept_begin: true,
@@ -235,6 +237,8 @@ fn device_bin_id_out_of_range_is_typed_error() {
         splits: vec![(0, 5)],
         leaf_values: vec![1.0, -1.0],
         leaf_of: Vec::new(),
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
     };
     let mock = DeviceMock {
         accept_begin: true,
@@ -272,6 +276,8 @@ fn device_declines_nonzero_starting_bias_boost_from_average() {
             splits: vec![(0, 1)],
             leaf_values: vec![2.0, -3.0],
             leaf_of: Vec::new(),
+            step_nodes: Vec::new(),
+            node_id_to_leaf_id: Vec::new(),
         }),
     };
     let params = BoostParams {
@@ -313,6 +319,8 @@ fn device_declines_newton_leaf_method_on_covered_loss() {
             splits: vec![(0, 1)],
             leaf_values: vec![2.0, -3.0],
             leaf_of: Vec::new(),
+            step_nodes: Vec::new(),
+            node_id_to_leaf_id: Vec::new(),
         }),
     };
     let params = BoostParams {
@@ -352,6 +360,8 @@ fn device_declined_begin_falls_back_to_cpu_path() {
             splits: vec![(0, 1)],
             leaf_values: vec![2.0, -3.0],
             leaf_of: Vec::new(),
+            step_nodes: Vec::new(),
+            node_id_to_leaf_id: Vec::new(),
         }),
     };
     let target = vec![1.0, 2.0, 3.0, 4.0];
