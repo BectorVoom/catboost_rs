@@ -46,12 +46,18 @@ benchmarked at the end (the BENCH-02 standing discipline).
 Signed-off-by: <name>
 
 Correctness gate (BLOCKING — all must PASS):
+# Bar semantics (match fixtures/README.md + cuda_oracle.ipynb): integer/INDEX
+# outputs (sort perm, reduce-by-key KEYS, cindex) are BIT-EXACT; FLOAT reduces
+# accumulate in f64 and match the serial CPU ref within <=1e-4 (they are also
+# byte-identical run-to-run per kernels/reduce.rs, but that is DETERMINISM, not
+# CPU bit-parity — do not record a tighter bar than the primitive's stated one).
 | Oracle                          | Bar        | Result | max|err| |
 |---------------------------------|------------|--------|----------|
 | primitive: scan                 | <=1e-4     | TBD    | TBD      |
 | primitive: segmented scan       | <=1e-4     | TBD    | TBD      |
 | primitive: radix sort / reorder | bit-exact  | TBD    | TBD      |
-| primitive: reduce-by-key        | <=1e-4     | TBD    | TBD      |
+| primitive: reduce-by-key (keys) | bit-exact  | TBD    | TBD      |
+| primitive: reduce-by-key (vals) | <=1e-4     | TBD    | TBD      |
 | primitive: segmented-reduce     | <=1e-4     | TBD    | TBD      |
 | primitive: update_part_props    | <=1e-4     | TBD    | TBD      |
 | cindex bit-pack (GPUT-15)       | bit-exact  | TBD    | TBD      |
