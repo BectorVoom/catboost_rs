@@ -83,6 +83,14 @@ pub enum CbError {
     #[error("degenerate training input: {0}")]
     Degenerate(String),
 
+    /// A requested operation cannot run on the active backend/device because a
+    /// required hardware capability is missing (e.g. the fixed-point partition
+    /// histogram fill needs `Atomic<u64>` add, which cpu/wgpu do not advertise).
+    /// Surfaced as a typed error BEFORE launch rather than attempting an
+    /// unsupported kernel (Phase-11 WR-02 mitigation).
+    #[error("unsupported on the active backend: {0}")]
+    Unsupported(String),
+
     /// An external (Arrow / Polars) source failed to yield a usable column.
     ///
     /// The external error is STRINGIFIED into `message` rather than wrapped via

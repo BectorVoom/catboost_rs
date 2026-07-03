@@ -295,6 +295,22 @@ fn device_supports_f64_atomic_add<R: cubecl::Runtime>(
         .contains(AtomicUsage::Add)
 }
 
+/// Does the device advertise `Atomic<u64>` add? Gates the fixed-point partition-histogram
+/// fill (`partition_hist2_nonbinary_kernel`), which accumulates into `&Array<Atomic<u64>>`
+/// and therefore CANNOT run on a backend without u64 atomic-add (cpu/wgpu). Mirrors
+/// [`device_supports_f64_atomic_add`] and the `kernels::reduce` u64 capability query. WR-02:
+/// the partition-fill launcher gates on this and surfaces a typed error before launch rather
+/// than attempting a kernel the backend cannot execute.
+fn device_supports_u64_atomic_add<R: cubecl::Runtime>(
+    client: &cubecl::client::ComputeClient<R>,
+) -> bool {
+    let ty = <Atomic<u64> as CubePrimitive>::as_type_native_unchecked();
+    client
+        .properties()
+        .atomic_type_usage(ty)
+        .contains(AtomicUsage::Add)
+}
+
 /// Reduce `input` to a SINGLE scalar sum on the compile-time [`SelectedRuntime`]
 /// using the D-03 IN-KERNEL ATOMIC finalize (D-7.1-07) — the cross-cube sum is
 /// performed on-device via `Atomic::fetch_add`, NOT by the host.
@@ -1791,6 +1807,19 @@ pub(crate) fn launch_partition_hist2_resident_into(
     // Empty fill: hand back a zero-length handle (no launch, no read-back).
     if n == 0 || n_features == 0 || n_bins == 0 {
         return Ok(client.empty(0));
+    }
+
+    // WR-02 / IN-02: the fill accumulates into `&Array<Atomic<u64>>`, so a backend without
+    // u64 atomic-add (cpu/wgpu) physically cannot run this kernel. Gate on the device's
+    // ADVERTISED capability here — the single choke point both grow paths route through
+    // (`launch_partition_hist2_into` and `grow_oblivious_tree_resident`) — and surface a
+    // typed error BEFORE launch rather than attempting an unsupported kernel.
+    if !device_supports_u64_atomic_add(client) {
+        return Err(CbError::Unsupported(
+            "partition-aware histogram fill requires Atomic<u64> add, which the active backend \
+             does not advertise (cpu/wgpu lack u64 atomics — use the rocm/cuda backend)"
+                .to_owned(),
+        ));
     }
 
     // Bit-width family selection (same host-side pick as the depth-1 seam).

@@ -567,6 +567,17 @@ mod single_tree {
     /// and f32 channel (wgpu) both run over `SelectedRuntime`.
     #[test]
     fn matches_cpu_greedy_search() {
+        // WR-02 (Phase 11 review): the depth-1 grow path now routes through the fixed-point
+        // `Atomic<u64>` partition-histogram fill, which cpu/wgpu cannot run (no u64 atomic add).
+        // Gate like the depth-6 tests so this SKIPs (not errors) on cpu/wgpu.
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11] SKIP matches_cpu_greedy_search: active backend lacks Atomic<u64> add \
+                 (cpu/wgpu) — the fixed-point partition histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
         let n_features = 3usize;
         let n_bins = 32usize;
         let depth = 1usize;
@@ -659,6 +670,17 @@ mod single_tree {
     /// mismatch is the REPORTED tolerance boundary, never signed off (7.6's epsilon).
     #[test]
     fn cosine_matches_cpu_cosine_greedy_search() {
+        // WR-02 (Phase 11 review): depth-1 grow routes through the fixed-point `Atomic<u64>`
+        // partition-histogram fill — SKIP (not error) on cpu/wgpu, matching the depth-6 tests.
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11] SKIP cosine_matches_cpu_cosine_greedy_search: active backend lacks \
+                 Atomic<u64> add (cpu/wgpu) — the fixed-point partition histogram path needs \
+                 rocm/cuda"
+            );
+            return;
+        }
+
         let n_features = 3usize;
         let n_bins = 32usize;
         let depth = 1usize;
@@ -748,6 +770,16 @@ mod single_tree {
     /// parity is the `depth6_rmse_grow_matches_cpu` oracle below).
     #[test]
     fn depth_gt_one_is_device_covered() {
+        // WR-02 (Phase 11 review): grow routes through the fixed-point `Atomic<u64>` partition
+        // fill — SKIP (not error) on cpu/wgpu, matching the depth-6 tests.
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11] SKIP depth_gt_one_is_device_covered: active backend lacks Atomic<u64> add \
+                 (cpu/wgpu) — the fixed-point partition histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
         let n_features = 2usize;
         // n_bins in the partition-fill one-byte non-binary family {32,64,128,256} (GPUT-05 MVP;
         // the half-byte/binary families for depth>1 are a follow-up).
@@ -1168,6 +1200,16 @@ mod multi_tree {
     /// across the whole run); REPORT the per-tree + aggregate leaf-value divergence.
     #[test]
     fn matches_cpu_multi_tree_boosting() {
+        // WR-02 (Phase 11 review): grow_boosting_pass routes through the fixed-point
+        // `Atomic<u64>` partition fill — SKIP (not error) on cpu/wgpu, matching the depth-6 tests.
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11] SKIP matches_cpu_multi_tree_boosting: active backend lacks Atomic<u64> add \
+                 (cpu/wgpu) — the fixed-point partition histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
         let n_features = 3usize;
         let n_bins = 32usize;
         let depth = 1usize;
@@ -1264,6 +1306,17 @@ mod multi_tree {
     /// run-to-run leaf-value drift.
     #[test]
     fn run_to_run_structure_stability_reported() {
+        // WR-02 (Phase 11 review): grow_boosting_pass routes through the fixed-point
+        // `Atomic<u64>` partition fill — SKIP (not error) on cpu/wgpu, matching the depth-6 tests.
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11] SKIP run_to_run_structure_stability_reported: active backend lacks \
+                 Atomic<u64> add (cpu/wgpu) — the fixed-point partition histogram path needs \
+                 rocm/cuda"
+            );
+            return;
+        }
+
         let n_features = 3usize;
         let n_bins = 32usize;
         let depth = 1usize;
