@@ -230,6 +230,18 @@ pub struct GrownTree {
     /// `(0, 0)` `step_nodes` entry). EMPTY for the oblivious searches. Same length
     /// as `step_nodes` when populated.
     pub node_id_to_leaf_id: Vec<u32>,
+    /// Per-LEVEL CONTINUE direction for a REGION path (GPUT-18 / D-03a). EMPTY for
+    /// every oblivious / non-symmetric search. When NON-empty this `GrownTree` is a
+    /// region PATH (NOT a node graph): `splits[level]` is the level's split, the
+    /// walk descends while `(value > border) == region_directions[level]`, and
+    /// `leaf_of[obj]` is the object's terminal bin (`0..=depth`). Length equals
+    /// `splits.len()` (== depth). `cb_model::Model::from_trained` lifts this into
+    /// `TreeVariant::Region`.
+    pub region_directions: Vec<bool>,
+    /// Per-LEVEL one-hot flag for a REGION path (`feature.OneHotFeature`). EMPTY for
+    /// non-region searches; all `false` for the CPU float grower (which emits
+    /// `value > border` splits only). Same length as `region_directions`.
+    pub region_one_hot: Vec<bool>,
 }
 
 /// One level's chosen-split kind in [`GrownTree::level_kinds`] (ORD-05): a float
@@ -576,6 +588,8 @@ pub fn greedy_tensor_search_oblivious_perturbed(
         level_kinds: Vec::new(),
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
+        region_directions: Vec::new(),
+        region_one_hot: Vec::new(),
     })
 }
 
@@ -1227,6 +1241,157 @@ pub fn leaf_wise_grower(
         level_kinds: Vec::new(),
         step_nodes,
         node_id_to_leaf_id,
+        region_directions: Vec::new(),
+        region_one_hot: Vec::new(),
+    })
+}
+
+/// Grow ONE region PATH tree (GPUT-18 / D-03a — upstream's `TRegionModel`, the
+/// single largest Phase-12 lift; "Region OUT" gap now closed on the CPU).
+///
+/// A region is an oblivious-like PATH, NOT a binary node graph: at each level the
+/// current path FRONTIER (the deepest not-yet-terminal leaf) is scored and its best
+/// split is taken; ONE child continues as the next frontier and the OTHER becomes a
+/// terminal leaf. A depth-`d` region has `d` levels and exactly `d + 1` leaves
+/// (`ComputeOptimalSplitsRegion`, `greedy_search_helper.cpp::SelectLeavesToSplit` —
+/// `MaxLeaves = MaxDepth + 1`). This does NOT emit `step_nodes` /
+/// `node_id_to_leaf_id` (that is the non-symmetric node-graph finalization — Pitfall
+/// 2); it emits `region_directions` + `region_one_hot` + a `leaf_of` in bin order.
+///
+/// **Continue direction** (upstream `SelectLeavesToSplit`): among the two children
+/// of the frontier split, the one with the BETTER (higher-gain) best-split is the
+/// next frontier; the other diverges. The recorded per-level direction is `true`
+/// when the CONTINUING child is the `value > border` (passes) child, else `false`
+/// (so the apply walk `(value > border) == direction` descends into the frontier).
+/// Ties prefer the passes-child (`>=`), a deterministic, reproducible rule.
+///
+/// **Leaf bins.** `leaf_of[obj]` is the object's terminal bin: `k` for an object
+/// that diverged at level `k` (`0 <= k < depth`), or `depth` for an object that
+/// matched every continue direction. This is EXACTLY the `AddRegionImpl` walk's
+/// `bin`, so the emitted `leaf_of` and the apply path agree by construction.
+///
+/// # Errors
+/// - [`CbError::DepthExceeded`] if `max_depth > MAX_DEPTH`.
+/// - [`CbError::Degenerate`] if the ROOT cannot be split (no candidate / gain below
+///   the `1e-9` cutoff), so no region path exists (mirrors the leaf-wise contract).
+#[allow(clippy::too_many_arguments)]
+pub fn region_grower(
+    matrix: &FeatureMatrix,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    max_depth: usize,
+    min_data_in_leaf: usize,
+    n_objects: usize,
+    score_function: EScoreFunction,
+) -> CbResult<GrownTree> {
+    check_depth(max_depth)?;
+
+    // The current path frontier's owning document subset (root = all objects).
+    let mut frontier: Vec<usize> = (0..n_objects).collect();
+    // Per-level chosen split + continue direction (`region_directions`), in walk
+    // order. `depth == splits.len()`.
+    let mut splits: Vec<Split> = Vec::new();
+    let mut directions: Vec<bool> = Vec::new();
+    // Per-bin terminal document subsets: `terminal_docs[k]` diverged at level `k`.
+    // The final frontier (bin == depth) is pushed after the loop.
+    let mut terminal_docs: Vec<Vec<usize>> = Vec::new();
+
+    for _level in 0..max_depth {
+        // Score the frontier's best split. `best_split_for_leaf` enforces
+        // `gain >= 1e-9` + `min_data_in_leaf`, so a beneficial split is required to
+        // extend the path (upstream `Score < 0` gate; the root splits only when a
+        // beneficial candidate exists — a degenerate root errors below).
+        let Some(bs) = best_split_for_leaf(
+            matrix,
+            &frontier,
+            der1,
+            weight,
+            scaled_l2,
+            min_data_in_leaf,
+            score_function,
+        ) else {
+            break;
+        };
+
+        // Continue direction: the child whose OWN best split has the higher gain is
+        // the next frontier (upstream picks the lower-Score == higher-gain child to
+        // split next). A non-splittable child scores `NEG_INFINITY`. Ties prefer the
+        // passes (right) child (`>=`), deterministic.
+        let right_gain = best_split_for_leaf(
+            matrix,
+            &bs.right_docs,
+            der1,
+            weight,
+            scaled_l2,
+            min_data_in_leaf,
+            score_function,
+        )
+        .map_or(f64::NEG_INFINITY, |b| b.gain);
+        let left_gain = best_split_for_leaf(
+            matrix,
+            &bs.left_docs,
+            der1,
+            weight,
+            scaled_l2,
+            min_data_in_leaf,
+            score_function,
+        )
+        .map_or(f64::NEG_INFINITY, |b| b.gain);
+
+        splits.push(bs.split);
+        if right_gain >= left_gain {
+            // The passes (`value > border`) child continues → direction `true`; the
+            // not-passes child (left_docs) diverges into this level's terminal bin.
+            directions.push(true);
+            terminal_docs.push(bs.left_docs);
+            frontier = bs.right_docs;
+        } else {
+            directions.push(false);
+            terminal_docs.push(bs.right_docs);
+            frontier = bs.left_docs;
+        }
+    }
+
+    if splits.is_empty() {
+        // The root never split → no region path (degenerate, matching the leaf-wise
+        // `Degenerate` contract for a root with no beneficial candidate).
+        return Err(CbError::Degenerate(
+            "region grower produced no split (root gain below the 1e-9 cutoff or too \
+             few documents)"
+                .to_owned(),
+        ));
+    }
+
+    let depth = splits.len();
+    // Assign each object its terminal bin (`AddRegionImpl` bin). Objects in
+    // `terminal_docs[k]` diverged at level `k` → bin `k`; the surviving `frontier`
+    // matched every direction → bin `depth`. Default `0` is overwritten for every
+    // object (each object lands in exactly one terminal set).
+    let mut leaf_of: Vec<usize> = vec![0usize; n_objects];
+    for (bin, docs) in terminal_docs.iter().enumerate() {
+        for &obj in docs {
+            if let Some(slot) = leaf_of.get_mut(obj) {
+                *slot = bin;
+            }
+        }
+    }
+    for &obj in &frontier {
+        if let Some(slot) = leaf_of.get_mut(obj) {
+            *slot = depth;
+        }
+    }
+
+    Ok(GrownTree {
+        splits,
+        leaf_of,
+        ctr_splits: Vec::new(),
+        level_kinds: Vec::new(),
+        step_nodes: Vec::new(),
+        node_id_to_leaf_id: Vec::new(),
+        region_directions: directions,
+        // CPU float grower emits `value > border` splits only (no one-hot).
+        region_one_hot: vec![false; depth],
     })
 }
 
@@ -1516,6 +1681,8 @@ pub fn greedy_tensor_search_oblivious_ordered(
         level_kinds: Vec::new(),
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
+        region_directions: Vec::new(),
+        region_one_hot: Vec::new(),
     })
 }
 
@@ -1953,6 +2120,8 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
         level_kinds,
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
+        region_directions: Vec::new(),
+        region_one_hot: Vec::new(),
     })
 }
 
@@ -2346,5 +2515,11 @@ pub fn greedy_tensor_search_oblivious_pairwise(
         level_kinds: Vec::new(),
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
+        region_directions: Vec::new(),
+        region_one_hot: Vec::new(),
     })
 }
+
+#[cfg(test)]
+#[path = "region_grow_test.rs"]
+mod region_grow_test;

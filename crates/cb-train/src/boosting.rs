@@ -45,8 +45,8 @@ use crate::candidates::tensor_ctr_candidates;
 use crate::tree::{
     check_depth, greedy_tensor_search_oblivious_ordered, greedy_tensor_search_oblivious_pairwise,
     greedy_tensor_search_oblivious_perturbed, greedy_tensor_search_oblivious_with_ctr, leaf_index,
-    leaf_wise_grower, CtrSplitSpec, FeatureMatrix, GrownTree, LeafWisePolicy, LevelKind,
-    Perturbation, Split,
+    leaf_wise_grower, region_grower, CtrSplitSpec, FeatureMatrix, GrownTree, LeafWisePolicy,
+    LevelKind, Perturbation, Split,
 };
 
 /// Per-iteration PRE-bootstrap draws on the persistent RNG (train.cpp:208,211):
@@ -1365,16 +1365,15 @@ fn validate_monotone_constraints(monotone_constraints: &[i8]) -> CbResult<()> {
 /// Both guards were DEFERRED by Plan 06.6-02 (the `grow_policy` enum did not yet
 /// exist); this is the enablement point Plan 06.6-04 owns.
 fn validate_grow_policy(grow_policy: EGrowPolicy, monotone_constraints: &[i8]) -> CbResult<()> {
-    if grow_policy == EGrowPolicy::Region {
-        return Err(CbError::OutOfRange(
-            "grow_policy=Region is not supported on the CPU training path \
-             (escalated gap, D-6.6-04 \"Region OUT\")"
-                .to_owned(),
-        ));
-    }
-    if grow_policy.is_non_symmetric() && !monotone_constraints.is_empty() {
+    // GPUT-18 / D-03a: the "Region OUT" rejection is LIFTED — Region now grows on the
+    // CPU as a `TRegionModel`-style path (`region_grower`). The monotone guard below
+    // STILL rejects Region + monotone_constraints (upstream rejects monotone
+    // constraints for every non-symmetric grow policy, region included).
+    let non_symmetric_policy =
+        grow_policy.is_non_symmetric() || grow_policy == EGrowPolicy::Region;
+    if non_symmetric_policy && !monotone_constraints.is_empty() {
         return Err(CbError::OutOfRange(format!(
-            "monotone_constraints are unsupported for non-symmetric trees \
+            "monotone_constraints are unsupported for non-symmetric / region trees \
              (grow_policy={grow_policy:?}); upstream rejects them \
              (monotonic_constraint_utils.h:42). Use grow_policy=SymmetricTree for \
              monotone constraints (D-6.6-07)."
@@ -2870,7 +2869,7 @@ fn train_inner<R: Runtime>(
     // GPUT-18 / D-03a: Region PATH trees accumulate here under `grow_policy=Region`.
     // Empty for every oblivious / non-symmetric model (the grower + push land in the
     // Region dispatch arm below).
-    let region_trees: Vec<RegionTree> = Vec::new();
+    let mut region_trees: Vec<RegionTree> = Vec::new();
 
     // Overfitting detection / use_best_model (TRAIN-06) + per-iteration eval-set
     // metric logging (TRAIN-07). The detector + best-model tracker consume the
@@ -3500,6 +3499,21 @@ fn train_inner<R: Runtime>(
         // pointer-walk land in 06.6-05). Region is rejected up front by
         // `validate_grow_policy`, so it never reaches here.
         let grown: GrownTree = match params.grow_policy {
+            // GPUT-18 / D-03a: Region grows a single PATH (d+1 leaves) via the
+            // dedicated `region_grower` — NOT the leaf-wise node-graph grower
+            // (Pitfall 2) and NOT the oblivious grower. It scores against the SAME
+            // perturbation-free whole-fold der/weights the plain path uses (the
+            // in-scope Region fixtures pin random_strength=0 + bootstrap_type=No).
+            EGrowPolicy::Region => region_grower(
+                &matrix,
+                &score_weighted_der1,
+                &score_weights,
+                scaled_l2,
+                params.depth,
+                params.min_data_in_leaf,
+                n,
+                params.score_function,
+            )?,
             EGrowPolicy::Lossguide | EGrowPolicy::Depthwise => {
                 let policy = if params.grow_policy == EGrowPolicy::Depthwise {
                     LeafWisePolicy::Depthwise
@@ -3525,9 +3539,9 @@ fn train_inner<R: Runtime>(
                     params.score_function,
                 )?
             }
-            // SymmetricTree (and the never-reached Region): the literal existing
-            // oblivious grower chain, UNCHANGED.
-            EGrowPolicy::SymmetricTree | EGrowPolicy::Region => {
+            // SymmetricTree: the literal existing oblivious grower chain, UNCHANGED
+            // (Region now has its own arm above — GPUT-18).
+            EGrowPolicy::SymmetricTree => {
             if is_pairwise_scoring(&params.loss) {
             // PAIRWISE SPLIT-SCORING (LOSS-04, Plan 06.3-16): `*Pairwise` losses
             // (`IsPairwiseScoring`) score candidate splits through upstream's
@@ -3648,7 +3662,10 @@ fn train_inner<R: Runtime>(
         // leaf-value estimation below so the reductions cover exactly this tree's
         // leaves. For the oblivious path `grown.step_nodes` is empty and this is the
         // unchanged `2^depth` (byte-identical, D-6.6-05).
-        let n_leaves: usize = if grown.step_nodes.is_empty() {
+        let n_leaves: usize = if !grown.region_directions.is_empty() {
+            // GPUT-18: a depth-d region path has exactly d+1 leaves (bins 0..=depth).
+            grown.region_directions.len() + 1
+        } else if grown.step_nodes.is_empty() {
             n_leaves
         } else {
             grown
@@ -4245,7 +4262,19 @@ fn train_inner<R: Runtime>(
         // (`step_nodes` / `node_id_to_leaf_id`) + per-node `splits`; the oblivious
         // path is byte-identical (empty `step_nodes` → `ObliviousTree`). A model is
         // EITHER all-oblivious or all-non-symmetric, so only one vec is ever pushed.
-        if grown.step_nodes.is_empty() {
+        if !grown.region_directions.is_empty() {
+            // GPUT-18 / D-03a: a region PATH tree — per-level split + continue
+            // direction + one-hot flag, with bin-indexed leaf values (length
+            // depth+1). A model is EITHER all-oblivious OR all-non-sym OR all-region,
+            // so only `region_trees` is pushed here.
+            region_trees.push(RegionTree {
+                splits: grown.splits,
+                directions: grown.region_directions,
+                one_hot: grown.region_one_hot,
+                leaf_values,
+                leaf_weights,
+            });
+        } else if grown.step_nodes.is_empty() {
             trees.push(ObliviousTree {
                 splits: grown.splits,
                 ctr_splits,
@@ -4317,6 +4346,9 @@ fn train_inner<R: Runtime>(
             // too so `use_best_model` is not a silent no-op there (WR-01). No-op
             // when `non_symmetric_trees` is empty (oblivious models).
             non_symmetric_trees.truncate(best + 1);
+            // GPUT-18: region models push every tree into `region_trees`; truncate
+            // it too so use_best_model is not a silent no-op there. No-op when empty.
+            region_trees.truncate(best + 1);
         }
     }
 

@@ -97,11 +97,11 @@ pub use boosting::{
     permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_ranking,
     train_with_eval, train_with_eval_sets, BoostParams, EBoostingType, EGrowPolicy, EvalSet, Model,
-    NonSymmetricTree, ObliviousTree, RankingData,
+    NonSymmetricTree, ObliviousTree, RankingData, RegionTree,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, greedy_tensor_search_oblivious_ordered,
     greedy_tensor_search_oblivious_with_ctr, grow_one_hot_tree, leaf_index, leaf_wise_grower,
-    select_best_candidate, AnySplit, Candidate, CtrSplitSpec, FeatureMatrix, GrownOneHotTree,
-    GrownTree, LeafWisePolicy, LevelKind, OneHotSplit, Split, MAX_DEPTH,
+    region_grower, select_best_candidate, AnySplit, Candidate, CtrSplitSpec, FeatureMatrix,
+    GrownOneHotTree, GrownTree, LeafWisePolicy, LevelKind, OneHotSplit, Split, MAX_DEPTH,
 };
