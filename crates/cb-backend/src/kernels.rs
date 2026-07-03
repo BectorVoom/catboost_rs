@@ -2460,6 +2460,157 @@ pub fn vector_div_kernel<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F
     }
 }
 
+// ===========================================================================
+// Plan 10-05 (GPUT-16): bit-compression pack / unpack (upstream `compression.cu`
+// `TCompressionHelper`, CATBOOST_CUDA_KERNELS_DESIGN §6.1). Packs an ≤8-bit bin
+// column into shared 32-bit words (`bitsPerKey = ceil(log2(n_bins+1))`,
+// `keysPerWord = 32/bitsPerKey`, `Mask = (1<<bitsPerKey)-1`) so the bit-packed
+// cindex (10-06) can address each field by (Offset, Shift, Mask). Both kernels are
+// pure `u32` integer transforms (bit-exact — tighter than the ≤1e-4 float bar, D-07);
+// the `<F: Float>` phantom (`let _ = F::new(0.0)`) keeps the launch signature uniform
+// with the other primitives (mirrors [`update_partition_sizes_kernel`]). The host-side
+// layout helper [`bit_pack_layout`] computes the comptime bit geometry with checked
+// arithmetic (T-10-12). The self-oracle lives in `kernels/compression.rs`.
+// ===========================================================================
+
+/// Bit geometry for packing an `n`-length ≤8-bit bin column into shared 32-bit words
+/// (upstream `TCompressionHelper`). `bits_per_key = ceil(log2(n_bins+1))` (bits needed
+/// to hold bin values `0..=n_bins`), `keys_per_word = 32/bits_per_key`,
+/// `mask = (1<<bits_per_key)-1`, `num_words = ceil(n / keys_per_word)`.
+// `pub(crate)` + consumed by the 10-05 self-oracle now and by the 10-06 bit-packed
+// cindex builder next; `allow(dead_code)` so the default (cpu, non-test) build does not
+// warn on the not-yet-wired production consumer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BitPackLayout {
+    /// Bits per packed key (`ceil(log2(n_bins+1))`, clamped to `1..=32`).
+    pub bits_per_key: u32,
+    /// Keys packed per 32-bit word (`32 / bits_per_key`).
+    pub keys_per_word: u32,
+    /// Extraction mask (`(1<<bits_per_key)-1`).
+    pub mask: u32,
+    /// Number of 32-bit words needed to hold `n` keys.
+    pub num_words: usize,
+}
+
+/// Compute the [`BitPackLayout`] for a feature with `n_bins` distinct border bins over
+/// `n` objects. Every arithmetic step that can overflow (`n_bins+1`, the mask shift, the
+/// word-count reconstruction) is CHECKED and surfaces as [`CbError::OutOfRange`] (T-10-12
+/// — no unguarded shift/mul crosses the host→device boundary). Borders/quantization stay
+/// host-side; this only sizes the packing.
+#[allow(dead_code)]
+pub(crate) fn bit_pack_layout(n_bins: u32, n: usize) -> CbResult<BitPackLayout> {
+    // Distinct values to represent = n_bins + 1 (bins 0..=n_bins).
+    let distinct = n_bins.checked_add(1).ok_or_else(|| {
+        CbError::OutOfRange(format!("bit_pack_layout: n_bins {n_bins} + 1 overflows u32"))
+    })?;
+    // bits_per_key = ceil(log2(distinct)), at least 1 (a single-value column still needs
+    // one bit so keys_per_word is well-defined).
+    let bits_per_key = if distinct <= 1 { 1u32 } else { (distinct - 1).ilog2() + 1 };
+    if bits_per_key == 0 || bits_per_key > 32 {
+        return Err(CbError::OutOfRange(format!(
+            "bit_pack_layout: bits_per_key {bits_per_key} out of 1..=32 for n_bins {n_bins}"
+        )));
+    }
+    let keys_per_word = 32u32 / bits_per_key;
+    if keys_per_word == 0 {
+        return Err(CbError::OutOfRange(format!(
+            "bit_pack_layout: keys_per_word 0 (bits_per_key {bits_per_key} > 32)"
+        )));
+    }
+    // mask = (1 << bits_per_key) - 1. `checked_shl` rejects a 32-shift (Rust UB); the
+    // full-width case is all-ones.
+    let mask = if bits_per_key == 32 {
+        u32::MAX
+    } else {
+        1u32.checked_shl(bits_per_key)
+            .ok_or_else(|| {
+                CbError::OutOfRange(format!("bit_pack_layout: 1 << {bits_per_key} overflows u32"))
+            })?
+            - 1
+    };
+    let num_words = n.div_ceil(keys_per_word as usize);
+    // Guard the word-count × keys_per_word reconstruction the kernels index with
+    // (`word_idx * keys_per_word + slot`); a silent usize overflow here would corrupt
+    // the pack address (T-10-12).
+    num_words.checked_mul(keys_per_word as usize).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "bit_pack_layout: num_words {num_words} * keys_per_word {keys_per_word} overflows usize"
+        ))
+    })?;
+    Ok(BitPackLayout {
+        bits_per_key,
+        keys_per_word,
+        mask,
+        num_words,
+    })
+}
+
+/// `pack`: pack an ≤8-bit bin column `bins` (each `u32` holds one bin value) into shared
+/// 32-bit `words` (upstream `compression.cu` pack). Each thread OWNS one output word and
+/// loops over the `keys_per_word` keys that land in it, OR-ing `(bins[key] & mask) <<
+/// (slot * bits_per_key)` into its private accumulator — one thread per word ⇒ NO
+/// cross-lane `|=` race, so the pack is deterministic and order-independent (T-10-14).
+///
+/// `bits_per_key` / `keys_per_word` / `mask` are `#[comptime]` (the JIT resolves the bit
+/// geometry — no runtime bit-width branch). Bounds-guarded (T-10-12); no `-inf` literal
+/// (T-10-14). Pure `u32` transform; the `<F: Float>` phantom keeps the launch signature
+/// uniform (`let _ = F::new(0.0)`).
+#[cube(launch)]
+pub fn pack_bins_kernel<F: Float>(
+    bins: &Array<u32>,
+    words: &mut Array<u32>,
+    #[comptime] bits_per_key: u32,
+    #[comptime] keys_per_word: u32,
+    #[comptime] mask: u32,
+) {
+    let _ = F::new(0.0);
+    let word_idx = ABSOLUTE_POS;
+    if word_idx < words.len() {
+        let n = bins.len();
+        let base = word_idx * (keys_per_word as usize);
+        let mut w = 0u32;
+        let mut slot = 0u32;
+        while slot < keys_per_word {
+            let key_idx = base + slot as usize;
+            if key_idx < n {
+                let field = (bins[key_idx] & mask) << (slot * bits_per_key);
+                w |= field;
+            }
+            slot += 1u32;
+        }
+        words[word_idx] = w;
+    }
+}
+
+/// `unpack`: extract key `i`'s bin field from the packed `words` (upstream
+/// `compression.cu` unpack / the `read_bin` accessor the cindex consumes). Key `i` lives
+/// in word `i / keys_per_word` at slot `i % keys_per_word`, so its value is
+/// `(words[word_idx] >> (slot * bits_per_key)) & mask`. One indexed read + one write per
+/// lane — multiple keys sharing a word each extract their OWN field via their distinct
+/// `Shift`, so pack∘unpack is bit-exact.
+///
+/// `bits_per_key` / `keys_per_word` / `mask` are `#[comptime]`. Bounds-guarded (T-10-12);
+/// no `-inf` literal (T-10-14). Pure `u32` transform; `<F: Float>` phantom.
+#[cube(launch)]
+pub fn unpack_bins_kernel<F: Float>(
+    words: &Array<u32>,
+    out: &mut Array<u32>,
+    #[comptime] bits_per_key: u32,
+    #[comptime] keys_per_word: u32,
+    #[comptime] mask: u32,
+) {
+    let _ = F::new(0.0);
+    let i = ABSOLUTE_POS;
+    if i < out.len() {
+        let kpw = keys_per_word as usize;
+        let word_idx = i / kpw;
+        let slot = (i % kpw) as u32;
+        let shift = slot * bits_per_key;
+        out[i] = (words[word_idx] >> shift) & mask;
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -2516,6 +2667,15 @@ mod partitions;
 // `SelectedRuntime`, so it builds/runs under EVERY backend.
 #[cfg(test)]
 mod fill_transform;
+
+// Bit-compression pack/unpack primitive oracle (source/test separation, Plan 10-05
+// GPUT-16): the pack∘unpack BIT-EXACT round-trip self-oracle vs an inline serial
+// pack/unpack reference (D-02, integer equality — tighter than ≤1e-4, D-07) plus the
+// `bit_pack_layout` checked-arithmetic guard tests live in `kernels/compression.rs`,
+// mounted at `kernels::compression`. Runs over the generic `SelectedRuntime`, so it
+// builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
+#[cfg(test)]
+mod compression;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
