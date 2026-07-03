@@ -67,7 +67,8 @@ pub use ranking_der::{
     Competitor as RankingCompetitor, GroupSpan,
 };
 pub use runtime::{
-    Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime, StochasticRankMetric,
+    DeviceGrownTree, Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime,
+    StochasticRankMetric,
     EXPECTILE_ALPHA_DEFAULT, QUERYSOFTMAX_BETA_DEFAULT, QUERYSOFTMAX_LAMBDA_DEFAULT,
     STOCHASTIC_RANK_LAMBDA_DEFAULT, STOCHASTIC_RANK_MU_DEFAULT,
     STOCHASTIC_RANK_NUM_ESTIMATIONS_DEFAULT, STOCHASTIC_RANK_NU_DEFAULT,

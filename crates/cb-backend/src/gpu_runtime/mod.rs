@@ -391,6 +391,16 @@ pub use der_seams::*;
 mod pairwise; // Phase 7.4/7.5 pairwise histogram + scan/score + pairwise grow driver.
 pub use pairwise::*;
 
+mod session; // Phase 10-07 (GPUT-02/03): the per-fit device-resident training session.
+pub use session::*;
+
+// Phase 10-07 (GPUT-02/03): the GpuTrainSession residency cross-oracle (source/test
+// separation) — begin uploads once, grow_one reuses the resident handles + chains der1 on
+// device, structure matches the CPU multi-tree boosting reference; the coverage gate
+// declines depth>1 / non-RMSE-Logloss / non-Plain / fold_count>1. rocm in-env on gfx1100.
+#[cfg(test)]
+mod session_residency;
+
 // Phase 10-06 (GPUT-15): the bit-packed compressed index (cindex) builder — the
 // grouped `WriteCompressedIndex` layout + per-feature `TCFeature` table the histogram /
 // partition consumers read through the ONE `kernels::read_bin` accessor. `pub(crate)` so
