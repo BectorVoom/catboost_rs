@@ -2935,7 +2935,13 @@ fn train_inner<R: Runtime>(
         && matches!(params.bootstrap_type, EBootstrapType::No)
         && params.random_strength == 0.0
         && eval_sets.is_empty()
-        && matrix.n_features() > 0;
+        && matrix.n_features() > 0
+        // CR-01: the device session always seeds its resident approx to zero
+        // (`GpuTrainSession::begin`), so a non-zero starting bias — e.g.
+        // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must
+        // fall back to the CPU grower (D-04) rather than train against a wrong
+        // (zero) starting point. `bias` is the computed `starting_approx` above.
+        && bias == 0.0;
 
     // The leaf-regularization is constant across the fit for the device-eligible
     // config (fixed weights / n, no per-tree sampling), so it is computed ONCE and
