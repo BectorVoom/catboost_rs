@@ -2313,6 +2313,86 @@ pub fn reorder_one_bit_scatter_kernel<F: Float>(
     }
 }
 
+// ===========================================================================
+// Plan 10-04 (GPUT-16): TDataPartition {Offset,Size} update (upstream
+// `partitions.cu` `UpdatePartitionOffsets` / `UpdatePartitionSizes`,
+// CATBOOST_CUDA_KERNELS_DESIGN §6.1/§2). From a SORTED partition-id array the two
+// kernels produce, per partition, the contiguous `{Offset,Size}` the depth>1
+// histograms (Phase 11) key on. They CONSUME the 10-01 exclusive `full_scan` (the
+// head-flag scan → per-element run index) exactly as reduce-by-key does; the
+// self-oracle lives in `kernels/partitions.rs`.
+// ===========================================================================
+
+/// TDataPartition offsets (phase A). Given a SORTED `part_ids` array, the per-element
+/// key-run HEAD flags (`i==0 || part_ids[i]!=part_ids[i-1]`, produced by
+/// [`key_head_flag_kernel`]) and `run_ids` = the EXCLUSIVE [`full_scan`] of those flags
+/// (each element's 0-based distinct-run index — the 10-01 scan reuse), every HEAD writes:
+/// - its start position `i` into the COMPACT `run_starts[run_id]` and its partition value
+///   into `run_keys[run_id]` (the run→partition map consumed by the size kernel), AND
+/// - its start position `i` directly into `offsets[part_ids[i]]` (the partition's Offset).
+///
+/// Each HEAD owns a DISTINCT `run_id` and a DISTINCT partition value, so no write
+/// collides — deterministic. Partitions with NO elements are never written, so they keep
+/// their host-seeded `{Offset:0}` (a well-defined empty offset). `run_ids` values are
+/// exact small integers held in `F` (sums of `0.0`/`1.0`), so `u32::cast_from` is exact.
+///
+/// Generic over `F: Float` (the scan channel); ids/positions are `u32`. One write per
+/// lane, bounds-guarded (T-10-09); no `-inf` literal (T-10-10).
+#[cube(launch)]
+pub fn update_partition_offsets_kernel<F: Float>(
+    part_ids: &Array<u32>,
+    flags: &Array<F>,
+    run_ids: &Array<F>,
+    offsets: &mut Array<u32>,
+    run_keys: &mut Array<u32>,
+    run_starts: &mut Array<u32>,
+) {
+    let i = ABSOLUTE_POS;
+    if i < part_ids.len() {
+        if flags[i] > F::new(0.5) {
+            let r = u32::cast_from(run_ids[i]);
+            let p = part_ids[i];
+            run_keys[r as usize] = p;
+            run_starts[r as usize] = i as u32;
+            offsets[p as usize] = i as u32;
+        }
+    }
+}
+
+/// TDataPartition sizes (phase B). Given the COMPACT `run_keys` / `run_starts` from
+/// [`update_partition_offsets_kernel`] (one entry per distinct run) plus the total
+/// element count `n`, each run `r` writes its length into `sizes[run_keys[r]]`:
+///
+/// ```text
+/// end  = (r + 1 < num_runs) ? run_starts[r+1] : n
+/// size = end - run_starts[r]
+/// ```
+///
+/// Runs are contiguous and cover `[0, n)`, so this is exactly each partition's element
+/// count. Partitions with NO run keep their host-seeded `{Size:0}`. Launch geometry is
+/// one lane per run (`num_runs` lanes); bounds-guarded (T-10-09); no `-inf` literal
+/// (T-10-10). Generic over `F: Float` for launch-signature symmetry (ids are `u32`).
+#[cube(launch)]
+pub fn update_partition_sizes_kernel<F: Float>(
+    run_keys: &Array<u32>,
+    run_starts: &Array<u32>,
+    sizes: &mut Array<u32>,
+    n: u32,
+    num_runs: u32,
+) {
+    let _ = F::new(0.0);
+    let r = ABSOLUTE_POS;
+    if r < run_keys.len() {
+        let start = run_starts[r as usize];
+        let mut end = n;
+        if (r as u32) + 1u32 < num_runs {
+            end = run_starts[(r + 1) as usize];
+        }
+        let p = run_keys[r as usize];
+        sizes[p as usize] = end - start;
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -2353,6 +2433,14 @@ mod segmented_scan;
 // EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod sort;
+
+// TDataPartition {Offset,Size} update oracle (source/test separation, Plan 10-04
+// GPUT-16): the offset/size update self-oracle vs an inline serial partition-
+// bookkeeping reference (D-02), including an empty-partition case, lives in
+// `kernels/partitions.rs`, mounted at `kernels::partitions`. Runs over the generic
+// `SelectedRuntime`, so it builds/runs under EVERY backend.
+#[cfg(test)]
+mod partitions;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
