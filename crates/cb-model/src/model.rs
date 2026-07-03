@@ -134,17 +134,64 @@ pub struct NonSymmetricTree {
     pub leaf_weights: Vec<f64>,
 }
 
-/// A tree in the canonical model: EITHER an oblivious (symmetric) tree OR a
-/// non-symmetric (Lossguide / Depthwise) tree (FEAT-06 / D-6.6-05). Every tree
-/// consumer (apply / SHAP / fstr / serialize) matches this enum exhaustively so
-/// the non-symmetric arm can never be silently dropped, and the oblivious arm
-/// stays byte-identical to the pre-6.6 path.
+/// One level of a [`RegionTree`] path (GPUT-18 / D-03a): a split test plus the
+/// CONTINUE direction the walk follows while the test matches. Mirrors upstream's
+/// `TRegionDirection { ui16 Bin; ui16 Value; }` + the `takeEqualAndSplitDirection`
+/// bit-packing (`add_model_value.cu:229` — one-hot in bit 0, expected direction in
+/// bit 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionLevel {
+    /// The split test at this level (a `value > border` float test, or a CTR test).
+    /// The CPU grower emits float splits only; the CTR / device paths may add more.
+    pub split: ModelSplit,
+    /// The CONTINUE direction: the walk descends to the next level while
+    /// `passes(split) == expected_direction`, otherwise it diverges into this
+    /// level's terminal leaf.
+    pub expected_direction: bool,
+    /// One-hot flag (`feature.OneHotFeature`): when `true` the split is an equality
+    /// test rather than `>`. Always `false` for the CPU float grower; carried for
+    /// round-trip fidelity + device parity (Plan 04).
+    pub one_hot: bool,
+}
+
+/// One REGION tree in the canonical model (GPUT-18 / D-03a): upstream's
+/// `TRegionModel` — an oblivious-like PATH walked while each level's computed split
+/// matches the stored direction, diverging into a terminal leaf otherwise. A
+/// depth-`d` Region has `d` [`RegionLevel`]s and exactly `d + 1` leaves (leaf `k`
+/// for `0 <= k < depth` holds objects that diverged at level `k`; leaf `depth`
+/// holds objects that matched every direction).
+///
+/// This is a PATH model — the apply walk ([`crate::apply`] `region_leaf`) is
+/// `bin = 0; for level { if passes == expected_direction { bin += 1 } else { break }
+/// } leaf = bin`. It is DISTINCT from [`NonSymmetricTree`]'s binary node graph and
+/// MUST NOT be modeled with `step_nodes` (leaf count `2^depth` is the failure
+/// signal, Pitfall 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionTree {
+    /// The per-level path splits + directions, in walk order, length `depth`.
+    pub levels: Vec<RegionLevel>,
+    /// Leaf values in bin order (dimension-major for multi-output,
+    /// `leaf_values[d * n_leaves + l]`), length `(depth + 1) * dim`. Indexed
+    /// DIRECTLY by the walk's `bin` (0..=depth).
+    pub leaf_values: Vec<f64>,
+    /// Per-leaf summed training-document weights, same bin order as `leaf_values`,
+    /// length `depth + 1`.
+    pub leaf_weights: Vec<f64>,
+}
+
+/// A tree in the canonical model: an oblivious (symmetric) tree, a non-symmetric
+/// (Lossguide / Depthwise) tree (FEAT-06 / D-6.6-05), OR a region path (GPUT-18 /
+/// D-03a). Every tree consumer (apply / SHAP / fstr / serialize) matches this enum
+/// exhaustively so no arm can be silently dropped, and the oblivious arm stays
+/// byte-identical to the pre-6.6 path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TreeVariant {
     /// A symmetric oblivious tree (the pre-6.6 path, BYTE-IDENTICAL).
     Oblivious(ObliviousTree),
     /// A non-symmetric (Lossguide / Depthwise) tree.
     NonSymmetric(NonSymmetricTree),
+    /// A region path tree (GPUT-18).
+    Region(RegionTree),
 }
 
 impl TreeVariant {
@@ -153,7 +200,7 @@ impl TreeVariant {
     pub fn as_oblivious(&self) -> Option<&ObliviousTree> {
         match self {
             Self::Oblivious(t) => Some(t),
-            Self::NonSymmetric(_) => None,
+            Self::NonSymmetric(_) | Self::Region(_) => None,
         }
     }
 
@@ -163,17 +210,27 @@ impl TreeVariant {
     pub fn as_non_symmetric(&self) -> Option<&NonSymmetricTree> {
         match self {
             Self::NonSymmetric(t) => Some(t),
-            Self::Oblivious(_) => None,
+            Self::Oblivious(_) | Self::Region(_) => None,
+        }
+    }
+
+    /// The region tree if this is an [`TreeVariant::Region`], else `None`.
+    #[must_use]
+    pub fn as_region(&self) -> Option<&RegionTree> {
+        match self {
+            Self::Region(t) => Some(t),
+            Self::Oblivious(_) | Self::NonSymmetric(_) => None,
         }
     }
 
     /// This tree's leaf values (forward-bit order for oblivious, flat-node leaf
-    /// order for non-symmetric).
+    /// order for non-symmetric, bin order for region).
     #[must_use]
     pub fn leaf_values(&self) -> &[f64] {
         match self {
             Self::Oblivious(t) => &t.leaf_values,
             Self::NonSymmetric(t) => &t.leaf_values,
+            Self::Region(t) => &t.leaf_values,
         }
     }
 
@@ -183,6 +240,7 @@ impl TreeVariant {
         match self {
             Self::Oblivious(t) => &t.leaf_weights,
             Self::NonSymmetric(t) => &t.leaf_weights,
+            Self::Region(t) => &t.leaf_weights,
         }
     }
 }
@@ -221,6 +279,12 @@ pub struct Model {
     /// policies within one model). The grower (06.6-04) populates this; the
     /// pointer-walk apply (06.6-05) consumes it.
     pub non_symmetric_trees: Vec<NonSymmetricTree>,
+    /// The region path trees in boosting order (GPUT-18 / D-03a). EMPTY for every
+    /// oblivious / non-symmetric model (a model is EITHER all-oblivious OR
+    /// all-non-symmetric OR all-region — never mixed), so those `.cbm` / json /
+    /// apply paths stay byte-identical. The Region grower (Plan 12-02) populates
+    /// this; the walk-until-diverge apply (`predict_raw_one`) consumes it.
+    pub region_trees: Vec<RegionTree>,
     /// The starting approx / model bias.
     pub bias: f64,
     /// Per-float-feature ascending candidate borders (`float_feature_borders[f]`
@@ -321,9 +385,38 @@ impl Model {
                 }
             })
             .collect();
+        // GPUT-18 / D-03a: lift the Region grower output into `TreeVariant::Region`
+        // shaped `RegionTree`s. Each per-level float split becomes a
+        // `ModelSplit::Float` (exactly as the oblivious / non-sym lifts do), zipped
+        // with its continue direction + one-hot flag. A model is EITHER all-oblivious
+        // OR all-non-sym OR all-region, so for a non-region model
+        // `trained.region_trees` is empty and this is a no-op (the other lift paths
+        // stay byte-identical, D-04).
+        let region_trees = trained
+            .region_trees
+            .iter()
+            .map(|t| {
+                let levels: Vec<RegionLevel> = t
+                    .splits
+                    .iter()
+                    .enumerate()
+                    .map(|(level, s)| RegionLevel {
+                        split: ModelSplit::Float(*s),
+                        expected_direction: t.directions.get(level).copied().unwrap_or(false),
+                        one_hot: t.one_hot.get(level).copied().unwrap_or(false),
+                    })
+                    .collect();
+                RegionTree {
+                    levels,
+                    leaf_values: t.leaf_values.clone(),
+                    leaf_weights: t.leaf_weights.clone(),
+                }
+            })
+            .collect();
         Self {
             oblivious_trees,
             non_symmetric_trees,
+            region_trees,
             bias: trained.bias,
             float_feature_borders,
             ctr_data: None,

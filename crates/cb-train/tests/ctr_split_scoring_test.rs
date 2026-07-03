@@ -437,6 +437,7 @@ fn single_ctr_split_model(
     cb_model::Model {
         oblivious_trees: vec![tree],
         non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
         bias: 0.0,
         float_feature_borders: Vec::new(),
         ctr_data: Some(ctr_data),

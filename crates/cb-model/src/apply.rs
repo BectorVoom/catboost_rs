@@ -266,6 +266,42 @@ fn leaf_index_nonsym(
     None
 }
 
+/// The walk-until-diverge leaf index of one object in one REGION tree (GPUT-18 /
+/// D-03a, transcribing `add_model_value.cu::AddRegionImpl` / `ComputeRegionBinsImpl`).
+///
+/// Walks the path levels from the root: `bin = 0`; at each level compute
+/// `split = passes_split(level)`, and while `split == expected_direction` advance
+/// (`bin += 1`); on the FIRST mismatch the path diverges and the walk HALTS. The
+/// returned leaf is `bin` — the depth reached along the region path (`0..=depth`).
+/// A depth-`d` region therefore has exactly `d + 1` reachable leaves.
+///
+/// All leaf/level access is checked, so a malformed region (missing level, short
+/// `leaf_values`) yields a bounded walk and the caller contributes `0.0` rather than
+/// panicking (T-12-03 — mirror of [`leaf_index_nonsym`]'s defensive discipline). The
+/// walk is intrinsically bounded by the level count (no cyclic-graph risk — a path
+/// visits each level at most once).
+fn region_leaf(
+    model: &Model,
+    tree: &crate::RegionTree,
+    features: &[f32],
+    cat_values: &[String],
+) -> usize {
+    let mut bin: usize = 0;
+    for level in &tree.levels {
+        // `passes` is the `value > border` (or CTR) test; `one_hot` equality is
+        // reserved for the device / categorical region path (Plan 04) and never
+        // emitted by the CPU float grower, so the float `>` test is authoritative
+        // here. The walk continues while the test matches the stored direction.
+        let passes = passes_split(model, &level.split, features, cat_values);
+        if passes == level.expected_direction {
+            bin += 1;
+        } else {
+            break;
+        }
+    }
+    bin
+}
+
 /// Apply every tree to one object and accumulate `bias + Σ_trees
 /// leaf_values[leaf]` (Steps B + C), branching per-tree on the model's tree
 /// VARIANT (D-6.6-05): an oblivious model walks `oblivious_trees` via the EXISTING
@@ -303,8 +339,19 @@ fn predict_raw_one(model: &Model, features: &[f32], cat_values: &[String]) -> f6
                 .unwrap_or(0.0)
         })
         .collect();
+    // Region arm: the walk-until-diverge path (GPUT-18). Empty for an oblivious /
+    // non-symmetric model, so this contributes nothing there. The bin leaf index
+    // is checked against `leaf_values` (a short buffer contributes 0.0, no panic).
+    let region: Vec<f64> = model
+        .region_trees
+        .iter()
+        .map(|tree| {
+            let leaf = region_leaf(model, tree, features, cat_values);
+            tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
+        })
+        .collect();
     // Σ_trees via the order-locked sum (D-08), THEN + bias exactly once.
-    model.bias + sum_f64(&oblivious) + sum_f64(&non_symmetric)
+    model.bias + sum_f64(&oblivious) + sum_f64(&non_symmetric) + sum_f64(&region)
 }
 
 /// Apply `model` to a numeric feature view, returning the per-object
@@ -689,3 +736,7 @@ pub fn apply_virtual_ensembles(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "region_apply_test.rs"]
+mod region_apply_test;

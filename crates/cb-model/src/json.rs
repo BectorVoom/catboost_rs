@@ -32,7 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ModelError;
-use crate::{Model, ModelSplit, NonSymmetricTree, ObliviousTree, Split};
+use crate::{Model, ModelSplit, NonSymmetricTree, ObliviousTree, RegionLevel, RegionTree, Split};
 
 /// The maximum non-symmetric `"trees"` nested-node recursion depth accepted by
 /// the converter (T-06.6-07): a crafted, deeply-nested model file cannot drive
@@ -116,6 +116,39 @@ struct FloatFeatureJson {
     nan_value_treatment: String,
 }
 
+/// One level of a region path (GPUT-18 / D-03a). A flat `(feature, border,
+/// direction, one_hot)` record — the region analogue of [`SplitJson`], carrying the
+/// continue direction the walk follows. A self-contained round-trip schema (Region
+/// is not part of the upstream numeric `model.json`; this establishes the CPU
+/// oracle Plan 04's device path reproduces).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegionLevelJson {
+    /// The split border (`value > border`).
+    border: f64,
+    /// The float feature this level tests.
+    float_feature_index: i64,
+    /// The CONTINUE direction: descend while `(value > border) == expected_direction`.
+    expected_direction: bool,
+    /// One-hot equality flag (always `false` for the CPU float grower).
+    #[serde(default)]
+    one_hot: bool,
+}
+
+/// One region tree: the ordered path levels + per-bin `leaf_values` / `leaf_weights`
+/// (GPUT-18). Structurally DISTINCT from `oblivious_trees` / `trees`; routed through
+/// the region top-level key so oblivious / non-symmetric exports stay byte-identical.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegionTreeJson {
+    /// The path levels in walk order (length `depth`).
+    levels: Vec<RegionLevelJson>,
+    /// Leaf values in LEAF-MAJOR wire order (`leaf_values[l * dim + d]`); at
+    /// `dim == 1` identical to the in-memory dimension-major bin order.
+    leaf_values: Vec<f64>,
+    /// Per-leaf summed weights (`#[serde(default)]` tolerates older fixtures).
+    #[serde(default)]
+    leaf_weights: Vec<f64>,
+}
+
 /// The `features_info` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FeaturesInfoJson {
@@ -141,6 +174,12 @@ struct ModelJsonDoc {
     /// byte-identical (the key is omitted entirely).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     trees: Vec<NonSymmetricNodeJson>,
+    /// All REGION path trees in boosting order (GPUT-18 / D-03a — a DISTINCT
+    /// top-level key). EMPTY for an oblivious / non-symmetric model;
+    /// `#[serde(default)]` + `skip_serializing_if` so those exports stay
+    /// byte-identical (the key is omitted entirely).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    region_trees: Vec<RegionTreeJson>,
     /// Upstream `[scale, [bias, …]]`; emitted as `[1, [bias]]` (Pitfall 6).
     scale_and_bias: serde_json::Value,
     /// The upstream `model_info` block — carries `class_params` /
@@ -461,10 +500,40 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
         .map(unflatten_non_symmetric)
         .collect();
 
+    // Region path trees → the region top-level key (GPUT-18). EMPTY for an
+    // oblivious / non-symmetric model, so `skip_serializing_if` omits the key and
+    // those exports stay byte-identical. Each level emits its FLOAT split only (a
+    // CTR region level is skipped, mirroring the oblivious float-only json export);
+    // the CPU grower emits float levels exclusively.
+    let region_trees = model
+        .region_trees
+        .iter()
+        .map(|t| {
+            let levels = t
+                .levels
+                .iter()
+                .filter_map(|lvl| {
+                    lvl.split.as_float().map(|s| RegionLevelJson {
+                        border: s.border,
+                        float_feature_index: i64::try_from(s.feature).unwrap_or(i64::MAX),
+                        expected_direction: lvl.expected_direction,
+                        one_hot: lvl.one_hot,
+                    })
+                })
+                .collect();
+            RegionTreeJson {
+                levels,
+                leaf_values: transpose_dim_major_to_leaf_major(&t.leaf_values, dim),
+                leaf_weights: t.leaf_weights.clone(),
+            }
+        })
+        .collect();
+
     ModelJsonDoc {
         features_info: FeaturesInfoJson { float_features },
         oblivious_trees,
         trees,
+        region_trees,
         // [1, [bias_d0, …]] — scale 1, a per-dimension bias vector (Pitfall 6).
         // At `dim == 1` this is exactly `[1, [bias]]` (byte-identical). The model
         // carries a single scalar bias this wave, so higher dimensions repeat it
@@ -590,6 +659,50 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         .map(flatten_non_symmetric)
         .collect::<Result<Vec<_>, ModelError>>()?;
 
+    // Region path trees (GPUT-18) → the canonical `RegionTree`. EMPTY for an
+    // oblivious / non-symmetric model (the `region_trees` key is absent → the paths
+    // above are byte-identical). Each level's float feature index is validated
+    // (negative → typed `Deserialize` error, no OOB); `leaf_values` un-transposes
+    // from LEAF-MAJOR back to the canonical dimension-major bin order.
+    let region_trees = doc
+        .region_trees
+        .iter()
+        .map(|t| {
+            let levels = t
+                .levels
+                .iter()
+                .map(|lvl| {
+                    let feature = usize::try_from(lvl.float_feature_index).map_err(|_| {
+                        ModelError::Deserialize(format!(
+                            "negative region float_feature_index {}",
+                            lvl.float_feature_index
+                        ))
+                    })?;
+                    Ok(RegionLevel {
+                        split: ModelSplit::Float(Split {
+                            feature,
+                            border: lvl.border,
+                        }),
+                        expected_direction: lvl.expected_direction,
+                        one_hot: lvl.one_hot,
+                    })
+                })
+                .collect::<Result<Vec<_>, ModelError>>()?;
+            let leaf_values = transpose_leaf_major_to_dim_major(&t.leaf_values, dim);
+            let n_leaves = if dim == 0 { t.leaf_values.len() } else { t.leaf_values.len() / dim };
+            let leaf_weights = if t.leaf_weights.len() == n_leaves {
+                t.leaf_weights.clone()
+            } else {
+                vec![0.0; n_leaves]
+            };
+            Ok(RegionTree {
+                levels,
+                leaf_values,
+                leaf_weights,
+            })
+        })
+        .collect::<Result<Vec<_>, ModelError>>()?;
+
     // Recover the SORTED distinct class labels from `model_info.class_params`
     // (falling back to `multiclass_params`), CR-01 / LOSS-02. Absent for a scalar
     // model (empty vector — the Class transform then falls back to the raw class
@@ -603,6 +716,7 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
     Ok(Model {
         oblivious_trees,
         non_symmetric_trees,
+        region_trees,
         bias: read_bias(&doc.scale_and_bias)?,
         float_feature_borders,
         ctr_data: None,

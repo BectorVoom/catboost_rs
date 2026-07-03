@@ -67,6 +67,7 @@ fn rust_built_model() -> Model {
             },
         ],
         non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
         bias: 0.25,
         float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
         ctr_data: None,

@@ -77,6 +77,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
     Model {
         oblivious_trees,
         non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
@@ -106,6 +107,7 @@ fn rust_built_model() -> Model {
             },
         ],
         non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
         bias: 0.25,
         float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
         ctr_data: None,

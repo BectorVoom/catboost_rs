@@ -66,6 +66,7 @@ fn model_from_json(mj: &ModelJson) -> Model {
     Model {
         oblivious_trees,
         non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
         bias: mj.bias().expect("bias must parse"),
         float_feature_borders: mj.float_feature_borders(),
         ctr_data: None,
@@ -109,6 +110,7 @@ fn bias_added_once_no_trees() {
     let model = Model {
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
         bias: 0.42,
         float_feature_borders: vec![vec![0.5]],
         ctr_data: None,

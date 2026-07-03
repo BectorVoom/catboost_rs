@@ -527,6 +527,7 @@ fn reconstruct_model(trees: &TModelTrees, class_to_label: Vec<f64>) -> Result<Mo
         return Ok(Model {
             oblivious_trees: Vec::new(),
             non_symmetric_trees,
+            region_trees: Vec::new(),
             bias: read_bias(trees),
             float_feature_borders,
             ctr_data: None,
@@ -603,6 +604,9 @@ fn reconstruct_model(trees: &TModelTrees, class_to_label: Vec<f64>) -> Result<Mo
         // Oblivious models carry no non-symmetric trees (the non-symmetric `.cbm`
         // is handled by the early return above, D-6.6-05).
         non_symmetric_trees: Vec::new(),
+        // Region models are not produced by the `.cbm` decode path (GPUT-18 lands
+        // via the json round-trip); an oblivious `.cbm` carries no region trees.
+        region_trees: Vec::new(),
         bias: read_bias(trees),
         float_feature_borders,
         ctr_data: None,

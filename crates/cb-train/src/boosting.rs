@@ -813,6 +813,37 @@ pub struct NonSymmetricTree {
     pub leaf_weights: Vec<f64>,
 }
 
+/// One trained REGION tree's STRUCTURE + leaf values (GPUT-18, D-03a). Upstream's
+/// `TRegionModel` (`region_model.h::TRegionStructure`): an oblivious-like PATH
+/// walked while the computed split matches the stored `direction`, diverging into a
+/// terminal leaf otherwise. A depth-`d` Region has `d` per-level splits and exactly
+/// `d + 1` leaves (`LeavesCount() = Splits.size() + 1`). This is a PATH model, NOT a
+/// binary node graph — it MUST NOT reuse [`NonSymmetricTree`]'s `step_nodes`.
+///
+/// The apply walk (`add_model_value.cu::AddRegionImpl`) is: `bin = 0; for level in
+/// 0..depth { split = value > border; if split != directions[level] { break }; bin
+/// += 1 } leaf = bin`. Leaf `k` (`0 <= k < depth`) holds the objects that diverged
+/// at level `k`; leaf `depth` holds the objects that matched every direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionTree {
+    /// Per-level float split (`value > border`), one per level, length `depth`.
+    pub splits: Vec<Split>,
+    /// Per-level CONTINUE direction (`ESplitValue`), length `depth`: the walk
+    /// continues to the next level while `(value > border) == directions[level]`.
+    pub directions: Vec<bool>,
+    /// Per-level one-hot flag (`feature.OneHotFeature`), length `depth`. Always
+    /// `false` for the CPU float grower (which emits only `value > border` splits);
+    /// carried for structural fidelity + device parity (Plan 04).
+    pub one_hot: Vec<bool>,
+    /// Leaf values in bin order (dimension-major for the multi-output case,
+    /// `leaf_values[d * n_leaves + l]`), length `(depth + 1) * dim`. Indexed
+    /// DIRECTLY by the walk's `bin` (0..=depth).
+    pub leaf_values: Vec<f64>,
+    /// Per-leaf summed training-document weights, same bin order as `leaf_values`,
+    /// length `depth + 1`.
+    pub leaf_weights: Vec<f64>,
+}
+
 /// A trained plain-boosted model: the boosting-order trees plus the starting
 /// approx (`boost_from_average`) stored as the model bias.
 #[derive(Debug, Clone, PartialEq)]
@@ -824,6 +855,11 @@ pub struct Model {
     /// all-non-symmetric — upstream never mixes grow policies), so the oblivious
     /// lift / apply paths stay byte-identical (D-6.6-05).
     pub non_symmetric_trees: Vec<NonSymmetricTree>,
+    /// The REGION trees in boosting order (GPUT-18, D-03a). EMPTY for every
+    /// oblivious / non-symmetric model (a model is EITHER all-oblivious OR
+    /// all-non-symmetric OR all-region — never mixed), so those paths stay
+    /// byte-identical. Populated only under `grow_policy=Region`.
+    pub region_trees: Vec<RegionTree>,
     /// The starting approx / model bias.
     pub bias: f64,
     /// The number of output (approx) dimensions (D-6.2-01 / Plan 06.2-02). `1`
@@ -2831,6 +2867,10 @@ fn train_inner<R: Runtime>(
     // FEAT-06 / D-6.6-04: non-symmetric (Lossguide / Depthwise) trees accumulate here
     // when `grow_policy` selects a leaf-wise grower. Empty for every oblivious model.
     let mut non_symmetric_trees: Vec<NonSymmetricTree> = Vec::new();
+    // GPUT-18 / D-03a: Region PATH trees accumulate here under `grow_policy=Region`.
+    // Empty for every oblivious / non-symmetric model (the grower + push land in the
+    // Region dispatch arm below).
+    let region_trees: Vec<RegionTree> = Vec::new();
 
     // Overfitting detection / use_best_model (TRAIN-06) + per-iteration eval-set
     // metric logging (TRAIN-07). The detector + best-model tracker consume the
@@ -4337,6 +4377,7 @@ fn train_inner<R: Runtime>(
         Model {
             oblivious_trees: trees,
             non_symmetric_trees,
+            region_trees,
             bias,
             approx_dimension,
             class_to_label,
