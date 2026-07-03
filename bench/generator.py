@@ -253,7 +253,11 @@ def serial_depth1_tree(X, y, weights, loss, borders,
         der1 = y - 0.5  # sigmoid(0) == 0.5
     else:
         raise ValueError("loss must be 'rmse' or 'logloss'")
-    der1 = der1 * weights
+    # WR-02: the shipped path sums the UNWEIGHTED der into histogram channel 0
+    # (`reduce_leaf_stats` -> sum_f64(deltas); device `bin_sums[cell] += der1[obj]`),
+    # folding weight only into the leaf/count DENOMINATOR. Do NOT pre-multiply der1 by
+    # weights here, or a future weighted fixture would make this reference diverge from
+    # the device/CPU result it certifies.
 
     n_features = X.shape[1]
     best = None
@@ -269,7 +273,16 @@ def serial_depth1_tree(X, y, weights, loss, borders,
                 continue  # degenerate split, skip
             sl = der1[left].sum()
             sr = der1[right].sum()
-            score = sl * sl / (wl + l2) + sr * sr / (wr + l2)
+            # WR-01: TRUE Cosine score (matching the device Cosine arm
+            # `kernels.rs` / find_optimal_split_kernel and score.rs): the L2 fold
+            # `folded = Σ avg·sum` divided by `sqrt(1e-100 + Σ avg²·w)`, where
+            # `avg = sum / (w + l2)` per leaf. argmax(Cosine) != argmax(L2) in
+            # general, so the reference must use the SAME score fn as the device.
+            avg_l = sl / (wl + l2)
+            avg_r = sr / (wr + l2)
+            folded = avg_l * sl + avg_r * sr
+            denominator = 1e-100 + avg_l * avg_l * wl + avg_r * avg_r * wr
+            score = folded / np.sqrt(denominator)
             if best is None or score > best["score"]:
                 best = dict(
                     best_feature=int(f),
