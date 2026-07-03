@@ -159,6 +159,77 @@ pub(crate) fn launch_der_binary_into(
     Ok(out_handle)
 }
 
+/// GPUT-03 resident der seam: recompute der1 from PRE-UPLOADED, device-resident
+/// `approx_h`/`target_h` handles and return the der1 output Handle WITHOUT reading either
+/// input OR the output back to host (no n-length crossing). This is the residency variant
+/// of [`launch_der_binary_into`]: the boosting loop keeps `approx` resident (updated in
+/// place by `apply_leaf_delta`) and chains `der1_h = der(approx_h, target_h)` into the
+/// next tree entirely on-device (the must-have no-read-back contract). The input handles
+/// are read-only (`&Array`), so the caller passes `.clone()`s and keeps its own resident
+/// copies (a CubeCL Handle clone shares the device buffer, it does NOT copy).
+///
+/// `n` is the object count (both inputs are length `n`). Empty (`n == 0`) returns a
+/// zero-length handle with NO launch (Pitfall 5). The whole der seam is f64-typed (WGSL
+/// has no f64 type), so a genuine wgpu backend surfaces a typed [`CbError::OutOfRange`]
+/// rather than an opaque JIT crash (WR-02) — the in-env rocm/cuda/cpu f64 path is
+/// unaffected. No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+#[cfg_attr(feature = "wgpu", allow(unused_variables))]
+pub(crate) fn launch_der_binary_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx_h: Handle,
+    target_h: Handle,
+    kernel: DerBinaryKernel,
+    n: usize,
+) -> CbResult<Handle> {
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(CbError::OutOfRange(
+            "resident binary der seam requires an f64 device channel; the wgpu backend has \
+             no f64 type (WR-02). Use the rocm/cuda/cpu backend for derivative computation."
+                .to_owned(),
+        ));
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        // The der output is per-element (length `n`), NOT one slot per cube.
+        let out_handle = client.empty(n * std::mem::size_of::<f64>());
+        let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+        let count = CubeCount::Static(num_cubes as u32, 1, 1);
+        let dim = CubeDim {
+            x: CUBE_DIM as u32,
+            y: 1,
+            z: 1,
+        };
+        // `from_raw_parts` consumes each input handle; clone the output so the original
+        // stays returnable on-device. NO `read_one` here (SC-3). Each match arm consumes
+        // approx_h/target_h — mutually exclusive at runtime, so the moves do not conflict.
+        match kernel {
+            DerBinaryKernel::RmseGradient => gradient_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_h, n) },
+                unsafe { ArrayArg::from_raw_parts(target_h, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            ),
+            DerBinaryKernel::LoglossGradient => logloss_gradient_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(approx_h, n) },
+                unsafe { ArrayArg::from_raw_parts(target_h, n) },
+                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+            ),
+        }
+        Ok(out_handle)
+    }
+}
+
 /// Host-readback wrapper over the der launch: launch the der1 kernel
 /// device-resident, then read the handle back to a host `Vec<f64>`. This is the
 /// seam the all-backend self-oracle exercises (it compares the device der1 to the

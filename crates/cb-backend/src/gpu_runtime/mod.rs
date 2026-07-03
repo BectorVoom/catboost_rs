@@ -59,6 +59,7 @@ use cubecl::server::Handle;
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
+    apply_leaf_delta_kernel,
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
     focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
@@ -598,8 +599,12 @@ fn launch_pointwise_hist2_into(
         return Ok(client.empty(0));
     }
 
-    // GPUT-15: build the bit-packed grouped cindex + per-feature TCFeature table
-    // (Offset/Shift/Mask) and upload THAT instead of the plain feature-major layout. Every
+    // GPUT-15/GPUT-03: build the bit-packed grouped cindex + per-feature TCFeature table
+    // (Offset/Shift/Mask) and upload the channel-typed der1/weight + the packed cindex
+    // `words` + per-feature (offsets, shifts, masks) + indices, then delegate to the ONE
+    // resident histogram geometry [`hist2_launch_resident`]. This SLICE entry uploads fresh
+    // handles per call; the GPUT-03 resident session path uploads these ONCE at `begin` and
+    // clones the persistent handles into the SAME geometry (no per-tree re-upload). Every
     // fill kernel reads bins through the ONE `read_bin` accessor over the packed words
     // (`(cindex[offset + obj] >> shift) & mask`), NEVER the old plain
     // `cindex[feature * n + obj]` load (T-10-15). The bin VALUE is unchanged (the
@@ -612,9 +617,60 @@ fn launch_pointwise_hist2_into(
     let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
     let num_words = packed.words.len();
 
-    // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in
-    // every fill kernel handles any surplus via the total-thread-count stride). Shared
-    // by the half-byte branch below and the non-binary branch (IN-02 — one geometry).
+    // Upload der1/weight as the channel float type (f32 on wgpu, f64 elsewhere — RESEARCH
+    // A1) via the shared helper, and the packed cindex `words` + TCFeature arrays + indices
+    // as u32. These are the SAME handles the resident session holds persistently (GPUT-03).
+    let der1_h = upload_channel_floats(client, der1);
+    let weight_h = upload_channel_floats(client, weight);
+    let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
+    let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
+    let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
+    let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+    hist2_launch_resident(
+        client, der1_h, weight_h, cindex_words_h, offsets_h, shifts_h, masks_h, indices_h,
+        num_words, n, n_bins, n_features,
+    )
+}
+
+/// The ONE resident pointwise-histogram launch geometry (GPUT-03 / IN-02 — one place). Takes
+/// PRE-UPLOADED, channel-typed device handles (der1/weight already f32-on-wgpu / f64-else,
+/// the packed cindex `words`, the per-feature TCFeature offsets/shifts/masks, and indices),
+/// picks the bit-width family HOST-SIDE from `n_bins`, zero-initialises the `binSums`
+/// buffer, launches the fill kernel, and returns the `binSums` Handle WITHOUT reading it
+/// back (SC-3 / Pitfall 5). Both the slice entry [`launch_pointwise_hist2_into`] (fresh
+/// per-call handles) and the resident session grow loop (persistent handles, cloned per
+/// call — no per-tree re-upload) route through here, so the launch geometry stays single.
+///
+/// The input handles are `.clone()`d into each launch arm (a CubeCL Handle is a ref-counted
+/// buffer binding; cloning shares the device buffer, it does NOT copy) so the SAME resident
+/// buffers feed every boosting iteration. The caller is responsible for the value-range
+/// guards (`indices[i] < n`, `cindex bin < n_bins`) — the slice entry runs them before
+/// upload; the resident session runs them ONCE at `begin`. No `unwrap`/`expect`/`panic`/
+/// indexing (workspace lints + D-13).
+#[allow(clippy::too_many_arguments)]
+fn hist2_launch_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1_h: Handle,
+    weight_h: Handle,
+    cindex_words_h: Handle,
+    offsets_h: Handle,
+    shifts_h: Handle,
+    masks_h: Handle,
+    indices_h: Handle,
+    num_words: usize,
+    n: usize,
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<Handle> {
+    // Empty fill: hand back a zero-length handle (no launch, no read-back — Pitfall 5).
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in every fill
+    // kernel handles any surplus via the total-thread-count stride). Shared by all families.
     let num_cubes = n.div_ceil(CUBE_DIM).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
@@ -623,55 +679,30 @@ fn launch_pointwise_hist2_into(
         z: 1,
     };
 
-    // IN-02: the per-family upload + zero-init + channel-float `#[cfg]` split + launch +
-    // `return Ok(h)` boilerplate is IDENTICAL across the binary / half-byte / non-binary
-    // arms (they differ only in the kernel launcher and, for non-binary, a trailing
-    // `bits` comptime arg). Extract it into ONE macro so the channel-float split (f64 on
-    // rocm/cuda/cpu, f32 on wgpu — RESEARCH A1) and the zero-init live in exactly one
-    // place; a fix to the channel dispatch or the zero-init is then applied once, not
-    // three times. The macro captures `client`/`count`/`dim`/`n`/`cindex`/`indices`/
-    // `der1`/`weight`/`cindex_stride`/`n_features`/`n_bins` from the enclosing scope and
-    // takes the kernel launcher path plus any trailing comptime launch args. It zero-
-    // initialises `binSums` so the in-kernel `fetch_add`s accumulate from 0.0, casts the
-    // der1/weight inputs to the channel type at upload, and returns the `binSums` Handle
-    // WITHOUT a read-back (SC-3 / Pitfall 5). `from_raw_parts` consumes each input handle;
-    // the output is cloned so the original stays returnable on-device.
+    // IN-02: the per-family zero-init + channel-float `#[cfg]` split + launch + `return
+    // Ok(h)` boilerplate is IDENTICAL across the binary / half-byte / non-binary arms (they
+    // differ only in the kernel launcher and, for non-binary, a trailing `bits` comptime
+    // arg). Each input handle is `.clone()`d into the launch (share, not copy) so the SAME
+    // resident buffers feed every call; the fresh `binSums` output `h` is returned WITHOUT a
+    // read-back. Exactly one channel `#[cfg]` arm is compiled per build; the taken family
+    // `if` early-returns.
     macro_rules! launch_hist2_family {
         ($kernel:ident $(, $extra:expr )* $(,)?) => {{
             let bin_sums_len = hist2_binsums_len(n_bins, n_features);
-            // GPUT-15: upload the bit-packed grouped cindex `words` + the per-feature
-            // (offsets, shifts, masks) TCFeature arrays the `read_bin` accessor addresses
-            // (NOT the plain `cindex.to_vec()`). Channel-independent, so created once
-            // outside the f32/f64 split.
-            let cindex_handle =
-                client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
-            let offsets_handle =
-                client.create(cubecl::bytes::Bytes::from_elems(offsets_v.clone()));
-            let shifts_handle =
-                client.create(cubecl::bytes::Bytes::from_elems(shifts_v.clone()));
-            let masks_handle =
-                client.create(cubecl::bytes::Bytes::from_elems(masks_v.clone()));
-            let indices_handle =
-                client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
-
             #[cfg(feature = "wgpu")]
             {
-                let der1_f32: Vec<f32> = der1.iter().map(|&v| v as f32).collect();
-                let weight_f32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
-                let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1_f32));
-                let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight_f32));
                 let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; bin_sums_len]));
                 $kernel::launch::<f32, SelectedRuntime>(
                     client,
                     count,
                     dim,
-                    unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-                    unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                    unsafe { ArrayArg::from_raw_parts(cindex_handle, num_words) },
-                    unsafe { ArrayArg::from_raw_parts(offsets_handle, n_features) },
-                    unsafe { ArrayArg::from_raw_parts(shifts_handle, n_features) },
-                    unsafe { ArrayArg::from_raw_parts(masks_handle, n_features) },
-                    unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(der1_h.clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(weight_h.clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(cindex_words_h.clone(), num_words) },
+                    unsafe { ArrayArg::from_raw_parts(offsets_h.clone(), n_features) },
+                    unsafe { ArrayArg::from_raw_parts(shifts_h.clone(), n_features) },
+                    unsafe { ArrayArg::from_raw_parts(masks_h.clone(), n_features) },
+                    unsafe { ArrayArg::from_raw_parts(indices_h.clone(), n) },
                     unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                     n_features as u32,
                     $( $extra, )*
@@ -681,20 +712,18 @@ fn launch_pointwise_hist2_into(
 
             #[cfg(not(feature = "wgpu"))]
             {
-                let der1_handle = client.create(cubecl::bytes::Bytes::from_elems(der1.to_vec()));
-                let weight_handle = client.create(cubecl::bytes::Bytes::from_elems(weight.to_vec()));
                 let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; bin_sums_len]));
                 $kernel::launch::<f64, SelectedRuntime>(
                     client,
                     count,
                     dim,
-                    unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
-                    unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                    unsafe { ArrayArg::from_raw_parts(cindex_handle, num_words) },
-                    unsafe { ArrayArg::from_raw_parts(offsets_handle, n_features) },
-                    unsafe { ArrayArg::from_raw_parts(shifts_handle, n_features) },
-                    unsafe { ArrayArg::from_raw_parts(masks_handle, n_features) },
-                    unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
+                    unsafe { ArrayArg::from_raw_parts(der1_h.clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(weight_h.clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(cindex_words_h.clone(), num_words) },
+                    unsafe { ArrayArg::from_raw_parts(offsets_h.clone(), n_features) },
+                    unsafe { ArrayArg::from_raw_parts(shifts_h.clone(), n_features) },
+                    unsafe { ArrayArg::from_raw_parts(masks_h.clone(), n_features) },
+                    unsafe { ArrayArg::from_raw_parts(indices_h.clone(), n) },
                     unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                     n_features as u32,
                     $( $extra, )*
@@ -704,46 +733,22 @@ fn launch_pointwise_hist2_into(
         }};
     }
 
-    // Binary (1-bit) family branch (Plan D — D-7.3-02). A border count of
-    // `BINARY_BINS == 2` selects the SEPARATE `pointwise_hist2_binary_kernel` (NOT a
-    // comptime case of the non-binary kernel, NOR the half-byte kernel): upstream's binary
-    // path (`pointwise_hist2_binary.cu`'s `ComputeHist2Binary`) is a structurally distinct
-    // kernel family (2-bucket split-bit decomposition), so we dispatch to its own kernel
-    // here, mirroring `pointwise_kernels.cpp`'s `BinaryFeatures -> ComputeHist2Binary`
-    // dispatch. It writes the SAME FROZEN binSums layout `(feature * 2 + bin) * 2 +
-    // channel` through this UNCHANGED seam (the seam stays byte-identical — D-7.3-01). The
-    // same channel-float dispatch applies (f64 on rocm/cuda/cpu, f32 on wgpu — RESEARCH
-    // A1). NO read-back here (SC-3 / Pitfall 5).
+    // Binary (1-bit) family branch (Plan D — D-7.3-02): the SEPARATE
+    // `pointwise_hist2_binary_kernel` (a structurally distinct 2-bucket split-bit
+    // decomposition). Writes the SAME FROZEN binSums layout through this UNCHANGED seam.
     if n_bins == crate::kernels::BINARY_BINS {
         launch_hist2_family!(pointwise_hist2_binary_kernel);
     }
 
-    // Half-byte (4-bit) family branch (Plan C — D-7.3-02). A border count of
-    // `HALF_BYTE_BINS == 16` selects the SEPARATE `pointwise_hist2_half_byte_kernel`
-    // (NOT a comptime case of the non-binary kernel): upstream's half-byte path
-    // (`pointwise_hist2_half_byte_template.cuh`) is a structurally distinct kernel
-    // family (16-bin working histogram + nibble decomposition), so we dispatch to its
-    // own kernel here, mirroring `pointwise_kernels.cpp`'s `HalfByteFeatures ->
-    // ComputeHist2HalfByte` dispatch. It writes the SAME FROZEN binSums layout
-    // `(feature * 16 + bin) * 2 + channel` through this UNCHANGED seam (the seam stays
-    // byte-identical — D-7.3-01). The same channel-float dispatch applies (f64 on
-    // rocm/cuda/cpu, f32 on wgpu — RESEARCH A1). NO read-back here (SC-3 / Pitfall 5).
+    // Half-byte (4-bit) family branch (Plan C — D-7.3-02): the SEPARATE
+    // `pointwise_hist2_half_byte_kernel` (16-bin working histogram + nibble decomposition).
     if n_bins == crate::kernels::HALF_BYTE_BINS {
         launch_hist2_family!(pointwise_hist2_half_byte_kernel);
     }
 
-    // One-byte non-binary bit-width selection (Plan B — D-7.3-02). The bit-count is
-    // chosen HOST-SIDE from the feature group's border count `n_bins`, mirroring
-    // upstream `pointwise_kernels.cpp`'s `DISPATCH_ONE_BYTE(..., 5/6/7/8)` (a `b`-bit
-    // group has exactly `1 << b` bins). The selected `bits` is passed as the SAME
-    // `#[comptime]` arg of the SAME `pointwise_hist2_nonbinary_kernel` (the FROZEN Plan
-    // A kernel + binSums seam, reused UNCHANGED) — the comptime value drives the
-    // histogram line size / used-prefix at JIT time, so there is NO runtime bit-count
-    // branch in the device hot loop (the 7.1 `use_plane`/`inclusive` comptime pattern).
-    // `n_bins` MUST equal `1 << bits` for a one-byte non-binary group; anything else
-    // (not a power of two in the 5..=8 range) is not this family — surface a typed error
-    // rather than launch a malformed line size (half-byte/binary are separate kernels,
-    // Plans C/D). Half-byte (<5-bit, e.g. n_bins <= 16) is explicitly NOT routed here.
+    // One-byte non-binary bit-width selection (Plan B — D-7.3-02). `bits` is chosen
+    // HOST-SIDE from `n_bins` (a `b`-bit group has `1 << b` bins) and passed as the SAME
+    // `#[comptime]` arg of `pointwise_hist2_nonbinary_kernel` — no runtime bit-count branch.
     let bits: u32 = match n_bins {
         32 => 5,
         64 => 6,
@@ -756,24 +761,7 @@ fn launch_pointwise_hist2_into(
             )));
         }
     };
-    // Invariant (IN-01): `bits` is one of {5,6,7,8} from the match arms above and
-    // `HIST_MAX_BITS == 8`, so `bits <= HIST_MAX_BITS` is a compile-time fact already
-    // enforced by the module-level `const _: () = assert!(2 * (1 << HIST_MAX_BITS) <=
-    // HIST_SHMEM)`. The used prefix `2 * (1 << bits)` can never exceed the 8-bit
-    // shared-histogram allocation here — no runtime assert is needed.
 
-    // Channel float-type dispatch (RESEARCH A1 / Pitfall 1) + upload + zero-init + launch
-    // are handled by the shared `launch_hist2_family!` macro (IN-02 — one place): the
-    // in-kernel atomic merge needs `Atomic<F>::fetch_add` device-side; HIP (rocm) and CUDA
-    // support / emulate the f64 atomic add, so the channel is f64 there (D-03), while
-    // wgpu's WGSL has NO f64 atomics, so the wgpu arm uses an f32 channel (read back and
-    // UPCAST to f64). The buffer length (the FROZEN layout) is channel-type independent.
-    // The non-binary arm passes the host-selected `bits` comptime arg (the only structural
-    // difference from the binary/half-byte arms). NO read-back here (SC-3 / Pitfall 5).
-    // The macro `return`s the `binSums` handle from whichever channel `#[cfg]` arm is
-    // compiled (exactly one is always active), so control never reaches the trailing
-    // `unreachable!()` below — it only satisfies the type checker (the macro expands to a
-    // `()`-typed statement, not the function's `CbResult<Handle>` tail).
     launch_hist2_family!(pointwise_hist2_nonbinary_kernel, bits);
     #[allow(unreachable_code)]
     {
@@ -993,33 +981,54 @@ fn launch_find_optimal_split_pointwise_into(
         return Ok((None, Vec::new()));
     }
 
-    // Candidate-count overflow guard (T-07.5-01-02): the per-candidate score buffer and
-    // the kernel's candidate index math are products of caller-supplied dimensions. Reject
-    // a degenerate dimension with a typed range error BEFORE forming the product unchecked
-    // (a wrapping multiply would address the wrong cell; a debug build would panic).
+    // Fill the FROZEN 7.3 device-resident 2-channel histogram (this also runs the FROZEN
+    // length / value-range guards on der1/weight/cindex/indices BEFORE any launch, and
+    // returns a device HANDLE with NO read-back). The bulk histogram stays device-resident,
+    // then the per-candidate score + best split is computed over that handle via the ONE
+    // score geometry [`score_over_binsums`] (shared with the resident session grow loop,
+    // GPUT-03 — so the histogram fill and the score/argmin each live in exactly one place).
+    let bin_sums = launch_pointwise_hist2_into(client, der1, weight, cindex, indices, n_bins, n_features)?;
+    score_over_binsums(client, bin_sums, n_bins, n_features, scaled_l2, score_fn)
+}
+
+/// The ONE score/argmin geometry over a resident `binSums` handle (GPUT-03 / IN-02 — one
+/// place). Launches [`find_optimal_split_kernel`] over the device-resident histogram handle
+/// (consumed in place, NEVER read to host), reads back ONLY the per-candidate score vector
+/// (the self-oracle observation) + the O(blocks) per-block winner descriptors, and finishes
+/// the across-block argmin host-side with the strict lowest-`(feature, bin)` tie-break.
+/// Both the slice entry [`launch_find_optimal_split_pointwise_into`] and the resident
+/// session grow loop route through here.
+///
+/// `bin_sums` is the FROZEN 2-channel histogram handle (length [`hist2_binsums_len`]);
+/// `scaled_l2` the per-tree `scale_l2_reg` output; `score_fn` the comptime score calcer arm
+/// (already validated by the caller). Returns `(best_split, per_candidate_scores)`. A
+/// read-back failure surfaces [`CbError::Degenerate`] (WR-05), never a silent zero buffer.
+/// No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+fn score_over_binsums(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    bin_sums: Handle,
+    n_bins: usize,
+    n_features: usize,
+    scaled_l2: f64,
+    score_fn: u32,
+) -> CbResult<(Option<BestSplit>, Vec<f64>)> {
+    // Candidate-count overflow guard (T-07.5-01-02): the per-candidate score buffer and the
+    // kernel's candidate index math are products of caller-supplied dimensions. Reject a
+    // degenerate dimension with a typed range error BEFORE forming the product unchecked.
     let n_candidates = n_features.checked_mul(n_bins).ok_or_else(|| {
         CbError::OutOfRange(format!(
             "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (candidate count)"
         ))
     })?;
-
-    // Only the L2 arm exists this plan (D-7.5-01); a non-32/64/128/256 n_bins would not be
-    // a one-byte non-binary feature group either, but the histogram fill (below) already
-    // rejects that. The score kernel needs n_bins as a comptime u32; bound it to u32 here
-    // so the cast cannot silently truncate a degenerate dimension.
+    // The score kernel needs n_bins as a comptime u32; bound it so the cast cannot silently
+    // truncate a degenerate dimension.
     let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
         CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
     })?;
 
-    // Fill the FROZEN 7.3 device-resident 2-channel histogram (this also runs the FROZEN
-    // length / value-range guards on der1/weight/cindex/indices BEFORE any launch, and
-    // returns a device HANDLE with NO read-back). The bulk histogram stays device-resident.
-    let bin_sums = launch_pointwise_hist2_into(client, der1, weight, cindex, indices, n_bins, n_features)?;
-
     // Launch geometry: a SINGLE cube of CUBE_DIM units strides over all candidates and
-    // block-reduces to one winner. (A multi-cube grid is a perf follow-up; one cube keeps
-    // the across-block argmin trivial while staying device-resident.) The shared-mem argmin
-    // size is the comptime ARGMIN_SHMEM == CUBE_DIM (Pitfall 3).
+    // block-reduces to one winner. The shared-mem argmin size is the comptime
+    // ARGMIN_SHMEM == CUBE_DIM (Pitfall 3).
     let num_cubes = 1usize;
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
@@ -1029,10 +1038,9 @@ fn launch_find_optimal_split_pointwise_into(
     };
 
     // The score / argmin output buffers. `scores` is the per-candidate L2 score (the
-    // self-oracle observation); `best_gain`/`best_idx` carry one winner per cube. They are
-    // zero-initialised (the kernel writes every candidate it strides; the block-reduce
-    // writes the per-cube winner). The channel float type matches the histogram channel:
-    // f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1) — read back and UPCAST to f64.
+    // self-oracle observation); `best_gain`/`best_idx` carry one winner per cube. The
+    // channel float type matches the histogram channel: f64 on rocm/cuda/cpu, f32 on wgpu
+    // (RESEARCH A1) — read back and UPCAST to f64.
     let bin_sums_len = hist2_binsums_len(n_bins, n_features);
 
     #[cfg(feature = "wgpu")]
@@ -1104,15 +1112,8 @@ fn launch_find_optimal_split_pointwise_into(
         if (cand as usize) >= n_candidates {
             continue;
         }
-        // WR-05: the trailing `border == n_bins - 1` candidate is the no-op (all bins
-        // LEFT / none RIGHT) split that upstream and the pairwise path never enumerate.
-        // The device kernel already excludes it from its argmin (see the `border <
-        // n_bins - 1` guard in `find_optimal_split_kernel`), so a winning `cand` should
-        // never decode to that border; this host-side guard is the EXACT-lockstep belt
-        // to the kernel skip (and to `reference_best_split`'s host-oracle skip) so a
-        // future multi-cube grid or any block descriptor can never promote the no-op
-        // split. The per-candidate `scores` buffer still carries every border's value
-        // (geometry unchanged), only the WINNER decode excludes the trailing one.
+        // WR-05: the trailing `border == n_bins - 1` candidate is the no-op split (all bins
+        // LEFT / none RIGHT); the device kernel already excludes it, this is the host belt.
         if (cand as usize) % n_bins == n_bins - 1 {
             continue;
         }
@@ -1852,6 +1853,256 @@ fn grow_oblivious_tree_into(
         leaf_values,
         part_stats,
     })
+}
+
+/// GPUT-03: apply ONE tree's per-leaf delta to the running approx device-resident
+/// (`approx[i] += lr * leaf_values[leaf_of[i]]`) via [`apply_leaf_delta_kernel`], returning
+/// the UPDATED approx handle WITHOUT any n-length read-back. The running approx stays a
+/// resident device buffer across boosting iterations so the next tree's residual `der1` is
+/// recomputed device-side (the resident der seam) with no host round-trip (the must-have
+/// no-read-back contract).
+///
+/// `approx_h` (resident, updated IN PLACE and returned) and `leaf_of_h` (resident, cloned in
+/// — NEVER read to host) are length `n`; `leaf_values` (length `2^depth`, small) is the
+/// per-leaf UNSCALED delta; `lr` is the learning-rate scale. The small `leaf_values` + `lr`
+/// scalar are uploaded as the channel float type (f32 on wgpu, f64 elsewhere). Empty
+/// (`n == 0`) or empty `leaf_values` returns `approx_h` unchanged (no launch, Pitfall 5). No
+/// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+pub(crate) fn launch_apply_leaf_delta_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx_h: Handle,
+    leaf_of_h: Handle,
+    leaf_values: &[f64],
+    lr: f64,
+    n: usize,
+) -> CbResult<Handle> {
+    if n == 0 || leaf_values.is_empty() {
+        return Ok(approx_h);
+    }
+
+    let n_leaves = leaf_values.len();
+    let leaf_values_h = upload_channel_floats(client, leaf_values);
+    let lr_h = upload_channel_floats(client, &[lr]);
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The kernel writes `approx` in place; clone the resident handle into the `&mut` launch
+    // arg so the ORIGINAL stays returnable on-device (a CubeCL Handle clone shares the
+    // buffer — the write goes to the shared allocation). NO read-back (SC-3 / Pitfall 1).
+    #[cfg(feature = "wgpu")]
+    apply_leaf_delta_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(approx_h.clone(), n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_values_h, n_leaves) },
+        unsafe { ArrayArg::from_raw_parts(lr_h, 1) },
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    apply_leaf_delta_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(approx_h.clone(), n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_values_h, n_leaves) },
+        unsafe { ArrayArg::from_raw_parts(lr_h, 1) },
+    );
+
+    Ok(approx_h)
+}
+
+/// GPUT-02/03: grow ONE depth-1 oblivious tree over PRE-UPLOADED, session-resident device
+/// handles (the residency variant of [`grow_oblivious_tree_into`]), keeping the running
+/// approx / residual `der1` device-resident across boosting iterations. It re-uploads
+/// NOTHING per tree: the quantized matrix (both the packed cindex `words` the histogram
+/// reads AND the plain feature-major layout the partition split reads), the weights, the
+/// TCFeature table, the indices, and the target are uploaded ONCE by the session's `begin`
+/// and cloned into the SAME `hist2_launch_resident` / `score_over_binsums` /
+/// `launch_partition_*` geometry here.
+///
+/// Per tree (MVP depth == 1) it: (1) fills the resident histogram from the resident `der1`
+/// handle + resident weight/cindex/indices → the FROZEN score/argmin (Cosine or L2, the
+/// depth-1 device default is Cosine, GPUT-08) → ONE O(1) [`BestSplit`] read-back; (2)
+/// device `partition_split` (forward-bit doc-routing, resident); (3) device
+/// `partition_update` → ONE `2^depth` part-stats read-back → host leaf values via the
+/// FROZEN `cb_compute::calc_average`; (4) `apply_leaf_delta` updates the resident approx ON
+/// DEVICE; (5) recomputes the resident `der1` for the NEXT tree via the resident der seam —
+/// so NO n-length der1/approx read-back crosses per tree (only the O(1) BestSplit + the
+/// `2^depth` part-stats, plus ONE `leaf_of` read-back at the end for the structure oracle,
+/// the SAME crossing class as [`grow_oblivious_tree_into`]).
+///
+/// Returns `(GrownTree, approx_h_updated, der1_h_next)`: the grown structure (its
+/// `leaf_values` UNSCALED — the caller/`cb-train` applies `learning_rate` downstream, the
+/// 10-02 `DeviceGrownTree` contract; the approx update above already applied `lr` on
+/// device), the updated resident approx handle, and the recomputed resident `der1` handle
+/// for the next iteration.
+///
+/// # MVP scope (depth == 1)
+///
+/// `depth > 1` surfaces a typed [`CbError::OutOfRange`] (the partition-aware
+/// `fullPass = false` histogram forward dependency, documented in
+/// [`grow_oblivious_tree_into`]) → the coverage gate keeps it off this path. `der_kernel`
+/// selects the residual recompute (RMSE `target - approx` / Logloss `target -
+/// sigmoid(approx)`). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13). Threads
+/// ONE `&client`; never reads a 0-len handle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grow_oblivious_tree_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx_h: Handle,
+    der1_h: &Handle,
+    weight_h: &Handle,
+    plain_cindex_h: &Handle,
+    cindex_words_h: &Handle,
+    offsets_h: &Handle,
+    shifts_h: &Handle,
+    masks_h: &Handle,
+    indices_h: &Handle,
+    target_h: &Handle,
+    num_words: usize,
+    n: usize,
+    n_bins: usize,
+    n_features: usize,
+    cindex_stride: usize,
+    depth: usize,
+    scaled_l2: f64,
+    score_fn: u32,
+    learning_rate: f64,
+    der_kernel: DerBinaryKernel,
+) -> CbResult<(GrownTree, Handle, Handle)> {
+    // Empty short-circuit (Pitfall 3/5): no objects / no candidates -> an empty tree, approx
+    // unchanged, der1 carried forward.
+    if n == 0 || n_features == 0 || n_bins == 0 || depth == 0 {
+        return Ok((
+            GrownTree {
+                splits: Vec::new(),
+                leaf_of: vec![0u32; n],
+                leaf_values: Vec::new(),
+                part_stats: Vec::new(),
+            },
+            approx_h,
+            der1_h.clone(),
+        ));
+    }
+
+    // MVP scope guard (the partition-aware-histogram forward dependency) — mirrors
+    // `grow_oblivious_tree_into`: a whole-dataset stump score is the EXACT CPU level-0 score
+    // but NOT the per-partition level-L>0 score. Reject depth>1 with a typed error.
+    if depth > 1 {
+        return Err(CbError::OutOfRange(format!(
+            "grow_oblivious_tree_resident supports depth <= 1 until the per-partition \
+             (fullPass = false) histogram fill lands (the EXPLICIT tracked forward \
+             dependency); got depth = {depth}"
+        )));
+    }
+
+    let n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+
+    // leaf_of starts all-zero (every object in the root partition 0), resident on device.
+    let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
+    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+
+    for level in 0..depth {
+        // (1) Resident histogram fill over the SESSION handles (cloned, NOT re-uploaded) ->
+        //     the FROZEN score/argmin. The bulk histogram stays device-resident; only the
+        //     O(1) BestSplit crosses back.
+        let bin_sums = hist2_launch_resident(
+            client,
+            der1_h.clone(),
+            weight_h.clone(),
+            cindex_words_h.clone(),
+            offsets_h.clone(),
+            shifts_h.clone(),
+            masks_h.clone(),
+            indices_h.clone(),
+            num_words,
+            n,
+            n_bins,
+            n_features,
+        )?;
+        let (best, _scores) = score_over_binsums(client, bin_sums, n_bins, n_features, scaled_l2, score_fn)?;
+
+        // (2) The O(1) host integer split decision. No candidate -> degenerate dataset.
+        let split = best.ok_or_else(|| {
+            CbError::Degenerate(format!(
+                "grow_oblivious_tree_resident level {level}: no candidate split (degenerate histogram)"
+            ))
+        })?;
+        splits.push((split.feature_id, split.bin_id));
+
+        // (3) Device partition-split (forward-bit doc-routing) over the resident PLAIN
+        //     cindex — IN-PLACE on device, NO read-back (D-05).
+        leaf_of_h = launch_partition_split_into(
+            client,
+            der1_h.clone(),
+            plain_cindex_h.clone(),
+            indices_h.clone(),
+            leaf_of_h,
+            n,
+            cindex_stride,
+            split.feature_id,
+            split.bin_id,
+            level as u32,
+        )?;
+    }
+
+    // (4) Device partition-update -> ONE read-back of the 2^depth part-stats (the ONLY
+    //     bulk-data crossing besides the O(1) per-level BestSplit — D-05).
+    let part_stats_h = launch_partition_update_into(
+        client,
+        der1_h.clone(),
+        weight_h.clone(),
+        indices_h.clone(),
+        leaf_of_h.clone(),
+        n,
+        n_leaves,
+    )?;
+    let part_stats = read_part_stats_f64(client, part_stats_h)?;
+
+    // (5) Host leaf values via the FROZEN cb_compute::calc_average (UNSCALED delta — the
+    //     10-02 DeviceGrownTree contract; the approx update below applies learning_rate).
+    let mut leaf_values = vec![0.0_f64; n_leaves];
+    for leaf in 0..n_leaves {
+        let sum = part_stats.get(leaf * 2).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 2 + 1).copied().unwrap_or(0.0);
+        if let Some(slot) = leaf_values.get_mut(leaf) {
+            *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
+        }
+    }
+
+    // (6) Update the resident approx ON DEVICE (`approx[i] += lr * leaf_values[leaf_of[i]]`)
+    //     — NO n-length read-back. leaf_of_h is cloned in (the end-of-fn oracle read-back
+    //     still needs it).
+    let approx_h = launch_apply_leaf_delta_into(client, approx_h, leaf_of_h.clone(), &leaf_values, learning_rate, n)?;
+
+    // (7) Recompute the resident residual der1 for the NEXT tree DEVICE-SIDE from the updated
+    //     resident approx — NO approx/der1 read-back (the must-have no-read-back contract).
+    let der1_next = launch_der_binary_resident(client, approx_h.clone(), target_h.clone(), der_kernel, n)?;
+
+    // (8) ONE leaf_of read-back at the END (the SC-3 structure observation — the SAME
+    //     crossing class as the final part-stats, D-05); the per-level routing never crossed.
+    let leaf_of = read_u32_handle(client, leaf_of_h)?;
+
+    Ok((
+        GrownTree {
+            splits,
+            leaf_of,
+            leaf_values,
+            part_stats,
+        },
+        approx_h,
+        der1_next,
+    ))
 }
 
 // ===========================================================================

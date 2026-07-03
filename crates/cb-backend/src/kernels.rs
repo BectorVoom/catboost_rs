@@ -564,6 +564,39 @@ pub fn histogram_scatter_kernel<F: Float>(
     }
 }
 
+/// Apply ONE tree's per-leaf delta to the running approx device-resident (GPUT-03):
+/// `approx[i] += lr * leaf_values[leaf_of[i]]`, one write per object with NO cross-thread
+/// accumulation and NO host round-trip. This is the device analog of the CPU Plain-boosting
+/// approx update (`cb_train::boosting` `approx[i] += leaf_value[leaf(i)]`): the running
+/// approx stays a resident device handle across boosting iterations, so the next tree's
+/// residual `der1` is recomputed device-side (the der seam) WITHOUT ever reading the
+/// n-length approx/der1 back to host (the D-05 / must-have no-read-back contract).
+///
+/// `approx` (length `n`, resident — updated IN PLACE) is the running per-object prediction;
+/// `leaf_of` (length `n`, resident — NEVER read to host) is each object's leaf index in
+/// `0..2^depth`; `leaf_values` (length `2^depth`, small) is the per-leaf delta; `lr` is the
+/// learning-rate scale applied to the leaf delta.
+///
+/// # generics-float (AGENTS.md) / bounds guard
+///
+/// Generic over `F: Float` — the channel float type (f32 on wgpu, f64 elsewhere), NEVER a
+/// hard-coded float. Every device read/write is under an `ABSOLUTE_POS < approx.len()`
+/// bounds guard; the `leaf_of[i]` gather is bounded by construction (`leaf_of[i] < 2^depth
+/// == leaf_values.len()`, validated host-side before launch). No `-inf` literal. Uses the
+/// per-object one-write scatter shape (mirrors [`histogram_scatter_kernel`]).
+#[cube(launch)]
+pub fn apply_leaf_delta_kernel<F: Float>(
+    approx: &mut Array<F>,
+    leaf_of: &Array<u32>,
+    leaf_values: &Array<F>,
+    lr: &Array<F>,
+) {
+    if ABSOLUTE_POS < approx.len() {
+        let leaf = leaf_of[ABSOLUTE_POS] as usize;
+        approx[ABSOLUTE_POS] += lr[0] * leaf_values[leaf];
+    }
+}
+
 /// 2-channel pointwise histogram fill — the 8-bit non-binary `ComputeHist2NonBinary`
 /// analog (Phase 7.3, GPU-01 histogram slice; D-7.3-01..05). For every (feature, bin)
 /// it accumulates two interleaved channels: channel 0 = Σ der1 ("target"), channel 1
@@ -2820,6 +2853,14 @@ mod compression;
 // builds/runs under EVERY backend.
 #[cfg(test)]
 mod update_part_props;
+
+// apply_leaf_delta self-oracle (source/test separation, Plan 10-07 GPUT-03): the
+// device-resident approx update `approx[i] += lr * leaf_values[leaf_of[i]]` vs an inline
+// serial CPU reference (D-02) lives in `kernels/apply_leaf_delta.rs`, mounted at
+// `kernels::apply_leaf_delta`. Gated to the non-wgpu f64 channel it is exercised under
+// in-env (the resident session is f64-only — the der seam rejects wgpu, WR-02).
+#[cfg(test)]
+mod apply_leaf_delta;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
