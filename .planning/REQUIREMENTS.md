@@ -22,7 +22,7 @@
 - [ ] **GPUT-02**: A `GpuTrainSession` (cb-backend-internal) owns one `ComputeClient` + all persistent device handles for the whole fit; the quantized feature matrix is uploaded once above the iteration loop (no per-tree re-upload).
 - [ ] **GPUT-03**: Gradients/approx stay device-resident across boosting iterations; the per-tree `der1` host read-back is eliminated; only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (D-05).
 - [ ] **GPUT-15**: A bit-packed device-resident **compressed index** (cindex) with `TCFeature` Offset/Shift/Mask/OneHot addressing is built and kept resident as the single input to every histogram kernel, matching the CPU quantized layout ≤1e-4, oracle-tested on Kaggle CUDA. (Borders stay host — CPU quantization is the ≤1e-5 reference per GPUT-02; only cindex packing/residency is the device deliverable. §6.6a `gpu_data/kernel/binarize.cu`, `WriteCompressedIndex`.)
-- [ ] **GPUT-16**: A from-scratch **CubeCL-portable device-primitive library** — fill/transform (gather-scatter, vector arithmetic), full + segmented prefix scan, reduce / segmented-reduce / reduce-by-key, radix sort + stable single-bit reorder, bit-compression, `TDataPartition` offset/size update, and per-partition stat aggregation (`update_part_props`) — runs on device with a deterministic reduction, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (No CUB in CubeCL — these are real deliverables, not wrappers. §6.1 `cuda_util/kernel`, §6.2 `cuda_util/kernel/sort`.)
+- [x] **GPUT-16**: A from-scratch **CubeCL-portable device-primitive library** — fill/transform (gather-scatter, vector arithmetic), full + segmented prefix scan, reduce / segmented-reduce / reduce-by-key, radix sort + stable single-bit reorder, bit-compression, `TDataPartition` offset/size update, and per-partition stat aggregation (`update_part_props`) — runs on device with a deterministic reduction, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (No CUB in CubeCL — these are real deliverables, not wrappers. §6.1 `cuda_util/kernel`, §6.2 `cuda_util/kernel/sort`.)
 
 ### GPU Device-Resident Training — Tree Growth & Scoring (GPUT)
 
@@ -84,7 +84,7 @@
 | GPUT-04 | Phase 10 | Pending |
 | GPUT-08 | Phase 10 | Pending |
 | GPUT-15 | Phase 10 | Pending |
-| GPUT-16 | Phase 10 | Pending |
+| GPUT-16 | Phase 10 | Complete |
 | BENCH-01 | Phase 10 | Pending |
 | BENCH-02 | Phase 10 (standing — enforced in every GPU phase 10→13) | Pending |
 | GPUT-05 | Phase 11 | Pending |

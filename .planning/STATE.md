@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: GPU Performance
 current_phase: 10
-current_phase_name: planning — not started
-status: planning
+current_phase_name: gpu-foundations-runtime-seam-session-residency-device-primit
+status: executing
 stopped_at: v1.1 roadmap RE-DERIVED (Phases 10–14) — all 25 reqs mapped; awaiting /gsd-discuss-phase 10
-last_updated: "2026-07-02T23:19:22.108Z"
-last_activity: 2026-07-02
-last_activity_desc: v1.1 re-scoped against the full upstream CUDA kernel map. Added GPUT-15 (cindex residency), GPUT-16 (from-scratch CubeCL primitive library — no CUB), GPUT-17 (MVS sampling), GPUT-18 (Depthwise/Lossguide/Region grow policies), GPUT-19 (Exact leaf estimation), GPUT-20 (Langevin/SGLB), GPUT-21 (batched pairwise Cholesky solver), GPUT-22 (query/listwise ranking losses); narrowed GPUT-11 to PairLogit, widened GPUT-12 to multiclass/multi-target/uncertainty. PROJECT.md + REQUIREMENTS.md rewritten; stale Phase-10 draft plans cleared. Awaiting gsd-roadmapper to map all 25 reqs (GPUT-01..22 + BENCH-01..03) across the re-derived phases.
+last_updated: "2026-07-03T00:26:30.578Z"
+last_activity: 2026-07-03
+last_activity_desc: Phase 10 execution started
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 9
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 08 — python-bindings-dual-api-packaging
+**Current focus:** Phase 10 — gpu-foundations-runtime-seam-session-residency-device-primit
 
 ## Current Position
 
-Phase: 10 (planning — not started)
-Plan: —
-Status: v1.1 GPU Performance roadmap RE-DERIVED in place (Phases 10–14). All 25 requirements (GPUT-01..22 + BENCH-01..03) mapped, 100% coverage, no orphans/duplicates. REQUIREMENTS.md traceability re-populated.
-Last activity: 2026-07-02 — v1.1 re-scoped against the full upstream CUDA kernel map. Added GPUT-15 (cindex residency), GPUT-16 (from-scratch CubeCL primitive library — no CUB), GPUT-17 (MVS sampling), GPUT-18 (Depthwise/Lossguide/Region grow policies), GPUT-19 (Exact leaf estimation), GPUT-20 (Langevin/SGLB), GPUT-21 (batched pairwise Cholesky solver), GPUT-22 (query/listwise ranking losses); narrowed GPUT-11 to PairLogit, widened GPUT-12 to multiclass/multi-target/uncertainty. PROJECT.md + REQUIREMENTS.md rewritten; stale Phase-10 draft plans cleared. Awaiting gsd-roadmapper to map all 25 reqs (GPUT-01..22 + BENCH-01..03) across the re-derived phases.
+Phase: 10 (gpu-foundations-runtime-seam-session-residency-device-primit) — EXECUTING
+Plan: 2 of 9
+Status: Ready to execute
+Last activity: 2026-07-03 — Phase 10 execution started
 
 ## Performance Metrics
 
@@ -166,6 +166,7 @@ Last activity: 2026-07-02 — v1.1 re-scoped against the full upstream CUDA kern
 | Phase 08 P05 | ~25min | 2 tasks | 7 files |
 | Phase 08 P07 | 20min | 2 tasks | 4 files |
 | Phase 08 P08 | 7 min | 2 tasks | 6 files |
+| Phase 10 P01 | 35 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -367,6 +368,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 08-07: rocm wheel BUILD deferred to gap plan 08-08 (Option B, generic GpuBackend: cb_compute::Runtime over SelectedRuntime for cpu/wgpu/cuda/rocm); 08-07 ships rocm distribution config + cpu/abi3 wheel + PACKAGING + CI
 - [Phase ?]: 08-08: generic GpuBackend over SelectedRuntime serves wgpu/cuda/rocm via the 7.2 der seam; facade selects backend by Cargo feature
 - [Phase ?]: 08-08: rocm wheel built in-env, GPU fit/predict bit-exact vs cpu (max_abs_diff 0.0, within <=1e-4 D-04); wheel runtime needs ROCM_PATH+LD_PRELOAD of system libhiprtc/libamdhip64
+- [Phase 10]: 10-01: recursive two-level cross-cube full_scan (generalizes single-cube block_scan to arbitrary n); segmented_scan single-cube scope documented (cross-cube carry = forward dep)
 
 ### Pending Todos
 
@@ -426,7 +428,7 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-02T23:19:22.100Z
+Last session: 2026-07-03T00:26:08.196Z
 Stopped at: Phase 10 context gathered
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
