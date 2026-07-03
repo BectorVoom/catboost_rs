@@ -31,20 +31,47 @@
 //! `Derivatives` the host loop folds via `cb_core::sum_f64` are bit-compatible with
 //! the CPU path within the Phase-7 GPU tolerance (D-04, <=1e-4).
 
-use cb_compute::{Derivatives, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA};
+use std::cell::RefCell;
+
+use cb_compute::{
+    DeviceGrownTree, Derivatives, EScoreFunction, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+};
 use cb_core::{CbError, CbResult};
 
 use crate::gpu_runtime::{
     launch_der_binary, launch_der_param, launch_der_unary, DerBinaryKernel, DerParamKernel,
-    DerUnaryKernel,
+    DerUnaryKernel, GpuTrainSession,
 };
 
 /// The CubeCL GPU runtime as `cb-compute`'s [`Runtime`], generic over
-/// [`crate::SelectedRuntime`] (the der seam resolves the concrete runtime
-/// internally). A zero-sized handle — the CubeCL client is created per call inside
-/// the seam, mirroring [`crate::cpu_runtime::CpuBackend`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GpuBackend;
+/// [`crate::SelectedRuntime`] (the der seam resolves the concrete runtime internally). The
+/// der path ([`Runtime::compute_gradients`]) creates its CubeCL client per call inside the
+/// seam (stateless, mirroring [`crate::cpu_runtime::CpuBackend`]); the GPUT-02/03 device
+/// grow-tree path holds a per-fit [`GpuTrainSession`] behind a `RefCell` so the `&self`
+/// [`Runtime`] seam signatures stay unchanged (Pitfall 6 — the interior mutability drops the
+/// former `Copy`/zero-sized derive).
+///
+/// `RefCell` is `!Sync`; that is fine here — the `Model` Send+Sync contract is about the
+/// TRAINED model, not this transient training-time backend (which is bound once and used by
+/// `&reference` within a single training call). `Default` constructs it with NO open session.
+#[derive(Default)]
+pub struct GpuBackend {
+    /// The per-fit device-resident training session (GPUT-02): `Some` between a covered
+    /// [`Runtime::begin_device_training`] and [`Runtime::end_device_training`], `None`
+    /// otherwise (the CPU-fallback state, D-04).
+    session: RefCell<Option<GpuTrainSession>>,
+}
+
+impl std::fmt::Debug for GpuBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A GpuTrainSession holds device handles (not Debug); surface only whether a session
+        // is currently open so `GpuBackend` stays `Debug` without requiring the session to be.
+        let active = self.session.borrow().is_some();
+        f.debug_struct("GpuBackend")
+            .field("session_active", &active)
+            .finish()
+    }
+}
 
 /// Host-materialize a length-`n` constant der2 buffer for the CONSTANT-der2 losses
 /// (RMSE der2 = `-1.0`, Quantile/MAE der2 = `0.0`).
@@ -211,5 +238,88 @@ impl Runtime for GpuBackend {
             der2.extend_from_slice(&der2_d);
         }
         Ok(Derivatives { der1, der2 })
+    }
+
+    /// GPUT-02/04: open a device-resident training session for a covered fit. Constructs a
+    /// [`GpuTrainSession`] via its coverage gate (D-10-02) and stores it behind the `RefCell`,
+    /// returning `Ok(true)` when the device path is selected or `Ok(false)` (→ CPU fallback,
+    /// D-04) when the config is not covered (depth>1 / non-RMSE-Logloss / non-Plain /
+    /// fold_count>1 / unsupported score fn). Overrides the trait default (which always
+    /// declines).
+    #[allow(clippy::too_many_arguments)]
+    fn begin_device_training(
+        &self,
+        loss: &Loss,
+        depth: usize,
+        boosting_type_is_plain: bool,
+        fold_count: usize,
+        score_function: EScoreFunction,
+        bins_feature_major: &[u32],
+        weight: &[f64],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+    ) -> CbResult<bool> {
+        let session = GpuTrainSession::begin(
+            loss,
+            depth,
+            boosting_type_is_plain,
+            fold_count,
+            score_function,
+            bins_feature_major,
+            weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+        )?;
+        let covered = session.is_some();
+        *self.session.borrow_mut() = session;
+        Ok(covered)
+    }
+
+    /// GPUT-03/04: grow one oblivious tree on the device over the resident session, or signal
+    /// the CPU fallback. When a session is open it advances the device-resident boosting
+    /// (der1 chained on device, approx updated via `apply_leaf_delta` — no per-tree der1
+    /// read-back) and returns the host-typed [`DeviceGrownTree`]; when no session is open
+    /// (uncovered config) it returns `Ok(None)` so the caller uses the CPU grow loop (D-04).
+    ///
+    /// The passed `approx` is validated against the session's object count; the resident
+    /// approx is authoritative for the device pass (in the covered Plain / fold=1 / from-zero
+    /// regime it tracks the caller's `approx` exactly, since both start at zero and apply the
+    /// SAME per-tree `lr * leaf_values`). `target` is uploaded once by the session and reused.
+    fn grow_tree_on_device(
+        &self,
+        approx: &[f64],
+        target: &[f64],
+    ) -> CbResult<Option<DeviceGrownTree>> {
+        let mut guard = self.session.borrow_mut();
+        match guard.as_mut() {
+            None => Ok(None),
+            Some(session) => {
+                // Defensive length agreement (the session holds the authoritative resident
+                // approx; a mismatch signals a caller inconsistency, surfaced typed not UB).
+                if approx.len() != session.n() {
+                    return Err(CbError::LengthMismatch {
+                        column: "approx".to_owned(),
+                        expected: session.n(),
+                        actual: approx.len(),
+                    });
+                }
+                let tree = session.grow_one(target)?;
+                Ok(Some(tree))
+            }
+        }
+    }
+
+    /// GPUT-02/04: end the device training session, dropping the resident client + handles
+    /// deterministically (a no-op if no session was open — the CPU-fallback path).
+    fn end_device_training(&self) -> CbResult<()> {
+        // `take()` moves the session out and drops it here (frees the client + handles).
+        let _ = self.session.borrow_mut().take();
+        Ok(())
     }
 }

@@ -355,7 +355,7 @@ impl CatBoostBuilder {
         #[cfg(feature = "cpu")]
         let backend = CpuBackend;
         #[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
-        let backend = GpuBackend;
+        let backend = GpuBackend::default();
         let trained = train(
             &backend,
             &feature_values,

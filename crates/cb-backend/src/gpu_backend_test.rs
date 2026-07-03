@@ -9,7 +9,7 @@
 //! the parity tests are guarded to SKIP (return early) under wgpu rather than
 //! falsely failing, while the typed-error tests still run on every GPU backend.
 
-use cb_compute::{Loss, Runtime};
+use cb_compute::{EScoreFunction, Loss, Runtime};
 
 use crate::gpu_backend::GpuBackend;
 
@@ -55,7 +55,7 @@ fn gpu_backend_rmse_matches_host_baseline() {
         .map(|(&a, &t)| cb_compute::rmse_der2(a, t))
         .collect();
 
-    let ders = GpuBackend
+    let ders = GpuBackend::default()
         .compute_gradients(&Loss::Rmse, &approx, &target, 1)
         .expect("GpuBackend RMSE compute_gradients should succeed in-env");
 
@@ -84,7 +84,7 @@ fn gpu_backend_logloss_matches_host_baseline() {
         .map(|(&a, &t)| cb_compute::logloss_der2(a, t))
         .collect();
 
-    let ders = GpuBackend
+    let ders = GpuBackend::default()
         .compute_gradients(&Loss::Logloss, &approx, &target, 1)
         .expect("GpuBackend Logloss compute_gradients should succeed in-env");
 
@@ -96,7 +96,7 @@ fn gpu_backend_logloss_matches_host_baseline() {
 /// including wgpu (no f64 launch is reached).
 #[test]
 fn gpu_backend_empty_input_short_circuits() {
-    let ders = GpuBackend
+    let ders = GpuBackend::default()
         .compute_gradients(&Loss::Rmse, &[], &[], 1)
         .expect("empty input should short-circuit to empty derivatives");
     assert!(ders.der1.is_empty());
@@ -111,7 +111,7 @@ fn gpu_backend_unsupported_loss_returns_typed_error() {
     let approx = [0.5_f64, -1.0, 2.0];
     let target = [1.0_f64, -0.5, 1.5];
 
-    let err = GpuBackend
+    let err = GpuBackend::default()
         .compute_gradients(&Loss::LogCosh, &approx, &target, 1)
         .expect_err("LogCosh has no GPU der kernel — must return a typed error");
 
@@ -128,9 +128,105 @@ fn gpu_backend_unsupported_loss_returns_typed_error() {
 fn gpu_backend_zero_dimension_rejected() {
     let approx = [0.5_f64, -1.0];
     let target = [1.0_f64, -0.5];
-    let err = GpuBackend
+    let err = GpuBackend::default()
         .compute_gradients(&Loss::Rmse, &approx, &target, 0)
         .expect_err("approx_dimension == 0 must be rejected");
     let msg = format!("{err}");
     assert!(msg.contains("approx_dimension"), "unexpected error: {msg}");
+}
+
+// ===========================================================================
+// GPUT-02/03/04: the device grow-tree seam lifecycle over the GpuBackend RefCell session.
+// Under wgpu the resident der seam typed-rejects f64 (WR-02), so the covered-path grow is
+// skipped there; the coverage gate (Ok(false)/Ok(None)) is exercised on every GPU backend.
+// ===========================================================================
+
+/// A small feature-major fixture: feature 0's bins climb monotonically with the object
+/// index (a clear best border); returns `(target, weight, cindex)`.
+fn seam_fixture(n: usize, n_features: usize, n_bins: usize) -> (Vec<f64>, Vec<f64>, Vec<u32>) {
+    let target: Vec<f64> = (0..n).map(|k| (k as f64) - (n as f64) / 2.0).collect();
+    let weight: Vec<f64> = (0..n).map(|k| 0.5 + ((k % 5) as f64) * 0.25).collect();
+    let mut cindex = vec![0u32; n_features * n];
+    for feature in 0..n_features {
+        for obj in 0..n {
+            let bin = if feature == 0 {
+                ((obj * n_bins) / n.max(1)).min(n_bins - 1)
+            } else {
+                (obj * (feature + 2) + feature) % n_bins
+            };
+            cindex[feature * n + obj] = bin as u32;
+        }
+    }
+    (target, weight, cindex)
+}
+
+/// GPUT-04: the covered depth-1 RMSE/Plain/fold-1/Cosine config opens a session
+/// (`begin -> Ok(true)`), grows a device tree (`grow_tree_on_device -> Ok(Some(tree))` with a
+/// depth-1 split + per-object leaf_of), and tears it down (`end -> Ok(())`). rocm/cuda only
+/// (the resident der seam is f64; wgpu is skipped — WR-02).
+#[test]
+fn gpu_backend_device_grow_lifecycle_covered() {
+    if WGPU_F64_UNSUPPORTED {
+        return;
+    }
+    let n = 64usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let (target, weight, cindex) = seam_fixture(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, cb_core::sum_f64(&weight), n);
+
+    let backend = GpuBackend::default();
+    let covered = backend
+        .begin_device_training(
+            &Loss::Rmse, 1, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+            n_bins, 0.3, scaled_l2,
+        )
+        .expect("begin must not error on a covered config");
+    assert!(covered, "depth1/RMSE/Plain/fold1/Cosine must open a device session (Ok(true))");
+
+    let approx = vec![0.0_f64; n];
+    let tree = backend
+        .grow_tree_on_device(&approx, &target)
+        .expect("grow_tree_on_device must not error over an open session")
+        .expect("an open session must grow a device tree (Ok(Some))");
+    assert_eq!(tree.splits.len(), 1, "depth-1 device tree must have exactly one split");
+    assert_eq!(tree.leaf_of.len(), n, "device tree leaf_of must be populated length n");
+    assert_eq!(tree.leaf_values.len(), 2, "depth-1 device tree must have 2 leaf values");
+
+    backend.end_device_training().expect("end must release the session cleanly");
+
+    // After end, the session is gone -> the grow seam falls back to Ok(None).
+    let after = backend
+        .grow_tree_on_device(&approx, &target)
+        .expect("grow after end must not error");
+    assert!(after.is_none(), "after end_device_training the grow seam must return Ok(None)");
+}
+
+/// GPUT-04: an UNCOVERED config declines to the CPU path — `begin -> Ok(false)` and the grow
+/// seam returns `Ok(None)` (no session stored). Runs on every GPU backend (no device grow).
+#[test]
+fn gpu_backend_device_grow_uncovered_falls_back() {
+    let n = 32usize;
+    let n_features = 2usize;
+    let n_bins = 32usize;
+    let (target, weight, cindex) = seam_fixture(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, cb_core::sum_f64(&weight), n);
+
+    let backend = GpuBackend::default();
+    // depth == 2 is not covered (the per-partition histogram forward dependency).
+    let covered = backend
+        .begin_device_training(
+            &Loss::Rmse, 2, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+            n_bins, 0.3, scaled_l2,
+        )
+        .expect("begin must not error while classifying coverage");
+    assert!(!covered, "depth>1 must decline the device path (Ok(false))");
+
+    let approx = vec![0.0_f64; n];
+    let tree = backend
+        .grow_tree_on_device(&approx, &target)
+        .expect("grow must not error with no open session");
+    assert!(tree.is_none(), "uncovered config must route through Ok(None) -> CPU fallback");
+
+    backend.end_device_training().expect("end is a no-op with no open session");
 }
