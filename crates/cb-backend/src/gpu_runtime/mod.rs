@@ -1849,8 +1849,10 @@ pub(crate) fn launch_partition_hist2_resident_into(
     };
 
     // The der1/weight channel float type is f32 on wgpu, f64 elsewhere (RESEARCH A1); the
-    // fixed-point `Atomic<u64>` accumulator output is `u64` on both. (wgpu lacks u64
-    // atomics — the caller gates this path on the device's advertised capability.)
+    // fixed-point `Atomic<u64>` accumulator output is `u64` on both. (IN-02: wgpu/cpu lack
+    // u64 atomics — this launcher itself gates on the device's advertised `Atomic<u64>` add
+    // capability above and returns `CbError::Unsupported` before reaching this launch, so the
+    // kernel below only runs on a backend that actually supports it.)
     #[cfg(feature = "wgpu")]
     partition_hist2_nonbinary_kernel::launch::<f32, SelectedRuntime>(
         client,
