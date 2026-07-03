@@ -1645,6 +1645,45 @@ fn compute_softmax_leaf_deltas(
 /// `leaf_of` produces: `leaf_weights[leaf]` is `Σ weight` over members of `leaf`.
 /// For unweighted training (`weights` all `1.0`) a leaf weight equals its
 /// document count (RESEARCH A4).
+/// The walk-until-halt distinct-leaf index of one object over a NON-SYMMETRIC device
+/// node graph (GPUT-18 / Phase 12 Plan 03). TRANSCRIBES `cb_model::apply::leaf_index_nonsym`
+/// (`apply.rs:234-270`) inline into cb-train (the forbidden direction is a cb-BACKEND dep
+/// inside cb-train, NOT transcribing cb-MODEL apply logic): a bounded flat-node walk over
+/// `step_nodes` left/right diffs, `u32::MAX` interior guard, halting on the zero side and
+/// reading `node_id_to_leaf_id`. The pass test is the SAME `value > border` the oblivious
+/// fold uses. Returns `None` on a malformed / cyclic graph (the caller substitutes a checked
+/// leaf-0 fallback — never a panic, T-12-05).
+fn device_leaf_of_nonsym(
+    obj: usize,
+    splits: &[Split],
+    step_nodes: &[(u16, u16)],
+    node_id_to_leaf_id: &[u32],
+    feature_values: &[Vec<f32>],
+) -> Option<usize> {
+    let node_count = step_nodes.len();
+    let mut index: i64 = 0;
+    // A valid walk visits each node at most once — cap iterations to reject a cyclic graph.
+    for _ in 0..=node_count {
+        let idx = usize::try_from(index).ok()?;
+        let &(left_diff, right_diff) = step_nodes.get(idx)?;
+        let split = splits.get(idx)?;
+        let passes = feature_values
+            .get(split.feature)
+            .and_then(|col| col.get(obj))
+            .is_some_and(|&v| f64::from(v) > split.border);
+        let diff: i64 = if passes { i64::from(right_diff) } else { i64::from(left_diff) };
+        index = index.checked_add(diff)?;
+        if diff == 0 {
+            let leaf_id = *node_id_to_leaf_id.get(idx)?;
+            if leaf_id == u32::MAX {
+                return None;
+            }
+            return usize::try_from(leaf_id).ok();
+        }
+    }
+    None
+}
+
 fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) -> Vec<f64> {
     // Bucket each leaf's member weights in object order (checked `.get` only —
     // `indexing_slicing` is deny).
@@ -3060,89 +3099,171 @@ fn train_inner<R: Runtime>(
                     )
                 })?;
 
-            // Resolve each device split `(feature, bin_id)` to a Model `Split` via
-            // `border = feature_borders[feature][bin_id]` (Pattern 4 — the one
-            // non-obvious correctness join). Range-check `bin_id` against the
-            // feature's border count (T-10-22): an out-of-range index is a typed
-            // error, never a panic / raw index. `DeviceGrownTree.leaf_of` is NOT
-            // consumed (D-05 — empty in the production hot path).
-            let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
-            for &(feature, bin_id) in &dev_tree.splits {
-                let f = feature as usize;
-                let b = bin_id as usize;
-                let border = feature_borders
-                    .get(f)
-                    .and_then(|borders| borders.get(b))
-                    .copied()
-                    .ok_or_else(|| {
-                        CbError::OutOfRange(format!(
-                            "device split (feature {f}, bin_id {b}) is out of range for \
-                             feature_borders (feature count {}, feature border count {})",
-                            feature_borders.len(),
-                            feature_borders.get(f).map_or(0, Vec::len),
-                        ))
-                    })?;
-                device_splits.push(Split { feature: f, border });
-            }
-
-            // Per-object leaf assignment on the HOST from the resolved splits (D-05:
-            // the device does NOT cross the seam with an `n`-length `leaf_of`).
-            // This is the SAME `value > border` + forward-bit `leaf_index` the CPU
-            // oblivious path uses, so the folded partition is CPU-identical.
-            let device_leaf_of: Vec<usize> = (0..n)
-                .map(|obj| {
-                    let passes: Vec<bool> = device_splits
-                        .iter()
-                        .map(|s| {
-                            feature_values
-                                .get(s.feature)
-                                .and_then(|col| col.get(obj))
-                                .is_some_and(|&v| f64::from(v) > s.border)
-                        })
-                        .collect();
-                    leaf_index(&passes)
-                })
-                .collect();
-
-            // Leaf values: the device returns UN-scaled leaves (the 10-02 contract);
-            // cb-train applies the `learning_rate` shrinkage. RMSE / Logloss /
-            // CrossEntropy are non-pairwise, so `normalize_leaf_values` applies ONLY
-            // the lr scale (no weighted-mean centering) — byte-identical to the CPU
-            // `learning_rate * delta` store (D-04).
-            let mut device_leaf_values = dev_tree.leaf_values.clone();
-            let device_leaf_weights =
-                accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
-            normalize_leaf_values(
-                /* is_pairwise = */ false,
-                learning_rate,
-                &device_leaf_weights,
-                &mut device_leaf_values,
-                n_leaves,
-                /* approx_dimension = */ 1,
-            );
-
-            // Update approx: `approx[i] += leaf_values[leaf(i)]` (single dimension) —
-            // the SAME per-object accumulation the CPU path applies, so the staged
-            // approximant and the next tree's device derivatives stay CPU-consistent.
-            for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                if let (Some(a), Some(&lv)) =
-                    (approx.get_mut(i), device_leaf_values.get(leaf))
-                {
-                    *a += lv;
+            // Phase 12 Plan 03 (GPUT-18): dispatch on the populated `DeviceGrownTree`
+            // SHAPE. An EMPTY `step_nodes` is the oblivious / symmetric emission (the
+            // byte-unchanged Plan-01 path → `ObliviousTree`); a NON-EMPTY `step_nodes`
+            // is a Depthwise / Lossguide non-symmetric node graph → `NonSymmetricTree`
+            // into `non_symmetric_trees`. The dispatch KEY mirrors the CPU fold at
+            // `:4277` (`grown.step_nodes.is_empty()`). The Region arm is Plan 04's
+            // (Region device types do not exist yet), so only two arms here.
+            if dev_tree.step_nodes.is_empty() {
+                // ─── OBLIVIOUS ARM (byte-identical to the Plan-01 device fold) ───
+                // Resolve each device split `(feature, bin_id)` to a Model `Split` via
+                // `border = feature_borders[feature][bin_id]` (Pattern 4). Range-check
+                // `bin_id` (T-10-22): an out-of-range index is a typed error, never a
+                // panic / raw index. `DeviceGrownTree.leaf_of` is NOT consumed (D-05).
+                let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
+                for &(feature, bin_id) in &dev_tree.splits {
+                    let f = feature as usize;
+                    let b = bin_id as usize;
+                    let border = feature_borders
+                        .get(f)
+                        .and_then(|borders| borders.get(b))
+                        .copied()
+                        .ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device split (feature {f}, bin_id {b}) is out of range for \
+                                 feature_borders (feature count {}, feature border count {})",
+                                feature_borders.len(),
+                                feature_borders.get(f).map_or(0, Vec::len),
+                            ))
+                        })?;
+                    device_splits.push(Split { feature: f, border });
                 }
-            }
 
-            // Record the staged approximant (raw value / logit) for this iteration.
-            if let Some(out) = staged_out.as_deref_mut() {
-                out.extend_from_slice(&approx);
-            }
+                // Per-object leaf assignment on the HOST via the forward-bit `leaf_index`
+                // (the SAME `value > border` the CPU oblivious path uses; D-05).
+                let device_leaf_of: Vec<usize> = (0..n)
+                    .map(|obj| {
+                        let passes: Vec<bool> = device_splits
+                            .iter()
+                            .map(|s| {
+                                feature_values
+                                    .get(s.feature)
+                                    .and_then(|col| col.get(obj))
+                                    .is_some_and(|&v| f64::from(v) > s.border)
+                            })
+                            .collect();
+                        leaf_index(&passes)
+                    })
+                    .collect();
 
-            trees.push(ObliviousTree {
-                splits: device_splits,
-                ctr_splits: Vec::new(),
-                leaf_values: device_leaf_values,
-                leaf_weights: device_leaf_weights,
-            });
+                // Leaf values: the device returns UN-scaled leaves; cb-train applies the
+                // `learning_rate` shrinkage. Non-pairwise → `normalize_leaf_values` applies
+                // ONLY the lr scale (byte-identical to `learning_rate * delta`, D-04).
+                let mut device_leaf_values = dev_tree.leaf_values.clone();
+                let device_leaf_weights =
+                    accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
+                normalize_leaf_values(
+                    /* is_pairwise = */ false,
+                    learning_rate,
+                    &device_leaf_weights,
+                    &mut device_leaf_values,
+                    n_leaves,
+                    /* approx_dimension = */ 1,
+                );
+
+                for (i, &leaf) in device_leaf_of.iter().enumerate() {
+                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
+                        *a += lv;
+                    }
+                }
+
+                if let Some(out) = staged_out.as_deref_mut() {
+                    out.extend_from_slice(&approx);
+                }
+
+                trees.push(ObliviousTree {
+                    splits: device_splits,
+                    ctr_splits: Vec::new(),
+                    leaf_values: device_leaf_values,
+                    leaf_weights: device_leaf_weights,
+                });
+            } else {
+                // ─── NON-SYMMETRIC ARM (Depthwise / Lossguide, GPUT-18) ───
+                // The device emits a PER-NODE `(feature, bin_id)` in `dev_tree.splits`
+                // (one per node, `(0,0)` placeholder for leaf nodes) plus the node graph
+                // (`step_nodes` / `node_id_to_leaf_id`). Resolve each INTERIOR node's split
+                // via the SAME `feature_borders[feature][bin_id]` join; leaf placeholder
+                // nodes (step `(0,0)`) get an inert `Split` that the walk never reads for
+                // routing (its diffs are zero → the node is a halt point).
+                let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
+                for (node, &(feature, bin_id)) in dev_tree.splits.iter().enumerate() {
+                    let is_leaf = dev_tree
+                        .step_nodes
+                        .get(node)
+                        .map_or(true, |&(ld, rd)| ld == 0 && rd == 0);
+                    if is_leaf {
+                        // Inert placeholder split for a terminal node (never routes).
+                        device_splits.push(Split { feature: 0, border: 0.0 });
+                        continue;
+                    }
+                    let f = feature as usize;
+                    let b = bin_id as usize;
+                    let border = feature_borders
+                        .get(f)
+                        .and_then(|borders| borders.get(b))
+                        .copied()
+                        .ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device non-sym split (feature {f}, bin_id {b}) is out of range for \
+                                 feature_borders (feature count {}, feature border count {})",
+                                feature_borders.len(),
+                                feature_borders.get(f).map_or(0, Vec::len),
+                            ))
+                        })?;
+                    device_splits.push(Split { feature: f, border });
+                }
+
+                // Per-object DISTINCT-leaf assignment via the transcribed
+                // `leaf_index_nonsym` pointer-walk. A malformed graph → checked leaf-0
+                // fallback (never a panic, T-12-05).
+                let device_leaf_of: Vec<usize> = (0..n)
+                    .map(|obj| {
+                        device_leaf_of_nonsym(
+                            obj,
+                            &device_splits,
+                            &dev_tree.step_nodes,
+                            &dev_tree.node_id_to_leaf_id,
+                            feature_values,
+                        )
+                        .unwrap_or(0)
+                    })
+                    .collect();
+
+                // Non-sym leaf count is the DISTINCT-leaf count (NOT 2^depth), == the
+                // device leaf-value vector length.
+                let nonsym_n_leaves = dev_tree.leaf_values.len();
+                let mut device_leaf_values = dev_tree.leaf_values.clone();
+                let device_leaf_weights =
+                    accumulate_leaf_weights(&device_leaf_of, &weights, nonsym_n_leaves);
+                normalize_leaf_values(
+                    /* is_pairwise = */ false,
+                    learning_rate,
+                    &device_leaf_weights,
+                    &mut device_leaf_values,
+                    nonsym_n_leaves,
+                    /* approx_dimension = */ 1,
+                );
+
+                for (i, &leaf) in device_leaf_of.iter().enumerate() {
+                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
+                        *a += lv;
+                    }
+                }
+
+                if let Some(out) = staged_out.as_deref_mut() {
+                    out.extend_from_slice(&approx);
+                }
+
+                non_symmetric_trees.push(NonSymmetricTree {
+                    splits: device_splits,
+                    step_nodes: dev_tree.step_nodes.clone(),
+                    node_id_to_leaf_id: dev_tree.node_id_to_leaf_id.clone(),
+                    leaf_values: device_leaf_values,
+                    leaf_weights: device_leaf_weights,
+                });
+            }
             continue;
         }
 
@@ -4421,3 +4542,7 @@ fn train_inner<R: Runtime>(
 #[cfg(test)]
 #[path = "boosting_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "boosting_device_fold_test.rs"]
+mod boosting_device_fold_tests;
