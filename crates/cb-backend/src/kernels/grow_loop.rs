@@ -1243,17 +1243,20 @@ mod partition_hist {
             let device = <crate::SelectedRuntime as Runtime>::Device::default();
             let client = <crate::SelectedRuntime as Runtime>::client(&device);
 
-            // (1) Child-level partition-aware fill: 2^level leaf slots, fixed-point u64.
+            // (1) Child-level partition-aware fill: 2^level leaf slots, fixed-point u64. Plan 03
+            //     threads leaf_of as a DEVICE-RESIDENT handle (D-05); upload the known routing.
+            let child_of_h = client.create(cubecl::bytes::Bytes::from_elems(child_of.clone()));
             let child_h = launch_partition_hist2_into(
-                &client, &der1, &weight, &cindex, &indices, &child_of, n_bins, n_features, level,
+                &client, &der1, &weight, &cindex, &indices, child_of_h, n_bins, n_features, level,
             )
             .expect("partition_hist2 (child level) must launch");
             let child_hist = read_fixedpoint_hist_f64(&client, child_h.clone(), n_parts * per_leaf)
                 .expect("read child fixed-point hist");
 
             // (2) Parent-level fill: 2^(level-1) resident parent histograms.
+            let parent_of_h = client.create(cubecl::bytes::Bytes::from_elems(parent_of.clone()));
             let parent_h = launch_partition_hist2_into(
-                &client, &der1, &weight, &cindex, &indices, &parent_of, n_bins, n_features,
+                &client, &der1, &weight, &cindex, &indices, parent_of_h, n_bins, n_features,
                 level - 1,
             )
             .expect("partition_hist2 (parent level) must launch");

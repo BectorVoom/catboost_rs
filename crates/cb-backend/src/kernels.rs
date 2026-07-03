@@ -3756,6 +3756,180 @@ pub fn subtract_histograms_kernel<F: Float>(
     }
 }
 
+/// Device-resident **partition-aware pointwise split score + deterministic split argmin**
+/// over the MULTI-LEAF FIXED-POINT `u64` partition histogram (GPUT-05 depth>1 scorer, Phase
+/// 11 Plan 03). The depth>1 sibling of [`find_optimal_split_kernel`]: where that scorer folds
+/// ONE whole-dataset 2-channel histogram, this folds the `2^level` per-leaf slots of the
+/// partition-aware fill ([`partition_hist2_nonbinary_kernel`]) and scores the SINGLE oblivious
+/// `(feature, border)` split applied to EVERY active leaf, summing each leaf's contribution
+/// (CATBOOST_CUDA_KERNELS_DESIGN §6.3/§6.4 — left = hist[leaf, ≤border], right = the leaf's
+/// remaining bins).
+///
+/// # Inputs / layout
+///
+/// `bin_sums` is the FIXED-POINT `u64` partition histogram (read-only, device-resident, NO
+/// host round-trip — D-05): flat cell index `part * leaf_stride + (feature * n_bins + bin) * 2
+/// + channel`, `leaf_stride = n_features * n_bins * 2`, **channel 0 = Σ weight/hessian,
+/// channel 1 = Σ der1** (the layout [`partition_hist2_nonbinary_kernel`] writes — the SWAP vs
+/// [`find_optimal_split_kernel`] is why this is a distinct kernel, NOT a reuse). Each cell is
+/// decoded to the working float via [`fixedpoint_decode`]. `n_parts = 2^level` is the runtime
+/// active-leaf count; `scaled_l2` the per-tree regularizer (length-1 device array).
+///
+/// # Score fold (per active leaf, then argmin)
+///
+/// For each candidate `(feature, border)` the split produces, PER leaf, a LEFT side (bins
+/// `0..=border`) and a RIGHT side (bins `border+1..n_bins`); their `(Σ der1, Σ weight)` fold
+/// through the SHARED [`cb_leaf_score_term`] (the SAME comptime calcer arm the depth-1 scorer
+/// uses), summed left-then-right across ALL `n_parts` leaves — exactly the CPU
+/// `cb_compute::{l2,cosine}_split_score` over the `2·n_parts` resulting leaves. Cosine's single
+/// `1e-100`-seeded denominator is accumulated ONCE across all leaves (`Σ avg²·weight`), then
+/// `score = numerator / sqrt(den)` — matching `cosine_split_score`'s seed-first order.
+///
+/// # Deterministic argmin (Pitfall 1) + D-05
+///
+/// Each thread keeps a running best `(gain, candidate-index)` with the strict-`>` first-wins /
+/// lowest-`(feature, bin)`-index tie-break, then the cube block-reduces (wave-agnostic
+/// `CUBE_DIM_X`-strided shared-mem tree, D-09) into ONE `(best_gain, best_idx)` — the ONLY
+/// O(1) descriptor read back to host (the bulk histogram NEVER crosses — D-05). The trailing
+/// `border == n_bins - 1` no-op (all bins LEFT) is EXCLUDED from the argmin, in lockstep with
+/// the depth-1 scorer and the CPU reference.
+///
+/// Generic over `F: Float` (AGENTS.md generics-float). The `f32::MIN` sentinel (HIP-safe finite
+/// `-inf` stand-in, WR-01 — a literal `-inf` fails the gfx1100 JIT) seeds the argmin so any real
+/// candidate wins. if-as-STATEMENT only (CubeCL conditionals). Every read is grid-stride /
+/// position bounded; the candidate/leaf VALUE ranges are host-validated before launch.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_optimal_split_partition_kernel<F: Float>(
+    bin_sums: &Array<u64>,
+    best_gain: &mut Array<F>,
+    best_idx: &mut Array<u32>,
+    scaled_l2: &Array<F>,
+    n_parts: u32,
+    n_features: u32,
+    #[comptime] n_bins: u32,
+    #[comptime] score_fn: u32,
+) {
+    let tid = UNIT_POS;
+    let n_bins_usize = n_bins as usize;
+    let n_features_usize = n_features as usize;
+    let n_parts_usize = n_parts as usize;
+    let n_candidates = n_features_usize * n_bins_usize;
+    // One full (feature, bin, channel) histogram line per partition slot (== the leaf stride
+    // the partition-aware fill writes: upstream §6.4 leaf-wise tensor layout).
+    let leaf_stride = n_features_usize * n_bins_usize * 2usize;
+
+    let lambda = scaled_l2[0usize];
+    // The minimal-score sentinel any real candidate must beat (the `f64::NEG_INFINITY`
+    // analogue). Finite `f32::MIN` is the HIP-safe stand-in (WR-01 — a literal `-inf` fails
+    // the gfx1100 JIT); L2/Cosine scores are >= 0 and the Solar/LOO/Sat terms are bounded, so
+    // this is behaviorally identical to `-inf` for all reachable inputs.
+    let minimal_score = F::new(f32::MIN);
+
+    let mut my_gain = minimal_score;
+    let mut my_idx = n_candidates as u32;
+
+    // Grid-stride over candidates (D-09: stride == cube width CUBE_DIM_X, a topology value).
+    let mut c = tid as usize;
+    while c < n_candidates {
+        let feature = c / n_bins_usize;
+        let border = c % n_bins_usize;
+
+        // Sum the single oblivious split's score over EVERY active leaf. `score_acc` is the
+        // numerator (== whole score for L2/Solar/LOO/Sat); `cos_den` the Cosine denominator
+        // seeded ONCE (1e-100 first summand, matching cosine_split_score).
+        let mut score_acc = F::new(0.0);
+        let mut cos_den = F::new(1e-100);
+
+        let mut part = 0usize;
+        while part < n_parts_usize {
+            let part_base = part * leaf_stride;
+            let mut left_w = F::new(0.0);
+            let mut left_d = F::new(0.0);
+            let mut right_w = F::new(0.0);
+            let mut right_d = F::new(0.0);
+            let mut bin = 0usize;
+            while bin < n_bins_usize {
+                // channel 0 = Σ weight, channel 1 = Σ der1 (the partition-fill layout).
+                let cell = part_base + (feature * n_bins_usize + bin) * 2usize;
+                let w = fixedpoint_decode::<F>(bin_sums[cell]);
+                let d = fixedpoint_decode::<F>(bin_sums[cell + 1usize]);
+                if bin <= border {
+                    left_w += w;
+                    left_d += d;
+                } else {
+                    right_w += w;
+                    right_d += d;
+                }
+                bin += 1usize;
+            }
+            // Per-leaf additive term in the SAME left-then-right order the depth-1 scorer and
+            // the CPU oracle use (sum = der1, weight = weight).
+            score_acc += cb_leaf_score_term::<F>(left_d, left_w, lambda, score_fn);
+            score_acc += cb_leaf_score_term::<F>(right_d, right_w, lambda, score_fn);
+            if score_fn == comptime!(SCORE_FN_COSINE) {
+                let left_avg = cb_leaf_avg::<F>(left_d, left_w, lambda);
+                let right_avg = cb_leaf_avg::<F>(right_d, right_w, lambda);
+                cos_den += left_avg * left_avg * left_w;
+                cos_den += right_avg * right_avg * right_w;
+            }
+            part += 1usize;
+        }
+
+        let mut score = score_acc;
+        if score_fn == comptime!(SCORE_FN_COSINE) {
+            score = score_acc / cos_den.sqrt();
+        }
+
+        // Strict-first-wins / lowest-index tie-break; EXCLUDE the trailing no-op border.
+        if border < n_bins_usize - 1usize {
+            if score > my_gain {
+                my_gain = score;
+                my_idx = c as u32;
+            }
+        }
+
+        c += CUBE_DIM_X as usize;
+    }
+
+    // Block-reduce the per-thread bests into ONE (gain, candidate-index) winner (the SAME
+    // wave-agnostic shared-mem tree + lowest-index tie-break as find_optimal_split_kernel).
+    let mut sh_gain = SharedMemory::<F>::new(ARGMIN_SHMEM);
+    let mut sh_idx = SharedMemory::<u32>::new(ARGMIN_SHMEM);
+    sh_gain[tid as usize] = my_gain;
+    sh_idx[tid as usize] = my_idx;
+    sync_cube();
+
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let other_gain = sh_gain[(tid + s) as usize];
+            let other_idx = sh_idx[(tid + s) as usize];
+            let cur_gain = sh_gain[tid as usize];
+            let cur_idx = sh_idx[tid as usize];
+            let mut take_other = false;
+            if other_gain > cur_gain {
+                take_other = true;
+            } else if other_gain == cur_gain {
+                if other_idx < cur_idx {
+                    take_other = true;
+                }
+            }
+            if take_other {
+                sh_gain[tid as usize] = other_gain;
+                sh_idx[tid as usize] = other_idx;
+            }
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+
+    if tid == 0u32 {
+        best_gain[CUBE_POS] = sh_gain[0usize];
+        best_idx[CUBE_POS] = sh_idx[0usize];
+    }
+}
+
 // ===========================================================================
 // Phase 7.5 Plan 06 — the PAIRWISE split scorer (split_pairwise.cuh), the
 // genuinely-new structurally-heaviest piece (Pitfall 5), sequenced LAST per

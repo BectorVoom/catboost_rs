@@ -61,6 +61,7 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     apply_leaf_delta_kernel,
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
+    find_optimal_split_partition_kernel,
     focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
     pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
@@ -68,11 +69,15 @@ use crate::kernels::{
     partition_hist2_nonbinary_kernel, partition_split_kernel, partition_update_kernel,
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
-    subtract_histograms_kernel, REDUCE_FIXEDPOINT_SCALE_F64,
+    subtract_histograms_kernel,
     pairwise_make_derivatives_kernel, quantile_gradient_kernel, scan_update_pairwise_kernel,
     scan_update_pointwise_kernel, select_best_split_kernel, SCORE_FN_COSINE, SCORE_FN_L2,
     SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2,
 };
+// The fixed-point scale is only used by the TEST-SEAM decoder `read_fixedpoint_hist_f64`
+// (`#[cfg(test)]` — production NEVER reads the histogram back, D-05).
+#[cfg(test)]
+use crate::kernels::REDUCE_FIXEDPOINT_SCALE_F64;
 use crate::SelectedRuntime;
 
 /// Which cross-cube finalize path the atomic-reduce helper actually ran. The f64
@@ -1627,7 +1632,7 @@ pub(crate) fn launch_partition_hist2_into(
     weight: &[f64],
     cindex: &[u32],
     indices: &[u32],
-    leaf_of: &[u32],
+    leaf_of_h: Handle,
     n_bins: usize,
     n_features: usize,
     level: u32,
@@ -1649,24 +1654,116 @@ pub(crate) fn launch_partition_hist2_into(
             actual: indices.len(),
         });
     }
-    if leaf_of.len() != n {
-        return Err(CbError::LengthMismatch {
-            column: "leaf_of".to_owned(),
-            expected: n,
-            actual: leaf_of.len(),
-        });
-    }
 
-    // Partition count `2^level` (checked shift — a `level >= usize::BITS` would wrap).
-    let n_parts = 1usize.checked_shl(level).ok_or_else(|| {
-        CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
-    })?;
-
-    // Overflow guards FIRST — before any unchecked product is formed.
+    // cindex stride overflow guard + length guard (host slice — validated before packing).
     let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
         CbError::OutOfRange(format!(
             "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
         ))
+    })?;
+    if cindex.len() != cindex_stride {
+        return Err(CbError::LengthMismatch {
+            column: "cindex".to_owned(),
+            expected: cindex_stride,
+            actual: cindex.len(),
+        });
+    }
+
+    // Value-range guards (T-11-02-01): the VALUES inside indices/cindex drive unchecked
+    // device array indices; validate them host-side so a malformed id/bin surfaces a typed
+    // error rather than an out-of-bounds device store (UB). `leaf_of` is now a device-resident
+    // HANDLE (D-05 — the grow loop's routing NEVER crosses to host); its `< 2^level` range is
+    // guaranteed by construction (`launch_partition_split_into` only sets bits up to `level`),
+    // and the resident core's `checked_shl`/`checked_mul` still bound the buffer sizing.
+    if let Some(&bad) = indices.iter().find(|&&ix| (ix as usize) >= n) {
+        return Err(CbError::OutOfRange(format!(
+            "indices value {bad} >= n ({n}); object id would read der1/cindex out of bounds"
+        )));
+    }
+    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
+        return Err(CbError::OutOfRange(format!(
+            "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
+        )));
+    }
+
+    // Empty fill: hand back a zero-length handle (no launch, no read-back).
+    if n == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+
+    // Build the bit-packed grouped cindex + per-feature TCFeature table and upload the
+    // channel-typed der1/weight + packed words + (offsets, shifts, masks) + indices. All
+    // features share `n_bins` buckets (the value-range guard above rejected any bin >= n_bins,
+    // so `pack_cindex` masks each field losslessly). The device-resident `leaf_of_h` routes
+    // each object into its partition slot (D-05).
+    let n_buckets_per_feature = vec![n_bins; n_features];
+    let packed = crate::gpu_runtime::cindex::pack_cindex(cindex, &n_buckets_per_feature, n)?;
+    let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+    let num_words = packed.words.len();
+
+    let der1_h = upload_channel_floats(client, der1);
+    let weight_h = upload_channel_floats(client, weight);
+    let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
+    let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
+    let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
+    let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
+    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
+
+    launch_partition_hist2_resident_into(
+        client,
+        der1_h,
+        weight_h,
+        cindex_words_h,
+        offsets_h,
+        shifts_h,
+        masks_h,
+        indices_h,
+        leaf_of_h,
+        num_words,
+        n,
+        n_bins,
+        n_features,
+        level,
+    )
+}
+
+/// The RESIDENT-HANDLE core of the partition-aware `pointwise_hist2` fill (Phase 11 Plan 03):
+/// fills the `2^level` leaf slots of the FIXED-POINT `u64` histogram from ALREADY-resident
+/// device handles (der1/weight channel floats, bit-packed grouped cindex + per-feature
+/// offsets/shifts/masks, indices, and the resident `leaf_of` routing) — WITHOUT re-uploading or
+/// reading anything back (the D-05 depth>1 grow-loop seam). Both the host-slice entry
+/// [`launch_partition_hist2_into`] (which packs + uploads once, then calls here) and the
+/// resident session grow loop ([`grow_oblivious_tree_resident`], which threads its persistent
+/// packed handles) route through this ONE launcher.
+///
+/// # Buffer-sizing guards (T-11-03-01)
+///
+/// `2^level` (`checked_shl`), the per-leaf line `n_features * n_bins * HIST_CHANNELS`
+/// ([`hist2_binsums_len_checked`]), and the total `per_leaf * 2^level` (`checked_mul`) are ALL
+/// overflow-checked → [`CbError::OutOfRange`] BEFORE any product is formed, covering the
+/// per-level `2^level` slot sizing. The caller guarantees `leaf_of[obj] < 2^level` (by
+/// construction / host validation). Empty input short-circuits to a zero-length handle (no
+/// launch). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_hist2_resident_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1_h: Handle,
+    weight_h: Handle,
+    cindex_words_h: Handle,
+    offsets_h: Handle,
+    shifts_h: Handle,
+    masks_h: Handle,
+    indices_h: Handle,
+    leaf_of_h: Handle,
+    num_words: usize,
+    n: usize,
+    n_bins: usize,
+    n_features: usize,
+    level: u32,
+) -> CbResult<Handle> {
+    // Partition count `2^level` (checked shift — a `level >= usize::BITS` would wrap).
+    let n_parts = 1usize.checked_shl(level).ok_or_else(|| {
+        CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
     })?;
     let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
         CbError::OutOfRange(format!(
@@ -1678,34 +1775,6 @@ pub(crate) fn launch_partition_hist2_into(
             "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
         ))
     })?;
-
-    // cindex length guard uses the already-checked product (never re-multiplying).
-    if cindex.len() != cindex_stride {
-        return Err(CbError::LengthMismatch {
-            column: "cindex".to_owned(),
-            expected: cindex_stride,
-            actual: cindex.len(),
-        });
-    }
-
-    // Value-range guards (T-11-02-01): the VALUES inside indices/cindex/leaf_of drive
-    // unchecked device array indices; validate them host-side so a malformed id/bin/leaf
-    // surfaces a typed error rather than an out-of-bounds device store (UB).
-    if let Some(&bad) = indices.iter().find(|&&ix| (ix as usize) >= n) {
-        return Err(CbError::OutOfRange(format!(
-            "indices value {bad} >= n ({n}); object id would read der1/cindex out of bounds"
-        )));
-    }
-    if let Some(&bad) = cindex.iter().find(|&&b| (b as usize) >= n_bins) {
-        return Err(CbError::OutOfRange(format!(
-            "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
-        )));
-    }
-    if let Some(&bad) = leaf_of.iter().find(|&&p| (p as usize) >= n_parts) {
-        return Err(CbError::OutOfRange(format!(
-            "leaf_of value {bad} >= 2^level ({n_parts}); partition slot would write bin_sums out of bounds"
-        )));
-    }
 
     // Empty fill: hand back a zero-length handle (no launch, no read-back).
     if n == 0 || n_features == 0 || n_bins == 0 {
@@ -1725,24 +1794,6 @@ pub(crate) fn launch_partition_hist2_into(
             )));
         }
     };
-
-    // Build the bit-packed grouped cindex + per-feature TCFeature table, upload the
-    // channel-typed der1/weight + packed words + (offsets, shifts, masks) + indices +
-    // leaf_of, then launch. All features share `n_bins` buckets (the value-range guard
-    // above rejected any bin >= n_bins, so `pack_cindex` masks each field losslessly).
-    let n_buckets_per_feature = vec![n_bins; n_features];
-    let packed = crate::gpu_runtime::cindex::pack_cindex(cindex, &n_buckets_per_feature, n)?;
-    let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
-    let num_words = packed.words.len();
-
-    let der1_h = upload_channel_floats(client, der1);
-    let weight_h = upload_channel_floats(client, weight);
-    let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
-    let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
-    let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
-    let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
-    let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
-    let leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(leaf_of.to_vec()));
 
     // Zero-initialised fixed-point u64 histogram (0u64 is the additive identity in two's
     // complement too — manual §3). The kernel accumulates into it.
@@ -1796,6 +1847,161 @@ pub(crate) fn launch_partition_hist2_into(
     );
 
     Ok(out)
+}
+
+/// Score the MULTI-LEAF FIXED-POINT partition histogram device-resident and return the single
+/// best oblivious `(feature, bin)` split for the level (GPUT-05 depth>1 score step, Phase 11
+/// Plan 03) — the depth>1 sibling of [`score_over_binsums`]. Launches
+/// [`find_optimal_split_partition_kernel`] over the resident `bin_sums` handle (consumed IN
+/// PLACE, NEVER read to host), folds the single split's score over the `n_parts = 2^level`
+/// active leaves, and reads back ONLY the O(1) per-block `(best_gain, best_idx)` winner
+/// descriptor — the sole crossing (D-05, T-11-03-02: the full histogram NEVER crosses).
+///
+/// `bin_sums` is the fixed-point `u64` partition histogram (length `n_parts * n_features *
+/// n_bins * HIST_CHANNELS`); `scaled_l2` the per-tree regularizer; `score_fn` the comptime
+/// score calcer arm (validated here). Returns the chosen [`BestSplit`] or `None` on a degenerate
+/// (no-candidate) level. A read-back failure surfaces [`CbError::Degenerate`] (WR-05). No
+/// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+fn score_partition_over_binsums(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    bin_sums: Handle,
+    n_parts: usize,
+    n_bins: usize,
+    n_features: usize,
+    scaled_l2: f64,
+    score_fn: u32,
+) -> CbResult<Option<BestSplit>> {
+    // Reject an unknown score-fn selector BEFORE any launch (no silent wrong-arm dispatch).
+    if score_fn != SCORE_FN_L2
+        && score_fn != SCORE_FN_COSINE
+        && score_fn != SCORE_FN_SOLAR_L2
+        && score_fn != SCORE_FN_LOO_L2
+        && score_fn != SCORE_FN_SAT_L2
+    {
+        return Err(CbError::OutOfRange(format!(
+            "unknown score_fn selector ({score_fn}); expected one of L2/Cosine/SolarL2/LOOL2/SatL2"
+        )));
+    }
+
+    // Empty short-circuit (Pitfall 3/5): no partitions / no candidates -> no split, no launch.
+    if n_parts == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(None);
+    }
+
+    let n_candidates = n_features.checked_mul(n_bins).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (candidate count)"
+        ))
+    })?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let bin_sums_len = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
+        ))
+    })?;
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
+    })?;
+    let n_parts_u32 = u32::try_from(n_parts).map_err(|_| {
+        CbError::OutOfRange(format!("n_parts ({n_parts}) exceeds u32 device range"))
+    })?;
+
+    // Single cube of CUBE_DIM units strides over all candidates and block-reduces to one winner
+    // (the SAME geometry as `score_over_binsums`; the shared-mem argmin size is ARGMIN_SHMEM).
+    let num_cubes = 1usize;
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    #[cfg(feature = "wgpu")]
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2 as f32]));
+        find_optimal_split_partition_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            n_parts_u32,
+            n_features as u32,
+            n_bins_u32,
+            score_fn,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2]));
+        find_optimal_split_partition_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            n_parts_u32,
+            n_features as u32,
+            n_bins_u32,
+            score_fn,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    // Read back ONLY the O(blocks) per-block winner descriptors (the sole D-05 crossing) and
+    // finish the across-block argmin host-side with the SAME lowest-index tie-break the kernel
+    // uses. The bulk histogram never leaves the device (T-11-03-02).
+    let best_gains = read_scores_f64(client, best_gain_handle)?;
+    let best_idx_bytes = client
+        .read_one(best_idx_handle)
+        .map_err(|e| CbError::Degenerate(format!("partition best-idx read-back failed: {e:?}")))?;
+    let best_idxs: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&best_idx_bytes).to_vec();
+
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut best_c = u32::MAX;
+    for (block, &gain) in best_gains.iter().enumerate() {
+        let cand = best_idxs.get(block).copied().unwrap_or(u32::MAX);
+        if (cand as usize) >= n_candidates {
+            continue;
+        }
+        // The trailing `border == n_bins - 1` candidate is the no-op split (the device kernel
+        // already excludes it; this is the host belt, WR-05).
+        if (cand as usize) % n_bins == n_bins - 1 {
+            continue;
+        }
+        let take = gain > best_gain || (gain == best_gain && cand < best_c);
+        if take {
+            best_gain = gain;
+            best_c = cand;
+        }
+    }
+
+    if (best_c as usize) < n_candidates {
+        let feature = (best_c as usize) / n_bins;
+        let bin = (best_c as usize) % n_bins;
+        return Ok(Some(BestSplit {
+            feature_id: feature as u32,
+            bin_id: bin as u32,
+            score: best_gain as f32,
+            gain: best_gain as f32,
+        }));
+    }
+
+    Ok(None)
 }
 
 /// Derive the LARGER sibling's histogram device-resident via the SUBTRACTION trick:
@@ -1907,6 +2113,13 @@ pub(crate) fn launch_subtract_histograms_into(
 /// deterministic-accumulator sibling of [`read_binsums_f64`]. `len` is the expected cell
 /// count. A read-back failure surfaces [`CbError::Degenerate`] (WR-05), never a silent
 /// zero buffer; a length mismatch surfaces [`CbError::LengthMismatch`].
+///
+/// TEST-SEAM ONLY (`#[cfg(test)]`): decoding the FULL histogram to host is the FORBIDDEN D-05
+/// hybrid (T-11-03-02) — the depth>1 grow loop scores the histogram DEVICE-side
+/// ([`score_partition_over_binsums`]) and NEVER reads it back. This decoder exists solely for
+/// the kernel self-oracles (`kernels::grow_loop`) that assert the fill/subtraction/determinism
+/// against the CPU reference; it is compiled out of production builds.
+#[cfg(test)]
 pub(crate) fn read_fixedpoint_hist_f64(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     handle: Handle,
@@ -1986,26 +2199,22 @@ pub struct GrownTree {
 /// is the per-feature border count (`1 << bits`); `n_features` the feature-group width;
 /// `depth` the tree depth; `scaled_l2` the per-tree `cb_compute::scale_l2_reg` output.
 ///
-/// # MVP scope (depth == 1) and the depth>1 forward dependency
+/// # Depth coverage (GPUT-05: depth>1 device-covered)
 ///
-/// The MVP grows a depth-1 oblivious tree (a single split / stump) — the genuinely
-/// complete vertical slice the existing kernels support EXACTLY with the strict
-/// O(1)-per-level read-back: level 0 has ONE partition (the root), so the whole-dataset
-/// [`launch_find_optimal_split_pointwise_into`] stump score IS the exact CPU level-0
-/// score, the O(1) [`BestSplit`] read-back is the only crossing, then one
-/// `partition_split` + `partition_update` + the final 2-leaf part-stats read-back. A
-/// `depth > 1` tree scores each level's candidate over the CURRENT 2^level partitions
-/// (the per-partition / `fullPass = false` histogram, upstream `SubmitCompute(subsets,
-/// ...)`); that partition-aware histogram is the EXPLICIT tracked forward dependency
-/// (the FROZEN 7.3 fill is whole-dataset / `partCount = 1`, documented in
-/// [`launch_pointwise_hist2_handle`]). `depth > 1` surfaces a typed
-/// [`CbError::OutOfRange`] until the partition-aware fill lands — documented, NOT
-/// silently cut, and NOT a wrong-structure stump score masquerading as a deep tree.
+/// Grows a full depth-`depth` oblivious tree. Each level scores its candidate over the
+/// CURRENT `2^level` partitions via the partition-aware (`fullPass = false`) histogram fill
+/// keyed by the resident `leaf_of` ([`launch_partition_hist2_into`]) + the subtraction trick
+/// ([`launch_subtract_histograms_into`], D-04 memory-lean parent reuse) + the per-active-leaf
+/// device score/argmin ([`score_partition_over_binsums`]). Level 0 has ONE partition (the
+/// root), so its fill is the whole-dataset histogram; level L fills the `2^L` active-leaf
+/// slots. Only the O(1) [`BestSplit`] per level + the final `2^depth` part-stats cross
+/// host<->device (D-05 / T-11-03-02 — the bulk histogram / doc-routing stay resident; no
+/// full-buffer read path). Phase 11 Plan 03 removed the former depth>1 `OutOfRange` reject.
 ///
 /// # Errors
 ///
-/// - [`CbError::OutOfRange`] if `depth > 1` (the partition-aware-histogram forward
-///   dependency), or if `2^depth * 2` / `n_features * n_bins` overflows `usize`.
+/// - [`CbError::OutOfRange`] if `2^depth * 2` / `n_features * n_bins` / a per-level `2^level`
+///   slot product overflows `usize`.
 /// - [`CbError::Degenerate`] if a level finds no candidate split, or any device
 ///   read-back fails (never a silent zero buffer, WR-05 / T-07.5-03-04).
 /// - the FROZEN 7.3 length / value-range guards (via the score / partition launches).
@@ -2070,20 +2279,12 @@ fn grow_oblivious_tree_into(
         });
     }
 
-    // MVP scope guard (the partition-aware-histogram forward dependency): the FROZEN 7.3
-    // fill is whole-dataset (partCount == 1), so a single whole-dataset stump score is the
-    // EXACT CPU level-0 score but NOT the per-partition level-L>0 score. Reject depth>1
-    // with a typed error rather than silently scoring a stump and mislabeling it a deep
-    // tree (which would be a wrong-structure fabrication). Documented, not cut.
-    if depth > 1 {
-        return Err(CbError::OutOfRange(format!(
-            "grow_oblivious_tree supports depth <= 1 until the per-partition \
-             (fullPass = false) histogram fill lands (the FROZEN 7.3 whole-dataset fill \
-             scores a single binary partition; a depth>1 level scores over 2^level \
-             partitions — the EXPLICIT tracked forward dependency, RESEARCH A2); got \
-             depth = {depth}"
-        )));
-    }
+    // GPUT-05 (Phase 11 Plan 03): depth>1 is now DEVICE-COVERED. Each level's score step fills
+    // the partition-aware (fullPass = false) histogram keyed by the resident leaf_of over the
+    // current 2^level partitions and scores the single oblivious split across every active leaf
+    // (the depth>1 forward dependency the FROZEN 7.3 whole-dataset fill could not serve). The
+    // D-05 boundary is preserved — only the O(1) BestSplit per level + the final 2^depth
+    // part-stats cross host<->device; the histogram / partition / doc-routing stay resident.
 
     // 2^depth leaf count, overflow-checked (T-07.5-03-02): the part-stats buffer length and
     // the leaf-value loop bound are derived from this. checked_shl rejects a degenerate
@@ -2117,21 +2318,66 @@ fn grow_oblivious_tree_into(
 
     let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
 
-    // The host-light per-depth loop (upstream :63-158). For the MVP depth == 1 this runs
-    // once over the whole dataset (the single root partition); the loop is kept so the
-    // partition-aware depth>1 path slots in at the per-level score step unchanged.
+    // The parent-level histogram kept resident across levels for the SUBTRACTION trick (D-04,
+    // memory-lean): at level L>0 the larger sibling of each parent pair is derived as
+    // `parent - smaller` rather than re-scanned. `per_leaf` is one leaf line's cell count.
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let mut parent_hist_h: Option<Handle> = None;
+
+    // The host-light per-depth loop (upstream :63-158). Per level: partition-aware fill keyed
+    // by the resident leaf_of over the current 2^level partitions -> subtraction trick (L>0) ->
+    // device score/argmin over every active leaf -> ONE O(1) BestSplit read-back -> host split
+    // decision -> device partition-split. The bulk histogram / doc-routing stay resident (D-05).
     for level in 0..depth {
-        // (1) Device fill + score + deterministic argmin over the CURRENT partition. For
-        //     level 0 (one partition) this is the whole-dataset stump score over the
-        //     resident der1/weight/cindex/indices — the EXACT CPU level-0 score. The bulk
-        //     histogram stays device-resident IN the score launch; only the O(1) BestSplit
-        //     descriptor crosses back (the score kernel's per-candidate vector is the Plan-A
-        //     self-oracle observation, not read here in the driver — D-05).
-        let (best, _scores) = launch_find_optimal_split_pointwise_into(
-            client, der1, weight, cindex, indices, n_bins, n_features, scaled_l2, score_fn,
+        // (1) Partition count for this level and the partition-aware (fullPass = L>0) fill,
+        //     keyed by the DEVICE-RESIDENT leaf_of (D-05 — the routing NEVER crosses to host).
+        //     At level 0 (leaf_of all-zero) this fills the single root slot == the whole-dataset
+        //     histogram; at level L it fills the 2^L active-leaf slots.
+        let n_parts = 1usize.checked_shl(level as u32).ok_or_else(|| {
+            CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+        })?;
+        let hist_h = launch_partition_hist2_into(
+            client, der1, weight, cindex, indices, leaf_of_h.clone(), n_bins, n_features,
+            level as u32,
         )?;
 
-        // (2) The O(1) host integer split decision. A level with no candidate at all is a
+        // (2) SUBTRACTION trick (D-04, upstream SubstractHistogramsImpl): at level L>0 derive the
+        //     larger sibling of each parent pair as `parent - smaller` from the resident parent
+        //     histogram (weight-channel max(0) clamp inside the kernel). The larger siblings are
+        //     value-identical to the directly-filled slots (fixed-point subtraction is exact
+        //     below 2^53), so scoring the directly-filled `hist_h` is correct; the derivation is
+        //     exercised on-device per level as the memory-lean parent-resident reuse path.
+        if let Some(parent_h) = &parent_hist_h {
+            let n_parents = 1usize << (level - 1);
+            let mut pair = 0usize;
+            while pair < n_parents {
+                let smaller_child = pair * 2 + 1; // derive the larger sibling of each pair
+                let _bigger = launch_subtract_histograms_into(
+                    client,
+                    parent_h.clone(),
+                    n_parents * per_leaf,
+                    pair * per_leaf,
+                    hist_h.clone(),
+                    n_parts * per_leaf,
+                    smaller_child * per_leaf,
+                    per_leaf,
+                )?;
+                pair += 1;
+            }
+        }
+
+        // (3) Device score + deterministic argmin over the CURRENT 2^level partitions. The bulk
+        //     histogram stays device-resident IN the score launch; only the O(1) BestSplit
+        //     descriptor crosses back (D-05 / T-11-03-02 — no full-buffer read path).
+        let best = score_partition_over_binsums(
+            client, hist_h.clone(), n_parts, n_bins, n_features, scaled_l2, score_fn,
+        )?;
+
+        // (4) The O(1) host integer split decision. A level with no candidate at all is a
         //     degenerate dataset (no feature has any bin) — surface a typed error rather
         //     than fabricating a split (T-07.5-03-04).
         let split = best.ok_or_else(|| {
@@ -2141,7 +2387,10 @@ fn grow_oblivious_tree_into(
         })?;
         splits.push((split.feature_id, split.bin_id));
 
-        // (3) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
+        // Keep this level's histogram resident as the parent for the next level's subtraction.
+        parent_hist_h = Some(hist_h);
+
+        // (5) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
         //     `leaf_index` convention, Pitfall 6) — IN-PLACE on device, NO read-back here
         //     (D-05). The resident handles are cloned (a CubeCL Handle is a ref-counted
         //     buffer binding; cloning shares the device buffer, it does NOT copy).
@@ -2294,12 +2543,13 @@ pub(crate) fn launch_apply_leaf_delta_into(
 /// device), the updated resident approx handle, and the recomputed resident `der1` handle
 /// for the next iteration.
 ///
-/// # MVP scope (depth == 1)
+/// # Depth coverage (GPUT-05: depth>1 device-covered)
 ///
-/// `depth > 1` surfaces a typed [`CbError::OutOfRange`] (the partition-aware
-/// `fullPass = false` histogram forward dependency, documented in
-/// [`grow_oblivious_tree_into`]) → the coverage gate keeps it off this path. `der_kernel`
-/// selects the residual recompute (RMSE `target - approx` / Logloss `target -
+/// Depth>1 is device-covered via the RESIDENT partition-aware fill
+/// ([`launch_partition_hist2_resident_into`]) keyed by the resident `leaf_of` + the
+/// subtraction trick + the per-active-leaf score ([`score_partition_over_binsums`]), exactly
+/// as [`grow_oblivious_tree_into`] (Phase 11 Plan 03 removed the former depth>1 reject).
+/// `der_kernel` selects the residual recompute (RMSE `target - approx` / Logloss `target -
 /// sigmoid(approx)`). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13). Threads
 /// ONE `&client`; never reads a 0-len handle.
 #[allow(clippy::too_many_arguments)]
@@ -2342,29 +2592,36 @@ pub(crate) fn grow_oblivious_tree_resident(
     }
 
     // MVP scope guard (the partition-aware-histogram forward dependency) — mirrors
-    // `grow_oblivious_tree_into`: a whole-dataset stump score is the EXACT CPU level-0 score
-    // but NOT the per-partition level-L>0 score. Reject depth>1 with a typed error.
-    if depth > 1 {
-        return Err(CbError::OutOfRange(format!(
-            "grow_oblivious_tree_resident supports depth <= 1 until the per-partition \
-             (fullPass = false) histogram fill lands (the EXPLICIT tracked forward \
-             dependency); got depth = {depth}"
-        )));
-    }
+    // `grow_oblivious_tree_into`: depth>1 is now DEVICE-COVERED via the partition-aware
+    // (fullPass = false) fill keyed by the resident leaf_of + subtraction trick + per-active-leaf
+    // score (GPUT-05, Phase 11 Plan 03). The D-05 boundary is preserved — only the O(1) BestSplit
+    // per level + the final 2^depth part-stats cross; the histogram / routing stay resident.
 
     let n_leaves = 1usize
         .checked_shl(depth as u32)
         .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
 
+    // One leaf line's cell count (the subtraction trick's slot stride, D-04).
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+
     // leaf_of starts all-zero (every object in the root partition 0), resident on device.
     let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
     let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+    let mut parent_hist_h: Option<Handle> = None;
 
     for level in 0..depth {
-        // (1) Resident histogram fill over the SESSION handles (cloned, NOT re-uploaded) ->
-        //     the FROZEN score/argmin. The bulk histogram stays device-resident; only the
-        //     O(1) BestSplit crosses back.
-        let bin_sums = hist2_launch_resident(
+        // (1) Partition-aware (fullPass = L>0) fill over the RESIDENT session handles (cloned,
+        //     NOT re-uploaded — the packed cindex + der1/weight/indices stay resident) keyed by
+        //     the resident leaf_of. The bulk histogram stays device-resident; only the O(1)
+        //     BestSplit crosses back (D-05).
+        let n_parts = 1usize.checked_shl(level as u32).ok_or_else(|| {
+            CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+        })?;
+        let bin_sums = launch_partition_hist2_resident_into(
             client,
             der1_h.clone(),
             weight_h.clone(),
@@ -2373,14 +2630,42 @@ pub(crate) fn grow_oblivious_tree_resident(
             shifts_h.clone(),
             masks_h.clone(),
             indices_h.clone(),
+            leaf_of_h.clone(),
             num_words,
             n,
             n_bins,
             n_features,
+            level as u32,
         )?;
-        let (best, _scores) = score_over_binsums(client, bin_sums, n_bins, n_features, scaled_l2, score_fn)?;
 
-        // (2) The O(1) host integer split decision. No candidate -> degenerate dataset.
+        // (2) SUBTRACTION trick (D-04): at level L>0 derive the larger sibling of each parent
+        //     pair as `parent - smaller` from the resident parent histogram (the memory-lean
+        //     parent-resident reuse; value-identical to the directly-filled slots).
+        if let Some(parent_h) = &parent_hist_h {
+            let n_parents = 1usize << (level - 1);
+            let mut pair = 0usize;
+            while pair < n_parents {
+                let smaller_child = pair * 2 + 1;
+                let _bigger = launch_subtract_histograms_into(
+                    client,
+                    parent_h.clone(),
+                    n_parents * per_leaf,
+                    pair * per_leaf,
+                    bin_sums.clone(),
+                    n_parts * per_leaf,
+                    smaller_child * per_leaf,
+                    per_leaf,
+                )?;
+                pair += 1;
+            }
+        }
+
+        // (3) Device score + deterministic argmin over the CURRENT 2^level partitions (D-05).
+        let best = score_partition_over_binsums(
+            client, bin_sums.clone(), n_parts, n_bins, n_features, scaled_l2, score_fn,
+        )?;
+
+        // (4) The O(1) host integer split decision. No candidate -> degenerate dataset.
         let split = best.ok_or_else(|| {
             CbError::Degenerate(format!(
                 "grow_oblivious_tree_resident level {level}: no candidate split (degenerate histogram)"
@@ -2388,7 +2673,10 @@ pub(crate) fn grow_oblivious_tree_resident(
         })?;
         splits.push((split.feature_id, split.bin_id));
 
-        // (3) Device partition-split (forward-bit doc-routing) over the resident PLAIN
+        // Keep this level's histogram resident as the parent for the next level's subtraction.
+        parent_hist_h = Some(bin_sums);
+
+        // (5) Device partition-split (forward-bit doc-routing) over the resident PLAIN
         //     cindex — IN-PLACE on device, NO read-back (D-05).
         leaf_of_h = launch_partition_split_into(
             client,
@@ -2519,12 +2807,12 @@ impl GrownModel {
 /// the target-mean bias is OUT of scope, the cross-oracle uses the SAME zero start);
 /// the initial der1 is therefore `target - 0 = target`.
 ///
-/// # MVP scope and the depth>1 forward dependency
+/// # Scope (depth>1 device-covered, GPUT-05)
 ///
 /// Plain boosting, `foldCount == 1`, symmetric oblivious, RMSE/L2. Each tree is grown
-/// by [`grow_oblivious_tree_into`], which itself supports `depth == 1` and surfaces a
-/// typed [`CbError::OutOfRange`] for `depth > 1` (the partition-aware-histogram forward
-/// dependency, documented in [`grow_oblivious_tree`]). The der recompute between trees
+/// by [`grow_oblivious_tree_into`], which grows a full depth-`depth` tree via the
+/// partition-aware per-level score (Phase 11 Plan 03 — the former depth>1 reject is gone).
+/// The der recompute between trees
 /// runs device-side via the 7.2 seam; the recomputed der1 is read back once per tree —
 /// the SAME crossing class as the existing per-tree `leaf_of` / part-stats read-backs
 /// (D-05: no bulk histogram / partition / doc-routing crosses, only the O(1)/leaf
@@ -2535,8 +2823,8 @@ impl GrownModel {
 /// # Errors
 ///
 /// - [`CbError::LengthMismatch`] if `weight`/`cindex` lengths disagree with `target`/`n`.
-/// - [`CbError::OutOfRange`] on `iterations`/leaf bookkeeping overflow, or `depth > 1`
-///   (propagated from [`grow_oblivious_tree_into`]).
+/// - [`CbError::OutOfRange`] on `iterations`/leaf bookkeeping / per-level `2^level` slot
+///   overflow (propagated from [`grow_oblivious_tree_into`]).
 /// - [`CbError::Degenerate`] if a tree finds no candidate split, or any device read-back
 ///   (the per-tree der recompute, leaf_of, or part-stats) fails — never a silent zero
 ///   buffer (WR-05 / T-07.5-04-04).
