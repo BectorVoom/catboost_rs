@@ -4,17 +4,17 @@ milestone: v1.1
 milestone_name: GPU Performance
 current_phase: 10
 current_phase_name: gpu-foundations-runtime-seam-session-residency-device-primit
-status: executing
+status: verifying
 stopped_at: v1.1 roadmap RE-DERIVED (Phases 10–14) — all 25 reqs mapped; awaiting /gsd-discuss-phase 10
-last_updated: "2026-07-03T02:44:08.291Z"
+last_updated: "2026-07-03T02:53:42.172Z"
 last_activity: 2026-07-03
 last_activity_desc: Phase 10 execution started
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 9
-  completed_plans: 8
-  percent: 0
+  completed_plans: 9
+  percent: 20
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 Phase: 10 (gpu-foundations-runtime-seam-session-residency-device-primit) — EXECUTING
 Plan: 9 of 9
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-07-03 — Phase 10 execution started
 
 ## Performance Metrics
@@ -173,6 +173,7 @@ Last activity: 2026-07-03 — Phase 10 execution started
 | Phase 10 P06 | ~11min | 2 tasks | 5 files |
 | Phase 10 P07 | ~110min | 3 tasks | 10 files |
 | Phase 10 P08 | ~35min | 2 tasks | 2 files |
+| Phase 10 P09 | ~6min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -383,6 +384,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 10-07: upload BOTH cindex layouts once (packed words for histogram read_bin, plain feature-major for partition_split) — keeps launch_partition_split_into byte-identical vs a resident repack rippling to out-of-scope callers
 - [Phase ?]: 10-07: Cosine is the depth-1 device default (GPUT-08); Newton score fns decline (GPU-only, no depth-1 MVP arm)
 - [Phase ?]: 10-08: Device grow seam wired into cb-train boosting loop; per-fit all-or-nothing (D-10-01), Ok(None) after commit is a typed error (no CPU/device tree mixing)
+- [Phase ?]: 10-09: One seeded generator (D-06) sources BOTH the depth-1 <=1e-5 correctness fixture and the ~1e6x50 speed workload; correctness is a BLOCKING gate before any speed cell; D-10-09 (depth-1 device>=CPU only at large n) surfaced in RESULTS.md, no fabricated Kaggle numbers
 
 ### Pending Todos
 
@@ -442,7 +444,7 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-03T02:43:51.910Z
+Last session: 2026-07-03T02:53:20.567Z
 Stopped at: Phase 10 context gathered
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.

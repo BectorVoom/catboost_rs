@@ -46,7 +46,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 
 #### Phase Checklist
 
-- [ ] **Phase 10: GPU Foundations — Runtime Seam, Session Residency, Device-Primitive Library, Compressed Index, Depth-1 + Kaggle CUDA Oracle & Speed Harness** - The from-scratch CubeCL device-primitive substrate (no CUB) and the device-resident compressed index land; the device grow loop becomes reachable from `fit()`; training data stays device-resident; depth-1 oblivious trees grow on device with the Cosine GPU-default score; the foundational Kaggle CUDA harness measures BOTH correctness (≤1e-5) AND wall-clock speed from the start.
+- [x] **Phase 10: GPU Foundations — Runtime Seam, Session Residency, Device-Primitive Library, Compressed Index, Depth-1 + Kaggle CUDA Oracle & Speed Harness** - The from-scratch CubeCL device-primitive substrate (no CUB) and the device-resident compressed index land; the device grow loop becomes reachable from `fit()`; training data stays device-resident; depth-1 oblivious trees grow on device with the Cosine GPU-default score; the foundational Kaggle CUDA harness measures BOTH correctness (≤1e-5) AND wall-clock speed from the start. (completed 2026-07-03)
 - [ ] **Phase 11: Depth>1 Partition-Aware Histograms + Reduction Determinism + Newton Der2** - Real depth-6 RMSE + Logloss workloads grow fully on device within ε=1e-4, via partition-aware histograms + the subtraction trick + a deterministic reduction + Newton der2 leaf estimation, oracle-tested AND speed-measured on Kaggle CUDA; GPUT-14 becomes the operative standing gate.
 - [ ] **Phase 12: Grow-Policy, Leaf-Method, Sampling & Categorical Device Coverage** - Non-symmetric grow policies (Depthwise/Lossguide/Region), Exact weighted-quantile leaf estimation, bootstrap/random-strength + MVS sampling, and CTR/categorical features each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands.
 - [ ] **Phase 13: Pairwise, Ranking, Multiclass, Ordered & Langevin Device Coverage** - The PairLogit pairwise path + batched device Cholesky solver, query/listwise ranking objectives with device query-grouping, multiclass/multi-target/uncertainty, ordered boosting, and Langevin/SGLB noise each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands.
@@ -67,7 +67,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   4. The `Runtime` grow-tree seam (`begin_device_training` / `grow_tree_on_device → CbResult<Option<DeviceGrownTree>>` / `end_device_training`, CubeCL-free host-typed) is reachable from `cb_train::train`; the quantized feature matrix uploads exactly once per `fit()`; gradients/approx stay device-resident across iterations; the per-tree `der1` host read-back is eliminated; only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (GPUT-01/02/03, D-05).
   5. A reproducible **Kaggle CUDA harness (BENCH-01)** builds the `--features cuda` wheel and on a Kaggle CUDA notebook runs BOTH the correctness oracle (≤1e-5 depth-1, correctness as a blocking gate) AND a warm-run/JIT-excluded train-only **wall-clock speed** measurement (device vs host-CPU baseline, and vs official CatBoost GPU where a comparable config exists) — establishing the **standing per-phase speed check (BENCH-02)** discipline enforced from here to the last phase; an uncovered case (e.g. depth>1) returns `Ok(None)` and falls back to the byte-unchanged host CPU grower (D-04 no-regression), and the reduction-determinism strategy is spiked with a recommendation documented to feed Phase 11.
 
-**Plans**: 8/9 plans executed
+**Plans**: 9/9 plans complete
 **Wave 1**
 
 - [x] 10-01-PLAN.md — Scan primitives: cross-cube full scan + segmented scan (GPUT-16)
@@ -99,7 +99,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 10-09-PLAN.md — Kaggle CUDA oracle + speed harness + reduction-spike numbers + D-10-09 escalation (BENCH-01/02)
+- [x] 10-09-PLAN.md — Kaggle CUDA oracle + speed harness + reduction-spike numbers + D-10-09 escalation (BENCH-01/02)
 
 **UI hint**: no
 **Notes**: The heaviest, most foundational phase — it carries the two biggest hidden risks (GPUT-16 device-primitive library, GPUT-15 cindex) alongside the seam+residency+depth-1 wiring and the harness. ~80% of the depth-1 device machinery already exists and is oracle-validated (Phase 7.5 `grow_oblivious_tree_into` grows a depth-1 device tree with L2/Cosine calcers; Phase 7.2 der seam; `calc_average` leaf formula) — the seam mirrors the shipped `compute_gradients_grouped` default-impl pattern. The genuinely new engineering is: the from-scratch primitive substrate (no CUB), the resident cindex, the `GpuTrainSession` residency wrapper owning one `ComputeClient` + persistent handles (`RefCell<Option<…>>` on `GpuBackend`), one small `apply_leaf_delta` device kernel to keep the approx-update on device, the bin→border join (`border = feature_borders[feature][bin_id]`), the Kaggle harness, and the reduction spike. **ESCALATION (D-10-09):** depth-1 device ≥ CPU wall-clock is achievable only at large n (≈10⁵–10⁶+ rows), NOT at `benchmark.py`'s 1000×20 (depth-1 is the most launch-overhead-bound workload) — pin BENCH-02's depth-1 speed bar to a large-n dataset. Logloss depth-1 ≤1e-5 pins the CPU-reference fixture to first-order (`calc_average`) leaves (Newton der2 is Phase 11). Landmines: no `cb-train` dep in `cb-backend`; `f32::MIN` sentinel; deterministic reduction still required. Prior research: `.planning/milestones/v1.1-rescope-2026-07-02-phases/10-.../10-RESEARCH.md` (seam/residency/depth-1 architecture still valid; re-plan to add GPUT-08/15/16 scope). Given the scope, plans will decompose this phase into several waves (primitive library → cindex → seam+residency → depth-1+Cosine → Kaggle harness → reduction spike).
@@ -174,7 +174,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 8/9 | In Progress|  |
+| 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 0/TBD | Not started | - |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 0/TBD | Not started | - |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |

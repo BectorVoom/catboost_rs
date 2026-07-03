@@ -52,8 +52,8 @@
 
 ### CUDA Oracle Harness & Performance Benchmark (BENCH)
 
-- [ ] **BENCH-01**: A reproducible Kaggle CUDA oracle/test harness — **established in Phase 10** and reused by every later phase — builds the `--features cuda` wheel and on a Kaggle CUDA notebook runs BOTH the GPU kernel **correctness** oracle (≤1e-5 for the depth-1 tree, ≤1e-4 for depth>1) AND a **wall-clock speed** measurement (warm-run/JIT-excluded, train-only), with correctness as a blocking gate before any speed number. From Phase 10 the harness measures BOTH correctness AND speed from the start. Authoritative GPU oracle; ROCm in-env is not a gate; human-gated external step.
-- [ ] **BENCH-02**: **Standing per-phase speed check** — first established in Phase 10 but enforced in EVERY GPU phase (analogous to how GPUT-14's ε=1e-4 gate is mapped to one phase yet enforced onward). Every phase that lands GPU kernels reports a Kaggle CUDA speed measurement for those kernels (device path vs the host-CPU baseline, and vs official CatBoost GPU where a comparable config exists), so speed is tracked incrementally across the whole milestone rather than only at the end. No phase's GPU kernels are considered done without a recorded CUDA speed check.
+- [x] **BENCH-01**: A reproducible Kaggle CUDA oracle/test harness — **established in Phase 10** and reused by every later phase — builds the `--features cuda` wheel and on a Kaggle CUDA notebook runs BOTH the GPU kernel **correctness** oracle (≤1e-5 for the depth-1 tree, ≤1e-4 for depth>1) AND a **wall-clock speed** measurement (warm-run/JIT-excluded, train-only), with correctness as a blocking gate before any speed number. From Phase 10 the harness measures BOTH correctness AND speed from the start. Authoritative GPU oracle; ROCm in-env is not a gate; human-gated external step.
+- [x] **BENCH-02**: **Standing per-phase speed check** — first established in Phase 10 but enforced in EVERY GPU phase (analogous to how GPUT-14's ε=1e-4 gate is mapped to one phase yet enforced onward). Every phase that lands GPU kernels reports a Kaggle CUDA speed measurement for those kernels (device path vs the host-CPU baseline, and vs official CatBoost GPU where a comparable config exists), so speed is tracked incrementally across the whole milestone rather than only at the end. No phase's GPU kernels are considered done without a recorded CUDA speed check.
 - [ ] **BENCH-03**: The device-resident training path demonstrably closes the >20× gap on Kaggle CUDA: a **comprehensive final** speed-parity sign-off vs official CatBoost GPU across the workload matrix is documented and signed off against the pre-Phase-10 host-light baseline, **aggregating the per-phase speed checks** (BENCH-02).
 
 ## Future Requirements (deferred)
@@ -85,8 +85,8 @@
 | GPUT-08 | Phase 10 | Complete |
 | GPUT-15 | Phase 10 | Complete |
 | GPUT-16 | Phase 10 | Complete |
-| BENCH-01 | Phase 10 | Pending |
-| BENCH-02 | Phase 10 (standing — enforced in every GPU phase 10→13) | Pending |
+| BENCH-01 | Phase 10 | Complete |
+| BENCH-02 | Phase 10 (standing — enforced in every GPU phase 10→13) | Complete |
 | GPUT-05 | Phase 11 | Pending |
 | GPUT-06 | Phase 11 | Pending |
 | GPUT-07 | Phase 11 | Pending |
