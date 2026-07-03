@@ -444,6 +444,9 @@ mod partition {
 
         for &n in &[1usize, 37usize, 1000usize] {
             let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+            // A distinct synthetic per-object der2 (NON-positive, the hessian convention) so the
+            // 3rd channel Σ(der2·weight) is exercised with a value distinct from der1/weight.
+            let der2: Vec<f64> = (0..n).map(|i| -(0.5 + (i % 7) as f64 * 0.25)).collect();
             let splits: Vec<(usize, usize)> = vec![(0, 15), (1, 10)];
             let depth = splits.len();
             let n_parts = 1usize << depth;
@@ -453,6 +456,7 @@ mod partition {
 
             let der1_h = upload_channel_floats(&client, &der1);
             let weight_h = upload_channel_floats(&client, &weight);
+            let der2_h = upload_channel_floats(&client, &der2);
             let cindex_h = client.create(cubecl::bytes::Bytes::from_elems(cindex.clone()));
             let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.clone()));
             let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
@@ -475,11 +479,13 @@ mod partition {
             }
 
             // Device per-partition reduce (the leaf_of handle is consumed; clone it so the
-            // host reference can read the SAME routing back).
+            // host reference can read the SAME routing back). 3-channel: Σder1 / Σweight /
+            // Σ(der2·weight) (GPUT-07).
             let part_stats_h = launch_partition_update_into(
                 &client,
                 der1_h.clone(),
                 weight_h.clone(),
+                der2_h.clone(),
                 indices_h.clone(),
                 leaf_of_h.clone(),
                 n,
@@ -490,26 +496,30 @@ mod partition {
                 read_part_stats_f64(&client, part_stats_h).expect("read part-stats");
 
             // Host ordered reference: read the device routing back, fold each partition's
-            // der1/weight in ascending object order via sum_f64 (NEVER naive .sum(), D-08).
+            // der1/weight/(der2·weight) in ascending object order via sum_f64 (NEVER naive
+            // .sum(), D-08). The der2 channel folds weight per obj (A3), matching the kernel.
             let device_leaf_of = read_u32_handle(&client, leaf_of_h).expect("read leaf_of");
-            let mut baseline = vec![0.0_f64; n_parts * 2];
+            let mut baseline = vec![0.0_f64; n_parts * 3];
             for part in 0..n_parts {
                 let mut der_seg: Vec<f64> = Vec::new();
                 let mut w_seg: Vec<f64> = Vec::new();
+                let mut h_seg: Vec<f64> = Vec::new();
                 for obj in 0..n {
                     if device_leaf_of[obj] as usize == part {
                         der_seg.push(der1[obj]);
                         w_seg.push(weight[obj]);
+                        h_seg.push(der2[obj] * weight[obj]);
                     }
                 }
-                baseline[part * 2] = sum_f64(&der_seg);
-                baseline[part * 2 + 1] = sum_f64(&w_seg);
+                baseline[part * 3] = sum_f64(&der_seg);
+                baseline[part * 3 + 1] = sum_f64(&w_seg);
+                baseline[part * 3 + 2] = sum_f64(&h_seg);
             }
 
             assert_eq!(
                 device_stats.len(),
                 baseline.len(),
-                "device part-stats length must equal n_parts * 2 (n={n})"
+                "device part-stats length must equal n_parts * 3 (n={n})"
             );
             let (abs, rel) = max_divergence(&device_stats, &baseline);
             println!(
@@ -853,6 +863,184 @@ mod single_tree {
             assert!(
                 abs <= GROW_EPS || rel <= GROW_EPS,
                 "device depth-6 leaf values (n={n}) exceeded the ε=1e-4 bar: abs={abs:.3e} rel={rel:.3e}"
+            );
+        }
+    }
+
+    /// GPUT-07: device-resident **Newton der2** leaf estimation on a depth-6 Logloss tree.
+    /// Grows the tree via the Newton path ([`crate::gpu_runtime::grow_oblivious_tree_newton`])
+    /// over a genuine Logloss hessian (`der2 = -p(1-p)`, `p = sigmoid(margin)` — NON-positive),
+    /// then hard-asserts, within the ε=1e-4 GPU bar:
+    /// - (Σder2 channel) the device Σ(der2·weight) part-stats channel-2 matches the CPU
+    ///   `cb_compute::reduce_leaf_der2` over the SAME leaf partition (weight folded per obj, A3);
+    /// - (leaf value) the device Newton leaf values match the CPU
+    ///   `cb_compute::newton_leaf_delta(Σder1, Σ(der2·weight), scaled_l2)` — the single
+    ///   closed-form step (A1, `leaf_estimation_iterations = 1`).
+    /// The tree STRUCTURE (split sequence + leaf_of) is der2-independent (A2), so it must equal
+    /// the same CPU greedy reference as the RMSE arm. Runs on rocm/cuda (the fixed-point partition
+    /// path needs Atomic<u64>); cpu/wgpu SKIP.
+    #[test]
+    fn newton_leaf_matches_cpu() {
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11-04] SKIP newton_leaf_matches_cpu: active backend lacks Atomic<u64> add \
+                 (cpu/wgpu) — the fixed-point partition histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
+        use crate::gpu_runtime::grow_oblivious_tree_newton;
+
+        const NEWTON_EPS: f64 = 1e-4;
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 6usize;
+        let l2 = 3.0_f64;
+        let score_fn = crate::kernels::SCORE_FN_COSINE;
+
+        for &n in &[200usize, 2000usize] {
+            let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+            let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+            // A genuine Logloss hessian: margin = 0.3·der1, p = sigmoid(margin),
+            // der2 = -p(1-p) (NON-positive — the LoglossHessian seam contract, A3).
+            let der2: Vec<f64> = der1
+                .iter()
+                .map(|&g| {
+                    let p = 1.0_f64 / (1.0_f64 + (-(0.3_f64 * g)).exp());
+                    -p * (1.0_f64 - p)
+                })
+                .collect();
+
+            // Device: grow the depth-6 tree via the Newton der2 leaf path.
+            let tree = grow_oblivious_tree_newton(
+                &der1, &der2, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2,
+                score_fn,
+            )
+            .expect("depth-6 grow_oblivious_tree_newton must succeed on the clear-margin fixture");
+
+            // CPU structure reference (der2-independent, A2): the same Cosine greedy search.
+            let (cpu_splits, cpu_leaf_of) =
+                cpu_greedy_oblivious(&der1, &weight, &cindex, n, n_features, n_bins, depth, scaled_l2, score_fn);
+
+            // (A) STRUCTURE — split sequence + per-object leaf_of must match EXACTLY.
+            let device_splits: Vec<(usize, usize)> =
+                tree.splits.iter().map(|&(f, b)| (f as usize, b as usize)).collect();
+            assert_eq!(
+                device_splits, cpu_splits,
+                "device Newton depth-6 split sequence must match CPU greedy (n={n})"
+            );
+            assert_eq!(
+                tree.leaf_of, cpu_leaf_of,
+                "device Newton depth-6 leaf_of must equal CPU leaf_index forward-bit (n={n})"
+            );
+
+            // (B) Σder2 CHANNEL — the device Σ(der2·weight) part-stats channel-2 must match the
+            //     CPU reduce_leaf_der2 (weighted_der2[i] = der2·weight, canonical object order).
+            let n_leaves = 1usize << depth;
+            let cpu_leaf_of_usize: Vec<usize> = cpu_leaf_of.iter().map(|&l| l as usize).collect();
+            let weighted_der2: Vec<f64> = (0..n).map(|i| der2[i] * weight[i]).collect();
+            let cpu_sum_der2 = cb_compute::reduce_leaf_der2(&cpu_leaf_of_usize, &weighted_der2, n_leaves);
+            let dev_sum_der2: Vec<f64> = (0..n_leaves)
+                .map(|leaf| tree.part_stats.get(leaf * 3 + 2).copied().unwrap_or(0.0))
+                .collect();
+            let (h_abs, h_rel) = max_divergence(&dev_sum_der2, &cpu_sum_der2);
+            println!(
+                "[newton n={n}] Σ(der2·weight) channel max abs_div={h_abs:.3e} rel_div={h_rel:.3e} \
+                 (bar={NEWTON_EPS:.0e})"
+            );
+            assert!(
+                h_abs <= NEWTON_EPS || h_rel <= NEWTON_EPS,
+                "device Σ(der2·weight) channel (n={n}) exceeded the ε=1e-4 bar: \
+                 abs={h_abs:.3e} rel={h_rel:.3e}"
+            );
+
+            // (C) LEAF VALUES — the device Newton leaves must match the CPU newton_leaf_delta over
+            //     the SAME partition: leaf = Σder1 / (-Σ(der2·weight) + scaled_l2), single step (A1).
+            let mut cpu_leaf_values = vec![0.0_f64; n_leaves];
+            for leaf in 0..n_leaves {
+                let mut der_seg: Vec<f64> = Vec::new();
+                for obj in 0..n {
+                    if cpu_leaf_of[obj] as usize == leaf {
+                        der_seg.push(der1[obj]);
+                    }
+                }
+                let sum_der = sum_f64(&der_seg);
+                let sum_der2 = cpu_sum_der2.get(leaf).copied().unwrap_or(0.0);
+                cpu_leaf_values[leaf] = cb_compute::newton_leaf_delta(sum_der, sum_der2, scaled_l2);
+            }
+            let (abs, rel) = max_divergence(&tree.leaf_values, &cpu_leaf_values);
+            println!(
+                "[newton n={n}] Newton leaf-value max abs_div={abs:.3e} rel_div={rel:.3e} \
+                 (bar={NEWTON_EPS:.0e})"
+            );
+            assert!(
+                abs <= NEWTON_EPS || rel <= NEWTON_EPS,
+                "device Newton depth-6 leaf values (n={n}) exceeded the ε=1e-4 bar: \
+                 abs={abs:.3e} rel={rel:.3e}"
+            );
+        }
+    }
+
+    /// GPUT-07 collapse check (Pitfall 2 warning sign): with `der2 = -1` (the RMSE hessian) the
+    /// Newton path MUST collapse to `calc_average` — `-Σ(der2·weight) = Σweight`, so
+    /// `newton_leaf_delta(Σder1, -Σweight, l2) == Σder1 / (Σweight + l2) == calc_average`. Grows the
+    /// SAME depth-6 tree via BOTH the Newton path (der2 = -1) and the RMSE `grow_oblivious_tree`
+    /// (`calc_average`) and asserts the leaf values are bit-close (≤1e-4). A sign/weighting error in
+    /// the Σ(der2·weight) channel would break this collapse (sign-flipped / exploding leaves).
+    #[test]
+    fn rmse_newton_collapses_to_average() {
+        if !cfg!(any(feature = "rocm", feature = "cuda")) {
+            println!(
+                "[11-04] SKIP rmse_newton_collapses_to_average: active backend lacks Atomic<u64> \
+                 add (cpu/wgpu) — the fixed-point partition histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
+        use crate::gpu_runtime::{grow_oblivious_tree, grow_oblivious_tree_newton};
+
+        const COLLAPSE_EPS: f64 = 1e-4;
+        let n_features = 3usize;
+        let n_bins = 32usize;
+        let depth = 6usize;
+        let l2 = 3.0_f64;
+        let score_fn = crate::kernels::SCORE_FN_COSINE;
+
+        for &n in &[200usize, 2000usize] {
+            let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+            let scaled_l2 = scaled_l2_for(&weight, n, l2);
+            let der2 = vec![-1.0_f64; n]; // the RMSE hessian
+
+            let newton = grow_oblivious_tree_newton(
+                &der1, &der2, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2,
+                score_fn,
+            )
+            .expect("Newton grow (der2=-1) must succeed");
+            let average = grow_oblivious_tree(
+                &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2, score_fn,
+            )
+            .expect("RMSE calc_average grow must succeed");
+
+            // Structure must be identical (der2-independent scoring, A2).
+            assert_eq!(
+                newton.splits, average.splits,
+                "Newton (der2=-1) and RMSE structure must match (n={n})"
+            );
+            assert_eq!(
+                newton.leaf_of, average.leaf_of,
+                "Newton (der2=-1) and RMSE leaf_of must match (n={n})"
+            );
+
+            // Leaf VALUES must collapse to calc_average within ε=1e-4.
+            let (abs, rel) = max_divergence(&newton.leaf_values, &average.leaf_values);
+            println!(
+                "[rmse_collapse n={n}] Newton(der2=-1) vs calc_average max abs_div={abs:.3e} \
+                 rel_div={rel:.3e} (bar={COLLAPSE_EPS:.0e})"
+            );
+            assert!(
+                abs <= COLLAPSE_EPS || rel <= COLLAPSE_EPS,
+                "Newton der2=-1 did NOT collapse to calc_average (n={n}): abs={abs:.3e} rel={rel:.3e}"
             );
         }
     }
