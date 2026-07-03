@@ -258,6 +258,90 @@ fn device_bin_id_out_of_range_is_typed_error() {
 }
 
 #[test]
+fn device_declines_nonzero_starting_bias_boost_from_average() {
+    // CR-01 regression: `boost_from_average: true` on RMSE (the CatBoostBuilder
+    // default) makes `starting_approx` the target mean (2.5 here) — a non-zero
+    // bias the device session cannot seed (it always starts resident approx at
+    // zero). The host gate must therefore DECLINE the device path and fall back
+    // to the CPU grower, which calls the mock's `compute_gradients` sentinel.
+    // Reaching THAT error proves the CPU fallback (D-04) was taken even though
+    // the mock's `begin` would have accepted the device path.
+    let mock = DeviceMock {
+        accept_begin: true,
+        grow: Some(DeviceGrownTree {
+            splits: vec![(0, 1)],
+            leaf_values: vec![2.0, -3.0],
+            leaf_of: Vec::new(),
+        }),
+    };
+    let params = BoostParams {
+        boost_from_average: true,
+        ..device_params()
+    };
+    // Non-zero target mean -> non-zero starting bias.
+    let target = vec![1.0, 2.0, 3.0, 4.0];
+    let err = train(
+        &mock,
+        &feature_columns(),
+        &feature_borders(),
+        &target,
+        &[],
+        &params,
+        None,
+    )
+    .expect_err("non-zero starting bias must route to the CPU grower");
+    match err {
+        CbError::Degenerate(msg) => assert!(
+            msg.contains("compute_gradients must not be called"),
+            "expected the CPU-path sentinel (bias fallback), got: {msg}"
+        ),
+        other => panic!("expected the CPU-path compute_gradients sentinel, got {other:?}"),
+    }
+}
+
+#[test]
+fn device_declines_newton_leaf_method_on_covered_loss() {
+    // CR-02 regression: Newton leaf estimation on a device-covered loss (Logloss)
+    // diverges from the device grower's `calc_average` (Gradient) formula because
+    // `der2 = -p(1-p)` varies per object. The device grower has no Newton arm, so
+    // the host gate must DECLINE and fall back to the CPU grower, hitting the
+    // mock's `compute_gradients` sentinel. `boost_from_average` stays false (bias
+    // 0) so CR-01 is NOT the reason for the fallback — the leaf method is.
+    let mock = DeviceMock {
+        accept_begin: true,
+        grow: Some(DeviceGrownTree {
+            splits: vec![(0, 1)],
+            leaf_values: vec![2.0, -3.0],
+            leaf_of: Vec::new(),
+        }),
+    };
+    let params = BoostParams {
+        loss: Loss::Logloss,
+        leaf_method: LeafMethod::Newton,
+        ..device_params()
+    };
+    // Binary target for Logloss.
+    let target = vec![0.0, 1.0, 0.0, 1.0];
+    let err = train(
+        &mock,
+        &feature_columns(),
+        &feature_borders(),
+        &target,
+        &[],
+        &params,
+        None,
+    )
+    .expect_err("Newton leaf method must route to the CPU grower");
+    match err {
+        CbError::Degenerate(msg) => assert!(
+            msg.contains("compute_gradients must not be called"),
+            "expected the CPU-path sentinel (Newton fallback), got: {msg}"
+        ),
+        other => panic!("expected the CPU-path compute_gradients sentinel, got {other:?}"),
+    }
+}
+
+#[test]
 fn device_declined_begin_falls_back_to_cpu_path() {
     // begin declines (Ok(false)): the fit must use the CPU grower, which calls the
     // mock's compute_gradients -> the sentinel error. Reaching THAT error proves the
