@@ -14,12 +14,13 @@
 //! bounds (f32 ~1e-3 relative, f64 ~1e-9 relative) that catch a wrong fold without
 //! pinning the final epsilon.
 
-use cubecl::features::Plane;
+use cubecl::features::{AtomicUsage, Plane};
 use cubecl::prelude::*;
 
 use crate::kernels::{
-    block_reduce_atomic_kernel, block_reduce_kernel, full_scan_into, key_head_flag_kernel,
-    reduce_by_key_kernel, segment_offset_scatter_kernel, segmented_reduce_kernel,
+    block_reduce_atomic_kernel, block_reduce_fixedpoint_kernel, block_reduce_kernel, full_scan_into,
+    key_head_flag_kernel, reduce_by_key_kernel, segment_offset_scatter_kernel,
+    segmented_reduce_kernel, REDUCE_FIXEDPOINT_SCALE_F64,
 };
 
 // IN-03: the "generous, run-stable" oracle bounds, hoisted into named consts shared
@@ -635,4 +636,222 @@ fn reduce_by_key_matches_serial() {
         );
     }
     println!("[reduce-by-key] {} runs — f32+f64 keys+sums match serial", run_spec.len());
+}
+
+// ===========================================================================
+// Deterministic finalize strategies + run-to-run variance harness (Plan 10-03
+// Task 2, D-03/D-04). The scalar cross-cube reduce finalize is delivered as 2-3
+// SELECTABLE deterministic strategies, each of which must show ZERO run-to-run
+// spread (byte-identical over 32 launches) and REPORT which strategy actually ran
+// (a capability downgrade is reported, never a silent switch — T-10-07). The
+// measured winner ships as the library reduce (D-04, no throwaway) and feeds
+// Phase 11's ε=1e-4 histogram gate.
+//
+//   (a) FixedOrderTree    — recursive `block_reduce_kernel` (shared-mem tree, no
+//                           plane, no atomics) → a fixed pairing on EVERY backend.
+//   (b) HostSum           — per-cube partials + host `cb_core::sum_f64` (the
+//                           in-tree Phase-7.6 `HostSumFallback` precedent).
+//   (c) FixedPointAtomic  — `round(v*2^30) → i64 → u64` integer atomics
+//                           (`block_reduce_fixedpoint_kernel`); exact + order-
+//                           independent. Capability-gated on `Atomic<u64>` add;
+//                           where unadvertised it reports the (b) downgrade.
+// ===========================================================================
+
+/// Which deterministic finalize strategy actually ran (reported so a capability
+/// downgrade surfaces explicitly — never a silent atomic→deterministic switch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReduceFinalizeStrategy {
+    /// Recursive fixed-order shared-mem tree reduce (deterministic on any backend).
+    FixedOrderTree,
+    /// Per-cube partials + host `cb_core::sum_f64` (the in-tree `HostSumFallback`).
+    HostSum,
+    /// Fixed-point `Atomic<u64>` integer-atomic finalize (deterministic where the
+    /// device advertises `Atomic<u64>` add).
+    FixedPointAtomic,
+}
+
+/// Does the selected runtime's device advertise `Atomic<u64>` add? Gates strategy (c).
+fn device_supports_u64_atomic_add() -> bool {
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+    let ty = <cubecl::prelude::Atomic<u64> as CubePrimitive>::as_type_native_unchecked();
+    client
+        .properties()
+        .atomic_type_usage(ty)
+        .contains(AtomicUsage::Add)
+}
+
+/// One recursion level of the fixed-order tree reduce: launch `block_reduce_kernel`
+/// with `use_plane = false` (the FIXED-ORDER shared-mem tree — no plane, no atomics),
+/// reducing `n` elements to `ceil(n/32)` per-cube partials, recursing until one scalar
+/// remains. Deterministic on every backend.
+fn tree_reduce_into(
+    client: &cubecl::client::ComputeClient<crate::SelectedRuntime>,
+    in_handle: cubecl::server::Handle,
+    n: usize,
+) -> cubecl::server::Handle {
+    let num_cubes = n.div_ceil(32usize).max(1);
+    let out = client.empty(num_cubes * std::mem::size_of::<f64>());
+    block_reduce_kernel::launch::<f64, crate::SelectedRuntime>(
+        client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim { x: 32u32, y: 1, z: 1 },
+        unsafe { ArrayArg::from_raw_parts(in_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), num_cubes) },
+        false,
+    );
+    if num_cubes <= 1 {
+        return out;
+    }
+    tree_reduce_into(client, out, num_cubes)
+}
+
+/// Strategy (a): fully-deterministic on-device recursive fixed-order tree reduce.
+fn run_fixed_order_tree_reduce(input: &[f64]) -> f64 {
+    if input.is_empty() {
+        return 0.0;
+    }
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+    let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    let out = tree_reduce_into(&client, in_handle, input.len());
+    let bytes = client.read_one(out).unwrap();
+    bytemuck::cast_slice::<u8, f64>(&bytes)[0]
+}
+
+/// Strategy (b): per-cube partials (`launch_block_reduce_f64`) + host `cb_core::sum_f64`.
+fn run_host_sum_finalize(input: &[f64]) -> f64 {
+    let partials = crate::gpu_runtime::launch_block_reduce_f64(input).unwrap();
+    cb_core::sum_f64(&partials)
+}
+
+/// Strategy (c): fixed-point `Atomic<u64>` finalize. Runs the integer-atomic kernel when
+/// the device advertises `Atomic<u64>` add; otherwise reports the deterministic host-sum
+/// DOWNGRADE (never a silent switch). Returns `(sum, actual_strategy)`.
+fn run_fixedpoint_reduce(input: &[f64]) -> (f64, ReduceFinalizeStrategy) {
+    if input.is_empty() {
+        return (0.0, ReduceFinalizeStrategy::HostSum);
+    }
+    if !device_supports_u64_atomic_add() {
+        // Documented capability downgrade (gfx1100 case): the deterministic host sum
+        // stands in and the returned strategy says so — the harness asserts this.
+        return (run_host_sum_finalize(input), ReduceFinalizeStrategy::HostSum);
+    }
+
+    let device = <crate::SelectedRuntime as Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as Runtime>::client(&device);
+    let n = input.len();
+    let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
+    // Zero-initialized single u64 fixed-point accumulator.
+    let acc_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u64]));
+    let num_cubes = n.div_ceil(32usize).max(1);
+
+    block_reduce_fixedpoint_kernel::launch::<f64, crate::SelectedRuntime>(
+        &client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim { x: 32u32, y: 1, z: 1 },
+        unsafe { ArrayArg::from_raw_parts(in_handle, n) },
+        unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), 1) },
+    );
+
+    let bytes = client.read_one(acc_handle).unwrap();
+    let bits = bytemuck::cast_slice::<u8, u64>(&bytes)[0];
+    // Reinterpret the u64 two's-complement bits as i64 and scale back (manual §3).
+    let sum = (bits as i64) as f64 / REDUCE_FIXEDPOINT_SCALE_F64;
+    (sum, ReduceFinalizeStrategy::FixedPointAtomic)
+}
+
+/// Run `f` `runs` times, assert BYTE-IDENTICAL results (zero run-to-run spread),
+/// assert the reported strategy equals `expected` (no silent switch), and assert the
+/// result lands on `baseline` within a generous run-stable bound.
+fn assert_zero_spread<Fp>(
+    name: &str,
+    runs: usize,
+    baseline: f64,
+    mut f: Fp,
+    expected: ReduceFinalizeStrategy,
+) where
+    Fp: FnMut() -> (f64, ReduceFinalizeStrategy),
+{
+    let mut first_bits: Option<u64> = None;
+    let mut reported = expected;
+    for _ in 0..runs {
+        let (sum, strat) = f();
+        reported = strat;
+        assert_eq!(
+            strat, expected,
+            "[{name}] reported strategy {strat:?} != expected {expected:?} — a silent \
+             capability switch must FAIL, not pass (T-10-07)"
+        );
+        let bits = sum.to_bits();
+        match first_bits {
+            None => first_bits = Some(bits),
+            Some(b) => assert_eq!(
+                bits, b,
+                "[{name}] run-to-run spread detected ({} vs {}) — a deterministic \
+                 strategy must be byte-identical across launches (T-10-06)",
+                f64::from_bits(b),
+                sum
+            ),
+        }
+    }
+    let sum = f64::from_bits(first_bits.unwrap());
+    let abs = (sum - baseline).abs();
+    let rel = if baseline.abs() > 0.0 { abs / baseline.abs() } else { abs };
+    assert!(
+        rel <= F64_REL_TOL || abs <= F64_ABS_TOL_LARGE_N,
+        "[{name}] diverged from baseline: sum={sum} baseline={baseline} abs={abs:.3e}"
+    );
+    println!(
+        "[reduce finalize: {name}] path={reported:?} runs={runs} sum={sum} baseline={baseline} \
+         run_to_run_spread=0 abs_div={abs:.3e}"
+    );
+}
+
+#[test]
+fn reduce_finalize_strategies_are_deterministic_and_report_path() {
+    // Multi-cube input (300 elements → ~10 cubes at CUBE_DIM 32) so the cross-cube
+    // finalize (where any nondeterminism would live) is exercised by every strategy.
+    let input: Vec<f64> = (0..300).map(|k| ((k % 23) as f64) - 11.0 + 0.125 * (k as f64)).collect();
+    let baseline = cb_core::sum_f64(&input);
+    let runs = 32;
+
+    let u64_atomic = device_supports_u64_atomic_add();
+
+    // (a) fixed-order tree reduce — deterministic on every backend.
+    assert_zero_spread(
+        "fixed-order-tree",
+        runs,
+        baseline,
+        || (run_fixed_order_tree_reduce(&input), ReduceFinalizeStrategy::FixedOrderTree),
+        ReduceFinalizeStrategy::FixedOrderTree,
+    );
+
+    // (b) block-then-host-final-sum — the in-tree HostSumFallback (Phase 7.6 precedent).
+    assert_zero_spread(
+        "host-sum",
+        runs,
+        baseline,
+        || (run_host_sum_finalize(&input), ReduceFinalizeStrategy::HostSum),
+        ReduceFinalizeStrategy::HostSum,
+    );
+
+    // (c) fixed-point u64 atomics — capability-gated. On gfx1100 (no advertised u64
+    // atomic-add) this reports the deterministic host-sum downgrade; on CUDA it exercises
+    // the integer-atomic path. Either way: zero run-to-run spread + the REPORTED path
+    // matches the device capability (a silent switch fails the assertion above).
+    let expected_c = if u64_atomic {
+        ReduceFinalizeStrategy::FixedPointAtomic
+    } else {
+        ReduceFinalizeStrategy::HostSum
+    };
+    assert_zero_spread("fixed-point-atomic", runs, baseline, || run_fixedpoint_reduce(&input), expected_c);
+
+    println!(
+        "[reduce finalize strategies] u64_atomic_advertised={u64_atomic} — all 3 strategies \
+         show ZERO run-to-run spread; fixed-point path reported as {expected_c:?}. NOTE: \
+         gfx1100 ADVERTISES Atomic<u64> add (unlike Atomic<f64> add), so the fixed-point \
+         path runs the integer-atomic kernel in-env; CUDA err+ms numbers are filled on \
+         Kaggle via 10-09."
+    );
 }

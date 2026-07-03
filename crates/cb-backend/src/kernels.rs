@@ -2187,6 +2187,62 @@ pub fn reduce_by_key_kernel<F: Float>(
     }
 }
 
+/// Fixed-point scale for the deterministic reduce finalize (`2^30`, the well-tested
+/// gradient/hessian default from the CubeCL fixed-point-atomics manual §2.1). A
+/// power of two keeps `v * S` and `sum / S` exact mantissa shifts. Used by
+/// [`block_reduce_fixedpoint_kernel`] and its host read-back in `kernels/reduce.rs`.
+pub(crate) const REDUCE_FIXEDPOINT_SCALE_F64: f64 = 1_073_741_824.0; // 2^30
+
+/// Deterministic FIXED-POINT reduce finalize (Plan 10-03 Task 2, strategy (c); CubeCL
+/// fixed-point-atomics manual §3). Each cube folds its `CUBE_DIM`-wide slice of `input`
+/// into ONE f64 partial (fixed-order shared-mem tree reduce), then unit 0 quantizes that
+/// partial `round(partial * 2^30) -> i64 -> u64` and `fetch_add`s it into the single
+/// global `Atomic<u64>` accumulator. Integer atomic add is EXACT and ORDER-INDEPENDENT
+/// (two's-complement wrapping `u64` add == `i64` add), so the cross-cube finalize is
+/// DETERMINISTIC regardless of the hardware contention schedule — the property float
+/// atomics cannot offer. The host reinterprets `acc[0]` bits as `i64` and divides by
+/// `2^30` (see `kernels/reduce.rs`).
+///
+/// Guarded host-side by the device's `Atomic<u64>` add capability (the launcher only
+/// runs this when advertised; otherwise it reports the deterministic host-sum
+/// downgrade — no silent switch). Accumulation is in f64 (a full-magnitude fixed-point
+/// range at `k=30`); `SharedMemory` SIZE is the comptime [`BLOCK_REDUCE_SHMEM`] const
+/// (Pitfall 3); reduce stride from `CUBE_DIM_X` (D-09); bounds-guarded (T-10-01); no
+/// `-inf` literal (T-10-08). Generic over `F: Float` (the input channel).
+#[cube(launch)]
+pub fn block_reduce_fixedpoint_kernel<F: Float>(input: &Array<F>, acc: &Array<Atomic<u64>>) {
+    let tid = UNIT_POS;
+
+    // Load + widen to f64, zero-padding idle out-of-range lanes (T-10-01).
+    let mut val = 0.0f64;
+    if ABSOLUTE_POS < input.len() {
+        val = f64::cast_from(input[ABSOLUTE_POS]);
+    }
+
+    // Fixed-order f64 shared-mem tree reduce → one per-cube partial in unit 0.
+    let mut shared = SharedMemory::<f64>::new(BLOCK_REDUCE_SHMEM);
+    shared[tid as usize] = val;
+    sync_cube();
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let v = shared[(tid + s) as usize];
+            shared[tid as usize] += v;
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+
+    // Quantize the per-cube partial and integer-atomic-add into the global accumulator.
+    // `round(partial * 2^30) → i64 → reinterpret bits as u64`; wrapping u64 add is exact
+    // signed accumulation (manual §2.2). Order-independent ⇒ deterministic.
+    if tid == 0u32 {
+        let scaled = shared[0usize] * REDUCE_FIXEDPOINT_SCALE_F64;
+        let q = u64::cast_from(i64::cast_from(f64::round(scaled)));
+        acc[0].fetch_add(q);
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
