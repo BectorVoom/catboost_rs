@@ -253,8 +253,10 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
         // Grow `iterations` trees reusing the resident handles (NO re-upload per call).
         let mut device_trees = Vec::with_capacity(iterations);
         for _ in 0..iterations {
+            // Oblivious resident session: `approx` is ignored (the resident approx is
+            // authoritative), so a zero vector satisfies the length-agreement guard.
             let tree = session
-                .grow_one(&target)
+                .grow_one(&vec![0.0_f64; n], &target)
                 .expect("grow_one must succeed on the clear-margin fixture");
             device_trees.push(tree);
         }

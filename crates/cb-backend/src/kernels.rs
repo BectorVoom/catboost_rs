@@ -4299,6 +4299,13 @@ mod gradient_gpu;
 // sibling `kernels/nonsym_grow_test.rs`.
 pub(crate) mod nonsym_grow;
 
+// Serial CPU self-oracle for the device Depthwise / Lossguide non-symmetric grow (GPUT-18):
+// device `grow_nonsym_tree` vs an inline host leaf-wise reference — structure integer-exact,
+// leaf values ≤1e-4. Runs over `SelectedRuntime` (the pointwise-hist scoring path works on
+// cpu/wgpu too, unlike the resident oblivious grow). Lives in `kernels/nonsym_grow_test.rs`.
+#[cfg(test)]
+mod nonsym_grow_test;
+
 // Bit-packed compressed index (cindex) bit-exact self-oracle (GPU-01 cindex slice,
 // Phase 10-06, GPUT-15): the host `gpu_runtime::cindex::pack_cindex` grouped packing +
 // the device `read_all_bins_kernel` (which reads every cell through the ONE

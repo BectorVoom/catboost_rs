@@ -125,7 +125,7 @@ fn session_depth_gt1_grows_and_matches_direct() {
         assert_eq!(session.n(), n, "session n must equal the fixture n (n={n})");
 
         let dev_tree = session
-            .grow_one(&target)
+            .grow_one(&vec![0.0_f64; n], &target)
             .expect("depth-6 grow_one must succeed on the clear-margin fixture");
 
         // Direct reference: `grow_oblivious_tree` over the SAME first-tree residual + Cosine.

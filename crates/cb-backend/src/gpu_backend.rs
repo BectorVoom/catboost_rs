@@ -261,15 +261,13 @@ impl Runtime for GpuBackend {
         n_bins: usize,
         learning_rate: f64,
         scaled_l2: f64,
+        config: &cb_compute::DeviceTrainConfig,
     ) -> CbResult<bool> {
-        // Phase 12 Plan 01 (Open Q2): the config surface is a single plain host
-        // `DeviceTrainConfig`. The `Runtime::begin_device_training` trait method keeps its
-        // arg list (its sole caller lives in `cb_train::boosting`, owned by a later wave), so
-        // the backend constructs the DEFAULT covered regime here — every non-default family
-        // knob (grow policy / sampling / exact / CTR) is promoted to the trait method by the
-        // wave that lands its device kernel (Plan 02+). `default()` == today's covered path,
-        // so this is byte-unchanged (D-04).
-        let config = cb_compute::DeviceTrainConfig::default();
+        // Phase 12 Plan 03 (Open Q2 promotion): the config surface — the single plain host
+        // `DeviceTrainConfig` — is now threaded through from `cb_train::boosting` (the sole
+        // caller, this plan's wave), so the grow-policy / sampling / exact / CTR knobs reach
+        // the session gate. Passing `DeviceTrainConfig::default()` is byte-unchanged vs Plan 01
+        // (D-04); a Depthwise / Lossguide `grow_policy` now flips the non-symmetric device arm on.
         let session = GpuTrainSession::begin(
             loss,
             depth,
@@ -283,7 +281,7 @@ impl Runtime for GpuBackend {
             n_bins,
             learning_rate,
             scaled_l2,
-            &config,
+            config,
         )?;
         let covered = session.is_some();
         *self.session.borrow_mut() = session;
@@ -318,7 +316,7 @@ impl Runtime for GpuBackend {
                         actual: approx.len(),
                     });
                 }
-                let tree = session.grow_one(target)?;
+                let tree = session.grow_one(approx, target)?;
                 Ok(Some(tree))
             }
         }

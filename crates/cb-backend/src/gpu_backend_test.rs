@@ -179,7 +179,7 @@ fn gpu_backend_device_grow_lifecycle_covered() {
     let covered = backend
         .begin_device_training(
             &Loss::Rmse, 1, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
-            n_bins, 0.3, scaled_l2,
+            n_bins, 0.3, scaled_l2, &cb_compute::DeviceTrainConfig::default(),
         )
         .expect("begin must not error on a covered config");
     assert!(covered, "depth1/RMSE/Plain/fold1/Cosine must open a device session (Ok(true))");
@@ -213,14 +213,15 @@ fn gpu_backend_device_grow_uncovered_falls_back() {
     let scaled_l2 = cb_compute::scale_l2_reg(3.0, cb_core::sum_f64(&weight), n);
 
     let backend = GpuBackend::default();
-    // depth == 2 is not covered (the per-partition histogram forward dependency).
+    // `fold_count == 2` is not covered (the device grow path is single-fold only; depth>1 is
+    // NO LONGER an uncovered case since Phase 12 Plan 01 relaxed the depth-1 gate).
     let covered = backend
         .begin_device_training(
-            &Loss::Rmse, 2, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
-            n_bins, 0.3, scaled_l2,
+            &Loss::Rmse, 1, true, 2, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+            n_bins, 0.3, scaled_l2, &cb_compute::DeviceTrainConfig::default(),
         )
         .expect("begin must not error while classifying coverage");
-    assert!(!covered, "depth>1 must decline the device path (Ok(false))");
+    assert!(!covered, "fold_count>1 must decline the device path (Ok(false))");
 
     let approx = vec![0.0_f64; n];
     let tree = backend

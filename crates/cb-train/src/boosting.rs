@@ -27,8 +27,9 @@
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, is_pairwise_scoring,
     logcosh_exact_leaf_delta, newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg,
-    score_st_dev, simple_leaf_delta, solve_symmetric_newton, Derivatives, GroupSpan, LeafMethod,
-    Loss, Runtime, RankingCompetitor, QUANTILE_ALPHA, QUANTILE_DELTA,
+    score_st_dev, simple_leaf_delta, solve_symmetric_newton, Derivatives, DeviceGrowPolicy,
+    DeviceTrainConfig, GroupSpan, LeafMethod, Loss, Runtime, RankingCompetitor, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 use cb_data::Pair;
@@ -3006,7 +3007,13 @@ fn train_inner<R: Runtime>(
         && structure_fold_columns.iter().all(Vec::is_empty)
         && !penalties_active
         && params.monotone_constraints.is_empty()
-        && params.grow_policy == EGrowPolicy::SymmetricTree
+        // Phase 12 Plan 03 (GPUT-18): SymmetricTree (oblivious, Plan 01) AND the two
+        // non-symmetric leaf-wise policies Depthwise / Lossguide are device-eligible; Region
+        // (Plan 04, no device kernel yet) stays on the CPU grower.
+        && matches!(
+            params.grow_policy,
+            EGrowPolicy::SymmetricTree | EGrowPolicy::Depthwise | EGrowPolicy::Lossguide
+        )
         && approx_dimension == 1
         && !is_multiclass
         && !is_multilabel
@@ -3047,6 +3054,29 @@ fn train_inner<R: Runtime>(
     } else {
         (Vec::new(), 0)
     };
+    // Phase 12 Plan 03 (GPUT-18 / Open Q2 promotion): build the plain-host DeviceTrainConfig
+    // from `params` so the grow-policy (+ Lossguide leaf cap / min-data) reaches the session
+    // gate. SymmetricTree yields `DeviceTrainConfig::default()` (byte-unchanged, D-04); the two
+    // non-symmetric policies flip the device non-sym arm on. Every OTHER family knob stays at
+    // its default covered value (host eligibility already excludes sampling / exact / CTR).
+    let device_grow_policy = match params.grow_policy {
+        EGrowPolicy::Depthwise => DeviceGrowPolicy::Depthwise,
+        EGrowPolicy::Lossguide => DeviceGrowPolicy::Lossguide,
+        // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
+        _ => DeviceGrowPolicy::SymmetricTree,
+    };
+    let device_config = DeviceTrainConfig {
+        grow_policy: device_grow_policy,
+        // The Lossguide cap is meaningful ONLY for the non-sym leaf-wise policy; leave it
+        // `None` for SymmetricTree so `is_covered_regime()` (Plan 01) stays satisfied.
+        max_leaves: if matches!(params.grow_policy, EGrowPolicy::Lossguide) {
+            Some(params.max_leaves)
+        } else {
+            None
+        },
+        min_data_in_leaf: params.min_data_in_leaf,
+        ..DeviceTrainConfig::default()
+    };
     let device_active = if device_host_eligible && device_n_bins > 0 {
         runtime.begin_device_training(
             &params.loss,
@@ -3061,6 +3091,7 @@ fn train_inner<R: Runtime>(
             device_n_bins,
             learning_rate,
             device_scaled_l2,
+            &device_config,
         )?
     } else {
         false

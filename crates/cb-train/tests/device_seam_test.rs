@@ -61,6 +61,7 @@ impl Runtime for DeviceMock {
         _n_bins: usize,
         _learning_rate: f64,
         _scaled_l2: f64,
+        _config: &cb_compute::DeviceTrainConfig,
     ) -> CbResult<bool> {
         Ok(self.accept_begin)
     }

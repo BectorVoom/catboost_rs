@@ -1148,6 +1148,12 @@ pub trait Runtime {
     /// # Errors
     /// Returns a [`cb_core::CbError`] if a backend override fails to allocate or
     /// upload the session state. The default implementation never errors.
+    ///
+    /// `config` is the single plain-host [`DeviceTrainConfig`] carrying the grow-policy /
+    /// sampling / exact-leaf / CTR knobs (Phase 12 Plan 03 promotion — the config surface
+    /// widens by mutating this struct, not the argument list). The default covered regime is
+    /// [`DeviceTrainConfig::default`]; a Depthwise / Lossguide `grow_policy` flips the
+    /// non-symmetric device arm on.
     #[allow(clippy::too_many_arguments)]
     fn begin_device_training(
         &self,
@@ -1163,6 +1169,7 @@ pub trait Runtime {
         n_bins: usize,
         learning_rate: f64,
         scaled_l2: f64,
+        config: &DeviceTrainConfig,
     ) -> CbResult<bool> {
         let _ = (
             loss,
@@ -1177,6 +1184,7 @@ pub trait Runtime {
             n_bins,
             learning_rate,
             scaled_l2,
+            config,
         );
         Ok(false)
     }

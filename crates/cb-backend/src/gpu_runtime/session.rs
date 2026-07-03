@@ -39,7 +39,9 @@
 
 use cubecl::server::Handle;
 
-use cb_compute::{DeviceGrownTree, DeviceTrainConfig, EScoreFunction, Loss};
+use cb_compute::{
+    DeviceBootstrapType, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig, EScoreFunction, Loss,
+};
 use cb_core::{CbError, CbResult};
 
 use crate::gpu_runtime::cindex::pack_cindex;
@@ -47,8 +49,63 @@ use crate::gpu_runtime::{
     grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
     DerBinaryKernel,
 };
+use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
 use crate::kernels::{SCORE_FN_COSINE, SCORE_FN_L2, SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2};
 use crate::SelectedRuntime;
+
+/// Map a host [`DeviceGrowPolicy`] to the device non-symmetric grow strategy, or `None`
+/// for the oblivious / symmetric path (which stays on the resident grow loop) and for the
+/// not-yet-covered Region policy (Plan 04). Follows the `map_score_fn` / `map_der_kernel`
+/// `Option`-returning template (Pattern A — the family-gated coverage flip). Phase 12 Plan 03
+/// flips Depthwise / Lossguide `Ok(None)` → device; Region stays `None` until Plan 04.
+fn map_grow_policy(grow_policy: DeviceGrowPolicy) -> Option<NonsymPolicy> {
+    match grow_policy {
+        DeviceGrowPolicy::Depthwise => Some(NonsymPolicy::Depthwise),
+        DeviceGrowPolicy::Lossguide => Some(NonsymPolicy::Lossguide),
+        // SymmetricTree → the resident oblivious path (not a non-sym policy); Region → Plan 04.
+        DeviceGrowPolicy::SymmetricTree | DeviceGrowPolicy::Region => None,
+    }
+}
+
+/// The per-fit non-symmetric device-grow state (Phase 12 Plan 03). Held when the fit commits
+/// to a Depthwise / Lossguide device grow. Unlike the resident oblivious session this path is
+/// host-DRIVEN (the per-node device split scorer reads a host doc-subset per candidate), so it
+/// keeps HOST copies of the quantized bins + weights and re-derives the per-object der1 from
+/// the caller's `approx` each tree via [`host_der1`] (the covered regime is unit weights,
+/// bias 0, so `der1 = target - approx` for RMSE / `target - sigmoid(approx)` for Logloss
+/// matches the CPU `compute_gradients` used by the reference model, bit-for-bit).
+struct NonsymState {
+    policy: NonsymPolicy,
+    /// Feature-major quantized bins (`bins[f * n + i]`).
+    bins: Vec<u32>,
+    /// Per-object weight (the covered regime is all-`1.0`).
+    weight: Vec<f64>,
+    max_depth: usize,
+    /// Leaf cap (Lossguide); `usize::MAX` == unbounded (Depthwise / no cap).
+    max_leaves: usize,
+    min_data_in_leaf: usize,
+    /// The covered-loss der kind, driving the host der1 re-derivation.
+    der_kernel: DerBinaryKernel,
+}
+
+/// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
+/// for the covered losses, transcribing `cb_compute`'s documented formulas (RMSE:
+/// `der1 = target - approx`; Logloss / CrossEntropy: `der1 = target - sigmoid(approx)`). The
+/// covered regime is unit weights, so this UN-weighted der1 feeds the histogram numerator and
+/// `calc_average` denominator exactly as the CPU reference does.
+fn host_der1(der_kernel: DerBinaryKernel, approx: &[f64], target: &[f64]) -> Vec<f64> {
+    approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| match der_kernel {
+            DerBinaryKernel::RmseGradient => t - a,
+            DerBinaryKernel::LoglossGradient => {
+                let p = 1.0_f64 / (1.0_f64 + (-a).exp());
+                t - p
+            }
+        })
+        .collect()
+}
 
 /// The per-fit device-resident training session (GPUT-02): one client + the persistent
 /// device handles + the frozen per-fit configuration. Constructed by [`Self::begin`] only
@@ -98,6 +155,11 @@ pub struct GpuTrainSession {
     /// (default) regime reaches here, so no field is consumed yet.
     #[allow(dead_code)]
     config: DeviceTrainConfig,
+    /// The per-fit non-symmetric grow state (Phase 12 Plan 03). `Some` iff the fit committed
+    /// to a Depthwise / Lossguide device grow — [`Self::grow_one`] then dispatches to the
+    /// host-driven [`grow_nonsym_tree`] instead of the resident oblivious loop. `None` for the
+    /// oblivious / symmetric path (byte-unchanged, D-04).
+    nonsym: Option<NonsymState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -170,13 +232,37 @@ impl GpuTrainSession {
         if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
             return Ok(None);
         }
-        // D-10-01 all-or-nothing (Phase 12 Plan 01, Open Q2): any non-default DeviceTrainConfig
-        // family flag — a non-Symmetric grow policy, subsampling/bootstrap, MVS, exact leaf, CTR,
-        // or a leaf-count cap — still routes to the byte-unchanged CPU grower until its Phase-12
-        // wave flips the arm on (Plan 03/04 policies, Plan 05 exact, Plan 06/07 sampling, Plan 08
-        // CTR). The covered regime IS `DeviceTrainConfig::default()`.
-        if !config.is_covered_regime() {
-            return Ok(None);
+        // Phase 12 Plan 03 (GPUT-18): the grow-policy arm. `map_grow_policy` returns the device
+        // non-symmetric strategy for Depthwise / Lossguide (flipped ON this plan), or `None` for
+        // the oblivious / symmetric path (which is the byte-unchanged Plan-01 resident loop) and
+        // for the not-yet-covered Region policy (Plan 04, declines below).
+        let nonsym_policy = map_grow_policy(config.grow_policy);
+        match nonsym_policy {
+            None => {
+                // Region is a distinct policy with no device kernel yet (Plan 04) — decline it
+                // explicitly (never let it fall through to the oblivious path). SymmetricTree
+                // rides the Plan-01 covered-regime gate unchanged (D-10-01 all-or-nothing: any
+                // OTHER non-default family flag still routes to the CPU grower).
+                if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+                    return Ok(None);
+                }
+                if !config.is_covered_regime() {
+                    return Ok(None);
+                }
+            }
+            Some(_) => {
+                // Depthwise / Lossguide: every OTHER family flag must still be the default
+                // covered regime (no subsampling / MVS / exact leaf / CTR). Only `grow_policy`
+                // and `max_leaves` (the Lossguide cap) may be non-default — those are THIS
+                // family's own knobs (D-10-01 all-or-nothing PER family).
+                let family_default = config.bootstrap_type == DeviceBootstrapType::No
+                    && config.mvs_lambda.is_none()
+                    && !config.exact_leaf
+                    && config.ctr.is_none();
+                if !family_default {
+                    return Ok(None);
+                }
+            }
         }
         let der_kernel = match map_der_kernel(loss) {
             Some(k) => k,
@@ -198,7 +284,10 @@ impl GpuTrainSession {
         // would commit the whole fit to the device (D-10-01 all-or-nothing) and then hard-fail
         // at grow time. Decline to the byte-unchanged CPU grower (D-04) instead of a hard
         // failure. Keep this set in sync with `hist2_launch_resident`'s dispatch.
-        if !matches!(n_bins, 2 | 16 | 32 | 64 | 128 | 256) {
+        // This dispatch restriction applies ONLY to the resident oblivious partition-histogram
+        // fill. The non-symmetric grow (Plan 03) scores via the whole-subset `pointwise_hist2`
+        // path per node, which has no such line-size restriction — so skip the check for it.
+        if nonsym_policy.is_none() && !matches!(n_bins, 2 | 16 | 32 | 64 | 128 | 256) {
             return Ok(None);
         }
 
@@ -257,6 +346,18 @@ impl GpuTrainSession {
         // out of scope, the cross-oracle uses the SAME zero start).
         let approx_h = upload_channel_floats(&client, &vec![0.0_f64; n]);
 
+        // Phase 12 Plan 03: capture the non-symmetric grow state (host-driven; keeps host
+        // copies of the bins + weights and re-derives der1 from the caller's approx per tree).
+        let nonsym = nonsym_policy.map(|policy| NonsymState {
+            policy,
+            bins: bins_feature_major.to_vec(),
+            weight: weight.to_vec(),
+            max_depth: depth,
+            max_leaves: config.max_leaves.unwrap_or(usize::MAX),
+            min_data_in_leaf: config.min_data_in_leaf,
+            der_kernel,
+        });
+
         Ok(Some(Self {
             client,
             plain_cindex_h,
@@ -280,6 +381,7 @@ impl GpuTrainSession {
             learning_rate,
             der_kernel,
             config: config.clone(),
+            nonsym,
         }))
     }
 
@@ -302,13 +404,44 @@ impl GpuTrainSession {
     /// a prior call surfaces a typed [`CbError`]. The resident approx is authoritative for the
     /// device pass (in the covered Plain/fold=1/from-zero regime it tracks the caller's approx
     /// exactly). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
-    pub fn grow_one(&mut self, target: &[f64]) -> CbResult<DeviceGrownTree> {
+    pub fn grow_one(&mut self, approx: &[f64], target: &[f64]) -> CbResult<DeviceGrownTree> {
         if target.len() != self.n {
             return Err(CbError::LengthMismatch {
                 column: "target".to_owned(),
                 expected: self.n,
                 actual: target.len(),
             });
+        }
+
+        // Phase 12 Plan 03 (GPUT-18): the NON-SYMMETRIC arm. The fit committed to a Depthwise /
+        // Lossguide device grow — re-derive der1 on the host from the caller's `approx` + target
+        // (the covered regime is unit weights / bias 0, so this matches the CPU
+        // `compute_gradients` bit-for-bit) and grow the non-symmetric node graph via the
+        // host-driven device scorer. Emits `step_nodes` / `node_id_to_leaf_id` + per-node splits
+        // + `calc_average` leaf values; the boosting fold arm materializes the `NonSymmetricTree`.
+        if let Some(ns) = self.nonsym.as_ref() {
+            if approx.len() != self.n {
+                return Err(CbError::LengthMismatch {
+                    column: "approx".to_owned(),
+                    expected: self.n,
+                    actual: approx.len(),
+                });
+            }
+            let der1 = host_der1(ns.der_kernel, approx, target);
+            return grow_nonsym_tree(
+                ns.policy,
+                &der1,
+                &ns.weight,
+                &ns.bins,
+                self.n,
+                self.n_bins,
+                self.n_features,
+                ns.max_depth,
+                ns.max_leaves,
+                ns.min_data_in_leaf,
+                self.scaled_l2,
+                self.score_fn,
+            );
         }
 
         // Upload the target ONCE (first call), then initialise the resident der1 from the
