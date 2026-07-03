@@ -176,3 +176,10 @@ Run the depth-6 section of `bench/cuda_oracle.ipynb` on a Kaggle CUDA GPU:
 ---
 *Phase: 11-depth-1-partition-aware-histograms-reduction-determinism-new*
 *Tasks 1–2 completed: 2026-07-03 · Task 3 awaiting human-gated Kaggle CUDA run*
+
+## Self-Check: PASSED
+- Created/modified files present: 11-05-SUMMARY.md, bench/cuda_oracle.ipynb, bench/RESULTS.md, deferred-items.md
+- Task commits present: 9351d21 (Task 1), da32d10 (Task 2)
+- Notebook valid nbformat (22 cells); Task-1 verify (depth6 + 1e-4) and Task-2 verify
+  (Phase 11 / depth-6 in RESULTS.md) both pass
+- Task 3 (human-gated Kaggle CUDA run) intentionally NOT executed — plan not marked complete
