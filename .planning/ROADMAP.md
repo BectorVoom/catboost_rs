@@ -117,12 +117,14 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   4. **Speed check (BENCH-02, standing):** depth-6 RMSE and Logloss device training is timed on Kaggle CUDA and reported as device path vs the host-CPU baseline AND vs official CatBoost GPU (warm-run/JIT-excluded, train-only) — this phase's keystone kernels (partition-aware histograms + subtraction trick + Newton der2) carry their own recorded CUDA speed measurement, not deferred to Phase 14.
   5. Every device-covered case to date holds ε=1e-4 vs the Rust CPU path **on Kaggle CUDA**, and the CPU/host training paths remain byte-unchanged (D-04) — the standing GPUT-14 gate, operative from here to the end of the milestone.
 
-**Plans**: 5 plans
-- [ ] 11-01-PLAN.md — Depth-6 synthetic fixture generator (D-03) + CPU oracle cross-check (Wave 1)
+**Plans**: 1/5 plans executed
+
+- [x] 11-01-PLAN.md — Depth-6 synthetic fixture generator (D-03) + CPU oracle cross-check (Wave 1)
 - [ ] 11-02-PLAN.md — Partition-aware `fullPass=false` histogram + subtraction trick + deterministic fixed-point accumulator (GPUT-05/06, Wave 2)
 - [ ] 11-03-PLAN.md — Wire depth>1 into the grow loop + depth-6 grow self-oracle + zero-spread determinism check (GPUT-05/06, Wave 3)
 - [ ] 11-04-PLAN.md — Newton der2 leaf estimation (Σder2 channel, newton_leaf_delta, apply_leaf_delta refinement) (GPUT-07, Wave 4)
 - [ ] 11-05-PLAN.md — Kaggle CUDA harness: final-ε=1e-4 gate + per-tree diagnostic + BENCH-02 speed (GPUT-14/06/BENCH-02, Wave 5, human-gated)
+
 **UI hint**: no
 **Notes**: The single largest kernel extension of the milestone — partition-aware `pointwise_hist2` keyed by `leaf_of[obj]` into `2^level` slots; `TDataPartition{Offset,Size}` contiguous layout; parent-resident sibling-by-subtraction (§1.4 subtraction trick, §6.3 `pointwise_hist2`, §6.4 leaf-wise builder). Consumes the Phase-10 device-primitive library (scan/segmented-scan/reduce-by-key/partition-update) and the resident cindex directly. Reuses Phase 7.2 der2 handles for Newton. Oracle + speed of record = Kaggle CUDA (human-gated notebook); the optional ROCm in-env build is a fast local smoke check only. **BENCH-02's standing per-phase speed check applies here.** Landmines: deterministic reduction strategy mandatory (CUDA atomicAdd ordering still non-deterministic; gfx1100 still lacks f64 atomic-add for the smoke path); `f32::MIN` sentinel. Research flags: consume the Phase-10 `SPIKE-REDUCTION.md` recommendation as step 0 (before the histogram kernel); verify the multi-block scan carry against the vendored CubeCL manual. Given the kernel complexity, plans may decompose this phase into sub-waves (depth>1 histograms → reduction determinism → Newton der2).
 
@@ -180,7 +182,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
-| 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 0/TBD | Not started | - |
+| 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 1/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 0/TBD | Not started | - |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
