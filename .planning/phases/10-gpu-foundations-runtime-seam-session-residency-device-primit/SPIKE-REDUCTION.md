@@ -99,6 +99,13 @@ filled by the human-gated Kaggle run (Plan 10-09, `bench/cuda_oracle.ipynb`):
 warms one untimed launch, runs the correctness oracle (blocking), then times each strategy
 draining the CubeCL lazy queue before stopping the clock (RESEARCH warm-run caveat).
 
+**Fill source (wired in 10-09):** `bench/cuda_oracle.ipynb` runs the reduce oracle under
+`cargo test … reduce -- --nocapture` on CUDA; its
+`reduce_finalize_strategies_are_deterministic_and_report_path` output reports per-strategy
+run-to-run spread + path + `abs_div`. A dedicated notebook markdown cell ("Fill
+SPIKE-REDUCTION.md §4") instructs the human to transcribe the CUDA `err`/`ms` for (a)/(b)/(c)
+into the table above; the human sign-off is logged in `bench/RESULTS.md`.
+
 ---
 
 ## 5. Recommendation (D-04 — the winner that ships)
