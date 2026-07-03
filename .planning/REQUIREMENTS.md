@@ -18,7 +18,7 @@
 
 ### GPU Device-Resident Training — Seam, Residency & Foundations (GPUT)
 
-- [ ] **GPUT-01**: A `Runtime` grow-tree trait seam (`begin_device_training` / `grow_tree_on_device` returning `CbResult<Option<DeviceGrownTree>>` / `end_device_training`) exists in `cb-compute` with CubeCL-free host-typed signatures, and a `Ok(None)`→host-CPU fallback so any uncovered case stays correct.
+- [x] **GPUT-01**: A `Runtime` grow-tree trait seam (`begin_device_training` / `grow_tree_on_device` returning `CbResult<Option<DeviceGrownTree>>` / `end_device_training`) exists in `cb-compute` with CubeCL-free host-typed signatures, and a `Ok(None)`→host-CPU fallback so any uncovered case stays correct.
 - [ ] **GPUT-02**: A `GpuTrainSession` (cb-backend-internal) owns one `ComputeClient` + all persistent device handles for the whole fit; the quantized feature matrix is uploaded once above the iteration loop (no per-tree re-upload).
 - [ ] **GPUT-03**: Gradients/approx stay device-resident across boosting iterations; the per-tree `der1` host read-back is eliminated; only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (D-05).
 - [ ] **GPUT-15**: A bit-packed device-resident **compressed index** (cindex) with `TCFeature` Offset/Shift/Mask/OneHot addressing is built and kept resident as the single input to every histogram kernel, matching the CPU quantized layout ≤1e-4, oracle-tested on Kaggle CUDA. (Borders stay host — CPU quantization is the ≤1e-5 reference per GPUT-02; only cindex packing/residency is the device deliverable. §6.6a `gpu_data/kernel/binarize.cu`, `WriteCompressedIndex`.)
@@ -78,7 +78,7 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| GPUT-01 | Phase 10 | Pending |
+| GPUT-01 | Phase 10 | Complete |
 | GPUT-02 | Phase 10 | Pending |
 | GPUT-03 | Phase 10 | Pending |
 | GPUT-04 | Phase 10 | Pending |
