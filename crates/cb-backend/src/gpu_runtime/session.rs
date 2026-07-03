@@ -39,7 +39,7 @@
 
 use cubecl::server::Handle;
 
-use cb_compute::{DeviceGrownTree, EScoreFunction, Loss};
+use cb_compute::{DeviceGrownTree, DeviceTrainConfig, EScoreFunction, Loss};
 use cb_core::{CbError, CbResult};
 
 use crate::gpu_runtime::cindex::pack_cindex;
@@ -92,6 +92,12 @@ pub struct GpuTrainSession {
     score_fn: u32,
     learning_rate: f64,
     der_kernel: DerBinaryKernel,
+    /// The frozen per-fit device config (Phase 12 Plan 01, Open Q2). Stored so the later
+    /// Phase-12 waves (grow policy, sampling, exact leaf, CTR) read their knobs from ONE
+    /// place without re-threading the `begin` argument list. In Plan 01 only the covered
+    /// (default) regime reaches here, so no field is consumed yet.
+    #[allow(dead_code)]
+    config: DeviceTrainConfig,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -149,6 +155,7 @@ impl GpuTrainSession {
         n_bins: usize,
         learning_rate: f64,
         scaled_l2: f64,
+        config: &DeviceTrainConfig,
     ) -> CbResult<Option<Self>> {
         // --- Coverage gate (D-10-02): classification lives where the session is created. ---
         // The device path grows a depth>=1 Plain oblivious tree over a single fold with an
@@ -161,6 +168,14 @@ impl GpuTrainSession {
         // Plain/fold_count==1/covered-loss/score/n_bins guards remain; every still-uncovered
         // config returns `Ok(None)` → the byte-unchanged CPU grower (D-10-01 all-or-nothing).
         if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
+            return Ok(None);
+        }
+        // D-10-01 all-or-nothing (Phase 12 Plan 01, Open Q2): any non-default DeviceTrainConfig
+        // family flag — a non-Symmetric grow policy, subsampling/bootstrap, MVS, exact leaf, CTR,
+        // or a leaf-count cap — still routes to the byte-unchanged CPU grower until its Phase-12
+        // wave flips the arm on (Plan 03/04 policies, Plan 05 exact, Plan 06/07 sampling, Plan 08
+        // CTR). The covered regime IS `DeviceTrainConfig::default()`.
+        if !config.is_covered_regime() {
             return Ok(None);
         }
         let der_kernel = match map_der_kernel(loss) {
@@ -264,6 +279,7 @@ impl GpuTrainSession {
             score_fn,
             learning_rate,
             der_kernel,
+            config: config.clone(),
         }))
     }
 

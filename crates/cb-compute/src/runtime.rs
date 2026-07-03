@@ -950,6 +950,124 @@ pub struct DeviceGrownTree {
     pub node_id_to_leaf_id: Vec<u32>,
 }
 
+/// The device grow policy (Phase 12 Plan 01, GPUT-18), a PLAIN HOST enum mirroring
+/// upstream `EGrowPolicy` BY VALUE. Deliberately re-declared here (NOT `use cb_train`)
+/// so the [`Runtime`] seam — and therefore `cb-train` — never gains a `cubecl` /
+/// `cb-backend` dependency via feature unification (T-10-04 landmine). The device
+/// path covers only [`Self::SymmetricTree`] today; the non-symmetric arms are flipped
+/// on by later Phase-12 waves (Plan 03 Depthwise/Lossguide, Plan 04 Region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceGrowPolicy {
+    /// Oblivious / symmetric tree (the only device-covered policy in Plan 01).
+    #[default]
+    SymmetricTree,
+    /// Depth-wise non-symmetric growth (Plan 03).
+    Depthwise,
+    /// Loss-guided leaf-wise non-symmetric growth (Plan 03).
+    Lossguide,
+    /// Region growth — no CPU path upstream (Plan 04, built device-first).
+    Region,
+}
+
+/// The device bootstrap (sampling) type (Phase 12 Plan 01), a PLAIN HOST enum mirroring
+/// upstream `EBootstrapType` BY VALUE. The Plan-01 covered regime does NO subsampling
+/// ([`Self::No`], every object at full weight); the sampling arms are flipped on by
+/// Plan 06 (bootstrap) / Plan 07 (MVS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceBootstrapType {
+    /// No subsampling — the full dataset at uniform weight (the covered regime).
+    #[default]
+    No,
+    /// Bayesian bootstrap (Plan 06).
+    Bayesian,
+    /// Bernoulli subsampling (Plan 06).
+    Bernoulli,
+    /// Minimal-Variance Sampling (Plan 07).
+    Mvs,
+    /// Poisson bootstrap (Plan 06).
+    Poisson,
+}
+
+/// The device CTR (categorical target statistics) config placeholder (Phase 12 Plan 01),
+/// a PLAIN HOST struct. Empty for now — Plan 08 fills it with the CTR kind / prior / target
+/// binarization the device CTR kernel + cindex-join need. Its mere PRESENCE
+/// (`DeviceTrainConfig::ctr == Some(_)`) already routes to `Ok(None)` in Plan 01
+/// (D-10-01 all-or-nothing), so the covered regime carries `None`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceCtrConfig {}
+
+/// The single PLAIN HOST-typed device training config (Phase 12 Plan 01, Open Q2). It
+/// carries the grow-policy / leaf-method / sampling / exact / CTR knobs the later
+/// Phase-12 waves need, so [`Runtime::begin_device_training`]'s config surface widens by
+/// mutating THIS struct instead of growing the per-call argument list per wave. Every
+/// field is a plain host type (no `cubecl` / `cb-backend` type may appear here — the
+/// T-10-04 seam landmine).
+///
+/// [`Self::default`] reproduces TODAY'S device-covered regime exactly (SymmetricTree,
+/// no subsampling, RMSE/Newton leaf, no exact, no CTR), so an existing caller passing the
+/// default is byte-unchanged (D-04). For Plan 01 EVERY non-default value still routes to
+/// `Ok(None)` at the coverage gate — later waves flip each arm on as its device kernel lands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceTrainConfig {
+    /// The grow policy; only [`DeviceGrowPolicy::SymmetricTree`] is device-covered in Plan 01.
+    pub grow_policy: DeviceGrowPolicy,
+    /// Max leaves for the leaf-wise policies (`None` == unbounded / not applicable). Any
+    /// `Some(_)` declines in Plan 01.
+    pub max_leaves: Option<usize>,
+    /// Minimum objects per leaf (the covered regime uses `1`).
+    pub min_data_in_leaf: usize,
+    /// The bootstrap / subsampling type; only [`DeviceBootstrapType::No`] is covered in Plan 01.
+    pub bootstrap_type: DeviceBootstrapType,
+    /// The subsample rate (the covered regime is `1.0` — the full dataset).
+    pub sample_rate: f32,
+    /// The MVS regularization λ (`None` unless MVS sampling is active — Plan 07).
+    pub mvs_lambda: Option<f64>,
+    /// The pinned per-fit RNG seed (device-resident sampling reproducibility, Plan 06/07).
+    pub rng_seed: u64,
+    /// The exact-leaf (order-statistic) leaf method flag; `true` declines in Plan 01 (Plan 05).
+    pub exact_leaf: bool,
+    /// The quantile α for the exact-leaf method (Plan 05).
+    pub quantile_alpha: f64,
+    /// The quantile δ boundary for the exact-leaf method (Plan 05).
+    pub quantile_delta: f64,
+    /// The device CTR config; `Some(_)` declines in Plan 01 (Plan 08 fills + covers it).
+    pub ctr: Option<DeviceCtrConfig>,
+}
+
+impl Default for DeviceTrainConfig {
+    fn default() -> Self {
+        Self {
+            grow_policy: DeviceGrowPolicy::SymmetricTree,
+            max_leaves: None,
+            min_data_in_leaf: 1,
+            bootstrap_type: DeviceBootstrapType::No,
+            sample_rate: 1.0,
+            mvs_lambda: None,
+            rng_seed: 0,
+            exact_leaf: false,
+            quantile_alpha: 0.5,
+            quantile_delta: 1e-6,
+            ctr: None,
+        }
+    }
+}
+
+impl DeviceTrainConfig {
+    /// `true` iff this config is the exact Plan-01 device-covered regime (SymmetricTree,
+    /// no subsampling, RMSE/Newton leaf, no exact-leaf, no CTR, no leaf-count cap). The
+    /// coverage gate declines (`Ok(None)`) on anything else — every later Phase-12 wave
+    /// flips its own arm here as its device kernel lands (D-10-01 all-or-nothing).
+    #[must_use]
+    pub fn is_covered_regime(&self) -> bool {
+        self.grow_policy == DeviceGrowPolicy::SymmetricTree
+            && self.bootstrap_type == DeviceBootstrapType::No
+            && self.mvs_lambda.is_none()
+            && !self.exact_leaf
+            && self.ctr.is_none()
+            && self.max_leaves.is_none()
+    }
+}
+
 pub trait Runtime {
     /// Compute the per-object derivatives for `loss` from the raw approximants
     /// and targets, returning them UN-reduced in object order (D-02).

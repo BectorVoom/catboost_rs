@@ -17,7 +17,7 @@
 
 #![cfg(not(feature = "wgpu"))]
 
-use cb_compute::{EScoreFunction, Loss};
+use cb_compute::{DeviceTrainConfig, EScoreFunction, Loss};
 use cb_core::sum_f64;
 
 use crate::gpu_runtime::GpuTrainSession;
@@ -205,6 +205,18 @@ fn max_divergence(device: &[f64], baseline: &[f64]) -> (f64, f64) {
 /// multi-tree Cosine reference EXACTLY; leaf values REPORTED within the generous bound.
 #[test]
 fn session_residency_matches_cpu_multi_tree_boosting() {
+    // WR-01 anti-false-pass convention (Phase 7.6 / matches the grow_loop depth6 tests): the
+    // resident grow routes through the fixed-point `Atomic<u64>` partition histogram, which
+    // cpu/wgpu do not advertise — SKIP (not panic) on those backends so a default-`cpu`
+    // `cargo test` run does not fail on the device-only grow. Runs on rocm/cuda in-env.
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[10-07] SKIP session_residency_matches_cpu_multi_tree_boosting: active backend lacks \
+             Atomic<u64> add (cpu/wgpu) — the resident partition histogram path needs rocm/cuda"
+        );
+        return;
+    }
+
     let n_features = 3usize;
     let n_bins = 32usize;
     let l2 = 3.0_f64;
@@ -231,6 +243,7 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
             n_bins,
             learning_rate,
             scaled_l2,
+            &DeviceTrainConfig::default(),
         )
         .expect("session begin must not error on a covered config")
         .expect("covered config (depth1/RMSE/Plain/fold1/Cosine) must open a session");
@@ -320,9 +333,11 @@ fn session_residency_coverage_gate_declines_uncovered() {
     let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
     let lr = 0.3_f64;
 
+    let cfg = DeviceTrainConfig::default();
     let open = |loss: &Loss, depth: usize, plain: bool, folds: usize, sf: EScoreFunction| {
         GpuTrainSession::begin(
             loss, depth, plain, folds, sf, &cindex, &weight, n, n_features, n_bins, lr, scaled_l2,
+            &cfg,
         )
         .expect("begin must not error while classifying coverage")
         .is_some()

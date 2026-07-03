@@ -9,9 +9,9 @@
 //!    (`der1 = rmse_der1(0, target)`) bit-for-bit on the integer `(feature, bin)` split
 //!    sequence AND the per-object `leaf_of`, with the leaf VALUES within the ε=1e-4 GPU bar;
 //! 2. (gate) depth>1 Plain/fold1/RMSE/Cosine now returns `Ok(Some(_))`, while every
-//!    still-uncovered config (non-Plain, fold_count>1, unmapped loss, depth==0) still returns
-//!    `Ok(None)` (D-10-01 all-or-nothing → the byte-unchanged CPU grower). The non-default
-//!    [`cb_compute::DeviceTrainConfig`] family-flag arm is added by Plan-01 Task 3.
+//!    still-uncovered config (non-Plain, fold_count>1, unmapped loss, depth==0, and any
+//!    non-default [`cb_compute::DeviceTrainConfig`] family flag) still returns `Ok(None)`
+//!    (D-10-01 all-or-nothing → the byte-unchanged CPU grower).
 //!
 //! Source/test separation (CLAUDE.md / AGENTS.md): the session + grow driver are production
 //! code; ALL `#[test]` + `.unwrap()`/indexing live here. The structure oracle is the DIRECT
@@ -23,7 +23,7 @@
 
 #![cfg(not(feature = "wgpu"))]
 
-use cb_compute::{EScoreFunction, Loss};
+use cb_compute::{DeviceGrowPolicy, DeviceTrainConfig, EScoreFunction, Loss};
 use cb_core::sum_f64;
 
 use crate::gpu_runtime::{grow_oblivious_tree, GpuTrainSession};
@@ -117,6 +117,7 @@ fn session_depth_gt1_grows_and_matches_direct() {
             n_bins,
             learning_rate,
             scaled_l2,
+            &DeviceTrainConfig::default(),
         )
         .expect("begin must not error on a covered depth-6 config")
         .expect("depth-6 Plain/fold1/RMSE/Cosine must now open a session (A3 gap closed)");
@@ -175,9 +176,9 @@ fn session_depth_gt1_grows_and_matches_direct() {
 }
 
 /// (Gate) depth>1 Plain/fold1/RMSE/Cosine now opens a session; every still-uncovered config —
-/// non-Plain, fold_count>1, unmapped loss, depth==0 — still declines to `Ok(None)` (D-10-01
-/// all-or-nothing). Runs on EVERY backend (it only classifies at `begin` — it never grows), so
-/// no rocm skip. Plan-01 Task 3 extends this with the non-default `DeviceTrainConfig` arm.
+/// non-Plain, fold_count>1, unmapped loss, depth==0, and any non-default `DeviceTrainConfig`
+/// family flag — still declines to `Ok(None)` (D-10-01 all-or-nothing). Runs on EVERY backend
+/// (it only classifies at `begin` — it never grows), so no rocm skip.
 #[test]
 fn session_depth_gt1_gate_declines_uncovered() {
     let n = 37usize;
@@ -188,39 +189,65 @@ fn session_depth_gt1_gate_declines_uncovered() {
     let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
     let lr = 0.3_f64;
 
-    let open = |depth: usize, plain: bool, folds: usize, loss: &Loss, sf: EScoreFunction| {
+    let open = |depth: usize,
+                plain: bool,
+                folds: usize,
+                loss: &Loss,
+                sf: EScoreFunction,
+                cfg: &DeviceTrainConfig| {
         GpuTrainSession::begin(
             loss, depth, plain, folds, sf, &cindex, &weight, n, n_features, n_bins, lr, scaled_l2,
+            cfg,
         )
         .expect("begin must not error while classifying coverage")
         .is_some()
     };
+    let def = DeviceTrainConfig::default();
 
     // Covered: depth>1 Plain / fold1 / RMSE-or-Logloss / covered score (A3 gap closed).
     assert!(
-        open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine),
+        open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &def),
         "depth-6 Plain/fold1/RMSE/Cosine must now be covered"
     );
     assert!(
-        open(2, true, 1, &Loss::Logloss, EScoreFunction::Cosine),
+        open(2, true, 1, &Loss::Logloss, EScoreFunction::Cosine, &def),
         "depth-2 Plain/fold1/Logloss/Cosine must now be covered"
     );
 
     // Still-uncovered → None (byte-unchanged CPU fallback).
     assert!(
-        !open(6, false, 1, &Loss::Rmse, EScoreFunction::Cosine),
+        !open(6, false, 1, &Loss::Rmse, EScoreFunction::Cosine, &def),
         "non-Plain (Ordered) must decline even at depth>1"
     );
     assert!(
-        !open(6, true, 2, &Loss::Rmse, EScoreFunction::Cosine),
+        !open(6, true, 2, &Loss::Rmse, EScoreFunction::Cosine, &def),
         "fold_count>1 must decline even at depth>1"
     );
     assert!(
-        !open(6, true, 1, &Loss::Mae, EScoreFunction::Cosine),
+        !open(6, true, 1, &Loss::Mae, EScoreFunction::Cosine, &def),
         "an unmapped loss must decline even at depth>1"
     );
     assert!(
-        !open(0, true, 1, &Loss::Rmse, EScoreFunction::Cosine),
+        !open(0, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &def),
         "depth==0 (no tree to grow) must decline"
+    );
+
+    // A non-default `DeviceTrainConfig` family flag still declines (the Task 3 config gate —
+    // later waves flip each arm; for Plan 01 every non-default value routes to CPU).
+    let non_sym = DeviceTrainConfig {
+        grow_policy: DeviceGrowPolicy::Depthwise,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &non_sym),
+        "a non-SymmetricTree grow_policy must decline (D-10-01 all-or-nothing)"
+    );
+    let exact = DeviceTrainConfig {
+        exact_leaf: true,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &exact),
+        "an exact-leaf config must decline (D-10-01 all-or-nothing)"
     );
 }

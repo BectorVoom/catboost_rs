@@ -262,6 +262,14 @@ impl Runtime for GpuBackend {
         learning_rate: f64,
         scaled_l2: f64,
     ) -> CbResult<bool> {
+        // Phase 12 Plan 01 (Open Q2): the config surface is a single plain host
+        // `DeviceTrainConfig`. The `Runtime::begin_device_training` trait method keeps its
+        // arg list (its sole caller lives in `cb_train::boosting`, owned by a later wave), so
+        // the backend constructs the DEFAULT covered regime here — every non-default family
+        // knob (grow policy / sampling / exact / CTR) is promoted to the trait method by the
+        // wave that lands its device kernel (Plan 02+). `default()` == today's covered path,
+        // so this is byte-unchanged (D-04).
+        let config = cb_compute::DeviceTrainConfig::default();
         let session = GpuTrainSession::begin(
             loss,
             depth,
@@ -275,6 +283,7 @@ impl Runtime for GpuBackend {
             n_bins,
             learning_rate,
             scaled_l2,
+            &config,
         )?;
         let covered = session.is_some();
         *self.session.borrow_mut() = session;
