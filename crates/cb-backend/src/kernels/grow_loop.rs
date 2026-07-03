@@ -43,8 +43,9 @@ use cubecl::prelude::*;
 use cb_core::sum_f64;
 
 use crate::gpu_runtime::{
-    launch_partition_split_into, launch_partition_update_into, read_part_stats_f64, read_u32_handle,
-    upload_channel_floats,
+    launch_partition_hist2_into, launch_partition_split_into, launch_partition_update_into,
+    launch_subtract_histograms_into, read_fixedpoint_hist_f64, read_part_stats_f64,
+    read_u32_handle, upload_channel_floats,
 };
 
 /// The asserted run-stable leaf-VALUE divergence bound (REPORTED, not the GPU-06 epsilon —
@@ -1171,5 +1172,184 @@ mod pairwise {
             msg.contains("depth") && msg.contains("forward dependency"),
             "depth>1 error must name the partition-aware pairwise-assembly forward dependency: {msg}"
         );
+    }
+}
+
+// ===========================================================================
+// Partition-aware histogram + subtraction-trick cross-oracle (Phase 11 Plan 02,
+// Task 3; GPUT-05/06): the device partition-aware `pointwise_hist2` fill (2^level
+// leaf slots, LOCKED fixed-point Atomic<u64> accumulate) + the histogram
+// SUBTRACTION trick (parent − smaller, weight-channel max(0) clamp) must match the
+// CPU leaf-keyed scatter `cb_compute::reduce_leaf_stats` to ≤1e-4 on real gfx1100
+// hardware. Source/test separation (CLAUDE.md / AGENTS.md): the kernels live in
+// `kernels.rs`; the assertions live here (the established self-oracle test file).
+// ===========================================================================
+
+mod partition_hist {
+    use super::*;
+
+    /// The ε=1e-4 GPU correctness bar (D-04) for the partition-aware fill + subtraction
+    /// vs the CPU leaf-keyed scatter — the depth-6-slot correctness gate (NOT the reported
+    /// `LEAF_BOUND`). The fixed-point integer accumulate + exact-below-2^53 subtraction are
+    /// in practice bit-consistent; the 1e-4 bar is the signed-off GPU envelope.
+    const HIST_EPS: f64 = 1e-4;
+
+    /// The FROZEN 2-channel interleave (statId 0 = weight/hessian, statId 1 = der1).
+    const CHANNELS: usize = 2;
+
+    /// True only on backends with `Atomic<u64>` add (the fixed-point accumulator's
+    /// requirement): rocm/cuda. Under cpu (no atomics) or wgpu (no u64 atomics) the test
+    /// SKIPS rather than false-passing the `-inf`/JIT landmine or a CPU-vs-CPU compare
+    /// (the Phase-7.6 WR-01 anti-false-pass convention).
+    fn u64_atomic_backend() -> bool {
+        cfg!(any(feature = "rocm", feature = "cuda"))
+    }
+
+    /// Grow the partition-aware histogram for a KNOWN skewed `leaf_of` over `2^level`
+    /// slots, derive one larger sibling via the subtraction trick, and assert BOTH the
+    /// direct fill and the derived sibling match `reduce_leaf_stats` (per-leaf, feature-0
+    /// bin sum) to ≤1e-4 — plus the weight/hessian channel non-negativity (the max(0)
+    /// clamp). Exercises a level-2 (4 partitions) and a depth-6-slot (64 partitions) case
+    /// on real gfx1100.
+    #[test]
+    fn partition_aware_hist_matches_cpu_scatter() {
+        if !u64_atomic_backend() {
+            println!(
+                "[11-02] SKIP partition_aware_hist_matches_cpu_scatter: active backend lacks \
+                 Atomic<u64> add (cpu/wgpu) — the fixed-point histogram path needs rocm/cuda"
+            );
+            return;
+        }
+
+        let n_features = 3usize;
+        let n_bins = 32usize; // bits = 5
+        let per_leaf = n_features * n_bins * CHANNELS;
+
+        // Representative levels: level 2 (4 partitions) and a depth-6 slot case (64 parts).
+        for &(n, level) in &[(200usize, 2u32), (500usize, 6u32)] {
+            let n_parts = 1usize << level;
+            let (der1, weight, cindex, indices) = make_fixture(n, n_features, n_bins);
+
+            // Known, SKEWED leaf_of over 2^level partitions (unequal sibling sizes so the
+            // "smaller" sibling is unambiguous). Deterministic spread by object index.
+            let child_of: Vec<u32> = (0..n)
+                .map(|o| ((o * 7 + o / 2 + 1) % n_parts) as u32)
+                .collect();
+            // Parent index = child >> 1 (the coarser level-1 partition; siblings 2k, 2k+1
+            // share parent k). The parent histogram is the exact sum of its two children.
+            let parent_of: Vec<u32> = child_of.iter().map(|&c| c >> 1).collect();
+            let n_parents = 1usize << (level - 1);
+
+            let device = <crate::SelectedRuntime as Runtime>::Device::default();
+            let client = <crate::SelectedRuntime as Runtime>::client(&device);
+
+            // (1) Child-level partition-aware fill: 2^level leaf slots, fixed-point u64.
+            let child_h = launch_partition_hist2_into(
+                &client, &der1, &weight, &cindex, &indices, &child_of, n_bins, n_features, level,
+            )
+            .expect("partition_hist2 (child level) must launch");
+            let child_hist = read_fixedpoint_hist_f64(&client, child_h.clone(), n_parts * per_leaf)
+                .expect("read child fixed-point hist");
+
+            // (2) Parent-level fill: 2^(level-1) resident parent histograms.
+            let parent_h = launch_partition_hist2_into(
+                &client, &der1, &weight, &cindex, &indices, &parent_of, n_bins, n_features,
+                level - 1,
+            )
+            .expect("partition_hist2 (parent level) must launch");
+
+            // (3) CPU leaf-keyed scatter oracle (reduce_leaf_stats, canonical object order).
+            let child_usize: Vec<usize> = child_of.iter().map(|&c| c as usize).collect();
+            let cpu_child = cb_compute::reduce_leaf_stats(&child_usize, &der1, &weight, n_parts);
+
+            // STRUCTURE + VALUE (fill): each object lands in slot `leaf_of[i]`; the device
+            // histogram summed over feature-0 bins equals the per-leaf CPU total. channel 0
+            // = weight (statId0), channel 1 = der1.
+            for leaf in 0..n_parts {
+                let base = leaf * per_leaf;
+                let (mut dev_w, mut dev_d) = (0.0_f64, 0.0_f64);
+                for bin in 0..n_bins {
+                    let cell = base + bin * CHANNELS; // feature 0 (feature*n_bins term = 0)
+                    dev_w += child_hist[cell];
+                    dev_d += child_hist[cell + 1];
+                }
+                let cpu = cpu_child[leaf];
+                assert!(
+                    (dev_w - cpu.sum_weight).abs() <= HIST_EPS,
+                    "[fill n={n} level={level}] leaf {leaf} weight: dev={dev_w} cpu={} |Δ|={:.3e} > {HIST_EPS:.0e}",
+                    cpu.sum_weight,
+                    (dev_w - cpu.sum_weight).abs()
+                );
+                assert!(
+                    (dev_d - cpu.sum_weighted_delta).abs() <= HIST_EPS,
+                    "[fill n={n} level={level}] leaf {leaf} der1: dev={dev_d} cpu={} |Δ|={:.3e} > {HIST_EPS:.0e}",
+                    cpu.sum_weighted_delta,
+                    (dev_d - cpu.sum_weighted_delta).abs()
+                );
+            }
+
+            // (4) SUBTRACTION trick over the FIRST parent (children 0 and 1): the smaller
+            // sibling is filled directly (already in `child_hist`); derive the larger as
+            // parent[0] − smaller device-side. Pick the smaller by partition Size (D-04).
+            let size0 = child_of.iter().filter(|&&c| c == 0).count();
+            let size1 = child_of.iter().filter(|&&c| c == 1).count();
+            let (smaller_child, bigger_child) =
+                if size0 <= size1 { (0usize, 1usize) } else { (1usize, 0usize) };
+            let parent_leaf = 0usize; // children 0,1 share parent 0
+
+            let bigger_h = launch_subtract_histograms_into(
+                &client,
+                parent_h.clone(),
+                n_parents * per_leaf,
+                parent_leaf * per_leaf,
+                child_h.clone(),
+                n_parts * per_leaf,
+                smaller_child * per_leaf,
+                per_leaf,
+            )
+            .expect("subtract_histograms must launch");
+            let derived = read_fixedpoint_hist_f64(&client, bigger_h, per_leaf)
+                .expect("read derived bigger-sibling hist");
+
+            // Weight/hessian channel non-negativity (the statId==0 max(0) clamp).
+            let mut min_weight_cell = f64::INFINITY;
+            let mut c = 0usize;
+            while c < per_leaf {
+                min_weight_cell = min_weight_cell.min(derived[c]);
+                c += CHANNELS;
+            }
+            assert!(
+                min_weight_cell >= -1e-9,
+                "[subtract n={n} level={level}] weight/hessian channel must be >= 0 after the \
+                 max(0) clamp; min={min_weight_cell:.3e}"
+            );
+
+            // Derived bigger sibling (feature-0 bin sum) equals reduce_leaf_stats[bigger].
+            let (mut dw, mut dd) = (0.0_f64, 0.0_f64);
+            for bin in 0..n_bins {
+                let cell = bin * CHANNELS; // feature 0
+                dw += derived[cell];
+                dd += derived[cell + 1];
+            }
+            let cpu_big = cpu_child[bigger_child];
+            assert!(
+                (dw - cpu_big.sum_weight).abs() <= HIST_EPS,
+                "[subtract n={n} level={level}] bigger child {bigger_child} weight: dev={dw} cpu={} |Δ|={:.3e} > {HIST_EPS:.0e}",
+                cpu_big.sum_weight,
+                (dw - cpu_big.sum_weight).abs()
+            );
+            assert!(
+                (dd - cpu_big.sum_weighted_delta).abs() <= HIST_EPS,
+                "[subtract n={n} level={level}] bigger child {bigger_child} der1: dev={dd} cpu={} |Δ|={:.3e} > {HIST_EPS:.0e}",
+                cpu_big.sum_weighted_delta,
+                (dd - cpu_big.sum_weighted_delta).abs()
+            );
+
+            println!(
+                "[11-02 partition_hist n={n} level={level}] fill+subtraction match \
+                 reduce_leaf_stats ≤{HIST_EPS:.0e} (smaller child={smaller_child}, bigger={bigger_child}); \
+                 weight channel ≥0"
+            );
+        }
     }
 }
