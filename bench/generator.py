@@ -302,7 +302,19 @@ def serial_depth1_tree(X, y, weights, loss, borders,
             wl = weights[left].sum()
             wr = weights[right].sum()
             if wl <= 0.0 or wr <= 0.0:
-                continue  # degenerate split, skip
+                # IN-01 (Phase 11 review): this depth-1 reference uses a STRICTER
+                # admissibility rule than the depth-6 reference (`_cosine_split_score`) and
+                # the device partition scorer, which BOTH permit an empty side (the `l2>0`
+                # denominator keeps `avg = 0/(0+l2) = 0` finite, contributing 0 to the fold).
+                # The two rules agree whenever no degenerate-side candidate ever WINS. On the
+                # committed 2000x10 gaussian fixture every interior border keeps objects on
+                # both sides, so `expected_depth1_tree.json` is unaffected by the difference.
+                # This stricter skip is retained deliberately: it keeps the depth-1 reference
+                # from ever selecting an all-one-side stump (a no-op split). If a future
+                # fixture can produce a degenerate winner, drop this `continue` and score the
+                # empty side with the zero-average fold to match the device (then regenerate
+                # the pinned fixture under the Kaggle sign-off).
+                continue  # degenerate split, skip (see IN-01 note above)
             sl = der1[left].sum()
             sr = der1[right].sum()
             # WR-01: TRUE Cosine score (matching the device Cosine arm
