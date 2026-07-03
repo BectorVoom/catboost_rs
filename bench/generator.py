@@ -65,6 +65,38 @@ DEPTH1_L2 = 3.0
 #: Learning rate used by the depth-1 serial reference (matches benchmark.py).
 DEPTH1_LEARNING_RATE = 0.1
 
+#: Tree depth for the Phase-11 depth-6 RMSE + Logloss correctness fixtures (D-03).
+DEPTH6 = 6
+
+#: Newton leaf-estimation iteration count, PINNED to 1 in the fixture (A1 / D-02).
+#: The Rust CPU oracle (`newton_leaf_delta`) is a SINGLE closed-form Newton step
+#: with NO refinement/backtracking loop; every existing fixture pins this to 1, so
+#: the depth-6 Logloss device path has a single-step ε=1e-4 target. If a future
+#: fixture ever wants iterations>1, the iterative walker must be built in cb-compute
+#: (the oracle) FIRST — a scope expansion, NOT a device-only change (RESEARCH A1).
+LEAF_ESTIMATION_ITERATIONS = 1
+
+#: Split-score function PINNED for the depth-6 fixture (A2). BOTH arms score splits
+#: with the SAME Cosine function `serial_depth1_tree` uses — the per-leaf Cosine fold
+#: whose denominator weight is Σweight (the object count in the unweighted path), NOT
+#: Σder2. This is the channel-0 semantics assumption A2: for SCORING the histogram
+#: channel-0 carries Σweight (matching the depth-1 reference and the cb-compute CPU
+#: oracle); the Logloss Newton HESSIAN (Σder2·weight) enters only the leaf VALUE via
+#: `newton_leaf_delta`, not the split score. Downstream device plans cross-check their
+#: first-few-tree split scores against this pinned reference.
+DEPTH6_SCORE_FUNCTION = "Cosine"
+
+#: The channel-0 semantics the depth-6 score pins (A2) — recorded in the fixture so a
+#: later device change to der2-in-score surfaces as an oracle mismatch, not silent drift.
+DEPTH6_SCORE_CHANNEL0 = "sum_weight"
+
+#: Large-n depth-6 SPEED workload committed as a reproducible seed artifact
+#: (`X_depth6_speed.npy`, sha-manifested) for later BENCH-02 use. This is a
+#: committable representative "large-n" array (clearly larger than the 2000x10
+#: correctness fixture); the FULL ~1e6x50 speed run is regenerated on the fly from
+#: :data:`SPEED_CONFIG` on the Kaggle image (never committed — D-06 / fixtures/README).
+DEPTH6_SPEED_CONFIG = dict(n_rows=10_000, n_features=50, seed=42)
+
 
 # --------------------------------------------------------------------------------------
 # Core seeded generator (D-06 single source)
@@ -297,6 +329,149 @@ def serial_depth1_tree(X, y, weights, loss, borders,
     return best
 
 
+def _cosine_split_score(der1, weights, mask, right, l2):
+    """Total Cosine split score of one (feature, bin) candidate over CURRENT partitions.
+
+    ``mask`` selects, per partition, that partition's objects; ``right`` is the global
+    ``col > border`` boolean. For every partition the candidate is scored with the SAME
+    per-leaf Cosine fold `serial_depth1_tree` uses (``avg = Σder1 / (Σweight + l2)``;
+    ``folded = Σ avg·Σder1``; ``denom = 1e-100 + Σ avg²·Σweight``), summed across all
+    partitions, and returned as ``folded_total / sqrt(denom_total)``.
+
+    Empty split sides are permitted (an oblivious tree may leave a partition all on one
+    side): the ``l2>0`` denominator keeps ``avg = 0/(0+l2) = 0`` finite, contributing 0
+    to both sums — so NO candidate is rejected for a degenerate per-partition side (A2 /
+    upstream oblivious scoring). The score channel-0 weight is Σweight, NOT Σder2.
+    """
+    folded_total = 0.0
+    denom_total = 1e-100
+    rp = mask & right
+    lp = mask & ~right
+    wl = weights[lp].sum()
+    wr = weights[rp].sum()
+    sl = der1[lp].sum()
+    sr = der1[rp].sum()
+    avg_l = sl / (wl + l2)
+    avg_r = sr / (wr + l2)
+    folded_total += avg_l * sl + avg_r * sr
+    denom_total += avg_l * avg_l * wl + avg_r * avg_r * wr
+    return folded_total, denom_total
+
+
+def serial_depth6_tree(X, y, weights, loss, borders,
+                       l2=DEPTH1_L2, learning_rate=DEPTH1_LEARNING_RATE,
+                       depth=DEPTH6):
+    """Serial depth-6 OBLIVIOUS-tree reference (D-03): per-level Cosine best split.
+
+    Mirrors :func:`serial_depth1_tree` but recurses ``depth`` levels. At each level the
+    tree is oblivious — ONE ``(feature, bin_id)`` split is chosen for ALL current
+    ``2**level`` partitions, maximizing the SUMMED Cosine score across those partitions
+    (channel-0 = Σweight, A2). Objects route forward-bit: ``col > border`` adds
+    ``2**level`` to the leaf index, growing ``2**(level+1)`` partitions. At the final
+    level the ``2**depth`` leaves get their values:
+
+    * **RMSE** leaf value = ``calc_average(Σder1, Σweight, scaled_l2)`` — der2 == −1
+      collapses Newton to the average (RMSE der1 = ``y − approx``, approx == 0 here).
+    * **Logloss** leaf value = ``newton_leaf_delta(Σder1, Σ(der2·weight), scaled_l2)``
+      = ``Σder1 / (−Σ(der2·weight) + scaled_l2)`` — a SINGLE closed-form Newton step
+      (``leaf_estimation_iterations == 1``, A1), der1 = ``y − sigmoid(approx) = y − 0.5``,
+      der2 = ``−p(1−p) = −0.25``.
+
+    ``scaled_l2`` = :func:`scale_l2_reg`-equivalent = ``l2`` for the unit-weight path
+    (``Σweight == n``). Leaf values are stored as RAW deltas (pre-learning-rate) so the
+    cb-compute cross-check (Plan 11-01 Task 2) compares them DIRECTLY to
+    ``calc_average`` / ``newton_leaf_delta`` output; the boosting loop applies
+    ``learning_rate`` downstream (kept in the fixture ``config`` block).
+
+    Returns a dict carrying the 6-level ``splits`` sequence, the ``2**depth``
+    ``leaf_values`` (raw deltas), per-leaf reduced ``sum_der1`` / ``sum_weight`` /
+    ``sum_der2`` sums, and the per-object ``leaf_of`` / ``der1`` / ``weight`` /
+    ``weighted_der2`` arrays the Rust ``reduce_leaf_stats`` / ``reduce_leaf_der2``
+    cross-check consumes (so the Rust test needs NO ``.npy`` parser or X routing).
+    """
+    y = y.astype(np.float64)
+    weights = weights.astype(np.float64)
+    n = X.shape[0]
+    if loss == "rmse":
+        der1 = y.copy()  # approx == 0; weight folded into leaf/count denominator only
+        der2 = -np.ones(n)  # RMSE hessian == −1 (Newton collapses to calc_average)
+    elif loss == "logloss":
+        p = np.full(n, 0.5)  # sigmoid(approx == 0) == 0.5
+        der1 = y - p
+        der2 = -p * (1.0 - p)  # −0.25 per object
+    else:
+        raise ValueError("loss must be 'rmse' or 'logloss'")
+    weighted_der2 = der2 * weights  # the Σ(der2·weight) channel reduce_leaf_der2 consumes
+
+    scaled_l2 = l2 * (weights.sum() / n) if n > 0 else l2  # scale_l2_reg (== l2 unit-weight)
+
+    n_features = X.shape[1]
+    cols = [X[:, f].astype(np.float64) for f in range(n_features)]
+    leaf_of = np.zeros(n, dtype=np.int64)
+    splits = []
+
+    for level in range(depth):
+        n_parts = 1 << level
+        best = None
+        best_score = None
+        for f in range(n_features):
+            col = cols[f]
+            b = borders[f]
+            for bin_id in range(len(b)):
+                right = col > b[bin_id]
+                folded_total = 0.0
+                denom_total = 1e-100
+                for part in range(n_parts):
+                    mask = leaf_of == part
+                    folded, denom = _cosine_split_score(der1, weights, mask, right, l2)
+                    folded_total += folded
+                    denom_total += denom
+                score = folded_total / np.sqrt(denom_total)
+                if best is None or score > best_score:
+                    best = (int(f), int(bin_id), float(b[bin_id]))
+                    best_score = float(score)
+        if best is None:
+            raise ValueError(f"no depth-{depth} split found at level {level}")
+        f, bin_id, border = best
+        right = cols[f] > border
+        leaf_of = leaf_of + (right.astype(np.int64) << level)  # forward-bit routing
+        splits.append(dict(level=int(level), feature=int(f), bin=int(bin_id),
+                           border=float(border), score=float(best_score)))
+
+    n_leaves = 1 << depth
+    leaf_values = []
+    per_leaf = []
+    for leaf in range(n_leaves):
+        mask = leaf_of == leaf
+        sum_w = float(weights[mask].sum())
+        sum_d1 = float(der1[mask].sum())
+        sum_d2 = float(weighted_der2[mask].sum())
+        if loss == "rmse":
+            # calc_average(Σder1, Σweight, scaled_l2): 0.0 for an empty leaf.
+            val = sum_d1 / (sum_w + scaled_l2) if sum_w > 0.0 else 0.0
+        else:
+            # newton_leaf_delta(Σder1, Σ(der2·weight), scaled_l2) — single closed-form
+            # step; denom == 0 (empty leaf, no L2) guards to 0.0 like cb-compute.
+            denom = -sum_d2 + scaled_l2
+            val = sum_d1 / denom if denom != 0.0 else 0.0
+        leaf_values.append(float(val))
+        per_leaf.append(dict(sum_der1=sum_d1, sum_weight=sum_w, sum_der2=sum_d2))
+
+    return dict(
+        loss=loss,
+        depth=int(depth),
+        n_leaves=int(n_leaves),
+        scaled_l2=float(scaled_l2),
+        splits=splits,
+        leaf_values=leaf_values,
+        per_leaf=per_leaf,
+        leaf_of=leaf_of.astype(np.int64).tolist(),
+        der1=der1.tolist(),
+        weight=weights.tolist(),
+        weighted_der2=weighted_der2.tolist(),
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Fixture emission + commit-discipline manifest
 # --------------------------------------------------------------------------------------
@@ -381,14 +556,58 @@ def write_fixtures(out_dir):
         json.dump(depth1, fh, indent=2, sort_keys=True)
     files["expected_depth1_tree.json"] = None
 
+    # Depth-6 tree references (RMSE calc_average leaves + Logloss single-step Newton
+    # leaves), D-03. `config` pins A1 (leaf_estimation_iterations == 1) and A2
+    # (score_function / channel-0 = Σweight) so a device drift surfaces as a mismatch.
+    depth6 = dict(
+        config=dict(
+            correctness_config=cfg,
+            leaf_estimation_iterations=LEAF_ESTIMATION_ITERATIONS,
+            score_function=DEPTH6_SCORE_FUNCTION,
+            score_channel0=DEPTH6_SCORE_CHANNEL0,
+            l2_leaf_reg=DEPTH1_L2,
+            learning_rate=DEPTH1_LEARNING_RATE,
+            depth=DEPTH6,
+            n_bins=CINDEX_N_BINS,
+            seed=cfg["seed"],
+            leaf_values_are_raw_deltas=True,
+            note=(
+                "leaf_values are RAW pre-learning-rate deltas (direct calc_average / "
+                "newton_leaf_delta output); the boosting loop multiplies by "
+                "learning_rate. A1: single closed-form Newton step (iterations==1). "
+                "A2: split score uses the Cosine fn with channel-0 == Σweight; the "
+                "Logloss Newton hessian (Σder2·weight) enters ONLY the leaf value."
+            ),
+        ),
+        rmse=serial_depth6_tree(X, y_reg, weights, "rmse", borders),
+        logloss=serial_depth6_tree(X, y_bin, weights, "logloss", borders),
+    )
+    depth6_path = os.path.join(out_dir, "expected_depth6_tree.json")
+    with open(depth6_path, "w") as fh:
+        json.dump(depth6, fh, indent=2, sort_keys=True)
+    files["expected_depth6_tree.json"] = None
+
+    # Large-n depth-6 SPEED workload from the SAME seeded generator (D-03): correctness
+    # fixture and speed workload from one source. Committed as a reproducible seed
+    # artifact; the FULL ~1e6x50 run is regenerated on the fly from SPEED_CONFIG (never
+    # committed). Only the design matrix X is needed for wall-clock timing.
+    sp = DEPTH6_SPEED_CONFIG
+    X_speed, _ = generate(sp["n_rows"], sp["n_features"], sp["seed"])
+    _save("X_depth6_speed.npy", X_speed)
+
     # Manifest: shapes/seeds + sha256 of every committed fixture (commit-discipline gate).
     manifest = dict(
         generator="bench/generator.py",
         correctness_config=cfg,
         speed_config=SPEED_CONFIG,
+        depth6_speed_config=DEPTH6_SPEED_CONFIG,
         cindex_n_bins=CINDEX_N_BINS,
         depth1_l2=DEPTH1_L2,
         depth1_learning_rate=DEPTH1_LEARNING_RATE,
+        depth6=DEPTH6,
+        leaf_estimation_iterations=LEAF_ESTIMATION_ITERATIONS,
+        depth6_score_function=DEPTH6_SCORE_FUNCTION,
+        depth6_score_channel0=DEPTH6_SCORE_CHANNEL0,
         note=(
             "Only small-n correctness fixtures are committed; the large-n speed "
             "workload is regenerated from speed_config on the fly. A changed sha256 "
@@ -427,11 +646,20 @@ def _main():
             raise SystemExit(1)
         print(f"OK -- {len(fresh['sha256'])} fixtures reproduce bit-for-bit")
     else:
-        # Smoke: prove determinism (same seed -> same bytes).
+        # No-arg default: prove determinism (same seed -> same bytes), then emit the
+        # committed fixtures into the sibling `fixtures/` dir so a bare
+        # `python generator.py` (run from `bench/`) reproduces every fixture — the
+        # invocation Plan 11-01's verify uses. Explicit `--write DIR` / `--check DIR`
+        # remain for out-of-tree emission and the commit-discipline sha diff.
         X1, y1 = generate(**CORRECTNESS_CONFIG)
         X2, y2 = generate(**CORRECTNESS_CONFIG)
         assert (X1.tobytes() == X2.tobytes()) and (y1.tobytes() == y2.tobytes())
-        print("generator.py deterministic OK; run with --write DIR to emit fixtures")
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        manifest = write_fixtures(default_dir)
+        print(
+            f"generator.py deterministic OK; wrote {len(manifest['sha256'])} fixtures "
+            f"to {default_dir}"
+        )
 
 
 if __name__ == "__main__":
