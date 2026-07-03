@@ -625,6 +625,9 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
     der1: &Array<F>,
     weight: &Array<F>,
     cindex: &Array<u32>,
+    offsets: &Array<u32>,
+    shifts: &Array<u32>,
+    masks: &Array<u32>,
     indices: &Array<u32>,
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
@@ -654,7 +657,8 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
         // Bounds guard (T-7.1-01); `indices` is length n, indexed directly like the
         // elementwise kernels (`approx[ABSOLUTE_POS]`). The bin/object VALUES are `u32`
         // (from the `&Array<u32>` inputs); cast them to `usize` for the index math.
-        let obj = indices[i] as usize;
+        let obj_u = indices[i];
+        let obj = obj_u as usize;
         let d = der1[obj];
         let w = weight[obj];
 
@@ -662,15 +666,14 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
         // channels into the global histogram at the FROZEN interleaved index.
         let mut feature = 0usize;
         while feature < n_features_usize {
-            // The non-binary bin is read RAW — intentionally NOT masked (WR-01). Masking
-            // an up-to-8-bit value to 8 bits is a no-op, so it cannot be the kernel's
-            // safety net; instead this family relies on the host-side range guard in
-            // `launch_pointwise_hist2_into` (CR-01), which rejects any `cindex` value
-            // >= n_bins BEFORE launch. The half-byte/binary kernels mask (`& 15`/`& 1`)
-            // because their nibble/bit decomposition makes the mask structurally
-            // meaningful; here it would not be. The divergence is deliberate, not an
-            // oversight.
-            let bin = cindex[feature * n + obj] as usize;
+            // GPUT-15: the bin is read through the ONE `read_bin` accessor over the
+            // bit-packed grouped cindex (`(cindex[offset + obj] >> shift) & mask`), NEVER
+            // the old plain `cindex[feature * n + obj]` load (T-10-15). `masks[feature]`
+            // is this feature's exact field width, so the extracted value already carries
+            // no high bits — the former RAW non-binary read (masking was a no-op there,
+            // WR-01) is preserved bit-for-bit; the host range guard in
+            // `launch_pointwise_hist2_into` (CR-01) still rejects any bin >= n_bins.
+            let bin = read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature]) as usize;
             let cell = (feature * n_bins + bin) * 2usize;
             // channel 0 = Σ der1, channel 1 = Σ weight (in-kernel atomic, D-03).
             bin_sums[cell].fetch_add(d);
@@ -761,6 +764,9 @@ pub fn pointwise_hist2_half_byte_kernel<F: Float>(
     der1: &Array<F>,
     weight: &Array<F>,
     cindex: &Array<u32>,
+    offsets: &Array<u32>,
+    shifts: &Array<u32>,
+    masks: &Array<u32>,
     indices: &Array<u32>,
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
@@ -769,9 +775,6 @@ pub fn pointwise_hist2_half_byte_kernel<F: Float>(
     // value): the structural mark of the half-byte family (`TPointHistHalfByte` is a
     // 16-entry working histogram). Held `usize` for the (feature, bin) index math.
     let n_bins = comptime!(HALF_BYTE_BINS);
-    // 4-bit nibble mask (upstream `& 15` half-byte bin select). Applied to the raw
-    // `cindex` `u32` value before the `usize` index cast.
-    let nibble_mask = comptime!((HALF_BYTE_BINS as u32) - 1u32);
 
     let n = indices.len();
     let n_features_usize = n_features as usize;
@@ -781,15 +784,18 @@ pub fn pointwise_hist2_half_byte_kernel<F: Float>(
     let stride = CUBE_COUNT * (CUBE_DIM as usize);
     let mut i = ABSOLUTE_POS;
     while i < n {
-        let obj = indices[i] as usize;
+        let obj_u = indices[i];
+        let obj = obj_u as usize;
         let d = der1[obj];
         let w = weight[obj];
 
         let mut feature = 0usize;
         while feature < n_features_usize {
-            // Half-byte 4-bit nibble select (upstream `(bins >> ...) & 15`): mask the
-            // quantized bin to its 4 bits, routing it to one of the 16 half-byte bins.
-            let bin = (cindex[feature * n + obj] & nibble_mask) as usize;
+            // GPUT-15: read the 4-bit half-byte bin through the ONE `read_bin` accessor
+            // over the bit-packed cindex (T-10-15). `masks[feature]` is the feature's
+            // 4-bit field mask (== the former `& 15` nibble select), so the extracted
+            // value is identical to the old `(cindex[feature*n+obj] & 15)` load.
+            let bin = read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature]) as usize;
             let cell = (feature * n_bins + bin) * 2usize;
             // channel 0 = Σ der1, channel 1 = Σ weight (in-kernel atomic merge, D-03)
             // into the FROZEN binSums layout (byte-identical to the non-binary seam).
@@ -883,6 +889,9 @@ pub fn pointwise_hist2_binary_kernel<F: Float>(
     der1: &Array<F>,
     weight: &Array<F>,
     cindex: &Array<u32>,
+    offsets: &Array<u32>,
+    shifts: &Array<u32>,
+    masks: &Array<u32>,
     indices: &Array<u32>,
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
@@ -891,9 +900,6 @@ pub fn pointwise_hist2_binary_kernel<F: Float>(
     // NOR the half-byte's 16): the structural mark of the binary family. Held `usize` for
     // the (feature, bin) index math.
     let n_bins = comptime!(BINARY_BINS);
-    // 1-bit split mask (upstream's binary split bit select). Applied to the raw `cindex`
-    // `u32` value before the `usize` index cast.
-    let bit_mask = comptime!((BINARY_BINS as u32) - 1u32);
 
     let n = indices.len();
     let n_features_usize = n_features as usize;
@@ -903,15 +909,18 @@ pub fn pointwise_hist2_binary_kernel<F: Float>(
     let stride = CUBE_COUNT * (CUBE_DIM as usize);
     let mut i = ABSOLUTE_POS;
     while i < n {
-        let obj = indices[i] as usize;
+        let obj_u = indices[i];
+        let obj = obj_u as usize;
         let d = der1[obj];
         let w = weight[obj];
 
         let mut feature = 0usize;
         while feature < n_features_usize {
-            // Binary 1-bit split select (upstream's split bit): mask the quantized bin to
-            // its low bit, routing it to one of the 2 binary bins.
-            let bin = (cindex[feature * n + obj] & bit_mask) as usize;
+            // GPUT-15: read the 1-bit binary bin through the ONE `read_bin` accessor over
+            // the bit-packed cindex (T-10-15). `masks[feature]` is the feature's 1-bit
+            // field mask (== the former `& 1` split-bit select), so the extracted value
+            // is identical to the old `(cindex[feature*n+obj] & 1)` load.
+            let bin = read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature]) as usize;
             let cell = (feature * n_bins + bin) * 2usize;
             // channel 0 = Σ der1, channel 1 = Σ weight (in-kernel atomic merge, D-03)
             // into the FROZEN binSums layout (byte-identical to the non-binary/half-byte
@@ -3401,7 +3410,9 @@ pub fn partition_split_kernel<F: Float>(
     indices: &Array<u32>,
     leaf_of: &Array<u32>,
     new_leaf_of: &mut Array<u32>,
-    feature: u32,
+    offset: u32,
+    shift: u32,
+    mask: u32,
     bin: u32,
     level_bit: u32,
 ) {
@@ -3417,13 +3428,16 @@ pub fn partition_split_kernel<F: Float>(
     let stride = CUBE_COUNT * (CUBE_DIM as usize);
     let mut i = ABSOLUTE_POS;
     while i < n {
-        let obj = indices[i] as usize;
-        // The feature-major cindex stride is `feature * n + obj` (n == indices.len()):
-        // the SAME layout the histogram fill reads.
-        let cell = (feature as usize) * n + obj;
+        let obj_u = indices[i];
+        let obj = obj_u as usize;
         let mut new_leaf = leaf_of[obj];
-        // Forward-bit: object passes (gets bit `level_bit`) iff its bin > the border.
-        if cindex[cell] > bin {
+        // GPUT-15: the split bin is read through the ONE `read_bin` accessor (T-10-15),
+        // NEVER the old plain `cindex[feature * n + obj]` load. The split feature's
+        // plain feature-major layout is read_bin's DEGENERATE `TCFeature` addressing —
+        // the host passes `offset = feature * n, shift = 0, mask = 0xFFFF_FFFF`, so this
+        // is exactly the former `cindex[feature * n + obj]` value, routed through the
+        // single accessor. Forward-bit: object passes (gets bit `level_bit`) iff bin > border.
+        if read_bin(cindex, offset, obj_u, shift, mask) > bin {
             new_leaf = new_leaf | (1u32 << level_bit);
         }
         new_leaf_of[obj] = new_leaf;

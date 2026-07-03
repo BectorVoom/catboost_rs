@@ -598,6 +598,20 @@ fn launch_pointwise_hist2_into(
         return Ok(client.empty(0));
     }
 
+    // GPUT-15: build the bit-packed grouped cindex + per-feature TCFeature table
+    // (Offset/Shift/Mask) and upload THAT instead of the plain feature-major layout. Every
+    // fill kernel reads bins through the ONE `read_bin` accessor over the packed words
+    // (`(cindex[offset + obj] >> shift) & mask`), NEVER the old plain
+    // `cindex[feature * n + obj]` load (T-10-15). The bin VALUE is unchanged (the
+    // bin->border join is identical); only its storage/extraction changes. Host-pack-then-
+    // upload-once (Open Q1 / A2 — see `gpu_runtime::cindex`). All features in this fill
+    // share the same `n_bins` bucket count; the cindex value-range guard above already
+    // rejected any bin >= n_bins, so `pack_cindex` masks each field without truncation.
+    let n_buckets_per_feature = vec![n_bins; n_features];
+    let packed = crate::gpu_runtime::cindex::pack_cindex(cindex, &n_buckets_per_feature, n)?;
+    let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+    let num_words = packed.words.len();
+
     // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in
     // every fill kernel handles any surplus via the total-thread-count stride). Shared
     // by the half-byte branch below and the non-binary branch (IN-02 — one geometry).
@@ -625,8 +639,18 @@ fn launch_pointwise_hist2_into(
     macro_rules! launch_hist2_family {
         ($kernel:ident $(, $extra:expr )* $(,)?) => {{
             let bin_sums_len = hist2_binsums_len(n_bins, n_features);
+            // GPUT-15: upload the bit-packed grouped cindex `words` + the per-feature
+            // (offsets, shifts, masks) TCFeature arrays the `read_bin` accessor addresses
+            // (NOT the plain `cindex.to_vec()`). Channel-independent, so created once
+            // outside the f32/f64 split.
             let cindex_handle =
-                client.create(cubecl::bytes::Bytes::from_elems(cindex.to_vec()));
+                client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
+            let offsets_handle =
+                client.create(cubecl::bytes::Bytes::from_elems(offsets_v.clone()));
+            let shifts_handle =
+                client.create(cubecl::bytes::Bytes::from_elems(shifts_v.clone()));
+            let masks_handle =
+                client.create(cubecl::bytes::Bytes::from_elems(masks_v.clone()));
             let indices_handle =
                 client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
 
@@ -643,7 +667,10 @@ fn launch_pointwise_hist2_into(
                     dim,
                     unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
                     unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                    unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+                    unsafe { ArrayArg::from_raw_parts(cindex_handle, num_words) },
+                    unsafe { ArrayArg::from_raw_parts(offsets_handle, n_features) },
+                    unsafe { ArrayArg::from_raw_parts(shifts_handle, n_features) },
+                    unsafe { ArrayArg::from_raw_parts(masks_handle, n_features) },
                     unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
                     unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                     n_features as u32,
@@ -663,7 +690,10 @@ fn launch_pointwise_hist2_into(
                     dim,
                     unsafe { ArrayArg::from_raw_parts(der1_handle, n) },
                     unsafe { ArrayArg::from_raw_parts(weight_handle, n) },
-                    unsafe { ArrayArg::from_raw_parts(cindex_handle, cindex_stride) },
+                    unsafe { ArrayArg::from_raw_parts(cindex_handle, num_words) },
+                    unsafe { ArrayArg::from_raw_parts(offsets_handle, n_features) },
+                    unsafe { ArrayArg::from_raw_parts(shifts_handle, n_features) },
+                    unsafe { ArrayArg::from_raw_parts(masks_handle, n_features) },
                     unsafe { ArrayArg::from_raw_parts(indices_handle, n) },
                     unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                     n_features as u32,
@@ -1423,6 +1453,25 @@ pub(crate) fn launch_partition_split_into(
     // strides; idle lanes write nothing, but every object is covered by the grid-stride).
     let new_leaf_of = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
 
+    // GPUT-15: the kernel reads the split bin through the ONE `read_bin` accessor
+    // (T-10-15). The split feature's plain feature-major cindex is read_bin's DEGENERATE
+    // `TCFeature`: `offset = feature * n` (word base), `shift = 0`, `mask = 0xFFFF_FFFF`
+    // — so the read is byte-identical to the former `cindex[feature * n + obj]` load,
+    // routed through the single accessor. Guard the offset against the u32 device index
+    // range (T-10-16); `feature * n <= cindex_stride`, already validated by the caller.
+    let split_offset_usize = (feature as usize).checked_mul(n).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "partition split: feature ({feature}) * n ({n}) overflows usize"
+        ))
+    })?;
+    let split_offset = u32::try_from(split_offset_usize).map_err(|_| {
+        CbError::OutOfRange(format!(
+            "partition split: cindex offset {split_offset_usize} exceeds u32 device index range"
+        ))
+    })?;
+    let split_shift = 0u32;
+    let split_mask = u32::MAX;
+
     #[cfg(feature = "wgpu")]
     partition_split_kernel::launch::<f32, SelectedRuntime>(
         client,
@@ -1433,7 +1482,9 @@ pub(crate) fn launch_partition_split_into(
         unsafe { ArrayArg::from_raw_parts(indices, n) },
         unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
         unsafe { ArrayArg::from_raw_parts(new_leaf_of.clone(), n) },
-        feature,
+        split_offset,
+        split_shift,
+        split_mask,
         bin,
         level_bit,
     );
@@ -1448,7 +1499,9 @@ pub(crate) fn launch_partition_split_into(
         unsafe { ArrayArg::from_raw_parts(indices, n) },
         unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
         unsafe { ArrayArg::from_raw_parts(new_leaf_of.clone(), n) },
-        feature,
+        split_offset,
+        split_shift,
+        split_mask,
         bin,
         level_bit,
     );

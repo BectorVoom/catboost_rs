@@ -52,6 +52,7 @@ use cubecl::prelude::*;
 
 use cb_core::sum_f64;
 
+use crate::gpu_runtime::cindex::{pack_cindex, read_bin_host};
 use crate::gpu_runtime::{launch_pointwise_hist2, launch_pointwise_hist2_handle, AtomicFinalizePath};
 
 /// The asserted run-stable divergence bound for the device histogram channel. The
@@ -111,17 +112,27 @@ fn host_reference_hist2(
     n_features: usize,
 ) -> Vec<f64> {
     let n = der1.len();
+    // GPUT-15: extract each bin through the SAME shift-mask the device fill now uses —
+    // pack the plain feature-major cindex into the bit-packed grouped layout and read via
+    // `read_bin_host` (the host replica of the `read_bin` accessor). The extracted bin
+    // VALUE is identical to the old plain `cindex[feature * n + obj]` load (the packing
+    // identity is proven bit-exact by the independent `kernels::cindex` oracle), so this
+    // reference stays the ordered ground truth while agreeing cell-for-cell with the
+    // packed device path.
+    let n_buckets = vec![n_bins; n_features];
+    let packed = pack_cindex(cindex, &n_buckets, n).unwrap();
     // Gather each (feature, bin) cell's per-object contributions in ascending object
     // order, then fold through the ordered primitive (the reduce_leaf_stats shape).
     let mut delta_members: Vec<Vec<f64>> = vec![Vec::new(); n_features * n_bins];
     let mut weight_members: Vec<Vec<f64>> = vec![Vec::new(); n_features * n_bins];
 
     for feature in 0..n_features {
+        let tcf = packed.features[feature];
         // Visit objects in the `indices` order (ascending object-visiting order),
         // exactly as the device kernel walks them.
         for &obj in indices.iter() {
             let obj = obj as usize;
-            let bin = cindex[feature * n + obj] as usize;
+            let bin = read_bin_host(&packed.words, tcf.offset, obj, tcf.shift, tcf.mask) as usize;
             // WR-02: the reference indexes `delta_members[feature * n_bins + bin]` RAW,
             // so it REQUIRES every bin to be in `0..n_bins` (the host-side range guard in
             // `launch_pointwise_hist2_into` enforces the same invariant for the kernels).

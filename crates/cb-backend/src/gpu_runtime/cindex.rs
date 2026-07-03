@@ -76,9 +76,6 @@ pub(crate) struct TCFeature {
 /// The packed cindex: the grouped bit-packed `words` + the per-feature [`TCFeature`]
 /// table. `words` has length `num_groups * n` (one word per object per group);
 /// `features` has length `n_features`.
-// `#[allow(dead_code)]` until 10-06 Task 2 wires the histogram production consumer (this
-// plan's next commit); consumed by the `kernels::cindex` oracle now.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct PackedCindex {
     /// The grouped bit-packed words (feature groups share words; `read_bin`-addressed).
@@ -92,7 +89,6 @@ impl PackedCindex {
     /// [`crate::kernels::read_bin`]. `TCFeature.offset` is checked-cast to `u32` (the
     /// device array index type); an offset that overflows `u32` surfaces
     /// [`CbError::OutOfRange`] (T-10-16 — no unguarded index reaches the device).
-    #[allow(dead_code)] // until 10-06 Task 2 wires the histogram production consumer.
     pub fn device_arrays(&self) -> CbResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
         let mut offsets = Vec::with_capacity(self.features.len());
         let mut shifts = Vec::with_capacity(self.features.len());
@@ -117,7 +113,6 @@ impl PackedCindex {
 /// takes a value in `0..n_buckets`); a single-bucket feature still needs one bit so the
 /// packing geometry is well-defined. Overflow-guarded (T-10-16): a feature needing more
 /// than 32 bits cannot share a 32-bit word and surfaces [`CbError::OutOfRange`].
-#[allow(dead_code)] // reachable from production once 10-06 Task 2 wires pack_cindex.
 pub(crate) fn feature_bits(n_buckets: usize) -> CbResult<u32> {
     if n_buckets <= 1 {
         return Ok(1);
@@ -155,7 +150,6 @@ pub(crate) fn read_bin_host(words: &[u32], offset: u64, obj: usize, shift: u32, 
 /// (T-10-16); `bins.len() != n_features * n` → [`CbError::LengthMismatch`]. An out-of-range
 /// bin (`>= n_buckets[feature]`) surfaces [`CbError::OutOfRange`] BEFORE it is masked into
 /// a word (so a malformed bin can never silently truncate into another feature's field).
-#[allow(dead_code)] // until 10-06 Task 2 wires the histogram production consumer.
 pub(crate) fn pack_cindex(
     bins: &[u32],
     n_buckets: &[usize],
