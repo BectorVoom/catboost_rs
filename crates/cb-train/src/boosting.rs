@@ -2941,7 +2941,13 @@ fn train_inner<R: Runtime>(
         // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must
         // fall back to the CPU grower (D-04) rather than train against a wrong
         // (zero) starting point. `bias` is the computed `starting_approx` above.
-        && bias == 0.0;
+        && bias == 0.0
+        // CR-02: the device grower always computes leaf values via
+        // `calc_average` (the Gradient/Simple formula); it has no Newton arm.
+        // For RMSE Gradient==Newton coincide, but for Logloss/CrossEntropy the
+        // Newton formula diverges, so only Gradient/Simple are device-eligible.
+        // A Newton request on a device-covered loss falls back to the CPU grower.
+        && matches!(params.leaf_method, LeafMethod::Gradient | LeafMethod::Simple);
 
     // The leaf-regularization is constant across the fit for the device-eligible
     // config (fixed weights / n, no per-tree sampling), so it is computed ONCE and
