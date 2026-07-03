@@ -894,6 +894,40 @@ pub struct Derivatives {
 /// this by launching its `#[cube]` kernels and returning UN-reduced per-object
 /// buffers; the host (`cb-compute`/`cb-train`) finalizes every parity-critical
 /// SUM via `cb_core::sum_f64`.
+/// A host-typed, CubeCL-free description of a single tree grown entirely on the
+/// device (GPUT-01). This is the ONLY structure that crosses the
+/// [`Runtime::grow_tree_on_device`] seam back to cb-train; it deliberately holds
+/// only plain host types so the `Runtime` trait — and therefore cb-train — never
+/// gains a `cubecl`/`cb-backend` dependency via feature unification (T-10-04).
+///
+/// # Fields
+/// - `splits`: the per-level chosen oblivious split as `(feature_index, bin_id)`.
+///   The pass test the caller applies is `quantized_bin[feature] > bin_id`, and
+///   the caller resolves the concrete threshold with
+///   `border = feature_borders[feature][bin_id]` (see
+///   `cb_train::tree::FeatureMatrix`). Length equals the tree depth.
+/// - `leaf_values`: the per-leaf values in leaf-index order, length `2^depth`.
+///   These are **UN-scaled** by `learning_rate`; cb-train applies the shrinkage
+///   downstream so the device path matches the CPU leaf-update contract.
+/// - `leaf_of`: the per-object leaf index. In the production hot path this is
+///   **empty** (length 0) so the `n`-length buffer never crosses the seam per
+///   tree (D-05); it is populated to length `n` ONLY for the oracle structure
+///   check that compares device vs. CPU leaf assignment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceGrownTree {
+    /// Per-level chosen split as `(feature_index, bin_id)`; length = tree depth.
+    /// Pass test: `quantized_bin[feature] > bin_id`. The caller resolves the
+    /// border via `feature_borders[feature][bin_id]`.
+    pub splits: Vec<(u32, u32)>,
+    /// Per-leaf values in leaf-index order, length `2^depth`. UN-scaled by
+    /// `learning_rate` (cb-train applies the shrinkage).
+    pub leaf_values: Vec<f64>,
+    /// Per-object leaf index. EMPTY (length 0) in the production hot path so the
+    /// `n`-length buffer never crosses the seam per tree (D-05); length `n` only
+    /// for the oracle structure check.
+    pub leaf_of: Vec<u32>,
+}
+
 pub trait Runtime {
     /// Compute the per-object derivatives for `loss` from the raw approximants
     /// and targets, returning them UN-reduced in object order (D-02).
@@ -951,5 +985,95 @@ pub trait Runtime {
         random_seed: u64,
     ) -> CbResult<Vec<Derivatives>> {
         crate::ranking_der::calc_ders_for_queries(loss, approx, target, weights, groups, random_seed)
+    }
+
+    /// Begin a device-resident training session (GPUT-01). Uploads the
+    /// once-per-fit, tree-invariant state — the bins-feature-major quantized
+    /// design matrix (the cindex), per-object `weight`, and the scalar training
+    /// hyperparameters — to the device so [`Self::grow_tree_on_device`] can grow
+    /// each tree without re-crossing the seam with `n`-length buffers (D-05).
+    ///
+    /// `bins_feature_major` is the feature-major flat quantized matrix
+    /// (`bins_feature_major[f * n + i]`); `score_function` selects the split-score
+    /// calcer (GPUT-08; catboost's CPU default is [`EScoreFunction::Cosine`]).
+    /// `scaled_l2` is the leaf-regularization already folded to the device's
+    /// scale. `boosting_type_is_plain` distinguishes Plain from Ordered.
+    ///
+    /// Returns `Ok(true)` when the backend accepted the session and will grow
+    /// trees on the device; `Ok(false)` (the DEFAULT) means the backend declines
+    /// and the caller must use the CPU path (D-04). The default implementation
+    /// binds every parameter and returns `Ok(false)` so every existing
+    /// `Runtime` impl inherits the transparent CPU fallback unchanged.
+    ///
+    /// # Errors
+    /// Returns a [`cb_core::CbError`] if a backend override fails to allocate or
+    /// upload the session state. The default implementation never errors.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_device_training(
+        &self,
+        loss: &Loss,
+        depth: usize,
+        boosting_type_is_plain: bool,
+        fold_count: usize,
+        score_function: EScoreFunction,
+        bins_feature_major: &[u32],
+        weight: &[f64],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+    ) -> CbResult<bool> {
+        let _ = (
+            loss,
+            depth,
+            boosting_type_is_plain,
+            fold_count,
+            score_function,
+            bins_feature_major,
+            weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+        );
+        Ok(false)
+    }
+
+    /// Grow one oblivious tree on the device from the current `approx` and
+    /// `target`, using the session state uploaded by
+    /// [`Self::begin_device_training`] (GPUT-01). The only `n`-length buffers
+    /// that cross the seam are `approx`/`target` in and — behind the oracle flag —
+    /// `DeviceGrownTree::leaf_of` out; the hot path keeps `leaf_of` empty (D-05).
+    ///
+    /// Returns `Ok(Some(tree))` with the host-typed [`DeviceGrownTree`] when the
+    /// backend grew the tree, or `Ok(None)` (the DEFAULT) to signal the caller to
+    /// fall back to the CPU grow loop (D-04 / the oracle safety net T-10-05 —
+    /// never a fabricated device result). The default implementation binds its
+    /// parameters and returns `Ok(None)`.
+    ///
+    /// # Errors
+    /// Returns a [`cb_core::CbError`] if a backend override fails mid-grow. The
+    /// default implementation never errors.
+    fn grow_tree_on_device(
+        &self,
+        approx: &[f64],
+        target: &[f64],
+    ) -> CbResult<Option<DeviceGrownTree>> {
+        let _ = (approx, target);
+        Ok(None)
+    }
+
+    /// End the device training session opened by
+    /// [`Self::begin_device_training`], releasing the device-resident session
+    /// state (GPUT-01). The default implementation is a no-op returning `Ok(())`
+    /// so backends that never opened a session (the CPU fallback) are unaffected.
+    ///
+    /// # Errors
+    /// Returns a [`cb_core::CbError`] if a backend override fails to release
+    /// device resources. The default implementation never errors.
+    fn end_device_training(&self) -> CbResult<()> {
+        Ok(())
     }
 }
