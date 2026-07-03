@@ -2612,6 +2612,64 @@ pub fn unpack_bins_kernel<F: Float>(
 }
 
 // ===========================================================================
+// Plan 10-06 (GPUT-15): the bit-packed compressed index (cindex) accessor. `read_bin`
+// is the ONE accessor every histogram/partition consumer routes through — it replaces
+// the plain one-u32-per-cell `cindex[feature * n + obj]` load with the grouped
+// bit-packed extraction `(cindex[Offset + obj] >> Shift) & Mask` addressed by a
+// per-feature `TCFeature` descriptor (built host-side in `gpu_runtime::cindex`, upstream
+// `TCFeature` / `binarize.cu` `WriteCompressedIndex`, CATBOOST_CUDA_KERNELS_DESIGN
+// §2/§6.6a). The bin VALUE is identical to the plain layout; only its STORAGE/EXTRACTION
+// changes (the bin->border join is unchanged, T-10-15). The bit geometry mirrors
+// [`unpack_bins_kernel`]'s `(word >> shift) & mask`. No `-inf` literal (T-10-17); the
+// `<F: Float>` phantom keeps the materialize launch signature uniform.
+// ===========================================================================
+
+/// The ONE bit-packed cindex bin accessor (GPUT-15): extract object `obj`'s quantized
+/// bin for a feature whose packed field lives at word `offset + obj`, bit-`shift`,
+/// width-`mask` — `(cindex[offset + obj] >> shift) & mask`. This is the SINGLE
+/// expression every histogram/partition consumer routes through (T-10-15): the
+/// plain-layout `cindex[feature * n + obj]` load is the DEGENERATE case
+/// `offset = feature * n, shift = 0, mask = 0xFFFF_FFFF`. Pure `u32` straight-line
+/// device helper (`#[cube]`, inlined at JIT — mirrors [`unpack_bins_kernel`]).
+#[cube]
+pub(crate) fn read_bin(cindex: &Array<u32>, offset: u32, obj: u32, shift: u32, mask: u32) -> u32 {
+    let word = cindex[(offset + obj) as usize];
+    (word >> shift) & mask
+}
+
+/// Materialize the FULL feature-major bin matrix from the bit-packed cindex by reading
+/// every `(feature, obj)` cell through [`read_bin`] — the device exerciser the
+/// `kernels::cindex` bit-exact oracle launches (it asserts the materialized bins equal
+/// the CPU quantized bins, integer-exact). `out` is length `n_features * n`
+/// (feature-major, `out[feature * n + obj]`); `offsets`/`shifts`/`masks` are the
+/// per-feature `TCFeature` fields (length `n_features`). Grid-stride over the output
+/// cells (stride = total thread count `CUBE_COUNT * CUBE_DIM`, D-09); bounds-guarded
+/// (T-10-16); no `-inf` literal (T-10-17); `<F: Float>` phantom for launch-signature
+/// uniformity (`let _ = F::new(0.0)`). The host guards `n_features > 0` before launch so
+/// the `total / n_features` here never divides by zero.
+#[cube(launch)]
+pub fn read_all_bins_kernel<F: Float>(
+    cindex: &Array<u32>,
+    offsets: &Array<u32>,
+    shifts: &Array<u32>,
+    masks: &Array<u32>,
+    out: &mut Array<u32>,
+    n_features: u32,
+) {
+    let _ = F::new(0.0);
+    let total = out.len();
+    let n = total / (n_features as usize);
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut cell = ABSOLUTE_POS;
+    while cell < total {
+        let feature = cell / n;
+        let obj = cell % n;
+        out[cell] = read_bin(cindex, offsets[feature], obj as u32, shifts[feature], masks[feature]);
+        cell += stride;
+    }
+}
+
+// ===========================================================================
 // Plan 10-05 (GPUT-16): per-partition stat aggregation (`update_part_props`, upstream
 // `update_part_props.cu` `ComputeSum -> FastInBlockReduce -> SaveResults`,
 // CATBOOST_CUDA_KERNELS_DESIGN §6.1). Sums a stat channel (e.g. Σder1, Σweight) per
@@ -3749,6 +3807,18 @@ pub fn select_best_split_kernel<F: Float>(
 
 #[cfg(test)]
 mod gradient_gpu;
+
+// Bit-packed compressed index (cindex) bit-exact self-oracle (GPU-01 cindex slice,
+// Phase 10-06, GPUT-15): the host `gpu_runtime::cindex::pack_cindex` grouped packing +
+// the device `read_all_bins_kernel` (which reads every cell through the ONE
+// `kernels::read_bin` accessor) over `SelectedRuntime` must reproduce the CPU quantized
+// bins EXACTLY (integer equality, tighter than the ≤1e-4 float bar — D-07), across seeds,
+// mixed per-feature bit-widths, and multiple features sharing one word. Lives in
+// `kernels/cindex.rs`, mounted at `kernels::cindex`. Like `pointwise_hist`/`score_split`
+// it runs over the generic `SelectedRuntime` (the rocm in-env oracle on gfx1100 + the
+// wgpu host run + cuda/cpu compile).
+#[cfg(test)]
+mod cindex;
 
 // Device-resident 2-channel pointwise histogram self-oracle (GPU-01 histogram slice,
 // Phase 7.3): the GPU `pointwise_hist2` 8-bit non-binary fill over `SelectedRuntime`

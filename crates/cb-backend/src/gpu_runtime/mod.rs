@@ -390,6 +390,12 @@ pub use der_seams::*;
 mod pairwise; // Phase 7.4/7.5 pairwise histogram + scan/score + pairwise grow driver.
 pub use pairwise::*;
 
+// Phase 10-06 (GPUT-15): the bit-packed compressed index (cindex) builder — the
+// grouped `WriteCompressedIndex` layout + per-feature `TCFeature` table the histogram /
+// partition consumers read through the ONE `kernels::read_bin` accessor. `pub(crate)` so
+// the `kernels::cindex` bit-exact oracle can reach `pack_cindex`/`TCFeature`.
+pub(crate) mod cindex;
+
 // ===========================================================================
 // Phase 7.3 — the device-resident 2-channel pointwise histogram FILL seam
 // (GPU-01 histogram slice). The 8-bit non-binary `ComputeHist2NonBinary<8>` analog:
