@@ -1915,6 +1915,99 @@ where
     Ok(bytemuck::cast_slice::<u8, F>(&bytes).to_vec())
 }
 
+/// Flag-array SEGMENTED prefix scan (GPUT-16, Plan 10-01; upstream `segmented_scan.cu`
+/// `TSegmentedSum` pair-combiner). Each unit carries a `(value, flag)` pair where
+/// `flag = 1.0` marks a SEGMENT START; the running sum RESETS at each segment boundary
+/// so interior positions accumulate within their segment only. The `#[comptime]
+/// inclusive` flag selects inclusive (running total includes self) vs exclusive
+/// (segment start → `0`, otherwise sum of strictly-prior elements IN THE SEGMENT).
+///
+/// Structural parity: a shared-memory Hillis-Steele scan whose combine operator is the
+/// segmented pair-sum — `if flag[tid] == 0 { val[tid] += val[tid - s] }` and
+/// `flag[tid] |= flag[tid - s]`. Once a unit's accumulated flag is set, it stops
+/// absorbing left neighbours (the segment reset). Reads are snapshotted into registers
+/// before the barrier so the in-place shared update has no read/write hazard.
+///
+/// SCOPE (mirrors `block_scan_kernel` Open Q2): this performs the segmented scan WITHIN
+/// a single cube (`n <= SCAN_CUBE_DIM`). The cross-cube segmented carry (propagating a
+/// block's tail sum into the next block only until its first segment head) is the
+/// documented forward dependency — it reuses the SAME two-level pattern as [`full_scan`]
+/// plus a head-seen mask, and is NOT performed here (documented, not a silent cut).
+///
+/// Generic over `F: Float` (AGENTS.md generics-float). Every device access is under an
+/// `ABSOLUTE_POS < input.len()` bounds guard (T-10-01); no `-inf` literal (T-10-02); the
+/// `SharedMemory::new` SIZE is the comptime [`BLOCK_REDUCE_SHMEM`] const (Pitfall 3); the
+/// Hillis-Steele stride is bounded by `CUBE_DIM_X`, never a literal wave width (D-09).
+/// The `sflags` values are exactly `0.0`/`1.0` (assigned, never accumulated as floats),
+/// so the `== 0.0` / `> 0.0` segment tests are exact. if-as-STATEMENT only.
+#[cube(launch)]
+pub fn segmented_scan_kernel<F: Float>(
+    input: &Array<F>,
+    flags: &Array<F>,
+    output: &mut Array<F>,
+    #[comptime] inclusive: bool,
+) {
+    let tid = UNIT_POS;
+    let n = input.len();
+
+    // Load this unit's (value, flag), zero-padding idle out-of-range lanes (T-10-01).
+    let mut val = F::new(0.0);
+    let mut flag = F::new(0.0);
+    if ABSOLUTE_POS < n {
+        val = input[ABSOLUTE_POS];
+        flag = flags[ABSOLUTE_POS];
+    }
+
+    let mut svals = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    let mut sflags = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    svals[tid as usize] = val;
+    sflags[tid as usize] = flag;
+    sync_cube();
+
+    // Hillis-Steele segmented inclusive scan (TSegmentedSum). Stride bound = CUBE_DIM_X
+    // (the runtime cube width), never a literal.
+    let mut s = 1u32;
+    while s < CUBE_DIM_X {
+        // Snapshot the left neighbour into registers BEFORE any in-place write so the
+        // shared update below has no read/write hazard.
+        let mut nb_val = F::new(0.0);
+        let mut nb_flag = F::new(0.0);
+        let mut active = false;
+        if tid >= s {
+            nb_val = svals[(tid - s) as usize];
+            nb_flag = sflags[(tid - s) as usize];
+            active = true;
+        }
+        sync_cube();
+        if active {
+            // Absorb the neighbour only while no segment head has been reached yet.
+            if sflags[tid as usize] == F::new(0.0) {
+                svals[tid as usize] += nb_val;
+            }
+            // Propagate the head flag (logical OR over 0.0/1.0 values).
+            if nb_flag > F::new(0.0) {
+                sflags[tid as usize] = F::new(1.0);
+            }
+        }
+        sync_cube();
+        s *= 2u32;
+    }
+
+    let incl = svals[tid as usize];
+    let mut result = incl;
+    if !inclusive {
+        // Exclusive: subtract this lane's own value; a segment start resets to 0.
+        result = incl - val;
+        if flag > F::new(0.0) {
+            result = F::new(0.0);
+        }
+    }
+
+    if ABSOLUTE_POS < n {
+        output[ABSOLUTE_POS] = result;
+    }
+}
+
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
 // separation, CLAUDE.md / AGENTS.md — only a module declaration lives here, no
 // test body). Mounted at `kernels::gradient` so `cargo test kernels::gradient`
@@ -1939,6 +2032,14 @@ mod reduce;
 // builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod scan;
+
+// Flag-array segmented-scan primitive oracle (source/test separation, Plan 10-01
+// GPUT-16): the inclusive/exclusive segmented prefix-scan self-oracle vs an inline
+// serial segmented-prefix reference (D-02) lives in `kernels/segmented_scan.rs`,
+// mounted at `kernels::segmented_scan`. Runs over the generic `SelectedRuntime`, so it
+// builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
+#[cfg(test)]
+mod segmented_scan;
 
 // Histogram-scatter kernel tests (source/test separation): assertions live in
 // `kernels/scatter.rs`, mounted at `kernels::scatter`. Cpu-only for the same reason
