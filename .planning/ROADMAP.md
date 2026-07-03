@@ -67,7 +67,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   4. The `Runtime` grow-tree seam (`begin_device_training` / `grow_tree_on_device → CbResult<Option<DeviceGrownTree>>` / `end_device_training`, CubeCL-free host-typed) is reachable from `cb_train::train`; the quantized feature matrix uploads exactly once per `fit()`; gradients/approx stay device-resident across iterations; the per-tree `der1` host read-back is eliminated; only the O(1) BestSplit descriptor + `2^depth` partition statistics cross host↔device per level (GPUT-01/02/03, D-05).
   5. A reproducible **Kaggle CUDA harness (BENCH-01)** builds the `--features cuda` wheel and on a Kaggle CUDA notebook runs BOTH the correctness oracle (≤1e-5 depth-1, correctness as a blocking gate) AND a warm-run/JIT-excluded train-only **wall-clock speed** measurement (device vs host-CPU baseline, and vs official CatBoost GPU where a comparable config exists) — establishing the **standing per-phase speed check (BENCH-02)** discipline enforced from here to the last phase; an uncovered case (e.g. depth>1) returns `Ok(None)` and falls back to the byte-unchanged host CPU grower (D-04 no-regression), and the reduction-determinism strategy is spiked with a recommendation documented to feed Phase 11.
 
-**Plans**: 4/9 plans executed
+**Plans**: 5/9 plans executed
 **Wave 1**
 
 - [x] 10-01-PLAN.md — Scan primitives: cross-cube full scan + segmented scan (GPUT-16)
@@ -83,7 +83,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 10-05-PLAN.md — Bit-compression pack/unpack + update_part_props (GPUT-16)
+- [x] 10-05-PLAN.md — Bit-compression pack/unpack + update_part_props (GPUT-16)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -174,7 +174,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 4/9 | In Progress|  |
+| 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 5/9 | In Progress|  |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 0/TBD | Not started | - |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 0/TBD | Not started | - |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |
