@@ -141,7 +141,19 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   4. **Speed check (BENCH-02, standing):** each family (grow policies / Exact leaf / bootstrap / MVS / CTR) is timed on Kaggle CUDA **as it lands** — device path vs the host-CPU baseline, and vs official CatBoost GPU where a comparable config exists (warm-run/JIT-excluded, train-only) — so every family's kernels carry their own recorded CUDA speed measurement when they flip from `Ok(None)`→device, not deferred to Phase 14.
   5. Any sub-feature not yet passing Kaggle CUDA sign-off returns `Ok(None)`→CPU fallback (no incorrect device result), the CPU/host path stays byte-unchanged (GPUT-14/D-04), and the resulting GPU coverage matrix (correctness + per-family speed) is documented.
 
-**Plans**: TBD
+**Plans**: 9 plans
+
+Plans:
+- [ ] 12-01-PLAN.md — Device foundation: DeviceGrownTree non-sym fields + DeviceTrainConfig + session depth>1 relaxation (A3) (GPUT-18, Wave 1)
+- [ ] 12-02-PLAN.md — CPU Region path FIRST: grower + TreeVariant::Region + apply + json + validate_grow_policy lift + frozen ≤1e-5 oracle (GPUT-18, Wave 1)
+- [ ] 12-03-PLAN.md — W1 Depthwise/Lossguide device emission (nonsym_grow) + self-oracle + gate arm (GPUT-18, Wave 2)
+- [ ] 12-04-PLAN.md — W2b device Region path vs frozen CPU Region oracle + gate arm (GPUT-18, Wave 3)
+- [ ] 12-05-PLAN.md — W3 Exact weighted-quantile leaf + segmented-sort primitive (A1) + gate arm (GPUT-19, Wave 4)
+- [ ] 12-06-PLAN.md — W4 bootstrap + random-strength device RNG (pin-seed/freeze) + gate arm (GPUT-09, Wave 5)
+- [ ] 12-07-PLAN.md — W5 MVS per-block threshold + reweight (default GPU sampler) + gate arm (GPUT-17, Wave 6)
+- [ ] 12-08-PLAN.md — W6 CTR device port (ordered/one-hot/tensor) + CTR→cindex join + gate arm (GPUT-10, Wave 7)
+- [ ] 12-09-PLAN.md — Kaggle CUDA ε=1e-4 sign-off + per-family BENCH-02 + SC-5 coverage matrix (human-gated, Wave 8)
+
 **UI hint**: no
 **Notes**: Each family is independently shippable and deferrable — can be planned/executed as parallel sub-workstreams, or cut to a bootstrap + CTR MVP if Phase 11 runs long. Every per-family sign-off is a human-gated Kaggle CUDA oracle run (reusing the Phase-10 harness) AND a Kaggle CUDA speed measurement; the optional ROCm smoke build is a local convenience only. **BENCH-02's standing per-phase speed check applies here.** Research flags: CTR on device has the highest uncertainty (targeted read of `batch_binarized_ctr_calcer.h` + `ctrs/kernel/` before planning that sub-task); MVS threshold + reweight (§6.1 `mvs.{cu,cuh}`) and the Region/non-symmetric apply (§6.6c `models/kernel`) are the other high-uncertainty sub-tasks. Plans may sub-split this phase (e.g. 12.1 grow policies, 12.2 Exact leaf, 12.3 sampling+MVS, 12.4 CTR) given the kernel breadth. Landmine constraints unchanged.
 
@@ -183,7 +195,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 |-------|----------------|--------|-----------|
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
-| 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 0/TBD | Not started | - |
+| 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 0/9 | Planned | - |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
 
