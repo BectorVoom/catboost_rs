@@ -12,6 +12,18 @@
 //! the generic [`crate::SelectedRuntime`]. The authoritative Kaggle CUDA sign-off
 //! (bit-exact) is human-gated via 10-09; here the inline serial reference is the
 //! ground truth.
+//!
+//! # W3 segmentation audit (Phase 12 Plan 05, Open Q1 / Assumption A1 — RESOLVED)
+//!
+//! The Exact / MVS device paths need a per-SEGMENT (per-leaf-bin) sort. This file's
+//! `run_radix_sort` exposes only a WHOLE-BUFFER stable radix sort (keys+values, no
+//! segment awareness) — there is NO per-segment sort here. So the W3 audit ADDED the
+//! shared **segmented radix-sort primitive** (`segmented_radix_sort`) in the PRODUCTION
+//! module `kernels::exact_quantile`, which REUSES this exact radix machinery once per
+//! flag-delimited segment (mirroring the `segmented_scan.rs` head-flag geometry) — no
+//! second sort algorithm. It is consumed by Exact (Plan 05) and MVS (Plan 07). (The
+//! primitive lives in `exact_quantile.rs` rather than here because it must be callable
+//! from PRODUCTION session code, whereas this module is a `#[cfg(test)]` self-oracle.)
 
 use cubecl::prelude::*;
 

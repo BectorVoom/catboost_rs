@@ -2837,6 +2837,20 @@ mod segmented_scan;
 #[cfg(test)]
 mod sort;
 
+// Device Exact weighted-quantile leaf estimation (Phase 12 Plan 05, GPUT-19): the PRODUCTION
+// module hosting the shared segmented-radix-sort primitive (Open Q1 / A1 — reused by Exact +
+// MVS Plan 07) and `device_exact_leaf_delta` (the device twin of `leaf.rs::exact_leaf_delta`,
+// composed from the Phase-10 radix/scan kernels + the deterministic reduce; NO new `#[cube]`
+// body). Mounted under every backend (production, NOT `#[cfg(test)]`).
+pub(crate) mod exact_quantile;
+
+// Segmented radix-sort primitive self-oracle (source/test separation, Plan 05 Open Q1/A1):
+// the per-segment stable-sort / no-cross-segment-mixing assertions vs an inline serial
+// segmented stable sort (D-02) live in `kernels/segmented_sort_test.rs`, mounted at
+// `kernels::segmented_sort_test`. Runs over the generic `SelectedRuntime`.
+#[cfg(test)]
+mod segmented_sort_test;
+
 // TDataPartition {Offset,Size} update oracle (source/test separation, Plan 10-04
 // GPUT-16): the offset/size update self-oracle vs an inline serial partition-
 // bookkeeping reference (D-02), including an empty-partition case, lives in
