@@ -430,6 +430,14 @@ pub(crate) mod ranking;
 #[cfg(test)]
 mod ranking_det_test;
 
+// Phase 13 Plan 05 (GPUT-22, D-08): the STOCHASTIC ranking pair self-oracle (source/test
+// separation) — device YetiRank / PFound-F der vs the FROZEN pinned-seed CPU
+// `yetirank_sample_pairs` + `calc_ders_for_queries` reference at ε=1e-4, plus the per-query seed
+// chain + draw-count asserts (Pitfall 4 / T-13-10). rocm in-env on gfx1100 (numeric ε assertions
+// device-gated; cpu records-only, WR-01).
+#[cfg(test)]
+mod ranking_stoch_test;
+
 // Phase 10-07 (GPUT-02/03): the GpuTrainSession residency cross-oracle (source/test
 // separation) — begin uploads once, grow_one reuses the resident handles + chains der1 on
 // device, structure matches the CPU multi-tree boosting reference; the coverage gate
