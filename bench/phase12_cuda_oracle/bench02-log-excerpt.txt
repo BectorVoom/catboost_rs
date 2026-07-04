@@ -1,0 +1,2 @@
+|   0  Tesla P100-PCIE-16GB           Off |   00000000:00:04.0 Off |                    0 |
+BENCH_VERDICT: OK rows: 6

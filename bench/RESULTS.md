@@ -177,4 +177,16 @@ Verdict: **ALL-PASS — 31 device tests, 0 failed.** Provenance: `bench/phase12_
 Note: this also incidentally exercises the resident depth>1 grow path on CUDA (u64/f64
 atomics present), which the in-env ROCm runtime currently cannot run (Atomic<u64> regression).
 
-BENCH-02 speed (per family, train-only, warm, JIT-excluded): **NOT YET MEASURED — pending.**
+BENCH-02 speed (train-only, warm, JIT-excluded, depth=6 / 20 iters / 20 feat / 32 bins,
+device GpuBackend vs host-CPU boosting loop in one --features cuda binary):
+| family    | n       | device_s | cpu_s   | speedup |
+|-----------|---------|----------|---------|---------|
+| depthwise | 10,000  | 0.083    | 2.511   | 30.3x   |
+| depthwise | 100,000 | 0.746    | 29.842  | 40.0x   |
+| depthwise | 300,000 | 2.568    | 101.930 | 39.7x   |
+| region    | 10,000  | 0.101    | 3.178   | 31.3x   |
+| region    | 100,000 | 0.875    | 36.817  | 42.1x   |
+| region    | 300,000 | 2.872    | 113.303 | 39.5x   |
+Grow-loop device dominance 30-42x across n. Sub-op families (Exact/bootstrap/MVS/CTR)
+are device-resident within this same loop (no standalone train loop to isolate). Provenance:
+bench/phase12_cuda_oracle/bench02-result.json.

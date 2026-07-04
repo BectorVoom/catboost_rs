@@ -1,0 +1,72 @@
+{
+  "phase": 12,
+  "kind": "cuda-bench02-speed",
+  "runs": [
+    {
+      "family": "depthwise",
+      "n": 10000,
+      "device_s": 0.0828,
+      "cpu_s": 2.5109,
+      "speedup": "30.333",
+      "dev_trees": 20,
+      "cpu_trees": 20
+    },
+    {
+      "family": "depthwise",
+      "n": 100000,
+      "device_s": 0.7463,
+      "cpu_s": 29.8424,
+      "speedup": "39.987",
+      "dev_trees": 20,
+      "cpu_trees": 20
+    },
+    {
+      "family": "depthwise",
+      "n": 300000,
+      "device_s": 2.5678,
+      "cpu_s": 101.9296,
+      "speedup": "39.696",
+      "dev_trees": 20,
+      "cpu_trees": 20
+    },
+    {
+      "family": "region",
+      "n": 10000,
+      "device_s": 0.1014,
+      "cpu_s": 3.1776,
+      "speedup": "31.329",
+      "dev_trees": 20,
+      "cpu_trees": 20
+    },
+    {
+      "family": "region",
+      "n": 100000,
+      "device_s": 0.8749,
+      "cpu_s": 36.8173,
+      "speedup": "42.080",
+      "dev_trees": 20,
+      "cpu_trees": 20
+    },
+    {
+      "family": "region",
+      "n": 300000,
+      "device_s": 2.8719,
+      "cpu_s": 113.303,
+      "speedup": "39.452",
+      "dev_trees": 20,
+      "cpu_trees": 20
+    }
+  ],
+  "gpu": "Tesla P100-PCIE-16GB",
+  "nvcc": "release 12.8",
+  "exit": 0,
+  "secs": 1072.3,
+  "markers": [
+    "BENCH_DONE"
+  ],
+  "test_summary": [
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 296.69s"
+  ],
+  "tail": "ute v0.1.0 (/tmp/repo/crates/cb-compute)\n   Compiling cb-backend v0.1.0 (/tmp/repo/crates/cb-backend)\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow.rs:259:9\n    |\n259 |     let mut new_node = |nodes: &mut Vec<BuiltNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n    |\n    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow.rs:279:9\n    |\n279 |     let mut do_split = |nodes: &mut Vec<BuiltNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: function `draw_bootstrap_weights_host` is never used\n   --> crates/cb-backend/src/kernels/bootstrap_device.rs:459:15\n    |\n459 | pub(crate) fn draw_bootstrap_weights_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: function `device_score_stddev` is never used\n   --> crates/cb-backend/src/kernels/bootstrap_device.rs:502:15\n    |\n502 | pub(crate) fn device_score_stddev(scores: &[f64], random_strength: f64) -> f64 {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `draw_mvs_weights_host` is never used\n   --> crates/cb-backend/src/kernels/mvs_device.rs:326:15\n    |\n326 | pub(crate) fn draw_mvs_weights_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: fields `good` and `total` are never read\n   --> crates/cb-backend/src/kernels/ctr_device.rs:212:9\n    |\n210 | pub(crate) struct ResidentCtr {\n    |                   ----------- fields in this struct\n211 |     /// Per-object good count `N[1]` read before the label (u32, object order).\n212 |     pub good: Handle,\n    |         ^^^^\n213 |     /// Per-object total count `N[0] + N[1]` read before the label (u32, object order).\n214 |     pub total: Handle,\n    |         ^^^^^\n\nwarning: function `compute_ordered_ctr_host` is never used\n   --> crates/cb-backend/src/kernels/ctr_device.rs:350:15\n    |\n350 | pub(crate) fn compute_ordered_ctr_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `binarize_ctr_column_host` is never used\n   --> crates/cb-backend/src/kernels/ctr_device.rs:390:15\n    |\n390 | pub(crate) fn binarize_ctr_column_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^\n\n   Compiling py_literal v0.4.0\n   Compiling zip v6.0.0\n   Compiling ndarray v0.17.2\n   Compiling byteorder v1.5.0\n   Compiling ndarray-npy v0.10.0\n   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)\n   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)\nwarning: `cb-backend` (lib) generated 8 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\n   Compiling cb-oracle v0.1.0 (/tmp/repo/crates/cb-oracle)\n   Compiling approx v0.5.1\n    Finished `release` profile [optimized] target(s) in 12m 53s\n     Running tests/bench_grow_speed_test.rs (/tmp/target/release/deps/bench_grow_speed_test-bf6b2cec75d1610e)\n",
+  "verdict": "OK"
+}
