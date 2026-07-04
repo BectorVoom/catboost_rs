@@ -2859,6 +2859,15 @@ pub(crate) mod bootstrap_device;
 #[cfg(test)]
 mod bootstrap_device_test;
 
+// Device Minimal-Variance Sampling (Phase 12 Plan 07, GPUT-17): the PRODUCTION module hosting the
+// serial `#[cube]` MVS kernel — per-block (`BlockSize = 8192`) optimal threshold over
+// `sqrt(lambda + der^2)` (deterministic monotone bisection = the `calculate_threshold` root) +
+// inverse-probability reweight via the CPU's exact per-block reseeded `NextUniformF` stream. The
+// mask/weights stay device-resident (D-08); every block SUM is a serial single-thread accumulation
+// (no `Atomic<f64>` — runs in-env like Plan 06's RNG). MVS semantics are transcribed inline —
+// NEVER a `cb-train` dep (Pattern B). Mounted under every backend (production, NOT `#[cfg(test)]`).
+pub(crate) mod mvs_device;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
