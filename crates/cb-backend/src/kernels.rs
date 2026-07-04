@@ -2906,6 +2906,16 @@ pub(crate) mod cholesky_solve;
 #[cfg(test)]
 mod cholesky_solve_test;
 
+// Device shared query-grouping infrastructure (Phase 13 Plan 03, GPUT-22): the PRODUCTION module
+// hosting the `#[cube]` grouping kernels — group ids / weighted means / max / bias removal / in-query
+// sort keys / taken-docs + query-end masks — amortized ONCE across all five query/listwise objectives
+// (Plans 04–05). Der/weight group SUMS route through the k=30 fixed-point `REDUCE_FIXEDPOINT_SCALE_F64`
+// path (deterministic, T-13-06); in-query sampling REUSES `exact_quantile::segmented_radix_sort` (no
+// second sort); the RNG for `CreateSortKeys` is the `mvs_device` inline PCG transcription — NEVER a
+// `cb-train` dep (Pattern B). Mounted under every backend (production, NOT `#[cfg(test)]`); the f64
+// serial reductions surface a typed wgpu reject (no f64/u64 device channel).
+pub(crate) mod query_helper;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
