@@ -2859,6 +2859,24 @@ pub(crate) mod bootstrap_device;
 #[cfg(test)]
 mod bootstrap_device_test;
 
+// Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
+// module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
+// `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
+// resident across the learn permutation (D-06), the host tensor/feature-combination projection
+// (A5), and the CTR→cindex binarize JOIN that emits ADDITIONAL cindex columns the histogram loop
+// reads. Mounted under every backend (production, NOT `#[cfg(test)]`); the serial scan runs in-env
+// on the cpu backend (no `Atomic<u64>` needed — integer prefix counting is exact).
+pub(crate) mod ctr_device;
+
+// Device CTR self-oracle (source/test separation, Plan 08 GPUT-10, Pattern F): the device ordered
+// CTR column + the CTR→cindex binarize JOIN vs an inline serial CPU reference transcribing
+// `online_ctr_prefix_binclf` / `calc_ctr_online` (no `cb-train` dep) — read-before-increment
+// object-order values ≤1e-4 for ordered TS, one-hot, and a tensor/feature-combination case, plus
+// the first-doc-reads-prior invariant and the bit-exact cindex-column round-trip. Lives in
+// `kernels/ctr_device_test.rs`, mounted at `kernels::ctr_device_test`. Runs over `SelectedRuntime`.
+#[cfg(test)]
+mod ctr_device_test;
+
 // Segmented radix-sort primitive self-oracle (source/test separation, Plan 05 Open Q1/A1):
 // the per-segment stable-sort / no-cross-segment-mixing assertions vs an inline serial
 // segmented stable sort (D-02) live in `kernels/segmented_sort_test.rs`, mounted at

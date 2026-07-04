@@ -988,13 +988,42 @@ pub enum DeviceBootstrapType {
     Poisson,
 }
 
-/// The device CTR (categorical target statistics) config placeholder (Phase 12 Plan 01),
-/// a PLAIN HOST struct. Empty for now — Plan 08 fills it with the CTR kind / prior / target
-/// binarization the device CTR kernel + cindex-join need. Its mere PRESENCE
-/// (`DeviceTrainConfig::ctr == Some(_)`) already routes to `Ok(None)` in Plan 01
-/// (D-10-01 all-or-nothing), so the covered regime carries `None`.
+/// One CTR column to accumulate on device and binarize into an ADDITIONAL cindex column (Phase 12
+/// Plan 08, GPUT-10). A PLAIN HOST struct (no `cubecl` type — the T-10-04 seam landmine). Covers
+/// the ordered target statistic, one-hot (a single small-cardinality member), and the tensor /
+/// feature-combination projection (`member_bins.len() >= 2`, A5 — the device CTR math is shared;
+/// only the combined projection differs, and it is a host pre-step).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct DeviceCtrConfig {}
+pub struct DeviceCtrColumn {
+    /// The categorical member bin columns (object order, already hashed to category codes).
+    /// Length-1 for a plain single-feature / one-hot CTR; length `>= 2` for a tensor /
+    /// feature-combination projection (folded into one combined bin column on device-host, A5).
+    pub member_bins: Vec<Vec<u32>>,
+    /// The additive CTR prior numerator (`calc_ctr_online` `(good + prior) / (total + 1)`).
+    pub prior: f64,
+    /// The border table binarizing the accumulated CTR VALUE into cindex bins (the `> bin`
+    /// threshold convention; uploaded once per fit — quantization stays the CPU ≤1e-5 reference).
+    pub borders: Vec<f64>,
+}
+
+/// The device CTR (categorical target statistics) config (Phase 12 Plan 08, GPUT-10). A PLAIN
+/// HOST struct carrying the ORDERED CTR inputs the device kernel + cindex-join need: the single
+/// learn permutation (single-permutation covered regime, Open Q3 — multi-fold defers behind
+/// `Ok(None)`), the binclf target class per object, and the per-column CTR specs (priors,
+/// projections, border tables). Its mere PRESENCE (`DeviceTrainConfig::ctr == Some(_)`) declines
+/// via [`DeviceTrainConfig::is_covered_regime`]; the session's CTR gate arm (Plan 08) flips a
+/// single-permutation covered CTR config to the device path. No `cubecl` type appears here.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceCtrConfig {
+    /// The single learn permutation (learn-order object indices) the ordered CTR reads-before-
+    /// increments over. Single-permutation covered regime (Open Q3); a multi-fold / multi-
+    /// permutation CTR is NOT covered this wave (the session declines it to `Ok(None)`).
+    pub permutation: Vec<u32>,
+    /// The binclf target class per object (object order), each in `{0, 1}`.
+    pub target_class: Vec<u32>,
+    /// The CTR columns to accumulate + binarize into ADDITIONAL cindex columns.
+    pub columns: Vec<DeviceCtrColumn>,
+}
 
 /// The single PLAIN HOST-typed device training config (Phase 12 Plan 01, Open Q2). It
 /// carries the grow-policy / leaf-method / sampling / exact / CTR knobs the later
