@@ -40,7 +40,8 @@
 use cubecl::server::Handle;
 
 use cb_compute::{
-    DeviceBootstrapType, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig, EScoreFunction, Loss,
+    DeviceBootstrapType, DeviceCtrConfig, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig,
+    EScoreFunction, Loss,
 };
 use cb_core::{CbError, CbResult, TFastRng64};
 
@@ -51,6 +52,9 @@ use crate::gpu_runtime::{
 };
 use crate::kernels::bootstrap_device::{
     fold_weights_resident, launch_bootstrap_weights_resident, DeviceBootstrapKind,
+};
+use crate::kernels::ctr_device::{
+    binarize_ctr_column_resident, combine_projection_bins, launch_ordered_ctr_resident,
 };
 use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
@@ -95,6 +99,75 @@ fn map_bootstrap_kernel(bootstrap_type: DeviceBootstrapType) -> BootstrapArm {
         DeviceBootstrapType::Poisson => BootstrapArm::Device(DeviceBootstrapKind::Poisson),
         DeviceBootstrapType::Mvs => BootstrapArm::Decline,
     }
+}
+
+/// Whether a single-permutation CTR config is DEVICE-COVERED this wave (Phase 12 Plan 08, GPUT-10,
+/// Pattern A). Covered when: a CTR config is present; its permutation + target-class span all `n`
+/// objects (the single-permutation regime, Open Q3); every CTR column has at least one member and
+/// binarizes to EXACTLY `n_bins` buckets (`borders.len() + 1 == n_bins`) so the extra CTR cindex
+/// columns join the UNIFORM-`n_bins` resident histogram cleanly; and the f64 CTR seam exists on
+/// this backend (NOT wgpu, WR-02). A multi-fold / multi-permutation CTR is NOT covered — it is
+/// declined by the `fold_count != 1` gate upstream (Open Q3, deferred behind `Ok(None)`). Every
+/// OTHER family flag must still be the covered default (no bootstrap / MVS / exact / leaf-cap) —
+/// D-10-01 all-or-nothing PER family; the caller ANDs those in.
+fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
+    if cfg!(feature = "wgpu") {
+        return false;
+    }
+    let Some(ctr) = config.ctr.as_ref() else {
+        return false;
+    };
+    ctr.permutation.len() == n
+        && ctr.target_class.len() == n
+        && !ctr.columns.is_empty()
+        && ctr
+            .columns
+            .iter()
+            .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
+}
+
+/// Compute the ADDITIONAL binarized-CTR cindex columns for a covered CTR config ON device (Phase 12
+/// Plan 08, GPUT-10): for each CTR column, fold its member categories into the (combined) bin column
+/// (A5), accumulate the ordered read-before-increment target statistic resident across the
+/// permutation ([`launch_ordered_ctr_resident`]), binarize the CTR VALUES into cindex bins on device
+/// ([`binarize_ctr_column_resident`]), and read back ONLY the final integer bin column (the CTR
+/// VALUES never touch the host — the same host-pack-once discipline every plain feature follows,
+/// A2). Returns one `Vec<u32>` (object order) per CTR column, each with bins in `0..n_bins`.
+///
+/// # Errors
+/// [`CbError`] propagated from the device CTR launch / read-back; the caller only invokes this once
+/// [`ctr_covered`] has confirmed the shape invariants, so the length guards here are defensive.
+fn build_ctr_cindex_columns(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    ctr: &DeviceCtrConfig,
+    n: usize,
+) -> CbResult<Vec<Vec<u32>>> {
+    let mut columns = Vec::with_capacity(ctr.columns.len());
+    for col in &ctr.columns {
+        // Fold the member categories into one (combined) bin column + its distinct-bucket count.
+        let (bins, buckets) = if col.member_bins.len() == 1 {
+            let single = col.member_bins.first().cloned().unwrap_or_default();
+            let buckets = single.iter().copied().max().map_or(0, |m| m as usize + 1);
+            (single, buckets)
+        } else {
+            combine_projection_bins(&col.member_bins, n)?
+        };
+        let res = launch_ordered_ctr_resident(
+            client,
+            &ctr.permutation,
+            &bins,
+            &ctr.target_class,
+            col.prior,
+            buckets,
+            n,
+        )?;
+        let bin_h = binarize_ctr_column_resident(client, &res.value, &col.borders, n)?;
+        let bytes = client
+            .read_one(bin_h)
+            .map_err(|e| CbError::Degenerate(format!("CTR cindex column read-back failed: {e:?}")))?;
+        columns.push(bytemuck::cast_slice::<u8, u32>(&bytes).to_vec());
+    }
+    Ok(columns)
 }
 
 /// The per-fit device bootstrap state (Phase 12 Plan 06, GPUT-09). `Some` iff the fit committed to
@@ -407,7 +480,20 @@ impl GpuTrainSession {
                     && config.mvs_lambda.is_none()
                     && config.ctr.is_none()
                     && config.max_leaves.is_none();
-                if !config.is_covered_regime() && !exact_covered && !bootstrap_covered {
+                // Phase 12 Plan 08 (GPUT-10): the CTR regime is covered when ONLY the CTR config
+                // (single-permutation, n_bins-binarized columns) is non-default — every other
+                // family flag still the covered default (Newton leaf, symmetric, single fold, no
+                // bootstrap/MVS/exact/leaf-cap). D-10-01 all-or-nothing PER family.
+                let ctr_is_covered = ctr_covered(config, n, n_bins)
+                    && matches!(bootstrap_arm, BootstrapArm::NoDraw)
+                    && !config.exact_leaf
+                    && config.mvs_lambda.is_none()
+                    && config.max_leaves.is_none();
+                if !config.is_covered_regime()
+                    && !exact_covered
+                    && !bootstrap_covered
+                    && !ctr_is_covered
+                {
                     return Ok(None);
                 }
             }
@@ -491,22 +577,57 @@ impl GpuTrainSession {
             )));
         }
 
-        // --- Pack the cindex (10-06) + build the device arrays ONCE. ---
-        let n_buckets_per_feature = vec![n_bins; n_features];
-        let packed = pack_cindex(bins_feature_major, &n_buckets_per_feature, n)?;
-        let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
-        let num_words = packed.words.len();
-
         // --- One client owns every handle for the whole fit (Pitfall 3). ---
         let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
         let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+        // Phase 12 Plan 08 (GPUT-10): the CTR arm. When a single-permutation CTR config is covered
+        // (`ctr_covered` confirmed the shape invariants at the gate), accumulate the ordered
+        // read-before-increment target statistic for each CTR column ON device (resident across the
+        // permutation, D-06), binarize the CTR VALUES into ADDITIONAL cindex columns on device, and
+        // APPEND them to the feature-major bin matrix (each binarized to `n_bins` buckets, so the
+        // uniform-`n_bins` resident histogram consumes them like any plain feature). The CTR VALUES
+        // never touch the host — only the final integer bin columns are host-packed (the A2 cindex
+        // discipline). The full-tree grow numerics over the augmented cindex are the Kaggle CUDA
+        // sign-off (Plan 09); GPUT-10 stays Pending until then.
+        let ctr_is_covered = nonsym_policy.is_none()
+            && ctr_covered(config, n, n_bins)
+            && bootstrap_arm == BootstrapArm::NoDraw
+            && !config.exact_leaf
+            && config.mvs_lambda.is_none()
+            && config.max_leaves.is_none();
+        let (eff_bins, eff_n_features): (Vec<u32>, usize) = if ctr_is_covered {
+            if let Some(ctr) = config.ctr.as_ref() {
+                let ctr_columns = build_ctr_cindex_columns(&client, ctr, n)?;
+                let mut augmented = bins_feature_major.to_vec();
+                for col in &ctr_columns {
+                    augmented.extend_from_slice(col);
+                }
+                (augmented, n_features + ctr_columns.len())
+            } else {
+                (bins_feature_major.to_vec(), n_features)
+            }
+        } else {
+            (bins_feature_major.to_vec(), n_features)
+        };
+        let eff_cindex_stride = eff_n_features.checked_mul(n).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "eff_n_features ({eff_n_features}) * n ({n}) overflows usize (cindex stride)"
+            ))
+        })?;
+
+        // --- Pack the cindex (10-06) + build the device arrays ONCE (incl. CTR columns). ---
+        let n_buckets_per_feature = vec![n_bins; eff_n_features];
+        let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, n)?;
+        let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+        let num_words = packed.words.len();
 
         // Identity object-visiting order (whole-dataset root): indices[i] = i.
         let indices: Vec<u32> = (0..n as u32).collect();
 
         // Upload ALL resident handles ONCE. der1/weight/approx are channel-typed (f32 on
         // wgpu, f64 elsewhere) via the shared helper; cindex/indices/TCFeature are u32.
-        let plain_cindex_h = client.create(cubecl::bytes::Bytes::from_elems(bins_feature_major.to_vec()));
+        let plain_cindex_h = client.create(cubecl::bytes::Bytes::from_elems(eff_bins.clone()));
         let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
         let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
         let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
@@ -567,8 +688,8 @@ impl GpuTrainSession {
             num_words,
             n,
             n_bins,
-            n_features,
-            cindex_stride,
+            n_features: eff_n_features,
+            cindex_stride: eff_cindex_stride,
             depth,
             scaled_l2,
             score_fn,
@@ -586,6 +707,15 @@ impl GpuTrainSession {
     #[must_use]
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    /// The EFFECTIVE resident feature count — the plain feature count plus any binarized CTR
+    /// columns appended during `begin` (Phase 12 Plan 08, GPUT-10). Equals the input `n_features`
+    /// unless a covered CTR config augmented the cindex. The resident histogram loop iterates this
+    /// many features.
+    #[must_use]
+    pub fn n_features_effective(&self) -> usize {
+        self.n_features
     }
 
     /// Grow ONE tree over the resident state, advancing the device-resident boosting: it

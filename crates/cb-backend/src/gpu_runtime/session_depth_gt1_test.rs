@@ -466,6 +466,157 @@ fn session_bootstrap_gate_covers_bernoulli_bayesian_poisson() {
     assert!(open(&DeviceTrainConfig::default()), "the No-bootstrap default still opens");
 }
 
+/// (Gate, Plan 08 GPUT-10) the CTR arm: a covered SINGLE-PERMUTATION CTR config opens a session
+/// (`Ok(Some)`), actually accumulating the ordered CTR + binarizing the extra cindex columns ON
+/// device during `begin` (the serial read-before-increment scan runs in-env on cpu — no
+/// `Atomic<u64>`); a MULTI-FOLD CTR config declines (`Ok(None)`, Open Q3 deferred); a CTR config
+/// whose columns do not binarize to `n_bins` buckets declines; and CTR PLUS a second non-default
+/// family flag declines (D-10-01 all-or-nothing). Runs on every non-wgpu backend.
+#[test]
+fn session_ctr_gate_covers_single_permutation() {
+    use cb_compute::{DeviceCtrColumn, DeviceCtrConfig};
+
+    let n = 64usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let weight = weight_mod5(n);
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    // A single covered CTR column: one small-cardinality cat member, identity permutation, binclf
+    // classes, and 31 borders spanning (0,1) so `borders.len() + 1 == n_bins` (uniform histogram).
+    let cat: Vec<u32> = (0..n).map(|k| (k % 5) as u32).collect();
+    let target_class: Vec<u32> = (0..n).map(|k| (k % 2) as u32).collect();
+    let permutation: Vec<u32> = (0..n as u32).collect();
+    let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
+    assert_eq!(borders.len() + 1, n_bins, "borders must yield exactly n_bins buckets");
+    let ctr_column = DeviceCtrColumn {
+        member_bins: vec![cat.clone()],
+        prior: 0.5,
+        borders: borders.clone(),
+    };
+    let covered_ctr = DeviceCtrConfig {
+        permutation: permutation.clone(),
+        target_class: target_class.clone(),
+        columns: vec![ctr_column.clone()],
+    };
+
+    let open = |folds: usize, cfg: &DeviceTrainConfig| {
+        GpuTrainSession::begin(
+            &Loss::Rmse, 6, true, folds, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+            n_bins, 0.3, scaled_l2, cfg,
+        )
+        .expect("begin must not error while classifying / building the CTR arm")
+        .is_some()
+    };
+
+    // COVERED: single-permutation CTR → Ok(Some) (begin accumulates + binarizes on device).
+    let cfg_covered = DeviceTrainConfig {
+        ctr: Some(covered_ctr.clone()),
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        open(1, &cfg_covered),
+        "a single-permutation covered CTR config must open a session (Plan 08 gate arm)"
+    );
+
+    // NOT covered: multi-fold / multi-permutation CTR → Ok(None) (Open Q3 deferred behind None).
+    assert!(
+        !open(2, &cfg_covered),
+        "a multi-fold (fold_count>1) CTR config must decline (Open Q3 multi-permutation deferral)"
+    );
+
+    // NOT covered: a CTR column that does NOT binarize to n_bins buckets (wrong border count).
+    let wrong_bins = DeviceTrainConfig {
+        ctr: Some(DeviceCtrConfig {
+            permutation: permutation.clone(),
+            target_class: target_class.clone(),
+            columns: vec![DeviceCtrColumn {
+                member_bins: vec![cat.clone()],
+                prior: 0.5,
+                borders: vec![0.5_f64], // 2 buckets != n_bins
+            }],
+        }),
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(1, &wrong_bins),
+        "a CTR column not binarized to n_bins buckets must decline (uniform-histogram invariant)"
+    );
+
+    // NOT covered: CTR PLUS a second non-default family flag (exact leaf) → decline (all-or-nothing).
+    let ctr_plus_exact = DeviceTrainConfig {
+        ctr: Some(covered_ctr.clone()),
+        exact_leaf: true,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(1, &ctr_plus_exact),
+        "CTR + a second non-default family flag must decline (D-10-01 all-or-nothing)"
+    );
+
+    // The default (no CTR) path is unchanged.
+    assert!(open(1, &DeviceTrainConfig::default()), "the no-CTR default still opens");
+}
+
+/// (End-to-end residency, Plan 08 GPUT-10) a covered CTR session actually augments its resident
+/// cindex with the binarized CTR columns during `begin` — the effective feature count grows by the
+/// number of CTR columns, and the session opens with the extra columns device-resident. The ordered
+/// CTR VALUE numerics are locked ≤1e-4 by the `kernels::ctr_device` self-oracle; here we prove the
+/// begin wiring accumulates + joins the CTR columns on device end-to-end. The serial CTR scan runs
+/// in-env on cpu (no `Atomic<u64>`); a full-tree grow over the augmented cindex is the Plan-09
+/// Kaggle CUDA sign-off (needs the resident partition histogram), so this test does NOT call
+/// grow_one.
+#[test]
+fn session_ctr_augments_resident_cindex() {
+    use cb_compute::{DeviceCtrColumn, DeviceCtrConfig};
+
+    let n = 80usize;
+    let n_features = 2usize;
+    let n_bins = 16usize;
+    let weight = vec![1.0_f64; n];
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    let cat0: Vec<u32> = (0..n).map(|k| (k % 4) as u32).collect();
+    let cat1: Vec<u32> = (0..n).map(|k| (k % 6) as u32).collect();
+    let target_class: Vec<u32> = (0..n).map(|k| ((k / 3) % 2) as u32).collect();
+    let permutation: Vec<u32> = (0..n as u32).collect();
+    let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
+
+    // TWO CTR columns: one plain single-feature, one tensor/feature-combination (2 members, A5).
+    let ctr = DeviceCtrConfig {
+        permutation,
+        target_class,
+        columns: vec![
+            DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone() },
+            DeviceCtrColumn {
+                member_bins: vec![cat0.clone(), cat1.clone()],
+                prior: 1.0,
+                borders: borders.clone(),
+            },
+        ],
+    };
+    let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
+
+    let session = GpuTrainSession::begin(
+        &Loss::Rmse, 3, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features, n_bins,
+        0.3, scaled_l2, &cfg,
+    )
+    .expect("begin must not error building the CTR-augmented resident session")
+    .expect("a covered 2-column CTR config must open a session (Plan 08)");
+
+    // The effective feature count grew by the two binarized CTR columns (they are now resident
+    // cindex features the histogram loop reads).
+    assert_eq!(
+        session.n_features_effective(),
+        n_features + 2,
+        "the resident cindex must gain one feature per binarized CTR column"
+    );
+    assert_eq!(session.n(), n, "object count unchanged by the CTR augmentation");
+    drop(session);
+}
+
 /// (End-to-end wiring, Plan 06 GPUT-09) a Bernoulli-bootstrap session grows a real device tree:
 /// `grow_one` draws the device-resident keep-mask, folds it into the resident weight, and grows a
 /// finite tree. Proves the begin→grow_one bootstrap wiring runs on device; the DRAW numerics are

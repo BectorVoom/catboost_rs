@@ -20,6 +20,7 @@
 use cubecl::prelude::*;
 
 use crate::gpu_runtime::cindex::{feature_bits, pack_cindex, read_bin_host};
+use crate::kernels::ctr_device::binarize_ctr_column_host;
 use crate::kernels::read_all_bins_kernel;
 
 /// Launch geometry: 32-wide cubes (wave32 gfx1100), enough cubes to cover every cell.
@@ -170,6 +171,84 @@ fn pack_read_bit_exact_large_n() {
     let bins = synth_bins(n, &n_buckets, 20260703);
     let got = pack_then_read_all(&bins, &n_buckets, n);
     assert_eq!(got, bins, "large-n pack->read must be bit-exact");
+}
+
+/// Deterministic categorical bin + binclf class + permutation columns (LCG), for the CTR→cindex
+/// join test. Mirrors `ctr_device_test::synth_fixture` (kept local — the two test modules do not
+/// share a helper crate).
+fn synth_ctr_fixture(n: usize, cardinality: u32, seed: u32) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut s = seed;
+    let next = |st: &mut u32| {
+        *st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *st >> 8
+    };
+    let bins: Vec<u32> = (0..n).map(|_| next(&mut s) % cardinality).collect();
+    let class: Vec<u32> = (0..n).map(|_| next(&mut s) % 2).collect();
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    for i in 0..n {
+        let j = (next(&mut s) as usize) % n;
+        perm.swap(i, j);
+    }
+    (bins, class, perm)
+}
+
+#[test]
+fn ctr_binarized_column_joins_cindex_bit_exact() {
+    // Plan 08 (GPUT-10) CTR→cindex JOIN: a binarized device CTR column must pack into the cindex as
+    // an ADDITIONAL feature column the histogram loop reads, extracting bit-exactly like any other
+    // feature. Build two plain features + one device-CTR column (accumulated + binarized ON device),
+    // append the CTR column as the last feature, pack, and read every cell back bit-exact.
+    if cfg!(feature = "wgpu") {
+        eprintln!("SKIP ctr_binarized_column_joins_cindex_bit_exact: wgpu has no f64 CTR seam");
+        return;
+    }
+    let n = 300usize;
+    let prior = 0.5;
+    let borders = vec![0.2_f64, 0.4, 0.5, 0.6, 0.8]; // => 6 CTR buckets (0..=5)
+    let ctr_buckets = borders.len() + 1;
+
+    // The device CTR column, binarized to cindex bins (the extra column).
+    let (cat_bins, class, perm) = synth_ctr_fixture(n, 6, 314);
+    let ctr_bucket_count = cat_bins.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let ctr_col =
+        binarize_ctr_column_host(&perm, &cat_bins, &class, prior, ctr_bucket_count, &borders)
+            .unwrap();
+    assert_eq!(ctr_col.len(), n);
+
+    // Two plain quantized features (8-bit + 4-bit) alongside the CTR column.
+    let plain0 = synth_bins(n, &[256usize], 11);
+    let plain1 = synth_bins(n, &[16usize], 22);
+    let n_buckets = vec![256usize, 16, ctr_buckets];
+
+    // Feature-major augmented matrix: [plain0 | plain1 | ctr_col].
+    let mut bins = Vec::with_capacity(3 * n);
+    bins.extend_from_slice(&plain0);
+    bins.extend_from_slice(&plain1);
+    bins.extend_from_slice(&ctr_col);
+
+    // Pack the augmented matrix (the CTR column joins as feature 2), then extract EVERY cell via
+    // the HOST `read_bin_host` (the exact device `read_bin` accessor `(word >> shift) & mask`). The
+    // host extraction is deterministic and independent of the grid-stride `read_all_bins_kernel`
+    // device path (which the sibling `pack_read_bit_exact_*` oracles / the Kaggle CUDA sign-off
+    // exercise on device); here the point is that the binarized CTR column PACKS + EXTRACTS as an
+    // additional cindex feature bit-exact — the JOIN the histogram loop reads.
+    let packed = pack_cindex(&bins, &n_buckets, n).unwrap();
+    for feature in 0..3usize {
+        let f = &packed.features[feature];
+        for obj in 0..n {
+            let got = read_bin_host(&packed.words, f.offset, obj, f.shift, f.mask);
+            assert_eq!(
+                got,
+                bins[feature * n + obj],
+                "CTR-augmented cindex extract mismatch (feature {feature}, obj {obj})"
+            );
+        }
+    }
+    // The CTR column (feature 2) is a valid, non-degenerate additional cindex column.
+    assert!(
+        ctr_col.iter().all(|&b| (b as usize) < ctr_buckets),
+        "CTR cindex bins must lie in 0..ctr_buckets"
+    );
 }
 
 #[test]
