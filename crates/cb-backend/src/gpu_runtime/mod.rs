@@ -424,6 +424,14 @@ pub use session::*;
 // and the `multiclass_test` self-oracle reaches the block driver.
 pub(crate) mod multiclass;
 
+// Phase 13 Plan 07 (GPUT-12): the multi-output block-emission self-oracle (source/test separation) —
+// device coupled-softmax K=3 + diagonal RMSEWithUncertainty K=2 + diagonal MultiClassOneVsAll block
+// leaves vs the CPU `cb_compute::solve_symmetric_newton` multi-output leaf values at ε=1e-4, plus the
+// uncovered-config `Ok(None)` gate. rocm in-env on gfx1100 (numeric ε assertions device-gated; cpu
+// records-only, WR-01).
+#[cfg(test)]
+mod multiclass_test;
+
 // Phase 13 Plan 04 (GPUT-22): the deterministic query/listwise objective device driver
 // (QueryRMSE / QuerySoftMax / QueryCrossEntropy) over the Plan-03 query-grouping infra. `pub(crate)`
 // so the session ranking coverage gate reaches `RankingObjective` / `ranking_objective_covered` and

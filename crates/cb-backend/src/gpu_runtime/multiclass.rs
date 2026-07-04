@@ -166,7 +166,7 @@ pub(crate) fn assemble_multiclass_ders(
     let mut der2_packed = vec![0.0_f64; n_pk];
 
     // Set dimension `d` of object `i` in both der buffers (safe indexed writes).
-    let mut set = |der1: &mut [f64], der2: &mut [f64], i: usize, d: usize, d1: f64, d2_diag: f64| {
+    let set = |der1: &mut [f64], der2: &mut [f64], i: usize, d: usize, d1: f64, d2_diag: f64| {
         if let Some(slot) = der1.get_mut(d * n + i) {
             *slot = d1;
         }
