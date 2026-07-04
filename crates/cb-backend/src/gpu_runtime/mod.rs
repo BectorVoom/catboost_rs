@@ -424,6 +424,13 @@ pub use session::*;
 // and the `multiclass_test` self-oracle reaches the block driver.
 pub(crate) mod multiclass;
 
+// Phase 13 Plan 08 (GPUT-13): the ordered-boosting device driver — the per-permutation historical
+// approx trajectory (`ordered_approx_delta_simple` body/tail approximant) kept device-resident across
+// iterations, folded into the resident trajectory via `apply_leaf_delta` (identity leaf map + unit
+// rate). `pub(crate)` so the session ordered coverage gate + the `ordered_test` self-oracle reach the
+// `OrderedTree` descriptor + `ordered_approx_delta` / `accumulate_ordered_trajectory` driver.
+pub(crate) mod ordered;
+
 // Phase 13 Plan 07 (GPUT-12): the multi-output block-emission self-oracle (source/test separation) —
 // device coupled-softmax K=3 + diagonal RMSEWithUncertainty K=2 + diagonal MultiClassOneVsAll block
 // leaves vs the CPU `cb_compute::solve_symmetric_newton` multi-output leaf values at ε=1e-4, plus the

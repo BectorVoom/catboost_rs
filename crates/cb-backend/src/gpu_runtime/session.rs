@@ -501,6 +501,58 @@ fn map_multiclass_coverage(
     Some(MulticlassState { objective })
 }
 
+/// The per-fit device ORDERED-boosting state (Phase 13 Plan 08, GPUT-13). `Some` iff the fit
+/// committed to a covered ordered-boosting config — the per-permutation historical approx trajectory
+/// the device driver ([`crate::gpu_runtime::ordered`]) keeps RESIDENT across iterations, reproducing
+/// the frozen CPU `ordered_approx_delta_simple` body/tail approximant at ε=1e-4 (body rows keep delta
+/// 0). Like [`RankingState`] / [`MulticlassState`] this carries the coverage DECISION: the ordered
+/// trajectory driver + self-oracle land THIS plan; the per-tree ordered permutation-descriptor grow
+/// seam (the `Runtime::grow_tree_on_device` seam carries only scalar `approx`/`target` today, not the
+/// learn-order permutation + body/tail boundary an ordered grow needs) is a forward dependency, so a
+/// covered ordered fit currently declines to the byte-unchanged CPU grower (D-04 no-regression)
+/// rather than fabricating a Plain (leakage-prone) pointwise grow on an ordered fit.
+#[allow(dead_code)]
+struct OrderedState {
+    /// The covered ordered der/leaf method — the simple Gradient/RMSE approximant
+    /// (`ordered_approx_delta_simple`, `gradient_leaf_delta` = `calc_average`). Newton / other
+    /// approximants are NOT stored here — they map to `Ok(None)` without disabling the covered arm.
+    der_kernel: DerBinaryKernel,
+}
+
+/// Phase 13 Plan 08 (GPUT-13): the ordered-boosting coverage gate, mirroring the
+/// `map_ranking_coverage` / `map_multiclass_coverage` `Option`-returning family-gated template
+/// (Pattern A). Returns `Some(OrderedState)` iff the fit is a COVERED ordered config — a covered
+/// simple-approximant loss ([`map_der_kernel`]: RMSE / Logloss / CrossEntropy der), depth ≥ 1, single
+/// fold, SymmetricTree, and every OTHER family flag still the covered default (D-10-01 all-or-nothing
+/// PER family: no bootstrap / MVS / exact-leaf / CTR / leaf-cap). Ordered boosting itself is signalled
+/// by the caller's `!boosting_type_is_plain` at the call site (there is no `permutation_count` device
+/// knob — the frozen fixture pins it, Open Q2 single learning-fold). Returns `None` for any uncovered
+/// ordered config → the byte-unchanged CPU grower (never a fabricated device result).
+fn map_ordered_coverage(
+    loss: &Loss,
+    config: &DeviceTrainConfig,
+    depth: usize,
+    fold_count: usize,
+) -> Option<OrderedState> {
+    let der_kernel = map_der_kernel(loss)?;
+    if depth == 0 || fold_count != 1 {
+        return None;
+    }
+    if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+        return None;
+    }
+    // All-or-nothing per family: no other non-default family flag may be set.
+    let family_default = config.bootstrap_type == DeviceBootstrapType::No
+        && config.mvs_lambda.is_none()
+        && !config.exact_leaf
+        && config.ctr.is_none()
+        && config.max_leaves.is_none();
+    if !family_default {
+        return None;
+    }
+    Some(OrderedState { der_kernel })
+}
+
 /// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
 /// for the covered losses, transcribing `cb_compute`'s documented formulas (RMSE:
 /// `der1 = target - approx`; Logloss / CrossEntropy: `der1 = target - sigmoid(approx)`). The
@@ -615,6 +667,15 @@ pub struct GpuTrainSession {
     /// yet — the field is the landed structural seam, like `pairwise` / `ranking` / `config`).
     #[allow(dead_code)]
     multiclass: Option<MulticlassState>,
+    /// The per-fit ordered-boosting state (Phase 13 Plan 08, GPUT-13). `Some` iff the fit committed
+    /// to a covered ordered-boosting config (a covered simple-approximant loss over the historical
+    /// per-permutation trajectory); `None` for every Plain / pairwise / ranking / multi-output path
+    /// (byte-unchanged, D-04). Carries the coverage DECISION the ordered trajectory driver consumes
+    /// (the per-tree ordered permutation-descriptor grow seam is a forward dependency, so no
+    /// covered-ordered session is constructed yet — the field is the landed structural seam, like
+    /// `pairwise` / `ranking` / `multiclass` / `config`).
+    #[allow(dead_code)]
+    ordered: Option<OrderedState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -729,7 +790,25 @@ impl GpuTrainSession {
         // resident `leaf_of` + the per-active-leaf score/argmin). Only the
         // Plain/fold_count==1/covered-loss/score/n_bins guards remain; every still-uncovered
         // config returns `Ok(None)` → the byte-unchanged CPU grower (D-10-01 all-or-nothing).
-        if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
+        // Phase 13 Plan 08 (GPUT-13): the ordered-boosting coverage gate. Ordered boosting
+        // (`EBoostingType::Ordered`, `!boosting_type_is_plain`) keeps a per-permutation HISTORICAL
+        // approx trajectory (the anti-leakage body/tail approximant — a TAIL row is estimated from
+        // the BODY prefix plus only the tail rows that precede it in the learn permutation; body rows
+        // keep delta 0) that the device `crate::gpu_runtime::ordered` driver reproduces
+        // device-resident across iterations, self-oracled against the frozen CPU
+        // `ordered_approx_delta_simple` at ε=1e-4. `map_ordered_coverage` returns `Some(OrderedState)`
+        // for a covered ordered config, `None` otherwise. The ordered trajectory driver + self-oracle
+        // land THIS plan; the per-tree ordered permutation-descriptor grow seam (the
+        // `Runtime::grow_tree_on_device` seam carries only scalar `approx`/`target` today, not the
+        // learn-order permutation + body/tail boundary an ordered grow needs) is a forward
+        // dependency, so BOTH the covered and uncovered ordered branches decline to the
+        // byte-unchanged CPU grower (D-04 no-regression) — NEVER a fabricated Plain (leakage-prone)
+        // pointwise grow on an ordered fit (the pairwise / ranking / multiclass gate precedent).
+        if !boosting_type_is_plain {
+            let _ordered = map_ordered_coverage(loss, config, depth, fold_count);
+            return Ok(None);
+        }
+        if depth == 0 || fold_count != 1 {
             return Ok(None);
         }
         // Phase 13 Plan 01 (GPUT-11): the pairwise coverage gate. A `*Pairwise` loss
@@ -1155,6 +1234,11 @@ impl GpuTrainSession {
             // is gated + declined ABOVE (the multiclass arm returns Ok(None) pending the per-tree
             // shared multi-dim grow seam), so this construction is only ever reached scalar.
             multiclass: None,
+            // Plain path: no ordered state (byte-unchanged, D-04). A covered ordered fit is gated +
+            // declined ABOVE (the ordered arm returns Ok(None) pending the per-tree ordered
+            // permutation-descriptor grow seam), and this construction is only ever reached on the
+            // Plain (`boosting_type_is_plain`) path, so it is never ordered.
+            ordered: None,
         }))
     }
 
