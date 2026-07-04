@@ -53,6 +53,7 @@ use crate::gpu_runtime::{
 use crate::kernels::bootstrap_device::{
     fold_weights_resident, launch_bootstrap_weights_resident, DeviceBootstrapKind,
 };
+use crate::kernels::mvs_device::launch_mvs_weights_resident;
 use crate::kernels::ctr_device::{
     binarize_ctr_column_resident, combine_projection_bins, launch_ordered_ctr_resident,
 };
@@ -76,30 +77,43 @@ fn map_grow_policy(grow_policy: DeviceGrowPolicy) -> Option<NonsymPolicy> {
     }
 }
 
-/// The bootstrap gate arm outcome (Phase 12 Plan 06, GPUT-09) — the `map_score_fn` /
-/// `map_grow_policy` `Option`-returning template, widened to THREE outcomes because `No` is a
-/// covered non-draw (NOT a decline):
+/// The bootstrap gate arm outcome (Phase 12 Plan 06, GPUT-09; Plan 07 GPUT-17) — the `map_score_fn`
+/// / `map_grow_policy` `Option`-returning template, widened because `No` is a covered non-draw (NOT
+/// a decline) and MVS is its OWN device path (derivative reduction, distinct from the RNG-only draw):
 /// - `NoDraw` — `bootstrap_type == No`: the byte-unchanged covered default (no device draw).
 /// - `Device(kind)` — Bernoulli/Bayesian/Poisson: draw the device-resident sample per tree.
-/// - `Decline` — `Mvs`: not covered until Plan 07 → `Ok(None)` (CPU fallback, D-10-01).
+/// - `Mvs` — Minimal-Variance Sampling (Plan 07): the device per-block threshold + reweight over
+///   the resident derivatives (covered when the caller supplies `mvs_lambda`; else declines).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapArm {
     NoDraw,
     Device(DeviceBootstrapKind),
-    Decline,
+    Mvs,
 }
 
 /// Map a host [`DeviceBootstrapType`] to the device bootstrap arm (Pattern A). Bernoulli/Bayesian/
-/// Poisson flip to the device draw THIS plan; MVS declines to CPU until Plan 07; `No` is the
-/// covered non-draw default.
+/// Poisson flip to the device RNG draw (Plan 06); MVS routes to its device reduction (Plan 07); `No`
+/// is the covered non-draw default.
 fn map_bootstrap_kernel(bootstrap_type: DeviceBootstrapType) -> BootstrapArm {
     match bootstrap_type {
         DeviceBootstrapType::No => BootstrapArm::NoDraw,
         DeviceBootstrapType::Bernoulli => BootstrapArm::Device(DeviceBootstrapKind::Bernoulli),
         DeviceBootstrapType::Bayesian => BootstrapArm::Device(DeviceBootstrapKind::Bayesian),
         DeviceBootstrapType::Poisson => BootstrapArm::Device(DeviceBootstrapKind::Poisson),
-        DeviceBootstrapType::Mvs => BootstrapArm::Decline,
+        DeviceBootstrapType::Mvs => BootstrapArm::Mvs,
     }
+}
+
+/// `mean(|der|)^2` — the MVS iter-0 `GetLambda(...)` (`mvs.cpp:37-79`): the squared mean gradient
+/// magnitude via the ordered [`cb_core::sum_f64`] (D-05). Transcribed inline (NEVER a `cb-train`
+/// dep, Pattern B). Used when the caller does not pin `config.mvs_lambda`.
+fn mvs_lambda_from_der(derivatives: &[f64]) -> f64 {
+    if derivatives.is_empty() {
+        return 0.0;
+    }
+    let mags: Vec<f64> = derivatives.iter().map(|&d| (d * d).sqrt()).collect();
+    let mean = cb_core::sum_f64(&mags) / derivatives.len() as f64;
+    mean * mean
 }
 
 /// Whether a single-permutation CTR config is DEVICE-COVERED this wave (Phase 12 Plan 08, GPUT-10,
@@ -187,6 +201,26 @@ struct BootstrapState {
     /// Bayesian bagging temperature — the catboost default `1.0` (config carries no field yet;
     /// the covered device Bayesian regime uses the default, MVP-scoped).
     bagging_temperature: f64,
+}
+
+/// The per-fit device MVS state (Phase 12 Plan 07, GPUT-17). `Some` iff the fit committed to a
+/// covered oblivious grow with `bootstrap_type == Mvs` (and the caller pinned `config.mvs_lambda`).
+/// Like [`BootstrapState`] it holds the CONTINUOUS training stream on the validated
+/// [`cb_core::TFastRng64`] (seeded from `config.rng_seed`); [`GpuTrainSession::grow_one`] takes the
+/// ONE main-stream `GenRand()` as the per-tree `rand_seed`, draws the device-resident MVS sample
+/// (per-block threshold + reweight over the RESIDENT derivatives), folds it into the resident
+/// weight, then advances the stream by the draws that tree consumed (D-08 — no per-tree host
+/// round-trip of the mask). The λ is `config.mvs_lambda` (the caller's `GetLambda(...)`), or the
+/// iter-0 `mean(|der|)^2` derived from the resident derivatives when unpinned (MVP scope).
+struct MvsState {
+    /// The persistent continuous training stream (seeded once from `config.rng_seed`).
+    rng: TFastRng64,
+    /// The MVS subsample rate (`config.sample_rate`, f32-rounded downstream).
+    sample_rate: f64,
+    /// The caller-pinned `GetLambda(...)` (`config.mvs_lambda`); `None` ⇒ iter-0 `mean(|der|)^2`.
+    lambda: Option<f64>,
+    /// The covered-loss der kind, driving the host der re-derivation for the unpinned-λ path.
+    der_kernel: DerBinaryKernel,
 }
 
 /// The per-fit non-symmetric device-grow state (Phase 12 Plan 03). Held when the fit commits
@@ -334,6 +368,11 @@ pub struct GpuTrainSession {
     /// device-resident sample per tree and folds it into the resident weight. `None` for the
     /// no-subsampling default (byte-unchanged, D-04).
     bootstrap: Option<BootstrapState>,
+    /// The per-fit MVS state (Phase 12 Plan 07, GPUT-17). `Some` iff the fit committed to a covered
+    /// oblivious grow with `bootstrap_type == Mvs` — `grow_one` then draws the device-resident MVS
+    /// sample (per-block threshold + reweight over the resident derivatives) and folds it into the
+    /// resident weight. Mutually exclusive with [`Self::bootstrap`] (distinct `bootstrap_type`).
+    mvs: Option<MvsState>,
     /// The per-fit Region-grow state (Phase 12 Plan 04, GPUT-18). `Some` iff the fit committed to
     /// a `grow_policy=Region` device grow — [`Self::grow_one`] then dispatches to the host-driven
     /// [`grow_region_tree`] (a walk-until-diverge PATH, `MaxLeaves = max_depth + 1`) instead of
@@ -507,8 +546,9 @@ impl GpuTrainSession {
                 if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
                     return Ok(None);
                 }
-                // MVS bootstrap is not covered until Plan 07 — decline explicitly.
-                if bootstrap_arm == BootstrapArm::Decline {
+                // MVS with NO caller-pinned λ is not covered (the iter-0 `mean(|der|)^2` auto-λ
+                // needs the resident der, MVP-deferred) — decline explicitly so it falls to CPU.
+                if bootstrap_arm == BootstrapArm::Mvs && config.mvs_lambda.is_none() {
                     return Ok(None);
                 }
                 // The exact-leaf regime is covered when ONLY `exact_leaf` (+ its α/δ) is
@@ -525,6 +565,16 @@ impl GpuTrainSession {
                     && config.mvs_lambda.is_none()
                     && config.ctr.is_none()
                     && config.max_leaves.is_none();
+                // Phase 12 Plan 07 (GPUT-17): the MVS regime is covered when ONLY `bootstrap_type ==
+                // Mvs` (+ its rate/seed/λ) is non-default — the caller pins `mvs_lambda` (checked
+                // above), and every OTHER family flag is the covered default (Newton leaf, symmetric,
+                // single fold, no other-bootstrap/exact/CTR/leaf-cap). D-10-01 all-or-nothing PER
+                // family.
+                let mvs_covered = bootstrap_arm == BootstrapArm::Mvs
+                    && config.mvs_lambda.is_some()
+                    && !config.exact_leaf
+                    && config.ctr.is_none()
+                    && config.max_leaves.is_none();
                 // Phase 12 Plan 08 (GPUT-10): the CTR regime is covered when ONLY the CTR config
                 // (single-permutation, n_bins-binarized columns) is non-default — every other
                 // family flag still the covered default (Newton leaf, symmetric, single fold, no
@@ -538,6 +588,7 @@ impl GpuTrainSession {
                     && !exact_covered
                     && !bootstrap_covered
                     && !ctr_is_covered
+                    && !mvs_covered
                 {
                     return Ok(None);
                 }
@@ -735,6 +786,20 @@ impl GpuTrainSession {
             _ => None,
         };
 
+        // Phase 12 Plan 07 (GPUT-17): capture the MVS state (oblivious path only; the coverage gate
+        // already required the caller-pinned `mvs_lambda`). Seeds the CONTINUOUS training stream ONCE
+        // from `config.rng_seed`; `grow_one` takes the per-tree `rand_seed` and draws the resident
+        // MVS sample over the resident derivatives. Mutually exclusive with `bootstrap`.
+        let mvs = match bootstrap_arm {
+            BootstrapArm::Mvs if nonsym_policy.is_none() => Some(MvsState {
+                rng: TFastRng64::from_seed(config.rng_seed),
+                sample_rate: f64::from(config.sample_rate),
+                lambda: config.mvs_lambda,
+                der_kernel,
+            }),
+            _ => None,
+        };
+
         Ok(Some(Self {
             client,
             plain_cindex_h,
@@ -761,6 +826,7 @@ impl GpuTrainSession {
             nonsym,
             exact_leaf,
             bootstrap,
+            mvs,
             region,
         }))
     }
@@ -956,24 +1022,68 @@ impl GpuTrainSession {
                 DeviceBootstrapKind::Bayesian => {}
             }
         }
-        let tree_weight_h = match bootstrap_params {
-            Some((kind, base, rand_seed, rate, temp)) => {
-                let sample_h = launch_bootstrap_weights_resident(
-                    &self.client,
-                    kind,
-                    base,
-                    rand_seed,
-                    rate,
-                    temp,
-                    self.n,
-                )?;
-                Some(fold_weights_resident(
-                    &self.client,
-                    &self.weight_h,
-                    &sample_h,
-                    self.n,
-                )?)
+
+        // Phase 12 Plan 07 (GPUT-17): the MVS arm (mutually exclusive with the bootstrap arm above —
+        // a distinct `bootstrap_type`). Take the ONE main-stream `GenRand()` as the per-tree
+        // `rand_seed` (the per-block streams branch off it); the MVS kernel reduces over the resident
+        // derivatives (`der1_h`). λ is the caller-pinned `config.mvs_lambda` (the coverage gate
+        // required it), or the iter-0 `mean(|der|)^2` derived from the caller approx as a defensive
+        // fallback. With `sample_rate >= 1.0` upstream short-circuits to all-`1.0` with ZERO draws —
+        // pass the weight through unchanged and consume nothing.
+        let mut mvs_params: Option<(u64, f64, f64)> = None;
+        if let Some(mvs) = self.mvs.as_mut() {
+            if mvs.sample_rate < 1.0 {
+                let lambda = match mvs.lambda {
+                    Some(l) => l,
+                    None => {
+                        if approx.len() != self.n {
+                            return Err(CbError::LengthMismatch {
+                                column: "approx".to_owned(),
+                                expected: self.n,
+                                actual: approx.len(),
+                            });
+                        }
+                        mvs_lambda_from_der(&host_der1(mvs.der_kernel, approx, target))
+                    }
+                };
+                // rand_seed = the ONE main-stream draw; then two `performRandomChoice=false`
+                // compensation draws (`bootstrap()` Mvs branch) advance the stream to the next tree.
+                let rand_seed = mvs.rng.gen_rand();
+                mvs.rng.gen_rand();
+                mvs.rng.gen_rand();
+                mvs_params = Some((rand_seed, mvs.sample_rate, lambda));
             }
+        }
+
+        let sample_h = if let Some((kind, base, rand_seed, rate, temp)) = bootstrap_params {
+            Some(launch_bootstrap_weights_resident(
+                &self.client,
+                kind,
+                base,
+                rand_seed,
+                rate,
+                temp,
+                self.n,
+            )?)
+        } else if let Some((rand_seed, rate, lambda)) = mvs_params {
+            Some(launch_mvs_weights_resident(
+                &self.client,
+                &der1_h,
+                rand_seed,
+                rate,
+                lambda,
+                self.n,
+            )?)
+        } else {
+            None
+        };
+        let tree_weight_h = match sample_h {
+            Some(s) => Some(fold_weights_resident(
+                &self.client,
+                &self.weight_h,
+                &s,
+                self.n,
+            )?),
             None => None,
         };
         let weight_ref = tree_weight_h.as_ref().unwrap_or(&self.weight_h);

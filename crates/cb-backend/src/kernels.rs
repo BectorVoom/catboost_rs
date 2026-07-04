@@ -2868,6 +2868,14 @@ mod bootstrap_device_test;
 // NEVER a `cb-train` dep (Pattern B). Mounted under every backend (production, NOT `#[cfg(test)]`).
 pub(crate) mod mvs_device;
 
+// Device MVS self-oracle (source/test separation, Plan 07 GPUT-17, Pattern F): the device MVS draw
+// vs the FROZEN CPU `mvs_sample_weights` computed on the validated `cb_core::TFastRng64` + ordered
+// `sum_f64` (weights ≤1e-4, per-block threshold + sampled count), transcribed inline (no `cb-train`
+// dep). Lives in `kernels/mvs_device_test.rs`, mounted at `kernels::mvs_device_test`. Runs over
+// `SelectedRuntime` (u64/f64 serial → assertions skip off rocm/cuda, WR-01 anti-false-pass).
+#[cfg(test)]
+mod mvs_device_test;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
