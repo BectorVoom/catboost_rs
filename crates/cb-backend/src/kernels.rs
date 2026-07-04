@@ -2916,6 +2916,14 @@ mod cholesky_solve_test;
 // (no NaN, T-13-11). Amortized across the Plan-07 multi-output family. Mounted under every backend.
 pub(crate) mod multi_newton;
 
+// Device Newton der2 block-solve self-oracle (source/test separation, Plan 06 GPUT-12, Pattern F):
+// the device block solve vs the inline CPU parity ref (`cb_compute::solve_symmetric_newton`, coupled
+// + diagonal + scalar K=1) ≤1e-4; a non-PD block asserts the zeros fallback on both paths (T-13-11).
+// Lives in `kernels/multi_newton_test.rs`. Runs over `SelectedRuntime` (f64 serial → the numeric
+// assert skips off rocm/cuda, WR-01 anti-false-pass; the whole file is `not(feature = "wgpu")`).
+#[cfg(test)]
+mod multi_newton_test;
+
 // Device shared query-grouping infrastructure (Phase 13 Plan 03, GPUT-22): the PRODUCTION module
 // hosting the `#[cube]` grouping kernels — group ids / weighted means / max / bias removal / in-query
 // sort keys / taken-docs + query-end masks — amortized ONCE across all five query/listwise objectives
