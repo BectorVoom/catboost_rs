@@ -400,3 +400,131 @@ fn session_exact_leaf_grows_finite_quantile_leaves() {
     );
     drop(session);
 }
+
+/// (Gate, Plan 06 GPUT-09) the BOOTSTRAP arm: a covered non-`No` `bootstrap_type`
+/// (Bernoulli/Bayesian/Poisson) opens a session (`Ok(Some)`); MVS declines (Plan 07); the default
+/// (`No`) path is unchanged; and bootstrap PLUS a second non-default family flag still declines
+/// (D-10-01 all-or-nothing). Classify-only at `begin` — runs on EVERY backend.
+#[test]
+fn session_bootstrap_gate_covers_bernoulli_bayesian_poisson() {
+    use cb_compute::DeviceBootstrapType;
+    let n = 41usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let weight = weight_mod5(n);
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    let open = |cfg: &DeviceTrainConfig| {
+        GpuTrainSession::begin(
+            &Loss::Rmse, 6, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+            n_bins, 0.3, scaled_l2, cfg,
+        )
+        .expect("begin must not error while classifying the bootstrap arm")
+        .is_some()
+    };
+
+    let bern = DeviceTrainConfig {
+        bootstrap_type: DeviceBootstrapType::Bernoulli,
+        sample_rate: 0.7,
+        rng_seed: 17,
+        ..DeviceTrainConfig::default()
+    };
+    let bayes = DeviceTrainConfig {
+        bootstrap_type: DeviceBootstrapType::Bayesian,
+        rng_seed: 42,
+        ..DeviceTrainConfig::default()
+    };
+    let pois = DeviceTrainConfig {
+        bootstrap_type: DeviceBootstrapType::Poisson,
+        rng_seed: 7,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(open(&bern), "Bernoulli bootstrap must open a session (Plan 06)");
+    assert!(open(&bayes), "Bayesian bootstrap must open a session (Plan 06)");
+    assert!(open(&pois), "Poisson bootstrap must open a session (Plan 06)");
+
+    // MVS declines until Plan 07.
+    let mvs = DeviceTrainConfig {
+        bootstrap_type: DeviceBootstrapType::Mvs,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(!open(&mvs), "MVS bootstrap must still decline (Plan 07)");
+
+    // Bootstrap + a second non-default family flag (exact leaf) → decline (all-or-nothing).
+    let bern_plus_exact = DeviceTrainConfig {
+        bootstrap_type: DeviceBootstrapType::Bernoulli,
+        exact_leaf: true,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(&bern_plus_exact),
+        "bootstrap + a second non-default family flag must decline (all-or-nothing)"
+    );
+
+    // The default (No bootstrap) path is unchanged.
+    assert!(open(&DeviceTrainConfig::default()), "the No-bootstrap default still opens");
+}
+
+/// (End-to-end wiring, Plan 06 GPUT-09) a Bernoulli-bootstrap session grows a real device tree:
+/// `grow_one` draws the device-resident keep-mask, folds it into the resident weight, and grows a
+/// finite tree. Proves the begin→grow_one bootstrap wiring runs on device; the DRAW numerics are
+/// locked bit-for-bit by the `kernels::bootstrap_device` self-oracle. Needs `Atomic<u64>` (the
+/// resident histogram) + the u64 RNG kernel → SKIPS on cpu/wgpu, runs on rocm/cuda in-env.
+#[test]
+fn session_bootstrap_grows_finite_tree() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[12-06] SKIP session_bootstrap_grows_finite_tree: active backend lacks Atomic<u64> / \
+             the u64 RNG kernel (cpu/wgpu) — needs rocm/cuda"
+        );
+        return;
+    }
+    let n = 256usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let depth = 3usize;
+    let target = ramp_centred(n);
+    let weight = vec![1.0_f64; n];
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    let bern = DeviceTrainConfig {
+        bootstrap_type: cb_compute::DeviceBootstrapType::Bernoulli,
+        sample_rate: 0.7,
+        rng_seed: 2024,
+        ..DeviceTrainConfig::default()
+    };
+    let mut session = GpuTrainSession::begin(
+        &Loss::Rmse, depth, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+        n_bins, 0.3, scaled_l2, &bern,
+    )
+    .expect("begin must not error on a covered Bernoulli-bootstrap config")
+    .expect("Bernoulli bootstrap must open a session (Plan 06 gate arm)");
+
+    // Grow two trees to exercise the continuous-stream advance between trees.
+    let approx = vec![0.0_f64; n];
+    let t0 = match session.grow_one(&approx, &target) {
+        Ok(t) => t,
+        Err(cb_core::CbError::Unsupported(msg)) if msg.contains("Atomic<u64>") => {
+            // The resident partition histogram needs an ADVERTISED Atomic<u64> add. When the
+            // in-env ROCm runtime does not advertise it (an environment/driver capability state,
+            // NOT a bootstrap-draw defect — the `kernels::bootstrap_device` self-oracle proves the
+            // draw bit-for-bit), the WHOLE resident grow is unavailable, so skip the e2e wiring
+            // check (WR-01 capability-skip pattern) rather than fail on an environmental gate.
+            println!("[12-06] SKIP session_bootstrap_grows_finite_tree: {msg}");
+            return;
+        }
+        Err(e) => panic!("bootstrap grow_one (tree 0) must succeed: {e:?}"),
+    };
+    let t1 = session.grow_one(&approx, &target).expect("bootstrap grow_one (tree 1) must succeed");
+    for tree in [&t0, &t1] {
+        assert_eq!(tree.splits.len(), depth, "bootstrap tree must have {depth} splits");
+        assert_eq!(tree.leaf_of.len(), n, "leaf_of length must equal n");
+        assert_eq!(tree.leaf_values.len(), 1usize << depth, "2^depth leaf values");
+        for (l, &v) in tree.leaf_values.iter().enumerate() {
+            assert!(v.is_finite(), "bootstrap leaf value {l} must be finite, got {v}");
+        }
+    }
+    drop(session);
+}

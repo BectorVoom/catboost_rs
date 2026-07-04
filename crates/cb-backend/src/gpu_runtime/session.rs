@@ -42,12 +42,15 @@ use cubecl::server::Handle;
 use cb_compute::{
     DeviceBootstrapType, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig, EScoreFunction, Loss,
 };
-use cb_core::{CbError, CbResult};
+use cb_core::{CbError, CbResult, TFastRng64};
 
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
     grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
     DerBinaryKernel,
+};
+use crate::kernels::bootstrap_device::{
+    fold_weights_resident, launch_bootstrap_weights_resident, DeviceBootstrapKind,
 };
 use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
@@ -66,6 +69,50 @@ fn map_grow_policy(grow_policy: DeviceGrowPolicy) -> Option<NonsymPolicy> {
         // SymmetricTree → the resident oblivious path (not a non-sym policy); Region → Plan 04.
         DeviceGrowPolicy::SymmetricTree | DeviceGrowPolicy::Region => None,
     }
+}
+
+/// The bootstrap gate arm outcome (Phase 12 Plan 06, GPUT-09) — the `map_score_fn` /
+/// `map_grow_policy` `Option`-returning template, widened to THREE outcomes because `No` is a
+/// covered non-draw (NOT a decline):
+/// - `NoDraw` — `bootstrap_type == No`: the byte-unchanged covered default (no device draw).
+/// - `Device(kind)` — Bernoulli/Bayesian/Poisson: draw the device-resident sample per tree.
+/// - `Decline` — `Mvs`: not covered until Plan 07 → `Ok(None)` (CPU fallback, D-10-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapArm {
+    NoDraw,
+    Device(DeviceBootstrapKind),
+    Decline,
+}
+
+/// Map a host [`DeviceBootstrapType`] to the device bootstrap arm (Pattern A). Bernoulli/Bayesian/
+/// Poisson flip to the device draw THIS plan; MVS declines to CPU until Plan 07; `No` is the
+/// covered non-draw default.
+fn map_bootstrap_kernel(bootstrap_type: DeviceBootstrapType) -> BootstrapArm {
+    match bootstrap_type {
+        DeviceBootstrapType::No => BootstrapArm::NoDraw,
+        DeviceBootstrapType::Bernoulli => BootstrapArm::Device(DeviceBootstrapKind::Bernoulli),
+        DeviceBootstrapType::Bayesian => BootstrapArm::Device(DeviceBootstrapKind::Bayesian),
+        DeviceBootstrapType::Poisson => BootstrapArm::Device(DeviceBootstrapKind::Poisson),
+        DeviceBootstrapType::Mvs => BootstrapArm::Decline,
+    }
+}
+
+/// The per-fit device bootstrap state (Phase 12 Plan 06, GPUT-09). `Some` iff the fit committed to
+/// a covered oblivious grow with a non-`No` `bootstrap_type`. Holds the CONTINUOUS training stream
+/// on the validated [`cb_core::TFastRng64`] (seeded from `config.rng_seed`); [`GpuTrainSession::grow_one`]
+/// snapshots its O(1) base state per tree, draws the device-resident sample, folds it into the
+/// resident weight, then advances the stream by the draws that tree consumed — so the keep-mask /
+/// weights stay device-resident (no per-tree host round-trip, D-08) while the host manages only the
+/// O(1) stream position on the sanctioned RNG (never a `cb_train` dep).
+struct BootstrapState {
+    kind: DeviceBootstrapKind,
+    /// The persistent continuous training stream (seeded once from `config.rng_seed`).
+    rng: TFastRng64,
+    /// Bernoulli/Poisson subsample rate (`config.sample_rate`).
+    sample_rate: f64,
+    /// Bayesian bagging temperature — the catboost default `1.0` (config carries no field yet;
+    /// the covered device Bayesian regime uses the default, MVP-scoped).
+    bagging_temperature: f64,
 }
 
 /// The per-fit non-symmetric device-grow state (Phase 12 Plan 03). Held when the fit commits
@@ -188,6 +235,11 @@ pub struct GpuTrainSession {
     /// to a SymmetricTree oblivious grow with device Exact leaves (covered quantile-family
     /// loss + `exact_leaf`). `None` for the Newton/default path (byte-unchanged, D-04).
     exact_leaf: Option<ExactLeafState>,
+    /// The per-fit bootstrap state (Phase 12 Plan 06, GPUT-09). `Some` iff the fit committed to a
+    /// covered oblivious grow with a non-`No` `bootstrap_type` — `grow_one` then draws the
+    /// device-resident sample per tree and folds it into the resident weight. `None` for the
+    /// no-subsampling default (byte-unchanged, D-04).
+    bootstrap: Option<BootstrapState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -321,14 +373,24 @@ impl GpuTrainSession {
             None => return Ok(None),
         };
 
+        // Phase 12 Plan 06 (GPUT-09): the bootstrap arm. `map_bootstrap_kernel` returns the device
+        // draw family for Bernoulli/Bayesian/Poisson (flipped ON this plan), the covered non-draw
+        // default for `No`, or a decline for MVS (Plan 07). Only reachable on the oblivious path
+        // (the nonsym `family_default` below still requires `bootstrap_type == No`).
+        let bootstrap_arm = map_bootstrap_kernel(config.bootstrap_type);
+
         match nonsym_policy {
             None => {
                 // Region is a distinct policy with no device kernel yet (Plan 04) — decline it
                 // explicitly (never let it fall through to the oblivious path). SymmetricTree
                 // rides the Plan-01 covered-regime gate, EXTENDED (Plan 05) to also admit the
-                // exact-leaf quantile-family regime (D-10-01 all-or-nothing: any OTHER non-default
-                // family flag still routes to the CPU grower).
+                // exact-leaf quantile-family regime, and (Plan 06) the bootstrap regime (D-10-01
+                // all-or-nothing: any OTHER non-default family flag still routes to the CPU grower).
                 if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+                    return Ok(None);
+                }
+                // MVS bootstrap is not covered until Plan 07 — decline explicitly.
+                if bootstrap_arm == BootstrapArm::Decline {
                     return Ok(None);
                 }
                 // The exact-leaf regime is covered when ONLY `exact_leaf` (+ its α/δ) is
@@ -338,7 +400,14 @@ impl GpuTrainSession {
                     && config.mvs_lambda.is_none()
                     && config.ctr.is_none()
                     && config.max_leaves.is_none();
-                if !config.is_covered_regime() && !exact_covered {
+                // The bootstrap regime is covered when ONLY `bootstrap_type` (+ its rate/seed) is
+                // non-default (Newton leaf, symmetric, single fold, no MVS/exact/CTR/leaf-cap).
+                let bootstrap_covered = matches!(bootstrap_arm, BootstrapArm::Device(_))
+                    && !config.exact_leaf
+                    && config.mvs_lambda.is_none()
+                    && config.ctr.is_none()
+                    && config.max_leaves.is_none();
+                if !config.is_covered_regime() && !exact_covered && !bootstrap_covered {
                     return Ok(None);
                 }
             }
@@ -470,6 +539,19 @@ impl GpuTrainSession {
             _ => None,
         };
 
+        // Phase 12 Plan 06: capture the bootstrap state (oblivious path only; nonsym requires
+        // `bootstrap_type == No`). Seed the CONTINUOUS training stream ONCE from `config.rng_seed`;
+        // `grow_one` snapshots its O(1) base per tree and draws the device-resident sample.
+        let bootstrap = match bootstrap_arm {
+            BootstrapArm::Device(kind) if nonsym_policy.is_none() => Some(BootstrapState {
+                kind,
+                rng: TFastRng64::from_seed(config.rng_seed),
+                sample_rate: f64::from(config.sample_rate),
+                bagging_temperature: 1.0,
+            }),
+            _ => None,
+        };
+
         Ok(Some(Self {
             client,
             plain_cindex_h,
@@ -495,6 +577,7 @@ impl GpuTrainSession {
             config: config.clone(),
             nonsym,
             exact_leaf,
+            bootstrap,
         }))
     }
 
@@ -623,6 +706,55 @@ impl GpuTrainSession {
             }
         };
 
+        // Phase 12 Plan 06 (GPUT-09): the BOOTSTRAP arm. When a covered non-`No` `bootstrap_type`
+        // is active, draw the device-resident per-object sample from the CONTINUOUS stream's O(1)
+        // base state, fold it into a per-tree weight (`tree_weight = weight * sample`, on device),
+        // and advance the stream by the draws this tree consumed. The base `weight_h` is untouched
+        // (reused next tree); the default (no-bootstrap) path passes it through byte-unchanged (D-04).
+        // The RNG/client borrows are scoped so the O(1) stream advance (mutable `self.bootstrap`)
+        // completes before the launch reads `self.client`.
+        let mut bootstrap_params: Option<(DeviceBootstrapKind, [u64; 4], u64, f64, f64)> = None;
+        if let Some(bs) = self.bootstrap.as_mut() {
+            let base = bs.rng.raw_state();
+            // Bayesian consumes ONE main-stream draw for `rand_seed`; the per-block streams branch
+            // off it. Bernoulli/Poisson draw sequentially from the base (advanced by `n` below).
+            let rand_seed = match bs.kind {
+                DeviceBootstrapKind::Bayesian => bs.rng.gen_rand(),
+                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => 0,
+            };
+            bootstrap_params =
+                Some((bs.kind, base, rand_seed, bs.sample_rate, bs.bagging_temperature));
+            // Advance the continuous stream to the next tree's phase (Bernoulli/Poisson consume one
+            // `gen_rand` per object; Bayesian already advanced by the single `rand_seed` draw).
+            match bs.kind {
+                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => {
+                    bs.rng.advance(self.n as u64)
+                }
+                DeviceBootstrapKind::Bayesian => {}
+            }
+        }
+        let tree_weight_h = match bootstrap_params {
+            Some((kind, base, rand_seed, rate, temp)) => {
+                let sample_h = launch_bootstrap_weights_resident(
+                    &self.client,
+                    kind,
+                    base,
+                    rand_seed,
+                    rate,
+                    temp,
+                    self.n,
+                )?;
+                Some(fold_weights_resident(
+                    &self.client,
+                    &self.weight_h,
+                    &sample_h,
+                    self.n,
+                )?)
+            }
+            None => None,
+        };
+        let weight_ref = tree_weight_h.as_ref().unwrap_or(&self.weight_h);
+
         // Grow one tree over the resident handles; take ownership of the resident approx
         // (updated in place on device) and swap it back afterwards.
         let approx_h = self.approx_h.clone();
@@ -630,7 +762,7 @@ impl GpuTrainSession {
             &self.client,
             approx_h,
             &der1_h,
-            &self.weight_h,
+            weight_ref,
             &self.plain_cindex_h,
             &self.cindex_words_h,
             &self.offsets_h,
