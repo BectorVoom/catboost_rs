@@ -58,6 +58,7 @@ use crate::kernels::ctr_device::{
 };
 use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
+use crate::kernels::region_device::grow_region_tree;
 use crate::kernels::{SCORE_FN_COSINE, SCORE_FN_L2, SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2};
 use crate::SelectedRuntime;
 
@@ -209,6 +210,26 @@ struct NonsymState {
     der_kernel: DerBinaryKernel,
 }
 
+/// The per-fit device Region-grow state (Phase 12 Plan 04, GPUT-18, D-03a). `Some` iff the
+/// fit committed to a `grow_policy=Region` device grow. Like [`NonsymState`] the Region path
+/// is host-DRIVEN (the per-frontier device split scorer reads a host doc-subset per level),
+/// so it keeps HOST copies of the quantized bins + weights and re-derives the per-object der1
+/// from the caller's `approx` each tree via [`host_der1`] (the covered regime is unit weights /
+/// bias 0, so `der1 = target - approx` for RMSE / `target - sigmoid(approx)` for Logloss
+/// matches the CPU `compute_gradients` bit-for-bit). Region has `MaxLeaves = max_depth + 1`;
+/// there is no leaf cap (unlike Lossguide), so no `max_leaves` field.
+struct RegionState {
+    /// Feature-major quantized bins (`bins[f * n + i]`).
+    bins: Vec<u32>,
+    /// Per-object weight (the covered regime is all-`1.0`).
+    weight: Vec<f64>,
+    /// Region depth (`MaxLeaves = max_depth + 1`).
+    max_depth: usize,
+    min_data_in_leaf: usize,
+    /// The covered-loss der kind, driving the host der1 re-derivation.
+    der_kernel: DerBinaryKernel,
+}
+
 /// The per-fit device Exact-leaf state (Phase 12 Plan 05, GPUT-19). `Some` iff the fit
 /// committed to a SymmetricTree oblivious grow with `exact_leaf` set for a covered
 /// quantile-family loss. [`GpuTrainSession::grow_one`] then REPLACES the resident grow's
@@ -313,6 +334,11 @@ pub struct GpuTrainSession {
     /// device-resident sample per tree and folds it into the resident weight. `None` for the
     /// no-subsampling default (byte-unchanged, D-04).
     bootstrap: Option<BootstrapState>,
+    /// The per-fit Region-grow state (Phase 12 Plan 04, GPUT-18). `Some` iff the fit committed to
+    /// a `grow_policy=Region` device grow — [`Self::grow_one`] then dispatches to the host-driven
+    /// [`grow_region_tree`] (a walk-until-diverge PATH, `MaxLeaves = max_depth + 1`) instead of
+    /// the resident oblivious loop / non-sym node graph. `None` for every other grow policy.
+    region: Option<RegionState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -435,6 +461,12 @@ impl GpuTrainSession {
         // the oblivious / symmetric path (which is the byte-unchanged Plan-01 resident loop) and
         // for the not-yet-covered Region policy (Plan 04, declines below).
         let nonsym_policy = map_grow_policy(config.grow_policy);
+        // Phase 12 Plan 04 (GPUT-18, D-03a): the Region arm. Region is neither the oblivious
+        // resident path nor a non-symmetric node graph — it grows a walk-until-diverge PATH
+        // (`MaxLeaves = depth + 1`) via the host-driven device scorer. It is intercepted as a
+        // THIRD branch below (`map_grow_policy` returns `None` for it, so `region_active` guards
+        // the `None` arm from falling through to the SymmetricTree covered-regime gate).
+        let region_active = config.grow_policy == DeviceGrowPolicy::Region;
 
         // Phase 12 Plan 05 (GPUT-19): the exact-leaf gate arm. `map_leaf_method` returns the
         // device leaf method — `Newton` (default, unchanged) or the `Exact` weighted-quantile
@@ -453,9 +485,22 @@ impl GpuTrainSession {
         let bootstrap_arm = map_bootstrap_kernel(config.bootstrap_type);
 
         match nonsym_policy {
+            None if region_active => {
+                // Phase 12 Plan 04 (GPUT-18): the Region family gate. Region owns only its own
+                // knob (`grow_policy=Region`, depth → `MaxLeaves = depth + 1`); every OTHER family
+                // flag must still be the covered default (D-10-01 all-or-nothing PER family: no
+                // subsampling / MVS / exact leaf / CTR / leaf cap). Otherwise decline to CPU.
+                let family_default = config.bootstrap_type == DeviceBootstrapType::No
+                    && config.mvs_lambda.is_none()
+                    && !config.exact_leaf
+                    && config.ctr.is_none()
+                    && config.max_leaves.is_none();
+                if !family_default {
+                    return Ok(None);
+                }
+            }
             None => {
-                // Region is a distinct policy with no device kernel yet (Plan 04) — decline it
-                // explicitly (never let it fall through to the oblivious path). SymmetricTree
+                // Region is intercepted above (`region_active`). SymmetricTree
                 // rides the Plan-01 covered-regime gate, EXTENDED (Plan 05) to also admit the
                 // exact-leaf quantile-family regime, and (Plan 06) the bootstrap regime (D-10-01
                 // all-or-nothing: any OTHER non-default family flag still routes to the CPU grower).
@@ -544,7 +589,12 @@ impl GpuTrainSession {
         // This dispatch restriction applies ONLY to the resident oblivious partition-histogram
         // fill. The non-symmetric grow (Plan 03) scores via the whole-subset `pointwise_hist2`
         // path per node, which has no such line-size restriction — so skip the check for it.
-        if nonsym_policy.is_none() && !matches!(n_bins, 2 | 16 | 32 | 64 | 128 | 256) {
+        // The Region grow (Plan 04) also scores via the whole-subset `pointwise_hist2` path
+        // (no line-size restriction), so skip the resident-fill dispatch check for it too.
+        if nonsym_policy.is_none()
+            && !region_active
+            && !matches!(n_bins, 2 | 16 | 32 | 64 | 128 | 256)
+        {
             return Ok(None);
         }
 
@@ -591,6 +641,7 @@ impl GpuTrainSession {
         // discipline). The full-tree grow numerics over the augmented cindex are the Kaggle CUDA
         // sign-off (Plan 09); GPUT-10 stays Pending until then.
         let ctr_is_covered = nonsym_policy.is_none()
+            && !region_active
             && ctr_covered(config, n, n_bins)
             && bootstrap_arm == BootstrapArm::NoDraw
             && !config.exact_leaf
@@ -650,6 +701,17 @@ impl GpuTrainSession {
             der_kernel,
         });
 
+        // Phase 12 Plan 04: capture the Region-grow state (host-driven; keeps host copies of the
+        // bins + weights and re-derives der1 from the caller's approx per tree, exactly like the
+        // non-sym path). `grow_one` dispatches to `grow_region_tree` (walk-until-diverge PATH).
+        let region = region_active.then(|| RegionState {
+            bins: bins_feature_major.to_vec(),
+            weight: weight.to_vec(),
+            max_depth: depth,
+            min_data_in_leaf: config.min_data_in_leaf,
+            der_kernel,
+        });
+
         // Phase 12 Plan 05: capture the Exact-leaf state (oblivious path only; nonsym declined
         // exact above). `grow_one` overwrites the Newton leaf values with the device weighted
         // quantile per leaf, from the host residuals + this weight copy.
@@ -699,6 +761,7 @@ impl GpuTrainSession {
             nonsym,
             exact_leaf,
             bootstrap,
+            region,
         }))
     }
 
@@ -737,6 +800,36 @@ impl GpuTrainSession {
                 expected: self.n,
                 actual: target.len(),
             });
+        }
+
+        // Phase 12 Plan 04 (GPUT-18, D-03a): the REGION arm. The fit committed to a
+        // `grow_policy=Region` device grow — re-derive der1 on the host from the caller's
+        // `approx` + target (the covered regime is unit weights / bias 0, so this matches the CPU
+        // `compute_gradients` bit-for-bit) and grow the Region PATH via the host-driven device
+        // scorer. Emits a `region_path` + `depth+1` leaf values; the boosting Region fold arm
+        // materializes the `RegionTree`. Checked BEFORE the non-sym arm (they are mutually
+        // exclusive — `region` and `nonsym` are never both `Some`).
+        if let Some(rg) = self.region.as_ref() {
+            if approx.len() != self.n {
+                return Err(CbError::LengthMismatch {
+                    column: "approx".to_owned(),
+                    expected: self.n,
+                    actual: approx.len(),
+                });
+            }
+            let der1 = host_der1(rg.der_kernel, approx, target);
+            return grow_region_tree(
+                &der1,
+                &rg.weight,
+                &rg.bins,
+                self.n,
+                self.n_bins,
+                self.n_features,
+                rg.max_depth,
+                rg.min_data_in_leaf,
+                self.scaled_l2,
+                self.score_fn,
+            );
         }
 
         // Phase 12 Plan 03 (GPUT-18): the NON-SYMMETRIC arm. The fit committed to a Depthwise /
@@ -937,6 +1030,8 @@ impl GpuTrainSession {
             // (byte-unchanged, D-04). Only the Plan-03 non-sym device grow fills these.
             step_nodes: Vec::new(),
             node_id_to_leaf_id: Vec::new(),
+            // Oblivious emission carries NO region path (Plan 04 Region grow fills it).
+            region_path: Vec::new(),
         })
     }
 }

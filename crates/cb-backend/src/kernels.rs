@@ -4360,6 +4360,24 @@ pub(crate) mod nonsym_grow;
 #[cfg(test)]
 mod nonsym_grow_test;
 
+// GPUT-18 (Phase 12 Plan 04, W2b): the device Region grow driver — a PRODUCTION module
+// composing the SAME `nonsym_grow::device_best_split_for_node` per-frontier scoring spine as
+// the non-symmetric grow, with a REGION selection (walk-until-diverge, `MaxLeaves =
+// MaxDepth+1`). Emits a `region_path` (path, NOT a node graph) + `depth+1` leaf values onto
+// `DeviceGrownTree`; the boosting Region fold arm materializes a `RegionTree`. Transcribes the
+// `AddRegionImpl` walk inline (NEVER `use cb_train`/`cb_model`, Pattern B). Lives in
+// `kernels/region_device.rs`; its serial self-oracle vs the frozen CPU Region reference is the
+// sibling `kernels/region_device_test.rs`.
+pub(crate) mod region_device;
+
+// Serial self-oracle for the device Region grow (GPUT-18): device `grow_region_tree` vs the
+// frozen ≤1e-5 CPU Region reference (Plan 02) — path structure EXACT (per-level
+// `(feature, bin, direction, one_hot)`), leaf values ≤1e-4. Runs over `SelectedRuntime` (the
+// pointwise-hist scoring path works on cpu/wgpu too, but the WR-01 anti-false-pass skip keeps
+// it rocm/cuda-gated like the non-sym oracle). Lives in `kernels/region_device_test.rs`.
+#[cfg(test)]
+mod region_device_test;
+
 // Bit-packed compressed index (cindex) bit-exact self-oracle (GPU-01 cindex slice,
 // Phase 10-06, GPUT-15): the host `gpu_runtime::cindex::pack_cindex` grouped packing +
 // the device `read_all_bins_kernel` (which reads every cell through the ONE

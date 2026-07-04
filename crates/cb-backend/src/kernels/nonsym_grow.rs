@@ -69,14 +69,14 @@ pub(crate) enum NonsymPolicy {
 /// GAIN (2-leaf split score minus the unsplit single-leaf score), and the left / right
 /// child document subsets (`value <= border` / `value > border`). Mirrors
 /// `cb_train::tree::LeafBestSplit`.
-struct NodeBestSplit {
-    feature: u32,
-    bin: u32,
-    gain: f64,
+pub(crate) struct NodeBestSplit {
+    pub(crate) feature: u32,
+    pub(crate) bin: u32,
+    pub(crate) gain: f64,
     /// Left-child docs (split FALSE: `cindex <= bin`).
-    left_docs: Vec<usize>,
+    pub(crate) left_docs: Vec<usize>,
     /// Right-child docs (split TRUE: `cindex > bin`).
-    right_docs: Vec<usize>,
+    pub(crate) right_docs: Vec<usize>,
 }
 
 /// One built node in the flat non-symmetric node graph (mirrors
@@ -126,7 +126,7 @@ fn unsplit_score(docs: &[usize], der1: &[f64], weight: &[f64], scaled_l2: f64, s
 /// cannot be split (too few docs, no device candidate, or gain below the `1e-9` cutoff) —
 /// EXACTLY `cb_train::tree::best_split_for_leaf`'s gating, so the emitted structure matches.
 #[allow(clippy::too_many_arguments)]
-fn device_best_split_for_node(
+pub(crate) fn device_best_split_for_node(
     docs: &[usize],
     der1: &[f64],
     weight: &[f64],
@@ -468,5 +468,8 @@ pub(crate) fn grow_nonsym_tree(
         leaf_of,
         step_nodes,
         node_id_to_leaf_id,
+        // Non-symmetric emission carries NO region path (the boosting fold arm keys the
+        // Region dispatch on this being non-empty; a node-graph tree leaves it empty).
+        region_path: Vec::new(),
     })
 }

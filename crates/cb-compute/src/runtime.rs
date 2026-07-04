@@ -948,6 +948,25 @@ pub struct DeviceGrownTree {
     /// leaf id. **EMPTY** for the oblivious / symmetric path; ONLY the Plan-03
     /// non-sym device grow fills it. Plain host type — never a `cubecl` type.
     pub node_id_to_leaf_id: Vec<u32>,
+    /// REGION path carrier (Phase 12 Plan 04, GPUT-18, D-03a). The per-level
+    /// walk-until-diverge Region path (upstream `TRegionModel`), one entry per
+    /// level as `(feature_index, bin_id, expected_direction, one_hot)`:
+    /// - `feature_index` / `bin_id`: the level's chosen split; the caller resolves
+    ///   `border = feature_borders[feature][bin_id]` (the SAME `bin > bin_id` /
+    ///   `value > border` forward-bit test the oblivious path uses).
+    /// - `expected_direction`: the CONTINUE direction — the walk descends to the
+    ///   next level while `(value > border) == expected_direction`, and diverges
+    ///   into the current terminal bin on the first mismatch.
+    /// - `one_hot`: the categorical one-hot flag (always `false` for the device
+    ///   float Region grow; carried for structural fidelity / future parity).
+    ///
+    /// A depth-`d` Region has `d` path entries and exactly `d + 1` leaf values
+    /// (NOT `2^d` — the node-graph failure signal). **EMPTY** for the oblivious /
+    /// non-symmetric path (`step_nodes` empty AND `region_path` empty ⇒ oblivious;
+    /// non-empty `step_nodes` ⇒ non-symmetric; non-empty `region_path` ⇒ Region);
+    /// ONLY the Plan-04 device Region grow fills it. Plain host type — never a
+    /// `cubecl` type (the seam must never pull a backend dep into `cb-train`).
+    pub region_path: Vec<(u32, u32, bool, bool)>,
 }
 
 /// The device grow policy (Phase 12 Plan 01, GPUT-18), a PLAIN HOST enum mirroring
