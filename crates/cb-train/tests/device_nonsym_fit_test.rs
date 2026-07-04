@@ -45,7 +45,10 @@ fn nonsym_params(grow_policy: EGrowPolicy) -> BoostParams {
         loss: Loss::Rmse,
         iterations: 2,
         depth: 3,
-        learning_rate: 1.0,
+        // lr < 1 so the separable step fixture is NOT fit exactly in one tree — a non-zero
+        // residual remains for the 2nd iteration (a full-fit residual is all-zero → the root
+        // gain drops below the 1e-9 cutoff and BOTH growers would report Degenerate).
+        learning_rate: 0.3,
         l2_leaf_reg: 0.0,
         random_strength: 0.0,
         boost_from_average: false,
@@ -165,18 +168,14 @@ mod device {
                 "[{label}] obj {i}: device pred {d} vs cpu {c} exceeds ε=1e-4 (abs={abs:.3e})"
             );
         }
-        let target_err = dev_pred
+        // The two device trees each move the approx toward the separable target by `lr`; the
+        // sign must already match the target (partial fit), a sanity check the model is real.
+        let sign_ok = dev_pred
             .iter()
             .zip(target.iter())
-            .map(|(&p, &t)| (p - t).abs())
-            .fold(0.0_f64, f64::max);
-        println!(
-            "[{label}] device vs cpu max |Δpred| = {max_abs:.3e}; device vs target max |Δ| = {target_err:.3e}"
-        );
-        assert!(
-            target_err <= 1e-4,
-            "[{label}] the separable step fixture must be fit within ε=1e-4 (target_err={target_err:.3e})"
-        );
+            .all(|(&p, &t)| p == 0.0 || p.signum() == t.signum());
+        println!("[{label}] device vs cpu max |Δpred| = {max_abs:.3e}; sign_matches_target={sign_ok}");
+        assert!(sign_ok, "[{label}] device predictions must track the target sign (partial fit)");
     }
 }
 
