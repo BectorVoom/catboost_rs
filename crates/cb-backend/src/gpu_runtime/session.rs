@@ -1017,6 +1017,14 @@ impl GpuTrainSession {
             // `gen_rand` per object; Bayesian already advanced by the single `rand_seed` draw).
             match bs.kind {
                 DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => {
+                    // IN-02: Bernoulli consumes exactly one `gen_rand` per object, so the
+                    // `n`-draw advance is draw-faithful. Poisson (Knuth) consumes a VARIABLE
+                    // number of draws per object, so this advance is a deterministic-but-
+                    // arbitrary phase, NOT aligned to the draws actually consumed. That is
+                    // fine under the current scope (Poisson is validated for determinism
+                    // only — same seed ⇒ same weights — and has no CPU oracle). If a Poisson
+                    // parity oracle is ever added, make the kernel emit its consumed-draw
+                    // count (or advance the stream on-device) so this matches consumption.
                     bs.rng.advance(self.n as u64)
                 }
                 DeviceBootstrapKind::Bayesian => {}
@@ -1116,6 +1124,12 @@ impl GpuTrainSession {
         )?;
 
         // Advance the resident state for the next tree.
+        // IN-03: in the EXACT-leaf arm these two handles are overwritten from the
+        // freshly re-uploaded caller approx at the top of the NEXT call (der1/approx
+        // re-sync), so this Newton-updated writeback is discarded there — correct
+        // (the re-sync guarantees it), just redundant for the exact path. Kept
+        // unconditional so the non-exact (Newton-resident) arm keeps its carried
+        // state; the exact arm's extra der launch is harmless.
         self.approx_h = approx_next;
         self.der1_h = Some(der1_next);
 
