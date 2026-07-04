@@ -423,6 +423,13 @@ pub use session::*;
 // the `ranking_det_test` self-oracle reaches the der drivers.
 pub(crate) mod ranking;
 
+// Phase 13 Plan 04 (GPUT-22): the deterministic ranking der self-oracle (source/test separation) —
+// device QueryRMSE / QuerySoftMax der vs the CPU `cb_compute::ranking_der` at ε=1e-4, plus the
+// QueryCrossEntropy bounded-shift self-consistency + independent Ok(None) gate. rocm in-env on
+// gfx1100 (numeric ε assertions device-gated; cpu records-only, WR-01).
+#[cfg(test)]
+mod ranking_det_test;
+
 // Phase 10-07 (GPUT-02/03): the GpuTrainSession residency cross-oracle (source/test
 // separation) — begin uploads once, grow_one reuses the resident handles + chains der1 on
 // device, structure matches the CPU multi-tree boosting reference; the coverage gate
