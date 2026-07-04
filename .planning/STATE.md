@@ -4,11 +4,11 @@ milestone: v1.1
 milestone_name: GPU Performance
 current_phase: 13
 current_phase_name: pairwise-ranking-multiclass-ordered-langevin-device-coverage
-status: executing
-stopped_at: Completed 13-07-PLAN.md
-last_updated: "2026-07-04T09:59:42.610Z"
+status: paused-human-gate
+stopped_at: 13-10 scaffold committed; PAUSED at Task 2 BLOCKING human gate (Kaggle CUDA per-family ε=1e-4 + BENCH-02)
+last_updated: "2026-07-04T13:00:00.000Z"
 last_activity: 2026-07-04
-last_activity_desc: Phase 13 execution started
+last_activity_desc: 13-10 Kaggle CUDA notebook + coverage matrix scaffolded; PENDING human-gated CUDA run
 progress:
   total_phases: 5
   completed_phases: 3
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 13 (pairwise-ranking-multiclass-ordered-langevin-device-coverage) — EXECUTING
-Plan: 10 of 10
-Status: Ready to execute
-Last activity: 2026-07-04 — Phase 13 execution started
+Phase: 13 (pairwise-ranking-multiclass-ordered-langevin-device-coverage) — PAUSED (human gate)
+Plan: 10 of 10 — scaffold committed, PAUSED at Task 2 blocking human action
+Status: Awaiting human-gated Kaggle CUDA run (per-family ε=1e-4 correctness + BENCH-02 speed). Phase 13 device coverage is NOT authoritatively signed off until 13-COVERAGE-MATRIX.md tables are filled from real CUDA results.
+Last activity: 2026-07-04 — 13-10 Kaggle notebook + coverage matrix scaffolded (PENDING-KAGGLE)
 
 ## Performance Metrics
 
@@ -196,6 +196,7 @@ Last activity: 2026-07-04 — Phase 13 execution started
 | Phase 13 P07 | 45min | 2 tasks | 4 files |
 | Phase 13 P08 | 12 | 2 tasks | 4 files |
 | Phase 13 P09 | 22 | 2 tasks | 4 files |
+| Phase 13 P10 | 30min | 1/2 tasks (Task 2 human-gated PENDING) | 4 files |
 
 ## Accumulated Context
 
