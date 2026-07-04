@@ -242,6 +242,20 @@ pub(crate) fn launch_ordered_ctr_resident(
             actual: bins.len().min(class.len()).min(perm.len()),
         });
     }
+    // WR-02: guard bin/class value ranges host-side before dispatch. The kernel indexes
+    // `counts[2*bucket + class]` (length `2 * bucket_count`), so a bin >= bucket_count or a
+    // class not in {0,1} is an out-of-bounds device access (UB). Mirror the histogram seam's
+    // host-side bin guard rather than trusting callers to keep bins dense.
+    if let Some(&bad) = bins.iter().find(|&&b| (b as usize) >= bucket_count) {
+        return Err(CbError::OutOfRange(format!(
+            "ctr bin value {bad} >= bucket_count ({bucket_count})"
+        )));
+    }
+    if let Some(&bad) = class.iter().find(|&&c| c > 1) {
+        return Err(CbError::OutOfRange(format!(
+            "ctr class {bad} not in {{0,1}}"
+        )));
+    }
     if n == 0 {
         return Ok(ResidentCtr {
             good: client.empty(0),
