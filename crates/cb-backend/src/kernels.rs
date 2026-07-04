@@ -2906,6 +2906,16 @@ pub(crate) mod cholesky_solve;
 #[cfg(test)]
 mod cholesky_solve_test;
 
+// Device K-dim Newton der2 block-leaf solve (Phase 13 Plan 06, GPUT-12): the PRODUCTION module
+// hosting the serial `#[cube]` batched block solve — packed lower-triangular hessian reconstruction,
+// `maxTrace`/`adjustedL2` f32 regularization, `M = -(H − adjustedL2·I)`, inline Cholesky block
+// solve, `res = -x`. Coupled full k×k dispatch (MultiClass softmax) vs diagonal per-component 1×1
+// dispatch (the separable losses) selected by a mode flag. Transcribes
+// `cb_compute::leaf::solve_symmetric_newton` + `cholesky_solve` INLINE — NEVER a `cb-train` dep
+// (Pattern B). f64 non-atomic per-matrix arithmetic (D-07); a non-positive pivot → zeros fallback
+// (no NaN, T-13-11). Amortized across the Plan-07 multi-output family. Mounted under every backend.
+pub(crate) mod multi_newton;
+
 // Device shared query-grouping infrastructure (Phase 13 Plan 03, GPUT-22): the PRODUCTION module
 // hosting the `#[cube]` grouping kernels — group ids / weighted means / max / bias removal / in-query
 // sort keys / taken-docs + query-end masks — amortized ONCE across all five query/listwise objectives
