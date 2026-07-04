@@ -141,7 +141,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
   4. **Speed check (BENCH-02, standing):** each family (grow policies / Exact leaf / bootstrap / MVS / CTR) is timed on Kaggle CUDA **as it lands** — device path vs the host-CPU baseline, and vs official CatBoost GPU where a comparable config exists (warm-run/JIT-excluded, train-only) — so every family's kernels carry their own recorded CUDA speed measurement when they flip from `Ok(None)`→device, not deferred to Phase 14.
   5. Any sub-feature not yet passing Kaggle CUDA sign-off returns `Ok(None)`→CPU fallback (no incorrect device result), the CPU/host path stays byte-unchanged (GPUT-14/D-04), and the resulting GPU coverage matrix (correctness + per-family speed) is documented.
 
-**Plans**: 7/9 plans executed
+**Plans**: 8/9 plans executed
 
 Plans:
 **Wave 1**
@@ -167,7 +167,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 12-07-PLAN.md — W5 MVS per-block threshold + reweight (default GPU sampler) + gate arm (GPUT-17, Wave 6)
+- [x] 12-07-PLAN.md — W5 MVS per-block threshold + reweight (default GPU sampler) + gate arm (GPUT-17, Wave 6)
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
@@ -218,7 +218,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
-| 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 7/9 | In Progress|  |
+| 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 8/9 | In Progress|  |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
 

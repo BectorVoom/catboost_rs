@@ -37,7 +37,7 @@
 ### GPU Device-Resident Training — Sampling, Losses & Coverage (GPUT)
 
 - [ ] **GPUT-09**: Bootstrap + random-strength sampling runs on device (sampling parity for non-default `bootstrap_type`).
-- [ ] **GPUT-17**: **Minimal Variance Sampling (MVS)** bootstrap — per-block optimal threshold on `sqrt(der²+λ)` with inverse-probability reweighting — runs on device (MVS is CatBoost's *default* GPU sampling, distinct from GPUT-09's Poisson/Bayesian/Bernoulli), matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (§6.1 `mvs.{cu,cuh}`.)
+- [x] **GPUT-17**: **Minimal Variance Sampling (MVS)** bootstrap — per-block optimal threshold on `sqrt(der²+λ)` with inverse-probability reweighting — runs on device (MVS is CatBoost's *default* GPU sampling, distinct from GPUT-09's Poisson/Bayesian/Bernoulli), matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (§6.1 `mvs.{cu,cuh}`.)
 - [ ] **GPUT-10**: CTR / permutation-dependent categorical features train on device.
 - [ ] **GPUT-11**: The **PairLogit** pairwise-loss training path (pairwise 2×2-cell histograms) runs on device. (Query/listwise objectives are GPUT-22; the batched solver is GPUT-21. §6.3 `pairwise_hist*`.)
 - [ ] **GPUT-21**: Per-leaf **pairwise-derivative matrix assembly** (`MakePairwiseDerivatives` / `MakePointwiseDerivatives`) plus **batched device Cholesky** decomposition, forward/back substitution, ridge regularization, and score-from-decomposition (`CalcScoresCholesky`) run on device for pairwise split-scoring and leaf values, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (§6.3 `split_pairwise.{cu,cuh}`, `linear_solver.{cu,cuh}`.)
@@ -94,7 +94,7 @@
 | GPUT-18 | Phase 12 | Complete |
 | GPUT-19 | Phase 12 | Pending |
 | GPUT-09 | Phase 12 | Pending |
-| GPUT-17 | Phase 12 | Pending |
+| GPUT-17 | Phase 12 | Complete |
 | GPUT-10 | Phase 12 | Pending |
 | GPUT-11 | Phase 13 | Pending |
 | GPUT-21 | Phase 13 | Pending |
