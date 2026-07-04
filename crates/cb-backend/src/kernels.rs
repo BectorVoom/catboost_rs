@@ -2916,6 +2916,15 @@ mod cholesky_solve_test;
 // serial reductions surface a typed wgpu reject (no f64/u64 device channel).
 pub(crate) mod query_helper;
 
+// Device query-grouping self-oracle (source/test separation, Plan 03 GPUT-22, Pattern F): the device
+// group ids/means/max/bias-removal vs an inline serial CPU reference transcribing
+// `cb_compute::ranking_der::group_reduce_weighted` (no `cb-train` dep) ≤1e-4, plus the CreateSortKeys +
+// segmented-sort query-contiguity invariant and the SampledQuerySize ≥2 floor. Lives in
+// `kernels/query_helper_test.rs`. Runs over `SelectedRuntime` (f64/u64 group reductions → the numeric
+// assert skips off rocm/cuda, WR-01 anti-false-pass; the whole file is `not(feature = "wgpu")`).
+#[cfg(test)]
+mod query_helper_test;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
