@@ -2876,6 +2876,16 @@ pub(crate) mod mvs_device;
 #[cfg(test)]
 mod mvs_device_test;
 
+// Device Langevin / SGLB seeded-Gaussian noise (Phase 13 Plan 09, GPUT-20): the PRODUCTION module
+// hosting the serial `#[cube]` AddLangevinNoise kernel — per element, reseed `from_seed(rand_seed +
+// i).advance(10)`, draw ONE standard normal via the inline Marsaglia-polar rejection loop (the exact
+// `cb_core::normal::std_normal` draw order — VARIABLE even draw count per sample, Pitfall 4), and add
+// `coefficient · normal` to the RESIDENT reduced der IN PLACE (D-08 — no host round-trip). The
+// std_normal / RNG are transcribed inline — NEVER a `cb-train` dep (Pattern B). A `*Pairwise` +
+// Langevin config declines to CPU (`langevin_covered_loss` false for `is_pairwise_scoring`, A4).
+// Mounted under every backend (production, NOT `#[cfg(test)]`).
+pub(crate) mod langevin;
+
 // Device pairwise per-leaf linear-system assembly self-oracle (Phase 13 Plan 01, GPUT-11 /
 // GPUT-21 prep, Pattern F): the device `gpu_runtime::assemble_pairwise_system_host` packed
 // `linearSystem` vs the CPU parity reference (`calculate_pairwise_leaf_values` matrix build, reg

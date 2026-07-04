@@ -553,6 +553,61 @@ fn map_ordered_coverage(
     Some(OrderedState { der_kernel })
 }
 
+/// The per-fit device LANGEVIN / SGLB state (Phase 13 Plan 09, GPUT-20). `Some` iff the fit
+/// committed to a covered Langevin config — the noise the device driver ([`crate::kernels::langevin`])
+/// adds to the RESIDENT reduced derivatives per tree (`coefficient · std_normal(seed_i)`), reproducing
+/// the frozen pinned-seed CPU `coefficient · std_normal` sequence at ε=1e-4. Like [`RankingState`] /
+/// [`OrderedState`] this carries the coverage DECISION: the AddLangevinNoise kernel + self-oracle land
+/// THIS plan; there is no device Langevin CONFIG knob yet (the noise coefficient rides a forward seam
+/// alongside the per-tree grow descriptor), so a covered Langevin fit currently declines to the
+/// byte-unchanged CPU grower (D-04 no-regression) rather than fabricating an un-noised device grow.
+/// A `*Pairwise` + Langevin config is NOT covered ([`crate::kernels::langevin::langevin_covered_loss`]
+/// is false for `is_pairwise_scoring` — upstream `pairwise_oracle.h` `CB_ENSURE`, A4), so it falls
+/// back to CPU (`Ok(None)`), reinforcing the pairwise arm's own decline.
+#[allow(dead_code)]
+struct LangevinState {
+    /// The covered pointwise der kind, driving the host der re-derivation the Langevin noise layers
+    /// onto (RMSE / Logloss / CrossEntropy — the same covered family as the sampling families).
+    der_kernel: DerBinaryKernel,
+}
+
+/// Phase 13 Plan 09 (GPUT-20): the Langevin/SGLB coverage gate, mirroring the `map_ordered_coverage`
+/// / `map_ranking_coverage` `Option`-returning family-gated template (Pattern A). Returns
+/// `Some(LangevinState)` iff the fit is a COVERED Langevin config — a covered pointwise der loss
+/// ([`crate::kernels::langevin::langevin_covered_loss`]: RMSE / Logloss / CrossEntropy, and EXPLICITLY
+/// NOT a pairwise-scoring loss, A4), depth ≥ 1, Plain boosting, single fold, SymmetricTree, and every
+/// OTHER family flag still the covered default (D-10-01 all-or-nothing PER family: no bootstrap / MVS /
+/// exact-leaf / CTR / leaf-cap). A `*Pairwise` + Langevin config → `None` (Langevin not supported on
+/// the pairwise oracle) → the byte-unchanged CPU grower. Returns `None` for any uncovered config.
+fn map_langevin_coverage(
+    loss: &Loss,
+    config: &DeviceTrainConfig,
+    depth: usize,
+    boosting_type_is_plain: bool,
+    fold_count: usize,
+) -> Option<LangevinState> {
+    if !crate::kernels::langevin::langevin_covered_loss(loss) {
+        return None;
+    }
+    let der_kernel = map_der_kernel(loss)?;
+    if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
+        return None;
+    }
+    if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+        return None;
+    }
+    // All-or-nothing per family: no other non-default family flag may be set.
+    let family_default = config.bootstrap_type == DeviceBootstrapType::No
+        && config.mvs_lambda.is_none()
+        && !config.exact_leaf
+        && config.ctr.is_none()
+        && config.max_leaves.is_none();
+    if !family_default {
+        return None;
+    }
+    Some(LangevinState { der_kernel })
+}
+
 /// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
 /// for the covered losses, transcribing `cb_compute`'s documented formulas (RMSE:
 /// `der1 = target - approx`; Logloss / CrossEntropy: `der1 = target - sigmoid(approx)`). The
@@ -676,6 +731,15 @@ pub struct GpuTrainSession {
     /// `pairwise` / `ranking` / `multiclass` / `config`).
     #[allow(dead_code)]
     ordered: Option<OrderedState>,
+    /// The per-fit Langevin/SGLB state (Phase 13 Plan 09, GPUT-20). `Some` iff the fit committed to a
+    /// covered Langevin config (a covered pointwise der loss with the seeded-Gaussian noise layered
+    /// on the resident der); `None` for every non-Langevin path AND for every `*Pairwise` + Langevin
+    /// config (Langevin unsupported on the pairwise oracle, A4 → CPU fallback). Carries the coverage
+    /// DECISION the AddLangevinNoise driver consumes (the noise coefficient / per-tree grow seam is a
+    /// forward dependency, so no covered-Langevin session is constructed yet — the field is the landed
+    /// structural seam, like `pairwise` / `ranking` / `multiclass` / `ordered` / `config`).
+    #[allow(dead_code)]
+    langevin: Option<LangevinState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -889,6 +953,17 @@ impl GpuTrainSession {
                 None => return Ok(None),
             }
         }
+        // Phase 13 Plan 09 (GPUT-20): the Langevin/SGLB gate. `map_langevin_coverage` records whether
+        // this is a covered Langevin config — a covered pointwise der loss with the seeded-Gaussian
+        // noise layered on the resident der (`crate::kernels::langevin::langevin_covered_loss` is false
+        // for `is_pairwise_scoring`, so a `*Pairwise` + Langevin config is NOT covered — Langevin is
+        // unsupported on the pairwise oracle, A4 — and that config is already declined by the pairwise
+        // arm above). There is no device Langevin CONFIG knob yet (the noise coefficient + per-tree
+        // grow descriptor ride a forward seam), so — like the pairwise / ranking / multiclass / ordered
+        // structural seams — no covered-Langevin session is constructed here; the decision is recorded
+        // and a covered pointwise fit proceeds on the byte-unchanged path (the AddLangevinNoise kernel +
+        // self-oracle land THIS plan, exercised directly by the langevin self-oracle).
+        let _langevin = map_langevin_coverage(loss, config, depth, boosting_type_is_plain, fold_count);
         // Phase 12 Plan 03 (GPUT-18): the grow-policy arm. `map_grow_policy` returns the device
         // non-symmetric strategy for Depthwise / Lossguide (flipped ON this plan), or `None` for
         // the oblivious / symmetric path (which is the byte-unchanged Plan-01 resident loop) and
@@ -1239,6 +1314,12 @@ impl GpuTrainSession {
             // permutation-descriptor grow seam), and this construction is only ever reached on the
             // Plain (`boosting_type_is_plain`) path, so it is never ordered.
             ordered: None,
+            // Pointwise path: no Langevin state (byte-unchanged, D-04). A covered Langevin fit records
+            // its coverage decision via `map_langevin_coverage` but declines to CPU (the noise
+            // coefficient + per-tree grow seam are a forward dependency), and a `*Pairwise` + Langevin
+            // config is intercepted / declined above (A4), so this construction is only ever reached
+            // on a non-Langevin pointwise fit.
+            langevin: None,
         }))
     }
 
