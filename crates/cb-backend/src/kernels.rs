@@ -2896,6 +2896,16 @@ mod pairwise_deriv_test;
 // non-positive pivot → zeros fallback (no NaN, T-13-03). Mounted under every backend (production).
 pub(crate) mod cholesky_solve;
 
+// Device Cholesky solver self-oracle (source/test separation, Plan 02 GPUT-21, Pattern F): the
+// device solve vs the inline CPU parity refs — `calculate_pairwise_leaf_values` (leaf values, via
+// `cb_compute::pairwise_cholesky_solve`) and `calculate_score` (split score) — transcribed inline
+// (no `cb-train` dep) ≤1e-4; a degenerate non-PD system asserts the zeros fallback on both paths
+// (T-13-03). Lives in `kernels/cholesky_solve_test.rs`. Runs over `SelectedRuntime` (f64 serial →
+// the numeric assert skips off rocm/cuda, WR-01 anti-false-pass; the whole file is
+// `not(feature = "wgpu")`).
+#[cfg(test)]
+mod cholesky_solve_test;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
