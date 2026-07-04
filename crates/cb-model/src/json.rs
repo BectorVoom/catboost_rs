@@ -434,7 +434,14 @@ fn unflatten_non_symmetric(tree: &NonSymmetricTree) -> NonSymmetricNodeJson {
 }
 
 /// Build the serializable document from the canonical model.
-fn to_doc(model: &Model) -> ModelJsonDoc {
+///
+/// # Errors
+/// [`ModelError::Serialize`] if a Region tree carries a non-float split level
+/// (WR-03): the numeric JSON schema can only round-trip float levels, and
+/// silently dropping a CTR level would desync the level count from
+/// `leaf_values` (the walk could never reach the highest leaves). Surface it
+/// loudly instead of emitting a corrupt document.
+fn to_doc(model: &Model) -> Result<ModelJsonDoc, ModelError> {
     // Output dimensions (D-6.2-01 / Plan 06.2-02); `0`/unset means the scalar
     // default `1`. Drives the leaf-major transpose + per-dim bias vector below.
     let dim = model.approx_dimension.max(1);
@@ -509,27 +516,52 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
         .region_trees
         .iter()
         .map(|t| {
-            let levels = t
-                .levels
-                .iter()
-                .filter_map(|lvl| {
-                    lvl.split.as_float().map(|s| RegionLevelJson {
-                        border: s.border,
-                        float_feature_index: i64::try_from(s.feature).unwrap_or(i64::MAX),
-                        expected_direction: lvl.expected_direction,
-                        one_hot: lvl.one_hot,
-                    })
-                })
-                .collect();
-            RegionTreeJson {
+            // WR-03: the numeric JSON schema can only round-trip FLOAT levels. A
+            // `filter_map` that silently drops a CTR level would shrink the level
+            // count below `leaf_values.len() - 1`, so the deserialized walk could
+            // never reach the highest leaves — a silent round-trip corruption.
+            // Reject a non-float level loudly instead of emitting a corrupt doc.
+            let mut levels = Vec::with_capacity(t.levels.len());
+            for lvl in &t.levels {
+                let s = lvl.split.as_float().ok_or_else(|| {
+                    ModelError::Serialize(
+                        "region tree carries a non-float split level; the numeric \
+                         model.json schema can only serialize float levels"
+                            .to_owned(),
+                    )
+                })?;
+                levels.push(RegionLevelJson {
+                    border: s.border,
+                    float_feature_index: i64::try_from(s.feature).unwrap_or(i64::MAX),
+                    expected_direction: lvl.expected_direction,
+                    one_hot: lvl.one_hot,
+                });
+            }
+            // Belt-and-suspenders: the level count must be exactly one less than
+            // the per-dimension leaf count (a region of depth `d` has `d` levels
+            // and `d + 1` leaves). A mismatch would desync the walk.
+            let per_dim_leaves = if dim == 0 {
+                t.leaf_values.len()
+            } else {
+                t.leaf_values.len() / dim
+            };
+            if per_dim_leaves != levels.len() + 1 {
+                return Err(ModelError::Serialize(format!(
+                    "region tree level/leaf count mismatch: {} levels but {} leaves \
+                     (expected leaves == levels + 1)",
+                    levels.len(),
+                    per_dim_leaves
+                )));
+            }
+            Ok(RegionTreeJson {
                 levels,
                 leaf_values: transpose_dim_major_to_leaf_major(&t.leaf_values, dim),
                 leaf_weights: t.leaf_weights.clone(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ModelError>>()?;
 
-    ModelJsonDoc {
+    Ok(ModelJsonDoc {
         features_info: FeaturesInfoJson { float_features },
         oblivious_trees,
         trees,
@@ -543,7 +575,7 @@ fn to_doc(model: &Model) -> ModelJsonDoc {
         // Emit the multiclass `class_params.class_to_label` only when present; a
         // scalar model omits `model_info` entirely (byte-identical scalar export).
         model_info: model_info_from_class_labels(&model.class_to_label),
-    }
+    })
 }
 
 /// Transpose a DIMENSION-MAJOR leaf buffer (`src[d * n_leaves + l]`) into the
@@ -587,10 +619,11 @@ fn transpose_leaf_major_to_dim_major(src: &[f64], dim: usize) -> Vec<f64> {
 /// Serialize `model` to the upstream `model.json` schema at `path` (MODEL-06).
 ///
 /// # Errors
-/// [`ModelError::Json`] if serialization fails; [`ModelError::Io`] on a write
-/// failure.
+/// [`ModelError::Serialize`] if a Region tree carries a non-float split level
+/// or its level/leaf counts desync (WR-03); [`ModelError::Json`] if
+/// serialization fails; [`ModelError::Io`] on a write failure.
 pub fn save_json(model: &Model, path: &Path) -> Result<(), ModelError> {
-    let doc = to_doc(model);
+    let doc = to_doc(model)?;
     let s = serde_json::to_string_pretty(&doc)?;
     std::fs::write(path, s)?;
     Ok(())
@@ -690,10 +723,20 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
                 .collect::<Result<Vec<_>, ModelError>>()?;
             let leaf_values = transpose_leaf_major_to_dim_major(&t.leaf_values, dim);
             let n_leaves = if dim == 0 { t.leaf_values.len() } else { t.leaf_values.len() / dim };
-            let leaf_weights = if t.leaf_weights.len() == n_leaves {
+            // WR-04: only zero-fill when `leaf_weights` was legitimately ABSENT
+            // from the wire form (empty). A NON-EMPTY but length-mismatched
+            // `leaf_weights` signals a corrupt/desynced model (see WR-03); silently
+            // zeroing it would mask the inconsistency and degrade downstream
+            // consumers (SHAP / fstr / leaf-weight introspection). Surface it loudly.
+            let leaf_weights = if t.leaf_weights.is_empty() {
+                vec![0.0; n_leaves]
+            } else if t.leaf_weights.len() == n_leaves {
                 t.leaf_weights.clone()
             } else {
-                vec![0.0; n_leaves]
+                return Err(ModelError::Deserialize(format!(
+                    "region tree leaf_weights length {} does not match leaf count {n_leaves}",
+                    t.leaf_weights.len()
+                )));
             };
             Ok(RegionTree {
                 levels,

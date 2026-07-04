@@ -30,6 +30,14 @@ pub enum ModelError {
     #[error("unsupported model schema: {0}")]
     SchemaVersion(String),
 
+    /// The in-memory [`crate::Model`] cannot be represented in the target wire
+    /// schema without data loss: e.g. a Region tree carrying a non-float split
+    /// level, which the numeric `model.json` schema cannot round-trip (WR-03).
+    /// Surfaced loudly instead of emitting a document whose level count desyncs
+    /// from `leaf_values`.
+    #[error("model cannot be serialized without data loss: {0}")]
+    Serialize(String),
+
     /// Failed to (de)serialize JSON via `serde_json`.
     #[error("model.json (de)serialization error: {0}")]
     Json(#[from] serde_json::Error),
