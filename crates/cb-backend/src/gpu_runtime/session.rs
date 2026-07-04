@@ -363,6 +363,21 @@ fn is_deterministic_ranking_loss(loss: &Loss) -> bool {
     matches!(loss, Loss::QueryRmse | Loss::QuerySoftMax { .. })
 }
 
+/// Whether `loss` is a STOCHASTIC query/listwise ranking loss with a device der driver landed in
+/// Phase 13 Plan 05 (GPUT-22, D-08): YetiRank (pointwise leaf) / YetiRankPairwise (the PFound-F
+/// pairwise-leaf arm). Both ride the SAME in-query bootstrap-sampled competitor der
+/// ([`crate::gpu_runtime::ranking::yetirank_ders_host`] / `pfound_f_ders_host`), self-oracled against
+/// the FROZEN pinned-seed `yetirank_sample_pairs` + `calc_ders_for_queries` reference at ε=1e-4.
+fn is_stochastic_ranking_loss(loss: &Loss) -> bool {
+    matches!(loss, Loss::YetiRank { .. } | Loss::YetiRankPairwise { .. })
+}
+
+/// Whether `loss` is ANY device-covered query/listwise ranking loss (deterministic OR stochastic) —
+/// the gate that routes the fit through [`map_ranking_coverage`] (Phase 13 Plans 04 + 05, GPUT-22).
+fn is_ranking_loss(loss: &Loss) -> bool {
+    is_deterministic_ranking_loss(loss) || is_stochastic_ranking_loss(loss)
+}
+
 /// The per-fit device RANKING state (Phase 13 Plan 04, GPUT-22). `Some` iff the fit committed to a
 /// covered deterministic query objective — the [`crate::gpu_runtime::ranking::RankingObjective`] the
 /// device der driver computes over the Plan-03 grouping infra. Like [`PairwiseState`] this carries
@@ -400,7 +415,15 @@ fn map_ranking_coverage(
         Loss::QuerySoftMax { lambda, beta } => {
             crate::gpu_runtime::ranking::RankingObjective::QuerySoftMax { beta, lambda }
         }
-        // Not a deterministic ranking loss with a landed device der driver.
+        // Phase 13 Plan 05 (D-08): the stochastic pair. YetiRank → pointwise-leaf arm;
+        // YetiRankPairwise → the PFound-F pairwise-leaf arm. Both share the sampled-pair device der.
+        Loss::YetiRank { permutations, decay } => {
+            crate::gpu_runtime::ranking::RankingObjective::YetiRank { permutations, decay }
+        }
+        Loss::YetiRankPairwise { permutations, decay } => {
+            crate::gpu_runtime::ranking::RankingObjective::PFoundF { permutations, decay }
+        }
+        // Not a ranking loss with a landed device der driver.
         _ => return None,
     };
     // Independent per-objective gate: QueryCrossEntropy (Open Q3) is deferred even though its
@@ -688,7 +711,14 @@ impl GpuTrainSession {
         // dependency, so BOTH the covered and uncovered ranking branches decline to the
         // byte-unchanged CPU grower (D-04 no-regression) — NEVER a fabricated pointwise grow on a
         // ranking fit (the pairwise-gate precedent).
-        if is_deterministic_ranking_loss(loss) {
+        // Phase 13 Plan 05 (GPUT-22, D-08) EXTENDS this branch to the STOCHASTIC pair (YetiRank /
+        // PFound-F). NOTE: `YetiRankPairwise` (the PFound-F leaf path) is ALSO `is_pairwise_scoring`,
+        // so it is intercepted by the pairwise branch ABOVE (which likewise declines to CPU, the grow
+        // seam being a forward dependency) — its device der driver + self-oracle
+        // (`ranking::pfound_f_ders_host`) still land this plan and are exercised directly by the
+        // `ranking_stoch_test` self-oracle. YetiRank (pointwise leaf, NOT pairwise-scoring) reaches
+        // here and records its ranking coverage decision via `map_ranking_coverage`.
+        if is_ranking_loss(loss) {
             match map_ranking_coverage(loss, config, depth, boosting_type_is_plain, fold_count) {
                 // Covered ranking config: der driver + self-oracle landed; grow seam is a forward
                 // dependency. Decline to CPU (never a fabricated pointwise grow on a ranking fit).

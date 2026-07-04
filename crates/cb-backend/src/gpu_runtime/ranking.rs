@@ -48,6 +48,8 @@ use crate::kernels::query_helper::{
     compute_group_ids_host, compute_group_max_host, compute_group_means_host,
     remove_group_means_host,
 };
+#[cfg(not(feature = "wgpu"))]
+use crate::kernels::exact_quantile::segmented_radix_sort;
 use crate::SelectedRuntime;
 
 /// The deterministic query/listwise objective this driver computes the der for. QueryRMSE and
@@ -70,6 +72,28 @@ pub(crate) enum RankingObjective {
     /// QueryCrossEntropy — per-query bisection/Newton shift search (Open Q3, INDEPENDENTLY gated
     /// off: no CPU der oracle yet, so it is deferred rather than shipped as unverified der parity).
     QueryCrossEntropy,
+    /// YetiRank (Phase 13 Plan 05, D-08) — the STOCHASTIC in-query bootstrap-sampled listwise
+    /// objective (pointwise leaf). Per bootstrap iteration the device perturbs each doc's
+    /// exp-approx with `uni/(1.000001−uni)` (inline PCG, pinned seed), sorts within each query
+    /// (`segmented_radix_sort`), accumulates the Classic decayed pairwise weights, then the
+    /// accumulated competitors feed the pairwise-logit der — reproducing the CPU
+    /// `yetirank_sample_pairs` + `calc_ders_for_queries` stream bit-for-bit (Pitfall 4).
+    YetiRank {
+        /// Noise permutation count (`permutations`, default 10; validated `>= 1`).
+        permutations: u32,
+        /// Classic-weight geometric decay (`decay`, default 0.85; validated in `[0, 1]`).
+        decay: f64,
+    },
+    /// PFound-F (Phase 13 Plan 05, D-08) — the STOCHASTIC pairwise-leaf listwise objective
+    /// (`YetiRankPairwise`, the GPU `pfound_f` arm). Shares the SAME sampled-pair RNG stream +
+    /// competitor der as [`RankingObjective::YetiRank`]; only the leaf path differs (Cholesky vs
+    /// pointwise), decided later in boosting — NOT in the der. So the device der is identical.
+    PFoundF {
+        /// Noise permutation count (`permutations`, default 10; validated `>= 1`).
+        permutations: u32,
+        /// Classic-weight geometric decay (`decay`, default 0.85; validated in `[0, 1]`).
+        decay: f64,
+    },
 }
 
 /// Whether `objective` is in the COVERED deterministic ranking set (has a `cb_compute::ranking_der`
@@ -79,7 +103,13 @@ pub(crate) enum RankingObjective {
 #[must_use]
 pub(crate) fn ranking_objective_covered(objective: RankingObjective) -> bool {
     match objective {
-        RankingObjective::QueryRmse | RankingObjective::QuerySoftMax { .. } => true,
+        RankingObjective::QueryRmse
+        | RankingObjective::QuerySoftMax { .. }
+        // Phase 13 Plan 05 (D-08): the stochastic pair is COVERED — its device der reproduces the
+        // FROZEN pinned-seed CPU `yetirank_sample_pairs` + `calc_ders_for_queries` reference
+        // bit-for-bit at ε=1e-4 (the `ranking_stoch_test` self-oracle).
+        | RankingObjective::YetiRank { .. }
+        | RankingObjective::PFoundF { .. } => true,
         RankingObjective::QueryCrossEntropy => false,
     }
 }
@@ -520,6 +550,439 @@ pub(crate) fn query_cross_entropy_shifts_host(
         );
         read_f64(&client, out, "query_cross_entropy_shift")
     }
+}
+
+// ===========================================================================
+// Phase 13 Plan 05 (GPUT-22, D-08): the STOCHASTIC ranking pair — YetiRank / PFound-F.
+//
+// The device reproduces the CPU `cb_train::yetirank::sample_pairs` +
+// `cb_compute::calc_ders_for_queries` (YetiRank arm = pairwise-logit der over the sampled
+// competitors) stream BIT-FOR-BIT under the pinned-seed / frozen-fixture discipline (D-06):
+//
+//   1. host derives the per-query inner Gumbel seed inline (the single-block `derive_query_seeds`
+//      2-level `TFastRng64` chain — O(1) base state per query, NO per-iteration host RNG readback,
+//      the `bootstrap_device` precedent);
+//   2. the device `#[cube]` [`yetirank_perturb_kernel`] re-expands each query's `TFastRng64` INLINE
+//      (transcribed PCG, mirroring `kernels::mvs_device`) and, per permutation, per doc (in the EXACT
+//      CPU draw order — perm-major, doc-ascending), draws `gen_rand_real1`, CASTS it to `f32`,
+//      perturbs `exp(approx)` by the f32 ratio `u/(1.000001−u)` (Pitfall 4: the f32 round is
+//      load-bearing), producing the resident `perturbed[perm·n + d]`;
+//   3. host sorts each query DESCENDING per permutation by reusing [`segmented_radix_sort`] (a
+//      STABLE 2-pass 64-bit LSD radix over the non-negative-f64 bit pattern → full-precision order),
+//      accumulates the Classic decayed pairwise weights (f32 storage — the parity contract), then the
+//      accumulated competitors feed the transcribed pairwise-logit der.
+//
+// The RNG draw COUNT (`permutations · query_size` per query) is asserted by the self-oracle — a
+// divergent count desyncs every subsequent draw beyond ε=1e-4 (T-13-10). No `cb-train` dep (the
+// feature-unification landmine); the sampler + der are transcribed inline. No `-inf` literal in the
+// `#[cube]` body (the perturbation is a finite ratio). No `unwrap`/`expect`/`panic`/indexing in
+// production (workspace lints + D-13).
+// ===========================================================================
+
+/// LCG multiplier `A` (`cb_core::rng::LCG_MULTIPLIER`) transcribed inline (the `#[cube]` body cannot
+/// reach `cb_core`), matching [`crate::kernels::mvs_device`] / [`crate::kernels::bootstrap_device`].
+const LCG_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
+
+/// `1 / (2^53 − 1)` — the `ToRandReal1` divisor, matching [`cb_core::TFastRng64::gen_rand_real1`].
+const REAL1_INV: f64 = 1.0 / 9_007_199_254_740_991.0;
+
+/// The Gumbel-noise `1.000001` denominator guard (`yetirank_helpers.cpp:149-152`): `expApprox *=
+/// u / (1.000001 − u)`. The ratio is evaluated in `f32` (both operands `f32`) — the f32 round is
+/// LOAD-BEARING for the ≤1e-4 gate (an all-f64 ratio drifts the sampled weights ~1e-8, Pitfall 4).
+const YETI_NOISE_GUARD: f32 = 1.000_001;
+
+/// The Classic-weight magic constant `0.15` ("Like in GPU", `yetirank_helpers.cpp:198`).
+const YETI_MAGIC_CONST: f64 = 0.15;
+
+/// `RotateBitsRight(v, r)` for a 32-bit word (`fast.h` `TPCGMixer`), matching
+/// [`crate::kernels::mvs_device`]. `r = x >> 59` is in `0..32` (never 32); the `r == 0` guard avoids
+/// the `v << 32` UB shift.
+#[cube]
+fn rank_rotate_right_u32(v: u32, r: u32) -> u32 {
+    let mut out = v;
+    if r != 0u32 {
+        out = (v >> r) | (v << (32u32 - r));
+    }
+    out
+}
+
+/// `TPCGMixer::Mix` (`fast.h`): XSH-RR on the 64-bit state → 32-bit output, matching
+/// [`cb_core::rng::pcg_mix`] exactly.
+#[cube]
+fn rank_pcg_mix(x: u64) -> u32 {
+    let xorshifted = u32::cast_from(((x >> 18u32) ^ x) >> 27u32);
+    let rot = u32::cast_from(x >> 59u32);
+    rank_rotate_right_u32(xorshifted, rot)
+}
+
+/// Serial (unit 0) YetiRank/PFound-F in-query bootstrap perturbation kernel. Per query `g` (in group
+/// order) it re-expands `TFastRng64::from_seed(seeds[g])` INLINE, then per permutation, per doc `d`
+/// in `[begin, end)` (the EXACT CPU draw order) draws one `gen_rand_real1`, casts it to `f32`, and
+/// writes `perturbed[p·n + d] = exp(approx[d]) · f32(u/(1.000001−u))`. `params = [permutations]`.
+/// The draw stream is CONTINUOUS across permutations within a query (the CPU `for perm { for doc }`
+/// order), so a per-doc jump is unnecessary — the serial loop advances the stream in place.
+#[cube(launch)]
+fn yetirank_perturb_kernel(
+    approx: &Array<f64>,
+    q_offsets: &Array<u32>,
+    seeds: &Array<u64>,
+    params: &Array<u32>,
+    perturbed: &mut Array<f64>,
+) {
+    if ABSOLUTE_POS == 0 {
+        let a = LCG_MULTIPLIER;
+        let perms = params[0];
+        let n = approx.len();
+        let n_groups = q_offsets.len() - 1;
+        let mut g = 0usize;
+        while g < n_groups {
+            let begin = q_offsets[g];
+            let end = q_offsets[g + 1];
+            let s = seeds[g];
+
+            // from_seed(s): the `TReallyFastRng32(seed)` derive stream (addend `c == 1`) yields
+            // seed1 = GenRand64, seq1 = GenRand32, seed2 = GenRand64, seq2 = GenRand32.
+            let dc = 1u64;
+            let mut dx = s;
+            dx = dx * a + dc;
+            let s1_lo = rank_pcg_mix(dx);
+            dx = dx * a + dc;
+            let s1_hi = rank_pcg_mix(dx);
+            let seed1 = u64::cast_from(s1_lo) | (u64::cast_from(s1_hi) << 32u32);
+            dx = dx * a + dc;
+            let seq1 = rank_pcg_mix(dx);
+            dx = dx * a + dc;
+            let s2_lo = rank_pcg_mix(dx);
+            dx = dx * a + dc;
+            let s2_hi = rank_pcg_mix(dx);
+            let seed2 = u64::cast_from(s2_lo) | (u64::cast_from(s2_hi) << 32u32);
+            dx = dx * a + dc;
+            let seq2 = rank_pcg_mix(dx);
+
+            // TFastRng64::new: r1.c = (seq1<<1)|1; r2.seq = FixSeq(seq1, seq2); r2.c = (r2seq<<1)|1.
+            let mask = 0x7fff_ffffu32;
+            let mut r2seq = seq2;
+            if (seq1 & mask) == (seq2 & mask) {
+                r2seq = !seq2;
+            }
+            let mut r1x = seed1;
+            let r1c = (u64::cast_from(seq1) << 1u32) | 1u64;
+            let mut r2x = seed2;
+            let r2c = (u64::cast_from(r2seq) << 1u32) | 1u64;
+
+            let mut p = 0u32;
+            while p < perms {
+                let base = (p as usize) * n;
+                let mut d = begin;
+                while d < end {
+                    // gen_rand() = (r1.GenRand() << 32) | r2.GenRand(); real1 = (gen>>11)·REAL1_INV.
+                    r1x = r1x * a + r1c;
+                    let hi = rank_pcg_mix(r1x);
+                    r2x = r2x * a + r2c;
+                    let lo = rank_pcg_mix(r2x);
+                    let rand64 = (u64::cast_from(hi) << 32u32) | u64::cast_from(lo);
+                    let real1 = f64::cast_from(rand64 >> 11u32) * REAL1_INV;
+                    // The Gumbel ratio in f32 (both operands f32) — the load-bearing round.
+                    let uf = f32::cast_from(real1);
+                    let ratio = uf / (YETI_NOISE_GUARD - uf);
+                    let expa = f64::exp(approx[d as usize]);
+                    perturbed[base + d as usize] = expa * f64::cast_from(ratio);
+                    d += 1u32;
+                }
+                p += 1u32;
+            }
+            g += 1usize;
+        }
+    }
+}
+
+/// The per-query inner Gumbel seeds for a single-block (`blockCount == 1`) fit — the host-side
+/// transcription of `cb_train::yetirank::derive_query_seeds` (`yetirank_helpers.cpp:365-389` +
+/// `restorable_rng.cpp:3-9`), reusing the sanctioned [`cb_core::TFastRng64`] (NOT a `cb-train` dep):
+/// `blockSeed = TFastRng64(random_seed).GenRand()`, then per query `querySeed =
+/// TFastRng64(blockSeed).GenRand()`. This is the O(1) base state the device kernel re-expands.
+#[must_use]
+pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {
+    let mut seed_rng = cb_core::TFastRng64::from_seed(random_seed);
+    let block_seed = seed_rng.gen_rand();
+    let mut block_rng = cb_core::TFastRng64::from_seed(block_seed);
+    (0..group_count).map(|_| block_rng.gen_rand()).collect()
+}
+
+/// The pairwise-logit pair probability `p = exp(loser)/(exp(loser)+exp(winner))` (else `0.5` when
+/// both exps underflow) — the host transcription of `cb_compute::pairlogit_pair_prob` (kept inline so
+/// the stochastic der matches the CPU `pairlogit_group_der` scatter bit-for-bit; `cb_compute` is a
+/// normal dep, but transcribing avoids re-exporting a private helper).
+#[cfg(not(feature = "wgpu"))]
+#[inline]
+fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {
+    let exp_loser = loser_approx.exp();
+    let exp_winner = winner_approx.exp();
+    let denom = exp_loser + exp_winner;
+    if denom > 0.0 {
+        exp_loser / denom
+    } else {
+        0.5
+    }
+}
+
+/// The DESCENDING per-query sort order (global doc indices) for one permutation's `perturbed` slice,
+/// reusing [`segmented_radix_sort`] (the acceptance-criterion sort reuse). `perturbed` values are all
+/// NON-NEGATIVE (`exp(approx) > 0`, ratio `>= 0`), so their raw IEEE-754 `f64` bit patterns are
+/// MONOTONE — a stable 2-pass 64-bit LSD radix (low 32 bits then high 32 bits) yields the full
+/// ASCENDING order, which we reverse per query for the CPU's descending sort
+/// (`yetirank_helpers.cpp:326-331`). Distinct perturbed values (the well-separated frozen fixture) →
+/// no ties, so the tie-break never diverges from the CPU stable descending sort.
+#[cfg(not(feature = "wgpu"))]
+fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {
+    let n = perturbed.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut head = vec![0u32; n];
+    for w in q_offsets.windows(2) {
+        let b = *w.first().unwrap_or(&0) as usize;
+        if let Some(slot) = head.get_mut(b) {
+            *slot = 1;
+        }
+    }
+    let ord: Vec<u64> = perturbed.iter().map(|&v| v.to_bits()).collect();
+    let lo: Vec<u32> = ord.iter().map(|&b| b as u32).collect();
+    let hi: Vec<u32> = ord.iter().map(|&b| (b >> 32) as u32).collect();
+    let idx0: Vec<u32> = (0..n as u32).collect();
+    // Pass 1: stable sort by the low 32 bits.
+    let (_sk, order_lo) = segmented_radix_sort(&head, &lo, &idx0)?;
+    // Reorder the high 32 bits by pass-1's permutation, then stable-sort by them (carry the perm).
+    let hi_re: Vec<u32> = order_lo
+        .iter()
+        .map(|&i| hi.get(i as usize).copied().unwrap_or(0))
+        .collect();
+    let (_sk2, mut order) = segmented_radix_sort(&head, &hi_re, &order_lo)?;
+    // `order` is now ASCENDING by the full u64 bit pattern within each query; reverse per query.
+    for w in q_offsets.windows(2) {
+        let b = *w.first().unwrap_or(&0) as usize;
+        let e = *w.get(1).unwrap_or(&0) as usize;
+        if let Some(seg) = order.get_mut(b..e) {
+            seg.reverse();
+        }
+    }
+    Ok(order)
+}
+
+/// `AddWeight` (`yetirank_helpers.cpp:185-191`): route the pair weight to the higher-relevance doc as
+/// the winner (`f32` storage + accumulation, the parity contract). Ties (`==`) add nothing.
+#[cfg(not(feature = "wgpu"))]
+#[inline]
+fn yeti_add_weight(
+    first: usize,
+    second: usize,
+    relev_first: f32,
+    relev_second: f32,
+    weight: f32,
+    cw: &mut [Vec<f32>],
+) {
+    if relev_first > relev_second {
+        if let Some(row) = cw.get_mut(first) {
+            if let Some(cell) = row.get_mut(second) {
+                *cell += weight;
+            }
+        }
+    } else if relev_first < relev_second {
+        if let Some(row) = cw.get_mut(second) {
+            if let Some(cell) = row.get_mut(first) {
+                *cell += weight;
+            }
+        }
+    }
+}
+
+/// The STOCHASTIC YetiRank / PFound-F device der (Phase 13 Plan 05, D-08), shared by both public
+/// arms (PFound-F == `YetiRankPairwise` rides the SAME sampled-pair stream + competitor der; only the
+/// leaf path differs, which is decided later in boosting — NOT here). Returns `(der1, der2, draws)`,
+/// where `draws == permutations · n` is the consumed `gen_rand_real1` count (asserted by the
+/// self-oracle: a divergent count silently desyncs every value, T-13-10). Reproduces the CPU
+/// `yetirank_sample_pairs` + `pairlogit_group_der` reference for the pinned `random_seed` bit-for-bit
+/// at ε=1e-4. The covered regime is uniform per-group weight (`1.0`); the per-object `weights` are
+/// accepted for signature symmetry but the pairwise der folds the weight into the PAIR (upstream).
+#[cfg(not(feature = "wgpu"))]
+fn yetirank_sample_der_core(
+    approx: &[f64],
+    target: &[f64],
+    _weights: &[f64],
+    q_offsets: &[u32],
+    permutations: u32,
+    decay: f64,
+    random_seed: u64,
+) -> CbResult<(Vec<f64>, Vec<f64>, usize)> {
+    validate_ranking_inputs(approx, target, q_offsets)?;
+    let n = approx.len();
+    let n_groups = q_offsets.len().saturating_sub(1);
+    if n == 0 || n_groups == 0 || permutations == 0 {
+        return Ok((vec![0.0; n], vec![0.0; n], 0));
+    }
+
+    // (1) Per-query inner Gumbel seeds (host, O(1) base state) — the single-block derivation.
+    let seeds = derive_query_seeds_inline(random_seed, n_groups);
+
+    // (2) Device: perturb exp(approx) per permutation/doc in the exact CPU draw order (inline PCG).
+    let client = selected_client();
+    let approx_h = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
+    let off_h = client.create(cubecl::bytes::Bytes::from_elems(q_offsets.to_vec()));
+    let seeds_h = client.create(cubecl::bytes::Bytes::from_elems(seeds.clone()));
+    let params_h = client.create(cubecl::bytes::Bytes::from_elems(vec![permutations]));
+    let total = permutations as usize * n;
+    let perturbed_h = client.empty(total * std::mem::size_of::<f64>());
+    yetirank_perturb_kernel::launch::<SelectedRuntime>(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim { x: 1, y: 1, z: 1 },
+        unsafe { ArrayArg::from_raw_parts(approx_h, n) },
+        unsafe { ArrayArg::from_raw_parts(off_h, q_offsets.len()) },
+        unsafe { ArrayArg::from_raw_parts(seeds_h, n_groups) },
+        unsafe { ArrayArg::from_raw_parts(params_h, 1) },
+        unsafe { ArrayArg::from_raw_parts(perturbed_h.clone(), total) },
+    );
+    // One bulk read-back of the perturbed values (NOT a per-iteration RNG readback — the RNG stays
+    // device-resident; this is the same data-crossing class as the deterministic driver's der).
+    let perturbed = read_f64(&client, perturbed_h, "yetirank_perturbed")?;
+
+    // (3) Host: per permutation sort DESCENDING (segmented_radix_sort) + Classic decayed weights.
+    let mut der1 = vec![0.0_f64; n];
+    let mut der2 = vec![0.0_f64; n];
+    let draws = permutations as usize * n;
+    for w in q_offsets.windows(2) {
+        let begin = *w.first().unwrap_or(&0) as usize;
+        let end = *w.get(1).unwrap_or(&0) as usize;
+        let qs = end.saturating_sub(begin);
+        if qs == 0 {
+            continue;
+        }
+        // competitorsWeights[winner_local][loser_local], f32 (the parity contract).
+        let mut cw = vec![vec![0.0_f32; qs]; qs];
+        for p in 0..permutations as usize {
+            let base = p * n;
+            let seg = perturbed.get(base + begin..base + end).unwrap_or(&[]);
+            // Descending order (LOCAL indices) for this permutation's single-query slice
+            // (`local_offsets` = one segment `[0, qs)`) via the reused `segmented_radix_sort`.
+            let local_offsets = vec![0u32, qs as u32];
+            let order_global = descending_order_per_query(seg, &local_offsets)?;
+            // CalcWeightsClassic (yetirank_helpers.cpp:193-205): decayed |Δrelev| along the order.
+            let mut decay_coef = 1.0_f64;
+            for doc_id in 1..qs {
+                let first = order_global.get(doc_id - 1).copied().unwrap_or(0) as usize;
+                let second = order_global.get(doc_id).copied().unwrap_or(0) as usize;
+                #[allow(clippy::cast_possible_truncation)]
+                let rf = target.get(begin + first).copied().unwrap_or(0.0) as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let rs = target.get(begin + second).copied().unwrap_or(0.0) as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let pair_weight =
+                    (YETI_MAGIC_CONST * decay_coef * f64::from((rf - rs).abs())) as f32;
+                yeti_add_weight(first, second, rf, rs, pair_weight, &mut cw);
+                decay_coef *= decay;
+            }
+        }
+
+        // (4) Normalize `queryWeight · cw / permutations` (f32) → competitors, then pairlogit der.
+        // queryWeight is the covered uniform 1.0. The pairwise-logit der is a fixed-order scatter
+        // (winner raises own der, lowers each loser's) — reproduces `pairlogit_group_der` exactly.
+        let denom = permutations as f32;
+        for winner in 0..qs {
+            let winner_approx = approx.get(begin + winner).copied().unwrap_or(0.0);
+            let mut winner_der = 0.0_f64;
+            let mut winner_second = 0.0_f64;
+            for loser in 0..qs {
+                let cwl = cw
+                    .get(winner)
+                    .and_then(|row| row.get(loser))
+                    .copied()
+                    .unwrap_or(0.0);
+                let w_f32 = 1.0_f32 * cwl / denom;
+                if w_f32 != 0.0 {
+                    let loser_approx = approx.get(begin + loser).copied().unwrap_or(0.0);
+                    let p = pairlogit_pair_prob_local(winner_approx, loser_approx);
+                    let wp = f64::from(w_f32);
+                    winner_der += wp * p;
+                    winner_second += wp * p * (p - 1.0);
+                    if let Some(d) = der1.get_mut(begin + loser) {
+                        *d -= wp * p;
+                    }
+                    if let Some(d) = der2.get_mut(begin + loser) {
+                        *d += wp * p * (p - 1.0);
+                    }
+                }
+            }
+            if let Some(d) = der1.get_mut(begin + winner) {
+                *d += winner_der;
+            }
+            if let Some(d) = der2.get_mut(begin + winner) {
+                *d += winner_second;
+            }
+        }
+    }
+    Ok((der1, der2, draws))
+}
+
+/// YetiRank device der (Phase 13 Plan 05, D-08): the stochastic in-query bootstrap-sampled listwise
+/// der (POINTWISE leaf). Returns `(der1, der2)` (each length `n`), reproducing the CPU
+/// `yetirank_sample_pairs` + `calc_ders_for_queries` reference for the pinned `random_seed`
+/// bit-for-bit at ε=1e-4. See [`yetirank_sample_der_core`].
+#[cfg_attr(feature = "wgpu", allow(unused_variables))]
+pub(crate) fn yetirank_ders_host(
+    approx: &[f64],
+    target: &[f64],
+    weights: &[f64],
+    q_offsets: &[u32],
+    permutations: u32,
+    decay: f64,
+    random_seed: u64,
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
+    #[cfg(feature = "wgpu")]
+    {
+        validate_ranking_inputs(approx, target, q_offsets)?;
+        return Err(wgpu_reject());
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let (d1, d2, _draws) =
+            yetirank_sample_der_core(approx, target, weights, q_offsets, permutations, decay, random_seed)?;
+        Ok((d1, d2))
+    }
+}
+
+/// PFound-F device der (Phase 13 Plan 05, D-08): the stochastic PAIRWISE-leaf listwise der
+/// (`YetiRankPairwise`, the GPU `pfound_f` arm). Shares the SAME sampled-pair stream + competitor der
+/// as [`yetirank_ders_host`] (only the leaf path differs — Cholesky vs pointwise — decided later in
+/// boosting, NOT here), so the device der is identical. Returns `(der1, der2)`.
+#[cfg_attr(feature = "wgpu", allow(unused_variables))]
+pub(crate) fn pfound_f_ders_host(
+    approx: &[f64],
+    target: &[f64],
+    weights: &[f64],
+    q_offsets: &[u32],
+    permutations: u32,
+    decay: f64,
+    random_seed: u64,
+) -> CbResult<(Vec<f64>, Vec<f64>)> {
+    #[cfg(feature = "wgpu")]
+    {
+        validate_ranking_inputs(approx, target, q_offsets)?;
+        return Err(wgpu_reject());
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let (d1, d2, _draws) =
+            yetirank_sample_der_core(approx, target, weights, q_offsets, permutations, decay, random_seed)?;
+        Ok((d1, d2))
+    }
+}
+
+/// The consumed `gen_rand_real1` draw COUNT for a stochastic ranking fit — `permutations · n`
+/// (perm-major, doc-ascending, per query). Exposed so the self-oracle asserts the device stream
+/// length matches the CPU exactly (a divergent count silently shifts every value, T-13-10).
+#[must_use]
+pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {
+    permutations as usize * n
 }
 
 /// Read a resident `f64` handle back to host, mapping a failure to [`CbError::Degenerate`] (WR-05),
