@@ -193,7 +193,7 @@ Plans:
   4. **Speed check (BENCH-02, standing):** each family (pairwise / ranking / multiclass / ordered / langevin) is timed on Kaggle CUDA **as it lands** — device path vs the host-CPU baseline, and vs official CatBoost GPU where a comparable config exists (warm-run/JIT-excluded, train-only) — so every family's kernels carry their own recorded CUDA speed measurement when they flip from `Ok(None)`→device, not deferred to Phase 14.
   5. Any sub-feature not yet passing Kaggle CUDA sign-off returns `Ok(None)`→CPU fallback (no incorrect device result), the CPU/host path stays byte-unchanged (GPUT-14/D-04), and the resulting GPU coverage matrix (correctness + per-family speed) is documented — completing the device-coverage surface feeding the Phase-14 aggregate sign-off.
 
-**Plans**: 5/10 plans executed
+**Plans**: 6/10 plans executed
 
 Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 
@@ -202,7 +202,7 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 - [x] 13-03-PLAN.md — SHARED device query-grouping infra (GPUT-22 prereq, Wave 3)
 - [x] 13-04-PLAN.md — Deterministic ranking: QueryRMSE/QuerySoftMax/QueryCrossEntropy (GPUT-22, Wave 4)
 - [x] 13-05-PLAN.md — Stochastic ranking: YetiRank/PFound-F pinned-seed (GPUT-22, Wave 5)
-- [ ] 13-06-PLAN.md — SHARED DeviceGrownTree block-leaf + K-dim Newton der2 (GPUT-12 prereq/D-03/D-04, Wave 6)
+- [x] 13-06-PLAN.md — SHARED DeviceGrownTree block-leaf + K-dim Newton der2 (GPUT-12 prereq/D-03/D-04, Wave 6)
 - [ ] 13-07-PLAN.md — Multiclass/multi-target/uncertainty device wiring (GPUT-12, Wave 7)
 - [ ] 13-08-PLAN.md — Ordered boosting resident approx trajectory (GPUT-13/D-05/D-06, Wave 8)
 - [ ] 13-09-PLAN.md — Langevin/SGLB seeded Gaussian (GPUT-20/D-09, Wave 9)
@@ -233,7 +233,7 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete    | 2026-07-04 |
-| 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 5/10 | In Progress|  |
+| 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 6/10 | In Progress|  |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
