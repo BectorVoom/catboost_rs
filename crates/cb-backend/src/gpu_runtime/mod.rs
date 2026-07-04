@@ -70,6 +70,7 @@ use crate::kernels::{
     pointwise_hist2_binary_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
     subtract_histograms_kernel,
+    pairwise_assemble_system_kernel,
     pairwise_make_derivatives_kernel, quantile_gradient_kernel, scan_update_pairwise_kernel,
     scan_update_pointwise_kernel, select_best_split_kernel, SCORE_FN_COSINE, SCORE_FN_L2,
     SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2,

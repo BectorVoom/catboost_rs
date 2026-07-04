@@ -48,7 +48,7 @@ use cb_core::{CbError, CbResult, TFastRng64};
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
     grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
-    DerBinaryKernel,
+    DerBinaryKernel, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
     fold_weights_resident, launch_bootstrap_weights_resident, DeviceBootstrapKind,
@@ -287,6 +287,73 @@ struct ExactLeafState {
     weight: Vec<f64>,
 }
 
+/// The per-fit device PAIRWISE state (Phase 13 Plan 01, GPUT-11). `Some` iff the fit committed to
+/// a covered pairwise-scoring device path (a `*Pairwise` loss whose leaf VALUES solve the
+/// `(leaf_count-1)×(leaf_count-1)` SPD pairwise system, `is_pairwise_scoring`). The device pairwise
+/// histogram (reusing the Phase-7.4 4-channel `pairwise_hist` kernels) + the per-leaf
+/// `MakePairwiseDerivatives`/`MakePointwiseDerivatives` matrix assembly
+/// ([`crate::gpu_runtime::launch_pairwise_assemble_system_into`]) run device-side; the batched
+/// Cholesky SOLVE lands in Plan 02 (GPUT-21). The per-tree pair/group descriptor seam (the
+/// `Runtime::grow_tree_on_device` seam carries only `approx`/`target` today) is ALSO Plan 02's
+/// wiring, so a covered pairwise fit currently declines to the byte-unchanged CPU grower (D-04
+/// no-regression) rather than fabricating a pointwise grow on a pairwise fit. This state carries
+/// the coverage DECISION + the regularization priors the Plan-02 grow consumes.
+#[allow(dead_code)]
+struct PairwiseState {
+    /// The L2 diagonal reg (`l2_leaf_reg` / `L2Reg`); the per-leaf system diagonal prior.
+    l2_diag_reg: f64,
+    /// The pairwise bucket-weight prior reg (`bayesian_matrix_reg` / `PairwiseNonDiagReg`,
+    /// default [`PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT`]).
+    pairwise_bucket_weight_prior_reg: f64,
+}
+
+/// Phase 13 Plan 01 (GPUT-11): the pairwise coverage gate, mirroring the `map_leaf_method` /
+/// `map_bootstrap_kernel` `Option`-returning family-gated template (Pattern A). Returns
+/// `Some(PairwiseState)` iff the fit is a covered pairwise-scoring config — a `*Pairwise` loss
+/// (`is_pairwise_scoring`), depth ≥ 1, Plain boosting, single fold, `SymmetricTree`, a Phase-7.4
+/// pairwise-fill-supported `n_bins` (`1 << bits`, bits in {5,6,7} == {32,64,128}), and every OTHER
+/// family flag still the covered default (D-10-01 all-or-nothing PER family: no
+/// bootstrap/MVS/exact-leaf/CTR/leaf-cap). Returns `None` for any uncovered config → the
+/// byte-unchanged CPU grower (never a fabricated device result). `l2_diag_reg` is the caller's raw
+/// L2 leaf reg feeding the per-leaf system diagonal.
+fn map_pairwise_coverage(
+    loss: &Loss,
+    config: &DeviceTrainConfig,
+    depth: usize,
+    boosting_type_is_plain: bool,
+    fold_count: usize,
+    n_bins: usize,
+    l2_diag_reg: f64,
+) -> Option<PairwiseState> {
+    if !cb_compute::is_pairwise_scoring(loss) {
+        return None;
+    }
+    if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
+        return None;
+    }
+    if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+        return None;
+    }
+    // The device pairwise histogram fill is the Phase-7.4 one-byte non-binary family (bits in
+    // {5,6,7}); keep this set in sync with `launch_pairwise_split_score_into`'s `n_bins` match.
+    if !matches!(n_bins, 32 | 64 | 128) {
+        return None;
+    }
+    // All-or-nothing per family: no other non-default family flag may be set.
+    let family_default = config.bootstrap_type == DeviceBootstrapType::No
+        && config.mvs_lambda.is_none()
+        && !config.exact_leaf
+        && config.ctr.is_none()
+        && config.max_leaves.is_none();
+    if !family_default {
+        return None;
+    }
+    Some(PairwiseState {
+        l2_diag_reg,
+        pairwise_bucket_weight_prior_reg: PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
+    })
+}
+
 /// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
 /// for the covered losses, transcribing `cb_compute`'s documented formulas (RMSE:
 /// `der1 = target - approx`; Logloss / CrossEntropy: `der1 = target - sigmoid(approx)`). The
@@ -378,6 +445,13 @@ pub struct GpuTrainSession {
     /// [`grow_region_tree`] (a walk-until-diverge PATH, `MaxLeaves = max_depth + 1`) instead of
     /// the resident oblivious loop / non-sym node graph. `None` for every other grow policy.
     region: Option<RegionState>,
+    /// The per-fit pairwise state (Phase 13 Plan 01, GPUT-11). `Some` iff the fit committed to a
+    /// covered pairwise-scoring device path; `None` for every pointwise path (byte-unchanged,
+    /// D-04). Carries the coverage DECISION + regularization priors the Plan-02 grow wiring
+    /// consumes (the per-tree pair/group descriptor seam lands in Plan 02, so no covered-pairwise
+    /// session is constructed yet — the field is the landed structural seam, like `config`).
+    #[allow(dead_code)]
+    pairwise: Option<PairwiseState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -494,6 +568,34 @@ impl GpuTrainSession {
         // config returns `Ok(None)` → the byte-unchanged CPU grower (D-10-01 all-or-nothing).
         if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
             return Ok(None);
+        }
+        // Phase 13 Plan 01 (GPUT-11): the pairwise coverage gate. A `*Pairwise` loss
+        // (`is_pairwise_scoring`) solves its leaf VALUES via the SPD pairwise system, NOT the
+        // pointwise Gradient/Newton estimator — a fundamentally different grow. `map_pairwise_coverage`
+        // returns `Some(PairwiseState)` for a covered pairwise config (proven by the
+        // `pairwise_deriv` self-oracle), `None` otherwise. The device pairwise histogram
+        // (Phase-7.4 reuse) + the per-leaf `MakePairwise/PointwiseDerivatives` matrix ASSEMBLY
+        // ([`crate::gpu_runtime::launch_pairwise_assemble_system_into`]) land THIS plan; the batched
+        // Cholesky SOLVE + the per-tree pair/group descriptor seam (the `Runtime::grow_tree_on_device`
+        // seam carries only `approx`/`target` today) land in Plan 02 (GPUT-21). Until Plan 02 wires
+        // the grow, BOTH the covered and uncovered pairwise branches decline to the byte-unchanged
+        // CPU grower (D-04 no-regression) — NEVER a fabricated pointwise grow on a pairwise fit.
+        if cb_compute::is_pairwise_scoring(loss) {
+            match map_pairwise_coverage(
+                loss,
+                config,
+                depth,
+                boosting_type_is_plain,
+                fold_count,
+                n_bins,
+                scaled_l2,
+            ) {
+                // Covered pairwise config: device histogram reuse + per-leaf system assembly are
+                // landed + self-oracled this plan; the per-tree grow seam is Plan 02. Decline to CPU.
+                Some(_pairwise) => return Ok(None),
+                // Uncovered pairwise config → CPU grower (D-10-01 all-or-nothing per family).
+                None => return Ok(None),
+            }
         }
         // Phase 12 Plan 03 (GPUT-18): the grow-policy arm. `map_grow_policy` returns the device
         // non-symmetric strategy for Depthwise / Lossguide (flipped ON this plan), or `None` for
@@ -828,6 +930,10 @@ impl GpuTrainSession {
             bootstrap,
             mvs,
             region,
+            // Pointwise path: no pairwise state (byte-unchanged, D-04). A covered pairwise fit is
+            // gated + declined ABOVE (the pairwise arm returns Ok(None) pending the Plan-02
+            // per-tree pair/group seam), so this construction is only ever reached pointwise.
+            pairwise: None,
         }))
     }
 

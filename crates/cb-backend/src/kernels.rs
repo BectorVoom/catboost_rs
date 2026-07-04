@@ -2876,6 +2876,16 @@ pub(crate) mod mvs_device;
 #[cfg(test)]
 mod mvs_device_test;
 
+// Device pairwise per-leaf linear-system assembly self-oracle (Phase 13 Plan 01, GPUT-11 /
+// GPUT-21 prep, Pattern F): the device `gpu_runtime::assemble_pairwise_system_host` packed
+// `linearSystem` vs the CPU parity reference (`calculate_pairwise_leaf_values` matrix build, reg
+// constants transcribed inline — no `cb-train` dep) ≤1e-4, keyed by leaf, packed lower-triangular
+// (`rowSize*(rowSize+1)/2` cells then `rowSize` RHS). Lives in `kernels/pairwise_deriv_test.rs`.
+// Runs over `SelectedRuntime` (f64 serial → the numeric assert skips off rocm/cuda, WR-01
+// anti-false-pass; the whole file is `not(feature = "wgpu")`).
+#[cfg(test)]
+mod pairwise_deriv_test;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
@@ -4251,6 +4261,71 @@ pub fn pairwise_make_derivatives_kernel<F: Float>(
             feature += 1usize;
         }
         i += stride;
+    }
+}
+
+/// **Assemble the packed per-leaf pairwise linear system** (Phase 13 Plan 01, GPUT-11 /
+/// GPUT-21 prep) — the device transcription of the Rust CPU parity oracle
+/// `cb_train::pairwise_leaves::calculate_pairwise_leaf_values` (:154-186) matrix build,
+/// producing the packed lower-triangular `linearSystem` upstream `ExtractMatricesAndTargets`
+/// (`linear_solver.cu` §6.3) consumes: the `rowSize*(rowSize+1)/2` lower-triangle matrix cells
+/// (row-major, `x` in `0..=y`) FOLLOWED by the `rowSize` RHS, resident on device. This wave
+/// ASSEMBLES the system on device; Plan 02's batched Cholesky consumes it (the small solve stays
+/// host-side until then).
+///
+/// `rowSize = leaf_count - 1` — the leaf gauge freedom drops the last row (== the CPU oracle's
+/// `m = system_size - 1` + trailing-0 push). Each matrix cell is the per-leaf pairwise weight sum
+/// `weight_sums[y*leaf_count + x]` PLUS the regularization prior: `diag_reg` on the diagonal
+/// (`x == y`, the `MakePointwiseDerivatives` diagonal contribution), `non_diag_reg` off-diagonal
+/// (the `MakePairwiseDerivatives` pair contribution). `params = [non_diag_reg, diag_reg]` are the
+/// host-computed catboost constants (`pairwise_bucket_weight_prior_reg` prior + `l2_diag_reg`),
+/// transcribed inline — NO `cb-train` dep (the feature-unification landmine).
+///
+/// Serial (unit 0): the per-leaf system is small (`leaf_count <= 2^depth`), so ONE unit packs it
+/// in a fixed order — inherently deterministic (no atomic, no `-inf` literal, no host reach). f64
+/// accumulation feeds the Plan-02 Cholesky (D-07); the wgpu backend (no f64) rejects at the host
+/// launcher, never here.
+#[cube(launch)]
+pub fn pairwise_assemble_system_kernel(
+    weight_sums: &Array<f64>,
+    der_sums: &Array<f64>,
+    params: &Array<f64>,
+    out: &mut Array<f64>,
+) {
+    if ABSOLUTE_POS == 0 {
+        let leaf_count = der_sums.len();
+        let non_diag_reg = params[0];
+        let diag_reg = params[1];
+
+        // rowSize = leaf_count - 1 (drop the last row: leaf gauge freedom, == CPU oracle `m`).
+        let mut m = 0usize;
+        if leaf_count > 0 {
+            m = leaf_count - 1;
+        }
+
+        // Packed lower-triangle: for row y, cols x in 0..=y (row-major), diag vs off-diag reg.
+        let mut idx = 0usize;
+        let mut y = 0usize;
+        while y < m {
+            let mut x = 0usize;
+            while x <= y {
+                let mut reg = non_diag_reg;
+                if x == y {
+                    reg = diag_reg;
+                }
+                out[idx] = weight_sums[y * leaf_count + x] + reg;
+                idx += 1usize;
+                x += 1usize;
+            }
+            y += 1usize;
+        }
+
+        // RHS: der_sums[0..m] appended AFTER the `m*(m+1)/2` matrix cells (idx == matrix_len here).
+        let mut r = 0usize;
+        while r < m {
+            out[idx + r] = der_sums[r];
+            r += 1usize;
+        }
     }
 }
 

@@ -1306,6 +1306,145 @@ fn launch_pairwise_make_derivatives_into(
     read_pair_der_sums_f64(client, der_sums_handle)
 }
 
+/// The catboost pairwise bucket-weight prior reg default (`bayesian_matrix_reg` /
+/// `PairwiseNonDiagReg`, `oblivious_tree_options.cpp:15-16`, upstream default `0.1`).
+/// Transcribed inline (NO `cb-train` dep — the feature-unification landmine); the pairwise
+/// coverage gate carries it into the per-leaf system assembly.
+pub(crate) const PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT: f64 = 0.1;
+
+/// Reject the (impossible) wgpu f64 path for the pairwise per-leaf system assembly with a typed
+/// error, mirroring [`crate::kernels::mvs_device`]. The packed `linearSystem` accumulates in f64
+/// (D-07, feeding the Plan-02 batched Cholesky); WGSL has no f64, so a genuine `wgpu` backend
+/// surfaces a typed [`CbError::OutOfRange`] rather than an opaque JIT crash. The in-env
+/// rocm/cuda/cpu path is unaffected.
+#[cfg(feature = "wgpu")]
+fn pairwise_assemble_wgpu_reject() -> CbError {
+    CbError::OutOfRange(
+        "device pairwise per-leaf linear-system assembly requires f64 device channels; the wgpu \
+         backend has none. Use the rocm/cuda/cpu backend for the pairwise Cholesky path."
+            .to_owned(),
+    )
+}
+
+/// Assemble the packed lower-triangular per-leaf pairwise `linearSystem` resident on device
+/// (Phase 13 Plan 01, GPUT-11 / GPUT-21 prep) and return its HANDLE WITHOUT reading it back
+/// (D-05 residency — no `n`-length host round-trip of the pair stats). The device
+/// [`pairwise_assemble_system_kernel`] transcribes the Rust CPU parity oracle
+/// `cb_train::pairwise_leaves::calculate_pairwise_leaf_values` matrix build: the
+/// `rowSize*(rowSize+1)/2` lower-triangle matrix cells (row-major, `x` in `0..=y`, with the
+/// `diag_reg`/`non_diag_reg` prior) FOLLOWED by the `rowSize` RHS, where `rowSize = leaf_count - 1`
+/// (leaf gauge freedom). Plan 02's batched Cholesky consumes this resident system.
+///
+/// `weight_sums` is the per-leaf pairwise weight-sum matrix (row-major `leaf_count × leaf_count`,
+/// from the resident Phase-7.4 pairwise histograms), `der_sums` the per-leaf der sums
+/// (`leaf_count`), `l2_diag_reg = L2Reg`, `pairwise_bucket_weight_prior_reg = PairwiseNonDiagReg`.
+/// The reg constants are computed host-side (`cell_prior = 1/leaf_count`,
+/// `non_diag_reg = -prior*cell_prior`, `diag_reg = prior*(1-cell_prior) + l2_diag_reg`) — the
+/// EXACT CPU-oracle constants, NOT upstream's `RegularizeImpl` bump-heuristics (RESEARCH Pitfall
+/// 2). `leaf_count <= 1` yields an empty handle (a singleton/empty system has no matrix or RHS —
+/// its lone zero-averaged delta is 0). No `unwrap`/`expect`/`panic`/indexing; never reads a 0-len
+/// handle.
+pub fn launch_pairwise_assemble_system_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    weight_sums: &[f64],
+    der_sums: &[f64],
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+) -> CbResult<Handle> {
+    let leaf_count = der_sums.len();
+
+    // A singleton/empty system has no reduced matrix or RHS (rowSize = leaf_count - 1 == 0):
+    // its lone leaf delta is 0 after MakeZeroAverage. Return an empty handle (no launch, no
+    // 0-len read downstream) — the "Ok(None)"-analog at the assembly level (never a fabrication).
+    if leaf_count <= 1 {
+        return Ok(client.empty(0));
+    }
+
+    // Shape guard: the weight-sum matrix is row-major leaf_count × leaf_count.
+    let expected = leaf_count.checked_mul(leaf_count).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "leaf_count ({leaf_count}) squared overflows usize (weight-sum matrix length)"
+        ))
+    })?;
+    if weight_sums.len() != expected {
+        return Err(CbError::LengthMismatch {
+            column: "weight_sums".to_owned(),
+            expected,
+            actual: weight_sums.len(),
+        });
+    }
+
+    // The EXACT CPU-oracle reg constants (calculate_pairwise_leaf_values:123-125). Transcribed
+    // inline — NOT upstream RegularizeImpl (Pitfall 2).
+    let cell_prior = 1.0_f64 / leaf_count as f64;
+    let non_diag_reg = -pairwise_bucket_weight_prior_reg * cell_prior;
+    let diag_reg = pairwise_bucket_weight_prior_reg * (1.0 - cell_prior) + l2_diag_reg;
+
+    let m = leaf_count - 1;
+    // Packed length: m*(m+1)/2 lower-triangle matrix cells + m RHS. m*(m+1) is even so /2 is exact.
+    let matrix_len = m
+        .checked_mul(m + 1)
+        .map(|p| p / 2)
+        .ok_or_else(|| CbError::OutOfRange(format!("packed matrix length overflows (m = {m})")))?;
+    let out_len = matrix_len.checked_add(m).ok_or_else(|| {
+        CbError::OutOfRange(format!("packed system length overflows (matrix {matrix_len} + m {m})"))
+    })?;
+
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(pairwise_assemble_wgpu_reject());
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let ws_h = client.create(cubecl::bytes::Bytes::from_elems(weight_sums.to_vec()));
+        let ds_h = client.create(cubecl::bytes::Bytes::from_elems(der_sums.to_vec()));
+        let params_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![non_diag_reg, diag_reg]));
+        let out = client.empty(out_len * std::mem::size_of::<f64>());
+        // Serial single-thread launch (unit 0 packs the small per-leaf system in fixed order).
+        let count = CubeCount::Static(1, 1, 1);
+        let dim = CubeDim { x: 1, y: 1, z: 1 };
+        pairwise_assemble_system_kernel::launch::<SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(ws_h, expected) },
+            unsafe { ArrayArg::from_raw_parts(ds_h, leaf_count) },
+            unsafe { ArrayArg::from_raw_parts(params_h, 2) },
+            unsafe { ArrayArg::from_raw_parts(out.clone(), out_len) },
+        );
+        Ok(out)
+    }
+}
+
+/// Host-readback wrapper over the device pairwise per-leaf system assembly: build the resident
+/// packed `linearSystem`, then read it back to a host `Vec<f64>`. This is the seam the self-oracle
+/// exercises (device assembly vs the CPU pair-stat reference); it is NOT the residency path (that
+/// keeps the handle on-device for Plan 02's Cholesky). A `leaf_count <= 1` system reads back as an
+/// empty `Vec` WITHOUT reading a 0-len handle (HIP fault guard). A read-back failure surfaces
+/// [`CbError::Degenerate`], never a silent zero buffer.
+pub fn assemble_pairwise_system_host(
+    weight_sums: &[f64],
+    der_sums: &[f64],
+    l2_diag_reg: f64,
+    pairwise_bucket_weight_prior_reg: f64,
+) -> CbResult<Vec<f64>> {
+    if der_sums.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let handle = launch_pairwise_assemble_system_into(
+        &client,
+        weight_sums,
+        der_sums,
+        l2_diag_reg,
+        pairwise_bucket_weight_prior_reg,
+    )?;
+    read_pair_der_sums_f64(&client, handle)
+}
+
 /// The pairwise split scorer result: the per-candidate pairwise scores (one per border,
 /// `scores[feature * (bucket_count - 1) + border]`), the device-resident-assembled
 /// per-(feature, bucket) der-sums (the bounded descriptor read back, leaf 0 / root), and
