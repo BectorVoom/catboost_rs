@@ -2886,6 +2886,16 @@ mod mvs_device_test;
 #[cfg(test)]
 mod pairwise_deriv_test;
 
+// Device batched f64 SPD Cholesky solver (Phase 13 Plan 02, GPUT-21): the PRODUCTION module hosting
+// the serial `#[cube]` batched solver — in-place lower-triangular decomposition + forward/back
+// substitution + ridge + `CalcScoresCholesky`, `REMOVE_LAST` (drop last row) + zero-average, one
+// parameterized kernel serving both the leaf-value system (size `leaf_count`) and the split-score
+// system (size `2·PartCount`, RESEARCH Open Q1). Transcribes `cb_compute::leaf::cholesky_solve` +
+// `cb_train::pairwise_leaves::calculate_pairwise_leaf_values` + `pairwise_scoring::calculate_score`
+// INLINE — NEVER a `cb-train` dep (Pattern B). f64 non-atomic per-matrix arithmetic (D-07); a
+// non-positive pivot → zeros fallback (no NaN, T-13-03). Mounted under every backend (production).
+pub(crate) mod cholesky_solve;
+
 // Device ordered / one-hot / tensor CTR accumulation (Phase 12 Plan 08, GPUT-10): the PRODUCTION
 // module hosting the serial `#[cube]` read-before-increment ordered-prefix CTR kernel (port of
 // `online_ctr.cpp` `CalcQuantizedCtrs`, transcribed inline — NEVER a `cb-train` dep, Pattern B)
