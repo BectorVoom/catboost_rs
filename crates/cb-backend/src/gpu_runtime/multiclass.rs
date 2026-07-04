@@ -162,6 +162,31 @@ pub(crate) fn assemble_multiclass_ders(
             actual: approx.len(),
         });
     }
+    // Validate the objective-specific `target` layout and the `weight` column up front, so a
+    // too-short buffer raises a typed `LengthMismatch` rather than silently substituting 0/1 via
+    // `unwrap_or` and returning a wrong der (WR-01: the phase-wide "typed error, never a silent
+    // wrong result" contract). MultiCrossEntropy / MultiRmse read a dimension-major `target[d*n+i]`
+    // (length `k·n`); the rest read a per-object column (`target[i]`, length `n`).
+    let expected_target = match objective {
+        MulticlassObjective::MultiCrossEntropy | MulticlassObjective::MultiRmse => k_n,
+        MulticlassObjective::Softmax
+        | MulticlassObjective::OneVsAll
+        | MulticlassObjective::RmseWithUncertainty => n,
+    };
+    if target.len() != expected_target {
+        return Err(CbError::LengthMismatch {
+            column: "target".to_owned(),
+            expected: expected_target,
+            actual: target.len(),
+        });
+    }
+    if !weight.is_empty() && weight.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "weight".to_owned(),
+            expected: n,
+            actual: weight.len(),
+        });
+    }
     let mut der1 = vec![0.0_f64; k_n];
     let mut der2_packed = vec![0.0_f64; n_pk];
 
