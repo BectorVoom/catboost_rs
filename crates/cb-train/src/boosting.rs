@@ -3007,12 +3007,15 @@ fn train_inner<R: Runtime>(
         && structure_fold_columns.iter().all(Vec::is_empty)
         && !penalties_active
         && params.monotone_constraints.is_empty()
-        // Phase 12 Plan 03 (GPUT-18): SymmetricTree (oblivious, Plan 01) AND the two
-        // non-symmetric leaf-wise policies Depthwise / Lossguide are device-eligible; Region
-        // (Plan 04, no device kernel yet) stays on the CPU grower.
+        // Phase 12 Plan 03/04 (GPUT-18): SymmetricTree (oblivious, Plan 01), the two
+        // non-symmetric leaf-wise policies Depthwise / Lossguide (Plan 03), AND Region (Plan 04,
+        // the walk-until-diverge device PATH grow) are all device-eligible.
         && matches!(
             params.grow_policy,
-            EGrowPolicy::SymmetricTree | EGrowPolicy::Depthwise | EGrowPolicy::Lossguide
+            EGrowPolicy::SymmetricTree
+                | EGrowPolicy::Depthwise
+                | EGrowPolicy::Lossguide
+                | EGrowPolicy::Region
         )
         && approx_dimension == 1
         && !is_multiclass
@@ -3062,6 +3065,8 @@ fn train_inner<R: Runtime>(
     let device_grow_policy = match params.grow_policy {
         EGrowPolicy::Depthwise => DeviceGrowPolicy::Depthwise,
         EGrowPolicy::Lossguide => DeviceGrowPolicy::Lossguide,
+        // Phase 12 Plan 04 (GPUT-18): Region routes to the host-driven device Region PATH grow.
+        EGrowPolicy::Region => DeviceGrowPolicy::Region,
         // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
         _ => DeviceGrowPolicy::SymmetricTree,
     };
@@ -3130,14 +3135,112 @@ fn train_inner<R: Runtime>(
                     )
                 })?;
 
-            // Phase 12 Plan 03 (GPUT-18): dispatch on the populated `DeviceGrownTree`
-            // SHAPE. An EMPTY `step_nodes` is the oblivious / symmetric emission (the
-            // byte-unchanged Plan-01 path → `ObliviousTree`); a NON-EMPTY `step_nodes`
-            // is a Depthwise / Lossguide non-symmetric node graph → `NonSymmetricTree`
-            // into `non_symmetric_trees`. The dispatch KEY mirrors the CPU fold at
-            // `:4277` (`grown.step_nodes.is_empty()`). The Region arm is Plan 04's
-            // (Region device types do not exist yet), so only two arms here.
-            if dev_tree.step_nodes.is_empty() {
+            // Phase 12 Plan 03/04 (GPUT-18): dispatch on the populated `DeviceGrownTree`
+            // SHAPE, in the SAME order as the CPU fold at `:4419`: a NON-EMPTY
+            // `region_path` is a Region PATH tree → `RegionTree` into `region_trees`
+            // (Plan 04); else an EMPTY `step_nodes` is the oblivious / symmetric
+            // emission (the byte-unchanged Plan-01 path → `ObliviousTree`); else a
+            // NON-EMPTY `step_nodes` is a Depthwise / Lossguide non-symmetric node
+            // graph → `NonSymmetricTree` into `non_symmetric_trees`.
+            if !dev_tree.region_path.is_empty() {
+                // ─── REGION ARM (walk-until-diverge PATH, GPUT-18 / D-03a) ───
+                // The device emits a per-level `(feature, bin_id, expected_direction,
+                // one_hot)` `region_path` (length `depth`) plus `depth + 1` leaf
+                // values (NOT `2^depth` — a path, not a node graph). Resolve each
+                // level's `(feature, bin_id)` to a Model `Split` via the range-checked
+                // `feature_borders[feature][bin_id]` join (T-10-22: an out-of-range
+                // index is a typed error, never a panic / raw index).
+                let region_depth = dev_tree.region_path.len();
+                let mut region_splits: Vec<Split> = Vec::with_capacity(region_depth);
+                let mut region_directions: Vec<bool> = Vec::with_capacity(region_depth);
+                let mut region_one_hot: Vec<bool> = Vec::with_capacity(region_depth);
+                for &(feature, bin_id, expected_direction, one_hot) in &dev_tree.region_path {
+                    let f = feature as usize;
+                    let b = bin_id as usize;
+                    let border = feature_borders
+                        .get(f)
+                        .and_then(|borders| borders.get(b))
+                        .copied()
+                        .ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device region split (feature {f}, bin_id {b}) is out of range for \
+                                 feature_borders (feature count {}, feature border count {})",
+                                feature_borders.len(),
+                                feature_borders.get(f).map_or(0, Vec::len),
+                            ))
+                        })?;
+                    region_splits.push(Split { feature: f, border });
+                    region_directions.push(expected_direction);
+                    region_one_hot.push(one_hot);
+                }
+
+                // Per-object terminal bin via the walk-until-diverge path (TRANSCRIBED
+                // from `cb_model::apply::region_leaf` / `AddRegionImpl`, NOT imported):
+                // `bin = 0; for level { split = one_hot ? val == border : val > border;
+                // if split != expected_direction { break }; bin += 1 } leaf = bin`. All
+                // access checked → a malformed level halts the walk (bin so far), never
+                // a panic / raw index (T-12-05). `one_hot` is always false for the
+                // device float grower, so the `>` test is authoritative.
+                let device_leaf_of: Vec<usize> = (0..n)
+                    .map(|obj| {
+                        let mut bin = 0usize;
+                        for level in 0..region_depth {
+                            let (Some(s), Some(&dir), Some(&oh)) = (
+                                region_splits.get(level),
+                                region_directions.get(level),
+                                region_one_hot.get(level),
+                            ) else {
+                                break;
+                            };
+                            let val = feature_values
+                                .get(s.feature)
+                                .and_then(|col| col.get(obj))
+                                .map(|&v| f64::from(v));
+                            let Some(val) = val else { break };
+                            let split = if oh { val == s.border } else { val > s.border };
+                            if split == dir {
+                                bin += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        bin
+                    })
+                    .collect();
+
+                // A depth-`d` Region has `d + 1` leaves (== the device leaf-value
+                // vector length), indexed DIRECTLY by the walk bin (0..=depth).
+                let region_n_leaves = dev_tree.leaf_values.len();
+                let mut device_leaf_values = dev_tree.leaf_values.clone();
+                let device_leaf_weights =
+                    accumulate_leaf_weights(&device_leaf_of, &weights, region_n_leaves);
+                normalize_leaf_values(
+                    /* is_pairwise = */ false,
+                    learning_rate,
+                    &device_leaf_weights,
+                    &mut device_leaf_values,
+                    region_n_leaves,
+                    /* approx_dimension = */ 1,
+                );
+
+                for (i, &leaf) in device_leaf_of.iter().enumerate() {
+                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
+                        *a += lv;
+                    }
+                }
+
+                if let Some(out) = staged_out.as_deref_mut() {
+                    out.extend_from_slice(&approx);
+                }
+
+                region_trees.push(RegionTree {
+                    splits: region_splits,
+                    directions: region_directions,
+                    one_hot: region_one_hot,
+                    leaf_values: device_leaf_values,
+                    leaf_weights: device_leaf_weights,
+                });
+            } else if dev_tree.step_nodes.is_empty() {
                 // ─── OBLIVIOUS ARM (byte-identical to the Plan-01 device fold) ───
                 // Resolve each device split `(feature, bin_id)` to a Model `Split` via
                 // `border = feature_borders[feature][bin_id]` (Pattern 4). Range-check

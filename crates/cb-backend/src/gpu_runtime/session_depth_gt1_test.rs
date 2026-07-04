@@ -233,7 +233,7 @@ fn session_depth_gt1_gate_declines_uncovered() {
     );
 
     // Phase 12 Plan 03 (GPUT-18): the Depthwise / Lossguide grow policies are now COVERED
-    // (the non-symmetric device grow arm flipped on this wave). Region stays declined (Plan 04).
+    // (the non-symmetric device grow arm flipped on this wave). Region is covered by Plan 04.
     let depthwise = DeviceTrainConfig {
         grow_policy: DeviceGrowPolicy::Depthwise,
         ..DeviceTrainConfig::default()
@@ -251,13 +251,15 @@ fn session_depth_gt1_gate_declines_uncovered() {
         open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &lossguide),
         "Lossguide grow_policy (with a leaf cap) must now be covered (Plan 03)"
     );
+    // Phase 12 Plan 04 (GPUT-18, D-03a): the Region grow policy is now COVERED (the host-driven
+    // device Region PATH grow flipped on this wave — `MaxLeaves = depth + 1`).
     let region = DeviceTrainConfig {
         grow_policy: DeviceGrowPolicy::Region,
         ..DeviceTrainConfig::default()
     };
     assert!(
-        !open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &region),
-        "Region grow_policy must still decline (no device kernel until Plan 04)"
+        open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &region),
+        "Region grow_policy must now be covered (Plan 04 device Region PATH arm)"
     );
     let exact = DeviceTrainConfig {
         exact_leaf: true,
