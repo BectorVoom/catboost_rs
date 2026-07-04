@@ -417,6 +417,13 @@ pub use pairwise::*;
 mod session; // Phase 10-07 (GPUT-02/03): the per-fit device-resident training session.
 pub use session::*;
 
+// Phase 13 Plan 07 (GPUT-12): the multi-output device driver — the block-leaf emission that wires
+// the Plan-06 K-dim Newton block solve onto the multi-output loss family (MultiClass softmax,
+// MultiClassOneVsAll, MultiLogloss / MultiCrossEntropy, MultiRMSE, RMSEWithUncertainty). `pub(crate)`
+// so the session multiclass coverage gate reaches `map_multiclass_objective` / `MulticlassObjective`
+// and the `multiclass_test` self-oracle reaches the block driver.
+pub(crate) mod multiclass;
+
 // Phase 13 Plan 04 (GPUT-22): the deterministic query/listwise objective device driver
 // (QueryRMSE / QuerySoftMax / QueryCrossEntropy) over the Plan-03 query-grouping infra. `pub(crate)`
 // so the session ranking coverage gate reaches `RankingObjective` / `ranking_objective_covered` and

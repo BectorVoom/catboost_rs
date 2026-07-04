@@ -449,6 +449,58 @@ fn map_ranking_coverage(
     Some(RankingState { objective })
 }
 
+/// The per-fit device MULTI-OUTPUT state (Phase 13 Plan 07, GPUT-12). `Some` iff the fit committed
+/// to a covered multi-output loss — the [`crate::gpu_runtime::multiclass::MulticlassObjective`] the
+/// device block driver solves (COUPLED softmax vs DIAGONAL separable, RESEARCH Pitfall 3). Like
+/// [`PairwiseState`] / [`RankingState`] this carries the coverage DECISION: the block-leaf driver +
+/// self-oracle land THIS plan (`grow_multiclass_block` over the Plan-06 K-dim Newton block solve),
+/// but the per-tree SHARED multi-dim grow seam (the `Runtime::grow_tree_on_device` seam carries only
+/// scalar `approx`/`target` today, not the `K`-dimensional approx / block leaf) is a forward
+/// dependency, so a covered multi-output fit currently declines to the byte-unchanged CPU grower
+/// (D-04 no-regression) rather than fabricating a SCALAR pointwise grow (`approx_dim == 1`) on a
+/// multi-output fit — the pairwise / ranking gate precedent.
+#[allow(dead_code)]
+struct MulticlassState {
+    /// The covered multi-output objective the block driver solves (coupled softmax / diagonal
+    /// separable). MultiQuantile (a different exact-quantile leaf estimator, Plan 09) is NOT stored
+    /// here — it maps to `Ok(None)` without disabling the covered arms.
+    objective: crate::gpu_runtime::multiclass::MulticlassObjective,
+}
+
+/// Phase 13 Plan 07 (GPUT-12): the multi-output coverage gate, mirroring the `map_pairwise_coverage`
+/// / `map_ranking_coverage` `Option`-returning family-gated template (Pattern A). Returns
+/// `Some(MulticlassState)` iff the fit is a COVERED multi-output config — a MultiClass /
+/// MultiClassOneVsAll / MultiLogloss / MultiCrossEntropy / RMSEWithUncertainty loss
+/// ([`crate::gpu_runtime::multiclass::map_multiclass_objective`]), depth ≥ 1, Plain boosting, single
+/// fold, SymmetricTree, and every OTHER family flag still the covered default (D-10-01 all-or-nothing
+/// PER family: no bootstrap / MVS / exact-leaf / CTR / leaf-cap). MultiQuantile declines (its exact
+/// leaf is Plan 09). Returns `None` for any uncovered config → the byte-unchanged CPU grower.
+fn map_multiclass_coverage(
+    loss: &Loss,
+    config: &DeviceTrainConfig,
+    depth: usize,
+    boosting_type_is_plain: bool,
+    fold_count: usize,
+) -> Option<MulticlassState> {
+    let objective = crate::gpu_runtime::multiclass::map_multiclass_objective(loss)?;
+    if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
+        return None;
+    }
+    if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+        return None;
+    }
+    // All-or-nothing per family: no other non-default family flag may be set.
+    let family_default = config.bootstrap_type == DeviceBootstrapType::No
+        && config.mvs_lambda.is_none()
+        && !config.exact_leaf
+        && config.ctr.is_none()
+        && config.max_leaves.is_none();
+    if !family_default {
+        return None;
+    }
+    Some(MulticlassState { objective })
+}
+
 /// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
 /// for the covered losses, transcribing `cb_compute`'s documented formulas (RMSE:
 /// `der1 = target - approx`; Logloss / CrossEntropy: `der1 = target - sigmoid(approx)`). The
@@ -555,6 +607,14 @@ pub struct GpuTrainSession {
     /// / `config`). QueryCrossEntropy is INDEPENDENTLY deferred (Open Q3) and never stored here.
     #[allow(dead_code)]
     ranking: Option<RankingState>,
+    /// The per-fit multi-output state (Phase 13 Plan 07, GPUT-12). `Some` iff the fit committed to a
+    /// covered multi-output loss (MultiClass / OneVsAll / MultiLogloss / MultiCrossEntropy /
+    /// RMSEWithUncertainty); `None` for every scalar / pairwise / ranking path (byte-unchanged,
+    /// D-04). Carries the coverage DECISION the block-leaf driver consumes (the per-tree shared
+    /// multi-dim grow seam is a forward dependency, so no covered-multi-output session is constructed
+    /// yet — the field is the landed structural seam, like `pairwise` / `ranking` / `config`).
+    #[allow(dead_code)]
+    multiclass: Option<MulticlassState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -724,6 +784,29 @@ impl GpuTrainSession {
                 // dependency. Decline to CPU (never a fabricated pointwise grow on a ranking fit).
                 Some(_ranking) => return Ok(None),
                 // Uncovered ranking config → CPU grower (D-10-01 all-or-nothing per family).
+                None => return Ok(None),
+            }
+        }
+        // Phase 13 Plan 07 (GPUT-12): the multi-output coverage gate. A multi-output loss (MultiClass
+        // softmax / MultiClassOneVsAll / MultiLogloss / MultiCrossEntropy / RMSEWithUncertainty)
+        // grows ONE shared tree whose leaf VALUES are a `leaf_count × K` block solved by the Plan-06
+        // K-dim Newton block solve (COUPLED softmax vs DIAGONAL separable) — a fundamentally
+        // different leaf estimator than the scalar Gradient/Newton path. `map_multiclass_coverage`
+        // returns `Some(MulticlassState)` for a covered multi-output config (proven by the
+        // `multiclass` block-driver self-oracle), `None` otherwise (MultiQuantile's exact-quantile
+        // leaf is Plan 09). The block-leaf driver (`grow_multiclass_block`) + self-oracle land THIS
+        // plan; the per-tree SHARED multi-dim grow seam (the `Runtime::grow_tree_on_device` seam
+        // carries only scalar `approx`/`target` today, not the `K`-dimensional approx / block leaf)
+        // is a forward dependency, so BOTH the covered and uncovered multi-output branches decline to
+        // the byte-unchanged CPU grower (D-04 no-regression) — NEVER a fabricated SCALAR pointwise
+        // grow (`approx_dim == 1`) on a multi-output fit (the pairwise / ranking gate precedent).
+        if crate::gpu_runtime::multiclass::map_multiclass_objective(loss).is_some() {
+            match map_multiclass_coverage(loss, config, depth, boosting_type_is_plain, fold_count) {
+                // Covered multi-output config: block driver + self-oracle landed; grow seam is a
+                // forward dependency. Decline to CPU (never a fabricated scalar grow on a
+                // multi-output fit).
+                Some(_multiclass) => return Ok(None),
+                // Uncovered multi-output config → CPU grower (D-10-01 all-or-nothing per family).
                 None => return Ok(None),
             }
         }
@@ -1068,6 +1151,10 @@ impl GpuTrainSession {
             // gated + declined ABOVE (the ranking arm returns Ok(None) pending the per-tree
             // query-descriptor grow seam), so this construction is only ever reached pointwise.
             ranking: None,
+            // Scalar path: no multi-output state (byte-unchanged, D-04). A covered multi-output fit
+            // is gated + declined ABOVE (the multiclass arm returns Ok(None) pending the per-tree
+            // shared multi-dim grow seam), so this construction is only ever reached scalar.
+            multiclass: None,
         }))
     }
 
