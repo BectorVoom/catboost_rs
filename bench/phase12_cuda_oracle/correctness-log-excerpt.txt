@@ -1,0 +1,52 @@
+|   0  Tesla P100-PCIE-16GB           Off |   00000000:00:04.0 Off |                    0 |
+gpu: Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB | nvcc: Cuda compilation tools, release 12.8, V12.8.93 | cuda: /usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-12.8
+[nonsym_grow (Depthwise/Lossguide) GPUT-18] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+test kernels::region_device_test::region_device_reproduces_frozen_cpu_region_path ... [region] depth=2 leaves=3; leaf-value max abs_div=0.000e0 rel_div=0.000e0 (bar=1e-4)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out; finished in 0.35s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[region_device GPUT-18] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+test kernels::exact_quantile_test::exact_quantile_edge_cases_match_cpu ... [exact alpha zero -> min] device=-2.00000000 cpu=-2.00000000 abs_div=0.000e0
+[exact single element] device=7.49999900 cpu=7.49999900 abs_div=0.000e0
+[exact duplicate residuals] device=2.00000100 cpu=2.00000100 abs_div=0.000e0
+test kernels::exact_quantile_test::exact_quantile_larger_leaf_matches_cpu ... [exact large median] device=-2.42779656 cpu=-2.42779656 abs_div=0.000e0
+[exact large alpha 0.3] device=-9.96989055 cpu=-9.96989055 abs_div=0.000e0
+test kernels::exact_quantile_test::exact_quantile_mape_weights_with_targets_matches_cpu ... [exact mape weighted median] device=-0.49999900 cpu=-0.49999900 abs_div=0.000e0
+test kernels::exact_quantile_test::exact_quantile_median_unit_weights_matches_cpu ... [exact median odd] device=-1.00000100 cpu=-1.00000100 abs_div=0.000e0
+[exact median even] device=-1.99999900 cpu=-1.99999900 abs_div=0.000e0
+test kernels::exact_quantile_test::exact_quantile_nonmedian_alpha_matches_cpu ... [exact alpha 0.25] device=-1.99999900 cpu=-1.99999900 abs_div=0.000e0
+[exact alpha 0.75] device=2.99999900 cpu=2.99999900 abs_div=0.000e0
+[exact alpha 0.9 delta 1e-4] device=4.99990000 cpu=4.99990000 abs_div=0.000e0
+test kernels::exact_quantile_test::exact_quantile_weighted_matches_cpu ... [exact weighted 2-elem] device=0.00000100 cpu=0.00000100 abs_div=0.000e0
+[exact weighted 4-elem] device=6.99999900 cpu=6.99999900 abs_div=0.000e0
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.97s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[exact_quantile + segmented_sort GPUT-19] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+test kernels::bootstrap_device_test::bayesian_weights_match_frozen_cpu_sample_within_epsilon ... [bootstrap bayesian seed=17 temp=1 n=64] max_div=2.384e-7
+[bootstrap bayesian seed=7 temp=0.5 n=1536] max_div=2.384e-7
+test kernels::bootstrap_device_test::bernoulli_keep_mask_matches_frozen_cpu_sample_bit_for_bit ... [bootstrap bernoulli seed=17 rate=0.5] kept device=25 cpu=25 / 37
+[bootstrap bernoulli seed=42 rate=0.7] kept device=86 cpu=86 / 128
+[bootstrap bernoulli seed=123 rate=0.3] kept device=79 cpu=79 / 250
+test kernels::bootstrap_device_test::bernoulli_leaves_match_transitively_via_identical_mask ... [bootstrap leaves] device=-0.62965180 cpu=-0.62965180 div=0.000e0
+test kernels::bootstrap_device_test::poisson_weights_are_deterministic_and_nonnegative_integers ... [bootstrap poisson] n=200 mean_count=1.095 (Poisson(1) ⇒ ~1.0)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 160 filtered out; finished in 0.54s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[bootstrap_device GPUT-09] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+test kernels::mvs_device_test::mvs_multi_block_reseed_is_deterministic_and_finite ... [mvs multiblock] n=8216 tail_kept(block1)=15/24
+test kernels::mvs_device_test::mvs_per_block_threshold_matches_and_reweight_is_consistent ... [mvs threshold] cpu_threshold=4.02701297 max_div=5.329e-15
+test kernels::mvs_device_test::mvs_weights_match_frozen_cpu_sample_within_epsilon ... [mvs seed=17 rate=0.5 n=48] max_div=4.441e-16 kept dev=25 cpu=25 (~target 24.0)
+[mvs seed=42 rate=0.7 n=64] max_div=6.661e-16 kept dev=47 cpu=47 (~target 44.8)
+[mvs seed=2024 rate=0.3 n=200] max_div=4.441e-15 kept dev=54 cpu=54 (~target 60.0)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 162 filtered out; finished in 1.02s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[mvs_device GPUT-17] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 160 filtered out; finished in 0.37s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[ctr_device GPUT-10] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+test device_depthwise_fit_reproduces_cpu_leaf_wise ... [depthwise] device vs cpu max |Δpred| = 0.000e0; sign_matches_target=true
+test device_lossguide_fit_reproduces_cpu_leaf_wise ... [lossguide] device vs cpu max |Δpred| = 0.000e0; sign_matches_target=true
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+[device_nonsym_fit (e2e) GPUT-18] exit=0 ['test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s']
+test device_region_fit_reproduces_cpu_region_grower ... [region] device vs cpu max |Δpred| = 0.000e0; sign_matches_target=true
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+[device_region_fit (e2e) GPUT-18] exit=0 ['test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s']
+ORACLE_VERDICT: ALL-PASS

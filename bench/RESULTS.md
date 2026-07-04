@@ -151,3 +151,30 @@ RMSE + Logloss and the per-tree diagnostic (no compounding split-flip drift), re
 depth-6 speed numbers, and pastes a filled copy of the template above here.
 
 Correctness gate (depth-6): **TBD** · Speed (depth-6, large n): **TBD**
+
+---
+
+### Run 2026-07-04 — phase 12, Tesla P100-PCIE-16GB, CUDA 12.8 (V12.8.93), driver 580.159.04
+Signed-off-by: automated Kaggle CLI run (kernel `yensen2/catboost-rs-phase12-cuda-oracle`)
+
+Method: each Phase-12 family's existing device self-oracle (`*_test.rs`) run under
+`cargo test --release --no-default-features --features cuda` on the CUDA `SelectedRuntime`
+(device path vs the inline Rust CPU reference). Correctness is the BLOCKING gate.
+
+Correctness gate (BLOCKING — all PASS, bar ε=1e-4):
+| Family (Req)                         | Oracle                                   | Result | max\|div\|                |
+|--------------------------------------|------------------------------------------|--------|---------------------------|
+| Depthwise/Lossguide (GPUT-18)        | nonsym_grow_test 4/4                      | PASS   | 0.000e0 (bit-exact)       |
+| Region (GPUT-18)                     | region_device_test 1/1                   | PASS   | 0.000e0 (bit-exact)       |
+| Exact Quantile/MAE/MAPE (GPUT-19)    | exact_quantile+segmented_sort 10/10      | PASS   | 0.000e0                   |
+| Bootstrap (GPUT-09)                  | bootstrap_device_test 5/5                | PASS   | Bernoulli exact; Bayes 2.384e-7 |
+| MVS (GPUT-17)                        | mvs_device_test 3/3                      | PASS   | 6.66e-16 … 4.44e-15       |
+| CTR ordered/one-hot/tensor (GPUT-10) | ctr_device_test 5/5                      | PASS   | good/total exact, val ≤1e-4 |
+| e2e device fit non-sym (GPUT-18)     | device_nonsym_fit_test 2/2 (cb-train)    | PASS   | full-fit pred parity      |
+| e2e device fit Region (GPUT-18)      | device_region_fit_test 1/1 (cb-train)    | PASS   | full-fit pred parity      |
+
+Verdict: **ALL-PASS — 31 device tests, 0 failed.** Provenance: `bench/phase12_cuda_oracle/`.
+Note: this also incidentally exercises the resident depth>1 grow path on CUDA (u64/f64
+atomics present), which the in-env ROCm runtime currently cannot run (Atomic<u64> regression).
+
+BENCH-02 speed (per family, train-only, warm, JIT-excluded): **NOT YET MEASURED — pending.**
