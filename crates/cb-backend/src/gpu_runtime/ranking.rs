@@ -729,10 +729,12 @@ fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {
 /// The DESCENDING per-query sort order (global doc indices) for one permutation's `perturbed` slice,
 /// reusing [`segmented_radix_sort`] (the acceptance-criterion sort reuse). `perturbed` values are all
 /// NON-NEGATIVE (`exp(approx) > 0`, ratio `>= 0`), so their raw IEEE-754 `f64` bit patterns are
-/// MONOTONE — a stable 2-pass 64-bit LSD radix (low 32 bits then high 32 bits) yields the full
-/// ASCENDING order, which we reverse per query for the CPU's descending sort
-/// (`yetirank_helpers.cpp:326-331`). Distinct perturbed values (the well-separated frozen fixture) →
-/// no ties, so the tie-break never diverges from the CPU stable descending sort.
+/// MONOTONE. Radix-sorting the BITWISE-COMPLEMENTED key (`!bits`) ASCENDING in a single stable 2-pass
+/// 64-bit LSD radix (low 32 bits then high 32 bits) therefore yields the full DESCENDING value order
+/// directly, and — because the radix is STABLE and equal values share an equal complemented key —
+/// tied documents stay in ORIGINAL index order, exactly matching the upstream stable descending sort
+/// (`yetirank_helpers.cpp:326-331`). A plain reverse-of-stable-ascending would instead flip ties into
+/// reversed-index order (the WR-01 parity divergence), so we complement the key rather than reverse.
 #[cfg(not(feature = "wgpu"))]
 fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {
     let n = perturbed.len();
@@ -746,7 +748,11 @@ fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<
             *slot = 1;
         }
     }
-    let ord: Vec<u64> = perturbed.iter().map(|&v| v.to_bits()).collect();
+    // Complement the radix key so ONE stable ASCENDING pass already yields the DESCENDING value
+    // order with tie order preserved (WR-01). Non-negative f64 bit patterns are monotone, so `!bits`
+    // inverts the ordering while keeping equal keys equal; the stable radix then leaves tied docs in
+    // ORIGINAL index order — exactly the upstream stable descending sort, not a tie-flipping reverse.
+    let ord: Vec<u64> = perturbed.iter().map(|&v| !v.to_bits()).collect();
     let lo: Vec<u32> = ord.iter().map(|&b| b as u32).collect();
     let hi: Vec<u32> = ord.iter().map(|&b| (b >> 32) as u32).collect();
     let idx0: Vec<u32> = (0..n as u32).collect();
@@ -757,15 +763,8 @@ fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<
         .iter()
         .map(|&i| hi.get(i as usize).copied().unwrap_or(0))
         .collect();
-    let (_sk2, mut order) = segmented_radix_sort(&head, &hi_re, &order_lo)?;
-    // `order` is now ASCENDING by the full u64 bit pattern within each query; reverse per query.
-    for w in q_offsets.windows(2) {
-        let b = *w.first().unwrap_or(&0) as usize;
-        let e = *w.get(1).unwrap_or(&0) as usize;
-        if let Some(seg) = order.get_mut(b..e) {
-            seg.reverse();
-        }
-    }
+    let (_sk2, order) = segmented_radix_sort(&head, &hi_re, &order_lo)?;
+    // `order` is now DESCENDING by expApprox within each query (ties in original index order).
     Ok(order)
 }
 
