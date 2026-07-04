@@ -399,6 +399,21 @@ pub(crate) fn compute_group_means_host(
                 weight_col.len()
             )));
         }
+        // Reject magnitudes that would overflow the i64 fixed-point accumulator (IN-01): the kernel
+        // quantizes `value·weight` (and `weight`) as `i64::cast_from(round(prod · scale))`, whose
+        // f64 → i64 cast is backend-defined once `|prod| · scale` exceeds `i64::MAX`, silently
+        // corrupting the group mean. The covered mean-removed residuals stay far inside this bound;
+        // still reject an out-of-range magnitude up front with a typed error rather than trust it.
+        let max_mag = (i64::MAX as f64) / REDUCE_FIXEDPOINT_SCALE_F64;
+        for (v, w) in values.iter().zip(weight_col.iter()) {
+            if (v * w).abs() > max_mag || w.abs() > max_mag {
+                return Err(CbError::OutOfRange(format!(
+                    "compute_group_means_host: |value·weight| or |weight| exceeds the i64 \
+                     fixed-point range (±{max_mag:.3e}); the deterministic group reduction would \
+                     overflow"
+                )));
+            }
+        }
         let client = selected_client();
         let val_h = client.create(cubecl::bytes::Bytes::from_elems(values.to_vec()));
         let w_h = client.create(cubecl::bytes::Bytes::from_elems(weight_col));
