@@ -1169,7 +1169,11 @@ fn compute_exact_leaf_values(
         let t = target.get(i).copied().unwrap_or(0.0);
         let r = (t - a) as f32;
         let w = if ex.mape {
-            1.0 / f64::max(1.0, t.abs())
+            // IN-01: upstream folds the object weight into the MAPE weight
+            // (`weightsWithTargets[i] = weight_i / max(1, |target_i|)`). Multiply
+            // in `ex.weight` so the weighted case stays correct if the exact path
+            // is ever wired with non-unit weights (unit-weight regime unchanged).
+            ex.weight.get(i).copied().unwrap_or(1.0) / f64::max(1.0, t.abs())
         } else {
             ex.weight.get(i).copied().unwrap_or(1.0)
         };
