@@ -49,7 +49,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 - [x] **Phase 10: GPU Foundations — Runtime Seam, Session Residency, Device-Primitive Library, Compressed Index, Depth-1 + Kaggle CUDA Oracle & Speed Harness** - The from-scratch CubeCL device-primitive substrate (no CUB) and the device-resident compressed index land; the device grow loop becomes reachable from `fit()`; training data stays device-resident; depth-1 oblivious trees grow on device with the Cosine GPU-default score; the foundational Kaggle CUDA harness measures BOTH correctness (≤1e-5) AND wall-clock speed from the start. (completed 2026-07-03)
 - [ ] **Phase 11: Depth>1 Partition-Aware Histograms + Reduction Determinism + Newton Der2** - Real depth-6 RMSE + Logloss workloads grow fully on device within ε=1e-4, via partition-aware histograms + the subtraction trick + a deterministic reduction + Newton der2 leaf estimation, oracle-tested AND speed-measured on Kaggle CUDA; GPUT-14 becomes the operative standing gate.
 - [x] **Phase 12: Grow-Policy, Leaf-Method, Sampling & Categorical Device Coverage** - Non-symmetric grow policies (Depthwise/Lossguide/Region), Exact weighted-quantile leaf estimation, bootstrap/random-strength + MVS sampling, and CTR/categorical features each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands. (completed 2026-07-04)
-- [ ] **Phase 13: Pairwise, Ranking, Multiclass, Ordered & Langevin Device Coverage** - The PairLogit pairwise path + batched device Cholesky solver, query/listwise ranking objectives with device query-grouping, multiclass/multi-target/uncertainty, ordered boosting, and Langevin/SGLB noise each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands.
+- [x] **Phase 13: Pairwise, Ranking, Multiclass, Ordered & Langevin Device Coverage** - The PairLogit pairwise path + batched device Cholesky solver, query/listwise ranking objectives with device query-grouping, multiclass/multi-target/uncertainty, ordered boosting, and Langevin/SGLB noise each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands. (completed 2026-07-04)
 - [ ] **Phase 14: Comprehensive Kaggle CUDA Speed Benchmark + Parity Sign-Off** - The device-resident path demonstrably closes the >20× gap via a comprehensive final sign-off that AGGREGATES the per-phase speed checks (BENCH-02) from Phases 10–13, with CUDA correctness gated before any speed number.
 
 ## Phase Details
@@ -233,7 +233,7 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete    | 2026-07-04 |
-| 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 9/10 | In Progress|  |
+| 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 10/10 | Complete    | 2026-07-04 |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
