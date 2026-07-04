@@ -6,14 +6,14 @@ current_phase: 13
 current_phase_name: pairwise-ranking-multiclass-ordered-langevin-device-coverage
 status: executing
 stopped_at: Completed 13-02-PLAN.md (GPUT-21 device Cholesky, wire-device)
-last_updated: "2026-07-04T07:56:27.284Z"
+last_updated: "2026-07-04T08:18:49.756Z"
 last_activity: 2026-07-04
 last_activity_desc: Phase 13 execution started
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 33
-  completed_plans: 26
+  completed_plans: 27
   percent: 60
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 13 (pairwise-ranking-multiclass-ordered-langevin-device-coverage) — EXECUTING
-Plan: 4 of 10
+Plan: 5 of 10
 Status: Ready to execute
 Last activity: 2026-07-04 — Phase 13 execution started
 
@@ -190,6 +190,7 @@ Last activity: 2026-07-04 — Phase 13 execution started
 | Phase 13 P01 | 45min | 2 tasks | 5 files |
 | Phase 13 P02 | 90min | 3 tasks | 4 files |
 | Phase 13 P03 | 35 | 2 tasks | 3 files |
+| Phase 13 P04 | 45min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -414,6 +415,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 13-02: device batched f64 Cholesky solver (GPUT-21) wired into pairwise scorer (D-05 full residency); self-oracled bit-identical vs CPU; GPUT-21 stays open pending Plan-10 Kaggle CUDA sign-off
 - [Phase ?]: 13-03: query_helper.rs ships serial k=30 fixed-point (REDUCE_FIXEDPOINT_SCALE_F64) group der/weight sums — deterministic, satisfies T-13-06 without a real Atomic<u64>; warp-per-query deferred (perf)
 - [Phase ?]: 13-03: CreateSortKeys emits u32 random low-32 keys; in-query shuffle reuses exact_quantile::segmented_radix_sort under per-query head-flags (no second sort); contiguity test device-gated (full_scan plane op is rocm/cuda-only)
+- [Phase ?]: 13-04: covered ranking fit declines to CPU (Ok(None)) pending the per-tree query-descriptor grow seam; der driver + self-oracle are the deliverable (Plan-01 pairwise precedent)
+- [Phase ?]: 13-04: QueryCrossEntropy independently deferred (Open Q3) — bounded shift search landed structurally + gated off (no CPU der oracle) without disabling QueryRMSE/QuerySoftMax
 
 ### Pending Todos
 
@@ -475,7 +478,7 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-04T07:55:55.997Z
+Last session: 2026-07-04T08:18:25.369Z
 Stopped at: Completed 13-02-PLAN.md (GPUT-21 device Cholesky, wire-device)
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
