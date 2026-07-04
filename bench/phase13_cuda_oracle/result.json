@@ -1,0 +1,224 @@
+{
+  "phase": 13,
+  "kind": "cuda-signoff",
+  "families": {
+    "pairwise (deriv + batched Cholesky) GPUT-11/21": {
+      "req": "GPUT-11,GPUT-21",
+      "crate": "cb-backend",
+      "filters": [
+        "pairwise_deriv",
+        "cholesky_solve"
+      ],
+      "exit": 0,
+      "secs": 773.4,
+      "ran_any_tests": true,
+      "summary": [
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 198 filtered out; finished in 1.36s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "divergences": [
+        "Downloaded wgpu-core-deps-windows-linux-android v29.0.3",
+        "Downloaded argminmax v0.6.3",
+        "Compiling argminmax v0.6.3",
+        "warning: function `compute_group_max_host` is never used",
+        "421 | pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbResult<Vec<f64>> {",
+        "warning: function `query_softmax_ders_host` is never used",
+        "452 | pub(crate) fn query_softmax_ders_host(",
+        "Finished `release` profile [optimized] target(s) in 12m 49s",
+        "Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)"
+      ],
+      "tail": "NST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n    |\n595 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n    |\n705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n    |\n718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:737:4\n    |\n737 | fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:776:4\n    |\n776 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:808:4\n    |\n808 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n    |\n931 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n    |\n958 | pub(crate) fn pfound_f_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n    |\n984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n    |\n991 | fn read_f64(\n    |    ^^^^^^^^\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9\n    |\n165 |     let mut new_node = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9\n    |\n181 |     let mut do_split = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\nwarning: `cb-backend` (lib test) generated 4 warnings (2 duplicates) (run `cargo fix --lib -p cb-backend --tests` to apply 2 suggestions)\n    Finished `release` profile [optimized] target(s) in 12m 49s\n     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)\n   Doc-tests cb_backend\n"
+    },
+    "ranking (query grouping + det + stochastic) GPUT-22": {
+      "req": "GPUT-22",
+      "crate": "cb-backend",
+      "filters": [
+        "query_helper",
+        "ranking_det",
+        "ranking_stoch"
+      ],
+      "exit": 0,
+      "secs": 3.5,
+      "ran_any_tests": true,
+      "summary": [
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 192 filtered out; finished in 1.68s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "divergences": [
+        "pfound_f der2: max_div = 0.000e0 (<= 0.0001)",
+        "yetirank der2: max_div = 0.000e0 (<= 0.0001)",
+        "warning: function `compute_group_max_host` is never used",
+        "421 | pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbResult<Vec<f64>> {",
+        "warning: function `query_softmax_ders_host` is never used",
+        "452 | pub(crate) fn query_softmax_ders_host(",
+        "Finished `release` profile [optimized] target(s) in 0.40s",
+        "Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)"
+      ],
+      "tail": "CONST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n    |\n595 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n    |\n705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n    |\n718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:737:4\n    |\n737 | fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:776:4\n    |\n776 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:808:4\n    |\n808 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n    |\n931 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n    |\n958 | pub(crate) fn pfound_f_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n    |\n984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n    |\n991 | fn read_f64(\n    |    ^^^^^^^^\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9\n    |\n165 |     let mut new_node = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9\n    |\n181 |     let mut do_split = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\nwarning: `cb-backend` (lib test) generated 4 warnings (2 duplicates) (run `cargo fix --lib -p cb-backend --tests` to apply 2 suggestions)\n    Finished `release` profile [optimized] target(s) in 0.40s\n     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)\n   Doc-tests cb_backend\n"
+    },
+    "multiclass (softmax der + multi-Newton) GPUT-12": {
+      "req": "GPUT-12",
+      "crate": "cb-backend",
+      "filters": [
+        "multiclass",
+        "multi_newton"
+      ],
+      "exit": 0,
+      "secs": 2.6,
+      "ran_any_tests": true,
+      "summary": [
+        "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.78s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "divergences": [
+        "warning: function `compute_group_max_host` is never used",
+        "421 | pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbResult<Vec<f64>> {",
+        "warning: function `query_softmax_ders_host` is never used",
+        "452 | pub(crate) fn query_softmax_ders_host(",
+        "Finished `release` profile [optimized] target(s) in 0.37s",
+        "Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)"
+      ],
+      "tail": "CONST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n    |\n595 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n    |\n705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n    |\n718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:737:4\n    |\n737 | fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:776:4\n    |\n776 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:808:4\n    |\n808 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n    |\n931 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n    |\n958 | pub(crate) fn pfound_f_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n    |\n984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n    |\n991 | fn read_f64(\n    |    ^^^^^^^^\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9\n    |\n165 |     let mut new_node = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9\n    |\n181 |     let mut do_split = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\nwarning: `cb-backend` (lib test) generated 4 warnings (2 duplicates) (run `cargo fix --lib -p cb-backend --tests` to apply 2 suggestions)\n    Finished `release` profile [optimized] target(s) in 0.37s\n     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)\n   Doc-tests cb_backend\n"
+    },
+    "ordered (resident approx trajectory) GPUT-13": {
+      "req": "GPUT-13",
+      "crate": "cb-backend",
+      "filters": [
+        "ordered"
+      ],
+      "exit": 0,
+      "secs": 2.9,
+      "ran_any_tests": true,
+      "summary": [
+        "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.09s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "divergences": [
+        "[partition_update n=37] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[partition_update n=1000] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=37 n_bins=2 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1000 n_bins=2 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1 n_bins=2 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=37 n_bins=2 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1000 n_bins=2 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1 n_bins=16 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=37 n_bins=16 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1000 n_bins=16 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1 n_bins=16 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=37 n_bins=16 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1000 n_bins=16 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1 n_bins=32 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=37 n_bins=32 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1000 n_bins=32 n_features=1] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1 n_bins=32 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=37 n_bins=32 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "[scan n=1000 n_bins=32 n_features=3] REPORTED max abs_div=0.000e0 rel_div=0.000e0 (bound=1e-9)",
+        "warning: function `compute_group_max_host` is never used",
+        "421 | pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbResult<Vec<f64>> {",
+        "warning: function `query_softmax_ders_host` is never used",
+        "452 | pub(crate) fn query_softmax_ders_host(",
+        "Finished `release` profile [optimized] target(s) in 0.37s",
+        "Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)"
+      ],
+      "tail": "CONST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n    |\n595 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n    |\n705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n    |\n718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:737:4\n    |\n737 | fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:776:4\n    |\n776 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:808:4\n    |\n808 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n    |\n931 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n    |\n958 | pub(crate) fn pfound_f_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n    |\n984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n    |\n991 | fn read_f64(\n    |    ^^^^^^^^\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9\n    |\n165 |     let mut new_node = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9\n    |\n181 |     let mut do_split = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\nwarning: `cb-backend` (lib test) generated 4 warnings (2 duplicates) (run `cargo fix --lib -p cb-backend --tests` to apply 2 suggestions)\n    Finished `release` profile [optimized] target(s) in 0.37s\n     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)\n   Doc-tests cb_backend\n"
+    },
+    "langevin (seeded Gaussian / SGLB) GPUT-20": {
+      "req": "GPUT-20",
+      "crate": "cb-backend",
+      "filters": [
+        "langevin"
+      ],
+      "exit": 0,
+      "secs": 2.1,
+      "ran_any_tests": true,
+      "summary": [
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.33s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "divergences": [
+        "[langevin seed=42 coef=0.2 n=64] max_div=1.110e-16",
+        "[langevin seed=2024 coef=0.011 n=200] max_div=2.220e-16",
+        "[langevin draw-count] value max_div=4.441e-16",
+        "warning: function `compute_group_max_host` is never used",
+        "421 | pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbResult<Vec<f64>> {",
+        "warning: function `query_softmax_ders_host` is never used",
+        "452 | pub(crate) fn query_softmax_ders_host(",
+        "Finished `release` profile [optimized] target(s) in 0.38s",
+        "Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)"
+      ],
+      "tail": "CONST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n    |\n595 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n    |\n705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n    |\n718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:737:4\n    |\n737 | fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:776:4\n    |\n776 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:808:4\n    |\n808 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n    |\n931 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n    |\n958 | pub(crate) fn pfound_f_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n    |\n984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n    |\n991 | fn read_f64(\n    |    ^^^^^^^^\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9\n    |\n165 |     let mut new_node = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: variable does not need to be mutable\n   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9\n    |\n181 |     let mut do_split = |nodes: &mut Vec<RefNode>,\n    |         ----^^^^^^^^\n    |         |\n    |         help: remove this `mut`\n\nwarning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\nwarning: `cb-backend` (lib test) generated 4 warnings (2 duplicates) (run `cargo fix --lib -p cb-backend --tests` to apply 2 suggestions)\n    Finished `release` profile [optimized] target(s) in 0.38s\n     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)\n   Doc-tests cb_backend\n"
+    }
+  },
+  "bench02": {
+    "exit": 0,
+    "secs": 998.6,
+    "runs": [
+      {
+        "family": "depthwise",
+        "n": 10000,
+        "device_s": 0.108,
+        "cpu_s": 2.6645,
+        "speedup": "24.664",
+        "dev_trees": 20,
+        "cpu_trees": 20
+      },
+      {
+        "family": "depthwise",
+        "n": 100000,
+        "device_s": 0.9167,
+        "cpu_s": 30.3894,
+        "speedup": "33.151",
+        "dev_trees": 20,
+        "cpu_trees": 20
+      },
+      {
+        "family": "depthwise",
+        "n": 300000,
+        "device_s": 2.9717,
+        "cpu_s": 101.5605,
+        "speedup": "34.176",
+        "dev_trees": 20,
+        "cpu_trees": 20
+      },
+      {
+        "family": "region",
+        "n": 10000,
+        "device_s": 0.131,
+        "cpu_s": 3.1296,
+        "speedup": "23.888",
+        "dev_trees": 20,
+        "cpu_trees": 20
+      },
+      {
+        "family": "region",
+        "n": 100000,
+        "device_s": 0.9867,
+        "cpu_s": 36.1485,
+        "speedup": "36.635",
+        "dev_trees": 20,
+        "cpu_trees": 20
+      },
+      {
+        "family": "region",
+        "n": 300000,
+        "device_s": 3.2888,
+        "cpu_s": 111.6311,
+        "speedup": "33.943",
+        "dev_trees": 20,
+        "cpu_trees": 20
+      }
+    ],
+    "test_summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 295.29s"
+    ],
+    "markers": [
+      "BENCH_DONE"
+    ],
+    "tail": "ftmax_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `query_cross_entropy_shifts_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:512:15\n    |\n512 | pub(crate) fn query_cross_entropy_shifts_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: constant `YETI_MAGIC_CONST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n    |\n595 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n    |\n705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n    |\n718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:737:4\n    |\n737 | fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:776:4\n    |\n776 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:808:4\n    |\n808 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n    |\n931 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n    |\n958 | pub(crate) fn pfound_f_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n    |\n984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n    |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n    |\n991 | fn read_f64(\n    |    ^^^^^^^^\n\n   Compiling ndarray v0.17.2\n   Compiling zip v6.0.0\n   Compiling byteorder v1.5.0\n   Compiling ndarray-npy v0.10.0\n   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)\n   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)\n   Compiling cb-oracle v0.1.0 (/tmp/repo/crates/cb-oracle)\n   Compiling approx v0.5.1\nwarning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\n    Finished `release` profile [optimized] target(s) in 11m 43s\n     Running tests/bench_grow_speed_test.rs (/tmp/target/release/deps/bench_grow_speed_test-bf6b2cec75d1610e)\n"
+  },
+  "gpu": "Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB",
+  "nvcc": "release 12.8",
+  "cuda_dirs": "/usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-12.8",
+  "correctness_verdict": "ALL-PASS",
+  "bench_verdict": "OK"
+}

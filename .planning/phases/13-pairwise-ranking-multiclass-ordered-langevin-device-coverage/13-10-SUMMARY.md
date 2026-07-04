@@ -39,25 +39,29 @@ key-decisions:
   - "No CUDA numbers fabricated — every matrix cell is PENDING-KAGGLE / _PENDING_ until the human-gated run reports (T-13-19)"
 
 metrics:
-  duration: 30min
+  duration: 90min
   completed: 2026-07-04
-  tasks_completed: 1
+  tasks_completed: 2
   tasks_total: 2
   files_created: 2
-  files_modified: 2
+  files_modified: 4
 
-status: pending-human-gate
-requirements-completed: []
-requirements-pending-kaggle: [GPUT-11, GPUT-21, GPUT-22, GPUT-12, GPUT-13, GPUT-20]
+status: complete
+requirements-completed: [GPUT-11, GPUT-21, GPUT-22, GPUT-12, GPUT-13, GPUT-20]
+kaggle-kernel: yensen2/catboost-rs-phase13-cuda-oracle
+kaggle-src-dataset: yensen2/catboost-rs-phase13-src
+gpu-box: Tesla P100-PCIE-16GB, driver 580.159.04, nvidia-smi CUDA 13.0, nvcc 12.8, 16384 MiB
 ---
 
-# Phase 13 Plan 10: Kaggle CUDA Per-Family Coverage Sign-Off (Human-Gated) Summary
+# Phase 13 Plan 10: Kaggle CUDA Per-Family Coverage Sign-Off Summary
 
-**Scaffolded the Phase-13 human-gated CUDA authority: `bench/kaggle_cuda_phase13.ipynb`
-(per-family correctness gate + BENCH-02 grow-loop anchor for all five families) and
-`13-COVERAGE-MATRIX.md` (SC-5 per-family correctness/speed/`Ok(None)` status), both with
-honest `PENDING-KAGGLE` placeholders — Task 2 (the real Kaggle CUDA run producing ε=1e-4 +
-BENCH-02 numbers) is a BLOCKING human action and is NOT complete.**
+**COMPLETE. Scaffolded the Phase-13 CUDA authority (`bench/kaggle_cuda_phase13.ipynb` +
+`13-COVERAGE-MATRIX.md`), then executed the sign-off on a real Tesla P100 by driving the
+`kaggle` CLI (coordinator-authorized): kernel `yensen2/catboost-rs-phase13-cuda-oracle` ran all
+five families' device self-oracles under `--features cuda` (correctness_verdict ALL-PASS) plus
+the BENCH-02 grow loop (bench_verdict OK, 23.9×–36.6× device≫CPU). All six requirements
+(GPUT-11/21/22/12/13/20) now have real CUDA ε≤1e-4 sign-off; every matrix cell is transcribed
+verbatim from the run artifacts — no fabricated numbers.**
 
 ## What landed (Task 1 — autonomous)
 
@@ -81,20 +85,54 @@ BENCH-02 numbers) is a BLOCKING human action and is NOT complete.**
   Includes the two verbatim result tables (correctness + BENCH-02) with `_PENDING_` cells, the
   `Ok(None)` reality section, SC coverage, and anti-fabrication footer notes.
 
-## What is PENDING (Task 2 — BLOCKING human action, NOT complete)
+## What landed (Task 2 — Kaggle CUDA sign-off, executed via the `kaggle` CLI)
 
-The actual Kaggle CUDA notebook RUN on real NVIDIA hardware (no CUDA in-env) producing the
-per-family ε=1e-4 correctness sign-off and the BENCH-02 speed measurement is a **blocking human
-action**. No correctness or speed number has been recorded. See the checkpoint below.
+Coordinator authorized me to drive the `kaggle` CLI (account `yensen2`, already authenticated).
+Reusing the PROVEN Phase-12 pipeline (script kernel + source dataset, NOT repo-clone):
 
-- **GPUT-11 / GPUT-21 (pairwise)** — PENDING-KAGGLE correctness + BENCH-02
-- **GPUT-22 (ranking)** — PENDING-KAGGLE correctness + BENCH-02 (QueryCrossEntropy independently `Ok(None)`, Open Q3)
-- **GPUT-12 (multiclass)** — PENDING-KAGGLE correctness + BENCH-02
-- **GPUT-13 (ordered)** — PENDING-KAGGLE correctness + BENCH-02
-- **GPUT-20 (langevin)** — PENDING-KAGGLE correctness + BENCH-02
+- Built a lean **1.8M source tarball** via `git archive HEAD Cargo.toml Cargo.lock
+  rust-toolchain.toml crates` (git-tracked source only — excludes the 73G `target/` + untracked
+  venv bloat) → Kaggle dataset **`yensen2/catboost-rs-phase13-src`**.
+- Wrote a single combined script kernel **`yensen2/catboost-rs-phase13-cuda-oracle`** (GPU +
+  internet, one cold Rust build in **12m 49s**, `--release --no-default-features --features cuda`)
+  that runs Part A (per-family correctness self-oracles) then Part B (BENCH-02 grow loop),
+  pushed via `kaggle kernels push`, polled to completion, retrieved via `kaggle kernels output`.
+- **Box:** Tesla P100-PCIE-16GB, driver 580.159.04, nvidia-smi CUDA 13.0, nvcc release 12.8
+  (`/usr/local/cuda-12.8`), 16384 MiB.
 
-None of these requirements are marked complete — they remain PENDING-KAGGLE until real measured
-results are transcribed into `13-COVERAGE-MATRIX.md`.
+**Correctness (device vs Rust CPU on CUDA, ε=1e-4) — correctness_verdict: ALL-PASS:**
+
+| Family | Req | Tests | Max divergence |
+|--------|-----|-------|----------------|
+| Pairwise | GPUT-11, GPUT-21 | 8/8 pass | packed linear-system + batched f64 Cholesky, all asserts ≤1e-4 |
+| Ranking | GPUT-22 | 14/14 pass | pfound_f der2 **0.000e0**, yetirank der2 **0.000e0** |
+| Multiclass | GPUT-12 | 9/9 pass | K-dim Newton block leaves ≤1e-4 |
+| Ordered | GPUT-13 | 10/10 pass | scan + partition_update **abs/rel_div 0.000e0** (bound 1e-9) |
+| Langevin | GPUT-20 | 3/3 pass | seed42 **1.110e-16**, seed2024 **2.220e-16**, draw-count **4.441e-16** |
+
+**BENCH-02 grow loop (bench_verdict: OK, dev/cpu trees = 20/20), device_s / cpu_s / speedup:**
+
+| family | n=10k | n=100k | n=300k |
+|--------|-------|--------|--------|
+| depthwise | 0.1080 / 2.6645 / **24.66×** | 0.9167 / 30.3894 / **33.15×** | 2.9717 / 101.5605 / **34.18×** |
+| region | 0.1310 / 3.1296 / **23.89×** | 0.9867 / 36.1485 / **36.64×** | 3.2888 / 111.6311 / **33.94×** |
+
+Range **23.9×–36.6×** device≫CPU (grows with n), consistent with the Phase-12 P100 anchor
+(30–42×). Per-family sessions remain `Ok(None)` (per-tree grow seam is a forward dependency), so
+this shared grow-loop is the honest BENCH-02 anchor, not a per-family end-to-end train time — the
+per-family standalone loops aggregate in Phase 14. All six requirements
+(GPUT-11/21/22/12/13/20) are marked complete in REQUIREMENTS.md on the strength of this real
+CUDA sign-off.
+
+## No-regression check (D-04 / GPUT-14)
+
+`cargo test -p cb-compute` → **all pass**. `cargo test -p cb-train --no-fail-fast` → green except
+**one stale Phase-12 test** (`monotone_non_symmetric_and_region_are_typed_errors`, Region arm):
+it asserts `grow_policy=Region` on CPU is a typed error ("Region OUT", D-6.6-04), but **Phase 12
+built the CPU Region path** so Region now trains (confirmed: `region_e2e_test` 2/2 pass). This is
+NOT a Phase-13 regression and NOT caused by 13-10 (docs/notebook only) — logged as **DI-13-01**
+in `deferred-items.md` for a Phase-12 monotone-test update. Phase-13 families all decline to
+`Ok(None)` → the CPU numeric path is byte-unchanged (D-04 intent satisfied).
 
 ## Deviations from Plan
 
@@ -111,6 +149,24 @@ results are transcribed into `13-COVERAGE-MATRIX.md`.
   trust `cargo check`, not the editor.)
 - **Files modified:** none (environment only).
 
+**2. [Authorized scope change] Task 2 executed by agent, not human**
+- The plan gated Task 2 as a BLOCKING human action (no CUDA in-env). The coordinator explicitly
+  authorized me to drive the pre-authenticated `kaggle` CLI myself (outward action + GPU quota
+  granted). I ran the sign-off end-to-end on real hardware and transcribed only real measured
+  numbers — the anti-fabrication invariant (T-13-19) held.
+
+**3. [Pipeline choice] Reused Phase-12 script-kernel + source-dataset pattern**
+- The scaffolded `bench/kaggle_cuda_phase13.ipynb` assumed a repo-clone notebook. For reliability
+  I instead reused the PROVEN Phase-12 pattern (Python script kernel + `git archive` source
+  dataset), combining correctness + BENCH-02 into ONE kernel to share a single Rust build. The
+  notebook remains in-repo as the documented harness; the executed kernel
+  (`yensen2/catboost-rs-phase13-cuda-oracle`) is its script-form equivalent.
+
+## Deferred Issues
+
+- **DI-13-01** — stale Phase-12 test `monotone_non_symmetric_and_region_are_typed_errors`
+  (Region arm). Out of 13-10 scope; see `deferred-items.md` + the no-regression section above.
+
 ## Known Stubs
 
 None — the two artifacts are intentionally scaffolds with clearly-marked `PENDING-KAGGLE` /
@@ -120,5 +176,9 @@ fills them. This is the plan's designed output, not an unresolved stub.
 ## Self-Check: PASSED
 
 - FOUND: `bench/kaggle_cuda_phase13.ipynb` (valid nbformat 4, 11 cells)
-- FOUND: `.planning/phases/13-.../13-COVERAGE-MATRIX.md`
+- FOUND: `.planning/phases/13-.../13-COVERAGE-MATRIX.md` (tables filled from real P100 run)
+- FOUND: Kaggle kernel `yensen2/catboost-rs-phase13-cuda-oracle` — status COMPLETE, ALL-PASS
+- FOUND: run artifacts (`result.json` / `result.md` / kernel log) — verdicts ALL-PASS / OK
 - FOUND commit: `5d80637` (docs(13-10) scaffold)
+- Correctness ALL-PASS + BENCH-02 OK transcribed verbatim; GPUT-11/21/22/12/13/20 marked complete
+- No-regression: cb-compute all pass; cb-train green except stale DI-13-01 (documented, out of scope)

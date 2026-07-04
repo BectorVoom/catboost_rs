@@ -1,0 +1,16 @@
+{
+  "id": "yensen2/catboost-rs-phase13-cuda-oracle",
+  "title": "catboost-rs phase13 cuda oracle",
+  "code_file": "catboost-rs-phase13-cuda-oracle.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": ["gpu"],
+  "dataset_sources": ["yensen2/catboost-rs-phase13-src"],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

@@ -40,7 +40,7 @@
 - [x] **GPUT-17**: **Minimal Variance Sampling (MVS)** bootstrap — per-block optimal threshold on `sqrt(der²+λ)` with inverse-probability reweighting — runs on device (MVS is CatBoost's *default* GPU sampling, distinct from GPUT-09's Poisson/Bayesian/Bernoulli), matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (§6.1 `mvs.{cu,cuh}`.)
 - [x] **GPUT-10**: CTR / permutation-dependent categorical features train on device.
 - [x] **GPUT-11**: The **PairLogit** pairwise-loss training path (pairwise 2×2-cell histograms) runs on device. (Query/listwise objectives are GPUT-22; the batched solver is GPUT-21. §6.3 `pairwise_hist*`.)
-- [ ] **GPUT-21**: Per-leaf **pairwise-derivative matrix assembly** (`MakePairwiseDerivatives` / `MakePointwiseDerivatives`) plus **batched device Cholesky** decomposition, forward/back substitution, ridge regularization, and score-from-decomposition (`CalcScoresCholesky`) run on device for pairwise split-scoring and leaf values, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (§6.3 `split_pairwise.{cu,cuh}`, `linear_solver.{cu,cuh}`.)
+- [x] **GPUT-21**: Per-leaf **pairwise-derivative matrix assembly** (`MakePairwiseDerivatives` / `MakePointwiseDerivatives`) plus **batched device Cholesky** decomposition, forward/back substitution, ridge regularization, and score-from-decomposition (`CalcScoresCholesky`) run on device for pairwise split-scoring and leaf values, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (§6.3 `split_pairwise.{cu,cuh}`, `linear_solver.{cu,cuh}`.)
 - [x] **GPUT-22**: The **query-wise / listwise** objectives — QueryRMSE, QuerySoftMax, QueryCrossEntropy, YetiRank, PFound-F — with device query-grouping infrastructure (group ids/means/max, group-bias removal, in-query sampling radix sort, taken-docs masks) run on device, matching the CPU path ≤1e-4, oracle-tested on Kaggle CUDA. (Split out of the old over-broad GPUT-11. §6.5 `query_*.{cu,cuh}`, `yeti_rank_pointwise`, `pfound_f`; §6.6a `query_helper.cu`.)
 - [x] **GPUT-12**: The **multiclass / multi-target / uncertainty** training path — MultiClass, OneVsAll (MultiClassOneVsAll), MultiCrossEntropy, MultiRMSE, RMSEWithUncertainty (multilogit multi-row der2 blocks) — runs on device. (§6.5 `multilogit.{cu,cuh}`.)
 - [x] **GPUT-13**: Ordered boosting (`EBoostingType::Ordered`) trains on device.
@@ -97,7 +97,7 @@
 | GPUT-17 | Phase 12 | Complete |
 | GPUT-10 | Phase 12 | Complete |
 | GPUT-11 | Phase 13 | Complete |
-| GPUT-21 | Phase 13 | Pending |
+| GPUT-21 | Phase 13 | Complete |
 | GPUT-22 | Phase 13 | Complete |
 | GPUT-12 | Phase 13 | Complete |
 | GPUT-13 | Phase 13 | Complete |

@@ -1,0 +1,11 @@
+,{"stream_name":"stdout","time":0.831178988,"data":"| NVIDIA-SMI 580.159.04             Driver Version: 580.159.04     CUDA Version: 13.0     |\n"}
+,{"stream_name":"stdout","time":0.83120695,"data":"|   0  Tesla P100-PCIE-16GB           Off |   00000000:00:04.0 Off |                    0 |\n"}
+,{"stream_name":"stdout","time":0.900257638,"data":"gpu: Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB | nvcc: release 12.8 | cuda: /usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-12.8\n"}
+,{"stream_name":"stdout","time":790.097698151,"data":"    Finished `release` profile [optimized] target(s) in 12m 49s\n"}
+,{"stream_name":"stdout","time":793.62237008,"data":"    Finished `release` profile [optimized] target(s) in 0.40s\n"}
+,{"stream_name":"stdout","time":796.212586599,"data":"    Finished `release` profile [optimized] target(s) in 0.37s\n"}
+,{"stream_name":"stdout","time":799.080096087,"data":"    Finished `release` profile [optimized] target(s) in 0.37s\n"}
+,{"stream_name":"stdout","time":801.223888559,"data":"    Finished `release` profile [optimized] target(s) in 0.38s\n"}
+,{"stream_name":"stdout","time":1799.8331607,"data":"    Finished `release` profile [optimized] target(s) in 11m 43s\n"}
+,{"stream_name":"stdout","time":1799.834667696,"data":"CORRECTNESS_VERDICT: ALL-PASS\n"}
+,{"stream_name":"stdout","time":1799.834683851,"data":"BENCH_VERDICT: OK rows: 6\n"}
