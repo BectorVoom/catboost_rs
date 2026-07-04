@@ -218,7 +218,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 10. GPU Foundations — Seam + Residency + Primitive Library + cindex + Depth-1 + Kaggle CUDA Harness | 9/9 | Complete   | 2026-07-03 |
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
-| 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete   | 2026-07-04 |
+| 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete    | 2026-07-04 |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 0/TBD | Not started | - |
 | 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
 
