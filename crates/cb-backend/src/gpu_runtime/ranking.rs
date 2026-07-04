@@ -864,12 +864,12 @@ fn yetirank_sample_der_core(
             // Descending order (LOCAL indices) for this permutation's single-query slice
             // (`local_offsets` = one segment `[0, qs)`) via the reused `segmented_radix_sort`.
             let local_offsets = vec![0u32, qs as u32];
-            let order_global = descending_order_per_query(seg, &local_offsets)?;
+            let order_local = descending_order_per_query(seg, &local_offsets)?;
             // CalcWeightsClassic (yetirank_helpers.cpp:193-205): decayed |Δrelev| along the order.
             let mut decay_coef = 1.0_f64;
             for doc_id in 1..qs {
-                let first = order_global.get(doc_id - 1).copied().unwrap_or(0) as usize;
-                let second = order_global.get(doc_id).copied().unwrap_or(0) as usize;
+                let first = order_local.get(doc_id - 1).copied().unwrap_or(0) as usize;
+                let second = order_local.get(doc_id).copied().unwrap_or(0) as usize;
                 #[allow(clippy::cast_possible_truncation)]
                 let rf = target.get(begin + first).copied().unwrap_or(0.0) as f32;
                 #[allow(clippy::cast_possible_truncation)]
@@ -896,7 +896,8 @@ fn yetirank_sample_der_core(
                     .and_then(|row| row.get(loser))
                     .copied()
                     .unwrap_or(0.0);
-                let w_f32 = 1.0_f32 * cwl / denom;
+                // queryWeight is the covered uniform 1.0, so the normalized weight is `cwl / perms`.
+                let w_f32 = cwl / denom;
                 if w_f32 != 0.0 {
                     let loser_approx = approx.get(begin + loser).copied().unwrap_or(0.0);
                     let p = pairlogit_pair_prob_local(winner_approx, loser_approx);
