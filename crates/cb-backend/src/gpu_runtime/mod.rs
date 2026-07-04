@@ -417,6 +417,12 @@ pub use pairwise::*;
 mod session; // Phase 10-07 (GPUT-02/03): the per-fit device-resident training session.
 pub use session::*;
 
+// Phase 13 Plan 04 (GPUT-22): the deterministic query/listwise objective device driver
+// (QueryRMSE / QuerySoftMax / QueryCrossEntropy) over the Plan-03 query-grouping infra. `pub(crate)`
+// so the session ranking coverage gate reaches `RankingObjective` / `ranking_objective_covered` and
+// the `ranking_det_test` self-oracle reaches the der drivers.
+pub(crate) mod ranking;
+
 // Phase 10-07 (GPUT-02/03): the GpuTrainSession residency cross-oracle (source/test
 // separation) — begin uploads once, grow_one reuses the resident handles + chains der1 on
 // device, structure matches the CPU multi-tree boosting reference; the coverage gate

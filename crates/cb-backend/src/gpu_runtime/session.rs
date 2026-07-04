@@ -354,6 +354,78 @@ fn map_pairwise_coverage(
     })
 }
 
+/// Whether `loss` is a DETERMINISTIC query/listwise ranking loss with a device der driver landed in
+/// Phase 13 Plan 04 (GPUT-22): QueryRMSE / QuerySoftMax. These funnel through the shared Plan-03
+/// query-grouping infra + the [`crate::gpu_runtime::ranking`] der driver, self-oracled against
+/// `cb_compute::calc_ders_for_queries` at ε=1e-4. (QueryCrossEntropy is INDEPENDENTLY deferred —
+/// Open Q3 — and has no `Loss` variant yet, so it is not reachable here.)
+fn is_deterministic_ranking_loss(loss: &Loss) -> bool {
+    matches!(loss, Loss::QueryRmse | Loss::QuerySoftMax { .. })
+}
+
+/// The per-fit device RANKING state (Phase 13 Plan 04, GPUT-22). `Some` iff the fit committed to a
+/// covered deterministic query objective — the [`crate::gpu_runtime::ranking::RankingObjective`] the
+/// device der driver computes over the Plan-03 grouping infra. Like [`PairwiseState`] this carries
+/// the coverage DECISION: the der driver + self-oracle land THIS plan; the per-tree query-descriptor
+/// grow seam (the `Runtime::grow_tree_on_device` seam carries only `approx`/`target` today) is a
+/// forward dependency, so a covered ranking fit currently declines to the byte-unchanged CPU grower
+/// (D-04 no-regression) rather than fabricating a pointwise grow on a ranking fit.
+#[allow(dead_code)]
+struct RankingState {
+    /// The covered query objective the device der driver computes (QueryRMSE / QuerySoftMax). The
+    /// independently-deferred QueryCrossEntropy arm (Open Q3) is never stored here — it maps to
+    /// `Ok(None)` without disabling the covered arms.
+    objective: crate::gpu_runtime::ranking::RankingObjective,
+}
+
+/// Phase 13 Plan 04 (GPUT-22): the ranking coverage gate, mirroring the `map_pairwise_coverage` /
+/// `map_leaf_method` `Option`-returning family-gated template (Pattern A). Returns
+/// `Some(RankingState)` iff the fit is a COVERED deterministic query config — a QueryRMSE /
+/// QuerySoftMax loss ([`is_deterministic_ranking_loss`]), depth ≥ 1, Plain boosting, single fold,
+/// SymmetricTree, and every OTHER family flag still the covered default (D-10-01 all-or-nothing PER
+/// family: no bootstrap / MVS / exact-leaf / CTR / leaf-cap). The QueryCrossEntropy arm is
+/// INDEPENDENTLY gated off ([`crate::gpu_runtime::ranking::ranking_objective_covered`] returns
+/// `false`), so this returns `None` for it without disabling QueryRMSE / QuerySoftMax. Returns
+/// `None` for any uncovered config → the byte-unchanged CPU grower (never a fabricated device
+/// result).
+fn map_ranking_coverage(
+    loss: &Loss,
+    config: &DeviceTrainConfig,
+    depth: usize,
+    boosting_type_is_plain: bool,
+    fold_count: usize,
+) -> Option<RankingState> {
+    let objective = match *loss {
+        Loss::QueryRmse => crate::gpu_runtime::ranking::RankingObjective::QueryRmse,
+        Loss::QuerySoftMax { lambda, beta } => {
+            crate::gpu_runtime::ranking::RankingObjective::QuerySoftMax { beta, lambda }
+        }
+        // Not a deterministic ranking loss with a landed device der driver.
+        _ => return None,
+    };
+    // Independent per-objective gate: QueryCrossEntropy (Open Q3) is deferred even though its
+    // bounded shift search is landed — decline it here without disabling QueryRMSE / QuerySoftMax.
+    if !crate::gpu_runtime::ranking::ranking_objective_covered(objective) {
+        return None;
+    }
+    if depth == 0 || !boosting_type_is_plain || fold_count != 1 {
+        return None;
+    }
+    if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
+        return None;
+    }
+    // All-or-nothing per family: no other non-default family flag may be set.
+    let family_default = config.bootstrap_type == DeviceBootstrapType::No
+        && config.mvs_lambda.is_none()
+        && !config.exact_leaf
+        && config.ctr.is_none()
+        && config.max_leaves.is_none();
+    if !family_default {
+        return None;
+    }
+    Some(RankingState { objective })
+}
+
 /// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
 /// for the covered losses, transcribing `cb_compute`'s documented formulas (RMSE:
 /// `der1 = target - approx`; Logloss / CrossEntropy: `der1 = target - sigmoid(approx)`). The
@@ -452,6 +524,14 @@ pub struct GpuTrainSession {
     /// session is constructed yet — the field is the landed structural seam, like `config`).
     #[allow(dead_code)]
     pairwise: Option<PairwiseState>,
+    /// The per-fit ranking state (Phase 13 Plan 04, GPUT-22). `Some` iff the fit committed to a
+    /// covered deterministic query objective (QueryRMSE / QuerySoftMax); `None` for every pointwise
+    /// / pairwise path (byte-unchanged, D-04). Carries the coverage DECISION the ranking der driver
+    /// consumes (the per-tree query-descriptor grow seam is a forward dependency, so no covered-
+    /// ranking session is constructed yet — the field is the landed structural seam, like `pairwise`
+    /// / `config`). QueryCrossEntropy is INDEPENDENTLY deferred (Open Q3) and never stored here.
+    #[allow(dead_code)]
+    ranking: Option<RankingState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -594,6 +674,26 @@ impl GpuTrainSession {
                 // landed + self-oracled this plan; the per-tree grow seam is Plan 02. Decline to CPU.
                 Some(_pairwise) => return Ok(None),
                 // Uncovered pairwise config → CPU grower (D-10-01 all-or-nothing per family).
+                None => return Ok(None),
+            }
+        }
+        // Phase 13 Plan 04 (GPUT-22): the ranking coverage gate. A deterministic query/listwise loss
+        // (QueryRMSE / QuerySoftMax) computes its der over the shared Plan-03 query-grouping infra +
+        // the `crate::gpu_runtime::ranking` der driver, self-oracled against
+        // `cb_compute::calc_ders_for_queries` at ε=1e-4. `map_ranking_coverage` returns
+        // `Some(RankingState)` for a covered config, `None` otherwise (QueryCrossEntropy is
+        // INDEPENDENTLY deferred — Open Q3 — without disabling the covered arms). The der driver +
+        // self-oracle land THIS plan; the per-tree query-descriptor grow seam (the
+        // `Runtime::grow_tree_on_device` seam carries only `approx`/`target` today) is a forward
+        // dependency, so BOTH the covered and uncovered ranking branches decline to the
+        // byte-unchanged CPU grower (D-04 no-regression) — NEVER a fabricated pointwise grow on a
+        // ranking fit (the pairwise-gate precedent).
+        if is_deterministic_ranking_loss(loss) {
+            match map_ranking_coverage(loss, config, depth, boosting_type_is_plain, fold_count) {
+                // Covered ranking config: der driver + self-oracle landed; grow seam is a forward
+                // dependency. Decline to CPU (never a fabricated pointwise grow on a ranking fit).
+                Some(_ranking) => return Ok(None),
+                // Uncovered ranking config → CPU grower (D-10-01 all-or-nothing per family).
                 None => return Ok(None),
             }
         }
@@ -934,6 +1034,10 @@ impl GpuTrainSession {
             // gated + declined ABOVE (the pairwise arm returns Ok(None) pending the Plan-02
             // per-tree pair/group seam), so this construction is only ever reached pointwise.
             pairwise: None,
+            // Pointwise path: no ranking state (byte-unchanged, D-04). A covered ranking fit is
+            // gated + declined ABOVE (the ranking arm returns Ok(None) pending the per-tree
+            // query-descriptor grow seam), so this construction is only ever reached pointwise.
+            ranking: None,
         }))
     }
 
