@@ -2886,6 +2886,16 @@ mod mvs_device_test;
 // Mounted under every backend (production, NOT `#[cfg(test)]`).
 pub(crate) mod langevin;
 
+// Device Langevin self-oracle (source/test separation, Plan 09 GPUT-20, Pattern F): the device
+// noised der vs the FROZEN CPU `coefficient · std_normal` sequence computed on the validated
+// `cb_core::TFastRng64` + `cb_core::std_normal` (≤1e-4, per-element draw-count well-formed +
+// reproduced, empty-`n` no-op, PairLogit+Langevin → not covered), transcribed inline (no `cb-train`
+// dep). Lives in `kernels/langevin_test.rs`, mounted at `kernels::langevin_test`. Runs over
+// `SelectedRuntime` (u64/f64 serial → the numeric assert skips off rocm/cuda, WR-01 anti-false-pass;
+// the whole file is `not(feature = "wgpu")`).
+#[cfg(test)]
+mod langevin_test;
+
 // Device pairwise per-leaf linear-system assembly self-oracle (Phase 13 Plan 01, GPUT-11 /
 // GPUT-21 prep, Pattern F): the device `gpu_runtime::assemble_pairwise_system_host` packed
 // `linearSystem` vs the CPU parity reference (`calculate_pairwise_leaf_values` matrix build, reg
