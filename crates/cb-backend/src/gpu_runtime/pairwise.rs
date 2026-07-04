@@ -1461,17 +1461,92 @@ pub struct PairwiseSplitScore {
     pub best: Option<BestSplit>,
 }
 
+/// Assemble the per-border 2×2 pairwise split-score systems `(matrices, ders)` on the host — the
+/// `leaf_count == 1` (depth-1 MVP root) specialization of `cb_compute::calculate_pairwise_score`'s
+/// running accumulation (`pairwise_scoring.cpp:144-231`). `matrices` is `n_splits · 4` row-major
+/// 2×2 running weight matrices, `ders` is `n_splits · 2` running der vectors (the systems the SPD
+/// SOLVE + `CalcScoresCholesky` consume ON DEVICE via [`crate::kernels::cholesky_solve`], GPUT-21).
+///
+/// With only leaf 0 there are NO off-diagonal leaf pairs (`UpdateWeightSumFromTotal` /
+/// `UpdateWeightSumFromNonDiagStats` are empty), so the accumulation reduces to the diagonal 2×2
+/// block: `der_sum[1]` seeds with `Σ_bucket der`, then each border applies `der_delta` and the
+/// diagonal `weight_delta = smaller − greater_right` (the SAME running order the CPU scorer uses,
+/// so the assembled systems — and thus the device scores — are bit-identical to the FROZEN
+/// `calculate_pairwise_score`). No `unwrap`/`expect`/`panic`/indexing.
+#[cfg(not(feature = "wgpu"))]
+fn assemble_pairwise_score_systems_leaf1(
+    feat_der_sums: &[Vec<f64>],
+    pair_weight_statistics: &[Vec<Vec<cb_compute::BucketPairWeightStatistics>>],
+    bucket_count: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n_splits = bucket_count.saturating_sub(1);
+    let mut matrices = vec![0.0_f64; n_splits * 4];
+    let mut ders = vec![0.0_f64; n_splits * 2];
+
+    // Running der_sum (length 2) / symmetric 2×2 weight_sum. der_sum[1] (2·leaf+1, leaf 0) seeds
+    // with Σ_bucket der (sum_f64 order == the CPU scorer's step 2). w10 == w01 (symmetric).
+    let row0: &[f64] = feat_der_sums.first().map_or(&[][..], |r| r.as_slice());
+    let mut der0 = 0.0_f64;
+    let mut der1 = cb_core::sum_f64(row0);
+    let mut w00 = 0.0_f64;
+    let mut w01 = 0.0_f64;
+    let mut w11 = 0.0_f64;
+
+    for split_id in 0..n_splits {
+        let der_delta = row0.get(split_id).copied().unwrap_or(0.0);
+        der0 += der_delta;
+        der1 += -der_delta;
+
+        let diag = pair_weight_statistics
+            .first()
+            .and_then(|p| p.first())
+            .and_then(|r| r.get(split_id))
+            .copied()
+            .unwrap_or_default();
+        let weight_delta = diag.smaller_border_weight_sum - diag.greater_border_right_weight_sum;
+        w01 += weight_delta;
+        w00 -= weight_delta;
+        w11 -= weight_delta;
+
+        // Snapshot the running 2×2 system (row-major [w00, w01, w10, w11]) + der [der0, der1].
+        let mbase = split_id * 4;
+        if let Some(c) = matrices.get_mut(mbase) {
+            *c = w00;
+        }
+        if let Some(c) = matrices.get_mut(mbase + 1) {
+            *c = w01;
+        }
+        if let Some(c) = matrices.get_mut(mbase + 2) {
+            *c = w01;
+        }
+        if let Some(c) = matrices.get_mut(mbase + 3) {
+            *c = w11;
+        }
+        let dbase = split_id * 2;
+        if let Some(c) = ders.get_mut(dbase) {
+            *c = der0;
+        }
+        if let Some(c) = ders.get_mut(dbase + 1) {
+            *c = der1;
+        }
+    }
+    (matrices, ders)
+}
+
 /// Compute the device pairwise split score over the FROZEN 7.4 4-channel pairwise
 /// histogram handle (GPU-01 final slice). The heavy work is device-resident: the 4-channel
 /// pair-weight histogram fill (7.4) + the der-sum scatter
 /// ([`launch_pairwise_make_derivatives_into`]) build the per-(feature, bucket) statistics
 /// on device; this seam then reads back ONLY the bounded `n_features * n_bins` der-sum
-/// descriptor (the bulk pairwise histogram stays device-resident, D-05) and runs the
-/// small per-leaf Cholesky solve + `CalculateScore` host-side via the FROZEN
-/// `cb_compute::calculate_pairwise_score` (RESEARCH Open Q3: a `#[cube]` dense SPD solve
-/// is awkward, and the FROZEN CPU `pairwise_cholesky_solve` IS the parity oracle, so the
-/// small assembled system is solved over the bounded host read-back). The best split is
-/// then selected with the SAME lowest-(feature,bin)-index tie-break as the pointwise path.
+/// descriptor (the bulk pairwise histogram stays device-resident, D-05). The small per-leaf
+/// SPD Cholesky solve + `CalcScoresCholesky` now run **ON DEVICE** via
+/// [`crate::kernels::cholesky_solve::launch_cholesky_solve`] (GPUT-21 / D-05 full residency —
+/// the Phase-13 Plan-02 wiring that closed the Phase-7.5 "RESEARCH Open Q3" host solve): the
+/// bounded per-border `(weight_sum, der_sum)` systems are assembled host-side
+/// ([`assemble_pairwise_score_systems_leaf1`]) and batch-solved on device, whose score path is
+/// self-oracled bit-for-bit against `calculate_pairwise_score`. On the `wgpu` backend (no f64)
+/// the FROZEN host `cb_compute::calculate_pairwise_score` is retained (no regression). The best
+/// split is then selected with the SAME lowest-(feature,bin)-index tie-break as the pointwise path.
 ///
 /// # Depth-1 / leaf_count == 1 MVP scope
 ///
@@ -1656,9 +1731,41 @@ fn launch_pairwise_split_score_into(
             &bucket_of,
         )?;
 
-        // The per-feature, per-border pairwise scores via the FROZEN host scorer (the small
-        // per-leaf Cholesky solve runs here over the bounded assembled system).
-        let feat_scores = cb_compute::calculate_pairwise_score(
+        // The per-feature, per-border pairwise scores. The bounded per-border (weight_sum,
+        // der_sum) systems are assembled host-side; the SPD SOLVE + CalcScoresCholesky run ON
+        // DEVICE (GPUT-21 / D-05 full residency, closing the Phase-7.5 Open Q3 host solve). The
+        // device score path is self-oracled bit-for-bit vs calculate_pairwise_score
+        // (kernels::cholesky_solve_test), so the winner + per-candidate scores are unchanged.
+        // Only the bounded O(borders) system descriptor crosses to device — the Open Q3
+        // histogram cross-cube-carry scope is untouched. On wgpu (no f64) the FROZEN host scorer
+        // is retained (no regression).
+        #[cfg(not(feature = "wgpu"))]
+        let feat_scores: Vec<f64> = {
+            if n_splits == 0 {
+                Vec::new()
+            } else {
+                let (matrices, ders) = assemble_pairwise_score_systems_leaf1(
+                    &feat_der_sums,
+                    &pair_weight_statistics,
+                    bucket_count,
+                );
+                let mat_h = client.create(cubecl::bytes::Bytes::from_elems(matrices));
+                let der_h = client.create(cubecl::bytes::Bytes::from_elems(ders));
+                let handle = crate::kernels::cholesky_solve::launch_cholesky_solve(
+                    client,
+                    &mat_h,
+                    &der_h,
+                    2,
+                    n_splits,
+                    l2_diag_reg,
+                    pairwise_bucket_weight_prior_reg,
+                    true,
+                )?;
+                read_scores_f64(client, handle)?
+            }
+        };
+        #[cfg(feature = "wgpu")]
+        let feat_scores: Vec<f64> = cb_compute::calculate_pairwise_score(
             &feat_der_sums,
             &pair_weight_statistics,
             bucket_count,
