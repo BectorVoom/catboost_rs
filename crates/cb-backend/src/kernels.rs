@@ -2844,6 +2844,21 @@ mod sort;
 // body). Mounted under every backend (production, NOT `#[cfg(test)]`).
 pub(crate) mod exact_quantile;
 
+// Device bootstrap sample draw + random-strength score jitter (Phase 12 Plan 06, GPUT-09):
+// the PRODUCTION module hosting the serial `#[cube]` `TFastRng64` transcription
+// (Bernoulli/Bayesian/Poisson) that draws the per-object keep-mask / sample weight ON device
+// from a pinned base state (kept resident, D-08), plus the deterministic `device_score_stddev`
+// (Pattern C fixed-point reduce). NEVER a `cb-train` dep — the RNG semantics are transcribed
+// inline (Pattern B). Mounted under every backend (production, NOT `#[cfg(test)]`).
+pub(crate) mod bootstrap_device;
+
+// Device bootstrap self-oracle (source/test separation, Plan 06 GPUT-09, Pattern F): the device
+// draw vs the frozen CPU sample computed on the validated `cb_core::TFastRng64` — bit-for-bit
+// keep-mask for Bernoulli, ≤1e-4 weights for Bayesian, determinism for Poisson (no CPU oracle,
+// D-11) — lives in `kernels/bootstrap_device_test.rs`, mounted at `kernels::bootstrap_device_test`.
+#[cfg(test)]
+mod bootstrap_device_test;
+
 // Segmented radix-sort primitive self-oracle (source/test separation, Plan 05 Open Q1/A1):
 // the per-segment stable-sort / no-cross-segment-mixing assertions vs an inline serial
 // segmented stable sort (D-02) live in `kernels/segmented_sort_test.rs`, mounted at

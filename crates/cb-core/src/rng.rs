@@ -205,6 +205,23 @@ impl TFastRng64 {
         self.call_count
     }
 
+    /// The raw internal state of the two PCG-XSH-RR streams as
+    /// `[r1.x, r1.c, r2.x, r2.c]` — the exact 4-tuple a device kernel needs to
+    /// re-expand THIS stream position per-object without a `cb_core` reach inside
+    /// the kernel (Phase 12 Plan 06 device bootstrap: the host advances the
+    /// continuous stream on this validated RNG and hands the device the O(1) base
+    /// state, so the per-object keep-mask / weight draw stays device-resident, D-08).
+    ///
+    /// `x` is each stream's 64-bit LCG state; `c` its odd per-stream addend. A
+    /// device transcription that iterates `x' = x*A + c` then PCG-mixes reproduces
+    /// [`Self::gen_rand`] bit-for-bit from this tuple. Read-only snapshot — it does
+    /// NOT advance the generator.
+    #[inline]
+    #[must_use]
+    pub fn raw_state(&self) -> [u64; 4] {
+        [self.r1.x, self.r1.c, self.r2.x, self.r2.c]
+    }
+
     /// `TCommonRNG::GenRandReal1` for a `ui64` engine (`common_ops.h:19,99`):
     /// a real in `[0, 1]` with 53-bit resolution, `(GenRand() >> 11) *
     /// (1.0 / 9007199254740991.0)`. This is the exact draw the bootstrap /
