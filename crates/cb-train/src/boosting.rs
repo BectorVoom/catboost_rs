@@ -3080,6 +3080,22 @@ fn train_inner<R: Runtime>(
             None
         },
         min_data_in_leaf: params.min_data_in_leaf,
+        // WR-01 (NOT YET WIRED — test-only / pending Kaggle CUDA sign-off): the
+        // remaining device family knobs — `bootstrap_type`, `mvs_lambda`,
+        // `exact_leaf`, `ctr`, `sample_rate`, `rng_seed` — are DELIBERATELY left at
+        // their `DeviceTrainConfig::default()` (No bootstrap, no MVS, no exact leaf,
+        // no CTR, sample_rate 1.0). The Plan-05/06/07/08 session apparatus
+        // (`ExactLeafState`/`compute_exact_leaf_values`, `BootstrapState` +
+        // `launch_bootstrap_weights_resident`, `MvsState` +
+        // `launch_mvs_weights_resident`, `build_ctr_cindex_columns`, and
+        // `device_score_stddev`) is validated ONLY by its `#[cfg(test)]`
+        // self-oracles this phase; end-to-end wiring from `train()` is a later plan.
+        // `device_host_eligible` above ALSO independently excludes any pool that
+        // would need these arms (bootstrap != No, random_strength != 0, non
+        // Gradient/Simple leaf method), so a real fit can never silently reach an
+        // unwired arm — it falls back to the CPU grower instead. Do NOT assume these
+        // features are active on the device `train()` path until this default is
+        // replaced with `params`-threaded values and the eligibility gate relaxed.
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
