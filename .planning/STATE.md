@@ -5,15 +5,15 @@ milestone_name: GPU Performance
 current_phase: 12
 current_phase_name: grow-policy-leaf-method-sampling-categorical-device-coverage
 status: executing
-stopped_at: None
-last_updated: "2026-07-04T01:23:31.595Z"
+stopped_at: Completed 12-08-PLAN.md
+last_updated: "2026-07-04T01:47:52.747Z"
 last_activity: 2026-07-03
 last_activity_desc: Phase 12 execution started
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 23
-  completed_plans: 19
+  completed_plans: 20
   percent: 40
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 12 (grow-policy-leaf-method-sampling-categorical-device-coverage) — EXECUTING
-Plan: 6 of 9
+Plan: 7 of 9
 Status: Ready to execute
 Last activity: 2026-07-03 — Phase 12 execution started
 
@@ -183,6 +183,7 @@ Last activity: 2026-07-03 — Phase 12 execution started
 | Phase 12 P03 | 110min | 3 tasks | 13 files |
 | Phase 12 P05 | ~40min | 2 tasks | 7 files |
 | Phase 12 P06 | 90 | 2 tasks | 6 files |
+| Phase 12 P08 | 40 | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -401,6 +402,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 12-01: depth>1 was already device-covered by the Phase-11 substrate; only the session begin gate declined it — A3 closed by a one-condition gate relaxation, no grow wiring added.
 - [Phase ?]: Phase 12-01: DeviceTrainConfig threaded into GpuTrainSession::begin (not the Runtime trait method) to keep boosting.rs untouched per Plan-01 success criteria; trait promotion deferred to the owning wave.
 - [Phase ?]: Region is a PATH model with bin-indexed leaf_values (0..=depth); d+1 leaves (GPUT-18)
+- [Phase 12]: 12-08: device ordered/one-hot/tensor CTR = serial read-before-increment scan (exact integer counts, no Atomic<u64>); self-oracled <=1e-4 on cpu AND rocm gfx1100; GPUT-10 Pending pending Plan-09 Kaggle sign-off
 
 ### Pending Todos
 
@@ -461,8 +463,8 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-04T01:23:13.301Z
-Stopped at: None
+Last session: 2026-07-04T01:47:52.673Z
+Stopped at: Completed 12-08-PLAN.md
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
 Stopped at (prior): Completed 08-02-PLAN.md
