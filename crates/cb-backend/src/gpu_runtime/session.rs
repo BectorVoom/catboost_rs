@@ -49,6 +49,7 @@ use crate::gpu_runtime::{
     grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
     DerBinaryKernel,
 };
+use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
 use crate::kernels::{SCORE_FN_COSINE, SCORE_FN_L2, SCORE_FN_LOO_L2, SCORE_FN_SAT_L2, SCORE_FN_SOLAR_L2};
 use crate::SelectedRuntime;
@@ -86,6 +87,29 @@ struct NonsymState {
     min_data_in_leaf: usize,
     /// The covered-loss der kind, driving the host der1 re-derivation.
     der_kernel: DerBinaryKernel,
+}
+
+/// The per-fit device Exact-leaf state (Phase 12 Plan 05, GPUT-19). `Some` iff the fit
+/// committed to a SymmetricTree oblivious grow with `exact_leaf` set for a covered
+/// quantile-family loss. [`GpuTrainSession::grow_one`] then REPLACES the resident grow's
+/// Newton/`calc_average` leaf values with the device weighted-quantile order statistic
+/// ([`device_exact_leaf_delta`]) per leaf, from the host residuals `target - approx`.
+///
+/// The tree STRUCTURE is grown by the resident RMSE-residual-der path (`der_kernel =
+/// RmseGradient`, the MVP structural der); only the leaf VALUES become the Exact order
+/// statistic. Upstream quantile-der split parity + the full-tree Kaggle oracle are the
+/// Plan-09 sign-off; here the leaf-VALUE numerics are locked ≤1e-4 by the
+/// `kernels::exact_quantile` self-oracle (D-09).
+struct ExactLeafState {
+    /// The quantile level α (loss param for [`Loss::Quantile`], else config default 0.5).
+    alpha: f64,
+    /// The quantile deadzone δ (loss param for [`Loss::Quantile`], else config default 1e-6).
+    delta: f64,
+    /// MAPE selects the `weightsWithTargets[i] = weight_i/max(1,|target_i|)` divisor (A4).
+    mape: bool,
+    /// Host copy of the per-object weight (the covered regime is all-`1.0`); folded into the
+    /// per-leaf weighted quantile (× the MAPE divisor when `mape`).
+    weight: Vec<f64>,
 }
 
 /// Re-derive the UN-weighted per-object der1 on the host from the caller's `approx` + `target`
@@ -160,6 +184,10 @@ pub struct GpuTrainSession {
     /// host-driven [`grow_nonsym_tree`] instead of the resident oblivious loop. `None` for the
     /// oblivious / symmetric path (byte-unchanged, D-04).
     nonsym: Option<NonsymState>,
+    /// The per-fit Exact-leaf state (Phase 12 Plan 05, GPUT-19). `Some` iff the fit committed
+    /// to a SymmetricTree oblivious grow with device Exact leaves (covered quantile-family
+    /// loss + `exact_leaf`). `None` for the Newton/default path (byte-unchanged, D-04).
+    exact_leaf: Option<ExactLeafState>,
 }
 
 /// Map a host [`EScoreFunction`] to the device score-calcer selector, or `None` if the score
@@ -185,6 +213,51 @@ fn map_der_kernel(loss: &Loss) -> Option<DerBinaryKernel> {
     match *loss {
         Loss::Rmse => Some(DerBinaryKernel::RmseGradient),
         Loss::Logloss | Loss::CrossEntropy => Some(DerBinaryKernel::LoglossGradient),
+        _ => None,
+    }
+}
+
+/// The device leaf-estimation method (Phase 12 Plan 05, GPUT-19, D-09). `Newton` is the
+/// default closed-form (`calc_average` / der2) path, byte-unchanged. `Exact` is the device
+/// weighted-quantile ORDER STATISTIC for the Quantile/MAE/MAPE family — DISTINCT from Newton
+/// (`g/(h+ε)`), reproducing `cb-compute/src/leaf.rs::exact_leaf_delta` on device (Pitfall 6).
+/// `mape` selects the `weightsWithTargets[i] = weight_i/max(1,|target_i|)` divisor (A4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeviceLeafMethod {
+    Newton,
+    Exact { alpha: f64, delta: f64, mape: bool },
+}
+
+/// The exact-leaf gate arm (`map_leaf_method`) — mirrors the `map_score_fn` / `map_der_kernel`
+/// / `map_grow_policy` `Option`-returning family-gated template (Pattern A). Returns:
+/// - `Some(Newton)` when exact-leaf is NOT requested → the default path, unchanged (D-04).
+/// - `Some(Exact{..})` when `config.exact_leaf` is set AND the loss is in the covered
+///   quantile family (MAE / Quantile / MAPE, A4) → route the leaf VALUES to the device Exact
+///   order statistic.
+/// - `None` when exact-leaf is requested for a loss OUTSIDE the quantile family → decline to
+///   the CPU path (the prohibition: uncovered stays `Ok(None)`, never a wrong device result).
+///
+/// α/δ come from the loss's own params for [`Loss::Quantile`], else the config's
+/// `quantile_alpha`/`quantile_delta` (whose defaults `0.5`/`1e-6` are the MAE / MAPE median).
+fn map_leaf_method(config: &DeviceTrainConfig, loss: &Loss) -> Option<DeviceLeafMethod> {
+    if !config.exact_leaf {
+        return Some(DeviceLeafMethod::Newton);
+    }
+    match *loss {
+        Loss::Mae => Some(DeviceLeafMethod::Exact {
+            alpha: config.quantile_alpha,
+            delta: config.quantile_delta,
+            mape: false,
+        }),
+        Loss::Quantile { alpha, delta } => {
+            Some(DeviceLeafMethod::Exact { alpha, delta, mape: false })
+        }
+        Loss::Mape => Some(DeviceLeafMethod::Exact {
+            alpha: config.quantile_alpha,
+            delta: config.quantile_delta,
+            mape: true,
+        }),
+        // Exact leaf requested for a non-quantile loss → decline (never a wrong device leaf).
         _ => None,
     }
 }
@@ -237,16 +310,35 @@ impl GpuTrainSession {
         // the oblivious / symmetric path (which is the byte-unchanged Plan-01 resident loop) and
         // for the not-yet-covered Region policy (Plan 04, declines below).
         let nonsym_policy = map_grow_policy(config.grow_policy);
+
+        // Phase 12 Plan 05 (GPUT-19): the exact-leaf gate arm. `map_leaf_method` returns the
+        // device leaf method — `Newton` (default, unchanged) or the `Exact` weighted-quantile
+        // order statistic when `exact_leaf` is set for a covered quantile-family loss (MAE /
+        // Quantile / MAPE, A4). An exact-leaf request for a NON-quantile loss declines to CPU
+        // (prohibition: uncovered stays `Ok(None)`, never a wrong device leaf).
+        let leaf_method = match map_leaf_method(config, loss) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
         match nonsym_policy {
             None => {
                 // Region is a distinct policy with no device kernel yet (Plan 04) — decline it
                 // explicitly (never let it fall through to the oblivious path). SymmetricTree
-                // rides the Plan-01 covered-regime gate unchanged (D-10-01 all-or-nothing: any
-                // OTHER non-default family flag still routes to the CPU grower).
+                // rides the Plan-01 covered-regime gate, EXTENDED (Plan 05) to also admit the
+                // exact-leaf quantile-family regime (D-10-01 all-or-nothing: any OTHER non-default
+                // family flag still routes to the CPU grower).
                 if config.grow_policy != DeviceGrowPolicy::SymmetricTree {
                     return Ok(None);
                 }
-                if !config.is_covered_regime() {
+                // The exact-leaf regime is covered when ONLY `exact_leaf` (+ its α/δ) is
+                // non-default (every other family flag still the covered default).
+                let exact_covered = matches!(leaf_method, DeviceLeafMethod::Exact { .. })
+                    && config.bootstrap_type == DeviceBootstrapType::No
+                    && config.mvs_lambda.is_none()
+                    && config.ctr.is_none()
+                    && config.max_leaves.is_none();
+                if !config.is_covered_regime() && !exact_covered {
                     return Ok(None);
                 }
             }
@@ -264,9 +356,19 @@ impl GpuTrainSession {
                 }
             }
         }
-        let der_kernel = match map_der_kernel(loss) {
-            Some(k) => k,
-            None => return Ok(None),
+        // For the exact-leaf oblivious grow the STRUCTURE der is the RMSE residual der (the MVP
+        // structural der — the split histogram is driven by `target - approx`; the leaf VALUES
+        // are OVERWRITTEN by the device Exact order statistic in `grow_one`). Upstream
+        // quantile-der split parity + the full-tree Kaggle oracle are the Plan-09 sign-off; the
+        // leaf-VALUE numerics are locked ≤1e-4 by the `kernels::exact_quantile` self-oracle.
+        // Otherwise (Newton path) the covered der seam (RMSE / Logloss); a non-covered loss
+        // declines. Exact is only reachable on the oblivious path (nonsym declined exact above).
+        let der_kernel = match leaf_method {
+            DeviceLeafMethod::Exact { .. } => DerBinaryKernel::RmseGradient,
+            DeviceLeafMethod::Newton => match map_der_kernel(loss) {
+                Some(k) => k,
+                None => return Ok(None),
+            },
         };
         let score_fn = match map_score_fn(score_function) {
             Some(s) => s,
@@ -358,6 +460,16 @@ impl GpuTrainSession {
             der_kernel,
         });
 
+        // Phase 12 Plan 05: capture the Exact-leaf state (oblivious path only; nonsym declined
+        // exact above). `grow_one` overwrites the Newton leaf values with the device weighted
+        // quantile per leaf, from the host residuals + this weight copy.
+        let exact_leaf = match leaf_method {
+            DeviceLeafMethod::Exact { alpha, delta, mape } if nonsym_policy.is_none() => {
+                Some(ExactLeafState { alpha, delta, mape, weight: weight.to_vec() })
+            }
+            _ => None,
+        };
+
         Ok(Some(Self {
             client,
             plain_cindex_h,
@@ -382,6 +494,7 @@ impl GpuTrainSession {
             der_kernel,
             config: config.clone(),
             nonsym,
+            exact_leaf,
         }))
     }
 
@@ -444,8 +557,41 @@ impl GpuTrainSession {
             );
         }
 
+        // Phase 12 Plan 05 (GPUT-19): the EXACT-LEAF oblivious arm re-syncs the resident approx
+        // from the caller's host `approx` each tree. The leaf-value override at the end advances
+        // the TRUE approx via the device Exact order statistic (NOT the Newton leaves the
+        // resident grow applies on-device), so the resident approx must track the caller —
+        // otherwise the next tree's der1 + split structure would drift from the true,
+        // exact-leaf-advanced approx. The extra per-tree upload is confined to the exact path.
+        if self.exact_leaf.is_some() {
+            if approx.len() != self.n {
+                return Err(CbError::LengthMismatch {
+                    column: "approx".to_owned(),
+                    expected: self.n,
+                    actual: approx.len(),
+                });
+            }
+            let target_h = match &self.target_h {
+                Some(h) => h.clone(),
+                None => {
+                    let h = upload_channel_floats(&self.client, target);
+                    self.target_h = Some(h.clone());
+                    h
+                }
+            };
+            self.approx_h = upload_channel_floats(&self.client, approx);
+            self.der1_h = Some(launch_der_binary_resident(
+                &self.client,
+                self.approx_h.clone(),
+                target_h,
+                self.der_kernel,
+                self.n,
+            )?);
+        }
+
         // Upload the target ONCE (first call), then initialise the resident der1 from the
-        // resident (zero-start) approx device-side — NO read-back.
+        // resident (zero-start) approx device-side — NO read-back. (The exact-leaf arm above
+        // already set both handles from the fresh approx, so this init is skipped for it.)
         if self.target_h.is_none() {
             let target_h = upload_channel_floats(&self.client, target);
             let der1_h = launch_der_binary_resident(
@@ -508,9 +654,22 @@ impl GpuTrainSession {
         self.approx_h = approx_next;
         self.der1_h = Some(der1_next);
 
+        // Phase 12 Plan 05 (GPUT-19): OVERRIDE the Newton/calc_average leaf values with the
+        // device Exact weighted-quantile order statistic per leaf (from the host residuals
+        // `target - approx`), when the exact-leaf arm is active. The tree STRUCTURE + `leaf_of`
+        // stay from the resident grow; only the leaf VALUES become the Exact order statistic
+        // (≤1e-4 vs `exact_leaf_delta`, D-09). UNSCALED (learning_rate applied downstream — the
+        // DeviceGrownTree contract), exactly like `exact_leaf_delta`.
+        let leaf_values = match self.exact_leaf.as_ref() {
+            Some(ex) => {
+                compute_exact_leaf_values(&tree.leaf_of, tree.leaf_values.len(), approx, target, ex)?
+            }
+            None => tree.leaf_values,
+        };
+
         Ok(DeviceGrownTree {
             splits: tree.splits,
-            leaf_values: tree.leaf_values,
+            leaf_values,
             leaf_of: tree.leaf_of,
             // Oblivious / symmetric emission: the non-symmetric node-graph carrier stays EMPTY
             // (byte-unchanged, D-04). Only the Plan-03 non-sym device grow fills these.
@@ -518,4 +677,47 @@ impl GpuTrainSession {
             node_id_to_leaf_id: Vec::new(),
         })
     }
+}
+
+/// Compute the per-leaf device Exact weighted-quantile leaf values (Phase 12 Plan 05,
+/// GPUT-19). Groups the leaf members by `leaf_of[i]`, forms each member's residual
+/// `target_i - approx_i` (widened through `f32`, matching upstream's `TVector<float>
+/// leafSamples`) and weight (`weightsWithTargets[i] = weight_i/max(1,|target_i|)` for MAPE, A4;
+/// else the object weight), then calls [`device_exact_leaf_delta`] per leaf. Returns the
+/// UNSCALED per-leaf delta (length `n_leaves`); an empty leaf is `0.0` (the CPU-ref guard). No
+/// `unwrap`/`expect`/`panic`/indexing (D-13).
+fn compute_exact_leaf_values(
+    leaf_of: &[u32],
+    n_leaves: usize,
+    approx: &[f64],
+    target: &[f64],
+    ex: &ExactLeafState,
+) -> CbResult<Vec<f64>> {
+    let n = leaf_of.len();
+    let mut per_res: Vec<Vec<f32>> = vec![Vec::new(); n_leaves];
+    let mut per_w: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+    for i in 0..n {
+        let leaf = leaf_of.get(i).copied().unwrap_or(0) as usize;
+        let a = approx.get(i).copied().unwrap_or(0.0);
+        let t = target.get(i).copied().unwrap_or(0.0);
+        let r = (t - a) as f32;
+        let w = if ex.mape {
+            1.0 / f64::max(1.0, t.abs())
+        } else {
+            ex.weight.get(i).copied().unwrap_or(1.0)
+        };
+        if let (Some(pr), Some(pw)) = (per_res.get_mut(leaf), per_w.get_mut(leaf)) {
+            pr.push(r);
+            pw.push(w);
+        }
+    }
+    let mut values = vec![0.0_f64; n_leaves];
+    for l in 0..n_leaves {
+        let res = per_res.get(l).map_or(&[][..], |v| v.as_slice());
+        let wts = per_w.get(l).map_or(&[][..], |v| v.as_slice());
+        if let Some(slot) = values.get_mut(l) {
+            *slot = device_exact_leaf_delta(res, wts, ex.alpha, ex.delta)?;
+        }
+    }
+    Ok(values)
 }

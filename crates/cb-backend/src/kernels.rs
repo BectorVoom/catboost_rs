@@ -2851,6 +2851,13 @@ pub(crate) mod exact_quantile;
 #[cfg(test)]
 mod segmented_sort_test;
 
+// Device Exact weighted-quantile leaf-delta self-oracle (source/test separation, Plan 05
+// GPUT-19): the device Exact leaf value vs the CPU `cb_compute::exact_leaf_delta` ≤1e-4 for
+// the Quantile/MAE/MAPE family (A4) lives in `kernels/exact_quantile_test.rs`, mounted at
+// `kernels::exact_quantile_test`. Runs over the generic `SelectedRuntime` (rocm in-env).
+#[cfg(test)]
+mod exact_quantile_test;
+
 // TDataPartition {Offset,Size} update oracle (source/test separation, Plan 10-04
 // GPUT-16): the offset/size update self-oracle vs an inline serial partition-
 // bookkeeping reference (D-02), including an empty-partition case, lives in

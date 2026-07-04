@@ -265,6 +265,138 @@ fn session_depth_gt1_gate_declines_uncovered() {
     };
     assert!(
         !open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &exact),
-        "an exact-leaf config must decline (D-10-01 all-or-nothing)"
+        "an exact-leaf config with a NON-quantile loss (RMSE) must decline (Plan 05: exact-leaf \
+         is covered ONLY for the Quantile/MAE/MAPE family)"
     );
+    assert!(
+        !open(6, true, 1, &Loss::Logloss, EScoreFunction::Cosine, &exact),
+        "an exact-leaf config with Logloss (non-quantile) must decline (Plan 05)"
+    );
+}
+
+/// (Gate, Plan 05 GPUT-19) the EXACT-LEAF arm: an `exact_leaf` config with a covered
+/// quantile-family loss (MAE / Quantile / MAPE) now opens a session (`Ok(Some)`); the Newton
+/// path (exact_leaf unset) is unchanged, and exact-leaf with a non-quantile loss OR a second
+/// non-default family flag still declines. Classify-only at `begin` — runs on EVERY backend.
+#[test]
+fn session_exact_leaf_gate_covers_quantile_family() {
+    let n = 41usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let weight = weight_mod5(n);
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+    let lr = 0.3_f64;
+
+    let open = |loss: &Loss, cfg: &DeviceTrainConfig| {
+        GpuTrainSession::begin(
+            loss, 6, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features, n_bins, lr,
+            scaled_l2, cfg,
+        )
+        .expect("begin must not error while classifying the exact-leaf arm")
+        .is_some()
+    };
+
+    let exact = DeviceTrainConfig { exact_leaf: true, ..DeviceTrainConfig::default() };
+    let exact_q = DeviceTrainConfig {
+        exact_leaf: true,
+        quantile_alpha: 0.25,
+        quantile_delta: 1e-6,
+        ..DeviceTrainConfig::default()
+    };
+
+    // COVERED: exact-leaf + the Quantile/MAE/MAPE family → Ok(Some).
+    assert!(open(&Loss::Mae, &exact), "exact-leaf + MAE must open a session (Plan 05)");
+    assert!(
+        open(&Loss::Quantile { alpha: 0.25, delta: 1e-6 }, &exact_q),
+        "exact-leaf + Quantile must open a session (Plan 05)"
+    );
+    assert!(open(&Loss::Mape, &exact), "exact-leaf + MAPE must open a session (Plan 05)");
+
+    // NOT covered: exact-leaf + non-quantile loss → None.
+    assert!(!open(&Loss::Rmse, &exact), "exact-leaf + RMSE must decline (non-quantile)");
+
+    // NOT covered: exact-leaf PLUS another non-default family flag (e.g. bootstrap) → None
+    // (D-10-01 all-or-nothing — only exact_leaf may differ).
+    let exact_plus_bootstrap = DeviceTrainConfig {
+        exact_leaf: true,
+        bootstrap_type: cb_compute::DeviceBootstrapType::Bernoulli,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(&Loss::Mae, &exact_plus_bootstrap),
+        "exact-leaf + a second non-default family flag must still decline (all-or-nothing)"
+    );
+
+    // The Newton path (exact_leaf unset) is unchanged: MAE without exact_leaf still declines
+    // (no device der arm), RMSE still opens.
+    let def = DeviceTrainConfig::default();
+    assert!(!open(&Loss::Mae, &def), "MAE without exact_leaf keeps the Newton path (declines)");
+    assert!(open(&Loss::Rmse, &def), "RMSE (Newton) still opens — default path unchanged");
+}
+
+/// (End-to-end wiring, Plan 05 GPUT-19) an exact-leaf Quantile session grows a real device tree
+/// whose leaf VALUES are the device Exact order statistic (finite, non-NaN). The leaf-VALUE
+/// numerics are locked ≤1e-4 by the `kernels::exact_quantile` self-oracle; here we prove the
+/// begin→grow_one wiring produces a valid tree end-to-end. Needs `Atomic<u64>` (the resident
+/// partition histogram) + the device sort → SKIPS on cpu/wgpu, runs on rocm/cuda in-env.
+#[test]
+fn session_exact_leaf_grows_finite_quantile_leaves() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[12-05] SKIP session_exact_leaf_grows_finite_quantile_leaves: active backend lacks \
+             Atomic<u64> / the device sort composition (cpu/wgpu) — needs rocm/cuda"
+        );
+        return;
+    }
+    let n = 300usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let depth = 3usize;
+    let target = ramp_centred(n);
+    let weight = vec![1.0_f64; n]; // covered exact regime is unit weight
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    let exact = DeviceTrainConfig {
+        exact_leaf: true,
+        quantile_alpha: 0.5,
+        quantile_delta: 1e-6,
+        ..DeviceTrainConfig::default()
+    };
+    let mut session = GpuTrainSession::begin(
+        &Loss::Quantile { alpha: 0.5, delta: 1e-6 },
+        depth,
+        true,
+        1,
+        EScoreFunction::Cosine,
+        &cindex,
+        &weight,
+        n,
+        n_features,
+        n_bins,
+        0.3,
+        scaled_l2,
+        &exact,
+    )
+    .expect("begin must not error on a covered exact-leaf Quantile config")
+    .expect("exact-leaf Quantile must open a session (Plan 05 gate arm)");
+
+    let tree = session
+        .grow_one(&vec![0.0_f64; n], &target)
+        .expect("exact-leaf grow_one must succeed");
+
+    assert_eq!(tree.splits.len(), depth, "exact-leaf tree must have {depth} splits");
+    assert_eq!(tree.leaf_of.len(), n, "leaf_of length must equal n");
+    assert_eq!(tree.leaf_values.len(), 1usize << depth, "2^depth leaf values");
+    for (l, &v) in tree.leaf_values.iter().enumerate() {
+        assert!(v.is_finite(), "exact leaf value {l} must be finite, got {v}");
+    }
+    // At least one leaf must carry a non-zero exact quantile (the target is a non-trivial ramp,
+    // so the residual median per leaf is not identically zero).
+    assert!(
+        tree.leaf_values.iter().any(|&v| v.abs() > 1e-9),
+        "exact-leaf grow produced all-zero leaves — the quantile override did not run"
+    );
+    drop(session);
 }
