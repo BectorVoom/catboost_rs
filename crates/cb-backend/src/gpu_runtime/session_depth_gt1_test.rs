@@ -232,15 +232,32 @@ fn session_depth_gt1_gate_declines_uncovered() {
         "depth==0 (no tree to grow) must decline"
     );
 
-    // A non-default `DeviceTrainConfig` family flag still declines (the Task 3 config gate —
-    // later waves flip each arm; for Plan 01 every non-default value routes to CPU).
-    let non_sym = DeviceTrainConfig {
+    // Phase 12 Plan 03 (GPUT-18): the Depthwise / Lossguide grow policies are now COVERED
+    // (the non-symmetric device grow arm flipped on this wave). Region stays declined (Plan 04).
+    let depthwise = DeviceTrainConfig {
         grow_policy: DeviceGrowPolicy::Depthwise,
         ..DeviceTrainConfig::default()
     };
     assert!(
-        !open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &non_sym),
-        "a non-SymmetricTree grow_policy must decline (D-10-01 all-or-nothing)"
+        open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &depthwise),
+        "Depthwise grow_policy must now be covered (Plan 03 device non-sym arm)"
+    );
+    let lossguide = DeviceTrainConfig {
+        grow_policy: DeviceGrowPolicy::Lossguide,
+        max_leaves: Some(8),
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &lossguide),
+        "Lossguide grow_policy (with a leaf cap) must now be covered (Plan 03)"
+    );
+    let region = DeviceTrainConfig {
+        grow_policy: DeviceGrowPolicy::Region,
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(6, true, 1, &Loss::Rmse, EScoreFunction::Cosine, &region),
+        "Region grow_policy must still decline (no device kernel until Plan 04)"
     );
     let exact = DeviceTrainConfig {
         exact_leaf: true,
