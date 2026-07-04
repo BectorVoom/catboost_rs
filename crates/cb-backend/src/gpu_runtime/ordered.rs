@@ -203,6 +203,18 @@ pub(crate) fn accumulate_ordered_trajectory(trees: &[OrderedTree], n: usize) -> 
         let identity_h: Handle = client.create(cubecl::bytes::Bytes::from_elems(identity));
 
         for tree in trees {
+            // Guard the per-tree invariant `permutation.len() == n` BEFORE the resident apply
+            // (WR-03): `ordered_approx_delta` returns a `delta` of length `permutation.len()`, and
+            // the identity-mapped apply gathers `delta[i]` for `i in 0..n`. A tree whose permutation
+            // is shorter than `n` would make the device read past the end of the `delta` buffer
+            // (out-of-bounds device read / UB); reject it with a typed error instead.
+            if tree.permutation.len() != n {
+                return Err(CbError::LengthMismatch {
+                    column: "ordered permutation".to_owned(),
+                    expected: n,
+                    actual: tree.permutation.len(),
+                });
+            }
             // The ordered delta is an inherently SEQUENTIAL permutation scan (host).
             let delta = ordered_approx_delta(tree)?;
             // Resident add via the existing `apply_leaf_delta` kernel: the trajectory handle is
