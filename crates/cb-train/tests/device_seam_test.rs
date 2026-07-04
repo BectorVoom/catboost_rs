@@ -144,6 +144,7 @@ fn device_seam_folds_depth1_tree_via_bin_border_join() {
     let dev_tree = DeviceGrownTree {
         splits: vec![(0, 1)],
         leaf_values: vec![2.0, -3.0],
+        approx_dim: 1,
         leaf_of: Vec::new(),
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
@@ -238,6 +239,7 @@ fn device_bin_id_out_of_range_is_typed_error() {
     let dev_tree = DeviceGrownTree {
         splits: vec![(0, 5)],
         leaf_values: vec![1.0, -1.0],
+        approx_dim: 1,
         leaf_of: Vec::new(),
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
@@ -278,6 +280,7 @@ fn device_declines_nonzero_starting_bias_boost_from_average() {
         grow: Some(DeviceGrownTree {
             splits: vec![(0, 1)],
             leaf_values: vec![2.0, -3.0],
+            approx_dim: 1,
             leaf_of: Vec::new(),
             step_nodes: Vec::new(),
             node_id_to_leaf_id: Vec::new(),
@@ -322,6 +325,7 @@ fn device_declines_newton_leaf_method_on_covered_loss() {
         grow: Some(DeviceGrownTree {
             splits: vec![(0, 1)],
             leaf_values: vec![2.0, -3.0],
+            approx_dim: 1,
             leaf_of: Vec::new(),
             step_nodes: Vec::new(),
             node_id_to_leaf_id: Vec::new(),
@@ -364,6 +368,7 @@ fn device_declined_begin_falls_back_to_cpu_path() {
         grow: Some(DeviceGrownTree {
             splits: vec![(0, 1)],
             leaf_values: vec![2.0, -3.0],
+            approx_dim: 1,
             leaf_of: Vec::new(),
             step_nodes: Vec::new(),
             node_id_to_leaf_id: Vec::new(),

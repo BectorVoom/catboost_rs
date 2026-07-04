@@ -1389,6 +1389,9 @@ impl GpuTrainSession {
         Ok(DeviceGrownTree {
             splits: tree.splits,
             leaf_values,
+            // Scalar oblivious emission: one value per leaf ⇒ approx_dim == 1 (the
+            // block collapses to the flat scalar vector, byte-unchanged, D-04).
+            approx_dim: 1,
             leaf_of: tree.leaf_of,
             // Oblivious / symmetric emission: the non-symmetric node-graph carrier stays EMPTY
             // (byte-unchanged, D-04). Only the Plan-03 non-sym device grow fills these.

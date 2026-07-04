@@ -465,6 +465,9 @@ pub(crate) fn grow_nonsym_tree(
     Ok(DeviceGrownTree {
         splits,
         leaf_values,
+        // Scalar non-symmetric emission: one value per leaf ⇒ approx_dim == 1
+        // (byte-unchanged block collapse, D-04).
+        approx_dim: 1,
         leaf_of,
         step_nodes,
         node_id_to_leaf_id,

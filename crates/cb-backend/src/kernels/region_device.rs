@@ -176,6 +176,9 @@ pub(crate) fn grow_region_tree(
         // (which additionally carries the direction + one-hot flags).
         splits: region_path.iter().map(|&(f, b, _, _)| (f, b)).collect(),
         leaf_values,
+        // Scalar Region emission: one value per leaf ⇒ approx_dim == 1
+        // (byte-unchanged block collapse, D-04).
+        approx_dim: 1,
         leaf_of,
         // Region is a PATH — NO node graph (the boosting dispatch keys on `region_path`
         // non-empty BEFORE `step_nodes`, so these stay empty).

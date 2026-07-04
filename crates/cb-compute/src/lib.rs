@@ -98,6 +98,8 @@ mod leaf_test;
 #[cfg(test)]
 mod loss_test;
 #[cfg(test)]
+mod runtime_test;
+#[cfg(test)]
 mod score_test;
 #[cfg(test)]
 mod text_calcers_test;

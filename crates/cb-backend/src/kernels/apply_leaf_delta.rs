@@ -90,6 +90,83 @@ fn apply_leaf_delta_grid_stride_large_n() {
     }
 }
 
+/// Serial CPU reference for the MULTI-OUTPUT block apply (Phase 13 Plan 06, GPUT-12, D-03):
+/// `approx[d * n + i] += lr * leaf_block[leaf_of[i] * k + d]` over a dimension-major approx
+/// buffer (length `k * n`) and a `leaf_count × k` row-major leaf block. At `k == 1` this is
+/// byte-identical to [`cpu_apply`] (the scalar path — GPUT-14 / D-04 no-regression).
+fn cpu_apply_block(approx: &[f64], leaf_of: &[u32], leaf_block: &[f64], lr: f64, k: usize) -> Vec<f64> {
+    let n = approx.len() / k;
+    let mut out = approx.to_vec();
+    for d in 0..k {
+        for i in 0..n {
+            let leaf = leaf_of[i] as usize;
+            out[d * n + i] += lr * leaf_block[leaf * k + d];
+        }
+    }
+    out
+}
+
+/// Device block apply that ROUTES THROUGH the existing scalar multi-output apply layout: for each
+/// dimension `d` it slices the dimension-major approx span `approx[d * n .. (d + 1) * n]`, extracts
+/// the per-dimension leaf column `leaf_col[l] = leaf_block[l * k + d]`, and applies the SAME device
+/// `apply_leaf_delta_kernel` the scalar path uses (multilogit.cu applies one dimension at a time).
+/// The K slices are reassembled into the dimension-major buffer — exactly the CPU block layout.
+fn run_apply_block(approx: &[f64], leaf_of: &[u32], leaf_block: &[f64], lr: f64, k: usize) -> Vec<f64> {
+    let n = approx.len() / k;
+    let n_leaves = leaf_block.len() / k;
+    let mut out = vec![0.0_f64; approx.len()];
+    for d in 0..k {
+        let approx_dim: Vec<f64> = approx[d * n..(d + 1) * n].to_vec();
+        let leaf_col: Vec<f64> = (0..n_leaves).map(|l| leaf_block[l * k + d]).collect();
+        let updated = run_apply(&approx_dim, leaf_of, &leaf_col, lr);
+        out[d * n..(d + 1) * n].copy_from_slice(&updated);
+    }
+    out
+}
+
+#[test]
+fn apply_leaf_delta_block_matches_cpu_reference_k3() {
+    // K=3 multi-output, depth-1 (2 leaves), n=4 objects. Dimension-major approx buffer (length K*n).
+    let k = 3usize;
+    let n = 4usize;
+    let approx: Vec<f64> = (0..k * n).map(|x| (x as f64) * 0.1 - 0.5).collect();
+    let leaf_of = vec![0u32, 1, 1, 0];
+    // Leaf 0 = [0.10, 0.20, 0.30]; leaf 1 = [-0.40, -0.50, -0.60] (row-major per leaf).
+    let leaf_block = vec![0.10, 0.20, 0.30, -0.40, -0.50, -0.60];
+    let lr = 0.25_f64;
+
+    let dev = run_apply_block(&approx, &leaf_of, &leaf_block, lr, k);
+    let cpu = cpu_apply_block(&approx, &leaf_of, &leaf_block, lr, k);
+
+    assert_eq!(dev.len(), cpu.len(), "block length mismatch");
+    for (i, (d, c)) in dev.iter().zip(cpu.iter()).enumerate() {
+        assert!(
+            (d - c).abs() <= F64_TOL,
+            "block apply[{i}] device {d} vs cpu {c} (diff {})",
+            (d - c).abs()
+        );
+    }
+}
+
+#[test]
+fn apply_leaf_delta_block_k1_is_scalar_byte_unchanged() {
+    // K == 1: the block apply collapses to the scalar path — byte-identical (GPUT-14 / D-04).
+    let approx = vec![0.5, -1.0, 2.0, 0.0, 3.5, -2.5];
+    let leaf_of = vec![0u32, 1, 0, 1, 1, 0];
+    let leaf_values = vec![0.3_f64, -0.7]; // K == 1 ⇒ leaf_block == flat leaf vector.
+    let lr = 0.1_f64;
+
+    let block = run_apply_block(&approx, &leaf_of, &leaf_values, lr, 1);
+    let scalar = cpu_apply(&approx, &leaf_of, &leaf_values, lr);
+
+    for (i, (b, s)) in block.iter().zip(scalar.iter()).enumerate() {
+        assert!(
+            (b - s).abs() <= F64_TOL,
+            "K=1 block apply must equal the scalar apply at index {i}: {b} vs {s}"
+        );
+    }
+}
+
 #[test]
 fn apply_leaf_delta_empty_is_noop() {
     // n == 0: no launch, the resident approx handle is returned unchanged (Pitfall 5).

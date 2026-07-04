@@ -906,9 +906,13 @@ pub struct Derivatives {
 ///   the caller resolves the concrete threshold with
 ///   `border = feature_borders[feature][bin_id]` (see
 ///   `cb_train::tree::FeatureMatrix`). Length equals the tree depth.
-/// - `leaf_values`: the per-leaf values in leaf-index order, length `2^depth`.
-///   These are **UN-scaled** by `learning_rate`; cb-train applies the shrinkage
-///   downstream so the device path matches the CPU leaf-update contract.
+/// - `leaf_values`: the per-leaf values in leaf-index order, a
+///   `leaf_count × approx_dim` ROW-MAJOR block (`approx_dim == 1` for the scalar
+///   path ⇒ the flat `2^depth`-length vector, byte-unchanged, D-04). These are
+///   **UN-scaled** by `learning_rate`; cb-train applies the shrinkage downstream
+///   so the device path matches the CPU leaf-update contract.
+/// - `approx_dim`: the per-leaf approximant dimension `K` (`1` for every scalar
+///   construction; `> 1` only for the Phase-13 multi-output leaf blocks).
 /// - `leaf_of`: the per-object leaf index. In the production hot path this is
 ///   **empty** (length 0) so the `n`-length buffer never crosses the seam per
 ///   tree (D-05); it is populated to length `n` ONLY for the oracle structure
@@ -929,9 +933,29 @@ pub struct DeviceGrownTree {
     /// Pass test: `quantized_bin[feature] > bin_id`. The caller resolves the
     /// border via `feature_borders[feature][bin_id]`.
     pub splits: Vec<(u32, u32)>,
-    /// Per-leaf values in leaf-index order, length `2^depth`. UN-scaled by
-    /// `learning_rate` (cb-train applies the shrinkage).
+    /// Per-leaf values in leaf-index order. UN-scaled by `learning_rate`
+    /// (cb-train applies the shrinkage).
+    ///
+    /// # Multi-output block layout (Phase 13 Plan 06, GPUT-12, D-03)
+    /// `leaf_values` is a `leaf_count × approx_dim` ROW-MAJOR block: leaf `l`'s
+    /// per-dimension vector occupies the contiguous span
+    /// `leaf_values[l * approx_dim .. (l + 1) * approx_dim]`, so dimension `d` of
+    /// leaf `l` is `leaf_values[l * approx_dim + d]`. The block routes through the
+    /// existing multi-output CPU apply layout
+    /// `approx[d * n + i] += lr * leaf_values[leaf_of[i] * approx_dim + d]`.
+    ///
+    /// At `approx_dim == 1` (the scalar / oblivious path) this collapses to the
+    /// pre-Phase-13 flat `leaf_count`-length vector and the bytes are IDENTICAL
+    /// (GPUT-14 / D-04 no-regression): `leaf_values[l * 1 + 0] == leaf_values[l]`.
     pub leaf_values: Vec<f64>,
+    /// The per-leaf approximant dimension `K` — `leaf_values` is a
+    /// `leaf_count × approx_dim` row-major block (see the [`Self::leaf_values`]
+    /// layout note). `1` for every scalar / oblivious / non-symmetric / Region
+    /// construction (the block collapses to the flat scalar vector, byte-unchanged,
+    /// D-04); `> 1` only for the multi-output (multiclass / multi-target) leaf
+    /// blocks the Phase-13 Plan-07 family emits. Plain host `usize` — never a
+    /// `cubecl` / `cb-backend` type (T-10-04 feature-unification landmine).
+    pub approx_dim: usize,
     /// Per-object leaf index. EMPTY (length 0) in the production hot path so the
     /// `n`-length buffer never crosses the seam per tree (D-05); length `n` only
     /// for the oracle structure check.
