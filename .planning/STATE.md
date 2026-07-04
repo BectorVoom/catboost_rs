@@ -5,8 +5,8 @@ milestone_name: GPU Performance
 current_phase: 13
 current_phase_name: Pairwise, Ranking, Multiclass, Ordered & Langevin Device Coverage
 status: executing
-stopped_at: Completed 12-08-PLAN.md
-last_updated: "2026-07-04T04:40:26.432Z"
+stopped_at: Phase 13 context gathered
+last_updated: "2026-07-04T05:37:12.728Z"
 last_activity: 2026-07-04
 last_activity_desc: Phase 12 complete, transitioned to Phase 13
 progress:
@@ -468,8 +468,8 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-04T02:39:36.778Z
-Stopped at: Completed 12-08-PLAN.md
+Last session: 2026-07-04T05:37:12.720Z
+Stopped at: Phase 13 context gathered
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
 Stopped at (prior): Completed 08-02-PLAN.md
@@ -488,7 +488,7 @@ Stopped at (prior): context exhaustion at 75% (2026-06-15)
 
 Stopped at (prior): 05-16 COMPLETE (commit 9a2c974) — GAP 1 / ORD-02 wiring-test closure. The only failing test at HEAD (ordered_structure_differs_from_plain) RETIRED in place (renamed ordered_branch_alive_structural_authority_is_e2e_oracle); its assert_ne! premise was invalidated by upstream-faithful identity-Folds[0] behavior (boosting.rs:~1054, 05-12), NOT a dead branch. ORD-02 structural authority delegated to ordered_boost_e2e_oracle_test (2/2 <=1e-5); aliveness gates preserved; retire decision in 05-DEFERRED.md (no orphan todos/). Test-only; no production source. wiring 3/3, e2e 2/2, ordered_boost_oracle 5/5, lib 130/130, 0 warnings. Phase 05 gap-closure COMPLETE — no failing test at HEAD. NOTE: gsd-tools CLI absent -> STATE/ROADMAP updated MANUALLY. Resume file: .planning/phases/05-.../05-16-SUMMARY.md. NEXT: /gsd-transition or Phase 06.
 Stopped at (prior): 05-14 COMPLETE (commits fd5da4a Task1 / c5ea0eb Task2) — ORD-05 CLOSED. The FULL tensor_ctr_e2e_oracle_predictions_match_upstream hard gate is GREEN <=1e-5 across all 5 trees through cb_model::predict_raw_cat, driven by train_cat + with_ctr_data(CtrData::from_baked). Bake: cb_train::bake_ctr_table builds the whole-set inference CTR table over the COMBINED projection hash (accumulate_online + build_final_ctr) with (Shift,Scale)=calc_normalization(prior_num)+ctr_border_count (Shift=0,Scale=15); train_cat returns (Model, BakedCtrData). Apply: split.shift/split.scale threaded on BOTH branches (FOUND ctr_value_for_combined_projection + NOT-FOUND calc_inference); shared ctr_base_key makes bake key==apply key. TWO upstream-validated Rule-1 fixes were required: (A) model_size_reg cat-feature weight (default 0.5) down-weights NEW high-cardinality combination CTRs so {0,1} stops out-scoring a second {0} border -> structure [6,0,9,15]; (B) AveragingFold pre-draw (one GenRand, RNG call-count 1) -> averaging partition [6,0,7,17], leaf values bit-exact. Draw-order oracles re-keyed to call-count-1. NOTE: gsd-tools CLI binary absent on this machine -> STATE/ROADMAP updated MANUALLY. PRE-EXISTING out-of-scope failure (verified failing identically with this plan's changes stashed): ordered_boost_wiring::ordered_structure_differs_from_plain (Ordered==Plain on pc=1 identity fold; the ordered_boost_e2e ORD-02 gate stays GREEN). NEXT: Phase 05 complete — run /gsd-transition or proceed to Phase 06.
-Resume file: .planning/phases/12-grow-policy-leaf-method-sampling-categorical-device-coverage/12-CONTEXT.md
+Resume file: .planning/phases/13-pairwise-ranking-multiclass-ordered-langevin-device-coverage/13-CONTEXT.md
 
 ## Operator Next Steps
 
