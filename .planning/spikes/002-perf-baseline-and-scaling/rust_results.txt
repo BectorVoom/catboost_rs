@@ -1,0 +1,20 @@
+RSBENCH_META base_n=10000 base_nf=20 base_nbins=128 base_depth=6 iters=3
+RSBENCH n=10000 nf=20 nbins=128 depth=6 iters=3 train_s=6.4985 trees=3 per_tree_ms=2166.152
+RSBENCH n=5000 nf=20 nbins=128 depth=6 iters=3 train_s=3.3886 trees=3 per_tree_ms=1129.537
+RSBENCH n=20000 nf=20 nbins=128 depth=6 iters=3 train_s=12.5219 trees=3 per_tree_ms=4173.968
+RSBENCH n=40000 nf=20 nbins=128 depth=6 iters=3 train_s=25.2061 trees=3 per_tree_ms=8402.023
+RSBENCH n=10000 nf=5 nbins=128 depth=6 iters=3 train_s=1.6227 trees=3 per_tree_ms=540.899
+RSBENCH n=10000 nf=10 nbins=128 depth=6 iters=3 train_s=3.2161 trees=3 per_tree_ms=1072.043
+RSBENCH n=10000 nf=40 nbins=128 depth=6 iters=3 train_s=12.9796 trees=3 per_tree_ms=4326.544
+RSBENCH n=10000 nf=20 nbins=16 depth=6 iters=3 train_s=0.7715 trees=3 per_tree_ms=257.167
+RSBENCH n=10000 nf=20 nbins=32 depth=6 iters=3 train_s=1.6015 trees=3 per_tree_ms=533.829
+RSBENCH n=10000 nf=20 nbins=64 depth=6 iters=3 train_s=3.3444 trees=3 per_tree_ms=1114.813
+RSBENCH n=10000 nf=20 nbins=254 depth=6 iters=3 train_s=13.0808 trees=3 per_tree_ms=4360.271
+RSBENCH n=10000 nf=20 nbins=128 depth=2 iters=3 train_s=1.7447 trees=3 per_tree_ms=581.578
+RSBENCH n=10000 nf=20 nbins=128 depth=4 iters=3 train_s=3.8529 trees=3 per_tree_ms=1284.305
+RSBENCH_DONE
+EXIT=0
+RSBENCH_META base_n=20000 base_nf=20 base_nbins=128 base_depth=6 iters=10
+RSBENCH n=20000 nf=20 nbins=128 depth=6 iters=10 train_s=55.9740 trees=10 per_tree_ms=5597.403
+RSBENCH n=5000 nf=20 nbins=128 depth=6 iters=10 train_s=15.8107 trees=10 per_tree_ms=1581.071
+RSBENCH n=10000 nf=20 nbins=128 depth=6 iters=10 train_s=25.1110 trees=10 per_tree_ms=2511.105
