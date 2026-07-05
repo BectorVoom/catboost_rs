@@ -181,7 +181,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 |-------|-----------|----------------|--------|-----------|
 | 1–8 (Core Parity) | v1.0 | — | Complete | 2026-06-28 |
 | 10–14 (GPU Performance) | v1.1 | — | Complete | 2026-07-05 |
-| 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 4/4 | Complete   | 2026-07-05 |
+| 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 4/4 | Complete    | 2026-07-05 |
 | 16. Online-HNSW KNN Estimated-Feature Parity | v1.2 | 0/TBD | Not started | - |
 | 17. Model Export — ONNX + CoreML | v1.2 | 0/TBD | Not started | - |
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |

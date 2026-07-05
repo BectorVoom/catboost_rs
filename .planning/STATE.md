@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Parity Completion & Release Readiness
-current_phase: 15
-current_phase_name: debt-discharge-cuda-oracle-re-establishment
+current_phase: 16
+current_phase_name: Online-HNSW KNN Estimated-Feature Parity
 status: executing
-stopped_at: Completed 15-03-PLAN.md (single-session P100 CUDA oracle — Part A ALL-PASS + Part B 12 rows)
-last_updated: "2026-07-05T07:43:12.219Z"
+stopped_at: "15-03 COMPLETE (commits 5d07c67 Task1 / 734109a Task2) — the SINGLE authoritative Kaggle P100 CUDA session. Part A (blocking correctness pre-gate, ε=1e-4): all 13 v1.1 device families exit==0 + ran_any_tests==true in ONE --features cuda session, divergences bit-exact (max abs_div=0.000e0; only stochastic bootstrap 2.384e-7 / mvs ~1e-15 nonzero, far under 1e-4); rv13_oracles_expected == rv13_oracles_seen (all 4: tie_order_matches_cpu_stable_descending + softmax_weight_max_seed on ranking family, empty_group_means_no_fault on ranking, pairwise_near_equal_border_tiebreak on pairwise) → correctness_verdict ALL-PASS. Part B (BENCH-02, ran only because Part A passed, D-05): 12 depth-1/depth-6 × {depthwise,region} rows median-of-3, device beats host CPU every row 29.1×–40.8×, bench_verdict OK, depth6_ge20x true; crossover = device first beats CPU at n=100000 (depth-1 depthwise, smallest n; NOT gated per A4). Region catboost_gpu_s = N/A (no upstream Region grow_policy). Provenance: Tesla P100-PCIE-16GB, driver 580.159.04, CUDA 12.8, seed 42, single_session=true. Task-1 Rule-3 deviation: BENCH_DEPTH env lever (default 6) added to crates/cb-train/tests/bench_grow_speed_test.rs so both depth rows run in one kernel (depth-6 provenance byte-unchanged). NO numbers fabricated — result.json committed verbatim (734109a). HARD-01 + HARD-02 discharged. NEXT: 15-04 (Wave 3) — 15-EVIDENCE.md + BENCH-03 recompute-in-place from bench/phase15_cuda_oracle/result.json + REQUIREMENTS/MILESTONES/STATE bookkeeping flip. Resume file: .planning/phases/15-debt-discharge-cuda-oracle-re-establishment/15-03-SUMMARY.md."
+last_updated: "2026-07-05T07:48:59.577Z"
 last_activity: 2026-07-05
-last_activity_desc: "15-03 complete: authoritative single-session P100 CUDA oracle (Part A ALL-PASS ε=1e-4 all 13 families + 4 RV-13; Part B 12 BENCH-02 rows 29.1–40.8×); HARD-01/02 discharged"
+last_activity_desc: Phase 15 complete, transitioned to Phase 16
 progress:
   total_phases: 7
   completed_phases: 1
@@ -28,16 +28,16 @@ See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 ## Current Position
 
-Phase: 15 (debt-discharge-cuda-oracle-re-establishment) — EXECUTING
-Plan: 4 of 4 complete (Wave 2 done)
+Phase: 16 — Online-HNSW KNN Estimated-Feature Parity
+Plan: Not started
 Status: Ready to execute Wave 3 / 15-04
-Last activity: 2026-07-05 — 15-03 complete: authoritative single-session P100 CUDA oracle (Part A ALL-PASS ε=1e-4 all 13 families + 4 RV-13; Part B 12 BENCH-02 rows 29.1–40.8×); HARD-01/02 discharged
+Last activity: 2026-07-05 — Phase 15 complete, transitioned to Phase 16
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 79
+- Total plans completed: 83
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -60,6 +60,7 @@ Last activity: 2026-07-05 — 15-03 complete: authoritative single-session P100 
 | 12 | 9 | - | - |
 | 13 | 10 | - | - |
 | 14 | 3 | - | - |
+| 15 | 4 | - | - |
 
 **Recent Trend:**
 
