@@ -239,7 +239,7 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete    | 2026-07-04 |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 10/10 | Complete    | 2026-07-04 |
-| 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 3/3 | Complete   | 2026-07-05 |
+| 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 3/3 | Complete    | 2026-07-05 |
 
 ## Backlog (Deferred from v1.0)
 
