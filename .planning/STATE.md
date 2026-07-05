@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Parity Completion & Release Readiness
 current_phase: 15
-current_phase_name: not started; roadmap done
-status: planning
-stopped_at: Phase 15 context gathered
-last_updated: "2026-07-05T02:49:32.958Z"
+current_phase_name: debt-discharge-cuda-oracle-re-establishment
+status: executing
+stopped_at: Completed 15-01-PLAN.md (RV-13-01/02 discharged)
+last_updated: "2026-07-05T05:42:39.014Z"
 last_activity: 2026-07-05
-last_activity_desc: Milestone v1.2 roadmap created (Phases 15–21)
+last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 7
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 4
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** v1.2 roadmap created — 7 phases (15–21), 19/19 requirements mapped. Build order debt-first: Phase 15 (discharge GPUT-14/BENCH-02/RV-13 debt + re-establish CUDA oracle) → 16 (online-HNSW, last CPU parity gap) → 17 (ONNX/CoreML export) → 18 (extended fstr) → 19 (GPU inference) → 20 (CV/tuning/snapshot orchestration) → 21 (adoption/DX capstone). Next: `/gsd-plan-phase 15`.
+**Current focus:** Phase 15 — debt-discharge-cuda-oracle-re-establishment
 
 ## Current Position
 
-Phase: 15 — Debt Discharge & CUDA Oracle Re-establishment (not started; roadmap done)
-Plan: —
-Status: Roadmap complete — ready to plan Phase 15
-Last activity: 2026-07-05 — Milestone v1.2 roadmap created (Phases 15–21)
+Phase: 15 (debt-discharge-cuda-oracle-re-establishment) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-07-05 — Phase 15 execution started
 
 ## Performance Metrics
 
@@ -202,6 +202,7 @@ Last activity: 2026-07-05 — Milestone v1.2 roadmap created (Phases 15–21)
 | Phase 14 P01 | 6m | 2 tasks | 2 files |
 | Phase 14 P02 | 2min | 2 tasks | 3 files |
 | Phase 14 P03 | 6min | 2 tasks | 2 files |
+| Phase 15 P01 | 12 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -435,6 +436,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 14-01: offline aggregator honors D-03 (aggregate committed BENCH-02, no re-run) + D-01 (>=20x hard gate); 12/12 rows PASS, min 23.888x
 - [Phase ?]: Phase 14-02: CatBoost-GPU arm reproduces bench gen() not generator.py; Region=N/A (no official policy); border_count=32 explicit
 - [Phase ?]: BENCH-03 signed off PASS: all 12 device rows >=20x vs host-CPU baseline (D-01); CatBoost-GPU informational (Region N/A); GPUT-14 + RESULTS.md TBD table left out of scope (D-04)
+- [Phase 15]: RV-13-01 tie-order confirmatory (verified-stable + oracle, no code churn); RV-13-02 QuerySoftMax exp-shift re-seeded from weight>0 max to match CPU ranking_der.rs:257-266 — both proven on real gfx1100 (RV-13-02 der max_div 1.1e-16)
 
 ### Pending Todos
 
@@ -509,8 +511,8 @@ Items acknowledged and carried forward at the v1.1 GPU Performance milestone clo
 
 ## Session Continuity
 
-Last session: 2026-07-05T02:49:32.949Z
-Stopped at: Phase 15 context gathered
+Last session: 2026-07-05T05:42:39.005Z
+Stopped at: Completed 15-01-PLAN.md (RV-13-01/02 discharged)
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.
 Stopped at (prior): Completed 08-02-PLAN.md
