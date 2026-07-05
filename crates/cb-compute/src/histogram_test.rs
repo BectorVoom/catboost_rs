@@ -153,6 +153,80 @@ fn build_bucket_histogram_sums_match_reduce_leaf_stats() {
     }
 }
 
+/// The flat scatter-add build (Task 1, WR-02) must be bit-identical to a local
+/// gather-then-`sum_f64` reference for every channel of every cell — the scatter
+/// sequence per cell is the identical ascending object-order fold, so no per-cell
+/// heap `Vec` is needed to preserve parity (PERF-03).
+#[test]
+fn build_flat_scatter_equals_gather() {
+    let n = 7;
+    let leaf_of = [0usize, 1, 0, 1, 0, 1, 0];
+    let der_d0 = [1.0, -2.0, 3.0, 0.5, -1.5, 2.0, 4.0];
+    let der_d1 = [-0.5, 1.5, -1.0, 2.0, 0.5, -3.0, 1.0];
+    let mut der1 = Vec::with_capacity(2 * n);
+    der1.extend_from_slice(&der_d0);
+    der1.extend_from_slice(&der_d1);
+    let weight = [1.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0];
+    let n_leaves = 2;
+    let n_features = 2;
+    let n_bins = 4;
+    let approx_dimension = 2;
+    let n_channels = approx_dimension + 1;
+    // Feature-major bins.
+    let bins: Vec<u32> = vec![
+        0, 1, 2, 3, 1, 0, 2, // feature 0
+        0, 0, 1, 1, 2, 2, 3, // feature 1
+    ];
+
+    let hist = build_bucket_histogram(
+        &bins,
+        &der1,
+        &weight,
+        &leaf_of,
+        n_leaves,
+        n_features,
+        n_bins,
+        approx_dimension,
+    );
+
+    // Local gather-then-sum_f64 reference (the pre-Task-1 shape).
+    let total = n_leaves * n_features * n_bins * n_channels;
+    let mut members: Vec<Vec<f64>> = vec![Vec::new(); total];
+    for obj in 0..n {
+        let leaf = leaf_of[obj];
+        let w = weight[obj];
+        for feature in 0..n_features {
+            let bin = bins[feature * n + obj] as usize;
+            let cell_base = ((leaf * n_features + feature) * n_bins + bin) * n_channels;
+            for d in 0..approx_dimension {
+                members[cell_base + d].push(der1[d * n + obj]);
+            }
+            members[cell_base + approx_dimension].push(w);
+        }
+    }
+    for leaf in 0..n_leaves {
+        for feature in 0..n_features {
+            for bin in 0..n_bins {
+                let cell_base = ((leaf * n_features + feature) * n_bins + bin) * n_channels;
+                for ch in 0..n_channels {
+                    let want = crate::histogram_test::sum_ref(&members[cell_base + ch]);
+                    let got = hist.channel(leaf, feature, bin, ch);
+                    assert_eq!(got, want, "cell l{leaf} f{feature} b{bin} ch{ch}");
+                }
+            }
+        }
+    }
+}
+
+/// Local ascending fold reference (mirrors `cb_core::sum_f64`) for the test above.
+fn sum_ref(values: &[f64]) -> f64 {
+    let mut acc = 0.0_f64;
+    for &v in values {
+        acc += v;
+    }
+    acc
+}
+
 /// Build a histogram over an arbitrary object subset (object order preserved).
 fn build_subset_hist(
     subset: &[usize],
