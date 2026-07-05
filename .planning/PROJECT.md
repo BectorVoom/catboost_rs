@@ -10,6 +10,22 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 
 A memory-efficient, Rust-native CatBoost implementation that achieves verifiable feature parity with the original (oracle-tested to within 10⁻⁵), embeddable directly in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
 
+## Current Milestone: v1.2 Parity Completion & Release Readiness
+
+**Goal:** Close the remaining CatBoost surface described in `docs/CATBOOST_CORE_DESIGN.md` and `docs/CATBOOST_CUDA_KERNELS_DESIGN.md`, discharge the v1.1 standing debt, and make catboost-rs adoption-ready — held to the ≤10⁻⁵ CPU / ε=1e-4 GPU parity bar.
+
+**Target features:**
+- **Debt & hardening** — GPUT-14 aggregate ε=1e-4 Kaggle CUDA correctness sign-off; Phase-10/11 BENCH-02 speed rows (finish the BENCH-03 aggregate); RV-13-01..04 latent parity hazards; FEAT-07 online-HNSW port for bit-exact KNN estimated-feature parity.
+- **Model export** — ONNX and CoreML export (from `.cbm`/`.json` today).
+- **Extended feature importance** — Interaction, LossFunctionChange, partial-dependence (SHAP + basic fstr already shipped).
+- **Orchestration layer** — first-class cross-validation, hyperparameter tuning (grid/random), snapshot/resume, standalone calc_metrics / eval_result.
+- **GPU inference evaluator** — device-side predict (v1.1 delivered device training only).
+- **Adoption / DX** — end-to-end benchmark vs official CatBoost (accuracy + speed on real datasets), PyPI release readiness (per-backend wheels, CI, versioning), documentation + runnable Rust/Python examples, real-world dataset validation suite.
+
+**Deferred / out of scope for v1.2:** distributed & multi-node training (MPI master/worker, multi-GPU); PMML and C++/Python code export.
+
+**Key context carried:** Kaggle CUDA remains the sole authoritative GPU oracle (ROCm in-env = non-gating smoke); never add a `cb-train` dependency to `cb-backend`; CubeCL for all GPU kernels.
+
 ## Current State
 
 **Shipped:** v1.1 GPU Performance (2026-07-05) — Phases 10–14, 36 plans, 25 requirements. The boosting inner loop moved from a derivatives-only host-light MVP onto a fully device-resident CubeCL training path: a from-scratch device-primitive library (no CUB) with a deterministic reduction, a bit-packed device-resident compressed index, a per-fit `GpuTrainSession` keeping the quantized matrix/gradients/approx resident across iterations (no per-tree re-upload or `der1` read-back), depth-1→depth-6 partition-aware histograms with the subtraction trick + Newton der2, and full device coverage of grow policies (Depthwise/Lossguide/Region), Exact weighted-quantile leaves, bootstrap/random-strength/MVS sampling, CTR/categoricals, PairLogit + batched device Cholesky, query/listwise ranking, multiclass/multi-target/uncertainty, ordered boosting, and Langevin/SGLB noise — each behind an `Ok(None)`→CPU per-fit fallback. **BENCH-03: PASS** — 23.9×–42.1× vs the pre-Phase-10 host-light CPU baseline on Tesla P100, reversing the original >20× gap, with CUDA correctness (44 device self-oracle tests, ALL-PASS) gated first.
@@ -46,10 +62,14 @@ A memory-efficient, Rust-native CatBoost implementation that achieves verifiable
 
 ### Active
 
-<!-- Carried forward. Scope for the next milestone is defined via /gsd-new-milestone. -->
+<!-- v1.2 Parity Completion & Release Readiness scope. Full REQ-IDs in REQUIREMENTS.md. -->
 
-- [ ] **FEAT-07** — KNN estimated-feature bit-exact parity via an online-HNSW port (~832 LOC); shipped with brute-force-exact calcer that diverges from upstream's approximate HNSW. _(Deferred backlog — Phase 9)_
-- [ ] **GPUT-14 aggregate sign-off + Phase-10/11 BENCH-02** — run the milestone-wide ε=1e-4 Kaggle CUDA correctness row and the two missing depth-1/depth-6 speed rows to fully discharge the v1.1 standing debt. _(Deferred to a hardening pass)_
+- [ ] **Debt & hardening** — FEAT-07 online-HNSW KNN parity; GPUT-14 aggregate ε=1e-4 Kaggle CUDA sign-off; Phase-10/11 BENCH-02 speed rows; RV-13-01..04 latent parity hazards.
+- [ ] **Model export** — ONNX + CoreML from the trained model.
+- [ ] **Extended feature importance** — Interaction, LossFunctionChange, partial-dependence.
+- [ ] **Orchestration** — cross-validation, hyperparameter tuning (grid/random), snapshot/resume, standalone calc_metrics / eval_result.
+- [ ] **GPU inference evaluator** — device-side predict.
+- [ ] **Adoption / DX** — end-to-end benchmark vs official CatBoost, PyPI release readiness, docs + runnable examples, real-dataset validation suite.
 
 ### Out of Scope
 
@@ -59,6 +79,8 @@ A memory-efficient, Rust-native CatBoost implementation that achieves verifiable
 - Mobile / embedded targets — desktop and server workloads only
 - Real-time streaming / online training — batch training only
 - R and CLI interfaces — Rust and Python only for this milestone
+- Distributed / multi-node training (MPI master/worker, multi-GPU) — deferred to a later milestone (v1.2 decision); single-node CPU+GPU only, matching the existing batch-training scope
+- PMML and C++/Python source-code model export — deferred (v1.2 decision); ONNX + CoreML cover the interop need for now
 
 ## Context
 
@@ -121,4 +143,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-05 after v1.1 GPU Performance milestone (Phases 10–14). Device-resident training path shipped — BENCH-03: PASS (23.9×–42.1× vs host-light baseline on P100). Closed with accepted standing debt: GPUT-14 aggregate sign-off + Phase-10/11 BENCH-02 rows un-run.*
+*Last updated: 2026-07-05 after starting milestone v1.2 Parity Completion & Release Readiness (continues from Phase 14). Scope: close remaining CatBoost core/CUDA-doc surface (ONNX+CoreML export, extended fstr, CV/tuning/snapshot/calc_metrics orchestration, GPU inference evaluator), discharge v1.1 debt (GPUT-14, BENCH-02, RV-13-01..04, FEAT-07 HNSW), and productionize (benchmark vs official CatBoost, PyPI release, docs, real-dataset validation). Deferred: distributed training, PMML/code export.*

@@ -1,20 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1
-milestone_name: GPU Performance
-current_phase: 1
-status: Awaiting next milestone
-stopped_at: v1.1 GPU Performance shipped (2026-07-05) — archived + tagged
-last_updated: "2026-07-05T01:47:35.652Z"
+milestone: v1.2
+milestone_name: Parity Completion & Release Readiness
+status: planning
+last_updated: "2026-07-05T02:04:20.365Z"
 last_activity: 2026-07-05
-last_activity_desc: Milestone v1.1 completed and archived
 progress:
-  total_phases: 5
-  completed_phases: 5
-  total_plans: 36
-  completed_plans: 36
-  percent: 100
-current_phase_name: comprehensive-kaggle-cuda-speed-benchmark-parity-sign-off
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -28,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 ## Current Position
 
-Phase: Milestone v1.1 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-07-05 — Milestone v1.1 completed and archived
+Status: Defining requirements
+Last activity: 2026-07-05 — Milestone v1.2 started
 
 ## Performance Metrics
 
