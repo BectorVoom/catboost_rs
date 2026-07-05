@@ -701,26 +701,14 @@ impl GrowScratch {
         }
     }
 
-    /// `a + b` composed from the sanctioned whole-histogram subtraction
-    /// ([`BucketHistogram::remove`] is the only combinator the type exposes):
-    /// `a + b = a − (0 − b)`. Used to reunite the FALSE-child (low slots) and
-    /// TRUE-child (high slots) halves of a level transition, whose non-zero cells
-    /// are disjoint. Each `remove` is a cell-wise f64 op (O(cells), independent of
-    /// `n`), so no per-object rescan is introduced.
+    /// Reunite the FALSE-child (low slots) and TRUE-child (high slots) halves of a
+    /// level transition, whose non-zero cells are disjoint, via the single-pass
+    /// [`BucketHistogram::add`] (`a + b` in one allocation). Each add is a cell-wise
+    /// f64 op (O(cells), independent of `n`), so no per-object rescan is introduced;
+    /// the previous `a − (0 − b)` triple-`remove` identity is replaced by one pass
+    /// (bit-identical, the dominant per-level cost at large `n_bins`, PERF-01).
     fn hist_add(a: &BucketHistogram, b: &BucketHistogram) -> BucketHistogram {
-        let zero = a.remove(a);
-        let neg_b = zero.remove(b);
-        a.remove(&neg_b)
-    }
-
-    /// Relocate the RETAINED parent histogram (`parent`, `n_parent` leaves) into the
-    /// child `n_new_leaves` layout, copying parent leaf `p` into slot `p + shift`
-    /// (`shift = 0` for the FALSE/low slots, `shift = n_parent` for the TRUE/high
-    /// slots). A byte-identical memcpy of already-folded cells — the parent is
-    /// carried forward instead of rebuilt from objects, so the larger sibling can be
-    /// derived as `relocated_parent − smaller_sibling` (WR-04, no 3× rebuild).
-    fn relocate_parent(parent: &BucketHistogram, n_new_leaves: usize, shift: usize) -> BucketHistogram {
-        parent.relocate(n_new_leaves, shift)
+        a.add(b)
     }
 
     /// Advance from level `L` to `L+1` after `split` is chosen. Updates `leaf_of`
@@ -768,41 +756,33 @@ impl GrowScratch {
                 .collect();
             build(&next_leaf, n_next)
         } else if n_true <= n_false {
-            // TRUE is the smaller sibling → build ONLY it (one pass) in its high
-            // slots; derive the FALSE (larger) child = parent − true from the
-            // RETAINED parent (`self.hist`), NOT a from-scratch rebuild (WR-04).
-            let true_high: Vec<usize> = (0..n_objects)
-                .map(|o| if pass(o) { pget(o) + n_parent } else { sentinel })
-                .collect();
-            let true_low: Vec<usize> = (0..n_objects)
+            // TRUE is the smaller sibling → build ONLY it ONCE (one O(n) scatter) in
+            // its low slots. Derive the FALSE (larger) child = parent − true directly
+            // from the RETAINED parent (`self.hist`) via the fused relocate_sub
+            // (relocate parent into low slots − the true sibling), then reunite with
+            // the smaller sibling relocated into the high slots — each a single
+            // allocation (WR-04, PERF-01). Three total-sized allocs, not five.
+            let true_low_assign: Vec<usize> = (0..n_objects)
                 .map(|o| if pass(o) { pget(o) } else { sentinel })
                 .collect();
-            let h_true_high = build(&true_high, n_next);
-            let h_true_low = build(&true_low, n_next);
-            // Relocate the retained parent into the child (n_next) LOW slot space —
-            // a byte-identical memcpy of already-folded cells (leaf p → low slot p).
-            let h_base_low = Self::relocate_parent(&self.hist, n_next, 0);
-            // FixUpStats: false child (larger) = parent − true sibling (smaller).
-            let h_false_low = h_base_low.remove(&h_true_low);
-            Self::hist_add(&h_false_low, &h_true_high)
+            let h_true_low = build(&true_low_assign, n_next);
+            // FALSE (larger) in low slots = relocate(parent, 0) − true_low (fused).
+            let h_false_low = self.hist.relocate_sub(n_next, 0, &h_true_low);
+            // Result = false_low (low) + relocate(true_low, n_parent) (high), fused.
+            h_false_low.add_relocated(&h_true_low, n_parent)
         } else {
-            // FALSE is the smaller sibling → build ONLY it (one pass) in its low
-            // slots; derive the TRUE (larger) child = parent − false from the
-            // RETAINED parent (`self.hist`) relocated into the HIGH slots (WR-04).
-            let false_low: Vec<usize> = (0..n_objects)
+            // FALSE is the smaller sibling → build ONLY it ONCE (one O(n) scatter) in
+            // its low slots. Derive the TRUE (larger) child = parent − false directly
+            // from the RETAINED parent relocated into the HIGH slots via the fused
+            // relocate_sub, then reunite with the smaller sibling — three allocs.
+            let false_low_assign: Vec<usize> = (0..n_objects)
                 .map(|o| if pass(o) { sentinel } else { pget(o) })
                 .collect();
-            let false_high: Vec<usize> = (0..n_objects)
-                .map(|o| if pass(o) { sentinel } else { pget(o) + n_parent })
-                .collect();
-            let h_false_low = build(&false_low, n_next);
-            let h_false_high = build(&false_high, n_next);
-            // Relocate the retained parent into the child HIGH slot space (leaf p →
-            // slot p + n_parent), a byte-identical memcpy of already-folded cells.
-            let h_base_high = Self::relocate_parent(&self.hist, n_next, n_parent);
-            // FixUpStats: true child (larger) = parent − false sibling (smaller).
-            let h_true_high = h_base_high.remove(&h_false_high);
-            Self::hist_add(&h_false_low, &h_true_high)
+            let h_false_low = build(&false_low_assign, n_next);
+            // TRUE (larger) in low slots = relocate(parent, 0) − false_low (fused).
+            let h_true_low = self.hist.relocate_sub(n_next, 0, &h_false_low);
+            // Result = false_low (low) + relocate(true_low, n_parent) (high), fused.
+            h_false_low.add_relocated(&h_true_low, n_parent)
         };
 
         // Incrementally advance the partition (forward-bit, new split highest bit).

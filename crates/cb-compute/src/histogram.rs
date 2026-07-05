@@ -240,6 +240,21 @@ impl BucketHistogram {
         Some(((leaf * self.n_features + feature) * self.n_bins + bin) * self.n_channels)
     }
 
+    /// The contiguous flat block holding ALL `(bin, channel)` cells of
+    /// `(leaf, feature)` — length `n_bins * n_channels`, or `None` if the
+    /// `(leaf, feature)` index is out of range. Within the returned slice, cell
+    /// `(bin, channel)` lives at offset `bin * n_channels + channel` (the frozen
+    /// layout: `leaf`/`feature` are the outer indices, so a fixed `(leaf, feature)`
+    /// is one contiguous run). This lets the `O(n_bins)` prefix scan read a whole
+    /// feature row with a SINGLE base computation instead of the per-cell flat-index
+    /// multiply chain of [`channel`](Self::channel) — a pure constant-factor scan
+    /// speedup (PERF-01), byte-identical values (T-21-01 defensive `get`).
+    fn feature_block(&self, leaf: usize, feature: usize) -> Option<&[f64]> {
+        let base = self.cell_base(leaf, feature, 0)?;
+        let len = self.n_bins.checked_mul(self.n_channels)?;
+        self.data.get(base..base.checked_add(len)?)
+    }
+
     /// The value of one channel of cell `(leaf, feature, bin)`. Out-of-range
     /// indices return `0.0` (an absent cell contributes nothing — mirrors the
     /// empty-leaf `LeafStats::default()` convention).
@@ -280,6 +295,162 @@ impl BucketHistogram {
             .zip(other.data.iter())
             .map(|(&a, &b)| a - b)
             .collect();
+        BucketHistogram {
+            data,
+            n_leaves: self.n_leaves,
+            n_features: self.n_features,
+            n_bins: self.n_bins,
+            n_channels: self.n_channels,
+        }
+    }
+
+    /// Elementwise `self + other` in a SINGLE pass (one allocation) — the
+    /// disjoint-slot merge a level transition needs (the FALSE child occupies the
+    /// low slots, the TRUE child the high slots, so their non-zero cells never
+    /// overlap). The two histograms MUST share the same shape; on a mismatch the
+    /// receiver is returned unchanged (defensive, T-21-02).
+    ///
+    /// Each cell is a plain f64 `+` in the frozen cell order — bit-identical to the
+    /// `a − (0 − b)` triple-`remove` identity it replaces (`a − (−b) == a + b` in
+    /// IEEE), but one pass / one allocation instead of three, which is the dominant
+    /// per-level cost at large `n_bins` (PERF-01).
+    #[must_use]
+    pub fn add(&self, other: &BucketHistogram) -> BucketHistogram {
+        if self.n_leaves != other.n_leaves
+            || self.n_features != other.n_features
+            || self.n_bins != other.n_bins
+            || self.n_channels != other.n_channels
+            || self.data.len() != other.data.len()
+        {
+            return self.clone();
+        }
+        let data: Vec<f64> = self
+            .data
+            .iter()
+            .zip(other.data.iter())
+            .map(|(&a, &b)| a + b)
+            .collect();
+        BucketHistogram {
+            data,
+            n_leaves: self.n_leaves,
+            n_features: self.n_features,
+            n_bins: self.n_bins,
+            n_channels: self.n_channels,
+        }
+    }
+
+    /// Fused `relocate(self, shift) − minus` in a SINGLE allocation: relocate this
+    /// (parent) histogram into the `n_new_leaves` layout (leaf `p` → slot `p+shift`)
+    /// and subtract `minus` (already in the `n_new_leaves` layout). This is the
+    /// subtraction-trick larger-sibling derivation (WR-04) without the intermediate
+    /// relocated-parent allocation.
+    ///
+    /// Bit-identical to `self.relocate(n_new_leaves, shift).remove(minus)`: each cell
+    /// is `relocated_parent − minus`, computed here as `(−minus) + relocated_parent`
+    /// which equals `relocated_parent − minus` exactly in IEEE (`−minus` is an exact
+    /// negation, add is commutative). Shape mismatch falls back to the explicit
+    /// two-step path (defensive, T-21-02).
+    #[must_use]
+    pub fn relocate_sub(
+        &self,
+        n_new_leaves: usize,
+        shift: usize,
+        minus: &BucketHistogram,
+    ) -> BucketHistogram {
+        let per_leaf = self
+            .n_features
+            .checked_mul(self.n_bins)
+            .and_then(|x| x.checked_mul(self.n_channels))
+            .unwrap_or(0);
+        let total = n_new_leaves.checked_mul(per_leaf).unwrap_or(0);
+        if minus.n_leaves != n_new_leaves
+            || minus.n_features != self.n_features
+            || minus.n_bins != self.n_bins
+            || minus.n_channels != self.n_channels
+            || minus.data.len() != total
+        {
+            // Defensive: explicit relocate-then-remove (same bits, one extra alloc).
+            return self.relocate(n_new_leaves, shift).remove(minus);
+        }
+        // Start from −minus, then fold in the relocated parent blocks.
+        let mut data: Vec<f64> = minus.data.iter().map(|&b| -b).collect();
+        for p in 0..self.n_leaves {
+            let dest = match p.checked_add(shift) {
+                Some(d) if d < n_new_leaves => d,
+                _ => continue,
+            };
+            let src_start = match p.checked_mul(per_leaf) {
+                Some(s) => s,
+                None => continue,
+            };
+            let dst_start = match dest.checked_mul(per_leaf) {
+                Some(s) => s,
+                None => continue,
+            };
+            let src = match self.data.get(src_start..src_start.saturating_add(per_leaf)) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(dst) = data.get_mut(dst_start..dst_start.saturating_add(per_leaf)) {
+                for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                    *d += s;
+                }
+            }
+        }
+        BucketHistogram {
+            data,
+            n_leaves: n_new_leaves,
+            n_features: self.n_features,
+            n_bins: self.n_bins,
+            n_channels: self.n_channels,
+        }
+    }
+
+    /// Fused `self + relocate(other, shift)` in a SINGLE allocation: add `other`'s
+    /// cells, relocated by `shift` (leaf `p` → slot `p+shift`), into a clone of
+    /// `self`. This reunites the smaller sibling's second (high-slot) copy with the
+    /// larger sibling without a separate relocation allocation.
+    ///
+    /// Bit-identical to `self.add(&other.relocate(self.n_leaves, shift))`: each cell
+    /// is `self + relocated_other` in the same operand order. Shape mismatch on the
+    /// per-leaf block width falls back to that explicit path (defensive, T-21-02).
+    #[must_use]
+    pub fn add_relocated(&self, other: &BucketHistogram, shift: usize) -> BucketHistogram {
+        if self.n_features != other.n_features
+            || self.n_bins != other.n_bins
+            || self.n_channels != other.n_channels
+        {
+            return self.add(&other.relocate(self.n_leaves, shift));
+        }
+        let per_leaf = self
+            .n_features
+            .checked_mul(self.n_bins)
+            .and_then(|x| x.checked_mul(self.n_channels))
+            .unwrap_or(0);
+        let mut data = self.data.clone();
+        for p in 0..other.n_leaves {
+            let dest = match p.checked_add(shift) {
+                Some(d) if d < self.n_leaves => d,
+                _ => continue,
+            };
+            let src_start = match p.checked_mul(per_leaf) {
+                Some(s) => s,
+                None => continue,
+            };
+            let dst_start = match dest.checked_mul(per_leaf) {
+                Some(s) => s,
+                None => continue,
+            };
+            let src = match other.data.get(src_start..src_start.saturating_add(per_leaf)) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(dst) = data.get_mut(dst_start..dst_start.saturating_add(per_leaf)) {
+                for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                    *d += s;
+                }
+            }
+        }
         BucketHistogram {
             data,
             n_leaves: self.n_leaves,
@@ -490,14 +661,22 @@ pub fn scan_border_to_leaf_stats(
 ) -> Vec<Vec<LeafStats>> {
     let n_parent = hist.n_leaves();
     let n_bins = hist.n_bins();
+    let n_channels = hist.n_channels();
     let weight_channel = approx_dimension; // channel index of Σ weight
     let mut out: Vec<Vec<LeafStats>> =
         vec![vec![LeafStats::default(); 2 * n_parent]; approx_dimension.max(1)];
 
     for parent in 0..n_parent {
-        // Per-bin weight row (shared across dimensions), gathered ONCE in bin order.
+        // The whole (parent, feature) block, read ONCE (constant-factor scan win):
+        // cell (bin, channel) is at `bin * n_channels + channel`. A None block means
+        // the parent/feature is out of range → all-zero row (default LeafStats).
+        let block = match hist.feature_block(parent, feature) {
+            Some(b) => b,
+            None => continue,
+        };
+        // Per-bin weight column, gathered in bin order for the ordered sum_f64.
         let bin_weight: Vec<f64> = (0..n_bins)
-            .map(|bin| hist.channel(parent, feature, bin, weight_channel))
+            .map(|bin| block.get(bin * n_channels + weight_channel).copied().unwrap_or(0.0))
             .collect();
         // FALSE = ascending running prefix over bins 0..=border (bit-identical to
         // sum_f64(bins[0..=border])). TRUE = total − prefix (the reordered complement).
@@ -507,7 +686,7 @@ pub fn scan_border_to_leaf_stats(
 
         for d in 0..approx_dimension {
             let bin_delta: Vec<f64> = (0..n_bins)
-                .map(|bin| hist.channel(parent, feature, bin, d))
+                .map(|bin| block.get(bin * n_channels + d).copied().unwrap_or(0.0))
                 .collect();
             let total_d = sum_f64(&bin_delta);
             let d_false = running_prefix(&bin_delta, border);
@@ -571,6 +750,7 @@ pub fn scan_borders_to_leaf_stats(
 ) -> Vec<Vec<Vec<LeafStats>>> {
     let n_parent = hist.n_leaves();
     let n_bins = hist.n_bins();
+    let n_channels = hist.n_channels();
     let dim = approx_dimension.max(1);
     let weight_channel = approx_dimension; // channel index of Σ weight
     let mut out: Vec<Vec<Vec<LeafStats>>> =
@@ -581,16 +761,23 @@ pub fn scan_borders_to_leaf_stats(
     let mut bin_delta = vec![vec![0.0_f64; n_bins]; approx_dimension];
 
     for parent in 0..n_parent {
-        // Gather each channel's per-bin row ONCE per (parent, feature).
+        // The whole (parent, feature) block, read ONCE (constant-factor scan win):
+        // cell (bin, channel) is at `bin * n_channels + channel`. A None block means
+        // the parent/feature is out of range → all-zero row (default LeafStats).
+        let block = match hist.feature_block(parent, feature) {
+            Some(b) => b,
+            None => continue,
+        };
+        // Gather each channel's per-bin row ONCE per (parent, feature) from the block.
         for bin in 0..n_bins {
             if let Some(slot) = bin_weight.get_mut(bin) {
-                *slot = hist.channel(parent, feature, bin, weight_channel);
+                *slot = block.get(bin * n_channels + weight_channel).copied().unwrap_or(0.0);
             }
         }
         let total_w = sum_f64(&bin_weight);
         for d in 0..approx_dimension {
             for bin in 0..n_bins {
-                let v = hist.channel(parent, feature, bin, d);
+                let v = block.get(bin * n_channels + d).copied().unwrap_or(0.0);
                 if let Some(row) = bin_delta.get_mut(d) {
                     if let Some(slot) = row.get_mut(bin) {
                         *slot = v;
