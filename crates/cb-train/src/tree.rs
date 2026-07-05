@@ -30,10 +30,11 @@
 //! `unwrap`/`expect`/raw float fold (deny-lints + D-08).
 
 use cb_compute::{
-    calculate_pairwise_score, compute_der_sums as compute_pairwise_der_sums,
-    compute_pair_weight_statistics, cosine_split_score, l2_split_score, multi_dim_split_score,
-    random_score_instance, reduce_leaf_stats, scale_l2_reg, EScoreFunction, GroupSpan, LeafStats,
-    MINIMAL_SCORE,
+    bin_of, build_bucket_histogram, calculate_pairwise_score,
+    compute_der_sums as compute_pairwise_der_sums, compute_pair_weight_statistics,
+    cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
+    reduce_leaf_stats, scale_l2_reg, scan_borders_to_leaf_stats, BucketHistogram, EScoreFunction,
+    GroupSpan, LeafStats, MINIMAL_SCORE,
 };
 
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
@@ -416,6 +417,15 @@ fn assign_leaves_any(matrix: &FeatureMatrix, splits: &[AnySplit], n_objects: usi
 /// Score one candidate split applied across the CURRENT level: extend the
 /// already-chosen `splits` with the candidate, assign leaves, reduce per-leaf
 /// stats (ordered, via `cb_compute::reduce_leaf_stats`), and fold the L2 score.
+///
+/// Retained as the REFERENCE per-candidate scorer (the per-object-order rescan) —
+/// the documented analog base for [`score_candidate_ordered`] /
+/// [`score_candidate_ctr_aware`] / [`score_candidate_any`], and (via
+/// [`multi_dim_candidate_score`]) the equivalence anchor the WR-01 unit test
+/// pins. The oblivious plain/perturbed grow path no longer calls it: it now
+/// scores from the per-level [`BucketHistogram`] prefix scan (PERF-01), so this
+/// function is not on the hot path.
+#[allow(dead_code)]
 fn score_candidate(
     matrix: &FeatureMatrix,
     chosen: &[Split],
@@ -568,15 +578,24 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 
     let mut chosen: Vec<Split> = Vec::with_capacity(depth);
 
-    for _level in 0..depth {
+    // The reusable across-level grow state (the `TLearnContext` analogue): builds
+    // the quantized bin matrix once and holds the current level's histogram, so the
+    // O(n) binning + ordered reduction is paid ONCE per level (not once per
+    // candidate). Level 0's histogram (single root leaf) is built here.
+    let mut scratch = GrowScratch::new(matrix, der1, weight, n_objects);
+
+    for level in 0..depth {
         let best = match perturb.as_mut() {
-            None => select_level_plain(
-                matrix, &chosen, der1, weight, scaled_l2, n_objects, score_function, penalties,
-            )?,
-            Some(p) => select_level_perturbed(
-                matrix, &chosen, der1, weight, scaled_l2, n_objects, p, score_function, penalties,
-            )?,
+            None => select_level_plain(matrix, &scratch, scaled_l2, score_function, penalties)?,
+            Some(p) => {
+                select_level_perturbed(matrix, &scratch, scaled_l2, p, score_function, penalties)?
+            }
         };
+        // Derive the NEXT level's histogram (subtraction trick) before scoring it;
+        // the last level has no successor, so skip its (unused) transition.
+        if level + 1 < depth {
+            scratch.advance(matrix, der1, weight, &best, n_objects);
+        }
         chosen.push(best);
     }
 
@@ -593,25 +612,200 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     })
 }
 
-/// One level of the UNPERTURBED search: enumerate candidates in upstream order
-/// — FLOAT features (feature ascending, border ascending; `AddFloatFeatures`)
-/// THEN ONE-HOT categorical features (feature ascending, bin ascending;
-/// `AddOneHotFeatures`, `greedy_tensor_search.cpp:171-197`) — score each via the
-/// L2 calcer, and pick the strict first-wins best. No RNG draws (the first-slice
-/// / D-04 path).
+/// The reusable across-level grow state (the `TLearnContext` analogue, CONTEXT
+/// §Parallelism / PERF-03). It replaces the per-candidate `assign_leaves`
+/// + `reduce_leaf_stats` full-dataset rescan with a per-LEVEL histogram:
 ///
-/// Each scored [`Candidate`] is paired with the concrete [`Split`] it represents
-/// (float or one-hot) at the same index, so the strict first-wins winner maps
-/// back to the actual split. The `Candidate::border` carries the float border for
-/// a float candidate and the categorical bin (as `f64`) for a one-hot candidate,
-/// preserving the ascending iteration order the strict `>` tie-break relies on.
+/// - `bins`: the quantized per-feature bin matrix, built ONCE at construction
+///   (feature-major `bins[feature * n_objects + obj]`, via [`bin_of`]).
+/// - `leaf_of`: the current-partition leaf index per object, maintained
+///   INCREMENTALLY (once per chosen split, forward-bit) instead of reassigned per
+///   candidate.
+/// - `hist`: the current level's per-`(leaf, feature, bin)` [`BucketHistogram`].
+///   Each candidate is scored by an `O(n_bins)` prefix scan over this histogram
+///   ([`scan_borders_to_leaf_stats`]) fed to the UNCHANGED score math — the O(n)
+///   binning cost is paid ONCE per level, not once per candidate (PERF-01).
+///
+/// The histogram is a fixed-size buffer reused across levels (no per-candidate
+/// allocation storm, Spike 004); each level transition derives the next level's
+/// histogram from the current one with the SUBTRACTION TRICK
+/// ([`GrowScratch::advance`]).
+struct GrowScratch {
+    /// Feature-major quantized bins: `bins[feature * n_objects + obj]`.
+    bins: Vec<u32>,
+    /// Current-partition leaf index per object (`0..1 << level`), incremental.
+    leaf_of: Vec<usize>,
+    /// The current level's per-`(leaf, feature, bin)` histogram.
+    hist: BucketHistogram,
+    /// Number of float features histogrammed.
+    n_features: usize,
+    /// Global bins per feature (`max(n_borders) + 1`).
+    n_bins: usize,
+    /// Approx dimension (`der1.len() / n_objects`, `1` for scalar/binary losses).
+    approx_dim: usize,
+    /// Current level (`n_leaves == 1 << level`).
+    level: usize,
+}
+
+impl GrowScratch {
+    /// Build the bin matrix and the level-0 (single root leaf) histogram once.
+    fn new(matrix: &FeatureMatrix, der1: &[f64], weight: &[f64], n_objects: usize) -> Self {
+        let n_features = matrix.n_features();
+        // Global bin width = max(n_borders)+1 over features; a feature with fewer
+        // borders simply leaves the upper bins empty (the scan walks only its own
+        // borders, so the extra width is inert — Pitfall 4 boundary via `bin_of`).
+        let n_bins = (0..n_features)
+            .map(|f| matrix.feature_borders.get(f).map_or(0, Vec::len) + 1)
+            .max()
+            .unwrap_or(1);
+        let mut bins = vec![0u32; n_features.saturating_mul(n_objects)];
+        for f in 0..n_features {
+            let borders = matrix.feature_borders.get(f).map_or(&[][..], Vec::as_slice);
+            let col = matrix.feature_values.get(f).map_or(&[][..], Vec::as_slice);
+            for obj in 0..n_objects {
+                let v = col.get(obj).copied().unwrap_or(0.0);
+                if let Some(slot) = bins.get_mut(f * n_objects + obj) {
+                    *slot = bin_of(borders, v) as u32;
+                }
+            }
+        }
+        let approx_dim = if n_objects == 0 {
+            1
+        } else {
+            (der1.len() / n_objects).max(1)
+        };
+        let leaf_of = vec![0usize; n_objects];
+        let hist =
+            build_bucket_histogram(&bins, der1, weight, &leaf_of, 1, n_features, n_bins, approx_dim);
+        Self {
+            bins,
+            leaf_of,
+            hist,
+            n_features,
+            n_bins,
+            approx_dim,
+            level: 0,
+        }
+    }
+
+    /// `a + b` composed from the sanctioned whole-histogram subtraction
+    /// ([`BucketHistogram::remove`] is the only combinator the type exposes):
+    /// `a + b = a − (0 − b)`. Used to reunite the FALSE-child (low slots) and
+    /// TRUE-child (high slots) halves of a level transition, whose non-zero cells
+    /// are disjoint. Each `remove` is a cell-wise f64 op (O(cells), independent of
+    /// `n`), so no per-object rescan is introduced.
+    fn hist_add(a: &BucketHistogram, b: &BucketHistogram) -> BucketHistogram {
+        let zero = a.remove(a);
+        let neg_b = zero.remove(b);
+        a.remove(&neg_b)
+    }
+
+    /// Advance from level `L` to `L+1` after `split` is chosen. Updates `leaf_of`
+    /// incrementally (forward-bit: the new split occupies the highest bit, so
+    /// `leaf' = leaf + (passes ? 1<<L : 0)` — byte-identical to
+    /// `assign_leaves(chosen ++ split)`) and derives the next level's histogram
+    /// with the SUBTRACTION TRICK (upstream `FixUpStats`, `scoring.cpp:315`): build
+    /// the SMALLER sibling directly and derive the LARGER = parent − smaller. Both
+    /// siblings land in their canonical forward-bit slots (false child = parent
+    /// leaf `p`, true child = `p + n_parent`), so the derived histogram is
+    /// scannable exactly like a freshly-built one.
+    fn advance(
+        &mut self,
+        matrix: &FeatureMatrix,
+        der1: &[f64],
+        weight: &[f64],
+        split: &Split,
+        n_objects: usize,
+    ) {
+        let n_parent = 1usize << self.level;
+        let n_next = n_parent << 1;
+        let dim = self.approx_dim;
+        let nf = self.n_features;
+        let nb = self.n_bins;
+        // Objects whose leaf index is >= n_leaves are ignored by the builder — the
+        // sentinel places an object OUT of the histogram (used to build one sibling).
+        let sentinel = usize::MAX;
+
+        let passes: Vec<bool> = (0..n_objects).map(|o| matrix.passes(split, o)).collect();
+        let n_true = passes.iter().filter(|&&p| p).count();
+        let n_false = n_objects.saturating_sub(n_true);
+
+        let parent = &self.leaf_of;
+        let pget = |o: usize| parent.get(o).copied().unwrap_or(0);
+        let pass = |o: usize| passes.get(o).copied().unwrap_or(false);
+        let build = |assign: &[usize], nl: usize| {
+            build_bucket_histogram(&self.bins, der1, weight, assign, nl, nf, nb, dim)
+        };
+
+        let next_hist = if self.hist.n_leaves() != n_parent {
+            // Defensive: histogram shape drifted from the tracked partition — fall
+            // back to a fresh full rebuild (still O(n)/level, T-21-05).
+            let next_leaf: Vec<usize> = (0..n_objects)
+                .map(|o| pget(o) + if pass(o) { n_parent } else { 0 })
+                .collect();
+            build(&next_leaf, n_next)
+        } else if n_true <= n_false {
+            // TRUE is the smaller sibling → build it directly in its high slots;
+            // derive the FALSE (larger) child = parent − true in its low slots.
+            let true_high: Vec<usize> = (0..n_objects)
+                .map(|o| if pass(o) { pget(o) + n_parent } else { sentinel })
+                .collect();
+            let true_low: Vec<usize> = (0..n_objects)
+                .map(|o| if pass(o) { pget(o) } else { sentinel })
+                .collect();
+            let base_low: Vec<usize> = (0..n_objects).map(pget).collect();
+            let h_true_high = build(&true_high, n_next);
+            let h_true_low = build(&true_low, n_next);
+            let h_base_low = build(&base_low, n_next);
+            // FixUpStats: false child (larger) = parent − true sibling (smaller).
+            let h_false_low = h_base_low.remove(&h_true_low);
+            Self::hist_add(&h_false_low, &h_true_high)
+        } else {
+            // FALSE is the smaller sibling → build it directly in its low slots;
+            // derive the TRUE (larger) child = parent − false in its high slots.
+            let false_low: Vec<usize> = (0..n_objects)
+                .map(|o| if pass(o) { sentinel } else { pget(o) })
+                .collect();
+            let false_high: Vec<usize> = (0..n_objects)
+                .map(|o| if pass(o) { sentinel } else { pget(o) + n_parent })
+                .collect();
+            let base_high: Vec<usize> = (0..n_objects).map(|o| pget(o) + n_parent).collect();
+            let h_false_low = build(&false_low, n_next);
+            let h_false_high = build(&false_high, n_next);
+            let h_base_high = build(&base_high, n_next);
+            // FixUpStats: true child (larger) = parent − false sibling (smaller).
+            let h_true_high = h_base_high.remove(&h_false_high);
+            Self::hist_add(&h_false_low, &h_true_high)
+        };
+
+        // Incrementally advance the partition (forward-bit, new split highest bit).
+        // Computed into a fresh buffer so the `parent`/`pget` immutable borrow above
+        // is released before the write-back.
+        let next_leaf_of: Vec<usize> = (0..n_objects)
+            .map(|o| pget(o) + if pass(o) { n_parent } else { 0 })
+            .collect();
+        self.leaf_of = next_leaf_of;
+        self.hist = next_hist;
+        self.level += 1;
+    }
+}
+
+/// One level of the UNPERTURBED search: enumerate candidates in upstream order
+/// (FLOAT features, feature ascending × border ascending; `AddFloatFeatures`),
+/// score each from the current level's [`BucketHistogram`] via an `O(n_bins)`
+/// prefix scan ([`scan_borders_to_leaf_stats`]) fed to the UNCHANGED
+/// [`multi_dim_split_score`], and pick the strict first-wins best. No RNG draws
+/// (the first-slice / D-04 path).
+///
+/// This replaces the per-candidate `assign_leaves` + `reduce_leaf_stats` rescan
+/// (PERF-01): the histogram is built once per level in [`GrowScratch`], and every
+/// candidate's `&[LeafStats]` is derived from it by the prefix scan. The candidate
+/// enumeration ORDER, the FEAT-04 penalty insertion point, and the strict `>`
+/// first-wins tie-break are byte-for-byte unchanged.
 fn select_level_plain(
     matrix: &FeatureMatrix,
-    chosen: &[Split],
-    der1: &[f64],
-    weight: &[f64],
+    scratch: &GrowScratch,
     scaled_l2: f64,
-    n_objects: usize,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
 ) -> CbResult<Split> {
@@ -619,20 +813,22 @@ fn select_level_plain(
     // supplied; otherwise the candidate scores stay byte-identical to the pre-6.6
     // path (D-6.6-05 — gate on the param being non-empty).
     let active_penalties = penalties.filter(|p| !p.is_noop());
+    let dim = scratch.approx_dim;
     let mut candidates: Vec<Candidate> = Vec::new();
     for feature in 0..matrix.n_features() {
         let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-        for &border in borders {
-            let raw = score_candidate(
-                matrix,
-                chosen,
-                Split { feature, border },
-                der1,
-                weight,
-                scaled_l2,
-                n_objects,
-                score_function,
-            );
+        if borders.is_empty() {
+            continue;
+        }
+        // ONE O(n_bins) prefix scan per border, derived from the per-level
+        // histogram (not a per-candidate dataset rescan).
+        let scans = scan_borders_to_leaf_stats(&scratch.hist, feature, borders.len(), dim);
+        for (bi, &border) in borders.iter().enumerate() {
+            let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
+            // UNCHANGED score math over the scan-derived per-dimension LeafStats —
+            // the same call the prior `multi_dim_candidate_score` made (dim=1 is
+            // byte-identical to the scalar split, D-04).
+            let raw = multi_dim_split_score(score_function, per_dim, scaled_l2);
             // FEAT-04: multiplicative feature_weight + subtractive first-use /
             // per-object penalties (the two upstream insertion points). The no-op
             // context leaves `raw` untouched.
@@ -659,13 +855,16 @@ fn select_level_plain(
 /// One level of the PERTURBED search reproducing the upstream two-pass draw order
 /// (`SetBestScore` then `SelectBestCandidate`, Pitfall 3). See
 /// [`greedy_tensor_search_oblivious_perturbed`] for the draw contract.
+///
+/// Only the SOURCE of each candidate's RAW score changes (histogram prefix scan
+/// instead of the per-candidate rescan); the per-level `gen_rand`, the per-feature
+/// `from_seed(rand_seed + task_idx).advance(10)` reseed, the one `std_normal` per
+/// border, the per-feature `feature_best` bookkeeping, and the per-feature main-RNG
+/// `GetInstance` are byte-for-byte the same draw sequence and count (Pitfall 3).
 fn select_level_perturbed(
     matrix: &FeatureMatrix,
-    chosen: &[Split],
-    der1: &[f64],
-    weight: &[f64],
+    scratch: &GrowScratch,
     scaled_l2: f64,
-    n_objects: usize,
     perturb: &mut Perturbation<'_>,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
@@ -677,6 +876,7 @@ fn select_level_perturbed(
     // score (`PenalizeBestSplits`). A no-op (or absent) context leaves the score
     // untouched, so the unpenalized perturbed path is byte-identical (D-6.6-05).
     let active_penalties = penalties.filter(|p| !p.is_noop());
+    let dim = scratch.approx_dim;
 
     // (1) randSeed = Rand.GenRand() — one main-RNG draw per level (CalcScores).
     let rand_seed = perturb.rng.gen_rand();
@@ -699,20 +899,15 @@ fn select_level_perturbed(
         feat_rng.advance(10);
         task_idx += 1;
 
+        // ONE O(n_bins) prefix scan per border, from the per-level histogram — the
+        // per-border loop shape (and thus the RNG draw count/order) is untouched.
+        let scans = scan_borders_to_leaf_stats(&scratch.hist, feature, borders.len(), dim);
         let mut best_instance = MINIMAL_SCORE;
         let mut best_border: f64 = 0.0;
         let mut best_raw: f64 = MINIMAL_SCORE;
-        for &border in borders {
-            let raw = score_candidate(
-                matrix,
-                chosen,
-                Split { feature, border },
-                der1,
-                weight,
-                scaled_l2,
-                n_objects,
-                score_function,
-            );
+        for (bi, &border) in borders.iter().enumerate() {
+            let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
+            let raw = multi_dim_split_score(score_function, per_dim, scaled_l2);
             // scoreInstance = scoreWoNoise + std_normal(featRng) * scoreStDev.
             let instance = random_score_instance(raw, std_dev, &mut feat_rng);
             // Strict `>` first-wins on the per-feature border (SetBestScore).
@@ -1501,6 +1696,16 @@ fn ordered_segment_leaf_stats(
 
     Ok(reduce_leaf_stats(&seg_leaf_of, &seg_der, &seg_weight, n_leaves))
 }
+
+// DEFERRAL (Phase 21 → Phase 22): the ordered-boosting split search
+// (`score_candidate_ordered` / `select_level_ordered` below) is INTENTIONALLY left
+// on its per-segment `assign_leaves` + `reduce_leaf_stats` rescan this phase. The
+// Phase-21 histogram rewrite (PERF-01/02) targets the DEFAULT oblivious
+// plain/perturbed path (`select_level_plain` / `select_level_perturbed`); a
+// per-segment prefix-histogram for the ordered path is additional scope (each
+// `(body_finish, tail_finish)` segment needs its own bucket accumulation). Parity
+// is trivially preserved because this code is untouched; the residual ordered-path
+// slowness is tracked for Phase 22 (RESEARCH Open Question 1 / A2).
 
 /// Score one candidate split with the ORDERED per-segment sum (the ordered analog
 /// of [`score_candidate`]): extend `chosen` with `candidate`, assign leaves over
