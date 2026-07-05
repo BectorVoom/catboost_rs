@@ -26,6 +26,7 @@
 //! it with a typed error, never a JIT crash).
 #![cfg(not(feature = "wgpu"))]
 
+use crate::gpu_runtime::{select_best_candidate, REL_TOL};
 use crate::kernels::cholesky_solve::{score_pairwise_cholesky_host, solve_pairwise_leaf_values_host};
 use cb_compute::pairwise_cholesky_solve;
 
@@ -232,6 +233,89 @@ fn device_split_score_matches_cpu() {
              (device={device_score}, cpu={cpu_score})"
         );
     }
+}
+
+/// The naive exact-`==` argmax the RV-13-04 fix REPLACED (strict-`>` first-wins, no tolerance band).
+/// Kept HERE in the oracle only, to DEMONSTRATE the hazard: it flips its winner across the
+/// device-Cholesky vs host-scorer accumulation orders on genuinely-tied borders, whereas
+/// `select_best_candidate` does not.
+fn exact_argmax(scores: &[f64], cand_idxs: &[u32]) -> u32 {
+    let mut best_c = u32::MAX;
+    let mut best_score = f64::NEG_INFINITY;
+    for &cand in cand_idxs.iter() {
+        let score = match scores.get(cand as usize) {
+            Some(&s) => s,
+            None => continue,
+        };
+        if score > best_score || (score == best_score && cand < best_c) {
+            best_score = score;
+            best_c = cand;
+        }
+    }
+    best_c
+}
+
+/// Test 4 (RV-13-04): the pairwise split argmax tie-break is near-equal-tolerant and
+/// lowest-index-deterministic, so the device-Cholesky path and the frozen wgpu host-scorer path —
+/// which accumulate the per-candidate f64 score in different orders and land ~1e-13 apart on
+/// genuinely-tied borders — select the SAME border. The two leading borders' TRUE scores are EQUAL
+/// (well within the `REL_TOL` band, NOT well-separated — Pitfall 4); one score vector models the
+/// device-Cholesky accumulation order, the other the host-scorer order.
+///
+/// The oracle is non-tautological: the naive exact-`==` argmax the fix replaced FLIPS its winner
+/// across the two orders (device → 0, host → 1), while `select_best_candidate` agrees on the lowest
+/// index for both. A structural (index-equality) assert, so it runs on ALL backends.
+#[test]
+fn pairwise_near_equal_border_tiebreak() {
+    let cand_idxs = [0u32, 1u32];
+
+    // Two GENUINELY-tied borders (true scores equal at 10.0). The device-Cholesky and host-scorer
+    // orders each add ~1e-13 accumulation noise (a few ULP at magnitude 10) — enough to make border 1
+    // numerically larger under one order and border 0 larger under the other. Both deltas sit far
+    // inside the REL_TOL band (rel_tol·max ≈ 1e-9·10 = 1e-8 ≫ 1e-13).
+    let base = 10.0_f64;
+    let scores_device = [base + 1e-13, base - 1e-13]; // device order: border 0 numerically larger.
+    let scores_host = [base - 1e-13, base + 2e-13]; // host order: border 1 numerically larger.
+
+    // The near-equal deltas must actually be within the tolerance band (Pitfall 4 — not separated).
+    for s in [&scores_device, &scores_host] {
+        let band = REL_TOL * s[0].abs().max(s[1].abs()).max(1.0);
+        let delta = (s[0] - s[1]).abs();
+        assert!(
+            delta <= band,
+            "fixture borders must be near-equal (delta {delta:e} <= band {band:e})"
+        );
+    }
+
+    // The tolerant selector picks the SAME lowest border for BOTH accumulation orders.
+    let dev = select_best_candidate(&scores_device, &cand_idxs, REL_TOL);
+    let host = select_best_candidate(&scores_host, &cand_idxs, REL_TOL);
+    assert_eq!(dev, host, "device-Cholesky and host-scorer orders must select the same border");
+    assert_eq!(dev, 0, "on a near-equal tie the LOWEST candidate index wins (first-wins parity)");
+
+    // Demonstrate the hazard the fix removes: the exact-`==` argmax FLIPS across the two orders.
+    let exact_dev = exact_argmax(&scores_device, &cand_idxs);
+    let exact_host = exact_argmax(&scores_host, &cand_idxs);
+    assert_ne!(
+        exact_dev, exact_host,
+        "sanity: the replaced exact-== argmax must flip across accumulation orders (proves the oracle bites)"
+    );
+
+    // Regression: WELL-SEPARATED borders still select the strictly-higher score (border 1),
+    // order-independent, and the tolerant selector agrees with the exact one here.
+    let separated = [5.0_f64, 10.0_f64];
+    let sep = select_best_candidate(&separated, &cand_idxs, REL_TOL);
+    assert_eq!(sep, 1, "well-separated: the strictly-higher border wins");
+    assert_eq!(
+        sep,
+        exact_argmax(&separated, &cand_idxs),
+        "well-separated: tolerant and exact selectors must agree"
+    );
+
+    println!(
+        "[cholesky_solve] RV-13-04 tie-break: device={dev} host={host} (exact flip {exact_dev}->{exact_host}); \
+         separated winner={sep} (REL_TOL={REL_TOL:e})"
+    );
 }
 
 /// Test 3 (degenerate): a non-positive-definite system (all-zero weight sums, no ridge) returns the

@@ -1798,6 +1798,54 @@ fn launch_pairwise_split_score_into(
     })
 }
 
+/// Relative tie band for the pairwise split argmax (RV-13-04). The device f64 Cholesky solve and
+/// the frozen wgpu host scorer accumulate the per-candidate score in DIFFERENT orders, so two
+/// genuinely-equal borders can land ~1e-13 apart (a few ULP at score magnitudes ~1e0..1e1). Sized
+/// well above that observed device-vs-host delta yet far below any real score gap, so near-equal
+/// borders resolve deterministically by lowest index (accumulation-order-agnostic) while
+/// well-separated borders still pick the strictly-higher score.
+pub(crate) const REL_TOL: f64 = 1e-9;
+
+/// Deterministic, accumulation-order-agnostic best-candidate selector (RV-13-04). Scans the
+/// nominated `cand_idxs` over the exact host-resident f64 `scores` and returns the winning candidate
+/// index (`u32::MAX` when none qualifies — empty set or every index out of range).
+///
+/// Two candidate scores are treated as TIED when `|a - b| <= rel_tol * max(|a|, |b|, 1.0)`; on a tie
+/// the LOWEST candidate index wins (the strict first-wins parity contract). Otherwise the strictly
+/// greater score wins. This makes the winner independent of whether `scores` came from the device
+/// Cholesky order or the frozen host-scorer order — the two only differ within the tie band, so both
+/// select the same border. This is the SINGLE source of truth: production
+/// [`select_best_split_over_scores`] and the sibling oracle both call it (no divergent copy).
+pub(crate) fn select_best_candidate(scores: &[f64], cand_idxs: &[u32], rel_tol: f64) -> u32 {
+    let mut best_c = u32::MAX;
+    let mut best_score = f64::NEG_INFINITY;
+    for &cand in cand_idxs.iter() {
+        let score = match scores.get(cand as usize) {
+            Some(&s) => s,
+            None => continue, // out-of-range nominee (structural artifact): skip, never index-panic.
+        };
+        if best_c == u32::MAX {
+            best_c = cand;
+            best_score = score;
+            continue;
+        }
+        let band = rel_tol * best_score.abs().max(score.abs()).max(1.0);
+        let tied = (score - best_score).abs() <= band;
+        let take = if tied {
+            // Near-equal borders: keep the LOWEST candidate index (order-agnostic, first-wins).
+            cand < best_c
+        } else {
+            // Well-separated: the strictly-greater score wins (regression-preserving).
+            score > best_score
+        };
+        if take {
+            best_c = cand;
+            best_score = score;
+        }
+    }
+    best_c
+}
+
 /// Run the device [`select_best_split_kernel`] over a host-solved per-candidate score
 /// vector and finish the O(blocks) across-block argmax host-side with the SAME
 /// lowest-index tie-break (== `select_best_candidate`). Returns the winning
@@ -1873,29 +1921,20 @@ fn select_best_split_over_scores(
     // actual comparison and tie-break MUST use the exact host-resident f64 `scores`
     // (WR-03 / IN-01), never the f32-collapsed device `gain`. Two host-distinct f64
     // scores can collapse to one f32 tie on-device and then resolve by index, picking a
-    // different split than the CPU oracle's strict-`>` over f64. Re-resolving over f64
-    // `scores` here removes that near-tie flip risk; `best_gains` is intentionally not
+    // different split than the CPU oracle over f64. `best_gains` is intentionally not
     // read for the comparison (it stays the device round-trip's structural artifact).
-    // Highest score wins; on an EXACT f64 tie the LOWER candidate index wins (strict
-    // first-wins parity == select_best_candidate).
+    //
+    // RV-13-04: the winner is chosen by `select_best_candidate`, a near-equal-tolerant,
+    // lowest-index-deterministic rule (single source of truth, also unit-oracled). Two
+    // genuinely-equal borders that land ~1e-13 apart under the device-Cholesky vs frozen
+    // host-scorer accumulation orders fall inside `REL_TOL` and resolve to the SAME lowest
+    // index — removing the near-tie flip risk that an exact-`==` tie-break carried.
     let _ = &best_gains; // device-reduced gains: structural artifact only (see WR-03).
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_c = u32::MAX;
-    for &cand in best_idxs.iter() {
-        if (cand as usize) >= n_candidates {
-            continue;
-        }
-        // Exact host f64 score for this nominated candidate.
-        let score = match scores.get(cand as usize) {
-            Some(&s) => s,
-            None => continue,
-        };
-        let take = score > best_score || (score == best_score && cand < best_c);
-        if take {
-            best_score = score;
-            best_c = cand;
-        }
-    }
+    let best_c = select_best_candidate(scores, &best_idxs, REL_TOL);
+    let best_score = scores
+        .get(best_c as usize)
+        .copied()
+        .unwrap_or(f64::NEG_INFINITY);
 
     if (best_c as usize) < n_candidates && n_splits > 0 {
         let feature = (best_c as usize) / n_splits;
