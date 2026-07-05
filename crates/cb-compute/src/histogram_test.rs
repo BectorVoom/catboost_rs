@@ -3,8 +3,10 @@
 
 use crate::histogram::{
     bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
-    BucketHistogram, LeafStats,
+    scan_border_to_leaf_stats, BucketHistogram, LeafStats,
 };
+use crate::runtime::EScoreFunction;
+use crate::score::{l2_split_score, multi_dim_split_score};
 
 #[test]
 fn reduce_leaf_stats_groups_by_leaf() {
@@ -195,4 +197,122 @@ fn bucket_histogram_remove_equals_fresh_sibling() {
 
     let sibling = parent.remove(&child);
     assert_eq!(sibling, sibling_fresh);
+}
+
+/// Local transcription of the forward-bit `leaf_index` (tree.rs:284): split `i`
+/// occupies bit `i` (so the appended candidate takes the highest bit) — the
+/// reference the histogram prefix scan must reproduce WITHOUT depending on
+/// cb-train (cb-train depends on cb-compute; importing it would be circular).
+fn leaf_index_ref(passes: &[bool]) -> usize {
+    let mut idx = 0usize;
+    for (i, &p) in passes.iter().enumerate() {
+        if p {
+            idx |= 1usize << i;
+        }
+    }
+    idx
+}
+
+/// Feature-major bin matrix for `feature_values`/`feature_borders` (bin_of per cell).
+fn bin_matrix(feature_values: &[Vec<f32>], feature_borders: &[Vec<f64>], n: usize) -> Vec<u32> {
+    let n_features = feature_values.len();
+    let mut bins = vec![0u32; n_features * n];
+    for f in 0..n_features {
+        for obj in 0..n {
+            bins[f * n + obj] = bin_of(&feature_borders[f], feature_values[f][obj]) as u32;
+        }
+    }
+    bins
+}
+
+#[test]
+fn scan_border_matches_rescan_scalar() {
+    // 8 objects, feature 0 = chosen split, feature 1 = candidate borders.
+    let n = 8;
+    let der1 = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0, 4.0, -0.5];
+    let weight = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let borders0 = vec![2.0_f64];
+    let borders1 = vec![1.0_f64, 3.0];
+    let f0 = vec![1.0_f32, 3.0, 2.5, 0.0, 4.0, 1.5, 3.5, 2.0];
+    let f1 = vec![0.5_f32, 2.0, 4.0, 1.0, 3.5, 0.0, 2.5, 5.0];
+    let feature_values = vec![f0.clone(), f1.clone()];
+    let feature_borders = vec![borders0.clone(), borders1.clone()];
+    let n_features = 2;
+    let n_bins = borders0.len().max(borders1.len()) + 1; // uniform per-feature bin count
+
+    // Parent partition from the chosen split on feature 0.
+    let leaf_of: Vec<usize> = (0..n)
+        .map(|o| usize::from(f64::from(f0[o]) > borders0[0]))
+        .collect();
+    let bins = bin_matrix(&feature_values, &feature_borders, n);
+    let hist = build_bucket_histogram(&bins, &der1, &weight, &leaf_of, 2, n_features, n_bins, 1);
+
+    let scaled_l2 = 1.0;
+    for (b, &brd) in borders1.iter().enumerate() {
+        // Histogram path.
+        let per_dim = scan_border_to_leaf_stats(&hist, 1, b, 1);
+        let hist_leaves = &per_dim[0];
+        // Rescan reference: chosen(feature0) ++ candidate(feature1, border b).
+        let leaf_of_cand: Vec<usize> = (0..n)
+            .map(|o| {
+                let p0 = f64::from(f0[o]) > borders0[0];
+                let p1 = f64::from(f1[o]) > brd;
+                leaf_index_ref(&[p0, p1])
+            })
+            .collect();
+        let ref_leaves = reduce_leaf_stats(&leaf_of_cand, &der1, &weight, 4);
+        assert_eq!(hist_leaves, &ref_leaves, "LeafStats border {b}");
+        // Candidate score bit-exact.
+        let hist_score = l2_split_score(hist_leaves, scaled_l2);
+        let ref_score = l2_split_score(&ref_leaves, scaled_l2);
+        assert_eq!(hist_score, ref_score, "score border {b}");
+    }
+}
+
+#[test]
+fn scan_border_matches_rescan_multiclass() {
+    // approx_dimension = 2; der1 dimension-major (der[d*n + obj]).
+    let n = 8;
+    let der_d0 = [1.0, -2.0, 3.0, 0.5, -1.5, 2.0, 4.0, -0.5];
+    let der_d1 = [-0.5, 1.5, -1.0, 2.0, 0.5, -3.0, 1.0, 2.5];
+    let mut der1 = Vec::with_capacity(2 * n);
+    der1.extend_from_slice(&der_d0);
+    der1.extend_from_slice(&der_d1);
+    let weight = vec![1.0_f64; n];
+    let borders0 = vec![2.0_f64];
+    let borders1 = vec![1.0_f64, 3.0];
+    let f0 = vec![1.0_f32, 3.0, 2.5, 0.0, 4.0, 1.5, 3.5, 2.0];
+    let f1 = vec![0.5_f32, 2.0, 4.0, 1.0, 3.5, 0.0, 2.5, 5.0];
+    let feature_values = vec![f0.clone(), f1.clone()];
+    let feature_borders = vec![borders0.clone(), borders1.clone()];
+    let n_features = 2;
+    let n_bins = borders0.len().max(borders1.len()) + 1;
+
+    let leaf_of: Vec<usize> = (0..n)
+        .map(|o| usize::from(f64::from(f0[o]) > borders0[0]))
+        .collect();
+    let bins = bin_matrix(&feature_values, &feature_borders, n);
+    let hist = build_bucket_histogram(&bins, &der1, &weight, &leaf_of, 2, n_features, n_bins, 2);
+
+    let scaled_l2 = 1.0;
+    for (b, &brd) in borders1.iter().enumerate() {
+        let per_dim = scan_border_to_leaf_stats(&hist, 1, b, 2);
+        // Rescan reference per dimension.
+        let leaf_of_cand: Vec<usize> = (0..n)
+            .map(|o| {
+                let p0 = f64::from(f0[o]) > borders0[0];
+                let p1 = f64::from(f1[o]) > brd;
+                leaf_index_ref(&[p0, p1])
+            })
+            .collect();
+        let ref_dim0 = reduce_leaf_stats(&leaf_of_cand, &der_d0, &weight, 4);
+        let ref_dim1 = reduce_leaf_stats(&leaf_of_cand, &der_d1, &weight, 4);
+        assert_eq!(&per_dim[0], &ref_dim0, "dim0 border {b}");
+        assert_eq!(&per_dim[1], &ref_dim1, "dim1 border {b}");
+        // Cross-dimension Cosine score bit-exact through the UNCHANGED score math.
+        let ref_per_dim = vec![ref_dim0, ref_dim1];
+        let hist_score = multi_dim_split_score(EScoreFunction::Cosine, &per_dim, scaled_l2);
+        let ref_score = multi_dim_split_score(EScoreFunction::Cosine, &ref_per_dim, scaled_l2);
+        assert_eq!(hist_score, ref_score, "multiclass score border {b}");
+    }
 }

@@ -39,7 +39,7 @@ pub use embedding_calcers::{
 };
 pub use histogram::{
     bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
-    BucketHistogram, LeafStats,
+    scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram, LeafStats,
 };
 pub use lda_linalg::{
     calculate_projection, jacobi_symmetric_eig, reduce_generalized, sgemv_rowmajor, SymmetricEig,

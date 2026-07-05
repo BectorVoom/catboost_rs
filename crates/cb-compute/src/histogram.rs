@@ -400,3 +400,91 @@ pub fn build_bucket_histogram(
         n_channels,
     }
 }
+
+/// The `O(n_bins)` prefix scan for ONE candidate border on `feature`: split every
+/// existing leaf into its FALSE child (`bins <= border`) and TRUE child
+/// (`bins > border`) and emit the per-dimension canonical-leaf-order [`LeafStats`]
+/// array ready for [`crate::multi_dim_split_score`] / [`crate::l2_split_score`].
+///
+/// The returned `Vec` is indexed `[dimension]`; each inner `Vec<LeafStats>` is in
+/// canonical leaf order of length `2 * hist.n_leaves()`: index `parent` is the
+/// FALSE child of parent leaf `parent`, index `parent + n_leaves` is its TRUE
+/// child. This matches the forward-bit `leaf_index` convention (`tree.rs:284`)
+/// where the new candidate occupies the highest bit
+/// (`leaf = parent + (candidate ? n_leaves_parent : 0)`) — so the order is
+/// byte-for-byte the `assign_leaves(chosen ++ candidate)` + [`reduce_leaf_stats`]
+/// order the current `score_candidate` produces.
+///
+/// Buckets are combined via [`cb_core::sum_f64`] in ascending bin order (matching
+/// upstream `CalcScoresForLeaf`): the FALSE child is the ordered sum over bins
+/// `0..=border`, the TRUE child over bins `border+1..n_bins`. On a benign fixture
+/// (values exactly representable) this is bit-exact to the object-order
+/// [`reduce_leaf_stats`] fold (RESEARCH: the equivalence is proven on such
+/// fixtures; adversarial ULP ties are gated by the downstream oracle suite,
+/// Pitfall 1).
+#[must_use]
+pub fn scan_border_to_leaf_stats(
+    hist: &BucketHistogram,
+    feature: usize,
+    border: usize,
+    approx_dimension: usize,
+) -> Vec<Vec<LeafStats>> {
+    let n_parent = hist.n_leaves();
+    let n_bins = hist.n_bins();
+    let weight_channel = approx_dimension; // channel index of Σ weight
+    let mut out: Vec<Vec<LeafStats>> =
+        vec![vec![LeafStats::default(); 2 * n_parent]; approx_dimension.max(1)];
+
+    for parent in 0..n_parent {
+        // Per-bin weight row (shared across dimensions), gathered in bin order.
+        let bin_weight: Vec<f64> = (0..n_bins)
+            .map(|bin| hist.channel(parent, feature, bin, weight_channel))
+            .collect();
+        // FALSE = Σ bins <= border ; TRUE = Σ bins > border, both ascending order.
+        let w_false = sum_f64(bin_weight.get(0..=border).unwrap_or(&[]));
+        let w_true = sum_f64(bin_weight.get(border.saturating_add(1)..n_bins).unwrap_or(&[]));
+
+        for d in 0..approx_dimension {
+            let bin_delta: Vec<f64> = (0..n_bins)
+                .map(|bin| hist.channel(parent, feature, bin, d))
+                .collect();
+            let d_false = sum_f64(bin_delta.get(0..=border).unwrap_or(&[]));
+            let d_true =
+                sum_f64(bin_delta.get(border.saturating_add(1)..n_bins).unwrap_or(&[]));
+            let false_stats = LeafStats {
+                sum_weighted_delta: d_false,
+                sum_weight: w_false,
+            };
+            let true_stats = LeafStats {
+                sum_weighted_delta: d_true,
+                sum_weight: w_true,
+            };
+            if let Some(row) = out.get_mut(d) {
+                if let Some(slot) = row.get_mut(parent) {
+                    *slot = false_stats;
+                }
+                if let Some(slot) = row.get_mut(parent + n_parent) {
+                    *slot = true_stats;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Convenience wrapper over [`scan_border_to_leaf_stats`]: the full `O(n_borders)`
+/// scan across all `n_borders` candidate thresholds of `feature`, returning one
+/// per-dimension canonical-leaf-order [`LeafStats`] set PER border. The result is
+/// indexed `[border][dimension]`; `result[b]` is directly consumable by
+/// [`crate::multi_dim_split_score`] for candidate border `b`.
+#[must_use]
+pub fn scan_borders_to_leaf_stats(
+    hist: &BucketHistogram,
+    feature: usize,
+    n_borders: usize,
+    approx_dimension: usize,
+) -> Vec<Vec<Vec<LeafStats>>> {
+    (0..n_borders)
+        .map(|border| scan_border_to_leaf_stats(hist, feature, border, approx_dimension))
+        .collect()
+}
