@@ -122,7 +122,15 @@ mod bench {
     }
 
     pub fn run() {
-        let depth = 6usize;
+        // BENCH-02 grow depth is configurable via `BENCH_DEPTH` (default 6, so the
+        // existing Phase-12/13 depth-6 provenance is byte-unchanged when the var is
+        // unset). Phase-15's single-session oracle drives the depth-1 and depth-6
+        // rows in one kernel run by setting `BENCH_DEPTH` per row (D-07). Depth-1 is
+        // the launch-overhead-bound stump measured on the large-n SPEED_CONFIG.
+        let depth: usize = std::env::var("BENCH_DEPTH")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(6);
         let iters = 20usize;
         let nf = 20usize;
         let nbins = 32usize;
@@ -150,7 +158,7 @@ mod bench {
                 let speedup = if dev_s > 0.0 { cpu_s / dev_s } else { f64::NAN };
                 println!(
                     "BENCH family={label} n={n} device_s={dev_s:.4} cpu_s={cpu_s:.4} \
-                     speedup={speedup:.3}x dev_trees={dtrees} cpu_trees={ctrees}"
+                     speedup={speedup:.3}x dev_trees={dtrees} cpu_trees={ctrees} depth={depth}"
                 );
             }
         }
