@@ -47,7 +47,7 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
 
 **Milestone-wide context carried into every phase:** Kaggle CUDA is the SOLE authoritative GPU oracle (ROCm in-env = non-gating smoke); export uses an **export-specific float32 tolerance** oracled vs CatBoost's own ONNX/CoreML export in the target runtime (NOT the ≤10⁻⁵ double bar); FEAT-07 oracles the per-object **neighbor set** index-for-index; GPU-infer reuses the v1.1 fixed-point-u64 deterministic reduction + `f32::MIN` sentinel; **never add a `cb-train` dependency to `cb-backend`** (feature-unification landmine); new backend-bearing crates keep `default-features=false` / no unconditional `cpu`.
 
-- [ ] **Phase 15: Debt Discharge & CUDA Oracle Re-establishment** — GPUT-14 aggregate ε=1e-4 sign-off, Phase-10/11 BENCH-02 rows, RV-13-01..04 hazards; re-establishes the trusted CUDA oracle everything downstream rests on
+- [x] **Phase 15: Debt Discharge & CUDA Oracle Re-establishment** — GPUT-14 aggregate ε=1e-4 sign-off, Phase-10/11 BENCH-02 rows, RV-13-01..04 hazards; re-establishes the trusted CUDA oracle everything downstream rests on (completed 2026-07-05)
 - [ ] **Phase 16: Online-HNSW KNN Estimated-Feature Parity** — bit-for-bit port of upstream `online_hnsw` closing the last open ≤10⁻⁵ CPU parity gap (parallel with Phase 15, different crates)
 - [ ] **Phase 17: Model Export — ONNX + CoreML** — read-only float-only exporters with upstream guards, oracled under an export-specific tolerance
 - [ ] **Phase 18: Extended Feature Importance** — Interaction, LossFunctionChange, partial-dependence (parallel with Phase 17)
@@ -68,7 +68,7 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
   2. Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 speed rows are executed on Kaggle CUDA and the BENCH-03 aggregate is recomputed from real numbers with no stitched Phase-12/13-only gaps (HARD-02)
   3. Each RV-13-01..04 latent parity hazard is either fixed (with an oracle demonstrating the fix) or explicitly retired with recorded evidence (HARD-03)
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans complete
 Plans:
 **Wave 1**
 
@@ -81,7 +81,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 15-04-PLAN.md — 15-EVIDENCE.md + BENCH-03 recompute in place + REQUIREMENTS/MILESTONES/STATE bookkeeping flip [Wave 3, HARD-01/02/03]
+- [x] 15-04-PLAN.md — 15-EVIDENCE.md + BENCH-03 recompute in place + REQUIREMENTS/MILESTONES/STATE bookkeeping flip [Wave 3, HARD-01/02/03]
 
 **Context**: Mostly Kaggle CUDA job execution + contained `cb-backend`/`cb-train` fixes — high de-risking, low code-change risk. ROCm in-env is non-gating. This phase re-establishes the CUDA oracle before anyone benchmarks against it (avoids the benchmark-baseline-confusion pitfall).
 
@@ -181,7 +181,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 |-------|-----------|----------------|--------|-----------|
 | 1–8 (Core Parity) | v1.0 | — | Complete | 2026-06-28 |
 | 10–14 (GPU Performance) | v1.1 | — | Complete | 2026-07-05 |
-| 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 3/4 | In Progress|  |
+| 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 4/4 | Complete   | 2026-07-05 |
 | 16. Online-HNSW KNN Estimated-Feature Parity | v1.2 | 0/TBD | Not started | - |
 | 17. Model Export — ONNX + CoreML | v1.2 | 0/TBD | Not started | - |
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |
