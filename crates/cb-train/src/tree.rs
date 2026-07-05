@@ -33,8 +33,8 @@ use cb_compute::{
     bin_of, build_bucket_histogram, calculate_pairwise_score,
     compute_der_sums as compute_pairwise_der_sums, compute_pair_weight_statistics,
     cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
-    reduce_leaf_stats, scale_l2_reg, scan_borders_to_leaf_stats, BucketHistogram, EScoreFunction,
-    GroupSpan, LeafStats, MINIMAL_SCORE,
+    reduce_leaf_stats, scale_l2_reg, scan_border_to_leaf_stats, scan_borders_to_leaf_stats,
+    BucketHistogram, EScoreFunction, GroupSpan, LeafStats, MINIMAL_SCORE,
 };
 
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
@@ -2028,29 +2028,118 @@ fn assign_leaves_ctr_aware(
         .collect()
 }
 
-/// Score one [`CtrAwareSplit`] candidate applied across the CURRENT level (the
-/// CTR-aware analog of [`score_candidate`]): extend the chosen splits with the
-/// candidate, assign leaves, reduce per-leaf stats (ordered), and fold the SAME
-/// L2 score the float path uses (`l2_split_score` over `reduce_leaf_stats` — NOT
-/// a forked scorer).
-#[allow(clippy::too_many_arguments)]
-fn score_candidate_ctr_aware(
+/// Build the ONE per-level [`BucketHistogram`] the CTR-aware level search scores
+/// every candidate from — over the CURRENT partition (`chosen`) and the UNION of
+/// the FLOAT feature columns (bins via [`bin_of`] over `feature_borders`) AND the
+/// materialized CTR bin columns ([`crate::ctr::CtrFeatureColumn::bins`], the
+/// integer CTR bins fed DIRECTLY as their own histogram bin — the `ctr_bin > b`
+/// test is the same prefix-scan boundary as a float `bins > b`, RESEARCH
+/// §Coverage / Pitfall 4). This replaces the per-candidate `assign_leaves_ctr_aware`
+/// + `reduce_leaf_stats` full-dataset rescan (PERF-02): the `O(n)` binning +
+/// ordered reduction is paid ONCE per level, then every candidate comes from an
+/// `O(n_bins)` prefix scan ([`score_candidate_ctr_aware`]).
+///
+/// The combined histogram lays the float features first (indices `0..n_float`,
+/// matching [`FeatureMatrix::n_features`]) then the CTR columns
+/// (`n_float + col`), so a float candidate scans feature `feature` and a CTR
+/// candidate on column `col` scans feature `n_float + col`. The partition is the
+/// SAME [`assign_leaves_ctr_aware`] forward-bit leaf order the once-per-tree final
+/// assignment uses, so the scan's `[false, true]` children are byte-for-byte the
+/// leaves `reduce_leaf_stats(assign_leaves_ctr_aware(chosen ++ candidate))`
+/// produced. The CTR path scores single-dimension der1 (`approx_dim == 1`, the
+/// `reduce_leaf_stats` + `split_score` scalar contract) so the histogram carries
+/// one delta channel + one shared weight channel.
+fn build_ctr_aware_histogram(
     matrix: &FeatureMatrix,
     ctr_features: &[crate::ctr::CtrFeatureColumn],
+    ctr_border_count: usize,
     chosen: &[CtrAwareSplit],
-    candidate: CtrAwareSplit,
     der1: &[f64],
     weight: &[f64],
-    scaled_l2: f64,
     n_objects: usize,
+) -> BucketHistogram {
+    let n_float = matrix.n_features();
+    let n_ctr = ctr_features.len();
+    let n_features = n_float + n_ctr;
+    let approx_dim = 1usize;
+
+    // Global bin width across BOTH kinds of feature. Float feature `f` needs
+    // `n_borders(f) + 1` bins. A CTR column needs enough bins for (a) its highest
+    // actual bin value and (b) the scan's highest border index `ctr_border_count - 1`
+    // (the `.get(0..=border)` false-side slice must stay in range even when no
+    // object reaches that bin) — `ctr_border_count + 1` bounds both since CTR bins
+    // live in `[0, ctr_border_count]`. Extra empty upper bins contribute `0.0` and
+    // are inert (they only widen the scan, never change a sum — Pitfall 4).
+    let float_max = (0..n_float)
+        .map(|f| matrix.feature_borders.get(f).map_or(0, Vec::len) + 1)
+        .max()
+        .unwrap_or(0);
+    let ctr_actual = ctr_features
+        .iter()
+        .flat_map(|c| c.bins.iter().copied())
+        .max()
+        .map_or(0usize, |m| m as usize + 1);
+    let ctr_max = if n_ctr > 0 {
+        ctr_actual.max(ctr_border_count + 1)
+    } else {
+        0
+    };
+    let n_bins = float_max.max(ctr_max).max(1);
+
+    // Feature-major quantized bins: float columns via `bin_of`, then the CTR
+    // columns' integer bins fed DIRECTLY (bin == ctr bin value).
+    let mut bins = vec![0u32; n_features.saturating_mul(n_objects)];
+    for f in 0..n_float {
+        let borders = matrix.feature_borders.get(f).map_or(&[][..], Vec::as_slice);
+        let col = matrix.feature_values.get(f).map_or(&[][..], Vec::as_slice);
+        for obj in 0..n_objects {
+            let v = col.get(obj).copied().unwrap_or(0.0);
+            if let Some(slot) = bins.get_mut(f * n_objects + obj) {
+                *slot = bin_of(borders, v) as u32;
+            }
+        }
+    }
+    for c in 0..n_ctr {
+        let ctr_bins = ctr_features.get(c).map_or(&[][..], |col| col.bins.as_slice());
+        let f = n_float + c;
+        for obj in 0..n_objects {
+            let b = ctr_bins.get(obj).copied().unwrap_or(0);
+            if let Some(slot) = bins.get_mut(f * n_objects + obj) {
+                *slot = b;
+            }
+        }
+    }
+
+    // The current partition (chosen splits), forward-bit leaf order — the SAME
+    // partition `assign_leaves_ctr_aware` yields, so the scan's canonical
+    // `[false, true]` leaf order matches the pre-rewrite rescan exactly.
+    let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, chosen, n_objects);
+    let n_leaves = 1usize << chosen.len();
+    build_bucket_histogram(
+        &bins, der1, weight, &leaf_of, n_leaves, n_features, n_bins, approx_dim,
+    )
+}
+
+/// Score one CTR-aware candidate from the PRE-BUILT per-level histogram (the
+/// histogram-backed replacement for the per-candidate `assign_leaves_ctr_aware` +
+/// `reduce_leaf_stats` rescan). The candidate is identified by its combined-histogram
+/// `hist_feature` (float feature `f`, or `n_float + col` for a CTR column) and
+/// `border_index`; an `O(n_bins)` prefix scan
+/// ([`scan_border_to_leaf_stats`]) yields the split's `[false, true]` child
+/// [`LeafStats`] — `bins <= border` FALSE, `bins > border` TRUE, byte-for-byte the
+/// `reduce_leaf_stats(assign_leaves_ctr_aware(chosen ++ candidate))` leaf order —
+/// fed to the UNCHANGED [`split_score`] (`approx_dim == 1`, the same scalar calcer
+/// the float path uses; NOT a forked scorer).
+fn score_candidate_ctr_aware(
+    hist: &BucketHistogram,
+    hist_feature: usize,
+    border_index: usize,
+    scaled_l2: f64,
     score_function: EScoreFunction,
 ) -> f64 {
-    let mut splits = chosen.to_vec();
-    splits.push(candidate);
-    let n_leaves = 1usize << splits.len();
-    let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, &splits, n_objects);
-    let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, der1, weight, n_leaves);
-    split_score(score_function, &stats, scaled_l2)
+    let scan = scan_border_to_leaf_stats(hist, hist_feature, border_index, 1);
+    let stats = scan.first().map_or(&[][..], Vec::as_slice);
+    split_score(score_function, stats, scaled_l2)
 }
 
 /// One level of the CTR-aware UNPERTURBED search: enumerate FLOAT candidates
@@ -2193,14 +2282,29 @@ fn select_level_ctr_aware(
 ) -> CbResult<CtrAwareSplit> {
     let mut scored: Vec<(CtrAwareSplit, f64)> = Vec::new();
 
+    // Build the ONE per-level combined float+CTR histogram over the current
+    // partition; every candidate below is then scored by an `O(n_bins)` prefix
+    // scan of it (PERF-02 — no per-candidate dataset rescan). The candidate
+    // ENUMERATION ORDER, the `cat_feature_weight` insertion point, and the strict
+    // `>` first-wins tie-break are byte-for-byte unchanged.
+    let n_float = matrix.n_features();
+    let hist = build_ctr_aware_histogram(
+        matrix,
+        ctr_features,
+        ctr_border_count,
+        chosen,
+        der1,
+        weight,
+        n_objects,
+    );
+
     // FLOAT candidates first (AddFloatFeatures), feature asc / border asc.
-    for feature in 0..matrix.n_features() {
+    for feature in 0..n_float {
         let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-        for &border in borders {
+        for (border_index, &border) in borders.iter().enumerate() {
             let split = CtrAwareSplit::Float(Split { feature, border });
             let score = score_candidate_ctr_aware(
-                matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
-                score_function,
+                &hist, feature, border_index, scaled_l2, score_function,
             );
             scored.push((split, score));
         }
@@ -2247,13 +2351,15 @@ fn select_level_ctr_aware(
             }
             None => 1.0,
         };
+        // The CTR column occupies combined-histogram feature index `n_float + col`;
+        // border `border_idx` scans the `ctr_bin > border_idx` boundary directly.
+        let hist_feature = n_float + col;
         for border_idx in 0..ctr_border_count {
             let border = border_idx as f64;
             let split = CtrAwareSplit::Ctr { col, border };
             let score = cat_weight
                 * score_candidate_ctr_aware(
-                    matrix, ctr_features, chosen, split, der1, weight, scaled_l2, n_objects,
-                    score_function,
+                    &hist, hist_feature, border_idx, scaled_l2, score_function,
                 );
             scored.push((split, score));
         }
