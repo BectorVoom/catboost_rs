@@ -713,6 +713,16 @@ impl GrowScratch {
         a.remove(&neg_b)
     }
 
+    /// Relocate the RETAINED parent histogram (`parent`, `n_parent` leaves) into the
+    /// child `n_new_leaves` layout, copying parent leaf `p` into slot `p + shift`
+    /// (`shift = 0` for the FALSE/low slots, `shift = n_parent` for the TRUE/high
+    /// slots). A byte-identical memcpy of already-folded cells — the parent is
+    /// carried forward instead of rebuilt from objects, so the larger sibling can be
+    /// derived as `relocated_parent − smaller_sibling` (WR-04, no 3× rebuild).
+    fn relocate_parent(parent: &BucketHistogram, n_new_leaves: usize, shift: usize) -> BucketHistogram {
+        parent.relocate(n_new_leaves, shift)
+    }
+
     /// Advance from level `L` to `L+1` after `split` is chosen. Updates `leaf_of`
     /// incrementally (forward-bit: the new split occupies the highest bit, so
     /// `leaf' = leaf + (passes ? 1<<L : 0)` — byte-identical to
@@ -758,34 +768,38 @@ impl GrowScratch {
                 .collect();
             build(&next_leaf, n_next)
         } else if n_true <= n_false {
-            // TRUE is the smaller sibling → build it directly in its high slots;
-            // derive the FALSE (larger) child = parent − true in its low slots.
+            // TRUE is the smaller sibling → build ONLY it (one pass) in its high
+            // slots; derive the FALSE (larger) child = parent − true from the
+            // RETAINED parent (`self.hist`), NOT a from-scratch rebuild (WR-04).
             let true_high: Vec<usize> = (0..n_objects)
                 .map(|o| if pass(o) { pget(o) + n_parent } else { sentinel })
                 .collect();
             let true_low: Vec<usize> = (0..n_objects)
                 .map(|o| if pass(o) { pget(o) } else { sentinel })
                 .collect();
-            let base_low: Vec<usize> = (0..n_objects).map(pget).collect();
             let h_true_high = build(&true_high, n_next);
             let h_true_low = build(&true_low, n_next);
-            let h_base_low = build(&base_low, n_next);
+            // Relocate the retained parent into the child (n_next) LOW slot space —
+            // a byte-identical memcpy of already-folded cells (leaf p → low slot p).
+            let h_base_low = Self::relocate_parent(&self.hist, n_next, 0);
             // FixUpStats: false child (larger) = parent − true sibling (smaller).
             let h_false_low = h_base_low.remove(&h_true_low);
             Self::hist_add(&h_false_low, &h_true_high)
         } else {
-            // FALSE is the smaller sibling → build it directly in its low slots;
-            // derive the TRUE (larger) child = parent − false in its high slots.
+            // FALSE is the smaller sibling → build ONLY it (one pass) in its low
+            // slots; derive the TRUE (larger) child = parent − false from the
+            // RETAINED parent (`self.hist`) relocated into the HIGH slots (WR-04).
             let false_low: Vec<usize> = (0..n_objects)
                 .map(|o| if pass(o) { sentinel } else { pget(o) })
                 .collect();
             let false_high: Vec<usize> = (0..n_objects)
                 .map(|o| if pass(o) { sentinel } else { pget(o) + n_parent })
                 .collect();
-            let base_high: Vec<usize> = (0..n_objects).map(|o| pget(o) + n_parent).collect();
             let h_false_low = build(&false_low, n_next);
             let h_false_high = build(&false_high, n_next);
-            let h_base_high = build(&base_high, n_next);
+            // Relocate the retained parent into the child HIGH slot space (leaf p →
+            // slot p + n_parent), a byte-identical memcpy of already-folded cells.
+            let h_base_high = Self::relocate_parent(&self.hist, n_next, n_parent);
             // FixUpStats: true child (larger) = parent − false sibling (smaller).
             let h_true_high = h_base_high.remove(&h_false_high);
             Self::hist_add(&h_false_low, &h_true_high)

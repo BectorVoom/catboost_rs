@@ -288,6 +288,62 @@ impl BucketHistogram {
             n_channels: self.n_channels,
         }
     }
+
+    /// Relocate this histogram's leaves into a larger `n_new_leaves` partition,
+    /// copying source leaf `p`'s whole cell block into destination leaf `p + shift`.
+    ///
+    /// This is a byte-identical MEMCPY of already-folded cells — NO re-summation and
+    /// NO reorder, so the relocated histogram carries the exact same bits as the
+    /// source (parity-SAFE). It exists so [`GrowScratch::advance`] can produce the
+    /// parent histogram in the child (n_new_leaves) layout WITHOUT a from-scratch
+    /// object rebuild, then derive the larger sibling via [`remove`](Self::remove)
+    /// (the subtraction trick's actual payoff, WR-04). Destination leaves outside
+    /// `[shift, shift + n_leaves)` stay zero. On an index-arithmetic overflow the
+    /// result is an empty degenerate histogram rather than a panic (T-21-02); source
+    /// leaves whose destination falls outside the new partition are skipped
+    /// defensively (no raw indexing, T-21-01).
+    #[must_use]
+    pub fn relocate(&self, n_new_leaves: usize, shift: usize) -> BucketHistogram {
+        // Per-leaf contiguous block width (leaf is the OUTERMOST flat index).
+        let per_leaf = self
+            .n_features
+            .checked_mul(self.n_bins)
+            .and_then(|x| x.checked_mul(self.n_channels))
+            .unwrap_or(0);
+        let total = n_new_leaves.checked_mul(per_leaf).unwrap_or(0);
+        let mut data = vec![0.0_f64; total];
+        for p in 0..self.n_leaves {
+            let dest = match p.checked_add(shift) {
+                Some(d) if d < n_new_leaves => d,
+                _ => continue,
+            };
+            let src_start = match p.checked_mul(per_leaf) {
+                Some(s) => s,
+                None => continue,
+            };
+            let dst_start = match dest.checked_mul(per_leaf) {
+                Some(s) => s,
+                None => continue,
+            };
+            let src = match self
+                .data
+                .get(src_start..src_start.saturating_add(per_leaf))
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(dst) = data.get_mut(dst_start..dst_start.saturating_add(per_leaf)) {
+                dst.copy_from_slice(src);
+            }
+        }
+        BucketHistogram {
+            data,
+            n_leaves: n_new_leaves,
+            n_features: self.n_features,
+            n_bins: self.n_bins,
+            n_channels: self.n_channels,
+        }
+    }
 }
 
 /// The bin of `value` under ascending `borders`: the count of borders STRICTLY
@@ -403,17 +459,28 @@ pub fn build_bucket_histogram(
 /// FALSE child of parent leaf `parent`, index `parent + n_leaves` is its TRUE
 /// child. This matches the forward-bit `leaf_index` convention (`tree.rs:284`)
 /// where the new candidate occupies the highest bit
-/// (`leaf = parent + (candidate ? n_leaves_parent : 0)`) — so the order is
-/// byte-for-byte the `assign_leaves(chosen ++ candidate)` + [`reduce_leaf_stats`]
-/// order the current `score_candidate` produces.
+/// (`leaf = parent + (candidate ? n_leaves_parent : 0)`) — so the leaf ORDER is
+/// byte-for-byte the `assign_leaves(chosen ++ candidate)` order the current
+/// `score_candidate` produces (the forward-bit ORDER is unaffected by the
+/// running-prefix summation and stays exact).
 ///
-/// Buckets are combined via [`cb_core::sum_f64`] in ascending bin order (matching
-/// upstream `CalcScoresForLeaf`): the FALSE child is the ordered sum over bins
-/// `0..=border`, the TRUE child over bins `border+1..n_bins`. On a benign fixture
-/// (values exactly representable) this is bit-exact to the object-order
-/// [`reduce_leaf_stats`] fold (RESEARCH: the equivalence is proven on such
-/// fixtures; adversarial ULP ties are gated by the downstream oracle suite,
-/// Pitfall 1).
+/// # TRUE-side strategy (the parity-relevant summation order, 21-06)
+///
+/// Each parent's per-bin row is combined in a SINGLE ascending pass (matching
+/// upstream `CalcScoresForLeaf`'s running `trueStats = total − falseStats`
+/// complement, `score_calcers.cpp`):
+/// - **FALSE side** is a left-to-right running prefix `acc_false += bin[b]` in
+///   ascending bin order. This is BIT-IDENTICAL to the previous
+///   `sum_f64(bins[0..=border])` — a running `+=` from `acc = 0.0` in ascending
+///   order IS the [`cb_core::sum_f64`] fold — so the FALSE side carries ZERO
+///   parity risk.
+/// - **TRUE side** is `true = total − acc_false`, where
+///   `total = sum_f64(all bins ascending)` is computed ONCE per (parent, channel).
+///   This `total − prefix` complement is `O(n_bins)` (not the old `O(n_bins²)`
+///   per-border suffix re-sum) but it CHANGES the TRUE-side f64 bits versus the
+///   previous ascending suffix `sum_f64(bins[border+1..n])`. So the FALSE side is
+///   bit-identical while the TRUE side is only **≤1e-5 oracle-equivalent** (the
+///   `total − prefix` reorder, gated by the full atomic oracle suite, 21-06).
 #[must_use]
 pub fn scan_border_to_leaf_stats(
     hist: &BucketHistogram,
@@ -428,21 +495,23 @@ pub fn scan_border_to_leaf_stats(
         vec![vec![LeafStats::default(); 2 * n_parent]; approx_dimension.max(1)];
 
     for parent in 0..n_parent {
-        // Per-bin weight row (shared across dimensions), gathered in bin order.
+        // Per-bin weight row (shared across dimensions), gathered ONCE in bin order.
         let bin_weight: Vec<f64> = (0..n_bins)
             .map(|bin| hist.channel(parent, feature, bin, weight_channel))
             .collect();
-        // FALSE = Σ bins <= border ; TRUE = Σ bins > border, both ascending order.
-        let w_false = sum_f64(bin_weight.get(0..=border).unwrap_or(&[]));
-        let w_true = sum_f64(bin_weight.get(border.saturating_add(1)..n_bins).unwrap_or(&[]));
+        // FALSE = ascending running prefix over bins 0..=border (bit-identical to
+        // sum_f64(bins[0..=border])). TRUE = total − prefix (the reordered complement).
+        let total_w = sum_f64(&bin_weight);
+        let w_false = running_prefix(&bin_weight, border);
+        let w_true = total_w - w_false;
 
         for d in 0..approx_dimension {
             let bin_delta: Vec<f64> = (0..n_bins)
                 .map(|bin| hist.channel(parent, feature, bin, d))
                 .collect();
-            let d_false = sum_f64(bin_delta.get(0..=border).unwrap_or(&[]));
-            let d_true =
-                sum_f64(bin_delta.get(border.saturating_add(1)..n_bins).unwrap_or(&[]));
+            let total_d = sum_f64(&bin_delta);
+            let d_false = running_prefix(&bin_delta, border);
+            let d_true = total_d - d_false;
             let false_stats = LeafStats {
                 sum_weighted_delta: d_false,
                 sum_weight: w_false,
@@ -464,11 +533,35 @@ pub fn scan_border_to_leaf_stats(
     out
 }
 
-/// Convenience wrapper over [`scan_border_to_leaf_stats`]: the full `O(n_borders)`
-/// scan across all `n_borders` candidate thresholds of `feature`, returning one
-/// per-dimension canonical-leaf-order [`LeafStats`] set PER border. The result is
-/// indexed `[border][dimension]`; `result[b]` is directly consumable by
-/// [`crate::multi_dim_split_score`] for candidate border `b`.
+/// Ascending left-to-right running prefix `Σ row[0..=border]` — the FALSE-side
+/// fold. Folding a slice's leading `border+1` elements with a zero-seeded `+=` in
+/// ascending order is byte-for-byte [`cb_core::sum_f64`] of that leading run, so
+/// the FALSE side stays bit-identical to the previous `sum_f64(bins[0..=border])`.
+/// Out-of-range bins are skipped defensively (no raw indexing, T-21-01).
+fn running_prefix(row: &[f64], border: usize) -> f64 {
+    let mut acc = 0.0_f64;
+    let last = border.min(row.len().saturating_sub(1));
+    for b in 0..=last {
+        acc += row.get(b).copied().unwrap_or(0.0);
+    }
+    acc
+}
+
+/// The full `O(n_borders · n_bins)` scan across all `n_borders` candidate
+/// thresholds of `feature`, returning one per-dimension canonical-leaf-order
+/// [`LeafStats`] set PER border. The result is indexed `[border][dimension]`;
+/// `result[b]` is directly consumable by [`crate::multi_dim_split_score`] for
+/// candidate border `b`.
+///
+/// This is the PRIMARY scan (WR-03): each parent's per-channel bin row is gathered
+/// AT MOST ONCE per (parent, feature) — OUTSIDE the border loop — and its `total`
+/// is summed once; the borders are then walked with a single carried running prefix
+/// `acc_false += row[b]`, emitting `false = acc_false`, `true = total − acc_false`
+/// per border. No per-border re-gather and no per-border `Vec` allocation (the old
+/// path was `O(n_bins²)` and allocated fresh rows per border). The TRUE-side
+/// `total − prefix` reorder is the exact one documented on [`scan_border_to_leaf_stats`]
+/// (FALSE bit-identical, TRUE ≤1e-5 oracle-equivalent, gated by the 21-06 atomic
+/// oracle suite).
 #[must_use]
 pub fn scan_borders_to_leaf_stats(
     hist: &BucketHistogram,
@@ -476,7 +569,75 @@ pub fn scan_borders_to_leaf_stats(
     n_borders: usize,
     approx_dimension: usize,
 ) -> Vec<Vec<Vec<LeafStats>>> {
-    (0..n_borders)
-        .map(|border| scan_border_to_leaf_stats(hist, feature, border, approx_dimension))
-        .collect()
+    let n_parent = hist.n_leaves();
+    let n_bins = hist.n_bins();
+    let dim = approx_dimension.max(1);
+    let weight_channel = approx_dimension; // channel index of Σ weight
+    let mut out: Vec<Vec<Vec<LeafStats>>> =
+        vec![vec![vec![LeafStats::default(); 2 * n_parent]; dim]; n_borders];
+
+    // Reused per-parent gather scratch (allocated ONCE, not per border — PERF-03).
+    let mut bin_weight = vec![0.0_f64; n_bins];
+    let mut bin_delta = vec![vec![0.0_f64; n_bins]; approx_dimension];
+
+    for parent in 0..n_parent {
+        // Gather each channel's per-bin row ONCE per (parent, feature).
+        for bin in 0..n_bins {
+            if let Some(slot) = bin_weight.get_mut(bin) {
+                *slot = hist.channel(parent, feature, bin, weight_channel);
+            }
+        }
+        let total_w = sum_f64(&bin_weight);
+        for d in 0..approx_dimension {
+            for bin in 0..n_bins {
+                let v = hist.channel(parent, feature, bin, d);
+                if let Some(row) = bin_delta.get_mut(d) {
+                    if let Some(slot) = row.get_mut(bin) {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        // Precompute per-dimension totals once.
+        let total_d: Vec<f64> = (0..approx_dimension)
+            .map(|d| sum_f64(bin_delta.get(d).map_or(&[][..], Vec::as_slice)))
+            .collect();
+
+        // Single carried running prefix per channel across borders (FALSE side).
+        let mut acc_false_w = 0.0_f64;
+        let mut acc_false_d = vec![0.0_f64; approx_dimension];
+        for b in 0..n_borders {
+            acc_false_w += bin_weight.get(b).copied().unwrap_or(0.0);
+            let w_false = acc_false_w;
+            let w_true = total_w - acc_false_w;
+            for d in 0..approx_dimension {
+                let inc = bin_delta.get(d).and_then(|r| r.get(b)).copied().unwrap_or(0.0);
+                let acc = match acc_false_d.get_mut(d) {
+                    Some(a) => {
+                        *a += inc;
+                        *a
+                    }
+                    None => continue,
+                };
+                let td = total_d.get(d).copied().unwrap_or(0.0);
+                let false_stats = LeafStats {
+                    sum_weighted_delta: acc,
+                    sum_weight: w_false,
+                };
+                let true_stats = LeafStats {
+                    sum_weighted_delta: td - acc,
+                    sum_weight: w_true,
+                };
+                if let Some(row) = out.get_mut(b).and_then(|per_dim| per_dim.get_mut(d)) {
+                    if let Some(slot) = row.get_mut(parent) {
+                        *slot = false_stats;
+                    }
+                    if let Some(slot) = row.get_mut(parent + n_parent) {
+                        *slot = true_stats;
+                    }
+                }
+            }
+        }
+    }
+    out
 }

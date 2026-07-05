@@ -3,7 +3,7 @@
 
 use crate::histogram::{
     bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
-    scan_border_to_leaf_stats, BucketHistogram, LeafStats,
+    scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram, LeafStats,
 };
 use crate::runtime::EScoreFunction;
 use crate::score::{l2_split_score, multi_dim_split_score};
@@ -340,6 +340,71 @@ fn scan_border_matches_rescan_scalar() {
         let hist_score = l2_split_score(hist_leaves, scaled_l2);
         let ref_score = l2_split_score(&ref_leaves, scaled_l2);
         assert_eq!(hist_score, ref_score, "score border {b}");
+    }
+}
+
+#[test]
+fn running_prefix_scan_matches_per_border_reference() {
+    // The running-prefix scan's FALSE side must be BIT-IDENTICAL to the old
+    // `sum_f64(bins[0..=border])` per-border reference (the FALSE side never
+    // changes); the TRUE side must equal `total − false` (the documented reorder).
+    let n = 8;
+    let der1 = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0, 4.0, -0.5];
+    let weight = vec![1.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0, 2.0];
+    // feature 0 = the chosen split producing the parent partition; feature 1 scanned.
+    let borders0 = vec![2.0_f64];
+    let borders1 = vec![1.0_f64, 3.0, 4.5];
+    let f0 = vec![1.0_f32, 3.0, 2.5, 0.0, 4.0, 1.5, 3.5, 2.0];
+    let f1 = vec![0.5_f32, 2.0, 4.0, 1.0, 3.5, 0.0, 2.5, 5.0];
+    let feature_values = vec![f0.clone(), f1.clone()];
+    let feature_borders = vec![borders0.clone(), borders1.clone()];
+    let n_features = 2;
+    let n_bins = borders0.len().max(borders1.len()) + 1;
+
+    let leaf_of: Vec<usize> = (0..n)
+        .map(|o| usize::from(f64::from(f0[o]) > borders0[0]))
+        .collect();
+    let bins = bin_matrix(&feature_values, &feature_borders, n);
+    let hist = build_bucket_histogram(&bins, &der1, &weight, &leaf_of, 2, n_features, n_bins, 1);
+    let n_parent = hist.n_leaves();
+
+    let scans = scan_borders_to_leaf_stats(&hist, 1, borders1.len(), 1);
+
+    // Local per-border reference: FALSE = ascending sum_f64(bins[0..=border]),
+    // TRUE = ascending sum_f64(bins[border+1..n_bins]) — the pre-21-06 shape.
+    let sum_ref_local = |vals: &[f64]| -> f64 {
+        let mut acc = 0.0_f64;
+        for &v in vals {
+            acc += v;
+        }
+        acc
+    };
+    for (b, _brd) in borders1.iter().enumerate() {
+        let per_dim = &scans[b];
+        for parent in 0..n_parent {
+            let bin_w: Vec<f64> = (0..n_bins).map(|bin| hist.channel(parent, 1, bin, 1)).collect();
+            let bin_d: Vec<f64> = (0..n_bins).map(|bin| hist.channel(parent, 1, bin, 0)).collect();
+            let w_false_ref = sum_ref_local(&bin_w[0..=b]);
+            let d_false_ref = sum_ref_local(&bin_d[0..=b]);
+            let total_w = sum_ref_local(&bin_w);
+            let total_d = sum_ref_local(&bin_d);
+
+            let false_stats = per_dim[0][parent];
+            let true_stats = per_dim[0][parent + n_parent];
+            // FALSE side: bit-identical to the old ascending prefix.
+            assert_eq!(false_stats.sum_weight, w_false_ref, "FALSE weight b{b} p{parent}");
+            assert_eq!(
+                false_stats.sum_weighted_delta, d_false_ref,
+                "FALSE delta b{b} p{parent}"
+            );
+            // TRUE side: exactly total − false (the documented complement).
+            assert_eq!(true_stats.sum_weight, total_w - w_false_ref, "TRUE weight b{b} p{parent}");
+            assert_eq!(
+                true_stats.sum_weighted_delta,
+                total_d - d_false_ref,
+                "TRUE delta b{b} p{parent}"
+            );
+        }
     }
 }
 
