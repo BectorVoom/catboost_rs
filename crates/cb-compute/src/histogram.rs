@@ -152,3 +152,251 @@ pub fn collect_leaf_residuals(
     }
     out
 }
+
+// ----------------------------------------------------------------------------
+// CPU split-finding histogram primitives (PERF-01 / PERF-02, Phase 21).
+//
+// The parity-critical DATA-PRODUCTION layer: a per-(leaf, feature, bin)
+// 2+-channel `TBucketStats` histogram built by ONE object-order pass, the
+// `O(n_bins)` prefix scan that turns a feature's buckets into the per-border
+// `LeafStats` array fed to the UNCHANGED score math, and the subtraction trick
+// (child = parent − sibling). Everything routes every float sum through
+// [`cb_core::sum_f64`] in canonical order (D-05/D-08) so the ≤1e-5 oracle bar is
+// preserved. Pure host Rust — cubecl-free AND rayon-free (D-03); NOT a dependency
+// on `cb-backend` (the device `pointwise_hist.rs::host_reference_hist2` is the
+// READ-ONLY template transcribed here, never imported).
+// ----------------------------------------------------------------------------
+
+/// A per-`(leaf, feature, bin)` bucket-statistics histogram — the host
+/// `TBucketStats` analogue (`calc_score_cache.h:72-95`).
+///
+/// # Frozen flat layout (mirrors the device `pointwise_hist.rs:44-49`)
+///
+/// ```text
+/// index(leaf, feature, bin, channel) =
+///     ((leaf * n_features + feature) * n_bins + bin) * n_channels + channel
+/// ```
+///
+/// `n_channels = approx_dimension + 1`: channels `0..approx_dimension` hold
+/// `Σ der1[d]` (the "weighted delta" per output dimension), channel
+/// `approx_dimension` holds `Σ weight` (shared across dimensions). Each cell is
+/// the ordered [`cb_core::sum_f64`] of its member objects' contributions gathered
+/// in ascending object order — so the histogram carries exactly the same reduced
+/// totals [`reduce_leaf_stats`] would produce for the (leaf, feature, bin)
+/// partition, generalized from leaf to (leaf, feature, bin).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketHistogram {
+    /// Flat channel data in the frozen layout above.
+    data: Vec<f64>,
+    /// Number of leaves in the CURRENT partition.
+    n_leaves: usize,
+    /// Number of (float) features whose bins are histogrammed.
+    n_features: usize,
+    /// Number of bins per feature (`n_borders + 1`).
+    n_bins: usize,
+    /// Number of channels (`approx_dimension` delta channels + 1 weight channel).
+    n_channels: usize,
+}
+
+impl BucketHistogram {
+    /// Number of leaves in the partition this histogram was built over.
+    #[must_use]
+    pub fn n_leaves(&self) -> usize {
+        self.n_leaves
+    }
+
+    /// Number of features histogrammed.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+
+    /// Number of bins per feature (`n_borders + 1`).
+    #[must_use]
+    pub fn n_bins(&self) -> usize {
+        self.n_bins
+    }
+
+    /// Number of channels (`approx_dimension + 1`).
+    #[must_use]
+    pub fn n_channels(&self) -> usize {
+        self.n_channels
+    }
+
+    /// Number of delta (per-dimension `Σ der1`) channels (`n_channels - 1`).
+    #[must_use]
+    pub fn approx_dimension(&self) -> usize {
+        self.n_channels.saturating_sub(1)
+    }
+
+    /// The flat base offset of cell `(leaf, feature, bin)`, or `None` if any index
+    /// is out of range (defensive — no raw indexing, workspace deny
+    /// `indexing_slicing`).
+    fn cell_base(&self, leaf: usize, feature: usize, bin: usize) -> Option<usize> {
+        if leaf >= self.n_leaves || feature >= self.n_features || bin >= self.n_bins {
+            return None;
+        }
+        // (leaf * n_features + feature) * n_bins + bin) * n_channels
+        Some(((leaf * self.n_features + feature) * self.n_bins + bin) * self.n_channels)
+    }
+
+    /// The value of one channel of cell `(leaf, feature, bin)`. Out-of-range
+    /// indices return `0.0` (an absent cell contributes nothing — mirrors the
+    /// empty-leaf `LeafStats::default()` convention).
+    #[must_use]
+    pub fn channel(&self, leaf: usize, feature: usize, bin: usize, channel: usize) -> f64 {
+        if channel >= self.n_channels {
+            return 0.0;
+        }
+        self.cell_base(leaf, feature, bin)
+            .and_then(|base| self.data.get(base + channel))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// The subtraction trick (`TBucketStats::Remove`, `calc_score_cache.h:88`):
+    /// per-cell, per-channel `self - other`, yielding the sibling histogram
+    /// (`sibling = parent.remove(child)`, upstream `scoring.cpp:315` FixUpStats).
+    ///
+    /// The two histograms MUST share the same shape; on a shape mismatch the
+    /// receiver is returned unchanged (defensive — the trainer always subtracts a
+    /// same-shape child, and a mismatch is a caller bug rather than a panic
+    /// condition, T-21-02). Every subtraction is a plain f64 `-=` in the frozen
+    /// cell order, matching upstream's own subtraction so the rounding is
+    /// parity-faithful (RESEARCH Pitfall 2).
+    #[must_use]
+    pub fn remove(&self, other: &BucketHistogram) -> BucketHistogram {
+        if self.n_leaves != other.n_leaves
+            || self.n_features != other.n_features
+            || self.n_bins != other.n_bins
+            || self.n_channels != other.n_channels
+            || self.data.len() != other.data.len()
+        {
+            return self.clone();
+        }
+        let data: Vec<f64> = self
+            .data
+            .iter()
+            .zip(other.data.iter())
+            .map(|(&a, &b)| a - b)
+            .collect();
+        BucketHistogram {
+            data,
+            n_leaves: self.n_leaves,
+            n_features: self.n_features,
+            n_bins: self.n_bins,
+            n_channels: self.n_channels,
+        }
+    }
+}
+
+/// The bin of `value` under ascending `borders`: the count of borders STRICTLY
+/// LESS than `value` (an upper-bound), consistent with the split test
+/// `f64::from(value) > border` (`FeatureMatrix::passes_float`, `tree.rs:360-365`).
+///
+/// With `borders` ascending, object `obj` passes border `k` (`value > borders[k]`)
+/// exactly when `borders[k] < value`, i.e. when `k < bin_of(borders, value)`. So a
+/// split at border index `b` puts the FALSE child (`value <= borders[b]`) at
+/// `bins <= b` and the TRUE child (`value > borders[b]`) at `bins > b` — the
+/// boundary the prefix scan relies on (RESEARCH Pitfall 4). Values equal to a
+/// border land in the lower bucket (strict `<`), below-min lands in bin `0`, and
+/// above-max lands in bin `borders.len()` (`= n_bins - 1`).
+#[must_use]
+pub fn bin_of(borders: &[f64], value: f32) -> usize {
+    let v = f64::from(value);
+    borders.iter().filter(|&&b| b < v).count()
+}
+
+/// Build the per-`(leaf, feature, bin)` [`BucketHistogram`] in ONE object-order
+/// pass (transcribes the device `host_reference_hist2`, `pointwise_hist.rs:106-163`,
+/// generalizing [`reduce_leaf_stats`] from `leaf` to `(leaf, feature, bin)`).
+///
+/// - `bins` is the quantized bin matrix laid out FEATURE-major:
+///   `bins[feature * n_objects + obj]` is object `obj`'s bin for `feature`
+///   (produced by [`bin_of`]). `n_objects` is inferred from `leaf_of.len()`.
+/// - `der1` is the DIMENSION-major first-derivative buffer:
+///   `der1[d * n_objects + obj]`, length `approx_dimension * n_objects`.
+/// - `weight` is per-object (length `n_objects`), shared across dimensions.
+/// - `leaf_of[obj]` is object `obj`'s CURRENT-partition leaf index
+///   (`0..n_leaves`); objects with a leaf `>= n_leaves` are ignored defensively.
+///
+/// Each cell's contributions are GATHERED in ascending object order, then folded
+/// through [`cb_core::sum_f64`] (D-05) — never a raw iterator sum (D-08). Channel
+/// `d` (`0..approx_dimension`) is `Σ der1[d]`, channel `approx_dimension` is
+/// `Σ weight`. Out-of-range bins/objects are skipped (no raw indexing — workspace
+/// deny `indexing_slicing`, T-21-01). On an index-arithmetic overflow of the flat
+/// length the histogram is returned empty rather than panicking (T-21-02); the
+/// depth cap (`MAX_DEPTH=16`, `tree.rs:100`) bounds `n_leaves` well below that.
+///
+/// The eight parameters mirror the frozen `(bins, der1, weight, leaf_of, shape…)`
+/// contract of the device template (`pointwise_hist.rs`); bundling them into a
+/// struct would obscure that one-to-one correspondence, so the arity allow is
+/// deliberate.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_bucket_histogram(
+    bins: &[u32],
+    der1: &[f64],
+    weight: &[f64],
+    leaf_of: &[usize],
+    n_leaves: usize,
+    n_features: usize,
+    n_bins: usize,
+    approx_dimension: usize,
+) -> BucketHistogram {
+    let n_objects = leaf_of.len();
+    let n_channels = approx_dimension + 1;
+    // Checked flat length (T-21-02): overflow → empty degenerate histogram (no panic).
+    let total = n_leaves
+        .checked_mul(n_features)
+        .and_then(|x| x.checked_mul(n_bins))
+        .and_then(|x| x.checked_mul(n_channels))
+        .unwrap_or(0);
+
+    // Gather each (cell, channel) member list in ascending OBJECT order, then fold
+    // each through the single sanctioned ordered primitive (the reduce_leaf_stats
+    // shape, generalized). Scratch-buffer REUSE across levels is deferred to a
+    // later wave (21-05, PERF-03); this primitive allocates fresh for clarity.
+    let mut members: Vec<Vec<f64>> = vec![Vec::new(); total];
+
+    for obj in 0..n_objects {
+        let leaf = match leaf_of.get(obj) {
+            Some(&l) if l < n_leaves => l,
+            _ => continue,
+        };
+        let w = weight.get(obj).copied().unwrap_or(0.0);
+        for feature in 0..n_features {
+            let bin = match bins.get(feature * n_objects + obj) {
+                Some(&b) => b as usize,
+                None => continue,
+            };
+            if bin >= n_bins {
+                continue;
+            }
+            let cell_base = ((leaf * n_features + feature) * n_bins + bin) * n_channels;
+            for d in 0..approx_dimension {
+                let dval = der1.get(d * n_objects + obj).copied().unwrap_or(0.0);
+                if let Some(slot) = members.get_mut(cell_base + d) {
+                    slot.push(dval);
+                }
+            }
+            if let Some(slot) = members.get_mut(cell_base + approx_dimension) {
+                slot.push(w);
+            }
+        }
+    }
+
+    let mut data = vec![0.0_f64; total];
+    for (i, slot) in data.iter_mut().enumerate() {
+        let contributions = members.get(i).map_or(&[][..], Vec::as_slice);
+        *slot = sum_f64(contributions);
+    }
+
+    BucketHistogram {
+        data,
+        n_leaves,
+        n_features,
+        n_bins,
+        n_channels,
+    }
+}

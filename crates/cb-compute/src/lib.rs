@@ -38,7 +38,8 @@ pub use embedding_calcers::{
     LDA_DEFAULT_REG,
 };
 pub use histogram::{
-    collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats, LeafStats,
+    bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
+    BucketHistogram, LeafStats,
 };
 pub use lda_linalg::{
     calculate_projection, jacobi_symmetric_eig, reduce_generalized, sgemv_rowmajor, SymmetricEig,
