@@ -68,7 +68,7 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
   2. Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 speed rows are executed on Kaggle CUDA and the BENCH-03 aggregate is recomputed from real numbers with no stitched Phase-12/13-only gaps (HARD-02)
   3. Each RV-13-01..04 latent parity hazard is either fixed (with an oracle demonstrating the fix) or explicitly retired with recorded evidence (HARD-03)
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 Plans:
 **Wave 1**
 
@@ -77,7 +77,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 15-03-PLAN.md — single authoritative Kaggle CUDA session (Part A correctness gate + Part B depth-1/depth-6 BENCH-02) [Wave 2, HARD-01/02]
+- [x] 15-03-PLAN.md — single authoritative Kaggle CUDA session (Part A ALL-PASS ε=1e-4 all 13 families + 4 RV-13; Part B 12 depth-1/depth-6 rows 29.1–40.8×) [Wave 2, HARD-01/02]
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -181,7 +181,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 |-------|-----------|----------------|--------|-----------|
 | 1–8 (Core Parity) | v1.0 | — | Complete | 2026-06-28 |
 | 10–14 (GPU Performance) | v1.1 | — | Complete | 2026-07-05 |
-| 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 2/4 | In Progress|  |
+| 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 3/4 | In Progress|  |
 | 16. Online-HNSW KNN Estimated-Feature Parity | v1.2 | 0/TBD | Not started | - |
 | 17. Model Export — ONNX + CoreML | v1.2 | 0/TBD | Not started | - |
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |
