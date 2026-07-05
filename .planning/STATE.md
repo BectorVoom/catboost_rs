@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: GPU Performance
-current_phase: 14
-status: verifying
-stopped_at: Phase 14 context gathered
-last_updated: "2026-07-05T01:42:01.532Z"
+current_phase: 1
+status: Awaiting next milestone
+stopped_at: v1.1 GPU Performance shipped (2026-07-05) — archived + tagged
+last_updated: "2026-07-05T01:47:35.652Z"
 last_activity: 2026-07-05
-last_activity_desc: Phase 14 complete
+last_activity_desc: Milestone v1.1 completed and archived
 progress:
   total_phases: 5
   completed_phases: 5
@@ -21,17 +21,17 @@ current_phase_name: comprehensive-kaggle-cuda-speed-benchmark-parity-sign-off
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-13)
+See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 14 — comprehensive-kaggle-cuda-speed-benchmark-parity-sign-off
+**Current focus:** Planning next milestone (`/gsd-new-milestone`). v1.1 GPU Performance shipped — BENCH-03 PASS; open threads: FEAT-07 HNSW (Phase 9 backlog) + GPUT-14 aggregate / Phase-10-11 BENCH-02 standing debt.
 
 ## Current Position
 
-Phase: 14
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-07-05 — Phase 14 complete
+Phase: Milestone v1.1 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-07-05 — Milestone v1.1 completed and archived
 
 ## Performance Metrics
 
@@ -494,6 +494,19 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 | quick_task | 260619-cpr-estimated-feature-stored-border-value-qu (subsumed by FEAT-07 HNSW) | superseded | v1.0 close |
 | todo | estimated-feature-grid-parity.md — FEAT-07 online-HNSW port (Phase 9) | pending | v1.0 close |
 
+Items acknowledged and carried forward at the v1.1 GPU Performance milestone close (2026-07-05):
+
+| Category | Item | Status | Deferred At |
+|----------|------|--------|-------------|
+| requirement | GPUT-14 — ε=1e-4 device-vs-CPU standing correctness gate (Phase 11, enforced onward) | pending — per-family self-oracles pass ≤1e-4 in-env; the milestone-wide Kaggle CUDA GPUT-14 sign-off row not executed; formal accept-as-delivered override recorded in 14-VERIFICATION.md | v1.1 close |
+| bench | Phase-10 (depth-1) BENCH-02 Kaggle CUDA speed run | not executed — BENCH-03 aggregate stitches the committed Phase-12/13 numbers only | v1.1 close |
+| bench | Phase-11 (depth-6) BENCH-02 Kaggle CUDA speed run | not executed — see above | v1.1 close |
+| verification | Phase 10 — 10-VERIFICATION.md | human_needed (Kaggle CUDA depth-1 oracle+speed; later P100 ALL-PASS covered depth>1 in Phases 13/14, not the Phase-10 depth-1 row) | v1.1 close |
+| uat | Phase 10 — 10-UAT.md | testing (2 pending scenarios — same Kaggle CUDA depth-1 gate) | v1.1 close |
+| quick_task | 260619-bac-fix-builder-oracle-test-score-function-m | resolved-stale (shipped per 260623-mph; audit flag is a false positive) | v1.1 close |
+| quick_task | 260619-cpr-estimated-feature-stored-border-value-qu | superseded by FEAT-07 HNSW (Phase 9) | v1.1 close |
+| todo | estimated-feature-grid-parity.md — FEAT-07 online-HNSW port (Phase 9) | pending (still open) | v1.1 close |
+
 ## Session Continuity
 
 Last session: 2026-07-05T01:30:48.981Z
@@ -520,4 +533,4 @@ Resume file: .planning/phases/14-comprehensive-kaggle-cuda-speed-benchmark-parit
 
 ## Operator Next Steps
 
-- v1.1 GPU Performance roadmap RE-DERIVED (Phases 10–14; 25 reqs mapped). Phase 10 grew from the coarse seam into the foundations phase: it now also carries GPUT-16 (from-scratch CubeCL device-primitive library, no CUB), GPUT-15 (device-resident cindex), and GPUT-08 (Cosine GPU-default score) alongside the seam/residency/depth-1 wire + Kaggle CUDA harness. Coverage split into two phases: Phase 12 (grow-policy/leaf-method/sampling/CTR: GPUT-18/19/09/17/10) and Phase 13 (pairwise/ranking/multiclass/ordered/langevin: GPUT-11/21/22/12/13/20). Phase 14 = comprehensive final Kaggle CUDA speed sign-off (BENCH-03). Next: `/gsd-discuss-phase 10` then `/gsd-plan-phase 10`. NOTE: stale prior Phase-10 draft plans were cleared for regeneration; the 10-RESEARCH.md seam/residency/depth-1 architecture stays valid but re-plan must add GPUT-08/15/16 scope.
+- Start the next milestone with /gsd-new-milestone
