@@ -190,3 +190,4 @@ device GpuBackend vs host-CPU boosting loop in one --features cuda binary):
 Grow-loop device dominance 30-42x across n. Sub-op families (Exact/bootstrap/MVS/CTR)
 are device-resident within this same loop (no standalone train loop to isolate). Provenance:
 bench/phase12_cuda_oracle/bench02-result.json.
+See `bench/BENCH-03-SIGNOFF.md` for the milestone-closing BENCH-03 aggregate (all 12 device rows ≥20× vs host-CPU baseline; informational CatBoost-GPU head-to-head).
