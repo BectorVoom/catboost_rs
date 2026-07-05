@@ -65,7 +65,12 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
   1. A single aggregate GPUT-14 ε=1e-4 Kaggle CUDA correctness row covers all v1.1 device families as one authoritative run and passes (HARD-01)
   2. Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 speed rows are executed on Kaggle CUDA and the BENCH-03 aggregate is recomputed from real numbers with no stitched Phase-12/13-only gaps (HARD-02)
   3. Each RV-13-01..04 latent parity hazard is either fixed (with an oracle demonstrating the fix) or explicitly retired with recorded evidence (HARD-03)
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 15-01-PLAN.md — RV-13-01/02 ranking-der oracles (tie-order stability + weight>0 softmax max-seed) [Wave 1, HARD-03]
+- [ ] 15-02-PLAN.md — RV-13-03/04 oracles (n==0 empty-group guard + near-equal-border pairwise tie-break) [Wave 1, HARD-03]
+- [ ] 15-03-PLAN.md — single authoritative Kaggle CUDA session (Part A correctness gate + Part B depth-1/depth-6 BENCH-02) [Wave 2, HARD-01/02]
+- [ ] 15-04-PLAN.md — 15-EVIDENCE.md + BENCH-03 recompute in place + REQUIREMENTS/MILESTONES/STATE bookkeeping flip [Wave 3, HARD-01/02/03]
 **Context**: Mostly Kaggle CUDA job execution + contained `cb-backend`/`cb-train` fixes — high de-risking, low code-change risk. ROCm in-env is non-gating. This phase re-establishes the CUDA oracle before anyone benchmarks against it (avoids the benchmark-baseline-confusion pitfall).
 
 ### Phase 16: Online-HNSW KNN Estimated-Feature Parity
