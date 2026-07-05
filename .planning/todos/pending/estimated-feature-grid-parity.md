@@ -3,6 +3,7 @@ title: Estimated-feature stored-border-VALUE quantization-grid parity
 date: 2026-06-19
 priority: medium
 status: pending
+resolves_phase: 16
 origin: Phase 06.5 (deferred in 06.5-07, confirmed still-open after 06.5-08/09)
 blocks: nothing (non-blocking — FEAT-01/FEAT-02/SC-1..SC-4 all closed ≤1e-5)
 area: cb-train estimated-feature KNN calcer (online HNSW port) — NOT quantization/serialization
