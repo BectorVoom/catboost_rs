@@ -4,7 +4,7 @@
 
 - ✅ **v1.0 Core Parity** — Phases 1–8 (shipped 2026-06-28)
 - ✅ **v1.1 GPU Performance** — Phases 10–14 (shipped 2026-07-05) — the boosting inner loop moved fully device-resident (CubeCL, no CUB); BENCH-03: PASS, 23.9×–42.1× vs the host-light CPU baseline on P100. Closed with accepted standing debt (GPUT-14 aggregate + Phase-10/11 BENCH-02 un-run). Full detail: `milestones/v1.1-ROADMAP.md`.
-- 🚧 **v1.2 Parity Completion & Release Readiness** — Phases 15–21 (in progress) — discharge v1.1 debt + close the last CPU parity gap (online-HNSW), add ONNX/CoreML export, extended fstr, GPU inference, CV/tuning/snapshot orchestration, then benchmark vs official CatBoost + PyPI release as the capstone.
+- 🚧 **v1.2 Parity Completion & Release Readiness** — Phases 15–22 (in progress) — discharge v1.1 debt + close the last CPU parity gap (online-HNSW), add ONNX/CoreML export, extended fstr, GPU inference, CV/tuning/snapshot orchestration, rewrite the CPU split search onto histograms (close the ~250–450× CPU-training speed gap found in Spike 002), then benchmark vs official CatBoost + PyPI release as the capstone.
 
 ## Phases
 
@@ -53,7 +53,8 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
 - [ ] **Phase 18: Extended Feature Importance** — Interaction, LossFunctionChange, partial-dependence (parallel with Phase 17)
 - [ ] **Phase 19: GPU Inference Evaluator** — device-side predict for the upstream subset, deterministic, Kaggle-CUDA-signed (depends on Phase 15's re-signed oracle)
 - [ ] **Phase 20: Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics** — new `cb-orchestrate` crate + a `BoostingCheckpoint` surface on `cb-train` (parallel with Phase 19)
-- [ ] **Phase 21: Adoption / DX Capstone** — benchmark vs official CatBoost, PyPI per-backend wheels, docs + examples, real-dataset validation (last — exercises Phases 17/19/20)
+- [ ] **Phase 21: CPU Split-Finding Histogram Rewrite** — replace the per-candidate full-dataset rescan with per-feature bin histograms + subtraction trick + parallelism across ALL CPU grow policies (oblivious, Depthwise/Lossguide, CTR-feature scoring path), preserving ≤10⁻⁵ parity; closes the ~250–450× CPU-training slowdown (Spike 002/003/004). Must precede the Phase 22 benchmark.
+- [ ] **Phase 22: Adoption / DX Capstone** — benchmark vs official CatBoost, PyPI per-backend wheels, docs + examples, real-dataset validation (last — exercises Phases 17/19/20/21)
 
 ## Phase Details
 
@@ -157,10 +158,24 @@ Plans:
 **Plans**: TBD
 **Context**: New `cb-orchestrate` crate (mirrors upstream `train_lib` driver layer) + the only training-core change this milestone — a `BoostingCheckpoint` serde surface + resume entry on `cb-train`. Compute borders/CTR **inside each fold** (leakage). Snapshot the complete trainer state (iteration, all RNG/permutation state, ordered-boosting folds, approx cursors, OD history), not just the trees. **Research-phase flag:** re-verify CV fold-partition semantics against upstream `cross_validation.cpp` at plan time.
 
-### Phase 21: Adoption / DX Capstone
+### Phase 21: CPU Split-Finding Histogram Rewrite
+
+**Goal**: CPU training split-finding matches CatBoost's histogram/bucket-stats algorithm — per-feature bin histograms + subtraction trick + parallelism — collapsing the ~250–450× single-thread slowdown Spike 002 measured, while preserving the ≤10⁻⁵ CPU parity bar, across ALL CPU grow policies (oblivious `SymmetricTree`, non-symmetric `Depthwise`/`Lossguide`, and the online-CTR-feature scoring path).
+**Depends on**: Phase 3 (CPU training core + oblivious trees) and Phase 6.6 (non-symmetric leaf-wise growers) — both shipped. Independent of the other v1.2 phases (`cb-train` / `cb-compute` only, disjoint from export/GPU-infer/orchestration crates); may run parallel with 16–20. Must precede Phase 22 (the benchmark capstone) so the CPU baseline is competitive.
+**Requirements**: PERF-01, PERF-02, PERF-03
+**Success Criteria** (what must be TRUE):
+
+  1. The CPU oblivious split search builds per-feature bin histograms (`TBucketStats`: Σder1, Σweight per bin) in ONE `O(n)` pass per level plus the subtraction trick (child = parent − sibling), replacing the per-candidate full-dataset `assign_leaves`/`reduce_leaf_stats` rescan — per-tree CPU time no longer scales with `border_count` (flat within noise across 32→254 bins, vs the current linear blow-up) (PERF-01)
+  2. All CPU grow policies (`SymmetricTree`, `Depthwise`, `Lossguide`) AND the online-CTR-feature scoring path use the histogram scorer, and EVERY shipped ≤10⁻⁵ CPU oracle fixture stays bit-exact — parity preserved via deterministic ordered bin summation (fixed-point-u64 per Phase 10/11, or per-bin ordered `sum_f64`) so the algorithm change does not perturb `sum_f64` order (PERF-02)
+  3. The split search is parallelized over features/candidates (`rayon`) with reusable scratch buffers (no per-candidate allocation storm), with a documented end-to-end speedup vs the pre-rewrite baseline on the Spike-002 grid and single-thread per-core efficiency brought within a stated target factor of official CatBoost's 1-thread times (PERF-03)
+
+**Plans**: TBD
+**Context**: Root cause + measured evidence live in `.planning/spikes/002-perf-baseline-and-scaling`, `003-split-finding-hotpath-audit`, `004-parallelism-and-allocation-audit`. The device histogram already exists to mirror onto the host: `cb-backend/src/kernels/pointwise_hist.rs` (Phase 11 `pointwise_hist2` + subtraction trick). The crux (and the reason the current code is slow) is preserving D-05/D-08 bit-exact summation while dropping the rescan — the parity-first `sum_f64` gather-and-sum shortcut is what abandoned the histogram. Fix the ALGORITHM first (removes the `n_bins`/`n_features` blow-up + most allocations), parallelism SECOND. **never add a `cb-train` dependency to `cb-backend`** (feature-unification landmine) — transcribe the histogram logic inline into `cb-train`/`cb-compute`, do not cross the seam. Reuse the CB_PERF-gated harness `crates/cb-train/tests/perf_baseline_test.rs` + `catboost_grid.py` to measure before/after.
+
+### Phase 22: Adoption / DX Capstone
 
 **Goal**: The whole parity story is proven to adopters — benchmarked vs official CatBoost, released to PyPI per-backend, documented with runnable examples, and validated end-to-end on real datasets.
-**Depends on**: Phases 17 (export), 19 (GPU-infer), 20 (orchestration) — it exercises every one of them; must come last.
+**Depends on**: Phases 17 (export), 19 (GPU-infer), 20 (orchestration), 21 (competitive CPU baseline) — it exercises every one of them; must come last.
 **Requirements**: DX-01, DX-02, DX-03, DX-04
 **Success Criteria** (what must be TRUE):
 
@@ -175,7 +190,7 @@ Plans:
 ## Progress
 
 **Execution Order:**
-v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 21. Parallelizable pairs (different crates): {15, 16, 17, 18} overlap; {19, 20} overlap. Firm hard-dependencies: 19 after 15; 21 after 17/19/20; ORCH-02 after ORCH-01 (within 20).
+v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22. Parallelizable pairs (different crates): {15, 16, 17, 18} overlap; {19, 20, 21} overlap (21 is `cb-train`/`cb-compute`-only, disjoint from 19/20's crates). Firm hard-dependencies: 19 after 15; 22 after 17/19/20/21; ORCH-02 after ORCH-01 (within 20).
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -187,7 +202,8 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |
 | 20. Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics | v1.2 | 0/TBD | Not started | - |
-| 21. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
+| 21. CPU Split-Finding Histogram Rewrite | v1.2 | 0/TBD | Not started | - |
+| 22. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
 
