@@ -1,8 +1,8 @@
 ---
 phase: 15
 slug: debt-discharge-cuda-oracle-re-establishment
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-07-05
 ---
@@ -70,11 +70,13 @@ created: 2026-07-05
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 60s in-env
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (RV-13-01..04 oracles + `oracle.py` — authored in 15-01/15-02/15-03)
+- [x] No watch-mode flags
+- [x] Feedback latency < 60s in-env
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+> `wave_0_complete` stays `false` until the sibling `*_test.rs` oracle files exist on disk (written during Wave 1 execution). Plan-content nyquist compliance is confirmed (plan-checker PASS, Dimension 8).
+
+**Approval:** approved 2026-07-05

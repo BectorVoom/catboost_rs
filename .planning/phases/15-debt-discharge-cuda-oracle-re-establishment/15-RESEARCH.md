@@ -305,17 +305,19 @@ for &cand in best_idxs.iter() {
 | A5 | median-of-N and single-session assembly fit one Kaggle run (~15min like Phase 14) | Architecture §3 | LOW — CONTEXT says time is not a constraint; N=3 or N=5 is discretion. |
 | A6 | No RV-13 fix requires editing a `#[cube]` kernel body (all host-side driver/guard/tie-break) | Project Constraints | LOW — verified by reading each site; if RV-13-02's weight-aware max needs a new kernel, apply CubeCL rules + `f32::MIN` + ROCm-in-env re-run. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Is `run_radix_sort_device`'s single-segment scatter provably stable for equal keys?**
    - What we know: doc claims "each pass is stable, so the composition is a stable full sort" (`exact_quantile.rs:62-64`); it is a 1-bit split scatter (`reorder_one_bit_scatter`) which is the textbook stable radix primitive.
    - What's unclear: whether the device scatter is bit-stable under GPU lane races for equal keys (should be — it's a prefix-sum-positioned scatter, not an atomic race).
    - Recommendation: the RV-13-01 tie oracle empirically settles this on cuda/rocm. If stable, done; if not, carry the original index as a tertiary radix key.
+   - **RESOLVED: oracle-settled — 15-01 Task 1 writes the tie oracle first (confirm-or-fix per A1); a tertiary original-index radix-key fallback branch is planned if the oracle shows instability. "Verified stable + oracle added" is a valid HARD-03 discharge (D-01).**
 
 2. **Does RV-13-02's weight-aware group-max need a new kernel or a host-side filter?**
    - What we know: `compute_group_max_host` ignores weights; CPU filters `w>0`.
    - What's unclear: cheapest correct shape — (a) a host loop computing weight>0 per-query max (no kernel), or (b) a new weight-aware `compute_group_max_weighted` kernel.
    - Recommendation: prefer (a) host-side (the max-seed is O(n), already read back to host as `group_max`; no residency benefit to a kernel) — avoids a `#[cube]` edit. Oracle is identical either way.
+   - **RESOLVED: host-side weight>0 filter — 15-01 Task 2 adopts option (a), no `#[cube]` edit, mirroring CPU `ranking_der.rs:257-266`.**
 
 ## Environment Availability
 
