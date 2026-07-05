@@ -73,6 +73,13 @@ fn split_score(score_function: EScoreFunction, leaves: &[LeafStats], scaled_l2: 
 }
 use cb_core::{CbError, CbResult, TFastRng64};
 
+// PERF-03: data-parallel per-feature work. Parallelism is over INDEPENDENT
+// features only — each feature owns disjoint histogram rows / bin columns and its
+// per-bin fold stays the sequential `cb_core::sum_f64`, so `collect` into a
+// feature-ordered Vec is byte-for-byte deterministic (no cross-feature float
+// reduction, no unordered merge — 21-RESEARCH Pitfall 5).
+use rayon::prelude::*;
+
 use crate::fold::{body_sum_weights, body_tail_segments};
 
 // Tests live in dedicated sibling files (source/test separation, CLAUDE.md /
@@ -659,15 +666,21 @@ impl GrowScratch {
             .max()
             .unwrap_or(1);
         let mut bins = vec![0u32; n_features.saturating_mul(n_objects)];
-        for f in 0..n_features {
-            let borders = matrix.feature_borders.get(f).map_or(&[][..], Vec::as_slice);
-            let col = matrix.feature_values.get(f).map_or(&[][..], Vec::as_slice);
-            for obj in 0..n_objects {
-                let v = col.get(obj).copied().unwrap_or(0.0);
-                if let Some(slot) = bins.get_mut(f * n_objects + obj) {
-                    *slot = bin_of(borders, v) as u32;
+        // PERF-03: bin each feature's column in parallel. The feature-major layout
+        // gives each feature a DISJOINT `n_objects`-wide chunk, so `par_chunks_mut`
+        // writes independent slices with no shared reduction — byte-identical to the
+        // sequential loop regardless of thread scheduling (Pitfall 5).
+        if n_objects > 0 {
+            bins.par_chunks_mut(n_objects).enumerate().for_each(|(f, chunk)| {
+                let borders = matrix.feature_borders.get(f).map_or(&[][..], Vec::as_slice);
+                let col = matrix.feature_values.get(f).map_or(&[][..], Vec::as_slice);
+                for obj in 0..n_objects {
+                    let v = col.get(obj).copied().unwrap_or(0.0);
+                    if let Some(slot) = chunk.get_mut(obj) {
+                        *slot = bin_of(borders, v) as u32;
+                    }
                 }
-            }
+            });
         }
         let approx_dim = if n_objects == 0 {
             1
@@ -814,35 +827,51 @@ fn select_level_plain(
     // path (D-6.6-05 — gate on the param being non-empty).
     let active_penalties = penalties.filter(|p| !p.is_noop());
     let dim = scratch.approx_dim;
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for feature in 0..matrix.n_features() {
-        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-        if borders.is_empty() {
-            continue;
-        }
-        // ONE O(n_bins) prefix scan per border, derived from the per-level
-        // histogram (not a per-candidate dataset rescan).
-        let scans = scan_borders_to_leaf_stats(&scratch.hist, feature, borders.len(), dim);
-        for (bi, &border) in borders.iter().enumerate() {
-            let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
-            // UNCHANGED score math over the scan-derived per-dimension LeafStats —
-            // the same call the prior `multi_dim_candidate_score` made (dim=1 is
-            // byte-identical to the scalar split, D-04).
-            let raw = multi_dim_split_score(score_function, per_dim, scaled_l2);
-            // FEAT-04: multiplicative feature_weight + subtractive first-use /
-            // per-object penalties (the two upstream insertion points). The no-op
-            // context leaves `raw` untouched.
-            let score = match active_penalties {
-                Some(p) => p.penalize(feature, raw),
-                None => raw,
-            };
-            candidates.push(Candidate {
-                feature,
-                border,
-                score,
-            });
-        }
-    }
+    // PERF-03: score every feature's borders in parallel over INDEPENDENT features.
+    // Each feature reads disjoint histogram rows via its own `O(n_bins)` prefix scan
+    // and produces its candidate list; `collect` into a feature-ordered `Vec<Vec<_>>`
+    // then flatten reproduces the EXACT sequential enumeration order (feature
+    // ascending × border ascending), so the downstream strict `>` first-wins
+    // `select_best_candidate` is byte-for-byte deterministic single- vs
+    // multi-threaded (Pitfall 5). The per-bin fold inside `scan_borders_to_leaf_stats`
+    // stays the sequential `sum_f64` — no cross-feature float reduction.
+    let candidates: Vec<Candidate> = (0..matrix.n_features())
+        .into_par_iter()
+        .map(|feature| {
+            let borders =
+                matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+            if borders.is_empty() {
+                return Vec::new();
+            }
+            // ONE O(n_bins) prefix scan per border, derived from the per-level
+            // histogram (not a per-candidate dataset rescan).
+            let scans = scan_borders_to_leaf_stats(&scratch.hist, feature, borders.len(), dim);
+            let mut local = Vec::with_capacity(borders.len());
+            for (bi, &border) in borders.iter().enumerate() {
+                let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
+                // UNCHANGED score math over the scan-derived per-dimension LeafStats —
+                // the same call the prior `multi_dim_candidate_score` made (dim=1 is
+                // byte-identical to the scalar split, D-04).
+                let raw = multi_dim_split_score(score_function, per_dim, scaled_l2);
+                // FEAT-04: multiplicative feature_weight + subtractive first-use /
+                // per-object penalties (the two upstream insertion points). The no-op
+                // context leaves `raw` untouched.
+                let score = match active_penalties {
+                    Some(p) => p.penalize(feature, raw),
+                    None => raw,
+                };
+                local.push(Candidate {
+                    feature,
+                    border,
+                    score,
+                });
+            }
+            local
+        })
+        .collect::<Vec<Vec<Candidate>>>()
+        .into_iter()
+        .flatten()
+        .collect();
     let best = select_best_candidate(&candidates).ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
     })?;
@@ -1055,16 +1084,21 @@ fn best_split_for_leaf(
         docs.iter().map(|&i| weight.get(i).copied().unwrap_or(0.0)).collect();
 
     // Feature-major quantized bins for the doc subset: `bins[feature*n_docs+local]`.
+    // PERF-03: each feature owns a DISJOINT `n_docs`-wide chunk, so `par_chunks_mut`
+    // bins the columns in parallel with no shared reduction — byte-identical to the
+    // sequential loop regardless of scheduling (Pitfall 5).
     let mut bins = vec![0u32; n_features.saturating_mul(n_docs)];
-    for feature in 0..n_features {
-        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-        let col = matrix.feature_values.get(feature).map_or(&[][..], Vec::as_slice);
-        for (local, &obj) in docs.iter().enumerate() {
-            let v = col.get(obj).copied().unwrap_or(0.0);
-            if let Some(slot) = bins.get_mut(feature * n_docs + local) {
-                *slot = bin_of(borders, v) as u32;
+    if n_docs > 0 {
+        bins.par_chunks_mut(n_docs).enumerate().for_each(|(feature, chunk)| {
+            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+            let col = matrix.feature_values.get(feature).map_or(&[][..], Vec::as_slice);
+            for (local, &obj) in docs.iter().enumerate() {
+                let v = col.get(obj).copied().unwrap_or(0.0);
+                if let Some(slot) = chunk.get_mut(local) {
+                    *slot = bin_of(borders, v) as u32;
+                }
             }
-        }
+        });
     }
 
     // ONE object-order pass builds the parent leaf's histogram; every candidate's

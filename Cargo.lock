@@ -723,6 +723,7 @@ dependencies = [
  "cb-oracle",
  "ndarray",
  "ndarray-npy",
+ "rayon",
  "serde_json",
 ]
 

@@ -26,6 +26,9 @@ cb-compute = { path = "../cb-compute" }
 # default-features = false: backend selection is forwarded through the [features]
 # block above, never pinned to cpu via cb-backend's own default (Phase 8).
 cb-backend = { path = "../cb-backend", default-features = false }
+# Phase-21 PERF-03: data-parallel per-feature histogram build + border scoring in
+# the grow loop (`tree.rs`). NOT added to cb-compute (D-03 pure-generic boundary).
+rayon.workspace = true
 
 [dev-dependencies]
 # Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the

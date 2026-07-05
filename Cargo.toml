@@ -37,3 +37,13 @@ polars      = { version = "0.54.4", default-features = false, features = ["dtype
 # consumer via feature unification and defeat a cpu-free `--features rocm` build.
 cubecl      = { version = "0.10.0" }
 bytemuck    = { version = "1", features = ["extern_crate_std"] }
+# Phase-21 CPU split-finding parallelism (PERF-03). Data-parallel `par_iter` over
+# INDEPENDENT features for the per-level histogram build + border scoring — the
+# host analogue of upstream CatBoost's `LocalExecutor` parallel-over-candidates.
+# Wired into `cb-train` ONLY (the grow loop); NEVER into `cb-compute` (D-03 keeps
+# the pure-generic per-feature primitive cubecl-/rayon-free). Determinism is
+# preserved by per-feature-independent work + ordered `collect` (21-RESEARCH
+# Pitfall 5); each per-bin fold stays the sequential `cb_core::sum_f64`. Verdict
+# OK (crates.io, ~10yr, github.com/rayon-rs/rayon — 21-RESEARCH Package
+# Legitimacy Audit). Confirmed latest stable via `cargo search`, 2026-07-05.
+rayon       = "1.12.0"
