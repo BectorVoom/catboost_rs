@@ -169,11 +169,11 @@ Plans:
   2. All CPU grow policies (`SymmetricTree`, `Depthwise`, `Lossguide`) AND the online-CTR-feature scoring path use the histogram scorer, and EVERY shipped ≤10⁻⁵ CPU oracle fixture stays bit-exact — parity preserved via deterministic ordered bin summation (fixed-point-u64 per Phase 10/11, or per-bin ordered `sum_f64`) so the algorithm change does not perturb `sum_f64` order (PERF-02)
   3. The split search is parallelized over features/candidates (`rayon`) with reusable scratch buffers (no per-candidate allocation storm), with a documented end-to-end speedup vs the pre-rewrite baseline on the Spike-002 grid and single-thread per-core efficiency brought within a stated target factor of official CatBoost's 1-thread times (PERF-03)
 
-**Plans**: 5/6 plans complete (21-06 gap-closure planned)
+**Plans**: 6/6 plans complete
 **Wave 1**
 
 - [x] 21-01-PLAN.md — cb-compute histogram foundation (BucketHistogram build + prefix scan + subtraction) + bit-exact equivalence tests (PERF-01, PERF-02)
-- [ ] 21-06-PLAN.md — GAP CLOSURE (PERF-01 flatness): running-prefix O(n_bins) scan (TRUE=total−prefix) + cb_core scatter_add flat-scratch build + retained-parent subtraction advance, gated by an atomic full-oracle-suite parity run + CB_PERF 32→254 re-sweep (PERF-01, PERF-02, PERF-03)
+- [x] 21-06-PLAN.md — GAP CLOSURE (PERF-01 flatness): running-prefix O(n_bins) scan (TRUE=total−prefix) + cb_core scatter_add flat-scratch build + retained-parent subtraction advance, gated by an atomic full-oracle-suite parity run + CB_PERF 32→254 re-sweep (PERF-01, PERF-02, PERF-03)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -224,7 +224,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |
 | 20. Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics | v1.2 | 0/TBD | Not started | - |
-| 21. CPU Split-Finding Histogram Rewrite | v1.2 | 5/5 | Complete   | 2026-07-05 |
+| 21. CPU Split-Finding Histogram Rewrite | v1.2 | 6/6 | Complete   | 2026-07-05 |
 | 22. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
