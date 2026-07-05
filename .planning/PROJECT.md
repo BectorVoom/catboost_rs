@@ -24,6 +24,8 @@ A memory-efficient, Rust-native CatBoost implementation that achieves verifiable
 
 **Key context:** Correctness is developed + smoke-tested in-env on AMD/ROCm (CubeCL kernels are portable cuda/rocm/wgpu from one source), but **all GPU kernel oracles — correctness AND speed — are validated on Kaggle CUDA** (no NVIDIA in-env; ROCm is not a gate). The authoritative reference for the full device kernel surface being reimplemented is **`CATBOOST_CUDA_KERNELS_DESIGN.md`** (the complete upstream CUDA training-kernel map — 79 `.cu` + 77 `.cuh` across 9 kernel directories, host/device splits, data types, algorithms); every v1.1 phase cites it. Root-cause analysis of the >20× gap: `.planning/notes/gpu-training-host-light-root-cause.md`. **Landmine:** never add a `cb-train` dependency to `cb-backend` — feature unification breaks the rocm runtime; transcribe CPU references inline.
 
+**Current state (2026-07-05):** All 5 phases of v1.1 (10–14) are executed. **Phase 14 complete — BENCH-03 signed off** (`bench/BENCH-03-SIGNOFF.md`, verdict `BENCH-03: PASS`): every aggregated device row runs **23.9×–42.1× faster than the pre-Phase-10 host-light CPU baseline** on Tesla P100, reversing the original >20× device-slower-than-CPU gap, with CUDA correctness (44 device self-oracle tests, ALL-PASS) gated before any speed number. **Standing debt carried to milestone-close audit** (formal override recorded in `14-VERIFICATION.md`): Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 Kaggle runs were never executed and `GPUT-14` (ε=1e-4 correctness gate) is still `Pending` — the aggregate stitches the committed Phase-12/13 numbers only. Next: `/gsd-complete-milestone` (resolve GPUT-14 / Phase-10-11 BENCH-02 debt or accept as delivered).
+
 ## Requirements
 
 ### Validated
@@ -113,4 +115,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-02 — v1.1 GPU Performance re-scoped in place against `CATBOOST_CUDA_KERNELS_DESIGN.md` (17 → 25 requirements; +GPUT-15..22)*
+*Last updated: 2026-07-05 — Phase 14 complete; BENCH-03 signed off (device path 23.9×–42.1× vs host-light baseline, `BENCH-03: PASS`). All v1.1 phases (10–14) executed; GPUT-14 / Phase-10-11 BENCH-02 remain milestone-close standing debt.*
