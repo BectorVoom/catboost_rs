@@ -353,11 +353,13 @@ pub fn build_bucket_histogram(
         .and_then(|x| x.checked_mul(n_channels))
         .unwrap_or(0);
 
-    // Gather each (cell, channel) member list in ascending OBJECT order, then fold
-    // each through the single sanctioned ordered primitive (the reduce_leaf_stats
-    // shape, generalized). Scratch-buffer REUSE across levels is deferred to a
-    // later wave (21-05, PERF-03); this primitive allocates fresh for clarity.
-    let mut members: Vec<Vec<f64>> = vec![Vec::new(); total];
+    // Scatter-add each per-object contribution directly into ONE flat accumulator
+    // in ascending OBJECT order (WR-02, PERF-03): no per-cell nested-Vec gather.
+    // Because `scatter_add_f64` is the SCATTER form of the same left-to-right `+=`
+    // fold as `cb_core::sum_f64`, folding a cell's members by repeated scatter-add in
+    // this object-outer / feature-inner order is byte-identical to gathering them and
+    // calling `sum_f64` (D-05/D-08 preserved with zero per-cell heap allocation).
+    let mut data = vec![0.0_f64; total];
 
     for obj in 0..n_objects {
         let leaf = match leaf_of.get(obj) {
@@ -376,20 +378,10 @@ pub fn build_bucket_histogram(
             let cell_base = ((leaf * n_features + feature) * n_bins + bin) * n_channels;
             for d in 0..approx_dimension {
                 let dval = der1.get(d * n_objects + obj).copied().unwrap_or(0.0);
-                if let Some(slot) = members.get_mut(cell_base + d) {
-                    slot.push(dval);
-                }
+                cb_core::scatter_add_f64(&mut data, cell_base + d, dval);
             }
-            if let Some(slot) = members.get_mut(cell_base + approx_dimension) {
-                slot.push(w);
-            }
+            cb_core::scatter_add_f64(&mut data, cell_base + approx_dimension, w);
         }
-    }
-
-    let mut data = vec![0.0_f64; total];
-    for (i, slot) in data.iter_mut().enumerate() {
-        let contributions = members.get(i).map_or(&[][..], Vec::as_slice);
-        *slot = sum_f64(contributions);
     }
 
     BucketHistogram {

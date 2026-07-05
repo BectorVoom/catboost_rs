@@ -37,6 +37,28 @@ pub fn sum_f64(values: &[f64]) -> f64 {
     acc
 }
 
+/// The sanctioned SCATTER form of the same left-to-right `f64` fold as
+/// [`sum_f64`]: fold `value` into the accumulator slot at `idx` with a single
+/// sequential `+=`.
+///
+/// Folding a cell's members via repeated `scatter_add_f64` in ascending object
+/// order yields **byte-identical** bits to `sum_f64(&members)` — it is the exact
+/// same naive running sum, just addressed by slot index instead of gathered into a
+/// contiguous slice first. It exists so histogram accumulation can honor the D-08
+/// "no raw float fold outside this file" ban WITHOUT allocating a per-cell `Vec`
+/// (PERF-03): the scatter-add builder holds one flat accumulator and folds directly
+/// into it. Like [`sum_f64`] there is NO compensation (no Kahan/pairwise); the
+/// order is the parity contract.
+///
+/// An out-of-range `idx` is a defensive no-op (no raw indexing — workspace deny
+/// `indexing_slicing`; the caller guarantees valid indices, a mismatch is a bug,
+/// not a panic condition).
+pub fn scatter_add_f64(acc: &mut [f64], idx: usize, value: f64) {
+    if let Some(slot) = acc.get_mut(idx) {
+        *slot += value;
+    }
+}
+
 /// Sum `f32` values, accumulating in an `f64` accumulator, in strict
 /// left-to-right order. Each `f32` is widened to `f64` before being added, then
 /// folded sequentially — matching upstream's `double`-accumulator weight sums
