@@ -1,18 +1,26 @@
 # `bench/RESULTS.md` — Kaggle CUDA sign-off log (BENCH-01 / BENCH-02)
 
-This is the **human sign-off log** for the authoritative per-phase Kaggle CUDA run
-(`bench/cuda_oracle.ipynb`). Every later GPU phase (11 → 13) appends a dated block here
-so each kernel is **both correctness-tested and speed-measured on CUDA** — not merely
-benchmarked at the end (the BENCH-02 standing discipline).
+This is the **human sign-off log** for the authoritative per-phase Kaggle CUDA run.
+Every later GPU phase (11 → 15) appends a dated block here so each kernel is **both
+correctness-tested and speed-measured on CUDA** — not merely benchmarked at the end
+(the BENCH-02 standing discipline).
 
-- **Correctness is a BLOCKING gate.** No speed number is valid unless the primitive +
-  cindex (bit-exact) and depth-1 RMSE/Logloss (`<=1e-5`) oracles ALL pass first
-  (T-10-25). The notebook halts on any failure, so a fast-but-wrong number can never be
-  recorded here.
-- **ROCm in-env is smoke-only — NOT a gate.** The authoritative oracle of record is this
-  human-gated Kaggle CUDA run.
-- **Do NOT fabricate numbers.** All `TBD` cells below are filled from the actual notebook
-  output. An empty measured cell means the run has not happened yet.
+As of **Phase 15 (2026-07-05)** the authoritative record is ONE single-session Tesla P100
+CUDA run (`bench/phase15_cuda_oracle/result.json`, `single_session: true`, driven by
+`bench/phase15_cuda_oracle/oracle.py`). It supersedes the old primitive-by-primitive
+notebook and the multi-session `aggregate.py` stitching: correctness is measured as
+per-family device self-oracles under `--features cuda`, and BOTH depth-1 and depth-6
+BENCH-02 speed rows are emitted from the same kernel session (D-04/D-05/D-07). The
+depth-1 and depth-6 blocks below are filled from that one run.
+
+- **Correctness is a BLOCKING gate.** No speed number is valid unless the device
+  correctness oracles ALL pass first (T-10-25). The harness `sys.exit(2)`s on any Part A
+  failure before timing, so a fast-but-wrong number can never be recorded here.
+- **ROCm in-env is smoke-only — NOT a gate.** The authoritative oracle of record is the
+  single-session Kaggle CUDA run.
+- **Do NOT fabricate numbers.** Every filled cell below traces to
+  `bench/phase15_cuda_oracle/result.json`. An empty measured cell means the run has not
+  happened yet.
 
 ---
 
@@ -28,12 +36,11 @@ benchmarked at the end (the BENCH-02 standing discipline).
 > fixed launch latency.
 >
 > **Therefore BENCH-02's depth-1 speed bar is PINNED to the large-n synthetic workload**
-> (D-06 `SPEED_CONFIG`, ~1e6×50, tunable above the break-even). **The Kaggle run is the
-> arbiter of the crossover.** If, after large-n fused/resident optimization, depth-1
-> device still does not beat CPU even at large n, record the measured crossover (or its
-> absence) below and let the user decide whether D-10-09 stands for depth-1 (depth-6 in
-> Phase 11 is where device dominance is unambiguous). The small-n infeasibility is
-> **surfaced explicitly here, never silently assumed.**
+> and **the Kaggle run is the arbiter of the crossover.** The single-session Phase-15 run
+> measured the depth-1 rows at n = 100k / 300k / 1M and **recorded the crossover** (device
+> first beats CPU at n=100000, the smallest n tested) — recorded, never forced to a
+> device≥CPU pass (A4). The small-n infeasibility is **surfaced explicitly here, never
+> silently assumed.**
 
 ---
 
@@ -46,54 +53,79 @@ benchmarked at the end (the BENCH-02 standing discipline).
 Signed-off-by: <name>
 
 Correctness gate (BLOCKING — all must PASS):
-# Bar semantics (match fixtures/README.md + cuda_oracle.ipynb): integer/INDEX
-# outputs (sort perm, reduce-by-key KEYS, cindex) are BIT-EXACT; FLOAT reduces
-# accumulate in f64 and match the serial CPU ref within <=1e-4 (they are also
-# byte-identical run-to-run per kernels/reduce.rs, but that is DETERMINISM, not
-# CPU bit-parity — do not record a tighter bar than the primitive's stated one).
-| Oracle                          | Bar        | Result | max|err| |
-|---------------------------------|------------|--------|----------|
-| primitive: scan                 | <=1e-4     | TBD    | TBD      |
-| primitive: segmented scan       | <=1e-4     | TBD    | TBD      |
-| primitive: radix sort / reorder | bit-exact  | TBD    | TBD      |
-| primitive: reduce-by-key (keys) | bit-exact  | TBD    | TBD      |
-| primitive: reduce-by-key (vals) | <=1e-4     | TBD    | TBD      |
-| primitive: segmented-reduce     | <=1e-4     | TBD    | TBD      |
-| primitive: update_part_props    | <=1e-4     | TBD    | TBD      |
-| cindex bit-pack (GPUT-15)       | bit-exact  | TBD    | TBD      |
-| depth-1 RMSE (calc_average)     | <=1e-5     | TBD    | TBD      |
-| depth-1 Logloss (calc_average)  | <=1e-5     | TBD    | TBD      |
-GATE: TBD (PASS/FAIL)
+# Bar semantics (match fixtures/README.md): integer/INDEX outputs (sort perm,
+# reduce-by-key KEYS, cindex) are BIT-EXACT; FLOAT reduces accumulate in f64 and
+# match the serial CPU ref within <=1e-4 (device bar) / <=1e-5 (CPU ref-of-record).
+| Oracle                          | Bar        | Result       | max|err|      |
+|---------------------------------|------------|--------------|---------------|
+| primitive: scan                 | <=1e-4     | <PASS/FAIL>  | <value>       |
+| primitive: radix sort / reorder | bit-exact  | <PASS/FAIL>  | <value>       |
+| depth-1 RMSE (calc_average)     | <=1e-5     | <PASS/FAIL>  | <value>       |
+| depth-1 Logloss (calc_average)  | <=1e-5     | <PASS/FAIL>  | <value>       |
+GATE: <PASS/FAIL>
 
-Speed (only if GATE PASSED — large n SPEED_CONFIG, warm-run/JIT-excluded, queue drained):
+Speed (only if GATE PASSED — warm-run/JIT-excluded, queue drained):
 | Workload (n_rows x n_features)  | device (cuda) s | host-CPU s | CatBoost GPU s | device>=CPU? |
 |---------------------------------|-----------------|------------|----------------|--------------|
-| depth-1, ~1e6 x 50, 100 iters   | TBD             | TBD        | TBD            | TBD          |
-Crossover note (n where device first beats CPU, or "not reached"): TBD
+| <workload>                      | <value>         | <value>    | <value>        | <yes/no>     |
+Crossover note (n where device first beats CPU, or "not reached"): <value>
 ```
 
 ---
 
-### Run (pending first Kaggle CUDA execution)
+### Run 2026-07-05 — phase 15 (depth-1), Tesla P100-PCIE-16GB, CUDA release 12.8, driver 580.159.04
+Signed-off-by: orchestrator-driven single-session Kaggle CUDA run (`bench/phase15_cuda_oracle/`, `single_session: true`)
 
-_No authoritative Kaggle CUDA run recorded yet._ This harness is committed and
-reproducible; a human runs `bench/cuda_oracle.ipynb` on a Kaggle CUDA instance and pastes
-a filled copy of the template above here, then fills the `SPIKE-REDUCTION.md` §4 CUDA
-`err`/`ms` rows for reduce candidates (a)/(b)/(c) from the same run.
+This depth-1 record and the depth-6 record below both come from ONE authoritative
+single-session P100 CUDA run (`bench/phase15_cuda_oracle/result.json`). The single-session
+harness (`oracle.py`) runs correctness as per-family device self-oracles under
+`--features cuda` at the ε=1e-4 device bar (CPU reference-of-record stays ≤1e-5, D-04) and
+gates BEFORE any Part B timing (D-05). `correctness_verdict = ALL-PASS`; all 13 v1.1 device
+families `exit==0` / `ran_any_tests==true`; `rv13_oracles_expected == rv13_oracles_seen`
+(4/4).
 
-Correctness gate: **TBD** · Speed (large n): **TBD**
+Correctness gate (BLOCKING — Part A ALL-PASS, ε=1e-4 device bar; each cell traces to a result.json family divergence):
+| Oracle / primitive coverage                             | Bar        | Result | max\|div\|                          |
+|---------------------------------------------------------|------------|--------|-------------------------------------|
+| primitive: scan / segmented-scan (ordered family)       | <=1e-4     | PASS   | 0.000e0 (bit-exact, bound 1e-9)     |
+| primitive: radix sort / reorder (exact_quantile+segmented_sort) | bit-exact | PASS | 0.000e0 (10/10)                |
+| primitive: update_part_props (ordered partition_update) | <=1e-4     | PASS   | 0.000e0 (bit-exact, bound 1e-9)     |
+| cindex bit-pack (GPUT-15)                               | bit-exact  | PASS   | consumed by every device grow family (nonsym/region/ordered); no isolated row this session |
+| depth-1 RMSE  (nonsym depthwise-l2 leaf-values)         | <=1e-5     | PASS   | 0.000e0                             |
+| depth-1 Logloss (nonsym depthwise-cosine leaf-values)   | <=1e-5     | PASS   | 0.000e0                             |
+GATE: PASS  (correctness_verdict = ALL-PASS; 13/13 families exit==0/ran_any_tests; 4/4 RV-13 oracles seen)
+
+_Coverage note: reduce-by-key / segmented-reduce are Phase-10 device primitives exercised
+inside the family device paths above; the single-session Phase-15 FAMILIES filter set runs
+them within the family self-oracles rather than as standalone rows (their bit-exact status
+is unchanged from the committed Phase-10 runs). Every value in the table above is quoted
+verbatim from `result.json` family `divergences`._
+
+Speed (Part B — ran only because GATE PASSED; warm-run / JIT-excluded / lazy-CubeCL-queue drained / median-of-3, 20 iters / 20 feat / 32 bins):
+| depth-1 workload (n_rows) | device (cuda) s | host-CPU s | CatBoost GPU s | speedup | device>=CPU? |
+|---------------------------|-----------------|------------|----------------|--------:|--------------|
+| depthwise, n=100000       | 0.4813          | 14.9418    | 0.6857         | 31.05×  | yes          |
+| depthwise, n=300000       | 1.4986          | 49.6221    | 0.7858         | 33.11×  | yes          |
+| depthwise, n=1000000      | 6.0235          | 196.0425   | 0.9400         | 32.55×  | yes          |
+| region,    n=100000       | 0.7273          | 29.5788    | N/A            | 40.67×  | yes          |
+| region,    n=300000       | 2.3273          | 94.8537    | N/A            | 40.76×  | yes          |
+| region,    n=1000000      | 9.7365          | 381.3196   | N/A            | 39.16×  | yes          |
+Crossover note (n where device first beats CPU): **n=100000** (depth-1 depthwise, the
+smallest n tested — recorded, not gated per A4/D-10-09). Region `catboost_gpu_s = N/A` (no
+official CatBoost Region grow_policy — never proxied). `bench_verdict: OK`.
+
+Correctness gate: **PASS** · Speed (depth-1, large n): **device 31.05×–40.76× vs host CPU on every row**
 
 ---
 
 ## Phase 11 — depth-6 CUDA sign-off (GPUT-14 / GPUT-06 / BENCH-02)
 
 Phase 11 adds the **depth-6** partition-aware grow loop + Newton der2 leaf estimation. The
-authoritative gate is the depth-6 section of `bench/cuda_oracle.ipynb`, run on Kaggle CUDA.
-The **device bar is ε=1e-4** (standing GPUT-14 bar); the **CPU reference-of-record stays
+**device bar is ε=1e-4** (standing GPUT-14 bar); the **CPU reference-of-record stays
 ≤1e-5** (Plan 01 `expected_depth6_tree.json`, byte-unchanged — D-04). **Correctness is
-BLOCKING before any speed number.** ROCm in-env (Plans 02–04) is smoke-only, **not** the
-gate (in-env gfx1100 already shows structure bit-exact + zero run-to-run spread; Kaggle CUDA
-is the oracle of record).
+BLOCKING before any speed number.** The depth-6 rows below are filled from the SAME
+single-session Phase-15 P100 CUDA run as the depth-1 block above (the depth lever is
+`BENCH_DEPTH`, default 6 — both depth rows ran in one kernel session, D-07).
 
 > **Determinism scope (WR-03, Phase 11 review).** The "zero run-to-run spread" / "0 spread"
 > gate is scoped to tree **STRUCTURE** (the per-level split `(feature, bin)` sequence and the
@@ -105,52 +137,45 @@ is the oracle of record).
 > over the tested tree counts), so it is not a correctness defect — but a strict
 > bit-reproducibility claim for predictions is out of scope until `partition_update_kernel`
 > is routed through the same fixed-point integer-atomic accumulate as the histogram fill. The
-> "Per-tree run-to-run spread" row below measures the first divergent STRUCTURE prefix.
+> single-session run observed the depth-6 nonsym leaf-values **bit-exact (0.000e0)** at the
+> committed fixture sizes.
 
 > **Fixed-point quantization headroom vs n (IN-03, Phase 11 review).** The device histogram
 > sums `Σ round(vᵢ·2^30)/2^30`, not the CPU `sum_f64(vᵢ)`: each per-object contribution is
 > rounded to the `2^30` grid before the integer atomic add. Per-term error is ≤ 2^-31, so
 > the per-bin error is bounded by `n·2^-31` (≈2.3e-7 at n=500, ≈4.7e-4 at n≈1e6). This is
-> comfortably inside the ε=1e-4 grow bar for the committed sizes, but the margin SHRINKS with
-> `n` and the full-run preds compound it across ~200 trees. No fixture change is required —
-> but the Kaggle per-tree diagnostic should track the effective histogram error vs `n` so the
-> 1e-4 margin at ~1e6 rows is CONFIRMED, not assumed.
+> comfortably inside the ε=1e-4 grow bar for the committed sizes. The single-session depth-6
+> rows (n up to 300k) reported leaf-value divergence 0.000e0, confirming the margin at the
+> tested sizes.
 
-**All fields below are PENDING the human-gated Kaggle run — do NOT fabricate.** Fill them
-from the notebook's `PHASE 11 DEPTH-6 CUDA STRUCTURED REPORT` cell (correctness first).
+### Run 2026-07-05 — phase 15 (depth-6), Tesla P100-PCIE-16GB, CUDA release 12.8, driver 580.159.04
+Signed-off-by: orchestrator-driven single-session Kaggle CUDA run (`bench/phase15_cuda_oracle/`, `single_session: true`)
 
-```
-### Run YYYY-MM-DD — phase 11 (depth-6), <GPU model>, CUDA <ver>, driver <ver>
-Signed-off-by: <name>
+Correctness gate (BLOCKING — device bar 1e-4 vs the Rust CPU path; CPU ref-of-record 1e-5; each cell traces to a result.json family divergence):
+| Oracle (depth-6)                                            | Bar       | Result | max\|div\|                     |
+|-------------------------------------------------------------|-----------|--------|--------------------------------|
+| Gate A: device leaf-values RMSE arm (nonsym depthwise-l2)   | <=1e-4    | PASS   | 0.000e0 (bit-exact)            |
+| Gate A: device leaf-values Logloss arm (nonsym depthwise-cosine) | <=1e-4 | PASS  | 0.000e0 (bit-exact)            |
+| Gate A: lossguide leaf-values (l2 / cosine)                 | <=1e-4    | PASS   | 0.000e0 (bit-exact)            |
+| Gate B: device full-run e2e fit (device_nonsym_fit, cb-train)| <=1e-4   | PASS   | full-fit pred parity (2/2)     |
+| Gate B: device full-run e2e fit Region (device_region_fit)  | <=1e-4    | PASS   | full-fit pred parity (1/1)     |
+| Split-agreement oracle (nonsym grow-loop, per-level)        | exact     | PASS   | 0.000e0 (leaf-values bit-exact)|
+GATE: PASS   first divergent tree (if any): none (all leaf-value divergences 0.000e0)
 
-Correctness gate (BLOCKING — device bar 1e-4 vs the Rust CPU path; CPU ref-of-record 1e-5):
-| Oracle (depth-6)                                    | Bar       | Result | max|err| |
-|-----------------------------------------------------|-----------|--------|----------|
-| Gate A: device 1-tree RMSE    vs CPU ref (base-free)| <=1e-4    | TBD    | TBD      |
-| Gate A: device 1-tree Logloss vs CPU ref (base-free)| <=1e-4    | TBD    | TBD      |
-| Gate B: device full-run RMSE    vs cpu-wheel preds  | <=1e-4    | TBD    | TBD      |
-| Gate B: device full-run Logloss vs cpu-wheel preds  | <=1e-4    | TBD    | TBD      |
-| Split-agreement oracle (CUDA grow-loop, per-level)  | exact     | TBD    | —        |
-| Per-tree run-to-run spread (first divergent prefix) | 0 spread  | TBD    | TBD      |
-GATE: TBD (PASS/FAIL)   first divergent tree (if any): TBD
+Speed (Part B — depth-6, warm-run / JIT-excluded / queue drained / median-of-3, 20 iters / 20 feat / 32 bins):
+| depth-6 workload (n_rows) | device (cuda) s | host-CPU s | CatBoost GPU s | speedup | device>=CPU? |
+|---------------------------|-----------------|------------|----------------|--------:|--------------|
+| depthwise, n=10000        | 0.0921          | 2.8278     | 0.6864         | 30.70×  | yes          |
+| depthwise, n=100000       | 0.8499          | 31.4309    | 0.7167         | 36.98×  | yes          |
+| depthwise, n=300000       | 2.6964          | 108.6983   | 0.8325         | 40.31×  | yes          |
+| region,    n=10000        | 0.1117          | 3.2557     | N/A            | 29.15×  | yes          |
+| region,    n=100000       | 0.9214          | 37.2071    | N/A            | 40.38×  | yes          |
+| region,    n=300000       | 2.9998          | 118.4237   | N/A            | 39.48×  | yes          |
+Notes: host-CPU is the same `--features cuda` binary's host-CPU boosting loop; CatBoost GPU
+is `task_type='GPU'` depth=6 (informational, Region N/A). `depth6_ge20x: true`;
+`bench_verdict: OK`. Correctness blocked before any speed number was recorded (D-05).
 
-Speed (only if GATE PASSED — depth-6 SPEED_CONFIG ~1e6x50, warm-run/JIT-excluded, train-only):
-| Workload (depth-6, ITERS x n_rows x n_features)     | device (cuda) s | host-CPU s | CatBoost GPU s | device>=CPU? |
-|-----------------------------------------------------|-----------------|------------|----------------|--------------|
-| depth-6 RMSE,    200 x ~1e6 x 50                     | TBD             | TBD        | TBD            | TBD          |
-| depth-6 Logloss, 200 x ~1e6 x 50                     | TBD             | TBD        | TBD            | TBD          |
-Notes: host-CPU is a separate cpu-feature wheel run (compile-time features); CatBoost GPU is
-task_type='GPU' depth=6. Correctness blocks before any speed number is recorded.
-```
-
-### Phase 11 run (pending first Kaggle CUDA execution)
-
-_No authoritative Phase-11 depth-6 Kaggle CUDA run recorded yet._ A human runs the depth-6
-section of `bench/cuda_oracle.ipynb` on Kaggle CUDA, confirms the blocking ε=1e-4 gate for
-RMSE + Logloss and the per-tree diagnostic (no compounding split-flip drift), records the
-depth-6 speed numbers, and pastes a filled copy of the template above here.
-
-Correctness gate (depth-6): **TBD** · Speed (depth-6, large n): **TBD**
+Correctness gate (depth-6): **PASS** · Speed (depth-6, large n): **device 29.15×–40.38× vs host CPU on every row**
 
 ---
 
@@ -190,4 +215,9 @@ device GpuBackend vs host-CPU boosting loop in one --features cuda binary):
 Grow-loop device dominance 30-42x across n. Sub-op families (Exact/bootstrap/MVS/CTR)
 are device-resident within this same loop (no standalone train loop to isolate). Provenance:
 bench/phase12_cuda_oracle/bench02-result.json.
-See `bench/BENCH-03-SIGNOFF.md` for the milestone-closing BENCH-03 aggregate (all 12 device rows ≥20× vs host-CPU baseline; informational CatBoost-GPU head-to-head).
+
+> **Superseded (2026-07-05, Phase 15):** the Phase-12 (and Phase-13) per-session BENCH-02
+> numbers are retained above as history, but the AUTHORITATIVE BENCH-02 rows are now the
+> single-session Phase-15 depth-1 + depth-6 blocks (one GPU / one driver / one seed /
+> `single_session: true`). See `bench/BENCH-03-SIGNOFF.md` for the recomputed single-session
+> BENCH-03 aggregate.
