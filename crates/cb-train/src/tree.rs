@@ -1004,9 +1004,12 @@ fn unsplit_leaf_score(
 
 /// Find the best split for ONE leaf's document subset (FEAT-06 shared leaf-wise
 /// scoring core). Enumerates candidates in the SAME upstream order the oblivious
-/// path uses (float feature ascending, border ascending), scores the 2-leaf
-/// `{value <= border, value > border}` partition restricted to this leaf's docs via
-/// the configured score calcer, and keeps the strict first-wins best
+/// path uses (float feature ascending, border ascending) and scores each 2-leaf
+/// `{value <= border, value > border}` partition from a per-leaf
+/// [`BucketHistogram`] built ONCE over this leaf's docs + an `O(n_bins)` prefix
+/// scan ([`scan_borders_to_leaf_stats`]) fed to the UNCHANGED score calcer — the
+/// histogram scorer (PERF-02), replacing the old per-candidate `reduce_leaf_stats`
+/// full-subset rescan. Keeps the strict first-wins best
 /// ([`select_best_candidate`] semantics — strict `>`). The reported GAIN is
 /// `best_2leaf_score - unsplit_score`; the leaf is splittable only when
 /// `docs.len() >= min_data_in_leaf`, a candidate exists, and `gain >= 1e-9`
@@ -1025,35 +1028,96 @@ fn best_split_for_leaf(
     }
     let baseline = unsplit_leaf_score(docs, der1, weight, scaled_l2, score_function);
 
+    // Per-leaf BucketHistogram over THIS leaf's document subset — a SINGLE parent
+    // leaf (`n_leaves == 1`). Local object index `local` maps to global
+    // `docs[local]`; the subset's der1 / weight are gathered in ascending
+    // local-object (== ascending doc) order so the reduction order stays the
+    // canonical D-05 object order. The leaf-wise / region growers score
+    // single-dimension der1 (`approx_dim == 1` — `der1` indexed directly by object,
+    // the existing scalar contract, `boosting.rs:3778,3800`), so the histogram
+    // carries one delta channel + one shared weight channel.
+    let n_docs = docs.len();
+    let n_features = matrix.n_features();
+    let approx_dim = 1usize;
+
+    // Global bin width = max(n_borders)+1 across features; a feature with fewer
+    // borders leaves its upper bins empty (the per-feature scan walks only its own
+    // borders — Pitfall 4 boundary via `bin_of`). Mirrors `GrowScratch::new`.
+    let n_bins = (0..n_features)
+        .map(|f| matrix.feature_borders.get(f).map_or(0, Vec::len) + 1)
+        .max()
+        .unwrap_or(1);
+
     // Restricted der1 / weight for this leaf's docs (object order preserved so the
     // reduction order is deterministic).
     let der1_sub: Vec<f64> = docs.iter().map(|&i| der1.get(i).copied().unwrap_or(0.0)).collect();
     let weight_sub: Vec<f64> =
         docs.iter().map(|&i| weight.get(i).copied().unwrap_or(0.0)).collect();
 
-    let mut best: Option<(Candidate, Vec<bool>)> = None;
-    let mut best_score = MINIMAL_SCORE;
-    // Candidate enumeration: float features ascending, borders ascending (the
-    // upstream `AddFloatFeatures` order the oblivious `select_level_plain` uses).
-    for feature in 0..matrix.n_features() {
+    // Feature-major quantized bins for the doc subset: `bins[feature*n_docs+local]`.
+    let mut bins = vec![0u32; n_features.saturating_mul(n_docs)];
+    for feature in 0..n_features {
         let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-        for &border in borders {
-            // 2-leaf partition restricted to this leaf's docs: bit 0 = passes test.
-            let passes: Vec<bool> =
-                docs.iter().map(|&obj| matrix.passes_float(feature, obj, border)).collect();
-            let leaf_of: Vec<usize> = passes.iter().map(|&p| usize::from(p)).collect();
-            let stats = reduce_leaf_stats(&leaf_of, &der1_sub, &weight_sub, 2);
-            let score = split_score(score_function, &stats, scaled_l2);
-            // STRICT `>` first-wins (Pitfall 1): the FIRST candidate reaching the
-            // running max wins; later equal-gain candidates do NOT replace it.
-            if score > best_score {
-                best_score = score;
-                best = Some((Candidate { feature, border, score }, passes));
+        let col = matrix.feature_values.get(feature).map_or(&[][..], Vec::as_slice);
+        for (local, &obj) in docs.iter().enumerate() {
+            let v = col.get(obj).copied().unwrap_or(0.0);
+            if let Some(slot) = bins.get_mut(feature * n_docs + local) {
+                *slot = bin_of(borders, v) as u32;
             }
         }
     }
 
-    let (cand, passes) = best?;
+    // ONE object-order pass builds the parent leaf's histogram; every candidate's
+    // [false, true] children then come from the `O(n_bins)` prefix scan of THIS
+    // histogram, replacing the per-candidate `assign_leaves` + `reduce_leaf_stats`
+    // full-subset rescan (PERF-02). The histogram is fresh-built per leaf (still
+    // `O(docs)`/leaf — the target complexity). The two-children subtraction trick
+    // (`BucketHistogram::remove`) applies where a parent histogram is threaded to
+    // its children; here the per-leaf-independent grower architecture fresh-builds
+    // each child instead (histogram threading / scratch reuse is 21-05 scope), so
+    // this stays the "fresh-build both" branch.
+    let leaf_of_local = vec![0usize; n_docs];
+    let hist = build_bucket_histogram(
+        &bins,
+        &der1_sub,
+        &weight_sub,
+        &leaf_of_local,
+        1,
+        n_features,
+        n_bins,
+        approx_dim,
+    );
+
+    let mut best: Option<Candidate> = None;
+    let mut best_score = MINIMAL_SCORE;
+    // Candidate enumeration: float features ascending, borders ascending (the
+    // upstream `AddFloatFeatures` order the oblivious `select_level_plain` uses).
+    for feature in 0..n_features {
+        let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+        if borders.is_empty() {
+            continue;
+        }
+        // ONE `O(n_bins)` prefix scan per border from the per-leaf histogram: the
+        // FALSE child (`bins <= border`) is leaf index 0, the TRUE child
+        // (`bins > border`) is leaf index 1 — byte-for-byte the leaf order the old
+        // `reduce_leaf_stats(leaf_of = passes as 0/1, .., 2)` produced.
+        let scans = scan_borders_to_leaf_stats(&hist, feature, borders.len(), approx_dim);
+        for (bi, &border) in borders.iter().enumerate() {
+            // dim == 1: `per_dim[0]` is `[false_stats, true_stats]` — the exact
+            // `&[LeafStats]` the pre-rewrite `split_score` consumed.
+            let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
+            let stats = per_dim.first().map_or(&[][..], Vec::as_slice);
+            let score = split_score(score_function, stats, scaled_l2);
+            // STRICT `>` first-wins (Pitfall 1): the FIRST candidate reaching the
+            // running max wins; later equal-gain candidates do NOT replace it.
+            if score > best_score {
+                best_score = score;
+                best = Some(Candidate { feature, border, score });
+            }
+        }
+    }
+
+    let cand = best?;
     let gain = best_score - baseline;
     if gain < 1e-9 {
         return None;
@@ -1063,8 +1127,8 @@ fn best_split_for_leaf(
     // upstream's `AddSplit` uses (left = test-false subtree, right = test-true).
     let mut left_docs = Vec::new();
     let mut right_docs = Vec::new();
-    for (&obj, &p) in docs.iter().zip(passes.iter()) {
-        if p {
+    for &obj in docs {
+        if matrix.passes_float(cand.feature, obj, cand.border) {
             right_docs.push(obj);
         } else {
             left_docs.push(obj);
@@ -2728,3 +2792,7 @@ pub fn greedy_tensor_search_oblivious_pairwise(
 #[cfg(test)]
 #[path = "region_grow_test.rs"]
 mod region_grow_test;
+
+#[cfg(test)]
+#[path = "leaf_wise_scorer_test.rs"]
+mod leaf_wise_scorer;
