@@ -4,17 +4,17 @@ milestone: v1.2
 milestone_name: Parity Completion & Release Readiness
 current_phase: 21
 current_phase_name: cpu-split-finding-histogram-rewrite
-status: executing
+status: verifying
 stopped_at: "15-03 COMPLETE (commits 5d07c67 Task1 / 734109a Task2) — the SINGLE authoritative Kaggle P100 CUDA session. Part A (blocking correctness pre-gate, ε=1e-4): all 13 v1.1 device families exit==0 + ran_any_tests==true in ONE --features cuda session, divergences bit-exact (max abs_div=0.000e0; only stochastic bootstrap 2.384e-7 / mvs ~1e-15 nonzero, far under 1e-4); rv13_oracles_expected == rv13_oracles_seen (all 4: tie_order_matches_cpu_stable_descending + softmax_weight_max_seed on ranking family, empty_group_means_no_fault on ranking, pairwise_near_equal_border_tiebreak on pairwise) → correctness_verdict ALL-PASS. Part B (BENCH-02, ran only because Part A passed, D-05): 12 depth-1/depth-6 × {depthwise,region} rows median-of-3, device beats host CPU every row 29.1×–40.8×, bench_verdict OK, depth6_ge20x true; crossover = device first beats CPU at n=100000 (depth-1 depthwise, smallest n; NOT gated per A4). Region catboost_gpu_s = N/A (no upstream Region grow_policy). Provenance: Tesla P100-PCIE-16GB, driver 580.159.04, CUDA 12.8, seed 42, single_session=true. Task-1 Rule-3 deviation: BENCH_DEPTH env lever (default 6) added to crates/cb-train/tests/bench_grow_speed_test.rs so both depth rows run in one kernel (depth-6 provenance byte-unchanged). NO numbers fabricated — result.json committed verbatim (734109a). HARD-01 + HARD-02 discharged. NEXT: 15-04 (Wave 3) — 15-EVIDENCE.md + BENCH-03 recompute-in-place from bench/phase15_cuda_oracle/result.json + REQUIREMENTS/MILESTONES/STATE bookkeeping flip. Resume file: .planning/phases/15-debt-discharge-cuda-oracle-re-establishment/15-03-SUMMARY.md."
-last_updated: "2026-07-05T11:29:59.131Z"
+last_updated: "2026-07-05T11:54:22.007Z"
 last_activity: 2026-07-05
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 8
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 9
-  completed_plans: 8
-  percent: 13
+  completed_plans: 9
+  percent: 25
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 Phase: 21 (cpu-split-finding-histogram-rewrite) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-07-05 — Phase 21 execution started
 
 ## Performance Metrics
@@ -209,6 +209,7 @@ Last activity: 2026-07-05 — Phase 21 execution started
 | Phase 21 P01 | 16 | 2 tasks | 3 files |
 | Phase 21 P03 | 35 | 2 tasks | 2 files |
 | Phase 21 P04 | 30 | 2 tasks | 1 files |
+| Phase 21 P05 | 80 | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -446,6 +447,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 15 v1.1 debt discharged via single-session P100 CUDA run; HARD-01/02/03 complete; GPUT-14 aggregate + Phase-10/11 BENCH-02 gaps cleared; RV-13-01 confirmatory, RV-13-02/03/04 real fixes; Region catboost_gpu_s N/A
 - [Phase ?]: 21-03: best_split_for_leaf histogram-backed (per-leaf BucketHistogram + O(n_bins) prefix scan); Depthwise/Lossguide/Region inherit the scorer via the shared core; bit-exact non-symmetric/region oracles (PERF-02)
 - [Phase ?]: 21-03: subtraction-trick parent->child histogram threading deferred to 21-05; leaf-wise growers stay per-leaf-independent (fresh-build each leaf's histogram, O(docs)/leaf target complexity)
+- [Phase 21]: Phase 21-05: rayon parallelizes CPU split search over independent features (par_iter/par_chunks_mut, ordered collect); byte-identical determinism proven; PERF-03 8-30x per-tree speedup vs pre-rewrite, per-core gap vs CatBoost 1-thr cut from 173-454x to 8.6-33x; PERF-01 n_bins flatness PARTIAL (running-prefix scan deferred for parity safety)
 
 ### Pending Todos
 
@@ -520,7 +522,7 @@ Items acknowledged and carried forward at the v1.1 GPU Performance milestone clo
 
 ## Session Continuity
 
-Last session: 2026-07-05T11:29:51.262Z
+Last session: 2026-07-05T11:53:54.803Z
 Stopped at: 15-03 COMPLETE (commits 5d07c67 Task1 / 734109a Task2) — the SINGLE authoritative Kaggle P100 CUDA session. Part A (blocking correctness pre-gate, ε=1e-4): all 13 v1.1 device families exit==0 + ran_any_tests==true in ONE --features cuda session, divergences bit-exact (max abs_div=0.000e0; only stochastic bootstrap 2.384e-7 / mvs ~1e-15 nonzero, far under 1e-4); rv13_oracles_expected == rv13_oracles_seen (all 4: tie_order_matches_cpu_stable_descending + softmax_weight_max_seed on ranking family, empty_group_means_no_fault on ranking, pairwise_near_equal_border_tiebreak on pairwise) → correctness_verdict ALL-PASS. Part B (BENCH-02, ran only because Part A passed, D-05): 12 depth-1/depth-6 × {depthwise,region} rows median-of-3, device beats host CPU every row 29.1×–40.8×, bench_verdict OK, depth6_ge20x true; crossover = device first beats CPU at n=100000 (depth-1 depthwise, smallest n; NOT gated per A4). Region catboost_gpu_s = N/A (no upstream Region grow_policy). Provenance: Tesla P100-PCIE-16GB, driver 580.159.04, CUDA 12.8, seed 42, single_session=true. Task-1 Rule-3 deviation: BENCH_DEPTH env lever (default 6) added to crates/cb-train/tests/bench_grow_speed_test.rs so both depth rows run in one kernel (depth-6 provenance byte-unchanged). NO numbers fabricated — result.json committed verbatim (734109a). HARD-01 + HARD-02 discharged. NEXT: 15-04 (Wave 3) — 15-EVIDENCE.md + BENCH-03 recompute-in-place from bench/phase15_cuda_oracle/result.json + REQUIREMENTS/MILESTONES/STATE bookkeeping flip. Resume file: .planning/phases/15-debt-discharge-cuda-oracle-re-establishment/15-03-SUMMARY.md.
 Stopped at (prior): Completed 15-01-PLAN.md (RV-13-01/02 discharged)
 Stopped at (prior): Phase 9 context gathered

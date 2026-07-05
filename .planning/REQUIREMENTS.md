@@ -52,7 +52,7 @@ Requirements for the v1.2 milestone. Each maps to exactly one roadmap phase.
 
 - [x] **PERF-01**: The CPU oblivious split search builds per-feature bin histograms (`TBucketStats`: Σder1, Σweight per bin) in one `O(n)` pass per level + the subtraction trick (child = parent − sibling), replacing the per-candidate full-dataset `assign_leaves`/`reduce_leaf_stats` rescan — per-tree CPU time no longer scales with `border_count` (flat within noise 32→254 bins). Root cause: Spike 002/003.
 - [x] **PERF-02**: All CPU grow policies (`SymmetricTree`, `Depthwise`, `Lossguide`) AND the online-CTR-feature scoring path use the histogram scorer, and every shipped ≤10⁻⁵ CPU oracle fixture stays bit-exact — parity preserved via deterministic ordered bin summation (fixed-point-u64 per Phase 10/11, or per-bin ordered `sum_f64`).
-- [ ] **PERF-03**: The split search is parallelized over features/candidates (`rayon`) with reusable scratch buffers (no per-candidate allocation), with a documented end-to-end speedup vs the pre-rewrite baseline on the Spike-002 grid and single-thread per-core efficiency brought within a stated target factor of official CatBoost's 1-thread times. Contributing cause: Spike 004.
+- [x] **PERF-03**: The split search is parallelized over features/candidates (`rayon`) with reusable scratch buffers (no per-candidate allocation), with a documented end-to-end speedup vs the pre-rewrite baseline on the Spike-002 grid and single-thread per-core efficiency brought within a stated target factor of official CatBoost's 1-thread times. Contributing cause: Spike 004.
 
 ## Future Requirements
 
@@ -100,7 +100,7 @@ Which phases cover which requirements. Populated during roadmap creation.
 | GINF-01 | Phase 19 | Pending |
 | PERF-01 | Phase 21 | Complete |
 | PERF-02 | Phase 21 | Complete |
-| PERF-03 | Phase 21 | Pending |
+| PERF-03 | Phase 21 | Complete |
 | DX-01 | Phase 22 | Pending |
 | DX-02 | Phase 22 | Pending |
 | DX-03 | Phase 22 | Pending |
