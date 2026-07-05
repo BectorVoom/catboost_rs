@@ -6,7 +6,7 @@ status: planning
 last_updated: "2026-07-05T02:04:20.365Z"
 last_activity: 2026-07-05
 progress:
-  total_phases: 0
+  total_phases: 7
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Planning next milestone (`/gsd-new-milestone`). v1.1 GPU Performance shipped — BENCH-03 PASS; open threads: FEAT-07 HNSW (Phase 9 backlog) + GPUT-14 aggregate / Phase-10-11 BENCH-02 standing debt.
+**Current focus:** v1.2 roadmap created — 7 phases (15–21), 19/19 requirements mapped. Build order debt-first: Phase 15 (discharge GPUT-14/BENCH-02/RV-13 debt + re-establish CUDA oracle) → 16 (online-HNSW, last CPU parity gap) → 17 (ONNX/CoreML export) → 18 (extended fstr) → 19 (GPU inference) → 20 (CV/tuning/snapshot orchestration) → 21 (adoption/DX capstone). Next: `/gsd-plan-phase 15`.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 15 — Debt Discharge & CUDA Oracle Re-establishment (not started; roadmap done)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-07-05 — Milestone v1.2 started
+Status: Roadmap complete — ready to plan Phase 15
+Last activity: 2026-07-05 — Milestone v1.2 roadmap created (Phases 15–21)
 
 ## Performance Metrics
 

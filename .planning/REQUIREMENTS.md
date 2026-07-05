@@ -77,31 +77,31 @@ Which phases cover which requirements. Populated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HARD-01 | TBD | Pending |
-| HARD-02 | TBD | Pending |
-| HARD-03 | TBD | Pending |
-| FEAT-07 | TBD | Pending |
-| EXPORT-01 | TBD | Pending |
-| EXPORT-02 | TBD | Pending |
-| EXPORT-03 | TBD | Pending |
-| FSTR-01 | TBD | Pending |
-| FSTR-02 | TBD | Pending |
-| FSTR-03 | TBD | Pending |
-| ORCH-01 | TBD | Pending |
-| ORCH-02 | TBD | Pending |
-| ORCH-03 | TBD | Pending |
-| ORCH-04 | TBD | Pending |
-| GINF-01 | TBD | Pending |
-| DX-01 | TBD | Pending |
-| DX-02 | TBD | Pending |
-| DX-03 | TBD | Pending |
-| DX-04 | TBD | Pending |
+| HARD-01 | Phase 15 | Pending |
+| HARD-02 | Phase 15 | Pending |
+| HARD-03 | Phase 15 | Pending |
+| FEAT-07 | Phase 16 | Pending |
+| EXPORT-01 | Phase 17 | Pending |
+| EXPORT-02 | Phase 17 | Pending |
+| EXPORT-03 | Phase 17 | Pending |
+| FSTR-01 | Phase 18 | Pending |
+| FSTR-02 | Phase 18 | Pending |
+| FSTR-03 | Phase 18 | Pending |
+| ORCH-01 | Phase 20 | Pending |
+| ORCH-02 | Phase 20 | Pending |
+| ORCH-03 | Phase 20 | Pending |
+| ORCH-04 | Phase 20 | Pending |
+| GINF-01 | Phase 19 | Pending |
+| DX-01 | Phase 21 | Pending |
+| DX-02 | Phase 21 | Pending |
+| DX-03 | Phase 21 | Pending |
+| DX-04 | Phase 21 | Pending |
 
 **Coverage:**
 - v1.2 requirements: 19 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 19 ⚠️
+- Mapped to phases: 19 ✓
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-07-05*
-*Last updated: 2026-07-05 after initial v1.2 definition*
+*Last updated: 2026-07-05 after roadmap creation (v1.2 Phases 15–21, 19/19 mapped)*
