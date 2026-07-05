@@ -13,8 +13,8 @@ Requirements for the v1.2 milestone. Each maps to exactly one roadmap phase.
 
 ### Debt & Hardening
 
-- [ ] **HARD-01**: Aggregate ε=1e-4 Kaggle CUDA correctness sign-off (GPUT-14) executed across all v1.1 device families as one authoritative row
-- [ ] **HARD-02**: Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 speed rows executed on Kaggle CUDA; BENCH-03 aggregate completed with real numbers (no stitched gaps)
+- [x] **HARD-01**: Aggregate ε=1e-4 Kaggle CUDA correctness sign-off (GPUT-14) executed across all v1.1 device families as one authoritative row
+- [x] **HARD-02**: Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 speed rows executed on Kaggle CUDA; BENCH-03 aggregate completed with real numbers (no stitched gaps)
 - [x] **HARD-03**: RV-13-01..04 latent parity hazards resolved (or explicitly retired with evidence)
 - [ ] **FEAT-07**: Online-HNSW KNN estimated-feature bit-exact parity — bit-for-bit port of `library/cpp/online_hnsw` (~936 LOC) in `cb-compute`, oracled on the per-object neighbor set (index-for-index), closing the last open ≤10⁻⁵ CPU gap
 
@@ -77,8 +77,8 @@ Which phases cover which requirements. Populated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HARD-01 | Phase 15 | Pending |
-| HARD-02 | Phase 15 | Pending |
+| HARD-01 | Phase 15 | Complete |
+| HARD-02 | Phase 15 | Complete |
 | HARD-03 | Phase 15 | Complete |
 | FEAT-07 | Phase 16 | Pending |
 | EXPORT-01 | Phase 17 | Pending |

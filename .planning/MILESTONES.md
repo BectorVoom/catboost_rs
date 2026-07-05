@@ -14,14 +14,14 @@
 - **Phase 13 — Loss-family/multi-output/ordered:** PairLogit with a batched f64 device Cholesky solver (GPUT-11/21), five query/listwise ranking objectives incl. stochastic YetiRank/PFound-F over device query-grouping (GPUT-22), multiclass/multi-target/uncertainty K-dim Newton block-leaves (GPUT-12), ordered boosting (GPUT-13), and Langevin/SGLB noise (GPUT-20).
 - **Phase 14 — Sign-off:** BENCH-03 signed off PASS — all 12 aggregated device rows 23.9×–42.1× vs the host-light CPU baseline on P100, CUDA correctness (44 device self-oracle tests, ALL-PASS) gated before any speed number, with an informational CatBoost-GPU head-to-head and full mixed-session provenance.
 
-### Known Gaps (proceeded with incomplete requirements — formal accept-as-delivered)
+### Known Gaps (proceeded with incomplete requirements — formal accept-as-delivered) — DISCHARGED in v1.2 Phase 15
 
-Milestone closed with a documented override (recorded in `.planning/milestones/v1.1-phases/14-.../14-VERIFICATION.md`; standing debt in `.planning/PROJECT.md`). The device coverage passes per-family self-oracles ≤1e-4 in-env and on the committed Kaggle CUDA (P100) runs, but two milestone-wide sign-off rows were not executed:
+Milestone closed with a documented override (recorded in `.planning/milestones/v1.1-phases/14-.../14-VERIFICATION.md`; standing debt in `.planning/PROJECT.md`). The device coverage passed per-family self-oracles ≤1e-4 in-env and on the committed Kaggle CUDA (P100) runs, but two milestone-wide sign-off rows were not executed at v1.1 close. **Both were discharged in v1.2 by the single-session Phase-15 P100 CUDA run** (`bench/phase15_cuda_oracle/result.json`, `single_session: true`; see `bench/BENCH-03-SIGNOFF.md`):
 
-- **GPUT-14** (ε=1e-4 device-vs-CPU standing correctness gate, Phase 11 onward) — status **Pending**: the milestone-wide Kaggle CUDA GPUT-14 row was never run as a single aggregate; coverage is evidenced per-family instead.
-- **Phase-10 (depth-1) + Phase-11 (depth-6) BENCH-02** Kaggle CUDA speed runs were never executed; the BENCH-03 aggregate stitches the committed Phase-12/13 numbers only.
+- **GPUT-14** (ε=1e-4 device-vs-CPU standing correctness gate, Phase 11 onward) — **DISCHARGED (v1.2 Phase 15)**: the single-session run executed the milestone-wide aggregate row (all 13 v1.1 device families in one `--features cuda` session, `correctness_verdict: ALL-PASS`, 4/4 RV-13 oracles seen). Was **Pending** at v1.1 close (evidenced per-family only).
+- **Phase-10 (depth-1) + Phase-11 (depth-6) BENCH-02** Kaggle CUDA speed runs — **DISCHARGED (v1.2 Phase 15)**: both depth rows now exist as real single-session measurements (12 rows 29.1×–40.8×); the BENCH-03 aggregate is no longer stitched from the Phase-12/13 numbers.
 
-**Known deferred items at close:** 8 (see STATE.md → Deferred Items) — 1 pending requirement (GPUT-14), 2 un-run BENCH-02 rows, 1 human-needed verification + 1 UAT gap (Phase-10 depth-1 Kaggle gate), 2 quick tasks (1 resolved-stale, 1 superseded by FEAT-07), 1 pending todo (FEAT-07 HNSW, Phase 9).
+**Known deferred items at v1.1 close:** 8 (see STATE.md → Deferred Items) — the 1 requirement (GPUT-14) + 2 BENCH-02 rows + the Phase-10 depth-1 verification/UAT gate are **resolved in v1.2 Phase 15**; the remaining 2 quick tasks (1 resolved-stale, 1 superseded by FEAT-07) and 1 pending todo (FEAT-07 HNSW, Phase 9) carry forward.
 
 ---
 

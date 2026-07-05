@@ -501,11 +501,11 @@ Items acknowledged and carried forward at the v1.1 GPU Performance milestone clo
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| requirement | GPUT-14 — ε=1e-4 device-vs-CPU standing correctness gate (Phase 11, enforced onward) | pending — per-family self-oracles pass ≤1e-4 in-env; the milestone-wide Kaggle CUDA GPUT-14 sign-off row not executed; formal accept-as-delivered override recorded in 14-VERIFICATION.md | v1.1 close |
-| bench | Phase-10 (depth-1) BENCH-02 Kaggle CUDA speed run | not executed — BENCH-03 aggregate stitches the committed Phase-12/13 numbers only | v1.1 close |
-| bench | Phase-11 (depth-6) BENCH-02 Kaggle CUDA speed run | not executed — see above | v1.1 close |
-| verification | Phase 10 — 10-VERIFICATION.md | human_needed (Kaggle CUDA depth-1 oracle+speed; later P100 ALL-PASS covered depth>1 in Phases 13/14, not the Phase-10 depth-1 row) | v1.1 close |
-| uat | Phase 10 — 10-UAT.md | testing (2 pending scenarios — same Kaggle CUDA depth-1 gate) | v1.1 close |
+| requirement | GPUT-14 — ε=1e-4 device-vs-CPU standing correctness gate (Phase 11, enforced onward) | RESOLVED (v1.2 Phase 15) — the single-session P100 CUDA run executed the milestone-wide aggregate row (all 13 v1.1 families, correctness_verdict ALL-PASS ε=1e-4, 4/4 RV-13 oracles); HARD-01 complete. See bench/BENCH-03-SIGNOFF.md + 15-EVIDENCE.md | v1.1 close → resolved v1.2 P15 |
+| bench | Phase-10 (depth-1) BENCH-02 Kaggle CUDA speed run | RESOLVED (v1.2 Phase 15) — depth-1 rows (n=100k/300k/1M) measured in the single session; crossover at n=100000 recorded; HARD-02 complete | v1.1 close → resolved v1.2 P15 |
+| bench | Phase-11 (depth-6) BENCH-02 Kaggle CUDA speed run | RESOLVED (v1.2 Phase 15) — depth-6 rows (n=10k/100k/300k) measured in the same single session; 12 aggregate rows 29.1×–40.8×, all ≥20× | v1.1 close → resolved v1.2 P15 |
+| verification | Phase 10 — 10-VERIFICATION.md | RESOLVED (v1.2 Phase 15) — the single-session P100 run covered the Phase-10 depth-1 correctness+speed row (GATE PASS; bench/RESULTS.md depth-1 block) | v1.1 close → resolved v1.2 P15 |
+| uat | Phase 10 — 10-UAT.md | RESOLVED (v1.2 Phase 15) — the depth-1 Kaggle CUDA gate ran (Part A ALL-PASS + depth-1 speed rows); scenarios satisfied by the single session | v1.1 close → resolved v1.2 P15 |
 | quick_task | 260619-bac-fix-builder-oracle-test-score-function-m | resolved-stale (shipped per 260623-mph; audit flag is a false positive) | v1.1 close |
 | quick_task | 260619-cpr-estimated-feature-stored-border-value-qu | superseded by FEAT-07 HNSW (Phase 9) | v1.1 close |
 | todo | estimated-feature-grid-parity.md — FEAT-07 online-HNSW port (Phase 9) | pending (still open) | v1.1 close |
