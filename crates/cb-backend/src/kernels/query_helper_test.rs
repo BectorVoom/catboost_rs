@@ -184,6 +184,31 @@ fn zero_weight_query_mean_is_zero() {
     }
 }
 
+/// Test 1c (RV-13-03): an all-empty-group offset (`q_offsets=[0,0]`, `n == 0`, `n_groups == 1`) must
+/// return the correctly-sized zero-means result WITHOUT launching a zero-length device buffer (the
+/// project HIP residency lesson: never create/read a 0-len handle). Assert on the returned VALUE and
+/// LENGTH (`[0.0]`), not merely "no panic" (Pitfall 3): the guard must return `vec![0.0; n_groups]`
+/// (right length AND right value), NOT `Vec::new()`. This structural oracle runs on ALL backends (no
+/// ε), and is the ONE RV-13 fault-guard also smoke-tested on rocm/cuda in-env (D-03) — on a real
+/// device it proves no zero-length-handle fault on gfx1100.
+#[test]
+fn empty_group_means_no_fault() {
+    let values: Vec<f64> = Vec::new();
+    let weights: Vec<f64> = Vec::new();
+    let q_offsets = vec![0u32, 0]; // one all-empty group: n == 0, n_groups == 1.
+
+    let means = compute_group_means_host(&values, &weights, &q_offsets)
+        .expect("all-empty-group means must not error (n==0 short-circuit, no device launch)");
+
+    // Right LENGTH (one mean per group) AND right VALUE (empty group ⇒ 0.0) — not merely no panic.
+    assert_eq!(means.len(), 1, "one mean per group (n_groups == q_offsets.len()-1 == 1)");
+    assert_eq!(means, vec![0.0], "all-empty group mean must be exactly [0.0], not Vec::new()");
+    println!(
+        "[query_helper] empty-group means = {means:?} (device_backend_active={})",
+        device_backend_active()
+    );
+}
+
 /// Test 2: `RemoveGroupMeans` yields residuals matching the CPU per-query bias removal
 /// (`values[d] - mean[qid[d]]`). Also validates `ComputeGroupIds` (the qids feeding the removal).
 #[test]

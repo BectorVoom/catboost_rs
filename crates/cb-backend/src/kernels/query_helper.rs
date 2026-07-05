@@ -381,6 +381,15 @@ pub(crate) fn compute_group_means_host(
     if n_groups == 0 {
         return Ok(Vec::new());
     }
+    // RV-13-03: an all-empty-group offset (`q_offsets=[0,0,..]`, `n == 0`) has no docs to reduce.
+    // Short-circuit BEFORE any `selected_client()` / `client.create` so no zero-length device buffer
+    // is ever bound (the project HIP residency lesson: never create/read a 0-len handle). Every group
+    // is empty, so its weighted mean is `0.0` (CPU `queryAvrg 0` when the denominator ≤ 0,
+    // `ranking_der.rs:231`). Return the correctly-sized vector (`n_groups` entries), NOT `Vec::new()` —
+    // callers expect one mean per group.
+    if n == 0 {
+        return Ok(vec![0.0; n_groups]);
+    }
     #[cfg(feature = "wgpu")]
     {
         let _ = (weights, n);
