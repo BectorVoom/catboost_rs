@@ -735,8 +735,13 @@ fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {
 /// tied documents stay in ORIGINAL index order, exactly matching the upstream stable descending sort
 /// (`yetirank_helpers.cpp:326-331`). A plain reverse-of-stable-ascending would instead flip ties into
 /// reversed-index order (the WR-01 parity divergence), so we complement the key rather than reverse.
+///
+/// The tie-stability contract (equal values stay in ORIGINAL index order) is oracle-guarded by
+/// [`crate::gpu_runtime::ranking_stoch_test::tie_order_matches_cpu_stable_descending`] (RV-13-01,
+/// HARD-03): a fixture with deliberate exact ties is checked against an independent CPU stable
+/// descending sort. Raised to `pub(crate)` so that sibling oracle can invoke this directly.
 #[cfg(not(feature = "wgpu"))]
-fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {
+pub(crate) fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {
     let n = perturbed.len();
     if n == 0 {
         return Ok(Vec::new());

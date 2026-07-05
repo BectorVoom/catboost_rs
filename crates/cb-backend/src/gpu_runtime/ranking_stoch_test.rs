@@ -29,8 +29,9 @@
 #![cfg(not(feature = "wgpu"))]
 
 use crate::gpu_runtime::ranking::{
-    derive_query_seeds_inline, pfound_f_ders_host, ranking_objective_covered, yetirank_draw_count,
-    yetirank_ders_host, RankingObjective,
+    derive_query_seeds_inline, descending_order_per_query, pfound_f_ders_host,
+    query_softmax_ders_host, ranking_objective_covered, yetirank_draw_count, yetirank_ders_host,
+    RankingObjective,
 };
 
 /// The ε=1e-4 device-vs-CPU bar (D-07; the GPU bar, looser than the CPU ref's own ≤1e-5).
@@ -159,5 +160,85 @@ fn pfound_f_der_matches_frozen_cpu() {
         assert_der_close(&der2, &frozen_der2(), "pfound_f der2");
     } else {
         println!("pfound_f: cpu backend — numeric ε assert skipped (WR-01 record-only)");
+    }
+}
+
+/// The INDEPENDENT reference: a CPU stable DESCENDING sort per query, ties broken by ASCENDING
+/// original index. This is deliberately NOT the complemented-key radix path under test — it is a
+/// plain `sort_by` over `(value desc, index asc)` — so the oracle is non-tautological (a different
+/// algorithm reaching the same contract). `perturbed` values are all non-negative here (they model
+/// `exp(approx)` ratios), matching the production precondition.
+fn cpu_stable_descending_order(perturbed: &[f64], q_offsets: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(perturbed.len());
+    for w in q_offsets.windows(2) {
+        let begin = w[0] as usize;
+        let end = w[1] as usize;
+        let mut idx: Vec<u32> = (begin as u32..end as u32).collect();
+        // Stable sort by value DESCENDING; `sort_by` is stable, so equal-value docs retain their
+        // pre-sort (ascending original-index) order — exactly the upstream stable descending sort.
+        idx.sort_by(|&a, &b| {
+            let va = perturbed[a as usize];
+            let vb = perturbed[b as usize];
+            vb.partial_cmp(&va).expect("perturbed values are finite in the fixture")
+        });
+        out.extend(idx);
+    }
+    out
+}
+
+#[test]
+fn tie_order_matches_cpu_stable_descending() {
+    // RV-13-01 (HARD-03, D-02): prove `descending_order_per_query` preserves ORIGINAL-index order
+    // for TIED values, matching a CPU stable descending sort. This is the divergent path that the
+    // frozen-fixture "no ties" assertion never exercised.
+    //
+    // Fixture: two queries, sizes 5 / 4. Deliberate exact ties WITHIN each query (repeated f64 bit
+    // patterns model `exp(approx)` collisions + f32-Gumbel-induced equal values). Ties are placed at
+    // non-adjacent original indices so a tie-flip would be observable, and one tie value is repeated
+    // three times (index 1,2,4 in query 0) to catch a partial reversal.
+    let perturbed = vec![
+        // query 0 (indices 0..5): 2.0, 1.5, 1.5, 3.0, 1.5  → desc: idx3(3.0), idx0(2.0), then the
+        // three 1.5 ties MUST come out ascending-index: idx1, idx2, idx4.
+        2.0, 1.5, 1.5, 3.0, 1.5, //
+        // query 1 (indices 5..9): 0.5, 0.5, 0.9, 0.5 → desc: idx7(0.9), then 0.5 ties ascending:
+        // idx5, idx6, idx8.
+        0.5, 0.5, 0.9, 0.5,
+    ];
+    let q_offsets = vec![0u32, 5, 9];
+
+    // Sanity: the fixture actually contains ties (else the oracle is vacuous — Pitfall 1 guard).
+    assert_eq!(perturbed[1], perturbed[2], "fixture must contain an exact tie");
+    assert_eq!(perturbed[2], perturbed[4], "fixture must contain a 3-way tie");
+
+    let got = descending_order_per_query(&perturbed, &q_offsets).expect("descending order");
+    let want = cpu_stable_descending_order(&perturbed, &q_offsets);
+    assert_eq!(got.len(), perturbed.len(), "order must be a full permutation");
+
+    // The order is produced by the device `segmented_radix_sort` (`plane_inclusive_sum`), which is
+    // UNSUPPORTED on the cubecl `cpu` backend — so the exact-permutation assertion is device-gated
+    // (rocm/cuda), matching the WR-01 record-only discipline used for the ε der asserts above. On
+    // `cpu` the "device" sort is non-functional, so an order assert there would be meaningless, not a
+    // validation.
+    if device_backend_active() {
+        assert_eq!(
+            got, want,
+            "RV-13-01: device descending order diverged from CPU stable descending sort\n \
+             got  = {got:?}\n want = {want:?}"
+        );
+        // Explicit expected order documents the tie contract for the reader / 15-EVIDENCE.
+        assert_eq!(
+            got,
+            vec![3u32, 0, 1, 2, 4, 7, 5, 6, 8],
+            "RV-13-01: tied values must stay in ascending original-index order per query"
+        );
+        println!(
+            "RV-13-01 tie_order: device order == CPU stable descending sort (ties index-ascending)"
+        );
+    } else {
+        // Still exercise the code path (build + launch) and expose the reference for the record.
+        println!(
+            "RV-13-01 tie_order: cpu backend — order assert skipped (radix sort is device-only, \
+             WR-01 record-only). cpu_reference want = {want:?}"
+        );
     }
 }
