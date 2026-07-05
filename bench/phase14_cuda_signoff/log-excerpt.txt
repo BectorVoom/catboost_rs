@@ -1,0 +1,120 @@
+,{"stream_name":"stdout","time":819.40647729,"data":"373 | fn validate_ranking_inputs(approx: \u0026[f64], target: \u0026[f64], q_offsets: \u0026[u32]) -\u003e CbResult\u003c()\u003e {\n"}
+,{"stream_name":"stdout","time":819.4064811,"data":"    |    ^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406484337,"data":"\n"}
+,{"stream_name":"stdout","time":819.406487458,"data":"warning: function `query_rmse_ders_host` is never used\n"}
+,{"stream_name":"stdout","time":819.406490802,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:394:15\n"}
+,{"stream_name":"stdout","time":819.406497472,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406508128,"data":"394 | pub(crate) fn query_rmse_ders_host(\n"}
+,{"stream_name":"stdout","time":819.406516832,"data":"    |               ^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406521065,"data":"\n"}
+,{"stream_name":"stdout","time":819.406524642,"data":"warning: function `query_softmax_ders_host` is never used\n"}
+,{"stream_name":"stdout","time":819.406527994,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:452:15\n"}
+,{"stream_name":"stdout","time":819.406531425,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406534597,"data":"452 | pub(crate) fn query_softmax_ders_host(\n"}
+,{"stream_name":"stdout","time":819.406542005,"data":"    |               ^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406545447,"data":"\n"}
+,{"stream_name":"stdout","time":819.406548594,"data":"warning: function `query_cross_entropy_shifts_host` is never used\n"}
+,{"stream_name":"stdout","time":819.406552003,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:512:15\n"}
+,{"stream_name":"stdout","time":819.406555346,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406558527,"data":"512 | pub(crate) fn query_cross_entropy_shifts_host(\n"}
+,{"stream_name":"stdout","time":819.406561852,"data":"    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406565147,"data":"\n"}
+,{"stream_name":"stdout","time":819.406568229,"data":"warning: constant `YETI_MAGIC_CONST` is never used\n"}
+,{"stream_name":"stdout","time":819.406571451,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:595:7\n"}
+,{"stream_name":"stdout","time":819.406574788,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406578022,"data":"595 | const YETI_MAGIC_CONST: f64 = 0.15;\n"}
+,{"stream_name":"stdout","time":819.406584298,"data":"    |       ^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406595224,"data":"\n"}
+,{"stream_name":"stdout","time":819.406599077,"data":"warning: function `derive_query_seeds_inline` is never used\n"}
+,{"stream_name":"stdout","time":819.406603099,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:705:15\n"}
+,{"stream_name":"stdout","time":819.406607139,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406610926,"data":"705 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -\u003e Vec\u003cu64\u003e {\n"}
+,{"stream_name":"stdout","time":819.406614683,"data":"    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406617996,"data":"\n"}
+,{"stream_name":"stdout","time":819.406621073,"data":"warning: function `pairlogit_pair_prob_local` is never used\n"}
+,{"stream_name":"stdout","time":819.406624338,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:718:4\n"}
+,{"stream_name":"stdout","time":819.406627732,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406630899,"data":"718 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -\u003e f64 {\n"}
+,{"stream_name":"stdout","time":819.406634327,"data":"    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406637613,"data":"\n"}
+,{"stream_name":"stdout","time":819.406640678,"data":"warning: function `descending_order_per_query` is never used\n"}
+,{"stream_name":"stdout","time":819.406644021,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:739:4\n"}
+,{"stream_name":"stdout","time":819.406647424,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406650594,"data":"739 | fn descending_order_per_query(perturbed: \u0026[f64], q_offsets: \u0026[u32]) -\u003e CbResult\u003cVec\u003cu32\u003e\u003e {\n"}
+,{"stream_name":"stdout","time":819.406654447,"data":"    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406657761,"data":"\n"}
+,{"stream_name":"stdout","time":819.406660921,"data":"warning: function `yeti_add_weight` is never used\n"}
+,{"stream_name":"stdout","time":819.406664269,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:775:4\n"}
+,{"stream_name":"stdout","time":819.40667096,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406681291,"data":"775 | fn yeti_add_weight(\n"}
+,{"stream_name":"stdout","time":819.406685186,"data":"    |    ^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.40669282,"data":"\n"}
+,{"stream_name":"stdout","time":819.406697566,"data":"warning: function `yetirank_sample_der_core` is never used\n"}
+,{"stream_name":"stdout","time":819.406701433,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:807:4\n"}
+,{"stream_name":"stdout","time":819.406704994,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406708177,"data":"807 | fn yetirank_sample_der_core(\n"}
+,{"stream_name":"stdout","time":819.406711405,"data":"    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406714694,"data":"\n"}
+,{"stream_name":"stdout","time":819.406717809,"data":"warning: function `yetirank_ders_host` is never used\n"}
+,{"stream_name":"stdout","time":819.406721136,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:931:15\n"}
+,{"stream_name":"stdout","time":819.406724566,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406727714,"data":"931 | pub(crate) fn yetirank_ders_host(\n"}
+,{"stream_name":"stdout","time":819.406731052,"data":"    |               ^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406734321,"data":"\n"}
+,{"stream_name":"stdout","time":819.406737419,"data":"warning: function `pfound_f_ders_host` is never used\n"}
+,{"stream_name":"stdout","time":819.406740695,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:958:15\n"}
+,{"stream_name":"stdout","time":819.406744096,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.40674718,"data":"958 | pub(crate) fn pfound_f_ders_host(\n"}
+,{"stream_name":"stdout","time":819.406750518,"data":"    |               ^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406757531,"data":"\n"}
+,{"stream_name":"stdout","time":819.406759983,"data":"warning: function `yetirank_draw_count` is never used\n"}
+,{"stream_name":"stdout","time":819.406770221,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:984:15\n"}
+,{"stream_name":"stdout","time":819.406774195,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406777959,"data":"984 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -\u003e usize {\n"}
+,{"stream_name":"stdout","time":819.40678226,"data":"    |               ^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406786205,"data":"\n"}
+,{"stream_name":"stdout","time":819.406789583,"data":"warning: function `read_f64` is never used\n"}
+,{"stream_name":"stdout","time":819.406792868,"data":"   --\u003e crates/cb-backend/src/gpu_runtime/ranking.rs:991:4\n"}
+,{"stream_name":"stdout","time":819.406796259,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406799399,"data":"991 | fn read_f64(\n"}
+,{"stream_name":"stdout","time":819.406802638,"data":"    |    ^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406805848,"data":"\n"}
+,{"stream_name":"stdout","time":819.406808971,"data":"warning: variable does not need to be mutable\n"}
+,{"stream_name":"stdout","time":819.406812218,"data":"   --\u003e crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9\n"}
+,{"stream_name":"stdout","time":819.406815667,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406818808,"data":"165 |     let mut new_node = |nodes: \u0026mut Vec\u003cRefNode\u003e,\n"}
+,{"stream_name":"stdout","time":819.406822317,"data":"    |         ----^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406825551,"data":"    |         |\n"}
+,{"stream_name":"stdout","time":819.406828724,"data":"    |         help: remove this `mut`\n"}
+,{"stream_name":"stdout","time":819.406832001,"data":"\n"}
+,{"stream_name":"stdout","time":819.406835169,"data":"warning: variable does not need to be mutable\n"}
+,{"stream_name":"stdout","time":819.406841877,"data":"   --\u003e crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9\n"}
+,{"stream_name":"stdout","time":819.406847906,"data":"    |\n"}
+,{"stream_name":"stdout","time":819.406850623,"data":"181 |     let mut do_split = |nodes: \u0026mut Vec\u003cRefNode\u003e,\n"}
+,{"stream_name":"stdout","time":819.40686183,"data":"    |         ----^^^^^^^^\n"}
+,{"stream_name":"stdout","time":819.406865793,"data":"    |         |\n"}
+,{"stream_name":"stdout","time":819.406869678,"data":"    |         help: remove this `mut`\n"}
+,{"stream_name":"stdout","time":819.406873601,"data":"\n"}
+,{"stream_name":"stdout","time":819.406877453,"data":"warning: `cb-backend` (lib) generated 62 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)\n"}
+,{"stream_name":"stdout","time":819.406881034,"data":"warning: `cb-backend` (lib test) generated 4 warnings (2 duplicates) (run `cargo fix --lib -p cb-backend --tests` to apply 2 suggestions)\n"}
+,{"stream_name":"stdout","time":819.406884698,"data":"    Finished `release` profile [optimized] target(s) in 0.37s\n"}
+,{"stream_name":"stdout","time":819.406888116,"data":"     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-1ce8c652587b4afb)\n"}
+,{"stream_name":"stdout","time":819.406891601,"data":"   Doc-tests cb_backend\n"}
+,{"stream_name":"stdout","time":819.406894816,"data":"\n"}
+,{"stream_name":"stdout","time":819.407953836,"data":"[langevin (seeded Gaussian / SGLB) GPUT-20] exit=0 ['test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']\n"}
+,{"stream_name":"stdout","time":840.308487671,"data":"[catboost-gpu depthwise n=10000] catboost_gpu_s=0.6733\n"}
+,{"stream_name":"stdout","time":841.679117504,"data":"[catboost-gpu depthwise n=100000] catboost_gpu_s=0.7052\n"}
+,{"stream_name":"stdout","time":843.154454959,"data":"[catboost-gpu depthwise n=300000] catboost_gpu_s=0.8181\n"}
+,{"stream_name":"stdout","time":843.154503952,"data":"[catboost-gpu region n=10000] N/A (no official Region policy)\n"}
+,{"stream_name":"stdout","time":843.154510739,"data":"[catboost-gpu region n=100000] N/A (no official Region policy)\n"}
+,{"stream_name":"stdout","time":843.154516254,"data":"[catboost-gpu region n=300000] N/A (no official Region policy)\n"}
+,{"stream_name":"stdout","time":843.155290583,"data":"CORRECTNESS_VERDICT: ALL-PASS\n"}
+,{"stream_name":"stdout","time":843.155308808,"data":"CATBOOST_GPU_VERDICT: OK rows: 6\n"}
+,{"stream_name":"stdout","time":843.155321258,"data":"=================== PHASE-14 BENCH-03 SIGN-OFF COMPLETE ===================\n"}
+,{"stream_name":"stderr","time":845.620686547,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":845.620748484,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":845.852630897,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":845.852668263,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":846.990759805,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":847.799830764,"data":"[NbConvertApp] Writing 342116 bytes to __results__.html\n"}
+]
