@@ -50,7 +50,7 @@ Full per-phase detail: `.planning/milestones/v1.0-ROADMAP.md` and `.planning/mil
 - [ ] **Phase 11: Depth>1 Partition-Aware Histograms + Reduction Determinism + Newton Der2** - Real depth-6 RMSE + Logloss workloads grow fully on device within ε=1e-4, via partition-aware histograms + the subtraction trick + a deterministic reduction + Newton der2 leaf estimation, oracle-tested AND speed-measured on Kaggle CUDA; GPUT-14 becomes the operative standing gate.
 - [x] **Phase 12: Grow-Policy, Leaf-Method, Sampling & Categorical Device Coverage** - Non-symmetric grow policies (Depthwise/Lossguide/Region), Exact weighted-quantile leaf estimation, bootstrap/random-strength + MVS sampling, and CTR/categorical features each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands. (completed 2026-07-04)
 - [x] **Phase 13: Pairwise, Ranking, Multiclass, Ordered & Langevin Device Coverage** - The PairLogit pairwise path + batched device Cholesky solver, query/listwise ranking objectives with device query-grouping, multiclass/multi-target/uncertainty, ordered boosting, and Langevin/SGLB noise each transition to the device path (ε=1e-4 on Kaggle CUDA) behind the `Ok(None)` fallback gate, each timed on Kaggle CUDA as it lands. (completed 2026-07-04)
-- [ ] **Phase 14: Comprehensive Kaggle CUDA Speed Benchmark + Parity Sign-Off** - The device-resident path demonstrably closes the >20× gap via a comprehensive final sign-off that AGGREGATES the per-phase speed checks (BENCH-02) from Phases 10–13, with CUDA correctness gated before any speed number.
+- [x] **Phase 14: Comprehensive Kaggle CUDA Speed Benchmark + Parity Sign-Off** - The device-resident path demonstrably closes the >20× gap via a comprehensive final sign-off that AGGREGATES the per-phase speed checks (BENCH-02) from Phases 10–13, with CUDA correctness gated before any speed number. (completed 2026-07-05)
 
 ## Phase Details
 
@@ -222,11 +222,11 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
   2. The correctness oracle is re-confirmed on the CUDA backend (≤1e-4 vs the Rust CPU path, ≤1e-5 for the depth-1 tree) as a **blocking gate before any speed number is reported** — reusing the authoritative Phase-10 CUDA oracle, so a fast-but-wrong CUDA result is never quoted.
   3. The device-resident path demonstrably closes the >20× gap (BENCH-03): a documented, signed-off **comprehensive final** speed-parity result vs official CatBoost GPU on Kaggle CUDA, measured against the pre-Phase-10 host-light baseline and aggregating every per-phase speed measurement into the milestone-closing sign-off.
 
-**Plans**: 2/3 plans executed
+**Plans**: 3/3 plans complete
 
 - [x] 14-01-PLAN.md — Offline schema-branching BENCH-02 aggregator + unit test (D-03, Wave 1)
 - [x] 14-02-PLAN.md — Kaggle CUDA driver: Part A correctness pre-flight + Part C CatBoost-GPU arm + kernel-metadata + gen() test (D-04, Wave 1)
-- [ ] 14-03-PLAN.md — Human-gated Kaggle CUDA run + BENCH-03-SIGNOFF.md aggregate sign-off (D-01/D-03/D-04, Wave 2, human-gated)
+- [x] 14-03-PLAN.md — Human-gated Kaggle CUDA run + BENCH-03-SIGNOFF.md aggregate sign-off (D-01/D-03/D-04, Wave 2, human-gated)
 
 **UI hint**: no
 **Notes**: This is the comprehensive FINAL aggregate, not the first place speed is measured — Phases 10–13 each carried their own standing BENCH-02 Kaggle CUDA speed check; Phase 14 rolls them up into one head-to-head sign-off. Protocol fully specified (STACK.md / PITFALLS.md / existing `benchmark.py` template + the Phase-10 `bench/` harness). This is a human-gated Kaggle CUDA execution. Execution checklist: verify CUDA backend active via `nvidia-smi`, warm one untimed fit, drain the lazy CubeCL queue with a read-back/predict before stopping the clock, re-run the oracle (Phase-10 harness) before timing. Standard patterns — no new compute crates; `criterion 0.7.x` (dev-dep) for optional in-env ROCm relative-timing regression during development, optional `profile-tracy`/`tracing` behind a `profiling` Cargo feature.
@@ -239,7 +239,7 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete    | 2026-07-04 |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 10/10 | Complete    | 2026-07-04 |
-| 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 2/3 | In Progress|  |
+| 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 3/3 | Complete   | 2026-07-05 |
 
 ## Backlog (Deferred from v1.0)
 
