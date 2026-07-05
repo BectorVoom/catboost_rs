@@ -58,87 +58,117 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
 ## Phase Details
 
 ### Phase 15: Debt Discharge & CUDA Oracle Re-establishment
+
 **Goal**: The v1.1 GPU claims are backed by a single authoritative Kaggle CUDA correctness + speed record with no stitched gaps, and all latent parity hazards are resolved — re-establishing the trusted oracle every later parity/benchmark claim depends on.
 **Depends on**: Phase 14 (v1.1 device families + Kaggle CUDA harness)
 **Requirements**: HARD-01, HARD-02, HARD-03
 **Success Criteria** (what must be TRUE):
+
   1. A single aggregate GPUT-14 ε=1e-4 Kaggle CUDA correctness row covers all v1.1 device families as one authoritative run and passes (HARD-01)
   2. Phase-10 (depth-1) and Phase-11 (depth-6) BENCH-02 speed rows are executed on Kaggle CUDA and the BENCH-03 aggregate is recomputed from real numbers with no stitched Phase-12/13-only gaps (HARD-02)
   3. Each RV-13-01..04 latent parity hazard is either fixed (with an oracle demonstrating the fix) or explicitly retired with recorded evidence (HARD-03)
+
 **Plans**: 4 plans
 Plans:
+**Wave 1**
+
 - [ ] 15-01-PLAN.md — RV-13-01/02 ranking-der oracles (tie-order stability + weight>0 softmax max-seed) [Wave 1, HARD-03]
 - [ ] 15-02-PLAN.md — RV-13-03/04 oracles (n==0 empty-group guard + near-equal-border pairwise tie-break) [Wave 1, HARD-03]
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 15-03-PLAN.md — single authoritative Kaggle CUDA session (Part A correctness gate + Part B depth-1/depth-6 BENCH-02) [Wave 2, HARD-01/02]
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 15-04-PLAN.md — 15-EVIDENCE.md + BENCH-03 recompute in place + REQUIREMENTS/MILESTONES/STATE bookkeeping flip [Wave 3, HARD-01/02/03]
+
 **Context**: Mostly Kaggle CUDA job execution + contained `cb-backend`/`cb-train` fixes — high de-risking, low code-change risk. ROCm in-env is non-gating. This phase re-establishes the CUDA oracle before anyone benchmarks against it (avoids the benchmark-baseline-confusion pitfall).
 
 ### Phase 16: Online-HNSW KNN Estimated-Feature Parity
+
 **Goal**: The KNN estimated-feature calcer returns upstream-identical neighbor sets, closing the last open ≤10⁻⁵ CPU parity gap via a bit-for-bit transcription of upstream online-HNSW.
 **Depends on**: Phase 6.5 (estimated-feature calcer + frozen `text_embedding_xor/` fixture) — no v1.2 dependency; runs parallel with Phase 15 (`cb-compute` only, disjoint crates). Supersedes the deferred Phase 9 backlog.
 **Requirements**: FEAT-07
 **Success Criteria** (what must be TRUE):
+
   1. The Rust online-HNSW returns upstream-identical neighbor IDs index-for-index on the instrumented neighbor-set evidence corpus — the divergence from the current brute-force-exact calcer is reproduced, not merely "close" (FEAT-07)
   2. Both the online (`TKNNUpdatableCloud`) and offline (`TKNNCloud`) calcer paths match upstream neighbor sets bit-for-bit across the full XOR corpus, and the class-vote order matches upstream (feat0 = class-1 vote)
   3. The text+embedding+numeric XOR corpus StagedApprox + Predictions match upstream ≤10⁻⁵ with no weakened tolerance and no `#[ignore]`
+
 **Plans**: TBD
 **Context**: Bit-exact parity IS achievable — the crux is replicating upstream's construction RNG + insertion order + `TL2SqrDistance`; an off-the-shelf HNSW crate can NEVER pass (different RNG/graph). Oracle the neighbor **set**, not just the final prediction. Self-contained ~936 LOC port in `cb-compute/src/hnsw/` + one wiring change in `cb-train/estimated`.
 
 ### Phase 17: Model Export — ONNX + CoreML
+
 **Goal**: A user can export a float-only trained model to ONNX and CoreML matching upstream's guards and correctness, with unsupported (categorical/CTR/text/embedding) models rejected by a typed error.
 **Depends on**: Phase 15 preferred for a trusted parity baseline, but genuinely independent (read-only, zero seam risk) — may run parallel with Phases 15/16.
 **Requirements**: EXPORT-01, EXPORT-02, EXPORT-03
 **Success Criteria** (what must be TRUE):
+
   1. User can export a float-only oblivious identity-scale model to ONNX via `ai.onnx.ml` TreeEnsembleRegressor/Classifier (+ZipMap), and a categorical/CTR/text/embedding model is rejected with a typed error mirroring upstream's guard (EXPORT-01)
   2. User can export a float + one-hot-categorical oblivious (≤16 levels, single-dim bias, identity-scale) model to CoreML, with unsupported models rejected by a typed error (EXPORT-02)
   3. Exported ONNX predictions match official CatBoost's own ONNX export evaluated in ONNX Runtime under the export-specific float32 tolerance (RawFormulaVal + Probability as distinct cases; binary label ignored per the ORT bug); CoreML is execution-validated on an Apple runtime if available, else structurally validated with a documented gap (EXPORT-03)
+
 **Plans**: TBD
 **Context**: **Resolve the crate-placement disagreement in this phase's plan** — STACK.md recommends a new `cb-export` crate, ARCHITECTURE.md recommends a feature-gated `cb-model/export` submodule (both defensible; affects Cargo wiring, not algorithm correctness). Do NOT hold exports to the ≤10⁻⁵ double bar (float32 drift is inherent). Pin the opset. Decide the CoreML validation environment up front.
 
 ### Phase 18: Extended Feature Importance
+
 **Goal**: A user can compute Interaction, LossFunctionChange, and partial-dependence feature importance matching CatBoost's exact accounting (not textbook formulas).
 **Depends on**: Phase 4/6.6 (shipped SHAP `TShapPreparedTrees` + basic fstr) — independent single-crate work; may run parallel with Phase 17.
 **Requirements**: FSTR-01, FSTR-02, FSTR-03
 **Success Criteria** (what must be TRUE):
+
   1. User can compute `Interaction` feature importance (pairwise split-cooccurrence over tree structure, dataset-free) matching `get_feature_importance(type=Interaction)` ≤10⁻⁵, including on CTR-feature models (FSTR-01)
   2. User can compute `LossFunctionChange` importance over a supplied dataset (reusing shipped SHAP machinery + a new cubecl-free `cb-model→cb-compute` loss-derivative edge) matching upstream ≤10⁻⁵ (FSTR-02)
   3. User can compute partial-dependence for one or two features via a staged-apply sweep matching upstream's exact grid/quantization + averaging convention (FSTR-03)
+
 **Plans**: TBD
 **Context**: Oracle each type against `get_feature_importance` on models **with** categorical/CTR features (where the accounting is hardest), not just numeric fixtures. Extends `cb-model/src/fstr/` alongside existing SHAP/basic fstr.
 
 ### Phase 19: GPU Inference Evaluator
+
 **Goal**: A user can run device-side model inference for the upstream-supported subset — deterministic, ε=1e-4 Kaggle-CUDA-signed — with everything else falling back to CPU.
 **Depends on**: Phase 15 (the re-signed CUDA oracle + v1.1 primitive library must be trustworthy before a second device path is built on them). Parallel with Phase 20 (disjoint new crates).
 **Requirements**: GINF-01
 **Success Criteria** (what must be TRUE):
+
   1. User can run device-side predict for oblivious / single-dim / float-only models on RawFormulaVal|Probability|Class, matching the CPU predictor at ε=1e-4 (GINF-01)
   2. Non-oblivious / multi-dim / categorical / unsupported-prediction-type models transparently fall back to the CPU evaluator via `Ok(None)` — matching upstream's deliberately narrow subset, not exceeding it
   3. Repeated identical GPU applies are bit-identical (v1.1 fixed-point-u64 deterministic reduction reused, `f32::MIN` sentinel, `+=`/`<<` leaf-index), and the rocm suite passes in-env with no `-inf`/`|=` HIP codegen reject
   4. GPU-inference correctness (ε=1e-4 vs CPU + vs official CatBoost `EnableGPUEvaluation`) is signed off on Kaggle CUDA (ROCm in-env non-gating)
+
 **Plans**: TBD
 **Context**: New `cb-infer-gpu` crate above both `cb-model` and `cb-backend` (respects the no-cycle rule; mirrors upstream's `libs/model/cuda` separation, design-doc line 2859); model-agnostic kernels live in `cb-backend/src/kernels/infer/`. `default-features=false`, backend passthrough. **Research-phase flag:** re-verify CubeCL HIP kernel specifics before writing kernels.
 
 ### Phase 20: Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics
+
 **Goal**: A user can cross-validate, tune hyperparameters, snapshot/resume training bit-identically, and compute metrics standalone — all matching CatBoost's exact semantics.
 **Depends on**: Phase 15 (trusted training core baseline). Parallel with Phase 19 (disjoint new crates). Internal: ORCH-02 hard-depends on ORCH-01.
 **Requirements**: ORCH-01, ORCH-02, ORCH-03, ORCH-04
 **Success Criteria** (what must be TRUE):
+
   1. User can run `cv()` matching CatBoost fold semantics (Classical/Inverted/TimeSeries split types, per-loss stratification defaults, group-in-fold) with fold assignment oracled per seed and a target-permutation leakage canary scoring ~chance (ORCH-01)
   2. User can run `grid_search` and `randomized_search` hyperparameter tuning built on `cv()`, reusing the existing deterministic RNG stream with no `rand` dependency (ORCH-02)
   3. User can snapshot and resume training via a versioned `BoostingCheckpoint` (serde + format-version guard) with full RNG-state continuity — straight-run vs resumed-run predictions bit-identical for plain AND ordered boosting with sampling enabled (ORCH-03)
   4. User can compute metrics on precomputed predictions standalone (`calc_metrics` / `eval_metrics`, staged) independent of a live training run (ORCH-04)
+
 **Plans**: TBD
 **Context**: New `cb-orchestrate` crate (mirrors upstream `train_lib` driver layer) + the only training-core change this milestone — a `BoostingCheckpoint` serde surface + resume entry on `cb-train`. Compute borders/CTR **inside each fold** (leakage). Snapshot the complete trainer state (iteration, all RNG/permutation state, ordered-boosting folds, approx cursors, OD history), not just the trees. **Research-phase flag:** re-verify CV fold-partition semantics against upstream `cross_validation.cpp` at plan time.
 
 ### Phase 21: Adoption / DX Capstone
+
 **Goal**: The whole parity story is proven to adopters — benchmarked vs official CatBoost, released to PyPI per-backend, documented with runnable examples, and validated end-to-end on real datasets.
 **Depends on**: Phases 17 (export), 19 (GPU-infer), 20 (orchestration) — it exercises every one of them; must come last.
 **Requirements**: DX-01, DX-02, DX-03, DX-04
 **Success Criteria** (what must be TRUE):
+
   1. An end-to-end benchmark reports accuracy, speed, and peak-RSS memory vs official CatBoost on real datasets, matched hardware/version/params — GPU numbers from Kaggle CUDA only, CPU baseline = official CatBoost (NOT the v1.1 host-light baseline) (DX-01)
   2. Per-backend wheels (`cpu`/`cuda`/`rocm`/`wgpu` as separately-named distributions) build via the `maturin-action` CI matrix as abi3-py312 with versioning/tagging, and each imports + smoke-predicts in a clean environment (DX-02)
   3. Documentation + runnable Rust and Python examples cover training, inference, export, fstr, CV/tuning, and GPU usage (DX-03)
   4. A real-world dataset validation suite exercises the new surfaces (export round-trip, CV, tuning, GPU inference) end-to-end (DX-04)
+
 **Plans**: TBD
 **Context**: Benchmark vs **official CatBoost** (matched version/hardware/params), not the seductive v1.1 host-light numbers; warm up kernels before timed regions; report medians. Gate the free-threaded concurrency claim behind an actual `python3.13t` run or document it as a code property. Ship the rocm wheel's `ROCM_PATH`/`LD_PRELOAD` requirement; never bundle the patchelf-renamed `libhiprtc`.
 
