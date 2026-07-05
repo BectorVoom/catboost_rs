@@ -169,10 +169,10 @@ Plans:
   2. All CPU grow policies (`SymmetricTree`, `Depthwise`, `Lossguide`) AND the online-CTR-feature scoring path use the histogram scorer, and EVERY shipped ≤10⁻⁵ CPU oracle fixture stays bit-exact — parity preserved via deterministic ordered bin summation (fixed-point-u64 per Phase 10/11, or per-bin ordered `sum_f64`) so the algorithm change does not perturb `sum_f64` order (PERF-02)
   3. The split search is parallelized over features/candidates (`rayon`) with reusable scratch buffers (no per-candidate allocation storm), with a documented end-to-end speedup vs the pre-rewrite baseline on the Spike-002 grid and single-thread per-core efficiency brought within a stated target factor of official CatBoost's 1-thread times (PERF-03)
 
-**Plans**: 1/5 plans executed
+**Plans**: 2/5 plans executed
 
 - [x] 21-01-PLAN.md — cb-compute histogram foundation (BucketHistogram build + prefix scan + subtraction) + bit-exact equivalence tests (PERF-01, PERF-02)
-- [ ] 21-02-PLAN.md — wire oblivious plain + perturbed path to histogram + GrowScratch + n_bins-flat sweep (PERF-01, PERF-02)
+- [x] 21-02-PLAN.md — wire oblivious plain + perturbed path to histogram + GrowScratch + n_bins-flat sweep (PERF-01, PERF-02)
 - [ ] 21-03-PLAN.md — extend to non-symmetric leaf-wise Depthwise/Lossguide + Region (best_split_for_leaf) (PERF-02)
 - [ ] 21-04-PLAN.md — extend to the online-CTR-feature scoring path (PERF-02)
 - [ ] 21-05-PLAN.md — rayon parallelism + reusable scratch + determinism test + documented speedup (PERF-03)
@@ -210,7 +210,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |
 | 20. Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics | v1.2 | 0/TBD | Not started | - |
-| 21. CPU Split-Finding Histogram Rewrite | v1.2 | 1/5 | In Progress|  |
+| 21. CPU Split-Finding Histogram Rewrite | v1.2 | 2/5 | In Progress|  |
 | 22. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
