@@ -2091,10 +2091,12 @@ fn assign_leaves_ctr_aware(
 /// matching [`FeatureMatrix::n_features`]) then the CTR columns
 /// (`n_float + col`), so a float candidate scans feature `feature` and a CTR
 /// candidate on column `col` scans feature `n_float + col`. The partition is the
-/// SAME [`assign_leaves_ctr_aware`] forward-bit leaf order the once-per-tree final
-/// assignment uses, so the scan's `[false, true]` children are byte-for-byte the
-/// leaves `reduce_leaf_stats(assign_leaves_ctr_aware(chosen ++ candidate))`
-/// produced. The CTR path scores single-dimension der1 (`approx_dim == 1`, the
+/// SAME [`assign_leaves_ctr_aware`] forward-bit leaf ORDER the once-per-tree final
+/// assignment uses, so the scan's `[false, true]` children land in byte-for-byte
+/// the leaf ORDER `reduce_leaf_stats(assign_leaves_ctr_aware(chosen ++ candidate))`
+/// produced; the FALSE-side stats are bit-identical while the TRUE-side stats are
+/// ≤1e-5 oracle-equivalent (the `total − prefix` scan complement, 21-06). The CTR
+/// path scores single-dimension der1 (`approx_dim == 1`, the
 /// `reduce_leaf_stats` + `split_score` scalar contract) so the histogram carries
 /// one delta channel + one shared weight channel.
 fn build_ctr_aware_histogram(
@@ -2174,8 +2176,10 @@ fn build_ctr_aware_histogram(
 /// `hist_feature` (float feature `f`, or `n_float + col` for a CTR column) and
 /// `border_index`; an `O(n_bins)` prefix scan
 /// ([`scan_border_to_leaf_stats`]) yields the split's `[false, true]` child
-/// [`LeafStats`] — `bins <= border` FALSE, `bins > border` TRUE, byte-for-byte the
-/// `reduce_leaf_stats(assign_leaves_ctr_aware(chosen ++ candidate))` leaf order —
+/// [`LeafStats`] — `bins <= border` FALSE, `bins > border` TRUE, in byte-for-byte
+/// the `reduce_leaf_stats(assign_leaves_ctr_aware(chosen ++ candidate))` leaf ORDER
+/// (FALSE stats bit-identical; TRUE stats ≤1e-5 oracle-equivalent via the
+/// `total − prefix` scan complement, 21-06) —
 /// fed to the UNCHANGED [`split_score`] (`approx_dim == 1`, the same scalar calcer
 /// the float path uses; NOT a forked scorer).
 fn score_candidate_ctr_aware(
