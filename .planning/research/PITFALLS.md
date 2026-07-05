@@ -1,388 +1,392 @@
 # Pitfalls Research
 
-**Domain:** Device-resident GPU gradient-boosting training (CubeCL: cuda/rocm/wgpu/cpu) + speed-parity benchmarking vs official CatBoost GPU — v1.1 GPU Performance milestone
-**Researched:** 2026-06-28
-**Confidence:** HIGH (internal root-cause note + v1.0 retrospective + established memory landmines; corroborated by XGBoost/LightGBM/CatBoost GPU literature on FP non-associativity and atomicAdd)
+**Domain:** Parity-critical gradient-boosting library — v1.2 new surfaces (ONNX/CoreML export, GPU inference evaluator, extended fstr, CV/tuning/snapshot orchestration, online-HNSW KNN, benchmark + PyPI release)
+**Researched:** 2026-07-05
+**Confidence:** HIGH for ONNX/CoreML export limits, GPU-inference determinism, and HNSW feasibility (upstream source + instrumented-trainer evidence already in-repo); MEDIUM for CV fold-parity internals and PyPI free-threaded specifics.
 
-> Scope note: v1.0 shipped a **derivatives-only** GPU MVP. der1/der2 run on-device; the *entire* greedy tree-search inner loop (histogram → score → BestSplit → partition → leaf values) runs on the **host CPU**, with a per-tree device→host der read-back. This is the documented root cause of the >20× gap (`.planning/notes/gpu-training-host-light-root-cause.md`). The pitfalls below are ordered so the device-residency + sync-elimination ones (the actual gap) come first, then the determinism-vs-parallel-reduction tension against the ≤1e-5 oracle, then the repo-specific portability landmines, then benchmarking fairness.
+> **Headline findings for roadmap risk-planning**
+> 1. **ONNX/CoreML export of categorical/CTR/text/embedding models is IMPOSSIBLE upstream — do not scope it as a bug to fix.** CatBoost itself refuses these formats for any model with non-float features. The v1.2 requirement must be reframed to "float-feature models only, error clearly otherwise." (Pitfall 1, 2)
+> 2. **FEAT-07 bit-exact HNSW parity IS achievable — but only by porting the graph-construction RNG and insertion order bit-for-bit, NOT by writing "a good approximate KNN."** HNSW is deterministic given identical seed + insertion order + distance. The requirement should read "reproduce upstream's `online_hnsw` graph + search exactly," and its oracle must be the per-object neighbor **set**, not the final prediction. (Pitfall 8)
+> 3. **The GPU inference evaluator re-imports every v1.1 GPU determinism landmine** (double-accumulate atomic-add ordering, the `-inf`-literal HIP reject, `|=` A100 codegen bug) and adds upstream's own hard restrictions (oblivious-only, 1-dim-only, no cats, only 3 prediction types implemented). Match the restrictions exactly rather than "doing better." (Pitfall 5, 6, 7)
 
 ---
 
 ## Critical Pitfalls
 
-### Pitfall 1: Leaving the inner loop host-side — "GPU backend" that only computes derivatives
+### Pitfall 1: Trying to export categorical / CTR / text / embedding models to ONNX
 
 **What goes wrong:**
-A `Runtime` trait that exposes only `compute_gradients()` forces `fit()` to fall through to the CPU `greedy_tensor_search_*` growers. ~95% of training (histogram build, split scoring, BestSplit, partition/leaf-assign, leaf values) stays on the host. Selecting a GPU backend then adds a per-tree device→host der read-back *without removing any host work* — so the GPU path can be **slower than pure CPU**. This is exactly the v1.0 state.
+A CatBoost model trained with categorical features (the library's flagship capability, via ordered target statistics / CTR), or with text/embedding features, **cannot be represented in ONNX-ML at all**. Upstream CatBoost's `save_model(format="onnx")` only supports datasets **without** categorical features; text and embedding features "will likely never be supported." If v1.2 scopes "ONNX export" as a blanket feature, it will pass on the toy float-only fixtures and then fail (or silently produce a wrong model) the moment a real CatBoost user — whose entire reason for using CatBoost is categorical handling — exports their model.
 
 **Why it happens:**
-Derivatives are the easiest, most self-contained kernel and make a satisfying "GPU works" demo. The boosting loop `cb_train::train::<R: Runtime>` is generic over `Runtime`, but there is no trait seam for "grow a tree on device," so the fast path that *was already built* (`grow_boosting_pass` at `gpu_runtime/mod.rs:1890`) is only ever called from tests, never wired into `cb-train`.
+The ONNX `TreeEnsemble`/`TreeEnsembleClassifier` operators have no node mode for set-membership tests; a CTR is a learned numeric transform of a category's target statistics computed *during training* with permutation/ordering — there is no ONNX primitive for it. Developers assume "export = serialize the trees" and miss that CatBoost's split conditions reference CTR feature values that don't exist outside the trainer.
 
 **How to avoid:**
-Add a `Runtime` trait seam for on-device tree growth (e.g. `grow_tree`/`grow_pass`) and wire `grow_boosting_pass_into` into `cb_train::train`. Treat "GPU is selected but inner loop is on host" as a hard failure, not a silent fallback: a `cuda`/`rocm`/`wgpu` build that routes any per-object inner-loop work through the host CPU should be caught by a benchmark gate, not shipped.
+- **Reframe the requirement** to match upstream exactly: ONNX export is supported **only for models whose features are all float/numeric**. Enforce it at the export entry point with a typed `thiserror` variant (`ExportUnsupported { format: Onnx, reason: "categorical/text/embedding features present" }`) — mirror CatBoost's own error, never emit a silently-wrong graph.
+- Document the upstream workaround (cast categoricals to float64 pre-training loses native handling) but do **not** implement CTR-in-ONNX — it is out of scope and upstream doesn't do it either.
+- Support the three model types upstream supports: binary classification (`Logloss`), multiclass (`MultiClass`), regression. Use `ai.onnx.ml` TreeEnsemble operators.
 
 **Warning signs:**
-- GPU utilization near 0% during training; CPU pegged at one core.
-- GPU train time ≥ CPU train time on a large dataset.
-- A profiler shows time dominated by `tree.rs` host functions (`reduce_leaf_stats`, `select_best_candidate`, `assign_leaves`) rather than kernel launches.
+- Test fixtures are all numeric-only → false confidence. Real CatBoost adoption models are categorical-heavy.
+- An export path that "succeeds" on a categorical model is a red flag — upstream *rejects* it, so you've diverged.
 
-**Phase to address:** Phase 1 (Runtime grow-tree seam + wire `grow_boosting_pass` into `cb-train`) — the highest-leverage phase of v1.1.
+**Phase to address:** Model export (ONNX) phase — gate the scope in the SPEC as "float-only models."
 
 ---
 
-### Pitfall 2: Per-level / per-tree blocking read-backs (host↔device sync stalls)
+### Pitfall 2: ONNX/CoreML float-precision drift silently breaking the ≤10⁻⁵ parity bar
 
 **What goes wrong:**
-Reading a device buffer back to the host (`client.read_one`) is a synchronization point: it drains the queue and blocks until the kernel finishes. Doing this per feature, per bin, per level, or per tree serializes the GPU and host — the GPU repeatedly idles waiting for the host to decide the next split, and the host idles waiting for the read-back. Even the existing "host-light" grower reads back `2^depth` part-stats *per level* plus `leaf_of` and a recomputed `der1` *per tree*; multiply that across hundreds of trees × depth-6 and the stalls dominate.
+The project's parity bar is **≤10⁻⁵ absolute vs official CatBoost, and CatBoost accumulates leaf values in `double`** (Bias is `double`, the CPU applier sums in double). ONNX `TreeEnsemble` and CoreML tree evaluators operate in **float32** internally (ONNX Runtime's tree ensemble accumulates in float; CoreML is float32 end-to-end). Over hundreds of trees, float32 accumulation drifts well beyond 10⁻⁵ from the double reference — so an exported model that is *structurally correct* still "fails parity" if you test it against the `.cbm` double predictions at the CPU bar. Teams then chase a non-bug or, worse, loosen the bar globally.
 
 **Why it happens:**
-BestSplit is a tiny reduction whose result (which feature/border to split on) is needed by the host to drive the next level. The naive structure is "launch histogram kernel → read back → host picks split → launch next." Each arrow is a sync.
+Confusing "the exported model is faithful" with "the exported model reproduces double-precision predictions." The drift is inherent to the target runtime's numeric type, not an export bug.
 
 **How to avoid:**
-- Keep the split *decision* on-device too: compute BestSplit in a kernel and keep the chosen split index in a device buffer; only read back the final tree structure once per tree (or batch several trees).
-- Minimize crossings to O(1) metadata, never bulk per-object data (the established D-05 rule: only `2^depth` part-stats + `leaf_of` cross, never the histogram/partition/doc-routing).
-- Recompute `der1` device-side and keep it device-resident for the next iteration instead of reading it back (see Pitfall 3).
-- Where a read-back is unavoidable, overlap it: don't block the host on data the next launch doesn't need yet.
+- **Do not apply the ≤10⁻⁵ double bar to exported-model outputs.** Define an export-specific tolerance and test methodology:
+  - **Oracle = official CatBoost's own ONNX/CoreML export**, evaluated in the *same runtime* (ONNX Runtime / CoreML). Compare `our_onnx → ORT` against `catboost_onnx → ORT`. Both suffer the same float32 drift, so this comparison can legitimately be tight (target ≤10⁻⁵–10⁻⁶ on `RawFormulaVal`, because the numeric path is identical).
+  - **Secondary check**: `our_onnx → ORT` vs our own `.cbm` predictions, at a **documented looser tolerance** (realistic: ~10⁻⁴ to 10⁻⁵ on RawFormulaVal for shallow/short ensembles; larger for deep/long ensembles) — this catches structural bugs but is explicitly *not* the parity gate.
+- Test on **RawFormulaVal** first (identity post-processing) to isolate tree math from sigmoid/softmax. Add Probability/Class as separate checks.
+- Use ONNX Runtime as the checker (it is the reference ONNX-ML tree evaluator); pin the opset and ORT version in the test harness.
 
 **Warning signs:**
-- `read_one` / `read` calls inside the per-level or per-feature loop.
-- Timeline shows sawtooth GPU utilization (burst, idle, burst) synchronized with host activity.
-- Throughput scales with tree count far worse than O(trees).
+- Parity "failures" that grow with `iterations` / `depth` → precision drift, not a bug.
+- Passing at 10⁻² but failing at 10⁻⁵ against `.cbm` double predictions → expected float32 behavior, re-baseline the oracle.
 
-**Phase to address:** Phase 1–2 (device-resident BestSplit + read-back minimization), validated by the benchmark harness phase.
+**Phase to address:** Model export phase — define export tolerance + ORT-as-checker in the SPEC before coding.
 
 ---
 
-### Pitfall 3: Re-uploading training data every tree / iteration (failure to stay device-resident)
+### Pitfall 3: ONNX opset / prediction-type / binary-label mismatches
 
 **What goes wrong:**
-The quantized feature matrix (`cindex`, feature-major bins), weights, target, and visiting-order `indices` are constant across all boosting iterations. Re-uploading them per tree wastes PCIe bandwidth and adds a host-side allocation/copy each iteration. Only the running `approx`/`der1` change between trees.
+- **Opset drift:** the `ai.onnx.ml` TreeEnsemble op semantics changed across opsets; exporting against one opset and validating with an ONNX Runtime built for another produces subtle score differences or load failures.
+- **RawFormulaVal vs Probability confusion:** CatBoost's raw tree sum is `RawFormulaVal`; Probability requires the sigmoid/softmax post-transform. If the export bakes in the wrong prediction type (or none), consumers get logits when they expect probabilities.
+- **The known onnxruntime binary-classification label bug:** ORT infers the *label* incorrectly for binary classification exported from CatBoost — the documented guidance is "ignore the label output for binary classification, use the probability." A parity test that asserts on the label will spuriously fail.
 
 **Why it happens:**
-A function-per-tree decomposition that takes `&[u32] cindex` by host slice and uploads inside the call (convenient, stateless) re-uploads every call. The current `grow_boosting_pass_into` already threads one `client` and keeps `der1` in a host `Vec` that it re-derives device-side — but the bulk `cindex`/`weight` should be uploaded **once** before the iteration loop and reused as device handles.
+Export parameters (`onnx_domain`, `onnx_model_version`, opset) are under-specified, and the ONNX-ML classifier output contract (label + probabilities map) is more complex than a single score.
 
 **How to avoid:**
-- Upload `cindex`, `weight`, `target`, `indices` to device handles **once**, before the boosting loop; pass handles (not host slices) into the per-tree grower.
-- Keep `approx`/`der1` device-resident across iterations; update them with a kernel, not a host round-trip.
-- Thread ONE `ComputeClient` through the entire run — a CubeCL `Handle` is bound to its originating client; a handle allocated by one client and read by another is undefined (memory: "never read a 0-len handle"; `gpu_runtime/mod.rs:1917`).
+- Pin the export opset explicitly and match it in the ORT test environment; record both in the fixture manifest.
+- Export and test **RawFormulaVal** and **Probability** as distinct, labeled cases; make the prediction type an explicit export parameter mirroring CatBoost's `export_parameters` / `prediction_type`.
+- In binary-classification parity tests, **assert on the probability/score, not the ORT-inferred label** (document the upstream ORT bug in the test).
 
-**Warning signs:**
-- `client.create(...)` for the feature matrix inside the per-tree loop.
-- Host RSS churn / allocator pressure proportional to iteration count.
-- PCIe-bound profile on a dataset that fits in VRAM.
+**Warning signs:** Load errors mentioning unsupported opset; label mismatches only in binary classification; probabilities off by a monotonic transform (missing sigmoid).
 
-**Phase to address:** Phase 1 (device-resident data layout), enforced by Phase 2 depth>1 work.
+**Phase to address:** Model export phase.
 
 ---
 
-### Pitfall 4: Non-deterministic float reduction order breaks the ≤1e-5 oracle
+### Pitfall 4: CoreML non-determinism, float32-only, and limited op support
 
 **What goes wrong:**
-Floating-point addition is non-associative. Parallel histogram accumulation and parallel sum-reductions add per-object gradients to the same bin in a runtime-dependent order, so the histogram (and hence split scores, leaf values, predictions) differs run-to-run in the low bits. Against an *absolute* ≤1e-5 oracle this is usually fine for a single tree — but errors compound across hundreds of boosting iterations (a tiny split-score difference flips a split, which diverges the whole subtree), so a structurally-correct kernel can still fail the end-to-end parity gate.
+CoreML export shares the categorical-feature prohibition (float-only), is **float32 end-to-end** (same drift as Pitfall 2, usually worse — no double anywhere), and its tree/activation op coverage is narrower than ONNX. Exotic post-transforms (RMSEWithUncertainty, MultiProbability, custom activations) have no CoreML representation. CoreML also carries metadata and can exhibit platform-dependent evaluation (only truly testable on macOS/Apple runtimes), so a "successful export" produced/validated on Linux CI may not be faithfully checkable at all in-env.
 
 **Why it happens:**
-`atomicAdd` into a shared histogram bin is the easiest correct parallelization, but its commit order is non-deterministic. Likewise tree/warp reductions sum in hardware-dependent order. CatBoost's own docs note GPU ranking results are non-deterministic for this reason.
+CoreML is an Apple-ecosystem format; the toolchain (coremltools) and the evaluator are macOS-centric, and the format targets float32 mobile inference, not double-precision parity.
 
 **How to avoid:**
-- Prefer **deterministic reduction strategies**: fixed-order tree/segmented reductions or per-partition private histograms merged in a fixed index order, rather than global `atomicAdd` racing into shared bins.
-- Reduce in the **same associativity order** the CPU oracle uses where the gate is bit-tight; or accumulate in higher precision (f64) to push rounding below 1e-5.
-- Gate per-stage (borders → histogram → split score → leaf value → prediction) so a reduction-order divergence is caught at the histogram stage, not only at final predictions (the v1.0 highest-leverage practice).
-- Accept the established **ε=1e-4 GPU tolerance vs the Rust CPU path** (D-04) where bit-exactness is infeasible — but justify it per stage; do not silently widen the bar to make a flaky kernel pass (escalate-don't-weaken).
+- Scope CoreML to the **same float-only, 1-dim + multiclass, RawFormulaVal/Probability/Class** subset as upstream; reject everything else with a typed error.
+- Oracle strategy = **official CatBoost's CoreML export as the reference**, compared in the same evaluator, at a float32-realistic tolerance (≥10⁻⁴). Do not hold CoreML to the ≤10⁻⁵ double bar.
+- Decide the validation environment up front: if no macOS/CoreML runtime is available in CI, treat CoreML parity as **structural** (compare the exported CoreML tree structure/leaf values byte-or-field-wise against CatBoost's CoreML export) rather than execution-based, and document the gap — do **not** fabricate execution parity you can't run (mirrors the Kaggle-CUDA "no in-env oracle" discipline already used for GPU).
 
-**Warning signs:**
-- Same input → different model across two runs on the same GPU.
-- Parity passes at 1 tree, drifts past tolerance by iteration N.
-- A split flips between runs; downstream leaf values diverge by >>1e-5.
+**Warning signs:** CoreML parity "passes" but was never executed on an Apple runtime; predictions differ from ONNX for the same model (float32 vs the ONNX path).
 
-**Phase to address:** Phase 2 (device histogram + scoring) with a determinism sub-criterion; the determinism strategy must be chosen *before* the histogram kernel is written, not retrofitted.
+**Phase to address:** Model export (CoreML) phase — pair with ONNX but keep tolerance/validation separate.
 
 ---
 
-### Pitfall 5: f64 atomic-add unavailable / falls back to host-sum on some GPUs
+### Pitfall 5: GPU inference evaluator — non-deterministic reductions breaking ε=1e-4
 
 **What goes wrong:**
-Code assumes hardware f64 `atomicAdd` (or an f64 atomic reduce) exists. On gfx1100 / RDNA3 (the in-env ROCm GPU) there is **no f64 atomic-add**; CubeCL's f64 reduce falls back to a `HostSumFallback` (memory: `phase76-gpu-tolerance-signoff-outcome`). A kernel written against CUDA's f64 atomics compiles but either rejects on HIP or silently routes the reduction through a slow host path — destroying both performance and the "device-resident" guarantee, and only on the ROCm backend.
+Upstream's GPU evaluator accumulates each document's prediction into a `double4` and folds tree-sub-blocks with a **`TAtomicAdd` into `results`** (§7.1 of `CATBOOST_CUDA_KERNELS_DESIGN.md`). Atomic-add ordering is non-deterministic across launches, so a naive CubeCL port gives run-to-run jitter. For a *single* model apply this jitter is tiny, but the same class of non-determinism is exactly what forced v1.1 to build a **fixed-point u64 deterministic reduction** to hold ε=1e-4 across hundreds of trees. An inference evaluator that sums many trees per document hits the same wall — and worse, the parity bar is now against CatBoost, not just self-consistency.
 
 **Why it happens:**
-CUDA exposes f64 atomics broadly; developers test the cuda backend mentally and assume parity. RDNA3 consumer GPUs lack f64 atomics; the fallback is invisible to `cargo check` on cpu/wgpu and only manifests at runtime on the real GPU.
+Floating-point atomic-add is not associative; thread-scheduling order varies. Developers assume "inference is just a sum, order doesn't matter."
 
 **How to avoid:**
-- Do **not** depend on f64 atomics. Accumulate histograms in f32 with deterministic merge, or use per-partition private f64 histograms merged by a fixed-order reduction (no atomics), or a two-pass segmented reduction.
-- If higher precision is needed, fold weight downstream (the established 7.2 UNWEIGHTED-der + 7.3 histogram-folds-weight contract) so the hot reduction stays in a supported type.
-- Always run the **full ROCm suite in-env** after any `#[cube]` change — cpu/wgpu cargo-check cannot reveal the gfx1100 atomic/JIT behavior.
+- **Reuse the v1.1 deterministic-reduction machinery** (fixed-point u64 accumulation → convert to float) for the per-document tree-value fold. This is already proven on P100 and gfx1100 to hold ε=1e-4 across hundreds of trees (Key Decision, v1.1). Do not re-introduce a raw float `TAtomicAdd`.
+- Accumulate leaf values in the widest precision the backend allows (upstream uses `double`; match that where the backend supports f64 atomics, else fixed-point u64 as in v1.1 — note gfx1100 lacks f64 atomic-add, so the fixed-point path is mandatory in-env).
+- Oracle the GPU evaluator against the **CPU Rust predictor** at ε=1e-4 (the established GPU bar) AND against official CatBoost `EnableGPUEvaluation` output on Kaggle CUDA (the sole authoritative GPU oracle).
 
-**Warning signs:**
-- A reduce that is fast on the (untestable) cuda backend but collapses to host speed on rocm.
-- HIP JIT errors mentioning unsupported atomic on f64, or a sudden host-side hot spot in a "device" reduce.
+**Warning signs:** Predictions differ across repeated identical GPU applies (run twice, diff > 0); parity that passes on 10 trees and drifts at 500 trees; ε holds on wgpu/cpu facade but fails on real rocm/CUDA.
 
-**Phase to address:** Phase 2 (histogram/reduce kernel design) — choose an atomic-free, type-portable reduction up front.
+**Phase to address:** GPU inference evaluator phase.
 
 ---
 
-### Pitfall 6: CubeCL HIP rejects `-inf` literals in `#[cube]` kernels
+### Pitfall 6: GPU inference evaluator — the `-inf`-literal HIP landmine (and other CubeCL codegen traps) re-biting
 
 **What goes wrong:**
-`F::new(f32::NEG_INFINITY)` (or any `-inf` literal) inside a `#[cube]` kernel emits `double(-inf)` in generated HIP, which the gfx1100 JIT rejects with `undeclared identifier 'inf'`. The split-scorer's "no candidate yet" sentinel is the classic site. It is **invisible to cpu/wgpu cargo check** and fails *only* on the ROCm GPU at runtime (memory: `cubecl-hip-no-inf-literal`; bit Phase 7.5 WR-01, 16/75 → 75/75 after fix).
+The feature accessor in upstream's evaluator returns `NegativeInfty()` for out-of-range features (§7.1). A direct CubeCL transcription — `F::new(f32::NEG_INFINITY)` inside a `#[cube]` kernel — emits a bare `double(-inf)` literal that the **HIP/comgr compiler on gfx1100 rejects** (`use of undeclared identifier 'inf'`), failing the whole kernel JIT at runtime. This is **invisible to `cargo check` and to the `cpu`/`wgpu` facades** — it only surfaces when the rocm suite runs on the real GPU. It cost v1.1 a 16/75 rocm failure that looked like a logic bug.
 
 **Why it happens:**
-`-inf` is the natural "lowest possible score" initializer for an argmax. It works on CPU/wgpu and on CUDA; HIP's codegen path can't parse the literal.
+CubeCL's cpu facade compiles infinity literals fine; the HIP backend does not. Verifier/fixer subagents cannot reach the GPU, so the trap escapes normal review.
 
 **How to avoid:**
-- Use a **finite sentinel** (`f32::MIN`) for "lowest score" inside kernels; host code may keep `f64::NEG_INFINITY`.
-- Add a lint/review checklist item: no `INFINITY`/`NEG_INFINITY`/`inf` literals inside `#[cube]` functions.
-- Run the ROCm suite in-env after every `#[cube]` change (the only place this surfaces).
+- **Never seed a `#[cube]` kernel reduction/accessor with an infinity literal.** Use the finite sentinel `F::new(f32::MIN)` (~-3.4e38) for the out-of-range/argmin seed — behaviorally identical to -inf for all realizable inputs. Host-side (oracle) code may keep `f64::NEG_INFINITY`.
+- Also carry forward the **`|=` → `+=`/`<<` leaf-index construction** (upstream replaced `|=` with `+=`/`<<` to dodge the A100 codegen bug `MLTOOLS-6839`, noted in §7.1) — transcribe the shift form, not the OR form.
+- **Run the rocm suite in-env yourself before any GPU-inference sign-off** (`cargo test -p cb-backend --no-default-features --features rocm`). `cargo check`/cpu tests cannot catch HIP codegen rejects. Do not delegate GPU validation to a subagent that can't reach the device.
 
-**Warning signs:**
-- A kernel passes cpu/wgpu but the rocm run drops from N/N to a partial pass with a JIT "undeclared identifier 'inf'" error.
+**Warning signs:** rocm `ServerUnhealthy`/`Launch` compilation errors; tests green on cpu/wgpu but a fraction fail on rocm; failures that vanish when you remove an infinity/`|=` expression.
 
-**Phase to address:** Every phase that touches `#[cube]` scoring kernels (Phase 2 split-scorer, Phase 3 pairwise/multiclass). Add to the kernel-authoring checklist now.
+**Phase to address:** GPU inference evaluator phase (and any phase touching `#[cube]` code).
 
 ---
 
-### Pitfall 7: The `cb-backend` → `cb-train` dependency landmine (Cargo feature unification)
+### Pitfall 7: GPU inference evaluator — silently exceeding upstream's supported subset
 
 **What goes wrong:**
-Adding a `cb-train` dependency to `cb-backend` (e.g. to reuse a CPU reference function) triggers Cargo feature unification across the dependency graph, which breaks the ROCm runtime build/selection. The "obvious DRY refactor" silently corrupts backend selection.
+Upstream's `TGpuEvaluator` **enforces at construction**: oblivious (symmetric) trees only, **one output dimension only** (`CB_ENSURE(GetDimensionsCount() == 1)`), and **no categorical/text/embedding features**. Only `RawFormulaVal`, `Probability`, and `Class` post-transforms are implemented; `Exponent`, `RMSEWithUncertainty`, `MultiProbability`, multidim softmax, and `CalcLeafIndexes*` **`ythrow "Unimplemented on GPU"`**. A port that "helpfully" runs multiclass or non-symmetric trees on device will diverge from CatBoost (which falls back to CPU for those) — a parity failure, not a feature.
 
 **Why it happens:**
-The device grower needs CPU reference logic (leaf averaging, score formulas). The tempting fix is to depend on the crate that already has them. But `cb-backend` must stay feature-isolated so the `rocm`/`cuda`/`wgpu`/`cpu` features don't unify with `cb-train`'s.
+The v1.2 CPU/training engine already supports non-symmetric trees, multiclass, CTR, uncertainty — so it's tempting to route all of them through the new GPU evaluator. But upstream's GPU *inference* path is deliberately narrow; matching CatBoost means matching the narrowness.
 
 **How to avoid:**
-- **Never** add a `cb-train` dependency to `cb-backend`. **Transcribe** the needed CPU reference inline into `cb-backend` (the established rule, memory `phase75-grow-loop-outcome` / root-cause note line 64).
-- Factor shared math into a leaf crate with no backend features (e.g. `cb-compute`) that both depend on, rather than a `cb-backend → cb-train` edge.
+- Mirror upstream's construction-time guards exactly: reject non-oblivious, `ApproxDimension != 1`, and any cat/text/embedding model with a typed error, and **fall back to the CPU evaluator** (the `Ok(None)`→CPU seam pattern from v1.1 is the right shape).
+- Implement only `RawFormulaVal`/`Probability`/`Class`; explicitly error on the unimplemented prediction types (do not approximate them on device).
+- Keep the warp-interleaved quantized-buffer layout and `FeatureVal = CPU SplitIdx` verbatim (no border transform, per §7.1) — transforming borders is a classic silent divergence.
 
-**Warning signs:**
-- ROCm runtime selection regresses / wrong backend chosen after a refactor.
-- `cargo tree -f "{p} {f}"` shows `cb-train` features unified into the backend build.
+**Warning signs:** GPU predict "works" on a multiclass or CatFeature model where CatBoost would have thrown/fallen back; predictions match CPU on `RawFormulaVal` but diverge on Probability (post-transform bug).
 
-**Phase to address:** Phase 1 (architecture of the grow-tree seam) — bake the inline-transcription rule into the seam design.
+**Phase to address:** GPU inference evaluator phase.
 
 ---
 
-### Pitfall 8: cuda-vs-rocm behavioral divergence (correct in-env, broken on the benchmark target)
+### Pitfall 8: Online-HNSW — treating "approximate" as "non-deterministic" and declaring bit-exact parity infeasible
 
 **What goes wrong:**
-Correctness is developed and validated **only** on AMD/ROCm (no NVIDIA in-env); the head-to-head speed benchmark runs on **CUDA** (Kaggle). A kernel can pass all ROCm oracles yet behave differently on CUDA: different warp/wavefront width (RDNA3 wave32 vs NVIDIA warp32 — coincidentally equal, but block/occupancy tuning differs), different atomic availability (CUDA *has* f64 atomics, so a path that fell back on ROCm runs natively — different numerics), different JIT acceptance (CUDA accepts `-inf`, masking Pitfall 6). The benchmark run is the *first* time CUDA executes the code.
+The Phase-6.5 estimated-feature KNN residual was diagnosed **definitively** (instrumented catboost 1.2.10, `max|diff|=0.0` on frozen predictions): upstream's KNN embedding calcer uses `NOnlineHnsw::TOnlineHnswDenseVectorIndex<float, TL2SqrDistance<float>>` (approximate NN, `searchNeighborhoodSize=300`), while the Rust `cb_compute::KnnCalcer` is **brute-force-exact**. The two return *different neighbor sets* (proof: query doc6 exact 3-NN `{0,2,4}` vs upstream HNSW `{1,3,4}`), so exact-KNN can never match. The trap is concluding "approximate ⇒ random ⇒ bit-exact parity is impossible, weaken the requirement." **That is wrong.** HNSW is *approximate* but **deterministic**: given the same seed, same insertion order, same distance function, and same graph-construction RNG, it builds an identical graph and returns identical (approximate) neighbors every time.
 
 **Why it happens:**
-The portability promise ("write once, run cuda/rocm/wgpu") is real for *compilation* but not for *numerics, performance, or JIT edge-cases*. The asymmetry (validate on ROCm, benchmark on CUDA) means the CUDA path is effectively untested for correctness before it's timed.
+"Approximate nearest neighbor" is conflated with "stochastic output." ANN indices are approximate w.r.t. *true* nearest neighbors, but their output is a pure deterministic function of (data, insertion order, RNG stream, parameters).
 
-**How to avoid:**
-- On the Kaggle CUDA run, **first re-run the oracle/parity tests on CUDA** (not just the timing) before trusting the speed number — a fast-but-wrong CUDA result is worthless.
-- Keep kernels free of backend-specific assumptions (atomic availability, literal codegen, warp size); parameterize occupancy via CubeCL cube/plane dims rather than hard-coded NVIDIA numbers.
-- Treat ε=1e-4 GPU-vs-CPU tolerance as defined against the **Rust CPU path**, and verify it holds on *both* GPU backends, not just ROCm.
+**How to avoid — and the feasibility answer the roadmap needs:**
+- **Bit-exact parity IS achievable.** The requirement must be **reframed** from "implement a good approximate KNN" to: **"port `catboost-master/library/cpp/online_hnsw` bit-for-bit — the dynamic dense graph, incremental insert order, `TL2SqrDistance`, and the RNG-driven level/neighbor selection — so the constructed graph and search results match upstream's exactly."** This overrides the original Phase-6.5 decision "no third-party HNSW crate" (A2/D-05): you cannot use an off-the-shelf HNSW crate (hnswlib/`instant-distance`) because its RNG and construction order will differ — you must transcribe upstream's.
+- **The oracle must be the per-object neighbor *set* (and vote order), not the final prediction.** Instrument `knn_neighbors` and assert the returned indices match upstream index-for-index over the shuffled prefix `S = create_shuffled_indices(n, seed)`. Also reproduce the **class-vote-order** convention (upstream feat0 = class-1 vote; the Rust `[class0,class1]` order was a separate bug). Getting the prediction to ≤10⁻⁵ *follows* from matching the neighbor set — testing only the prediction hides which half is wrong.
+- Scope is bounded and known: ~936 LOC (dynamic dense graph + incremental insert + HNSW search + `TL2SqrDistance` + RNG). It is **its own focused phase** (FEAT-07) with the instrumented-trainer recipe already documented (`catboost-instrumented-trainer-build`).
+- The boosting-loop integration is **easy** (already proven): a single static online-over-`S` column for train + offline post-hoc apply; `fold_count=1`, no cycling, no `train_inner` change. Do not re-open the disproven hypotheses (thread the learn permutation; structure-fold cycling/averaging) — both are DISPROVEN.
 
 **Warning signs:**
-- Parity gates only ever ran on ROCm; the CUDA path has no correctness evidence.
-- Occupancy/block sizes hard-coded to multiples of 32 with NVIDIA assumptions.
+- Anyone proposing to "just use a mature HNSW crate for speed" — guarantees a different RNG/graph → parity permanently unreachable.
+- A KNN oracle that asserts only on the final XOR prediction (masks the neighbor-set divergence).
+- Neighbor sets that agree on early prefixes but diverge from p5 onward (the exact signature of construction-order/RNG mismatch, already observed).
 
-**Phase to address:** Benchmark/validation phase (final) — must include a CUDA-side correctness re-run, not only timing.
+**Phase to address:** FEAT-07 online-HNSW port — a dedicated debt/hardening phase. **Recommend the roadmap state the requirement as "match upstream `online_hnsw` graph construction & search bit-for-bit," with per-object neighbor-set oracles, not "approximate KNN within tolerance."**
 
 ---
 
-### Pitfall 9: Tiny-kernel launch overhead (per-feature / per-bin launches)
+### Pitfall 9: CV / hyperparameter tuning — data leakage and fold-partition divergence from CatBoost's `cv()`
 
 **What goes wrong:**
-Launching one kernel per feature, per border, or per leaf makes launch/dispatch overhead dominate actual compute. A 100-feature × 128-bin histogram done as 100 (or 12,800) micro-launches is latency-bound; the GPU spends more time scheduling than summing. (Note: the *current* code has **no** tiny-kernel problem because no training kernels launch at all — this becomes a risk precisely *when* the inner loop is moved on-device, so design for it from the start.)
+Two distinct failures:
+1. **Non-parity folds:** CatBoost's `cv()` has specific, non-obvious partitioning semantics — `type` ∈ {Classical, Inverted, TimeSeries}; **stratified sampling is ON by default for `Logloss`/`MultiClass`/`MultiClassOneVsAll` and OFF otherwise**; optional `shuffle` before splitting; and **group identifiers force all objects of a group into the same fold**. A reimplementation that uses sklearn's `KFold`/`StratifiedKFold` or a naive contiguous split will produce different folds → different per-fold metrics → "parity failure" that is really a fold-assignment mismatch. Ranking data with query groups is especially easy to get wrong (splitting mid-group leaks and breaks group metrics).
+2. **Leakage in tuning:** grid/random search that computes CTR/target-statistics or fits the quantization borders on the *full* dataset before CV, or that reuses a snapshot across folds, leaks target information into validation. CatBoost's ordered target statistics are precisely designed to avoid this — a careless orchestration layer can undo that guarantee.
 
 **Why it happens:**
-The host CPU loop structure (`for feature → for border`) is transcribed 1:1 into kernel launches instead of being collapsed into one fused kernel that parallelizes over (feature, bin, object) internally.
+CV/tuning is treated as a thin wrapper, so the subtle CatBoost-specific defaults (stratification triggers, group-awareness, per-fold border computation) get skipped. Leakage is invisible — it *improves* CV scores, so it looks like success.
 
 **How to avoid:**
-- Fuse: one histogram kernel that parallelizes across all features/bins/objects in a single launch; one scoring kernel across all candidate splits; one BestSplit reduction.
-- Batch per-level work, not per-feature work. Keep launches O(levels) or O(trees), not O(features × bins × levels).
+- Reproduce `cv()` semantics exactly: implement all three `type`s, match the stratification default-by-loss-function rule, honor `shuffle`/`partition_random_seed`, and keep **groups intact within a fold**. Oracle the *fold assignment* (which object → which fold, given seed) against CatBoost, not just the final metric.
+- Compute quantization borders, CTR statistics, and any target-dependent preprocessing **inside each fold's train split only** — never on the full pool. Add an explicit test that a target-permuted feature yields ~chance CV score (leakage canary).
+- For hyperparameter tuning, reuse the CV harness per candidate; never carry a snapshot/warm-start across folds unless explicitly matching CatBoost's `randomized_search`/`grid_search` behavior.
 
-**Warning signs:**
-- Launch count scales with feature/bin count.
-- Profiler shows high dispatch overhead, low kernel duration, low occupancy.
+**Warning signs:** CV scores noticeably better than held-out test; per-fold metrics that match CatBoost on regression but not on Logloss (stratification default missed); ranking CV where group metrics are unstable (split mid-group).
 
-**Phase to address:** Phase 2 (fused histogram + scoring kernels).
+**Phase to address:** Orchestration phase (CV / tuning).
 
 ---
 
-### Pitfall 10: Unfair benchmark vs official CatBoost GPU (apples-to-oranges)
+### Pitfall 10: Snapshot / resume — non-reproducible resumed training
 
 **What goes wrong:**
-The headline "20× slower / now at parity" number is meaningless unless the comparison is controlled. Common distortions: (a) counting the **first iteration** which includes CatBoost's JIT/kernel-compilation and our CubeCL JIT warmup; (b) measuring **end-to-end** (data load, quantization, Python/PyO3 overhead, I/O) instead of **train-only**; (c) different `depth`, `border_count`/bin count (128 vs 32 changes CatBoost GPU time a lot), `iterations`, `learning_rate`, bootstrap, or loss; (d) a dataset too small (<10k rows / <10 features) where GPU never wins for *either* implementation; (e) different `thread_count`/device; (f) one warm, one cold.
+`save_snapshot`/`snapshot_file`/`snapshot_interval` must let training **resume bit-identically** to an uninterrupted run. If the snapshot omits any piece of RNG/iteration state — the boosting iteration counter, the permutation/fold RNG state, the ordered-boosting fold permutations, the learning-rate schedule position, the overfitting-detector history, the current approx cursor — a resumed model diverges from a straight run, silently breaking the ≤10⁻⁵ parity bar for any user who relies on snapshotting.
 
 **Why it happens:**
-It's easy to call `.fit()` on both and diff wall-clock. CatBoost compiles CUDA kernels on first use; CubeCL JITs on first launch; both pollute the first measured iteration. Bin count and tree-size parity are non-obvious knobs that swing the result.
+Snapshot is treated as "dump the trees so far," but reproducible resume requires serializing the *entire* trainer state, including the RNG streams that drive sampling and ordered boosting (the same permutation machinery that was hard-won in Phase 5).
 
 **How to avoid:**
-- Discard warmup: run ≥1 untimed warmup fit, then time the median of several runs.
-- Measure **train-only** (exclude Pool construction, quantization upload, prediction, I/O) on both sides; or measure each phase separately.
-- Pin identical params: same `iterations`, `depth`, `border_count`/`max_bin`, `learning_rate`, loss, bootstrap, `random_seed`, and the **same quantized data**. Match tree sizes (CatBoost's own benchmark tunes hyperparams so all libs build similar-size trees).
-- Use a dataset large enough that GPU is meaningfully exercised (millions of rows or thousands of features for a real speedup signal; report bin count, e.g. 128 and 32).
-- Report the hardware and that it's a *single* GPU; don't compare our 1-GPU run to a CatBoost multi-GPU run.
+- Snapshot the **complete** trainer state: iteration index, all RNG/permutation states, ordered-boosting fold assignments, approx cursors, best-iteration/overfitting-detector state, metric history. Version the snapshot format.
+- Oracle test: train N iterations straight vs train `k`, snapshot, resume to `N` → assert **bit-identical** model (≤10⁻⁵, ideally 0.0). Do this for plain *and* ordered boosting, and with sampling enabled (the RNG-sensitive cases).
+- Reject resume across incompatible parameter/version changes with a typed error (CatBoost's "exclusive parameters" class of error).
 
-**Warning signs:**
-- Speed ratio changes wildly run-to-run (warmup not excluded).
-- "Parity reached" on a 5k-row toy set (GPU advantage is noise at that scale).
-- Params or bin counts differ between the two `.fit()` calls.
+**Warning signs:** Resumed model differs from straight run; divergence only appears with `bootstrap`/`subsample`/ordered boosting (RNG state not restored); resume works for 1 fold but not with CTR.
 
-**Phase to address:** Benchmark harness phase (final) — define the protocol before quoting any number.
+**Phase to address:** Orchestration phase (snapshot/resume).
 
 ---
 
-### Pitfall 11: Kaggle CUDA environment gotchas
+### Pitfall 11: PyPI release — per-backend wheel confusion and abi3/free-threaded traps
 
 **What goes wrong:**
-The Kaggle notebook is the *only* CUDA environment, so environment quirks masquerade as performance or correctness bugs: the CubeCL `cuda` feature must build against the notebook's CUDA toolkit/driver version; first-run JIT/`nvcc` compilation inflates the first timing; the GPU may be shared/throttled; session time limits and ephemeral filesystem can truncate long benchmark sweeps; installing a from-source Rust+CubeCL+maturin toolchain inside Kaggle is itself fragile.
+- **Backend/wheel mismatch:** the project ships per-backend wheels (`cpu`/`rocm`/`wgpu`/`cuda`) selected at *compile time* via Cargo features. On PyPI there is one package name and one import (`catboost_rs`); a user `pip install`ing the wrong wheel for their hardware gets import/runtime failures. The rocm wheel additionally needs system ROCm libs via `ROCM_PATH` + `LD_PRELOAD` of `libhiprtc`/`libamdhip64` (the bundled patchelf-renamed `libhiprtc` **segfaults the HIP JIT**) — a landmine already hit in Phase 8.
+- **abi3 vs free-threaded:** the wheels are `abi3-py312` (PyO3 0.29, `gil_used=false`). The concurrent free-threaded `fit`/`predict` UAT could not be validated in-env (needs `python3.13t`), so a free-threading regression could ship unverified. abi3 also constrains which PyO3 APIs are usable.
 
 **Why it happens:**
-Kaggle is a managed, time-boxed, shared environment not designed for from-source GPU Rust builds. CUDA driver/toolkit mismatches and cold JIT are the usual culprits.
+GPU-backend selection is a compile-time axis that doesn't map cleanly onto PyPI's single-artifact-per-platform model; free-threaded Python is new and hard to test without a `t` build.
 
 **How to avoid:**
-- Pin and verify the CUDA toolkit/driver the `cuda` feature compiles against; confirm the build actually selected the CUDA backend (not a silent cpu fallback) before timing.
-- Warm up CUDA (one untimed fit) so `nvcc`/JIT cost is excluded; check the GPU isn't being shared/throttled (`nvidia-smi`).
-- Keep the benchmark short enough to finish within the session limit; persist results out of the ephemeral FS immediately.
-- Re-run the parity oracle on CUDA in the same notebook before trusting timings (ties to Pitfall 8).
+- Decide and **document the distribution model** explicitly: either distinct PyPI package names per backend (`catboost-rs-cpu`, `catboost-rs-cuda`, …) or a CPU-default wheel + documented extra-index/local-build instructions for GPU wheels. Do not rely on users guessing.
+- Ship the rocm wheel with its documented `ROCM_PATH`/`LD_PRELOAD` runtime requirement in `pyproject-rocm.toml`; never bundle the patchelf-renamed `libhiprtc`.
+- Gate the free-threaded concurrency claim behind an actual `python3.13t` run (human-gated, mirroring the existing Phase-8 open UAT) before advertising free-threaded support; until then, document it as "abi3 built with `gil_used=false`, concurrency validated as a code property, not under a live `t` interpreter."
+- Test the wheel install path on a clean environment per backend (import + a smoke predict) in CI.
 
-**Warning signs:**
-- First-iteration time 10×+ the steady-state per-iteration time.
-- "cuda" build that actually ran on cpu (no GPU utilization in `nvidia-smi`).
-- Benchmark sweep killed by session timeout.
+**Warning signs:** ImportError/segfault on GPU wheels in a clean env; free-threaded claims with no `python3.13t` test evidence; users filing "wrong wheel" issues.
 
-**Phase to address:** Benchmark harness phase (final).
+**Phase to address:** Adoption/DX (PyPI release readiness) phase.
 
 ---
 
-### Pitfall 12: Occupancy / thread divergence in the tree-search kernels
+### Pitfall 12: Benchmark vs official CatBoost — measuring the wrong thing / apples-to-oranges
 
 **What goes wrong:**
-Gradient-boosting kernels have data-dependent control flow (a thread's partition/leaf assignment, variable bin counts per feature, masked candidates). Naive branching causes warp/wavefront divergence (threads in a wave taking different paths serialize), and poor cube/plane dimensions leave the GPU under-occupied — both leave large speedups on the table even after the loop is device-resident.
+The v1.2 benchmark must show accuracy + speed vs official CatBoost on real datasets. Easy ways to produce a misleading result: comparing against the **pre-Phase-10 host-light CPU baseline** (the 23.9–42.1× v1.1 numbers are vs *our own old baseline*, NOT vs official CatBoost — conflating them overstates competitiveness); benchmarking GPU on ROCm in-env (non-authoritative) instead of Kaggle CUDA; not pinning thread counts / `iterations` / hyperparameters identically; timing including JIT/first-launch kernel compilation; or comparing prediction accuracy without fixing the same borders/seed.
 
 **Why it happens:**
-The host code is branchy; transcribed literally, branches become per-thread divergence. Block/grid sizing copied from an unrelated example doesn't match this workload's register/shared-memory footprint.
+Benchmark framing is subtle and the existing v1.1 speedup numbers (vs internal baseline) are seductive to reuse as if they were vs-official.
 
 **How to avoid:**
-- Restructure hot kernels to be branch-light (predication, sorted/segmented layouts so threads in a wave share a path).
-- Tune cube/plane dims for occupancy per backend via CubeCL abstractions, not hard-coded constants; validate occupancy on the real GPU.
-- Keep per-feature bin counts uniform where possible (padding) so the histogram kernel doesn't diverge on ragged feature widths.
+- State the comparison baseline unambiguously: **official CatBoost** (matched version, e.g. 1.2.10) on the **same hardware**, same dataset, same hyperparameters, same thread count. GPU speed head-to-head runs on **Kaggle CUDA** (the sole authoritative GPU oracle), never on in-env ROCm.
+- Separate accuracy parity (≤10⁻⁵ CPU / ε=1e-4 GPU vs CatBoost's *own* predictions) from speed. Report both.
+- Exclude kernel-compile/JIT warmup from timed regions (warm up first); report medians over repeats.
+- Discharge the standing v1.1 debt honestly in the benchmark: **GPUT-14 aggregate sign-off and the Phase-10/11 BENCH-02 rows were never run** — the v1.2 benchmark is the place to actually execute them, not to restate the partial BENCH-03 stitch as if complete.
 
-**Warning signs:**
-- Profiler reports low achieved occupancy or high warp divergence on the histogram/scoring kernels.
-- Speedup plateaus well below CatBoost despite a fully device-resident loop.
+**Warning signs:** Speedups quoted "vs CatBoost" that are actually vs the host-light baseline; GPU numbers from ROCm presented as authoritative; benchmark that omits the categorical-heavy real datasets CatBoost is optimized for.
 
-**Phase to address:** Phase 2–3 (after correctness; an optimization sub-phase), measured by the benchmark harness.
+**Phase to address:** Adoption/DX (benchmark) phase.
+
+---
+
+### Pitfall 13: Extended fstr — Interaction / LossFunctionChange / partial-dependence numeric divergence
+
+**What goes wrong:**
+The extended feature-importance methods each have exact CatBoost algorithms that are easy to approximate incorrectly:
+- **LossFunctionChange** requires re-evaluating the loss with a feature's contribution removed — using the *training* loss vs a supplied dataset, and the correct handling of CTR/combination features, matters. Computing it against the wrong dataset or loss gives plausible-but-wrong numbers that pass a smell test but fail ≤10⁻⁵.
+- **Interaction** strength is defined over CatBoost's specific pairwise split-cooccurrence accounting; a from-scratch definition won't match.
+- **Partial dependence** must marginalize using CatBoost's exact grid/quantization and averaging convention.
+
+**Why it happens:**
+fstr methods "look like" standard model-interpretation formulas, so developers implement the textbook version rather than CatBoost's exact one. SHAP + basic fstr already shipped, creating false confidence that the rest is a small delta.
+
+**How to avoid:**
+- Oracle each fstr type independently against CatBoost's `get_feature_importance(type=...)` output at ≤10⁻⁵, on models **with categorical/CTR features** (where the accounting is hardest), not just numeric fixtures.
+- Read the exact upstream definition in `CATBOOST_CORE_DESIGN.md` / vendored source for each type before implementing; do not substitute a generic interpretation-library formula.
+
+**Warning signs:** fstr matches on numeric-only models but diverges with CTR/combinations; LossFunctionChange sign/magnitude off when the eval dataset differs from train.
+
+**Phase to address:** Extended feature-importance phase.
 
 ---
 
 ## Technical Debt Patterns
 
-Shortcuts that seem reasonable but create long-term problems.
-
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Derivatives-only GPU MVP, inner loop on host | Ships a "GPU backend" fast; reuses CPU grower | The >20× gap; GPU-vs-CPU regression; whole inner loop must be rebuilt | Only as an explicitly-labeled MVP with a *performance* success criterion deferred — never as "GPU done" |
-| Per-tree der read-back to host | Trivial to update running approx in a host `Vec` | Sync stall per tree; blocks staying device-resident | Acceptable as the depth-1 bridge; must be killed when approx/der go device-resident |
-| Global `atomicAdd` histogram | Easiest correct parallel histogram | Non-deterministic, fails f64 on gfx1100, fails tight oracle, slow | Only on f32 with a tolerance gate; never when bit-exact parity is required |
-| Hard-coded NVIDIA block/warp sizes | Quick tuning win on CUDA | Breaks/under-performs on ROCm/wgpu; cuda-vs-rocm divergence | Never — parameterize via CubeCL cube/plane dims |
-| `cb-backend` depends on `cb-train` for reference math | DRY; no transcription | Feature unification breaks ROCm runtime (landmine) | Never — transcribe inline or use a featureless leaf crate |
-| `-inf` literal as score sentinel in `#[cube]` | Natural argmax init | HIP JIT reject on gfx1100, only caught on real GPU | Never inside `#[cube]`; use `f32::MIN` |
-| Widening the GPU tolerance to pass a flaky kernel | Green gate | Hides a real numerics/determinism bug; erodes the parity bar | Never silently; only with a per-stage-justified, documented ε (escalate-don't-weaken) |
+| Use an off-the-shelf HNSW crate (hnswlib/instant-distance) for KNN | Fast to wire, well-tested | **Never matches upstream's RNG/graph → FEAT-07 bit-exact parity permanently unreachable** | Never (for parity). Only if KNN parity is explicitly dropped from scope. |
+| Hold exported ONNX/CoreML models to the ≤10⁻⁵ double bar | One tolerance everywhere | Chasing phantom "failures" from float32 drift; risk of loosening the global bar | Never — define an export-specific tolerance instead |
+| Route multiclass/non-symmetric/CTR models through the new GPU evaluator | "More features on GPU" | Diverges from CatBoost (which CPU-falls-back) → parity failures | Never — mirror upstream's oblivious/1-dim/float-only restriction + CPU fallback |
+| Raw float `TAtomicAdd` in the GPU evaluator reduction | Simplest transcription of §7.1 | Non-deterministic, breaks ε=1e-4 over many trees | Never — reuse v1.1 fixed-point u64 reduction |
+| Seed a `#[cube]` reduction with `-inf` | Faithful to upstream `NegativeInfty()` | HIP JIT reject on gfx1100, invisible to cpu/wgpu check | Never in kernel code — use `f32::MIN` sentinel |
+| Snapshot only the trees built so far | Small serialized state | Non-reproducible resume with sampling/ordered boosting | Never if reproducible resume is promised |
+| Benchmark vs the host-light CPU baseline | Reuses impressive v1.1 numbers | Misrepresents competitiveness vs official CatBoost | Only for internal regression tracking, clearly labeled |
+| Validate CoreML parity structurally (no execution) | Works without macOS runtime | Doesn't prove runtime faithfulness | Acceptable if no Apple runtime in-env AND the gap is documented (like Kaggle-CUDA discipline) |
 
 ## Integration Gotchas
 
 | Integration | Common Mistake | Correct Approach |
 |-------------|----------------|------------------|
-| CubeCL `ComputeClient` | Allocate a handle on one client, read on another | Thread ONE client through the whole boosting pass; a `Handle` is bound to its originating client |
-| CubeCL device buffers | Read a 0-length handle (empty dataset/iteration) | Short-circuit empty inputs to an empty model before any launch |
-| CubeCL `#[cube]` codegen on HIP | `-inf`/`INFINITY` literal in a kernel | Finite `f32::MIN` sentinel in-kernel; host keeps `f64::NEG_INFINITY` |
-| ROCm f64 reduce (gfx1100) | Assume hardware f64 atomic-add | Atomic-free deterministic reduction; or f32 accumulation; weight folded downstream |
-| Cargo features across crates | `cb-backend → cb-train` edge | Inline-transcribe CPU refs; shared math in a featureless leaf crate |
-| Official CatBoost GPU (benchmark) | Time `.fit()` cold, end-to-end, mismatched params | Warmup + train-only + identical params/bins/data, single GPU |
-| Kaggle CUDA | Trust first-run timing; assume backend selected | Verify `cuda` backend active via `nvidia-smi`; warm JIT; re-run oracle on CUDA |
-| PyO3 facade → GPU backend | `fit()` hard-wired to CPU path | Generic `GpuBackend` over `SelectedRuntime` routing the inner loop on-device (the 08-08 generic-backend precedent) |
+| ONNX Runtime (checker) | Testing against `.cbm` double predictions at 10⁻⁵ | Oracle = official CatBoost's own ONNX in the same ORT; export-specific tolerance; RawFormulaVal first |
+| ONNX-ML TreeEnsemble | Exporting categorical/CTR/text models | Reject with typed error (upstream does); float-only models only |
+| onnxruntime binary classifier | Asserting on the inferred label | Ignore label for binary classification; assert on probability |
+| CoreML / coremltools | Assuming Linux-CI execution parity | Validate on Apple runtime or do structural parity + document gap |
+| Kaggle CUDA (GPU oracle) | Signing off GPU inference on in-env ROCm | ROCm = non-gating smoke; authoritative correctness+speed on Kaggle CUDA |
+| `python3.13t` free-threaded | Advertising free-threaded support untested | Gate the claim behind an actual `t`-interpreter run |
+| rocm wheel runtime | Bundling patchelf-renamed `libhiprtc` | `ROCM_PATH` + `LD_PRELOAD` system libs; never bundle the renamed lib (segfaults HIP JIT) |
+| CatBoost `cv()` | Using sklearn KFold semantics | Match `type`/stratification-default/group-awareness exactly; oracle the fold assignment |
 
 ## Performance Traps
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| Inner loop on host (the v1.0 gap) | GPU idle, CPU pegged, GPU ≥ CPU time | Device-resident grow loop wired into `cb-train` | Always — even at small N the GPU never helps |
-| Per-level/per-tree blocking read-back | Sawtooth GPU util; time scales worse than O(trees) | Device-side BestSplit; O(1) metadata crossings only | Deep trees × many iterations |
-| Re-uploading feature matrix per tree | PCIe-bound; host alloc churn | Upload cindex/weight/target once; reuse handles | Many iterations on a VRAM-resident dataset |
-| Tiny per-feature/per-bin launches | Launch overhead dominates; low occupancy | Fuse into one histogram/scoring/BestSplit kernel | Wide feature sets / high bin counts |
-| Warp divergence in tree search | Low occupancy, high divergence in profiler | Branch-light, segmented/sorted layouts; tuned dims | Ragged bins / data-dependent partitions |
-| Benchmarking a tiny dataset | GPU "no faster" / noisy ratio | Use millions of rows or thousands of features | <10k rows or <10 features — GPU advantage is noise |
-| f64 atomic reduce on gfx1100 | "Device" reduce runs at host speed | Atomic-free / f32 reduction | Any f64 atomic path on RDNA3 consumer GPUs |
+| GPU evaluator per-call model re-upload | GPU predict slower than CPU on small batches | Build `TGPUModelData` **once** (upstream does in ctor), cache device buffers across calls (like v1.1 `GpuTrainSession`) | Any repeated predict / online serving |
+| GPU predict on tiny batches | Kernel-launch overhead dominates | Batch documents; keep quantized buffer cached; fall back to CPU below a batch-size threshold | Single-row / low-latency inference |
+| Deterministic fixed-point reduction overhead | GPU predict marginally slower than a raw-atomic version | Accept it — determinism is required for parity; optimize the fixed-point conversion, not by removing it | N/A (correctness constraint) |
+| Brute-force-exact KNN as "the fast path" | O(n²) apply on large embedding sets | The HNSW port is also the perf answer (approximate = sub-linear search); but correctness-first | Large embedding datasets |
+| Benchmark timing includes JIT warmup | First run wildly slower | Warm up kernels before timed region; report medians | Every GPU benchmark |
 
 ## Security Mistakes
 
-Not a primary concern for an in-process training library (no network surface, no untrusted input beyond the user's own data). The closest analogues:
-
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| Unbounded device allocation from user-supplied shapes | OOM / VRAM exhaustion (DoS-like crash) | Validate `n × n_features × n_bins` against device memory before allocating; typed error, not panic |
-| `unwrap()`/`expect()`/panic in the device driver | Crash the host process on a malformed launch | Workspace lint forbids it (D-13); surface `CbError` for every read-back/shape mismatch |
-| Silent zero-buffer on a failed read-back | Corrupt model passed off as valid | Failed read-back → `CbError::Degenerate`, never pad/zero (WR-05 precedent) |
+| Loading untrusted `.cbm`/`.onnx`/`.coreml` models without validation | Malformed model → panic/UB in deserializer | Validate structure on load; return typed errors, never `unwrap()` (project rule); fuzz the deserializers |
+| Snapshot files trusted across versions | Resuming from a tampered/incompatible snapshot corrupts training | Version + validate snapshot; reject incompatible params with a typed error |
+| Data leakage in CV/tuning (integrity, not confidentiality) | Overstated model quality shipped to users | Per-fold border/CTR computation; leakage canary test |
 
 ## UX Pitfalls
 
-"Users" here = Rust/Python ML practitioners selecting a backend.
-
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| Selecting a GPU backend silently runs slower than CPU | User loses trust in the GPU build | Inner loop genuinely on-device; benchmark gate proves GPU ≥ CPU on real datasets |
-| GPU result not bit-reproducible run-to-run | User can't reproduce models; CI flakes | Deterministic reductions; document the GPU ε tolerance explicitly |
-| Backend chosen at compile time, surprising at runtime | User installs the wrong wheel, gets cpu fallback | Clear per-backend wheels + a startup check that reports the active backend/device |
-| GPU "supported" but only depth-1 / RMSE works | User's depth-6 multiclass job silently routes to CPU or errors | Typed "unsupported on GPU" errors per feature; document the GPU coverage matrix |
+| ONNX/CoreML export silently succeeds on categorical models | User ships a wrong model, discovers it in production | Reject at export with a clear message naming the offending feature type (mirror CatBoost) |
+| Wrong per-backend wheel installed | ImportError/segfault, "it doesn't work" | Clear per-backend package naming/docs; CPU-default; smoke test on install |
+| GPU predict diverges from CPU predict without explanation | User distrusts the whole library | Document the ε=1e-4 GPU bar and the CPU-fallback conditions explicitly |
+| CV `type`/stratification defaults differ from CatBoost silently | Migrating users get different CV numbers than CatBoost | Match defaults exactly; document any deviation |
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **GPU training:** Often missing the *inner loop* on-device — verify GPU utilization is high and GPU train time < CPU train time on a large dataset, not just that "a kernel ran."
-- [ ] **Device residency:** Often missing — verify the feature matrix is uploaded **once** (no `client.create` inside the per-tree loop) and `approx`/`der1` never round-trip to host between iterations.
-- [ ] **BestSplit:** Often still host-side — verify the split decision is computed in a kernel, with only O(1) metadata crossing back per level.
-- [ ] **Determinism:** Often unverified — run the same input twice on the same GPU; the models must match within the documented ε; parity must hold at iteration N, not just iteration 1.
-- [ ] **ROCm in-env run:** Often skipped after a `#[cube]` change — verify the **full ROCm suite** ran in-env (cpu/wgpu cargo-check cannot catch `-inf` JIT reject or f64-atomic fallback).
-- [ ] **CUDA correctness:** Often only timed, never validated — verify the oracle/parity tests *passed on CUDA* (Kaggle), not only that it was fast.
-- [ ] **Benchmark fairness:** Often unfair — verify warmup excluded, train-only measured, identical params/bin counts/data/seed, single GPU, dataset large enough.
-- [ ] **Feature graph:** Often regressed — verify `cargo tree` shows no `cb-backend → cb-train` edge and ROCm backend still selected.
-- [ ] **GPU coverage matrix:** Often overstated — verify which losses/depths/CTR/pairwise/ordered/multiclass actually run on-device vs error/fallback.
+- [ ] **ONNX export:** Often missing the **categorical/text/embedding rejection** — verify export throws a typed error on a CTR model, and that a numeric model loads+scores in ONNX Runtime within the export tolerance (RawFormulaVal + Probability, binary label ignored).
+- [ ] **CoreML export:** Often missing **execution validation** — verify it either runs on an Apple runtime OR has documented structural parity; confirm float32 tolerance is used, not the double bar.
+- [ ] **GPU inference evaluator:** Often missing **determinism across repeated applies** and the **oblivious/1-dim/no-cat guards** — verify twice-run predictions are identical, and that a multiclass/CatFeature model falls back to CPU (matches CatBoost), and that the rocm suite passes in-env (no `-inf`/`|=` HIP reject).
+- [ ] **Online-HNSW (FEAT-07):** Often missing the **per-object neighbor-set oracle** — verify the returned neighbor indices match upstream index-for-index over the shuffled prefix (not just the final XOR prediction), and the class-vote order matches.
+- [ ] **CV/tuning:** Often missing **fold-assignment parity** and the **leakage canary** — verify object→fold matches CatBoost for a fixed seed across all three `type`s, groups stay intact, and a target-permuted feature scores ~chance.
+- [ ] **Snapshot/resume:** Often missing **RNG/ordered-boosting state** — verify snapshot-then-resume is bit-identical to a straight run with sampling AND ordered boosting enabled.
+- [ ] **PyPI release:** Often missing **clean-env install smoke per backend** and the **free-threaded run** — verify each wheel imports+predicts in a fresh env; verify (or explicitly defer with evidence) the `python3.13t` concurrency claim.
+- [ ] **Benchmark:** Often missing the **vs-official-CatBoost baseline** — verify speed/accuracy are vs official CatBoost (matched version/hardware/params), GPU on Kaggle CUDA, not vs the host-light baseline.
+- [ ] **Extended fstr:** Often missing **categorical/CTR-model oracles** — verify Interaction/LossFunctionChange/partial-dependence match `get_feature_importance` on models *with* CTR features, not just numeric.
 
 ## Recovery Strategies
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Inner loop left on host | HIGH | Add the `Runtime` grow-tree seam; wire `grow_boosting_pass`; this is the milestone's core work, not a patch |
-| Per-tree/level read-back stalls | MEDIUM | Move BestSplit + approx/der updates on-device; reduce crossings to O(1) metadata |
-| Re-uploading data per tree | LOW | Hoist the upload above the loop; pass handles instead of host slices |
-| Non-deterministic reduction fails oracle | MEDIUM | Replace atomic histogram with fixed-order/segmented reduction; or f64 accumulation; re-gate per stage |
-| f64 atomic fallback on gfx1100 | MEDIUM | Re-architect reduce to be atomic-free / f32; fold weight downstream |
-| `-inf` HIP reject | LOW | Replace in-kernel `-inf` with `f32::MIN`; re-run ROCm suite |
-| `cb-backend → cb-train` unification | LOW–MEDIUM | Remove the edge; transcribe inline or extract a featureless leaf crate; rebuild ROCm |
-| Unfair benchmark number | LOW | Re-run with warmup + train-only + matched params; re-quote |
-| Kaggle env / cold-JIT distortion | LOW | Warm up; verify backend active; persist results before session timeout |
+| Scoped ONNX/CoreML for categorical models | LOW | Reframe SPEC to float-only + typed rejection; delete the impossible path |
+| Held export to the ≤10⁻⁵ double bar | LOW | Re-baseline oracle to CatBoost's own ONNX/CoreML in the same runtime; set export tolerance |
+| Used off-the-shelf HNSW crate | HIGH | Rip out; port `online_hnsw` bit-for-bit with neighbor-set oracle (the only path to parity) |
+| GPU evaluator with raw atomic reduction | MEDIUM | Swap in v1.1 fixed-point u64 reduction; re-validate ε=1e-4 on Kaggle CUDA |
+| `-inf` in a `#[cube]` kernel | LOW | Replace with `f32::MIN` sentinel; re-run rocm suite in-env |
+| Snapshot missing RNG state | MEDIUM | Extend snapshot format (versioned); add straight-vs-resume bit-identical test |
+| Leaky CV/tuning | MEDIUM | Move border/CTR computation inside folds; add leakage canary; re-run benchmarks |
+| Benchmark vs wrong baseline | LOW | Re-run against official CatBoost on matched hardware/params; relabel numbers |
 
 ## Pitfall-to-Phase Mapping
 
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| 1. Inner loop on host | Phase 1 (Runtime grow-tree seam + wire `grow_boosting_pass`) | GPU train time < CPU on large data; GPU utilization high |
-| 2. Per-level/tree read-back stalls | Phase 1–2 (device BestSplit, O(1) crossings) | No `read_one` inside per-level/feature loop; flat GPU timeline |
-| 3. Re-uploading data per tree | Phase 1 (device-resident layout) | No `client.create` of feature matrix inside the loop |
-| 4. Non-deterministic reduction vs ≤1e-5 | Phase 2 (histogram/scoring) | Same input → same model within ε; parity holds at iteration N |
-| 5. f64 atomic-add unavailable (gfx1100) | Phase 2 (reduce design) | Atomic-free reduce; full ROCm suite green in-env |
-| 6. HIP `-inf` literal reject | Every `#[cube]` phase (2, 3) | ROCm suite N/N after each kernel change; no `inf` literals in `#[cube]` |
-| 7. `cb-backend → cb-train` landmine | Phase 1 (seam architecture) | `cargo tree` shows no edge; ROCm backend selected |
-| 8. cuda-vs-rocm divergence | Benchmark phase (final) | Oracle re-run *passes on CUDA*, not just timed |
-| 9. Tiny-kernel launch overhead | Phase 2 (fused kernels) | Launch count O(levels/trees), not O(features×bins) |
-| 10. Unfair benchmark | Benchmark phase (final) | Documented protocol: warmup, train-only, matched params/bins/data |
-| 11. Kaggle CUDA gotchas | Benchmark phase (final) | Backend verified active; warm JIT; results persisted |
-| 12. Occupancy / divergence | Phase 2–3 (optimization sub-phase) | Profiler occupancy/divergence within target; speedup approaches CatBoost |
+| 1. Categorical ONNX export | Model export (ONNX) | Typed rejection on CTR model; numeric model scores in ORT |
+| 2. Export float32 drift vs ≤10⁻⁵ | Model export (ONNX) | Export tolerance defined; oracle = CatBoost's own ONNX in ORT |
+| 3. Opset / prediction-type / binary label | Model export (ONNX) | Pinned opset; RawFormulaVal + Probability cases; label ignored for binary |
+| 4. CoreML determinism / float32 / ops | Model export (CoreML) | Float32 tolerance; execution-on-Apple or documented structural parity |
+| 5. GPU reduction non-determinism | GPU inference evaluator | Twice-run predictions identical; ε=1e-4 vs CPU + Kaggle CUDA |
+| 6. `-inf`/`\|=` HIP codegen traps | GPU inference evaluator | rocm suite passes in-env; `f32::MIN` sentinel; `+=`/`<<` leaf index |
+| 7. Exceeding upstream GPU subset | GPU inference evaluator | Multiclass/CatFeature/non-sym → CPU fallback (matches CatBoost) |
+| 8. HNSW "approximate = infeasible" | FEAT-07 online-HNSW port | Per-object neighbor-set matches upstream index-for-index; XOR ≤10⁻⁵ |
+| 9. CV fold divergence / leakage | Orchestration (CV/tuning) | Fold assignment matches CatBoost per seed; leakage canary ~chance |
+| 10. Non-reproducible resume | Orchestration (snapshot/resume) | Straight-vs-resume bit-identical with sampling + ordered boosting |
+| 11. Wheel/abi3/free-threaded | Adoption/DX (PyPI) | Clean-env per-backend install smoke; free-threaded run or documented defer |
+| 12. Benchmark baseline confusion | Adoption/DX (benchmark) | Vs official CatBoost, matched version/hardware; GPU on Kaggle CUDA |
+| 13. Extended fstr divergence | Extended feature-importance | Matches `get_feature_importance` on CTR models at ≤10⁻⁵ |
 
 ## Sources
 
-- `.planning/notes/gpu-training-host-light-root-cause.md` — internal root-cause of the >20× gap (host-light inner loop; per-tree read-back; landmines). HIGH.
-- `.planning/RETROSPECTIVE.md` + `.planning/PROJECT.md` — v1.0 lesson "parity must specify correctness AND performance"; CubeCL portability + landmine patterns. HIGH.
-- Project memory: `phase75-grow-loop-outcome` (cb-train↔cb-backend feature-unification landmine; host-light D-05), `phase76-gpu-tolerance-signoff-outcome` (gfx1100 f64 reduce = HostSumFallback, ε=1e-4 sign-off), `cubecl-hip-no-inf-literal` (HIP `-inf` JIT reject → `f32::MIN`), `phase8-python-bindings-outcome` (generic `GpuBackend` over `SelectedRuntime`). HIGH.
-- `crates/cb-backend/src/gpu_runtime/mod.rs:1850-2043` — `grow_boosting_pass[_into]` (one-client threading, O(1) crossings, empty-handle guards, MVP depth-1 scope). HIGH.
-- [XGBoost GPU docs — non-deterministic GPU ranking due to FP non-associativity](https://xgboost.readthedocs.io/en/release_1.4.0/gpu/index.html). MEDIUM.
-- [Quantized Training of Gradient Boosting Decision Trees (arXiv 2207.09682) — atomicAdd histogram non-determinism and cost](https://arxiv.org/pdf/2207.09682). MEDIUM.
-- [GPU-acceleration for Large-scale Tree Boosting (arXiv 1706.08359) — histogram/reduction strategies](https://arxiv.org/pdf/1706.08359). MEDIUM.
-- [Impacts of floating-point non-associativity on reproducibility (arXiv 2408.05148)](https://arxiv.org/pdf/2408.05148). MEDIUM.
-- [CatBoost GPU vs CPU training-speed benchmark (official) — fair-comparison methodology, bin count, dataset-size thresholds](https://github.com/catboost/benchmarks/blob/master/gpu_vs_cpu_training_speed/README.md). HIGH.
+- CatBoost — ONNX export only supports datasets without categorical features; text/embedding "likely never supported": [ONNX | CatBoost docs](https://catboost.ai/docs/en/concepts/apply-onnx-ml); [ONNX export doesn't support categorical features · Issue #863](https://github.com/catboost/catboost/issues/863) (HIGH)
+- CatBoost `save_model` ONNX supported types (binary/multiclass/regression) + `export_parameters` + onnxruntime binary-label bug: [save_model | CatBoost](https://catboost.ai/docs/en/concepts/python-reference_catboostregressor_save_model); [sklearn-onnx CatBoost tutorial](https://onnx.ai/sklearn-onnx/auto_tutorial/plot_gexternal_catboost.html) (HIGH)
+- CoreML export — datasets without categorical features only; `prediction_type` raw/probability: [Export a model to CoreML | CatBoost](https://catboost.ai/docs/en/features/export-model-to-core-ml); [CoreML | CatBoost](https://catboost.ai/docs/en/concepts/export-coreml) (HIGH)
+- CatBoost `cv()` — `type` {Classical/Inverted/TimeSeries}, stratification default by loss, group-in-fold, snapshot params: [cv | CatBoost](https://catboost.ai/docs/en/concepts/python-reference_cv); [Cross-validation | CatBoost](https://catboost.ai/docs/en/concepts/cli-reference_cross-validation) (HIGH)
+- GPU inference evaluator internals (oblivious/1-dim/no-cat restriction, double4 TAtomicAdd, unimplemented prediction types, MLTOOLS-6839 `|=`→`+=` codegen bug, warp-interleaved layout, `FeatureVal`=SplitIdx verbatim): `docs/CATBOOST_CUDA_KERNELS_DESIGN.md` §7.1 (in-repo, HIGH)
+- HNSW root-cause + feasibility (upstream `NOnlineHnsw::TOnlineHnswDenseVectorIndex`, instrumented-trainer neighbor-set proof, ~936 LOC port scope, disproven hypotheses): project memory `knn-estimated-feature-is-online-hnsw.md`; note `phase65-text-embedding-outcome` (HIGH)
+- GPU determinism + HIP `-inf`/`f32::MIN` landmine + fixed-point u64 reduction + rocm-only in-env validation: project memory `cubecl-hip-no-inf-literal.md`, `phase10-reduce-determinism-spike`, `phase76-gpu-tolerance-signoff-outcome`; `.planning/notes/gpu-training-host-light-root-cause.md` (HIGH)
+- PyO3 abi3-py312 / `gil_used=false` / free-threaded UAT gap / rocm wheel `LD_PRELOAD` requirement: project memory `phase8-python-bindings-outcome.md` (HIGH)
+- v1.1 speedup baseline caveat (23.9–42.1× vs host-light CPU baseline, NOT vs official CatBoost) + standing debt GPUT-14/BENCH-02: `.planning/PROJECT.md` Current State (HIGH)
 
 ---
-*Pitfalls research for: device-resident GPU gradient-boosting training + CatBoost-GPU speed-parity benchmarking*
-*Researched: 2026-06-28*
+*Pitfalls research for: catboost-rs v1.2 Parity Completion & Release Readiness*
+*Researched: 2026-07-05*

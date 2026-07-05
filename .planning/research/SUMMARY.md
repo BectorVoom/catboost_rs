@@ -1,175 +1,170 @@
 # Project Research Summary
 
-**Project:** catboost-rs v1.1 GPU Performance
-**Domain:** Device-resident GPU gradient-boosting training (CubeCL) + speed-parity benchmarking vs official CatBoost GPU
-**Researched:** 2026-06-28
+**Project:** catboost-rs
+**Domain:** Gradient-boosting library parity completion — v1.2 "Parity Completion & Release Readiness" (new export/orchestration/GPU-inference/HNSW/DX surfaces atop a mature Rust rewrite of CatBoost)
+**Researched:** 2026-07-05
 **Confidence:** HIGH
 
 ## Executive Summary
 
-The v1.1 milestone is a wiring + residency + kernel-coverage problem, not a new-technology problem. All four research agents converged on the same diagnosis: the >20x gap exists because `grow_boosting_pass` (`cb-backend/src/gpu_runtime/mod.rs:1890`) is a rocm-validated, depth-1 device grow loop that is never called from `cb_train::train` — there is no `Runtime` trait seam for on-device tree growth, so every GPU fit falls through to the host CPU growers. The derivative kernels run on-device, but then their output is read back to host per tree so the host can run ~95% of training (histogram build, split scoring, BestSplit, partition update, leaf values). The result is slower than pure CPU. The fix is not a new crate or new algorithm; it is adding one coarse trait method to `cb_compute::Runtime` and wiring the existing driver into `cb_train::train`. CubeCL 0.10.0 already provides every primitive required: persistent buffer handles, device atomics, scan/reduce, lazy async dispatch, and per-block carry for the multi-block scan.
+v1.2 is not greenfield — it is a subsequent-milestone integration study layering six new surfaces (debt discharge, ONNX/CoreML export, extended fstr, CV/tuning/snapshot orchestration, GPU inference, adoption/DX) onto an already-mature workspace that shipped full CPU parity (v1.0) and full device-resident GPU training (v1.1). The research is unusually well-grounded: every new feature has a documented, source-verified upstream analog (vendored `catboost-master/` C++ + the repo's own `CATBOOST_CORE_DESIGN.md`/`CATBOOST_CUDA_KERNELS_DESIGN.md`), so the correct behavior for each surface is a known target, not a design decision. The recommended approach is **debt-first, then export, then GPU-infer, then orchestration, capped by an adoption/DX phase**: re-establish the Kaggle CUDA oracle and close the one open CPU parity gap (online-HNSW) before building anything new on top of the training engine's credibility, land export next because it is read-only and zero-seam-risk, then GPU-inference (which reuses v1.1's device primitives and must inherit its determinism discipline), then the CV/tuning/snapshot orchestration layer (which needs a new `cb-train` checkpoint surface), and finally benchmark/PyPI/docs as the capstone that proves the whole story to adopters.
 
-The recommended execution order is: Phase 10 adds the coarse `Runtime` seam + `GpuTrainSession` (a new `cb-backend`-owned struct that holds the `ComputeClient` and all persistent handles for the whole fit), wires depth-1, and hoists the quantized-feature-matrix upload above the iteration loop — this alone closes most of the gap for the simplest workloads. Phase 11 adds partition-aware histograms (`fullPass=false`) for depth>1 and Newton der2 leaf estimation — the single largest kernel extension, gating real workloads (depth 6, Logloss). Phase 12 extends GPU coverage behind the same `Ok(None)`→host-CPU fallback gate (CTR, pairwise, ordered boosting, multiclass) in any sub-order. Phase 13 runs the Kaggle CUDA head-to-head, but must re-run the correctness oracle on CUDA before trusting timing numbers.
+The single biggest risk across all four research files is **conflating "parity" with "coverage."** Three of the new features have hard upstream ceilings that must be replicated, not exceeded: ONNX/CoreML export upstream itself refuses categorical/text/embedding models (there is no ONNX/CoreML primitive for a learned CTR), so "ONNX export" must be reframed as "float-only models, typed rejection otherwise" — attempting to support categorical export would silently diverge from the reference. The GPU inference evaluator upstream restricts itself to oblivious trees, one output dimension, and three prediction types; porting more "because our CPU engine already supports it" is itself a parity bug. And online-HNSW must be a bit-for-bit transcription of upstream's incremental graph construction (RNG, insertion order, `TL2SqrDistance`) oracled on the per-object neighbor *set*, not the final prediction — a third-party HNSW crate can never pass this bar no matter how good its approximate search is. A second cross-cutting risk is GPU determinism: the inference evaluator re-imports every v1.1 GPU landmine (raw atomic-add non-determinism, the HIP `-inf`-literal reject, the `|=` A100 codegen bug) and must reuse the v1.1 fixed-point u64 deterministic reduction and `f32::MIN` sentinel rather than re-transcribing upstream's `TAtomicAdd`/`NegativeInfty()` verbatim.
 
-The central tensions that must be resolved early are: (1) reduction non-determinism vs the parity oracle — parallel atomics produce non-associative sums that compound over hundreds of trees and can flip splits, so the reduction strategy must be chosen in Phase 10/11 before the partition-aware histogram kernel is written (the `ε=1e-4 vs Rust CPU path` precedent from Phase 7.6 applies to GPU, not ≤1e-5); (2) the validation asymmetry — correctness is validated in-env on AMD/ROCm, but the head-to-head speed benchmark runs on CUDA (Kaggle), making the CUDA path effectively unchecked for correctness until the benchmark phase; (3) three repo-specific landmines that silently corrupt the build: never add `cb-train` as a dependency of `cb-backend` (Cargo feature unification breaks the rocm runtime), never use `-inf` float literals inside `#[cube]` kernels (HIP JIT reject on gfx1100, invisible to cpu/wgpu cargo check), and never read a `Handle` through a client other than the one that allocated it.
+Architecturally, one structural question needs resolution at roadmap/planning time rather than research time: **STACK.md recommends a new `cb-export` crate** (to keep `prost`/protobuf codegen out of `cb-model`'s lean flatbuffers+serde core) as the primary option with a feature-gated `cb-model/export` module as the fallback, while **ARCHITECTURE.md recommends the feature-gated `cb-model/export` submodule as primary** (on the grounds that export is read-only and shaped exactly like the existing `json.rs`/`cbm.rs`). Both are internally consistent and defensible; the roadmapper should pick one explicitly (this summary defaults to ARCHITECTURE's `cb-model/export` feature-gated submodule, since it avoids a new workspace member and matches existing precedent, but flags the disagreement for the phase-1 export plan to settle before implementation starts) — see Gaps to Address.
 
 ## Key Findings
 
 ### Recommended Stack
 
-No new compute crates are needed. CubeCL 0.10.0 is already pinned in `Cargo.toml:38` and already exposes every required primitive. The additive additions are: optional `profile-tracy`/`tracing` features on the existing CubeCL dep (gated behind a `profiling` Cargo feature), `tracing-subscriber 0.3.x` as an optional dev dep, and `criterion 0.7.x` in `[dev-dependencies]` for Rust-side regression timing on ROCm. The Python benchmark harness uses `catboost==1.2.10` (already in `.venv`) and the existing `benchmark.py` pattern. The CUDA speed run requires a `--features cuda` wheel built via maturin and run on a Kaggle notebook — there is no NVIDIA in-env.
+The only genuinely new external dependencies are protobuf tooling for export (`prost`/`prost-build`/`protox`, avoiding a system `protoc`) and `criterion` for Rust-side microbenchmarks; everything else — GPU inference, CV/tuning/snapshot orchestration, extended fstr, online-HNSW — is pure Rust reusing existing crates and needs **no new dependency**. There is no mature Rust ONNX/CoreML *writer* library (tract/ort/coreml-rs only read or run models), so both exporters are hand-built protobuf messages over vendored `.proto` schemas, mirroring what upstream CatBoost's C++ does. `rand` must explicitly NOT be pulled in for random-search tuning — it would break the project's existing deterministic RNG stream that underwrites bootstrap/MVS/CTR reproducibility.
 
-**Core technologies (retain — do not re-add):**
-- `cubecl 0.10.0`: GPU kernel authoring + ComputeClient device memory/dispatch — already drives all Phase 7.x kernels; every residency primitive is in this version.
-- `SelectedRuntime` compile-time alias: zero-cost backend switching (cuda/rocm/wgpu/cpu) from one kernel source — must not be broken.
-- `bytemuck` (workspace-pinned): zero-copy host↔device byte casts for the O(1) per-level read-backs — already the established idiom.
-- `catboost==1.2.10` (Python, already in `.venv`): official GPU baseline for the Kaggle speed run.
-
-**New tooling (dev/profiling only):**
-- `cubecl` features `profile-tracy` + `tracing`: nanosecond GPU kernel/JIT/alloc profiling — gate behind a `profiling` Cargo feature, never in release build.
-- `criterion 0.7.x` (`[dev-dependencies]`): warm-run Rust benchmark statistics for ROCm relative-timing regression during development.
+**Core technologies:**
+- `prost` 0.14.4 + `prost-build` 0.14.4 + `protox` 0.9.1 — hand-build ONNX `ModelProto` / CoreML `Model` protobuf messages from vendored `.proto` schemas; `protox` keeps the build hermetic (no system `protoc`), matching the existing flatc precedent.
+- `criterion` 0.8.2 (dev-dependency, `harness = false`) — Rust-internal micro-benchmarks (predict, export serialize, GPU-inference kernel throughput); separate from the existing Python `benchmark*.py` e2e harness which stays the vs-official-CatBoost comparison layer.
+- `PyO3/maturin-action` (CI) over `cibuildwheel` — purpose-built for Rust cross-compiled wheels; one maturin leg per backend Cargo feature (`cpu`/`cuda`/`rocm`/`wgpu`), each a separately-named distribution.
+- Existing pins unchanged: cubecl 0.10, pyo3 0.29, flatbuffers, arrow, polars, thiserror/anyhow, ndarray 0.17.2 (reused for PDP grids).
 
 ### Expected Features
 
-**Must have (table stakes — the "GPU beats CPU" milestone, P1):**
-- `Runtime` grow-tree trait seam in `cb-compute` — without it no device grow loop is reachable from `fit()`; the entire milestone gate.
-- Wire depth-1 `grow_boosting_pass` into `cb_train::train` with a typed `Ok(None)`→host fallback.
-- Device-resident compressed index — upload the quantized feature matrix once above the iteration loop; eliminates the dominant PCIe re-copy.
-- Gradients/approx device-resident across iterations — eliminate the per-tree `der1` read-back and approx re-upload.
-- Partition-aware histograms (`fullPass=false`) + contiguous partition reorder — the keystone new kernel work; unlocks depth>1, and transitively Newton/CTR/multiclass. The single largest piece of the milestone.
-- Histogram subtraction trick — halves histogram work at every level; required for depth>1 to approach parity speed.
-- Correctness sign-off at ε=1e-4 vs Rust CPU path (Phase 7.6 precedent) and a benchmark harness vs official CatBoost GPU on Kaggle/CUDA.
+**Must have (table stakes for "parity complete + release ready"):**
+- Debt discharge: GPUT-14 aggregate ε=1e-4 Kaggle CUDA sign-off, Phase-10/11 BENCH-02 rows, RV-13-01..04 latent hazards.
+- Online-HNSW KNN (FEAT-07) — closes the one open ≤1e-5 CPU parity gap.
+- `cv()`, `grid_search()`/`randomized_search()`, snapshot/resume, `eval_metrics()`/`calc_metrics` — the orchestration surface every migrating CatBoost user calls (grid/random search hard-depends on `cv()` landing first).
+- Interaction + LossFunctionChange feature importance (LossFunctionChange reuses the already-shipped SHAP machinery; Interaction is dataset-free, tree-structure-only).
+- ONNX + CoreML export, with upstream's guards (float-only, identity-scale, oblivious-only) replicated exactly.
+- Benchmark vs official CatBoost (accuracy + speed + memory) + PyPI per-backend wheels + docs/examples — without these the parity work is invisible to adopters.
 
-**Should have (P2 — broader coverage once depth>1 is solid):**
-- Newton der2 leaf estimation on device — required for classification (Logloss default); reuses Phase 7.2 der2 handles.
-- Second-order/Cosine score function on device — GPU default is Cosine not L2 (known parity gap).
-- Bootstrap + random-strength noise on device — sampling parity for non-default `bootstrap_type`.
-- CTR / permutation-dependent features on device — categorical workloads; large, defer until numeric depth>1 is solid.
+**Should have (differentiators):**
+- GPU inference evaluator — device predict completing the device-training story from v1.1; sequence after debt/export since it stands up a new crate + device kernels.
+- Partial dependence — completes the explainability trio; lower priority than Interaction/LossFunctionChange.
+- Memory-efficiency-forward benchmark (peak-RSS vs official CatBoost) — cheap addition, directly serves the Core Value.
 
-**Defer (P3 / v2+):**
-- Pairwise/ranking device path, multiclass device path, ordered-boosting device path, multi-GPU.
-
-**Explicit anti-features (never build):**
-- Per-tree re-upload of the compressed index; bulk histogram/partition read-backs from device (only O(1) BestSplit + `2^depth` part-stats cross per level); chasing bit-exact f64 ≤1e-5 on GPU; `cb-train` dependency in `cb-backend`.
+**Defer (post-v1.2, explicitly out of scope):**
+- ONNX/CoreML export of categorical/CTR models — impossible upstream, not a bug to fix.
+- SAGE / Independent SHAP / Carry-Uplift fstr, PMML + C++/Python source export, distributed/multi-node training.
 
 ### Architecture Approach
 
-One coarse optional `Runtime` seam: three default-impl methods added to `cb_compute::Runtime` (`begin_device_training`, `grow_tree_on_device` returning `CbResult<Option<DeviceGrownTree>>`, `end_device_training`). No CubeCL types appear in the trait signature — all arguments and return types are plain host structs in `cb-compute`, mirroring exactly how `Derivatives` already crosses the seam today. Fine-grained per-stage seams were explicitly rejected by all agents: they force either CubeCL handles across the boundary (violating D-03) or per-stage bulk read-backs (destroying residency). The upstream reference (`catboost-master/catboost/cuda/methods/doc_parallel_pointwise_oblivious_tree.h`) independently confirms the coarse-seam design — upstream uses a coarse weak-learner template, not stage callbacks.
+v1.2 integrates six new capabilities into the existing crate graph (`cb-core → cb-data → cb-compute → cb-backend(CubeCL) → cb-train → cb-model → catboost-rs/-py`) without violating the standing landmine (`cb-backend` must never depend on `cb-train`). GPU inference is confirmed by the repo's own CUDA design doc (line 2859) to be architecturally separate from training upstream — sharing only the low-level primitive layer — so it lands in a **new `cb-infer-gpu` crate** sitting above both `cb-model` and `cb-backend` (device-agnostic kernels stay in `cb-backend/src/kernels/infer/`; model-shaped orchestration lives in the new crate, avoiding the `cb-backend→cb-model` cycle). Orchestration (CV/tuning/snapshot/calc_metrics) becomes a **new `cb-orchestrate` crate** mirroring upstream's `train_lib` driver-layer separation, requiring a new `BoostingCheckpoint` serde surface on `cb-train`. Extended fstr extends the existing `cb-model/fstr` module (adding a new cubecl-free `cb-model→cb-compute` edge for LossFunctionChange's loss derivatives). Online-HNSW is a self-contained ~936-LOC port living in `cb-compute/src/hnsw/`, wired into `cb-train/estimated` for training-time index build and reused at apply-time.
 
-**Major components:**
-1. `cb_compute::Runtime` trait (MODIFY) — three default-impl grow-tree methods; stays CubeCL-free; only change visible to `cb-train`.
-2. `GpuTrainSession` (NEW in `cb-backend`) — owns ONE `ComputeClient` + all persistent handles (`compressed_index_h`, `indices_h`, `target_h`, `weight_h`, `approx_h`, `der1_h`, `bins_h`, `part_stats_h`); created once per `fit()`, owned by `GpuBackend` via `RefCell<Option<GpuTrainSession>>`.
-3. `GpuBackend` (`cb-backend/src/gpu_backend.rs`) (MODIFY) — implement the seam, own the session, drive `grow_boosting_pass_into` over resident handles.
-4. `grow_boosting_pass_into` / `grow_oblivious_tree_into` (`cb-backend/src/gpu_runtime/mod.rs`) (MODIFY) — convert `*_into` launchers from host-slice args to handle-based args; add partition-aware histogram variant for depth>1.
-5. `train_inner::<R: Runtime>` (`cb-train/src/boosting.rs`) (MODIFY) — try device seam, fall back to host on `Ok(None)`; call begin/end around the loop.
-6. Host growers (`cb-train/src/tree.rs`) (KEEP UNCHANGED) — remain the CPU path and the device fallback.
-
-**Crossing contract (D-05, enforced per level):** only the O(1) `BestSplit` descriptor and the `2^depth` `TPartitionStatistics` cross host↔device per level; histogram, partition, per-doc routing stays device-resident.
+**Major components (new/modified):**
+1. `cb-infer-gpu` (NEW crate) — `GpuEvaluator` host orchestrator; resident `GpuModelData`; `Ok(None)`→CPU fallback for unsupported models (non-oblivious, multi-dim, cat/text/embedding).
+2. `cb-orchestrate` (NEW crate) — cross-validation, grid/random tuning, snapshot/resume, calc_metrics/eval_result; drives `cb-train` through a new checkpointable boosting API.
+3. Export (either NEW `cb-export` crate [STACK] or feature-gated `cb-model/export` submodule [ARCHITECTURE] — **unresolved, flag for phase-1 planning**) — read-only `&Model → Result<Vec<u8>>` exporters for ONNX/CoreML.
+4. `cb-model/fstr` (MODIFIED) — new `interaction.rs`, `loss_change.rs`, `partial_dependence.rs` alongside existing SHAP/basic fstr.
+5. `cb-compute/hnsw` (NEW) — bit-exact online-HNSW port, cubecl-free (D-03 clean).
 
 ### Critical Pitfalls
 
-1. **Inner loop left on host** — the exact v1.0 state; the `Runtime` seam is the fix; treat GPU train time ≥ CPU train time as a hard failure gate.
-2. **Per-tree/level blocking read-backs** — `read_one` inside the per-level loop drains the CubeCL queue; eliminate per-tree der read-back, enforce O(1) metadata crossings only.
-3. **Per-tree re-upload of training data** — re-uploading the immutable `cindex` per tree is the dominant discrete-GPU cost; `GpuTrainSession` hoists the upload once.
-4. **Non-deterministic float reduction breaks the parity oracle** — `atomicAdd` non-associativity compounds over hundreds of trees; the reduction strategy must be chosen before writing the partition-aware histogram kernel; hold GPU to `ε=1e-4 vs Rust CPU`, never widen silently.
-5. **f64 atomic-add unavailable on gfx1100/RDNA3** — falls back to `HostSumFallback`, destroying device residency on ROCm, invisible to cpu/wgpu cargo check; design the histogram reduction to be atomic-free.
-6. **HIP rejects `-inf` literals in `#[cube]` kernels** — use `f32::MIN` sentinel; add to every kernel-authoring checklist.
-7. **`cb-backend`→`cb-train` dependency landmine** — Cargo feature unification breaks ROCm backend selection; transcribe CPU reference logic inline, never add the edge.
-8. **CUDA correctness untested before timing** — CUDA path first executes on Kaggle; oracle re-run on CUDA is a blocking gate before quoting any speed number.
+1. **Scoping ONNX/CoreML export as "export the model" instead of "export float-only models, typed-reject the rest"** — upstream itself refuses categorical/text/embedding models; test fixtures being numeric-only creates false confidence that will break the moment a real (categorical-heavy) CatBoost model is exported. Avoid by enforcing the guard at the export entry point with a typed error, mirroring upstream's `CB_ENSURE` checks exactly.
+2. **Holding exported ONNX/CoreML predictions to the same ≤10⁻⁵ double-precision bar as CPU** — ONNX Runtime and CoreML accumulate in float32, so structurally-correct exports will legitimately drift beyond 10⁻⁵ vs the `.cbm` double reference over many trees. Avoid by defining an export-specific tolerance and oracling against **official CatBoost's own ONNX/CoreML export evaluated in the same runtime** (ORT/CoreML), not against the internal double predictor.
+3. **Treating online-HNSW's "approximate" nature as "infeasible to match bit-exactly."** HNSW is deterministic given identical seed/insertion-order/RNG/distance — bit-exact parity IS achievable, but only via a hand transcription of upstream's `library/cpp/online_hnsw` (~936 LOC), never an off-the-shelf HNSW crate. Oracle must assert the per-object neighbor *set* index-for-index, not just the final prediction, or the wrong half of the bug gets hidden.
+4. **Re-introducing GPU non-determinism / HIP codegen traps in the new inference evaluator.** Naive transcription of upstream's `double4`+`TAtomicAdd` reduction and `NegativeInfty()`/`|=` idioms reintroduces exactly the landmines v1.1 already solved (raw atomic-add jitter breaking ε=1e-4; bare `-inf` literals rejected by the HIP JIT on gfx1100, invisible to cpu/wgpu `cargo check`). Avoid by reusing the v1.1 fixed-point u64 deterministic reduction and `f32::MIN` sentinel verbatim, and running the rocm suite in-env before any GPU-inference sign-off.
+5. **CV/tuning fold-assignment divergence and data leakage** — CatBoost's `cv()` has non-obvious semantics (per-loss stratification defaults, group-in-fold, three split `type`s) that a naive sklearn-style K-fold reimplementation will silently violate; and computing CTR/quantization borders on the full pool before splitting leaks target info, which *improves* CV scores and hides the bug. Avoid by oracling fold-assignment against CatBoost per seed and adding a target-permutation leakage canary.
 
 ## Implications for Roadmap
 
-### Phase 10: Coarse Seam + GpuTrainSession Residency + Wire Depth-1
+Based on research (ARCHITECTURE.md's build-order analysis, cross-checked against FEATURES.md dependency graph and PITFALLS.md risk ordering), suggested phase structure:
 
-**Rationale:** Everything else is blocked on the seam; the residency architecture must be established here because retrofitting it after depth>1 kernels are written is significantly harder; the `Ok(None)` fallback pattern must be established here so all subsequent phases land incrementally without breaking correctness.
+### Phase 1: Debt discharge & CUDA oracle re-establishment
+**Rationale:** Every later parity/benchmark claim (export tolerance oracles, GPU-inference sign-off, the adoption benchmark) depends on a trusted CUDA oracle and closed parity hazards. Mostly job execution + contained fixes — high de-risking, low code-change risk.
+**Delivers:** GPUT-14 aggregate ε=1e-4 Kaggle CUDA correctness sign-off; Phase-10/11 BENCH-02 speed rows executed; RV-13-01..04 latent parity hazards closed.
+**Addresses:** Debt & hardening requirement (PROJECT.md Active).
+**Avoids:** Pitfall 12 (benchmark baseline confusion) by re-establishing the real oracle before anyone benchmarks against it.
 
-**Delivers:** `Runtime` trait with three default-impl grow-tree methods (plain host types, no CubeCL in signature); `GpuTrainSession` with all persistent handles; `*_into` launchers converted to handle-based args; `grow_boosting_pass` wired for the MVP envelope (depth=1, Plain, fold_count=1, RMSE/Logloss) with `Ok(None)` fallback; per-tree `der1` read-back eliminated; approx device-resident across iterations. Oracle: depth-1 RMSE ≤1e-5 vs CPU on rocm in-env; CPU/host paths byte-unchanged (D-04).
+### Phase 2: Online-HNSW KNN parity (FEAT-07)
+**Rationale:** Closes the one remaining open ≤10⁻⁵ CPU parity gap; fully self-contained (~936 LOC, `cb-compute` only); can overlap with Phase 1 since it touches different crates. Completing it makes the "verifiable parity" claim for the whole adoption/benchmark story true.
+**Delivers:** Bit-for-bit port of `library/cpp/online_hnsw` in `cb-compute/src/hnsw/`, wired into `cb-train/estimated`; per-object neighbor-set oracle passing.
+**Addresses:** FEAT-07 (Debt & hardening requirement).
+**Avoids:** Pitfall 8 (declaring HNSW parity infeasible because it's "approximate"; using a third-party HNSW crate).
 
-**Addresses features:** Runtime grow-tree seam, wire depth-1, compressed index resident, gradients/approx resident (all P1).
+### Phase 3: Model export (ONNX + CoreML)
+**Rationale:** Read-only, zero-seam-risk, independent of every other new surface — the earliest safe feature win, and it introduces no device path or new crate-cycle risk, so it should land before GPU-inference.
+**Delivers:** `cb-model/export` submodule (or `cb-export` crate — **resolve placement in this phase's plan**, see Gaps) implementing `Model → Result<Vec<u8>>` for ONNX and CoreML, with hard upstream guards (float-only, identity-scale, oblivious-only) enforced via typed errors.
+**Uses:** `prost`/`prost-build`/`protox`, vendored `onnx.proto`/CoreML `.proto` schemas from STACK.md.
+**Implements:** "Read-only exporter over `TModelTrees`" pattern from ARCHITECTURE.md.
+**Avoids:** Pitfalls 1–4 (categorical export, float32-vs-double tolerance confusion, opset/label mismatches, CoreML execution-validation gaps).
 
-**Avoids pitfalls:** 1 (inner loop on host), 2 (blocking read-backs), 3 (per-tree re-upload), 7 (landmine).
+### Phase 4: Extended feature importance
+**Rationale:** Independent, single-crate modification (`cb-model/fstr`), medium effort; can run in parallel with Phase 3.
+**Delivers:** Interaction (tree-structure-only), LossFunctionChange (reuses shipped SHAP machinery + new `cb-model→cb-compute` loss-derivative edge), partial-dependence (staged-apply sweep).
+**Addresses:** Extended feature importance requirement.
+**Avoids:** Pitfall 13 (implementing textbook interpretation formulas instead of CatBoost's exact accounting) — oracle each type against CatBoost on models with CTR features, not just numeric fixtures.
 
-**Research flag:** Standard patterns — seam shape fully specified; mirrors established `Derivatives` seam and `GpuBackend` patterns from Phases 7-8. Sub-task: spike the reduction-determinism strategy (fixed-point i64 atomics, private-histogram merge, or two-pass segmented reduce) in Phase 10 before Phase 11's histogram kernel is written.
+### Phase 5: GPU inference evaluator
+**Rationale:** Deliberately sequenced after Phase 1: the re-signed CUDA oracle and v1.1 primitive library must be trustworthy before a second device path is built on top of them. Requires a new crate to respect the no-cycle rule.
+**Delivers:** New `cb-infer-gpu` crate + `cb-backend/src/kernels/infer/` (Binarize/EvalObliviousTrees/ProcessResults kernels); `Ok(None)`→CPU fallback for non-oblivious/multi-dim/cat models; deterministic fixed-point reduction reused from v1.1.
+**Addresses:** GPU inference evaluator requirement.
+**Avoids:** Pitfalls 5, 6, 7 (non-deterministic reductions, HIP `-inf`/`|=` codegen traps, silently exceeding upstream's supported GPU subset).
 
-### Phase 11: Depth>1 Partition-Aware Histograms + Newton Der2
+### Phase 6: Orchestration (CV, tuning, snapshot/resume, calc_metrics)
+**Rationale:** Parallelizable with Phase 5 (disjoint crates); needs a new `cb-train` checkpoint surface, the only modification to the otherwise-frozen training core this milestone.
+**Delivers:** New `cb-orchestrate` crate — `cross_validation.rs`, `tuning.rs` (grid/random, depends on `cv()`), `snapshot.rs` (versioned `BoostingCheckpoint` + RNG-continuity resume), `calc_metrics.rs`.
+**Uses:** Existing `cb-train` boosting loop, serde/`.cbm`-style versioned serialization, existing deterministic RNG stream.
+**Avoids:** Pitfalls 9, 10 (CV fold/leakage divergence, non-reproducible snapshot/resume) — oracle fold-assignment and straight-vs-resume bit-identity explicitly.
 
-**Rationale:** Depth>1 is the keystone — depth 6 is the real-world default; the subtraction trick is required for parity speed at depth 6; Newton der2 is required for classification. Partition-aware histograms and contiguous partition reorder are co-dependent (histogram fill needs contiguous partitions) so they land together.
-
-**Delivers:** Partition-aware `pointwise_hist2` variant keyed by `leaf_of[obj]` into `2^level` slots; contiguous partition reorder (`TDataPartition{Offset,Size}` layout); histogram subtraction trick (parent-resident, sibling-by-subtraction); Newton der2 leaf estimation using Phase 7.2 der2 handles; chosen reduction-determinism strategy implemented. Oracle: depth>1 trees (RMSE + Logloss) ≤1e-4 vs CPU on rocm in-env.
-
-**Addresses features:** Partition-aware histograms/depth>1, partition reorder, histogram subtraction trick, Newton der2 leaf estimation, second-order/Cosine score (partial) — all P1/P2.
-
-**Avoids pitfalls:** 4 (non-deterministic reduction), 5 (f64 atomic-add unavailable), 6 (HIP -inf sentinel).
-
-**Research flag:** Needs a focused spike on reduction-determinism strategy before the histogram kernel is written. Also verify the multi-block scan carry ("Open Q2" forward dependency in the CubeCL manual) against the vendored manual before implementing.
-
-### Phase 12: GPU Coverage Expansion (CTR / Pairwise / Ordered / Multiclass)
-
-**Rationale:** Each feature family is independently shippable behind the `Ok(None)` fallback gate; they do not depend on each other. Recommended sub-order: bootstrap + random-strength (small, high-return), then CTR (headline use case), then pairwise (reuses Phase 7.4 kernels), then multiclass, then ordered boosting (heaviest residency). Each sub-feature lands when it passes ≤1e-4 oracle sign-off; users fall back to CPU otherwise.
-
-**Delivers:** Feature-by-feature transition from `Ok(None)`→CPU-fallback to `Ok(Some(tree))`→device path; GPU coverage matrix documented.
-
-**Research flag:** CTR on device has the highest uncertainty — consider a targeted research spike on `batch_binarized_ctr_calcer.h` + `ctrs/` before planning that sub-task. Pairwise partition + leaves oracle (`leaves_estimation/pairwise_oracle.h`) is under-documented relative to the pointwise path.
-
-### Phase 13: Kaggle CUDA Benchmark + Correctness Re-Run + ε Sign-Off
-
-**Rationale:** Benchmark is only meaningful after depth>1 is device-resident. The CUDA path is untested for correctness until this phase — oracle re-run on CUDA is a blocking gate before any speed number is quoted.
-
-**Delivers:** CUDA oracle re-run (≤1e-4 vs Rust CPU) as blocking gate; fair head-to-head timing (warm-run, train-only, identical params/bins/data, single GPU); throughput report; final ε sign-off documentation (D-04); ROCm regression criterion bench confirming device-resident path beats pre-Phase-10 host-light.
-
-**Research flag:** Standard patterns — protocol fully specified in STACK.md and PITFALLS.md. Execution checklist: verify CUDA backend active via `nvidia-smi`, warm one untimed fit, drain lazy CubeCL queue with a read-back/predict before stopping the clock, re-run oracle before timing.
+### Phase 7: Adoption / DX capstone
+**Rationale:** Must exercise export + GPU-infer + orchestration once they exist, and PyPI release is the final gate for the whole milestone — hence last.
+**Delivers:** End-to-end benchmark vs official CatBoost (accuracy + speed + memory, matched hardware/version, GPU numbers from Kaggle CUDA only), PyPI per-backend wheels + CI release matrix + versioning, docs + runnable Rust/Python examples, real-dataset validation suite.
+**Addresses:** Adoption/DX requirement.
+**Avoids:** Pitfalls 11, 12 (wheel/abi3/free-threaded confusion; benchmarking against the wrong baseline — must be vs official CatBoost, not the v1.1 host-light baseline).
 
 ### Phase Ordering Rationale
 
-- Phase 10 is a strict prerequisite: the seam gates the device path; the residency architecture gates the speedup; the fallback pattern gates safe incremental coverage.
-- Phase 11 is the performance keystone: depth>1 (default depth 6) is the first workload where GPU can plausibly beat CPU; the subtraction trick is also required to approach parity speed.
-- Phase 12 is inherently parallel: each feature family is independently gated and deferrable; can be planned and executed in parallel sub-workstreams, or cut to bootstrap + CTR MVP if Phase 11 runs long.
-- Phase 13 cannot start until CUDA correctness is established; oracle re-run is not optional.
+- **Debt-first over export-first** is a de-risking judgment (both orderings are defensible): the benchmark and "verifiable parity" release claim depend on a trusted CUDA oracle and a closed HNSW gap, so discharging those first protects every downstream claim at low relative cost.
+- **Export before GPU-infer** is dependency-neutral but risk-ordered: export has zero seam risk and no device/crate-cycle wiring, so it is the safest place to bank an early win, while GPU-infer should only proceed once the re-signed CUDA oracle (Phase 1) exists to validate it against.
+- **Orchestration's tuning sub-feature hard-depends on `cv()`** (grid/random search calls `CrossValidate` per candidate) — this ordering is firm within Phase 6, not just a suggestion.
+- **GPU-infer and Orchestration (Phases 5–6) are mutually parallelizable** — disjoint new crates (`cb-infer-gpu` vs `cb-orchestrate`), no shared edge.
+- Phase 7 must come last because it is the only phase that exercises every other phase's output (export, GPU-infer, orchestration all feed into the benchmark/docs/release story).
 
 ### Research Flags
 
-**Needs deeper research during planning:**
-- Phase 11 (reduction-determinism strategy): fixed-point i64 atomics vs private-histogram merge vs two-pass segmented reduce — must be spiked before the histogram kernel is written.
-- Phase 11 (multi-block scan carry): "Open Q2" in the CubeCL manual — verify against vendored docs before implementing.
-- Phase 12 (CTR on device): complex upstream `batch_binarized_ctr_calcer.h` pipeline warrants a targeted research sub-task.
+Phases likely needing deeper research during planning:
+- **Phase 3 (Model export):** the STACK vs ARCHITECTURE crate-placement disagreement (`cb-export` new crate vs `cb-model/export` feature-gated submodule) must be resolved before coding starts; also needs opset/tolerance decisions pinned in the SPEC (Pitfalls 2–3).
+- **Phase 5 (GPU inference evaluator):** needs a `--research-phase` pass on CubeCL kernel transcription specifics (the HIP `-inf`/`|=` landmines are documented but re-verification against the current CubeCL version is prudent before writing kernels).
+- **Phase 6 (Orchestration):** CV fold-parity semantics (stratification-by-loss-function defaults, group-in-fold, three split types) are MEDIUM confidence per PITFALLS.md and warrant a focused research pass against upstream `cross_validation.cpp` before implementation.
 
-**Standard patterns (skip additional research):**
-- Phase 10 (seam + session): architecture fully specified; mirrors established patterns from Phases 7-8.
-- Phase 13 (benchmark harness): protocol fully specified; existing `benchmark.py` is the template.
+Phases with standard patterns (skip research-phase):
+- **Phase 1 (Debt discharge):** execution of already-designed jobs (Kaggle CUDA runs) plus contained fixes — no new research needed.
+- **Phase 2 (Online-HNSW):** root cause and port scope are already definitively documented (instrumented-trainer evidence, ~936 LOC bounded); implementation is transcription, not design.
+- **Phase 4 (Extended fstr):** upstream algorithms are precisely documented in `calc_fstr.h`/`loss_change_fstr.h`; SHAP precedent already shipped.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | CubeCL 0.10.0 already in repo; all APIs verified against vendored manual and existing `gpu_runtime` code; no new compute crates needed. |
-| Features | HIGH | Grounded in direct read of `catboost-master/catboost/cuda/` upstream reference; dependency graph validated against existing Rust kernel surface. |
-| Architecture | HIGH | Coarse-seam + `GpuTrainSession` design independently confirmed by all three agents and by the upstream `TBoosting<TTarget, TWeakLearner>` template. |
-| Pitfalls | HIGH | Landmines 6 and 7 are in-repo validated (Phase 7.2/7.5/7.6 retrospectives); reduction non-determinism corroborated by GPU GBDT literature. |
+| Stack | HIGH | Crate versions verified via `cargo search`/pip 2026-07-05; ONNX/CoreML formats verified against upstream C++ source + onnx.ai/apple docs |
+| Features | HIGH | Grounded in vendored upstream source with file/line citations; algorithm-level detail confirmed for every P1 feature |
+| Architecture | HIGH | The load-bearing GPU-inference-separation decision is confirmed verbatim by the repo's own design doc (line 2859); crate-cycle analysis is mechanical and verified against real `Cargo.toml` files |
+| Pitfalls | HIGH for ONNX/CoreML limits, GPU determinism, HNSW feasibility (upstream source + in-repo instrumented-trainer evidence); MEDIUM for CV fold-parity internals and PyPI free-threaded specifics |
 
 **Overall confidence:** HIGH
 
 ### Gaps to Address
 
-- **Reduction-determinism strategy (Phase 11):** The right choice depends on gfx1100 performance characteristics only measurable by a targeted spike. Plan a spike sub-task in Phase 10 or as Phase 11 step 0.
-- **CUDA correctness before benchmark (Phase 13):** No pre-flight validation of CUDA-specific behavior before the benchmark phase; the oracle re-run on CUDA is designed to catch this; the `Ok(None)` fallback ensures CPU correctness as the safety net.
-- **Pairwise device path (Phase 12):** The pairwise partition + leaves oracle is less documented in this research; plan a targeted read of `leaves_estimation/pairwise_oracle.h` before implementation.
-- **Occupancy tuning per backend (Phase 12):** Cube/plane dim tuning for new kernel families is only measurable in-env; budget profiling time per new kernel family.
+- **Export crate placement (STACK vs ARCHITECTURE disagreement):** STACK.md recommends a new `cb-export` crate as primary (keeps protobuf codegen out of `cb-model`'s lean core); ARCHITECTURE.md recommends a feature-gated `cb-model/export` submodule as primary (matches the existing `json.rs`/`cbm.rs` read-only precedent, avoids a new workspace member). Both files list the other as a valid alternative. **Resolve explicitly in the Phase 3 plan** — this summary does not adjudicate it, since both research files present the tradeoff clearly and the choice affects Cargo.toml wiring, not algorithm correctness.
+- **CV fold-partition semantics (MEDIUM confidence):** exact stratification-default-by-loss-function rule, group-in-fold behavior, and the three `type`s (Classical/Inverted/TimeSeries) should be re-verified against `catboost-master/catboost/libs/train_lib/cross_validation.cpp` at Phase 6 planning time rather than relying solely on this research pass.
+- **PyPI free-threaded validation:** the abi3-py312/`gil_used=false` build's concurrency claim was never validated against a real `python3.13t` interpreter in Phase 8; Phase 7 must either run that validation or explicitly document the claim as "code property, not live-tested" per the established human-gated pattern.
+- **CoreML execution environment:** no macOS/Apple runtime is confirmed available in CI; Phase 3 planning should decide upfront whether CoreML parity will be execution-validated (if an Apple runtime becomes available) or structural-only (documented gap, mirroring the Kaggle-CUDA no-in-env-oracle discipline).
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- In-repo: `crates/cb-backend/src/gpu_runtime/mod.rs` (grow loop, `*_into` launchers, depth-1 MVP), `crates/cb-backend/src/gpu_runtime/der_seams.rs`, `crates/cb-compute/src/runtime.rs`, `crates/cb-train/src/boosting.rs`, `crates/cb-backend/src/gpu_backend.rs`.
-- Upstream CUDA reference: `catboost-master/catboost/cuda/methods/oblivious_tree_doc_parallel_structure_searcher.{h,cpp}`, `methods/doc_parallel_boosting.h`, `methods/pointwise_optimization_subsets.h`, `methods/histograms_helper.h`, `methods/pointwise_scores_calcer.h`, `methods/leaves_estimation/`, `gpu_data/compressed_index.h`, `gpu_data/gpu_structures.h`.
-- CubeCL vendored manual: `11_launch_overhead_and_transfers.md`, `05_lazy_execution.md`, `08_atomic_contention.md`, `09_fixedpoint_atomics.md`, `10_grid_stride_occupancy.md`, `profiling_tools.md`, `Cubecl_plane.md`, `04_autotune_optimization.md`.
-- `.planning/notes/gpu-training-host-light-root-cause.md` — root-cause analysis of the >20x gap.
-- Project memory: `phase75-grow-loop-outcome`, `phase76-gpu-tolerance-signoff-outcome`, `cubecl-hip-no-inf-literal`, `phase8-python-bindings-outcome`.
+- `docs/CATBOOST_CORE_DESIGN.md` — export formats, training orchestration/driver layer, fstr dispatcher, eval_result/calc_metrics, KNN=HNSW
+- `docs/CATBOOST_CUDA_KERNELS_DESIGN.md` §7 (GPU inference evaluator), line 2859 (inference independent of training) — repo-curated design doc
+- `catboost-master/catboost/libs/model/model_export/model_exporter.cpp`, `onnx_helpers.cpp`, `coreml_helpers.cpp` — export guards, opset/label semantics, CoreML pipeline details — upstream source, verified 2026-07-05
+- `catboost-master/catboost/libs/fstr/calc_fstr.h`, `loss_change_fstr.h`, `partial_dependence.h` — fstr algorithms
+- `catboost-master/catboost/libs/train_lib/cross_validation.cpp`, `hyperparameter_tuning.cpp` — CV/tuning semantics
+- `library/cpp/online_hnsw` (upstream) + `.planning/notes/knn-estimated-feature-is-online-hnsw.md` — HNSW root cause, bit-exact feasibility proof
+- Current workspace `Cargo.toml` files and `crates/*/src/` layout inspection — crate dependency graph
+- `.planning/PROJECT.md` — v1.2 scope, standing debt, landmine restatement
+- `cargo search` / `pip index versions` 2026-07-05 — crate/tool version verification
 
 ### Secondary (MEDIUM confidence)
-- [XGBoost GPU docs — FP non-associativity in GPU ranking](https://xgboost.readthedocs.io/en/release_1.4.0/gpu/index.html)
-- [GPU-acceleration for Large-scale Tree Boosting (arXiv 1706.08359)](https://arxiv.org/pdf/1706.08359)
-- [Quantized Training of Gradient Boosting Decision Trees (arXiv 2207.09682)](https://arxiv.org/pdf/2207.09682)
-- [CatBoost GPU vs CPU benchmark methodology](https://github.com/catboost/benchmarks/blob/master/gpu_vs_cpu_training_speed/README.md)
+- CV fold-partition internals (stratification defaults, group semantics) — documented but flagged for re-verification
+- PyPI free-threaded / `python3.13t` specifics — project memory (`phase8-python-bindings-outcome.md`), not independently re-verified this pass
 
 ---
-*Research completed: 2026-06-28*
+*Research completed: 2026-07-05*
 *Ready for roadmap: yes*
