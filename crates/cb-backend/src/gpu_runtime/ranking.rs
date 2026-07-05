@@ -45,8 +45,7 @@ use cubecl::server::Handle;
 use cb_core::{CbError, CbResult};
 
 use crate::kernels::query_helper::{
-    compute_group_ids_host, compute_group_max_host, compute_group_means_host,
-    remove_group_means_host,
+    compute_group_ids_host, compute_group_means_host, remove_group_means_host,
 };
 #[cfg(not(feature = "wgpu"))]
 use crate::kernels::exact_quantile::segmented_radix_sort;
@@ -368,6 +367,43 @@ fn weight_column(weights: &[f64], n: usize) -> CbResult<Vec<f64>> {
     Ok(weights.to_vec())
 }
 
+/// RV-13-02 (HARD-03): the per-query max-approx seed for the QuerySoftMax exp-shift, computed over
+/// **weight>0 objects only** — mirroring the CPU reference `cb_compute::ranking_der` QuerySoftMax arm
+/// (`ranking_der.rs:257-266`, `max_approx = max over {approx[i] : w[i] > 0}`, seeded at
+/// `f64::MIN` == upstream `-numeric_limits::max()`). The device previously seeded from
+/// [`crate::kernels::query_helper::compute_group_max_host`], a max over ALL objects, which diverges
+/// from CPU when the global-max-approx document has weight ≤ 0. A query with no positive-weight
+/// object keeps the `f64::MIN` seed; the caller's downstream `sum_weighted_targets > 0` guard
+/// short-circuits that query before any `exp`, exactly as the CPU path does. Pure host-side (the
+/// seed is already read back to the host), so no `#[cube]` kernel edit (Open Q2 → host-side).
+///
+/// `weight_col` is the already-expanded uniform-or-validated weight column (length `n`); for a
+/// uniform-weight query this returns the same value as the weight-blind max (regression-safe).
+pub(crate) fn compute_group_max_weighted_host(
+    approx: &[f64],
+    weight_col: &[f64],
+    q_offsets: &[u32],
+) -> Vec<f64> {
+    let n_groups = q_offsets.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(n_groups);
+    for w in q_offsets.windows(2) {
+        let begin = *w.first().unwrap_or(&0) as usize;
+        let end = *w.get(1).unwrap_or(&0) as usize;
+        let mut max_a = f64::MIN; // upstream -numeric_limits<double>::max()
+        for i in begin..end {
+            let wi = weight_col.get(i).copied().unwrap_or(0.0);
+            if wi > 0.0 {
+                let a = approx.get(i).copied().unwrap_or(0.0);
+                if a > max_a {
+                    max_a = a;
+                }
+            }
+        }
+        out.push(max_a);
+    }
+    out
+}
+
 /// Validate the flat ranking der inputs (shared by every objective). `approx` / `target` are length
 /// `n`; `q_offsets` has `n_groups + 1` entries covering `[0, n)`.
 fn validate_ranking_inputs(approx: &[f64], target: &[f64], q_offsets: &[u32]) -> CbResult<()> {
@@ -470,9 +506,13 @@ pub(crate) fn query_softmax_ders_host(
     #[cfg(not(feature = "wgpu"))]
     {
         let weight_col = weight_column(weights, n)?;
-        // Per-query max approx (Plan-03 ComputeGroupMax) — the max-shift before exp. Uniform-weight
-        // covered regime: max over all objects == the CPU max-over-(weight>0) seed.
-        let group_max = compute_group_max_host(approx, q_offsets)?;
+        // RV-13-02 (HARD-03): per-query max-approx shift seeded over WEIGHT>0 objects only, matching
+        // the CPU reference `ranking_der.rs:257-266`. The prior `compute_group_max_host(approx, ..)`
+        // took the max over ALL objects, which diverges from CPU when the global-max-approx document
+        // has weight ≤ 0 (softmax is shift-invariant in exact arithmetic, but the seed choice is the
+        // CPU parity contract and governs the exp-shift's floating-point behaviour). Pure host-side
+        // (no `#[cube]` edit — Open Q2).
+        let group_max = compute_group_max_weighted_host(approx, &weight_col, q_offsets);
         let n_groups = q_offsets.len().saturating_sub(1);
 
         let client = selected_client();

@@ -29,9 +29,9 @@
 #![cfg(not(feature = "wgpu"))]
 
 use crate::gpu_runtime::ranking::{
-    derive_query_seeds_inline, descending_order_per_query, pfound_f_ders_host,
-    query_softmax_ders_host, ranking_objective_covered, yetirank_draw_count, yetirank_ders_host,
-    RankingObjective,
+    compute_group_max_weighted_host, derive_query_seeds_inline, descending_order_per_query,
+    pfound_f_ders_host, query_softmax_ders_host, ranking_objective_covered, yetirank_draw_count,
+    yetirank_ders_host, RankingObjective,
 };
 
 /// The ε=1e-4 device-vs-CPU bar (D-07; the GPU bar, looser than the CPU ref's own ≤1e-5).
@@ -239,6 +239,103 @@ fn tie_order_matches_cpu_stable_descending() {
         println!(
             "RV-13-01 tie_order: cpu backend — order assert skipped (radix sort is device-only, \
              WR-01 record-only). cpu_reference want = {want:?}"
+        );
+    }
+}
+
+/// The RV-13-02 fixture (2 queries, sizes 3 / 3, `n = 6`). Query 0 is WEIGHTED and its global-max
+/// -approx document (`approx[0] = 3.0`) has `weight = 0.0` — so the weight-blind (pre-fix) seed 3.0
+/// diverges from the CPU weight>0 seed 1.0. Query 1 is uniform-weight (regression guard: weight>0
+/// max == global max == 0.8).
+fn softmax_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<u32>, f64, f64) {
+    let approx = vec![3.0, 1.0, 0.5, 0.2, 0.8, -0.1];
+    let target = vec![1.0, 1.0, 1.0, 1.0, 0.0, 1.0];
+    let weights = vec![0.0, 2.0, 1.0, 1.0, 1.0, 1.0];
+    let q_offsets = vec![0u32, 3, 6];
+    let beta = 1.0;
+    let lambda = 0.0;
+    (approx, target, weights, q_offsets, beta, lambda)
+}
+
+/// FROZEN CPU QuerySoftMax der for [`softmax_fixture`], generated ONCE offline from the INDEPENDENT
+/// `cb_compute` QuerySoftMax math (`ranking_der.rs:251-322` + `loss.rs::querysoftmax_der`,
+/// `:608-619`) seeded with the WEIGHT>0 per-query max. Generation recipe (transcribe the CPU
+/// formula, do NOT call the device path — non-tautology):
+/// ```text
+/// per query g with begin/end:
+///   max_a  = max{ approx[i] : weight[i] > 0 }               # weight>0 seed (the parity target)
+///   sum_wt = Σ_{w>0, t>0} weight[i]·target[i]
+///   if sum_wt > 0:
+///     sum_exp = Σ_i exp(beta·(approx[i] − max_a))·weight[i]
+///     for i in begin..end:
+///       if weight[i] > 0 and sum_exp > 0:
+///         p    = exp(beta·(approx[i] − max_a))·weight[i] / sum_exp
+///         der2 = beta·sum_wt·(beta·p·(p−1) − lambda)
+///         der1 = beta·(−sum_wt·p + weight[i]·target[i])
+///       else: der1 = der2 = 0
+///   else: der1 = der2 = 0
+/// ```
+/// (beta = 1.0, lambda = 0.0). A weight-blind seed (max over ALL objects) yields the SAME der to
+/// ~1e-16 here because softmax is shift-invariant in exact arithmetic; the oracle's TEETH are in
+/// [`softmax_weight_max_seed`]'s direct assertion that the SEED is the weight>0 max (1.0), not the
+/// global max (3.0) — the pre-fix behaviour that this fix corrects.
+fn frozen_softmax_der1() -> Vec<f64> {
+    vec![
+        0.0,
+        -0.3019103871433044,
+        0.3019103871433041,
+        0.4386653515985748,
+        -1.022818416162833,
+        0.5841530645642584,
+    ]
+}
+fn frozen_softmax_der2() -> Vec<f64> {
+    vec![
+        0.0,
+        -0.5356465769972252,
+        -0.5356465769972254,
+        -0.40378635465344936,
+        -0.4997396599419099,
+        -0.32938259858009267,
+    ]
+}
+
+#[test]
+fn softmax_weight_max_seed() {
+    // RV-13-02 (HARD-03, D-02): the QuerySoftMax exp-shift must be seeded from the WEIGHT>0 max,
+    // matching CPU `ranking_der.rs:257-266`.
+    let (approx, target, weights, q_offsets, beta, lambda) = softmax_fixture();
+
+    // (a) TEETH — direct, backend-agnostic assertion on the SEED SELECTION. The weighted max helper
+    // is pure host code (no device kernel), so it runs everywhere. The pre-fix weight-blind seed
+    // would return 3.0 for query 0 (the global max on the weight-0 doc); the fix returns 1.0.
+    let weight_col = weights.clone();
+    let seeds = compute_group_max_weighted_host(&approx, &weight_col, &q_offsets);
+    assert_eq!(
+        seeds,
+        vec![1.0, 0.8],
+        "RV-13-02: per-query seed must be the WEIGHT>0 max (q0=1.0, not the global 3.0 on the \
+         weight-0 doc; q1=0.8)"
+    );
+
+    // (b) der parity — device-gated ε (WR-01 record-only on cpu; still exercised + finiteness-checked
+    // there). The der driver runs on `SelectedRuntime`; on a real device it must match the frozen CPU
+    // reference within ε=1e-4.
+    let (der1, der2) =
+        query_softmax_ders_host(&approx, &target, &weights, &q_offsets, beta, lambda)
+            .expect("query_softmax der");
+    assert_eq!(der1.len(), approx.len());
+    assert_eq!(der2.len(), approx.len());
+    for v in der1.iter().chain(der2.iter()) {
+        assert!(v.is_finite(), "RV-13-02 softmax der must be finite (no inf/NaN)");
+    }
+    if device_backend_active() {
+        assert_der_close(&der1, &frozen_softmax_der1(), "softmax der1");
+        assert_der_close(&der2, &frozen_softmax_der2(), "softmax der2");
+    } else {
+        println!(
+            "RV-13-02 softmax_weight_max_seed: cpu backend — numeric ε assert skipped (WR-01 \
+             record-only); seed-selection assert (weight>0 max) ran and passed"
         );
     }
 }
