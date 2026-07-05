@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: GPU Performance
 current_phase: 14
-current_phase_name: Comprehensive Kaggle CUDA Speed Benchmark + Parity Sign-Off
-status: completed
+current_phase_name: comprehensive-kaggle-cuda-speed-benchmark-parity-sign-off
+status: executing
 stopped_at: Phase 14 context gathered
-last_updated: "2026-07-04T12:24:59.218Z"
-last_activity: 2026-07-04
-last_activity_desc: Phase 13 complete, transitioned to Phase 14
+last_updated: "2026-07-05T00:54:48.474Z"
+last_activity: 2026-07-05
+last_activity_desc: Phase 14 execution started
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 33
-  completed_plans: 33
+  total_plans: 36
+  completed_plans: 34
   percent: 80
 ---
 
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A memory-efficient, Rust-native CatBoost implementation with verifiable feature parity (oracle-tested ≤1e-5), embeddable in Rust and droppable into both scikit-learn and existing CatBoost Python pipelines.
-**Current focus:** Phase 13 — pairwise-ranking-multiclass-ordered-langevin-device-coverage
+**Current focus:** Phase 14 — comprehensive-kaggle-cuda-speed-benchmark-parity-sign-off
 
 ## Current Position
 
-Phase: 14 — Comprehensive Kaggle CUDA Speed Benchmark + Parity Sign-Off
-Plan: Not started
-Status: Phase 13 device coverage authoritatively SIGNED OFF. All five families (pairwise/ranking/multiclass/ordered/langevin) passed the Kaggle CUDA ε≤1e-4 correctness gate on real Tesla P100 (ALL-PASS) + BENCH-02 grow loop 23.9-36.6x device≫CPU. GPUT-11/21/22/12/13/20 complete. One stale Phase-12 test deferred (DI-13-01, not a regression).
-Last activity: 2026-07-04 — Phase 13 complete, transitioned to Phase 14
+Phase: 14 (comprehensive-kaggle-cuda-speed-benchmark-parity-sign-off) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
+Last activity: 2026-07-05 — Phase 14 execution started
 
 ## Performance Metrics
 
@@ -198,6 +198,7 @@ Last activity: 2026-07-04 — Phase 13 complete, transitioned to Phase 14
 | Phase 13 P08 | 12 | 2 tasks | 4 files |
 | Phase 13 P09 | 22 | 2 tasks | 4 files |
 | Phase 13 P10 | 90min | 2/2 tasks (Kaggle CUDA sign-off ALL-PASS on P100) | 6 files |
+| Phase 14 P01 | 6m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -428,6 +429,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 13-06: DeviceGrownTree.approx_dim block leaves + K-dim Newton der2 block solve (coupled+diagonal); device sign-off deferred to Plan 10
 - [Phase ?]: Plan 13-08 (GPUT-13): ordered boosting device trajectory — resident per-permutation approx trajectory folded via apply_leaf_delta (one final read-back, no per-iter n-length crossing); ordered grow declines to CPU (grow seam forward dep); self-oracled vs frozen ordered_approx_delta_simple at eps=1e-4
 - [Phase ?]: 13-09 (GPUT-20): device AddLangevinNoise = serial #[cube] over resident der; per-element reseed from_seed(rand_seed+i).advance(10) + inline Marsaglia-polar std_normal (unbounded while-!accepted flag → exact CPU draw-count parity, Pitfall 4); der[i] += coefficient*normal in place, no read_one. langevin_covered_loss false for is_pairwise_scoring (A4) → PairLogit+Langevin CPU fallback. rocm numeric assert pending in-env (disk 100%); CPU 3/3 green
+- [Phase ?]: 14-01: offline aggregator honors D-03 (aggregate committed BENCH-02, no re-run) + D-01 (>=20x hard gate); 12/12 rows PASS, min 23.888x
 
 ### Pending Todos
 
@@ -489,7 +491,7 @@ Items acknowledged and carried forward at the v1.0 Core Parity milestone close (
 
 ## Session Continuity
 
-Last session: 2026-07-04T12:24:59.210Z
+Last session: 2026-07-05T00:54:12.097Z
 Stopped at: Phase 14 context gathered
 Stopped at (prior): Phase 9 context gathered
 Stopped at (prior): 08-06 COMPLETE (commits 733546f Task1 / fedf1b3 Task2) — PYAPI-06 free-threaded-aware design. Task1: #[pymodule(gil_used = false)] (PyO3 0.29) on the catboost_rs module, backed by the 08-03 own-before-detach discipline (NOT new copying); tests/test_free_threaded.py = concurrent fit/predict over per-thread-private + shared-immutable inputs (>=8 threads), asserts finite + cross-thread equality (T-08-18/19); module-level skip-guard via sys._is_gil_enabled() (absent on pre-3.13 => GIL => skip), so the GIL venv (CPython 3.12.3) is a clean 3-skip, never a false pass/panic (Phase-7.5 cpu-skip lesson). Task2: FREE_THREADING.md documents (a) PYAPI-06 as a code property, (b) the free-threaded WHEEL deferral (abi3-py312 ⊥ free-threading in PyO3 0.29; CONTEXT Deferred Ideas), (c) the validation command, (d) the custom_loss/custom_metric callback GIL-reentry caveat (A6 / T-08-20 accept). SCOPED DEFERRAL: no python3.13t/3.14t in-env -> the concurrent free-threaded RUN is deferred-pending-interpreter; PYAPI-06 stands CODE-PROPERTY-VALIDATED (own-before-detach + gil_used=false + GIL-build skip-guard test passing). Gates: maturin develop --features cpu OK (abi3-py312 wheel); pytest 73 passed / 5 skipped (3 new) / 79 xfailed; cargo test -p catboost-rs-py 29/29. NOTE: gsd-tools CLI absent -> STATE/ROADMAP/REQUIREMENTS updated MANUALLY. NEXT: 08-07 (final plan of Phase 8). Resume file: .planning/phases/08-python-bindings-dual-api-packaging/08-06-SUMMARY.md.

@@ -222,9 +222,9 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
   2. The correctness oracle is re-confirmed on the CUDA backend (≤1e-4 vs the Rust CPU path, ≤1e-5 for the depth-1 tree) as a **blocking gate before any speed number is reported** — reusing the authoritative Phase-10 CUDA oracle, so a fast-but-wrong CUDA result is never quoted.
   3. The device-resident path demonstrably closes the >20× gap (BENCH-03): a documented, signed-off **comprehensive final** speed-parity result vs official CatBoost GPU on Kaggle CUDA, measured against the pre-Phase-10 host-light baseline and aggregating every per-phase speed measurement into the milestone-closing sign-off.
 
-**Plans**: 3 plans
+**Plans**: 1/3 plans executed
 
-- [ ] 14-01-PLAN.md — Offline schema-branching BENCH-02 aggregator + unit test (D-03, Wave 1)
+- [x] 14-01-PLAN.md — Offline schema-branching BENCH-02 aggregator + unit test (D-03, Wave 1)
 - [ ] 14-02-PLAN.md — Kaggle CUDA driver: Part A correctness pre-flight + Part C CatBoost-GPU arm + kernel-metadata + gen() test (D-04, Wave 1)
 - [ ] 14-03-PLAN.md — Human-gated Kaggle CUDA run + BENCH-03-SIGNOFF.md aggregate sign-off (D-01/D-03/D-04, Wave 2, human-gated)
 
@@ -239,7 +239,7 @@ Plans (sequenced waves, D-01/D-02 sub-order + 2 shared prerequisite sub-waves):
 | 11. Depth>1 Histograms + Reduction Determinism + Newton Der2 | 4/5 | In Progress|  |
 | 12. Grow-Policy, Leaf-Method, Sampling & Categorical Coverage | 9/9 | Complete    | 2026-07-04 |
 | 13. Pairwise, Ranking, Multiclass, Ordered & Langevin Coverage | 10/10 | Complete    | 2026-07-04 |
-| 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 0/TBD | Not started | - |
+| 14. Comprehensive Kaggle CUDA Benchmark + Sign-Off | 1/3 | In Progress|  |
 
 ## Backlog (Deferred from v1.0)
 
