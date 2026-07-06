@@ -7,7 +7,8 @@ use crate::histogram::LeafStats;
 use crate::runtime::EScoreFunction;
 use crate::score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
-    multi_dim_split_score, random_score_instance, score_st_dev, MINIMAL_SCORE,
+    multi_dim_split_score, multi_dim_split_score_into, random_score_instance, score_st_dev,
+    MINIMAL_SCORE,
 };
 
 #[test]
@@ -45,6 +46,75 @@ fn multi_dim_split_score_dim1_equals_scalar_score() {
         l2_scalar.to_bits(),
         "L2 dim=1 multi-dim score must be BIT-identical to the scalar score"
     );
+}
+
+#[test]
+fn multi_dim_split_score_into_matches_alloc() {
+    // The scratch-reusing `multi_dim_split_score_into` returns byte-for-byte the
+    // same f64 as the allocating `multi_dim_split_score` (pure allocation hoisting,
+    // no reorder), for the same per-dim leaves, for BOTH Cosine and L2, at dim=1 and
+    // dim=2. Reusing the SAME (cleared) scratch across successive calls still yields
+    // identical results — proving clear-then-refill is order-preserving (21-07).
+    let per_dim_a = vec![vec![
+        LeafStats {
+            sum_weighted_delta: 4.0,
+            sum_weight: 3.0,
+        },
+        LeafStats {
+            sum_weighted_delta: -2.5,
+            sum_weight: 2.0,
+        },
+        LeafStats {
+            sum_weighted_delta: 1.0,
+            sum_weight: 1.0,
+        },
+        LeafStats {
+            sum_weighted_delta: 0.5,
+            sum_weight: 2.0,
+        },
+    ]];
+    let per_dim_b = vec![
+        vec![
+            LeafStats {
+                sum_weighted_delta: 2.0,
+                sum_weight: 1.0,
+            },
+            LeafStats {
+                sum_weighted_delta: -1.0,
+                sum_weight: 2.0,
+            },
+        ],
+        vec![
+            LeafStats {
+                sum_weighted_delta: 3.0,
+                sum_weight: 2.0,
+            },
+            LeafStats {
+                sum_weighted_delta: -0.5,
+                sum_weight: 1.0,
+            },
+        ],
+    ];
+    let scaled_l2 = 1.0;
+    // Caller-owned scratch, reused across EVERY call below (never re-allocated).
+    let mut num_scratch: Vec<f64> = Vec::new();
+    let mut den_scratch: Vec<f64> = Vec::new();
+    for &sf in &[EScoreFunction::Cosine, EScoreFunction::L2] {
+        let alloc_a = multi_dim_split_score(sf, &per_dim_a, scaled_l2);
+        let into_a =
+            multi_dim_split_score_into(&mut num_scratch, &mut den_scratch, sf, &per_dim_a, scaled_l2);
+        assert_eq!(into_a.to_bits(), alloc_a.to_bits(), "dim1 into vs alloc sf{sf:?}");
+
+        let alloc_b = multi_dim_split_score(sf, &per_dim_b, scaled_l2);
+        let into_b =
+            multi_dim_split_score_into(&mut num_scratch, &mut den_scratch, sf, &per_dim_b, scaled_l2);
+        assert_eq!(into_b.to_bits(), alloc_b.to_bits(), "dim2 into vs alloc sf{sf:?}");
+    }
+    // Third pass on the SAME scratch confirms clear-then-refill stays bit-identical.
+    let again =
+        multi_dim_split_score_into(&mut num_scratch, &mut den_scratch, EScoreFunction::Cosine, &per_dim_a, scaled_l2);
+    let ref_again = multi_dim_split_score(EScoreFunction::Cosine, &per_dim_a, scaled_l2);
+    assert_eq!(again.to_bits(), ref_again.to_bits(), "reused scratch bit-identity");
 }
 
 #[test]

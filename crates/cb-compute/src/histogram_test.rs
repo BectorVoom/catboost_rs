@@ -3,7 +3,8 @@
 
 use crate::histogram::{
     bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
-    scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram, LeafStats,
+    scan_and_score_borders, scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram,
+    LeafStats,
 };
 use crate::runtime::EScoreFunction;
 use crate::score::{l2_split_score, multi_dim_split_score};
@@ -453,5 +454,58 @@ fn scan_border_matches_rescan_multiclass() {
         let hist_score = multi_dim_split_score(EScoreFunction::Cosine, &per_dim, scaled_l2);
         let ref_score = multi_dim_split_score(EScoreFunction::Cosine, &ref_per_dim, scaled_l2);
         assert_eq!(hist_score, ref_score, "multiclass score border {b}");
+    }
+}
+
+#[test]
+fn fused_scan_score_bit_identical() {
+    // The fused `scan_and_score_borders` must return, per candidate border, EXACTLY
+    // (bit-for-bit, `to_bits()` equality — NOT approx) the same f64 score as the
+    // current two-step reference: `scan_borders_to_leaf_stats` then
+    // `multi_dim_split_score`. Cover BOTH score functions (Cosine default + L2) and
+    // BOTH dim=1 and dim=2. The inputs are exactly-representable small integers /
+    // halves so ANY cross-border or cross-dim fold reorder would surface as a bit
+    // difference (the parity guard for the scan+score fusion, 21-07).
+    let n = 8;
+    let der_d0 = [1.0, -2.0, 3.0, 0.5, -1.5, 2.0, 4.0, -0.5];
+    let der_d1 = [-0.5, 1.5, -1.0, 2.0, 0.5, -3.0, 1.0, 2.5];
+    let weight = vec![1.0_f64; n];
+    let borders0 = vec![2.0_f64];
+    let borders1 = vec![1.0_f64, 3.0, 4.5];
+    let f0 = vec![1.0_f32, 3.0, 2.5, 0.0, 4.0, 1.5, 3.5, 2.0];
+    let f1 = vec![0.5_f32, 2.0, 4.0, 1.0, 3.5, 0.0, 2.5, 5.0];
+    let feature_values = vec![f0.clone(), f1.clone()];
+    let feature_borders = vec![borders0.clone(), borders1.clone()];
+    let n_features = 2;
+    let n_bins = borders0.len().max(borders1.len()) + 1;
+    let leaf_of: Vec<usize> = (0..n)
+        .map(|o| usize::from(f64::from(f0[o]) > borders0[0]))
+        .collect();
+    let bins = bin_matrix(&feature_values, &feature_borders, n);
+    let scaled_l2 = 1.0;
+
+    for &dim in &[1usize, 2usize] {
+        // dimension-major der buffer of length dim*n.
+        let mut der1 = Vec::with_capacity(dim * n);
+        der1.extend_from_slice(&der_d0);
+        if dim == 2 {
+            der1.extend_from_slice(&der_d1);
+        }
+        let hist =
+            build_bucket_histogram(&bins, &der1, &weight, &leaf_of, 2, n_features, n_bins, dim);
+        for &sf in &[EScoreFunction::Cosine, EScoreFunction::L2] {
+            let fused = scan_and_score_borders(&hist, 1, borders1.len(), dim, sf, scaled_l2);
+            let scans = scan_borders_to_leaf_stats(&hist, 1, borders1.len(), dim);
+            assert_eq!(fused.len(), borders1.len(), "fused score count dim{dim}");
+            for b in 0..borders1.len() {
+                let per_dim = &scans[b];
+                let ref_score = multi_dim_split_score(sf, per_dim, scaled_l2);
+                assert_eq!(
+                    fused[b].to_bits(),
+                    ref_score.to_bits(),
+                    "fused vs two-step reference dim{dim} sf{sf:?} border {b}"
+                );
+            }
+        }
     }
 }
