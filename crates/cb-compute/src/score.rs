@@ -112,23 +112,59 @@ pub fn multi_dim_split_score(
     per_dim_leaves: &[Vec<LeafStats>],
     scaled_l2: f64,
 ) -> f64 {
+    // Thin wrapper: allocate two local fold buffers and delegate to the
+    // scratch-reusing `_into` variant. The result is byte-for-byte identical (the
+    // fold order and summands are unchanged) — this preserves every caller and every
+    // existing equivalence test while the hot split-finding path (`histogram.rs
+    // scan_and_score_borders`) reuses caller-owned scratch across all candidate
+    // borders to eliminate the per-candidate heap allocation (PERF-03, 21-07).
+    let mut num_scratch: Vec<f64> = Vec::new();
+    let mut den_scratch: Vec<f64> = Vec::new();
+    multi_dim_split_score_into(
+        &mut num_scratch,
+        &mut den_scratch,
+        score_function,
+        per_dim_leaves,
+        scaled_l2,
+    )
+}
+
+/// Scratch-reusing sibling of [`multi_dim_split_score`]: the EXACT same num/den
+/// fold, but the two short-lived `Vec<f64>` term buffers are supplied by the caller
+/// (`num_scratch`, `den_scratch`) and reused via `clear()` + the SAME `push`
+/// sequence instead of a fresh per-call allocation. Result is byte-for-byte
+/// identical to [`multi_dim_split_score`] (pure allocation hoisting — NO reorder):
+/// the num fold is `add_leaf_plain` pushed in dimension-then-leaf order and reduced
+/// through [`sum_f64`]; the Cosine den is the `1e-100` seed first, then
+/// `avrg²·SW` in dimension-then-leaf order, reduced through [`sum_f64`]. At dim=1 it
+/// stays bit-identical to the scalar [`l2_split_score`] / [`cosine_split_score`]
+/// (D-04). Called once per candidate border by
+/// [`crate::histogram::scan_and_score_borders`] with per-border-reused scratch, so
+/// the split-finding sweep does zero per-candidate heap allocation (PERF-03, 21-07).
+///
+/// The scratch contents on return are unspecified (they hold the last fold's terms);
+/// callers reuse them purely as working buffers.
+#[must_use]
+pub fn multi_dim_split_score_into(
+    num_scratch: &mut Vec<f64>,
+    den_scratch: &mut Vec<f64>,
+    score_function: crate::runtime::EScoreFunction,
+    per_dim_leaves: &[Vec<LeafStats>],
+    scaled_l2: f64,
+) -> f64 {
     use crate::runtime::EScoreFunction;
     // Numerator accumulator: the per-(dim,leaf) `avrg·SWD` terms across ALL dims,
-    // folded through the sanctioned ordered primitive (D-08). This is exactly the
-    // concatenation of each dimension's `l2_split_score` summands in dimension then
-    // leaf order, so at dim=1 it is byte-identical to `l2_split_score`.
-    // Pre-size to the total per-(dim,leaf) term count (IN-01) — consistent with the
-    // Cosine denominator's `with_capacity` and avoids reallocations as the nested
-    // loop pushes. Does not change the fold ORDER (still dimension-then-leaf), so
-    // the dim=1 byte-identity (D-04) is preserved.
-    let total_terms: usize = per_dim_leaves.iter().map(Vec::len).sum();
-    let mut num_terms: Vec<f64> = Vec::with_capacity(total_terms);
+    // folded through the sanctioned ordered primitive (D-08), in dimension-then-leaf
+    // order — byte-identical to `l2_split_score` at dim=1. The scratch is CLEARED
+    // (retaining its capacity) then refilled with the SAME push sequence the
+    // allocating variant used, so no reorder is introduced.
+    num_scratch.clear();
     for leaves in per_dim_leaves {
         for &stats in leaves {
-            num_terms.push(add_leaf_plain(stats, scaled_l2));
+            num_scratch.push(add_leaf_plain(stats, scaled_l2));
         }
     }
-    let numerator = sum_f64(&num_terms);
+    let numerator = sum_f64(num_scratch);
     match score_function {
         // NewtonL2 (`pointwise_scores.cu:504-510`) reuses the L2 calcer VERBATIM —
         // the second-order distinction is the histogram FILL (summed positive der2 in
@@ -139,16 +175,17 @@ pub fn multi_dim_split_score(
         EScoreFunction::Cosine | EScoreFunction::NewtonCosine => {
             // Denominator: the seeded `1e-100` first summand (matching the scalar
             // Cosine seed so dim=1 accumulation order is identical), then the
-            // per-(dim,leaf) `avrg²·SW` terms across all dims.
-            let mut den_terms: Vec<f64> = Vec::with_capacity(num_terms.len() + 1);
-            den_terms.push(1e-100);
+            // per-(dim,leaf) `avrg²·SW` terms across all dims — into the reused
+            // `den_scratch` (cleared first).
+            den_scratch.clear();
+            den_scratch.push(1e-100);
             for leaves in per_dim_leaves {
                 for &stats in leaves {
                     let avrg = calc_average(stats.sum_weighted_delta, stats.sum_weight, scaled_l2);
-                    den_terms.push(avrg * avrg * stats.sum_weight);
+                    den_scratch.push(avrg * avrg * stats.sum_weight);
                 }
             }
-            let denominator = sum_f64(&den_terms);
+            let denominator = sum_f64(den_scratch);
             numerator / denominator.sqrt()
         }
         // SolarL2 (`score_calcers.cuh:22-24`): per-leaf scalar
@@ -157,7 +194,10 @@ pub fn multi_dim_split_score(
         // IN-04: the GPU Solar/LOO/Sat calcers compute `(-sum*sum)/weight`-style
         // terms directly and do NOT apply the `scaled_l2` regularizer that L2 /
         // Cosine thread in (correct per `score_calcers.cuh` — do not "fix" by adding
-        // it). Hence `scaled_l2` is intentionally unused by these three arms.
+        // it). Hence `scaled_l2` is intentionally unused by these three arms. These
+        // three variants are GPU-only / CPU-unreachable (D-6.4-06), so they retain the
+        // simple allocating helper form (not on the hot n_bins sweep — no scratch win
+        // needed); the returned value is byte-identical to the allocating variant.
         EScoreFunction::SolarL2 => {
             let terms = solar_l2_terms(per_dim_leaves);
             sum_f64(&terms)

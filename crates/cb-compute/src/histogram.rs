@@ -828,3 +828,166 @@ pub fn scan_borders_to_leaf_stats(
     }
     out
 }
+
+/// FUSED single-pass border scan + split score (PERF-01 constant recovery,
+/// PERF-03): returns the per-border candidate score directly, WITHOUT ever
+/// materializing the full `Vec<Vec<Vec<LeafStats>>>` that
+/// [`scan_borders_to_leaf_stats`] builds and WITHOUT the per-candidate score-side
+/// `Vec<f64>` [`crate::multi_dim_split_score`] would allocate. For each candidate
+/// border `b` (0-indexed, corresponding to bin `b`), the `2·n_parent` per-dimension
+/// [`LeafStats`] are computed inline from a per-parent running prefix
+/// (FALSE = running prefix, TRUE = per-parent total − prefix — the EXACT values
+/// [`scan_borders_to_leaf_stats`] emits) into a single REUSED `per_dim` scratch, then
+/// scored through [`crate::score::multi_dim_split_score_into`] with caller-reused
+/// `num`/`den` fold buffers. The candidate order is border-ascending (index 0..
+/// `n_borders`); `result[b]` is the score for border `b`.
+///
+/// # Bit-identity (the parity guard, 21-07)
+/// The per-border score is byte-for-byte identical to
+/// `multi_dim_split_score(score_function, &scan_borders_to_leaf_stats(..)[b],
+/// scaled_l2)`. The fold is a FRESH `sum_f64` over all `2·n_parent` leaves in
+/// canonical dimension-then-leaf order PER border — NO running/incremental num/den
+/// is carried across borders (a cross-border reorder is FORBIDDEN, D-08 + the ≤1e-5
+/// crux). Only the FALSE-side per-parent weight/delta running prefix accumulates
+/// across borders (the same ascending `+=` `scan_borders_to_leaf_stats` already does,
+/// bit-identical); the TRUE side is `total − prefix` (the already-gated 21-06 reorder,
+/// unchanged). The fusion changes ONLY allocation lifetime, not arithmetic order —
+/// `fused_scan_score_bit_identical` (histogram_test) asserts `to_bits()` equality.
+///
+/// # Performance shape (measured, PERF-01 honest framing)
+/// At the CB_PERF harness (n=10000, nf=20, depth=6) per-tree time decomposes as a
+/// flat floor ≈1.7ms (binning + the `O(n·nf)` scatter build) + ~0.026 ms/bin. The
+/// n_bins-linear term IS this `O(n_bins·n_leaves·n_features)` split-scoring pass,
+/// which is n-INDEPENDENT (the histogram cell count does not depend on the row
+/// count) and hence ALGORITHMICALLY IRREDUCIBLE. Flatness across the n_bins sweep
+/// requires n ≫ n_bins·n_leaves, which FAILS here (n_bins·n_leaves ≈ 16K > 10K) and
+/// would only hold at n ≥ 100k; official CatBoost is itself ~2.1× (not flat) at this
+/// size. This fused path recovers the parity-safe ALLOCATION constant (eliminating
+/// the giant materialization + per-candidate score Vecs) — it does NOT, and cannot,
+/// make the sweep flat at this harness size.
+#[must_use]
+pub fn scan_and_score_borders(
+    hist: &BucketHistogram,
+    feature: usize,
+    n_borders: usize,
+    approx_dimension: usize,
+    score_function: crate::runtime::EScoreFunction,
+    scaled_l2: f64,
+) -> Vec<f64> {
+    use crate::score::multi_dim_split_score_into;
+
+    let n_parent = hist.n_leaves();
+    let n_bins = hist.n_bins();
+    let n_channels = hist.n_channels();
+    let dim = approx_dimension.max(1);
+    let weight_channel = approx_dimension; // channel index of Σ weight
+
+    // Per-parent totals (`sum_f64` over the whole weight / delta column, ONCE per
+    // parent — the same total `scan_borders_to_leaf_stats` computes). Flat arrays:
+    // `total_w[parent]`, `total_d[parent * dim + d]`.
+    let mut total_w = vec![0.0_f64; n_parent];
+    let mut total_d = vec![0.0_f64; n_parent.saturating_mul(dim)];
+    // Reused per-parent gather column for the total's ordered `sum_f64`.
+    let mut col = vec![0.0_f64; n_bins];
+    for parent in 0..n_parent {
+        let block = match hist.feature_block(parent, feature) {
+            Some(b) => b,
+            None => continue, // out-of-range parent/feature → zero totals (empty row).
+        };
+        for bin in 0..n_bins {
+            if let Some(slot) = col.get_mut(bin) {
+                *slot = block.get(bin * n_channels + weight_channel).copied().unwrap_or(0.0);
+            }
+        }
+        if let Some(slot) = total_w.get_mut(parent) {
+            *slot = sum_f64(&col);
+        }
+        for d in 0..approx_dimension {
+            for bin in 0..n_bins {
+                if let Some(slot) = col.get_mut(bin) {
+                    *slot = block.get(bin * n_channels + d).copied().unwrap_or(0.0);
+                }
+            }
+            if let Some(slot) = total_d.get_mut(parent * dim + d) {
+                *slot = sum_f64(&col);
+            }
+        }
+    }
+
+    // Per-parent FALSE-side running prefixes, carried across the border loop (the
+    // ONLY cross-border accumulation — bit-identical ascending `+=`, the same one
+    // `scan_borders_to_leaf_stats` does). `acc_false_w[parent]`,
+    // `acc_false_d[parent * dim + d]`.
+    let mut acc_false_w = vec![0.0_f64; n_parent];
+    let mut acc_false_d = vec![0.0_f64; n_parent.saturating_mul(dim)];
+    // REUSED per-border LeafStats scratch: `per_dim[d]` is `[2·n_parent]` leaves
+    // (indices 0..n_parent = FALSE children, n_parent..2·n_parent = TRUE children),
+    // in the exact canonical order `multi_dim_split_score` folds (dimension-then-leaf).
+    let mut per_dim: Vec<Vec<LeafStats>> = vec![vec![LeafStats::default(); 2 * n_parent]; dim];
+    // REUSED score-fold buffers (num / den) — zero per-candidate heap allocation.
+    let mut num_scratch: Vec<f64> = Vec::new();
+    let mut den_scratch: Vec<f64> = Vec::new();
+
+    let mut scores: Vec<f64> = Vec::with_capacity(n_borders);
+    for b in 0..n_borders {
+        for parent in 0..n_parent {
+            // Advance this parent's FALSE prefix by bin `b` (or leave it if the
+            // parent/feature block is absent — its stats stay zero, matching the
+            // `scan_borders_to_leaf_stats` `continue`).
+            let block = hist.feature_block(parent, feature);
+            let w_inc = block
+                .and_then(|blk| blk.get(b * n_channels + weight_channel))
+                .copied()
+                .unwrap_or(0.0);
+            let w_false = match acc_false_w.get_mut(parent) {
+                Some(a) => {
+                    *a += w_inc;
+                    *a
+                }
+                None => continue,
+            };
+            let w_true = total_w.get(parent).copied().unwrap_or(0.0) - w_false;
+            for d in 0..approx_dimension {
+                let d_inc = block
+                    .and_then(|blk| blk.get(b * n_channels + d))
+                    .copied()
+                    .unwrap_or(0.0);
+                let acc = match acc_false_d.get_mut(parent * dim + d) {
+                    Some(a) => {
+                        *a += d_inc;
+                        *a
+                    }
+                    None => continue,
+                };
+                let td = total_d.get(parent * dim + d).copied().unwrap_or(0.0);
+                let false_stats = LeafStats {
+                    sum_weighted_delta: acc,
+                    sum_weight: w_false,
+                };
+                let true_stats = LeafStats {
+                    sum_weighted_delta: td - acc,
+                    sum_weight: w_true,
+                };
+                if let Some(row) = per_dim.get_mut(d) {
+                    if let Some(slot) = row.get_mut(parent) {
+                        *slot = false_stats;
+                    }
+                    if let Some(slot) = row.get_mut(parent + n_parent) {
+                        *slot = true_stats;
+                    }
+                }
+            }
+        }
+        // FRESH per-border fold over all 2·n_parent leaves in dimension-then-leaf
+        // order (the reused scratch is cleared+refilled inside `_into`).
+        let score = multi_dim_split_score_into(
+            &mut num_scratch,
+            &mut den_scratch,
+            score_function,
+            &per_dim,
+            scaled_l2,
+        );
+        scores.push(score);
+    }
+    scores
+}

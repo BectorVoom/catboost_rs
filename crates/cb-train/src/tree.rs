@@ -33,7 +33,7 @@ use cb_compute::{
     bin_of, build_bucket_histogram, calculate_pairwise_score,
     compute_der_sums as compute_pairwise_der_sums, compute_pair_weight_statistics,
     cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
-    reduce_leaf_stats, scale_l2_reg, scan_border_to_leaf_stats, scan_borders_to_leaf_stats,
+    reduce_leaf_stats, scale_l2_reg, scan_and_score_borders, scan_border_to_leaf_stats,
     BucketHistogram, EScoreFunction, GroupSpan, LeafStats, MINIMAL_SCORE,
 };
 
@@ -629,9 +629,10 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 ///   INCREMENTALLY (once per chosen split, forward-bit) instead of reassigned per
 ///   candidate.
 /// - `hist`: the current level's per-`(leaf, feature, bin)` [`BucketHistogram`].
-///   Each candidate is scored by an `O(n_bins)` prefix scan over this histogram
-///   ([`scan_borders_to_leaf_stats`]) fed to the UNCHANGED score math — the O(n)
-///   binning cost is paid ONCE per level, not once per candidate (PERF-01).
+///   Each candidate is scored by an `O(n_bins)` FUSED prefix scan + score over this
+///   histogram ([`scan_and_score_borders`]) — the O(n) binning cost is paid ONCE per
+///   level, not once per candidate (PERF-01), and the scan and the score share one
+///   pass with no per-candidate materialization / allocation (PERF-03).
 ///
 /// The histogram is a fixed-size buffer reused across levels (no per-candidate
 /// allocation storm, Spike 004); each level transition derives the next level's
@@ -799,10 +800,10 @@ impl GrowScratch {
 
 /// One level of the UNPERTURBED search: enumerate candidates in upstream order
 /// (FLOAT features, feature ascending × border ascending; `AddFloatFeatures`),
-/// score each from the current level's [`BucketHistogram`] via an `O(n_bins)`
-/// prefix scan ([`scan_borders_to_leaf_stats`]) fed to the UNCHANGED
-/// [`multi_dim_split_score`], and pick the strict first-wins best. No RNG draws
-/// (the first-slice / D-04 path).
+/// score each from the current level's [`BucketHistogram`] via a FUSED `O(n_bins)`
+/// prefix scan + score ([`scan_and_score_borders`], bit-identical to the prior
+/// [`scan_borders_to_leaf_stats`] + [`multi_dim_split_score`]), and pick the strict
+/// first-wins best. No RNG draws (the first-slice / D-04 path).
 ///
 /// This replaces the per-candidate `assign_leaves` + `reduce_leaf_stats` rescan
 /// (PERF-01): the histogram is built once per level in [`GrowScratch`], and every
@@ -837,16 +838,26 @@ fn select_level_plain(
             if borders.is_empty() {
                 return Vec::new();
             }
-            // ONE O(n_bins) prefix scan per border, derived from the per-level
-            // histogram (not a per-candidate dataset rescan).
-            let scans = scan_borders_to_leaf_stats(&scratch.hist, feature, borders.len(), dim);
+            // FUSED single-pass O(n_bins) scan + score over this feature's borders,
+            // derived from the per-level histogram (not a per-candidate dataset
+            // rescan). `scan_and_score_borders` reuses task-local scratch across all
+            // borders — no full `Vec<Vec<Vec<LeafStats>>>` materialization and no
+            // per-candidate score `Vec` (PERF-03). The per-border score is
+            // byte-for-byte the prior `scan_borders_to_leaf_stats` +
+            // `multi_dim_split_score` result (dim=1 byte-identical to the scalar split,
+            // D-04). All scratch is allocated INSIDE this rayon `.map` closure, so it
+            // is per-task-local — no cross-thread mutation (Pitfall 5 determinism).
+            let raw_scores = scan_and_score_borders(
+                &scratch.hist,
+                feature,
+                borders.len(),
+                dim,
+                score_function,
+                scaled_l2,
+            );
             let mut local = Vec::with_capacity(borders.len());
             for (bi, &border) in borders.iter().enumerate() {
-                let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
-                // UNCHANGED score math over the scan-derived per-dimension LeafStats —
-                // the same call the prior `multi_dim_candidate_score` made (dim=1 is
-                // byte-identical to the scalar split, D-04).
-                let raw = multi_dim_split_score(score_function, per_dim, scaled_l2);
+                let raw = raw_scores.get(bi).copied().unwrap_or(MINIMAL_SCORE);
                 // FEAT-04: multiplicative feature_weight + subtractive first-use /
                 // per-object penalties (the two upstream insertion points). The no-op
                 // context leaves `raw` untouched.
@@ -922,15 +933,25 @@ fn select_level_perturbed(
         feat_rng.advance(10);
         task_idx += 1;
 
-        // ONE O(n_bins) prefix scan per border, from the per-level histogram — the
-        // per-border loop shape (and thus the RNG draw count/order) is untouched.
-        let scans = scan_borders_to_leaf_stats(&scratch.hist, feature, borders.len(), dim);
+        // FUSED single-pass O(n_bins) scan + score over this feature's borders, from
+        // the per-level histogram — the per-border loop shape (and thus the RNG draw
+        // count/order) is untouched; only the SOURCE of each `raw` changes. Scratch is
+        // this-feature-local (allocated per `scan_and_score_borders` call), no
+        // per-candidate `Vec` (PERF-03), byte-identical `raw` to the prior two-step
+        // path (Pitfall 3: exactly one `std_normal` per border, same order/count).
+        let raw_scores = scan_and_score_borders(
+            &scratch.hist,
+            feature,
+            borders.len(),
+            dim,
+            score_function,
+            scaled_l2,
+        );
         let mut best_instance = MINIMAL_SCORE;
         let mut best_border: f64 = 0.0;
         let mut best_raw: f64 = MINIMAL_SCORE;
         for (bi, &border) in borders.iter().enumerate() {
-            let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
-            let raw = multi_dim_split_score(score_function, per_dim, scaled_l2);
+            let raw = raw_scores.get(bi).copied().unwrap_or(MINIMAL_SCORE);
             // scoreInstance = scoreWoNoise + std_normal(featRng) * scoreStDev.
             let instance = random_score_instance(raw, std_dev, &mut feat_rng);
             // Strict `>` first-wins on the per-feature border (SetBestScore).
@@ -1029,10 +1050,11 @@ fn unsplit_leaf_score(
 /// scoring core). Enumerates candidates in the SAME upstream order the oblivious
 /// path uses (float feature ascending, border ascending) and scores each 2-leaf
 /// `{value <= border, value > border}` partition from a per-leaf
-/// [`BucketHistogram`] built ONCE over this leaf's docs + an `O(n_bins)` prefix
-/// scan ([`scan_borders_to_leaf_stats`]) fed to the UNCHANGED score calcer — the
-/// histogram scorer (PERF-02), replacing the old per-candidate `reduce_leaf_stats`
-/// full-subset rescan. Keeps the strict first-wins best
+/// [`BucketHistogram`] built ONCE over this leaf's docs + a FUSED `O(n_bins)` prefix
+/// scan + score ([`scan_and_score_borders`], bit-identical to the scalar
+/// `split_score` at dim=1) — the histogram scorer (PERF-02), replacing the old
+/// per-candidate `reduce_leaf_stats` full-subset rescan. Keeps the strict first-wins
+/// best
 /// ([`select_best_candidate`] semantics — strict `>`). The reported GAIN is
 /// `best_2leaf_score - unsplit_score`; the leaf is splittable only when
 /// `docs.len() >= min_data_in_leaf`, a candidate exists, and `gain >= 1e-9`
@@ -1125,17 +1147,19 @@ fn best_split_for_leaf(
         if borders.is_empty() {
             continue;
         }
-        // ONE `O(n_bins)` prefix scan per border from the per-leaf histogram: the
-        // FALSE child (`bins <= border`) is leaf index 0, the TRUE child
-        // (`bins > border`) is leaf index 1 — byte-for-byte the leaf order the old
-        // `reduce_leaf_stats(leaf_of = passes as 0/1, .., 2)` produced.
-        let scans = scan_borders_to_leaf_stats(&hist, feature, borders.len(), approx_dim);
+        // FUSED single-pass `O(n_bins)` scan + score per border from the per-leaf
+        // histogram: the FALSE child (`bins <= border`) is leaf index 0, the TRUE
+        // child (`bins > border`) is leaf index 1 — byte-for-byte the leaf order the
+        // old `reduce_leaf_stats(leaf_of = passes as 0/1, .., 2)` produced. At dim=1
+        // `scan_and_score_borders`'s `multi_dim_split_score_into` seam is bit-identical
+        // to the scalar `split_score` (the `multi_dim_split_score_dim1_equals_scalar`
+        // D-04 anchor + Task 1's `fused_scan_score_bit_identical`), so routing dim=1
+        // through the fused seam preserves the exact scores. No per-candidate `Vec`
+        // (PERF-03).
+        let raw_scores =
+            scan_and_score_borders(&hist, feature, borders.len(), approx_dim, score_function, scaled_l2);
         for (bi, &border) in borders.iter().enumerate() {
-            // dim == 1: `per_dim[0]` is `[false_stats, true_stats]` — the exact
-            // `&[LeafStats]` the pre-rewrite `split_score` consumed.
-            let per_dim = scans.get(bi).map_or(&[][..], Vec::as_slice);
-            let stats = per_dim.first().map_or(&[][..], Vec::as_slice);
-            let score = split_score(score_function, stats, scaled_l2);
+            let score = raw_scores.get(bi).copied().unwrap_or(MINIMAL_SCORE);
             // STRICT `>` first-wins (Pitfall 1): the FIRST candidate reaching the
             // running max wins; later equal-gain candidates do NOT replace it.
             if score > best_score {

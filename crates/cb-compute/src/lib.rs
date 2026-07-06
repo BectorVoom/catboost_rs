@@ -39,7 +39,8 @@ pub use embedding_calcers::{
 };
 pub use histogram::{
     bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
-    scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram, LeafStats,
+    scan_and_score_borders, scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram,
+    LeafStats,
 };
 pub use lda_linalg::{
     calculate_projection, jacobi_symmetric_eig, reduce_generalized, sgemv_rowmajor, SymmetricEig,
@@ -80,7 +81,8 @@ pub use runtime::{
 };
 pub use score::{
     add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
-    multi_dim_split_score, random_score_instance, score_st_dev, MINIMAL_SCORE,
+    multi_dim_split_score, multi_dim_split_score_into, random_score_instance, score_st_dev,
+    MINIMAL_SCORE,
 };
 pub use text_calcers::{
     bag_of_words_compute, bm25_compute, naive_bayes_compute, Bm25State, NaiveBayesState,
