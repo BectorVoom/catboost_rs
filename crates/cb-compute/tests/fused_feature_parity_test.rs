@@ -39,16 +39,20 @@ use cb_compute::{
 };
 
 /// Lifted from `spike006_fused_parallel_test.rs::make_inputs`: same splitmix64
-/// generator — feature-major bins + a per-object der1 (dim=1) + unit weight + a
-/// mid-tree partition.
+/// generator — feature-major bins + a per-object, DIMENSION-major der1
+/// (`der1[d * n + i]`, `dim` output channels) + unit weight + a mid-tree partition.
+/// For `dim == 1` this produces EXACTLY the same `der1` values as the original
+/// single-dimension generator (`(f + 0) % 2 == 0` reduces to `f % 2 == 0`), so the
+/// existing dim=1 callers are unaffected byte-for-byte (WR-01).
 fn make_inputs(
     n: usize,
     nf: usize,
     nbins: usize,
     n_leaves: usize,
+    dim: usize,
 ) -> (Vec<u32>, Vec<f64>, Vec<f64>, Vec<usize>) {
     let mut bins = vec![0u32; nf * n];
-    let mut der1 = vec![0.0f64; n];
+    let mut der1 = vec![0.0f64; dim.max(1) * n];
     for f in 0..nf {
         for i in 0..n {
             let mut z = (i as u64)
@@ -60,7 +64,9 @@ fn make_inputs(
             let v = (z >> 11) as f64 / (1u64 << 53) as f64; // [0,1)
             bins[f * n + i] = ((v * nbins as f64) as usize).min(nbins - 1) as u32;
             if f < 5 {
-                der1[i] += v * if f % 2 == 0 { 1.0 } else { -1.0 };
+                for d in 0..dim.max(1) {
+                    der1[d * n + i] += v * if (f + d) % 2 == 0 { 1.0 } else { -1.0 };
+                }
             }
         }
     }
@@ -70,14 +76,16 @@ fn make_inputs(
 }
 
 /// One level-0 shape: fused per-feature scores == two-pass scores, byte-for-byte,
-/// for EVERY (feature, border). One `FusedFeatureScratch` is reused across features
-/// (D-07) — proving reuse does not perturb the bits.
-fn check_level0(n: usize, nf: usize, nbins: usize, n_leaves: usize) {
-    let dim = 1usize;
+/// for EVERY (feature, border), at the given `dim` (`approx_dimension`). One
+/// `FusedFeatureScratch` is reused across features (D-07) — proving reuse does not
+/// perturb the bits. `dim >= 2` exercises the multiclass fused path (WR-01): the
+/// per-dimension FALSE prefix / `total_d` indexing in `scan_and_score_borders_into`
+/// (`histogram.rs`) and the per-channel build in `build_bucket_histogram_into`.
+fn check_level0(n: usize, nf: usize, nbins: usize, n_leaves: usize, dim: usize) {
     let sf = EScoreFunction::L2;
     let l2 = 3.0f64;
     let n_borders = nbins - 1;
-    let (bins, der1, weight, leaf_of) = make_inputs(n, nf, nbins, n_leaves);
+    let (bins, der1, weight, leaf_of) = make_inputs(n, nf, nbins, n_leaves, dim);
 
     // Reference: serial whole-partition build over ALL features, then per-feature score.
     let hist = build_bucket_histogram(&bins, &der1, &weight, &leaf_of, n_leaves, nf, nbins, dim);
@@ -103,14 +111,14 @@ fn check_level0(n: usize, nf: usize, nbins: usize, n_leaves: usize) {
         assert_eq!(
             reference.len(),
             fused.len(),
-            "border count mismatch at feature {f} (shape n={n} nf={nf} nbins={nbins})"
+            "border count mismatch at feature {f} (shape n={n} nf={nf} nbins={nbins} dim={dim})"
         );
         for b in 0..reference.len() {
             assert_eq!(
                 reference[b].to_bits(),
                 fused[b].to_bits(),
                 "fused diverged from two-pass at (feature {f}, border {b}) \
-                 for shape n={n} nf={nf} nbins={nbins} n_leaves={n_leaves}"
+                 for shape n={n} nf={nf} nbins={nbins} n_leaves={n_leaves} dim={dim}"
             );
         }
     }
@@ -119,8 +127,19 @@ fn check_level0(n: usize, nf: usize, nbins: usize, n_leaves: usize) {
 #[test]
 fn fused_equals_two_pass_level0() {
     // Wide-feature AND low-feature/high-bin — the two contrasting shapes (D-05).
-    check_level0(10_000, 20, 128, 32);
-    check_level0(40_000, 8, 254, 16);
+    check_level0(10_000, 20, 128, 32, 1);
+    check_level0(40_000, 8, 254, 16, 1);
+}
+
+/// WR-01: the byte-identity guard above only ever exercised `dim == 1`, but
+/// `select_level_plain` / `select_level_perturbed` are reachable with
+/// `approx_dimension > 1` (oblivious multiclass training). Lock the fused path at
+/// `dim >= 2` on the same two contrasting shapes, so a per-dimension channel-offset
+/// or `total_d` mis-indexing regression trips this always-run net.
+#[test]
+fn fused_equals_two_pass_level0_multiclass() {
+    check_level0(10_000, 20, 128, 32, 3);
+    check_level0(40_000, 8, 254, 16, 2);
 }
 
 #[test]
