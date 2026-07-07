@@ -210,7 +210,7 @@ Plans:
   3. The subtraction trick (child = parent − sibling) is preserved within the fused per-feature path, and per-task scratch is reused (rayon `map_init` / per-thread pool), not allocated inside the `.map` closure (PERF-04)
   4. A documented 1→16-thread scaling curve on the Spike-002 grid (`CB_PERF` harness) shows per-level / per-tree speedup recovered from the ~1.7× two-pass ceiling to ≥3× at 16 threads, with the determinism test still green single- vs multi-threaded (PERF-04)
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 **Wave 1**
 
 - [x] 21.5-01-PLAN.md — cb-compute single-feature fused accumulate+score primitive (build/scan `_into` + `FusedFeatureScratch`, D-07) + RED-first byte-identity guard test (D-05)
@@ -221,7 +221,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 21.5-03-PLAN.md — fuse `select_level_perturbed`, preserving the Pitfall-3 RNG draw contract byte-for-byte (D-02)
+- [x] 21.5-03-PLAN.md — fuse `select_level_perturbed`, preserving the Pitfall-3 RNG draw contract byte-for-byte (D-02)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -260,7 +260,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |
 | 20. Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics | v1.2 | 0/TBD | Not started | - |
 | 21. CPU Split-Finding Histogram Rewrite | v1.2 | 7/7 | Complete   | 2026-07-05 |
-| 21.5. CPU Parallel-Scaling — Fused Feature-Parallel Histogram | v1.2 | 2/4 | In Progress|  |
+| 21.5. CPU Parallel-Scaling — Fused Feature-Parallel Histogram | v1.2 | 3/4 | In Progress|  |
 | 22. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
