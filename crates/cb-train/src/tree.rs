@@ -33,8 +33,9 @@ use cb_compute::{
     bin_of, build_bucket_histogram, calculate_pairwise_score,
     compute_der_sums as compute_pairwise_der_sums, compute_pair_weight_statistics,
     cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
-    reduce_leaf_stats, scale_l2_reg, scan_and_score_borders, scan_border_to_leaf_stats,
-    BucketHistogram, EScoreFunction, GroupSpan, LeafStats, MINIMAL_SCORE,
+    reduce_leaf_stats, scale_l2_reg, scan_and_score_borders, scan_and_score_borders_into,
+    scan_border_to_leaf_stats, BucketHistogram, EScoreFunction, GroupSpan, LeafStats,
+    ScanScoreScratch, MINIMAL_SCORE,
 };
 
 /// Dispatch the configured split-score calcer over reduced leaf statistics.
@@ -620,31 +621,41 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 }
 
 /// The reusable across-level grow state (the `TLearnContext` analogue, CONTEXT
-/// §Parallelism / PERF-03). It replaces the per-candidate `assign_leaves`
-/// + `reduce_leaf_stats` full-dataset rescan with a per-LEVEL histogram:
+/// §Parallelism / PERF-04). It replaces the per-candidate `assign_leaves`
+/// + `reduce_leaf_stats` full-dataset rescan with a per-LEVEL, PER-FEATURE
+/// histogram:
 ///
 /// - `bins`: the quantized per-feature bin matrix, built ONCE at construction
 ///   (feature-major `bins[feature * n_objects + obj]`, via [`bin_of`]).
 /// - `leaf_of`: the current-partition leaf index per object, maintained
 ///   INCREMENTALLY (once per chosen split, forward-bit) instead of reassigned per
 ///   candidate.
-/// - `hist`: the current level's per-`(leaf, feature, bin)` [`BucketHistogram`].
-///   Each candidate is scored by an `O(n_bins)` FUSED prefix scan + score over this
-///   histogram ([`scan_and_score_borders`]) — the O(n) binning cost is paid ONCE per
-///   level, not once per candidate (PERF-01), and the scan and the score share one
-///   pass with no per-candidate materialization / allocation (PERF-03).
+/// - `feature_hists`: the current level's per-FEATURE single-feature
+///   [`BucketHistogram`] (`feature_hists[f]` has `n_features == 1`,
+///   `n_leaves == 1 << level`). Splitting the old whole-partition histogram into one
+///   histogram per INDEPENDENT feature is byte-for-byte identical (the bins are
+///   feature-major, so each cell belongs to exactly one feature, D-03) and lets the
+///   per-level accumulate + score run INSIDE the rayon parallel-over-features region
+///   (PERF-04 / Spike 006 fused feature-parallel histogram), collapsing the serial
+///   fraction Spike 005 root-caused. Each feature's borders are scored by an
+///   `O(n_bins)` FUSED prefix scan + score over its own histogram
+///   ([`scan_and_score_borders_into`]).
 ///
-/// The histogram is a fixed-size buffer reused across levels (no per-candidate
-/// allocation storm, Spike 004); each level transition derives the next level's
-/// histogram from the current one with the SUBTRACTION TRICK
-/// ([`GrowScratch::advance`]).
+/// The per-feature histograms are derived across levels with the SUBTRACTION TRICK
+/// ([`derive_feature_level_hist`]): the smaller sibling's per-feature stats are
+/// built directly and the larger derived by `parent − sibling`, per feature —
+/// parallelization is orthogonal to the sub-trick and both compose (D-06). The
+/// derivation is byte-identical to the previous whole-partition
+/// `relocate_sub`/`add_relocated` decomposition (each cell belongs to one feature).
 struct GrowScratch {
     /// Feature-major quantized bins: `bins[feature * n_objects + obj]`.
     bins: Vec<u32>,
     /// Current-partition leaf index per object (`0..1 << level`), incremental.
     leaf_of: Vec<usize>,
-    /// The current level's per-`(leaf, feature, bin)` histogram.
-    hist: BucketHistogram,
+    /// The current level's per-FEATURE single-feature histogram
+    /// (`feature_hists[f]`: `n_features == 1`, `n_leaves == 1 << level`). Retained
+    /// as the parent store the next level derives from via the subtraction trick.
+    feature_hists: Vec<BucketHistogram>,
     /// Number of float features histogrammed.
     n_features: usize,
     /// Global bins per feature (`max(n_borders) + 1`).
@@ -689,12 +700,24 @@ impl GrowScratch {
             (der1.len() / n_objects).max(1)
         };
         let leaf_of = vec![0usize; n_objects];
-        let hist =
-            build_bucket_histogram(&bins, der1, weight, &leaf_of, 1, n_features, n_bins, approx_dim);
+        // Build the level-0 (single root leaf) histogram PER FEATURE, in parallel
+        // over independent features (PERF-04). Each `feature_hists[f]` is a
+        // single-feature (`n_features == 1`) histogram over that feature's contiguous
+        // feature-major column `bins[f*n_objects .. (f+1)*n_objects]`; because the
+        // bins are feature-major, a 1-feature build folds each cell's members in the
+        // SAME ascending-object `scatter_add_f64` order as the whole-partition
+        // `build_bucket_histogram`, so the cells are byte-for-byte identical (D-03).
+        let feature_hists: Vec<BucketHistogram> = (0..n_features)
+            .into_par_iter()
+            .map(|feature| {
+                let col = feature_col(&bins, feature, n_objects);
+                build_bucket_histogram(col, der1, weight, &leaf_of, 1, 1, n_bins, approx_dim)
+            })
+            .collect();
         Self {
             bins,
             leaf_of,
-            hist,
+            feature_hists,
             n_features,
             n_bins,
             approx_dim,
@@ -702,25 +725,36 @@ impl GrowScratch {
         }
     }
 
-    /// Reunite the FALSE-child (low slots) and TRUE-child (high slots) halves of a
-    /// level transition, whose non-zero cells are disjoint, via the single-pass
-    /// [`BucketHistogram::add`] (`a + b` in one allocation). Each add is a cell-wise
-    /// f64 op (O(cells), independent of `n`), so no per-object rescan is introduced;
-    /// the previous `a − (0 − b)` triple-`remove` identity is replaced by one pass
-    /// (bit-identical, the dominant per-level cost at large `n_bins`, PERF-01).
-    fn hist_add(a: &BucketHistogram, b: &BucketHistogram) -> BucketHistogram {
-        a.add(b)
+    /// The CHEAP per-level transition after `split` is chosen: advance `leaf_of`
+    /// incrementally (forward-bit — the new split occupies the highest bit, so
+    /// `leaf' = leaf + (passes ? 1<<L : 0)`, byte-identical to
+    /// `assign_leaves(chosen ++ split)`) and bump `level`. This does NOT touch the
+    /// per-feature histograms: the FUSED plain path ([`select_level_plain`]) derives
+    /// each feature's next-level histogram INSIDE its own rayon task (D-01/D-06), so
+    /// the whole-partition build is gone from the per-level hot path.
+    fn advance_leaf_only(&mut self, matrix: &FeatureMatrix, split: &Split, n_objects: usize) {
+        let n_parent = 1usize << self.level;
+        let parent = &self.leaf_of;
+        let next_leaf_of: Vec<usize> = (0..n_objects)
+            .map(|o| {
+                let base = parent.get(o).copied().unwrap_or(0);
+                base + if matrix.passes(split, o) { n_parent } else { 0 }
+            })
+            .collect();
+        self.leaf_of = next_leaf_of;
+        self.level += 1;
     }
 
-    /// Advance from level `L` to `L+1` after `split` is chosen. Updates `leaf_of`
-    /// incrementally (forward-bit: the new split occupies the highest bit, so
-    /// `leaf' = leaf + (passes ? 1<<L : 0)` — byte-identical to
-    /// `assign_leaves(chosen ++ split)`) and derives the next level's histogram
-    /// with the SUBTRACTION TRICK (upstream `FixUpStats`, `scoring.cpp:315`): build
-    /// the SMALLER sibling directly and derive the LARGER = parent − smaller. Both
-    /// siblings land in their canonical forward-bit slots (false child = parent
-    /// leaf `p`, true child = `p + n_parent`), so the derived histogram is
-    /// scannable exactly like a freshly-built one.
+    /// Advance from level `L` to `L+1` after `split` is chosen AND derive the next
+    /// level's per-feature histograms (the PERTURBED-path transition, which scores
+    /// from the retained `feature_hists` rather than fusing the derivation into its
+    /// own — RNG-ordered — feature loop). First updates `leaf_of` + `level`
+    /// ([`Self::advance_leaf_only`]), then derives each feature's next-level
+    /// histogram from its retained parent via the SUBTRACTION TRICK
+    /// ([`derive_feature_level_hist`]), PER FEATURE and in parallel over independent
+    /// features (PERF-04). Byte-identical to the previous whole-partition
+    /// `relocate_sub`/`add_relocated` decomposition (each cell belongs to one
+    /// feature, D-03/D-06).
     fn advance(
         &mut self,
         matrix: &FeatureMatrix,
@@ -729,72 +763,119 @@ impl GrowScratch {
         split: &Split,
         n_objects: usize,
     ) {
-        let n_parent = 1usize << self.level;
-        let n_next = n_parent << 1;
+        // (i) cheap partition transition: `leaf_of` becomes the level-(L+1) partition,
+        // `level` becomes L+1.
+        self.advance_leaf_only(matrix, split, n_objects);
+        // (ii) per-feature histogram derivation from the retained parents, reading the
+        // now-level-(L+1) `leaf_of` (which encodes the chosen split in its highest
+        // bit — `derive_feature_level_hist` reconstructs the parent partition + passes
+        // from it). Parallel over independent features; each writes a fresh Vec so the
+        // immutable `self.feature_hists` borrow is released before the write-back.
         let dim = self.approx_dim;
-        let nf = self.n_features;
-        let nb = self.n_bins;
-        // Objects whose leaf index is >= n_leaves are ignored by the builder — the
-        // sentinel places an object OUT of the histogram (used to build one sibling).
-        let sentinel = usize::MAX;
-
-        let passes: Vec<bool> = (0..n_objects).map(|o| matrix.passes(split, o)).collect();
-        let n_true = passes.iter().filter(|&&p| p).count();
-        let n_false = n_objects.saturating_sub(n_true);
-
-        let parent = &self.leaf_of;
-        let pget = |o: usize| parent.get(o).copied().unwrap_or(0);
-        let pass = |o: usize| passes.get(o).copied().unwrap_or(false);
-        let build = |assign: &[usize], nl: usize| {
-            build_bucket_histogram(&self.bins, der1, weight, assign, nl, nf, nb, dim)
-        };
-
-        let next_hist = if self.hist.n_leaves() != n_parent {
-            // Defensive: histogram shape drifted from the tracked partition — fall
-            // back to a fresh full rebuild (still O(n)/level, T-21-05).
-            let next_leaf: Vec<usize> = (0..n_objects)
-                .map(|o| pget(o) + if pass(o) { n_parent } else { 0 })
-                .collect();
-            build(&next_leaf, n_next)
-        } else if n_true <= n_false {
-            // TRUE is the smaller sibling → build ONLY it ONCE (one O(n) scatter) in
-            // its low slots. Derive the FALSE (larger) child = parent − true directly
-            // from the RETAINED parent (`self.hist`) via the fused relocate_sub
-            // (relocate parent into low slots − the true sibling), then reunite with
-            // the smaller sibling relocated into the high slots — each a single
-            // allocation (WR-04, PERF-01). Three total-sized allocs, not five.
-            let true_low_assign: Vec<usize> = (0..n_objects)
-                .map(|o| if pass(o) { pget(o) } else { sentinel })
-                .collect();
-            let h_true_low = build(&true_low_assign, n_next);
-            // FALSE (larger) in low slots = relocate(parent, 0) − true_low (fused).
-            let h_false_low = self.hist.relocate_sub(n_next, 0, &h_true_low);
-            // Result = false_low (low) + relocate(true_low, n_parent) (high), fused.
-            h_false_low.add_relocated(&h_true_low, n_parent)
-        } else {
-            // FALSE is the smaller sibling → build ONLY it ONCE (one O(n) scatter) in
-            // its low slots. Derive the TRUE (larger) child = parent − false directly
-            // from the RETAINED parent relocated into the HIGH slots via the fused
-            // relocate_sub, then reunite with the smaller sibling — three allocs.
-            let false_low_assign: Vec<usize> = (0..n_objects)
-                .map(|o| if pass(o) { sentinel } else { pget(o) })
-                .collect();
-            let h_false_low = build(&false_low_assign, n_next);
-            // TRUE (larger) in low slots = relocate(parent, 0) − false_low (fused).
-            let h_true_low = self.hist.relocate_sub(n_next, 0, &h_false_low);
-            // Result = false_low (low) + relocate(true_low, n_parent) (high), fused.
-            h_false_low.add_relocated(&h_true_low, n_parent)
-        };
-
-        // Incrementally advance the partition (forward-bit, new split highest bit).
-        // Computed into a fresh buffer so the `parent`/`pget` immutable borrow above
-        // is released before the write-back.
-        let next_leaf_of: Vec<usize> = (0..n_objects)
-            .map(|o| pget(o) + if pass(o) { n_parent } else { 0 })
+        let n_bins = self.n_bins;
+        let level = self.level;
+        let bins = &self.bins;
+        let leaf_of = &self.leaf_of;
+        let parents = &self.feature_hists;
+        let next_hists: Vec<BucketHistogram> = (0..self.n_features)
+            .into_par_iter()
+            .map(|feature| {
+                let parent_hist = parents.get(feature);
+                let col = feature_col(bins, feature, n_objects);
+                derive_feature_level_hist(parent_hist, col, der1, weight, leaf_of, level, n_bins, dim)
+            })
             .collect();
-        self.leaf_of = next_leaf_of;
-        self.hist = next_hist;
-        self.level += 1;
+        self.feature_hists = next_hists;
+    }
+}
+
+/// This feature's contiguous, feature-major bin column
+/// `bins[feature * n_objects .. (feature + 1) * n_objects]`, or an empty slice if
+/// the index arithmetic falls out of range (defensive — no raw indexing, T-21-01).
+fn feature_col(bins: &[u32], feature: usize, n_objects: usize) -> &[u32] {
+    let start = match feature.checked_mul(n_objects) {
+        Some(s) => s,
+        None => return &[],
+    };
+    let end = match start.checked_add(n_objects) {
+        Some(e) => e,
+        None => return &[],
+    };
+    bins.get(start..end).unwrap_or(&[])
+}
+
+/// Derive ONE feature's level-`level` single-feature histogram from its retained
+/// level-`(level-1)` parent via the SUBTRACTION TRICK (upstream `FixUpStats`,
+/// `scoring.cpp:315`), reusing the buffer-free single-feature primitives.
+///
+/// `leaf_of` is the CURRENT (level-`level`) partition; because it is built
+/// forward-bit as `parent_leaf + passes * n_parent` with the newest split in the
+/// highest bit, the parent partition (`leaf_of & (n_parent - 1)`) and the split
+/// outcome (`leaf_of & n_parent`) are reconstructed from it — no separate `passes`
+/// state is threaded. The smaller GLOBAL sibling (`n_true <= n_false`) is built
+/// directly in its low slots; the larger is derived `parent − smaller` via
+/// [`BucketHistogram::relocate_sub`]; the two are reunited in their canonical
+/// forward-bit slots (false child `p`, true child `p + n_parent`) via
+/// [`BucketHistogram::add_relocated`]. This is bit-for-bit the previous
+/// whole-partition derivation restricted to this feature's cells (each cell belongs
+/// to exactly one feature, D-03/D-06). On a parent-shape drift the feature's level
+/// histogram is freshly rebuilt from `leaf_of` (still `O(n)`/level, T-21-05).
+#[allow(clippy::too_many_arguments)]
+fn derive_feature_level_hist(
+    parent_hist: Option<&BucketHistogram>,
+    col: &[u32],
+    der1: &[f64],
+    weight: &[f64],
+    leaf_of: &[usize],
+    level: usize,
+    n_bins: usize,
+    dim: usize,
+) -> BucketHistogram {
+    let n_objects = leaf_of.len();
+    // `level >= 1` here (level 0 fresh-builds, never derives). n_parent = 2^(level-1).
+    let n_parent = 1usize << level.saturating_sub(1);
+    let n_next = 1usize << level;
+    // Objects whose leaf index is >= n_leaves are ignored by the builder — the
+    // sentinel places an object OUT of the histogram (used to build one sibling).
+    let sentinel = usize::MAX;
+    let parent_leaf = |o: usize| leaf_of.get(o).copied().unwrap_or(0) & (n_parent - 1);
+    let pass = |o: usize| (leaf_of.get(o).copied().unwrap_or(0) & n_parent) != 0;
+    let n_true = (0..n_objects).filter(|&o| pass(o)).count();
+    let n_false = n_objects.saturating_sub(n_true);
+    let build = |assign: &[usize], nl: usize| {
+        build_bucket_histogram(col, der1, weight, assign, nl, 1, n_bins, dim)
+    };
+
+    let shape_ok = parent_hist.is_some_and(|h| h.n_leaves() == n_parent);
+    let parent = match parent_hist {
+        Some(h) if shape_ok => h,
+        _ => {
+            // Defensive: parent shape drifted from the tracked partition — fall back
+            // to a fresh full rebuild directly from the level-(L+1) partition
+            // (`leaf_of` already encodes each object's next-level leaf).
+            return build(leaf_of, n_next);
+        }
+    };
+
+    if n_true <= n_false {
+        // TRUE is the smaller sibling → build ONLY it in its low slots (parent leaf),
+        // then derive FALSE (larger) = parent − true and reunite with TRUE relocated
+        // into the high slots. Bit-for-bit the whole-partition path restricted to this
+        // feature (WR-04, PERF-04).
+        let true_low_assign: Vec<usize> = (0..n_objects)
+            .map(|o| if pass(o) { parent_leaf(o) } else { sentinel })
+            .collect();
+        let h_true_low = build(&true_low_assign, n_next);
+        let h_false_low = parent.relocate_sub(n_next, 0, &h_true_low);
+        h_false_low.add_relocated(&h_true_low, n_parent)
+    } else {
+        // FALSE is the smaller sibling → symmetric derivation.
+        let false_low_assign: Vec<usize> = (0..n_objects)
+            .map(|o| if pass(o) { sentinel } else { parent_leaf(o) })
+            .collect();
+        let h_false_low = build(&false_low_assign, n_next);
+        let h_true_low = parent.relocate_sub(n_next, 0, &h_false_low);
+        h_false_low.add_relocated(&h_true_low, n_parent)
     }
 }
 
@@ -839,17 +920,21 @@ fn select_level_plain(
                 return Vec::new();
             }
             // FUSED single-pass O(n_bins) scan + score over this feature's borders,
-            // derived from the per-level histogram (not a per-candidate dataset
-            // rescan). `scan_and_score_borders` reuses task-local scratch across all
-            // borders — no full `Vec<Vec<Vec<LeafStats>>>` materialization and no
-            // per-candidate score `Vec` (PERF-03). The per-border score is
-            // byte-for-byte the prior `scan_borders_to_leaf_stats` +
-            // `multi_dim_split_score` result (dim=1 byte-identical to the scalar split,
-            // D-04). All scratch is allocated INSIDE this rayon `.map` closure, so it
-            // is per-task-local — no cross-thread mutation (Pitfall 5 determinism).
+            // derived from this feature's OWN single-feature per-level histogram
+            // (`feature_hists[feature]`, feature index 0 within it — not a
+            // per-candidate dataset rescan). `scan_and_score_borders` reuses
+            // task-local scratch across all borders — no full `Vec<Vec<Vec<LeafStats>>>`
+            // materialization and no per-candidate score `Vec` (PERF-04). The per-border
+            // score is byte-for-byte the prior whole-partition `scan_and_score_borders`
+            // for this feature (each cell belongs to one feature, D-03). All scratch is
+            // allocated INSIDE this rayon `.map` closure, so it is per-task-local — no
+            // cross-thread mutation (Pitfall 5 determinism).
+            let Some(feature_hist) = scratch.feature_hists.get(feature) else {
+                return Vec::new();
+            };
             let raw_scores = scan_and_score_borders(
-                &scratch.hist,
-                feature,
+                feature_hist,
+                0,
                 borders.len(),
                 dim,
                 score_function,
@@ -934,14 +1019,20 @@ fn select_level_perturbed(
         task_idx += 1;
 
         // FUSED single-pass O(n_bins) scan + score over this feature's borders, from
-        // the per-level histogram — the per-border loop shape (and thus the RNG draw
-        // count/order) is untouched; only the SOURCE of each `raw` changes. Scratch is
-        // this-feature-local (allocated per `scan_and_score_borders` call), no
-        // per-candidate `Vec` (PERF-03), byte-identical `raw` to the prior two-step
-        // path (Pitfall 3: exactly one `std_normal` per border, same order/count).
+        // this feature's OWN single-feature per-level histogram
+        // (`feature_hists[feature]`, feature index 0) — the per-border loop shape (and
+        // thus the RNG draw count/order) is untouched; only the SOURCE of each `raw`
+        // changes. Scratch is this-feature-local (allocated per `scan_and_score_borders`
+        // call), no per-candidate `Vec` (PERF-04), byte-identical `raw` to the prior
+        // whole-partition path (each cell belongs to one feature, D-03; Pitfall 3:
+        // exactly one `std_normal` per border, same order/count).
+        let Some(feature_hist) = scratch.feature_hists.get(feature) else {
+            feature_best.push(None);
+            continue;
+        };
         let raw_scores = scan_and_score_borders(
-            &scratch.hist,
-            feature,
+            feature_hist,
+            0,
             borders.len(),
             dim,
             score_function,
