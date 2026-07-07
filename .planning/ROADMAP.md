@@ -54,6 +54,7 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
 - [ ] **Phase 19: GPU Inference Evaluator** — device-side predict for the upstream subset, deterministic, Kaggle-CUDA-signed (depends on Phase 15's re-signed oracle)
 - [ ] **Phase 20: Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics** — new `cb-orchestrate` crate + a `BoostingCheckpoint` surface on `cb-train` (parallel with Phase 19)
 - [x] **Phase 21: CPU Split-Finding Histogram Rewrite** — replace the per-candidate full-dataset rescan with per-feature bin histograms + subtraction trick + parallelism across ALL CPU grow policies (oblivious, Depthwise/Lossguide, CTR-feature scoring path), preserving ≤10⁻⁵ parity; closes the ~250–450× CPU-training slowdown (Spike 002/003/004). Must precede the Phase 22 benchmark. (completed 2026-07-05)
+- [ ] **Phase 21.5: CPU Parallel-Scaling — Fused Feature-Parallel Histogram** — move the per-level O(n·nf) histogram accumulation INTO the parallel region by fusing per-feature accumulate+score into one rayon pass (upstream `CalcStatsAndScores` shape), recovering multi-core scaling from the ~1.7× two-pass ceiling to ≥3×@16t while staying byte-identical (parity-free, proven Spikes 005/006). Must precede the Phase 22 benchmark. (PERF-04)
 - [ ] **Phase 22: Adoption / DX Capstone** — benchmark vs official CatBoost, PyPI per-backend wheels, docs + examples, real-dataset validation (last — exercises Phases 17/19/20/21)
 
 ## Phase Details
@@ -197,10 +198,25 @@ Plans:
 *Scope decision (Open Question 1): the ordered-boosting path (`score_candidate_ordered`) is a boosting TYPE, not a grow policy, and is NOT in the CONTEXT scope list — it is explicitly deferred to Phase 22, left unchanged (parity trivially preserved, residual slowness surfaced). The pairwise scorer stays excluded per CONTEXT.*
 **Context**: Root cause + measured evidence live in `.planning/spikes/002-perf-baseline-and-scaling`, `003-split-finding-hotpath-audit`, `004-parallelism-and-allocation-audit`. The device histogram already exists to mirror onto the host: `cb-backend/src/kernels/pointwise_hist.rs` (Phase 11 `pointwise_hist2` + subtraction trick). The crux (and the reason the current code is slow) is preserving D-05/D-08 bit-exact summation while dropping the rescan — the parity-first `sum_f64` gather-and-sum shortcut is what abandoned the histogram. Fix the ALGORITHM first (removes the `n_bins`/`n_features` blow-up + most allocations), parallelism SECOND. **never add a `cb-train` dependency to `cb-backend`** (feature-unification landmine) — transcribe the histogram logic inline into `cb-train`/`cb-compute`, do not cross the seam. Reuse the CB_PERF-gated harness `crates/cb-train/tests/perf_baseline_test.rs` + `catboost_grid.py` to measure before/after.
 
+### Phase 21.5: CPU Parallel-Scaling — Fused Feature-Parallel Histogram
+
+**Goal**: CPU tree-grow recovers CatBoost-class multi-core scaling by moving the per-level bucket-histogram accumulation INTO the parallel region — fusing per-feature accumulate + score into one `rayon` parallel-over-features pass (upstream `CalcStatsAndScores` shape) — replacing Phase 21's serial-accumulate → parallel-score two-pass structure, while every shipped ≤10⁻⁵ CPU oracle fixture stays BIT-EXACT (feature-outer restructuring is byte-identical to the serial build, proven parity-free in Spikes 005/006).
+**Depends on**: Phase 21 (the `BucketHistogram` / `build_bucket_histogram` / `scan_and_score_borders` foundation + the `GrowScratch` per-level histogram wiring in `cb-train`/`cb-compute` — all shipped). `cb-train`/`cb-compute` only, disjoint from export/GPU-infer/orchestration crates; may run parallel with 16–20. Must precede Phase 22 (the benchmark capstone) so the CPU baseline reflects the parallelized path, not the ~1.7× two-pass ceiling.
+**Requirements**: PERF-04
+**Success Criteria** (what must be TRUE):
+
+  1. The per-level histogram accumulation (`build_bucket_histogram`, the O(n·nf) pass) is no longer a serial phase preceding the parallel scorer — the oblivious plain AND perturbed split search (`select_level_plain` / `select_level_perturbed`) fuse per-feature accumulate + score into ONE `rayon` parallel-over-features pass; the separate serial whole-partition build is removed from the per-level hot path (PERF-04)
+  2. Parity is preserved BYTE-FOR-BYTE: the fused per-feature scores are bit-identical to the pre-change serial-build + parallel-score path (feature-outer / object-inner keeps each cell's ascending-object-order `sum_f64` fold), so EVERY shipped ≤10⁻⁵ CPU oracle fixture stays bit-exact with NO fixed-point and NO oracle re-baseline (PERF-04)
+  3. The subtraction trick (child = parent − sibling) is preserved within the fused per-feature path, and per-task scratch is reused (rayon `map_init` / per-thread pool), not allocated inside the `.map` closure (PERF-04)
+  4. A documented 1→16-thread scaling curve on the Spike-002 grid (`CB_PERF` harness) shows per-level / per-tree speedup recovered from the ~1.7× two-pass ceiling to ≥3× at 16 threads, with the determinism test still green single- vs multi-threaded (PERF-04)
+
+**Plans**: TBD
+**Context**: Root cause + the validated fix live in `.planning/spikes/005-parallel-scaling-root-cause` and `006-fused-feature-parallel-histogram`. Spike 005 pinned the ceiling to the rayon-free serial `build_bucket_histogram` (D-03) sitting OUTSIDE the parallel region (`serial_fraction≈0.41`, Amdahl 16t ceiling ≈2.2×; only `nf`≈20 coarse scoring tasks are parallel, regressing past 4–8 threads). Spike 006 prototyped the fix (fused per-feature accumulate+score) at **5.0× @16t vs two-pass 1.66×, `byte_identical=true`** on nf=20 AND nf=8/nbins=254. **The fix is parity-FREE** because bins are feature-major (`bins[feature*n_objects+obj]`) and each cell belongs to one feature, so feature-outer parallelism preserves the exact `sum_f64` order — this is a refactor, not a numerics change; the existing oracle suite is the guard. Keep the subtraction trick per-feature (`tree.rs:745-796` `relocate_sub` moves into the per-feature task). **never add a `cb-train` dependency to `cb-backend`** (feature-unification landmine). Low-nf (nf<cores) / within-feature ROW-BLOCK parallelism (which WOULD lose byte-identity and need fixed-point-u64 + upstream re-verification) is OUT of scope — deferred to a future spike/phase. Harness: `crates/cb-train/tests/spike005_parallel_scaling_test.rs` + `spike006_fused_parallel_test.rs` + `perf_baseline_test.rs` (all `CB_PERF`-gated).
+
 ### Phase 22: Adoption / DX Capstone
 
 **Goal**: The whole parity story is proven to adopters — benchmarked vs official CatBoost, released to PyPI per-backend, documented with runnable examples, and validated end-to-end on real datasets.
-**Depends on**: Phases 17 (export), 19 (GPU-infer), 20 (orchestration), 21 (competitive CPU baseline) — it exercises every one of them; must come last.
+**Depends on**: Phases 17 (export), 19 (GPU-infer), 20 (orchestration), 21 + 21.5 (competitive, multi-core CPU baseline) — it exercises every one of them; must come last.
 **Requirements**: DX-01, DX-02, DX-03, DX-04
 **Success Criteria** (what must be TRUE):
 
@@ -215,7 +231,7 @@ Plans:
 ## Progress
 
 **Execution Order:**
-v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22. Parallelizable pairs (different crates): {15, 16, 17, 18} overlap; {19, 20, 21} overlap (21 is `cb-train`/`cb-compute`-only, disjoint from 19/20's crates). Firm hard-dependencies: 19 after 15; 22 after 17/19/20/21; ORCH-02 after ORCH-01 (within 20).
+v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 21 → 21.5 → 22. Parallelizable pairs (different crates): {15, 16, 17, 18} overlap; {19, 20, 21} overlap (21 is `cb-train`/`cb-compute`-only, disjoint from 19/20's crates). Phase 21.5 hard-depends on 21 (same crates) and, like 21, is disjoint from 19/20 so may run parallel with them. Firm hard-dependencies: 19 after 15; 21.5 after 21; 22 after 17/19/20/21/21.5; ORCH-02 after ORCH-01 (within 20).
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -228,6 +244,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |
 | 20. Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics | v1.2 | 0/TBD | Not started | - |
 | 21. CPU Split-Finding Histogram Rewrite | v1.2 | 7/7 | Complete   | 2026-07-05 |
+| 21.5. CPU Parallel-Scaling — Fused Feature-Parallel Histogram | v1.2 | 0/TBD | Not started | - |
 | 22. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)
