@@ -345,11 +345,26 @@ impl BucketHistogram {
     /// subtraction-trick larger-sibling derivation (WR-04) without the intermediate
     /// relocated-parent allocation.
     ///
-    /// Bit-identical to `self.relocate(n_new_leaves, shift).remove(minus)`: each cell
-    /// is `relocated_parent − minus`, computed here as `(−minus) + relocated_parent`
-    /// which equals `relocated_parent − minus` exactly in IEEE (`−minus` is an exact
-    /// negation, add is commutative). Shape mismatch falls back to the explicit
-    /// two-step path (defensive, T-21-02).
+    /// Bit-identical to `self.relocate(n_new_leaves, shift).remove(minus)` for every
+    /// cell COVERED by the relocated parent (destination leaves in
+    /// `[shift, shift + self.n_leaves)`): each such cell is `relocated_parent − minus`,
+    /// computed here as `(−minus) + relocated_parent`, which equals
+    /// `relocated_parent − minus` exactly in IEEE (`−minus` is an exact negation, add
+    /// is commutative).
+    ///
+    /// For destination cells OUTSIDE that covered range (where the relocated parent
+    /// contributes nothing), `relocate().remove()` computes `0.0 − minus[cell]`, while
+    /// this fused form seeds `−minus[cell]` directly (WR-03). The two agree for every
+    /// value except `minus[cell] == +0.0`: `0.0 − 0.0` is `+0.0` but `−(+0.0)` is
+    /// `−0.0` — equal under `==` but `f64::to_bits` differs. This is additively
+    /// neutral for every downstream consumer (`sum_f64`/`calc_average` treat `±0.0`
+    /// identically) and is washed back to `+0.0` by the production caller's
+    /// subsequent [`add_relocated`](Self::add_relocated) (shift=0 then
+    /// shift=n_parent, `derive_feature_level_hist`) — but a HYPOTHETICAL future caller
+    /// that consumed an uncovered cell WITHOUT a following add would observe this
+    /// signed-zero divergence from `relocate().remove()`, so do not rely on bit-level
+    /// identity for uncovered cells in isolation. Shape mismatch falls back to the
+    /// explicit two-step path (defensive, T-21-02).
     #[must_use]
     pub fn relocate_sub(
         &self,
