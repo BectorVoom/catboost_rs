@@ -587,23 +587,44 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     let mut chosen: Vec<Split> = Vec::with_capacity(depth);
 
     // The reusable across-level grow state (the `TLearnContext` analogue): builds
-    // the quantized bin matrix once and holds the current level's histogram, so the
-    // O(n) binning + ordered reduction is paid ONCE per level (not once per
-    // candidate). Level 0's histogram (single root leaf) is built here.
-    let mut scratch = GrowScratch::new(matrix, der1, weight, n_objects);
+    // the quantized bin matrix once and holds the current level's per-feature
+    // histograms. The FUSED plain path builds each level (incl. level 0) INSIDE its
+    // own parallel-over-features pass, so it skips the up-front level-0 build; the
+    // perturbed path scores from the retained `feature_hists`, so it materializes
+    // level 0 here (Plan 03 fuses that path).
+    let mut scratch = GrowScratch::new(matrix, der1, weight, n_objects, perturb.is_some());
 
     for level in 0..depth {
+        // PLAIN path (perturb = None): `select_level_plain` FUSES the per-feature
+        // build/derive + score in ONE rayon parallel-over-features pass (D-01) and
+        // RETURNS this level's per-feature histograms, which become the parent the
+        // next level derives from; the follow-up transition is the CHEAP leaf-only
+        // `advance_leaf_only` (no histogram build on the hot path).
+        //
+        // PERTURBED path (perturb = Some): the RNG-ordered feature loop scores from
+        // the retained `feature_hists`, and the full `advance` derives the next
+        // level's per-feature histograms (Plan 03 fuses this path).
         let best = match perturb.as_mut() {
-            None => select_level_plain(matrix, &scratch, scaled_l2, score_function, penalties)?,
+            None => {
+                let (split, hists) =
+                    select_level_plain(matrix, &scratch, der1, weight, scaled_l2, score_function, penalties)?;
+                scratch.feature_hists = hists;
+                if level + 1 < depth {
+                    scratch.advance_leaf_only(matrix, &split, n_objects);
+                }
+                split
+            }
             Some(p) => {
-                select_level_perturbed(matrix, &scratch, scaled_l2, p, score_function, penalties)?
+                let split =
+                    select_level_perturbed(matrix, &scratch, scaled_l2, p, score_function, penalties)?;
+                // Derive the NEXT level's histogram (subtraction trick); the last
+                // level has no successor, so skip its (unused) transition.
+                if level + 1 < depth {
+                    scratch.advance(matrix, der1, weight, &split, n_objects);
+                }
+                split
             }
         };
-        // Derive the NEXT level's histogram (subtraction trick) before scoring it;
-        // the last level has no successor, so skip its (unused) transition.
-        if level + 1 < depth {
-            scratch.advance(matrix, der1, weight, &best, n_objects);
-        }
         chosen.push(best);
     }
 
@@ -667,8 +688,21 @@ struct GrowScratch {
 }
 
 impl GrowScratch {
-    /// Build the bin matrix and the level-0 (single root leaf) histogram once.
-    fn new(matrix: &FeatureMatrix, der1: &[f64], weight: &[f64], n_objects: usize) -> Self {
+    /// Build the bin matrix and, when `build_initial_hists`, the level-0 (single root
+    /// leaf) per-feature histograms.
+    ///
+    /// The FUSED plain path builds level 0 INSIDE its own parallel pass
+    /// ([`select_level_plain`]), so it passes `build_initial_hists = false` and skips
+    /// the redundant up-front build. The perturbed path scores from the retained
+    /// `feature_hists` (Plan 03 fuses it later), so it needs the level-0 histograms
+    /// materialized here (`build_initial_hists = true`).
+    fn new(
+        matrix: &FeatureMatrix,
+        der1: &[f64],
+        weight: &[f64],
+        n_objects: usize,
+        build_initial_hists: bool,
+    ) -> Self {
         let n_features = matrix.n_features();
         // Global bin width = max(n_borders)+1 over features; a feature with fewer
         // borders simply leaves the upper bins empty (the scan walks only its own
@@ -701,19 +735,25 @@ impl GrowScratch {
         };
         let leaf_of = vec![0usize; n_objects];
         // Build the level-0 (single root leaf) histogram PER FEATURE, in parallel
-        // over independent features (PERF-04). Each `feature_hists[f]` is a
-        // single-feature (`n_features == 1`) histogram over that feature's contiguous
-        // feature-major column `bins[f*n_objects .. (f+1)*n_objects]`; because the
-        // bins are feature-major, a 1-feature build folds each cell's members in the
-        // SAME ascending-object `scatter_add_f64` order as the whole-partition
-        // `build_bucket_histogram`, so the cells are byte-for-byte identical (D-03).
-        let feature_hists: Vec<BucketHistogram> = (0..n_features)
-            .into_par_iter()
-            .map(|feature| {
-                let col = feature_col(&bins, feature, n_objects);
-                build_bucket_histogram(col, der1, weight, &leaf_of, 1, 1, n_bins, approx_dim)
-            })
-            .collect();
+        // over independent features (PERF-04), ONLY when requested. Each
+        // `feature_hists[f]` is a single-feature (`n_features == 1`) histogram over
+        // that feature's contiguous feature-major column
+        // `bins[f*n_objects .. (f+1)*n_objects]`; because the bins are feature-major,
+        // a 1-feature build folds each cell's members in the SAME ascending-object
+        // `scatter_add_f64` order as the whole-partition `build_bucket_histogram`, so
+        // the cells are byte-for-byte identical (D-03). The fused plain path skips this
+        // (it builds level 0 in its own parallel pass), leaving `feature_hists` empty.
+        let feature_hists: Vec<BucketHistogram> = if build_initial_hists {
+            (0..n_features)
+                .into_par_iter()
+                .map(|feature| {
+                    let col = feature_col(&bins, feature, n_objects);
+                    build_bucket_histogram(col, der1, weight, &leaf_of, 1, 1, n_bins, approx_dim)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             bins,
             leaf_of,
@@ -879,61 +919,93 @@ fn derive_feature_level_hist(
     }
 }
 
-/// One level of the UNPERTURBED search: enumerate candidates in upstream order
-/// (FLOAT features, feature ascending × border ascending; `AddFloatFeatures`),
-/// score each from the current level's [`BucketHistogram`] via a FUSED `O(n_bins)`
-/// prefix scan + score ([`scan_and_score_borders`], bit-identical to the prior
-/// [`scan_borders_to_leaf_stats`] + [`multi_dim_split_score`]), and pick the strict
-/// first-wins best. No RNG draws (the first-slice / D-04 path).
+/// One level of the UNPERTURBED search: FUSE the per-feature histogram
+/// accumulate/derive + `O(n_bins)` prefix-scan score into ONE rayon
+/// parallel-over-features pass (D-01, PERF-04 / Spike 006), enumerate candidates in
+/// upstream order (FLOAT features, feature ascending × border ascending;
+/// `AddFloatFeatures`), and pick the strict first-wins best. No RNG draws (the
+/// first-slice / D-04 path). Returns the chosen [`Split`] AND this level's
+/// per-feature histograms (the parent the next level derives from).
 ///
-/// This replaces the per-candidate `assign_leaves` + `reduce_leaf_stats` rescan
-/// (PERF-01): the histogram is built once per level in [`GrowScratch`], and every
-/// candidate's `&[LeafStats]` is derived from it by the prefix scan. The candidate
-/// enumeration ORDER, the FEAT-04 penalty insertion point, and the strict `>`
-/// first-wins tie-break are byte-for-byte unchanged.
+/// Each feature's `into_par_iter` task BOTH builds/derives its feature's level
+/// histogram AND scores it, reusing a per-rayon-task [`ScanScoreScratch`] via
+/// `map_init` (D-07 — allocated ONCE per task, reused across every feature that task
+/// handles, avoiding the >8-thread allocator-contention dip Spike 006 measured). The
+/// separate serial whole-partition build is GONE from the per-level hot path (D-01).
+///
+/// - Level 0 builds this feature's fresh single-feature histogram from its
+///   contiguous feature-major bin column (byte-identical to the whole-partition
+///   build's feature-`f` cells, D-03).
+/// - Level > 0 derives it from the retained parent via the per-feature SUBTRACTION
+///   TRICK ([`derive_feature_level_hist`], D-06).
+///
+/// The candidate enumeration ORDER (feature-ordered `collect` + flatten), the
+/// FEAT-04 penalty insertion point, and the strict `>` first-wins tie-break are
+/// byte-for-byte unchanged (D-08) — so single- vs multi-thread runs stay
+/// byte-identical.
 fn select_level_plain(
     matrix: &FeatureMatrix,
     scratch: &GrowScratch,
+    der1: &[f64],
+    weight: &[f64],
     scaled_l2: f64,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
-) -> CbResult<Split> {
+) -> CbResult<(Split, Vec<BucketHistogram>)> {
     // FEAT-04 penalties are applied ONLY when an active (non-no-op) context is
     // supplied; otherwise the candidate scores stay byte-identical to the pre-6.6
     // path (D-6.6-05 — gate on the param being non-empty).
     let active_penalties = penalties.filter(|p| !p.is_noop());
     let dim = scratch.approx_dim;
-    // PERF-03: score every feature's borders in parallel over INDEPENDENT features.
-    // Each feature reads disjoint histogram rows via its own `O(n_bins)` prefix scan
-    // and produces its candidate list; `collect` into a feature-ordered `Vec<Vec<_>>`
-    // then flatten reproduces the EXACT sequential enumeration order (feature
-    // ascending × border ascending), so the downstream strict `>` first-wins
-    // `select_best_candidate` is byte-for-byte deterministic single- vs
-    // multi-threaded (Pitfall 5). The per-bin fold inside `scan_borders_to_leaf_stats`
-    // stays the sequential `sum_f64` — no cross-feature float reduction.
-    let candidates: Vec<Candidate> = (0..matrix.n_features())
+    let level = scratch.level;
+    let n_bins = scratch.n_bins;
+    let n_objects = scratch.leaf_of.len();
+    let bins = &scratch.bins;
+    let leaf_of = &scratch.leaf_of;
+    let parents = &scratch.feature_hists;
+    // PERF-04: FUSE per-feature accumulate/derive + score in parallel over
+    // INDEPENDENT features. Each feature builds (level 0) or derives (level > 0) its
+    // OWN single-feature histogram INSIDE its task and immediately scores it via the
+    // `O(n_bins)` prefix scan; `collect` into a feature-ordered `Vec` then flatten
+    // reproduces the EXACT sequential enumeration order (feature ascending × border
+    // ascending), so the downstream strict `>` first-wins `select_best_candidate` is
+    // byte-for-byte deterministic single- vs multi-threaded (D-08). The per-bin fold
+    // inside the scan stays the sequential `sum_f64` — no cross-feature float
+    // reduction.
+    let per_feature: Vec<(Vec<Candidate>, BucketHistogram)> = (0..matrix.n_features())
         .into_par_iter()
-        .map(|feature| {
-            let borders =
-                matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-            if borders.is_empty() {
-                return Vec::new();
-            }
-            // FUSED single-pass O(n_bins) scan + score over this feature's borders,
-            // derived from this feature's OWN single-feature per-level histogram
-            // (`feature_hists[feature]`, feature index 0 within it — not a
-            // per-candidate dataset rescan). `scan_and_score_borders` reuses
-            // task-local scratch across all borders — no full `Vec<Vec<Vec<LeafStats>>>`
-            // materialization and no per-candidate score `Vec` (PERF-04). The per-border
-            // score is byte-for-byte the prior whole-partition `scan_and_score_borders`
-            // for this feature (each cell belongs to one feature, D-03). All scratch is
-            // allocated INSIDE this rayon `.map` closure, so it is per-task-local — no
-            // cross-thread mutation (Pitfall 5 determinism).
-            let Some(feature_hist) = scratch.feature_hists.get(feature) else {
-                return Vec::new();
+        .map_init(ScanScoreScratch::new, |scan, feature| {
+            let col = feature_col(bins, feature, n_objects);
+            // Build (level 0) / derive (level > 0) this feature's current-level
+            // single-feature histogram — the accumulation now lives INSIDE the
+            // parallel region (D-01).
+            let feature_hist = if level == 0 {
+                build_bucket_histogram(col, der1, weight, leaf_of, 1, 1, n_bins, dim)
+            } else {
+                derive_feature_level_hist(
+                    parents.get(feature),
+                    col,
+                    der1,
+                    weight,
+                    leaf_of,
+                    level,
+                    n_bins,
+                    dim,
+                )
             };
-            let raw_scores = scan_and_score_borders(
-                feature_hist,
+            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+            if borders.is_empty() {
+                return (Vec::new(), feature_hist);
+            }
+            // FUSED single-pass O(n_bins) scan + score over this feature's own
+            // single-feature histogram (feature index 0), reusing the per-task
+            // `scan` scratch across every feature this task handles (D-07). The
+            // per-border score is byte-for-byte the prior whole-partition
+            // `scan_and_score_borders` for this feature (each cell belongs to one
+            // feature, D-03; dim=1 byte-identical to the scalar split, D-04).
+            let raw_scores = scan_and_score_borders_into(
+                scan,
+                &feature_hist,
                 0,
                 borders.len(),
                 dim,
@@ -956,19 +1028,28 @@ fn select_level_plain(
                     score,
                 });
             }
-            local
+            (local, feature_hist)
         })
-        .collect::<Vec<Vec<Candidate>>>()
-        .into_iter()
-        .flatten()
         .collect();
+    // Split the feature-ordered results: flatten candidates (feature ascending ×
+    // border ascending, D-08) and retain this level's per-feature histograms as the
+    // next level's parent store.
+    let mut hists = Vec::with_capacity(per_feature.len());
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (local, feature_hist) in per_feature {
+        candidates.extend(local);
+        hists.push(feature_hist);
+    }
     let best = select_best_candidate(&candidates).ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
     })?;
-    Ok(Split {
-        feature: best.feature,
-        border: best.border,
-    })
+    Ok((
+        Split {
+            feature: best.feature,
+            border: best.border,
+        },
+        hists,
+    ))
 }
 
 /// One level of the PERTURBED search reproducing the upstream two-pass draw order
