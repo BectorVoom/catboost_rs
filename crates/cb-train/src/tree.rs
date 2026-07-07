@@ -776,14 +776,37 @@ impl GrowScratch {
 /// This feature's contiguous, feature-major bin column
 /// `bins[feature * n_objects .. (feature + 1) * n_objects]`, or an empty slice if
 /// the index arithmetic falls out of range (defensive — no raw indexing, T-21-01).
+///
+/// IN-02: on `checked_mul`/`checked_add` overflow this returns the SAME `&[]` a
+/// genuinely zero-length column would, so the downstream `build_bucket_histogram`
+/// silently produces an all-zero histogram rather than surfacing the index-
+/// arithmetic fault. Given `MAX_DEPTH` bounds `n_leaves` and realistic
+/// `n_features * n_objects` products, this overflow is unreachable in practice — the
+/// `debug_assert!`s below are defensive-only: a no-op in release (same `&[]`
+/// fallback, unchanged production numerics) and a loud signal in debug/test builds
+/// should a future contract change (e.g. larger index types) ever reach this path.
 fn feature_col(bins: &[u32], feature: usize, n_objects: usize) -> &[u32] {
     let start = match feature.checked_mul(n_objects) {
         Some(s) => s,
-        None => return &[],
+        None => {
+            debug_assert!(
+                false,
+                "feature_col: feature ({feature}) * n_objects ({n_objects}) overflowed \
+                 usize — this is an index-arithmetic fault, not a legitimately empty column"
+            );
+            return &[];
+        }
     };
     let end = match start.checked_add(n_objects) {
         Some(e) => e,
-        None => return &[],
+        None => {
+            debug_assert!(
+                false,
+                "feature_col: start ({start}) + n_objects ({n_objects}) overflowed usize \
+                 — this is an index-arithmetic fault, not a legitimately empty column"
+            );
+            return &[];
+        }
     };
     bins.get(start..end).unwrap_or(&[])
 }
