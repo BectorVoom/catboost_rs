@@ -193,3 +193,91 @@ fn multi_dim_candidate_score_bad_stride_scores_zero_not_whole_buffer() {
         "dim=1 path must be byte-identical to the single-dim reduction"
     );
 }
+
+/// WR-02: the always-run `fused_feature_parity_test` guard only ever exercises
+/// `fused_feature_scan_and_score` (a test/harness-only primitive) and a DIFFERENT
+/// subtraction-trick decomposition than production runs
+/// (`relocate_sub(shift=2)`+`add_relocated(shift=0)` for the FALSE-sibling case, vs
+/// production's `relocate_sub(shift=0)`+`add_relocated(shift=n_parent)` inside
+/// [`crate::tree::derive_feature_level_hist`]). Call `derive_feature_level_hist`
+/// directly — the ACTUAL level>0 production derivation — at `level >= 2`, covering
+/// BOTH the `n_true <= n_false` and `n_true > n_false` branches, and assert
+/// cell-by-cell `to_bits` equality against a fresh whole-partition build over the
+/// same next-level partition.
+fn make_derive_case(
+    n: usize,
+    n_bins: usize,
+    level: usize,
+    majority_true: bool,
+) -> (Vec<u32>, Vec<f64>, Vec<f64>, Vec<usize>, Vec<usize>, usize, usize) {
+    let n_parent = 1usize << level.saturating_sub(1);
+    let n_next = 1usize << level;
+    // Deterministic per-object bin spread over the feature's contiguous column.
+    let col: Vec<u32> = (0..n).map(|o| ((o * 7 + 3) % n_bins) as u32).collect();
+    // Integer der1 in a small range, exact under f64 (mirrors the existing
+    // subtraction-trick convention: integer sums keep `parent - false == true`
+    // bit-exact so the fresh-build reference is a meaningful oracle).
+    let der1: Vec<f64> = (0..n).map(|o| (o % 9) as f64 - 4.0).collect();
+    let weight = vec![1.0f64; n];
+    let parent_leaf: Vec<usize> = (0..n).map(|o| o % n_parent).collect();
+    // Skew the pass/fail split so one case is TRUE-minority (n_true <= n_false) and
+    // the other TRUE-majority (n_true > n_false) — the two branches
+    // `derive_feature_level_hist` selects between.
+    let pass = |o: usize| if majority_true { o % 5 != 0 } else { o % 5 == 0 };
+    let leaf_of: Vec<usize> = (0..n)
+        .map(|o| parent_leaf[o] + if pass(o) { n_parent } else { 0 })
+        .collect();
+    (col, der1, weight, leaf_of, parent_leaf, n_parent, n_next)
+}
+
+#[test]
+fn derive_feature_level_hist_matches_fresh_build_both_branches() {
+    use crate::tree::derive_feature_level_hist;
+    use cb_compute::build_bucket_histogram;
+
+    let n = 40usize;
+    let n_bins = 6usize;
+    let level = 2usize; // n_parent = 2, n_next = 4 (level >= 2, per WR-02).
+    let dim = 1usize;
+    let n_channels = dim + 1;
+
+    for majority_true in [false, true] {
+        let (col, der1, weight, leaf_of, parent_leaf, n_parent, n_next) =
+            make_derive_case(n, n_bins, level, majority_true);
+
+        let n_true = leaf_of.iter().filter(|&&l| l >= n_parent).count();
+        let n_false = n - n_true;
+        if majority_true {
+            assert!(n_true > n_false, "expected a TRUE-majority (n_true > n_false) case");
+        } else {
+            assert!(n_true <= n_false, "expected a TRUE-minority-or-tie (n_true <= n_false) case");
+        }
+
+        let parent_hist =
+            build_bucket_histogram(&col, &der1, &weight, &parent_leaf, n_parent, 1, n_bins, dim);
+        let derived = derive_feature_level_hist(
+            Some(&parent_hist),
+            &col,
+            &der1,
+            &weight,
+            &leaf_of,
+            level,
+            n_bins,
+            dim,
+        );
+        let fresh = build_bucket_histogram(&col, &der1, &weight, &leaf_of, n_next, 1, n_bins, dim);
+
+        for leaf in 0..n_next {
+            for bin in 0..n_bins {
+                for c in 0..n_channels {
+                    assert_eq!(
+                        derived.channel(leaf, 0, bin, c).to_bits(),
+                        fresh.channel(leaf, 0, bin, c).to_bits(),
+                        "derive_feature_level_hist (majority_true={majority_true}) diverged \
+                         from a fresh build at leaf {leaf} bin {bin} channel {c}"
+                    );
+                }
+            }
+        }
+    }
+}
