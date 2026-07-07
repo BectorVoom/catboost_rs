@@ -260,7 +260,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |
 | 20. Orchestration — CV, Tuning, Snapshot/Resume, calc_metrics | v1.2 | 0/TBD | Not started | - |
 | 21. CPU Split-Finding Histogram Rewrite | v1.2 | 7/7 | Complete   | 2026-07-05 |
-| 21.5. CPU Parallel-Scaling — Fused Feature-Parallel Histogram | v1.2 | 4/4 | Complete   | 2026-07-07 |
+| 21.5. CPU Parallel-Scaling — Fused Feature-Parallel Histogram | v1.2 | 4/4 | Complete    | 2026-07-07 |
 | 22. Adoption / DX Capstone | v1.2 | 0/TBD | Not started | - |
 
 ## Backlog (Deferred from v1.0)

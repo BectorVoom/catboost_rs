@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Parity Completion & Release Readiness
-current_phase: 21.5
-current_phase_name: cpu-parallel-scaling-fused-feature-parallel-histogram
+current_phase: 22
+current_phase_name: Adoption / DX Capstone
 status: verifying
 stopped_at: "15-03 COMPLETE (commits 5d07c67 Task1 / 734109a Task2) — the SINGLE authoritative Kaggle P100 CUDA session. Part A (blocking correctness pre-gate, ε=1e-4): all 13 v1.1 device families exit==0 + ran_any_tests==true in ONE --features cuda session, divergences bit-exact (max abs_div=0.000e0; only stochastic bootstrap 2.384e-7 / mvs ~1e-15 nonzero, far under 1e-4); rv13_oracles_expected == rv13_oracles_seen (all 4: tie_order_matches_cpu_stable_descending + softmax_weight_max_seed on ranking family, empty_group_means_no_fault on ranking, pairwise_near_equal_border_tiebreak on pairwise) → correctness_verdict ALL-PASS. Part B (BENCH-02, ran only because Part A passed, D-05): 12 depth-1/depth-6 × {depthwise,region} rows median-of-3, device beats host CPU every row 29.1×–40.8×, bench_verdict OK, depth6_ge20x true; crossover = device first beats CPU at n=100000 (depth-1 depthwise, smallest n; NOT gated per A4). Region catboost_gpu_s = N/A (no upstream Region grow_policy). Provenance: Tesla P100-PCIE-16GB, driver 580.159.04, CUDA 12.8, seed 42, single_session=true. Task-1 Rule-3 deviation: BENCH_DEPTH env lever (default 6) added to crates/cb-train/tests/bench_grow_speed_test.rs so both depth rows run in one kernel (depth-6 provenance byte-unchanged). NO numbers fabricated — result.json committed verbatim (734109a). HARD-01 + HARD-02 discharged. NEXT: 15-04 (Wave 3) — 15-EVIDENCE.md + BENCH-03 recompute-in-place from bench/phase15_cuda_oracle/result.json + REQUIREMENTS/MILESTONES/STATE bookkeeping flip. Resume file: .planning/phases/15-debt-discharge-cuda-oracle-re-establishment/15-03-SUMMARY.md."
-last_updated: "2026-07-07T03:17:05.052Z"
+last_updated: "2026-07-07T03:23:00.495Z"
 last_activity: 2026-07-07
-last_activity_desc: Phase 21.5 execution started
+last_activity_desc: Phase 21.5 complete, transitioned to Phase 22
 progress:
   total_phases: 9
   completed_phases: 3
@@ -28,16 +28,16 @@ See: .planning/PROJECT.md (updated 2026-07-05 after v1.1 milestone)
 
 ## Current Position
 
-Phase: 21.5 (cpu-parallel-scaling-fused-feature-parallel-histogram) — EXECUTING
-Plan: 4 of 4
+Phase: 22 — Adoption / DX Capstone
+Plan: Not started
 Status: Phase complete — ready for verification
-Last activity: 2026-07-07 — Phase 21.5 execution started
+Last activity: 2026-07-07 — Phase 21.5 complete, transitioned to Phase 22
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 83
+- Total plans completed: 85
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -61,6 +61,7 @@ Last activity: 2026-07-07 — Phase 21.5 execution started
 | 13 | 10 | - | - |
 | 14 | 3 | - | - |
 | 15 | 4 | - | - |
+| 21.5 | 4 | - | - |
 
 **Recent Trend:**
 
