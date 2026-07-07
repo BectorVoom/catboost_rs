@@ -6,9 +6,9 @@ current_phase: 21
 current_phase_name: cpu-split-finding-histogram-rewrite
 status: phase_complete
 stopped_at: "15-03 COMPLETE (commits 5d07c67 Task1 / 734109a Task2) — the SINGLE authoritative Kaggle P100 CUDA session. Part A (blocking correctness pre-gate, ε=1e-4): all 13 v1.1 device families exit==0 + ran_any_tests==true in ONE --features cuda session, divergences bit-exact (max abs_div=0.000e0; only stochastic bootstrap 2.384e-7 / mvs ~1e-15 nonzero, far under 1e-4); rv13_oracles_expected == rv13_oracles_seen (all 4: tie_order_matches_cpu_stable_descending + softmax_weight_max_seed on ranking family, empty_group_means_no_fault on ranking, pairwise_near_equal_border_tiebreak on pairwise) → correctness_verdict ALL-PASS. Part B (BENCH-02, ran only because Part A passed, D-05): 12 depth-1/depth-6 × {depthwise,region} rows median-of-3, device beats host CPU every row 29.1×–40.8×, bench_verdict OK, depth6_ge20x true; crossover = device first beats CPU at n=100000 (depth-1 depthwise, smallest n; NOT gated per A4). Region catboost_gpu_s = N/A (no upstream Region grow_policy). Provenance: Tesla P100-PCIE-16GB, driver 580.159.04, CUDA 12.8, seed 42, single_session=true. Task-1 Rule-3 deviation: BENCH_DEPTH env lever (default 6) added to crates/cb-train/tests/bench_grow_speed_test.rs so both depth rows run in one kernel (depth-6 provenance byte-unchanged). NO numbers fabricated — result.json committed verbatim (734109a). HARD-01 + HARD-02 discharged. NEXT: 15-04 (Wave 3) — 15-EVIDENCE.md + BENCH-03 recompute-in-place from bench/phase15_cuda_oracle/result.json + REQUIREMENTS/MILESTONES/STATE bookkeeping flip. Resume file: .planning/phases/15-debt-discharge-cuda-oracle-re-establishment/15-03-SUMMARY.md."
-last_updated: "2026-07-06T02:13:39.650Z"
+last_updated: "2026-07-07T02:02:22.229Z"
 last_activity: 2026-07-06
-last_activity_desc: "Phase 21 complete — 21-06/21-07 gap closure; PERF-02 bit-identical + PERF-03 verified, PERF-01 accepted-with-override (flat bar amended, proven unachievable at harness size)"
+last_activity_desc: Phase 21 gap closure + verification complete
 progress:
   total_phases: 8
   completed_phases: 2

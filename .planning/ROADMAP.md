@@ -211,10 +211,22 @@ Plans:
   4. A documented 1→16-thread scaling curve on the Spike-002 grid (`CB_PERF` harness) shows per-level / per-tree speedup recovered from the ~1.7× two-pass ceiling to ≥3× at 16 threads, with the determinism test still green single- vs multi-threaded (PERF-04)
 
 **Plans**: 4 plans
+**Wave 1**
+
 - [ ] 21.5-01-PLAN.md — cb-compute single-feature fused accumulate+score primitive (build/scan `_into` + `FusedFeatureScratch`, D-07) + RED-first byte-identity guard test (D-05)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 21.5-02-PLAN.md — fuse `select_level_plain` + restructure `GrowScratch` (per-feature subtraction trick, map_init scratch, serial build removed from hot path) (D-01/D-03/D-06/D-07/D-08)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 21.5-03-PLAN.md — fuse `select_level_perturbed`, preserving the Pitfall-3 RNG draw contract byte-for-byte (D-02)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 21.5-04-PLAN.md — verify: full ≤10⁻⁵ oracle suite + determinism green (no re-baseline) + documented 1→16-thread scaling curve ≥3× at 16t (Success Criterion 4)
+
 **Context**: Root cause + the validated fix live in `.planning/spikes/005-parallel-scaling-root-cause` and `006-fused-feature-parallel-histogram`. Spike 005 pinned the ceiling to the rayon-free serial `build_bucket_histogram` (D-03) sitting OUTSIDE the parallel region (`serial_fraction≈0.41`, Amdahl 16t ceiling ≈2.2×; only `nf`≈20 coarse scoring tasks are parallel, regressing past 4–8 threads). Spike 006 prototyped the fix (fused per-feature accumulate+score) at **5.0× @16t vs two-pass 1.66×, `byte_identical=true`** on nf=20 AND nf=8/nbins=254. **The fix is parity-FREE** because bins are feature-major (`bins[feature*n_objects+obj]`) and each cell belongs to one feature, so feature-outer parallelism preserves the exact `sum_f64` order — this is a refactor, not a numerics change; the existing oracle suite is the guard. Keep the subtraction trick per-feature (`tree.rs:745-796` `relocate_sub` moves into the per-feature task). **never add a `cb-train` dependency to `cb-backend`** (feature-unification landmine). Low-nf (nf<cores) / within-feature ROW-BLOCK parallelism (which WOULD lose byte-identity and need fixed-point-u64 + upstream re-verification) is OUT of scope — deferred to a future spike/phase. Harness: `crates/cb-train/tests/spike005_parallel_scaling_test.rs` + `spike006_fused_parallel_test.rs` + `perf_baseline_test.rs` (all `CB_PERF`-gated).
 
 ### Phase 22: Adoption / DX Capstone
