@@ -654,8 +654,14 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 ///   INCREMENTALLY (once per chosen split, forward-bit) instead of reassigned per
 ///   candidate.
 /// - `feature_hists`: the current level's per-FEATURE single-feature
-///   [`BucketHistogram`] (`feature_hists[f]` has `n_features == 1`,
-///   `n_leaves == 1 << level`). Splitting the old whole-partition histogram into one
+///   `Option<`[`BucketHistogram`]`>` (`feature_hists[f]` has `n_features == 1`,
+///   `n_leaves == 1 << level` when `Some`). A `None` slot means feature `f` has NO
+///   candidate borders (`matrix.feature_borders[f].is_empty()`, a STATIC per-feature
+///   property that does not change across levels) — such a feature is never scored
+///   at any level, so its build/derive is skipped entirely (WR-04, PERF-04); the
+///   `Option` preserves positional alignment with `parents.get(feature)` at the next
+///   level without paying an `O(n)` build/derive for a histogram that is never read.
+///   Splitting the old whole-partition histogram into one
 ///   histogram per INDEPENDENT feature is byte-for-byte identical (the bins are
 ///   feature-major, so each cell belongs to exactly one feature, D-03) and lets the
 ///   per-level accumulate + score run INSIDE the rayon parallel-over-features region
@@ -676,9 +682,11 @@ struct GrowScratch {
     /// Current-partition leaf index per object (`0..1 << level`), incremental.
     leaf_of: Vec<usize>,
     /// The current level's per-FEATURE single-feature histogram
-    /// (`feature_hists[f]`: `n_features == 1`, `n_leaves == 1 << level`). Retained
-    /// as the parent store the next level derives from via the subtraction trick.
-    feature_hists: Vec<BucketHistogram>,
+    /// (`feature_hists[f]`: `n_features == 1`, `n_leaves == 1 << level`), or `None`
+    /// for a feature with no candidate borders (WR-04: never scored, so never
+    /// built/derived). Retained as the parent store the next level derives from via
+    /// the subtraction trick.
+    feature_hists: Vec<Option<BucketHistogram>>,
     /// Global bins per feature (`max(n_borders) + 1`).
     n_bins: usize,
     /// Approx dimension (`der1.len() / n_objects`, `1` for scalar/binary losses).
@@ -732,7 +740,7 @@ impl GrowScratch {
         // BOTH fused paths build their level-0 per-feature histograms inside their own
         // parallel pass, so `new` leaves `feature_hists` empty (no redundant up-front
         // O(n·nf) build).
-        let feature_hists: Vec<BucketHistogram> = Vec::new();
+        let feature_hists: Vec<Option<BucketHistogram>> = Vec::new();
         Self {
             bins,
             leaf_of,
@@ -887,7 +895,7 @@ fn select_level_plain(
     scaled_l2: f64,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
-) -> CbResult<(Split, Vec<BucketHistogram>)> {
+) -> CbResult<(Split, Vec<Option<BucketHistogram>>)> {
     // FEAT-04 penalties are applied ONLY when an active (non-no-op) context is
     // supplied; otherwise the candidate scores stay byte-identical to the pre-6.6
     // path (D-6.6-05 — gate on the param being non-empty).
@@ -908,9 +916,16 @@ fn select_level_plain(
     // byte-for-byte deterministic single- vs multi-threaded (D-08). The per-bin fold
     // inside the scan stays the sequential `sum_f64` — no cross-feature float
     // reduction.
-    let per_feature: Vec<(Vec<Candidate>, BucketHistogram)> = (0..matrix.n_features())
+    let per_feature: Vec<(Vec<Candidate>, Option<BucketHistogram>)> = (0..matrix.n_features())
         .into_par_iter()
         .map_init(ScanScoreScratch::new, |scan, feature| {
+            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+            if borders.is_empty() {
+                // WR-04: a border-less feature is NEVER scored at any level (borders
+                // are a static per-feature property) — skip the O(n) build/derive
+                // entirely rather than building a histogram that is never read.
+                return (Vec::new(), None);
+            }
             let col = feature_col(bins, feature, n_objects);
             // Build (level 0) / derive (level > 0) this feature's current-level
             // single-feature histogram — the accumulation now lives INSIDE the
@@ -919,7 +934,7 @@ fn select_level_plain(
                 build_bucket_histogram(col, der1, weight, leaf_of, 1, 1, n_bins, dim)
             } else {
                 derive_feature_level_hist(
-                    parents.get(feature),
+                    parents.get(feature).and_then(Option::as_ref),
                     col,
                     der1,
                     weight,
@@ -929,10 +944,6 @@ fn select_level_plain(
                     dim,
                 )
             };
-            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-            if borders.is_empty() {
-                return (Vec::new(), feature_hist);
-            }
             // FUSED single-pass O(n_bins) scan + score over this feature's own
             // single-feature histogram (feature index 0), reusing the per-task
             // `scan` scratch across every feature this task handles (D-07). The
@@ -964,7 +975,7 @@ fn select_level_plain(
                     score,
                 });
             }
-            (local, feature_hist)
+            (local, Some(feature_hist))
         })
         .collect();
     // Split the feature-ordered results: flatten candidates (feature ascending ×
@@ -1013,7 +1024,7 @@ fn select_level_perturbed(
     perturb: &mut Perturbation<'_>,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
-) -> CbResult<(Split, Vec<BucketHistogram>)> {
+) -> CbResult<(Split, Vec<Option<BucketHistogram>>)> {
     let std_dev = perturb.score_st_dev;
     // FEAT-04 penalties apply at the per-feature SelectBestCandidate stage (pass 3
     // below) — the multiplicative feature weight scales the gain and the
@@ -1040,15 +1051,22 @@ fn select_level_perturbed(
     //     retained per-feature histograms become the next level's parent. NONE of the
     //     Pitfall-3 draws happen here — they stay in the serial feature-ascending
     //     passes (1)-(3), so the draw order/count is provably preserved.
-    let per_feature: Vec<(Vec<f64>, BucketHistogram)> = (0..matrix.n_features())
+    let per_feature: Vec<(Vec<f64>, Option<BucketHistogram>)> = (0..matrix.n_features())
         .into_par_iter()
         .map_init(ScanScoreScratch::new, |scan, feature| {
+            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+            if borders.is_empty() {
+                // WR-04: a border-less feature is NEVER scored at any level (borders
+                // are a static per-feature property) — skip the O(n) build/derive
+                // entirely rather than building a histogram that is never read.
+                return (Vec::new(), None);
+            }
             let col = feature_col(bins, feature, n_objects);
             let feature_hist = if level == 0 {
                 build_bucket_histogram(col, der1, weight, leaf_of, 1, 1, n_bins, dim)
             } else {
                 derive_feature_level_hist(
-                    parents.get(feature),
+                    parents.get(feature).and_then(Option::as_ref),
                     col,
                     der1,
                     weight,
@@ -1058,10 +1076,6 @@ fn select_level_perturbed(
                     dim,
                 )
             };
-            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
-            if borders.is_empty() {
-                return (Vec::new(), feature_hist);
-            }
             let raw_scores = scan_and_score_borders_into(
                 scan,
                 &feature_hist,
@@ -1071,7 +1085,7 @@ fn select_level_perturbed(
                 score_function,
                 scaled_l2,
             );
-            (raw_scores.to_vec(), feature_hist)
+            (raw_scores.to_vec(), Some(feature_hist))
         })
         .collect();
     // Split the feature-ordered results: the per-feature RAW border scores (the
