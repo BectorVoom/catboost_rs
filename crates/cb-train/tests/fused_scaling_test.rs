@@ -368,6 +368,14 @@ fn fused_scaling_curve() {
     secondary_end_to_end_curve();
 
     println!("RSBENCH215_DONE fused_per_level_speedup_16t={fused_16:.2}");
+    // IN-01: this hard `assert!` on a measured wall-clock speedup ratio is
+    // inherently machine/load dependent (core count, thermal throttling,
+    // background load). It is safe ONLY because this whole test is `CB_PERF`-gated
+    // (the early return above) and therefore never runs under a plain `cargo test`
+    // / normal CI invocation. If this test is ever promoted into an automated gate
+    // (e.g. a dedicated perf-CI lane), add margin/retry around the measurement or
+    // downgrade this to a warn-on-regression report rather than a hard `assert!`,
+    // so transient machine noise cannot flake the build.
     assert!(
         fused_16 >= 3.0,
         "isolated per-level fused 16-thread speedup = {fused_16:.2}x, expected >= 3.0x \
