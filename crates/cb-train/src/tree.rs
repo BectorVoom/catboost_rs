@@ -588,11 +588,10 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 
     // The reusable across-level grow state (the `TLearnContext` analogue): builds
     // the quantized bin matrix once and holds the current level's per-feature
-    // histograms. The FUSED plain path builds each level (incl. level 0) INSIDE its
-    // own parallel-over-features pass, so it skips the up-front level-0 build; the
-    // perturbed path scores from the retained `feature_hists`, so it materializes
-    // level 0 here (Plan 03 fuses that path).
-    let mut scratch = GrowScratch::new(matrix, der1, weight, n_objects, perturb.is_some());
+    // histograms. BOTH the plain and perturbed paths now build each level (incl.
+    // level 0) INSIDE their own fused parallel-over-features pass, so `new` skips the
+    // up-front level-0 build entirely (D-01/D-02).
+    let mut scratch = GrowScratch::new(matrix, der1, n_objects);
 
     for level in 0..depth {
         // PLAIN path (perturb = None): `select_level_plain` FUSES the per-feature
@@ -601,9 +600,13 @@ pub fn greedy_tensor_search_oblivious_perturbed(
         // next level derives from; the follow-up transition is the CHEAP leaf-only
         // `advance_leaf_only` (no histogram build on the hot path).
         //
-        // PERTURBED path (perturb = Some): the RNG-ordered feature loop scores from
-        // the retained `feature_hists`, and the full `advance` derives the next
-        // level's per-feature histograms (Plan 03 fuses this path).
+        // PERTURBED path (perturb = Some): `select_level_perturbed` now ALSO FUSES the
+        // per-feature build/derive + score into ONE rayon parallel-over-features pass
+        // (D-02) — the accumulation moves into the parallel region WITHOUT perturbing
+        // the Pitfall-3 draw contract (the RNG-bearing SetBestScore pass stays serial
+        // and feature-ascending, consuming the pre-computed raw scores) — and RETURNS
+        // this level's per-feature histograms; the follow-up transition is the SAME
+        // cheap leaf-only `advance_leaf_only` the plain path uses.
         let best = match perturb.as_mut() {
             None => {
                 let (split, hists) =
@@ -615,12 +618,11 @@ pub fn greedy_tensor_search_oblivious_perturbed(
                 split
             }
             Some(p) => {
-                let split =
-                    select_level_perturbed(matrix, &scratch, scaled_l2, p, score_function, penalties)?;
-                // Derive the NEXT level's histogram (subtraction trick); the last
-                // level has no successor, so skip its (unused) transition.
+                let (split, hists) =
+                    select_level_perturbed(matrix, &scratch, der1, weight, scaled_l2, p, score_function, penalties)?;
+                scratch.feature_hists = hists;
                 if level + 1 < depth {
-                    scratch.advance(matrix, der1, weight, &split, n_objects);
+                    scratch.advance_leaf_only(matrix, &split, n_objects);
                 }
                 split
             }
@@ -677,8 +679,6 @@ struct GrowScratch {
     /// (`feature_hists[f]`: `n_features == 1`, `n_leaves == 1 << level`). Retained
     /// as the parent store the next level derives from via the subtraction trick.
     feature_hists: Vec<BucketHistogram>,
-    /// Number of float features histogrammed.
-    n_features: usize,
     /// Global bins per feature (`max(n_borders) + 1`).
     n_bins: usize,
     /// Approx dimension (`der1.len() / n_objects`, `1` for scalar/binary losses).
@@ -688,20 +688,15 @@ struct GrowScratch {
 }
 
 impl GrowScratch {
-    /// Build the bin matrix and, when `build_initial_hists`, the level-0 (single root
-    /// leaf) per-feature histograms.
-    ///
-    /// The FUSED plain path builds level 0 INSIDE its own parallel pass
-    /// ([`select_level_plain`]), so it passes `build_initial_hists = false` and skips
-    /// the redundant up-front build. The perturbed path scores from the retained
-    /// `feature_hists` (Plan 03 fuses it later), so it needs the level-0 histograms
-    /// materialized here (`build_initial_hists = true`).
+    /// Build the bin matrix. BOTH grow paths (plain AND perturbed) now build their
+    /// level-0 per-feature histograms INSIDE their own fused parallel-over-features
+    /// pass ([`select_level_plain`] / [`select_level_perturbed`], D-01/D-02), so `new`
+    /// no longer materializes the redundant up-front level-0 build — the exact serial
+    /// O(n·nf) fraction this phase removes — and leaves `feature_hists` empty.
     fn new(
         matrix: &FeatureMatrix,
         der1: &[f64],
-        weight: &[f64],
         n_objects: usize,
-        build_initial_hists: bool,
     ) -> Self {
         let n_features = matrix.n_features();
         // Global bin width = max(n_borders)+1 over features; a feature with fewer
@@ -734,31 +729,14 @@ impl GrowScratch {
             (der1.len() / n_objects).max(1)
         };
         let leaf_of = vec![0usize; n_objects];
-        // Build the level-0 (single root leaf) histogram PER FEATURE, in parallel
-        // over independent features (PERF-04), ONLY when requested. Each
-        // `feature_hists[f]` is a single-feature (`n_features == 1`) histogram over
-        // that feature's contiguous feature-major column
-        // `bins[f*n_objects .. (f+1)*n_objects]`; because the bins are feature-major,
-        // a 1-feature build folds each cell's members in the SAME ascending-object
-        // `scatter_add_f64` order as the whole-partition `build_bucket_histogram`, so
-        // the cells are byte-for-byte identical (D-03). The fused plain path skips this
-        // (it builds level 0 in its own parallel pass), leaving `feature_hists` empty.
-        let feature_hists: Vec<BucketHistogram> = if build_initial_hists {
-            (0..n_features)
-                .into_par_iter()
-                .map(|feature| {
-                    let col = feature_col(&bins, feature, n_objects);
-                    build_bucket_histogram(col, der1, weight, &leaf_of, 1, 1, n_bins, approx_dim)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // BOTH fused paths build their level-0 per-feature histograms inside their own
+        // parallel pass, so `new` leaves `feature_hists` empty (no redundant up-front
+        // O(n·nf) build).
+        let feature_hists: Vec<BucketHistogram> = Vec::new();
         Self {
             bins,
             leaf_of,
             feature_hists,
-            n_features,
             n_bins,
             approx_dim,
             level: 0,
@@ -785,48 +763,6 @@ impl GrowScratch {
         self.level += 1;
     }
 
-    /// Advance from level `L` to `L+1` after `split` is chosen AND derive the next
-    /// level's per-feature histograms (the PERTURBED-path transition, which scores
-    /// from the retained `feature_hists` rather than fusing the derivation into its
-    /// own — RNG-ordered — feature loop). First updates `leaf_of` + `level`
-    /// ([`Self::advance_leaf_only`]), then derives each feature's next-level
-    /// histogram from its retained parent via the SUBTRACTION TRICK
-    /// ([`derive_feature_level_hist`]), PER FEATURE and in parallel over independent
-    /// features (PERF-04). Byte-identical to the previous whole-partition
-    /// `relocate_sub`/`add_relocated` decomposition (each cell belongs to one
-    /// feature, D-03/D-06).
-    fn advance(
-        &mut self,
-        matrix: &FeatureMatrix,
-        der1: &[f64],
-        weight: &[f64],
-        split: &Split,
-        n_objects: usize,
-    ) {
-        // (i) cheap partition transition: `leaf_of` becomes the level-(L+1) partition,
-        // `level` becomes L+1.
-        self.advance_leaf_only(matrix, split, n_objects);
-        // (ii) per-feature histogram derivation from the retained parents, reading the
-        // now-level-(L+1) `leaf_of` (which encodes the chosen split in its highest
-        // bit — `derive_feature_level_hist` reconstructs the parent partition + passes
-        // from it). Parallel over independent features; each writes a fresh Vec so the
-        // immutable `self.feature_hists` borrow is released before the write-back.
-        let dim = self.approx_dim;
-        let n_bins = self.n_bins;
-        let level = self.level;
-        let bins = &self.bins;
-        let leaf_of = &self.leaf_of;
-        let parents = &self.feature_hists;
-        let next_hists: Vec<BucketHistogram> = (0..self.n_features)
-            .into_par_iter()
-            .map(|feature| {
-                let parent_hist = parents.get(feature);
-                let col = feature_col(bins, feature, n_objects);
-                derive_feature_level_hist(parent_hist, col, der1, weight, leaf_of, level, n_bins, dim)
-            })
-            .collect();
-        self.feature_hists = next_hists;
-    }
 }
 
 /// This feature's contiguous, feature-major bin column
@@ -1056,19 +992,28 @@ fn select_level_plain(
 /// (`SetBestScore` then `SelectBestCandidate`, Pitfall 3). See
 /// [`greedy_tensor_search_oblivious_perturbed`] for the draw contract.
 ///
-/// Only the SOURCE of each candidate's RAW score changes (histogram prefix scan
-/// instead of the per-candidate rescan); the per-level `gen_rand`, the per-feature
-/// `from_seed(rand_seed + task_idx).advance(10)` reseed, the one `std_normal` per
-/// border, the per-feature `feature_best` bookkeeping, and the per-feature main-RNG
-/// `GetInstance` are byte-for-byte the same draw sequence and count (Pitfall 3).
+/// D-02: the per-feature accumulation is now FUSED with the score into ONE rayon
+/// parallel-over-features pass (same build/derive + `scan_and_score_borders_into`
+/// path the plain search uses, [`select_level_plain`]) — moving the O(n·nf)
+/// accumulation INTO the parallel region — WITHOUT perturbing the Pitfall-3 draw
+/// contract: that fused pass draws NO RNG; the raw border scores it produces are the
+/// unchanged SOURCE for the serial, feature-ascending SetBestScore pass below. The
+/// per-level `gen_rand`, the per-feature `from_seed(rand_seed + task_idx).advance(10)`
+/// reseed, the one `std_normal` per border, the per-feature `feature_best`
+/// bookkeeping, and the per-feature main-RNG `GetInstance` are byte-for-byte the same
+/// draw sequence and count (Pitfall 3). Returns the chosen [`Split`] AND this level's
+/// per-feature histograms (the parent the next level derives from), exactly like the
+/// plain path.
 fn select_level_perturbed(
     matrix: &FeatureMatrix,
     scratch: &GrowScratch,
+    der1: &[f64],
+    weight: &[f64],
     scaled_l2: f64,
     perturb: &mut Perturbation<'_>,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
-) -> CbResult<Split> {
+) -> CbResult<(Split, Vec<BucketHistogram>)> {
     let std_dev = perturb.score_st_dev;
     // FEAT-04 penalties apply at the per-feature SelectBestCandidate stage (pass 3
     // below) — the multiplicative feature weight scales the gain and the
@@ -1077,6 +1022,66 @@ fn select_level_perturbed(
     // untouched, so the unpenalized perturbed path is byte-identical (D-6.6-05).
     let active_penalties = penalties.filter(|p| !p.is_noop());
     let dim = scratch.approx_dim;
+    let level = scratch.level;
+    let n_bins = scratch.n_bins;
+    let n_objects = scratch.leaf_of.len();
+    let bins = &scratch.bins;
+    let leaf_of = &scratch.leaf_of;
+    let parents = &scratch.feature_hists;
+
+    // (0) D-02 FUSED per-feature accumulate + score, PARALLEL over INDEPENDENT
+    //     features and drawing NO RNG. Each feature builds (level 0) or derives
+    //     (level > 0, SUBTRACTION TRICK) its OWN single-feature histogram INSIDE its
+    //     `map_init` task, reusing a per-rayon-task [`ScanScoreScratch`] (D-07), and
+    //     scores its borders via the `O(n_bins)` prefix scan — byte-for-byte the same
+    //     RAW scores the previous whole-partition `scan_and_score_borders` produced
+    //     (each cell belongs to one feature, D-03; dim=1 byte-identical, D-04). The
+    //     accumulation now lives in the parallel region (Amdahl fix, Spike 006); the
+    //     retained per-feature histograms become the next level's parent. NONE of the
+    //     Pitfall-3 draws happen here — they stay in the serial feature-ascending
+    //     passes (1)-(3), so the draw order/count is provably preserved.
+    let per_feature: Vec<(Vec<f64>, BucketHistogram)> = (0..matrix.n_features())
+        .into_par_iter()
+        .map_init(ScanScoreScratch::new, |scan, feature| {
+            let col = feature_col(bins, feature, n_objects);
+            let feature_hist = if level == 0 {
+                build_bucket_histogram(col, der1, weight, leaf_of, 1, 1, n_bins, dim)
+            } else {
+                derive_feature_level_hist(
+                    parents.get(feature),
+                    col,
+                    der1,
+                    weight,
+                    leaf_of,
+                    level,
+                    n_bins,
+                    dim,
+                )
+            };
+            let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
+            if borders.is_empty() {
+                return (Vec::new(), feature_hist);
+            }
+            let raw_scores = scan_and_score_borders_into(
+                scan,
+                &feature_hist,
+                0,
+                borders.len(),
+                dim,
+                score_function,
+                scaled_l2,
+            );
+            (raw_scores.to_vec(), feature_hist)
+        })
+        .collect();
+    // Split the feature-ordered results: the per-feature RAW border scores (the
+    // unchanged SOURCE the RNG pass consumes) and the retained per-feature histograms.
+    let mut hists = Vec::with_capacity(per_feature.len());
+    let mut raw_per_feature: Vec<Vec<f64>> = Vec::with_capacity(per_feature.len());
+    for (raw, feature_hist) in per_feature {
+        raw_per_feature.push(raw);
+        hists.push(feature_hist);
+    }
 
     // (1) randSeed = Rand.GenRand() — one main-RNG draw per level (CalcScores).
     let rand_seed = perturb.rng.gen_rand();
@@ -1099,26 +1104,11 @@ fn select_level_perturbed(
         feat_rng.advance(10);
         task_idx += 1;
 
-        // FUSED single-pass O(n_bins) scan + score over this feature's borders, from
-        // this feature's OWN single-feature per-level histogram
-        // (`feature_hists[feature]`, feature index 0) — the per-border loop shape (and
-        // thus the RNG draw count/order) is untouched; only the SOURCE of each `raw`
-        // changes. Scratch is this-feature-local (allocated per `scan_and_score_borders`
-        // call), no per-candidate `Vec` (PERF-04), byte-identical `raw` to the prior
-        // whole-partition path (each cell belongs to one feature, D-03; Pitfall 3:
-        // exactly one `std_normal` per border, same order/count).
-        let Some(feature_hist) = scratch.feature_hists.get(feature) else {
-            feature_best.push(None);
-            continue;
-        };
-        let raw_scores = scan_and_score_borders(
-            feature_hist,
-            0,
-            borders.len(),
-            dim,
-            score_function,
-            scaled_l2,
-        );
+        // The RAW border scores come from the fused pass (0) above (this feature's OWN
+        // single-feature histogram, D-03) — only the SOURCE of each `raw` changed; the
+        // per-border loop shape, and thus the RNG draw count/order, is untouched
+        // (Pitfall 3: exactly one `std_normal` per border in ascending order).
+        let raw_scores = raw_per_feature.get(feature).map_or(&[][..], Vec::as_slice);
         let mut best_instance = MINIMAL_SCORE;
         let mut best_border: f64 = 0.0;
         let mut best_raw: f64 = MINIMAL_SCORE;
@@ -1159,9 +1149,10 @@ fn select_level_perturbed(
         }
     }
 
-    chosen_split.ok_or_else(|| {
+    let split = chosen_split.ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
-    })
+    })?;
+    Ok((split, hists))
 }
 
 // ===========================================================================
