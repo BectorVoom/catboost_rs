@@ -1,0 +1,16 @@
+{
+  "id": "yensen2/catboost-rs-quick-gpu-speed-check",
+  "title": "catboost-rs quick gpu speed check",
+  "code_file": "bench.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": ["gpu"],
+  "dataset_sources": ["yensen2/catboost-rs-quick-gpu-speed-src"],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}
