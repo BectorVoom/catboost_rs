@@ -38,9 +38,10 @@ pub use embedding_calcers::{
     LDA_DEFAULT_REG,
 };
 pub use histogram::{
-    bin_of, build_bucket_histogram, collect_leaf_residuals, reduce_leaf_der2, reduce_leaf_stats,
-    scan_and_score_borders, scan_border_to_leaf_stats, scan_borders_to_leaf_stats, BucketHistogram,
-    LeafStats,
+    bin_of, build_bucket_histogram, build_bucket_histogram_into, collect_leaf_residuals,
+    fused_feature_scan_and_score, reduce_leaf_der2, reduce_leaf_stats, scan_and_score_borders,
+    scan_and_score_borders_into, scan_border_to_leaf_stats, scan_borders_to_leaf_stats,
+    BucketHistogram, FusedFeatureScratch, LeafStats, ScanScoreScratch,
 };
 pub use lda_linalg::{
     calculate_projection, jacobi_symmetric_eig, reduce_generalized, sgemv_rowmajor, SymmetricEig,

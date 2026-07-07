@@ -571,23 +571,74 @@ pub fn build_bucket_histogram(
     n_bins: usize,
     approx_dimension: usize,
 ) -> BucketHistogram {
+    let n_channels = approx_dimension + 1;
+    // Single accumulation code path: delegate to the buffer-reusing `_into` variant
+    // with a fresh Vec, then wrap. The scatter fold is spelled ONCE (in `_into`), so
+    // this allocating entry and the fused per-feature path share bit-for-bit identical
+    // accumulation arithmetic (D-03).
+    let mut data: Vec<f64> = Vec::new();
+    build_bucket_histogram_into(
+        &mut data, bins, der1, weight, leaf_of, n_leaves, n_features, n_bins, approx_dimension,
+    );
+
+    BucketHistogram {
+        data,
+        n_leaves,
+        n_features,
+        n_bins,
+        n_channels,
+    }
+}
+
+/// Buffer-reusing sibling of [`build_bucket_histogram`]: the SAME object-outer /
+/// feature-inner scatter-add fold, but writing into the CALLER's `data` buffer
+/// instead of a freshly allocated `Vec` (D-07). The buffer is `clear()`ed and
+/// `resize`d to the checked flat length (all-zero), then scattered — an identical
+/// all-zero starting state to the previous `vec![0.0; total]`, so the produced bits
+/// are byte-for-byte unchanged. Every per-object contribution is folded in ascending
+/// OBJECT order through [`cb_core::scatter_add_f64`] (the SCATTER form of the same
+/// left-to-right `+=` fold as [`cb_core::sum_f64`], D-05/D-08) — so a per-feature
+/// call (`n_features = 1`) over a contiguous feature column produces exactly the
+/// cells [`build_bucket_histogram`] over all features would for that feature (D-03).
+///
+/// On an index-arithmetic overflow of the flat length the buffer is left EMPTY rather
+/// than panicking (T-21-02). Out-of-range bins/objects are skipped (no raw indexing,
+/// T-21-01). The eight trailing parameters mirror the frozen device-template contract
+/// exactly as [`build_bucket_histogram`], so the arity allow is deliberate.
+#[allow(clippy::too_many_arguments)]
+pub fn build_bucket_histogram_into(
+    data: &mut Vec<f64>,
+    bins: &[u32],
+    der1: &[f64],
+    weight: &[f64],
+    leaf_of: &[usize],
+    n_leaves: usize,
+    n_features: usize,
+    n_bins: usize,
+    approx_dimension: usize,
+) {
     let n_objects = leaf_of.len();
     let n_channels = approx_dimension + 1;
-    // Checked flat length (T-21-02): overflow → empty degenerate histogram (no panic).
+    // Checked flat length (T-21-02): overflow → empty degenerate buffer (no panic).
     let total = n_leaves
         .checked_mul(n_features)
         .and_then(|x| x.checked_mul(n_bins))
         .and_then(|x| x.checked_mul(n_channels))
         .unwrap_or(0);
 
-    // Scatter-add each per-object contribution directly into ONE flat accumulator
-    // in ascending OBJECT order (WR-02, PERF-03): no per-cell nested-Vec gather.
-    // Because `scatter_add_f64` is the SCATTER form of the same left-to-right `+=`
-    // fold as `cb_core::sum_f64`, folding a cell's members by repeated scatter-add in
-    // this object-outer / feature-inner order is byte-identical to gathering them and
-    // calling `sum_f64` (D-05/D-08 preserved with zero per-cell heap allocation).
-    let mut data = vec![0.0_f64; total];
+    // Resize-and-zero the caller's buffer to exactly `total` (D-07: no per-call Vec
+    // allocation when reused across `map_init` tasks). `clear()` drops the previous
+    // contents (len → 0) and `resize(total, 0.0)` fills to the frozen length with
+    // zeros — an all-zero buffer identical to `vec![0.0; total]`.
+    data.clear();
+    data.resize(total, 0.0_f64);
 
+    // Scatter-add each per-object contribution directly into the flat accumulator in
+    // ascending OBJECT order (WR-02, PERF-03): no per-cell nested-Vec gather. Because
+    // `scatter_add_f64` is the SCATTER form of the same left-to-right `+=` fold as
+    // `cb_core::sum_f64`, folding a cell's members by repeated scatter-add in this
+    // object-outer / feature-inner order is byte-identical to gathering them and
+    // calling `sum_f64` (D-05/D-08 preserved with zero per-cell heap allocation).
     for obj in 0..n_objects {
         let leaf = match leaf_of.get(obj) {
             Some(&l) if l < n_leaves => l,
@@ -605,18 +656,10 @@ pub fn build_bucket_histogram(
             let cell_base = ((leaf * n_features + feature) * n_bins + bin) * n_channels;
             for d in 0..approx_dimension {
                 let dval = der1.get(d * n_objects + obj).copied().unwrap_or(0.0);
-                cb_core::scatter_add_f64(&mut data, cell_base + d, dval);
+                cb_core::scatter_add_f64(data, cell_base + d, dval);
             }
-            cb_core::scatter_add_f64(&mut data, cell_base + approx_dimension, w);
+            cb_core::scatter_add_f64(data, cell_base + approx_dimension, w);
         }
-    }
-
-    BucketHistogram {
-        data,
-        n_leaves,
-        n_features,
-        n_bins,
-        n_channels,
     }
 }
 
@@ -874,7 +917,81 @@ pub fn scan_and_score_borders(
     score_function: crate::runtime::EScoreFunction,
     scaled_l2: f64,
 ) -> Vec<f64> {
+    let mut scratch = ScanScoreScratch::new();
+    scan_and_score_borders_into(
+        &mut scratch,
+        hist,
+        feature,
+        n_borders,
+        approx_dimension,
+        score_function,
+        scaled_l2,
+    )
+    .to_vec()
+}
+
+/// Caller-owned reusable working buffers for [`scan_and_score_borders_into`]: the
+/// per-parent totals / FALSE-prefix accumulators, the per-parent gather column, the
+/// per-border [`LeafStats`] scratch, the num/den score-fold buffers, and the output
+/// `scores` Vec — everything [`scan_and_score_borders`] used to allocate fresh per
+/// call. Bundling them into one struct lets `tree.rs` construct a single scratch per
+/// rayon `map_init` task (D-07) and reuse it across every feature that task scores,
+/// so the split-finding sweep does ZERO per-feature/per-candidate heap allocation.
+///
+/// All buffers are cleared/resized (never re-read stale) at the start of each
+/// [`scan_and_score_borders_into`] call, so a reused scratch produces byte-for-byte
+/// identical results to a fresh one — pure allocation hoisting, no arithmetic change.
+#[derive(Debug, Default, Clone)]
+pub struct ScanScoreScratch {
+    total_w: Vec<f64>,
+    total_d: Vec<f64>,
+    col: Vec<f64>,
+    acc_false_w: Vec<f64>,
+    acc_false_d: Vec<f64>,
+    per_dim: Vec<Vec<LeafStats>>,
+    num: Vec<f64>,
+    den: Vec<f64>,
+    scores: Vec<f64>,
+}
+
+impl ScanScoreScratch {
+    /// A fresh, empty scratch (all buffers lazily sized on first use).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Buffer-reusing sibling of [`scan_and_score_borders`]: the SAME per-parent totals +
+/// FALSE-prefix running-sum + [`crate::score::multi_dim_split_score_into`] fold, but
+/// with every working buffer supplied by the caller via `scratch` (cleared+resized,
+/// not freshly allocated, D-07). The returned slice borrows `scratch.scores`; it is
+/// byte-for-byte identical to [`scan_and_score_borders`]'s owned `Vec` (pure
+/// allocation hoisting — NO reorder). The scoring math is [`multi_dim_split_score_into`]
+/// verbatim (single source of truth — NOT forked here).
+#[allow(clippy::too_many_arguments)]
+pub fn scan_and_score_borders_into<'s>(
+    scratch: &'s mut ScanScoreScratch,
+    hist: &BucketHistogram,
+    feature: usize,
+    n_borders: usize,
+    approx_dimension: usize,
+    score_function: crate::runtime::EScoreFunction,
+    scaled_l2: f64,
+) -> &'s [f64] {
     use crate::score::multi_dim_split_score_into;
+
+    let ScanScoreScratch {
+        total_w,
+        total_d,
+        col,
+        acc_false_w,
+        acc_false_d,
+        per_dim,
+        num,
+        den,
+        scores,
+    } = scratch;
 
     let n_parent = hist.n_leaves();
     let n_bins = hist.n_bins();
@@ -884,11 +1001,15 @@ pub fn scan_and_score_borders(
 
     // Per-parent totals (`sum_f64` over the whole weight / delta column, ONCE per
     // parent — the same total `scan_borders_to_leaf_stats` computes). Flat arrays:
-    // `total_w[parent]`, `total_d[parent * dim + d]`.
-    let mut total_w = vec![0.0_f64; n_parent];
-    let mut total_d = vec![0.0_f64; n_parent.saturating_mul(dim)];
+    // `total_w[parent]`, `total_d[parent * dim + d]`. Reset to all-zero of the exact
+    // length (identical starting state to the previous `vec![0.0; ..]`).
+    total_w.clear();
+    total_w.resize(n_parent, 0.0_f64);
+    total_d.clear();
+    total_d.resize(n_parent.saturating_mul(dim), 0.0_f64);
     // Reused per-parent gather column for the total's ordered `sum_f64`.
-    let mut col = vec![0.0_f64; n_bins];
+    col.clear();
+    col.resize(n_bins, 0.0_f64);
     for parent in 0..n_parent {
         let block = match hist.feature_block(parent, feature) {
             Some(b) => b,
@@ -900,7 +1021,7 @@ pub fn scan_and_score_borders(
             }
         }
         if let Some(slot) = total_w.get_mut(parent) {
-            *slot = sum_f64(&col);
+            *slot = sum_f64(col.as_slice());
         }
         for d in 0..approx_dimension {
             for bin in 0..n_bins {
@@ -909,7 +1030,7 @@ pub fn scan_and_score_borders(
                 }
             }
             if let Some(slot) = total_d.get_mut(parent * dim + d) {
-                *slot = sum_f64(&col);
+                *slot = sum_f64(col.as_slice());
             }
         }
     }
@@ -917,18 +1038,24 @@ pub fn scan_and_score_borders(
     // Per-parent FALSE-side running prefixes, carried across the border loop (the
     // ONLY cross-border accumulation — bit-identical ascending `+=`, the same one
     // `scan_borders_to_leaf_stats` does). `acc_false_w[parent]`,
-    // `acc_false_d[parent * dim + d]`.
-    let mut acc_false_w = vec![0.0_f64; n_parent];
-    let mut acc_false_d = vec![0.0_f64; n_parent.saturating_mul(dim)];
+    // `acc_false_d[parent * dim + d]`. Reset to zero before the sweep.
+    acc_false_w.clear();
+    acc_false_w.resize(n_parent, 0.0_f64);
+    acc_false_d.clear();
+    acc_false_d.resize(n_parent.saturating_mul(dim), 0.0_f64);
     // REUSED per-border LeafStats scratch: `per_dim[d]` is `[2·n_parent]` leaves
     // (indices 0..n_parent = FALSE children, n_parent..2·n_parent = TRUE children),
     // in the exact canonical order `multi_dim_split_score` folds (dimension-then-leaf).
-    let mut per_dim: Vec<Vec<LeafStats>> = vec![vec![LeafStats::default(); 2 * n_parent]; dim];
-    // REUSED score-fold buffers (num / den) — zero per-candidate heap allocation.
-    let mut num_scratch: Vec<f64> = Vec::new();
-    let mut den_scratch: Vec<f64> = Vec::new();
+    // Reset each row to all-`default()`, reusing the inner Vec allocations across calls.
+    per_dim.resize_with(dim, Vec::new);
+    for row in per_dim.iter_mut() {
+        row.clear();
+        row.resize(2 * n_parent, LeafStats::default());
+    }
+    // Output scores buffer (num/den fold buffers are cleared inside `_into`).
+    scores.clear();
+    scores.reserve(n_borders);
 
-    let mut scores: Vec<f64> = Vec::with_capacity(n_borders);
     for b in 0..n_borders {
         for parent in 0..n_parent {
             // Advance this parent's FALSE prefix by bin `b` (or leave it if the
@@ -979,15 +1106,109 @@ pub fn scan_and_score_borders(
             }
         }
         // FRESH per-border fold over all 2·n_parent leaves in dimension-then-leaf
-        // order (the reused scratch is cleared+refilled inside `_into`).
-        let score = multi_dim_split_score_into(
-            &mut num_scratch,
-            &mut den_scratch,
-            score_function,
-            &per_dim,
-            scaled_l2,
-        );
+        // order (the reused num/den scratch is cleared+refilled inside `_into`).
+        let score =
+            multi_dim_split_score_into(num, den, score_function, per_dim.as_slice(), scaled_l2);
         scores.push(score);
     }
+    scores.as_slice()
+}
+
+/// Caller-owned reusable buffers for [`fused_feature_scan_and_score`]: one histogram
+/// `data` Vec (the single-feature [`BucketHistogram`] backing store) plus a
+/// [`ScanScoreScratch`]. This is the `map_init` unit `tree.rs` constructs ONCE per
+/// rayon task (D-07) and threads through every feature that task fuses, so neither the
+/// per-feature histogram nor any score-side buffer is allocated inside the `.map`
+/// closure (the >8-thread allocator-contention dip Spike 006 measured).
+#[derive(Debug, Default, Clone)]
+pub struct FusedFeatureScratch {
+    /// Reusable single-feature histogram backing store (frozen flat layout).
+    data: Vec<f64>,
+    /// Reusable scan+score working buffers.
+    scan: ScanScoreScratch,
+}
+
+impl FusedFeatureScratch {
+    /// A fresh, empty scratch (all buffers lazily sized on first use).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// The FUSED single-feature accumulate+score primitive (D-03/D-07): build the
+/// 1-feature [`BucketHistogram`] for one feature's contiguous, feature-major bin
+/// column `feature_col_bins` (`n_features = 1`) into the caller's reusable
+/// `scratch.data`, then scan+score its borders into `scratch.scan`, returning the
+/// per-border score slice. This is exactly the per-feature body of Spike 006's
+/// `run_fused` with ALL buffers reused across calls.
+///
+/// # Bit-identity (the parity contract, D-03/D-04)
+/// Because the bins are feature-major, a 1-feature build over the contiguous column
+/// folds each cell's members in the SAME ascending-object-order `scatter_add_f64`
+/// order as the whole-partition [`build_bucket_histogram`], so the produced cells are
+/// byte-for-byte identical for that feature; the subsequent scan+score reuses the
+/// frozen [`scan_and_score_borders_into`] path verbatim. Hence
+/// `fused_feature_scan_and_score(col_f) == build_bucket_histogram(all) then
+/// scan_and_score_borders(f)` to `f64::to_bits`, proven by the
+/// `fused_feature_parity_test` guard.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_feature_scan_and_score<'s>(
+    scratch: &'s mut FusedFeatureScratch,
+    feature_col_bins: &[u32],
+    der1: &[f64],
+    weight: &[f64],
+    leaf_of: &[usize],
+    n_leaves: usize,
+    n_bins: usize,
+    approx_dimension: usize,
+    n_borders: usize,
+    score_function: crate::runtime::EScoreFunction,
+    scaled_l2: f64,
+) -> &'s [f64] {
+    let FusedFeatureScratch { data, scan } = scratch;
+
+    // (1) Build the 1-feature histogram into the reused backing store.
+    build_bucket_histogram_into(
+        data,
+        feature_col_bins,
+        der1,
+        weight,
+        leaf_of,
+        n_leaves,
+        1,
+        n_bins,
+        approx_dimension,
+    );
+
+    // (2) Wrap the freshly-filled buffer in a BucketHistogram view. `mem::take`
+    // moves the Vec out (leaving `data` momentarily empty); the wrapper is dropped
+    // below and its buffer moved BACK into `data` so the allocation is retained for
+    // the next call (D-07). `scan_and_score_borders_into` reads the histogram
+    // immutably, so this borrows nothing from `scan`.
+    let n_channels = approx_dimension + 1;
+    let hist = BucketHistogram {
+        data: std::mem::take(data),
+        n_leaves,
+        n_features: 1,
+        n_bins,
+        n_channels,
+    };
+
+    // (3) Scan+score feature 0 into the reused scan scratch.
+    let scores = scan_and_score_borders_into(
+        scan,
+        &hist,
+        0,
+        n_borders,
+        approx_dimension,
+        score_function,
+        scaled_l2,
+    );
+
+    // (4) Reclaim the histogram backing store into `scratch.data` for reuse. `data`
+    // and `scan` are disjoint fields, so mutating `*data` while `scores` borrows
+    // `scan` is sound.
+    *data = hist.data;
     scores
 }
