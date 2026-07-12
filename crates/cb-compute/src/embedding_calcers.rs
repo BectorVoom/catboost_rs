@@ -661,21 +661,21 @@ impl KnnCalcer {
     /// - `is_classification` selects the vote-count vs mean arm.
     /// - `num_classes` sets the classification output width (ignored for reg).
     ///
-    /// Falls back to the exact backend only if the derived HNSW options are
-    /// degenerate (`close_num == 0` or `close_num > 300`), which the trainer never
-    /// produces; see [`Self::new_exact`] for the explicit exact opt-in.
-    #[must_use]
+    /// # Errors
+    /// [`CbError::OutOfRange`] if the derived HNSW options are invalid — i.e.
+    /// `close_num == 0` or `close_num > 300` (the pinned `SearchNeighborhoodSize`).
+    /// This mirrors upstream's own `CheckOptions` guard (`1 <= MaxNeighbors <=
+    /// SearchNeighborhoodSize`, `build_options.h`); an invalid `k` is surfaced
+    /// rather than silently degraded to the non-parity exact backend. Use
+    /// [`Self::new_exact`] for the explicit exact opt-in.
     pub fn new(
         dimension: usize,
         close_num: usize,
         is_classification: bool,
         num_classes: usize,
-    ) -> Self {
-        let backend = match HnswKnnCloud::new(dimension, close_num) {
-            Ok(c) => KnnBackend::Hnsw(c),
-            Err(_) => KnnBackend::Exact(KnnCloud::new(dimension)),
-        };
-        Self::from_backend(backend, close_num, is_classification, num_classes)
+    ) -> CbResult<Self> {
+        let backend = KnnBackend::Hnsw(HnswKnnCloud::new(dimension, close_num)?);
+        Ok(Self::from_backend(backend, close_num, is_classification, num_classes))
     }
 
     /// A new empty KNN calcer using the brute-force-EXACT neighbor backend (D-03

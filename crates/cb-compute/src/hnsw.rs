@@ -293,16 +293,19 @@ impl DynamicDenseGraph {
             g.ids.extend_from_slice(&other.ids);
             return g;
         }
+        // `max_neighbor_count >= other.max_neighbor_count >= other.neighbor_count`
+        // (upstream `Y_ASSERT(other.MaxNeighborCount <= MaxNeighborCount)`), so the
+        // pad width is non-negative; `saturating_sub` matches the rest of the file
+        // and cannot underflow-panic if that invariant is ever violated.
+        let pad = max_neighbor_count.saturating_sub(g.neighbor_count);
         for vertex_id in 0..other.size {
             let d = other.neighbor_distances(vertex_id);
             let i = other.neighbor_ids(vertex_id);
             // ExtendWithPadding: append `neighbor_count` live entries, pad to mnc.
             g.distances.extend_from_slice(&d);
-            g.distances
-                .resize(g.distances.len() + max_neighbor_count - g.neighbor_count, 0.0);
+            g.distances.resize(g.distances.len() + pad, 0.0);
             g.ids.extend_from_slice(&i);
-            g.ids
-                .resize(g.ids.len() + max_neighbor_count - g.neighbor_count, 0);
+            g.ids.resize(g.ids.len() + pad, 0);
         }
         g
     }
@@ -315,11 +318,20 @@ impl DynamicDenseGraph {
         self.neighbor_count
     }
 
-    /// The live neighbor ids of `index` (length `neighbor_count`).
-    fn neighbor_ids(&self, index: usize) -> Vec<usize> {
+    /// The live neighbor ids of `index` as a BORROWED slice (length
+    /// `neighbor_count`) — the zero-alloc form used on the read-only search hot
+    /// path. The mutation paths that read-then-mutate the graph use the owned
+    /// [`Self::neighbor_ids`] instead to sidestep the borrow conflict.
+    fn neighbor_ids_slice(&self, index: usize) -> &[usize] {
         let start = index.saturating_mul(self.max_neighbor_count);
         let end = start + self.neighbor_count;
-        self.ids.get(start..end).map(<[usize]>::to_vec).unwrap_or_default()
+        self.ids.get(start..end).unwrap_or(&[])
+    }
+
+    /// The live neighbor ids of `index` (length `neighbor_count`), OWNED — for
+    /// callers that must retain the ids across a subsequent graph mutation.
+    fn neighbor_ids(&self, index: usize) -> Vec<usize> {
+        self.neighbor_ids_slice(index).to_vec()
     }
 
     /// The live neighbor distances of `index` (length `neighbor_count`).
@@ -511,6 +523,15 @@ impl OnlineHnswIndex {
         l2_sqr_f32(query, self.item(id))
     }
 
+    /// Distance from `query` to stored item `id`, reading `points`/`dimension` as
+    /// FIELDS (not via `&self` methods) so the search hot path can compute it while
+    /// holding an immutable borrow of the disjoint `levels` field — enabling the
+    /// zero-alloc [`DynamicDenseGraph::neighbor_ids_slice`] on the traversal loops.
+    fn dist_to_fielded(points: &[f32], dim: usize, query: &[f32], id: usize) -> f32 {
+        let start = id.saturating_mul(dim);
+        l2_sqr_f32(query, points.get(start..start + dim).unwrap_or(&[]))
+    }
+
     /// `GetNearestNeighbors(item, topSize)` — the read path (`index_base.h:178-187`).
     /// Naive-exact when `max_neighbors + 1 >= num_items`, else the approximate HNSW
     /// search. Returns neighbors ASCENDING by distance (nearest first).
@@ -560,24 +581,27 @@ impl OnlineHnswIndex {
     /// (the raw max-queue drain order; the caller reverses).
     fn find_approximate_neighbors(&self, query: &[f32], top_size: usize) -> Vec<Neighbor> {
         let num_levels = self.levels.len();
+        let dim = self.dimension;
         let mut entry_id = 0usize;
         let mut entry_dist = self.dist_to(query, entry_id);
 
         // Greedy descent: for level = size; level-- > 1;
+        // `points` is borrowed as a field alongside the `levels` slice (disjoint),
+        // so `neighbor_ids_slice` stays zero-alloc on this hot loop.
+        let points = &self.points;
         let mut level = num_levels;
         while level > 1 {
             level -= 1;
-            let Some(graph) = self.levels.get(level) else {
-                continue;
-            };
             loop {
                 let mut entry_changed = false;
-                for neighbor_id in graph.neighbor_ids(entry_id) {
-                    let d = self.dist_to(query, neighbor_id);
-                    if d < entry_dist {
-                        entry_dist = d;
-                        entry_id = neighbor_id;
-                        entry_changed = true;
+                if let Some(graph) = self.levels.get(level) {
+                    for &neighbor_id in graph.neighbor_ids_slice(entry_id) {
+                        let d = Self::dist_to_fielded(points, dim, query, neighbor_id);
+                        if d < entry_dist {
+                            entry_dist = d;
+                            entry_id = neighbor_id;
+                            entry_changed = true;
+                        }
                     }
                 }
                 if !entry_changed {
@@ -600,31 +624,33 @@ impl OnlineHnswIndex {
         });
         visited.insert(entry_id);
 
-        let base = self.levels.front();
         while !candidates.is_empty() {
             let cur = candidates.top();
             candidates.pop();
             if nearest.top().dist < cur.dist {
                 break;
             }
-            let cur_neighbors = base.map(|g| g.neighbor_ids(cur.id)).unwrap_or_default();
-            for neighbor_id in cur_neighbors {
-                if visited.contains(&neighbor_id) {
-                    continue;
-                }
-                let d = self.dist_to(query, neighbor_id);
-                if nearest.size() < ef || d < nearest.top().dist {
-                    nearest.push(Neighbor {
-                        dist: d,
-                        id: neighbor_id,
-                    });
-                    candidates.push(Neighbor {
-                        dist: d,
-                        id: neighbor_id,
-                    });
-                    visited.insert(neighbor_id);
-                    if nearest.size() > ef {
-                        nearest.pop();
+            // Borrow the base level's neighbor slice for `cur.id` (zero-alloc) while
+            // reading `points` as the disjoint field — no per-candidate Vec.
+            if let Some(base) = self.levels.front() {
+                for &neighbor_id in base.neighbor_ids_slice(cur.id) {
+                    if visited.contains(&neighbor_id) {
+                        continue;
+                    }
+                    let d = Self::dist_to_fielded(points, dim, query, neighbor_id);
+                    if nearest.size() < ef || d < nearest.top().dist {
+                        nearest.push(Neighbor {
+                            dist: d,
+                            id: neighbor_id,
+                        });
+                        candidates.push(Neighbor {
+                            dist: d,
+                            id: neighbor_id,
+                        });
+                        visited.insert(neighbor_id);
+                        if nearest.size() > ef {
+                            nearest.pop();
+                        }
                     }
                 }
             }
@@ -978,7 +1004,6 @@ impl OnlineHnswIndex {
 #[derive(Debug, Clone)]
 pub struct HnswKnnCloud {
     dimension: usize,
-    close_num: usize,
     index: OnlineHnswIndex,
 }
 
@@ -995,7 +1020,6 @@ impl HnswKnnCloud {
     pub fn new(dimension: usize, close_num: usize) -> CbResult<Self> {
         Ok(HnswKnnCloud {
             dimension,
-            close_num,
             index: OnlineHnswIndex::new(dimension, close_num, KNN_SEARCH_NEIGHBORHOOD_SIZE)?,
         })
     }
@@ -1042,7 +1066,6 @@ impl HnswKnnCloud {
                 self.dimension
             )));
         }
-        let _ = self.close_num;
         Ok(self
             .index
             .get_nearest_neighbors(query, k)

@@ -486,7 +486,13 @@ fn xor_corpus() -> (Vec<String>, Vec<Vec<f32>>, Vec<f64>, Vec<f32>) {
 /// for prediction (`data.cpp:537` `EstimatedObjectsData`, `learnPermutation =
 /// Nothing()`). The tree split borders are the model's own (learned on the online
 /// column); only the per-object feature VALUES come from `apply_cols`.
+///
+/// SCALAR-ONLY: this indexes `tree.leaf_values` directly by leaf, which is correct
+/// only for `approx_dimension == 1` (the XOR binary model). A multi-output model
+/// uses the dimension-major `leaf_values[d * n_leaves + l]` layout; the assert makes
+/// a misuse fail loudly rather than silently reading dimension 0.
 fn staged_apply_offline(model: &CbTrainModel, apply_cols: &[Vec<f32>]) -> (Vec<f64>, Vec<f64>) {
+    assert_eq!(model.approx_dimension, 1, "staged_apply_offline is scalar-only");
     let n = apply_cols.first().map_or(0, Vec::len);
     let mut cumulative = vec![model.bias; n];
     let mut staged: Vec<f64> = Vec::with_capacity(model.oblivious_trees.len() * n);
