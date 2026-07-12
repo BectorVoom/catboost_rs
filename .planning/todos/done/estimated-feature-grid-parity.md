@@ -2,11 +2,39 @@
 title: Estimated-feature stored-border-VALUE quantization-grid parity
 date: 2026-06-19
 priority: medium
-status: pending
+status: RESOLVED (2026-07-12, Phase 16 / FEAT-07)
 resolves_phase: 16
 origin: Phase 06.5 (deferred in 06.5-07, confirmed still-open after 06.5-08/09)
 blocks: nothing (non-blocking — FEAT-01/FEAT-02/SC-1..SC-4 all closed ≤1e-5)
 area: cb-train estimated-feature KNN calcer (online HNSW port) — NOT quantization/serialization
+---
+
+## RESOLUTION (2026-07-12, Phase 16 / FEAT-07)
+
+**CLOSED ≤1e-5.** The blocker identified below (upstream KNN uses online HNSW, Rust used
+brute-force-exact) was fixed by porting `library/cpp/online_hnsw/base` + the `NHnsw`
+routines + the libc++ `push_heap`/`pop_heap` tie-break bit-for-bit into
+`crates/cb-compute/src/hnsw.rs`. HNSW is now the DEFAULT `KnnCalcer` backend (exact kept
+behind `KnnCalcer::new_exact`, D-03).
+
+- **Neighbor set (SC-1):** `crates/cb-oracle/tests/hnsw_neighbor_oracle_test.rs` reproduces
+  the instrumented `knn_neighbors` dump index-for-index, including the approximate-path
+  prefixes (size ≥ 7). The distance-tie ordering the old exact calcer got wrong (it assumed
+  ascending-id; upstream uses the libc++ heap element-movement order) is now exact.
+- **XOR per-stage (SC-3):** `text_embedding_end_to_end_oracle_test.rs::xor_oracle_{staged_approx,predictions}_match_upstream`
+  pass ≤1e-5 IN ORDER (measured max|diff| ≈ 1.2e-8), no weakened tolerance, no `#[ignore]`.
+- **The second coupled fix (the "train-vs-apply source split" hypothesized below, gap #1):**
+  CONFIRMED and applied. Structure + leaf values are learned on the ONLINE (leakage-controlled)
+  KNN column; the trained trees are APPLIED to the OFFLINE whole-set column for staged
+  approx + predictions. Gaps #2 (multi-permutation fold averaging) and #3 (per-iteration
+  dynamic column) from the "second pass" note below were DISPROVEN by the instrumented
+  trainer (fold_count=1, single static online column) and are NOT needed — the identity
+  online prefix + offline apply reproduces upstream exactly once the neighbors match.
+
+Remaining (non-blocking, tracked in ROADMAP Phase 16 Deferred): the static `TKNNCloud`
+batched builder (`TIndexBuilder::Build`, only constructed on `.cbm` LOAD) was not ported;
+no in-tree path exercises it.
+
 ---
 
 # Estimated-feature stored-border grid parity

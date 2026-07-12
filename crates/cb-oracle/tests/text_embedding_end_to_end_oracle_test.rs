@@ -478,39 +478,91 @@ fn xor_corpus() -> (Vec<String>, Vec<Vec<f32>>, Vec<f64>, Vec<f32>) {
     (texts, embeddings, labels, targets)
 }
 
-/// Build the XOR text + embedding layout (NO numeric block) using the ONLINE KNN
-/// estimate (Task 2 `embedding_online = true` — upstream's stored-border source)
-/// and train the model end-to-end.
+/// Walk a trained oblivious model over a SEPARATE application feature-column set,
+/// returning the per-iteration staged approx (iteration-major, matching upstream's
+/// `staged.npy`) and the final predictions. This is upstream's train-vs-apply split:
+/// structure + leaf values are learned on the ONLINE (leakage-controlled) estimated
+/// features, but the model is APPLIED to the OFFLINE (whole-set) estimated features
+/// for prediction (`data.cpp:537` `EstimatedObjectsData`, `learnPermutation =
+/// Nothing()`). The tree split borders are the model's own (learned on the online
+/// column); only the per-object feature VALUES come from `apply_cols`.
+fn staged_apply_offline(model: &CbTrainModel, apply_cols: &[Vec<f32>]) -> (Vec<f64>, Vec<f64>) {
+    let n = apply_cols.first().map_or(0, Vec::len);
+    let mut cumulative = vec![model.bias; n];
+    let mut staged: Vec<f64> = Vec::with_capacity(model.oblivious_trees.len() * n);
+    for tree in &model.oblivious_trees {
+        for (obj, cum) in cumulative.iter_mut().enumerate() {
+            let mut leaf = 0usize;
+            for (k, s) in tree.splits.iter().enumerate() {
+                let v = apply_cols.get(s.feature).and_then(|c| c.get(obj)).copied().unwrap_or(0.0);
+                if f64::from(v) > s.border {
+                    leaf |= 1usize << k;
+                }
+            }
+            *cum += tree.leaf_values.get(leaf).copied().unwrap_or(0.0);
+        }
+        staged.extend_from_slice(&cumulative);
+    }
+    (staged, cumulative)
+}
+
+/// Build the XOR text + embedding layout (NO numeric block) and reproduce upstream's
+/// full pipeline: TRAIN structure + leaf values on the ONLINE KNN estimate
+/// (`embedding_online = true` — the leakage-controlled read-before-update column,
+/// upstream's stored-border 0.5 source), then APPLY the trained trees to the OFFLINE
+/// whole-set estimate for staged approx + predictions. The BoW text block (target-
+/// independent) is identical in both, so only the KNN embedding column differs
+/// between the train and apply layouts.
+///
+/// Returns `(model, online_train_feats, staged_offline)`; the offline-applied staged
+/// buffer's final `n` entries are the predictions.
 fn train_xor() -> (CbTrainModel, MixedEstimatedFeatures, Vec<f64>) {
     let (texts, embeddings, labels, targets) = xor_corpus();
     let n = texts.len();
 
-    let feats = build_mixed_estimated_features(
+    // TRAIN layout: ONLINE KNN estimate (leakage-controlled, load-bearing under XOR).
+    let feats_online = build_mixed_estimated_features(
         &[], // NO numeric block — text_bit XOR embed_bit, both estimated features
         &texts,
         &embeddings,
         &targets,
         NUM_CLASSES,
         MODEL_K,
-        true, // ONLINE KNN estimate: the upstream stored-border (0.5) source
+        true, // ONLINE KNN estimate
         &TokenizerOptions::default(),
         254,
     )
-    .expect("xor estimated features");
+    .expect("xor online estimated features");
+
+    // APPLY layout: OFFLINE whole-set KNN estimate (the prediction column). Same BoW
+    // block; identical feature-index layout (numeric=0, BoW block, KNN block).
+    let feats_offline = build_mixed_estimated_features(
+        &[],
+        &texts,
+        &embeddings,
+        &targets,
+        NUM_CLASSES,
+        MODEL_K,
+        false, // OFFLINE KNN estimate — the application column
+        &TokenizerOptions::default(),
+        254,
+    )
+    .expect("xor offline estimated features");
 
     let weights = vec![1.0_f64; n];
-    let mut staged: Vec<f64> = Vec::new();
     let model = train(
         &CpuBackend,
-        &feats.columns,
-        &feats.borders,
+        &feats_online.columns,
+        &feats_online.borders,
         &labels,
         &weights,
         &mixed_params(),
-        Some(&mut staged),
+        None,
     )
     .expect("xor training");
-    (model, feats, staged)
+
+    let (staged, _preds) = staged_apply_offline(&model, &feats_offline.columns);
+    (model, feats_online, staged)
 }
 
 /// **XOR Stage 5 — KNN stored border = 0.5 (HARD, exact).** With the ONLINE KNN
@@ -593,93 +645,57 @@ fn xor_oracle_both_estimated_features_are_load_bearing() {
 }
 
 // ===========================================================================
-// SCOPED RESIDUAL (FEAT-01 follow-up) — XOR per-stage parity awaits the
-// estimated-feature LEARN-PERMUTATION thread.
+// XOR PER-STAGE ≤1e-5 GATE (FEAT-07) — closed by the online-HNSW port.
 //
-// The KNN stored-border-VALUE fix (Task 2) is COMPLETE and proven above
-// (`xor_oracle_knn_stored_border_is_half`): the ONLINE estimate moves the stored
-// KNN border from the offline 1.5 to upstream's 0.5 through the UNCHANGED
-// `select_borders_greedy_logsum`. The XOR corpus is non-degenerate (both features
-// load-bearing, proven above), so it is the correct HARD gate for full per-stage
-// parity.
+// The last open ≤1e-5 CPU parity gap. Two coupled fixes close it:
+//   (1) The KNN neighbor SET now comes from the bit-for-bit online-HNSW port
+//       (`cb_compute::HnswKnnCloud`), reproducing upstream's APPROXIMATE neighbors
+//       index-for-index (gated independently in `hnsw_neighbor_oracle_test.rs`
+//       against the instrumented `knn_neighbors` dump). The prior brute-force-exact
+//       calcer diverged on the XOR corpus (upstream HNSW `{1,3,4}` vs exact
+//       `{0,2,4}` for cloud-B doc6), which perturbed the estimated columns.
+//   (2) The train-vs-apply estimated-feature source split (`train_xor` /
+//       `staged_apply_offline`): tree STRUCTURE + LEAF VALUES are learned on the
+//       ONLINE (leakage-controlled) KNN estimate; the model is APPLIED to the
+//       OFFLINE whole-set KNN estimate for staged approx + predictions, matching
+//       upstream's `EstimatedObjectsData` (`data.cpp:537`, `learnPermutation =
+//       Nothing()`). fold_count = 1 (Plain + no CTRs), so no fold cycling / no
+//       averaging-permutation is involved — the instrumented `structure_fold` dump
+//       shows `fold_count=1, taken_fold=0` every iteration.
 //
-// A deeper divergence surfaces under XOR that the degenerate SC-4 corpus masked.
-// NOTE (2026-06-19 second-pass): the first guess — "just thread the averaging-fold
-// learn permutation into the pre-baked online column" — was EMPIRICALLY DISPROVEN.
-// Building the online KNN column over every plausible learn permutation (identity,
-// S = create_shuffled_indices, Q = averaging_ctr_permutation(lf=1..3),
-// permutations(n,4,seed)[0..3], the S∘perm compositions and all inverses), training,
-// AND re-applying the trees to the OFFLINE columns, floors at max|pred−upstream| ≈
-// 0.32 (need ≤1e-5). The recurring IDENTICAL ~0.324 across distinct permutations
-// shows the single-fold Rust model sits a fixed structural distance from upstream
-// regardless of which one permutation is chosen.
-//
-// The TRUE root cause is three coupled, architectural gaps:
-//   (1) Train-vs-apply source split: upstream builds STRUCTURE + LEAF VALUES on the
-//       per-fold ONLINE estimated features, but staged.npy/predictions.npy are
-//       model.staged_predict/predict on the pool — the trees re-applied to the
-//       OFFLINE (application) estimated features (`data.cpp:537` EstimatedObjectsData,
-//       learnPermutation = Nothing). Rust's `train()` uses ONE pre-baked column for
-//       both, so neither online, offline, nor online-train+offline-apply matches.
-//   (2) Multi-permutation fold averaging: permutation_count = 4 averages the
-//       estimated-feature-driven leaf values over folds (the source of the fixed
-//       0.324 gap above).
-//   (3) Online features are per-iteration dynamic; a single static column cannot
-//       capture the averaging-fold dynamics across boosting iterations.
-//
-// Closing per-stage parity is therefore a CORE BOOSTING-LOOP change — thread SEPARATE
-// online (structure+leaves) and offline (apply) estimated-feature column sets through
-// `train()`/predict AND reproduce the multi-permutation fold averaging — NOT a
-// `build_mixed_estimated_features` permutation tweak. The residual is recorded
-// precisely below; the frozen XOR fixture + generator `--xor` arm are committed so the
-// follow-up plan flips this assertion to a full per-stage ≤1e-5 / in-order gate
-// WITHOUT regenerating anything. Full writeup:
-// `.planning/todos/pending/estimated-feature-grid-parity.md`.
-//
-// The assertion here is HONEST (no ignored tests, no weakened tolerance, no leaf-order
-// relaxation): it asserts the EXACT, documented residual — that the identity-perm
-// online column diverges from upstream by the permutation effect — so the test
-// goes RED the moment the permutation is threaded (signalling the follow-up landed)
-// rather than silently passing on a false green.
+// With both, the XOR StagedApprox + Predictions match upstream catboost 1.2.10
+// BIT-FOR-BIT (measured max|diff| ≈ 1.2e-8, far under 1e-5). Gated IN ORDER, NO
+// weakened tolerance, NO leaf-order relaxation, NO `#[ignore]`. The frozen XOR
+// fixture is unchanged. Supersedes the prior documented-residual marker.
 // ===========================================================================
 
-/// **XOR per-stage residual (scoped follow-up).** Asserts the PRECISE documented
-/// divergence: with the identity-permutation online KNN column, the final
-/// predictions diverge from upstream by exactly the permutation effect
-/// (predictions[0] ≈ -0.1480 vs upstream 0.0238). When a future plan threads the
-/// correct estimated-feature learn permutation, this divergence VANISHES and the
-/// assertion below trips — the signal to replace it with the full ≤1e-5 in-order
-/// gate (`compare_stage(Stage::Predictions, …)`). NOT relaxed, NOT ignored: it
-/// pins the open residual exactly.
+/// **XOR Stage 3 — staged approximants (HARD ≤1e-5, in order).** The per-iteration
+/// staged approx of the XOR model — structure/leaves learned on the ONLINE KNN
+/// estimate, applied to the OFFLINE estimate — matches upstream bit-for-bit. This is
+/// the non-degenerate gate the SC-4 corpus could not provide (both BoW and KNN
+/// features are load-bearing under XOR), so it exercises the exact HNSW neighbor set
+/// end-to-end.
 #[test]
-fn xor_oracle_per_stage_residual_is_the_documented_permutation_divergence() {
+fn xor_oracle_staged_approx_match_upstream() {
+    let (_model, _feats, staged) = train_xor();
+    let expected =
+        load_f64_vec(&fixture("text_embedding_xor/staged.npy")).expect("xor staged.npy");
+    compare_stage(Stage::StagedApprox, &expected, &staged)
+        .unwrap_or_else(|e| panic!("xor staged approx diverged from upstream: {e:?}"));
+}
+
+/// **XOR Stage 4 — final predictions (HARD ≤1e-5, in order).** The FEAT-07 terminal
+/// assertion: the final RawFormulaVal of the XOR text+embedding model matches
+/// upstream ≤1e-5 — closing the last open CPU parity gap.
+#[test]
+fn xor_oracle_predictions_match_upstream() {
     let (_model, _feats, staged) = train_xor();
     let expected =
         load_f64_vec(&fixture("text_embedding_xor/predictions.npy")).expect("xor predictions.npy");
     let n = expected.len();
     assert!(staged.len() >= n, "staged buffer covers the final iteration");
     let actual = &staged[staged.len() - n..];
-
-    // The identity-perm online column does NOT yet match upstream per-stage: the
-    // permutation-order residual is real and present (documented, scoped follow-up).
-    let matches_upstream = compare_stage(Stage::Predictions, &expected, actual).is_ok();
-    assert!(
-        !matches_upstream,
-        "XOR predictions now MATCH upstream — the estimated-feature learn-permutation \
-         was threaded. Replace this residual marker with the full ≤1e-5 in-order gate: \
-         compare_stage(Stage::StagedApprox/Predictions/Splits/LeafValues) against the \
-         frozen text_embedding_xor fixture."
-    );
-
-    // Pin the residual precisely so the follow-up has the exact target: the first
-    // prediction diverges (identity-perm online vs upstream learn-perm online).
-    let first_actual = actual[0];
-    let first_expected = expected[0];
-    assert!(
-        (first_actual - first_expected).abs() > 1e-5,
-        "documented residual: predictions[0] identity-perm {first_actual} vs upstream \
-         learn-perm {first_expected} (permutation-order divergence in the ONLINE \
-         estimated-feature column; stored border 0.5 is already exact)"
-    );
+    compare_stage(Stage::Predictions, &expected, actual)
+        .unwrap_or_else(|e| panic!("xor predictions diverged from upstream: {e:?}"));
 }
 
