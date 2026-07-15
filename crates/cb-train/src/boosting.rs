@@ -33,6 +33,7 @@ use cb_compute::{
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 use cb_data::Pair;
+use rayon::prelude::*;
 
 use crate::autolr::{self, TargetType};
 use crate::query_info::{build_query_info, QueryInfo};
@@ -2185,19 +2186,27 @@ fn quantize_feature_major(
 ) -> (Vec<u32>, usize) {
     let n_features = feature_values.len();
     let mut bins = vec![0u32; n_features * n];
-    let mut n_bins = 0usize;
-    for f in 0..n_features {
-        let borders = feature_borders.get(f).map_or(&[][..], Vec::as_slice);
-        n_bins = n_bins.max(borders.len() + 1);
-        let col = feature_values.get(f).map_or(&[][..], Vec::as_slice);
-        for i in 0..n {
-            let v = col.get(i).copied().map_or(0.0_f64, f64::from);
-            let bin = borders.iter().filter(|&&b| v > b).count() as u32;
-            if let Some(slot) = bins.get_mut(f * n + i) {
-                *slot = bin;
+    let n_bins = feature_borders
+        .iter()
+        .fold(0usize, |acc, borders| acc.max(borders.len() + 1));
+    // Columns are independent (each feature's bins depend only on that feature's
+    // values + borders), so the per-feature quantization runs in parallel over
+    // the disjoint feature-major stripes. Borders are sorted ascending
+    // (`select_borders_greedy_logsum` sorts + dedups), so
+    // `partition_point(|b| v > b)` returns EXACTLY the serial
+    // `filter(|b| v > b).count()` — the `v > b` predicate is monotone
+    // (true-prefix) over an ascending border list, including the NaN case
+    // (all-false -> 0). Byte-identical bins, O(log borders) per value.
+    bins.par_chunks_mut(n)
+        .enumerate()
+        .for_each(|(f, stripe)| {
+            let borders = feature_borders.get(f).map_or(&[][..], Vec::as_slice);
+            let col = feature_values.get(f).map_or(&[][..], Vec::as_slice);
+            for (i, slot) in stripe.iter_mut().enumerate() {
+                let v = col.get(i).copied().map_or(0.0_f64, f64::from);
+                *slot = borders.partition_point(|&b| v > b) as u32;
             }
-        }
-    }
+        });
     (bins, n_bins)
 }
 
@@ -3053,7 +3062,17 @@ fn train_inner<R: Runtime>(
     // `scale_l2_reg(l2, sumAllWeights, n)`.
     let device_scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
     let (device_bins, device_n_bins) = if device_host_eligible {
-        quantize_feature_major(feature_values, feature_borders, n)
+        let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
+        let prof_t = std::time::Instant::now();
+        let out = quantize_feature_major(feature_values, feature_borders, n);
+        if prof {
+            eprintln!(
+                "CB_GPU_PROF quantize n={n} nf={} elapsed={:.2}ms",
+                feature_values.len(),
+                prof_t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        out
     } else {
         (Vec::new(), 0)
     };
@@ -3281,20 +3300,29 @@ fn train_inner<R: Runtime>(
                     device_splits.push(Split { feature: f, border });
                 }
 
-                // Per-object leaf assignment on the HOST via the forward-bit `leaf_index`
-                // (the SAME `value > border` the CPU oblivious path uses; D-05).
+                // Per-object leaf assignment on the HOST, forward bit order (split `l` ->
+                // bit `l` — the SAME `value > border` + `leaf_index` semantics the CPU
+                // oblivious path uses; D-05). The split columns are resolved ONCE outside
+                // the object loop and the leaf bits set directly (no per-object Vec<bool>
+                // allocation — this loop runs n times per boosting iteration).
+                let split_cols: Vec<(&[f32], f64)> = device_splits
+                    .iter()
+                    .map(|s| {
+                        (
+                            feature_values.get(s.feature).map_or(&[][..], Vec::as_slice),
+                            s.border,
+                        )
+                    })
+                    .collect();
                 let device_leaf_of: Vec<usize> = (0..n)
                     .map(|obj| {
-                        let passes: Vec<bool> = device_splits
-                            .iter()
-                            .map(|s| {
-                                feature_values
-                                    .get(s.feature)
-                                    .and_then(|col| col.get(obj))
-                                    .is_some_and(|&v| f64::from(v) > s.border)
-                            })
-                            .collect();
-                        leaf_index(&passes)
+                        let mut leaf = 0usize;
+                        for (l, (col, border)) in split_cols.iter().enumerate() {
+                            if col.get(obj).is_some_and(|&v| f64::from(v) > *border) {
+                                leaf |= 1usize << l;
+                            }
+                        }
+                        leaf
                     })
                     .collect();
 

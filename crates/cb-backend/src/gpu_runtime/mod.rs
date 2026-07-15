@@ -66,8 +66,9 @@ use crate::kernels::{
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
     pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
+    derive_sibling_partition_hist_kernel, fold_hist_copies_kernel,
     partition_hist2_nonbinary_kernel, partition_split_kernel, partition_update_kernel,
-    pointwise_hist2_binary_kernel,
+    pointwise_hist2_binary_kernel, zero_u64_kernel,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
     subtract_histograms_kernel,
     pairwise_assemble_system_kernel,
@@ -138,6 +139,38 @@ const _: () = assert!(
     "CUBE_DIM (launch width) must be a power of two — the shared-mem tree-reduce \
      halves its stride and would silently drop the top element(s) otherwise"
 );
+
+/// Launch geometry for the PARTITION-HISTOGRAM family (fill / zero / fold / derive):
+/// 256 threads per cube. These kernels are pure grid-stride loops with NO
+/// `SharedMemory` allocation, so they are decoupled from the [`CUBE_DIM`]-sized
+/// shared-mem reduce family above. 32-thread cubes (one warp per block on CUDA)
+/// cap occupancy well below the SM limit on NVIDIA/AMD; 256 is the conventional
+/// occupancy-friendly width for atomic-scatter kernels (upstream CatBoost's
+/// histogram kernels use 256..768-thread blocks).
+const HIST_CUBE_DIM: usize = 256;
+
+/// Maximum privatized-copy count for the multi-copy partition-histogram fill (the
+/// contention fix): at `2^level` partitions the launcher allocates
+/// `max(1, HIST_MAX_COPIES >> level)` copies, so the total allocation stays
+/// ~`HIST_MAX_COPIES × one-partition line` at every level while same-cell atomic
+/// contention drops by the copy count where it is worst (the shallow levels, where
+/// few hot cells absorb every object's 2-atomic scatter).
+const HIST_MAX_COPIES: usize = 64;
+
+/// `CB_GPU_PROF=1` gates the per-stage device profiling prints (stage attribution for
+/// the resident grow loop). The env var is read ONCE; unset (or `"0"`) keeps every
+/// profiling branch cold — no sync, no timing, no output — so the hot path is unchanged.
+pub(crate) fn gpu_prof_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0"))
+}
+
+/// Drain the device queue (a profiling FENCE — only ever called under
+/// [`gpu_prof_enabled`], never on the un-profiled hot path). Errors are swallowed:
+/// a failed fence skews a timing report, it must not fail training.
+pub(crate) fn prof_sync(client: &cubecl::client::ComputeClient<SelectedRuntime>) {
+    let _ = cubecl::reader::try_read_sync(client.sync());
+}
 
 /// Pointwise-histogram geometry guard (Phase 7.3 / Pitfall 3): the 8-bit non-binary
 /// fill's worst-case used prefix is `2 channels * (1 << 8) bins = 512`, which MUST
@@ -1465,6 +1498,53 @@ pub(crate) fn upload_channel_floats(
     }
 }
 
+/// Create an `n`-element channel-typed device buffer filled with ONE constant, ON DEVICE
+/// (a length-1 value upload + a [`crate::kernels::fill_kernel`] launch) — the transfer-lean
+/// sibling of [`upload_channel_floats`] for constant vectors (e.g. the RMSE `der2 = -1`
+/// channel), replacing a per-call O(n) host alloc + PCIe upload with O(1) bytes crossing.
+pub(crate) fn create_channel_const(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    value: f64,
+    n: usize,
+) -> Handle {
+    if n == 0 {
+        return client.empty(0);
+    }
+    let num_cubes = n.div_ceil(HIST_CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: HIST_CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+    #[cfg(feature = "wgpu")]
+    {
+        let out = client.empty(n * std::mem::size_of::<f32>());
+        let val_h = client.create(cubecl::bytes::Bytes::from_elems(vec![value as f32]));
+        crate::kernels::fill_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(out.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(val_h, 1) },
+        );
+        out
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let out = client.empty(n * std::mem::size_of::<f64>());
+        let val_h = client.create(cubecl::bytes::Bytes::from_elems(vec![value]));
+        crate::kernels::fill_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(out.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(val_h, 1) },
+        );
+        out
+    }
+}
+
 /// Read a device part-stats handle (channel float type) back to a host `Vec<f64>`,
 /// UPCASTING the f32 channel on wgpu (RESEARCH A1) — the part-stats sibling of
 /// [`read_binsums_f64`]/[`read_scores_f64`]. A read-back failure surfaces
@@ -1501,6 +1581,41 @@ pub(crate) fn read_u32_handle(
         .read_one(handle)
         .map_err(|e| CbError::Degenerate(format!("u32 handle read-back failed: {e:?}")))?;
     Ok(bytemuck::cast_slice::<u8, u32>(&bytes).to_vec())
+}
+
+/// Read the per-tree part-stats (channel float) AND the final `leaf_of` routing in ONE
+/// blocking read — the same two D-05 end-of-tree crossings as
+/// [`read_part_stats_f64`] + [`read_u32_handle`], batched so the resident grow pays a
+/// single pipeline sync per tree instead of two. wgpu upcasts the f32 channel exactly
+/// like `read_part_stats_f64`. A read-back failure surfaces [`CbError::Degenerate`]
+/// (WR-05), never a silent zero buffer.
+pub(crate) fn read_part_stats_and_leaf_of(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    part_stats_h: Handle,
+    leaf_of_h: Handle,
+) -> CbResult<(Vec<f64>, Vec<u32>)> {
+    let buffers = cubecl::reader::try_read_sync(client.read_async(vec![part_stats_h, leaf_of_h]))
+        .ok_or_else(|| {
+            CbError::Degenerate(
+                "part-stats/leaf_of read-back: blocking reads are unsupported on this platform"
+                    .to_owned(),
+            )
+        })?
+        .map_err(|e| CbError::Degenerate(format!("part-stats/leaf_of read-back failed: {e:?}")))?;
+    let mut buffers = buffers.into_iter();
+    let (Some(stats_bytes), Some(leaf_bytes)) = (buffers.next(), buffers.next()) else {
+        return Err(CbError::Degenerate(
+            "part-stats/leaf_of read-back returned fewer than 2 buffers".to_owned(),
+        ));
+    };
+    #[cfg(feature = "wgpu")]
+    let part_stats = bytemuck::cast_slice::<u8, f32>(&stats_bytes)
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    #[cfg(not(feature = "wgpu"))]
+    let part_stats = bytemuck::cast_slice::<u8, f64>(&stats_bytes).to_vec();
+    Ok((part_stats, bytemuck::cast_slice::<u8, u32>(&leaf_bytes).to_vec()))
 }
 
 /// Apply ONE split's forward-bit doc-routing reorder device-resident: returns a NEW
@@ -1811,6 +1926,7 @@ pub(crate) fn launch_partition_hist2_into(
         n_bins,
         n_features,
         level,
+        /* filter_mask = */ 0,
     )
 }
 
@@ -1847,6 +1963,7 @@ pub(crate) fn launch_partition_hist2_resident_into(
     n_bins: usize,
     n_features: usize,
     level: u32,
+    filter_mask: u32,
 ) -> CbResult<Handle> {
     // Partition count `2^level` (checked shift — a `level >= usize::BITS` would wrap).
     let n_parts = 1usize.checked_shl(level).ok_or_else(|| {
@@ -1895,17 +2012,36 @@ pub(crate) fn launch_partition_hist2_resident_into(
         }
     };
 
-    // Zero-initialised fixed-point u64 histogram (0u64 is the additive identity in two's
-    // complement too — manual §3). The kernel accumulates into it.
-    let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u64; total]));
+    // Level-scaled privatized copy count (the contention fix): shallow levels concentrate
+    // every object's 2-atomic scatter on few hot cells, so they get the most copies; the
+    // total allocation stays ~`HIST_MAX_COPIES × per-leaf line` at every level.
+    let n_copies = (HIST_MAX_COPIES / n_parts).clamp(1, HIST_MAX_COPIES);
+    let alloc_len = total.checked_mul(n_copies).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "total ({total}) * n_copies ({n_copies}) overflows usize (multi-copy binSums length)"
+        ))
+    })?;
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: CUBE_DIM as u32,
+    // Allocate the multi-copy fixed-point u64 histogram and zero it ON DEVICE (0u64 is the
+    // additive identity in two's complement too — manual §3; no O(histogram) zero bytes
+    // cross the bus). The fill kernel accumulates into it.
+    let out = client.empty(alloc_len * std::mem::size_of::<u64>());
+    let hist_dim = CubeDim {
+        x: HIST_CUBE_DIM as u32,
         y: 1,
         z: 1,
     };
+    let zero_cubes = alloc_len.div_ceil(HIST_CUBE_DIM).max(1);
+    zero_u64_kernel::launch::<SelectedRuntime>(
+        client,
+        CubeCount::Static(zero_cubes as u32, 1, 1),
+        hist_dim,
+        unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
+    );
+
+    let num_cubes = n.div_ceil(HIST_CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = hist_dim;
 
     // The der1/weight channel float type is f32 on wgpu, f64 elsewhere (RESEARCH A1); the
     // fixed-point `Atomic<u64>` accumulator output is `u64` on both. (IN-02: wgpu/cpu lack
@@ -1925,8 +2061,10 @@ pub(crate) fn launch_partition_hist2_resident_into(
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(indices_h, n) },
         unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
-        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
         n_features as u32,
+        n_copies as u32,
+        filter_mask,
         bits,
     );
 
@@ -1943,12 +2081,101 @@ pub(crate) fn launch_partition_hist2_resident_into(
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(indices_h, n) },
         unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
-        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
         n_features as u32,
+        n_copies as u32,
+        filter_mask,
         bits,
     );
 
+    // Fold the privatized copies into copy 0 (integer adds — exact, order-independent,
+    // GPUT-06 determinism unchanged). Downstream consumers read the handle with length
+    // `total` (copy 0 only), so the extra copies never leave the device.
+    if n_copies > 1 {
+        let fold_cubes = total.div_ceil(HIST_CUBE_DIM).max(1);
+        fold_hist_copies_kernel::launch::<SelectedRuntime>(
+            client,
+            CubeCount::Static(fold_cubes as u32, 1, 1),
+            hist_dim,
+            unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
+            n_copies as u32,
+        );
+    }
+
     Ok(out)
+}
+
+/// Complete a level's partition histogram from the PARENT level's histogram via the
+/// subtraction trick (WR-01 wired, upstream §5.5): the level-`L` fill ran with
+/// `filter_mask = 1 << (L-1)`, accumulating ONLY the newest-bit-set partitions
+/// `p + half`; this launch derives every unfilled sibling slot as
+/// `hist[p] = parent[p] − hist[p + half]` for `p < half = 2^(L-1)` — elementwise over
+/// each slot's per-leaf line, device-resident, bit-exact (see
+/// [`derive_sibling_partition_hist_kernel`]). `parent_h` is the previous level's
+/// (already copy-folded) histogram (`half` slots); `hist_h` the current level's
+/// (`2 * half` slots). No read-back; empty dimensions are a no-op.
+pub(crate) fn launch_derive_sibling_hist_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    parent_h: &Handle,
+    hist_h: &Handle,
+    half: usize,
+    n_bins: usize,
+    n_features: usize,
+) -> CbResult<()> {
+    if half == 0 || n_bins == 0 || n_features == 0 {
+        return Ok(());
+    }
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let cells = per_leaf.checked_mul(half).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * half ({half}) overflows usize (sibling-derive cell count)"
+        ))
+    })?;
+    let hist_len = cells.checked_mul(2).ok_or_else(|| {
+        CbError::OutOfRange(format!("cells ({cells}) * 2 overflows usize (child histogram length)"))
+    })?;
+    let half_u32 = u32::try_from(half).map_err(|_| {
+        CbError::OutOfRange(format!("half ({half}) exceeds u32 (sibling-derive slot count)"))
+    })?;
+    let leaf_stride_u32 = u32::try_from(per_leaf).map_err(|_| {
+        CbError::OutOfRange(format!("per-leaf line ({per_leaf}) exceeds u32 (sibling-derive stride)"))
+    })?;
+
+    let num_cubes = cells.div_ceil(HIST_CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: HIST_CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    #[cfg(feature = "wgpu")]
+    derive_sibling_partition_hist_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(parent_h.clone(), cells) },
+        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+        half_u32,
+        leaf_stride_u32,
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    derive_sibling_partition_hist_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(parent_h.clone(), cells) },
+        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+        half_u32,
+        leaf_stride_u32,
+    );
+
+    Ok(())
 }
 
 /// Score the MULTI-LEAF FIXED-POINT partition histogram device-resident and return the single
@@ -1969,10 +2196,21 @@ fn score_partition_over_binsums(
     bin_sums: Handle,
     n_parts: usize,
     n_bins: usize,
+    n_bins_used: usize,
     n_features: usize,
     scaled_l2: f64,
     score_fn: u32,
 ) -> CbResult<Option<BestSplit>> {
+    // `n_bins` is the (possibly PADDED) histogram line width the fill dispatched
+    // ({32,64,128,256}); `n_bins_used` the ACTUAL quantized bin count (<= n_bins). The
+    // padding cells are zero and their phantom borders are excluded from the argmin
+    // (device-side in the kernel + the host belt below), so the scored candidate set is
+    // exactly the CPU reference's real-border enumeration.
+    if n_bins_used == 0 || n_bins_used > n_bins {
+        return Err(CbError::OutOfRange(format!(
+            "n_bins_used ({n_bins_used}) must be in 1..=n_bins ({n_bins})"
+        )));
+    }
     // Reject an unknown score-fn selector BEFORE any launch (no silent wrong-arm dispatch).
     if score_fn != SCORE_FN_L2
         && score_fn != SCORE_FN_COSINE
@@ -2012,9 +2250,15 @@ fn score_partition_over_binsums(
         CbError::OutOfRange(format!("n_parts ({n_parts}) exceeds u32 device range"))
     })?;
 
-    // Single cube of CUBE_DIM units strides over all candidates and block-reduces to one winner
-    // (the SAME geometry as `score_over_binsums`; the shared-mem argmin size is ARGMIN_SHMEM).
-    let num_cubes = 1usize;
+    // MULTI-cube candidate sweep (perf pass): one CUBE_DIM-thread cube per CUBE_DIM
+    // candidates, so the argmin uses the whole device instead of one SM (the old
+    // `num_cubes = 1` dispatch serialized ~n_candidates * n_parts * n_bins decode+add
+    // iterations onto a single 32-thread warp — the dominant per-level scorer cost at
+    // depth > 1). Every candidate is still scored by exactly ONE thread and every fold
+    // keeps the strict-`>`/lowest-index tie-break, so the chosen split is bit-identical
+    // (see the kernel doc). The shared-mem argmin size stays the comptime ARGMIN_SHMEM
+    // (== CUBE_DIM, Pitfall 3).
+    let num_cubes = n_candidates.div_ceil(CUBE_DIM).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
         x: CUBE_DIM as u32,
@@ -2022,67 +2266,81 @@ fn score_partition_over_binsums(
         z: 1,
     };
 
+    // Packed per-block winner buffer: gains in slots `0..num_cubes`, candidate indices
+    // (widened to the channel float — exact for every u32 in f64) in slots
+    // `num_cubes..2*num_cubes`, retrieved with ONE read-back (one sync per level, not two).
     #[cfg(feature = "wgpu")]
-    let (best_gain_handle, best_idx_handle) = {
-        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
-        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+    let best_out_handle = {
+        let best_out_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; 2 * num_cubes]));
         let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2 as f32]));
         find_optimal_split_partition_kernel::launch::<f32, SelectedRuntime>(
             client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
-            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
-            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_out_h.clone(), 2 * num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_parts_u32,
             n_features as u32,
+            n_bins_used as u32,
             n_bins_u32,
             score_fn,
         );
-        (best_gain_h, best_idx_h)
+        best_out_h
     };
 
     #[cfg(not(feature = "wgpu"))]
-    let (best_gain_handle, best_idx_handle) = {
-        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
-        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+    let best_out_handle = {
+        let best_out_h =
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; 2 * num_cubes]));
         let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2]));
         find_optimal_split_partition_kernel::launch::<f64, SelectedRuntime>(
             client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
-            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
-            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_out_h.clone(), 2 * num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_parts_u32,
             n_features as u32,
+            n_bins_used as u32,
             n_bins_u32,
             score_fn,
         );
-        (best_gain_h, best_idx_h)
+        best_out_h
     };
 
     // Read back ONLY the O(blocks) per-block winner descriptors (the sole D-05 crossing) and
     // finish the across-block argmin host-side with the SAME lowest-index tie-break the kernel
     // uses. The bulk histogram never leaves the device (T-11-03-02).
-    let best_gains = read_scores_f64(client, best_gain_handle)?;
-    let best_idx_bytes = client
-        .read_one(best_idx_handle)
-        .map_err(|e| CbError::Degenerate(format!("partition best-idx read-back failed: {e:?}")))?;
-    let best_idxs: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&best_idx_bytes).to_vec();
+    let best_out = read_scores_f64(client, best_out_handle)?;
+    let (best_gains, best_idx_f) = best_out
+        .split_at_checked(num_cubes)
+        .ok_or_else(|| {
+            CbError::Degenerate(format!(
+                "partition best-split read-back returned {} slots, expected {}",
+                best_out.len(),
+                2 * num_cubes
+            ))
+        })?;
 
     let mut best_gain = f64::NEG_INFINITY;
     let mut best_c = u32::MAX;
     for (block, &gain) in best_gains.iter().enumerate() {
-        let cand = best_idxs.get(block).copied().unwrap_or(u32::MAX);
+        // The idx slot is an exact small integer in the channel float; an out-of-range or
+        // non-finite slot falls to u32::MAX and is skipped by the candidate-range guard.
+        let cand = best_idx_f
+            .get(block)
+            .copied()
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX))
+            .map_or(u32::MAX, |v| v as u32);
         if (cand as usize) >= n_candidates {
             continue;
         }
-        // The trailing `border == n_bins - 1` candidate is the no-op split (the device kernel
-        // already excludes it; this is the host belt, WR-05).
-        if (cand as usize) % n_bins == n_bins - 1 {
+        // Trailing no-op border AND phantom padded borders (`border >= n_bins_used - 1`)
+        // are all-LEFT no-op splits (the device kernel already excludes them; host belt, WR-05).
+        if (cand as usize) % n_bins >= n_bins_used - 1 {
             continue;
         }
         let take = gain > best_gain || (gain == best_gain && cand < best_c);
@@ -2452,7 +2710,7 @@ fn grow_oblivious_tree_into(
         //     histogram stays device-resident IN the score launch; only the O(1) BestSplit
         //     descriptor crosses back (D-05 / T-11-03-02 — no full-buffer read path).
         let best = score_partition_over_binsums(
-            client, hist_h.clone(), n_parts, n_bins, n_features, scaled_l2, score_fn,
+            client, hist_h.clone(), n_parts, n_bins, n_bins, n_features, scaled_l2, score_fn,
         )?;
 
         // (3) The O(1) host integer split decision. A level with no candidate at all is a
@@ -2488,7 +2746,7 @@ fn grow_oblivious_tree_into(
     //     RMSE arm: der2 = const -1 (RMSE hessian), so the Σ(der2·weight) channel is -Σweight
     //     and `newton_leaf_delta` collapses to `calc_average` (see step 6). The channel is
     //     computed for symmetry with the Newton path but the RMSE leaf reads channels 0/1.
-    let der2_rmse_h = upload_channel_floats(client, &vec![-1.0_f64; n]);
+    let der2_rmse_h = create_channel_const(client, -1.0, n);
     let part_stats_h = launch_partition_update_into(
         client,
         der1_h.clone(),
@@ -2788,6 +3046,7 @@ pub(crate) fn grow_oblivious_tree_resident(
     num_words: usize,
     n: usize,
     n_bins: usize,
+    n_bins_used: usize,
     n_features: usize,
     cindex_stride: usize,
     depth: usize,
@@ -2821,22 +3080,35 @@ pub(crate) fn grow_oblivious_tree_resident(
         .checked_shl(depth as u32)
         .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
 
-    // NOTE (WR-01, Phase 11 review): the D-04 "memory-lean" subtraction trick is NOT wired into
-    // this scored path — the partition-aware fill computes every slot directly, so the discarded
-    // per-level derivation (and the parent-resident bookkeeping it required) has been removed.
+    // WR-01 WIRED (perf pass): the D-04 subtraction trick now drives every level > 0 of this
+    // scored path. The level-L fill accumulates ONLY the newest-bit-set partitions
+    // (`filter_mask = 1 << (L-1)` — roughly half the objects); the sibling slots are then
+    // derived device-side as `parent − filled` (bit-exact — integer fixed-point arithmetic),
+    // so the per-level atomic-scatter traffic is roughly halved beyond the root level.
 
     // leaf_of starts all-zero (every object in the root partition 0), resident on device.
     let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
     let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+    // The previous level's (copy-folded, complete) histogram — the subtraction parent.
+    let mut prev_bin_sums: Option<Handle> = None;
+
+    // CB_GPU_PROF stage attribution (cold unless the env var is set): each lap fences the
+    // queue so the elapsed wall time is the STAGE's device time, not launch-enqueue time.
+    let prof = gpu_prof_enabled();
+    let (mut t_fill, mut t_derive, mut t_score, mut t_split, mut t_stats, mut t_tail) =
+        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut prof_t = std::time::Instant::now();
 
     for level in 0..depth {
         // (1) Partition-aware (fullPass = L>0) fill over the RESIDENT session handles (cloned,
         //     NOT re-uploaded — the packed cindex + der1/weight/indices stay resident) keyed by
         //     the resident leaf_of. The bulk histogram stays device-resident; only the O(1)
-        //     BestSplit crosses back (D-05).
+        //     BestSplit crosses back (D-05). Levels > 0 fill only the newest-bit-set sibling
+        //     of each partition pair (the subtraction-trick filter).
         let n_parts = 1usize.checked_shl(level as u32).ok_or_else(|| {
             CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
         })?;
+        let filter_mask: u32 = if level == 0 { 0 } else { 1u32 << (level - 1) };
         let bin_sums = launch_partition_hist2_resident_into(
             client,
             der1_h.clone(),
@@ -2852,12 +3124,41 @@ pub(crate) fn grow_oblivious_tree_resident(
             n_bins,
             n_features,
             level as u32,
+            filter_mask,
         )?;
+        if prof {
+            prof_sync(client);
+            t_fill += prof_t.elapsed().as_secs_f64();
+            prof_t = std::time::Instant::now();
+        }
+
+        // (1b) Derive the unfilled sibling slots from the parent level's histogram
+        //      (`hist[p] = parent[p] − hist[p + half]`, device-resident, bit-exact).
+        if level > 0 {
+            let parent = prev_bin_sums.as_ref().ok_or_else(|| {
+                CbError::Degenerate(format!(
+                    "grow_oblivious_tree_resident level {level}: missing parent histogram \
+                     for the subtraction trick (internal invariant)"
+                ))
+            })?;
+            launch_derive_sibling_hist_into(client, parent, &bin_sums, n_parts / 2, n_bins, n_features)?;
+        }
+        if prof {
+            prof_sync(client);
+            t_derive += prof_t.elapsed().as_secs_f64();
+            prof_t = std::time::Instant::now();
+        }
 
         // (2) Device score + deterministic argmin over the CURRENT 2^level partitions (D-05).
         let best = score_partition_over_binsums(
-            client, bin_sums.clone(), n_parts, n_bins, n_features, scaled_l2, score_fn,
+            client, bin_sums.clone(), n_parts, n_bins, n_bins_used, n_features, scaled_l2, score_fn,
         )?;
+        prev_bin_sums = Some(bin_sums);
+        if prof {
+            // The scorer's own read-back already drained the queue — this lap is pure elapsed.
+            t_score += prof_t.elapsed().as_secs_f64();
+            prof_t = std::time::Instant::now();
+        }
 
         // (3) The O(1) host integer split decision. No candidate -> degenerate dataset.
         let split = best.ok_or_else(|| {
@@ -2881,14 +3182,22 @@ pub(crate) fn grow_oblivious_tree_resident(
             split.bin_id,
             level as u32,
         )?;
+        if prof {
+            prof_sync(client);
+            t_split += prof_t.elapsed().as_secs_f64();
+            prof_t = std::time::Instant::now();
+        }
     }
 
-    // (4) Device partition-update -> ONE read-back of the 2^depth part-stats (the ONLY
-    //     bulk-data crossing besides the O(1) per-level BestSplit — D-05). RMSE arm: der2 =
+    // (4) Device partition-update -> ONE combined read-back of the 2^depth part-stats AND
+    //     the final leaf_of routing (the ONLY bulk-data crossing besides the O(1) per-level
+    //     BestSplit — D-05; batched into a single sync, see `read_part_stats_and_leaf_of`).
+    //     leaf_of is FINAL after the level loop — the launches below never touch it — so
+    //     reading it here is byte-identical to the old end-of-fn read. RMSE arm: der2 =
     //     const -1 (the Σ(der2·weight) channel is computed but the calc_average leaf reads
     //     channels 0/1; the Newton/Logloss leaf estimation is the dedicated
     //     `grow_oblivious_tree_newton_into` path, GPUT-07).
-    let der2_rmse_h = upload_channel_floats(client, &vec![-1.0_f64; n]);
+    let der2_rmse_h = create_channel_const(client, -1.0, n);
     let part_stats_h = launch_partition_update_into(
         client,
         der1_h.clone(),
@@ -2899,7 +3208,13 @@ pub(crate) fn grow_oblivious_tree_resident(
         n,
         n_leaves,
     )?;
-    let part_stats = read_part_stats_f64(client, part_stats_h)?;
+    let (part_stats, leaf_of) =
+        read_part_stats_and_leaf_of(client, part_stats_h, leaf_of_h.clone())?;
+    if prof {
+        // The combined read-back drained the queue — pure elapsed.
+        t_stats += prof_t.elapsed().as_secs_f64();
+        prof_t = std::time::Instant::now();
+    }
 
     // (5) Host leaf values via the FROZEN cb_compute::calc_average (UNSCALED delta — the
     //     10-02 DeviceGrownTree contract; the approx update below applies learning_rate).
@@ -2914,17 +3229,31 @@ pub(crate) fn grow_oblivious_tree_resident(
     }
 
     // (6) Update the resident approx ON DEVICE (`approx[i] += lr * leaf_values[leaf_of[i]]`)
-    //     — NO n-length read-back. leaf_of_h is cloned in (the end-of-fn oracle read-back
-    //     still needs it).
-    let approx_h = launch_apply_leaf_delta_into(client, approx_h, leaf_of_h.clone(), &leaf_values, learning_rate, n)?;
+    //     — NO n-length read-back.
+    let approx_h = launch_apply_leaf_delta_into(client, approx_h, leaf_of_h, &leaf_values, learning_rate, n)?;
 
     // (7) Recompute the resident residual der1 for the NEXT tree DEVICE-SIDE from the updated
     //     resident approx — NO approx/der1 read-back (the must-have no-read-back contract).
     let der1_next = launch_der_binary_resident(client, approx_h.clone(), target_h.clone(), der_kernel, n)?;
 
-    // (8) ONE leaf_of read-back at the END (the SC-3 structure observation — the SAME
-    //     crossing class as the final part-stats, D-05); the per-level routing never crossed.
-    let leaf_of = read_u32_handle(client, leaf_of_h)?;
+    // (leaf_of crossed with the part-stats in step 4 — the SC-3 structure observation, the
+    // SAME crossing class, one sync instead of two; the per-level routing never crossed.)
+
+    if prof {
+        prof_sync(client);
+        t_tail += prof_t.elapsed().as_secs_f64();
+        eprintln!(
+            "CB_GPU_PROF tree n={n} nf={n_features} bins={n_bins} depth={depth} \
+             fill={:.2}ms derive={:.2}ms score={:.2}ms split={:.2}ms stats_read={:.2}ms \
+             leaf_apply_der={:.2}ms",
+            t_fill * 1e3,
+            t_derive * 1e3,
+            t_score * 1e3,
+            t_split * 1e3,
+            t_stats * 1e3,
+            t_tail * 1e3,
+        );
+    }
 
     Ok((
         GrownTree {

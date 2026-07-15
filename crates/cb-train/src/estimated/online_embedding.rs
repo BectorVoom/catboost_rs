@@ -323,7 +323,7 @@ pub fn offline_knn_features(
     let dim = first.len();
     let width = knn_feature_count(num_classes, is_classification);
 
-    let mut calcer = KnnCalcer::new(dim, close_num, is_classification, num_classes);
+    let mut calcer = KnnCalcer::new(dim, close_num, is_classification, num_classes)?;
     for (doc, embed) in embeddings.iter().enumerate() {
         let Some(&target) = targets.get(doc) else {
             continue;
@@ -386,7 +386,7 @@ pub fn online_knn_prefix(
     let dim = first.len();
     let width = knn_feature_count(num_classes, is_classification);
 
-    let mut calcer = KnnCalcer::new(dim, close_num, is_classification, num_classes);
+    let mut calcer = KnnCalcer::new(dim, close_num, is_classification, num_classes)?;
     let mut columns: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; width];
     let mut neighbors_in_order: Vec<Vec<usize>> = Vec::with_capacity(n);
 

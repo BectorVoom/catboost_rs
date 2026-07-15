@@ -268,6 +268,8 @@ impl Runtime for GpuBackend {
         // caller, this plan's wave), so the grow-policy / sampling / exact / CTR knobs reach
         // the session gate. Passing `DeviceTrainConfig::default()` is byte-unchanged vs Plan 01
         // (D-04); a Depthwise / Lossguide `grow_policy` now flips the non-symmetric device arm on.
+        let prof = crate::gpu_runtime::gpu_prof_enabled();
+        let prof_t = std::time::Instant::now();
         let session = GpuTrainSession::begin(
             loss,
             depth,
@@ -284,6 +286,13 @@ impl Runtime for GpuBackend {
             config,
         )?;
         let covered = session.is_some();
+        if prof {
+            eprintln!(
+                "CB_GPU_PROF begin covered={covered} n={n} nf={n_features} n_bins={n_bins} \
+                 elapsed={:.2}ms",
+                prof_t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         *self.session.borrow_mut() = session;
         Ok(covered)
     }

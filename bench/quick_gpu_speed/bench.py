@@ -179,6 +179,15 @@ def main():
         sys.exit(2)
     log("REPO staged ->", sorted(os.listdir(REPO))[:20])
 
+    # Source-provenance marker (added with the 2026-07 perf pass): record whether the
+    # staged source actually contains the perf-pass kernels, so a stale dataset version
+    # can never be mistaken for a no-effect optimization (do-not-fabricate discipline).
+    rc_m, out_m = sh("grep -c derive_sibling_partition_hist_kernel "
+                     "/tmp/repo/crates/cb-backend/src/kernels.rs")
+    marker_lines = [ln.strip() for ln in (out_m or "").splitlines() if ln.strip().isdigit()]
+    result["staged_source_has_perf_kernels"] = bool(marker_lines and int(marker_lines[0]) > 0)
+    log("staged_source_has_perf_kernels:", result["staged_source_has_perf_kernels"])
+
     # ---------------------------------------------------------------
     # STEP 3 — Rust toolchain
     # ---------------------------------------------------------------
@@ -340,6 +349,46 @@ def main():
     }
 
     # ---------------------------------------------------------------
+    # STEP 9b — CB_GPU_PROF stage-attributed fit (SEPARATE subprocess: the env gate
+    # latches via OnceLock at first use, so it must be set at process start; the
+    # profiling fences add syncs, which is why this run is NEVER the timed number).
+    # ---------------------------------------------------------------
+    prof_script = "/tmp/prof_fit.py"
+    with open(prof_script, "w") as fh:
+        fh.write(
+            "import sys, time\n"
+            f"sys.path.insert(0, {os.path.join(REPO, 'bench')!r})\n"
+            "import generator, catboost_rs\n"
+            f"X, y = generator.generate(**{SPEED_CONFIG!r})\n"
+            "m = catboost_rs.CatBoostRegressor(\n"
+            f"    iterations={ITERS}, depth={DEPTH}, learning_rate={LEARNING_RATE},\n"
+            f"    l2_leaf_reg={L2_LEAF_REG}, border_count={BORDER_COUNT}, loss_function='RMSE',\n"
+            "    bootstrap_type='No', random_strength=0.0,\n"
+            "    leaf_estimation_method='Gradient', boost_from_average=False)\n"
+            "t0 = time.time()\n"
+            "m.fit(X, y)\n"
+            "print('PROF_FIT_TOTAL_S', round(time.time() - t0, 4), flush=True)\n"
+        )
+    env_prof = env.copy()
+    env_prof["CB_GPU_PROF"] = "1"
+    rc_p, out_p = sh([sys.executable, prof_script], env=env_prof, timeout=1800)
+    prof_lines = [ln for ln in (out_p or "").splitlines() if "CB_GPU_PROF" in ln]
+    result["prof_lines"] = prof_lines[:80]
+    # Aggregate the per-tree stage sums (ms) so the report answers "where do the
+    # milliseconds go" without hand-parsing 30 lines.
+    stage_sums = {}
+    for ln in prof_lines:
+        for tok in ln.split():
+            if "=" in tok and tok.endswith("ms"):
+                k, v = tok.split("=", 1)
+                try:
+                    stage_sums[k] = round(stage_sums.get(k, 0.0) + float(v[:-2]), 2)
+                except ValueError:
+                    pass
+    result["prof_stage_sums_ms"] = stage_sums
+    log("prof_stage_sums_ms:", stage_sums)
+
+    # ---------------------------------------------------------------
     # STEP 10 — emit output
     # ---------------------------------------------------------------
     result["date"] = time.strftime("%Y-%m-%d", time.gmtime())
@@ -372,6 +421,12 @@ def main():
             fh.write("## Arm errors\n\n")
             for k, v in t["errors"].items():
                 fh.write(f"- **{k}**: {v}\n")
+            fh.write("\n")
+        if result.get("prof_stage_sums_ms"):
+            fh.write("## Stage attribution (CB_GPU_PROF fit — fenced, NOT the timed number)\n\n")
+            fh.write("| stage | total ms |\n|---|---|\n")
+            for k, v in sorted(result["prof_stage_sums_ms"].items()):
+                fh.write(f"| {k} | {v} |\n")
             fh.write("\n")
         fh.write("## Device-activation caveat (always included)\n\n")
         fh.write(caveat + "\n")

@@ -3873,6 +3873,8 @@ pub fn partition_hist2_nonbinary_kernel<F: Float>(
     leaf_of: &Array<u32>,
     bin_sums: &Array<Atomic<u64>>,
     n_features: u32,
+    n_copies: u32,
+    filter_mask: u32,
     #[comptime] bits: u32,
 ) {
     // n_bins = 1 << bits (comptime); the (feature, bin) index arithmetic stays `usize`.
@@ -3882,6 +3884,14 @@ pub fn partition_hist2_nonbinary_kernel<F: Float>(
     // One full (feature, bin, channel) histogram line per partition slot (the leaf
     // stride prepended to the FROZEN interleaved cell index — upstream §6.4 layout).
     let leaf_stride = n_features_usize * n_bins * 2usize;
+
+    // Multi-copy privatization: `bin_sums` holds `n_copies` independent copies of the
+    // whole partition histogram (`bin_sums.len() == n_copies * copy_stride`); cubes are
+    // spread round-robin over the copies so same-cell atomic contention drops ~n_copies×.
+    // The copies are folded afterwards by `fold_hist_copies_kernel` — integer adds,
+    // order-independent, so the GPUT-06 determinism guarantee is unchanged.
+    let copy_stride = bin_sums.len() / (n_copies as usize);
+    let copy_base = ((CUBE_POS as usize) % (n_copies as usize)) * copy_stride;
 
     // Grid-stride loop over the object-visiting order (stride == total thread count,
     // a topology value — NEVER a literal 32/64, D-09).
@@ -3893,25 +3903,121 @@ pub fn partition_hist2_nonbinary_kernel<F: Float>(
         // Partition routing (fullPass=false): same `leaf_of[obj]` gather as
         // partition_update_kernel. The VALUE range (`< 2^level`) is host-validated so
         // `part * leaf_stride` cannot address `bin_sums` out of bounds.
-        let part = leaf_of[obj] as usize;
-        let d = der1[obj];
-        let w = weight[obj];
+        let lf = leaf_of[obj];
+        // Sibling-subtraction filter (upstream §5.5): with a non-zero `filter_mask` only
+        // the objects routed into the mask-selected (newest-bit-set) partitions are
+        // accumulated directly; the sibling slots are derived afterwards as
+        // `parent − filled` by `derive_sibling_partition_hist_kernel`.
+        let mut take = true;
+        if filter_mask != 0u32 {
+            if (lf & filter_mask) == 0u32 {
+                take = false;
+            }
+        }
+        if take {
+            let part = lf as usize;
+            let d = der1[obj];
+            let w = weight[obj];
 
-        let part_base = part * leaf_stride;
-        let mut feature = 0usize;
-        while feature < n_features_usize {
-            let bin =
-                read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature]) as usize;
-            let cell = part_base + (feature * n_bins + bin) * 2usize;
-            // channel 0 = Σ weight (statId 0), channel 1 = Σ der1. Fixed-point Atomic<u64>
-            // accumulate (GPUT-06): quantize each contribution, integer-atomic-add — exact
-            // + order-independent (deterministic), NOT a naked f64 fetch_add.
-            bin_sums[cell].fetch_add(fixedpoint_encode::<F>(w));
-            bin_sums[cell + 1usize].fetch_add(fixedpoint_encode::<F>(d));
-            feature += 1usize;
+            let part_base = copy_base + part * leaf_stride;
+            let mut feature = 0usize;
+            while feature < n_features_usize {
+                let bin = read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature])
+                    as usize;
+                let cell = part_base + (feature * n_bins + bin) * 2usize;
+                // channel 0 = Σ weight (statId 0), channel 1 = Σ der1. Fixed-point Atomic<u64>
+                // accumulate (GPUT-06): quantize each contribution, integer-atomic-add — exact
+                // + order-independent (deterministic), NOT a naked f64 fetch_add.
+                bin_sums[cell].fetch_add(fixedpoint_encode::<F>(w));
+                bin_sums[cell + 1usize].fetch_add(fixedpoint_encode::<F>(d));
+                feature += 1usize;
+            }
         }
 
         i += stride;
+    }
+}
+
+/// Zero-initialise a `u64` device buffer in place (grid-stride, one store per cell).
+/// Replaces the former host-side `vec![0u64; total]` upload for the (multi-copy)
+/// partition histogram: the buffer is `client.empty`-allocated and zeroed ON DEVICE, so
+/// no O(histogram) zero bytes ever cross the PCIe bus.
+#[cube(launch)]
+pub fn zero_u64_kernel(buf: &mut Array<u64>) {
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < buf.len() {
+        buf[i] = 0u64;
+        i += stride;
+    }
+}
+
+/// Fold the `n_copies` privatized copies of the fixed-point partition histogram into
+/// copy 0 IN PLACE: `buf[i] += Σ_{c>=1} buf[c * copy_stride + i]` for
+/// `i < copy_stride = buf.len() / n_copies`. Plain wrapping `u64` adds — the same
+/// two's-complement integer accumulation as the atomic fill, so the fold is exact,
+/// order-independent, and bit-deterministic (GPUT-06 unchanged). Each lane owns its
+/// output cell (no cross-thread writes → no atomics needed). Downstream consumers read
+/// the handle with length `copy_stride` (copy 0 only).
+#[cube(launch)]
+pub fn fold_hist_copies_kernel(buf: &mut Array<u64>, n_copies: u32) {
+    let copy_stride = buf.len() / (n_copies as usize);
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut i = ABSOLUTE_POS;
+    while i < copy_stride {
+        let mut acc = buf[i];
+        let mut c = 1usize;
+        while c < n_copies as usize {
+            acc += buf[c * copy_stride + i];
+            c += 1usize;
+        }
+        buf[i] = acc;
+        i += stride;
+    }
+}
+
+/// Derive the UNFILLED sibling half of a partition histogram from the parent level's
+/// histogram (the wired form of the subtraction trick, upstream `SubstractHistogramsImpl`
+/// / CATBOOST_CUDA_KERNELS_DESIGN §5.5): with the newest split bit `b = log2(half)`, the
+/// level-`L` fill accumulated ONLY the bit-set partitions `p + half` (see the
+/// `filter_mask` arm of [`partition_hist2_nonbinary_kernel`]); this kernel completes the
+/// low slots as `hist[p] = parent[p] − hist[p + half]` for every `p < half`, elementwise
+/// over each slot's `leaf_stride` cells.
+///
+/// Both operands are exact integer sums of identically-quantized fixed-point
+/// contributions, and the parent partition is EXACTLY the disjoint union of its two
+/// children, so the decode→subtract→encode round-trip reproduces the direct fill
+/// BIT-EXACTLY (magnitudes bounded by the WR-04 `< 2^33` precondition, far below the
+/// f64-exact 2^53). The statId==0 (weight) channel — cell index `≡ 0 (mod 2)` — keeps the
+/// upstream `max(., 0)` underflow clamp (inert under exact arithmetic, kept as the
+/// 11-PATTERNS Pattern-2 belt). One output cell per lane, no atomics — deterministic by
+/// construction. Generic over `F: Float` (AGENTS.md generics-float); if-as-STATEMENT only.
+#[cube(launch)]
+pub fn derive_sibling_partition_hist_kernel<F: Float>(
+    parent: &Array<u64>,
+    hist: &mut Array<u64>,
+    half: u32,
+    leaf_stride: u32,
+) {
+    let ls = leaf_stride as usize;
+    let cells = (half as usize) * ls;
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut c = ABSOLUTE_POS;
+    while c < cells {
+        let p = c / ls;
+        let j = c % ls;
+        let par = fixedpoint_decode::<F>(parent[p * ls + j]);
+        let filled = fixedpoint_decode::<F>(hist[(p + half as usize) * ls + j]);
+        let mut diff = par - filled;
+        // statId==0 (weight/hessian) channel: clamp to >= 0 (the SubstractHistogramsImpl
+        // underflow guard; exact arithmetic makes it inert, kept as the Pattern-2 belt).
+        if j % 2usize == 0usize {
+            if diff < F::new(0.0) {
+                diff = F::new(0.0);
+            }
+        }
+        hist[p * ls + j] = fixedpoint_encode::<F>(diff);
+        c += stride;
     }
 }
 
@@ -3998,10 +4104,19 @@ pub fn subtract_histograms_kernel<F: Float>(
 ///
 /// # Deterministic argmin (Pitfall 1) + D-05
 ///
-/// Each thread keeps a running best `(gain, candidate-index)` with the strict-`>` first-wins /
-/// lowest-`(feature, bin)`-index tie-break, then the cube block-reduces (wave-agnostic
-/// `CUBE_DIM_X`-strided shared-mem tree, D-09) into ONE `(best_gain, best_idx)` — the ONLY
-/// O(1) descriptor read back to host (the bulk histogram NEVER crosses — D-05). The trailing
+/// Each thread keeps a running best `(gain, candidate-index)` over its grid-strided candidate
+/// subset (stride = total thread count `CUBE_COUNT * CUBE_DIM`, D-09 — MULTI-cube so the
+/// candidate sweep uses the whole device, not one SM) with the strict-`>` first-wins /
+/// lowest-`(feature, bin)`-index tie-break, then each cube block-reduces (wave-agnostic
+/// `CUBE_DIM_X`-strided shared-mem tree, D-09) into its per-block `(best_gain, best_idx)`
+/// winner. The two winners pack into ONE output buffer — `best_out[CUBE_POS]` = the gain,
+/// `best_out[CUBE_COUNT + CUBE_POS]` = the candidate index widened to `F` (exact: `f64` holds
+/// every `u32`; the reachable backends here are the u64-atomic ones whose channel float is
+/// `f64`) — so the host finishes the across-block argmin from a SINGLE O(blocks) read-back
+/// (the bulk histogram NEVER crosses — D-05). Determinism is unchanged by the multi-cube
+/// geometry: every candidate is scored by exactly ONE thread, per-thread and per-block folds
+/// use the same strict-`>`/lowest-index rule, and the host fold applies the identical global
+/// tie-break, so the chosen split is bit-identical to the single-cube dispatch. The trailing
 /// `border == n_bins - 1` no-op (all bins LEFT) is EXCLUDED from the argmin, in lockstep with
 /// the depth-1 scorer and the CPU reference.
 ///
@@ -4013,16 +4128,22 @@ pub fn subtract_histograms_kernel<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn find_optimal_split_partition_kernel<F: Float>(
     bin_sums: &Array<u64>,
-    best_gain: &mut Array<F>,
-    best_idx: &mut Array<u32>,
+    best_out: &mut Array<F>,
     scaled_l2: &Array<F>,
     n_parts: u32,
     n_features: u32,
+    n_bins_used: u32,
     #[comptime] n_bins: u32,
     #[comptime] score_fn: u32,
 ) {
     let tid = UNIT_POS;
     let n_bins_usize = n_bins as usize;
+    // The ACTUAL quantized bin count (<= the comptime padded line width `n_bins`). Bins
+    // `n_bins_used..n_bins` are zero PADDING cells (the odd-width dispatch fix): they
+    // contribute nothing to any left/right sum, and their borders are EXCLUDED from the
+    // argmin below — a phantom border's "split" is the no-op all-LEFT split, which the
+    // CPU reference never enumerates (it scores real borders only).
+    let max_border = (n_bins_used as usize) - 1usize;
     let n_features_usize = n_features as usize;
     let n_parts_usize = n_parts as usize;
     let n_candidates = n_features_usize * n_bins_usize;
@@ -4040,8 +4161,10 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     let mut my_gain = minimal_score;
     let mut my_idx = n_candidates as u32;
 
-    // Grid-stride over candidates (D-09: stride == cube width CUBE_DIM_X, a topology value).
-    let mut c = tid as usize;
+    // Grid-stride over candidates (D-09: stride == TOTAL thread count CUBE_COUNT * CUBE_DIM,
+    // a topology value — the multi-cube dispatch spreads the candidate sweep over the device).
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut c = ABSOLUTE_POS;
     while c < n_candidates {
         let feature = c / n_bins_usize;
         let border = c % n_bins_usize;
@@ -4092,15 +4215,17 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
             score = score_acc / cos_den.sqrt();
         }
 
-        // Strict-first-wins / lowest-index tie-break; EXCLUDE the trailing no-op border.
-        if border < n_bins_usize - 1usize {
+        // Strict-first-wins / lowest-index tie-break; EXCLUDE the trailing no-op border AND
+        // every phantom padded border (`border >= n_bins_used - 1` — all-LEFT no-op splits
+        // the CPU reference never enumerates).
+        if border < max_border {
             if score > my_gain {
                 my_gain = score;
                 my_idx = c as u32;
             }
         }
 
-        c += CUBE_DIM_X as usize;
+        c += stride;
     }
 
     // Block-reduce the per-thread bests into ONE (gain, candidate-index) winner (the SAME
@@ -4136,8 +4261,11 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     }
 
     if tid == 0u32 {
-        best_gain[CUBE_POS] = sh_gain[0usize];
-        best_idx[CUBE_POS] = sh_idx[0usize];
+        // Packed per-block winner: gain in the first CUBE_COUNT slots, candidate index
+        // (widened to F — exact for every u32 in the f64 channel) in the second, so the
+        // host retrieves BOTH from one read-back (one sync per level instead of two).
+        best_out[CUBE_POS] = sh_gain[0usize];
+        best_out[CUBE_COUNT + CUBE_POS] = F::cast_from(sh_idx[0usize]);
     }
 }
 

@@ -662,6 +662,11 @@ pub struct GpuTrainSession {
     num_words: usize,
     n: usize,
     n_bins: usize,
+    /// The (possibly PADDED) partition-histogram line width the resident fill dispatches
+    /// ({32,64,128,256}; == `n_bins` when it is already a dispatched width). Only the
+    /// oblivious resident grow reads it; the nonsym/Region/CTR paths keep the ACTUAL
+    /// `n_bins`.
+    n_bins_line: usize,
     n_features: usize,
     cindex_stride: usize,
     depth: usize,
@@ -755,6 +760,21 @@ fn map_score_fn(score_function: EScoreFunction) -> Option<u32> {
         // The Newton (der2-weighted) score functions are GPU-only upstream and have no
         // depth-1 MVP device arm here — decline to the CPU path (D-04), never a wrong score.
         EScoreFunction::NewtonL2 | EScoreFunction::NewtonCosine => None,
+    }
+}
+
+/// Round a quantized bin count UP to the next partition-histogram line width the resident
+/// fill dispatches (`1 << bits`, bits 5..=8 → {32,64,128,256}), or `None` for a >8-bit
+/// quantization (n_bins > 256 → CPU fallback, D-04). The padding cells (`n_bins..width`)
+/// stay zero in every histogram and their phantom borders are excluded from the split
+/// argmin, so padding is score-invariant (see `GpuTrainSession::begin`).
+fn pad_hist_line_bins(n_bins: usize) -> Option<usize> {
+    match n_bins {
+        1..=32 => Some(32),
+        33..=64 => Some(64),
+        65..=128 => Some(128),
+        129..=256 => Some(256),
+        _ => None,
     }
 }
 
@@ -1100,23 +1120,28 @@ impl GpuTrainSession {
             return Ok(None);
         }
 
-        // The device histogram fill (`hist2_launch_resident`) only dispatches these line
-        // sizes: BINARY_BINS (2), HALF_BYTE_BINS (16), and the non-binary {32,64,128,256}
-        // widths. Any other `n_bins` (e.g. the default 254-border quantization → n_bins=255)
-        // would commit the whole fit to the device (D-10-01 all-or-nothing) and then hard-fail
-        // at grow time. Decline to the byte-unchanged CPU grower (D-04) instead of a hard
-        // failure. Keep this set in sync with `hist2_launch_resident`'s dispatch.
-        // This dispatch restriction applies ONLY to the resident oblivious partition-histogram
-        // fill. The non-symmetric grow (Plan 03) scores via the whole-subset `pointwise_hist2`
-        // path per node, which has no such line-size restriction — so skip the check for it.
-        // The Region grow (Plan 04) also scores via the whole-subset `pointwise_hist2` path
-        // (no line-size restriction), so skip the resident-fill dispatch check for it too.
-        if nonsym_policy.is_none()
-            && !region_active
-            && !matches!(n_bins, 2 | 16 | 32 | 64 | 128 | 256)
-        {
-            return Ok(None);
-        }
+        // The resident oblivious partition-histogram fill dispatches only the non-binary
+        // {32,64,128,256} line widths (`1 << bits`, bits 5..=8). Any OTHER `n_bins` — e.g. the
+        // real-world `border_count=32` → 33 bins, or the CatBoost default 254 borders → 255
+        // bins — is handled by PADDING the histogram LINE width up to the next dispatched
+        // family width (`n_bins_line`): the padding cells stay zero (they contribute nothing
+        // to any left/right sum) and their phantom borders are excluded from the split argmin
+        // (`n_bins_used` in `find_optimal_split_partition_kernel`), so the scored candidate
+        // set — and therefore the chosen splits — stay bit-identical to the unpadded CPU
+        // enumeration. Before this padding, every non-family width silently declined to the
+        // CPU grower here, which made the device path unreachable from any real `.fit()`
+        // (the SILENT-CPU-FALLBACK root cause of the 2026-07 GPU-speed investigation).
+        // Only `n_bins > 256` (a >8-bit quantization) still declines (D-04).
+        // The non-symmetric (Plan 03) / Region (Plan 04) grows score via the whole-subset
+        // `pointwise_hist2` path per node, which keeps its own dispatch — skip for them.
+        let n_bins_line = if nonsym_policy.is_none() && !region_active {
+            match pad_hist_line_bins(n_bins) {
+                Some(w) => w,
+                None => return Ok(None),
+            }
+        } else {
+            n_bins
+        };
 
         // --- Host-side validation (V5): the resident grow skips per-tree guards, so validate
         // the value ranges ONCE here (T-10-18 residency + the histogram value-range contract).
@@ -1188,7 +1213,10 @@ impl GpuTrainSession {
         })?;
 
         // --- Pack the cindex (10-06) + build the device arrays ONCE (incl. CTR columns). ---
-        let n_buckets_per_feature = vec![n_bins; eff_n_features];
+        // Pack with the (possibly padded) line width `n_bins_line`: the mask covers every
+        // real bin value (`< n_bins <= n_bins_line`) losslessly, and the resident fill /
+        // scorer address cells by the SAME padded width.
+        let n_buckets_per_feature = vec![n_bins_line; eff_n_features];
         let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, n)?;
         let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
         let num_words = packed.words.len();
@@ -1284,6 +1312,7 @@ impl GpuTrainSession {
             num_words,
             n,
             n_bins,
+            n_bins_line,
             n_features: eff_n_features,
             cindex_stride: eff_cindex_stride,
             depth,
@@ -1605,6 +1634,7 @@ impl GpuTrainSession {
             &target_h,
             self.num_words,
             self.n,
+            self.n_bins_line,
             self.n_bins,
             self.n_features,
             self.cindex_stride,
