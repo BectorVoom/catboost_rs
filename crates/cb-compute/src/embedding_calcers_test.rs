@@ -231,7 +231,7 @@ fn knn_cloud_rejects_dim_mismatch_on_add_and_query() {
 #[test]
 fn knn_calcer_classification_vote_counts_width_is_num_classes() {
     // Online insert docs 0..2 (read-before-update prefix), compute doc 3.
-    let mut calcer = KnnCalcer::new(DIM, 3, true, 2);
+    let mut calcer = KnnCalcer::new(DIM, 3, true, 2).expect("knn calcer");
     assert_eq!(calcer.feature_count(), 2, "clf width = num_classes");
     for i in 0..3 {
         calcer
@@ -245,7 +245,7 @@ fn knn_calcer_classification_vote_counts_width_is_num_classes() {
 
 #[test]
 fn knn_calcer_classification_empty_prefix_is_all_zero() {
-    let calcer = KnnCalcer::new(DIM, 3, true, 2);
+    let calcer = KnnCalcer::new(DIM, 3, true, 2).expect("knn calcer");
     let feat = calcer.compute(&EMB[0]).expect("compute ok");
     assert_eq!(feat, vec![0.0, 0.0], "no neighbors -> zero votes");
 }
@@ -253,7 +253,7 @@ fn knn_calcer_classification_empty_prefix_is_all_zero() {
 #[test]
 fn knn_calcer_regression_mean_target_width_one() {
     // Regression: width=1, result[0] = mean(neighbor targets).
-    let mut calcer = KnnCalcer::new(DIM, 3, false, 2);
+    let mut calcer = KnnCalcer::new(DIM, 3, false, 2).expect("knn calcer");
     assert_eq!(calcer.feature_count(), 1, "reg width = 1 (Pitfall 5)");
     // Insert docs 0,1,2 with targets 10,20,30.
     calcer.update(10.0, &EMB[0]).expect("ok");
@@ -267,7 +267,7 @@ fn knn_calcer_regression_mean_target_width_one() {
 
 #[test]
 fn knn_calcer_regression_empty_prefix_is_zero() {
-    let calcer = KnnCalcer::new(DIM, 3, false, 2);
+    let calcer = KnnCalcer::new(DIM, 3, false, 2).expect("knn calcer");
     let feat = calcer.compute(&EMB[0]).expect("compute ok");
     assert_eq!(feat, vec![0.0], "no neighbors -> zero mean");
 }
@@ -276,7 +276,7 @@ fn knn_calcer_regression_empty_prefix_is_zero() {
 fn knn_calcer_whole_set_separates_classes_at_border_half() {
     // Whole-set (offline Plain) insert; the k=3 class0 vote perfectly separates
     // classes (class0 docs -> [3,0], class1 docs -> [0,3]) at the 0.5 border.
-    let mut calcer = KnnCalcer::new(DIM, 3, true, 2);
+    let mut calcer = KnnCalcer::new(DIM, 3, true, 2).expect("knn calcer");
     for (i, row) in EMB.iter().enumerate() {
         calcer.update(LABELS[i] as f32, row).expect("update ok");
     }
@@ -293,6 +293,6 @@ fn knn_calcer_whole_set_separates_classes_at_border_half() {
 
 #[test]
 fn knn_calcer_update_rejects_dim_mismatch() {
-    let mut calcer = KnnCalcer::new(DIM, 3, true, 2);
+    let mut calcer = KnnCalcer::new(DIM, 3, true, 2).expect("knn calcer");
     assert!(calcer.update(0.0, &[1.0, 2.0]).is_err());
 }

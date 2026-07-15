@@ -21,6 +21,7 @@
 mod custom;
 mod embedding_calcers;
 mod histogram;
+mod hnsw;
 mod lda_linalg;
 mod leaf;
 mod loss;
@@ -42,6 +43,10 @@ pub use histogram::{
     fused_feature_scan_and_score, reduce_leaf_der2, reduce_leaf_stats, scan_and_score_borders,
     scan_and_score_borders_into, scan_border_to_leaf_stats, scan_borders_to_leaf_stats,
     BucketHistogram, FusedFeatureScratch, LeafStats, ScanScoreScratch,
+};
+pub use hnsw::{
+    l2_sqr_f32, HnswKnnCloud, Neighbor as HnswNeighbor, OnlineHnswIndex,
+    KNN_SEARCH_NEIGHBORHOOD_SIZE,
 };
 pub use lda_linalg::{
     calculate_projection, jacobi_symmetric_eig, reduce_generalized, sgemv_rowmajor, SymmetricEig,
@@ -95,6 +100,8 @@ pub use text_calcers::{
 mod embedding_calcers_test;
 #[cfg(test)]
 mod histogram_test;
+#[cfg(test)]
+mod hnsw_test;
 #[cfg(test)]
 mod lda_linalg_test;
 #[cfg(test)]

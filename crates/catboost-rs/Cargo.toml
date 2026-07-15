@@ -33,6 +33,10 @@ cb-backend = { path = "../cb-backend", default-features = false }
 cb-train = { path = "../cb-train", default-features = false }
 cb-model = { path = "../cb-model", default-features = false }
 thiserror.workspace = true
+# Per-feature data-prep parallelism in `fit` (border selection is embarrassingly
+# parallel across independent float columns; outputs are order-preserved and
+# byte-identical to the serial loop). Same workspace pin cb-train already uses.
+rayon.workspace = true
 
 [dev-dependencies]
 # Oracle harness + npy readers for the end-to-end train->serialize->load->predict

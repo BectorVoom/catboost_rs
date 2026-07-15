@@ -616,6 +616,7 @@ dependencies = [
  "cb-train",
  "ndarray",
  "ndarray-npy",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

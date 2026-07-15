@@ -48,7 +48,7 @@ Full per-phase detail: `.planning/milestones/v1.1-ROADMAP.md` and `.planning/mil
 **Milestone-wide context carried into every phase:** Kaggle CUDA is the SOLE authoritative GPU oracle (ROCm in-env = non-gating smoke); export uses an **export-specific float32 tolerance** oracled vs CatBoost's own ONNX/CoreML export in the target runtime (NOT the ≤10⁻⁵ double bar); FEAT-07 oracles the per-object **neighbor set** index-for-index; GPU-infer reuses the v1.1 fixed-point-u64 deterministic reduction + `f32::MIN` sentinel; **never add a `cb-train` dependency to `cb-backend`** (feature-unification landmine); new backend-bearing crates keep `default-features=false` / no unconditional `cpu`.
 
 - [x] **Phase 15: Debt Discharge & CUDA Oracle Re-establishment** — GPUT-14 aggregate ε=1e-4 sign-off, Phase-10/11 BENCH-02 rows, RV-13-01..04 hazards; re-establishes the trusted CUDA oracle everything downstream rests on (completed 2026-07-05)
-- [ ] **Phase 16: Online-HNSW KNN Estimated-Feature Parity** — bit-for-bit port of upstream `online_hnsw` closing the last open ≤10⁻⁵ CPU parity gap (parallel with Phase 15, different crates)
+- [x] **Phase 16: Online-HNSW KNN Estimated-Feature Parity** — bit-for-bit port of upstream `online_hnsw` closing the last open ≤10⁻⁵ CPU parity gap (parallel with Phase 15, different crates) (completed 2026-07-12)
 - [ ] **Phase 17: Model Export — ONNX + CoreML** — read-only float-only exporters with upstream guards, oracled under an export-specific tolerance
 - [ ] **Phase 18: Extended Feature Importance** — Interaction, LossFunctionChange, partial-dependence (parallel with Phase 17)
 - [ ] **Phase 19: GPU Inference Evaluator** — device-side predict for the upstream subset, deterministic, Kaggle-CUDA-signed (depends on Phase 15's re-signed oracle)
@@ -98,8 +98,12 @@ Plans:
   2. Both the online (`TKNNUpdatableCloud`) and offline (`TKNNCloud`) calcer paths match upstream neighbor sets bit-for-bit across the full XOR corpus, and the class-vote order matches upstream (feat0 = class-1 vote)
   3. The text+embedding+numeric XOR corpus StagedApprox + Predictions match upstream ≤10⁻⁵ with no weakened tolerance and no `#[ignore]`
 
-**Plans**: TBD
-**Context**: Bit-exact parity IS achievable — the crux is replicating upstream's construction RNG + insertion order + `TL2SqrDistance`; an off-the-shelf HNSW crate can NEVER pass (different RNG/graph). Oracle the neighbor **set**, not just the final prediction. Self-contained ~936 LOC port in `cb-compute/src/hnsw/` + one wiring change in `cb-train/estimated`.
+**Status**: COMPLETE (2026-07-12). Single-plan execution.
+**Outcome vs Success Criteria**:
+  1. ✅ MET — `cb-compute/src/hnsw.rs` (online-HNSW + `NHnsw::FindApproximateNeighbors` + `GetLevelSizes` + a libc++-faithful `push_heap`/`pop_heap` port) reproduces the instrumented `knn_neighbors` dump index-for-index, INCLUDING the approximate-path prefixes (size ≥ 7 > `MaxNeighbors+1`), gated by `crates/cb-oracle/tests/hnsw_neighbor_oracle_test.rs`. The heap tie-break (distance ties resolved by heap element-movement, NOT ascending-id) is what the prior brute-force-exact calcer got wrong.
+  2. ✅ MET (online) / PARTIAL (offline) — the online (`TKNNUpdatableCloud`) path is bit-for-bit (default `KnnBackend::Hnsw`; exact retained behind `KnnCalcer::new_exact`, D-03). The offline "application" column is produced by querying the same online-built HNSW graph at full population (the whole-set apply), which reproduces upstream's prediction column to ≤1e-5 end-to-end; the separate STATIC `TKNNCloud` batched builder (`TIndexBuilder::Build`, only constructed on `.cbm` LOAD) was NOT ported — deferred (see Deferred Items), as no in-tree path exercises it (training + predict use the one online updatable cloud).
+  3. ✅ MET — the XOR text+embedding StagedApprox + Predictions match upstream ≤1e-5 IN ORDER (measured max|diff| ≈ 1.2e-8), NO weakened tolerance, NO `#[ignore]`, NO leaf-order relaxation (`text_embedding_end_to_end_oracle_test.rs::xor_oracle_{staged_approx,predictions}_match_upstream`). The two coupled fixes: (a) the HNSW neighbor set, (b) the train-vs-apply estimated-feature source split — structure/leaves learned on the ONLINE column, prediction applied to the OFFLINE column (`EstimatedObjectsData`, `learnPermutation = Nothing()`); fold_count=1, no fold cycling/averaging.
+**Context**: Bit-exact parity IS achievable — the crux was replicating insertion order + `TL2SqrDistance` (f32 SSE-lane accumulation) + the libc++ heap tie-break (NO construction RNG in the online path, confirmed by transcription). An off-the-shelf HNSW crate can NEVER pass. Self-contained port in `cb-compute/src/hnsw.rs` + a backend swap in `cb-compute/embedding_calcers.rs` (`KnnCalcer` → `KnnBackend`); NO `cb-train` change needed (the seam functions `online_knn_prefix`/`offline_knn_features` route through the calcer unchanged). Resolves `.planning/todos/done/estimated-feature-grid-parity.md`.
 
 ### Phase 17: Model Export — ONNX + CoreML
 
@@ -254,7 +258,7 @@ v1.2 phases execute in numeric order: 15 → 16 → 17 → 18 → 19 → 20 → 
 | 1–8 (Core Parity) | v1.0 | — | Complete | 2026-06-28 |
 | 10–14 (GPU Performance) | v1.1 | — | Complete | 2026-07-05 |
 | 15. Debt Discharge & CUDA Oracle Re-establishment | v1.2 | 4/4 | Complete    | 2026-07-05 |
-| 16. Online-HNSW KNN Estimated-Feature Parity | v1.2 | 0/TBD | Not started | - |
+| 16. Online-HNSW KNN Estimated-Feature Parity | v1.2 | 1/1 | Complete | 2026-07-12 |
 | 17. Model Export — ONNX + CoreML | v1.2 | 0/TBD | Not started | - |
 | 18. Extended Feature Importance | v1.2 | 0/TBD | Not started | - |
 | 19. GPU Inference Evaluator | v1.2 | 0/TBD | Not started | - |

@@ -47,6 +47,7 @@
 
 use cb_core::{CbError, CbResult};
 
+use crate::hnsw::HnswKnnCloud;
 use crate::lda_linalg::{calculate_projection, sgemv_rowmajor};
 
 /// LDA default regularization (`embedding_feature_estimators.cpp`:reg default
@@ -584,14 +585,61 @@ impl KnnCloud {
     }
 }
 
+/// The KNN neighbor source. Upstream's `TKNNCalcer` stores vectors in an ONLINE
+/// HNSW approximate index (`TOnlineHnswDenseVectorIndex`); the [`Hnsw`](KnnBackend::Hnsw)
+/// variant is the DEFAULT (parity) backend (D-03 / FEAT-07). The
+/// [`Exact`](KnnBackend::Exact) brute-force-exact scan is retained as an explicit
+/// opt-in ([`KnnCalcer::new_exact`]) for callers who want true nearest neighbors;
+/// it diverges from upstream on corpora where the HNSW graph does NOT degenerate to
+/// exact (e.g. the XOR corpus).
+#[derive(Debug, Clone)]
+enum KnnBackend {
+    /// Online-HNSW approximate index — bit-for-bit upstream parity (default).
+    Hnsw(HnswKnnCloud),
+    /// Brute-force-exact L2-squared scan — non-parity opt-in (D-03).
+    Exact(KnnCloud),
+}
+
+impl KnnBackend {
+    fn len(&self) -> usize {
+        match self {
+            KnnBackend::Hnsw(c) => c.len(),
+            KnnBackend::Exact(c) => c.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            KnnBackend::Hnsw(c) => c.is_empty(),
+            KnnBackend::Exact(c) => c.is_empty(),
+        }
+    }
+
+    fn add_vector(&mut self, embed: &[f32]) -> CbResult<()> {
+        match self {
+            KnnBackend::Hnsw(c) => c.add_vector(embed),
+            KnnBackend::Exact(c) => c.add_vector(embed),
+        }
+    }
+
+    fn nearest_neighbors(&self, query: &[f32], k: usize) -> CbResult<Vec<usize>> {
+        match self {
+            KnnBackend::Hnsw(c) => c.nearest_neighbors(query, k),
+            KnnBackend::Exact(c) => c.nearest_neighbors(query, k),
+        }
+    }
+}
+
 /// KNN neighbor-vote calcer (`TKNNCalcer`, `knn.h:94-142` / `knn.cpp:51-90`).
 ///
 /// Classification emits per-class neighbor-vote COUNTS (`width = num_classes`);
-/// regression emits the neighbor target MEAN (`width = 1`, Pitfall 5). The
-/// neighbor set is the brute-force-exact spike-validated `k`-NN (see module note).
+/// regression emits the neighbor target MEAN (`width = 1`, Pitfall 5). The neighbor
+/// set comes from the [`KnnBackend`] — the online-HNSW index by default (upstream
+/// parity, [`KnnCalcer::new`]) or the brute-force-exact scan on the explicit opt-in
+/// ([`KnnCalcer::new_exact`], D-03).
 #[derive(Debug, Clone)]
 pub struct KnnCalcer {
-    cloud: KnnCloud,
+    backend: KnnBackend,
     /// `CloseNum` — the query `k` (`knn.h:107`; fixtures `KNN:k=3`).
     close_num: usize,
     /// `true` -> classification (per-class vote counts); `false` -> regression mean.
@@ -606,14 +654,50 @@ pub struct KnnCalcer {
 }
 
 impl KnnCalcer {
-    /// A new empty KNN calcer over `dimension`-dim embeddings.
+    /// A new empty KNN calcer over `dimension`-dim embeddings, using the DEFAULT
+    /// online-HNSW neighbor backend (upstream parity, D-03 / FEAT-07).
     ///
     /// - `close_num` is the query `k` (`KNN:k=...`).
     /// - `is_classification` selects the vote-count vs mean arm.
     /// - `num_classes` sets the classification output width (ignored for reg).
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`CbError::OutOfRange`] if the derived HNSW options are invalid — i.e.
+    /// `close_num == 0` or `close_num > 300` (the pinned `SearchNeighborhoodSize`).
+    /// This mirrors upstream's own `CheckOptions` guard (`1 <= MaxNeighbors <=
+    /// SearchNeighborhoodSize`, `build_options.h`); an invalid `k` is surfaced
+    /// rather than silently degraded to the non-parity exact backend. Use
+    /// [`Self::new_exact`] for the explicit exact opt-in.
     pub fn new(
         dimension: usize,
+        close_num: usize,
+        is_classification: bool,
+        num_classes: usize,
+    ) -> CbResult<Self> {
+        let backend = KnnBackend::Hnsw(HnswKnnCloud::new(dimension, close_num)?);
+        Ok(Self::from_backend(backend, close_num, is_classification, num_classes))
+    }
+
+    /// A new empty KNN calcer using the brute-force-EXACT neighbor backend (D-03
+    /// opt-in). Non-parity: diverges from upstream on corpora where the HNSW graph
+    /// does not degenerate to exact.
+    #[must_use]
+    pub fn new_exact(
+        dimension: usize,
+        close_num: usize,
+        is_classification: bool,
+        num_classes: usize,
+    ) -> Self {
+        Self::from_backend(
+            KnnBackend::Exact(KnnCloud::new(dimension)),
+            close_num,
+            is_classification,
+            num_classes,
+        )
+    }
+
+    fn from_backend(
+        backend: KnnBackend,
         close_num: usize,
         is_classification: bool,
         num_classes: usize,
@@ -624,7 +708,7 @@ impl KnnCalcer {
             1
         };
         Self {
-            cloud: KnnCloud::new(dimension),
+            backend,
             close_num,
             is_classification,
             feature_count,
@@ -642,13 +726,13 @@ impl KnnCalcer {
     /// Number of inserted neighbors so far.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cloud.len()
+        self.backend.len()
     }
 
     /// Whether no neighbors have been inserted yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.cloud.is_empty()
+        self.backend.is_empty()
     }
 
     /// The k nearest insertion ids to `embed` over the currently-inserted prefix
@@ -657,7 +741,7 @@ impl KnnCalcer {
     /// # Errors
     /// [`CbError::OutOfRange`] on a dimension mismatch.
     pub fn neighbors(&self, embed: &[f32]) -> CbResult<Vec<usize>> {
-        self.cloud.nearest_neighbors(embed, self.close_num)
+        self.backend.nearest_neighbors(embed, self.close_num)
     }
 
     /// Insert `embed` with its `target` (`TKNNCalcerVisitor::Update`,
@@ -666,7 +750,7 @@ impl KnnCalcer {
     /// # Errors
     /// [`CbError::OutOfRange`] on a dimension mismatch.
     pub fn update(&mut self, target: f32, embed: &[f32]) -> CbResult<()> {
-        self.cloud.add_vector(embed)?;
+        self.backend.add_vector(embed)?;
         if self.is_classification {
             // The class label must be a non-negative integer in `[0, num_classes)`.
             // Upstream `(ui32)target` wraps/UB on negative/fractional/non-finite
@@ -697,7 +781,7 @@ impl KnnCalcer {
     /// recorded class/target (a parallel-array desync — never silently indexed).
     pub fn compute(&self, embed: &[f32]) -> CbResult<Vec<f32>> {
         let mut result = vec![0.0_f32; self.feature_count];
-        let neighbors = self.cloud.nearest_neighbors(embed, self.close_num)?;
+        let neighbors = self.backend.nearest_neighbors(embed, self.close_num)?;
         if self.is_classification {
             for &id in &neighbors {
                 let class = *self.target_classes.get(id).ok_or_else(|| {

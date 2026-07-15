@@ -30,6 +30,7 @@ use cb_compute::{
     LeafMethod, Loss,
 };
 use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
+use rayon::prelude::*;
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
     counter_calc_method_default, fold_len_multiplier_default, has_time_default,
@@ -331,6 +332,11 @@ impl CatBoostBuilder {
     /// Returns [`CatBoostError::Train`] for any training failure (degenerate
     /// input, depth exceeded, runtime gradient error).
     pub fn fit(&self, pool: &Pool) -> Result<Model, CatBoostError> {
+        // CB_GPU_PROF host-stage attribution (shares the device profiler's env gate; cold
+        // when unset — the checks below never allocate or print).
+        let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
+        let prof_t = std::time::Instant::now();
+
         // SoA float columns as f32 (the feature storage type; the apply path
         // binarizes f32 against the borders).
         let feature_values: Vec<Vec<f32>> = pool
@@ -341,12 +347,23 @@ impl CatBoostBuilder {
 
         // Per-float-feature quantization borders from the pool (Phase-2 greedy
         // logsum). NaN sentinel is off for the numeric first-slice surface
-        // (NaN-free features are always Forbidden regardless).
+        // (NaN-free features are always Forbidden regardless). Columns are
+        // independent, so the per-feature selection runs in parallel; rayon's
+        // indexed `par_iter` preserves output order, so the result is
+        // byte-identical to the serial loop (each column's borders depend only
+        // on that column).
         let feature_borders: Vec<Vec<f64>> = pool
             .float_features()
-            .iter()
+            .par_iter()
             .map(|col| select_borders_greedy_logsum(col, self.border_count, false))
             .collect();
+        if prof {
+            eprintln!(
+                "CB_GPU_PROF fit-prep copy+borders elapsed={:.2}ms",
+                prof_t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        let prof_train_t = std::time::Instant::now();
 
         let params = self.boost_params();
         // Compile-time backend selection (08-08): exactly one feature is active, so
@@ -365,6 +382,13 @@ impl CatBoostBuilder {
             &params,
             None,
         )?;
+
+        if prof {
+            eprintln!(
+                "CB_GPU_PROF fit-train elapsed={:.2}ms",
+                prof_train_t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
 
         let canonical = cb_model::Model::from_trained(&trained, feature_borders);
         Ok(Model::from_canonical(canonical))
