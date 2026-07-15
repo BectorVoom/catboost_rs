@@ -1,4 +1,3 @@
-<!-- GSD:project-start source:PROJECT.md -->
 
 ## Project
 
@@ -97,10 +96,6 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 - `libcatboostmodel.so` / `libcatboostmodel.dylib` / `catboostmodel.dll` — shared library must be available at runtime (linked dynamically via `cargo:rustc-link-lib=dylib=catboostmodel`)
 - Target platforms: Linux (x86_64, aarch64, ppc64le), macOS (x86_64, arm64), Windows (x86_64), Android
 
-<!-- GSD:stack-end -->
-
-<!-- GSD:conventions-start source:CONVENTIONS.md -->
-
 ## Conventions
 
 ## Source/Test Separation — Mandatory Rule
@@ -146,15 +141,6 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 - No more than one statement per line
 - Template keyword on its own line
 
-## Import Organization
-
-### Rust
-
-### C++ (catboost-master/)
-
-## Error Handling
-
-### Rust
 
 ### C++ (catboost-master/)
 
@@ -180,19 +166,6 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 - On any CubeCL build error, immediately load `/home/user/Documents/workspace/cubecl_manual/manual/Cubecl/cubecl_error_guideline.md` before attempting any fix.
 - Blind fixes to CubeCL build errors without consulting the guideline are prohibited.
 
-## Module Design
-
-<!-- GSD:conventions-end -->
-
-<!-- GSD:architecture-start source:ARCHITECTURE.md -->
-
-## Architecture
-
-## System Overview
-
-```text
-
-```
 
 ## Component Responsibilities
 
@@ -241,14 +214,6 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 - Contains: model serialization (`libs/model/`), training (`libs/train_lib/`, `libs/train_interface/`), CUDA kernels (`cuda/`)
 - Used by: `c_api.cpp`
 
-## Data Flow
-
-### Model Inference (Primary Path)
-
-### Model Loading
-
-### Build-time Binding Generation
-
 ## GPU Acceleration
 
 - CatBoost's CUDA training layer is implemented in `catboost-master/catboost/cuda/`
@@ -289,39 +254,3 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 - **Unsafe boundary:** All `unsafe` is contained in `catboost-sys/src/lib.rs` (generated) and the `unsafe {}` blocks inside `model.rs`. The public API of `catboost` crate is fully safe.
 - **Build dependency:** Requires Python and either a C++ compiler toolchain or a pre-built `libcatboostmodel`. CUDA builds additionally require NVCC.
 - **Circular imports:** None detected.
-
-## Anti-Patterns
-
-### Tests embedded in production source files
-
-<!-- GSD:architecture-end -->
-
-<!-- GSD:skills-start source:skills/ -->
-
-## Project Skills
-
-No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
-<!-- GSD:skills-end -->
-
-<!-- GSD:workflow-start source:GSD defaults -->
-
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-<!-- GSD:profile-start -->
-
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->

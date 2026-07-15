@@ -187,6 +187,13 @@ def main():
     marker_lines = [ln.strip() for ln in (out_m or "").splitlines() if ln.strip().isdigit()]
     result["staged_source_has_perf_kernels"] = bool(marker_lines and int(marker_lines[0]) > 0)
     log("staged_source_has_perf_kernels:", result["staged_source_has_perf_kernels"])
+    # Round-3 provenance marker: the packed-cindex partition split (plain-cindex upload
+    # removed from `begin`). Same do-not-fabricate discipline as the round-1 marker.
+    rc_m3, out_m3 = sh("grep -c launch_partition_split_packed_into "
+                       "/tmp/repo/crates/cb-backend/src/gpu_runtime/mod.rs")
+    marker3_lines = [ln.strip() for ln in (out_m3 or "").splitlines() if ln.strip().isdigit()]
+    result["staged_source_has_round3_kernels"] = bool(marker3_lines and int(marker3_lines[0]) > 0)
+    log("staged_source_has_round3_kernels:", result["staged_source_has_round3_kernels"])
 
     # ---------------------------------------------------------------
     # STEP 3 — Rust toolchain

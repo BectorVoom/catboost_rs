@@ -211,13 +211,20 @@ pub fn select_borders_greedy_logsum(
     max_borders: usize,
     nan_sentinel: bool,
 ) -> Vec<f64> {
-    // Narrow to f32 (feature storage type), drop NaNs, sort ascending.
+    // Narrow to f32 (feature storage type), drop NaNs, sort ascending. The UNSTABLE
+    // sort is byte-identical here: keys equal under the comparator are either
+    // bit-identical f32s or the {-0.0, +0.0} pair, and every downstream consumer is
+    // order-insensitive across equal keys — `left_border`'s midpoint of any {-0.0, +0.0}
+    // adjacency is +0.0 in either order, the greedy split scores depend only on the
+    // sorted VALUES at each index, and the emitted border set normalizes -0.0 to +0.0
+    // before dedup. pdqsort avoids the stable merge sort's O(n/2) allocation on the hot
+    // fit-prep path.
     let mut values: Vec<f32> = column
         .iter()
         .map(|&v| v as f32)
         .filter(|v| !v.is_nan())
         .collect();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // Each non-NaN object carries unit weight; the total weight is accumulated
     // through the audited reduction primitive (D-07) — for the unweighted path
