@@ -338,10 +338,12 @@ impl CatBoostBuilder {
         let prof_t = std::time::Instant::now();
 
         // SoA float columns as f32 (the feature storage type; the apply path
-        // binarizes f32 against the borders).
+        // binarizes f32 against the borders). Columns are independent and rayon's
+        // indexed `par_iter` preserves output order, so the narrowed matrix is
+        // byte-identical to the serial loop.
         let feature_values: Vec<Vec<f32>> = pool
             .float_features()
-            .iter()
+            .par_iter()
             .map(|col| col.iter().map(|&v| v as f32).collect())
             .collect();
 

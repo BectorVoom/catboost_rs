@@ -163,6 +163,29 @@ fn pack_read_bit_exact_mixed_widths_grouping() {
     assert_eq!(got, bins, "mixed-width grouping must be bit-exact");
 }
 
+/// HOST-ONLY pack→extract bit-exactness over mixed widths and a non-trivial `n` — no
+/// device launch, so it guards the (rayon-parallel) `pack_cindex` group-column packing
+/// even where the device runtime is unavailable: every `(feature, obj)` cell extracted
+/// through `read_bin_host` must reproduce the source bin exactly.
+#[test]
+fn pack_host_extract_bit_exact_mixed_widths() {
+    let n = 10_007usize; // prime, so chunk boundaries never align with feature strides
+    let n_buckets = vec![16usize, 16, 256, 2, 256, 256, 64, 33];
+    let bins = synth_bins(n, &n_buckets, 260716);
+
+    let packed = pack_cindex(&bins, &n_buckets, n).unwrap();
+    for (feature, f) in packed.features.iter().enumerate() {
+        for obj in 0..n {
+            let got = read_bin_host(&packed.words, f.offset, obj, f.shift, f.mask);
+            assert_eq!(
+                got,
+                bins[feature * n + obj],
+                "host pack->extract (feature {feature}, obj {obj})"
+            );
+        }
+    }
+}
+
 #[test]
 fn pack_read_bit_exact_large_n() {
     // Large n so many packed words + a non-cube-multiple tail are exercised.

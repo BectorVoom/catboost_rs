@@ -41,6 +41,7 @@
 //! [`CbError::LengthMismatch`].
 
 use cb_core::{CbError, CbResult};
+use rayon::prelude::*;
 
 /// Per-feature bit-packed cindex descriptor (upstream `TCFeature`). `offset` is the WORD
 /// base of the feature's group ([`crate::kernels::read_bin`] indexes `cindex[offset +
@@ -207,37 +208,9 @@ pub(crate) fn pack_cindex(
     })?;
     let mut words = vec![0u32; num_words];
 
-    // Second pass: OR each feature's masked field into its group's word column, and emit
-    // the TCFeature descriptor. `chunks_exact(n)` walks each feature's plain bin column
-    // (bins.len() == n_features * n, n > 0, so exactly n_features chunks, no remainder);
-    // `zip` keeps the bucket count + placement aligned — no slice indexing.
+    // Second pass (a): emit the TCFeature descriptor table (serial — `n_features` entries).
     let mut features: Vec<TCFeature> = Vec::with_capacity(n_features);
-    for ((&nb, &(group, shift, mask)), bins_chunk) in
-        n_buckets.iter().zip(placed.iter()).zip(bins.chunks_exact(n))
-    {
-        let group_base = group.checked_mul(n).ok_or_else(|| {
-            CbError::OutOfRange(format!("pack_cindex: group {group} * n ({n}) overflows usize"))
-        })?;
-        let group_end = group_base.checked_add(n).ok_or_else(|| {
-            CbError::OutOfRange(format!(
-                "pack_cindex: group_base ({group_base}) + n ({n}) overflows usize"
-            ))
-        })?;
-        let word_col = words.get_mut(group_base..group_end).ok_or_else(|| {
-            CbError::OutOfRange(format!(
-                "pack_cindex: word column {group_base}..{group_end} out of the {num_words}-word buffer"
-            ))
-        })?;
-        for (&raw, w) in bins_chunk.iter().zip(word_col.iter_mut()) {
-            // Value-range guard (T-10-16): a bin >= n_buckets would corrupt an adjacent
-            // field once masked/shifted — reject it here rather than silently truncate.
-            if (raw as usize) >= nb {
-                return Err(CbError::OutOfRange(format!(
-                    "pack_cindex: bin value {raw} >= n_buckets ({nb})"
-                )));
-            }
-            *w |= (raw & mask) << shift;
-        }
+    for (&nb, &(group, shift, mask)) in n_buckets.iter().zip(placed.iter()) {
         let offset = (group as u64).checked_mul(n as u64).ok_or_else(|| {
             CbError::OutOfRange(format!("pack_cindex: group offset {group} * n ({n}) overflows u64"))
         })?;
@@ -253,6 +226,68 @@ pub(crate) fn pack_cindex(
             one_hot_feature: false,
         });
     }
+
+    // Second pass (b): OR each feature's masked field into its group's word column, in
+    // PARALLEL over the groups. Group columns are DISJOINT `n`-word slices
+    // (`par_chunks_mut(n)` yields exactly `num_groups` of them, aligned with
+    // `group_ranges` below), and a feature writes ONLY its own group's column, so there
+    // is no aliasing; within a group each feature owns a disjoint bit FIELD of the
+    // shared word, so the packed words are BIT-IDENTICAL to the former serial loop.
+    // The per-element value-range guard is preserved (T-10-16): a bin >= n_buckets
+    // would corrupt an adjacent field once masked/shifted — reject, never truncate.
+    //
+    // `placed` assigns groups in monotone non-decreasing order, so each group's
+    // features form one contiguous index range.
+    let mut group_ranges: Vec<std::ops::Range<usize>> = vec![0..0; num_groups];
+    for (fi, &(group, _, _)) in placed.iter().enumerate() {
+        if let Some(r) = group_ranges.get_mut(group) {
+            if r.start == r.end {
+                *r = fi..fi + 1;
+            } else {
+                r.end = fi + 1;
+            }
+        }
+    }
+    words
+        .par_chunks_mut(n)
+        .zip(group_ranges.par_iter())
+        .try_for_each(|(word_col, range)| -> CbResult<()> {
+            for fi in range.clone() {
+                let (&nb, &(_, shift, mask)) = match (n_buckets.get(fi), placed.get(fi)) {
+                    (Some(nb), Some(p)) => (nb, p),
+                    _ => {
+                        return Err(CbError::OutOfRange(format!(
+                            "pack_cindex: feature index {fi} out of the placement table (internal)"
+                        )))
+                    }
+                };
+                let col_start = fi.checked_mul(n).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "pack_cindex: feature {fi} * n ({n}) overflows usize"
+                    ))
+                })?;
+                let col_end = col_start.checked_add(n).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "pack_cindex: column start ({col_start}) + n ({n}) overflows usize"
+                    ))
+                })?;
+                let bins_chunk = bins.get(col_start..col_end).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "pack_cindex: bin column {col_start}..{col_end} out of the {}-cell buffer",
+                        bins.len()
+                    ))
+                })?;
+                for (&raw, w) in bins_chunk.iter().zip(word_col.iter_mut()) {
+                    if (raw as usize) >= nb {
+                        return Err(CbError::OutOfRange(format!(
+                            "pack_cindex: bin value {raw} >= n_buckets ({nb})"
+                        )));
+                    }
+                    *w |= (raw & mask) << shift;
+                }
+            }
+            Ok(())
+        })?;
 
     Ok(PackedCindex { words, features })
 }

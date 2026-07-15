@@ -22,6 +22,10 @@ bytemuck.workspace = true
 # `#[cube]` kernels (D-03 keeps cubecl OUT of cb-compute, not the reverse).
 cb-compute = { path = "../cb-compute" }
 cb-core = { path = "../cb-core" }
+# Host-side parallelism for the per-fit prep transforms (cindex pack, value-range
+# validation) — order-preserving `par_*` only, so outputs stay byte-identical to the
+# serial loops (GPU round-3 perf pass).
+rayon.workspace = true
 
 [features]
 # Compile-time backend selection only — NO runtime dispatch (D-02). Each backend

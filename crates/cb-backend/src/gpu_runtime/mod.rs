@@ -1716,6 +1716,87 @@ pub(crate) fn launch_partition_split_into(
     Ok(new_leaf_of)
 }
 
+/// Packed-cindex variant of [`launch_partition_split_into`] (round-3 perf): the split
+/// feature's bin is read through the ONE `read_bin` accessor with its REAL `TCFeature`
+/// `(offset, shift, mask)` descriptor over the resident bit-packed `words` — `read_bin`
+/// reproduces the plain feature-major bin bit-exactly (the `kernels/cindex.rs` pack→read
+/// oracle), so the forward-bit routing decision is byte-identical while the
+/// 4-byte-per-cell plain replica never needs uploading.
+///
+/// The output buffer is `client.empty` (NOT zero-created + uploaded): the grid-stride
+/// covers every `i in 0..n` and writes `new_leaf_of[indices[i]]` unconditionally, so as
+/// long as `indices` covers `0..n` (the resident session's `indices` is the IDENTITY
+/// permutation by construction) every cell is written before any read. A caller whose
+/// `indices` does not cover `0..n` must use [`launch_partition_split_into`] (which
+/// zero-creates) instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_split_packed_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1: Handle,
+    cindex_words: Handle,
+    indices: Handle,
+    leaf_of: Handle,
+    n: usize,
+    num_words: usize,
+    offset: u32,
+    shift: u32,
+    mask: u32,
+    bin: u32,
+    level_bit: u32,
+) -> CbResult<Handle> {
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // No host-side zero buffer + upload here: the kernel writes every covered object
+    // (see the doc invariant above), so an uninitialized device allocation suffices.
+    let new_leaf_of = client.empty(n * std::mem::size_of::<u32>());
+
+    #[cfg(feature = "wgpu")]
+    partition_split_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_words, num_words) },
+        unsafe { ArrayArg::from_raw_parts(indices, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+        unsafe { ArrayArg::from_raw_parts(new_leaf_of.clone(), n) },
+        offset,
+        shift,
+        mask,
+        bin,
+        level_bit,
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    partition_split_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(der1, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_words, num_words) },
+        unsafe { ArrayArg::from_raw_parts(indices, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+        unsafe { ArrayArg::from_raw_parts(new_leaf_of.clone(), n) },
+        offset,
+        shift,
+        mask,
+        bin,
+        level_bit,
+    );
+
+    Ok(new_leaf_of)
+}
+
 /// Recompute the per-partition `Σ der1` / `Σ weight` / `Σ (der2·weight)` device-resident
 /// after a split: returns a NEW `part_stats` handle of length `n_parts * 3` (channel 0 =
 /// Σ der1, channel 1 = Σ weight, channel 2 = Σ (der2·weight) — the GPUT-07 Newton hessian
@@ -3036,7 +3117,9 @@ pub(crate) fn grow_oblivious_tree_resident(
     approx_h: Handle,
     der1_h: &Handle,
     weight_h: &Handle,
-    plain_cindex_h: &Handle,
+    feat_offsets: &[u32],
+    feat_shifts: &[u32],
+    feat_masks: &[u32],
     cindex_words_h: &Handle,
     offsets_h: &Handle,
     shifts_h: &Handle,
@@ -3048,7 +3131,6 @@ pub(crate) fn grow_oblivious_tree_resident(
     n_bins: usize,
     n_bins_used: usize,
     n_features: usize,
-    cindex_stride: usize,
     depth: usize,
     scaled_l2: f64,
     score_fn: u32,
@@ -3168,17 +3250,34 @@ pub(crate) fn grow_oblivious_tree_resident(
         })?;
         splits.push((split.feature_id, split.bin_id));
 
-        // (4) Device partition-split (forward-bit doc-routing) over the resident PLAIN
-        //     cindex — IN-PLACE on device, NO read-back (D-05).
-        leaf_of_h = launch_partition_split_into(
+        // (4) Device partition-split (forward-bit doc-routing) over the resident PACKED
+        //     cindex words — IN-PLACE on device, NO read-back (D-05). The split feature's
+        //     bin is read through the ONE `read_bin` accessor with its REAL TCFeature
+        //     (offset, shift, mask) descriptor — bit-exact vs the former plain
+        //     feature-major replica (the `kernels/cindex.rs` pack→read oracle), which is
+        //     therefore no longer uploaded at `begin` (round-3 perf).
+        let fi = split.feature_id as usize;
+        let (split_offset, split_shift, split_mask) =
+            match (feat_offsets.get(fi), feat_shifts.get(fi), feat_masks.get(fi)) {
+                (Some(&o), Some(&s), Some(&m)) => (o, s, m),
+                _ => {
+                    return Err(CbError::OutOfRange(format!(
+                        "grow_oblivious_tree_resident level {level}: split feature {fi} out of \
+                         the {n_features}-feature packed descriptor table"
+                    )))
+                }
+            };
+        leaf_of_h = launch_partition_split_packed_into(
             client,
             der1_h.clone(),
-            plain_cindex_h.clone(),
+            cindex_words_h.clone(),
             indices_h.clone(),
             leaf_of_h,
             n,
-            cindex_stride,
-            split.feature_id,
+            num_words,
+            split_offset,
+            split_shift,
+            split_mask,
             split.bin_id,
             level as u32,
         )?;

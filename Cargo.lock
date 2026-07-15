@@ -643,6 +643,7 @@ dependencies = [
  "cb-compute",
  "cb-core",
  "cubecl",
+ "rayon",
 ]
 
 [[package]]

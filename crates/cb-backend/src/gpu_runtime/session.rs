@@ -44,6 +44,7 @@ use cb_compute::{
     EScoreFunction, Loss,
 };
 use cb_core::{CbError, CbResult, TFastRng64};
+use rayon::prelude::*;
 
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
@@ -635,9 +636,17 @@ pub struct GpuTrainSession {
     client: cubecl::client::ComputeClient<SelectedRuntime>,
 
     // --- Persistent device handles, uploaded ONCE at `begin` (cloned per tree) ---
-    /// The plain feature-major quantized bins (`cindex[feature * n + obj]`), for the
-    /// partition split's degenerate-TCFeature read.
-    plain_cindex_h: Handle,
+    /// Host copies of the per-feature packed-cindex addressing (TCFeature
+    /// Offset/Shift/Mask): the per-level partition split looks up the CHOSEN split
+    /// feature's descriptor here and reads its bin through `read_bin` over the resident
+    /// packed `words` — bit-exact vs the former plain feature-major replica, which is no
+    /// longer uploaded (round-3 perf: it duplicated the packed words at 4 bytes/cell for
+    /// this one consumer).
+    feat_offsets: Vec<u32>,
+    /// Per-feature TCFeature `Shift` (host copy — see `feat_offsets`).
+    feat_shifts: Vec<u32>,
+    /// Per-feature TCFeature `Mask` (host copy — see `feat_offsets`).
+    feat_masks: Vec<u32>,
     /// The bit-packed grouped cindex `words`, for the histogram's `read_bin` accessor.
     cindex_words_h: Handle,
     /// Per-feature TCFeature `Offset` array (packed-layout addressing).
@@ -668,7 +677,6 @@ pub struct GpuTrainSession {
     /// `n_bins`.
     n_bins_line: usize,
     n_features: usize,
-    cindex_stride: usize,
     depth: usize,
     scaled_l2: f64,
     score_fn: u32,
@@ -1166,7 +1174,13 @@ impl GpuTrainSession {
         }
         // Every quantized bin must fit the dispatched line size (`n_bins`); a value >= n_bins
         // would write bin_sums out of bounds in the non-binary fill (which does not mask).
-        if let Some(&bad) = bins_feature_major.iter().find(|&&b| (b as usize) >= n_bins) {
+        // Parallel scan (round-3 perf: this is an n*n_features-cell sweep on the hot begin
+        // path); `find_first` keeps the FIRST offender in slice order, so the surfaced
+        // error is byte-identical to the serial `find`.
+        if let Some(&bad) = bins_feature_major
+            .par_iter()
+            .find_first(|&&b| (b as usize) >= n_bins)
+        {
             return Err(CbError::OutOfRange(format!(
                 "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
             )));
@@ -1192,25 +1206,26 @@ impl GpuTrainSession {
             && !config.exact_leaf
             && config.mvs_lambda.is_none()
             && config.max_leaves.is_none();
-        let (eff_bins, eff_n_features): (Vec<u32>, usize) = if ctr_is_covered {
+        // Round-3 perf: the non-CTR path BORROWS the caller's bins (no n*n_features-cell
+        // copy on the hot begin path); only the CTR arm materializes an augmented owned
+        // buffer. `Cow` keeps both arms feeding the SAME pack below.
+        let (eff_bins, eff_n_features): (std::borrow::Cow<'_, [u32]>, usize) = if ctr_is_covered {
             if let Some(ctr) = config.ctr.as_ref() {
                 let ctr_columns = build_ctr_cindex_columns(&client, ctr, n)?;
                 let mut augmented = bins_feature_major.to_vec();
                 for col in &ctr_columns {
                     augmented.extend_from_slice(col);
                 }
-                (augmented, n_features + ctr_columns.len())
+                (
+                    std::borrow::Cow::Owned(augmented),
+                    n_features + ctr_columns.len(),
+                )
             } else {
-                (bins_feature_major.to_vec(), n_features)
+                (std::borrow::Cow::Borrowed(bins_feature_major), n_features)
             }
         } else {
-            (bins_feature_major.to_vec(), n_features)
+            (std::borrow::Cow::Borrowed(bins_feature_major), n_features)
         };
-        let eff_cindex_stride = eff_n_features.checked_mul(n).ok_or_else(|| {
-            CbError::OutOfRange(format!(
-                "eff_n_features ({eff_n_features}) * n ({n}) overflows usize (cindex stride)"
-            ))
-        })?;
 
         // --- Pack the cindex (10-06) + build the device arrays ONCE (incl. CTR columns). ---
         // Pack with the (possibly padded) line width `n_bins_line`: the mask covers every
@@ -1221,13 +1236,24 @@ impl GpuTrainSession {
         let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
         let num_words = packed.words.len();
 
+        // Host copies of the per-feature packed addressing (offset/shift/mask): the
+        // per-level partition split reads the chosen split feature's bin through the ONE
+        // `read_bin` accessor over the resident PACKED words, addressed by these
+        // descriptors — bit-exact vs the former plain feature-major replica (the
+        // `kernels/cindex.rs` pack→read oracle), which is therefore NO LONGER uploaded
+        // (round-3 perf: that replica was a 4-byte-per-cell duplicate of the packed
+        // words consumed by nothing else).
+        let feat_offsets = offsets_v.clone();
+        let feat_shifts = shifts_v.clone();
+        let feat_masks = masks_v.clone();
+
         // Identity object-visiting order (whole-dataset root): indices[i] = i.
         let indices: Vec<u32> = (0..n as u32).collect();
 
         // Upload ALL resident handles ONCE. der1/weight/approx are channel-typed (f32 on
         // wgpu, f64 elsewhere) via the shared helper; cindex/indices/TCFeature are u32.
-        let plain_cindex_h = client.create(cubecl::bytes::Bytes::from_elems(eff_bins.clone()));
-        let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
+        // `packed.words` is MOVED into the upload (no clone — round-3 perf).
+        let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words));
         let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
         let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
         let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
@@ -1299,7 +1325,9 @@ impl GpuTrainSession {
 
         Ok(Some(Self {
             client,
-            plain_cindex_h,
+            feat_offsets,
+            feat_shifts,
+            feat_masks,
             cindex_words_h,
             offsets_h,
             shifts_h,
@@ -1314,7 +1342,6 @@ impl GpuTrainSession {
             n_bins,
             n_bins_line,
             n_features: eff_n_features,
-            cindex_stride: eff_cindex_stride,
             depth,
             scaled_l2,
             score_fn,
@@ -1625,7 +1652,9 @@ impl GpuTrainSession {
             approx_h,
             &der1_h,
             weight_ref,
-            &self.plain_cindex_h,
+            &self.feat_offsets,
+            &self.feat_shifts,
+            &self.feat_masks,
             &self.cindex_words_h,
             &self.offsets_h,
             &self.shifts_h,
@@ -1637,7 +1666,6 @@ impl GpuTrainSession {
             self.n_bins_line,
             self.n_bins,
             self.n_features,
-            self.cindex_stride,
             self.depth,
             self.scaled_l2,
             self.score_fn,
