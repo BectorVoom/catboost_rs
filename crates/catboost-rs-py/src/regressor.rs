@@ -113,6 +113,33 @@ impl CatBoostRegressor {
         Ok(preds.to_pyarray(py))
     }
 
+    /// Partial dependence for one or two float features (FSTR-03), mirroring
+    /// upstream `plot_partial_dependence`. Returns a dict `{features: list[int],
+    /// grids: list[np.ndarray], values: np.ndarray}`; `values` is row-major over
+    /// the Cartesian product of `grids` (first feature outer). `features` indexes
+    /// the model's float features (`0..n_float_features`); pass 1 or 2 distinct
+    /// indices.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on a bad `X` (dtype /
+    /// layout) or an invalid feature request (arity / out-of-range / duplicate /
+    /// empty dataset).
+    #[pyo3(signature = (x, features))]
+    fn partial_dependence<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+        features: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostRegressor is not fitted yet; call `fit` before `partial_dependence`",
+            )
+        })?;
+        crate::estimator::partial_dependence_py(model, py, x, features)
+    }
+
     /// Return the verbatim constructor kwargs (sklearn `get_params`). `deep` is
     /// accepted for signature parity (no nested estimators). Enables
     /// `sklearn.base.clone` and `GridSearchCV` (T-08-15).

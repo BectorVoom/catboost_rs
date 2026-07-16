@@ -15,8 +15,9 @@ use std::path::Path;
 
 use cb_data::Pool;
 use cb_model::{
-    apply_prediction_type, interaction, load_cbm, load_json, predict_raw, prediction_values_change,
-    save_cbm, save_json, shap_values, FeatureImportanceType, PredictionType,
+    apply_prediction_type, interaction, load_cbm, load_json, partial_dependence, predict_raw,
+    prediction_values_change, save_cbm, save_json, shap_values, FeatureImportanceType,
+    PartialDependence, PredictionType,
 };
 
 use crate::error::CatBoostError;
@@ -189,6 +190,30 @@ impl Model {
                     .collect())
             }
         }
+    }
+
+    /// Compute partial dependence for one or two float features over `pool`
+    /// (FSTR-03). Each target feature is swept across its per-bin grid while the
+    /// other features keep their per-object `pool` values; the `RawFormulaVal` is
+    /// averaged over all objects, matching upstream `plot_partial_dependence`
+    /// within `1e-5`. Returns the per-feature grids and the averaged surface
+    /// (row-major, first feature outer, for two features) — see
+    /// [`cb_model::PartialDependence`].
+    ///
+    /// `features` indexes the model's float-feature space (`0..n_float_features`);
+    /// pass 1 or 2 distinct indices.
+    ///
+    /// # Errors
+    /// [`CatBoostError::FeatureMismatch`] if `pool`'s float-feature count differs
+    /// from the model's; [`CatBoostError::PartialDependence`] for an invalid
+    /// request (bad arity, out-of-range / duplicate feature, empty dataset).
+    pub fn partial_dependence(
+        &self,
+        pool: &Pool,
+        features: &[usize],
+    ) -> Result<PartialDependence, CatBoostError> {
+        let columns = self.feature_columns(pool)?;
+        Ok(partial_dependence(&self.inner, &columns, features)?)
     }
 
     /// Save the model to a native `.cbm` file (D-07).

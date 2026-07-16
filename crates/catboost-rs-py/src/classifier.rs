@@ -166,7 +166,31 @@ impl CatBoostClassifier {
         })
     }
 
-    /// Return the verbatim constructor kwargs (sklearn `get_params`). Enables
+    /// Partial dependence for one or two float features (FSTR-03), mirroring
+    /// upstream `plot_partial_dependence`. Returns a dict `{features: list[int],
+    /// grids: list[np.ndarray], values: np.ndarray}` (values row-major, first
+    /// feature outer). `features` indexes the model's float features.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on a bad `X` or an
+    /// invalid feature request (arity / out-of-range / duplicate / empty dataset).
+    #[pyo3(signature = (x, features))]
+    fn partial_dependence<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+        features: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostClassifier is not fitted yet; call `fit` before `partial_dependence`",
+            )
+        })?;
+        crate::estimator::partial_dependence_py(model, py, x, features)
+    }
+
+    /// Return the verbatim constructor kwargs (sklearn `get_params`); enables
     /// `sklearn.base.clone` / `GridSearchCV` (T-08-15).
     ///
     /// # Errors

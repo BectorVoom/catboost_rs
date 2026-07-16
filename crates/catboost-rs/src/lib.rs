@@ -31,6 +31,10 @@ pub use model::Model;
 // without reaching into the internal crates.
 pub use cb_model::{FeatureImportanceType, PredictionType};
 
+// Re-export the partial-dependence result + error types (FSTR-03) so callers
+// consume `Model::partial_dependence` entirely through the published crate.
+pub use cb_model::{PartialDependence, PdpError};
+
 // Re-export the loss / leaf-method / score-function / bootstrap knobs the
 // Builder consumes, so a caller configures a run entirely through the published
 // crate. `EScoreFunction` drives `.score_function()` (Cosine = catboost CPU

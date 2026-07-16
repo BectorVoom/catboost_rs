@@ -110,6 +110,9 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         FacadeError::Io(io) => PyIOError::new_err(io.to_string()),
         FacadeError::Train(c) => CatBoostError::new_err(c.to_string()),
         FacadeError::Model(m) => CatBoostError::new_err(m.to_string()),
+        // An invalid partial-dependence request is a bad-input value error
+        // (like FeatureMismatch): arity / out-of-range / duplicate / empty.
+        FacadeError::PartialDependence(e) => CatBoostValueError::new_err(e.to_string()),
     }
 }
 

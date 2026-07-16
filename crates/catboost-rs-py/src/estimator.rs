@@ -10,11 +10,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use catboost_rs::{CatBoostBuilder, CatBoostError, IngestSource, Model, Pool};
+use numpy::{PyArray1, ToPyArray};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::errors::CatBoostValueError;
+use crate::errors::{CatBoostValueError, PyCbError};
 use crate::ingest_py::ingest_to_owned;
 
 /// Shared estimator state: kwargs stored verbatim (D-06) + the fitted model
@@ -246,6 +247,38 @@ pub(crate) fn data_to_pool(
     ingest_to_owned(py, x, y, None)?
         .into_pool()
         .map_err(|e| CatBoostValueError::new_err(e.to_string()))
+}
+
+/// Shared FSTR-03 partial-dependence adapter for the estimators. Ingests `x` into
+/// an owned [`Pool`] under the GIL (D-11), releases the GIL for the compute
+/// (`py.detach`), and returns a dict `{features: list[int], grids:
+/// list[np.ndarray[f64]], values: np.ndarray[f64]}` — `values` row-major over the
+/// Cartesian product of `grids` (first feature outer). Mirrors the `predict`
+/// adapter shape.
+///
+/// # Errors
+/// [`CatBoostValueError`] on a bad `x` (dtype/layout) or an invalid partial-
+/// dependence request (bad arity / out-of-range / duplicate feature / empty
+/// dataset), via [`crate::errors::to_pyerr`].
+pub(crate) fn partial_dependence_py<'py>(
+    model: &Model,
+    py: Python<'py>,
+    x: &Bound<'py, PyAny>,
+    features: Vec<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // --- GIL HELD: own the input before any detach (D-11) ---
+    let pool = data_to_pool(py, x, None)?;
+    // --- owned data only: safe to release the GIL for the compute ---
+    let pd = py
+        .detach(|| model.partial_dependence(&pool, &features))
+        .map_err(PyCbError)?;
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "features"), pd.features)?;
+    let grids: Vec<Bound<'py, PyArray1<f64>>> =
+        pd.grids.iter().map(|g| g.to_pyarray(py)).collect();
+    dict.set_item(intern!(py, "grids"), grids)?;
+    dict.set_item(intern!(py, "values"), pd.values.to_pyarray(py))?;
+    Ok(dict)
 }
 
 /// Load a reference model from `path`, dispatching on the file extension: a

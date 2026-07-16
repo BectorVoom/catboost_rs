@@ -68,4 +68,11 @@ pub enum CatBoostError {
     /// error so no out-of-bounds access crosses the public boundary.
     #[error("feature mismatch: {0}")]
     FeatureMismatch(String),
+
+    /// A [`crate::Model::partial_dependence`] request was invalid — bad arity
+    /// (not 1 or 2 features), an out-of-range or duplicate feature index, or an
+    /// empty dataset. Carries the typed `cb-model` [`cb_model::PdpError`].
+    /// Converted with `?` via `#[from]`.
+    #[error("partial dependence error: {0}")]
+    PartialDependence(#[from] cb_model::PdpError),
 }
