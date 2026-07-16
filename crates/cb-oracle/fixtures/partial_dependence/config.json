@@ -1,0 +1,45 @@
+{
+  "artifacts": [
+    "model.cbm",
+    "model.json",
+    "pdp_single_values.npy",
+    "pdp_pair_values.npy"
+  ],
+  "borders": {
+    "0": [
+      0.5756795406341553,
+      0.7963352203369141
+    ],
+    "1": [
+      -0.08364950865507126,
+      0.28499358892440796
+    ],
+    "2": [],
+    "3": [
+      -0.1585310399532318,
+      0.3004736602306366,
+      1.0769416093826294
+    ]
+  },
+  "catboost_version": "1.2.10",
+  "grid_convention": "per-BIN: n_borders+1 bins. Rust grid representative for bin i = [b0-1.0, (b_{i-1}+b_i)/2 ..., b_last+1.0]; any interior value maps to the same bin so the averaged RawFormulaVal equals upstream _calc_partial_dependence.",
+  "input_dataset": "numeric_tiny",
+  "note": "FSTR-03 partial dependence (PDP-02..04). Values are upstream plot_partial_dependence(pool, features, plot=False)[0] == _calc_partial_dependence (core.py:4041). ONE value per bin. pdp_pair_values.npy is C-order row-major (feature 0 outer, 3 inner).",
+  "pair_axis_to_feature": {
+    "axis0_outer": 0,
+    "axis1_inner": 3
+  },
+  "pair_features": [
+    0,
+    3
+  ],
+  "pair_shape_row_major": [
+    3,
+    4
+  ],
+  "random_seed": 0,
+  "scenario": "partial_dependence",
+  "single_feature": 3,
+  "single_n_bins": 4,
+  "thread_count": 1
+}

@@ -18,6 +18,7 @@ mod error;
 mod fstr;
 mod json;
 mod model;
+mod partial_dependence;
 mod predict;
 mod shap;
 
@@ -40,6 +41,7 @@ pub use model::{
     CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, RegionLevel, RegionTree, Split,
     TreeVariant,
 };
+pub use partial_dependence::{partial_dependence, PartialDependence, PdpError};
 pub use predict::{
     apply_multiclass_prediction, apply_prediction_type, apply_ve_prediction_type, MultiClassKind,
     PredictionType,

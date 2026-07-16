@@ -3,14 +3,14 @@ title: "FSTR-03 — Partial-Dependence Feature Importance (one or two features)"
 status: draft
 format: markdown
 spec_version: 1
-updated_at: 2026-07-12T00:00:00Z
+updated_at: 2026-07-16T00:00:00Z
 phase: 18
 requirement_ids:
   - FSTR-03
 source_requirements:
-  - ".planning/REQUIREMENTS.md:31 (FSTR-03)"
-  - ".planning/ROADMAP.md:131 (Phase 18 Success Criterion 3)"
-pageindex_target: "PENDING — no writable PageIndex spec corpus is indexed for this repo (see §10). This file is the local authoritative draft."
+  - ".planning/REQUIREMENTS.md:31 (FSTR-03) — git-recovered (commit a82289c); NOT in the working tree. Confirm the canonical revision before flipping the requirement checkbox."
+  - ".planning/ROADMAP.md:131 (Phase 18 Success Criterion 3) — git-recovered (commit a82289c); not in the working tree."
+pageindex_target: "catboost_rs/SPEC.md (PageIndex folder id cmrhcxbtm000104jr3i5jzm0m, indexed 2026-07-12, status=completed). PENDING re-index of THIS hardened revision — see §10 (the MCP's process_document ingests PDFs and offers no in-place Markdown upsert)."
 ---
 
 # FSTR-03 — Partial-Dependence Feature Importance
@@ -77,16 +77,42 @@ two-feature plot is a 2-D grid `[VERIFIED: CONTEXT7 /catboost/catboost plot_part
 | Dependency | Typed interface | Evidence |
 |-----------|-----------------|----------|
 | Model apply (RawFormulaVal) | `predict_raw(model: &Model, feature_values: &[Vec<f32>]) -> Vec<f64>` (SoA: `feature_values[f]` = float feature `f`'s per-object `f32` column) | `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:370]` |
-| Float-feature grid source | `Model.float_feature_borders: Vec<Vec<f64>>` (per-feature ascending borders) | `[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs:293]` |
-| Deterministic mean fold | `cb_core::sum_f64(&[f64]) -> f64` (upstream iteration order, D-08) | `[VERIFIED: LOCAL crates/cb-model/src/fstr.rs:49,55]` |
-| Oracle comparator | `cb_oracle::compare::assert_abs_close(expected, actual, 1e-5)` / `compare_stage(stage, …)` | `[VERIFIED: CODEGRAPH crates/cb-oracle/src/compare.rs:46,84]` |
+| Float-feature grid source | **`pub` field** `cb_model::Model.float_feature_borders: Vec<Vec<f64>>` (per-feature ascending borders; empty inner vecs preserved so index == float-feature index) | `[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs:293 (field on the struct at :272)]` |
+| Float-feature count | `n_float = model.float_feature_borders.len()` (the model exposes NO other flat-feature layout — see §4 index-space note) | `[VERIFIED: CODEGRAPH crates/catboost-rs/src/model.rs:51-53 `n_float_features` reads `float_feature_borders.len()`]` |
+| Silent NaN-pad hazard | `predict_raw_cat` gathers each object row via `col.get(obj).copied().unwrap_or(f32::NAN)` — a **short or missing** column silently reads `NaN` (no error), which would corrupt the PD average. Motivates the PDP-05 `MalformedColumns` guard. | `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407]` |
+| Deterministic mean fold | `cb_core::sum_f64(&[f64]) -> f64` (sequential left-to-right `f64` fold, upstream order, D-08 — never `.sum()`) | `[VERIFIED: CODEGRAPH crates/cb-core/src/reduction.rs:32]` |
+| Oracle comparator | `cb_oracle::compare::assert_abs_close(expected: &[f64], actual: &[f64], tol: f64) -> Result<(), OracleError>` — **returns a `Result`, never panics**; oracle tests propagate/`unwrap` it under the test-only lint allow | `[VERIFIED: CODEGRAPH crates/cb-oracle/src/compare.rs:46]` |
 | Fixture recipe | upstream `catboost==1.2.10` in a venv, `.npy` + `config.json` committed under `crates/cb-oracle/fixtures/<name>/` | `[VERIFIED: LOCAL crates/cb-oracle/fixtures/advanced_fstr/gen_fixtures.py:1-70]` |
+| Oracle test harness pattern | integration test under `crates/cb-model/tests/` with top `#![allow(clippy::unwrap_used, expect_used, panic, indexing_slicing)]`, `const TOL: f64 = 1e-5`, a `fixture()` path helper, and `ndarray_npy::read_npy` / `cb_oracle::load_f64_vec` loaders | `[VERIFIED: LOCAL crates/cb-model/tests/advanced_fstr_oracle_test.rs:18-49]` |
 
 **Layering:** all work lives in `cb-model` (already depends on `cb-core`); no
 `cb-train`/`cb-backend`/`cb-compute` edge is added, so no CubeCL feature-unification
 risk `[VERIFIED: LOCAL .planning/research/unimplemented-parity-research.md:47,182]`.
 
 ## 4. Typed contracts
+
+### Feature-index space (load-bearing — read first)
+
+`features` and `columns` are **both indexed in float-feature-index space**:
+index `f ∈ 0..n_float` where `n_float = model.float_feature_borders.len()`, and
+`columns[f]` is that float feature's per-object `f32` column (exactly the SoA
+layout `predict_raw` consumes). **This is the only index space the API can
+honor**, because `cb_model::Model` stores *no* flat-feature / feature-kind map —
+its only feature metadata is `float_feature_borders` (float features) and
+`ctr_data: Option<CtrData>` (whether CTR splits exist)
+`[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs:272-313 — Model has no flat-feature
+kind list]`. For the **numeric-only fixture model in scope**, the float-feature
+index is *identical* to upstream `plot_partial_dependence(pool, features)`'s
+flat feature index (the pool has only float features), so the oracle comparison
+is apples-to-apples. `[INFERRED: numeric-only ⇒ float-index == flat-index]`
+
+**Consequence for validation:** a *categorical / CTR / text / embedding* target
+feature **cannot be expressed** through this float-index column API and **cannot
+be detected** from `Model` metadata, so there is no `UnsupportedFeatureKind`
+error — such an index is simply out of the float range (`FeatureIndexOutOfRange`).
+Categorical / flat-index partial dependence (which needs the internal→regular
+feature-index remap) is a **deferred follow-up** (an FSTR-01-adjacent concern),
+explicitly out of this slice. `[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs:272-313]`
 
 ```rust
 /// Result of a partial-dependence computation for one or two features.
@@ -103,20 +129,34 @@ pub struct PartialDependence {
 }
 
 /// Typed failure at the partial-dependence boundary (no panic, no unwrap).
+/// Every variant is REACHABLE and IMPLEMENTABLE from `Model` + `columns` alone
+/// (see §5 PDP-05 for the one-Red-test-per-arm mapping).
 #[derive(Debug, thiserror::Error)]
 pub enum PdpError {
+    /// A requested feature index is >= the model's float-feature count. Also the
+    /// (only) outcome for a categorical/CTR target, which has no float index.
     #[error("feature index {index} out of range (model has {n_float} float features)")]
     FeatureIndexOutOfRange { index: usize, n_float: usize },
-    #[error("feature {index} is not a float feature; partial dependence is float-only in this release")]
-    UnsupportedFeatureKind { index: usize },
+    /// `features.len()` is not 1 or 2 (upstream partial dependence is 1–2 features).
     #[error("partial dependence supports 1 or 2 features, got {requested}")]
     UnsupportedFeatureArity { requested: usize },
+    /// A two-feature request named the SAME float feature twice; a 2-D PD surface
+    /// over `(f, f)` is degenerate. Conservative API precondition of this slice.
+    #[error("partial dependence over two features requires distinct features; feature {index} was given twice")]
+    DuplicateFeature { index: usize },
+    /// `columns` does not match the model's float-feature layout: the count is not
+    /// `n_float`, or the columns are ragged (unequal lengths). Guards the silent
+    /// NaN-pad hazard (§3) — a short/narrow column would otherwise average garbage.
+    #[error("columns malformed: expected {expected_float_features} equal-length float columns, got {actual}")]
+    MalformedColumns { expected_float_features: usize, actual: String },
+    /// The dataset has no objects (`columns` empty, or every column length 0).
     #[error("dataset has no objects")]
     EmptyDataset,
 }
 
-/// Public entry point (composes PDP-02 grid + PDP-01 engine).
-/// `columns[f]` is float feature `f`'s per-object `f32` column (SoA, as `predict_raw`).
+/// Public entry point (composes PDP-05 validation + PDP-02 grid + PDP-01 engine).
+/// `columns[f]` is float feature `f`'s per-object `f32` column (SoA, as `predict_raw`);
+/// `columns.len()` MUST equal `model.float_feature_borders.len()` (validated).
 pub fn partial_dependence(
     model: &Model,
     columns: &[Vec<f32>],
@@ -127,6 +167,13 @@ pub fn partial_dependence(
 > Exact placement of `PdpError` (a dedicated enum in the new module vs. new
 > `cb_model::ModelError` variants) is a plan-time wiring choice — see `PLAN.md`
 > Task 0. It does not change the behavioral contract. `[INFERRED]`
+>
+> **Change note (2026-07-16 hardening):** the earlier draft's
+> `UnsupportedFeatureKind { index }` variant was **removed** — it is not
+> implementable (Model exposes no feature-kind map) nor reachable (a non-float
+> index is caught by `FeatureIndexOutOfRange`). It is replaced by two
+> implementable, individually-testable guards — `DuplicateFeature` and
+> `MalformedColumns` — the latter closing the verified silent-NaN-pad hole (§3).
 
 ## 5. Failure-isolated behavioral specifications
 
@@ -137,11 +184,13 @@ explicit dependency boundary, and one primary cause of acceptance-test failure.
 
 ### PDP-01 — Single-feature averaging engine over an explicit grid
 
-- **Status:** draft
+- **Status:** implemented (2026-07-16; unit AT-01a/b/c green in `partial_dependence_test.rs`)
 - **Responsibility:** given a grid, compute the averaged RawFormulaVal for each
   grid point. *Isolates the averaging math from grid derivation.*
-- **Preconditions:** `columns` non-empty and rectangular; `feature < columns.len()`;
-  `feature` is a float feature.
+- **Preconditions (guaranteed by PDP-05 before the engine runs):** `columns.len()
+  == n_float` (`= model.float_feature_borders.len()`); every column has the same
+  length `n >= 1` (rectangular, non-empty); `feature < n_float`. Because these
+  hold, `predict_raw` never NaN-pads a short/missing column (§3 hazard closed).
 - **Input:** `model: &Model`, `columns: &[Vec<f32>]`, `feature: usize`, `grid: &[f64]`.
 - **Output:** `Vec<f64>`, `len == grid.len()`.
 - **Dependencies:** `predict_raw` (apply.rs:370), `cb_core::sum_f64`.
@@ -166,39 +215,47 @@ explicit dependency boundary, and one primary cause of acceptance-test failure.
 
 ---
 
-### PDP-02 — Default grid derivation from model borders (single float feature)
+### PDP-02 — Per-bin grid derivation from model borders (single float feature)
 
-- **Status:** draft
-- **Responsibility:** produce the x-axis grid for a float feature, **matching
-  upstream's grid**. *Isolates the one genuine open convention question.*
+- **Status:** implemented (2026-07-16; unit `grid_for_feature_is_per_bin_representatives` green)
+- **Responsibility:** produce the per-bin representative grid for a float feature.
+  *Grid transform RESOLVED (was the one open convention question).*
 - **Preconditions:** `feature` is a valid float feature index.
 - **Input:** `model: &Model`, `feature: usize`.
-- **Output:** `Vec<f64>` ascending grid.
-- **Dependencies:** `Model.float_feature_borders[feature]` (model.rs:293).
+- **Output:** `Vec<f64>` ascending grid, length `n_borders + 1` (one per bin).
+- **Dependencies:** `model.float_feature_borders[feature]` (model.rs:293).
+- **RESOLVED transform (ground-truth, `catboost==1.2.10`).** Upstream computes PD
+  **per BIN**: borders `b_0 < … < b_{k-1}` define `k+1` bins
+  (`(-inf,b_0], (b_0,b_1], …, (b_{k-1},+inf)`), and `plot_partial_dependence`
+  returns one value per bin (`_calc_partial_dependence`, `core.py:4041`). Since a
+  prediction depends only on which bin the feature lands in, the bin-`i`
+  representative is any interior point; we use
+  `[b_0 - 1, (b_0+b_1)/2, …, (b_{k-2}+b_{k-1})/2, b_{k-1} + 1]` (length `k+1`,
+  strictly ascending). Feeding `grid[i]` through the PDP-01 engine reproduces
+  upstream bin `i` (verified <1e-15 on numeric_tiny). There is **no upstream
+  numeric x-grid** to compare against (upstream's x-axis is bin indices with
+  interval tick text), so PDP-02 is a **unit** test on the deterministic
+  transform, while the *values* it feeds are oracle-locked by PDP-03/04.
+  `[VERIFIED: LOCAL catboost 1.2.10 core.py:4033-4055; empirical dev <1e-15]`
 - **Behavior (Given/When/Then):**
-  - **Given** feature `f` with stored borders `b_0 < … < b_{k-1}`, **when** the
-    grid is derived, **then** it equals the upstream `plot_partial_dependence`
-    x-grid for `f` on the same model. The **exact transform** (borders verbatim
-    vs. consecutive midpoints vs. borders-plus-endpoints) is **TBD** — resolved
-    empirically in TDD by comparing to the committed `pdp_single_grid.npy`
-    (resolution owner: fixture generator run under pinned `catboost==1.2.10`).
-    `[UNVERIFIED: exact grid transform not derivable from vendored source or docs]`
+  - **Given** feature `f` with borders `b_0 < … < b_{k-1}`, **then** the grid is
+    the `k+1` per-bin representatives above (ascending).
   - **Given** a feature the model never split on (empty borders), **then** the
-    grid is empty and `values` is empty (no crash). `[INFERRED]`
-- **Invariants:** ascending, deduplicated, finite.
-- **Acceptance tests (oracle):**
-  - AT-02a: derived grid equals `partial_dependence/pdp_single_grid.npy` element-for-element
-    (≤1e-5; grid values are borders, so exact or near-exact).
+    grid is the benign single point `[0.0]` (the feature does not affect
+    prediction; upstream rejects such a feature outright — we do not). `[INFERRED]`
+- **Invariants:** ascending, finite, length `n_borders + 1`.
+- **Acceptance tests (unit):**
+  - AT-02: `grid_for_feature` == `[b0-1, midpoints…, b_last+1]` for a 3-border and
+    a 1-border feature; `[0.0]` for empty borders; strictly ascending.
 - **Out of scope:** averaging; two features.
 - **Traceability:** `[VERIFIED: CODEGRAPH model.rs:293]`,
-  `[VERIFIED: CONTEXT7 grid derives from float-split borders]`,
-  `[UNVERIFIED: precise transform → oracle-resolved]`.
+  `[VERIFIED: LOCAL catboost==1.2.10 core.py:4041 `_calc_partial_dependence` per-bin]`.
 
 ---
 
 ### PDP-03 — Single-feature partial dependence (public API, end-to-end)
 
-- **Status:** draft
+- **Status:** implemented (2026-07-16; oracle `single_feature_pdp_matches_upstream` green ≤1e-5)
 - **Responsibility:** compose PDP-02 grid + PDP-01 engine behind the public
   `partial_dependence(model, columns, &[f])` and return `PartialDependence`.
 - **Preconditions:** valid float feature; non-empty rectangular `columns`.
@@ -220,7 +277,7 @@ explicit dependency boundary, and one primary cause of acceptance-test failure.
 
 ### PDP-04 — Two-feature partial dependence (2-D grid)
 
-- **Status:** draft
+- **Status:** implemented (2026-07-16; oracle `pair_feature_pdp_matches_upstream` green ≤1e-5)
 - **Responsibility:** partial dependence over the Cartesian product of two
   float features' grids.
 - **Preconditions:** two distinct valid float feature indices; non-empty columns.
@@ -243,32 +300,60 @@ explicit dependency boundary, and one primary cause of acceptance-test failure.
 
 ### PDP-05 — Typed rejection of unsupported inputs
 
-- **Status:** draft
+- **Status:** implemented (2026-07-16; unit AT-05a..e green in `partial_dependence_test.rs`)
 - **Responsibility:** reject invalid requests with a typed `PdpError`, never
   panic/unwrap (workspace denies `unwrap_used`/`panic`/`indexing_slicing`).
+  Every arm is reachable and implementable from `Model` + `columns` alone.
 - **Input / Output:** as `partial_dependence(...) -> Result<_, PdpError>`.
-- **Dependencies:** none beyond `Model` metadata (`float_feature_borders.len()`).
+- **Dependencies:** `Model` metadata only (`float_feature_borders.len()` = `n_float`).
+- **Deterministic check order (must be honored so each Red test isolates one arm):**
+  1. **arity** — `features.len() ∉ {1, 2}` → `UnsupportedFeatureArity { requested }`.
+  2. **column shape** — `columns.len() != n_float` (this includes the empty
+     `columns == []` case, since `0 != n_float` for the in-scope `n_float >= 1`),
+     or columns are ragged (unequal lengths) → `MalformedColumns { expected_float_features: n_float, actual }`.
+  3. **empty dataset** — shape is correct (`columns.len() == n_float`) but every
+     column has length 0 → `EmptyDataset`. (Ordered after shape so a width/ragged
+     mismatch is `MalformedColumns` and only a correctly-shaped, zero-row dataset
+     is `EmptyDataset`. `columns == []` is therefore `MalformedColumns`, NOT
+     `EmptyDataset` — resolves the prior AT-05b/c overlap.)
+  4. **feature range** — any `features[k] >= n_float` → `FeatureIndexOutOfRange
+     { index: features[k], n_float }` (first offending index, in request order).
+  5. **duplicate (2-feature only)** — `features == [f, f]` → `DuplicateFeature { index: f }`.
 - **Behavior (Given/When/Then), each independently testable:**
-  - **Given** `features = [i]` with `i >= n_float`, **then** `Err(FeatureIndexOutOfRange { index: i, n_float })`.
-  - **Given** a target feature that is categorical / CTR-only (not a float
-    feature), **then** `Err(UnsupportedFeatureKind { index })`.
-  - **Given** `features.len() == 0` or `> 2`, **then** `Err(UnsupportedFeatureArity { requested })`.
-  - **Given** `columns` empty or a zero-length first column, **then** `Err(EmptyDataset)`.
-- **Invariants:** no partial computation on the error paths; message names the offending input.
-- **Acceptance tests (unit):** AT-05a..d, one per arm above.
-- **Out of scope:** the happy-path math (PDP-01/03/04).
+  - **Given** `features.len() == 0` or `== 3`, **then** `Err(UnsupportedFeatureArity { requested })`.
+  - **Given** `columns == []`, `columns.len() != n_float`, or ragged columns,
+    **then** `Err(MalformedColumns { expected_float_features: n_float, .. })`.
+  - **Given** `columns.len() == n_float` with every column length 0, **then**
+    `Err(EmptyDataset)`.
+  - **Given** valid rectangular non-empty columns (`columns.len() == n_float`,
+    length `n >= 1`) and `features = [i]` with `i >= n_float`, **then**
+    `Err(FeatureIndexOutOfRange { index: i, n_float })`.
+  - **Given** valid rectangular non-empty columns and `features = [f, f]` (both in
+    range), **then** `Err(DuplicateFeature { index: f })`.
+- **Invariants:** no partial computation on any error path; the message names the
+  offending input; a valid request never returns a `PdpError`.
+- **Acceptance tests (unit):** AT-05a (arity), AT-05b (malformed columns —
+  includes `columns == []`, wrong width, and ragged), AT-05c (empty dataset:
+  `n_float` columns each length 0), AT-05d (out-of-range), AT-05e (duplicate) —
+  one per arm; all buildable against a numeric-only model (no categorical model
+  needed). **AT-05d/AT-05e must pass valid rectangular non-empty `columns`** so
+  checks 1–3 succeed and the range/duplicate check is the one under test.
+- **Out of scope:** the happy-path math (PDP-01/03/04); categorical/flat-index
+  support (deferred, see §4 index-space note).
 - **Traceability:** `[VERIFIED: LOCAL Cargo.toml:10-14 restriction lints]`,
-  `[INFERRED: float-only guard mirrors upstream export rejection]`.
+  `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407 NaN-pad → MalformedColumns guard]`,
+  `[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs:272-313 no feature-kind map → no UnsupportedFeatureKind arm]`,
+  `[INFERRED: DuplicateFeature is a conservative API precondition, not asserted upstream behavior]`.
 
 ## 6. Acceptance scenarios (roll-up)
 
 | Scenario | Spec | Kind | Oracle artifact | Bar |
 |----------|------|------|-----------------|-----|
 | Engine averages a constant grid == direct mean | PDP-01 | unit | — | exact |
-| Derived grid == upstream x-grid | PDP-02 | oracle | `pdp_single_grid.npy` | ≤1e-5 |
+| Per-bin grid == `[b0-1, midpoints…, b_last+1]` | PDP-02 | unit | — (no upstream numeric x-grid) | exact |
 | Single-feature curve == upstream | PDP-03 | oracle | `pdp_single_values.npy` | ≤1e-5 |
 | Two-feature surface == upstream | PDP-04 | oracle | `pdp_pair_values.npy` | ≤1e-5 |
-| Invalid inputs → typed errors | PDP-05 | unit | — | typed `Err` |
+| Invalid inputs → typed errors (arity / malformed columns / empty / out-of-range / duplicate) | PDP-05 | unit | — | typed `Err` (5 arms) |
 
 ## 7. Impact scope
 
@@ -296,25 +381,38 @@ existing signature, no fixture changes. No migration needed. `[INFERRED]`
 
 ## 9. Risks and open questions
 
-1. **[UNVERIFIED] Exact grid transform (PDP-02).** Borders-verbatim vs.
-   midpoints vs. borders+endpoints is not derivable from vendored source or
-   docs. *Resolution:* the fixture dumps upstream's x-grid; the PDP-02 RED test
-   compares against it and GREEN adjusts the transform until it matches. Owner:
-   fixture-generation task (T3) + PDP-02 task (T4).
-2. **[UNVERIFIED] How the generator extracts truth from `plot_partial_dependence`.**
-   The upstream call returns a figure, not arrays. *Resolution:* extract grid +
-   values from the returned figure object's data (e.g. `fig.data[...] .x/.y` for
-   the plotly backend) under pinned `catboost==1.2.10`; confirm the exact
-   attribute path when authoring `gen_fixtures.py`. Owner: T3. Do **not** compute
-   the truth with our own averaging loop — the oracle must be upstream's output.
-3. **[INFERRED] Feature-index space.** `partial_dependence` indexes the **float**
-   feature space (as `float_feature_borders` / `predict_raw` columns do). Choose
-   a numeric-only fixture model so float-index == flat-index and the open
-   internal→regular remap (an FSTR-01 concern) never arises. Owner: T3.
+1. **[RESOLVED] Exact grid transform (PDP-02).** Upstream computes PD **per BIN**
+   (`n_borders+1` bins), NOT per border value. The grid is the per-bin
+   representatives `[b0-1, midpoints…, b_last+1]` (see PDP-02). Confirmed by
+   reading `catboost==1.2.10` `core.py:4033-4055` and reproducing `all_predictions`
+   to <1e-15 via the engine. `[VERIFIED: LOCAL core.py:4041; empirical]`
+2. **[RESOLVED] How the generator extracts truth from `plot_partial_dependence`.**
+   `plot_partial_dependence(data, features, plot=False)` **returns
+   `(all_predictions, fig)`** — `all_predictions` IS the oracle array
+   (`_calc_partial_dependence`); **no figure parsing needed**. `plot=False` also
+   avoids the notebook-only render path. The generator dumps `all_predictions`
+   verbatim (1-D) / C-order-flattened (2-D). No hand-averaging.
+   `[VERIFIED: LOCAL catboost 1.2.10 core.py:4041,4055]`
+3. **[RESOLVED] Feature-index space.** `partial_dependence` indexes the **float**
+   feature space (`0..model.float_feature_borders.len()`), because `cb_model::Model`
+   exposes no flat-feature/kind map `[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs:272-313]`.
+   The numeric-only fixture model makes float-index == upstream flat-index, so the
+   internal→regular remap (an FSTR-01 concern) never arises and categorical PD is a
+   deferred follow-up (see §4 index-space note). Owner: T3.
 4. **[INFERRED] `catboost` not installed in this env** and vendored snapshot
    lacks the utility → fixtures are generated **offline** in a pinned venv and
    committed; CI/dev consume committed `.npy` (same pattern as every fixture
    family). `[VERIFIED: LOCAL advanced_fstr/gen_fixtures.py:1-21]`
+5. **[VERIFIED] Silent NaN-pad hazard closed by PDP-05.** `predict_raw` reads a
+   missing/short column as `NaN` `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407]`;
+   the `MalformedColumns` guard (PDP-05 check 2) requires `columns.len() == n_float`
+   and rectangular columns before any apply, so the PD average is never computed
+   over silently-padded garbage.
+6. **[INFERRED] Grid `f64 → f32` cast.** The engine overrides the target column
+   with `grid[k] as f32` (the column storage `predict_raw` already uses), so the
+   cast introduces **no** precision hazard beyond what upstream apply itself has;
+   exact parity is still adjudicated by the ≤1e-5 oracle, not by reasoning about
+   the cast. `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:370 f32 columns]`
 
 ## 10. Traceability and sources
 
@@ -331,8 +429,13 @@ existing signature, no fixture changes. No migration needed. `[INFERRED]`
 - **Constraints:** `[VERIFIED: LOCAL Cargo.toml:10-14]`, `[VERIFIED: LOCAL CLAUDE.md
   source/test separation + no-unwrap]`.
 - **Absence proof:** `[VERIFIED: LOCAL grep partial_dependence → 0 hits in crates/ and catboost-master/]`.
-- **PageIndex:** no writable indexed spec corpus applies to this in-repo code
-  question (the MCP corpus is document/PDF-oriented, not the `.planning/` tree);
-  this draft is the local authoritative artifact. **Pending PageIndex update:**
-  none required unless the team indexes `.planning/phases/**` — if so, upsert this
-  file as document id `phase-18/fstr-03-partial-dependence` with `status: draft`.
+- **PageIndex:** this SPEC **is already indexed** — `[VERIFIED: PAGEINDEX
+  catboost_rs/SPEC.md (folder id cmrhcxbtm000104jr3i5jzm0m, status=completed,
+  indexed 2026-07-12)]` — correcting the earlier draft's claim that no corpus
+  applied. **Pending PageIndex update (this hardened revision):** the MCP's
+  `process_document` ingests PDFs/files as *new* documents (no `doc_id` overwrite
+  / in-place Markdown upsert), so re-processing would create a **duplicate**; the
+  human owner should re-index `SPEC.md` into folder `catboost_rs` (replacing the
+  2026-07-12 doc) out-of-band. No duplicate was created and the existing doc was
+  NOT removed by the planner. `[VERIFIED: TOOL process_document schema — url/file
+  ingestion only]`
