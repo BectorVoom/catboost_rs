@@ -52,6 +52,7 @@ use std::collections::BTreeMap;
 use cb_core::sum_f64;
 use serde::{Deserialize, Serialize};
 
+use crate::ctr_data_generated::ncat_boost_fbs::{root_as_tctr_value_table, TCtrValueTable};
 use crate::error::ModelError;
 
 // Tests live in a dedicated sibling file (source/test separation, CLAUDE.md /
@@ -471,6 +472,272 @@ impl CtrValueTable {
             counter_denominator: json.counter_denominator,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Upstream `.cbm` model-parts tail parser (CTR-03) — a DIFFERENT wire format
+// from the self-describing LE blob below (`decode_ctr_data` / `encode_ctr_data`
+// are cb-model's OWN round-trip format and are never used to read an upstream
+// `.cbm`). The model-parts region appended after the `TModelCore` FlatBuffers
+// core (`cbm.rs` framing doc) is:
+//
+//   u32 LE  part_count
+//   repeat part_count times:
+//     u32 LE  part_size ; part_size bytes = a `TCtrValueTable` FlatBuffers
+//                          table (verified via `root_as_tctr_value_table`,
+//                          never `_unchecked`)
+//
+// Each `TCtrValueTable` carries `ModelCtrBase` (ctr_type + combined-projection
+// cat features), `IndexHashRaw` (a dense-hash byte blob: 12-byte slots of
+// `(u64 hash LE, u32 blob_index LE)`, empty marker `hash ==
+// 0xFFFF_FFFF_FFFF_FFFF`), `CTRBlob` (a raw `i32` LE array, width
+// `TargetClassesCount` for Borders/Buckets or forced `1` for Counter/
+// FeatureFreq, whose `TargetClassesCount` wire field is `0`), and
+// `CounterDenominator`. Every declared length is bounds-checked against the
+// remaining bytes BEFORE slicing (Security V5); mean-type CTRs
+// (`BinarizedTargetMeanValue`/`FloatTargetMeanValue`) are rejected (v1,
+// SPEC §2/MAJOR-2 — their `TCtrMeanHistory` byte layout is not empirically
+// dissected and no fixture exercises it).
+// ---------------------------------------------------------------------------
+
+/// Byte width of one `IndexHashRaw` dense-hash slot: `u64 hash LE` (8 bytes)
+/// followed by `u32 blob_index LE` (4 bytes).
+const INDEX_HASH_SLOT_LEN: usize = 12;
+
+/// The `IndexHashRaw` empty-slot sentinel hash value.
+const EMPTY_HASH_MARKER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Parse the appended upstream model-parts tail into the canonical [`CtrData`]
+/// (CTR-03): `u32 part_count` then `part_count * (u32 part_size +
+/// TCtrValueTable FlatBuffers table)`. Every length is bounds-checked against
+/// the remaining bytes BEFORE slicing; the VERIFYING `root_as_tctr_value_table`
+/// accessor is used (never `_unchecked`). Each table is keyed by
+/// [`ctr_base_key`] over `(ctr_type, projection.cat_features())` — the SAME
+/// form [`crate::apply`]'s `ctr_table_key` reconstructs at apply time.
+///
+/// # Errors
+/// [`ModelError::Deserialize`] on: a truncated/missing part_count or part
+/// header; a declared part size exceeding the remaining bytes; a corrupt
+/// FlatBuffers `TCtrValueTable`; a mean-type CTR (`BinarizedTargetMeanValue`/
+/// `FloatTargetMeanValue`, deferred — v1); an `IndexHashRaw` whose non-empty
+/// `blob_index` set is not EXACTLY `0..bucket_count` (a gap, duplicate, or
+/// out-of-range index); a `CTRBlob` byte length that does not cross-check
+/// against `bucket_count * width`; or a duplicate `(ctr_type, projection)`
+/// table key.
+pub fn decode_ctr_model_parts(tail: &[u8]) -> Result<CtrData, ModelError> {
+    let count_bytes: [u8; 4] = tail
+        .get(0..4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .ok_or_else(|| ModelError::Deserialize("truncated ctr model-parts count".to_owned()))?;
+    let count = u32::from_le_bytes(count_bytes);
+
+    let mut pos: usize = 4;
+    let mut tables = BTreeMap::new();
+
+    for _ in 0..count {
+        let size_bytes: [u8; 4] = tail
+            .get(pos..pos.saturating_add(4))
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or_else(|| ModelError::Deserialize("truncated ctr model-part size".to_owned()))?;
+        let size = u32::from_le_bytes(size_bytes) as usize;
+        pos = pos.saturating_add(4);
+
+        let part = tail.get(pos..pos.saturating_add(size)).ok_or_else(|| {
+            ModelError::Deserialize(format!(
+                "declared ctr model-part size {size} exceeds available {} bytes",
+                tail.len().saturating_sub(pos)
+            ))
+        })?;
+        pos = pos.saturating_add(size);
+
+        let vt = root_as_tctr_value_table(part).map_err(|e| {
+            ModelError::Deserialize(format!("corrupt FlatBuffers TCtrValueTable: {e}"))
+        })?;
+
+        let (key, table) = decode_one_ctr_value_table(&vt)?;
+        if tables.insert(key.clone(), table).is_some() {
+            return Err(ModelError::Deserialize(format!(
+                "duplicate ctr_data table key {key:?} (ctr_type/projection collision, CTR-05)"
+            )));
+        }
+    }
+
+    Ok(CtrData { tables })
+}
+
+/// Decode one `TCtrValueTable` FlatBuffers part into its canonical
+/// `(key, CtrValueTable)` pair (CTR-03 field mapping).
+fn decode_one_ctr_value_table(
+    vt: &TCtrValueTable<'_>,
+) -> Result<(String, CtrValueTable), ModelError> {
+    let base = vt.ModelCtrBase().ok_or_else(|| {
+        ModelError::Deserialize("TCtrValueTable missing ModelCtrBase".to_owned())
+    })?;
+    // The generated `ECtrType` here is the transparent `ECtrType(pub i8)` tuple
+    // from `ctr_data_generated` (a SEPARATE self-contained schema module from
+    // `model_generated`'s copy) — convert via `.0` (MINOR-1).
+    let ctr_type = ECtrType::from_i8(base.CtrType().0)?;
+    if ctr_type.is_mean() {
+        return Err(ModelError::Deserialize(
+            "mean/target-mean CTR unsupported (v1, MAJOR-2)".to_owned(),
+        ));
+    }
+
+    let combination = base.FeatureCombination().ok_or_else(|| {
+        ModelError::Deserialize("TModelCtrBase missing FeatureCombination".to_owned())
+    })?;
+    let mut cat_features: Vec<usize> = Vec::new();
+    if let Some(cats) = combination.CatFeatures() {
+        for i in 0..cats.len() {
+            let raw = cats.get(i);
+            let idx = usize::try_from(raw).map_err(|_| {
+                ModelError::Deserialize(format!("negative CatFeatures index {raw}"))
+            })?;
+            cat_features.push(idx);
+        }
+    }
+    let projection = cb_train::TProjection::from_features(&cat_features);
+    let key = ctr_base_key(ctr_type, projection.cat_features());
+
+    let hashes = decode_index_hash_raw(vt)?;
+    let bucket_count = hashes.len();
+    let target_classes_count = usize::try_from(vt.TargetClassesCount())
+        .map_err(|_| ModelError::Deserialize("negative TargetClassesCount".to_owned()))?;
+    // Counter/FeatureFreq wire TargetClassesCount is 0 (a single bucket total,
+    // not a per-class count); force width 1 so we never divide by zero
+    // (MINOR-3).
+    let width = if ctr_type.is_counter() {
+        1
+    } else {
+        target_classes_count
+    };
+    if width == 0 {
+        return Err(ModelError::Deserialize(format!(
+            "ctr_type {ctr_type:?} has zero-width CTRBlob (TargetClassesCount {target_classes_count})"
+        )));
+    }
+    let int_counts = decode_ctr_blob(vt, bucket_count, width)?;
+    let counter_denominator = i64::from(vt.CounterDenominator());
+
+    Ok((
+        key,
+        CtrValueTable {
+            ctr_type,
+            target_classes_count,
+            hashes,
+            int_counts,
+            mean: Vec::new(),
+            counter_denominator,
+        },
+    ))
+}
+
+/// Decode `IndexHashRaw` (a dense-hash byte blob: 12-byte `(u64 hash LE, u32
+/// blob_index LE)` slots, empty marker `hash == 0xFFFF_FFFF_FFFF_FFFF`) into
+/// the per-bucket `hashes` vector, sized to the AUTHORITATIVE `bucket_count`
+/// (the number of non-empty slots, MINOR-3). The non-empty `blob_index` set
+/// MUST be exactly `0..bucket_count` — a gap, duplicate, or out-of-range index
+/// is a typed error, never a silent truncation or OOB write (MINOR-2).
+fn decode_index_hash_raw(vt: &TCtrValueTable<'_>) -> Result<Vec<u64>, ModelError> {
+    let raw: Vec<u8> = vt
+        .IndexHashRaw()
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    if !raw.len().is_multiple_of(INDEX_HASH_SLOT_LEN) {
+        return Err(ModelError::Deserialize(format!(
+            "IndexHashRaw length {} is not a multiple of {INDEX_HASH_SLOT_LEN}",
+            raw.len()
+        )));
+    }
+    let n_slots = raw.len() / INDEX_HASH_SLOT_LEN;
+
+    let mut non_empty: Vec<(usize, u64)> = Vec::new();
+    for s in 0..n_slots {
+        let off = s.saturating_mul(INDEX_HASH_SLOT_LEN);
+        let slot = raw
+            .get(off..off.saturating_add(INDEX_HASH_SLOT_LEN))
+            .ok_or_else(|| ModelError::Deserialize("IndexHashRaw slot out of range".to_owned()))?;
+        let hash_bytes: [u8; 8] = slot
+            .get(0..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .ok_or_else(|| ModelError::Deserialize("IndexHashRaw hash read failed".to_owned()))?;
+        let idx_bytes: [u8; 4] = slot
+            .get(8..12)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .ok_or_else(|| ModelError::Deserialize("IndexHashRaw idx read failed".to_owned()))?;
+        let hash = u64::from_le_bytes(hash_bytes);
+        if hash == EMPTY_HASH_MARKER {
+            continue;
+        }
+        let idx = u32::from_le_bytes(idx_bytes) as usize;
+        non_empty.push((idx, hash));
+    }
+
+    let bucket_count = non_empty.len();
+    let mut hashes = vec![0u64; bucket_count];
+    let mut filled = vec![false; bucket_count];
+    for (idx, hash) in non_empty {
+        let Some(filled_slot) = filled.get_mut(idx) else {
+            return Err(ModelError::Deserialize(format!(
+                "IndexHashRaw bucket index {idx} out of range (bucket_count {bucket_count})"
+            )));
+        };
+        if *filled_slot {
+            return Err(ModelError::Deserialize(format!(
+                "IndexHashRaw duplicate bucket index {idx}"
+            )));
+        }
+        *filled_slot = true;
+        if let Some(slot) = hashes.get_mut(idx) {
+            *slot = hash;
+        }
+    }
+    if filled.iter().any(|&f| !f) {
+        return Err(ModelError::Deserialize(
+            "IndexHashRaw bucket indices are not exactly 0..bucket_count (gap detected)"
+                .to_owned(),
+        ));
+    }
+    Ok(hashes)
+}
+
+/// Decode `CTRBlob` (a raw little-endian `i32` array) into the per-bucket
+/// `int_counts`, cross-checking the byte length against `bucket_count * width`
+/// (MINOR-3) before slicing.
+fn decode_ctr_blob(
+    vt: &TCtrValueTable<'_>,
+    bucket_count: usize,
+    width: usize,
+) -> Result<Vec<Vec<i64>>, ModelError> {
+    let blob: Vec<u8> = vt.CTRBlob().map(|v| v.iter().collect()).unwrap_or_default();
+    if !blob.len().is_multiple_of(4) {
+        return Err(ModelError::Deserialize(format!(
+            "CTRBlob length {} is not a multiple of 4",
+            blob.len()
+        )));
+    }
+    let n_i32 = blob.len() / 4;
+    let expected = bucket_count.saturating_mul(width);
+    if n_i32 != expected {
+        return Err(ModelError::Deserialize(format!(
+            "CTRBlob element count {n_i32} does not match bucket_count*width ({bucket_count}*{width}={expected})"
+        )));
+    }
+    let mut int_counts: Vec<Vec<i64>> = Vec::with_capacity(bucket_count);
+    for b in 0..bucket_count {
+        let mut counts = Vec::with_capacity(width);
+        for j in 0..width {
+            let i = b.saturating_mul(width).saturating_add(j);
+            let off = i.saturating_mul(4);
+            let bytes: [u8; 4] = blob
+                .get(off..off.saturating_add(4))
+                .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                .ok_or_else(|| ModelError::Deserialize("CTRBlob read out of range".to_owned()))?;
+            counts.push(i64::from(i32::from_le_bytes(bytes)));
+        }
+        int_counts.push(counts);
+    }
+    Ok(int_counts)
 }
 
 // ---------------------------------------------------------------------------

@@ -18,9 +18,10 @@
 
 use std::path::PathBuf;
 
+use cb_data::stringify_int_category;
 use cb_model::{
-    decode_cbm, load_cbm, predict_raw, save_cbm, Model, ModelError, ModelSplit, ObliviousTree,
-    Split, CBM1, FLATBUFFERS_MODEL_V1,
+    decode_cbm, load_cbm, predict_raw, predict_raw_cat, save_cbm, Model, ModelError, ModelSplit,
+    ObliviousTree, Split, CBM1, FLATBUFFERS_MODEL_V1,
 };
 use cb_oracle::{compare_stage, load_f64_vec, load_model_json, ModelJson, Stage};
 use ndarray::Array2;
@@ -177,6 +178,88 @@ fn cbm_load_upstream_binclf_applies_within_tol() {
 #[test]
 fn cbm_load_upstream_regression_applies_within_tol() {
     assert_upstream_cbm_load_parity("regression");
+}
+
+// ── (b2) upstream 1.2.10 CATEGORICAL .cbm load-and-predict parity (CTR-04) ──
+
+/// Load the CTR-load fixture's single float column (`X_float.npy`, shape
+/// `(N, 1)`) as per-feature `f32` SoA columns (the same feature-major shape
+/// [`predict_raw_cat`] expects).
+fn load_ctr_float_columns() -> Vec<Vec<f32>> {
+    let x: Array2<f64> = read_npy(fixture("ctr_load/X_float.npy"))
+        .unwrap_or_else(|e| panic!("ctr_load/X_float.npy must load: {e:?}"));
+    (0..x.ncols())
+        .map(|fi| x.column(fi).iter().map(|&v| v as f32).collect())
+        .collect()
+}
+
+/// Load the CTR-load fixture's two categorical columns from `cat_cols.json`
+/// (`{"c0": [...], "c1": [...]}`, each already an A4 plain-integer string) as
+/// per-feature `Vec<String>` SoA columns in `(c0, c1)` order — matching the
+/// upstream `cat_features=[2, 3]` positional order the fixture was trained
+/// with (feature 0 = c0, feature 1 = c1).
+fn load_ctr_cat_columns() -> Vec<Vec<String>> {
+    let raw = std::fs::read_to_string(fixture("ctr_load/cat_cols.json"))
+        .unwrap_or_else(|e| panic!("ctr_load/cat_cols.json must load: {e:?}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("cat_cols.json must parse: {e:?}"));
+    ["c0", "c1"]
+        .iter()
+        .map(|col| {
+            parsed
+                .get(col)
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("cat_cols.json missing column {col:?}"))
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .unwrap_or_else(|| panic!("cat_cols.json column {col:?} entry not a string"))
+                        .to_owned()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `load_cbm(ctr_load/{scenario}.cbm)` -> `predict_raw_cat` reproduces the
+/// upstream `predict(X, prediction_type='RawFormulaVal')` fixture <= 1e-5
+/// (CTR-04): the objective end-to-end gate for the hash-fold + f32->f64
+/// border invariants over a REAL upstream categorical model (SimpleCtr for
+/// `simple`, SimpleCtr + CombinationCtr for `combo`).
+fn assert_upstream_ctr_load_parity(scenario: &str) {
+    let model = load_cbm(&fixture(&format!("ctr_load/{scenario}.cbm")))
+        .unwrap_or_else(|e| panic!("upstream ctr_load/{scenario}.cbm must load: {e:?}"));
+    assert!(
+        model.ctr_data.is_some(),
+        "a categorical model must decode with ctr_data: Some(..)"
+    );
+    let float_cols = load_ctr_float_columns();
+    let cat_cols = load_ctr_cat_columns();
+    let actual = predict_raw_cat(&model, &float_cols, &cat_cols);
+    let expected = load_f64_vec(&fixture(&format!("ctr_load/{scenario}_preds.npy")))
+        .unwrap_or_else(|e| panic!("ctr_load/{scenario}_preds.npy must load: {e:?}"));
+    compare_stage(Stage::Predictions, &expected, &actual)
+        .unwrap_or_else(|e| panic!("upstream {scenario} categorical .cbm apply diverged: {e:?}"));
+}
+
+#[test]
+fn cbm_load_upstream_ctr_simple_applies_within_tol() {
+    assert_upstream_ctr_load_parity("simple");
+}
+
+#[test]
+fn cbm_load_upstream_ctr_combo_applies_within_tol() {
+    assert_upstream_ctr_load_parity("combo");
+}
+
+/// `stringify_int_category` is the A4 form the fixture's `cat_cols.json` was
+/// already pre-stringified with (`str(int(v))`); this sanity-checks the two
+/// stringifications agree, so a future fixture regeneration that switches to
+/// raw integer columns stays compatible with the SAME hashing convention.
+#[test]
+fn ctr_load_cat_columns_use_the_a4_stringification() {
+    assert_eq!(stringify_int_category(2), "2");
+    assert_eq!(stringify_int_category(-1), "-1");
 }
 
 // ── (c) malformed input → typed error, never panic (Security V5) ────────────
