@@ -252,6 +252,54 @@ fn cbm_load_upstream_ctr_combo_applies_within_tol() {
     assert_upstream_ctr_load_parity("combo");
 }
 
+// ── (b3) CATEGORICAL .cbm SAVE round-trip: load -> save -> load applies the
+//    upstream preds <= 1e-5 AND the reloaded Model is structurally == (T5) ────
+
+/// `load_cbm(ctr_load/{s}.cbm)` -> `save_cbm` (to a unique tmp) -> `load_cbm`
+/// back -> `predict_raw_cat` still reproduces the upstream preds <= 1e-5, AND the
+/// reloaded `Model` is structurally `==` the first-loaded `Model`. This is the
+/// inverse of `assert_upstream_ctr_load_parity`: it proves `save_cbm` emits the
+/// `CtrFeatures` core section + model-parts tail our own loader reads back
+/// losslessly (the parity bar is the Rust round-trip, mirroring the load slice).
+fn assert_upstream_ctr_save_reload_parity(scenario: &str) {
+    let first_loaded = load_cbm(&fixture(&format!("ctr_load/{scenario}.cbm")))
+        .unwrap_or_else(|e| panic!("upstream ctr_load/{scenario}.cbm must load: {e:?}"));
+    assert!(
+        first_loaded.ctr_data.is_some(),
+        "a categorical model must load with ctr_data: Some(..)"
+    );
+
+    let path = unique_tmp(&format!("ctr_roundtrip_{scenario}"));
+    save_cbm(&first_loaded, &path).expect("save_cbm must succeed for a CTR model");
+    let reloaded = load_cbm(&path).expect("load_cbm must re-read the saved CTR model");
+    let _ = std::fs::remove_file(&path);
+
+    // Structural round-trip: the reloaded Model equals the first-loaded one.
+    assert_eq!(
+        first_loaded, reloaded,
+        "save_cbm -> load_cbm must reproduce the CTR Model structurally"
+    );
+
+    // Apply parity: the reloaded model still reproduces the upstream preds.
+    let float_cols = load_ctr_float_columns();
+    let cat_cols = load_ctr_cat_columns();
+    let actual = predict_raw_cat(&reloaded, &float_cols, &cat_cols);
+    let expected = load_f64_vec(&fixture(&format!("ctr_load/{scenario}_preds.npy")))
+        .unwrap_or_else(|e| panic!("ctr_load/{scenario}_preds.npy must load: {e:?}"));
+    compare_stage(Stage::Predictions, &expected, &actual)
+        .unwrap_or_else(|e| panic!("saved {scenario} categorical .cbm apply diverged: {e:?}"));
+}
+
+#[test]
+fn cbm_ctr_simple_save_reload_applies_within_tol() {
+    assert_upstream_ctr_save_reload_parity("simple");
+}
+
+#[test]
+fn cbm_ctr_combo_save_reload_applies_within_tol() {
+    assert_upstream_ctr_save_reload_parity("combo");
+}
+
 /// `stringify_int_category` is the A4 form the fixture's `cat_cols.json` was
 /// already pre-stringified with (`str(int(v))`); this sanity-checks the two
 /// stringifications agree, so a future fixture regeneration that switches to

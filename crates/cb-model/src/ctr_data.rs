@@ -50,9 +50,13 @@
 use std::collections::BTreeMap;
 
 use cb_core::sum_f64;
+use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use serde::{Deserialize, Serialize};
 
-use crate::ctr_data_generated::ncat_boost_fbs::{root_as_tctr_value_table, TCtrValueTable};
+use crate::ctr_data_generated::ncat_boost_fbs::{
+    root_as_tctr_value_table, ECtrType as TailECtrType, TCtrValueTable, TCtrValueTableArgs,
+    TFeatureCombination, TFeatureCombinationArgs, TModelCtrBase, TModelCtrBaseArgs,
+};
 use crate::error::ModelError;
 
 // Tests live in a dedicated sibling file (source/test separation, CLAUDE.md /
@@ -738,6 +742,191 @@ fn decode_ctr_blob(
         int_counts.push(counts);
     }
     Ok(int_counts)
+}
+
+// ---------------------------------------------------------------------------
+// Upstream `.cbm` model-parts tail ENCODER (the inverse of
+// `decode_ctr_model_parts`, ctr_data.rs:527) — emits the SAME framing the load
+// path reads: `u32 LE part_count` then per table `u32 LE part_size` + an
+// independent finished `TCtrValueTable` FlatBuffers buffer. Each table's
+// projection cat-features are recovered from its key (`parse_ctr_base_key`),
+// `IndexHashRaw` is the minimal dense-hash form (one slot per bucket,
+// `blob_index == bucket position`, no empties) `decode_index_hash_raw` reads
+// back, and `CTRBlob` is the row-major LE `i32` array `decode_ctr_blob` reads.
+// Mean tables and marker-valued hashes are rejected (v1) — never a silent
+// mis-save. This is DISTINCT from the self-describing `encode_ctr_data` below
+// (cb-model's OWN round-trip format, never used for an upstream `.cbm`).
+// ---------------------------------------------------------------------------
+
+/// Parse a canonical CTR-base key (`"ctr:type=<i8>:proj=<f0>,<f1>,…"`, the form
+/// [`ctr_base_key`] emits) back into its `(ctr_type, projection cat-features)` —
+/// the inverse of [`ctr_base_key`], recovering the combined projection the
+/// encoder writes into `TFeatureCombination.CatFeatures` (empty `proj=` → empty
+/// vector). A malformed key is a typed error, never a panic.
+///
+/// # Errors
+/// [`ModelError::Serialize`] if the key lacks the `ctr:type=`/`:proj=` frame, or
+/// carries a non-i8 type / non-i32 cat-feature member.
+fn parse_ctr_base_key(key: &str) -> Result<(ECtrType, Vec<i32>), ModelError> {
+    let rest = key.strip_prefix("ctr:type=").ok_or_else(|| {
+        ModelError::Serialize(format!("ctr_data key {key:?} missing 'ctr:type=' prefix"))
+    })?;
+    let (type_str, proj_str) = rest.split_once(":proj=").ok_or_else(|| {
+        ModelError::Serialize(format!("ctr_data key {key:?} missing ':proj=' segment"))
+    })?;
+    let type_i8: i8 = type_str.parse().map_err(|_| {
+        ModelError::Serialize(format!("ctr_data key {key:?} has non-i8 ctr_type {type_str:?}"))
+    })?;
+    let ctr_type = ECtrType::from_i8(type_i8)?;
+    let cat_features = if proj_str.is_empty() {
+        Vec::new()
+    } else {
+        proj_str
+            .split(',')
+            .map(|s| {
+                s.parse::<i32>().map_err(|_| {
+                    ModelError::Serialize(format!(
+                        "ctr_data key {key:?} has non-i32 cat-feature {s:?}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<i32>, ModelError>>()?
+    };
+    Ok((ctr_type, cat_features))
+}
+
+/// Build one `TCtrValueTable` FlatBuffers table from a canonical
+/// `(key, CtrValueTable)` — the inverse of [`decode_one_ctr_value_table`].
+///
+/// # Errors
+/// [`ModelError::Serialize`] on a mean-type table (undissected `TCtrMeanHistory`
+/// layout, v1), a bucket hash equal to the empty-slot marker (would read back as
+/// an empty slot and corrupt `bucket_count`), a per-bucket count width that does
+/// not match `width = counter?1:target_classes_count`, or any count / index /
+/// count-field value that exceeds `i32`.
+fn build_tctr_value_table<'a>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    key: &str,
+    table: &CtrValueTable,
+) -> Result<WIPOffset<TCtrValueTable<'a>>, ModelError> {
+    if table.ctr_type.is_mean() {
+        return Err(ModelError::Serialize(
+            "mean/target-mean CTR unsupported on save (v1, MAJOR-2)".to_owned(),
+        ));
+    }
+    // Recover the projection cat-features from the KEY; the encoded CtrType comes
+    // from the table itself (they agree — the key was built from the same type).
+    let (_key_type, cat_features) = parse_ctr_base_key(key)?;
+
+    // IndexHashRaw: one 12-byte `(u64 hash LE, u32 blob_index = bucket pos LE)`
+    // slot per bucket, no empty markers (the minimal dense-hash form
+    // `decode_index_hash_raw` reads back — non-empty idx set = exactly
+    // 0..bucket_count). A marker-valued hash would read back as an empty slot.
+    let mut index_hash_raw: Vec<u8> =
+        Vec::with_capacity(table.hashes.len().saturating_mul(INDEX_HASH_SLOT_LEN));
+    for (i, &hash) in table.hashes.iter().enumerate() {
+        if hash == EMPTY_HASH_MARKER {
+            return Err(ModelError::Serialize(
+                "CTR bucket hash equals the empty-slot marker 0xFFFF_FFFF_FFFF_FFFF".to_owned(),
+            ));
+        }
+        let idx = u32::try_from(i).map_err(|_| {
+            ModelError::Serialize("CTR bucket index exceeds u32 range".to_owned())
+        })?;
+        index_hash_raw.extend_from_slice(&hash.to_le_bytes());
+        index_hash_raw.extend_from_slice(&idx.to_le_bytes());
+    }
+
+    // CTRBlob: row-major `bucket_count × width` LE i32 (width = counter?1:tcc),
+    // cross-checking each bucket's count width (the inverse of `decode_ctr_blob`).
+    let width = if table.ctr_type.is_counter() {
+        1
+    } else {
+        table.target_classes_count
+    };
+    let mut ctr_blob: Vec<u8> = Vec::with_capacity(
+        table.hashes.len().saturating_mul(width).saturating_mul(4),
+    );
+    for counts in &table.int_counts {
+        if counts.len() != width {
+            return Err(ModelError::Serialize(format!(
+                "CTR bucket count width {} does not match expected width {width}",
+                counts.len()
+            )));
+        }
+        for &c in counts {
+            let v = i32::try_from(c)
+                .map_err(|_| ModelError::Serialize(format!("CTR count {c} exceeds i32 range")))?;
+            ctr_blob.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    let cat_vec = fbb.create_vector(&cat_features);
+    let combination = TFeatureCombination::create(
+        fbb,
+        &TFeatureCombinationArgs {
+            CatFeatures: Some(cat_vec),
+            ..TFeatureCombinationArgs::default()
+        },
+    );
+    // The generated `ECtrType` here is `ctr_data_generated`'s transparent
+    // `ECtrType(pub i8)` tuple — wrap the discriminant (MINOR-1).
+    let base = TModelCtrBase::create(
+        fbb,
+        &TModelCtrBaseArgs {
+            FeatureCombination: Some(combination),
+            CtrType: TailECtrType(table.ctr_type.as_i8()),
+            TargetBorderClassifierIdx: 0,
+        },
+    );
+    let ihr_vec = fbb.create_vector(&index_hash_raw);
+    let blob_vec = fbb.create_vector(&ctr_blob);
+    let target_classes_count = i32::try_from(table.target_classes_count).map_err(|_| {
+        ModelError::Serialize("TargetClassesCount exceeds i32 range".to_owned())
+    })?;
+    let counter_denominator = i32::try_from(table.counter_denominator).map_err(|_| {
+        ModelError::Serialize("CounterDenominator exceeds i32 range".to_owned())
+    })?;
+    Ok(TCtrValueTable::create(
+        fbb,
+        &TCtrValueTableArgs {
+            ModelCtrBase: Some(base),
+            IndexHashRaw: Some(ihr_vec),
+            CTRBlob: Some(blob_vec),
+            CounterDenominator: counter_denominator,
+            TargetClassesCount: target_classes_count,
+        },
+    ))
+}
+
+/// Encode a [`CtrData`] to the upstream model-parts tail (T3, the inverse of
+/// [`decode_ctr_model_parts`]): `u32 LE part_count` then, per table (BTreeMap →
+/// deterministic order), a `u32 LE part_size` + an INDEPENDENT finished
+/// `TCtrValueTable` FlatBuffers buffer. Each part is its own finished buffer,
+/// matching `root_as_tctr_value_table(part)` reading one table per part.
+///
+/// # Errors
+/// [`ModelError::Serialize`] if the table count / a part size exceeds `u32`, or
+/// on any per-table rejection [`build_tctr_value_table`] surfaces (mean table,
+/// marker hash, width mismatch, or an `i32`-overflowing count / index / field).
+pub fn encode_ctr_model_parts(ctr_data: &CtrData) -> Result<Vec<u8>, ModelError> {
+    let count = u32::try_from(ctr_data.tables.len()).map_err(|_| {
+        ModelError::Serialize("ctr_data table count exceeds u32 range".to_owned())
+    })?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&count.to_le_bytes());
+    for (key, table) in &ctr_data.tables {
+        let mut fbb = FlatBufferBuilder::new();
+        let vt = build_tctr_value_table(&mut fbb, key, table)?;
+        fbb.finish(vt, None);
+        let part = fbb.finished_data();
+        let part_size = u32::try_from(part.len()).map_err(|_| {
+            ModelError::Serialize("ctr model-part size exceeds u32 range".to_owned())
+        })?;
+        out.extend_from_slice(&part_size.to_le_bytes());
+        out.extend_from_slice(part);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -17,8 +17,11 @@ use std::path::PathBuf;
 
 use flatbuffers::FlatBufferBuilder;
 
-use super::{build_combined_bins, ctr_split_from, BinKind};
-use crate::ctr_data::{ctr_base_key, decode_ctr_model_parts};
+use super::{
+    build_combined_bins, build_ctr_features, build_tctr_feature, ctr_split_from,
+    ctr_split_to_global_index, BinKind, CtrIdentity,
+};
+use crate::ctr_data::{ctr_base_key, decode_ctr_model_parts, Prior};
 use crate::ctr_data_generated::ncat_boost_fbs::{
     ECtrType as TailECtrType, TCtrValueTable, TCtrValueTableArgs,
     TFeatureCombination as TailFeatureCombination,
@@ -282,6 +285,128 @@ fn classify_bins_numeric_only_model_matches_float_only_order() {
             },
         ]
     );
+}
+
+// ── SAVE T1 — CtrFeatures grouping + combined global index ───────────────────
+
+/// A `Borders` CTR split over `cats` at `border` with the given `scale` (the
+/// remaining identity fields fixed so `cats`/`scale`/`border` drive grouping).
+fn save_ctr_split(cats: &[usize], border: f64, scale: f64) -> crate::CtrSplit {
+    crate::CtrSplit {
+        projection: cb_train::TProjection::from_features(cats),
+        ctr_type: ECtrType::Borders,
+        prior: Prior { num: 0.0, denom: 1.0 },
+        target_border_idx: 0,
+        border,
+        shift: 0.0,
+        scale,
+    }
+}
+
+/// A minimal `Model` carrying one oblivious tree whose splits are the given CTR
+/// splits (float borders / leaves are irrelevant to grouping).
+fn model_with_ctr_splits(splits: Vec<crate::CtrSplit>) -> crate::Model {
+    let model_splits = splits.into_iter().map(crate::model::ModelSplit::Ctr).collect();
+    crate::Model {
+        oblivious_trees: vec![crate::ObliviousTree {
+            splits: model_splits,
+            leaf_values: Vec::new(),
+            leaf_weights: Vec::new(),
+        }],
+        non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
+        bias: 0.0,
+        float_feature_borders: Vec::new(),
+        ctr_data: None,
+        approx_dimension: 1,
+        class_to_label: Vec::new(),
+    }
+}
+
+#[test]
+fn group_ctr_features_assigns_stable_indices() {
+    // Identity A = proj[0], used at borders 6.0 and 1.0 (2 distinct borders);
+    // Identity B = proj[1], used at border 2.0 (1 border). `scale` is held equal
+    // so only (projection, border) vary — grouping must fold `border` OUT.
+    let a_hi = save_ctr_split(&[0], 6.0, 15.0);
+    let a_lo = save_ctr_split(&[0], 1.0, 15.0);
+    let b = save_ctr_split(&[1], 2.0, 15.0);
+    let model = model_with_ctr_splits(vec![a_hi.clone(), a_lo.clone(), b.clone()]);
+
+    let plan = build_ctr_features(&model).expect("grouping must succeed");
+    assert_eq!(plan.identities.len(), 2, "two distinct CTR identities");
+    // Deterministic order by ctr_base_key: proj=[0] before proj=[1].
+    assert_eq!(plan.identities[0].projection.cat_features(), &[0]);
+    assert_eq!(
+        plan.identities[0].borders,
+        vec![1.0, 6.0],
+        "distinct borders sorted ascending"
+    );
+    assert_eq!(plan.identities[1].projection.cat_features(), &[1]);
+    assert_eq!(plan.identities[1].borders, vec![2.0]);
+
+    // Combined global index = n_float_bins + Σ(preceding Borders.len()) +
+    // border_index. With n_float_bins = 3: A's borders occupy [3, 4]; B's [5].
+    let n_float_bins = 3;
+    assert_eq!(
+        ctr_split_to_global_index(&a_lo, n_float_bins, &plan).unwrap(),
+        3
+    );
+    assert_eq!(
+        ctr_split_to_global_index(&a_hi, n_float_bins, &plan).unwrap(),
+        4
+    );
+    assert_eq!(ctr_split_to_global_index(&b, n_float_bins, &plan).unwrap(), 5);
+
+    // A float split still maps via the existing float-only index (unchanged).
+    let bins = super::build_bin_features(&[vec![0.5, 2.5], vec![1.5]]);
+    let fs = crate::Split { feature: 1, border: 1.5 };
+    assert_eq!(super::split_to_global_index(&fs, &bins).unwrap(), 2);
+}
+
+// ── SAVE T2 — TCtrFeature build round-trips via ctr_split_from ────────────────
+
+#[test]
+fn tctr_feature_roundtrips_via_ctr_split_from() {
+    // Build ONE TCtrFeature from a CtrIdentity, then feed each border index back
+    // through the EXISTING load-side `ctr_split_from` — proving T2 is the exact
+    // inverse of CTR-02.
+    let identity = CtrIdentity {
+        projection: cb_train::TProjection::from_features(&[2, 0, 1]),
+        ctr_type: ECtrType::Counter,
+        prior: Prior { num: 0.5, denom: 1.0 },
+        target_border_idx: 1,
+        shift: 0.25,
+        scale: 2.0,
+        borders: vec![1.0, 3.5, 6.0],
+    };
+    let mut fbb = FlatBufferBuilder::new();
+    let cf = build_tctr_feature(&mut fbb, &identity).expect("build_tctr_feature");
+    let ctr_features = fbb.create_vector(&[cf]);
+    let trees = TModelTrees::create(
+        &mut fbb,
+        &TModelTreesArgs {
+            CtrFeatures: Some(ctr_features),
+            Scale: 1.0,
+            ..TModelTreesArgs::default()
+        },
+    );
+    fbb.finish(trees, None);
+    let buf = fbb.finished_data().to_vec();
+    let trees = flatbuffers::root::<TModelTrees>(&buf).expect("verifying root parse");
+    let tcf = trees.CtrFeatures().expect("CtrFeatures present").get(0);
+
+    for (k, &b) in identity.borders.iter().enumerate() {
+        let split = ctr_split_from(tcf, k).expect("ctr_split_from must succeed");
+        assert_eq!(split.projection.cat_features(), &[0, 1, 2], "sorted + deduped");
+        assert_eq!(split.ctr_type, ECtrType::Counter);
+        assert_eq!(split.target_border_idx, 1);
+        assert!((split.prior.num - 0.5).abs() < 1e-6);
+        assert!((split.prior.denom - 1.0).abs() < 1e-6);
+        assert!((split.shift - 0.25).abs() < 1e-6);
+        assert!((split.scale - 2.0).abs() < 1e-6);
+        assert!((split.border - b).abs() < 1e-6, "border {k}");
+    }
 }
 
 // ── T2 — CTR-02 CtrSplit reconstruction from the core flatbuffer ────────────
@@ -705,6 +830,89 @@ fn numeric_only_model_still_decodes_with_ctr_data_none() {
         }
         other => panic!("expected a Float split, got {other:?}"),
     }
+}
+
+// ── SAVE T6 — save-side robustness / typed rejection ─────────────────────────
+
+#[test]
+fn save_ctr_split_missing_table_is_typed_error() {
+    // A model carrying a CTR split but NO `ctr_data` (its apply-time table would
+    // miss) must be rejected — never emit a CtrFeature whose lookup would fail.
+    let model = model_with_ctr_splits(vec![save_ctr_split(&[0], 1.0, 15.0)]);
+    assert!(model.ctr_data.is_none());
+    match super::build_core_blob(&model) {
+        Err(ModelError::Serialize(_)) => {}
+        other => panic!("CTR split with missing ctr_data must be Serialize error, got {other:?}"),
+    }
+}
+
+#[test]
+fn save_non_symmetric_ctr_split_is_typed_error() {
+    // A non-symmetric tree carrying a CTR split at an INTERIOR node: v1 supports
+    // CTR splits on oblivious trees only — the save arm must error, not write `0`.
+    let tree = crate::NonSymmetricTree {
+        tree_splits: vec![crate::model::ModelSplit::Ctr(save_ctr_split(&[0], 1.0, 15.0))],
+        step_nodes: vec![(1, 0)], // NOT (0,0) -> an interior (non-leaf) node.
+        node_id_to_leaf_id: vec![0],
+        leaf_values: vec![0.0],
+        leaf_weights: vec![0.0],
+    };
+    let model = crate::Model {
+        oblivious_trees: Vec::new(),
+        non_symmetric_trees: vec![tree],
+        region_trees: Vec::new(),
+        bias: 0.0,
+        float_feature_borders: Vec::new(),
+        ctr_data: None,
+        approx_dimension: 1,
+        class_to_label: Vec::new(),
+    };
+    match super::build_core_blob(&model) {
+        Err(ModelError::Serialize(_)) => {}
+        other => panic!("non-symmetric CTR split must be Serialize error, got {other:?}"),
+    }
+}
+
+#[test]
+fn save_numeric_model_emits_no_tail() {
+    // Regression lock: a numeric-only model (no CTR splits, `ctr_data: None`)
+    // saves with NO model-parts tail — the file is exactly the 8-byte frame plus
+    // the FlatBuffers core, byte-for-byte the pre-slice layout.
+    let model = crate::Model {
+        oblivious_trees: vec![crate::ObliviousTree {
+            splits: vec![crate::model::ModelSplit::Float(crate::Split { feature: 0, border: 0.5 })],
+            leaf_values: vec![0.1, -0.2],
+            leaf_weights: vec![1.0, 1.0],
+        }],
+        non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
+        bias: 0.0,
+        float_feature_borders: vec![vec![0.5]],
+        ctr_data: None,
+        approx_dimension: 1,
+        class_to_label: Vec::new(),
+    };
+    let path = std::env::temp_dir().join(format!(
+        "cb_model_no_tail_{}_{}.cbm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    crate::save_cbm(&model, &path).expect("save_cbm numeric must succeed");
+    let bytes = std::fs::read(&path).expect("read back");
+    let _ = std::fs::remove_file(&path);
+
+    let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    assert_eq!(
+        bytes.len(),
+        8 + declared,
+        "numeric model must have NO tail beyond frame + core"
+    );
+    // And it decodes back with ctr_data: None (never a phantom tail).
+    let reloaded = super::decode_cbm(&bytes).expect("decode numeric");
+    assert!(reloaded.ctr_data.is_none());
 }
 
 #[test]

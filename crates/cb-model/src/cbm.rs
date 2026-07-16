@@ -43,17 +43,20 @@
 //! buffers and caps depth), and uses checked `u32::try_from` / `.get` throughout.
 //! Every failure maps to a typed [`ModelError`]; nothing panics.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use flatbuffers::FlatBufferBuilder;
+use flatbuffers::{FlatBufferBuilder, WIPOffset};
 
-use crate::ctr_data::{decode_ctr_model_parts, ECtrType, Prior};
+use crate::ctr_data::{ctr_base_key, decode_ctr_model_parts, encode_ctr_model_parts, ECtrType, Prior};
 use crate::error::ModelError;
 use crate::model_generated::ncat_boost_fbs::{
-    root_as_tmodel_core, TCtrFeature, TFloatFeature, TFloatFeatureArgs, TKeyValue, TKeyValueArgs,
-    TModelCore, TModelCoreArgs, TModelTrees, TModelTreesArgs, TNonSymmetricTreeStepNode,
+    root_as_tmodel_core, ECtrType as CoreECtrType, TCtrFeature, TCtrFeatureArgs,
+    TFeatureCombination, TFeatureCombinationArgs, TFloatFeature, TFloatFeatureArgs, TKeyValue,
+    TKeyValueArgs, TModelCore, TModelCoreArgs, TModelCtr, TModelCtrArgs, TModelCtrBase,
+    TModelCtrBaseArgs, TModelTrees, TModelTreesArgs, TNonSymmetricTreeStepNode,
 };
-use crate::{CtrSplit, Model, NonSymmetricTree, ObliviousTree, Split};
+use crate::{CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, Split};
 
 // Tests live in a dedicated sibling file (source/test separation, CLAUDE.md /
 // AGENTS.md — no test body in this production file), mirroring the
@@ -108,6 +111,226 @@ fn split_to_global_index(split: &Split, bins: &[BinFeature]) -> Result<i32, Mode
     i32::try_from(pos).map_err(|_| {
         ModelError::SchemaVersion(format!("global split index {pos} exceeds i32 range"))
     })
+}
+
+/// A unique CTR feature IDENTITY (the SAVE-side inverse of the load path's
+/// per-`CtrSplit` grouping, [`ctr_split_from`] cbm.rs:199): everything a
+/// `TCtrFeature` carries EXCEPT the border — `(projection, ctr_type, prior,
+/// target_border_idx, shift, scale)` — plus the SORTED-ASCENDING distinct border
+/// set the trees test against it. The load path rebuilds one [`CtrSplit`] per
+/// `(ctr_feature c, border_index k)`, so one identity + its `k`-th border
+/// reconstructs exactly one `CtrSplit`.
+#[derive(Debug, Clone, PartialEq)]
+struct CtrIdentity {
+    /// The combined categorical projection (sorted cat-feature member set).
+    projection: cb_train::TProjection,
+    /// The CTR type this feature computes.
+    ctr_type: ECtrType,
+    /// The apply prior `(num, denom)`.
+    prior: Prior,
+    /// The Buckets per-class numerator selector.
+    target_border_idx: usize,
+    /// The inference `Shift`.
+    shift: f64,
+    /// The inference `Scale`.
+    scale: f64,
+    /// The distinct borders SORTED ASCENDING (`f64::total_cmp`, deduped by bits)
+    /// — the wire `Borders` order the load path reads `Borders[k]` back from.
+    borders: Vec<f64>,
+}
+
+/// A CTR identity's grouping key — everything a `TCtrFeature` carries with the
+/// `border` folded OUT (fact 2). `f64` fields compare by their raw bits so a
+/// grouping is exact (never an epsilon collapse). A `BTreeMap` over this key
+/// gives a deterministic identity order for reproducible round-trips.
+type CtrIdentityKey = (String, u64, u64, usize, u64, u64);
+
+/// The stable grouping key of a [`CtrSplit`]: `(ctr_base_key, prior.num bits,
+/// prior.denom bits, target_border_idx, shift bits, scale bits)`.
+fn ctr_identity_key(split: &CtrSplit) -> CtrIdentityKey {
+    (
+        ctr_base_key(split.ctr_type, split.projection.cat_features()),
+        split.prior.num.to_bits(),
+        split.prior.denom.to_bits(),
+        split.target_border_idx,
+        split.shift.to_bits(),
+        split.scale.to_bits(),
+    )
+}
+
+/// The ordered `CtrFeatures` plan a save emits: the distinct CTR identities in a
+/// deterministic order, a `(CtrSplit identity) -> ctr_feature` lookup, and the
+/// cumulative preceding-border offsets used to map a `CtrSplit` to its combined
+/// global split index (`ctr_split_to_global_index`).
+struct CtrFeaturePlan {
+    /// The distinct CTR identities, in `index_by_key` (BTreeMap) order.
+    identities: Vec<CtrIdentity>,
+    /// Identity key -> its index into `identities` (the `ctr_feature` c).
+    index_by_key: BTreeMap<CtrIdentityKey, usize>,
+    /// `offsets[c]` = Σ `borders.len()` of `identities[0..c]` — the preceding CTR
+    /// bins ahead of identity `c` in the combined `CtrFeatures` index range.
+    offsets: Vec<usize>,
+}
+
+/// Group a model's tree `ModelSplit::Ctr` splits into ordered CTR identities
+/// (T1, the inverse of [`build_combined_bins`]'s CTR walk). Each distinct
+/// `(projection, ctr_type, prior, target_border_idx, shift, scale)` becomes one
+/// identity carrying the SORTED-ASCENDING distinct set of borders the trees test
+/// against it; the returned plan maps each tree `CtrSplit` back to its
+/// `(ctr_feature, border_index)`. v1 groups OBLIVIOUS trees only (CTR splits on
+/// non-symmetric trees are rejected in the save loop).
+fn build_ctr_features(model: &Model) -> Result<CtrFeaturePlan, ModelError> {
+    // Collect one identity per distinct key, folding `border` OUT of the key and
+    // accumulating each split's border under it. `BTreeMap` keys give the
+    // deterministic identity order.
+    let mut grouped: BTreeMap<CtrIdentityKey, CtrIdentity> = BTreeMap::new();
+    for tree in &model.oblivious_trees {
+        for split in &tree.splits {
+            if let ModelSplit::Ctr(cs) = split {
+                grouped
+                    .entry(ctr_identity_key(cs))
+                    .or_insert_with(|| CtrIdentity {
+                        projection: cs.projection.clone(),
+                        ctr_type: cs.ctr_type,
+                        prior: cs.prior,
+                        target_border_idx: cs.target_border_idx,
+                        shift: cs.shift,
+                        scale: cs.scale,
+                        borders: Vec::new(),
+                    })
+                    .borders
+                    .push(cs.border);
+            }
+        }
+    }
+
+    let mut identities = Vec::with_capacity(grouped.len());
+    let mut index_by_key = BTreeMap::new();
+    for (i, (key, mut identity)) in grouped.into_iter().enumerate() {
+        // Sort ascending + dedup by bits: the wire `Borders` the load path reads
+        // `Borders[k]` from, matching `build_combined_bins`'s `border_index` walk.
+        identity.borders.sort_by(f64::total_cmp);
+        identity.borders.dedup_by_key(|b| b.to_bits());
+        index_by_key.insert(key, i);
+        identities.push(identity);
+    }
+
+    // Cumulative preceding-border offsets within the CTR range (v1 has no one-hot
+    // bins, so the CTR range starts at `n_float_bins`, fact 1).
+    let mut offsets = Vec::with_capacity(identities.len());
+    let mut acc: usize = 0;
+    for identity in &identities {
+        offsets.push(acc);
+        acc = acc.saturating_add(identity.borders.len());
+    }
+
+    Ok(CtrFeaturePlan {
+        identities,
+        index_by_key,
+        offsets,
+    })
+}
+
+/// Map a tree [`CtrSplit`] to its combined GLOBAL split index (T1):
+/// `n_float_bins + Σ(preceding Borders.len()) + border_index` (fact 1). The
+/// identity is located via its grouping key; the border index is its position in
+/// that identity's sorted `borders`. A split absent from the plan (or a
+/// border/offset out of range) is a typed error rather than a silent mis-index.
+fn ctr_split_to_global_index(
+    split: &CtrSplit,
+    n_float_bins: usize,
+    plan: &CtrFeaturePlan,
+) -> Result<i32, ModelError> {
+    let &c = plan.index_by_key.get(&ctr_identity_key(split)).ok_or_else(|| {
+        ModelError::Serialize("CTR split identity missing from the CtrFeatures plan".to_owned())
+    })?;
+    let identity = plan
+        .identities
+        .get(c)
+        .ok_or_else(|| ModelError::Serialize("CtrFeatures plan index out of range".to_owned()))?;
+    let border_index = identity
+        .borders
+        .iter()
+        .position(|b| b.to_bits() == split.border.to_bits())
+        .ok_or_else(|| {
+            ModelError::Serialize("CTR split border missing from its identity".to_owned())
+        })?;
+    let offset = plan
+        .offsets
+        .get(c)
+        .copied()
+        .ok_or_else(|| ModelError::Serialize("CtrFeatures plan offset out of range".to_owned()))?;
+    let global = n_float_bins
+        .checked_add(offset)
+        .and_then(|g| g.checked_add(border_index))
+        .ok_or_else(|| ModelError::Serialize("CTR global split index overflow".to_owned()))?;
+    i32::try_from(global).map_err(|_| {
+        ModelError::SchemaVersion(format!("CTR global split index {global} exceeds i32 range"))
+    })
+}
+
+/// Build one `TCtrFeature` FlatBuffers table from a [`CtrIdentity`] (T2, the exact
+/// inverse of [`ctr_split_from`]): `Ctr = TModelCtr{ Base = TModelCtrBase{
+/// FeatureCombination.CatFeatures = projection, CtrType }, TargetBorderIdx,
+/// PriorNum/PriorDenom, Shift, Scale }`, `Borders = sorted borders as f32`. The
+/// `f32` casts on the value fields mirror the existing `FloatFeatures` border
+/// write (`build_core_blob`) — the load path reads them back via `f64::from`.
+fn build_tctr_feature<'a>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    identity: &CtrIdentity,
+) -> Result<WIPOffset<TCtrFeature<'a>>, ModelError> {
+    let cats: Vec<i32> = identity
+        .projection
+        .cat_features()
+        .iter()
+        .map(|&f| {
+            i32::try_from(f).map_err(|_| {
+                ModelError::SchemaVersion(format!("cat-feature index {f} exceeds i32 range"))
+            })
+        })
+        .collect::<Result<Vec<i32>, ModelError>>()?;
+    let cat_vec = fbb.create_vector(&cats);
+    let combination = TFeatureCombination::create(
+        fbb,
+        &TFeatureCombinationArgs {
+            CatFeatures: Some(cat_vec),
+            ..TFeatureCombinationArgs::default()
+        },
+    );
+    // `model_generated`'s transparent `ECtrType(i8)` (a SEPARATE schema module
+    // from `ctr_data_generated`'s copy) — the SAME discriminant `ctr_split_from`
+    // reads back via `.0` (MINOR-1).
+    let base = TModelCtrBase::create(
+        fbb,
+        &TModelCtrBaseArgs {
+            FeatureCombination: Some(combination),
+            CtrType: CoreECtrType(identity.ctr_type.as_i8()),
+            TargetBorderClassifierIdx: 0,
+        },
+    );
+    let target_border_idx = i32::try_from(identity.target_border_idx).map_err(|_| {
+        ModelError::SchemaVersion("TargetBorderIdx exceeds i32 range".to_owned())
+    })?;
+    let ctr = TModelCtr::create(
+        fbb,
+        &TModelCtrArgs {
+            Base: Some(base),
+            TargetBorderIdx: target_border_idx,
+            PriorNum: identity.prior.num as f32,
+            PriorDenom: identity.prior.denom as f32,
+            Shift: identity.shift as f32,
+            Scale: identity.scale as f32,
+        },
+    );
+    let borders_f32: Vec<f32> = identity.borders.iter().map(|&b| b as f32).collect();
+    let borders_vec = fbb.create_vector(&borders_f32);
+    Ok(TCtrFeature::create(
+        fbb,
+        &TCtrFeatureArgs {
+            Ctr: Some(ctr),
+            Borders: Some(borders_vec),
+        },
+    ))
 }
 
 /// One classified entry of the FULL combined `FloatFeatures -> OneHotFeatures
@@ -259,7 +482,10 @@ fn ctr_split_from(feature: TCtrFeature<'_>, border_index: usize) -> Result<CtrSp
 /// per-tree `TreeSizes` / `TreeStartOffsets`, the flat `LeafValues` /
 /// `LeafWeights` arrays, the `FloatFeatures` borders (as f32, the schema type),
 /// `ApproxDimension = 1`, and the single `Bias` (bias-free leaf values, Open Q3 /
-/// Pitfall 6).
+/// Pitfall 6). A categorical model additionally emits the `CtrFeatures` core
+/// section (T4, grouped from the trees' `ModelSplit::Ctr` splits) and appends the
+/// `ctr_data` model-parts tail after the frame + core; a numeric-only model
+/// (`ctr_data: None`) emits neither and stays byte-identical.
 ///
 /// # Errors
 /// [`ModelError::SchemaVersion`] if the model is too large to address with the
@@ -277,6 +503,14 @@ pub fn save_cbm(model: &Model, path: &Path) -> Result<(), ModelError> {
     out.extend_from_slice(&core_len.to_le_bytes());
     out.extend_from_slice(&core);
 
+    // Append the CTR model-parts tail AFTER the 8-byte frame + core (the tail
+    // lives at `buf[8 + core_len..]`, exactly where `decode_cbm` reads it). The
+    // `core_len` field still counts ONLY the FlatBuffers core, NOT the tail. A
+    // numeric-only model (`ctr_data: None`) appends nothing → byte-identical.
+    if let Some(ctr_data) = &model.ctr_data {
+        out.extend_from_slice(&encode_ctr_model_parts(ctr_data)?);
+    }
+
     std::fs::write(path, out)?;
     Ok(())
 }
@@ -284,6 +518,30 @@ pub fn save_cbm(model: &Model, path: &Path) -> Result<(), ModelError> {
 /// Build the FlatBuffers `TModelCore` payload (the bytes after the 8-byte frame).
 fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     let bins = build_bin_features(&model.float_feature_borders);
+
+    // CTR save plan (T1/T4): group the trees' `ModelSplit::Ctr` splits into the
+    // ordered `CtrFeatures` identities and their combined global-index math. v1
+    // has no one-hot bins, so the CTR range begins right after the float bins.
+    let plan = build_ctr_features(model)?;
+    let n_float_bins = bins.len();
+
+    // A CTR split must have a matching baked table in `model.ctr_data` (its
+    // apply-time lookup key) — never emit a CtrFeature whose table would miss.
+    if !plan.identities.is_empty() {
+        let ctr_data = model.ctr_data.as_ref().ok_or_else(|| {
+            ModelError::Serialize(
+                "model carries CTR splits but ctr_data is None (nothing to save)".to_owned(),
+            )
+        })?;
+        for identity in &plan.identities {
+            let key = ctr_base_key(identity.ctr_type, identity.projection.cat_features());
+            if !ctr_data.tables.contains_key(&key) {
+                return Err(ModelError::Serialize(format!(
+                    "CTR split table {key:?} missing from ctr_data"
+                )));
+            }
+        }
+    }
 
     // Number of output dimensions (D-6.2-01 / Plan 06.2-02). A model carries its
     // training `approx_dimension`; `0` is meaningless, so treat it as the scalar
@@ -331,7 +589,12 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
                 } else if let Some(float_split) = split.as_float() {
                     tree_splits.push(split_to_global_index(float_split, &bins)?);
                 } else {
-                    tree_splits.push(0);
+                    // A CTR split at a non-symmetric INTERIOR node: v1 supports CTR
+                    // splits on OBLIVIOUS trees only (SPEC §2). Reject loudly rather
+                    // than silently write a filler `0` (which would mis-apply).
+                    return Err(ModelError::Serialize(
+                        "non-symmetric CTR save unsupported (v1)".to_owned(),
+                    ));
                 }
             }
             for &(left_diff, right_diff) in &tree.step_nodes {
@@ -391,12 +654,16 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
             ModelError::SchemaVersion("cumulative tree-split offset overflow".to_owned())
         })?;
         for split in &tree.splits {
-            // The native `.cbm` numeric core serializes FLOAT splits (the global
-            // split-pool index is a float-feature/border pair); a CTR split
-            // round-trips through the `ctr_data` model-parts region, not the float
-            // split pool, so it is skipped here.
-            if let Some(float_split) = split.as_float() {
-                tree_splits.push(split_to_global_index(float_split, &bins)?);
+            // A FLOAT split maps to its float-feature/border global index; a CTR
+            // split maps to its combined `CtrFeatures` global index (T4). Both push
+            // EXACTLY one `tree_splits` entry, so `TreeSizes`/offsets are unchanged.
+            match split {
+                ModelSplit::Float(float_split) => {
+                    tree_splits.push(split_to_global_index(float_split, &bins)?);
+                }
+                ModelSplit::Ctr(ctr_split) => {
+                    tree_splits.push(ctr_split_to_global_index(ctr_split, n_float_bins, &plan)?);
+                }
             }
         }
         // LEAF-MAJOR transpose (Pitfall 6): the training buffer is DIMENSION-MAJOR
@@ -446,6 +713,19 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     }
     let float_features = fbb.create_vector(&float_feature_offsets);
 
+    // CtrFeatures (T4): one `TCtrFeature` per grouped identity. `None` when the
+    // model carries no CTR splits, so a numeric-only model omits the field
+    // entirely and its `.cbm` bytes stay byte-identical (regression lock).
+    let ctr_features_vec = if plan.identities.is_empty() {
+        None
+    } else {
+        let mut ctr_offsets = Vec::with_capacity(plan.identities.len());
+        for identity in &plan.identities {
+            ctr_offsets.push(build_tctr_feature(&mut fbb, identity)?);
+        }
+        Some(fbb.create_vector(&ctr_offsets))
+    };
+
     let tree_splits_vec = fbb.create_vector(&tree_splits);
     let tree_sizes_vec = fbb.create_vector(&tree_sizes);
     let tree_start_offsets_vec = fbb.create_vector(&tree_start_offsets);
@@ -475,6 +755,7 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
             TreeSizes: Some(tree_sizes_vec),
             TreeStartOffsets: Some(tree_start_offsets_vec),
             FloatFeatures: Some(float_features),
+            CtrFeatures: ctr_features_vec,
             LeafValues: Some(leaf_values_vec),
             LeafWeights: Some(leaf_weights_vec),
             NonSymmetricStepNodes: non_symmetric_step_nodes_vec,
