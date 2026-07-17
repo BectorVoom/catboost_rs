@@ -88,6 +88,25 @@ impl CatBoostRegressor {
         })
     }
 
+    /// Export the fitted model to ONNX (EXPORT-01f) as a `TreeEnsembleRegressor`
+    /// (`post_transform="NONE"`). Categorical/CTR and non-oblivious models are
+    /// rejected with a typed `CatBoostValueError`, never a panic.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on an unsupported
+    /// model; `IOError` on a downstream file-write failure.
+    fn save_onnx(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostRegressor is not fitted yet; call `fit` before `save_onnx`",
+            )
+        })?;
+        py.detach(|| model.save_onnx(std::path::Path::new(path), false))
+            .map_err(PyCbError)?;
+        Ok(())
+    }
+
     /// Predict raw model scores for a C-contiguous float32 NumPy `X` `(n, k)`.
     /// Returns a NumPy `float64` array of length `n`.
     ///

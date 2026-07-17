@@ -166,6 +166,26 @@ impl CatBoostClassifier {
         })
     }
 
+    /// Export the fitted model to ONNX (EXPORT-01f) as a
+    /// `TreeEnsembleClassifier`+`ZipMap` pair (`post_transform="LOGISTIC"` for
+    /// binary, `"SOFTMAX"` for multiclass). Categorical/CTR and non-oblivious
+    /// models are rejected with a typed `CatBoostValueError`, never a panic.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on an unsupported
+    /// model; `IOError` on a downstream file-write failure.
+    fn save_onnx(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostClassifier is not fitted yet; call `fit` before `save_onnx`",
+            )
+        })?;
+        py.detach(|| model.save_onnx(std::path::Path::new(path), true))
+            .map_err(PyCbError)?;
+        Ok(())
+    }
+
     /// Partial dependence for one or two float features (FSTR-03), mirroring
     /// upstream `plot_partial_dependence`. Returns a dict `{features: list[int],
     /// grids: list[np.ndarray], values: np.ndarray}` (values row-major, first

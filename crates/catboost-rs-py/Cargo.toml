@@ -34,16 +34,35 @@ cb-data = { path = "../cb-data" }
 # copy Float32 columns out of the RecordBatch `pyo3_arrow::PyTable` yields.
 arrow.workspace = true
 thiserror.workspace = true
+# PRODUCTION dependency as of EXPORT-01f (Phase 17 T6-0, plan-checker pass 3
+# CRITICAL fix): `errors.rs`'s `to_pyerr` — a production function, not test-only
+# — names `cb_model::OnnxExportError` directly in its `Export` match arm. Cargo's
+# dev-dependency extern prelude is populated for `cargo test` but NOT for the
+# real `cargo build -p catboost-rs-py` / `maturin develop`/`build` production
+# build, so leaving this a dev-dependency would let `cargo test` pass while the
+# actual wheel build failed to compile (the exact defect class the plan-checker
+# caught). default-features = false is PRESERVED here (re-verified for the
+# regular-dependency case, not just the former dev-dependency case): it still
+# prevents this dependency from re-enabling `cb-backend`'s default `cpu` feature
+# via `cb-model -> cb-train -> cb-backend` and unifying cpu+rocm under a
+# workspace `--features rocm` build (WR-03 feature-unification landmine) —
+# backend selection continues to flow ONLY through this crate's own [features]
+# passthrough below, which already forwards `catboost-rs/<backend>` (and thus
+# `cb-model/<backend>`) explicitly; a second, unconditional `cb-model` edge with
+# default features would defeat that passthrough exactly as it would for any
+# other backend-bearing dependency in this crate.
+cb-model = { path = "../cb-model", default-features = false }
 
 [dev-dependencies]
 # Used only by `errors_test.rs` to construct the `CbError` / `ModelError` payloads
 # that drive the `Train` / `Model` facade-error variants through `to_pyerr`
 # (these internal error crates are NOT re-exported by the facade).
 cb-core = { path = "../cb-core" }
-# default-features = false: prevents this dev-dep re-enabling cb-backend's default
-# `cpu` (via cb-model -> cb-train -> cb-backend) and unifying cpu+rocm under a
-# workspace `cargo test --features rocm` (WR-03 feature-unification landmine).
-cb-model = { path = "../cb-model", default-features = false }
+# Test-only (D-14/D-15 edge, AT-01f-5): `prost::EncodeError` has no public
+# constructor, so `errors_test.rs`'s `Export(Encode(_))` mapping test forces a
+# REAL encode failure (a too-small `BufMut` target) rather than fabricate an
+# unreachable variant. Same version cb-model already pins.
+prost = "0.14.4"
 
 [features]
 # Compile-time backend selection only — forward to the facade passthrough, which

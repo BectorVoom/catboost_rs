@@ -86,3 +86,91 @@ fn pycberror_newtype_routes_through_to_pyerr() {
         assert!(err.is_instance_of::<CatBoostValueError>(py));
     });
 }
+
+// ── EXPORT-01f (AT-01f-5): `Export` sub-variant -> Python exception mapping ──
+
+/// `CategoricalFeaturesUnsupported` / `NonObliviousTreesUnsupported` /
+/// `RegionTreesUnsupported` -> `CatBoostValueError` (the model itself is the
+/// "bad input" to the export operation, like `PartialDependence`'s mapping).
+#[test]
+fn export_categorical_unsupported_maps_to_value_error() {
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::Export(
+            cb_model::OnnxExportError::CategoricalFeaturesUnsupported,
+        ));
+        assert!(err.is_instance_of::<CatBoostValueError>(py));
+    });
+}
+
+#[test]
+fn export_non_oblivious_unsupported_maps_to_value_error() {
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::Export(
+            cb_model::OnnxExportError::NonObliviousTreesUnsupported,
+        ));
+        assert!(err.is_instance_of::<CatBoostValueError>(py));
+    });
+}
+
+#[test]
+fn export_region_unsupported_maps_to_value_error() {
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::Export(
+            cb_model::OnnxExportError::RegionTreesUnsupported,
+        ));
+        assert!(err.is_instance_of::<CatBoostValueError>(py));
+    });
+}
+
+/// `NonIntegerClassLabelsUnsupported` -> `CatBoostValueError` (same "bad
+/// input model" category as the other three guard-rejection variants).
+#[test]
+fn export_non_integer_class_labels_unsupported_maps_to_value_error() {
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::Export(
+            cb_model::OnnxExportError::NonIntegerClassLabelsUnsupported,
+        ));
+        assert!(err.is_instance_of::<CatBoostValueError>(py));
+    });
+}
+
+/// `Io` -> `PyIOError` (mirrors the top-level `CatBoostError::Io` arm's own
+/// mapping exactly).
+#[test]
+fn export_io_maps_to_io_error() {
+    Python::attach(|py| {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no parent dir");
+        let err = to_pyerr(&FacadeError::Export(cb_model::OnnxExportError::Io(io)));
+        assert!(err.is_instance_of::<PyIOError>(py));
+        assert!(err.value(py).to_string().contains("no parent dir"));
+    });
+}
+
+/// A minimal, non-empty local message — `prost::EncodeError` has no public
+/// constructor, so the only way to obtain a REAL one (rather than fabricate a
+/// variant that can never occur) is to force an actual encode failure: a
+/// too-small `BufMut` target for a message with at least one non-default field.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct EncodeErrorProbe {
+    #[prost(int64, tag = "1")]
+    value: i64,
+}
+
+/// `Encode` -> base `CatBoostError` (an internal/unexpected failure, mirrors
+/// `Train`/`Model`'s mapping — not user-input-driven).
+#[test]
+fn export_encode_maps_to_base_error() {
+    let probe = EncodeErrorProbe { value: 42 };
+    let mut small_buf = [0_u8; 0];
+    let mut writer: &mut [u8] = &mut small_buf;
+    let encode_err = prost::Message::encode(&probe, &mut writer)
+        .expect_err("a zero-capacity buffer must fail to encode a non-empty message");
+
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::Export(cb_model::OnnxExportError::Encode(
+            encode_err,
+        )));
+        assert!(err.is_instance_of::<PyCatBoostError>(py));
+        assert!(!err.is_instance_of::<CatBoostValueError>(py));
+    });
+}

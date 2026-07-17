@@ -35,6 +35,11 @@ pub use cb_model::{FeatureImportanceType, PredictionType};
 // consume `Model::partial_dependence` entirely through the published crate.
 pub use cb_model::{PartialDependence, PdpError};
 
+// Re-export the ONNX export error type (EXPORT-01) so callers can match on
+// `catboost_rs::OnnxExportError` sub-variants (via `CatBoostError::Export`)
+// entirely through the published crate, mirroring the `PdpError` precedent.
+pub use cb_model::OnnxExportError;
+
 // Re-export the loss / leaf-method / score-function / bootstrap knobs the
 // Builder consumes, so a caller configures a run entirely through the published
 // crate. `EScoreFunction` drives `.score_function()` (Cosine = catboost CPU
@@ -49,3 +54,5 @@ pub use cb_data::Pool;
 
 #[cfg(test)]
 mod error_test;
+#[cfg(test)]
+mod onnx_test;

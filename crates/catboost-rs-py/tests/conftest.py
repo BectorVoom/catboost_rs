@@ -104,3 +104,34 @@ def oracle_binclf():
         "X": np.ascontiguousarray(x, dtype=np.float32),
         "ref_raw": ref_raw,
     }
+
+
+@pytest.fixture
+def oracle_multiclass_softmax():
+    """Offline catboost 1.2.10 multiclass (3-class, Softmax) oracle fixture.
+
+    Used by the ONNX-export ONNX-runtime round-trip test (EXPORT-01, see
+    ``test_onnx_export.py``): this Python surface's ``CatBoostClassifier.predict``
+    / ``.predict_proba`` are still hardcoded to the BINARY two-column convention
+    (``classifier.rs``), so a genuine ``dim > 1`` round trip cannot go through
+    ``.fit()`` + ``.predict()`` yet — it instead loads this frozen upstream
+    model via the PUBLIC ``load_model`` (no training) and compares against the
+    SAME already-oracle-verified ``predictions.npy`` the Rust
+    ``multiclass_apply_oracle_test.rs`` locks to <= 1e-5.
+
+    Returns a dict with the reference ``model.json`` path, the input matrix
+    (``numeric_tiny``), and the reference per-class SOFTMAX probabilities
+    reshaped to OBJECT-MAJOR ``(n, dim)`` (``predictions.npy`` is stored as a
+    flat row-major ``(n_rows, dim)`` array). Hermetic: reads only frozen files,
+    never imports the ``catboost`` package.
+    """
+    base = _ORACLE_FIXTURES / "multiclass_softmax"
+    x = np.load(_ORACLE_FIXTURES / "inputs" / "numeric_tiny" / "X.npy")
+    ref = np.load(base / "predictions.npy")
+    n = x.shape[0]
+    dim = ref.size // n
+    return {
+        "json": str(base / "model.json"),
+        "X": np.ascontiguousarray(x, dtype=np.float32),
+        "ref_probabilities": ref.reshape(n, dim),
+    }

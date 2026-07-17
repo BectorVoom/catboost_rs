@@ -15,9 +15,9 @@ use std::path::Path;
 
 use cb_data::Pool;
 use cb_model::{
-    apply_prediction_type, interaction, load_cbm, load_json, partial_dependence, predict_raw,
-    prediction_values_change, save_cbm, save_json, shap_values, FeatureImportanceType,
-    PartialDependence, PredictionType,
+    apply_prediction_type, export_onnx, interaction, load_cbm, load_json, partial_dependence,
+    predict_raw, prediction_values_change, save_cbm, save_json, shap_values,
+    FeatureImportanceType, PartialDependence, PredictionType,
 };
 
 use crate::error::CatBoostError;
@@ -254,5 +254,22 @@ impl Model {
     pub fn load_json(path: &Path) -> Result<Self, CatBoostError> {
         let inner = load_json(path)?;
         Ok(Self::from_canonical(inner))
+    }
+
+    /// Export to ONNX (EXPORT-01): a float-only, oblivious, identity-scale
+    /// model only — categorical/CTR and non-oblivious (Lossguide/Depthwise/
+    /// Region) models are rejected with a typed error, never a panic.
+    /// `is_classifier` selects `TreeEnsembleClassifier`+`ZipMap`
+    /// (`post_transform="LOGISTIC"`/`"SOFTMAX"`) vs `TreeEnsembleRegressor`
+    /// (`post_transform="NONE"`) — see [`cb_model::export_onnx`]. The caller
+    /// supplies this because the model carries no loss-function/objective
+    /// metadata to infer it from.
+    ///
+    /// # Errors
+    /// [`CatBoostError::Export`] on an unsupported model (categorical/CTR,
+    /// non-oblivious) or a downstream encode/I/O failure.
+    pub fn save_onnx(&self, path: &Path, is_classifier: bool) -> Result<(), CatBoostError> {
+        export_onnx(&self.inner, path, is_classifier)?;
+        Ok(())
     }
 }

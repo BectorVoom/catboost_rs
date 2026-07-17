@@ -75,4 +75,11 @@ pub enum CatBoostError {
     /// Converted with `?` via `#[from]`.
     #[error("partial dependence error: {0}")]
     PartialDependence(#[from] cb_model::PdpError),
+
+    /// A [`crate::Model::save_onnx`] export failed — an unsupported model
+    /// (categorical/CTR, non-oblivious) or a downstream encode/I/O error.
+    /// Carries the typed `cb-model` [`cb_model::OnnxExportError`]. Converted
+    /// with `?` via `#[from]`.
+    #[error("ONNX export error: {0}")]
+    Export(#[from] cb_model::OnnxExportError),
 }
