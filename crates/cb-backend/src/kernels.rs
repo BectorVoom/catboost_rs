@@ -4292,16 +4292,20 @@ pub fn subtract_histograms_kernel<F: Float>(
 /// candidate sweep uses the whole device, not one SM) with the strict-`>` first-wins /
 /// lowest-`(feature, bin)`-index tie-break, then each cube block-reduces (wave-agnostic
 /// `CUBE_DIM_X`-strided shared-mem tree, D-09) into its per-block `(best_gain, best_idx)`
-/// winner. The two winners pack into ONE output buffer — `best_out[CUBE_POS]` = the gain,
-/// `best_out[CUBE_COUNT + CUBE_POS]` = the candidate index widened to `F` (exact: `f64` holds
-/// every `u32`; the reachable backends here are the u64-atomic ones whose channel float is
-/// `f64`) — so the host finishes the across-block argmin from a SINGLE O(blocks) read-back
-/// (the bulk histogram NEVER crosses — D-05). Determinism is unchanged by the multi-cube
-/// geometry: every candidate is scored by exactly ONE thread, per-thread and per-block folds
-/// use the same strict-`>`/lowest-index rule, and the host fold applies the identical global
-/// tie-break, so the chosen split is bit-identical to the single-cube dispatch. The trailing
-/// `border == n_bins - 1` no-op (all bins LEFT) is EXCLUDED from the argmin, in lockstep with
-/// the depth-1 scorer and the CPU reference.
+/// winner. The two winners write into TWO SEPARATE output buffers — `best_gain[CUBE_POS]` /
+/// `best_idx[CUBE_POS]` — mirroring [`find_optimal_split_kernel`]'s `best_idx: &mut Array<u32>`,
+/// rather than widening the candidate index into the channel float `F` and packing it
+/// alongside the gain: `F` is `f32` on the wgpu backend (RESEARCH A1 channel-float table),
+/// whose 24-bit mantissa only represents integers EXACTLY up to `2^24` — a candidate index at
+/// or beyond that (`n_features * n_bins >= 2^24`) would silently round to the WRONG index. A
+/// genuine `u32` output has no such ceiling on any backend. The host finishes the across-block
+/// argmin from a batched O(blocks) read-back of both buffers together (the bulk histogram
+/// NEVER crosses — D-05). Determinism is unchanged by the multi-cube geometry: every candidate
+/// is scored by exactly ONE thread, per-thread and per-block folds use the same
+/// strict-`>`/lowest-index rule, and the host fold applies the identical global tie-break, so
+/// the chosen split is bit-identical to the single-cube dispatch. The trailing `border ==
+/// n_bins - 1` no-op (all bins LEFT) is EXCLUDED from the argmin, in lockstep with the depth-1
+/// scorer and the CPU reference.
 ///
 /// Generic over `F: Float` (AGENTS.md generics-float). The `f32::MIN` sentinel (HIP-safe finite
 /// `-inf` stand-in, WR-01 — a literal `-inf` fails the gfx1100 JIT) seeds the argmin so any real
@@ -4311,7 +4315,8 @@ pub fn subtract_histograms_kernel<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn find_optimal_split_partition_kernel<F: Float>(
     bin_sums: &Array<u64>,
-    best_out: &mut Array<F>,
+    best_gain: &mut Array<F>,
+    best_idx: &mut Array<u32>,
     scaled_l2: &Array<F>,
     n_parts: u32,
     n_features: u32,
@@ -4444,11 +4449,12 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     }
 
     if tid == 0u32 {
-        // Packed per-block winner: gain in the first CUBE_COUNT slots, candidate index
-        // (widened to F — exact for every u32 in the f64 channel) in the second, so the
-        // host retrieves BOTH from one read-back (one sync per level instead of two).
-        best_out[CUBE_POS] = sh_gain[0usize];
-        best_out[CUBE_COUNT + CUBE_POS] = F::cast_from(sh_idx[0usize]);
+        // Per-block winner: gain and candidate index in their OWN typed buffers (see the
+        // function doc — `best_idx` stays a genuine `u32`, never widened into the channel
+        // float `F`, which is only exact up to 2^24 on the wgpu f32 channel). The host
+        // batches both buffers into one read-back (one sync per level, same as before).
+        best_gain[CUBE_POS] = sh_gain[0usize];
+        best_idx[CUBE_POS] = sh_idx[0usize];
     }
 }
 

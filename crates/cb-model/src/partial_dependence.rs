@@ -161,20 +161,54 @@ fn validate(model: &Model, columns: &[Vec<f32>], features: &[usize]) -> Result<u
     Ok(n_obj)
 }
 
-/// PDP-01: the single-feature averaging engine over an explicit grid.
+/// Shared per-grid-point PDP step, factored out of what was previously
+/// hand-duplicated column-override + zero-object-guard + predict+average logic
+/// (once in [`pdp_curve_single`], twice nested in [`pdp_curve_pair`]) — a future
+/// fix to this logic (e.g. the NaN-pad guard this module's doc comment warns
+/// about) now only needs to be applied once.
 ///
-/// **Precondition (enforced by [`validate`] before this ever runs in the
-/// public [`partial_dependence`] path):** `columns.len() == n_float`, every
-/// column has the same length `n >= 1`, and `feature < n_float` — because
-/// these hold, `predict_raw` never NaN-pads a short/missing column
+/// **Precondition (enforced by [`validate`] before either curve engine ever
+/// runs in the public [`partial_dependence`] path):** `working.len() == n_float`,
+/// every column has the same length `n_obj`, and every `overrides` feature index
+/// is `< n_float` — because these hold, `predict_raw` never NaN-pads a
+/// short/missing column
 /// `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407]`.
 ///
+/// Overwrites each `(feature, value)` pair's ENTIRE column in `working` (every
+/// object gets the same pinned value — a no-op for an out-of-range `feature`,
+/// same as the pre-refactor `if let Some(col) = ...` guard), then, unless
+/// `n_obj == 0`, calls [`predict_raw`] and folds the mean through [`sum_f64`]
+/// (D-08 — never a raw `.sum()`). `working` is the caller's REUSED working-column
+/// buffer (mutated in place, not re-cloned per call — same allocation-reuse
+/// discipline as before the refactor).
+fn pdp_averaged_prediction(
+    model: &Model,
+    working: &mut [Vec<f32>],
+    overrides: &[(usize, f64)],
+    n_obj: usize,
+) -> f64 {
+    for &(feature, value) in overrides {
+        if let Some(col) = working.get_mut(feature) {
+            let v = value as f32;
+            for slot in col.iter_mut() {
+                *slot = v;
+            }
+        }
+    }
+    if n_obj == 0 {
+        return 0.0;
+    }
+    let preds = predict_raw(model, working);
+    sum_f64(&preds) / (n_obj as f64)
+}
+
+/// PDP-01: the single-feature averaging engine over an explicit grid.
+///
 /// For each grid point, forms a working column set identical to `columns`
-/// except that the whole `feature` column is overridden to `grid[k] as f32`,
-/// calls [`predict_raw`], and folds the mean through [`sum_f64`] (D-08 —
-/// never a raw `.sum()`). Pure: the caller's `columns` are not mutated (the
-/// override happens on an owned working copy, reused across grid points).
-/// Output length is exactly `grid.len()`, in grid order.
+/// except that the whole `feature` column is overridden to `grid[k] as f32`
+/// (via [`pdp_averaged_prediction`]). Pure: the caller's `columns` are not
+/// mutated (the override happens on an owned working copy, reused across grid
+/// points). Output length is exactly `grid.len()`, in grid order.
 fn pdp_curve_single(model: &Model, columns: &[Vec<f32>], feature: usize, grid: &[f64]) -> Vec<f64> {
     let n_obj = columns.first().map_or(0, Vec::len);
     // One reusable working buffer (T1 refactor): clone the column set once,
@@ -182,19 +216,7 @@ fn pdp_curve_single(model: &Model, columns: &[Vec<f32>], feature: usize, grid: &
     // rather than re-cloning every column on every iteration.
     let mut working: Vec<Vec<f32>> = columns.to_vec();
     grid.iter()
-        .map(|&v| {
-            if let Some(col) = working.get_mut(feature) {
-                let value = v as f32;
-                for slot in col.iter_mut() {
-                    *slot = value;
-                }
-            }
-            if n_obj == 0 {
-                return 0.0;
-            }
-            let preds = predict_raw(model, &working);
-            sum_f64(&preds) / (n_obj as f64)
-        })
+        .map(|&v| pdp_averaged_prediction(model, &mut working, &[(feature, v)], n_obj))
         .collect()
 }
 
@@ -232,8 +254,8 @@ fn grid_for_feature(model: &Model, feature: usize) -> Vec<f64> {
 /// PDP-04: the two-feature averaging engine over the Cartesian product of two
 /// grids, row-major (`f1` outer, `f2` inner: index `a*g2.len()+b`). Same
 /// validated precondition as [`pdp_curve_single`]; `f1 != f2` (validate rejects
-/// duplicates). Overrides BOTH target columns per grid point; the mean folds
-/// through [`sum_f64`] (D-08).
+/// duplicates). Overrides BOTH target columns per grid point (via
+/// [`pdp_averaged_prediction`]); the mean folds through [`sum_f64`] (D-08).
 fn pdp_curve_pair(
     model: &Model,
     columns: &[Vec<f32>],
@@ -246,25 +268,8 @@ fn pdp_curve_pair(
     let mut working: Vec<Vec<f32>> = columns.to_vec();
     let mut out = Vec::with_capacity(g1.len().saturating_mul(g2.len()));
     for &a in g1 {
-        if let Some(col) = working.get_mut(f1) {
-            let value = a as f32;
-            for slot in col.iter_mut() {
-                *slot = value;
-            }
-        }
         for &b in g2 {
-            if let Some(col) = working.get_mut(f2) {
-                let value = b as f32;
-                for slot in col.iter_mut() {
-                    *slot = value;
-                }
-            }
-            if n_obj == 0 {
-                out.push(0.0);
-                continue;
-            }
-            let preds = predict_raw(model, &working);
-            out.push(sum_f64(&preds) / (n_obj as f64));
+            out.push(pdp_averaged_prediction(model, &mut working, &[(f1, a), (f2, b)], n_obj));
         }
     }
     out

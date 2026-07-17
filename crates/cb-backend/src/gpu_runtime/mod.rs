@@ -1633,6 +1633,43 @@ pub(crate) fn read_part_stats_and_leaf_of(
     Ok((part_stats, bytemuck::cast_slice::<u8, u32>(&leaf_bytes).to_vec()))
 }
 
+/// Read a per-block `(best_gain, best_idx)` winner-descriptor pair back in ONE blocking read —
+/// used by [`score_partition_over_binsums`] so its two SEPARATE typed output buffers (channel
+/// float gain, genuine `u32` index — see [`find_optimal_split_partition_kernel`]'s doc for why
+/// they are kept separate rather than packed into one float buffer) still cost only one
+/// pipeline sync per level, matching [`read_part_stats_and_leaf_of`]'s batching pattern. wgpu
+/// upcasts the f32 gain channel exactly like [`read_scores_f64`]; the index buffer is read back
+/// bit-for-bit as `u32` on every backend (never round-tripped through a float). A read-back
+/// failure surfaces [`CbError::Degenerate`] (WR-05), never a silent zero buffer.
+fn read_gain_and_idx(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    best_gain_h: Handle,
+    best_idx_h: Handle,
+) -> CbResult<(Vec<f64>, Vec<u32>)> {
+    let buffers = cubecl::reader::try_read_sync(client.read_async(vec![best_gain_h, best_idx_h]))
+        .ok_or_else(|| {
+            CbError::Degenerate(
+                "best-gain/best-idx read-back: blocking reads are unsupported on this platform"
+                    .to_owned(),
+            )
+        })?
+        .map_err(|e| CbError::Degenerate(format!("best-gain/best-idx read-back failed: {e:?}")))?;
+    let mut buffers = buffers.into_iter();
+    let (Some(gain_bytes), Some(idx_bytes)) = (buffers.next(), buffers.next()) else {
+        return Err(CbError::Degenerate(
+            "best-gain/best-idx read-back returned fewer than 2 buffers".to_owned(),
+        ));
+    };
+    #[cfg(feature = "wgpu")]
+    let best_gain = bytemuck::cast_slice::<u8, f32>(&gain_bytes)
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    #[cfg(not(feature = "wgpu"))]
+    let best_gain = bytemuck::cast_slice::<u8, f64>(&gain_bytes).to_vec();
+    Ok((best_gain, bytemuck::cast_slice::<u8, u32>(&idx_bytes).to_vec()))
+}
+
 /// Apply ONE split's forward-bit doc-routing reorder device-resident: returns a NEW
 /// `leaf_of` handle with bit `level_bit` set for every object whose quantized bin on
 /// `feature` is `> bin` (== `cb_train::leaf_index`'s `idx |= 1 << i`, Pitfall 6). The
@@ -2739,20 +2776,24 @@ fn score_partition_over_binsums(
         z: 1,
     };
 
-    // Packed per-block winner buffer: gains in slots `0..num_cubes`, candidate indices
-    // (widened to the channel float — exact for every u32 in f64) in slots
-    // `num_cubes..2*num_cubes`, retrieved with ONE read-back (one sync per level, not two).
+    // Per-block winner buffers: `best_gain_h` (channel float, `num_cubes` slots) and
+    // `best_idx_h` (genuine `u32`, `num_cubes` slots) — kept SEPARATE rather than packed into
+    // one channel-float buffer, because the channel float `F` is `f32` on the wgpu backend
+    // (RESEARCH A1) whose 24-bit mantissa cannot represent every candidate index exactly once
+    // `n_features * n_bins >= 2^24` (see the kernel doc). Both buffers are still retrieved in
+    // ONE batched read-back below (one sync per level, not two).
     #[cfg(feature = "wgpu")]
-    let best_out_handle = {
-        let best_out_h =
-            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; 2 * num_cubes]));
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
         let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2 as f32]));
         find_optimal_split_partition_kernel::launch::<f32, SelectedRuntime>(
             client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
-            unsafe { ArrayArg::from_raw_parts(best_out_h.clone(), 2 * num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_parts_u32,
             n_features as u32,
@@ -2760,20 +2801,21 @@ fn score_partition_over_binsums(
             n_bins_u32,
             score_fn,
         );
-        best_out_h
+        (best_gain_h, best_idx_h)
     };
 
     #[cfg(not(feature = "wgpu"))]
-    let best_out_handle = {
-        let best_out_h =
-            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; 2 * num_cubes]));
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
         let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2]));
         find_optimal_split_partition_kernel::launch::<f64, SelectedRuntime>(
             client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
-            unsafe { ArrayArg::from_raw_parts(best_out_h.clone(), 2 * num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_parts_u32,
             n_features as u32,
@@ -2781,33 +2823,30 @@ fn score_partition_over_binsums(
             n_bins_u32,
             score_fn,
         );
-        best_out_h
+        (best_gain_h, best_idx_h)
     };
 
     // Read back ONLY the O(blocks) per-block winner descriptors (the sole D-05 crossing) and
     // finish the across-block argmin host-side with the SAME lowest-index tie-break the kernel
-    // uses. The bulk histogram never leaves the device (T-11-03-02).
-    let best_out = read_scores_f64(client, best_out_handle)?;
-    let (best_gains, best_idx_f) = best_out
-        .split_at_checked(num_cubes)
-        .ok_or_else(|| {
-            CbError::Degenerate(format!(
-                "partition best-split read-back returned {} slots, expected {}",
-                best_out.len(),
-                2 * num_cubes
-            ))
-        })?;
+    // uses. The bulk histogram never leaves the device (T-11-03-02). Batched via
+    // `read_gain_and_idx` (mirrors `read_part_stats_and_leaf_of`) so both buffers cost one
+    // pipeline sync, not two.
+    let (best_gains, best_idx) = read_gain_and_idx(client, best_gain_handle, best_idx_handle)?;
+    if best_gains.len() != num_cubes || best_idx.len() != num_cubes {
+        return Err(CbError::Degenerate(format!(
+            "partition best-split read-back returned {}/{} slots, expected {num_cubes}/{num_cubes}",
+            best_gains.len(),
+            best_idx.len()
+        )));
+    }
 
     let mut best_gain = f64::NEG_INFINITY;
     let mut best_c = u32::MAX;
     for (block, &gain) in best_gains.iter().enumerate() {
-        // The idx slot is an exact small integer in the channel float; an out-of-range or
-        // non-finite slot falls to u32::MAX and is skipped by the candidate-range guard.
-        let cand = best_idx_f
-            .get(block)
-            .copied()
-            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX))
-            .map_or(u32::MAX, |v| v as u32);
+        // `best_idx` is a genuine `u32` read-back (see the buffer-allocation comment above) —
+        // no float round-trip, so no range/finiteness filtering is needed; a missing slot
+        // falls to the u32::MAX sentinel and is skipped by the candidate-range guard below.
+        let cand = best_idx.get(block).copied().unwrap_or(u32::MAX);
         if (cand as usize) >= n_candidates {
             continue;
         }

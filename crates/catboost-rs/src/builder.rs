@@ -338,27 +338,32 @@ impl CatBoostBuilder {
         let prof_t = std::time::Instant::now();
 
         // SoA float columns as f32 (the feature storage type; the apply path
-        // binarizes f32 against the borders). Columns are independent and rayon's
-        // indexed `par_iter` preserves output order, so the narrowed matrix is
-        // byte-identical to the serial loop.
-        let feature_values: Vec<Vec<f32>> = pool
-            .float_features()
-            .par_iter()
-            .map(|col| col.iter().map(|&v| v as f32).collect())
-            .collect();
-
-        // Per-float-feature quantization borders from the pool (Phase-2 greedy
-        // logsum). NaN sentinel is off for the numeric first-slice surface
-        // (NaN-free features are always Forbidden regardless). Columns are
-        // independent, so the per-feature selection runs in parallel; rayon's
-        // indexed `par_iter` preserves output order, so the result is
-        // byte-identical to the serial loop (each column's borders depend only
-        // on that column).
-        let feature_borders: Vec<Vec<f64>> = pool
-            .float_features()
-            .par_iter()
-            .map(|col| select_borders_greedy_logsum(col, self.border_count, false))
-            .collect();
+        // binarizes f32 against the borders) AND the per-float-feature
+        // quantization borders (Phase-2 greedy logsum; NaN sentinel is off for the
+        // numeric first-slice surface — NaN-free features are always Forbidden
+        // regardless). Both are independent `rayon`-parallel reductions over the
+        // SAME `pool.float_features()`, reading disjoint per-column data and
+        // writing disjoint outputs (`feature_values` narrows f64->f32,
+        // `feature_borders` derives borders — neither reads the other's output),
+        // so they run CONCURRENTLY via `rayon::join` rather than sequentially, to
+        // shrink this fit-prep stage's latency (the CB_GPU_PROF timer below
+        // specifically attributes to this stage). Each inner `par_iter`'s indexed
+        // map preserves output order, so both results stay byte-identical to the
+        // fully-serial form.
+        let (feature_values, feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
+            || {
+                pool.float_features()
+                    .par_iter()
+                    .map(|col| col.iter().map(|&v| v as f32).collect())
+                    .collect()
+            },
+            || {
+                pool.float_features()
+                    .par_iter()
+                    .map(|col| select_borders_greedy_logsum(col, self.border_count, false))
+                    .collect()
+            },
+        );
         if prof {
             eprintln!(
                 "CB_GPU_PROF fit-prep copy+borders elapsed={:.2}ms",

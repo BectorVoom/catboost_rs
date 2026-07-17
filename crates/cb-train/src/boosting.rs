@@ -2179,6 +2179,16 @@ pub fn train_cat<R: Runtime>(
 /// `bin_id -> border` join (Pattern 4) the device tree is folded through. Only the
 /// numeric float columns are quantized (the device path is gated off the cat / CTR
 /// configs). Uses checked `.get` only (no panic / raw index).
+///
+/// # Precondition
+/// Every `feature_borders[f]` MUST be sorted ascending (`select_borders_greedy_logsum`'s
+/// contract — it always sorts + dedups before returning). This function reads
+/// borders via `partition_point`, a binary search that is only correct on
+/// sorted input: on an unsorted slice it silently returns a wrong bin index
+/// (no panic) instead of the linear-scan `filter(|&&b| v > b).count()` an
+/// unsorted-safe reader might expect. A `debug_assert!` below catches a
+/// precondition violation in debug/test builds; release builds trust the
+/// invariant for the `O(log borders)` win.
 fn quantize_feature_major(
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -2201,6 +2211,14 @@ fn quantize_feature_major(
         .enumerate()
         .for_each(|(f, stripe)| {
             let borders = feature_borders.get(f).map_or(&[][..], Vec::as_slice);
+            debug_assert!(
+                borders.windows(2).all(|w| match w {
+                    [a, b] => a <= b,
+                    _ => true,
+                }),
+                "quantize_feature_major: feature_borders[{f}] must be ascending-sorted \
+                 for partition_point to be correct (see function doc precondition)",
+            );
             let col = feature_values.get(f).map_or(&[][..], Vec::as_slice);
             for (i, slot) in stripe.iter_mut().enumerate() {
                 let v = col.get(i).copied().map_or(0.0_f64, f64::from);
