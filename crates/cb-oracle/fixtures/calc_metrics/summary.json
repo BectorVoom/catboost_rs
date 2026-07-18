@@ -1,0 +1,36 @@
+{
+  "catboost_version": "1.2.10",
+  "seed": 20260718,
+  "n": 16,
+  "weight_supported": true,
+  "scenarios": {
+    "rmse": {
+      "metric": "RMSE",
+      "weighted": false,
+      "value": [
+        0.9721118698904884
+      ]
+    },
+    "logloss": {
+      "metric": "Logloss",
+      "weighted": false,
+      "value": [
+        0.8860430098190653
+      ]
+    },
+    "msle": {
+      "metric": "MSLE",
+      "weighted": false,
+      "value": [
+        0.4077660108725021
+      ]
+    },
+    "rmse_weighted": {
+      "metric": "RMSE",
+      "weighted": true,
+      "value": [
+        0.9259270041115908
+      ]
+    }
+  }
+}

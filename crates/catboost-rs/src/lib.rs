@@ -21,10 +21,12 @@
 
 mod builder;
 mod error;
+mod metrics;
 mod model;
 
 pub use builder::CatBoostBuilder;
 pub use error::CatBoostError;
+pub use metrics::{eval_metric, eval_metrics};
 pub use model::Model;
 
 // Re-export the prediction / importance enums so callers drive the facade
@@ -54,5 +56,7 @@ pub use cb_data::Pool;
 
 #[cfg(test)]
 mod error_test;
+#[cfg(test)]
+mod metrics_test;
 #[cfg(test)]
 mod onnx_test;

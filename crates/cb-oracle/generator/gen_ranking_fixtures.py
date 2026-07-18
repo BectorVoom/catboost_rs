@@ -279,6 +279,20 @@ def gen_metric(metric: str) -> None:
 METRICS_DIR = RANKING_CORPUS / "ranking_metrics"
 METRIC_APPROX_SEED = 42
 
+# ---------------------------------------------------------------------------
+# ORCH-04-S2 FLAT calc_metrics fixtures (standalone eval_metric surface).
+# Metrics on FIXED predictions have no training/quantization nondeterminism, so
+# these are the cleanest possible oracle. A SINGLE shared (label, approx) pair is
+# reused for RMSE, Logloss, and MSLE simultaneously; this is valid ONLY because
+# `label` is pinned to {0, 1} (upstream Logloss requires target in [0,1]; MSLE's
+# `1+label>0` holds trivially) and `approx > -1` (the MSLE `1+approx>0`
+# log-domain guard, cb-train metrics.rs:326-331). A positive `weight` vector
+# yields the weighted-RMSE case (`catboost.utils.eval_metric` accepts `weight=`
+# in 1.2.10 -- confirmed at gen time).
+CALC_METRICS_DIR = FIXTURES / "calc_metrics"
+CALC_METRICS_SEED = 20260718
+N_CALC = 16
+
 # The metric scenarios: (scenario_name, catboost_metric_string). Defaults +
 # explicit top=2 cases exercise the nth_element / tie path; QueryAUC uses
 # type=Ranking for the graded-relevance corpus (the singleclass Classic default
@@ -351,6 +365,57 @@ def gen_metrics_eval() -> None:
     print(f"wrote {len(summary['scenarios'])} metric fixtures under {METRICS_DIR}")
 
 
+def gen_calc_metrics_flat() -> None:
+    """Freeze the FLAT calc_metrics fixtures over a FIXED (label, approx) pair
+    (ORCH-04-S2). RMSE/Logloss/MSLE share the one pair; a positive weight vector
+    yields the weighted-RMSE case."""
+    from catboost.utils import eval_metric
+
+    CALC_METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(CALC_METRICS_SEED)
+    # label in {0,1}: satisfies RMSE + Logloss (target in [0,1]) + MSLE (1+label>0).
+    label = rng.integers(0, 2, size=N_CALC).astype(np.float64)
+    # approx > -1: MSLE log-domain guard (1+approx>0); RMSE/Logloss accept any raw.
+    approx = rng.uniform(-0.5, 2.0, size=N_CALC).astype(np.float64)
+    # strictly-positive per-object weights for the weighted-RMSE case.
+    weight = rng.uniform(0.5, 2.0, size=N_CALC).astype(np.float64)
+
+    # Shared inputs (float64 so cb_oracle::load_f64_vec can read them).
+    np.save(CALC_METRICS_DIR / "label.npy", label, allow_pickle=False)
+    np.save(CALC_METRICS_DIR / "approx.npy", approx, allow_pickle=False)
+    np.save(CALC_METRICS_DIR / "weight.npy", weight, allow_pickle=False)
+
+    summary = {
+        "catboost_version": CATBOOST_VERSION,
+        "seed": CALC_METRICS_SEED,
+        "n": N_CALC,
+        "weight_supported": True,
+        "scenarios": {},
+    }
+
+    def freeze(name: str, metric: str, **kw) -> None:
+        value = eval_metric(label, approx, metric, **kw)
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name}: non-finite metric value {arr!r}")
+        np.save(CALC_METRICS_DIR / f"{name}.npy", arr, allow_pickle=False)
+        summary["scenarios"][name] = {
+            "metric": metric,
+            "weighted": bool(kw),
+            "value": [float(v) for v in arr],
+        }
+
+    freeze("rmse", "RMSE")
+    freeze("logloss", "Logloss")
+    freeze("msle", "MSLE")
+    freeze("rmse_weighted", "RMSE", weight=weight)
+
+    (CALC_METRICS_DIR / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    print(f"wrote {len(summary['scenarios'])} flat calc_metrics fixtures under {CALC_METRICS_DIR}")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", action="store_true", help="write corpus inputs only")
@@ -360,6 +425,11 @@ def main(argv: list[str]) -> int:
         "--metrics-eval",
         action="store_true",
         help="freeze all eval-only ranking metric fixtures (LOSS-05, Plan 06.3-05)",
+    )
+    parser.add_argument(
+        "--calc-metrics",
+        action="store_true",
+        help="freeze the FLAT calc_metrics fixtures (ORCH-04-S2: RMSE/Logloss/MSLE + weighted)",
     )
     args = parser.parse_args(argv)
 
@@ -373,7 +443,15 @@ def main(argv: list[str]) -> int:
         gen_metric(args.metric)
     if args.metrics_eval:
         gen_metrics_eval()
-    if not (args.inputs or args.loss or args.metric or args.metrics_eval):
+    if args.calc_metrics:
+        gen_calc_metrics_flat()
+    if not (
+        args.inputs
+        or args.loss
+        or args.metric
+        or args.metrics_eval
+        or args.calc_metrics
+    ):
         # Default: (re)write the corpus inputs so the frozen shape is materialized.
         write_inputs()
     return 0
