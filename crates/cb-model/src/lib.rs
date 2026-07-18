@@ -30,8 +30,8 @@ pub use apply::{
 };
 pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
 pub use ctr_data::{
-    calc_inference, ctr_base_key, decode_ctr_data, encode_ctr_data, CtrData, CtrTableJson,
-    CtrValueTable, ECtrType, Prior,
+    calc_inference, ctr_base_key, decode_ctr_data, decode_ctr_model_parts, encode_ctr_data,
+    CtrData, CtrTableJson, CtrValueTable, ECtrType, Prior,
 };
 pub use error::ModelError;
 pub use export::{export_onnx, OnnxExportError};

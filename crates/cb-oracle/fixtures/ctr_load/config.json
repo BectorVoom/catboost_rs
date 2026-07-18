@@ -1,0 +1,36 @@
+{
+  "n_rows": 400,
+  "n_float_features": 1,
+  "cat_features_columns": [
+    "c0",
+    "c1"
+  ],
+  "scenarios": {
+    "simple": {
+      "max_ctr_complexity": 1,
+      "n_ctrs": 7,
+      "n_ctr_data_tables": 3,
+      "ctr_types_in_splits": [
+        "Borders",
+        "Counter"
+      ],
+      "ctr_types_in_tables": [
+        "Borders",
+        "Counter"
+      ]
+    },
+    "combo": {
+      "max_ctr_complexity": 2,
+      "n_ctrs": 10,
+      "n_ctr_data_tables": 4,
+      "ctr_types_in_splits": [
+        "Borders",
+        "Counter"
+      ],
+      "ctr_types_in_tables": [
+        "Borders",
+        "Counter"
+      ]
+    }
+  }
+}
