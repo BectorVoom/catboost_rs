@@ -69,6 +69,7 @@ pub(crate) enum MulticlassObjective {
     MultiCrossEntropy,
     /// MultiRMSE — DIAGONAL per-target regression Newton (`der1 = w·(target−approx)`, `der2 = −w`).
     /// (No `Loss` variant yet; classified here so the arm lands when the variant is added.)
+    #[allow(dead_code)] // consumed by the #[cfg(test)] multiclass_test self-oracle (source/test separation)
     MultiRmse,
     /// RMSEWithUncertainty — DIAGONAL K=2 solve over `[mean, log-scale]`
     /// (`rmse_with_uncertainty_ders`; the weight is folded inside that der).
@@ -78,6 +79,7 @@ pub(crate) enum MulticlassObjective {
 impl MulticlassObjective {
     /// Whether this objective uses the COUPLED full-block solve (softmax only). Every other arm is
     /// separable and uses the diagonal per-component solve (Pitfall 3).
+    #[allow(dead_code)] // consumed by the #[cfg(test)] multiclass_test self-oracle (source/test separation)
     pub(crate) fn is_coupled(self) -> bool {
         matches!(self, MulticlassObjective::Softmax)
     }
@@ -101,6 +103,7 @@ pub(crate) fn map_multiclass_objective(loss: &Loss) -> Option<MulticlassObjectiv
 /// The packed lower-triangular index of the diagonal entry `(d, d)` in the order
 /// `[(0,0),(0,1),…,(0,k-1),(1,1),…]`: `d·k − d·(d−1)/2`. Guards the `d == 0` usize underflow (the
 /// device kernel evaluates the identical expression in wrapping GPU arithmetic).
+#[allow(dead_code)] // consumed by the #[cfg(test)] multiclass_test self-oracle (source/test separation)
 fn diag_index(d: usize, k: usize) -> usize {
     if d == 0 {
         return 0;
@@ -140,6 +143,7 @@ fn class_of(target: &[f64], i: usize) -> usize {
 /// (MultiCrossEntropy, `target[d * n + i]`), or a per-object regression target (MultiRMSE /
 /// RMSEWithUncertainty). `weight` is per-object (length `n`); the covered regime is unit weights.
 /// No `unwrap`/`expect`/`panic`/indexing (D-13).
+#[allow(dead_code)] // consumed by the #[cfg(test)] multiclass_test self-oracle (source/test separation)
 pub(crate) fn assemble_multiclass_ders(
     objective: MulticlassObjective,
     approx: &[f64],
@@ -382,6 +386,7 @@ fn solve_blocks_device(
 /// `target` / `weight` follow [`assemble_multiclass_ders`]; `k` is the approx dimension; `n_leaves`
 /// the leaf count; `scaled_l2` the per-tree `scale_l2_reg` output. No `unwrap`/`expect`/`panic`/
 /// indexing (D-13).
+#[allow(dead_code)] // consumed by the #[cfg(test)] multiclass_test self-oracle (source/test separation)
 pub(crate) fn grow_multiclass_block(
     objective: MulticlassObjective,
     leaf_of: &[u32],

@@ -251,6 +251,7 @@ pub(crate) fn launch_langevin_resident(
 ///
 /// # Errors
 /// [`CbError`] propagated from the device launch / read-back.
+#[allow(dead_code)] // consumed by the #[cfg(test)] langevin_test self-oracle (source/test separation)
 pub(crate) fn draw_langevin_host(
     derivatives: &[f64],
     rand_seed: u64,

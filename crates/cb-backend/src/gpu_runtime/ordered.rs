@@ -50,6 +50,7 @@ use crate::SelectedRuntime;
 /// the object at learn position `p`). The body/tail boundary [`Self::body_finish`] /
 /// [`Self::tail_finish`] are learn-order positions (the estimation prefix is `[0, body_finish)`; the
 /// historically-approximated tail is `[body_finish, tail_finish)`).
+#[allow(dead_code)] // consumed by the #[cfg(test)] ordered_test self-oracle (source/test separation)
 pub(crate) struct OrderedTree<'a> {
     /// Object `doc`'s leaf index in the grown tree (OBJECT order), length ≥ `permutation.len()`.
     pub leaf_of: &'a [u32],
@@ -92,6 +93,7 @@ fn weight_of(weights: &[f64], doc: usize) -> f64 {
 /// # Errors
 /// [`CbError::Degenerate`] if `leaf_of` / `der` are shorter than the permutation implies, or a
 /// permutation index is negative / out of range.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ordered_test self-oracle (source/test separation)
 pub(crate) fn ordered_approx_delta(tree: &OrderedTree) -> CbResult<Vec<f64>> {
     let n = tree.permutation.len();
     if tree.leaf_of.len() < n || tree.der.len() < n {
@@ -177,6 +179,7 @@ pub(crate) fn ordered_approx_delta(tree: &OrderedTree) -> CbResult<Vec<f64>> {
 /// # Errors
 /// [`CbError::OutOfRange`] on the (f64-less) wgpu backend; propagates any
 /// [`ordered_approx_delta`] error or a device read-back failure.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ordered_test self-oracle (source/test separation)
 pub(crate) fn accumulate_ordered_trajectory(trees: &[OrderedTree], n: usize) -> CbResult<Vec<f64>> {
     #[cfg(feature = "wgpu")]
     {
