@@ -63,3 +63,52 @@ fn rmse_weighted_matches_upstream() {
     let weight = load_f64_vec(&fixture("weight.npy")).unwrap();
     gate(EvalMetric::Rmse, "rmse_weighted.npy", &weight);
 }
+
+// EM-05 — flat Min-optimized metrics (MAE / MAPE / Quantile) parity ≤1e-5.
+// Each `gate(...)` call routes the metric through `calc_metric` → the flat
+// `eval` path, so these tests ALSO constitute the flat-routing SUCCESS
+// assertion deferred from EMT-5: the three metrics `calc_metric`-succeed and
+// `is_ranking` is `false` for them (a ranking metric would panic in `gate`
+// because `calc_metric` would take the grouped path and fail without groups).
+
+#[test]
+fn mae_matches_upstream() {
+    gate(EvalMetric::Mae, "mae.npy", &[]);
+}
+
+#[test]
+fn mape_matches_upstream() {
+    // The frozen `{0,1}` label carries zero-target rows, so this gate is the R1
+    // arbiter: `max(1.0, |t|)` is the ONLY divisor convention that reproduces the
+    // committed upstream scalar (`max(EPS,|t|)` explodes to ~1e37, skip-zero
+    // undershoots). R1 RESOLVED against `catboost==1.2.10`.
+    gate(EvalMetric::Mape, "mape.npy", &[]);
+}
+
+#[test]
+fn quantile_default_matches_upstream() {
+    // Default alpha 0.5 (== 0.5·MAE).
+    gate(EvalMetric::Quantile { alpha: 0.5 }, "quantile_default.npy", &[]);
+}
+
+#[test]
+fn quantile_alpha90_matches_upstream() {
+    // R2 — asymmetric alpha; confirms the pinball weighting/alpha convention.
+    gate(EvalMetric::Quantile { alpha: 0.9 }, "quantile_a90.npy", &[]);
+}
+
+#[test]
+fn mae_weighted_matches_upstream() {
+    let weight = load_f64_vec(&fixture("weight.npy")).unwrap();
+    gate(EvalMetric::Mae, "mae_weighted.npy", &weight);
+}
+
+#[test]
+fn quantile_default_weighted_matches_upstream() {
+    let weight = load_f64_vec(&fixture("weight.npy")).unwrap();
+    gate(
+        EvalMetric::Quantile { alpha: 0.5 },
+        "quantile_default_weighted.npy",
+        &weight,
+    );
+}

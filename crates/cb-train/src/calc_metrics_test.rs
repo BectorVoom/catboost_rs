@@ -8,6 +8,7 @@
 use super::{calc_metric, eval_metric, parse_metric};
 use crate::ranking_metrics::{AucType, DcgDenominator, DcgMetricType};
 use crate::EvalMetric;
+use cb_core::CbError;
 
 // --- ORCH-04-S1: metric-descriptor parser -----------------------------------
 
@@ -126,6 +127,48 @@ fn parse_rejects_unknown() {
     assert!(parse_metric("NDCG:top").is_err());
     // Duplicate key.
     assert!(parse_metric("NDCG:top=1:top=2").is_err());
+}
+
+// --- EM-04 / EM-03 parse: MAE / MAPE / Quantile[:alpha] ---------------------
+// PARSE-ONLY (EMT-5). Asserts the three new names parse to the right variants
+// (case-insensitive), Quantile's `alpha` param + its 0.5 default, and that bogus
+// params are rejected with a typed `CbError::Degenerate`. The flat-routing
+// SUCCESS probe (`calc_metric` on these succeeds, `is_ranking` false) is EMT-6's
+// oracle gate — deliberately NOT asserted here.
+
+#[test]
+fn parse_mae_mape_quantile() {
+    // Case-insensitive metric names -> the matching Min-optimized flat variants.
+    assert_eq!(parse_metric("MAE").unwrap(), EvalMetric::Mae);
+    assert_eq!(parse_metric("mape").unwrap(), EvalMetric::Mape);
+    // Quantile with an explicit alpha param.
+    assert_eq!(
+        parse_metric("Quantile:alpha=0.3").unwrap(),
+        EvalMetric::Quantile { alpha: 0.3 }
+    );
+    // Quantile with no param defaults alpha to 0.5 (both casings).
+    assert_eq!(
+        parse_metric("Quantile").unwrap(),
+        EvalMetric::Quantile { alpha: 0.5 }
+    );
+    assert_eq!(
+        parse_metric("quantile").unwrap(),
+        EvalMetric::Quantile { alpha: 0.5 }
+    );
+}
+
+#[test]
+fn parse_rejects_bad_quantile_param() {
+    // `beta` is not a Quantile param key -> reject_unknown fires.
+    assert!(matches!(
+        parse_metric("quantile:beta=1"),
+        Err(CbError::Degenerate(_))
+    ));
+    // MAE takes no params -> `top` is unknown.
+    assert!(matches!(
+        parse_metric("mae:top=2"),
+        Err(CbError::Degenerate(_))
+    ));
 }
 
 // --- ORCH-04-S2 (weighting): deterministic hand-computed weighted RMSE -------

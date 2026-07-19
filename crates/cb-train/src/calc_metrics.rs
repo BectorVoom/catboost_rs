@@ -20,7 +20,7 @@ use crate::EvalMetric;
 /// parser's error message steers callers), plus the note that `Custom` is
 /// program-constructed only and never string-parsed (SPEC §9 Q2).
 const DEFERRED_METRICS: &str =
-    "deferred (not yet in EvalMetric): AUC, Accuracy, F1, Precision, Recall, R2, MAE, MAPE; \
+    "deferred (not yet in EvalMetric): AUC, Accuracy, F1, Precision, Recall, R2; \
      `Custom` is program-constructed only (never parsed from a string)";
 
 /// A parsed `key=value` param token list (lowercased keys, raw values).
@@ -167,6 +167,20 @@ pub fn parse_metric(descr: &str) -> CbResult<EvalMetric> {
             p.reject_unknown(name, &[])?;
             EvalMetric::Msle
         }
+        "mae" => {
+            p.reject_unknown(name, &[])?;
+            EvalMetric::Mae
+        }
+        "mape" => {
+            p.reject_unknown(name, &[])?;
+            EvalMetric::Mape
+        }
+        "quantile" => {
+            p.reject_unknown(name, &["alpha"])?;
+            EvalMetric::Quantile {
+                alpha: p.f64_or("alpha", 0.5, name)?,
+            }
+        }
         "ndcg" => {
             p.reject_unknown(name, &["top", "type", "denominator"])?;
             EvalMetric::Ndcg {
@@ -232,8 +246,9 @@ pub fn parse_metric(descr: &str) -> CbResult<EvalMetric> {
         }
         other => {
             return Err(CbError::Degenerate(format!(
-                "unknown metric name `{other}`; supported: RMSE, Logloss, MSLE, NDCG, DCG, MAP, \
-                 MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC; {DEFERRED_METRICS}"
+                "unknown metric name `{other}`; supported: RMSE, Logloss, MSLE, MAE, MAPE, \
+                 Quantile, NDCG, DCG, MAP, MRR, ERR, PFound, PrecisionAt, RecallAt, QueryAUC; \
+                 {DEFERRED_METRICS}"
             )));
         }
     };

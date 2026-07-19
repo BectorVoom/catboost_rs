@@ -405,10 +405,37 @@ def gen_calc_metrics_flat() -> None:
             "value": [float(v) for v in arr],
         }
 
+    def freeze_weighted(name: str, metric: str) -> None:
+        """Freeze a weighted scenario ONLY if `catboost.utils.eval_metric`
+        actually accepts `weight=` for `metric` in this catboost version. A
+        `weight=`-unsupported metric must NOT silently emit a bogus fixture
+        (EMT-6): skip it and record the skip in summary.json."""
+        try:
+            freeze(name, metric, weight=weight)
+        except Exception as exc:  # noqa: BLE001 — record + skip, never emit bogus
+            summary["scenarios"][name] = {
+                "metric": metric,
+                "weighted": True,
+                "skipped": f"weight= unsupported: {type(exc).__name__}: {exc}",
+            }
+            print(f"skip {name}: weight= unsupported for {metric}: {exc}")
+
     freeze("rmse", "RMSE")
     freeze("logloss", "Logloss")
     freeze("msle", "MSLE")
     freeze("rmse_weighted", "RMSE", weight=weight)
+
+    # EM-05 — flat Min-optimized metrics (EMT-6). The frozen `{0,1}` label
+    # carries zero-target rows, so `mape` is the R1 divisor arbiter.
+    freeze("mae", "MAE")
+    freeze("mape", "MAPE")
+    freeze("quantile_default", "Quantile")  # alpha default 0.5
+    freeze("quantile_a90", "Quantile:alpha=0.9")  # R2 asymmetric alpha
+    # Weighted variants — verified `weight=`-supported for MAE/Quantile in
+    # catboost 1.2.10, but freeze via try/skip so a version that rejects
+    # `weight=` does not emit a bogus fixture.
+    freeze_weighted("mae_weighted", "MAE")
+    freeze_weighted("quantile_default_weighted", "Quantile")
 
     (CALC_METRICS_DIR / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
