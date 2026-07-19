@@ -19,8 +19,40 @@ use cb_model::{
     predict_raw, prediction_values_change, save_cbm, save_json, shap_values,
     FeatureImportanceType, PartialDependence, PredictionType,
 };
+use cb_train::{parse_metric, EvalMetric};
 
 use crate::error::CatBoostError;
+
+/// Map a trained-loss name to its Min-optimized [`EvalMetric`] for
+/// `LossFunctionChange` (FL-03). Only the supported numeric losses `RMSE`,
+/// `MAE`, `MAPE`, `Quantile[:alpha=..]`, and `Logloss` are accepted — the base
+/// name (before any `:param` suffix) is checked case-insensitively against this
+/// explicit allow-list, then the full descriptor is parsed by
+/// [`cb_train::parse_metric`] (which resolves e.g. `Quantile`'s `alpha`). A
+/// Max-optimized (`AUC`/`Accuracy`/`R²`), ranking (`NDCG`/…), out-of-scope
+/// (`MSLE`), or unknown loss yields [`CatBoostError::UnsupportedLoss`], never a
+/// silent fallback. A malformed *param* on a supported base name also yields
+/// `UnsupportedLoss`, but with the underlying [`cb_train::parse_metric`] reason
+/// appended so the caller can see the loss IS supported and only the param is
+/// wrong.
+///
+/// The base name is `trim`med (like `parse_metric` itself) so a cosmetically
+/// whitespaced descriptor (`" RMSE"`) is not spuriously rejected.
+///
+/// **Quantile caveat:** the model file carries no loss metadata (Q1), so the
+/// caller supplies `loss`; a bare `"Quantile"` resolves the default `alpha=0.5`.
+/// If the model was trained at a different `alpha`, pass the full
+/// `"Quantile:alpha=.."` descriptor — otherwise the pinball final error is
+/// evaluated at the wrong quantile (the facade cannot detect the mismatch).
+fn eval_metric_for_loss(loss: &str) -> Result<EvalMetric, CatBoostError> {
+    let lower = loss.to_ascii_lowercase();
+    let base = lower.split(':').next().unwrap_or(lower.as_str()).trim();
+    match base {
+        "rmse" | "logloss" | "mae" | "mape" | "quantile" => parse_metric(loss)
+            .map_err(|e| CatBoostError::UnsupportedLoss(format!("{loss} ({e})"))),
+        _ => Err(CatBoostError::UnsupportedLoss(loss.to_owned())),
+    }
+}
 
 /// A trained CatBoost model (the published facade over [`cb_model::Model`]).
 ///
@@ -164,24 +196,46 @@ impl Model {
     /// [`FeatureImportanceType::Interaction`]) ignore the dataset and delegate to
     /// [`Model::feature_importance`].
     ///
+    /// For [`FeatureImportanceType::LossFunctionChange`], `loss` names the
+    /// model's trained objective (case-insensitive); the model file carries no
+    /// loss metadata (Q1), so the caller supplies it. Only the Min-optimized
+    /// numeric losses `RMSE`, `MAE`, `MAPE`, `Quantile[:alpha=..]`, and `Logloss`
+    /// are supported in this slice — any other (Max-optimized, ranking, or
+    /// unknown) loss yields [`CatBoostError::UnsupportedLoss`] rather than a
+    /// silent wrong-metric fallback (FL-03). `loss` is ignored by the
+    /// structure-only variants.
+    ///
     /// # Errors
-    /// [`CatBoostError`] if the pool's feature columns cannot be projected.
+    /// [`CatBoostError::FeatureMismatch`] if the pool's feature columns cannot be
+    /// projected; [`CatBoostError::UnsupportedLoss`] for an out-of-scope
+    /// `LossFunctionChange` loss name.
     pub fn feature_importance_with_data(
         &self,
         importance_type: FeatureImportanceType,
         pool: &Pool,
+        loss: &str,
     ) -> Result<Vec<(usize, usize, f64)>, CatBoostError> {
         match importance_type {
             FeatureImportanceType::PredictionValuesChange
             | FeatureImportanceType::Interaction => Ok(self.feature_importance(importance_type)),
             FeatureImportanceType::LossFunctionChange => {
+                // Map the trained loss → its Min-optimized `EvalMetric`; reject
+                // anything outside the supported numeric set (no silent Logloss).
+                let metric = eval_metric_for_loss(loss)?;
                 let columns = self.feature_columns(pool)?;
-                let labels = pool.label().to_vec();
+                // Inject the metric's `GetFinalError` as a non-panicking closure.
+                // Weights: unit only — this first slice ignores per-object `Pool`
+                // weights (SPEC R3), matching the retained Logloss path; a weighted
+                // pool would diverge from upstream's weighted `GetFinalError`, so
+                // weighted `LossFunctionChange` stays out of scope until a weighted
+                // oracle exists. A degenerate `eval` (length/empty/weight guard)
+                // yields `NaN` rather than panicking across the public boundary.
                 let scores = cb_model::loss_function_change(
                     &self.inner,
                     &columns,
-                    &labels,
+                    pool.label(),
                     self.n_float_features(),
+                    |approx, target| metric.eval(approx, target, &[]).unwrap_or(f64::NAN),
                 );
                 Ok(scores
                     .into_iter()

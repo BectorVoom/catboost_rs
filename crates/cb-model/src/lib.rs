@@ -24,9 +24,9 @@ mod predict;
 mod shap;
 
 pub use apply::{
-    apply_virtual_ensembles, binarize_feature, ctr_value_for_combined_projection,
-    ctr_value_for_projection, predict_raw, predict_raw_cat, predict_raw_multi,
-    predict_raw_multi_biased,
+    apply_virtual_ensembles, binarize_feature, collect_leaves_statistics,
+    ctr_value_for_combined_projection, ctr_value_for_projection, predict_raw, predict_raw_cat,
+    predict_raw_multi, predict_raw_multi_biased,
 };
 pub use cbm::{decode_cbm, load_cbm, save_cbm, CBM1, FLATBUFFERS_MODEL_V1};
 pub use ctr_data::{
@@ -36,7 +36,8 @@ pub use ctr_data::{
 pub use error::ModelError;
 pub use export::{export_onnx, OnnxExportError};
 pub use fstr::{
-    interaction, loss_function_change, prediction_values_change, FeatureImportanceType,
+    interaction, loss_function_change, loss_function_change_logloss, prediction_values_change,
+    prediction_values_change_with_data, FeatureImportanceType,
 };
 pub use json::{decode_json, load_json, save_json};
 pub use model::{

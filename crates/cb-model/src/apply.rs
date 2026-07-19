@@ -626,6 +626,78 @@ fn apply_tree_slice_one(
     out
 }
 
+/// Per-tree leaf statistics over a dataset (upstream `CollectLeavesStatistics`,
+/// `catboost/libs/fstr/util.cpp` v1.2.10): apply every tree to every object via
+/// the SAME leaf-assignment walk the predict path uses ([`leaf_index_for`] /
+/// [`leaf_index_nonsym`]) and add `1.0` per document to the landed leaf's slot
+/// (unit document weights — upstream falls back to `+= 1.0` when the pool's
+/// weights are trivial, which is the only mode this port supports).
+///
+/// The outer Vec lists oblivious trees first, then non-symmetric trees (a model
+/// is one kind or the other in practice); each inner Vec has one slot per
+/// STRUCTURAL leaf (`leaf_values.len() / approx_dimension`). This is the
+/// dataset-weights substrate of
+/// [`crate::prediction_values_change_with_data`] — for online-CTR models
+/// these statistics genuinely differ from the stored training-time
+/// `leaf_weights`, because training assigns documents by online (prefix) CTR
+/// values while this walk uses the final baked tables. A malformed
+/// non-symmetric walk ([`leaf_index_nonsym`] `None`) contributes nothing for
+/// that document, mirroring the apply path's defensive discipline.
+#[must_use]
+pub fn collect_leaves_statistics(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    cat_columns: &[Vec<String>],
+) -> Vec<Vec<f64>> {
+    let dim = model.approx_dimension.max(1);
+    let mut stats: Vec<Vec<f64>> = model
+        .oblivious_trees
+        .iter()
+        .map(|t| vec![0.0_f64; t.leaf_values.len() / dim])
+        .chain(
+            model
+                .non_symmetric_trees
+                .iter()
+                .map(|t| vec![0.0_f64; t.leaf_values.len() / dim]),
+        )
+        .collect();
+
+    let n_float_objs = feature_values.first().map_or(0, Vec::len);
+    let n_cat_objs = cat_columns.first().map_or(0, Vec::len);
+    let n_objects = n_float_objs.max(n_cat_objs);
+    let nonsym_base = model.oblivious_trees.len();
+
+    for obj in 0..n_objects {
+        // Gather rows exactly as `predict_raw_cat` does (checked `.get`; a
+        // short float column reads NaN, failing every strict `> border` test).
+        let row: Vec<f32> = feature_values
+            .iter()
+            .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+            .collect();
+        let cats: Vec<String> = cat_columns
+            .iter()
+            .map(|col| col.get(obj).cloned().unwrap_or_default())
+            .collect();
+
+        for (tree_idx, tree) in model.oblivious_trees.iter().enumerate() {
+            let leaf = leaf_index_for(model, tree, &row, &cats);
+            if let Some(slot) = stats.get_mut(tree_idx).and_then(|s| s.get_mut(leaf)) {
+                *slot += 1.0;
+            }
+        }
+        for (tree_idx, tree) in model.non_symmetric_trees.iter().enumerate() {
+            if let Some(leaf) = leaf_index_nonsym(model, tree, &row, &cats) {
+                if let Some(slot) =
+                    stats.get_mut(nonsym_base + tree_idx).and_then(|s| s.get_mut(leaf))
+                {
+                    *slot += 1.0;
+                }
+            }
+        }
+    }
+    stats
+}
+
 /// Apply the trained model's virtual-ensemble slicing (`apply.cpp:526-600`),
 /// producing the per-ensemble RAW approx matrix in OBJECT-MAJOR
 /// `(n, virtual_ensembles_count, approx_dimension)` flat layout — value at index

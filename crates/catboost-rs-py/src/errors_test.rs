@@ -174,3 +174,15 @@ fn export_encode_maps_to_base_error() {
         assert!(!err.is_instance_of::<CatBoostValueError>(py));
     });
 }
+
+/// `UnsupportedLoss` -> `CatBoostValueError` (an out-of-scope
+/// LossFunctionChange loss name is a bad-input value error, like
+/// `FeatureMismatch` / `PartialDependence`; FSTR-02 FL-03).
+#[test]
+fn unsupported_loss_maps_to_value_error() {
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::UnsupportedLoss("AUC".to_owned()));
+        assert!(err.is_instance_of::<CatBoostValueError>(py));
+        assert!(err.value(py).to_string().contains("AUC"));
+    });
+}

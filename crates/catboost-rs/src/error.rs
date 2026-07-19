@@ -82,4 +82,15 @@ pub enum CatBoostError {
     /// with `?` via `#[from]`.
     #[error("ONNX export error: {0}")]
     Export(#[from] cb_model::OnnxExportError),
+
+    /// A [`crate::Model::feature_importance_with_data`]
+    /// [`cb_model::FeatureImportanceType::LossFunctionChange`] request named a
+    /// loss the first slice does not support (FSTR-02, FL-03). Only the
+    /// Min-optimized numeric losses `RMSE`, `MAE`, `MAPE`, `Quantile`, and
+    /// `Logloss` are accepted; a Max-optimized (`AUC`/`Accuracy`/`R²`), ranking,
+    /// or unknown loss name lands here — surfaced as a typed error rather than
+    /// silently falling back to a wrong Logloss score. Carries the offending
+    /// loss descriptor.
+    #[error("unsupported loss for LossFunctionChange: {0}")]
+    UnsupportedLoss(String),
 }

@@ -122,6 +122,13 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         // An invalid partial-dependence request is a bad-input value error
         // (like FeatureMismatch): arity / out-of-range / duplicate / empty.
         FacadeError::PartialDependence(e) => CatBoostValueError::new_err(e.to_string()),
+        // An unsupported LossFunctionChange loss name is a bad-input value error
+        // (like FeatureMismatch / PartialDependence): the user named a loss the
+        // first slice does not support. Surface the full `Display`
+        // ("unsupported loss for LossFunctionChange: <name>"), not the bare inner
+        // name, so the Python message is self-describing (mirrors the
+        // `PartialDependence`/`Export` arms that use the error's `Display`).
+        FacadeError::UnsupportedLoss(_) => CatBoostValueError::new_err(err.to_string()),
         FacadeError::Export(e) => match e {
             cb_model::OnnxExportError::CategoricalFeaturesUnsupported
             | cb_model::OnnxExportError::NonObliviousTreesUnsupported
