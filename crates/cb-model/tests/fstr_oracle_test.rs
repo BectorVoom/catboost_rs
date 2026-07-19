@@ -25,7 +25,8 @@
 use std::path::PathBuf;
 
 use cb_model::{
-    interaction, load_cbm, loss_function_change, prediction_values_change, Model, ModelSplit,
+    interaction, load_cbm, loss_function_change, loss_function_change_logloss,
+    prediction_values_change, Model, ModelSplit,
     ObliviousTree, Split,
 };
 use cb_oracle::{load_f64_vec, load_model_json, ModelJson};
@@ -175,7 +176,9 @@ fn loss_function_change_matches_upstream_within_tol() {
         .expect("binclf_y.npy must load");
 
     let n_features = model.float_feature_borders.len().max(4);
-    let lfc = loss_function_change(&model, &cols, &labels, n_features);
+    // FL-02: the Logloss-defaulted wrapper reproduces the pre-FL-01 behavior
+    // byte-for-byte (binary model → Logloss `GetFinalError`).
+    let lfc = loss_function_change_logloss(&model, &cols, &labels, n_features);
 
     let expected =
         load_f64_vec(&fixture("fstr_loss_change/oblivious_loss_function_change.npy"))
@@ -195,6 +198,128 @@ fn loss_function_change_matches_upstream_within_tol() {
             (got - want).abs()
         );
     }
+}
+
+// ── FSTR-02: per-numeric-loss LossFunctionChange (FL-04a / FL-04b) ──────────
+//
+// Each oblivious REGRESSOR trained with a distinct Min-optimized loss
+// (RMSE / MAE / MAPE / Quantile:alpha=0.5) is reconstructed from its committed
+// `.cbm` and its upstream `get_feature_importance('LossFunctionChange')` vector
+// reproduced <=1e-5 by feeding an INDEPENDENT hand-written final-error closure
+// (a stronger oracle than routing through the very `cb_train::EvalMetric` the
+// facade uses) into the generalized `loss_function_change`.
+
+/// Reproduce the `{tag}_loss_function_change.npy` fixture for the regressor in
+/// `{tag}_model.cbm` using the supplied final-error closure; assert <= TOL.
+fn assert_regression_lfc_matches<F: Fn(&[f64], &[f64]) -> f64>(tag: &str, final_error: F) {
+    let model = load_cbm(&fixture(&format!("fstr_loss_change/{tag}_model.cbm")))
+        .unwrap_or_else(|e| panic!("{tag}_model.cbm must load: {e:?}"));
+    assert!(
+        model.non_symmetric_trees.is_empty() && !model.oblivious_trees.is_empty(),
+        "{tag}_model.cbm must be a pure oblivious model"
+    );
+    let cols = load_columns(&format!("fstr_loss_change/{tag}_X.npy"));
+    let labels = load_f64_vec(&fixture(&format!("fstr_loss_change/{tag}_y.npy")))
+        .unwrap_or_else(|e| panic!("{tag}_y.npy must load: {e:?}"));
+    let expected =
+        load_f64_vec(&fixture(&format!("fstr_loss_change/{tag}_loss_function_change.npy")))
+            .unwrap_or_else(|e| panic!("{tag}_loss_function_change.npy must load: {e:?}"));
+
+    let n_features = expected.len();
+    let lfc = loss_function_change(&model, &cols, &labels, n_features, final_error);
+    assert_eq!(lfc.len(), expected.len(), "{tag} LFC length mismatch");
+    for (i, (&got, &want)) in lfc.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() <= TOL,
+            "{tag} LFC[{i}] diverges: got {got}, want {want} (|d|={})",
+            (got - want).abs()
+        );
+    }
+}
+
+/// RMSE `GetFinalError` = `sqrt(mean((a − t)^2))`.
+fn rmse_final_error(approx: &[f64], target: &[f64]) -> f64 {
+    let n = approx.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let sq: Vec<f64> = approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| (a - t) * (a - t))
+        .collect();
+    (cb_core::sum_f64(&sq) / n as f64).sqrt()
+}
+
+/// MAE `GetFinalError` = `mean(|a − t|)`.
+fn mae_final_error(approx: &[f64], target: &[f64]) -> f64 {
+    let n = approx.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let ad: Vec<f64> = approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| (a - t).abs())
+        .collect();
+    cb_core::sum_f64(&ad) / n as f64
+}
+
+/// MAPE `GetFinalError` = `mean(|a − t| / max(1, |t|))` — the upstream
+/// `TMAPEMetric` divisor convention pinned by the eval-metric-extension oracle.
+fn mape_final_error(approx: &[f64], target: &[f64]) -> f64 {
+    let n = approx.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let ape: Vec<f64> = approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| (a - t).abs() / t.abs().max(1.0))
+        .collect();
+    cb_core::sum_f64(&ape) / n as f64
+}
+
+/// Quantile(alpha) `GetFinalError` = `mean(pinball(a, t, alpha))`,
+/// `pinball = t >= a ? alpha·(t − a) : (1 − alpha)·(a − t)`.
+fn quantile_final_error(approx: &[f64], target: &[f64], alpha: f64) -> f64 {
+    let n = approx.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let pin: Vec<f64> = approx
+        .iter()
+        .zip(target.iter())
+        .map(|(&a, &t)| {
+            let d = t - a;
+            if d >= 0.0 {
+                alpha * d
+            } else {
+                (1.0 - alpha) * -d
+            }
+        })
+        .collect();
+    cb_core::sum_f64(&pin) / n as f64
+}
+
+#[test]
+fn loss_function_change_rmse_matches_upstream_within_tol() {
+    assert_regression_lfc_matches("rmse", rmse_final_error);
+}
+
+#[test]
+fn loss_function_change_mae_matches_upstream_within_tol() {
+    assert_regression_lfc_matches("mae", mae_final_error);
+}
+
+#[test]
+fn loss_function_change_mape_matches_upstream_within_tol() {
+    assert_regression_lfc_matches("mape", mape_final_error);
+}
+
+#[test]
+fn loss_function_change_quantile_matches_upstream_within_tol() {
+    assert_regression_lfc_matches("quantile", |a, t| quantile_final_error(a, t, 0.5));
 }
 
 // ── Non-symmetric PVC / Interaction (D-6.6-10) ──────────────────────────────

@@ -2,8 +2,8 @@
 //! errors, and per-type Calc (Security V5, T-05-04-V5 / T-05-04-01).
 
 use crate::ctr_data::{
-    calc_inference, decode_ctr_data, encode_ctr_data, CtrData, CtrTableJson, CtrValueTable,
-    ECtrType, Prior,
+    calc_inference, ctr_base_key, decode_ctr_data, decode_ctr_model_parts, encode_ctr_data,
+    encode_ctr_model_parts, CtrData, CtrTableJson, CtrValueTable, ECtrType, Prior,
 };
 use std::collections::BTreeMap;
 
@@ -175,4 +175,59 @@ fn empty_ctr_data_round_trips() {
     let back = decode_ctr_data(&blob).expect("decode empty");
     assert_eq!(back, data);
     assert!(back.tables.is_empty());
+}
+
+// ── T3 — upstream model-parts tail ENCODER round-trips via the decoder ────────
+
+#[test]
+fn encode_ctr_model_parts_roundtrips_via_decode() {
+    // A Borders table (width 2) keyed by proj=[0] and a Counter table (width 1,
+    // counter_denominator set) keyed by proj=[1] — the projection is recovered
+    // from the KEY on encode, so the keys MUST be the canonical `ctr_base_key`.
+    let mut tables = BTreeMap::new();
+    tables.insert(ctr_base_key(ECtrType::Borders, &[0]), borders_table());
+    tables.insert(ctr_base_key(ECtrType::Counter, &[1]), counter_table());
+    let data = CtrData { tables };
+
+    let bytes = encode_ctr_model_parts(&data).expect("encode_ctr_model_parts");
+    let back = decode_ctr_model_parts(&bytes).expect("decode_ctr_model_parts");
+    assert_eq!(back, data, "encode -> decode must reproduce the CtrData");
+}
+
+#[test]
+fn encode_ctr_model_parts_rejects_mean_table() {
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        ctr_base_key(ECtrType::FloatTargetMeanValue, &[0]),
+        CtrValueTable {
+            ctr_type: ECtrType::FloatTargetMeanValue,
+            target_classes_count: 2,
+            hashes: vec![5],
+            int_counts: Vec::new(),
+            mean: vec![(6.0, 2)],
+            counter_denominator: 0,
+        },
+    );
+    assert!(encode_ctr_model_parts(&CtrData { tables }).is_err());
+}
+
+#[test]
+fn encode_ctr_model_parts_rejects_marker_hash() {
+    // A bucket hash == 0xFFFF_FFFF_FFFF_FFFF would read back as an empty slot and
+    // corrupt bucket_count — the encoder must reject it (never a silent mis-save).
+    let mut t = borders_table();
+    t.hashes = vec![0xFFFF_FFFF_FFFF_FFFF, 20, 30];
+    let mut tables = BTreeMap::new();
+    tables.insert(ctr_base_key(ECtrType::Borders, &[0]), t);
+    assert!(encode_ctr_model_parts(&CtrData { tables }).is_err());
+}
+
+#[test]
+fn encode_ctr_model_parts_rejects_count_exceeding_i32() {
+    // A CTRBlob value that overflows i32 is a typed error, never `as` truncation.
+    let mut t = borders_table();
+    t.int_counts = vec![vec![i64::from(i32::MAX) + 1, 0], vec![1, 1], vec![0, 1]];
+    let mut tables = BTreeMap::new();
+    tables.insert(ctr_base_key(ECtrType::Borders, &[0]), t);
+    assert!(encode_ctr_model_parts(&CtrData { tables }).is_err());
 }

@@ -44,6 +44,57 @@
 //! `finalError` is the mean per-object Logloss (best value = Min, so the score
 //! is used verbatim — `CalcFeatureEffectLossChangeFromScores`).
 //!
+//! # CTR-aware attribution (FSTR-01: FIC-01/FIC-02/FIC-03)
+//!
+//! `prediction_values_change` and `interaction` are CTR-aware: a
+//! `ModelSplit::Ctr` split's effect is attributed to the underlying
+//! categorical feature(s) its projection combines, not silently dropped. Both
+//! functions place categorical contributions into a **combined flat index**
+//! ([`cat_feature_count`], [`flat_cat_index`]) that extends the existing
+//! float-only layout — floats occupy `[0, n_float)` (unchanged,
+//! [`feature_count`]), categoricals occupy `[n_float, n_float +
+//! cat_feature_count(model))`. For a float-only model this is byte-identical
+//! to the pre-CTR-aware behavior (regression-locked by the existing
+//! `fstr_oracle_test.rs` assertions).
+//!
+//! - **`interaction`** (matching upstream `CalcMostInteractingFeatures` +
+//!   `CalcFeatureInteraction`, `feature_str.cpp:190-223` / `calc_fstr.cpp:343-414`
+//!   v1.2.10): split levels are first grouped by INTERNAL feature identity
+//!   ([`same_internal_feature`] — a `Float` split's feature index, or a `Ctr`
+//!   split's full border-less CTR descriptor, upstream `TFeature`/`GetFeature`).
+//!   Level pairs of the SAME internal feature are skipped outright (upstream's
+//!   `srcFeature1 == srcFeature2 → continue`); each surviving pair's `|delta|`
+//!   accumulates into a per-internal-PAIR score. Only then does
+//!   `CalcFeatureInteraction` expand each internal pair to combined-flat
+//!   indices ([`split_flat_indices`]): each cross-product cell `(f0 ∈ side0) ×
+//!   (f1 ∈ side1)` gets `score / (side0.len() * side1.len())`, self-cells
+//!   (`f0 == f1`) are dropped from the OUTPUT — but the pair's FULL `score`
+//!   still enters `totalEffect` (upstream `totalEffect += effect` sits outside
+//!   the cross-product loops), so dropped self-cell mass deflates every
+//!   returned percentage. The oblivious arm's `delta` is a fully-aggregated,
+//!   pre-`abs()` scalar; the non-symmetric DFS arm accumulates SIGNED
+//!   per-internal-pair sums with magnitude taken exactly once per tree
+//!   (`sumInteractions[pair] += fabs(treeSum)`), preserving cross-leaf
+//!   sign-cancellation.
+//! - **`prediction_values_change`** (matching upstream
+//!   `CalcRegularFeatureEffect`, `calc_fstr.cpp` v1.2.10): a `Ctr` split's
+//!   `dif` (unchanged math) is divided EQUALLY across its projection's
+//!   constituent categorical features' flat slots (no cross-product — one
+//!   split's own effect, not a pair). The output vector widens to
+//!   `n_float + cat_feature_count(model)` to hold the categorical slots.
+//!   [`prediction_values_change_with_data`] is upstream's `data=pool` mode
+//!   (`CollectLeavesStatistics`, `fstr/util.cpp`): the per-leaf weights are
+//!   recomputed from the provided dataset via the APPLY path instead of the
+//!   model's stored training-time `leaf_weights` — the two genuinely differ
+//!   for online-CTR models (training-time online CTR values assign documents
+//!   to different leaves than the final baked apply-time tables).
+//!
+//! `interaction`/`prediction_values_change`'s public signatures and return
+//! TYPES are unchanged; only the returned index range widens for CTR-bearing
+//! models. Out of scope: one-hot cat splits / float-in-CTR (`BinFeatures`) —
+//! this codebase's `TProjection` is categorical-only, so upstream's
+//! `BinFeatures`/`OneHotFeatures` expansion terms are vacuous here.
+//!
 //! # Parity discipline
 //!
 //! Every float fold routes through [`cb_core::sum_f64`] (D-08). All leaf / weight
@@ -99,6 +150,46 @@ fn feature_count(model: &Model) -> usize {
     oblivious_max.max(non_symmetric_max)
 }
 
+/// The number of DISTINCT categorical feature indices referenced by any
+/// `ModelSplit::Ctr` split's projection, across BOTH tree kinds — the
+/// categorical analogue of [`feature_count`] (SPEC FIC-01). `max(local cat
+/// index) + 1`, mirroring `feature_count`'s "widen based on observed usage"
+/// convention; `0` if the model has no CTR splits.
+fn cat_feature_count(model: &Model) -> usize {
+    let oblivious_max = model
+        .oblivious_trees
+        .iter()
+        .flat_map(|t| t.splits.iter())
+        .filter_map(|s| match s {
+            crate::ModelSplit::Ctr(c) => c.projection.cat_features().iter().copied().max(),
+            crate::ModelSplit::Float(_) => None,
+        })
+        .map(|m| m + 1)
+        .max()
+        .unwrap_or(0);
+    let non_symmetric_max = model
+        .non_symmetric_trees
+        .iter()
+        .flat_map(|t| t.tree_splits.iter())
+        .filter_map(|s| match s {
+            crate::ModelSplit::Ctr(c) => c.projection.cat_features().iter().copied().max(),
+            crate::ModelSplit::Float(_) => None,
+        })
+        .map(|m| m + 1)
+        .max()
+        .unwrap_or(0);
+    oblivious_max.max(non_symmetric_max)
+}
+
+/// The combined flat index (§4) for a categorical feature's LOCAL index `c`
+/// (as it appears in `TProjection::cat_features()`), given the model's float
+/// width `n_float` (from [`feature_count`]). Always `n_float + c` — floats
+/// occupy `[0, n_float)`, categoricals occupy `[n_float, n_float +
+/// cat_feature_count(model))` (SPEC FIC-01).
+const fn flat_cat_index(n_float: usize, local_cat_index: usize) -> usize {
+    n_float + local_cat_index
+}
+
 /// `ConvertToPercents` (`feature_str.cpp`): scale `res` in place so it sums to
 /// 100. A zero total leaves the vector untouched (upstream divides by `total`;
 /// the importance is only computed for models with weighted leaves, so `total`
@@ -121,16 +212,61 @@ fn convert_to_percents(res: &mut [f64]) {
 /// 100.
 #[must_use]
 pub fn prediction_values_change(model: &Model) -> Vec<f64> {
+    pvc_impl(model, None)
+}
+
+/// `PredictionValuesChange` with a dataset — upstream's
+/// `get_feature_importance(type='PredictionValuesChange', data=pool)` mode
+/// (`CalcFeatureEffectAverageChange` with a dataset, `calc_fstr.cpp` v1.2.10):
+/// the per-leaf weights are recomputed from the provided columns via the APPLY
+/// path ([`crate::collect_leaves_statistics`], upstream
+/// `CollectLeavesStatistics`) instead of the model's stored training-time
+/// `leaf_weights`. For online-CTR models the two genuinely differ (documents
+/// land in different leaves under training-time online CTR values than under
+/// the final baked tables), so oracle parity against a `data=pool` fixture
+/// REQUIRES this mode. `feature_values` / `cat_columns` follow the
+/// [`crate::predict_raw_cat`] SoA convention (unit document weights).
+#[must_use]
+pub fn prediction_values_change_with_data(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    cat_columns: &[Vec<String>],
+) -> Vec<f64> {
+    let stats = crate::apply::collect_leaves_statistics(model, feature_values, cat_columns);
+    pvc_impl(model, Some(&stats))
+}
+
+/// Shared `PredictionValuesChange` body: `weights_override` is the
+/// dataset-recomputed per-tree leaf statistics (oblivious trees first, then
+/// non-symmetric, matching [`crate::collect_leaves_statistics`]'s layout);
+/// `None` uses each tree's stored `leaf_weights` (upstream's no-dataset arm).
+fn pvc_impl(model: &Model, weights_override: Option<&[Vec<f64>]>) -> Vec<f64> {
     let n_features = feature_count(model);
-    let mut res = vec![0.0_f64; n_features];
+    // The combined flat-index width (SPEC §4, FIC-03): a `Ctr` split's `dif`
+    // redistributes equally across its projection's categorical members'
+    // flat slots, `[n_features, n_features + cat_feature_count(model))`.
+    // `feature_count` itself stays LOCKED unchanged (regression discipline);
+    // widening `res` here is the ONLY place this vector's length is fixed —
+    // the two accumulate helpers below receive it as an already-sized slice
+    // and cannot widen it themselves.
+    let n_float = n_features;
+    let mut res = vec![0.0_f64; n_features + cat_feature_count(model)];
 
     // OBLIVIOUS arm — the literal pre-6.6 bit-indexed loop (D-6.6-05).
-    for tree in &model.oblivious_trees {
-        pvc_accumulate_oblivious(tree, &mut res);
+    for (tree_idx, tree) in model.oblivious_trees.iter().enumerate() {
+        let weights = weights_override
+            .and_then(|ws| ws.get(tree_idx))
+            .map_or(tree.leaf_weights.as_slice(), Vec::as_slice);
+        pvc_accumulate_oblivious(tree, weights, &mut res, n_float);
     }
-    // NON-SYMMETRIC arm — node-graph recursion (D-6.6-10).
-    for tree in &model.non_symmetric_trees {
-        pvc_accumulate_non_symmetric(tree, &mut res);
+    // NON-SYMMETRIC arm — node-graph recursion (D-6.6-10). Its statistics
+    // follow the oblivious trees' in `collect_leaves_statistics`'s layout.
+    let nonsym_base = model.oblivious_trees.len();
+    for (tree_idx, tree) in model.non_symmetric_trees.iter().enumerate() {
+        let weights = weights_override
+            .and_then(|ws| ws.get(nonsym_base + tree_idx))
+            .map_or(tree.leaf_weights.as_slice(), Vec::as_slice);
+        pvc_accumulate_non_symmetric(tree, weights, &mut res, n_float);
     }
 
     convert_to_percents(&mut res);
@@ -139,24 +275,38 @@ pub fn prediction_values_change(model: &Model) -> Vec<f64> {
 
 /// The OBLIVIOUS `PredictionValuesChange` accumulation (`CalcEffect`,
 /// `feature_str.h:233-270`) — bit-indexed leaf pairs `(leaf, leaf ^ (1<<bit))`.
-/// Kept BYTE-IDENTICAL to the pre-6.6 loop (D-6.6-05).
-fn pvc_accumulate_oblivious(tree: &crate::ObliviousTree, res: &mut [f64]) {
+/// The `count1`/`count2`/`avrg`/`dif` computation is BYTE-IDENTICAL to the
+/// pre-6.6 loop (D-6.6-05); only the post-`dif` "which slot(s) does this add
+/// to" step is CTR-aware (FIC-03): a `Float` split adds the FULL `dif` to its
+/// single slot (unchanged); a `Ctr` split divides `dif` EQUALLY across its
+/// projection's constituent categorical features' flat slots (no
+/// cross-product — a single split's own effect, not a pair).
+///
+/// `leaf_weights` is passed explicitly (rather than read off the tree) so the
+/// dataset-recomputed statistics of [`prediction_values_change_with_data`] can
+/// substitute for the stored training-time weights.
+fn pvc_accumulate_oblivious(
+    tree: &crate::ObliviousTree,
+    leaf_weights: &[f64],
+    res: &mut [f64],
+    n_float: usize,
+) {
     let leaf_count = tree.leaf_values.len();
     // for (feature = 0; feature < tree.SrcFeatures.size(); ++feature)
     for (feature_bit, split) in tree.splits.iter().enumerate() {
-        // Numeric-only importance: a CTR split has no single float-feature
-        // index, so it contributes nothing to the per-float-feature vector.
-        let Some(src_idx) = split.float_feature() else {
+        let target_slots = split_flat_indices(split, n_float);
+        if target_slots.is_empty() {
             continue;
-        };
+        }
+        let add_effect_divisor = target_slots.len() as f64;
         // for (leafIdx = 0; leafIdx < tree.Leaves.size(); ++leafIdx)
         for leaf_idx in 0..leaf_count {
             let inverted = leaf_idx ^ (1usize << feature_bit);
             if inverted < leaf_idx {
                 continue;
             }
-            let count1 = tree.leaf_weights.get(leaf_idx).copied().unwrap_or(0.0);
-            let count2 = tree.leaf_weights.get(inverted).copied().unwrap_or(0.0);
+            let count1 = leaf_weights.get(leaf_idx).copied().unwrap_or(0.0);
+            let count2 = leaf_weights.get(inverted).copied().unwrap_or(0.0);
             if count1 == 0.0 || count2 == 0.0 {
                 continue;
             }
@@ -165,9 +315,12 @@ fn pvc_accumulate_oblivious(tree: &crate::ObliviousTree, res: &mut [f64]) {
 
             let avrg = (val1 * count1 + val2 * count2) / (count1 + count2);
             let dif = (val1 - avrg).powi(2) * count1 + (val2 - avrg).powi(2) * count2;
+            let add_effect = dif / add_effect_divisor;
 
-            if let Some(slot) = res.get_mut(src_idx) {
-                *slot += dif;
+            for &slot_idx in &target_slots {
+                if let Some(slot) = res.get_mut(slot_idx) {
+                    *slot += add_effect;
+                }
             }
         }
     }
@@ -191,17 +344,27 @@ struct NodeInfo {
 /// terminal AND an interior node, so it is additionally pushed as a triangle.
 /// Pass 2 (LIFO over the triangle stack ⇒ bottom-up, since children appear after
 /// their parent in node order): combine the left/right child `NodeInfo`,
-/// accumulate `dif = (val1−avrg)²·c1 + (val2−avrg)²·c2` into `res[featureIdx]`,
-/// and store the merged parent `NodeInfo`. All reductions are scalar adds in the
-/// upstream order; `.get(...)` everywhere (depth-bounded by `node_count`,
-/// T-06.6-15).
-fn pvc_accumulate_non_symmetric(tree: &crate::NonSymmetricTree, res: &mut [f64]) {
+/// accumulate `dif = (val1−avrg)²·c1 + (val2−avrg)²·c2` into `res[featureIdx]`
+/// (FIC-03: a `Ctr` split's `dif` is instead divided EQUALLY across its
+/// projection's constituent categorical features' flat slots — see
+/// [`split_flat_indices`]), and store the merged parent `NodeInfo`. All
+/// reductions are scalar adds in the upstream order; `.get(...)` everywhere
+/// (depth-bounded by `node_count`, T-06.6-15).
+///
+/// `leaf_weights` is passed explicitly (see [`pvc_accumulate_oblivious`]) so
+/// dataset-recomputed statistics can substitute for the stored weights.
+fn pvc_accumulate_non_symmetric(
+    tree: &crate::NonSymmetricTree,
+    leaf_weights: &[f64],
+    res: &mut [f64],
+    n_float: usize,
+) {
     use std::collections::HashMap;
 
     let node_count = tree.step_nodes.len();
     let mut node_info: HashMap<usize, NodeInfo> = HashMap::new();
-    // (parent_node, left_child, right_child, feature_idx)
-    let mut triangles: Vec<(usize, usize, usize, usize)> = Vec::new();
+    // (parent_node, left_child, right_child, target_slots)
+    let mut triangles: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
 
     for node_idx in 0..node_count {
         let (left_diff, right_diff) = tree.step_nodes.get(node_idx).copied().unwrap_or((0, 0));
@@ -216,28 +379,32 @@ fn pvc_accumulate_non_symmetric(tree: &crate::NonSymmetricTree, res: &mut [f64])
                 .copied()
                 .map_or(usize::MAX, |v| v as usize);
             let value = tree.leaf_values.get(leaf_id).copied().unwrap_or(0.0);
-            let count = tree.leaf_weights.get(leaf_id).copied().unwrap_or(0.0);
+            let count = leaf_weights.get(leaf_id).copied().unwrap_or(0.0);
             node_info.insert(node_idx, NodeInfo { value, count });
             if left_diff == 0 && right_diff == 0 {
                 continue;
             }
         }
-        // Interior (possibly one-sided): record the triangle. A CTR split has no
-        // float-feature index and is skipped (numeric-only projection).
-        let Some(feature_idx) = tree
-            .tree_splits
-            .get(node_idx)
-            .and_then(crate::ModelSplit::float_feature)
-        else {
+        // Interior (possibly one-sided): record the triangle. FIC-03: the
+        // node's split expansion (a `Float` split's single slot, or a `Ctr`
+        // split's constituent cat features' flat slots) — an empty
+        // expansion (malformed empty-projection `Ctr` split, defensive)
+        // skips the node the same way the pre-FIC-03 code skipped a CTR
+        // split entirely.
+        let Some(split) = tree.tree_splits.get(node_idx) else {
             continue;
         };
+        let target_slots = split_flat_indices(split, n_float);
+        if target_slots.is_empty() {
+            continue;
+        }
         let left_child = node_idx.saturating_add(left_diff as usize);
         let right_child = node_idx.saturating_add(right_diff as usize);
-        triangles.push((node_idx, left_child, right_child, feature_idx));
+        triangles.push((node_idx, left_child, right_child, target_slots));
     }
 
     // LIFO pop = bottom-up (children were pushed after their parent).
-    while let Some((parent, left, right, feature_idx)) = triangles.pop() {
+    while let Some((parent, left, right, target_slots)) = triangles.pop() {
         let left_info = node_info.remove(&left).unwrap_or(NodeInfo { value: 0.0, count: 0.0 });
         let right_info = node_info.remove(&right).unwrap_or(NodeInfo { value: 0.0, count: 0.0 });
 
@@ -251,17 +418,79 @@ fn pvc_accumulate_non_symmetric(tree: &crate::NonSymmetricTree, res: &mut [f64])
         let denom = if sum_count != 0.0 { sum_count } else { 1.0 };
         let avrg = (val1 * count1 + val2 * count2) / denom;
         let dif = (val1 - avrg).powi(2) * count1 + (val2 - avrg).powi(2) * count2;
+        let add_effect = dif / target_slots.len() as f64;
 
-        if let Some(slot) = res.get_mut(feature_idx) {
-            *slot += dif;
+        for &slot_idx in &target_slots {
+            if let Some(slot) = res.get_mut(slot_idx) {
+                *slot += add_effect;
+            }
         }
         node_info.insert(parent, NodeInfo { value: avrg, count: sum_count });
     }
 }
 
-/// Accumulate `|delta|` for a sorted source-feature pair into the insertion-order
+/// Expand a single [`crate::ModelSplit`] to the list of combined-flat feature
+/// indices (SPEC §4) its effect attributes to: a `Float` split expands to its
+/// single float-feature index; a `Ctr` split expands to every constituent
+/// categorical feature's flat index (`flat_cat_index(n_float, c)` for each `c`
+/// in `projection.cat_features()`). Shared by `interaction()`'s oblivious and
+/// non-symmetric arms (FIC-02) and `prediction_values_change()`'s two
+/// accumulate helpers (FIC-03) so the expansion rule is defined exactly once.
+/// An empty result (a `Ctr` split with an empty projection — should not occur
+/// from `Model::from_trained`, but defensively) means "attributes to nothing".
+fn split_flat_indices(split: &crate::ModelSplit, n_float: usize) -> Vec<usize> {
+    match split {
+        crate::ModelSplit::Float(s) => vec![s.feature],
+        crate::ModelSplit::Ctr(c) => c
+            .projection
+            .cat_features()
+            .iter()
+            .map(|&x| flat_cat_index(n_float, x))
+            .collect(),
+    }
+}
+
+/// Whether two splits test the SAME internal feature (upstream `TFeature`
+/// equality, `GetFeature` in `feature_str.cpp` v1.2.10): a `Float` split's
+/// internal identity is its float-feature index (every border of a float
+/// feature is the same internal feature); a `Ctr` split's is its FULL
+/// border-less CTR descriptor (`TModelCtr`: projection + ctr type + prior +
+/// target border idx + shift + scale — the split `border` is NOT part of the
+/// identity, it lives in the binary split, not the feature). Two splits of
+/// different kinds are never the same internal feature.
+fn same_internal_feature(a: &crate::ModelSplit, b: &crate::ModelSplit) -> bool {
+    match (a, b) {
+        (crate::ModelSplit::Float(x), crate::ModelSplit::Float(y)) => x.feature == y.feature,
+        (crate::ModelSplit::Ctr(x), crate::ModelSplit::Ctr(y)) => {
+            x.projection == y.projection
+                && x.ctr_type == y.ctr_type
+                && x.prior == y.prior
+                && x.target_border_idx == y.target_border_idx
+                && x.shift == y.shift
+                && x.scale == y.scale
+        }
+        _ => false,
+    }
+}
+
+/// Intern `split`'s internal feature into `internal` (first-seen order,
+/// mirroring upstream `GetFeatureToIdxMap`'s insertion-order indexing) and
+/// return its index. Linear scan — internal feature counts are tiny (bounded
+/// by distinct split features, not trees × splits).
+fn intern_internal_feature(internal: &mut Vec<crate::ModelSplit>, split: &crate::ModelSplit) -> usize {
+    if let Some(pos) = internal.iter().position(|s| same_internal_feature(s, split)) {
+        pos
+    } else {
+        internal.push(split.clone());
+        internal.len() - 1
+    }
+}
+
+/// Accumulate a contribution for a sorted key pair into the insertion-order
 /// `(pairs, sums)` accumulator (a Vec keyed by pair rather than a hash map, so
 /// the iteration order is deterministic; the final score sort is by value).
+/// Used both for INTERNAL-feature pairs (the `sumInteractions` stage) and for
+/// the expanded combined-flat pairs (the `CalcFeatureInteraction` stage).
 fn interaction_add(pairs: &mut Vec<(usize, usize)>, sums: &mut Vec<f64>, a: usize, b: usize, contribution: f64) {
     if let Some(pos) = pairs.iter().position(|&p| p == (a, b)) {
         if let Some(slot) = sums.get_mut(pos) {
@@ -286,19 +515,43 @@ fn interaction_add(pairs: &mut Vec<(usize, usize)>, sums: &mut Vec<f64>, a: usiz
 /// **NOT** SHAP interaction values (that is the advanced-fstr plan).
 #[must_use]
 pub fn interaction(model: &Model) -> Vec<(usize, usize, f64)> {
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
-    let mut sums: Vec<f64> = Vec::new();
+    // Stage 1 (upstream `CalcInternalFeatureInteraction`): accumulate
+    // per-INTERNAL-feature-pair scores. `internal` interns each split's
+    // border-less internal identity ([`same_internal_feature`], first-seen
+    // order); `int_pairs`/`int_sums` are keyed by sorted internal-index pairs.
+    let mut internal: Vec<crate::ModelSplit> = Vec::new();
+    let mut int_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut int_sums: Vec<f64> = Vec::new();
+    // The combined flat-index float width (SPEC §4) — a CTR split's
+    // categorical members are attributed to `[n_float, n_float +
+    // cat_feature_count(model))`.
+    let n_float = feature_count(model);
 
-    // OBLIVIOUS arm — the literal pre-6.6 bit-indexed loop (D-6.6-05).
+    // OBLIVIOUS arm — the literal bit-indexed loop (`CalcMostInteractingFeatures`,
+    // `feature_str.cpp:190-223`; D-6.6-05).
     for tree in &model.oblivious_trees {
         let split_count = tree.splits.len();
         let leaf_count = tree.leaf_values.len();
         // for (firstIdx = 0; firstIdx < splits-1; ++firstIdx)
         for first_idx in 0..split_count.saturating_sub(1) {
             for second_idx in (first_idx + 1)..split_count {
+                let (Some(split1), Some(split2)) =
+                    (tree.splits.get(first_idx), tree.splits.get(second_idx))
+                else {
+                    continue;
+                };
+                let src1 = intern_internal_feature(&mut internal, split1);
+                let src2 = intern_internal_feature(&mut internal, split2);
+                // Two borders of the SAME internal feature interact with
+                // nothing — upstream `srcFeature1 == srcFeature2 → continue`
+                // BEFORE any accumulation, so the pair contributes to neither
+                // the output nor `totalEffect`.
+                if src1 == src2 {
+                    continue;
+                }
+
                 let n1 = 1usize << first_idx;
                 let n2 = 1usize << second_idx;
-
                 // delta = Σ_leaf sign·leafValue (order-locked, D-08).
                 let signed: Vec<f64> = (0..leaf_count)
                     .map(|leaf_idx| {
@@ -311,31 +564,55 @@ pub fn interaction(model: &Model) -> Vec<(usize, usize, f64)> {
                     .collect();
                 let delta = sum_f64(&signed);
 
-                // Numeric-only interaction: skip a pair that involves a CTR split
-                // (no single float-feature index).
-                let (Some(src1), Some(src2)) = (
-                    tree.splits.get(first_idx).and_then(crate::ModelSplit::float_feature),
-                    tree.splits.get(second_idx).and_then(crate::ModelSplit::float_feature),
-                ) else {
-                    continue;
-                };
-                if src1 == src2 {
-                    continue;
-                }
                 let (a, b) = if src1 < src2 { (src1, src2) } else { (src2, src1) };
-                interaction_add(&mut pairs, &mut sums, a, b, delta.abs());
+                interaction_add(&mut int_pairs, &mut int_sums, a, b, delta.abs());
             }
         }
     }
 
-    // NON-SYMMETRIC arm — per-tree signed DFS accumulation, then `|·|` per tree
-    // (D-6.6-10).
+    // NON-SYMMETRIC arm — per-tree signed DFS accumulation keyed by internal
+    // pair, then `|·|` per tree (D-6.6-10).
     for tree in &model.non_symmetric_trees {
-        interaction_accumulate_non_symmetric(tree, &mut pairs, &mut sums);
+        interaction_accumulate_non_symmetric(tree, &mut internal, &mut int_pairs, &mut int_sums);
     }
 
-    // CalcFeatureInteraction: score = sum / totalEffect * 100.
-    let total_effect = sum_f64(&sums);
+    // Stage 2 (`CalcFeatureInteraction`, `calc_fstr.cpp:343-414`): expand each
+    // internal pair to its combined-flat cross-product. Self-cells (`f0 ==
+    // f1`) are dropped from the OUTPUT, but the pair's FULL score still
+    // enters `totalEffect` (upstream `totalEffect += effect` sits OUTSIDE the
+    // cross-product loops) — so e.g. a simple-CTR × combination-CTR pair
+    // sharing a cat feature keeps its dropped self-cell mass in the
+    // denominator, deflating every returned percentage (AT-FIC02d's fixture
+    // demonstrates exactly this: upstream's five scores sum to ~92.5, not 100).
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut sums: Vec<f64> = Vec::new();
+    let mut total_parts: Vec<f64> = Vec::new();
+    for (&(ia, ib), &score) in int_pairs.iter().zip(int_sums.iter()) {
+        let (Some(feat_a), Some(feat_b)) = (internal.get(ia), internal.get(ib)) else {
+            continue;
+        };
+        let side0 = split_flat_indices(feat_a, n_float);
+        let side1 = split_flat_indices(feat_b, n_float);
+        // Defensive (an empty-projection `Ctr` cannot occur upstream): skip
+        // the pair entirely — nothing in the output, nothing in the total.
+        if side0.is_empty() || side1.is_empty() {
+            continue;
+        }
+        let divisor = (side0.len() * side1.len()) as f64;
+        for &f0 in &side0 {
+            for &f1 in &side1 {
+                if f0 == f1 {
+                    continue;
+                }
+                let (a, b) = if f0 < f1 { (f0, f1) } else { (f1, f0) };
+                interaction_add(&mut pairs, &mut sums, a, b, score / divisor);
+            }
+        }
+        total_parts.push(score);
+    }
+
+    // score = sum / totalEffect * 100.
+    let total_effect = sum_f64(&total_parts);
     let mut result: Vec<(usize, usize, f64)> = pairs
         .iter()
         .zip(sums.iter())
@@ -358,18 +635,24 @@ pub fn interaction(model: &Model) -> Vec<(usize, usize, f64)> {
 /// `CalcMostInteractingFeatures(model, featureToIdx)` (`feature_str.cpp:226-295`,
 /// D-6.6-10).
 ///
-/// Per tree: DFS from the root node carrying a `path` of `(feature_idx, sign)`.
-/// At a TERMINAL node (`left_child == node || right_child == node`, i.e. one diff
-/// is 0) accumulate `treeSum[(f1,f2)] += sign1·sign2·delta` for every pair in the
-/// path (`delta` = Σ leaf values over the dimension; 1-dim ⇒ the single value).
-/// Descending into the left child uses `sign = -1`, the right child `sign = +1`.
-/// After the tree, fold `Σ|treeSum[pair]|` into the shared accumulator. The walk
-/// is `node_count`-depth-bounded with checked `.get` (T-06.6-15) — a malformed
-/// graph stops the descent rather than recursing forever.
+/// Per tree: DFS from the root node carrying a `path` of `(internal_idx, sign)`
+/// — INTERNAL feature indices (upstream `featureToIdx.at(feature)`), NOT
+/// expanded flat indices; expansion to combined-flat pairs happens once, in
+/// `interaction()`'s `CalcFeatureInteraction` stage. At a TERMINAL node
+/// (`left_child == node || right_child == node`, i.e. one diff is 0)
+/// accumulate `treeSum[(i1,i2)] += sign1·sign2·delta` for every path pair with
+/// DISTINCT internal features (upstream's `srcFeature1 == srcFeature2 →
+/// continue`; `delta` = Σ leaf values over the dimension; 1-dim ⇒ the single
+/// value). Descending into the left child uses `sign = -1`, the right child
+/// `sign = +1`. After the tree, fold `Σ|treeSum[pair]|` into the shared
+/// internal-pair accumulator. The walk is `node_count`-depth-bounded with
+/// checked `.get` (T-06.6-15) — a malformed graph stops the descent rather
+/// than recursing forever.
 fn interaction_accumulate_non_symmetric(
     tree: &crate::NonSymmetricTree,
-    pairs: &mut Vec<(usize, usize)>,
-    sums: &mut Vec<f64>,
+    internal: &mut Vec<crate::ModelSplit>,
+    int_pairs: &mut Vec<(usize, usize)>,
+    int_sums: &mut Vec<f64>,
 ) {
     let node_count = tree.step_nodes.len();
     // Per-tree signed accumulator (insertion-order keyed Vec, like the shared one).
@@ -377,11 +660,15 @@ fn interaction_accumulate_non_symmetric(
     let mut tree_sums: Vec<f64> = Vec::new();
     let mut path: Vec<(usize, i32)> = Vec::new();
 
-    interaction_dfs(tree, 0, node_count, &mut path, &mut tree_pairs, &mut tree_sums);
+    interaction_dfs(tree, 0, node_count, internal, &mut path, &mut tree_pairs, &mut tree_sums);
 
-    // sumInteractions[pair] += |treeSum[pair]|.
+    // sumInteractions[pair] += |treeSum[pair]|. This is the SOLE place
+    // magnitude is taken for this arm (FIC-02) — the terminal accumulation
+    // stays SIGNED (never `.abs()`'d per-leaf), so same-pair contributions
+    // from different leaves along the path can partially cancel before this
+    // deferred `.abs()`.
     for (&pair, &signed) in tree_pairs.iter().zip(tree_sums.iter()) {
-        interaction_add(pairs, sums, pair.0, pair.1, signed.abs());
+        interaction_add(int_pairs, int_sums, pair.0, pair.1, signed.abs());
     }
 }
 
@@ -393,6 +680,7 @@ fn interaction_dfs(
     tree: &crate::NonSymmetricTree,
     node_idx: usize,
     remaining_depth: usize,
+    internal: &mut Vec<crate::ModelSplit>,
     path: &mut Vec<(usize, i32)>,
     tree_pairs: &mut Vec<(usize, usize)>,
     tree_sums: &mut Vec<f64>,
@@ -407,9 +695,15 @@ fn interaction_dfs(
     let left_child = node_idx.saturating_add(left_diff as usize);
     let right_child = node_idx.saturating_add(right_diff as usize);
 
-    // Terminal node: accumulate over every path pair (DoSwap to sorted order,
-    // skip equal source features). For a 1-dim numeric model `delta` is the
-    // single leaf value at the node's leaf id.
+    // Terminal node: accumulate `sign1·sign2·delta` for every path-entry PAIR
+    // with DISTINCT internal features (upstream's `srcFeature1 == srcFeature2
+    // → continue`; the combined-flat cross-product expansion — including its
+    // per-cell self-pair skip for PARTIAL overlaps, AT-FIC02e — happens once
+    // in `interaction()`'s `CalcFeatureInteraction` stage, NOT here). For a
+    // 1-dim numeric model `delta` is the single leaf value at the node's leaf
+    // id. **STILL SIGNED here** (do NOT take `.abs()` at this call site) —
+    // `interaction_accumulate_non_symmetric`'s `signed.abs()` remains the
+    // sole place magnitude is taken for this arm.
     if left_child == node_idx || right_child == node_idx {
         let leaf_id = tree
             .node_id_to_leaf_id
@@ -420,17 +714,16 @@ fn interaction_dfs(
 
         for first in 0..path.len() {
             for second in (first + 1)..path.len() {
-                let (Some(&(f1, s1)), Some(&(f2, s2))) = (path.get(first), path.get(second)) else {
+                let (Some(&(src1, sign1)), Some(&(src2, sign2))) =
+                    (path.get(first), path.get(second))
+                else {
                     continue;
                 };
-                let (mut a, mut b) = (f1, f2);
-                if b < a {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                if a == b {
+                if src1 == src2 {
                     continue;
                 }
-                let sign = f64::from(s1 * s2);
+                let sign = f64::from(sign1 * sign2);
+                let (a, b) = if src1 < src2 { (src1, src2) } else { (src2, src1) };
                 interaction_add(tree_pairs, tree_sums, a, b, sign * delta);
             }
         }
@@ -438,29 +731,34 @@ fn interaction_dfs(
 
     // A pure-leaf node carries a placeholder `Float { feature: 0, .. }` split
     // (its step entry is `(0, 0)`); short-circuit on that sentinel BEFORE reading
-    // the split feature so the placeholder is never mistaken for real feature 0
+    // the split so the placeholder is never mistaken for real feature 0
     // (WR-04). Behaviour-preserving: a `(0, 0)` node has both diffs zero, so the
     // descent loop below was already a no-op for it.
     if matches!(tree.step_nodes.get(node_idx), Some(&(0, 0))) {
         return;
     }
 
-    // The node's own split feature (skip a CTR split — no float-feature index).
-    let Some(feature_idx) = tree
-        .tree_splits
-        .get(node_idx)
-        .and_then(crate::ModelSplit::float_feature)
-    else {
+    // The node's own split, interned to its internal-feature index (FIC-02).
+    let Some(split) = tree.tree_splits.get(node_idx) else {
         return;
     };
+    let src = intern_internal_feature(internal, split);
 
     // Descend: left child sign = -1, right child sign = +1 (the upstream
     // `sign = -1; ... sign *= -1` order over `{left, right}`).
     let mut sign: i32 = -1;
     for &child_idx in &[left_child, right_child] {
         if child_idx != node_idx {
-            path.push((feature_idx, sign));
-            interaction_dfs(tree, child_idx, remaining_depth - 1, path, tree_pairs, tree_sums);
+            path.push((src, sign));
+            interaction_dfs(
+                tree,
+                child_idx,
+                remaining_depth - 1,
+                internal,
+                path,
+                tree_pairs,
+                tree_sums,
+            );
             path.pop();
         }
         sign = -sign;
@@ -487,11 +785,12 @@ fn interaction_dfs(
 /// feature width. Reductions route through [`cb_core::sum_f64`] (D-08); all access
 /// is checked `.get` (no `unwrap` / `expect`).
 #[must_use]
-pub fn loss_function_change(
+pub fn loss_function_change<F: Fn(&[f64], &[f64]) -> f64>(
     model: &Model,
     cols: &[Vec<f32>],
     labels: &[f64],
     n_features: usize,
+    final_error: F,
 ) -> Vec<f64> {
     let n_objects = cols.first().map_or(0, Vec::len);
     if n_objects == 0 || labels.len() != n_objects {
@@ -504,8 +803,12 @@ pub fn loss_function_change(
     // trailing column is the bias / mean and is not subtracted).
     let shap = shap_values(model, cols, n_features);
 
-    // finalError(approx) = mean per-object Logloss (additive metric / count).
-    let base_score = logloss_final_error(&approx, labels);
+    // finalError(approx) via the CALLER-supplied metric closure (its
+    // `GetFinalError`); the metric MUST be Min-optimized so the per-feature
+    // difference below is the importance verbatim (FL-01). Kept metric-agnostic
+    // so this crate needs no metric implementation — the facade owns the
+    // loss → closure mapping.
+    let base_score = final_error(&approx, labels);
 
     (0..n_features)
         .map(|feature| {
@@ -521,11 +824,26 @@ pub fn loss_function_change(
                     a - s
                 })
                 .collect();
-            // score = finalError(without feature f) − finalError(full). Logloss
-            // best value is Min, so the difference is the importance verbatim.
-            logloss_final_error(&approx_f, labels) - base_score
+            // score = finalError(without feature f) − finalError(full). The
+            // metric best value is Min, so the difference is the importance
+            // verbatim.
+            final_error(&approx_f, labels) - base_score
         })
         .collect()
+}
+
+/// Logloss-defaulted convenience wrapper — the pre-FL-01 behavior verbatim,
+/// retained so existing binary-model callers/tests stay byte-identical. Delegates
+/// to the generic [`loss_function_change`] with the built-in
+/// [`logloss_final_error`] closure (`FL-02` back-compat).
+#[must_use]
+pub fn loss_function_change_logloss(
+    model: &Model,
+    cols: &[Vec<f32>],
+    labels: &[f64],
+    n_features: usize,
+) -> Vec<f64> {
+    loss_function_change(model, cols, labels, n_features, logloss_final_error)
 }
 
 /// The additive `Logloss` `finalError`: the mean per-object binary cross-entropy
@@ -548,3 +866,10 @@ fn logloss_final_error(approx: &[f64], labels: &[f64]) -> f64 {
     }
     sum_f64(&losses) / count as f64
 }
+
+// Tests live in a dedicated sibling file (source/test separation, CLAUDE.md /
+// AGENTS.md — no test body in this production file), mirroring
+// `crates/cb-model/src/ctr_data.rs:58-61`.
+#[cfg(test)]
+#[path = "fstr_test.rs"]
+mod tests;

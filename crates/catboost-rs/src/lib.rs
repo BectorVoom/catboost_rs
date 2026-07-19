@@ -21,15 +21,31 @@
 
 mod builder;
 mod error;
+mod metrics;
 mod model;
 
 pub use builder::CatBoostBuilder;
 pub use error::CatBoostError;
+pub use metrics::{eval_metric, eval_metrics};
 pub use model::Model;
 
 // Re-export the prediction / importance enums so callers drive the facade
 // without reaching into the internal crates.
 pub use cb_model::{FeatureImportanceType, PredictionType};
+
+// Re-export the partial-dependence result + error types (FSTR-03) so callers
+// consume `Model::partial_dependence` entirely through the published crate.
+pub use cb_model::{PartialDependence, PdpError};
+
+// Re-export the ONNX export error type (EXPORT-01) so callers can match on
+// `catboost_rs::OnnxExportError` sub-variants (via `CatBoostError::Export`)
+// entirely through the published crate, mirroring the `PdpError` precedent.
+pub use cb_model::OnnxExportError;
+
+// Re-export the CoreML export error type (EXPORT-02) so callers can match on
+// `catboost_rs::CoreMlExportError` sub-variants (via `CatBoostError::CoreMlExport`)
+// entirely through the published crate, mirroring the `OnnxExportError` precedent.
+pub use cb_model::CoreMlExportError;
 
 // Re-export the loss / leaf-method / score-function / bootstrap knobs the
 // Builder consumes, so a caller configures a run entirely through the published
@@ -45,3 +61,9 @@ pub use cb_data::Pool;
 
 #[cfg(test)]
 mod error_test;
+#[cfg(test)]
+mod metrics_test;
+#[cfg(test)]
+mod model_sum_test;
+#[cfg(test)]
+mod onnx_test;

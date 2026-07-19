@@ -53,6 +53,45 @@ def gen_oblivious_lfc():
     return lfc.tolist()
 
 
+def _numeric_regression_pool():
+    """The `numeric_tiny` X with its RAW continuous y (regression target)."""
+    X = np.load(os.path.join(INPUTS, "X.npy"))
+    y = np.load(os.path.join(INPUTS, "y.npy")).astype(np.float64)
+    return X, y, cb.Pool(X, y)
+
+
+def gen_regression_lfc(tag: str, loss_function: str):
+    """FSTR-02 (FL-04): LossFunctionChange on a float-only oblivious REGRESSOR
+    trained with `loss_function` on `numeric_tiny`. Freezes the model `.cbm`,
+    the X/y the Rust side feeds to its own apply + SHAP + final-error closure,
+    and the upstream LossFunctionChange vector. The model's own metric
+    `GetFinalError` (RMSE / MAE / MAPE / Quantile) is what the Rust closure
+    must reproduce <=1e-5.
+
+    Isolating params mirror the oblivious binclf fixture (`bootstrap_type="No"`,
+    depth=2, iterations=5, l2_leaf_reg=3.0, learning_rate=0.1, seed=0,
+    random_strength=0, score_function="L2", thread_count=1,
+    boost_from_average=False) so the model is fully determined and the Rust
+    reconstruction (`load_cbm`) is exact."""
+    X, y, pool = _numeric_regression_pool()
+    m = cb.CatBoostRegressor(
+        loss_function=loss_function, boost_from_average=False, bootstrap_type="No",
+        depth=2, iterations=5, l2_leaf_reg=3.0, leaf_estimation_iterations=1,
+        leaf_estimation_method="Gradient", learning_rate=0.1, random_seed=0,
+        random_strength=0, score_function="L2", thread_count=1, verbose=False,
+    )
+    m.fit(pool)
+    m.save_model(os.path.join(HERE, f"{tag}_model.cbm"), format="cbm")
+    m.save_model(os.path.join(HERE, f"{tag}_model.json"), format="json")
+    lfc = np.asarray(m.get_feature_importance(type="LossFunctionChange", data=pool),
+                     dtype=np.float64)
+    np.save(os.path.join(HERE, f"{tag}_loss_function_change.npy"), lfc)
+    np.save(os.path.join(HERE, f"{tag}_X.npy"), X.astype(np.float64))
+    np.save(os.path.join(HERE, f"{tag}_y.npy"), y.astype(np.float64))
+    print(f"{tag} ({loss_function}) LFC:", lfc.tolist())
+    return lfc.tolist()
+
+
 def gen_non_symmetric():
     """Non-symmetric Depthwise model + PVC/Interaction/LFC ground truth."""
     X, yb, pool = load_binclf_pool()
@@ -84,6 +123,11 @@ def gen_non_symmetric():
 def main():
     obl_lfc = gen_oblivious_lfc()
     ns_pvc, ns_inter, ns_lfc = gen_non_symmetric()
+    # FSTR-02 (FL-04a/FL-04b): per-numeric-loss oblivious regressor LFC fixtures.
+    rmse_lfc = gen_regression_lfc("rmse", "RMSE")
+    mae_lfc = gen_regression_lfc("mae", "MAE")
+    mape_lfc = gen_regression_lfc("mape", "MAPE")
+    quantile_lfc = gen_regression_lfc("quantile", "Quantile:alpha=0.5")
     config = {
         "catboost_version": "1.2.10",
         "input_dataset": "numeric_tiny",
@@ -91,16 +135,23 @@ def main():
         "thread_count": 1,
         "seed_oblivious": 0,
         "seed_non_symmetric": 42,
+        "seed_regression": 0,
         "note": (
             "06.6-06: LossFunctionChange (MODEL-03/D-12) + non-symmetric "
-            "PVC/Interaction (D-6.6-10). All vectors from catboost 1.2.10 "
-            "get_feature_importance(...). Oblivious model = the binclf params; "
-            "non-symmetric model = Depthwise max_depth=3."
+            "PVC/Interaction (D-6.6-10). FSTR-02 (FL-04): per-loss oblivious "
+            "REGRESSOR LFC (RMSE/MAE/MAPE/Quantile:alpha=0.5). All vectors from "
+            "catboost 1.2.10 get_feature_importance(...). Oblivious binclf model "
+            "= the binclf params; non-symmetric model = Depthwise max_depth=3; "
+            "regression models = the binclf isolating params on the raw y."
         ),
         "oblivious_loss_function_change": obl_lfc,
         "non_symmetric_pvc": ns_pvc,
         "non_symmetric_interaction": ns_inter,
         "non_symmetric_loss_function_change": ns_lfc,
+        "rmse_loss_function_change": rmse_lfc,
+        "mae_loss_function_change": mae_lfc,
+        "mape_loss_function_change": mape_lfc,
+        "quantile_loss_function_change": quantile_lfc,
         "artifacts": [
             "oblivious_loss_function_change.npy",
             "binclf_X.npy",
@@ -110,6 +161,11 @@ def main():
             "non_symmetric_pvc.npy",
             "non_symmetric_interaction.npy",
             "non_symmetric_loss_function_change.npy",
+        ] + [
+            f"{tag}_{suffix}"
+            for tag in ("rmse", "mae", "mape", "quantile")
+            for suffix in ("model.cbm", "model.json", "loss_function_change.npy",
+                           "X.npy", "y.npy")
         ],
     }
     with open(os.path.join(HERE, "config.json"), "w") as f:

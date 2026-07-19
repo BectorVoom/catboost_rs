@@ -125,3 +125,34 @@ fn nan_sentinel_prepended_when_requested() {
         assert!(b > f64::from(f32::MIN));
     }
 }
+
+/// Locks the ascending-sorted-output invariant that `cb_train::boosting::
+/// quantize_feature_major`'s `partition_point` optimization depends on (a
+/// binary search is only correct on sorted input; upstream's `THashSet` ->
+/// sort -> dedup pipeline is documented but not otherwise directly tested).
+/// Covers: unsorted/reversed/interleaved input, ties, a `max_borders` budget
+/// spanning "no split" to "many splits", and both `nan_sentinel` settings —
+/// the sentinel value itself (`f32::MIN`) must sort to the front too.
+#[test]
+fn output_is_always_ascending_sorted() {
+    let reversed: Vec<f64> = (0..32).rev().map(f64::from).collect();
+    let mut interleaved = Vec::with_capacity(32);
+    for i in 0..16 {
+        interleaved.push(f64::from(i));
+        interleaved.push(f64::from(31 - i));
+    }
+    let with_ties: Vec<f64> = (0..32).map(|i| f64::from(i / 3)).collect();
+
+    for column in [&reversed, &interleaved, &with_ties] {
+        for max_borders in [0usize, 1, 3, 8, 254] {
+            for nan_sentinel in [false, true] {
+                let borders = select_borders_greedy_logsum(column, max_borders, nan_sentinel);
+                assert!(
+                    borders.windows(2).all(|w| w[0] <= w[1]),
+                    "borders not ascending-sorted for max_borders={max_borders}, \
+                     nan_sentinel={nan_sentinel}: {borders:?}"
+                );
+            }
+        }
+    }
+}

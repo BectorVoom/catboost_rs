@@ -1,14 +1,47 @@
 # TDD Implementation Plan — FSTR-03 Partial Dependence
 
+> ## Execution status (2026-07-16) — ✅ COMPLETE (all of T0–T7)
+> The oracle blocker was lifted by installing `catboost==1.2.10` in a `uv`-managed
+> CPython-3.12 venv, so the full slice shipped:
+> - **T0** scaffold + `#[path]` unit-test mount · **T1** PDP-01 engine · **T2**
+>   PDP-05 validation · **T3** fixtures generated from real upstream · **T4** PDP-02
+>   per-bin grid · **T5** PDP-03 single-feature oracle · **T6** PDP-04 pair oracle ·
+>   **T7** `pub use` export + resolved module docs.
+> - **Tests:** 9 unit (`cargo test -p cb-model partial_dependence`) + 2 oracle
+>   (`--test partial_dependence_oracle_test`) green; full `cargo test -p cb-model` =
+>   0 failures. New code restriction-lint clean (`cargo clippy -p cb-model --lib
+>   --no-deps` → 0 errors on `partial_dependence.rs`).
+> - **Grid transform RESOLVED:** upstream PD is **per BIN** (`n_borders+1` bins);
+>   grid = `[b0-1, midpoints…, b_last+1]`. Oracle truth =
+>   `plot_partial_dependence(pool, features, plot=False)[0]` (== `_calc_partial_dependence`),
+>   reproduced ≤1e-5. Specs **PDP-01..05 all implemented**.
+> - **Files:** `crates/cb-model/src/partial_dependence.rs`,
+>   `partial_dependence_test.rs`, `lib.rs` (+2), new fixture dir
+>   `crates/cb-oracle/fixtures/partial_dependence/` (`gen_fixtures.py`, `model.cbm`,
+>   `model.json`, `pdp_single_values.npy`, `pdp_pair_values.npy`, `config.json`).
+>
+> **Not done (out of slice, unchanged):** facade (`catboost-rs`) / Python
+> (`catboost-rs-py`) surfacing = later DX task; the FSTR-03 requirement checkbox in
+> the git-recovered `.planning/REQUIREMENTS.md` (off-tree) — confirm canonical
+> revision before flipping. Pre-existing/unrelated: `cargo clippy -p cb-model
+> --all-targets` still trips on `cb-oracle/src/model_json.rs:161` +
+> `tests/ctr_data_roundtrip_test.rs` (baseline-reproduced) — gate new cb-model code
+> with `--lib --no-deps`.
+
+
+
 **Phase:** 18 (Extended Feature Importance) · **Slice:** FSTR-03
 **Spec:** `./SPEC.md` (specs PDP-01..PDP-05) · **Requirement:** FSTR-03
 **Crate:** `cb-model` (+ oracle fixture in `cb-oracle`) · **Impact:** `local`
 **Parity bar:** `1e-5` (CPU, D-12) via `cb_oracle::compare::assert_abs_close`.
 
 > Executor contract: strict Red → Green → Refactor per task. One spec per TDD
-> cycle. **Source/test separation is mandatory** — no `#[cfg(test)] mod tests` in
-> production `.rs`; unit tests go in `crates/cb-model/src/partial_dependence_test.rs`,
-> integration/oracle tests in `crates/cb-model/tests/`. **No `unwrap`/`expect`/
+> cycle. **Source/test separation is mandatory** — no inline `#[cfg(test)] mod
+> tests { … }` *body* in production `.rs`; unit tests go in a sibling
+> `crates/cb-model/src/partial_dependence_test.rs` wired via the sanctioned
+> `#[cfg(test)] #[path = "partial_dependence_test.rs"] mod tests;` mount (see T0,
+> mirroring `ctr_data.rs:58-61`/`region_apply_test.rs`), integration/oracle tests
+> in `crates/cb-model/tests/`. **No `unwrap`/`expect`/
 > `panic`/`indexing_slicing`** in production (workspace-denied `[VERIFIED: LOCAL
 > Cargo.toml:10-14]`). Every mean folds through `cb_core::sum_f64`, never `.sum()`
 > (D-08). Do **not** mark any task complete during planning.
@@ -18,8 +51,15 @@
 ```
 cargo test -p cb-model                     # unit + oracle for this slice
 cargo test -p cb-model -p cb-oracle        # + comparator
-cargo build -p cb-model                    # restriction-lint gate (unwrap/panic/indexing denied)
+cargo clippy -p cb-model --all-targets     # RESTRICTION-LINT GATE (unwrap/expect/panic/indexing denied)
+cargo build -p cb-model                    # compile check only — does NOT enforce the clippy restriction lints
 ```
+> **Lint-gate correction:** the workspace restriction lints
+> (`unwrap_used/expect_used/panic/indexing_slicing`) are **clippy** lints; they are
+> inert under `cargo build`/`rustc` and are ONLY enforced by `cargo clippy`
+> `[VERIFIED: LOCAL Cargo.toml:10-14 + crates/cb-model/Cargo.toml:7-8 `[lints]
+> workspace = true`]`. Use `cargo clippy` as the gate; `cargo build` passing does
+> NOT prove the slice is free of `.unwrap()`/indexing.
 Known-red suites to ignore (pre-existing, environmental): `cb-backend --lib`
 (CubeCL MLIR), `cb-train monotone_*`, `catboost-rs-py` (python3.14 link)
 `[VERIFIED: LOCAL memory catboost-rs-preexisting-test-failures.md]`. Fixture
@@ -42,19 +82,37 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
 - **Goal:** create the module and typed error so later tasks compile.
 - **Files:**
   - create `crates/cb-model/src/partial_dependence.rs` — `PartialDependence`
-    struct, `PdpError` enum (§4 contract), empty `pub fn partial_dependence(...)`
-    returning `todo`-free `Err(PdpError::EmptyDataset)` placeholder is **not**
-    allowed (no stubs that pass); instead leave the fn **unimplemented at test
-    time only** by making T1/T2 the first cycles that force its body. Concretely:
-    define the types + a private engine signature; the public fn is authored in T1/T3.
+    struct, `PdpError` enum with the **five** §4 variants (`FeatureIndexOutOfRange`,
+    `UnsupportedFeatureArity`, `DuplicateFeature`, `MalformedColumns`,
+    `EmptyDataset` — NO `UnsupportedFeatureKind`, which was removed as
+    unimplementable per §4 change-note). A stub `partial_dependence(...)` that
+    passes any test is **not** allowed (no `Ok`/`Err` placeholder that a Red test
+    would accept); instead define the types + a private engine signature only, and
+    let T1/T2/T5 force the public fn's body. `[VERIFIED: SPEC §4 PdpError]`
   - create empty `crates/cb-model/src/partial_dependence_test.rs`.
+  - **MOUNT the unit-test file** — append to the bottom of
+    `crates/cb-model/src/partial_dependence.rs` the sanctioned source/test-separation
+    mount (NOT an embedded test body):
+    ```rust
+    #[cfg(test)]
+    #[path = "partial_dependence_test.rs"]
+    mod tests;
+    ```
+    This mirrors `crates/cb-model/src/ctr_data.rs:59-61` and `apply.rs:741`
+    `[VERIFIED: LOCAL crates/cb-model/src/ctr_data.rs:58-61]`. **Without this mount
+    the compiler never sees `partial_dependence_test.rs` and `cargo test` runs ZERO
+    unit tests while reporting success** — a silent false-green that defeats the
+    Red phase for T1/T2.
   - edit `crates/cb-model/src/lib.rs:14-22` — add `mod partial_dependence;` and
     (at T7) `pub use partial_dependence::{PartialDependence, PdpError, partial_dependence};`.
   - **Decision (record in code doc):** place `PdpError` in the new module (keeps
     the slice self-contained) rather than extending `cb_model::ModelError`.
     `[INFERRED from SPEC §4 note]`
-- **Validation:** `cargo build -p cb-model` compiles with the new (unused) module.
-- **Completion evidence:** module + test file exist; lib.rs declares the module.
+- **Validation:** `cargo build -p cb-model` compiles with the new module; the
+  `#[path]` mount makes `cargo test -p cb-model` actually pick up (empty)
+  `partial_dependence_test.rs`.
+- **Completion evidence:** module + test file exist and are MOUNTED (the `#[path]`
+  line is present); lib.rs declares the module.
 - **Refactor constraints:** none yet.
 
 ## T1 — PDP-01 single-feature averaging engine (unit)
@@ -76,6 +134,13 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
   grid point, build a working `Vec<Vec<f32>>` = clone of `columns` with column
   `feature` overwritten to `grid[k] as f32` for all objects, call `predict_raw`,
   push `sum_f64(&preds) / n_objects`. Use checked `.get`, no indexing.
+  - **Precondition (relied upon, enforced by PDP-05/T2):** `columns.len() ==
+    n_float` and rectangular, so `predict_raw` never NaN-pads a short/missing
+    column `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407]`. The engine
+    is a private fn; the public `partial_dependence` runs `validate(...)` (T2)
+    first, so the engine is only ever reached with validated inputs. For the T1
+    *unit* tests that call the engine directly, construct `columns` that already
+    satisfy the precondition (width == the test model's `n_float`).
 - **Refactor:** hoist the working-buffer allocation out of the grid loop (reuse
   one buffer, reset the target column per point) — keep behavior byte-identical;
   re-run T1 tests.
@@ -85,26 +150,42 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
 ## T2 — PDP-05 typed input validation (unit)
 
 - **Spec:** PDP-05. **Depends on:** T0. **Parallel with:** T1, T3.
-- **Red** — unit tests, one per arm (AT-05a..d):
-  - `rejects_out_of_range_feature` → `Err(FeatureIndexOutOfRange{..})`.
-  - `rejects_non_float_feature` → `Err(UnsupportedFeatureKind{..})` (construct/load
-    a model with a categorical/CTR feature, or assert via the float-index bound
-    if the fixture is numeric-only — see note).
-  - `rejects_bad_arity` for `len 0` and `len 3` → `Err(UnsupportedFeatureArity{..})`.
-  - `rejects_empty_dataset` for `columns=[]` and `columns=[vec![]]` → `Err(EmptyDataset)`.
+- **Test model (T3-independent):** these arms only read `model.float_feature_borders.len()`,
+  so build a small **in-code** `cb_model::Model` with `n_float >= 2` (a couple of
+  non-empty border vecs, empty trees) rather than loading the T3 fixture — this
+  keeps T2 genuinely parallel with T3. NO categorical model is needed (a categorical
+  target has no float index and cannot be expressed via the float-index API, SPEC §4).
+- **Red** — unit tests, one per arm (AT-05a..e):
+  - `rejects_bad_arity` for `features.len()==0` and `==3` → `Err(UnsupportedFeatureArity{ requested })` (AT-05a).
+  - `rejects_malformed_columns` (AT-05b) for **three** shapes — `columns == []`,
+    `columns.len() != n_float` (wrong width), and ragged (unequal-length) columns —
+    each → `Err(MalformedColumns{ expected_float_features, .. })`. (`columns == []`
+    is malformed, NOT empty, because `0 != n_float`; SPEC §5 check order.)
+  - `rejects_empty_dataset` (AT-05c) for exactly `n_float` columns each of length 0
+    (correct width, zero rows) → `Err(EmptyDataset)`.
+  - **Both AT-05b and AT-05c pass a valid-arity `features`** (e.g. `&[0]`) so check 1
+    (arity) does not preempt the column-shape / emptiness check under test.
+  - `rejects_out_of_range_feature` (AT-05d): pass **valid rectangular non-empty
+    columns** (`n_float` columns, length `n>=1`) with `features=[n_float]` →
+    `Err(FeatureIndexOutOfRange{ index, n_float })` (so checks 1–3 pass and the
+    range check is under test).
+  - `rejects_duplicate_feature_pair` (AT-05e): pass valid rectangular non-empty
+    columns with `features=[f, f]` (`f` in range) → `Err(DuplicateFeature{ index: f })`.
   - **Expected initial failure:** validation absent → wrong/no `Err`.
-- **Green:** implement the guard block at the top of `partial_dependence(...)`:
-  arity check → dataset non-empty check → per-feature range+kind check, returning
-  the matching `PdpError` before any compute. Derive `n_float` from
-  `model.float_feature_borders.len()`; "float feature" = index `< n_float`.
-- **Refactor:** extract a `validate(model, columns, features) -> Result<usize /*n_obj*/, PdpError>`.
-- **Note (owner: executor):** if the committed fixture model is numeric-only, the
-  `UnsupportedFeatureKind` test needs a model that actually has a non-float
-  feature; reuse an existing categorical fixture model (e.g. from
-  `one_hot_cat`/`plain_ctr`) rather than adding a new one. `[VERIFIED: LOCAL
-  crates/cb-oracle/fixtures/{one_hot_cat,plain_ctr}]`
+- **Green:** implement `fn validate(model, columns, features) -> Result<usize /*n_obj*/, PdpError>`
+  and call it at the very top of `partial_dependence(...)`, honoring the SPEC §5
+  **deterministic check order**: (1) arity → (2) column shape (`columns.len() ==
+  n_float` AND rectangular) → (3) empty dataset (`n_obj == 0`) → (4) per-feature
+  range (first `features[k] >= n_float`, in request order) → (5) duplicate
+  (2-feature `[f,f]`). Derive `n_float = model.float_feature_borders.len()`. Return
+  `n_obj` (the common column length) on success. Use checked `.get`/iterators — no
+  indexing, no `unwrap`. This `validate` is the single guard the T1 engine relies
+  on to never NaN-pad `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407]`.
+- **Refactor:** keep `validate` as the one reusable entry guard for both the
+  single- and pair-feature paths (T5/T6 call the same `partial_dependence`).
 - **Validation:** `cargo test -p cb-model partial_dependence`.
-- **Completion evidence:** AT-05a..d pass.
+- **Completion evidence:** AT-05a..e pass; the removed `UnsupportedFeatureKind`
+  arm has no test (it no longer exists — SPEC §4 change-note).
 
 ## T3 — Oracle fixture generation (enabler artifact)
 
@@ -122,7 +203,13 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
     feature `f`, and `plot_partial_dependence(pool, [f1, f2])` for a pair; extract
     the **upstream** grid + values from the returned figure object and dump:
     `pdp_single_grid.npy`, `pdp_single_values.npy`, `pdp_pair_grid0.npy`,
-    `pdp_pair_grid1.npy`, `pdp_pair_values.npy` (row-major, `float64`).
+    `pdp_pair_grid1.npy`, `pdp_pair_values.npy` (`float64`). **`pdp_pair_values.npy`
+    MUST be dumped in the SPEC §4 row-major order — `grid0`/`f1` OUTER, `grid1`/`f2`
+    INNER, i.e. flat index `a*len(grid1)+b` = `(grid0[a], grid1[b])`** — so any
+    transpose disagreement with the Rust engine surfaces as a real AT-04a oracle
+    failure, not a silent pass. Reshape/flatten explicitly (e.g.
+    `np.asarray(surface, dtype=np.float64).reshape(len(grid0), len(grid1)).ravel(order="C")`)
+    and record the axis→feature mapping in `config.json`.
     **Resolve the exact figure-data extraction path** against installed
     `catboost==1.2.10` (SPEC §9 risk 2) — do NOT recompute truth with a hand
     averaging loop.
@@ -141,9 +228,26 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
 ## T4 — PDP-02 grid derivation (oracle)
 
 - **Spec:** PDP-02. **Depends on:** T3.
-- **Red** — `crates/cb-model/tests/partial_dependence_oracle_test.rs`:
-  - `derived_grid_matches_upstream` (AT-02a): load `model.cbm`, derive grid for
-    `single_feature`, load `pdp_single_grid.npy`, `assert_abs_close(grid, npy, 1e-5)`.
+- **Oracle-test harness (applies to T4/T5/T6, mirror the verified pattern):**
+  `crates/cb-model/tests/partial_dependence_oracle_test.rs` opens with
+  `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]`,
+  a `const TOL: f64 = 1e-5;`, a `fixture(rel)` path helper joining
+  `../cb-oracle/fixtures/…`, and loads `.npy` via `ndarray_npy::read_npy` /
+  `cb_oracle::load_f64_vec` — exactly as `advanced_fstr_oracle_test.rs`
+  `[VERIFIED: LOCAL crates/cb-model/tests/advanced_fstr_oracle_test.rs:18-49]`.
+  **`assert_abs_close` returns `Result<(), OracleError>` — it does NOT panic**
+  `[VERIFIED: CODEGRAPH crates/cb-oracle/src/compare.rs:46]`; assert success with
+  `.expect("… within TOL")` (permitted under the top-of-file test allow) or make
+  the test fn return `Result<(), OracleError>`.
+- **Red** — in that file:
+  - `derived_grid_matches_upstream` (AT-02a): load the model via
+    `cb_model::load_cbm(fixture("partial_dependence/model.cbm"))` — which returns a
+    `cb_model::Model` directly and is proven to parse an upstream `catboost==1.2.10`
+    `.cbm` `[VERIFIED: LOCAL crates/cb-model/tests/advanced_fstr_oracle_test.rs:23,93
+    load_cbm on an upstream fixture]` (alternatively `cb_oracle::load_model_json` on
+    `model.json` + manual `Model` build, the binclf pattern at :53-55) — derive the
+    grid for `single_feature`, load `pdp_single_grid.npy`, then
+    `assert_abs_close(&grid, &npy, TOL).expect("grid within TOL")`.
   - **Expected initial failure:** grid derivation absent / wrong transform →
     length or value mismatch. **Record the exact mismatch** — it reveals the
     transform (borders-verbatim vs midpoints vs endpoints).
@@ -202,9 +306,12 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
   - Module-level doc comment on `partial_dependence.rs` transcribing the upstream
     averaging formula + the **resolved** grid convention (cite CONTEXT7 +
     resolved T4 finding); note float-only scope + typed rejections.
-  - Confirm no `.sum()`/`unwrap`/`expect`/indexing crept in (grep the new file).
+  - Confirm no `.sum()`/`unwrap`/`expect`/indexing crept in — grep the new file
+    AND run the clippy gate below (the grep is a smell check; `cargo clippy` is the
+    authoritative enforcement).
 - **Validation (full slice):**
   ```
+  cargo clippy -p cb-model --all-targets   # restriction-lint gate (authoritative)
   cargo build -p cb-model
   cargo test -p cb-model
   cargo test -p cb-model -p cb-oracle
@@ -219,7 +326,7 @@ T0 scaffold ──┬─> T1 (PDP-01 engine, unit) ──┐
 |------|------|------------------|------|
 | T0 | (enabler) | compiles | — |
 | T1 | PDP-01 | AT-01a/b/c | unit |
-| T2 | PDP-05 | AT-05a/b/c/d | unit |
+| T2 | PDP-05 | AT-05a/b/c/d/e | unit |
 | T3 | (enabler) | fixtures loadable | artifact |
 | T4 | PDP-02 | AT-02a | oracle |
 | T5 | PDP-03 | AT-03a/b | oracle |

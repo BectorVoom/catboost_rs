@@ -68,4 +68,48 @@ pub enum CatBoostError {
     /// error so no out-of-bounds access crosses the public boundary.
     #[error("feature mismatch: {0}")]
     FeatureMismatch(String),
+
+    /// A [`crate::Model::partial_dependence`] request was invalid — bad arity
+    /// (not 1 or 2 features), an out-of-range or duplicate feature index, or an
+    /// empty dataset. Carries the typed `cb-model` [`cb_model::PdpError`].
+    /// Converted with `?` via `#[from]`.
+    #[error("partial dependence error: {0}")]
+    PartialDependence(#[from] cb_model::PdpError),
+
+    /// A [`crate::Model::save_onnx`] export failed — an unsupported model
+    /// (categorical/CTR, non-oblivious) or a downstream encode/I/O error.
+    /// Carries the typed `cb-model` [`cb_model::OnnxExportError`]. Converted
+    /// with `?` via `#[from]`.
+    #[error("ONNX export error: {0}")]
+    Export(#[from] cb_model::OnnxExportError),
+
+    /// A [`crate::Model::save_coreml`] export failed — an unsupported model
+    /// (categorical/CTR, non-oblivious, region, or multi-dimensional) or a
+    /// downstream encode/I/O error. Carries the typed `cb-model`
+    /// [`cb_model::CoreMlExportError`]. A NEW variant distinct from
+    /// [`CatBoostError::Export`], because that arm is hard-typed to
+    /// [`cb_model::OnnxExportError`] and thiserror cannot attach a second
+    /// `#[from]` of a different type. Converted with `?` via `#[from]`.
+    #[error("CoreML export error: {0}")]
+    CoreMlExport(#[from] cb_model::CoreMlExportError),
+
+    /// A [`crate::Model::feature_importance_with_data`]
+    /// [`cb_model::FeatureImportanceType::LossFunctionChange`] request named a
+    /// loss the first slice does not support (FSTR-02, FL-03). Only the
+    /// Min-optimized numeric losses `RMSE`, `MAE`, `MAPE`, `Quantile`, and
+    /// `Logloss` are accepted; a Max-optimized (`AUC`/`Accuracy`/`R²`), ranking,
+    /// or unknown loss name lands here — surfaced as a typed error rather than
+    /// silently falling back to a wrong Logloss score. Carries the offending
+    /// loss descriptor.
+    #[error("unsupported loss for LossFunctionChange: {0}")]
+    UnsupportedLoss(String),
+
+    /// A [`crate::Model::staged_predict`] request targeted a model the first
+    /// slice does not support: a non-scalar (`approx_dimension > 1`),
+    /// non-oblivious (non-symmetric / Region), or CTR/categorical model. The
+    /// float-only scalar staged path would silently drop dimensions or ignore
+    /// trees on such a model, so it is rejected with a typed error rather than
+    /// returning silently-wrong output. Carries a human-readable reason.
+    #[error("unsupported model: {0}")]
+    UnsupportedModel(String),
 }

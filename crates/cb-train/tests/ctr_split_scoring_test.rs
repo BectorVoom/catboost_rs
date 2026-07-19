@@ -58,6 +58,24 @@ fn uninformative_float_matrix(n: usize) -> (Vec<Vec<f32>>, Vec<Vec<f64>>) {
     (values, borders)
 }
 
+/// Like [`ctr_column_from_bins`], but with an explicit `projection` — used by
+/// ORD-06-03's regression fence to construct a COMBINATION column (`{0,1}`
+/// projection) alongside a SIMPLE one.
+fn ctr_column_from_bins_with_projection(bins: &[u32], projection: TProjection) -> CtrFeatureColumn {
+    let mut distinct: Vec<u32> = bins.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    CtrFeatureColumn {
+        projection,
+        ctr_type: 0,
+        prior_num: PRIOR_NUM,
+        prior_denom: PRIOR_DENOM,
+        bins: bins.to_vec(),
+        ctr_value: bins.iter().map(|&b| f64::from(b)).collect(),
+        bucket_count: distinct.len().max(1),
+    }
+}
+
 // ===========================================================================
 // Task 1 — STRUCTURE (CTR scored into the oblivious search)
 // ===========================================================================
@@ -90,6 +108,7 @@ fn ctr_candidate_wins_over_uninformative_float() {
         0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
     )
     .expect("ctr search");
 
@@ -138,6 +157,7 @@ fn tie_break_float_then_ctr_first_wins() {
         0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
     )
     .expect("ctr search");
 
@@ -180,6 +200,7 @@ fn forward_bit_leaf_index_mixed_float_and_ctr() {
         0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
     )
     .expect("ctr search");
 
@@ -237,6 +258,7 @@ fn single_feature_ctr_structure_partition_6_0_9_15() {
         0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
     )
     .expect("ctr search");
 
@@ -249,6 +271,65 @@ fn single_feature_ctr_structure_partition_6_0_9_15() {
         counts[leaf] += 1;
     }
     assert_eq!(counts, [6, 0, 9, 15], "structure partition [6,0,9,15]");
+}
+
+/// Test (AT-ORD06-03c, ORD-06-03 regression fence): at level 0 (`chosen` empty,
+/// `depth = 1`), a materialized COMBINATION `CtrFeatureColumn` (projection
+/// `{0,1}`) whose bins are a PERFECT separator (artificially high score — it
+/// would win if scored) must NEVER be scored/win, because no `Ctr` split has
+/// been chosen yet to extend (ORD-06-01's root-level gate). A materialized
+/// SIMPLE column (projection `{0}`) with a genuinely weaker (imperfect) split is
+/// the legitimate winner instead.
+#[test]
+fn combination_ctr_cannot_win_at_level_zero() {
+    let n = 8;
+    let der1: Vec<f64> = vec![-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0];
+    let weight = vec![1.0; n];
+
+    // Simple column {0}: an IMPERFECT separator (one object on the wrong side of
+    // every candidate border) — a genuinely lower, but nonzero, score.
+    let simple_bins: [u32; 8] = [0, 0, 0, 10, 0, 10, 10, 10];
+    let simple_col =
+        ctr_column_from_bins_with_projection(&simple_bins, TProjection::single(0));
+
+    // Combination column {0,1}: a PERFECT separator matching der1's sign exactly
+    // — the highest possible L2/cosine gain for this data, so WITHOUT the
+    // eligibility fix it would win over the simple column above.
+    let combo_bins: [u32; 8] = [0, 0, 0, 0, 10, 10, 10, 10];
+    let combo_col =
+        ctr_column_from_bins_with_projection(&combo_bins, TProjection::from_features(&[0, 1]));
+
+    let (values, borders) = uninformative_float_matrix(n);
+    let matrix = FeatureMatrix::new(&values, &borders);
+
+    let grown = greedy_tensor_search_oblivious_with_ctr(
+        &matrix,
+        &[simple_col, combo_col],
+        ctr_border_count_default(),
+        &der1,
+        &weight,
+        3.0,
+        1, // depth = 1: level 0 only, `chosen` starts empty.
+        n,
+        0,
+        0.0, // model_size_reg = 0 (not this fence's concern — see T2.5's own tests)
+        cb_compute::EScoreFunction::Cosine,
+        &[],
+    )
+    .expect("ctr search");
+
+    assert_eq!(grown.ctr_splits.len(), 1, "a CTR split should win (float is uninformative)");
+    assert!(
+        grown.ctr_splits[0].projection.is_simple(),
+        "the COMBINATION projection {{0,1}} must never win at level 0 (no Ctr split \
+         chosen yet to extend) — got projection {:?}, expected the simple {{0}} winner",
+        grown.ctr_splits[0].projection
+    );
+    assert_eq!(
+        grown.ctr_splits[0].projection,
+        TProjection::single(0),
+        "the legitimate simple-CTR winner is projection {{0}}"
+    );
 }
 
 // ===========================================================================

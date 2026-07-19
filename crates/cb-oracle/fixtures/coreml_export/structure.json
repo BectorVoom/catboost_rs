@@ -1,0 +1,624 @@
+{
+  "base_prediction_value": [
+    -0.18855807185173035
+  ],
+  "num_prediction_dimensions": 1,
+  "spec_type": "treeEnsembleRegressor",
+  "trees": {
+    "0": {
+      "0": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.17894206162063497,
+        "true_child_node_id": 0
+      },
+      "1": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "10": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": 0.9457218647003174,
+        "false_child_node_id": 4,
+        "true_child_node_id": 5
+      },
+      "11": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": 0.9457218647003174,
+        "false_child_node_id": 6,
+        "true_child_node_id": 7
+      },
+      "12": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": -0.0470917709171772,
+        "false_child_node_id": 8,
+        "true_child_node_id": 9
+      },
+      "13": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": -0.0470917709171772,
+        "false_child_node_id": 10,
+        "true_child_node_id": 11
+      },
+      "14": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": -0.12274917215108871,
+        "false_child_node_id": 12,
+        "true_child_node_id": 13
+      },
+      "2": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0819054176369738,
+        "true_child_node_id": 0
+      },
+      "3": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "4": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.11670319514287275,
+        "true_child_node_id": 0
+      },
+      "5": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.006990876885389352,
+        "true_child_node_id": 0
+      },
+      "6": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.11594914882179674,
+        "true_child_node_id": 0
+      },
+      "7": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.21686355428103787,
+        "true_child_node_id": 0
+      },
+      "8": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": 0.9457218647003174,
+        "false_child_node_id": 0,
+        "true_child_node_id": 1
+      },
+      "9": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": 0.9457218647003174,
+        "false_child_node_id": 2,
+        "true_child_node_id": 3
+      }
+    },
+    "1": {
+      "0": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.21746452882194314,
+        "true_child_node_id": 0
+      },
+      "1": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "10": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 4,
+        "true_child_node_id": 5
+      },
+      "11": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 6,
+        "true_child_node_id": 7
+      },
+      "12": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.41188979148864746,
+        "false_child_node_id": 8,
+        "true_child_node_id": 9
+      },
+      "13": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.41188979148864746,
+        "false_child_node_id": 10,
+        "true_child_node_id": 11
+      },
+      "14": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": -0.3564434051513672,
+        "false_child_node_id": 12,
+        "true_child_node_id": 13
+      },
+      "2": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.02905041194899425,
+        "true_child_node_id": 0
+      },
+      "3": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "4": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.0556156330472465,
+        "true_child_node_id": 0
+      },
+      "5": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.04713053402129875,
+        "true_child_node_id": 0
+      },
+      "6": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.008324422479258435,
+        "true_child_node_id": 0
+      },
+      "7": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.22199937553274715,
+        "true_child_node_id": 0
+      },
+      "8": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 0,
+        "true_child_node_id": 1
+      },
+      "9": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 2,
+        "true_child_node_id": 3
+      }
+    },
+    "2": {
+      "0": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.0894979099668547,
+        "true_child_node_id": 0
+      },
+      "1": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.02664339745440709,
+        "true_child_node_id": 0
+      },
+      "10": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.7963352203369141,
+        "false_child_node_id": 4,
+        "true_child_node_id": 5
+      },
+      "11": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.7963352203369141,
+        "false_child_node_id": 6,
+        "true_child_node_id": 7
+      },
+      "12": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": 0.39033639430999756,
+        "false_child_node_id": 8,
+        "true_child_node_id": 9
+      },
+      "13": {
+        "behavior": 3,
+        "branch_feature_index": 2,
+        "branch_feature_value": 0.39033639430999756,
+        "false_child_node_id": 10,
+        "true_child_node_id": 11
+      },
+      "14": {
+        "behavior": 3,
+        "branch_feature_index": 3,
+        "branch_feature_value": 0.3004736602306366,
+        "false_child_node_id": 12,
+        "true_child_node_id": 13
+      },
+      "2": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.028880713484816533,
+        "true_child_node_id": 0
+      },
+      "3": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.12448588184142684,
+        "true_child_node_id": 0
+      },
+      "4": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.04673600744641358,
+        "true_child_node_id": 0
+      },
+      "5": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0683313430597436,
+        "true_child_node_id": 0
+      },
+      "6": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.028222599872813895,
+        "true_child_node_id": 0
+      },
+      "7": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.16694336716488412,
+        "true_child_node_id": 0
+      },
+      "8": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.7963352203369141,
+        "false_child_node_id": 0,
+        "true_child_node_id": 1
+      },
+      "9": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.7963352203369141,
+        "false_child_node_id": 2,
+        "true_child_node_id": 3
+      }
+    },
+    "3": {
+      "0": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.08880173403069273,
+        "true_child_node_id": 0
+      },
+      "1": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.020436727109772623,
+        "true_child_node_id": 0
+      },
+      "10": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 4,
+        "true_child_node_id": 5
+      },
+      "11": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 6,
+        "true_child_node_id": 7
+      },
+      "12": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.6582577228546143,
+        "false_child_node_id": 8,
+        "true_child_node_id": 9
+      },
+      "13": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.6582577228546143,
+        "false_child_node_id": 10,
+        "true_child_node_id": 11
+      },
+      "14": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.3678482174873352,
+        "false_child_node_id": 12,
+        "true_child_node_id": 13
+      },
+      "2": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0026370314030760528,
+        "true_child_node_id": 0
+      },
+      "3": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "4": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "5": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.052016451722442646,
+        "true_child_node_id": 0
+      },
+      "6": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "7": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.18479577396032704,
+        "true_child_node_id": 0
+      },
+      "8": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 0,
+        "true_child_node_id": 1
+      },
+      "9": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.07385917007923126,
+        "false_child_node_id": 2,
+        "true_child_node_id": 3
+      }
+    },
+    "4": {
+      "0": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.10637819074545157,
+        "true_child_node_id": 0
+      },
+      "1": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "10": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.6582577228546143,
+        "false_child_node_id": 4,
+        "true_child_node_id": 5
+      },
+      "11": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.6582577228546143,
+        "false_child_node_id": 6,
+        "true_child_node_id": 7
+      },
+      "12": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": -0.7778791189193726,
+        "false_child_node_id": 8,
+        "true_child_node_id": 9
+      },
+      "13": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": -0.7778791189193726,
+        "false_child_node_id": 10,
+        "true_child_node_id": 11
+      },
+      "14": {
+        "behavior": 3,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.4117700457572937,
+        "false_child_node_id": 12,
+        "true_child_node_id": 13
+      },
+      "2": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.03347993162331372,
+        "true_child_node_id": 0
+      },
+      "3": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.03953734050954527,
+        "true_child_node_id": 0
+      },
+      "4": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": -0.060287335042577106,
+        "true_child_node_id": 0
+      },
+      "5": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.0,
+        "true_child_node_id": 0
+      },
+      "6": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.06448314990526466,
+        "true_child_node_id": 0
+      },
+      "7": {
+        "behavior": 6,
+        "branch_feature_index": 0,
+        "branch_feature_value": 0.0,
+        "evaluation_index": 0,
+        "false_child_node_id": 0,
+        "leaf_value": 0.14462959185638008,
+        "true_child_node_id": 0
+      },
+      "8": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.6582577228546143,
+        "false_child_node_id": 0,
+        "true_child_node_id": 1
+      },
+      "9": {
+        "behavior": 3,
+        "branch_feature_index": 1,
+        "branch_feature_value": 0.6582577228546143,
+        "false_child_node_id": 2,
+        "true_child_node_id": 3
+      }
+    }
+  }
+}

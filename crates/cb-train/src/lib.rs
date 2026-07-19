@@ -16,6 +16,7 @@
 mod autolr;
 mod bootstrap;
 mod boosting;
+pub mod calc_metrics;
 mod candidates;
 mod ctr;
 mod estimated;
@@ -67,6 +68,7 @@ pub use fold::{
     body_sum_weights, body_tail_boundaries, body_tail_segments, create_folds, learning_fold_count,
     plain_fold_body_tail, select_min_batch_size, select_tail_size, Fold,
 };
+pub use calc_metrics::{calc_metric, eval_metric, parse_metric};
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 pub use pairwise_leaves::{calculate_pairwise_leaf_values, compute_pairwise_leaf_deltas};

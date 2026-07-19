@@ -73,6 +73,23 @@ pub enum EvalMetric {
     /// (`EvalMetric::for_loss` has no MSLE arm). The approx is RAW (`isExpApprox`
     /// asserted false upstream, `metric.cpp:1912`).
     Msle,
+    /// Mean absolute error: `Σ w·|approx−target| / Σ w` (flat, Min-optimized,
+    /// `is_max_optimal == false`). Evaluated via the flat [`EvalMetric::eval`]
+    /// path, never the grouped seam.
+    Mae,
+    /// Mean absolute percentage error: `Σ w·|approx−target|/D(target) / Σ w`
+    /// with a zero-target-guarded divisor `D` (flat, Min-optimized,
+    /// `is_max_optimal == false`). Evaluated via the flat [`EvalMetric::eval`]
+    /// path, never the grouped seam.
+    Mape,
+    /// Quantile (pinball) loss at `alpha`: `Σ w·pinball(a,t,alpha) / Σ w`
+    /// (flat, Min-optimized, `is_max_optimal == false`); default `alpha == 0.5`
+    /// (see `cb_compute::QUANTILE_ALPHA`), at which it equals `0.5·MAE`.
+    /// Evaluated via the flat [`EvalMetric::eval`] path, never the grouped seam.
+    Quantile {
+        /// Pinball quantile level in `(0, 1)`; default `0.5`.
+        alpha: f64,
+    },
     /// Normalized DCG per group, averaged over groups (`metric.cpp:3079`).
     /// `top=-1` → full group; upstream defaults `type=Base`,
     /// `denominator=LogPosition`, `normalized=true`. IDCG==0 → 1.
@@ -334,6 +351,79 @@ impl EvalMetric {
                 }
                 Ok(sum_f64(&weighted_sq) / total_weight)
             }
+            // Flat Min-optimized metrics (EM-01/EM-02/EM-03). The real
+            // final-error math lands in EMT-2 (MAE) / EMT-3 (MAPE) / EMT-4
+            // (Quantile); these are inert typed placeholders so the crate
+            // compiles with the new variants present (EMT-1 compile-safety
+            // spine). Kept next to the flat arms (Rmse/Logloss/Msle) above.
+            Self::Mae => {
+                // sum_w |approx - target| / sum_w — weighted mean absolute error
+                // (EM-01). Min-optimized flat metric; mirrors the `Rmse` fold
+                // shape above (build the weighted per-object column, reduce via
+                // `cb_core::sum_f64` (D-08), divide by the shared `total_weight`).
+                let weighted_abs: Vec<f64> = approx
+                    .iter()
+                    .zip(target.iter())
+                    .enumerate()
+                    .map(|(i, (&a, &t))| weight_at(i) * (a - t).abs())
+                    .collect();
+                Ok(sum_f64(&weighted_abs) / total_weight)
+            }
+            Self::Mape => {
+                // sum_w |approx - target| / D(target) / sum_w — weighted mean
+                // absolute percentage error (EM-02), where D(t) is the guarded,
+                // zero-target-safe divisor. Min-optimized flat metric; mirrors the
+                // `Mae` fold shape above (build the weighted per-object column,
+                // reduce via `cb_core::sum_f64` (D-08), divide by `total_weight`).
+                //
+                // R1 (zero-target divisor) — RESOLVED (EMT-6): `D(t) = max(1.0, |t|)`,
+                // the upstream `TMAPEMetric` convention. Pinned against the frozen
+                // `catboost==1.2.10` scalar in
+                // `calc_metrics_flat_oracle_test::mape_matches_upstream`, whose `{0,1}`
+                // label carries zero-target rows: `max(1.0,|t|)` reproduces the
+                // upstream value to ~1e-16, while SPEC §4's `max(|t|, EPS)` explodes
+                // (zero row → ~1e37) and skip-zero undershoots — so this convention is
+                // the unique arbiter-confirmed one. The divisor is >= 1 for every row,
+                // so a `target == 0` row is FINITE (no div-by-zero, no NaN/Inf).
+                let weighted_ape: Vec<f64> = approx
+                    .iter()
+                    .zip(target.iter())
+                    .enumerate()
+                    .map(|(i, (&a, &t))| {
+                        let divisor = t.abs().max(1.0);
+                        weight_at(i) * (a - t).abs() / divisor
+                    })
+                    .collect();
+                Ok(sum_f64(&weighted_ape) / total_weight)
+            }
+            Self::Quantile { alpha } => {
+                // sum_w pinball(approx, target, alpha) / sum_w — weighted mean
+                // pinball (quantile) loss (EM-03), where
+                // `pinball(a,t,alpha) = t>=a ? alpha·(t−a) : (1−alpha)·(a−t)`.
+                // Min-optimized flat metric; mirrors the `Mae` fold shape above
+                // (build the weighted per-object column, reduce via
+                // `cb_core::sum_f64` (D-08), divide by the shared `total_weight`).
+                // `self` is matched by reference, so `alpha` is `&f64` — deref for
+                // the arithmetic. At `alpha == 0.5` (the parse default,
+                // `cb_compute::QUANTILE_ALPHA`) every row contributes `0.5·|a−t|`,
+                // so the metric equals `0.5·MAE`.
+                let a_lvl = *alpha;
+                let weighted_pinball: Vec<f64> = approx
+                    .iter()
+                    .zip(target.iter())
+                    .enumerate()
+                    .map(|(i, (&a, &t))| {
+                        let d = t - a;
+                        let pinball = if d >= 0.0 {
+                            a_lvl * d
+                        } else {
+                            (1.0 - a_lvl) * -d
+                        };
+                        weight_at(i) * pinball
+                    })
+                    .collect();
+                Ok(sum_f64(&weighted_pinball) / total_weight)
+            }
             // Custom user metric (LOSS-07, D-6.4-05): the user trait accumulates
             // `(error_sum, weight_sum)` via `evaluate`, then `get_final_error`
             // reduces them (e.g. `error / weight`). The trait owns its own folding
@@ -509,8 +599,15 @@ impl EvalMetric {
             Self::PrecisionAt { top, border } => precision_at_group(approx, target, *top, *border),
             Self::RecallAt { top, border } => recall_at_group(approx, target, *top, *border),
             Self::QueryAuc { auc_type } => query_auc_group(approx, target, *auc_type),
-            // Custom is a FLAT metric (the `eval` path), never the grouped seam.
-            Self::Rmse | Self::Logloss | Self::Msle | Self::Custom(_) => {
+            // Flat metrics (the `eval` path), never the grouped seam:
+            // Rmse/Logloss/Msle, the Min-optimized Mae/Mape/Quantile, and Custom.
+            Self::Rmse
+            | Self::Logloss
+            | Self::Msle
+            | Self::Mae
+            | Self::Mape
+            | Self::Quantile { .. }
+            | Self::Custom(_) => {
                 return Err(CbError::Degenerate(
                     "non-ranking metric passed to the grouped seam (use eval)".to_owned(),
                 ))

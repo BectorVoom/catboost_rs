@@ -15,11 +15,46 @@ use std::path::Path;
 
 use cb_data::Pool;
 use cb_model::{
-    apply_prediction_type, interaction, load_cbm, load_json, predict_raw, prediction_values_change,
-    save_cbm, save_json, shap_values, FeatureImportanceType, PredictionType,
+    apply_prediction_type, export_coreml, export_onnx, interaction, load_cbm, load_json,
+    partial_dependence,
+    predict_raw, predict_raw_staged, prediction_values_change, prediction_values_change_with_data,
+    save_cbm, save_json, shap_values, sum_models, FeatureImportanceType, PartialDependence,
+    PredictionType,
 };
+use cb_train::{parse_metric, EvalMetric};
 
 use crate::error::CatBoostError;
+
+/// Map a trained-loss name to its Min-optimized [`EvalMetric`] for
+/// `LossFunctionChange` (FL-03). Only the supported numeric losses `RMSE`,
+/// `MAE`, `MAPE`, `Quantile[:alpha=..]`, and `Logloss` are accepted — the base
+/// name (before any `:param` suffix) is checked case-insensitively against this
+/// explicit allow-list, then the full descriptor is parsed by
+/// [`cb_train::parse_metric`] (which resolves e.g. `Quantile`'s `alpha`). A
+/// Max-optimized (`AUC`/`Accuracy`/`R²`), ranking (`NDCG`/…), out-of-scope
+/// (`MSLE`), or unknown loss yields [`CatBoostError::UnsupportedLoss`], never a
+/// silent fallback. A malformed *param* on a supported base name also yields
+/// `UnsupportedLoss`, but with the underlying [`cb_train::parse_metric`] reason
+/// appended so the caller can see the loss IS supported and only the param is
+/// wrong.
+///
+/// The base name is `trim`med (like `parse_metric` itself) so a cosmetically
+/// whitespaced descriptor (`" RMSE"`) is not spuriously rejected.
+///
+/// **Quantile caveat:** the model file carries no loss metadata (Q1), so the
+/// caller supplies `loss`; a bare `"Quantile"` resolves the default `alpha=0.5`.
+/// If the model was trained at a different `alpha`, pass the full
+/// `"Quantile:alpha=.."` descriptor — otherwise the pinball final error is
+/// evaluated at the wrong quantile (the facade cannot detect the mismatch).
+fn eval_metric_for_loss(loss: &str) -> Result<EvalMetric, CatBoostError> {
+    let lower = loss.to_ascii_lowercase();
+    let base = lower.split(':').next().unwrap_or(lower.as_str()).trim();
+    match base {
+        "rmse" | "logloss" | "mae" | "mape" | "quantile" => parse_metric(loss)
+            .map_err(|e| CatBoostError::UnsupportedLoss(format!("{loss} ({e})"))),
+        _ => Err(CatBoostError::UnsupportedLoss(loss.to_owned())),
+    }
+}
 
 /// A trained CatBoost model (the published facade over [`cb_model::Model`]).
 ///
@@ -101,6 +136,77 @@ impl Model {
         self.predict_with(pool, PredictionType::RawFormulaVal)
     }
 
+    /// Reject a model the scalar float-only staged path cannot handle (SP-03
+    /// guard): a non-scalar (`approx_dimension > 1`), non-oblivious
+    /// (non-symmetric / Region), or CTR/categorical model. On such a model
+    /// [`predict_raw_staged`] would silently drop dimensions or ignore trees, so
+    /// it is rejected with a typed [`CatBoostError::UnsupportedModel`].
+    fn ensure_scalar_oblivious(&self) -> Result<(), CatBoostError> {
+        let inner = self.as_canonical();
+        if inner.approx_dimension > 1 {
+            return Err(CatBoostError::UnsupportedModel(format!(
+                "staged_predict supports only scalar (approx_dimension == 1) models, got approx_dimension = {}",
+                inner.approx_dimension
+            )));
+        }
+        if !inner.non_symmetric_trees.is_empty() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only oblivious models; this model has non-symmetric trees"
+                    .to_owned(),
+            ));
+        }
+        if !inner.region_trees.is_empty() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only oblivious models; this model has region trees"
+                    .to_owned(),
+            ));
+        }
+        if inner.ctr_data.is_some() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only float-only models; this model has CTR data"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cumulative raw predictions ([`PredictionType::RawFormulaVal`]) over an
+    /// increasing prefix of the ensemble — one `Vec<f64>` per stage, each length
+    /// `n_objects` in object order (scalar oblivious float-only models).
+    ///
+    /// `ntree_start` / `ntree_end` / `eval_period` default to `0` / `0` / `1`
+    /// (all trees, one stage per tree) when `None`, matching upstream
+    /// `staged_predict`. Stages step by `eval_period` and always include
+    /// `ntree_end` (`0` ⇒ all trees) as the final stage; `stages.last()` equals
+    /// [`Model::predict`] for the default schedule.
+    ///
+    /// # Errors
+    /// [`CatBoostError::UnsupportedModel`] if the model is not scalar
+    /// (`approx_dimension > 1`), not oblivious (non-symmetric / Region trees), or
+    /// carries CTR data — checked BEFORE the pool so the scope error is
+    /// deterministic. [`CatBoostError::FeatureMismatch`] if `pool`'s
+    /// float-feature count differs from the model's.
+    pub fn staged_predict(
+        &self,
+        pool: &Pool,
+        ntree_start: Option<usize>,
+        ntree_end: Option<usize>,
+        eval_period: Option<usize>,
+    ) -> Result<Vec<Vec<f64>>, CatBoostError> {
+        self.ensure_scalar_oblivious()?;
+        let columns = self.feature_columns(pool)?;
+        let start = ntree_start.unwrap_or(0);
+        let end = ntree_end.unwrap_or(0);
+        let period = eval_period.unwrap_or(1);
+        Ok(predict_raw_staged(
+            self.as_canonical(),
+            &columns,
+            start,
+            end,
+            period,
+        ))
+    }
+
     /// Predict class probabilities ([`PredictionType::Probability`]) — the D-06
     /// shorthand. Two values per object (`[class-0, class-1]`, row-major).
     ///
@@ -158,29 +264,73 @@ impl Model {
     /// the ONLY way to obtain [`FeatureImportanceType::LossFunctionChange`], which
     /// re-evaluates the objective metric with each feature's per-document SHAP
     /// contribution removed; the result is `(feature, feature, score)` tuples in
-    /// feature-index order. The structure-only variants
-    /// ([`FeatureImportanceType::PredictionValuesChange`] /
-    /// [`FeatureImportanceType::Interaction`]) ignore the dataset and delegate to
+    /// feature-index order.
+    ///
+    /// [`FeatureImportanceType::PredictionValuesChange`] recomputes each tree's
+    /// per-leaf weights from `pool`'s columns
+    /// ([`cb_model::prediction_values_change_with_data`], upstream's
+    /// `data=pool` mode) instead of using the model's stored training-time
+    /// `leaf_weights` — for online-CTR models the two genuinely differ (documents
+    /// land in different leaves under training-time online CTR values than under
+    /// the final baked tables), so this is required for oracle parity against a
+    /// `data=pool` fixture on a CTR model.
+    ///
+    /// [`FeatureImportanceType::Interaction`] has no dataset-aware mode in this
+    /// crate yet ([`cb_model::interaction`] is structure-only — it reads each
+    /// tree's baked `leaf_values`, never `leaf_weights`, so there is currently no
+    /// dataset-recomputed variant to call); it ignores `pool` and delegates to
     /// [`Model::feature_importance`].
     ///
+    /// For [`FeatureImportanceType::LossFunctionChange`], `loss` names the
+    /// model's trained objective (case-insensitive); the model file carries no
+    /// loss metadata (Q1), so the caller supplies it. Only the Min-optimized
+    /// numeric losses `RMSE`, `MAE`, `MAPE`, `Quantile[:alpha=..]`, and `Logloss`
+    /// are supported in this slice — any other (Max-optimized, ranking, or
+    /// unknown) loss yields [`CatBoostError::UnsupportedLoss`] rather than a
+    /// silent wrong-metric fallback (FL-03). `loss` is ignored by the
+    /// structure-only variants.
+    ///
     /// # Errors
-    /// [`CatBoostError`] if the pool's feature columns cannot be projected.
+    /// [`CatBoostError::FeatureMismatch`] if the pool's feature columns cannot be
+    /// projected; [`CatBoostError::UnsupportedLoss`] for an out-of-scope
+    /// `LossFunctionChange` loss name.
     pub fn feature_importance_with_data(
         &self,
         importance_type: FeatureImportanceType,
         pool: &Pool,
+        loss: &str,
     ) -> Result<Vec<(usize, usize, f64)>, CatBoostError> {
         match importance_type {
-            FeatureImportanceType::PredictionValuesChange
-            | FeatureImportanceType::Interaction => Ok(self.feature_importance(importance_type)),
-            FeatureImportanceType::LossFunctionChange => {
+            FeatureImportanceType::PredictionValuesChange => {
                 let columns = self.feature_columns(pool)?;
-                let labels = pool.label().to_vec();
+                let cat_columns = pool.cat_features().to_vec();
+                Ok(
+                    prediction_values_change_with_data(&self.inner, &columns, &cat_columns)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(feature, score)| (feature, feature, score))
+                        .collect(),
+                )
+            }
+            FeatureImportanceType::Interaction => Ok(self.feature_importance(importance_type)),
+            FeatureImportanceType::LossFunctionChange => {
+                // Map the trained loss → its Min-optimized `EvalMetric`; reject
+                // anything outside the supported numeric set (no silent Logloss).
+                let metric = eval_metric_for_loss(loss)?;
+                let columns = self.feature_columns(pool)?;
+                // Inject the metric's `GetFinalError` as a non-panicking closure.
+                // Weights: unit only — this first slice ignores per-object `Pool`
+                // weights (SPEC R3), matching the retained Logloss path; a weighted
+                // pool would diverge from upstream's weighted `GetFinalError`, so
+                // weighted `LossFunctionChange` stays out of scope until a weighted
+                // oracle exists. A degenerate `eval` (length/empty/weight guard)
+                // yields `NaN` rather than panicking across the public boundary.
                 let scores = cb_model::loss_function_change(
                     &self.inner,
                     &columns,
-                    &labels,
+                    pool.label(),
                     self.n_float_features(),
+                    |approx, target| metric.eval(approx, target, &[]).unwrap_or(f64::NAN),
                 );
                 Ok(scores
                     .into_iter()
@@ -189,6 +339,30 @@ impl Model {
                     .collect())
             }
         }
+    }
+
+    /// Compute partial dependence for one or two float features over `pool`
+    /// (FSTR-03). Each target feature is swept across its per-bin grid while the
+    /// other features keep their per-object `pool` values; the `RawFormulaVal` is
+    /// averaged over all objects, matching upstream `plot_partial_dependence`
+    /// within `1e-5`. Returns the per-feature grids and the averaged surface
+    /// (row-major, first feature outer, for two features) — see
+    /// [`cb_model::PartialDependence`].
+    ///
+    /// `features` indexes the model's float-feature space (`0..n_float_features`);
+    /// pass 1 or 2 distinct indices.
+    ///
+    /// # Errors
+    /// [`CatBoostError::FeatureMismatch`] if `pool`'s float-feature count differs
+    /// from the model's; [`CatBoostError::PartialDependence`] for an invalid
+    /// request (bad arity, out-of-range / duplicate feature, empty dataset).
+    pub fn partial_dependence(
+        &self,
+        pool: &Pool,
+        features: &[usize],
+    ) -> Result<PartialDependence, CatBoostError> {
+        let columns = self.feature_columns(pool)?;
+        Ok(partial_dependence(&self.inner, &columns, features)?)
     }
 
     /// Save the model to a native `.cbm` file (D-07).
@@ -229,5 +403,51 @@ impl Model {
     pub fn load_json(path: &Path) -> Result<Self, CatBoostError> {
         let inner = load_json(path)?;
         Ok(Self::from_canonical(inner))
+    }
+
+    /// Export to ONNX (EXPORT-01): a float-only, oblivious, identity-scale
+    /// model only — categorical/CTR and non-oblivious (Lossguide/Depthwise/
+    /// Region) models are rejected with a typed error, never a panic.
+    /// `is_classifier` selects `TreeEnsembleClassifier`+`ZipMap`
+    /// (`post_transform="LOGISTIC"`/`"SOFTMAX"`) vs `TreeEnsembleRegressor`
+    /// (`post_transform="NONE"`) — see [`cb_model::export_onnx`]. The caller
+    /// supplies this because the model carries no loss-function/objective
+    /// metadata to infer it from.
+    ///
+    /// # Errors
+    /// [`CatBoostError::Export`] on an unsupported model (categorical/CTR,
+    /// non-oblivious) or a downstream encode/I/O failure.
+    pub fn save_onnx(&self, path: &Path, is_classifier: bool) -> Result<(), CatBoostError> {
+        export_onnx(&self.inner, path, is_classifier)?;
+        Ok(())
+    }
+
+    /// Export to Apple CoreML `.mlmodel` (EXPORT-02): a float-only, oblivious,
+    /// scalar REGRESSOR model only — categorical/CTR, non-oblivious
+    /// (Lossguide/Depthwise/Region), and multi-dimensional (multiclass) models
+    /// are rejected with a typed error, never a panic. The emitted
+    /// `treeEnsembleRegressor` replicates CatBoost's own `.mlmodel` node
+    /// numbering — see [`cb_model::export_coreml`].
+    ///
+    /// # Errors
+    /// [`CatBoostError::CoreMlExport`] on an unsupported model (categorical/CTR,
+    /// non-oblivious, region, or multi-dimensional) or a downstream encode/I/O
+    /// failure.
+    pub fn save_coreml(&self, path: &Path) -> Result<(), CatBoostError> {
+        export_coreml(&self.inner, path)?;
+        Ok(())
+    }
+
+    /// Combine several models into one weighted-sum model (D-07 analogue).
+    /// `weights[i]` scales model `i`'s leaf contributions; `None` defaults
+    /// every model to weight `1.0`.
+    ///
+    /// # Errors
+    /// [`CatBoostError::Model`] on an unmergeable set — see
+    /// [`cb_model::sum_models`].
+    pub fn sum_models(models: &[&Model], weights: Option<&[f64]>) -> Result<Model, CatBoostError> {
+        let canonical: Vec<&cb_model::Model> = models.iter().map(|m| &m.inner).collect();
+        let merged = sum_models(&canonical, weights.unwrap_or(&[]))?;
+        Ok(Self::from_canonical(merged))
     }
 }

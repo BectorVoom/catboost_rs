@@ -2303,6 +2303,13 @@ fn assign_leaves_ctr_aware(
 /// path scores single-dimension der1 (`approx_dim == 1`, the
 /// `reduce_leaf_stats` + `split_score` scalar contract) so the histogram carries
 /// one delta channel + one shared weight channel.
+///
+/// `leaf_of` is the CALLER-precomputed [`assign_leaves_ctr_aware`] partition over
+/// the FULL `chosen` (the current tree's live partition) — the caller
+/// ([`select_level_ctr_aware`]) already needs this same partition for
+/// [`max_bucket_count_with_phantom`], so it is computed exactly ONCE per level and
+/// threaded through here rather than recomputed.
+#[allow(clippy::too_many_arguments)]
 fn build_ctr_aware_histogram(
     matrix: &FeatureMatrix,
     ctr_features: &[crate::ctr::CtrFeatureColumn],
@@ -2311,6 +2318,7 @@ fn build_ctr_aware_histogram(
     der1: &[f64],
     weight: &[f64],
     n_objects: usize,
+    leaf_of: &[usize],
 ) -> BucketHistogram {
     let n_float = matrix.n_features();
     let n_ctr = ctr_features.len();
@@ -2366,11 +2374,11 @@ fn build_ctr_aware_histogram(
 
     // The current partition (chosen splits), forward-bit leaf order — the SAME
     // partition `assign_leaves_ctr_aware` yields, so the scan's canonical
-    // `[false, true]` leaf order matches the pre-rewrite rescan exactly.
-    let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, chosen, n_objects);
+    // `[false, true]` leaf order matches the pre-rewrite rescan exactly. Passed
+    // in by the caller (see doc comment above) rather than recomputed here.
     let n_leaves = 1usize << chosen.len();
     build_bucket_histogram(
-        &bins, der1, weight, &leaf_of, n_leaves, n_features, n_bins, approx_dim,
+        &bins, der1, weight, leaf_of, n_leaves, n_features, n_bins, approx_dim,
     )
 }
 
@@ -2523,6 +2531,169 @@ impl FeaturePenalties<'_> {
     }
 }
 
+/// Whether a combination (`>= 2`-feature) CTR projection is eligible to be
+/// scored at the CURRENT level, given the tree's already-chosen CTR
+/// projections (ORD-06-01/02, `AddTreeCtrs`, `greedy_tensor_search.cpp:503-568`,
+/// `v1.2.10`). Mirrors upstream's `seenProj`/`baseProj.IsEmpty()` gate, restricted
+/// to this codebase's categorical-only [`crate::TProjection`] (SPEC.md §1
+/// "Codebase-specific simplification" — upstream's `binAndOneHotFeaturesTree`
+/// half of `seenProj` would only ever license a MIXED float+cat projection,
+/// which this codebase's purely-categorical `TProjection` cannot represent; only
+/// the `GetUsedCtrs()` half — already-chosen `Ctr` splits' projections — is
+/// relevant here).
+///
+/// A SIMPLE (single-feature) projection is ALWAYS eligible — this predicate is
+/// never called for one (callers guard on `projection.is_combination()` first).
+/// A COMBINATION projection `p` is eligible iff `used_projections` contains some
+/// projection `q` such that `q`'s cat-feature set is a SUBSET of `p`'s with
+/// EXACTLY one fewer member (`p` is `q` extended by exactly one feature) —
+/// mirroring `AddTreeCtrs`'s `proj.AddCatFeature(...)` one-at-a-time extension.
+/// Returns `false` for EVERY combination whenever `used_projections` is empty
+/// (tree root, or a tree so far containing only `Float` splits — no `Ctr` split
+/// chosen yet), exactly mirroring upstream's `baseProj.IsEmpty()` root-level
+/// skip.
+#[must_use]
+fn combination_ctr_eligible(
+    projection: &crate::TProjection,
+    used_projections: &[&crate::TProjection],
+) -> bool {
+    let members = projection.cat_features();
+    used_projections.iter().any(|q| {
+        let q_members = q.cat_features();
+        q_members.len() + 1 == members.len()
+            && q_members.iter().all(|m| members.contains(m))
+    })
+}
+
+/// The `model_size_reg` cat-feature-weight penalty's `max_bucket_count` input
+/// (`CalcMaxFeatureValueCount`, `greedy_tensor_search.cpp:1097-1115`), SCOPED to
+/// the per-level ELIGIBLE candidate set (ORD-06-04, a plan-checker CRITICAL
+/// finding): upstream computes this max over `candidatesContexts` — the CURRENT
+/// LEVEL's already-`AddTreeCtrs`-gated candidate list — never over an ineligible
+/// combination's bucket count. A SIMPLE column is always eligible (unconditional,
+/// `AddSimpleCtrs`); a COMBINATION column is eligible under the SAME
+/// [`combination_ctr_eligible`] rule ORD-06-03 applies to `scored`, so both gates
+/// stay in lockstep (no separately-maintained copy of the eligibility rule).
+/// Falls back to `1` when the eligible set is empty (the pre-existing
+/// `.unwrap_or(1).max(1)` guard, preserved unchanged).
+#[must_use]
+fn eligible_max_bucket_count(
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    used_projections: &[&crate::TProjection],
+) -> usize {
+    ctr_features
+        .iter()
+        .filter(|c| {
+            c.projection.is_simple() || combination_ctr_eligible(&c.projection, used_projections)
+        })
+        .map(|c| c.bucket_count)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// ORD-07-01: the number of DISTINCT `(current-partition-leaf, cat-value)` pairs
+/// actually observed in the learn sample, for ONE CTR-eligible categorical
+/// feature, given the tree's CURRENT partition. Mirrors upstream's
+/// `binAndOneHotFeaturesTree`-derived phantom projection (`AddTreeCtrs`,
+/// `greedy_tensor_search.cpp:517-522` builds this base; `CalcMaxFeatureValueCount`,
+/// `:1097-1115` consumes its bucket count) — this projection is NEVER itself a
+/// scoreable candidate in this codebase (categorical-only `TProjection`, ORD-06's
+/// simplification), it exists ONLY to correctly size `max_bucket_count`.
+///
+/// `leaf_of` is the per-object partition assignment over the chosen `Float`
+/// splits ONLY ([`assign_leaves_ctr_aware`] restricted to `CtrAwareSplit::Float`
+/// entries — see [`max_bucket_count_with_phantom`]'s doc comment for why `Ctr`
+/// splits must NOT contribute a bit here); `cat_bucket` is the per-object
+/// [`cb_data::perfect_hash_bins`] bucket index for ONE CTR-eligible cat feature
+/// (raw categorical identity, NOT an online-CTR value). A length mismatch
+/// degrades to the shorter length via `.zip` — never panics, never indexes.
+#[must_use]
+fn phantom_mixed_bucket_count(leaf_of: &[usize], cat_bucket: &[u32]) -> usize {
+    leaf_of
+        .iter()
+        .zip(cat_bucket.iter())
+        .map(|(&leaf, &bucket)| (leaf, bucket))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// ORD-07-02: whether the [`phantom_mixed_bucket_count`] contribution applies at
+/// all at this level — `true` iff `chosen` contains `>= 1` [`CtrAwareSplit::Float`]
+/// entry. Mirrors `binAndOneHotFeaturesTree`'s non-empty condition
+/// (`greedy_tensor_search.cpp:517-522`): `binAndOneHotFeaturesTree.BinFeatures =
+/// currentTree.GetBinFeatures()` is built and inserted into `seenProj`
+/// UNCONDITIONALLY, independent of whether any `Ctr` split has ALSO been chosen —
+/// so this gate depends ONLY on chosen Float (and one-hot) splits, never on
+/// `Ctr` splits, and is independent of / additive to ORD-06-04's
+/// `combination_ctr_eligible` gating.
+#[must_use]
+fn phantom_bucket_gate(chosen: &[CtrAwareSplit]) -> bool {
+    chosen.iter().any(|s| matches!(s, CtrAwareSplit::Float(_)))
+}
+
+/// ORD-07-03: SPEC.md §4's combined `max_bucket_count` — ORD-06-04's per-level
+/// ELIGIBLE-candidate maximum (`eligible_max`, computed by the caller via
+/// [`eligible_max_bucket_count`], UNCHANGED), `.max`-combined with ORD-07's
+/// phantom mixed float-partition + categorical-feature contribution
+/// ([`phantom_mixed_bucket_count`], gated by [`phantom_bucket_gate`]) — a single
+/// outer `.max(...)` over the two INDEPENDENT contributions to the SAME final
+/// value, matching upstream's `CalcMaxFeatureValueCount`
+/// (`greedy_tensor_search.cpp:1097-1115`).
+///
+/// `cat_eligible_buckets` is one raw per-object [`cb_data::perfect_hash_bins`]
+/// column per CTR-eligible categorical feature (may be empty when no cat
+/// features are eligible, e.g. the numeric-only training path — the `.max()`
+/// over an empty iterator then contributes `0`, a correct no-op).
+///
+/// The phantom partition MUST be built from ONLY the chosen `Float` splits, not
+/// the full `chosen` (which may also contain `Ctr` splits) — upstream's
+/// `binAndOneHotFeaturesTree.BinFeatures` is `currentTree.GetBinFeatures()`
+/// (`greedy_tensor_search.cpp:517-522`), which is the chosen Float/one-hot split
+/// list ONLY; a `Ctr` split chosen earlier in the SAME tree never contributes a
+/// bit to this partition. `chosen_leaf_of` is the caller's ALREADY-COMPUTED
+/// [`assign_leaves_ctr_aware`] partition over the FULL `chosen` (needed anyway
+/// for the level's histogram, see [`build_ctr_aware_histogram`]); when `chosen`
+/// contains no `Ctr` split (the common case before the tree's first `Ctr` split
+/// is chosen), the Float-only partition IS `chosen_leaf_of` byte-for-byte, so it
+/// is reused directly instead of a second, redundant
+/// [`assign_leaves_ctr_aware`] pass. Only when `chosen` actually mixes `Float`
+/// and `Ctr` splits is a second, narrower pass over the Float-only subset paid.
+#[allow(clippy::too_many_arguments)]
+fn max_bucket_count_with_phantom(
+    matrix: &FeatureMatrix,
+    ctr_features: &[crate::ctr::CtrFeatureColumn],
+    chosen: &[CtrAwareSplit],
+    n_objects: usize,
+    eligible_max: usize,
+    cat_eligible_buckets: &[Vec<u32>],
+    chosen_leaf_of: &[usize],
+) -> usize {
+    let phantom_max = if phantom_bucket_gate(chosen) {
+        let float_chosen: Vec<CtrAwareSplit> = chosen
+            .iter()
+            .copied()
+            .filter(|s| matches!(s, CtrAwareSplit::Float(_)))
+            .collect();
+        let computed_leaf_of;
+        let leaf_of: &[usize] = if float_chosen.len() == chosen.len() {
+            chosen_leaf_of
+        } else {
+            computed_leaf_of =
+                assign_leaves_ctr_aware(matrix, ctr_features, &float_chosen, n_objects);
+            &computed_leaf_of
+        };
+        cat_eligible_buckets
+            .iter()
+            .map(|buckets| phantom_mixed_bucket_count(leaf_of, buckets))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    eligible_max.max(phantom_max).max(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_level_ctr_aware(
     matrix: &FeatureMatrix,
@@ -2535,6 +2706,7 @@ fn select_level_ctr_aware(
     n_objects: usize,
     model_size_reg: f64,
     score_function: EScoreFunction,
+    cat_eligible_buckets: &[Vec<u32>],
 ) -> CbResult<CtrAwareSplit> {
     let mut scored: Vec<(CtrAwareSplit, f64)> = Vec::new();
 
@@ -2544,6 +2716,11 @@ fn select_level_ctr_aware(
     // ENUMERATION ORDER, the `cat_feature_weight` insertion point, and the strict
     // `>` first-wins tie-break are byte-for-byte unchanged.
     let n_float = matrix.n_features();
+    // Computed ONCE per level and shared by `build_ctr_aware_histogram` (the
+    // current tree's live partition, needed for scoring) and, when relevant,
+    // `max_bucket_count_with_phantom` (which reuses it directly whenever
+    // `chosen` is Float-only — see that function's doc comment).
+    let leaf_of = assign_leaves_ctr_aware(matrix, ctr_features, chosen, n_objects);
     let hist = build_ctr_aware_histogram(
         matrix,
         ctr_features,
@@ -2552,6 +2729,7 @@ fn select_level_ctr_aware(
         der1,
         weight,
         n_objects,
+        &leaf_of,
     );
 
     // FLOAT candidates first (AddFloatFeatures), feature asc / border asc.
@@ -2566,19 +2744,10 @@ fn select_level_ctr_aware(
         }
     }
 
-    // The `model_size_reg` cat-feature-weight penalty inputs (GetCatFeatureWeight,
-    // greedy_tensor_search.cpp:908-932 + CalcMaxFeatureValueCount:1070-1088):
-    //   * `max_bucket_count` = max distinct-bucket count over ALL CTR candidate
-    //     columns (the candidates this level scores).
-    //   * a projection ALREADY split in this tree (`chosen`) is exempt (weight 1.0)
-    //     — the penalty only down-weights NEW projections, so a second border on an
-    //     already-used simple CTR is never penalized while a new combination CTR is.
-    let max_bucket_count = ctr_features
-        .iter()
-        .map(|c| c.bucket_count)
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    // ORD-06-04: `used_projections` must be computed BEFORE `max_bucket_count`,
+    // since the latter's eligibility filter (below) consumes it — the SAME
+    // "already-chosen `Ctr` split projections" set ORD-06-03's `scored` guard
+    // uses.
     let used_projections: Vec<&crate::TProjection> = chosen
         .iter()
         .filter_map(|s| match s {
@@ -2589,11 +2758,51 @@ fn select_level_ctr_aware(
         })
         .collect();
 
+    // The `model_size_reg` cat-feature-weight penalty inputs (GetCatFeatureWeight,
+    // greedy_tensor_search.cpp:908-932 + CalcMaxFeatureValueCount:1070-1088):
+    //   * `max_bucket_count` = max distinct-bucket count over the per-level
+    //     ELIGIBLE CTR candidate columns ONLY (ORD-06-04 — `CalcMaxFeatureValueCount`
+    //     iterates `candidatesContexts`, the CURRENT LEVEL's already-`AddTreeCtrs`-
+    //     gated list, never an ineligible combination's bucket count) — ADDITIVELY
+    //     combined (ORD-07-03) with the phantom mixed float-partition +
+    //     categorical-feature projection's bucket count upstream's
+    //     `CalcMaxFeatureValueCount` ALSO includes once the tree has chosen `>= 1`
+    //     Float split (`AddTreeCtrs`'s unconditional `binAndOneHotFeaturesTree`),
+    //     via a single outer `.max(...)` — see `max_bucket_count_with_phantom`.
+    //   * a projection ALREADY split in this tree (`chosen`) is exempt (weight 1.0)
+    //     — the penalty only down-weights NEW projections, so a second border on an
+    //     already-used simple CTR is never penalized while a new combination CTR is.
+    let eligible_max = eligible_max_bucket_count(ctr_features, &used_projections);
+    let max_bucket_count = max_bucket_count_with_phantom(
+        matrix,
+        ctr_features,
+        chosen,
+        n_objects,
+        eligible_max,
+        cat_eligible_buckets,
+        &leaf_of,
+    );
+
     // CTR candidates next (AddTreeCtrs), column asc / border asc. One candidate per
     // CTR-value border in `0..ctr_border_count`; the `ctr_bin > border` test
     // borders are the integer bucket thresholds the materialized `bins` are
     // quantized into (a border `b` ⇔ bucket > `b`, i.e. bucket ≥ `b + 1`).
     for col in 0..ctr_features.len() {
+        // ORD-06-03: a COMBINATION (multi-feature) projection is only eligible at
+        // this level if it extends an ALREADY-CHOSEN `Ctr` split's projection by
+        // exactly one more feature (`AddTreeCtrs`'s `seenProj`/`baseProj.IsEmpty()`
+        // gate, greedy_tensor_search.cpp:503-568). Skip an ineligible combination
+        // BEFORE any scoring work (`cat_feature_weight`/`score_candidate_ctr_aware`)
+        // — never even considered, matching upstream semantics. SIMPLE (single-
+        // feature) columns are unaffected (`AddSimpleCtrs`, unconditional every
+        // level).
+        let ineligible_combination = ctr_features.get(col).is_some_and(|column| {
+            column.projection.is_combination()
+                && !combination_ctr_eligible(&column.projection, &used_projections)
+        });
+        if ineligible_combination {
+            continue;
+        }
         // The cat-feature weight for this column's projection (1.0 if already used,
         // else (1 + count/maxCount)^(-model_size_reg)).
         let cat_weight = match ctr_features.get(col) {
@@ -2654,6 +2863,16 @@ fn select_level_ctr_aware(
 /// `ctr_features` are the IDENTITY-learning-fold materialized CTR columns
 /// (structure search); `target_border_idx` is the Buckets per-class numerator
 /// selector carried onto each chosen `CtrSplitSpec` (default `0`).
+/// `cat_eligible_buckets` (ORD-07) is one raw per-object
+/// [`cb_data::perfect_hash_bins`] column per CTR-eligible categorical feature —
+/// the phantom mixed float-partition + categorical-feature projection's bucket
+/// count that upstream's `CalcMaxFeatureValueCount`
+/// (`greedy_tensor_search.cpp:1097-1115`) folds into `max_bucket_count` once the
+/// tree has chosen `>= 1` Float split, EVEN THOUGH this codebase's
+/// categorical-only `TProjection` never scores that mixed projection itself as a
+/// candidate (ORD-06's simplification). Pass `&[]` when no cat features are
+/// CTR-eligible (e.g. the numeric-only training path) — a correct, provable
+/// no-op.
 ///
 /// IMPORTANT — this computes the STRUCTURE only. `grown.leaf_of` is the structure
 /// partition; Plan 05-13 Task 2 REASSIGNS leaf_of over the averaging-fold CTR
@@ -2678,6 +2897,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
     target_border_idx: usize,
     model_size_reg: f64,
     score_function: EScoreFunction,
+    cat_eligible_buckets: &[Vec<u32>],
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
@@ -2694,6 +2914,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
             n_objects,
             model_size_reg,
             score_function,
+            cat_eligible_buckets,
         )?;
         chosen.push(best);
     }

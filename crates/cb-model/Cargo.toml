@@ -36,6 +36,16 @@ flatbuffers = "25.12.19"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# ONNX export (EXPORT-01 / Phase 17 T0). Encodes the hand-built `onnx::ModelProto`
+# to protobuf wire bytes via `prost::Message::encode`. The ONNX message TYPES
+# themselves are a COMMITTED, generated-once `src/generated/onnx_generated.rs`
+# (mirrors the flatbuffers precedent above — `protox`/`prost-build` run ONCE,
+# offline, out of the `cargo build` graph, never as a build dependency here).
+# Pinned to the latest stable release resolved at scaffold time (2026-07-17);
+# maintained by the tokio-rs org, widely adopted (gRPC/protobuf de facto Rust
+# standard) — passes the project's informal Package Legitimacy Audit bar
+# (research.md "Dependency Analysis").
+prost = "0.14.4"
 
 [dev-dependencies]
 # Test/dev edge only (D-14/D-15): the oracle harness + npy readers for the

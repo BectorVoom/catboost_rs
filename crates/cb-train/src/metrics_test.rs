@@ -178,3 +178,121 @@ fn msle_is_never_a_for_loss_default() {
         assert_ne!(EvalMetric::for_loss(&loss), EvalMetric::Msle);
     }
 }
+
+// --- MAE eval-metric (EM-01, Min-optimized flat metric) --------------------
+
+/// MAE = mean_w( |approx - target| ) over a hand-computed unweighted set:
+/// approx=[1,3], target=[2,2] -> abs diffs [1, 1], mean = (1+1)/2 = 1.0.
+#[test]
+fn mae_eval() {
+    let approx = [1.0, 3.0];
+    let target = [2.0, 2.0];
+    let got = EvalMetric::Mae.eval(&approx, &target, &[]).unwrap();
+    assert!((got - 1.0).abs() < 1e-12, "mae unweighted = {got}");
+}
+
+/// Weighted MAE: approx=[1,2,3], target=[1.5,1.0,4.0] -> abs diffs [0.5, 1.0, 1.0];
+/// weights [1,2,1] -> weighted sum 0.5 + 2.0 + 1.0 = 3.5 / total weight 4.0 = 0.875.
+#[test]
+fn mae_eval_weighted() {
+    let approx = [1.0, 2.0, 3.0];
+    let target = [1.5, 1.0, 4.0];
+    let weights = [1.0, 2.0, 1.0];
+    let got = EvalMetric::Mae.eval(&approx, &target, &weights).unwrap();
+    assert!((got - 0.875).abs() < 1e-12, "mae weighted = {got}");
+}
+
+/// MAE rejects a length mismatch (approx vs target, or weights) with a typed
+/// error — reusing the shared flat-arm guards (never a panic, T-03-06-01).
+#[test]
+fn mae_rejects_length_mismatch() {
+    assert!(EvalMetric::Mae.eval(&[1.0, 2.0], &[1.0], &[]).is_err());
+    assert!(EvalMetric::Mae
+        .eval(&[1.0, 2.0], &[1.0, 2.0], &[1.0])
+        .is_err());
+}
+
+// --- MAPE eval-metric (EM-02, Min-optimized flat metric, zero-target guard) -
+//
+// R1 (MAPE zero-target divisor) is PROVISIONAL: EMT-3 implements the arm against
+// the first hypothesis `D(t) = max(1.0, |t|)` (candidate upstream `TMAPEMetric`
+// convention). The exact convention is FINALIZED in EMT-6 against the frozen
+// `catboost==1.2.10` scalar in `calc_metrics_flat_oracle_test::mape*`. The
+// value-bearing assertions below therefore encode the PROVISIONAL divisor and may
+// be updated when EMT-6 pins the convention; `mape_zero_target_finite` asserts
+// FINITENESS ONLY, so it holds under any of the three candidate conventions.
+
+/// MAPE = mean_w( |approx - target| / max(1.0, |target|) ) over a hand-computed
+/// unweighted set (PROVISIONAL divisor `D(t) = max(1.0, |t|)`, pinned in EMT-6):
+/// approx=[1,2], target=[2,0.5] -> |a-t| = [1.0, 1.5]; D = [max(1,2), max(1,0.5)]
+/// = [2.0, 1.0]; per-object = [0.5, 1.5]; mean = (0.5+1.5)/2 = 1.0.
+/// The `0.5` target row exercises the `max(1.0, .)` guard (plain `|t|` would give
+/// a different value), so this test discriminates the provisional convention.
+#[test]
+fn mape_eval() {
+    let approx = [1.0, 2.0];
+    let target = [2.0, 0.5];
+    let got = EvalMetric::Mape.eval(&approx, &target, &[]).unwrap();
+    assert!((got - 1.0).abs() < 1e-12, "mape unweighted = {got}");
+}
+
+/// MAPE stays FINITE when a target is exactly `0.0` — the whole point of the
+/// zero-target guard (no NaN / Inf, EM-02). Asserts finiteness only (holds under
+/// any candidate `D(t)` convention; the exact value is pinned in EMT-6).
+#[test]
+fn mape_zero_target_finite() {
+    let approx = [1.0, 2.0];
+    let target = [0.0, 2.0];
+    let got = EvalMetric::Mape.eval(&approx, &target, &[]).unwrap();
+    assert!(got.is_finite(), "mape with zero target must be finite: {got}");
+}
+
+/// MAPE rejects a length mismatch (approx vs target, or weights) with a typed
+/// error — reusing the shared flat-arm guards (never a panic, T-03-06-01).
+#[test]
+fn mape_rejects_length_mismatch() {
+    assert!(EvalMetric::Mape.eval(&[1.0, 2.0], &[1.0], &[]).is_err());
+    assert!(EvalMetric::Mape
+        .eval(&[1.0, 2.0], &[1.0, 2.0], &[1.0])
+        .is_err());
+}
+
+// --- Quantile eval-metric (EM-03 math, Min-optimized flat metric) -----------
+//
+// Quantile is the mean pinball loss `Σ w·pinball / Σ w`, where
+// `pinball(a,t,alpha) = t>=a ? alpha·(t−a) : (1−alpha)·(a−t)`. At `alpha=0.5`
+// every row contributes `0.5·|a−t|`, so the metric equals `0.5·MAE` (this is the
+// default `alpha`; parse of the `alpha` param is EMT-5, not exercised here).
+
+/// Quantile at the default `alpha=0.5` equals `0.5·MAE` over the EMT-2 MAE
+/// vectors: approx=[1,3], target=[2,2] -> MAE = 1.0, so Quantile(0.5) = 0.5.
+#[test]
+fn quantile_eval_default() {
+    let approx = [1.0, 3.0];
+    let target = [2.0, 2.0];
+    let mae = EvalMetric::Mae.eval(&approx, &target, &[]).unwrap();
+    let got = EvalMetric::Quantile { alpha: 0.5 }
+        .eval(&approx, &target, &[])
+        .unwrap();
+    assert!(
+        (got - 0.5 * mae).abs() < 1e-12,
+        "quantile(0.5) = {got} must equal 0.5*MAE = {}",
+        0.5 * mae
+    );
+    assert!((got - 0.5).abs() < 1e-12, "quantile(0.5) = {got}");
+}
+
+/// Asymmetric hand calc at `alpha=0.9`: approx=[0,10], target=[3,2].
+/// Row 0: t=3 >= a=0 (under-predict) -> alpha·(t−a) = 0.9·3 = 2.7.
+/// Row 1: t=2 <  a=10 (over-predict) -> (1−alpha)·(a−t) = 0.1·8 = 0.8.
+/// mean = (2.7 + 0.8) / 2 = 1.75. Distinct from 0.5·MAE (= 2.75) because the
+/// over/under magnitudes are unequal, so the arm must honour `alpha`.
+#[test]
+fn quantile_eval_alpha() {
+    let approx = [0.0, 10.0];
+    let target = [3.0, 2.0];
+    let got = EvalMetric::Quantile { alpha: 0.9 }
+        .eval(&approx, &target, &[])
+        .unwrap();
+    assert!((got - 1.75).abs() < 1e-12, "quantile(0.9) = {got}");
+}

@@ -194,6 +194,12 @@ def main():
     marker3_lines = [ln.strip() for ln in (out_m3 or "").splitlines() if ln.strip().isdigit()]
     result["staged_source_has_round3_kernels"] = bool(marker3_lines and int(marker3_lines[0]) > 0)
     log("staged_source_has_round3_kernels:", result["staged_source_has_round3_kernels"])
+    # Round-4 provenance marker: the LDS-privatized (shared-memory) partition hist fill.
+    rc_m4, out_m4 = sh("grep -c partition_hist2_lds_kernel "
+                       "/tmp/repo/crates/cb-backend/src/kernels.rs")
+    marker4_lines = [ln.strip() for ln in (out_m4 or "").splitlines() if ln.strip().isdigit()]
+    result["staged_source_has_round4_kernels"] = bool(marker4_lines and int(marker4_lines[0]) > 0)
+    log("staged_source_has_round4_kernels:", result["staged_source_has_round4_kernels"])
 
     # ---------------------------------------------------------------
     # STEP 3 — Rust toolchain
@@ -284,8 +290,29 @@ def main():
     # STEP 8 — warm/drain timed fit helper (fact 9)
     # ---------------------------------------------------------------
     result["timings"] = {"errors": {}}
+    result["quality"] = {}
 
-    def timed_fit(arm_name, make_model, Xd, yd):
+    import numpy as np
+
+    def train_quality(arm_name, model, Xd, yd, kind):
+        """Record a train-set quality number so cross-library speed numbers are
+        comparable (different tree shapes must not win by underfitting): RMSE for
+        regression arms, logloss for binary-classification arms. Never fatal."""
+        try:
+            if kind == "reg":
+                pred = np.asarray(model.predict(Xd), dtype=np.float64).reshape(-1)
+                rmse = float(np.sqrt(np.mean((pred - np.asarray(yd, dtype=np.float64)) ** 2)))
+                result["quality"][arm_name] = {"train_rmse": round(rmse, 6)}
+            else:
+                p = np.asarray(model.predict_proba(Xd), dtype=np.float64)
+                p1 = np.clip(p[:, 1] if p.ndim == 2 else p, 1e-12, 1 - 1e-12)
+                yv = np.asarray(yd, dtype=np.float64)
+                ll = float(-np.mean(yv * np.log(p1) + (1 - yv) * np.log(1 - p1)))
+                result["quality"][arm_name] = {"train_logloss": round(ll, 6)}
+        except Exception as e:
+            result["quality"][arm_name] = {"error": repr(e)}
+
+    def timed_fit(arm_name, make_model, Xd, yd, kind=None):
         try:
             warm = make_model()
             warm.fit(Xd, yd)                  # UNTIMED warm/JIT-absorbing run
@@ -301,6 +328,8 @@ def main():
             _ = list(_[:1]) if hasattr(_, "__iter__") else _
             elapsed = round(time.time() - t0, 4)
             log(f"[{arm_name}] fit_s={elapsed}")
+            if kind:
+                train_quality(arm_name, model, Xd, yd, kind)
             return elapsed
         except Exception as e:
             log(f"[{arm_name}] timed fit FAILED: {e}")
@@ -339,10 +368,112 @@ def main():
             boost_from_average=False, random_seed=RANDOM_SEED, verbose=False)
 
     t = result["timings"]
-    t["catboost_rs_rmse_s"] = timed_fit("catboost_rs_rmse", rs_rmse, X, y_reg)
-    t["catboost_rs_logloss_s"] = timed_fit("catboost_rs_logloss", rs_logloss, X, y_bin)
-    t["catboost_official_gpu_rmse_s"] = timed_fit("catboost_official_gpu_rmse", cb_rmse, X, y_reg)
-    t["catboost_official_gpu_logloss_s"] = timed_fit("catboost_official_gpu_logloss", cb_logloss, X, y_bin)
+    t["catboost_rs_rmse_s"] = timed_fit("catboost_rs_rmse", rs_rmse, X, y_reg, kind="reg")
+    t["catboost_rs_logloss_s"] = timed_fit("catboost_rs_logloss", rs_logloss, X, y_bin, kind="clf")
+    t["catboost_official_gpu_rmse_s"] = timed_fit("catboost_official_gpu_rmse", cb_rmse, X, y_reg, kind="reg")
+    t["catboost_official_gpu_logloss_s"] = timed_fit("catboost_official_gpu_logloss", cb_logloss, X, y_bin, kind="clf")
+
+    # ---------------------------------------------------------------
+    # STEP 9a2 — HGB competitor arms ("win cuML histogram gradient boosting").
+    #
+    # FACT (docs.rapids.ai cuml.accel limitations page, checked 2026-07-16): cuml.accel
+    # does NOT accelerate sklearn's HistGradientBoosting* — its sklearn.ensemble coverage
+    # is RandomForest{Classifier,Regressor} only, and "if you don't see an estimator on
+    # this page, we do not provide acceleration for it". So "cuML histogram gradient
+    # boosting" runs sklearn's CPU implementation even under cuml.accel. We measure:
+    #   (a) sklearn HGB plain (the code cuml.accel would fall back to),
+    #   (b) sklearn HGB under cuml.accel in a SUBPROCESS (proves the fallback empirically
+    #       when cuml is installed on the image),
+    #   (c) XGBoost GPU hist — the RAPIDS-ecosystem GPU histogram-GBDT reference.
+    # Configs are matched to the catboost arms where the knob exists (30 iters, lr 0.1,
+    # depth 6, 32 bins, L2 3.0); remaining knobs are library defaults, and the quality
+    # table keeps the comparison honest across differing tree shapes.
+    # ---------------------------------------------------------------
+    from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+    import sklearn
+    result["sklearn_version"] = sklearn.__version__
+
+    def hgb_reg():
+        return HistGradientBoostingRegressor(
+            max_iter=ITERS, learning_rate=LEARNING_RATE, max_depth=DEPTH,
+            max_bins=BORDER_COUNT, l2_regularization=L2_LEAF_REG,
+            early_stopping=False, random_state=RANDOM_SEED)
+
+    def hgb_clf():
+        return HistGradientBoostingClassifier(
+            max_iter=ITERS, learning_rate=LEARNING_RATE, max_depth=DEPTH,
+            max_bins=BORDER_COUNT, l2_regularization=L2_LEAF_REG,
+            early_stopping=False, random_state=RANDOM_SEED)
+
+    t["sklearn_hgb_rmse_s"] = timed_fit("sklearn_hgb_rmse", hgb_reg, X, y_reg, kind="reg")
+    t["sklearn_hgb_logloss_s"] = timed_fit("sklearn_hgb_logloss", hgb_clf, X, y_bin, kind="clf")
+
+    try:
+        import xgboost
+        result["xgboost_version"] = xgboost.__version__
+
+        def xgb_reg():
+            return xgboost.XGBRegressor(
+                n_estimators=ITERS, learning_rate=LEARNING_RATE, max_depth=DEPTH,
+                max_bin=BORDER_COUNT, reg_lambda=L2_LEAF_REG, tree_method="hist",
+                device="cuda", random_state=RANDOM_SEED, verbosity=0)
+
+        def xgb_clf():
+            return xgboost.XGBClassifier(
+                n_estimators=ITERS, learning_rate=LEARNING_RATE, max_depth=DEPTH,
+                max_bin=BORDER_COUNT, reg_lambda=L2_LEAF_REG, tree_method="hist",
+                device="cuda", random_state=RANDOM_SEED, verbosity=0)
+
+        t["xgboost_gpu_hist_rmse_s"] = timed_fit("xgboost_gpu_hist_rmse", xgb_reg, X, y_reg, kind="reg")
+        t["xgboost_gpu_hist_logloss_s"] = timed_fit("xgboost_gpu_hist_logloss", xgb_clf, X, y_bin, kind="clf")
+    except Exception as e:
+        result["xgboost_version"] = None
+        t["errors"]["xgboost_gpu_hist"] = repr(e)
+
+    # (b) sklearn HGB under cuml.accel, in a subprocess (cuml.accel.install() patches
+    # import machinery process-wide; keep the main process clean). Reports the fit time
+    # and whether cuml is present at all — a time ≈ the plain sklearn arm is the
+    # empirical proof of the documented CPU fallback.
+    accel_script = "/tmp/hgb_cuml_accel.py"
+    with open(accel_script, "w") as fh:
+        fh.write(
+            "import sys, time, json\n"
+            "out = {}\n"
+            "try:\n"
+            "    import cuml.accel, cuml\n"
+            "    cuml.accel.install()\n"
+            "    out['cuml_version'] = cuml.__version__\n"
+            "except Exception as e:\n"
+            "    out['cuml_version'] = None\n"
+            "    out['error'] = repr(e)\n"
+            "    print('HGB_CUML_ACCEL_JSON ' + json.dumps(out), flush=True)\n"
+            "    sys.exit(0)\n"
+            "from sklearn.ensemble import HistGradientBoostingRegressor\n"
+            f"sys.path.insert(0, {os.path.join(REPO, 'bench')!r})\n"
+            "import generator\n"
+            f"X, y = generator.generate(**{SPEED_CONFIG!r})\n"
+            "def mk():\n"
+            "    return HistGradientBoostingRegressor(\n"
+            f"        max_iter={ITERS}, learning_rate={LEARNING_RATE}, max_depth={DEPTH},\n"
+            f"        max_bins={BORDER_COUNT}, l2_regularization={L2_LEAF_REG},\n"
+            f"        early_stopping=False, random_state={RANDOM_SEED})\n"
+            "mk().fit(X, y)\n"
+            "t0 = time.time()\n"
+            "mk().fit(X, y)\n"
+            "out['fit_s'] = round(time.time() - t0, 4)\n"
+            "print('HGB_CUML_ACCEL_JSON ' + json.dumps(out), flush=True)\n"
+        )
+    rc_a, out_a = sh([sys.executable, accel_script], env=env, timeout=1800)
+    accel_info = {"cuml_version": None, "error": "marker line not found"}
+    for ln in (out_a or "").splitlines():
+        if ln.startswith("HGB_CUML_ACCEL_JSON "):
+            try:
+                accel_info = json.loads(ln[len("HGB_CUML_ACCEL_JSON "):])
+            except ValueError:
+                accel_info = {"cuml_version": None, "error": "unparseable marker line"}
+    result["hgb_under_cuml_accel"] = accel_info
+    t["sklearn_hgb_cuml_accel_rmse_s"] = accel_info.get("fit_s")
+    log("hgb_under_cuml_accel:", accel_info)
 
     def ratio(official, rs):
         if isinstance(official, (int, float)) and isinstance(rs, (int, float)) and rs > 0:
@@ -350,9 +481,14 @@ def main():
         return None
 
     result["speedup"] = {
-        # ratio > 1 => catboost_rs faster; < 1 => official CatBoost GPU faster.
+        # ratio > 1 => catboost_rs faster; < 1 => the competitor is faster.
         "rmse_official_over_rs": ratio(t["catboost_official_gpu_rmse_s"], t["catboost_rs_rmse_s"]),
         "logloss_official_over_rs": ratio(t["catboost_official_gpu_logloss_s"], t["catboost_rs_logloss_s"]),
+        "rmse_sklearn_hgb_over_rs": ratio(t.get("sklearn_hgb_rmse_s"), t["catboost_rs_rmse_s"]),
+        "logloss_sklearn_hgb_over_rs": ratio(t.get("sklearn_hgb_logloss_s"), t["catboost_rs_logloss_s"]),
+        "rmse_xgboost_gpu_over_rs": ratio(t.get("xgboost_gpu_hist_rmse_s"), t["catboost_rs_rmse_s"]),
+        "logloss_xgboost_gpu_over_rs": ratio(t.get("xgboost_gpu_hist_logloss_s"), t["catboost_rs_logloss_s"]),
+        "rmse_hgb_cuml_accel_over_rs": ratio(t.get("sklearn_hgb_cuml_accel_rmse_s"), t["catboost_rs_rmse_s"]),
     }
 
     # ---------------------------------------------------------------
@@ -419,11 +555,32 @@ def main():
         fh.write(f"| catboost_rs RMSE | {fmt(t['catboost_rs_rmse_s'])} |\n")
         fh.write(f"| catboost_rs Logloss | {fmt(t['catboost_rs_logloss_s'])} |\n")
         fh.write(f"| official CatBoost GPU RMSE | {fmt(t['catboost_official_gpu_rmse_s'])} |\n")
-        fh.write(f"| official CatBoost GPU Logloss | {fmt(t['catboost_official_gpu_logloss_s'])} |\n\n")
-        fh.write("## Speedup (official / catboost_rs; >1 => catboost_rs faster)\n\n")
-        fh.write("| loss | official_over_rs |\n|---|---|\n")
-        fh.write(f"| RMSE | {fmtx(result['speedup']['rmse_official_over_rs'])} |\n")
-        fh.write(f"| Logloss | {fmtx(result['speedup']['logloss_official_over_rs'])} |\n\n")
+        fh.write(f"| official CatBoost GPU Logloss | {fmt(t['catboost_official_gpu_logloss_s'])} |\n")
+        fh.write(f"| sklearn HGB (CPU) RMSE | {fmt(t.get('sklearn_hgb_rmse_s'))} |\n")
+        fh.write(f"| sklearn HGB (CPU) Logloss | {fmt(t.get('sklearn_hgb_logloss_s'))} |\n")
+        fh.write(f"| sklearn HGB under cuml.accel RMSE | {fmt(t.get('sklearn_hgb_cuml_accel_rmse_s'))} |\n")
+        fh.write(f"| XGBoost GPU hist RMSE | {fmt(t.get('xgboost_gpu_hist_rmse_s'))} |\n")
+        fh.write(f"| XGBoost GPU hist Logloss | {fmt(t.get('xgboost_gpu_hist_logloss_s'))} |\n\n")
+        fh.write("## Speedup (competitor / catboost_rs; >1 => catboost_rs faster)\n\n")
+        fh.write("| competitor | RMSE | Logloss |\n|---|---|---|\n")
+        fh.write(f"| official CatBoost GPU | {fmtx(result['speedup']['rmse_official_over_rs'])} | "
+                 f"{fmtx(result['speedup']['logloss_official_over_rs'])} |\n")
+        fh.write(f"| sklearn HGB (CPU) | {fmtx(result['speedup']['rmse_sklearn_hgb_over_rs'])} | "
+                 f"{fmtx(result['speedup']['logloss_sklearn_hgb_over_rs'])} |\n")
+        fh.write(f"| sklearn HGB under cuml.accel | {fmtx(result['speedup']['rmse_hgb_cuml_accel_over_rs'])} | N/A |\n")
+        fh.write(f"| XGBoost GPU hist | {fmtx(result['speedup']['rmse_xgboost_gpu_over_rs'])} | "
+                 f"{fmtx(result['speedup']['logloss_xgboost_gpu_over_rs'])} |\n\n")
+        fh.write("## Train-set quality (comparability check across tree shapes)\n\n")
+        fh.write("| arm | metric | value |\n|---|---|---|\n")
+        for arm, q in sorted(result.get("quality", {}).items()):
+            for mk_, mv in q.items():
+                fh.write(f"| {arm} | {mk_} | {mv} |\n")
+        fh.write("\n## cuML note (checked against docs.rapids.ai, 2026-07-16)\n\n")
+        fh.write("cuml.accel does NOT accelerate sklearn's HistGradientBoosting* (its "
+                 "sklearn.ensemble coverage is RandomForest only), so 'cuML histogram "
+                 "gradient boosting' executes sklearn's CPU implementation. The "
+                 "'sklearn HGB under cuml.accel' arm above measures exactly that "
+                 f"(cuml present: {result['hgb_under_cuml_accel'].get('cuml_version')!r}).\n\n")
         if t["errors"]:
             fh.write("## Arm errors\n\n")
             for k, v in t["errors"].items():
