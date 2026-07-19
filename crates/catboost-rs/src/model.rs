@@ -16,8 +16,8 @@ use std::path::Path;
 use cb_data::Pool;
 use cb_model::{
     apply_prediction_type, export_onnx, interaction, load_cbm, load_json, partial_dependence,
-    predict_raw, prediction_values_change, save_cbm, save_json, shap_values,
-    FeatureImportanceType, PartialDependence, PredictionType,
+    predict_raw, prediction_values_change, prediction_values_change_with_data, save_cbm,
+    save_json, shap_values, sum_models, FeatureImportanceType, PartialDependence, PredictionType,
 };
 use cb_train::{parse_metric, EvalMetric};
 
@@ -191,9 +191,21 @@ impl Model {
     /// the ONLY way to obtain [`FeatureImportanceType::LossFunctionChange`], which
     /// re-evaluates the objective metric with each feature's per-document SHAP
     /// contribution removed; the result is `(feature, feature, score)` tuples in
-    /// feature-index order. The structure-only variants
-    /// ([`FeatureImportanceType::PredictionValuesChange`] /
-    /// [`FeatureImportanceType::Interaction`]) ignore the dataset and delegate to
+    /// feature-index order.
+    ///
+    /// [`FeatureImportanceType::PredictionValuesChange`] recomputes each tree's
+    /// per-leaf weights from `pool`'s columns
+    /// ([`cb_model::prediction_values_change_with_data`], upstream's
+    /// `data=pool` mode) instead of using the model's stored training-time
+    /// `leaf_weights` — for online-CTR models the two genuinely differ (documents
+    /// land in different leaves under training-time online CTR values than under
+    /// the final baked tables), so this is required for oracle parity against a
+    /// `data=pool` fixture on a CTR model.
+    ///
+    /// [`FeatureImportanceType::Interaction`] has no dataset-aware mode in this
+    /// crate yet ([`cb_model::interaction`] is structure-only — it reads each
+    /// tree's baked `leaf_values`, never `leaf_weights`, so there is currently no
+    /// dataset-recomputed variant to call); it ignores `pool` and delegates to
     /// [`Model::feature_importance`].
     ///
     /// For [`FeatureImportanceType::LossFunctionChange`], `loss` names the
@@ -216,8 +228,18 @@ impl Model {
         loss: &str,
     ) -> Result<Vec<(usize, usize, f64)>, CatBoostError> {
         match importance_type {
-            FeatureImportanceType::PredictionValuesChange
-            | FeatureImportanceType::Interaction => Ok(self.feature_importance(importance_type)),
+            FeatureImportanceType::PredictionValuesChange => {
+                let columns = self.feature_columns(pool)?;
+                let cat_columns = pool.cat_features().to_vec();
+                Ok(
+                    prediction_values_change_with_data(&self.inner, &columns, &cat_columns)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(feature, score)| (feature, feature, score))
+                        .collect(),
+                )
+            }
+            FeatureImportanceType::Interaction => Ok(self.feature_importance(importance_type)),
             FeatureImportanceType::LossFunctionChange => {
                 // Map the trained loss → its Min-optimized `EvalMetric`; reject
                 // anything outside the supported numeric set (no silent Logloss).
@@ -325,5 +347,18 @@ impl Model {
     pub fn save_onnx(&self, path: &Path, is_classifier: bool) -> Result<(), CatBoostError> {
         export_onnx(&self.inner, path, is_classifier)?;
         Ok(())
+    }
+
+    /// Combine several models into one weighted-sum model (D-07 analogue).
+    /// `weights[i]` scales model `i`'s leaf contributions; `None` defaults
+    /// every model to weight `1.0`.
+    ///
+    /// # Errors
+    /// [`CatBoostError::Model`] on an unmergeable set — see
+    /// [`cb_model::sum_models`].
+    pub fn sum_models(models: &[&Model], weights: Option<&[f64]>) -> Result<Model, CatBoostError> {
+        let canonical: Vec<&cb_model::Model> = models.iter().map(|m| &m.inner).collect();
+        let merged = sum_models(&canonical, weights.unwrap_or(&[]))?;
+        Ok(Self::from_canonical(merged))
     }
 }

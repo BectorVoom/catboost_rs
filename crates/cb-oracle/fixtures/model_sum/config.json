@@ -1,0 +1,56 @@
+{
+  "artifacts": [
+    "m0.cbm",
+    "m1.cbm",
+    "X.npy",
+    "expected_m0.npy",
+    "expected_m1.npy",
+    "expected_w_1_1.npy",
+    "expected_w_03_07.npy"
+  ],
+  "catboost_version": "1.2.10",
+  "input_dataset": "numeric_tiny",
+  "m0_params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "depth": 1,
+    "iterations": 1,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "RMSE",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1
+  },
+  "m1_params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "depth": 1,
+    "iterations": 1,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.6,
+    "loss_function": "RMSE",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1
+  },
+  "note": "sum_models (SPEC sum_models, SM-07): two float-only (no cat features -> ctr_data-free) oblivious RMSE regressors sharing IDENTICAL float_feature_borders and bias (SM-04's first-slice merge precondition) but DIFFERENT leaf values (different learning_rate at depth=1/iterations=1 -- see gen_fixtures.py module docstring for why deeper/more-iterations configurations reliably diverge in which borders get baked into the model). expected_m0/expected_m1 isolate apply from merge arithmetic; expected_w_1_1/expected_w_03_07 are catboost.sum_models(...).predict(...) ground truth. Every .predict(...) call pins prediction_type='RawFormulaVal' explicitly.",
+  "prediction_type": "RawFormulaVal",
+  "scenario": "model_sum",
+  "thread_count": 1,
+  "upstream_signature": "sum_models(models, weights=None, ctr_merge_policy='IntersectingCountersAverage')",
+  "weights_03_07": [
+    0.3,
+    0.7
+  ],
+  "weights_1_1": [
+    1.0,
+    1.0
+  ]
+}

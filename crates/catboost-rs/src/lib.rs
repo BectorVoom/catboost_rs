@@ -59,4 +59,6 @@ mod error_test;
 #[cfg(test)]
 mod metrics_test;
 #[cfg(test)]
+mod model_sum_test;
+#[cfg(test)]
 mod onnx_test;

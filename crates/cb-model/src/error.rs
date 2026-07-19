@@ -49,4 +49,11 @@ pub enum ModelError {
     /// Underlying I/O error while reading or writing a model file.
     #[error("model I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Two or more models cannot be merged: empty input, weight/model count
+    /// mismatch, an unsupported model kind (CTR / non-oblivious), or
+    /// incompatible feature/output structure. Surfaced loudly instead of
+    /// emitting a wrong-valued merged model.
+    #[error("models cannot be merged: {0}")]
+    Merge(String),
 }
