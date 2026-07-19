@@ -20,6 +20,7 @@ mod params;
 mod pool;
 mod ranker;
 mod regressor;
+mod utils;
 
 pub use classifier::CatBoostClassifier;
 pub use pool::Pool;
@@ -52,6 +53,8 @@ fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(py, m)?;
     // D-07 registry introspection helper for the param-coverage test.
     m.add_function(wrap_pyfunction!(params::_param_status, m)?)?;
+    // ORCH-04-S6 standalone metric surface: `catboost_rs.utils.eval_metric`.
+    utils::register(py, m)?;
     Ok(())
 }
 

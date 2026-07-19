@@ -415,6 +415,122 @@ pub fn predict_raw_cat(
         .collect()
 }
 
+/// The upstream `staged_predict` stage tree-counts for the half-open interval
+/// `[start, end)` stepping by `step` (`step >= 1`, `start < end`): the counts
+/// `start + step, start + 2·step, …` that stay `< end`, then ALWAYS `end` as the
+/// final stage. A pure, side-effect-free schedule generator so SP-02's inclusion
+/// rule is reasoned about independently of the per-object accumulation.
+///
+/// All arithmetic is saturating (workspace deny `arithmetic_side_effects` is not
+/// on, but overflow would be a silent bug, not a panic).
+fn stage_counts(start: usize, end: usize, step: usize) -> Vec<usize> {
+    let mut counts = Vec::new();
+    let mut count = start.saturating_add(step);
+    while count < end {
+        counts.push(count);
+        count = count.saturating_add(step);
+    }
+    // The final stage is always the full `end` (upstream always includes it).
+    counts.push(end);
+    counts
+}
+
+/// Raw approx over an increasing prefix of the ensemble (SCALAR oblivious models).
+/// Returns one row per stage; each row is length `n_objects` in object order.
+/// Stages are the tree counts `ntree_start + eval_period, …, ntree_end`, where
+/// `ntree_end == 0` is treated as `oblivious_trees.len()`. `eval_period == 0` is
+/// treated as `1`. An out-of-range `ntree_start >= end` yields an empty `Vec`.
+///
+/// # Interval semantics (`[ntree_start, ntree_end)`)
+/// Each stage sums ONLY the trees in `[ntree_start, count)` — trees before
+/// `ntree_start` are excluded — matching upstream `staged_predict`/`predict`'s
+/// `[ntree_start, ntree_end)` window. The model's base value (`bias`) is included
+/// ONLY when `ntree_start == 0` (a partial start sums its trees alone, no base),
+/// again matching upstream: `predict(ntree_start=k>0, ntree_end=c)` returns
+/// `Σ_{k≤t<c} contribution` with no bias, verified against `catboost==1.2.10`.
+///
+/// Each tree's leaf contribution is evaluated EXACTLY ONCE per object; a running
+/// left-to-right accumulator (bit-identical to [`sum_f64`] over the prefix, D-08)
+/// is snapshotted at each stage boundary, so cost is linear in the tree count,
+/// not quadratic in the number of stages.
+///
+/// # Contract (UNGUARDED — caller's responsibility)
+/// This function does NOT validate model shape: it only accumulates
+/// `model.oblivious_trees` over the scalar leaf-value path. On a multi-dimension
+/// (`approx_dimension > 1`), non-symmetric, Region, or CTR model it returns
+/// SILENTLY WRONG output (dropped dimensions / ignored trees), not an error. The
+/// scalar-oblivious guard lives at the facade (SP-03); any direct `cb-model`
+/// caller MUST ensure the model is scalar + oblivious + float-only before calling.
+#[must_use]
+pub fn predict_raw_staged(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    ntree_start: usize,
+    ntree_end: usize,
+    eval_period: usize,
+) -> Vec<Vec<f64>> {
+    let n_trees = model.oblivious_trees.len();
+    // `ntree_end == 0` means "all trees"; otherwise clamp to the tree count.
+    let end = if ntree_end == 0 {
+        n_trees
+    } else {
+        ntree_end.min(n_trees)
+    };
+    if ntree_start >= end {
+        return Vec::new();
+    }
+    // `eval_period == 0` degenerates to a step of 1 (one stage per tree).
+    let step = eval_period.max(1);
+    let counts = stage_counts(ntree_start, end, step);
+
+    // The base value is included ONLY for a full-prefix start (`ntree_start == 0`);
+    // a partial start sums trees `[ntree_start, count)` alone (upstream semantics).
+    let base = if ntree_start == 0 { model.bias } else { 0.0 };
+
+    // Float-only staged path: no categorical columns are consulted. The object
+    // count is the FIRST float column's length (matching `predict_raw_cat`).
+    let n_objects = feature_values.first().map_or(0, Vec::len);
+    // Gather each object's contiguous float row ONCE (checked `.get`; a short
+    // column reads NaN, which fails every strict `> border` test) and reuse it
+    // across every stage.
+    let rows: Vec<Vec<f32>> = (0..n_objects)
+        .map(|obj| {
+            feature_values
+                .iter()
+                .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+                .collect()
+        })
+        .collect();
+
+    // One row per stage; filled object-by-object. Each object walks the trees in
+    // `[ntree_start, end)` exactly once, maintaining a running sum (the SAME
+    // left-to-right fold `sum_f64` performs, so identical to `base +
+    // sum_f64(contribs[ntree_start..count])`), and snapshots `base + running` as
+    // the running window `[ntree_start, t + 1)` reaches each stage `count`.
+    let mut stages: Vec<Vec<f64>> = counts.iter().map(|_| Vec::with_capacity(n_objects)).collect();
+    for row in &rows {
+        let mut running = 0.0_f64;
+        let mut next_stage = 0usize;
+        for t in ntree_start..end {
+            if let Some(tree) = model.oblivious_trees.get(t) {
+                let leaf = leaf_index_for(model, tree, row, &[]);
+                running += tree.leaf_values.get(leaf).copied().unwrap_or(0.0);
+            }
+            // After tree `t`, `running` covers `[ntree_start, t + 1)`; snapshot
+            // every stage whose tree-count equals `t + 1` (a `while` because a
+            // degenerate schedule could in principle repeat a count).
+            let reached = t.saturating_add(1);
+            while counts.get(next_stage).copied() == Some(reached) {
+                if let Some(stage) = stages.get_mut(next_stage) {
+                    stage.push(base + running);
+                }
+                next_stage = next_stage.saturating_add(1);
+            }
+        }
+    }
+    stages
+}
+
 /// Apply `model` to a numeric feature view, returning the DIMENSION-MAJOR raw
 /// approx of length `approx_dimension * n` (output index `d * n + i`) — the public
 /// N-dim apply for multi-output models (MultiClass / MultiClassOneVsAll /
@@ -626,6 +742,78 @@ fn apply_tree_slice_one(
     out
 }
 
+/// Per-tree leaf statistics over a dataset (upstream `CollectLeavesStatistics`,
+/// `catboost/libs/fstr/util.cpp` v1.2.10): apply every tree to every object via
+/// the SAME leaf-assignment walk the predict path uses ([`leaf_index_for`] /
+/// [`leaf_index_nonsym`]) and add `1.0` per document to the landed leaf's slot
+/// (unit document weights — upstream falls back to `+= 1.0` when the pool's
+/// weights are trivial, which is the only mode this port supports).
+///
+/// The outer Vec lists oblivious trees first, then non-symmetric trees (a model
+/// is one kind or the other in practice); each inner Vec has one slot per
+/// STRUCTURAL leaf (`leaf_values.len() / approx_dimension`). This is the
+/// dataset-weights substrate of
+/// [`crate::prediction_values_change_with_data`] — for online-CTR models
+/// these statistics genuinely differ from the stored training-time
+/// `leaf_weights`, because training assigns documents by online (prefix) CTR
+/// values while this walk uses the final baked tables. A malformed
+/// non-symmetric walk ([`leaf_index_nonsym`] `None`) contributes nothing for
+/// that document, mirroring the apply path's defensive discipline.
+#[must_use]
+pub fn collect_leaves_statistics(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    cat_columns: &[Vec<String>],
+) -> Vec<Vec<f64>> {
+    let dim = model.approx_dimension.max(1);
+    let mut stats: Vec<Vec<f64>> = model
+        .oblivious_trees
+        .iter()
+        .map(|t| vec![0.0_f64; t.leaf_values.len() / dim])
+        .chain(
+            model
+                .non_symmetric_trees
+                .iter()
+                .map(|t| vec![0.0_f64; t.leaf_values.len() / dim]),
+        )
+        .collect();
+
+    let n_float_objs = feature_values.first().map_or(0, Vec::len);
+    let n_cat_objs = cat_columns.first().map_or(0, Vec::len);
+    let n_objects = n_float_objs.max(n_cat_objs);
+    let nonsym_base = model.oblivious_trees.len();
+
+    for obj in 0..n_objects {
+        // Gather rows exactly as `predict_raw_cat` does (checked `.get`; a
+        // short float column reads NaN, failing every strict `> border` test).
+        let row: Vec<f32> = feature_values
+            .iter()
+            .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+            .collect();
+        let cats: Vec<String> = cat_columns
+            .iter()
+            .map(|col| col.get(obj).cloned().unwrap_or_default())
+            .collect();
+
+        for (tree_idx, tree) in model.oblivious_trees.iter().enumerate() {
+            let leaf = leaf_index_for(model, tree, &row, &cats);
+            if let Some(slot) = stats.get_mut(tree_idx).and_then(|s| s.get_mut(leaf)) {
+                *slot += 1.0;
+            }
+        }
+        for (tree_idx, tree) in model.non_symmetric_trees.iter().enumerate() {
+            if let Some(leaf) = leaf_index_nonsym(model, tree, &row, &cats) {
+                if let Some(slot) =
+                    stats.get_mut(nonsym_base + tree_idx).and_then(|s| s.get_mut(leaf))
+                {
+                    *slot += 1.0;
+                }
+            }
+        }
+    }
+    stats
+}
+
 /// Apply the trained model's virtual-ensemble slicing (`apply.cpp:526-600`),
 /// producing the per-ensemble RAW approx matrix in OBJECT-MAJOR
 /// `(n, virtual_ensembles_count, approx_dimension)` flat layout — value at index
@@ -740,3 +928,7 @@ pub fn apply_virtual_ensembles(
 #[cfg(test)]
 #[path = "region_apply_test.rs"]
 mod region_apply_test;
+
+#[cfg(test)]
+#[path = "staged_predict_test.rs"]
+mod staged_predict_test;

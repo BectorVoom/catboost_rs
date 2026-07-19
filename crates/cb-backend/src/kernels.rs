@@ -3976,6 +3976,189 @@ pub fn fold_hist_copies_kernel(buf: &mut Array<u64>, n_copies: u32) {
     }
 }
 
+/// Comptime `SharedMemory` cell budgets for the LDS-privatized partition-histogram fill
+/// ([`partition_hist2_lds_kernel`]) — the size passed to `SharedMemory::new` MUST be a
+/// compile-time value (Pitfall 3 / `Cubecl_shared_memory.md` Static Sizing), so the host
+/// launcher picks the SMALLEST budget covering the cube's tile (`n_active_parts *
+/// tile_features * n_bins * HIST_CHANNELS` cells) and the kernel is JIT-instantiated per
+/// budget. Three tiers trade LDS footprint (`cells * 8` bytes of `u64`) against
+/// occupancy: 1024 cells = 8 KiB (high occupancy, shallow levels), 2048 = 16 KiB, 4096 =
+/// 32 KiB (the cap — a tile that cannot fit 4096 cells with `tile_features == 1` falls
+/// back to the global-atomic multi-copy kernel). These are shared-memory SIZES (the
+/// allocation), NOT wave/warp-size literals in any stride (D-09) — the analog of
+/// [`HIST_SHMEM`] / [`BLOCK_REDUCE_SHMEM`].
+pub(crate) const HIST_LDS_CELLS_SMALL: usize = 1024;
+/// Middle LDS budget tier (16 KiB of `u64` cells) — see [`HIST_LDS_CELLS_SMALL`].
+pub(crate) const HIST_LDS_CELLS_MEDIUM: usize = 2048;
+/// Largest LDS budget tier (32 KiB of `u64` cells) — see [`HIST_LDS_CELLS_SMALL`].
+pub(crate) const HIST_LDS_CELLS_LARGE: usize = 4096;
+
+/// LDS-privatized partition-aware 2-channel `pointwise_hist2` fill — the Tier-1
+/// shared-memory privatization of [`partition_hist2_nonbinary_kernel`] (CubeCL manual
+/// `08_atomic_contention.md` §4; upstream `pointwise_hist2_one_byte_templ.cuh` keeps its
+/// per-block `__shared__` working histogram the same way). Each cube owns a PRIVATE
+/// fixed-point sub-histogram in shared memory covering its (partition-set × feature-tile)
+/// slice, scatters its object chunk into it with cheap intra-cube LDS atomics, then
+/// merges into the global histogram with ONE global atomic per non-zero LDS cell —
+/// cutting global-atomic traffic from `O(n · n_features)` to `O(cubes · tile_cells)`.
+///
+/// # Dispatch geometry (2-D)
+///
+/// `CUBE_POS_X` = object chunk (grid-stride along X over the visiting order);
+/// `CUBE_POS_Y` = feature tile (`tile_features` features starting at `CUBE_POS_Y *
+/// tile_features`, the last tile clamped to `n_features`). Every cube covers ALL active
+/// partitions for its tile, so the host caps `n_active_parts * tile_features * n_bins *
+/// HIST_CHANNELS <= lds_cells` (the comptime budget) before launch.
+///
+/// # Partition compression under the subtraction-trick filter
+///
+/// With `filter_mask != 0` (level-L fill, mask `= 2^(L-1) = half`) only the
+/// newest-bit-set partitions `part ∈ [half, 2·half)` are accumulated, so the LDS tile
+/// indexes them COMPRESSED as `local_part = part - half` (`n_active_parts == half`); the
+/// merge re-adds `half` to write the true global slot. With `filter_mask == 0` all
+/// `n_active_parts` slots map identity. The host guarantees `filter_mask == 0 || 2 *
+/// filter_mask == n_parts` (else it takes the global-atomic path).
+///
+/// # Deterministic fixed-point accumulate (GPUT-06 unchanged)
+///
+/// Contributions are quantized ONCE per object via [`fixedpoint_encode`] and
+/// integer-atomic-added into LDS; the merge adds the exact per-cube integer partial into
+/// the global `Atomic<u64>` cell. Integer addition is exact and commutative, so the
+/// LDS-privatized fill is BIT-IDENTICAL to the direct global-atomic fill regardless of
+/// scheduling — same guarantee, less contention. Zero-valued LDS cells are skipped at
+/// merge (adding 0 is the identity — exact, and it drops the flush traffic for sparse
+/// tiles).
+///
+/// # Wave-size policy (D-09) / generics-float (AGENTS.md)
+///
+/// Strides derive from `CUBE_COUNT_X`/`CUBE_DIM` topology values — NEVER a literal
+/// 32/64. Generic over `F: Float` (the der1/weight channel type). Bins are read through
+/// the ONE [`read_bin`] accessor over the bit-packed grouped cindex (T-10-15). The two
+/// `sync_cube()` barriers (post-zero, post-scatter) are the mandatory privatization
+/// races' fences (`08_atomic_contention.md` §4); both sit OUTSIDE divergent branches so
+/// every unit reaches them. VALUE ranges (`indices[i] < n`, bin `< n_bins`,
+/// `leaf_of[obj] < n_parts`) are validated host-side before launch. if-as-STATEMENT only.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn partition_hist2_lds_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    cindex: &Array<u32>,
+    offsets: &Array<u32>,
+    shifts: &Array<u32>,
+    masks: &Array<u32>,
+    indices: &Array<u32>,
+    leaf_of: &Array<u32>,
+    bin_sums: &Array<Atomic<u64>>,
+    n_features: u32,
+    filter_mask: u32,
+    n_active_parts: u32,
+    tile_features: u32,
+    #[comptime] bits: u32,
+    #[comptime] lds_cells: u32,
+) {
+    // n_bins = 1 << bits (comptime); the (feature, bin) index arithmetic stays `usize`.
+    let n_bins = comptime!((1u32 << bits) as usize);
+    // The per-cube private sub-histogram (comptime-sized budget; only the ACTIVE prefix
+    // `n_active_parts * tile_actual * n_bins * 2` is touched — manual §4 rule 1).
+    let lds = SharedMemory::<Atomic<u64>>::new(comptime!(lds_cells as usize));
+
+    let n = indices.len();
+    let n_features_usize = n_features as usize;
+    let n_active = n_active_parts as usize;
+    let tile_f = tile_features as usize;
+    let cd = CUBE_DIM as usize;
+
+    // This cube's feature tile [f_begin, f_end) — the last tile clamps to n_features.
+    let f_begin = (CUBE_POS_Y as usize) * tile_f;
+    let mut f_end = f_begin + tile_f;
+    if f_end > n_features_usize {
+        f_end = n_features_usize;
+    }
+    let tile_actual = f_end - f_begin;
+
+    // Active LDS prefix: local cell = ((lp * tile_actual + lf) * n_bins + bin) * 2 + ch.
+    let active_cells = n_active * tile_actual * n_bins * 2usize;
+
+    // (1) Zero the ACTIVE LDS cells, strided across the cube's units.
+    let mut c = UNIT_POS as usize;
+    while c < active_cells {
+        lds[c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+
+    // (2) Scatter this cube's object chunk into the private LDS sub-histogram
+    //     (grid-stride along the X axis only — Y is the feature tile).
+    let stride = (CUBE_COUNT_X as usize) * cd;
+    let mut i = (CUBE_POS_X as usize) * cd + (UNIT_POS as usize);
+    while i < n {
+        let obj_u = indices[i];
+        let obj = obj_u as usize;
+        let lf = leaf_of[obj];
+        // Sibling-subtraction filter (upstream §5.5): identical semantics to
+        // partition_hist2_nonbinary_kernel's filter arm.
+        let mut take = true;
+        if filter_mask != 0u32 {
+            if (lf & filter_mask) == 0u32 {
+                take = false;
+            }
+        }
+        if take {
+            // Compressed local partition slot (see the doc header): identity when
+            // unfiltered, `part - half` when the newest-bit filter is active.
+            let mut lp = lf as usize;
+            if filter_mask != 0u32 {
+                lp = (lf - filter_mask) as usize;
+            }
+            // Quantize ONCE per object (pure function — bit-identical to encoding at
+            // every cell like the global-atomic kernel does, minus the redundant work).
+            let enc_w = fixedpoint_encode::<F>(weight[obj]);
+            let enc_d = fixedpoint_encode::<F>(der1[obj]);
+            let mut lfi = 0usize;
+            while lfi < tile_actual {
+                let feature = f_begin + lfi;
+                let bin =
+                    read_bin(cindex, offsets[feature], obj_u, shifts[feature], masks[feature])
+                        as usize;
+                let cell = ((lp * tile_actual + lfi) * n_bins + bin) * 2usize;
+                // channel 0 = Σ weight (statId 0), channel 1 = Σ der1 — the frozen
+                // interleaved layout, privatized per cube.
+                lds[cell].fetch_add(enc_w);
+                lds[cell + 1usize].fetch_add(enc_d);
+                lfi += 1usize;
+            }
+        }
+        i += stride;
+    }
+    sync_cube();
+
+    // (3) Merge LDS → global: ONE global atomic per non-zero active cell.
+    let leaf_stride = n_features_usize * n_bins * 2usize;
+    let mut m = UNIT_POS as usize;
+    while m < active_cells {
+        let v = lds[m].load();
+        if v != 0u64 {
+            // Decompose the local cell back to (local_part, local_feature, bin, ch)
+            // and re-expand to the global slot index.
+            let ch = m % 2usize;
+            let rest = m / 2usize;
+            let bin = rest % n_bins;
+            let rest2 = rest / n_bins;
+            let lfi = rest2 % tile_actual;
+            let lp = rest2 / tile_actual;
+            let mut part = lp;
+            if filter_mask != 0u32 {
+                part = lp + (filter_mask as usize);
+            }
+            let feature = f_begin + lfi;
+            let cell = part * leaf_stride + (feature * n_bins + bin) * 2usize + ch;
+            bin_sums[cell].fetch_add(v);
+        }
+        m += cd;
+    }
+}
+
 /// Derive the UNFILLED sibling half of a partition histogram from the parent level's
 /// histogram (the wired form of the subtraction trick, upstream `SubstractHistogramsImpl`
 /// / CATBOOST_CUDA_KERNELS_DESIGN §5.5): with the newest split bit `b = log2(half)`, the
@@ -4109,16 +4292,20 @@ pub fn subtract_histograms_kernel<F: Float>(
 /// candidate sweep uses the whole device, not one SM) with the strict-`>` first-wins /
 /// lowest-`(feature, bin)`-index tie-break, then each cube block-reduces (wave-agnostic
 /// `CUBE_DIM_X`-strided shared-mem tree, D-09) into its per-block `(best_gain, best_idx)`
-/// winner. The two winners pack into ONE output buffer — `best_out[CUBE_POS]` = the gain,
-/// `best_out[CUBE_COUNT + CUBE_POS]` = the candidate index widened to `F` (exact: `f64` holds
-/// every `u32`; the reachable backends here are the u64-atomic ones whose channel float is
-/// `f64`) — so the host finishes the across-block argmin from a SINGLE O(blocks) read-back
-/// (the bulk histogram NEVER crosses — D-05). Determinism is unchanged by the multi-cube
-/// geometry: every candidate is scored by exactly ONE thread, per-thread and per-block folds
-/// use the same strict-`>`/lowest-index rule, and the host fold applies the identical global
-/// tie-break, so the chosen split is bit-identical to the single-cube dispatch. The trailing
-/// `border == n_bins - 1` no-op (all bins LEFT) is EXCLUDED from the argmin, in lockstep with
-/// the depth-1 scorer and the CPU reference.
+/// winner. The two winners write into TWO SEPARATE output buffers — `best_gain[CUBE_POS]` /
+/// `best_idx[CUBE_POS]` — mirroring [`find_optimal_split_kernel`]'s `best_idx: &mut Array<u32>`,
+/// rather than widening the candidate index into the channel float `F` and packing it
+/// alongside the gain: `F` is `f32` on the wgpu backend (RESEARCH A1 channel-float table),
+/// whose 24-bit mantissa only represents integers EXACTLY up to `2^24` — a candidate index at
+/// or beyond that (`n_features * n_bins >= 2^24`) would silently round to the WRONG index. A
+/// genuine `u32` output has no such ceiling on any backend. The host finishes the across-block
+/// argmin from a batched O(blocks) read-back of both buffers together (the bulk histogram
+/// NEVER crosses — D-05). Determinism is unchanged by the multi-cube geometry: every candidate
+/// is scored by exactly ONE thread, per-thread and per-block folds use the same
+/// strict-`>`/lowest-index rule, and the host fold applies the identical global tie-break, so
+/// the chosen split is bit-identical to the single-cube dispatch. The trailing `border ==
+/// n_bins - 1` no-op (all bins LEFT) is EXCLUDED from the argmin, in lockstep with the depth-1
+/// scorer and the CPU reference.
 ///
 /// Generic over `F: Float` (AGENTS.md generics-float). The `f32::MIN` sentinel (HIP-safe finite
 /// `-inf` stand-in, WR-01 — a literal `-inf` fails the gfx1100 JIT) seeds the argmin so any real
@@ -4128,7 +4315,8 @@ pub fn subtract_histograms_kernel<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn find_optimal_split_partition_kernel<F: Float>(
     bin_sums: &Array<u64>,
-    best_out: &mut Array<F>,
+    best_gain: &mut Array<F>,
+    best_idx: &mut Array<u32>,
     scaled_l2: &Array<F>,
     n_parts: u32,
     n_features: u32,
@@ -4261,11 +4449,12 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     }
 
     if tid == 0u32 {
-        // Packed per-block winner: gain in the first CUBE_COUNT slots, candidate index
-        // (widened to F — exact for every u32 in the f64 channel) in the second, so the
-        // host retrieves BOTH from one read-back (one sync per level instead of two).
-        best_out[CUBE_POS] = sh_gain[0usize];
-        best_out[CUBE_COUNT + CUBE_POS] = F::cast_from(sh_idx[0usize]);
+        // Per-block winner: gain and candidate index in their OWN typed buffers (see the
+        // function doc — `best_idx` stays a genuine `u32`, never widened into the channel
+        // float `F`, which is only exact up to 2^24 on the wgpu f32 channel). The host
+        // batches both buffers into one read-back (one sync per level, same as before).
+        best_gain[CUBE_POS] = sh_gain[0usize];
+        best_idx[CUBE_POS] = sh_idx[0usize];
     }
 }
 

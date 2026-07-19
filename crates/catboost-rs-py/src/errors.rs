@@ -101,6 +101,19 @@ impl From<PyCbError> for PyErr {
 ///   unsupported model = value error).
 /// - `Io` -> `PyIOError` (a file-I/O failure surfaces as the stdlib I/O error).
 /// - `Train` / `Model` -> base `CatBoostError` (internal training / model error).
+/// - `Export` (EXPORT-01f) -> per `OnnxExportError` sub-variant: the four
+///   guard-rejection variants (`CategoricalFeaturesUnsupported` /
+///   `NonObliviousTreesUnsupported` / `RegionTreesUnsupported` /
+///   `NonIntegerClassLabelsUnsupported`) map to `CatBoostValueError` (the
+///   model itself is the "bad input" to the export operation, mirroring
+///   `PartialDependence`'s own mapping); `Io` mirrors the top-level `Io`
+///   arm's own mapping (`PyIOError`); `Encode` maps to the base
+///   `CatBoostError` (an internal/unexpected failure, mirroring `Train`/`Model`
+///   — not user-input-driven).
+/// - `CoreMlExport` (EXPORT-02) -> per `CoreMlExportError` sub-variant, using
+///   the SAME mapping as the `Export` (ONNX) arm: the guard-rejection variants
+///   map to `CatBoostValueError`, `Io` to `PyIOError`, `Encode` to the base
+///   `CatBoostError`.
 pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
     match err {
         FacadeError::FeatureMismatch(m) => CatBoostValueError::new_err(m.clone()),
@@ -110,6 +123,48 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         FacadeError::Io(io) => PyIOError::new_err(io.to_string()),
         FacadeError::Train(c) => CatBoostError::new_err(c.to_string()),
         FacadeError::Model(m) => CatBoostError::new_err(m.to_string()),
+        // An invalid partial-dependence request is a bad-input value error
+        // (like FeatureMismatch): arity / out-of-range / duplicate / empty.
+        FacadeError::PartialDependence(e) => CatBoostValueError::new_err(e.to_string()),
+        // An unsupported LossFunctionChange loss name is a bad-input value error
+        // (like FeatureMismatch / PartialDependence): the user named a loss the
+        // first slice does not support. Surface the full `Display`
+        // ("unsupported loss for LossFunctionChange: <name>"), not the bare inner
+        // name, so the Python message is self-describing (mirrors the
+        // `PartialDependence`/`Export` arms that use the error's `Display`).
+        FacadeError::UnsupportedLoss(_) => CatBoostValueError::new_err(err.to_string()),
+        // An unsupported `staged_predict` model (non-scalar / non-oblivious / CTR)
+        // is a bad-input value error (the model itself is the "bad input", like
+        // `PartialDependence` / `Export`'s guard rejections). Surface the full
+        // `Display` ("unsupported model: <reason>") so the Python message is
+        // self-describing.
+        FacadeError::UnsupportedModel(_) => CatBoostValueError::new_err(err.to_string()),
+        FacadeError::Export(e) => match e {
+            cb_model::OnnxExportError::CategoricalFeaturesUnsupported
+            | cb_model::OnnxExportError::NonObliviousTreesUnsupported
+            | cb_model::OnnxExportError::RegionTreesUnsupported
+            | cb_model::OnnxExportError::NonIntegerClassLabelsUnsupported => {
+                CatBoostValueError::new_err(e.to_string())
+            }
+            cb_model::OnnxExportError::Io(io) => PyIOError::new_err(io.to_string()),
+            cb_model::OnnxExportError::Encode(_) => CatBoostError::new_err(e.to_string()),
+        },
+        // `CoreMlExport` (EXPORT-02) mirrors the `Export` (ONNX) arm exactly:
+        // the four guard-rejection variants (`CategoricalFeaturesUnsupported` /
+        // `NonObliviousTreesUnsupported` / `RegionTreesUnsupported` /
+        // `MultiDimUnsupported`) map to `CatBoostValueError` (the model itself
+        // is the "bad input" to the export operation); `Io` -> `PyIOError`;
+        // `Encode` -> base `CatBoostError` (an internal/unexpected failure).
+        FacadeError::CoreMlExport(e) => match e {
+            cb_model::CoreMlExportError::CategoricalFeaturesUnsupported
+            | cb_model::CoreMlExportError::NonObliviousTreesUnsupported
+            | cb_model::CoreMlExportError::RegionTreesUnsupported
+            | cb_model::CoreMlExportError::MultiDimUnsupported => {
+                CatBoostValueError::new_err(e.to_string())
+            }
+            cb_model::CoreMlExportError::Io(io) => PyIOError::new_err(io.to_string()),
+            cb_model::CoreMlExportError::Encode(_) => CatBoostError::new_err(e.to_string()),
+        },
     }
 }
 

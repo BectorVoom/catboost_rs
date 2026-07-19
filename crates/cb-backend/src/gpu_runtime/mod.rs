@@ -67,8 +67,10 @@ use crate::kernels::{
     pairwise_hist_8bit_atomics_kernel, pairwise_hist_binary_kernel,
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
     derive_sibling_partition_hist_kernel, fold_hist_copies_kernel,
-    partition_hist2_nonbinary_kernel, partition_split_kernel, partition_update_kernel,
+    partition_hist2_lds_kernel, partition_hist2_nonbinary_kernel, partition_split_kernel,
+    partition_update_kernel,
     pointwise_hist2_binary_kernel, zero_u64_kernel,
+    HIST_LDS_CELLS_LARGE, HIST_LDS_CELLS_MEDIUM, HIST_LDS_CELLS_SMALL,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
     subtract_histograms_kernel,
     pairwise_assemble_system_kernel,
@@ -156,6 +158,19 @@ const HIST_CUBE_DIM: usize = 256;
 /// contention drops by the copy count where it is worst (the shallow levels, where
 /// few hot cells absorb every object's 2-atomic scatter).
 const HIST_MAX_COPIES: usize = 64;
+
+/// Target TOTAL cube count for the 2-D LDS-privatized fill dispatch (object chunks ×
+/// feature tiles). ~4-8 cubes per SM/CU on the mid-size parts this targets (P100 = 56
+/// SMs, gfx11 APUs ~20 CUs) — enough resident cubes to hide LDS-atomic latency without
+/// exploding the per-cube merge traffic (`cubes × tile_cells` global atomics). A soft
+/// target: the object axis is capped by [`HIST_LDS_MIN_OBJ_PER_THREAD`] and the feature
+/// axis by the LDS budget, so tiny inputs launch fewer cubes.
+const HIST_LDS_TARGET_CUBES: usize = 256;
+
+/// Minimum objects per thread on the LDS fill's object axis: more chunks than
+/// `n / (HIST_CUBE_DIM * this)` would spend more time on per-cube zero+merge overhead
+/// than on scatter work (each extra chunk re-merges its whole tile).
+const HIST_LDS_MIN_OBJ_PER_THREAD: usize = 8;
 
 /// `CB_GPU_PROF=1` gates the per-stage device profiling prints (stage attribution for
 /// the resident grow loop). The env var is read ONCE; unset (or `"0"`) keeps every
@@ -1618,6 +1633,43 @@ pub(crate) fn read_part_stats_and_leaf_of(
     Ok((part_stats, bytemuck::cast_slice::<u8, u32>(&leaf_bytes).to_vec()))
 }
 
+/// Read a per-block `(best_gain, best_idx)` winner-descriptor pair back in ONE blocking read —
+/// used by [`score_partition_over_binsums`] so its two SEPARATE typed output buffers (channel
+/// float gain, genuine `u32` index — see [`find_optimal_split_partition_kernel`]'s doc for why
+/// they are kept separate rather than packed into one float buffer) still cost only one
+/// pipeline sync per level, matching [`read_part_stats_and_leaf_of`]'s batching pattern. wgpu
+/// upcasts the f32 gain channel exactly like [`read_scores_f64`]; the index buffer is read back
+/// bit-for-bit as `u32` on every backend (never round-tripped through a float). A read-back
+/// failure surfaces [`CbError::Degenerate`] (WR-05), never a silent zero buffer.
+fn read_gain_and_idx(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    best_gain_h: Handle,
+    best_idx_h: Handle,
+) -> CbResult<(Vec<f64>, Vec<u32>)> {
+    let buffers = cubecl::reader::try_read_sync(client.read_async(vec![best_gain_h, best_idx_h]))
+        .ok_or_else(|| {
+            CbError::Degenerate(
+                "best-gain/best-idx read-back: blocking reads are unsupported on this platform"
+                    .to_owned(),
+            )
+        })?
+        .map_err(|e| CbError::Degenerate(format!("best-gain/best-idx read-back failed: {e:?}")))?;
+    let mut buffers = buffers.into_iter();
+    let (Some(gain_bytes), Some(idx_bytes)) = (buffers.next(), buffers.next()) else {
+        return Err(CbError::Degenerate(
+            "best-gain/best-idx read-back returned fewer than 2 buffers".to_owned(),
+        ));
+    };
+    #[cfg(feature = "wgpu")]
+    let best_gain = bytemuck::cast_slice::<u8, f32>(&gain_bytes)
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    #[cfg(not(feature = "wgpu"))]
+    let best_gain = bytemuck::cast_slice::<u8, f64>(&gain_bytes).to_vec();
+    Ok((best_gain, bytemuck::cast_slice::<u8, u32>(&idx_bytes).to_vec()))
+}
+
 /// Apply ONE split's forward-bit doc-routing reorder device-resident: returns a NEW
 /// `leaf_of` handle with bit `level_bit` set for every object whose quantized bin on
 /// `feature` is `> bin` (== `cb_train::leaf_index`'s `idx |= 1 << i`, Pitfall 6). The
@@ -2093,6 +2145,246 @@ pub(crate) fn launch_partition_hist2_resident_into(
         }
     };
 
+    // ---- Round-4 Tier-1 LDS privatization (CubeCL manual 08_atomic_contention.md §4):
+    // when every cube can hold its (active-partition × feature-tile) slice of the
+    // fixed-point histogram in shared memory, scatter into the per-cube LDS copy and
+    // merge with ONE global atomic per non-zero cell — global-atomic traffic drops from
+    // O(n · n_features) to O(cubes · tile_cells). Integer fixed-point adds are exact and
+    // commutative, so this is BIT-IDENTICAL to the multi-copy global-atomic path
+    // (GPUT-06 unchanged). The filter compression needs `filter_mask == half` (the grow
+    // loop's `1 << (L-1)` invariant); any other non-zero mask keeps the proven path.
+    //
+    // WHICH arm is faster is HARDWARE-dependent (measured 2026-07-16): shared-memory
+    // u64 atomics win on modern parts but LOSE to L2-side global u64 atomics on Pascal
+    // (Kaggle P100: LDS ~6.9 ms/tree vs multi-copy ~5 ms/tree). Since both arms are
+    // bit-identical, the choice is pure throughput — so it is PROBED once per process
+    // on the first eligible fill (both arms fenced and timed on the real inputs, the
+    // faster latched; see [`hist_fill_path`]) instead of hard-coding either.
+    // `CB_HIST_LDS` (=1 force LDS / =0 force multi-copy) overrides the probe for A/B
+    // provenance.
+    let n_active = if filter_mask == 0 { n_parts } else { filter_mask as usize };
+    let mask_compressible =
+        filter_mask == 0 || (filter_mask as usize).checked_mul(2) == Some(n_parts);
+    let lds_cpf = if mask_compressible {
+        n_active
+            .checked_mul(n_bins)
+            .and_then(|v| v.checked_mul(HIST_CHANNELS))
+            .filter(|&cpf| cpf <= HIST_LDS_CELLS_LARGE)
+    } else {
+        None
+    };
+
+    if let Some(cpf) = lds_cpf {
+        match hist_fill_path(cpf) {
+            Some(HistFillPath::Lds) => {
+                return launch_partition_hist2_lds(
+                    client,
+                    der1_h,
+                    weight_h,
+                    cindex_words_h,
+                    offsets_h,
+                    shifts_h,
+                    masks_h,
+                    indices_h,
+                    leaf_of_h,
+                    num_words,
+                    n,
+                    n_features,
+                    total,
+                    n_active,
+                    cpf,
+                    filter_mask,
+                    bits,
+                );
+            }
+            Some(HistFillPath::MultiCopy) => {}
+            None => {
+                // One-time probe (JIT-warmed, fenced, best-of-2 per arm). Every launch
+                // below is a REAL fill of these exact inputs — all results are
+                // bit-identical, so the winner's LAST handle is returned as the level's
+                // histogram and the discarded ones just return to the memory pool.
+                let run_mc = || -> CbResult<Handle> {
+                    launch_partition_hist2_multicopy(
+                        client,
+                        der1_h.clone(),
+                        weight_h.clone(),
+                        cindex_words_h.clone(),
+                        offsets_h.clone(),
+                        shifts_h.clone(),
+                        masks_h.clone(),
+                        indices_h.clone(),
+                        leaf_of_h.clone(),
+                        num_words,
+                        n,
+                        n_parts,
+                        n_features,
+                        total,
+                        filter_mask,
+                        bits,
+                    )
+                };
+                let run_lds = || -> CbResult<Handle> {
+                    launch_partition_hist2_lds(
+                        client,
+                        der1_h.clone(),
+                        weight_h.clone(),
+                        cindex_words_h.clone(),
+                        offsets_h.clone(),
+                        shifts_h.clone(),
+                        masks_h.clone(),
+                        indices_h.clone(),
+                        leaf_of_h.clone(),
+                        num_words,
+                        n,
+                        n_features,
+                        total,
+                        n_active,
+                        cpf,
+                        filter_mask,
+                        bits,
+                    )
+                };
+                // JIT warm-up launches (untimed — the first launch of each kernel
+                // family compiles it; timing that would swamp the exec comparison).
+                drop(run_mc()?);
+                drop(run_lds()?);
+                prof_sync(client);
+                // Best-of-2 fenced timings per arm.
+                let mut t_mc = f64::INFINITY;
+                let mut t_lds = f64::INFINITY;
+                let mut mc_out: Option<Handle> = None;
+                let mut lds_out: Option<Handle> = None;
+                for _ in 0..2 {
+                    let t0 = std::time::Instant::now();
+                    let h = run_mc()?;
+                    prof_sync(client);
+                    t_mc = t_mc.min(t0.elapsed().as_secs_f64());
+                    mc_out = Some(h);
+                    let t1 = std::time::Instant::now();
+                    let h = run_lds()?;
+                    prof_sync(client);
+                    t_lds = t_lds.min(t1.elapsed().as_secs_f64());
+                    lds_out = Some(h);
+                }
+                let chosen = if t_lds <= t_mc {
+                    HistFillPath::Lds
+                } else {
+                    HistFillPath::MultiCopy
+                };
+                if let Ok(mut probed) = HIST_FILL_PROBED.lock() {
+                    probed.insert(cpf, chosen);
+                }
+                if gpu_prof_enabled() {
+                    println!(
+                        "CB_GPU_PROF hist-fill probe cpf={cpf}: multicopy={:.2}ms lds={:.2}ms -> {chosen:?}",
+                        t_mc * 1e3,
+                        t_lds * 1e3,
+                    );
+                }
+                // Return the winner's (bit-identical) histogram; the loser's drops.
+                let winner = match chosen {
+                    HistFillPath::Lds => lds_out,
+                    HistFillPath::MultiCopy => mc_out,
+                };
+                return winner.ok_or_else(|| {
+                    CbError::Degenerate(
+                        "hist-fill probe produced no histogram handle (internal invariant)"
+                            .to_owned(),
+                    )
+                });
+            }
+        }
+    }
+
+    launch_partition_hist2_multicopy(
+        client,
+        der1_h,
+        weight_h,
+        cindex_words_h,
+        offsets_h,
+        shifts_h,
+        masks_h,
+        indices_h,
+        leaf_of_h,
+        num_words,
+        n,
+        n_parts,
+        n_features,
+        total,
+        filter_mask,
+        bits,
+    )
+}
+
+/// The fill-arm selector for the LDS-eligible partition histogram fill, keyed by the
+/// fill's `cells_per_feature` (`n_active * n_bins * HIST_CHANNELS` — the level SHAPE).
+/// Per-shape latching matters: measured on Kaggle P100 (2026-07-16, r4b), the LDS arm
+/// WINS the shallow 1-partition fill (probe 1.18 ms vs 1.69 ms) but LOSES the deep
+/// multi-slot fills (Pascal's shared-mem u64 atomics vs its L2 global atomics), so one
+/// global choice is wrong at one end — each distinct shape gets its own probe instead.
+/// Resolution order: the `CB_HIST_LDS` env override (`"1"` → LDS, `"0"` → multi-copy;
+/// latched at first read like `CB_GPU_PROF`), then the shape's probe-latched winner,
+/// then `None` (→ the caller runs the one-time probe for this shape). Process-global:
+/// one device per process by construction (compile-time backend selection, D-02), and
+/// both arms are bit-identical, so a latched choice can never change results — only
+/// throughput.
+fn hist_fill_path(cells_per_feature: usize) -> Option<HistFillPath> {
+    static ENV_OVERRIDE: std::sync::OnceLock<Option<HistFillPath>> = std::sync::OnceLock::new();
+    let env = ENV_OVERRIDE.get_or_init(|| match std::env::var("CB_HIST_LDS").ok().as_deref() {
+        Some("1") => Some(HistFillPath::Lds),
+        Some("0") => Some(HistFillPath::MultiCopy),
+        _ => None,
+    });
+    if let Some(p) = env {
+        return Some(*p);
+    }
+    HIST_FILL_PROBED
+        .lock()
+        .ok()
+        .and_then(|probed| probed.get(&cells_per_feature).copied())
+}
+
+/// The two bit-identical fill arms of the LDS-eligible partition histogram fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistFillPath {
+    /// Per-cube shared-memory privatization ([`partition_hist2_lds_kernel`]).
+    Lds,
+    /// Multi-copy global-atomic privatization ([`partition_hist2_nonbinary_kernel`] +
+    /// fold).
+    MultiCopy,
+}
+
+/// The probe-latched fill arm per level shape (`cells_per_feature` → winner; each shape
+/// is probed exactly once per process, on its first eligible fill).
+static HIST_FILL_PROBED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, HistFillPath>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The MULTI-COPY global-atomic arm of [`launch_partition_hist2_resident_into`] — the
+/// pre-round-4 body, extracted verbatim so the one-time probe can time it against the
+/// LDS arm. Allocates `n_copies` privatized copies (level-scaled — see
+/// [`HIST_MAX_COPIES`]), zeroes them on device, scatters with global fixed-point
+/// `Atomic<u64>` adds, and folds the copies into copy 0 (integer adds — exact,
+/// order-independent, GPUT-06).
+#[allow(clippy::too_many_arguments)]
+fn launch_partition_hist2_multicopy(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1_h: Handle,
+    weight_h: Handle,
+    cindex_words_h: Handle,
+    offsets_h: Handle,
+    shifts_h: Handle,
+    masks_h: Handle,
+    indices_h: Handle,
+    leaf_of_h: Handle,
+    num_words: usize,
+    n: usize,
+    n_parts: usize,
+    n_features: usize,
+    total: usize,
+    filter_mask: u32,
+    bits: u32,
+) -> CbResult<Handle> {
     // Level-scaled privatized copy count (the contention fix): shallow levels concentrate
     // every object's 2-atomic scatter on few hot cells, so they get the most copies; the
     // total allocation stays ~`HIST_MAX_COPIES × per-leaf line` at every level.
@@ -2182,6 +2474,143 @@ pub(crate) fn launch_partition_hist2_resident_into(
             n_copies as u32,
         );
     }
+
+    // Return a COPY-0 VIEW (`total` cells, `Handle::offset_end` trims the tail copies):
+    // kernel consumers always bind an explicit `total` length, but WHOLE-handle reads
+    // (`read_fixedpoint_hist_f64`, the grow-loop self-oracles) see the handle's logical
+    // size — returning the full `alloc_len` buffer leaked the folded-away tail copies
+    // into those read-backs (a silent round-1 multi-copy regression, caught by the
+    // round-4 gfx1151 suite once a local device could actually run it). The trim also
+    // makes this arm's return SHAPE identical to the LDS arm's, which the probe relies
+    // on (either arm's handle is a drop-in level histogram).
+    let tail_bytes = (alloc_len - total) * std::mem::size_of::<u64>();
+    Ok(out.offset_end(tail_bytes as u64))
+}
+
+/// The LDS-privatized arm of [`launch_partition_hist2_resident_into`] (round 4, Tier-1
+/// shared-memory privatization — CubeCL manual `08_atomic_contention.md` §4). Allocates
+/// the SINGLE-copy fixed-point histogram (`total` cells — no multi-copy, no fold pass:
+/// privatization lives in each cube's shared memory instead), zeroes it on device, and
+/// dispatches [`partition_hist2_lds_kernel`] on a 2-D grid (X = object chunks, Y =
+/// feature tiles).
+///
+/// # Tile geometry
+///
+/// `cells_per_feature = n_active * n_bins * HIST_CHANNELS` is the caller-checked
+/// (`<= HIST_LDS_CELLS_LARGE`) per-feature LDS cost. The tile width is capped by the
+/// LDS budget (`tile_cap`), then the launch splits its parallelism between object
+/// chunks and feature tiles to land near [`HIST_LDS_TARGET_CUBES`] total cubes; the
+/// smallest comptime LDS tier covering `cells_per_feature * tile_f` is selected so
+/// shallow levels keep a small footprint (higher occupancy). `ceil(f / ceil(f/t)) <= t`
+/// keeps `tile_f` within the cap; the final `clamp` is the belt.
+///
+/// Bit-exactness: the kernel accumulates the SAME `fixedpoint_encode` contributions with
+/// integer atomics (LDS then global) — order-independent, so the result is byte-identical
+/// to the multi-copy global-atomic arm (GPUT-06). No read-back; the returned handle is
+/// consumed with length `total` exactly like the multi-copy arm's copy 0.
+#[allow(clippy::too_many_arguments)]
+fn launch_partition_hist2_lds(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1_h: Handle,
+    weight_h: Handle,
+    cindex_words_h: Handle,
+    offsets_h: Handle,
+    shifts_h: Handle,
+    masks_h: Handle,
+    indices_h: Handle,
+    leaf_of_h: Handle,
+    num_words: usize,
+    n: usize,
+    n_features: usize,
+    total: usize,
+    n_active: usize,
+    cells_per_feature: usize,
+    filter_mask: u32,
+    bits: u32,
+) -> CbResult<Handle> {
+    // Allocate + device-zero the single-copy fixed-point u64 histogram (0u64 is the
+    // additive identity — no O(histogram) zero bytes cross the bus).
+    let out = client.empty(total * std::mem::size_of::<u64>());
+    let hist_dim = CubeDim {
+        x: HIST_CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+    let zero_cubes = total.div_ceil(HIST_CUBE_DIM).max(1);
+    zero_u64_kernel::launch::<SelectedRuntime>(
+        client,
+        CubeCount::Static(zero_cubes as u32, 1, 1),
+        hist_dim,
+        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+    );
+
+    // Tile geometry (see the doc header). `cells_per_feature >= 1` (caller guards
+    // n_bins/n_features > 0), so no division by zero.
+    let tile_cap = (HIST_LDS_CELLS_LARGE / cells_per_feature).clamp(1, n_features);
+    let groups_min = n_features.div_ceil(tile_cap);
+    let obj_chunk_cap = n.div_ceil(HIST_CUBE_DIM * HIST_LDS_MIN_OBJ_PER_THREAD).max(1);
+    let chunks = (HIST_LDS_TARGET_CUBES / groups_min).clamp(1, obj_chunk_cap);
+    let groups_desired = HIST_LDS_TARGET_CUBES.div_ceil(chunks).max(groups_min);
+    let tile_f = n_features.div_ceil(groups_desired).clamp(1, tile_cap);
+    let groups = n_features.div_ceil(tile_f);
+
+    // Smallest comptime LDS tier covering the tile (JIT-instantiated per tier).
+    let lds_needed = cells_per_feature * tile_f;
+    let lds_cells = if lds_needed <= HIST_LDS_CELLS_SMALL {
+        HIST_LDS_CELLS_SMALL
+    } else if lds_needed <= HIST_LDS_CELLS_MEDIUM {
+        HIST_LDS_CELLS_MEDIUM
+    } else {
+        HIST_LDS_CELLS_LARGE
+    };
+
+    let count = CubeCount::Static(chunks as u32, groups as u32, 1);
+
+    // The der1/weight channel float type is f32 on wgpu, f64 elsewhere (RESEARCH A1);
+    // unreachable on wgpu in practice (the caller's Atomic<u64> capability gate).
+    #[cfg(feature = "wgpu")]
+    partition_hist2_lds_kernel::launch::<f32, SelectedRuntime>(
+        client,
+        count,
+        hist_dim,
+        unsafe { ArrayArg::from_raw_parts(der1_h, n) },
+        unsafe { ArrayArg::from_raw_parts(weight_h, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_words_h, num_words) },
+        unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        n_features as u32,
+        filter_mask,
+        n_active as u32,
+        tile_f as u32,
+        bits,
+        lds_cells as u32,
+    );
+
+    #[cfg(not(feature = "wgpu"))]
+    partition_hist2_lds_kernel::launch::<f64, SelectedRuntime>(
+        client,
+        count,
+        hist_dim,
+        unsafe { ArrayArg::from_raw_parts(der1_h, n) },
+        unsafe { ArrayArg::from_raw_parts(weight_h, n) },
+        unsafe { ArrayArg::from_raw_parts(cindex_words_h, num_words) },
+        unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
+        unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        n_features as u32,
+        filter_mask,
+        n_active as u32,
+        tile_f as u32,
+        bits,
+        lds_cells as u32,
+    );
 
     Ok(out)
 }
@@ -2347,20 +2776,24 @@ fn score_partition_over_binsums(
         z: 1,
     };
 
-    // Packed per-block winner buffer: gains in slots `0..num_cubes`, candidate indices
-    // (widened to the channel float — exact for every u32 in f64) in slots
-    // `num_cubes..2*num_cubes`, retrieved with ONE read-back (one sync per level, not two).
+    // Per-block winner buffers: `best_gain_h` (channel float, `num_cubes` slots) and
+    // `best_idx_h` (genuine `u32`, `num_cubes` slots) — kept SEPARATE rather than packed into
+    // one channel-float buffer, because the channel float `F` is `f32` on the wgpu backend
+    // (RESEARCH A1) whose 24-bit mantissa cannot represent every candidate index exactly once
+    // `n_features * n_bins >= 2^24` (see the kernel doc). Both buffers are still retrieved in
+    // ONE batched read-back below (one sync per level, not two).
     #[cfg(feature = "wgpu")]
-    let best_out_handle = {
-        let best_out_h =
-            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; 2 * num_cubes]));
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
         let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2 as f32]));
         find_optimal_split_partition_kernel::launch::<f32, SelectedRuntime>(
             client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
-            unsafe { ArrayArg::from_raw_parts(best_out_h.clone(), 2 * num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_parts_u32,
             n_features as u32,
@@ -2368,20 +2801,21 @@ fn score_partition_over_binsums(
             n_bins_u32,
             score_fn,
         );
-        best_out_h
+        (best_gain_h, best_idx_h)
     };
 
     #[cfg(not(feature = "wgpu"))]
-    let best_out_handle = {
-        let best_out_h =
-            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; 2 * num_cubes]));
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
         let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(vec![scaled_l2]));
         find_optimal_split_partition_kernel::launch::<f64, SelectedRuntime>(
             client,
             count,
             dim,
             unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
-            unsafe { ArrayArg::from_raw_parts(best_out_h.clone(), 2 * num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
             n_parts_u32,
             n_features as u32,
@@ -2389,33 +2823,30 @@ fn score_partition_over_binsums(
             n_bins_u32,
             score_fn,
         );
-        best_out_h
+        (best_gain_h, best_idx_h)
     };
 
     // Read back ONLY the O(blocks) per-block winner descriptors (the sole D-05 crossing) and
     // finish the across-block argmin host-side with the SAME lowest-index tie-break the kernel
-    // uses. The bulk histogram never leaves the device (T-11-03-02).
-    let best_out = read_scores_f64(client, best_out_handle)?;
-    let (best_gains, best_idx_f) = best_out
-        .split_at_checked(num_cubes)
-        .ok_or_else(|| {
-            CbError::Degenerate(format!(
-                "partition best-split read-back returned {} slots, expected {}",
-                best_out.len(),
-                2 * num_cubes
-            ))
-        })?;
+    // uses. The bulk histogram never leaves the device (T-11-03-02). Batched via
+    // `read_gain_and_idx` (mirrors `read_part_stats_and_leaf_of`) so both buffers cost one
+    // pipeline sync, not two.
+    let (best_gains, best_idx) = read_gain_and_idx(client, best_gain_handle, best_idx_handle)?;
+    if best_gains.len() != num_cubes || best_idx.len() != num_cubes {
+        return Err(CbError::Degenerate(format!(
+            "partition best-split read-back returned {}/{} slots, expected {num_cubes}/{num_cubes}",
+            best_gains.len(),
+            best_idx.len()
+        )));
+    }
 
     let mut best_gain = f64::NEG_INFINITY;
     let mut best_c = u32::MAX;
     for (block, &gain) in best_gains.iter().enumerate() {
-        // The idx slot is an exact small integer in the channel float; an out-of-range or
-        // non-finite slot falls to u32::MAX and is skipped by the candidate-range guard.
-        let cand = best_idx_f
-            .get(block)
-            .copied()
-            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX))
-            .map_or(u32::MAX, |v| v as u32);
+        // `best_idx` is a genuine `u32` read-back (see the buffer-allocation comment above) —
+        // no float round-trip, so no range/finiteness filtering is needed; a missing slot
+        // falls to the u32::MAX sentinel and is skipped by the candidate-range guard below.
+        let cand = best_idx.get(block).copied().unwrap_or(u32::MAX);
         if (cand as usize) >= n_candidates {
             continue;
         }

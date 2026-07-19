@@ -1,0 +1,57 @@
+{
+  "cat_cardinalities": [
+    5,
+    4
+  ],
+  "cat_features": [
+    2,
+    3
+  ],
+  "catboost_version": "1.2.10",
+  "column_order_invariant": "SPEC section 4 LOAD-BEARING invariant: this fixture's Pool places ALL float feature columns (positions [0, 1]) BEFORE ALL categorical feature columns (positions [2, 3], cat_features=[2, 3]) so the Rust-side combined flat index (floats [0, n_float), cats [n_float, n_float+n_cat)) coincides with upstream's true external feature index. Regenerating this fixture with a DIFFERENT column order silently breaks this invariant and the AT-FIC02d/AT-FIC03d oracle comparisons that depend on it \u2014 do NOT reorder the columns without updating SPEC.md section 4.",
+  "n_cat": 2,
+  "n_float": 2,
+  "n_rows": 200,
+  "note": "FSTR-01: interaction() / prediction_values_change() CTR-aware attribution ground truth. Mixed float+categorical model (2 float, 2 cat), trained with the tensor_ctr_e2e-family isolating params (depth/iterations empirically adjusted, see ISOLATING_PARAMS' comment, so the grower selects BOTH a float split and a genuine combination CTR, not just the combination alone). HARD GATE verified: >= 1 OnlineCtr split has a >= 2-cat-feature projection (a genuine combination CTR), not just simple CTRs. interaction.npy is flattened [feature_i, feature_j, score] triples (the existing fstr_oracle_test.rs convention); prediction_values_change.npy is length n_float+n_cat in flat-index order (floats then cats, matching the Pool's own column order, so upstream's external index numbering coincides, SPEC section 4 / section 9 risk 9).",
+  "npy_schema": {
+    "X_cat.npy": "[N, 2] int32 \u2014 the 2 raw categorical columns as integer codes (Rust stringifies via cb_data::stringify_int_category, A4).",
+    "X_float.npy": "[N, 2] float64 \u2014 the 2 float feature columns.",
+    "interaction.npy": "flattened [feature_i, feature_j, score] triples from get_feature_importance(type='Interaction').",
+    "model.cbm": "the trained upstream catboost 1.2.10 model, binary form.",
+    "model.json": "the same model, JSON form (splits + leaf_values + borders + baked ctr_data).",
+    "prediction_values_change.npy": "[n_float+n_cat] float64 from get_feature_importance(type='PredictionValuesChange', data=pool), summing to 100.",
+    "predictions.npy": "[N] float64, upstream RawFormulaVal -- a sanity gate proving the Rust-lifted model matches upstream BEFORE trusting an interaction/PVC mismatch as an algorithm bug (PLAN.md T5 Risk note).",
+    "y.npy": "[N] float64 \u2014 Logloss labels."
+  },
+  "params": {
+    "boost_from_average": false,
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "combinations_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "counter_calc_method": "SkipTest",
+    "depth": 3,
+    "fold_len_multiplier": 2.0,
+    "iterations": 15,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "Logloss",
+    "max_ctr_complexity": 2,
+    "one_hot_max_size": 1,
+    "permutation_count": 1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "simple_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "thread_count": 1,
+    "verbose": false
+  },
+  "requirement": "FSTR-01",
+  "scenario": "fstr_ctr",
+  "seed": 0,
+  "thread_count": 1
+}

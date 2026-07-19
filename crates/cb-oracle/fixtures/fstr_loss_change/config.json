@@ -7,10 +7,42 @@
     "non_symmetric_model.json",
     "non_symmetric_pvc.npy",
     "non_symmetric_interaction.npy",
-    "non_symmetric_loss_function_change.npy"
+    "non_symmetric_loss_function_change.npy",
+    "rmse_model.cbm",
+    "rmse_model.json",
+    "rmse_loss_function_change.npy",
+    "rmse_X.npy",
+    "rmse_y.npy",
+    "mae_model.cbm",
+    "mae_model.json",
+    "mae_loss_function_change.npy",
+    "mae_X.npy",
+    "mae_y.npy",
+    "mape_model.cbm",
+    "mape_model.json",
+    "mape_loss_function_change.npy",
+    "mape_X.npy",
+    "mape_y.npy",
+    "quantile_model.cbm",
+    "quantile_model.json",
+    "quantile_loss_function_change.npy",
+    "quantile_X.npy",
+    "quantile_y.npy"
   ],
   "catboost_version": "1.2.10",
   "input_dataset": "numeric_tiny",
+  "mae_loss_function_change": [
+    0.028099905423021543,
+    0.0,
+    0.0,
+    0.13168083744550607
+  ],
+  "mape_loss_function_change": [
+    0.013126833173023433,
+    0.0,
+    0.0,
+    0.05730596520135678
+  ],
   "non_symmetric_interaction": [
     [
       0.0,
@@ -40,15 +72,28 @@
     0.0,
     76.17490656953973
   ],
-  "note": "06.6-06: LossFunctionChange (MODEL-03/D-12) + non-symmetric PVC/Interaction (D-6.6-10). All vectors from catboost 1.2.10 get_feature_importance(...). Oblivious model = the binclf params; non-symmetric model = Depthwise max_depth=3.",
+  "note": "06.6-06: LossFunctionChange (MODEL-03/D-12) + non-symmetric PVC/Interaction (D-6.6-10). FSTR-02 (FL-04): per-loss oblivious REGRESSOR LFC (RMSE/MAE/MAPE/Quantile:alpha=0.5). All vectors from catboost 1.2.10 get_feature_importance(...). Oblivious binclf model = the binclf params; non-symmetric model = Depthwise max_depth=3; regression models = the binclf isolating params on the raw y.",
   "oblivious_loss_function_change": [
     0.013190765002674132,
     0.0,
     0.0,
     0.06321635368335143
   ],
+  "quantile_loss_function_change": [
+    0.014049952711510771,
+    0.0,
+    0.0,
+    0.06584041872275304
+  ],
+  "rmse_loss_function_change": [
+    0.09548712349024013,
+    0.1004648816646827,
+    0.0,
+    0.7047362481031234
+  ],
   "scenario": "fstr_loss_change",
   "seed_non_symmetric": 42,
   "seed_oblivious": 0,
+  "seed_regression": 0,
   "thread_count": 1
 }

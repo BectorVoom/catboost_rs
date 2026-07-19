@@ -1,0 +1,187 @@
+{
+  "kind": "quick-gpu-speed-check",
+  "task": "260707-rr0",
+  "provenance": {
+    "gpu": "Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB",
+    "driver": "580.159.04",
+    "nvcc": "release 12.8",
+    "cuda_dirs": "/usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-12.8"
+  },
+  "staged_source_has_perf_kernels": true,
+  "staged_source_has_round3_kernels": true,
+  "staged_source_has_round4_kernels": true,
+  "build_ok": true,
+  "build_tail": "|    ^^^^^^^^^^^^^\n\nwarning: function `compute_group_max_weighted_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:382:15\n    |\n382 | pub(crate) fn compute_group_max_weighted_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `validate_ranking_inputs` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:409:4\n    |\n409 | fn validate_ranking_inputs(approx: &[f64], target: &[f64], q_offsets: &[u32]) -> CbResult<()> {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `query_rmse_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:430:15\n    |\n430 | pub(crate) fn query_rmse_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `query_softmax_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:488:15\n    |\n488 | pub(crate) fn query_softmax_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `query_cross_entropy_shifts_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:552:15\n    |\n552 | pub(crate) fn query_cross_entropy_shifts_host(\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: constant `YETI_MAGIC_CONST` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:635:7\n    |\n635 | const YETI_MAGIC_CONST: f64 = 0.15;\n    |       ^^^^^^^^^^^^^^^^\n\nwarning: function `derive_query_seeds_inline` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:745:15\n    |\n745 | pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `pairlogit_pair_prob_local` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:758:4\n    |\n758 | fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `descending_order_per_query` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:784:15\n    |\n784 | pub(crate) fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {\n    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yeti_add_weight` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:820:4\n    |\n820 | fn yeti_add_weight(\n    |    ^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_sample_der_core` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:852:4\n    |\n852 | fn yetirank_sample_der_core(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_ders_host` is never used\n   --> crates/cb-backend/src/gpu_runtime/ranking.rs:976:15\n    |\n976 | pub(crate) fn yetirank_ders_host(\n    |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `pfound_f_ders_host` is never used\n    --> crates/cb-backend/src/gpu_runtime/ranking.rs:1003:15\n     |\n1003 | pub(crate) fn pfound_f_ders_host(\n     |               ^^^^^^^^^^^^^^^^^^\n\nwarning: function `yetirank_draw_count` is never used\n    --> crates/cb-backend/src/gpu_runtime/ranking.rs:1029:15\n     |\n1029 | pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {\n     |               ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `read_f64` is never used\n    --> crates/cb-backend/src/gpu_runtime/ranking.rs:1036:4\n     |\n1036 | fn read_f64(\n     |    ^^^^^^^^\n\n   Compiling numpy v0.29.0\n   Compiling thiserror v1.0.69\n   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)\nwarning: `cb-backend` (lib) generated 183 warnings (run `cargo fix --lib -p cb-backend` to apply 122 suggestions)\n   Compiling ndarray v0.17.2\n   Compiling thiserror-impl v1.0.69\n   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)\n   Compiling catboost-rs v0.1.0 (/tmp/repo/crates/catboost-rs)\n   Compiling pyo3-arrow v0.19.0\n   Compiling catboost-rs-py v0.1.0 (/tmp/repo/crates/catboost-rs-py)\n    Finished `release` profile [optimized] target(s) in 16m 50s\n\ud83d\udce6 Built wheel for abi3 Python \u2265 3.12 to /tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl\n",
+  "wheel": "/tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl",
+  "import_ok": true,
+  "catboost_version": "1.2.10",
+  "config": {
+    "speed_config": {
+      "n_rows": 300000,
+      "n_features": 50,
+      "seed": 42
+    },
+    "depth": 6,
+    "iters": 30,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "border_count": 32,
+    "random_seed": 42,
+    "X_shape": [
+      300000,
+      50
+    ]
+  },
+  "device_eligibility_preconditions": {
+    "preconditions": {
+      "grow_policy_symmetric": {
+        "satisfied": true,
+        "rationale": "default grow_policy (SymmetricTree/oblivious) \u2014 no grow_policy kwarg passed."
+      },
+      "single_dim_target": {
+        "satisfied": true,
+        "rationale": "approx_dimension == 1 \u2014 single-dim RMSE regression / binary Logloss, not multiclass/multilabel."
+      },
+      "bootstrap_type_no": {
+        "satisfied": true,
+        "rationale": "bootstrap_type='No' passed explicitly (also the Python default)."
+      },
+      "random_strength_zero": {
+        "satisfied": true,
+        "rationale": "random_strength=0.0 passed explicitly (also the default)."
+      },
+      "leaf_estimation_gradient": {
+        "satisfied": true,
+        "rationale": "leaf_estimation_method='Gradient' passed explicitly (Gradient/Simple are eligible)."
+      },
+      "unit_weights": {
+        "satisfied": true,
+        "rationale": "no sample_weight passed -> unit object weights."
+      },
+      "boost_from_average_false": {
+        "satisfied": true,
+        "rationale": "boost_from_average=False passed explicitly (bias==0.0; the default True silently falls back to the CPU grower for RMSE)."
+      },
+      "no_eval_set": {
+        "satisfied": true,
+        "rationale": "no eval_set passed to fit()."
+      },
+      "no_monotone_constraints": {
+        "satisfied": true,
+        "rationale": "no monotone constraints configured."
+      },
+      "pure_float_features": {
+        "satisfied": true,
+        "rationale": "X is pure float32 \u2014 no categorical / text / embedding columns."
+      },
+      "no_ranking_groups": {
+        "satisfied": true,
+        "rationale": "single fold, no ranking group ids \u2014 plain regression/classification."
+      }
+    },
+    "activation_observable": false,
+    "caveat": "Device activation is NOT directly instrumented or observable from the Python surface in this informal check: catboost_rs exposes no log line or public attribute indicating whether the GPU tree-growth loop actually ran for a given .fit(). This bench satisfies every known device_host_eligible precondition BY CONSTRUCTION (see the preconditions map above), but that is a static/documented audit, not a runtime proof. A silent CPU fallback therefore cannot be 100% ruled out from the Python surface alone. If a catboost_rs timing lands in the same ballpark as a known host-CPU reference rather than a device-fast number, treat it as a possible silent CPU fallback."
+  },
+  "timings": {
+    "errors": {},
+    "catboost_rs_rmse_s": 1.4425,
+    "catboost_rs_logloss_s": 1.4945,
+    "catboost_official_gpu_rmse_s": 1.4252,
+    "catboost_official_gpu_logloss_s": 1.408,
+    "sklearn_hgb_rmse_s": 3.3102,
+    "sklearn_hgb_logloss_s": 3.8655,
+    "xgboost_gpu_hist_rmse_s": 1.2094,
+    "xgboost_gpu_hist_logloss_s": 1.2411,
+    "sklearn_hgb_cuml_accel_rmse_s": 3.2231
+  },
+  "quality": {
+    "catboost_rs_rmse": {
+      "train_rmse": 4.307126
+    },
+    "catboost_rs_logloss": {
+      "train_logloss": 0.607269
+    },
+    "catboost_official_gpu_rmse": {
+      "train_rmse": 4.309055
+    },
+    "catboost_official_gpu_logloss": {
+      "train_logloss": 0.488567
+    },
+    "sklearn_hgb_rmse": {
+      "train_rmse": 4.411695
+    },
+    "sklearn_hgb_logloss": {
+      "train_logloss": 0.503607
+    },
+    "xgboost_gpu_hist_rmse": {
+      "train_rmse": 4.246603
+    },
+    "xgboost_gpu_hist_logloss": {
+      "train_logloss": 0.486318
+    }
+  },
+  "sklearn_version": "1.6.1",
+  "xgboost_version": "3.2.0",
+  "hgb_under_cuml_accel": {
+    "cuml_version": "26.02.000",
+    "fit_s": 3.2231
+  },
+  "speedup": {
+    "rmse_official_over_rs": 0.988,
+    "logloss_official_over_rs": 0.9421,
+    "rmse_sklearn_hgb_over_rs": 2.2948,
+    "logloss_sklearn_hgb_over_rs": 2.5865,
+    "rmse_xgboost_gpu_over_rs": 0.8384,
+    "logloss_xgboost_gpu_over_rs": 0.8304,
+    "rmse_hgb_cuml_accel_over_rs": 2.2344
+  },
+  "prof_lines": [
+    "CB_GPU_PROF hist-fill probe: multicopy=1.69ms lds=1.18ms -> Lds",
+    "CB_GPU_PROF fit-prep copy+borders elapsed=251.51ms",
+    "CB_GPU_PROF quantize n=300000 nf=50 elapsed=77.42ms",
+    "CB_GPU_PROF begin covered=true n=300000 nf=50 n_bins=33 elapsed=225.26ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=632.81ms derive=64.29ms score=182.80ms split=60.38ms stats_read=154.68ms leaf_apply_der=55.19ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.04ms derive=1.40ms score=0.93ms split=0.47ms stats_read=0.72ms leaf_apply_der=0.31ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.09ms derive=1.47ms score=1.65ms split=0.40ms stats_read=0.94ms leaf_apply_der=0.28ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.90ms derive=1.65ms score=0.88ms split=0.48ms stats_read=0.76ms leaf_apply_der=0.34ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.17ms derive=1.25ms score=0.95ms split=0.46ms stats_read=0.89ms leaf_apply_der=0.21ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.73ms derive=1.17ms score=0.89ms split=0.41ms stats_read=0.88ms leaf_apply_der=0.27ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.32ms derive=1.02ms score=0.91ms split=0.41ms stats_read=0.82ms leaf_apply_der=0.32ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.59ms derive=1.11ms score=0.96ms split=0.44ms stats_read=0.85ms leaf_apply_der=0.25ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.03ms derive=1.28ms score=0.93ms split=0.42ms stats_read=0.75ms leaf_apply_der=0.34ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.99ms derive=1.42ms score=1.07ms split=0.46ms stats_read=0.74ms leaf_apply_der=0.26ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.53ms derive=1.11ms score=0.90ms split=0.43ms stats_read=0.91ms leaf_apply_der=0.21ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.34ms derive=1.12ms score=0.92ms split=0.40ms stats_read=0.91ms leaf_apply_der=0.20ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.07ms derive=1.34ms score=0.99ms split=0.43ms stats_read=0.80ms leaf_apply_der=0.34ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.01ms derive=1.12ms score=0.94ms split=0.44ms stats_read=0.90ms leaf_apply_der=0.20ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.28ms derive=1.33ms score=0.91ms split=0.42ms stats_read=1.09ms leaf_apply_der=0.27ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.98ms derive=1.18ms score=0.99ms split=0.46ms stats_read=1.00ms leaf_apply_der=0.33ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.98ms derive=1.34ms score=0.97ms split=0.42ms stats_read=1.00ms leaf_apply_der=0.28ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.26ms derive=1.45ms score=1.06ms split=0.38ms stats_read=1.01ms leaf_apply_der=0.33ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.12ms derive=1.33ms score=0.95ms split=0.41ms stats_read=0.72ms leaf_apply_der=0.36ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.88ms derive=1.42ms score=0.81ms split=0.33ms stats_read=0.71ms leaf_apply_der=0.37ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.14ms derive=1.38ms score=1.01ms split=0.43ms stats_read=0.97ms leaf_apply_der=0.33ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.27ms derive=1.12ms score=0.88ms split=0.34ms stats_read=0.75ms leaf_apply_der=0.25ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.59ms derive=1.34ms score=0.87ms split=0.37ms stats_read=0.89ms leaf_apply_der=0.14ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.03ms derive=1.61ms score=0.96ms split=0.38ms stats_read=0.88ms leaf_apply_der=0.28ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.23ms derive=1.41ms score=0.93ms split=0.80ms stats_read=0.78ms leaf_apply_der=0.28ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.67ms derive=1.31ms score=0.96ms split=0.43ms stats_read=0.83ms leaf_apply_der=0.39ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=7.52ms derive=0.92ms score=0.85ms split=0.35ms stats_read=1.02ms leaf_apply_der=0.26ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.88ms derive=1.56ms score=0.85ms split=0.34ms stats_read=0.92ms leaf_apply_der=0.24ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.75ms derive=0.93ms score=0.84ms split=0.34ms stats_read=1.03ms leaf_apply_der=0.34ms",
+    "CB_GPU_PROF tree n=300000 nf=50 bins=64 depth=6 fill=6.94ms derive=1.48ms score=0.94ms split=0.37ms stats_read=1.00ms leaf_apply_der=0.44ms",
+    "CB_GPU_PROF fit-train elapsed=2334.83ms"
+  ],
+  "prof_stage_sums_ms": {
+    "multicopy": 1.69,
+    "lds": 1.18,
+    "elapsed": 2889.02,
+    "fill": 838.14,
+    "derive": 101.86,
+    "score": 210.5,
+    "split": 72.6,
+    "stats_read": 180.15,
+    "leaf_apply_der": 63.61
+  },
+  "date": "2026-07-16"
+}
