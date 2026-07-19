@@ -6,6 +6,8 @@
 //! rather than splitting them across crates (research.md Crate-Placement
 //! Decision).
 
+mod coreml;
 mod onnx;
 
+pub use coreml::{export_coreml, CoreMlExportError};
 pub use onnx::{export_onnx, OnnxExportError};

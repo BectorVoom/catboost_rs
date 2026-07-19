@@ -35,7 +35,7 @@ pub use ctr_data::{
     CtrData, CtrTableJson, CtrValueTable, ECtrType, Prior,
 };
 pub use error::ModelError;
-pub use export::{export_onnx, OnnxExportError};
+pub use export::{export_coreml, export_onnx, CoreMlExportError, OnnxExportError};
 pub use fstr::{
     interaction, loss_function_change, loss_function_change_logloss, prediction_values_change,
     prediction_values_change_with_data, FeatureImportanceType,
@@ -97,3 +97,4 @@ generated_module!(model_generated, "generated/model_generated.rs");
 generated_module!(features_generated, "generated/features_generated.rs");
 generated_module!(ctr_data_generated, "generated/ctr_data_generated.rs");
 generated_module!(onnx_generated, "generated/onnx_generated.rs");
+generated_module!(coreml_generated, "generated/coreml_generated.rs");

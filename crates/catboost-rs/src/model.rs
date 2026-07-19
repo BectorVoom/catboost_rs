@@ -15,7 +15,8 @@ use std::path::Path;
 
 use cb_data::Pool;
 use cb_model::{
-    apply_prediction_type, export_onnx, interaction, load_cbm, load_json, partial_dependence,
+    apply_prediction_type, export_coreml, export_onnx, interaction, load_cbm, load_json,
+    partial_dependence,
     predict_raw, predict_raw_staged, prediction_values_change, prediction_values_change_with_data,
     save_cbm, save_json, shap_values, sum_models, FeatureImportanceType, PartialDependence,
     PredictionType,
@@ -418,6 +419,22 @@ impl Model {
     /// non-oblivious) or a downstream encode/I/O failure.
     pub fn save_onnx(&self, path: &Path, is_classifier: bool) -> Result<(), CatBoostError> {
         export_onnx(&self.inner, path, is_classifier)?;
+        Ok(())
+    }
+
+    /// Export to Apple CoreML `.mlmodel` (EXPORT-02): a float-only, oblivious,
+    /// scalar REGRESSOR model only — categorical/CTR, non-oblivious
+    /// (Lossguide/Depthwise/Region), and multi-dimensional (multiclass) models
+    /// are rejected with a typed error, never a panic. The emitted
+    /// `treeEnsembleRegressor` replicates CatBoost's own `.mlmodel` node
+    /// numbering — see [`cb_model::export_coreml`].
+    ///
+    /// # Errors
+    /// [`CatBoostError::CoreMlExport`] on an unsupported model (categorical/CTR,
+    /// non-oblivious, region, or multi-dimensional) or a downstream encode/I/O
+    /// failure.
+    pub fn save_coreml(&self, path: &Path) -> Result<(), CatBoostError> {
+        export_coreml(&self.inner, path)?;
         Ok(())
     }
 

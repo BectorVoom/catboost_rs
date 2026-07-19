@@ -42,6 +42,11 @@ pub use cb_model::{PartialDependence, PdpError};
 // entirely through the published crate, mirroring the `PdpError` precedent.
 pub use cb_model::OnnxExportError;
 
+// Re-export the CoreML export error type (EXPORT-02) so callers can match on
+// `catboost_rs::CoreMlExportError` sub-variants (via `CatBoostError::CoreMlExport`)
+// entirely through the published crate, mirroring the `OnnxExportError` precedent.
+pub use cb_model::CoreMlExportError;
+
 // Re-export the loss / leaf-method / score-function / bootstrap knobs the
 // Builder consumes, so a caller configures a run entirely through the published
 // crate. `EScoreFunction` drives `.score_function()` (Cosine = catboost CPU

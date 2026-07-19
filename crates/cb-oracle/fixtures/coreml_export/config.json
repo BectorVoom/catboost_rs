@@ -1,0 +1,22 @@
+{
+  "artifacts": [
+    "model.cbm",
+    "reference.mlmodel",
+    "structure.json",
+    "golden.mlmodel",
+    "config.json"
+  ],
+  "bootstrap_type": "No",
+  "catboost_version": "1.2.10",
+  "coremltools_version": "9.0",
+  "depth": 3,
+  "golden_provenance": "golden.mlmodel is the Rust exporter's own output for model.cbm, produced by running `cargo test -p cb-model --test coreml_export_test` once with CB_COREML_REGEN_GOLDEN=1 (NOT by this Python script). Frozen thereafter; regenerate deliberately only on a schema change.",
+  "input_dataset": "inputs/numeric_tiny/X.npy",
+  "iterations": 5,
+  "learning_rate": 0.3,
+  "loss_function": "RMSE",
+  "n_trees": 5,
+  "note": "FROZEN. CatBoost quantization is run-to-run nondeterministic; never regenerate at test time. structure.json is the CM-04 oracle target.",
+  "seed": 0,
+  "thread_count": 1
+}

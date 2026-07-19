@@ -83,6 +83,16 @@ pub enum CatBoostError {
     #[error("ONNX export error: {0}")]
     Export(#[from] cb_model::OnnxExportError),
 
+    /// A [`crate::Model::save_coreml`] export failed — an unsupported model
+    /// (categorical/CTR, non-oblivious, region, or multi-dimensional) or a
+    /// downstream encode/I/O error. Carries the typed `cb-model`
+    /// [`cb_model::CoreMlExportError`]. A NEW variant distinct from
+    /// [`CatBoostError::Export`], because that arm is hard-typed to
+    /// [`cb_model::OnnxExportError`] and thiserror cannot attach a second
+    /// `#[from]` of a different type. Converted with `?` via `#[from]`.
+    #[error("CoreML export error: {0}")]
+    CoreMlExport(#[from] cb_model::CoreMlExportError),
+
     /// A [`crate::Model::feature_importance_with_data`]
     /// [`cb_model::FeatureImportanceType::LossFunctionChange`] request named a
     /// loss the first slice does not support (FSTR-02, FL-03). Only the

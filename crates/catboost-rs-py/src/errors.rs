@@ -110,6 +110,10 @@ impl From<PyCbError> for PyErr {
 ///   arm's own mapping (`PyIOError`); `Encode` maps to the base
 ///   `CatBoostError` (an internal/unexpected failure, mirroring `Train`/`Model`
 ///   — not user-input-driven).
+/// - `CoreMlExport` (EXPORT-02) -> per `CoreMlExportError` sub-variant, using
+///   the SAME mapping as the `Export` (ONNX) arm: the guard-rejection variants
+///   map to `CatBoostValueError`, `Io` to `PyIOError`, `Encode` to the base
+///   `CatBoostError`.
 pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
     match err {
         FacadeError::FeatureMismatch(m) => CatBoostValueError::new_err(m.clone()),
@@ -144,6 +148,22 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
             }
             cb_model::OnnxExportError::Io(io) => PyIOError::new_err(io.to_string()),
             cb_model::OnnxExportError::Encode(_) => CatBoostError::new_err(e.to_string()),
+        },
+        // `CoreMlExport` (EXPORT-02) mirrors the `Export` (ONNX) arm exactly:
+        // the four guard-rejection variants (`CategoricalFeaturesUnsupported` /
+        // `NonObliviousTreesUnsupported` / `RegionTreesUnsupported` /
+        // `MultiDimUnsupported`) map to `CatBoostValueError` (the model itself
+        // is the "bad input" to the export operation); `Io` -> `PyIOError`;
+        // `Encode` -> base `CatBoostError` (an internal/unexpected failure).
+        FacadeError::CoreMlExport(e) => match e {
+            cb_model::CoreMlExportError::CategoricalFeaturesUnsupported
+            | cb_model::CoreMlExportError::NonObliviousTreesUnsupported
+            | cb_model::CoreMlExportError::RegionTreesUnsupported
+            | cb_model::CoreMlExportError::MultiDimUnsupported => {
+                CatBoostValueError::new_err(e.to_string())
+            }
+            cb_model::CoreMlExportError::Io(io) => PyIOError::new_err(io.to_string()),
+            cb_model::CoreMlExportError::Encode(_) => CatBoostError::new_err(e.to_string()),
         },
     }
 }

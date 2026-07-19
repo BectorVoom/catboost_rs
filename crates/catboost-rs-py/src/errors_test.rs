@@ -198,3 +198,55 @@ fn unsupported_model_maps_to_value_error() {
         assert!(err.value(py).to_string().contains("non-symmetric trees"));
     });
 }
+
+// ── EXPORT-02 (CM-03): `CoreMlExport` sub-variant -> Python exception mapping ──
+
+/// The four `CoreMlExportError` guard-rejection variants
+/// (`CategoricalFeaturesUnsupported` / `NonObliviousTreesUnsupported` /
+/// `RegionTreesUnsupported` / `MultiDimUnsupported`) -> `CatBoostValueError`
+/// (the model itself is the "bad input" to the export, like the ONNX `Export`
+/// arm).
+#[test]
+fn coreml_guard_rejections_map_to_value_error() {
+    Python::attach(|py| {
+        for e in [
+            cb_model::CoreMlExportError::CategoricalFeaturesUnsupported,
+            cb_model::CoreMlExportError::NonObliviousTreesUnsupported,
+            cb_model::CoreMlExportError::RegionTreesUnsupported,
+            cb_model::CoreMlExportError::MultiDimUnsupported,
+        ] {
+            let err = to_pyerr(&FacadeError::CoreMlExport(e));
+            assert!(err.is_instance_of::<CatBoostValueError>(py));
+        }
+    });
+}
+
+/// `CoreMlExportError::Io` -> `PyIOError` (mirrors the ONNX `Export` `Io` arm).
+#[test]
+fn coreml_io_maps_to_io_error() {
+    Python::attach(|py| {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no parent dir");
+        let err = to_pyerr(&FacadeError::CoreMlExport(cb_model::CoreMlExportError::Io(io)));
+        assert!(err.is_instance_of::<PyIOError>(py));
+        assert!(err.value(py).to_string().contains("no parent dir"));
+    });
+}
+
+/// `CoreMlExportError::Encode` -> base `CatBoostError` (an internal/unexpected
+/// failure, mirrors `Train`/`Model` and the ONNX `Export` `Encode` arm).
+#[test]
+fn coreml_encode_maps_to_base_error() {
+    let probe = EncodeErrorProbe { value: 7 };
+    let mut small_buf = [0_u8; 0];
+    let mut writer: &mut [u8] = &mut small_buf;
+    let encode_err = prost::Message::encode(&probe, &mut writer)
+        .expect_err("a zero-capacity buffer must fail to encode a non-empty message");
+
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::CoreMlExport(
+            cb_model::CoreMlExportError::Encode(encode_err),
+        ));
+        assert!(err.is_instance_of::<PyCatBoostError>(py));
+        assert!(!err.is_instance_of::<CatBoostValueError>(py));
+    });
+}
