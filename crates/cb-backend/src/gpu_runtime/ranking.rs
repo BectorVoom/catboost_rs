@@ -70,6 +70,7 @@ pub(crate) enum RankingObjective {
     },
     /// QueryCrossEntropy — per-query bisection/Newton shift search (Open Q3, INDEPENDENTLY gated
     /// off: no CPU der oracle yet, so it is deferred rather than shipped as unverified der parity).
+    #[allow(dead_code)] // consumed by the #[cfg(test)] ranking_det_test self-oracle (source/test separation)
     QueryCrossEntropy,
     /// YetiRank (Phase 13 Plan 05, D-08) — the STOCHASTIC in-query bootstrap-sampled listwise
     /// objective (pointwise leaf). Per bootstrap iteration the device perturbs each doc's
@@ -379,6 +380,7 @@ fn weight_column(weights: &[f64], n: usize) -> CbResult<Vec<f64>> {
 ///
 /// `weight_col` is the already-expanded uniform-or-validated weight column (length `n`); for a
 /// uniform-weight query this returns the same value as the weight-blind max (regression-safe).
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_stoch_test self-oracle (source/test separation)
 pub(crate) fn compute_group_max_weighted_host(
     approx: &[f64],
     weight_col: &[f64],
@@ -427,6 +429,7 @@ fn validate_ranking_inputs(approx: &[f64], target: &[f64], q_offsets: &[u32]) ->
 /// reduction), `ComputeGroupIds`, `RemoveGroupMeans` (`residual − queryAvrg`) — with
 /// [`ranking_rmse_der_kernel`]. Returns `(der1, der2)` (each length `n`), matching
 /// `cb_compute::calc_ders_for_queries` for `Loss::QueryRmse` within ε=1e-4.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_det_test self-oracle (source/test separation)
 pub(crate) fn query_rmse_ders_host(
     approx: &[f64],
     target: &[f64],
@@ -485,6 +488,7 @@ pub(crate) fn query_rmse_ders_host(
 /// QuerySoftMax device der: the per-query weighted softmax der using the Plan-03 `ComputeGroupMax`
 /// shift. Returns `(der1, der2)` (each length `n`), matching `cb_compute::calc_ders_for_queries` for
 /// `Loss::QuerySoftMax { lambda, beta }` within ε=1e-4 (covered uniform-weight regime).
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_det_test self-oracle (source/test separation)
 pub(crate) fn query_softmax_ders_host(
     approx: &[f64],
     target: &[f64],
@@ -549,6 +553,7 @@ pub(crate) fn query_softmax_ders_host(
 /// the fixed-count bisection + Newton [`query_cross_entropy_shift_kernel`]. This is a genuine,
 /// self-consistent root-find (the returned shift satisfies the equation) — NOT a der claim; the full
 /// QueryCrossEntropy der stays gated off until its CPU oracle lands.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_det_test self-oracle (source/test separation)
 pub(crate) fn query_cross_entropy_shifts_host(
     approx: &[f64],
     target: &[f64],
@@ -742,6 +747,7 @@ fn yetirank_perturb_kernel(
 /// `blockSeed = TFastRng64(random_seed).GenRand()`, then per query `querySeed =
 /// TFastRng64(blockSeed).GenRand()`. This is the O(1) base state the device kernel re-expands.
 #[must_use]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_stoch_test self-oracle (source/test separation)
 pub(crate) fn derive_query_seeds_inline(random_seed: u64, group_count: usize) -> Vec<u64> {
     let mut seed_rng = cb_core::TFastRng64::from_seed(random_seed);
     let block_seed = seed_rng.gen_rand();
@@ -781,6 +787,7 @@ fn pairlogit_pair_prob_local(winner_approx: f64, loser_approx: f64) -> f64 {
 /// HARD-03): a fixture with deliberate exact ties is checked against an independent CPU stable
 /// descending sort. Raised to `pub(crate)` so that sibling oracle can invoke this directly.
 #[cfg(not(feature = "wgpu"))]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_stoch_test self-oracle (source/test separation)
 pub(crate) fn descending_order_per_query(perturbed: &[f64], q_offsets: &[u32]) -> CbResult<Vec<u32>> {
     let n = perturbed.len();
     if n == 0 {
@@ -973,6 +980,7 @@ fn yetirank_sample_der_core(
 /// `yetirank_sample_pairs` + `calc_ders_for_queries` reference for the pinned `random_seed`
 /// bit-for-bit at ε=1e-4. See [`yetirank_sample_der_core`].
 #[cfg_attr(feature = "wgpu", allow(unused_variables))]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_stoch_test self-oracle (source/test separation)
 pub(crate) fn yetirank_ders_host(
     approx: &[f64],
     target: &[f64],
@@ -1000,6 +1008,7 @@ pub(crate) fn yetirank_ders_host(
 /// as [`yetirank_ders_host`] (only the leaf path differs — Cholesky vs pointwise — decided later in
 /// boosting, NOT here), so the device der is identical. Returns `(der1, der2)`.
 #[cfg_attr(feature = "wgpu", allow(unused_variables))]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_stoch_test self-oracle (source/test separation)
 pub(crate) fn pfound_f_ders_host(
     approx: &[f64],
     target: &[f64],
@@ -1026,6 +1035,7 @@ pub(crate) fn pfound_f_ders_host(
 /// (perm-major, doc-ascending, per query). Exposed so the self-oracle asserts the device stream
 /// length matches the CPU exactly (a divergent count silently shifts every value, T-13-10).
 #[must_use]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ranking_stoch_test self-oracle (source/test separation)
 pub(crate) fn yetirank_draw_count(n: usize, permutations: u32) -> usize {
     permutations as usize * n
 }

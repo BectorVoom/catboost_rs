@@ -344,6 +344,7 @@ fn build_query_head_flags(q_offsets: &[u32], n: usize) -> Vec<u32> {
 }
 
 /// `ComputeGroupIds` host readback: the per-doc query id for the `n` docs described by `q_offsets`.
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn compute_group_ids_host(q_offsets: &[u32], n: usize) -> CbResult<Vec<u32>> {
     if n == 0 {
         return Ok(Vec::new());
@@ -371,6 +372,7 @@ pub(crate) fn compute_group_ids_host(q_offsets: &[u32], n: usize) -> CbResult<Ve
 
 /// `ComputeGroupMeans` host readback: the per-query weighted means. `weights` is either empty
 /// (uniform `1.0`) or length `n`.
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn compute_group_means_host(
     values: &[f64],
     weights: &[f64],
@@ -442,6 +444,7 @@ pub(crate) fn compute_group_means_host(
 }
 
 /// `ComputeGroupMax` host readback: the per-query maxima.
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbResult<Vec<f64>> {
     let n = values.len();
     let n_groups = q_offsets.len().saturating_sub(1);
@@ -473,6 +476,7 @@ pub(crate) fn compute_group_max_host(values: &[f64], q_offsets: &[u32]) -> CbRes
 
 /// `RemoveGroupMeans` host readback: `values[d] - group_means[qids[d]]` per doc. `qids` / `values`
 /// are length `n`; `group_means` is length `n_groups`.
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn remove_group_means_host(
     values: &[f64],
     qids: &[u32],
@@ -545,6 +549,7 @@ pub(crate) fn create_sort_keys_host(base_seed: u64, n: usize) -> CbResult<Vec<u3
 }
 
 /// The per-query sampled sizes (`ComputeSampledSizes`) — the ≥2-floor readback surface.
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn compute_sampled_sizes_host(
     q_offsets: &[u32],
     sample_rate: f64,
@@ -578,6 +583,7 @@ pub(crate) fn compute_sampled_sizes_host(
 
 /// `FillTakenDocsMask` host readback: the per-doc taken mask for the given `sample_rate` over the
 /// CURRENT doc order (`n` docs).
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn fill_taken_docs_mask_host(
     q_offsets: &[u32],
     sample_rate: f64,
@@ -610,6 +616,7 @@ pub(crate) fn fill_taken_docs_mask_host(
 }
 
 /// `FillQueryEndMask` host readback: the per-doc query-end mask (`1` at each query's last doc).
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn fill_query_end_mask_host(q_offsets: &[u32], n: usize) -> CbResult<Vec<u32>> {
     if n == 0 {
         return Ok(Vec::new());
@@ -639,6 +646,7 @@ pub(crate) fn fill_query_end_mask_host(q_offsets: &[u32], n: usize) -> CbResult<
 /// ([`crate::kernels::exact_quantile::segmented_radix_sort`]) so queries stay contiguous while docs
 /// shuffle WITHIN each query. Returns the permuted doc indices `[0, n)`. `q_offsets` delimits the
 /// queries; `base_seed` pins the draw.
+#[allow(dead_code)] // consumed by the #[cfg(test)] query_helper_test self-oracle (source/test separation)
 pub(crate) fn shuffle_within_queries_host(
     q_offsets: &[u32],
     base_seed: u64,

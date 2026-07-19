@@ -209,8 +209,10 @@ fn wgpu_reject() -> CbError {
 /// downstream diagnostics).
 pub(crate) struct ResidentCtr {
     /// Per-object good count `N[1]` read before the label (u32, object order).
+    #[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
     pub good: Handle,
     /// Per-object total count `N[0] + N[1]` read before the label (u32, object order).
+    #[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
     pub total: Handle,
     /// Per-object online CTR value `(good + prior) / (total + 1)` (f64, object order).
     pub value: Handle,
@@ -361,6 +363,7 @@ pub(crate) fn binarize_ctr_column_resident(
 ///
 /// Returns `(good, total, value)` in object order; `good`/`total` are widened to `i64` to match
 /// the CPU reference's integer prefix schema.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
 pub(crate) fn compute_ordered_ctr_host(
     perm: &[u32],
     bins: &[u32],
@@ -401,6 +404,7 @@ pub(crate) fn compute_ordered_ctr_host(
 /// read that bin column back. Returns the per-object bin indices (`> bin` convention). A read-back
 /// failure surfaces [`CbError::Degenerate`] (WR-05).
 #[cfg(not(feature = "wgpu"))]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
 pub(crate) fn binarize_ctr_column_host(
     perm: &[u32],
     bins: &[u32],

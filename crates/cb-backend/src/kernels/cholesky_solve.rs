@@ -399,6 +399,7 @@ fn read_f64(
 /// `leaf_count × leaf_count` per-leaf pairwise weight-sum matrix (no ridge), `der_sums` the
 /// per-leaf der sums. A `leaf_count <= 1` system returns `vec![0.0; leaf_count]` WITHOUT a device
 /// launch (its lone zero-averaged delta is 0; matches the CPU singleton/empty guard).
+#[allow(dead_code)] // consumed by the #[cfg(test)] cholesky_solve_test self-oracle (source/test separation)
 pub(crate) fn solve_pairwise_leaf_values_host(
     weight_sums: &[f64],
     der_sums: &[f64],
@@ -448,6 +449,7 @@ pub(crate) fn solve_pairwise_leaf_values_host(
 /// `weight_sum` is the row-major `n × n` running pairwise weight matrix (no ridge, `n = 2·PartCount`),
 /// `der_sum` the running der vector. Returns the scalar score (`0.0` for a degenerate `n < 2`
 /// system, matching the CPU zeros-leaf → 0-score path).
+#[allow(dead_code)] // consumed by the #[cfg(test)] cholesky_solve_test self-oracle (source/test separation)
 pub(crate) fn score_pairwise_cholesky_host(
     weight_sum: &[f64],
     der_sum: &[f64],

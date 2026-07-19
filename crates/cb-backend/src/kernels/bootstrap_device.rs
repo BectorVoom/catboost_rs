@@ -456,6 +456,7 @@ pub(crate) fn fold_weights_resident(
 /// (device draw vs the frozen CPU sample); it is NOT the residency fold path (that keeps the
 /// handle on-device). A read-back failure surfaces [`CbError::Degenerate`] (WR-05), never a
 /// silent zero buffer.
+#[allow(dead_code)] // consumed by the #[cfg(test)] bootstrap_device_test self-oracle (source/test separation)
 pub(crate) fn draw_bootstrap_weights_host(
     kind: DeviceBootstrapKind,
     base_state: [u64; 4],
@@ -499,6 +500,7 @@ pub(crate) fn draw_bootstrap_weights_host(
 /// Returns `random_strength * sqrt(max(0, var))`; an empty / single-element score set yields a
 /// zero scale (no jitter). No `unwrap`/`panic` (D-13).
 #[must_use]
+#[allow(dead_code)] // consumed by the #[cfg(test)] bootstrap_device_test self-oracle (source/test separation)
 pub(crate) fn device_score_stddev(scores: &[f64], random_strength: f64) -> f64 {
     let n = scores.len();
     if n < 2 || random_strength == 0.0 {

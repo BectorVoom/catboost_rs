@@ -416,6 +416,7 @@ fn read_f64(
 /// per-dimension der sum (length `k`); `sum_der2_packed` is the packed lower-triangular hessian
 /// (length `k·(k+1)/2`). `coupled == true` runs the full softmax solve; `coupled == false` runs the
 /// per-component diagonal solve. A `k <= 0` system returns an empty `Vec` WITHOUT a device launch.
+#[allow(dead_code)] // consumed by the #[cfg(test)] multi_newton_test self-oracle (source/test separation)
 pub(crate) fn solve_multi_newton_host(
     sum_der: &[f64],
     sum_der2_packed: &[f64],

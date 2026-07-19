@@ -323,6 +323,7 @@ pub(crate) fn launch_mvs_weights_resident(
 /// exercises (device MVS vs the frozen CPU `mvs_sample_weights`); it is NOT the residency fold path
 /// (that keeps the handle on-device). A read-back failure surfaces [`CbError::Degenerate`] (WR-05),
 /// never a silent zero buffer.
+#[allow(dead_code)] // consumed by the #[cfg(test)] mvs_device_test self-oracle (source/test separation)
 pub(crate) fn draw_mvs_weights_host(
     derivatives: &[f64],
     rand_seed: u64,
