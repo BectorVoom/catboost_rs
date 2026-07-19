@@ -16,8 +16,9 @@ use std::path::Path;
 use cb_data::Pool;
 use cb_model::{
     apply_prediction_type, export_onnx, interaction, load_cbm, load_json, partial_dependence,
-    predict_raw, prediction_values_change, prediction_values_change_with_data, save_cbm,
-    save_json, shap_values, sum_models, FeatureImportanceType, PartialDependence, PredictionType,
+    predict_raw, predict_raw_staged, prediction_values_change, prediction_values_change_with_data,
+    save_cbm, save_json, shap_values, sum_models, FeatureImportanceType, PartialDependence,
+    PredictionType,
 };
 use cb_train::{parse_metric, EvalMetric};
 
@@ -132,6 +133,77 @@ impl Model {
     /// [`CatBoostError::FeatureMismatch`] (see [`Model::predict_with`]).
     pub fn predict(&self, pool: &Pool) -> Result<Vec<f64>, CatBoostError> {
         self.predict_with(pool, PredictionType::RawFormulaVal)
+    }
+
+    /// Reject a model the scalar float-only staged path cannot handle (SP-03
+    /// guard): a non-scalar (`approx_dimension > 1`), non-oblivious
+    /// (non-symmetric / Region), or CTR/categorical model. On such a model
+    /// [`predict_raw_staged`] would silently drop dimensions or ignore trees, so
+    /// it is rejected with a typed [`CatBoostError::UnsupportedModel`].
+    fn ensure_scalar_oblivious(&self) -> Result<(), CatBoostError> {
+        let inner = self.as_canonical();
+        if inner.approx_dimension > 1 {
+            return Err(CatBoostError::UnsupportedModel(format!(
+                "staged_predict supports only scalar (approx_dimension == 1) models, got approx_dimension = {}",
+                inner.approx_dimension
+            )));
+        }
+        if !inner.non_symmetric_trees.is_empty() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only oblivious models; this model has non-symmetric trees"
+                    .to_owned(),
+            ));
+        }
+        if !inner.region_trees.is_empty() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only oblivious models; this model has region trees"
+                    .to_owned(),
+            ));
+        }
+        if inner.ctr_data.is_some() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only float-only models; this model has CTR data"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cumulative raw predictions ([`PredictionType::RawFormulaVal`]) over an
+    /// increasing prefix of the ensemble — one `Vec<f64>` per stage, each length
+    /// `n_objects` in object order (scalar oblivious float-only models).
+    ///
+    /// `ntree_start` / `ntree_end` / `eval_period` default to `0` / `0` / `1`
+    /// (all trees, one stage per tree) when `None`, matching upstream
+    /// `staged_predict`. Stages step by `eval_period` and always include
+    /// `ntree_end` (`0` ⇒ all trees) as the final stage; `stages.last()` equals
+    /// [`Model::predict`] for the default schedule.
+    ///
+    /// # Errors
+    /// [`CatBoostError::UnsupportedModel`] if the model is not scalar
+    /// (`approx_dimension > 1`), not oblivious (non-symmetric / Region trees), or
+    /// carries CTR data — checked BEFORE the pool so the scope error is
+    /// deterministic. [`CatBoostError::FeatureMismatch`] if `pool`'s
+    /// float-feature count differs from the model's.
+    pub fn staged_predict(
+        &self,
+        pool: &Pool,
+        ntree_start: Option<usize>,
+        ntree_end: Option<usize>,
+        eval_period: Option<usize>,
+    ) -> Result<Vec<Vec<f64>>, CatBoostError> {
+        self.ensure_scalar_oblivious()?;
+        let columns = self.feature_columns(pool)?;
+        let start = ntree_start.unwrap_or(0);
+        let end = ntree_end.unwrap_or(0);
+        let period = eval_period.unwrap_or(1);
+        Ok(predict_raw_staged(
+            self.as_canonical(),
+            &columns,
+            start,
+            end,
+            period,
+        ))
     }
 
     /// Predict class probabilities ([`PredictionType::Probability`]) — the D-06

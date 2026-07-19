@@ -129,6 +129,12 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         // name, so the Python message is self-describing (mirrors the
         // `PartialDependence`/`Export` arms that use the error's `Display`).
         FacadeError::UnsupportedLoss(_) => CatBoostValueError::new_err(err.to_string()),
+        // An unsupported `staged_predict` model (non-scalar / non-oblivious / CTR)
+        // is a bad-input value error (the model itself is the "bad input", like
+        // `PartialDependence` / `Export`'s guard rejections). Surface the full
+        // `Display` ("unsupported model: <reason>") so the Python message is
+        // self-describing.
+        FacadeError::UnsupportedModel(_) => CatBoostValueError::new_err(err.to_string()),
         FacadeError::Export(e) => match e {
             cb_model::OnnxExportError::CategoricalFeaturesUnsupported
             | cb_model::OnnxExportError::NonObliviousTreesUnsupported

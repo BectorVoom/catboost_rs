@@ -93,4 +93,13 @@ pub enum CatBoostError {
     /// loss descriptor.
     #[error("unsupported loss for LossFunctionChange: {0}")]
     UnsupportedLoss(String),
+
+    /// A [`crate::Model::staged_predict`] request targeted a model the first
+    /// slice does not support: a non-scalar (`approx_dimension > 1`),
+    /// non-oblivious (non-symmetric / Region), or CTR/categorical model. The
+    /// float-only scalar staged path would silently drop dimensions or ignore
+    /// trees on such a model, so it is rejected with a typed error rather than
+    /// returning silently-wrong output. Carries a human-readable reason.
+    #[error("unsupported model: {0}")]
+    UnsupportedModel(String),
 }

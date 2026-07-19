@@ -415,6 +415,105 @@ pub fn predict_raw_cat(
         .collect()
 }
 
+/// The upstream `staged_predict` stage tree-counts for the half-open interval
+/// `[start, end)` stepping by `step` (`step >= 1`, `start < end`): the counts
+/// `start + step, start + 2·step, …` that stay `< end`, then ALWAYS `end` as the
+/// final stage. A pure, side-effect-free schedule generator so SP-02's inclusion
+/// rule is reasoned about independently of the per-object accumulation.
+///
+/// All arithmetic is saturating (workspace deny `arithmetic_side_effects` is not
+/// on, but overflow would be a silent bug, not a panic).
+fn stage_counts(start: usize, end: usize, step: usize) -> Vec<usize> {
+    let mut counts = Vec::new();
+    let mut count = start.saturating_add(step);
+    while count < end {
+        counts.push(count);
+        count = count.saturating_add(step);
+    }
+    // The final stage is always the full `end` (upstream always includes it).
+    counts.push(end);
+    counts
+}
+
+/// The cumulative raw approx of ONE object over the first `end` oblivious trees:
+/// `bias + Σ_{t<end} tree_t.leaf_values[leaf_index_for(t, x)]`, accumulated
+/// through the order-locked [`sum_f64`] (D-08), `+ bias` once. Byte-identical to
+/// the oblivious arm of [`predict_raw_one`] truncated to the first `end` trees;
+/// `cat_values` is empty on the float-only staged path (no CTR split evaluated).
+fn prefix_row_value(model: &Model, features: &[f32], cat_values: &[String], end: usize) -> f64 {
+    let contributions: Vec<f64> = model
+        .oblivious_trees
+        .iter()
+        .take(end)
+        .map(|tree| {
+            let leaf = leaf_index_for(model, tree, features, cat_values);
+            tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
+        })
+        .collect();
+    model.bias + sum_f64(&contributions)
+}
+
+/// Raw approx over an increasing prefix of the ensemble (SCALAR oblivious models).
+/// Returns one row per stage; each row is length `n_objects` in object order.
+/// Stages are the tree counts `min(ntree_start + eval_period, ntree_end), …,
+/// ntree_end`, where `ntree_end == 0` is treated as `oblivious_trees.len()`.
+/// `eval_period == 0` is treated as `1`. An out-of-range `ntree_start >= end`
+/// yields an empty `Vec`.
+///
+/// # Contract (UNGUARDED — caller's responsibility)
+/// This function does NOT validate model shape: it only accumulates
+/// `model.oblivious_trees` over the scalar leaf-value path. On a multi-dimension
+/// (`approx_dimension > 1`), non-symmetric, Region, or CTR model it returns
+/// SILENTLY WRONG output (dropped dimensions / ignored trees), not an error. The
+/// scalar-oblivious guard lives at the facade (SP-03); any direct `cb-model`
+/// caller MUST ensure the model is scalar + oblivious + float-only before calling.
+#[must_use]
+pub fn predict_raw_staged(
+    model: &Model,
+    feature_values: &[Vec<f32>],
+    ntree_start: usize,
+    ntree_end: usize,
+    eval_period: usize,
+) -> Vec<Vec<f64>> {
+    let n_trees = model.oblivious_trees.len();
+    // `ntree_end == 0` means "all trees"; otherwise clamp to the tree count.
+    let end = if ntree_end == 0 {
+        n_trees
+    } else {
+        ntree_end.min(n_trees)
+    };
+    if ntree_start >= end {
+        return Vec::new();
+    }
+    // `eval_period == 0` degenerates to a step of 1 (one stage per tree).
+    let step = eval_period.max(1);
+    let counts = stage_counts(ntree_start, end, step);
+
+    // Float-only staged path: no categorical columns are consulted. The object
+    // count is the FIRST float column's length (matching `predict_raw_cat`).
+    let n_objects = feature_values.first().map_or(0, Vec::len);
+    // Gather each object's contiguous float row ONCE (checked `.get`; a short
+    // column reads NaN, which fails every strict `> border` test) and reuse it
+    // across every stage.
+    let rows: Vec<Vec<f32>> = (0..n_objects)
+        .map(|obj| {
+            feature_values
+                .iter()
+                .map(|col| col.get(obj).copied().unwrap_or(f32::NAN))
+                .collect()
+        })
+        .collect();
+
+    counts
+        .iter()
+        .map(|&count| {
+            rows.iter()
+                .map(|row| prefix_row_value(model, row, &[], count))
+                .collect()
+        })
+        .collect()
+}
+
 /// Apply `model` to a numeric feature view, returning the DIMENSION-MAJOR raw
 /// approx of length `approx_dimension * n` (output index `d * n + i`) — the public
 /// N-dim apply for multi-output models (MultiClass / MultiClassOneVsAll /
@@ -812,3 +911,7 @@ pub fn apply_virtual_ensembles(
 #[cfg(test)]
 #[path = "region_apply_test.rs"]
 mod region_apply_test;
+
+#[cfg(test)]
+#[path = "staged_predict_test.rs"]
+mod staged_predict_test;

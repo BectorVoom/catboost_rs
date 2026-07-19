@@ -186,3 +186,15 @@ fn unsupported_loss_maps_to_value_error() {
         assert!(err.value(py).to_string().contains("AUC"));
     });
 }
+
+/// `UnsupportedModel` -> `CatBoostValueError` (a non-scalar / non-oblivious / CTR
+/// model handed to `staged_predict` is a bad-input value error, like
+/// `UnsupportedLoss` / `PartialDependence`; SP-03).
+#[test]
+fn unsupported_model_maps_to_value_error() {
+    Python::attach(|py| {
+        let err = to_pyerr(&FacadeError::UnsupportedModel("non-symmetric trees".to_owned()));
+        assert!(err.is_instance_of::<CatBoostValueError>(py));
+        assert!(err.value(py).to_string().contains("non-symmetric trees"));
+    });
+}
