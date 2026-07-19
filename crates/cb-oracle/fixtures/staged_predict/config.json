@@ -2,13 +2,26 @@
   "artifacts": [
     "model.cbm",
     "staged_period1.npy",
-    "staged_period3.npy"
+    "staged_period3.npy",
+    "staged_start2_period3.npy"
   ],
   "catboost_version": "1.2.10",
   "input_dataset": "numeric_tiny",
   "loss_function": "RMSE",
   "n_trees": 10,
   "note": "SP-04 / R1: float-only oblivious CatBoostRegressor. staged_predict(X, prediction_type='RawFormulaVal', eval_period=k) frozen as [n_stages, n_objects]. stage_tree_counts[k] are the EMPIRICALLY confirmed tree counts each stage corresponds to (matched against predict(ntree_end=c)).",
+  "partial_start": {
+    "start2_period3": {
+      "eval_period": 3,
+      "note": "Generated from the FROZEN model.cbm (loaded, not retrained). staged_predict(ntree_start=2,eval_period=3) sums trees [2,count) with NO bias.",
+      "ntree_start": 2,
+      "stage_tree_counts": [
+        5,
+        8,
+        10
+      ]
+    }
+  },
   "scenario": "staged_predict",
   "seed": 0,
   "stage_tree_counts": {

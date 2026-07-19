@@ -28,6 +28,11 @@ INPUTS = os.path.join(ROOT, "crates", "cb-oracle", "fixtures", "inputs", "numeri
 
 N_TREES = 10
 PERIODS = [1, 3]
+# Partial-start arm (ntree_start > 0): sums trees [ntree_start, count) with NO
+# bias, matching upstream's [ntree_start, ntree_end) window. Frozen as
+# `staged_start2_period3.npy`.
+PARTIAL_START = 2
+PARTIAL_PERIOD = 3
 # Tolerance for matching a staged row to a truncated `predict(ntree_end=c)` row.
 MATCH_TOL = 1e-9
 
@@ -45,21 +50,24 @@ def fit_model():
     return X, m
 
 
-def confirm_stage_counts(model, X, staged_rows):
-    """For each staged row, find the tree count c in 1..=N_TREES whose truncated
-    `predict(ntree_end=c)` reproduces it (R1). Returns the confirmed counts."""
+def confirm_stage_counts(model, X, staged_rows, ntree_start=0):
+    """For each staged row, find the tree count c in (ntree_start, N_TREES] whose
+    truncated `predict(ntree_start, ntree_end=c)` reproduces it (R1). Returns the
+    confirmed counts. `ntree_start > 0` sums trees [ntree_start, c) with no bias."""
     truncated = {
         c: np.asarray(
-            model.predict(X, prediction_type="RawFormulaVal", ntree_end=c),
+            model.predict(
+                X, prediction_type="RawFormulaVal", ntree_start=ntree_start, ntree_end=c
+            ),
             dtype=np.float64,
         )
-        for c in range(1, N_TREES + 1)
+        for c in range(ntree_start + 1, N_TREES + 1)
     }
     counts = []
     for j, row in enumerate(staged_rows):
         row = np.asarray(row, dtype=np.float64).reshape(-1)
         matched = None
-        for c in range(1, N_TREES + 1):
+        for c in range(ntree_start + 1, N_TREES + 1):
             if np.max(np.abs(truncated[c] - row)) <= MATCH_TOL:
                 matched = c
                 break
@@ -109,6 +117,37 @@ def main():
         config["artifacts"].append(fname)
         print(f"eval_period={k}: n_stages={len(staged)} "
               f"stage_tree_counts={counts} shape={mat.shape}")
+
+    # Partial-start arm: sums trees [PARTIAL_START, count) with NO bias.
+    staged_ps = list(
+        model.staged_predict(
+            X,
+            prediction_type="RawFormulaVal",
+            ntree_start=PARTIAL_START,
+            ntree_end=0,
+            eval_period=PARTIAL_PERIOD,
+        )
+    )
+    counts_ps = confirm_stage_counts(model, X, staged_ps, ntree_start=PARTIAL_START)
+    mat_ps = np.asarray(
+        [np.asarray(r, dtype=np.float64).reshape(-1) for r in staged_ps],
+        dtype=np.float64,
+    )
+    np.save(os.path.join(HERE, "staged_start2_period3.npy"), mat_ps)
+    config["partial_start"] = {
+        "start2_period3": {
+            "ntree_start": PARTIAL_START,
+            "eval_period": PARTIAL_PERIOD,
+            "stage_tree_counts": counts_ps,
+            "note": (
+                "staged_predict(ntree_start=2, eval_period=3) sums trees "
+                "[2, count) with NO bias."
+            ),
+        }
+    }
+    config["artifacts"].append("staged_start2_period3.npy")
+    print(f"partial start={PARTIAL_START} period={PARTIAL_PERIOD}: "
+          f"n_stages={len(staged_ps)} stage_tree_counts={counts_ps} shape={mat_ps.shape}")
 
     with open(os.path.join(HERE, "config.json"), "w") as f:
         json.dump(config, f, indent=2, sort_keys=True)

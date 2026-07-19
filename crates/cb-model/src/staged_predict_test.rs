@@ -119,3 +119,40 @@ fn staged_schedule_boundaries() {
     let empty = predict_raw_staged(&model, &cols, 10, 5, 1);
     assert!(empty.is_empty(), "start >= end yields no stages");
 }
+
+/// SP-02 (partial start): with `ntree_start > 0`, each stage sums ONLY the trees
+/// in `[ntree_start, count)` — trees before `ntree_start` are excluded — AND the
+/// model bias is NOT added (upstream `[ntree_start, ntree_end)` window semantics,
+/// verified against `catboost==1.2.10`). Regression guard for the review finding
+/// that the accumulation started at tree 0 and always added the bias.
+#[test]
+fn staged_partial_start_excludes_earlier_trees_and_bias() {
+    let scales = [1.0, 10.0, 100.0, 1000.0];
+    // Non-zero bias so a wrongly-included base value would show up immediately.
+    let model = model_from_scales(&scales, 7.0);
+    let cols = probe_columns();
+
+    // start=1, end=0 (all=4), period=1 => stage counts {2, 3, 4}; each stage sums
+    // trees [1, count) with NO bias. Object `i` lands in leaf `i`, so tree `t`
+    // contributes `scales[t] * (i + 1)`.
+    let staged = predict_raw_staged(&model, &cols, 1, 0, 1);
+    assert_eq!(staged.len(), 3, "start=1 over 4 trees, period 1 => counts {{2,3,4}}");
+    for (stage_idx, &count) in [2usize, 3, 4].iter().enumerate() {
+        for obj in 0..4usize {
+            let expected: f64 = (1..count).map(|t| scales[t] * (obj as f64 + 1.0)).sum();
+            assert_eq!(
+                staged[stage_idx][obj], expected,
+                "stage {stage_idx} obj {obj}: sum trees [1,{count}) with no bias"
+            );
+        }
+    }
+
+    // A partial start's final stage must NOT equal the full `predict_raw` (which
+    // includes tree 0 and the bias) — proves the earlier trees are truly excluded.
+    let full = predict_raw(&model, &cols);
+    assert_ne!(
+        staged.last().unwrap(),
+        &full,
+        "partial-start final stage excludes tree 0 and bias, so differs from predict_raw"
+    );
+}

@@ -435,30 +435,24 @@ fn stage_counts(start: usize, end: usize, step: usize) -> Vec<usize> {
     counts
 }
 
-/// The cumulative raw approx of ONE object over the first `end` oblivious trees:
-/// `bias + Σ_{t<end} tree_t.leaf_values[leaf_index_for(t, x)]`, accumulated
-/// through the order-locked [`sum_f64`] (D-08), `+ bias` once. Byte-identical to
-/// the oblivious arm of [`predict_raw_one`] truncated to the first `end` trees;
-/// `cat_values` is empty on the float-only staged path (no CTR split evaluated).
-fn prefix_row_value(model: &Model, features: &[f32], cat_values: &[String], end: usize) -> f64 {
-    let contributions: Vec<f64> = model
-        .oblivious_trees
-        .iter()
-        .take(end)
-        .map(|tree| {
-            let leaf = leaf_index_for(model, tree, features, cat_values);
-            tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
-        })
-        .collect();
-    model.bias + sum_f64(&contributions)
-}
-
 /// Raw approx over an increasing prefix of the ensemble (SCALAR oblivious models).
 /// Returns one row per stage; each row is length `n_objects` in object order.
-/// Stages are the tree counts `min(ntree_start + eval_period, ntree_end), …,
-/// ntree_end`, where `ntree_end == 0` is treated as `oblivious_trees.len()`.
-/// `eval_period == 0` is treated as `1`. An out-of-range `ntree_start >= end`
-/// yields an empty `Vec`.
+/// Stages are the tree counts `ntree_start + eval_period, …, ntree_end`, where
+/// `ntree_end == 0` is treated as `oblivious_trees.len()`. `eval_period == 0` is
+/// treated as `1`. An out-of-range `ntree_start >= end` yields an empty `Vec`.
+///
+/// # Interval semantics (`[ntree_start, ntree_end)`)
+/// Each stage sums ONLY the trees in `[ntree_start, count)` — trees before
+/// `ntree_start` are excluded — matching upstream `staged_predict`/`predict`'s
+/// `[ntree_start, ntree_end)` window. The model's base value (`bias`) is included
+/// ONLY when `ntree_start == 0` (a partial start sums its trees alone, no base),
+/// again matching upstream: `predict(ntree_start=k>0, ntree_end=c)` returns
+/// `Σ_{k≤t<c} contribution` with no bias, verified against `catboost==1.2.10`.
+///
+/// Each tree's leaf contribution is evaluated EXACTLY ONCE per object; a running
+/// left-to-right accumulator (bit-identical to [`sum_f64`] over the prefix, D-08)
+/// is snapshotted at each stage boundary, so cost is linear in the tree count,
+/// not quadratic in the number of stages.
 ///
 /// # Contract (UNGUARDED — caller's responsibility)
 /// This function does NOT validate model shape: it only accumulates
@@ -489,6 +483,10 @@ pub fn predict_raw_staged(
     let step = eval_period.max(1);
     let counts = stage_counts(ntree_start, end, step);
 
+    // The base value is included ONLY for a full-prefix start (`ntree_start == 0`);
+    // a partial start sums trees `[ntree_start, count)` alone (upstream semantics).
+    let base = if ntree_start == 0 { model.bias } else { 0.0 };
+
     // Float-only staged path: no categorical columns are consulted. The object
     // count is the FIRST float column's length (matching `predict_raw_cat`).
     let n_objects = feature_values.first().map_or(0, Vec::len);
@@ -504,14 +502,33 @@ pub fn predict_raw_staged(
         })
         .collect();
 
-    counts
-        .iter()
-        .map(|&count| {
-            rows.iter()
-                .map(|row| prefix_row_value(model, row, &[], count))
-                .collect()
-        })
-        .collect()
+    // One row per stage; filled object-by-object. Each object walks the trees in
+    // `[ntree_start, end)` exactly once, maintaining a running sum (the SAME
+    // left-to-right fold `sum_f64` performs, so identical to `base +
+    // sum_f64(contribs[ntree_start..count])`), and snapshots `base + running` as
+    // the running window `[ntree_start, t + 1)` reaches each stage `count`.
+    let mut stages: Vec<Vec<f64>> = counts.iter().map(|_| Vec::with_capacity(n_objects)).collect();
+    for row in &rows {
+        let mut running = 0.0_f64;
+        let mut next_stage = 0usize;
+        for t in ntree_start..end {
+            if let Some(tree) = model.oblivious_trees.get(t) {
+                let leaf = leaf_index_for(model, tree, row, &[]);
+                running += tree.leaf_values.get(leaf).copied().unwrap_or(0.0);
+            }
+            // After tree `t`, `running` covers `[ntree_start, t + 1)`; snapshot
+            // every stage whose tree-count equals `t + 1` (a `while` because a
+            // degenerate schedule could in principle repeat a count).
+            let reached = t.saturating_add(1);
+            while counts.get(next_stage).copied() == Some(reached) {
+                if let Some(stage) = stages.get_mut(next_stage) {
+                    stage.push(base + running);
+                }
+                next_stage = next_stage.saturating_add(1);
+            }
+        }
+    }
+    stages
 }
 
 /// Apply `model` to a numeric feature view, returning the DIMENSION-MAJOR raw

@@ -91,3 +91,27 @@ fn staged_predict_matches_upstream_period1() {
 fn staged_predict_matches_upstream_period3() {
     assert_period_matches(3, 4);
 }
+
+/// SP-04 (partial start): `ntree_start=2, eval_period=3` reproduces upstream's
+/// 3-stage matrix at tree-counts `{5, 8, 10}`, where each stage sums ONLY trees
+/// `[2, count)` and omits the model bias (upstream `[ntree_start, ntree_end)`
+/// window). Oracle cover for the previously-untested `ntree_start > 0` path.
+#[test]
+fn staged_predict_matches_upstream_partial_start() {
+    let model = staged_model();
+    let cols = numeric_tiny_columns();
+
+    let expected: Array2<f64> = read_npy(fixture("staged_predict/staged_start2_period3.npy"))
+        .expect("partial-start expected matrix loads");
+    assert_eq!(expected.nrows(), 3, "partial-start fixture has 3 stages ({{5,8,10}})");
+
+    // ntree_start=2, ntree_end=0 (all), eval_period=3.
+    let staged = predict_raw_staged(&model, &cols, 2, 0, 3);
+    assert_eq!(staged.len(), 3, "Rust produced 3 partial-start stages");
+
+    for (j, actual_row) in staged.iter().enumerate() {
+        let exp_row: Vec<f64> = expected.row(j).to_vec();
+        assert_abs_close(&exp_row, actual_row, TOL)
+            .unwrap_or_else(|e| panic!("partial-start stage {j} within TOL: {e}"));
+    }
+}
