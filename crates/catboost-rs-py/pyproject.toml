@@ -17,10 +17,13 @@ classifiers = [
 
 [project.optional-dependencies]
 # D-08 realization (A3, confirmed Task 1): PyPI accepts one binary wheel per
-# name+version+platform, so the rocm backend ships as a SEPARATE distribution
-# `catboost-rs-rocm`. The `[rocm]` extra pulls it; both wheels expose the
-# `catboost_rs` import name and MUST NOT be installed simultaneously.
+# name+version+platform, so the GPU backends ship as SEPARATE distributions:
+# `catboost-rs-rocm`, `catboost-rs-cuda`, `catboost-rs-wgpu`.
+# The extras pull them; all wheels expose the `catboost_rs` import name and
+# MUST NOT be installed simultaneously.
 rocm = ["catboost-rs-rocm"]
+cuda = ["catboost-rs-cuda"]
+wgpu = ["catboost-rs-wgpu"]
 
 [tool.maturin]
 # Import name is `catboost_rs` (D-09) — no shadowing of the real `catboost`.

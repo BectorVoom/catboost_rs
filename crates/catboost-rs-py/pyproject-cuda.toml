@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "catboost-rs-cuda"
+version = "0.1.0"
+description = "Rust-native CatBoost (CUDA backend) — scikit-learn-compatible and CatBoost-native Python bindings"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[tool.maturin]
+module-name = "catboost_rs"
+features = ["pyo3/extension-module"]
