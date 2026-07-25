@@ -256,7 +256,7 @@ pub(crate) fn grow_nonsym_tree(
     let mut node_docs: Vec<Vec<usize>> = Vec::new();
     let mut node_depth: Vec<usize> = Vec::new();
 
-    let mut new_node = |nodes: &mut Vec<BuiltNode>,
+    let new_node = |nodes: &mut Vec<BuiltNode>,
                         node_docs: &mut Vec<Vec<usize>>,
                         node_depth: &mut Vec<usize>,
                         docs: Vec<usize>,
@@ -276,7 +276,7 @@ pub(crate) fn grow_nonsym_tree(
 
     // Split node `id` given its best split: register two children, route docs. Returns
     // (left_child_id, right_child_id). Mirrors leaf_wise_grower::do_split.
-    let mut do_split = |nodes: &mut Vec<BuiltNode>,
+    let do_split = |nodes: &mut Vec<BuiltNode>,
                         node_docs: &mut Vec<Vec<usize>>,
                         node_depth: &mut Vec<usize>,
                         leaf_owner: &mut [usize],

@@ -17,6 +17,7 @@ mod ctr_data;
 mod error;
 mod export;
 mod fstr;
+mod gpu_apply;
 mod json;
 mod model;
 mod model_sum;
@@ -36,6 +37,9 @@ pub use ctr_data::{
 };
 pub use error::ModelError;
 pub use export::{export_coreml, export_onnx, CoreMlExportError, OnnxExportError};
+pub use gpu_apply::{
+    check_gpu_apply_supported, flatten_oblivious_f64, FlatObliviousF64, GpuApplyUnsupported,
+};
 pub use fstr::{
     interaction, loss_function_change, loss_function_change_logloss, prediction_values_change,
     prediction_values_change_with_data, FeatureImportanceType,

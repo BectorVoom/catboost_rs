@@ -13,6 +13,7 @@
 use pyo3::prelude::*;
 
 mod classifier;
+mod cv;
 mod errors;
 mod estimator;
 mod ingest_py;
@@ -20,6 +21,7 @@ mod params;
 mod pool;
 mod ranker;
 mod regressor;
+mod search;
 mod utils;
 
 pub use classifier::CatBoostClassifier;
@@ -53,8 +55,16 @@ fn catboost_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(py, m)?;
     // D-07 registry introspection helper for the param-coverage test.
     m.add_function(wrap_pyfunction!(params::_param_status, m)?)?;
+    // SM-06 module-level model merge: `catboost_rs.sum_models(models, weights=None)`.
+    m.add_function(wrap_pyfunction!(regressor::sum_models, m)?)?;
     // ORCH-04-S6 standalone metric surface: `catboost_rs.utils.eval_metric`.
     utils::register(py, m)?;
+    // ORCH-01-S6 cross-validation surface: `catboost_rs.cv(pool, params, ...)`.
+    m.add_function(wrap_pyfunction!(cv::cv, m)?)?;
+    // ORCH-02-S5/S6 hyperparameter search: `catboost_rs.grid_search(...)` /
+    // `catboost_rs.randomized_search(...)`.
+    m.add_function(wrap_pyfunction!(search::grid_search, m)?)?;
+    m.add_function(wrap_pyfunction!(search::randomized_search, m)?)?;
     Ok(())
 }
 

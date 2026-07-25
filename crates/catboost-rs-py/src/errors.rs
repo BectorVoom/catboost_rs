@@ -23,7 +23,7 @@
 
 use catboost_rs::CatBoostError as FacadeError;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyIOError, PyValueError};
+use pyo3::exceptions::{PyException, PyIOError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyTuple, PyType};
@@ -31,6 +31,11 @@ use pyo3::types::{PyDict, PyTuple, PyType};
 create_exception!(catboost_rs, CatBoostError, PyException);
 create_exception!(catboost_rs, CatBoostParameterError, CatBoostError);
 create_exception!(catboost_rs, CatBoostValueError, CatBoostError);
+// `FitFailedWarning` mirrors sklearn's `sklearn.exceptions.FitFailedWarning`: it
+// is a WARNING (subclasses `UserWarning`, not an exception in the taxonomy),
+// emitted by `grid_search` / `randomized_search` when one or more candidate fits
+// were assigned `error_score` (default `np.nan`) instead of aborting the search.
+create_exception!(catboost_rs, FitFailedWarning, PyUserWarning);
 // `NotFittedError` must subclass BOTH `CatBoostError` (taxonomy lineage) AND
 // `ValueError` (so sklearn's `check_is_fitted` not-fitted path recognizes it).
 // PyO3's `create_exception!` macro accepts only a single parent, so the macro
@@ -180,6 +185,7 @@ pub(crate) fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
         py.get_type::<CatBoostParameterError>(),
     )?;
     m.add("CatBoostValueError", py.get_type::<CatBoostValueError>())?;
+    m.add("FitFailedWarning", py.get_type::<FitFailedWarning>())?;
     m.add("NotFittedError", not_fitted_type(py)?.clone())?;
     Ok(())
 }

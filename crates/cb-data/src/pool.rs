@@ -202,4 +202,67 @@ impl Pool {
     pub fn baseline(&self) -> &[f64] {
         &self.baseline
     }
+
+    /// Build a new [`Pool`] containing only `indices` rows, in the given order,
+    /// across every populated column (float/cat/text/embedding features + label,
+    /// weights, group_id, subgroup_id, baseline). An empty source column stays
+    /// empty (the gather never fabricates values for an absent column).
+    ///
+    /// Ranking `pairs` are DROPPED: row re-indexing would invalidate their
+    /// object-index ids, and the first-slice cross-validation path (ORCH-01) is
+    /// numeric / grouped, not pairwise.
+    ///
+    /// An out-of-range index is skipped via checked access (never panics), so
+    /// the result has `<= indices.len()` rows and `n_rows()` equals the number
+    /// of in-range indices supplied.
+    #[must_use]
+    pub fn select_rows(&self, indices: &[usize]) -> Pool {
+        fn gather<T: Clone>(col: &[T], indices: &[usize]) -> Vec<T> {
+            indices
+                .iter()
+                .filter_map(|&i| col.get(i).cloned())
+                .collect()
+        }
+
+        let float_features = self
+            .float_features
+            .iter()
+            .map(|col| gather(col, indices))
+            .collect();
+        let cat_features = self
+            .cat_features
+            .iter()
+            .map(|col| gather(col, indices))
+            .collect();
+        let text_features = self
+            .text_features
+            .iter()
+            .map(|col| gather(col, indices))
+            .collect();
+        let embedding_features = self
+            .embedding_features
+            .iter()
+            .map(|col| gather(col, indices))
+            .collect();
+
+        // The actual gathered valid-index count. Every populated per-row column
+        // (float SoA columns and `label` when present) has length `n_rows`, so
+        // its gathered length equals this count — the Pool stays internally
+        // length-consistent. Empty columns gather to empty and are unaffected.
+        let n_rows = indices.iter().filter(|&&i| i < self.n_rows).count();
+
+        Pool::from_validated_columns(
+            n_rows,
+            float_features,
+            cat_features,
+            text_features,
+            embedding_features,
+            gather(&self.label, indices),
+            gather(&self.weights, indices),
+            gather(&self.group_id, indices),
+            gather(&self.subgroup_id, indices),
+            Vec::new(),
+            gather(&self.baseline, indices),
+        )
+    }
 }

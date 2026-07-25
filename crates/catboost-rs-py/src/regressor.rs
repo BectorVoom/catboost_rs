@@ -107,6 +107,25 @@ impl CatBoostRegressor {
         Ok(())
     }
 
+    /// Export the fitted model to Apple CoreML (`.mlmodel`) as a
+    /// `TreeEnsembleRegressor` (EXPORT-02). Categorical/CTR and non-oblivious
+    /// models are rejected with a typed `CatBoostValueError`, never a panic.
+    ///
+    /// # Errors
+    /// `NotFittedError` if unfitted; `CatBoostValueError` on an unsupported
+    /// model; `IOError` on a downstream file-write failure.
+    fn save_coreml(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let model = self.base.model.as_ref().ok_or_else(|| {
+            not_fitted_err(
+                py,
+                "this CatBoostRegressor is not fitted yet; call `fit` before `save_coreml`",
+            )
+        })?;
+        py.detach(|| model.save_coreml(std::path::Path::new(path)))
+            .map_err(PyCbError)?;
+        Ok(())
+    }
+
     /// Predict raw model scores for a C-contiguous float32 NumPy `X` `(n, k)`.
     /// Returns a NumPy `float64` array of length `n`.
     ///
@@ -244,6 +263,43 @@ impl CatBoostRegressor {
         }
         Ok(r2_score(&y_true, &preds))
     }
+}
+
+/// Combine several fitted [`CatBoostRegressor`]s into one via a weighted sum of
+/// their leaf contributions (SM-06), mirroring upstream
+/// `sum_models(models, weights=None)`. `weights[i]` scales model `i`'s leaf
+/// contributions; omitting `weights` defaults every model to weight `1.0`.
+///
+/// # Errors
+/// `NotFittedError` if any input model is unfitted; the typed facade error
+/// (mapped via [`PyCbError`]) on an unmergeable set (mismatched float-feature
+/// borders / count / `approx_dimension`).
+#[pyfunction]
+#[pyo3(signature = (models, weights = None))]
+pub(crate) fn sum_models(
+    py: Python<'_>,
+    models: Vec<PyRef<'_, CatBoostRegressor>>,
+    weights: Option<Vec<f64>>,
+) -> PyResult<CatBoostRegressor> {
+    let inner_models = models
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.base.model.as_ref().ok_or_else(|| {
+                not_fitted_err(
+                    py,
+                    &format!(
+                        "model at index {i} is not fitted yet; call `fit` before `sum_models`"
+                    ),
+                )
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let merged = catboost_rs::Model::sum_models(&inner_models, weights.as_deref())
+        .map_err(PyCbError)?;
+    Ok(CatBoostRegressor {
+        base: EstimatorBase::from_model(merged),
+    })
 }
 
 /// Read a C-contiguous float32 1-D NumPy array into an owned `Vec<f64>` (the

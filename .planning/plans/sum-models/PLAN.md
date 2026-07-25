@@ -1,10 +1,10 @@
 ---
 title: sum_models — weighted model merge (float-only oblivious, first slice) — TDD PLAN
 plan_for_spec: .planning/plans/sum-models/SPEC.md
-status: draft
+status: complete
 format: markdown
 plan_version: 1
-updated_at: 2026-07-18T00:00:00Z
+updated_at: 2026-07-19T00:00:00Z
 gsd_used: false
 source_evidence:
   - ".planning/plans/sum-models/SPEC.md"
@@ -13,6 +13,29 @@ source_evidence:
 ---
 
 # TDD Implementation Plan — `sum_models`
+
+> ## Execution status (2026-07-19) — ✅ COMPLETE, including TASK-09 (Python)
+> TASK-01..08 landed earlier (`crates/cb-model/src/model_sum.rs` +
+> `model_sum_test.rs`, facade `Model::sum_models`, oracle fixtures; commit
+> `1ed82ba`). **TASK-09 (previously deferred)** now shipped: a module-level
+> `#[pyfunction] sum_models(models, weights=None)` in
+> `crates/catboost-rs-py/src/regressor.rs`, registered in `lib.rs`, wrapping
+> the facade call and re-fitting a `CatBoostRegressor` via
+> `EstimatorBase::from_model`. Unfitted inputs raise `NotFittedError`; facade
+> `ModelError::Merge` variants map through the existing `FacadeError::Model`
+> `to_pyerr` arm (no new match arm needed). New
+> `crates/catboost-rs-py/tests/test_sum_models.py` (weighted sum, default
+> weights, unfitted-input guard, weight-count-mismatch guard) — **built and
+> run for real** via `.venv-py8/bin/maturin develop --features cpu` +
+> `.venv-py8/bin/pytest` (this venv is python3.12, distinct from the system
+> python3.14 that blocks a plain `cargo test -p catboost-rs-py` link — see
+> `crates/catboost-rs-py/README.md`'s dev recipe): **4/4 passed**. Full
+> `.venv-py8/bin/pytest tests --ignore=tests/test_utils_eval_metric.py`:
+> 85 passed, 7 skipped, 79 xfailed, 0 failed (the ignored file needs an
+> upstream `catboost` install this venv lacks — pre-existing, unrelated).
+> `cargo clippy -p catboost-rs-py --lib --no-deps` on the touched files
+> (`regressor.rs`, `lib.rs`) is clean; the 9 pre-existing clippy errors are
+> confined to untouched `params.rs`/`ingest_py.rs`.
 
 Plan FROM `.planning/plans/sum-models/SPEC.md`. Goal-backward: each task derives one
 observable success condition from a SPEC acceptance scenario and closes exactly one

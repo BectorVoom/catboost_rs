@@ -74,7 +74,7 @@ pub fn logloss_gradient_kernel<F: Float>(
 ) {
     if ABSOLUTE_POS < approx.len() {
         let e = F::exp(approx[ABSOLUTE_POS]);
-        let p = F::new(1.0) - F::new(1.0) / (F::new(1.0) + e);
+        let p = F::new(1.0_f32) - F::new(1.0_f32) / (F::new(1.0_f32) + e);
         der1[ABSOLUTE_POS] = target[ABSOLUTE_POS] - p;
     }
 }
@@ -101,7 +101,7 @@ pub fn quantile_gradient_kernel<F: Float>(
     delta: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
+        let one = F::new(1.0_f32);
         let a = alpha[0];
         let d = delta[0];
         let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
@@ -111,10 +111,10 @@ pub fn quantile_gradient_kernel<F: Float>(
         // the correct `huber_gradient_kernel` `>= delta` band. The if-as-STATEMENT
         // pattern (CubeCL conditionals manual): `g` starts at the deadzone `0`,
         // then is overwritten with the `val < 0` arm and finally the `val > 0` arm.
-        let mut g = F::new(0.0);
+        let mut g = F::new(0.0_f32);
         if F::abs(val) >= d {
-            g = F::new(0.0) - (one - a);
-            if val > F::new(0.0) {
+            g = F::new(0.0_f32) - (one - a);
+            if val > F::new(0.0_f32) {
                 g = a;
             }
         }
@@ -132,8 +132,8 @@ pub fn quantile_gradient_kernel<F: Float>(
 pub fn logloss_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) {
     if ABSOLUTE_POS < approx.len() {
         let e = F::exp(approx[ABSOLUTE_POS]);
-        let p = F::new(1.0) - F::new(1.0) / (F::new(1.0) + e);
-        der2[ABSOLUTE_POS] = F::new(0.0) - p * (F::new(1.0) - p);
+        let p = F::new(1.0_f32) - F::new(1.0_f32) / (F::new(1.0_f32) + e);
+        der2[ABSOLUTE_POS] = F::new(0.0_f32) - p * (F::new(1.0_f32) - p);
     }
 }
 
@@ -159,11 +159,11 @@ pub fn focal_gradient_kernel<F: Float>(
     gamma: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
-        let p_min = F::new(1e-13);
+        let one = F::new(1.0_f32);
+        let p_min = F::new(1e-13_f32);
         let a = alpha[0];
         let g = gamma[0];
-        let e = F::exp(F::new(0.0) - approx[ABSOLUTE_POS]);
+        let e = F::exp(F::new(0.0_f32) - approx[ABSOLUTE_POS]);
         let p = F::clamp(one / (one + e), p_min, one - p_min);
 
         let is_pos = target[ABSOLUTE_POS] == one;
@@ -173,11 +173,11 @@ pub fn focal_gradient_kernel<F: Float>(
             at = a;
             pt = p;
         }
-        let y = F::new(2.0) * target[ABSOLUTE_POS] - one;
+        let y = F::new(2.0_f32) * target[ABSOLUTE_POS] - one;
 
         let factor = F::powf(one - pt, g);
         let inner = g * pt * F::ln(pt) + pt - one;
-        der1[ABSOLUTE_POS] = F::new(0.0) - (at * y * factor * inner);
+        der1[ABSOLUTE_POS] = F::new(0.0_f32) - (at * y * factor * inner);
     }
 }
 
@@ -199,11 +199,11 @@ pub fn focal_hessian_kernel<F: Float>(
     gamma: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
-        let p_min = F::new(1e-13);
+        let one = F::new(1.0_f32);
+        let p_min = F::new(1e-13_f32);
         let a = alpha[0];
         let g = gamma[0];
-        let e = F::exp(F::new(0.0) - approx[ABSOLUTE_POS]);
+        let e = F::exp(F::new(0.0_f32) - approx[ABSOLUTE_POS]);
         let p = F::clamp(one / (one + e), p_min, one - p_min);
 
         let is_pos = target[ABSOLUTE_POS] == one;
@@ -213,13 +213,13 @@ pub fn focal_hessian_kernel<F: Float>(
             at = a;
             pt = p;
         }
-        let y = F::new(2.0) * target[ABSOLUTE_POS] - one;
+        let y = F::new(2.0_f32) * target[ABSOLUTE_POS] - one;
 
         let u = at * y * F::powf(one - pt, g);
-        let du = (F::new(0.0) - at) * y * g * F::powf(one - pt, g - one);
+        let du = (F::new(0.0_f32) - at) * y * g * F::powf(one - pt, g - one);
         let v = g * pt * F::ln(pt) + pt - one;
         let dv = g * F::ln(pt) + g + one;
-        der2[ABSOLUTE_POS] = F::new(0.0) - ((du * v + u * dv) * y * (pt * (one - pt)));
+        der2[ABSOLUTE_POS] = F::new(0.0_f32) - ((du * v + u * dv) * y * (pt * (one - pt)));
     }
 }
 
@@ -236,7 +236,7 @@ pub fn logcosh_gradient_kernel<F: Float>(
 ) {
     if ABSOLUTE_POS < approx.len() {
         let r = approx[ABSOLUTE_POS] - target[ABSOLUTE_POS];
-        der1[ABSOLUTE_POS] = F::new(0.0) - F::tanh(r);
+        der1[ABSOLUTE_POS] = F::new(0.0_f32) - F::tanh(r);
     }
 }
 
@@ -254,7 +254,7 @@ pub fn logcosh_hessian_kernel<F: Float>(
     if ABSOLUTE_POS < approx.len() {
         let r = approx[ABSOLUTE_POS] - target[ABSOLUTE_POS];
         let c = F::cosh(r);
-        der2[ABSOLUTE_POS] = F::new(0.0) - F::new(1.0) / (c * c);
+        der2[ABSOLUTE_POS] = F::new(0.0_f32) - F::new(1.0_f32) / (c * c);
     }
 }
 
@@ -276,14 +276,14 @@ pub fn lq_gradient_kernel<F: Float>(
     q: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
+        let one = F::new(1.0_f32);
         let qv = q[0];
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
         let abs_loss = F::abs(a - t);
         let abs_loss_q = F::powf(abs_loss, qv - one);
-        let mut sign = F::new(0.0) - one;
-        if t - a > F::new(0.0) {
+        let mut sign = F::new(0.0_f32) - one;
+        if t - a > F::new(0.0_f32) {
             sign = one;
         }
         der1[ABSOLUTE_POS] = qv * sign * abs_loss_q;
@@ -305,11 +305,11 @@ pub fn lq_hessian_kernel<F: Float>(
     q: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
+        let one = F::new(1.0_f32);
         let qv = q[0];
         let abs_loss = F::abs(target[ABSOLUTE_POS] - approx[ABSOLUTE_POS]);
-        let pow_term = F::powf(abs_loss, qv - F::new(2.0));
-        der2[ABSOLUTE_POS] = (F::new(0.0) - qv) * (qv - one) * pow_term;
+        let pow_term = F::powf(abs_loss, qv - F::new(2.0_f32));
+        der2[ABSOLUTE_POS] = (F::new(0.0_f32) - qv) * (qv - one) * pow_term;
     }
 }
 
@@ -334,8 +334,8 @@ pub fn huber_gradient_kernel<F: Float>(
         let diff = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
         let mut g = diff;
         if F::abs(diff) >= d {
-            g = F::new(0.0) - d;
-            if diff > F::new(0.0) {
+            g = F::new(0.0_f32) - d;
+            if diff > F::new(0.0_f32) {
                 g = d;
             }
         }
@@ -360,9 +360,9 @@ pub fn huber_hessian_kernel<F: Float>(
     if ABSOLUTE_POS < approx.len() {
         let d = delta[0];
         let diff = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let mut h = F::new(0.0);
+        let mut h = F::new(0.0_f32);
         if F::abs(diff) < d {
-            h = F::new(0.0) - F::new(1.0);
+            h = F::new(0.0_f32) - F::new(1.0_f32);
         }
         der2[ABSOLUTE_POS] = h;
     }
@@ -385,12 +385,12 @@ pub fn expectile_gradient_kernel<F: Float>(
     alpha: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
-        let two = F::new(2.0);
+        let one = F::new(1.0_f32);
+        let two = F::new(2.0_f32);
         let a = alpha[0];
         let e = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
         let mut g = two * (one - a) * e;
-        if e > F::new(0.0) {
+        if e > F::new(0.0_f32) {
             g = two * a * e;
         }
         der1[ABSOLUTE_POS] = g;
@@ -412,13 +412,13 @@ pub fn expectile_hessian_kernel<F: Float>(
     alpha: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
-        let two = F::new(2.0);
+        let one = F::new(1.0_f32);
+        let two = F::new(2.0_f32);
         let a = alpha[0];
         let e = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let mut h = (F::new(0.0) - two) * (one - a);
-        if e > F::new(0.0) {
-            h = (F::new(0.0) - two) * a;
+        let mut h = (F::new(0.0_f32) - two) * (one - a);
+        if e > F::new(0.0_f32) {
+            h = (F::new(0.0_f32) - two) * a;
         }
         der2[ABSOLUTE_POS] = h;
     }
@@ -454,7 +454,7 @@ pub fn poisson_gradient_kernel<F: Float>(
 pub fn poisson_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) {
     if ABSOLUTE_POS < approx.len() {
         let e = F::exp(approx[ABSOLUTE_POS]);
-        der2[ABSOLUTE_POS] = F::new(0.0) - e;
+        der2[ABSOLUTE_POS] = F::new(0.0_f32) - e;
     }
 }
 
@@ -475,8 +475,8 @@ pub fn tweedie_gradient_kernel<F: Float>(
     variance_power: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
-        let two = F::new(2.0);
+        let one = F::new(1.0_f32);
+        let two = F::new(2.0_f32);
         let p = variance_power[0];
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
@@ -501,8 +501,8 @@ pub fn tweedie_hessian_kernel<F: Float>(
     variance_power: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
-        let two = F::new(2.0);
+        let one = F::new(1.0_f32);
+        let two = F::new(2.0_f32);
         let p = variance_power[0];
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
@@ -530,12 +530,12 @@ pub fn mape_gradient_kernel<F: Float>(
     der1: &mut Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0);
+        let one = F::new(1.0_f32);
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
         let denom = F::max(one, F::abs(t));
-        let mut sign = F::new(0.0) - one;
-        if t - a > F::new(0.0) {
+        let mut sign = F::new(0.0_f32) - one;
+        if t - a > F::new(0.0_f32) {
             sign = one;
         }
         der1[ABSOLUTE_POS] = sign / denom;
@@ -594,6 +594,92 @@ pub fn apply_leaf_delta_kernel<F: Float>(
     if ABSOLUTE_POS < approx.len() {
         let leaf = leaf_of[ABSOLUTE_POS] as usize;
         approx[ABSOLUTE_POS] += lr[0] * leaf_values[leaf];
+    }
+}
+
+/// GINF-01-S3: one raw prediction per object for a float-only oblivious scalar
+/// ensemble. Generic-float; one object per thread (`ABSOLUTE_POS`), branchless
+/// per-split predication (no per-split branch, avoiding intra-plane divergence —
+/// `plane_alignment.md`), per-tree accumulate seeded at `0.0`, with `bias` added
+/// exactly ONCE AFTER the tree loop. That association mirrors `predict_raw_one`'s
+/// `model.bias + sum_f64(&oblivious)` bit-for-bit (pre-seeding `bias` is a
+/// DIFFERENT float association and is WRONG). The object matrix is FEATURE-MAJOR
+/// (`features[f * n_objects + obj]`) so adjacent object-threads touch adjacent
+/// addresses (`07_memory_coalescing.md`). The invariant model arrays are uploaded
+/// once by the launch helper (`11_launch_overhead_and_transfers.md`).
+///
+/// `split_borders` / `leaf_values` / `out` are `F`; the index arrays
+/// (`split_features`, `tree_split_offsets`, `tree_leaf_offsets`) are `u32`. An
+/// out-of-range leaf index contributes `F::new(0.0)` (statement-form guard,
+/// `Cubecl_conditionals.md`), mirroring the CPU `unwrap_or(0.0)`.
+///
+/// A split feature index `f >= n_features` is treated as ABSENT — it contributes
+/// bit 0 (statement-form guard) and its feature-major gather is SKIPPED, so the
+/// kernel never reads past the uploaded `n_features * n_objects` feature array.
+/// This mirrors the CPU `passes_float_split`'s checked `.get` (`apply.rs:136-140`),
+/// which returns `false` for a feature the caller did not supply (e.g. a
+/// 6-feature model applied to a 4-column batch).
+///
+/// `bias` is a length-1 `Array<F>`, NOT a generic-`F` launch scalar: this codebase
+/// passes float values through `Array<F>` because a `#[cube(launch)]` scalar must
+/// be a concrete `CubeElement`, not the generic `F` (see the `find_optimal_split_kernel`
+/// `lambda = scaled_l2[0usize]` precedent). The `u32` counts stay plain scalars.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_oblivious_float_kernel<F: Float>(
+    features: &Array<F>,
+    split_features: &Array<u32>,
+    split_borders: &Array<F>,
+    tree_split_offsets: &Array<u32>,
+    leaf_values: &Array<F>,
+    tree_leaf_offsets: &Array<u32>,
+    out: &mut Array<F>,
+    bias: &Array<F>,
+    n_objects: u32,
+    n_features: u32,
+    n_trees: u32,
+) {
+    let obj = ABSOLUTE_POS;
+    if obj < n_objects as usize {
+        // Accumulator seeded at 0.0 — bias is NOT seeded here (added once after the loop).
+        let mut acc = F::new(0.0);
+        let mut t = 0u32;
+        while t < n_trees {
+            let s0 = tree_split_offsets[t as usize];
+            let s1 = tree_split_offsets[(t + 1) as usize];
+            let mut leaf = 0u32; // forward bit order (mirror leaf_index: idx |= 1 << i)
+            let mut i = 0u32; // bit index within this tree
+            let mut s = s0;
+            while s < s1 {
+                let f = split_features[s as usize];
+                let b = split_borders[s as usize];
+                // Guarded FEATURE-MAJOR gather (statement-form `if`, NOT an
+                // if-expression — `Cubecl_conditionals.md`): a split feature index
+                // `f >= n_features` is ABSENT → bit 0, mirroring the CPU
+                // `passes_float_split`'s checked `.get` (`apply.rs:136-140`), and
+                // NEVER reads past the uploaded `n_features * n_objects` array.
+                let mut passes = false;
+                if f < n_features {
+                    let v = features[f as usize * n_objects as usize + obj];
+                    passes = v > b;
+                }
+                let bit = u32::cast_from(passes);
+                leaf += bit << i;
+                i += 1;
+                s += 1;
+            }
+            let li = tree_leaf_offsets[t as usize] + leaf;
+            // Out-of-range leaf contributes 0 (mirror CPU unwrap_or(0.0)); statement-form guard.
+            let mut contrib = F::new(0.0);
+            if li < tree_leaf_offsets[(t + 1) as usize] {
+                contrib = leaf_values[li as usize];
+            }
+            acc += contrib;
+            t += 1;
+        }
+        // bias added ONCE, AFTER all trees — mirrors `bias + sum_f64(&oblivious)`.
+        acc += bias[0usize];
+        out[obj] = acc;
     }
 }
 
@@ -1475,7 +1561,7 @@ pub fn block_reduce_kernel<F: Float>(
 
     // Load this unit's element, zero-padding the idle out-of-range lanes
     // (if-as-STATEMENT: init to 0, overwrite inside the bounds guard).
-    let mut acc = F::new(0.0);
+    let mut acc = F::new(0.0_f32);
     if ABSOLUTE_POS < input.len() {
         acc = input[ABSOLUTE_POS];
     }
@@ -1498,7 +1584,7 @@ pub fn block_reduce_kernel<F: Float>(
             // per-plane partials sequentially (the count is small: 1 on wave32 at
             // CUBE_DIM 32). The loop bound derives from PLANE_DIM, not a literal.
             let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
-            let mut sum = F::new(0.0);
+            let mut sum = F::new(0.0_f32);
             let mut p = 0u32;
             while p < num_planes {
                 sum += partials[p as usize];
@@ -1570,7 +1656,7 @@ pub fn block_reduce_atomic_kernel<F: Float>(
     let tid = UNIT_POS;
 
     // Load this unit's element, zero-padding idle out-of-range lanes (T-7.1-01).
-    let mut val = F::new(0.0);
+    let mut val = F::new(0.0_f32);
     if ABSOLUTE_POS < input.len() {
         val = input[ABSOLUTE_POS];
     }
@@ -1578,7 +1664,7 @@ pub fn block_reduce_atomic_kernel<F: Float>(
     // Intra-cube fold into a single per-cube partial held by unit 0 — identical
     // structure to `block_reduce_kernel`, but the finalize differs (atomic add into
     // a global accumulator instead of writing one slot per cube).
-    let mut cube_partial = F::new(0.0);
+    let mut cube_partial = F::new(0.0_f32);
     if use_plane {
         let plane_total = plane_sum(val);
         let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
@@ -1588,7 +1674,7 @@ pub fn block_reduce_atomic_kernel<F: Float>(
         sync_cube();
         if tid == 0u32 {
             let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
-            let mut sum = F::new(0.0);
+            let mut sum = F::new(0.0_f32);
             let mut p = 0u32;
             while p < num_planes {
                 sum += partials[p as usize];
@@ -1662,7 +1748,7 @@ pub fn block_scan_kernel<F: Float>(
 
     // Load this unit's element, zero-padding idle out-of-range lanes
     // (if-as-STATEMENT: init to 0, overwrite inside the bounds guard, T-7.1-01).
-    let mut val = F::new(0.0);
+    let mut val = F::new(0.0_f32);
     if ABSOLUTE_POS < input.len() {
         val = input[ABSOLUTE_POS];
     }
@@ -1699,7 +1785,7 @@ pub fn block_scan_kernel<F: Float>(
     // (tid == its plane index) owns each slot.
     let mut s = 1u32;
     while s < num_planes {
-        let mut add = F::new(0.0);
+        let mut add = F::new(0.0_f32);
         // tid drives a slot iff tid < num_planes and tid >= s.
         if tid < num_planes {
             if tid >= s {
@@ -1719,7 +1805,7 @@ pub fn block_scan_kernel<F: Float>(
     // 3) Each plane's EXCLUSIVE carry = inclusive-scan of partials, shifted by one
     //    plane (carry for plane p = sum of all strictly-prior planes' totals).
     //    PLANE_POS == 0 has zero carry; otherwise carry = partials[PLANE_POS - 1].
-    let mut carry = F::new(0.0);
+    let mut carry = F::new(0.0_f32);
     if PLANE_POS >= 1u32 {
         carry = partials[(PLANE_POS - 1u32) as usize];
     }
@@ -1767,7 +1853,7 @@ pub fn block_scan_total_kernel<F: Float>(
     let n = input.len();
 
     // Load this unit's element, zero-padding idle out-of-range lanes (T-10-01).
-    let mut val = F::new(0.0);
+    let mut val = F::new(0.0_f32);
     if ABSOLUTE_POS < n {
         val = input[ABSOLUTE_POS];
     }
@@ -1793,7 +1879,7 @@ pub fn block_scan_total_kernel<F: Float>(
     let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
     let mut s = 1u32;
     while s < num_planes {
-        let mut add = F::new(0.0);
+        let mut add = F::new(0.0_f32);
         if tid < num_planes {
             if tid >= s {
                 add = partials[(tid - s) as usize];
@@ -1809,7 +1895,7 @@ pub fn block_scan_total_kernel<F: Float>(
         s *= 2u32;
     }
 
-    let mut carry = F::new(0.0);
+    let mut carry = F::new(0.0_f32);
     if PLANE_POS >= 1u32 {
         carry = partials[(PLANE_POS - 1u32) as usize];
     }
@@ -1997,8 +2083,8 @@ pub fn segmented_scan_kernel<F: Float>(
     let n = input.len();
 
     // Load this unit's (value, flag), zero-padding idle out-of-range lanes (T-10-01).
-    let mut val = F::new(0.0);
-    let mut flag = F::new(0.0);
+    let mut val = F::new(0.0_f32);
+    let mut flag = F::new(0.0_f32);
     if ABSOLUTE_POS < n {
         val = input[ABSOLUTE_POS];
         flag = flags[ABSOLUTE_POS];
@@ -2016,8 +2102,8 @@ pub fn segmented_scan_kernel<F: Float>(
     while s < CUBE_DIM_X {
         // Snapshot the left neighbour into registers BEFORE any in-place write so the
         // shared update below has no read/write hazard.
-        let mut nb_val = F::new(0.0);
-        let mut nb_flag = F::new(0.0);
+        let mut nb_val = F::new(0.0_f32);
+        let mut nb_flag = F::new(0.0_f32);
         let mut active = false;
         if tid >= s {
             nb_val = svals[(tid - s) as usize];
@@ -2027,12 +2113,12 @@ pub fn segmented_scan_kernel<F: Float>(
         sync_cube();
         if active {
             // Absorb the neighbour only while no segment head has been reached yet.
-            if sflags[tid as usize] == F::new(0.0) {
+            if sflags[tid as usize] == F::new(0.0_f32) {
                 svals[tid as usize] += nb_val;
             }
             // Propagate the head flag (logical OR over 0.0/1.0 values).
-            if nb_flag > F::new(0.0) {
-                sflags[tid as usize] = F::new(1.0);
+            if nb_flag > F::new(0.0_f32) {
+                sflags[tid as usize] = F::new(1.0_f32);
             }
         }
         sync_cube();
@@ -2044,8 +2130,8 @@ pub fn segmented_scan_kernel<F: Float>(
     if !inclusive {
         // Exclusive: subtract this lane's own value; a segment start resets to 0.
         result = incl - val;
-        if flag > F::new(0.0) {
-            result = F::new(0.0);
+        if flag > F::new(0.0_f32) {
+            result = F::new(0.0_f32);
         }
     }
 
@@ -2136,12 +2222,12 @@ pub fn segmented_reduce_kernel<F: Float>(
 pub fn key_head_flag_kernel<F: Float>(keys: &Array<u32>, flags: &mut Array<F>) {
     let i = ABSOLUTE_POS;
     if i < keys.len() {
-        let mut head = F::new(0.0);
+        let mut head = F::new(0.0_f32);
         if i == 0usize {
-            head = F::new(1.0);
+            head = F::new(1.0_f32);
         } else {
             if keys[i] != keys[i - 1usize] {
-                head = F::new(1.0);
+                head = F::new(1.0_f32);
             }
         }
         flags[i] = head;
@@ -2163,7 +2249,7 @@ pub fn segment_offset_scatter_kernel<F: Float>(
 ) {
     let i = ABSOLUTE_POS;
     if i < flags.len() {
-        if flags[i] > F::new(0.5) {
+        if flags[i] > F::new(0.5_f32) {
             let seg = u32::cast_from(seg_ids[i]);
             seg_offsets[seg as usize] = i as u32;
         }
@@ -2319,9 +2405,9 @@ pub fn radix_bit_flag_kernel<F: Float>(keys: &Array<u32>, flags: &mut Array<F>, 
     let i = ABSOLUTE_POS;
     if i < keys.len() {
         // Branch-assign the exact float flag (avoid a u32->F numeric cast).
-        let mut f = F::new(0.0);
+        let mut f = F::new(0.0_f32);
         if (keys[i] >> bit) & 1u32 == 1u32 {
-            f = F::new(1.0);
+            f = F::new(1.0_f32);
         }
         flags[i] = f;
     }
@@ -2404,7 +2490,7 @@ pub fn update_partition_offsets_kernel<F: Float>(
 ) {
     let i = ABSOLUTE_POS;
     if i < part_ids.len() {
-        if flags[i] > F::new(0.5) {
+        if flags[i] > F::new(0.5_f32) {
             let r = u32::cast_from(run_ids[i]);
             let p = part_ids[i];
             run_keys[r as usize] = p;
@@ -2435,7 +2521,7 @@ pub fn update_partition_sizes_kernel<F: Float>(
     n: u32,
     num_runs: u32,
 ) {
-    let _ = F::new(0.0);
+    let _ = F::new(0.0_f32);
     let r = ABSOLUTE_POS;
     if r < run_keys.len() {
         let start = run_starts[r as usize];
@@ -2619,7 +2705,7 @@ pub fn pack_bins_kernel<F: Float>(
     #[comptime] keys_per_word: u32,
     #[comptime] mask: u32,
 ) {
-    let _ = F::new(0.0);
+    let _ = F::new(0.0_f32);
     let word_idx = ABSOLUTE_POS;
     if word_idx < words.len() {
         let n = bins.len();
@@ -2655,7 +2741,7 @@ pub fn unpack_bins_kernel<F: Float>(
     #[comptime] keys_per_word: u32,
     #[comptime] mask: u32,
 ) {
-    let _ = F::new(0.0);
+    let _ = F::new(0.0_f32);
     let i = ABSOLUTE_POS;
     if i < out.len() {
         let kpw = keys_per_word as usize;
@@ -2715,7 +2801,7 @@ pub fn read_all_bins_kernel<F: Float>(
     out: &mut Array<u32>,
     n_features: u32,
 ) {
-    let _ = F::new(0.0);
+    let _ = F::new(0.0_f32);
     let total = out.len();
     let n = total / (n_features as usize);
     let stride = CUBE_COUNT * (CUBE_DIM as usize);
@@ -3043,6 +3129,14 @@ mod apply_leaf_delta;
 #[cfg(all(test, feature = "cpu"))]
 mod scatter;
 
+// GINF-01-S3 apply-oblivious kernel oracle (source/test separation): the `#[cube]`
+// body lives in `kernels.rs`; the device-vs-host assertions live in
+// `kernels/apply_oblivious_test.rs`, mounted at `kernels::apply_oblivious_test`.
+// Cpu-only (the child launches the kernel in f64, and `SelectedRuntime` is the
+// f64 `CpuRuntime` under `cpu`; wgpu has no f64).
+#[cfg(all(test, feature = "cpu"))]
+mod apply_oblivious_test;
+
 // Device-resident RMSE der self-oracle (GPU-01 der, Phase 7.2): the GPU der1 over
 // `SelectedRuntime` vs the `cb-compute::loss` CPU baseline, plus the SC-3
 // device-residency hand-off assertion, live in `kernels/gradient_gpu.rs`, mounted
@@ -3100,8 +3194,8 @@ pub(crate) const ARGMIN_SHMEM: usize = BLOCK_REDUCE_SHMEM;
 /// hand-inlined arms (IN-02 behavior-preserving extraction). `if`-as-statement only.
 #[cube]
 fn cb_leaf_avg<F: Float>(sum: F, w: F, lambda: F) -> F {
-    let mut avg = F::new(0.0);
-    if w > F::new(0.0) {
+    let mut avg = F::new(0.0_f32);
+    if w > F::new(0.0_f32) {
         avg = sum / (w + lambda);
     }
     avg
@@ -3127,7 +3221,7 @@ fn cb_leaf_avg<F: Float>(sum: F, w: F, lambda: F) -> F {
 /// generics-float — no hard-coded float type).
 #[cube]
 fn cb_leaf_score_term<F: Float>(sum: F, w: F, lambda: F, #[comptime] score_fn: u32) -> F {
-    let mut term = F::new(0.0);
+    let mut term = F::new(0.0_f32);
 
     // --- L2 / Cosine numerator: avg·sum, avg = calc_average (count>0 guard).
     if score_fn == comptime!(SCORE_FN_L2) {
@@ -3141,9 +3235,9 @@ fn cb_leaf_score_term<F: Float>(sum: F, w: F, lambda: F, #[comptime] score_fn: u
 
     // --- SolarL2: weight>1e-20 ? (-sum*sum)*(1 + 2*ln(weight+1))/weight : 0. NO scaled_l2.
     if score_fn == comptime!(SCORE_FN_SOLAR_L2) {
-        if w > F::new(1e-20) {
-            let one = F::new(1.0);
-            let two = F::new(2.0);
+        if w > F::new(1e-20_f32) {
+            let one = F::new(1.0_f32);
+            let two = F::new(2.0_f32);
             term = (-sum * sum) * (one + two * F::ln(w + one)) / w;
         }
     }
@@ -3151,13 +3245,13 @@ fn cb_leaf_score_term<F: Float>(sum: F, w: F, lambda: F, #[comptime] score_fn: u
     // --- LOOL2: adjust = weight>1 ? weight/(weight-1) : 0; adjust*=adjust;
     //     weight>0 ? adjust*(-sum*sum)/weight : 0. NO scaled_l2.
     if score_fn == comptime!(SCORE_FN_LOO_L2) {
-        let one = F::new(1.0);
-        let mut adjust = F::new(0.0);
+        let one = F::new(1.0_f32);
+        let mut adjust = F::new(0.0_f32);
         if w > one {
             adjust = w / (w - one);
         }
         adjust = adjust * adjust;
-        if w > F::new(0.0) {
+        if w > F::new(0.0_f32) {
             term = adjust * (-sum * sum) / w;
         }
     }
@@ -3165,14 +3259,14 @@ fn cb_leaf_score_term<F: Float>(sum: F, w: F, lambda: F, #[comptime] score_fn: u
     // --- SatL2: adjust = weight>2 ? weight*(weight-2)/(weight²-3*weight+1) : 0;
     //     weight>0 ? adjust*(-sum*sum)/weight : 0. NO scaled_l2.
     if score_fn == comptime!(SCORE_FN_SAT_L2) {
-        let two = F::new(2.0);
-        let three = F::new(3.0);
-        let one = F::new(1.0);
-        let mut adjust = F::new(0.0);
+        let two = F::new(2.0_f32);
+        let three = F::new(3.0_f32);
+        let one = F::new(1.0_f32);
+        let mut adjust = F::new(0.0_f32);
         if w > two {
             adjust = w * (w - two) / (w * w - three * w + one);
         }
-        if w > F::new(0.0) {
+        if w > F::new(0.0_f32) {
             term = adjust * (-sum * sum) / w;
         }
     }
@@ -3308,10 +3402,10 @@ pub fn find_optimal_split_kernel<F: Float>(
 
         // Fold the feature's bins into LEFT (bins 0..=border) / RIGHT (bins
         // border+1..n_bins) leaf stats, reading the FROZEN 2-channel histogram in place.
-        let mut left_sum = F::new(0.0);
-        let mut left_w = F::new(0.0);
-        let mut right_sum = F::new(0.0);
-        let mut right_w = F::new(0.0);
+        let mut left_sum = F::new(0.0_f32);
+        let mut left_w = F::new(0.0_f32);
+        let mut right_sum = F::new(0.0_f32);
+        let mut right_w = F::new(0.0_f32);
         let mut bin = 0usize;
         while bin < n_bins_usize {
             let cell = (feature * n_bins_usize + bin) * 2usize;
@@ -3333,7 +3427,7 @@ pub fn find_optimal_split_kernel<F: Float>(
         // runtime score-function branch. Every arm is transcribed VERBATIM from the
         // FROZEN CPU oracle `cb-compute/src/score.rs` (cited per arm) and folded in the
         // f64 device channel (D-03; f32 only on wgpu, matching the histogram channel).
-        let mut score = F::new(0.0);
+        let mut score = F::new(0.0_f32);
 
         // IN-02: the five copy-pasted comptime calcer arms are factored into the shared
         // per-leaf [`cb_leaf_score_term`] (the additive leaf contribution for the
@@ -3371,7 +3465,7 @@ pub fn find_optimal_split_kernel<F: Float>(
         if score_fn == comptime!(SCORE_FN_COSINE) {
             let left_avg = cb_leaf_avg::<F>(left_sum, left_w, lambda);
             let right_avg = cb_leaf_avg::<F>(right_sum, right_w, lambda);
-            let mut denominator = F::new(1e-100);
+            let mut denominator = F::new(1e-100_f32);
             denominator += left_avg * left_avg * left_w;
             denominator += right_avg * right_avg * right_w;
             score = folded / denominator.sqrt();
@@ -3516,7 +3610,7 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     // Load this unit's bin value for the (feature, channel) axis, zero-padding idle
     // out-of-range lanes (this cube has CUBE_DIM units; only the first n_bins own a
     // bin). if-as-STATEMENT: init to 0, overwrite inside the bounds guard.
-    let mut val = F::new(0.0);
+    let mut val = F::new(0.0_f32);
     if tid < n_bins {
         let cell = (feature * n_bins_usize + tid as usize) * 2usize + channel;
         if cell < bin_sums.len() {
@@ -3548,7 +3642,7 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     // Hillis-Steele inclusive scan over the per-plane partials.
     let mut s = 1u32;
     while s < num_planes {
-        let mut add = F::new(0.0);
+        let mut add = F::new(0.0_f32);
         if tid < num_planes {
             if tid >= s {
                 add = partials[(tid - s) as usize];
@@ -3565,7 +3659,7 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     }
 
     // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
-    let mut carry = F::new(0.0);
+    let mut carry = F::new(0.0_f32);
     if PLANE_POS >= 1u32 {
         carry = partials[(PLANE_POS - 1u32) as usize];
     }
@@ -4195,8 +4289,8 @@ pub fn derive_sibling_partition_hist_kernel<F: Float>(
         // statId==0 (weight/hessian) channel: clamp to >= 0 (the SubstractHistogramsImpl
         // underflow guard; exact arithmetic makes it inert, kept as the Pattern-2 belt).
         if j % 2usize == 0usize {
-            if diff < F::new(0.0) {
-                diff = F::new(0.0);
+            if diff < F::new(0.0_f32) {
+                diff = F::new(0.0_f32);
             }
         }
         hist[p * ls + j] = fixedpoint_encode::<F>(diff);
@@ -4248,8 +4342,8 @@ pub fn subtract_histograms_kernel<F: Float>(
         // >= 0 (the SubstractHistogramsImpl underflow guard; omitting it is the LANDMINE).
         // if-as-STATEMENT only (CubeCL conditionals manual).
         if c % (channels as usize) == 0usize {
-            if diff < F::new(0.0) {
-                diff = F::new(0.0);
+            if diff < F::new(0.0_f32) {
+                diff = F::new(0.0_f32);
             }
         }
         bigger[bigger_base as usize + c] = fixedpoint_encode::<F>(diff);
@@ -4360,16 +4454,16 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
         // Sum the single oblivious split's score over EVERY active leaf. `score_acc` is the
         // numerator (== whole score for L2/Solar/LOO/Sat); `cos_den` the Cosine denominator
         // seeded ONCE (1e-100 first summand, matching cosine_split_score).
-        let mut score_acc = F::new(0.0);
-        let mut cos_den = F::new(1e-100);
+        let mut score_acc = F::new(0.0_f32);
+        let mut cos_den = F::new(1e-100_f32);
 
         let mut part = 0usize;
         while part < n_parts_usize {
             let part_base = part * leaf_stride;
-            let mut left_w = F::new(0.0);
-            let mut left_d = F::new(0.0);
-            let mut right_w = F::new(0.0);
-            let mut right_d = F::new(0.0);
+            let mut left_w = F::new(0.0_f32);
+            let mut left_d = F::new(0.0_f32);
+            let mut right_w = F::new(0.0_f32);
+            let mut right_d = F::new(0.0_f32);
             let mut bin = 0usize;
             while bin < n_bins_usize {
                 // channel 0 = Σ weight, channel 1 = Σ der1 (the partition-fill layout).
@@ -4525,7 +4619,7 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     // Load this unit's bin value for the (feature, histId) axis, zero-padding idle
     // out-of-range lanes (this cube has CUBE_DIM units; only the first n_bins own a
     // bin). if-as-STATEMENT: init to 0, overwrite inside the bounds guard.
-    let mut val = F::new(0.0);
+    let mut val = F::new(0.0_f32);
     if tid < n_bins {
         let cell = (feature * n_bins_usize + tid as usize) * 4usize + hist_id;
         if cell < bin_sums.len() {
@@ -4557,7 +4651,7 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     // Hillis-Steele inclusive scan over the per-plane partials.
     let mut s = 1u32;
     while s < num_planes {
-        let mut add = F::new(0.0);
+        let mut add = F::new(0.0_f32);
         if tid < num_planes {
             if tid >= s {
                 add = partials[(tid - s) as usize];
@@ -4574,7 +4668,7 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     }
 
     // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
-    let mut carry = F::new(0.0);
+    let mut carry = F::new(0.0_f32);
     if PLANE_POS >= 1u32 {
         carry = partials[(PLANE_POS - 1u32) as usize];
     }
