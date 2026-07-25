@@ -41,13 +41,15 @@ jobs:
       - name: Install maturin
         run: python -m pip install "maturin[patchelf]>=1.9.4,<2.0"
 
-      # Build CPU and WGPU wheels + source distributions.
-      - name: Build sdist and cpu & wgpu abi3-py312 wheels
+      # Build CPU, WGPU, CUDA, and ROCm wheels + source distributions.
+      - name: Build all backend wheels and sdists
         run: |
           cd crates/catboost-rs-py
           maturin sdist
           maturin build --features cpu --release
           ./build-wgpu-wheel.sh --sdist
+          ./build-cuda-wheel.sh --sdist
+          ./build-rocm-wheel.sh --sdist
 
       # The wheel tag MUST contain `abi3` — proves the limited-API build.
       - name: Assert abi3 wheel tag
