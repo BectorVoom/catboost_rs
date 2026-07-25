@@ -45,3 +45,5 @@ rayon.workspace = true
 cb-oracle = { path = "../cb-oracle" }
 ndarray.workspace = true
 ndarray-npy.workspace = true
+# Parse the committed cv/ fixture folds.json / params.json in the cv oracle test.
+serde_json.workspace = true

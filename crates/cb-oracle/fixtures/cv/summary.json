@@ -1,0 +1,150 @@
+{
+  "catboost_version": "1.2.10",
+  "dataset": {
+    "n_rows": 30,
+    "n_features": 4,
+    "data_seed": 20260720,
+    "target": "2*x0 - 1.5*x1 + 0.75*x2*x3 + 0.3*N(0,1)"
+  },
+  "params": {
+    "iterations": 10,
+    "learning_rate": 0.1,
+    "depth": 4,
+    "loss_function": "RMSE",
+    "border_count": 128,
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "random_strength": 0
+  },
+  "folds_type": "KFold(n_splits=3, shuffle=False)",
+  "folds_test_indices": [
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    [
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ]
+  ],
+  "default_metric": "RMSE",
+  "std_ddof": 1,
+  "std_convention": "sample std (ddof=1, divide by F-1)",
+  "parity_self_check": {
+    "mismatches": 0,
+    "per_fold": [
+      {
+        "fold": 0,
+        "train_size": 20,
+        "test_size": 10,
+        "borders_identical": true,
+        "scale_bias_identical": true,
+        "scale": 1.0,
+        "bias": 0.08446192741394043
+      },
+      {
+        "fold": 1,
+        "train_size": 20,
+        "test_size": 10,
+        "borders_identical": true,
+        "scale_bias_identical": true,
+        "scale": 1.0,
+        "bias": 0.08427249640226364
+      },
+      {
+        "fold": 2,
+        "train_size": 20,
+        "test_size": 10,
+        "borders_identical": true,
+        "scale_bias_identical": true,
+        "scale": 1.0,
+        "bias": -0.565584659576416
+      }
+    ],
+    "note": "For every fold, catboost.cv(return_models=True) fold model and a standalone CatBoostRegressor(**params).fit(Pool(X[train],y[train])) on the identical train subset have IDENTICAL get_borders() and get_scale_and_bias(). Zero mismatches => the pinned params fully reproduce upstream cv's per-fold training."
+  },
+  "ddof_confirmation": {
+    "reconstructed_mean_max_abs_diff": 0.0,
+    "std_ddof1_max_abs_diff": 0.0,
+    "std_ddof0_max_abs_diff": 0.1041453368465361,
+    "note": "Reported test-RMSE-std matches numpy.std(per_fold_curve, ddof=1) and differs from ddof=0 => sample std."
+  },
+  "columns": {
+    "test-RMSE-mean": [
+      2.3091916412605116,
+      2.25221677046516,
+      2.2057618250917166,
+      2.1590435514672577,
+      2.1134644672897864,
+      2.076531604742666,
+      2.0359957653553655,
+      2.003368529473256,
+      1.968638577475205,
+      1.9419270893150953
+    ],
+    "test-RMSE-std": [
+      0.5572566022201834,
+      0.5585615222543864,
+      0.5574326639740831,
+      0.5625117789970723,
+      0.5629027080460165,
+      0.5628841392542999,
+      0.5648733957923949,
+      0.5669470898480704,
+      0.5675389449038973,
+      0.5603831982810893
+    ],
+    "train-RMSE-mean": [
+      2.1953129350597633,
+      2.115231860007787,
+      2.0431814725673427,
+      1.9713600321608105,
+      1.9013003205851824,
+      1.838253815461078,
+      1.772619841210364,
+      1.7118457883761877,
+      1.6501473224368741,
+      1.5965820170529497
+    ],
+    "train-RMSE-std": [
+      0.284926933155002,
+      0.276054778463073,
+      0.26896347932355086,
+      0.25857888082902186,
+      0.2514489540080235,
+      0.24541470219811287,
+      0.2392855477857012,
+      0.23002455582488956,
+      0.22225762314428502,
+      0.2192485929033957
+    ]
+  }
+}

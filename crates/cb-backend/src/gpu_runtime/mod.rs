@@ -60,6 +60,7 @@ use cb_core::{CbError, CbResult};
 
 use crate::kernels::{
     apply_leaf_delta_kernel,
+    apply_oblivious_float_kernel,
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
     find_optimal_split_partition_kernel,
     focal_gradient_kernel,
@@ -257,6 +258,216 @@ pub fn launch_block_reduce_f64(input: &[f64]) -> CbResult<Vec<f64>> {
         .read_one(out_handle)
         .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
     Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+}
+
+/// GINF-01-S4: launch [`apply_oblivious_float_kernel`] over a FEATURE-MAJOR object
+/// matrix + the flat model arrays on the compile-time [`SelectedRuntime`], returning
+/// one f64 raw prediction per object. The invariant model arrays are uploaded once
+/// (launch-overhead manual). Model-AGNOSTIC: takes flat slices, never a `Model`, so
+/// `cb-backend` gains no `cb-model` dependency and no crate cycle is introduced.
+///
+/// Under `cpu`/`rocm`/`cuda` the launch runs in f64 (borders exact); under `wgpu`
+/// (no f64) it runs in f32 (borders lose precision — smoke only, SPEC §9 R2) and the
+/// read-back is widened to f64. This mirrors the `find_optimal_split_kernel`
+/// `SCORE_BOUND` cfg element-type pattern.
+///
+/// `n_trees` is derived from the CSR offset length (`tree_split_offsets.len() - 1`).
+/// `bias` is uploaded as a length-1 `Array<F>` (a `#[cube(launch)]` scalar must be a
+/// concrete `CubeElement`, not the generic `F` — house convention).
+/// # Errors
+/// [`CbError::OutOfRange`] on a length/shape precondition violation: feature-matrix
+/// length; split/border length; the two CSR offset arrays being empty or unequal in
+/// length; either CSR offset array not starting at 0, not being monotonic
+/// non-decreasing, or not terminating at the length of the array it indexes
+/// (`tree_split_offsets` at `split_features.len()` / `split_borders.len()`,
+/// `tree_leaf_offsets` at `leaf_values.len()`); or a u32 scalar overflow.
+/// [`CbError::Degenerate`] on a device read-back failure (never a silent zero
+/// buffer, WR-05). Never panics.
+/// Validate one CSR-style offset array (CR Finding #2): it must be non-empty, start
+/// at 0, be monotonic non-decreasing, and terminate at `indexed_len` (the length of
+/// the array the offsets slice into). Uses only checked iteration (`.first()`,
+/// `.last()`, `.windows(2)` with a slice pattern) — no indexing, never panics.
+/// Returns [`CbError::OutOfRange`] on any violation.
+fn validate_csr_offsets(offsets: &[u32], indexed_len: usize, name: &str) -> CbResult<()> {
+    if offsets.first() != Some(&0) {
+        return Err(CbError::OutOfRange(format!(
+            "{name} must be a non-empty CSR offset array starting at 0; got first = {:?}",
+            offsets.first()
+        )));
+    }
+    if !offsets.windows(2).all(|w| matches!(w, [a, b] if a <= b)) {
+        return Err(CbError::OutOfRange(format!(
+            "{name} must be monotonic non-decreasing (CSR offset array)"
+        )));
+    }
+    let terminal = offsets.last().copied().map(|v| v as usize);
+    if terminal != Some(indexed_len) {
+        return Err(CbError::OutOfRange(format!(
+            "{name} must terminate at the indexed length {indexed_len}; got last = {terminal:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn launch_apply_oblivious_f64(
+    features_feature_major: &[f64],
+    n_objects: usize,
+    n_features: usize,
+    split_features: &[u32],
+    split_borders: &[f64],
+    tree_split_offsets: &[u32],
+    leaf_values: &[f64],
+    tree_leaf_offsets: &[u32],
+    bias: f64,
+) -> CbResult<Vec<f64>> {
+    // Host-side shape validation (typed → OutOfRange; never a panic/index).
+    if features_feature_major.len() != n_features.saturating_mul(n_objects) {
+        return Err(CbError::OutOfRange(format!(
+            "features length {} != n_features {} * n_objects {}",
+            features_feature_major.len(),
+            n_features,
+            n_objects
+        )));
+    }
+    if split_features.len() != split_borders.len() {
+        return Err(CbError::OutOfRange(format!(
+            "split_features length {} != split_borders length {}",
+            split_features.len(),
+            split_borders.len()
+        )));
+    }
+    if tree_split_offsets.is_empty() || tree_leaf_offsets.is_empty() {
+        return Err(CbError::OutOfRange(
+            "tree_split_offsets / tree_leaf_offsets must be CSR arrays of length n_trees + 1".into(),
+        ));
+    }
+    if tree_split_offsets.len() != tree_leaf_offsets.len() {
+        return Err(CbError::OutOfRange(format!(
+            "tree_split_offsets length {} != tree_leaf_offsets length {}",
+            tree_split_offsets.len(),
+            tree_leaf_offsets.len()
+        )));
+    }
+    // Full CSR-offset validity (CR Finding #2): each offset array must start at 0,
+    // be monotonic non-decreasing, and terminate at the length of the array it
+    // indexes. Without this a public caller passing e.g. `tree_split_offsets =
+    // [0, 100]` with `split_features.len() == 4` (both offset arrays length 2, so
+    // the shape checks above pass) would drive the kernel to read `split_features[s]`
+    // for `s` up to 100 → out of bounds. Checked iteration only (no indexing).
+    validate_csr_offsets(tree_split_offsets, split_features.len(), "tree_split_offsets")?;
+    validate_csr_offsets(tree_leaf_offsets, leaf_values.len(), "tree_leaf_offsets")?;
+
+    // Empty batch: no launch (short-circuit, mirrors launch_block_reduce_f64).
+    if n_objects == 0 {
+        return Ok(Vec::new());
+    }
+
+    let n_trees = u32::try_from(tree_split_offsets.len() - 1).map_err(|_| {
+        CbError::OutOfRange(format!(
+            "n_trees ({}) exceeds u32 (kernel scalar arg)",
+            tree_split_offsets.len() - 1
+        ))
+    })?;
+    let n_objects_u32 = u32::try_from(n_objects).map_err(|_| {
+        CbError::OutOfRange(format!("n_objects ({n_objects}) exceeds u32 (kernel scalar arg)"))
+    })?;
+    let n_features_u32 = u32::try_from(n_features).map_err(|_| {
+        CbError::OutOfRange(format!("n_features ({n_features}) exceeds u32 (kernel scalar arg)"))
+    })?;
+
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let num_cubes = n_objects.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+
+    // The u32 index arrays are backend-invariant — upload once, outside the float cfg.
+    let split_features_h = client.create(cubecl::bytes::Bytes::from_elems(split_features.to_vec()));
+    let tree_split_offsets_h =
+        client.create(cubecl::bytes::Bytes::from_elems(tree_split_offsets.to_vec()));
+    let tree_leaf_offsets_h =
+        client.create(cubecl::bytes::Bytes::from_elems(tree_leaf_offsets.to_vec()));
+
+    // Float channel: f32 on wgpu (no f64), f64 elsewhere. Read back → UPCAST to f64.
+    // The f64→f32 narrowing on the wgpu arm below (features/borders/leaves/bias) is
+    // inherent to this deliberately-f64 launch API and acceptable on the smoke-only
+    // wgpu path (SPEC §9 R2 / Finding #3) — wgpu has no f64 device type.
+    #[cfg(feature = "wgpu")]
+    let out = {
+        let features_h = client.create(cubecl::bytes::Bytes::from_elems(
+            features_feature_major.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        ));
+        let split_borders_h = client.create(cubecl::bytes::Bytes::from_elems(
+            split_borders.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        ));
+        let leaf_values_h = client.create(cubecl::bytes::Bytes::from_elems(
+            leaf_values.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        ));
+        let bias_h = client.create(cubecl::bytes::Bytes::from_elems(vec![bias as f32]));
+        let out_h = client.empty(n_objects * std::mem::size_of::<f32>());
+        apply_oblivious_float_kernel::launch::<f32, SelectedRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(features_h, features_feature_major.len()) },
+            unsafe { ArrayArg::from_raw_parts(split_features_h, split_features.len()) },
+            unsafe { ArrayArg::from_raw_parts(split_borders_h, split_borders.len()) },
+            unsafe { ArrayArg::from_raw_parts(tree_split_offsets_h, tree_split_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(leaf_values_h, leaf_values.len()) },
+            unsafe { ArrayArg::from_raw_parts(tree_leaf_offsets_h, tree_leaf_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(out_h.clone(), n_objects) },
+            unsafe { ArrayArg::from_raw_parts(bias_h, 1) },
+            n_objects_u32,
+            n_features_u32,
+            n_trees,
+        );
+        let bytes = client
+            .read_one(out_h)
+            .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+        bytemuck::cast_slice::<u8, f32>(&bytes)
+            .iter()
+            .map(|&v| v as f64)
+            .collect::<Vec<f64>>()
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let out = {
+        let features_h =
+            client.create(cubecl::bytes::Bytes::from_elems(features_feature_major.to_vec()));
+        let split_borders_h =
+            client.create(cubecl::bytes::Bytes::from_elems(split_borders.to_vec()));
+        let leaf_values_h = client.create(cubecl::bytes::Bytes::from_elems(leaf_values.to_vec()));
+        let bias_h = client.create(cubecl::bytes::Bytes::from_elems(vec![bias]));
+        let out_h = client.empty(n_objects * std::mem::size_of::<f64>());
+        apply_oblivious_float_kernel::launch::<f64, SelectedRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(features_h, features_feature_major.len()) },
+            unsafe { ArrayArg::from_raw_parts(split_features_h, split_features.len()) },
+            unsafe { ArrayArg::from_raw_parts(split_borders_h, split_borders.len()) },
+            unsafe { ArrayArg::from_raw_parts(tree_split_offsets_h, tree_split_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(leaf_values_h, leaf_values.len()) },
+            unsafe { ArrayArg::from_raw_parts(tree_leaf_offsets_h, tree_leaf_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(out_h.clone(), n_objects) },
+            unsafe { ArrayArg::from_raw_parts(bias_h, 1) },
+            n_objects_u32,
+            n_features_u32,
+            n_trees,
+        );
+        let bytes = client
+            .read_one(out_h)
+            .map_err(|e| CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}")))?;
+        bytemuck::cast_slice::<u8, f64>(&bytes).to_vec()
+    };
+
+    Ok(out)
 }
 
 /// Compute the block inclusive/exclusive prefix-scan of `input` on the

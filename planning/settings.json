@@ -1,0 +1,21 @@
+{
+  "$schema": "./settings.schema.json",
+  "version": 2,
+  "models": {
+    "profile": "custom",
+    "overrides": {
+      "planner": "claude-opus-4-8",
+      "researcher": "claude-sonnet-5",
+      "implementer": "claude-opus-4-8",
+      "reviewer": "claude-opus-4-8",
+      "verifier": "claude-sonnet-5"
+    }
+  },
+  "effort": {
+    "default": "high",
+    "overrides": {}
+  },
+  "implementation": {
+    "use_worktree": false
+  }
+}

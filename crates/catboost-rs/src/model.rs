@@ -207,6 +207,71 @@ impl Model {
         ))
     }
 
+    /// Marshal per-feature `f32` columns into a FEATURE-MAJOR `f64` buffer
+    /// (`out[f * n_objects + obj]`) for the device apply kernel (GINF-01-S5).
+    ///
+    /// `n_objects` is the FIRST column's length (mirroring `predict_raw_cat`'s
+    /// `n_float = feature_values.first().map_or(0, Vec::len)`, `apply.rs:397`), so
+    /// a LATER column SHORTER than the first is NaN-padded per-cell (checked
+    /// `.get`, mirroring `apply.rs:404-407`) and a LATER column LONGER than the
+    /// first is naturally truncated (the inner loop stops at `n_objects`). The
+    /// outer loop over columns / inner loop over objects lays the buffer out
+    /// feature-major so adjacent object-threads touch adjacent addresses.
+    fn to_feature_major_f64(features: &[Vec<f32>], n_objects: usize) -> Vec<f64> {
+        let mut out = Vec::with_capacity(features.len().saturating_mul(n_objects));
+        for column in features {
+            for obj in 0..n_objects {
+                out.push(column.get(obj).map_or(f64::NAN, |&v| f64::from(v)));
+            }
+        }
+        out
+    }
+
+    /// GPU inference for float-only oblivious scalar models (GINF-01-S5): marshals
+    /// the inner model (guard → flatten → device launch) into raw predictions
+    /// ([`PredictionType::RawFormulaVal`]) on the compile-time-selected backend.
+    ///
+    /// `n_objects` is derived EXCLUSIVELY from `features.first()`'s length —
+    /// bit-for-bit mirroring `predict_raw_cat`'s `n_float` derivation
+    /// (`apply.rs:397-399`), NOT a max-over-columns rule: a later column LONGER
+    /// than the first is silently truncated to `n_objects` (its tail is never
+    /// read, exactly as the CPU apply does); a later column SHORTER than the first
+    /// is NaN-padded per-cell (`apply.rs:404-407`). The result matches
+    /// [`cb_model::predict_raw`] within the project `SCORE_BOUND` convention
+    /// (≤`1e-9` under the `cpu`/f64 backend; ≤`1e-3` smoke-only under wgpu-f32) —
+    /// within-bound of the order-locked `sum_f64`, not bit-exact (D-08).
+    ///
+    /// # Errors
+    /// [`CatBoostError`] wrapping the flattener/guard `cb_core::CbError`
+    /// (unsupported model: categorical/CTR, non-oblivious, region, or
+    /// multi-dimensional) or the underlying device `cb_core::CbError` (shape /
+    /// read-back). Never panics.
+    pub fn predict_raw_on_device(&self, features: &[Vec<f32>]) -> Result<Vec<f64>, CatBoostError> {
+        // Guard + flatten the model into device-ready flat arrays (cb-model, pure).
+        // A guard rejection surfaces as `CbError::Unsupported` and maps to
+        // `CatBoostError::Train` via the `#[from] cb_core::CbError` arm.
+        let flat = cb_model::flatten_oblivious_f64(self.as_canonical())?;
+
+        // n_objects governed by the FIRST column (mirrors the CPU derivation).
+        let n_objects = features.first().map_or(0, Vec::len);
+        let n_features = features.len();
+        let feature_major = Self::to_feature_major_f64(features, n_objects);
+
+        // Launch the device kernel (cb-backend, Model-agnostic flat slices).
+        let predictions = cb_backend::gpu_runtime::launch_apply_oblivious_f64(
+            &feature_major,
+            n_objects,
+            n_features,
+            &flat.split_features,
+            &flat.split_borders,
+            &flat.tree_split_offsets,
+            &flat.leaf_values,
+            &flat.tree_leaf_offsets,
+            flat.bias,
+        )?;
+        Ok(predictions)
+    }
+
     /// Predict class probabilities ([`PredictionType::Probability`]) — the D-06
     /// shorthand. Two values per object (`[class-0, class-1]`, row-major).
     ///

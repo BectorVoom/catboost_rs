@@ -1,10 +1,10 @@
 ---
 title: EXPORT-02 — CoreML export (float-only oblivious regressor) — TDD PLAN
 plan_for: .planning/plans/coreml-export/SPEC.md
-status: draft
+status: complete
 format: markdown
 plan_version: 1
-updated_at: 2026-07-18T00:00:00Z
+updated_at: 2026-07-19T00:00:00Z
 spec_ids: [CM-01, CM-02, CM-03, CM-04]
 tasks: [CM-R0, CM-01, CM-02, CM-03, CM-04, CM-PY]
 no_gsd: true
@@ -12,6 +12,27 @@ verification_caveat: "No Apple CoreML runtime on this Linux host → NO ≤1e-5 
 ---
 
 # EXPORT-02 — CoreML export: goal-backward TDD plan
+
+> ## Execution status (2026-07-19) — ✅ COMPLETE, including CM-PY (Python)
+> CM-R0/CM-01..04 landed earlier (`crates/cb-model/src/export/coreml.rs` +
+> `coreml_test.rs`, facade `Model::save_coreml`; commit `cf1252b`).
+> **CM-PY (previously deferred)** now shipped: `CatBoostRegressor.save_coreml(path)`
+> in `crates/catboost-rs-py/src/regressor.rs`, mirroring `save_onnx` exactly
+> (`NotFittedError` guard + `py.detach(|| model.save_coreml(..))` +
+> `PyCbError`); the `FacadeError::CoreMlExport` `to_pyerr` arm already existed
+> (`errors.rs`), so no error-mapping change was needed. New
+> `crates/catboost-rs-py/tests/test_coreml_export.py`: unfitted-guard +
+> fitted-nonempty-file tests, plus an optional `coremltools`-decode round trip
+> gated by `pytest.importorskip` (skipped here — `coremltools` isn't installed
+> in this venv, matching the plan's "no Apple runtime" caveat) — **built and
+> run for real** via `.venv-py8/bin/maturin develop --features cpu` +
+> `.venv-py8/bin/pytest`: 2 passed, 1 skipped. Full
+> `.venv-py8/bin/pytest tests --ignore=tests/test_utils_eval_metric.py`:
+> 85 passed, 7 skipped, 79 xfailed, 0 failed (the ignored file needs an
+> upstream `catboost` install this venv lacks — pre-existing, unrelated).
+> `cargo clippy -p catboost-rs-py --lib --no-deps` on the touched files is
+> clean; the 9 pre-existing clippy errors are confined to untouched
+> `params.rs`/`ingest_py.rs`.
 
 **Provenance / GSD:** This plan was authored WITHOUT any GSD skill, command, workflow, or
 sub-agent. No production code was written; the sole artifact is this file. All symbols below were

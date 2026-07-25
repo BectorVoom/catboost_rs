@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "./settings.schema.json",
+  "title": "Planning Settings",
+  "type": "object",
+  "required": [
+    "version",
+    "models",
+    "effort",
+    "implementation"
+  ],
+  "$defs": {
+    "role": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "effortLevel": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "effortRole": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/effortLevel"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "models": {
+      "type": "object",
+      "required": [
+        "profile",
+        "overrides"
+      ],
+      "properties": {
+        "profile": {
+          "enum": [
+            "quality",
+            "balanced",
+            "custom"
+          ]
+        },
+        "overrides": {
+          "type": "object",
+          "properties": {
+            "planner": {
+              "$ref": "#/$defs/role"
+            },
+            "researcher": {
+              "$ref": "#/$defs/role"
+            },
+            "implementer": {
+              "$ref": "#/$defs/role"
+            },
+            "reviewer": {
+              "$ref": "#/$defs/role"
+            },
+            "verifier": {
+              "$ref": "#/$defs/role"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "effort": {
+      "type": "object",
+      "required": [
+        "default",
+        "overrides"
+      ],
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/effortLevel"
+        },
+        "overrides": {
+          "type": "object",
+          "properties": {
+            "planner": {
+              "$ref": "#/$defs/effortRole"
+            },
+            "researcher": {
+              "$ref": "#/$defs/effortRole"
+            },
+            "implementer": {
+              "$ref": "#/$defs/effortRole"
+            },
+            "reviewer": {
+              "$ref": "#/$defs/effortRole"
+            },
+            "verifier": {
+              "$ref": "#/$defs/effortRole"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "implementation": {
+      "type": "object",
+      "required": [
+        "use_worktree"
+      ],
+      "properties": {
+        "use_worktree": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

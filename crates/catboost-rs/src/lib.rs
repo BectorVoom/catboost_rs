@@ -20,12 +20,18 @@
 //! facade is a `thiserror`-only library.
 
 mod builder;
+mod cv;
 mod error;
+mod grid_search;
 mod metrics;
 mod model;
 
 pub use builder::CatBoostBuilder;
+pub use cv::{cv, make_cv_folds, CvFold, CvResult, CvType};
 pub use error::CatBoostError;
+pub use grid_search::{
+    grid_search, metric_is_max_optimal, randomized_search, ErrorScore, SearchResult,
+};
 pub use metrics::{eval_metric, eval_metrics};
 pub use model::Model;
 
@@ -62,7 +68,11 @@ pub use cb_data::Pool;
 #[cfg(test)]
 mod error_test;
 #[cfg(test)]
+mod grid_search_test;
+#[cfg(test)]
 mod metrics_test;
+#[cfg(test)]
+mod model_device_test;
 #[cfg(test)]
 mod model_sum_test;
 #[cfg(test)]
