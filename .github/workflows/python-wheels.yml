@@ -67,6 +67,27 @@ jobs:
           /tmp/wheel-smoke/bin/pip install target/wheels/*abi3*.whl
           /tmp/wheel-smoke/bin/python -c "import catboost_rs; catboost_rs.CatBoostRegressor; print('import OK:', catboost_rs.__name__)"
 
+      # abi3-py312 is a forward-compatibility claim (one wheel installs on any
+      # CPython >= 3.12 GIL build); prove it by actually installing + fitting
+      # + predicting on 3.13 and 3.14 interpreters, not just the 3.12 build
+      # interpreter above.
+      - name: Set up Python 3.13 and 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.13
+            3.14
+
+      - name: abi3 forward-compat smoke (3.13, 3.14)
+        run: |
+          set -euo pipefail
+          for pyver in 3.13 3.14; do
+            echo "== abi3 smoke on Python $pyver =="
+            python$pyver -m venv /tmp/wheel-smoke-$pyver
+            /tmp/wheel-smoke-$pyver/bin/pip install numpy target/wheels/*abi3*.whl
+            /tmp/wheel-smoke-$pyver/bin/python .github/scripts/abi3_smoke.py
+          done
+
       - name: Upload cpu wheel artifact
         uses: actions/upload-artifact@v4
         with:
