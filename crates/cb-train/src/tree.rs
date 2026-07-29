@@ -594,6 +594,24 @@ pub fn greedy_tensor_search_oblivious_perturbed(
     let mut scratch = GrowScratch::new(matrix, der1, n_objects);
 
     for level in 0..depth {
+        // Per-level RSM-candidate-selection draws (`SelectFeaturesForScoring`),
+        // ONE `Rand.GenRandReal1()` per LISTED float feature (including
+        // border-less/unused-but-quantized ones), drawn UNCONDITIONALLY
+        // regardless of the (unimplemented, always-select) `Rsm` value —
+        // discarded here since this project's fixtures never subsample
+        // features. VERIFIED against a real instrumented upstream 1.2.10
+        // build (2026-07-30): exactly `n_features` draws precede EVERY
+        // level's `CalcScores` fence, including level 0 (see
+        // `.planning/plans/bayesian-rng-draw-accounting/
+        // instrumented-ground-truth/GROUND_TRUTH.md`). Only consumed when
+        // `perturb` is `Some` — `None` means `draws_active == false`
+        // (bootstrap_type=No, random_strength=0), the byte-identical
+        // zero-draw first-slice path this must not touch.
+        if let Some(p) = perturb.as_mut() {
+            for _ in 0..matrix.n_features() {
+                p.rng.gen_rand_real1();
+            }
+        }
         // PLAIN path (perturb = None): `select_level_plain` FUSES the per-feature
         // build/derive + score in ONE rayon parallel-over-features pass (D-01) and
         // RETURNS this level's per-feature histograms, which become the parent the
@@ -1169,20 +1187,33 @@ fn select_level_perturbed(
     let mut best_gain = f64::NEG_INFINITY;
     let mut chosen_split: Option<Split> = None;
     for (feature, slot) in feature_best.iter().enumerate() {
-        let &Some((border, raw)) = slot else {
-            continue;
-        };
-        // FEAT-04: penalize the per-feature best RAW score before the noise instance
-        // (multiplicative weight + subtractive first-use/per-object). No-op context
-        // ⇒ `raw` unchanged.
-        let penalized_raw = match active_penalties {
-            Some(p) => p.penalize(feature, raw),
-            None => raw,
-        };
-        let instance = random_score_instance(penalized_raw, std_dev, perturb.rng);
-        if instance > best_gain {
-            best_gain = instance;
-            chosen_split = Some(Split { feature, border });
+        match slot {
+            Some((border, raw)) => {
+                let (border, raw) = (*border, *raw);
+                // FEAT-04: penalize the per-feature best RAW score before the noise
+                // instance (multiplicative weight + subtractive first-use/per-object).
+                // No-op context ⇒ `raw` unchanged.
+                let penalized_raw = match active_penalties {
+                    Some(p) => p.penalize(feature, raw),
+                    None => raw,
+                };
+                let instance = random_score_instance(penalized_raw, std_dev, perturb.rng);
+                if instance > best_gain {
+                    best_gain = instance;
+                    chosen_split = Some(Split { feature, border });
+                }
+            }
+            None => {
+                // Border-less ("unused-but-quantized") feature: upstream's
+                // SelectBestCandidate still iterates it as a listed candidate and
+                // draws ONE GetInstance normal for it (VERIFIED against a real
+                // instrumented upstream 1.2.10 build, 2026-07-30 — see
+                // `.planning/plans/bayesian-rng-draw-accounting/
+                // instrumented-ground-truth/GROUND_TRUTH.md`), even though it can
+                // never actually win (no valid split border). Draw and discard;
+                // `f64::NEG_INFINITY` guarantees it never beats `best_gain`.
+                let _ = random_score_instance(f64::NEG_INFINITY, std_dev, perturb.rng);
+            }
         }
     }
 
