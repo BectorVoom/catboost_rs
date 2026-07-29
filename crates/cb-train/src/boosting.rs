@@ -57,12 +57,15 @@ use crate::tree::{
 /// is active so the bootstrap draws land on the correct RNG phase every tree.
 const PRE_TREE_DRAWS: usize = 2;
 
-/// Per-iteration POST-bootstrap draws BEYOND the `depth` per-level
-/// `CalcScores` random-strength seed draws (greedy_tensor_search.cpp:884): the
-/// depth loop evaluates `depth + 1` candidate levels (the final level finds no
-/// improving split and breaks), so `CalcScores` draws one extra `GenRand()`.
-/// Verified end-to-end against the Bernoulli oracle (post = depth + 1).
-const POST_TREE_EXTRA_DRAWS: usize = 1;
+/// Per-tree leaf-estimation-seed draws, consumed ONCE per tree after the
+/// level-search loop finishes (train.cpp's `GenRandUI64Vector(foldCount,
+/// Rand.GenRand())`-adjacent leaf-value phase). VERIFIED against a real
+/// instrumented upstream 1.2.10 build (`CB_INSTRUMENT_LOG`, 2026-07-30 —
+/// `.planning/plans/bayesian-rng-draw-accounting/instrumented-ground-truth/
+/// GROUND_TRUTH.md`): `tree_rng_end.cc - tree_rng_pre_leaf.cc == 2`,
+/// identically across all 4 bootstrap-type scenarios and all 3 trees (12/12
+/// confirmations) — NOT 1 as an earlier, unverified wave assumed.
+const POST_TREE_EXTRA_DRAWS: usize = 2;
 
 /// The boosting type (`EBoostingType`, `boosting_options.cpp:16`). The CPU
 /// default is [`EBoostingType::Plain`]; [`EBoostingType::Ordered`] drives the
@@ -3797,14 +3800,30 @@ fn train_inner<R: Runtime>(
         // `eff_weights`, `scoring.cpp:276-279`), never the L2 scaling. `docCount`
         // stays `n`. For every non-pairwise loss this is byte-identical (D-04).
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
-        let perturb = if perturb_active {
+        // Widened from `perturb_active` to `draws_active` (2026-07-30, real
+        // instrumented-upstream ground truth — see the `POST_TREE_EXTRA_DRAWS`
+        // doc comment and `.planning/plans/bayesian-rng-draw-accounting/
+        // instrumented-ground-truth/GROUND_TRUTH.md`): upstream's per-level RSM
+        // reselection + `SelectBestCandidate` draws happen UNCONDITIONALLY
+        // whenever sampling is active, even at `random_strength == 0`
+        // (`score_st_dev = 0.0` then makes the perturbation a numeric no-op —
+        // `val + std_normal(rng) * 0.0 == val` — so the CHOSEN split/leaf is
+        // unaffected; only the RNG phase entering the NEXT tree's `Bootstrap`
+        // call changes). When `draws_active` is false (bootstrap_type=No AND
+        // random_strength=0) `perturb` stays `None` and the search remains the
+        // byte-identical, zero-draw first-slice path — untouched.
+        let perturb = if draws_active {
             let model_length = iter as f64 * learning_rate;
             // CR-02: std-dev sums `wd²` over the FULL dim-major buffer but
             // divides by the per-OBJECT count `n` (NOT `dim*n`); the `ln(n)`
             // model-size multiplier likewise uses `n` (greedy_tensor_search.cpp:
             // 106, 125). At dim=1, `weighted_der1.len() == n` so this is
             // byte-identical to the prior call (D-04).
-            let std_dev = score_st_dev(params.random_strength, &weighted_der1, n, model_length);
+            let std_dev = if perturb_active {
+                score_st_dev(params.random_strength, &weighted_der1, n, model_length)
+            } else {
+                0.0
+            };
             Some(Perturbation {
                 rng: &mut rng,
                 score_st_dev: std_dev,
@@ -4545,31 +4564,21 @@ fn train_inner<R: Runtime>(
             out.extend_from_slice(&approx);
         }
 
-        // POST per-tree draws. Two distinct main-RNG consumers run AFTER the tree
-        // structure is grown:
-        //   (a) the per-level `CalcScores` randSeed (greedy_tensor_search.cpp:884)
-        //       — ONE `Rand.GenRand()` per level; and
-        //   (b) the leaf-estimation seed (train.cpp:303,
-        //       `GenRandUI64Vector(foldCount, Rand.GenRand())`) — ONE
-        //       `Rand.GenRand()` per TREE, drawn once the tree is built.
-        // When the perturbation is OFF but sampling is on, (a) is not observable
-        // individually, so the prior wave folds (a)+(b) into a single bulk
-        // `depth + 1` advance that keeps the next tree's Bootstrap phase-aligned.
-        // When the perturbation is ON, the perturbed search ALREADY consumed (a)'s
-        // randSeed AND the `SelectBestCandidate` normal draws inline in exact
-        // upstream order, so only (b) — the single leaf-estimation seed draw —
-        // remains to be consumed here (train.cpp:303). This source-faithful draw
-        // locks the FIRST tree end-to-end (splits + leaf values <= 1e-5); a
-        // per-tree main-RNG phase drift remains for tree-1+ (the variable-length
-        // normal-draw accounting could not be localized at tree granularity
-        // without C++ instrumentation of `LearnProgress->Rand` — escalated to
-        // D-11 / Open Q4, see the regularization oracle test header and SUMMARY).
-        if perturb_active {
+        // POST per-tree draws: the leaf-estimation seed
+        // (`GenRandUI64Vector(foldCount, Rand.GenRand())`-adjacent phase,
+        // train.cpp), `POST_TREE_EXTRA_DRAWS` (= 2) `Rand.GenRand()` calls, once
+        // per tree. This is the ONLY draw source left to consume out-of-line:
+        // the per-level RSM-reselection + `CalcScores` randSeed +
+        // `SelectBestCandidate` draws now all happen INLINE during the grow
+        // above (`perturb` is `Some` whenever `draws_active`, regardless of
+        // `perturb_active` — see its construction above), in exact upstream
+        // order/count, VERIFIED against a real instrumented upstream 1.2.10
+        // build (2026-07-30, `.planning/plans/bayesian-rng-draw-accounting/
+        // instrumented-ground-truth/GROUND_TRUTH.md`). `draws_active == false`
+        // (bootstrap_type=No, random_strength=0) stays the byte-identical
+        // zero-draw first-slice path.
+        if draws_active {
             for _ in 0..POST_TREE_EXTRA_DRAWS {
-                rng.gen_rand();
-            }
-        } else if draws_active {
-            for _ in 0..(params.depth + POST_TREE_EXTRA_DRAWS) {
                 rng.gen_rand();
             }
         }
