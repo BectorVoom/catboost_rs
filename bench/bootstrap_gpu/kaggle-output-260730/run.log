@@ -1,0 +1,410 @@
+$ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB
+
+GPU: Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB
+$ nvcc --version || true
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Fri_Feb_21_20:23:50_PST_2025
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+
+$ git clone --depth 1 --branch fix/bootstrap-rng-draw-accounting https://github.com/BectorVoom/catboost_rs.git /tmp/repo
+Cloning into '/tmp/repo'...
+
+$ git -C /tmp/repo rev-parse HEAD
+5a5068a4d6dff9eff43126a08a1ab8dfbfa20a8a
+
+$ grep -c 'POST_TREE_EXTRA_DRAWS: usize = 2' /tmp/repo/crates/cb-train/src/boosting.rs || true
+1
+
+staged_source_has_rng_fix: True
+$ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
+
+$ rustc --version && cargo --version
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+
+
+======================================================================
+PART A — oracle
+======================================================================
+$ cargo test --release -p cb-train --test bootstrap_oracle_test -- --include-ignored --test-threads 1
+  Compiling arrow-row v59.0.0
+   Compiling arrow-arith v59.0.0
+   Compiling cubecl-cpu v0.10.0
+   Compiling stable-vec v0.4.2
+   Compiling crc32fast v1.5.0
+   Compiling cubecl-opt v0.10.0
+   Compiling arrow v59.0.0
+   Compiling tracel-llvm v20.1.4-7
+   Compiling pest_meta v2.8.6
+   Compiling cubecl-std v0.10.0
+   Compiling sysinfo v0.38.4
+   Compiling matrixmultiply v0.3.10
+   Compiling cubecl v0.10.0
+   Compiling pest_generator v2.8.6
+   Compiling cb-data v0.1.0 (/tmp/repo/crates/cb-data)
+   Compiling rawpointer v0.2.1
+   Compiling zlib-rs v0.6.3
+   Compiling simd-adler32 v0.3.9
+   Compiling bumpalo v3.20.3
+   Compiling zopfli v0.8.3
+   Compiling flate2 v1.1.9
+   Compiling cb-compute v0.1.0 (/tmp/repo/crates/cb-compute)
+   Compiling pest_derive v2.8.6
+   Compiling itertools v0.14.0
+   Compiling prost-derive v0.14.4
+   Compiling cb-backend v0.1.0 (/tmp/repo/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling py_literal v0.4.0
+   Compiling ndarray v0.17.2
+   Compiling zip v6.0.0
+   Compiling byteorder v1.5.0
+   Compiling ndarray-npy v0.10.0
+   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)
+   Compiling prost v0.14.4
+   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling cb-oracle v0.1.0 (/tmp/repo/crates/cb-oracle)
+   Compiling approx v0.5.1
+    Finished `release` profile [optimized] target(s) in 14m 34s
+     Running tests/bootstrap_oracle_test.rs (/tmp/target/release/deps/bootstrap_oracle_test-81ef8931cffcff58)
+
+running 5 tests
+test bootstrap_oracle_bayesian ... ok
+test bootstrap_oracle_bayesian_first_tree ... ok
+test bootstrap_oracle_bernoulli ... ok
+test bootstrap_oracle_mvs ... ok
+test bootstrap_oracle_no ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+[oracle] cb-train bootstrap parity (CPU, all 4 types): rc=0 passed=5 failed=0
+$ cargo test --release -p cb-train --test regularization_oracle_test -- --include-ignored --test-threads 1
+   Compiling cubecl v0.10.0
+   Compiling cb-backend v0.1.0 (/tmp/repo/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)
+   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 1m 15s
+     Running tests/regularization_oracle_test.rs (/tmp/target/release/deps/regularization_oracle_test-03cadc405de7f372)
+
+running 6 tests
+test regularization_oracle_bagging_temp ... ok
+test regularization_oracle_bagging_temp_first_tree ... ok
+test regularization_oracle_l2 ... ok
+test regularization_oracle_random_strength ... FAILED
+test regularization_oracle_random_strength_bernoulli ... ok
+test regularization_oracle_random_strength_first_tree ... ok
+
+failures:
+
+---- regularization_oracle_random_strength stdout ----
+
+thread 'regularization_oracle_random_strength' (8340) panicked at crates/cb-train/tests/regularization_oracle_test.rs:147:29:
+regularization/random_strength: splits diverged: StageDiverged { stage: Splits, index: 2, expected: -0.1585310399532318, actual: 0.3004736602306366, diff: 0.4590047001838684 }
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: regularization_oracle_test::check_scenario::{closure#0}
+   3: regularization_oracle_test::check_scenario
+   4: <regularization_oracle_test::regularization_oracle_random_strength::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    regularization_oracle_random_strength
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p cb-train --test regularization_oracle_test`
+
+[oracle] cb-train regularization parity (CPU): rc=101 passed=5 failed=1
+$ cargo test --release -p cb-backend --no-default-features --features cuda --lib bootstrap -- --include-ignored --test-threads 1
+po/crates/cb-data)
+   Compiling cubecl-std v0.10.0
+   Compiling cb-compute v0.1.0 (/tmp/repo/crates/cb-compute)
+   Compiling cb-backend v0.1.0 (/tmp/repo/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9
+    |
+165 |     let mut new_node = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9
+    |
+181 |     let mut do_split = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 11m 51s
+     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-af33330f3ab8e5f5)
+
+running 7 tests
+test gpu_runtime::session_depth_gt1_test::session_bootstrap_gate_covers_bernoulli_bayesian_poisson ... ok
+test gpu_runtime::session_depth_gt1_test::session_bootstrap_grows_finite_tree ... ok
+test kernels::bootstrap_device_test::bayesian_weights_match_frozen_cpu_sample_within_epsilon ... ok
+test kernels::bootstrap_device_test::bernoulli_keep_mask_matches_frozen_cpu_sample_bit_for_bit ... ok
+test kernels::bootstrap_device_test::bernoulli_leaves_match_transitively_via_identical_mask ... ok
+test kernels::bootstrap_device_test::poisson_weights_are_deterministic_and_nonnegative_integers ... ok
+test kernels::bootstrap_device_test::score_stddev_is_deterministic_and_matches_population_stddev ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 204 filtered out; finished in 2.31s
+
+
+[oracle] cb-backend device bootstrap kernels (CUDA): rc=0 passed=7 failed=0
+$ cargo test --release -p cb-backend --no-default-features --features cuda --lib mvs -- --include-ignored --test-threads 1
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9
+    |
+165 |     let mut new_node = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9
+    |
+181 |     let mut do_split = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.44s
+     Running unittests src/lib.rs (/tmp/target/release/deps/cb_backend-af33330f3ab8e5f5)
+
+running 3 tests
+test kernels::mvs_device_test::mvs_multi_block_reseed_is_deterministic_and_finite ... ok
+test kernels::mvs_device_test::mvs_per_block_threshold_matches_and_reweight_is_consistent ... ok
+test kernels::mvs_device_test::mvs_weights_match_frozen_cpu_sample_within_epsilon ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 1.08s
+
+
+[oracle] cb-backend device MVS kernels (CUDA): rc=0 passed=3 failed=0
+PART A verdict: ORACLE-PASS (blocking suites green)
+
+======================================================================
+PART B — speed
+======================================================================
+$ pip install -q maturin
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.6/10.6 MB 98.3 MB/s eta 0:00:00
+
+$ maturin build --release --no-default-features --features cuda -m /tmp/repo/crates/catboost-rs-py/Cargo.toml
+d v59.0.0
+   Compiling arrow-cast v59.0.0
+   Compiling cubecl-runtime v0.10.0
+   Compiling pyo3-build-config v0.29.0
+   Compiling polars-core v0.54.4
+   Compiling cubecl-core v0.10.0
+   Compiling polars-ops v0.54.4
+   Compiling num-rational v0.4.2
+   Compiling now v0.1.3
+   Compiling num-iter v0.1.45
+   Compiling num v0.4.3
+   Compiling polars-time v0.54.4
+   Compiling polars-io v0.54.4
+   Compiling cubecl-opt v0.10.0
+   Compiling arrow-ipc v59.0.0
+   Compiling arrow-csv v59.0.0
+   Compiling pyo3-ffi v0.29.0
+   Compiling arrow-json v59.0.0
+   Compiling arrow-string v59.0.0
+   Compiling arrow-arith v59.0.0
+   Compiling arrow-row v59.0.0
+   Compiling cubecl-cpp v0.10.0
+   Compiling arrow v59.0.0
+   Compiling polars v0.54.4
+   Compiling cb-data v0.1.0 (/tmp/repo/crates/cb-data)
+   Compiling cubecl-cuda v0.10.0
+   Compiling cubecl-std v0.10.0
+   Compiling pyo3 v0.29.0
+   Compiling cubecl v0.10.0
+   Compiling cb-compute v0.1.0 (/tmp/repo/crates/cb-compute)
+   Compiling pyo3-macros-backend v0.29.0
+   Compiling pyo3-macros v0.29.0
+   Compiling prost-derive v0.14.4
+   Compiling cb-backend v0.1.0 (/tmp/repo/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling numpy v0.29.0
+   Compiling thiserror v1.0.69
+   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)
+   Compiling prost v0.14.4
+   Compiling ndarray v0.17.2
+   Compiling thiserror-impl v1.0.69
+   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)
+   Compiling catboost-rs v0.1.0 (/tmp/repo/crates/catboost-rs)
+   Compiling pyo3-arrow v0.19.0
+   Compiling catboost-rs-py v0.1.0 (/tmp/repo/crates/catboost-rs-py)
+    Finished `release` profile [optimized] target(s) in 11m 14s
+📦 Built wheel for abi3 Python ≥ 3.12 to /tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl
+
+$ pip install --force-reinstall /tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl
+Processing /tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl
+Installing collected packages: catboost-rs
+Successfully installed catboost-rs-0.1.0
+
+
+--- bootstrap_type=No (catboost_rs GPU-eligible: True) ---
+[catboost_rs[No]] fit_s=1.9283 train_rmse=4.307126
+[catboost_gpu[No]] fit_s=1.3105 train_rmse=4.309055
+[catboost_cpu[No]] fit_s=1.8603 train_rmse=4.309055
+
+--- bootstrap_type=Bayesian (catboost_rs GPU-eligible: False) ---
+[catboost_rs[Bayesian]] fit_s=16.5562 train_rmse=4.309573
+[catboost_gpu[Bayesian]] fit_s=1.2762 train_rmse=4.308913
+[catboost_cpu[Bayesian]] fit_s=1.9301 train_rmse=4.311477
+
+--- bootstrap_type=Bernoulli (catboost_rs GPU-eligible: False) ---
+[catboost_rs[Bernoulli]] fit_s=16.2594 train_rmse=4.309293
+[catboost_gpu[Bernoulli]] fit_s=1.3242 train_rmse=4.309728
+[catboost_cpu[Bernoulli]] fit_s=1.7332 train_rmse=4.311261
+
+--- bootstrap_type=MVS (catboost_rs GPU-eligible: False) ---
+[catboost_rs[MVS]] fit_s=16.7216 train_rmse=4.306912
+[catboost_gpu[MVS]] fit_s=1.3818 train_rmse=4.329662
+[catboost_cpu[MVS]] fit_s=1.7759 train_rmse=4.307197
+
+--- bootstrap_type=Poisson (catboost_rs GPU-eligible: False) ---
+[catboost_rs[Poisson]] warm fit FAILED: degenerate training input: poisson bootstrap is not supported on CPU
+[catboost_gpu[Poisson]] fit_s=1.3267 train_rmse=4.309988
+[catboost_cpu[Poisson]] warm fit FAILED: catboost/private/libs/options/bootstrap_options.cpp:29: Error: poisson bootstrap is not supported on CPU
+
+DONE — verdict: ORACLE-PASS
