@@ -105,102 +105,47 @@ fn params(
     }
 }
 
-/// The scenarios gated over ALL THREE trees against upstream
+/// The four scenarios, each gated over ALL THREE trees against upstream
 /// (`(dir, type, subsample, temperature)`).
 ///
-/// MVS is deliberately NOT here — see [`MVS_SCENARIO`] and [`MVS_GATED_TREES`].
+/// MVS used to carry a reduced-tree carve-out (`MVS_GATED_TREES = 2`) because the CPU
+/// sampler diverged from upstream partway through a fit. The cause was two fabricated
+/// RNG draws in `cb_train::bootstrap`'s MVS arm — a per-tree phase drift, fixed by
+/// deleting them — so MVS is now gated exactly like every other scenario.
 const SCENARIOS: &[(&str, EBootstrapType, f64, f32)] = &[
     ("no", EBootstrapType::No, 1.0, 0.0),
     ("bayesian", EBootstrapType::Bayesian, 1.0, 1.0),
     ("bernoulli", EBootstrapType::Bernoulli, 0.8, 0.0),
+    ("mvs", EBootstrapType::Mvs, 0.8, 0.0),
 ];
-
-/// MVS, gated separately over a REDUCED tree range.
-const MVS_SCENARIO: (&str, EBootstrapType, f64, f32) = ("mvs", EBootstrapType::Mvs, 0.8, 0.0);
-
-/// How many of the fixture's 3 trees the MVS scenario is gated over.
-///
-/// # Why MVS is gated over 2 trees, not 3 — a PRE-EXISTING CPU-side gap
-///
-/// Generating this bias-0 family exposed a real upstream-parity gap in the CPU MVS
-/// sampler that no committed fixture covered. It is NOT introduced by the WR-01
-/// device work: the CPU grow path is byte-unchanged this phase (the device branch is
-/// inert under `CpuBackend`), and it reproduces with the device untouched.
-///
-/// Measured on this dataset, `subsample = 0.8`, 3 iterations, comparing our CPU fit
-/// against freshly generated upstream 1.2.10 fixtures — each run using its OWN
-/// model's quantization borders (borders are NOT stable across configurations, so a
-/// shared-border comparison is invalid and was discarded):
-///
-/// | `boost_from_average` | seeds matching upstream on all 3 trees |
-/// |---|---|
-/// | `true`  (the committed `bootstrap/` family) | 3 / 5 (seeds 0, 2, 3) |
-/// | `false` (this bias-0 family)                | 0 / 5 |
-///
-/// In EVERY failing case the first divergent split is at flat index 4 or 5 — i.e.
-/// **tree 2**, never trees 0 or 1. Trees 0 and 1 agree with upstream to ~5e-9, and
-/// the carried MVS λ feeding tree 2 agrees to ~3e-9, so the λ formula itself
-/// (`last_iter_mean_leaf_value`) is not the defect; the divergence enters when tree
-/// 2's sample is drawn from that λ.
-///
-/// The committed `bootstrap/mvs` oracle (seed 0, `boost_from_average=True`) happens
-/// to be one of the passing configurations, which is why the gap went unnoticed.
-///
-/// Gating trees 0–1 keeps a REAL upstream claim for MVS and still catches a
-/// regression in the sampler's first two trees, without asserting a third tree we
-/// know does not hold. Device-vs-CPU MVS parity is separately locked at ≤1e-5
-/// (measured ~4.7e-11) by `device_bootstrap_parity_test`, so the DEVICE half of
-/// WR-01 is unaffected by this CPU-side gap. Raise this to 3 once the MVS tree-2
-/// sampling gap is fixed.
-const MVS_GATED_TREES: usize = 2;
 
 /// Gate one trained model + staged approximant against the upstream fixture at
 /// the ≤1e-5 bar (`compare_stage`'s tolerance).
 ///
-/// `gated_trees` bounds how many leading trees are compared. It exists ONLY for the
-/// MVS carve-out documented on [`MVS_GATED_TREES`]; every other scenario passes the
-/// full tree count and is gated end to end.
 fn gate_against_upstream(
     who: &str,
     scenario: &str,
     model: &cb_train::Model,
     staged: &[f64],
-    gated_trees: usize,
 ) {
     let dir = format!("bootstrap_dev/{scenario}");
     let model_json = load_model_json(&fixture(&format!("{dir}/model.json")))
         .unwrap_or_else(|e| panic!("{dir}/model.json must load: {e:?}"));
 
     let n_trees = model.oblivious_trees.len();
-    assert!(
-        gated_trees <= n_trees,
-        "[{who}] {dir}: cannot gate {gated_trees} trees out of {n_trees}"
-    );
-    // Trees are flat-concatenated per stage: `depth` splits and `2^depth` leaf values
-    // each, and one `n_rows` block per staged iteration. Truncate all three
-    // consistently so a reduced gate compares the SAME leading trees everywhere.
-    let depth = 2usize;
-    let n_rows = 1500usize;
-    let split_end = gated_trees * depth;
-    let leaf_end = gated_trees * (1usize << depth);
-    let staged_end = gated_trees * n_rows;
 
     let up_splits = model_json.split_borders();
     let our_splits = model.split_borders();
-    compare_stage(Stage::Splits, &up_splits[..split_end], &our_splits[..split_end])
+    compare_stage(Stage::Splits, &up_splits, &our_splits)
         .unwrap_or_else(|e| panic!("[{who}] {dir}: splits diverged from upstream: {e:?}"));
 
     let up_leaves = model_json.leaf_values();
     let our_leaves = model.leaf_values();
-    compare_stage(Stage::LeafValues, &up_leaves[..leaf_end], &our_leaves[..leaf_end])
+    compare_stage(Stage::LeafValues, &up_leaves, &our_leaves)
         .unwrap_or_else(|e| panic!("[{who}] {dir}: leaf values diverged from upstream: {e:?}"));
 
     let expected_staged = load_f64_vec(&fixture(&format!("{dir}/staged.npy"))).unwrap();
-    compare_stage(
-        Stage::StagedApprox,
-        &expected_staged[..staged_end],
-        &staged[..staged_end],
-    )
+    compare_stage(Stage::StagedApprox, &expected_staged, staged)
     .unwrap_or_else(|e| panic!("[{who}] {dir}: staged approx diverged from upstream: {e:?}"));
 
     // The fixture must be a bias-0 fit — this is the property that makes the family
@@ -215,7 +160,7 @@ fn gate_against_upstream(
     );
     println!(
         "[{who}] {dir}: splits + leaf values + staged within 1e-5 of upstream \
-         over {gated_trees}/{n_trees} trees"
+         over all {n_trees} trees"
     );
 }
 
@@ -230,12 +175,7 @@ fn bootstrap_dev_cpu_matches_upstream() {
 
     let columns = load_feature_columns();
     let target = load_target();
-    // The fully-gated scenarios, then MVS over its reduced tree range.
-    let all = SCENARIOS
-        .iter()
-        .map(|&s| (s, 3usize))
-        .chain(std::iter::once((MVS_SCENARIO, MVS_GATED_TREES)));
-    for ((scenario, bt, subsample, temp), gated) in all {
+    for &(scenario, bt, subsample, temp) in SCENARIOS {
         let model_json =
             load_model_json(&fixture(&format!("bootstrap_dev/{scenario}/model.json"))).unwrap();
         let borders = model_json.float_feature_borders();
@@ -250,7 +190,7 @@ fn bootstrap_dev_cpu_matches_upstream() {
             Some(&mut staged),
         )
         .unwrap_or_else(|e| panic!("bootstrap_dev/{scenario}: CPU training failed: {e:?}"));
-        gate_against_upstream("cpu", scenario, &model, &staged, gated);
+        gate_against_upstream("cpu", scenario, &model, &staged);
     }
 }
 
@@ -341,11 +281,7 @@ fn bootstrap_dev_device_matches_upstream() {
 
     let columns = load_feature_columns();
     let target = load_target();
-    let all = SCENARIOS
-        .iter()
-        .map(|&s| (s, 3usize))
-        .chain(std::iter::once((MVS_SCENARIO, MVS_GATED_TREES)));
-    for ((scenario, bt, subsample, temp), gated) in all {
+    for &(scenario, bt, subsample, temp) in SCENARIOS {
         let model_json =
             load_model_json(&fixture(&format!("bootstrap_dev/{scenario}/model.json"))).unwrap();
         let borders = model_json.float_feature_borders();
@@ -377,6 +313,6 @@ fn bootstrap_dev_device_matches_upstream() {
             gpu.sampled_trees.get()
         );
 
-        gate_against_upstream("device", scenario, &model, &staged, gated);
+        gate_against_upstream("device", scenario, &model, &staged);
     }
 }

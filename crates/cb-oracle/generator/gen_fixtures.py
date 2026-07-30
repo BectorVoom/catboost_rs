@@ -64,6 +64,11 @@ BOOTSTRAP = FIXTURES / "bootstrap"
 # the scenarios reachable by the device grower (its CR-01 gate requires a zero
 # starting approx). The committed `bootstrap/` family stays byte-untouched.
 BOOTSTRAP_DEV = FIXTURES / "bootstrap_dev"
+# MVS multi-seed x bias family (mvs-tree2-parity, MVS-S3). The single committed MVS
+# scenario passed DESPITE a 2-draw-per-tree sampler defect, so this family exists to
+# make that class of regression impossible to hide: >=5 seeds x both
+# `boost_from_average` settings, each gated at <=1e-5 over all 3 trees.
+MVS_SEEDS = FIXTURES / "mvs_seeds"
 BOOTSTRAP_INPUT = INPUTS / "bootstrap_multiblock"
 REGULARIZATION = FIXTURES / "regularization"
 OVERFIT = FIXTURES / "overfit"
@@ -946,6 +951,104 @@ def gen_bootstrap_dev() -> None:
         with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
             json.dump(config, fh, indent=2, sort_keys=True)
             fh.write("\n")
+
+
+def gen_mvs_seeds() -> None:
+    """mvs_seeds/s{seed}_bfa{0,1}/ — the MVS multi-seed x bias upstream oracle
+    (mvs-tree2-parity, MVS-S3).
+
+    WHY THIS EXISTS. `bootstrap/mvs` pins exactly one configuration
+    (`random_seed=0`, `boost_from_average=True`). A defect that made the CPU MVS
+    sampler consume two extra RNG draws per tree -- shifting the sampled subset of
+    every tree from the first onward -- left that one configuration GREEN while
+    breaking 7 of 10 seed/bias combinations, because a wrong subset only shows up
+    when it actually flips a split argmax. One scenario cannot discriminate; this
+    family can.
+
+    Everything except `random_seed` and `boost_from_average` is pinned to the
+    `bootstrap_dev` values, so a divergence is attributable to the sampler.
+
+    BORDERS ARE PER-SCENARIO. CatBoost's quantization borders are NOT stable across
+    configurations (they were observed to move with `subsample` on identical data),
+    so each scenario ships its own `model.json` and the oracle MUST read that
+    scenario's own `float_feature_borders()`. A shared border set silently
+    invalidates the whole comparison.
+
+    Reuses the frozen `inputs/bootstrap_multiblock/` dataset -- loaded, never
+    rewritten. Reachable ONLY through `--mvs-seeds-only`; `main()` never calls it, so
+    no committed fixture outside `mvs_seeds/` can be touched."""
+    MVS_SEEDS.mkdir(parents=True, exist_ok=True)
+
+    x = _assert_f64(np.load(BOOTSTRAP_INPUT / "X.npy", allow_pickle=False), "mvs_seeds X")
+    y = _assert_f64(np.load(BOOTSTRAP_INPUT / "y.npy", allow_pickle=False), "mvs_seeds y")
+
+    # Every knob catboost's raw dict API defaults differently from the Rust builder is
+    # pinned EXPLICITLY here (random_strength=0 above all), on BOTH sides, so a silent
+    # default drift cannot masquerade as a sampler bug.
+    shared = {k: v for k, v in ISOLATING_PARAMS.items() if k != "bootstrap_type"}
+    shared = {**shared, "iterations": 3, "bootstrap_type": "MVS", "subsample": 0.8}
+
+    for seed in (0, 1, 2, 3, 4):
+        for bfa in (False, True):
+            name = f"s{seed}_bfa{int(bfa)}"
+            d = MVS_SEEDS / name
+            d.mkdir(parents=True, exist_ok=True)
+            params = {**shared, "random_seed": seed, "boost_from_average": bfa}
+
+            model = CatBoostRegressor(**params)
+            model.fit(x, y)
+            model.save_model(str(d / "model.json"), format="json")
+
+            staged = [np.asarray(p, dtype=np.float64) for p in model.staged_predict(x)]
+            staged_flat = _assert_f64(
+                np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+            )
+            np.save(d / "staged.npy", staged_flat, allow_pickle=False)
+            predictions = _assert_f64(
+                np.asarray(model.predict(x), dtype=np.float64), "predictions"
+            )
+            np.save(d / "predictions.npy", predictions, allow_pickle=False)
+
+            with (d / "config.json").open("w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "scenario": f"mvs_seeds/{name}",
+                        "seed": seed,
+                        "catboost_version": CATBOOST_VERSION,
+                        "thread_count": 1,
+                        "input_dataset": "bootstrap_multiblock",
+                        "loss_function": "RMSE",
+                        "bootstrap_type": "MVS",
+                        "subsample": 0.8,
+                        "boost_from_average": bfa,
+                        "params": params,
+                        "n_rows": int(x.shape[0]),
+                        "n_features": int(x.shape[1]),
+                        "n_iterations": len(staged),
+                        "stages": ["Splits", "LeafValues", "StagedApprox"],
+                        "purpose": (
+                            "MVS-S3 discriminating family. One MVS scenario is not enough: "
+                            "a 2-draw-per-tree sampler defect kept bootstrap/mvs green while "
+                            "breaking 7 of 10 seed/bias combinations."
+                        ),
+                        "borders_note": (
+                            "Read THIS scenario's float_feature_borders(); CatBoost "
+                            "quantization borders are not stable across configurations."
+                        ),
+                    },
+                    fh,
+                    indent=2,
+                    sort_keys=True,
+                )
+                fh.write("\n")
+
+
+def gen_mvs_seeds_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the `mvs_seeds/` family, leaving every
+    other committed fixture -- notably the frozen `bootstrap/`, `bootstrap_dev/` and
+    `inputs/` roots -- untouched."""
+    gen_mvs_seeds()
+    print("Wrote MVS multi-seed x bias oracle fixtures (5 seeds x 2 bias settings)")
 
 
 def gen_bootstrap_dev_only() -> None:
@@ -3371,6 +3474,10 @@ if __name__ == "__main__":
         # (multilogloss / multicrossentropy), leaving every committed
         # Phase 2-5 / 6.1 / 6.2-03 fixture untouched.
         gen_multilabel_only()
+    elif "--mvs-seeds-only" in sys.argv:
+        # `--mvs-seeds-only` regenerates ONLY the MVS-S3 multi-seed x bias family,
+        # leaving every other committed fixture untouched.
+        gen_mvs_seeds_only()
     elif "--bootstrap-dev-only" in sys.argv:
         # `--bootstrap-dev-only` regenerates ONLY the WR-01 bias-0 `bootstrap_dev/`
         # family, leaving the frozen `bootstrap/` family and every other committed
