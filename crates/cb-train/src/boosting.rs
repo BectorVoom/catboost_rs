@@ -27,9 +27,9 @@
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, is_pairwise_scoring,
     logcosh_exact_leaf_delta, newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg,
-    score_st_dev, simple_leaf_delta, solve_symmetric_newton, Derivatives, DeviceGrowPolicy,
-    DeviceTrainConfig, GroupSpan, LeafMethod, Loss, Runtime, RankingCompetitor, QUANTILE_ALPHA,
-    QUANTILE_DELTA,
+    score_st_dev, simple_leaf_delta, solve_symmetric_newton, DeviceBootstrapType, Derivatives,
+    DeviceGrowPolicy, DeviceTrainConfig, GroupSpan, LeafMethod, Loss, Runtime, RankingCompetitor,
+    QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 use cb_data::Pair;
@@ -39,6 +39,7 @@ use crate::autolr::{self, TargetType};
 use crate::query_info::{build_query_info, QueryInfo};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::ctr::bake::{bake_ctr_table, BakedCtrData};
+use crate::device_draw_replay::replay_grow_draws;
 use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
@@ -3070,7 +3071,20 @@ fn train_inner<R: Runtime>(
         && approx_dimension == 1
         && !is_multiclass
         && !is_multilabel
-        && matches!(params.bootstrap_type, EBootstrapType::No)
+        // WR-01 (`WR01-S9`): the three parity-target bootstrap types are now device-eligible
+        // via HOST sampling (Design A — `bootstrap()` runs here, only the per-object
+        // multiplier crosses the seam). They are admitted ONLY for the oblivious
+        // (SymmetricTree) grow: the non-symmetric / Region / CTR / exact-leaf × sampling
+        // combinations are out of scope this phase and the backend session declines them
+        // explicitly rather than dropping the sample. Poisson is NOT admitted — it has no
+        // CPU-semantics parity target (upstream CatBoost rejects it on CPU while its GPU
+        // trains it), so it stays a uniform up-front rejection on every backend
+        // (`WR01-S16`).
+        && (matches!(params.bootstrap_type, EBootstrapType::No)
+            || (matches!(
+                params.bootstrap_type,
+                EBootstrapType::Bayesian | EBootstrapType::Bernoulli | EBootstrapType::Mvs
+            ) && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
         && params.random_strength == 0.0
         && eval_sets.is_empty()
         && matrix.n_features() > 0
@@ -3140,22 +3154,30 @@ fn train_inner<R: Runtime>(
             None
         },
         min_data_in_leaf: params.min_data_in_leaf,
-        // WR-01 (NOT YET WIRED — test-only / pending Kaggle CUDA sign-off): the
-        // remaining device family knobs — `bootstrap_type`, `mvs_lambda`,
-        // `exact_leaf`, `ctr`, `sample_rate`, `rng_seed` — are DELIBERATELY left at
-        // their `DeviceTrainConfig::default()` (No bootstrap, no MVS, no exact leaf,
-        // no CTR, sample_rate 1.0). The Plan-05/06/07/08 session apparatus
-        // (`ExactLeafState`/`compute_exact_leaf_values`, `BootstrapState` +
-        // `launch_bootstrap_weights_resident`, `MvsState` +
-        // `launch_mvs_weights_resident`, `build_ctr_cindex_columns`, and
-        // `device_score_stddev`) is validated ONLY by its `#[cfg(test)]`
-        // self-oracles this phase; end-to-end wiring from `train()` is a later plan.
-        // `device_host_eligible` above ALSO independently excludes any pool that
-        // would need these arms (bootstrap != No, random_strength != 0, non
-        // Gradient/Simple leaf method), so a real fit can never silently reach an
-        // unwired arm — it falls back to the CPU grower instead. Do NOT assume these
-        // features are active on the device `train()` path until this default is
-        // replaced with `params`-threaded values and the eligibility gate relaxed.
+        // ─── WR-01 WIRED: the bootstrap family knobs ────────────────────────────────
+        // `bootstrap_type` is now threaded from `params` and `sample_from_host` declares
+        // that the HOST computes the per-tree sample (Design A / `[DECISION D4]`). The two
+        // fields travel together: the backend session reads `sample_from_host` to decide
+        // that it must NOT open its own device-resident sampler, and reads
+        // `bootstrap_type` only as bookkeeping describing WHICH host sampler ran. Poisson
+        // never reaches here (rejected up front on every backend, `WR01-S16`).
+        bootstrap_type: match params.bootstrap_type {
+            EBootstrapType::Bayesian => DeviceBootstrapType::Bayesian,
+            EBootstrapType::Bernoulli => DeviceBootstrapType::Bernoulli,
+            EBootstrapType::Mvs => DeviceBootstrapType::Mvs,
+            // `No` and (unreachable) Poisson keep the no-subsampling covered default.
+            _ => DeviceBootstrapType::No,
+        },
+        sample_from_host: !matches!(params.bootstrap_type, EBootstrapType::No),
+        // STILL NOT WIRED (deliberately, at `DeviceTrainConfig::default()`):
+        // `mvs_lambda`, `sample_rate` and `rng_seed` are the DEVICE-RESIDENT sampler's
+        // inputs, and Design A never opens that sampler — λ, the subsample rate and the
+        // RNG stream all live host-side inside `bootstrap()` above, which is the
+        // ≤1e-5-verified sampler and the reason upstream parity is reachable. Setting
+        // them here would be inert at best and, for `mvs_lambda`, actively misleading.
+        // `exact_leaf` / `ctr` likewise stay default: exact-leaf × sampling and CTR ×
+        // sampling are out of scope (SPEC §2) and the session declines both combinations.
+        // Design B′ (device-resident sampling) is the perf follow-up that would wire them.
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
@@ -3195,8 +3217,85 @@ fn train_inner<R: Runtime>(
         // it, so it is not a dead binding.
         if device_active {
             let _ = iter;
+
+            // ─── WR-01: PER-TREE HOST BOOTSTRAP (Design A) ───────────────────────────
+            // The device branch keeps the ENTIRE sampler on the host: `bootstrap()` is the
+            // ≤1e-5-verified CPU sampler and the sole source of `sample_weights`/`control`,
+            // so reusing it (rather than the device-resident draw) is what makes upstream
+            // parity reachable at all. Only the resulting per-object multiplier crosses the
+            // seam. The draw ORDER here is IDENTICAL to the CPU branch's — `PRE_TREE_DRAWS`
+            // → `bootstrap()` → the level-search draws (replayed after the grow below) →
+            // `POST_TREE_EXTRA_DRAWS` — because tree `k+1`'s sample is drawn from the phase
+            // tree `k` left behind, so any miscount silently changes every later tree's
+            // sample (`WR01-S7`).
+            let device_sample: Vec<f64> = if draws_active {
+                // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211).
+                for _ in 0..PRE_TREE_DRAWS {
+                    rng.gen_rand();
+                }
+                // `bootstrap()` takes the OBJECT COUNT from `derivatives.len()`, so this
+                // vector's LENGTH is load-bearing for every arm even when its VALUES are
+                // not: a short vector silently yields an empty sample (⇒ the multiplier
+                // defaults to 1.0 everywhere AND the arm consumes no draws, desynchronising
+                // the stream). It must always be length `n`.
+                //
+                // MVS is the only arm that reads the VALUES (its threshold is a function of
+                // `|der|`), so the gradient round-trip is paid only when MVS is selected —
+                // Bayesian reads just `n` (`generate_random_weights`) and Bernoulli just `n`
+                // (`set_sampled_control`), so a zero-filled vector is exactly equivalent for
+                // them and keeps the hot device path free of an extra n-length pass.
+                //
+                // At `approx_dimension == 1` with the unit weights the gate requires, the
+                // CPU's `der_obj[i] = sqrt(Σ_d weighted_der1²)` collapses to `|der1[i]|`.
+                let der_obj: Vec<f64> = if matches!(params.bootstrap_type, EBootstrapType::Mvs) {
+                    let ders =
+                        runtime.compute_gradients(&params.loss, &approx, target, approx_dimension)?;
+                    (0..n)
+                        .map(|i| ders.der1.get(i).copied().unwrap_or(0.0).abs())
+                        .collect()
+                } else {
+                    vec![0.0_f64; n]
+                };
+                // 1b. The ONE per-tree `bootstrap()` call on the continuous stream.
+                // `prev_leaf_mean_l2` is this fit's carried MVS λ input (`WR01-S8`) — it is
+                // `None` on the first tree and the previous tree's mean leaf L2 norm after.
+                let sampled = bootstrap(
+                    params.bootstrap_type,
+                    &der_obj,
+                    params.subsample,
+                    params.bagging_temperature,
+                    prev_leaf_mean_l2,
+                    &mut rng,
+                )?;
+                // The per-object SPLIT-SCORING multiplier (`WR01-S6`): exactly the CPU
+                // branch's `control[i] ? sample_weights[i] : 0.0`. A zeroed entry excludes
+                // the object from the split histogram, which is how a `control == false`
+                // object drops out of upstream's `sampledDocs`. Leaf estimation on the
+                // device consumes the UNSAMPLED channels, mirroring the CPU split.
+                (0..n)
+                    .map(|i| {
+                        let sw = sampled.sample_weights.get(i).copied().unwrap_or(1.0);
+                        let c = sampled.control.get(i).copied().unwrap_or(true);
+                        if c {
+                            sw
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            } else {
+                // `bootstrap_type == No` and `random_strength == 0`: no sampling, no draws.
+                // An EMPTY sample keeps the device grow byte-identical to the pre-WR-01
+                // path (`WR01-S3`, D-04).
+                Vec::new()
+            };
+
+            // The stored (learning-rate-scaled) leaf values of THIS tree, captured by the
+            // fold arms below so the MVS λ carry after them has something to read.
+            let mut device_stored_leaf_values: Vec<f64> = Vec::new();
+
             let dev_tree = runtime
-                .grow_tree_on_device(&approx, target)?
+                .grow_tree_on_device(&approx, target, &device_sample)?
                 .ok_or_else(|| {
                     // `begin` returned Ok(true): the whole fit is committed to the
                     // device grower (D-10-01). Folding a CPU-grown tree here would MIX
@@ -3298,6 +3397,10 @@ fn train_inner<R: Runtime>(
                     region_n_leaves,
                     /* approx_dimension = */ 1,
                 );
+                // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
+                // per-tree MVS λ carry after the fold arms can compute this tree's mean
+                // leaf L2 norm, exactly as the CPU branch does.
+                device_stored_leaf_values.clone_from(&device_leaf_values);
 
                 for (i, &leaf) in device_leaf_of.iter().enumerate() {
                     if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
@@ -3381,6 +3484,10 @@ fn train_inner<R: Runtime>(
                     n_leaves,
                     /* approx_dimension = */ 1,
                 );
+                // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
+                // per-tree MVS λ carry after the fold arms can compute this tree's mean
+                // leaf L2 norm, exactly as the CPU branch does.
+                device_stored_leaf_values.clone_from(&device_leaf_values);
 
                 for (i, &leaf) in device_leaf_of.iter().enumerate() {
                     if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
@@ -3464,6 +3571,10 @@ fn train_inner<R: Runtime>(
                     nonsym_n_leaves,
                     /* approx_dimension = */ 1,
                 );
+                // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
+                // per-tree MVS λ carry after the fold arms can compute this tree's mean
+                // leaf L2 norm, exactly as the CPU branch does.
+                device_stored_leaf_values.clone_from(&device_leaf_values);
 
                 for (i, &leaf) in device_leaf_of.iter().enumerate() {
                     if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
@@ -3483,6 +3594,29 @@ fn train_inner<R: Runtime>(
                     leaf_weights: device_leaf_weights,
                 });
             }
+
+            // ─── WR-01: RESTORE THE RNG PHASE + CARRY THE MVS λ ──────────────────────
+            // The device grow skipped the CPU level search entirely, so the draws that
+            // search would have consumed must be replayed here — otherwise the NEXT tree's
+            // `bootstrap()` call above would read a different RNG phase than upstream and
+            // every tree from the second on would diverge (`WR01-S7`). The replay must land
+            // AFTER `bootstrap()` and BEFORE `POST_TREE_EXTRA_DRAWS` to reproduce the CPU
+            // branch's order exactly. `draws_active == false` keeps this a no-op, so the
+            // byte-unchanged `bootstrap_type = No` device path is untouched (D-04).
+            if draws_active {
+                replay_grow_draws(&mut rng, params.depth, matrix.n_features());
+                for _ in 0..POST_TREE_EXTRA_DRAWS {
+                    rng.gen_rand();
+                }
+            }
+
+            // MVS λ for the NEXT tree is THIS tree's mean leaf L2 norm
+            // (`CalculateLastIterMeanLeafValue`, mvs.cpp:21-35) over the stored,
+            // learning-rate-scaled leaf values — the same source and the same helper the
+            // CPU branch uses (`WR01-S8`). Carried unconditionally so the device branch's
+            // λ sequence matches the CPU branch's for every bootstrap type.
+            prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&device_stored_leaf_values));
+
             continue;
         }
 

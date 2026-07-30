@@ -159,6 +159,16 @@ def main():
     result["provenance"]["staged_source_has_rng_fix"] = bool(digits and int(digits[0]) > 0)
     log("staged_source_has_rng_fix:", result["provenance"]["staged_source_has_rng_fix"])
 
+    # Provenance marker 2: the LDS-privatized partition stat reduction. Without this the
+    # `No` row would be measuring the OLD naive-global-atomic kernel and any speed claim
+    # about the optimization would be false.
+    rc_m2, out_m2 = sh("grep -c 'partition_update_lds_kernel' "
+                       f"{REPO}/crates/cb-backend/src/kernels.rs || true")
+    d2 = [ln.strip() for ln in (out_m2 or "").splitlines() if ln.strip().isdigit()]
+    result["provenance"]["staged_source_has_lds_part_update"] = bool(d2 and int(d2[0]) > 0)
+    log("staged_source_has_lds_part_update:",
+        result["provenance"]["staged_source_has_lds_part_update"])
+
     # -----------------------------------------------------------------
     # STEP 3 — rust toolchain
     # -----------------------------------------------------------------

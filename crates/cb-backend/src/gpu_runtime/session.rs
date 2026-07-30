@@ -628,6 +628,75 @@ fn host_der1(der_kernel: DerBinaryKernel, approx: &[f64], target: &[f64]) -> Vec
         .collect()
 }
 
+/// The fixed-point histogram's accumulated-magnitude ceiling, `2^33` (WR-01 `WR01-S10`,
+/// finding F-D). The split histogram stores `round(Σ · 2^30)` as `i64` bits inside an
+/// `Atomic<u64>`, so the integer sum is exact only while `|Σ| · 2^30 < 2^63`, i.e.
+/// `|Σ| < 2^33 ≈ 8.6e9`. Beyond it the wrapping add SILENTLY sign-flips — no error, no
+/// saturation (`kernels.rs` `REDUCE_FIXEDPOINT_SCALE_F64` doc). There is no in-kernel guard
+/// (a `#[cube]` kernel cannot surface a typed error), so the check has to happen host-side.
+const FIXEDPOINT_SUM_CEILING: f64 = 8_589_934_592.0; // 2^33
+
+/// Reject a host bootstrap `sample` that would overflow the split histogram's fixed-point
+/// encode, BEFORE anything is uploaded or launched (WR-01 `WR01-S10`).
+///
+/// Two channels are checked with the conservative all-objects-in-one-bin bound
+/// `n · max|channel|`: the derivative channel `der1·s` and the weight channel `w·s`. The
+/// weight channel is the one that actually matters — MVS's `s = 1/prob` makes
+/// `w·s = threshold / sqrt(λ + der²)` unbounded as `λ → 0`, whereas the der channel is
+/// self-bounding (`|der·s| ≤ threshold`) and Bernoulli's `s ∈ {0,1}` is non-increasing.
+/// `w ≡ 1` in the WR-01 eligible regime (the gate requires unit weights), so the weight
+/// channel bound reduces to `n · max s`.
+///
+/// A non-finite or negative `s[i]` is also rejected: `NaN` would poison the whole
+/// histogram bin and a negative multiplier has no upstream meaning (`sample_weights` are
+/// magnitudes and `control` only ever zeroes them).
+///
+/// Returns [`CbError::OutOfRange`] naming the channel, the computed bound and the limit.
+/// This is deliberately an ERROR rather than a CPU fallback: the fit already committed to
+/// the device path (D-10-01 per-fit all-or-nothing), so falling back mid-run would mix
+/// device- and CPU-grown trees into one model.
+fn guard_sample_fixedpoint_range(sample: &[f64], der1: &[f64], n: usize) -> CbResult<()> {
+    let mut max_s = 0.0_f64;
+    let mut max_der_s = 0.0_f64;
+    for (i, &s) in sample.iter().enumerate() {
+        if !s.is_finite() || s < 0.0 {
+            return Err(CbError::OutOfRange(format!(
+                "host bootstrap sample[{i}] = {s} is not a finite non-negative multiplier; \
+                 a NaN/inf would poison every histogram bin it lands in and a negative \
+                 multiplier has no upstream meaning (WR01-S10)"
+            )));
+        }
+        if s > max_s {
+            max_s = s;
+        }
+        let d = der1.get(i).copied().unwrap_or(0.0).abs() * s;
+        if d > max_der_s {
+            max_der_s = d;
+        }
+    }
+    let nf = n as f64;
+    // Weight channel: `w · s` with `w ≡ 1` in the eligible regime.
+    if nf * max_s >= FIXEDPOINT_SUM_CEILING {
+        return Err(CbError::OutOfRange(format!(
+            "host bootstrap sample would overflow the fixed-point split histogram on the \
+             WEIGHT channel: n * max(w*s) = {n} * {max_s} = {} >= 2^33 = {FIXEDPOINT_SUM_CEILING} \
+             (the Atomic<u64> k=30 accumulator silently sign-flips beyond this; WR01-S10)",
+            nf * max_s,
+        )));
+    }
+    // Derivative channel: `der1 · s`.
+    if nf * max_der_s >= FIXEDPOINT_SUM_CEILING {
+        return Err(CbError::OutOfRange(format!(
+            "host bootstrap sample would overflow the fixed-point split histogram on the \
+             DERIVATIVE channel: n * max|der1*s| = {n} * {max_der_s} = {} >= 2^33 = \
+             {FIXEDPOINT_SUM_CEILING} (the Atomic<u64> k=30 accumulator silently sign-flips \
+             beyond this; WR01-S10)",
+            nf * max_der_s,
+        )));
+    }
+    Ok(())
+}
+
 /// The per-fit device-resident training session (GPUT-02): one client + the persistent
 /// device handles + the frozen per-fit configuration. Constructed by [`Self::begin`] only
 /// when the coverage gate passes; dropped (client + handles freed) at end of fit.
@@ -1018,7 +1087,20 @@ impl GpuTrainSession {
         // draw family for Bernoulli/Bayesian/Poisson (flipped ON this plan), the covered non-draw
         // default for `No`, or a decline for MVS (Plan 07). Only reachable on the oblivious path
         // (the nonsym `family_default` below still requires `bootstrap_type == No`).
-        let bootstrap_arm = map_bootstrap_kernel(config.bootstrap_type);
+        // WR-01 (`WR01-S5`, `[DECISION D4]`): host sampling and device-resident sampling are
+        // MUTUALLY EXCLUSIVE. When the caller declares `sample_from_host`, the per-tree sample
+        // arrives through `grow_one`'s `sample` argument and this session must NOT open its own
+        // `BootstrapState` / `MvsState` — otherwise the tree would be sampled TWICE (once by the
+        // host multiplier, once by the device draw). Forcing the arm to `NoDraw` here is what
+        // makes that structurally impossible: every downstream construction of the resident
+        // sampler states below keys off `bootstrap_arm`, so a single decision point covers them
+        // all. `config.bootstrap_type` is still carried, but purely as bookkeeping describing
+        // WHICH host sampler ran.
+        let bootstrap_arm = if config.sample_from_host {
+            BootstrapArm::NoDraw
+        } else {
+            map_bootstrap_kernel(config.bootstrap_type)
+        };
 
         match nonsym_policy {
             None if region_active => {
@@ -1030,7 +1112,12 @@ impl GpuTrainSession {
                     && config.mvs_lambda.is_none()
                     && !config.exact_leaf
                     && config.ctr.is_none()
-                    && config.max_leaves.is_none();
+                    && config.max_leaves.is_none()
+                    // WR-01: Region × sampling is OUT of scope (SPEC §2). Without this the
+                    // Region arm would accept `sample_from_host` + `bootstrap_type == No` and
+                    // then DROP the sample (the Region grow path ignores it) — a silent
+                    // wrong-answer. Decline to the CPU grower instead.
+                    && !config.sample_from_host;
                 if !family_default {
                     return Ok(None);
                 }
@@ -1080,12 +1167,35 @@ impl GpuTrainSession {
                     && matches!(bootstrap_arm, BootstrapArm::NoDraw)
                     && !config.exact_leaf
                     && config.mvs_lambda.is_none()
+                    && config.max_leaves.is_none()
+                    // WR-01: CTR × host-sampling is OUT of scope (SPEC §2). Excluded here so a
+                    // host sample can never be silently applied to a CTR fit — `bootstrap_arm`
+                    // is forced to `NoDraw` under host sampling, which would otherwise let such
+                    // a config ride the CTR arm.
+                    && !config.sample_from_host;
+                // WR-01 (`WR01-S9`): the HOST-SAMPLED oblivious regime. Covered when the caller
+                // declares `sample_from_host` for one of the three parity-target bootstrap types
+                // and every OTHER family flag is the covered default. `mvs_lambda` is deliberately
+                // NOT required (and NOT forbidden): under host sampling λ lives on the host inside
+                // `cb_train::bootstrap`, so the device-side field is inert bookkeeping.
+                // Poisson is absent BY DESIGN — it has no CPU-semantics parity target and is
+                // rejected up front on every backend (SPEC §8 / `WR01-S16`).
+                let host_sample_covered = config.sample_from_host
+                    && matches!(
+                        config.bootstrap_type,
+                        DeviceBootstrapType::Bayesian
+                            | DeviceBootstrapType::Bernoulli
+                            | DeviceBootstrapType::Mvs
+                    )
+                    && !config.exact_leaf
+                    && config.ctr.is_none()
                     && config.max_leaves.is_none();
                 if !config.is_covered_regime()
                     && !exact_covered
                     && !bootstrap_covered
                     && !ctr_is_covered
                     && !mvs_covered
+                    && !host_sample_covered
                 {
                     return Ok(None);
                 }
@@ -1098,7 +1208,11 @@ impl GpuTrainSession {
                 let family_default = config.bootstrap_type == DeviceBootstrapType::No
                     && config.mvs_lambda.is_none()
                     && !config.exact_leaf
-                    && config.ctr.is_none();
+                    && config.ctr.is_none()
+                    // WR-01: non-symmetric (Depthwise / Lossguide) × sampling is OUT of scope
+                    // (SPEC §2). Same silent-drop hazard as the Region arm above — the nonsym
+                    // grow path ignores the sample, so decline rather than grow unsampled.
+                    && !config.sample_from_host;
                 if !family_default {
                     return Ok(None);
                 }
@@ -1205,7 +1319,11 @@ impl GpuTrainSession {
             && bootstrap_arm == BootstrapArm::NoDraw
             && !config.exact_leaf
             && config.mvs_lambda.is_none()
-            && config.max_leaves.is_none();
+            && config.max_leaves.is_none()
+            // WR-01: mirrors the gate's CTR arm — host sampling forces `bootstrap_arm` to
+            // `NoDraw`, so without this the augmented-CTR bins would be built for a config the
+            // gate already declined. Keep the two conditions in lockstep.
+            && !config.sample_from_host;
         // Round-3 perf: the non-CTR path BORROWS the caller's bins (no n*n_features-cell
         // copy on the hot begin path); only the CTR arm materializes an augmented owned
         // buffer. `Cow` keeps both arms feeding the SAME pack below.
@@ -1407,13 +1525,47 @@ impl GpuTrainSession {
     /// a prior call surfaces a typed [`CbError`]. The resident approx is authoritative for the
     /// device pass (in the covered Plain/fold=1/from-zero regime it tracks the caller's approx
     /// exactly). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
-    pub fn grow_one(&mut self, approx: &[f64], target: &[f64]) -> CbResult<DeviceGrownTree> {
+    pub fn grow_one(
+        &mut self,
+        approx: &[f64],
+        target: &[f64],
+        sample: &[f64],
+    ) -> CbResult<DeviceGrownTree> {
         if target.len() != self.n {
             return Err(CbError::LengthMismatch {
                 column: "target".to_owned(),
                 expected: self.n,
                 actual: target.len(),
             });
+        }
+
+        // WR-01 (`WR01-S4`/`WR01-S5`): validate the host sample BEFORE any launch. The two
+        // sampling mechanisms are mutually exclusive and the length is checked, never
+        // truncated — a short `sample` would silently leave the tail of the pool unsampled,
+        // which is precisely the class of wrong-answer this phase must not ship.
+        if !sample.is_empty() {
+            if !self.config.sample_from_host {
+                return Err(CbError::Degenerate(format!(
+                    "grow_one received a {}-element host bootstrap sample but the session was \
+                     opened with sample_from_host = false; host sampling and device-resident \
+                     sampling are mutually exclusive (WR01-S5)",
+                    sample.len(),
+                )));
+            }
+            if sample.len() != self.n {
+                return Err(CbError::LengthMismatch {
+                    column: "sample".to_owned(),
+                    expected: self.n,
+                    actual: sample.len(),
+                });
+            }
+        } else if self.config.sample_from_host {
+            return Err(CbError::Degenerate(
+                "grow_one received an EMPTY host bootstrap sample but the session was opened \
+                 with sample_from_host = true; the host must supply an n-length per-object \
+                 multiplier for every tree (WR01-S4)"
+                    .to_owned(),
+            ));
         }
 
         // Phase 12 Plan 04 (GPUT-18, D-03a): the REGION arm. The fit committed to a
@@ -1633,16 +1785,45 @@ impl GpuTrainSession {
         } else {
             None
         };
-        let tree_weight_h = match sample_h {
-            Some(s) => Some(fold_weights_resident(
-                &self.client,
-                &self.weight_h,
-                &s,
-                self.n,
-            )?),
+        // WR-01 (`WR01-S1`/`WR01-S2`, Design A): resolve the ONE effective per-object sample
+        // multiplier for this tree. Exactly one source can be active — the gate forces
+        // `bootstrap_arm = NoDraw` under `sample_from_host`, so `sample_h` is `None` on the host
+        // arm and the host `sample` is empty on the device-resident arm.
+        let effective_sample_h = match sample_h {
+            Some(s) => Some(s),
+            None if !sample.is_empty() => {
+                // Reject a sample that would overflow the histogram's fixed-point encode
+                // BEFORE uploading it (`WR01-S10`). The check needs host `der1`, which is the
+                // same value the resident `der1_h` holds — recomputed here from the caller's
+                // approx/target through the SAME `host_der1` helper the nonsym / region / exact
+                // arms use, so the two can never disagree.
+                guard_sample_fixedpoint_range(
+                    sample,
+                    &host_der1(self.der_kernel, approx, target),
+                    self.n,
+                )?;
+                Some(upload_channel_floats(&self.client, sample))
+            }
             None => None,
         };
-        let weight_ref = tree_weight_h.as_ref().unwrap_or(&self.weight_h);
+
+        // The SCORE channels (split histogram) consume the SAMPLED pair `(der1·s, weight·s)`;
+        // the LEAF channels keep the UNSAMPLED `(der1, weight)`. This mirrors the CPU reference
+        // exactly: the sample multiplies `score_weighted_der1` / `score_weights` for split
+        // scoring only, while `CalcLeafValues` reads the full un-sampled fold
+        // (`boosting.rs` score-vs-leaf channel split). With NO sample active both pairs are the
+        // SAME handles, so the grow is byte-unchanged (`WR01-S3`, D-04).
+        //
+        // NOTE this also corrects the device-RESIDENT sampler arm, which previously folded the
+        // sample into the single `weight_ref` handed to BOTH the histogram and the leaf reduce
+        // while leaving `der1` unsampled — wrong on both channels under any sampling.
+        let (score_der1_h, score_weight_h) = match effective_sample_h.as_ref() {
+            Some(s) => (
+                fold_weights_resident(&self.client, &der1_h, s, self.n)?,
+                fold_weights_resident(&self.client, &self.weight_h, s, self.n)?,
+            ),
+            None => (der1_h.clone(), self.weight_h.clone()),
+        };
 
         // Grow one tree over the resident handles; take ownership of the resident approx
         // (updated in place on device) and swap it back afterwards.
@@ -1651,7 +1832,9 @@ impl GpuTrainSession {
             &self.client,
             approx_h,
             &der1_h,
-            weight_ref,
+            &self.weight_h,
+            &score_der1_h,
+            &score_weight_h,
             &self.feat_offsets,
             &self.feat_shifts,
             &self.feat_masks,

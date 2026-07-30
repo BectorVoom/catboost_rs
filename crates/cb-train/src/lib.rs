@@ -19,6 +19,7 @@ mod boosting;
 pub mod calc_metrics;
 mod candidates;
 mod ctr;
+mod device_draw_replay;
 mod estimated;
 mod feature_selection;
 mod fold;

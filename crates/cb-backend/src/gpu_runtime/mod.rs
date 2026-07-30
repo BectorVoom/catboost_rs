@@ -3805,6 +3805,8 @@ pub(crate) fn grow_oblivious_tree_resident(
     approx_h: Handle,
     der1_h: &Handle,
     weight_h: &Handle,
+    score_der1_h: &Handle,
+    score_weight_h: &Handle,
     feat_offsets: &[u32],
     feat_shifts: &[u32],
     feat_masks: &[u32],
@@ -3881,8 +3883,13 @@ pub(crate) fn grow_oblivious_tree_resident(
         let filter_mask: u32 = if level == 0 { 0 } else { 1u32 << (level - 1) };
         let bin_sums = launch_partition_hist2_resident_into(
             client,
-            der1_h.clone(),
-            weight_h.clone(),
+            // WR-01 (`WR01-S1`): the SPLIT histogram consumes the SAMPLED stat pair.
+            // When no host sampling is active these are the same handles as
+            // `der1_h`/`weight_h`, so this fill is byte-unchanged (`WR01-S3`, D-04).
+            // The subtraction-trick parent chain below stays valid because EVERY
+            // level — root and filtered — fills from this SAME pair.
+            score_der1_h.clone(),
+            score_weight_h.clone(),
             cindex_words_h.clone(),
             offsets_h.clone(),
             shifts_h.clone(),
