@@ -59,6 +59,11 @@ CAT_HASH = FIXTURES / "cat_hash"
 CLASS_WEIGHTS = FIXTURES / "class_weights"
 LEAF_METHODS = FIXTURES / "leaf_methods"
 BOOTSTRAP = FIXTURES / "bootstrap"
+# WR-01 (device bootstrap parity): the BIAS-0 sibling of the `bootstrap/` family.
+# Identical in every respect except `boost_from_average=False`, which is what makes
+# the scenarios reachable by the device grower (its CR-01 gate requires a zero
+# starting approx). The committed `bootstrap/` family stays byte-untouched.
+BOOTSTRAP_DEV = FIXTURES / "bootstrap_dev"
 BOOTSTRAP_INPUT = INPUTS / "bootstrap_multiblock"
 REGULARIZATION = FIXTURES / "regularization"
 OVERFIT = FIXTURES / "overfit"
@@ -848,6 +853,107 @@ def gen_bootstrap() -> None:
         with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
             json.dump(config, fh, indent=2, sort_keys=True)
             fh.write("\n")
+
+
+def gen_bootstrap_dev() -> None:
+    """bootstrap_dev/{no,bayesian,bernoulli,mvs}/ — the WR-01 BIAS-0 sampling oracle.
+
+    Why a second family instead of reusing `bootstrap/`: the device oblivious
+    grower seeds its resident approx to zero, so a fit with a non-zero starting
+    bias (`boost_from_average=True`, which the committed `bootstrap/` family uses)
+    is excluded by the device eligibility gate and can never be device-grown. To
+    hold the device to a real UPSTREAM oracle -- not merely to the in-repo CPU
+    grower -- an upstream fixture family with `boost_from_average=False` is
+    required. Everything else (dataset, seed, iterations, depth, sampler params)
+    is deliberately identical to `bootstrap/`, so a diff between the two families
+    isolates the bias term alone.
+
+    The committed `bootstrap/` fixtures are NOT touched by this function: it is
+    reachable only through the `--bootstrap-dev-only` entrypoint, never `main()`.
+
+    Reuses the frozen `inputs/bootstrap_multiblock/` dataset (1500 objects >= 2
+    Bayesian reseed blocks of 1000), so no new input is synthesized here.
+
+    POISSON IS DELIBERATELY ABSENT, exactly as in `gen_bootstrap`: upstream
+    rejects `bootstrap_type=Poisson` on CPU, so no Python oracle exists for it."""
+    BOOTSTRAP_DEV.mkdir(parents=True, exist_ok=True)
+
+    # The frozen input this family shares with `bootstrap/`. Loaded, never rewritten.
+    x = np.load(BOOTSTRAP_INPUT / "X.npy", allow_pickle=False)
+    y = np.load(BOOTSTRAP_INPUT / "y.npy", allow_pickle=False)
+    x = _assert_f64(x, "bootstrap_dev X")
+    y = _assert_f64(y, "bootstrap_dev y")
+
+    scenarios = [
+        ("no", "No", {}),
+        ("bayesian", "Bayesian", {"bagging_temperature": 1.0}),
+        ("bernoulli", "Bernoulli", {"subsample": 0.8}),
+        ("mvs", "MVS", {"subsample": 0.8}),
+    ]
+
+    # Same isolating params as `gen_bootstrap` EXCEPT boost_from_average=False.
+    # Every knob catboost's raw dict API defaults differently from the Rust builder
+    # is pinned explicitly here (random_strength=0 in particular) so the two sides
+    # cannot silently disagree on a default.
+    shared = {k: v for k, v in ISOLATING_PARAMS.items() if k != "bootstrap_type"}
+    shared = {**shared, "iterations": 3, "boost_from_average": False}
+
+    for name, bt, extra in scenarios:
+        scenario_dir = BOOTSTRAP_DEV / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        params = {**shared, "bootstrap_type": bt, **extra}
+
+        model = CatBoostRegressor(**params)
+        model.fit(x, y)
+        model.save_model(str(scenario_dir / "model.json"), format="json")
+
+        staged = [np.asarray(p, dtype=np.float64) for p in model.staged_predict(x)]
+        staged_flat = _assert_f64(
+            np.concatenate([s.ravel() for s in staged]).astype(np.float64), "staged"
+        )
+        np.save(scenario_dir / "staged.npy", staged_flat, allow_pickle=False)
+
+        predictions = _assert_f64(
+            np.asarray(model.predict(x), dtype=np.float64), "predictions"
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+
+        config = {
+            "scenario": f"bootstrap_dev/{name}",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "input_dataset": "bootstrap_multiblock",
+            "loss_function": "RMSE",
+            "bootstrap_type": bt,
+            "boost_from_average": False,
+            "params": params,
+            "n_rows": int(x.shape[0]),
+            "n_features": int(x.shape[1]),
+            "n_iterations": len(staged),
+            "stages": ["Splits", "LeafValues", "StagedApprox", "Predictions"],
+            "staged_layout": (
+                "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations "
+                "stages (raw approximant)"
+            ),
+            "purpose": (
+                "WR-01 device bootstrap parity. Identical to bootstrap/{name} except "
+                "boost_from_average=False (bias 0), which is what makes the scenario "
+                "reachable by the device oblivious grower (CR-01 zero-approx gate). "
+                "Gates BOTH the CPU and the device path at <= 1e-5."
+            ),
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+
+def gen_bootstrap_dev_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the WR-01 `bootstrap_dev/` bias-0
+    family, leaving every other committed fixture -- in particular the frozen
+    `bootstrap/` family and `inputs/bootstrap_multiblock/` -- untouched."""
+    gen_bootstrap_dev()
+    print("Wrote WR-01 bias-0 bootstrap_dev fixtures (no/bayesian/bernoulli/mvs)")
 
 
 def gen_regularization() -> None:
@@ -3265,6 +3371,11 @@ if __name__ == "__main__":
         # (multilogloss / multicrossentropy), leaving every committed
         # Phase 2-5 / 6.1 / 6.2-03 fixture untouched.
         gen_multilabel_only()
+    elif "--bootstrap-dev-only" in sys.argv:
+        # `--bootstrap-dev-only` regenerates ONLY the WR-01 bias-0 `bootstrap_dev/`
+        # family, leaving the frozen `bootstrap/` family and every other committed
+        # fixture untouched.
+        gen_bootstrap_dev_only()
     elif "--multiquantile-only" in sys.argv:
         # `--multiquantile-only` regenerates ONLY the Plan 06.2-05 MultiQuantile
         # fixture (multiquantile), leaving every committed Phase 2-5 / 6.1 /

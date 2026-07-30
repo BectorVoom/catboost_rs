@@ -1104,6 +1104,20 @@ pub struct DeviceTrainConfig {
     pub quantile_delta: f64,
     /// The device CTR config; `Some(_)` declines in Plan 01 (Plan 08 fills + covers it).
     pub ctr: Option<DeviceCtrConfig>,
+    /// WR-01 (`[DECISION D4]`, `WR01-S5`/`WR01-S9`). `true` iff the HOST computes the
+    /// per-tree bootstrap sample and passes it through
+    /// [`Runtime::grow_tree_on_device`]'s `sample` argument.
+    ///
+    /// This is an EXPLICIT intent flag rather than an inference from "the config says
+    /// a bootstrap type but a sample arrived": it makes double-sampling (a host
+    /// multiplier AND a device-resident sampler applied to the same tree)
+    /// structurally impossible instead of merely unlikely. When `true`,
+    /// [`Self::bootstrap_type`] describes WHICH host sampler ran — for gate
+    /// bookkeeping and diagnostics only — and the backend session MUST NOT open its
+    /// device-resident bootstrap / MVS state.
+    ///
+    /// Default `false` (the byte-unchanged covered regime, D-04).
+    pub sample_from_host: bool,
 }
 
 impl Default for DeviceTrainConfig {
@@ -1120,6 +1134,7 @@ impl Default for DeviceTrainConfig {
             quantile_alpha: 0.5,
             quantile_delta: 1e-6,
             ctr: None,
+            sample_from_host: false,
         }
     }
 }
@@ -1137,6 +1152,12 @@ impl DeviceTrainConfig {
             && !self.exact_leaf
             && self.ctr.is_none()
             && self.max_leaves.is_none()
+            // WR-01 (`WR01-S5`): host sampling is NEVER part of the no-sampling
+            // covered regime. It has its own gate arm in the backend session, so an
+            // incoherent `sample_from_host = true` + `bootstrap_type = No` config
+            // declines to the CPU grower instead of silently riding this arm and
+            // growing with a sample the caller never meant to apply.
+            && !self.sample_from_host
     }
 }
 
@@ -1273,15 +1294,37 @@ pub trait Runtime {
     /// never a fabricated device result). The default implementation binds its
     /// parameters and returns `Ok(None)`.
     ///
+    /// # The `sample` argument (WR-01, `WR01-S4`)
+    ///
+    /// `sample` is the per-tree HOST-computed bootstrap multiplier, `s[i] =
+    /// control[i] ? sample_weights[i] : 0.0` from `cb_train::bootstrap::bootstrap`.
+    /// It is either
+    ///
+    /// - **length 0** — no host sampling this tree (the byte-unchanged covered
+    ///   regime, D-04); or
+    /// - **length `n`** — the per-object multiplier, which the backend folds into
+    ///   the SPLIT-SCORING stat channels ONLY. Leaf estimation stays on the
+    ///   UNSAMPLED derivatives / weights, mirroring the CPU reference where the
+    ///   sample multiplies `score_weighted_der1` / `score_weights` but never
+    ///   `CalcLeafValues`' inputs.
+    ///
+    /// Any other length is a caller bug and surfaces
+    /// [`cb_core::CbError::LengthMismatch`], never a silently truncated sample. A
+    /// non-empty `sample` is only honoured when the session was opened with
+    /// [`DeviceTrainConfig::sample_from_host`]; the two sampling mechanisms are
+    /// mutually exclusive (`WR01-S5`).
+    ///
     /// # Errors
-    /// Returns a [`cb_core::CbError`] if a backend override fails mid-grow. The
-    /// default implementation never errors.
+    /// Returns a [`cb_core::CbError`] if a backend override fails mid-grow, or if
+    /// `sample` is neither empty nor length `n`. The default implementation never
+    /// errors.
     fn grow_tree_on_device(
         &self,
         approx: &[f64],
         target: &[f64],
+        sample: &[f64],
     ) -> CbResult<Option<DeviceGrownTree>> {
-        let _ = (approx, target);
+        let _ = (approx, target, sample);
         Ok(None)
     }
 

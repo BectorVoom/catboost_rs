@@ -70,6 +70,7 @@ impl Runtime for DeviceMock {
         &self,
         _approx: &[f64],
         _target: &[f64],
+        _sample: &[f64],
     ) -> CbResult<Option<DeviceGrownTree>> {
         Ok(self.grow.clone())
     }

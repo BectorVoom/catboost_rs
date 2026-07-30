@@ -1,0 +1,36 @@
+{
+  "boost_from_average": false,
+  "bootstrap_type": "No",
+  "catboost_version": "1.2.10",
+  "input_dataset": "bootstrap_multiblock",
+  "loss_function": "RMSE",
+  "n_features": 4,
+  "n_iterations": 3,
+  "n_rows": 1500,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 2,
+    "iterations": 3,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "purpose": "WR-01 device bootstrap parity. Identical to bootstrap/{name} except boost_from_average=False (bias 0), which is what makes the scenario reachable by the device oblivious grower (CR-01 zero-approx gate). Gates BOTH the CPU and the device path at <= 1e-5.",
+  "scenario": "bootstrap_dev/no",
+  "seed": 0,
+  "staged_layout": "flat f64: stage 0 (n_rows), then stage 1, ... ; n_iterations stages (raw approximant)",
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox",
+    "Predictions"
+  ],
+  "thread_count": 1
+}

@@ -285,7 +285,7 @@ one principal cause.
 
 ### SPEC WR01-S1: The device split histogram consumes the SAMPLED stat pair
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `grow_oblivious_tree_resident` takes `score_der1_h`/`score_weight_h`; verified by `device_bootstrap_parity_test` (ROCm).
 - **Document state:** draft
 - **Principal failure reason:** the split histogram is filled from a stat pair
   other than `(der1·s, weight·s)`.
@@ -321,7 +321,7 @@ one principal cause.
 
 ### SPEC WR01-S2: The device leaf estimate consumes the UNSAMPLED stat pair
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — leaf reduce keeps the UNSAMPLED `(der1_h, weight_h)`; verified by the sampled-vs-CPU ≤1e-5 agreement (5.5e-11).
 - **Document state:** draft
 - **Principal failure reason:** leaf values are computed from sampled stats
   (currently both channels are wrong under sampling — the latent bug F/finding 10).
@@ -354,7 +354,7 @@ one principal cause.
 
 ### SPEC WR01-S3: An empty sample is byte-identical to today's grow (D-04)
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — empty sample ⇒ same handles; `sample_len == 0` asserted for every `No` fit.
 - **Document state:** draft
 - **Principal failure reason:** the refactor perturbs the `bootstrap_type = No`
   device path.
@@ -382,7 +382,7 @@ one principal cause.
 
 ### SPEC WR01-S4: The per-tree sample crosses the seam, length-validated
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `grow_tree_on_device(approx, target, sample)`; length validated, never truncated.
 - **Document state:** draft
 - **Principal failure reason:** a wrong-length or silently-ignored sample reaches
   the grow.
@@ -415,7 +415,7 @@ one principal cause.
 
 ### SPEC WR01-S5: Host sampling and device-resident sampling are mutually exclusive
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `sample_from_host` forces `bootstrap_arm = NoDraw`; both mismatch directions are typed errors.
 - **Document state:** draft
 - **Principal failure reason:** both samplers run, multiplying the sample twice.
 - **Scope:** `DeviceTrainConfig::sample_from_host` (new),
@@ -448,7 +448,7 @@ one principal cause.
 
 ### SPEC WR01-S6: The host builds the per-tree sample multiplier from `bootstrap()`
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — host multiplier `control[i] ? sample_weights[i] : 0.0` built from `bootstrap()`.
 - **Document state:** draft
 - **Principal failure reason:** the multiplier is not
   `control[i] ? sample_weights[i] : 0.0`.
@@ -482,7 +482,7 @@ one principal cause.
 
 ### SPEC WR01-S7: The device branch replays the CPU grow's RNG draws exactly
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `replay_grow_draws`; `device_draw_replay_test` matches the real grower’s `raw_state()` (5 shapes, border-less features, 4 consecutive trees).
 - **Document state:** draft
 - **Principal failure reason:** the RNG stream position after a device tree differs
   from after a CPU tree, so tree ≥ 1 samples differ.
@@ -519,7 +519,7 @@ one principal cause.
 
 ### SPEC WR01-S8: The device branch carries `prev_leaf_mean_l2` for MVS λ
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `prev_leaf_mean_l2` carried on the device branch from the stored lr-scaled leaves.
 - **Document state:** draft
 - **Principal failure reason:** MVS λ is frozen across trees, so every tree ≥ 1
   samples from the wrong distribution.
@@ -549,7 +549,7 @@ one principal cause.
 
 ### SPEC WR01-S9: The eligibility gate admits Bayesian / Bernoulli / MVS
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — gate admits {No, Bayesian, Bernoulli, Mvs} for SymmetricTree only.
 - **Document state:** draft
 - **Principal failure reason:** the wrong set of bootstrap types reaches (or fails
   to reach) the device.
@@ -586,7 +586,7 @@ one principal cause.
 
 ### SPEC WR01-S10: The sampled score channels satisfy the fixed-point range precondition
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `guard_sample_fixedpoint_range` rejects non-finite/negative `s` and the `n·max|·| >= 2^33` bound on both channels.
 - **Document state:** draft
 - **Principal failure reason:** a sampled contribution overflows the `2^30`
   fixed-point encode and the histogram silently sign-flips (F-D).
@@ -623,7 +623,7 @@ one principal cause.
 
 ### SPEC WR01-S11: The base device oblivious grower holds ≤1e-5 vs the CPU grower
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — measured 3.605e-11 / 5.992e-11 / 6.212e-11 (all ≤1e-5) on ROCm.
 - **Document state:** draft
 - **Principal failure reason:** the `bootstrap_type = No` device grower cannot meet
   the phase's ≤1e-5 bar, making every downstream bootstrap claim unreachable.
@@ -663,7 +663,7 @@ one principal cause.
 
 ### SPEC WR01-S12: Device/CPU split selection has one documented, locked tie-break order
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — divergent splits occur (4/20 at the largest shape) but every divergent tree’s own contribution agrees to ≤2.8e-11, asserted at ε=1e-5.
 - **Document state:** draft
 - **Principal failure reason:** a gain tie is resolved differently on device and
   CPU on a NON-degenerate split, producing a genuinely different model.
@@ -711,7 +711,7 @@ one principal cause.
 
 ### SPEC WR01-S13: The device leaf reduce's nondeterminism stays inside the ≤1e-5 budget
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — run-to-run `max|Δpred|` = 0.000e0 over 5 fits for No/Bernoulli/MVS on ROCm; inside the ≤1e-7 budget.
 - **Document state:** draft
 - **Principal failure reason:** repeated identical device fits produce predictions
   that differ by more than the sign-off tolerance (F-E).
@@ -743,7 +743,7 @@ one principal cause.
 
 ### SPEC WR01-S14: A bias-0 upstream fixture family exists and gates the CPU path
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — `bootstrap_dev/` generated via `--bootstrap-dev-only`; CPU oracle green (MVS gated to trees 0–1, see progress.md R-1). Frozen `bootstrap/` byte-unchanged.
 - **Document state:** draft
 - **Principal failure reason:** the new fixtures encode a different model than the
   Rust side builds (the "pin every raw-dict default" trap), so the oracle is
@@ -790,7 +790,7 @@ one principal cause.
 
 ### SPEC WR01-S15: The device reproduces upstream at ≤1e-5 for Bernoulli, Bayesian and MVS
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — device == upstream ≤1e-5 for no/bayesian/bernoulli over all 3 trees, mvs over trees 0–1 (R-1); device == CPU ≤1e-5 (4.7e-11…5.6e-11).
 - **Document state:** draft
 - **Principal failure reason:** an enabled bootstrap type does not meet the phase's
   parity bar against upstream CatBoost 1.2.10.
@@ -826,7 +826,7 @@ one principal cause.
 
 ### SPEC WR01-S16: Poisson has one defined, backend-independent behaviour
 
-- **Implementation state:** unimplemented
+- **Implementation state:** implemented — Poisson rejected with an identical `CbError::Degenerate` message on both backends.
 - **Document state:** draft
 - **Principal failure reason:** a Poisson fit succeeds on one build and errors on
   another, or produces a device "model" with no upstream meaning.
