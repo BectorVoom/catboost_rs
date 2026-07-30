@@ -40,3 +40,15 @@ cpu = ["cubecl/cpu"]
 wgpu = ["cubecl/wgpu"]
 cuda = ["cubecl/cuda"]
 rocm = ["cubecl/hip"]
+
+[dev-dependencies]
+# Test-only (D-14/D-15 permit dev edges): the Poisson bootstrap self-oracle reads the
+# committed `cb-oracle/fixtures/bootstrap_poisson/` `.npy` + `config.json` produced by
+# `poisson_bootstrap_oracle.cpp` (the verbatim host transcription of upstream's CUDA
+# kernel). Deliberately NOT a `cb-oracle` dev-dependency: cb-oracle's own dev-deps pull
+# cb-backend WITH a backend feature, and that edge would unify `cpu` into a
+# `--features rocm` build (the feature-unification landmine). Reading two files needs
+# neither the crate nor the risk.
+ndarray.workspace = true
+ndarray-npy.workspace = true
+serde_json.workspace = true

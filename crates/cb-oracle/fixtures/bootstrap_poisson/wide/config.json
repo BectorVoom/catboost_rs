@@ -1,0 +1,16 @@
+{
+  "source": "poisson_bootstrap_oracle.cpp (verbatim transcription of catboost/cuda/cuda_util/kernel/bootstrap.cu PoissonBootstrapImpl + cuda_util/kernel/random_gen.cuh NextPoisson)",
+  "n": 20000,
+  "seeds_size": 65536,
+  "subsample": 0.8,
+  "lambda": 1.6094379425048828,
+  "seed0": 42,
+  "rounds": 2,
+  "block_size": 256,
+  "num_blocks": 79,
+  "stride": 20224,
+  "seed_derivation": "splitmix64",
+  "layout": "round-major: round 0 objects 0..n-1, then round 1",
+  "mean_count": 1.6032,
+  "zero_fraction": 0.1989
+}

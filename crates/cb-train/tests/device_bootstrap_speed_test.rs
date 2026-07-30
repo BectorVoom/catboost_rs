@@ -127,6 +127,10 @@ mod device {
             ("Bernoulli", EBootstrapType::Bernoulli, 0.8_f64, 0.0_f32),
             ("Bayesian", EBootstrapType::Bayesian, 1.0, 1.0),
             ("MVS", EBootstrapType::Mvs, 0.8, 0.0),
+            // Poisson is the one arm sampled ENTIRELY on device (upstream has no CPU
+            // Poisson sampler), so it pays no per-tree host sample at all — its ratio is
+            // expected to be the tightest of the four, not merely under the bar.
+            ("Poisson", EBootstrapType::Poisson, 0.8, 0.0),
         ] {
             let s = timed(bt, ss, tp);
             let ratio = s / base;

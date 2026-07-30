@@ -645,7 +645,10 @@ dependencies = [
  "cb-compute",
  "cb-core",
  "cubecl",
+ "ndarray",
+ "ndarray-npy",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]

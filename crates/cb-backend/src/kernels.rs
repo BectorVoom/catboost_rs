@@ -2945,6 +2945,20 @@ pub(crate) mod bootstrap_device;
 #[cfg(test)]
 mod bootstrap_device_test;
 
+// Device Poisson bootstrap UPSTREAM oracle (source/test separation): the `#[cube]` Poisson
+// kernel is a verbatim transcription of upstream's CUDA `PoissonBootstrapImpl`, and this
+// mount holds it bit-for-bit against `cb-oracle/fixtures/bootstrap_poisson/`, frozen by the
+// host-compiled `poisson_bootstrap_oracle.cpp`. Poisson has no CPU sampler ANYWHERE (upstream
+// rejects it on CPU), so this — not a CatBoost-Python run — is its parity gate.
+#[cfg(test)]
+mod poisson_bootstrap_oracle_test;
+
+// Device Poisson bootstrap SPEED evidence (source/test separation): the parallel
+// grid-stride transcription vs the serial single-thread stream draw the other arms are
+// (correctly) stuck with. Lives in `kernels/poisson_bootstrap_speed_test.rs`.
+#[cfg(test)]
+mod poisson_bootstrap_speed_test;
+
 // Device Minimal-Variance Sampling (Phase 12 Plan 07, GPUT-17): the PRODUCTION module hosting the
 // serial `#[cube]` MVS kernel — per-block (`BlockSize = 8192`) optimal threshold over
 // `sqrt(lambda + der^2)` (deterministic monotone bisection = the `calculate_threshold` root) +
