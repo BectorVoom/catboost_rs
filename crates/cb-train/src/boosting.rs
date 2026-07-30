@@ -3076,14 +3076,24 @@ fn train_inner<R: Runtime>(
         // multiplier crosses the seam). They are admitted ONLY for the oblivious
         // (SymmetricTree) grow: the non-symmetric / Region / CTR / exact-leaf × sampling
         // combinations are out of scope this phase and the backend session declines them
-        // explicitly rather than dropping the sample. Poisson is NOT admitted — it has no
-        // CPU-semantics parity target (upstream CatBoost rejects it on CPU while its GPU
-        // trains it), so it stays a uniform up-front rejection on every backend
-        // (`WR01-S16`).
+        // explicitly rather than dropping the sample.
+        //
+        // POISSON is admitted here too, but on a DIFFERENT footing and only for the
+        // oblivious grow. It is upstream's GPU-ONLY sampler — `TBootstrapConfig::Validate`
+        // rejects it on the CPU task type outright ("poisson bootstrap is not supported on
+        // CPU") — so it has no CPU sampler to run host-side and `bootstrap()` still refuses
+        // it. Instead the device draws it RESIDENT, from a verbatim transcription of
+        // upstream's CUDA `PoissonBootstrapImpl` (`cb_backend::kernels::bootstrap_device`,
+        // gated bit-for-bit against the `bootstrap_poisson/` upstream fixtures). If the
+        // device does not actually commit, Poisson is rejected below rather than silently
+        // falling back to a CPU grower that cannot express it.
         && (matches!(params.bootstrap_type, EBootstrapType::No)
             || (matches!(
                 params.bootstrap_type,
-                EBootstrapType::Bayesian | EBootstrapType::Bernoulli | EBootstrapType::Mvs
+                EBootstrapType::Bayesian
+                    | EBootstrapType::Bernoulli
+                    | EBootstrapType::Mvs
+                    | EBootstrapType::Poisson
             ) && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
         && params.random_strength == 0.0
         && eval_sets.is_empty()
@@ -3159,16 +3169,32 @@ fn train_inner<R: Runtime>(
         // that the HOST computes the per-tree sample (Design A / `[DECISION D4]`). The two
         // fields travel together: the backend session reads `sample_from_host` to decide
         // that it must NOT open its own device-resident sampler, and reads
-        // `bootstrap_type` only as bookkeeping describing WHICH host sampler ran. Poisson
-        // never reaches here (rejected up front on every backend, `WR01-S16`).
+        // `bootstrap_type` only as bookkeeping describing WHICH host sampler ran.
+        //
+        // POISSON inverts that: it is the one arm the DEVICE samples (upstream has no CPU
+        // Poisson sampler to mirror), so it travels with `sample_from_host = false` and the
+        // session opens its own resident sampler — which is why `sample_rate` and `rng_seed`
+        // below are wired for it and inert for everything else.
         bootstrap_type: match params.bootstrap_type {
             EBootstrapType::Bayesian => DeviceBootstrapType::Bayesian,
             EBootstrapType::Bernoulli => DeviceBootstrapType::Bernoulli,
             EBootstrapType::Mvs => DeviceBootstrapType::Mvs,
-            // `No` and (unreachable) Poisson keep the no-subsampling covered default.
+            EBootstrapType::Poisson => DeviceBootstrapType::Poisson,
+            // `No` keeps the no-subsampling covered default.
             _ => DeviceBootstrapType::No,
         },
-        sample_from_host: !matches!(params.bootstrap_type, EBootstrapType::No),
+        sample_from_host: !matches!(
+            params.bootstrap_type,
+            EBootstrapType::No | EBootstrapType::Poisson
+        ),
+        // Read by the device-resident sampler ONLY, i.e. only on the Poisson arm. λ is
+        // derived from `sample_rate` inside the kernel wrapper through upstream's
+        // `GetPoissonLambda() = -log(1 - subsample)`; the seed buffer is built once per fit
+        // from `rng_seed`. For every host-sampled arm these stay inert (the sample already
+        // crossed the seam fully formed), which is why they are set unconditionally rather
+        // than being made Poisson-only — an inert value cannot mislead, a missing one can.
+        sample_rate: params.subsample as f32,
+        rng_seed: params.random_seed,
         // STILL NOT WIRED (deliberately, at `DeviceTrainConfig::default()`):
         // `mvs_lambda`, `sample_rate` and `rng_seed` are the DEVICE-RESIDENT sampler's
         // inputs, and Design A never opens that sampler — λ, the subsample rate and the
@@ -3206,6 +3232,27 @@ fn train_inner<R: Runtime>(
         active: device_active,
     };
 
+    // Poisson exists ONLY as a device sampler (upstream rejects it on the CPU task type and
+    // `bootstrap()` below does the same). If the fit did not actually commit to the device —
+    // a CPU/wgpu build, or any config the coverage gate declined — there is nothing that can
+    // express it, so fail here with the reason rather than let the CPU grower's `bootstrap()`
+    // raise a bare "unsupported" from deep inside the tree loop.
+    if matches!(params.bootstrap_type, EBootstrapType::Poisson) && !device_active {
+        return Err(CbError::Degenerate(
+            "poisson bootstrap is not supported on CPU (upstream CatBoost rejects it on the \
+             CPU task type). It requires the device grow path: build with the `cuda` or \
+             `rocm` backend feature and a device-eligible configuration (grow_policy = \
+             SymmetricTree, random_strength = 0, unit object weights, boost_from_average = \
+             false, Gradient/Simple leaves, no CTR / eval sets / groups)"
+                .to_owned(),
+        ));
+    }
+    // Poisson is drawn device-resident from its own persistent seed buffer, so the host runs
+    // no per-tree sampler and consumes no draws for it — unlike every other bootstrap type,
+    // whose host draw order is load-bearing for upstream parity.
+    let device_poisson =
+        device_active && matches!(params.bootstrap_type, EBootstrapType::Poisson);
+
     for iter in 0..params.iterations {
         // GPUT-01 DEVICE GROW BRANCH (D-10-01 per-fit all-or-nothing). When the fit
         // committed to the device path at `begin` (`device_active`), grow THIS
@@ -3228,7 +3275,7 @@ fn train_inner<R: Runtime>(
             // `POST_TREE_EXTRA_DRAWS` — because tree `k+1`'s sample is drawn from the phase
             // tree `k` left behind, so any miscount silently changes every later tree's
             // sample (`WR01-S7`).
-            let device_sample: Vec<f64> = if draws_active {
+            let device_sample: Vec<f64> = if draws_active && !device_poisson {
                 // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211).
                 for _ in 0..PRE_TREE_DRAWS {
                     rng.gen_rand();
@@ -3603,7 +3650,11 @@ fn train_inner<R: Runtime>(
             // AFTER `bootstrap()` and BEFORE `POST_TREE_EXTRA_DRAWS` to reproduce the CPU
             // branch's order exactly. `draws_active == false` keeps this a no-op, so the
             // byte-unchanged `bootstrap_type = No` device path is untouched (D-04).
-            if draws_active {
+            //
+            // Poisson is excluded for the same reason it skips `bootstrap()` above: its
+            // randomness lives entirely in the device seed buffer, this host stream feeds
+            // nothing on that arm, and there is no upstream CPU phase to stay aligned with.
+            if draws_active && !device_poisson {
                 replay_grow_draws(&mut rng, params.depth, matrix.n_features());
                 for _ in 0..POST_TREE_EXTRA_DRAWS {
                     rng.gen_rand();

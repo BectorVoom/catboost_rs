@@ -24,9 +24,16 @@
 //!   accuracy); the device uses the exact `ln`. Their divergence (~1e-5) is INSIDE the device
 //!   ε=1e-4 bar, so the Bayesian weights are checked ≤1e-4 (NOT bit-for-bit), avoiding an
 //!   f32-bit-reinterpretation (`to_bits`/`from_bits`) HIP-JIT surface in the kernel.
-//! - **Poisson** — GPU-only (upstream REJECTS it on CPU, `bootstrap_options.cpp:27`, so there
-//!   is NO CPU oracle, D-11). Knuth's multiplicative Poisson(1) over the base stream; validated
-//!   for DETERMINISM only (same seed ⇒ same weights), never against a fabricated CPU sample.
+//! - **Poisson** — GPU-only, and therefore the ONE arm that does NOT follow the model above.
+//!   Upstream REJECTS Poisson on the CPU task type (`bootstrap_options.cpp:29`, "poisson
+//!   bootstrap is not supported on CPU"), so there is no CPU sampler to mirror and no CPU
+//!   stream to advance. Upstream's CUDA kernel IS the specification, and it is transcribed
+//!   here VERBATIM: a per-thread seed buffer, `numBlocks = min(ceil(seeds/256), ceil(n/256))`
+//!   blocks of 256, a grid-stride walk, and the multiply-with-carry `AdvanceSeed` /
+//!   `NextUniform` / `NextPoisson` of `cuda_util/kernel/random_gen.cuh`. See
+//!   [`launch_poisson_bootstrap_resident`]. Gated bit-for-bit against
+//!   `cb-oracle/generator/poisson_bootstrap_oracle.cpp` (a host transcription of the SAME
+//!   upstream sources) via the `bootstrap_poisson/` fixtures.
 //!
 //! # Random-strength (`ScoreStdDev`)
 //!
@@ -237,44 +244,88 @@ fn bootstrap_bayesian_kernel(seed: &Array<u64>, temp: &Array<f64>, weights: &mut
     }
 }
 
-/// Knuth Poisson(1) weights over the base stream (GPU-only; no CPU oracle, D-11). Per object,
-/// `k = 0; p = 1; loop { p *= gen_rand_real1(); if p <= exp(-1) break; k += 1 } weights[i] = k`.
-/// Serial single-thread (unit 0). `base = [r1x, r1c, r2x, r2c]`. Validated for DETERMINISM only.
+/// `NextUniform` scale `2^-32` (`random_gen.cuh:27`) — the literal upstream writes.
+const NEXT_UNIFORM_SCALE: f64 = 2.328_306_435_996_595e-10;
+
+/// The upstream Poisson bootstrap block size (`bootstrap.cu:67`, `blockSize = 256`).
+pub(crate) const POISSON_BLOCK_SIZE: usize = 256;
+
+/// The largest `alpha` the transcribed [`poisson_bootstrap_kernel`] covers. Upstream's
+/// `NextPoisson` switches to a Gaussian approximation above 20, but that branch is
+/// UNREACHABLE through `GetPoissonLambda() = -log(1 - subsample)` computed in f32:
+/// `alpha > 20` needs `1 - subsample < 2.1e-9`, and every such `subsample` rounds to
+/// exactly `1.0f` in f32, where the formula returns `-1` instead. The host entry point
+/// rejects an out-of-range `alpha` rather than silently taking the wrong branch.
+const POISSON_MAX_ALPHA: f64 = 20.0;
+
+/// Upstream's `PoissonBootstrapImpl` (`catboost/cuda/cuda_util/kernel/bootstrap.cu:8-19`)
+/// with `NextPoisson`/`NextUniform`/`AdvanceSeed` (`random_gen.cuh`) inlined — a VERBATIM
+/// transcription, because on the GPU-only Poisson arm this kernel IS the specification
+/// (upstream has no CPU Poisson sampler).
+///
+/// Thread `t` of the `stride = numBlocks * 256` launched threads owns `seeds[t]` and walks
+/// objects `t, t + stride, t + 2*stride, ...`, mutating its seed word in place and writing
+/// it back — so consecutive trees continue the per-thread streams exactly as upstream's
+/// persistent seed buffer does. `weights[i]` is the raw Poisson count: upstream fills the
+/// buffer with `1.0f` before the draw (`gpu_data/bootstrap.h:88-90`) and multiplies.
+///
+/// Float widths are load-bearing and match upstream exactly: `NextUniform` returns f64,
+/// `log` is the f64 natural log, but the accumulator `logp` and the threshold `L = -alpha`
+/// are f32 — so every iteration rounds the f64 log to 24 bits. Substituting an f32 log or
+/// an f64 accumulator changes which objects cross the threshold.
+///
+/// `cfg = [alpha]` (f32, `GetPoissonLambda()`). The stride is read from the launch geometry
+/// (`CUBE_COUNT_X * CUBE_DIM_X`), which is literally upstream's `gridDim.x * blockDim.x`.
+/// No `-inf` literal (a `u == 0` draw yields a runtime `-inf` from `ln`, which exits the loop
+/// with count 0 — exactly what upstream does).
 #[cube(launch)]
-fn bootstrap_poisson_kernel(base: &Array<u64>, weights: &mut Array<f64>) {
-    if ABSOLUTE_POS == 0 {
-        let a = LCG_MULTIPLIER;
-        let mut r1x = base[0];
-        let r1c = base[1];
-        let mut r2x = base[2];
-        let r2c = base[3];
-        // exp(-1) — a finite host constant (NOT an -inf sentinel).
-        let l = 0.367_879_441_171_442_33_f64;
-        let n = weights.len();
-        let mut i = 0usize;
+fn poisson_bootstrap_kernel(seeds: &mut Array<u64>, cfg: &Array<f32>, weights: &mut Array<f64>) {
+    let n = weights.len();
+    let t = ABSOLUTE_POS;
+    // Threads past the object count do no work; upstream writes their seed back unchanged,
+    // which is a no-op. The `seeds.len()` half is a bounds guard the host also enforces.
+    if t < n && t < seeds.len() {
+        let stride = CUBE_COUNT_X as usize * CUBE_DIM_X as usize;
+        let alpha = cfg[0];
+        // `float L = -alpha` (random_gen.cuh:66). Written as a subtraction so no negative
+        // literal enters the kernel body.
+        let l = 0.0_f32 - alpha;
+        let mut s = seeds[t];
+        let mut i = t;
         while i < n {
-            // The Poisson(1) count accumulates as f64 (a runtime integer counter is ambiguous
-            // to infer in `#[cube]`); the count is a small non-negative integer, exact in f64.
+            // `NextPoisson(&s, alpha)`, the `alpha <= 20` branch (random_gen.cuh:66-72).
+            let mut logp = 0.0_f32;
+            // Upstream's `int k`, held as f64: a runtime integer counter is ambiguous to
+            // infer inside `#[cube]` (the same reason the Bayesian block index is handled
+            // this way), and the count is a small non-negative integer, exact in f64.
             let mut k = 0.0_f64;
-            let mut p = 1.0_f64;
             let mut done = false;
             while !done {
-                r1x = r1x * a + r1c;
-                let hi = pcg_mix(r1x);
-                r2x = r2x * a + r2c;
-                let lo = pcg_mix(r2x);
-                let rand64 = (u64::cast_from(hi) << 32u32) | u64::cast_from(lo);
-                let u = f64::cast_from(rand64 >> 11u32) * REAL1_INV;
-                p *= u;
-                if p <= l {
+                k += 1.0_f64;
+                // `AdvanceSeed(&s)` (random_gen.cuh:7-15): two independent 16-bit
+                // multiply-with-carry steps on the high/low halves. u32 arithmetic wraps
+                // natively on device, matching C++ unsigned wraparound.
+                let v0 = u32::cast_from(s >> 32u32);
+                let u0 = u32::cast_from(s & 0xFFFF_FFFFu64);
+                let v = 36969u32 * (v0 & 0xFFFFu32) + (v0 >> 16u32);
+                let u = 18000u32 * (u0 & 0xFFFFu32) + (u0 >> 16u32);
+                s = (u64::cast_from(v) << 32u32) | u64::cast_from(u);
+                // `NextUniform` (random_gen.cuh:22-29) re-splits the advanced state; `(v << 16)
+                // + u` is u32 arithmetic (wrapping) BEFORE the widening to f64.
+                let mixed = (v << 16u32) + u;
+                let uni = f64::cast_from(mixed) * NEXT_UNIFORM_SCALE;
+                // `logp += log(NextUniform(seed))` — f64 log accumulated into an f32.
+                logp = f32::cast_from(f64::cast_from(logp) + uni.ln());
+                if logp <= l {
                     done = true;
-                } else {
-                    k += 1.0_f64;
                 }
             }
-            weights[i] = k;
-            i += 1usize;
+            // `return k - 1` — the loop runs at least once, so `k >= 1` and the count is
+            // non-negative.
+            weights[i] = k - 1.0_f64;
+            i += stride;
         }
+        seeds[t] = s;
     }
 }
 
@@ -362,19 +413,169 @@ pub(crate) fn launch_bootstrap_weights_resident(
                 );
                 Ok(out)
             }
-            DeviceBootstrapKind::Poisson => {
-                let base_h = client.create(cubecl::bytes::Bytes::from_elems(base_state.to_vec()));
-                bootstrap_poisson_kernel::launch::<SelectedRuntime>(
-                    client,
-                    count,
-                    dim,
-                    unsafe { ArrayArg::from_raw_parts(base_h, 4) },
-                    unsafe { ArrayArg::from_raw_parts(out.clone(), n) },
-                );
-                Ok(out)
-            }
+            // Poisson does NOT ride this entry point: it has no host-advanced CPU stream to
+            // snapshot (upstream has no CPU Poisson sampler at all), and its state is the
+            // persistent per-thread device seed buffer. It routes to
+            // [`launch_poisson_bootstrap_resident`] instead, and the session never reaches
+            // here with it.
+            DeviceBootstrapKind::Poisson => Err(CbError::Degenerate(
+                "Poisson bootstrap does not use the host-stream draw path; call \
+                 launch_poisson_bootstrap_resident with the resident seed buffer"
+                    .to_owned(),
+            )),
         }
     }
+}
+
+/// `TBootstrapConfig::GetPoissonLambda()` (`bootstrap_options.h:31-34`), VERBATIM:
+/// `takenFraction < 1 ? -log(1 - takenFraction) : -1`, computed in f32 exactly as upstream.
+///
+/// The `subsample >= 1` case really does return `-1` upstream, and a negative `alpha` makes
+/// `NextPoisson` return 0 for EVERY object (the `logp > L` test fails on the first draw), i.e.
+/// an all-zero sample. Callers must reject that configuration up front rather than train a
+/// model on identically-zero weights — [`poisson_alpha`] returns it faithfully and the
+/// resident entry point below refuses it.
+#[must_use]
+pub(crate) fn poisson_alpha(subsample: f64) -> f32 {
+    let taken = subsample as f32;
+    if taken < 1.0 {
+        -((1.0_f32 - taken).ln())
+    } else {
+        -1.0
+    }
+}
+
+/// The upstream launch geometry (`PoissonBootstrap`, `bootstrap.cu:66-70`):
+/// `numBlocks = min(ceil(seeds_size / 256), ceil(n / 256))`, `stride = numBlocks * 256`.
+/// Exposed because the mapping object → seed depends on it, so the oracle and the session
+/// must agree on it exactly.
+#[must_use]
+pub(crate) fn poisson_grid(seeds_size: usize, n: usize) -> (usize, usize) {
+    let num_blocks = seeds_size
+        .div_ceil(POISSON_BLOCK_SIZE)
+        .min(n.div_ceil(POISSON_BLOCK_SIZE));
+    (num_blocks, num_blocks * POISSON_BLOCK_SIZE)
+}
+
+/// Draw the device-resident Poisson bootstrap weights for `n` objects, ADVANCING the resident
+/// per-thread seed buffer in place (`seeds_h`, `seeds_size` u64 words) exactly as upstream's
+/// persistent `TGpuAwareRandom` seed buffer advances across trees. Returns the resident
+/// length-`n` f64 weight handle WITHOUT reading it back (D-08).
+///
+/// `subsample` is the raw `subsample` parameter; λ is derived through [`poisson_alpha`].
+/// Rejects, with a typed error rather than a silently wrong model:
+/// - `subsample >= 1.0` (upstream λ = -1 ⇒ every weight 0),
+/// - `alpha > 20` (upstream's Gaussian branch, unreachable through the f32 λ formula),
+/// - a `seeds_size` that is not a multiple of the 256 block size (upstream's own launch would
+///   read past the buffer for such a size).
+#[cfg_attr(feature = "wgpu", allow(unused_variables))]
+pub(crate) fn launch_poisson_bootstrap_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    seeds_h: &Handle,
+    seeds_size: usize,
+    subsample: f64,
+    n: usize,
+) -> CbResult<Handle> {
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(wgpu_reject());
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let alpha = poisson_alpha(subsample);
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(CbError::OutOfRange(format!(
+                "Poisson bootstrap needs subsample in (0, 1): upstream's GetPoissonLambda \
+                 returns -1 for subsample >= 1, which zeroes every sample weight (got \
+                 subsample = {subsample})"
+            )));
+        }
+        if f64::from(alpha) > POISSON_MAX_ALPHA {
+            return Err(CbError::OutOfRange(format!(
+                "Poisson bootstrap lambda {alpha} exceeds the transcribed alpha <= 20 branch \
+                 of upstream NextPoisson"
+            )));
+        }
+        if seeds_size == 0 || !seeds_size.is_multiple_of(POISSON_BLOCK_SIZE) {
+            return Err(CbError::OutOfRange(format!(
+                "Poisson bootstrap seed buffer must be a non-zero multiple of the upstream \
+                 block size {POISSON_BLOCK_SIZE} (got {seeds_size})"
+            )));
+        }
+
+        let (num_blocks, _stride) = poisson_grid(seeds_size, n);
+        let out = client.empty(n * std::mem::size_of::<f64>());
+        let cfg_h = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+        poisson_bootstrap_kernel::launch::<SelectedRuntime>(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim {
+                x: POISSON_BLOCK_SIZE as u32,
+                y: 1,
+                z: 1,
+            },
+            unsafe { ArrayArg::from_raw_parts(seeds_h.clone(), seeds_size) },
+            unsafe { ArrayArg::from_raw_parts(cfg_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(out.clone(), n) },
+        );
+        Ok(out)
+    }
+}
+
+/// Upstream's per-device seed-buffer size (`TGpuAwareRandom::CreateSeeds`,
+/// `gpu_random.h:26` — `maxCountPerDevice = 256 * 256`). It caps the Poisson kernel's
+/// parallelism at 65536 threads, which is also why the block count is `min(256, ...)`.
+pub(crate) const POISSON_SEEDS_SIZE: usize = 256 * 256;
+
+/// Create and upload the resident Poisson seed buffer for a fit.
+///
+/// Upstream fills this buffer host-side from its Mersenne `TRandom::NextUniformL`
+/// (`gpu_random.cpp:261-268`). We fill it from the repo's validated
+/// [`cb_core::TFastRng64`] instead: the seed material is opaque random state, its
+/// provenance is NOT part of the kernel contract being reproduced (the oracle pins the
+/// buffer explicitly), and a real upstream fit's Mersenne stream position at the moment
+/// `GetGpuSeeds` is first called is not observable from outside anyway. What IS reproduced
+/// bit-for-bit is the object → weight map GIVEN a seed buffer, which is where every
+/// upstream-specific decision lives.
+pub(crate) fn create_poisson_seeds(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    rng_seed: u64,
+    seeds_size: usize,
+) -> Handle {
+    let mut rng = cb_core::TFastRng64::from_seed(rng_seed);
+    let seeds: Vec<u64> = (0..seeds_size).map(|_| rng.gen_rand()).collect();
+    client.create(cubecl::bytes::Bytes::from_elems(seeds))
+}
+
+/// Host-readback wrapper over the device Poisson draw: upload `seeds`, run `rounds`
+/// CONSECUTIVE draws over the same (in-place advanced) seed buffer, and return the
+/// concatenated round-major weights. This is the seam the upstream-fixture oracle
+/// exercises; it is NOT the residency path (that keeps the handle on-device).
+#[allow(dead_code)] // consumed by the #[cfg(test)] bootstrap_device_test self-oracle (source/test separation)
+pub(crate) fn draw_poisson_weights_host(
+    seeds: &[u64],
+    subsample: f64,
+    n: usize,
+    rounds: usize,
+) -> CbResult<Vec<f64>> {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let seeds_h = client.create(cubecl::bytes::Bytes::from_elems(seeds.to_vec()));
+    let mut out = Vec::with_capacity(rounds * n);
+    for _ in 0..rounds {
+        let handle =
+            launch_poisson_bootstrap_resident(&client, &seeds_h, seeds.len(), subsample, n)?;
+        let bytes = client.read_one(handle).map_err(|e| {
+            CbError::Degenerate(format!("CubeCL Poisson read-back failed: {e:?}"))
+        })?;
+        out.extend_from_slice(bytemuck::cast_slice::<u8, f64>(&bytes));
+    }
+    Ok(out)
 }
 
 /// Widen a device u32 keep-mask into an f64 weight buffer (`w[i] = keep[i] as f64`) on device,

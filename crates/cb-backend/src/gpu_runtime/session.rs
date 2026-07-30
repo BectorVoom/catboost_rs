@@ -52,7 +52,8 @@ use crate::gpu_runtime::{
     DerBinaryKernel, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
-    fold_weights_resident, launch_bootstrap_weights_resident, DeviceBootstrapKind,
+    create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
+    launch_poisson_bootstrap_resident, DeviceBootstrapKind, POISSON_SEEDS_SIZE,
 };
 use crate::kernels::mvs_device::launch_mvs_weights_resident;
 use crate::kernels::ctr_device::{
@@ -196,7 +197,17 @@ fn build_ctr_cindex_columns(
 struct BootstrapState {
     kind: DeviceBootstrapKind,
     /// The persistent continuous training stream (seeded once from `config.rng_seed`).
+    /// Bernoulli/Bayesian only — Poisson has no host stream (see [`Self::poisson_seeds`]).
     rng: TFastRng64,
+    /// The PERSISTENT per-thread Poisson seed buffer — `Some` iff `kind == Poisson`.
+    ///
+    /// Poisson is the one arm whose upstream definition is a GPU kernel rather than a CPU
+    /// sampler, and that kernel keeps its randomness in a device-resident seed buffer that
+    /// each thread advances in place and writes back (`bootstrap.cu:16`). Holding it for the
+    /// whole fit reproduces upstream's `TGpuAwareRandom` seed buffer, which is likewise
+    /// created once and mutated by every tree. There is no host-side stream to advance, so
+    /// `rng` is unused on this arm.
+    poisson_seeds: Option<Handle>,
     /// Bernoulli/Poisson subsample rate (`config.sample_rate`).
     sample_rate: f64,
     /// Bayesian bagging temperature — the catboost default `1.0` (config carries no field yet;
@@ -1417,10 +1428,22 @@ impl GpuTrainSession {
         // Phase 12 Plan 06: capture the bootstrap state (oblivious path only; nonsym requires
         // `bootstrap_type == No`). Seed the CONTINUOUS training stream ONCE from `config.rng_seed`;
         // `grow_one` snapshots its O(1) base per tree and draws the device-resident sample.
+        // Poisson additionally allocates its PERSISTENT per-thread device seed buffer here (once
+        // per fit, exactly like upstream's `TGpuAwareRandom::GetGpuSeeds`), because its upstream
+        // definition is a GPU kernel with device-resident state rather than a CPU sampler with a
+        // host stream.
         let bootstrap = match bootstrap_arm {
             BootstrapArm::Device(kind) if nonsym_policy.is_none() => Some(BootstrapState {
                 kind,
                 rng: TFastRng64::from_seed(config.rng_seed),
+                poisson_seeds: match kind {
+                    DeviceBootstrapKind::Poisson => Some(create_poisson_seeds(
+                        &client,
+                        config.rng_seed,
+                        POISSON_SEEDS_SIZE,
+                    )),
+                    _ => None,
+                },
                 sample_rate: f64::from(config.sample_rate),
                 bagging_temperature: 1.0,
             }),
@@ -1703,31 +1726,38 @@ impl GpuTrainSession {
         // The RNG/client borrows are scoped so the O(1) stream advance (mutable `self.bootstrap`)
         // completes before the launch reads `self.client`.
         let mut bootstrap_params: Option<(DeviceBootstrapKind, [u64; 4], u64, f64, f64)> = None;
+        let mut poisson_params: Option<(Handle, f64)> = None;
         if let Some(bs) = self.bootstrap.as_mut() {
-            let base = bs.rng.raw_state();
-            // Bayesian consumes ONE main-stream draw for `rand_seed`; the per-block streams branch
-            // off it. Bernoulli/Poisson draw sequentially from the base (advanced by `n` below).
-            let rand_seed = match bs.kind {
-                DeviceBootstrapKind::Bayesian => bs.rng.gen_rand(),
-                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => 0,
-            };
-            bootstrap_params =
-                Some((bs.kind, base, rand_seed, bs.sample_rate, bs.bagging_temperature));
-            // Advance the continuous stream to the next tree's phase (Bernoulli/Poisson consume one
-            // `gen_rand` per object; Bayesian already advanced by the single `rand_seed` draw).
             match bs.kind {
-                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => {
-                    // IN-02: Bernoulli consumes exactly one `gen_rand` per object, so the
-                    // `n`-draw advance is draw-faithful. Poisson (Knuth) consumes a VARIABLE
-                    // number of draws per object, so this advance is a deterministic-but-
-                    // arbitrary phase, NOT aligned to the draws actually consumed. That is
-                    // fine under the current scope (Poisson is validated for determinism
-                    // only — same seed ⇒ same weights — and has no CPU oracle). If a Poisson
-                    // parity oracle is ever added, make the kernel emit its consumed-draw
-                    // count (or advance the stream on-device) so this matches consumption.
-                    bs.rng.advance(self.n as u64)
+                // Poisson: no host stream at all. Upstream's kernel advances a PERSISTENT
+                // per-thread device seed buffer and writes it back, so the cross-tree phase is
+                // carried on the device — which is also what makes it draw-faithful. (The old
+                // host `advance(n)` here was a deterministic-but-arbitrary phase: Poisson
+                // consumes a VARIABLE number of draws per object, so no host counter can track
+                // it. That approximation is gone with the stream it approximated.)
+                DeviceBootstrapKind::Poisson => {
+                    if let Some(seeds) = bs.poisson_seeds.as_ref() {
+                        poisson_params = Some((seeds.clone(), bs.sample_rate));
+                    }
                 }
-                DeviceBootstrapKind::Bayesian => {}
+                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Bayesian => {
+                    let base = bs.rng.raw_state();
+                    // Bayesian consumes ONE main-stream draw for `rand_seed`; the per-block
+                    // streams branch off it. Bernoulli draws sequentially from the base
+                    // (advanced by `n` below).
+                    let rand_seed = match bs.kind {
+                        DeviceBootstrapKind::Bayesian => bs.rng.gen_rand(),
+                        _ => 0,
+                    };
+                    bootstrap_params =
+                        Some((bs.kind, base, rand_seed, bs.sample_rate, bs.bagging_temperature));
+                    // Advance the continuous stream to the next tree's phase. IN-02: Bernoulli
+                    // consumes exactly one `gen_rand` per object, so the `n`-draw advance is
+                    // draw-faithful; Bayesian already advanced by its single `rand_seed` draw.
+                    if bs.kind == DeviceBootstrapKind::Bernoulli {
+                        bs.rng.advance(self.n as u64);
+                    }
+                }
             }
         }
 
@@ -1763,7 +1793,17 @@ impl GpuTrainSession {
             }
         }
 
-        let sample_h = if let Some((kind, base, rand_seed, rate, temp)) = bootstrap_params {
+        let sample_h = if let Some((seeds_h, rate)) = poisson_params {
+            // Upstream `PoissonBootstrap`: the seed buffer is BOTH input and output — the kernel
+            // advances each thread's word in place, so the next tree continues these streams.
+            Some(launch_poisson_bootstrap_resident(
+                &self.client,
+                &seeds_h,
+                POISSON_SEEDS_SIZE,
+                rate,
+                self.n,
+            )?)
+        } else if let Some((kind, base, rand_seed, rate, temp)) = bootstrap_params {
             Some(launch_bootstrap_weights_resident(
                 &self.client,
                 kind,

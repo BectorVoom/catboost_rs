@@ -15,7 +15,10 @@
 //!   still agrees to ≤1e-5, i.e. the tie-break picked an equivalent partition.
 //! - `WR01-S15` — with Bernoulli / Bayesian / MVS sampling active, the device fit
 //!   reproduces the CPU fit to ≤1e-5. This is the phase's headline claim.
-//! - `WR01-S16` — Poisson is rejected identically on every backend.
+//! - Poisson's backend contract — the device TRAINS it (upstream's GPU task type
+//!   does) while the CPU grower refuses it with upstream's own wording. This supersedes
+//!   `WR01-S16`'s placeholder "rejected on every backend"; the kernel's own bit-for-bit
+//!   upstream gate lives in cb-backend's `poisson_bootstrap_oracle_test`.
 //!
 //! # Anti-false-pass discipline
 //!
@@ -475,34 +478,52 @@ mod device {
         }
     }
 
-    /// `WR01-S16`: Poisson is rejected identically on every backend, with the same
-    /// typed error — never trained on one backend and refused on the other.
-    pub fn poisson_rejected_on_both_backends() {
+    /// Poisson's backend contract, superseding `WR01-S16`'s "rejected everywhere".
+    ///
+    /// WR-01 rejected Poisson on every backend because it had no CPU-semantics parity
+    /// target. That was a placeholder, not upstream's behaviour: upstream CatBoost
+    /// TRAINS Poisson on the GPU task type and REFUSES it on the CPU one
+    /// (`bootstrap_options.cpp:29`). Now that the device kernel is a verbatim
+    /// transcription of upstream's `PoissonBootstrapImpl`, gated bit-for-bit in
+    /// `cb-backend`'s `poisson_bootstrap_oracle_test`, this suite asserts the SAME
+    /// asymmetry — the device trains it, the CPU grower refuses it with upstream's own
+    /// wording.
+    pub fn poisson_trains_on_device_and_is_refused_on_cpu() {
         let (n, nf) = (2048usize, 8usize);
         let (columns, borders, target) = fixture(n, nf);
         let params = params_with(EBootstrapType::Poisson, 0.8, 0.0, 4, 3);
 
-        let dev = train(&CountingGpu::new(), &columns, &borders, &target, &[], &params, None);
-        let cpu = train(&CpuRefRuntime, &columns, &borders, &target, &[], &params, None);
-
-        let (dev_err, cpu_err) = match (dev, cpu) {
-            (Err(d), Err(c)) => (d, c),
-            (Ok(_), _) => panic!("Poisson must be REJECTED on the device backend, not trained"),
-            (_, Ok(_)) => panic!("Poisson must be REJECTED on the CPU backend, not trained"),
-        };
-        // Same variant AND same message: the rejection is backend-independent, so a
-        // caller cannot observe which backend refused.
-        assert!(
-            matches!(dev_err, CbError::Degenerate(_)) && matches!(cpu_err, CbError::Degenerate(_)),
-            "Poisson rejection must be CbError::Degenerate on both backends, \
-             got device={dev_err:?} cpu={cpu_err:?}"
-        );
+        let gpu = CountingGpu::new();
+        let dev = train(&gpu, &columns, &borders, &target, &[], &params, None)
+            .expect("Poisson must TRAIN on the device backend (upstream's GPU task type does)");
+        // The device really grew every tree — otherwise "it trained" would mean a CPU
+        // fallback that cannot even express Poisson.
+        assert_eq!(gpu.begun.get(), 1, "the device session must be accepted for Poisson");
         assert_eq!(
-            dev_err.to_string(),
-            cpu_err.to_string(),
-            "the Poisson rejection message must be backend-independent (WR01-S16)"
+            gpu.grown.get(),
+            params.iterations,
+            "every Poisson tree must be grown ON DEVICE"
         );
-        println!("[poisson] both backends rejected identically: {dev_err}");
+        // The host must NOT have sampled: Poisson is drawn device-resident, so an empty
+        // sample crosses the seam. A non-empty one would mean double sampling.
+        assert_eq!(
+            gpu.last_sample_len.get(),
+            0,
+            "Poisson is drawn device-resident; the host must pass an EMPTY sample"
+        );
+        assert_eq!(dev.oblivious_trees.len(), params.iterations);
+
+        let cpu_err = train(&CpuRefRuntime, &columns, &borders, &target, &[], &params, None)
+            .expect_err("Poisson must be REFUSED on the CPU grower, as upstream refuses it");
+        assert!(
+            matches!(cpu_err, CbError::Degenerate(_)),
+            "CPU Poisson rejection must stay CbError::Degenerate, got {cpu_err:?}"
+        );
+        assert!(
+            cpu_err.to_string().contains("poisson bootstrap is not supported on CPU"),
+            "the CPU rejection should carry upstream's wording, got: {cpu_err}"
+        );
+        println!("[poisson] device trained {} trees; CPU refused: {cpu_err}", gpu.grown.get());
     }
 }
 
@@ -526,8 +547,8 @@ fn wr01_device_run_to_run_jitter_within_budget() {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 #[test]
-fn wr01_poisson_is_rejected_identically_on_every_backend() {
-    device::poisson_rejected_on_both_backends();
+fn poisson_trains_on_device_and_is_refused_on_cpu() {
+    device::poisson_trains_on_device_and_is_refused_on_cpu();
 }
 
 #[cfg(not(any(feature = "rocm", feature = "cuda")))]

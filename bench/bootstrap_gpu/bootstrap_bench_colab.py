@@ -9,7 +9,11 @@
 #      uncommitted WR-01 changes. Provenance markers below prove WHICH tree it is.
 #   2. The `only_No_is_gpu_eligible` caveat is GONE, because it is no longer true:
 #      WR-01 made Bayesian / Bernoulli / MVS device-eligible for the oblivious grow.
-#      Poisson remains rejected on every backend by design.
+#      Poisson is now device-eligible TOO, but on a different footing: it is upstream's
+#      GPU-ONLY sampler (the CPU validator rejects it outright), so it is drawn
+#      device-resident by a verbatim transcription of upstream's CUDA
+#      PoissonBootstrapImpl rather than by a host sampler. The CatBoost GPU column is
+#      therefore a genuine like-for-like comparison for the Poisson row.
 #   3. The `device_activation_not_observable` caveat is CLOSED, not restated. Part B0
 #      runs one short fit per arm under `CB_GPU_PROF=1` and greps the per-tree device
 #      profiling lines the resident grower emits. An arm that prints no `CB_GPU_PROF
@@ -39,8 +43,10 @@ BORDER_COUNT = 32
 RANDOM_SEED = 42
 
 # `subsample` / `bagging_temperature` mirror the oracle fixtures' pinning so each arm
-# exercises a real sampler rather than a degenerate all-1.0 short-circuit. Poisson is
-# included to RECORD the uniform rejection, not as a pass condition.
+# exercises a real sampler rather than a degenerate all-1.0 short-circuit. Poisson needs
+# subsample < 1 for a non-degenerate lambda: upstream's
+# GetPoissonLambda() = -log(1 - subsample) returns -1 at subsample >= 1, which would zero
+# every weight (catboost_rs rejects that configuration rather than train on it).
 BOOTSTRAP_ARMS = [
     ("No", {}),
     ("Bayesian", {"bagging_temperature": 1.0}),
@@ -49,7 +55,7 @@ BOOTSTRAP_ARMS = [
     ("Poisson", {"subsample": 0.8}),
 ]
 # Which arms WR-01 makes device-eligible for the oblivious grow.
-GPU_ELIGIBLE = {"No", "Bayesian", "Bernoulli", "MVS"}
+GPU_ELIGIBLE = {"No", "Bayesian", "Bernoulli", "MVS", "Poisson"}
 
 # (label, crate, cargo extra args, test filters, blocking?)
 ORACLE_SUITES = [
@@ -67,6 +73,18 @@ ORACLE_SUITES = [
      ["--no-default-features", "--features", "cuda", "--lib"], ["bootstrap"], False),
     ("cb-backend device MVS kernels (CUDA)", "cb-backend",
      ["--no-default-features", "--features", "cuda", "--lib"], ["mvs"], False),
+    # The Poisson kernel's own upstream gate: bit-for-bit vs the fixtures frozen by the
+    # host-compiled verbatim transcription of upstream's CUDA PoissonBootstrapImpl.
+    # BLOCKING — it is the only parity evidence Poisson can have (no CPU oracle exists).
+    ("cb-backend Poisson upstream oracle (CUDA, bit-for-bit)", "cb-backend",
+     ["--no-default-features", "--features", "cuda", "--lib"],
+     ["poisson_bootstrap_oracle_test"], True),
+    ("cb-train Poisson device e2e (CUDA)", "cb-train",
+     ["--no-default-features", "--features", "cuda", "--test",
+      "device_poisson_bootstrap_test"], [], True),
+    ("cb-backend Poisson parallel-draw speed (CUDA)", "cb-backend",
+     ["--no-default-features", "--features", "cuda", "--lib"],
+     ["poisson_bootstrap_speed_test"], False),
 ]
 
 
@@ -98,10 +116,22 @@ def main():
 
     result = {"provenance": {}, "oracle": {}, "speed": {}, "caveats": {}}
     result["caveats"]["gpu_eligibility"] = (
-        "WR-01 made bootstrap_type in {No, Bayesian, Bernoulli, MVS} device-eligible "
-        "for the SymmetricTree (oblivious) grow via host sampling (Design A). Poisson "
-        "is rejected up front on EVERY backend by design. Non-oblivious grow policies "
-        "x sampling remain CPU-only."
+        "bootstrap_type in {No, Bayesian, Bernoulli, MVS} is device-eligible for the "
+        "SymmetricTree (oblivious) grow via HOST sampling (WR-01 Design A). Poisson is "
+        "device-eligible via DEVICE-RESIDENT sampling instead: upstream has no CPU "
+        "Poisson sampler at all, so its CUDA kernel is the specification and catboost_rs "
+        "transcribes it verbatim. Poisson therefore trains on the device and is refused "
+        "on the CPU grower, exactly as upstream accepts it on task_type=GPU and rejects "
+        "it on task_type=CPU. Non-oblivious grow policies x sampling remain CPU-only."
+    )
+    result["caveats"]["poisson_parity_basis"] = (
+        "Poisson cannot be gated against a CatBoost-Python run: upstream rejects it on "
+        "CPU, and its per-object GPU bootstrap weights are not observable through any "
+        "public API. Its parity evidence is instead bit-for-bit agreement between the "
+        "device kernel and cb-oracle/generator/poisson_bootstrap_oracle.cpp, a verbatim "
+        "host transcription of upstream's PoissonBootstrapImpl + random_gen.cuh, over "
+        "three launch geometries and two consecutive draws. The end-to-end CatBoost GPU "
+        "comparison below is a SPEED and quality comparison, not a numeric parity gate."
     )
     result["caveats"]["device_activation_is_proven_per_arm"] = (
         "Part B0 proves device residency per arm by running a short fit under "
@@ -140,6 +170,14 @@ def main():
                                     "crates/cb-backend/src/gpu_runtime/mod.rs"),
         "has_draw_replay": ("replay_grow_draws",
                             "crates/cb-train/src/device_draw_replay.rs"),
+        # Poisson markers: prove the staged tree carries the upstream-faithful kernel and
+        # its training wiring, so a stale upload cannot masquerade as a verified run.
+        "has_poisson_kernel": ("poisson_bootstrap_kernel",
+                               "crates/cb-backend/src/kernels/bootstrap_device.rs"),
+        "has_poisson_seeds": ("create_poisson_seeds",
+                              "crates/cb-backend/src/gpu_runtime/session.rs"),
+        "has_poisson_wiring": ("device_poisson",
+                               "crates/cb-train/src/boosting.rs"),
     }
     for key, (needle, rel) in markers.items():
         rc_m, out_m = sh(f"grep -c '{needle}' {REPO}/{rel} || true")
@@ -359,7 +397,7 @@ def main():
 
     # ---- report ----
     with open(os.path.join(WORK, "report.md"), "w") as fh:
-        fh.write("# WR-01 bootstrap oracle + speed — Colab T4 (CUDA)\n\n")
+        fh.write("# Bootstrap oracle + speed (incl. Poisson) — Colab T4 (CUDA)\n\n")
         fh.write(f"- GPU: `{result['provenance']['gpu']}`\n")
         fh.write(f"- verdict: **{result['verdict']}**\n")
         fh.write(f"- catboost: {result['speed'].get('catboost_version')}\n\n")
