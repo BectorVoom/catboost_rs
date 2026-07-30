@@ -3860,6 +3860,88 @@ pub fn partition_update_kernel<F: Float>(
     }
 }
 
+/// Tier-1 LDS-privatized [`partition_update_kernel`] (CubeCL manual
+/// `08_atomic_contention.md` §4) — the SAME per-partition `[Σ der1, Σ weight,
+/// Σ(der2·weight)]` reduction, but each cube first folds its object chunk into a
+/// PRIVATE shared-memory sub-result and then merges with ONE global atomic per cell.
+///
+/// Why: the naive kernel fires `3·n` global float atomics into only `n_parts * 3`
+/// addresses (at depth 6 / n=300k that is 900k atomics contending on 192 cells), which
+/// measured as ~40% of the resident oblivious grow's device time. Global traffic here
+/// drops to `CUBE_COUNT_X * cells`, INDEPENDENT of `n`.
+///
+/// The LDS accumulator is fixed-point [`Atomic<u64>`] rather than `Atomic<F>` for two
+/// reasons: shared-memory `f64` atomic-add is not uniformly available across backends
+/// (`Atomic<u64>` is the pattern already proven in [`partition_hist2_lds_kernel`]), and
+/// integer accumulation makes the INTRA-cube fold exactly order-independent. The
+/// cross-cube merge stays `Atomic<F>` so the host read path is byte-unchanged; that
+/// merge is `CUBE_COUNT_X`-way instead of `n`-way, so its float-atomic reordering
+/// exposure is strictly smaller than the kernel it replaces.
+///
+/// RANGE precondition (inherited from [`fixedpoint_encode`]): each PER-CUBE partial sum
+/// must satisfy `|Σ| < 2^33`. Per-cube partials are `n / CUBE_COUNT_X` objects wide —
+/// strictly smaller than the whole-column sums the caller already validates.
+///
+/// `lds_cells` is the comptime LDS budget; the caller must guarantee
+/// `part_stats.len() <= lds_cells` and fall back to [`partition_update_kernel`]
+/// otherwise.
+#[cube(launch)]
+pub fn partition_update_lds_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    der2: &Array<F>,
+    indices: &Array<u32>,
+    leaf_of: &Array<u32>,
+    part_stats: &Array<Atomic<F>>,
+    #[comptime] lds_cells: u32,
+) {
+    let lds = SharedMemory::<Atomic<u64>>::new(comptime!(lds_cells as usize));
+
+    let n = indices.len();
+    let cd = CUBE_DIM as usize;
+    // Only the ACTIVE prefix is touched (manual §4 rule 1): the caller sized
+    // `part_stats` to exactly `n_parts * 3`.
+    let active = part_stats.len();
+
+    // (1) Zero the ACTIVE LDS cells, strided across the cube's units.
+    let mut c = UNIT_POS as usize;
+    while c < active {
+        lds[c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+
+    // (2) Fold this cube's grid-strided object chunk into the private sub-result.
+    let stride = (CUBE_COUNT_X as usize) * cd;
+    let mut i = (CUBE_POS_X as usize) * cd + (UNIT_POS as usize);
+    while i < n {
+        let obj = indices[i] as usize;
+        let part = leaf_of[obj] as usize;
+        let d = der1[obj];
+        let w = weight[obj];
+        // Newton hessian channel folds weight HERE (A3 landmine), matching
+        // `cb_compute::reduce_leaf_der2`'s `der2·weight` convention — identical to
+        // `partition_update_kernel`.
+        let h = der2[obj] * w;
+        // Same in-kernel partition VALUE guard as the naive kernel (WR-04): `leaf_of`
+        // is DEVICE-PRODUCED, so the range check must live here. if-as-STATEMENT only.
+        if part * 3usize + 2usize < active {
+            lds[part * 3usize].fetch_add(fixedpoint_encode::<F>(d));
+            lds[part * 3usize + 1usize].fetch_add(fixedpoint_encode::<F>(w));
+            lds[part * 3usize + 2usize].fetch_add(fixedpoint_encode::<F>(h));
+        }
+        i += stride;
+    }
+    sync_cube();
+
+    // (3) Merge LDS → global: ONE global atomic per active cell, per cube.
+    let mut m = UNIT_POS as usize;
+    while m < active {
+        part_stats[m].fetch_add(fixedpoint_decode::<F>(lds[m].load()));
+        m += cd;
+    }
+}
+
 // ===========================================================================
 // Phase 11 Plan 02 (GPUT-05 / GPUT-06) — the partition-aware `pointwise_hist2`
 // (`fullPass = false`) keyed by `leaf_of[obj]` into `2^level` leaf slots, the
