@@ -69,7 +69,7 @@ use crate::kernels::{
     pairwise_hist_half_byte_kernel, pairwise_hist_nonbinary_kernel,
     derive_sibling_partition_hist_kernel, fold_hist_copies_kernel,
     partition_hist2_lds_kernel, partition_hist2_nonbinary_kernel, partition_split_kernel,
-    partition_update_kernel,
+    partition_update_kernel, partition_update_lds_kernel,
     pointwise_hist2_binary_kernel, zero_u64_kernel,
     HIST_LDS_CELLS_LARGE, HIST_LDS_CELLS_MEDIUM, HIST_LDS_CELLS_SMALL,
     pointwise_hist2_half_byte_kernel, pointwise_hist2_nonbinary_kernel,
@@ -159,6 +159,24 @@ const HIST_CUBE_DIM: usize = 256;
 /// contention drops by the copy count where it is worst (the shallow levels, where
 /// few hot cells absorb every object's 2-atomic scatter).
 const HIST_MAX_COPIES: usize = 64;
+
+/// Cube width for the LDS-privatized per-partition stat reduction
+/// ([`crate::kernels::partition_update_lds_kernel`]). Same occupancy reasoning as
+/// [`HIST_CUBE_DIM`]: a wide cube amortizes the fixed per-cube zero + merge passes
+/// over more objects, which is what makes privatization pay.
+const PART_UPDATE_CUBE_DIM: usize = 256;
+
+/// Cube-count CAP for the LDS-privatized partition stat reduction. Global-atomic
+/// traffic after privatization is `cubes * n_parts * 3`, so the cap — NOT `n` — bounds
+/// the merge cost; 256 cubes × 256 units still saturates the device at n ≫ 65k while
+/// keeping the merge ~18× cheaper than the naive `3·n` scatter at depth 6.
+const PART_UPDATE_MAX_CUBES: usize = 256;
+
+/// LDS capacity guard (in `u64` cells) for the privatized partition stat reduction.
+/// `n_parts * 3` cells at 8 bytes: 1536 cells = 12 KiB, covering depth <= 9. Anything
+/// wider falls back to the naive global-atomic kernel rather than overflowing shared
+/// memory.
+const PART_UPDATE_LDS_MAX_CELLS: usize = 1536;
 
 /// Target TOTAL cube count for the 2-D LDS-privatized fill dispatch (object chunks ×
 /// feature tiles). ~4-8 cubes per SM/CU on the mid-size parts this targets (P100 = 56
@@ -2126,17 +2144,45 @@ pub(crate) fn launch_partition_update_into(
     #[cfg(not(feature = "wgpu"))]
     let part_stats = {
         let h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; part_stats_len]));
-        partition_update_kernel::launch::<f64, SelectedRuntime>(
-            client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(der1, n) },
-            unsafe { ArrayArg::from_raw_parts(weight, n) },
-            unsafe { ArrayArg::from_raw_parts(der2, n) },
-            unsafe { ArrayArg::from_raw_parts(indices, n) },
-            unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
-            unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
-        );
+        // Tier-1 LDS privatization (CubeCL manual 08_atomic_contention.md §4) when the
+        // per-partition cells fit shared memory. The naive kernel's `3·n` global float
+        // atomics contend on only `n_parts * 3` addresses and measured ~40% of the
+        // resident oblivious grow's device time; privatizing drops global traffic to
+        // `cubes * cells`, independent of `n`. Wider-than-budget partition sets (depth
+        // > 9) keep the naive path rather than overflowing LDS.
+        if part_stats_len <= PART_UPDATE_LDS_MAX_CELLS {
+            let lds_cubes = n
+                .div_ceil(PART_UPDATE_CUBE_DIM)
+                .clamp(1, PART_UPDATE_MAX_CUBES);
+            partition_update_lds_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                CubeCount::Static(lds_cubes as u32, 1, 1),
+                CubeDim {
+                    x: PART_UPDATE_CUBE_DIM as u32,
+                    y: 1,
+                    z: 1,
+                },
+                unsafe { ArrayArg::from_raw_parts(der1, n) },
+                unsafe { ArrayArg::from_raw_parts(weight, n) },
+                unsafe { ArrayArg::from_raw_parts(der2, n) },
+                unsafe { ArrayArg::from_raw_parts(indices, n) },
+                unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+                unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+                part_stats_len as u32,
+            );
+        } else {
+            partition_update_kernel::launch::<f64, SelectedRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(der1, n) },
+                unsafe { ArrayArg::from_raw_parts(weight, n) },
+                unsafe { ArrayArg::from_raw_parts(der2, n) },
+                unsafe { ArrayArg::from_raw_parts(indices, n) },
+                unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
+                unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+            );
+        }
         h
     };
 
