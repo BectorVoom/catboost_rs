@@ -36,7 +36,27 @@
 //!   8192-element block; `lambda` from the mean gradient magnitude (iter 0) or
 //!   the previous tree's mean leaf L2 norm; per-block threshold via
 //!   [`calculate_threshold`]; `SampleWeights[i] = (1/p) * (r.gen_rand_real1() <
-//!   p)`; `control[i] = SampleWeights[i] > eps`.
+//!   p)`; `control[i] = SampleWeights[i] > eps`. Consumes **exactly ONE**
+//!   main-stream draw per call (`mvs.cpp:174`) — see the DRAW CONTRACT note in
+//!   the dispatch arm; the per-block streams branch off it.
+//!
+//! # Known, deliberate deviations from upstream (MVS)
+//!
+//! Recorded so a future reader does not mistake the MVS port for a complete
+//! transcription:
+//!
+//! - **`CalculateMeanGradValue` reduction order.** Upstream blocks the mean-gradient
+//!   reduction by `CB_THREAD_LIMIT` (`restrictions.h:59`), independently of the
+//!   configured thread count; [`mean_grad_value`] uses one flat ordered
+//!   `cb_core::sum_f64` instead. Observable only through the iteration-0 lambda, and
+//!   no committed oracle currently sees it (every fixture's tree-0 splits agree).
+//! - **`mvs_reg` / `TMaybe<float> Lambda`.** Upstream lets the caller override lambda
+//!   (`mvs.h:49`); this port always derives it. Unmodelled — no parameter exposes it.
+//! - **Learn-weight multiplication.** Upstream multiplies the object weight into
+//!   `SampleWeights` (`tensor_search_helpers.cpp:482`); this port does not, and no
+//!   weighted-MVS fixture exists to prove or disprove a gap.
+//! - **Ordered-boosting MVS.** The tail-derivative copy (`mvs.cpp:136-168`) is out of
+//!   scope; only Plain boosting is modelled.
 //! - [`EBootstrapType::Poisson`] — UNSUPPORTED on CPU (upstream
 //!   `bootstrap_options.cpp:27-33` throws "poisson bootstrap is not supported on
 //!   CPU"). The dispatch surfaces [`CbError::Degenerate`]; there is no CPU
@@ -309,7 +329,7 @@ fn mvs_sample_weights(
             &mut candidates,
             0.0,
             0.0,
-            sample_rate * block_size as f64,
+            mvs_block_sample_size(sample_rate, block_size),
         );
 
         for (offset, &der) in block.iter().enumerate() {
@@ -320,7 +340,14 @@ fn mvs_sample_weights(
                 let weight = 1.0 / probability;
                 let r = block_rng.gen_rand_real1();
                 if let Some(slot) = weights.get_mut(idx) {
-                    *slot = weight * f64::from(r < probability);
+                    // Upstream stores into `TVector<float> SampleWeights`
+                    // (`catboost/private/libs/algo/fold.h:217`), so the value is
+                    // f32-rounded before anything reads it. The narrowing wraps the
+                    // whole product, leaving the `r < probability` decision — and
+                    // therefore the draw stream — untouched. A dropped object still
+                    // stores a bit-exact `0.0`, so the `control` mask
+                    // (`w > f32::EPSILON`) is unaffected: a kept weight is `1/p >= 1`.
+                    *slot = f64::from((weight * f64::from(r < probability)) as f32);
                 }
             } else if let Some(slot) = weights.get_mut(idx) {
                 *slot = 0.0;
@@ -328,6 +355,22 @@ fn mvs_sample_weights(
         }
     }
     weights
+}
+
+/// The per-block threshold-search target, `SampleRate * blockSize`.
+///
+/// Upstream's `TMvsSampler::SampleRate` is a **`float`** (`mvs.h:47`), so the product
+/// is evaluated in `f32` and only then widened. `block_size <= MVS_BLOCK_SIZE = 8192
+/// < 2^24`, so the `f32` cast of the count is exact and this is a faithful
+/// transcription of `float * ui32`.
+///
+/// The helper narrows the rate itself rather than trusting the caller to have done it.
+/// That is idempotent at the real call site (`mvs_sample_weights` already narrowed at
+/// the top) and it makes the function correct in isolation — a unit test calling it
+/// with a raw `0.8` literal gets the same answer the sampler does.
+#[inline]
+fn mvs_block_sample_size(sample_rate: f64, block_size: usize) -> f64 {
+    f64::from((sample_rate as f32) * block_size as f32)
 }
 
 /// `CalculateMeanGradValue` (`mvs.cpp:37-65`): mean over objects of
@@ -410,19 +453,27 @@ pub fn bootstrap(
         EBootstrapType::Mvs => {
             let lambda = mvs_lambda(derivatives, prev_leaf_mean_l2);
             let sample_weights = mvs_sample_weights(derivatives, lambda, subsample, rng);
-            if subsample < 1.0 {
-                // MVS uses `performRandomChoice=false` (calc_score_cache.cpp:752),
-                // so its `sampledDocs->Sample` keeps the full doc set and the score
-                // path consumes two additional `GenRand()` draws on the main stream
-                // relative to the Bernoulli/`SetSampledControl` path. Reproduce them
-                // so the next tree's MVS reseed lands on the correct RNG phase
-                // (verified end-to-end against the MVS oracle). With subsample==1.0
-                // MVS draws nothing at all (the early-return identity path).
-                rng.gen_rand();
-                rng.gen_rand();
-            }
+            // DRAW CONTRACT: MVS consumes EXACTLY ONE main-stream draw per
+            // `Bootstrap()` call — the `randSeed = rand->GenRand()` that
+            // `mvs_sample_weights` takes above (`mvs.cpp:174`). Nothing else on this
+            // path draws: with `performRandomChoice = false`,
+            // `TCalcScoreFold::Sample` goes down the `SetControlNoZeroWeighted`
+            // branch (`calc_score_cache.cpp:742-748`), which never touches `rand`,
+            // and `CalcWeightedData` (`tensor_search_helpers.cpp:442-485`) is
+            // draw-free. Verified against the instrumented 1.2.10 trace
+            // (`.planning/plans/bayesian-rng-draw-accounting/
+            // instrumented-ground-truth/mvs.jsonl`): `tree_rng_pre_gts.cc = 2` ->
+            // level-0 `cc_start = 7` = 1 bootstrap draw + 4 RSM draws.
+            //
+            // Two "compensation" `gen_rand()` calls used to live here, justified by a
+            // misreading of `calc_score_cache.cpp`. They made every tree from the
+            // first onward sample from a wrong RNG phase, which flipped a split
+            // argmax on 7 of 10 seed/bias configurations — invisibly, because the
+            // single committed MVS oracle happened to be one of the 3 that still
+            // passed. Do NOT reintroduce a compensating advance here or anywhere
+            // else; `mvs_bootstrap_consumes_exactly_one_main_stream_draw` pins it.
             // performRandomChoice = false -> control = weight > eps
-            // (SetControlNoZeroWeighted, calc_score_cache.cpp:1203-1211).
+            // (SetControlNoZeroWeighted, calc_score_cache.cpp:1196-1204, mask at :1202).
             let control: Vec<bool> = sample_weights
                 .iter()
                 .map(|&w| w > f64::from(f32::EPSILON))

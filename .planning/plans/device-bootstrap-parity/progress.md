@@ -46,7 +46,7 @@ disjoint files, verified in `PLAN.md` §1.
 
 ## Residuals discovered during implementation (NOT introduced by this phase)
 
-### R-1 — MVS diverges from upstream at tree 2 (pre-existing, CPU-side)
+### R-1 — MVS diverged from upstream (pre-existing, CPU-side) — **RESOLVED**
 
 Generating the bias-0 `bootstrap_dev/` family exposed a real upstream-parity gap in
 the **CPU** MVS sampler that no committed fixture covered. It is not caused by the
@@ -70,13 +70,44 @@ the defect; the divergence enters when tree 2's sample is drawn from that λ. Th
 committed `bootstrap/mvs` oracle (seed 0, `boost_from_average=True`) happens to be one
 of the passing configurations, which is why the gap went unnoticed.
 
+**RESOLVED 2026-07-31** by the `mvs-tree2-parity` phase. The diagnosis recorded below
+was WRONG in two ways and is kept only as a record of what was believed at the time:
+
+1. **The cause was not a tree-2 mechanism and not λ.** `cb_train::bootstrap`'s MVS arm
+   consumed **three** main-stream RNG draws per tree — one real `rand_seed` plus **two
+   fabricated "compensation" draws** — where upstream consumes exactly one
+   (`mvs.cpp:174`). The justification in that code block misread its own source: with
+   `performRandomChoice = false`, `TCalcScoreFold::Sample` takes the
+   `SetControlNoZeroWeighted` branch (`calc_score_cache.cpp:742-748`) and never touches
+   `rand`. The fix was a deletion.
+2. **Drift begins at tree 1, not tree 2.** The tree-2 appearance was an artifact of the
+   single configuration first examined; at `boost_from_average=true, seed=4` the first
+   divergent split is flat index 3 (tree 1). Measured first-bad-split set across the
+   seven failing configurations: `{3, 4, 4, 4, 5, 5, 4}`.
+
+The +2-draws-per-tree phase drift made every tree from the first onward sample a
+different 80 % subset; a wrong subset only surfaces when it actually flips a split
+argmax, which is why the failure looked seed- and bias-dependent.
+
+**Outcome:** all 10 `(seed, bias)` configurations now match upstream at ≤1e-5 over all
+3 trees, on CPU and on the device. `MVS_GATED_TREES` is gone —
+`bootstrap_dev_oracle_test` gates MVS exactly like every other scenario. A new
+`mvs_seeds/` fixture family (5 seeds × both bias settings) makes the class of regression
+that hid this defect impossible to repeat: with the two draws re-inserted, **7 of 10**
+scenarios fail. Device-vs-CPU MVS parity re-measured at **6.798e-11** (was 4.703e-11).
+See `.planning/plans/mvs-tree2-parity/`.
+
+---
+
+*Historical record of the superseded diagnosis follows.*
+
 **Handled by:** `bootstrap_dev_oracle_test::MVS_GATED_TREES = 2` — MVS keeps a real
 upstream claim over trees 0–1 and still catches a regression there, without asserting
 a third tree we know does not hold. Device-vs-CPU MVS parity is separately locked at
 ≤1e-5 (measured 4.703e-11), so the DEVICE half of WR-01 is unaffected.
 
-**Not fixed here** — it is a distinct CPU-sampler defect deserving its own
-spec + TDD bug-chase phase, not a scope extension of the device phase.
+**Was not fixed in the device phase** — it was a distinct CPU-sampler defect, and it got
+its own spec + TDD bug-chase phase (`mvs-tree2-parity`) rather than a scope extension.
 
 ### R-2 — base-grower deltas moved from ~2e-16 to ~5e-11
 
