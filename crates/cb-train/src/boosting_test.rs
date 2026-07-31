@@ -18,6 +18,8 @@ use cb_compute::{
 };
 
 use super::{calc_pairwise_weights, compute_leaf_deltas, uses_pairwise_weights};
+use super::oblivious_from_grown;
+use crate::tree::{CtrSplitSpec, Split};
 use super::validate_score_function;
 use cb_compute::EScoreFunction;
 
@@ -300,4 +302,96 @@ fn calc_pairwise_weights_honors_weights_and_empty_groups() {
     };
     let pw = calc_pairwise_weights(&[group_a, group_b], 4);
     assert_eq!(pw, vec![2.5, 2.5, 0.0, 0.0]);
+}
+
+// ===========================================================================
+// T03 / SPEC-OH-01 — ObliviousTree carries ordered mixed-kind levels
+// ===========================================================================
+
+/// The trainer must stop discarding `GrownTree.level_kinds` at the persist step.
+///
+/// Until now `oblivious_from_grown`'s predecessor built `ObliviousTree` from
+/// `grown.splits` + `ctr_splits` only, throwing the per-level interleaving away.
+/// Since `cb_model`'s apply path treats STORED split order as the leaf-index bit
+/// order, a tree whose level 0 is a CTR split and level 1 a float split had its
+/// leaf indices transposed once it crossed the trainer→model boundary. Carrying
+/// `level_kinds` through is the prerequisite for fixing that (T04) and for storing
+/// mixed float/one-hot levels at all (T19).
+#[test]
+fn oblivious_tree_records_level_kinds_in_level_order() {
+    use crate::tree::LevelKind;
+
+    let grown_level_kinds = vec![
+        LevelKind::Ctr {
+            ctr_idx: 0,
+            border: 0.5,
+        },
+        LevelKind::Float(0),
+    ];
+
+    let tree = oblivious_from_grown(
+        vec![Split {
+            feature: 0,
+            border: 1.5,
+        }],
+        vec![CtrSplitSpec {
+            projection: crate::TProjection::single(0),
+            ctr_type: 0,
+            prior_num: 0.5,
+            prior_denom: 1.0,
+            target_border_idx: 0,
+            border: 0.5,
+            shift: 0.0,
+            scale: 1.0,
+        }],
+        Vec::new(),
+        grown_level_kinds.clone(),
+        vec![10.0, 20.0, 30.0, 40.0],
+        vec![1.0, 1.0, 1.0, 1.0],
+    );
+
+    assert_eq!(
+        tree.level_kinds, grown_level_kinds,
+        "level_kinds must survive the persist step in LEVEL order (CTR at level 0, \
+         float at level 1) — dropping it is what transposes leaf indices downstream"
+    );
+    assert!(
+        tree.one_hot_splits.is_empty(),
+        "T03 introduces the one_hot_splits field but never populates it (that is T19)"
+    );
+    // The pre-existing kind-grouped vectors are untouched.
+    assert_eq!(tree.splits.len(), 1);
+    assert_eq!(tree.ctr_splits.len(), 1);
+}
+
+/// A float-only tree persists EMPTY `level_kinds`, so downstream consumers take the
+/// unchanged legacy path and the float-only output stays byte-identical
+/// (SPEC-OH-31). This is the structural half of the no-regression guarantee.
+#[test]
+fn float_only_tree_persists_empty_level_kinds() {
+    let tree = oblivious_from_grown(
+        vec![
+            Split {
+                feature: 0,
+                border: 1.5,
+            },
+            Split {
+                feature: 1,
+                border: 2.5,
+            },
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![1.0, 2.0, 3.0, 4.0],
+        vec![1.0, 1.0, 1.0, 1.0],
+    );
+
+    assert!(
+        tree.level_kinds.is_empty(),
+        "a float-only tree must persist EMPTY level_kinds so consumers keep the \
+         byte-identical legacy path"
+    );
+    assert!(tree.one_hot_splits.is_empty());
+    assert_eq!(tree.splits.len(), 2);
 }

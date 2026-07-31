@@ -768,6 +768,32 @@ pub fn ordered_approx_delta_simple(
     Ok(approx_delta)
 }
 
+/// Assemble one [`ObliviousTree`] from a grown tree's parts, carrying the
+/// per-level kind order through (T03 / SPEC-OH-01).
+///
+/// Extracted from the boosting loop's push site so the level-order contract is
+/// unit-testable without running a fit. `level_kinds` is passed through verbatim:
+/// EMPTY for a single-kind tree (consumers keep the byte-identical legacy path),
+/// populated in true level order when kinds interleave.
+#[must_use]
+fn oblivious_from_grown(
+    splits: Vec<Split>,
+    ctr_splits: Vec<CtrSplitSpec>,
+    one_hot_splits: Vec<crate::tree::OneHotSplit>,
+    level_kinds: Vec<crate::tree::LevelKind>,
+    leaf_values: Vec<f64>,
+    leaf_weights: Vec<f64>,
+) -> ObliviousTree {
+    ObliviousTree {
+        splits,
+        ctr_splits,
+        one_hot_splits,
+        level_kinds,
+        leaf_values,
+        leaf_weights,
+    }
+}
+
 /// One trained oblivious tree: the ordered splits, the per-leaf values
 /// (already scaled by `learning_rate`, matching upstream `model.json`), and the
 /// per-leaf summed training-document weights (`leaf_weights`, RESEARCH Pitfall 1).
@@ -784,6 +810,29 @@ pub struct ObliviousTree {
     /// numeric / one-hot / ordered-boosting paths (no CTR candidates emitted).
     /// `cb_model::Model::from_trained` lifts each into a `ModelSplit::Ctr`.
     pub ctr_splits: Vec<CtrSplitSpec>,
+    /// The ordered ONE-HOT categorical splits chosen during tree growth
+    /// (`cat_bin == value`), one [`crate::tree::OneHotSplit`] per chosen one-hot
+    /// level. EMPTY for every path that emits no one-hot candidate — which is all
+    /// of them until T19 populates it — so the widely-read `splits` surface stays
+    /// byte-for-byte unchanged. `cb_model::Model::from_trained` lifts each into a
+    /// `ModelSplit::OneHot`.
+    pub one_hot_splits: Vec<crate::tree::OneHotSplit>,
+    /// The per-level chosen-split kinds in TRUE LEVEL ORDER, carried through from
+    /// [`crate::tree::GrownTree::level_kinds`].
+    ///
+    /// EMPTY when a tree's levels are all one kind — consumers then fall back to
+    /// the kind-grouped order, which is byte-identical to pre-change behaviour
+    /// (SPEC-OH-31). NON-empty only when kinds interleave.
+    ///
+    /// # Why this field exists
+    ///
+    /// `cb_model`'s apply path (`leaf_index_for`) treats the STORED split order as
+    /// the leaf-index bit order. Persisting only the kind-grouped vectors
+    /// (`splits` then `ctr_splits`) therefore TRANSPOSED leaf indices for any tree
+    /// whose levels interleave — e.g. `[Ctr, Float]` was stored as `[Float, Ctr]`,
+    /// swapping leaves 1 and 2. Carrying the true order here is what lets
+    /// `from_trained` reconstruct it.
+    pub level_kinds: Vec<crate::tree::LevelKind>,
     /// Leaf values in canonical forward-bit-order, length `2^depth`.
     pub leaf_values: Vec<f64>,
     /// Per-leaf summed training-document weights in the same forward-bit-order
@@ -3546,12 +3595,17 @@ fn train_inner<R: Runtime>(
                     out.extend_from_slice(&approx);
                 }
 
-                trees.push(ObliviousTree {
-                    splits: device_splits,
-                    ctr_splits: Vec::new(),
-                    leaf_values: device_leaf_values,
-                    leaf_weights: device_leaf_weights,
-                });
+                // The device oblivious grower emits FLOAT splits only, so its
+                // levels are single-kind and `level_kinds` stays EMPTY — consumers
+                // take the byte-identical legacy path (SPEC-OH-31).
+                trees.push(oblivious_from_grown(
+                    device_splits,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    device_leaf_values,
+                    device_leaf_weights,
+                ));
             } else {
                 // ─── NON-SYMMETRIC ARM (Depthwise / Lossguide, GPUT-18) ───
                 // The device emits a PER-NODE `(feature, bin_id)` in `dev_tree.splits`
@@ -4807,12 +4861,14 @@ fn train_inner<R: Runtime>(
                 leaf_weights,
             });
         } else if grown.step_nodes.is_empty() {
-            trees.push(ObliviousTree {
-                splits: grown.splits,
+            trees.push(oblivious_from_grown(
+                grown.splits,
                 ctr_splits,
+                Vec::new(),
+                grown.level_kinds,
                 leaf_values,
                 leaf_weights,
-            });
+            ));
         } else {
             non_symmetric_trees.push(NonSymmetricTree {
                 splits: grown.splits,

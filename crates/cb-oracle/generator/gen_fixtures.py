@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -98,6 +99,16 @@ ORDERED_BOOST_E2E = FIXTURES / "ordered_boost_e2e"
 # oracle validates final predictions through the production cb_model::predict_raw
 # CTR-split apply path (ModelSplit::Ctr) ≤1e-5 across ALL trees.
 TENSOR_CTR_E2E = FIXTURES / "tensor_ctr_e2e"
+
+# SPEC-OH-29 (one-hot categorical TRAINING). A NEW family — never an extension of
+# the frozen `one_hot_cat/` per-object anchor, which carries no model at all. Each
+# scenario trains an upstream one-hot model (a categorical column whose cardinality
+# lands on `route_categorical`'s OneHot arm, i.e. 1 < cardinality <= one_hot_max_size)
+# and saves BOTH `.cbm` and `model.json`, so the Rust oracle can prove (a) our
+# encoding is upstream-COMPATIBLE (load upstream's .cbm and predict) and (b) our
+# training reproduces upstream ≤1e-5 through production code. Reachable ONLY through
+# `--one-hot-only`; NEVER from main().
+ONE_HOT_TRAIN = FIXTURES / "one_hot_train"
 
 # ---------------------------------------------------------------------------
 # PHASE-4 FIXTURE MANIFEST (D-13) — every NEW fixture path the downstream Wave-2..5
@@ -1057,6 +1068,359 @@ def gen_bootstrap_dev_only() -> None:
     `bootstrap/` family and `inputs/bootstrap_multiblock/` -- untouched."""
     gen_bootstrap_dev()
     print("Wrote WR-01 bias-0 bootstrap_dev fixtures (no/bayesian/bernoulli/mvs)")
+
+
+
+def _one_hot_fixture_dirty_paths() -> list[str]:
+    """`git status --short crates/cb-oracle/fixtures`, one path per entry.
+
+    SPEC-OH-29 abort guard. `gen_fixtures.py` has NO positional-scenario dispatch:
+    an unrecognised argv falls through to `else: main()` and regenerates the ENTIRE
+    committed corpus, which is run-to-run NONDETERMINISTIC (upstream quantization).
+    This guard makes any such spill loud instead of silent.
+    """
+    out = subprocess.run(
+        ["git", "status", "--short", "crates/cb-oracle/fixtures"],
+        cwd=str(GENERATOR_DIR.parent.parent.parent),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return [line[3:].strip() for line in out.splitlines() if line.strip()]
+
+
+def _first_referenced_values(model_json_path) -> dict[int, list[int]]:
+    """Per cat-feature, the one-hot `value`s in the order the TREES first reference
+    them (walking trees in order, splits in level order).
+
+    Used to prove the fixture actually DISCRIMINATES upstream's `Values`-array
+    ordering rule (first-referenced vs ascending-hash). If every cat feature's
+    values happen to be ascending, the ordering pin is vacuous and a wrong
+    implementation would still pass.
+    """
+    with open(model_json_path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    seen: dict[int, list[int]] = {}
+    for tree in doc.get("oblivious_trees", []):
+        for split in tree.get("splits", []):
+            if split.get("split_type") != "OneHotFeature":
+                continue
+            cat = int(split["cat_feature_index"])
+            val = int(split["value"])
+            bucket = seen.setdefault(cat, [])
+            if val not in bucket:
+                bucket.append(val)
+    return seen
+
+
+def _stored_values(model_json_path) -> dict[int, list[int]]:
+    """Per cat-feature, the `values` array upstream STORED in the model (the
+    one-hot bin order that fixes the global combined-bin indices)."""
+    with open(model_json_path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    stored: dict[int, list[int]] = {}
+    for cat in doc.get("features_info", {}).get("categorical_features", []):
+        if "values" in cat:
+            stored[int(cat["feature_index"])] = [int(v) for v in cat["values"]]
+    return stored
+
+
+def gen_one_hot() -> None:
+    """one_hot_train/{default_binary,multi}/ — upstream one-hot TRAINING fixtures.
+
+    A NEW family. It is NOT an extension of `one_hot_cat/` (a frozen per-object
+    anchor with no model) and MUST NOT be reached from `main()` — only through
+    `--one-hot-only`.
+
+    Why it exists: `cb_train`'s `grow_one_hot_tree` has no production caller, so a
+    categorical column routed to `EncodingPath::OneHot` contributes NOTHING to the
+    trained model, silently. With the builder default `one_hot_max_size = 2` that
+    is every binary categorical column. These fixtures are the upstream ground
+    truth that makes the gap testable.
+
+    Scenarios:
+      default_binary/ — 3 float columns + 1 BINARY cat column at the DEFAULT
+                        `one_hot_max_size = 2`; the headline silent-drop case.
+      multi/          — 1 float column (2 borders) + cat columns of cardinality
+                        2 and 3, `one_hot_max_size = 5`, `max_ctr_complexity = 0`;
+                        mirrors the probe that pinned the combined bin space
+                        (float 0,1; cat 0 -> 2; cat 1 -> 3,4).
+    """
+    ONE_HOT_TRAIN.mkdir(parents=True, exist_ok=True)
+
+    # `shared` deliberately reuses ISOLATING_PARAMS (never mutates it — it is
+    # shared by every family) and pins random_strength = 0 EXPLICITLY: catboost's
+    # raw dict API and our builder disagree on that default, which has silently
+    # invalidated oracle fixtures before.
+    shared = {
+        **ISOLATING_PARAMS,
+        "iterations": 3,
+        "depth": 3,
+        "random_seed": 0,
+        "thread_count": 1,
+        "random_strength": 0,
+        "boost_from_average": False,
+        "loss_function": "Logloss",
+        "verbose": False,
+    }
+
+    rng = np.random.default_rng(SEED)
+    n_rows = 256
+
+    scenarios = {
+        "default_binary": {
+            "n_float": 3,
+            # Labels chosen so first-referenced order and ascending-hash order can
+            # diverge; asserted below and perturbed until they do.
+            "cat_labels": [["alpha", "beta"]],
+            "one_hot_max_size": 2,
+        },
+        "multi": {
+            "n_float": 1,
+            "cat_labels": [["alpha", "beta"], ["x", "y", "z"]],
+            "one_hot_max_size": 5,
+        },
+    }
+
+    family_discriminates: dict[str, bool] = {}
+
+    for name, spec in scenarios.items():
+        scenario_dir = ONE_HOT_TRAIN / name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        n_float = spec["n_float"]
+        x_float = rng.normal(0.0, 1.0, size=(n_rows, n_float))
+
+        # Search label permutations until at least ONE cat feature's stored
+        # `values` array is NOT ascending — otherwise the ordering rule
+        # (first-referenced vs ascending-hash) is indistinguishable and T07's pin
+        # would be vacuous.
+        chosen = None
+        for attempt in range(24):
+            cat_labels = [
+                [f"{lbl}{attempt}" if attempt else lbl for lbl in labels]
+                for labels in spec["cat_labels"]
+            ]
+            cat_cols = [
+                rng.integers(0, len(labels), size=n_rows) for labels in cat_labels
+            ]
+            x_cat_str = np.stack(
+                [
+                    np.array([labels[i] for i in col], dtype=object)
+                    for labels, col in zip(cat_labels, cat_cols)
+                ],
+                axis=1,
+            )
+            logit = x_float[:, 0] + 0.9 * cat_cols[0].astype(np.float64)
+            if len(cat_cols) > 1:
+                logit = logit - 0.7 * cat_cols[1].astype(np.float64)
+            logit = logit - logit.mean()
+            y = (logit > 0.0).astype(np.float64)
+            if len(np.unique(y)) < 2:
+                continue
+
+            params = {
+                **shared,
+                "one_hot_max_size": spec["one_hot_max_size"],
+                "max_ctr_complexity": 0,
+            }
+            x_all = np.concatenate(
+                [x_float.astype(object), x_cat_str], axis=1
+            )
+            cat_idx = list(range(n_float, n_float + len(cat_labels)))
+            model = CatBoost(params)
+            model.fit(Pool(x_all, y, cat_features=cat_idx))
+            tmp_json = scenario_dir / "model.json"
+            model.save_model(str(tmp_json), format="json")
+
+            stored = _stored_values(tmp_json)
+            if not stored:
+                continue
+            # A fixture DISCRIMINATES upstream's `Values`-ordering rule iff, for
+            # some cat feature with >= 2 stored values, the STORED order differs
+            # from the order the trees FIRST REFERENCE those values. Only then can
+            # an implementation that guesses "first-referenced" be told apart from
+            # one that uses ascending-hash order.
+            #
+            # (An earlier predicate here asked whether stored order was
+            # non-ascending. That was wrong: it tests the ANSWER rather than the
+            # fixture's ability to distinguish the two candidate answers, and it
+            # rejects a perfectly discriminating fixture whose rule happens to BE
+            # ascending — which upstream's is.)
+            first_ref_probe = _first_referenced_values(tmp_json)
+            discriminates = any(
+                len(vals) >= 2 and vals != first_ref_probe.get(cat, [])
+                for cat, vals in stored.items()
+            )
+            chosen = {
+                "cat_labels": cat_labels,
+                "cat_cols": cat_cols,
+                "x_cat_str": x_cat_str,
+                "x_all": x_all,
+                "cat_idx": cat_idx,
+                "y": y,
+                "model": model,
+                "params": params,
+                "stored": stored,
+                "discriminates": discriminates,
+                "attempt": attempt,
+            }
+            if discriminates:
+                break
+
+        if chosen is None:
+            raise AssertionError(
+                f"one_hot_train/{name}: could not train a model with one-hot splits"
+            )
+        # NOTE: discrimination is a FAMILY-level requirement, asserted after the
+        # loop. A scenario whose cat features each store a SINGLE value (upstream
+        # prunes `Values` to those actually referenced by a split, so a binary
+        # column commonly stores just one) is trivially "ascending" and CANNOT
+        # discriminate the ordering rule no matter what labels are chosen —
+        # failing per-scenario would make `default_binary` unbuildable.
+        family_discriminates[name] = bool(chosen["discriminates"])
+
+        model = chosen["model"]
+        first_ref = _first_referenced_values(scenario_dir / "model.json")
+        print(
+            f"  one_hot_train/{name}: stored={chosen['stored']} "
+            f"first_referenced={first_ref} "
+            f"(ascending would be { {k: sorted(v) for k, v in chosen['stored'].items()} })"
+        )
+
+        model.save_model(str(scenario_dir / "model.cbm"), format="cbm")
+        predictions = _assert_f64(
+            np.asarray(
+                model.predict(chosen["x_all"], prediction_type="RawFormulaVal"),
+                dtype=np.float64,
+            ),
+            "predictions",
+        )
+        np.save(scenario_dir / "predictions.npy", predictions, allow_pickle=False)
+        np.save(
+            scenario_dir / "X_float.npy",
+            _assert_f64(x_float, "X_float"),
+            allow_pickle=False,
+        )
+        np.save(
+            scenario_dir / "y.npy", _assert_f64(chosen["y"], "y"), allow_pickle=False
+        )
+        with (scenario_dir / "cat_cols.json").open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "labels": chosen["cat_labels"],
+                    "columns": [
+                        [chosen["cat_labels"][c][int(i)] for i in col]
+                        for c, col in enumerate(chosen["cat_cols"])
+                    ],
+                    "cat_feature_indices_in_x_all": chosen["cat_idx"],
+                },
+                fh,
+                indent=2,
+                sort_keys=True,
+            )
+            fh.write("\n")
+
+        read_back = model.get_all_params()
+        for key in (
+            "one_hot_max_size",
+            "random_strength",
+            "random_seed",
+            "depth",
+            "iterations",
+            "thread_count",
+        ):
+            if key in read_back and str(read_back[key]) != str(chosen["params"][key]):
+                raise AssertionError(
+                    f"one_hot_train/{name}: {key} read back as {read_back[key]!r}, "
+                    f"pinned {chosen['params'][key]!r}"
+                )
+
+        config = {
+            "scenario": f"one_hot_train/{name}",
+            "requirement": "SPEC-OH-29",
+            "seed": SEED,
+            "catboost_version": CATBOOST_VERSION,
+            "thread_count": 1,
+            "n_rows": int(n_rows),
+            "n_float_features": int(n_float),
+            "n_cat_features": int(len(chosen["cat_labels"])),
+            "cat_labels": chosen["cat_labels"],
+            "one_hot_max_size": spec["one_hot_max_size"],
+            "boost_from_average": False,
+            "prediction_type": "RawFormulaVal",
+            "params": chosen["params"],
+            "stored_one_hot_values": {
+                str(k): v for k, v in chosen["stored"].items()
+            },
+            "first_referenced_one_hot_values": {
+                str(k): v for k, v in first_ref.items()
+            },
+            "values_order_discriminates_ascending": bool(chosen["discriminates"]),
+            "stages": ["Splits", "LeafValues", "Predictions"],
+            "note": (
+                "Upstream catboost 1.2.10 ONE-HOT training fixture (SPEC-OH-29). "
+                "Generated OFFLINE with thread_count=1 and a pinned seed; NEVER "
+                "regenerated in CI (upstream quantization is run-to-run "
+                "nondeterministic) — CI only READS these artifacts. At least one "
+                "cat feature's stored `values` array is NON-ascending, so the "
+                "first-referenced vs ascending-hash ordering rule is genuinely "
+                "discriminated."
+            ),
+            "npy_schema": {
+                "X_float.npy": f"[N, {n_float}] float64 — float columns",
+                "y.npy": "[N] float64 — Logloss labels",
+                "cat_cols.json": "raw categorical columns as STRING labels (the A4 form calc_cat_feature_hash hashes)",
+                "model.cbm": "upstream one-hot model, FlatBuffers (the interop target)",
+                "model.json": "upstream one-hot model, json (splits + leaf_values + borders + categorical_features.values)",
+                "predictions.npy": "[N] float64 — upstream RawFormulaVal (the ≤1e-5 target)",
+            },
+        }
+        with (scenario_dir / "config.json").open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    # FAMILY-level ordering-discrimination requirement. At least ONE scenario must
+    # store a NON-ascending `values` array, otherwise upstream's ordering rule
+    # (first-referenced vs ascending-hash) is indistinguishable across the whole
+    # family and T07's pin would be vacuous — a wrong implementation would pass.
+    if not any(family_discriminates.values()):
+        raise AssertionError(
+            "one_hot_train: NO scenario stored a `values` array whose order DIFFERS "
+            f"from the trees' first-referenced order (per-scenario: "
+            f"{family_discriminates}). The Values-ordering rule is not "
+            "discriminated; widen the label search or add a higher-cardinality "
+            "scenario."
+        )
+    print(f"  one_hot_train ordering discrimination: {family_discriminates}")
+
+
+def gen_one_hot_only() -> None:
+    """Targeted entrypoint: regenerate ONLY the SPEC-OH-29 `one_hot_train/` family,
+    leaving every other committed fixture -- in particular the frozen
+    `one_hot_cat/` per-object anchor -- untouched.
+
+    Guarded on BOTH sides: any fixture path outside `one_hot_train/` that this run
+    dirties is a hard failure, because the bare-argv fallthrough would otherwise
+    regenerate the whole nondeterministic corpus silently.
+    """
+    before = set(_one_hot_fixture_dirty_paths())
+    gen_one_hot()
+    after = set(_one_hot_fixture_dirty_paths())
+    spilled = sorted(
+        p
+        for p in (after - before)
+        if "crates/cb-oracle/fixtures/one_hot_train/" not in p.replace("\\", "/")
+    )
+    if spilled:
+        print(
+            "ABORT: --one-hot-only dirtied fixtures OUTSIDE one_hot_train/:",
+            file=sys.stderr,
+        )
+        for path in spilled:
+            print(f"  {path}", file=sys.stderr)
+        sys.exit(1)
+    print("Wrote SPEC-OH-29 one_hot_train fixtures (default_binary/multi)")
 
 
 def gen_regularization() -> None:
@@ -3483,6 +3847,11 @@ if __name__ == "__main__":
         # family, leaving the frozen `bootstrap/` family and every other committed
         # fixture untouched.
         gen_bootstrap_dev_only()
+    elif "--one-hot-only" in sys.argv:
+        # `--one-hot-only` regenerates ONLY the SPEC-OH-29 `one_hot_train/` family,
+        # leaving the frozen `one_hot_cat/` anchor and every other committed fixture
+        # untouched.
+        gen_one_hot_only()
     elif "--multiquantile-only" in sys.argv:
         # `--multiquantile-only` regenerates ONLY the Plan 06.2-05 MultiQuantile
         # fixture (multiquantile), leaving every committed Phase 2-5 / 6.1 /
