@@ -328,17 +328,11 @@ impl Model {
             .oblivious_trees
             .iter()
             .map(|t| {
-                let mut splits: Vec<ModelSplit> = t
-                    .splits
-                    .iter()
-                    .map(|s| ModelSplit::Float(*s))
-                    .collect();
-                // Lift any trainer-side tensor-CTR splits into ModelSplit::Ctr
-                // (ORD-05 / D-05). The numeric / one-hot / ordered paths carry an
-                // empty `ctr_splits`, so this is a no-op there.
-                for c in &t.ctr_splits {
+                // Lift one trainer-side tensor-CTR split into a `ModelSplit::Ctr`
+                // (ORD-05 / D-05).
+                let lift_ctr = |c: &cb_train::CtrSplitSpec| {
                     let ctr_type = ECtrType::from_i8(c.ctr_type).unwrap_or(ECtrType::Borders);
-                    splits.push(ModelSplit::Ctr(CtrSplit {
+                    ModelSplit::Ctr(CtrSplit {
                         projection: c.projection.clone(),
                         ctr_type,
                         prior: Prior {
@@ -352,8 +346,42 @@ impl Model {
                         // the found and not-found branches (Plan 05-14).
                         shift: c.shift,
                         scale: c.scale,
-                    }));
-                }
+                    })
+                };
+
+                // SPEC-OH-02: the STORED split order IS the leaf-index bit order
+                // (`leaf_index_for`, apply.rs:208-215), and `.cbm` save/load
+                // preserve it 1:1. So when a tree's levels interleave kinds, the
+                // splits must be emitted in TRUE LEVEL order — assembling them
+                // kind-grouped (all floats, then all CTRs) transposes leaf indices
+                // and mis-predicts.
+                let splits: Vec<ModelSplit> = if t.level_kinds.is_empty() {
+                    // LEGACY PATH — every single-kind tree (which is every tree the
+                    // float, device, one-hot-free and ordered paths produce) leaves
+                    // `level_kinds` empty and keeps the exact pre-change assembly:
+                    // floats first, then CTRs. Byte-identical (SPEC-OH-31).
+                    let mut splits: Vec<ModelSplit> =
+                        t.splits.iter().map(|s| ModelSplit::Float(*s)).collect();
+                    splits.extend(t.ctr_splits.iter().map(&lift_ctr));
+                    splits
+                } else {
+                    // MIXED-KIND PATH — walk the recorded per-level kinds in order,
+                    // indexing back into the parallel kind-grouped vectors. An index
+                    // out of range is skipped defensively: a malformed
+                    // `level_kinds` must not panic across the crate boundary
+                    // (no `unwrap`, no indexing_slicing).
+                    t.level_kinds
+                        .iter()
+                        .filter_map(|kind| match *kind {
+                            cb_train::LevelKind::Float(idx) => {
+                                t.splits.get(idx).copied().map(ModelSplit::Float)
+                            }
+                            cb_train::LevelKind::Ctr { ctr_idx, .. } => {
+                                t.ctr_splits.get(ctr_idx).map(&lift_ctr)
+                            }
+                        })
+                        .collect()
+                };
                 ObliviousTree {
                     splits,
                     leaf_values: t.leaf_values.clone(),

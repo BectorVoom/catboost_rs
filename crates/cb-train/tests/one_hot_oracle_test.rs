@@ -318,3 +318,81 @@ fn predict_all(model: &cb_train::Model, cols: &[Vec<f32>]) -> Vec<f64> {
         })
         .collect()
 }
+
+// ===========================================================================
+// T02 / SPEC-OH-29 — the frozen `one_hot_train/` upstream fixture family
+// ===========================================================================
+//
+// SCAFFOLDING: this asserts only that the committed fixture exists and is
+// well-formed. The ≤1e-5 parity assertions against it land in T15 (upstream
+// `.cbm` -> predict) and T22 (production `train_cat` -> predict), at which point
+// the test-local driver above is deleted.
+
+/// The `one_hot_train/` family is present, well-formed, and — critically — the
+/// `multi` scenario genuinely DISCRIMINATES upstream's `Values`-ordering rule:
+/// the stored order differs from the trees' first-referenced order, so an
+/// implementation that guesses "first-referenced" cannot pass by accident.
+#[test]
+fn one_hot_train_fixture_is_present_and_wellformed() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../cb-oracle/fixtures/one_hot_train");
+
+    for scenario in ["default_binary", "multi"] {
+        let dir = root.join(scenario);
+        for artifact in [
+            "model.cbm",
+            "model.json",
+            "predictions.npy",
+            "X_float.npy",
+            "y.npy",
+            "cat_cols.json",
+            "config.json",
+        ] {
+            assert!(
+                dir.join(artifact).is_file(),
+                "missing fixture artifact {scenario}/{artifact}"
+            );
+        }
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).expect("config"))
+                .expect("config.json parses");
+        assert_eq!(
+            config["catboost_version"], "1.2.10",
+            "{scenario}: fixture must be pinned to the oracle catboost version"
+        );
+        assert_eq!(
+            config["thread_count"], 1,
+            "{scenario}: thread_count must be pinned to 1 for deterministic summation"
+        );
+        assert_eq!(
+            config["params"]["random_strength"], 0,
+            "{scenario}: random_strength must be pinned explicitly on BOTH sides"
+        );
+
+        let n_rows = config["n_rows"].as_u64().expect("n_rows") as usize;
+        let preds = ndarray_npy::read_npy::<_, ndarray::Array1<f64>>(dir.join("predictions.npy"))
+            .expect("predictions.npy");
+        assert_eq!(
+            preds.len(),
+            n_rows,
+            "{scenario}: predictions.npy must carry one RawFormulaVal per row"
+        );
+    }
+
+    // The family-level ordering-discrimination requirement (blocker B3): at least
+    // one scenario's stored `values` order must differ from the order the trees
+    // first reference those values, otherwise the ordering rule is untestable.
+    let multi: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("multi/config.json")).expect("multi config"),
+    )
+    .expect("multi config.json parses");
+    assert_eq!(
+        multi["values_order_discriminates_ascending"], true,
+        "the `multi` scenario must discriminate upstream's Values-ordering rule"
+    );
+    assert_ne!(
+        multi["stored_one_hot_values"], multi["first_referenced_one_hot_values"],
+        "stored order must differ from first-referenced order to be discriminating"
+    );
+}

@@ -759,6 +759,14 @@ mod session_residency;
 #[cfg(test)]
 mod session_depth_gt1_test;
 
+// T00 / SPEC-OH-31: the DEVICE float-only identity baseline. Lives here (a
+// `gpu_runtime` descendant) rather than in `tests/` because `pack_cindex` and
+// `PackedCindex::device_arrays` are `pub(crate)` inside a `pub(crate)` module and
+// are unreachable from an integration test. Carries only the `#[ignore]`d capture
+// fn plus its non-degeneracy guard; T29b adds the assertion fns.
+#[cfg(test)]
+mod device_float_only_identity_test;
+
 // Phase 10-06 (GPUT-15): the bit-packed compressed index (cindex) builder — the
 // grouped `WriteCompressedIndex` layout + per-feature `TCFeature` table the histogram /
 // partition consumers read through the ONE `kernels::read_bin` accessor. `pub(crate)` so
