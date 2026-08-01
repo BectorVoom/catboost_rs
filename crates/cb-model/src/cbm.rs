@@ -43,7 +43,7 @@
 //! buffers and caps depth), and uses checked `u32::try_from` / `.get` throughout.
 //! Every failure maps to a typed [`ModelError`]; nothing panics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
@@ -51,10 +51,11 @@ use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use crate::ctr_data::{ctr_base_key, decode_ctr_model_parts, encode_ctr_model_parts, ECtrType, Prior};
 use crate::error::ModelError;
 use crate::model_generated::ncat_boost_fbs::{
-    root_as_tmodel_core, ECtrType as CoreECtrType, TCtrFeature, TCtrFeatureArgs,
-    TFeatureCombination, TFeatureCombinationArgs, TFloatFeature, TFloatFeatureArgs, TKeyValue,
-    TKeyValueArgs, TModelCore, TModelCoreArgs, TModelCtr, TModelCtrArgs, TModelCtrBase,
-    TModelCtrBaseArgs, TModelTrees, TModelTreesArgs, TNonSymmetricTreeStepNode,
+    root_as_tmodel_core, ECtrType as CoreECtrType, TCatFeature, TCatFeatureArgs, TCtrFeature,
+    TCtrFeatureArgs, TFeatureCombination, TFeatureCombinationArgs, TFloatFeature,
+    TFloatFeatureArgs, TKeyValue, TKeyValueArgs, TModelCore, TModelCoreArgs, TModelCtr,
+    TModelCtrArgs, TModelCtrBase, TModelCtrBaseArgs, TModelTrees, TModelTreesArgs,
+    TNonSymmetricTreeStepNode, TOneHotFeature, TOneHotFeatureArgs,
 };
 use crate::{CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, Split};
 
@@ -110,6 +111,114 @@ fn split_to_global_index(split: &Split, bins: &[BinFeature]) -> Result<i32, Mode
         })?;
     i32::try_from(pos).map_err(|_| {
         ModelError::SchemaVersion(format!("global split index {pos} exceeds i32 range"))
+    })
+}
+
+/// The ordered `OneHotFeatures` plan a save emits (SPEC-OH-11, the SAVE-side
+/// inverse of [`build_combined_bins`]'s one-hot walk): one entry per referenced
+/// categorical column, in ASCENDING cat-feature order, each carrying the
+/// ASCENDING-SIGNED distinct `value_hash` set the trees actually test.
+///
+/// # Values ORDER (pinned empirically)
+/// Upstream stores `TOneHotFeature.Values` in **ASCENDING SIGNED `i32`** order,
+/// NOT first-referenced order. Pinned against the committed
+/// `crates/cb-oracle/fixtures/one_hot_train/multi` fixture, produced by real
+/// catboost 1.2.10: its cat feature 1 is first referenced as
+/// `[476319382, -784473192]` but stored as `[-784473192, 476319382]`
+/// (`config.json`'s `first_referenced_one_hot_values` vs
+/// `stored_one_hot_values`), and that model's `split_index 3` resolves to value
+/// `476319382` — the SECOND ascending entry — which only holds under the
+/// ascending rule.
+///
+/// # Pruning
+/// Only values some tree split references are stored, mirroring upstream (a
+/// value present in the training pool but never split on does not occupy a bin).
+struct OneHotFeaturePlan {
+    /// `(cat_feature, ascending distinct value hashes)`, ASCENDING by
+    /// `cat_feature`.
+    features: Vec<(usize, Vec<i32>)>,
+    /// `offsets[i]` = Σ `values.len()` of `features[0..i]` — the preceding
+    /// one-hot bins ahead of entry `i` within the one-hot range.
+    offsets: Vec<usize>,
+    /// Σ over every entry's `values.len()` — the width of the whole one-hot
+    /// range, which the CTR range starts after (SPEC §7 supersedes the
+    /// pre-one-hot "CTR starts at `n_float_bins`" assumption).
+    n_bins: usize,
+}
+
+/// Group a model's tree `ModelSplit::OneHot` splits into the ordered
+/// `OneHotFeatures` plan (SPEC-OH-11) — the inverse of [`build_combined_bins`]'s
+/// one-hot walk. v1 groups OBLIVIOUS trees only, matching
+/// [`build_ctr_features`]; a one-hot split on a non-symmetric tree is rejected
+/// in the save loop.
+fn build_one_hot_features(model: &Model) -> OneHotFeaturePlan {
+    let mut grouped: BTreeMap<usize, BTreeSet<i32>> = BTreeMap::new();
+    for tree in &model.oblivious_trees {
+        for split in &tree.splits {
+            if let ModelSplit::OneHot(oh) = split {
+                grouped.entry(oh.cat_feature).or_default().insert(oh.value_hash);
+            }
+        }
+    }
+
+    // `BTreeMap`/`BTreeSet` iteration already yields cat features ascending and,
+    // within each, value hashes ASCENDING SIGNED (`i32`'s natural `Ord`) — the
+    // pinned upstream order.
+    let features: Vec<(usize, Vec<i32>)> = grouped
+        .into_iter()
+        .map(|(cat_feature, values)| (cat_feature, values.into_iter().collect()))
+        .collect();
+
+    let mut offsets = Vec::with_capacity(features.len());
+    let mut acc: usize = 0;
+    for (_, values) in &features {
+        offsets.push(acc);
+        acc = acc.saturating_add(values.len());
+    }
+
+    OneHotFeaturePlan {
+        features,
+        offsets,
+        n_bins: acc,
+    }
+}
+
+/// Map a tree [`crate::OneHotModelSplit`] to its combined GLOBAL split index
+/// (SPEC-OH-11): `n_float_bins + Σ(preceding Values.len()) + value_index`, where
+/// `value_index` is the split's position in its feature's ASCENDING `values`.
+/// A split absent from the plan is a typed error rather than a silent mis-index.
+fn one_hot_split_to_global_index(
+    split: &crate::OneHotModelSplit,
+    n_float_bins: usize,
+    plan: &OneHotFeaturePlan,
+) -> Result<i32, ModelError> {
+    let entry = plan
+        .features
+        .iter()
+        .position(|(c, _)| *c == split.cat_feature)
+        .ok_or_else(|| {
+            ModelError::Serialize(
+                "one-hot split cat feature missing from the OneHotFeatures plan".to_owned(),
+            )
+        })?;
+    let (_, values) = plan.features.get(entry).ok_or_else(|| {
+        ModelError::Serialize("OneHotFeatures plan index out of range".to_owned())
+    })?;
+    let value_index = values
+        .iter()
+        .position(|v| *v == split.value_hash)
+        .ok_or_else(|| {
+            ModelError::Serialize("one-hot split value missing from its feature".to_owned())
+        })?;
+    let offset = plan.offsets.get(entry).copied().ok_or_else(|| {
+        ModelError::Serialize("OneHotFeatures plan offset out of range".to_owned())
+    })?;
+    let global = n_float_bins
+        .checked_add(offset)
+        .and_then(|g| g.checked_add(value_index))
+        .ok_or_else(|| ModelError::Serialize("one-hot global split index overflow".to_owned()))?;
+    i32::try_from(global).map_err(|_| {
+        ModelError::SchemaVersion(format!("one-hot global split index {global} exceeds i32 range"))
     })
 }
 
@@ -232,13 +341,16 @@ fn build_ctr_features(model: &Model) -> Result<CtrFeaturePlan, ModelError> {
 }
 
 /// Map a tree [`CtrSplit`] to its combined GLOBAL split index (T1):
-/// `n_float_bins + Σ(preceding Borders.len()) + border_index` (fact 1). The
-/// identity is located via its grouping key; the border index is its position in
-/// that identity's sorted `borders`. A split absent from the plan (or a
-/// border/offset out of range) is a typed error rather than a silent mis-index.
+/// `ctr_bin_base + Σ(preceding Borders.len()) + border_index`. `ctr_bin_base` is
+/// where the CTR range starts in the combined `Float -> OneHot -> Ctr` space —
+/// `n_float_bins + n_one_hot_bins` (SPEC-OH-11), which degenerates to
+/// `n_float_bins` for a model with no one-hot splits (fact 1). The identity is
+/// located via its grouping key; the border index is its position in that
+/// identity's sorted `borders`. A split absent from the plan (or a border/offset
+/// out of range) is a typed error rather than a silent mis-index.
 fn ctr_split_to_global_index(
     split: &CtrSplit,
-    n_float_bins: usize,
+    ctr_bin_base: usize,
     plan: &CtrFeaturePlan,
 ) -> Result<i32, ModelError> {
     let &c = plan.index_by_key.get(&ctr_identity_key(split)).ok_or_else(|| {
@@ -260,7 +372,7 @@ fn ctr_split_to_global_index(
         .get(c)
         .copied()
         .ok_or_else(|| ModelError::Serialize("CtrFeatures plan offset out of range".to_owned()))?;
-    let global = n_float_bins
+    let global = ctr_bin_base
         .checked_add(offset)
         .and_then(|g| g.checked_add(border_index))
         .ok_or_else(|| ModelError::Serialize("CTR global split index overflow".to_owned()))?;
@@ -347,11 +459,17 @@ enum BinKind {
         /// The border threshold.
         border: f64,
     },
-    /// A one-hot equality bin. COUNTED for the offset (upstream always
-    /// includes `OneHotFeatures` bins in the combined index space) but not
-    /// representable as a [`crate::ModelSplit`] in v1 (SPEC §2/CTR-05) — a
-    /// *tree split* referencing this range is a typed error.
-    OneHot,
+    /// A one-hot equality bin: the `value_hash`-th `Values` entry of the
+    /// `OneHotFeatures` entry whose `Index` is `cat_feature`. COUNTED for the
+    /// offset (upstream always includes `OneHotFeatures` bins in the combined
+    /// index space) AND, since SPEC-OH-08, decodable to a
+    /// [`crate::ModelSplit::OneHot`] (T08).
+    OneHot {
+        /// The ABSOLUTE categorical-column index (`TOneHotFeature.Index`).
+        cat_feature: usize,
+        /// The raw upstream `i32` hash (`TOneHotFeature.Values[k]`).
+        value_hash: i32,
+    },
     /// A CTR bin: the `border_index`-th border of `CtrFeatures[ctr_feature]`.
     Ctr {
         /// Index into `TModelTrees.CtrFeatures`.
@@ -369,6 +487,11 @@ enum BinKind {
 /// order) so a numeric-only model (`CtrFeatures`/`OneHotFeatures` both empty)
 /// classifies exactly as before.
 ///
+/// The one-hot walk is the exact INVERSE of [`build_one_hot_features`]: that
+/// function emits `OneHotFeatures` ascending by `Index` with `Values` ascending
+/// signed, and this one reads them back positionally in the same order, so a
+/// save → load → save round-trip is byte-identical (SPEC-OH-12).
+///
 /// # Errors
 /// [`ModelError::Deserialize`] on a malformed `FloatFeatures` table (the same
 /// failure [`read_float_feature_borders`] surfaces).
@@ -384,9 +507,25 @@ fn build_combined_bins(trees: &TModelTrees) -> Result<Vec<BinKind>, ModelError> 
 
     if let Some(one_hot_features) = trees.OneHotFeatures() {
         for i in 0..one_hot_features.len() {
-            let n_values = one_hot_features.get(i).Values().map_or(0, |v| v.len());
-            for _ in 0..n_values {
-                out.push(BinKind::OneHot);
+            let feature = one_hot_features.get(i);
+            // `Index` is the ABSOLUTE cat-column index; upstream's default is
+            // `-1` (unset), which cannot address a column.
+            let cat_feature = usize::try_from(feature.Index()).map_err(|_| {
+                ModelError::Deserialize(format!(
+                    "OneHotFeatures[{i}] has a negative Index ({})",
+                    feature.Index()
+                ))
+            })?;
+            let values = feature.Values();
+            let n_values = values.as_ref().map_or(0, ::flatbuffers::Vector::len);
+            for k in 0..n_values {
+                // Bounds-safe: `k < n_values` and `values` is `Some` whenever
+                // `n_values > 0`.
+                let value_hash = values.as_ref().map_or(0_i32, |v| v.get(k));
+                out.push(BinKind::OneHot {
+                    cat_feature,
+                    value_hash,
+                });
             }
         }
     }
@@ -520,10 +659,19 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
     let bins = build_bin_features(&model.float_feature_borders);
 
     // CTR save plan (T1/T4): group the trees' `ModelSplit::Ctr` splits into the
-    // ordered `CtrFeatures` identities and their combined global-index math. v1
-    // has no one-hot bins, so the CTR range begins right after the float bins.
+    // ordered `CtrFeatures` identities and their combined global-index math.
     let plan = build_ctr_features(model)?;
     let n_float_bins = bins.len();
+
+    // One-hot save plan (SPEC-OH-11): the combined bin space is
+    // `Float -> OneHot -> Ctr`, so the CTR range begins after BOTH the float
+    // bins and the one-hot bins. A model with no one-hot splits has
+    // `one_hot_plan.n_bins == 0`, leaving `ctr_bin_base == n_float_bins` and the
+    // pre-one-hot wire bytes byte-identical (SPEC-OH-31).
+    let one_hot_plan = build_one_hot_features(model);
+    let ctr_bin_base = n_float_bins.checked_add(one_hot_plan.n_bins).ok_or_else(|| {
+        ModelError::Serialize("combined float + one-hot bin count overflow".to_owned())
+    })?;
 
     // A CTR split must have a matching baked table in `model.ctr_data` (its
     // apply-time lookup key) — never emit a CtrFeature whose table would miss.
@@ -661,8 +809,17 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
                 ModelSplit::Float(float_split) => {
                     tree_splits.push(split_to_global_index(float_split, &bins)?);
                 }
+                // A ONE-HOT split maps to its `OneHotFeatures` global index,
+                // which sits between the float and CTR ranges (SPEC-OH-11).
+                ModelSplit::OneHot(oh) => {
+                    tree_splits.push(one_hot_split_to_global_index(
+                        oh,
+                        n_float_bins,
+                        &one_hot_plan,
+                    )?);
+                }
                 ModelSplit::Ctr(ctr_split) => {
-                    tree_splits.push(ctr_split_to_global_index(ctr_split, n_float_bins, &plan)?);
+                    tree_splits.push(ctr_split_to_global_index(ctr_split, ctr_bin_base, &plan)?);
                 }
             }
         }
@@ -726,6 +883,58 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
         Some(fbb.create_vector(&ctr_offsets))
     };
 
+    // OneHotFeatures + CatFeatures (SPEC-OH-11): one `TOneHotFeature` per
+    // referenced cat column, ASCENDING by cat index, carrying its ASCENDING
+    // pruned `Values`; plus the `TCatFeature` descriptor upstream pairs with it
+    // (`Index` = the cat-column index, `FlatIndex` = `n_float + Index` — the
+    // shape read off the `one_hot_train/multi` fixture's
+    // `categorical_features[*].{feature_index, flat_feature_index}`). BOTH stay
+    // `None` for a model with no one-hot splits, so the pre-one-hot wire bytes
+    // are byte-identical (SPEC-OH-31).
+    let (one_hot_features_vec, cat_features_vec) = if one_hot_plan.features.is_empty() {
+        (None, None)
+    } else {
+        let n_float = model.float_feature_borders.len();
+        let mut one_hot_offsets = Vec::with_capacity(one_hot_plan.features.len());
+        let mut cat_offsets = Vec::with_capacity(one_hot_plan.features.len());
+        for (cat_feature, values) in &one_hot_plan.features {
+            let index = i32::try_from(*cat_feature).map_err(|_| {
+                ModelError::SchemaVersion(format!(
+                    "cat-feature index {cat_feature} exceeds i32 range"
+                ))
+            })?;
+            let flat = n_float.checked_add(*cat_feature).ok_or_else(|| {
+                ModelError::Serialize("cat-feature flat index overflow".to_owned())
+            })?;
+            let flat_index = i32::try_from(flat).map_err(|_| {
+                ModelError::SchemaVersion(format!("cat-feature flat index {flat} exceeds i32 range"))
+            })?;
+            let values_vec = fbb.create_vector(values);
+            one_hot_offsets.push(TOneHotFeature::create(
+                &mut fbb,
+                &TOneHotFeatureArgs {
+                    Index: index,
+                    Values: Some(values_vec),
+                    ..TOneHotFeatureArgs::default()
+                },
+            ));
+            let feature_id = fbb.create_string("");
+            cat_offsets.push(TCatFeature::create(
+                &mut fbb,
+                &TCatFeatureArgs {
+                    Index: index,
+                    FlatIndex: flat_index,
+                    FeatureId: Some(feature_id),
+                    UsedInModel: true,
+                },
+            ));
+        }
+        (
+            Some(fbb.create_vector(&one_hot_offsets)),
+            Some(fbb.create_vector(&cat_offsets)),
+        )
+    };
+
     let tree_splits_vec = fbb.create_vector(&tree_splits);
     let tree_sizes_vec = fbb.create_vector(&tree_sizes);
     let tree_start_offsets_vec = fbb.create_vector(&tree_start_offsets);
@@ -755,6 +964,8 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
             TreeSizes: Some(tree_sizes_vec),
             TreeStartOffsets: Some(tree_start_offsets_vec),
             FloatFeatures: Some(float_features),
+            CatFeatures: cat_features_vec,
+            OneHotFeatures: one_hot_features_vec,
             CtrFeatures: ctr_features_vec,
             LeafValues: Some(leaf_values_vec),
             LeafWeights: Some(leaf_weights_vec),
@@ -1034,15 +1245,17 @@ fn reconstruct_model(
                     feature: *feature,
                     border: *border,
                 }),
-                // One-hot FEATURE tables are counted for the bin offset (CTR-01)
-                // but no `ModelSplit::OneHot` variant exists; a *tree split*
-                // referencing this range is a typed error (CTR-05), never a
-                // silent drop.
-                BinKind::OneHot => {
-                    return Err(ModelError::Deserialize(
-                        "one-hot split unsupported (v1)".to_owned(),
-                    ))
-                }
+                // A one-hot bin decodes straight back into the equality split
+                // that produced it (SPEC-OH-12, superseding CTR-05's blanket
+                // rejection). `build_combined_bins` already validated
+                // `OneHotFeature.Index` as a non-negative cat-column index.
+                BinKind::OneHot {
+                    cat_feature,
+                    value_hash,
+                } => crate::ModelSplit::OneHot(crate::OneHotModelSplit {
+                    cat_feature: *cat_feature,
+                    value_hash: *value_hash,
+                }),
                 BinKind::Ctr {
                     ctr_feature,
                     border_index,

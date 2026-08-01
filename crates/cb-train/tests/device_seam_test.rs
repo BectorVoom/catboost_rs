@@ -143,7 +143,7 @@ fn device_seam_folds_depth1_tree_via_bin_border_join() {
     // Device returns split (feature 0, bin_id 1) -> border must resolve to
     // feature_borders[0][1] = 1.5; UN-scaled leaf values [2.0, -3.0].
     let dev_tree = DeviceGrownTree {
-        splits: vec![(0, 1)],
+        splits: vec![(0, 1, false)],
         leaf_values: vec![2.0, -3.0],
         approx_dim: 1,
         leaf_of: Vec::new(),
@@ -184,11 +184,30 @@ fn device_seam_folds_depth1_tree_via_bin_border_join() {
         tree.splits[0].border
     );
 
-    // Leaf values are the device's UN-scaled leaves * learning_rate (0.1), no
-    // pairwise centering for RMSE (D-04 leaf-update contract).
+    // Leaf values are the device's UN-scaled leaves (`2.0` / `-3.0`) times
+    // `learning_rate`, with no pairwise centering for RMSE (D-04 leaf-update
+    // contract).
+    //
+    // The rate is written as `f64::from(0.1_f32)`, NOT the literal `0.1`:
+    // upstream's `TBoostingOptions::LearningRate` is an f32, so the trainer
+    // scales by the f32-representable rate (`0.10000000149011612`). Hard-coding
+    // `0.2` here would assert the pre-fix f64 semantics and drift by 3.0e-9 —
+    // well outside this 1e-12 tolerance. Expressing the RULE rather than the
+    // constant keeps the assertion honest if the rate ever changes again.
+    let lr = f64::from(0.1_f32);
     assert_eq!(tree.leaf_values.len(), 2);
-    assert!((tree.leaf_values[0] - 0.2).abs() < 1e-12);
-    assert!((tree.leaf_values[1] + 0.3).abs() < 1e-12);
+    assert!(
+        (tree.leaf_values[0] - 2.0 * lr).abs() < 1e-12,
+        "leaf 0: expected 2.0 * f32(0.1) = {}, got {}",
+        2.0 * lr,
+        tree.leaf_values[0]
+    );
+    assert!(
+        (tree.leaf_values[1] + 3.0 * lr).abs() < 1e-12,
+        "leaf 1: expected -3.0 * f32(0.1) = {}, got {}",
+        -3.0 * lr,
+        tree.leaf_values[1]
+    );
 
     // Staged approx = bias (0) + per-object leaf contribution, using the SAME
     // forward-bit leaf assignment (value > 1.5) the fold applied.
@@ -238,7 +257,7 @@ fn device_bin_id_out_of_range_is_typed_error() {
     // Feature 0 has 3 borders (valid bin ids 0..=2); bin_id 5 is out of range and
     // must surface a typed OutOfRange error, never a panic / raw index (T-10-22).
     let dev_tree = DeviceGrownTree {
-        splits: vec![(0, 5)],
+        splits: vec![(0, 5, false)],
         leaf_values: vec![1.0, -1.0],
         approx_dim: 1,
         leaf_of: Vec::new(),
@@ -279,7 +298,7 @@ fn device_declines_nonzero_starting_bias_boost_from_average() {
     let mock = DeviceMock {
         accept_begin: true,
         grow: Some(DeviceGrownTree {
-            splits: vec![(0, 1)],
+            splits: vec![(0, 1, false)],
             leaf_values: vec![2.0, -3.0],
             approx_dim: 1,
             leaf_of: Vec::new(),
@@ -324,7 +343,7 @@ fn device_declines_newton_leaf_method_on_covered_loss() {
     let mock = DeviceMock {
         accept_begin: true,
         grow: Some(DeviceGrownTree {
-            splits: vec![(0, 1)],
+            splits: vec![(0, 1, false)],
             leaf_values: vec![2.0, -3.0],
             approx_dim: 1,
             leaf_of: Vec::new(),
@@ -367,7 +386,7 @@ fn device_declined_begin_falls_back_to_cpu_path() {
     let mock = DeviceMock {
         accept_begin: false,
         grow: Some(DeviceGrownTree {
-            splits: vec![(0, 1)],
+            splits: vec![(0, 1, false)],
             leaf_values: vec![2.0, -3.0],
             approx_dim: 1,
             leaf_of: Vec::new(),

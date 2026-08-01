@@ -93,7 +93,7 @@ fn shap_matrix_matches_upstream_within_tol() {
     let model = model_from_json(&mj);
     let cols = load_feature_columns();
 
-    let shap = shap_values(&model, &cols, N_FEATURES);
+    let shap = shap_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let flat: Vec<f64> = shap.iter().flat_map(|row| row.iter().copied()).collect();
 
     let expected = load_f64_vec(&fixture("feature_importance/shap_values.npy"))
@@ -122,7 +122,7 @@ fn shap_local_accuracy_holds_on_upstream_model() {
     let model = model_from_json(&mj);
     let cols = load_feature_columns();
 
-    let shap = shap_values(&model, &cols, N_FEATURES);
+    let shap = shap_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let preds = predict_raw(&model, &cols);
     assert_eq!(shap.len(), preds.len(), "one SHAP row per object");
 
@@ -176,7 +176,7 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
         vec![0.0, 2.0, 0.0, 1.0, 1.0],
     ];
 
-    let shap = shap_values(&model, &cols, 2);
+    let shap = shap_values(&model, &cols, 2).expect("the fixture model is float-only");
     let preds = predict_raw(&model, &cols);
     assert_eq!(shap.len(), preds.len());
     for (obj, (row, &pred)) in shap.iter().zip(preds.iter()).enumerate() {
@@ -205,7 +205,7 @@ fn non_symmetric_shap_matches_upstream_and_local_accuracy() {
     );
     let cols = load_feature_columns(); // numeric_tiny X (same inputs the model trained on)
 
-    let shap = shap_values(&model, &cols, N_FEATURES);
+    let shap = shap_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let flat: Vec<f64> = shap.iter().flat_map(|row| row.iter().copied()).collect();
 
     let expected = load_f64_vec(&fixture("advanced_fstr/non_symmetric_shap.npy"))
@@ -230,4 +230,96 @@ fn non_symmetric_shap_matches_upstream_and_local_accuracy() {
             (total - pred).abs()
         );
     }
+}
+
+// ── SPEC-OH-15 — no SHAP surface silently drops a non-float split ────────────
+
+/// A depth-2 model whose level 0 is a float split and level 1 a one-hot split.
+/// Under the pre-SPEC-OH-15 code `float_splits_of` dropped the one-hot level, so
+/// every surface computed at `tree_depth == 1`: leaves `30.0`/`40.0` were
+/// unreachable and `shap_values` summed to `2.0` instead of the real prediction
+/// — a SILENT local-accuracy violation. Every surface must now refuse.
+fn one_hot_depth2_model() -> Model {
+    Model {
+        oblivious_trees: vec![ObliviousTree {
+            splits: vec![
+                ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                ModelSplit::OneHot(cb_model::OneHotModelSplit {
+                    cat_feature: 0,
+                    value_hash: 1_296_865_003,
+                }),
+            ],
+            leaf_values: vec![1.0, 2.0, 30.0, 40.0],
+            leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+        }],
+        non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
+        bias: 0.0,
+        float_feature_borders: vec![vec![0.5]],
+        ctr_data: None,
+        approx_dimension: 1,
+        class_to_label: Vec::new(),
+    }
+}
+
+#[test]
+fn shap_values_rejects_one_hot_models_instead_of_shrinking_tree_depth() {
+    let model = one_hot_depth2_model();
+    let cols = vec![vec![0.9_f32]];
+    assert!(matches!(
+        cb_model::shap_values(&model, &cols, 1),
+        Err(cb_model::ShapUnsupported::OneHotSplits)
+    ));
+}
+
+#[test]
+fn shap_interaction_values_rejects_one_hot_models() {
+    let model = one_hot_depth2_model();
+    let cols = vec![vec![0.9_f32]];
+    assert!(matches!(
+        cb_model::shap_interaction_values(&model, &cols, 1),
+        Err(cb_model::ShapUnsupported::OneHotSplits)
+    ));
+}
+
+#[test]
+fn prediction_diff_rejects_one_hot_models() {
+    let model = one_hot_depth2_model();
+    let cols = vec![vec![0.9_f32, 0.1]];
+    assert!(matches!(
+        cb_model::prediction_diff(&model, &cols, 1),
+        Err(cb_model::ShapUnsupported::OneHotSplits)
+    ));
+}
+
+#[test]
+fn sage_values_rejects_one_hot_models() {
+    let model = one_hot_depth2_model();
+    let cols = vec![vec![0.9_f32, 0.1]];
+    assert!(matches!(
+        cb_model::sage_values(&model, &cols, 1),
+        Err(cb_model::ShapUnsupported::OneHotSplits)
+    ));
+}
+
+/// The SAME silent drop applied to CTR splits before SPEC-OH-15 — the guard is
+/// structural (`float_splits_of` is fallible), so both non-float kinds are
+/// refused, not just the newly added one.
+#[test]
+fn shap_values_rejects_ctr_models_too() {
+    let mut model = one_hot_depth2_model();
+    model.oblivious_trees[0].splits[1] = ModelSplit::Ctr(cb_model::CtrSplit {
+        projection: cb_train::TProjection::from_features(&[0]),
+        ctr_type: cb_model::ECtrType::Borders,
+        prior: cb_model::Prior { num: 0.0, denom: 1.0 },
+        target_border_idx: 0,
+        border: 0.5,
+        shift: 0.0,
+        scale: 1.0,
+    });
+    let cols = vec![vec![0.9_f32]];
+    assert!(matches!(
+        cb_model::shap_values(&model, &cols, 1),
+        Err(cb_model::ShapUnsupported::CtrSplits)
+    ));
 }

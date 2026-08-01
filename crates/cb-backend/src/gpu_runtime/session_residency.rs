@@ -274,7 +274,7 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
             device_trees.iter().zip(cpu.iter()).enumerate()
         {
             assert_eq!(dev.splits.len(), 1, "device tree {k} must be a depth-1 stump (n={n})");
-            let (df, db) = dev.splits[0];
+            let (df, db, _one_hot) = dev.splits[0];
             assert_eq!(
                 (df as usize, db as usize),
                 *cpu_split,

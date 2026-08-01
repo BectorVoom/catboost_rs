@@ -401,7 +401,9 @@ pub(crate) fn grow_nonsym_tree(
     let node_count = nodes.len();
     let mut step_nodes: Vec<(u16, u16)> = Vec::with_capacity(node_count);
     let mut node_id_to_leaf_id: Vec<u32> = vec![u32::MAX; node_count];
-    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(node_count);
+    // SPEC-OH-24: the non-symmetric grower is OUT OF SCOPE for one-hot, so every entry
+    // carries the byte-unchanged `one_hot = false`.
+    let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(node_count);
     let mut leaf_values: Vec<f64> = Vec::new();
     let mut node_to_leaf: Vec<Option<u32>> = vec![None; node_count];
     let mut next_leaf_id: u32 = 0;
@@ -409,7 +411,7 @@ pub(crate) fn grow_nonsym_tree(
     for (id, node) in nodes.iter().enumerate() {
         match node {
             BuiltNode::Interior { feature, bin, left, right } => {
-                splits.push((*feature, *bin));
+                splits.push((*feature, *bin, false));
                 if let Some(slot) = node_id_to_leaf_id.get_mut(id) {
                     *slot = u32::MAX;
                 }
@@ -429,7 +431,7 @@ pub(crate) fn grow_nonsym_tree(
             }
             BuiltNode::Leaf => {
                 // Placeholder split for a leaf node (never read — its step entry is (0,0)).
-                splits.push((0, 0));
+                splits.push((0, 0, false));
                 step_nodes.push((0, 0));
                 if let Some(slot) = node_to_leaf.get_mut(id) {
                     *slot = Some(next_leaf_id);

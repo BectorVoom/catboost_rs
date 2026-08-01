@@ -174,7 +174,10 @@ pub(crate) fn grow_region_tree(
         // `splits` mirrors the region path's per-level `(feature, bin)` for structural
         // completeness; the boosting Region fold arm resolves its borders from `region_path`
         // (which additionally carries the direction + one-hot flags).
-        splits: region_path.iter().map(|&(f, b, _, _)| (f, b)).collect(),
+        // SPEC-OH-24: Region is OUT OF SCOPE for one-hot training, so the kind carried here
+        // is the byte-unchanged `false`. (`region_path`'s own 4th element remains the
+        // authoritative per-level one-hot flag for the Region fold arm.)
+        splits: region_path.iter().map(|&(f, b, _, _)| (f, b, false)).collect(),
         leaf_values,
         // Scalar Region emission: one value per leaf ⇒ approx_dim == 1
         // (byte-unchanged block collapse, D-04).

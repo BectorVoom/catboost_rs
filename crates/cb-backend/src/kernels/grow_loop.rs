@@ -604,7 +604,7 @@ mod single_tree {
                 depth,
                 "device tree must have exactly `depth` splits (n={n})"
             );
-            let (dev_feat, dev_bin) = tree.splits[0];
+            let (dev_feat, dev_bin, _dev_one_hot) = tree.splits[0];
             assert_eq!(
                 (dev_feat as usize, dev_bin as usize),
                 cpu_split,
@@ -708,7 +708,7 @@ mod single_tree {
                 depth,
                 "device Cosine tree must have exactly `depth` splits (n={n})"
             );
-            let (dev_feat, dev_bin) = tree.splits[0];
+            let (dev_feat, dev_bin, _dev_one_hot) = tree.splits[0];
             assert_eq!(
                 (dev_feat as usize, dev_bin as usize),
                 cpu_split,
@@ -852,7 +852,7 @@ mod single_tree {
             // (A) STRUCTURE — the full 6-level split (feature, bin) sequence must match EXACTLY.
             assert_eq!(tree.splits.len(), depth, "device tree must have exactly depth splits (n={n})");
             let device_splits: Vec<(usize, usize)> =
-                tree.splits.iter().map(|&(f, b)| (f as usize, b as usize)).collect();
+                tree.splits.iter().map(|&(f, b, _)| (f as usize, b as usize)).collect();
             assert_eq!(
                 device_splits, cpu_splits,
                 "device depth-6 split sequence must match CPU Cosine greedy first-wins (n={n}): \
@@ -957,7 +957,7 @@ mod single_tree {
 
             // (A) STRUCTURE — split sequence + per-object leaf_of must match EXACTLY.
             let device_splits: Vec<(usize, usize)> =
-                tree.splits.iter().map(|&(f, b)| (f as usize, b as usize)).collect();
+                tree.splits.iter().map(|&(f, b, _)| (f as usize, b as usize)).collect();
             assert_eq!(
                 device_splits, cpu_splits,
                 "device Newton depth-6 split sequence must match CPU greedy (n={n})"
@@ -1256,7 +1256,7 @@ mod multi_tree {
                     depth,
                     "device tree {k} must have exactly `depth` splits (n={n})"
                 );
-                let (dev_feat, dev_bin) = dev_tree.splits[0];
+                let (dev_feat, dev_bin, _dev_one_hot) = dev_tree.splits[0];
                 assert_eq!(
                     (dev_feat as usize, dev_bin as usize),
                     *cpu_split,
@@ -1520,7 +1520,7 @@ mod pairwise {
                 depth,
                 "device pairwise tree must have exactly `depth` splits (n={n})"
             );
-            let (dev_feat, dev_bin) = tree.splits[0];
+            let (dev_feat, dev_bin, _dev_one_hot) = tree.splits[0];
             assert_eq!(
                 (dev_feat as usize, dev_bin as usize),
                 cpu_split,

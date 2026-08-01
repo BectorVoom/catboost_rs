@@ -62,37 +62,70 @@ pub struct CtrSplit {
     pub scale: f64,
 }
 
-/// One stored oblivious-tree split: EITHER a float threshold ([`Split`]) OR a
-/// tensor / combination CTR test ([`CtrSplit`]). Mirrors the trainer-side
-/// `cb_train::AnySplit` precedent (ORD-05 / D-05). Every split consumer
-/// (apply / SHAP / fstr / serialize) matches this enum exhaustively so no
-/// consumer silently drops a CTR split (T-05-09-03).
+/// One stored oblivious-tree ONE-HOT split (SPEC-OH-08): the equality test
+/// `calc_cat_feature_hash(raw_cat_value) == value_hash` on a single categorical
+/// column, mirroring upstream's `TOneHotFeature { Index, Values }` (one
+/// `Values[k]` entry per emitted bin).
+///
+/// # Value space
+/// `value_hash` is the UPSTREAM raw `i32` hash — the bit-preserving `as i32` of
+/// [`cb_data::calc_cat_feature_hash`]'s `u32` — and is **NOT** a
+/// `PerfectHash`/quantization bin. research.md §4.1 pinned this empirically by
+/// byte-scanning a real catboost 1.2.10 one-hot model: `Values` holds raw
+/// hashes, so a model saved here loads in upstream CatBoost and vice versa.
+///
+/// `cat_feature` is the ABSOLUTE categorical-column index (the pool's cat
+/// column position), matching upstream's `TOneHotFeature.Index`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OneHotModelSplit {
+    /// The ABSOLUTE categorical-column index this split tests.
+    pub cat_feature: usize,
+    /// The raw upstream `i32` `calc_cat_feature_hash` value the column must
+    /// equal for the split to pass. NOT a `PerfectHash` bin.
+    pub value_hash: i32,
+}
+
+/// One stored oblivious-tree split: a float threshold ([`Split`]), a one-hot
+/// categorical equality test ([`OneHotModelSplit`]), or a tensor / combination
+/// CTR test ([`CtrSplit`]). Mirrors the trainer-side `cb_train::AnySplit`
+/// precedent (ORD-05 / D-05). Every split consumer (apply / SHAP / fstr /
+/// serialize) matches this enum exhaustively so no consumer silently drops a
+/// split (T-05-09-03, SPEC-OH-08).
+///
+/// # Compatibility
+/// The [`ModelSplit::OneHot`] variant was ADDED after v1 (SPEC §8). This is a
+/// breaking change for any external code that matches `ModelSplit`
+/// exhaustively: such a match must gain a `OneHot` arm. Every in-tree consumer
+/// handles the variant explicitly — a silent drop is forbidden.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelSplit {
     /// A float `value > border` threshold split.
     Float(Split),
+    /// A one-hot categorical `calc_cat_feature_hash(value) == value_hash` test.
+    OneHot(OneHotModelSplit),
     /// A tensor / combination CTR `ctr_value > border` split.
     Ctr(CtrSplit),
 }
 
 impl ModelSplit {
-    /// The FLOAT feature index this split tests, or `None` for a CTR split. The
-    /// numeric-only feature-importance / SHAP consumers project over this (a CTR
-    /// split has no single float-feature index).
+    /// The FLOAT feature index this split tests, or `None` for a one-hot or CTR
+    /// split. The numeric-only feature-importance / SHAP consumers project over
+    /// this (neither a one-hot nor a CTR split has a float-feature index).
     #[must_use]
     pub fn float_feature(&self) -> Option<usize> {
         match self {
             Self::Float(s) => Some(s.feature),
-            Self::Ctr(_) => None,
+            Self::OneHot(_) | Self::Ctr(_) => None,
         }
     }
 
-    /// The inner [`Split`] for a float split, or `None` for a CTR split.
+    /// The inner [`Split`] for a float split, or `None` for a one-hot or CTR
+    /// split.
     #[must_use]
     pub fn as_float(&self) -> Option<&Split> {
         match self {
             Self::Float(s) => Some(s),
-            Self::Ctr(_) => None,
+            Self::OneHot(_) | Self::Ctr(_) => None,
         }
     }
 }
@@ -349,6 +382,41 @@ impl Model {
                     })
                 };
 
+                // SPEC-OH-09: lift one trainer-side one-hot split into a
+                // `ModelSplit::OneHot`, translating BOTH of its coordinates out of
+                // the fit-local trainer space into upstream's model space:
+                //
+                //   * `feature` is the dense ONE-HOT POSITION (an index into the
+                //     matrix's `cat_bins`), which upstream has never heard of —
+                //     `one_hot_absolute[position]` maps it to the ABSOLUTE
+                //     cat-column index that `TOneHotFeature.Index` stores;
+                //   * `value` is a first-seen `PerfectHash` BIN, likewise fit-local
+                //     — `one_hot_bin_to_hash[position][bin]` maps it to the RAW
+                //     `calc_cat_feature_hash` value `TOneHotFeature.Values` stores.
+                //
+                // The `as i32` is the bit-preserving cast the `.cbm` writer and the
+                // apply-side equality test both use ([C3]: the hash is `u32`,
+                // the wire field is `i32`).
+                //
+                // A missing table entry drops the split rather than emitting a
+                // wrong one: `from_trained` is infallible (`#[must_use]`, 24
+                // callers), and a fabricated `value_hash` would silently
+                // mis-predict, whereas a dropped level is caught by the
+                // production oracle (SPEC-OH-28 / T22), which compares against
+                // upstream predictions.
+                let lift_one_hot = |oh: &cb_train::OneHotSplit| -> Option<ModelSplit> {
+                    let cat_feature = trained.one_hot_absolute.get(oh.feature).copied()?;
+                    let value_hash = trained
+                        .one_hot_bin_to_hash
+                        .get(oh.feature)
+                        .and_then(|table| table.get(oh.value as usize))
+                        .copied()?;
+                    Some(ModelSplit::OneHot(crate::OneHotModelSplit {
+                        cat_feature,
+                        value_hash: value_hash as i32,
+                    }))
+                };
+
                 // SPEC-OH-02: the STORED split order IS the leaf-index bit order
                 // (`leaf_index_for`, apply.rs:208-215), and `.cbm` save/load
                 // preserve it 1:1. So when a tree's levels interleave kinds, the
@@ -375,6 +443,9 @@ impl Model {
                         .filter_map(|kind| match *kind {
                             cb_train::LevelKind::Float(idx) => {
                                 t.splits.get(idx).copied().map(ModelSplit::Float)
+                            }
+                            cb_train::LevelKind::OneHot(idx) => {
+                                t.one_hot_splits.get(idx).and_then(&lift_one_hot)
                             }
                             cb_train::LevelKind::Ctr { ctr_idx, .. } => {
                                 t.ctr_splits.get(ctr_idx).map(&lift_ctr)
@@ -479,3 +550,7 @@ impl Model {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "model_test.rs"]
+mod model_test;

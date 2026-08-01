@@ -40,17 +40,72 @@ use crate::{Model, ModelSplit, NonSymmetricTree, ObliviousTree, RegionLevel, Reg
 /// `64` is well past any real model while bounding the conversion.
 const MAX_NON_SYMMETRIC_DEPTH: usize = 64;
 
+/// The `split_type` upstream writes for a one-hot categorical equality split.
+/// The numeric v1 schema cannot represent it (SPEC-OH-14 / Q1), so both
+/// directions reject it by NAME rather than dropping or mis-parsing it.
+const ONE_HOT_SPLIT_TYPE: &str = "OneHotFeature";
+
 /// One split in an oblivious tree (upstream `oblivious_trees[i].splits[j]`).
+///
+/// `border` and `float_feature_index` are `Option` because an upstream ONE-HOT
+/// document omits both (it carries `cat_feature_index` + `value` instead) —
+/// without the defaults, serde fails such a document with the misleading
+/// `missing field 'border'` before the loader can name the real cause
+/// (SPEC-OH-14). [`decode_float_split`] is the single place that turns the
+/// options back into a hard requirement, so a MALFORMED float split (a
+/// `"FloatFeature"` entry genuinely missing its `border`) still fails loudly
+/// rather than silently binarizing against `0.0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SplitJson {
-    /// Split border (threshold) on the referenced float feature.
-    border: f64,
-    /// Index of the float feature this split tests.
-    float_feature_index: i64,
+    /// Split border (threshold) on the referenced float feature. Absent on a
+    /// one-hot split.
+    #[serde(default)]
+    border: Option<f64>,
+    /// Index of the float feature this split tests. Absent on a one-hot split.
+    #[serde(default)]
+    float_feature_index: Option<i64>,
     /// Positional split index (self-consistent within the export).
     split_index: i64,
     /// Split kind; numeric-only models emit `"FloatFeature"`.
     split_type: String,
+}
+
+/// Decode one wire [`SplitJson`] into a canonical [`ModelSplit::Float`]
+/// (SPEC-OH-14). The single chokepoint for the optional `border` /
+/// `float_feature_index` fields:
+///
+/// - a `"OneHotFeature"` split is a typed error that NAMES one-hot, instead of
+///   serde's misleading `missing field 'border'`;
+/// - any other split missing `border` or `float_feature_index` is a typed error
+///   too, so the `#[serde(default)]` needed for the one-hot detection can never
+///   mask a malformed float split.
+///
+/// # Errors
+/// [`ModelError::Deserialize`] in each of the cases above.
+fn decode_float_split(s: &SplitJson) -> Result<ModelSplit, ModelError> {
+    if s.split_type == ONE_HOT_SPLIT_TYPE {
+        return Err(ModelError::Deserialize(
+            "one-hot json split unsupported (v1): the numeric model.json schema cannot \
+             represent a one-hot split; load the .cbm instead"
+                .to_owned(),
+        ));
+    }
+    let border = s.border.ok_or_else(|| {
+        ModelError::Deserialize(format!(
+            "split of type {:?} is missing its border",
+            s.split_type
+        ))
+    })?;
+    let raw_feature = s.float_feature_index.ok_or_else(|| {
+        ModelError::Deserialize(format!(
+            "split of type {:?} is missing its float_feature_index",
+            s.split_type
+        ))
+    })?;
+    let feature = usize::try_from(raw_feature).map_err(|_| {
+        ModelError::Deserialize(format!("negative float_feature_index {raw_feature}"))
+    })?;
+    Ok(ModelSplit::Float(Split { feature, border }))
 }
 
 /// One oblivious tree: per-tree NESTED `leaf_values` + `leaf_weights` (Pitfall 2)
@@ -270,16 +325,7 @@ fn flatten_non_symmetric(root: &NonSymmetricNodeJson) -> Result<NonSymmetricTree
             let split = node.split.as_ref().ok_or_else(|| {
                 ModelError::Deserialize("non-symmetric interior node missing split".to_owned())
             })?;
-            let feature = usize::try_from(split.float_feature_index).map_err(|_| {
-                ModelError::Deserialize(format!(
-                    "negative float_feature_index {}",
-                    split.float_feature_index
-                ))
-            })?;
-            tree_splits.push(ModelSplit::Float(Split {
-                feature,
-                border: split.border,
-            }));
+            tree_splits.push(decode_float_split(split)?);
             let left = node.left.as_deref().ok_or_else(|| {
                 ModelError::Deserialize("non-symmetric interior node missing left".to_owned())
             })?;
@@ -400,8 +446,8 @@ fn unflatten_non_symmetric(tree: &NonSymmetricTree) -> NonSymmetricNodeJson {
                     return leaf_at(tree, id);
                 };
                 let split_json = SplitJson {
-                    border: split.border,
-                    float_feature_index: i64::try_from(split.feature).unwrap_or(i64::MAX),
+                    border: Some(split.border),
+                    float_feature_index: Some(i64::try_from(split.feature).unwrap_or(i64::MAX)),
                     split_index: i64::try_from(id).unwrap_or(i64::MAX),
                     split_type: "FloatFeature".to_owned(),
                 };
@@ -433,15 +479,46 @@ fn unflatten_non_symmetric(tree: &NonSymmetricTree) -> NonSymmetricNodeJson {
     build(tree, 0, 0)
 }
 
+/// Whether any tree of `model` — oblivious, non-symmetric or region — carries a
+/// [`ModelSplit::OneHot`] split (SPEC-OH-14).
+fn has_one_hot_split(model: &Model) -> bool {
+    let is_one_hot = |s: &ModelSplit| matches!(s, ModelSplit::OneHot(_));
+    model
+        .oblivious_trees
+        .iter()
+        .flat_map(|t| t.splits.iter())
+        .chain(model.non_symmetric_trees.iter().flat_map(|t| t.tree_splits.iter()))
+        .chain(model.region_trees.iter().flat_map(|t| t.levels.iter().map(|l| &l.split)))
+        .any(is_one_hot)
+}
+
 /// Build the serializable document from the canonical model.
 ///
+/// # One-hot (SPEC-OH-14 / Q1)
+/// A model carrying ANY one-hot split is rejected outright. The alternative —
+/// emitting upstream's real one-hot shape — would require `split_index` to
+/// become the GLOBAL combined bin index (`Float → OneHot → Ctr`) instead of the
+/// positional counter this exporter has always used, re-specifying the json
+/// split-index semantics for every float model too and putting the float-only
+/// byte-identity guarantee (SPEC-OH-31) at risk for a secondary export. The
+/// `.cbm` path is the upstream-interop path and DOES carry one-hot splits; json
+/// one-hot emit is deferred.
+///
 /// # Errors
-/// [`ModelError::Serialize`] if a Region tree carries a non-float split level
-/// (WR-03): the numeric JSON schema can only round-trip float levels, and
-/// silently dropping a CTR level would desync the level count from
-/// `leaf_values` (the walk could never reach the highest leaves). Surface it
-/// loudly instead of emitting a corrupt document.
+/// [`ModelError::Serialize`] if any tree carries a one-hot split (above), or if
+/// a Region tree carries a non-float split level (WR-03): the numeric JSON
+/// schema can only round-trip float levels, and silently dropping a CTR level
+/// would desync the level count from `leaf_values` (the walk could never reach
+/// the highest leaves). Surface it loudly instead of emitting a corrupt
+/// document.
 fn to_doc(model: &Model) -> Result<ModelJsonDoc, ModelError> {
+    if has_one_hot_split(model) {
+        return Err(ModelError::Serialize(
+            "one-hot splits cannot be represented in the numeric model.json schema (v1); \
+             save the model as .cbm instead"
+                .to_owned(),
+        ));
+    }
     // Output dimensions (D-6.2-01 / Plan 06.2-02); `0`/unset means the scalar
     // default `1`. Drives the leaf-major transpose + per-dim bias vector below.
     let dim = model.approx_dimension.max(1);
@@ -477,8 +554,8 @@ fn to_doc(model: &Model) -> Result<ModelJsonDoc, ModelError> {
                 .filter_map(ModelSplit::as_float)
                 .enumerate()
                 .map(|(si, s)| SplitJson {
-                    border: s.border,
-                    float_feature_index: i64::try_from(s.feature).unwrap_or(i64::MAX),
+                    border: Some(s.border),
+                    float_feature_index: Some(i64::try_from(s.feature).unwrap_or(i64::MAX)),
                     split_index: i64::try_from(si).unwrap_or(i64::MAX),
                     split_type: "FloatFeature".to_owned(),
                 })
@@ -648,18 +725,7 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
             let splits = t
                 .splits
                 .iter()
-                .map(|s| {
-                    let feature = usize::try_from(s.float_feature_index).map_err(|_| {
-                        ModelError::Deserialize(format!(
-                            "negative float_feature_index {}",
-                            s.float_feature_index
-                        ))
-                    })?;
-                    Ok(ModelSplit::Float(Split {
-                        feature,
-                        border: s.border,
-                    }))
-                })
+                .map(decode_float_split)
                 .collect::<Result<Vec<_>, ModelError>>()?;
             // Un-transpose the wire LEAF-MAJOR `leaf_values` (`leaf_values[l*dim
             // + d]`) back into the canonical DIMENSION-MAJOR buffer

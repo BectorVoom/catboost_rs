@@ -34,7 +34,8 @@ use cb_compute::{
     compute_der_sums as compute_pairwise_der_sums, compute_pair_weight_statistics,
     cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
     reduce_leaf_stats, scale_l2_reg, scan_and_score_borders, scan_and_score_borders_into,
-    scan_border_to_leaf_stats, BucketHistogram, EScoreFunction, GroupSpan, LeafStats,
+    scan_and_score_one_hot_bins_into, scan_border_to_leaf_stats, BucketHistogram, EScoreFunction,
+    GroupSpan, LeafStats,
     ScanScoreScratch, MINIMAL_SCORE,
 };
 
@@ -103,6 +104,10 @@ mod ordered;
 #[cfg(test)]
 #[path = "tree_pairwise_test.rs"]
 mod pairwise;
+
+#[cfg(test)]
+#[path = "tree_one_hot_fused_test.rs"]
+mod tree_one_hot_fused_test;
 
 /// Maximum supported tree depth (upstream `MaxDepth`). Capping `depth <= 16`
 /// keeps `2^depth` within `usize` and bounds leaf-buffer allocation.
@@ -205,6 +210,13 @@ pub struct Candidate {
 pub struct GrownTree {
     /// The `depth` ordered splits (one per level).
     pub splits: Vec<Split>,
+    /// The chosen ONE-HOT categorical splits (SPEC-OH-07), one per level a
+    /// one-hot candidate won, in level order. EMPTY for every float-only /
+    /// CTR-only / ordered search, so their consumers keep compiling unchanged
+    /// (the empty-parallel-vector precedent of `ctr_splits` / `level_kinds`).
+    /// [`Self::level_kinds`] is the only record of how these interleave with
+    /// [`Self::splits`].
+    pub one_hot_splits: Vec<OneHotSplit>,
     /// Per-object leaf index (`0..2^depth`), object order.
     pub leaf_of: Vec<usize>,
     /// The chosen tensor / combination CTR splits (ORD-05), one
@@ -262,6 +274,9 @@ pub enum LevelKind {
     /// This level is a float `value > border` split; the payload is its index
     /// into [`GrownTree::splits`].
     Float(usize),
+    /// This level is a ONE-HOT `cat_bin == value` split (SPEC-OH-07); the payload
+    /// is its index into [`GrownTree::one_hot_splits`].
+    OneHot(usize),
     /// This level is a CTR `ctr_bin > border` split; the payload is its index into
     /// [`GrownTree::ctr_splits`] and the chosen CTR-value border.
     Ctr {
@@ -310,16 +325,89 @@ pub fn leaf_index(passes: &[bool]) -> usize {
 /// and diverge from upstream (Pitfall 1).
 #[must_use]
 pub fn select_best_candidate(candidates: &[Candidate]) -> Option<Candidate> {
-    let mut best: Option<Candidate> = None;
+    select_best(candidates).copied()
+}
+
+/// Anything the level argmax can rank (SPEC-OH-06). Implemented by [`Candidate`]
+/// (float borders) and [`LevelCandidate`] (float OR one-hot), so BOTH kinds go
+/// through the ONE argmax below rather than a second hand-rolled scan — the
+/// drift class that would let the float-vs-one-hot tie-break diverge from the
+/// float-vs-float one.
+trait HasScore {
+    /// This candidate's split score.
+    fn score(&self) -> f64;
+}
+
+impl HasScore for Candidate {
+    fn score(&self) -> f64 {
+        self.score
+    }
+}
+
+/// THE level argmax (`greedy_tensor_search.cpp:948-966`): iterate in the
+/// caller's enumeration order and keep the FIRST candidate whose score strictly
+/// exceeds the running best, seeded at [`MINIMAL_SCORE`].
+///
+/// Strict `>` is load-bearing: a `>=` would pick the LATER equal-gain candidate
+/// and diverge from upstream (Pitfall 1). With one-hot candidates enumerated
+/// AFTER the floats (SPEC-OH-06), that same strictness is what makes an exact
+/// float/one-hot score tie resolve to the FLOAT.
+fn select_best<T: HasScore>(candidates: &[T]) -> Option<&T> {
+    let mut best: Option<&T> = None;
     let mut best_score = MINIMAL_SCORE;
-    for &candidate in candidates {
+    for candidate in candidates {
         // STRICT `>` (NOT `>=`): first-wins on equal gain.
-        if candidate.score > best_score {
-            best_score = candidate.score;
+        if candidate.score() > best_score {
+            best_score = candidate.score();
             best = Some(candidate);
         }
     }
     best
+}
+
+/// One scored candidate of the FUSED level search (SPEC-OH-06): a float border
+/// candidate or a one-hot equality candidate. Both are ranked by the SAME
+/// [`select_best`] over ONE flat vector whose order is
+/// `floats (feature asc x border asc)` THEN
+/// `one-hots (cat feature asc x bin asc)` — upstream's `AddFloatFeatures` then
+/// `AddOneHotFeatures` ordering (`greedy_tensor_search.cpp:1020-1021`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LevelCandidate {
+    /// A float `value > border` candidate.
+    Float(Candidate),
+    /// A one-hot `cat_bin == value` candidate.
+    OneHot {
+        /// The categorical feature index.
+        feature: usize,
+        /// The categorical bin tested for equality.
+        value: u32,
+        /// This candidate's split score.
+        score: f64,
+    },
+}
+
+impl HasScore for LevelCandidate {
+    fn score(&self) -> f64 {
+        match self {
+            Self::Float(c) => c.score,
+            Self::OneHot { score, .. } => *score,
+        }
+    }
+}
+
+impl LevelCandidate {
+    /// The concrete [`AnySplit`] this candidate selects.
+    fn to_split(self) -> AnySplit {
+        match self {
+            Self::Float(c) => AnySplit::Float(Split {
+                feature: c.feature,
+                border: c.border,
+            }),
+            Self::OneHot { feature, value, .. } => {
+                AnySplit::OneHot(OneHotSplit { feature, value })
+            }
+        }
+    }
 }
 
 /// Per-object access to feature values for split tests: float `value > border`
@@ -584,7 +672,7 @@ pub fn greedy_tensor_search_oblivious_perturbed(
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
-    let mut chosen: Vec<Split> = Vec::with_capacity(depth);
+    let mut chosen: Vec<AnySplit> = Vec::with_capacity(depth);
 
     // The reusable across-level grow state (the `TLearnContext` analogue): builds
     // the quantized bin matrix once and holds the current level's per-feature
@@ -627,18 +715,20 @@ pub fn greedy_tensor_search_oblivious_perturbed(
         // cheap leaf-only `advance_leaf_only` the plain path uses.
         let best = match perturb.as_mut() {
             None => {
-                let (split, hists) =
+                let (split, hists, cat_hists) =
                     select_level_plain(matrix, &scratch, der1, weight, scaled_l2, score_function, penalties)?;
                 scratch.feature_hists = hists;
+                scratch.cat_hists = cat_hists;
                 if level + 1 < depth {
                     scratch.advance_leaf_only(matrix, &split, n_objects);
                 }
                 split
             }
             Some(p) => {
-                let (split, hists) =
+                let (split, hists, cat_hists) =
                     select_level_perturbed(matrix, &scratch, der1, weight, scaled_l2, p, score_function, penalties)?;
                 scratch.feature_hists = hists;
+                scratch.cat_hists = cat_hists;
                 if level + 1 < depth {
                     scratch.advance_leaf_only(matrix, &split, n_objects);
                 }
@@ -648,12 +738,41 @@ pub fn greedy_tensor_search_oblivious_perturbed(
         chosen.push(best);
     }
 
-    let leaf_of = assign_leaves(matrix, &chosen, n_objects);
+    let leaf_of = assign_leaves_any(matrix, &chosen, n_objects);
+
+    // SPEC-OH-07: split the level-ordered `AnySplit` list back into the
+    // kind-specific vectors the persist step consumes, keeping `level_kinds` as
+    // the ONLY record of the true per-level order (the same shape the CTR
+    // split-back at `greedy_tensor_search_oblivious_with_ctr` uses). A float-only
+    // tree yields `one_hot_splits` empty and `level_kinds` all-`Float`.
+    let mut splits: Vec<Split> = Vec::with_capacity(chosen.len());
+    let mut one_hot_splits: Vec<OneHotSplit> = Vec::new();
+    let mut level_kinds: Vec<LevelKind> = Vec::with_capacity(chosen.len());
+    for any in &chosen {
+        match any {
+            AnySplit::Float(sp) => {
+                level_kinds.push(LevelKind::Float(splits.len()));
+                splits.push(*sp);
+            }
+            AnySplit::OneHot(oh) => {
+                level_kinds.push(LevelKind::OneHot(one_hot_splits.len()));
+                one_hot_splits.push(*oh);
+            }
+        }
+    }
+    // A float-only tree keeps `level_kinds` EMPTY, byte-identical to the
+    // pre-one-hot `GrownTree` (SPEC-OH-31): the persist step treats an empty
+    // `level_kinds` as "all float, in `splits` order".
+    if one_hot_splits.is_empty() {
+        level_kinds.clear();
+    }
+
     Ok(GrownTree {
-        splits: chosen,
+        splits,
+        one_hot_splits,
         leaf_of,
         ctr_splits: Vec::new(),
-        level_kinds: Vec::new(),
+        level_kinds,
         step_nodes: Vec::new(),
         node_id_to_leaf_id: Vec::new(),
         region_directions: Vec::new(),
@@ -707,6 +826,19 @@ struct GrowScratch {
     feature_hists: Vec<Option<BucketHistogram>>,
     /// Global bins per feature (`max(n_borders) + 1`).
     n_bins: usize,
+    /// CAT-major one-hot bin matrix: `cat_bins[c * n_objects + obj]` (SPEC-OH-06).
+    /// EMPTY when the matrix has no categorical columns, so the float-only path
+    /// allocates nothing and the added `0..n_cat_features()` passes below are
+    /// empty ranges (SPEC-OH-31 byte-identity by construction).
+    cat_bins: Vec<u32>,
+    /// Global bin width for the cat histograms (`max cardinality`, `1` when there
+    /// are no cat columns) — the categorical analogue of `n_bins`.
+    cat_n_bins: usize,
+    /// The current level's per-CAT-FEATURE single-feature histogram, retained as
+    /// the parent the next level derives from via the SAME subtraction trick the
+    /// float histograms use ([`derive_feature_level_hist`]). `None` for a cat
+    /// feature with no candidate bins (never scored, so never built).
+    cat_hists: Vec<Option<BucketHistogram>>,
     /// Approx dimension (`der1.len() / n_objects`, `1` for scalar/binary losses).
     approx_dim: usize,
     /// Current level (`n_leaves == 1 << level`).
@@ -759,11 +891,43 @@ impl GrowScratch {
         // parallel pass, so `new` leaves `feature_hists` empty (no redundant up-front
         // O(n·nf) build).
         let feature_hists: Vec<Option<BucketHistogram>> = Vec::new();
+
+        // SPEC-OH-06: the CAT-major one-hot bin matrix, laid out exactly like
+        // `bins` so `feature_col` addresses it the same way. Already-quantized —
+        // `matrix.cat_bins[c]` IS the first-seen `PerfectHash` bin column, so
+        // there is no `bin_of` step. Both this and `cat_n_bins` degenerate to
+        // empty / `1` on the float-only path.
+        let n_cat = matrix.n_cat_features();
+        let cat_n_bins = (0..n_cat)
+            .map(|c| {
+                matrix
+                    .cat_bins
+                    .get(c)
+                    .map_or(0, |col| col.iter().copied().max().map_or(0, |m| m as usize + 1))
+            })
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut cat_bins = vec![0u32; n_cat.saturating_mul(n_objects)];
+        if n_objects > 0 && n_cat > 0 {
+            cat_bins.par_chunks_mut(n_objects).enumerate().for_each(|(c, chunk)| {
+                let col = matrix.cat_bins.get(c).map_or(&[][..], Vec::as_slice);
+                for obj in 0..n_objects {
+                    if let Some(slot) = chunk.get_mut(obj) {
+                        *slot = col.get(obj).copied().unwrap_or(0);
+                    }
+                }
+            });
+        }
+
         Self {
             bins,
             leaf_of,
             feature_hists,
             n_bins,
+            cat_bins,
+            cat_n_bins,
+            cat_hists: Vec::new(),
             approx_dim,
             level: 0,
         }
@@ -776,13 +940,13 @@ impl GrowScratch {
     /// per-feature histograms: the FUSED plain path ([`select_level_plain`]) derives
     /// each feature's next-level histogram INSIDE its own rayon task (D-01/D-06), so
     /// the whole-partition build is gone from the per-level hot path.
-    fn advance_leaf_only(&mut self, matrix: &FeatureMatrix, split: &Split, n_objects: usize) {
+    fn advance_leaf_only(&mut self, matrix: &FeatureMatrix, split: &AnySplit, n_objects: usize) {
         let n_parent = 1usize << self.level;
         let parent = &self.leaf_of;
         let next_leaf_of: Vec<usize> = (0..n_objects)
             .map(|o| {
                 let base = parent.get(o).copied().unwrap_or(0);
-                base + if matrix.passes(split, o) { n_parent } else { 0 }
+                base + if matrix.passes_any(split, o) { n_parent } else { 0 }
             })
             .collect();
         self.leaf_of = next_leaf_of;
@@ -928,6 +1092,7 @@ fn derive_feature_level_hist(
 /// FEAT-04 penalty insertion point, and the strict `>` first-wins tie-break are
 /// byte-for-byte unchanged (D-08) — so single- vs multi-thread runs stay
 /// byte-identical.
+#[allow(clippy::type_complexity)]
 fn select_level_plain(
     matrix: &FeatureMatrix,
     scratch: &GrowScratch,
@@ -936,7 +1101,11 @@ fn select_level_plain(
     scaled_l2: f64,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
-) -> CbResult<(Split, Vec<Option<BucketHistogram>>)> {
+) -> CbResult<(
+    AnySplit,
+    Vec<Option<BucketHistogram>>,
+    Vec<Option<BucketHistogram>>,
+)> {
     // FEAT-04 penalties are applied ONLY when an active (non-no-op) context is
     // supplied; otherwise the candidate scores stay byte-identical to the pre-6.6
     // path (D-6.6-05 — gate on the param being non-empty).
@@ -1023,21 +1192,133 @@ fn select_level_plain(
     // border ascending, D-08) and retain this level's per-feature histograms as the
     // next level's parent store.
     let mut hists = Vec::with_capacity(per_feature.len());
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut candidates: Vec<LevelCandidate> = Vec::new();
     for (local, feature_hist) in per_feature {
-        candidates.extend(local);
+        candidates.extend(local.into_iter().map(LevelCandidate::Float));
         hists.push(feature_hist);
     }
-    let best = select_best_candidate(&candidates).ok_or_else(|| {
-        CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
+
+    // SPEC-OH-06: the SECOND fused pass, over the one-hot categorical columns
+    // (`AddOneHotFeatures`, enumerated AFTER every float candidate). Same
+    // machinery — build at level 0 / derive via the subtraction trick above,
+    // score through the SAME `multi_dim_split_score` fold — with the equality
+    // partition (`left = bin_sums[value]`, `right = total - left`) instead of the
+    // prefix cut. On the float-only path `n_cat_features() == 0`, so this range
+    // is EMPTY: no allocation, no candidate, and the flat vector below is
+    // bit-identical to the pre-one-hot one (SPEC-OH-31 by construction).
+    let cat_hists_out = append_one_hot_candidates(
+        matrix,
+        scratch,
+        der1,
+        weight,
+        scaled_l2,
+        score_function,
+        &mut candidates,
+    );
+
+    // ONE argmax over the ONE flat vector, in the fixed float-then-one-hot order
+    // (MAJOR-6: never a second hand-rolled scan).
+    let best = select_best(&candidates).ok_or_else(|| {
+        CbError::Degenerate(
+            "no candidate split available (no float border and no one-hot categorical)".to_owned(),
+        )
     })?;
-    Ok((
-        Split {
-            feature: best.feature,
-            border: best.border,
-        },
-        hists,
-    ))
+    Ok((best.to_split(), hists, cat_hists_out))
+}
+
+/// The shared one-hot half of the fused level search (SPEC-OH-06): score every
+/// categorical column's candidate EQUALITY splits and APPEND them to
+/// `candidates`, returning this level's per-cat-feature histograms (the parent
+/// the next level derives from).
+///
+/// Factored out so [`select_level_plain`] and [`select_level_perturbed`] share
+/// ONE enumeration — the float-then-one-hot order, the one-candidate-per-DISTINCT
+/// bin rule (`distinct_bins_ascending`, matching the frozen
+/// [`select_level_one_hot`] reference exactly), and the histogram
+/// build/derive — so the two paths can never drift apart.
+///
+/// Draws NO RNG (like the float fused pass), so it is safe to call from the
+/// perturbed path without perturbing its draw contract.
+#[allow(clippy::too_many_arguments)]
+fn append_one_hot_candidates(
+    matrix: &FeatureMatrix,
+    scratch: &GrowScratch,
+    der1: &[f64],
+    weight: &[f64],
+    scaled_l2: f64,
+    score_function: EScoreFunction,
+    candidates: &mut Vec<LevelCandidate>,
+) -> Vec<Option<BucketHistogram>> {
+    let n_cat = matrix.n_cat_features();
+    if n_cat == 0 {
+        return Vec::new();
+    }
+    let dim = scratch.approx_dim;
+    let level = scratch.level;
+    let cat_n_bins = scratch.cat_n_bins;
+    let n_objects = scratch.leaf_of.len();
+    let cat_bins = &scratch.cat_bins;
+    let leaf_of = &scratch.leaf_of;
+    let cat_parents = &scratch.cat_hists;
+
+    let per_cat: Vec<(Vec<LevelCandidate>, Option<BucketHistogram>)> = (0..n_cat)
+        .into_par_iter()
+        .map_init(ScanScoreScratch::new, |scan, feature| {
+            let col = feature_col(cat_bins, feature, n_objects);
+            // One candidate per DISTINCT learn-set bin, ASCENDING — the frozen
+            // reference's rule verbatim. An absent / constant column yields at
+            // most one candidate, which can never improve on the parent.
+            let values = distinct_bins_ascending(col);
+            if values.is_empty() {
+                return (Vec::new(), None);
+            }
+            let cat_hist = if level == 0 {
+                build_bucket_histogram(col, der1, weight, leaf_of, 1, 1, cat_n_bins, dim)
+            } else {
+                derive_feature_level_hist(
+                    cat_parents.get(feature).and_then(Option::as_ref),
+                    col,
+                    der1,
+                    weight,
+                    leaf_of,
+                    level,
+                    cat_n_bins,
+                    dim,
+                )
+            };
+            let raw_scores = scan_and_score_one_hot_bins_into(
+                scan,
+                &cat_hist,
+                0,
+                &values,
+                dim,
+                score_function,
+                scaled_l2,
+            );
+            let mut local = Vec::with_capacity(values.len());
+            for (vi, &value) in values.iter().enumerate() {
+                // NOTE: the FEAT-04 penalties are indexed by FLOAT feature and are
+                // deliberately NOT applied to a categorical candidate — upstream's
+                // per-feature weight / first-use vectors address the float feature
+                // space, and mapping a cat column into it would penalize an
+                // unrelated float feature.
+                let score = raw_scores.get(vi).copied().unwrap_or(MINIMAL_SCORE);
+                local.push(LevelCandidate::OneHot {
+                    feature,
+                    value,
+                    score,
+                });
+            }
+            (local, Some(cat_hist))
+        })
+        .collect();
+
+    let mut cat_hists_out = Vec::with_capacity(per_cat.len());
+    for (local, cat_hist) in per_cat {
+        candidates.extend(local);
+        cat_hists_out.push(cat_hist);
+    }
+    cat_hists_out
 }
 
 /// One level of the PERTURBED search reproducing the upstream two-pass draw order
@@ -1056,6 +1337,7 @@ fn select_level_plain(
 /// draw sequence and count (Pitfall 3). Returns the chosen [`Split`] AND this level's
 /// per-feature histograms (the parent the next level derives from), exactly like the
 /// plain path.
+#[allow(clippy::type_complexity)]
 fn select_level_perturbed(
     matrix: &FeatureMatrix,
     scratch: &GrowScratch,
@@ -1065,7 +1347,29 @@ fn select_level_perturbed(
     perturb: &mut Perturbation<'_>,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
-) -> CbResult<(Split, Vec<Option<BucketHistogram>>)> {
+) -> CbResult<(
+    AnySplit,
+    Vec<Option<BucketHistogram>>,
+    Vec<Option<BucketHistogram>>,
+)> {
+    // SPEC-OH-27 (T01b, branch b): one-hot columns are UNREACHABLE here. The
+    // upstream per-level RNG draw accounting for one-hot candidates under
+    // `CompressCandidates` is NOT ESTABLISHED, so `train_inner` typed-rejects
+    // one-hot x (bootstrap != No OR random_strength != 0) before any tree is
+    // grown — and `perturb.is_some()` is exactly that condition. Adding one-hot
+    // candidates to the passes below would silently change the draw count per
+    // level and desynchronise every subsequent tree's bootstrap sample, so this
+    // path deliberately enumerates FLOATS ONLY and asserts the precondition
+    // rather than assuming it.
+    if matrix.n_cat_features() != 0 {
+        return Err(CbError::Unsupported(format!(
+            "one-hot categorical candidates ({}) reached the PERTURBED level search; the \
+             upstream per-level RNG draw accounting for one-hot candidates has not been \
+             established, so this combination must be rejected in train_inner before growing \
+             (see .planning/plans/one-hot-categorical-training/instrumented-ground-truth/ONE_HOT_GROUND_TRUTH.md)",
+            matrix.n_cat_features()
+        )));
+    }
     let std_dev = perturb.score_st_dev;
     // FEAT-04 penalties apply at the per-feature SelectBestCandidate stage (pass 3
     // below) — the multiplicative feature weight scales the gain and the
@@ -1220,7 +1524,9 @@ fn select_level_perturbed(
     let split = chosen_split.ok_or_else(|| {
         CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
     })?;
-    Ok((split, hists))
+    // No cat histograms: the guard at the top of this function proves
+    // `n_cat_features() == 0` on every reachable perturbed level.
+    Ok((AnySplit::Float(split), hists, Vec::new()))
 }
 
 // ===========================================================================
@@ -1777,6 +2083,7 @@ pub fn leaf_wise_grower(
         .collect();
 
     Ok(GrownTree {
+        one_hot_splits: Vec::new(),
         splits,
         leaf_of,
         ctr_splits: Vec::new(),
@@ -1925,6 +2232,7 @@ pub fn region_grower(
     }
 
     Ok(GrownTree {
+        one_hot_splits: Vec::new(),
         splits,
         leaf_of,
         ctr_splits: Vec::new(),
@@ -2227,6 +2535,7 @@ pub fn greedy_tensor_search_oblivious_ordered(
 
     let leaf_of = assign_leaves(matrix, &chosen, n_objects);
     Ok(GrownTree {
+        one_hot_splits: Vec::new(),
         splits: chosen,
         leaf_of,
         ctr_splits: Vec::new(),
@@ -2997,6 +3306,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
     }
 
     Ok(GrownTree {
+        one_hot_splits: Vec::new(),
         splits,
         leaf_of,
         ctr_splits,
@@ -3392,6 +3702,7 @@ pub fn greedy_tensor_search_oblivious_pairwise(
 
     let leaf_of = assign_leaves(matrix, &chosen, n_objects);
     Ok(GrownTree {
+        one_hot_splits: Vec::new(),
         splits: chosen,
         leaf_of,
         ctr_splits: Vec::new(),

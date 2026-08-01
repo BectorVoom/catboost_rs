@@ -757,6 +757,15 @@ pub struct GpuTrainSession {
     /// `n_bins`.
     n_bins_line: usize,
     n_features: usize,
+    /// SPEC-OH-22/24: the float/one-hot boundary of the CONCATENATED device feature axis.
+    /// The resident oblivious grow derives its two scorer pass windows from it —
+    /// `[0, n_float)` threshold, `[n_float, n_features)` equality. Equal to `n_features`
+    /// on a float-only fit, which makes pass B empty and the scorer byte-unchanged.
+    n_float: usize,
+    /// SPEC-OH-22: the per-device-feature REAL cardinality, length `n_features`, sized
+    /// against the CTR-widened `eff_n_features`. NOT `TCFeature.folds` (the padded line
+    /// width) — see the `DeviceTrainConfig::real_folds` doc.
+    real_folds: Vec<u32>,
     depth: usize,
     scaled_l2: f64,
     score_fn: u32,
@@ -1361,8 +1370,43 @@ impl GpuTrainSession {
         // real bin value (`< n_bins <= n_bins_line`) losslessly, and the resident fill /
         // scorer address cells by the SAME padded width.
         let n_buckets_per_feature = vec![n_bins_line; eff_n_features];
-        let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, n)?;
-        let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+        // SPEC-OH-21/22 (T24/T27b): the one-hot channel, sized against the CTR-widened
+        // `eff_n_features`.
+        //
+        //  * `one_hot_flags` is a pure descriptor annotation — it does not change the
+        //    packed words, so a float-only fit is byte-unchanged.
+        //  * `real_folds` is the per-feature REAL cardinality bound. A CTR column (present
+        //    only when `ctr_is_covered` widened the axis) is padded with `n_bins_line`,
+        //    which is inert because a CTR column is never one-hot and the scorer reads this
+        //    array only on the one-hot arm.
+        //
+        // Both lengths are asserted UNCONDITIONALLY: with the trainer always calling the
+        // one-hot quantizer, `real_folds` is populated on every device-eligible fit
+        // including float-only, so a short array is a genuine wiring bug — never a
+        // tolerable "no one-hot columns" shortcut, which is exactly the silently-inert
+        // bound this design exists to eliminate.
+        let mut one_hot_flags = config.one_hot_flags.clone();
+        let mut real_folds = config.real_folds.clone();
+        one_hot_flags.resize(eff_n_features, false);
+        if real_folds.len() < eff_n_features {
+            real_folds.resize(eff_n_features, n_bins_line as u32);
+        }
+        if real_folds.len() != eff_n_features || one_hot_flags.len() != eff_n_features {
+            return Err(CbError::LengthMismatch {
+                column: "device one-hot channel".to_owned(),
+                expected: eff_n_features,
+                actual: real_folds.len().max(one_hot_flags.len()),
+            });
+        }
+        let n_float = if config.has_one_hot() {
+            config.n_float
+        } else {
+            // Float-only (or an all-`false` flag set): the whole axis is pass A, so pass B
+            // is empty and the scorer collapses to today's single launch.
+            eff_n_features
+        };
+        let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, &one_hot_flags, n)?;
+        let (offsets_v, shifts_v, masks_v, _one_hot_flags_v) = packed.device_arrays()?;
         let num_words = packed.words.len();
 
         // Host copies of the per-feature packed addressing (offset/shift/mask): the
@@ -1483,6 +1527,8 @@ impl GpuTrainSession {
             n_bins,
             n_bins_line,
             n_features: eff_n_features,
+            n_float,
+            real_folds,
             depth,
             scaled_l2,
             score_fn,
@@ -1534,6 +1580,33 @@ impl GpuTrainSession {
     #[must_use]
     pub fn n_features_effective(&self) -> usize {
         self.n_features
+    }
+
+    /// SPEC-OH-22/24 observation point: the frozen one-hot channel as the resident scorer
+    /// will actually see it — `(one_hot_flags, real_folds, n_float, feature_lo,
+    /// feature_hi)` where the last two are pass B's window.
+    ///
+    /// This exists so a seam-level test can assert the values are RIGHT, not merely
+    /// present. The load-bearing case is a low-cardinality column: `real_folds[c]` must be
+    /// the column's true cardinality (e.g. `2`), NOT the padded `n_bins_line` (e.g. `32`)
+    /// that `TCFeature.folds` would have supplied. Catching that here localizes the bug at
+    /// the seam instead of surfacing it as an unattributable ≤1e-5 device-vs-CPU gap.
+    ///
+    /// `pub(crate)` — reachable from the `gpu_runtime` sibling tests, no public surface.
+    /// Its only consumer is `#[cfg(test)]`, so the lib target sees it as unread.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn one_hot_channel(&self) -> (Vec<bool>, Vec<u32>, usize, usize, usize) {
+        let flags = (0..self.n_features)
+            .map(|f| f >= self.n_float)
+            .collect::<Vec<bool>>();
+        (
+            flags,
+            self.real_folds.clone(),
+            self.n_float,
+            self.n_float,
+            self.n_features,
+        )
     }
 
     /// Grow ONE tree over the resident state, advancing the device-resident boosting: it
@@ -1889,6 +1962,12 @@ impl GpuTrainSession {
             self.n_bins_line,
             self.n_bins,
             self.n_features,
+            // SPEC-OH-22/24: the one-hot boundary + the real-cardinality bound, both
+            // frozen at `begin` from the host trainer's `DeviceTrainConfig`. On a
+            // float-only fit `n_float == n_features` (pass B empty) and `real_folds` is
+            // never read, so the scorer is byte-unchanged.
+            self.n_float,
+            &self.real_folds,
             self.depth,
             self.scaled_l2,
             self.score_fn,

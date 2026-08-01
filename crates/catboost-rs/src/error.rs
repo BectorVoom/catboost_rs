@@ -112,4 +112,15 @@ pub enum CatBoostError {
     /// returning silently-wrong output. Carries a human-readable reason.
     #[error("unsupported model: {0}")]
     UnsupportedModel(String),
+
+    /// A SHAP-family request ([`crate::Model::shap_values`], or a
+    /// [`cb_model::FeatureImportanceType::LossFunctionChange`] importance, which
+    /// is DEFINED as a SHAP difference) targeted a model carrying one-hot or CTR
+    /// splits (SPEC-OH-15). Those surfaces are defined over float splits only:
+    /// projecting a categorical level away would silently shorten the tree depth
+    /// and return rows that violate the local-accuracy invariant, so the request
+    /// is rejected instead. Carries the typed `cb-model`
+    /// [`cb_model::ShapUnsupported`]. Converted with `?` via `#[from]`.
+    #[error("SHAP unsupported: {0}")]
+    ShapUnsupported(#[from] cb_model::ShapUnsupported),
 }

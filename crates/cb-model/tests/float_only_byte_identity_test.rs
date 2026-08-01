@@ -184,21 +184,43 @@ fn capture_float_only_baseline() {
         format!(
             "# float-only `.cbm` byte-identity baseline (SPEC-OH-31 / T00)\n\
              \n\
-             **PLAN_BASE_SHA: `{sha}`**\n\
+             **CAPTURED_AT_SHA: `{sha}`** (plus the uncommitted working tree at\n\
+             capture time — see the re-baseline note below).\n\
              \n\
-             Captured BEFORE any one-hot production change, by\n\
-             `float_only_byte_identity_test::capture_float_only_baseline`\n\
+             Written by `float_only_byte_identity_test::capture_float_only_baseline`\n\
              (`#[ignore]`d; run with `-- --ignored`).\n\
              \n\
-             ## THIS FIXTURE IS FROZEN\n\
+             ## RE-BASELINED once, deliberately (learning_rate f32)\n\
              \n\
-             No later task may regenerate it. Regenerating it after a production\n\
-             change turns SPEC-OH-31 into a self-comparison that proves nothing —\n\
-             the whole point is that these bytes predate the change.\n\
+             The ORIGINAL capture, taken at plan-base\n\
+             `9bf734512d7fccb25a9e8304b34183375ae3e7f5` before any one-hot\n\
+             production change, is preserved verbatim as `baseline_pre_lr_f32.cbm`\n\
+             (sha256 `37b373e7e16499fdba8abbefda956bbb355ca3908b510b131f23f3990dce6b21`).\n\
+             \n\
+             `baseline.cbm` was regenerated ONCE, for a single deliberate reason:\n\
+             upstream stores `learning_rate` as an **f32**, so every leaf value is\n\
+             scaled by `f32(lr)` rather than the `f64` the caller supplied. Fixing\n\
+             that (`cb-train/src/boosting.rs`) moves every leaf by the constant\n\
+             factor `f32(0.3) / 0.3` at this fixture's pinned rate — TOWARD\n\
+             upstream, verified to one ulp against real catboost 1.2.10.\n\
+             \n\
+             **The SPEC-OH-31 guarantee was NOT simply discarded.**\n\
+             `baseline_only_differs_from_pre_lr_baseline_by_the_learning_rate_factor`\n\
+             proves mechanically that the two baselines have IDENTICAL tree\n\
+             structure (same split count, features and borders) and that every\n\
+             leaf differs by exactly that one factor. So `no one-hot change leaked\n\
+             into the float-only path` remains PROVEN, not merely asserted.\n\
+             \n\
+             ## Still frozen from here on\n\
+             \n\
+             Do not regenerate again without the same treatment: preserve the prior\n\
+             bytes and prove the delta. An unexplained regeneration turns\n\
+             SPEC-OH-31 into a self-comparison that proves nothing.\n\
              \n\
              ## Contents\n\
              \n\
              - `baseline.cbm` — the pinned float-only fit, serialized.\n\
+             - `baseline_pre_lr_f32.cbm` — the ORIGINAL plan-base capture (frozen).\n\
              - `inputs/X.npy` — `{N_ROWS} x {N_FEATURES}` float64 features.\n\
              - `inputs/y.npy` — `{N_ROWS}` float64 RMSE target.\n\
              \n\
@@ -267,18 +289,112 @@ fn float_only_cbm_bytes_match_the_frozen_plan_base_baseline() {
     }
 }
 
-/// The frozen fixture must carry its provenance — without the plan-base SHA there
-/// is no way to tell a genuine baseline from one regenerated after a change.
+/// The fixture must carry its provenance — without the capture SHA, and without
+/// the record of the ONE deliberate re-baseline, there is no way to tell a
+/// genuine baseline from one quietly regenerated after a change.
 #[test]
 fn frozen_baseline_records_its_plan_base_sha() {
     let readme = std::fs::read_to_string(baseline_dir().join("README.md"))
         .expect("the frozen baseline must carry a README.md");
     assert!(
-        readme.contains("PLAN_BASE_SHA"),
-        "README.md must record the plan-base SHA the bytes were captured at"
+        readme.contains("CAPTURED_AT_SHA"),
+        "README.md must record the SHA the bytes were captured at"
     );
     assert!(
-        readme.contains("FROZEN"),
-        "README.md must state that the fixture is frozen"
+        readme.contains("RE-BASELINED"),
+        "README.md must disclose the one deliberate re-baseline (learning_rate f32)"
     );
+    assert!(
+        readme.contains("baseline_pre_lr_f32.cbm"),
+        "README.md must point at the preserved plan-base bytes, which are what \
+         keeps the SPEC-OH-31 guarantee provable rather than merely asserted"
+    );
+    assert!(
+        readme.contains("Still frozen from here on"),
+        "README.md must state that the fixture is frozen going forward"
+    );
+    // The preserved original must actually be there — the differential proof
+    // (`baseline_only_differs_from_pre_lr_baseline_by_the_learning_rate_factor`)
+    // is meaningless without it.
+    assert!(
+        baseline_dir().join("baseline_pre_lr_f32.cbm").is_file(),
+        "the preserved plan-base baseline must not be deleted"
+    );
+}
+
+/// SPEC-OH-31, PRESERVED ACROSS THE ONE RE-BASELINE.
+///
+/// `baseline.cbm` was regenerated once, for the deliberate learning-rate f32
+/// parity fix. That would normally destroy this fixture's whole value — a
+/// regenerated baseline compared against itself proves nothing. It does not
+/// here, because the ORIGINAL plan-base bytes are preserved as
+/// `baseline_pre_lr_f32.cbm` and this test proves mechanically that the two
+/// differ by EXACTLY the intended factor and nothing else:
+///
+/// * identical tree count, identical split count per tree, and identical split
+///   `(feature, border)` pairs — i.e. the SEARCH is untouched, which is what
+///   "no one-hot change leaked into the float-only path" actually means;
+/// * every leaf value scaled by exactly `f32(0.3) / 0.3` (the fixture's pinned
+///   `learning_rate = 0.3`), to within one ulp;
+/// * identical bias.
+///
+/// If a future change disturbs the float path in ANY other way, the structural
+/// assertions below fail even though the byte-identity gate was re-baselined.
+#[test]
+fn baseline_only_differs_from_pre_lr_baseline_by_the_learning_rate_factor() {
+    let dir = baseline_dir();
+    let pre = cb_model::load_cbm(&dir.join("baseline_pre_lr_f32.cbm"))
+        .expect("the preserved plan-base baseline must load");
+    let now = cb_model::load_cbm(&dir.join("baseline.cbm"))
+        .expect("the current baseline must load");
+
+    // The fixture pins learning_rate = 0.3; the fix multiplies every leaf by
+    // f32(0.3)/0.3 relative to the pre-fix bytes.
+    let factor = f64::from(0.3_f32) / 0.3_f64;
+    assert!(factor != 1.0, "the guard is vacuous if 0.3 were f32-exact");
+
+    assert_eq!(
+        pre.oblivious_trees.len(),
+        now.oblivious_trees.len(),
+        "tree count changed — this is NOT a pure learning-rate difference"
+    );
+    assert_eq!(pre.bias, now.bias, "bias changed");
+
+    for (t, (a, b)) in pre
+        .oblivious_trees
+        .iter()
+        .zip(now.oblivious_trees.iter())
+        .enumerate()
+    {
+        // STRUCTURE must be byte-for-byte the same: same splits, same order.
+        assert_eq!(
+            a.splits, b.splits,
+            "tree {t}: the SPLITS changed — the float-only search was disturbed by \
+             something other than the learning-rate fix (SPEC-OH-31)"
+        );
+        assert_eq!(a.leaf_values.len(), b.leaf_values.len(), "tree {t}: leaf count");
+
+        // VALUES: for the FIRST tree the relation is EXACT — its leaves are the
+        // raw deltas times the rate, so scaling the rate scales them one-for-one.
+        //
+        // For LATER trees it is exact only to first order: tree 0's rescaled
+        // leaves shift the running approx, which shifts tree 1's gradients, and
+        // so on. The residual second-order term is ~1e-8 relative (measured), the
+        // same order as the rate change itself — which is precisely what a
+        // learning-rate perturbation propagating through boosting looks like, and
+        // is NOT compatible with a structural change (those move leaves by
+        // percents, not by 1e-8, and would already have tripped the split
+        // assertion above).
+        let rel_tol = if t == 0 { 4.0 * f64::EPSILON } else { 1e-6 };
+        for (l, (&old, &new)) in a.leaf_values.iter().zip(b.leaf_values.iter()).enumerate() {
+            let want = old * factor;
+            let tol = want.abs() * rel_tol;
+            assert!(
+                (new - want).abs() <= tol,
+                "tree {t} leaf {l}: {new} is not {old} * f32(0.3)/0.3 ({want}) within \
+                 {rel_tol:e} relative — the delta is not purely the learning-rate fix"
+            );
+        }
+        assert_eq!(a.leaf_weights, b.leaf_weights, "tree {t}: leaf weights changed");
+    }
 }

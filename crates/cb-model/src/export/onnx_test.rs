@@ -607,3 +607,36 @@ fn unwritable_path_returns_typed_io_error() {
     let result = export_onnx(&model, &path, false);
     assert!(matches!(result, Err(OnnxExportError::Io(_))));
 }
+
+
+// ── SPEC-OH-16 — one-hot models are rejected, not silently mis-exported ─────
+
+/// A depth-1 model whose only split is one-hot. Without the SPEC-OH-16 guard
+/// the node builder falls through `as_float() -> None` and emits a
+/// `(feature = 0, border = 0.0)` node — a structurally valid ONNX file encoding
+/// the WRONG model.
+fn one_hot_split_tree() -> ObliviousTree {
+    ObliviousTree {
+        splits: vec![ModelSplit::OneHot(cb_model_one_hot_split())],
+        leaf_values: vec![1.0, 2.0],
+        leaf_weights: vec![1.0, 1.0],
+    }
+}
+
+fn cb_model_one_hot_split() -> crate::OneHotModelSplit {
+    crate::OneHotModelSplit {
+        cat_feature: 0,
+        value_hash: 1_296_865_003,
+    }
+}
+
+#[test]
+fn onnx_export_rejects_one_hot_models() {
+    let mut model = empty_model();
+    model.oblivious_trees.push(one_hot_split_tree());
+    model.float_feature_borders = vec![vec![0.5]];
+    assert!(matches!(
+        is_onnx_exportable(&model),
+        Err(OnnxExportError::OneHotSplitsUnsupported)
+    ));
+}

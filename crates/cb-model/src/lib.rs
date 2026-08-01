@@ -46,8 +46,8 @@ pub use fstr::{
 };
 pub use json::{decode_json, load_json, save_json};
 pub use model::{
-    CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, RegionLevel, RegionTree, Split,
-    TreeVariant,
+    CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree, OneHotModelSplit, RegionLevel,
+    RegionTree, Split, TreeVariant,
 };
 pub use model_sum::sum_models;
 pub use partial_dependence::{partial_dependence, PartialDependence, PdpError};
@@ -55,7 +55,9 @@ pub use predict::{
     apply_multiclass_prediction, apply_prediction_type, apply_ve_prediction_type, MultiClassKind,
     PredictionType,
 };
-pub use shap::{prediction_diff, sage_values, shap_interaction_values, shap_values};
+pub use shap::{
+    prediction_diff, sage_values, shap_interaction_values, shap_values, ShapUnsupported,
+};
 
 // Generated-bindings mount (D-01): a committed, `#[path]`-mounted module with a
 // blanket lint-exemption, reused for EVERY vendored code-generator this crate

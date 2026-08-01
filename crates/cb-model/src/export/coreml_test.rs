@@ -361,3 +361,24 @@ fn coreml_feature_descriptors() {
         other => panic!("output expected multiArrayType, got {other:?}"),
     }
 }
+
+
+// ── SPEC-OH-16 — one-hot models are rejected, not silently mis-exported ─────
+
+#[test]
+fn coreml_export_rejects_one_hot_models() {
+    let mut model = empty_model();
+    model.oblivious_trees.push(ObliviousTree {
+        splits: vec![ModelSplit::OneHot(crate::OneHotModelSplit {
+            cat_feature: 0,
+            value_hash: 1_296_865_003,
+        })],
+        leaf_values: vec![1.0, 2.0],
+        leaf_weights: vec![1.0, 1.0],
+    });
+    model.float_feature_borders = vec![vec![0.5]];
+    assert!(matches!(
+        is_coreml_exportable(&model),
+        Err(CoreMlExportError::OneHotSplitsUnsupported)
+    ));
+}

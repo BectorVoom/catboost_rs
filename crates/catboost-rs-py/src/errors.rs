@@ -144,8 +144,14 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         // `Display` ("unsupported model: <reason>") so the Python message is
         // self-describing.
         FacadeError::UnsupportedModel(_) => CatBoostValueError::new_err(err.to_string()),
+        // A SHAP-family request on a one-hot / CTR model (SPEC-OH-15) is a
+        // bad-input value error in exactly the same sense as `UnsupportedModel`:
+        // the model is the "bad input" to the explain operation. Surface the
+        // full `Display` so the Python message names the reason.
+        FacadeError::ShapUnsupported(_) => CatBoostValueError::new_err(err.to_string()),
         FacadeError::Export(e) => match e {
             cb_model::OnnxExportError::CategoricalFeaturesUnsupported
+            | cb_model::OnnxExportError::OneHotSplitsUnsupported
             | cb_model::OnnxExportError::NonObliviousTreesUnsupported
             | cb_model::OnnxExportError::RegionTreesUnsupported
             | cb_model::OnnxExportError::NonIntegerClassLabelsUnsupported => {
@@ -162,6 +168,7 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         // `Encode` -> base `CatBoostError` (an internal/unexpected failure).
         FacadeError::CoreMlExport(e) => match e {
             cb_model::CoreMlExportError::CategoricalFeaturesUnsupported
+            | cb_model::CoreMlExportError::OneHotSplitsUnsupported
             | cb_model::CoreMlExportError::NonObliviousTreesUnsupported
             | cb_model::CoreMlExportError::RegionTreesUnsupported
             | cb_model::CoreMlExportError::MultiDimUnsupported => {

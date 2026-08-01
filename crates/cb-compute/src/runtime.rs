@@ -929,10 +929,16 @@ pub struct Derivatives {
 ///   landmine: the seam must never pull a backend dep into `cb-train`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceGrownTree {
-    /// Per-level chosen split as `(feature_index, bin_id)`; length = tree depth.
-    /// Pass test: `quantized_bin[feature] > bin_id`. The caller resolves the
-    /// border via `feature_borders[feature][bin_id]`.
-    pub splits: Vec<(u32, u32)>,
+    /// Per-level chosen split as `(feature_index, bin_id, one_hot)`; length = tree depth.
+    ///
+    /// Pass test: `quantized_bin[feature] > bin_id` when `one_hot == false` (the caller
+    /// resolves the border via `feature_borders[feature][bin_id]`), and
+    /// `quantized_bin[feature] == bin_id` when `one_hot == true` — the EQUALITY split of a
+    /// one-hot categorical column (SPEC-OH-24). The kind rides INSIDE the tuple, mirroring
+    /// `region_path`'s precedent, so it can never be separated from the split it describes.
+    ///
+    /// `false` is the byte-unchanged float meaning; every non-oblivious grower emits it.
+    pub splits: Vec<(u32, u32, bool)>,
     /// Per-leaf values in leaf-index order. UN-scaled by `learning_rate`
     /// (cb-train applies the shrinkage).
     ///
@@ -1118,6 +1124,31 @@ pub struct DeviceTrainConfig {
     ///
     /// Default `false` (the byte-unchanged covered regime, D-04).
     pub sample_from_host: bool,
+
+    // ─── SPEC-OH-21/22/24/25 (one-hot categorical training) ──────────────────────
+    /// Per-device-feature one-hot flag, length `n_features` (the CONCATENATED
+    /// `float | one-hot` axis). All-`false` — or empty — is the byte-unchanged
+    /// float-only regime.
+    pub one_hot_flags: Vec<bool>,
+    /// Per-device-feature REAL cardinality, length `n_features`: `borders[f].len() + 1`
+    /// for a float feature, the column's `PerfectHash` cardinality for a one-hot column.
+    ///
+    /// This is **NOT** `TCFeature.folds`. On the production path the latter is the padded
+    /// uniform histogram line width (`vec![n_bins_line; eff_n_features]`), so
+    /// `border < folds[feature]` is the loop bound itself and excludes nothing — a
+    /// cardinality-2 column in a 32-wide line would contribute 30 phantom
+    /// "all-objects-right" candidates. This array is the real bound the one-hot scorer
+    /// arm reads; the padded width may never substitute for it.
+    ///
+    /// The host quantizer populates it on EVERY device-eligible fit, float-only included,
+    /// which is what lets the backend assert `real_folds.len() == n_features`
+    /// unconditionally instead of tolerating a silently-inert empty bound.
+    pub real_folds: Vec<u32>,
+    /// The float/one-hot boundary of the device feature axis: device indices
+    /// `[0, n_float)` are float columns and `[n_float, n_features)` are one-hot columns.
+    /// The split scorer derives its two pass windows from it. `n_float == n_features`
+    /// is the float-only regime (pass B empty).
+    pub n_float: usize,
 }
 
 impl Default for DeviceTrainConfig {
@@ -1135,6 +1166,14 @@ impl Default for DeviceTrainConfig {
             quantile_delta: 1e-6,
             ctr: None,
             sample_from_host: false,
+            // SPEC-OH-21/24: empty / `0` is the byte-unchanged float-only regime, so every
+            // existing `DeviceTrainConfig { .. ..Default::default() }` literal keeps
+            // compiling and behaving identically. Note this is about CONSTRUCTION sites
+            // only: on a real device-eligible fit the trainer always populates
+            // `real_folds`, never leaving it at this default.
+            one_hot_flags: Vec::new(),
+            real_folds: Vec::new(),
+            n_float: 0,
         }
     }
 }
@@ -1158,6 +1197,20 @@ impl DeviceTrainConfig {
             // declines to the CPU grower instead of silently riding this arm and
             // growing with a sample the caller never meant to apply.
             && !self.sample_from_host
+            // SPEC-OH-25: the one-hot regime IS covered, but only alongside the
+            // conditions above — in particular `ctr.is_none()` is NOT relaxed. SPEC-OH-26
+            // rejects a pool that mixes one-hot and CTR columns outright, so a one-hot fit
+            // always has `ctr == None`; asserting it here means a future change that
+            // loosened that gate declines to the CPU grower rather than silently training
+            // a combination no device kernel implements.
+            && (self.one_hot_flags.iter().all(|&f| !f) || self.ctr.is_none())
+    }
+
+    /// `true` iff any device feature is one-hot (SPEC-OH-21). An empty or all-`false`
+    /// `one_hot_flags` is the float-only regime.
+    #[must_use]
+    pub fn has_one_hot(&self) -> bool {
+        self.one_hot_flags.iter().any(|&f| f)
     }
 }
 
