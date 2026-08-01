@@ -2098,7 +2098,7 @@ fn grow_oblivious_tree_pairwise_into(
     let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
     let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
 
-    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+    let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(depth);
 
     for level in 0..depth {
         // (1) Device pairwise fill + der-sum scatter + score + deterministic argmax over
@@ -2125,7 +2125,8 @@ fn grow_oblivious_tree_pairwise_into(
                 "grow_oblivious_tree_pairwise level {level}: no candidate split (degenerate)"
             ))
         })?;
-        splits.push((split.feature_id, split.bin_id));
+        // The pairwise grower is OUT OF SCOPE for one-hot (SPEC §2): threshold only.
+        splits.push((split.feature_id, split.bin_id, false));
 
         // (3) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
         //     `leaf_index` convention) — IN-PLACE on device, NO read-back here (D-05).

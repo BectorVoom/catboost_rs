@@ -64,6 +64,15 @@ pub enum CoreMlExportError {
     #[error("model uses categorical/CTR features, which CoreML export does not support")]
     CategoricalFeaturesUnsupported,
 
+    /// The model contains at least one one-hot categorical split (SPEC-OH-16).
+    /// A DISTINCT variant from
+    /// [`CoreMlExportError::CategoricalFeaturesUnsupported`] so the message
+    /// names the real cause: without this guard the node builder falls through
+    /// `as_float() -> None` and silently emits a `(feature = 0, border = 0.0)`
+    /// node — a wrong model, exported cleanly.
+    #[error("model contains one-hot categorical splits, which CoreML export does not support")]
+    OneHotSplitsUnsupported,
+
     /// The model has at least one non-symmetric (Lossguide/Depthwise) tree —
     /// upstream's `IsOblivious()` guard.
     #[error("model contains non-symmetric (Lossguide/Depthwise) trees, which CoreML export does not support")]
@@ -102,6 +111,15 @@ fn is_coreml_exportable(model: &Model) -> Result<(), CoreMlExportError> {
     }
     if !model.region_trees.is_empty() {
         return Err(CoreMlExportError::RegionTreesUnsupported);
+    }
+    // SPEC-OH-16: BEFORE the generic categorical arm, so the message is specific.
+    let has_one_hot_split = model
+        .oblivious_trees
+        .iter()
+        .flat_map(|tree| tree.splits.iter())
+        .any(|split| matches!(split, ModelSplit::OneHot(_)));
+    if has_one_hot_split {
+        return Err(CoreMlExportError::OneHotSplitsUnsupported);
     }
     let has_ctr_split = model
         .oblivious_trees

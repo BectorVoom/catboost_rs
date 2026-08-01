@@ -51,7 +51,7 @@ fn host_score(leaves: &[LeafStats], scaled_l2: f64, score_fn: u32) -> f64 {
 
 /// The CPU leaf-wise reference tree (mirrors `grow_nonsym_tree` but with HOST split selection).
 struct CpuTree {
-    splits: Vec<(u32, u32)>,
+    splits: Vec<(u32, u32, bool)>,
     step_nodes: Vec<(u16, u16)>,
     node_id_to_leaf_id: Vec<u32>,
     leaf_values: Vec<f64>,
@@ -295,7 +295,7 @@ fn cpu_leaf_wise(
     for (id, node) in nodes.iter().enumerate() {
         match node {
             RefNode::Interior { feature, bin, left, right } => {
-                splits.push((*feature, *bin));
+                splits.push((*feature, *bin, false));
                 node_id_to_leaf_id[id] = u32::MAX;
                 step_nodes.push((
                     u16::try_from(left - id).unwrap(),
@@ -303,7 +303,7 @@ fn cpu_leaf_wise(
                 ));
             }
             RefNode::Leaf => {
-                splits.push((0, 0));
+                splits.push((0, 0, false));
                 step_nodes.push((0, 0));
                 node_to_leaf[id] = Some(next_leaf_id);
                 node_id_to_leaf_id[id] = next_leaf_id;

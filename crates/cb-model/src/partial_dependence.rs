@@ -104,6 +104,13 @@ pub enum PdpError {
     /// The dataset has no objects (`columns` empty, or every column length 0).
     #[error("dataset has no objects")]
     EmptyDataset,
+    /// The model carries at least one one-hot categorical split (SPEC-OH-19).
+    /// PDP sweeps a FLOAT feature's grid while holding every other column at
+    /// its observed value, and `columns` is the float column space alone — a
+    /// one-hot split reads a raw categorical column PDP never supplies, so
+    /// every swept prediction would silently take the same (fail) branch.
+    #[error("model contains one-hot categorical splits, which partial dependence does not support")]
+    OneHotSplitsUnsupported,
 }
 
 /// PDP-05: validate `(model, columns, features)` against the SPEC §5
@@ -113,6 +120,22 @@ pub enum PdpError {
 /// to never NaN-pad a short/missing column
 /// `[VERIFIED: CODEGRAPH crates/cb-model/src/apply.rs:404-407]`.
 fn validate(model: &Model, columns: &[Vec<f32>], features: &[usize]) -> Result<usize, PdpError> {
+    // (0) SPEC-OH-19: a one-hot model has a categorical column PDP never
+    // supplies; reject before any sweep rather than averaging one branch.
+    let has_one_hot_split = model
+        .oblivious_trees
+        .iter()
+        .flat_map(|tree| tree.splits.iter())
+        .chain(
+            model
+                .non_symmetric_trees
+                .iter()
+                .flat_map(|tree| tree.tree_splits.iter()),
+        )
+        .any(|split| matches!(split, crate::ModelSplit::OneHot(_)));
+    if has_one_hot_split {
+        return Err(PdpError::OneHotSplitsUnsupported);
+    }
     // (1) arity: 1 or 2 features only.
     if features.len() != 1 && features.len() != 2 {
         return Err(PdpError::UnsupportedFeatureArity {

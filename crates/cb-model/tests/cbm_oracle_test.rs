@@ -370,3 +370,88 @@ fn cbm_short_header_is_typed_error() {
 fn format_version_literal_is_the_canonical_typo() {
     assert_eq!(FLATBUFFERS_MODEL_V1, "FlabuffersModel_v1");
 }
+
+// ── SPEC-OH-13 — an UPSTREAM-produced one-hot `.cbm` predicts within 1e-5 ────
+//
+// The only specification proving the one-hot encoding is genuinely
+// upstream-compatible rather than merely self-consistent (SPEC §1.2 / §9 R2,
+// load side): the `.cbm` files under `cb-oracle/fixtures/one_hot_train/` were
+// produced by real catboost 1.2.10 (FROZEN — never regenerated in CI, because
+// upstream quantization is run-to-run nondeterministic), loaded here through
+// PRODUCTION `load_cbm` and applied through PRODUCTION `predict_raw_cat`.
+//
+// A failure here localizes to the `.cbm` one-hot offset math (T07) or the
+// `TOneHotFeature.Index` interpretation (T08), never to this test.
+//
+// Lives in THIS binary rather than its own `tests/` file on purpose: each
+// integration-test file is a separate link unit, and the fixture helpers and
+// imports it needs are already here.
+
+/// The one-hot fixture's raw categorical columns, already in the A4 string form.
+fn one_hot_cat_columns(scenario: &str) -> Vec<Vec<String>> {
+    let raw = std::fs::read_to_string(fixture(&format!("one_hot_train/{scenario}/cat_cols.json")))
+        .unwrap_or_else(|e| panic!("{scenario}/cat_cols.json must load: {e:?}"));
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).expect("cat_cols.json must be valid json");
+    doc["columns"]
+        .as_array()
+        .expect("cat_cols.json.columns must be an array of columns")
+        .iter()
+        .map(|col| {
+            col.as_array()
+                .expect("each column is an array")
+                .iter()
+                .map(|v| v.as_str().expect("each cat value is a string").to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+/// The one-hot fixture's float columns, transposed `[N, F]` -> per-feature SoA.
+fn one_hot_float_columns(scenario: &str) -> Vec<Vec<f32>> {
+    let x: Array2<f64> = read_npy(fixture(&format!("one_hot_train/{scenario}/X_float.npy")))
+        .unwrap_or_else(|e| panic!("{scenario}/X_float.npy must load: {e:?}"));
+    let (n_rows, n_cols) = x.dim();
+    (0..n_cols)
+        .map(|f| (0..n_rows).map(|r| x[[r, f]] as f32).collect())
+        .collect()
+}
+
+/// Assert one committed scenario: the upstream `.cbm` loads, genuinely carries
+/// one-hot splits, and reproduces the upstream `RawFormulaVal` at <= 1e-5.
+fn assert_upstream_one_hot_cbm(scenario: &str) {
+    let model = load_cbm(&fixture(&format!("one_hot_train/{scenario}/model.cbm")))
+        .unwrap_or_else(|e| panic!("{scenario}/model.cbm must load: {e:?}"));
+
+    // Non-vacuity: the fixture must actually exercise the variant, else this
+    // oracle would pass on a float-only model.
+    let n_one_hot = model
+        .oblivious_trees
+        .iter()
+        .flat_map(|t| t.splits.iter())
+        .filter(|s| matches!(s, ModelSplit::OneHot(_)))
+        .count();
+    assert!(
+        n_one_hot > 0,
+        "{scenario}: the fixture must carry one-hot splits, else the oracle is vacuous"
+    );
+
+    let got = predict_raw_cat(
+        &model,
+        &one_hot_float_columns(scenario),
+        &one_hot_cat_columns(scenario),
+    );
+    let want = load_f64_vec(&fixture(&format!("one_hot_train/{scenario}/predictions.npy")))
+        .unwrap_or_else(|e| panic!("{scenario}/predictions.npy must load: {e:?}"));
+
+    compare_stage(Stage::Predictions, &got, &want)
+        .unwrap_or_else(|e| panic!("{scenario}: one-hot .cbm predictions diverge: {e:?}"));
+}
+
+#[test]
+fn upstream_one_hot_cbm_predicts_within_1e5() {
+    // Both committed scenarios, in ONE test: they share the load+apply path, so
+    // splitting them buys no localization but doubles the fixture I/O.
+    assert_upstream_one_hot_cbm("default_binary");
+    assert_upstream_one_hot_cbm("multi");
+}

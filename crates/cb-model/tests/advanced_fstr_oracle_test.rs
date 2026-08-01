@@ -128,7 +128,7 @@ fn shap_interaction_values_matches_upstream_within_tol() {
     let model = binclf_model();
     let cols = load_feature_columns("advanced_fstr/binclf_X.npy");
 
-    let inter = shap_interaction_values(&model, &cols, N_FEATURES);
+    let inter = shap_interaction_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let flat: Vec<f64> = inter.iter().flat_map(|m| m.iter().copied()).collect();
 
     let expected = load_f64_vec(&fixture("advanced_fstr/oblivious_shap_interaction.npy"))
@@ -142,8 +142,8 @@ fn shap_interaction_row_sum_equals_shap_values() {
     // the feature columns (excluding the bias slot) reproduces ϕ(i).
     let model = binclf_model();
     let cols = load_feature_columns("advanced_fstr/binclf_X.npy");
-    let inter = shap_interaction_values(&model, &cols, N_FEATURES);
-    let shap = shap_values(&model, &cols, N_FEATURES);
+    let inter = shap_interaction_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
+    let shap = shap_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let dim = N_FEATURES + 1;
     for (obj, mat) in inter.iter().enumerate() {
         for i in 0..N_FEATURES {
@@ -167,7 +167,7 @@ fn prediction_diff_matches_upstream_within_tol() {
         .map(|c| c.iter().take(2).copied().collect())
         .collect();
 
-    let pdiff = prediction_diff(&model, &cols, N_FEATURES);
+    let pdiff = prediction_diff(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let expected = load_f64_vec(&fixture("advanced_fstr/prediction_diff.npy"))
         .expect("prediction_diff.npy must load");
     assert_close("PredictionDiff", &pdiff, &expected);
@@ -185,7 +185,7 @@ fn sage_values_structural_oracle() {
     let model = binclf_model();
     let cols = load_feature_columns("advanced_fstr/binclf_X.npy");
 
-    let sage = sage_values(&model, &cols, N_FEATURES);
+    let sage = sage_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     // (1) correct shape.
     assert_eq!(sage.len(), N_FEATURES, "SAGE has one value per feature");
     // (2) finite + non-negative (a magnitude importance).
@@ -195,7 +195,7 @@ fn sage_values_structural_oracle() {
     }
     // (3) deterministic across repeated calls (no hidden RNG state in the Rust
     // surrogate — the seed-match property RESEARCH gate 2 requires).
-    let sage2 = sage_values(&model, &cols, N_FEATURES);
+    let sage2 = sage_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     assert_eq!(sage, sage2, "SAGE surrogate must be deterministic");
     // (4) the upstream fixture exists and has the right shape (captured for the
     // future seed-match value oracle), and upstream agrees on which features are
@@ -221,7 +221,7 @@ fn non_symmetric_shap_matches_upstream_within_tol() {
     let model = non_symmetric_model();
     let cols = load_feature_columns("advanced_fstr/binclf_X.npy");
 
-    let shap = shap_values(&model, &cols, N_FEATURES);
+    let shap = shap_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let flat: Vec<f64> = shap.iter().flat_map(|r| r.iter().copied()).collect();
 
     let expected = load_f64_vec(&fixture("advanced_fstr/non_symmetric_shap.npy"))
@@ -234,7 +234,7 @@ fn non_symmetric_shap_interaction_matches_upstream_within_tol() {
     let model = non_symmetric_model();
     let cols = load_feature_columns("advanced_fstr/binclf_X.npy");
 
-    let inter = shap_interaction_values(&model, &cols, N_FEATURES);
+    let inter = shap_interaction_values(&model, &cols, N_FEATURES).expect("the fixture model is float-only");
     let flat: Vec<f64> = inter.iter().flat_map(|m| m.iter().copied()).collect();
 
     let expected =

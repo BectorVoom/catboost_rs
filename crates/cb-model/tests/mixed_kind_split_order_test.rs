@@ -74,6 +74,8 @@ fn ctr_at_level_zero_tree() -> TrainModel {
         bias: 0.0,
         approx_dimension: 1,
         class_to_label: Vec::new(),
+        one_hot_bin_to_hash: Vec::new(),
+        one_hot_absolute: Vec::new(),
     }
 }
 
@@ -163,6 +165,8 @@ fn empty_level_kinds_keeps_the_byte_identical_legacy_order() {
         bias: 0.0,
         approx_dimension: 1,
         class_to_label: Vec::new(),
+        one_hot_bin_to_hash: Vec::new(),
+        one_hot_absolute: Vec::new(),
     };
 
     let model = CbModel::from_trained(&trained, vec![vec![0.5], vec![1.5]]);

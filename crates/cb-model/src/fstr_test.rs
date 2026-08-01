@@ -483,7 +483,7 @@ fn loss_change_uses_injected_final_error() {
 
     // Independent recomputation of the expected LFC vector with the RMSE closure.
     let approx = crate::apply::predict_raw(&model, &cols);
-    let shap = shap_values(&model, &cols, n_features);
+    let shap = shap_values(&model, &cols, n_features).expect("the fixture model is float-only");
     let base = rmse_final_error(&approx, &labels);
     let expected: Vec<f64> = (0..n_features)
         .map(|feature| {
@@ -494,7 +494,7 @@ fn loss_change_uses_injected_final_error() {
         })
         .collect();
 
-    let got = loss_function_change(&model, &cols, &labels, n_features, rmse_final_error);
+    let got = loss_function_change(&model, &cols, &labels, n_features, rmse_final_error).expect("the fixture model is float-only");
     assert_eq!(got.len(), n_features);
     for (f, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
         assert!(
@@ -506,9 +506,76 @@ fn loss_change_uses_injected_final_error() {
     // Guard: the RMSE result must genuinely differ from the retained Logloss
     // wrapper's result (else the test could pass even if the closure were
     // ignored and Logloss hard-coded).
-    let logloss = loss_function_change_logloss(&model, &cols, &labels, n_features);
+    let logloss = loss_function_change_logloss(&model, &cols, &labels, n_features).expect("the fixture model is float-only");
     assert!(
         got.iter().zip(logloss.iter()).any(|(r, l)| (r - l).abs() > 1e-9),
         "RMSE closure result must differ from the Logloss wrapper: rmse={got:?} logloss={logloss:?}"
+    );
+}
+
+// ── SPEC-OH-18 — a one-hot split's internal identity is its cat feature ─────
+
+/// SPEC-OH-18 — upstream `TFeature` equality ignores the tested VALUE for a
+/// one-hot split exactly as it ignores the border for a float split: every
+/// `Values[k]` bin of one `TOneHotFeature` is the SAME internal feature. Before
+/// this arm, `(OneHot, OneHot)` fell into the `_ => false` wildcard, so the same
+/// cat column interned twice — silently backwards.
+#[test]
+fn two_one_hot_splits_on_the_same_cat_feature_are_one_internal_feature() {
+    let a = ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 1, value_hash: 111 });
+    let b = ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 1, value_hash: 222 });
+    let c = ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 2, value_hash: 111 });
+
+    assert!(
+        same_internal_feature(&a, &b),
+        "the same cat column with different values is ONE internal feature"
+    );
+    assert!(!same_internal_feature(&a, &c), "different cat columns are distinct");
+    assert!(
+        !same_internal_feature(&a, &ModelSplit::Float(Split { feature: 1, border: 0.5 })),
+        "kinds never collide"
+    );
+
+    let n_float = 3;
+    assert_eq!(split_flat_indices(&a, n_float), vec![flat_cat_index(n_float, 1)]);
+}
+
+/// SPEC-OH-18 — `interaction()` over a depth-2 tree whose BOTH levels are
+/// one-hot splits on the SAME cat feature must not report a pair of two
+/// distinct internal features: with one interned identity there is no PAIR at
+/// all, so the result is empty.
+#[test]
+fn interaction_attributes_two_one_hot_splits_to_one_pair() {
+    let mut model = empty_model();
+    model.oblivious_trees.push(ObliviousTree {
+        splits: vec![
+            ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 0, value_hash: 111 }),
+            ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 0, value_hash: 222 }),
+        ],
+        leaf_values: vec![1.0, 2.0, 3.0, 0.0],
+        leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+    });
+    assert_eq!(
+        interaction(&model),
+        Vec::<(usize, usize, f64)>::new(),
+        "a self-pair of ONE internal feature is not an interaction"
+    );
+
+    // …whereas two DIFFERENT cat columns do interact.
+    let mut model2 = empty_model();
+    model2.oblivious_trees.push(ObliviousTree {
+        splits: vec![
+            ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 0, value_hash: 111 }),
+            ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 1, value_hash: 222 }),
+        ],
+        leaf_values: vec![1.0, 2.0, 3.0, 0.0],
+        leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+    });
+    let got = interaction(&model2);
+    assert_eq!(got.len(), 1, "two distinct cat columns form exactly one pair");
+    assert_eq!(
+        (got[0].0, got[0].1),
+        (flat_cat_index(0, 0), flat_cat_index(0, 1)),
+        "both members are CAT flat indices (n_float == 0: no float split)"
     );
 }

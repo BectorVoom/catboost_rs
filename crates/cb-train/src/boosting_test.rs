@@ -395,3 +395,97 @@ fn float_only_tree_persists_empty_level_kinds() {
     assert!(tree.one_hot_splits.is_empty());
     assert_eq!(tree.splits.len(), 2);
 }
+
+// ── SPEC-OH-04 — one-hot vs CTR cat-column partition ────────────────────────
+
+/// SPEC-OH-04 — the one-hot-routed and CTR-eligible column lists are derived
+/// from ONE `route_categorical` match, so they are disjoint BY CONSTRUCTION
+/// (two independent filters could drift into double-counting a column, which
+/// would materialize the same feature on both paths).
+#[test]
+fn one_hot_routed_columns_are_partitioned_disjointly_from_ctr_eligible() {
+    // cardinalities [2, 5, 3] at one_hot_max_size = 3:
+    //   card 2 <= 3 -> OneHot; card 5 > 3 -> Ctr; card 3 <= 3 -> OneHot.
+    let (one_hot, ctr) = super::partition_cat_columns(&[2, 5, 3], 3);
+    assert_eq!(one_hot, vec![0, 2]);
+    assert_eq!(ctr, vec![1]);
+
+    // A constant column (cardinality <= 1) routes to NEITHER list
+    // (`route_categorical` -> `Skip`).
+    let (one_hot, ctr) = super::partition_cat_columns(&[1, 2], 2);
+    assert_eq!(one_hot, vec![1]);
+    assert!(ctr.is_empty());
+
+    // Disjointness, asserted rather than assumed.
+    let (one_hot, ctr) = super::partition_cat_columns(&[1, 2, 3, 7, 9], 3);
+    assert!(
+        one_hot.iter().all(|c| !ctr.contains(c)),
+        "the two lists must never share a column"
+    );
+}
+
+// ── SPEC-OH-05 — one-hot bin columns + the exact bin -> raw-hash inverse ────
+
+/// SPEC-OH-05 — a one-hot-routed column contributes its FIRST-SEEN
+/// `PerfectHash` bin column, and the fit-wide `bin -> raw hash` table is its
+/// EXACT inverse.
+///
+/// The inverse must be built by zipping the raw column with the bins
+/// `perfect_hash_bins` returned (first-seen order), NOT by sorting the distinct
+/// hashes ascending: `PerfectHash::remap_bounded` assigns `bin = map.len()` on
+/// first sight, so `hash_by_bin[1]` is the SECOND value ENCOUNTERED, which for
+/// this column is `"a"` — while the ascending-hash reading would give a
+/// different value. The `hash_by_bin.len() == cardinality` assertion is what
+/// makes a partially-filled table impossible.
+#[test]
+fn one_hot_columns_build_bins_and_an_exact_bin_to_hash_inverse() {
+    let cat_columns = vec![vec![
+        "b".to_owned(),
+        "a".to_owned(),
+        "b".to_owned(),
+        "c".to_owned(),
+    ]];
+    let (bins, hash_by_bin) = super::build_one_hot_columns(&cat_columns, &[0])
+        .expect("building one-hot columns must succeed");
+
+    assert_eq!(bins, vec![vec![0, 1, 0, 2]], "first-seen bin assignment");
+    assert_eq!(
+        hash_by_bin,
+        vec![vec![
+            cb_data::calc_cat_feature_hash("b"),
+            cb_data::calc_cat_feature_hash("a"),
+            cb_data::calc_cat_feature_hash("c"),
+        ]],
+        "the inverse follows FIRST-SEEN bin order, not ascending hash order"
+    );
+    assert_eq!(hash_by_bin[0].len(), 3, "one entry per distinct value");
+
+    // The inverse is exact: re-deriving each object's hash through the table
+    // reproduces hashing the raw value directly.
+    for (obj, raw) in cat_columns[0].iter().enumerate() {
+        let bin = bins[0][obj] as usize;
+        assert_eq!(hash_by_bin[0][bin], cb_data::calc_cat_feature_hash(raw));
+    }
+}
+
+/// SPEC-OH-05 — only the LISTED one-hot columns are materialized, in the listed
+/// order, so a mixed pool's CTR-routed columns never leak into `cat_bins`.
+#[test]
+fn build_one_hot_columns_materializes_only_the_listed_columns() {
+    let cat_columns = vec![
+        vec!["x".to_owned(), "y".to_owned()],
+        vec!["p".to_owned(), "q".to_owned()],
+        vec!["m".to_owned(), "n".to_owned()],
+    ];
+    let (bins, hash_by_bin) =
+        super::build_one_hot_columns(&cat_columns, &[2, 0]).expect("must succeed");
+    assert_eq!(bins.len(), 2);
+    assert_eq!(hash_by_bin.len(), 2);
+    // Position 0 is ABSOLUTE column 2 ("m","n"); position 1 is column 0.
+    assert_eq!(hash_by_bin[0][0], cb_data::calc_cat_feature_hash("m"));
+    assert_eq!(hash_by_bin[1][0], cb_data::calc_cat_feature_hash("x"));
+
+    // An out-of-range absolute index is a typed error, never a silent empty
+    // column that would make every one-hot split fail.
+    assert!(super::build_one_hot_columns(&cat_columns, &[9]).is_err());
+}

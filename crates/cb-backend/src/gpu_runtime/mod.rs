@@ -767,6 +767,39 @@ mod session_depth_gt1_test;
 #[cfg(test)]
 mod device_float_only_identity_test;
 
+// T24 / SPEC-OH-21: the packed cindex marks one-hot features truthfully, and the
+// standing pin that `TCFeature.folds` is the PADDED line width (never a candidate
+// bound). Same `pub(crate)`-visibility reason as the sibling above.
+#[cfg(test)]
+mod cindex_one_hot_test;
+
+// T25 / SPEC-OH-22: the split scorer's one-hot (EQUALITY) fold arm. Drives the private
+// `score_partition_over_binsums` directly, so it must be a `gpu_runtime` descendant.
+//
+// NOT built under the default `cpu` backend: `find_optimal_split_partition_kernel` uses the
+// `CUBE_COUNT` builtin for its grid stride, and cubecl-cpu rejects it outright
+// ("Unsupported builtin was used: CubeCount"). Every fn here would fail for that reason
+// alone, which would be indistinguishable from a real one-hot regression. Run with a real
+// device:
+//   cargo test -p cb-backend --no-default-features --features rocm \
+//       --lib gpu_runtime::one_hot_split_score_test
+#[cfg(all(test, not(feature = "cpu")))]
+mod one_hot_split_score_test;
+
+// T26 / SPEC-OH-23: the split APPLICATION's one-hot (EQUALITY) arm. Same `pub(crate)`
+// visibility reason, and the same `CUBE_COUNT` cpu-backend limitation
+// (`partition_split_kernel` grid-strides over `CUBE_COUNT * CUBE_DIM`), so it is likewise
+// device-only.
+#[cfg(all(test, not(feature = "cpu")))]
+mod one_hot_partition_split_test;
+
+// T27b / SPEC-OH-24+25: the one-hot channel (`one_hot_flags` / `real_folds` / `n_float`)
+// reaches the resident scorer with the RIGHT VALUES. `GpuTrainSession` lives in the private
+// `mod session;`, so this must be a `gpu_runtime` descendant. Self-skips on a backend
+// without `Atomic<u64>`.
+#[cfg(test)]
+mod one_hot_session_wiring_test;
+
 // Phase 10-06 (GPUT-15): the bit-packed compressed index (cindex) builder — the
 // grouped `WriteCompressedIndex` layout + per-feature `TCFeature` table the histogram /
 // partition consumers read through the ONE `kernels::read_bin` accessor. `pub(crate)` so
@@ -989,8 +1022,13 @@ fn launch_pointwise_hist2_into(
     // share the same `n_bins` bucket count; the cindex value-range guard above already
     // rejected any bin >= n_bins, so `pack_cindex` masks each field without truncation.
     let n_buckets_per_feature = vec![n_bins; n_features];
-    let packed = crate::gpu_runtime::cindex::pack_cindex(cindex, &n_buckets_per_feature, n)?;
-    let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+    let packed = crate::gpu_runtime::cindex::pack_cindex(
+        cindex,
+        &n_buckets_per_feature,
+        /* one_hot = */ &vec![false; n_features],
+        n,
+    )?;
+    let (offsets_v, shifts_v, masks_v, _one_hot_flags_v) = packed.device_arrays()?;
     let num_words = packed.words.len();
 
     // Upload der1/weight as the channel float type (f32 on wgpu, f64 elsewhere — RESEARCH
@@ -1419,6 +1457,14 @@ fn score_over_binsums(
     // (RESEARCH A1) — read back and UPCAST to f64.
     let bin_sums_len = hist2_binsums_len(n_bins, n_features);
 
+    // SPEC-OH-22: this SLICE entry is the float-only, single-pass launcher — it has no
+    // one-hot caller. It therefore always dispatches `one_hot = false` over the FULL
+    // feature range, which collapses the kernel's added arithmetic to today's exactly.
+    // `real_folds` is still supplied (the kernel signature is uniform) but is never read
+    // on that arm; the padded line width is the inert value.
+    let real_folds_h =
+        client.create(cubecl::bytes::Bytes::from_elems(vec![n_bins as u32; n_features]));
+
     #[cfg(feature = "wgpu")]
     let (scores_handle, best_gain_handle, best_idx_handle) = {
         let scores_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; n_candidates]));
@@ -1434,9 +1480,13 @@ fn score_over_binsums(
             unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), n_features) },
             n_features as u32,
+            /* feature_lo = */ 0u32,
+            /* feature_hi = */ n_features as u32,
             n_bins_u32,
             score_fn,
+            /* one_hot = */ false,
         );
         (scores_h, best_gain_h, best_idx_h)
     };
@@ -1456,9 +1506,13 @@ fn score_over_binsums(
             unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), n_features) },
             n_features as u32,
+            /* feature_lo = */ 0u32,
+            /* feature_hi = */ n_features as u32,
             n_bins_u32,
             score_fn,
+            /* one_hot = */ false,
         );
         (scores_h, best_gain_h, best_idx_h)
     };
@@ -1983,6 +2037,10 @@ pub(crate) fn launch_partition_split_into(
         split_mask,
         bin,
         level_bit,
+        // SPEC-OH-23: this launcher serves the plain feature-major (non-packed) path and
+        // the OUT-OF-SCOPE non-symmetric / Region / pairwise growers. All of them are
+        // threshold splits, so the byte-unchanged default is the only correct value here.
+        /* one_hot = */ false,
     );
 
     #[cfg(not(feature = "wgpu"))]
@@ -2000,6 +2058,10 @@ pub(crate) fn launch_partition_split_into(
         split_mask,
         bin,
         level_bit,
+        // SPEC-OH-23: this launcher serves the plain feature-major (non-packed) path and
+        // the OUT-OF-SCOPE non-symmetric / Region / pairwise growers. All of them are
+        // threshold splits, so the byte-unchanged default is the only correct value here.
+        /* one_hot = */ false,
     );
 
     Ok(new_leaf_of)
@@ -2032,6 +2094,10 @@ pub(crate) fn launch_partition_split_packed_into(
     mask: u32,
     bin: u32,
     level_bit: u32,
+    // SPEC-OH-23: the chosen split's KIND. `false` is the byte-unchanged threshold
+    // routing (`read_bin(..) > bin`); `true` selects the equality routing
+    // (`read_bin(..) == bin`) an oblivious one-hot level needs.
+    one_hot: bool,
 ) -> CbResult<Handle> {
     if n == 0 {
         return Ok(client.empty(0));
@@ -2064,6 +2130,7 @@ pub(crate) fn launch_partition_split_packed_into(
         mask,
         bin,
         level_bit,
+        one_hot,
     );
 
     #[cfg(not(feature = "wgpu"))]
@@ -2081,6 +2148,7 @@ pub(crate) fn launch_partition_split_packed_into(
         mask,
         bin,
         level_bit,
+        one_hot,
     );
 
     Ok(new_leaf_of)
@@ -2297,8 +2365,13 @@ pub(crate) fn launch_partition_hist2_into(
     // so `pack_cindex` masks each field losslessly). The device-resident `leaf_of_h` routes
     // each object into its partition slot (D-05).
     let n_buckets_per_feature = vec![n_bins; n_features];
-    let packed = crate::gpu_runtime::cindex::pack_cindex(cindex, &n_buckets_per_feature, n)?;
-    let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+    let packed = crate::gpu_runtime::cindex::pack_cindex(
+        cindex,
+        &n_buckets_per_feature,
+        /* one_hot = */ &vec![false; n_features],
+        n,
+    )?;
+    let (offsets_v, shifts_v, masks_v, _one_hot_flags_v) = packed.device_arrays()?;
     let num_words = packed.words.len();
 
     let der1_h = upload_channel_floats(client, der1);
@@ -2966,6 +3039,20 @@ pub(crate) fn launch_derive_sibling_hist_into(
 /// score calcer arm (validated here). Returns the chosen [`BestSplit`] or `None` on a degenerate
 /// (no-candidate) level. A read-back failure surfaces [`CbError::Degenerate`] (WR-05). No
 /// `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+///
+/// # One-hot passes (SPEC-OH-22)
+///
+/// `feature_lo`/`feature_hi` bound this launch to ONE contiguous device-feature range and
+/// `one_hot` selects the fold: THRESHOLD (`bin > border`, the unchanged prefix fold) or
+/// EQUALITY (`bin == value`). The candidate index stays ABSOLUTE, so the feature decode,
+/// the range guard and the lowest-index tie-break below are byte-unchanged; the range
+/// guard is tightened from the full candidate count to THIS pass's `pass_hi` so a narrower
+/// pass's no-winner sentinel cannot be read back as a real winner. `real_folds` is the
+/// per-feature REAL cardinality array (NOT the padded `TCFeature.folds`) and is read only
+/// on the `one_hot == true` arm. A float-only fit launches once with
+/// `one_hot = false, feature_lo = 0, feature_hi = n_features`, which collapses to today's
+/// arithmetic exactly.
+#[allow(clippy::too_many_arguments)]
 fn score_partition_over_binsums(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     bin_sums: Handle,
@@ -2975,6 +3062,10 @@ fn score_partition_over_binsums(
     n_features: usize,
     scaled_l2: f64,
     score_fn: u32,
+    real_folds: &[u32],
+    one_hot: bool,
+    feature_lo: usize,
+    feature_hi: usize,
 ) -> CbResult<Option<BestSplit>> {
     // `n_bins` is the (possibly PADDED) histogram line width the fill dispatched
     // ({32,64,128,256}); `n_bins_used` the ACTUAL quantized bin count (<= n_bins). The
@@ -3008,6 +3099,27 @@ fn score_partition_over_binsums(
             "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (candidate count)"
         ))
     })?;
+    // The pass window, validated BEFORE launch. An out-of-range or inverted window is a
+    // wiring bug, never a silently-empty sweep.
+    if feature_lo > feature_hi || feature_hi > n_features {
+        return Err(CbError::OutOfRange(format!(
+            "scorer pass window [{feature_lo}, {feature_hi}) is not within 0..={n_features}"
+        )));
+    }
+    if real_folds.len() != n_features {
+        return Err(CbError::LengthMismatch {
+            column: "real_folds".to_owned(),
+            expected: n_features,
+            actual: real_folds.len(),
+        });
+    }
+    let pass_lo = feature_lo * n_bins;
+    let pass_hi = feature_hi * n_bins;
+    if pass_lo == pass_hi {
+        // An empty pass has no candidate at all — no launch, no winner.
+        return Ok(None);
+    }
+    let pass_candidates = pass_hi - pass_lo;
     let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
         CbError::OutOfRange(format!(
             "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
@@ -3033,13 +3145,24 @@ fn score_partition_over_binsums(
     // keeps the strict-`>`/lowest-index tie-break, so the chosen split is bit-identical
     // (see the kernel doc). The shared-mem argmin size stays the comptime ARGMIN_SHMEM
     // (== CUBE_DIM, Pitfall 3).
-    let num_cubes = n_candidates.div_ceil(CUBE_DIM).max(1);
+    //
+    // The dispatch is sized to THIS PASS's candidate count, not the full space: a pass-B
+    // launch over the one-hot suffix must not spawn cubes for the float prefix it never
+    // sweeps. On the single-pass float-only launch `pass_candidates == n_candidates`, so
+    // the geometry is byte-unchanged.
+    let num_cubes = pass_candidates.div_ceil(CUBE_DIM).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
         x: CUBE_DIM as u32,
         y: 1,
         z: 1,
     };
+    // `real_folds` is read ONLY under the comptime `one_hot == true` arm, but it is
+    // uploaded on every launch so the kernel signature is uniform. It is O(n_features)
+    // `u32`s — negligible against the histogram it accompanies.
+    let real_folds_h = client.create(cubecl::bytes::Bytes::from_elems(real_folds.to_vec()));
+    let feature_lo_u32 = feature_lo as u32;
+    let feature_hi_u32 = feature_hi as u32;
 
     // Per-block winner buffers: `best_gain_h` (channel float, `num_cubes` slots) and
     // `best_idx_h` (genuine `u32`, `num_cubes` slots) — kept SEPARATE rather than packed into
@@ -3060,11 +3183,15 @@ fn score_partition_over_binsums(
             unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), real_folds.len()) },
             n_parts_u32,
             n_features as u32,
             n_bins_used as u32,
+            feature_lo_u32,
+            feature_hi_u32,
             n_bins_u32,
             score_fn,
+            one_hot,
         );
         (best_gain_h, best_idx_h)
     };
@@ -3082,11 +3209,15 @@ fn score_partition_over_binsums(
             unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
             unsafe { ArrayArg::from_raw_parts(lambda_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), real_folds.len()) },
             n_parts_u32,
             n_features as u32,
             n_bins_used as u32,
+            feature_lo_u32,
+            feature_hi_u32,
             n_bins_u32,
             score_fn,
+            one_hot,
         );
         (best_gain_h, best_idx_h)
     };
@@ -3112,12 +3243,29 @@ fn score_partition_over_binsums(
         // no float round-trip, so no range/finiteness filtering is needed; a missing slot
         // falls to the u32::MAX sentinel and is skipped by the candidate-range guard below.
         let cand = best_idx.get(block).copied().unwrap_or(u32::MAX);
-        if (cand as usize) >= n_candidates {
+        // Range guard, tightened from the FULL candidate count to THIS pass's upper bound
+        // (SPEC-OH-22). Each pass seeds its no-winner sentinel to its own `pass_hi`, which
+        // for a narrower pass is strictly below `n_candidates` and would otherwise slip
+        // through as a phantom winner carrying an `f32::MIN`-adjacent gain. On the
+        // single-pass float-only launch `pass_hi == n_candidates`, byte-unchanged.
+        if (cand as usize) >= pass_hi || (cand as usize) < pass_lo {
             continue;
         }
-        // Trailing no-op border AND phantom padded borders (`border >= n_bins_used - 1`)
-        // are all-LEFT no-op splits (the device kernel already excludes them; host belt, WR-05).
-        if (cand as usize) % n_bins >= n_bins_used - 1 {
+        let cand_feature = (cand as usize) / n_bins;
+        let cand_border = (cand as usize) % n_bins;
+        // The host belt mirroring the kernel's eligibility (WR-05).
+        //  * THRESHOLD: trailing no-op border AND phantom padded borders
+        //    (`border >= n_bins_used - 1`) are all-LEFT no-op splits.
+        //  * EQUALITY: the trailing border is a REAL candidate — the highest category —
+        //    so the belt must not discard it. Bound by the feature's real cardinality
+        //    instead. Lifting this in the kernel alone would leave the highest category
+        //    permanently unselectable.
+        if one_hot {
+            let fold = real_folds.get(cand_feature).copied().unwrap_or(0) as usize;
+            if cand_border >= fold {
+                continue;
+            }
+        } else if cand_border >= n_bins_used - 1 {
             continue;
         }
         let take = gain > best_gain || (gain == best_gain && cand < best_c);
@@ -3295,8 +3443,14 @@ pub(crate) fn read_fixedpoint_hist_f64(
 /// leaf-value divergence report).
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrownTree {
-    /// The per-level chosen `(feature, bin)` split sequence (FORWARD-bit order).
-    pub splits: Vec<(u32, u32)>,
+    /// The per-level chosen `(feature, bin, one_hot)` split sequence (FORWARD-bit order).
+    ///
+    /// SPEC-OH-24: `one_hot` records whether the level's split is an EQUALITY split
+    /// (`bin == value`) rather than the threshold `bin > border`. It rides INSIDE the
+    /// tuple — not in a parallel `Vec<bool>` — so the kind and the split can never drift
+    /// apart (the mistake `region_path` already avoids). `false` is the byte-unchanged
+    /// float meaning, which is what every non-oblivious grower emits.
+    pub splits: Vec<(u32, u32, bool)>,
     /// The per-object final leaf index (`0..2^depth`) — the SC-3 structure observation.
     pub leaf_of: Vec<u32>,
     /// The per-leaf estimated value (`calc_average(Σ der1, Σ weight, scaled_l2)`).
@@ -3457,7 +3611,7 @@ fn grow_oblivious_tree_into(
     let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices.to_vec()));
     let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
 
-    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+    let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(depth);
 
     // NOTE (WR-01, Phase 11 review): the D-04 "memory-lean" subtraction trick is NOT wired into
     // this scored path. The partition-aware fill below computes every `2^level` slot directly, so
@@ -3486,8 +3640,22 @@ fn grow_oblivious_tree_into(
         // (2) Device score + deterministic argmin over the CURRENT 2^level partitions. The bulk
         //     histogram stays device-resident IN the score launch; only the O(1) BestSplit
         //     descriptor crosses back (D-05 / T-11-03-02 — no full-buffer read path).
+        // SPEC-OH-22: the NON-resident grower is the float-only slice entry — one pass,
+        // `one_hot = false` over the full feature range, so the scorer arithmetic collapses
+        // to today's. `real_folds` is inert on that arm (the padded line width).
         let best = score_partition_over_binsums(
-            client, hist_h.clone(), n_parts, n_bins, n_bins, n_features, scaled_l2, score_fn,
+            client,
+            hist_h.clone(),
+            n_parts,
+            n_bins,
+            n_bins,
+            n_features,
+            scaled_l2,
+            score_fn,
+            &vec![n_bins as u32; n_features],
+            /* one_hot = */ false,
+            /* feature_lo = */ 0,
+            /* feature_hi = */ n_features,
         )?;
 
         // (3) The O(1) host integer split decision. A level with no candidate at all is a
@@ -3498,7 +3666,9 @@ fn grow_oblivious_tree_into(
                 "grow_oblivious_tree level {level}: no candidate split (degenerate histogram)"
             ))
         })?;
-        splits.push((split.feature_id, split.bin_id));
+        // The NON-resident oblivious grower is float-only (SPEC-OH-24): threshold splits
+        // exclusively, so the kind is the byte-unchanged `false`.
+        splits.push((split.feature_id, split.bin_id, false));
 
         // (4) Device partition-split (forward-bit doc-routing, level -> bit level == the CPU
         //     `leaf_index` convention, Pitfall 6) — IN-PLACE on device, NO read-back here
@@ -3829,6 +3999,12 @@ pub(crate) fn grow_oblivious_tree_resident(
     n_bins: usize,
     n_bins_used: usize,
     n_features: usize,
+    // SPEC-OH-22 (T25): the boundary of the concatenated `float | one-hot` device feature
+    // axis, and the per-feature REAL cardinality array that bounds one-hot candidates.
+    // `n_float == n_features` (and an all-padded-width `real_folds`) is the float-only
+    // regime, where pass B is empty and the scorer arithmetic is byte-unchanged.
+    n_float: usize,
+    real_folds: &[u32],
     depth: usize,
     scaled_l2: f64,
     score_fn: u32,
@@ -3868,7 +4044,7 @@ pub(crate) fn grow_oblivious_tree_resident(
 
     // leaf_of starts all-zero (every object in the root partition 0), resident on device.
     let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
-    let mut splits: Vec<(u32, u32)> = Vec::with_capacity(depth);
+    let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(depth);
     // The previous level's (copy-folded, complete) histogram — the subtraction parent.
     let mut prev_bin_sums: Option<Handle> = None;
 
@@ -3935,9 +4111,59 @@ pub(crate) fn grow_oblivious_tree_resident(
         }
 
         // (2) Device score + deterministic argmin over the CURRENT 2^level partitions (D-05).
-        let best = score_partition_over_binsums(
-            client, bin_sums.clone(), n_parts, n_bins, n_bins_used, n_features, scaled_l2, score_fn,
+        //
+        // SPEC-OH-22 — TWO passes when the pool carries one-hot columns:
+        //   pass A: `one_hot = false` over `[0, n_float)`     — the threshold fold;
+        //   pass B: `one_hot = true`  over `[n_float, n_total)` — the equality fold.
+        // The cross-pass argmax below is STRICT `>` with pass A evaluated FIRST, so a
+        // pass-B tie can never displace a float candidate — which reproduces the CPU
+        // enumeration order (`AddOneHotFeatures` runs AFTER every float candidate, and
+        // `select_best`'s strict `>` keeps the first). That is a DIFFERENT mechanism from
+        // the per-pass `cand < best_c` lowest-index tie-break inside
+        // `score_partition_over_binsums`; the two must not be conflated.
+        //
+        // With no one-hot columns pass B's window is empty (`n_float == n_features`), so
+        // this is ONE launch with today's arguments exactly.
+        let pass_a = score_partition_over_binsums(
+            client,
+            bin_sums.clone(),
+            n_parts,
+            n_bins,
+            n_bins_used,
+            n_features,
+            scaled_l2,
+            score_fn,
+            real_folds,
+            /* one_hot = */ false,
+            /* feature_lo = */ 0,
+            /* feature_hi = */ n_float,
         )?;
+        let pass_b = score_partition_over_binsums(
+            client,
+            bin_sums.clone(),
+            n_parts,
+            n_bins,
+            n_bins_used,
+            n_features,
+            scaled_l2,
+            score_fn,
+            real_folds,
+            /* one_hot = */ true,
+            /* feature_lo = */ n_float,
+            /* feature_hi = */ n_features,
+        )?;
+        let best = match (pass_a, pass_b) {
+            (Some(a), Some(b)) => {
+                // STRICT `>`: pass B must beat pass A outright to win.
+                if b.gain > a.gain {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
         prev_bin_sums = Some(bin_sums);
         if prof {
             // The scorer's own read-back already drained the queue — this lap is pure elapsed.
@@ -3951,7 +4177,13 @@ pub(crate) fn grow_oblivious_tree_resident(
                 "grow_oblivious_tree_resident level {level}: no candidate split (degenerate histogram)"
             ))
         })?;
-        splits.push((split.feature_id, split.bin_id));
+        // SPEC-OH-23/24: the winner's KIND is decided by WHICH pass produced it — pass B
+        // sweeps `[n_float, n_features)`, so a winner at or above `n_float` is a one-hot
+        // (equality) split. It must travel WITH the split, both into the device routing
+        // below and out through `GrownTree.splits`; a parallel `Vec<bool>` would let the
+        // kind and the split drift apart.
+        let split_is_one_hot = (split.feature_id as usize) >= n_float;
+        splits.push((split.feature_id, split.bin_id, split_is_one_hot));
 
         // (4) Device partition-split (forward-bit doc-routing) over the resident PACKED
         //     cindex words — IN-PLACE on device, NO read-back (D-05). The split feature's
@@ -3983,6 +4215,7 @@ pub(crate) fn grow_oblivious_tree_resident(
             split_mask,
             split.bin_id,
             level as u32,
+            split_is_one_hot,
         )?;
         if prof {
             prof_sync(client);

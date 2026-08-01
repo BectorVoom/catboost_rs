@@ -41,7 +41,8 @@ pub use embedding_calcers::{
 pub use histogram::{
     bin_of, build_bucket_histogram, build_bucket_histogram_into, collect_leaf_residuals,
     fused_feature_scan_and_score, reduce_leaf_der2, reduce_leaf_stats, scan_and_score_borders,
-    scan_and_score_borders_into, scan_border_to_leaf_stats, scan_borders_to_leaf_stats,
+    scan_and_score_borders_into, scan_and_score_one_hot_bins_into, scan_border_to_leaf_stats,
+    scan_borders_to_leaf_stats,
     BucketHistogram, FusedFeatureScratch, LeafStats, ScanScoreScratch,
 };
 pub use hnsw::{

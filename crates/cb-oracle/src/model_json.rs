@@ -182,10 +182,22 @@ impl NonSymmetricNodeJson {
                 split_borders.push(f64::NEG_INFINITY);
                 step_nodes.push((0, 0));
                 let leaf_id = leaf_values.len();
-                node_id_to_leaf_id[id] =
+                let leaf_id_u32 =
                     u32::try_from(leaf_id).map_err(|_| OracleError::MalformedModel {
                         what: "non-symmetric leaf id exceeds u32".to_owned(),
                     })?;
+                // Checked `.get_mut` rather than raw indexing (workspace
+                // `indexing_slicing` lint): `node_id_to_leaf_id` is sized from the node
+                // count, so an out-of-range `id` means a malformed document, not a bug —
+                // surface it typed instead of panicking on a caller's file.
+                let node_count = node_id_to_leaf_id.len();
+                *node_id_to_leaf_id
+                    .get_mut(id)
+                    .ok_or_else(|| OracleError::MalformedModel {
+                        what: format!(
+                            "non-symmetric node id {id} is outside the {node_count}-node table"
+                        ),
+                    })? = leaf_id_u32;
                 leaf_values.push(value);
                 leaf_weights.push(node.weight.unwrap_or(0.0));
             }

@@ -178,7 +178,7 @@ fn loss_function_change_matches_upstream_within_tol() {
     let n_features = model.float_feature_borders.len().max(4);
     // FL-02: the Logloss-defaulted wrapper reproduces the pre-FL-01 behavior
     // byte-for-byte (binary model → Logloss `GetFinalError`).
-    let lfc = loss_function_change_logloss(&model, &cols, &labels, n_features);
+    let lfc = loss_function_change_logloss(&model, &cols, &labels, n_features).expect("the fixture model is float-only");
 
     let expected =
         load_f64_vec(&fixture("fstr_loss_change/oblivious_loss_function_change.npy"))
@@ -226,7 +226,7 @@ fn assert_regression_lfc_matches<F: Fn(&[f64], &[f64]) -> f64>(tag: &str, final_
             .unwrap_or_else(|e| panic!("{tag}_loss_function_change.npy must load: {e:?}"));
 
     let n_features = expected.len();
-    let lfc = loss_function_change(&model, &cols, &labels, n_features, final_error);
+    let lfc = loss_function_change(&model, &cols, &labels, n_features, final_error).expect("the fixture model is float-only");
     assert_eq!(lfc.len(), expected.len(), "{tag} LFC length mismatch");
     for (i, (&got, &want)) in lfc.iter().zip(expected.iter()).enumerate() {
         assert!(

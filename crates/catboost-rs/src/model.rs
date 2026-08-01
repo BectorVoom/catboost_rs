@@ -286,10 +286,13 @@ impl Model {
     ///
     /// # Errors
     /// [`CatBoostError::FeatureMismatch`] if `pool`'s float-feature count differs
-    /// from the model's.
+    /// from the model's; [`CatBoostError::ShapUnsupported`] if the model carries
+    /// one-hot or CTR splits (SPEC-OH-15 — SHAP is defined over float splits
+    /// only, and projecting a categorical level away would silently break the
+    /// local-accuracy invariant).
     pub fn shap_values(&self, pool: &Pool) -> Result<Vec<Vec<f64>>, CatBoostError> {
         let columns = self.feature_columns(pool)?;
-        Ok(shap_values(&self.inner, &columns, self.n_float_features()))
+        Ok(shap_values(&self.inner, &columns, self.n_float_features())?)
     }
 
     /// Compute a feature-importance vector / pairing for the requested
@@ -396,7 +399,7 @@ impl Model {
                     pool.label(),
                     self.n_float_features(),
                     |approx, target| metric.eval(approx, target, &[]).unwrap_or(f64::NAN),
-                );
+                )?;
                 Ok(scores
                     .into_iter()
                     .enumerate()

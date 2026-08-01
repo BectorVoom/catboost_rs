@@ -930,6 +930,27 @@ pub struct Model {
     /// predictions recover the original labels via this map. EMPTY for every scalar
     /// regression / binary model (byte-identical to the pre-6.2 model).
     pub class_to_label: Vec<f64>,
+    /// The fit-wide `bin -> raw hash` table for the ONE-HOT-routed categorical
+    /// columns (SPEC-OH-05 / SPEC-OH-09), indexed by ONE-HOT POSITION then bin:
+    /// `one_hot_bin_to_hash[p][bin] == cb_data::calc_cat_feature_hash(raw)` for
+    /// the raw value that produced `bin`.
+    ///
+    /// The trainer's `AnySplit::OneHot` carries a first-seen `PerfectHash` BIN,
+    /// which is fit-local and meaningless to upstream; the model lift
+    /// (`cb_model::Model::from_trained`) re-expresses it in upstream's RAW hash
+    /// space through this table. EMPTY for every float-only / CTR-only fit.
+    ///
+    /// # Validity
+    /// Valid ONLY for the exact learn-set columns it was built from — bins are
+    /// first-seen per column, so a different row order yields a different
+    /// (equally valid) table.
+    pub one_hot_bin_to_hash: Vec<Vec<u32>>,
+    /// One-hot POSITION -> ABSOLUTE `cat_columns` index (SPEC-OH-05). Parallel to
+    /// [`Model::one_hot_bin_to_hash`]; the model lift needs it to record each
+    /// split's absolute cat-feature index (upstream's `TOneHotFeature.Index`)
+    /// rather than the dense one-hot position. EMPTY for every float-only /
+    /// CTR-only fit.
+    pub one_hot_absolute: Vec<usize>,
 }
 
 impl Model {
@@ -1852,6 +1873,23 @@ fn assign_leaf_of_averaging(
                                 .map(|&v| f64::from(v) > s.border)
                         })
                         .unwrap_or(false),
+                    // SPEC-OH-07: a one-hot level is the `cat_bin == value`
+                    // equality test on the matrix's one-hot bin column. This
+                    // rebuild runs on the CTR leaf-value path, where one-hot and
+                    // CTR columns never co-occur (SPEC-OH-26 gates the mix), but
+                    // the arm is real rather than a silent `false` so a future
+                    // mixed pool cannot mis-assign leaves undetected.
+                    LevelKind::OneHot(one_hot_idx) => grown
+                        .one_hot_splits
+                        .get(*one_hot_idx)
+                        .and_then(|oh| {
+                            matrix
+                                .cat_bins
+                                .get(oh.feature)
+                                .and_then(|col| col.get(obj))
+                                .map(|&bin| bin == oh.value)
+                        })
+                        .unwrap_or(false),
                     LevelKind::Ctr { ctr_idx, border } => grown
                         .ctr_splits
                         .get(*ctr_idx)
@@ -2281,6 +2319,68 @@ fn quantize_feature_major(
     (bins, n_bins)
 }
 
+/// The device quantizer for a pool that MAY carry one-hot columns (SPEC-OH-21),
+/// returning `(bins, n_bins, real_folds)`.
+///
+/// This is the ONE device-quantize entry the trainer calls — on EVERY device-eligible
+/// pool, float-only included (with an empty `cat_bins`). That is deliberate: it is what
+/// makes `real_folds` always populated, so the session's
+/// `real_folds.len() == eff_n_features` check can stay unconditional instead of
+/// degenerating into the silently-inert bound SPEC-OH-22 exists to eliminate.
+///
+/// - **Layout.** The device feature axis is the CONCATENATION `float | one-hot`: device
+///   feature index `n_float + c` is one-hot column `c`. The one-hot columns therefore
+///   form one CONTIGUOUS range, which is what lets the split scorer bound its second
+///   pass with a single `feature_lo = n_float`.
+/// - **Bins.** Float stripes are produced by delegating to [`quantize_feature_major`]
+///   with its body and signature unmodified, so the float bin bytes are provably
+///   identical (SPEC-OH-31). One-hot stripes are the `PerfectHash` bin columns copied
+///   VERBATIM — there is no second binning of a categorical column anywhere.
+/// - **`n_bins`.** `max(float n_bins, max cat cardinality).max(1)`. The `.max(1)` and the
+///   cat term matter: a 0-float pool would otherwise report `n_bins == 0` and the backend
+///   session declines on `n_features == 0 || n_bins == 0`, making SPEC-OH-20's 0-float
+///   target unreachable.
+/// - **`real_folds`.** The per-feature REAL cardinality — `borders[f].len() + 1` for a
+///   float feature, the column's `PerfectHash` cardinality for a one-hot column. This is
+///   a SEPARATE array and is **not** `TCFeature.folds`, which on the production path is
+///   the padded uniform line width and bounds nothing (see the `TCFeature.folds` doc in
+///   `cb-backend`'s `gpu_runtime::cindex`). It is also NOT fixable by passing true
+///   cardinalities into `pack_cindex`: that would change `feature_bits` and hence the
+///   packed words for every pool, float-only included.
+fn quantize_feature_major_with_one_hot(
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_bins: &[Vec<u32>],
+    n: usize,
+) -> (Vec<u32>, usize, Vec<u32>) {
+    let n_float = feature_values.len();
+    // Float prefix: delegate, so the float bytes cannot drift from the plain entry.
+    let (float_bins, float_n_bins) = quantize_feature_major(feature_values, feature_borders, n);
+
+    let mut real_folds: Vec<u32> = Vec::with_capacity(n_float + cat_bins.len());
+    for f in 0..n_float {
+        let borders = feature_borders.get(f).map_or(0usize, Vec::len);
+        real_folds.push(u32::try_from(borders + 1).unwrap_or(u32::MAX));
+    }
+
+    // One-hot suffix: cardinality is `max bin + 1` over the column (the `PerfectHash`
+    // bins are dense `0..cardinality` by construction, so this is exact).
+    let mut bins = float_bins;
+    bins.reserve(cat_bins.len() * n);
+    let mut max_cat_cardinality = 0usize;
+    for col in cat_bins {
+        let cardinality = col.iter().copied().max().map_or(0usize, |m| m as usize + 1);
+        max_cat_cardinality = max_cat_cardinality.max(cardinality);
+        real_folds.push(u32::try_from(cardinality).unwrap_or(u32::MAX));
+        for obj in 0..n {
+            bins.push(col.get(obj).copied().unwrap_or(0));
+        }
+    }
+
+    let n_bins = float_n_bins.max(max_cat_cardinality).max(1);
+    (bins, n_bins, real_folds)
+}
+
 /// RAII teardown for the GPUT-01 device training session (T-10-24): guarantees
 /// [`Runtime::end_device_training`] runs on EVERY exit path from [`train_inner`] —
 /// including the `?` error path — once [`Runtime::begin_device_training`] opened a
@@ -2300,6 +2400,149 @@ impl<R: Runtime> Drop for DeviceSessionGuard<'_, R> {
             let _ = self.runtime.end_device_training();
         }
     }
+}
+
+/// Partition the categorical columns by encoding path (SPEC-OH-04), returning
+/// `(one_hot_absolute, ctr_absolute)` — both ASCENDING absolute `cat_columns`
+/// indices.
+///
+/// Derived from ONE [`crate::candidates::route_categorical`] match per column,
+/// so the two lists are DISJOINT BY CONSTRUCTION: two independent filters could
+/// drift (a routing-rule change touching only one of them would materialize the
+/// same feature on both paths, double-counting its contribution). A constant
+/// column (`cardinality <= 1`, [`crate::candidates::EncodingPath::Skip`])
+/// appears in NEITHER list.
+///
+/// The CTR list is byte-identical to the pre-one-hot `eligible_absolute`.
+fn partition_cat_columns(
+    cat_cardinalities: &[u32],
+    one_hot_max_size: u32,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut one_hot = Vec::new();
+    let mut ctr = Vec::new();
+    for (abs_idx, &card) in cat_cardinalities.iter().enumerate() {
+        match crate::candidates::route_categorical(card, one_hot_max_size) {
+            crate::candidates::EncodingPath::OneHot => one_hot.push(abs_idx),
+            crate::candidates::EncodingPath::Ctr => ctr.push(abs_idx),
+            crate::candidates::EncodingPath::Skip => {}
+        }
+    }
+    (one_hot, ctr)
+}
+
+/// The widest one-hot column the device grower accepts (SPEC §9 R10).
+///
+/// The device histogram line is padded to one of `{32, 64, 128, 256}` bins and is
+/// SHARED by every feature, so a one-hot column's cardinality must fit alongside the
+/// float bin count. `32` keeps a binary/low-cardinality pool inside the narrowest
+/// (fastest) legal line, which is the regime `one_hot_max_size` actually produces —
+/// upstream's default is `2`, and its documented ceiling for the one-hot route is far
+/// below this.
+///
+/// Exceeding it is NOT an error: the fit falls back to the CPU grower, which handles
+/// any cardinality. Aborting an otherwise-valid fit would be strictly worse behavior
+/// than training it correctly a bit slower.
+pub(crate) const DEVICE_ONE_HOT_MAX_CARDINALITY: u32 = 32;
+
+/// Whether every one-hot column fits the device histogram line
+/// ([`DEVICE_ONE_HOT_MAX_CARDINALITY`]). A pool with no one-hot columns trivially
+/// fits, which is what keeps the float-only path unchanged (SPEC-OH-31).
+fn one_hot_cardinalities_fit_the_device(cardinalities: &[u32]) -> bool {
+    cardinalities
+        .iter()
+        .all(|&c| c <= DEVICE_ONE_HOT_MAX_CARDINALITY)
+}
+
+/// Whether the pool has ANY feature the level search can rank (SPEC-OH-20).
+///
+/// This is clause 11 of `device_host_eligible`, extracted so it can be asserted
+/// on its own (the full eligibility expression needs a whole fit context). Before
+/// SPEC-OH-20 it read `matrix.n_features() > 0` — float columns only — which
+/// silently excluded a pool routed entirely one-hot from the device grower.
+///
+/// A one-hot cat column IS scorable: `AddOneHotFeatures` contributes
+/// `cat_bin == value` candidates to the SAME level argmax the float borders feed
+/// (SPEC-OH-06). Only a pool with neither kind has nothing to rank.
+fn has_any_scorable_feature(matrix: &crate::tree::FeatureMatrix<'_>) -> bool {
+    matrix.n_features() > 0 || matrix.n_cat_features() > 0
+}
+
+/// Materialize the one-hot-routed categorical columns (SPEC-OH-05), returning
+/// `(bins, hash_by_bin)`, both indexed by ONE-HOT POSITION (the index into
+/// `one_hot_abs`), NOT by absolute cat-column index.
+///
+/// - `bins[p][obj]` is the object's FIRST-SEEN [`cb_data::PerfectHash`] bin —
+///   produced by [`cb_data::perfect_hash_bins`], the single sanctioned hashing
+///   primitive (SPEC §3); no second hashing loop exists.
+/// - `hash_by_bin[p][bin]` is the raw `calc_cat_feature_hash` value that
+///   produced `bin` — the EXACT inverse of the bin assignment, and the table
+///   [`crate::Model::one_hot_bin_to_hash`] carries to the model lift so a
+///   trainer-side bin can be re-expressed in upstream's raw-hash split space
+///   (SPEC-OH-09).
+///
+/// The inverse is built by zipping the raw column with the returned bins, NOT by
+/// sorting distinct hashes: `PerfectHash::remap_bounded` assigns
+/// `bin = map.len()` on first sight, so bin order is ENCOUNTER order.
+///
+/// # Validity
+/// The table is valid ONLY for the exact learn-set column it was built from —
+/// bins are first-seen per column, so a different row order yields a different
+/// (equally valid) table.
+///
+/// # Errors
+/// [`CbError::OutOfRange`] if an absolute index is not a column of
+/// `cat_columns`; [`CbError::Degenerate`] if the built table is not exactly one
+/// entry per distinct value (an internal invariant violation, not a data
+/// condition); or any error [`cb_data::perfect_hash_bins`] surfaces.
+fn build_one_hot_columns(
+    cat_columns: &[Vec<String>],
+    one_hot_abs: &[usize],
+) -> CbResult<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
+    let mut bins_out = Vec::with_capacity(one_hot_abs.len());
+    let mut hash_out = Vec::with_capacity(one_hot_abs.len());
+
+    for &abs_idx in one_hot_abs {
+        let col = cat_columns.get(abs_idx).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "one-hot cat column {abs_idx} out of range ({} cat columns)",
+                cat_columns.len()
+            ))
+        })?;
+        let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+        let bins = cb_data::perfect_hash_bins(&as_str)?;
+
+        // Zip raw <-> bin and record each bin's raw hash on first sight. The
+        // table is grown to `bin + 1` as bins appear; because `remap_bounded`
+        // hands out `0, 1, 2, …` in encounter order, growth is always by one.
+        let mut hash_by_bin: Vec<Option<u32>> = Vec::new();
+        for (raw, &bin) in col.iter().zip(bins.iter()) {
+            let idx = bin as usize;
+            if idx >= hash_by_bin.len() {
+                hash_by_bin.resize(idx.saturating_add(1), None);
+            }
+            if let Some(slot) = hash_by_bin.get_mut(idx) {
+                if slot.is_none() {
+                    *slot = Some(cb_data::calc_cat_feature_hash(raw));
+                }
+            }
+        }
+
+        // Every bin in [0, cardinality) must have been filled: a hole would make
+        // the model lift emit a wrong (or missing) `value_hash` for that split.
+        let cardinality = hash_by_bin.len();
+        let table: Vec<u32> = hash_by_bin.iter().flatten().copied().collect();
+        if table.len() != cardinality {
+            return Err(CbError::Degenerate(format!(
+                "one-hot cat column {abs_idx}: bin -> hash table has {} of {cardinality} entries",
+                table.len()
+            )));
+        }
+
+        bins_out.push(bins);
+        hash_out.push(table);
+    }
+
+    Ok((bins_out, hash_out))
 }
 
 /// The shared boosting loop body for the numeric ([`train_with_eval_sets`]) and
@@ -2416,6 +2659,26 @@ fn train_inner<R: Runtime>(
     } else {
         params.learning_rate
     };
+    // Upstream's `TBoostingOptions::LearningRate` is a **float**, so the rate that
+    // actually multiplies every leaf value is the f32-representable value, NOT the
+    // f64 the caller supplied. For the ubiquitous `learning_rate = 0.1` the two
+    // differ by a CONSTANT relative `1.4901161e-8`
+    // (`f32(0.1) = 0.10000000149011612`); the factor lands on every leaf of every
+    // tree and compounds through the boosting residuals.
+    //
+    // Pinned EXACTLY against the committed `one_hot_train/multi` fixture (real
+    // catboost 1.2.10): all eight of tree 0's upstream leaf values equal ours
+    // times `f32(0.1) / 0.1`, reproducing them to 6.9e-18 (one ulp). End to end
+    // through production train→predict, `one_hot_train/default_binary` improves
+    // from `1.998e-9` to `2.776e-17` against upstream.
+    //
+    // The error was invisible for the project's whole life because 1.49e-8 sits
+    // four orders of magnitude under the ≤1e-5 oracle bar; it surfaced only when
+    // it flipped a NEAR-TIED one-hot split, turning an 1e-8 arithmetic difference
+    // into a 4.6e-2 prediction difference. Full measurements and the re-baseline
+    // record:
+    // `.planning/plans/one-hot-categorical-training/instrumented-ground-truth/LEARNING_RATE_F32.md`
+    let learning_rate = f64::from(learning_rate as f32);
 
     // Per-object weights: default to 1.0 when no weights are supplied.
     let weights: Vec<f64> = if weights.is_empty() {
@@ -2721,10 +2984,58 @@ fn train_inner<R: Runtime>(
         }
     };
 
-    // Numeric-only training matrix (no categorical features in this path; the
-    // one-hot categorical splits are exercised through the categorical-aware
-    // tree search directly in the ORD-04 oracle test, D-04).
-    let matrix = FeatureMatrix::new(feature_values, feature_borders);
+    // SPEC-OH-04 / SPEC-OH-05: partition the cat columns by encoding path, then
+    // materialize the one-hot-routed ones into first-seen `PerfectHash` bin
+    // columns plus their exact bin -> raw-hash inverse. On the numeric path
+    // `cat_columns` is empty, so both lists and both tables are empty and the
+    // matrix below is byte-identical to `FeatureMatrix::new` (SPEC-OH-31).
+    //
+    // CAT INGESTION (Plan 05-11): the cat-aware path computes per-cat-feature
+    // OnLearnOnly cardinalities (`learn_set_cardinality` = calc_cat_feature_hash +
+    // PerfectHash, NEVER a model's CTR hash map).
+    let cat_cardinalities: Vec<u32> = cat_columns
+        .iter()
+        .map(|col| {
+            let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+            crate::candidates::learn_set_cardinality(&as_str)
+        })
+        .collect::<CbResult<Vec<u32>>>()?;
+    let (one_hot_absolute, eligible_absolute) =
+        partition_cat_columns(&cat_cardinalities, params.one_hot_max_size);
+
+    // SPEC-OH-26 — a pool spanning BOTH encoding routes is typed-rejected.
+    //
+    // The level search has no three-way candidate union: `has_ctr` selects
+    // `greedy_tensor_search_oblivious_with_ctr` (which takes no `cat_bins` and
+    // therefore enumerates no one-hot candidates), otherwise the plain perturbed
+    // arm runs (which sees no CTR columns). A mixed pool would silently take one
+    // branch and drop the OTHER encoding's columns entirely — exactly the
+    // class of bug this whole plan exists to fix. Device-side CTR co-existence is
+    // deferred (SPEC §9 R12), so the honest gate ships instead of a silent drop.
+    //
+    // The gate lives HERE, where both partitions are in scope, so no future
+    // dispatch arm can bypass it.
+    if !one_hot_absolute.is_empty() && !eligible_absolute.is_empty() {
+        return Err(CbError::Unsupported(format!(
+            "training a pool with both one-hot-routed and CTR-routed categorical columns is \
+             not yet supported (device-side CTR co-existence is deferred): raise \
+             one_hot_max_size to route all columns one-hot, or lower it to route all columns \
+             to CTR. At one_hot_max_size = {}, one-hot columns are {one_hot_absolute:?} and \
+             CTR columns are {eligible_absolute:?}",
+            params.one_hot_max_size,
+        )));
+    }
+
+    let (one_hot_bins, one_hot_bin_to_hash) =
+        build_one_hot_columns(cat_columns, &one_hot_absolute)?;
+
+    // Training matrix: float columns plus the one-hot bin columns (empty on the
+    // numeric path ⇒ `n_cat_features() == 0`, the pre-one-hot behaviour).
+    let matrix = FeatureMatrix {
+        feature_values,
+        feature_borders,
+        cat_bins: &one_hot_bins,
+    };
 
     // FEAT-04 first-use / per-object penalty state (`feature_penalties_calcer.cpp`):
     // `used_features[f] == true` once any PRIOR tree in this run has split on float
@@ -2740,42 +3051,16 @@ fn train_inner<R: Runtime>(
     // Tensor / combination CTR candidate generation (ORD-05 / D-05, AddTreeCtrs,
     // greedy_tensor_search.cpp:491-551): emit the SimpleCtr / CombinationCtr
     // projections over the CTR-eligible cat features under the
-    // `params.max_ctr_complexity` gate (:532-533).
-    //
-    // CAT INGESTION (Plan 05-11): the cat-aware path computes per-cat-feature
-    // OnLearnOnly cardinalities (`learn_set_cardinality` = calc_cat_feature_hash +
-    // PerfectHash, NEVER a model's CTR hash map) and feeds the REAL cat set to
-    // `tensor_ctr_candidates`. The numeric `train` / `train_with_eval_sets` path
-    // supplies an EMPTY `cat_columns`, so the cardinalities and candidate set are
-    // both empty and the float-only oracles are byte-for-byte unchanged.
-    let cat_cardinalities: Vec<u32> = cat_columns
-        .iter()
-        .map(|col| {
-            let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
-            crate::candidates::learn_set_cardinality(&as_str)
-        })
-        .collect::<CbResult<Vec<u32>>>()?;
+    // `params.max_ctr_complexity` gate (:532-533). The numeric `train` /
+    // `train_with_eval_sets` path supplies an EMPTY `cat_columns`, so the
+    // cardinalities and candidate set are both empty and the float-only oracles
+    // are byte-for-byte unchanged. `cat_cardinalities` / `eligible_absolute` were
+    // computed above, alongside the SPEC-OH-04 one-hot partition.
     let ctr_candidates = tensor_ctr_candidates(
         &cat_cardinalities,
         params.one_hot_max_size,
         params.max_ctr_complexity,
     );
-
-    // Map the CTR-eligible-position projection members emitted by
-    // `tensor_ctr_candidates` (dense positions into the CTR-eligible feature list,
-    // candidates.rs) back to ABSOLUTE `cat_columns` indices so
-    // `materialize_ctr_feature` reads the right columns. The eligible list is the
-    // cat features routing to the CTR path (cardinality > one_hot_max_size), in
-    // ascending absolute-index order.
-    let eligible_absolute: Vec<usize> = cat_cardinalities
-        .iter()
-        .enumerate()
-        .filter(|(_, &card)| {
-            crate::candidates::route_categorical(card, params.one_hot_max_size)
-                == crate::candidates::EncodingPath::Ctr
-        })
-        .map(|(abs_idx, _)| abs_idx)
-        .collect();
 
     // ORD-07: raw per-object categorical-bucket data for every CTR-eligible cat
     // feature (the phantom mixed float-partition + categorical-feature
@@ -3069,6 +3354,43 @@ fn train_inner<R: Runtime>(
     // the bulk POST per-level draws must NOT be applied in that case.
     let perturb_active = params.random_strength != 0.0;
     let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No) || perturb_active;
+
+    // SPEC-OH-27 (T01b, branch b) — one-hot x ACTIVE RNG draws is typed-rejected.
+    //
+    // Upstream charges one unconditional `GenRandReal1()` per candidate sub-list,
+    // and `AddOneHotFeatures` contributes one sub-list per one-hot-routed cat
+    // column, so the per-level draw count becomes `n_float + n_one_hot`. That rule
+    // is SOURCE-DERIVED with HIGH confidence for the un-bundled `OneFeature` path
+    // — but `CompressCandidates` runs BETWEEN `AddOneHotFeatures` and the draw
+    // site and can re-bundle those candidates into `BinarySplits` /
+    // `ExclusiveBundle` / `FeaturesGroup` ensembles whose draw arithmetic DIFFERS,
+    // and a cardinality-2 categorical column is exactly the shape most likely to
+    // be packed. That case is NOT ESTABLISHED (see
+    // `.planning/plans/one-hot-categorical-training/instrumented-ground-truth/ONE_HOT_GROUND_TRUTH.md`).
+    //
+    // Consuming the un-bundled rule regardless would desynchronise every
+    // subsequent tree's bootstrap sample with no visible symptom on non-bootstrap
+    // tests — the exact defect class fixed in `d7676b5`. So the combination is
+    // refused until an instrumented upstream run settles it. The gate lives HERE,
+    // where both the one-hot column list and `draws_active` are in scope, so no
+    // downstream dispatch arm can bypass it.
+    //
+    // The DEFAULT path is unaffected: `bootstrap_type = No` and
+    // `random_strength = 0` are both draw-inert, so one-hot training works out of
+    // the box; only an explicit opt-in to draws is refused.
+    if !one_hot_absolute.is_empty() && draws_active {
+        return Err(CbError::Unsupported(format!(
+            "one-hot categorical training is not supported with bootstrap_type != No or \
+             random_strength != 0 (got bootstrap_type = {:?}, random_strength = {}); the \
+             upstream per-level RNG draw accounting for one-hot candidates under \
+             CompressCandidates has not been established (see \
+             .planning/plans/one-hot-categorical-training/instrumented-ground-truth/ONE_HOT_GROUND_TRUTH.md). \
+             {} one-hot-routed cat column(s): {one_hot_absolute:?}",
+            params.bootstrap_type,
+            params.random_strength,
+            one_hot_absolute.len(),
+        )));
+    }
     // MVS lambda for trees after the first uses the previous tree's mean leaf L2
     // norm (`CalculateLastIterMeanLeafValue`); `None` on the first tree.
     let mut prev_leaf_mean_l2: Option<f64> = None;
@@ -3146,7 +3468,33 @@ fn train_inner<R: Runtime>(
             ) && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
         && params.random_strength == 0.0
         && eval_sets.is_empty()
-        && matrix.n_features() > 0
+        // SPEC-OH-20 (T23): "has something to score" is float OR one-hot, not float
+        // alone. A pool routed entirely one-hot has zero float columns; the old
+        // `matrix.n_features() > 0` made SPEC-OH-20's 0-float target unreachable.
+        //
+        // Two things this clause deliberately does NOT do:
+        //   * It does NOT lift clause 3 (`materialized_ctr_features.is_empty() &&
+        //     structure_fold_columns.iter().all(Vec::is_empty)`) — one-hot × CTR stays
+        //     off the device (SPEC §9 R12, SPEC-OH-26 rejects the mixed pool outright).
+        //   * It is NOT the only place a 0-float pool is decided. The backend session
+        //     ALSO declines on `n == 0 || n_features == 0 || n_bins == 0`
+        //     (`cb-backend/src/gpu_runtime/session.rs`, the `begin` preamble) and then
+        //     pads the histogram line with `pad_hist_line_bins(n_bins)`. Under T24's
+        //     concatenated axis `n_features` is the TOTAL (`n_float + n_cat`) and
+        //     `n_bins = max(float n_bins, max cat cardinality)`, so a cat-only pool
+        //     passes both; a cardinality-2 column pads to a legal `n_bins_line == 32`.
+        && has_any_scorable_feature(&matrix)
+        // SPEC §9 R10 (T24): bound the one-hot cardinality on the device OR FALL BACK.
+        // Falling back is expressed HERE, as an eligibility clause, rather than as an
+        // error out of the quantizer — an over-wide column must train correctly on the
+        // CPU grower, not abort an otherwise valid fit. Inert for a float-only pool
+        // (an empty cardinality list trivially fits), so SPEC-OH-31 is unaffected.
+        && one_hot_cardinalities_fit_the_device(
+            &one_hot_bin_to_hash
+                .iter()
+                .map(|h| u32::try_from(h.len()).unwrap_or(u32::MAX))
+                .collect::<Vec<_>>(),
+        )
         // WR-03: the device grow path sums the UNWEIGHTED der (`Σ der1`) into
         // histogram channel 0 and estimates leaves via `calc_average(Σ der1,
         // Σ weight, l2)` — object weight enters only the denominator, never the
@@ -3175,21 +3523,36 @@ fn train_inner<R: Runtime>(
     // handed to `begin`, matching the CPU per-tree
     // `scale_l2_reg(l2, sumAllWeights, n)`.
     let device_scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
-    let (device_bins, device_n_bins) = if device_host_eligible {
+    // SPEC-OH-21 (T24): ONE device-quantize entry, on EVERY device-eligible pool. A
+    // float-only pool passes an empty `cat_bins` slice and still gets a fully populated
+    // `real_folds` (`[borders[f].len() + 1, …]`), which is what lets the session's
+    // `real_folds.len() == eff_n_features` check stay unconditional. Routing float-only
+    // fits back through the 2-tuple `quantize_feature_major` would leave nothing
+    // producing `real_folds` and break every existing float-only device oracle.
+    let (device_bins, device_n_bins, device_real_folds) = if device_host_eligible {
         let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
         let prof_t = std::time::Instant::now();
-        let out = quantize_feature_major(feature_values, feature_borders, n);
+        let out =
+            quantize_feature_major_with_one_hot(feature_values, feature_borders, &one_hot_bins, n);
         if prof {
             eprintln!(
-                "CB_GPU_PROF quantize n={n} nf={} elapsed={:.2}ms",
+                "CB_GPU_PROF quantize n={n} nf={} n_one_hot={} elapsed={:.2}ms",
                 feature_values.len(),
+                one_hot_bins.len(),
                 prof_t.elapsed().as_secs_f64() * 1e3,
             );
         }
         out
     } else {
-        (Vec::new(), 0)
+        (Vec::new(), 0, Vec::new())
     };
+    // The device feature axis is `float | one-hot` (T24's layout), so the total width
+    // and the one-hot boundary are both derived here and travel together.
+    let device_n_float = matrix.n_features();
+    let device_n_features = device_n_float + one_hot_bins.len();
+    let device_one_hot_flags: Vec<bool> = (0..device_n_features)
+        .map(|f| f >= device_n_float)
+        .collect();
     // Phase 12 Plan 03 (GPUT-18 / Open Q2 promotion): build the plain-host DeviceTrainConfig
     // from `params` so the grow-policy (+ Lossguide leaf cap / min-data) reaches the session
     // gate. SymmetricTree yields `DeviceTrainConfig::default()` (byte-unchanged, D-04); the two
@@ -3253,6 +3616,20 @@ fn train_inner<R: Runtime>(
         // `exact_leaf` / `ctr` likewise stay default: exact-leaf × sampling and CTR ×
         // sampling are out of scope (SPEC §2) and the session declines both combinations.
         // Design B′ (device-resident sampling) is the perf follow-up that would wire them.
+        //
+        // ─── SPEC-OH-21/22/24/25: the one-hot channel ───────────────────────────────
+        // All three travel together and describe the SAME concatenated `float | one-hot`
+        // device feature axis. On a float-only pool `one_hot_flags` is all-`false`,
+        // `n_float == n_features`, and `real_folds` is the per-float `borders + 1` — the
+        // scorer then only ever takes the `one_hot == false` arm whose eligibility is the
+        // unchanged `border < max_border`, so `real_folds` is uploaded but never read and
+        // the float path is numerically unchanged (SPEC-OH-31).
+        //
+        // `real_folds` is NOT `TCFeature.folds` (the padded line width): see the field doc
+        // on `DeviceTrainConfig`.
+        one_hot_flags: device_one_hot_flags.clone(),
+        real_folds: device_real_folds.clone(),
+        n_float: device_n_float,
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
@@ -3265,7 +3642,10 @@ fn train_inner<R: Runtime>(
             &device_bins,
             &weights,
             n,
-            matrix.n_features(),
+            // The device feature axis is the CONCATENATED `float | one-hot` width
+            // (SPEC-OH-21), not the float count — equal to `matrix.n_features()` on a
+            // float-only pool, so this is byte-unchanged there.
+            device_n_features,
             device_n_bins,
             learning_rate,
             device_scaled_l2,
@@ -3521,10 +3901,44 @@ fn train_inner<R: Runtime>(
                 // `border = feature_borders[feature][bin_id]` (Pattern 4). Range-check
                 // `bin_id` (T-10-22): an out-of-range index is a typed error, never a
                 // panic / raw index. `DeviceGrownTree.leaf_of` is NOT consumed (D-05).
+                // SPEC-OH-24: the device feature axis is the CONCATENATION
+                // `float | one-hot` (T24's layout), so a device index `>= device_n_float`
+                // is one-hot column `idx - device_n_float`. Map it back to the ABSOLUTE
+                // cat-column index through `one_hot_absolute` (the inverse of the layout)
+                // and emit a `LevelKind::OneHot` + `OneHotSplit` instead of a float
+                // `Split`. `level_kinds` stays EMPTY when every level is float, so the
+                // float-only fold is byte-identical (SPEC-OH-31).
                 let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
-                for &(feature, bin_id) in &dev_tree.splits {
+                let mut device_one_hot_splits: Vec<crate::tree::OneHotSplit> = Vec::new();
+                let mut device_level_kinds: Vec<crate::tree::LevelKind> = Vec::new();
+                let device_has_one_hot = dev_tree.splits.iter().any(|&(_, _, oh)| oh);
+                for &(feature, bin_id, is_one_hot) in &dev_tree.splits {
                     let f = feature as usize;
                     let b = bin_id as usize;
+                    if is_one_hot {
+                        let pos = f.checked_sub(device_n_float).ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device one-hot split names device feature {f}, which is \
+                                 below the float boundary {device_n_float} (internal \
+                                 invariant: pass B sweeps only [{device_n_float}, ..))"
+                            ))
+                        })?;
+                        let absolute = one_hot_absolute.get(pos).copied().ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device one-hot split names one-hot column {pos}, but only \
+                                 {} column(s) were routed one-hot",
+                                one_hot_absolute.len()
+                            ))
+                        })?;
+                        device_level_kinds.push(crate::tree::LevelKind::OneHot(
+                            device_one_hot_splits.len(),
+                        ));
+                        device_one_hot_splits.push(crate::tree::OneHotSplit {
+                            feature: absolute,
+                            value: bin_id,
+                        });
+                        continue;
+                    }
                     let border = feature_borders
                         .get(f)
                         .and_then(|borders| borders.get(b))
@@ -3537,6 +3951,10 @@ fn train_inner<R: Runtime>(
                                 feature_borders.get(f).map_or(0, Vec::len),
                             ))
                         })?;
+                    if device_has_one_hot {
+                        device_level_kinds
+                            .push(crate::tree::LevelKind::Float(device_splits.len()));
+                    }
                     device_splits.push(Split { feature: f, border });
                 }
 
@@ -3545,20 +3963,74 @@ fn train_inner<R: Runtime>(
                 // oblivious path uses; D-05). The split columns are resolved ONCE outside
                 // the object loop and the leaf bits set directly (no per-object Vec<bool>
                 // allocation — this loop runs n times per boosting iteration).
-                let split_cols: Vec<(&[f32], f64)> = device_splits
-                    .iter()
-                    .map(|s| {
-                        (
-                            feature_values.get(s.feature).map_or(&[][..], Vec::as_slice),
-                            s.border,
-                        )
-                    })
-                    .collect();
+                //
+                // SPEC-OH-24: with one-hot levels present the LEVEL order is what fixes
+                // each bit, so the per-level column + test are resolved from
+                // `device_level_kinds` — a float level keeps the `value > border` test,
+                // a one-hot level uses `cat_bin == value` over the ONE-HOT bin column (by
+                // one-hot POSITION, which is the device index minus the float boundary).
+                // With no one-hot level `device_level_kinds` is empty and this collapses
+                // to the byte-identical float-only loop.
+                enum DeviceLevelCol<'a> {
+                    Float(&'a [f32], f64),
+                    OneHot(&'a [u32], u32),
+                }
+                let level_cols: Vec<DeviceLevelCol<'_>> = if device_has_one_hot {
+                    device_level_kinds
+                        .iter()
+                        .map(|kind| match kind {
+                            crate::tree::LevelKind::OneHot(idx) => {
+                                let s = device_one_hot_splits.get(*idx);
+                                let pos = s.and_then(|s| {
+                                    one_hot_absolute.iter().position(|&a| a == s.feature)
+                                });
+                                DeviceLevelCol::OneHot(
+                                    pos.and_then(|p| one_hot_bins.get(p))
+                                        .map_or(&[][..], Vec::as_slice),
+                                    s.map_or(u32::MAX, |s| s.value),
+                                )
+                            }
+                            crate::tree::LevelKind::Float(idx) => {
+                                let s = device_splits.get(*idx);
+                                DeviceLevelCol::Float(
+                                    s.and_then(|s| feature_values.get(s.feature))
+                                        .map_or(&[][..], Vec::as_slice),
+                                    s.map_or(f64::INFINITY, |s| s.border),
+                                )
+                            }
+                            // A device-grown oblivious tree never carries a CTR level
+                            // (host eligibility excludes CTR pools entirely), so this arm
+                            // is unreachable; route it to a never-passing float test
+                            // rather than fabricating a split.
+                            crate::tree::LevelKind::Ctr { .. } => {
+                                DeviceLevelCol::Float(&[][..], f64::INFINITY)
+                            }
+                        })
+                        .collect()
+                } else {
+                    device_splits
+                        .iter()
+                        .map(|s| {
+                            DeviceLevelCol::Float(
+                                feature_values.get(s.feature).map_or(&[][..], Vec::as_slice),
+                                s.border,
+                            )
+                        })
+                        .collect()
+                };
                 let device_leaf_of: Vec<usize> = (0..n)
                     .map(|obj| {
                         let mut leaf = 0usize;
-                        for (l, (col, border)) in split_cols.iter().enumerate() {
-                            if col.get(obj).is_some_and(|&v| f64::from(v) > *border) {
+                        for (l, col) in level_cols.iter().enumerate() {
+                            let passes = match col {
+                                DeviceLevelCol::Float(values, border) => values
+                                    .get(obj)
+                                    .is_some_and(|&v| f64::from(v) > *border),
+                                DeviceLevelCol::OneHot(bins, value) => {
+                                    bins.get(obj).is_some_and(|&b| b == *value)
+                                }
+                            };
+                            if passes {
                                 leaf |= 1usize << l;
                             }
                         }
@@ -3595,14 +4067,15 @@ fn train_inner<R: Runtime>(
                     out.extend_from_slice(&approx);
                 }
 
-                // The device oblivious grower emits FLOAT splits only, so its
-                // levels are single-kind and `level_kinds` stays EMPTY — consumers
-                // take the byte-identical legacy path (SPEC-OH-31).
+                // `level_kinds` stays EMPTY when the device tree is single-kind (float
+                // only) — consumers then take the byte-identical legacy path
+                // (SPEC-OH-31). It is populated ONLY when a one-hot level is present, in
+                // which case it carries the full LEVEL ORDER (SPEC-OH-01/24).
                 trees.push(oblivious_from_grown(
                     device_splits,
                     Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
+                    device_one_hot_splits,
+                    device_level_kinds,
                     device_leaf_values,
                     device_leaf_weights,
                 ));
@@ -3615,7 +4088,9 @@ fn train_inner<R: Runtime>(
                 // nodes (step `(0,0)`) get an inert `Split` that the walk never reads for
                 // routing (its diffs are zero → the node is a halt point).
                 let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
-                for (node, &(feature, bin_id)) in dev_tree.splits.iter().enumerate() {
+                // SPEC-OH-24: the non-symmetric growers are OUT OF SCOPE for one-hot, so
+                // the kind is always `false` here and is deliberately ignored.
+                for (node, &(feature, bin_id, _one_hot)) in dev_tree.splits.iter().enumerate() {
                     let is_leaf = dev_tree
                         .step_nodes
                         .get(node)
@@ -4861,10 +5336,14 @@ fn train_inner<R: Runtime>(
                 leaf_weights,
             });
         } else if grown.step_nodes.is_empty() {
+            // SPEC-OH-07: carry the grower's ONE-HOT splits and the true per-level
+            // kind order through to the trained tree. A float-only / CTR-only tree
+            // leaves `one_hot_splits` empty and (for float-only) `level_kinds`
+            // empty too, so the persisted tree is byte-identical (SPEC-OH-31).
             trees.push(oblivious_from_grown(
                 grown.splits,
                 ctr_splits,
-                Vec::new(),
+                grown.one_hot_splits,
                 grown.level_kinds,
                 leaf_values,
                 leaf_weights,
@@ -5001,6 +5480,11 @@ fn train_inner<R: Runtime>(
             bias,
             approx_dimension,
             class_to_label,
+            // SPEC-OH-05: the fit-wide one-hot bin -> raw-hash table and the
+            // position -> absolute cat-index map, both EMPTY on the float-only
+            // and CTR-only paths.
+            one_hot_bin_to_hash,
+            one_hot_absolute,
         },
         baked,
     ))

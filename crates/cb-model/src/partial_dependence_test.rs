@@ -279,3 +279,36 @@ fn rejects_duplicate_feature_pair() {
         other => panic!("expected DuplicateFeature{{index: 0}}, got {other:?}"),
     }
 }
+
+
+// ── SPEC-OH-19 — partial dependence rejects one-hot models ──────────────────
+
+#[test]
+fn partial_dependence_rejects_one_hot_models() {
+    // A model whose ONLY defect is a one-hot split: `validation_model`'s float
+    // layout is otherwise valid, so a rejection can only come from the
+    // SPEC-OH-19 guard, not from arity / shape / range.
+    let mut model = validation_model();
+    model.oblivious_trees.push(ObliviousTree {
+        splits: vec![
+            ModelSplit::Float(Split { feature: 0, border: 0.1 }),
+            ModelSplit::OneHot(crate::OneHotModelSplit {
+                cat_feature: 0,
+                value_hash: 1_296_865_003,
+            }),
+        ],
+        leaf_values: vec![1.0, 2.0, 3.0, 4.0],
+        leaf_weights: vec![1.0; 4],
+    });
+
+    let columns = valid_columns();
+    assert!(matches!(
+        partial_dependence(&model, &columns, &[0]),
+        Err(PdpError::OneHotSplitsUnsupported)
+    ));
+    // The same guard fires through `validate` directly.
+    assert!(matches!(
+        validate(&model, &columns, &[0]),
+        Err(PdpError::OneHotSplitsUnsupported)
+    ));
+}
