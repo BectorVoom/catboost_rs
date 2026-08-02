@@ -193,7 +193,38 @@ pub fn bake_ctr_table(
     //    Borders class counts; pass a zero vector of matching length.
     let target_zero = vec![0.0_f64; n];
     let target_class_n = target_class.get(..n).unwrap_or(target_class).to_vec();
-    let acc = accumulate_online(&key_refs, &target_class_n, &target_zero, classes, classes)?;
+    // BUG-BTMV / SPEC-BTMV-01. The WHOLE-SET bake divides the binarized target by
+    // `targetClassesCount - 1` (`CalcFinalCtrsImpl`, online_ctr.cpp:914 — the
+    // binding sits OUTSIDE the per-type dispatch, so it is type-independent).
+    // Passing `classes` here made every BinarizedTargetMeanValue `Sum` exactly
+    // HALF upstream's. The defect was latent until E11 made the mean path live:
+    // the divisor reaches only `binarized_mean`, which only the
+    // BinarizedTargetMeanValue arm of `build_final_ctr` reads.
+    //
+    // *** NOT `ctr_type.target_border_count(classes)`. *** That helper mirrors
+    // `GetTargetBorderCount` (ctr_helper.h:34-42), which upstream uses on the
+    // ONLINE path for allocation sizing (online_ctr.cpp:738/741) and for the
+    // CLASS prefix types (:777) — never in CalcFinalCtrsImpl. The two agree at
+    // binclf and DIFFER for Buckets, so routing through the helper would be
+    // undetectable here and wrong at multiclass.
+    //
+    // The `.max(1)` floor: `accumulate_online` rejects `target_border_count == 0`
+    // with a typed error (online.rs:176-180), so a single-class corpus would
+    // start erroring without it. Same idiom as `online_mean_prefix`
+    // (online.rs:321). Behavior at `classes == 1` is unchanged either way (every
+    // target_class is 0, so every Sum is 0); `classes == 0` flips Err->Ok and is
+    // unreachable — the sole production caller hard-codes 2.
+    let target_border_count = classes.saturating_sub(1).max(1);
+    // 4th arg `classes` = TargetClassesCount (the class-histogram WIDTH,
+    // online_ctr.cpp:909-911/930-934) — correct, and deliberately NOT the same
+    // quantity as the 5th.
+    let acc = accumulate_online(
+        &key_refs,
+        &target_class_n,
+        &target_zero,
+        classes,
+        target_border_count,
+    )?;
     // E11: the requested type, not a hard-coded Borders head.
     // `counter_calc_skip_test` is the SkipTest default and inert until E22.
     let final_table = build_final_ctr(&acc, ctr_type, true);

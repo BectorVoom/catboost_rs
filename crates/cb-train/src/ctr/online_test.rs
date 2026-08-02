@@ -568,3 +568,89 @@ fn class_prefix_column_rejects_counter_as_a_checked_misuse() {
         other => panic!("expected CbError::Degenerate, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// BUG-BTMV / SPEC-BTMV-03 — the ONLINE mean prefix producer is NOT affected by
+// the whole-set bake's divisor defect, and is correct at EVERY class count.
+//
+// These are GUARDS, not Reds: they pass before and after the bake fix, because
+// `online_mean_prefix` is not being changed. Their falsifiability comes from the
+// mutation check recorded in B06's completion evidence, not from an initial Red.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn online_mean_prefix_divides_by_classes_minus_one_at_three_classes() {
+    use crate::ctr::online::online_mean_prefix;
+
+    // classes = 3. The three candidate divisors DIFFER here:
+    //   `classes - 1`                       (upstream, online_ctr.cpp:762) -> 2
+    //   `BTMV.target_border_count(classes)` (GetTargetBorderCount)         -> 1
+    //   `classes`                                                         -> 3
+    // This is the ONLINE analogue of B01 Test 2, and it is why
+    // `online_mean_prefix` is provably correct at ALL class counts, not just binclf.
+    let perm: Vec<i32> = vec![0, 1, 2, 3];
+    let bins: Vec<u32> = vec![0, 0, 0, 0];
+    let tc: Vec<usize> = vec![2, 0, 1, 2];
+    let got = online_mean_prefix(&perm, &bins, &tc, 3, 0.5).expect("mean prefix");
+
+    // Read-before-increment, adding targetClass / 2:
+    //   doc 0 reads (0.0, 0) then adds 1.0
+    //   doc 1 reads (1.0, 1) then adds 0.0
+    //   doc 2 reads (1.0, 2) then adds 0.5
+    //   doc 3 reads (1.5, 3) then adds 1.0
+    assert_eq!(
+        got.sum,
+        vec![0.0f32, 1.0, 1.0, 1.5],
+        "the online mean divisor must be `classes - 1` == 2 \
+         (online_ctr.cpp:762, passed as a LITERAL, not via GetTargetBorderCount). \
+         Observed {:?}. `classes` (3) would give [0.0, 0.666.., 0.666.., 1.0]; \
+         the ctr-type helper (1) would give [0.0, 2.0, 2.0, 3.0].",
+        got.sum
+    );
+    assert_eq!(got.count, vec![0i64, 1, 2, 3]);
+}
+
+#[test]
+fn online_mean_prefix_and_the_whole_set_bake_agree_at_binclf() {
+    use crate::ctr::online::online_mean_prefix;
+
+    // The cross-path consistency statement — the reason BUG-BTMV existed at all.
+    for classes in [2usize, 3] {
+        let perm: Vec<i32> = vec![0, 1, 2, 3];
+        let bins: Vec<u32> = vec![0, 0, 0, 0];
+        let tc: Vec<usize> = vec![1, 0, 1, classes - 1];
+        let got = online_mean_prefix(&perm, &bins, &tc, classes, 0.5).expect("mean prefix");
+
+        let divisor = (classes - 1) as f32;
+        for i in 1..got.sum.len() {
+            assert_eq!(
+                got.sum[i] - got.sum[i - 1],
+                tc[i - 1] as f32 / divisor,
+                "classes={classes}, doc {i}: the ONLINE prefix (online_ctr.cpp:762) \
+                 and the WHOLE-SET bake (online_ctr.cpp:914) use the SAME divisor \
+                 `targetClassesCount - 1`. BUG-BTMV was precisely the two paths \
+                 disagreeing: the prefix was right and the bake was wrong, so the \
+                 trained structure and the baked table described different CTR \
+                 values. If this ever fails, the two paths have diverged again."
+            );
+        }
+    }
+}
+
+#[test]
+fn online_mean_prefix_floors_the_divisor_at_one() {
+    use crate::ctr::online::online_mean_prefix;
+
+    // D3's floor, on the side that already has it (online.rs:319-321).
+    for classes in [1usize, 0] {
+        let got = online_mean_prefix(&[0], &[0], &[0], classes, 0.5)
+            .unwrap_or_else(|e| panic!("classes={classes} must be Ok: {e:?}"));
+        assert_eq!(
+            got.sum,
+            vec![0.0f32],
+            "classes={classes}: the divisor is floored at 1 \
+             (`saturating_sub(1).max(1)`, online.rs:319-321), and every \
+             target_class is 0, so every Sum is 0"
+        );
+    }
+}
