@@ -45,9 +45,11 @@ pub use candidates::{
 pub use ctr::{
     bake_ctr_table, BakedCtrData, BakedCtrTable,
     accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
-    calc_normalization, materialize_ctr_feature, online_class_prefix, online_ctr_prefix_binclf,
+    calc_normalization, materialize_ctr_feature, online_class_prefix, online_class_prefix_column,
+    online_counter_column, online_ctr_prefix_binclf, online_mean_prefix,
     ordered_ctr_per_permutation, CounterCalcMethod, CtrFeatureColumn, ECtrType, FinalCtrTable,
-    OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior, TCtrHistory, TCtrMeanHistory,
+    OnlineCtrAccumulator, OnlineCtrPrefix, OnlineMeanPrefix, OrderedCtrPrefix, Prior, TCtrHistory,
+    TCtrMeanHistory,
     SIMPLE_CLASSES_COUNT,
 };
 pub use estimated::estimated_features::{

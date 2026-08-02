@@ -41,6 +41,7 @@ fn ctr_column_from_bins(bins: &[u32]) -> CtrFeatureColumn {
     CtrFeatureColumn {
         projection: TProjection::single(0),
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: PRIOR_NUM,
         prior_denom: PRIOR_DENOM,
         bins: bins.to_vec(),
@@ -68,6 +69,7 @@ fn ctr_column_from_bins_with_projection(bins: &[u32], projection: TProjection) -
     CtrFeatureColumn {
         projection,
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: PRIOR_NUM,
         prior_denom: PRIOR_DENOM,
         bins: bins.to_vec(),
@@ -389,6 +391,8 @@ fn second_materialization_differs_from_structure() {
         PRIOR_NUM,
         PRIOR_DENOM,
         ctr_border_count_default(),
+        cb_train::ECtrType::Borders,
+        0,
     )
     .expect("identity materialization");
     let leaf_value = materialize_ctr_feature(
@@ -399,6 +403,8 @@ fn second_materialization_differs_from_structure() {
         PRIOR_NUM,
         PRIOR_DENOM,
         ctr_border_count_default(),
+        cb_train::ECtrType::Borders,
+        0,
     )
     .expect("averaging materialization");
 

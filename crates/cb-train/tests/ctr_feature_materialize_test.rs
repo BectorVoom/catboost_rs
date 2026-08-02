@@ -78,6 +78,8 @@ fn materialize_no_leakage_under_identity_permutation() {
         PRIOR_NUM,
         PRIOR_DENOM,
         border_count,
+        cb_train::ECtrType::Borders,
+        0,
     )
     .expect("materialize the combined-projection online CTR feature");
 
@@ -127,6 +129,8 @@ fn assert_matches_reference_prefix(
         PRIOR_NUM,
         PRIOR_DENOM,
         border_count,
+        cb_train::ECtrType::Borders,
+        0,
     )
     .expect("materialize the projection");
 
@@ -194,6 +198,8 @@ fn materialize_quantization_range_and_prior_pair() {
         PRIOR_NUM,
         PRIOR_DENOM,
         border_count,
+        cb_train::ECtrType::Borders,
+        0,
     )
     .expect("materialize for quantization-range check");
 
@@ -226,5 +232,144 @@ fn materialize_quantization_range_and_prior_pair() {
             column.bins[a] <= column.bins[b],
             "CTR bin must be monotone non-decreasing in the online value"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E09 / SPEC-CTRT-06/-07/-08 (wiring half) — `materialize_ctr_feature` dispatches
+// per CTR type instead of hard-coding the Borders head.
+// ---------------------------------------------------------------------------
+
+/// A 6-distinct-value categorical column over 12 documents.
+fn e09_dataset() -> (Vec<Vec<String>>, Vec<usize>, Vec<i32>) {
+    let cat0: Vec<String> = (0..12).map(|i| stringify_int_category(i % 6)).collect();
+    let target_class: Vec<usize> = vec![1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1];
+    let permutation: Vec<i32> = (0..12).collect();
+    (vec![cat0], target_class, permutation)
+}
+
+#[test]
+fn materialize_emits_the_requested_ctr_type_and_border_idx() {
+    use cb_train::ECtrType;
+
+    let (cats, tc, perm) = e09_dataset();
+    let proj = TProjection::from_features(&[0]);
+    let call = |ctr_type: ECtrType, b: usize, permutation: &[i32]| {
+        materialize_ctr_feature(
+            &cats,
+            &proj,
+            permutation,
+            &tc,
+            PRIOR_NUM,
+            PRIOR_DENOM,
+            15,
+            ctr_type,
+            b,
+        )
+        .expect("materialize must succeed for a CPU-legal type")
+    };
+
+    // --- Borders, b=0: the D-04 NO-OP proof. -------------------------------
+    // These literals were transcribed from a PRE-CHANGE run, so this is a frozen
+    // characterization: the per-type dispatch must not perturb the pre-existing
+    // Borders path by even one bin or one ulp.
+    let borders = call(ECtrType::Borders, 0, &perm);
+    assert_eq!(borders.ctr_type, ECtrType::Borders.as_i8());
+    assert_eq!(borders.target_border_idx, 0);
+    assert_eq!(
+        borders.bins,
+        vec![7, 7, 7, 7, 7, 7, 11, 3, 11, 11, 3, 3],
+        "the Borders/b=0 path must stay byte-identical to the pre-dispatch output"
+    );
+    let borders_value_bits: Vec<u64> = borders.ctr_value.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(
+        borders_value_bits,
+        vec![
+            4602678819172646912,
+            4602678819172646912,
+            4602678819172646912,
+            4602678819172646912,
+            4602678819172646912,
+            4602678819172646912,
+            4604930618986332160,
+            4598175219545276416,
+            4604930618986332160,
+            4604930618986332160,
+            4598175219545276416,
+            4598175219545276416,
+        ],
+        "the Borders/b=0 CTR values must be BIT-identical to the pre-dispatch output"
+    );
+    assert_eq!(borders.bucket_count, 6);
+
+    // --- Buckets -----------------------------------------------------------
+    let buckets_b1 = call(ECtrType::Buckets, 1, &perm);
+    assert_eq!(buckets_b1.ctr_type, 1);
+    assert_eq!(buckets_b1.target_border_idx, 1);
+
+    // For BINCLF, Buckets at b=1 and Borders at b=0 are the SAME column by
+    // construction: Borders(b=0) = Total - N[0] = N[1] = Buckets(b=1). (The E04
+    // table shows the same identity: counts [3,7] gives 7.0 under both.) So this
+    // pair CANNOT discriminate a real dispatch from a hard-coded Borders head,
+    // and asserting they differ would be unsatisfiable. Pin the identity instead
+    // — it is a genuine property worth locking.
+    assert_eq!(
+        buckets_b1.bins, borders.bins,
+        "for binclf, Buckets(b=1) and Borders(b=0) are the same statistic (N[1])"
+    );
+
+    // The discriminating pair is Buckets at b=0 (= N[0]) versus Borders at b=0
+    // (= N[1]). A still-hard-coded Borders head would make these equal.
+    let buckets_b0 = call(ECtrType::Buckets, 0, &perm);
+    assert_eq!(buckets_b0.ctr_type, 1);
+    assert_eq!(buckets_b0.target_border_idx, 0);
+    assert_ne!(
+        buckets_b0.bins, borders.bins,
+        "Buckets at b=0 (N[0]) must differ from Borders at b=0 (N[1]) — equal \
+         bins would mean the type is still hard-coded"
+    );
+
+    // --- Counter, b=0: permutation invariance ------------------------------
+    let counter = call(ECtrType::Counter, 0, &perm);
+    assert_eq!(counter.ctr_type, 4);
+    let shuffled: Vec<i32> = vec![11, 3, 0, 7, 2, 9, 5, 1, 10, 4, 8, 6];
+    let counter_shuffled = call(ECtrType::Counter, 0, &shuffled);
+    assert_eq!(
+        counter.bins, counter_shuffled.bins,
+        "Counter is permutation-INDEPENDENT \
+         (IsPermutationDependentCtrType(Counter)==false, ctr_type.cpp:43-56)"
+    );
+
+    // --- BinarizedTargetMeanValue, b=0 -------------------------------------
+    let btmv = call(ECtrType::BinarizedTargetMeanValue, 0, &perm);
+    assert_eq!(btmv.ctr_type, 2);
+    let first = btmv.bins.first().copied().unwrap_or(0);
+    assert!(
+        btmv.bins.iter().any(|&b| b != first),
+        "the BTMV column must not be constant — a constant column would mean the \
+         mean prefix never varied"
+    );
+}
+
+#[test]
+fn materialize_rejects_cpu_illegal_ctr_types() {
+    use cb_train::ECtrType;
+
+    let (cats, tc, perm) = e09_dataset();
+    let proj = TProjection::from_features(&[0]);
+
+    // Defence in depth: E02 already rejects these at train_inner, but a direct
+    // caller must not get a silently-wrong column either.
+    for ty in [ECtrType::FloatTargetMeanValue, ECtrType::FeatureFreq] {
+        let err = materialize_ctr_feature(
+            &cats, &proj, &perm, &tc, PRIOR_NUM, PRIOR_DENOM, 15, ty, 0,
+        )
+        .expect_err("a CPU-illegal CTR type must be rejected");
+        match err {
+            cb_core::CbError::Unsupported(msg) => {
+                assert!(msg.contains("not implemented on CPU yet"), "{msg}");
+            }
+            other => panic!("expected CbError::Unsupported, got {other:?}"),
+        }
     }
 }

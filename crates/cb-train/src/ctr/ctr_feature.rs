@@ -56,8 +56,10 @@ use std::collections::HashMap;
 use cb_core::{CbError, CbResult};
 use cb_data::calc_cat_feature_hash;
 
-use crate::ctr::calc_ctr::calc_ctr_online_bin;
-use crate::ctr::online::online_ctr_prefix_binclf;
+use crate::ctr::calc_ctr::{calc_ctr_online, calc_ctr_online_bin};
+use crate::ctr::online::{
+    online_class_prefix_column, online_counter_column, online_mean_prefix, SIMPLE_CLASSES_COUNT,
+};
 use crate::ctr::ECtrType;
 use crate::projection::TProjection;
 
@@ -70,9 +72,12 @@ pub struct CtrFeatureColumn {
     /// The combined categorical projection (sorted member set) this column was
     /// materialized over.
     pub projection: TProjection,
-    /// The CTR type i8 discriminant (Borders head — the combinations_ctr /
-    /// simple_ctr default; the SAME values as [`ECtrType`] / `cb_model::ECtrType`).
+    /// The CTR type i8 discriminant this column was materialized for (the SAME
+    /// values as [`ECtrType`] / `cb_model::ECtrType`).
     pub ctr_type: i8,
+    /// The Buckets per-class numerator selector this column was materialized for
+    /// (`GetTargetBorderCount`'s border index). `0` for every non-Buckets type.
+    pub target_border_idx: usize,
     /// The CTR prior numerator (`PriorNum`), carried as a PAIR (never pre-divided).
     pub prior_num: f64,
     /// The CTR prior denominator (`PriorDenom`); `1.0` for the default priors.
@@ -128,6 +133,8 @@ pub fn materialize_ctr_feature(
     target_class: &[usize],
     prior_num: f64, prior_denom: f64,
     ctr_border_count: usize,
+    ctr_type: ECtrType,
+    target_border_idx: usize,
 ) -> CbResult<CtrFeatureColumn> {
     // The document count is the permutation length (every learn document appears
     // once); the member columns must each be at least that long.
@@ -201,16 +208,77 @@ pub fn materialize_ctr_feature(
     // order). Reused verbatim — no re-derived prefix loop. target_class is sliced
     // to n so the length contract matches the permutation/bins.
     let target_class_n = target_class.get(..n).unwrap_or(target_class);
-    let prefix =
-        online_ctr_prefix_binclf(permutation, &combined_bins, target_class_n, prior_scalar)?;
+
+    // 3b. Per-type dispatch (SPEC-CTRT-06/-07/-08). Each arm supplies the
+    //     per-document (numerator, denominator) INPUTS; the quantizer below is
+    //     type-agnostic and stays byte-identical.
+    let bucket_count = remap.len();
+    let (nums, denoms, ctr_value, quantize_in_f32) = match ctr_type {
+        ECtrType::Borders | ECtrType::Buckets => {
+            // Borders at target_border_idx == 0 is EXACTLY the pre-dispatch
+            // `online_ctr_prefix_binclf` path (E05's firewall proves the
+            // equivalence bit-for-bit).
+            let prefix = online_class_prefix_column(
+                permutation,
+                &combined_bins,
+                target_class_n,
+                SIMPLE_CLASSES_COUNT,
+                target_border_idx,
+                ctr_type,
+                prior_scalar,
+            )?;
+            let nums: Vec<f64> = prefix.good.iter().map(|&g| g as f64).collect();
+            (nums, prefix.total, prefix.value, false)
+        }
+        ECtrType::BinarizedTargetMeanValue => {
+            let prefix = online_mean_prefix(
+                permutation,
+                &combined_bins,
+                target_class_n,
+                SIMPLE_CLASSES_COUNT,
+                prior_scalar,
+            )?;
+            let nums: Vec<f64> = prefix.sum.iter().map(|&s| f64::from(s)).collect();
+            // BTMV quantizes in f32, mirroring upstream's all-`float` CalcCTR.
+            (nums, prefix.count, prefix.value, true)
+        }
+        ECtrType::Counter => {
+            // Whole-set totals with the CONSTANT max-bucket denominator; no
+            // permutation dependence at all (ctr_type.cpp:43-56).
+            let (totals, denominator) = online_counter_column(&combined_bins, bucket_count);
+            let nums: Vec<f64> = totals.iter().map(|&t| t as f64).collect();
+            let denoms: Vec<i64> = vec![denominator; totals.len()];
+            let value: Vec<f64> = nums
+                .iter()
+                .map(|&num| calc_ctr_online(num, denominator, prior_scalar))
+                .collect();
+            (nums, denoms, value, false)
+        }
+        ECtrType::FloatTargetMeanValue | ECtrType::FeatureFreq => {
+            // Defence in depth — E02 already rejects these at `train_inner`, but a
+            // direct caller must not get a silently-wrong column either.
+            return Err(CbError::Unsupported(format!(
+                "Ctr type {ctr_type:?} is not implemented on CPU yet \
+                 (upstream catboost_options.cpp:504-509)"
+            )));
+        }
+    };
 
     // 4. Quantize each document's online CTR value to an integer CTR bin (the
-    //    implicit float -> ui8 truncation). good[i]/total[i] are in OBJECT order.
+    //    implicit float -> ui8 truncation). Inputs are in OBJECT order.
     let mut bins: Vec<u32> = Vec::with_capacity(n);
     for i in 0..n {
-        let good = prefix.good.get(i).copied().unwrap_or(0);
-        let total = prefix.total.get(i).copied().unwrap_or(0);
-        let bin_f = calc_ctr_online_bin(good as f64, total, prior_scalar, ctr_border_count);
+        let good = nums.get(i).copied().unwrap_or(0.0);
+        let total = denoms.get(i).copied().unwrap_or(0);
+        let bin_f = if quantize_in_f32 {
+            // Upstream's CalcCTR is all-`float` for the mean types; compute in f32
+            // and widen only at the end (research §A.0 caveat).
+            let norm = (total as f32) + 1.0f32;
+            let ctr = (good as f32 + prior_scalar as f32) / norm;
+            f64::from(ctr * ctr_border_count as f32)
+        } else {
+            calc_ctr_online_bin(good, total, prior_scalar, ctr_border_count)
+        };
         // Truncate toward zero, clamp into [0, ctr_border_count] (a degenerate
         // negative or over-range float maps to the nearest valid bin — no panic,
         // no out-of-range cast). The CTR is non-negative and bounded by the
@@ -228,14 +296,14 @@ pub fn materialize_ctr_feature(
 
     Ok(CtrFeatureColumn {
         projection: projection.clone(),
-        // Borders head — the combinations_ctr / simple_ctr default family.
-        ctr_type: ECtrType::Borders.as_i8(),
+        ctr_type: ctr_type.as_i8(),
+        target_border_idx,
         prior_num,
         prior_denom,
         bins,
-        ctr_value: prefix.value,
+        ctr_value,
         // Distinct combined-projection buckets (the projection cardinality) — the
         // size of the first-seen remap.
-        bucket_count: remap.len(),
+        bucket_count,
     })
 }

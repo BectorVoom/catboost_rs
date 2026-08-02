@@ -374,6 +374,7 @@ fn column_with_bucket_count(projection: TProjection, bucket_count: usize) -> Ctr
     CtrFeatureColumn {
         projection,
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: 0.5,
         prior_denom: 1.0,
         bins: Vec::new(),
@@ -662,6 +663,7 @@ fn max_bucket_count_phantom_excludes_ctr_split_from_partition() {
     let ctr_col = CtrFeatureColumn {
         projection: TProjection::single(0),
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: 0.5,
         prior_denom: 1.0,
         bins: vec![0, 1, 0, 1], // obj0,obj2 fail border 0.5; obj1,obj3 pass.
