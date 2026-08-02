@@ -195,7 +195,14 @@ fn encode_ctr_model_parts_roundtrips_via_decode() {
 }
 
 #[test]
-fn encode_ctr_model_parts_rejects_mean_table() {
+fn encode_ctr_model_parts_round_trips_a_mean_table() {
+    // INVERTED at E20 (was `encode_ctr_model_parts_rejects_mean_table`, the v1
+    // MAJOR-2 rejection): mean tables encode as the 8-byte `f32 Sum` + `i32
+    // Count` stride (SPEC-CTRT-14) and must survive encode -> decode exactly.
+    // Deliberately a `FloatTargetMeanValue` table — the OTHER half of the
+    // `is_mean()` pair from E18/E19's BinarizedTargetMeanValue fixture, so a
+    // BTMV-only codec branch fails here.
+    let original_mean = vec![(6.0f32, 2i64)];
     let mut tables = BTreeMap::new();
     tables.insert(
         ctr_base_key(ECtrType::FloatTargetMeanValue, &[0]),
@@ -204,11 +211,20 @@ fn encode_ctr_model_parts_rejects_mean_table() {
             target_classes_count: 2,
             hashes: vec![5],
             int_counts: Vec::new(),
-            mean: vec![(6.0, 2)],
+            mean: original_mean.clone(),
             counter_denominator: 0,
         },
     );
-    assert!(encode_ctr_model_parts(&CtrData { tables }).is_err());
+    let parts = encode_ctr_model_parts(&CtrData { tables })
+        .expect("mean tables are encodable after SPEC-CTRT-14");
+    let back = decode_ctr_model_parts(&parts).expect("decode");
+    let t = back.tables.values().next().expect("one table");
+    assert!(
+        !t.mean.is_empty(),
+        "anti-vacuity: an empty mean vector would round-trip trivially"
+    );
+    assert_eq!(t.mean, original_mean, "the (f32, i64) pairs must survive exactly");
+    assert!(t.int_counts.is_empty(), "a mean table carries no int_counts");
 }
 
 #[test]

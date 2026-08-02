@@ -182,22 +182,35 @@ fn btmv_baked_table_carries_a_non_empty_mean_vector() {
 }
 
 #[test]
-fn btmv_save_cbm_is_a_typed_rejection_until_e20() {
-    let (trained, baked, _cat_cols, borders) = fit();
+fn btmv_trained_model_round_trips_through_cbm() {
+    // FLIPPED at E20 (was `btmv_save_cbm_is_a_typed_rejection_until_e20`, the
+    // v1 encode-side limitation): a trained BTMV model saves, reloads, and the
+    // reloaded model predicts within 1e-5 of the in-memory one.
+    let (trained, baked, cat_cols, borders) = fit();
     let model = CbModel::from_trained(&trained, borders)
         .with_ctr_data(cb_model::CtrData::from_baked(&baked));
 
-    // A REAL v1 limitation, tested rather than merely known. E20 lifts the
-    // encode-side restriction and FLIPS this test; it must not be deleted.
-    let path = std::env::temp_dir().join(format!("btmv_reject_{}.cbm", std::process::id()));
-    let err = cb_model::save_cbm(&model, &path)
-        .expect_err("save_cbm must still reject a mean-CTR model until E20");
+    let path = std::env::temp_dir().join(format!("btmv_roundtrip_{}.cbm", std::process::id()));
+    cb_model::save_cbm(&model, &path)
+        .unwrap_or_else(|e| panic!("save_cbm must accept a mean-CTR model after E20: {e:?}"));
+    let reloaded = cb_model::load_cbm(&path)
+        .unwrap_or_else(|e| panic!("the saved BTMV .cbm must reload: {e:?}"));
     let _ = std::fs::remove_file(&path);
 
-    let msg = format!("{err:?}");
+    let in_memory = cb_model::predict_raw_cat(&model, &[], &cat_cols);
+    let round_tripped = cb_model::predict_raw_cat(&reloaded, &[], &cat_cols);
     assert!(
-        msg.contains("mean") || msg.contains("target-mean"),
-        "the rejection must name the mean-CTR limitation, got {msg}"
+        in_memory.iter().any(|v| *v != in_memory[0]),
+        "constant predictions — the round-trip gate would be vacuous"
+    );
+    let max_div = in_memory
+        .iter()
+        .zip(round_tripped.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_div <= 1e-5,
+        "the round-tripped BTMV model diverged from the in-memory one: {max_div:e}"
     );
 }
 
