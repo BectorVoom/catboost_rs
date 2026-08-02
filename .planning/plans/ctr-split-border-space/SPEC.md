@@ -299,3 +299,47 @@ path is required; the change makes newly written models correct.
   `PLAN.md` §3.
 - `[UNVERIFIED]` no independent Research Agent pass was run — the user elected to
   plan from session evidence.
+
+---
+
+## 11. Execution record (C06 close-out)
+
+Executed 2026-08-02. All six tasks complete; every spec ID gated.
+
+| Spec | Gate | Result |
+|---|---|---|
+| SPEC-CTRB-01 | C02 convention + upstream membership; C04 Tests A/B/C/E | green |
+| SPEC-CTRB-02 | C01 train/apply agreement (primary Red) | Red → green |
+| SPEC-CTRB-03 | C01 step-6 + C04 Test D integrality | green |
+| SPEC-CTRB-04 | `!has_ctr` fallback decision (below) | confirmed, no change |
+| SPEC-CTRB-05 | C05 `.cbm` round-trip | green |
+
+**SPEC-CTRB-04 — decision CONFIRMED, `boosting.rs` `border: 0.0` NOT converted.**
+`ctr_splits_for_tree` is reached only on the `!has_ctr` branch, where the
+candidate list is empty, so it returns an EMPTY vector and the `border: 0.0`
+literal is never constructed in production. E03's four characterization tests
+call the function directly with a NON-empty list and still assert
+`border == 0.0`; they pass unchanged and `git diff` on
+`crates/cb-train/src/boosting_test.rs` is empty — exactly as predicted. A later
+reader must not "fix" this site.
+
+**Mutation record (falsifiability, §3.1).**
+
+| Mutation | Expected | Observed |
+|---|---|---|
+| C04 M1 — compute in f64 | Test E fails; A/B/C pass; oracles green | `16.999999046325684 != 17.0`; A/B/C passed; E12 4/4 and oracles green |
+| C04 M2 — convert the `LevelKind` site too | Test D fails; C01 step-6 fails; **E12 + oracles stay GREEN** | all four exactly as predicted |
+| C05 — `+ 0.1` on the persisted border | round-trip border shifts | `9.099999046325683 -> 9.09999942779541` |
+
+M2's green half is the empirical confirmation that converting the `LevelKind`
+site is arithmetically a no-op no oracle can detect — which is why the two
+integrality assertions are the only guard and must never be removed.
+
+**Blast radius, all run:** 11 CTR oracles green (9 cb-train + 2 cb-model), 3
+one-hot targets green, E00 frozen non-mean `.cbm` byte baseline green,
+`cbm`/`json`/`float_only` byte gates green, the four BUG-CTRB gates green, and
+the E12 `ctr_counter_simple` parity gate 4/4 (`max |diff|` 2.687e-1 → ≤1e-5).
+`cb-train` and `cb-model` sweeps show only the pre-existing
+`monotone_non_symmetric_and_region_are_typed_errors` failure recorded in
+ctr-type `PLAN.md` §3. No new clippy findings (`cb-oracle`'s three are
+pre-existing, confirmed by re-linting with the change stashed).
