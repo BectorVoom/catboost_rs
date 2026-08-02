@@ -729,7 +729,11 @@ fn decode_ctr_parts_blob_length_mismatch_is_typed_error() {
 }
 
 #[test]
-fn decode_ctr_parts_mean_ctr_type_is_typed_error() {
+fn decode_ctr_parts_mean_ctr_type_round_trips_sum_and_count() {
+    // INVERTED at E19 (was `decode_ctr_parts_mean_ctr_type_is_typed_error`,
+    // the v1 MAJOR-2 rejection): a mean-typed part's CTRBlob is upstream's
+    // 8-byte `TCtrMeanHistory { f32 Sum; i32 Count; }` stride, and the decoder
+    // must reconstruct the pairs, not reject them.
     let ihr = hash_slot(111, 0);
     let blob: Vec<u8> = [7.0f32.to_le_bytes(), 3i32.to_le_bytes()].concat();
     let tail = build_one_part_tail(
@@ -741,8 +745,77 @@ fn decode_ctr_parts_mean_ctr_type_is_typed_error() {
         &blob,
     );
     match decode_ctr_model_parts(&tail) {
-        Err(ModelError::Deserialize(_)) => {}
-        other => panic!("mean ctr_type must be Deserialize error (v1, MAJOR-2), got {other:?}"),
+        Ok(data) => {
+            let table = data
+                .tables
+                .values()
+                .next()
+                .expect("one decoded mean table expected");
+            assert!(!table.mean.is_empty(), "anti-vacuity: the mean pairs must decode");
+            assert_eq!(
+                table.mean,
+                vec![(7.0f32, 3i64)],
+                "the single bucket must reconstruct exactly (Sum, Count) = (7.0, 3)"
+            );
+            assert!(table.int_counts.is_empty(), "a mean table carries no int_counts");
+        }
+        other => panic!("mean ctr_type must decode after E19, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_ctr_parts_mean_blob_matching_neither_stride_is_typed_error() {
+    // ADDITIVE sibling negative case (E19): a mean-typed part whose blob length
+    // matches NEITHER the 8-byte upstream stride nor the 12-byte self-format
+    // stride must still be a typed rejection, never a panic or a silent guess.
+    let ihr = hash_slot(111, 0);
+    let blob: Vec<u8> = vec![0u8; 11]; // 1 bucket: neither 8 nor 12
+    let tail = build_one_part_tail(
+        &[0],
+        TailECtrType::BinarizedTargetMeanValue,
+        0,
+        0,
+        &ihr,
+        &blob,
+    );
+    match decode_ctr_model_parts(&tail) {
+        Err(ModelError::Deserialize(msg)) => {
+            assert!(
+                msg.contains("11") && msg.contains('8') && msg.contains("12"),
+                "the rejection must name the length and BOTH candidate strides: {msg}"
+            );
+        }
+        other => panic!("neither-stride mean blob must be Deserialize error, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_ctr_parts_mean_blob_reports_rather_than_silently_accepting_a_twelve_byte_stride() {
+    // THE STRIDE-AMBIGUITY PIN (E19 / SPEC-CTRT-15): this repo's OWN
+    // self-describing CTR format persists mean pairs at a 12-byte stride
+    // (`f32 Sum ; i64 Count`). If an input blob matches 12 bytes per bucket,
+    // the `.cbm` decoder must NOT silently adopt it — SPEC-CTRT-14's 8-byte
+    // upstream layout would need re-specification first. The rejection must
+    // say so.
+    let ihr = hash_slot(111, 0);
+    let blob: Vec<u8> = vec![0u8; 12]; // 1 bucket at exactly the 12-byte stride
+    let tail = build_one_part_tail(
+        &[0],
+        TailECtrType::BinarizedTargetMeanValue,
+        0,
+        0,
+        &ihr,
+        &blob,
+    );
+    match decode_ctr_model_parts(&tail) {
+        Err(ModelError::Deserialize(msg)) => {
+            assert!(
+                msg.contains("12-byte") && msg.contains("re-specified"),
+                "the rejection must name the matched 12-byte stride and demand \
+                 re-specification, not silently decode: {msg}"
+            );
+        }
+        other => panic!("12-byte-stride mean blob must REPORT, got {other:?}"),
     }
 }
 
