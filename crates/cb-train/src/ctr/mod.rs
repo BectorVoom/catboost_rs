@@ -209,7 +209,7 @@ pub use bake::{bake_ctr_table, BakedCtrData, BakedCtrTable};
 pub use ctr_feature::{materialize_ctr_feature, CtrFeatureColumn};
 pub use final_ctr::{build_final_ctr, FinalCtrTable};
 pub use online::{
-    accumulate_online, online_ctr_prefix_binclf, ordered_ctr_per_permutation,
+    accumulate_online, online_class_prefix, online_ctr_prefix_binclf, ordered_ctr_per_permutation,
     OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, TCtrHistory, TCtrMeanHistory,
     SIMPLE_CLASSES_COUNT,
 };

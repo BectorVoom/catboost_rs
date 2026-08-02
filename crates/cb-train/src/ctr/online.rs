@@ -260,6 +260,55 @@ pub fn accumulate_online(
 /// # Errors
 /// [`CbError::Degenerate`] if `bins` / `target_class` are shorter than the
 /// permutation implies, or a permutation index is out of range.
+/// The ONE generic classes-prefix producer: given a bucket's per-class prefix
+/// `counts`, the target-border index `b` and the CTR type, return that bucket's
+/// `(numerator, denominator)` pair (SPEC-CTRT-04).
+///
+/// # Upstream
+/// `UpdateGoodCount` (`online_ctr.cpp:115-121`):
+/// ```text
+/// if (ctrType == Buckets) *goodCount = curCount; else *goodCount -= curCount;
+/// ```
+/// applied cumulatively over `border = 0..targetBorderCount` starting from
+/// `goodCount = Total`. For a single border index `b` that collapses to:
+///
+/// - [`Buckets`](crate::ctr::ECtrType::Buckets) → `N[b]`
+/// - everything else → `Total - Σ_{c ≤ b} N[c]`
+///
+/// The denominator is always the bucket total. The read-before-increment
+/// ORDER (`online_ctr.cpp:168-185`) is the CALLER's responsibility — this
+/// function is pure and sees only an already-read prefix.
+///
+/// # Not for `Counter`
+/// [`Counter`](crate::ctr::ECtrType::Counter) is **not** a class-prefix type: its
+/// numerator is the whole-set bucket total and its denominator is the MAX bucket
+/// total, neither of which is derivable from one bucket's class counts. It must
+/// never be passed here; `online_counter_column` owns that path.
+///
+/// # Safety of the arithmetic
+/// Access is via checked `.get` only — an out-of-range `b` contributes `0`
+/// rather than panicking — and the cumulative subtraction saturates, so a
+/// malformed `counts` can never underflow.
+#[must_use]
+pub fn online_class_prefix(
+    counts: &[i64],
+    target_border_idx: usize,
+    ctr_type: crate::ctr::ECtrType,
+) -> (f64, i64) {
+    let total: i64 = counts.iter().sum();
+
+    let num = if matches!(ctr_type, crate::ctr::ECtrType::Buckets) {
+        counts.get(target_border_idx).copied().unwrap_or(0)
+    } else {
+        let head: i64 = (0..=target_border_idx)
+            .map(|c| counts.get(c).copied().unwrap_or(0))
+            .sum();
+        total.saturating_sub(head)
+    };
+
+    (num as f64, total)
+}
+
 pub fn online_ctr_prefix_binclf(
     permutation: &[i32],
     bins: &[u32],
@@ -294,11 +343,13 @@ pub fn online_ctr_prefix_binclf(
             ));
         };
         let bucket = bin as usize;
-        let elem = counts.get(bucket);
         // READ the prefix counts BEFORE incrementing (online_ctr.cpp:303-304).
-        let (n0, n1) = elem.map_or((0, 0), |e| (e[0], e[1]));
-        let g = n1; // good = N[1] (pos class)
-        let t = n0 + n1; // total = N[0] + N[1]
+        // Routed through the ONE generic classes-prefix producer (E05/SPEC-CTRT-05):
+        // binclf Borders IS `online_class_prefix(&[N0, N1], 0, Borders)`, proven
+        // bit-identical over an exhaustive grid in `online_test.rs`.
+        let slots: &[i64] = counts.get(bucket).map_or(&[][..], |e| &e[..]);
+        let (g_f64, t) = online_class_prefix(slots, 0, crate::ctr::ECtrType::Borders);
+        let g = g_f64 as i64; // good = N[1] (pos class)
         if let Some(slot) = good.get_mut(doc) {
             *slot = g;
         }
@@ -306,7 +357,7 @@ pub fn online_ctr_prefix_binclf(
             *slot = t;
         }
         if let Some(slot) = value.get_mut(doc) {
-            *slot = calc_ctr_online(g as f64, t, prior);
+            *slot = calc_ctr_online(g_f64, t, prior);
         }
         // INCREMENT after read (learn set): ++N[targetClass[doc]].
         if let Some(elem) = counts.get_mut(bucket) {
@@ -390,9 +441,13 @@ pub fn ordered_ctr_per_permutation(
             ));
         };
         let bucket = bin as usize;
-        let (n0, n1) = counts.get(bucket).map_or((0, 0), |e| (e[0], e[1]));
-        step_num.push(n1);
-        step_denom.push(n0 + n1);
+        // Re-routed through the SAME generic producer as `online_ctr_prefix_binclf`
+        // above. Both loops MUST use it: this second derivation is independent, so
+        // re-routing only one of the two would let them silently diverge (E05).
+        let slots: &[i64] = counts.get(bucket).map_or(&[][..], |e| &e[..]);
+        let (num, denom) = online_class_prefix(slots, 0, crate::ctr::ECtrType::Borders);
+        step_num.push(num as i64);
+        step_denom.push(denom);
         if let Some(elem) = counts.get_mut(bucket) {
             if let Some(c) = elem.get_mut(class) {
                 *c += 1;

@@ -171,3 +171,167 @@ fn ordered_ctr_length_mismatch_is_typed_error() {
     let target_class = vec![1usize, 0];
     assert!(ordered_ctr_per_permutation(&permutation, &bins, &target_class, 0.5).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// E04 / SPEC-CTRT-04 — `online_class_prefix`, the ONE generic classes-prefix
+// producer.
+//
+// Upstream `UpdateGoodCount` (online_ctr.cpp:115-121):
+//   if (Buckets) *goodCount = curCount; else *goodCount -= curCount;
+// applied cumulatively over border = 0..targetBorderCount starting from
+// goodCount = Total. For a single border `b` that collapses to:
+//   Buckets -> N[b]
+//   Borders -> Total - sum(N[0..=b])
+// ---------------------------------------------------------------------------
+
+#[test]
+fn online_class_prefix_matches_hand_computed_upstream_vectors() {
+    use crate::ctr::online::online_class_prefix;
+    use crate::ctr::ECtrType;
+
+    // (counts, b, ctr_type, expected_num, expected_denom) — every value
+    // hand-computed from the upstream formula above, not from this code.
+    let cases: Vec<(Vec<i64>, usize, ECtrType, f64, i64)> = vec![
+        // Buckets selects the b-th class count directly.
+        (vec![3, 7], 0, ECtrType::Buckets, 3.0, 10),
+        (vec![3, 7], 1, ECtrType::Buckets, 7.0, 10),
+        // Borders subtracts the cumulative head: 10 - 3 = 7.
+        (vec![3, 7], 0, ECtrType::Borders, 7.0, 10),
+        (vec![2, 5, 4], 0, ECtrType::Buckets, 2.0, 11),
+        (vec![2, 5, 4], 1, ECtrType::Buckets, 5.0, 11),
+        // 11 - 2 = 9.
+        (vec![2, 5, 4], 0, ECtrType::Borders, 9.0, 11),
+        // 11 - (2 + 5) = 4.
+        (vec![2, 5, 4], 1, ECtrType::Borders, 4.0, 11),
+        // An empty bucket must produce the empty value, never a division setup.
+        (vec![0, 0], 0, ECtrType::Borders, 0.0, 0),
+        // Degenerate: no classes at all. Must not panic.
+        (vec![], 0, ECtrType::Buckets, 0.0, 0),
+        // Out-of-range border index: checked `.get`, so 0 rather than a panic.
+        (vec![3, 7], 9, ECtrType::Buckets, 0.0, 10),
+    ];
+
+    for (counts, b, ctr_type, want_num, want_denom) in cases {
+        let (num, denom) = online_class_prefix(&counts, b, ctr_type);
+        // Integers exactly representable in f64 — exact equality, no tolerance.
+        assert_eq!(
+            num, want_num,
+            "numerator for counts={counts:?} b={b} type={ctr_type:?}"
+        );
+        assert_eq!(
+            denom, want_denom,
+            "denominator for counts={counts:?} b={b} type={ctr_type:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E05 / SPEC-CTRT-05 (acceptance A7) — THE REGRESSION FIREWALL.
+//
+// These three tests are the single most important risk control in Part 1. They
+// prove that today's Borders-binclf prefix is BIT-FOR-BIT the (classes = 2,
+// b = 0) special case of the generic `online_class_prefix` producer, so the
+// W2/W3 per-type dispatch refactor cannot silently move any of the 11 existing
+// CTR oracles.
+//
+// Test fns 2 and 3 carry literals TRANSCRIBED FROM A PRE-CHANGE RUN (captured
+// before `online_ctr_prefix_binclf` was re-routed through the generic producer),
+// which is what makes them a frozen characterization rather than a
+// self-comparison.
+// ---------------------------------------------------------------------------
+
+/// The fixed 12-document scenario shared by test fns 2 and 3.
+fn e05_scenario() -> (Vec<i32>, Vec<u32>, Vec<usize>, f64) {
+    let permutation = vec![3, 0, 7, 1, 9, 4, 11, 2, 6, 5, 10, 8];
+    let bins = vec![0, 1, 0, 2, 1, 0, 2, 2, 1, 0, 1, 2];
+    let target_class = vec![1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1];
+    (permutation, bins, target_class, 0.5)
+}
+
+#[test]
+fn borders_binclf_is_bit_identical_to_the_generic_class_prefix_at_b0() {
+    use crate::ctr::online::online_class_prefix;
+    use crate::ctr::ECtrType;
+
+    // Exhaustive over a small grid: 13 x 13 = 169 cases. Bit equality on the
+    // raw f64, NOT a tolerance — the firewall's whole value is that it admits
+    // no drift at all.
+    for n0 in 0..=12i64 {
+        for n1 in 0..=12i64 {
+            let (num, denom) = online_class_prefix(&[n0, n1], 0, ECtrType::Borders);
+            assert_eq!(
+                num.to_bits(),
+                (n1 as f64).to_bits(),
+                "generic Borders numerator must be BIT-identical to N[1] at n0={n0} n1={n1}"
+            );
+            assert_eq!(
+                denom,
+                n0 + n1,
+                "generic Borders denominator must be the bucket total at n0={n0} n1={n1}"
+            );
+        }
+    }
+}
+
+#[test]
+fn online_ctr_prefix_binclf_output_is_unchanged_by_the_generic_reroute() {
+    use crate::ctr::online::online_ctr_prefix_binclf;
+
+    let (perm, bins, tc, prior) = e05_scenario();
+    let got = online_ctr_prefix_binclf(&perm, &bins, &tc, prior).expect("prefix must succeed");
+
+    // FROZEN literals, transcribed from the run taken BEFORE the re-route.
+    let want_good: Vec<i64> = vec![0, 0, 2, 0, 0, 3, 2, 1, 0, 1, 0, 1];
+    let want_total: Vec<i64> = vec![0, 0, 2, 0, 1, 3, 3, 1, 3, 1, 2, 2];
+    // `value` is compared BIT-FOR-BIT, not with a tolerance: the re-route must
+    // not perturb the f64 result by even one ulp.
+    let want_value_bits: Vec<u64> = vec![
+        4602678819172646912,
+        4602678819172646912,
+        4605681218924227243,
+        4602678819172646912,
+        4598175219545276416,
+        4606056518893174784,
+        4603804719079489536,
+        4604930618986332160,
+        4593671619917905920,
+        4604930618986332160,
+        4595172819793696085,
+        4602678819172646912,
+    ];
+
+    assert_eq!(got.good, want_good, "good vector moved under the re-route");
+    assert_eq!(got.total, want_total, "total vector moved under the re-route");
+    let got_bits: Vec<u64> = got.value.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(
+        got_bits, want_value_bits,
+        "CTR value is not BIT-identical to the pre-re-route output"
+    );
+}
+
+#[test]
+fn ordered_ctr_per_permutation_step_counts_match_the_prefix_reroute() {
+    use crate::ctr::online::ordered_ctr_per_permutation;
+
+    let (perm, bins, tc, prior) = e05_scenario();
+    let got = ordered_ctr_per_permutation(&perm, &bins, &tc, prior).expect("ordered must succeed");
+
+    // The no-out-of-order anchor must survive the re-route.
+    assert!(
+        got.per_bucket_monotone(&perm, &bins),
+        "per-bucket prefixes must stay monotone along the permutation"
+    );
+
+    // FROZEN literals from the same pre-change run. `ordered_ctr_per_permutation`
+    // RE-DERIVES the read-before-increment loop separately from
+    // `online_ctr_prefix_binclf`; if only one of the two is re-routed they
+    // silently diverge, which is exactly what this test catches.
+    let want_step_num: Vec<i64> = vec![0, 0, 1, 0, 1, 0, 1, 2, 2, 3, 0, 0];
+    let want_step_denom: Vec<i64> = vec![0, 0, 1, 0, 1, 1, 2, 2, 3, 3, 2, 3];
+
+    assert_eq!(got.step_num, want_step_num, "step_num moved under the re-route");
+    assert_eq!(
+        got.step_denom, want_step_denom,
+        "step_denom moved under the re-route"
+    );
+}
