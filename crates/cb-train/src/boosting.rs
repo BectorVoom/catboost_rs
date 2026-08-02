@@ -812,9 +812,9 @@ pub struct ObliviousTree {
     pub ctr_splits: Vec<CtrSplitSpec>,
     /// The ordered ONE-HOT categorical splits chosen during tree growth
     /// (`cat_bin == value`), one [`crate::tree::OneHotSplit`] per chosen one-hot
-    /// level. EMPTY for every path that emits no one-hot candidate — which is all
-    /// of them until T19 populates it — so the widely-read `splits` surface stays
-    /// byte-for-byte unchanged. `cb_model::Model::from_trained` lifts each into a
+    /// level. EMPTY for every path that emits no one-hot candidate — so the
+    /// widely-read `splits` surface stays byte-for-byte unchanged for float-only
+    /// and CTR-only models. `cb_model::Model::from_trained` lifts each into a
     /// `ModelSplit::OneHot`.
     pub one_hot_splits: Vec<crate::tree::OneHotSplit>,
     /// The per-level chosen-split kinds in TRUE LEVEL ORDER, carried through from
@@ -1959,24 +1959,63 @@ fn assign_leaf_of_averaging(
 /// in-scope `Borders:Prior=0.5` fixture) seeds the spec. The split BORDER is left
 /// `0.0` here (the candidate-emission stage); the categorical scorer overwrites it
 /// with the chosen CTR-value threshold when a CTR split actually wins a level.
+/// Resolve the `(CTR type, head prior)` pair that governs ONE candidate
+/// (SPEC-CTRT-09 / SPEC-CTRT-10).
+///
+/// A **simple** candidate (a single categorical feature) is governed by
+/// `simple_ctr` / `simple_ctr_priors`; a **combination** candidate by
+/// `combinations_ctr` / `combinations_ctr_priors`. Before E10 a single
+/// `combinations_ctr_priors.first()` fed BOTH, so the combination prior silently
+/// governed simple candidates — the bug SPEC-CTRT-10 fixes.
+///
+/// Still exactly ONE prior per candidate (`.first()`): expanding the full prior
+/// list into separate candidates is W3 (E15).
+fn ctr_config_for(
+    simple_ctr: crate::ctr::ECtrType,
+    simple_priors: &[f64],
+    combinations_ctr: crate::ctr::ECtrType,
+    combinations_priors: &[f64],
+    is_simple: bool,
+) -> (crate::ctr::ECtrType, f64) {
+    let (ctr_type, priors) = if is_simple {
+        (simple_ctr, simple_priors)
+    } else {
+        (combinations_ctr, combinations_priors)
+    };
+    (ctr_type, priors.first().copied().unwrap_or(0.5))
+}
+
 fn ctr_splits_for_tree(
     candidates: &[crate::candidates::CtrCandidate],
-    priors: &[f64],
+    simple_ctr: crate::ctr::ECtrType,
+    simple_priors: &[f64],
+    combinations_ctr: crate::ctr::ECtrType,
+    combinations_priors: &[f64],
 ) -> Vec<CtrSplitSpec> {
-    let prior_num = priors.first().copied().unwrap_or(0.5);
     candidates
         .iter()
-        .map(|c| CtrSplitSpec {
-            projection: c.projection.clone(),
-            // combinations_ctr default head family is Borders (i8 == 0); pinned
-            // explicitly at the BoostParams level (combinations_ctr_default).
-            ctr_type: crate::ctr::ECtrType::Borders.as_i8(),
-            prior_num,
-            prior_denom: 1.0,
-            target_border_idx: 0,
-            border: 0.0,
-            shift: 0.0,
-            scale: 1.0,
+        .map(|c| {
+            // Per-candidate routing (E10): no hard-coded Borders head, and the
+            // simple/combination prior lists are kept distinct.
+            let (ctr_type, prior_num) = ctr_config_for(
+                simple_ctr,
+                simple_priors,
+                combinations_ctr,
+                combinations_priors,
+                c.is_simple,
+            );
+            CtrSplitSpec {
+                projection: c.projection.clone(),
+                ctr_type: ctr_type.as_i8(),
+                prior_num,
+                // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
+                prior_denom: 1.0,
+                // W3 (E16) expands this; W2 keeps the single border index.
+                target_border_idx: 0,
+                border: 0.0,
+                shift: 0.0,
+                scale: 1.0,
+            }
         })
         .collect()
 }
@@ -3185,12 +3224,16 @@ fn train_inner<R: Runtime>(
     // `target_class[i] = usize::from(target[i] > 0.5)`.
     let target_class: Vec<usize> = target.iter().map(|&t| usize::from(t > 0.5)).collect();
 
-    // The combination/simple CTR prior PAIR (numerator + unit denominator). The
-    // head prior of the explicit `combinations_ctr_priors` (`0.5` for the in-scope
-    // `Borders:Prior=0.5` fixture); the denominator is `1` (RESEARCH A6) — both
-    // halves are carried so the Plan 05-12 bake receives the denominator for
-    // `calc_normalization`, never a pre-divided scalar.
-    let ctr_prior_num = params.combinations_ctr_priors.first().copied().unwrap_or(0.5);
+    // The CTR prior DENOMINATOR. It is the constant `1` on the CPU path
+    // (RESEARCH A6; a non-unit denominator is forbidden by `ctr_helper.cpp:50`),
+    // and it is carried as a separate half so the Plan 05-12 bake receives the
+    // denominator for `calc_normalization` rather than a pre-divided scalar.
+    //
+    // There is deliberately NO shared prior NUMERATOR here any more (E10 /
+    // SPEC-CTRT-10): the numerator is resolved PER CANDIDATE by `ctr_config_for`,
+    // because `simple_ctr_priors` and `combinations_ctr_priors` are distinct
+    // lists. A single hoisted `combinations_ctr_priors.first()` is exactly the
+    // bug that made the combination prior govern simple candidates.
     let ctr_prior_denom = 1.0;
     let ctr_border_count = ctr_border_count_default();
 
@@ -3272,18 +3315,27 @@ fn train_inner<R: Runtime>(
                     .unwrap_or_else(|| (0..n as i32).collect())
             };
             let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for proj in &absolute_projections {
+            for (ci, proj) in absolute_projections.iter().enumerate() {
+                // `absolute_projections` is index-aligned with `ctr_candidates`,
+                // so `is_simple` is available without a second lookup.
+                let is_simple = ctr_candidates.get(ci).is_some_and(|c| c.is_simple);
+                let (ctr_type, prior_num) = ctr_config_for(
+                    params.simple_ctr,
+                    &params.simple_ctr_priors,
+                    params.combinations_ctr,
+                    &params.combinations_ctr_priors,
+                    is_simple,
+                );
                 let col = crate::ctr::materialize_ctr_feature(
                     cat_columns,
                     proj,
                     &perm,
                     &target_class,
-                    ctr_prior_num,
+                    prior_num,
                     ctr_prior_denom,
                     ctr_border_count,
-                    // E09: behavior-preserving constants. Per-candidate type and
-                    // prior resolution is E10's, not this task's.
-                    crate::ctr::ECtrType::Borders,
+                    ctr_type,
+                    // W3 (E16) expands the border index.
                     0,
                 )?;
                 cols.push(col);
@@ -3312,16 +3364,23 @@ fn train_inner<R: Runtime>(
     let averaging_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
         if let Some(avg_perm) = cat_averaging_permutation.as_deref() {
             let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for proj in &absolute_projections {
+            for (ci, proj) in absolute_projections.iter().enumerate() {
+                let is_simple = ctr_candidates.get(ci).is_some_and(|c| c.is_simple);
+                let (ctr_type, prior_num) = ctr_config_for(
+                    params.simple_ctr,
+                    &params.simple_ctr_priors,
+                    params.combinations_ctr,
+                    &params.combinations_ctr_priors,
+                    is_simple,
+                );
                 let col = crate::ctr::materialize_ctr_feature(
                     cat_columns,
                     proj,
                     avg_perm,
                     &target_class,
-                    ctr_prior_num, ctr_prior_denom,
+                    prior_num, ctr_prior_denom,
                     ctr_border_count,
-                    // E09: behavior-preserving constants (E10 makes them per-candidate).
-                    crate::ctr::ECtrType::Borders,
+                    ctr_type,
                     0,
                 )?;
                 cols.push(col);
@@ -5360,7 +5419,13 @@ fn train_inner<R: Runtime>(
         let ctr_splits = if has_ctr {
             grown.ctr_splits.clone()
         } else {
-            ctr_splits_for_tree(&ctr_candidates, &params.combinations_ctr_priors)
+            ctr_splits_for_tree(
+                &ctr_candidates,
+                params.simple_ctr,
+                &params.simple_ctr_priors,
+                params.combinations_ctr,
+                &params.combinations_ctr_priors,
+            )
         };
 
         // FEAT-06 / D-6.6-04: a non-symmetric leaf-wise tree (Lossguide / Depthwise)
@@ -5487,14 +5552,23 @@ fn train_inner<R: Runtime>(
             for spec in &tree.ctr_splits {
                 if !seen.iter().any(|p| p == &spec.projection) {
                     seen.push(spec.projection.clone());
+                    // E10: bake with the CHOSEN split's own routed prior, not the
+                    // global combinations prior. This site is load-bearing because
+                    // the (Shift, Scale, prior) pair is COPIED BACK onto every
+                    // matching spec below — baking with the wrong prior would
+                    // overwrite the correctly-routed value and silently undo
+                    // SPEC-CTRT-10. At the default config both prior lists are
+                    // [0.5], so this is byte-identical to the previous behavior.
+                    // (The per-type `ctr_type` argument arrives in E11, which owns
+                    // `bake_ctr_table`'s signature.)
                     let table = bake_ctr_table(
                         cat_columns,
                         &spec.projection,
                         &target_class,
                         2, // binclf target-class count
                         ctr_border_count,
-                        ctr_prior_num,
-                        ctr_prior_denom,
+                        spec.prior_num,
+                        spec.prior_denom,
                     )?;
                     baked.tables.push(table);
                 }

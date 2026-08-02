@@ -517,7 +517,16 @@ fn ctr_splits_for_tree_emits_one_spec_per_candidate_with_the_head_prior() {
         },
     ];
 
-    let specs = super::ctr_splits_for_tree(&cands, &[0.25, 0.75]);
+    // E10: routing now reads BOTH pairs. At the default config (Borders on both
+    // sides, same priors) the output is unchanged — this is the D-04 no-op proof
+    // and it re-asserts E03's frozen expectations verbatim.
+    let specs = super::ctr_splits_for_tree(
+        &cands,
+        crate::ctr::ECtrType::Borders,
+        &[0.25, 0.75],
+        crate::ctr::ECtrType::Borders,
+        &[0.25, 0.75],
+    );
 
     assert_eq!(specs.len(), 2, "one spec per candidate, in candidate order");
 
@@ -561,7 +570,13 @@ fn ctr_splits_for_tree_empty_priors_defaults_to_half() {
     ];
 
     // Pins the `priors.first().copied().unwrap_or(0.5)` fallback.
-    let specs = super::ctr_splits_for_tree(&cands, &[]);
+    let specs = super::ctr_splits_for_tree(
+        &cands,
+        crate::ctr::ECtrType::Borders,
+        &[],
+        crate::ctr::ECtrType::Borders,
+        &[],
+    );
 
     assert_eq!(specs.len(), 2);
     for (i, spec) in specs.iter().enumerate() {
@@ -708,4 +723,105 @@ fn cpu_illegal_ctr_types_are_typed_unsupported_before_training() {
         result.is_ok(),
         "a CPU-legal CTR type must be unaffected, got {result:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E10 / SPEC-CTRT-09, SPEC-CTRT-10 — ctr_type and prior selection follow
+// `is_simple`.
+//
+// Two bugs are closed here:
+//   1. ctr_splits_for_tree hard-coded ECtrType::Borders regardless of config;
+//   2. the COMBINATION prior governed SIMPLE candidates too (a single
+//      `combinations_ctr_priors.first()` fed every materialization site).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctr_splits_for_tree_routes_type_and_prior_by_is_simple() {
+    use crate::ctr::ECtrType;
+
+    let cands = vec![
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0]),
+            is_simple: true,
+        },
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0, 1]),
+            is_simple: false,
+        },
+    ];
+
+    // Deliberately DIFFERENT on both axes so a single-source implementation
+    // (one type, or one prior, for both candidates) cannot pass.
+    let specs = super::ctr_splits_for_tree(
+        &cands,
+        ECtrType::Counter,
+        &[0.25],
+        ECtrType::Buckets,
+        &[0.75],
+    );
+
+    assert_eq!(specs.len(), 2);
+
+    // The SIMPLE candidate takes the simple pair.
+    assert_eq!(
+        specs[0].ctr_type,
+        ECtrType::Counter.as_i8(),
+        "a simple candidate must take simple_ctr"
+    );
+    assert_eq!(
+        specs[0].prior_num, 0.25,
+        "a simple candidate must take simple_ctr_priors, NOT combinations_ctr_priors"
+    );
+
+    // The COMBINATION candidate takes the combination pair.
+    assert_eq!(
+        specs[1].ctr_type,
+        ECtrType::Buckets.as_i8(),
+        "a combination candidate must take combinations_ctr"
+    );
+    assert_eq!(specs[1].prior_num, 0.75);
+
+    // Still one prior per candidate and border index 0 — expansion is W3.
+    for spec in &specs {
+        assert_eq!(spec.prior_denom, 1.0, "CPU forbids a non-unit denominator");
+        assert_eq!(spec.target_border_idx, 0, "target_border_idx expansion is W3");
+    }
+}
+
+#[test]
+fn ctr_splits_for_tree_defaults_are_byte_identical_to_the_e03_characterization() {
+    use crate::ctr::ECtrType;
+
+    let cands = vec![
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0]),
+            is_simple: true,
+        },
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0, 1]),
+            is_simple: false,
+        },
+    ];
+
+    // The DEFAULT config: Borders on both sides, identical priors. Every spec
+    // must match E03's frozen pre-routing expectations exactly — the D-04 no-op
+    // proof that keeps the 11 CTR oracles green.
+    let specs = super::ctr_splits_for_tree(
+        &cands,
+        ECtrType::Borders,
+        &[0.25, 0.75],
+        ECtrType::Borders,
+        &[0.25, 0.75],
+    );
+
+    assert_eq!(specs.len(), 2);
+    for (i, spec) in specs.iter().enumerate() {
+        assert_eq!(spec.ctr_type, ECtrType::Borders.as_i8(), "spec {i}");
+        assert_eq!(spec.prior_num, 0.25, "spec {i}: head prior only");
+        assert_eq!(spec.prior_denom, 1.0, "spec {i}");
+        assert_eq!(spec.target_border_idx, 0, "spec {i}");
+        assert_eq!(spec.border, 0.0, "spec {i}");
+        assert_eq!(spec.shift, 0.0, "spec {i}");
+        assert_eq!(spec.scale, 1.0, "spec {i}");
+    }
 }
