@@ -3163,10 +3163,14 @@ fn train_inner<R: Runtime>(
     // now CARRYING the initial learn-set shuffle `S` in the averaging order (ORD-01
     // / bar (c), plan 05-19):
     //   * `cat_learn_permutation` — the STRUCTURE-search fold = the lone learning
-    //     `Folds[0]`, the IDENTITY (`shuffle = foldIdx != 0`,
-    //     `learn_context.cpp:524`). The structure-search CTR column is materialized
-    //     under this permutation. (Per-iteration structure-fold cycling
-    //     `[0,2,0,2,2]` is Task 4; T3 keeps the fixed identity Folds[0].)
+    //     `Folds[0]` (`shuffle = foldIdx != 0`, `learn_context.cpp:526-529`).
+    //     Upstream builds the folds on the ALREADY-S-SHUFFLED learn data
+    //     (`ShuffleLearnDataIfNeeded` runs first), so Folds[0]'s "identity" is
+    //     identity over shuffled data — `S` itself in ORIGINAL-object order.
+    //     BUG-SFS was materializing this fold under the raw identity instead
+    //     (`ctr_structure_fold_shuffle_test` pins the corrected borders). The
+    //     actual per-fold permutations are built at `structure_fold_columns`
+    //     below; this Option is the has-CTR presence gate.
     //   * `cat_averaging_permutation` — the AveragingFold's original-object CTR
     //     order `Q = [S[p] for p in P_avg]`
     //     ([`crate::averaging_ctr_permutation`]), where `S` is the initial
@@ -3202,8 +3206,15 @@ fn train_inner<R: Runtime>(
         } else {
             let learning_folds =
                 crate::learning_fold_count(params.permutation_count, /* needed = */ true);
-            // STRUCTURE: identity Folds[0] (the structure-search fold).
-            let learn: Vec<i32> = (0..n as i32).collect();
+            // STRUCTURE: the fold-0 order in ORIGINAL-object coordinates — `S`
+            // when the learn set is shuffled (BUG-SFS), identity when time-ordered.
+            // The materialization below rebuilds the per-fold permutations itself;
+            // this value's role is the has-CTR presence gate (`.is_some()`).
+            let learn: Vec<i32> = if need_shuffle {
+                crate::create_shuffled_indices(n, params.random_seed)
+            } else {
+                (0..n as i32).collect()
+            };
             // LEAF VALUES: the averaging-fold original-object CTR order.
             // `need_shuffle` (the normal cat path) ⇒ `Q = S ∘ P_avg` carries the
             // initial learn-set shuffle. The (time-ordered) `!need_shuffle` fallback
@@ -3298,10 +3309,14 @@ fn train_inner<R: Runtime>(
         };
         let mut per_fold = Vec::with_capacity(learning_folds_for_cycle);
         for fold in 0..learning_folds_for_cycle {
-            // fold 0: identity (unshuffled structure data, the lone Folds[0]).
+            // fold 0: identity over the S-SHUFFLED data (`shuffle = foldIdx != 0`,
+            // learn_context.cpp:526-529, on the ShuffleLearnDataIfNeeded output)
+            // ⇒ ORIGINAL-object order = S itself.
             // fold j>0: original-object order = [S[p] for p in stream[j]].
-            let perm: Vec<i32> = if fold == 0 || !need_shuffle {
+            let perm: Vec<i32> = if !need_shuffle {
                 (0..n as i32).collect()
+            } else if fold == 0 {
+                s.clone()
             } else {
                 stream
                     .get(fold)

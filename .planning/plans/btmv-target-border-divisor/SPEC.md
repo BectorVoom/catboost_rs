@@ -1,7 +1,8 @@
 ---
 title: BinarizedTargetMeanValue Sum is halved — bake passes the wrong target_border_count
-status: complete-with-recorded-residual
+status: complete
 completion_record: .planning/plans/btmv-target-border-divisor/COMPLETION.md
+residual_resolution: BUG-SFS (structure fold shuffle) — fixed and gated, see §5 A-BTMV-1 and §9
 format: markdown
 spec_version: 1
 updated_at: 2026-08-02T00:00:00Z
@@ -214,14 +215,15 @@ path. This asymmetry must be verified, not assumed — see SPEC-BTMV-03.
 ## 5. Acceptance scenarios
 
 - **A-BTMV-1:** E13's `ctr_btmv_simple` gate passes at ≤1e-5 (currently
-  `1.283e-1`). — ❌ **NOT MET; recorded residual.** The fix worked and the failure
-  MODE changed (the `predictions are constant` guard no longer fires, so the model
-  no longer collapses to one leaf), but a **second, independent** divergence sits
-  downstream of the baked table: `StageDiverged { stage: Predictions, index: 0,
-  expected: 0.08766370996535935, actual: 0.049457048547128145 }`,
-  `max |diff| = 1.371e-1`. It is **not** this defect — A-BTMV-2 proves the table
-  itself is now byte-correct against upstream. Specced separately; not chased.
-  Nothing was weakened, no fixture touched, nothing regenerated.
+  `1.283e-1`). — ✅ **MET (two defects deep).** The divisor fix alone left a
+  second, independent divergence (`StageDiverged`, `max |diff| = 1.371e-1` —
+  recorded at B03 close-out as NOT this defect, with A-BTMV-2 proving the table
+  byte-correct). That residual was then localized and fixed as **BUG-SFS**
+  (§9): the STRUCTURE-search CTR column was materialized under the raw
+  identity permutation instead of the learn-set shuffle `S`. With both fixes
+  in, `ctr_btmv_simple_oracle_test` is **4/4 green** and the `predictions are
+  constant` guard is retired by an exact structure match. Nothing was weakened,
+  no fixture touched, nothing regenerated.
 - **A-BTMV-2:** the baked BTMV table matches upstream bucket-for-bucket. — ✅ **MET**
   (`ctr_btmv_bake_upstream_table_test`, exact `==` on every `(hash, Sum, Count)`).
 - **A-BTMV-3:** all 11 CTR oracles + 3 one-hot targets stay green. — ✅ **MET**,
@@ -300,3 +302,92 @@ travels with the code.
 - Sibling defect: BUG-CTRB (`.planning/plans/ctr-split-border-space/`), also a
   latent defect exposed by a newly-added per-type gate.
 - `[UNVERIFIED]` no Research Agent pass; planned from session evidence.
+- **Downstream defect: BUG-SFS (§9)** — the E13 residual this plan recorded at
+  close-out, localized and fixed in the follow-on session (2026-08-02).
+
+## 9. BUG-SFS — the E13 residual: structure fold materialized under identity, not S
+
+*Added at residual resolution (2026-08-02). This is the "second, independent
+defect downstream of the baked table" that B03's STOP-AND-REPORT branch
+recorded. Chain: BUG-CTRB (border space) → BUG-BTMV (bake divisor) → BUG-SFS
+(structure-fold permutation) — three latent defects, each unmasked by fixing
+the previous one.*
+
+### Symptom
+
+With the BUG-BTMV divisor fix landed, `ctr_btmv_simple_oracle_test` failed at
+`StageDiverged { index: 0, expected: 0.08766…, actual: 0.04945… }`,
+`max |diff| = 1.371e-1` — no longer constant predictions, but a genuine
+divergence, while B02 proved the baked table byte-exact against upstream.
+
+### Localization (measured, not inferred)
+
+- Our persisted CTR split borders were `{6.999999046325684, 12.999999046325684}`
+  (bins 6, 12); upstream's committed `model.json` carries
+  `{7.999999046325684, 10.999999046325684}` (bins 7, 10) in **all 5 trees**.
+  Bin 12 was degenerate at apply time — no bucket's CTR value exceeds it — so
+  one leaf stayed permanently empty (upstream `leaf_weights = [14, 0, 8, 8]`).
+- Upstream's first-split partition is 14/16. Our structure CTR column under the
+  **identity** permutation splits 15/15 at every candidate — it *cannot*
+  produce 14/16. Under the learn-set shuffle `S` it produces exactly 14/16.
+
+### Root cause
+
+Upstream physically shuffles the learn set when CTRs are present and
+`has_time = false` (`NeedShuffle`, `preprocess.cpp:161`;
+`ShuffleLearnDataIfNeeded`, `preprocess.cpp:183`), **then** builds the folds.
+`Folds[0]` is created with `shuffle = foldIdx != 0`
+(`learn_context.cpp:526-529`) — identity **over the S-shuffled data** — so in
+original-object coordinates the structure fold's online-prefix order is `S`
+itself. `[VERIFIED: UPSTREAM v1.2.10 learn_context.cpp:480-600, fetched and
+read]`
+
+cb-train's `structure_fold_columns` (boosting.rs) materialized fold 0 under the
+**raw identity**, while folds `j > 0` and the averaging fold correctly composed
+`S` (`S ∘ stream[j]`, `Q = S ∘ P_avg` — plan 05-19). The in-code comment even
+stated the correct rule ("ORIGINAL order = S itself") before concluding the
+opposite. The structure search and the leaf-value estimation therefore
+disagreed about the CTR feature space.
+
+### Why every existing oracle missed it
+
+The 11 CTR oracles and both e2e fixtures pass under **both** identity and `S`:
+their structure choices are permutation-robust (the argmax does not sit on a
+near-tie), and leaf values always come from the (correctly S-composed)
+averaging fold. The 30-row BTMV fixture is the first whose chosen structure
+actually differs between the two orders. Counter is permutation-invariant
+entirely. Stage-level oracles drive `materialize_ctr_feature` with explicit
+permutations and cannot see the driver's choice.
+
+### The fix (one expression + the gate value)
+
+`crates/cb-train/src/boosting.rs`, `structure_fold_columns` fold-0 branch:
+identity → `s.clone()` when `need_shuffle` (the `!need_shuffle` / `has_time`
+branch keeps the raw identity, which is upstream-correct there). The
+`cat_learn_permutation` presence-gate value was aligned to the same rule and
+the two misleading comments corrected.
+
+### Gates
+
+- `crates/cb-train/tests/ctr_structure_fold_shuffle_test.rs` (NEW):
+  - `btmv_structure_ctr_borders_match_upstreams_committed_splits` — pins the
+    persisted borders of **all 5 trees** to upstream's committed pair, plus the
+    projection (`[1]`) and CTR type. STRUCTURE-level, sharper than the ≤1e-5
+    prediction gate.
+  - `has_time_disables_the_structure_fold_shuffle` — characterizes the
+    `!need_shuffle` branch (raw identity is correct for a time-ordered set).
+- **Mutation M-SFS** (fold-0 → identity, the original defect), all outcomes
+  observed: the border gate fails naming `[6.99…, 12.99…]` vs
+  `[7.99…, 10.99…]`; E13 regresses to the byte-identical original residual
+  (`max |diff| = 1.371207585124875e-1`); the `has_time` characterization stays
+  green. Reverted manually.
+- Full regression: 11 CTR oracles, 3 one-hot targets, Counter gate, BUG-CTRB
+  gates, cb-model suite — **all green, zero diff**; cb-train sweep shows only
+  the pre-existing monotone failure; clippy clean.
+
+### Scope note
+
+`has_time = true` cat-CTR runs have no committed oracle fixture; the
+characterization test asserts behavior (raw identity, training succeeds), not
+upstream parity. A time-ordered CTR fixture is future work if that path needs
+a parity bar.

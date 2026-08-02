@@ -1,7 +1,8 @@
 ---
 title: Completion record — BUG-BTMV (BTMV target-border divisor)
 plan_id: BUG-BTMV
-status: complete-with-recorded-residual
+status: complete
+residual_resolution: BUG-SFS — fixed and gated same-day; see §6 and SPEC.md §9
 format: markdown
 updated_at: 2026-08-02T00:00:00Z
 source_plan: .planning/plans/btmv-target-border-divisor/PLAN.md
@@ -220,7 +221,7 @@ No fixture was regenerated; neither `gen_fixtures.py` was invoked. No
 
 | Scenario | Result |
 |---|---|
-| **A-BTMV-1** — E13's `ctr_btmv_simple` gate at ≤1e-5 | ❌ **NOT MET — recorded residual, see below** |
+| **A-BTMV-1** — E13's `ctr_btmv_simple` gate at ≤1e-5 | ✅ **MET after BUG-SFS** (❌ at plan close-out; the residual below was then localized and fixed — see the resolution block at the end of this section) |
 | **A-BTMV-2** — baked BTMV table matches upstream bucket-for-bucket | ✅ **MET** — B02 green, exact `==` on every `(hash, Sum, Count)` |
 | **A-BTMV-3** — 11 CTR oracles + 3 one-hot targets green | ✅ **MET**, with zero diff on all eleven |
 | **A-BTMV-4** — Counter gate + BUG-CTRB gates green | ✅ **MET** |
@@ -243,6 +244,29 @@ OQ-A — *that fixing the divisor alone turns E13 green* — was flagged
 - Nothing was weakened, no fixture was touched, nothing was regenerated.
 
 **This is specced separately.** It is not a blocker for B04, B05 or B07.
+
+### RESOLUTION (same-day follow-on): BUG-SFS
+
+The residual was localized and fixed after this record was first written. Full
+write-up: **SPEC.md §9**. In one paragraph: the STRUCTURE-search CTR column was
+materialized under the raw identity permutation, but upstream builds `Folds[0]`
+on the **already-S-shuffled** learn data (`ShuffleLearnDataIfNeeded`,
+`preprocess.cpp:183`; `shuffle = foldIdx != 0`, `learn_context.cpp:526-529`), so
+the structure fold's prefix order in original-object coordinates is `S` itself.
+The averaging fold already composed `S` (plan 05-19); the two folds disagreed
+about the CTR feature space, and on this fixture the structure search chose
+bins `(6, 12)` instead of upstream's `(7, 10)` — bin 12 degenerate at apply
+time. Fix: `boosting.rs` `structure_fold_columns` fold-0 branch, identity →
+`S` under `need_shuffle`. Gate:
+`crates/cb-train/tests/ctr_structure_fold_shuffle_test.rs` pins all 5 trees'
+persisted CTR borders to upstream's committed pair; mutation M-SFS reproduced
+the original residual byte-identically (`max |diff| = 1.371207585124875e-1`)
+and was reverted. After the fix: `ctr_btmv_simple_oracle_test` **4/4**, the 11
+CTR oracles + 3 one-hot targets + Counter + BUG-CTRB gates + cb-model suite all
+green, cb-train sweep clean except the pre-existing monotone failure. Every
+existing e2e oracle passes under both permutations (their structure argmax is
+not near a tie), which is why this fixture was the first to see it. A-BTMV-1 is
+now **MET**.
 
 ## 7. SPEC resolutions recorded in SPEC.md
 
