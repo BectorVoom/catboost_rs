@@ -226,25 +226,31 @@ cargo test -p cb-model --test <target_name> -- <filter>
 # 9 in cb-train + 2 in cb-model. Every task that states "the 11 CTR oracles" as its
 # regression scope MUST run this whole block, not a subset.
 #
-# DIFF GATE — PER FILE, in three categories. THREE of the eleven are legitimately
-# edited by owning tasks; the other EIGHT are untouched by every task.
+# DIFF GATE — PER FILE, in three categories. FOUR of the eleven are legitimately
+# edited by owning tasks; the other SEVEN are untouched by every task.
 #
-#   ZERO DIFF REQUIRED (8) — `git diff --stat` over these must print NOTHING:
+#   ZERO DIFF REQUIRED (7) — `git diff --stat` over these must print NOTHING:
 #     plain_ctr_oracle_test, ordered_ctr_oracle_test, tensor_ctr_oracle_test,
-#     tensor_ctr_e2e_oracle_test, s_order_ctr_bins_oracle_test,
+#     tensor_ctr_e2e_oracle_test,
 #     multi_permutation_e2e_oracle_test, multi_permutation_fold_oracle_test,
 #     fstr_ctr_oracle_test
 #
-#   MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES (3) — signature-driven
+#   MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES (4) — signature-driven
 #   argument/field edits and ADDITIVE new test functions, nothing else:
 #     ctr_split_scoring_test      — E09 (`target_border_idx` at :41,:68 and
 #                                   `materialize_ctr_feature` args at :384,:394),
 #                                   E11 (`bake_ctr_table` args at :542,:576,:645),
 #                                   E16 (five dropped args at :99,:148,:191,:249,:305),
-#                                   E22 (all five call sites again)
+#                                   E22 (all five call sites again),
+#                                   F08 (the `cb_model::Model` literal at :518 —
+#                                   `#[non_exhaustive]` migration to the constructor)
 #     ctr_feature_materialize_test — E09, E22 (ADDITIVE test fns + widened args)
 #     ctr_data_roundtrip_test      — E11 (ADDITIVE test fns 2/4 + the compile-forced
 #                                   `build_final_ctr` arg at :101,:138,:143,:163)
+#     s_order_ctr_bins_oracle_test — E09 (`materialize_ctr_feature` args at :70 —
+#                                   7 args → 9), E22 (the same site again —
+#                                   9 args → 10, `extra_cat_columns`). Compile-forced
+#                                   by the widened signature; MECHANICAL ARITY ONLY.
 #
 #   A diff that touches an EXISTING assertion in ANY of the eleven — added,
 #   removed, weakened or reworded — is a STOP-AND-REPORT condition. Weakening or
@@ -332,7 +338,18 @@ W6  honesty + builder setters
       lane A (STRICTLY SERIAL on crates/catboost-rs/src/builder.rs):
         F01 -> F02 -> F03 -> F04 -> F05 -> F06 -> F08 -> F09
         (F08 owns cb-model/src/model.rs, not builder.rs, but it is the PRODUCER of
-         `Model::with_cat_feature_count`, which F09 CALLS — so it precedes F09.)
+         `Model::with_cat_feature_count`, which F09 CALLS — so it precedes F09.
+         F08 ALSO marks `cb_model::Model` `#[non_exhaustive]` and migrates every
+         EXTERNAL `Model { … }` literal to the new constructor/builder form — 18 in
+         crates/cb-model/tests/*.rs (integration tests are separate crates), 4 in
+         crates/catboost-rs (written `cb_model::Model {`) and 1 in
+         crates/cb-train/tests/ctr_split_scoring_test.rs; ~20-25 total, plus ~20
+         intra-crate literals in cb-model/src that need the field. The site list is
+         produced BY THE COMPILER (E0063 / E0639), never by a grep — see F08's
+         warning; this count has been got wrong four times. Mechanical, zero
+         assertion changes. F08's #[non_exhaustive] reaches NO ZERO-DIFF oracle —
+         fstr_ctr_oracle_test.rs and ctr_data_roundtrip_test.rs contain no
+         cb_model::Model struct literal.)
       lane B (parallel with lane A, disjoint files):
         F07 (crates/catboost-rs/src/lib.rs + new tests/ file)
         F19 (fixture reuse audit — read-only, no generation)
