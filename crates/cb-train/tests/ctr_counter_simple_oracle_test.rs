@@ -209,6 +209,7 @@ fn counter_column_is_permutation_invariant_end_to_end() {
             cb_train::ctr_border_count_default(),
             ty,
             0,
+            &[],
         )
         .expect("materialize must succeed")
     };
@@ -258,6 +259,7 @@ fn borders_column_is_not_permutation_invariant_on_the_same_corpus() {
             cb_train::ctr_border_count_default(),
             ECtrType::Borders,
             0,
+            &[],
         )
         .expect("materialize must succeed")
     };

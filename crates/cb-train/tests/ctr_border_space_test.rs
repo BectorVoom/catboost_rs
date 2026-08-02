@@ -85,6 +85,7 @@ fn materialize_and_grow() -> (cb_train::CtrFeatureColumn, Vec<f64>, f64, f64) {
         ctr_border_count,
         ECtrType::Borders,
         0,
+        &[],
     )
     .expect("materialize_ctr_feature must succeed");
 

@@ -393,6 +393,7 @@ fn second_materialization_differs_from_structure() {
         ctr_border_count_default(),
         cb_train::ECtrType::Borders,
         0,
+        &[],
     )
     .expect("identity materialization");
     let leaf_value = materialize_ctr_feature(
@@ -405,6 +406,7 @@ fn second_materialization_differs_from_structure() {
         ctr_border_count_default(),
         cb_train::ECtrType::Borders,
         0,
+        &[],
     )
     .expect("averaging materialization");
 
@@ -554,6 +556,8 @@ fn bake_derives_shift_zero_scale_fifteen_for_borders_prior_half() {
         PRIOR_NUM,
         PRIOR_DENOM,
         cb_train::ECtrType::Borders,
+        true,
+        &[],
     )
     .expect("bake");
 
@@ -583,6 +587,8 @@ fn apply_found_branch_uses_split_scale() {
     let table = bake_ctr_table(
         &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
         cb_train::ECtrType::Borders,
+        true,
+        &[],
     )
     .expect("bake");
     let ctr_data = cb_model::CtrData::from_baked(&cb_train::BakedCtrData {
@@ -653,6 +659,8 @@ fn bake_round_trips_to_apply_inference_value() {
     let table = bake_ctr_table(
         &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
         cb_train::ECtrType::Borders,
+        true,
+        &[],
     )
     .expect("bake");
     let shift = table.shift;

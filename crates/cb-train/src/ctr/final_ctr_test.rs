@@ -127,7 +127,7 @@ fn bake_emits_the_requested_type_and_denominator() {
 
     let (cats, tc, proj) = e11_fixture();
     let bake = |ty: ECtrType| {
-        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty).expect("bake must succeed")
+        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty, true, &[]).expect("bake must succeed")
     };
 
     // --- Borders: per-bucket [N0, N1], no counter denominator, no mean. ------
@@ -192,7 +192,7 @@ fn borders_bake_bytes_are_unchanged() {
     // must be byte-identical after the per-type reshape. This is what keeps the
     // 11 CTR oracles green.
     let (cats, tc, proj) = e11_fixture();
-    let t = bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ECtrType::Borders)
+    let t = bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ECtrType::Borders, true, &[])
         .expect("bake must succeed");
 
     assert_eq!(
@@ -231,12 +231,14 @@ fn btmv_bake_sums_class_one_documents_per_bucket() {
     let t = bake_ctr_table(
         &cats, &proj, &tc, 2, 15, 0.5, 1.0,
         ECtrType::BinarizedTargetMeanValue,
+        true,
+        &[],
     )
     .expect("bake must succeed");
 
     // THE NON-FIAT STEP: tie the mean table to the INDEPENDENTLY FROZEN Borders
     // payload rather than to a literal chosen by the author.
-    let borders = bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ECtrType::Borders)
+    let borders = bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ECtrType::Borders, true, &[])
         .expect("borders bake must succeed");
 
     for b in 0..t.mean.len() {
@@ -321,6 +323,8 @@ fn bake_target_border_divisor_is_classes_minus_one_not_the_ctr_type_helper() {
     let t = bake_ctr_table(
         &[col], &proj, &tc, 3, 15, 0.5, 1.0,
         ECtrType::BinarizedTargetMeanValue,
+        true,
+        &[],
     )
     .expect("bake must succeed");
 
@@ -346,6 +350,8 @@ fn btmv_bake_at_one_class_is_unchanged_and_does_not_error() {
     let t = bake_ctr_table(
         &[col], &proj, &tc, 1, 15, 0.5, 1.0,
         ECtrType::BinarizedTargetMeanValue,
+        true,
+        &[],
     );
 
     assert!(
@@ -391,7 +397,7 @@ fn buckets_and_counter_bake_bytes_are_unchanged() {
     // isolation has been broken — STOP AND REPORT.
     let (cats, tc, proj) = e11_fixture();
     let bake = |ty: ECtrType| {
-        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty).expect("bake must succeed")
+        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty, true, &[]).expect("bake must succeed")
     };
 
     // The same frozen triple `borders_bake_bytes_are_unchanged` pins: the hash
@@ -464,7 +470,7 @@ fn the_divisor_is_unreachable_from_every_non_mean_payload() {
     // of any other type.
     let (cats, tc, proj) = e11_fixture();
     let bake = |ty: ECtrType| {
-        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty).expect("bake must succeed")
+        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty, true, &[]).expect("bake must succeed")
     };
 
     for ty in [ECtrType::Borders, ECtrType::Buckets, ECtrType::Counter] {
@@ -492,4 +498,87 @@ fn the_divisor_is_unreachable_from_every_non_mean_payload() {
         "the mean types carry (Sum, Count) pairs INSTEAD of class counts, so \
          `int_counts` must be empty exactly for BinarizedTargetMeanValue"
     );
+}
+
+// --- counter_calc_method (E22 / SPEC-CTRT-17) -------------------------------
+//
+// The flag's SECOND effect site is the final bake (`online_ctr.cpp:945-968`):
+// under `Full`, Counter — and ONLY Counter — tallies learn + every eval
+// document into the bucket totals before the MAX denominator. The observation
+// channel is `bake_ctr_table`, which owns the accumulation.
+
+#[test]
+fn feature_freq_total_sample_count_ignores_counter_calc_method() {
+    use crate::ctr::bake::bake_ctr_table;
+    use crate::TProjection;
+
+    let learn: Vec<Vec<String>> =
+        vec![["a", "a", "b", "a", "b", "c"].iter().map(|s| (*s).to_owned()).collect()];
+    let eval_cols: Vec<Vec<String>> =
+        vec![["b", "c", "c", "c"].iter().map(|s| (*s).to_owned()).collect()];
+    let target_class = vec![1usize, 1, 0, 0, 1, 1];
+    let proj = TProjection::from_features(&[0]);
+
+    // Counter DIFFERS across the two settings (the eval docs join the tally)…
+    let counter_skip = bake_ctr_table(
+        &learn, &proj, &target_class, 2, 15, 0.5, 1.0, ECtrType::Counter, true, &[],
+    )
+    .expect("Counter SkipTest bake");
+    let counter_full = bake_ctr_table(
+        &learn, &proj, &target_class, 2, 15, 0.5, 1.0, ECtrType::Counter, false, &eval_cols,
+    )
+    .expect("Counter Full bake");
+    assert_ne!(
+        counter_skip.counter_denominator, counter_full.counter_denominator,
+        "Counter's MAX denominator must see the eval documents under Full \
+         (learn a:3/b:2/c:1 -> max 3; +eval b:1/c:3 -> a:3/b:3/c:4 -> max 4)"
+    );
+    assert_eq!(counter_skip.counter_denominator, 3);
+    assert_eq!(counter_full.counter_denominator, 4);
+
+    // …while FeatureFreq is IDENTICAL under both — the flag is Counter-only
+    // (`ctrType == ECtrType::Counter && counterCalcMethod == Full`,
+    // online_ctr.cpp:956-960): a blanket implementation fails here.
+    let freq_skip = bake_ctr_table(
+        &learn, &proj, &target_class, 2, 15, 0.5, 1.0, ECtrType::FeatureFreq, true, &[],
+    )
+    .expect("FeatureFreq SkipTest bake");
+    let freq_full = bake_ctr_table(
+        &learn, &proj, &target_class, 2, 15, 0.5, 1.0, ECtrType::FeatureFreq, false, &eval_cols,
+    )
+    .expect("FeatureFreq Full bake");
+    assert_eq!(
+        freq_skip.counter_denominator, freq_full.counter_denominator,
+        "FeatureFreq's totalSampleCount must IGNORE counter_calc_method"
+    );
+    assert_eq!(freq_skip.int_counts, freq_full.int_counts);
+}
+
+#[test]
+fn borders_and_btmv_tables_are_unchanged_by_counter_calc_method() {
+    use crate::ctr::bake::bake_ctr_table;
+    use crate::TProjection;
+
+    let learn: Vec<Vec<String>> =
+        vec![["a", "a", "b", "a", "b", "c"].iter().map(|s| (*s).to_owned()).collect()];
+    let eval_cols: Vec<Vec<String>> =
+        vec![["b", "c", "c", "c"].iter().map(|s| (*s).to_owned()).collect()];
+    let target_class = vec![1usize, 1, 0, 0, 1, 1];
+    let proj = TProjection::from_features(&[0]);
+
+    for ctr_type in [ECtrType::Borders, ECtrType::BinarizedTargetMeanValue] {
+        let skip = bake_ctr_table(
+            &learn, &proj, &target_class, 2, 15, 0.5, 1.0, ctr_type, true, &[],
+        )
+        .expect("SkipTest bake");
+        let full = bake_ctr_table(
+            &learn, &proj, &target_class, 2, 15, 0.5, 1.0, ctr_type, false, &eval_cols,
+        )
+        .expect("Full bake");
+        assert_eq!(
+            (skip.int_counts, skip.mean, skip.hashes, skip.counter_denominator),
+            (full.int_counts, full.mean, full.hashes, full.counter_denominator),
+            "{ctr_type:?} must be byte-identical under both settings — the flag is Counter-only"
+        );
+    }
 }

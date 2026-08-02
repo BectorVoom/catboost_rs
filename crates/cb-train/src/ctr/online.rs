@@ -490,9 +490,20 @@ pub fn online_class_prefix_column(
 /// yields `(vec![], 0)` — a zero denominator is returned plainly rather than
 /// producing a division by zero downstream.
 #[must_use]
-pub fn online_counter_column(bins: &[u32], bucket_count: usize) -> (Vec<i64>, i64) {
+pub fn online_counter_column(
+    bins: &[u32],
+    extra_bins: &[u32],
+    bucket_count: usize,
+) -> (Vec<i64>, i64) {
     let mut totals = vec![0i64; bucket_count];
-    for &bin in bins {
+    // `extra_bins` (E22 / SPEC-CTRT-17): the concatenated EVAL-set bins under
+    // `counter_calc_method = Full` — upstream's `CountOnlineCTRTotal` sample
+    // range spans the learn + every-test-set `hashArr` (`online_ctr.cpp:
+    // 716-729`), so eval documents join the per-bucket tally AND the MAX
+    // denominator. EMPTY under `SkipTest` — byte-identical to the learn-only
+    // behavior. The per-document OUTPUT column below is indexed by the LEARN
+    // `bins` only: eval documents never produce output rows.
+    for &bin in bins.iter().chain(extra_bins) {
         if let Some(slot) = totals.get_mut(bin as usize) {
             *slot += 1;
         }
