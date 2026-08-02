@@ -489,3 +489,223 @@ fn build_one_hot_columns_materializes_only_the_listed_columns() {
     // column that would make every one-hot split fail.
     assert!(super::build_one_hot_columns(&cat_columns, &[9]).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// E03 — characterization tests for `ctr_splits_for_tree`.
+//
+// CodeGraph reports this function as having NO covering tests, and E10 is about
+// to change it (SPEC-CTRT-09). These two tests pin TODAY'S behavior verbatim so
+// that E10's change is a visible, reviewed diff rather than a silent one. They
+// are CHARACTERIZATION tests: they assert what the code does now, not what it
+// ought to do. E10 is expected to update them deliberately.
+//
+// Falsifiability is established by the mutation check recorded in E03's
+// completion evidence (§3.1), not by an initial Red — a characterization test
+// passes on first write by construction.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctr_splits_for_tree_emits_one_spec_per_candidate_with_the_head_prior() {
+    let cands = vec![
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0]),
+            is_simple: true,
+        },
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0, 1]),
+            is_simple: false,
+        },
+    ];
+
+    let specs = super::ctr_splits_for_tree(&cands, &[0.25, 0.75]);
+
+    assert_eq!(specs.len(), 2, "one spec per candidate, in candidate order");
+
+    for (i, spec) in specs.iter().enumerate() {
+        // ONLY the head prior is used today; the tail (0.75) is dropped. E15 is
+        // the task that makes the full prior list expand into separate splits.
+        assert_eq!(
+            spec.prior_num, 0.25,
+            "spec {i}: only priors.first() is read today"
+        );
+        assert_eq!(spec.prior_denom, 1.0, "spec {i}");
+        // Every candidate is emitted as Borders today regardless of the
+        // configured type — this is exactly the inertness SPEC-CTRT-09 fixes.
+        assert_eq!(
+            spec.ctr_type,
+            crate::ctr::ECtrType::Borders.as_i8(),
+            "spec {i}: hard-coded Borders head"
+        );
+        assert_eq!(spec.target_border_idx, 0, "spec {i}");
+        assert_eq!(spec.border, 0.0, "spec {i}");
+        assert_eq!(spec.shift, 0.0, "spec {i}");
+        assert_eq!(spec.scale, 1.0, "spec {i}");
+        assert_eq!(
+            spec.projection, cands[i].projection,
+            "spec {i}: projection carried through unchanged, in order"
+        );
+    }
+}
+
+#[test]
+fn ctr_splits_for_tree_empty_priors_defaults_to_half() {
+    let cands = vec![
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0]),
+            is_simple: true,
+        },
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0, 1]),
+            is_simple: false,
+        },
+    ];
+
+    // Pins the `priors.first().copied().unwrap_or(0.5)` fallback.
+    let specs = super::ctr_splits_for_tree(&cands, &[]);
+
+    assert_eq!(specs.len(), 2);
+    for (i, spec) in specs.iter().enumerate() {
+        assert_eq!(spec.prior_num, 0.5, "spec {i}: empty-prior fallback is 0.5");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E02 — SPEC-CTRT-03 / acceptance A10: CPU-illegal CTR types are rejected with a
+// typed error BEFORE any accumulation or tree growth.
+//
+// Upstream: catboost_options.cpp:504-509
+//   CB_ENSURE(IsSupportedCtrType(CPU, ctrType),
+//             "Ctr type " << ctrType << " is not implemented on CPU yet")
+//
+// Zero behavior change today: no site anywhere in the workspace pins a
+// non-default ECtrType, and both defaults are Borders, so this guard rejects
+// nothing that currently exists.
+// ---------------------------------------------------------------------------
+
+/// A fully-explicit `BoostParams` (Pitfall-6 discipline: every field pinned, so a
+/// changed default cannot silently alter what this test exercises).
+fn e02_params(simple: crate::ctr::ECtrType, combos: crate::ctr::ECtrType) -> crate::BoostParams {
+    crate::BoostParams {
+        loss: cb_compute::Loss::Logloss,
+        iterations: 1,
+        depth: 1,
+        learning_rate: 0.1,
+        l2_leaf_reg: 3.0,
+        random_strength: 0.0,
+        boost_from_average: false,
+        leaf_method: cb_compute::LeafMethod::Gradient,
+        bootstrap_type: crate::bootstrap::EBootstrapType::No,
+        subsample: 1.0,
+        bagging_temperature: 0.0,
+        random_seed: 0,
+        od_type: crate::overfit::EOverfittingDetectorType::None,
+        od_pval: 0.0,
+        od_wait: 0,
+        use_best_model: false,
+        eval_metric: None,
+        auto_learning_rate: false,
+        one_hot_max_size: 1,
+        permutation_count: 1,
+        fold_len_multiplier: 2.0,
+        simple_ctr: simple,
+        simple_ctr_priors: crate::simple_ctr_priors_default(),
+        counter_calc_method: crate::counter_calc_method_default(),
+        boosting_type: crate::boosting_type_default(),
+        max_ctr_complexity: 1,
+        combinations_ctr: combos,
+        combinations_ctr_priors: crate::combinations_ctr_priors_default(),
+        score_function: crate::score_function_default(),
+        has_time: false,
+        feature_weights: crate::feature_weights_default(),
+        first_feature_use_penalties: crate::first_feature_use_penalties_default(),
+        per_object_feature_penalties: crate::per_object_feature_penalties_default(),
+        penalties_coefficient: crate::penalties_coefficient_default(),
+        monotone_constraints: crate::monotone_constraints_default(),
+        grow_policy: crate::grow_policy_default(),
+        max_leaves: crate::max_leaves_default(),
+        min_data_in_leaf: crate::min_data_in_leaf_default(),
+    }
+}
+
+#[test]
+fn cpu_illegal_ctr_types_are_typed_unsupported_before_training() {
+    use crate::ctr::ECtrType;
+
+    // A 4-row, 1-cat-column corpus. Small on purpose: the rejection must happen
+    // before any accumulation, so the data never actually gets trained on.
+    let cat_cols = vec![vec![
+        "a".to_owned(),
+        "b".to_owned(),
+        "a".to_owned(),
+        "b".to_owned(),
+    ]];
+    let y = vec![0.0_f64, 1.0, 0.0, 1.0];
+    let w = vec![1.0_f64; 4];
+
+    // Case 1: simple_ctr = FloatTargetMeanValue (GPU-only, restrictions.h:18-48).
+    let params = e02_params(ECtrType::FloatTargetMeanValue, ECtrType::Borders);
+    let result = crate::train_cat(
+        &cb_backend::CpuBackend,
+        &[],
+        &[],
+        &cat_cols,
+        &y,
+        &w,
+        &params,
+        None,
+    );
+    match result {
+        Err(cb_core::CbError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("FloatTargetMeanValue"),
+                "must name the type: {msg}"
+            );
+            assert!(
+                msg.contains("not implemented on CPU yet"),
+                "must mirror upstream catboost_options.cpp:504-509: {msg}"
+            );
+        }
+        other => panic!("expected CbError::Unsupported, got {other:?}"),
+    }
+
+    // Case 2: combinations_ctr = FeatureFreq — the OTHER field must be checked
+    // too, so a guard that only reads simple_ctr fails here.
+    let params = e02_params(ECtrType::Borders, ECtrType::FeatureFreq);
+    let result = crate::train_cat(
+        &cb_backend::CpuBackend,
+        &[],
+        &[],
+        &cat_cols,
+        &y,
+        &w,
+        &params,
+        None,
+    );
+    match result {
+        Err(cb_core::CbError::Unsupported(msg)) => {
+            assert!(msg.contains("FeatureFreq"), "must name the type: {msg}");
+            assert!(
+                msg.contains("not implemented on CPU yet"),
+                "must mirror upstream: {msg}"
+            );
+        }
+        other => panic!("expected CbError::Unsupported, got {other:?}"),
+    }
+
+    // Case 3 (the anti-over-rejection guard): the legal default still trains.
+    let params = e02_params(ECtrType::Borders, ECtrType::Borders);
+    let result = crate::train_cat(
+        &cb_backend::CpuBackend,
+        &[],
+        &[],
+        &cat_cols,
+        &y,
+        &w,
+        &params,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "a CPU-legal CTR type must be unaffected, got {result:?}"
+    );
+}
