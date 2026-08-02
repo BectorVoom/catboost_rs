@@ -116,6 +116,27 @@ rejection.
 - Modify: `crates/cb-model/src/ctr_data.rs`
 - Modify: `crates/cb-model/src/ctr_data_test.rs` (exists
   `[VERIFIED: LOCAL crates/cb-model/src/ctr_data_test.rs]`)
+- Modify: **`crates/cb-model/src/cbm_test.rs`** — **INVERT the existing green test**
+  `decode_ctr_parts_mean_ctr_type_is_typed_error` at
+  `crates/cb-model/src/cbm_test.rs:731-746`
+  `[VERIFIED: LOCAL, read verbatim — it builds a ONE-bucket
+  `TailECtrType::BinarizedTargetMeanValue` part whose blob is exactly
+  `7.0f32.to_le_bytes()` ++ `3i32.to_le_bytes()` (8 bytes) and ends in
+  `panic!("mean ctr_type must be Deserialize error (v1, MAJOR-2), got {other:?}")`]`.
+  That 8-byte / 1-bucket fixture is **precisely what this task's mandatory stride-8
+  probe ACCEPTS**, so after Green the test takes the success path and panics.
+  This is the **DECODE mirror** of the encode-side inversion E20 performs on
+  `ctr_data_test.rs:197-212`; the wording below is deliberately the same.
+  **Do NOT delete it.** Rename it to
+  `decode_ctr_parts_mean_ctr_type_round_trips_sum_and_count` and rewrite the body
+  to assert `Ok(data)` and then assert on the **reconstructed `mean` values** —
+  the single decoded bucket must be `(7.0f32, 3i64)` — plus
+  `assert!(!mean.is_empty())` as the anti-vacuity guard. Keep a **sibling negative
+  case** in the same file: a mean-typed part whose blob length matches **neither**
+  stride 8 nor stride 12 must still assert `Err(ModelError::Deserialize(_))`. The
+  unit coverage of the decoder's mean-typed part header must be **inverted, not
+  removed** — this is the only unit-level pin on it, at exactly the task that
+  starts interpreting those bytes. **No other test in `cbm_test.rs` may be touched.**
 - Create: `crates/cb-model/tests/ctr_mean_cbm_oracle_test.rs`
 
 **Exact verified files/symbols to touch**
@@ -211,6 +232,15 @@ rejection sites plus the JSON serde `[VERIFIED: LOCAL grep]`.
 - **EXPECTED INITIAL FAILURE:** test fn 1 —
   `Err(ModelError::Deserialize("mean/target-mean CTR unsupported (v1, MAJOR-2)"))`
   surfaced as ``called `Result::unwrap()` on an `Err` value`` in the test harness.
+- **SECOND EXPECTED FAILURE, on the OTHER side of Green (compile-clean, behavioral):**
+  once the rejection is lifted, the currently-green unit test
+  `crates/cb-model/src/cbm_test.rs:731 decode_ctr_parts_mean_ctr_type_is_typed_error`
+  fails with
+  ``mean ctr_type must be Deserialize error (v1, MAJOR-2), got Ok(CtrData { … })``
+  under `cargo test -p cb-model` (this task's stated regression scope). That is
+  **expected and correct** — its 8-byte / 1-bucket fixture is exactly what the
+  stride-8 probe accepts. The remedy is the **INVERSION** named in Files, never a
+  deletion.
 - Run: `cargo test -p cb-model --test ctr_mean_cbm_oracle_test`
 
 **Green (minimal implementation intent).** Replace the `is_mean()` rejection with a
@@ -266,6 +296,17 @@ REPORTS instead of completing); the three structural assertions (including the
 all-zero anti-vacuity guard) pass; ≤1e-5 with the recorded max-divergence; the
 malformed-blob and 12-byte-stride typed rejections; all `cb-model` targets green
 including both byte-identity baselines.
+**INVERTED-TEST ACCOUNTING (the only permitted diff to a previously-green test in
+this task).** `git diff crates/cb-model/src/cbm_test.rs` shows exactly ONE test
+function changed — `decode_ctr_parts_mean_ctr_type_is_typed_error` renamed to
+`decode_ctr_parts_mean_ctr_type_round_trips_sum_and_count` and its `match` arm
+inverted from `Err(Deserialize)` to `Ok(..)` with `mean == vec![(7.0f32, 3i64)]`
+and the `!mean.is_empty()` anti-vacuity guard — **plus** the ADDITIVE sibling
+negative case (a blob matching neither stride) and **NOTHING else**. No other test
+in the file added, removed, weakened or reworded. This is the DECODE counterpart
+of E20's encode-side inversion in `ctr_data_test.rs`; the two must be counted
+together when auditing "tests inverted by the mean-codec wave" (**two**, one per
+side).
 
 ---
 
@@ -626,6 +667,17 @@ is read from `params.counter_calc_method`, which today has **zero reads** in
   **CHANGE NO ASSERTION.** This file is **one of the eleven SPEC-CTRT-18 oracle
   targets** (PLAN.md §3.2); **weakening or deleting any assertion in it is
   FORBIDDEN.**
+- Modify: `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` — **mechanical,
+  forced by this task's further widening of `materialize_ctr_feature`.** Update the
+  ONE call site at `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70` (E09
+  already widened it from 7 to 9 arguments; E22 adds `extra_cat_columns`, passed as
+  an **empty** slice — the `SkipTest` default, byte-identical behavior), giving 10
+  arguments after this task
+  `[VERIFIED: LOCAL crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70-79]`.
+  **Mechanical arity update only. CHANGE NO ASSERTION; weakening or deleting any
+  assertion is FORBIDDEN** — this file is **one of the eleven SPEC-CTRT-18 oracle
+  targets** (PLAN.md §3.2) and sits in the **MECHANICAL EDITS ONLY** row of the
+  per-file diff gate, NOT in ZERO DIFF.
 
 **Exact verified files/symbols to touch**
 - `pub enum CounterCalcMethod { #[default] SkipTest, Full }` at
@@ -712,6 +764,10 @@ so this task changes semantics only — no second signature churn.
   `:384`, `:394` and `bake_ctr_table` at `:542`, `:576`, `:645` — as soon as the
   widened signatures land. That target does not build until the five mechanical
   argument additions in Files land; compile-forced, not behavioral.**
+  **And the same `error[E0061]: this function takes 10 arguments but 9 were
+  supplied` at `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70`. That
+  oracle target does not build until its one mechanical `extra_cat_columns`
+  argument addition lands; compile-forced, not behavioral.**
 - Run: `cargo test -p cb-train --lib ctr::online_test -- counter_calc`,
   `cargo test -p cb-train --lib ctr::final_ctr_test -- counter_calc` and
   `cargo test -p cb-train --test ctr_feature_materialize_test -- eval_only_unseen`
@@ -805,7 +861,10 @@ denominator while the output column stays learn-length**;
 `boosting.rs` call sites (`:3238`, `:3274`) thread it; every existing oracle green.
 **`git diff crates/cb-train/tests/ctr_split_scoring_test.rs` shows exactly the five
 widened call sites (`materialize_ctr_feature` `:384`, `:394`; `bake_ctr_table`
-`:542`, `:576`, `:645`) on top of the earlier tasks' edits and NOTHING else** — no
+`:542`, `:576`, `:645`) on top of the earlier tasks' edits and NOTHING else, and
+`git diff crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` shows exactly the
+ONE widened `materialize_ctr_feature` call site (`:70`) on top of E09's edit and
+NOTHING else** — no
 assertion added, removed, weakened or reworded.
 
 ---

@@ -3,202 +3,555 @@
 **Verdict:** ISSUES_FOUND
 **Goal:** Make four inert CTR params (`simple_ctr`, `simple_ctr_priors`, `combinations_ctr` TYPE, `counter_calc_method`) genuinely honored by the training engine, then route `cat_features`/CTR through the `CatBoostBuilder` facade and the Python bindings, at ≤1e-5 vs `catboost==1.2.10`.
 **Plan:** `.planning/plans/ctr-type-engine-and-facade-routing/{PLAN.md, PLAN-W2-W3.md, PLAN-W4-W5.md, PLAN-PART2.md, PLAN-COVERAGE.md}` — 48 tasks (E00–E23, F00–F23)
-**Pass:** 3 of 3 (final). Pass 1 = ISSUES_FOUND (5 CRITICAL, 5 MAJOR, 5 MINOR); pass 2 = ISSUES_FOUND (1 CRITICAL, 2 MAJOR, 6 MINOR)
+**Pass:** 5 of 5 (confirming pass, scoped to Jobs 1–3). Pass 1 = ISSUES_FOUND (5C/5M/5m); pass 2 = ISSUES_FOUND (1C/2M/6m); pass 3 = ISSUES_FOUND (1C/1M/5m); pass 4 = ISSUES_FOUND (4C/1M/5m)
 
 ---
 
 ### Summary
 
-- **All 9 pass-2 required revisions were applied, and 8 of them are VERIFIED correct against the working tree this session** (anchors re-derived by direct read + grep, not taken from the plan's own claims). The `cat_eligible_buckets` correction, the `Full` bucket-space ownership move to E22, the `find`-as-existence-gate wording, the four new edges, the 10→11 reconciliation, the `:4669` / `:5464` / `HashMap<u64,u32>` anchor fixes, the defensive-not-reachable E11 rewording and the `is_mean()` codec constraint are all present and all factually correct.
-- **Revision #1 (NEW-1, the CRITICAL) is PARTIAL, and the residue is itself a CRITICAL.** The fix enumerated **two** of the **four** compile-forced edit groups in `crates/cb-train/tests/ctr_split_scoring_test.rs`. Verified this session: that file **also** calls `materialize_ctr_feature` at `:384` and `:394` (7 args — E09 widens to 9, E22 widens again) and `bake_ctr_table` at `:542`, `:576`, `:645` (7 args — E11 widens to 8, E22 widens again). **E11 and E22 do not list the file at all**, and E09's instruction for it is "add one field initializer per literal **and nothing else**", while E16 says "if a call no longer compiles for any reason other than the dropped argument, **STOP AND REPORT**". As written, one of the eleven SPEC-CTRT-18 oracle targets cannot compile at E09, E11 or E22, with no authorized fix.
-- **A second, related MAJOR:** the new zero-diff carve-out ("**ten** of these eleven files must show `git diff --stat` printing NOTHING; `ctr_split_scoring_test.rs` is the exception") is factually false for two more of the eleven: **`crates/cb-train/tests/ctr_feature_materialize_test.rs`** is an explicit Files entry of **E09 and E22**, and **`crates/cb-model/tests/ctr_data_roundtrip_test.rs`** is an explicit Files entry of **E11**. The gate contradicts three tasks' own Files lists under both the per-task and the cumulative reading.
-- Everything else found this pass is MINOR: two unstated observation channels for assertions on `train_inner` locals, a `pub(crate)` vs `pub use` re-export inconsistency, and three "Blocks:" cells that under-list edges the edge list now carries.
-- **Locked user decisions (1)–(4) and every project constraint remain honored.** Re-checked: engine-before-facade (`E23->F00/F01/F07/F19` + Part 2's prose gate); the `.cbm` mean lift with E00's pre-change hand-constructed non-mean baseline; the scalar `simple_ctr: ECtrType` untouched with the multi-description gap documented by F00; `one_hot_train/` reused read-only with no corpus generation; source/test separation; no `unwrap`/`expect`/`panic`/indexing in production; no `--features rocm` without `--no-default-features`; `crates/cb-oracle/generator/gen_fixtures.py` never invoked; `catboost-master/` never cited as a parity reference; the accepted failing-test baseline used as a "no previously-passing target may fail" gate; the uncommitted one-hot wave never reverted and its three oracles mandatory for every `boosting.rs`/`tree.rs` task.
+- **JOB 1 — all five pass-4 fixes are VERIFIED CORRECT and, in four of five cases, over-delivered.**
+  P4-1, P4-2, P4-3, P4-5 are fully applied with the exact wording demanded. P4-4 is applied in
+  **form** (`#[non_exhaustive]` + constructor/builders per the locked decision, the
+  self-contradictory `cbm.rs`/`json.rs` prohibition deleted, the rationale recorded) — but its
+  **numbers are wrong**, see Job 2.
+- **JOB 2 — the counts were re-derived from scratch. Three of the five headline numbers are right;
+  two are wrong, and the mandated locating grep is broken in a way that reproduces the exact
+  same-name-different-type trap that caused all three prior miscounts.**
+  - `crates/cb-model/tests` = **18 literals** ✓ **plan is CORRECT** (but across **9** files, not 11).
+  - `crates/cb-train` = **1** (`ctr_split_scoring_test.rs:518`) ✓ **plan is CORRECT**.
+  - The **withdrawal of the `fstr_ctr_oracle_test.rs` STOP-AND-REPORT open item is CORRECT** ✓ — the
+    file's only `Model` occurrence is `fn loaded_model() -> CbModel {` at `:84`, a return type; the
+    model is produced by `load_cbm`. `ctr_data_roundtrip_test.rs` contains **zero** `Model` tokens.
+    **No ZERO-DIFF oracle of this plan is affected** ✓.
+  - `crates/catboost-rs` = **4**, **NOT 0** ✗ — `src/model_sum_test.rs:16`, `src/onnx_test.rs:32`,
+    `src/model_device_test.rs:25`, `:68`, all `cb_model::Model {` in a **separate crate**.
+  - **Total external migration set = 23, not 19** ✗.
+  - `crates/cb-model/src` = **21** literals (+ one `Self {`), not 17 and not "roughly 37" ✗.
+- **JOB 3 — no unowned consumer found among the three symbols whose ownership changed.** The two new
+  `pub(crate) fn`s collide with nothing and have no pre-existing caller; `Model` has no
+  pattern-match / destructuring / FRU consumer anywhere in the workspace; `decode_ctr_model_parts` /
+  `decode_ctr_blob` have no mean-rejection consumer besides the one `cbm_test.rs` test E19 now owns.
+- **Locked decisions (1)–(5) all still honored**; not reconsidered.
+- **Execution-blocking?** ONE MAJOR remains: F08 states, with a `[VERIFIED]` tag, that
+  "`crates/catboost-rs` contributes **ZERO**" and "Total external migration set: **19**", while the
+  SAME task's Files list, Rationale ("5 outside `cb-model`") and Regression scope
+  (`cargo test -p catboost-rs`) all say **4 in `catboost-rs`**. That is a self-contradiction inside
+  one task. Compounding it, the grep the task mandates ("Locate them with, **and only with**")
+  returns **none** of the five external literals and **does** return
+  `crates/cb-train/src/boosting.rs:5476` — a genuine struct literal of the **different**
+  `cb_train::Model`. Everything else remaining is MINOR/cosmetic and must not block.
 
 ---
 
-### Pass 1 disposition
+### Pass 1–4 disposition (brief)
 
-| # | Pass-1 finding | Status after pass 3 |
+| Pass | Finding | Status at pass 5 |
 |---|---|---|
-| 1 | CRITICAL-1 bake copy-back owned by no task | **VERIFIED** — E15 owns `boosting.rs:5437-5473`; copy-back re-keyed on `(projection, ctr_type)`, `spec.prior_num`/`prior_denom` assignments deleted, `shift`/`scale` derived per split; E15 test fn 3 pins distinct `prior_num` AND distinct `scale` |
-| 2 | CRITICAL-2 wrong bake de-dup key | **VERIFIED** — `(projection, ctr_type)` only; explicit `target_border_idx` prohibition in `ctr_base_key`/bake key; E11 test fn 4's `tables.len() == 1` + `== 2` complement; rationale now correctly stated as defensive (pass-2 NEW-8 applied) |
-| 3 | CRITICAL-3 E20 breaks an unlisted green test + a second doc block | **VERIFIED** — `ctr_data_test.rs:197-212` INVERT instruction; both doc blocks (`:756-758`, `# Errors` at `:801-806`) |
-| 4 | CRITICAL-4 eval-set bucket space undefined | **VERIFIED** — E22 now owns `crates/cb-train/src/ctr/ctr_feature.rs` with the explicit `extra_cat_columns` widening; E21 step 5 is specification-only (pass-2 NEW-3 applied) |
-| 5 | CRITICAL-5 inverted F09/F08 order | **VERIFIED** — `F06->F08->F09` in the edge list, the W6 lane, the W7 header and both task bodies |
-| 6 | MAJOR-6 W0 graph vs edge list | **VERIFIED** — `E01->E02`, `E03->E02`, `E13->E18` present; graph acyclic (re-derived below) |
-| 7 | MAJOR-7 `staged_predict` silently wrong on one-hot | **VERIFIED** — `ensure_scalar_oblivious` one-hot arm (F11), one-hot case in `staged_predict_facade_test` (F12), F14's "extending is required, weakening is forbidden" |
-| 8 | MAJOR-8 vacuous E12 permutation test | **VERIFIED** — assertion on the materialized column + the fn-3b Borders anti-vacuity companion |
-| 9 | MAJOR-9 600 MB `2^24` fixture | **VERIFIED** — seeded `TCtrMeanHistory` accumulator differential with the `assert_ne!` guard; SPEC §7 A2 note |
-| 10 | MAJOR-10 `target_border_idx` route under-specified | **VERIFIED** — `tree.rs:3296` reads `column.target_border_idx`, `tree.rs:3237` param and `boosting.rs:4662` literal `0` deleted (all three re-confirmed verbatim this session); the erroneous `cat_eligible_buckets` lockstep constraint is retracted (pass-2 NEW-2 applied) |
-| 11 | MINOR line numbers | **VERIFIED** (`:4662` confirmed to be the literal `0`; `:4669` the `&cat_eligible_buckets` argument) |
-| 12 | MINOR 10→11 oracle reconciliation | **VERIFIED** — `PLAN-COVERAGE.md:30` and R1 now say 11 |
-| 13 | MINOR Validation blocks vs stated scope | **VERIFIED** — E02's Validation now appends `cargo test -p cb-model --test ctr_data_roundtrip_test --test fstr_ctr_oracle_test` |
-| 14 | MINOR stale §6.1 blocker | **VERIFIED** |
-| 15 | MINOR weak F22 marker test | **VERIFIED** |
-| 16 | Extra: E19 stride probe | **VERIFIED** — 8 → 12 → STOP AND REPORT; layout `[INFERRED]` |
-| 17 | Extra: F16 `combinations_ctr = []` | **VERIFIED** — binary resolution, "leaving it undefined is forbidden" |
+| 1 | CRITICAL-1..5, MAJOR-6..10, 12 MINORs | VERIFIED at pass 3/4; not re-litigated |
+| 2 | NEW-1..NEW-9 | VERIFIED at pass 3/4; not re-litigated |
+| 3 | P3-1, P3-2 | VERIFIED at pass 4; P3-7 retracted (pass 3 was wrong) |
+| 4 | **P4-1** s_order oracle unowned + mis-gated (CRITICAL) | **FIXED — VERIFIED** |
+| 4 | **P4-2** E09 leaves `cb-train` un-buildable (CRITICAL) | **FIXED — VERIFIED** |
+| 4 | **P4-3** E19 breaks unowned `cbm_test.rs` decode test (CRITICAL) | **FIXED — VERIFIED** |
+| 4 | **P4-4** `cb_model::Model` blast radius (CRITICAL) | **FIXED IN FORM — numbers wrong (P5-1)** |
+| 4 | **P4-5** no observation channel for `train_inner` locals (MAJOR) | **FIXED — VERIFIED** |
+| 4 | P4-6 `pub(crate) fn` + `pub use` = `E0365` (MINOR) | **UNAPPLIED** — still MINOR |
+| 4 | P4-7 E22 test fn 4 denominator channel (MINOR) | **PARTLY APPLIED** (file-choice justified; channel + field-creep prohibition still absent) — MINOR |
+| 4 | P4-8 E11 `counter_calc_skip_test` `false` vs `true` (MINOR) | **UNAPPLIED** — still MINOR |
+| 4 | P4-9 third mean-rejection doc block (MINOR) | **UNAPPLIED** — MINOR/doc |
+| 4 | P4-10 three under-listed edge cells (MINOR, cosmetic) | **UNAPPLIED** — cosmetic |
 
 ---
 
-### Pass 2 disposition
+### JOB 1 — verification of the five pass-4 fixes
 
-| # | Pass-2 required revision | Status | Evidence checked this session |
+**P4-1 — VERIFIED, complete.**
+
+| Requirement | Evidence |
+|---|---|
+| owned by E09 (7→9) | `PLAN-W2-W3.md:355-367` ("mechanical, forced by the widened signature", the two new args at `:70`) |
+| owned by E22 (9→10) | `PLAN-W4-W5.md:670-680` (`extra_cat_columns`, empty slice) |
+| "CHANGE NO ASSERTION" both | `PLAN-W2-W3.md:363-367`; `PLAN-W4-W5.md:677-680` |
+| `E0061` in E09's expected-failure list | `PLAN-W2-W3.md:456-460` (item 1c, "mirror `error[E0061]`… 9 arguments but 7 were supplied") |
+| `E0061` in E22's expected-failure list | `PLAN-W4-W5.md:768` |
+| MECHANICAL group = **4**, ZERO-DIFF = **7**, in all five places | `PLAN.md:229-253` (7 / 4, `s_order` listed under MECHANICAL at `:250-253`); E15 table `PLAN-W2-W3.md:1440-1450` (row 8 = MECHANICAL); E16 table `PLAN-W2-W3.md:1733-1743` (row 8 = MECHANICAL); `PLAN-COVERAGE.md:37`; `PLAN-COVERAGE.md:105` |
+| E16 STOP-AND-REPORT exempts the new file | `PLAN-W2-W3.md:1508` names `s_order_ctr_bins_oracle_test.rs` in the exemption text |
+| E09 completion evidence names the diff | `PLAN-W2-W3.md:518-524` ("exactly four added `target_border_idx: 0` … PLUS the three widened call sites … and NOTHING else") |
+
+**P4-2 — VERIFIED, complete.** `PLAN-W2-W3.md:317-324` now reads "**E09 MUST leave `cb-train`
+compiling** … E09 makes them compile with the pre-change constants … **E10 makes them
+per-candidate**. (An earlier revision … claimed 'its two call sites in `boosting.rs` are E10's' —
+that was WRONG and is deleted…)". Files item at `:345-354` adds `boosting.rs` with the
+behavior-preserving `ECtrType::Borders` / `target_border_idx: 0` at `:3238` and `:3274` and the
+explicit "Per-candidate type/prior resolution is E10's and MUST NOT be done here". EXPECTED INITIAL
+FAILURE item **1d** (`:461-465`) carries the two production `E0061`s and states "not deferrable to
+E10". Green (`:489-495`) ends "**`cb-train` MUST compile at the end of E09**". Completion evidence
+(`:525-528`) gates `git diff crates/cb-train/src/boosting.rs` to exactly those two sites and requires
+`cargo build -p cb-train` to succeed. The `E09->E10` edge already serializes the file.
+
+**P4-3 — VERIFIED, complete.** `PLAN-W4-W5.md:119-139` adds `crates/cb-model/src/cbm_test.rs` to
+E19's Files with "**INVERT the existing green test** `decode_ctr_parts_mean_ctr_type_is_typed_error`
+at `:731-746` … **Do NOT delete it.** Rename it to
+`decode_ctr_parts_mean_ctr_type_round_trips_sum_and_count` … assert the single decoded bucket is
+`(7.0f32, 3i64)` … `assert!(!mean.is_empty())` … Keep a **sibling negative case** … neither stride 8
+nor stride 12 … **No other test in `cbm_test.rs` may be touched.**" The wording explicitly mirrors
+E20's encode-side inversion. Accounting block at `:299-302`; `PLAN-COVERAGE.md:34` (SPEC-CTRT-15)
+carries the same. Verified against the on-disk test at `crates/cb-model/src/cbm_test.rs:731-746`
+(1 bucket, 8-byte `f32`+`i32` blob — precisely what E19's stride-8 probe accepts).
+
+**P4-5 — VERIFIED, complete and stronger than demanded.** `PLAN-W2-W3.md:1336-1354` — E15 **Green
+step 0**, executed *first*, extracts two `pub(crate) fn`s in `crates/cb-train/src/boosting.rs`:
+`materialize_ctr_columns_for_perm(..) -> CbResult<Vec<CtrFeatureColumn>>` (the body of both
+`train_inner` loops at `:3237-3247` / `:3273-3282`) and
+`cat_eligible_buckets_for(cat_columns, eligible_absolute) -> Vec<Vec<u32>>` (the `:3074` build), both
+declared behavior-preserving. E15 test fn 2 (`:1278-1305`) and E16 test fn 1 (`:1587-1624`) both
+assert **through** those functions, and both carry an explicit
+"**FORBIDDEN: a test that re-derives the expansion itself** … Such a test is a **tautological
+guard**". The `cat_eligible_buckets` pin is made falsifiable exactly as demanded — same fixture,
+`cat_eligible_buckets_for(..).len() == 1` **while** `cols.len() == 2` — plus a byte-unchanged
+cross-check against the Borders configuration, and the retracted lockstep invariant is explicitly
+restated as retracted (`:1620-1624`).
+
+---
+
+### JOB 2 — independent re-derivation of the `Model` blast radius
+
+**Method.** Three distinct greps, because no single regex is sufficient: (a) bare `Model {`, (b)
+qualified `cb_model::Model {` / `crate::Model {` / `CbModel {` (the plan's own char class
+`[^a-zA-Z_:]` **excludes `:` and therefore cannot see any qualified path**), (c) `Self {` inside
+`impl Model`. Every hit was then classified by reading the line: a hit is counted **only** if it is a
+struct-literal construction of `cb_model::Model`. Excluded: `-> Model {` return types,
+`pub struct Model {`, `impl Model {`, the CoreML proto `cm::Model`
+(`crates/cb-model/src/generated/coreml_generated.rs:25`), `catboost_rs::Model`
+(`crates/catboost-rs/src/model.rs:64`) and `cb_train::Model`
+(`crates/cb-train/src/boosting.rs:905`).
+
+**Struct shape confirmed** `[CODEGRAPH crates/cb-model/src/model.rs:304-346]`:
+`#[derive(Debug, Clone, PartialEq)] pub struct Model` — 8 fields, **no `Default`**, **no
+`#[non_exhaustive]`**, **no `Serialize`/`Deserialize` derive**. Workspace-wide `..Default::default()`
+hits are **all** in `export/onnx.rs` / `export/coreml.rs` proto structs — **zero** inside a `Model`
+literal ✓ (the plan's claim is correct).
+
+#### A. `crates/cb-model/src` — **21 literals** (+ one `Self {`). Plan says 17 (parent brief) / "roughly 37" (plan text). **Both wrong.**
+
+Bare `Model {` — **17**:
+`model_sum.rs:115`, `json.rs:825`, `cbm.rs:1193`, `cbm.rs:1318` (the four production sites),
+`region_apply_test.rs:42`, `fstr_test.rs:21`, `gpu_apply_test.rs:22`,
+`partial_dependence_test.rs:36`, `:123`, `:164`, `model_sum_test.rs:17`, `:73`,
+`export/coreml_test.rs:25`, `staged_predict_test.rs:37`, `:52`, `export/onnx_test.rs:23`,
+`apply_one_hot_test.rs:25`.
+
+Qualified `crate::Model {` — **4**, **invisible to the plan's grep**:
+`cbm_test.rs:322`, `:879`, `:900`, `:1030`.
+
+Plus `Self {` at `model.rs:515` inside `from_trained` — the plan handles this one by name
+(Green step 3), so it is not a gap.
+
+*Where the plan's "roughly 37" comes from:* the plan's grep
+`grep -rnE '(^|[^a-zA-Z_:])Model *\{$' crates/cb-model/src` returns **37 lines**, of which **20 are
+not literals** (16 `-> Model {` return types, `pub struct Model {` ×2, `impl Model {`, and the CoreML
+proto struct). 37 − 20 = 17; the plan then says "37 literals **plus** the production sites
+`json.rs`, `cbm.rs` (×2), `model_sum.rs`", double-counting four sites that are already inside the 37.
+**Non-blocking**: the plan says "do NOT trust a hard-coded line list", every intra-crate site is
+compile-forced by `error[E0063]`, and the four `crate::Model {` sites the grep misses will still
+break the build and be fixed. MINOR.
+
+#### B. `crates/cb-model/tests` — **18 literals**. **Plan is CORRECT.** Across **9** files, not 11.
+
+`apply_oracle_test.rs:66`, `:110`; `cbm_oracle_test.rs:78`, `:94`;
+`advanced_fstr_oracle_test.rs:78`; `class_params_roundtrip_test.rs:25`, `:47`;
+`predict_oracle_test.rs:59`; `json_oracle_test.rs:53`, `:206`;
+`predict_raw_multi_test.rs:33`, `:73`, `:99`, `:141`;
+`shap_oracle_test.rs:72`, `:162`, `:243`; `fstr_oracle_test.rs:70`.
+
+The plan's grep returns 35 lines (18 literals + 17 `-> Model {` return types); its per-file
+breakdown ("advanced_fstr 3, apply 3, cbm 4, class_params 4, fstr 4, json 3,
+partial_dependence_oracle 1, predict 2, predict_raw_multi 5, shap 5, staged_predict_oracle 1") sums
+to **35**, i.e. it is the raw line count, not the literal count — even though the headline **18** is
+right. `partial_dependence_oracle_test.rs:35` and `staged_predict_oracle_test.rs:38` are
+`-> Model { load_cbm(..) }` and contain **no literal at all**, so the correct file count is **9**.
+MINOR.
+
+#### C. `crates/cb-train` — **1**. **Plan is CORRECT.**
+`crates/cb-train/tests/ctr_split_scoring_test.rs:518` (`cb_model::Model {`, read verbatim; `:501` is
+the `-> cb_model::Model {` return type). `crates/cb-train/src/boosting.rs:5476` is a literal of
+`cb_train::Model` — a **different type** — and must **not** be touched.
+
+#### D. `crates/catboost-rs` — **4**, NOT 0. **Plan's headline is WRONG.**
+```
+crates/catboost-rs/src/model_sum_test.rs:16     cb_model::Model {
+crates/catboost-rs/src/onnx_test.rs:32          cb_model::Model {
+crates/catboost-rs/src/model_device_test.rs:25  cb_model::Model {
+crates/catboost-rs/src/model_device_test.rs:68  cb_model::Model {
+```
+All four are `#[cfg(test)] mod`-mounted inside `crates/catboost-rs/src` — a **separate crate** from
+`cb-model`, so `#[non_exhaustive]` forbids the literal syntax at every one of them.
+`crates/catboost-rs/src/model.rs:65` holds `inner: cb_model::Model` as a **field**, not a literal —
+unaffected. The remaining `-> Model {` hits in `crates/catboost-rs/tests/*` are `catboost_rs::Model`
+return types — correctly excluded.
+
+#### E. All other crates — **0**.
+`catboost-rs-py`, `cb-oracle`, `cb-data`, `cb-compute`, `cb-core`: no `cb_model::Model` literal.
+`cb-backend`'s `FlatModel` / `GrownModel` are unrelated types.
+
+#### Totals
+
+| Group | Independently derived | Plan asserts | Verdict |
 |---|---|---|---|
-| **NEW-1** | CRITICAL — own the compile-forced edits in `ctr_split_scoring_test.rs` / `tree_test.rs`; carve the zero-diff gate | **PARTIAL** | E09 Files now name `tree_test.rs:374,:662` and `ctr_split_scoring_test.rs:41,:68` with "CHANGE NO ASSERTION" ✓ (literals confirmed at exactly those lines); E09's EXPECTED INITIAL FAILURE names both `E0061` and `E0063` ✓; E16 Files name the five `greedy_tensor_search_oblivious_with_ctr` sites `:99,:148,:191,:249,:305` ✓ (confirmed); E15/E16 carve the gate to TEN files ✓. **BUT** the enumeration misses `materialize_ctr_feature` at `:384,:394` (E09, E22) and `bake_ctr_table` at `:542,:576,:645` (E11, E22), and misses two more of the eleven files entirely — see **P3-1** and **P3-2** |
-| **NEW-2** | MAJOR — replace the `cat_eligible_buckets` lockstep constraint | **VERIFIED** | E15 (`PLAN-W2-W3.md:1120-1128`), E16 (`:1358-1367`, `:1468-1475`) and R11 all carry the per-eligible-cat-feature / `.max()` / MUST-NOT-grow statement; the `assert_eq!(cat_eligible_buckets.len(), ctr_features.len())` is deleted and explicitly retracted (`:1406-1410`); R11 scoped to `structure_fold_columns` + `averaging_ctr_features` ✓. Code re-confirmed: built at `boosting.rs:3074` from `eligible_absolute`, passed at `:4669`, consumed by `.max()` at `tree.rs:3026` |
-| **NEW-3** | MAJOR — give the `Full` remap an owner and a reachable test | **VERIFIED** (one MINOR residue, P3-4) | E22 Files include `crates/cb-train/src/ctr/ctr_feature.rs` with Green step 0: `extra_cat_columns: &[Vec<String>]`, folded into the `HashMap<u64,u32>` remap **after** the learn documents, output indexed by the learn slice, threaded from `boosting.rs:3238` and `:3274` (both confirmed as the only two production call sites); test fn 4 moved to `crates/cb-train/tests/ctr_feature_materialize_test.rs` with the Run/Validation commands pointing there; E21 step 5 marked "a SPECIFICATION, consumed by E22 … produces NO code in E21" ✓ |
-| **NEW-4** | MINOR — state the `find`'s post-fix role | **VERIFIED** | E15 Green 2(a) `PLAN-W2-W3.md:1216-1229`: the `find` "SURVIVES, purely as an existence gate", written as `.any(...)`, with `BakedCtrTable.{shift,scale,prior_num,prior_denom}` recorded informational-only and "MUST stay" |
-| **NEW-5** | MINOR — four missing edges | **VERIFIED** | `PLAN.md:352` `E23->F01 E23->F07 E23->F19`; `:359` `F14->F20`. Graph re-derived: still acyclic |
-| **NEW-6** | MINOR — 10→11 and E02's Validation | **VERIFIED** | `PLAN-COVERAGE.md:30` "all 11 single-prior oracles unchanged"; R1 "all 11 single-prior oracles"; `PLAN.md:699` adds the two cb-model targets |
-| **NEW-7** | MINOR — anchor corrections | **VERIFIED** | `:4668`/`:4670` → `:4669` everywhere; `find(...)` cited at `:5464` (confirmed: `:5459` is `for tree in &mut trees {`); "first-seen `HashMap<u64,u32>` remap" everywhere, no `PerfectHash` wording survives |
-| **NEW-8** | MINOR — E11 rationale defensive, not reachable | **VERIFIED** | E11 Green step 5 and R12 both say "the multi-type case is not reachable today"; test fn 4 kept as the pin |
-| **NEW-9** | MINOR (codec) — key on `ctr_type.is_mean()` | **VERIFIED** | E19 Refactor constraint `PLAN-W4-W5.md:233-242` and E20 `:398-408`, both mandatory, both naming the `FloatTargetMeanValue` test / `BinarizedTargetMeanValue` fixture asymmetry |
+| `crates/cb-model/src` (intra-crate, field only) | **21** (+ `Self {` at `model.rs:515`) | 17 / "roughly 37" | ✗ MINOR (compile-forced anyway) |
+| `crates/cb-model/tests` (external, migrate) | **18** across **9** files | 18 across 11 files | **✓ count correct**, file count MINOR |
+| `crates/cb-train` (external, migrate) | **1** | 1 | **✓ correct** |
+| `crates/catboost-rs` (external, migrate) | **4** | 0 (headline) / 4 (Files, Rationale, Regression scope) | **✗ MAJOR — self-contradictory** |
+| **Total external migration set** | **23** | 19 | **✗** |
+| `fstr_ctr_oracle_test.rs` withdrawal | **CORRECT** | withdrawn | **✓** |
+| `ctr_data_roundtrip_test.rs` | zero literals | zero | **✓** |
+
+#### The mandated locating grep is broken (this is the substantive defect)
+
+`PLAN-PART2.md:367-371` says "Locate them with, **and only with**:"
+```
+grep -rnE '(^|[^a-zA-Z_:])Model \{' crates/catboost-rs crates/cb-train
+```
+Run verbatim, that returns **10 lines**, of which:
+- **0** are `cb_model::Model` literals — the char class excludes `:`, so every `cb_model::Model {` is
+  invisible. All five true external non-`cb-model` sites are missed.
+- **1** IS a genuine struct literal — `crates/cb-train/src/boosting.rs:5476`, of the **different**
+  `cb_train::Model`. This is precisely the same-name-different-type trap that caused all three prior
+  miscounts, now embedded in a mandated command.
+- the rest are `-> Model {` return types, `pub struct`, `impl`.
+
+The corrected regex the plan itself uses one paragraph earlier
+(`'(^|[^a-zA-Z_:])(cb_model::Model|CbModel) *\{'`) works, and applied to `crates/catboost-rs` it
+surfaces exactly the four sites the "ZERO" paragraph denies.
+
+#### Other F08 checks requested
+
+- **F08 no longer forbids touching `cbm.rs`/`json.rs`** ✓ — `PLAN-PART2.md:348-358`: "**REQUIRED,
+  mechanical** … **The earlier prohibition … was SELF-CONTRADICTORY and is DELETED.**" The accurate
+  replacement constraint (do not touch the FlatBuffers schema, the `.cbm` encoder's **byte output**,
+  or `json.rs`'s **serde shape**) is stated in both Files and Green, and is backed by test fn 2
+  (`adding_the_cat_feature_count_does_not_change_cbm_bytes`), which keeps E00's and
+  `float_only_byte_identity`'s frozen baselines valid.
+- **The `#[non_exhaustive]` rationale is recorded** ✓ — `PLAN-PART2.md:267-276` ("LOCKED DECISION (do
+  not re-litigate)") and `:474-480` ("permanently prevents external breakage for every future `Model`
+  field — this exact defect class … has now been found four times in this plan").
+- **`cbm_oracle_test.rs` (2 literals) / `json_oracle_test.rs` (2 literals) disposition is ADEQUATE**
+  ✓ — they are correctly identified as NOT among the eleven SPEC-CTRT-18 targets; the plan names them
+  as SPEC-OH-31 "edited by no task" files from the SHIPPED one-hot plan, requires the migration be
+  mechanical and assertion-preserving, adds them by name to F08's regression scope
+  (`PLAN-PART2.md:489-490`), adds an explicit "**A migrated site must produce a `Model`
+  field-for-field identical to the literal it replaced**" constraint (`:484-486`), and requires the
+  diff be recorded with a plain statement that no assertion changed. Given the migration is forced by
+  a locked user decision and the byte-identity guard (test fn 2) is separate and explicit, this is a
+  coherent and sufficient disposition. (The per-file counts are 2 and 2, not the plan's 4 and 3 —
+  same raw-grep inflation; MINOR.)
+- **F08's regression scope already reaches all three crates** ✓ — `PLAN-PART2.md:487-492` runs
+  `cargo test -p cb-model`, `cargo test -p catboost-rs`, and
+  `cargo test -p cb-train --test ctr_split_scoring_test`, naming catboost-rs as one of "the two other
+  crates the migration reaches". This is what makes P5-1 a MAJOR rather than a CRITICAL: the wrong
+  headline is contradicted by three other statements in the same task, and the compiler plus this
+  regression scope will surface the four sites.
 
 ---
 
-### CodeGraph / verbatim evidence (pass 3, re-derived)
+### JOB 3 — the recurring defect class, restricted to symbols whose ownership changed
 
-- `CtrFeatureColumn` — `crates/cb-train/src/ctr/ctr_feature.rs:69`; external struct literals at `crates/cb-train/src/tree_test.rs:374`, `:662`, `crates/cb-train/tests/ctr_split_scoring_test.rs:41`, `:68`. **Exactly the four E09 now owns.** ✓
-- `materialize_ctr_feature` — `crates/cb-train/src/ctr/ctr_feature.rs:124`, **7 parameters** (`cat_columns, projection, permutation, target_class, prior_num, prior_denom, ctr_border_count`); first-seen remap is the local `HashMap<u64,u32>` beginning at `:183`; `ctr_type: ECtrType::Borders.as_i8()` hard-code at `:232`; `bucket_count: remap.len()`.
-  - Callers: production `crates/cb-train/src/boosting.rs:3238`, `:3274` ✓ (exactly the two E22 threads) — **plus `crates/cb-train/tests/ctr_split_scoring_test.rs:384`, `:394` and `crates/cb-train/tests/ctr_feature_materialize_test.rs:73`, `:122`, `:189`.** Load-bearing for **P3-1**.
-- `bake_ctr_table` — `crates/cb-train/src/ctr/bake.rs:110`, 7 parameters. Test callers: **`crates/cb-train/tests/ctr_split_scoring_test.rs:542`, `:576`, `:645`** (verbatim: `bake_ctr_table(&cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM)`). Load-bearing for **P3-1**.
-- `build_final_ctr` — test callers `crates/cb-model/tests/ctr_data_roundtrip_test.rs:101,138,143,163` and `crates/cb-train/src/ctr/final_ctr_test.rs:20,29,36,44,55,56,63,72`. **Both files ARE in E11's Files list** ✓ — but `ctr_data_roundtrip_test.rs` is one of the eleven oracles, which breaks the "ten files, zero diff" claim (**P3-2**).
-- `greedy_tensor_search_oblivious_with_ctr` — `crates/cb-train/src/tree.rs:3228`; `target_border_idx: usize` at `:3237`; `CtrSplitSpec { … target_border_idx, … }` at `:3296`; production call `crates/cb-train/src/boosting.rs:4653` with the literal `0` at `:4662`; `&cat_eligible_buckets` at `:4669`; test calls at `ctr_split_scoring_test.rs:99,148,191,249,305`. **All exactly as the plan now states.** ✓
-- `cat_eligible_buckets` — `crates/cb-train/src/boosting.rs:3074`, `eligible_absolute.iter().map(|&abs_idx| … perfect_hash_bins(&as_str))`; a **local inside `train_inner` (`:2555`)**; consumed at `crates/cb-train/src/tree.rs:3026` by an order-insensitive `.max()`. The plan's constraint is correct; its **test channel** is not stated (**P3-3**).
-- `structure_fold_columns` (`boosting.rs:3201`), `materialized_ctr_features` (`:3258`), `averaging_ctr_features` (`:3270`) — **also `train_inner` locals**, not observable from `boosting_test.rs` without extracting a helper (**P3-3**).
-- The bake block — `crates/cb-train/src/boosting.rs:5437-5473`, read verbatim: `let mut baked` `:5437`; `seen` de-dup `:5440-5443`; `bake_ctr_table(…)` `:5445-5453` with `ctr_prior_num` at `:5451`; copy-back comment `:5458`; `for tree in &mut trees` `:5459`; `.find(|t| t.projection == spec.projection)` **`:5464`**; `spec.prior_num = table.prior_num;` `:5468`. **All pass-2 anchor corrections confirmed.** ✓
-- `crates/cb-train/src/lib.rs:45-52` and `crates/cb-train/src/ctr/mod.rs:138-148` re-export **`pub`** items (`online_ctr_prefix_binclf`, `materialize_ctr_feature`, …). E04/E06/E07/E08 specify `pub(crate) fn` **and** addition to those `pub use` lists — mutually exclusive (**P3-5**).
+**(a) The two new `pub(crate) fn`s in `boosting.rs` (E15 Green step 0).** No collision, no existing
+caller affected.
+- **No pre-existing caller.** Both bodies are lifted from `let` bindings **inside `train_inner`**
+  (`crates/cb-train/src/boosting.rs:2555`) — `cat_eligible_buckets` at `:3074`, the two
+  materialization loops at `:3237-3247` / `:3273-3282`. Function locals have no callers by
+  construction; after extraction the only callers are the two `train_inner` sites the same task
+  rewrites, plus the two tests. The extraction is declared behavior-preserving with the D-04
+  single-prior byte-identity proof required to still hold after step 0 alone
+  (`PLAN-W2-W3.md:1352-1354`). ✓
+- **No owned-region collision.** `boosting.rs` is claimed by E02, E09, E10, E15, E16, E21, E22 — all
+  declare **Parallelizable: NO**, so none can run concurrently. Region-wise they are disjoint or
+  strictly sequenced: E09 (`:3238`/`:3274` arity) → E10 (same sites, values) → E15 (extract those
+  loops + `:3074` + the bake block `:5437-5473`) → E16 (`:4662` + the helper body) → E21 (`EvalSet`)
+  → E22 (`counter_calc_method` + the helper). E16 explicitly says "**Do not re-inline the helper** and
+  do not add a second expansion site; `cat_eligible_buckets_for` is untouched by this task"
+  (`PLAN-W2-W3.md:1648-1650`). ✓
+- **No `E0365` risk for these two.** E15/E16's tests live in `crates/cb-train/src/boosting_test.rs`,
+  a `#[cfg(test)] mod`-mounted sibling **inside** the crate, so `pub(crate)` is visible; and unlike
+  the E04/E06/E07/E08 producers, no task orders these two into a `pub use` re-export list. ✓
+- One drift: E22's Files (`PLAN-W4-W5.md:647-648`) still says "thread the eval cat columns from
+  **BOTH** `materialize_ctr_feature` call sites" in `boosting.rs`. After E15's extraction there is
+  **one** such call site (inside `materialize_ctr_columns_for_perm`) plus two *helper* call sites.
+  Descriptive drift only — the compiler forces the correct shape. **MINOR.**
+
+**(b) `Model` + `#[non_exhaustive]` + constructor — consumers beyond the literal sites.** None.
+- **No pattern match / destructuring anywhere.** A workspace-wide search for
+  `(let|match|if let) … Model {` returns 9 hits, all of which are `let model = Model { … }`
+  *assignments* already inside the counted literal set — **zero** destructuring patterns, zero
+  `match … { Model { .. } => }`. ✓
+- **No functional-record-update consumer.** Zero `..Default::default()` / `..other` inside a `Model`
+  literal workspace-wide. ✓ (`#[non_exhaustive]`'s `E0639` would otherwise fire on FRU too.)
+- **No derived serde.** `Model` derives only `Debug, Clone, PartialEq`
+  `[CODEGRAPH crates/cb-model/src/model.rs:304]`; `json.rs` builds it by hand, so `#[non_exhaustive]`
+  cannot break a derive. ✓
+- **The facade holds it as a private field**, not a literal — `crates/catboost-rs/src/model.rs:65
+  inner: cb_model::Model`, constructed via `Model::from_canonical(inner)`
+  `[CODEGRAPH crates/catboost-rs/src/model.rs:61-88]`. Unaffected. ✓
+- F08's **test fn 3** correctly lives in an **integration** target
+  (`crates/cb-model/tests/model_constructor_test.rs`) so the `#[non_exhaustive]` decision is verified
+  from **outside** the crate, and Green step 2 requires builders for exactly the shapes the migrated
+  sites need (`with_non_symmetric_trees`, `with_region_trees`, `with_approx_dimension`,
+  `with_class_to_label`, `with_ctr_data`, `with_cat_feature_count`) with "Add **only** what a migrated
+  site actually sets". Cross-checked against the four `catboost-rs` and one `cb-train` literals: they
+  set `oblivious_trees`, `bias`, `float_feature_borders`, `ctr_data`, `approx_dimension`,
+  `class_to_label` — all covered. ✓
+
+**(c) `decode_ctr_model_parts` / `decode_ctr_blob` after E19's inversion.** No unowned consumer.
+- `[CODEGRAPH decode_ctr_model_parts (crates/cb-model/src/ctr_data.rs:531) — callers in
+  crates/cb-model/src/cbm.rs, crates/cb-model/src/lib.rs; tests: ctr_data_test.rs, cbm_test.rs]`.
+- The **only** test pinning the mean rejection is `cbm_test.rs:731-746`, now owned by E19 with the
+  INVERT instruction. Its four sibling negative tests that also call `decode_ctr_model_parts`
+  (`:695` bucket-index gap, `:712` duplicate index, `:725` blob width mismatch, `:766` duplicate
+  table key) all build **`TailECtrType::Borders` / `Counter`** parts — read verbatim — so none is
+  affected by removing the `is_mean()` guard. ✓
+- `decode_ctr_blob` (`:711`) has **exactly 1 caller** (`decode_one_ctr_value_table`) and
+  ⚠️ no covering tests `[CODEGRAPH]`; E19 adds a **sibling** decoder rather than modifying it
+  (`PLAN-W4-W5.md:153-157`), so that single caller is E19's own edit. ✓
+- The other four `is_mean()` sites are untouched by E19 and remain correct:
+  `ctr_data.rs:369` (`to_json`), `:443` (`from_json` — pinned green by
+  `ctr_data_test.rs:83 json_round_trip_mean_table`, which already passes and does not go through the
+  `.cbm` decoder), `:812` (the **encode** rejection, E20's), `:1055` (the self-describing encoder).
+  ✓ — but see P5-4 (the decode-side module doc block at `ctr_data.rs:495-505` still becomes a
+  documentation lie; P4-9, unapplied, MINOR).
 
 ---
 
 ### Issues
 
-#### [CRITICAL] P3-1 — The NEW-1 ownership fix enumerates 2 of 4 compile-forced edit groups; `ctr_split_scoring_test.rs` still cannot compile at E09, E11 and E22
+#### [MAJOR] P5-1 — F08's external blast-radius headline is self-contradictory and understates the migration by 4 sites; the mandated locating grep finds none of them and surfaces a wrong-type false positive
 
-- **Plan location:** PLAN-W2-W3.md E09 "Files" + "NOTE (both files)"; E11 "Files"; PLAN-W4-W5.md E22 "Files"; PLAN.md §3.2 carve-out; E15/E16 Completion evidence
-- **Requirement:** SPEC-CTRT-06/-07/-08/-13/-17, SPEC-CTRT-18, acceptance A7
-- **Evidence (all re-read verbatim this session):**
-  - `crates/cb-train/tests/ctr_split_scoring_test.rs:26` imports **`bake_ctr_table, greedy_tensor_search_oblivious_with_ctr, materialize_ctr_feature`**.
-  - It calls `materialize_ctr_feature` with **7 arguments** at `:384` and `:394`. **E09 widens that function to 9** (`+ ctr_type, + target_border_idx`) and **E22 widens it again** (`+ extra_cat_columns`). Neither task's instruction for this file mentions these sites; E09 says the permitted edits are "add one field initializer per literal **and nothing else**".
-  - It calls `bake_ctr_table` with **7 arguments** at `:542`, `:576`, `:645`. **E11 widens that function to 8** (`+ ctr_type`; E11's own EXPECTED INITIAL FAILURE is `E0061: takes 7 arguments but 8 were supplied`) and **E22 widens it again** (`+ counter_calc_skip_test` + the eval cat columns). **Neither E11 nor E22 lists `ctr_split_scoring_test.rs` in Files at all.**
-  - E16 additionally instructs: "If a call no longer compiles for any reason other than the dropped argument, **STOP AND REPORT** rather than adjusting the test."
-  - E09's Parallelizable note asserts "no later task re-edits them except E16's argument drop" — **false**: E11 and E22 both do.
-- **Failure scenario:** At E09 the executor adds two `target_border_idx: 0` initializers, then `cargo test -p cb-train --test ctr_split_scoring_test` fails to build with two `E0061`s at `:384`/`:394` that no instruction authorizes fixing. Same at E11 (three `E0061`s at `:542`/`:576`/`:645`, in a file E11 does not own) and again at E22. In each case the executor either stalls, or "fixes" the break by deleting the offending construction — silently removing the permutation-difference and bake assertions from a CTR regression oracle during the highest-risk waves — or edits it anyway, at which point E15/E16's completion gate ("only the mechanical field/argument edits, ZERO assertion changes … E09's two initializers and E16's five dropped arguments") is provably unsatisfiable because five further edit sites exist.
-- **Impact:** One of the eleven SPEC-CTRT-18 targets — the most CTR-split-specific one — is un-buildable through W2–W5, so the A7 firewall runs at 10/11 exactly when tie-breaks are being changed. Risk of silent coverage loss.
+- **Plan location:** `PLAN-PART2.md:287-312` (blast-radius group 1 + "Total external migration set:
+  19" + the "`crates/catboost-rs` contributes **ZERO**" paragraph); `:364-380` (the "Locate them with,
+  and only with" grep block); `:439-444` (EXPECTED INITIAL FAILURE item 3)
+- **Requirement:** SPEC-CATF-Δ4 / CATF-10; the plan's own "no previously-passing target may fail" gate
+- **Evidence:**
+  - `PLAN-PART2.md:309-312` — "**Total external migration set: 19** (18 in `cb-model/tests` + 1 in
+    `cb-train`). `crates/catboost-rs` contributes **ZERO** — its `Model` hits are `-> Model {` return
+    types of its OWN `catboost_rs::Model`, a different type `[VERIFIED: LOCAL
+    crates/catboost-rs/src/model.rs:64]`."
+  - Contradicted three ways inside the SAME task: Files `:373-375` lists the four
+    `crates/catboost-rs` sites to migrate; the Rationale `:474-476` says "**5** outside `cb-model`";
+    Regression scope `:489-491` runs `cargo test -p catboost-rs` and calls it one of "the two other
+    crates the migration reaches".
+  - Independently re-derived this session: **4** `cb_model::Model` struct literals in
+    `crates/catboost-rs/src/{model_sum_test.rs:16, onnx_test.rs:32, model_device_test.rs:25, :68}`,
+    each read verbatim, each in a crate distinct from `cb-model`. True total = **23**.
+  - The mandated grep `grep -rnE '(^|[^a-zA-Z_:])Model \{' crates/catboost-rs crates/cb-train`, run
+    verbatim, yields 10 lines: **zero** `cb_model::Model` literals (the char class excludes `:`), and
+    **one genuine literal of the wrong type** at `crates/cb-train/src/boosting.rs:5476`
+    (`cb_train::Model`).
+  - EXPECTED INITIAL FAILURE item 3 says "36 in `crates/cb-model/tests/*.rs`" where the blast-radius
+    block says 18; the true number is **18**.
+- **Failure scenario:** An executor that trusts the headline ("ZERO", "19") skips `crates/catboost-rs`
+  and reports F08 complete at 19/23; `cargo test -p catboost-rs` then fails with 4 × `error[E0639]`
+  in a crate the executor believes is out of scope. An executor that instead obeys "Locate them with,
+  **and only with**" gets a hit list containing **no** real target and **one** `cb_train::Model`
+  literal at `boosting.rs:5476`, and attempts to migrate the trainer's own model type to a
+  `Model::new(..)` that does not exist on it — a wrong edit inside E22's serialized file, in a wave
+  that runs after E22.
+- **Impact:** F08 blocks the `F08->F09->F10` producer chain (itself a pass-1 CRITICAL fix). A wrong
+  edit at `boosting.rs:5476` lands in the trainer's model assembly. The completion-evidence count
+  (19) cannot match the real diff (23), so the task's own gate is un-satisfiable as written.
 - **Required revision:**
-  1. Add to **E09's** `ctr_split_scoring_test.rs` entry: "…and add the two new arguments (`ctr_type: ECtrType::Borders`, `target_border_idx: 0`) to the `materialize_ctr_feature` calls at `:384` and `:394`, preserving today's behavior. **CHANGE NO ASSERTION.**"
-  2. Add `crates/cb-train/tests/ctr_split_scoring_test.rs` to **E11's** Files: "pass the resolved `ECtrType::Borders` to the `bake_ctr_table` calls at `:542`, `:576`, `:645`. **CHANGE NO ASSERTION.**"
-  3. Add `crates/cb-train/tests/ctr_split_scoring_test.rs` to **E22's** Files: "pass an empty `extra_cat_columns` slice at `:384`, `:394` and `counter_calc_skip_test = true` at `:542`, `:576`, `:645` — the `SkipTest` default, byte-identical behavior. **CHANGE NO ASSERTION.**"
-  4. Restate the PLAN.md §3.2 carve-out and E15/E16's completion evidence over the **complete** permitted-edit set for that file: 2 struct-literal initializers (E09), 2 `materialize_ctr_feature` argument additions (E09) + 2 more (E22), 5 dropped `greedy_tensor_search_oblivious_with_ctr` arguments (E16), 3 `bake_ctr_table` argument additions (E11) + 3 more (E22). Gate: **only** signature-driven argument/field edits, **zero** assertion changes.
-  5. Delete E09's false claim that no later task re-edits the file.
+  1. Delete the paragraph at `PLAN-PART2.md:310-312` ("`crates/catboost-rs` contributes **ZERO** …")
+     — it is false and carries a `[VERIFIED]` tag it has not earned. Replace with:
+     "`crates/catboost-rs` contributes **4** — `src/model_sum_test.rs:16`, `src/onnx_test.rs:32`,
+     `src/model_device_test.rs:25`, `:68`, all written `cb_model::Model {` and all in a crate
+     separate from `cb-model`. Its `-> Model {` hits under `tests/` are `catboost_rs::Model`
+     (`crates/catboost-rs/src/model.rs:64`), a different type, and are NOT literals."
+  2. `:309` — "Total external migration set: **19**" → "**23** (18 in `cb-model/tests` + 4 in
+     `catboost-rs` + 1 in `cb-train`)". Same in the Rationale (`:474-476` already says 5 outside
+     `cb-model` — keep it and make the two consistent) and in EXPECTED INITIAL FAILURE item 3, whose
+     "36 in `crates/cb-model/tests/*.rs`" must become **18**.
+  3. Replace the mandated grep block at `:368-371` with regexes that can see a qualified path AND
+     exclude the two same-named types, and add the explicit exclusion note:
+     ```bash
+     # external literals — MUST be migrated to Model::new(..) + builders
+     grep -rnE '(^|[^a-zA-Z_:])(cb_model::Model|CbModel|Model) *\{$' \
+          crates/catboost-rs crates/cb-train crates/cb-model/tests \
+       | grep -v -- '->'
+     ```
+     followed by: "**EXCLUDE by hand, they are DIFFERENT TYPES that merely share the name:**
+     `crates/catboost-rs/src/model.rs:64` (`catboost_rs::Model`) and every literal of it;
+     `crates/cb-train/src/boosting.rs:905` / the literal at `:5476` (`cb_train::Model`);
+     `crates/cb-model/src/generated/coreml_generated.rs:25` (`cm::Model`). This same-name confusion
+     has produced a wrong count four times — verify the type of every hit by reading the line before
+     editing it."
+  4. Correct the intra-crate grep at `:362` the same way — as written it misses the four
+     `crate::Model {` literals in `crates/cb-model/src/cbm_test.rs:322`, `:879`, `:900`, `:1030`.
 
-#### [MAJOR] P3-2 — The "TEN files, zero diff" claim is false for two more of the eleven oracles
+#### [MINOR] P5-2 — F08's literal counts are raw grep line counts, not literal counts
 
-- **Plan location:** PLAN.md §3.2 "ZERO-DIFF CARVE-OUT (one file only)"; E15 and E16 Completion evidence; PLAN-COVERAGE SPEC-CTRT-18 row and R1
-- **Requirement:** SPEC-CTRT-18, acceptance A7
-- **Evidence:** `crates/cb-train/tests/ctr_feature_materialize_test.rs` is an explicit **Files** entry of **E09** ("Modify … (existing target)", plus a whole new test fn) **and of E22** ("existing target; it is where test fn 4 lives"). `crates/cb-model/tests/ctr_data_roundtrip_test.rs` is an explicit **Files** entry of **E11** (test fns 2 and 4) — and its `build_final_ctr` calls at `:101,138,143,163` are compile-forced by E11's signature change. Both files are in the eleven (PLAN.md §3.2, SPEC-CTRT-18).
-- **Failure scenario:** At E09/E11/E22 the task's own Files list orders an edit that §3.2 forbids; at E15/E16 the completion evidence demands `git diff --stat` over "the ten" print nothing, which cannot hold under either the per-task or the cumulative baseline. The executor must invent an interpretation of a gate that PLAN.md calls authoritative.
-- **Impact:** No wrong production code, but the central regression gate of Part 1 is self-contradictory at three points; an executor may relocate legitimate new tests out of the reusable targets, or record a false "gate satisfied".
-- **Required revision:** Restate the carve-out as: *"The gate is **no modification of any EXISTING assertion** in the eleven files. Three of them are legitimately edited by owning tasks — `ctr_split_scoring_test.rs` (E09/E11/E16/E22, signature-driven only), `ctr_feature_materialize_test.rs` (E09 and E22, ADDITIVE new test fns), `ctr_data_roundtrip_test.rs` (E11, ADDITIVE test fns 2/4 + the compile-forced `build_final_ctr` argument). For the remaining **eight**, `git diff --stat` must print nothing."* Update PLAN-COVERAGE's SPEC-CTRT-18 row and R1 identically.
+- **Plan location:** `PLAN-PART2.md:284-286` ("Roughly **37**"), `:298-307` (the per-file breakdown
+  summing to 35), `:436-438` ("~37 in `crates/cb-model/src/**`"), `:474-476` ("36 in `cb-model`'s own
+  integration targets")
+- **Evidence:** The intra-crate grep returns 37 lines of which 20 are return types / `pub struct` /
+  `impl` / the CoreML proto struct; true literal count is **21** (17 bare + 4 `crate::`-qualified).
+  The `cb-model/tests` grep returns 35 lines of which 17 are return types; true count is **18** across
+  **9** files, not 11 — `partial_dependence_oracle_test.rs` and `staged_predict_oracle_test.rs` are
+  `-> Model { load_cbm(..) }` with no literal.
+- **Impact:** Prose only. The plan explicitly says "do NOT trust a hard-coded line list", and every
+  site is compile-forced (`E0063` intra-crate, `E0639` external). No edit changes.
+- **Required revision:** State 21 / 18-across-9, and drop the double-counting of the four production
+  sites ("37 literals **plus** the production sites `json.rs`, `cbm.rs` ×2, `model_sum.rs`" — those
+  four are already inside the 37).
 
-#### [MINOR] P3-3 — E15 test fn 2 and E16 test fn 1 assert on `train_inner` locals with no stated observation channel; the `cat_eligible_buckets` pin is vacuous if re-derived
+#### [MINOR] P5-3 — (P4-6, unapplied) `pub(crate) fn` producers are simultaneously ordered into a `pub use` re-export list
 
-- **Plan location:** PLAN-W2-W3.md E15 Red test fn 2; E16 Red test fn 1 ("capture the `Vec<Vec<u32>>` as built at `crates/cb-train/src/boosting.rs:3074` and compare it element-for-element…")
-- **Evidence:** `cat_eligible_buckets` (`:3074`), `structure_fold_columns` (`:3201`), `materialized_ctr_features` (`:3258`) and `averaging_ctr_features` (`:3270`) are all `let` bindings **inside `train_inner` (`:2555`)**. A child-module test in `boosting_test.rs` can reach private *items*, not function locals. If the test re-derives `cat_eligible_buckets` from `eligible_absolute` + `cat_columns`, the comparison is tautological (the expression does not depend on the prior/border expansion at all), so the "no-growth pin" can never fail and is not a guard under §3.1.
-- **Impact:** A verification-mechanism gap on R11's "most fragile thing W3 can break". Not behavior-threatening: the no-growth constraint is stated four times in prose and no Green step touches `:3074`.
-- **Required revision:** State the channel once, in E15: *"extract the expansion into a private helper in `boosting.rs` (E15 owns the file) — e.g. `fn materialize_ctr_columns(cat_columns, projections, perm, target_class, priors, borders, …) -> CbResult<Vec<CtrFeatureColumn>>` — and assert on its return value; `cat_eligible_buckets` stays where it is and is pinned by asserting `cat_eligible_buckets.len() == <count of CTR-eligible cat features>` **while** `ctr_features.len()` is the expanded product, which is the exact inverse of the retracted invariant."*
+- **Plan location:** E04 (`PLAN.md:883` + Files `:853-854`), E06 (`PLAN-W2-W3.md:81` + Files `:39-40`),
+  E07 (`:196`), E08 (`:280`)
+- **Evidence:** `crates/cb-train/src/ctr/mod.rs:144-148` re-exports `pub` items; `pub use` of a
+  `pub(crate)` item is `error[E0365]`.
+- **Impact:** A compile error on E04's first Green step, trivially self-correcting. Cannot produce
+  wrong code or a false pass. Note this does **not** touch E15/E16's two new `pub(crate) fn`s — those
+  are not re-exported (Job 3a).
+- **Required revision:** "`pub(crate) fn`" → "`pub fn`" in E04/E06/E07/E08.
 
-#### [MINOR] P3-4 — E22 test fn 4's two denominator assertions have no observation channel on `CtrFeatureColumn`
+#### [MINOR] P5-4 — (P4-7 / P4-8 / P4-9 / P4-10, unapplied) four residual pass-4 minors
 
-- **Plan location:** PLAN-W4-W5.md E22 Red test fn 4 (`assert_eq!(denominator_full, 3, …)`, `assert_eq!(denominator_skiptest, 2)`)
-- **Evidence:** `CtrFeatureColumn` (`crates/cb-train/src/ctr/ctr_feature.rs:69-94`) carries `projection, ctr_type, prior_num, prior_denom, bins, ctr_value, bucket_count` (+ `target_border_idx` after E09). **No denominator field**, and E22's Green step 0 does not add one. The other three assertions (`bucket_count_full == 3`, `bucket_count_skiptest == 2`, `column_full.bins.len() == 3`) are expressible ✓.
-- **Impact:** Low — the MAX-denominator behavior is already gated by E22 test fn 1 (`ctr/online_test.rs`, `denominator 2` vs `4`) and by E23 test fn 4 (`denominator_full > denominator_skiptest`), so no coverage is lost. The hazard is that an executor "fixes" the gap by adding a field to `CtrFeatureColumn`, which re-breaks the four external literals in files E22 does not own.
-- **Required revision:** Either drop the two denominator lines from test fn 4 (pointing at test fn 1), or state the channel: *"assert the denominator by calling the re-exported `online_counter_column(&column_full.bins, &[2,2,2], column_full.bucket_count)` — the eval bins are deterministic because the remap appends extras after the learn documents."* **Add: "Do NOT add a denominator field to `CtrFeatureColumn`."**
+- **P4-7** (`PLAN-W4-W5.md:749-750`): E22 test fn 4's `denominator_full` / `denominator_skiptest`
+  still have no stated observation channel — `CtrFeatureColumn` has no denominator field and E22 adds
+  none. The file-placement rationale was added (`:728-736`) but the channel was not. The
+  field-creep prohibition ("Do NOT add a denominator field to `CtrFeatureColumn`") is still missing;
+  adding one would break `tree_test.rs:374`, `:662`, which E22 does not own. The behavior is already
+  gated by E22 test fn 1 in `ctr/online_test.rs` (`Full` → totals `[2,4]`, denominator 4) and by E23.
+- **P4-8** (`PLAN-W2-W3.md:699` vs `:781-782`): E11 still says "threaded as a constant **`false`**
+  here" in one paragraph and "every caller passes **`true`** (the `SkipTest` default)" in Green step
+  3. `counter_calc_method_default()` returns `SkipTest`, so **`true`** is the behavior-preserving
+  value. Delete the `false`.
+- **P4-9**: `crates/cb-model/src/ctr_data.rs:495-505` (the decode-side module doc block stating that
+  mean-type CTRs "are **rejected** (v1, SPEC §2/MAJOR-2)") still becomes a documentation lie after
+  E19 and is still unnamed in E19's list of blocks to update, unlike E20's two. The file **is** in
+  E19's Files, so the edit is authorized — only unnamed.
+- **P4-10** (cosmetic): E18 "Blocked by: E13" omits `E11->E18`; E23 "Blocks: F00"
+  (`PLAN-W4-W5.md:875`) omits `E23->F01/F07/F19`; F12 "Blocks: F20" (`PLAN-PART2.md:565`) omits
+  `F12->F13`. Every omission is an under-statement and §4's edge list is declared authoritative.
 
-#### [MINOR] P3-5 — `pub(crate) fn` producers are simultaneously ordered into `pub use` re-export lists
+#### [MINOR] P5-5 — two stale descriptions created by E15's extraction and E09's new file
 
-- **Plan location:** E04, E06, E07, E08 (Green: "One `#[must_use] pub(crate) fn`"; Files: "add … to the existing `pub use online::{…}` re-export block at `crates/cb-train/src/ctr/mod.rs:144-148`; and to `crates/cb-train/src/lib.rs:46-50`")
-- **Evidence:** `crates/cb-train/src/ctr/mod.rs:144-148` and `crates/cb-train/src/lib.rs:45-52` re-export **`pub`** items. Re-exporting a `pub(crate)` fn with `pub use` is `error[E0364]`.
-- **Impact:** A compile error on the first Green step of E04, trivially self-correcting (make the fn `pub`, matching `online_ctr_prefix_binclf`). Also note E22 test fn 4's suggested channel (P3-4) needs these public.
-- **Required revision:** Change "`pub(crate) fn`" to "`pub fn` (matching `online_ctr_prefix_binclf`'s visibility, since the Files list re-exports it)" in E04/E06/E07/E08.
-
-#### [MINOR] P3-6 — Three "Blocks:"/"Blocked by:" cells under-list edges the (authoritative) edge list carries
-
-- **Plan location:** E18 ("Blocked by: E13" — the list also has `E11->E18`); E23 ("Blocks: F00" — the list also has `E23->F01/F07/F19`); PLAN-PART2 F12 row ("Blocks: F20" — the list also has `F12->F13`)
-- **Impact:** None on ordering — every omission is an *under*-statement, and the edge list is declared authoritative; the W4 wave text already names E11. Cosmetic.
-- **Required revision:** Append the missing IDs to the three cells.
-
-#### [MINOR] P3-7 — Remap span cited as `ctr_feature.rs:183-196`; the loop actually ends at `:198`
-
-- **Evidence:** the `// 2. Remap combined keys…` comment is at `:183`; `combined_bins.push(bin);` / closing brace land at `:197-198`.
-- **Impact:** None — unambiguous in context. Cosmetic.
+- E22's Files (`PLAN-W4-W5.md:647-648`) says "thread the eval cat columns from **BOTH**
+  `materialize_ctr_feature` call sites" in `boosting.rs`; after E15 Green step 0 there is **one** such
+  call site (inside `materialize_ctr_columns_for_perm`) plus two *helper* call sites.
+- E09's "Parallelizable: **NO** — owns `crates/cb-train/src/ctr/ctr_feature.rs`"
+  (`PLAN-W2-W3.md:316`) no longer names `crates/cb-train/src/boosting.rs`, which E09 now also edits
+  (the very next sentences explain it, so an executor is not misled). No hazard: E02, which also owns
+  `boosting.rs` and has no edge to/from E09, is likewise **Parallelizable: NO**, so the two cannot run
+  concurrently.
+- Both are wording; neither changes what gets edited.
 
 ---
 
 ### Implementation Order Review
 
-Edge list re-derived from `PLAN.md:345-359` and checked against all 48 task bodies:
+Edge list re-checked against `PLAN.md:361-376` — **unchanged from pass 4 and still acyclic**; the only
+ID-descending edge remains `E03->E02`, and `E03` has no in-edges.
 
-```
-E01->E02  E03->E02  E01->E04  E04->E05  E05->E06  E06->E07  E07->E08  E08->E09
-E09->E10  E02->E10  E03->E10  E10->E11  E11->E12  E11->E13  E11->E15  E14->E15
-E05->E15  E15->E16  E16->E17  E11->E18  E13->E18  E18->E19  E19->E20  E00->E20
-E11->E21  E21->E22  E22->E23  E23->F00  E23->F01  E23->F07  E23->F19
-F00->F03  F00->F05  F00->F16  F01->F02  F02->F03  F03->F04  F04->F05  F05->F06
-F06->F08  F08->F09  F09->F10  F10->F11  F11->F12  F12->F13  F11->F14
-F05->F15  F07->F15  F15->F16  F09->F17  F11->F17  F15->F18  F16->F18  F17->F18
-F18->F20  F19->F20  F12->F20  F14->F20  F20->F21  F21->F22  F22->F23
-```
-
-- **Acyclic.** The only ID-descending edge is `E03->E02`; `E03` has no in-edges and `E02`'s sole out-edge is `E02->E10`, from which no path returns. The four edges added this round (`E23->F01`, `E23->F07`, `E23->F19`, `F14->F20`) all advance the wave order.
-- **Blocked-by/Blocks reconciliation:** every task's Blocked-by set is a subset of its in-edges and every in-edge is justified by a body; the only mismatches are the three under-listed "Blocks" cells in P3-6.
-- **File-ownership serialization spot-checks:** `boosting.rs` is serialized E02 → E10 → E15 → E16 → E21 → E22 ✓. `online.rs` E04 → E05 → E06 → E07 → E08 ✓. `ctr_feature.rs` E09 → (nine tasks) → E22 ✓ — **no collision**: E09 lands in W2, E22 in W5, connected by `E09->E10->E11->E21->E22`, and E22's own note states this correctly. `crates/cb-model/src/ctr_data.rs` E11 → E19 → E20 ✓. `catboost-rs/src/model.rs` F10 → F11 → F12 → F13 ✓. `params.rs` F15 → F16 ✓.
-- **The only order-relevant correction required** is P3-1: three tasks (E09, E11, E22) must take ownership of the compile-forced edits in `crates/cb-train/tests/ctr_split_scoring_test.rs`. These are Files-list additions, not new tasks, and change no edge.
+- **The pass-4 fixes moved no edge.** P4-1 and P4-3 are Files-list additions; P4-2 is a Files-list
+  addition inside the already-serialized `E09->E10` chain; P4-4 was resolved by `#[non_exhaustive]`
+  rather than a relocation, so `F06->F08->F09->F10` stands as the corrected producer chain; P4-5's
+  extraction is E15's own Green step 0 and precedes both consumers (E15 test fn 2, E16 test fn 1).
+- **File-ownership serialization, re-derived:** `boosting.rs` E02 ‖ E09 → E10 → E15 → E16 → E21 → E22
+  (E02 and E09 are unordered but both **Parallelizable: NO**, and their regions — the `train_inner`
+  rejection vs `:3238`/`:3274` — are disjoint); `online.rs` E04 → E05 → E06 → E07 → E08;
+  `ctr_feature.rs` E09 → E22; `cb-model/src/ctr_data.rs` E11 → E19 → E20; `cb-model/src/model.rs` F08
+  only; `catboost-rs/src/model.rs` F10 → F11 → F12 → F13 (F08 touches only
+  `catboost-rs/src/*_test.rs`, not `model.rs` — no collision); `params.rs` F15 → F16. All intact.
+- **No intermediate un-buildable state remains.** The two pass-4 order defects are closed: E09 now
+  ends with `cargo build -p cb-train` succeeding, and every one of the eleven SPEC-CTRT-18 targets
+  builds at every task boundary.
+- **P5-1 requires no ordering change** — it is a text correction plus a corrected grep inside F08.
 
 ---
 
 ### Potential Bugs
 
-- **Un-buildable oracle target (P3-1).** Trigger: E09's `materialize_ctr_feature` widening / E11's and E22's `bake_ctr_table` widening. Failure mode: `E0061` × 5 in `ctr_split_scoring_test.rs` with no authorized fix; worst branch is assertion deletion in a CTR regression oracle. Mitigation: the four Files-list additions above.
-- **Vacuous no-growth guard (P3-3).** Trigger: re-deriving `cat_eligible_buckets` inside the test. Failure mode: a green test that cannot fail; the `model_size_reg` cat-weight regression it was added to catch would pass unnoticed. Mitigation: the helper-extraction channel, or the inverse-length assertion.
-- **`CtrFeatureColumn` field creep (P3-4).** Trigger: an executor adding a denominator field to satisfy test fn 4. Failure mode: `E0063` again at `tree_test.rs:374,662` and `ctr_split_scoring_test.rs:41,68` in files E22 does not own. Mitigation: the explicit prohibition.
-- **`is_mean()` covering both mean types** — now an explicit MANDATORY constraint in both E19 and E20, with the `FloatTargetMeanValue`-vs-`BinarizedTargetMeanValue` asymmetry spelled out. Closed.
-- **Divergent remaps between Counter totals and Counter bins** — closed by E22 Green step 0's single-remap rule plus the explicit FORBIDDEN clause on a second bucket space inside `online_counter_column`.
-- **f32-vs-f64 quantization for non-BTMV types** — carried, correctly recorded as a limitation, not a plan defect.
+- **Under-migration at F08 (P5-1).** Trigger: trusting "catboost-rs contributes ZERO / total 19".
+  Failure: 4 × `error[E0639]` in `crates/catboost-rs`. Caught by F08's own regression scope
+  (`cargo test -p catboost-rs`), so it surfaces rather than shipping — but the executor is told the
+  crate is out of scope, so the likely response is confusion or an unauthorized edit.
+- **Wrong-type edit at `crates/cb-train/src/boosting.rs:5476` (P5-1).** Trigger: obeying "Locate them
+  with, **and only with**" the broken grep. Failure: an attempt to migrate a `cb_train::Model` literal
+  to a `Model::new(..)` that does not exist on that type; self-correcting at compile time, but it is
+  an edit to E22's serialized file made during W7.
+- **Missed intra-crate literals in `cbm_test.rs` (P5-2).** Trigger: the `:362` grep excluding `crate::`
+  paths. Failure: 4 × `error[E0063]`. Compile-forced, self-correcting.
+- **Vacuous denominator assertions at E22 test fn 4 (P5-4/P4-7).** Trigger: no channel for
+  `denominator_full`. Worst branch: an executor adds a denominator field to `CtrFeatureColumn`,
+  re-breaking `tree_test.rs:374`, `:662` in a file E22 does not own. Mitigation: state the channel or
+  drop the two lines, and add the explicit prohibition.
+- **`E0365` at E04's Green (P5-3).** Trigger: `pub use` of a `pub(crate) fn`. Self-correcting.
+- Closed at earlier passes and NOT re-litigated: bake copy-back per-split normalization; the
+  `(projection, ctr_type)` de-dup key; `target_border_idx` excluded from `ctr_base_key`; `is_mean()`
+  covering both mean types; the single-remap rule for Counter bins vs totals; the f32-vs-f64 BTMV
+  accumulator differential; the eval-set bucket-space rule; the `.cbm` mean stride-8/12 probe.
 
 ---
 
-### Compliance Checks (all PASS)
+### Compliance Checks (re-confirmed, not re-litigated)
 
-- **Locked decisions:** (1) engine before facade — `E23->F00/F01/F07/F19` plus "Part 2 starts only after E23 is green" ✓; (2) `.cbm` mean lift with a non-mean byte gate — E00's hand-constructed pre-change baseline + E20's stride-mutation falsifiability ✓; (3) CTR type + full prior list honored, scalar `simple_ctr: ECtrType` unchanged (no `BoostParams` field added or retyped, 62 sites untouched), multi-description gap documented by F00 with a doc-presence test ✓; (4) `crates/cb-oracle/fixtures/one_hot_train/` reused read-only by F19/F20, no corpus-wide generation ✓.
-- **Source/test separation:** every unit test is a sibling `<name>_test.rs` mounted via `#[cfg(test)] #[path = …] mod`; integration tests live in `crates/<crate>/tests/` ✓.
-- **No `unwrap`/`expect`/`panic`/indexing in production:** every Green step mandates checked `.get`, `saturating_*`, typed `CbError`/`ModelError` ✓.
-- **Backend trap:** no command passes `--features rocm` without `--no-default-features`; the only `--features` use is `maturin develop … --features cpu` ✓.
-- **`crates/cb-oracle/generator/gen_fixtures.py`:** never invoked; all six new fixtures use the fixture-local pattern with the corpus-cleanliness guard ✓.
-- **`catboost-master/`:** never cited as a parity reference; only as the reason F18's registry test currently SKIPs ✓.
-- **Accepted failing-test baseline:** used as a "no previously-passing target may fail" gate by E23 and F23, with the flaky and pre-existing-failure caveats recorded ✓.
-- **Uncommitted one-hot wave:** never reverted; `git checkout --` forbidden in every mutation revert; `one_hot_oracle_test`, `one_hot_draw_accounting_test`, `device_one_hot_parity_test` are mandatory regression scope for E02, E05, E10, E15, E16, E21, E22 and the F23 closing gate ✓.
+- **Locked decisions, all still honored:** (1) engine before facade — `E23->F00/F01/F07/F19` plus
+  "Part 2 starts only after E23 is green" ✓; (2) the `.cbm` mean lift gated by E00's hand-constructed
+  **non-mean** byte-identity baseline plus E20's stride-mutation falsifiability ✓; (3) scalar
+  `simple_ctr: ECtrType` untouched, the full prior list honored by E15, the multi-description default
+  documented as a gap by F00 ✓; (4) `crates/cb-oracle/fixtures/one_hot_train/` reused read-only by
+  F19/F20 with no corpus-wide generation and `gen_fixtures.py` never invoked ✓; (5) `Model` gets
+  `#[non_exhaustive]` + a constructor — F08 Green steps 1–2, with the rationale recorded at
+  `PLAN-PART2.md:267-276` and an external-crate verification test (test fn 3) in an integration
+  target ✓.
+- **Source/test separation**, **no `unwrap`/`expect`/`panic!` in production**, **no bare
+  `--features rocm`**, **`catboost-master/` never cited as a parity reference**, **the accepted
+  failing-test baseline used as a "no previously-passing target may fail" gate** (now honored on both
+  the encode and decode sides after P4-3), **the uncommitted one-hot wave never reverted and its three
+  oracles in mandatory regression scope for every `boosting.rs`/`tree.rs` task** — all ✓.
 
 ---
 
 ### Required Plan Revisions
 
-1. **E09 + E11 + E22 + PLAN.md §3.2 + E15/E16 completion evidence:** own the remaining compile-forced edits in `crates/cb-train/tests/ctr_split_scoring_test.rs` — `materialize_ctr_feature` at `:384`, `:394` (E09, again E22) and `bake_ctr_table` at `:542`, `:576`, `:645` (E11, again E22) — and restate the carve-out over the complete permitted-edit set. Delete E09's "no later task re-edits them" claim. **(CRITICAL, P3-1)**
-2. **PLAN.md §3.2 + PLAN-COVERAGE SPEC-CTRT-18/R1 + E15/E16:** rewrite the zero-diff gate as "no modification of any EXISTING assertion", naming the three legitimately-edited oracle files and requiring an empty `git diff --stat` over the remaining **eight**. **(MAJOR, P3-2)**
-3. **E15/E16:** state the observation channel for the expansion assertions (a private helper in `boosting.rs`) and make the `cat_eligible_buckets` pin falsifiable (length vs the CTR-eligible-feature count while `ctr_features` grows). **(MINOR, P3-3)**
-4. **E22 test fn 4:** drop the two denominator assertions or state the `online_counter_column` channel; add "Do NOT add a denominator field to `CtrFeatureColumn`". **(MINOR, P3-4)**
-5. **E04/E06/E07/E08:** `pub(crate) fn` → `pub fn` for the producers that the same tasks re-export. **(MINOR, P3-5)**
-6. **E18 / E23 / F12:** append the missing IDs to the three "Blocked by:"/"Blocks:" cells. **(MINOR, P3-6)**
-7. **E21/E22:** `ctr_feature.rs:183-196` → `:183-198`. **(MINOR, P3-7)**
+1. **F08 (`PLAN-PART2.md`):** delete the false "`crates/catboost-rs` contributes **ZERO**" paragraph
+   (`:310-312`); correct "Total external migration set" 19 → **23**; correct EXPECTED INITIAL FAILURE
+   item 3's "36 in `crates/cb-model/tests`" → **18**; replace the "and only with" grep block with
+   regexes that see qualified paths, exclude `->` lines, and carry an explicit
+   "these three same-named types are NOT `cb_model::Model`" exclusion list naming
+   `crates/catboost-rs/src/model.rs:64`, `crates/cb-train/src/boosting.rs:905`/`:5476`, and
+   `crates/cb-model/src/generated/coreml_generated.rs:25`. **(MAJOR, P5-1)**
+2. **F08:** correct the intra-crate grep so it sees `crate::Model {`
+   (`crates/cb-model/src/cbm_test.rs:322`, `:879`, `:900`, `:1030`), and restate the counts as
+   **21 intra-crate literals + `from_trained`'s `Self {`** and **18 external across 9 files**,
+   dropping the double-count of the four production sites. **(MINOR, P5-2)**
+3. **E04/E06/E07/E08:** `pub(crate) fn` → `pub fn`. **(MINOR, P5-3)**
+4. **E22 test fn 4:** state the denominator observation channel or drop the two lines, and add
+   "Do NOT add a denominator field to `CtrFeatureColumn`". **(MINOR, P5-4)**
+5. **E11:** delete "threaded as a constant `false` here" at `PLAN-W2-W3.md:699`; `true` everywhere.
+   **(MINOR, P5-4)**
+6. **E19:** name `crates/cb-model/src/ctr_data.rs:495-505` as a third doc block to update in the same
+   edit. **(MINOR, P5-4)**
+7. **E18 / E23 / F12:** append the missing IDs to the three "Blocked by:"/"Blocks:" cells.
+   **(MINOR, cosmetic, P5-4)**
+8. **E22 Files / E09 Parallelizable:** "BOTH `materialize_ctr_feature` call sites" → "the single call
+   site inside `materialize_ctr_columns_for_perm`, plus that helper's two call sites"; name
+   `boosting.rs` in E09's "owns" clause. **(MINOR, P5-5)**
 
 ---
 
 ### Unverified Items
 
-1. Whether the 30-row isolating configs yield a winning split of each intended type — data-dependent; falsified at generation time by each generator's mandatory anti-false-pass assertion. Correctly recorded.
-2. The upstream `CTRBlob` mean stride — `[INFERRED]`, with the mandatory 8 → 12 → STOP AND REPORT probe and an upstream-produced `.cbm` (E18) as the falsifier. Resolved as far as a plan can resolve it.
-3. Whether E23's fixture can discriminate `Full` from `SkipTest` while both land within 1e-5 — pre-written deferral path exists; ladder step 0 now points at an implemented rule (E22 Green step 0).
-4. Whether `catboost==1.2.10` is byte-deterministic for categorical-only fixtures — falsified by each fixture task's double-generation `diff -r`.
-5. `bench/one_hot_gpu_speed/one_hot_bench_colab.py` end-to-end behavior after F09 — only the source-level preflight is testable locally; F22 gates a call-position marker paired with F09 test fn 1.
-6. `ensure_scalar_oblivious` has no covering tests today; F11 extends it and F12 adds the first direct coverage. Acceptable — F12 should assert the pre-existing CTR arm alongside the new one-hot arm.
+1. Whether the 30-row isolating configs yield a winning split of each intended type — data-dependent;
+   falsified at generation time by each generator's anti-false-pass assertion. Correctly recorded.
+2. The upstream `CTRBlob` mean stride — `[INFERRED]`, with the mandatory 8 → 12 → STOP-AND-REPORT
+   probe and E18's upstream-produced `.cbm` as the falsifier. Resolved as far as a plan can.
+3. Whether E23's fixture can discriminate `Full` from `SkipTest` while both land within 1e-5 — a
+   pre-written deferral path exists.
+4. Whether `catboost==1.2.10` is byte-deterministic for categorical-only fixtures — falsified by each
+   fixture task's double-generation `diff -r`.
+5. `bench/one_hot_gpu_speed/one_hot_bench_colab.py` end-to-end behavior after F09 — only the
+   source-level preflight is testable locally.
+6. Pass-4 item 6 (whether the facade-wrapper alternative to F08 is compatible with F10/F13) is
+   **CLOSED** — the locked decision selected `#[non_exhaustive]` + a constructor on
+   `cb_model::Model`, so the alternative is out of scope and no longer needs verification.

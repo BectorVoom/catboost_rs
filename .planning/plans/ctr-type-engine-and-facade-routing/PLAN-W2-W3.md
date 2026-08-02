@@ -313,12 +313,21 @@ oracles green.
 
 - **Specs:** SPEC-CTRT-06 / -07 / -08 (wiring half)
 - **Blocked by:** E08. **Blocks:** E10.
-- **Parallelizable:** **NO** — owns `crates/cb-train/src/ctr/ctr_feature.rs`;
-  its two call sites in `boosting.rs` are E10's. It additionally owns the FOUR
+- **Parallelizable:** **NO** — owns `crates/cb-train/src/ctr/ctr_feature.rs`.
+  **E09 MUST leave `cb-train` compiling**: Rust has no default arguments, so the
+  widened signature forces E09 to update **its two production call sites in
+  `crates/cb-train/src/boosting.rs` (`:3238` structure folds, `:3274` averaging
+  fold)** in the same task — E09 makes them compile with the pre-change constants
+  (`ECtrType::Borders`, `target_border_idx: 0`); **E10 makes them per-candidate**.
+  (An earlier revision of this task claimed "its two call sites in `boosting.rs`
+  are E10's" — that was WRONG and is deleted: it left `cb-train` un-buildable at
+  the end of E09, while E09's own Validation runs `cargo test -p cb-train`.) It
+  additionally owns the FOUR
   mechanical `CtrFeatureColumn` literal fixes in `crates/cb-train/src/tree_test.rs`
-  and `crates/cb-train/tests/ctr_split_scoring_test.rs`, **plus the TWO
+  and `crates/cb-train/tests/ctr_split_scoring_test.rs`, **plus the THREE
   compile-forced `materialize_ctr_feature` argument additions at
-  `crates/cb-train/tests/ctr_split_scoring_test.rs:384` and `:394`** (see Files) —
+  `crates/cb-train/tests/ctr_split_scoring_test.rs:384`, `:394` and
+  `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70`** (see Files) —
   those are compile-forced, not behavioral. **`ctr_split_scoring_test.rs` IS
   re-edited by later tasks** — E11 (three `bake_ctr_table` call sites), E16 (five
   dropped `greedy_tensor_search_oblivious_with_ctr` arguments) and E22 (both the
@@ -333,6 +342,29 @@ producers; `CtrFeatureColumn` carries `target_border_idx` and the REAL
 **Files**
 - Modify: `crates/cb-train/src/ctr/ctr_feature.rs`
 - Modify: `crates/cb-train/tests/ctr_feature_materialize_test.rs` (existing target)
+- Modify: `crates/cb-train/src/boosting.rs` — **mechanical, forced by the widened
+  signature, and ONLY this.** Pass the behavior-preserving `ECtrType::Borders` and
+  `target_border_idx: 0` at the TWO `materialize_ctr_feature` call sites,
+  `crates/cb-train/src/boosting.rs:3238` (structure folds) and `:3274` (averaging
+  fold) — 7 arguments on disk today, 9 after this task
+  `[VERIFIED: LOCAL crates/cb-train/src/boosting.rs:3238, :3274, read verbatim]`.
+  **Per-candidate type/prior resolution is E10's and MUST NOT be done here** —
+  E09 only makes these two sites compile with today's constants. Nothing else in
+  `boosting.rs` may be touched by E09; the `E09->E10` edge already serializes this
+  file, so there is no edit conflict.
+- Modify: `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` — **mechanical,
+  forced by the widened signature.** Add the two new arguments
+  (`ctr_type: ECtrType::Borders`, `target_border_idx: 0`) to the
+  `materialize_ctr_feature` call at
+  `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70` — 7 arguments on disk
+  today, 9 after this task — preserving today's behavior exactly (`Borders, b=0`
+  is the pre-change hard-coded path)
+  `[VERIFIED: LOCAL crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70-79]`.
+  **Mechanical arity update only. CHANGE NO ASSERTION; weakening or deleting any
+  assertion is FORBIDDEN** — this file is **one of the eleven SPEC-CTRT-18 oracle
+  targets** and carries `assert_s_order_reproduces_bins`, the only pin on
+  `Q = S∘P_avg` bit-exactness. It sits in the **MECHANICAL EDITS ONLY** row of the
+  per-file diff gate (PLAN.md §3.2; the table in E15/E16), NOT in ZERO DIFF.
 - Modify: `crates/cb-train/src/tree_test.rs` — **mechanical, forced by the new
   struct field.** Add `target_border_idx: 0` to the `CtrFeatureColumn` struct
   literals at `tree_test.rs:374` and `tree_test.rs:662`
@@ -353,16 +385,21 @@ producers; `CtrFeatureColumn` carries `target_border_idx` and the REAL
 
   **CHANGE NO ASSERTION.** This file is **one of the eleven SPEC-CTRT-18 oracle
   targets** (PLAN.md §3.2); see the per-file diff gate table in E15/E16.
-- **NOTE (both files):** `CtrFeatureColumn` (`crates/cb-train/src/ctr/ctr_feature.rs:69`)
+- **NOTE (all compile-forced files):** `CtrFeatureColumn`
+  (`crates/cb-train/src/ctr/ctr_feature.rs:69`)
   is **not** `#[non_exhaustive]`, so all four external literals must gain the
   field. The permitted mechanical edits are exactly: **(i)** one
   `target_border_idx: 0` field initializer per `CtrFeatureColumn` literal
   (`tree_test.rs:374`, `:662`, `ctr_split_scoring_test.rs:41`, `:68`) **and (ii)**
-  the two new arguments at the `materialize_ctr_feature` call sites
-  (`ctr_split_scoring_test.rs:384`, `:394`) — nothing else. **Weakening or
-  deleting any assertion in `ctr_split_scoring_test.rs` is FORBIDDEN** — it is a
-  CTR regression oracle, and "fixing" the compile break by removing a construction
-  silently removes CTR-split-scoring coverage during the highest-risk waves.
+  the two new arguments at **every** `materialize_ctr_feature` call site —
+  `ctr_split_scoring_test.rs:384`, `:394`,
+  `s_order_ctr_bins_oracle_test.rs:70`, and the two production sites
+  `boosting.rs:3238`, `:3274` — nothing else. **Weakening or
+  deleting any assertion in `ctr_split_scoring_test.rs` or in
+  `s_order_ctr_bins_oracle_test.rs` is FORBIDDEN** — both are
+  CTR regression oracles, and "fixing" the compile break by removing a construction
+  or a call silently removes CTR-split-scoring / S-order bin-reproduction coverage
+  during the highest-risk waves.
 
 **Exact verified files/symbols to touch**
 - `pub fn materialize_ctr_feature(cat_columns, projection, permutation,
@@ -406,7 +443,7 @@ there `[VERIFIED: research §F.2]`.
   - `Counter, b=0` → `col.ctr_type == 4`, plus permutation invariance
     (`materialize` under two different permutations yields identical `bins`);
   - `BinarizedTargetMeanValue, b=0` → `col.ctr_type == 2`, `bins` non-constant.
-- **EXPECTED INITIAL FAILURE (two distinct compile errors, in three files):**
+- **EXPECTED INITIAL FAILURE (two distinct compile errors, in five files):**
   1. `error[E0061]: this function takes 7 arguments but 9 were supplied` on the
      `materialize_ctr_feature` call in
      `crates/cb-train/tests/ctr_feature_materialize_test.rs` (the `ctr_type` /
@@ -416,6 +453,16 @@ there `[VERIFIED: research §F.2]`.
      soon as the widened signature lands. That target does not build until the two
      mechanical argument additions of Files item 2 land. This is compile-forced,
      not behavioral.
+  1c. The **mirror** `error[E0061]: this function takes 9 arguments but 7 were
+     supplied` on the `materialize_ctr_feature` call in
+     `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs:70`, as soon as the
+     widened signature lands. That oracle target does not build until the
+     mechanical argument addition lands. Compile-forced, not behavioral.
+  1d. The **same** `error[E0061]` on the TWO PRODUCTION call sites
+     `crates/cb-train/src/boosting.rs:3238` and `:3274`. Until these land, the
+     `cb-train` **library** does not compile and EVERY command in this task's
+     Validation block fails at the build step. These two are not optional and are
+     not deferrable to E10.
   2. `error[E0063]: missing field target_border_idx in initializer of
      CtrFeatureColumn` — emitted **once per external struct literal** as soon as
      the field is added to the non-`#[non_exhaustive]` `CtrFeatureColumn`
@@ -424,8 +471,10 @@ there `[VERIFIED: research §F.2]`.
      `crates/cb-train/tests/ctr_split_scoring_test.rs:41`, `:68`. Both the
      `cb-train` lib test build and the `ctr_split_scoring_test` target fail to
      compile until the four mechanical `target_border_idx: 0` initializers land.
-  After the signature, the four initializers **and the two `:384`/`:394` argument
-  additions** land but before the dispatch, the failure becomes
+  After the signature, the four initializers **and all five compile-forced argument
+  additions** (`ctr_split_scoring_test.rs:384`, `:394`,
+  `s_order_ctr_bins_oracle_test.rs:70`, `boosting.rs:3238`, `:3274`) land but
+  before the dispatch, the failure becomes
   ``assertion `left == right` failed: left: 0, right: 4`` on the Counter case.
 - Run: `cargo test -p cb-train --test ctr_feature_materialize_test`
 
@@ -437,6 +486,13 @@ into three arms (`Borders | Buckets` → `online_class_prefix_column`;
 already rejects at `train_inner`). Set `ctr_type: ctr_type.as_i8()` and
 `target_border_idx`. Keep the combined-hash fold (`:165-196`) and the quantization
 clamp (`:209-227`) byte-identical.
+Then, in the **same** Green step, make every caller compile again by passing the
+pre-change constants `ECtrType::Borders` and `target_border_idx: 0`: the two
+PRODUCTION sites `crates/cb-train/src/boosting.rs:3238` and `:3274`, the two test
+sites `ctr_split_scoring_test.rs:384`/`:394`, and the oracle site
+`s_order_ctr_bins_oracle_test.rs:70`. **`cb-train` MUST compile at the end of E09**
+— the per-candidate values at the two `boosting.rs` sites are E10's, and E10
+changes only the VALUES passed there (the arguments already exist after E09).
 
 **Refactor constraints + required regression scope**
 - Constraint: the `Borders, b=0` path must remain byte-identical — that is what
@@ -460,10 +516,16 @@ cargo clippy -p cb-train --all-targets
 **Completion evidence.** Four per-type cases green including the frozen
 Borders byte-identity literals and the Counter permutation-invariance assertion;
 all 11 CTR oracles green. **`git diff crates/cb-train/src/tree_test.rs
-crates/cb-train/tests/ctr_split_scoring_test.rs` shows exactly four added
-`target_border_idx: 0` field-initializer lines PLUS the two widened
-`materialize_ctr_feature` call sites (`ctr_split_scoring_test.rs:384`, `:394`) and
+crates/cb-train/tests/ctr_split_scoring_test.rs
+crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` shows exactly four added
+`target_border_idx: 0` field-initializer lines PLUS the three widened
+`materialize_ctr_feature` call sites (`ctr_split_scoring_test.rs:384`, `:394`,
+`s_order_ctr_bins_oracle_test.rs:70`) and
 NOTHING else** — no assertion added, removed, weakened or reworded.
+**`git diff crates/cb-train/src/boosting.rs` shows exactly the two widened
+`materialize_ctr_feature` call sites (`:3238`, `:3274`) passing
+`ECtrType::Borders, 0` and NOTHING else** — no routing, no prior resolution
+(that is E10's). `cargo build -p cb-train` succeeds at the end of this task.
 
 ---
 
@@ -473,6 +535,14 @@ NOTHING else** — no assertion added, removed, weakened or reworded.
 - **Blocked by:** E02, E03, E09. **Blocks:** E11.
 - **Parallelizable:** **NO** — owns `crates/cb-train/src/boosting.rs` (and
   `tree.rs` for the `target_border_idx` argument).
+- **Hand-off from E09 (explicit, so the two tasks do not collide on
+  `boosting.rs`):** E09 has ALREADY widened the two `materialize_ctr_feature` call
+  sites at `boosting.rs:3238` and `:3274` to the 9-argument form, passing the
+  constants `ECtrType::Borders, 0` — **E09 = arity only**. E10 changes only the
+  VALUES passed at those two sites (per-candidate `ECtrType` + prior) — **E10 =
+  value/routing only**; it adds no argument and removes none. The `E09->E10` edge
+  in the authoritative edge list already serializes `boosting.rs`, so this split
+  needs no new edge.
 
 **Goal / observable completion condition.** `params.simple_ctr` /
 `params.combinations_ctr` and `params.simple_ctr_priors` /
@@ -546,6 +616,9 @@ routing.
    helper `fn ctr_config_for(params, is_simple) -> (ECtrType, f64)` returning the
    `(type, head prior)` pair, called inside the two materialization loops
    (`:3237-3247`, `:3273-3282`) and at the bake site (`:5445-5455`).
+   **The `ctr_type` / `target_border_idx` ARGUMENTS at those two materialization
+   sites already exist** — E09 added them as the constants `ECtrType::Borders, 0`.
+   E10 replaces the *values* only; it must NOT re-widen the call.
 3. Keep `prior_denom = 1.0` (CPU forbids a non-unit denominator —
    `ctr_helper.cpp:50`) and `target_border_idx = 0` (W3 expands it).
 4. Fix the stale `one_hot_splits` doc comment at `:816-817`.
@@ -1202,15 +1275,39 @@ data-backed.
   As E12's shape, with `simple_ctr_priors: vec![0.0, 0.5, 1.0]`.
 - Test fn 2 (in `boosting_test.rs`):
   `candidate_expansion_emits_one_column_per_prior`
+  **OBSERVATION CHANNEL (mandatory — channel (a), the extracted helper).**
+  `materialized_ctr_features`, `structure_fold_columns` and
+  `averaging_ctr_features` are `let` bindings **inside `train_inner`**
+  (`crates/cb-train/src/boosting.rs:2555`) `[VERIFIED: LOCAL]`; a child-module test
+  in `boosting_test.rs` can reach private *items*, **not** function locals, so this
+  test **cannot** observe them as written today. Green step 0 (below) therefore
+  **extracts the expansion** into
+  `pub(crate) fn materialize_ctr_columns_for_perm(cat_columns: &[Vec<String>],
+  absolute_projections: &[TProjection], ctr_candidates: &[CtrCandidate],
+  params: &BoostParams, permutation: &[i32], target_class: &[i32],
+  ctr_border_count: usize) -> CbResult<Vec<CtrFeatureColumn>>`, and **BOTH**
+  `train_inner` loops (`boosting.rs:3237-3247` structure, `:3273-3282` averaging)
+  call it. The test calls the SAME function — it does **not** re-implement it.
   Setup: 2 CTR-eligible cat columns, `max_ctr_complexity = 1`,
   `simple_ctr_priors = [0.0, 0.5, 1.0]`.
-  Expected: `materialized_ctr_features.len() == 2 projections * 3 priors == 6`,
-  the emitted `prior_num` sequence is exactly `[0.0, 0.5, 1.0, 0.0, 0.5, 1.0]`
-  (upstream's `(ctrIdx, targetBorderIdx, priorIdx)` nesting order), and
-  `averaging_ctr_features` has the SAME length and the SAME `(projection, prior)`
-  sequence — the alignment invariant asserted, not assumed.
+  Expected, over the helper's return value: `cols.len() == 2 projections *
+  3 priors == 6`, the emitted `prior_num` sequence is exactly
+  `[0.0, 0.5, 1.0, 0.0, 0.5, 1.0]`
+  (upstream's `(ctrIdx, targetBorderIdx, priorIdx)` nesting order), and calling the
+  helper a second time with the **averaging** permutation yields the SAME length
+  and the SAME `(projection, prior)` sequence — the alignment invariant asserted,
+  not assumed. (Because both `train_inner` loops go through this one function, the
+  in-production alignment follows from the assertion rather than being restated.)
+  **FORBIDDEN: a test that re-derives the expansion itself** (e.g. building its own
+  `for proj { for prior { … } }` and comparing that to itself). Such a test is a
+  **tautological guard** — it passes by construction no matter what `train_inner`
+  does, and would leave R1 ("multi-prior expansion changes tie-breaks
+  corpus-wide") completely unguarded.
 - Test fn 3 (in `boosting_test.rs`, **the bake copy-back pin — CRITICAL**):
   `two_splits_on_one_projection_keep_distinct_priors_and_scales_after_the_bake`
+  **OBSERVATION CHANNEL: (b), an integration-level observable** — the assertions
+  read `CtrSplitSpec.{prior_num, scale}` off the **trained model returned by
+  `train_inner`**, not any local, so no extraction is needed here.
   Setup: train a model on a corpus where projection `{0}` wins CTR splits at **two
   different priors** from `simple_ctr_priors = [0.0, 1.0]` (in different trees).
   Expected, after the whole `train_inner` run — i.e. **after** the
@@ -1237,7 +1334,26 @@ data-backed.
   `cargo test -p cb-train --lib boosting::tests -- distinct_priors`
 
 **Green (minimal implementation intent).**
-1. In both materialization loops, wrap the `materialize_ctr_feature` call in
+0. **EXTRACT THE OBSERVATION CHANNEL FIRST (it is what makes test fn 2 and E16's
+   test fn 1 expressible at all).** Two `pub(crate) fn`s in
+   `crates/cb-train/src/boosting.rs`, both pure and both called by `train_inner`:
+   - `pub(crate) fn materialize_ctr_columns_for_perm(cat_columns: &[Vec<String>],
+     absolute_projections: &[TProjection], ctr_candidates: &[CtrCandidate],
+     params: &BoostParams, permutation: &[i32], target_class: &[i32],
+     ctr_border_count: usize) -> CbResult<Vec<CtrFeatureColumn>>` — the body of the
+     two materialization loops (`:3237-3247`, `:3273-3282`), which become one call
+     each. This is the ONLY place the `(projection, prior)` — and, after E16, the
+     `(projection, b, prior)` — product is built.
+   - `pub(crate) fn cat_eligible_buckets_for(cat_columns: &[Vec<String>],
+     eligible_absolute: &[usize]) -> Vec<Vec<u32>>` — the body of the
+     `cat_eligible_buckets` build at `boosting.rs:3074`, which becomes one call.
+     It takes `eligible_absolute` and NOT the expanded column list, which is
+     precisely why its output cannot grow with the expansion.
+   Both are behavior-preserving extractions: **no logic change in this step**, and
+   the D-04 no-op proof (single-element prior list ⇒ byte-identical output) must
+   still hold after step 0 alone.
+1. In both materialization loops — now the single body of
+   `materialize_ctr_columns_for_perm` — wrap the `materialize_ctr_feature` call in
    `for &prior in priors_for(candidate.is_simple)`, pushing one column per prior, in
    prior-list order, into both `structure_fold_columns[fold]` and
    `averaging_ctr_features`. **Leave `cat_eligible_buckets` exactly as built** — it
@@ -1325,22 +1441,31 @@ targets (PLAN.md §3.2) is **per file**, in three categories:
 | 2 | `crates/cb-train/tests/ordered_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
 | 3 | `crates/cb-train/tests/tensor_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
 | 4 | `crates/cb-train/tests/tensor_ctr_e2e_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 5 | `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 6 | `crates/cb-train/tests/multi_permutation_e2e_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 7 | `crates/cb-train/tests/multi_permutation_fold_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 8 | `crates/cb-model/tests/fstr_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 9 | `crates/cb-train/tests/ctr_split_scoring_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (`target_border_idx: 0` at `:41`, `:68`; `materialize_ctr_feature` args at `:384`, `:394`), E11 (`bake_ctr_table` args at `:542`, `:576`, `:645`), E16 (five dropped args at `:99, :148, :191, :249, :305`), E22 (all five call sites again) |
+| 5 | `crates/cb-train/tests/multi_permutation_e2e_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
+| 6 | `crates/cb-train/tests/multi_permutation_fold_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
+| 7 | `crates/cb-model/tests/fstr_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none (but see the F08 `#[non_exhaustive]` note under the table) |
+| 8 | `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (`materialize_ctr_feature` args at `:70` — 7 args → 9), E22 (the same site again — 9 args → 10, `extra_cat_columns`) |
+| 9 | `crates/cb-train/tests/ctr_split_scoring_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (`target_border_idx: 0` at `:41`, `:68`; `materialize_ctr_feature` args at `:384`, `:394`), E11 (`bake_ctr_table` args at `:542`, `:576`, `:645`), E16 (five dropped args at `:99, :148, :191, :249, :305`), E22 (all five call sites again), F08 (the `cb_model::Model` literal at `:518` migrated to the `Model::new(..)` + builder form, forced by `#[non_exhaustive]`) |
 | 10 | `crates/cb-train/tests/ctr_feature_materialize_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (widened `materialize_ctr_feature` calls + an ADDITIVE new test fn), E22 (ADDITIVE test fn 4 + the `extra_cat_columns` argument) |
 | 11 | `crates/cb-model/tests/ctr_data_roundtrip_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E11 (ADDITIVE test fns 2 and 4 + the compile-forced `build_final_ctr` argument at `:101`, `:138`, `:143`, `:163`) |
 
-For rows 1–8, `git diff --stat` over those eight files must print **nothing**. For
-rows 9–11 the permitted diff is **signature-driven argument/field edits and ADDITIVE
+For rows 1–7, `git diff --stat` over those seven files must print **nothing**. For
+rows 8–11 the permitted diff is **signature-driven argument/field edits and ADDITIVE
 new test functions only**. **A diff that touches an EXISTING assertion in ANY of the
 eleven — added, removed, weakened or reworded — is a STOP-AND-REPORT condition.**
 At E15 the edits present in row 9 are E09's two `target_border_idx: 0` initializers
 (`:41`, `:68`), E09's two widened `materialize_ctr_feature` calls (`:384`, `:394`)
 and E11's three widened `bake_ctr_table` calls (`:542`, `:576`, `:645`); E16 adds
-the five dropped `0` arguments (`:99, :148, :191, :249, :305`).
+the five dropped `0` arguments (`:99, :148, :191, :249, :305`). Row 8 at E15 carries
+E09's single widened `materialize_ctr_feature` call at `:70` and nothing else.
+**F08 `#[non_exhaustive]` note (Part 2, far downstream of E15/E16):** F08 marks
+`cb_model::Model` `#[non_exhaustive]`, which forbids struct-literal construction
+from every *other* crate — including `crates/cb-model/tests/*.rs`, which are
+separate crates. Row 7 (`fstr_ctr_oracle_test.rs`) contains ONE such literal, so
+`#[non_exhaustive]` compile-forces a one-line constructor migration there. That
+edit is **F08's**, is **mechanical only**, and **must change no assertion**; see
+F08 in PLAN-PART2.md, which enumerates the full migration set and flags this
+ZERO-DIFF collision as an OPEN item.
 
 ---
 
@@ -1370,13 +1495,20 @@ column's `target_border_idx` reaches `CtrSplitSpec` (no longer the literal `0`);
   **purely mechanical** (delete one argument per call), and **weakening or deleting
   any assertion in `ctr_split_scoring_test.rs` is FORBIDDEN**. If a call no longer
   compiles for a reason **other than** (i) this task's dropped argument or (ii) a
-  mechanical arity update that E09, E11 or E22 explicitly authorizes in this same
-  file — E09's `CtrFeatureColumn` initializers at `:41`/`:68` and
+  mechanical arity update that E09, E11, E22 or F08 explicitly authorizes in this
+  same file — E09's `CtrFeatureColumn` initializers at `:41`/`:68` and
   `materialize_ctr_feature` arguments at `:384`/`:394`, E11's `bake_ctr_table`
   arguments at `:542`/`:576`/`:645`, E22's further widening of those same five
-  sites — then **STOP AND REPORT** rather than adjusting the test. **Any change
+  sites, F08's `#[non_exhaustive]`-forced migration of the `cb_model::Model`
+  literal at `:518` to the constructor form — then **STOP AND REPORT** rather than
+  adjusting the test. **Any change
   that would touch an assertion is STOP AND REPORT regardless of which task
   appears to force it.**
+  **The SAME exemption clause applies, word for word, to the SECOND mechanical
+  oracle file `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs`:** the only
+  authorized edits there are E09's widening of the `materialize_ctr_feature` call
+  at `:70` (7 args → 9) and E22's further widening of that same site (9 args → 10).
+  Anything else in that file is **STOP AND REPORT**.
 - Create: `crates/cb-oracle/fixtures/ctr_buckets_simple/gen_fixtures.py`
 - Create + COMMIT: `.../{X_cat.npy,y.npy,model.json,predictions.npy,config.json}`
 - Create: `crates/cb-train/tests/ctr_buckets_simple_oracle_test.rs`
@@ -1452,19 +1584,41 @@ the same projection, whereas Borders/BTMV/Counter emit only `0`
 **Red**
 - File: `crates/cb-train/src/boosting_test.rs`
 - Test fn 1: `buckets_expansion_emits_both_target_border_indices`
+  **OBSERVATION CHANNEL (mandatory — channel (a), E15's extracted helpers).** Both
+  `cat_eligible_buckets` (`crates/cb-train/src/boosting.rs:3074`) and the column
+  list are `let` bindings **inside `train_inner`** and are unreachable from a
+  child-module test `[VERIFIED: LOCAL]`. This test therefore observes them through
+  the two `pub(crate) fn`s **E15 Green step 0 extracted** —
+  `materialize_ctr_columns_for_perm(..)` for the columns and
+  `cat_eligible_buckets_for(cat_columns, eligible_absolute)` for the bin columns.
+  E16 extends the FIRST helper's body over `(projection, b, prior)`; it adds no new
+  channel. The test **calls** both helpers; it re-implements neither.
   Setup: 1 CTR-eligible cat column, `simple_ctr = Buckets`,
   `simple_ctr_priors = [0.5]`, `max_ctr_complexity = 1`.
-  Expected: 2 columns, with `target_border_idx` sequence `[0, 1]`, and
+  Expected: `materialize_ctr_columns_for_perm(..)` returns 2 columns, with
+  `target_border_idx` sequence `[0, 1]`, and
   `assert_ne!(cols[0].bins, cols[1].bins)` — the anti-vacuity guard proving the
   index genuinely changes the column.
-  **Plus the `cat_eligible_buckets` no-growth pin:** assert
-  `cat_eligible_buckets` is **BYTE-UNCHANGED** across the expansion —
-  `assert_eq!(cat_eligible_buckets_after, cat_eligible_buckets_before)` (capture
-  the `Vec<Vec<u32>>` as built at `crates/cb-train/src/boosting.rs:3074` and
-  compare it element-for-element against the same build under the un-expanded
-  configuration; it has one column per CTR-**eligible categorical feature**, so
-  neither its length nor any element may move when the `(projection, b, prior)`
-  product grows). **Do NOT assert
+  **Plus the `cat_eligible_buckets` no-growth pin, made FALSIFIABLE:** in the SAME
+  test, with the SAME inputs, assert
+  ```rust
+  assert_eq!(cat_eligible_buckets_for(&cat_columns, &eligible_absolute).len(), 1,
+      "one bin column per CTR-ELIGIBLE CATEGORICAL FEATURE — never per emitted CTR column");
+  assert_eq!(cols.len(), 2,
+      "…while the (projection, b, prior) product HAS grown");
+  ```
+  i.e. the two lengths are pinned to **different** numbers from the **same**
+  fixture, so a change that made `cat_eligible_buckets` track the expansion fails
+  immediately. Also assert it is **BYTE-UNCHANGED** against the un-expanded
+  configuration (`simple_ctr = Borders`, which emits 1 column):
+  `assert_eq!(cat_eligible_buckets_for(..) /* Buckets run */,
+  cat_eligible_buckets_for(..) /* Borders run */)`, element for element.
+  **FORBIDDEN: re-deriving `cat_eligible_buckets` inside the test** (e.g. rebuilding
+  the `perfect_hash_bins` columns from `eligible_absolute` in the test body and
+  comparing that to itself). The re-derived expression does not depend on the
+  prior/border expansion at all, so the comparison is **tautological** and the pin
+  can never fail — while R11 calls this "the most fragile thing W3 can break".
+  **Do NOT assert
   `cat_eligible_buckets.len() == ctr_features.len()`** — that invariant is false
   (an earlier draft of this plan mandated it; it is hereby retracted), and making
   it pass would require duplicating or re-deriving the bin columns, which changes
@@ -1487,10 +1641,14 @@ the same projection, whereas Borders/BTMV/Counter emit only `0`
   `cargo test -p cb-train --test ctr_buckets_simple_oracle_test`
 
 **Green (minimal implementation intent).**
-1. In both materialization loops, nest
+1. Inside **`materialize_ctr_columns_for_perm`** — E15 Green step 0's `pub(crate)`
+   helper, which is the single body both `train_inner` materialization loops now
+   call, and the observation channel test fn 1 asserts through — nest
    `for b in 0..ctr_type.target_border_count(classes)` **outside** the prior loop,
    matching upstream's `(ctrIdx, targetBorderIdx, priorIdx)` nesting
    (`greedy_tensor_search.cpp:400-428`); pass `b` to `materialize_ctr_feature`.
+   **Do not re-inline the helper** and do not add a second expansion site;
+   `cat_eligible_buckets_for` is untouched by this task.
 2. **The whole-tree `target_border_idx` parameter is DELETED, not made optional.**
    Concretely, and with no remaining choice for the implementer:
    - `crates/cb-train/src/tree.rs:3296` reads **`column.target_border_idx`**
@@ -1576,20 +1734,23 @@ E15:
 | 2 | `crates/cb-train/tests/ordered_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
 | 3 | `crates/cb-train/tests/tensor_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
 | 4 | `crates/cb-train/tests/tensor_ctr_e2e_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 5 | `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 6 | `crates/cb-train/tests/multi_permutation_e2e_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 7 | `crates/cb-train/tests/multi_permutation_fold_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 8 | `crates/cb-model/tests/fstr_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
-| 9 | `crates/cb-train/tests/ctr_split_scoring_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (`target_border_idx: 0` at `:41`, `:68`; `materialize_ctr_feature` args at `:384`, `:394`), E11 (`bake_ctr_table` args at `:542`, `:576`, `:645`), E16 (five dropped args at `:99, :148, :191, :249, :305`), E22 (all five call sites again) |
+| 5 | `crates/cb-train/tests/multi_permutation_e2e_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
+| 6 | `crates/cb-train/tests/multi_permutation_fold_oracle_test.rs` | **ZERO DIFF REQUIRED** | none |
+| 7 | `crates/cb-model/tests/fstr_ctr_oracle_test.rs` | **ZERO DIFF REQUIRED** | none (but see the F08 `#[non_exhaustive]` note under the table) |
+| 8 | `crates/cb-train/tests/s_order_ctr_bins_oracle_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (`materialize_ctr_feature` args at `:70` — 7 args → 9), E22 (the same site again — 9 args → 10, `extra_cat_columns`) |
+| 9 | `crates/cb-train/tests/ctr_split_scoring_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (`target_border_idx: 0` at `:41`, `:68`; `materialize_ctr_feature` args at `:384`, `:394`), E11 (`bake_ctr_table` args at `:542`, `:576`, `:645`), E16 (five dropped args at `:99, :148, :191, :249, :305`), E22 (all five call sites again), F08 (the `cb_model::Model` literal at `:518` migrated to the `Model::new(..)` + builder form, forced by `#[non_exhaustive]`) |
 | 10 | `crates/cb-train/tests/ctr_feature_materialize_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E09 (widened `materialize_ctr_feature` calls + an ADDITIVE new test fn), E22 (ADDITIVE test fn 4 + the `extra_cat_columns` argument) |
 | 11 | `crates/cb-model/tests/ctr_data_roundtrip_test.rs` | **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** | E11 (ADDITIVE test fns 2 and 4 + the compile-forced `build_final_ctr` argument at `:101`, `:138`, `:143`, `:163`) |
 
-For rows 1–8, `git diff --stat` over those eight files must print **nothing**. For
-rows 9–11 the permitted diff is **signature-driven argument/field edits and ADDITIVE
+For rows 1–7, `git diff --stat` over those seven files must print **nothing**. For
+rows 8–11 the permitted diff is **signature-driven argument/field edits and ADDITIVE
 new test functions only**. **A diff that touches an EXISTING assertion in ANY of the
 eleven — added, removed, weakened or reworded — is a STOP-AND-REPORT condition.**
 At E16 row 9 additionally carries this task's five dropped `0` arguments
-(`:99, :148, :191, :249, :305`).
+(`:99, :148, :191, :249, :305`); row 8 still carries only E09's single widened
+`materialize_ctr_feature` call at `:70` (E22's second widening of that site comes
+later, in W5). The F08 `#[non_exhaustive]` note under E15's copy of this table
+applies here unchanged.
 
 ---
 

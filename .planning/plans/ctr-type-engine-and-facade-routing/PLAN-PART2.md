@@ -260,7 +260,94 @@ byte-unchanged.
 **Goal / observable completion condition.** `cb_model::Model` gains an explicit
 `cat_feature_count: usize` (default `0`, serde-default-preserving) set from the
 pool's **DECLARED** cat width at fit time, so no consumer ever derives a width from
-the splits the model happened to choose.
+the splits the model happened to choose. In the SAME task `Model` becomes
+`#[non_exhaustive]` and gains a constructor + builder surface, so that this field —
+and every future `Model` field — costs external crates **nothing**.
+
+**LOCKED DECISION (do not re-litigate): `#[non_exhaustive]` + a constructor.**
+`crates/cb-model/src/model.rs:305` is `#[derive(Debug, Clone, PartialEq)] pub
+struct Model`, with **no `Default`** and **no `#[non_exhaustive]`**, and a
+workspace-wide search for `..Default::default()` inside a `Model {` literal returns
+**0** `[VERIFIED: LOCAL grep]`. Every construction is therefore an exhaustive struct
+literal and would gain `error[E0063]: missing field cat_feature_count`. The recorded
+decision is to pay a **one-time** migration now and permanently prevent external
+breakage for every future `Model` field: `#[non_exhaustive]` makes struct-literal
+syntax illegal from any *other* crate, so from F08 onward a new `Model` field is a
+`cb-model`-internal change only.
+
+**Verified blast radius** (re-derive with the greps below; do NOT trust a
+hard-coded line list — line numbers drift):
+- **INSIDE the `cb-model` crate** (`crates/cb-model/src/**`, including the
+  `mod`-mounted unit-test files such as `cbm_test.rs`, `model_test.rs`,
+  `partial_dependence_test.rs`, …): `#[non_exhaustive]` does **NOT** affect
+  intra-crate literals. These need **only the new field added** —
+  `cat_feature_count: 0` — as a mechanical edit. Roughly **37** literals plus the
+  production sites `json.rs`, `cbm.rs` (×2), `model_sum.rs`, `model.rs`
+  (`from_trained`).
+- **OUTSIDE the `cb-model` crate**: `#[non_exhaustive]` **forbids struct-literal
+  syntax entirely**, so these MUST migrate to the constructor/builder form.
+  Two groups, and **both** are external crates:
+  1. `crates/catboost-rs` — **4** literals: `src/model_sum_test.rs:16`,
+     `src/onnx_test.rs:32`, `src/model_device_test.rs:25`, `:68`
+     `[VERIFIED: LOCAL grep -rnE '(^|[^a-zA-Z_:])Model \{' crates/catboost-rs]`;
+     and `crates/cb-train` — **1** literal:
+     `crates/cb-train/tests/ctr_split_scoring_test.rs:518`
+     `[VERIFIED: LOCAL]`. (PLAN-CHECK P4-4 says "2 in `cb-train`"; a fresh
+     `grep -rnE '(^|[^a-zA-Z_:])(cb_model::Model|CbModel) *\{' crates/cb-train`
+     finds exactly **one**. **The grep at execution time is authoritative.**)
+  2. **`crates/cb-model/tests/*.rs` — integration tests are SEPARATE CRATES**, so
+     `#[non_exhaustive]` applies to them exactly as it does to `catboost-rs` and
+     `cb-train`. This group was NOT in PLAN-CHECK P4-4's count and is the largest
+     part of the migration.
+     **No per-file breakdown is given here on purpose.** Five successive attempts
+     to enumerate this group by grep produced five different answers (36/12 files,
+     18/11, 18/9, 20/10, …), because the counts move with the regex — see the
+     warning below. The compiler produces the authoritative list; a plan-time
+     tally would only invite an executor to trust it.
+
+**Expected magnitude — NOT a work list.** External migration set is roughly
+**20–25** sites: the bulk in `crates/cb-model/tests`, **4 in `crates/catboost-rs`**
+(`src/model_sum_test.rs:16`, `src/onnx_test.rs:32`, `src/model_device_test.rs:25`,
+`:68` — all written `cb_model::Model {`, and twice mis-recorded as ZERO), and **1**
+in `crates/cb-train` (`tests/ctr_split_scoring_test.rs:518`). Intra-crate, roughly
+**20** sites in `cb-model/src`, including 4 written `crate::Model {` in
+`cbm_test.rs` that a `:`-excluding regex cannot see.
+
+Treat these as an order-of-magnitude sanity check on the compiler's output. If the
+compiler names far fewer or far more, STOP AND REPORT — that gap is the signal, not
+a number to reconcile by hand.
+
+> **⚠️ THIS COUNT HAS BEEN GOT WRONG FOUR TIMES, EACH BY A DIFFERENT GREP.**
+> Three distinct types are named `Model` — `cb_model::Model`,
+> `catboost_rs::Model` (`crates/catboost-rs/src/model.rs:64`) and
+> `cb_train::Model` (`crates/cb-train/src/boosting.rs:905`) — plus
+> `cm::Model` in `crates/cb-model/src/generated/coreml_generated.rs:25`. A regex
+> anchored on `Model {` conflates all four and also matches `-> Model {` return
+> types; a regex excluding `:` (e.g. `[^a-zA-Z_:]`) silently misses every
+> `cb_model::Model {` and `crate::Model {` construction, which is how
+> `crates/catboost-rs` was twice recorded as ZERO when it has four.
+>
+> **DO NOT trust any grep here, including the ones below. THE COMPILER IS THE
+> AUTHORITY.** See the locating procedure in the two bullets that follow.
+
+**No ZERO-DIFF oracle is affected.**
+`crates/cb-model/tests/fstr_ctr_oracle_test.rs` — one of the eleven SPEC-CTRT-18
+targets and **ZERO DIFF REQUIRED** — contains **no** `cb_model::Model` struct
+literal at all; its only `Model` occurrence is `fn loaded_model() -> CbModel {` at
+`:84`, a return type, and the model itself is loaded rather than constructed
+`[VERIFIED: LOCAL grep -nE 'Model *\{|Model::' crates/cb-model/tests/fstr_ctr_oracle_test.rs
+→ one hit, line 84]`. An earlier revision of this task claimed one literal here and
+raised a STOP-AND-REPORT open item on that basis; **that count was wrong (it
+matched the `-> CbModel {` return type) and the open item is withdrawn.**
+`ctr_data_roundtrip_test.rs`, the other cb-model oracle in the eleven, likewise
+contains no `Model` literal.
+
+`cbm_oracle_test.rs` (4) and `json_oracle_test.rs` (3) DO carry literals, but
+neither is among the eleven SPEC-CTRT-18 targets. They are float-only oracles the
+**one-hot** plan's SPEC-OH-31 lists as "must be edited by no task" — that plan has
+shipped, and this is a mechanical, assertion-preserving constructor migration, so
+record the diff in F08's completion evidence and state plainly that no assertion
+changed.
 
 **Why this and not the derived bound.** PLAN-CHECK CRITICAL-3, re-verified:
 `max(projection member) + 1` equals the true training width **only if** the
@@ -273,12 +360,56 @@ pool)` would be rejected. **A derived width is a data-dependent lower bound and
 must not be enforced as equality.**
 
 **Files**
-- Modify: `crates/cb-model/src/model.rs`
+- Modify: `crates/cb-model/src/model.rs` — add `#[non_exhaustive]` to `pub struct
+  Model`, add the `cat_feature_count: usize` field, add the constructor + builder
+  surface (Green step 2), and set the field in `from_trained` (`:359`).
 - Modify: `crates/cb-model/src/model_test.rs` (exists)
-- Modify: `crates/cb-model/src/{cbm,json}.rs` **only if** the field must survive
-  serialization — **it must NOT**: keep it a runtime-only field with
-  `#[serde(default)]` semantics so `.cbm`/`.json` bytes are untouched (E00/E20's
-  byte-identity gates would otherwise fail).
+- Modify: `crates/cb-model/src/{cbm,json}.rs` — **REQUIRED, mechanical.** These
+  hold **compile-forced production literals** (`json.rs:825`, `cbm.rs:1193`,
+  `cbm.rs:1318`) which cannot compile without the new field; the same applies to
+  `crates/cb-model/src/model_sum.rs:120`. Add `cat_feature_count: 0` at each (the
+  decoders have no cat width to report). **The earlier prohibition "modify
+  `{cbm,json}.rs` only if the field must survive serialization — it must NOT" was
+  SELF-CONTRADICTORY and is DELETED.** The accurate constraint is: do **not** touch
+  the FlatBuffers schema, the `.cbm` encoder's **byte output**, or `json.rs`'s
+  **serde shape** — `cat_feature_count` is **runtime-only** and is neither written
+  nor read by either codec, so E00's / `float_only_byte_identity`'s frozen
+  baselines stay valid (test fn 2 proves it).
+- Modify: **every remaining `cb_model::Model` struct literal inside the `cb-model`
+  crate** — **mechanical, forced by the new non-`Default` field; CHANGE NO
+  ASSERTION.** Add `cat_feature_count: 0`.
+  **Locating procedure (authoritative):** add the field, run
+  `cargo build -p cb-model --all-targets`, and fix exactly the sites the compiler
+  names with `error[E0063]: missing field cat_feature_count`. Repeat until clean.
+  Do NOT work from a hard-coded line list and do NOT trust a grep — a grep
+  excluding `:` misses the 4 `crate::Model {` literals in `cbm_test.rs`
+  (`:322`, `:879`, `:900`, `:1030`). Expect **21** sites.
+- Modify: **every `cb_model::Model` struct literal OUTSIDE the `cb-model` crate** —
+  **mechanical, forced by `#[non_exhaustive]`; CHANGE NO ASSERTION.** These must be
+  **migrated to constructor/builder form** (struct-literal syntax is no longer
+  legal for them).
+  **Locating procedure (authoritative):** add `#[non_exhaustive]`, run
+  `cargo build --workspace --all-targets`, and migrate exactly the sites the
+  compiler names with `error[E0639]` (cannot create a non-exhaustive struct using
+  a struct literal). Repeat until clean. Expect **23** sites. A grep may be used
+  as a pre-flight estimate ONLY, never as the work list — see the warning above.
+  The estimate below was enumerated at plan time and is the expected shape, not
+  the source of truth:
+  - `crates/catboost-rs/src/model_sum_test.rs:16`,
+    `crates/catboost-rs/src/onnx_test.rs:32`,
+    `crates/catboost-rs/src/model_device_test.rs:25`, `:68` — **4**;
+  - `crates/cb-train/tests/ctr_split_scoring_test.rs:518` — **1**. This file is
+    **one of the eleven SPEC-CTRT-18 oracle targets**; it sits in the
+    **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** row of the per-file diff gate
+    (PLAN.md §3.2 and the tables in E15/E16 Completion evidence), with **F08 named
+    as an owning task**. **Weakening or deleting any assertion in it is FORBIDDEN.**
+  - `crates/cb-model/tests/*.rs` — **18** across 11 files (see the blast-radius
+    block above). Two of these — `cbm_oracle_test.rs` and `json_oracle_test.rs` —
+    are float-only oracles the SHIPPED one-hot plan's SPEC-OH-31 listed as
+    "edited by no task"; the migration is mechanical and assertion-preserving, so
+    record the diff and state plainly that no assertion changed. **No ZERO-DIFF
+    oracle of THIS plan is affected** — `fstr_ctr_oracle_test.rs` and
+    `ctr_data_roundtrip_test.rs` contain no `cb_model::Model` struct literal.
 - **NOT** `crates/catboost-rs/src/builder.rs` — the call site belongs to **F09**,
   which lands after F08. F08 ships the field, the builder-style setter and the
   getter only; nothing calls them yet, which is exactly why F08 can precede F09.
@@ -288,8 +419,20 @@ must not be enforced as equality.**
   `region_trees`, `bias`, `float_feature_borders`, `ctr_data`, `approx_dimension`,
   `class_to_label` — **no cat count** (Part-2 PLAN finding **F3**, re-confirmed:
   the canonical model has no such field) `[VERIFIED: CODEGRAPH crates/cb-model/src/model.rs]`.
-- `Model::with_ctr_data` is the builder-style precedent to mirror for
-  `with_cat_feature_count` `[VERIFIED: Part-2 PLAN T08 anchor]`.
+- `Model::with_ctr_data(mut self, ctr_data: CtrData) -> Self` at
+  **`crates/cb-model/src/model.rs:530`** is the builder-style precedent to mirror
+  exactly for `with_cat_feature_count`
+  `[VERIFIED: LOCAL crates/cb-model/src/model.rs:527-533, read verbatim —
+  `#[must_use]`, `mut self`, one field assignment, `self`]`.
+- `Model::from_trained(trained: &cb_train::Model, float_feature_borders:
+  Vec<Vec<f64>>) -> Self` at **`crates/cb-model/src/model.rs:359`** is the
+  production constructor `[VERIFIED: LOCAL, read verbatim]`; it must set
+  `cat_feature_count: 0` (it has no pool, so the DECLARED width arrives later via
+  the builder — F09's job).
+- **`from_trained` alone cannot replace the external literals**: they build models
+  `from_trained` cannot express (hand-written `ObliviousTree`s, an explicit
+  `ctr_data`, `approx_dimension != 1`, a non-empty `class_to_label`). The migration
+  therefore needs a **base constructor plus per-field builders** — Green step 2.
 - `Pool::n_cat_features()` `[VERIFIED: Part-2 PLAN T08/T09 anchors, cb-data/src/pool.rs]`.
 
 **Red**
@@ -302,34 +445,102 @@ must not be enforced as equality.**
   Expected: `save_cbm` on a model with `cat_feature_count = 7` produces bytes
   **identical** to the same model with `cat_feature_count = 0`. This is what keeps
   E00's and `float_only_byte_identity`'s frozen baselines valid.
-- **EXPECTED INITIAL FAILURE:** `error[E0599]: no method named 'with_cat_feature_count'`.
+- Test fn 3 (**the external-construction guard — it must live in an INTEGRATION
+  target so it compiles as a separate crate**, e.g.
+  `crates/cb-model/tests/model_constructor_test.rs`):
+  `an_external_crate_can_build_every_model_shape_without_struct_literal_syntax`
+  Expected: the constructor + builders reproduce, by `assert_eq!` against a model
+  built inside `cb-model`, each shape the migrated sites need — trees + bias +
+  borders, `.with_ctr_data(..)`, `.with_approx_dimension(..)`,
+  `.with_class_to_label(..)`, `.with_cat_feature_count(..)`. Without this test the
+  `#[non_exhaustive]` decision is unverified from the outside.
+- **EXPECTED INITIAL FAILURE:**
+  1. `error[E0599]: no method named 'with_cat_feature_count'` (test fn 1).
+  2. `error[E0063]: missing field cat_feature_count in initializer of Model` —
+     emitted **once per intra-crate struct literal** the moment the field is added
+     (~37 in `crates/cb-model/src/**`, including the production sites `json.rs:825`,
+     `cbm.rs:1193`, `cbm.rs:1318`, `model_sum.rs:120`). `cargo test -p cb-model`
+     does not build until every one carries `cat_feature_count: 0`.
+  3. `error[E0639]: cannot create non-exhaustive struct using functional record
+     update syntax / struct expression` (the `#[non_exhaustive]` diagnostic) —
+     emitted **once per EXTERNAL struct literal**: 36 in
+     `crates/cb-model/tests/*.rs`, 4 in `crates/catboost-rs`, 1 in
+     `crates/cb-train/tests/ctr_split_scoring_test.rs`. Those targets do not build
+     until each is migrated to the constructor/builder form.
 - Run: `cargo test -p cb-model --lib model_test -- cat_feature_count`
 
-**Green.** Add the field with `Default` = `0`, a `#[must_use] pub fn
-with_cat_feature_count(mut self, n: usize) -> Self`, and a
-`#[must_use] pub fn cat_feature_count(&self) -> usize`. **Do not** touch the
-FlatBuffers schema, `cbm.rs`'s encoder, or `json.rs`.
+**Green.**
+1. Add `#[non_exhaustive]` to `pub struct Model` (`crates/cb-model/src/model.rs:305`,
+   keeping `#[derive(Debug, Clone, PartialEq)]`) and the field
+   `pub cat_feature_count: usize` (logical default `0`).
+2. Add the **constructor + builder surface**, every method `#[must_use]` and shaped
+   exactly like `with_ctr_data` (`:530`) — `mut self`, one assignment, `self`:
+   - `pub fn new(oblivious_trees: Vec<ObliviousTree>, bias: f64,
+     float_feature_borders: Vec<Vec<f64>>) -> Self` — every other field at its
+     zero/empty value (`approx_dimension: 1`, `cat_feature_count: 0`,
+     `ctr_data: None`, the two non-oblivious tree vectors empty);
+   - `with_cat_feature_count(mut self, n: usize) -> Self` (the field this task
+     exists for) and `pub fn cat_feature_count(&self) -> usize`;
+   - the builders the migration needs so external crates can still express every
+     shape: `with_non_symmetric_trees`, `with_region_trees`,
+     `with_approx_dimension`, `with_class_to_label` (`with_ctr_data` already
+     exists). Add **only** what a migrated site actually sets — no speculative API.
+3. Set `cat_feature_count: 0` in `from_trained` (`:359`) and in the four production
+   literals (`json.rs:825`, `cbm.rs:1193`, `cbm.rs:1318`, `model_sum.rs:120`).
+4. Add `cat_feature_count: 0` to every remaining **intra-crate** literal —
+   mechanical, **CHANGE NO ASSERTION**.
+5. Migrate every **external** literal to `Model::new(..)` + builders — mechanical,
+   **CHANGE NO ASSERTION**; the resulting `Model` must be field-for-field identical
+   to the literal it replaces.
+**Do not** touch the FlatBuffers schema, the `.cbm` encoder's **byte output**, or
+`json.rs`'s **serde shape**: `cat_feature_count` is runtime-only, neither written
+nor read by either codec.
+
+**Rationale, recorded so it is not re-litigated.** `#[non_exhaustive]` costs a
+one-time migration of the external literals **now** (5 outside `cb-model` + 36 in
+`cb-model`'s own integration targets) and **permanently prevents external breakage
+for every future `Model` field** — this exact defect class (a shared struct grows a
+field while consumers sit in no task's Files list) has now been found four times in
+this plan. Without it, every later field repeats the whole blast radius.
 
 **Refactor constraints + required regression scope**
 - Constraint: **SPEC-CATF §7 lists `cb-model` as verification-only.** This task is
   an explicit, recorded amendment to that section (PLAN-CHECK revision #3,
   option 1). State the amendment in `../catboost-builder-cat-features-routing/SPEC.md`
   §7 in the same change.
+- Constraint: **the `#[non_exhaustive]` migration is MECHANICAL in every file it
+  touches.** No assertion may be added, removed, weakened or reworded anywhere —
+  in particular not in `cbm_oracle_test.rs`, `json_oracle_test.rs`,
+  `fstr_ctr_oracle_test.rs` or `crates/cb-train/tests/ctr_split_scoring_test.rs`,
+  all of which carry frozen assertions gated elsewhere in this plan. **A migrated
+  site must produce a `Model` field-for-field identical to the literal it replaced.**
 - Regression scope: `cargo test -p cb-model`, especially
   `ctr_nonmean_byte_identity_test` (E00), `float_only_byte_identity_test`,
-  `cbm_oracle_test`, `json_oracle_test`, `model_sum_test`.
+  `cbm_oracle_test`, `json_oracle_test`, `model_sum_test`; **plus
+  `cargo test -p catboost-rs` and `cargo test -p cb-train --test
+  ctr_split_scoring_test`, the two other crates the migration reaches.**
 
 **Validation**
 ```bash
 cargo test -p cb-model --lib model_test
+cargo test -p cb-model --test model_constructor_test
 cargo test -p cb-model --test ctr_nonmean_byte_identity_test \
   --test float_only_byte_identity_test --test cbm_oracle_test --test json_oracle_test
 cargo test -p cb-model -p catboost-rs
-cargo clippy -p cb-model --all-targets
+cargo test -p cb-train --test ctr_split_scoring_test --test fstr_ctr_oracle_test
+cargo clippy -p cb-model -p catboost-rs --all-targets
 ```
 
-**Completion evidence.** Both tests green — in particular the `.cbm` byte-identity
-guard, which proves the field is runtime-only.
+**Completion evidence.** All three tests green — in particular the `.cbm`
+byte-identity guard, which proves the field is runtime-only, and the external
+construction guard, which proves `#[non_exhaustive]` left no shape unexpressible.
+**Migration accounting:** `git diff --stat` shows the intra-crate literals gaining
+exactly one `cat_feature_count: 0` line each, and every external literal replaced
+by a `Model::new(..)` + builder chain — **no assertion touched in any file**.
+`grep -rnE '(^|[^a-zA-Z_:>-])Model \{' crates/cb-train crates/cb-model/tests`
+(excluding `-> Model {` return types) returns **zero** `cb_model::Model` struct
+literals afterwards — all 19 have moved to constructor form. No ZERO-DIFF oracle of
+this plan is touched.
 
 ---
 
