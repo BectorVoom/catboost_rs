@@ -1879,12 +1879,16 @@ fn normalize_leaf_values(
 /// diverges from the structure partition (`[6,0,7,17]` vs `[6,0,9,15]` for the
 /// tensor_ctr_e2e config).
 ///
-/// `averaging_ctr_features` is index-aligned with the structure
-/// `materialized_ctr_features` (same projection order), and a `LevelKind::Ctr`'s
-/// `ctr_idx` indexes the tree's chosen `ctr_splits`, whose projection identifies
-/// which averaging column to read. Out-of-range indices contribute a `false` bit
+/// `ctr_columns` is whichever fold's materialized CTR column set the caller
+/// wants the partition under — the AVERAGING fold's for the leaf-VALUE
+/// partition, or a LEARNING fold's for that fold's own approx update
+/// (`UpdateLearningFold`, `train.cpp:585`). All fold column sets are emitted by
+/// the same `materialize_ctr_columns_for_perm`, so the candidate-identity keys
+/// used below are aligned across folds by construction. A `LevelKind::Ctr`'s
+/// `ctr_idx` indexes the tree's chosen `ctr_splits`, whose candidate identity
+/// selects which column to read. Out-of-range indices contribute a `false` bit
 /// defensively (checked `.get` only — no panic, no raw index).
-fn assign_leaf_of_averaging(
+fn assign_leaf_over_ctr_columns(
     matrix: &FeatureMatrix,
     averaging_ctr_features: &[crate::ctr::CtrFeatureColumn],
     grown: &GrownTree,
@@ -1926,13 +1930,26 @@ fn assign_leaf_of_averaging(
                     LevelKind::Ctr { ctr_idx, border } => grown
                         .ctr_splits
                         .get(*ctr_idx)
-                        // Find the averaging column whose projection matches this
-                        // chosen CTR split (index-aligned with the structure
-                        // columns; the projection is the stable key).
+                        // Find the averaging column this chosen CTR split was
+                        // scored on. The key is the FULL candidate identity —
+                        // `(projection, ctr_type, target_border_idx, prior)` —
+                        // NOT the projection alone (E15): the multi-prior
+                        // expansion emits one column per prior on the same
+                        // projection, so a projection-only `find` would silently
+                        // return the HEAD prior's column and partition the leaf
+                        // VALUES on bins the structure search never scored. Both
+                        // sides of the prior comparison originate from the same
+                        // configured list element (the column's prior is copied
+                        // verbatim onto the split in `crate::tree`), so bit
+                        // equality is exact rather than approximate.
                         .and_then(|spec| {
-                            averaging_ctr_features
-                                .iter()
-                                .find(|c| c.projection == spec.projection)
+                            averaging_ctr_features.iter().find(|c| {
+                                c.projection == spec.projection
+                                    && c.ctr_type == spec.ctr_type
+                                    && c.target_border_idx == spec.target_border_idx
+                                    && c.prior_num.to_bits() == spec.prior_num.to_bits()
+                                    && c.prior_denom.to_bits() == spec.prior_denom.to_bits()
+                            })
                         })
                         .and_then(|col| col.bins.get(obj))
                         .is_some_and(|&bin| f64::from(bin) > *border),
@@ -1968,8 +1985,10 @@ fn assign_leaf_of_averaging(
 /// `combinations_ctr_priors.first()` fed BOTH, so the combination prior silently
 /// governed simple candidates — the bug SPEC-CTRT-10 fixes.
 ///
-/// Still exactly ONE prior per candidate (`.first()`): expanding the full prior
-/// list into separate candidates is W3 (E15).
+/// Returns only the HEAD prior. The candidate MATERIALIZATION expands over the
+/// whole list (E15, [`ctr_config_list_for`]); this single-prior form survives for
+/// [`ctr_splits_for_tree`], the no-CTR-candidate fallback where no materialized
+/// column exists to carry a per-candidate prior.
 fn ctr_config_for(
     simple_ctr: crate::ctr::ECtrType,
     simple_priors: &[f64],
@@ -1977,13 +1996,143 @@ fn ctr_config_for(
     combinations_priors: &[f64],
     is_simple: bool,
 ) -> (crate::ctr::ECtrType, f64) {
+    let (ctr_type, priors) = ctr_config_list_for(
+        simple_ctr,
+        simple_priors,
+        combinations_ctr,
+        combinations_priors,
+        is_simple,
+    );
+    (ctr_type, priors.first().copied().unwrap_or(DEFAULT_CTR_PRIOR))
+}
+
+/// The prior a candidate falls back to when its configured prior list is EMPTY.
+/// Matches the pre-E15 `.first().unwrap_or(0.5)` behavior exactly, so an empty
+/// list still emits exactly one column at `0.5`.
+const DEFAULT_CTR_PRIOR: f64 = 0.5;
+
+/// The prior list an empty configuration degenerates to — one column at
+/// [`DEFAULT_CTR_PRIOR`], never zero columns.
+const DEFAULT_CTR_PRIORS: [f64; 1] = [DEFAULT_CTR_PRIOR];
+
+/// Resolve the `(CTR type, FULL prior list)` pair that governs ONE candidate
+/// (SPEC-CTRT-10 / SPEC-CTRT-11).
+///
+/// The list half is what E15 needs: upstream emits one candidate column per
+/// `(ctrIdx, targetBorderIdx, priorIdx)` (`greedy_tensor_search.cpp:414-427`), so
+/// every configured prior produces its own scored column. An EMPTY configured
+/// list degenerates to `[DEFAULT_CTR_PRIOR]` rather than to no columns, keeping
+/// the pre-E15 `.first().unwrap_or(0.5)` behavior byte-identical.
+fn ctr_config_list_for<'a>(
+    simple_ctr: crate::ctr::ECtrType,
+    simple_priors: &'a [f64],
+    combinations_ctr: crate::ctr::ECtrType,
+    combinations_priors: &'a [f64],
+    is_simple: bool,
+) -> (crate::ctr::ECtrType, &'a [f64]) {
     let (ctr_type, priors) = if is_simple {
         (simple_ctr, simple_priors)
     } else {
         (combinations_ctr, combinations_priors)
     };
-    (ctr_type, priors.first().copied().unwrap_or(0.5))
+    if priors.is_empty() {
+        (ctr_type, &DEFAULT_CTR_PRIORS)
+    } else {
+        (ctr_type, priors)
+    }
 }
+
+/// The RAW per-object categorical-bucket column for every CTR-eligible cat
+/// feature — the `model_size_reg` cat-feature-weight input (`GetCatFeatureWeight`,
+/// `greedy_tensor_search.cpp:908-932`), consumed by an order-insensitive `.max()`
+/// in [`crate::tree::select_level_ctr_aware`]'s phantom mixed-partition bucket
+/// count.
+///
+/// **One column per CTR-eligible categorical FEATURE, never per emitted CTR
+/// candidate column.** It is NOT index-aligned with the materialized CTR column
+/// list and MUST NOT grow with the `(projection, prior)` — after E16,
+/// `(projection, target_border_idx, prior)` — candidate expansion: growing it
+/// would change `phantom_mixed_bucket_count`, hence `model_size_reg`'s
+/// cat-feature weight, hence split choice. Taking `eligible_absolute` rather than
+/// the column list is precisely what makes that structurally impossible.
+///
+/// Empty for the numeric path (`cat_columns` empty ⇒ `eligible_absolute` empty),
+/// a provable no-op there.
+pub(crate) fn cat_eligible_buckets_for(
+    cat_columns: &[Vec<String>],
+    eligible_absolute: &[usize],
+) -> CbResult<Vec<Vec<u32>>> {
+    eligible_absolute
+        .iter()
+        .map(|&abs_idx| match cat_columns.get(abs_idx) {
+            Some(col) => {
+                let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+                cb_data::perfect_hash_bins(&as_str)
+            }
+            None => Ok(Vec::new()),
+        })
+        .collect::<CbResult<Vec<Vec<u32>>>>()
+}
+
+/// Materialize the online CTR candidate columns for ONE permutation — the single
+/// place the candidate product is built (E15).
+///
+/// `train_inner` calls this twice: once per STRUCTURE learning fold (each fold's
+/// own permutation) and once for the AVERAGING fold. Because both go through this
+/// one function, the index alignment the chosen-split → averaging-column lookup
+/// depends on holds by construction rather than by convention.
+///
+/// The emitted order is upstream's `(ctrIdx, priorIdx)` nesting
+/// (`greedy_tensor_search.cpp:414-427`): for each candidate, one column per prior
+/// in configured list order. E16 inserts the `targetBorderIdx` loop between them.
+/// With a single-element prior list the sequence is byte-identical to the
+/// pre-E15 one-column-per-candidate emission (the D-04 no-op proof).
+pub(crate) fn materialize_ctr_columns_for_perm(
+    cat_columns: &[Vec<String>],
+    absolute_projections: &[crate::TProjection],
+    ctr_candidates: &[crate::candidates::CtrCandidate],
+    params: &BoostParams,
+    permutation: &[i32],
+    target_class: &[usize],
+    ctr_border_count: usize,
+) -> CbResult<Vec<crate::ctr::CtrFeatureColumn>> {
+    let mut cols = Vec::with_capacity(ctr_candidates.len());
+    for (ci, proj) in absolute_projections.iter().enumerate() {
+        // `absolute_projections` is index-aligned with `ctr_candidates`, so
+        // `is_simple` is available without a second lookup.
+        let is_simple = ctr_candidates.get(ci).is_some_and(|c| c.is_simple);
+        let (ctr_type, priors) = ctr_config_list_for(
+            params.simple_ctr,
+            &params.simple_ctr_priors,
+            params.combinations_ctr,
+            &params.combinations_ctr_priors,
+            is_simple,
+        );
+        for &prior_num in priors {
+            let col = crate::ctr::materialize_ctr_feature(
+                cat_columns,
+                proj,
+                permutation,
+                target_class,
+                prior_num,
+                // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
+                CTR_PRIOR_DENOM,
+                ctr_border_count,
+                ctr_type,
+                // W3 (E16) expands the border index.
+                0,
+            )?;
+            cols.push(col);
+        }
+    }
+    Ok(cols)
+}
+
+/// The CTR prior DENOMINATOR. Constant `1` on the CPU path (RESEARCH A6; a
+/// non-unit denominator is forbidden by `ctr_helper.cpp:50`), carried as a
+/// separate half so the bake receives the denominator for `calc_normalization`
+/// rather than a pre-divided scalar.
+const CTR_PRIOR_DENOM: f64 = 1.0;
 
 fn ctr_splits_for_tree(
     candidates: &[crate::candidates::CtrCandidate],
@@ -3148,16 +3297,8 @@ fn train_inner<R: Runtime>(
     // SPEC.md §7 rather than a new hand-rolled hashing loop). Empty for the
     // numeric path (`cat_columns` empty ⇒ `eligible_absolute` empty), a
     // provable no-op there.
-    let cat_eligible_buckets: Vec<Vec<u32>> = eligible_absolute
-        .iter()
-        .map(|&abs_idx| match cat_columns.get(abs_idx) {
-            Some(col) => {
-                let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
-                cb_data::perfect_hash_bins(&as_str)
-            }
-            None => Ok(Vec::new()),
-        })
-        .collect::<CbResult<Vec<Vec<u32>>>>()?;
+    let cat_eligible_buckets: Vec<Vec<u32>> =
+        cat_eligible_buckets_for(cat_columns, &eligible_absolute)?;
 
     // The TWO permutations for the cat-CTR two-materialization (research Q1/Q3),
     // now CARRYING the initial learn-set shuffle `S` in the averaging order (ORD-01
@@ -3235,17 +3376,13 @@ fn train_inner<R: Runtime>(
     // `target_class[i] = usize::from(target[i] > 0.5)`.
     let target_class: Vec<usize> = target.iter().map(|&t| usize::from(t > 0.5)).collect();
 
-    // The CTR prior DENOMINATOR. It is the constant `1` on the CPU path
-    // (RESEARCH A6; a non-unit denominator is forbidden by `ctr_helper.cpp:50`),
-    // and it is carried as a separate half so the Plan 05-12 bake receives the
-    // denominator for `calc_normalization` rather than a pre-divided scalar.
-    //
-    // There is deliberately NO shared prior NUMERATOR here any more (E10 /
-    // SPEC-CTRT-10): the numerator is resolved PER CANDIDATE by `ctr_config_for`,
-    // because `simple_ctr_priors` and `combinations_ctr_priors` are distinct
-    // lists. A single hoisted `combinations_ctr_priors.first()` is exactly the
-    // bug that made the combination prior govern simple candidates.
-    let ctr_prior_denom = 1.0;
+    // There is deliberately NO shared prior NUMERATOR here (E10 / SPEC-CTRT-10):
+    // the numerator is resolved PER CANDIDATE — and, after E15, per (candidate,
+    // prior) — inside `materialize_ctr_columns_for_perm`, because
+    // `simple_ctr_priors` and `combinations_ctr_priors` are distinct lists. A
+    // single hoisted `combinations_ctr_priors.first()` is exactly the bug that
+    // made the combination prior govern simple candidates. The DENOMINATOR is the
+    // constant [`CTR_PRIOR_DENOM`].
     let ctr_border_count = ctr_border_count_default();
 
     // Resolve the per-candidate ABSOLUTE projections ONCE (re-index the CTR-
@@ -3329,33 +3466,15 @@ fn train_inner<R: Runtime>(
                     })
                     .unwrap_or_else(|| (0..n as i32).collect())
             };
-            let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for (ci, proj) in absolute_projections.iter().enumerate() {
-                // `absolute_projections` is index-aligned with `ctr_candidates`,
-                // so `is_simple` is available without a second lookup.
-                let is_simple = ctr_candidates.get(ci).is_some_and(|c| c.is_simple);
-                let (ctr_type, prior_num) = ctr_config_for(
-                    params.simple_ctr,
-                    &params.simple_ctr_priors,
-                    params.combinations_ctr,
-                    &params.combinations_ctr_priors,
-                    is_simple,
-                );
-                let col = crate::ctr::materialize_ctr_feature(
-                    cat_columns,
-                    proj,
-                    &perm,
-                    &target_class,
-                    prior_num,
-                    ctr_prior_denom,
-                    ctr_border_count,
-                    ctr_type,
-                    // W3 (E16) expands the border index.
-                    0,
-                )?;
-                cols.push(col);
-            }
-            per_fold.push(cols);
+            per_fold.push(materialize_ctr_columns_for_perm(
+                cat_columns,
+                &absolute_projections,
+                &ctr_candidates,
+                params,
+                &perm,
+                &target_class,
+                ctr_border_count,
+            )?);
         }
         per_fold
     } else {
@@ -3378,29 +3497,15 @@ fn train_inner<R: Runtime>(
     // order), so a chosen structure CTR split maps to the same averaging column.
     let averaging_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
         if let Some(avg_perm) = cat_averaging_permutation.as_deref() {
-            let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for (ci, proj) in absolute_projections.iter().enumerate() {
-                let is_simple = ctr_candidates.get(ci).is_some_and(|c| c.is_simple);
-                let (ctr_type, prior_num) = ctr_config_for(
-                    params.simple_ctr,
-                    &params.simple_ctr_priors,
-                    params.combinations_ctr,
-                    &params.combinations_ctr_priors,
-                    is_simple,
-                );
-                let col = crate::ctr::materialize_ctr_feature(
-                    cat_columns,
-                    proj,
-                    avg_perm,
-                    &target_class,
-                    prior_num, ctr_prior_denom,
-                    ctr_border_count,
-                    ctr_type,
-                    0,
-                )?;
-                cols.push(col);
-            }
-            cols
+            materialize_ctr_columns_for_perm(
+                cat_columns,
+                &absolute_projections,
+                &ctr_candidates,
+                params,
+                avg_perm,
+                &target_class,
+                ctr_border_count,
+            )?
         } else {
             Vec::new()
         };
@@ -3800,6 +3905,72 @@ fn train_inner<R: Runtime>(
     // whose host draw order is load-bearing for upstream parity.
     let device_poisson =
         device_active && matches!(params.bootstrap_type, EBootstrapType::Poisson);
+
+    // One approx per LEARNING fold (Plain CTR path — `TFold`/`UpdateLearningFold`,
+    // `train.cpp:585`). Upstream's structure search does NOT read the averaging
+    // fold's derivatives: each learning fold carries its OWN approx, advanced every
+    // iteration over that fold's OWN CTR-bin leaf assignment, and the greedy search
+    // consumes the TAKEN fold's derivatives. With CTRs the fold partition diverges
+    // from the averaging partition from iteration 1 on (structure bins ≠ averaging
+    // bins), so feeding the single averaging approx to the search accumulates drift
+    // until a split choice flips — invisible on the committed 5-iteration CTR
+    // oracles, a >1e-1 prediction divergence by 20 iterations (the
+    // `ctr_borders_multiprior` localization, 2026-08-02). EMPTY on every non-CTR
+    // path (`structure_fold_columns` is empty there), so the float / one-hot /
+    // ordered / grouped paths are structurally byte-identical.
+    let mut fold_approxes: Vec<Vec<f64>> = if structure_fold_columns.is_empty() {
+        Vec::new()
+    } else {
+        vec![approx.clone(); structure_fold_columns.len()]
+    };
+
+    // EXP-DOMAIN approx semantics for `IsStoreExpApprox` losses on the CTR path
+    // (`approx_updater_helpers.h:60-72`; see [`crate::fast_approx`]). Upstream
+    // stores every TRAINING-FOLD approx (learning folds AND the averaging fold)
+    // as `exp(approx)` for these losses, and applies deltas through APPROXIMATE
+    // transcendentals — `fmath::expd_v` per leaf, `fast_exp(FastLogf(·)·lr)` per
+    // document. Their ~1e-6 per-application error feeds the next iteration's
+    // derivatives and moves greedy split scores across tie-break boundaries by
+    // ~10-20 iterations, so an exact-`exp` engine diverges from upstream's
+    // chosen STRUCTURE at iteration scale (the `ctr_borders_multiprior`
+    // localization, verified against an instrumented v1.2.10 build).
+    //
+    // Scope: the cat-CTR path (`structure_fold_columns` non-empty) with the
+    // binclf losses, matching every committed CTR fixture. The float-only /
+    // one-hot Logloss paths keep the exact-`exp` derivative stream — their
+    // committed oracles prove the divergence stays under the 1e-5 gate at their
+    // iteration scale; widening the exp-domain semantics to those paths is a
+    // recorded follow-up, not a silent behavior change here. The model-output
+    // approx (`approx`, upstream's `AvrgApprox`) STAYS linear and exact — only
+    // derivative computation reads the exp-domain buffers.
+    let exp_ctr = !structure_fold_columns.is_empty()
+        && matches!(params.loss, cb_compute::Loss::Logloss | cb_compute::Loss::CrossEntropy)
+        && approx_dimension == 1;
+    // The averaging fold's exp approx (`AveragingFold.BodyTailArr[0].Approx`) —
+    // feeds the LEAF-VALUE derivatives. Initialized like upstream's
+    // `InitApproxes` + `ExpApproxIf` (the fmath batch exp of the starting
+    // approx; `fmath_expd(0) == 1` for the un-biased binclf start).
+    let mut avg_exp_approx: Vec<f64> = if exp_ctr {
+        approx.iter().map(|&a| crate::fast_approx::fmath_expd(a)).collect()
+    } else {
+        Vec::new()
+    };
+    // Learning-fold approxes switch to exp domain under the same gate.
+    if exp_ctr {
+        for fa in &mut fold_approxes {
+            for v in fa.iter_mut() {
+                *v = crate::fast_approx::fmath_expd(*v);
+            }
+        }
+    }
+
+    // `TLearnProgress::UsedCtrSplits` (learn_context.h:108) — the MODEL-LIFETIME
+    // set of `(ctr_type, projection)` pairs some already-grown tree split on.
+    // `GetCatFeatureWeight` lifts the model-size penalty (weight 1.0) for
+    // members; `ProcessCtrSplit` inserts the pair the moment a level chooses a
+    // CTR split (greedy_tensor_search.cpp:926-950, :1126). Accumulated across
+    // the whole fit and passed into every tree's structure search.
+    let mut used_ctr_splits: Vec<(i8, crate::TProjection)> = Vec::new();
 
     for iter in 0..params.iterations {
         // GPUT-01 DEVICE GROW BRANCH (D-10-01 per-fit all-or-nothing). When the fit
@@ -4388,6 +4559,12 @@ fn train_inner<R: Runtime>(
                 }
             }
         }
+        // STRUCTURE-fold cycling (Task 4): THIS iteration's learning fold.
+        // `taken_fold = struct_fold_cycle[iter]` (defaulting to 0); hoisted above
+        // the derivative computation because the SEARCH derivatives come from the
+        // taken fold's own approx (fold-approx semantics, see `fold_approxes`).
+        let taken_fold = struct_fold_cycle.get(iter).copied().unwrap_or(0);
+
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
         //    `approx` is the DIMENSION-MAJOR flat buffer `approx[d*n+i]` of length
         //    `approx_dimension * n` (Plan 06.2-02). The backend runs an OUTER
@@ -4430,6 +4607,21 @@ fn train_inner<R: Runtime>(
                     der1.len(),
                     der2.len()
                 )));
+            }
+            Derivatives { der1, der2 }
+        } else if exp_ctr {
+            // LEAF-VALUE derivatives from the AVERAGING fold's EXP-domain approx
+            // (`CalcApproxesLeafwise` reads `AveragingFold.BodyTailArr[0].Approx`,
+            // which upstream stores as exp for these losses and advances through
+            // the approximate `fmath::expd_v` pipeline — see `avg_exp_approx`).
+            // The linear `approx` stays the metrics/output stream (AvrgApprox).
+            let mut der1 = Vec::with_capacity(n);
+            let mut der2 = Vec::with_capacity(n);
+            for (i, &e) in avg_exp_approx.iter().enumerate() {
+                let t = target.get(i).copied().unwrap_or(0.0);
+                let (d1, d2) = crate::fast_approx::logloss_ders_exp(e, t);
+                der1.push(d1);
+                der2.push(d2);
             }
             Derivatives { der1, der2 }
         } else {
@@ -4478,6 +4670,49 @@ fn train_inner<R: Runtime>(
                 .collect()
         };
 
+        // FOLD-APPROX SEARCH DERIVATIVES (Plain CTR path). The structure search —
+        // and everything scoped to it: the bootstrap/MVS per-object der, the
+        // sampled score buffers, and the random-strength score std-dev
+        // (`CalcDerivativesStDevFromZeroPlainBoosting` reads the fold passed to
+        // `GreedyTensorSearch`) — consumes the TAKEN learning fold's derivatives,
+        // computed from that fold's own approx. The LEAF path below keeps the
+        // averaging `ders`/`weighted_der1` untouched. `fold_approxes` is empty on
+        // every non-CTR path and the grouped seam never co-occurs with CTR
+        // candidates, so `search_weighted_der1` aliases `weighted_der1` there —
+        // byte-identical.
+        let search_ders_owned: Option<Derivatives> = match fold_approxes.get(taken_fold) {
+            Some(fold_approx) if group_spans.is_none() => Some(if exp_ctr {
+                // `CalcWeightedDerivatives` on the fold's EXP-domain approx:
+                // `p = 1 - 1/(1+e)` (the upstream rounding order, see
+                // `fast_approx::logloss_ders_exp`).
+                let mut der1 = Vec::with_capacity(n);
+                let mut der2 = Vec::with_capacity(n);
+                for (i, &e) in fold_approx.iter().enumerate() {
+                    let t = target.get(i).copied().unwrap_or(0.0);
+                    let (d1, d2) = crate::fast_approx::logloss_ders_exp(e, t);
+                    der1.push(d1);
+                    der2.push(d2);
+                }
+                Derivatives { der1, der2 }
+            } else {
+                runtime.compute_gradients(&params.loss, fold_approx, target, approx_dimension)?
+            }),
+            _ => None,
+        };
+        let search_weighted_der1_owned: Option<Vec<f64>> = search_ders_owned.as_ref().map(|sd| {
+            sd.der1
+                .iter()
+                .enumerate()
+                .map(|(idx, &d)| {
+                    let i = idx % n;
+                    let w = weights.get(i).copied().unwrap_or(1.0);
+                    d * w
+                })
+                .collect()
+        });
+        let search_weighted_der1: &[f64] =
+            search_weighted_der1_owned.as_deref().unwrap_or(&weighted_der1);
+
         // EFFECTIVE histogram / leaf weight (LOSS-04, 06.3-09): for a
         // pairwise-loss (`UsesPairsForCalculation` — PairLogit / PairLogitPairwise /
         // YetiRank{,Pairwise}) the split-scoring histogram `sumWeight` and the
@@ -4515,11 +4750,14 @@ fn train_inner<R: Runtime>(
         // already has length `n`, so the scalar bootstrap/MVS inputs are
         // byte-identical to before (D-04). The per-dim squares route through the
         // sanctioned ordered `sum_f64` (D-08).
+        // Fold-approx semantics: the bootstrap/MVS input is the SEARCH (taken
+        // learning fold) derivative — `search_weighted_der1` aliases
+        // `weighted_der1` on every non-CTR path.
         let der_obj: Vec<f64> = (0..n)
             .map(|i| {
                 let squares: Vec<f64> = (0..approx_dimension)
                     .map(|d| {
-                        let v = weighted_der1.get(d * n + i).copied().unwrap_or(0.0);
+                        let v = search_weighted_der1.get(d * n + i).copied().unwrap_or(0.0);
                         v * v
                     })
                     .collect();
@@ -4568,7 +4806,7 @@ fn train_inner<R: Runtime>(
         // (tensor_search_helpers.cpp:468-472 — the same per-object weight the
         // leaf path already shares). At `approx_dimension == 1`, `idx % n == idx`
         // so this is byte-identical to the prior per-object zip (D-04).
-        let score_weighted_der1: Vec<f64> = weighted_der1
+        let score_weighted_der1: Vec<f64> = search_weighted_der1
             .iter()
             .enumerate()
             .map(|(idx, &d)| {
@@ -4653,7 +4891,10 @@ fn train_inner<R: Runtime>(
             // 106, 125). At dim=1, `weighted_der1.len() == n` so this is
             // byte-identical to the prior call (D-04).
             let std_dev = if perturb_active {
-                score_st_dev(params.random_strength, &weighted_der1, n, model_length)
+                // Fold-approx semantics: the score std-dev reads the fold handed
+                // to the search (`CalcDerivativesStDevFromZeroPlainBoosting`) —
+                // aliases `weighted_der1` on every non-CTR path.
+                score_st_dev(params.random_strength, search_weighted_der1, n, model_length)
             } else {
                 0.0
             };
@@ -4671,12 +4912,12 @@ fn train_inner<R: Runtime>(
         // false for them and they keep their exact previous dispatch.
         let has_ctr = !materialized_ctr_features.is_empty();
         // STRUCTURE-fold cycling (Task 4): select THIS iteration's learning fold's
-        // structure CTR columns. `taken_fold = struct_fold_cycle[iter]` (defaulting
-        // to 0). For learning_folds==1 the cycle is all-zeros, so this is always
+        // structure CTR columns (`taken_fold` was hoisted above the derivative
+        // computation — the search derivatives come from that fold's approx). For
+        // learning_folds==1 the cycle is all-zeros, so this is always
         // `structure_fold_columns[0]` == the prior fixed `materialized_ctr_features`
         // (byte-identical). For pc=4 it cycles `[0,2,0,2,2]`, materializing the tree
         // STRUCTURE under fold 0 (borders [7,2]) or fold 2 (borders [3,7]) per iter.
-        let taken_fold = struct_fold_cycle.get(iter).copied().unwrap_or(0);
         let iter_ctr_features: &[crate::ctr::CtrFeatureColumn] = structure_fold_columns
             .get(taken_fold)
             .map_or(materialized_ctr_features.as_slice(), Vec::as_slice);
@@ -4773,8 +5014,14 @@ fn train_inner<R: Runtime>(
                 &matrix,
                 iter_ctr_features,
                 ctr_border_count,
-                &weighted_der1,
-                &weights,
+                // FOLD-APPROX SEMANTICS: the structure search consumes the TAKEN
+                // learning fold's derivatives (`search_weighted_der1`), sampled/
+                // masked exactly like the float arm (`score_weighted_der1` is
+                // built FROM the search der above). At bootstrap_type=No +
+                // random_strength=0 — every committed CTR fixture — the mask is
+                // an element-wise no-op, so this equals the fold der verbatim.
+                &score_weighted_der1,
+                &score_weights,
                 scaled_l2,
                 params.depth,
                 n,
@@ -4786,6 +5033,7 @@ fn train_inner<R: Runtime>(
                 model_size_reg_default(),
                 params.score_function,
                 &cat_eligible_buckets,
+                &used_ctr_splits,
             )?
         } else {
             match ordered_learning_perm.as_deref() {
@@ -4846,6 +5094,18 @@ fn train_inner<R: Runtime>(
             }
             }
         };
+
+        // `ProcessCtrSplit` (greedy_tensor_search.cpp:1126): every CTR split
+        // this tree chose enters the model-lifetime `UsedCtrSplits` set, so the
+        // NEXT tree's `GetCatFeatureWeight` scores the pair at weight 1.0
+        // (within-tree lifting is handled inside `select_level_ctr_aware` off
+        // `chosen`). De-duplicated — the set semantics of the upstream THashSet.
+        for spec in &grown.ctr_splits {
+            let key = (spec.ctr_type, spec.projection.clone());
+            if !used_ctr_splits.contains(&key) {
+                used_ctr_splits.push(key);
+            }
+        }
 
         // Per-tree leaf count: a non-symmetric leaf-wise tree has a DISTINCT leaf
         // count (number of terminal nodes), NOT `2^depth`. Shadow `n_leaves` for the
@@ -5021,7 +5281,7 @@ fn train_inner<R: Runtime>(
         // (byte-identical to before — the numeric / one-hot / ordered oracles are
         // provably unaffected by the gate below).
         let leaf_value_leaf_of: Vec<usize> = if has_ctr {
-            assign_leaf_of_averaging(&matrix, &averaging_ctr_features, &grown, n)
+            assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown, n)
         } else {
             grown.leaf_of.clone()
         };
@@ -5282,6 +5542,161 @@ fn train_inner<R: Runtime>(
                     leaf_values.get(leaf_base + leaf),
                 ) {
                     *a += lv;
+                }
+            }
+        }
+
+        // AVERAGING-FOLD EXP-APPROX UPDATE (`UpdateLearnAvrgApprox`,
+        // `approx_updater_helpers.cpp:24-48`): `avrgFoldApprox[i] *=
+        // expTreeDelta[leaf]`, where `expTreeDelta = ExpApproxIf(treeDelta)` —
+        // the fmath batch exp of the POST-NormalizeLeafValues (learning-rate-
+        // scaled) per-leaf tree values. The linear `approx` update above is
+        // upstream's `AvrgApprox += treeDelta[leaf]` — both run, feeding
+        // different consumers (ders vs metrics/output).
+        if exp_ctr {
+            let exp_tree_delta: Vec<f64> = leaf_values
+                .iter()
+                .map(|&v| crate::fast_approx::fmath_expd(v))
+                .collect();
+            for (i, &leaf) in leaf_value_leaf_of.iter().enumerate() {
+                if let (Some(a), Some(&factor)) =
+                    (avg_exp_approx.get_mut(i), exp_tree_delta.get(leaf))
+                {
+                    *a *= factor;
+                }
+            }
+        }
+
+        // FOLD-APPROX UPDATE (`UpdateLearningFold`, `train.cpp:585` — Plain CTR
+        // path). EVERY learning fold advances its own approx each iteration (not
+        // only the taken one): leaf deltas are re-estimated over the FOLD's own
+        // CTR-bin leaf assignment (the taken fold's is exactly `grown.leaf_of`;
+        // the others reassign against their fold's columns) and the FOLD's own
+        // PRE-update derivatives, then normalized and learning-rate-scaled
+        // identically to the model deltas. The monotone post-pass is not
+        // replicated: monotone constraints never co-occur with the CTR path in
+        // scope. `fold_approxes` is empty on every non-CTR path, so this whole
+        // block is a structural no-op there.
+        if !fold_approxes.is_empty() && group_spans.is_none() {
+            for (j, fold_approx) in fold_approxes.iter_mut().enumerate() {
+                let fold_leaf_of: Vec<usize> = if j == taken_fold {
+                    grown.leaf_of.clone()
+                } else {
+                    structure_fold_columns.get(j).map_or_else(
+                        || grown.leaf_of.clone(),
+                        |cols| assign_leaf_over_ctr_columns(&matrix, cols, &grown, n),
+                    )
+                };
+                // The taken fold's pre-update derivatives were already computed
+                // for the search — reuse them; the other folds compute theirs
+                // here (still pre-update: this fold's approx is untouched so far
+                // this iteration).
+                let fold_ders_recomputed: Derivatives;
+                let fold_ders: &Derivatives = match (&search_ders_owned, j == taken_fold) {
+                    (Some(sd), true) => sd,
+                    _ => {
+                        fold_ders_recomputed = if exp_ctr {
+                            // This fold's approx is EXP-domain under `exp_ctr` —
+                            // same der form as the search ders above.
+                            let mut der1 = Vec::with_capacity(n);
+                            let mut der2 = Vec::with_capacity(n);
+                            for (i, &e) in fold_approx.iter().enumerate() {
+                                let t = target.get(i).copied().unwrap_or(0.0);
+                                let (d1, d2) = crate::fast_approx::logloss_ders_exp(e, t);
+                                der1.push(d1);
+                                der2.push(d2);
+                            }
+                            Derivatives { der1, der2 }
+                        } else {
+                            runtime.compute_gradients(
+                                &params.loss,
+                                fold_approx,
+                                target,
+                                approx_dimension,
+                            )?
+                        };
+                        &fold_ders_recomputed
+                    }
+                };
+                let fold_weighted_der1: Vec<f64> = fold_ders
+                    .der1
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &d1)| {
+                        let i = idx % n;
+                        let w = weights.get(i).copied().unwrap_or(1.0);
+                        d1 * w
+                    })
+                    .collect();
+                let fold_leaf_weights = accumulate_leaf_weights(&fold_leaf_of, &weights, n_leaves);
+                let mut fold_leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
+                for d in 0..approx_dimension {
+                    let der1_d = fold_weighted_der1.get(d * n..(d + 1) * n).unwrap_or(&[]);
+                    let der2_d = fold_ders.der2.get(d * n..(d + 1) * n).unwrap_or(&[]);
+                    let approx_d = fold_approx.get(d * n..(d + 1) * n).unwrap_or(&[]);
+                    let deltas = compute_leaf_deltas(
+                        params.leaf_method,
+                        &params.loss,
+                        &fold_leaf_of,
+                        der1_d,
+                        der2_d,
+                        // Pointwise path only (the grouped seam is gated out
+                        // above): the leaf weight is the per-object weight.
+                        &weights,
+                        approx_d,
+                        target,
+                        scaled_l2,
+                        n_leaves,
+                        d,
+                    );
+                    fold_leaf_values.extend_from_slice(&deltas);
+                }
+                if exp_ctr {
+                    // `UpdateApproxDeltas` + `UpdateBodyTailApprox` for an
+                    // EXP-stored fold (`approx_calcer.cpp:83-117`,
+                    // `approx_updater_helpers.h:20-37`): the RAW leaf deltas
+                    // (no learning rate, no normalize) are exp-ified per LEAF
+                    // via the fmath batch exp, then each document's fold approx
+                    // is multiplied by
+                    // `fast_exp(FastLogf(expLeafDelta) * learning_rate)` — the
+                    // approximate per-doc pipeline whose error is load-bearing
+                    // for structure parity (see `fast_approx`). Logloss is
+                    // non-pairwise, so upstream's fold update applies no
+                    // centering — dropping `normalize_leaf_values` here loses
+                    // only its learning-rate scale, which `ApplyLearningRate`
+                    // supplies instead.
+                    let exp_leaf_deltas: Vec<f64> = fold_leaf_values
+                        .iter()
+                        .map(|&v| crate::fast_approx::fmath_expd(v))
+                        .collect();
+                    for (i, &leaf) in fold_leaf_of.iter().enumerate() {
+                        if let (Some(a), Some(&ed)) =
+                            (fold_approx.get_mut(i), exp_leaf_deltas.get(leaf))
+                        {
+                            *a *= crate::fast_approx::apply_learning_rate_exp(ed, learning_rate);
+                        }
+                    }
+                } else {
+                    normalize_leaf_values(
+                        uses_pairwise_weights(&params.loss),
+                        learning_rate,
+                        &fold_leaf_weights,
+                        &mut fold_leaf_values,
+                        n_leaves,
+                        approx_dimension,
+                    );
+                    for d in 0..approx_dimension {
+                        let approx_base = d * n;
+                        let leaf_base = d * n_leaves;
+                        for (i, &leaf) in fold_leaf_of.iter().enumerate() {
+                            if let (Some(a), Some(&lv)) = (
+                                fold_approx.get_mut(approx_base + i),
+                                fold_leaf_values.get(leaf_base + leaf),
+                            ) {
+                                *a += lv;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5604,21 +6019,40 @@ fn train_inner<R: Runtime>(
                 }
             }
         }
-        // Copy the bake-derived (Shift, Scale) + prior PAIR onto each chosen split.
+        // Derive each chosen split's inference (Shift, Scale) from ITS OWN prior.
+        //
+        // E15: this loop used to COPY `(shift, scale, prior_num, prior_denom)` off
+        // the matching baked table. Both halves of that were wrong once more than
+        // one prior is live on a projection:
+        //   * the prior copy CLOBBERED the split's own `prior_num`/`prior_denom`,
+        //     which already arrive correct from the winning column via
+        //     `crate::tree`'s `CtrSplitSpec` construction — so every split on a
+        //     projection collapsed onto the first baked table's (head) prior;
+        //   * one baked table carries ONE normalization, so copying it is wrong
+        //     for every split at a different prior.
+        // The table lookup SURVIVES purely as an existence gate: only a split with
+        // a baked `(projection, ctr_type)` table gets a derived normalization; a
+        // split without one keeps `0.0` / `1.0`. `(projection, ctr_type)` is the
+        // same key the bake de-dup uses — `target_border_idx` must not enter it.
+        //
+        // Consequence: `BakedCtrTable.{shift, scale, prior_num, prior_denom}` are
+        // now INFORMATIONAL-ONLY in production (`CtrData::from_baked` already
+        // ignores them), but they stay on the struct — `ctr_split_scoring_test`
+        // and `ctr::final_ctr_test` read them.
         for tree in &mut trees {
             for spec in &mut tree.ctr_splits {
-                // Same (projection, ctr_type) key as the bake above — matching on
-                // projection alone would copy a different-typed table's
-                // normalization onto this split.
-                if let Some(table) = baked
+                if baked
                     .tables
                     .iter()
-                    .find(|t| t.projection == spec.projection && t.ctr_type == spec.ctr_type)
+                    .any(|t| t.projection == spec.projection && t.ctr_type == spec.ctr_type)
                 {
-                    spec.shift = table.shift;
-                    spec.scale = table.scale;
-                    spec.prior_num = table.prior_num;
-                    spec.prior_denom = table.prior_denom;
+                    let (shift, norm) = crate::ctr::calc_normalization(spec.prior_num);
+                    spec.shift = shift;
+                    spec.scale = if norm == 0.0 {
+                        1.0
+                    } else {
+                        ctr_border_count as f64 / norm
+                    };
                 }
             }
         }

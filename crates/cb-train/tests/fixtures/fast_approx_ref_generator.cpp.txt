@@ -1,0 +1,73 @@
+// Reference-vector dump — no vendored headers; direct extern decls + inline FastLogf copy.
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <random>
+
+void FastExpInplaceAvx2(double* x, size_t count) noexcept;  // fmath::expd_v (the trainer's AVX2 batch path)
+
+// Verbatim re-compilation of library/cpp/fast_exp/fast_exp.cpp's scalar fast_exp
+// (same source, same host libm, same IEEE ops => bit-identical to the built .o,
+// which we cannot link directly because of its yutil singleton dependency).
+#include <cmath>
+namespace {
+    union TDoubleInt { double FVal; uint64_t IVal; };
+    struct TTable {
+        TTable() {
+            for (int i = 0; i < 65536; ++i) {
+                TDoubleInt x;
+                x.IVal = ((uint64_t)i) << 48;
+                ExpTable[i] = std::exp(x.FVal);
+            }
+        }
+        double ExpTable[65536];
+    };
+}
+static double fast_exp(double x) {
+    static const TTable table;
+    const double* expTable = table.ExpTable;
+    double arg = x;
+    double res = 1;
+    for (int iter = 0; iter < 4; ++iter) {
+        TDoubleInt dd;
+        dd.FVal = arg;
+        double chk = expTable[dd.IVal >> 48];
+        dd.IVal &= 0xffff000000000000ll;
+        res *= chk;
+        arg -= dd.FVal;
+    }
+    return res * (1 + arg);
+}
+
+static inline float FastLog2f(float value) noexcept {
+    union { float f; uint32_t i; } vx = {value};
+    union { uint32_t i; float f; } mx = {(vx.i & 0x007FFFFF) | 0x3f000000};
+    float y = vx.i;
+    y *= 1.1920928955078125e-7f;
+    return y - 124.22551499f - 1.498030302f * mx.f - 1.72587999f / (0.3520887068f + mx.f);
+}
+static inline float FastLogf(float value) noexcept { return 0.69314718f * FastLog2f(value); }
+
+static uint64_t dbits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+int main() {
+    std::mt19937_64 rng(42);
+    std::uniform_real_distribution<double> small(-0.5, 0.5);
+    std::uniform_real_distribution<double> wide(-30.0, 30.0);
+    std::vector<double> xs;
+    for (int i = 0; i < 1200; ++i) xs.push_back(small(rng));
+    for (int i = 0; i < 600; ++i) xs.push_back(wide(rng));
+    for (double v : {0.0, 1.0, -1.0, 0.5, -0.0096153846153846159, 0.24242424242424243,
+                     -0.17045454545454547, 1e-12, -1e-12, 700.0, -700.0}) xs.push_back(v);
+
+    for (double x : xs) printf("fast_exp %016lx %016lx\n", dbits(x), dbits(fast_exp(x)));
+    { std::vector<double> a(xs); FastExpInplaceAvx2(a.data(), a.size());
+      for (size_t i = 0; i < xs.size(); ++i) printf("fmath_expd %016lx %016lx\n", dbits(xs[i]), dbits(a[i])); }
+    std::uniform_real_distribution<float> pos(0.01f, 3.0f);
+    for (int i = 0; i < 1200; ++i) { float x = pos(rng); printf("fast_logf %08x %08x\n", fbits(x), fbits(FastLogf(x))); }
+    for (float v : {1.0f, 0.9904306f, 1.2745968f, 0.5f, 2.0f, 0.99043072f})
+        printf("fast_logf %08x %08x\n", fbits(v), fbits(FastLogf(v)));
+    return 0;
+}

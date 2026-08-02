@@ -123,36 +123,12 @@ impl BootstrapResult {
     }
 }
 
-/// `FastLog2f` (`library/cpp/fast_log/fast_log.h:62-76`) — a bit-manipulation
-/// base-2 log APPROXIMATION (accuracy ~1e-5), NOT the exact `log2`. Bayesian
-/// parity REQUIRES this exact approximation: substituting `f32::log2` shifts the
-/// weight at the ~1e-5 scale and breaks the oracle. Transcribed verbatim.
-// `excessive_precision` / `approx_constant` are intentionally allowed on the
-// two fast-log helpers: the literals are VERBATIM transcriptions of upstream's
-// C source constants (`fast_log.h`). Trimming them to the shortest round-tripping
-// decimal (excessive_precision) or substituting `f32::consts::LN_2`
-// (approx_constant) would change the exact f32 bit pattern and break Bayesian
-// parity at the ~1e-5 oracle bound. The constant `0.69314718` is upstream's own
-// truncated `ln(2)` literal — NOT the standard-library constant.
-#[allow(clippy::excessive_precision, clippy::approx_constant)]
-#[inline]
-fn fast_log2f(value: f32) -> f32 {
-    // Constants transcribed at FULL upstream precision (fast_log.h:73-75); a
-    // truncated literal shifts the result by ~1e-7 and compounds into the
-    // Bayesian leaf values past the 1e-5 oracle bound.
-    let vx_i = value.to_bits();
-    let mx = f32::from_bits((vx_i & 0x007F_FFFF) | 0x3f00_0000);
-    let mut y = vx_i as f32;
-    y *= 1.192_092_895_507_812_5e-7_f32;
-    y - 124.225_514_99_f32 - 1.498_030_302_f32 * mx - 1.725_879_99_f32 / (0.352_088_706_8_f32 + mx)
-}
-
-/// `FastLogf` (`fast_log.h:84-86`): `0.69314718 * FastLog2f(value)`.
-#[allow(clippy::approx_constant)]
-#[inline]
-fn fast_logf(value: f32) -> f32 {
-    0.693_147_18_f32 * fast_log2f(value)
-}
+// `FastLogf` (`library/cpp/fast_log/fast_log.h`) — the bit-manipulation log
+// APPROXIMATION Bayesian parity requires — lives in [`crate::fast_approx`]
+// (the canonical home for upstream's approximate transcendentals, shared with
+// the exp-domain approx pipeline), pinned bit-exact there by committed
+// reference vectors.
+use crate::fast_approx::fast_logf;
 
 /// `GenerateBayessianWeight` (`tensor_search_helpers.cpp:322-325`):
 /// `w = -FastLogf(GenRandReal1() + 1e-100)` then `powf(w, baggingTemperature)`.
