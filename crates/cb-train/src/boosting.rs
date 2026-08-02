@@ -2098,6 +2098,7 @@ pub(crate) fn materialize_ctr_columns_for_perm(
     permutation: &[i32],
     target_class: &[usize],
     ctr_border_count: usize,
+    extra_cat_columns: &[Vec<String>],
 ) -> CbResult<Vec<crate::ctr::CtrFeatureColumn>> {
     // The binclf target-class count — the SAME `2` the bake passes to
     // `bake_ctr_table` (`GetTargetBorderCount`'s `targetClassesCount` input).
@@ -2127,6 +2128,10 @@ pub(crate) fn materialize_ctr_columns_for_perm(
                     ctr_border_count,
                     ctr_type,
                     target_border_idx,
+                    // E22 / SPEC-CTRT-17: the concatenated eval-set cat columns
+                    // under `counter_calc_method = Full` (empty otherwise); the
+                    // materializer applies them to COUNTER candidates only.
+                    extra_cat_columns,
                 )?;
                 cols.push(col);
             }
@@ -3456,6 +3461,36 @@ fn train_inner<R: Runtime>(
     // constant [`CTR_PRIOR_DENOM`].
     let ctr_border_count = ctr_border_count_default();
 
+    // `counter_calc_method` (E22 / SPEC-CTRT-17) — the FIRST read of
+    // `params.counter_calc_method` in this file. Under `Full`, the eval sets'
+    // categorical columns join the COUNTER bucket tally at both effect sites —
+    // the online materialization (`CountOnlineCTRTotal` over the learn +
+    // every-test-set hash array, `online_ctr.cpp:716-729`) and the final bake
+    // (`online_ctr.cpp:956-960`). `counter_full_eval_columns[c]` is the
+    // concatenation `eval[0].cat_columns[c] ++ eval[1].cat_columns[c] ++ …`,
+    // matching `cat_columns`' absolute layout; EMPTY under `SkipTest` (the
+    // default) or with no eval cat columns — byte-identical to the pre-E22
+    // behavior.
+    let counter_calc_skip_test =
+        matches!(params.counter_calc_method, CounterCalcMethod::SkipTest);
+    let counter_full_eval_columns: Vec<Vec<String>> = if counter_calc_skip_test {
+        Vec::new()
+    } else {
+        let mut cols: Vec<Vec<String>> = vec![Vec::new(); cat_columns.len()];
+        for es in eval_sets {
+            for (c, col) in cols.iter_mut().enumerate() {
+                if let Some(eval_col) = es.cat_columns.get(c) {
+                    col.extend(eval_col.iter().cloned());
+                }
+            }
+        }
+        if cols.iter().all(Vec::is_empty) {
+            Vec::new()
+        } else {
+            cols
+        }
+    };
+
     // Resolve the per-candidate ABSOLUTE projections ONCE (re-index the CTR-
     // eligible-position members emitted by `tensor_ctr_candidates` back to absolute
     // `cat_columns` indices). Both the structure (identity) and the leaf-value
@@ -3545,6 +3580,7 @@ fn train_inner<R: Runtime>(
                 &perm,
                 &target_class,
                 ctr_border_count,
+                &counter_full_eval_columns,
             )?);
         }
         per_fold
@@ -3576,6 +3612,7 @@ fn train_inner<R: Runtime>(
                 avg_perm,
                 &target_class,
                 ctr_border_count,
+                &counter_full_eval_columns,
             )?
         } else {
             Vec::new()
@@ -6084,6 +6121,8 @@ fn train_inner<R: Runtime>(
                         spec.prior_num,
                         spec.prior_denom,
                         spec_ctr_type,
+                        counter_calc_skip_test,
+                        &counter_full_eval_columns,
                     )?;
                     baked.tables.push(table);
                 }

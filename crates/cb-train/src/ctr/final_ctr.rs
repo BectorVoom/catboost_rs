@@ -68,16 +68,20 @@ pub struct FinalCtrTable {
 /// online accumulator (`CalcFinalCtrsImpl`, `online_ctr.cpp:916-939`).
 ///
 /// `counter_calc_skip_test` selects the `CounterCalcMethod` semantics
-/// (default `SkipTest`, Pitfall 4) — in this whole-learn-set build there are no
-/// test documents, so the flag does not change the counts; it is recorded for the
-/// model's `CounterCalcMethod` field and reserved for the tensor-CTR path.
+/// (default `SkipTest`, Pitfall 4). The flag is a no-op **only when there is no
+/// eval set** (measured ground truth: learn-only `maxdiff = 0.000e+00`, with an
+/// eval set `4.010e-01` — research §B): with eval documents present under
+/// `Full`, `bake_ctr_table` (E22) appends every eval document to the Counter
+/// accumulation BEFORE this function runs, so the Counter arm's `MAX` sees the
+/// widened totals (`online_ctr.cpp:956-960`).
 ///
 /// # `counter_calc_skip_test`
 /// Threaded here so the parameter this doc comment has always described actually
-/// exists (it did not, until E11 — a live documentation lie). It is **inert**
-/// in this whole-learn-set build: there are no test documents to include or
-/// skip, so no arm reads it yet. E22 makes it real, once `EvalSet` can carry
-/// categorical columns at all. Every caller passes `true`, the `SkipTest`
+/// exists (it did not, until E11 — a live documentation lie). The widening
+/// happens in the ACCUMULATION (`bake_ctr_table`, the online materialization),
+/// not in this per-type dispatch — so no arm reads it here by design; it
+/// documents the semantics the caller already applied. Callers on the
+/// learn-only path pass `true`, the `SkipTest`
 /// default returned by `counter_calc_method_default()`.
 #[must_use]
 pub fn build_final_ctr(

@@ -152,6 +152,7 @@ pub fn materialize_ctr_feature(
     ctr_border_count: usize,
     ctr_type: ECtrType,
     target_border_idx: usize,
+    extra_cat_columns: &[Vec<String>],
 ) -> CbResult<CtrFeatureColumn> {
     // The document count is the permutation length (every learn document appears
     // once); the member columns must each be at least that long.
@@ -219,6 +220,39 @@ pub fn materialize_ctr_feature(
         combined_bins.push(bin);
     }
 
+    // 2b. The `counter_calc_method = Full` bucket-space rule (E22 implementing
+    //     E21's spec; see the doc comment above). COUNTER-ONLY: upstream widens
+    //     `uniqValuesCounts.CounterCount` — the Counter bucket space — to
+    //     `leafCount` over the learn ++ every-eval hash array
+    //     (`online_ctr.cpp:716-729`), while every other type's unique count
+    //     stays learn-only. Eval keys extend the SAME first-seen remap AFTER
+    //     the learn documents (learn bin numbering byte-identical; an eval-only
+    //     value can only ever receive a NEW, higher bin) and produce
+    //     `extra_bins` for the tally — never output rows. `extra_cat_columns`
+    //     is EMPTY under `SkipTest` (the caller's gate), making this a no-op.
+    let mut extra_bins: Vec<u32> = Vec::new();
+    if ctr_type == ECtrType::Counter && !extra_cat_columns.is_empty() {
+        let m = extra_cat_columns.iter().map(Vec::len).max().unwrap_or(0);
+        let extra_count = extra_cat_columns.len();
+        for i in 0..m {
+            let mut feature_hashes: Vec<u32> = Vec::with_capacity(extra_count);
+            for col in extra_cat_columns {
+                let value = col.get(i).map_or("", String::as_str);
+                feature_hashes.push(calc_cat_feature_hash(value));
+            }
+            let key = projection.combined_hash(&feature_hashes);
+            let next = remap.len();
+            if next >= u32::MAX as usize {
+                return Err(CbError::OutOfRange(
+                    "materialize_ctr_feature: more than u32::MAX distinct combined keys"
+                        .to_owned(),
+                ));
+            }
+            let bin = *remap.entry(key).or_insert(next as u32);
+            extra_bins.push(bin);
+        }
+    }
+
     // 3. Scalar online prior from the PAIR (prior_denom == 1 ⇒ scalar == num).
     let prior_scalar = prior_num / prior_denom;
     // The read-before-increment online prefix over the combined bins (OBJECT
@@ -261,8 +295,11 @@ pub fn materialize_ctr_feature(
         }
         ECtrType::Counter => {
             // Whole-set totals with the CONSTANT max-bucket denominator; no
-            // permutation dependence at all (ctr_type.cpp:43-56).
-            let (totals, denominator) = online_counter_column(&combined_bins, bucket_count);
+            // permutation dependence at all (ctr_type.cpp:43-56). Under
+            // `counter_calc_method = Full` the eval bins join the tally and the
+            // MAX (step 2b); the output stays learn-indexed.
+            let (totals, denominator) =
+                online_counter_column(&combined_bins, &extra_bins, bucket_count);
             let nums: Vec<f64> = totals.iter().map(|&t| t as f64).collect();
             let denoms: Vec<i64> = vec![denominator; totals.len()];
             let value: Vec<f64> = nums

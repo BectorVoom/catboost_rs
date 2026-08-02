@@ -352,7 +352,7 @@ fn counter_column_is_the_whole_set_bucket_total_over_the_max_bucket() {
 
     // bucket 0 has 3 documents, bucket 1 has 2, bucket 2 has 1.
     let bins: Vec<u32> = vec![0, 0, 0, 1, 1, 2];
-    let (col, denom) = online_counter_column(&bins, 3);
+    let (col, denom) = online_counter_column(&bins, &[], 3);
 
     // Each document's OWN row is counted — this is not read-before-increment.
     assert_eq!(col, vec![3, 3, 3, 2, 2, 1]);
@@ -375,8 +375,8 @@ fn counter_column_is_permutation_invariant() {
     let bins_a: Vec<u32> = perm_a.iter().map(|&i| bins[i]).collect();
     let bins_b: Vec<u32> = perm_b.iter().map(|&i| bins[i]).collect();
 
-    let (col_a, denom_a) = online_counter_column(&bins_a, 3);
-    let (col_b, denom_b) = online_counter_column(&bins_b, 3);
+    let (col_a, denom_a) = online_counter_column(&bins_a, &[], 3);
+    let (col_b, denom_b) = online_counter_column(&bins_b, &[], 3);
 
     // Undo the permutation to compare in the original document order.
     let mut col_b_unpermuted = vec![0i64; col_b.len()];
@@ -402,7 +402,7 @@ fn counter_column_is_permutation_invariant() {
 fn counter_column_on_empty_bins_is_empty_with_zero_denominator() {
     use crate::ctr::online::online_counter_column;
 
-    let (col, denom) = online_counter_column(&[], 0);
+    let (col, denom) = online_counter_column(&[], &[], 0);
     assert!(col.is_empty());
     // A zero denominator must be returned plainly, never produce a division by
     // zero downstream.
@@ -653,4 +653,31 @@ fn online_mean_prefix_floors_the_divisor_at_one() {
              target_class is 0, so every Sum is 0"
         );
     }
+}
+
+// --- counter_calc_method (E22 / SPEC-CTRT-17) -------------------------------
+
+#[test]
+fn counter_column_full_includes_eval_bins_skip_test_does_not() {
+    use crate::ctr::online::online_counter_column;
+
+    // Learn bins [0,0,1]; eval bins [1,1,1] (already remapped into the SAME
+    // widened bucket space by materialize_ctr_feature's Full rule).
+    let learn: Vec<u32> = vec![0, 0, 1];
+    let eval_bins: Vec<u32> = vec![1, 1, 1];
+
+    // SkipTest: the eval slice is empty — learn-only totals [2, 1], MAX 2.
+    let (skip_col, skip_denom) = online_counter_column(&learn, &[], 2);
+    assert_eq!(skip_col, vec![2, 2, 1], "learn-only per-doc totals");
+    assert_eq!(skip_denom, 2, "learn-only MAX bucket total");
+
+    // Full: eval docs join the tally — totals [2, 4], MAX 4; the OUTPUT is
+    // still indexed by the LEARN bins only (3 rows, not 6).
+    let (full_col, full_denom) = online_counter_column(&learn, &eval_bins, 2);
+    assert_eq!(full_col, vec![2, 2, 4], "eval docs join the per-bucket tally");
+    assert_eq!(full_col.len(), learn.len(), "output stays learn-indexed");
+    assert_eq!(full_denom, 4, "the MAX sees the widened bucket totals");
+
+    // Anti-vacuity: the two settings must be distinguishable on this fixture.
+    assert_ne!((skip_col, skip_denom), (full_col, full_denom));
 }

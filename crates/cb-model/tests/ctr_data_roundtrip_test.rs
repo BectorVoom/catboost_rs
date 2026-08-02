@@ -251,7 +251,7 @@ fn e11_baked(ctr_type: cb_train::ECtrType) -> cb_train::BakedCtrTable {
         .collect();
     let target_class: Vec<usize> = vec![1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1];
     let proj = cb_train::TProjection::from_features(&[0]);
-    cb_train::bake_ctr_table(&[col], &proj, &target_class, 2, 15, 0.5, 1.0, ctr_type)
+    cb_train::bake_ctr_table(&[col], &proj, &target_class, 2, 15, 0.5, 1.0, ctr_type, true, &[])
         .expect("bake must succeed")
 }
 

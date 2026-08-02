@@ -874,6 +874,7 @@ fn candidate_expansion_emits_one_column_per_prior() {
         &identity_perm,
         &target_class,
         crate::ctr_border_count_default(),
+        &[],
     )
     .expect("materialization must succeed");
 
@@ -901,6 +902,7 @@ fn candidate_expansion_emits_one_column_per_prior() {
         &averaging_perm,
         &target_class,
         crate::ctr_border_count_default(),
+        &[],
     )
     .expect("averaging materialization must succeed");
     assert_eq!(avg_cols.len(), cols.len(), "alignment: same column count");
@@ -930,6 +932,7 @@ fn buckets_expansion_emits_both_target_border_indices() {
         &identity_perm,
         &target_class,
         crate::ctr_border_count_default(),
+        &[],
     )
     .expect("materialization must succeed");
 
@@ -983,6 +986,7 @@ fn borders_expansion_emits_exactly_one_target_border_index() {
         &identity_perm,
         &target_class,
         crate::ctr_border_count_default(),
+        &[],
     )
     .expect("materialization must succeed");
 

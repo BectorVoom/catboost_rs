@@ -80,6 +80,7 @@ fn materialize_no_leakage_under_identity_permutation() {
         border_count,
         cb_train::ECtrType::Borders,
         0,
+        &[],
     )
     .expect("materialize the combined-projection online CTR feature");
 
@@ -131,6 +132,7 @@ fn assert_matches_reference_prefix(
         border_count,
         cb_train::ECtrType::Borders,
         0,
+        &[],
     )
     .expect("materialize the projection");
 
@@ -200,6 +202,7 @@ fn materialize_quantization_range_and_prior_pair() {
         border_count,
         cb_train::ECtrType::Borders,
         0,
+        &[],
     )
     .expect("materialize for quantization-range check");
 
@@ -265,7 +268,8 @@ fn materialize_emits_the_requested_ctr_type_and_border_idx() {
             15,
             ctr_type,
             b,
-        )
+        &[],
+    )
         .expect("materialize must succeed for a CPU-legal type")
     };
 
@@ -363,7 +367,8 @@ fn materialize_rejects_cpu_illegal_ctr_types() {
     for ty in [ECtrType::FloatTargetMeanValue, ECtrType::FeatureFreq] {
         let err = materialize_ctr_feature(
             &cats, &proj, &perm, &tc, PRIOR_NUM, PRIOR_DENOM, 15, ty, 0,
-        )
+        &[],
+    )
         .expect_err("a CPU-illegal CTR type must be rejected");
         match err {
             cb_core::CbError::Unsupported(msg) => {
@@ -372,4 +377,66 @@ fn materialize_rejects_cpu_illegal_ctr_types() {
             other => panic!("expected CbError::Unsupported, got {other:?}"),
         }
     }
+}
+
+// --- counter_calc_method = Full bucket-space rule (E22 / SPEC-CTRT-17) ------
+
+/// The EVAL-ONLY UNSEEN CATEGORY case: an eval categorical value that appears
+/// in NO learn document must get its OWN bucket under `Full`
+/// (`uniqValuesCounts.CounterCount = leafCount`, `online_ctr.cpp:716-729`),
+/// while `SkipTest` keeps the learn-only bucket space byte-identical — and the
+/// OUTPUT column stays indexed by the LEARN slice under both.
+#[test]
+fn an_eval_only_unseen_category_widens_both_the_bucket_count_and_the_denominator() {
+    let cat_columns: Vec<Vec<String>> =
+        vec![["a", "a", "b"].iter().map(|s| (*s).to_owned()).collect()];
+    let eval_columns: Vec<Vec<String>> =
+        vec![["c", "c", "c"].iter().map(|s| (*s).to_owned()).collect()];
+    let proj = cb_train::TProjection::from_features(&[0]);
+    let identity: Vec<i32> = (0..3).collect();
+    let target_class = vec![0usize, 1, 0];
+
+    let column_skiptest = materialize_ctr_feature(
+        &cat_columns,
+        &proj,
+        &identity,
+        &target_class,
+        PRIOR_NUM,
+        PRIOR_DENOM,
+        15,
+        cb_train::ECtrType::Counter,
+        0,
+        &[],
+    )
+    .expect("SkipTest materialization");
+    let column_full = materialize_ctr_feature(
+        &cat_columns,
+        &proj,
+        &identity,
+        &target_class,
+        PRIOR_NUM,
+        PRIOR_DENOM,
+        15,
+        cb_train::ECtrType::Counter,
+        0,
+        &eval_columns,
+    )
+    .expect("Full materialization");
+
+    assert_eq!(
+        column_full.bucket_count, 3,
+        "an eval-only category must get its OWN bucket under Full \
+         (uniqValuesCounts.CounterCount = leafCount, online_ctr.cpp:716-729)"
+    );
+    assert_eq!(
+        column_skiptest.bucket_count, 2,
+        "under SkipTest the bucket space is learn-only and MUST be unchanged"
+    );
+    assert_eq!(
+        column_full.bins.len(),
+        3,
+        "the OUTPUT column stays indexed by the LEARN slice — eval documents \
+         contribute to the tally and the bucket space, never to output rows"
+    );
+    assert_eq!(column_full.ctr_value.len(), 3, "same for the raw online values");
 }
