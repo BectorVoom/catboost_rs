@@ -47,3 +47,30 @@ bytemuck    = { version = "1", features = ["extern_crate_std"] }
 # OK (crates.io, ~10yr, github.com/rayon-rs/rayon — 21-RESEARCH Package
 # Legitimacy Audit). Confirmed latest stable via `cargo search`, 2026-07-05.
 rayon       = "1.12.0"
+
+# ---------------------------------------------------------------------------
+# Build profiles — test/dev debuginfo budget.
+#
+# Stock `debug = 2` produced 1.334 GB PER TEST BINARY here, of which ~1.09 GB was
+# DWARF: `.debug_str` alone was 886 MB (66%) against just 86 MB of `.text`. The
+# cause is CubeCL's deeply-generic monomorphized type names, whose mangled
+# strings are emitted near-identically into EVERY one of the ~60 integration-test
+# binaries. With `target/` already at 134 GB, and this repo's documented failure
+# mode being disk exhaustion presenting as OOM-killed jobs and link failures,
+# that is the dominant cost of running the test suite.
+#
+# `line-tables-only` keeps the file:line information that panic backtraces and
+# assertion failures need, and drops the type/variable DWARF that made up the
+# bulk. `split-debuginfo = "unpacked"` additionally leaves what remains in the
+# per-crate object files instead of copying it into every dependent binary, so
+# N test targets no longer carry N copies of the same dependency debuginfo.
+#
+# Neither setting changes generated code: opt-level, overflow checks, debug
+# assertions and codegen are untouched, so test SEMANTICS are identical.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
