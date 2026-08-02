@@ -201,20 +201,10 @@ pub fn bake_ctr_table(
     // the divisor reaches only `binarized_mean`, which only the
     // BinarizedTargetMeanValue arm of `build_final_ctr` reads.
     //
-    // *** NOT `ctr_type.target_border_count(classes)`. *** That helper mirrors
-    // `GetTargetBorderCount` (ctr_helper.h:34-42), which upstream uses on the
-    // ONLINE path for allocation sizing (online_ctr.cpp:738/741) and for the
-    // CLASS prefix types (:777) — never in CalcFinalCtrsImpl. The two agree at
-    // binclf and DIFFER for Buckets, so routing through the helper would be
-    // undetectable here and wrong at multiclass.
-    //
-    // The `.max(1)` floor: `accumulate_online` rejects `target_border_count == 0`
-    // with a typed error (online.rs:176-180), so a single-class corpus would
-    // start erroring without it. Same idiom as `online_mean_prefix`
-    // (online.rs:321). Behavior at `classes == 1` is unchanged either way (every
-    // target_class is 0, so every Sum is 0); `classes == 0` flips Err->Ok and is
-    // unreachable — the sole production caller hard-codes 2.
-    let target_border_count = classes.saturating_sub(1).max(1);
+    // *** NOT `ctr_type.target_border_count(classes)`. *** The two rules, the
+    // `.max(1)` floor and why they are deliberately not shared with
+    // `online_mean_prefix` are documented on `final_ctr_target_border_count`.
+    let target_border_count = super::final_ctr_target_border_count(classes);
     // 4th arg `classes` = TargetClassesCount (the class-histogram WIDTH,
     // online_ctr.cpp:909-911/930-934) — correct, and deliberately NOT the same
     // quantity as the 5th.

@@ -364,3 +364,132 @@ fn btmv_bake_at_one_class_is_unchanged_and_does_not_error() {
         "every target_class is 0, so every Sum must be 0 under any divisor"
     );
 }
+
+// ---------------------------------------------------------------------------
+// BUG-BTMV / SPEC-BTMV-04 — the non-mean baked payloads are byte-identical.
+//
+// These are GUARDS, not Reds: they pass both before and after the divisor fix,
+// because the whole-set target border count never reached a non-mean payload in
+// the first place. Their falsifiability comes from the mutation check M-B05,
+// whose expectation is INVERTED — mutating the divisor must leave these GREEN,
+// with the BTMV test as the control proving the mutation was live.
+//
+// `borders_bake_bytes_are_unchanged` (above) already froze the Borders bake.
+// These extend the freeze to Buckets and Counter, which had no byte-level pin.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn buckets_and_counter_bake_bytes_are_unchanged() {
+    use crate::ctr::bake::bake_ctr_table;
+
+    // The isolation these assertions encode: the whole-set target border count
+    // reaches exactly one accumulator field, `binarized_mean`
+    // (online.rs:212-214), which exactly one arm of `build_final_ctr` reads
+    // (BinarizedTargetMeanValue, final_ctr.rs). Borders/Buckets read
+    // `class_histories`; Counter/FeatureFreq read `total_counts`. No non-mean
+    // payload can move when the divisor changes. If either of these fails, that
+    // isolation has been broken — STOP AND REPORT.
+    let (cats, tc, proj) = e11_fixture();
+    let bake = |ty: ECtrType| {
+        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty).expect("bake must succeed")
+    };
+
+    // The same frozen triple `borders_bake_bytes_are_unchanged` pins: the hash
+    // set and (Shift, Scale) are derived type-agnostically from the prior
+    // (bake.rs:263-270) and must not move with the CTR type either.
+    let frozen_hashes = vec![
+        14_096_670_708_071_601_218_u64,
+        10_650_234_391_120_027_977,
+        6_692_239_851_685_836_511,
+    ];
+
+    // --- Buckets ------------------------------------------------------------
+    let buckets = bake(ECtrType::Buckets);
+    assert_eq!(buckets.ctr_type, 1, "SPEC-BTMV-04: Buckets discriminant");
+    assert_eq!(
+        buckets.hashes, frozen_hashes,
+        "SPEC-BTMV-04: the divisor cannot reach the bucket hash set"
+    );
+    assert_eq!(
+        buckets.int_counts,
+        vec![vec![0, 4], vec![4, 0], vec![1, 3]],
+        "SPEC-BTMV-04: Buckets reads `class_histories`, never `binarized_mean` \
+         — its per-bucket [N0, N1] payload is identical to the frozen Borders \
+         one and must not move when the whole-set divisor changes"
+    );
+    assert_eq!(buckets.counter_denominator, 0);
+    assert!(
+        buckets.mean.is_empty(),
+        "SPEC-BTMV-04: the Buckets arm leaves `mean` empty (bake.rs:226-238)"
+    );
+    assert_eq!(buckets.shift.to_bits(), 9_223_372_036_854_775_808);
+    assert_eq!(buckets.scale.to_bits(), 4_624_633_867_356_078_080);
+
+    // --- Counter ------------------------------------------------------------
+    let counter = bake(ECtrType::Counter);
+    assert_eq!(counter.ctr_type, 4, "SPEC-BTMV-04: Counter discriminant");
+    assert_eq!(
+        counter.hashes, frozen_hashes,
+        "SPEC-BTMV-04: the divisor cannot reach the bucket hash set"
+    );
+    assert_eq!(
+        counter.int_counts,
+        vec![vec![4], vec![4], vec![4]],
+        "SPEC-BTMV-04: Counter reads `total_counts`, never `binarized_mean` — \
+         the column is i % 3 over 12 documents, so every bucket holds 4"
+    );
+    assert_eq!(
+        counter.counter_denominator, 4,
+        "SPEC-BTMV-04: CounterDenominator is the MAX bucket total \
+         (online_ctr.cpp:934-936) and is divisor-independent"
+    );
+    assert!(
+        counter.mean.is_empty(),
+        "SPEC-BTMV-04: the Counter arm leaves `mean` empty (bake.rs:239-249)"
+    );
+    assert_eq!(counter.shift.to_bits(), 9_223_372_036_854_775_808);
+    assert_eq!(counter.scale.to_bits(), 4_624_633_867_356_078_080);
+}
+
+#[test]
+fn the_divisor_is_unreachable_from_every_non_mean_payload() {
+    use crate::ctr::bake::bake_ctr_table;
+
+    // The explicit isolation statement, over every CPU-legal type at once.
+    // `bake_ctr_table`'s per-type reshape (bake.rs:226-260) populates `mean`
+    // ONLY in the BinarizedTargetMeanValue | FloatTargetMeanValue arm; every
+    // other arm fills `int_counts` and leaves `mean` empty. Since the whole-set
+    // target border count is consumed exclusively by `binarized_mean`, which
+    // only the mean arm reads, it is structurally unreachable from the payload
+    // of any other type.
+    let (cats, tc, proj) = e11_fixture();
+    let bake = |ty: ECtrType| {
+        bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ty).expect("bake must succeed")
+    };
+
+    for ty in [ECtrType::Borders, ECtrType::Buckets, ECtrType::Counter] {
+        let t = bake(ty);
+        assert!(
+            t.mean.is_empty(),
+            "{ty:?} must carry NO mean payload (bake.rs:226-249), so the \
+             whole-set divisor cannot reach it — SPEC-BTMV-04"
+        );
+        assert!(
+            !t.int_counts.is_empty(),
+            "{ty:?} carries its payload in `int_counts`, not `mean`"
+        );
+    }
+
+    let btmv = bake(ECtrType::BinarizedTargetMeanValue);
+    assert!(
+        !btmv.mean.is_empty(),
+        "BinarizedTargetMeanValue is the ONLY CPU-legal type whose payload the \
+         divisor reaches (bake.rs:250-260) — if this is empty the isolation \
+         statement is vacuous"
+    );
+    assert!(
+        btmv.int_counts.is_empty(),
+        "the mean types carry (Sum, Count) pairs INSTEAD of class counts, so \
+         `int_counts` must be empty exactly for BinarizedTargetMeanValue"
+    );
+}

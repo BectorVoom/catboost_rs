@@ -5,8 +5,9 @@
 //! - `target_border_count` → `ctr_helper.h:34-42` (`GetTargetBorderCount`)
 //! - `is_cpu_supported`    → `restrictions.h:18-48` (`IsSupportedCtrType(CPU, …)`)
 //! - `is_online_prefix`    → `ctr_type.cpp:43-56` (`IsPermutationDependentCtrType`)
+//! - `final_ctr_target_border_count` → `online_ctr.cpp:914` (`CalcFinalCtrsImpl`)
 
-use super::ECtrType;
+use super::{final_ctr_target_border_count, ECtrType};
 
 /// Every variant, in discriminant order. Asserting over this array (rather than a
 /// hand-picked subset) is what stops a future seventh variant from silently
@@ -90,5 +91,104 @@ fn is_online_prefix_is_false_only_for_counter() {
     assert!(
         !ECtrType::Counter.is_online_prefix(),
         "Counter is permutation-INdependent (ctr_type.cpp:43-56)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BUG-BTMV / SPEC-BTMV-01 — the WHOLE-SET bake's target border count.
+//
+// Upstream has TWO target-border-count rules and they are not the same
+// function. `ECtrType::target_border_count` (above) mirrors
+// `GetTargetBorderCount` (ctr_helper.h:34-42), the ONLINE-path helper.
+// `final_ctr_target_border_count` mirrors `CalcFinalCtrsImpl`
+// (online_ctr.cpp:914), which is `targetClassesCount - 1` UNCONDITIONALLY —
+// computed once, OUTSIDE the per-type dispatch. These tests pin the second rule
+// directly, independently of any bake.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn final_ctr_target_border_count_is_classes_minus_one() {
+    // online_ctr.cpp:914   int targetBorderCount = targetClassesCount - 1;
+    // online_ctr.cpp:920   elem.Add(static_cast<float>(targetClass[z]) / targetBorderCount);
+    //
+    // No `ctrType` appears in either line: the whole-set divisor is
+    // type-INDEPENDENT. BUG-BTMV was `bake.rs` passing `targetClassesCount`
+    // itself, which halved every BinarizedTargetMeanValue `Sum`.
+    for (classes, want) in [(2usize, 1usize), (3, 2), (5, 4), (10, 9)] {
+        assert_eq!(
+            final_ctr_target_border_count(classes),
+            want,
+            "CalcFinalCtrsImpl divides by targetClassesCount - 1 \
+             (online_ctr.cpp:914): {classes} classes must give {want}"
+        );
+    }
+}
+
+#[test]
+fn final_ctr_target_border_count_floors_at_one() {
+    // `accumulate_online` rejects `target_border_count == 0` with a typed
+    // `CbError::Degenerate` (online.rs:176-180), so without the `.max(1)` floor
+    // a single-class corpus would start erroring where it returns `Ok` today.
+    // The floor is behavior-preserving at `classes == 1` (every target_class is
+    // 0, so every Sum is 0 under either divisor) and flips `Err` -> `Ok` at
+    // `classes == 0`, which is unreachable — the sole production caller
+    // hard-codes 2 (boosting.rs:5582). See PLAN D3.
+    assert_eq!(
+        final_ctr_target_border_count(1),
+        1,
+        "a single-class corpus must not divide by zero (D3, online.rs:176-180)"
+    );
+    assert_eq!(
+        final_ctr_target_border_count(0),
+        1,
+        "saturating_sub must not underflow at zero classes (D3)"
+    );
+}
+
+#[test]
+fn the_two_target_border_rules_differ_for_buckets() {
+    // The structural statement: substituting one rule for the other is
+    // UNDETECTABLE at binary classification and WRONG at multiclass. Asserted at
+    // classes = 3, the smallest count where the two rules separate.
+    for t in ALL_TYPES {
+        let online = t.target_border_count(3);
+        let bake = final_ctr_target_border_count(3);
+        if matches!(t, ECtrType::Buckets) {
+            assert_ne!(
+                online, bake,
+                "Buckets is exactly where the two rules diverge \
+                 (GetTargetBorderCount returns targetClassesCount; \
+                 CalcFinalCtrsImpl returns targetClassesCount - 1) — this \
+                 inequality is WHY the bake must not route through the \
+                 ECtrType helper (BUG-BTMV, PLAN §0)"
+            );
+        }
+    }
+
+    // All THREE candidate divisors are distinct at classes = 3. That is what
+    // makes `final_ctr_test::bake_target_border_divisor_is_classes_minus_one_\
+    // not_the_ctr_type_helper` (B01 Test 2) a genuine discriminator: at
+    // classes = 2 the fix and the helper both return 1 and no runtime gate can
+    // tell them apart.
+    //
+    //   expression                                  classes=2   classes=3
+    //   ------------------------------------------  ---------   ---------
+    //   `classes`            (BUG-BTMV, the defect)     2           3
+    //   `classes - 1`        (upstream, D1/E1)          1           2
+    //   `BTMV.target_border_count(classes)` (E4)        1           1
+    assert_eq!(
+        ECtrType::Buckets.target_border_count(3),
+        3,
+        "GetTargetBorderCount keeps the full class count for Buckets"
+    );
+    assert_eq!(
+        ECtrType::BinarizedTargetMeanValue.target_border_count(3),
+        1,
+        "GetTargetBorderCount is fixed at 1 for BinarizedTargetMeanValue"
+    );
+    assert_eq!(
+        final_ctr_target_border_count(3),
+        2,
+        "CalcFinalCtrsImpl is targetClassesCount - 1 regardless of type"
     );
 }
