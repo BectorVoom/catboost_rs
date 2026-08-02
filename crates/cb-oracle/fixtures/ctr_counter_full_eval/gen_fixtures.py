@@ -70,6 +70,12 @@ def params(method):
         "leaf_estimation_method": "Gradient",
         "leaf_estimation_iterations": 1,
         "bootstrap_type": "No",
+        # PIN use_best_model: with an eval_set, catboost's raw dict-API default
+        # flips to True and TRUNCATES the model to the best eval iteration
+        # (observed: the un-pinned SkipTest run kept 1 of 10 trees) — the
+        # classic unpinned-default trap (cv-orch01). Both settings must train
+        # the full 10 trees for the discriminator to isolate counter_calc_method.
+        "use_best_model": False,
         "random_strength": 0,
         "random_seed": 0,
         "thread_count": 1,
