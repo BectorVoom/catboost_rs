@@ -897,8 +897,10 @@ hand-computed vectors. **No caller yet** — E05 wires it.
   (or `error[E0603]` if the re-export is added before the definition).
 - Run: `cargo test -p cb-train --lib ctr::online_test -- online_class_prefix`
 
-**Green (minimal implementation intent).** One `#[must_use] pub(crate) fn` in
-`online.rs`:
+**Green (minimal implementation intent).** One `#[must_use] pub fn` in
+`online.rs` (**`pub`, not `pub(crate)`** — this task's Files also add the name to
+`crates/cb-train/src/ctr/mod.rs`'s `pub use online::{…}` block, and `pub use` of a
+`pub(crate)` item is `error[E0365]`):
 ```
 total = counts.iter().sum::<i64>()
 Buckets → (counts.get(b).copied().unwrap_or(0) as f64, total)

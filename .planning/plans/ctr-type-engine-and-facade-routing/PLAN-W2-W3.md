@@ -78,8 +78,10 @@ existing one — the quantizer is type-agnostic and stays untouched.
   `error[E0425]: cannot find function 'online_counter_column' in module 'super'`.
 - Run: `cargo test -p cb-train --lib ctr::online_test -- counter_column`
 
-**Green (minimal implementation intent).** One `#[must_use] pub(crate) fn` in
-`online.rs`: tally `totals[bin] += 1` over `bins` (checked `.get_mut`), take
+**Green (minimal implementation intent).** One `#[must_use] pub fn` in
+`online.rs` (**`pub`, not `pub(crate)`** — it is re-exported from
+`crates/cb-train/src/ctr/mod.rs`; `pub use` of a `pub(crate)` item is
+`error[E0365]`): tally `totals[bin] += 1` over `bins` (checked `.get_mut`), take
 `max().unwrap_or(0)` as the denominator, map each document to `totals[bins[doc]]`.
 **No permutation parameter at all** — the absence of the parameter makes
 permutation-invariance structural rather than merely asserted. Doc comment carries
@@ -193,7 +195,9 @@ leaves, verified to one ulp).
   `error[E0425]: cannot find function 'online_mean_prefix' in module 'super'`.
 - Run: `cargo test -p cb-train --lib ctr::online_test -- btmv`
 
-**Green (minimal implementation intent).** One `pub(crate) fn` mirroring
+**Green (minimal implementation intent).** One `pub fn` (**`pub`, not
+`pub(crate)`** — re-exported from `ctr/mod.rs`; `pub use` of `pub(crate)` is
+`error[E0365]`) mirroring
 `online_ctr_prefix_binclf`'s loop shape exactly (same `CbError::Degenerate` length
 guards, same checked `.get`, same permutation-range errors), with per-bucket state
 `Vec<TCtrMeanHistory>`: READ `(elem.sum, elem.count)` → compute
@@ -277,7 +281,9 @@ equivalence is what proves the shared producer did not move the existing oracles
   `error[E0425]: cannot find function 'online_class_prefix_column'`.
 - Run: `cargo test -p cb-train --lib ctr::online_test -- prefix_column`
 
-**Green (minimal implementation intent).** One `pub(crate) fn` reusing
+**Green (minimal implementation intent).** One `pub fn` (**`pub`, not
+`pub(crate)`** — re-exported from `ctr/mod.rs`; `pub use` of `pub(crate)` is
+`error[E0365]`) reusing
 `online_ctr_prefix_binclf`'s guard block verbatim; per-bucket state
 `Vec<TCtrHistory>` sized `classes`; per document READ `hist.n` → call
 `online_class_prefix(&hist.n, target_border_idx, ctr_type)` → store
@@ -313,7 +319,9 @@ oracles green.
 
 - **Specs:** SPEC-CTRT-06 / -07 / -08 (wiring half)
 - **Blocked by:** E08. **Blocks:** E10.
-- **Parallelizable:** **NO** — owns `crates/cb-train/src/ctr/ctr_feature.rs`.
+- **Parallelizable:** **NO** — owns `crates/cb-train/src/ctr/ctr_feature.rs` **and
+  edits `crates/cb-train/src/boosting.rs`** (the two behavior-preserving call-site
+  widenings at `:3238` / `:3274`, below).
   **E09 MUST leave `cb-train` compiling**: Rust has no default arguments, so the
   widened signature forces E09 to update **its two production call sites in
   `crates/cb-train/src/boosting.rs` (`:3238` structure folds, `:3274` averaging
@@ -698,7 +706,9 @@ and `CtrData::from_baked` carries mean tables instead of `Vec::new()`.
   at `crates/cb-train/src/ctr/final_ctr.rs:75`. **Its doc comment at `:70-73`
   already describes a `counter_calc_skip_test` parameter that DOES NOT EXIST in the
   signature** `[VERIFIED: LOCAL, read verbatim]` — a live documentation lie. E11
-  adds the parameter (threaded as a constant `false` here; E22 makes it real), or
+  adds the parameter (threaded as the constant **`true`** here — `SkipTest` is the
+  default returned by `counter_calc_method_default()`, so `true` is the
+  behavior-preserving value; E22 makes it real), or
   the doc must be corrected. **Adding it now avoids a second signature churn in
   W5** — do it here and note the semantics are inert until E22.
 - `FinalCtrTable { ctr_type, target_classes_count, int_counts: Vec<i64>,
