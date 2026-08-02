@@ -120,6 +120,23 @@ pub struct CtrFeatureColumn {
 /// `ctr_border_count` is the Borders CTR border count
 /// ([`crate::ctr_border_count_default`] = 15).
 ///
+/// # The `counter_calc_method = Full` bucket-space rule (E21 spec, E22 impl)
+///
+/// Under [`crate::CounterCalcMethod::Full`], the combined-projection hash and
+/// the first-seen `HashMap<u64, u32>` remap in step 2 are built over the
+/// **CONCATENATION of the learn cat columns and EVERY eval set's cat columns**,
+/// in the order `learn ++ eval[0] ++ eval[1] ++ …` — mirroring upstream, which
+/// tallies over a `hashArr` built across learn AND every test set and, under
+/// `Full`, sets `uniqValuesCounts.CounterCount = leafCount`
+/// (`online_ctr.cpp:716-729`). Consequence: an eval-only categorical value that
+/// never appears in the learn set gets ITS OWN bucket, so `bucket_count`
+/// (`leafCount`) GROWS. Under `SkipTest` the remap is built over the learn
+/// columns only and `bucket_count` is unchanged — today's behavior,
+/// byte-identical. In BOTH settings the learn-document OUTPUT column stays
+/// indexed by the LEARN slice: eval documents contribute to the tally and the
+/// bucket space but produce no output rows, so `bins.len()` and
+/// `ctr_value.len()` always equal the learn document count.
+///
 /// # Errors
 /// - [`CbError::Degenerate`] if `cat_columns` is empty, a member column is
 ///   shorter than the permutation implies, or `prior_denom == 0`.

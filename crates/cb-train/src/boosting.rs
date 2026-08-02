@@ -2188,6 +2188,13 @@ pub struct EvalSet<'a> {
     pub feature_values: &'a [Vec<f32>],
     /// Eval per-object target labels.
     pub target: &'a [f64],
+    /// `cat_columns[c]` is eval categorical column `c`'s per-object RAW string
+    /// values (E21, enabling SPEC-CTRT-17): under `counter_calc_method = Full`
+    /// upstream tallies learn **+ every eval set** into the Counter bucket
+    /// totals (`online_ctr.cpp:716-729`), so the eval categorical data must be
+    /// carriable at all. Empty (`&[]`) on every numeric path — exactly the
+    /// pre-E21 semantics, byte-identical.
+    pub cat_columns: &'a [Vec<String>],
 }
 
 /// The ranking (grouped) structure a ranking loss reads (LOSS-04, D-6.3-03):
@@ -2325,6 +2332,7 @@ pub fn train_with_eval<R: Runtime>(
             vec![EvalSet {
                 feature_values: es.feature_values,
                 target: es.target,
+                cat_columns: es.cat_columns,
             }]
         })
         .unwrap_or_default();
@@ -2486,6 +2494,58 @@ pub fn train_cat<R: Runtime>(
         staged_out,
         &[],
         None,
+        RankingData::default(),
+    )
+}
+
+/// [`train_cat`] plus held-out evaluation sets (E21, enabling SPEC-CTRT-17) —
+/// the categorical mirror of [`train_with_eval_sets`], except the baked CTR
+/// data is RETURNED rather than discarded (a categorical model without its
+/// baked tables cannot predict).
+///
+/// Each eval set may carry its own `cat_columns`; under
+/// `counter_calc_method = Full` (threaded by E22) those columns join the
+/// Counter bucket tally exactly as upstream's learn-plus-every-test-set hash
+/// array does (`online_ctr.cpp:716-729`).
+///
+/// # Errors
+/// As [`train_cat`], plus [`CbError::LengthMismatch`] if any eval set's
+/// categorical column length disagrees with that set's target length.
+#[allow(clippy::too_many_arguments)]
+pub fn train_cat_with_eval_sets<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_columns: &[Vec<String>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+    eval_sets: &[EvalSet],
+    history: Option<&mut EvalMetricHistory>,
+) -> CbResult<(Model, BakedCtrData)> {
+    for (si, es) in eval_sets.iter().enumerate() {
+        for (ci, col) in es.cat_columns.iter().enumerate() {
+            if col.len() != es.target.len() {
+                return Err(CbError::LengthMismatch {
+                    column: format!("eval set {si} categorical column {ci}"),
+                    expected: es.target.len(),
+                    actual: col.len(),
+                });
+            }
+        }
+    }
+    train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        cat_columns,
+        target,
+        weights,
+        params,
+        staged_out,
+        eval_sets,
+        history,
         RankingData::default(),
     )
 }
