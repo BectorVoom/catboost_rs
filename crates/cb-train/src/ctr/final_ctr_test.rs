@@ -209,3 +209,158 @@ fn borders_bake_bytes_are_unchanged() {
     assert_eq!(t.scale.to_bits(), 4_624_633_867_356_078_080);
     assert_eq!(t.counter_denominator, 0);
 }
+
+// ---------------------------------------------------------------------------
+// BUG-BTMV / SPEC-BTMV-01 — the whole-set bake divides by
+// `targetClassesCount - 1` (online_ctr.cpp:914), NOT by `targetClassesCount`
+// and NOT by GetTargetBorderCount (ctr_helper.h:34-42, the ONLINE-path helper).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn btmv_bake_sums_class_one_documents_per_bucket() {
+    use crate::ctr::bake::bake_ctr_table;
+
+    // `e11_fixture` is reused deliberately: it is already cross-checked against
+    // the frozen Borders bake, which is what lets these expectations be DERIVED
+    // rather than asserted by fiat.
+    //
+    // Buckets are `i % 3` in first-seen order 0, 1, 2. Class-1 counts are 4, 0, 3.
+    // With the upstream whole-set divisor `targetClassesCount - 1 == 1` for
+    // binclf, each bucket's Sum is EXACTLY its class-1 count.
+    let (cats, tc, proj) = e11_fixture();
+    let t = bake_ctr_table(
+        &cats, &proj, &tc, 2, 15, 0.5, 1.0,
+        ECtrType::BinarizedTargetMeanValue,
+    )
+    .expect("bake must succeed");
+
+    // THE NON-FIAT STEP: tie the mean table to the INDEPENDENTLY FROZEN Borders
+    // payload rather than to a literal chosen by the author.
+    let borders = bake_ctr_table(&cats, &proj, &tc, 2, 15, 0.5, 1.0, ECtrType::Borders)
+        .expect("borders bake must succeed");
+
+    for b in 0..t.mean.len() {
+        assert_eq!(
+            f64::from(t.mean[b].0),
+            borders.int_counts[b][1] as f64,
+            "bucket {b}: the BTMV Sum must equal the Borders N1 (class-1 count) — \
+             the whole-set divisor is targetClassesCount - 1 == 1 for binclf \
+             (online_ctr.cpp:914). Observed Sum {} vs N1 {}: the ratio names the \
+             wrong divisor.",
+            t.mean[b].0,
+            borders.int_counts[b][1]
+        );
+        assert_eq!(
+            t.mean[b].1,
+            borders.int_counts[b][0] + borders.int_counts[b][1],
+            "bucket {b}: Count must equal N0 + N1"
+        );
+    }
+
+    // Literal pin as well — belt and braces, and the human-readable failure.
+    assert_eq!(
+        t.mean,
+        vec![(4.0f32, 4i64), (0.0, 4), (3.0, 4)],
+        "hand-computed from e11_fixture. Halved Sums => bake.rs:196 passed \
+         `classes` (2) as target_border_count instead of `classes - 1` (1)."
+    );
+
+    // ANTI-VACUITY, both clauses.
+    assert!(
+        t.mean.iter().any(|&(s, c)| f64::from(s) != c as f64 && s != 0.0),
+        "every bucket has Sum == Count or Sum == 0 — a degenerate corpus would \
+         satisfy this test trivially; the corpus must contain a bucket with a \
+         MIXED target (bucket 2: 3 of 4)"
+    );
+
+    assert!(
+        t.int_counts.is_empty(),
+        "the mean types carry (Sum, Count) pairs"
+    );
+}
+
+#[test]
+fn bake_target_border_divisor_is_classes_minus_one_not_the_ctr_type_helper() {
+    use crate::ctr::bake::bake_ctr_table;
+
+    // A 3-class corpus. Production is binclf-only (boosting.rs:5582 hard-codes 2),
+    // so this is a CHARACTERIZATION of `bake_ctr_table`'s public contract at a
+    // configuration production does not reach. It exists because at classes == 2
+    // the FIX and the HELPER are indistinguishable (both yield 1); the BUG yields
+    // 2 and is distinguishable, but only in the Sum MAGNITUDE, not in
+    // which-candidate-is-which — so classes = 3 is required to tell the fix apart
+    // from the helper:
+    //
+    //   expression                                  classes=2   classes=3
+    //   ------------------------------------------  ---------   ---------
+    //   `classes`            (TODAY'S BUG)              2           3
+    //   `classes - 1`        (upstream)                 1           2
+    //   `BTMV.target_border_count(classes)`             1           1
+    //
+    // STOP CONDITION: if this assertion ever needs to change, either upstream's
+    // CalcFinalCtrsImpl changed (re-read online_ctr.cpp:914) or someone routed
+    // the bake through GetTargetBorderCount. Do NOT adjust the expected value.
+
+    // ANTI-VACUITY: this is a discriminator ONLY while the three candidates differ.
+    assert_ne!(
+        3usize - 1,
+        ECtrType::BinarizedTargetMeanValue.target_border_count(3),
+        "this test is only a discriminator while these differ; if the helper ever \
+         returns `classes - 1` for BTMV, re-derive the discriminator before \
+         touching the expectations"
+    );
+    assert_ne!(3usize, 3usize - 1);
+
+    let col: Vec<String> = ["a", "a", "a", "b", "b", "b"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let tc: Vec<usize> = vec![0, 1, 2, 2, 2, 0];
+    let proj = crate::projection::TProjection::from_features(&[0]);
+
+    let t = bake_ctr_table(
+        &[col], &proj, &tc, 3, 15, 0.5, 1.0,
+        ECtrType::BinarizedTargetMeanValue,
+    )
+    .expect("bake must succeed");
+
+    // Under `classes - 1 == 2`: "a" = (0+1+2)/2 = 1.5 over 3; "b" = (2+2+0)/2 = 2.0 over 3.
+    assert_eq!(
+        t.mean,
+        vec![(1.5f32, 3i64), (2.0, 3)],
+        "the whole-set divisor must be `classes - 1` == 2. Observed {:?}. \
+         `classes` (3, today's bug) would give [(1.0, 3), (1.333.., 3)]; \
+         the ctr-type helper (1) would give [(3.0, 3), (4.0, 3)].",
+        t.mean
+    );
+}
+
+#[test]
+fn btmv_bake_at_one_class_is_unchanged_and_does_not_error() {
+    use crate::ctr::bake::bake_ctr_table;
+
+    let col: Vec<String> = (0..6).map(|i| cb_data::stringify_int_category(i % 2)).collect();
+    let tc: Vec<usize> = vec![0; 6];
+    let proj = crate::projection::TProjection::from_features(&[0]);
+
+    let t = bake_ctr_table(
+        &[col], &proj, &tc, 1, 15, 0.5, 1.0,
+        ECtrType::BinarizedTargetMeanValue,
+    );
+
+    assert!(
+        t.is_ok(),
+        "`accumulate_online` rejects `target_border_count == 0` \
+         (online.rs:176-180), so the bake floors the divisor at 1 \
+         (`saturating_sub(1).max(1)`, the same idiom as `online_mean_prefix`, \
+         online.rs:321). Without the floor this bake would start returning \
+         CbError::Degenerate where it returns Ok today. Upstream's \
+         CalcFinalCtrsImpl divides by 0 here and is undefined; the floor is a \
+         deliberate, behavior-preserving divergence."
+    );
+    let t = t.expect("checked above");
+    assert!(
+        t.mean.iter().all(|&(s, _)| s == 0.0),
+        "every target_class is 0, so every Sum must be 0 under any divisor"
+    );
+}
