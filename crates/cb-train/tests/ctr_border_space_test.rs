@@ -124,7 +124,6 @@ fn materialize_and_grow() -> (cb_train::CtrFeatureColumn, Vec<f64>, f64, f64) {
         3.0,
         1,
         n,
-        0,
         0.0,
         EScoreFunction::Cosine,
         &[],

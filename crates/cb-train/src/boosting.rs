@@ -2082,11 +2082,14 @@ pub(crate) fn cat_eligible_buckets_for(
 /// one function, the index alignment the chosen-split → averaging-column lookup
 /// depends on holds by construction rather than by convention.
 ///
-/// The emitted order is upstream's `(ctrIdx, priorIdx)` nesting
-/// (`greedy_tensor_search.cpp:414-427`): for each candidate, one column per prior
-/// in configured list order. E16 inserts the `targetBorderIdx` loop between them.
-/// With a single-element prior list the sequence is byte-identical to the
-/// pre-E15 one-column-per-candidate emission (the D-04 no-op proof).
+/// The emitted order is upstream's `(ctrIdx, targetBorderIdx, priorIdx)`
+/// nesting (`greedy_tensor_search.cpp:400-428`): for each candidate, one column
+/// per `target_border_idx` in `0..target_border_count(classes)` (E16 /
+/// SPEC-CTRT-12 — `2` for Buckets at binclf, `1` for every other CPU-legal
+/// type), and inside that one column per prior in configured list order. With a
+/// single-element prior list and a non-Buckets type the sequence is
+/// byte-identical to the pre-E15 one-column-per-candidate emission (the D-04
+/// no-op proof).
 pub(crate) fn materialize_ctr_columns_for_perm(
     cat_columns: &[Vec<String>],
     absolute_projections: &[crate::TProjection],
@@ -2096,6 +2099,9 @@ pub(crate) fn materialize_ctr_columns_for_perm(
     target_class: &[usize],
     ctr_border_count: usize,
 ) -> CbResult<Vec<crate::ctr::CtrFeatureColumn>> {
+    // The binclf target-class count — the SAME `2` the bake passes to
+    // `bake_ctr_table` (`GetTargetBorderCount`'s `targetClassesCount` input).
+    const TARGET_CLASSES: usize = 2;
     let mut cols = Vec::with_capacity(ctr_candidates.len());
     for (ci, proj) in absolute_projections.iter().enumerate() {
         // `absolute_projections` is index-aligned with `ctr_candidates`, so
@@ -2108,21 +2114,22 @@ pub(crate) fn materialize_ctr_columns_for_perm(
             &params.combinations_ctr_priors,
             is_simple,
         );
-        for &prior_num in priors {
-            let col = crate::ctr::materialize_ctr_feature(
-                cat_columns,
-                proj,
-                permutation,
-                target_class,
-                prior_num,
-                // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
-                CTR_PRIOR_DENOM,
-                ctr_border_count,
-                ctr_type,
-                // W3 (E16) expands the border index.
-                0,
-            )?;
-            cols.push(col);
+        for target_border_idx in 0..ctr_type.target_border_count(TARGET_CLASSES) {
+            for &prior_num in priors {
+                let col = crate::ctr::materialize_ctr_feature(
+                    cat_columns,
+                    proj,
+                    permutation,
+                    target_class,
+                    prior_num,
+                    // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
+                    CTR_PRIOR_DENOM,
+                    ctr_border_count,
+                    ctr_type,
+                    target_border_idx,
+                )?;
+                cols.push(col);
+            }
         }
     }
     Ok(cols)
@@ -2159,7 +2166,11 @@ fn ctr_splits_for_tree(
                 prior_num,
                 // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
                 prior_denom: 1.0,
-                // W3 (E16) expands this; W2 keeps the single border index.
+                // DELIBERATE, TESTED CONSTANT (E16): this function is reached
+                // only from the `!has_ctr` fallback, where NO materialized
+                // column exists by construction — so there is no per-column
+                // `target_border_idx` to read, and structurally cannot be. The
+                // E03 characterization test pins the `0`.
                 target_border_idx: 0,
                 border: 0.0,
                 shift: 0.0,
@@ -5025,7 +5036,6 @@ fn train_inner<R: Runtime>(
                 scaled_l2,
                 params.depth,
                 n,
-                0,
                 // model_size_reg cat-feature weight (GetCatFeatureWeight): the
                 // default 0.5 down-weights high-cardinality (combination) CTR
                 // candidates so a new {0,1} combination does not out-score a second
