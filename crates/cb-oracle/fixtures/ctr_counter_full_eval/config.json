@@ -26,6 +26,7 @@
     "leaf_estimation_method": "Gradient",
     "leaf_estimation_iterations": 1,
     "bootstrap_type": "No",
+    "use_best_model": false,
     "random_strength": 0,
     "random_seed": 0,
     "thread_count": 1,
@@ -51,13 +52,14 @@
     "leaf_estimation_method": "Gradient",
     "leaf_estimation_iterations": 1,
     "bootstrap_type": "No",
+    "use_best_model": false,
     "random_strength": 0,
     "random_seed": 0,
     "thread_count": 1,
     "boost_from_average": false,
     "verbose": false
   },
-  "observed_full_vs_skiptest_maxdiff": 0.22398770125642198,
+  "observed_full_vs_skiptest_maxdiff": 0.29855589502319396,
   "npy_schema": {
     "X_cat.npy": "[60,2] int32 \u2014 learn categorical codes",
     "y.npy": "[60] f64 \u2014 learn binclf label",

@@ -80,8 +80,8 @@
             ],
           "classes_count":0
         },
-      "model_guid":"8079fe8f-ad989dbe-6445de7c-e610cba5",
-      "output_options":"{\"name\":\"experiment\",\"verbose\":0,\"test_error_log\":\"test_error.tsv\",\"json_log\":\"catboost_training.json\",\"result_model_file\":\"model\",\"roc_file\":\"\",\"eval_file_name\":\"\",\"use_best_model\":true,\"allow_writing_files\":true,\"prediction_type\":[\"RawFormulaVal\"],\"fstr_internal_file\":\"\",\"output_columns\":[\"SampleId\",\"RawFormulaVal\",\"Label\"],\"snapshot_interval\":600,\"time_left_log\":\"time_left.tsv\",\"fstr_type\":\"FeatureImportance\",\"profile_log\":\"catboost_profile.log\",\"train_dir\":\"catboost_info\",\"learn_error_log\":\"learn_error.tsv\",\"training_options_file\":\"\",\"snapshot_file\":\"experiment.cbsnapshot\",\"save_snapshot\":false,\"model_format\":[\"CatboostBinary\"],\"final_feature_calcer_computation_mode\":\"Default\",\"metric_period\":1,\"output_borders\":\"\",\"final_ctr_computation_mode\":\"Default\",\"best_model_min_trees\":1,\"fstr_regular_file\":\"\"}",
+      "model_guid":"85b8e3e0-507e67d2-ea57ed6b-ada97a4c",
+      "output_options":"{\"name\":\"experiment\",\"verbose\":0,\"test_error_log\":\"test_error.tsv\",\"json_log\":\"catboost_training.json\",\"result_model_file\":\"model\",\"roc_file\":\"\",\"eval_file_name\":\"\",\"use_best_model\":false,\"allow_writing_files\":true,\"prediction_type\":[\"RawFormulaVal\"],\"fstr_internal_file\":\"\",\"output_columns\":[\"SampleId\",\"RawFormulaVal\",\"Label\"],\"snapshot_interval\":600,\"time_left_log\":\"time_left.tsv\",\"fstr_type\":\"FeatureImportance\",\"profile_log\":\"catboost_profile.log\",\"train_dir\":\"catboost_info\",\"learn_error_log\":\"learn_error.tsv\",\"training_options_file\":\"\",\"snapshot_file\":\"experiment.cbsnapshot\",\"save_snapshot\":false,\"model_format\":[\"CatboostBinary\"],\"final_feature_calcer_computation_mode\":\"Default\",\"metric_period\":1,\"output_borders\":\"\",\"final_ctr_computation_mode\":\"Default\",\"best_model_min_trees\":1,\"fstr_regular_file\":\"\"}",
       "params":
         {
           "boosting_options":
@@ -302,6 +302,7 @@
                   "Counter:Prior=0.5"
                 ],
               "thread_count":1,
+              "use_best_model":false,
               "verbose":0
             },
           "logging_level":"Silent",
@@ -394,7 +395,7 @@
               "sparse_features_conflict_fraction":0
             }
         },
-      "train_finish_time":"2026-08-02T22:58:59Z",
+      "train_finish_time":"2026-08-02T23:01:17Z",
       "training":"{\"metrics\":{\"best_iteration\":9,\"learn_best_error\":{\"Logloss\":0.674509132378169},\"test_metrics_history\":[[{\"Logloss\":0.6896657862386453}],[{\"Logloss\":0.6863176312668772}],[{\"Logloss\":0.6830974119111777}],[{\"Logloss\":0.6800000165314303}],[{\"Logloss\":0.6770205218879372}],[{\"Logloss\":0.6741541890972262}],[{\"Logloss\":0.6713964592979598}],[{\"Logloss\":0.6687429490828455}],[{\"Logloss\":0.6661894457471671}],[{\"Logloss\":0.6637319023995045}]],\"learn_metrics_history\":[{\"Logloss\":0.690912987660372},{\"Logloss\":0.6887705821731326},{\"Logloss\":0.6867161684005387},{\"Logloss\":0.6847460921139716},{\"Logloss\":0.6828568376520006},{\"Logloss\":0.6810450247735846},{\"Logloss\":0.679307405311058},{\"Logloss\":0.6776408596635527},{\"Logloss\":0.6760423931676365},{\"Logloss\":0.674509132378169}],\"test_best_error\":[{\"Logloss\":0.6637319023995045}]}}"
     },
   "oblivious_trees":
