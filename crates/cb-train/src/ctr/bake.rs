@@ -75,6 +75,10 @@ pub struct BakedCtrTable {
     pub int_counts: Vec<Vec<i64>>,
     /// `CounterDenominator` (Counter / FeatureFreq); `0` otherwise.
     pub counter_denominator: i64,
+    /// Per-bucket `(Sum, Count)` pairs for the mean types
+    /// (BinarizedTargetMeanValue / FloatTargetMeanValue); empty otherwise. `Sum`
+    /// is `f32` to match upstream `TCtrMeanHistory::Sum` (`online_ctr.h:373`).
+    pub mean: Vec<(f32, i64)>,
     /// The inference `Shift` (`calc_normalization(prior_num)` → `shift`).
     pub shift: f64,
     /// The inference `Scale` (`ctr_border_count / norm`).
@@ -115,6 +119,7 @@ pub fn bake_ctr_table(
     ctr_border_count: usize,
     prior_num: f64,
     prior_denom: f64,
+    ctr_type: ECtrType,
 ) -> CbResult<BakedCtrTable> {
     if cat_columns.is_empty() {
         return Err(CbError::Degenerate(
@@ -189,7 +194,9 @@ pub fn bake_ctr_table(
     let target_zero = vec![0.0_f64; n];
     let target_class_n = target_class.get(..n).unwrap_or(target_class).to_vec();
     let acc = accumulate_online(&key_refs, &target_class_n, &target_zero, classes, classes)?;
-    let final_table = build_final_ctr(&acc, ECtrType::Borders);
+    // E11: the requested type, not a hard-coded Borders head.
+    // `counter_calc_skip_test` is the SkipTest default and inert until E22.
+    let final_table = build_final_ctr(&acc, ctr_type, true);
 
     // 4. Reshape the flat bucket-major class counts into per-bucket `[N0, N1, …]`,
     //    keyed by the first-seen combined hash. accumulate_online's PerfectHash
@@ -207,15 +214,50 @@ pub fn bake_ctr_table(
         ));
     }
     let mut hashes: Vec<u64> = Vec::with_capacity(bucket_count);
-    let mut int_counts: Vec<Vec<i64>> = Vec::with_capacity(bucket_count);
     for b in 0..bucket_count {
-        let hash = first_seen_hashes.get(b).copied().unwrap_or(0);
-        let start = b.saturating_mul(classes);
-        let counts: Vec<i64> = (0..classes)
-            .map(|c| final_table.int_counts.get(start + c).copied().unwrap_or(0))
-            .collect();
-        hashes.push(hash);
-        int_counts.push(counts);
+        hashes.push(first_seen_hashes.get(b).copied().unwrap_or(0));
+    }
+
+    // E11 / SPEC-CTRT-13: reshape PER TYPE. `FinalCtrTable` already carries the
+    // right payload for all six types; only the per-bucket layout differs.
+    let mut int_counts: Vec<Vec<i64>> = Vec::new();
+    let mut mean: Vec<(f32, i64)> = Vec::new();
+    match ctr_type {
+        ECtrType::Borders | ECtrType::Buckets => {
+            // Bucket-major [N0, N1, …] — the pre-E11 layout, unchanged. Buckets
+            // and Borders bake IDENTICALLY; they differ only at apply time, where
+            // `target_border_idx` selects the numerator.
+            int_counts = Vec::with_capacity(bucket_count);
+            for b in 0..bucket_count {
+                let start = b.saturating_mul(classes);
+                let counts: Vec<i64> = (0..classes)
+                    .map(|c| final_table.int_counts.get(start + c).copied().unwrap_or(0))
+                    .collect();
+                int_counts.push(counts);
+            }
+        }
+        ECtrType::Counter | ECtrType::FeatureFreq => {
+            // ONE value per bucket. Counter's wire `TargetClassesCount` is 0 and
+            // the decoder forces `width = 1`, so emitting the class-major layout
+            // here would mis-align every decoded bucket.
+            int_counts = final_table
+                .int_counts
+                .iter()
+                .take(bucket_count)
+                .map(|&total| vec![total])
+                .collect();
+        }
+        ECtrType::BinarizedTargetMeanValue | ECtrType::FloatTargetMeanValue => {
+            // (Sum, Count) pairs; `int_counts` stays empty.
+            mean = (0..bucket_count)
+                .map(|b| {
+                    (
+                        final_table.mean_sum.get(b).copied().unwrap_or(0.0),
+                        final_table.mean_count.get(b).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+        }
     }
 
     // Derive (Shift, Scale) from the prior PAIR (calc_normalization(prior_num)):
@@ -229,11 +271,12 @@ pub fn bake_ctr_table(
 
     Ok(BakedCtrTable {
         projection: projection.clone(),
-        ctr_type: ECtrType::Borders.as_i8(),
+        ctr_type: ctr_type.as_i8(),
         target_classes_count: classes,
         hashes,
         int_counts,
-        counter_denominator: 0,
+        counter_denominator: final_table.counter_denominator,
+        mean,
         shift,
         scale,
         prior_num,

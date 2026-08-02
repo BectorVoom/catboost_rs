@@ -322,7 +322,12 @@ impl CtrData {
                     target_classes_count: t.target_classes_count,
                     hashes: t.hashes.clone(),
                     int_counts: t.int_counts.clone(),
-                    mean: Vec::new(),
+                    // E11 / SPEC-CTRT-13: carry the baked mean tables. This was
+                    // hard-coded `Vec::new()`, which silently discarded every
+                    // BinarizedTargetMeanValue / FloatTargetMeanValue table — the
+                    // apply path then saw an empty `mean` and produced the
+                    // not-found value for every bucket.
+                    mean: t.mean.clone(),
                     counter_denominator: t.counter_denominator,
                 },
             );

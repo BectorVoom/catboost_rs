@@ -98,7 +98,7 @@ fn cb_data_hash(s: &str) -> u32 {
 fn borders_ctr_data_round_trips_and_applies() {
     let (col, tc, t) = anchor_column();
     let acc = accumulate_online(&col, &tc, &t, 2, 2).expect("accumulate");
-    let final_table = build_final_ctr(&acc, cb_train::ECtrType::Borders);
+    let final_table = build_final_ctr(&acc, cb_train::ECtrType::Borders, true);
     let table = lift(ECtrType::Borders, &final_table, &["a", "b", "c"]);
 
     // Build the ctr_data section and round-trip through BOTH wire forms.
@@ -135,12 +135,12 @@ fn counter_vs_feature_freq_denominators_apply_distinctly() {
 
     let counter = lift(
         ECtrType::Counter,
-        &build_final_ctr(&acc, cb_train::ECtrType::Counter),
+        &build_final_ctr(&acc, cb_train::ECtrType::Counter, true),
         &["a", "b", "c"],
     );
     let freq = lift(
         ECtrType::FeatureFreq,
-        &build_final_ctr(&acc, cb_train::ECtrType::FeatureFreq),
+        &build_final_ctr(&acc, cb_train::ECtrType::FeatureFreq, true),
         &["a", "b", "c"],
     );
 
@@ -160,7 +160,7 @@ fn float_target_mean_round_trips_and_applies() {
     let acc = accumulate_online(&col, &tc, &t, 2, 2).expect("accumulate");
     let table = lift(
         ECtrType::FloatTargetMeanValue,
-        &build_final_ctr(&acc, cb_train::ECtrType::FloatTargetMeanValue),
+        &build_final_ctr(&acc, cb_train::ECtrType::FloatTargetMeanValue, true),
         &["a", "b", "c"],
     );
 
@@ -236,4 +236,92 @@ fn malformed_blob_is_typed_error_not_panic() {
     let mut blob = Vec::new();
     blob.extend_from_slice(&u32::MAX.to_le_bytes());
     assert!(decode_ctr_data(&blob).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// E11 / SPEC-CTRT-13 — `CtrData::from_baked` carries the mean tables, and the
+// bake/table key is `(projection, ctr_type)` — never `target_border_idx`.
+// ---------------------------------------------------------------------------
+
+/// Build a `BakedCtrTable` for one projection at one CTR type, through the
+/// PRODUCTION bake, so these tests exercise the real reshape.
+fn e11_baked(ctr_type: cb_train::ECtrType) -> cb_train::BakedCtrTable {
+    let col: Vec<String> = (0..12)
+        .map(|i| cb_data::stringify_int_category(i % 3))
+        .collect();
+    let target_class: Vec<usize> = vec![1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1];
+    let proj = cb_train::TProjection::from_features(&[0]);
+    cb_train::bake_ctr_table(&[col], &proj, &target_class, 2, 15, 0.5, 1.0, ctr_type)
+        .expect("bake must succeed")
+}
+
+#[test]
+fn from_baked_carries_mean_tables_for_btmv() {
+    let baked = cb_train::BakedCtrData {
+        tables: vec![e11_baked(cb_train::ECtrType::BinarizedTargetMeanValue)],
+    };
+    let data = cb_model::CtrData::from_baked(&baked);
+
+    let key = cb_model::ctr_base_key(cb_model::ECtrType::BinarizedTargetMeanValue, &[0]);
+    let table = data.tables.get(&key).expect("the BTMV table must be present");
+
+    assert_eq!(table.mean.len(), 3, "one (Sum, Count) pair per bucket");
+    assert!(
+        !table.mean.is_empty(),
+        "from_baked hard-coded mean: Vec::new(), which silently dropped every mean table"
+    );
+    // ANTI-VACUITY: an all-zero mean table would satisfy the length assertion
+    // while still being the discarded-data bug.
+    assert!(
+        table.mean.iter().any(|&(sum, _)| sum != 0.0),
+        "a bucket with positive-class documents must carry a non-zero Sum"
+    );
+}
+
+#[test]
+fn from_baked_emits_exactly_one_table_for_two_buckets_splits_at_different_border_idx() {
+    // ONE projection, ONE ctr_type, reached by two chosen Buckets splits that
+    // differ ONLY in target_border_idx. The bake key must ignore the border
+    // index entirely, so both splits share a single table.
+    let baked = cb_train::BakedCtrData {
+        tables: vec![e11_baked(cb_train::ECtrType::Buckets)],
+    };
+    let data = cb_model::CtrData::from_baked(&baked);
+
+    assert_eq!(
+        data.tables.len(),
+        1,
+        "target_border_idx must NOT be part of ctr_base_key or the bake key — one \
+         Buckets table serves both b=0 and b=1 (crates/cb-model/src/ctr_data.rs:299)"
+    );
+    assert!(data
+        .tables
+        .contains_key(&cb_model::ctr_base_key(cb_model::ECtrType::Buckets, &[0])));
+}
+
+#[test]
+fn from_baked_emits_two_tables_for_two_distinct_ctr_types_on_one_projection() {
+    // The complement: the SAME projection at two DIFFERENT types must produce two
+    // tables. Together with the test above this proves the key is
+    // (projection, ctr_type) — not projection alone, and not (.., border_idx).
+    let baked = cb_train::BakedCtrData {
+        tables: vec![
+            e11_baked(cb_train::ECtrType::Buckets),
+            e11_baked(cb_train::ECtrType::Counter),
+        ],
+    };
+    let data = cb_model::CtrData::from_baked(&baked);
+
+    assert_eq!(
+        data.tables.len(),
+        2,
+        "distinct ctr_type => distinct ctr_base_key, so one projection can carry \
+         two typed tables"
+    );
+    assert!(data
+        .tables
+        .contains_key(&cb_model::ctr_base_key(cb_model::ECtrType::Buckets, &[0])));
+    assert!(data
+        .tables
+        .contains_key(&cb_model::ctr_base_key(cb_model::ECtrType::Counter, &[0])));
 }
