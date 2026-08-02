@@ -140,6 +140,19 @@ impl TProjection {
     }
 
     /// Whether this projection is a SimpleCtr (single feature). Length 1.
+    ///
+    /// Upstream caveats (E17 / SPEC-CTRT-10 — recorded, NOT implemented):
+    ///
+    /// 1. `GetCtrInfo` checks `PerFeatureCtrs` FIRST for a single-cat
+    ///    projection (`ctr_helper.h:52-62`); `per_feature_ctr` is unsupported
+    ///    here, so the mapping is "`simple_ctr` unless a per-feature override
+    ///    exists (unsupported)".
+    /// 2. Upstream's `IsSingleCatFeature()` also requires `BinFeatures.empty()
+    ///    && OneHotFeatures.empty()` (`projection.h:102-104`). This
+    ///    `TProjection` holds ONLY `cat_features`, so `len() == 1` is currently
+    ///    EXACTLY equivalent — but if a later phase adds bin/one-hot projection
+    ///    members, this predicate MUST widen to reject them, or a mixed
+    ///    projection would silently route to `simple_ctr`.
     #[must_use]
     pub fn is_simple(&self) -> bool {
         self.cat_features.len() == 1
