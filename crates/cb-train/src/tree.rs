@@ -3286,6 +3286,23 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
                 })?;
                 level_kinds.push(LevelKind::Ctr {
                     ctr_idx: ctr_splits.len(),
+                    // BIN SPACE — deliberately NOT the value-space conversion
+                    // applied to the persisted `CtrSplitSpec.border` below.
+                    //
+                    // This border is training-only: its sole consumer is
+                    // `assign_leaf_of_averaging` (boosting.rs:1926-1938), which
+                    // tests `f64::from(bin) > *border` against
+                    // `CtrFeatureColumn::bins` (`Vec<u32>`). Because that operand
+                    // is an INTEGER, `bin > b` and `bin > (b+1) - 2^-20` are
+                    // arithmetically EQUIVALENT here, so converting this line
+                    // would change no behavior — it is kept in bin space as a
+                    // UNITS contract, matching the unit of the value it is
+                    // compared against. Mixing units across these two adjacent,
+                    // identically-typed fields is how BUG-CTRB arose.
+                    //
+                    // Consequence: no runtime test can detect a conversion here.
+                    // The guard is the explicit integrality assertion in
+                    // tests/ctr_border_space_test.rs (SPEC-CTRB-03).
                     border: *border,
                 });
                 ctr_splits.push(CtrSplitSpec {
@@ -3294,7 +3311,26 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
                     prior_num: column.prior_num,
                     prior_denom: column.prior_denom,
                     target_border_idx,
-                    border: *border,
+                    // VALUE SPACE (SPEC-CTRB-01). The search chose the integer
+                    // bin index `*border`; every consumer of the PERSISTED border
+                    // — `cb_model::passes_ctr_split` (apply.rs:189), the `.cbm`
+                    // codec (cbm.rs:437/601) and upstream CatBoost — compares it
+                    // against the SCALED CTR value, where the bin is `trunc(v)`.
+                    // Upstream's convention is `(bin + 1) - 2^-20`; every committed
+                    // CTR fixture border matches it bit-for-bit.
+                    //
+                    // Computed in f32 and widened once because the `.cbm` codec
+                    // narrows `Borders` to f32 on save and widens via `f64::from`
+                    // on load — the value must therefore be an f32 fixed point,
+                    // which the f32 form is and the naive f64 form is not.
+                    //
+                    // DOMAIN: `bin <= 15`. Above that the f32 subtraction rounds
+                    // to exactly `bin + 1` and the strict-interval property is
+                    // lost. Guaranteed reachable-safe by
+                    // `ctr_border_count_default() == 15` (boosting.rs:529-531),
+                    // consumed at boosting.rs:3238 — the single, non-configurable
+                    // source of `ctr_border_count`.
+                    border: f64::from((*border as f32 + 1.0) - f32::powi(2.0, -20)),
                     // Default Shift/Scale at structure-search time; the train_cat
                     // bake (Plan 05-14) overwrites these on the chosen splits with
                     // the calc_normalization(prior_num)-derived (Shift, Scale).
