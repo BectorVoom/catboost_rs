@@ -3281,6 +3281,10 @@ fn train_inner<R: Runtime>(
                     ctr_prior_num,
                     ctr_prior_denom,
                     ctr_border_count,
+                    // E09: behavior-preserving constants. Per-candidate type and
+                    // prior resolution is E10's, not this task's.
+                    crate::ctr::ECtrType::Borders,
+                    0,
                 )?;
                 cols.push(col);
             }
@@ -3316,6 +3320,9 @@ fn train_inner<R: Runtime>(
                     &target_class,
                     ctr_prior_num, ctr_prior_denom,
                     ctr_border_count,
+                    // E09: behavior-preserving constants (E10 makes them per-candidate).
+                    crate::ctr::ECtrType::Borders,
+                    0,
                 )?;
                 cols.push(col);
             }

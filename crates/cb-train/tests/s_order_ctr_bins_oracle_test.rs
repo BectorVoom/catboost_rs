@@ -75,6 +75,8 @@ fn assert_s_order_reproduces_bins(p_avg: &[i32], avg_bins_ctr_order: &[u32]) {
         PRIOR_NUM,
         PRIOR_DENOM,
         CTR_BORDER_COUNT,
+        cb_train::ECtrType::Borders,
+        0,
     )
     .expect("materialize_ctr_feature over S∘P_avg must succeed");
 
