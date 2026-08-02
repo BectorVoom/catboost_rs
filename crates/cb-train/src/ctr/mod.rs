@@ -48,6 +48,9 @@ mod calc_ctr_test;
 #[cfg(test)]
 #[path = "final_ctr_test.rs"]
 mod final_ctr_test;
+#[cfg(test)]
+#[path = "mod_test.rs"]
+mod mod_test;
 
 /// The six CTR types (`ECtrType`, `ctr_type.h`), mirroring the upstream i8
 /// discriminants bit-for-bit (the SAME values as `cb-model`'s generated
@@ -99,6 +102,70 @@ impl ECtrType {
             4 => Some(Self::Counter),
             5 => Some(Self::FeatureFreq),
             _ => None,
+        }
+    }
+
+    /// The number of target borders this CTR type binarizes the target into
+    /// (`GetTargetBorderCount`, `ctr_helper.h:34-42`).
+    ///
+    /// - [`Buckets`](Self::Buckets) keeps the full `target_classes_count`
+    ///   (one bucket per class);
+    /// - [`BinarizedTargetMeanValue`](Self::BinarizedTargetMeanValue) and
+    ///   [`Counter`](Self::Counter) are fixed at `1` — neither binarizes the
+    ///   target at all;
+    /// - every other type uses `target_classes_count - 1` (the border count
+    ///   between classes), saturating at `0` so a degenerate
+    ///   `target_classes_count == 0` cannot underflow.
+    ///
+    /// For binary classification (`target_classes_count == 2`) this is `2` for
+    /// `Buckets` and `1` for every other CPU-legal type.
+    #[must_use]
+    pub const fn target_border_count(self, target_classes_count: usize) -> usize {
+        match self {
+            Self::Buckets => target_classes_count,
+            Self::BinarizedTargetMeanValue | Self::Counter => 1,
+            Self::Borders | Self::FloatTargetMeanValue | Self::FeatureFreq => {
+                target_classes_count.saturating_sub(1)
+            }
+        }
+    }
+
+    /// Whether this CTR type is computable on the CPU training path
+    /// (`IsSupportedCtrType(ETaskType::CPU, …)`, `restrictions.h:18-48`).
+    ///
+    /// Exactly [`FloatTargetMeanValue`](Self::FloatTargetMeanValue) and
+    /// [`FeatureFreq`](Self::FeatureFreq) are GPU-only; the other four are legal.
+    /// A configuration naming a CPU-illegal type must be rejected with a typed
+    /// error before any accumulation happens (SPEC-CTRT-03).
+    #[must_use]
+    pub const fn is_cpu_supported(self) -> bool {
+        match self {
+            Self::Borders | Self::Buckets | Self::BinarizedTargetMeanValue | Self::Counter => true,
+            Self::FloatTargetMeanValue | Self::FeatureFreq => false,
+        }
+    }
+
+    /// Whether this CTR type is accumulated as a permutation-dependent
+    /// read-before-increment ONLINE PREFIX, rather than as a whole-set tally
+    /// (`IsPermutationDependentCtrType`, `ctr_type.cpp:43-56`).
+    ///
+    /// [`Counter`](Self::Counter) and [`FeatureFreq`](Self::FeatureFreq) are
+    /// permutation-INdependent: their bucket totals are counted over the whole
+    /// set, so the learn permutation cannot change them. Every other type reads
+    /// the prefix strictly before its own document is folded in.
+    ///
+    /// [`FloatTargetMeanValue`](Self::FloatTargetMeanValue) is classified here
+    /// for match totality only — it is CPU-illegal
+    /// ([`is_cpu_supported`](Self::is_cpu_supported)) and is rejected upstream of
+    /// every caller of this method.
+    #[must_use]
+    pub const fn is_online_prefix(self) -> bool {
+        match self {
+            Self::Borders
+            | Self::Buckets
+            | Self::BinarizedTargetMeanValue
+            | Self::FloatTargetMeanValue => true,
+            Self::Counter | Self::FeatureFreq => false,
         }
     }
 

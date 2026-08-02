@@ -1307,6 +1307,39 @@ fn validate_score_function(score_function: cb_compute::EScoreFunction) -> CbResu
     Ok(())
 }
 
+/// Reject the CTR types that have no CPU training implementation (SPEC-CTRT-03).
+///
+/// Upstream gates this at option-parse time
+/// (`catboost_options.cpp:504-509`):
+/// ```text
+/// CB_ENSURE(IsSupportedCtrType(CPU, ctrType),
+///           "Ctr type " << ctrType << " is not implemented on CPU yet")
+/// ```
+/// `IsSupportedCtrType(ETaskType::CPU, …)` (`restrictions.h:18-48`) admits exactly
+/// `{Borders, Buckets, BinarizedTargetMeanValue, Counter}`, so
+/// [`FloatTargetMeanValue`](crate::ctr::ECtrType::FloatTargetMeanValue) and
+/// [`FeatureFreq`](crate::ctr::ECtrType::FeatureFreq) are GPU-only.
+///
+/// Checked BEFORE any CTR accumulation or tree growth so an unsupported request
+/// is a typed error rather than a model silently trained with a different CTR
+/// type than the caller asked for.
+fn validate_ctr_types(params: &BoostParams) -> CbResult<()> {
+    for (field, ty) in [
+        ("simple_ctr", params.simple_ctr),
+        ("combinations_ctr", params.combinations_ctr),
+    ] {
+        if !ty.is_cpu_supported() {
+            return Err(CbError::Unsupported(format!(
+                "Ctr type {ty:?} ({field}) is not implemented on CPU yet \
+                 (upstream catboost_options.cpp:504-509; \
+                 IsSupportedCtrType(CPU, …) admits only Borders, Buckets, \
+                 BinarizedTargetMeanValue and Counter)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
     if matches!(method, LeafMethod::Exact)
         && !matches!(
@@ -2572,6 +2605,11 @@ fn train_inner<R: Runtime>(
     // NaN/Inf derivatives that poison the histogram and leaf reductions, so it is
     // rejected up front with a typed CbError rather than producing a corrupt model.
     params.loss.validate()?;
+
+    // Reject CTR types with no CPU training implementation (SPEC-CTRT-03) before
+    // any accumulation or tree growth. Placed AFTER `loss.validate()` so the
+    // existing loss-validation error precedence is unchanged.
+    validate_ctr_types(params)?;
 
     // Reject the second-order (Newton) split-score functions on the CPU training
     // path (CR-01): `NewtonL2` / `NewtonCosine` reuse the L2 / Cosine score formula
