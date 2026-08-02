@@ -3229,9 +3229,11 @@ fn select_level_ctr_aware(
 /// ctr_type); `GrownTree.level_kinds` records each level's kind so the forward-bit
 /// leaf index assigns CTR bits and float bits in the correct level order.
 ///
-/// `ctr_features` are the IDENTITY-learning-fold materialized CTR columns
-/// (structure search); `target_border_idx` is the Buckets per-class numerator
-/// selector carried onto each chosen `CtrSplitSpec` (default `0`).
+/// `ctr_features` are the SELECTED-learning-fold materialized CTR columns
+/// (structure search); each chosen `CtrSplitSpec`'s `target_border_idx` — the
+/// Buckets per-class numerator selector — comes from the winning COLUMN
+/// (`CtrFeatureColumn.target_border_idx`, E16 / SPEC-CTRT-12), exactly like its
+/// `ctr_type` and prior pair. There is no whole-tree index parameter.
 /// `cat_eligible_buckets` (ORD-07) is one raw per-object
 /// [`cb_data::perfect_hash_bins`] column per CTR-eligible categorical feature —
 /// the phantom mixed float-partition + categorical-feature projection's bucket
@@ -3306,7 +3308,6 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
     scaled_l2: f64,
     depth: usize,
     n_objects: usize,
-    target_border_idx: usize,
     model_size_reg: f64,
     score_function: EScoreFunction,
     cat_eligible_buckets: &[Vec<u32>],
@@ -3384,7 +3385,12 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
                     ctr_type: column.ctr_type,
                     prior_num: column.prior_num,
                     prior_denom: column.prior_denom,
-                    target_border_idx,
+                    // E16 (SPEC-CTRT-12): the winning COLUMN's own per-class
+                    // numerator selector — sourced exactly like `ctr_type` and
+                    // the prior pair above. There is no whole-tree fallback;
+                    // the value exists in exactly one place,
+                    // `CtrFeatureColumn.target_border_idx`.
+                    target_border_idx: column.target_border_idx,
                     // VALUE SPACE (SPEC-CTRB-01). The search chose the integer
                     // bin index `*border`; every consumer of the PERSISTED border
                     // — `cb_model::passes_ctr_split` (apply.rs:189), the `.cbm`

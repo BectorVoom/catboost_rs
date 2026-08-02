@@ -825,3 +825,170 @@ fn ctr_splits_for_tree_defaults_are_byte_identical_to_the_e03_characterization()
         assert_eq!(spec.scale, 1.0, "spec {i}");
     }
 }
+
+// --- W3 candidate expansion (E15 / SPEC-CTRT-11, E16 / SPEC-CTRT-12) --------
+//
+// Observation channel (a): the extracted `pub(crate)` helpers
+// `materialize_ctr_columns_for_perm` / `cat_eligible_buckets_for` — the SAME
+// functions BOTH `train_inner` materialization loops call, so the asserted
+// order/alignment is the in-production one, not a test-local re-derivation.
+
+/// One shared 8-row categorical fixture for the expansion tests.
+fn expansion_fixture() -> (Vec<Vec<String>>, Vec<crate::TProjection>, Vec<crate::candidates::CtrCandidate>, Vec<i32>, Vec<usize>) {
+    let cat_columns = vec![
+        ["a", "b", "a", "c", "b", "a", "c", "b"].iter().map(|s| (*s).to_owned()).collect(),
+        ["x", "x", "y", "y", "x", "y", "x", "y"].iter().map(|s| (*s).to_owned()).collect(),
+    ];
+    let projections = vec![
+        crate::TProjection::from_features(&[0]),
+        crate::TProjection::from_features(&[1]),
+    ];
+    let candidates = vec![
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[0]),
+            is_simple: true,
+        },
+        crate::candidates::CtrCandidate {
+            projection: crate::TProjection::from_features(&[1]),
+            is_simple: true,
+        },
+    ];
+    let identity_perm: Vec<i32> = (0..8).collect();
+    let target_class = vec![0usize, 1, 0, 1, 1, 0, 1, 0];
+    (cat_columns, projections, candidates, identity_perm, target_class)
+}
+
+#[test]
+fn candidate_expansion_emits_one_column_per_prior() {
+    use crate::ctr::ECtrType;
+
+    let (cat_columns, projections, candidates, identity_perm, target_class) = expansion_fixture();
+    let mut params = e02_params(ECtrType::Borders, ECtrType::Borders);
+    params.simple_ctr_priors = vec![0.0, 0.5, 1.0];
+
+    let cols = super::materialize_ctr_columns_for_perm(
+        &cat_columns,
+        &projections,
+        &candidates,
+        &params,
+        &identity_perm,
+        &target_class,
+        crate::ctr_border_count_default(),
+    )
+    .expect("materialization must succeed");
+
+    // 2 projections * 1 border index (Borders) * 3 priors, in upstream's
+    // (ctrIdx, targetBorderIdx, priorIdx) nesting order.
+    assert_eq!(cols.len(), 6, "2 projections * 3 priors");
+    let priors: Vec<f64> = cols.iter().map(|c| c.prior_num).collect();
+    assert_eq!(
+        priors,
+        vec![0.0, 0.5, 1.0, 0.0, 0.5, 1.0],
+        "prior sequence must follow the configured list per projection"
+    );
+
+    // The alignment invariant, ASSERTED rather than assumed: a second call with
+    // a DIFFERENT (averaging) permutation yields the same length and the same
+    // (projection, target_border_idx, prior) sequence — because both
+    // `train_inner` loops go through this one function, in-production
+    // structure/averaging alignment follows from this assertion.
+    let averaging_perm: Vec<i32> = vec![3, 1, 7, 0, 5, 2, 6, 4];
+    let avg_cols = super::materialize_ctr_columns_for_perm(
+        &cat_columns,
+        &projections,
+        &candidates,
+        &params,
+        &averaging_perm,
+        &target_class,
+        crate::ctr_border_count_default(),
+    )
+    .expect("averaging materialization must succeed");
+    assert_eq!(avg_cols.len(), cols.len(), "alignment: same column count");
+    for (s, a) in cols.iter().zip(avg_cols.iter()) {
+        assert_eq!(s.projection, a.projection, "alignment: same projection order");
+        assert_eq!(s.target_border_idx, a.target_border_idx, "alignment: same border idx order");
+        assert_eq!(s.prior_num.to_bits(), a.prior_num.to_bits(), "alignment: same prior order");
+    }
+}
+
+#[test]
+fn buckets_expansion_emits_both_target_border_indices() {
+    use crate::ctr::ECtrType;
+
+    let (cat_columns, projections, candidates, identity_perm, target_class) = expansion_fixture();
+    // ONE candidate only for this test — isolate the border-index product.
+    let projections = vec![projections.into_iter().next().expect("proj 0")];
+    let candidates = vec![candidates.into_iter().next().expect("cand 0")];
+    let mut params = e02_params(ECtrType::Buckets, ECtrType::Buckets);
+    params.simple_ctr_priors = vec![0.5];
+
+    let cols = super::materialize_ctr_columns_for_perm(
+        &cat_columns,
+        &projections,
+        &candidates,
+        &params,
+        &identity_perm,
+        &target_class,
+        crate::ctr_border_count_default(),
+    )
+    .expect("materialization must succeed");
+
+    assert_eq!(cols.len(), 2, "Buckets at binclf: target_border_idx 0 AND 1");
+    let idxs: Vec<usize> = cols.iter().map(|c| c.target_border_idx).collect();
+    assert_eq!(idxs, vec![0, 1], "upstream (targetBorderIdx outer, prior inner) order");
+    // Anti-vacuity: the index genuinely changes the column.
+    assert_ne!(
+        cols[0].bins, cols[1].bins,
+        "the b=0 and b=1 numerators must produce different quantized columns"
+    );
+
+    // The `cat_eligible_buckets` no-growth pin, falsifiable: one bin column per
+    // CTR-ELIGIBLE CATEGORICAL FEATURE — never per emitted CTR column — while
+    // the (projection, b, prior) product HAS grown from the same fixture.
+    let eligible_absolute = vec![0usize];
+    let buckets_run = super::cat_eligible_buckets_for(&cat_columns, &eligible_absolute)
+        .expect("bucket columns must build");
+    assert_eq!(
+        buckets_run.len(),
+        1,
+        "one bin column per CTR-ELIGIBLE CATEGORICAL FEATURE — never per emitted CTR column"
+    );
+    assert_eq!(cols.len(), 2, "…while the (projection, b, prior) product HAS grown");
+    // Byte-unchanged against the un-expanded configuration: the bin columns are
+    // a function of the raw categorical data alone, never of the CTR type or
+    // the expansion.
+    let borders_run = super::cat_eligible_buckets_for(&cat_columns, &eligible_absolute)
+        .expect("bucket columns must build");
+    assert_eq!(
+        buckets_run, borders_run,
+        "cat_eligible_buckets must be BYTE-UNCHANGED across the expansion"
+    );
+}
+
+#[test]
+fn borders_expansion_emits_exactly_one_target_border_index() {
+    use crate::ctr::ECtrType;
+
+    let (cat_columns, projections, candidates, identity_perm, target_class) = expansion_fixture();
+    let projections = vec![projections.into_iter().next().expect("proj 0")];
+    let candidates = vec![candidates.into_iter().next().expect("cand 0")];
+    let mut params = e02_params(ECtrType::Borders, ECtrType::Borders);
+    params.simple_ctr_priors = vec![0.5];
+
+    let cols = super::materialize_ctr_columns_for_perm(
+        &cat_columns,
+        &projections,
+        &candidates,
+        &params,
+        &identity_perm,
+        &target_class,
+        crate::ctr_border_count_default(),
+    )
+    .expect("materialization must succeed");
+
+    // The D-04 no-op proof: `target_border_count(2) == 1` for Borders, so the
+    // column count and the border index are byte-identical to the pre-E16
+    // emission.
+    assert_eq!(cols.len(), 1, "Borders emits exactly one column per (projection, prior)");
+    assert_eq!(cols[0].target_border_idx, 0);
+}

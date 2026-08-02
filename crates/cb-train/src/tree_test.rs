@@ -826,7 +826,6 @@ fn persisted_and_level_kind_borders_are_in_different_spaces() {
         3.0,
         1,
         n,
-        0,
         0.0,
         EScoreFunction::Cosine,
         &[],
