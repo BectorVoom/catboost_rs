@@ -830,6 +830,7 @@ fn persisted_and_level_kind_borders_are_in_different_spaces() {
         0.0,
         EScoreFunction::Cosine,
         &[],
+        &[],
     )
     .expect("depth-1 CTR growth must succeed");
 

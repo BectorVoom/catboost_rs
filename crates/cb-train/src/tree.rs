@@ -3047,6 +3047,7 @@ fn select_level_ctr_aware(
     model_size_reg: f64,
     score_function: EScoreFunction,
     cat_eligible_buckets: &[Vec<u32>],
+    used_ctr_splits: &[(i8, crate::TProjection)],
 ) -> CbResult<CtrAwareSplit> {
     let mut scored: Vec<(CtrAwareSplit, f64)> = Vec::new();
 
@@ -3143,12 +3144,40 @@ fn select_level_ctr_aware(
         if ineligible_combination {
             continue;
         }
-        // The cat-feature weight for this column's projection (1.0 if already used,
-        // else (1 + count/maxCount)^(-model_size_reg)).
+        // The cat-feature weight for this column's `(ctr_type, projection)`
+        // (`GetCatFeatureWeight`, greedy_tensor_search.cpp:926-950): `1.0` once
+        // the pair is in `UsedCtrSplits`, else
+        // `(1 + count/maxCount)^(-model_size_reg)`.
+        //
+        // `UsedCtrSplits` is MODEL-LIFETIME state, not per-tree
+        // (`TLearnProgress::UsedCtrSplits`, learn_context.h:108, inserted by
+        // `ProcessCtrSplit` the moment a level chooses a CTR split,
+        // greedy_tensor_search.cpp:1126). The penalty exists to discourage
+        // GROWING the model's CTR table set; re-splitting a projection any
+        // LATER tree already baked is free. Membership is therefore the union
+        // of the trainer-supplied persistent set (`used_ctr_splits` — every
+        // `(ctr_type, projection)` chosen by ANY previous tree) and this tree's
+        // own already-chosen levels (`chosen` — upstream's within-tree inserts,
+        // which land in the set before the next level scores). Keying on the
+        // projection alone (the pre-fix behavior, and per-tree only) kept the
+        // penalty active forever, so an already-used projection's score stayed
+        // ~`weight×` too low from tree 1 on — at iteration scale that flipped
+        // the greedy winner (the `ctr_borders_multiprior` 20-iteration
+        // localization, 2026-08-03).
         let cat_weight = match ctr_features.get(col) {
             Some(column) => {
-                let already_used = used_projections.iter().any(|p| **p == column.projection);
-                if already_used {
+                let used_in_model = used_ctr_splits
+                    .iter()
+                    .any(|(t, p)| *t == column.ctr_type && *p == column.projection);
+                let used_in_tree = chosen.iter().any(|s| match s {
+                    CtrAwareSplit::Ctr { col: c, .. } => ctr_features
+                        .get(*c)
+                        .is_some_and(|cc| {
+                            cc.ctr_type == column.ctr_type && cc.projection == column.projection
+                        }),
+                    CtrAwareSplit::Float(_) => false,
+                });
+                if used_in_model || used_in_tree {
                     1.0
                 } else {
                     cat_feature_weight(column.bucket_count, max_bucket_count, model_size_reg)
@@ -3281,6 +3310,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
     model_size_reg: f64,
     score_function: EScoreFunction,
     cat_eligible_buckets: &[Vec<u32>],
+    used_ctr_splits: &[(i8, crate::TProjection)],
 ) -> CbResult<GrownTree> {
     check_depth(depth)?;
 
@@ -3298,6 +3328,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
             model_size_reg,
             score_function,
             cat_eligible_buckets,
+            used_ctr_splits,
         )?;
         chosen.push(best);
     }

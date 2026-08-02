@@ -111,6 +111,7 @@ fn ctr_candidate_wins_over_uninformative_float() {
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
         &[],
+        &[],
     )
     .expect("ctr search");
 
@@ -160,6 +161,7 @@ fn tie_break_float_then_ctr_first_wins() {
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
         &[],
+        &[],
     )
     .expect("ctr search");
 
@@ -202,6 +204,7 @@ fn forward_bit_leaf_index_mixed_float_and_ctr() {
         0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");
@@ -261,6 +264,7 @@ fn single_feature_ctr_structure_partition_6_0_9_15() {
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
         &[],
+        &[],
     )
     .expect("ctr search");
 
@@ -316,6 +320,7 @@ fn combination_ctr_cannot_win_at_level_zero() {
         0,
         0.0, // model_size_reg = 0 (not this fence's concern — see T2.5's own tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");

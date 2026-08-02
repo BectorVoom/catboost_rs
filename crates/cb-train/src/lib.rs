@@ -21,6 +21,7 @@ mod candidates;
 mod ctr;
 mod device_draw_replay;
 mod estimated;
+mod fast_approx;
 mod feature_selection;
 mod fold;
 mod metrics;

@@ -337,6 +337,68 @@ them — that is the regression gate.
 parameter documentation and in `params.rs`, with the upstream anchor.
 *Non-goal:* closing it (locked user decision).
 
+### 5.1 AMENDMENT (2026-08-03, during E15 execution) — iteration-scale structure-parity semantics
+
+E14's 20-iteration fixture exposed a divergence that is **independent of the
+prior expansion**: the SAME corpus diverged from upstream at ~1.1e-1 with a
+SINGLE prior once the iteration count exceeded ~8, while every committed
+5-iteration CTR oracle stayed green. Localization against an **instrumented
+v1.2.10 CLI build** (fold-approx/leaf-delta dumps at `%.17g`; the repo's
+`logging_level="Debug"` winner-score technique; `/home/user/cb_instrumented_build`)
+identified THREE missing upstream semantics, now specified as SPEC-CTRT-20..22.
+All three are invisible at the 5-iteration scale of the pre-existing oracles —
+each becomes structure-flipping at iteration scale.
+
+### SPEC-CTRT-20 — per-learning-fold approx; the structure search reads the TAKEN fold
+**Given** the Plain cat-CTR path, **when** a tree's structure is searched, **then** the
+derivatives come from the TAKEN learning fold's OWN approx — advanced each iteration over
+that fold's OWN CTR-bin leaf assignment by re-estimated fold deltas
+(`UpdateLearningFold`/`CalcApproxForLeafStruct`, `train.cpp:585`,
+`approx_calcer.cpp:706-800`) — never from the averaging fold's approx. The averaging
+fold's approx (leaf-VALUE derivatives) and the linear output approx (`AvrgApprox`;
+metrics/OD/staged) remain distinct streams. `UseAveragingFoldAsFoldZero` is FALSE here
+because CTRs force `IsAveragingFoldPermuted` `[VERIFIED: WEB learn_context.cpp v1.2.10]`.
+*Detection:* iteration-0 fold leaf `(SumDer, SumWeights, delta)` match the instrumented
+upstream bit-for-bit; a single-approx engine's search derivatives drift from iteration 1.
+*Acceptance:* the 20-iteration `ctr_borders_multiprior` fixture ≤1e-5; all 11 CTR oracles
+unchanged (fold and averaging partitions coincide only when no CTR is present, so every
+non-CTR path is structurally byte-identical).
+
+### SPEC-CTRT-21 — EXP-domain approx storage with upstream's APPROXIMATE transcendentals
+**Given** an `IsStoreExpApprox` loss (Logloss/CrossEntropy on this path,
+`approx_updater_helpers.h:60-72`), **when** any training-fold approx (learning folds AND
+the averaging fold) is stored or advanced, **then** the upstream approximate pipeline is
+reproduced BIT-FOR-BIT: per-leaf delta exp-ification via `fmath::expd_v`
+(`ExpApproxIf` → `FastExpInplaceAvx2`), per-document learning-rate application via
+`fast_exp(FastLogf(δ)·lr)` (`ApplyLearningRate<true>`), and derivatives via
+`p = 1 − 1/(1+e)` (`CalcCrossEntropyDerRangeImpl`, `error_functions.cpp:304-334` —
+that rounding order, not `e/(1+e)`). The approximation error (~1e-6 absolute in log
+space per application) is LOAD-BEARING: it feeds the next iteration's derivatives and
+moves greedy scores across tie-break boundaries by ~10-20 iterations.
+*Scope:* the cat-CTR path. The float-only / one-hot Logloss paths keep exact `exp`
+derivative streams — their committed oracles prove the divergence stays under 1e-5 at
+their iteration scale; widening is a recorded follow-up, not a silent change.
+*Acceptance:* `crates/cb-train/src/fast_approx.rs` ports `fast_exp` (65536-entry table,
+`library/cpp/fast_exp`), `fmath::expd` (`contrib/libs/fmath`), and `FastLogf`
+(`library/cpp/fast_log`), pinned bit-exact by committed reference vectors generated from
+the REAL upstream objects (`tests/fixtures/fast_approx_ref{.txt,_generator.cpp.txt}`);
+the composed pipeline reproduces the instrumented fold approx (`0.99903645…`, NOT the
+exact-exp `0.99903892…`).
+
+### SPEC-CTRT-22 — `UsedCtrSplits` is MODEL-LIFETIME, and the weight key is `(ctr_type, projection)`
+**Given** a CTR split some ALREADY-GROWN tree chose, **when** any later tree's search
+scores a candidate with the same `(ctr_type, projection)`, **then** the `model_size_reg`
+cat-feature weight is `1.0` — the penalty
+`(1 + count/maxCount)^(−model_size_reg)` applies only while the pair has never been
+used by the model (`GetCatFeatureWeight` + `TLearnProgress::UsedCtrSplits` +
+`ProcessCtrSplit`, `greedy_tensor_search.cpp:926-950, :1126`; `learn_context.h:108`).
+A per-tree-only lift (the pre-fix behavior) keeps an already-baked projection's score
+~`weight×` too low from tree 1 on.
+*Detection:* upstream's iteration-1 level-0 winner score jumps 1.192119137 → 1.647348574
+on identical derivatives — the ratio is exactly the lifted penalty.
+*Acceptance:* the 20-iteration fixtures above; the within-tree lift (already present)
+remains, now keyed on `(ctr_type, projection)`.
+
 ---
 
 ## 6. Failure-isolated behavioral specifications — Part 2 (facade)
