@@ -1,0 +1,70 @@
+{
+  "scenario": "ctr_counter_full_eval",
+  "requirement": "SPEC-CTRT-17",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_learn": 60,
+  "n_eval": 40,
+  "description": "counter_calc_method eval-set discrimination (E23 / A6). Categorical-ONLY, 60 learn + 40 eval rows, simple Counter CTR. Trained TWICE \u2014 Full vs SkipTest, same eval set \u2014 and the guard asserts the two prediction vectors differ by > 1e-3, so a threading bug that makes the repo compute either setting for both cannot pass both gates. NEVER regenerated in CI.",
+  "params_full": {
+    "loss_function": "Logloss",
+    "iterations": 10,
+    "depth": 2,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [
+      "Counter:Prior=0.5"
+    ],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "Full",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "boost_from_average": false,
+    "verbose": false
+  },
+  "params_skiptest": {
+    "loss_function": "Logloss",
+    "iterations": 10,
+    "depth": 2,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [
+      "Counter:Prior=0.5"
+    ],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "boost_from_average": false,
+    "verbose": false
+  },
+  "observed_full_vs_skiptest_maxdiff": 0.22398770125642198,
+  "npy_schema": {
+    "X_cat.npy": "[60,2] int32 \u2014 learn categorical codes",
+    "y.npy": "[60] f64 \u2014 learn binclf label",
+    "X_cat_eval.npy": "[40,2] int32 \u2014 eval categorical codes",
+    "y_eval.npy": "[40] f64 \u2014 eval binclf label",
+    "predictions_full.npy": "[60] f64 \u2014 RawFormulaVal under Full (<=1e-5 gate)",
+    "predictions_skiptest.npy": "[60] f64 \u2014 RawFormulaVal under SkipTest (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gates."
+}
