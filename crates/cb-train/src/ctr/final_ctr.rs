@@ -71,8 +71,23 @@ pub struct FinalCtrTable {
 /// (default `SkipTest`, Pitfall 4) — in this whole-learn-set build there are no
 /// test documents, so the flag does not change the counts; it is recorded for the
 /// model's `CounterCalcMethod` field and reserved for the tensor-CTR path.
+///
+/// # `counter_calc_skip_test`
+/// Threaded here so the parameter this doc comment has always described actually
+/// exists (it did not, until E11 — a live documentation lie). It is **inert**
+/// in this whole-learn-set build: there are no test documents to include or
+/// skip, so no arm reads it yet. E22 makes it real, once `EvalSet` can carry
+/// categorical columns at all. Every caller passes `true`, the `SkipTest`
+/// default returned by `counter_calc_method_default()`.
 #[must_use]
-pub fn build_final_ctr(acc: &OnlineCtrAccumulator, ctr_type: ECtrType) -> FinalCtrTable {
+pub fn build_final_ctr(
+    acc: &OnlineCtrAccumulator,
+    ctr_type: ECtrType,
+    counter_calc_skip_test: bool,
+) -> FinalCtrTable {
+    // Inert until E22 (see the doc comment above). Bound so the parameter is not
+    // an unused-variable warning and so its arrival is greppable.
+    let _ = counter_calc_skip_test;
     let classes = acc.classes;
     let bucket_count = acc.bucket_count;
 

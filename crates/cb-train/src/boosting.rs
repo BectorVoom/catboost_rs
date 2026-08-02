@@ -5546,21 +5546,35 @@ fn train_inner<R: Runtime>(
     // models keep ctr_data None.
     let mut baked = BakedCtrData::default();
     if !cat_columns.is_empty() {
-        // Distinct chosen projections (by the sorted member set) across all trees.
-        let mut seen: Vec<crate::TProjection> = Vec::new();
+        // Distinct chosen (projection, ctr_type) pairs across all trees.
+        //
+        // The de-dup key is `(projection, ctr_type)` and NOTHING ELSE. In
+        // particular `target_border_idx` MUST NOT enter it: it is a per-SPLIT
+        // selector consumed by `CtrValueTable::numerator_denominator`, so ONE
+        // Buckets table serves both b=0 and b=1. Adding it would break the
+        // apply-side key reconstruction (`cb_model::apply::ctr_table_key`), which
+        // rebuilds `"ctr:type=<i8>:proj=<members>"` from the split and carries no
+        // border index, and would invalidate every committed .cbm fixture.
+        let mut seen: Vec<(crate::TProjection, i8)> = Vec::new();
         for tree in &trees {
             for spec in &tree.ctr_splits {
-                if !seen.iter().any(|p| p == &spec.projection) {
-                    seen.push(spec.projection.clone());
-                    // E10: bake with the CHOSEN split's own routed prior, not the
-                    // global combinations prior. This site is load-bearing because
-                    // the (Shift, Scale, prior) pair is COPIED BACK onto every
-                    // matching spec below — baking with the wrong prior would
-                    // overwrite the correctly-routed value and silently undo
+                let key = (spec.projection.clone(), spec.ctr_type);
+                if !seen.iter().any(|k| k == &key) {
+                    seen.push(key);
+                    let Some(spec_ctr_type) = crate::ctr::ECtrType::from_i8(spec.ctr_type) else {
+                        return Err(CbError::OutOfRange(format!(
+                            "chosen CTR split carries an unknown ctr_type discriminant {}",
+                            spec.ctr_type
+                        )));
+                    };
+                    // E10/E11: bake with the CHOSEN split's own routed type AND
+                    // prior, not a global default. This site is load-bearing
+                    // because the (Shift, Scale, prior) pair is COPIED BACK onto
+                    // every matching spec below — baking with the wrong prior
+                    // would overwrite the correctly-routed value and silently undo
                     // SPEC-CTRT-10. At the default config both prior lists are
-                    // [0.5], so this is byte-identical to the previous behavior.
-                    // (The per-type `ctr_type` argument arrives in E11, which owns
-                    // `bake_ctr_table`'s signature.)
+                    // [0.5] and both types are Borders, so this is byte-identical
+                    // to the previous behavior.
                     let table = bake_ctr_table(
                         cat_columns,
                         &spec.projection,
@@ -5569,6 +5583,7 @@ fn train_inner<R: Runtime>(
                         ctr_border_count,
                         spec.prior_num,
                         spec.prior_denom,
+                        spec_ctr_type,
                     )?;
                     baked.tables.push(table);
                 }
@@ -5577,10 +5592,13 @@ fn train_inner<R: Runtime>(
         // Copy the bake-derived (Shift, Scale) + prior PAIR onto each chosen split.
         for tree in &mut trees {
             for spec in &mut tree.ctr_splits {
+                // Same (projection, ctr_type) key as the bake above — matching on
+                // projection alone would copy a different-typed table's
+                // normalization onto this split.
                 if let Some(table) = baked
                     .tables
                     .iter()
-                    .find(|t| t.projection == spec.projection)
+                    .find(|t| t.projection == spec.projection && t.ctr_type == spec.ctr_type)
                 {
                     spec.shift = table.shift;
                     spec.scale = table.scale;

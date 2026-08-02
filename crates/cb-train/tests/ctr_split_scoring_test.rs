@@ -553,6 +553,7 @@ fn bake_derives_shift_zero_scale_fifteen_for_borders_prior_half() {
         ctr_border_count_default(),
         PRIOR_NUM,
         PRIOR_DENOM,
+        cb_train::ECtrType::Borders,
     )
     .expect("bake");
 
@@ -581,6 +582,7 @@ fn apply_found_branch_uses_split_scale() {
     let proj = TProjection::single(0);
     let table = bake_ctr_table(
         &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
+        cb_train::ECtrType::Borders,
     )
     .expect("bake");
     let ctr_data = cb_model::CtrData::from_baked(&cb_train::BakedCtrData {
@@ -650,6 +652,7 @@ fn bake_round_trips_to_apply_inference_value() {
     let proj = TProjection::single(0);
     let table = bake_ctr_table(
         &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
+        cb_train::ECtrType::Borders,
     )
     .expect("bake");
     let shift = table.shift;
