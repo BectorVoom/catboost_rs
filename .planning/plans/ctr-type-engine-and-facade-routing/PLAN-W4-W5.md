@@ -33,7 +33,7 @@ Continuation of `./PLAN.md` and `./PLAN-W2-W3.md`. §3 (shared conventions), §3
 ### E18 — Upstream BTMV `.cbm` fixture (data lands before the codec)
 
 - **Specs:** SPEC-CTRT-15 (data half); acceptance **A8** second half
-- **Blocked by:** E13 (its generator already trains the BTMV model). **Blocks:** E19.
+- **Blocked by:** E11, E13 (its generator already trains the BTMV model). **Blocks:** E19.
 - **Parallelizable:** **YES** with E17 and with all of W5 — owns only the fixture
   directory; no production code.
 
@@ -258,6 +258,17 @@ that
   `decode_ctr_blob` does — **no indexing, no panic**.
 Then set `int_counts: Vec::new()`, `mean: decoded`, and skip the `width == 0`
 rejection for mean types.
+
+**Update the decode-side module doc block in the SAME edit.**
+`crates/cb-model/src/ctr_data.rs:495-505` currently ends "…mean-type CTRs
+(`BinarizedTargetMeanValue`/`FloatTargetMeanValue`) are **rejected** (v1,
+SPEC §2/MAJOR-2 — their `TCtrMeanHistory` byte layout is not empirically dissected
+and no fixture exercises it)" `[VERIFIED: LOCAL, read verbatim]`. Every clause of
+that sentence becomes false at this task: the layout IS dissected (E18's upstream
+fixture) and it IS decoded. Rewrite it to state the accepted layout and the
+recorded stride. This is the **decode** counterpart of the two **encode**-side doc
+blocks E20 updates; the file is already in this task's Files list, so the edit is
+authorized here.
 
 **Refactor constraints + required regression scope**
 - **Constraint (the branch predicate — MANDATORY, no implementer discretion):** the
@@ -645,7 +656,11 @@ is read from `params.counter_calc_method`, which today has **zero reads** in
   `counter_calc_skip_test` parameter real)
 - Modify: `crates/cb-train/src/ctr/bake.rs` (thread it through `bake_ctr_table`)
 - Modify: `crates/cb-train/src/boosting.rs` (read `params.counter_calc_method`;
-  thread the eval cat columns from BOTH `materialize_ctr_feature` call sites)
+  thread the eval cat columns through the **single** `materialize_ctr_feature` call
+  site — which E15 Green step 0 moved inside `materialize_ctr_columns_for_perm` —
+  plus that helper's **two** call sites in `train_inner`. An earlier revision said
+  "BOTH `materialize_ctr_feature` call sites"; that predates E15's extraction and is
+  no longer the shape of the file.)
 - **Modify: `crates/cb-train/src/ctr/ctr_feature.rs` — E22 OWNS THIS FILE.** It is
   where E21 Green step 5's `Full` bucket-space rule is actually implemented (E21
   only wrote the doc comment). E22 already owns `crates/cb-train/src/boosting.rs`,
@@ -746,12 +761,22 @@ so this task changes semantics only — no second signature churn.
        (uniqValuesCounts.CounterCount = leafCount, online_ctr.cpp:716-729)");
   assert_eq!(bucket_count_skiptest, 2,
       "under SkipTest the bucket space is learn-only and MUST be unchanged");
-  assert_eq!(denominator_full, 3, "the MAX denominator sees the widened space");
-  assert_eq!(denominator_skiptest, 2);
   assert_eq!(column_full.bins.len(), 3,
       "the OUTPUT column stays indexed by the LEARN slice — eval documents \
        contribute to the tally and the bucket space, never to output rows");
   ```
+  **Observation channels, verified.** `bucket_count` IS a public field of
+  `CtrFeatureColumn` (`crates/cb-train/src/ctr/ctr_feature.rs:93`) and `bins` is
+  too (`:82`), so all three assertions above read real returned state. The
+  **denominator has NO channel here** and two `denominator_*` assertions were
+  therefore DELETED from this test: `CtrFeatureColumn` carries no denominator
+  field, and the MAX-denominator half of the rule is already gated at the bins
+  level by **test fn 1** (`ctr/online_test.rs`: `Full` → totals `[2,4]`,
+  denominator `4`) and end to end by E23.
+  **PROHIBITED: do NOT add a denominator field to `CtrFeatureColumn` to make an
+  assertion expressible.** It is constructed by two exhaustive struct literals in
+  `crates/cb-train/src/tree_test.rs` (`:374`, `:662`) — a file **E22 does not own**
+  — and a new field breaks both with `error[E0063]`.
 - **EXPECTED INITIAL FAILURE:** test fn 1 —
   ``assertion `left == right` failed: left: [2, 1], right: [2, 4]`` for the `Full`
   case, because `online_counter_column` (E06) deliberately has no extra-sample
@@ -872,7 +897,7 @@ assertion added, removed, weakened or reworded.
 ### E23 — `counter_full_eval` fixture + the eval-set ≤1e-5 gate (or a RECORDED deferral)
 
 - **Specs:** SPEC-CTRT-17 (parity half); acceptance **A6**
-- **Blocked by:** E22. **Blocks:** F00 (start of Part 2).
+- **Blocked by:** E22. **Blocks:** F00, F01, F07, F19 (start of Part 2).
 - **Parallelizable:** **YES** with E17/E18 — owns a new fixture directory and a new
   test target.
 

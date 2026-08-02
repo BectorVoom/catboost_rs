@@ -281,9 +281,9 @@ hard-coded line list — line numbers drift):
   `mod`-mounted unit-test files such as `cbm_test.rs`, `model_test.rs`,
   `partial_dependence_test.rs`, …): `#[non_exhaustive]` does **NOT** affect
   intra-crate literals. These need **only the new field added** —
-  `cat_feature_count: 0` — as a mechanical edit. Roughly **37** literals plus the
-  production sites `json.rs`, `cbm.rs` (×2), `model_sum.rs`, `model.rs`
-  (`from_trained`).
+  `cat_feature_count: 0` — as a mechanical edit. **21** literals, which INCLUDE
+  (not "plus") the production sites `json.rs:825`, `cbm.rs:1193`, `cbm.rs:1318`,
+  `model_sum.rs:115`, and `model.rs:515` (`from_trained`'s `Self { … }`).
 - **OUTSIDE the `cb-model` crate**: `#[non_exhaustive]` **forbids struct-literal
   syntax entirely**, so these MUST migrate to the constructor/builder form.
   Two groups, and **both** are external crates:
@@ -313,9 +313,11 @@ in `crates/cb-train` (`tests/ctr_split_scoring_test.rs:518`). Intra-crate, rough
 **20** sites in `cb-model/src`, including 4 written `crate::Model {` in
 `cbm_test.rs` that a `:`-excluding regex cannot see.
 
-Treat these as an order-of-magnitude sanity check on the compiler's output. If the
-compiler names far fewer or far more, STOP AND REPORT — that gap is the signal, not
-a number to reconcile by hand.
+Treat these as an order-of-magnitude sanity check on the compiler's output, NOT as
+a work list. **STOP-AND-REPORT trigger, numeric:** halt and report if the compiler
+emits **fewer than 18 or more than 28** `error[E0639]`, or **fewer than 18 or more
+than 25** `error[E0063]`. Inside those bands, the compiler's list is simply correct
+— proceed without reconciling it against any number written here.
 
 > **⚠️ THIS COUNT HAS BEEN GOT WRONG FOUR TIMES, EACH BY A DIFFERENT GREP.**
 > Three distinct types are named `Model` — `cb_model::Model`,
@@ -342,7 +344,7 @@ matched the `-> CbModel {` return type) and the open item is withdrawn.**
 `ctr_data_roundtrip_test.rs`, the other cb-model oracle in the eleven, likewise
 contains no `Model` literal.
 
-`cbm_oracle_test.rs` (4) and `json_oracle_test.rs` (3) DO carry literals, but
+`cbm_oracle_test.rs` (2) and `json_oracle_test.rs` (2) DO carry literals, but
 neither is among the eleven SPEC-CTRT-18 targets. They are float-only oracles the
 **one-hot** plan's SPEC-OH-31 lists as "must be edited by no task" — that plan has
 shipped, and this is a mechanical, assertion-preserving constructor migration, so
@@ -367,7 +369,7 @@ must not be enforced as equality.**
 - Modify: `crates/cb-model/src/{cbm,json}.rs` — **REQUIRED, mechanical.** These
   hold **compile-forced production literals** (`json.rs:825`, `cbm.rs:1193`,
   `cbm.rs:1318`) which cannot compile without the new field; the same applies to
-  `crates/cb-model/src/model_sum.rs:120`. Add `cat_feature_count: 0` at each (the
+  `crates/cb-model/src/model_sum.rs:115`. Add `cat_feature_count: 0` at each (the
   decoders have no cat width to report). **The earlier prohibition "modify
   `{cbm,json}.rs` only if the field must survive serialization — it must NOT" was
   SELF-CONTRADICTORY and is DELETED.** The accurate constraint is: do **not** touch
@@ -403,8 +405,8 @@ must not be enforced as equality.**
     **MECHANICAL EDITS ONLY, ZERO ASSERTION CHANGES** row of the per-file diff gate
     (PLAN.md §3.2 and the tables in E15/E16 Completion evidence), with **F08 named
     as an owning task**. **Weakening or deleting any assertion in it is FORBIDDEN.**
-  - `crates/cb-model/tests/*.rs` — **18** across 11 files (see the blast-radius
-    block above). Two of these — `cbm_oracle_test.rs` and `json_oracle_test.rs` —
+  - `crates/cb-model/tests/*.rs` — **18** across **9** files. Two of these —
+    `cbm_oracle_test.rs` and `json_oracle_test.rs` —
     are float-only oracles the SHIPPED one-hot plan's SPEC-OH-31 listed as
     "edited by no task"; the migration is mechanical and assertion-preserving, so
     record the diff and state plainly that no assertion changed. **No ZERO-DIFF
@@ -458,15 +460,16 @@ must not be enforced as equality.**
   1. `error[E0599]: no method named 'with_cat_feature_count'` (test fn 1).
   2. `error[E0063]: missing field cat_feature_count in initializer of Model` —
      emitted **once per intra-crate struct literal** the moment the field is added
-     (~37 in `crates/cb-model/src/**`, including the production sites `json.rs:825`,
-     `cbm.rs:1193`, `cbm.rs:1318`, `model_sum.rs:120`). `cargo test -p cb-model`
-     does not build until every one carries `cat_feature_count: 0`.
+     (**21** in `crates/cb-model/src/**`, including the production sites
+     `json.rs:825`, `cbm.rs:1193`, `cbm.rs:1318`, `model_sum.rs:115`).
+     `cargo test -p cb-model` does not build until every one carries
+     `cat_feature_count: 0`.
   3. `error[E0639]: cannot create non-exhaustive struct using functional record
      update syntax / struct expression` (the `#[non_exhaustive]` diagnostic) —
-     emitted **once per EXTERNAL struct literal**: 36 in
-     `crates/cb-model/tests/*.rs`, 4 in `crates/catboost-rs`, 1 in
-     `crates/cb-train/tests/ctr_split_scoring_test.rs`. Those targets do not build
-     until each is migrated to the constructor/builder form.
+     emitted **once per EXTERNAL struct literal**: **18** in
+     `crates/cb-model/tests/*.rs`, **4** in `crates/catboost-rs`, **1** in
+     `crates/cb-train/tests/ctr_split_scoring_test.rs` (**23** total). Those targets
+     do not build until each is migrated to the constructor/builder form.
 - Run: `cargo test -p cb-model --lib model_test -- cat_feature_count`
 
 **Green.**
@@ -486,7 +489,7 @@ must not be enforced as equality.**
      `with_approx_dimension`, `with_class_to_label` (`with_ctr_data` already
      exists). Add **only** what a migrated site actually sets — no speculative API.
 3. Set `cat_feature_count: 0` in `from_trained` (`:359`) and in the four production
-   literals (`json.rs:825`, `cbm.rs:1193`, `cbm.rs:1318`, `model_sum.rs:120`).
+   literals (`json.rs:825`, `cbm.rs:1193`, `cbm.rs:1318`, `model_sum.rs:115`).
 4. Add `cat_feature_count: 0` to every remaining **intra-crate** literal —
    mechanical, **CHANGE NO ASSERTION**.
 5. Migrate every **external** literal to `Model::new(..)` + builders — mechanical,
@@ -497,8 +500,8 @@ must not be enforced as equality.**
 nor read by either codec.
 
 **Rationale, recorded so it is not re-litigated.** `#[non_exhaustive]` costs a
-one-time migration of the external literals **now** (5 outside `cb-model` + 36 in
-`cb-model`'s own integration targets) and **permanently prevents external breakage
+one-time migration of the external literals **now** (5 outside `cb-model` + 18 in
+`cb-model`'s own integration targets = **23**) and **permanently prevents external breakage
 for every future `Model` field** — this exact defect class (a shared struct grows a
 field while consumers sit in no task's Files list) has now been found four times in
 this plan. Without it, every later field repeats the whole blast radius.
@@ -537,10 +540,18 @@ construction guard, which proves `#[non_exhaustive]` left no shape unexpressible
 **Migration accounting:** `git diff --stat` shows the intra-crate literals gaining
 exactly one `cat_feature_count: 0` line each, and every external literal replaced
 by a `Model::new(..)` + builder chain — **no assertion touched in any file**.
-`grep -rnE '(^|[^a-zA-Z_:>-])Model \{' crates/cb-train crates/cb-model/tests`
-(excluding `-> Model {` return types) returns **zero** `cb_model::Model` struct
-literals afterwards — all 19 have moved to constructor form. No ZERO-DIFF oracle of
-this plan is touched.
+**The primary completion evidence is a clean `cargo build --workspace --all-targets`
+with zero `E0063` and zero `E0639`** — that, not a grep, is what proves all **23**
+external sites moved to constructor form and all **21** intra-crate sites carry the
+field. As a secondary cross-check only:
+```bash
+grep -rnE '(^|[^a-zA-Z_])(cb_model::Model|CbModel|crate::Model|Model) *\{' \
+     crates/cb-model/tests crates/catboost-rs crates/cb-train \
+  | grep -v -- '->'
+```
+**Expected residue: exactly ONE line** — `crates/cb-train/src/boosting.rs:5476`, a
+literal of `cb_train::Model`, a **DIFFERENT TYPE**. **DO NOT migrate it.** Any other
+surviving line is a missed site. No ZERO-DIFF oracle of this plan is touched.
 
 ---
 
@@ -552,7 +563,7 @@ All four own `crates/catboost-rs/src/model.rs` and are **STRICTLY SERIAL**.
 |---|---|---|---|---|---|
 | **F10** `Model::cat_columns()` width validation | T09 | SPEC-CATF-10, Δ4 | F09 | F11 | **REWRITTEN.** Delete T09's `expected_cat_features()` derivation entirely. `cat_columns()` now compares `pool.n_cat_features()` against `self.inner.cat_feature_count()`. **Rename the predicate** `is_ctr_model()` → **`needs_cat_columns()`** = `ctr_data.is_some() || any tree carries a ModelSplit::OneHot` (Δ7: a one-hot-only model has **no** `ctr_data`, but `predict_raw = predict_raw_cat(m, fv, &[])` makes `cat_values.get(i) → None → false`, so **every one-hot split fails** — a silent-wrongness class the original plan did not know about). **ADD a positive regression test**: `fit(pool with 2 cat columns, one one-hot-routed) → predict(the SAME pool)` must be `Ok` — the case T09's equality-on-a-derived-bound would have rejected. |
 | **F11** `predict_with` is CTR-aware **and one-hot-aware** | T10 | SPEC-CATF-11, Δ7 | F10 | F12, F14, F17 | **WIDENED.** T10's byte-identity argument (`predict_raw(m, fv) == predict_raw_cat(m, fv, &[])`, re-verified at `crates/cb-model/src/apply.rs:393-395` `[VERIFIED: CODEGRAPH]`) still holds. Route through `predict_raw_cat` using `needs_cat_columns()`. **EXTEND `ensure_scalar_oblivious` (`crates/catboost-rs/src/model.rs:144-171`) with a `needs_cat_columns()` ONE-HOT arm returning `CatBoostError::UnsupportedModel`.** The earlier "preserve, do not extend" instruction is **RETRACTED where it blocks this**: that function today rejects `approx_dimension > 1`, non-symmetric trees, region trees and `ctr_data.is_some()`, but **NOT `ModelSplit::OneHot`** `[VERIFIED: CODEGRAPH — 1 caller, `staged_predict` at `:196`]`, and `predict_raw_staged` (`crates/cb-model/src/apply.rs:488-526`) is **float-only** and never reads cat columns. So after F09 a one-hot model — which has `ctr_data == None` — passes the guard and is scored as though **every one-hot split failed**: a NEW silent-wrongness surface on a documented public API, exactly the class F10/F11 close for `predict_raw`. The pre-existing CTR rejection is preserved unchanged; only the one-hot arm is added. |
-| **F12** zero-cat-column guard on all **four** entrypoints (`predict`, `predict_with`, `predict_proba`, **`staged_predict`**) | T11 | SPEC-CATF-12, Δ7 | F11 | F20 | **WIDENED** to the `needs_cat_columns()` predicate, **and widened again to cover `staged_predict`** (MAJOR-7 residue). **Red — ADD a one-hot case to `crates/catboost-rs/tests/staged_predict_facade_test.rs`** (already in F10–F13's shared regression scope): fit a pool whose cat column has cardinality 2 at `one_hot_max_size(2)`, call `model.staged_predict(&pool, …)`, and expect `Err(CatBoostError::UnsupportedModel)`; the `Ok(_)` arm must `panic!("staged_predict SILENTLY SCORED a one-hot model as though every one-hot split failed")`. **Mutation check (§3.1), RECORDED:** temporarily make `needs_cat_columns()` return `ctr_data.is_some()` only, re-run, and assert BOTH the `predict` arm's `Ok(v) => panic!("SILENTLY SCORED …")` and the new `staged_predict` arm's panic fire; record both failure texts; revert **manually** (never `git checkout --`). |
+| **F12** zero-cat-column guard on all **four** entrypoints (`predict`, `predict_with`, `predict_proba`, **`staged_predict`**) | T11 | SPEC-CATF-12, Δ7 | F11 | F13, F20 | **WIDENED** to the `needs_cat_columns()` predicate, **and widened again to cover `staged_predict`** (MAJOR-7 residue). **Red — ADD a one-hot case to `crates/catboost-rs/tests/staged_predict_facade_test.rs`** (already in F10–F13's shared regression scope): fit a pool whose cat column has cardinality 2 at `one_hot_max_size(2)`, call `model.staged_predict(&pool, …)`, and expect `Err(CatBoostError::UnsupportedModel)`; the `Ok(_)` arm must `panic!("staged_predict SILENTLY SCORED a one-hot model as though every one-hot split failed")`. **Mutation check (§3.1), RECORDED:** temporarily make `needs_cat_columns()` return `ctr_data.is_some()` only, re-run, and assert BOTH the `predict` arm's `Ok(v) => panic!("SILENTLY SCORED …")` and the new `staged_predict` arm's panic fire; record both failure texts; revert **manually** (never `git checkout --`). |
 | **F13** typed rejection for the remaining fstr/PDP paths | **NEW** (MAJOR-7 residue) | SPEC-CATF-Δ7 | F12 | — | `shap_values` is **already fixed** by the uncommitted one-hot wave (`crates/cb-model/src/shap.rs:552-608` `float_splits_of` returns `Err(ShapUnsupported::OneHotSplits / ::CtrSplits)`; `crates/catboost-rs/src/model.rs` propagates with `?`) `[VERIFIED: LOCAL git diff + grep]`. **Remaining:** `Model::partial_dependence` (`crates/catboost-rs/src/model.rs:427-434`) passes only `feature_columns` `[VERIFIED: CODEGRAPH]`, and `Model::feature_importance_with_data(PredictionValuesChange)` (`:365-382`) passes `pool.cat_features().to_vec()` with **no width check** `[VERIFIED: CODEGRAPH]`. Add `self.cat_columns(pool)?` to the latter and a typed `UnsupportedModel` rejection to the former when `needs_cat_columns()`. **Verified already safe (do not touch):** `Model::predict_raw_on_device` guards via `cb_model::flatten_oblivious_f64`, which rejects categorical/CTR models. |
 
 **Shared Red shape.** New file
