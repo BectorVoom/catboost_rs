@@ -3225,6 +3225,49 @@ fn select_level_ctr_aware(
 /// - [`CbError::DepthExceeded`] if `depth > MAX_DEPTH` (before allocation).
 /// - [`CbError::Degenerate`] if a level has no candidate split at all.
 #[allow(clippy::too_many_arguments)]
+/// Convert a chosen CTR **bin index** into the **value-space** threshold the
+/// model persists (SPEC-CTRB-01, BUG-CTRB).
+///
+/// The structure search enumerates candidates as integer bin indices and tests
+/// `bin > b` (`passes_ctr_aware`, this file). Every consumer of the PERSISTED
+/// border instead tests `ctr_value > border` against the SCALED CTR value
+/// (`cb_model::passes_ctr_split`, apply.rs:189). Upstream CatBoost bridges the
+/// two with `(b + 1) - 2^-20`, so that `ctr_value > border` reproduces
+/// `trunc(ctr_value) > b` for every value the quantizer can produce.
+///
+/// Computed in `f32` and widened once: the `.cbm` codec narrows `Borders` to
+/// `f32` on save and widens via `f64::from` on load, so the value must be an
+/// `f32` fixed point. Computing in `f64` and narrowing on save would not be.
+/// That codec requirement — NOT any claim of general correctness — is why this
+/// is `f32`.
+///
+/// # DOMAIN: `bin_border <= 15`
+///
+/// Two properties must hold together:
+///   1. strict interval:  `bin_border < result < bin_border + 1`
+///   2. f32 fixed point:  `f64::from(result as f32) == result`
+///
+/// They hold together ONLY while `bin_border + 1` has an f32 ulp `<= 2^-20`,
+/// i.e. `bin_border <= 15`. At `bin_border == 16` the f32 subtraction rounds to
+/// exactly `17.0` and property 1 is LOST; the f64 formulation would instead lose
+/// property 2. NEITHER form is correct above 15 — the correct value there is
+/// simply not known from any in-repo artifact.
+///
+/// Reachability guarantee: `ctr_border_count` is not configurable —
+/// [`crate::ctr_border_count_default`] returns 15 (boosting.rs:529-531) and is
+/// consumed at exactly one site, boosting.rs:3238 — so candidates are
+/// `border_idx in 0..15` and `bin_border <= 14`.
+///
+/// STOP CONDITION: if `ctr_border_count` ever becomes configurable or exceeds
+/// 16, this contract breaks and BUG-CTRB reappears at the top of the range. The
+/// `b = 16` characterization test in `tree_test.rs` pins that boundary.
+///
+/// This function is for the PERSISTED border ONLY. `LevelKind::Ctr.border` stays
+/// in BIN space — see the comment at its construction site.
+pub(crate) fn ctr_bin_border_to_value_space(bin_border: f64) -> f64 {
+    f64::from((bin_border as f32 + 1.0) - f32::powi(2.0, -20))
+}
+
 pub fn greedy_tensor_search_oblivious_with_ctr(
     matrix: &FeatureMatrix,
     ctr_features: &[crate::ctr::CtrFeatureColumn],
@@ -3330,7 +3373,7 @@ pub fn greedy_tensor_search_oblivious_with_ctr(
                     // `ctr_border_count_default() == 15` (boosting.rs:529-531),
                     // consumed at boosting.rs:3238 — the single, non-configurable
                     // source of `ctr_border_count`.
-                    border: f64::from((*border as f32 + 1.0) - f32::powi(2.0, -20)),
+                    border: ctr_bin_border_to_value_space(*border),
                     // Default Shift/Scale at structure-search time; the train_cat
                     // bake (Plan 05-14) overwrites these on the chosen splits with
                     // the calc_normalization(prior_num)-derived (Shift, Scale).
