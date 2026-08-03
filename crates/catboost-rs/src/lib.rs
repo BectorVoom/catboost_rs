@@ -26,7 +26,7 @@ mod grid_search;
 mod metrics;
 mod model;
 
-pub use builder::CatBoostBuilder;
+pub use builder::{CatBoostBuilder, FitResult};
 pub use cv::{cv, make_cv_folds, CvFold, CvResult, CvType};
 pub use error::CatBoostError;
 pub use grid_search::{
@@ -65,6 +65,19 @@ pub use cb_train::EBootstrapType;
 // types, so a caller could not configure a categorical run through the
 // published crate alone.
 pub use cb_train::{CounterCalcMethod, ECtrType};
+
+// PARAM-01: the training knobs the Builder's new setters take. Without these
+// re-exports an external crate could name `grow_policy` / `od_type` /
+// `boosting_type` / `eval_metric` but not their argument types, so the params
+// would be un-configurable through the published crate alone (the same reasoning
+// that motivated the CTR re-exports above).
+//
+// `parse_metric` is re-exported alongside `EvalMetric` because the string form
+// (`"AUC"`, `"Quantile:alpha=0.9"`) is how upstream names a metric — without it a
+// caller would have to reconstruct the parametric variants by hand.
+pub use cb_train::{
+    parse_metric, EBoostingType, EGrowPolicy, EOverfittingDetectorType, EvalMetric,
+};
 
 // Re-export the Pool ingestion surface (the `fit`/predict input) from the
 // published crate.
