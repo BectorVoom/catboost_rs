@@ -386,6 +386,9 @@ pub fn grid_search(
         return Err(degenerate("grid_search: `metrics` must be non-empty"));
     }
 
+    // F14 / SPEC-CATF-Δ6 — before any candidate is fitted.
+    crate::cv::reject_categorical_pool("grid_search", pool)?;
+
     let (best_index, cv_results, failures) = run_over(
         pool,
         candidates,
@@ -468,6 +471,11 @@ pub fn randomized_search(
     if metrics.is_empty() {
         return Err(degenerate("randomized_search: `metrics` must be non-empty"));
     }
+
+    // F14 / SPEC-CATF-Δ6 — randomized_search shares `run_over`, so it carries
+    // the IDENTICAL all-NaN degradation hazard; leaving it unguarded would
+    // re-open exactly what this task closes.
+    crate::cv::reject_categorical_pool("randomized_search", pool)?;
 
     // The deterministically sampled ORIGINAL indices, in permuted order.
     let sampled_idx = sample_indices(candidates.len(), n_iter, partition_random_seed);

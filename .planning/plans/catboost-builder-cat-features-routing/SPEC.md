@@ -389,9 +389,28 @@ routing automatically. Both must be re-run as regression gates (CATF-07).
   round-trip already shipped in Phase 23.
 - **Python surface widens, never narrows:** six kwargs move from rejected to accepted;
   no previously accepted kwarg changes meaning.
-- **One deliberate behavior change:** `predict()` on a CTR model with a cat-free pool
+- **Deliberate behavior change 1:** `predict()` on a CTR model with a cat-free pool
   moves from *silently wrong numbers* to a typed error (CATF-12). This is a fix, but
   it is technically observable; it must be called out in the change description.
+  **AMENDED (F11/F12, SPEC-CATF-Δ7):** the same change applies to a **ONE-HOT**
+  model, which has no `ctr_data` at all — `predict_raw(m, fv)` is
+  `predict_raw_cat(m, fv, &[])`, so every one-hot split silently evaluated to
+  `false`. The predicate is `needs_cat_columns()`, not `is_ctr_model()`, and it
+  guards **four** entrypoints: `predict`, `predict_with`, `predict_proba` and
+  `staged_predict` (the last via a new `ensure_scalar_oblivious` arm). It also
+  reaches `partial_dependence` and
+  `feature_importance_with_data(PredictionValuesChange)` (F13).
+- **Deliberate behavior change 2 (F14, SPEC-CATF-Δ6):** `cv()`, `grid_search()`
+  and `randomized_search()` on a pool with categorical columns now return a typed
+  `CatBoostError::UnsupportedModel` **before any fold is fitted**, instead of
+  fitting every fold and then failing from inside it — or, worse, with
+  `ErrorScore::Value(NaN)` (the sklearn default), absorbing every candidate's
+  failure into `error_score` and RETURNING a `SearchResult` with all-NaN scores
+  and an arbitrary `best_index`. A categorical pool is a *configuration* failure,
+  not a *candidate* failure, so mapping it to `error_score` is category
+  confusion. `randomized_search` shares `run_over` and therefore the identical
+  hazard, so it is guarded too. Float-only pools are entirely unaffected
+  (`cv_on_a_float_only_pool_is_unchanged`).
 - **Backend-agnostic:** `train_cat` is `R: Runtime`-generic exactly like `train`, so
   every existing backend feature (`cpu`/`wgpu`/`cuda`/`rocm`) compiles unchanged with
   no new feature gating.
