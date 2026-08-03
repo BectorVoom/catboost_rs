@@ -424,3 +424,76 @@ fn cv_serial_vs_parallel_byte_identical() {
         "serial and cpu-parallel CvResult must be byte-identical"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F14 (SPEC-CATF-Δ6, resolving MAJOR-6) — categorical pools fail FAST
+// ---------------------------------------------------------------------------
+
+/// A pool with one high-cardinality categorical column.
+fn categorical_pool() -> Pool {
+    let n = 40_usize;
+    let label: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+    let cat: Vec<String> = (0..n).map(|i| format!("c{}", i % 9)).collect();
+    let floats = vec![(0..n).map(|i| (i % 7) as f64).collect::<Vec<f64>>()];
+    OwnedColumns::new(floats, label)
+        .with_cat_features(vec![cat])
+        .into_pool()
+        .expect("categorical pool builds")
+}
+
+/// F14 test fn 1 — `cv` on a categorical pool is a typed error raised BEFORE
+/// any fold is fitted.
+///
+/// The hazard: `cv` does `select_rows` (which PRESERVES cat_features) →
+/// `builder.fit` (which after F09 bakes CTR) → `staged_predict` (which rejects
+/// CTR/one-hot models). Without a top-level guard, `cv` would fit every fold at
+/// full cost and only then fail from inside the fold. `iterations(100_000)`
+/// makes "fails before fitting" observable: fitting even one fold at that size
+/// could not finish in the asserted budget.
+#[test]
+fn cv_on_a_categorical_pool_is_a_typed_unsupported_model() {
+    let pool = categorical_pool();
+    let builder = CatBoostBuilder::new().iterations(100_000).depth(6);
+
+    let start = std::time::Instant::now();
+    let result = cv(&pool, &builder, &["RMSE"], 3, false, 0, false, None);
+    let elapsed = start.elapsed();
+
+    match result {
+        Err(crate::CatBoostError::UnsupportedModel(msg)) => {
+            assert!(
+                msg.contains("categorical"),
+                "the error must name the categorical columns, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected UnsupportedModel, got {other:?}"),
+        Ok(_) => panic!(
+            "cv SILENTLY RAN on a categorical pool — every fold ignored the cat column"
+        ),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "cv must reject a categorical pool BEFORE fitting any fold; \
+         an iterations(100_000) builder returned in {elapsed:?}, which is only \
+         possible if no fold was fitted"
+    );
+}
+
+/// F14 test fn 3 — the D-04 no-op proof: a float-only pool is unchanged.
+#[test]
+fn cv_on_a_float_only_pool_is_unchanged() {
+    let n = 24_usize;
+    let label: Vec<f64> = (0..n).map(|i| (i % 5) as f64).collect();
+    let floats = vec![(0..n).map(|i| (i % 7) as f64).collect::<Vec<f64>>()];
+    let pool = OwnedColumns::new(floats, label)
+        .into_pool()
+        .expect("float-only pool builds");
+    let builder = CatBoostBuilder::new().iterations(3).depth(2);
+
+    let result = cv(&pool, &builder, &["RMSE"], 3, false, 0, false, None);
+    assert!(
+        result.is_ok(),
+        "the F14 guard must not touch a float-only pool: {:?}",
+        result.err()
+    );
+}

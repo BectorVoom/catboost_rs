@@ -29,15 +29,18 @@ use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
     LeafMethod, Loss,
 };
-use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
+use cb_data::{select_borders_greedy_logsum, AutoClassWeights, Pool, QuantizeParams};
 use rayon::prelude::*;
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
-    counter_calc_method_default, fold_len_multiplier_default, has_time_default,
-    max_ctr_complexity_default,
-    one_hot_max_size_default, permutation_count_default, score_function_default,
-    simple_ctr_default, simple_ctr_priors_default, train, BoostParams, EBootstrapType,
-    EOverfittingDetectorType, EvalMetric,
+    counter_calc_method_default, feature_weights_default, first_feature_use_penalties_default,
+    fold_len_multiplier_default, grow_policy_default, has_time_default, max_ctr_complexity_default,
+    max_leaves_default, min_data_in_leaf_default, monotone_constraints_default,
+    one_hot_max_size_default, penalties_coefficient_default, per_object_feature_penalties_default,
+    permutation_count_default, score_function_default, simple_ctr_default,
+    simple_ctr_priors_default, train_cat_with_eval_sets, train_with_eval_sets, BoostParams,
+    CounterCalcMethod, EBoostingType, EBootstrapType, ECtrType, EGrowPolicy,
+    EOverfittingDetectorType, EvalMetric, EvalMetricHistory, EvalSet,
 };
 
 use crate::error::CatBoostError;
@@ -82,6 +85,156 @@ pub struct CatBoostBuilder {
     random_seed: u64,
     border_count: usize,
     score_function: EScoreFunction,
+    /// Cardinality ceiling for the one-hot categorical encoding path
+    /// (`one_hot_max_size`, upstream default 2). A categorical column with
+    /// `1 < learn-cardinality <= one_hot_max_size` routes to one-hot; above it,
+    /// to the CTR path.
+    one_hot_max_size: u32,
+    /// Maximum feature-combination (tensor-CTR) projection length
+    /// (`max_ctr_complexity`, upstream default 4). `1` emits SimpleCtrs only and
+    /// is the ONLY in-engine way to suppress combination CTRs entirely.
+    max_ctr_complexity: usize,
+    /// The SINGLE simple-CTR type (`simple_ctr`).
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`catboost_options.cpp:439-453`); this crate models ONE
+    /// description with a prior LIST. The type and the full prior list ARE
+    /// honored (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]`
+    /// configuration is NOT representable.
+    simple_ctr: ECtrType,
+    /// Per-prior NUMERATORS for [`Self::simple_ctr`]. Each denominator is pinned
+    /// to `1`: `Prior=<n>/<d>` with `d != 1` is illegal on CPU upstream
+    /// (`ctr_helper.cpp:50`), which is what vindicates the engine's
+    /// `prior_denom: 1.0` pin.
+    simple_ctr_priors: Vec<f64>,
+    /// The SINGLE combination-CTR type (`combinations_ctr`). Same
+    /// single-description parity gap as [`Self::simple_ctr`].
+    combinations_ctr: ECtrType,
+    /// Per-prior NUMERATORS for [`Self::combinations_ctr`]; unit denominators,
+    /// as for [`Self::simple_ctr_priors`].
+    combinations_ctr_priors: Vec<f64>,
+    /// Whether the Counter CTR tally folds the eval sets in (`Full`) or skips
+    /// them (`SkipTest`, the upstream default).
+    ///
+    /// **Observable only when an eval set is present**: with a learn set alone
+    /// the two settings produce bit-identical models (measured `0.000e+00`
+    /// learn-only vs `4.010e-01` with an eval set — the E23 gate).
+    counter_calc_method: CounterCalcMethod,
+
+    // ---- PARAM-01: the overfitting-detector / best-model controls -----------
+    // Each of these was previously PINNED inside `boost_params()` to the
+    // engine-inert value, so `cb_train` implemented the behaviour but no caller
+    // — Rust or Python — could reach it. The defaults below reproduce those
+    // pins exactly, so an untouched builder is byte-identical to the pre-PARAM-01
+    // form (asserted by `untouched_builder_emits_the_pinned_engine_defaults`).
+    /// Overfitting-detector type (`od_type`). [`EOverfittingDetectorType::None`]
+    /// (the default) never stops. Consumed ONLY through an eval-set fit
+    /// ([`CatBoostBuilder::fit_with_eval`]): with no eval set there is no metric
+    /// curve to detect on, so the detector never fires.
+    od_type: EOverfittingDetectorType,
+    /// Overfitting-detector stop threshold (`od_pval` / `AutoStopPValue`). `0.0`
+    /// makes IncToDec / Wilcoxon inactive (the upstream default); `Iter` ignores
+    /// it (its threshold is forced to `1.0`).
+    od_pval: f64,
+    /// Overfitting-detector wait iterations (`od_wait` / `IterationsWait`) — the
+    /// number of non-improving iterations tolerated before stopping. This is what
+    /// upstream's `early_stopping_rounds` sets (together with `od_type = Iter`).
+    od_wait: usize,
+    /// `use_best_model`: track the best eval-metric iteration and truncate the
+    /// model to `best_iteration + 1` trees. Eval-set-only, like the detector.
+    use_best_model: bool,
+
+    // ---- PARAM-01: the boosting-scheme controls ----------------------------
+    /// The boosting type (`boosting_type`). [`EBoostingType::Plain`] is the CPU
+    /// default; [`EBoostingType::Ordered`] drives the anti-leakage ordered
+    /// approximant path (ORD-02).
+    boosting_type: EBoostingType,
+    /// Whether the learn dataset is TIME-ORDERED (`has_time`). `true` SKIPS the
+    /// initial learn-set Fisher-Yates shuffle (`preprocess.cpp:161`), preserving
+    /// the natural object order.
+    has_time: bool,
+    /// Number of random permutations for the multi-permutation fold machinery
+    /// (`permutation_count`, upstream default 4).
+    permutation_count: usize,
+    /// Tail-growth multiplier for the dynamic (ordered) fold body/tail
+    /// (`fold_len_multiplier`, upstream default 2.0).
+    fold_len_multiplier: f64,
+
+    // ---- PARAM-01: the per-feature weighting / penalty surface -------------
+    /// Per-float-feature MULTIPLICATIVE gain weights (`feature_weights`). EMPTY
+    /// (the upstream default) means every weight is `1.0`.
+    feature_weights: Vec<f64>,
+    /// Per-float-feature SUBTRACTIVE first-use penalties
+    /// (`first_feature_use_penalties`). EMPTY ⇒ `0.0` for every feature.
+    first_feature_use_penalties: Vec<f64>,
+    /// Per-float-feature SUBTRACTIVE per-object penalties
+    /// (`per_object_feature_penalties`). EMPTY ⇒ `0.0` for every feature.
+    per_object_feature_penalties: Vec<f64>,
+    /// The scaling coefficient multiplying BOTH penalty terms
+    /// (`penalties_coefficient`, upstream default `1.0`). Never consumed while
+    /// both penalty vectors are empty.
+    penalties_coefficient: f64,
+    /// Per-float-feature monotone constraints (`monotone_constraints`): `+1`
+    /// non-decreasing, `-1` non-increasing, `0` free. Enforced as an isotonic
+    /// (PAVA) projection over the per-leaf deltas. OBLIVIOUS-ONLY — upstream
+    /// rejects them under every non-symmetric grow policy, and so does the
+    /// engine's typed guard.
+    monotone_constraints: Vec<i8>,
+
+    // ---- PARAM-01: the tree grow policy ------------------------------------
+    /// The tree grow policy (`grow_policy`). [`EGrowPolicy::SymmetricTree`] is
+    /// the oblivious default; `Lossguide` / `Depthwise` grow a true non-symmetric
+    /// node graph; `Region` is rejected by the engine's validator.
+    grow_policy: EGrowPolicy,
+    /// Maximum leaf count for the Lossguide grower (`max_leaves`, default 31).
+    /// Ignored by SymmetricTree / Depthwise (both bounded by `depth`).
+    max_leaves: usize,
+    /// Minimum document count required to split a leaf (`min_data_in_leaf`,
+    /// default 1). Read by the leaf-wise growers.
+    min_data_in_leaf: usize,
+
+    // ---- PARAM-03: the class-weighting surface (classification only) -------
+    //
+    // `cb_data::weights` already implemented the upstream-faithful computation
+    // (and `weights_oracle_test` gates it against the frozen
+    // `class_weights/` fixture), but NOTHING applied it during a fit — the
+    // resolved per-object weights never reached `train`. These three fields are
+    // the missing application path.
+    /// Explicit per-class weights (`class_weights`). EMPTY (the default) means no
+    /// class reweighting. Multiplies each object's weight by its class's entry.
+    class_weights: Vec<f64>,
+    /// Automatic class weights derived from the class distribution
+    /// (`auto_class_weights`). Mutually exclusive with
+    /// [`Self::class_weights`] / [`Self::scale_pos_weight`].
+    auto_class_weights: AutoClassWeights,
+    /// Binary-classification positive-class multiplier (`scale_pos_weight`),
+    /// upstream default `1.0` — exactly `class_weights = [1.0, w]`. Mutually
+    /// exclusive with the other two.
+    scale_pos_weight: f64,
+
+    // ---- PARAM-03: ignored_features ----------------------------------------
+    /// Float-feature indices the tree search must never split on
+    /// (`ignored_features`). EMPTY (the default) ignores nothing.
+    ignored_features: Vec<usize>,
+}
+
+/// The result of an eval-set fit ([`CatBoostBuilder::fit_with_eval_sets`]): the
+/// trained model plus the per-eval-set per-iteration metric curves the run
+/// produced.
+///
+/// `eval_history[k]` is eval set `k`'s ordered `eval_metric` values, one per
+/// COMPLETED boosting iteration. When the overfitting detector stops the run
+/// early the curves are shorter than `iterations` — their length is therefore the
+/// observable "how many iterations actually ran", which a bare [`Model`] cannot
+/// report once `use_best_model` has truncated its tree list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FitResult {
+    /// The trained model (already truncated to `best_iteration + 1` trees when
+    /// [`CatBoostBuilder::use_best_model`] was set).
+    pub model: Model,
+    /// Per-eval-set per-iteration metric curves; `eval_history[0]` is the PRIMARY
+    /// set, the one the detector and the best-model tracker consume.
+    pub eval_history: Vec<Vec<f64>>,
 }
 
 impl Default for CatBoostBuilder {
@@ -113,6 +266,38 @@ impl CatBoostBuilder {
             random_seed: 0,
             border_count: QuantizeParams::default().border_count,
             score_function: score_function_default(),
+            one_hot_max_size: one_hot_max_size_default(),
+            max_ctr_complexity: max_ctr_complexity_default(),
+            simple_ctr: simple_ctr_default(),
+            simple_ctr_priors: simple_ctr_priors_default(),
+            combinations_ctr: combinations_ctr_default(),
+            combinations_ctr_priors: combinations_ctr_priors_default(),
+            counter_calc_method: counter_calc_method_default(),
+            // PARAM-01: every value below reproduces the literal constant
+            // `boost_params()` used to pin, so `CatBoostBuilder::new()` emits the
+            // SAME `BoostParams` as before the setters existed (D-04).
+            od_type: EOverfittingDetectorType::None,
+            od_pval: 0.0,
+            od_wait: 0,
+            use_best_model: false,
+            boosting_type: boosting_type_default(),
+            has_time: has_time_default(),
+            permutation_count: permutation_count_default(),
+            fold_len_multiplier: fold_len_multiplier_default(),
+            feature_weights: feature_weights_default(),
+            first_feature_use_penalties: first_feature_use_penalties_default(),
+            per_object_feature_penalties: per_object_feature_penalties_default(),
+            penalties_coefficient: penalties_coefficient_default(),
+            monotone_constraints: monotone_constraints_default(),
+            grow_policy: grow_policy_default(),
+            max_leaves: max_leaves_default(),
+            min_data_in_leaf: min_data_in_leaf_default(),
+            // PARAM-03: all four are the upstream "off" values, so an untouched
+            // builder resolves weights to the pool's own and ignores nothing.
+            class_weights: Vec::new(),
+            auto_class_weights: AutoClassWeights::None,
+            scale_pos_weight: 1.0,
+            ignored_features: Vec::new(),
         }
     }
 
@@ -252,10 +437,324 @@ impl CatBoostBuilder {
         self
     }
 
-    /// Map the builder fields onto the internal [`BoostParams`]. The
-    /// overfitting-detector / `use_best_model` / `eval_metric` controls are off
-    /// (the Phase-4 first-slice surface does not expose an eval set through the
-    /// facade).
+    /// Cardinality ceiling for the one-hot categorical encoding path
+    /// (`one_hot_max_size`, upstream default 2 —
+    /// `cat_feature_options.cpp:232-233`). A categorical column whose learn-set
+    /// cardinality satisfies `1 < cardinality <= one_hot_max_size` routes to the
+    /// one-hot path; above it, to the CTR path.
+    #[must_use]
+    pub fn one_hot_max_size(mut self, one_hot_max_size: u32) -> Self {
+        self.one_hot_max_size = one_hot_max_size;
+        self
+    }
+
+    /// Maximum feature-combination (tensor-CTR) projection length
+    /// (`max_ctr_complexity` / upstream `MaxTensorComplexity`, default 4 —
+    /// `cat_feature_options.cpp:231`). `1` emits SimpleCtrs only; `>= 2` admits
+    /// CombinationCtrs of that length. Setting `1` is the ONLY in-engine way to
+    /// suppress combination CTRs entirely.
+    #[must_use]
+    pub fn max_ctr_complexity(mut self, max_ctr_complexity: usize) -> Self {
+        self.max_ctr_complexity = max_ctr_complexity;
+        self
+    }
+
+    /// The simple-CTR type (`simple_ctr`). GENUINELY CONSUMED: it selects both
+    /// the online producer and the final bake, so changing it changes the model.
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+    /// `catboost_options.cpp:439-453`). This crate models ONE description with a
+    /// prior LIST — set the type here and the full prior list via
+    /// [`CatBoostBuilder::simple_ctr_priors`]. A simultaneous
+    /// `[Borders, Counter]` configuration is NOT representable.
+    #[must_use]
+    pub fn simple_ctr(mut self, simple_ctr: ECtrType) -> Self {
+        self.simple_ctr = simple_ctr;
+        self
+    }
+
+    /// The FULL prior list for [`CatBoostBuilder::simple_ctr`] — one CTR column
+    /// is generated per prior.
+    ///
+    /// Each value is a prior NUMERATOR over an implicit denominator of `1`:
+    /// upstream rejects `Prior=<n>/<d>` with `d != 1` on CPU
+    /// (`ctr_helper.cpp:50`), which is exactly why the engine pins
+    /// `prior_denom: 1.0`.
+    #[must_use]
+    pub fn simple_ctr_priors(mut self, simple_ctr_priors: Vec<f64>) -> Self {
+        self.simple_ctr_priors = simple_ctr_priors;
+        self
+    }
+
+    /// The combination-CTR type (`combinations_ctr`), applied to tensor
+    /// (multi-column) projections. Consumed whenever
+    /// [`CatBoostBuilder::max_ctr_complexity`] is `>= 2`. Carries the same
+    /// single-description parity gap as [`CatBoostBuilder::simple_ctr`].
+    #[must_use]
+    pub fn combinations_ctr(mut self, combinations_ctr: ECtrType) -> Self {
+        self.combinations_ctr = combinations_ctr;
+        self
+    }
+
+    /// The FULL prior list for [`CatBoostBuilder::combinations_ctr`]; unit
+    /// denominators, as for [`CatBoostBuilder::simple_ctr_priors`].
+    #[must_use]
+    pub fn combinations_ctr_priors(mut self, combinations_ctr_priors: Vec<f64>) -> Self {
+        self.combinations_ctr_priors = combinations_ctr_priors;
+        self
+    }
+
+    /// Whether the Counter CTR tally folds the eval sets into the counts
+    /// ([`CounterCalcMethod::Full`]) or skips them
+    /// ([`CounterCalcMethod::SkipTest`], the upstream default —
+    /// `cat_feature_options.cpp:234`).
+    ///
+    /// **This flag is observable only when an eval set is present.** Training on
+    /// a learn set alone produces bit-identical models under either setting
+    /// (measured max|diff| `0.000e+00` learn-only versus `4.010e-01` with an
+    /// eval set — the E23 gate). It is therefore NOT a blanket parity control:
+    /// it only bites through the eval-set training entrypoint.
+    #[must_use]
+    pub fn counter_calc_method(mut self, counter_calc_method: CounterCalcMethod) -> Self {
+        self.counter_calc_method = counter_calc_method;
+        self
+    }
+
+    /// The per-iteration eval-set validation metric (`eval_metric`, TRAIN-07).
+    /// Unset derives it from the loss ([`EvalMetric::for_loss`]).
+    ///
+    /// Consumed ONLY through an eval-set fit ([`CatBoostBuilder::fit_with_eval`] /
+    /// [`CatBoostBuilder::fit_with_eval_sets`]) — a learn-only [`CatBoostBuilder::fit`]
+    /// computes no validation metric, so setting this alone changes nothing.
+    ///
+    /// Note this REPLACES any metric previously installed by
+    /// [`CatBoostBuilder::custom_metric`] (both write the same field).
+    #[must_use]
+    pub fn eval_metric(mut self, eval_metric: EvalMetric) -> Self {
+        self.eval_metric = Some(eval_metric);
+        self
+    }
+
+    /// Overfitting-detector type (`od_type`, TRAIN-06). Eval-set-only: with no
+    /// eval set there is no metric curve to detect on.
+    #[must_use]
+    pub fn od_type(mut self, od_type: EOverfittingDetectorType) -> Self {
+        self.od_type = od_type;
+        self
+    }
+
+    /// Overfitting-detector stop threshold (`od_pval`). `0.0` (the default) makes
+    /// IncToDec / Wilcoxon inactive; [`EOverfittingDetectorType::Iter`] ignores it.
+    #[must_use]
+    pub fn od_pval(mut self, od_pval: f64) -> Self {
+        self.od_pval = od_pval;
+        self
+    }
+
+    /// Overfitting-detector wait iterations (`od_wait`) — how many non-improving
+    /// iterations to tolerate before stopping.
+    #[must_use]
+    pub fn od_wait(mut self, od_wait: usize) -> Self {
+        self.od_wait = od_wait;
+        self
+    }
+
+    /// Upstream's `early_stopping_rounds`: stop after `rounds` iterations without
+    /// an eval-metric improvement.
+    ///
+    /// This is the exact pair upstream sets for that kwarg — `od_type = Iter`
+    /// (the threshold-free "N rounds since the best" detector) plus
+    /// `od_wait = rounds` — surfaced as ONE setter so a caller cannot set the
+    /// wait while leaving the detector off, which would silently disable early
+    /// stopping entirely.
+    #[must_use]
+    pub fn early_stopping_rounds(mut self, rounds: usize) -> Self {
+        self.od_type = EOverfittingDetectorType::Iter;
+        self.od_wait = rounds;
+        self
+    }
+
+    /// `use_best_model`: track the best eval-metric iteration and truncate the
+    /// returned model to `best_iteration + 1` trees. Eval-set-only.
+    #[must_use]
+    pub fn use_best_model(mut self, use_best_model: bool) -> Self {
+        self.use_best_model = use_best_model;
+        self
+    }
+
+    /// The boosting type (`boosting_type`): [`EBoostingType::Plain`] (the CPU
+    /// default) or [`EBoostingType::Ordered`] (the anti-leakage ordered
+    /// approximant path).
+    #[must_use]
+    pub fn boosting_type(mut self, boosting_type: EBoostingType) -> Self {
+        self.boosting_type = boosting_type;
+        self
+    }
+
+    /// Whether the learn dataset is TIME-ORDERED (`has_time`). `true` skips the
+    /// initial learn-set shuffle, preserving the natural object order.
+    #[must_use]
+    pub fn has_time(mut self, has_time: bool) -> Self {
+        self.has_time = has_time;
+        self
+    }
+
+    /// Number of random permutations for the multi-permutation fold machinery
+    /// (`permutation_count`, upstream default 4).
+    #[must_use]
+    pub fn permutation_count(mut self, permutation_count: usize) -> Self {
+        self.permutation_count = permutation_count;
+        self
+    }
+
+    /// Tail-growth multiplier for the dynamic (ordered) fold body/tail
+    /// (`fold_len_multiplier`, upstream default 2.0).
+    #[must_use]
+    pub fn fold_len_multiplier(mut self, fold_len_multiplier: f64) -> Self {
+        self.fold_len_multiplier = fold_len_multiplier;
+        self
+    }
+
+    /// Per-float-feature MULTIPLICATIVE candidate-gain weights
+    /// (`feature_weights`). An empty vector (the default) weights every feature
+    /// `1.0`; an out-of-range index also falls back to `1.0`.
+    #[must_use]
+    pub fn feature_weights(mut self, feature_weights: Vec<f64>) -> Self {
+        self.feature_weights = feature_weights;
+        self
+    }
+
+    /// Per-float-feature SUBTRACTIVE first-use penalties
+    /// (`first_feature_use_penalties`), scaled by
+    /// [`CatBoostBuilder::penalties_coefficient`] and applied while the feature is
+    /// still unused anywhere in the model being built.
+    #[must_use]
+    pub fn first_feature_use_penalties(mut self, penalties: Vec<f64>) -> Self {
+        self.first_feature_use_penalties = penalties;
+        self
+    }
+
+    /// Per-float-feature SUBTRACTIVE per-object penalties
+    /// (`per_object_feature_penalties`), scaled by
+    /// [`CatBoostBuilder::penalties_coefficient`] and by the unused-document count.
+    #[must_use]
+    pub fn per_object_feature_penalties(mut self, penalties: Vec<f64>) -> Self {
+        self.per_object_feature_penalties = penalties;
+        self
+    }
+
+    /// The scaling coefficient multiplying BOTH penalty vectors
+    /// (`penalties_coefficient`, upstream default `1.0`). Inert while both
+    /// vectors are empty.
+    #[must_use]
+    pub fn penalties_coefficient(mut self, penalties_coefficient: f64) -> Self {
+        self.penalties_coefficient = penalties_coefficient;
+        self
+    }
+
+    /// Per-float-feature monotone constraints (`monotone_constraints`): `+1`
+    /// (output non-decreasing in that feature), `-1` (non-increasing), `0`
+    /// (free). Applied as an isotonic (PAVA) projection over the per-leaf deltas
+    /// after the tree structure is built.
+    ///
+    /// OBLIVIOUS-ONLY: combining a non-empty constraint vector with a
+    /// non-symmetric [`CatBoostBuilder::grow_policy`] is rejected at `fit()` by
+    /// the engine's typed guard (upstream rejects it too), never silently ignored.
+    #[must_use]
+    pub fn monotone_constraints(mut self, monotone_constraints: Vec<i8>) -> Self {
+        self.monotone_constraints = monotone_constraints;
+        self
+    }
+
+    /// The tree grow policy (`grow_policy`). [`EGrowPolicy::SymmetricTree`] is
+    /// the oblivious default; `Lossguide` / `Depthwise` grow a non-symmetric node
+    /// graph; `Region` is rejected at `fit()`.
+    #[must_use]
+    pub fn grow_policy(mut self, grow_policy: EGrowPolicy) -> Self {
+        self.grow_policy = grow_policy;
+        self
+    }
+
+    /// Maximum leaf count for the Lossguide grower (`max_leaves`, default 31).
+    /// Ignored by SymmetricTree / Depthwise, which `depth` bounds.
+    #[must_use]
+    pub fn max_leaves(mut self, max_leaves: usize) -> Self {
+        self.max_leaves = max_leaves;
+        self
+    }
+
+    /// Minimum document count required to split a leaf (`min_data_in_leaf`,
+    /// default 1). Read by the leaf-wise growers.
+    #[must_use]
+    pub fn min_data_in_leaf(mut self, min_data_in_leaf: usize) -> Self {
+        self.min_data_in_leaf = min_data_in_leaf;
+        self
+    }
+
+    /// Explicit per-class weights (`class_weights`): each object's weight is
+    /// multiplied by `class_weights[class_of(object)]`, where the class is the
+    /// object's integer label.
+    ///
+    /// CLASSIFICATION ONLY — combining it with a regression loss is rejected at
+    /// `fit()` (upstream rejects it too), because "the class of an object" is
+    /// undefined for a continuous target.
+    #[must_use]
+    pub fn class_weights(mut self, class_weights: Vec<f64>) -> Self {
+        self.class_weights = class_weights;
+        self
+    }
+
+    /// Derive the class weights automatically from the class distribution
+    /// (`auto_class_weights`).
+    ///
+    /// Mutually exclusive with [`CatBoostBuilder::class_weights`] and
+    /// [`CatBoostBuilder::scale_pos_weight`]: all three write the SAME per-object
+    /// weight, so combining them is rejected at `fit()` rather than resolved by
+    /// precedence, which would silently drop one the caller set on purpose.
+    #[must_use]
+    pub fn auto_class_weights(mut self, auto_class_weights: AutoClassWeights) -> Self {
+        self.auto_class_weights = auto_class_weights;
+        self
+    }
+
+    /// Binary-classification positive-class weight (`scale_pos_weight`, upstream
+    /// default `1.0`) — exactly `class_weights = [1.0, scale_pos_weight]`.
+    ///
+    /// Binary only, and mutually exclusive with the other two class-weight
+    /// controls (see [`CatBoostBuilder::auto_class_weights`]).
+    #[must_use]
+    pub fn scale_pos_weight(mut self, scale_pos_weight: f64) -> Self {
+        self.scale_pos_weight = scale_pos_weight;
+        self
+    }
+
+    /// Float-feature indices the tree search must never split on
+    /// (`ignored_features`).
+    ///
+    /// Implemented by giving each ignored feature an EMPTY border set, which
+    /// leaves it with no candidate split at any level. That is chosen over
+    /// physically dropping the column so the model's feature INDEXING is
+    /// unchanged: `predict` still takes the full-width pool, and every
+    /// feature-importance / SHAP index keeps meaning the same input column. An
+    /// ignored feature simply contributes nothing.
+    ///
+    /// An out-of-range index is rejected at `fit()` rather than ignored — a typo
+    /// that silently ignores nothing is exactly the failure this parameter is
+    /// used to prevent.
+    #[must_use]
+    pub fn ignored_features(mut self, ignored_features: Vec<usize>) -> Self {
+        self.ignored_features = ignored_features;
+        self
+    }
+
+    /// Map the builder fields onto the internal [`BoostParams`].
+    ///
+    /// PARAM-01: the overfitting-detector / `use_best_model` / `eval_metric` /
+    /// penalty / grow-policy / boosting-scheme fields are now READ FROM THE
+    /// BUILDER instead of being pinned to literals here. `new()` seeds each with
+    /// the value that was pinned, so an untouched builder emits an identical
+    /// `BoostParams` (the D-04 no-regression gate).
     fn boost_params(&self) -> BoostParams {
         BoostParams {
             // `Loss` is no longer `Copy` (Phase 6.2, D-6.2-05 — the Wave-3
@@ -274,47 +773,42 @@ impl CatBoostBuilder {
             subsample: self.subsample,
             bagging_temperature: self.bagging_temperature,
             random_seed: self.random_seed,
-            od_type: EOverfittingDetectorType::None,
-            od_pval: 0.0,
-            od_wait: 0,
-            use_best_model: false,
+            od_type: self.od_type,
+            od_pval: self.od_pval,
+            od_wait: self.od_wait,
+            use_best_model: self.use_best_model,
             // Custom eval metric (LOSS-07) when set via `custom_metric`; else the
             // train loop derives it from the loss (`EvalMetric::for_loss`).
             eval_metric: self.eval_metric.clone(),
-            // Pinned to the upstream default (cat_feature_options.cpp:231-232);
-            // the facade does not yet surface categorical config, and the
-            // numeric-only train path never exercises the one-hot branch.
-            one_hot_max_size: one_hot_max_size_default(),
-            // Pinned to the upstream defaults (RESEARCH Pitfall 6); the numeric
-            // facade path needs no permutation, so these are inert here.
-            permutation_count: permutation_count_default(),
-            fold_len_multiplier: fold_len_multiplier_default(),
-            // CTR config pinned to the upstream defaults (D-07 / Pitfall 6); the
-            // numeric facade path bakes no CTR table, so these are inert here.
-            simple_ctr: simple_ctr_default(),
-            simple_ctr_priors: simple_ctr_priors_default(),
-            counter_calc_method: counter_calc_method_default(),
-            boosting_type: boosting_type_default(),
-            // Tensor-CTR config pinned to the upstream defaults (D-07 / Pitfall
-            // 6); the numeric facade path forms no combination, so these are
-            // inert here.
-            max_ctr_complexity: max_ctr_complexity_default(),
-            combinations_ctr: combinations_ctr_default(),
-            combinations_ctr_priors: combinations_ctr_priors_default(),
+            // The facade now surfaces the categorical / CTR config (F01-F05);
+            // each field defaults to the upstream value in `new()`, so a
+            // builder that never touches them is byte-equivalent to the
+            // previously-pinned form (guarded by `builder_test`'s
+            // `untouched_builder_emits_the_canonical_ctr_defaults`).
+            one_hot_max_size: self.one_hot_max_size,
+            permutation_count: self.permutation_count,
+            fold_len_multiplier: self.fold_len_multiplier,
+            simple_ctr: self.simple_ctr,
+            simple_ctr_priors: self.simple_ctr_priors.clone(),
+            counter_calc_method: self.counter_calc_method,
+            boosting_type: self.boosting_type,
+            max_ctr_complexity: self.max_ctr_complexity,
+            combinations_ctr: self.combinations_ctr,
+            combinations_ctr_priors: self.combinations_ctr_priors.clone(),
             // Split-score function (`score_function`). The facade now surfaces
             // this via `.score_function()`, defaulting to the catboost CPU
             // default (Cosine, oblivious_tree_options.cpp:22) through
             // `score_function_default()` in `new()`.
             score_function: self.score_function,
-            has_time: has_time_default(),
-            feature_weights: cb_train::feature_weights_default(),
-            first_feature_use_penalties: cb_train::first_feature_use_penalties_default(),
-            per_object_feature_penalties: cb_train::per_object_feature_penalties_default(),
-            penalties_coefficient: cb_train::penalties_coefficient_default(),
-            monotone_constraints: cb_train::monotone_constraints_default(),
-            grow_policy: cb_train::grow_policy_default(),
-            max_leaves: cb_train::max_leaves_default(),
-            min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+            has_time: self.has_time,
+            feature_weights: self.feature_weights.clone(),
+            first_feature_use_penalties: self.first_feature_use_penalties.clone(),
+            per_object_feature_penalties: self.per_object_feature_penalties.clone(),
+            penalties_coefficient: self.penalties_coefficient,
+            monotone_constraints: self.monotone_constraints.clone(),
+            grow_policy: self.grow_policy,
+            max_leaves: self.max_leaves,
+            min_data_in_leaf: self.min_data_in_leaf,
         }
     }
 
@@ -332,6 +826,181 @@ impl CatBoostBuilder {
     /// Returns [`CatBoostError::Train`] for any training failure (degenerate
     /// input, depth exceeded, runtime gradient error).
     pub fn fit(&self, pool: &Pool) -> Result<Model, CatBoostError> {
+        // PARAM-01: `fit` is now the no-eval-set case of the shared inner. The
+        // engine's own `train`/`train_cat` are themselves literal delegations to
+        // `train_with_eval_sets`/`train_cat_with_eval_sets` with `&[]` sets and a
+        // `None` history (boosting.rs:2325-2350, 2527-2551), so routing through
+        // the inner with an empty set list is byte-identical to the previous
+        // direct call — the D-04 / F21 no-regression gate.
+        Ok(self.fit_inner(pool, &[])?.model)
+    }
+
+    /// Train on `pool` with ONE held-out eval set, returning the model together
+    /// with its per-iteration eval-metric curve.
+    ///
+    /// This is the entry point that makes the eval-set-only parameters
+    /// observable: [`CatBoostBuilder::od_type`] /
+    /// [`CatBoostBuilder::early_stopping_rounds`] (stop early),
+    /// [`CatBoostBuilder::use_best_model`] (truncate to the best iteration),
+    /// [`CatBoostBuilder::eval_metric`] (which metric is tracked), and
+    /// [`CatBoostBuilder::counter_calc_method`] (whether the Counter CTR tally
+    /// folds the eval set in). With a learn set alone every one of those is inert.
+    ///
+    /// # Errors
+    /// As [`CatBoostBuilder::fit`], plus [`CatBoostError::FeatureMismatch`] when
+    /// the eval pool's float / categorical width disagrees with the learn pool's,
+    /// and any detector-construction or eval-metric failure.
+    pub fn fit_with_eval(&self, pool: &Pool, eval_pool: &Pool) -> Result<FitResult, CatBoostError> {
+        self.fit_inner(pool, &[eval_pool])
+    }
+
+    /// Train on `pool` with ZERO OR MORE held-out eval sets.
+    ///
+    /// `eval_pools[0]` is the PRIMARY set — the only one the overfitting detector
+    /// and the `use_best_model` tracker consume; the rest are evaluated and
+    /// logged into [`FitResult::eval_history`] only. Passing an empty slice is
+    /// exactly [`CatBoostBuilder::fit`].
+    ///
+    /// # Errors
+    /// As [`CatBoostBuilder::fit_with_eval`].
+    pub fn fit_with_eval_sets(
+        &self,
+        pool: &Pool,
+        eval_pools: &[&Pool],
+    ) -> Result<FitResult, CatBoostError> {
+        self.fit_inner(pool, eval_pools)
+    }
+
+    /// Whether `loss` defines a per-object CLASS, which is what the class-weight
+    /// controls need in order to mean anything.
+    fn loss_is_classification(loss: &Loss) -> bool {
+        matches!(
+            loss,
+            Loss::Logloss
+                | Loss::CrossEntropy
+                | Loss::Focal { .. }
+                | Loss::MultiClass
+                | Loss::MultiClassOneVsAll
+                | Loss::MultiLogloss
+                | Loss::MultiCrossEntropy
+        )
+    }
+
+    /// PARAM-03: resolve the effective per-object training weights from the
+    /// class-weight controls, or `None` when none is active (in which case the
+    /// caller passes the pool's own weights through UNCHANGED — the byte-identical
+    /// default path).
+    ///
+    /// The three controls all write the same per-object weight, so at most one may
+    /// be active; the conflict is an error rather than a precedence rule.
+    fn resolve_weights(&self, pool: &Pool) -> Result<Option<Vec<f64>>, CatBoostError> {
+        let explicit = !self.class_weights.is_empty();
+        let auto = self.auto_class_weights != AutoClassWeights::None;
+        // Compared against the default rather than "is it set", because the
+        // builder cannot distinguish an unset field from one explicitly set to
+        // the default — and `scale_pos_weight = 1.0` is a no-op either way.
+        let scaled = (self.scale_pos_weight - 1.0).abs() > f64::EPSILON;
+        let active = usize::from(explicit) + usize::from(auto) + usize::from(scaled);
+        if active == 0 {
+            return Ok(None);
+        }
+        if active > 1 {
+            return Err(CatBoostError::InvalidConfig(
+                "class_weights, auto_class_weights and scale_pos_weight all set the same \
+                 per-object weight; set at most one (combining them would silently discard \
+                 all but one)"
+                    .to_owned(),
+            ));
+        }
+        if !Self::loss_is_classification(&self.loss) {
+            return Err(CatBoostError::InvalidConfig(format!(
+                "the class-weight controls (class_weights / auto_class_weights / \
+                 scale_pos_weight) need a per-object CLASS, which loss {:?} does not define; \
+                 they apply to classification losses only",
+                self.loss
+            )));
+        }
+
+        // Derive each object's class index from its label. A classification label
+        // is an integer class id (0/1 for the binary losses), so a non-integral or
+        // negative label is a typed error rather than a silent `as usize` truncation
+        // that would bucket 0.7 and 0.2 into the same class.
+        let mut classes: Vec<usize> = Vec::with_capacity(pool.label().len());
+        for (i, &label) in pool.label().iter().enumerate() {
+            if !label.is_finite() || label < 0.0 || (label.fract()).abs() > f64::EPSILON {
+                return Err(CatBoostError::InvalidConfig(format!(
+                    "the class-weight controls require integer class labels, but label[{i}] \
+                     is {label}; for a probabilistic CrossEntropy target there is no class \
+                     to weight"
+                )));
+            }
+            classes.push(label as usize);
+        }
+
+        let observed = classes.iter().copied().max().map_or(0, |m| m + 1);
+        let (weights, class_count) = if explicit {
+            (
+                self.class_weights.iter().map(|&w| w as f32).collect(),
+                self.class_weights.len(),
+            )
+        } else if scaled {
+            (vec![1.0_f32, self.scale_pos_weight as f32], 2)
+        } else {
+            // Auto weights are DERIVED from the observed distribution, so the class
+            // count is whatever the labels span.
+            //
+            // `summary_class_weights` requires one item weight PER OBJECT, while an
+            // unweighted `Pool` carries an EMPTY weight vector (the all-ones
+            // convention `train` and `resolve_object_weights` both accept). Densify
+            // here rather than loosening the primitive: its length check is what
+            // catches a genuinely mismatched caller.
+            let dense: Vec<f64> = if pool.weights().is_empty() {
+                vec![1.0; classes.len()]
+            } else {
+                pool.weights().to_vec()
+            };
+            (
+                cb_data::auto_class_weights(self.auto_class_weights, &classes, &dense, observed)?,
+                observed,
+            )
+        };
+        if observed > class_count {
+            return Err(CatBoostError::InvalidConfig(format!(
+                "the labels span {observed} classes but only {class_count} class weight(s) \
+                 were given"
+            )));
+        }
+        Ok(Some(cb_data::resolve_object_weights(
+            &weights,
+            pool.weights(),
+            &classes,
+        )?))
+    }
+
+    /// PARAM-03: blank out each ignored feature's border set, leaving it with no
+    /// candidate split at any level while preserving every other feature's index.
+    fn apply_ignored_features(
+        &self,
+        borders: &mut [Vec<f64>],
+    ) -> Result<(), CatBoostError> {
+        // `width` is read BEFORE the loop so the error message can name it without
+        // borrowing `borders` immutably inside the `get_mut` closure (E0502).
+        let width = borders.len();
+        for &f in &self.ignored_features {
+            let slot = borders.get_mut(f).ok_or_else(|| {
+                CatBoostError::InvalidConfig(format!(
+                    "ignored_features index {f} is out of range for a pool with {width} float \
+                     feature(s)"
+                ))
+            })?;
+            slot.clear();
+        }
+        Ok(())
+    }
+
+    /// The single training implementation behind `fit` / `fit_with_eval` /
+    /// `fit_with_eval_sets`.
+    fn fit_inner(&self, pool: &Pool, eval_pools: &[&Pool]) -> Result<FitResult, CatBoostError> {
         // CB_GPU_PROF host-stage attribution (shares the device profiler's env gate; cold
         // when unset — the checks below never allocate or print).
         let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
@@ -350,7 +1019,7 @@ impl CatBoostBuilder {
         // specifically attributes to this stage). Each inner `par_iter`'s indexed
         // map preserves output order, so both results stay byte-identical to the
         // fully-serial form.
-        let (feature_values, feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
+        let (feature_values, mut feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
             || {
                 pool.float_features()
                     .par_iter()
@@ -364,12 +1033,71 @@ impl CatBoostBuilder {
                     .collect()
             },
         );
+        // PARAM-03: an ignored feature keeps its column and its index but loses
+        // its borders, so the candidate enumeration never proposes a split on it.
+        // Applied AFTER border selection (not before) so the borders of every
+        // OTHER feature are byte-identical to a run without the parameter.
+        self.apply_ignored_features(&mut feature_borders)?;
+        // PARAM-03: the effective training weights. `None` = no class-weight
+        // control is active, and the pool's own weights pass through unchanged.
+        let resolved_weights = self.resolve_weights(pool)?;
+        let weights: &[f64] = resolved_weights.as_deref().unwrap_or_else(|| pool.weights());
         if prof {
             eprintln!(
                 "CB_GPU_PROF fit-prep copy+borders elapsed={:.2}ms",
                 prof_t.elapsed().as_secs_f64() * 1e3,
             );
         }
+        // Narrow each eval pool to the SAME f32 storage type the learn columns use
+        // (the apply path binarizes f32 against the learn borders, so an eval set
+        // held at f64 would be scored against a different quantization than the
+        // learn set — the borders come from the LEARN pool only, never recomputed
+        // per eval set).
+        //
+        // The width check is EAGER and typed: `train_with_eval_sets` indexes the
+        // eval columns positionally, so a narrower eval pool would otherwise be a
+        // silent wrong-feature evaluation rather than an error.
+        let mut eval_values: Vec<Vec<Vec<f32>>> = Vec::with_capacity(eval_pools.len());
+        for (i, ep) in eval_pools.iter().enumerate() {
+            if ep.n_float_features() != pool.n_float_features() {
+                return Err(CatBoostError::FeatureMismatch(format!(
+                    "eval set {i} has {} float features, the learn pool has {}",
+                    ep.n_float_features(),
+                    pool.n_float_features()
+                )));
+            }
+            if ep.n_cat_features() != pool.n_cat_features() {
+                return Err(CatBoostError::FeatureMismatch(format!(
+                    "eval set {i} has {} categorical features, the learn pool has {}",
+                    ep.n_cat_features(),
+                    pool.n_cat_features()
+                )));
+            }
+            eval_values.push(
+                ep.float_features()
+                    .par_iter()
+                    .map(|col| col.iter().map(|&v| v as f32).collect())
+                    .collect(),
+            );
+        }
+        let eval_sets: Vec<EvalSet> = eval_values
+            .iter()
+            .zip(eval_pools.iter())
+            .map(|(values, ep)| EvalSet {
+                feature_values: values,
+                target: ep.label(),
+                cat_columns: ep.cat_features(),
+            })
+            .collect();
+        // Track the per-set metric curves ONLY when there is a set to track, so a
+        // plain `fit()` allocates nothing and passes the same `None` the engine's
+        // `train` does.
+        let mut history = if eval_sets.is_empty() {
+            None
+        } else {
+            Some(EvalMetricHistory::new(eval_sets.len()))
+        };
+
         let prof_train_t = std::time::Instant::now();
 
         let params = self.boost_params();
@@ -380,24 +1108,77 @@ impl CatBoostBuilder {
         let backend = CpuBackend;
         #[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
         let backend = GpuBackend::default();
-        let trained = train(
-            &backend,
-            &feature_values,
-            &feature_borders,
-            pool.label(),
-            pool.weights(),
-            &params,
-            None,
-        )?;
 
-        if prof {
-            eprintln!(
-                "CB_GPU_PROF fit-train elapsed={:.2}ms",
-                prof_train_t.elapsed().as_secs_f64() * 1e3,
-            );
-        }
-
-        let canonical = cb_model::Model::from_trained(&trained, feature_borders);
-        Ok(Model::from_canonical(canonical))
+        // F09 / SPEC-CATF-08: a pool that DECLARES categorical columns routes
+        // through `train_cat`, which returns the baked CTR tables alongside the
+        // model. Before this branch existed, `fit()` always called the float-only
+        // `train` and `pool.cat_features()` was never read, so every categorical
+        // column was SILENTLY DROPPED — the fit succeeded and produced a model
+        // that scored as though the column did not exist.
+        //
+        // The cat-free arm is left EXACTLY as it was (same `train` call, same
+        // arguments, same order), so a numeric pool is bit-identical to the
+        // pre-F09 result — the F21 no-regression gate.
+        let canonical = if pool.cat_features().is_empty() {
+            let trained = train_with_eval_sets(
+                &backend,
+                &feature_values,
+                &feature_borders,
+                pool.label(),
+                weights,
+                &params,
+                None,
+                &eval_sets,
+                history.as_mut(),
+            )?;
+            if prof {
+                eprintln!(
+                    "CB_GPU_PROF fit-train elapsed={:.2}ms",
+                    prof_train_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            cb_model::Model::from_trained(&trained, feature_borders)
+        } else {
+            let (trained, baked) = train_cat_with_eval_sets(
+                &backend,
+                &feature_values,
+                &feature_borders,
+                pool.cat_features(),
+                pool.label(),
+                weights,
+                &params,
+                None,
+                &eval_sets,
+                history.as_mut(),
+            )?;
+            if prof {
+                eprintln!(
+                    "CB_GPU_PROF fit-train-cat elapsed={:.2}ms",
+                    prof_train_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            let model = cb_model::Model::from_trained(&trained, feature_borders);
+            // A purely ONE-HOT-routed pool bakes no CTR table. Attaching an
+            // empty `CtrData` would make `ctr_data.is_some()` true for a model
+            // with no CTR split at all, which the predict-side
+            // `needs_cat_columns()` predicate reads as "this is a CTR model".
+            let model = if baked.tables.is_empty() {
+                model
+            } else {
+                model.with_ctr_data(cb_model::CtrData::from_baked(&baked))
+            };
+            // Δ4: record the pool's DECLARED cat width, so the predict-side
+            // width check never compares against a width derived from the
+            // splits the model happened to choose (PLAN-CHECK CRITICAL-3).
+            model.with_cat_feature_count(pool.n_cat_features())
+        };
+        Ok(FitResult {
+            model: Model::from_canonical(canonical),
+            eval_history: history.map(|h| h.per_set).unwrap_or_default(),
+        })
     }
 }
+
+#[cfg(test)]
+#[path = "builder_test.rs"]
+mod builder_test;

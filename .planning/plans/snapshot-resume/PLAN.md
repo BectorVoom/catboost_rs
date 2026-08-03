@@ -3,8 +3,10 @@ title: "ORCH-03 — Training snapshot / resume (slice 1) — TDD Implementation 
 phase: 20-orchestration
 slice: snapshot-resume
 plan_version: 1
-status: planned
-updated_at: 2026-07-19T00:00:00Z
+status: implemented
+updated_at: 2026-08-03T00:00:00Z
+result: ./IMPLEMENTATION-RESULT.md
+spike_findings: ./TASK-01-findings.md
 source_spec: .planning/plans/snapshot-resume/SPEC.md
 source_research: "Phase-20 three-gap research pass (snapshot/resume = highest-risk gap)"
 gsd_used: false

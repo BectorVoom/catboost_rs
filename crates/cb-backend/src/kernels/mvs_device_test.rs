@@ -125,11 +125,23 @@ fn mvs_lambda_iter0(derivatives: &[f64]) -> f64 {
     mean * mean
 }
 
+/// The per-block threshold-search target, `SampleRate * blockSize` — a VERBATIM MIRROR of
+/// `cb_train::bootstrap::mvs_block_sample_size`. Upstream's `SampleRate` is a `float`
+/// (`mvs.h:47`), so the product is an f32 one; `block_len <= MVS_BLOCK_SIZE = 8192 < 2^24`
+/// makes the f32 cast of the count exact.
+///
+/// Kept as a copy rather than an import because `cb-backend` must never depend on
+/// `cb-train`. That makes it a real hazard: the two can silently drift. The mirror test
+/// `cpu_reference_mirrors_cb_train_mvs_transcription` pins both to the same three values.
+fn cpu_block_sample_size(sample_rate: f64, block_len: usize) -> f64 {
+    f64::from((sample_rate as f32) * block_len as f32)
+}
+
 /// The per-block CPU MVS threshold for `derivatives[begin..end]` with the given `lambda` /
 /// f32-rounded `sample_rate` — used to assert the device reproduces the per-block threshold.
 fn cpu_block_threshold(block: &[f64], lambda: f64, sample_rate: f64) -> f64 {
     let mut candidates: Vec<f64> = block.iter().map(|&d| (lambda + d * d).sqrt()).collect();
-    calculate_threshold(&mut candidates, 0.0, 0.0, sample_rate * block.len() as f64)
+    calculate_threshold(&mut candidates, 0.0, 0.0, cpu_block_sample_size(sample_rate, block.len()))
 }
 
 /// `TMvsSampler::GenSampleWeights` (`mvs.cpp:120-224`, single-dimension) — the FROZEN CPU sample.
@@ -162,7 +174,9 @@ fn cpu_mvs_sample(
                 let weight = 1.0 / probability;
                 let r = block_rng.gen_rand_real1();
                 if let Some(slot) = weights.get_mut(idx) {
-                    *slot = weight * f64::from(r < probability);
+                    // MIRROR of cb_train: upstream stores into `TVector<float>
+                    // SampleWeights` (`fold.h:217`), so the value is f32-rounded.
+                    *slot = f64::from((weight * f64::from(r < probability)) as f32);
                 }
             } else if let Some(slot) = weights.get_mut(idx) {
                 *slot = 0.0;
@@ -297,4 +311,42 @@ fn mvs_multi_block_reseed_is_deterministic_and_finite() {
     // The second block (24 objects) must have been visited (weights present past the boundary).
     let tail_kept = a.get(MVS_BLOCK_SIZE..n).map_or(0, |t| t.iter().filter(|&&w| w > 0.0).count());
     println!("[mvs multiblock] n={n} tail_kept(block1)={tail_kept}/24");
+}
+
+/// `MVS-S6`: this file's inline CPU reference must stay a faithful mirror of
+/// `cb_train::bootstrap`'s MVS transcription.
+///
+/// The two are deliberately duplicated — `cb-backend` may never depend on `cb-train` —
+/// which makes silent drift a real hazard, and one that is normally invisible: the
+/// device oracles below only run on rocm/cuda, so a mirror break would pass the default
+/// CPU CI unnoticed. This test is therefore **NOT** gated on `device_backend_active()`;
+/// it is pure host `f64`/`f32` arithmetic and must run under the default `cpu` feature.
+///
+/// The three pinned values are byte-identical to
+/// `cb_train::bootstrap_test::mvs_f32_transcription_targets_and_weight_narrowing`,
+/// which is what makes the two transcriptions provably the same function. Note that 4 of
+/// the 5 call sites in this file are bit-identical under the f32 change — only
+/// `(0.3, 200)` moves — so a device-only criterion could be satisfied while the
+/// transcriptions disagree. Hence the direct pins.
+#[test]
+fn cpu_reference_mirrors_cb_train_mvs_transcription() {
+    // The block threshold target: upstream's `float * ui32`.
+    assert_eq!(cpu_block_sample_size(0.8, 1500), 1200.0);
+    assert_eq!(cpu_block_sample_size(0.8, 8192), 6553.600_097_656_25);
+    assert_eq!(cpu_block_sample_size(0.8, 3616), 2892.800_048_828_125);
+    // The one call-site shape that actually moves under the f32 change.
+    assert_eq!(cpu_block_sample_size(0.3, 200), 60.000_003_814_697_266);
+
+    // The stored weight is f32-representable, mirroring `TVector<float>`.
+    let n = 512;
+    let ders: Vec<f64> = (0..n).map(|i| (i as f64 % 13.0) - 6.0).collect();
+    let (_seed, weights) = cpu_mvs_sample(0, &ders, 0.25, 0.5);
+    assert!(weights.iter().any(|&w| w > 0.0), "sample must be non-degenerate");
+    for &w in &weights {
+        assert_eq!(
+            w,
+            f64::from(w as f32),
+            "mirrored MVS weights must be f32-representable (fold.h:217)"
+        );
+    }
 }

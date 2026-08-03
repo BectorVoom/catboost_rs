@@ -16,10 +16,34 @@
 //!
 //! Validation runs at `fit()` time (D-06), NOT in `__init__`, so the sklearn
 //! "no work in `__init__`" contract (08-05) holds.
+//!
+//! # KNOWN PARITY GAP — the CTR default is a single description, not a list
+//!
+//! Upstream's CPU default is a LIST of two CTR descriptions
+//! (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`, set by
+//! `SetCtrDefaults` at `catboost_options.cpp:439-453`; measured through
+//! `get_all_params()` as
+//! `['Borders:…:Prior=0/1:Prior=0.5/1:Prior=1/1', 'Counter:…:Prior=0/1']`).
+//!
+//! This crate models ONE CTR description with a prior LIST: the engine field is
+//! a scalar `ECtrType` plus a `Vec<f64>` of priors. The CTR **type** and the
+//! **full prior list** ARE honored (SPEC-CTRT-09/10/11) — but a simultaneous
+//! `[Borders, Counter]` configuration is NOT representable, so `simple_ctr` /
+//! `combinations_ctr` accept exactly one CTR description each (SPEC-CTRT-19).
+//!
+//! This is deliberate, not an oversight: `simple_ctr: ECtrType` is pinned at 62
+//! construction sites across the workspace and retyping it to a list has zero
+//! behavioral benefit to any of them. A user who passes more than one
+//! description is REJECTED with a `CatBoostParameterError` naming this gap —
+//! never silently narrowed to the first entry.
 
 use std::collections::BTreeMap;
 
-use catboost_rs::{CatBoostBuilder, EBootstrapType, EScoreFunction, LeafMethod, Loss};
+use catboost_rs::{
+    parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
+    EBootstrapType, ECtrType, EGrowPolicy, EOverfittingDetectorType, EScoreFunction, EvalMetric,
+    LeafMethod, Loss,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
@@ -54,6 +78,82 @@ const IMPLEMENTED: &[&str] = &[
     "score_function",
     "boost_from_average",
     "leaf_estimation_method",
+    // The six categorical / CTR params promoted by F15-F17. Each is now
+    // GENUINELY consumed: F01-F05 gave the builder its setter, F09 routes a
+    // categorical pool through `train_cat`, and E10/E11/E22 made the engine read
+    // the type, the full prior list and `counter_calc_method`. `cat_features` is
+    // a `fit()` kwarg rather than a builder setter (F17) but is IMPLEMENTED all
+    // the same, so it must not be rejected as a parity gap.
+    "cat_features",
+    "one_hot_max_size",
+    "max_ctr_complexity",
+    "simple_ctr",
+    "combinations_ctr",
+    "counter_calc_method",
+    // PARAM-02: promoted once `CatBoostBuilder` grew a setter for each (PARAM-01).
+    // Before that the engine implemented every one of these but `boost_params()`
+    // pinned it to a literal, so the honest status was KnownNotYet.
+    //
+    // The four EVAL-SET-ONLY params (`od_*`, `use_best_model`, `eval_metric`,
+    // plus the already-implemented `counter_calc_method`) are inert unless
+    // `fit(..., eval_set=...)` supplies a validation set. That is NOT a reason to
+    // reject them — upstream accepts them the same way — but it IS why
+    // `use_best_model` / `early_stopping_rounds` without an `eval_set` raise
+    // rather than silently doing nothing (see `validate_eval_set_only_params`).
+    "od_type",
+    "od_pval",
+    "od_wait",
+    "early_stopping_rounds",
+    "use_best_model",
+    "eval_metric",
+    "boosting_type",
+    "has_time",
+    "fold_len_multiplier",
+    "monotone_constraints",
+    "feature_weights",
+    "penalties_coefficient",
+    "first_feature_use_penalties",
+    "per_object_feature_penalties",
+    "grow_policy",
+    "max_leaves",
+    "min_data_in_leaf",
+    // PARAM-03: the class-weight family + ignored_features. The class-weight
+    // COMPUTATION already existed in `cb_data::weights` (oracle-gated against the
+    // frozen upstream `class_weights/` fixture); what PARAM-03 added is the path
+    // that APPLIES the resolved per-object weights during a fit.
+    "class_weights",
+    "auto_class_weights",
+    "scale_pos_weight",
+    "ignored_features",
+];
+
+/// The params that only DO something when `fit` is given an `eval_set`. Passing
+/// one without a validation set is REJECTED rather than silently ignored (threat
+/// T-08-05): a user who writes `use_best_model=True` and gets an untruncated
+/// model back has no way to notice the parameter did nothing.
+///
+/// `eval_metric` and `counter_calc_method` are deliberately NOT in this list.
+/// Both are also read on the learn-only path in upstream workflows (an
+/// `eval_metric` is meaningful metadata on the model, and `counter_calc_method`
+/// is a CTR-tally setting whose eval-set-only OBSERVABILITY is a property of the
+/// data, not a misuse), so rejecting them would break valid calls.
+const EVAL_SET_ONLY: &[&str] = &[
+    "od_type",
+    "od_pval",
+    "od_wait",
+    "early_stopping_rounds",
+    "use_best_model",
+];
+
+/// The four CTR types CatBoost implements ON CPU. `FloatTargetMeanValue` and
+/// `FeatureFreq` are GPU-only (`catboost_options.cpp:504-509`); upstream rejects
+/// them on CPU and so does this crate's engine (the E02 guard), so accepting
+/// them here would manufacture a kwarg that fails deeper with a worse message.
+const CPU_LEGAL_CTR_TYPES: &[&str] = &[
+    "Borders",
+    "Buckets",
+    "BinarizedTargetMeanValue",
+    "Counter",
 ];
 
 /// The full upstream `CatBoostClassifier.__init__` vocabulary (the AUTHORITATIVE
@@ -202,6 +302,11 @@ const ALIASES: &[(&str, &str)] = &[
     ("eta", "learning_rate"),
     ("max_bin", "border_count"),
     ("colsample_bylevel", "rsm"),
+    // PARAM-02: the two LightGBM-style leaf aliases. Both are real upstream
+    // kwargs (they are in VOCABULARY) and both now resolve onto an IMPLEMENTED
+    // canonical name.
+    ("num_leaves", "max_leaves"),
+    ("min_child_samples", "min_data_in_leaf"),
 ];
 
 /// Resolve an alias to its canonical name (identity if not an alias).
@@ -317,6 +422,34 @@ pub(crate) fn validate_params(params: &BTreeMap<String, Py<PyAny>>) -> PyResult<
     Ok(())
 }
 
+/// Reject the EVAL-SET-ONLY params when `fit` was called WITHOUT an `eval_set`
+/// (PARAM-02, threat T-08-05).
+///
+/// `od_type` / `od_wait` / `od_pval` / `early_stopping_rounds` / `use_best_model`
+/// all act on the per-iteration validation curve. With no eval set that curve
+/// does not exist, so the trainer runs to completion and returns the full model —
+/// a caller who asked for early stopping gets none, with nothing to notice. This
+/// is exactly the "silently ignored parameter" the honesty policy forbids, so it
+/// raises instead.
+///
+/// # Errors
+/// `CatBoostParameterError` naming the first eval-set-only param present.
+pub(crate) fn validate_eval_set_only_params(
+    params: &BTreeMap<String, Py<PyAny>>,
+) -> PyResult<()> {
+    for name in params.keys() {
+        let canonical = resolve_alias(name);
+        if EVAL_SET_ONLY.contains(&canonical) {
+            return Err(CatBoostParameterError::new_err(format!(
+                "parameter `{name}` only takes effect when `fit` is given an `eval_set`: it \
+                 acts on the per-iteration validation metric, which a learn-only fit never \
+                 computes. Pass `eval_set=(X_valid, y_valid)` (or a Pool), or drop `{name}`."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Read a stored param (alias-resolved at the call site) as `T` via `extract`.
 fn get<'py, T>(params: &'py BTreeMap<String, Py<PyAny>>, py: Python<'py>, name: &str) -> PyResult<Option<T>>
 where
@@ -396,6 +529,305 @@ fn parse_bootstrap_type(name: &str) -> PyResult<EBootstrapType> {
         "Poisson" => Ok(EBootstrapType::Poisson),
         other => Err(CatBoostParameterError::new_err(format!(
             "unknown bootstrap_type `{other}`"
+        ))),
+    }
+}
+
+/// Map a `counter_calc_method` string onto a [`CounterCalcMethod`] (F15).
+///
+/// **Observable only with an eval set.** Training on a learn set alone produces
+/// bit-identical models under either setting (measured max|diff| `0.000e+00`
+/// learn-only versus `4.010e-01` with an eval set — the E23 gate), so this is
+/// NOT a blanket parity control: it bites only through the eval-set training
+/// entrypoint.
+fn parse_counter_calc_method(name: &str) -> PyResult<CounterCalcMethod> {
+    match name {
+        "SkipTest" => Ok(CounterCalcMethod::SkipTest),
+        "Full" => Ok(CounterCalcMethod::Full),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown counter_calc_method `{other}`; expected SkipTest or Full"
+        ))),
+    }
+}
+
+/// Map a CTR-type name onto an [`ECtrType`], rejecting the two GPU-only types
+/// by name with upstream's own reasoning (`catboost_options.cpp:504-509`).
+fn parse_ctr_type(name: &str, param: &str) -> PyResult<ECtrType> {
+    match name {
+        "Borders" => Ok(ECtrType::Borders),
+        "Buckets" => Ok(ECtrType::Buckets),
+        "BinarizedTargetMeanValue" => Ok(ECtrType::BinarizedTargetMeanValue),
+        "Counter" => Ok(ECtrType::Counter),
+        "FloatTargetMeanValue" | "FeatureFreq" => Err(CatBoostParameterError::new_err(format!(
+            "`{param}` CTR type `{name}` is not implemented on CPU (it is GPU-only, \
+             catboost_options.cpp:504-509); supported CPU types are {}",
+            CPU_LEGAL_CTR_TYPES.join(", ")
+        ))),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown `{param}` CTR type `{other}`; supported CPU types are {}",
+            CPU_LEGAL_CTR_TYPES.join(", ")
+        ))),
+    }
+}
+
+/// Parse ONE CatBoost CTR description — `"<Type>[:Key=Value]..."` — into its
+/// `(type, prior numerators)` pair (F16 / SPEC-CATF-13).
+///
+/// Recognised keys: `Prior` (repeatable — one CTR column per prior). A prior is
+/// `<num>` or `<num>/<denom>`; upstream rejects `denom != 1` on CPU
+/// (`ctr_helper.cpp:50`), which is exactly what vindicates the engine's
+/// `prior_denom: 1.0` pin, so a non-unit denominator is rejected here rather
+/// than silently renormalized.
+///
+/// Any other key is REJECTED, never ignored: silently dropping a
+/// `CtrBorderCount=...` the engine does not read would train a
+/// differently-parameterized model than the user asked for.
+fn parse_ctr_description(desc: &str, param: &str) -> PyResult<(ECtrType, Vec<f64>)> {
+    let mut tokens = desc.split(':');
+    let type_name = tokens.next().unwrap_or("").trim();
+    let ctr_type = parse_ctr_type(type_name, param)?;
+
+    let mut priors: Vec<f64> = Vec::new();
+    for token in tokens {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (key, value) = token.split_once('=').ok_or_else(|| {
+            CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: malformed token `{token}` (expected Key=Value)"
+            ))
+        })?;
+        if !key.trim().eq_ignore_ascii_case("Prior") {
+            return Err(CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: key `{}` is not supported; this crate \
+                 reads only the CTR type and its Prior list",
+                key.trim()
+            )));
+        }
+        let value = value.trim();
+        let (num_str, denom) = match value.split_once('/') {
+            Some((n, d)) => {
+                let denom: f64 = d.trim().parse().map_err(|_| {
+                    CatBoostParameterError::new_err(format!(
+                        "`{param}` description `{desc}`: prior denominator `{d}` is not a number"
+                    ))
+                })?;
+                (n.trim(), denom)
+            }
+            None => (value, 1.0),
+        };
+        if (denom - 1.0).abs() > f64::EPSILON {
+            return Err(CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: a prior denominator other than 1 is \
+                 illegal on CPU (ctr_helper.cpp:50), got `{denom}`; write the prior as \
+                 `Prior=<numerator>` or `Prior=<numerator>/1`"
+            )));
+        }
+        let num: f64 = num_str.trim().parse().map_err(|_| {
+            CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: prior numerator `{num_str}` is not a number"
+            ))
+        })?;
+        priors.push(num);
+    }
+    Ok((ctr_type, priors))
+}
+
+/// Parse a `simple_ctr` / `combinations_ctr` kwarg — a LIST of CTR descriptions
+/// (upstream's shape) or a single bare string — into one `(type, priors)` pair.
+///
+/// `None` means "the list was empty", which only `combinations_ctr` gives a
+/// meaning to (see [`make_builder`]).
+///
+/// KNOWN PARITY GAP (SPEC-CTRT-19): upstream's CPU default is a LIST of two
+/// descriptions (`catboost_options.cpp:439-453`); this crate models ONE with a
+/// prior LIST. A multi-description list is therefore REJECTED with that gap
+/// named — never silently narrowed to its first entry, which would train a
+/// model the user did not ask for.
+fn parse_ctr_param(descs: &[String], param: &str) -> PyResult<Option<(ECtrType, Vec<f64>)>> {
+    match descs {
+        [] => Ok(None),
+        [one] => parse_ctr_description(one, param).map(Some),
+        many => Err(CatBoostParameterError::new_err(format!(
+            "`{param}` accepts exactly one CTR description, got {} ({many:?}). KNOWN \
+             PARITY GAP: upstream's CPU default is a LIST of two descriptions \
+             (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`, \
+             catboost_options.cpp:439-453), but this crate models ONE description \
+             with a prior LIST — the type and the full prior list ARE honored, a \
+             simultaneous [Borders, Counter] configuration is not representable. \
+             Passing several descriptions is rejected rather than narrowed to the \
+             first, which would silently train a different model.",
+            many.len()
+        ))),
+    }
+}
+
+/// Extract a `simple_ctr` / `combinations_ctr` kwarg as a list of descriptions,
+/// accepting either upstream's `list[str]` or a convenience bare `str`.
+fn extract_ctr_descriptions(
+    params: &BTreeMap<String, Py<PyAny>>,
+    py: Python<'_>,
+    name: &str,
+) -> PyResult<Option<Vec<String>>> {
+    let Some(obj) = params.get(name) else {
+        return Ok(None);
+    };
+    let bound = obj.bind(py);
+    if let Ok(one) = bound.extract::<String>() {
+        return Ok(Some(vec![one]));
+    }
+    bound.extract::<Vec<String>>().map(Some).map_err(|_| {
+        CatBoostParameterError::new_err(format!(
+            "`{name}` must be a list of CTR description strings (or a single string), \
+             e.g. [\"Borders:Prior=0:Prior=0.5\"]"
+        ))
+    })
+}
+
+/// Map an `od_type` string onto an [`EOverfittingDetectorType`] (PARAM-02).
+fn parse_od_type(name: &str) -> PyResult<EOverfittingDetectorType> {
+    match name {
+        "IncToDec" => Ok(EOverfittingDetectorType::IncToDec),
+        "Iter" => Ok(EOverfittingDetectorType::Iter),
+        // Not an upstream `od_type` value, but the engine implements the
+        // detector, so it is reachable here rather than silently absent.
+        "Wilcoxon" => Ok(EOverfittingDetectorType::Wilcoxon),
+        "None" => Ok(EOverfittingDetectorType::None),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown od_type `{other}`; expected IncToDec, Iter, Wilcoxon or None"
+        ))),
+    }
+}
+
+/// Map a `boosting_type` string onto an [`EBoostingType`] (PARAM-02).
+fn parse_boosting_type(name: &str) -> PyResult<EBoostingType> {
+    match name {
+        "Plain" => Ok(EBoostingType::Plain),
+        "Ordered" => Ok(EBoostingType::Ordered),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown boosting_type `{other}`; expected Plain or Ordered"
+        ))),
+    }
+}
+
+/// Map a `grow_policy` string onto an [`EGrowPolicy`] (PARAM-02).
+///
+/// `Region` is REJECTED here by name with its own reason rather than passed
+/// through to the engine's `validate_grow_policy`: the engine's rejection fires
+/// deep inside `fit`, after ingestion, with an internal-sounding message.
+fn parse_grow_policy(name: &str) -> PyResult<EGrowPolicy> {
+    match name {
+        "SymmetricTree" => Ok(EGrowPolicy::SymmetricTree),
+        "Lossguide" => Ok(EGrowPolicy::Lossguide),
+        "Depthwise" => Ok(EGrowPolicy::Depthwise),
+        "Region" => Err(CatBoostParameterError::new_err(
+            "grow_policy `Region` is not implemented in catboost-rs (parity gap); \
+             supported policies are SymmetricTree, Lossguide, Depthwise",
+        )),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown grow_policy `{other}`; expected SymmetricTree, Lossguide or Depthwise"
+        ))),
+    }
+}
+
+/// Map an `eval_metric` descriptor string onto an [`EvalMetric`] (PARAM-02),
+/// reusing the engine's own parser so the accepted vocabulary (including the
+/// parametric forms like `"Quantile:alpha=0.9"` and `"NDCG:top=5"`) cannot drift
+/// from what the trainer actually computes.
+fn parse_eval_metric(descr: &str) -> PyResult<EvalMetric> {
+    parse_metric(descr).map_err(|e| {
+        CatBoostParameterError::new_err(format!("eval_metric `{descr}` is not supported: {e}"))
+    })
+}
+
+/// Extract a `monotone_constraints` kwarg into the engine's per-float-feature
+/// `Vec<i8>` (PARAM-02).
+///
+/// Upstream accepts three shapes, all supported here:
+///  - a LIST / tuple of ints, one per feature: `[1, 0, -1]`;
+///  - a STRING of comma-separated ints, optionally parenthesised: `"(1,0,-1)"`;
+///  - a DICT keyed by feature INDEX: `{0: 1, 2: -1}` — expanded to a dense
+///    vector of `max(index) + 1` entries, unlisted features free (`0`).
+///
+/// A dict keyed by feature NAME is REJECTED: the engine indexes constraints
+/// positionally and a `Pool` built from NumPy carries no feature names, so
+/// resolving a name would require guessing. Silently dropping named entries
+/// would train an unconstrained model the caller believes is constrained.
+fn extract_monotone_constraints(
+    params: &BTreeMap<String, Py<PyAny>>,
+    py: Python<'_>,
+) -> PyResult<Option<Vec<i8>>> {
+    let Some(obj) = params.get("monotone_constraints") else {
+        return Ok(None);
+    };
+    let bound = obj.bind(py);
+
+    if let Ok(list) = bound.extract::<Vec<i64>>() {
+        return list.into_iter().map(to_constraint).collect::<PyResult<_>>().map(Some);
+    }
+    if let Ok(text) = bound.extract::<String>() {
+        let trimmed = text.trim().trim_start_matches(['(', '[']).trim_end_matches([')', ']']);
+        let mut out = Vec::new();
+        for token in trimmed.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let v: i64 = token.parse().map_err(|_| {
+                CatBoostParameterError::new_err(format!(
+                    "monotone_constraints `{text}`: `{token}` is not an integer"
+                ))
+            })?;
+            out.push(to_constraint(v)?);
+        }
+        return Ok(Some(out));
+    }
+    if let Ok(map) = bound.extract::<BTreeMap<usize, i64>>() {
+        let width = map.keys().copied().max().map_or(0, |m| m + 1);
+        let mut out = vec![0i8; width];
+        for (idx, v) in map {
+            // `idx < width` by construction (width is max(idx) + 1), so this
+            // never silently drops an entry.
+            if let Some(slot) = out.get_mut(idx) {
+                *slot = to_constraint(v)?;
+            }
+        }
+        return Ok(Some(out));
+    }
+    Err(CatBoostParameterError::new_err(
+        "monotone_constraints must be a list of -1/0/1 (one per float feature), a \
+         comma-separated string such as \"1,0,-1\", or a dict keyed by feature INDEX \
+         such as {0: 1, 2: -1}. A dict keyed by feature NAME is not supported: the \
+         engine applies constraints positionally and a Pool carries no feature names.",
+    ))
+}
+
+/// Narrow one monotone-constraint value to the `{-1, 0, 1}` the engine expects.
+fn to_constraint(v: i64) -> PyResult<i8> {
+    match v {
+        -1 => Ok(-1),
+        0 => Ok(0),
+        1 => Ok(1),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "monotone_constraints entry {other} is invalid; expected -1 (non-increasing), \
+             0 (free) or 1 (non-decreasing)"
+        ))),
+    }
+}
+
+/// Map an `auto_class_weights` string onto an [`AutoClassWeights`] (PARAM-03).
+///
+/// Upstream spells "off" as `None` (the Python literal `None`, i.e. the kwarg
+/// absent) — the string `"None"` is accepted too so an explicit round-trip
+/// through `get_params()` works.
+fn parse_auto_class_weights(name: &str) -> PyResult<AutoClassWeights> {
+    match name {
+        "None" => Ok(AutoClassWeights::None),
+        "Balanced" => Ok(AutoClassWeights::Balanced),
+        "SqrtBalanced" => Ok(AutoClassWeights::SqrtBalanced),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown auto_class_weights `{other}`; expected Balanced, SqrtBalanced or None"
         ))),
     }
 }
@@ -508,6 +940,174 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "leaf_estimation_method")? {
         builder = builder.leaf_method(parse_leaf_method(&v)?);
+    }
+
+    // ---- PARAM-02: the overfitting-detector / best-model surface ------------
+    //
+    // ORDER MATTERS. `early_stopping_rounds` is upstream shorthand for the PAIR
+    // (od_type=Iter, od_wait=rounds), so it is applied FIRST and an explicit
+    // `od_type` / `od_wait` alongside it is rejected outright (below) rather than
+    // resolved by precedence — either resolution silently discards one of two
+    // parameters the user explicitly set.
+    let has_early_stop = params.contains_key("early_stopping_rounds");
+    let has_explicit_od = params.contains_key("od_type") || params.contains_key("od_wait");
+    if has_early_stop && has_explicit_od {
+        return Err(CatBoostParameterError::new_err(
+            "`early_stopping_rounds` is shorthand for `od_type=\"Iter\"` + `od_wait=<rounds>`; \
+             passing it together with an explicit `od_type` / `od_wait` is ambiguous. Pass \
+             either the shorthand or the pair, not both.",
+        ));
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "early_stopping_rounds")? {
+        // >= 1: waiting zero non-improving rounds would stop at the first
+        // iteration that fails to improve, which upstream does not permit.
+        check_range("early_stopping_rounds", v as f64, 1.0, f64::INFINITY, true)?;
+        builder = builder.early_stopping_rounds(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "od_type")? {
+        builder = builder.od_type(parse_od_type(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "od_pval")? {
+        // A p-value threshold; 0 (the default) makes IncToDec/Wilcoxon inactive.
+        check_range("od_pval", v, 0.0, 1.0, true)?;
+        builder = builder.od_pval(v);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "od_wait")? {
+        builder = builder.od_wait(v);
+    }
+    if let Some(v) = get_with_aliases::<bool>(params, py, "use_best_model")? {
+        builder = builder.use_best_model(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "eval_metric")? {
+        builder = builder.eval_metric(parse_eval_metric(&v)?);
+    }
+
+    // ---- PARAM-02: the boosting-scheme controls ----------------------------
+    if let Some(v) = get_with_aliases::<String>(params, py, "boosting_type")? {
+        builder = builder.boosting_type(parse_boosting_type(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<bool>(params, py, "has_time")? {
+        builder = builder.has_time(v);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "fold_len_multiplier")? {
+        // Upstream requires fold_len_multiplier > 1 (a multiplier of 1 would never
+        // grow the tail, so the dynamic fold would not advance).
+        check_range("fold_len_multiplier", v, 1.0, f64::INFINITY, false)?;
+        builder = builder.fold_len_multiplier(v);
+    }
+
+    // ---- PARAM-02: the grow policy -----------------------------------------
+    if let Some(v) = get_with_aliases::<String>(params, py, "grow_policy")? {
+        builder = builder.grow_policy(parse_grow_policy(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "max_leaves")? {
+        // >= 2: a one-leaf "tree" is a constant, which the grower cannot produce.
+        check_range("max_leaves", v as f64, 2.0, 65536.0, true)?;
+        builder = builder.max_leaves(v);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "min_data_in_leaf")? {
+        builder = builder.min_data_in_leaf(v);
+    }
+
+    // ---- PARAM-02: the per-feature weighting / penalty surface -------------
+    if let Some(v) = get_with_aliases::<Vec<f64>>(params, py, "feature_weights")? {
+        builder = builder.feature_weights(v);
+    }
+    if let Some(v) = get_with_aliases::<Vec<f64>>(params, py, "first_feature_use_penalties")? {
+        builder = builder.first_feature_use_penalties(v);
+    }
+    if let Some(v) = get_with_aliases::<Vec<f64>>(params, py, "per_object_feature_penalties")? {
+        builder = builder.per_object_feature_penalties(v);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "penalties_coefficient")? {
+        check_range("penalties_coefficient", v, 0.0, f64::INFINITY, true)?;
+        builder = builder.penalties_coefficient(v);
+    }
+    if let Some(v) = extract_monotone_constraints(params, py)? {
+        builder = builder.monotone_constraints(v);
+    }
+
+    // ---- PARAM-03: the class-weight family + ignored_features --------------
+    //
+    // The three class-weight controls are NOT cross-validated here: the facade's
+    // `resolve_weights` already rejects the combination (and rejects a
+    // classification-only control on a regression loss) with a message naming the
+    // conflict, and duplicating that rule in two places is how the two copies
+    // drift apart. Only per-value validation lives here.
+    if let Some(v) = get_with_aliases::<Vec<f64>>(params, py, "class_weights")? {
+        for (i, w) in v.iter().enumerate() {
+            check_range(&format!("class_weights[{i}]"), *w, 0.0, f64::INFINITY, true)?;
+        }
+        builder = builder.class_weights(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "auto_class_weights")? {
+        builder = builder.auto_class_weights(parse_auto_class_weights(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "scale_pos_weight")? {
+        // > 0: a zero or negative positive-class weight would erase or invert the
+        // class's contribution rather than reweight it.
+        check_range("scale_pos_weight", v, 0.0, f64::INFINITY, false)?;
+        builder = builder.scale_pos_weight(v);
+    }
+    if let Some(v) = get_with_aliases::<Vec<usize>>(params, py, "ignored_features")? {
+        builder = builder.ignored_features(v);
+    }
+
+    // ---- F15/F16: the categorical / CTR surface -----------------------------
+    if let Some(v) = get_with_aliases::<u32>(params, py, "one_hot_max_size")? {
+        // Upstream default 2; the CPU upper bound is `OneHotMaxSizeLimit =
+        // GetMaxBinCount()` (cat_feature_options.cpp:232-233, 267-268).
+        check_range("one_hot_max_size", f64::from(v), 0.0, 65535.0, true)?;
+        builder = builder.one_hot_max_size(v);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "max_ctr_complexity")? {
+        // Upstream default 4; `CB_ENSURE(MaxTensorComplexity < GetMaxTreeDepth())`
+        // (cat_feature_options.cpp:231, 269-271) with GetMaxTreeDepth() == 16.
+        check_range("max_ctr_complexity", v as f64, 0.0, 15.0, true)?;
+        builder = builder.max_ctr_complexity(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "counter_calc_method")? {
+        builder = builder.counter_calc_method(parse_counter_calc_method(&v)?);
+    }
+    if let Some(descs) = extract_ctr_descriptions(params, py, "simple_ctr")? {
+        match parse_ctr_param(&descs, "simple_ctr")? {
+            Some((ctr_type, priors)) => {
+                builder = builder.simple_ctr(ctr_type);
+                if !priors.is_empty() {
+                    builder = builder.simple_ctr_priors(priors);
+                }
+            }
+            // `simple_ctr=[]` has NO in-engine meaning: simple CTRs cannot be
+            // switched off (unlike combination CTRs, which `max_ctr_complexity=1`
+            // suppresses). Reject rather than silently ignore the kwarg.
+            None => {
+                return Err(CatBoostParameterError::new_err(
+                    "`simple_ctr=[]` has no meaning: simple CTRs cannot be disabled. \
+                     Every high-cardinality categorical column is CTR-encoded; pass a \
+                     single description such as [\"Borders:Prior=0.5\"] instead.",
+                ))
+            }
+        }
+    }
+    if let Some(descs) = extract_ctr_descriptions(params, py, "combinations_ctr")? {
+        match parse_ctr_param(&descs, "combinations_ctr")? {
+            Some((ctr_type, priors)) => {
+                builder = builder.combinations_ctr(ctr_type);
+                if !priors.is_empty() {
+                    builder = builder.combinations_ctr_priors(priors);
+                }
+            }
+            // RECORDED MAPPING (F16, option (a)): the engine field is a scalar
+            // `ECtrType` with no "disabled" representation, and
+            // `max_ctr_complexity = 1` is the ONLY in-engine way to suppress
+            // combination CTRs. `combinations_ctr=[]` therefore maps to
+            // `max_ctr_complexity = 1`. Chosen over rejecting `[]` because the
+            // committed crates/cb-oracle/fixtures/plain_ctr/config.json uses
+            // exactly that form, so F19 requires it be expressible here.
+            // Asserted by `empty_combinations_ctr_maps_to_max_ctr_complexity_one`,
+            // which checks the value ACTUALLY moves rather than that fit() is quiet.
+            None => builder = builder.max_ctr_complexity(1),
+        }
     }
     Ok(builder)
 }

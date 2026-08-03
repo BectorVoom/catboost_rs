@@ -17,9 +17,9 @@ use cb_data::Pool;
 use cb_model::{
     apply_prediction_type, export_coreml, export_onnx, interaction, load_cbm, load_json,
     partial_dependence,
-    predict_raw, predict_raw_staged, prediction_values_change, prediction_values_change_with_data,
-    save_cbm, save_json, shap_values, sum_models, FeatureImportanceType, PartialDependence,
-    PredictionType,
+    predict_raw_cat, predict_raw_staged, prediction_values_change,
+    prediction_values_change_with_data, save_cbm, save_json, shap_values, sum_models,
+    FeatureImportanceType, ModelSplit, PartialDependence, PredictionType,
 };
 use cb_train::{parse_metric, EvalMetric};
 
@@ -106,6 +106,63 @@ impl Model {
             .collect())
     }
 
+    /// Whether this model can only be scored with the pool's raw categorical
+    /// columns in hand (F10 / SPEC-CATF-Δ7).
+    ///
+    /// TWO model shapes need them, and the second is easy to miss:
+    ///
+    /// * a **CTR** model (`ctr_data.is_some()`), whose CTR splits look values up
+    ///   in the baked tables by the document's combined categorical hash; and
+    /// * a **ONE-HOT** model, which has **no `ctr_data` at all** but carries
+    ///   [`ModelSplit::OneHot`] splits. Because `predict_raw(m, fv)` is defined
+    ///   as `predict_raw_cat(m, fv, &[])`, scoring one without cat columns makes
+    ///   `cat_values.get(i)` return `None`, so **every** one-hot split evaluates
+    ///   to `false` — plausible numbers, no error, entirely wrong.
+    ///
+    /// Named `needs_cat_columns` rather than `is_ctr_model` precisely so the
+    /// one-hot case cannot be forgotten again.
+    #[must_use]
+    fn needs_cat_columns(&self) -> bool {
+        if self.inner.ctr_data.is_some() {
+            return true;
+        }
+        self.inner
+            .oblivious_trees
+            .iter()
+            .flat_map(|t| t.splits.iter())
+            .any(|s| matches!(s, ModelSplit::OneHot(_)))
+    }
+
+    /// The pool's raw categorical columns, after checking its DECLARED
+    /// categorical width against the width recorded at fit time (F10 /
+    /// SPEC-CATF-10 / Δ4).
+    ///
+    /// The comparison is DECLARED width versus DECLARED width. It is deliberately
+    /// NOT `max(projection member) + 1`: a width derived from the splits the
+    /// model happened to choose is only a LOWER BOUND — a trailing cardinality-2
+    /// column routes to one-hot and never enters `eligible_absolute`, and an
+    /// uninformative column is never selected — so enforcing a derived width as
+    /// equality would reject the entirely legitimate
+    /// `fit(pool) -> predict(same pool)` (PLAN-CHECK CRITICAL-3).
+    ///
+    /// A float-only model needs no categorical columns and accepts any pool.
+    fn cat_columns<'a>(&self, pool: &'a Pool) -> Result<&'a [Vec<String>], CatBoostError> {
+        if !self.needs_cat_columns() {
+            return Ok(&[]);
+        }
+        let expected = self.inner.cat_feature_count();
+        let actual = pool.n_cat_features();
+        if actual != expected {
+            return Err(CatBoostError::FeatureMismatch(format!(
+                "pool has {actual} categorical feature(s), model expects {expected}; \
+                 this model scores categorical splits and cannot be applied without \
+                 the raw categorical columns (scoring it with none would silently \
+                 fail every categorical split)"
+            )));
+        }
+        Ok(pool.cat_features())
+    }
+
     /// Predict with an explicit [`PredictionType`] (the D-06 enum core).
     ///
     /// Returns the flattened (row-major) output: one value per object for
@@ -116,14 +173,21 @@ impl Model {
     ///
     /// # Errors
     /// [`CatBoostError::FeatureMismatch`] if `pool`'s float-feature count differs
-    /// from the model's.
+    /// from the model's, or — for a model with categorical splits — if its
+    /// DECLARED categorical width differs from the width recorded at fit time
+    /// (see [`Model::cat_columns`]).
     pub fn predict_with(
         &self,
         pool: &Pool,
         prediction_type: PredictionType,
     ) -> Result<Vec<f64>, CatBoostError> {
         let columns = self.feature_columns(pool)?;
-        let raw = predict_raw(&self.inner, &columns);
+        // F11: route through the CATEGORICAL apply entry. For a float-only model
+        // `cat_columns` yields `&[]`, and `predict_raw(m, fv)` is *defined* as
+        // `predict_raw_cat(m, fv, &[])` (`cb-model/src/apply.rs`), so the numeric
+        // path is byte-identical to the previous `predict_raw` call.
+        let cat_columns = self.cat_columns(pool)?;
+        let raw = predict_raw_cat(&self.inner, &columns, cat_columns);
         Ok(apply_prediction_type(prediction_type, &raw))
     }
 
@@ -164,6 +228,21 @@ impl Model {
         if inner.ctr_data.is_some() {
             return Err(CatBoostError::UnsupportedModel(
                 "staged_predict supports only float-only models; this model has CTR data"
+                    .to_owned(),
+            ));
+        }
+        // F11 / SPEC-CATF-Δ7 — the ONE-HOT arm. The CTR arm above does NOT cover
+        // it: a one-hot model has `ctr_data == None`, so before this check it
+        // passed the guard entirely, and `predict_raw_staged` is float-only and
+        // never reads categorical columns. The result was a one-hot model scored
+        // as though EVERY one-hot split failed — silent wrongness on a documented
+        // public API, the same class F10/F11 close for `predict_raw`. The
+        // pre-existing arms above are preserved unchanged; only this one is new.
+        if self.needs_cat_columns() {
+            return Err(CatBoostError::UnsupportedModel(
+                "staged_predict supports only float-only models; this model has one-hot \
+                 categorical splits, and the staged apply path never reads categorical \
+                 columns (every one-hot split would silently evaluate to false)"
                     .to_owned(),
             ));
         }
@@ -286,10 +365,13 @@ impl Model {
     ///
     /// # Errors
     /// [`CatBoostError::FeatureMismatch`] if `pool`'s float-feature count differs
-    /// from the model's.
+    /// from the model's; [`CatBoostError::ShapUnsupported`] if the model carries
+    /// one-hot or CTR splits (SPEC-OH-15 — SHAP is defined over float splits
+    /// only, and projecting a categorical level away would silently break the
+    /// local-accuracy invariant).
     pub fn shap_values(&self, pool: &Pool) -> Result<Vec<Vec<f64>>, CatBoostError> {
         let columns = self.feature_columns(pool)?;
-        Ok(shap_values(&self.inner, &columns, self.n_float_features()))
+        Ok(shap_values(&self.inner, &columns, self.n_float_features())?)
     }
 
     /// Compute a feature-importance vector / pairing for the requested
@@ -368,7 +450,12 @@ impl Model {
         match importance_type {
             FeatureImportanceType::PredictionValuesChange => {
                 let columns = self.feature_columns(pool)?;
-                let cat_columns = pool.cat_features().to_vec();
+                // F13 / SPEC-CATF-Δ7: this passed `pool.cat_features()` straight
+                // through with NO width check, so a pool whose categorical width
+                // disagreed with the model's produced silently-wrong importances
+                // (the leaf-statistics pass scores every document through the
+                // same categorical apply path `predict` uses).
+                let cat_columns = self.cat_columns(pool)?.to_vec();
                 Ok(
                     prediction_values_change_with_data(&self.inner, &columns, &cat_columns)
                         .into_iter()
@@ -396,7 +483,7 @@ impl Model {
                     pool.label(),
                     self.n_float_features(),
                     |approx, target| metric.eval(approx, target, &[]).unwrap_or(f64::NAN),
-                );
+                )?;
                 Ok(scores
                     .into_iter()
                     .enumerate()
@@ -426,6 +513,20 @@ impl Model {
         pool: &Pool,
         features: &[usize],
     ) -> Result<PartialDependence, CatBoostError> {
+        // F13 / SPEC-CATF-Δ7: PDP sweeps a FLOAT feature across its grid and
+        // averages `predict_raw`, which passes NO categorical columns. On a model
+        // with categorical splits every such split would silently evaluate to
+        // false for every swept point, so the whole surface would be an artifact
+        // of the failure rather than a partial dependence. Refuse instead.
+        if self.needs_cat_columns() {
+            return Err(CatBoostError::UnsupportedModel(
+                "partial_dependence supports only float-only models; this model has \
+                 categorical (CTR or one-hot) splits, and the PDP sweep scores through \
+                 the float-only apply path (every categorical split would silently \
+                 evaluate to false)"
+                    .to_owned(),
+            ));
+        }
         let columns = self.feature_columns(pool)?;
         Ok(partial_dependence(&self.inner, &columns, features)?)
     }

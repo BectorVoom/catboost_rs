@@ -20,6 +20,7 @@ use crate::predict_raw;
 /// baseline every disqualifying-condition test overrides one field of.
 fn empty_model() -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -253,4 +254,29 @@ fn flatten_rejects_unsupported() {
         leaf_weights: vec![1.0, 1.0],
     }];
     assert!(flatten_oblivious_f64(&model).is_err());
+}
+
+
+// ── SPEC-OH-17 — the guard names one-hot explicitly ─────────────────────────
+
+#[test]
+fn gpu_apply_guard_names_one_hot_splits_explicitly() {
+    let mut model = empty_model();
+    model.oblivious_trees.push(ObliviousTree {
+        splits: vec![ModelSplit::OneHot(crate::OneHotModelSplit {
+            cat_feature: 0,
+            value_hash: 1_296_865_003,
+        })],
+        leaf_values: vec![1.0, 2.0],
+        leaf_weights: vec![1.0, 1.0],
+    });
+    model.float_feature_borders = vec![vec![0.5]];
+    assert!(matches!(
+        check_gpu_apply_supported(&model),
+        Err(GpuApplyUnsupported::OneHotSplits)
+    ));
+    // …and the flattener inherits the SAME rejection (it calls the guard first),
+    // never the "unexpected one-hot split in a guard-passed model" fallback.
+    let flat = flatten_oblivious_f64(&model);
+    assert!(flat.is_err(), "the flattener must inherit the guard rejection");
 }

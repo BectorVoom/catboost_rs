@@ -186,7 +186,7 @@ fn gpu_backend_device_grow_lifecycle_covered() {
 
     let approx = vec![0.0_f64; n];
     let tree = backend
-        .grow_tree_on_device(&approx, &target)
+        .grow_tree_on_device(&approx, &target, &[])
         .expect("grow_tree_on_device must not error over an open session")
         .expect("an open session must grow a device tree (Ok(Some))");
     assert_eq!(tree.splits.len(), 1, "depth-1 device tree must have exactly one split");
@@ -197,7 +197,7 @@ fn gpu_backend_device_grow_lifecycle_covered() {
 
     // After end, the session is gone -> the grow seam falls back to Ok(None).
     let after = backend
-        .grow_tree_on_device(&approx, &target)
+        .grow_tree_on_device(&approx, &target, &[])
         .expect("grow after end must not error");
     assert!(after.is_none(), "after end_device_training the grow seam must return Ok(None)");
 }
@@ -225,7 +225,7 @@ fn gpu_backend_device_grow_uncovered_falls_back() {
 
     let approx = vec![0.0_f64; n];
     let tree = backend
-        .grow_tree_on_device(&approx, &target)
+        .grow_tree_on_device(&approx, &target, &[])
         .expect("grow must not error with no open session");
     assert!(tree.is_none(), "uncovered config must route through Ok(None) -> CPU fallback");
 

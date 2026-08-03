@@ -322,7 +322,12 @@ impl CtrData {
                     target_classes_count: t.target_classes_count,
                     hashes: t.hashes.clone(),
                     int_counts: t.int_counts.clone(),
-                    mean: Vec::new(),
+                    // E11 / SPEC-CTRT-13: carry the baked mean tables. This was
+                    // hard-coded `Vec::new()`, which silently discarded every
+                    // BinarizedTargetMeanValue / FloatTargetMeanValue table — the
+                    // apply path then saw an empty `mean` and produced the
+                    // not-found value for every bucket.
+                    mean: t.mean.clone(),
                     counter_denominator: t.counter_denominator,
                 },
             );
@@ -498,10 +503,14 @@ impl CtrValueTable {
 // `TargetClassesCount` for Borders/Buckets or forced `1` for Counter/
 // FeatureFreq, whose `TargetClassesCount` wire field is `0`), and
 // `CounterDenominator`. Every declared length is bounds-checked against the
-// remaining bytes BEFORE slicing (Security V5); mean-type CTRs
-// (`BinarizedTargetMeanValue`/`FloatTargetMeanValue`) are rejected (v1,
-// SPEC §2/MAJOR-2 — their `TCtrMeanHistory` byte layout is not empirically
-// dissected and no fixture exercises it).
+// remaining bytes BEFORE slicing (Security V5). Mean-type CTRs
+// (`BinarizedTargetMeanValue`/`FloatTargetMeanValue`, the `is_mean()` pair)
+// carry a DIFFERENT `CTRBlob` layout: upstream's `TCtrMeanHistory { float Sum;
+// int Count; }` (`online_ctr.h:380-401`) — an 8-byte stride of `f32 LE Sum` +
+// `i32 LE Count` per bucket, dissected empirically against the
+// upstream-produced `ctr_btmv_simple/model.cbm` fixture and decoded by
+// `decode_ctr_mean_blob` (E19 / SPEC-CTRT-15). A blob matching this repo's OWN
+// 12-byte self-format stride instead is REPORTED, never silently adopted.
 // ---------------------------------------------------------------------------
 
 /// Byte width of one `IndexHashRaw` dense-hash slot: `u64 hash LE` (8 bytes)
@@ -581,11 +590,6 @@ fn decode_one_ctr_value_table(
     // from `ctr_data_generated` (a SEPARATE self-contained schema module from
     // `model_generated`'s copy) — convert via `.0` (MINOR-1).
     let ctr_type = ECtrType::from_i8(base.CtrType().0)?;
-    if ctr_type.is_mean() {
-        return Err(ModelError::Deserialize(
-            "mean/target-mean CTR unsupported (v1, MAJOR-2)".to_owned(),
-        ));
-    }
 
     let combination = base.FeatureCombination().ok_or_else(|| {
         ModelError::Deserialize("TModelCtrBase missing FeatureCombination".to_owned())
@@ -607,6 +611,29 @@ fn decode_one_ctr_value_table(
     let bucket_count = hashes.len();
     let target_classes_count = usize::try_from(vt.TargetClassesCount())
         .map_err(|_| ModelError::Deserialize("negative TargetClassesCount".to_owned()))?;
+
+    // MEAN types (BinarizedTargetMeanValue / FloatTargetMeanValue — the
+    // `is_mean()` PAIR, deliberately not BTMV alone) carry one `TCtrMeanHistory
+    // { float Sum; int Count; }` per bucket (`online_ctr.h:380-401`) instead of
+    // per-class int counts — the width logic below does not apply to them at
+    // all (a mean table has one pair per bucket regardless of
+    // `TargetClassesCount`, which is 1 on the wire for BTMV).
+    if ctr_type.is_mean() {
+        let mean = decode_ctr_mean_blob(vt, bucket_count)?;
+        let counter_denominator = i64::from(vt.CounterDenominator());
+        return Ok((
+            key,
+            CtrValueTable {
+                ctr_type,
+                target_classes_count,
+                hashes,
+                int_counts: Vec::new(),
+                mean,
+                counter_denominator,
+            },
+        ));
+    }
+
     // Counter/FeatureFreq wire TargetClassesCount is 0 (a single bucket total,
     // not a per-class count); force width 1 so we never divide by zero
     // (MINOR-3).
@@ -634,6 +661,69 @@ fn decode_one_ctr_value_table(
             counter_denominator,
         },
     ))
+}
+
+/// Decode a MEAN-type `CTRBlob` into per-bucket `(Sum, Count)` pairs.
+///
+/// The accepted wire layout is upstream's `TCtrMeanHistory { float Sum; int
+/// Count; }` (`catboost/libs/model/online_ctr.h:380-401`): an 8-byte stride of
+/// `f32 LE Sum` + `i32 LE Count` per bucket — verified empirically against the
+/// upstream-produced `ctr_btmv_simple/model.cbm` fixture (E18/E19).
+///
+/// STRIDE-AMBIGUITY GUARD (SPEC-CTRT-15): this repo's OWN self-describing CTR
+/// format persists mean pairs at a 12-byte stride (`f32 LE Sum ; i64 LE
+/// Count`, see the format doc below in this file). If an input blob matches
+/// the 12-byte stride instead of 8, this decoder REPORTS rather than silently
+/// adopting it — a 12-byte upstream stride would invalidate SPEC-CTRT-14's
+/// stated layout and the encode side, and both must be re-specified before any
+/// such file is accepted. A blob matching neither stride is a typed error
+/// naming the length, the bucket count, and both candidate strides.
+fn decode_ctr_mean_blob(
+    vt: &TCtrValueTable<'_>,
+    bucket_count: usize,
+) -> Result<Vec<(f32, i64)>, ModelError> {
+    let blob: Vec<u8> = vt.CTRBlob().map(|v| v.iter().collect()).unwrap_or_default();
+
+    let matches_8 = blob.len().is_multiple_of(8) && blob.len() / 8 == bucket_count;
+    if !matches_8 {
+        let matches_12 = blob.len().is_multiple_of(12) && blob.len() / 12 == bucket_count;
+        if matches_12 {
+            return Err(ModelError::Deserialize(format!(
+                "mean CTRBlob length {} for {bucket_count} buckets matches the 12-byte \
+                 (f32 Sum ; i64 Count) stride, NOT the specified 8-byte upstream \
+                 TCtrMeanHistory layout — SPEC-CTRT-14's wire layout must be \
+                 re-specified before such a file can be accepted (STOP AND REPORT)",
+                blob.len()
+            )));
+        }
+        return Err(ModelError::Deserialize(format!(
+            "mean CTRBlob length {} does not match {bucket_count} buckets at either \
+             candidate stride (8 bytes: f32 Sum + i32 Count; 12 bytes: f32 Sum + i64 Count)",
+            blob.len()
+        )));
+    }
+
+    let mut mean: Vec<(f32, i64)> = Vec::with_capacity(bucket_count);
+    for b in 0..bucket_count {
+        let off = b.saturating_mul(8);
+        let sum_bytes: [u8; 4] = blob
+            .get(off..off.saturating_add(4))
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or_else(|| {
+                ModelError::Deserialize("mean CTRBlob Sum read out of range".to_owned())
+            })?;
+        let count_bytes: [u8; 4] = blob
+            .get(off.saturating_add(4)..off.saturating_add(8))
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or_else(|| {
+                ModelError::Deserialize("mean CTRBlob Count read out of range".to_owned())
+            })?;
+        mean.push((
+            f32::from_le_bytes(sum_bytes),
+            i64::from(i32::from_le_bytes(count_bytes)),
+        ));
+    }
+    Ok(mean)
 }
 
 /// Decode `IndexHashRaw` (a dense-hash byte blob: 12-byte `(u64 hash LE, u32
@@ -752,10 +842,13 @@ fn decode_ctr_blob(
 // projection cat-features are recovered from its key (`parse_ctr_base_key`),
 // `IndexHashRaw` is the minimal dense-hash form (one slot per bucket,
 // `blob_index == bucket position`, no empties) `decode_index_hash_raw` reads
-// back, and `CTRBlob` is the row-major LE `i32` array `decode_ctr_blob` reads.
-// Mean tables and marker-valued hashes are rejected (v1) — never a silent
-// mis-save. This is DISTINCT from the self-describing `encode_ctr_data` below
-// (cb-model's OWN round-trip format, never used for an upstream `.cbm`).
+// back. `CTRBlob` is the row-major LE `i32` array `decode_ctr_blob` reads for
+// the int-count types, and the 8-byte `f32 LE Sum` + `i32 LE Count` stride
+// `decode_ctr_mean_blob` reads for the mean pair (E20 / SPEC-CTRT-14 — the
+// same empirically-verified `TCtrMeanHistory` layout as the decode side).
+// Marker-valued hashes are rejected — never a silent mis-save. This is
+// DISTINCT from the self-describing `encode_ctr_data` below (cb-model's OWN
+// round-trip format, never used for an upstream `.cbm`).
 // ---------------------------------------------------------------------------
 
 /// Parse a canonical CTR-base key (`"ctr:type=<i8>:proj=<f0>,<f1>,…"`, the form
@@ -799,21 +892,17 @@ fn parse_ctr_base_key(key: &str) -> Result<(ECtrType, Vec<i32>), ModelError> {
 /// `(key, CtrValueTable)` — the inverse of [`decode_one_ctr_value_table`].
 ///
 /// # Errors
-/// [`ModelError::Serialize`] on a mean-type table (undissected `TCtrMeanHistory`
-/// layout, v1), a bucket hash equal to the empty-slot marker (would read back as
-/// an empty slot and corrupt `bucket_count`), a per-bucket count width that does
-/// not match `width = counter?1:target_classes_count`, or any count / index /
-/// count-field value that exceeds `i32`.
+/// [`ModelError::Serialize`] on a bucket hash equal to the empty-slot marker
+/// (would read back as an empty slot and corrupt `bucket_count`), a per-bucket
+/// count width that does not match `width = counter?1:target_classes_count`, a
+/// mean table whose pair count does not match its bucket count or whose
+/// `Count` exceeds `i32` (the wire stride stores `i32 LE`), or any count /
+/// index / count-field value that exceeds `i32`.
 fn build_tctr_value_table<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
     key: &str,
     table: &CtrValueTable,
 ) -> Result<WIPOffset<TCtrValueTable<'a>>, ModelError> {
-    if table.ctr_type.is_mean() {
-        return Err(ModelError::Serialize(
-            "mean/target-mean CTR unsupported on save (v1, MAJOR-2)".to_owned(),
-        ));
-    }
     // Recover the projection cat-features from the KEY; the encoded CtrType comes
     // from the table itself (they agree — the key was built from the same type).
     let (_key_type, cat_features) = parse_ctr_base_key(key)?;
@@ -837,27 +926,52 @@ fn build_tctr_value_table<'a>(
         index_hash_raw.extend_from_slice(&idx.to_le_bytes());
     }
 
-    // CTRBlob: row-major `bucket_count × width` LE i32 (width = counter?1:tcc),
-    // cross-checking each bucket's count width (the inverse of `decode_ctr_blob`).
-    let width = if table.ctr_type.is_counter() {
-        1
-    } else {
-        table.target_classes_count
-    };
-    let mut ctr_blob: Vec<u8> = Vec::with_capacity(
-        table.hashes.len().saturating_mul(width).saturating_mul(4),
-    );
-    for counts in &table.int_counts {
-        if counts.len() != width {
+    // CTRBlob. MEAN types (the `is_mean()` PAIR — BTMV and FloatTargetMeanValue,
+    // matching E19's decode branch exactly): the 8-byte `f32 LE Sum` + `i32 LE
+    // Count` stride per bucket (`TCtrMeanHistory`, SPEC-CTRT-14) — the width
+    // logic does not apply. Every other type: row-major `bucket_count × width`
+    // LE i32 (width = counter?1:tcc), cross-checking each bucket's count width
+    // (the inverse of `decode_ctr_blob`).
+    let mut ctr_blob: Vec<u8>;
+    if table.ctr_type.is_mean() {
+        if table.mean.len() != table.hashes.len() {
             return Err(ModelError::Serialize(format!(
-                "CTR bucket count width {} does not match expected width {width}",
-                counts.len()
+                "mean CTR table carries {} (Sum, Count) pairs for {} buckets",
+                table.mean.len(),
+                table.hashes.len()
             )));
         }
-        for &c in counts {
-            let v = i32::try_from(c)
-                .map_err(|_| ModelError::Serialize(format!("CTR count {c} exceeds i32 range")))?;
-            ctr_blob.extend_from_slice(&v.to_le_bytes());
+        ctr_blob = Vec::with_capacity(table.mean.len().saturating_mul(8));
+        for (b, &(sum, count)) in table.mean.iter().enumerate() {
+            let c = i32::try_from(count).map_err(|_| {
+                ModelError::Serialize(format!(
+                    "mean CTR Count {count} at bucket {b} exceeds the i32 wire range"
+                ))
+            })?;
+            ctr_blob.extend_from_slice(&sum.to_le_bytes());
+            ctr_blob.extend_from_slice(&c.to_le_bytes());
+        }
+    } else {
+        let width = if table.ctr_type.is_counter() {
+            1
+        } else {
+            table.target_classes_count
+        };
+        ctr_blob = Vec::with_capacity(
+            table.hashes.len().saturating_mul(width).saturating_mul(4),
+        );
+        for counts in &table.int_counts {
+            if counts.len() != width {
+                return Err(ModelError::Serialize(format!(
+                    "CTR bucket count width {} does not match expected width {width}",
+                    counts.len()
+                )));
+            }
+            for &c in counts {
+                let v = i32::try_from(c)
+                    .map_err(|_| ModelError::Serialize(format!("CTR count {c} exceeds i32 range")))?;
+                ctr_blob.extend_from_slice(&v.to_le_bytes());
+            }
         }
     }
 

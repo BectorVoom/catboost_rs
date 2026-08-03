@@ -52,7 +52,8 @@ use crate::gpu_runtime::{
     DerBinaryKernel, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
-    fold_weights_resident, launch_bootstrap_weights_resident, DeviceBootstrapKind,
+    create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
+    launch_poisson_bootstrap_resident, DeviceBootstrapKind, POISSON_SEEDS_SIZE,
 };
 use crate::kernels::mvs_device::launch_mvs_weights_resident;
 use crate::kernels::ctr_device::{
@@ -196,7 +197,17 @@ fn build_ctr_cindex_columns(
 struct BootstrapState {
     kind: DeviceBootstrapKind,
     /// The persistent continuous training stream (seeded once from `config.rng_seed`).
+    /// Bernoulli/Bayesian only — Poisson has no host stream (see [`Self::poisson_seeds`]).
     rng: TFastRng64,
+    /// The PERSISTENT per-thread Poisson seed buffer — `Some` iff `kind == Poisson`.
+    ///
+    /// Poisson is the one arm whose upstream definition is a GPU kernel rather than a CPU
+    /// sampler, and that kernel keeps its randomness in a device-resident seed buffer that
+    /// each thread advances in place and writes back (`bootstrap.cu:16`). Holding it for the
+    /// whole fit reproduces upstream's `TGpuAwareRandom` seed buffer, which is likewise
+    /// created once and mutated by every tree. There is no host-side stream to advance, so
+    /// `rng` is unused on this arm.
+    poisson_seeds: Option<Handle>,
     /// Bernoulli/Poisson subsample rate (`config.sample_rate`).
     sample_rate: f64,
     /// Bayesian bagging temperature — the catboost default `1.0` (config carries no field yet;
@@ -628,6 +639,75 @@ fn host_der1(der_kernel: DerBinaryKernel, approx: &[f64], target: &[f64]) -> Vec
         .collect()
 }
 
+/// The fixed-point histogram's accumulated-magnitude ceiling, `2^33` (WR-01 `WR01-S10`,
+/// finding F-D). The split histogram stores `round(Σ · 2^30)` as `i64` bits inside an
+/// `Atomic<u64>`, so the integer sum is exact only while `|Σ| · 2^30 < 2^63`, i.e.
+/// `|Σ| < 2^33 ≈ 8.6e9`. Beyond it the wrapping add SILENTLY sign-flips — no error, no
+/// saturation (`kernels.rs` `REDUCE_FIXEDPOINT_SCALE_F64` doc). There is no in-kernel guard
+/// (a `#[cube]` kernel cannot surface a typed error), so the check has to happen host-side.
+const FIXEDPOINT_SUM_CEILING: f64 = 8_589_934_592.0; // 2^33
+
+/// Reject a host bootstrap `sample` that would overflow the split histogram's fixed-point
+/// encode, BEFORE anything is uploaded or launched (WR-01 `WR01-S10`).
+///
+/// Two channels are checked with the conservative all-objects-in-one-bin bound
+/// `n · max|channel|`: the derivative channel `der1·s` and the weight channel `w·s`. The
+/// weight channel is the one that actually matters — MVS's `s = 1/prob` makes
+/// `w·s = threshold / sqrt(λ + der²)` unbounded as `λ → 0`, whereas the der channel is
+/// self-bounding (`|der·s| ≤ threshold`) and Bernoulli's `s ∈ {0,1}` is non-increasing.
+/// `w ≡ 1` in the WR-01 eligible regime (the gate requires unit weights), so the weight
+/// channel bound reduces to `n · max s`.
+///
+/// A non-finite or negative `s[i]` is also rejected: `NaN` would poison the whole
+/// histogram bin and a negative multiplier has no upstream meaning (`sample_weights` are
+/// magnitudes and `control` only ever zeroes them).
+///
+/// Returns [`CbError::OutOfRange`] naming the channel, the computed bound and the limit.
+/// This is deliberately an ERROR rather than a CPU fallback: the fit already committed to
+/// the device path (D-10-01 per-fit all-or-nothing), so falling back mid-run would mix
+/// device- and CPU-grown trees into one model.
+fn guard_sample_fixedpoint_range(sample: &[f64], der1: &[f64], n: usize) -> CbResult<()> {
+    let mut max_s = 0.0_f64;
+    let mut max_der_s = 0.0_f64;
+    for (i, &s) in sample.iter().enumerate() {
+        if !s.is_finite() || s < 0.0 {
+            return Err(CbError::OutOfRange(format!(
+                "host bootstrap sample[{i}] = {s} is not a finite non-negative multiplier; \
+                 a NaN/inf would poison every histogram bin it lands in and a negative \
+                 multiplier has no upstream meaning (WR01-S10)"
+            )));
+        }
+        if s > max_s {
+            max_s = s;
+        }
+        let d = der1.get(i).copied().unwrap_or(0.0).abs() * s;
+        if d > max_der_s {
+            max_der_s = d;
+        }
+    }
+    let nf = n as f64;
+    // Weight channel: `w · s` with `w ≡ 1` in the eligible regime.
+    if nf * max_s >= FIXEDPOINT_SUM_CEILING {
+        return Err(CbError::OutOfRange(format!(
+            "host bootstrap sample would overflow the fixed-point split histogram on the \
+             WEIGHT channel: n * max(w*s) = {n} * {max_s} = {} >= 2^33 = {FIXEDPOINT_SUM_CEILING} \
+             (the Atomic<u64> k=30 accumulator silently sign-flips beyond this; WR01-S10)",
+            nf * max_s,
+        )));
+    }
+    // Derivative channel: `der1 · s`.
+    if nf * max_der_s >= FIXEDPOINT_SUM_CEILING {
+        return Err(CbError::OutOfRange(format!(
+            "host bootstrap sample would overflow the fixed-point split histogram on the \
+             DERIVATIVE channel: n * max|der1*s| = {n} * {max_der_s} = {} >= 2^33 = \
+             {FIXEDPOINT_SUM_CEILING} (the Atomic<u64> k=30 accumulator silently sign-flips \
+             beyond this; WR01-S10)",
+            nf * max_der_s,
+        )));
+    }
+    Ok(())
+}
+
 /// The per-fit device-resident training session (GPUT-02): one client + the persistent
 /// device handles + the frozen per-fit configuration. Constructed by [`Self::begin`] only
 /// when the coverage gate passes; dropped (client + handles freed) at end of fit.
@@ -677,6 +757,15 @@ pub struct GpuTrainSession {
     /// `n_bins`.
     n_bins_line: usize,
     n_features: usize,
+    /// SPEC-OH-22/24: the float/one-hot boundary of the CONCATENATED device feature axis.
+    /// The resident oblivious grow derives its two scorer pass windows from it —
+    /// `[0, n_float)` threshold, `[n_float, n_features)` equality. Equal to `n_features`
+    /// on a float-only fit, which makes pass B empty and the scorer byte-unchanged.
+    n_float: usize,
+    /// SPEC-OH-22: the per-device-feature REAL cardinality, length `n_features`, sized
+    /// against the CTR-widened `eff_n_features`. NOT `TCFeature.folds` (the padded line
+    /// width) — see the `DeviceTrainConfig::real_folds` doc.
+    real_folds: Vec<u32>,
     depth: usize,
     scaled_l2: f64,
     score_fn: u32,
@@ -1018,7 +1107,20 @@ impl GpuTrainSession {
         // draw family for Bernoulli/Bayesian/Poisson (flipped ON this plan), the covered non-draw
         // default for `No`, or a decline for MVS (Plan 07). Only reachable on the oblivious path
         // (the nonsym `family_default` below still requires `bootstrap_type == No`).
-        let bootstrap_arm = map_bootstrap_kernel(config.bootstrap_type);
+        // WR-01 (`WR01-S5`, `[DECISION D4]`): host sampling and device-resident sampling are
+        // MUTUALLY EXCLUSIVE. When the caller declares `sample_from_host`, the per-tree sample
+        // arrives through `grow_one`'s `sample` argument and this session must NOT open its own
+        // `BootstrapState` / `MvsState` — otherwise the tree would be sampled TWICE (once by the
+        // host multiplier, once by the device draw). Forcing the arm to `NoDraw` here is what
+        // makes that structurally impossible: every downstream construction of the resident
+        // sampler states below keys off `bootstrap_arm`, so a single decision point covers them
+        // all. `config.bootstrap_type` is still carried, but purely as bookkeeping describing
+        // WHICH host sampler ran.
+        let bootstrap_arm = if config.sample_from_host {
+            BootstrapArm::NoDraw
+        } else {
+            map_bootstrap_kernel(config.bootstrap_type)
+        };
 
         match nonsym_policy {
             None if region_active => {
@@ -1030,7 +1132,12 @@ impl GpuTrainSession {
                     && config.mvs_lambda.is_none()
                     && !config.exact_leaf
                     && config.ctr.is_none()
-                    && config.max_leaves.is_none();
+                    && config.max_leaves.is_none()
+                    // WR-01: Region × sampling is OUT of scope (SPEC §2). Without this the
+                    // Region arm would accept `sample_from_host` + `bootstrap_type == No` and
+                    // then DROP the sample (the Region grow path ignores it) — a silent
+                    // wrong-answer. Decline to the CPU grower instead.
+                    && !config.sample_from_host;
                 if !family_default {
                     return Ok(None);
                 }
@@ -1080,12 +1187,35 @@ impl GpuTrainSession {
                     && matches!(bootstrap_arm, BootstrapArm::NoDraw)
                     && !config.exact_leaf
                     && config.mvs_lambda.is_none()
+                    && config.max_leaves.is_none()
+                    // WR-01: CTR × host-sampling is OUT of scope (SPEC §2). Excluded here so a
+                    // host sample can never be silently applied to a CTR fit — `bootstrap_arm`
+                    // is forced to `NoDraw` under host sampling, which would otherwise let such
+                    // a config ride the CTR arm.
+                    && !config.sample_from_host;
+                // WR-01 (`WR01-S9`): the HOST-SAMPLED oblivious regime. Covered when the caller
+                // declares `sample_from_host` for one of the three parity-target bootstrap types
+                // and every OTHER family flag is the covered default. `mvs_lambda` is deliberately
+                // NOT required (and NOT forbidden): under host sampling λ lives on the host inside
+                // `cb_train::bootstrap`, so the device-side field is inert bookkeeping.
+                // Poisson is absent BY DESIGN — it has no CPU-semantics parity target and is
+                // rejected up front on every backend (SPEC §8 / `WR01-S16`).
+                let host_sample_covered = config.sample_from_host
+                    && matches!(
+                        config.bootstrap_type,
+                        DeviceBootstrapType::Bayesian
+                            | DeviceBootstrapType::Bernoulli
+                            | DeviceBootstrapType::Mvs
+                    )
+                    && !config.exact_leaf
+                    && config.ctr.is_none()
                     && config.max_leaves.is_none();
                 if !config.is_covered_regime()
                     && !exact_covered
                     && !bootstrap_covered
                     && !ctr_is_covered
                     && !mvs_covered
+                    && !host_sample_covered
                 {
                     return Ok(None);
                 }
@@ -1098,7 +1228,11 @@ impl GpuTrainSession {
                 let family_default = config.bootstrap_type == DeviceBootstrapType::No
                     && config.mvs_lambda.is_none()
                     && !config.exact_leaf
-                    && config.ctr.is_none();
+                    && config.ctr.is_none()
+                    // WR-01: non-symmetric (Depthwise / Lossguide) × sampling is OUT of scope
+                    // (SPEC §2). Same silent-drop hazard as the Region arm above — the nonsym
+                    // grow path ignores the sample, so decline rather than grow unsampled.
+                    && !config.sample_from_host;
                 if !family_default {
                     return Ok(None);
                 }
@@ -1205,7 +1339,11 @@ impl GpuTrainSession {
             && bootstrap_arm == BootstrapArm::NoDraw
             && !config.exact_leaf
             && config.mvs_lambda.is_none()
-            && config.max_leaves.is_none();
+            && config.max_leaves.is_none()
+            // WR-01: mirrors the gate's CTR arm — host sampling forces `bootstrap_arm` to
+            // `NoDraw`, so without this the augmented-CTR bins would be built for a config the
+            // gate already declined. Keep the two conditions in lockstep.
+            && !config.sample_from_host;
         // Round-3 perf: the non-CTR path BORROWS the caller's bins (no n*n_features-cell
         // copy on the hot begin path); only the CTR arm materializes an augmented owned
         // buffer. `Cow` keeps both arms feeding the SAME pack below.
@@ -1232,8 +1370,43 @@ impl GpuTrainSession {
         // real bin value (`< n_bins <= n_bins_line`) losslessly, and the resident fill /
         // scorer address cells by the SAME padded width.
         let n_buckets_per_feature = vec![n_bins_line; eff_n_features];
-        let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, n)?;
-        let (offsets_v, shifts_v, masks_v) = packed.device_arrays()?;
+        // SPEC-OH-21/22 (T24/T27b): the one-hot channel, sized against the CTR-widened
+        // `eff_n_features`.
+        //
+        //  * `one_hot_flags` is a pure descriptor annotation — it does not change the
+        //    packed words, so a float-only fit is byte-unchanged.
+        //  * `real_folds` is the per-feature REAL cardinality bound. A CTR column (present
+        //    only when `ctr_is_covered` widened the axis) is padded with `n_bins_line`,
+        //    which is inert because a CTR column is never one-hot and the scorer reads this
+        //    array only on the one-hot arm.
+        //
+        // Both lengths are asserted UNCONDITIONALLY: with the trainer always calling the
+        // one-hot quantizer, `real_folds` is populated on every device-eligible fit
+        // including float-only, so a short array is a genuine wiring bug — never a
+        // tolerable "no one-hot columns" shortcut, which is exactly the silently-inert
+        // bound this design exists to eliminate.
+        let mut one_hot_flags = config.one_hot_flags.clone();
+        let mut real_folds = config.real_folds.clone();
+        one_hot_flags.resize(eff_n_features, false);
+        if real_folds.len() < eff_n_features {
+            real_folds.resize(eff_n_features, n_bins_line as u32);
+        }
+        if real_folds.len() != eff_n_features || one_hot_flags.len() != eff_n_features {
+            return Err(CbError::LengthMismatch {
+                column: "device one-hot channel".to_owned(),
+                expected: eff_n_features,
+                actual: real_folds.len().max(one_hot_flags.len()),
+            });
+        }
+        let n_float = if config.has_one_hot() {
+            config.n_float
+        } else {
+            // Float-only (or an all-`false` flag set): the whole axis is pass A, so pass B
+            // is empty and the scorer collapses to today's single launch.
+            eff_n_features
+        };
+        let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, &one_hot_flags, n)?;
+        let (offsets_v, shifts_v, masks_v, _one_hot_flags_v) = packed.device_arrays()?;
         let num_words = packed.words.len();
 
         // Host copies of the per-feature packed addressing (offset/shift/mask): the
@@ -1299,10 +1472,22 @@ impl GpuTrainSession {
         // Phase 12 Plan 06: capture the bootstrap state (oblivious path only; nonsym requires
         // `bootstrap_type == No`). Seed the CONTINUOUS training stream ONCE from `config.rng_seed`;
         // `grow_one` snapshots its O(1) base per tree and draws the device-resident sample.
+        // Poisson additionally allocates its PERSISTENT per-thread device seed buffer here (once
+        // per fit, exactly like upstream's `TGpuAwareRandom::GetGpuSeeds`), because its upstream
+        // definition is a GPU kernel with device-resident state rather than a CPU sampler with a
+        // host stream.
         let bootstrap = match bootstrap_arm {
             BootstrapArm::Device(kind) if nonsym_policy.is_none() => Some(BootstrapState {
                 kind,
                 rng: TFastRng64::from_seed(config.rng_seed),
+                poisson_seeds: match kind {
+                    DeviceBootstrapKind::Poisson => Some(create_poisson_seeds(
+                        &client,
+                        config.rng_seed,
+                        POISSON_SEEDS_SIZE,
+                    )),
+                    _ => None,
+                },
                 sample_rate: f64::from(config.sample_rate),
                 bagging_temperature: 1.0,
             }),
@@ -1342,6 +1527,8 @@ impl GpuTrainSession {
             n_bins,
             n_bins_line,
             n_features: eff_n_features,
+            n_float,
+            real_folds,
             depth,
             scaled_l2,
             score_fn,
@@ -1395,6 +1582,33 @@ impl GpuTrainSession {
         self.n_features
     }
 
+    /// SPEC-OH-22/24 observation point: the frozen one-hot channel as the resident scorer
+    /// will actually see it — `(one_hot_flags, real_folds, n_float, feature_lo,
+    /// feature_hi)` where the last two are pass B's window.
+    ///
+    /// This exists so a seam-level test can assert the values are RIGHT, not merely
+    /// present. The load-bearing case is a low-cardinality column: `real_folds[c]` must be
+    /// the column's true cardinality (e.g. `2`), NOT the padded `n_bins_line` (e.g. `32`)
+    /// that `TCFeature.folds` would have supplied. Catching that here localizes the bug at
+    /// the seam instead of surfacing it as an unattributable ≤1e-5 device-vs-CPU gap.
+    ///
+    /// `pub(crate)` — reachable from the `gpu_runtime` sibling tests, no public surface.
+    /// Its only consumer is `#[cfg(test)]`, so the lib target sees it as unread.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn one_hot_channel(&self) -> (Vec<bool>, Vec<u32>, usize, usize, usize) {
+        let flags = (0..self.n_features)
+            .map(|f| f >= self.n_float)
+            .collect::<Vec<bool>>();
+        (
+            flags,
+            self.real_folds.clone(),
+            self.n_float,
+            self.n_float,
+            self.n_features,
+        )
+    }
+
     /// Grow ONE tree over the resident state, advancing the device-resident boosting: it
     /// recomputes the residual `der1` from the resident approx device-side (no read-back),
     /// grows a depth-1 oblivious tree over the resident matrix (uploaded once at `begin`),
@@ -1407,13 +1621,47 @@ impl GpuTrainSession {
     /// a prior call surfaces a typed [`CbError`]. The resident approx is authoritative for the
     /// device pass (in the covered Plain/fold=1/from-zero regime it tracks the caller's approx
     /// exactly). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
-    pub fn grow_one(&mut self, approx: &[f64], target: &[f64]) -> CbResult<DeviceGrownTree> {
+    pub fn grow_one(
+        &mut self,
+        approx: &[f64],
+        target: &[f64],
+        sample: &[f64],
+    ) -> CbResult<DeviceGrownTree> {
         if target.len() != self.n {
             return Err(CbError::LengthMismatch {
                 column: "target".to_owned(),
                 expected: self.n,
                 actual: target.len(),
             });
+        }
+
+        // WR-01 (`WR01-S4`/`WR01-S5`): validate the host sample BEFORE any launch. The two
+        // sampling mechanisms are mutually exclusive and the length is checked, never
+        // truncated — a short `sample` would silently leave the tail of the pool unsampled,
+        // which is precisely the class of wrong-answer this phase must not ship.
+        if !sample.is_empty() {
+            if !self.config.sample_from_host {
+                return Err(CbError::Degenerate(format!(
+                    "grow_one received a {}-element host bootstrap sample but the session was \
+                     opened with sample_from_host = false; host sampling and device-resident \
+                     sampling are mutually exclusive (WR01-S5)",
+                    sample.len(),
+                )));
+            }
+            if sample.len() != self.n {
+                return Err(CbError::LengthMismatch {
+                    column: "sample".to_owned(),
+                    expected: self.n,
+                    actual: sample.len(),
+                });
+            }
+        } else if self.config.sample_from_host {
+            return Err(CbError::Degenerate(
+                "grow_one received an EMPTY host bootstrap sample but the session was opened \
+                 with sample_from_host = true; the host must supply an n-length per-object \
+                 multiplier for every tree (WR01-S4)"
+                    .to_owned(),
+            ));
         }
 
         // Phase 12 Plan 04 (GPUT-18, D-03a): the REGION arm. The fit committed to a
@@ -1551,31 +1799,38 @@ impl GpuTrainSession {
         // The RNG/client borrows are scoped so the O(1) stream advance (mutable `self.bootstrap`)
         // completes before the launch reads `self.client`.
         let mut bootstrap_params: Option<(DeviceBootstrapKind, [u64; 4], u64, f64, f64)> = None;
+        let mut poisson_params: Option<(Handle, f64)> = None;
         if let Some(bs) = self.bootstrap.as_mut() {
-            let base = bs.rng.raw_state();
-            // Bayesian consumes ONE main-stream draw for `rand_seed`; the per-block streams branch
-            // off it. Bernoulli/Poisson draw sequentially from the base (advanced by `n` below).
-            let rand_seed = match bs.kind {
-                DeviceBootstrapKind::Bayesian => bs.rng.gen_rand(),
-                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => 0,
-            };
-            bootstrap_params =
-                Some((bs.kind, base, rand_seed, bs.sample_rate, bs.bagging_temperature));
-            // Advance the continuous stream to the next tree's phase (Bernoulli/Poisson consume one
-            // `gen_rand` per object; Bayesian already advanced by the single `rand_seed` draw).
             match bs.kind {
-                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Poisson => {
-                    // IN-02: Bernoulli consumes exactly one `gen_rand` per object, so the
-                    // `n`-draw advance is draw-faithful. Poisson (Knuth) consumes a VARIABLE
-                    // number of draws per object, so this advance is a deterministic-but-
-                    // arbitrary phase, NOT aligned to the draws actually consumed. That is
-                    // fine under the current scope (Poisson is validated for determinism
-                    // only — same seed ⇒ same weights — and has no CPU oracle). If a Poisson
-                    // parity oracle is ever added, make the kernel emit its consumed-draw
-                    // count (or advance the stream on-device) so this matches consumption.
-                    bs.rng.advance(self.n as u64)
+                // Poisson: no host stream at all. Upstream's kernel advances a PERSISTENT
+                // per-thread device seed buffer and writes it back, so the cross-tree phase is
+                // carried on the device — which is also what makes it draw-faithful. (The old
+                // host `advance(n)` here was a deterministic-but-arbitrary phase: Poisson
+                // consumes a VARIABLE number of draws per object, so no host counter can track
+                // it. That approximation is gone with the stream it approximated.)
+                DeviceBootstrapKind::Poisson => {
+                    if let Some(seeds) = bs.poisson_seeds.as_ref() {
+                        poisson_params = Some((seeds.clone(), bs.sample_rate));
+                    }
                 }
-                DeviceBootstrapKind::Bayesian => {}
+                DeviceBootstrapKind::Bernoulli | DeviceBootstrapKind::Bayesian => {
+                    let base = bs.rng.raw_state();
+                    // Bayesian consumes ONE main-stream draw for `rand_seed`; the per-block
+                    // streams branch off it. Bernoulli draws sequentially from the base
+                    // (advanced by `n` below).
+                    let rand_seed = match bs.kind {
+                        DeviceBootstrapKind::Bayesian => bs.rng.gen_rand(),
+                        _ => 0,
+                    };
+                    bootstrap_params =
+                        Some((bs.kind, base, rand_seed, bs.sample_rate, bs.bagging_temperature));
+                    // Advance the continuous stream to the next tree's phase. IN-02: Bernoulli
+                    // consumes exactly one `gen_rand` per object, so the `n`-draw advance is
+                    // draw-faithful; Bayesian already advanced by its single `rand_seed` draw.
+                    if bs.kind == DeviceBootstrapKind::Bernoulli {
+                        bs.rng.advance(self.n as u64);
+                    }
+                }
             }
         }
 
@@ -1611,7 +1866,17 @@ impl GpuTrainSession {
             }
         }
 
-        let sample_h = if let Some((kind, base, rand_seed, rate, temp)) = bootstrap_params {
+        let sample_h = if let Some((seeds_h, rate)) = poisson_params {
+            // Upstream `PoissonBootstrap`: the seed buffer is BOTH input and output — the kernel
+            // advances each thread's word in place, so the next tree continues these streams.
+            Some(launch_poisson_bootstrap_resident(
+                &self.client,
+                &seeds_h,
+                POISSON_SEEDS_SIZE,
+                rate,
+                self.n,
+            )?)
+        } else if let Some((kind, base, rand_seed, rate, temp)) = bootstrap_params {
             Some(launch_bootstrap_weights_resident(
                 &self.client,
                 kind,
@@ -1633,16 +1898,45 @@ impl GpuTrainSession {
         } else {
             None
         };
-        let tree_weight_h = match sample_h {
-            Some(s) => Some(fold_weights_resident(
-                &self.client,
-                &self.weight_h,
-                &s,
-                self.n,
-            )?),
+        // WR-01 (`WR01-S1`/`WR01-S2`, Design A): resolve the ONE effective per-object sample
+        // multiplier for this tree. Exactly one source can be active — the gate forces
+        // `bootstrap_arm = NoDraw` under `sample_from_host`, so `sample_h` is `None` on the host
+        // arm and the host `sample` is empty on the device-resident arm.
+        let effective_sample_h = match sample_h {
+            Some(s) => Some(s),
+            None if !sample.is_empty() => {
+                // Reject a sample that would overflow the histogram's fixed-point encode
+                // BEFORE uploading it (`WR01-S10`). The check needs host `der1`, which is the
+                // same value the resident `der1_h` holds — recomputed here from the caller's
+                // approx/target through the SAME `host_der1` helper the nonsym / region / exact
+                // arms use, so the two can never disagree.
+                guard_sample_fixedpoint_range(
+                    sample,
+                    &host_der1(self.der_kernel, approx, target),
+                    self.n,
+                )?;
+                Some(upload_channel_floats(&self.client, sample))
+            }
             None => None,
         };
-        let weight_ref = tree_weight_h.as_ref().unwrap_or(&self.weight_h);
+
+        // The SCORE channels (split histogram) consume the SAMPLED pair `(der1·s, weight·s)`;
+        // the LEAF channels keep the UNSAMPLED `(der1, weight)`. This mirrors the CPU reference
+        // exactly: the sample multiplies `score_weighted_der1` / `score_weights` for split
+        // scoring only, while `CalcLeafValues` reads the full un-sampled fold
+        // (`boosting.rs` score-vs-leaf channel split). With NO sample active both pairs are the
+        // SAME handles, so the grow is byte-unchanged (`WR01-S3`, D-04).
+        //
+        // NOTE this also corrects the device-RESIDENT sampler arm, which previously folded the
+        // sample into the single `weight_ref` handed to BOTH the histogram and the leaf reduce
+        // while leaving `der1` unsampled — wrong on both channels under any sampling.
+        let (score_der1_h, score_weight_h) = match effective_sample_h.as_ref() {
+            Some(s) => (
+                fold_weights_resident(&self.client, &der1_h, s, self.n)?,
+                fold_weights_resident(&self.client, &self.weight_h, s, self.n)?,
+            ),
+            None => (der1_h.clone(), self.weight_h.clone()),
+        };
 
         // Grow one tree over the resident handles; take ownership of the resident approx
         // (updated in place on device) and swap it back afterwards.
@@ -1651,7 +1945,9 @@ impl GpuTrainSession {
             &self.client,
             approx_h,
             &der1_h,
-            weight_ref,
+            &self.weight_h,
+            &score_der1_h,
+            &score_weight_h,
             &self.feat_offsets,
             &self.feat_shifts,
             &self.feat_masks,
@@ -1666,6 +1962,12 @@ impl GpuTrainSession {
             self.n_bins_line,
             self.n_bins,
             self.n_features,
+            // SPEC-OH-22/24: the one-hot boundary + the real-cardinality bound, both
+            // frozen at `begin` from the host trainer's `DeviceTrainConfig`. On a
+            // float-only fit `n_float == n_features` (pass B empty) and `real_folds` is
+            // never read, so the scorer is byte-unchanged.
+            self.n_float,
+            &self.real_folds,
             self.depth,
             self.scaled_l2,
             self.score_fn,

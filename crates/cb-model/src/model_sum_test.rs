@@ -15,6 +15,7 @@ fn tiny_model(bias: f64) -> Model {
         border: 0.5,
     });
     Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![
             ObliviousTree {
                 splits: vec![split.clone()],
@@ -71,6 +72,7 @@ fn tiny_model_b(bias: f64) -> Model {
         border: 0.5,
     });
     Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![
             ObliviousTree {
                 splits: vec![split.clone()],

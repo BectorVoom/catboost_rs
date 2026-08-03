@@ -120,10 +120,12 @@ fn train_eval_metrics(
         EvalSet {
             feature_values: &x_eval0,
             target: &y_eval0,
+            cat_columns: &[],
         },
         EvalSet {
             feature_values: &x_eval1,
             target: &y_eval1,
+            cat_columns: &[],
         },
     ];
     let mut history = EvalMetricHistory::new(2);
@@ -228,10 +230,12 @@ fn eval_metric_defaults_to_objective_curve() {
         EvalSet {
             feature_values: &x_eval0,
             target: &y_eval0,
+            cat_columns: &[],
         },
         EvalSet {
             feature_values: &x_eval1,
             target: &y_eval1,
+            cat_columns: &[],
         },
     ];
     let mut defaulted = EvalMetricHistory::new(2);

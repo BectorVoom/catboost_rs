@@ -35,6 +35,7 @@ fn scaled_tree(scale: f64) -> ObliviousTree {
 /// A scalar oblivious model built from `scales` (one tree per scale), bias `bias`.
 fn model_from_scales(scales: &[f64], bias: f64) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: scales.iter().map(|&s| scaled_tree(s)).collect(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -50,6 +51,7 @@ fn model_from_scales(scales: &[f64], bias: f64) -> Model {
 /// hand-rolled "truncated apply" reference for a prefix of length `k`.
 fn truncate(model: &Model, k: usize) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: model.oblivious_trees.iter().take(k).cloned().collect(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),

@@ -50,30 +50,25 @@ fn unique_tmp(tag: &str) -> PathBuf {
 
 /// A small Rust-built model for the export round-trip.
 fn rust_built_model() -> Model {
-    Model {
-        oblivious_trees: vec![
-            ObliviousTree {
-                splits: vec![
-                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
-                    ModelSplit::Float(Split { feature: 1, border: 1.5 }),
-                ],
-                leaf_values: vec![0.1, -0.2, 0.3, -0.4],
-                leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
-            },
-            ObliviousTree {
-                splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
-                leaf_values: vec![0.05, -0.05],
-                leaf_weights: vec![12.0, 13.0],
-            },
-        ],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.25,
-        float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    Model::new(
+        vec![
+                ObliviousTree {
+                    splits: vec![
+                        ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                        ModelSplit::Float(Split { feature: 1, border: 1.5 }),
+                    ],
+                    leaf_values: vec![0.1, -0.2, 0.3, -0.4],
+                    leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
+                },
+                ObliviousTree {
+                    splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
+                    leaf_values: vec![0.05, -0.05],
+                    leaf_weights: vec![12.0, 13.0],
+                },
+            ],
+        0.25,
+        vec![vec![0.5, 2.5], vec![1.5]],
+    )
 }
 
 // ── (a) save_json round-trips through the cb-oracle parser ──────────────────
@@ -192,5 +187,93 @@ fn malformed_json_is_typed_error_not_panic() {
     match decode_json(bad_bias) {
         Err(ModelError::Deserialize(_)) => {}
         other => panic!("malformed scale_and_bias must be Deserialize error, got {other:?}"),
+    }
+}
+
+// ── SPEC-OH-14 — one-hot splits are never silently dropped by the json path ──
+
+/// SPEC-OH-14 — the numeric `model.json` schema (v1) cannot represent a one-hot
+/// split, so `save_json` must REJECT the model rather than emit a document whose
+/// `splits` array is shorter than the tree's real depth (which would desync the
+/// split count from `leaf_values` and silently mis-predict on reload).
+#[test]
+fn save_json_rejects_one_hot_models_instead_of_shortening_splits() {
+    let model = Model::new(
+        vec![ObliviousTree {
+                splits: vec![
+                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                    ModelSplit::OneHot(cb_model::OneHotModelSplit {
+                        cat_feature: 0,
+                        value_hash: 1_296_865_003,
+                    }),
+                ],
+                leaf_values: vec![1.0, 2.0, 3.0, 4.0],
+                leaf_weights: vec![1.0; 4],
+            }],
+        0.0,
+        vec![vec![0.5]],
+    );
+
+    let path = std::env::temp_dir().join(format!("cb_one_hot_json_{}.json", std::process::id()));
+    let got = save_json(&model, &path);
+    let _ = std::fs::remove_file(&path);
+
+    match got {
+        Err(ModelError::Serialize(msg)) => {
+            assert!(
+                msg.contains("one-hot"),
+                "the error must name one-hot, got {msg:?}"
+            );
+        }
+        other => panic!("save_json on a one-hot model must be a Serialize error, got {other:?}"),
+    }
+}
+
+/// SPEC-OH-14 — an upstream one-hot `model.json` document is rejected with an
+/// error that NAMES one-hot, rather than the misleading serde
+/// `missing field 'border'`.
+#[test]
+fn json_load_rejects_an_upstream_one_hot_document_with_a_named_error() {
+    let doc = r#"{
+      "features_info": {"float_features": [{"borders": [0.5], "feature_id": "",
+        "feature_index": 0, "flat_feature_index": 0, "has_nans": false,
+        "nan_value_treatment": "AsIs"}]},
+      "oblivious_trees": [{"leaf_values": [1.0, 2.0], "leaf_weights": [1.0, 1.0],
+        "splits": [{"cat_feature_index": 0, "split_index": 1,
+                    "split_type": "OneHotFeature", "value": 1296865003}]}],
+      "scale_and_bias": [1, [0.0]]
+    }"#;
+
+    match decode_json(doc) {
+        Err(ModelError::Deserialize(msg)) => {
+            assert!(
+                msg.contains("one-hot"),
+                "the error must name one-hot, got {msg:?}"
+            );
+        }
+        other => panic!("a one-hot json document must be a Deserialize error, got {other:?}"),
+    }
+}
+
+/// SPEC-OH-14 guard-rail — making `border` `#[serde(default)]` must NOT mask a
+/// malformed FLOAT split: a `FloatFeature` document with no `border` still
+/// fails loudly rather than silently binarizing against `0.0`.
+#[test]
+fn json_load_still_rejects_a_float_split_with_no_border() {
+    let doc = r#"{
+      "features_info": {"float_features": [{"borders": [0.5], "feature_id": "",
+        "feature_index": 0, "flat_feature_index": 0, "has_nans": false,
+        "nan_value_treatment": "AsIs"}]},
+      "oblivious_trees": [{"leaf_values": [1.0, 2.0], "leaf_weights": [1.0, 1.0],
+        "splits": [{"float_feature_index": 0, "split_index": 0,
+                    "split_type": "FloatFeature"}]}],
+      "scale_and_bias": [1, [0.0]]
+    }"#;
+
+    match decode_json(doc) {
+        Err(ModelError::Deserialize(msg)) => {
+            assert!(msg.contains("border"), "the error must name the border, got {msg:?}");
+        }
+        other => panic!("a border-less float split must be a Deserialize error, got {other:?}"),
     }
 }

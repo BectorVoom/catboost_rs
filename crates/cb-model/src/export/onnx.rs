@@ -62,6 +62,14 @@ pub enum OnnxExportError {
     #[error("model uses categorical/CTR features, which ONNX export does not support")]
     CategoricalFeaturesUnsupported,
 
+    /// The model contains at least one one-hot categorical split (SPEC-OH-16).
+    /// A DISTINCT variant from [`OnnxExportError::CategoricalFeaturesUnsupported`]
+    /// so the message names the real cause: without this guard the node builder
+    /// falls through `as_float() -> None` and silently emits a
+    /// `(feature = 0, border = 0.0)` node — a wrong model, exported cleanly.
+    #[error("model contains one-hot categorical splits, which ONNX export does not support")]
+    OneHotSplitsUnsupported,
+
     /// The model has at least one non-symmetric (Lossguide/Depthwise) tree —
     /// upstream's `IsOblivious()` guard.
     #[error("model contains non-symmetric (Lossguide/Depthwise) trees, which ONNX export does not support")]
@@ -95,13 +103,23 @@ pub enum OnnxExportError {
 /// EXPORT-01a guard: reject a model this exporter cannot represent, in the
 /// deterministic check order SPEC.md §4/§5 specifies — (1) non-symmetric tree
 /// present, (2) region tree present, (3) CTR split or baked `ctr_data`
-/// present, (4) otherwise `Ok(())`. Pure; no I/O, no protobuf.
+/// present, (4) one-hot split present (SPEC-OH-16 — checked BEFORE the generic
+/// CTR/categorical arm so the message is specific), (5) otherwise `Ok(())`.
+/// Pure; no I/O, no protobuf.
 fn is_onnx_exportable(model: &Model) -> Result<(), OnnxExportError> {
     if !model.non_symmetric_trees.is_empty() {
         return Err(OnnxExportError::NonObliviousTreesUnsupported);
     }
     if !model.region_trees.is_empty() {
         return Err(OnnxExportError::RegionTreesUnsupported);
+    }
+    let has_one_hot_split = model
+        .oblivious_trees
+        .iter()
+        .flat_map(|tree| tree.splits.iter())
+        .any(|split| matches!(split, ModelSplit::OneHot(_)));
+    if has_one_hot_split {
+        return Err(OnnxExportError::OneHotSplitsUnsupported);
     }
     let has_ctr_split = model
         .oblivious_trees

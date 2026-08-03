@@ -311,6 +311,7 @@ impl Runtime for GpuBackend {
         &self,
         approx: &[f64],
         target: &[f64],
+        sample: &[f64],
     ) -> CbResult<Option<DeviceGrownTree>> {
         let mut guard = self.session.borrow_mut();
         match guard.as_mut() {
@@ -325,7 +326,9 @@ impl Runtime for GpuBackend {
                         actual: approx.len(),
                     });
                 }
-                let tree = session.grow_one(approx, target)?;
+                // WR-01: the host bootstrap sample passes straight through; the session
+                // validates its length / exclusivity and folds it into the SCORE channels only.
+                let tree = session.grow_one(approx, target, sample)?;
                 Ok(Some(tree))
             }
         }

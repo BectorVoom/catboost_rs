@@ -52,6 +52,23 @@ use cb_core::sum_f64;
 
 use crate::{Model, NonSymmetricTree};
 
+/// Why a SHAP-family surface cannot run on a model (SPEC-OH-15).
+///
+/// Every surface in this module is defined over FLOAT splits only: the feature
+/// path, the subtree-weight tree and the leaf indexing are all keyed by a single
+/// float-feature index per level. A one-hot or CTR level has no such index, and
+/// silently skipping it desyncs `tree_depth` from `leaf_values` — so the
+/// surfaces refuse instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ShapUnsupported {
+    /// The model carries at least one [`crate::ModelSplit::OneHot`] split.
+    #[error("SHAP-family importances are not supported for models with one-hot splits")]
+    OneHotSplits,
+    /// The model carries at least one [`crate::ModelSplit::Ctr`] split.
+    #[error("SHAP-family importances are not supported for models with CTR splits")]
+    CtrSplits,
+}
+
 /// `TFixedFeatureParams` (`shap_values.h`): when computing ShapInteractionValues
 /// the recursion is re-run with one feature (combination class) held FIXED — on
 /// every path (`FixedOn`) or off every path (`FixedOff`). `None` is the plain
@@ -530,8 +547,17 @@ fn document_leaf_index(splits: &[crate::Split], row: &[f32]) -> usize {
 /// Returns one `[n_features + 1]` row per object (object order). By construction
 /// the local-accuracy invariant holds: `Σ_columns row == predict_raw[obj]`
 /// (D-11).
-#[must_use]
-pub fn shap_values(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<Vec<f64>> {
+///
+/// # Errors
+/// [`ShapUnsupported`] if the model carries a one-hot or CTR split (SPEC-OH-15):
+/// the local-accuracy invariant above CANNOT hold for such a model under a
+/// float-only projection, so the surface refuses rather than returning rows that
+/// silently violate it.
+pub fn shap_values(
+    model: &Model,
+    cols: &[Vec<f32>],
+    n_features: usize,
+) -> Result<Vec<Vec<f64>>, ShapUnsupported> {
     shap_values_fixed(model, cols, n_features, None)
 }
 
@@ -546,9 +572,47 @@ struct Prepared {
 }
 
 /// Project a tree's `Vec<ModelSplit>` to its float `Vec<Split>` (numeric-only
-/// SHAP — a CTR split has no single float-feature index and is out of scope).
-fn float_splits_of(splits: &[crate::ModelSplit]) -> Vec<crate::Split> {
-    splits.iter().filter_map(crate::ModelSplit::as_float).copied().collect()
+/// SHAP — neither a one-hot nor a CTR split has a single float-feature index,
+/// and both are out of scope).
+///
+/// FALLIBLE by design (SPEC-OH-15). The pre-SPEC-OH-15 version was
+/// `filter_map(as_float)`, which SILENTLY dropped non-float levels: every caller
+/// then derived `tree_depth = splits.len()` from the shortened list, made the
+/// upper half of `leaf_values` unreachable, and returned rows that violate the
+/// local-accuracy invariant with no signal at all. Returning a `Result` makes
+/// the guard STRUCTURAL — the compiler forces every call site to handle it.
+///
+/// # Errors
+/// [`ShapUnsupported::OneHotSplits`] / [`ShapUnsupported::CtrSplits`] if the
+/// tree carries a split of that kind.
+fn float_splits_of(splits: &[crate::ModelSplit]) -> Result<Vec<crate::Split>, ShapUnsupported> {
+    let mut out = Vec::with_capacity(splits.len());
+    for s in splits {
+        match s {
+            crate::ModelSplit::Float(f) => out.push(*f),
+            crate::ModelSplit::OneHot(_) => return Err(ShapUnsupported::OneHotSplits),
+            crate::ModelSplit::Ctr(_) => return Err(ShapUnsupported::CtrSplits),
+        }
+    }
+    Ok(out)
+}
+
+/// Project every tree of `model` — oblivious AND non-symmetric — through
+/// [`float_splits_of`], so a model whose non-float split sits on a
+/// non-symmetric tree is refused just as loudly (the non-symmetric SHAP descent
+/// stops at a split with no `float_feature()`, the same silent truncation in a
+/// different shape).
+///
+/// # Errors
+/// As [`float_splits_of`].
+fn assert_float_only(model: &Model) -> Result<(), ShapUnsupported> {
+    for tree in &model.non_symmetric_trees {
+        float_splits_of(&tree.tree_splits)?;
+    }
+    for tree in &model.oblivious_trees {
+        float_splits_of(&tree.splits)?;
+    }
+    Ok(())
 }
 
 /// `GetReversedSubtreeForNonObliviousTree` (`shap_prepared_trees.cpp:69-94`):
@@ -817,17 +881,27 @@ fn shap_recurse_non_symmetric(
 /// [`shap_interaction_values`] to form `(contribOn − contribOff) / 2`. The
 /// expected-value / bias column is computed once (mean of per-tree mean values +
 /// model bias) — `shap_values.cpp:1030-1055`.
+///
+/// # Errors
+/// [`ShapUnsupported`] if any tree carries a non-float split (SPEC-OH-15).
 fn shap_values_fixed(
     model: &Model,
     cols: &[Vec<f32>],
     n_features: usize,
     fixed: Option<FixedFeature>,
-) -> Vec<Vec<f64>> {
+) -> Result<Vec<Vec<f64>>, ShapUnsupported> {
+    // Refuse BEFORE any arithmetic — including on the non-symmetric trees,
+    // whose descent would otherwise stop silently at a non-float node.
+    assert_float_only(model)?;
+
     let n_objects = cols.first().map_or(0, Vec::len);
 
     // Oblivious per-tree prep.
-    let obl_float_splits: Vec<Vec<crate::Split>> =
-        model.oblivious_trees.iter().map(|t| float_splits_of(&t.splits)).collect();
+    let obl_float_splits: Vec<Vec<crate::Split>> = model
+        .oblivious_trees
+        .iter()
+        .map(|t| float_splits_of(&t.splits))
+        .collect::<Result<Vec<_>, ShapUnsupported>>()?;
     let obl_prepared: Vec<Prepared> = model
         .oblivious_trees
         .iter()
@@ -855,7 +929,7 @@ fn shap_values_fixed(
         obl_prepared.iter().chain(ns_prepared.iter()).map(|p| p.mean_value).collect();
     let expected_value = sum_f64(&mean_values) + model.bias;
 
-    (0..n_objects)
+    let out = (0..n_objects)
         .map(|obj| {
             let row: Vec<f32> = cols
                 .iter()
@@ -909,11 +983,12 @@ fn shap_values_fixed(
                 );
             }
 
-            let mut out = shap_by_feature;
-            out.push(expected_value);
-            out
+            let mut row_out = shap_by_feature;
+            row_out.push(expected_value);
+            row_out
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 
 /// `ShapInteractionValues` (MODEL-05; `shap_interaction_values.cpp`): per object,
@@ -937,17 +1012,19 @@ fn shap_values_fixed(
 /// `reshape(-1)`). For numeric-only models the combination-class indirection is
 /// the identity and `rescaleCoefficients == 1` (a no-op unpack), so the per-class
 /// `Φ` IS the per-feature `Φ`.
-#[must_use]
+///
+/// # Errors
+/// [`ShapUnsupported`] if the model carries a one-hot or CTR split (SPEC-OH-15).
 pub fn shap_interaction_values(
     model: &Model,
     cols: &[Vec<f32>],
     n_features: usize,
-) -> Vec<Vec<f64>> {
+) -> Result<Vec<Vec<f64>>, ShapUnsupported> {
     let n_objects = cols.first().map_or(0, Vec::len);
     let dim = n_features + 1;
 
     // Regular SHAP ϕ(i) once (the diagonal seed).
-    let shap = shap_values_fixed(model, cols, n_features, None);
+    let shap = shap_values_fixed(model, cols, n_features, None)?;
 
     // contribOn[f] / contribOff[f]: SHAP with feature `f` fixed On / Off.
     let mut contrib_on: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_features);
@@ -959,16 +1036,16 @@ pub fn shap_interaction_values(
             cols,
             n_features,
             Some(FixedFeature { feature, mode: FixedMode::On }),
-        ));
+        )?);
         contrib_off.push(shap_values_fixed(
             model,
             cols,
             n_features,
             Some(FixedFeature { feature, mode: FixedMode::Off }),
-        ));
+        )?);
     }
 
-    (0..n_objects)
+    let out = (0..n_objects)
         .map(|obj| {
             let mut mat = vec![0.0_f64; dim * dim];
 
@@ -1023,7 +1100,8 @@ pub fn shap_interaction_values(
 
             mat
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 
 /// Per-tree per-feature `floatFeatureImpact[featureIdx][borderSlot]` for one
@@ -1133,10 +1211,19 @@ fn prediction_diff_single(
 /// the final per-feature value is `|impact[0][f] + impact[1][f]|`. Oblivious,
 /// numeric-only models (the supported surface — `CB_ENSURE` num-cat-features==0,
 /// dim==1). `cols` must carry exactly two objects.
-#[must_use]
-pub fn prediction_diff(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<f64> {
-    let float_splits: Vec<Vec<crate::Split>> =
-        model.oblivious_trees.iter().map(|t| float_splits_of(&t.splits)).collect();
+///
+/// # Errors
+/// [`ShapUnsupported`] if the model carries a one-hot or CTR split (SPEC-OH-15).
+pub fn prediction_diff(
+    model: &Model,
+    cols: &[Vec<f32>],
+    n_features: usize,
+) -> Result<Vec<f64>, ShapUnsupported> {
+    let float_splits: Vec<Vec<crate::Split>> = model
+        .oblivious_trees
+        .iter()
+        .map(|t| float_splits_of(&t.splits))
+        .collect::<Result<Vec<_>, ShapUnsupported>>()?;
 
     // Document feature rows + their per-feature bucket (= # borders exceeded).
     let object_count = cols.first().map_or(0, Vec::len).min(2);
@@ -1199,13 +1286,14 @@ pub fn prediction_diff(model: &Model, cols: &[Vec<f32>], n_features: usize) -> V
         })
         .collect();
 
-    (0..n_features)
+    let out = (0..n_features)
         .map(|f| {
             let a = impacts.first().and_then(|r| r.get(f)).copied().unwrap_or(0.0);
             let b = impacts.get(1).and_then(|r| r.get(f)).copied().unwrap_or(0.0);
             (a + b).abs()
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 
 /// `SageValues` (MODEL-05; **D-6.6-11 fallback (b)** — documented structural
@@ -1232,11 +1320,17 @@ pub fn prediction_diff(model: &Model, cols: &[Vec<f32>], n_features: usize) -> V
 /// non-negativity) rather than a ≤1e-5 value oracle. The seed-match `≤1e-5` SAGE
 /// value oracle is deferred to a future plan that transcribes the upstream RNG
 /// subsystem. Reductions route through [`cb_core::sum_f64`] (D-08).
-#[must_use]
-pub fn sage_values(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<f64> {
-    let shap = shap_values_fixed(model, cols, n_features, None);
+///
+/// # Errors
+/// [`ShapUnsupported`] if the model carries a one-hot or CTR split (SPEC-OH-15).
+pub fn sage_values(
+    model: &Model,
+    cols: &[Vec<f32>],
+    n_features: usize,
+) -> Result<Vec<f64>, ShapUnsupported> {
+    let shap = shap_values_fixed(model, cols, n_features, None)?;
     let n_objects = shap.len();
-    (0..n_features)
+    let out = (0..n_features)
         .map(|f| {
             let per_obj: Vec<f64> = shap
                 .iter()
@@ -1248,6 +1342,7 @@ pub fn sage_values(model: &Model, cols: &[Vec<f32>], n_features: usize) -> Vec<f
                 sum_f64(&per_obj) / n_objects as f64
             }
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 

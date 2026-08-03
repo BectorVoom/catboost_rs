@@ -19,7 +19,9 @@ mod boosting;
 pub mod calc_metrics;
 mod candidates;
 mod ctr;
+mod device_draw_replay;
 mod estimated;
+mod fast_approx;
 mod feature_selection;
 mod fold;
 mod metrics;
@@ -29,6 +31,7 @@ mod permutation;
 mod projection;
 mod query_info;
 mod ranking_metrics;
+pub mod snapshot;
 mod tree;
 mod yetirank;
 
@@ -44,9 +47,11 @@ pub use candidates::{
 pub use ctr::{
     bake_ctr_table, BakedCtrData, BakedCtrTable,
     accumulate_online, build_final_ctr, calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin,
-    calc_normalization, materialize_ctr_feature, online_ctr_prefix_binclf,
+    calc_normalization, materialize_ctr_feature, online_class_prefix, online_class_prefix_column,
+    online_counter_column, online_ctr_prefix_binclf, online_mean_prefix,
     ordered_ctr_per_permutation, CounterCalcMethod, CtrFeatureColumn, ECtrType, FinalCtrTable,
-    OnlineCtrAccumulator, OnlineCtrPrefix, OrderedCtrPrefix, Prior, TCtrHistory, TCtrMeanHistory,
+    OnlineCtrAccumulator, OnlineCtrPrefix, OnlineMeanPrefix, OrderedCtrPrefix, Prior, TCtrHistory,
+    TCtrMeanHistory,
     SIMPLE_CLASSES_COUNT,
 };
 pub use estimated::estimated_features::{
@@ -82,6 +87,7 @@ pub use yetirank::{
     derive_per_tree_query_seeds, derive_query_seeds, sample_pairs as yetirank_sample_pairs,
     sum_competitor_weights, YetiRankTreeSeeder, YetiRankTreeSeeds,
 };
+pub use snapshot::SnapshotConfig;
 pub use ranking_metrics::{
     clamp_top, compare_docs, dcg_group, err_group, map_at_group, mrr_group, ndcg_group,
     pfound_group, precision_at_group, query_auc_group, recall_at_group, AucType, DcgDenominator,
@@ -98,7 +104,8 @@ pub use boosting::{
     per_object_feature_penalties_default, structure_fold_cycle,
     permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_ranking,
-    train_with_eval, train_with_eval_sets, BoostParams, EBoostingType, EGrowPolicy, EvalSet, Model,
+    train_with_snapshot,
+    train_cat_with_eval_sets, train_with_eval, train_with_eval_sets, BoostParams, EBoostingType, EGrowPolicy, EvalSet, Model,
     NonSymmetricTree, ObliviousTree, RankingData, RegionTree,
 };
 pub use tree::{

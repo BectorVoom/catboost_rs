@@ -19,19 +19,36 @@ from catboost_rs import CatBoostParameterError, CatBoostRegressor
 
 # Repo layout: crates/catboost-rs-py/tests/ -> repo root is three parents up.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_CORE_PY = (
-    _REPO_ROOT
-    / "catboost-master"
-    / "catboost"
-    / "python-package"
-    / "catboost"
-    / "core.py"
-)
+
+
+def _core_py() -> Path:
+    """Locate upstream's ``core.py`` — the AUTHORITATIVE kwarg vocabulary.
+
+    F18: this used to point ONLY at ``catboost-master/catboost/python-package/
+    catboost/core.py``, which does not exist in this checkout (the vendored tree
+    is a three-file stub of a DIFFERENT revision), so the registry-truthfulness
+    test silently SKIPPED — and a skipped test is not a gate. Fall back to the
+    INSTALLED ``catboost==1.2.10`` package, which is the parity target this
+    repository actually pins.
+    """
+    vendored = (
+        _REPO_ROOT
+        / "catboost-master"
+        / "catboost"
+        / "python-package"
+        / "catboost"
+        / "core.py"
+    )
+    if vendored.exists():
+        return vendored
+    import catboost
+
+    return Path(catboost.__file__).resolve().parent / "core.py"
 
 
 def _upstream_classifier_init_kwargs():
     """Extract every kwarg name from CatBoostClassifier.__init__ in core.py."""
-    text = _CORE_PY.read_text()
+    text = _core_py().read_text()
     # Find the CatBoostClassifier.__init__ signature block.
     cls_idx = text.index("class CatBoostClassifier")
     init_idx = text.index("def __init__(", cls_idx)
@@ -51,8 +68,13 @@ def _toy_xy():
 
 
 def test_every_upstream_param_is_in_registry():
-    if not _CORE_PY.exists():
-        pytest.skip(f"vendored core.py not found at {_CORE_PY}")
+    # F18: NEVER skip. A skipped test is not a gate, and this is the only thing
+    # standing between the registry and a silently-missing upstream parameter.
+    core = _core_py()
+    assert core.exists(), (
+        f"upstream core.py not found at {core}; the registry-truthfulness gate "
+        "cannot be skipped — install catboost==1.2.10"
+    )
     upstream = _upstream_classifier_init_kwargs()
     assert len(upstream) > 100, "expected the full upstream kwarg vocabulary"
     missing = [
@@ -100,3 +122,28 @@ def test_validation_fires_at_fit_not_init():
     x, y = _toy_xy()
     with pytest.raises(CatBoostParameterError):
         model.fit(x, y)
+
+
+def test_ctr_default_parity_gap_is_documented():
+    """SPEC-CTRT-19 / SPEC-CATF-Δ2 — the single-description CTR limit is recorded.
+
+    Upstream's CPU default is a LIST of two CTR descriptions; this crate models
+    ONE description with a prior LIST. That divergence must be documented, with
+    its upstream anchor, everywhere a user or implementer will look, so it
+    cannot silently rot into an undocumented parity gap.
+    """
+    src = (_REPO_ROOT / "crates" / "catboost-rs-py" / "src" / "params.rs").read_text()
+    assert "catboost_options.cpp:439-453" in src, (
+        "the multi-description default parity gap must cite its upstream anchor"
+    )
+    assert "single-description" in src or "one CTR description" in src
+
+    boosting = (
+        _REPO_ROOT / "crates" / "cb-train" / "src" / "boosting.rs"
+    ).read_text()
+    assert boosting.count("catboost_options.cpp:439-453") >= 4, (
+        "all four CTR *_default() doc comments must cite the parity-gap anchor"
+    )
+    # The now-false framing must be deleted, not left beside the new text.
+    assert "never exercise the CTR path" not in boosting
+    assert "never exercise the combination path" not in boosting

@@ -2945,6 +2945,20 @@ pub(crate) mod bootstrap_device;
 #[cfg(test)]
 mod bootstrap_device_test;
 
+// Device Poisson bootstrap UPSTREAM oracle (source/test separation): the `#[cube]` Poisson
+// kernel is a verbatim transcription of upstream's CUDA `PoissonBootstrapImpl`, and this
+// mount holds it bit-for-bit against `cb-oracle/fixtures/bootstrap_poisson/`, frozen by the
+// host-compiled `poisson_bootstrap_oracle.cpp`. Poisson has no CPU sampler ANYWHERE (upstream
+// rejects it on CPU), so this — not a CatBoost-Python run — is its parity gate.
+#[cfg(test)]
+mod poisson_bootstrap_oracle_test;
+
+// Device Poisson bootstrap SPEED evidence (source/test separation): the parallel
+// grid-stride transcription vs the serial single-thread stream draw the other arms are
+// (correctly) stuck with. Lives in `kernels/poisson_bootstrap_speed_test.rs`.
+#[cfg(test)]
+mod poisson_bootstrap_speed_test;
+
 // Device Minimal-Variance Sampling (Phase 12 Plan 07, GPUT-17): the PRODUCTION module hosting the
 // serial `#[cube]` MVS kernel — per-block (`BlockSize = 8192`) optimal threshold over
 // `sqrt(lambda + der^2)` (deterministic monotone bisection = the `calculate_threshold` root) +
@@ -3356,14 +3370,28 @@ pub fn find_optimal_split_kernel<F: Float>(
     best_gain: &mut Array<F>,
     best_idx: &mut Array<u32>,
     scaled_l2: &Array<F>,
-    n_features: u32,
+    real_folds: &Array<u32>,
+    // The FULL feature count. Kept in the signature (and in the caller's argument list)
+    // because it defines the `scores` buffer geometry and the absolute candidate index
+    // space this kernel writes into; the sweep bound itself now comes from
+    // `feature_lo`/`feature_hi` (SPEC-OH-22), which is why it is no longer read here.
+    _n_features: u32,
+    feature_lo: u32,
+    feature_hi: u32,
     #[comptime] n_bins: u32,
     #[comptime] score_fn: u32,
+    #[comptime] one_hot: bool,
 ) {
     let tid = UNIT_POS;
     let n_bins_usize = n_bins as usize;
-    let n_features_usize = n_features as usize;
-    let n_candidates = n_features_usize * n_bins_usize;
+    // The pass's ABSOLUTE candidate range (SPEC-OH-22, mirroring
+    // `find_optimal_split_partition_kernel`). Candidates are NEVER renumbered — the bound
+    // moves, the index space does not — so the host's `feature = c / n_bins` decode and the
+    // `scores` buffer's full `n_features * n_bins` geometry are both unchanged. The
+    // single-pass float-only launch passes `feature_lo = 0, feature_hi = n_features`, which
+    // makes `lo == 0` and `hi == n_features * n_bins`, i.e. today's arithmetic exactly.
+    let lo = (feature_lo as usize) * n_bins_usize;
+    let hi = (feature_hi as usize) * n_bins_usize;
 
     // The per-tree L2 regularizer is passed as a length-1 device array (the codebase
     // passes float values through `Array<F>`, never as a generic-`F` launch scalar — a
@@ -3391,17 +3419,22 @@ pub fn find_optimal_split_kernel<F: Float>(
     // candidate index (== feature * n_bins + bin); ties keep the LOWER index, so seed it
     // to the max so any real candidate replaces it on the first strict-greater compare.
     let mut my_gain = minimal_score;
-    let mut my_idx = n_candidates as u32;
+    // No-winner sentinel: THIS pass's own upper bound (== `n_candidates` on the
+    // single-pass float-only launch, byte-unchanged).
+    let mut my_idx = hi as u32;
 
     // Grid-stride over candidates (D-09: the stride is the cube width CUBE_DIM_X, a
     // topology value, never a literal). Each candidate is one (feature, border) split.
-    let mut c = tid as usize;
-    while c < n_candidates {
+    let mut c = (tid as usize) + lo;
+    while c < hi {
         let feature = c / n_bins_usize;
         let border = c % n_bins_usize;
 
-        // Fold the feature's bins into LEFT (bins 0..=border) / RIGHT (bins
-        // border+1..n_bins) leaf stats, reading the FROZEN 2-channel histogram in place.
+        // Fold the feature's bins into LEFT / RIGHT leaf stats, reading the FROZEN
+        // 2-channel histogram in place. THRESHOLD (`one_hot == false`): LEFT is bins
+        // `0..=border`. EQUALITY (`one_hot == true`, SPEC-OH-22): LEFT is the single
+        // matching bin and RIGHT is everything else — accumulated as the total minus the
+        // match, so the bin loop stays a single pass.
         let mut left_sum = F::new(0.0_f32);
         let mut left_w = F::new(0.0_f32);
         let mut right_sum = F::new(0.0_f32);
@@ -3411,14 +3444,27 @@ pub fn find_optimal_split_kernel<F: Float>(
             let cell = (feature * n_bins_usize + bin) * 2usize;
             let d = bin_sums[cell];
             let w = bin_sums[cell + 1usize];
-            if bin <= border {
-                left_sum += d;
-                left_w += w;
-            } else {
+            if one_hot {
                 right_sum += d;
                 right_w += w;
+                if bin == border {
+                    left_sum += d;
+                    left_w += w;
+                }
+            } else {
+                if bin <= border {
+                    left_sum += d;
+                    left_w += w;
+                } else {
+                    right_sum += d;
+                    right_w += w;
+                }
             }
             bin += 1usize;
+        }
+        if one_hot {
+            right_sum -= left_sum;
+            right_w -= left_w;
         }
 
         // The candidate's split score, computed by the comptime-selected calcer arm.
@@ -3490,7 +3536,20 @@ pub fn find_optimal_split_kernel<F: Float>(
         // (`reference_best_split` in `score_split.rs`) and the host winner decode
         // (`gpu_runtime.rs`) skip the SAME trailing border in EXACT lockstep, so device
         // and CPU oracle agree on a real (`border < n_bins - 1`) split.
-        if border < n_bins_usize - 1usize {
+        // EQUALITY splits bound candidates by the feature's REAL cardinality instead:
+        // the highest category is a genuine candidate, and the padded bins are not
+        // (SPEC-OH-22).
+        let mut eligible = false;
+        if one_hot {
+            if border < real_folds[feature] as usize {
+                eligible = true;
+            }
+        } else {
+            if border < n_bins_usize - 1usize {
+                eligible = true;
+            }
+        }
+        if eligible {
             if score > my_gain {
                 my_gain = score;
                 my_idx = c as u32;
@@ -3725,6 +3784,7 @@ pub fn partition_split_kernel<F: Float>(
     mask: u32,
     bin: u32,
     level_bit: u32,
+    #[comptime] one_hot: bool,
 ) {
     // Keep the `F: Float` generic real (AGENTS.md generics-float) while routing on the
     // integer bin axis only — the resident der1 handle is threaded but not value-read
@@ -3746,9 +3806,22 @@ pub fn partition_split_kernel<F: Float>(
         // plain feature-major layout is read_bin's DEGENERATE `TCFeature` addressing —
         // the host passes `offset = feature * n, shift = 0, mask = 0xFFFF_FFFF`, so this
         // is exactly the former `cindex[feature * n + obj]` value, routed through the
-        // single accessor. Forward-bit: object passes (gets bit `level_bit`) iff bin > border.
-        if read_bin(cindex, offset, obj_u, shift, mask) > bin {
-            new_leaf = new_leaf | (1u32 << level_bit);
+        // single accessor.
+        //
+        // Forward-bit routing, by split kind (SPEC-OH-23). The `#[comptime] one_hot`
+        // resolves ONE arm away at JIT, so neither path carries a runtime branch:
+        //   * THRESHOLD (`one_hot == false`): passes iff `bin > border` — unchanged.
+        //   * EQUALITY  (`one_hot == true`):  passes iff `bin == value`, matching the CPU
+        //     `FeatureMatrix::passes_one_hot` / upstream `IsTrueOneHotFeature`.
+        let b = read_bin(cindex, offset, obj_u, shift, mask);
+        if one_hot {
+            if b == bin {
+                new_leaf = new_leaf | (1u32 << level_bit);
+            }
+        } else {
+            if b > bin {
+                new_leaf = new_leaf | (1u32 << level_bit);
+            }
         }
         new_leaf_of[obj] = new_leaf;
         i += stride;
@@ -3857,6 +3930,88 @@ pub fn partition_update_kernel<F: Float>(
             part_stats[part * 3usize + 2usize].fetch_add(h);
         }
         i += stride;
+    }
+}
+
+/// Tier-1 LDS-privatized [`partition_update_kernel`] (CubeCL manual
+/// `08_atomic_contention.md` §4) — the SAME per-partition `[Σ der1, Σ weight,
+/// Σ(der2·weight)]` reduction, but each cube first folds its object chunk into a
+/// PRIVATE shared-memory sub-result and then merges with ONE global atomic per cell.
+///
+/// Why: the naive kernel fires `3·n` global float atomics into only `n_parts * 3`
+/// addresses (at depth 6 / n=300k that is 900k atomics contending on 192 cells), which
+/// measured as ~40% of the resident oblivious grow's device time. Global traffic here
+/// drops to `CUBE_COUNT_X * cells`, INDEPENDENT of `n`.
+///
+/// The LDS accumulator is fixed-point [`Atomic<u64>`] rather than `Atomic<F>` for two
+/// reasons: shared-memory `f64` atomic-add is not uniformly available across backends
+/// (`Atomic<u64>` is the pattern already proven in [`partition_hist2_lds_kernel`]), and
+/// integer accumulation makes the INTRA-cube fold exactly order-independent. The
+/// cross-cube merge stays `Atomic<F>` so the host read path is byte-unchanged; that
+/// merge is `CUBE_COUNT_X`-way instead of `n`-way, so its float-atomic reordering
+/// exposure is strictly smaller than the kernel it replaces.
+///
+/// RANGE precondition (inherited from [`fixedpoint_encode`]): each PER-CUBE partial sum
+/// must satisfy `|Σ| < 2^33`. Per-cube partials are `n / CUBE_COUNT_X` objects wide —
+/// strictly smaller than the whole-column sums the caller already validates.
+///
+/// `lds_cells` is the comptime LDS budget; the caller must guarantee
+/// `part_stats.len() <= lds_cells` and fall back to [`partition_update_kernel`]
+/// otherwise.
+#[cube(launch)]
+pub fn partition_update_lds_kernel<F: Float>(
+    der1: &Array<F>,
+    weight: &Array<F>,
+    der2: &Array<F>,
+    indices: &Array<u32>,
+    leaf_of: &Array<u32>,
+    part_stats: &Array<Atomic<F>>,
+    #[comptime] lds_cells: u32,
+) {
+    let lds = SharedMemory::<Atomic<u64>>::new(comptime!(lds_cells as usize));
+
+    let n = indices.len();
+    let cd = CUBE_DIM as usize;
+    // Only the ACTIVE prefix is touched (manual §4 rule 1): the caller sized
+    // `part_stats` to exactly `n_parts * 3`.
+    let active = part_stats.len();
+
+    // (1) Zero the ACTIVE LDS cells, strided across the cube's units.
+    let mut c = UNIT_POS as usize;
+    while c < active {
+        lds[c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+
+    // (2) Fold this cube's grid-strided object chunk into the private sub-result.
+    let stride = (CUBE_COUNT_X as usize) * cd;
+    let mut i = (CUBE_POS_X as usize) * cd + (UNIT_POS as usize);
+    while i < n {
+        let obj = indices[i] as usize;
+        let part = leaf_of[obj] as usize;
+        let d = der1[obj];
+        let w = weight[obj];
+        // Newton hessian channel folds weight HERE (A3 landmine), matching
+        // `cb_compute::reduce_leaf_der2`'s `der2·weight` convention — identical to
+        // `partition_update_kernel`.
+        let h = der2[obj] * w;
+        // Same in-kernel partition VALUE guard as the naive kernel (WR-04): `leaf_of`
+        // is DEVICE-PRODUCED, so the range check must live here. if-as-STATEMENT only.
+        if part * 3usize + 2usize < active {
+            lds[part * 3usize].fetch_add(fixedpoint_encode::<F>(d));
+            lds[part * 3usize + 1usize].fetch_add(fixedpoint_encode::<F>(w));
+            lds[part * 3usize + 2usize].fetch_add(fixedpoint_encode::<F>(h));
+        }
+        i += stride;
+    }
+    sync_cube();
+
+    // (3) Merge LDS → global: ONE global atomic per active cell, per cube.
+    let mut m = UNIT_POS as usize;
+    while m < active {
+        part_stats[m].fetch_add(fixedpoint_decode::<F>(lds[m].load()));
+        m += cd;
     }
 }
 
@@ -4412,11 +4567,15 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     best_gain: &mut Array<F>,
     best_idx: &mut Array<u32>,
     scaled_l2: &Array<F>,
+    real_folds: &Array<u32>,
     n_parts: u32,
     n_features: u32,
     n_bins_used: u32,
+    feature_lo: u32,
+    feature_hi: u32,
     #[comptime] n_bins: u32,
     #[comptime] score_fn: u32,
+    #[comptime] one_hot: bool,
 ) {
     let tid = UNIT_POS;
     let n_bins_usize = n_bins as usize;
@@ -4428,10 +4587,19 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     let max_border = (n_bins_used as usize) - 1usize;
     let n_features_usize = n_features as usize;
     let n_parts_usize = n_parts as usize;
-    let n_candidates = n_features_usize * n_bins_usize;
     // One full (feature, bin, channel) histogram line per partition slot (== the leaf stride
-    // the partition-aware fill writes: upstream §6.4 leaf-wise tensor layout).
+    // the partition-aware fill writes: upstream §6.4 leaf-wise tensor layout). Derived from
+    // the FULL `n_features`, NEVER from a pass-narrowed count — `feature_lo`/`feature_hi`
+    // move only the loop's start/end, they do not renumber candidates or repitch rows.
     let leaf_stride = n_features_usize * n_bins_usize * 2usize;
+    // The pass's ABSOLUTE candidate range. The candidate index `c` stays absolute so the
+    // host's `feature = c / n_bins` decode, its range guard and its lowest-index tie-break
+    // are all byte-unchanged. A RELATIVE range would produce three distinct defects: a
+    // phantom winner (a pass sentinel below the full candidate count slips the host guard),
+    // a wrong feature id (`absolute - feature_lo`, attributing a one-hot split to a float
+    // feature), and an ill-defined cross-pass tie-break.
+    let lo = (feature_lo as usize) * n_bins_usize;
+    let hi = (feature_hi as usize) * n_bins_usize;
 
     let lambda = scaled_l2[0usize];
     // The minimal-score sentinel any real candidate must beat (the `f64::NEG_INFINITY`
@@ -4441,13 +4609,16 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     let minimal_score = F::new(f32::MIN);
 
     let mut my_gain = minimal_score;
-    let mut my_idx = n_candidates as u32;
+    // No-winner sentinel: THIS pass's own upper bound. On the float-only single-pass launch
+    // `hi == n_features * n_bins`, byte-unchanged. The host skips `cand >= pass_hi`, which is
+    // what keeps a narrower pass's sentinel from being read as a real winner.
+    let mut my_idx = hi as u32;
 
     // Grid-stride over candidates (D-09: stride == TOTAL thread count CUBE_COUNT * CUBE_DIM,
     // a topology value — the multi-cube dispatch spreads the candidate sweep over the device).
     let stride = CUBE_COUNT * (CUBE_DIM as usize);
-    let mut c = ABSOLUTE_POS;
-    while c < n_candidates {
+    let mut c = ABSOLUTE_POS + lo;
+    while c < hi {
         let feature = c / n_bins_usize;
         let border = c % n_bins_usize;
 
@@ -4470,14 +4641,34 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
                 let cell = part_base + (feature * n_bins_usize + bin) * 2usize;
                 let w = fixedpoint_decode::<F>(bin_sums[cell]);
                 let d = fixedpoint_decode::<F>(bin_sums[cell + 1usize]);
-                if bin <= border {
-                    left_w += w;
-                    left_d += d;
-                } else {
+                if one_hot {
+                    // EQUALITY split (`cat_bin == value`, upstream `IsTrueOneHotFeature`):
+                    // LEFT is the single matching bin, RIGHT is everything else. `right_*`
+                    // accumulates the TOTAL here and the matching bin is subtracted after
+                    // the loop, so this stays ONE pass over `bin_sums` — the fill and its
+                    // memory traffic are untouched, which is what keeps the speed goal
+                    // reachable.
                     right_w += w;
                     right_d += d;
+                    if bin == border {
+                        left_w += w;
+                        left_d += d;
+                    }
+                } else {
+                    // THRESHOLD split (`bin > border`) — the unchanged prefix fold.
+                    if bin <= border {
+                        left_w += w;
+                        left_d += d;
+                    } else {
+                        right_w += w;
+                        right_d += d;
+                    }
                 }
                 bin += 1usize;
+            }
+            if one_hot {
+                right_w -= left_w;
+                right_d -= left_d;
             }
             // Per-leaf additive term in the SAME left-then-right order the depth-1 scorer and
             // the CPU oracle use (sum = der1, weight = weight).
@@ -4497,10 +4688,32 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
             score = score_acc / cos_den.sqrt();
         }
 
-        // Strict-first-wins / lowest-index tie-break; EXCLUDE the trailing no-op border AND
-        // every phantom padded border (`border >= n_bins_used - 1` — all-LEFT no-op splits
-        // the CPU reference never enumerates).
-        if border < max_border {
+        // Strict-first-wins / lowest-index tie-break, over the ELIGIBLE candidates only.
+        //
+        //  * THRESHOLD (`one_hot == false`): exclude the trailing no-op border AND every
+        //    phantom padded border (`border >= n_bins_used - 1` — all-LEFT no-op splits the
+        //    CPU reference never enumerates). Byte-unchanged.
+        //  * EQUALITY (`one_hot == true`): the trailing border is NOT a no-op — the highest
+        //    category is a real, selectable candidate — so the bound is instead this
+        //    feature's REAL cardinality. Without it a cardinality-2 column in a 32-wide
+        //    padded line contributes 30 phantom "all-objects-right" candidates that can tie
+        //    or beat a real one, and the device diverges from the CPU grower, which
+        //    enumerates only bins actually present (`distinct_bins_ascending`).
+        //
+        // `real_folds` is the SEPARATE per-feature real-cardinality array the host quantizer
+        // builds — NOT `TCFeature.folds`, which on the production path is the padded uniform
+        // line width and would bound nothing.
+        let mut eligible = false;
+        if one_hot {
+            if border < real_folds[feature] as usize {
+                eligible = true;
+            }
+        } else {
+            if border < max_border {
+                eligible = true;
+            }
+        }
+        if eligible {
             if score > my_gain {
                 my_gain = score;
                 my_idx = c as u32;

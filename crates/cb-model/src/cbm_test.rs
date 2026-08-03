@@ -237,8 +237,20 @@ fn classify_bins_places_float_onehot_ctr_ranges() {
             border: 5.0
         }
     );
-    for i in 3..6 {
-        assert_eq!(combined[i], BinKind::OneHot, "one-hot range at index {i}");
+    // SPEC-OH-08 [C5]: the one-hot range carries the ABSOLUTE cat-column index
+    // (`TOneHotFeature.Index`) and the raw upstream `i32` value hash
+    // (`Values[k]`), one bin per value, so T08 can decode it into a
+    // `ModelSplit::OneHot` instead of erroring.
+    for (k, value_hash) in [10_i32, 20, 30].into_iter().enumerate() {
+        let i = 3 + k;
+        assert_eq!(
+            combined[i],
+            BinKind::OneHot {
+                cat_feature: 0,
+                value_hash
+            },
+            "one-hot range at index {i}"
+        );
     }
     assert_eq!(
         combined[6],
@@ -308,6 +320,7 @@ fn save_ctr_split(cats: &[usize], border: f64, scale: f64) -> crate::CtrSplit {
 fn model_with_ctr_splits(splits: Vec<crate::CtrSplit>) -> crate::Model {
     let model_splits = splits.into_iter().map(crate::model::ModelSplit::Ctr).collect();
     crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![crate::ObliviousTree {
             splits: model_splits,
             leaf_values: Vec::new(),
@@ -717,7 +730,11 @@ fn decode_ctr_parts_blob_length_mismatch_is_typed_error() {
 }
 
 #[test]
-fn decode_ctr_parts_mean_ctr_type_is_typed_error() {
+fn decode_ctr_parts_mean_ctr_type_round_trips_sum_and_count() {
+    // INVERTED at E19 (was `decode_ctr_parts_mean_ctr_type_is_typed_error`,
+    // the v1 MAJOR-2 rejection): a mean-typed part's CTRBlob is upstream's
+    // 8-byte `TCtrMeanHistory { f32 Sum; i32 Count; }` stride, and the decoder
+    // must reconstruct the pairs, not reject them.
     let ihr = hash_slot(111, 0);
     let blob: Vec<u8> = [7.0f32.to_le_bytes(), 3i32.to_le_bytes()].concat();
     let tail = build_one_part_tail(
@@ -729,8 +746,77 @@ fn decode_ctr_parts_mean_ctr_type_is_typed_error() {
         &blob,
     );
     match decode_ctr_model_parts(&tail) {
-        Err(ModelError::Deserialize(_)) => {}
-        other => panic!("mean ctr_type must be Deserialize error (v1, MAJOR-2), got {other:?}"),
+        Ok(data) => {
+            let table = data
+                .tables
+                .values()
+                .next()
+                .expect("one decoded mean table expected");
+            assert!(!table.mean.is_empty(), "anti-vacuity: the mean pairs must decode");
+            assert_eq!(
+                table.mean,
+                vec![(7.0f32, 3i64)],
+                "the single bucket must reconstruct exactly (Sum, Count) = (7.0, 3)"
+            );
+            assert!(table.int_counts.is_empty(), "a mean table carries no int_counts");
+        }
+        other => panic!("mean ctr_type must decode after E19, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_ctr_parts_mean_blob_matching_neither_stride_is_typed_error() {
+    // ADDITIVE sibling negative case (E19): a mean-typed part whose blob length
+    // matches NEITHER the 8-byte upstream stride nor the 12-byte self-format
+    // stride must still be a typed rejection, never a panic or a silent guess.
+    let ihr = hash_slot(111, 0);
+    let blob: Vec<u8> = vec![0u8; 11]; // 1 bucket: neither 8 nor 12
+    let tail = build_one_part_tail(
+        &[0],
+        TailECtrType::BinarizedTargetMeanValue,
+        0,
+        0,
+        &ihr,
+        &blob,
+    );
+    match decode_ctr_model_parts(&tail) {
+        Err(ModelError::Deserialize(msg)) => {
+            assert!(
+                msg.contains("11") && msg.contains('8') && msg.contains("12"),
+                "the rejection must name the length and BOTH candidate strides: {msg}"
+            );
+        }
+        other => panic!("neither-stride mean blob must be Deserialize error, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_ctr_parts_mean_blob_reports_rather_than_silently_accepting_a_twelve_byte_stride() {
+    // THE STRIDE-AMBIGUITY PIN (E19 / SPEC-CTRT-15): this repo's OWN
+    // self-describing CTR format persists mean pairs at a 12-byte stride
+    // (`f32 Sum ; i64 Count`). If an input blob matches 12 bytes per bucket,
+    // the `.cbm` decoder must NOT silently adopt it — SPEC-CTRT-14's 8-byte
+    // upstream layout would need re-specification first. The rejection must
+    // say so.
+    let ihr = hash_slot(111, 0);
+    let blob: Vec<u8> = vec![0u8; 12]; // 1 bucket at exactly the 12-byte stride
+    let tail = build_one_part_tail(
+        &[0],
+        TailECtrType::BinarizedTargetMeanValue,
+        0,
+        0,
+        &ihr,
+        &blob,
+    );
+    match decode_ctr_model_parts(&tail) {
+        Err(ModelError::Deserialize(msg)) => {
+            assert!(
+                msg.contains("12-byte") && msg.contains("re-specified"),
+                "the rejection must name the matched 12-byte stride and demand \
+                 re-specification, not silently decode: {msg}"
+            );
+        }
+        other => panic!("12-byte-stride mean blob must REPORT, got {other:?}"),
     }
 }
 
@@ -758,23 +844,30 @@ fn decode_ctr_parts_duplicate_table_key_is_typed_error() {
 }
 
 #[test]
-fn one_hot_split_index_is_typed_error() {
-    // A tree with ONE split referencing the one-hot range (float bins occupy
-    // [0], one-hot occupies [1]) must be rejected — no `ModelSplit::OneHot`
-    // variant exists (CTR-05).
+fn one_hot_split_index_decodes_to_one_hot_model_split() {
+    // SPEC-OH-12 SUPERSEDES CTR-05 (which rejected this outright, when no
+    // `ModelSplit::OneHot` variant existed): a tree with ONE split referencing
+    // the one-hot range (float bins occupy [0], one-hot occupies [1, 2]) now
+    // decodes into the equality split it denotes — `cat_feature` from
+    // `TOneHotFeature.Index`, `value_hash` from `Values[k]`.
     let buf = build_trees_buf(
         &[vec![0.5]],
         &[vec![10, 20]],
         &[],
-        &[1], // TreeSplits: global index 1 -> the one-hot range.
+        &[1], // TreeSplits: global index 1 -> the one-hot range, Values[0].
         &[1], // TreeSizes: depth 1.
         &[0.0, 0.0],
     );
     let trees = flatbuffers::root::<TModelTrees>(&buf).expect("verifying root parse");
-    match super::reconstruct_model(&trees, Vec::new(), &[]) {
-        Err(ModelError::Deserialize(_)) => {}
-        other => panic!("one-hot split index must be Deserialize error, got {other:?}"),
-    }
+    let model = super::reconstruct_model(&trees, Vec::new(), &[])
+        .expect("a one-hot split index must decode, not error");
+    assert_eq!(
+        model.oblivious_trees[0].splits,
+        vec![ModelSplit::OneHot(crate::OneHotModelSplit {
+            cat_feature: 0,
+            value_hash: 10,
+        })]
+    );
 }
 
 #[test]
@@ -858,6 +951,7 @@ fn save_non_symmetric_ctr_split_is_typed_error() {
         leaf_weights: vec![0.0],
     };
     let model = crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: vec![tree],
         region_trees: Vec::new(),
@@ -879,6 +973,7 @@ fn save_numeric_model_emits_no_tail() {
     // saves with NO model-parts tail — the file is exactly the 8-byte frame plus
     // the FlatBuffers core, byte-for-byte the pre-slice layout.
     let model = crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![crate::ObliviousTree {
             splits: vec![crate::model::ModelSplit::Float(crate::Split { feature: 0, border: 0.5 })],
             leaf_values: vec![0.1, -0.2],
@@ -994,5 +1089,179 @@ fn non_symmetric_model_with_ctr_features_is_typed_error() {
     match super::reconstruct_model(&trees, Vec::new(), &[]) {
         Err(ModelError::Deserialize(_)) => {}
         other => panic!("non-symmetric + CtrFeatures must be Deserialize error, got {other:?}"),
+    }
+}
+
+// ── SPEC-OH-11 / SPEC-OH-12 — one-hot save + load ───────────────────────────
+
+/// The SPEC-OH-11 acceptance model: 1 float feature with 2 borders, cat 0 with
+/// ONE used value, cat 1 with TWO used values, plus a cat-1 value referenced by
+/// NO split (the pruning probe). The one-hot value hashes are chosen so cat 1's
+/// FIRST-REFERENCED order differs from its ASCENDING order, matching the
+/// `one_hot_train/multi` fixture's discriminating property — so the ordering pin
+/// below is not vacuous.
+fn one_hot_acceptance_model() -> (crate::Model, [i32; 4]) {
+    // h1 > h2: referencing h1 first makes first-referenced != ascending.
+    let (h0, h1, h2, h3) = (1_296_865_003_i32, 476_319_382_i32, -784_473_192_i32, 999_i32);
+    let model = crate::Model {
+        cat_feature_count: 0,
+        oblivious_trees: vec![crate::ObliviousTree {
+            splits: vec![
+                crate::model::ModelSplit::Float(crate::Split { feature: 0, border: 0.25 }),
+                crate::model::ModelSplit::OneHot(crate::OneHotModelSplit {
+                    cat_feature: 1,
+                    value_hash: h1,
+                }),
+                crate::model::ModelSplit::OneHot(crate::OneHotModelSplit {
+                    cat_feature: 0,
+                    value_hash: h0,
+                }),
+                crate::model::ModelSplit::OneHot(crate::OneHotModelSplit {
+                    cat_feature: 1,
+                    value_hash: h2,
+                }),
+            ],
+            leaf_values: (0..16).map(f64::from).collect(),
+            leaf_weights: vec![1.0; 16],
+        }],
+        non_symmetric_trees: Vec::new(),
+        region_trees: Vec::new(),
+        bias: 0.0,
+        float_feature_borders: vec![vec![0.25, 0.75]],
+        ctr_data: None,
+        approx_dimension: 1,
+        class_to_label: Vec::new(),
+    };
+    (model, [h0, h1, h2, h3])
+}
+
+fn temp_cbm_path(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cb_model_{tag}_{}_{}.cbm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+#[test]
+fn one_hot_save_emits_pruned_values_and_float_then_one_hot_bin_offsets() {
+    // SPEC-OH-11 pinned acceptance: float bins occupy [0, 1]; cat 0's single
+    // used value occupies [2]; cat 1's two used values occupy [3, 4]. The
+    // unreferenced value `h3` must be PRUNED (upstream stores only the values
+    // its trees actually test). `Values` order is ASCENDING SIGNED i32, pinned
+    // against `one_hot_train/multi` (stored [-784473192, 476319382] while
+    // first-referenced is [476319382, -784473192]).
+    let (model, [h0, h1, h2, _h3]) = one_hot_acceptance_model();
+
+    let path = temp_cbm_path("one_hot_save");
+    crate::save_cbm(&model, &path).expect("saving a one-hot model must succeed");
+    let bytes = std::fs::read(&path).expect("read back");
+    let _ = std::fs::remove_file(&path);
+
+    let (core, tail) = split_core_and_tail(&bytes);
+    assert!(tail.is_empty(), "a one-hot model without CTRs emits no tail");
+    let core_root = root_as_tmodel_core(core).expect("core parses");
+    let trees = core_root.ModelTrees().expect("ModelTrees present");
+
+    // OneHotFeatures: cat 0 -> [h0]; cat 1 -> ascending [h2, h1] (h3 pruned).
+    let ohf = trees.OneHotFeatures().expect("OneHotFeatures emitted");
+    assert_eq!(ohf.len(), 2, "one entry per referenced cat feature");
+    assert_eq!(ohf.get(0).Index(), 0);
+    assert_eq!(
+        ohf.get(0).Values().expect("values").iter().collect::<Vec<i32>>(),
+        vec![h0]
+    );
+    assert_eq!(ohf.get(1).Index(), 1);
+    assert_eq!(
+        ohf.get(1).Values().expect("values").iter().collect::<Vec<i32>>(),
+        vec![h2, h1],
+        "Values are ASCENDING SIGNED i32, and the unreferenced value is pruned"
+    );
+
+    // CatFeatures: one per referenced cat feature, `FlatIndex = n_float + c`.
+    let cf = trees.CatFeatures().expect("CatFeatures emitted");
+    assert_eq!(cf.len(), 2);
+    assert_eq!((cf.get(0).Index(), cf.get(0).FlatIndex()), (0, 1));
+    assert_eq!((cf.get(1).Index(), cf.get(1).FlatIndex()), (1, 2));
+    assert!(cf.get(0).UsedInModel() && cf.get(1).UsedInModel());
+
+    // TreeSplits: float border 0.25 -> 0; cat1==h1 -> 4 (the ASCENDING second
+    // value of cat 1); cat0==h0 -> 2; cat1==h2 -> 3.
+    let ts = trees.TreeSplits().expect("TreeSplits").iter().collect::<Vec<i32>>();
+    assert_eq!(ts, vec![0, 4, 2, 3], "combined Float -> OneHot bin space");
+}
+
+#[test]
+fn one_hot_cbm_round_trips_to_model_split_one_hot() {
+    // SPEC-OH-12: the load path decodes the one-hot range into
+    // `ModelSplit::OneHot` (superseding CTR-05's blanket rejection), and a
+    // second save is byte-identical to the first.
+    let (model, [h0, h1, h2, _h3]) = one_hot_acceptance_model();
+
+    let path = temp_cbm_path("one_hot_rt");
+    crate::save_cbm(&model, &path).expect("save");
+    let first = std::fs::read(&path).expect("read back");
+    let loaded = crate::load_cbm(&path).expect("loading a one-hot .cbm must succeed");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        loaded.oblivious_trees[0].splits,
+        vec![
+            crate::model::ModelSplit::Float(crate::Split { feature: 0, border: 0.25 }),
+            crate::model::ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 1, value_hash: h1 }),
+            crate::model::ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 0, value_hash: h0 }),
+            crate::model::ModelSplit::OneHot(crate::OneHotModelSplit { cat_feature: 1, value_hash: h2 }),
+        ],
+        "every split round-trips, in the SAME level order"
+    );
+
+    let path2 = temp_cbm_path("one_hot_rt2");
+    crate::save_cbm(&loaded, &path2).expect("re-save");
+    let second = std::fs::read(&path2).expect("read back 2");
+    let _ = std::fs::remove_file(&path2);
+    assert_eq!(first, second, "save -> load -> save is byte-identical");
+}
+
+#[test]
+fn one_hot_feature_with_negative_index_is_typed_error() {
+    // SPEC-OH-12: `TOneHotFeature.Index` defaults to `-1` (unset) in the
+    // schema; it can never address a cat column, so the decode is a typed
+    // error, never a silent 0.
+    let mut fbb = FlatBufferBuilder::new();
+    let values = fbb.create_vector(&[10_i32, 20]);
+    let oh = TOneHotFeature::create(
+        &mut fbb,
+        &TOneHotFeatureArgs {
+            Index: -1,
+            Values: Some(values),
+            ..TOneHotFeatureArgs::default()
+        },
+    );
+    let ohf = fbb.create_vector(&[oh]);
+    let splits = fbb.create_vector(&[0_i32]);
+    let sizes = fbb.create_vector(&[1_i32]);
+    let offsets = fbb.create_vector(&[0_i32]);
+    let leaves = fbb.create_vector(&[0.0_f64, 0.0]);
+    let trees = TModelTrees::create(
+        &mut fbb,
+        &TModelTreesArgs {
+            ApproxDimension: 1,
+            TreeSplits: Some(splits),
+            TreeSizes: Some(sizes),
+            TreeStartOffsets: Some(offsets),
+            OneHotFeatures: Some(ohf),
+            LeafValues: Some(leaves),
+            ..TModelTreesArgs::default()
+        },
+    );
+    fbb.finish(trees, None);
+    let buf = fbb.finished_data().to_vec();
+    let parsed = flatbuffers::root::<TModelTrees>(&buf).expect("verifying root parse");
+    match build_combined_bins(&parsed) {
+        Err(ModelError::Deserialize(_)) => {}
+        other => panic!("negative OneHotFeature.Index must be a Deserialize error, got {other:?}"),
     }
 }

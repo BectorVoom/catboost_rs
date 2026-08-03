@@ -1,0 +1,37 @@
+{
+  "boost_from_average": true,
+  "bootstrap_type": "MVS",
+  "borders_note": "Read THIS scenario's float_feature_borders(); CatBoost quantization borders are not stable across configurations.",
+  "catboost_version": "1.2.10",
+  "input_dataset": "bootstrap_multiblock",
+  "loss_function": "RMSE",
+  "n_features": 4,
+  "n_iterations": 3,
+  "n_rows": 1500,
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "MVS",
+    "depth": 2,
+    "iterations": 3,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "subsample": 0.8,
+    "thread_count": 1,
+    "verbose": false
+  },
+  "purpose": "MVS-S3 discriminating family. One MVS scenario is not enough: a 2-draw-per-tree sampler defect kept bootstrap/mvs green while breaking 7 of 10 seed/bias combinations.",
+  "scenario": "mvs_seeds/s0_bfa1",
+  "seed": 0,
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "StagedApprox"
+  ],
+  "subsample": 0.8,
+  "thread_count": 1
+}

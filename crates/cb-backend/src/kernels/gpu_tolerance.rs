@@ -810,7 +810,7 @@ fn gpu06_end_to_end_leaf_values_report_evidence() {
             depth,
             "device tree must have exactly `depth` splits (n={n})"
         );
-        let (dev_feat, dev_bin) = tree.splits[0];
+        let (dev_feat, dev_bin, _dev_one_hot) = tree.splits[0];
         assert_eq!(
             (dev_feat as usize, dev_bin as usize),
             cpu_split,

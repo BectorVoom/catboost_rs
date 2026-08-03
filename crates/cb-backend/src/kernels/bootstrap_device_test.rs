@@ -151,25 +151,26 @@ fn bayesian_weights_match_frozen_cpu_sample_within_epsilon() {
 }
 
 #[test]
-fn poisson_weights_are_deterministic_and_nonnegative_integers() {
+fn poisson_does_not_ride_the_host_stream_draw_path() {
     if !device_backend_active() {
         eprintln!("[bootstrap poisson] skipped — device draw needs rocm/cuda (u64/f64 serial)");
         return;
     }
-    // No CPU oracle (upstream rejects Poisson on CPU, D-11) — validate determinism + shape only.
+    // Poisson no longer shares this entry point. Bernoulli/Bayesian mirror an upstream CPU
+    // sampler, so the host advances a `TFastRng64` stream and the device expands its base
+    // state. Poisson has NO CPU sampler at all (upstream rejects it on CPU), so upstream's
+    // CUDA kernel is its specification: a persistent per-thread device seed buffer, drawn
+    // through `launch_poisson_bootstrap_resident` and gated bit-for-bit in
+    // `kernels::poisson_bootstrap_oracle_test`. Routing it through the host-stream path
+    // would silently produce a NON-upstream sample, so it fails loudly instead.
     let base = TFastRng64::from_seed(2024).raw_state();
-    let n = 200usize;
-    let a =
-        draw_bootstrap_weights_host(DeviceBootstrapKind::Poisson, base, 0, 1.0, 0.0, n).unwrap();
-    let b =
-        draw_bootstrap_weights_host(DeviceBootstrapKind::Poisson, base, 0, 1.0, 0.0, n).unwrap();
-    assert_eq!(a, b, "device Poisson draw is not deterministic for a pinned seed");
-    for &w in &a {
-        assert!(w >= 0.0, "Poisson weight must be non-negative");
-        assert!((w - w.round()).abs() < 1e-9, "Poisson weight must be an integer count");
-    }
-    let mean = a.iter().sum::<f64>() / n as f64;
-    println!("[bootstrap poisson] n={n} mean_count={mean:.3} (Poisson(1) ⇒ ~1.0)");
+    let err = draw_bootstrap_weights_host(DeviceBootstrapKind::Poisson, base, 0, 0.8, 0.0, 200)
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("launch_poisson_bootstrap_resident"),
+        "the host-stream path must point Poisson at the resident seed-buffer draw: {msg}"
+    );
 }
 
 #[test]

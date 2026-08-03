@@ -45,8 +45,8 @@ pub use quantized_pool::{
     pack_bins, select_bin_width, ColumnBins, FeatureKind, QuantizedPool,
 };
 pub use weights::{
-    balanced_class_weights, resolve_object_weights, sqrt_balanced_class_weights,
-    summary_class_weights, MINIMAL_CLASS_WEIGHT,
+    auto_class_weights, balanced_class_weights, resolve_object_weights,
+    sqrt_balanced_class_weights, summary_class_weights, AutoClassWeights, MINIMAL_CLASS_WEIGHT,
 };
 
 #[cfg(test)]

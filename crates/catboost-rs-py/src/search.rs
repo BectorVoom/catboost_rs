@@ -301,7 +301,10 @@ pub(crate) fn grid_search(
 ) -> PyResult<Py<PyDict>> {
     // --- GIL HELD: own every Python-borrowed input before any detach (D-11). ---
     let base = base_params(estimator)?;
-    let pool = data_to_pool(py, x, y)?;
+    // F17: honour the estimator's `cat_features` so a categorical pool reaches
+    // F14's fail-fast guard instead of being silently ingested float-only.
+    let cats = crate::estimator::resolve_cat_features(&base, py, None)?;
+    let pool = data_to_pool(py, x, y, Some(&cats))?;
     let (builders, grid_points) = expand_param_grid(&base, param_grid, py)?;
     let error_score = parse_error_score(error_score)?;
 
@@ -386,7 +389,10 @@ pub(crate) fn randomized_search(
 ) -> PyResult<Py<PyDict>> {
     // --- GIL HELD: own every Python-borrowed input before any detach (D-11). ---
     let base = base_params(estimator)?;
-    let pool = data_to_pool(py, x, y)?;
+    // F17: honour the estimator's `cat_features` so a categorical pool reaches
+    // F14's fail-fast guard instead of being silently ingested float-only.
+    let cats = crate::estimator::resolve_cat_features(&base, py, None)?;
+    let pool = data_to_pool(py, x, y, Some(&cats))?;
     let (builders, grid_points) = expand_param_grid(&base, param_distributions, py)?;
     let error_score = parse_error_score(error_score)?;
 

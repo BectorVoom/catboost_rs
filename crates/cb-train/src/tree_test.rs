@@ -3,7 +3,9 @@
 //! candidates MUST resolve to the FIRST one in upstream candidate order
 //! (feature index ascending, border ascending) via strict `gain > bestGain`.
 
-use crate::tree::{combination_ctr_eligible, select_best_candidate, Candidate};
+use crate::tree::{
+    combination_ctr_eligible, ctr_bin_border_to_value_space, select_best_candidate, Candidate,
+};
 use crate::TProjection;
 
 #[test]
@@ -374,6 +376,7 @@ fn column_with_bucket_count(projection: TProjection, bucket_count: usize) -> Ctr
     CtrFeatureColumn {
         projection,
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: 0.5,
         prior_denom: 1.0,
         bins: Vec::new(),
@@ -662,6 +665,7 @@ fn max_bucket_count_phantom_excludes_ctr_split_from_partition() {
     let ctr_col = CtrFeatureColumn {
         projection: TProjection::single(0),
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: 0.5,
         prior_denom: 1.0,
         bins: vec![0, 1, 0, 1], // obj0,obj2 fail border 0.5; obj1,obj3 pass.
@@ -694,4 +698,160 @@ fn max_bucket_count_phantom_excludes_ctr_split_from_partition() {
     // Correct (Float-only partition {0,1},{2,3}): 1 distinct cat value per leaf -> 2.
     // The bug (full Ctr+Float partition, bijective): every object its own leaf -> 4.
     assert_eq!(result, 2);
+}
+
+// ---------------------------------------------------------------------------
+// BUG-CTRB / SPEC-CTRB-01 — the bin-index -> value-space border conversion.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctr_bin_border_matches_every_committed_upstream_fixture_border() {
+    // Every CTR border catboost 1.2.10 committed across the three fixtures that
+    // carry one. Bit-equality, not tolerance.
+    let cases: [(f64, f64, &str); 7] = [
+        (2.0, 2.9999990463256836, "tensor_ctr_e2e"),
+        (3.0, 3.9999990463256836, "fstr_ctr"),
+        (6.0, 6.999999046325684, "fstr_ctr"),
+        (7.0, 7.999999046325684, "tensor_ctr_e2e"),
+        (8.0, 8.999999046325684, "ctr_counter_simple"),
+        (10.0, 10.999999046325684, "ctr_counter_simple"),
+        (11.0, 11.999999046325684, "fstr_ctr"),
+    ];
+    for (b, expected, fixture) in cases {
+        let got = ctr_bin_border_to_value_space(b);
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "bin {b} must convert to upstream's committed border {expected} \
+             (fixture {fixture}), got {got}"
+        );
+    }
+}
+
+#[test]
+fn ctr_bin_border_brackets_its_bin_over_the_reachable_domain() {
+    // The loop bound is `ctr_border_count_default()` PRECISELY because that is
+    // the reachability guarantee (it is the single, non-configurable source of
+    // ctr_border_count). The property is KNOWN FALSE above 15 — see
+    // `ctr_bin_border_collapses_to_b_plus_one_at_sixteen_and_is_unreachable`.
+    for b in 0..crate::ctr_border_count_default() {
+        let x = ctr_bin_border_to_value_space(b as f64);
+        assert!(
+            x > b as f64 && x < (b + 1) as f64,
+            "bin {b}: the border {x} must lie strictly inside ({b}, {}) — this is \
+             Invariant 1, the property that makes SPEC-CTRB-02 hold",
+            b + 1
+        );
+    }
+}
+
+#[test]
+fn ctr_bin_border_is_an_f32_fixed_point_over_the_reachable_domain() {
+    // 0..=14 ONLY. Do NOT sweep 0..=254: such a sweep passes and thereby implies
+    // a generality this formula does not have.
+    for b in 0..crate::ctr_border_count_default() {
+        let x = ctr_bin_border_to_value_space(b as f64);
+        assert_eq!(
+            f64::from(x as f32),
+            x,
+            "bin {b}: the .cbm codec narrows Borders to f32 and widens via \
+             f64::from; a non-fixed-point border shifts on save/load \
+             (SPEC-CTRB-01 Invariant 2, SPEC-CTRB-05). This asserts the f32 fixed \
+             point over the REACHABLE domain ONLY — it does NOT assert the formula \
+             is general."
+        );
+    }
+}
+
+#[test]
+fn ctr_bin_border_collapses_to_b_plus_one_at_sixteen_and_is_unreachable() {
+    let x = ctr_bin_border_to_value_space(16.0);
+    assert_eq!(
+        x, 17.0,
+        "CHARACTERIZATION, not a desired property: at b = 16 the f32 subtraction \
+         rounds to exactly b+1, so `v > border` becomes `v >= next_after(b+1)` and \
+         the strict-interval invariant (SPEC-CTRB-01 Invariant 1) is LOST — \
+         BUG-CTRB would reappear at the top of the range. This is UNREACHABLE \
+         today: ctr_border_count is not configurable. IF THIS TEST EVER NEEDS TO \
+         CHANGE, ctr_border_count has become configurable or exceeds 16: STOP AND \
+         REPORT. Do not adjust this assertion; re-derive the border formula for \
+         the widened domain first. The naive f64 form is not an alternative — it \
+         yields 16.999999046325684, which is NOT an f32 fixed point and would \
+         shift on the .cbm round trip. NOTE: 17.0 is what THIS formula produces, \
+         not what upstream produces; upstream's exact epsilon above b = 15 is \
+         unverified, and `(b+1) - 1e-6f` — consistent with every committed \
+         fixture — rounds the OTHER way here."
+    );
+
+    // The reachability guard itself, asserted rather than merely commented.
+    assert_eq!(
+        crate::ctr_border_count_default(),
+        15,
+        "the b = 16 case is unreachable ONLY while this is 15 (boosting.rs:529-531)"
+    );
+}
+
+#[test]
+fn persisted_and_level_kind_borders_are_in_different_spaces() {
+    use crate::ctr::CtrFeatureColumn;
+    use crate::tree::{greedy_tensor_search_oblivious_with_ctr, FeatureMatrix, LevelKind};
+    use cb_compute::EScoreFunction;
+
+    // A hand-built column whose bins span several CTR bins, so some border wins.
+    let bins: Vec<u32> = vec![0, 0, 3, 3, 7, 7, 11, 11];
+    let n = bins.len();
+    let col = CtrFeatureColumn {
+        projection: crate::TProjection::single(0),
+        ctr_type: 0,
+        target_border_idx: 0,
+        prior_num: 0.5,
+        prior_denom: 1.0,
+        ctr_value: bins.iter().map(|&b| f64::from(b) / 15.0).collect(),
+        bins: bins.clone(),
+        bucket_count: 4,
+    };
+
+    let values = vec![vec![0.0_f32; n]];
+    let borders = vec![vec![0.5_f64]];
+    let matrix = FeatureMatrix::new(&values, &borders);
+    let der1: Vec<f64> = (0..n).map(|i| if i < n / 2 { 1.0 } else { -1.0 }).collect();
+    let weight = vec![1.0_f64; n];
+
+    let grown = greedy_tensor_search_oblivious_with_ctr(
+        &matrix,
+        &[col],
+        crate::ctr_border_count_default(),
+        &der1,
+        &weight,
+        3.0,
+        1,
+        n,
+        0.0,
+        EScoreFunction::Cosine,
+        &[],
+        &[],
+    )
+    .expect("depth-1 CTR growth must succeed");
+
+    assert_eq!(grown.ctr_splits.len(), 1, "a CTR split must have won");
+    let LevelKind::Ctr {
+        border: bin_border, ..
+    } = grown.level_kinds[0]
+    else {
+        panic!("the chosen level must be a CTR level");
+    };
+
+    // §0 hazard: the two adjacent `border:` sites must remain in DIFFERENT spaces.
+    assert_eq!(
+        bin_border,
+        bin_border.trunc(),
+        "§0 hazard: LevelKind::Ctr.border must stay INTEGRAL (bin space). No \
+         oracle can detect a conversion here — this assertion is the only guard."
+    );
+    assert_eq!(
+        grown.ctr_splits[0].border,
+        ctr_bin_border_to_value_space(bin_border),
+        "§0 hazard: the PERSISTED CtrSplitSpec.border must be the VALUE-space \
+         conversion of the bin-space border"
+    );
 }

@@ -1,0 +1,16 @@
+{
+  "id": "boomvector/catboost-rs-one-hot-gpu",
+  "title": "catboost-rs one-hot gpu",
+  "code_file": "one_hot_bench_colab.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": ["gpu"],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

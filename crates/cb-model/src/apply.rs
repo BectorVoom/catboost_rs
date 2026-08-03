@@ -189,13 +189,36 @@ fn passes_ctr_split(model: &Model, split: &CtrSplit, cat_values: &[String]) -> b
     ctr_value > split.border
 }
 
+/// Whether an object passes one [`ModelSplit::OneHot`] split (SPEC-OH-10): the
+/// RAW categorical value at `s.cat_feature` hashes — via
+/// [`cb_data::calc_cat_feature_hash`], the same function the trainer and the
+/// `.cbm` writer use — to exactly `s.value_hash`.
+///
+/// The comparison happens in the UPSTREAM signed space: `calc_cat_feature_hash`
+/// returns `u32` and `TOneHotFeature.Values` is `[i32]`, so the hash is cast
+/// with the bit-preserving `as i32` — the SAME cast direction as the save path
+/// ([`crate::save_cbm`]) and the trainer lift ([`Model::from_trained`]).
+///
+/// A `cat_feature` beyond the supplied columns returns `false` defensively
+/// (consistent with [`passes_float_split`], where a short column reads `NaN` and
+/// fails every strict `>` test) — never a panic.
+fn passes_one_hot_split(s: &crate::OneHotModelSplit, cat_values: &[String]) -> bool {
+    match cat_values.get(s.cat_feature) {
+        Some(v) => cb_data::calc_cat_feature_hash(v) as i32 == s.value_hash,
+        None => false,
+    }
+}
+
 /// Whether an object passes one [`ModelSplit`] (Step B): a [`ModelSplit::Float`]
-/// keeps the existing `value > border` path byte-for-byte; a [`ModelSplit::Ctr`]
-/// evaluates the combined-projection CTR value against the split border
+/// keeps the existing `value > border` path byte-for-byte; a
+/// [`ModelSplit::OneHot`] is a raw-hash equality test
+/// ([`passes_one_hot_split`]); a [`ModelSplit::Ctr`] evaluates the
+/// combined-projection CTR value against the split border
 /// ([`passes_ctr_split`]).
 fn passes_split(model: &Model, split: &ModelSplit, features: &[f32], cat_values: &[String]) -> bool {
     match split {
         ModelSplit::Float(s) => passes_float_split(s.feature, s.border, features),
+        ModelSplit::OneHot(s) => passes_one_hot_split(s, cat_values),
         ModelSplit::Ctr(c) => passes_ctr_split(model, c, cat_values),
     }
 }
@@ -924,6 +947,10 @@ pub fn apply_virtual_ensembles(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "apply_one_hot_test.rs"]
+mod apply_one_hot_test;
 
 #[cfg(test)]
 #[path = "region_apply_test.rs"]

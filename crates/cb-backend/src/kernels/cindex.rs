@@ -32,8 +32,9 @@ const CUBE_DIM: usize = 32;
 /// the materialized feature-major bin matrix (must equal the source `bins`, bit-exact).
 fn pack_then_read_all(bins: &[u32], n_buckets: &[usize], n: usize) -> Vec<u32> {
     let n_features = n_buckets.len();
-    let packed = pack_cindex(bins, n_buckets, n).unwrap();
-    let (offsets, shifts, masks) = packed.device_arrays().unwrap();
+    let one_hot = vec![false; n_buckets.len()];
+    let packed = pack_cindex(bins, n_buckets, &one_hot, n).unwrap();
+    let (offsets, shifts, masks, _one_hot_flags) = packed.device_arrays().unwrap();
 
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
@@ -87,7 +88,7 @@ fn pack_read_bit_exact_multiple_features_per_word() {
     let n_buckets = vec![256usize, 256];
     let bins = synth_bins(n, &n_buckets, 42);
 
-    let packed = pack_cindex(&bins, &n_buckets, n).unwrap();
+    let packed = pack_cindex(&bins, &n_buckets, &vec![false; n_buckets.len()], n).unwrap();
     // Grouping: two 8-bit features share word column 0 (offset 0), shifts 0 and 8.
     assert_eq!(packed.features[0].offset, 0, "feature 0 word base");
     assert_eq!(packed.features[1].offset, 0, "feature 1 shares the same word column");
@@ -144,7 +145,7 @@ fn pack_read_bit_exact_mixed_widths_grouping() {
     let n_buckets = vec![16usize, 16, 256, 2, 256, 256];
     let bins = synth_bins(n, &n_buckets, 7);
 
-    let packed = pack_cindex(&bins, &n_buckets, n).unwrap();
+    let packed = pack_cindex(&bins, &n_buckets, &vec![false; n_buckets.len()], n).unwrap();
     // Groups: features 0..=4 in column 0 (offset 0), feature 5 in column 1 (offset n).
     assert_eq!(packed.features[0].offset, 0);
     assert_eq!(packed.features[4].offset, 0);
@@ -173,7 +174,7 @@ fn pack_host_extract_bit_exact_mixed_widths() {
     let n_buckets = vec![16usize, 16, 256, 2, 256, 256, 64, 33];
     let bins = synth_bins(n, &n_buckets, 260716);
 
-    let packed = pack_cindex(&bins, &n_buckets, n).unwrap();
+    let packed = pack_cindex(&bins, &n_buckets, &vec![false; n_buckets.len()], n).unwrap();
     for (feature, f) in packed.features.iter().enumerate() {
         for obj in 0..n {
             let got = read_bin_host(&packed.words, f.offset, obj, f.shift, f.mask);
@@ -255,7 +256,7 @@ fn ctr_binarized_column_joins_cindex_bit_exact() {
     // device path (which the sibling `pack_read_bit_exact_*` oracles / the Kaggle CUDA sign-off
     // exercise on device); here the point is that the binarized CTR column PACKS + EXTRACTS as an
     // additional cindex feature bit-exact — the JOIN the histogram loop reads.
-    let packed = pack_cindex(&bins, &n_buckets, n).unwrap();
+    let packed = pack_cindex(&bins, &n_buckets, &vec![false; n_buckets.len()], n).unwrap();
     for feature in 0..3usize {
         let f = &packed.features[feature];
         for obj in 0..n {
@@ -289,7 +290,7 @@ fn feature_bits_and_overflow_guards() {
     let n_buckets = vec![16usize];
     let mut bins = synth_bins(n, &n_buckets, 1);
     bins[0] = 16; // == n_buckets -> out of the valid 0..16 range
-    let err = pack_cindex(&bins, &n_buckets, n);
+    let err = pack_cindex(&bins, &n_buckets, &vec![false; n_buckets.len()], n);
     assert!(
         matches!(err, Err(cb_core::CbError::OutOfRange(_))),
         "out-of-range bin must surface CbError::OutOfRange, got {err:?}"
@@ -297,7 +298,7 @@ fn feature_bits_and_overflow_guards() {
 
     // Length disagreement surfaces LengthMismatch.
     let short = &bins[..bins.len() - 1];
-    let err = pack_cindex(short, &n_buckets, n);
+    let err = pack_cindex(short, &n_buckets, &vec![false; n_buckets.len()], n);
     assert!(
         matches!(err, Err(cb_core::CbError::LengthMismatch { .. })),
         "wrong bins length must surface CbError::LengthMismatch, got {err:?}"

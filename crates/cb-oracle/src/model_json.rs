@@ -24,6 +24,12 @@ use crate::error::OracleError;
 pub struct SplitJson {
     /// Split border (threshold). For a `FloatFeature` split this is the float
     /// feature threshold; for an `OnlineCtr` split it is the CTR-value border.
+    /// ABSENT on `OneHotFeature` splits — a one-hot split is an equality test
+    /// (`cat_feature_index` == `value`) and carries no threshold at all — so the
+    /// field is `#[serde(default)]` (0.0) and is not meaningful for one. This
+    /// mirrors exactly why `float_feature_index` is defaulted for `OnlineCtr`:
+    /// requiring it would reject a real upstream `model.json` outright.
+    #[serde(default)]
     pub border: f64,
     /// Index of the float feature this split tests. Present on `FloatFeature`
     /// splits; ABSENT on `OnlineCtr` (CTR) splits — those reference a CTR table
@@ -36,9 +42,27 @@ pub struct SplitJson {
     /// Global split index in the model's split pool. For an `OnlineCtr` split this
     /// indexes the model's CTR feature definitions.
     pub split_index: i64,
-    /// Split kind: `"FloatFeature"` (numeric) or `"OnlineCtr"` (CTR). Unknown
-    /// CTR-only fields (e.g. `ctr_target_border_idx`) are ignored by serde.
+    /// Split kind: `"FloatFeature"` (numeric), `"OnlineCtr"` (CTR), or
+    /// `"OneHotFeature"` (categorical equality). Unknown kind-specific fields
+    /// (e.g. `ctr_target_border_idx`) are ignored by serde.
     pub split_type: String,
+    /// Index of the CATEGORICAL feature this split tests. Present only on
+    /// `OneHotFeature` splits; `None` for `FloatFeature` / `OnlineCtr`.
+    #[serde(default)]
+    pub cat_feature_index: Option<i64>,
+    /// The category this one-hot split tests for equality, as upstream's RAW
+    /// `calc_cat_feature_hash` output (an `i32` widened to `i64` by serde_json),
+    /// NOT a perfect-hash bin ordinal. Present only on `OneHotFeature` splits.
+    #[serde(default)]
+    pub value: Option<i64>,
+}
+
+impl SplitJson {
+    /// True for an upstream `OneHotFeature` split (a categorical equality test).
+    #[must_use]
+    pub fn is_one_hot(&self) -> bool {
+        self.split_type == "OneHotFeature"
+    }
 }
 
 /// One oblivious (symmetric) tree: a flat list of `leaf_values` of length
@@ -158,10 +182,22 @@ impl NonSymmetricNodeJson {
                 split_borders.push(f64::NEG_INFINITY);
                 step_nodes.push((0, 0));
                 let leaf_id = leaf_values.len();
-                node_id_to_leaf_id[id] =
+                let leaf_id_u32 =
                     u32::try_from(leaf_id).map_err(|_| OracleError::MalformedModel {
                         what: "non-symmetric leaf id exceeds u32".to_owned(),
                     })?;
+                // Checked `.get_mut` rather than raw indexing (workspace
+                // `indexing_slicing` lint): `node_id_to_leaf_id` is sized from the node
+                // count, so an out-of-range `id` means a malformed document, not a bug —
+                // surface it typed instead of panicking on a caller's file.
+                let node_count = node_id_to_leaf_id.len();
+                *node_id_to_leaf_id
+                    .get_mut(id)
+                    .ok_or_else(|| OracleError::MalformedModel {
+                        what: format!(
+                            "non-symmetric node id {id} is outside the {node_count}-node table"
+                        ),
+                    })? = leaf_id_u32;
                 leaf_values.push(value);
                 leaf_weights.push(node.weight.unwrap_or(0.0));
             }

@@ -62,37 +62,70 @@ pub struct CtrSplit {
     pub scale: f64,
 }
 
-/// One stored oblivious-tree split: EITHER a float threshold ([`Split`]) OR a
-/// tensor / combination CTR test ([`CtrSplit`]). Mirrors the trainer-side
-/// `cb_train::AnySplit` precedent (ORD-05 / D-05). Every split consumer
-/// (apply / SHAP / fstr / serialize) matches this enum exhaustively so no
-/// consumer silently drops a CTR split (T-05-09-03).
+/// One stored oblivious-tree ONE-HOT split (SPEC-OH-08): the equality test
+/// `calc_cat_feature_hash(raw_cat_value) == value_hash` on a single categorical
+/// column, mirroring upstream's `TOneHotFeature { Index, Values }` (one
+/// `Values[k]` entry per emitted bin).
+///
+/// # Value space
+/// `value_hash` is the UPSTREAM raw `i32` hash — the bit-preserving `as i32` of
+/// [`cb_data::calc_cat_feature_hash`]'s `u32` — and is **NOT** a
+/// `PerfectHash`/quantization bin. research.md §4.1 pinned this empirically by
+/// byte-scanning a real catboost 1.2.10 one-hot model: `Values` holds raw
+/// hashes, so a model saved here loads in upstream CatBoost and vice versa.
+///
+/// `cat_feature` is the ABSOLUTE categorical-column index (the pool's cat
+/// column position), matching upstream's `TOneHotFeature.Index`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OneHotModelSplit {
+    /// The ABSOLUTE categorical-column index this split tests.
+    pub cat_feature: usize,
+    /// The raw upstream `i32` `calc_cat_feature_hash` value the column must
+    /// equal for the split to pass. NOT a `PerfectHash` bin.
+    pub value_hash: i32,
+}
+
+/// One stored oblivious-tree split: a float threshold ([`Split`]), a one-hot
+/// categorical equality test ([`OneHotModelSplit`]), or a tensor / combination
+/// CTR test ([`CtrSplit`]). Mirrors the trainer-side `cb_train::AnySplit`
+/// precedent (ORD-05 / D-05). Every split consumer (apply / SHAP / fstr /
+/// serialize) matches this enum exhaustively so no consumer silently drops a
+/// split (T-05-09-03, SPEC-OH-08).
+///
+/// # Compatibility
+/// The [`ModelSplit::OneHot`] variant was ADDED after v1 (SPEC §8). This is a
+/// breaking change for any external code that matches `ModelSplit`
+/// exhaustively: such a match must gain a `OneHot` arm. Every in-tree consumer
+/// handles the variant explicitly — a silent drop is forbidden.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelSplit {
     /// A float `value > border` threshold split.
     Float(Split),
+    /// A one-hot categorical `calc_cat_feature_hash(value) == value_hash` test.
+    OneHot(OneHotModelSplit),
     /// A tensor / combination CTR `ctr_value > border` split.
     Ctr(CtrSplit),
 }
 
 impl ModelSplit {
-    /// The FLOAT feature index this split tests, or `None` for a CTR split. The
-    /// numeric-only feature-importance / SHAP consumers project over this (a CTR
-    /// split has no single float-feature index).
+    /// The FLOAT feature index this split tests, or `None` for a one-hot or CTR
+    /// split. The numeric-only feature-importance / SHAP consumers project over
+    /// this (neither a one-hot nor a CTR split has a float-feature index).
     #[must_use]
     pub fn float_feature(&self) -> Option<usize> {
         match self {
             Self::Float(s) => Some(s.feature),
-            Self::Ctr(_) => None,
+            Self::OneHot(_) | Self::Ctr(_) => None,
         }
     }
 
-    /// The inner [`Split`] for a float split, or `None` for a CTR split.
+    /// The inner [`Split`] for a float split, or `None` for a one-hot or CTR
+    /// split.
     #[must_use]
     pub fn as_float(&self) -> Option<&Split> {
         match self {
             Self::Float(s) => Some(s),
-            Self::Ctr(_) => None,
+            Self::OneHot(_) | Self::Ctr(_) => None,
         }
     }
 }
@@ -268,7 +301,18 @@ pub struct ObliviousTree {
 /// borders, the baked [`CtrData`] tables CTR splits look up, and (for the
 /// categorical apply path) the per-document raw categorical feature columns.
 /// Carries everything apply / SHAP / serialize need without a training pool.
+///
+/// # `#[non_exhaustive]` (F08 / SPEC-CATF-Δ4)
+///
+/// This struct is `#[non_exhaustive]`, so struct-literal syntax is illegal from
+/// any OTHER crate. Build one with [`Model::new`] plus the `with_*` builders.
+/// The reason is recorded so it is not re-litigated: every time this shared
+/// struct grew a field, every external exhaustive literal broke at once — a
+/// defect class found FOUR times while planning this change. `#[non_exhaustive]`
+/// paid that migration once, and from here a new `Model` field is a
+/// `cb-model`-internal change only.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Model {
     /// The oblivious trees in boosting (iteration) order.
     pub oblivious_trees: Vec<ObliviousTree>,
@@ -310,6 +354,25 @@ pub struct Model {
     /// Predictions recover the original labels via this map (`class_params` /
     /// `multiclass_params` model_info, verified empirically against catboost 1.2.10).
     pub class_to_label: Vec<f64>,
+    /// The number of categorical columns the training pool DECLARED (F08 /
+    /// SPEC-CATF-Δ4). `0` for every float-only model and for every model that
+    /// arrived through a codec (neither the `.cbm` nor the JSON decoder has a
+    /// pool to report a width from).
+    ///
+    /// This is the DECLARED width, never one derived from the splits the model
+    /// happened to choose. `max(projection member) + 1` equals the true training
+    /// width only if the highest-indexed cat column is BOTH CTR-eligible AND
+    /// selected by some split; two reachable counterexamples at default
+    /// parameters are (a) a trailing cardinality-2 column that routes to
+    /// `EncodingPath::OneHot` and so never enters `eligible_absolute`, and (b) an
+    /// uninformative column that is never selected. In both, a derived width is
+    /// a strict LOWER BOUND, and enforcing it as equality would reject the
+    /// entirely legitimate `fit(pool) -> predict(same pool)`.
+    ///
+    /// **Runtime-only.** Neither the `.cbm` encoder nor `json.rs`'s serde shape
+    /// writes or reads it, so every frozen byte-identity baseline stays valid
+    /// (guarded by `adding_the_cat_feature_count_does_not_change_cbm_bytes`).
+    pub cat_feature_count: usize,
 }
 
 impl Model {
@@ -328,17 +391,11 @@ impl Model {
             .oblivious_trees
             .iter()
             .map(|t| {
-                let mut splits: Vec<ModelSplit> = t
-                    .splits
-                    .iter()
-                    .map(|s| ModelSplit::Float(*s))
-                    .collect();
-                // Lift any trainer-side tensor-CTR splits into ModelSplit::Ctr
-                // (ORD-05 / D-05). The numeric / one-hot / ordered paths carry an
-                // empty `ctr_splits`, so this is a no-op there.
-                for c in &t.ctr_splits {
+                // Lift one trainer-side tensor-CTR split into a `ModelSplit::Ctr`
+                // (ORD-05 / D-05).
+                let lift_ctr = |c: &cb_train::CtrSplitSpec| {
                     let ctr_type = ECtrType::from_i8(c.ctr_type).unwrap_or(ECtrType::Borders);
-                    splits.push(ModelSplit::Ctr(CtrSplit {
+                    ModelSplit::Ctr(CtrSplit {
                         projection: c.projection.clone(),
                         ctr_type,
                         prior: Prior {
@@ -352,8 +409,80 @@ impl Model {
                         // the found and not-found branches (Plan 05-14).
                         shift: c.shift,
                         scale: c.scale,
-                    }));
-                }
+                    })
+                };
+
+                // SPEC-OH-09: lift one trainer-side one-hot split into a
+                // `ModelSplit::OneHot`, translating BOTH of its coordinates out of
+                // the fit-local trainer space into upstream's model space:
+                //
+                //   * `feature` is the dense ONE-HOT POSITION (an index into the
+                //     matrix's `cat_bins`), which upstream has never heard of —
+                //     `one_hot_absolute[position]` maps it to the ABSOLUTE
+                //     cat-column index that `TOneHotFeature.Index` stores;
+                //   * `value` is a first-seen `PerfectHash` BIN, likewise fit-local
+                //     — `one_hot_bin_to_hash[position][bin]` maps it to the RAW
+                //     `calc_cat_feature_hash` value `TOneHotFeature.Values` stores.
+                //
+                // The `as i32` is the bit-preserving cast the `.cbm` writer and the
+                // apply-side equality test both use ([C3]: the hash is `u32`,
+                // the wire field is `i32`).
+                //
+                // A missing table entry drops the split rather than emitting a
+                // wrong one: `from_trained` is infallible (`#[must_use]`, 24
+                // callers), and a fabricated `value_hash` would silently
+                // mis-predict, whereas a dropped level is caught by the
+                // production oracle (SPEC-OH-28 / T22), which compares against
+                // upstream predictions.
+                let lift_one_hot = |oh: &cb_train::OneHotSplit| -> Option<ModelSplit> {
+                    let cat_feature = trained.one_hot_absolute.get(oh.feature).copied()?;
+                    let value_hash = trained
+                        .one_hot_bin_to_hash
+                        .get(oh.feature)
+                        .and_then(|table| table.get(oh.value as usize))
+                        .copied()?;
+                    Some(ModelSplit::OneHot(crate::OneHotModelSplit {
+                        cat_feature,
+                        value_hash: value_hash as i32,
+                    }))
+                };
+
+                // SPEC-OH-02: the STORED split order IS the leaf-index bit order
+                // (`leaf_index_for`, apply.rs:208-215), and `.cbm` save/load
+                // preserve it 1:1. So when a tree's levels interleave kinds, the
+                // splits must be emitted in TRUE LEVEL order — assembling them
+                // kind-grouped (all floats, then all CTRs) transposes leaf indices
+                // and mis-predicts.
+                let splits: Vec<ModelSplit> = if t.level_kinds.is_empty() {
+                    // LEGACY PATH — every single-kind tree (which is every tree the
+                    // float, device, one-hot-free and ordered paths produce) leaves
+                    // `level_kinds` empty and keeps the exact pre-change assembly:
+                    // floats first, then CTRs. Byte-identical (SPEC-OH-31).
+                    let mut splits: Vec<ModelSplit> =
+                        t.splits.iter().map(|s| ModelSplit::Float(*s)).collect();
+                    splits.extend(t.ctr_splits.iter().map(&lift_ctr));
+                    splits
+                } else {
+                    // MIXED-KIND PATH — walk the recorded per-level kinds in order,
+                    // indexing back into the parallel kind-grouped vectors. An index
+                    // out of range is skipped defensively: a malformed
+                    // `level_kinds` must not panic across the crate boundary
+                    // (no `unwrap`, no indexing_slicing).
+                    t.level_kinds
+                        .iter()
+                        .filter_map(|kind| match *kind {
+                            cb_train::LevelKind::Float(idx) => {
+                                t.splits.get(idx).copied().map(ModelSplit::Float)
+                            }
+                            cb_train::LevelKind::OneHot(idx) => {
+                                t.one_hot_splits.get(idx).and_then(&lift_one_hot)
+                            }
+                            cb_train::LevelKind::Ctr { ctr_idx, .. } => {
+                                t.ctr_splits.get(ctr_idx).map(&lift_ctr)
+                            }
+                        })
+                        .collect()
+                };
                 ObliviousTree {
                     splits,
                     leaf_values: t.leaf_values.clone(),
@@ -414,6 +543,7 @@ impl Model {
             })
             .collect();
         Self {
+            cat_feature_count: 0,
             oblivious_trees,
             non_symmetric_trees,
             region_trees,
@@ -425,12 +555,90 @@ impl Model {
         }
     }
 
+    /// Build a model from the three fields every model must supply, leaving
+    /// every other field at its zero/empty value (`approx_dimension: 1`,
+    /// `cat_feature_count: 0`, `ctr_data: None`, no non-symmetric or region
+    /// trees, no `class_to_label`).
+    ///
+    /// This is the entry point for the `with_*` builders, and — because
+    /// [`Model`] is `#[non_exhaustive]` — the ONLY way an external crate can
+    /// construct one. Chain the builders to express the other shapes:
+    /// [`Self::with_ctr_data`], [`Self::with_non_symmetric_trees`],
+    /// [`Self::with_region_trees`], [`Self::with_approx_dimension`],
+    /// [`Self::with_class_to_label`], [`Self::with_cat_feature_count`].
+    #[must_use]
+    pub fn new(
+        oblivious_trees: Vec<ObliviousTree>,
+        bias: f64,
+        float_feature_borders: Vec<Vec<f64>>,
+    ) -> Self {
+        Self {
+            oblivious_trees,
+            non_symmetric_trees: Vec::new(),
+            region_trees: Vec::new(),
+            bias,
+            float_feature_borders,
+            ctr_data: None,
+            approx_dimension: 1,
+            class_to_label: Vec::new(),
+            cat_feature_count: 0,
+        }
+    }
+
     /// Attach the baked [`CtrData`] tables CTR splits look up at apply time
     /// (the categorical train→predict path threads the model's `ctr_data` in).
     #[must_use]
     pub fn with_ctr_data(mut self, ctr_data: CtrData) -> Self {
         self.ctr_data = Some(ctr_data);
         self
+    }
+
+    /// Replace the non-symmetric (Lossguide / Depthwise) trees. A model is
+    /// EITHER all-oblivious or all-non-symmetric — upstream never mixes grow
+    /// policies within one model.
+    #[must_use]
+    pub fn with_non_symmetric_trees(mut self, trees: Vec<NonSymmetricTree>) -> Self {
+        self.non_symmetric_trees = trees;
+        self
+    }
+
+    /// Replace the region path trees (GPUT-18 / D-03a).
+    #[must_use]
+    pub fn with_region_trees(mut self, trees: Vec<RegionTree>) -> Self {
+        self.region_trees = trees;
+        self
+    }
+
+    /// Set the number of output (approx) dimensions — `1` for every scalar
+    /// regression / binary model, `> 1` for multiclass / multilabel /
+    /// MultiQuantile.
+    #[must_use]
+    pub fn with_approx_dimension(mut self, approx_dimension: usize) -> Self {
+        self.approx_dimension = approx_dimension;
+        self
+    }
+
+    /// Set the `ClassToLabel` map (the SORTED distinct original class labels).
+    #[must_use]
+    pub fn with_class_to_label(mut self, class_to_label: Vec<f64>) -> Self {
+        self.class_to_label = class_to_label;
+        self
+    }
+
+    /// Record the number of categorical columns the training pool DECLARED
+    /// (F08 / SPEC-CATF-Δ4). See [`Model::cat_feature_count`] for why this must
+    /// be the declared width and never one derived from the chosen splits.
+    #[must_use]
+    pub fn with_cat_feature_count(mut self, cat_feature_count: usize) -> Self {
+        self.cat_feature_count = cat_feature_count;
+        self
+    }
+
+    /// The number of categorical columns the training pool declared; `0` for a
+    /// float-only model or one loaded from a codec.
+    #[must_use]
+    pub fn cat_feature_count(&self) -> usize {
+        self.cat_feature_count
     }
 
     /// Per-tree leaf values flattened in tree order.
@@ -451,3 +659,7 @@ impl Model {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "model_test.rs"]
+mod model_test;

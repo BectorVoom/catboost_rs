@@ -1,0 +1,675 @@
+$ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB
+
+GPU: Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB | P100 requested: True
+copied /kaggle/input/datasets/boomvector/catboost-rs-poisson-src -> /kaggle/tmp/cbrs
+$ grep -c 'poisson_bootstrap_kernel' /kaggle/tmp/cbrs/crates/cb-backend/src/kernels/bootstrap_device.rs || true
+3
+
+has_poisson_kernel: True
+$ grep -c 'NextUniform' /kaggle/tmp/cbrs/crates/cb-backend/src/kernels/bootstrap_device.rs || true
+7
+
+has_upstream_next_poisson: True
+$ grep -c 'create_poisson_seeds' /kaggle/tmp/cbrs/crates/cb-backend/src/gpu_runtime/session.rs || true
+2
+
+has_poisson_seeds: True
+$ grep -c 'device_poisson' /kaggle/tmp/cbrs/crates/cb-train/src/boosting.rs || true
+3
+
+has_poisson_wiring: True
+$ grep -c 'bit_for_bit' /kaggle/tmp/cbrs/crates/cb-backend/src/kernels/poisson_bootstrap_oracle_test.rs || true
+3
+
+has_poisson_oracle_test: True
+$ grep -c 'stride' /kaggle/tmp/cbrs/crates/cb-oracle/fixtures/bootstrap_poisson/wide/config.json || true
+1
+
+has_poisson_fixtures: True
+$ rustc --version
+/bin/sh: 1: rustc: not found
+
+$ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
+
+$ rustc --version && cargo --version && nvcc --version | tail -2
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+
+
+======================================================================
+PART A — oracle (blocking)
+======================================================================
+$ cargo test -p cb-backend --no-default-features --features cuda --lib poisson_bootstrap_oracle_test -- --test-threads 1 --nocapture
+ type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9
+    |
+165 |     let mut new_node = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9
+    |
+181 |     let mut do_split = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 26s
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/cb_backend-055be287c1335ccf)
+
+running 8 tests
+test kernels::poisson_bootstrap_oracle_test::poisson_draw_is_deterministic ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_grid_matches_upstream_launch_geometry ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_grid_wrap_matches_upstream_bit_for_bit ... [poisson oracle grid_wrap] n=4096 seeds=1024 lambda=1.609438 stride=1024 rounds=2 mean=1.5806 — bit-for-bit vs upstream
+ok
+test kernels::poisson_bootstrap_oracle_test::poisson_lambda_matches_upstream_formula ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_one_pass_matches_upstream_bit_for_bit ... [poisson oracle one_pass] n=1000 seeds=65536 lambda=1.078810 stride=1024 rounds=2 mean=1.0740 — bit-for-bit vs upstream
+ok
+test kernels::poisson_bootstrap_oracle_test::poisson_rejects_subsample_at_or_above_one ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_seed_buffer_is_well_formed ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_wide_matches_upstream_bit_for_bit ... [poisson oracle wide] n=20000 seeds=65536 lambda=1.609438 stride=20224 rounds=2 mean=1.6067 — bit-for-bit vs upstream
+ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.85s
+
+
+[oracle] Poisson upstream oracle (CUDA, bit-for-bit): rc=0 passed=8 failed=0
+$ cargo test -p cb-train --no-default-features --features cuda --test device_poisson_bootstrap_test -- --test-threads 1 --nocapture
+fers v25.12.19
+   Compiling anyhow v1.0.102
+   Compiling either v1.16.0
+   Compiling cb-oracle v0.1.0 (/kaggle/tmp/cbrs/crates/cb-oracle)
+   Compiling itertools v0.14.0
+   Compiling arrow-ipc v59.0.0
+   Compiling approx v0.5.1
+   Compiling prost-derive v0.14.4
+   Compiling arrow v59.0.0
+   Compiling cb-data v0.1.0 (/kaggle/tmp/cbrs/crates/cb-data)
+   Compiling prost v0.14.4
+   Compiling cb-compute v0.1.0 (/kaggle/tmp/cbrs/crates/cb-compute)
+   Compiling cb-backend v0.1.0 (/kaggle/tmp/cbrs/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling cb-train v0.1.0 (/kaggle/tmp/cbrs/crates/cb-train)
+   Compiling cb-model v0.1.0 (/kaggle/tmp/cbrs/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.71s
+     Running tests/device_poisson_bootstrap_test.rs (/kaggle/tmp/target/debug/deps/device_poisson_bootstrap_test-16a30cd40aeac7ce)
+
+running 6 tests
+test poisson_is_run_to_run_deterministic ... [poisson e2e] run-to-run max|dpred| = 0 (bit-identical)
+ok
+test poisson_model_still_learns ... [poisson e2e] rmse 0.1602 vs constant-predictor 0.6963 (spread 2.151)
+ok
+test poisson_rejects_degenerate_subsample ... [poisson e2e] degenerate subsample rejected: value out of range: Poisson bootstrap needs subsample in (0, 1): upstream's GetPoissonLambda returns -1 for subsample >= 1, which zeroes every sample weight (got subsample = 1)
+ok
+test poisson_sampling_changes_the_model ... [poisson e2e] sampled vs unsampled max|dpred| = 2.303e-2
+ok
+test poisson_seed_changes_the_draw ... [poisson e2e] seed 1 vs 2 max|dpred| = 2.277e-2
+ok
+test poisson_subsample_changes_the_draw ... [poisson e2e] subsample 0.5 vs 0.9 max|dpred| = 3.266e-2
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.53s
+
+
+[oracle] Poisson device e2e (CUDA): rc=0 passed=6 failed=0
+$ cargo test -p cb-train --no-default-features --features cuda --test bootstrap_dev_oracle_test -- --test-threads 1 --nocapture
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling cb-train v0.1.0 (/kaggle/tmp/cbrs/crates/cb-train)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.93s
+     Running tests/bootstrap_dev_oracle_test.rs (/kaggle/tmp/target/debug/deps/bootstrap_dev_oracle_test-d24ddddfb53097e2)
+
+running 1 test
+test bootstrap_dev_device_matches_upstream ... [device] bootstrap_dev/no: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+[device] bootstrap_dev/bayesian: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+[device] bootstrap_dev/bernoulli: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+[device] bootstrap_dev/mvs: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+
+[oracle] bias-0 device vs UPSTREAM CatBoost (CUDA): rc=0 passed=1 failed=0
+$ cargo test -p cb-train --no-default-features --features cuda --test device_bootstrap_parity_test -- --test-threads 1 --nocapture
+ound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling cb-train v0.1.0 (/kaggle/tmp/cbrs/crates/cb-train)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.42s
+     Running tests/device_bootstrap_parity_test.rs (/kaggle/tmp/target/debug/deps/device_bootstrap_parity_test-b5bacd0ec4b8c331)
+
+running 4 tests
+test poisson_trains_on_device_and_is_refused_on_cpu ... [poisson] device trained 3 trees; CPU refused: degenerate training input: poisson bootstrap is not supported on CPU (upstream CatBoost rejects it on the CPU task type). It requires the device grow path: build with the `cuda` or `rocm` backend feature and a device-eligible configuration (grow_policy = SymmetricTree, random_strength = 0, unit object weights, boost_from_average = false, Gradient/Simple leaves, no CTR / eval sets / groups)
+ok
+test wr01_base_device_grower_holds_1e5_vs_cpu ... [BASE n=512 nf=4 d=3 it=5] max|Δpred|=3.605e-11 split_mismatched_trees=0/5
+[BASE n=2048 nf=8 d=6 it=10] max|Δpred|=5.992e-11 split_mismatched_trees=0/10
+[BASE n=20000 nf=16 d=6 it=20] max|Δpred|=6.212e-11 split_mismatched_trees=4/20
+[BASE n=20000 nf=16 d=6 it=20]   tree 0 split-mismatch: max|Δcontribution|=2.799e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 4 split-mismatch: max|Δcontribution|=1.847e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 9 split-mismatch: max|Δcontribution|=2.405e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 19 split-mismatch: max|Δcontribution|=2.121e-11
+ok
+test wr01_device_run_to_run_jitter_within_budget ... [jitter/no] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/bernoulli] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/mvs] run-to-run max|Δpred| over 5 fits = 0.000e0
+ok
+test wr01_device_sampled_bootstrap_holds_1e5_vs_cpu ... [bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.589e-11 split_mismatched_trees=2/20 first_mismatched_trees=[0, 3]
+[bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=3.003e-3
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.477e-11 split_mismatched_trees=4/20 first_mismatched_trees=[0, 5, 17, 19]
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=4.878e-3
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=6.798e-11 split_mismatched_trees=4/20 first_mismatched_trees=[3, 5, 11, 17]
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=3.056e-3
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 70.89s
+
+
+[oracle] WR-01 device bootstrap parity (CUDA): rc=0 passed=4 failed=0
+$ cargo test -p cb-backend --no-default-features --features cuda --lib bootstrap -- --test-threads 1 --nocapture
+ to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9
+    |
+181 |     let mut do_split = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.63s
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/cb_backend-055be287c1335ccf)
+
+running 16 tests
+test gpu_runtime::session_depth_gt1_test::session_bootstrap_gate_covers_bernoulli_bayesian_poisson ... ok
+test gpu_runtime::session_depth_gt1_test::session_bootstrap_grows_finite_tree ... ok
+test kernels::bootstrap_device_test::bayesian_weights_match_frozen_cpu_sample_within_epsilon ... [bootstrap bayesian seed=17 temp=1 n=64] max_div=2.384e-7
+[bootstrap bayesian seed=7 temp=0.5 n=1536] max_div=2.384e-7
+ok
+test kernels::bootstrap_device_test::bernoulli_keep_mask_matches_frozen_cpu_sample_bit_for_bit ... [bootstrap bernoulli seed=17 rate=0.5] kept device=25 cpu=25 / 37
+[bootstrap bernoulli seed=42 rate=0.7] kept device=86 cpu=86 / 128
+[bootstrap bernoulli seed=123 rate=0.3] kept device=79 cpu=79 / 250
+ok
+test kernels::bootstrap_device_test::bernoulli_leaves_match_transitively_via_identical_mask ... [bootstrap leaves] device=-0.62965180 cpu=-0.62965180 div=0.000e0
+ok
+test kernels::bootstrap_device_test::poisson_does_not_ride_the_host_stream_draw_path ... ok
+test kernels::bootstrap_device_test::score_stddev_is_deterministic_and_matches_population_stddev ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_draw_is_deterministic ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_grid_matches_upstream_launch_geometry ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_grid_wrap_matches_upstream_bit_for_bit ... [poisson oracle grid_wrap] n=4096 seeds=1024 lambda=1.609438 stride=1024 rounds=2 mean=1.5806 — bit-for-bit vs upstream
+ok
+test kernels::poisson_bootstrap_oracle_test::poisson_lambda_matches_upstream_formula ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_one_pass_matches_upstream_bit_for_bit ... [poisson oracle one_pass] n=1000 seeds=65536 lambda=1.078810 stride=1024 rounds=2 mean=1.0740 — bit-for-bit vs upstream
+ok
+test kernels::poisson_bootstrap_oracle_test::poisson_rejects_subsample_at_or_above_one ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_seed_buffer_is_well_formed ... ok
+test kernels::poisson_bootstrap_oracle_test::poisson_wide_matches_upstream_bit_for_bit ... [poisson oracle wide] n=20000 seeds=65536 lambda=1.609438 stride=20224 rounds=2 mean=1.6067 — bit-for-bit vs upstream
+ok
+test kernels::poisson_bootstrap_speed_test::poisson_parallel_draw_outpaces_the_serial_stream_draw ... [poisson speed] n=2000000: parallel Poisson 17.1ms vs serial stream draw 210.1ms -> 12.3x
+ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 205 filtered out; finished in 2.62s
+
+
+[oracle] device bootstrap kernels (CUDA): rc=0 passed=16 failed=0
+$ cargo test -p cb-backend --no-default-features --features cuda --release --lib poisson_bootstrap_speed_test -- --test-threads 1 --nocapture
+ Compiling zlib-rs v0.6.3
+   Compiling simd-adler32 v0.3.9
+   Compiling zopfli v0.8.3
+   Compiling flate2 v1.1.9
+   Compiling cubecl-cpp v0.10.0
+   Compiling arrow v59.0.0
+   Compiling pest_derive v2.8.6
+   Compiling cb-core v0.1.0 (/kaggle/tmp/cbrs/crates/cb-core)
+   Compiling cubecl v0.10.0
+   Compiling cb-data v0.1.0 (/kaggle/tmp/cbrs/crates/cb-data)
+   Compiling py_literal v0.4.0
+   Compiling ndarray v0.17.2
+   Compiling zip v6.0.0
+   Compiling cubecl-std v0.10.0
+   Compiling byteorder v1.5.0
+   Compiling ndarray-npy v0.10.0
+   Compiling cb-compute v0.1.0 (/kaggle/tmp/cbrs/crates/cb-compute)
+   Compiling cb-backend v0.1.0 (/kaggle/tmp/cbrs/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:165:9
+    |
+165 |     let mut new_node = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9
+    |
+181 |     let mut do_split = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 10m 17s
+     Running unittests src/lib.rs (/kaggle/tmp/target/release/deps/cb_backend-95c81c410e793e9e)
+
+running 1 test
+test kernels::poisson_bootstrap_speed_test::poisson_parallel_draw_outpaces_the_serial_stream_draw ... [poisson speed] n=2000000: parallel Poisson 17.4ms vs serial stream draw 210.2ms -> 12.1x
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 220 filtered out; finished in 1.07s
+
+
+[oracle] Poisson parallel-draw speed (CUDA): rc=0 passed=1 failed=0
+$ cargo test -p cb-train --no-default-features --features cuda --release --test device_bootstrap_speed_test -- --test-threads 1 --nocapture
+   Compiling flatbuffers v25.12.19
+   Compiling anyhow v1.0.102
+   Compiling either v1.16.0
+   Compiling cb-oracle v0.1.0 (/kaggle/tmp/cbrs/crates/cb-oracle)
+   Compiling itertools v0.14.0
+   Compiling arrow-ipc v59.0.0
+   Compiling approx v0.5.1
+   Compiling prost-derive v0.14.4
+   Compiling arrow v59.0.0
+   Compiling cb-data v0.1.0 (/kaggle/tmp/cbrs/crates/cb-data)
+   Compiling cb-compute v0.1.0 (/kaggle/tmp/cbrs/crates/cb-compute)
+   Compiling prost v0.14.4
+   Compiling cb-backend v0.1.0 (/kaggle/tmp/cbrs/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling cb-train v0.1.0 (/kaggle/tmp/cbrs/crates/cb-train)
+   Compiling cb-model v0.1.0 (/kaggle/tmp/cbrs/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 43.93s
+     Running tests/device_bootstrap_speed_test.rs (/kaggle/tmp/target/release/deps/device_bootstrap_speed_test-d215efcf5c80c662)
+
+running 1 test
+test wr01_sampled_fits_run_at_device_speed ... [speed] No        0.079s (device baseline, n=60000 nf=24)
+[speed] Bernoulli 0.098s  ratio_vs_No=1.25x
+[speed] Bayesian  0.110s  ratio_vs_No=1.40x
+[speed] MVS       0.122s  ratio_vs_No=1.55x
+[speed] Poisson   0.078s  ratio_vs_No=0.99x
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.50s
+
+
+[oracle] sampled fits run at device speed (CUDA): rc=0 passed=1 failed=0
+PART A verdict: ORACLE-PASS
+
+======================================================================
+PART B — speed
+======================================================================
+$ /usr/bin/python3 -m pip install -q maturin
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.6/10.6 MB 88.9 MB/s eta 0:00:00
+
+$ maturin build --release --no-default-features --features cuda -m /kaggle/tmp/cbrs/crates/catboost-rs-py/Cargo.toml
+cast v59.0.0
+   Compiling cubecl-macros v0.10.0
+   Compiling cubecl-runtime v0.10.0
+   Compiling pyo3-build-config v0.29.0
+   Compiling polars-core v0.54.4
+   Compiling cubecl-core v0.10.0
+   Compiling polars-ops v0.54.4
+   Compiling num-rational v0.4.2
+   Compiling now v0.1.3
+   Compiling num-iter v0.1.45
+   Compiling num v0.4.3
+   Compiling polars-time v0.54.4
+   Compiling cubecl-opt v0.10.0
+   Compiling polars-io v0.54.4
+   Compiling arrow-ipc v59.0.0
+   Compiling arrow-csv v59.0.0
+   Compiling pyo3-ffi v0.29.0
+   Compiling arrow-json v59.0.0
+   Compiling arrow-string v59.0.0
+   Compiling arrow-arith v59.0.0
+   Compiling arrow-row v59.0.0
+   Compiling cubecl-cpp v0.10.0
+   Compiling arrow v59.0.0
+   Compiling polars v0.54.4
+   Compiling cb-data v0.1.0 (/kaggle/tmp/cbrs/crates/cb-data)
+   Compiling cubecl-cuda v0.10.0
+   Compiling cubecl-std v0.10.0
+   Compiling pyo3 v0.29.0
+   Compiling cubecl v0.10.0
+   Compiling cb-compute v0.1.0 (/kaggle/tmp/cbrs/crates/cb-compute)
+   Compiling pyo3-macros-backend v0.29.0
+   Compiling cb-backend v0.1.0 (/kaggle/tmp/cbrs/crates/cb-backend)
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:645:30
+    |
+645 |         let mut acc = F::new(0.0);
+    |                              ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling pyo3-macros v0.29.0
+   Compiling numpy v0.29.0
+   Compiling thiserror v1.0.69
+   Compiling cb-train v0.1.0 (/kaggle/tmp/cbrs/crates/cb-train)
+   Compiling ndarray v0.17.2
+   Compiling thiserror-impl v1.0.69
+   Compiling cb-model v0.1.0 (/kaggle/tmp/cbrs/crates/cb-model)
+   Compiling pyo3-arrow v0.19.0
+   Compiling catboost-rs v0.1.0 (/kaggle/tmp/cbrs/crates/catboost-rs)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling catboost-rs-py v0.1.0 (/kaggle/tmp/cbrs/crates/catboost-rs-py)
+    Finished `release` profile [optimized] target(s) in 9m 01s
+📦 Built wheel for abi3 Python ≥ 3.12 to /kaggle/tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl
+
+$ /usr/bin/python3 -m pip install --force-reinstall /kaggle/tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl
+Processing /kaggle/tmp/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl
+Installing collected packages: catboost-rs
+Successfully installed catboost-rs-0.1.0
+
+
+--- PART B0: device residency proof (CB_GPU_PROF) ---
+$ /usr/bin/python3 /kaggle/working/probe.py Poisson {"subsample": 0.8}
+CB_GPU_PROF fit-prep copy+borders elapsed=1.71ms
+CB_GPU_PROF quantize n=4000 nf=8 elapsed=0.60ms
+CB_GPU_PROF begin covered=true n=4000 nf=8 n_bins=33 elapsed=104.48ms
+CB_GPU_PROF hist-fill probe cpf=128: multicopy=0.09ms lds=0.06ms -> Lds
+CB_GPU_PROF hist-fill probe cpf=256: multicopy=0.06ms lds=0.06ms -> MultiCopy
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=897.16ms derive=75.85ms score=169.62ms split=70.63ms stats_read=154.86ms leaf_apply_der=63.57ms
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=0.39ms derive=0.08ms score=0.51ms split=0.13ms stats_read=0.10ms leaf_apply_der=0.06ms
+CB_GPU_PROF fit-train elapsed=1539.11ms
+
+[residency] Poisson: device_resident=True (tree lines=2, rc=0)
+$ /usr/bin/python3 /kaggle/working/probe.py No {}
+CB_GPU_PROF fit-prep copy+borders elapsed=1.79ms
+CB_GPU_PROF quantize n=4000 nf=8 elapsed=0.42ms
+CB_GPU_PROF begin covered=true n=4000 nf=8 n_bins=33 elapsed=103.24ms
+CB_GPU_PROF hist-fill probe cpf=128: multicopy=0.07ms lds=0.06ms -> Lds
+CB_GPU_PROF hist-fill probe cpf=256: multicopy=0.05ms lds=0.06ms -> MultiCopy
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=523.85ms derive=66.90ms score=168.65ms split=57.45ms stats_read=112.54ms leaf_apply_der=50.09ms
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=0.44ms derive=0.07ms score=0.23ms split=0.10ms stats_read=0.08ms leaf_apply_der=0.05ms
+CB_GPU_PROF fit-train elapsed=1085.04ms
+
+[residency] No: device_resident=True (tree lines=2, rc=0)
+$ /usr/bin/python3 /kaggle/working/probe.py Bernoulli {"subsample": 0.8}
+CB_GPU_PROF fit-prep copy+borders elapsed=3.20ms
+CB_GPU_PROF quantize n=4000 nf=8 elapsed=0.63ms
+CB_GPU_PROF begin covered=true n=4000 nf=8 n_bins=33 elapsed=96.37ms
+CB_GPU_PROF hist-fill probe cpf=128: multicopy=0.07ms lds=0.06ms -> Lds
+CB_GPU_PROF hist-fill probe cpf=256: multicopy=0.05ms lds=0.06ms -> MultiCopy
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=622.65ms derive=53.96ms score=125.95ms split=54.66ms stats_read=110.94ms leaf_apply_der=49.19ms
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=0.28ms derive=0.06ms score=0.22ms split=0.09ms stats_read=0.16ms leaf_apply_der=0.08ms
+CB_GPU_PROF fit-train elapsed=1116.32ms
+
+[residency] Bernoulli: device_resident=True (tree lines=2, rc=0)
+$ /usr/bin/python3 /kaggle/working/probe.py Bayesian {"bagging_temperature": 1.0}
+CB_GPU_PROF fit-prep copy+borders elapsed=5.69ms
+CB_GPU_PROF quantize n=4000 nf=8 elapsed=1.89ms
+CB_GPU_PROF begin covered=true n=4000 nf=8 n_bins=33 elapsed=91.72ms
+CB_GPU_PROF hist-fill probe cpf=128: multicopy=0.09ms lds=0.07ms -> Lds
+CB_GPU_PROF hist-fill probe cpf=256: multicopy=0.09ms lds=0.07ms -> Lds
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=589.18ms derive=54.38ms score=117.39ms split=53.12ms stats_read=106.12ms leaf_apply_der=48.97ms
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=0.49ms derive=0.11ms score=0.28ms split=0.14ms stats_read=0.13ms leaf_apply_der=0.08ms
+CB_GPU_PROF fit-train elapsed=1065.25ms
+
+[residency] Bayesian: device_resident=True (tree lines=2, rc=0)
+$ /usr/bin/python3 /kaggle/working/probe.py MVS {"subsample": 0.8}
+CB_GPU_PROF fit-prep copy+borders elapsed=1.64ms
+CB_GPU_PROF quantize n=4000 nf=8 elapsed=0.51ms
+CB_GPU_PROF begin covered=true n=4000 nf=8 n_bins=33 elapsed=97.53ms
+CB_GPU_PROF hist-fill probe cpf=128: multicopy=0.06ms lds=0.06ms -> Lds
+CB_GPU_PROF hist-fill probe cpf=256: multicopy=0.05ms lds=0.06ms -> MultiCopy
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=528.40ms derive=56.56ms score=175.20ms split=55.09ms stats_read=121.01ms leaf_apply_der=50.91ms
+CB_GPU_PROF tree n=4000 nf=8 bins=64 depth=3 fill=0.29ms derive=0.08ms score=0.22ms split=0.09ms stats_read=0.08ms leaf_apply_der=0.05ms
+CB_GPU_PROF fit-train elapsed=1172.40ms
+
+[residency] MVS: device_resident=True (tree lines=2, rc=0)
+
+--- bootstrap_type=Poisson (catboost_rs device-resident PROVEN: True) ---
+[catboost_rs[Poisson]] fit_s=1.0851 train_rmse=4.307280
+[catboost_gpu[Poisson]] fit_s=1.2572 train_rmse=4.309988
+[catboost_cpu[Poisson]] warm fit FAILED: catboost/private/libs/options/bootstrap_options.cpp:29: Error: poisson bootstrap is not supported on CPU
+
+--- bootstrap_type=No (catboost_rs device-resident PROVEN: True) ---
+[catboost_rs[No]] fit_s=1.0853 train_rmse=4.307126
+[catboost_gpu[No]] fit_s=1.1995 train_rmse=4.309055
+[catboost_cpu[No]] fit_s=1.8551 train_rmse=4.309055
+
+--- bootstrap_type=Bernoulli (catboost_rs device-resident PROVEN: True) ---
+[catboost_rs[Bernoulli]] fit_s=1.2526 train_rmse=4.309293
+[catboost_gpu[Bernoulli]] fit_s=1.2208 train_rmse=4.309728
+[catboost_cpu[Bernoulli]] fit_s=1.8892 train_rmse=4.311261
+
+--- bootstrap_type=Bayesian (catboost_rs device-resident PROVEN: True) ---
+[catboost_rs[Bayesian]] fit_s=1.4597 train_rmse=4.309573
+[catboost_gpu[Bayesian]] fit_s=1.2535 train_rmse=4.308913
+[catboost_cpu[Bayesian]] fit_s=1.9533 train_rmse=4.311477
+
+--- bootstrap_type=MVS (catboost_rs device-resident PROVEN: True) ---
+[catboost_rs[MVS]] fit_s=1.7051 train_rmse=4.308105
+[catboost_gpu[MVS]] fit_s=1.2504 train_rmse=4.329662
+[catboost_cpu[MVS]] fit_s=1.7652 train_rmse=4.307197
+
+# GPU-only Poisson bootstrap — oracle + speed (Kaggle CUDA)
+
+- GPU: `Tesla P100-PCIE-16GB, 580.159.04, 16384 MiB` (P100 requested: True)
+- verdict: **ORACLE-PASS**
+- catboost: 1.2.10
+- toolchain: `rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0`
+
+## Oracle
+
+| suite | passed | failed | blocking |
+|---|---|---|---|
+| Poisson upstream oracle (CUDA, bit-for-bit) | 8 | 0 | True |
+| Poisson device e2e (CUDA) | 6 | 0 | True |
+| bias-0 device vs UPSTREAM CatBoost (CUDA) | 1 | 0 | True |
+| WR-01 device bootstrap parity (CUDA) | 4 | 0 | True |
+| device bootstrap kernels (CUDA) | 16 | 0 | False |
+| Poisson parallel-draw speed (CUDA) | 1 | 0 | False |
+| sampled fits run at device speed (CUDA) | 1 | 0 | False |
+
+### Measured evidence
+
+```
+test kernels::poisson_bootstrap_oracle_test::poisson_grid_wrap_matches_upstream_bit_for_bit ... [poisson oracle grid_wrap] n=4096 seeds=1024 lambda=1.609438 stride=1024 rounds=2 mean=1.5806 — bit-for-bit vs upstream
+test kernels::poisson_bootstrap_oracle_test::poisson_one_pass_matches_upstream_bit_for_bit ... [poisson oracle one_pass] n=1000 seeds=65536 lambda=1.078810 stride=1024 rounds=2 mean=1.0740 — bit-for-bit vs upstream
+test kernels::poisson_bootstrap_oracle_test::poisson_wide_matches_upstream_bit_for_bit ... [poisson oracle wide] n=20000 seeds=65536 lambda=1.609438 stride=20224 rounds=2 mean=1.6067 — bit-for-bit vs upstream
+test poisson_is_run_to_run_deterministic ... [poisson e2e] run-to-run max|dpred| = 0 (bit-identical)
+test poisson_model_still_learns ... [poisson e2e] rmse 0.1602 vs constant-predictor 0.6963 (spread 2.151)
+test poisson_rejects_degenerate_subsample ... [poisson e2e] degenerate subsample rejected: value out of range: Poisson bootstrap needs subsample in (0, 1): upstream's GetPoissonLambda returns -1 for subsample >= 1, which zeroes every sample weight (got subsample = 1)
+test poisson_sampling_changes_the_model ... [poisson e2e] sampled vs unsampled max|dpred| = 2.303e-2
+test poisson_seed_changes_the_draw ... [poisson e2e] seed 1 vs 2 max|dpred| = 2.277e-2
+test poisson_subsample_changes_the_draw ... [poisson e2e] subsample 0.5 vs 0.9 max|dpred| = 3.266e-2
+test bootstrap_dev_device_matches_upstream ... [device] bootstrap_dev/no: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+[device] bootstrap_dev/bayesian: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+[device] bootstrap_dev/bernoulli: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+[device] bootstrap_dev/mvs: splits + leaf values + staged within 1e-5 of upstream over all 3 trees
+test poisson_trains_on_device_and_is_refused_on_cpu ... [poisson] device trained 3 trees; CPU refused: degenerate training input: poisson bootstrap is not supported on CPU (upstream CatBoost rejects it on the CPU task type). It requires the device grow path: build with the `cuda` or `rocm` backend feature and a device-eligible configuration (grow_policy = SymmetricTree, random_strength = 0, unit object weights, boost_from_average = false, Gradient/Simple leaves, no CTR / eval sets / groups)
+test wr01_base_device_grower_holds_1e5_vs_cpu ... [BASE n=512 nf=4 d=3 it=5] max|Δpred|=3.605e-11 split_mismatched_trees=0/5
+[BASE n=2048 nf=8 d=6 it=10] max|Δpred|=5.992e-11 split_mismatched_trees=0/10
+[BASE n=20000 nf=16 d=6 it=20] max|Δpred|=6.212e-11 split_mismatched_trees=4/20
+[BASE n=20000 nf=16 d=6 it=20]   tree 0 split-mismatch: max|Δcontribution|=2.799e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 4 split-mismatch: max|Δcontribution|=1.847e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 9 split-mismatch: max|Δcontribution|=2.405e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 19 split-mismatch: max|Δcontribution|=2.121e-11
+test wr01_device_run_to_run_jitter_within_budget ... [jitter/no] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/bernoulli] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/mvs] run-to-run max|Δpred| over 5 fits = 0.000e0
+test wr01_device_sampled_bootstrap_holds_1e5_vs_cpu ... [bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.589e-11 split_mismatched_trees=2/20 first_mismatched_trees=[0, 3]
+[bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=3.003e-3
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.477e-11 split_mismatched_trees=4/20 first_mismatched_trees=[0, 5, 17, 19]
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=4.878e-3
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=6.798e-11 split_mismatched_trees=4/20 first_mismatched_trees=[3, 5, 11, 17]
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=3.056e-3
+test kernels::poisson_bootstrap_oracle_test::poisson_grid_wrap_matches_upstream_bit_for_bit ... [poisson oracle grid_wrap] n=4096 seeds=1024 lambda=1.609438 stride=1024 rounds=2 mean=1.5806 — bit-for-bit vs upstream
+test kernels::poisson_bootstrap_oracle_test::poisson_one_pass_matches_upstream_bit_for_bit ... [poisson oracle one_pass] n=1000 seeds=65536 lambda=1.078810 stride=1024 rounds=2 mean=1.0740 — bit-for-bit vs upstream
+test kernels::poisson_bootstrap_oracle_test::poisson_wide_matches_upstream_bit_for_bit ... [poisson oracle wide] n=20000 seeds=65536 lambda=1.609438 stride=20224 rounds=2 mean=1.6067 — bit-for-bit vs upstream
+test kernels::poisson_bootstrap_speed_test::poisson_parallel_draw_outpaces_the_serial_stream_draw ... [poisson speed] n=2000000: parallel Poisson 17.1ms vs serial stream draw 210.1ms -> 12.3x
+test kernels::poisson_bootstrap_speed_test::poisson_parallel_draw_outpaces_the_serial_stream_draw ... [poisson speed] n=2000000: parallel Poisson 17.4ms vs serial stream draw 210.2ms -> 12.1x
+test wr01_sampled_fits_run_at_device_speed ... [speed] No        0.079s (device baseline, n=60000 nf=24)
+[speed] Bernoulli 0.098s  ratio_vs_No=1.25x
+[speed] Bayesian  0.110s  ratio_vs_No=1.40x
+[speed] MVS       0.122s  ratio_vs_No=1.55x
+[speed] Poisson   0.078s  ratio_vs_No=0.99x
+```
+
+## Speed (300000x50, depth 6, 30 iters, RMSE)
+
+| bootstrap | rs on device? | catboost_rs s | CatBoost GPU s | CatBoost CPU s | rs/CB-GPU |
+|---|---|---|---|---|---|
+| Poisson | True | 1.0851 | 1.2572 | None | 0.863 |
+| No | True | 1.0853 | 1.1995 | 1.8551 | 0.905 |
+| Bernoulli | True | 1.2526 | 1.2208 | 1.8892 | 1.026 |
+| Bayesian | True | 1.4597 | 1.2535 | 1.9533 | 1.164 |
+| MVS | True | 1.7051 | 1.2504 | 1.7652 | 1.364 |
+
+## Caveats
+
+- **poisson_parity_basis**: Poisson cannot be gated against a CatBoost-Python run: upstream rejects it on task_type=CPU, and its per-object GPU bootstrap weights are not exposed by any public API. Its parity evidence is bit-for-bit agreement between the device kernel and a verbatim host transcription of upstream's PoissonBootstrapImpl + random_gen.cuh (three launch geometries, two consecutive draws). The CatBoost GPU columns below are a SPEED and quality comparison, not a numeric parity gate.
+- **backend_asymmetry**: catboost_rs mirrors upstream's asymmetry: Poisson trains on the device and is REFUSED by the CPU grower, exactly as upstream accepts it on task_type=GPU and rejects it on task_type=CPU. The CatBoost CPU column is therefore expected to be null for the Poisson row — that is the correct result, not a failure.
+- **device_residency_proven**: Part B0 proves device residency per arm with CB_GPU_PROF=1 and the per-tree device lines the resident grower emits. Arms without them are reported as CPU.
+
+DONE verdict=ORACLE-PASS

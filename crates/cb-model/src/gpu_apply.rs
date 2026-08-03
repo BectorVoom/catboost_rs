@@ -20,6 +20,14 @@ pub enum GpuApplyUnsupported {
     /// baked `ctr_data`), which need a variable-size hash-table lookup.
     #[error("model uses categorical/CTR features, unsupported by the GPU apply first slice")]
     CategoricalFeatures,
+    /// The model contains at least one one-hot categorical split (SPEC-OH-17).
+    /// A DISTINCT variant from [`GpuApplyUnsupported::CategoricalFeatures`]: a
+    /// one-hot split needs the RAW categorical column, which the device apply
+    /// path (float bins only) never uploads. Named explicitly so the failure
+    /// does not fall through into `flatten_oblivious_f64`'s
+    /// "unexpected … in a guard-passed model" message.
+    #[error("model contains one-hot categorical splits, unsupported by the GPU apply first slice")]
+    OneHotSplits,
     /// The model contains non-symmetric (Lossguide / Depthwise) trees, which use
     /// a separate pointer-walk apply path.
     #[error("model contains non-symmetric (Lossguide/Depthwise) trees, unsupported")]
@@ -36,7 +44,8 @@ pub enum GpuApplyUnsupported {
 
 /// GINF-01-S1: admit ONLY a float-only, oblivious, scalar model. Deterministic
 /// check order (mirroring [`crate::export`]'s `is_onnx_exportable`):
-/// non-symmetric → region → CTR → multi-dim → `Ok(())`. Pure; no I/O; total.
+/// non-symmetric → region → one-hot → CTR → multi-dim → `Ok(())`. Pure; no I/O;
+/// total.
 ///
 /// # Errors
 /// A [`GpuApplyUnsupported`] variant naming the first disqualifying property.
@@ -46,6 +55,15 @@ pub fn check_gpu_apply_supported(model: &Model) -> Result<(), GpuApplyUnsupporte
     }
     if !model.region_trees.is_empty() {
         return Err(GpuApplyUnsupported::RegionTrees);
+    }
+    // SPEC-OH-17: BEFORE the generic categorical arm, so the message is specific.
+    let has_one_hot_split = model
+        .oblivious_trees
+        .iter()
+        .flat_map(|tree| tree.splits.iter())
+        .any(|split| matches!(split, ModelSplit::OneHot(_)));
+    if has_one_hot_split {
+        return Err(GpuApplyUnsupported::OneHotSplits);
     }
     let has_ctr_split = model
         .oblivious_trees
@@ -126,12 +144,17 @@ pub fn flatten_oblivious_f64(model: &Model) -> CbResult<FlatObliviousF64> {
                     split_features.push(feature);
                     split_borders.push(s.border);
                 }
-                // Unreachable in practice: the guard above rejects any CTR split.
-                // A typed error (never a panic) keeps this total if the guard and
-                // this match ever drift.
+                // Unreachable in practice: the guard above rejects any CTR or
+                // one-hot split. A typed error (never a panic) keeps this total
+                // if the guard and this match ever drift.
                 ModelSplit::Ctr(_) => {
                     return Err(CbError::Unsupported(
                         "unexpected CTR split in a guard-passed model".to_string(),
+                    ));
+                }
+                ModelSplit::OneHot(_) => {
+                    return Err(CbError::Unsupported(
+                        "unexpected one-hot split in a guard-passed model".to_string(),
                     ));
                 }
             }

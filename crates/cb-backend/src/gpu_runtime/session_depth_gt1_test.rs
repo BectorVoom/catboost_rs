@@ -125,7 +125,7 @@ fn session_depth_gt1_grows_and_matches_direct() {
         assert_eq!(session.n(), n, "session n must equal the fixture n (n={n})");
 
         let dev_tree = session
-            .grow_one(&vec![0.0_f64; n], &target)
+            .grow_one(&vec![0.0_f64; n], &target, &[])
             .expect("depth-6 grow_one must succeed on the clear-margin fixture");
 
         // Direct reference: `grow_oblivious_tree` over the SAME first-tree residual + Cosine.
@@ -385,7 +385,7 @@ fn session_exact_leaf_grows_finite_quantile_leaves() {
     .expect("exact-leaf Quantile must open a session (Plan 05 gate arm)");
 
     let tree = session
-        .grow_one(&vec![0.0_f64; n], &target)
+        .grow_one(&vec![0.0_f64; n], &target, &[])
         .expect("exact-leaf grow_one must succeed");
 
     assert_eq!(tree.splits.len(), depth, "exact-leaf tree must have {depth} splits");
@@ -657,7 +657,7 @@ fn session_bootstrap_grows_finite_tree() {
 
     // Grow two trees to exercise the continuous-stream advance between trees.
     let approx = vec![0.0_f64; n];
-    let t0 = match session.grow_one(&approx, &target) {
+    let t0 = match session.grow_one(&approx, &target, &[]) {
         Ok(t) => t,
         Err(cb_core::CbError::Unsupported(msg)) if msg.contains("Atomic<u64>") => {
             // The resident partition histogram needs an ADVERTISED Atomic<u64> add. When the
@@ -670,7 +670,7 @@ fn session_bootstrap_grows_finite_tree() {
         }
         Err(e) => panic!("bootstrap grow_one (tree 0) must succeed: {e:?}"),
     };
-    let t1 = session.grow_one(&approx, &target).expect("bootstrap grow_one (tree 1) must succeed");
+    let t1 = session.grow_one(&approx, &target, &[]).expect("bootstrap grow_one (tree 1) must succeed");
     for tree in [&t0, &t1] {
         assert_eq!(tree.splits.len(), depth, "bootstrap tree must have {depth} splits");
         assert_eq!(tree.leaf_of.len(), n, "leaf_of length must equal n");

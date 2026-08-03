@@ -60,6 +60,36 @@ pub(crate) fn degenerate(msg: impl Into<String>) -> CatBoostError {
     CatBoostError::Train(cb_core::CbError::Degenerate(msg.into()))
 }
 
+/// F14 / SPEC-CATF-Δ6 — reject a CATEGORICAL pool at the top of every
+/// cross-validating entrypoint, BEFORE a single fold is fitted.
+///
+/// The hazard, verified: `cv` does `pool.select_rows(..)` → `builder.fit(..)` →
+/// `model.staged_predict(..)`. `select_rows` PRESERVES `cat_features`, after F09
+/// `fit` bakes CTR data, and `ensure_scalar_oblivious` rejects a CTR or one-hot
+/// model — so every fold fails from INSIDE the fold, at full training cost.
+///
+/// In `grid_search` with `ErrorScore::Value(NaN)` (the sklearn default) that is
+/// worse than slow: every candidate's failure is absorbed into `error_score`,
+/// `warn_fit_failed` emits a warning, and a `SearchResult` with all-NaN scores
+/// and an arbitrary `best_index` is RETURNED — a silent degradation, not an
+/// error.
+///
+/// A categorical pool is a CONFIGURATION failure, not a CANDIDATE failure, so
+/// converting it into `error_score` is category confusion. Fail fast, typed, at
+/// the top.
+pub(crate) fn reject_categorical_pool(what: &str, pool: &Pool) -> Result<(), CatBoostError> {
+    let n = pool.n_cat_features();
+    if n > 0 {
+        return Err(CatBoostError::UnsupportedModel(format!(
+            "{what} does not support categorical pools ({n} categorical column(s)): \
+             cross-validation scores via staged_predict, which rejects CTR and one-hot \
+             models (crates/catboost-rs/src/model.rs ensure_scalar_oblivious). Fit \
+             directly with CatBoostBuilder::fit and score with predict instead."
+        )));
+    }
+    Ok(())
+}
+
 /// Split `len` items into `fold_count` contiguous, near-equal blocks, returning
 /// each block's `(start, end)` half-open bounds. The first `len % fold_count`
 /// blocks are one larger than the rest, so every block is non-empty when
@@ -495,6 +525,9 @@ pub fn cv(
     if metrics.is_empty() {
         return Err(degenerate("cv: `metrics` must be non-empty"));
     }
+
+    // F14 / SPEC-CATF-Δ6 — before any fold is fitted.
+    reject_categorical_pool("cv", pool)?;
 
     // Ranking `pairs` cannot survive the per-fold row re-indexing: each fold
     // trains on a `Pool::select_rows` sub-Pool, which DROPS pairs (row re-index
