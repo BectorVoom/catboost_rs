@@ -193,3 +193,92 @@ def test_cat_features_works_on_all_three_estimators():
         model = cls(iterations=3, depth=2, one_hot_max_size=1, max_ctr_complexity=1)
         model.fit(df, y, cat_features=[2])
         assert model.predict(df).shape == (40,)
+
+
+# ---------------------------------------------------------------------------
+# F20 (SPEC-CATF-16, acceptance A11) — the PUBLIC PYTHON API oracle, <= 1e-5
+# ---------------------------------------------------------------------------
+
+
+def _one_hot_fixture(scenario="default_binary"):
+    import json
+
+    d = _FIXTURES / "one_hot_train" / scenario
+    cfg = json.loads((d / "config.json").read_text())
+    cat = json.loads((d / "cat_cols.json").read_text())
+    return (
+        cfg,
+        np.load(d / "X_float.npy"),
+        np.load(d / "y.npy"),
+        cat["columns"],
+        cat["cat_feature_indices_in_x_all"],
+        np.load(d / "predictions.npy"),
+    )
+
+
+def test_public_api_one_hot_oracle_parity():
+    """Drive the frozen upstream one-hot corpus end to end through the PUBLIC
+    Python API and match ``predictions.npy`` at ``atol=1e-5, rtol=0``.
+
+    Localization ladder, if this fails (STOP AND REPORT at the first hit):
+      1. ``crates/cb-train/tests/one_hot_oracle_test.rs`` IS the direct Rust
+         ``train_cat`` + ``predict_raw_cat`` comparison on this same corpus. If
+         it passes and this fails, the gap is in the facade/binding wiring.
+      2. If the Rust-direct path also diverges, the gap is inside the shipped
+         engine — STOP AND REPORT.
+      3. If it passes at ``max_ctr_complexity=0`` and fails at ``> 1``, that is
+         the ORD-06/ORD-07 combination-CTR gating bug
+         (`.planning/phases/24-ctr-split-search-correctness/`) — STOP AND
+         REPORT, do NOT fix it here. The ``permutation_count=4`` risk is
+         already closed by ``multi_permutation_e2e_oracle_test.rs``.
+    """
+    pd = pytest.importorskip("pandas")
+    cfg, x_float, y, cat_columns, cat_idx, expected = _one_hot_fixture()
+    p = cfg["params"]
+
+    frame = {f"f{i}": x_float[:, i].astype(np.float32) for i in range(x_float.shape[1])}
+    for j, col in enumerate(cat_columns):
+        frame[f"c{j}"] = col
+    df = pd.DataFrame(frame)
+
+    # CatBoostRegressor, not CatBoostClassifier: the fixture's reference vector
+    # is RawFormulaVal, and the regressor's `predict` returns exactly that
+    # (the classifier's returns CLASS labels). `loss_function="Logloss"` keeps
+    # the TRAINING objective identical to the fixture's.
+    model = CatBoostRegressor(
+        iterations=p["iterations"],
+        depth=p["depth"],
+        learning_rate=p["learning_rate"],
+        l2_leaf_reg=p["l2_leaf_reg"],
+        loss_function=p["loss_function"],
+        leaf_estimation_method=p["leaf_estimation_method"],
+        bootstrap_type=p["bootstrap_type"],
+        boost_from_average=p["boost_from_average"],
+        random_strength=p["random_strength"],
+        random_seed=p["random_seed"],
+        score_function=p["score_function"],
+        one_hot_max_size=p["one_hot_max_size"],
+        max_ctr_complexity=p["max_ctr_complexity"],
+    )
+    model.fit(df, y.astype(np.float32), cat_features=cat_idx)
+    actual = model.predict(df)
+
+    # Non-degeneracy: a constant prediction vector would match a broken model
+    # that had simply learned the base rate.
+    assert actual.std() > 1e-6, f"predictions are degenerate (std {actual.std()})"
+
+    # The configuration must genuinely have produced a categorical split, so a
+    # run that degenerated to float-only cannot pass vacuously. Proof through
+    # the PUBLIC API: after F10/F12, predicting WITHOUT the categorical column
+    # raises iff `needs_cat_columns()` is true. With `max_ctr_complexity=0`
+    # there is no CTR data, so the only thing that can make it true is a
+    # `ModelSplit::OneHot`.
+    float_only = df[[c for c in df.columns if c.startswith("f")]]
+    with pytest.raises(Exception) as e:
+        model.predict(float_only)
+    assert "categorical" in str(e.value), (
+        "the fitted model carries no categorical split — this configuration "
+        f"degenerated to float-only and the oracle comparison is vacuous: {e.value}"
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=0)
