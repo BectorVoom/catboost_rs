@@ -20,7 +20,8 @@ use pyo3::types::PyDict;
 
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
 use crate::estimator::{
-    accuracy_score, build_sklearn_tags, data_to_pool, fit_pool, load_model_path, EstimatorBase,
+    accuracy_score, build_sklearn_tags, data_to_pool, fit_pool, load_model_path,
+    resolve_cat_features, EstimatorBase,
 };
 use crate::params::{make_builder, validate_params};
 use crate::regressor::y_to_vec;
@@ -57,15 +58,20 @@ impl CatBoostClassifier {
     /// `CatBoostParameterError` on an unknown / unsupported kwarg;
     /// `CatBoostValueError` on a dtype / layout / shape mismatch (D-12); the typed
     /// taxonomy on a training failure (08-02 / PYAPI-05).
-    #[pyo3(signature = (x, y = None))]
+    #[pyo3(signature = (x, y = None, cat_features = None))]
     fn fit(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
         y: Option<&Bound<'_, PyAny>>,
+        cat_features: Option<Vec<usize>>,
     ) -> PyResult<Py<Self>> {
         validate_params(&slf.base.params)?;
-        let pool = data_to_pool(py, x, y)?;
+        // F17: `cat_features` from the fit kwarg, else from the constructor.
+        // Remembered on the base because PREDICT must declare the same width
+        // (F10 checks the pool's declared width against the model's).
+        let cats = resolve_cat_features(&slf.base.params, py, cat_features)?;
+        let pool = data_to_pool(py, x, y, Some(&cats))?;
         let mut builder = make_builder(&slf.base.params, py)?;
         // The classifier defaults to a CLASSIFICATION loss (D-05). Only override
         // when the user supplied neither the canonical name nor its alias, so an
@@ -76,6 +82,7 @@ impl CatBoostClassifier {
         }
         let model = py.detach(|| fit_pool(builder, &pool)).map_err(PyCbError)?;
         slf.base.model = Some(model);
+        slf.base.cat_features = cats;
         Ok(slf.into())
     }
 
@@ -97,7 +104,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `predict`",
             )
         })?;
-        let pool = data_to_pool(py, x, None)?;
+        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
         let preds = py
             .detach(|| model.predict_with(&pool, PredictionType::Class))
             .map_err(PyCbError)?;
@@ -123,7 +130,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `predict_proba`",
             )
         })?;
-        let pool = data_to_pool(py, x, None)?;
+        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
         // The facade returns the two-column probability output flattened row-major
         // (`[class-0, class-1]` per object). Reshape to `(n, 2)` for the upstream
         // binary convention.
@@ -207,7 +214,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `partial_dependence`",
             )
         })?;
-        crate::estimator::partial_dependence_py(model, py, x, features)
+        crate::estimator::partial_dependence_py(model, py, x, features, &self.base.cat_features)
     }
 
     /// Return the verbatim constructor kwargs (sklearn `get_params`); enables
@@ -277,7 +284,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `score`",
             )
         })?;
-        let pool = data_to_pool(py, x, None)?;
+        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
         let preds = py
             .detach(|| model.predict_with(&pool, PredictionType::Class))
             .map_err(PyCbError)?;
