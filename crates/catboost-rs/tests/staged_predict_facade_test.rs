@@ -88,3 +88,51 @@ fn staged_predict_rejects_non_scalar_oblivious() {
         other => panic!("expected UnsupportedModel, got {other:?}"),
     }
 }
+
+/// F12 / SPEC-CATF-Δ7 — `staged_predict` REFUSES a ONE-HOT model.
+///
+/// This is the MAJOR-7 residue the original plan did not know about. A one-hot
+/// model has `ctr_data == None`, so it passed every pre-F11 arm of
+/// `ensure_scalar_oblivious`; `predict_raw_staged` is float-only and never reads
+/// categorical columns. The result was a one-hot model scored as though EVERY
+/// one-hot split failed — no error, plausible numbers, entirely wrong.
+#[test]
+fn staged_predict_rejects_a_one_hot_model() {
+    use catboost_rs::{CatBoostBuilder, Loss};
+
+    let n = 40_usize;
+    let label: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+    let cat: Vec<String> = (0..n)
+        .map(|i| if i % 2 == 0 { "alpha" } else { "beta" }.to_owned())
+        .collect();
+    let floats = vec![(0..n).map(|i| (i % 7) as f64).collect::<Vec<f64>>()];
+    let pool = OwnedColumns::new(floats, label)
+        .with_cat_features(vec![cat])
+        .into_pool()
+        .expect("one-hot pool builds");
+
+    let model = CatBoostBuilder::new()
+        .loss(Loss::Logloss)
+        .iterations(3)
+        .depth(3)
+        .learning_rate(0.1)
+        .boost_from_average(false)
+        .random_strength(0.0)
+        .one_hot_max_size(2)
+        .max_ctr_complexity(1)
+        .fit(&pool)
+        .expect("one-hot fit must succeed");
+
+    match model.staged_predict(&pool, None, None, None) {
+        Err(CatBoostError::UnsupportedModel(msg)) => {
+            assert!(
+                msg.contains("one-hot") || msg.contains("categorical"),
+                "the error must name the one-hot limitation, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected UnsupportedModel, got {other:?}"),
+        Ok(_) => panic!(
+            "staged_predict SILENTLY SCORED a one-hot model as though every one-hot split failed"
+        ),
+    }
+}
