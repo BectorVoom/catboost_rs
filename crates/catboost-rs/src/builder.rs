@@ -36,8 +36,8 @@ use cb_train::{
     counter_calc_method_default, fold_len_multiplier_default, has_time_default,
     max_ctr_complexity_default,
     one_hot_max_size_default, permutation_count_default, score_function_default,
-    simple_ctr_default, simple_ctr_priors_default, train, BoostParams, CounterCalcMethod,
-    EBootstrapType, ECtrType, EOverfittingDetectorType, EvalMetric,
+    simple_ctr_default, simple_ctr_priors_default, train, train_cat, BoostParams,
+    CounterCalcMethod, EBootstrapType, ECtrType, EOverfittingDetectorType, EvalMetric,
 };
 
 use crate::error::CatBoostError;
@@ -503,24 +503,66 @@ impl CatBoostBuilder {
         let backend = CpuBackend;
         #[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
         let backend = GpuBackend::default();
-        let trained = train(
-            &backend,
-            &feature_values,
-            &feature_borders,
-            pool.label(),
-            pool.weights(),
-            &params,
-            None,
-        )?;
 
-        if prof {
-            eprintln!(
-                "CB_GPU_PROF fit-train elapsed={:.2}ms",
-                prof_train_t.elapsed().as_secs_f64() * 1e3,
-            );
-        }
-
-        let canonical = cb_model::Model::from_trained(&trained, feature_borders);
+        // F09 / SPEC-CATF-08: a pool that DECLARES categorical columns routes
+        // through `train_cat`, which returns the baked CTR tables alongside the
+        // model. Before this branch existed, `fit()` always called the float-only
+        // `train` and `pool.cat_features()` was never read, so every categorical
+        // column was SILENTLY DROPPED — the fit succeeded and produced a model
+        // that scored as though the column did not exist.
+        //
+        // The cat-free arm is left EXACTLY as it was (same `train` call, same
+        // arguments, same order), so a numeric pool is bit-identical to the
+        // pre-F09 result — the F21 no-regression gate.
+        let canonical = if pool.cat_features().is_empty() {
+            let trained = train(
+                &backend,
+                &feature_values,
+                &feature_borders,
+                pool.label(),
+                pool.weights(),
+                &params,
+                None,
+            )?;
+            if prof {
+                eprintln!(
+                    "CB_GPU_PROF fit-train elapsed={:.2}ms",
+                    prof_train_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            cb_model::Model::from_trained(&trained, feature_borders)
+        } else {
+            let (trained, baked) = train_cat(
+                &backend,
+                &feature_values,
+                &feature_borders,
+                pool.cat_features(),
+                pool.label(),
+                pool.weights(),
+                &params,
+                None,
+            )?;
+            if prof {
+                eprintln!(
+                    "CB_GPU_PROF fit-train-cat elapsed={:.2}ms",
+                    prof_train_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            let model = cb_model::Model::from_trained(&trained, feature_borders);
+            // A purely ONE-HOT-routed pool bakes no CTR table. Attaching an
+            // empty `CtrData` would make `ctr_data.is_some()` true for a model
+            // with no CTR split at all, which the predict-side
+            // `needs_cat_columns()` predicate reads as "this is a CTR model".
+            let model = if baked.tables.is_empty() {
+                model
+            } else {
+                model.with_ctr_data(cb_model::CtrData::from_baked(&baked))
+            };
+            // Δ4: record the pool's DECLARED cat width, so the predict-side
+            // width check never compares against a width derived from the
+            // splits the model happened to choose (PLAN-CHECK CRITICAL-3).
+            model.with_cat_feature_count(pool.n_cat_features())
+        };
         Ok(Model::from_canonical(canonical))
     }
 }
