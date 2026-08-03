@@ -61,6 +61,43 @@ def test_fitted_regressor_save_coreml_writes_nonempty_file(tmp_path, toy_regress
     assert len(path.read_bytes()) > 0
 
 
+def _predict_payload(spec, row):
+    """Build the `MLModel.predict` input dict for one feature `row`.
+
+    The spec declares one SCALAR `doubleType` input per float feature, so the
+    payload is one scalar per declared input name — NOT the whole row under a
+    single key. Extracted from the macOS-only execute test so the marshalling
+    itself can be verified on any platform (see
+    `test_predict_payload_matches_the_declared_inputs`).
+    """
+    return {inp.name: float(row[k]) for k, inp in enumerate(spec.description.input)}
+
+
+def _payload_conformance_errors(payload, spec):
+    """Problems that would make `payload` invalid for `spec`, as a list.
+
+    Returns `[]` for a conformant payload. This is the check that makes the
+    original defect visible without an Apple runtime.
+    """
+    problems = []
+    declared = [inp.name for inp in spec.description.input]
+    if sorted(payload) != sorted(declared):
+        problems.append(
+            f"payload keys {sorted(payload)} != declared inputs {sorted(declared)}"
+        )
+    for name, value in payload.items():
+        # A `doubleType` input takes ONE number. A list/ndarray under a scalar
+        # input is exactly the original bug.
+        if hasattr(value, "__len__"):
+            problems.append(
+                f"input '{name}' is declared scalar doubleType but got a "
+                f"sequence of length {len(value)}"
+            )
+        elif not isinstance(value, (int, float)):
+            problems.append(f"input '{name}' is not a number: {type(value).__name__}")
+    return problems
+
+
 def _fit_and_export(tmp_path, toy_regression, name, iterations=10, depth=3):
     import catboost_rs
 
@@ -114,6 +151,43 @@ def test_fitted_regressor_save_coreml_decodes_via_coremltools(tmp_path, toy_regr
     assert len({n.treeId for n in nodes}) == iterations
 
 
+def test_predict_payload_matches_the_declared_inputs(tmp_path, toy_regression):
+    """The `predict` input marshalling is correct — checked WITHOUT a runtime.
+
+    THE ORIGINAL DEFECT: the execute test passed the whole feature ROW as one
+    array under `feature_0`:
+
+        loaded.predict({input_name: np.asarray(x[0], dtype=np.float32)})
+
+    but the spec declares one SCALAR `doubleType` input PER feature, so that
+    payload was malformed and would have been rejected on macOS too. Because
+    the only test using it is macOS-only, the bug was invisible on this host —
+    and so was its fix. This test closes that hole: it exercises the real
+    `_predict_payload` helper the execute test now calls, on any platform.
+    """
+    coremltools = pytest.importorskip("coremltools")
+    import numpy as np
+
+    x, path = _fit_and_export(tmp_path, toy_regression, "regressor_payload.mlmodel")
+    spec = coremltools.models.MLModel(str(path)).get_spec()
+    row = np.asarray(x[0], dtype=np.float64)
+
+    payload = _predict_payload(spec, row)
+    assert _payload_conformance_errors(payload, spec) == []
+    # One entry per feature, positionally faithful to the row.
+    assert len(payload) == x.shape[1]
+    for k, inp in enumerate(spec.description.input):
+        assert payload[inp.name] == pytest.approx(float(row[k]))
+
+    # FALSIFIABILITY: the exact payload the old code built must be REJECTED by
+    # the same checker. Without this, the test above could pass vacuously.
+    old_buggy_payload = {spec.description.input[0].name: np.asarray(x[0], dtype=np.float32)}
+    problems = _payload_conformance_errors(old_buggy_payload, spec)
+    assert problems, "the checker must reject the original one-array-under-one-key payload"
+    assert any("declared scalar doubleType but got a sequence" in p for p in problems)
+    assert any("!= declared inputs" in p for p in problems)
+
+
 @pytest.mark.skipif(
     platform.system() != "Darwin",
     reason="MLModel.predict requires Apple's native CoreML runtime "
@@ -132,12 +206,13 @@ def test_fitted_regressor_coreml_predicts_finite_values(tmp_path, toy_regression
     if not _coreml_runtime_available(loaded):
         pytest.skip("coremltools is installed without its native runtime proxy")
 
-    # ONE SCALAR PER INPUT. The previous version passed the whole 4-feature row
-    # under `feature_0`, which the spec's four scalar doubleType inputs would
-    # have rejected even on macOS.
+    # ONE SCALAR PER INPUT, via the SAME helper
+    # `test_predict_payload_matches_the_declared_inputs` verifies on every
+    # platform — so this marshalling is covered even where `predict` cannot
+    # run. The previous version passed the whole 4-feature row under
+    # `feature_0`, which the spec's four scalar doubleType inputs would have
+    # rejected even on macOS.
     row = np.asarray(x[0], dtype=np.float64)
-    out = loaded.predict(
-        {i.name: float(row[k]) for k, i in enumerate(loaded.get_spec().description.input)}
-    )
+    out = loaded.predict(_predict_payload(loaded.get_spec(), row))
     prediction = np.asarray(next(iter(out.values())))
     assert np.all(np.isfinite(prediction))
