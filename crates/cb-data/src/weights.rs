@@ -189,3 +189,47 @@ pub fn resolve_object_weights(
     }
     Ok(resolved)
 }
+
+/// Which automatic class-weight scheme to derive from the class distribution
+/// (`auto_class_weights`, `calc_class_weights.cpp:11-27`).
+///
+/// [`Self::None`] (the upstream default) leaves the weights alone; the other two
+/// select [`balanced_class_weights`] / [`sqrt_balanced_class_weights`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoClassWeights {
+    /// No automatic reweighting (the upstream default).
+    #[default]
+    None,
+    /// `max(summary) / summary[c]` per class.
+    Balanced,
+    /// `sqrt(max(summary) / summary[c])` per class.
+    SqrtBalanced,
+}
+
+/// Derive the per-class weight vector for `kind` from the class distribution.
+///
+/// [`AutoClassWeights::None`] returns an EMPTY vector, which
+/// [`resolve_object_weights`] reads as "no class reweighting" — so the caller can
+/// pass the result through unconditionally without a special case, and the
+/// no-auto path stays byte-identical to passing no class weights at all.
+///
+/// # Errors
+///
+/// Propagates [`summary_class_weights`] errors (empty `class_count`, length
+/// mismatch, out-of-range class index).
+pub fn auto_class_weights(
+    kind: AutoClassWeights,
+    target_classes: &[usize],
+    item_weights: &[f64],
+    class_count: usize,
+) -> CbResult<Vec<f32>> {
+    match kind {
+        AutoClassWeights::None => Ok(Vec::new()),
+        AutoClassWeights::Balanced => {
+            balanced_class_weights(target_classes, item_weights, class_count)
+        }
+        AutoClassWeights::SqrtBalanced => {
+            sqrt_balanced_class_weights(target_classes, item_weights, class_count)
+        }
+    }
+}

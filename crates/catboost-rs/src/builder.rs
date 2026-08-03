@@ -29,7 +29,7 @@ use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
     LeafMethod, Loss,
 };
-use cb_data::{select_borders_greedy_logsum, Pool, QuantizeParams};
+use cb_data::{select_borders_greedy_logsum, AutoClassWeights, Pool, QuantizeParams};
 use rayon::prelude::*;
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
@@ -192,6 +192,30 @@ pub struct CatBoostBuilder {
     /// Minimum document count required to split a leaf (`min_data_in_leaf`,
     /// default 1). Read by the leaf-wise growers.
     min_data_in_leaf: usize,
+
+    // ---- PARAM-03: the class-weighting surface (classification only) -------
+    //
+    // `cb_data::weights` already implemented the upstream-faithful computation
+    // (and `weights_oracle_test` gates it against the frozen
+    // `class_weights/` fixture), but NOTHING applied it during a fit — the
+    // resolved per-object weights never reached `train`. These three fields are
+    // the missing application path.
+    /// Explicit per-class weights (`class_weights`). EMPTY (the default) means no
+    /// class reweighting. Multiplies each object's weight by its class's entry.
+    class_weights: Vec<f64>,
+    /// Automatic class weights derived from the class distribution
+    /// (`auto_class_weights`). Mutually exclusive with
+    /// [`Self::class_weights`] / [`Self::scale_pos_weight`].
+    auto_class_weights: AutoClassWeights,
+    /// Binary-classification positive-class multiplier (`scale_pos_weight`),
+    /// upstream default `1.0` — exactly `class_weights = [1.0, w]`. Mutually
+    /// exclusive with the other two.
+    scale_pos_weight: f64,
+
+    // ---- PARAM-03: ignored_features ----------------------------------------
+    /// Float-feature indices the tree search must never split on
+    /// (`ignored_features`). EMPTY (the default) ignores nothing.
+    ignored_features: Vec<usize>,
 }
 
 /// The result of an eval-set fit ([`CatBoostBuilder::fit_with_eval_sets`]): the
@@ -268,6 +292,12 @@ impl CatBoostBuilder {
             grow_policy: grow_policy_default(),
             max_leaves: max_leaves_default(),
             min_data_in_leaf: min_data_in_leaf_default(),
+            // PARAM-03: all four are the upstream "off" values, so an untouched
+            // builder resolves weights to the pool's own and ignores nothing.
+            class_weights: Vec::new(),
+            auto_class_weights: AutoClassWeights::None,
+            scale_pos_weight: 1.0,
+            ignored_features: Vec::new(),
         }
     }
 
@@ -662,6 +692,62 @@ impl CatBoostBuilder {
         self
     }
 
+    /// Explicit per-class weights (`class_weights`): each object's weight is
+    /// multiplied by `class_weights[class_of(object)]`, where the class is the
+    /// object's integer label.
+    ///
+    /// CLASSIFICATION ONLY — combining it with a regression loss is rejected at
+    /// `fit()` (upstream rejects it too), because "the class of an object" is
+    /// undefined for a continuous target.
+    #[must_use]
+    pub fn class_weights(mut self, class_weights: Vec<f64>) -> Self {
+        self.class_weights = class_weights;
+        self
+    }
+
+    /// Derive the class weights automatically from the class distribution
+    /// (`auto_class_weights`).
+    ///
+    /// Mutually exclusive with [`CatBoostBuilder::class_weights`] and
+    /// [`CatBoostBuilder::scale_pos_weight`]: all three write the SAME per-object
+    /// weight, so combining them is rejected at `fit()` rather than resolved by
+    /// precedence, which would silently drop one the caller set on purpose.
+    #[must_use]
+    pub fn auto_class_weights(mut self, auto_class_weights: AutoClassWeights) -> Self {
+        self.auto_class_weights = auto_class_weights;
+        self
+    }
+
+    /// Binary-classification positive-class weight (`scale_pos_weight`, upstream
+    /// default `1.0`) — exactly `class_weights = [1.0, scale_pos_weight]`.
+    ///
+    /// Binary only, and mutually exclusive with the other two class-weight
+    /// controls (see [`CatBoostBuilder::auto_class_weights`]).
+    #[must_use]
+    pub fn scale_pos_weight(mut self, scale_pos_weight: f64) -> Self {
+        self.scale_pos_weight = scale_pos_weight;
+        self
+    }
+
+    /// Float-feature indices the tree search must never split on
+    /// (`ignored_features`).
+    ///
+    /// Implemented by giving each ignored feature an EMPTY border set, which
+    /// leaves it with no candidate split at any level. That is chosen over
+    /// physically dropping the column so the model's feature INDEXING is
+    /// unchanged: `predict` still takes the full-width pool, and every
+    /// feature-importance / SHAP index keeps meaning the same input column. An
+    /// ignored feature simply contributes nothing.
+    ///
+    /// An out-of-range index is rejected at `fit()` rather than ignored — a typo
+    /// that silently ignores nothing is exactly the failure this parameter is
+    /// used to prevent.
+    #[must_use]
+    pub fn ignored_features(mut self, ignored_features: Vec<usize>) -> Self {
+        self.ignored_features = ignored_features;
+        self
+    }
+
     /// Map the builder fields onto the internal [`BoostParams`].
     ///
     /// PARAM-01: the overfitting-detector / `use_best_model` / `eval_metric` /
@@ -785,6 +871,133 @@ impl CatBoostBuilder {
         self.fit_inner(pool, eval_pools)
     }
 
+    /// Whether `loss` defines a per-object CLASS, which is what the class-weight
+    /// controls need in order to mean anything.
+    fn loss_is_classification(loss: &Loss) -> bool {
+        matches!(
+            loss,
+            Loss::Logloss
+                | Loss::CrossEntropy
+                | Loss::Focal { .. }
+                | Loss::MultiClass
+                | Loss::MultiClassOneVsAll
+                | Loss::MultiLogloss
+                | Loss::MultiCrossEntropy
+        )
+    }
+
+    /// PARAM-03: resolve the effective per-object training weights from the
+    /// class-weight controls, or `None` when none is active (in which case the
+    /// caller passes the pool's own weights through UNCHANGED — the byte-identical
+    /// default path).
+    ///
+    /// The three controls all write the same per-object weight, so at most one may
+    /// be active; the conflict is an error rather than a precedence rule.
+    fn resolve_weights(&self, pool: &Pool) -> Result<Option<Vec<f64>>, CatBoostError> {
+        let explicit = !self.class_weights.is_empty();
+        let auto = self.auto_class_weights != AutoClassWeights::None;
+        // Compared against the default rather than "is it set", because the
+        // builder cannot distinguish an unset field from one explicitly set to
+        // the default — and `scale_pos_weight = 1.0` is a no-op either way.
+        let scaled = (self.scale_pos_weight - 1.0).abs() > f64::EPSILON;
+        let active = usize::from(explicit) + usize::from(auto) + usize::from(scaled);
+        if active == 0 {
+            return Ok(None);
+        }
+        if active > 1 {
+            return Err(CatBoostError::InvalidConfig(
+                "class_weights, auto_class_weights and scale_pos_weight all set the same \
+                 per-object weight; set at most one (combining them would silently discard \
+                 all but one)"
+                    .to_owned(),
+            ));
+        }
+        if !Self::loss_is_classification(&self.loss) {
+            return Err(CatBoostError::InvalidConfig(format!(
+                "the class-weight controls (class_weights / auto_class_weights / \
+                 scale_pos_weight) need a per-object CLASS, which loss {:?} does not define; \
+                 they apply to classification losses only",
+                self.loss
+            )));
+        }
+
+        // Derive each object's class index from its label. A classification label
+        // is an integer class id (0/1 for the binary losses), so a non-integral or
+        // negative label is a typed error rather than a silent `as usize` truncation
+        // that would bucket 0.7 and 0.2 into the same class.
+        let mut classes: Vec<usize> = Vec::with_capacity(pool.label().len());
+        for (i, &label) in pool.label().iter().enumerate() {
+            if !label.is_finite() || label < 0.0 || (label.fract()).abs() > f64::EPSILON {
+                return Err(CatBoostError::InvalidConfig(format!(
+                    "the class-weight controls require integer class labels, but label[{i}] \
+                     is {label}; for a probabilistic CrossEntropy target there is no class \
+                     to weight"
+                )));
+            }
+            classes.push(label as usize);
+        }
+
+        let observed = classes.iter().copied().max().map_or(0, |m| m + 1);
+        let (weights, class_count) = if explicit {
+            (
+                self.class_weights.iter().map(|&w| w as f32).collect(),
+                self.class_weights.len(),
+            )
+        } else if scaled {
+            (vec![1.0_f32, self.scale_pos_weight as f32], 2)
+        } else {
+            // Auto weights are DERIVED from the observed distribution, so the class
+            // count is whatever the labels span.
+            //
+            // `summary_class_weights` requires one item weight PER OBJECT, while an
+            // unweighted `Pool` carries an EMPTY weight vector (the all-ones
+            // convention `train` and `resolve_object_weights` both accept). Densify
+            // here rather than loosening the primitive: its length check is what
+            // catches a genuinely mismatched caller.
+            let dense: Vec<f64> = if pool.weights().is_empty() {
+                vec![1.0; classes.len()]
+            } else {
+                pool.weights().to_vec()
+            };
+            (
+                cb_data::auto_class_weights(self.auto_class_weights, &classes, &dense, observed)?,
+                observed,
+            )
+        };
+        if observed > class_count {
+            return Err(CatBoostError::InvalidConfig(format!(
+                "the labels span {observed} classes but only {class_count} class weight(s) \
+                 were given"
+            )));
+        }
+        Ok(Some(cb_data::resolve_object_weights(
+            &weights,
+            pool.weights(),
+            &classes,
+        )?))
+    }
+
+    /// PARAM-03: blank out each ignored feature's border set, leaving it with no
+    /// candidate split at any level while preserving every other feature's index.
+    fn apply_ignored_features(
+        &self,
+        borders: &mut [Vec<f64>],
+    ) -> Result<(), CatBoostError> {
+        // `width` is read BEFORE the loop so the error message can name it without
+        // borrowing `borders` immutably inside the `get_mut` closure (E0502).
+        let width = borders.len();
+        for &f in &self.ignored_features {
+            let slot = borders.get_mut(f).ok_or_else(|| {
+                CatBoostError::InvalidConfig(format!(
+                    "ignored_features index {f} is out of range for a pool with {width} float \
+                     feature(s)"
+                ))
+            })?;
+            slot.clear();
+        }
+        Ok(())
+    }
+
     /// The single training implementation behind `fit` / `fit_with_eval` /
     /// `fit_with_eval_sets`.
     fn fit_inner(&self, pool: &Pool, eval_pools: &[&Pool]) -> Result<FitResult, CatBoostError> {
@@ -806,7 +1019,7 @@ impl CatBoostBuilder {
         // specifically attributes to this stage). Each inner `par_iter`'s indexed
         // map preserves output order, so both results stay byte-identical to the
         // fully-serial form.
-        let (feature_values, feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
+        let (feature_values, mut feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
             || {
                 pool.float_features()
                     .par_iter()
@@ -820,6 +1033,15 @@ impl CatBoostBuilder {
                     .collect()
             },
         );
+        // PARAM-03: an ignored feature keeps its column and its index but loses
+        // its borders, so the candidate enumeration never proposes a split on it.
+        // Applied AFTER border selection (not before) so the borders of every
+        // OTHER feature are byte-identical to a run without the parameter.
+        self.apply_ignored_features(&mut feature_borders)?;
+        // PARAM-03: the effective training weights. `None` = no class-weight
+        // control is active, and the pool's own weights pass through unchanged.
+        let resolved_weights = self.resolve_weights(pool)?;
+        let weights: &[f64] = resolved_weights.as_deref().unwrap_or_else(|| pool.weights());
         if prof {
             eprintln!(
                 "CB_GPU_PROF fit-prep copy+borders elapsed={:.2}ms",
@@ -903,7 +1125,7 @@ impl CatBoostBuilder {
                 &feature_values,
                 &feature_borders,
                 pool.label(),
-                pool.weights(),
+                weights,
                 &params,
                 None,
                 &eval_sets,
@@ -923,7 +1145,7 @@ impl CatBoostBuilder {
                 &feature_borders,
                 pool.cat_features(),
                 pool.label(),
-                pool.weights(),
+                weights,
                 &params,
                 None,
                 &eval_sets,

@@ -123,4 +123,18 @@ pub enum CatBoostError {
     /// [`cb_model::ShapUnsupported`]. Converted with `?` via `#[from]`.
     #[error("SHAP unsupported: {0}")]
     ShapUnsupported(#[from] cb_model::ShapUnsupported),
+
+    /// A [`crate::CatBoostBuilder`] configuration the facade rejects BEFORE
+    /// training (PARAM-03): two parameters that write the same quantity are both
+    /// set (`class_weights` + `auto_class_weights` + `scale_pos_weight`), a
+    /// class-weight control is paired with a regression loss, a class label is
+    /// not a non-negative integer, or an `ignored_features` index is out of
+    /// range.
+    ///
+    /// A DISTINCT variant from [`CatBoostError::FeatureMismatch`] (which is about
+    /// the DATA disagreeing with a trained model) — this is the CONFIGURATION
+    /// disagreeing with itself, caught before any work happens so the failure
+    /// names the parameter rather than surfacing as a degenerate model.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
 }

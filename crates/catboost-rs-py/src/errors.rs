@@ -149,6 +149,13 @@ pub(crate) fn to_pyerr(err: &FacadeError) -> PyErr {
         // the model is the "bad input" to the explain operation. Surface the
         // full `Display` so the Python message names the reason.
         FacadeError::ShapUnsupported(_) => CatBoostValueError::new_err(err.to_string()),
+        // PARAM-03: an invalid builder CONFIGURATION is a parameter error, not a
+        // data error — it is raised by the same honesty rule as the registry's
+        // parity-gap rejections (two params that write the same quantity, a
+        // class-weight control on a regression loss, an out-of-range
+        // `ignored_features` index), so it lands on `CatBoostParameterError`
+        // rather than `CatBoostValueError`.
+        FacadeError::InvalidConfig(_) => CatBoostParameterError::new_err(err.to_string()),
         FacadeError::Export(e) => match e {
             cb_model::OnnxExportError::CategoricalFeaturesUnsupported
             | cb_model::OnnxExportError::OneHotSplitsUnsupported
