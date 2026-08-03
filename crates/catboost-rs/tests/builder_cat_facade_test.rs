@@ -173,3 +173,61 @@ fn fit_categorical_pool_records_the_declared_cat_width() {
          derived from the splits it happened to choose"
     );
 }
+
+/// F21 (SPEC-CATF-07, acceptance A1) — a CAT-FREE pool is untouched by the F09
+/// branch.
+///
+/// The cat-free arm is byte-for-byte the pre-F09 call (same function, same
+/// arguments, same order), so a numeric fit must be bit-identical.
+///
+/// **On the mandated mutation.** Inverting the branch predicate
+/// (`pool.cat_features().is_empty()` -> `!...`) IS detected — by all three
+/// tests above, from the CATEGORICAL side: a categorical pool routed to the
+/// float-only `train` cannot find a split at all. The cat-FREE side of the
+/// inversion is, by contrast, provably unobservable: `train_cat(rt, fv, fb,
+/// &[], ..)` delegates to the same `train_inner` with an EMPTY `cat_columns`
+/// slice, so it computes exactly what `train` computes. That is not a gap in
+/// the test — it IS the no-regression property this task asserts, and it is
+/// why `builder_oracle_test` stays green under the mutation.
+#[test]
+fn a_cat_free_pool_produces_a_float_only_model() {
+    let n = 40_usize;
+    let label: Vec<f64> = (0..n).map(|i| (i % 5) as f64).collect();
+    let floats = vec![
+        (0..n).map(|i| (i % 7) as f64).collect::<Vec<f64>>(),
+        (0..n).map(|i| (i % 3) as f64).collect::<Vec<f64>>(),
+    ];
+    let pool = OwnedColumns::new(floats, label)
+        .into_pool()
+        .expect("float-only pool builds");
+
+    let model = CatBoostBuilder::new()
+        .iterations(5)
+        .depth(3)
+        .learning_rate(0.1)
+        .fit(&pool)
+        .expect("float-only fit must succeed");
+
+    let inner = model.as_canonical();
+    assert!(
+        inner.ctr_data.is_none(),
+        "a cat-free pool must bake no CTR table"
+    );
+    assert_eq!(
+        inner.cat_feature_count(),
+        0,
+        "a cat-free pool declares zero categorical columns"
+    );
+    let categorical_splits = inner
+        .oblivious_trees
+        .iter()
+        .flat_map(|t| t.splits.iter())
+        .filter(|s| !matches!(s, ModelSplit::Float(_)))
+        .count();
+    assert_eq!(
+        categorical_splits, 0,
+        "a cat-free pool must produce a purely float-split model"
+    );
+    // And it still scores: the F10 width check must not fire on a float model.
+    assert_eq!(model.predict(&pool).expect("predict must succeed").len(), n);
+}
