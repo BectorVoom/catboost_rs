@@ -134,16 +134,35 @@ impl Model {
     }
 
     /// The pool's raw categorical columns, after checking its DECLARED
-    /// categorical width against the width recorded at fit time (F10 /
+    /// categorical width against the width recorded on the model (F10 /
     /// SPEC-CATF-10 / Δ4).
     ///
-    /// The comparison is DECLARED width versus DECLARED width. It is deliberately
-    /// NOT `max(projection member) + 1`: a width derived from the splits the
-    /// model happened to choose is only a LOWER BOUND — a trailing cardinality-2
-    /// column routes to one-hot and never enters `eligible_absolute`, and an
-    /// uninformative column is never selected — so enforcing a derived width as
-    /// equality would reject the entirely legitimate
-    /// `fit(pool) -> predict(same pool)` (PLAN-CHECK CRITICAL-3).
+    /// # Why this is a MINIMUM, not an equality
+    /// `cat_feature_count` is only the exact declared width for a model that
+    /// came straight from `fit` — the builder records `pool.n_cat_features()`
+    /// there. It is deliberately NOT written to the `.cbm` bytes (F08), so a
+    /// model that came off disk carries the best LOWER BOUND its decoder could
+    /// recover (`cbm::decoded_cat_width`), never the original declared width.
+    ///
+    /// An equality check therefore rejected every `save -> load -> predict`
+    /// round-trip of a categorical model, and every upstream categorical `.cbm`:
+    /// the model needs categorical columns, the pool supplies exactly the ones
+    /// it was fit on, and the check failed anyway because the recovered width was
+    /// smaller than (or, before the decoder recovered anything at all, zero
+    /// against) the pool's. That is the same "a derived width is only a lower
+    /// bound" reasoning that already ruled out deriving `expected` from the
+    /// projections here (PLAN-CHECK CRITICAL-3) — it applies to the DECODED
+    /// width too.
+    ///
+    /// So the contract is: the pool must supply AT LEAST the categorical columns
+    /// the model can reference. That still catches the failure this guard exists
+    /// for — a categorical model scored against a pool with NO (or too few)
+    /// categorical columns, where `cat_values.get(i)` returns `None` and every
+    /// categorical split silently evaluates to `false`. A pool that is WIDER than
+    /// the model's recorded width is accepted; the extra trailing columns are
+    /// simply never indexed. Positional column MISalignment within the supplied
+    /// width is not detectable here at any comparison operator — the model stores
+    /// no categorical feature identities to compare against.
     ///
     /// A float-only model needs no categorical columns and accepts any pool.
     fn cat_columns<'a>(&self, pool: &'a Pool) -> Result<&'a [Vec<String>], CatBoostError> {
@@ -152,12 +171,12 @@ impl Model {
         }
         let expected = self.inner.cat_feature_count();
         let actual = pool.n_cat_features();
-        if actual != expected {
+        if actual < expected {
             return Err(CatBoostError::FeatureMismatch(format!(
-                "pool has {actual} categorical feature(s), model expects {expected}; \
+                "pool has {actual} categorical feature(s), model needs at least {expected}; \
                  this model scores categorical splits and cannot be applied without \
-                 the raw categorical columns (scoring it with none would silently \
-                 fail every categorical split)"
+                 the raw categorical columns (scoring it with too few would silently \
+                 fail every categorical split that references a missing column)"
             )));
         }
         Ok(pool.cat_features())

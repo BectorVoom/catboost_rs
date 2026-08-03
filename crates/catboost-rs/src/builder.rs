@@ -243,6 +243,44 @@ impl Default for CatBoostBuilder {
     }
 }
 
+/// PARAM-03: blank every categorical column named in `ignored` (LOCAL categorical
+/// indices), leaving every other column — and every column's INDEX — untouched.
+///
+/// A blanked column holds one repeated value, so its learn-set cardinality is `1`
+/// and `route_categorical` classifies it `Skip`: it enters neither the one-hot nor
+/// the CTR candidate list, while the columns around it keep their absolute
+/// indices. That is upstream's own `AddOneHotFeatures` skip-if-`<=1` rule, and it
+/// is the exact categorical analogue of clearing a float feature's border set —
+/// no candidate split at any level, no renumbering of anything else.
+///
+/// Returns [`std::borrow::Cow::Borrowed`] — the zero-copy identity — when
+/// `ignored` is empty, so a fit that ignores no categorical feature is
+/// byte-identical to one built without the parameter and copies nothing. The
+/// owned arm does clone the pool's categorical columns; that cost is paid only by
+/// a fit that actually ignores a categorical column, and the alternative (a
+/// masking seam threaded through the trainer's public signatures) would push the
+/// same concern into every caller that has no categorical features at all.
+fn mask_ignored_cat_columns<'a>(
+    cat_columns: &'a [Vec<String>],
+    ignored: &[usize],
+) -> std::borrow::Cow<'a, [Vec<String>]> {
+    if ignored.is_empty() {
+        return std::borrow::Cow::Borrowed(cat_columns);
+    }
+    let mut cols = cat_columns.to_vec();
+    for &c in ignored {
+        if let Some(col) = cols.get_mut(c) {
+            // Clear IN PLACE (the clone above already allocated the column) —
+            // every value becomes the same empty string, so the column is
+            // constant and its cardinality is 1.
+            for v in col.iter_mut() {
+                v.clear();
+            }
+        }
+    }
+    std::borrow::Cow::Owned(cols)
+}
+
 impl CatBoostBuilder {
     /// Create a builder with catboost 1.2.10 defaults for the in-scope
     /// plain-boosting surface. The default loss is [`Loss::Rmse`] (regression);
@@ -729,19 +767,27 @@ impl CatBoostBuilder {
         self
     }
 
-    /// Float-feature indices the tree search must never split on
+    /// Feature indices the tree search must never split on
     /// (`ignored_features`).
     ///
-    /// Implemented by giving each ignored feature an EMPTY border set, which
-    /// leaves it with no candidate split at any level. That is chosen over
-    /// physically dropping the column so the model's feature INDEXING is
-    /// unchanged: `predict` still takes the full-width pool, and every
-    /// feature-importance / SHAP index keeps meaning the same input column. An
-    /// ignored feature simply contributes nothing.
+    /// Indices are in upstream's FLAT space, spanning BOTH feature kinds: a
+    /// pool's categorical columns are always a trailing block, so index `i`
+    /// names float feature `i` while `i >= n_float` names categorical column
+    /// `i - n_float`. Both kinds are accepted, which is what upstream does and
+    /// what a migrating script expects.
     ///
-    /// An out-of-range index is rejected at `fit()` rather than ignored — a typo
-    /// that silently ignores nothing is exactly the failure this parameter is
-    /// used to prevent.
+    /// Implemented WITHOUT physically dropping the column, so the model's
+    /// feature INDEXING is unchanged: `predict` still takes the full-width pool,
+    /// and every feature-importance / SHAP index keeps meaning the same input
+    /// column. An ignored feature simply contributes nothing. A float feature is
+    /// given an EMPTY border set; a categorical column is blanked to a single
+    /// repeated value, which routes it to `Skip` (upstream's own
+    /// skip-cardinality-`<=1` rule). Neither yields a candidate split at any
+    /// level.
+    ///
+    /// An out-of-range index — one past the END of the flat space — is rejected
+    /// at `fit()` rather than ignored: a typo that silently ignores nothing is
+    /// exactly the failure this parameter is used to prevent.
     #[must_use]
     pub fn ignored_features(mut self, ignored_features: Vec<usize>) -> Self {
         self.ignored_features = ignored_features;
@@ -977,25 +1023,54 @@ impl CatBoostBuilder {
         )?))
     }
 
-    /// PARAM-03: blank out each ignored feature's border set, leaving it with no
-    /// candidate split at any level while preserving every other feature's index.
+    /// PARAM-03: apply `ignored_features`, whose indices are in upstream's FLAT
+    /// (float-then-categorical) space.
+    ///
+    /// A pool's categorical columns are always a TRAILING block — every ingest
+    /// path rejects a categorical column followed by a float one — so the flat
+    /// space is exactly `[0, n_float)` float features followed by
+    /// `[n_float, n_float + n_cat)` categorical ones, and a float feature's flat
+    /// index equals its float index.
+    ///
+    /// A FLOAT index is handled here: its border set is blanked, leaving it with
+    /// no candidate split at any level while preserving every other feature's
+    /// index. A CATEGORICAL index cannot be handled here (it has no border set),
+    /// so it is returned as a LOCAL categorical index for the caller to mask out
+    /// of the categorical columns; see `mask_ignored_cat_columns`.
+    ///
+    /// Before this split existed, every index `>= n_float` was rejected as
+    /// out-of-range, so `ignored_features` naming a categorical column — which
+    /// upstream accepts, and which is the only way to ignore one at all — aborted
+    /// the fit.
+    ///
+    /// Returns the ASCENDING, de-duplicated local categorical indices to ignore.
     fn apply_ignored_features(
         &self,
         borders: &mut [Vec<f64>],
-    ) -> Result<(), CatBoostError> {
-        // `width` is read BEFORE the loop so the error message can name it without
-        // borrowing `borders` immutably inside the `get_mut` closure (E0502).
-        let width = borders.len();
+        n_cat: usize,
+    ) -> Result<Vec<usize>, CatBoostError> {
+        // Read BEFORE the loop so the error message can name both widths without
+        // borrowing `borders` immutably inside the `get_mut` arm (E0502).
+        let n_float = borders.len();
+        let flat_width = n_float.saturating_add(n_cat);
+        let mut ignored_cat = Vec::new();
         for &f in &self.ignored_features {
-            let slot = borders.get_mut(f).ok_or_else(|| {
-                CatBoostError::InvalidConfig(format!(
-                    "ignored_features index {f} is out of range for a pool with {width} float \
-                     feature(s)"
-                ))
-            })?;
-            slot.clear();
+            if let Some(slot) = borders.get_mut(f) {
+                slot.clear();
+            } else if f < flat_width {
+                // `f >= n_float` and inside the flat width -> a categorical column.
+                ignored_cat.push(f - n_float);
+            } else {
+                return Err(CatBoostError::InvalidConfig(format!(
+                    "ignored_features index {f} is out of range for a pool with {n_float} \
+                     float feature(s) and {n_cat} categorical feature(s) (flat indices \
+                     0..{flat_width})"
+                )));
+            }
         }
-        Ok(())
+        ignored_cat.sort_unstable();
+        ignored_cat.dedup();
+        Ok(ignored_cat)
     }
 
     /// The single training implementation behind `fit` / `fit_with_eval` /
@@ -1037,7 +1112,12 @@ impl CatBoostBuilder {
         // its borders, so the candidate enumeration never proposes a split on it.
         // Applied AFTER border selection (not before) so the borders of every
         // OTHER feature are byte-identical to a run without the parameter.
-        self.apply_ignored_features(&mut feature_borders)?;
+        //
+        // `ignored_features` is indexed in upstream's FLAT space, so an index
+        // naming a categorical column comes back here to be masked separately
+        // (the categorical arm below); it is EMPTY for a float-only pool and for
+        // every fit that ignores only float features.
+        let ignored_cat = self.apply_ignored_features(&mut feature_borders, pool.n_cat_features())?;
         // PARAM-03: the effective training weights. `None` = no class-weight
         // control is active, and the pool's own weights pass through unchanged.
         let resolved_weights = self.resolve_weights(pool)?;
@@ -1139,11 +1219,15 @@ impl CatBoostBuilder {
             }
             cb_model::Model::from_trained(&trained, feature_borders)
         } else {
+            // PARAM-03: mask out any categorical column named by
+            // `ignored_features`. `Cow::Borrowed` — the zero-copy identity — for
+            // every fit that ignores no categorical feature, which is the norm.
+            let cat_columns = mask_ignored_cat_columns(pool.cat_features(), &ignored_cat);
             let (trained, baked) = train_cat_with_eval_sets(
                 &backend,
                 &feature_values,
                 &feature_borders,
-                pool.cat_features(),
+                cat_columns.as_ref(),
                 pool.label(),
                 weights,
                 &params,

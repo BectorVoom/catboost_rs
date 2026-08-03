@@ -21,9 +21,11 @@ use pyo3::types::PyDict;
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
 use crate::estimator::{
     accuracy_score, build_sklearn_tags, data_to_pool, eval_set_to_pools, fit_pool_with_eval,
-    load_model_path, resolve_cat_features, EstimatorBase,
+    load_model_path, resolve_cat_features, scoring_data_to_pool, EstimatorBase,
 };
-use crate::params::{make_builder, validate_eval_set_only_params, validate_params};
+use crate::params::{
+    make_builder, validate_eval_set_only_params, validate_params, EVAL_SET_REMEDY_FIT,
+};
 use crate::regressor::y_to_vec;
 
 /// CatBoost-mirror classifier (sklearn-compatible). Reuses the shared estimator
@@ -79,7 +81,7 @@ impl CatBoostClassifier {
             None => Vec::new(),
         };
         if eval_pools.is_empty() {
-            validate_eval_set_only_params(&slf.base.params)?;
+            validate_eval_set_only_params(py, &slf.base.params, EVAL_SET_REMEDY_FIT)?;
         }
         let mut builder = make_builder(&slf.base.params, py)?;
         // The classifier defaults to a CLASSIFICATION loss (D-05). Only override
@@ -115,7 +117,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `predict`",
             )
         })?;
-        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
+        let pool = scoring_data_to_pool(py, x, &self.base.cat_features)?;
         let preds = py
             .detach(|| model.predict_with(&pool, PredictionType::Class))
             .map_err(PyCbError)?;
@@ -141,7 +143,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `predict_proba`",
             )
         })?;
-        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
+        let pool = scoring_data_to_pool(py, x, &self.base.cat_features)?;
         // The facade returns the two-column probability output flattened row-major
         // (`[class-0, class-1]` per object). Reshape to `(n, 2)` for the upstream
         // binary convention.
@@ -295,7 +297,7 @@ impl CatBoostClassifier {
                 "this CatBoostClassifier is not fitted yet; call `fit` before `score`",
             )
         })?;
-        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
+        let pool = scoring_data_to_pool(py, x, &self.base.cat_features)?;
         let preds = py
             .detach(|| model.predict_with(&pool, PredictionType::Class))
             .map_err(PyCbError)?;

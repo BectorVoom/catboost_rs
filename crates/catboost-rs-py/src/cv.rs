@@ -14,7 +14,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::errors::{CatBoostValueError, PyCbError};
 use crate::estimator::data_to_pool;
-use crate::params::make_builder;
+use crate::params::{make_builder, validate_eval_set_only_params, EVAL_SET_REMEDY_CV};
 
 /// Resolve the requested metric descriptors: an explicit `str` / `list[str]`, or
 /// (when `None`) the canonical metric derived from `params["loss_function"]`
@@ -116,6 +116,14 @@ pub(crate) fn cv(
         let name: String = key.extract()?;
         params_map.insert(name, value.unbind());
     }
+
+    // Every fold is fit through `builder.fit(&train_pool)` — the LEARN-ONLY path,
+    // with no eval set — so the detector / best-model params act on a validation
+    // curve that is never computed. `fit` rejects them for exactly this reason;
+    // accepting them here and silently dropping them is the failure the guard
+    // exists to prevent, and is worse than on `fit` because the raise over there
+    // is what persuades a user the parameter is honoured everywhere.
+    validate_eval_set_only_params(py, &params_map, EVAL_SET_REMEDY_CV)?;
 
     // F17: honour `params["cat_features"]` so a categorical pool reaches F14's
     // fail-fast guard rather than being silently ingested float-only.
