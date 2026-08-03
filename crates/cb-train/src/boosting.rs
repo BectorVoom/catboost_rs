@@ -2451,6 +2451,7 @@ pub fn train_with_eval_sets<R: Runtime>(
         eval_sets,
         history,
         RankingData::default(),
+        None,
     )?;
     Ok(model)
 }
@@ -2491,6 +2492,7 @@ pub fn train_ranking<R: Runtime>(
         &[],
         None,
         ranking,
+        None,
     )?;
     Ok(model)
 }
@@ -2544,6 +2546,7 @@ pub fn train_cat<R: Runtime>(
         &[],
         None,
         RankingData::default(),
+        None,
     )
 }
 
@@ -2596,7 +2599,77 @@ pub fn train_cat_with_eval_sets<R: Runtime>(
         eval_sets,
         history,
         RankingData::default(),
+        None,
     )
+}
+
+/// Train a numeric model with a periodic on-disk CHECKPOINT, resuming
+/// automatically from `snapshot.snapshot_file` when it already exists and its
+/// fingerprint matches this run (ORCH-03-S7).
+///
+/// Mirrors upstream's `snapshot_file` / `snapshot_interval` semantics: a
+/// checkpoint is written at completed-iteration boundaries no more often than
+/// `snapshot_interval`, and a subsequent call with the same configuration picks up
+/// where the previous one stopped instead of retraining from scratch.
+///
+/// Snapshotting is defined only for plain float-only CPU boosting — see
+/// [`snapshot_scope_ok`] for the exact admitted regime and the reason each excluded
+/// feature is excluded.
+///
+/// Returns the trained model together with the iteration the run RESUMED FROM —
+/// `0` for a fresh fit, `K` when a `K`-tree checkpoint was picked up. That number
+/// is the only observable difference between a resume and a from-scratch retrain
+/// (both produce the same model, which is the point), so callers that need to know
+/// whether the checkpoint was used must read it here.
+///
+/// # Errors
+/// [`CbError::Snapshot`] if the configuration is outside the snapshot regime (no
+/// file is written), if the existing snapshot's fingerprint does not match this
+/// run's, or on any snapshot I/O / codec failure. Otherwise the same errors as
+/// [`train`].
+pub fn train_with_snapshot<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    snapshot: &crate::snapshot::SnapshotConfig,
+) -> CbResult<(Model, usize)> {
+    // The resume point is determined by PEEKING the checkpoint here rather than by
+    // growing `train_inner`'s return type: that would force a three-tuple
+    // destructure at all four of its existing call sites, turning an additive
+    // change into a signature change across paths that have nothing to do with
+    // snapshots. `train_inner` re-reads and restores the file itself; on this
+    // deterministic single-threaded path the extra read is cheap and side-effect
+    // free.
+    //
+    // The fingerprint check runs BEFORE any training, so a mismatched checkpoint
+    // costs the caller nothing.
+    let resume_from = if snapshot.snapshot_file.exists() {
+        let stored = crate::snapshot::read_from(&snapshot.snapshot_file)?;
+        let current = crate::snapshot::fingerprint(params, target.len(), feature_borders, target);
+        crate::snapshot::check_resume(stored.fingerprint, current)?;
+        stored.completed_iters
+    } else {
+        0
+    };
+
+    let (model, _baked) = train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        &[],
+        target,
+        weights,
+        params,
+        None,
+        &[],
+        None,
+        RankingData::default(),
+        Some(snapshot),
+    )?;
+    Ok((model, resume_from))
 }
 
 /// Quantize the float design matrix into the device's feature-major cindex
@@ -2886,6 +2959,96 @@ fn build_one_hot_columns(
     Ok((bins_out, hash_out))
 }
 
+/// Admit a training run into the snapshot regime, or reject it with a typed error
+/// naming the offending feature (ORCH-03-S5).
+///
+/// Slice 1 snapshots exactly the configuration whose loop-carried mutable state is
+/// `{approx, trees, rng}` — established by the audit in
+/// `.planning/plans/snapshot-resume/TASK-01-findings.md` against this file. Every
+/// predicate below marks state that a checkpoint does NOT carry, so resuming such a
+/// run would continue from a partially-restored trainer and silently produce a
+/// model that is neither the interrupted run's nor a fresh run's. Refusing up front
+/// is the only honest option; each rejection names what to turn off.
+///
+/// Two predicates deserve their own note:
+///
+/// * A `Loss::Custom(_)` objective / `EvalMetric::Custom(_)` metric is an opaque
+///   `Arc<dyn …>` whose only equality is process-local pointer identity. No
+///   cross-process fingerprint can tell two custom instances apart, so a resume
+///   could silently pair a snapshot with a DIFFERENT objective. Neither is caught
+///   by any other predicate: `Loss::Custom` is single-dimension and is not a
+///   grouped loss.
+/// * A requested `staged_out` buffer accumulates one row per iteration and is NOT
+///   part of the checkpoint, so a resumed run would return `N-K` staged rows where
+///   a straight-through run returns `N`. (Found by the TASK-01 audit; it is a
+///   `train_inner` PARAMETER, not a local, which is why the original state audit
+///   missed it.)
+#[allow(clippy::too_many_arguments)]
+fn snapshot_scope_ok(
+    params: &BoostParams,
+    cat_columns: &[Vec<String>],
+    eval_sets: &[EvalSet],
+    approx_dimension: usize,
+    penalties_active: bool,
+    device_active: bool,
+    staged_requested: bool,
+    ranking: &RankingData,
+) -> CbResult<()> {
+    let reject = |what: &str| {
+        Err(CbError::Snapshot(format!(
+            "training snapshots are supported only for plain float-only CPU boosting; \
+             this run uses {what}"
+        )))
+    };
+
+    if matches!(params.loss, Loss::Custom(_)) {
+        return reject("a custom objective (its identity cannot be fingerprinted across runs)");
+    }
+    if matches!(params.eval_metric, Some(EvalMetric::Custom(_))) {
+        return reject("a custom eval metric (its identity cannot be fingerprinted across runs)");
+    }
+    if is_grouped_loss(&params.loss) {
+        return reject("a grouped / ranking loss");
+    }
+    if !ranking.group_id.is_empty() || !ranking.subgroup_id.is_empty() || !ranking.pairs.is_empty()
+    {
+        return reject("ranking data (group_id / subgroup_id / pairs)");
+    }
+    if !cat_columns.is_empty() {
+        return reject("categorical features");
+    }
+    if !matches!(params.boosting_type, EBoostingType::Plain) {
+        return reject("ordered boosting");
+    }
+    if !eval_sets.is_empty() {
+        return reject("eval sets (the overfitting detector's state is not checkpointed)");
+    }
+    if !matches!(params.bootstrap_type, EBootstrapType::No) {
+        return reject("bootstrap sampling");
+    }
+    if params.random_strength != 0.0 {
+        return reject("a non-zero random_strength");
+    }
+    if approx_dimension != 1 {
+        return reject("a multi-dimensional approximant");
+    }
+    if penalties_active {
+        return reject("feature weights / penalties");
+    }
+    if !matches!(params.grow_policy, EGrowPolicy::SymmetricTree) {
+        return reject("a non-symmetric grow policy");
+    }
+    if device_active {
+        return reject("device (GPU) training");
+    }
+    if staged_requested {
+        return reject(
+            "a staged-prediction buffer (a resumed run would emit only the post-resume rows)",
+        );
+    }
+    Ok(())
+}
+
 /// The shared boosting loop body for the numeric ([`train_with_eval_sets`]) and
 /// cat-aware ([`train_cat`]) entry points. `cat_columns` is EMPTY for the numeric
 /// path (byte-identical to the pre-05-11 driver); a non-empty `cat_columns`
@@ -2905,7 +3068,13 @@ fn train_inner<R: Runtime>(
     eval_sets: &[EvalSet],
     mut history: Option<&mut EvalMetricHistory>,
     ranking: RankingData,
+    snapshot: Option<&crate::snapshot::SnapshotConfig>,
 ) -> CbResult<(Model, BakedCtrData)> {
+    // ORCH-03 TASK-03: the parameter is threaded but not yet read — the write hook
+    // (TASK-06) and the resume block (TASK-07) are the first consumers. Every
+    // existing caller passes `None`, so this task is behavior-preserving by
+    // construction (the D-04 anchor: the FULL `cb-train` suite must stay green).
+    let _ = &snapshot;
     check_depth(params.depth)?;
 
     // Validate the loss's hyperparameters before any training work
@@ -4124,7 +4293,108 @@ fn train_inner<R: Runtime>(
     // the whole fit and passed into every tree's structure search.
     let mut used_ctr_splits: Vec<(i8, crate::TProjection)> = Vec::new();
 
-    for iter in 0..params.iterations {
+    // ORCH-03-S5: snapshot admission. Placed HERE — after every gate local this
+    // guard reads is computed (`device_active` at the device-begin above is the
+    // last of them) and BEFORE the first tree grows — so an out-of-scope regime is
+    // refused without ever writing a file. `snapshot == None` skips the whole block
+    // and leaves the loop byte-identical (the D-04 anchor).
+    let snapshot_state = match snapshot {
+        None => None,
+        Some(cfg) => {
+            snapshot_scope_ok(
+                params,
+                cat_columns,
+                eval_sets,
+                approx_dimension,
+                penalties_active,
+                device_active,
+                staged_out.is_some(),
+                &ranking,
+            )?;
+            let fingerprint =
+                crate::snapshot::fingerprint(params, n, feature_borders, target);
+            Some((cfg, fingerprint))
+        }
+    };
+    // ORCH-03-S6: RESUME. When the configured file already exists and its stored
+    // fingerprint matches this run, the loop-carried state is replaced wholesale
+    // with the checkpoint's and the loop starts at `completed_iters` instead of 0.
+    //
+    // `approx` is taken VERBATIM from the checkpoint rather than rebuilt by
+    // re-applying the persisted trees: re-application would re-associate the
+    // per-iteration floating-point sums, and a resumed run must be BIT-identical to
+    // the straight-through run, not merely close.
+    //
+    // A fingerprint mismatch is an ERROR, never a silent fresh start — the file
+    // belongs to a different configuration, and quietly ignoring it would discard
+    // work the caller believes is being continued.
+    let mut resume_from = 0usize;
+    if let Some((cfg, fingerprint)) = snapshot_state {
+        if cfg.snapshot_file.exists() {
+            let stored = crate::snapshot::read_from(&cfg.snapshot_file)?;
+            crate::snapshot::check_resume(stored.fingerprint, fingerprint)?;
+
+            // Both are deterministic functions of the fingerprinted inputs, so a
+            // disagreement means the fingerprint failed to cover something — a
+            // silent-corruption bug, not a user error. Fail loudly.
+            if stored.approx_dimension != approx_dimension {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot approx_dimension {} != this run's {approx_dimension} despite a \
+                     matching fingerprint",
+                    stored.approx_dimension
+                )));
+            }
+            if stored.approx.len() != approx.len() {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot approx has {} values, this run has {} objects despite a matching \
+                     fingerprint",
+                    stored.approx.len(),
+                    approx.len()
+                )));
+            }
+            if stored.completed_iters > params.iterations {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot holds {} completed iterations, more than this run's {} — nothing \
+                     to resume",
+                    stored.completed_iters, params.iterations
+                )));
+            }
+            if stored.trees.len() != stored.completed_iters {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot claims {} completed iterations but carries {} trees",
+                    stored.completed_iters,
+                    stored.trees.len()
+                )));
+            }
+
+            // `bias` is `starting_approx(params, target)` — a pure function of the
+            // fingerprinted `loss` / `boost_from_average` / `target`. It is
+            // therefore VERIFIED against the checkpoint rather than restored from
+            // it: a disagreement means the fingerprint failed to cover an input
+            // that moves the starting approximant, which is a silent-corruption
+            // bug. Compared on bits, since this must be exact, not close.
+            if stored.bias.to_bits() != bias.to_bits() {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot bias {} != this run's {bias} despite a matching fingerprint",
+                    stored.bias
+                )));
+            }
+
+            trees = stored.trees.iter().map(crate::snapshot::tree_from_dto).collect();
+            approx = stored.approx;
+            rng = cb_core::TFastRng64::from_raw_state(stored.rng_raw_state, stored.rng_call_count);
+            resume_from = stored.completed_iters;
+        }
+    }
+
+    // Interval accounting for the periodic write. Seeded at the loop start so the
+    // FIRST checkpoint also honours `snapshot_interval` (a zero interval writes at
+    // every tree, which is what the deterministic tests use).
+    let mut last_snapshot_write = std::time::Instant::now();
+
+    // `resume_from` is 0 unless a checkpoint was just restored, so the non-snapshot
+    // path keeps the original `0..iterations` bound byte-for-byte (the D-04 anchor).
+    for iter in resume_from..params.iterations {
         // GPUT-01 DEVICE GROW BRANCH (D-10-01 per-fit all-or-nothing). When the fit
         // committed to the device path at `begin` (`device_active`), grow THIS
         // iteration's oblivious tree on the device seam and fold it into the Model
@@ -6089,6 +6359,31 @@ fn train_inner<R: Runtime>(
                 if detector.is_need_stop() {
                     break;
                 }
+            }
+        }
+
+        // ORCH-03-S5: periodic checkpoint. Written at the END of the iteration
+        // body, where iteration `iter` is fully complete — the tree is pushed and
+        // `approx` carries its contribution — so `completed_iters = iter + 1` is
+        // exactly where a resumed run must restart. The device arm `continue`s
+        // long before this point and is excluded by the scope guard anyway.
+        //
+        // The write is atomic (see `snapshot::write_atomic`); an I/O failure
+        // PROPAGATES rather than being swallowed, because a checkpoint the caller
+        // believes exists but does not is worse than a failed fit.
+        if let Some((cfg, fingerprint)) = snapshot_state {
+            if last_snapshot_write.elapsed() >= cfg.snapshot_interval {
+                let snap = crate::snapshot::capture(
+                    iter.saturating_add(1),
+                    fingerprint,
+                    bias,
+                    approx_dimension,
+                    &approx,
+                    &trees,
+                    &rng,
+                )?;
+                crate::snapshot::write_atomic(&cfg.snapshot_file, &snap)?;
+                last_snapshot_write = std::time::Instant::now();
             }
         }
     }
