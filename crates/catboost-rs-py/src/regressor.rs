@@ -13,10 +13,10 @@ use pyo3::types::PyDict;
 
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
 use crate::estimator::{
-    build_sklearn_tags, data_to_pool, fit_pool, load_model_path, r2_score,
-    resolve_cat_features, EstimatorBase,
+    build_sklearn_tags, data_to_pool, eval_set_to_pools, fit_pool_with_eval, load_model_path,
+    r2_score, resolve_cat_features, EstimatorBase,
 };
-use crate::params::{make_builder, validate_params};
+use crate::params::{make_builder, validate_eval_set_only_params, validate_params};
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
 /// thinnest `__init__` / `fit` / `predict` path; the full sklearn contract and
@@ -49,13 +49,14 @@ impl CatBoostRegressor {
     /// # Errors
     /// [`PyValueError`] on a dtype / layout / shape mismatch (D-12) or a training
     /// failure (typed taxonomy: 08-02).
-    #[pyo3(signature = (x, y = None, cat_features = None))]
+    #[pyo3(signature = (x, y = None, cat_features = None, eval_set = None))]
     fn fit(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
         y: Option<&Bound<'_, PyAny>>,
         cat_features: Option<Vec<usize>>,
+        eval_set: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<Self>> {
         // Validate kwargs against the D-07 registry BEFORE ingest (D-06): reject
         // known-not-yet (parity gap) and unknown (typo) params with a typed
@@ -72,9 +73,23 @@ impl CatBoostRegressor {
         // (F10 checks the pool's declared width against the model's).
         let cats = resolve_cat_features(&slf.base.params, py, cat_features)?;
         let pool = data_to_pool(py, x, y, Some(&cats))?;
+        // PARAM-02: the eval sets are ingested to OWNED pools under the GIL, like
+        // the learn set. An absent `eval_set` yields an empty vector, which the
+        // facade treats as a plain learn-only fit.
+        let eval_pools = match eval_set {
+            Some(es) => eval_set_to_pools(py, es, &cats)?,
+            None => Vec::new(),
+        };
+        // The detector / best-model params act on the validation curve; with no
+        // eval set they would be silently inert, so reject rather than ignore.
+        if eval_pools.is_empty() {
+            validate_eval_set_only_params(&slf.base.params)?;
+        }
         let builder = make_builder(&slf.base.params, py)?;
         // --- owned/quantized data only: safe to release the GIL ---
-        let model = py.detach(|| fit_pool(builder, &pool)).map_err(PyCbError)?;
+        let model = py
+            .detach(|| fit_pool_with_eval(builder, &pool, &eval_pools))
+            .map_err(PyCbError)?;
         slf.base.model = Some(model);
         slf.base.cat_features = cats;
         Ok(slf.into())

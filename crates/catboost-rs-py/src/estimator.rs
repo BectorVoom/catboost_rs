@@ -207,15 +207,108 @@ pub(crate) fn accuracy_score(y: &[f64], pred: &[f64]) -> f64 {
     correct as f64 / n as f64
 }
 
-/// Build a [`CatBoostBuilder`] from the params and fit it on an OWNED pool. The
-/// caller is expected to invoke this under `py.detach` (the `pool` is owned, so
-/// no Python buffer borrow is alive — D-11). Returns the typed facade
-/// [`CatBoostError`]; the caller maps it via `errors::to_pyerr` (PYAPI-05).
+/// Build a [`CatBoostBuilder`] from the params and fit it on an OWNED learn pool
+/// with OWNED eval pools (PARAM-02). The caller is expected to invoke this under
+/// `py.detach` (every pool is owned, so no Python buffer borrow is alive — D-11).
+/// Returns the typed facade [`CatBoostError`]; the caller maps it via
+/// `errors::to_pyerr` (PYAPI-05).
+///
+/// An EMPTY `eval_pools` is a plain learn-only fit: the facade's
+/// `fit_with_eval_sets` and `fit` share one inner, so passing no eval set is
+/// byte-identical to calling `fit` directly.
 ///
 /// # Errors
-/// Returns the facade [`CatBoostError`] training error.
-pub(crate) fn fit_pool(builder: CatBoostBuilder, pool: &Pool) -> Result<Model, CatBoostError> {
-    builder.fit(pool)
+/// Returns the facade [`CatBoostError`] training error (including
+/// `FeatureMismatch` when an eval pool's width disagrees with the learn pool's).
+pub(crate) fn fit_pool_with_eval(
+    builder: CatBoostBuilder,
+    pool: &Pool,
+    eval_pools: &[Pool],
+) -> Result<Model, CatBoostError> {
+    let refs: Vec<&Pool> = eval_pools.iter().collect();
+    builder.fit_with_eval_sets(pool, &refs).map(|out| out.model)
+}
+
+/// Ingest the `eval_set` fit kwarg into owned [`Pool`]s (PARAM-02).
+///
+/// Upstream accepts any of:
+///  - a single `Pool`;
+///  - a single `(X, y)` tuple;
+///  - a LIST of either.
+///
+/// All four shapes are accepted here and normalized to a vector of owned pools,
+/// ingested through the SAME [`data_to_pool`] path as the learn set so an eval
+/// set gets identical dtype / layout / nullability validation (D-12).
+///
+/// `cat_features` is threaded through so an eval set declares the same
+/// categorical columns the learn set does — the facade rejects a width mismatch,
+/// and without this an eval set built from a DataFrame would silently arrive
+/// float-only.
+///
+/// # Errors
+/// [`CatBoostValueError`] on any shape the four forms above do not cover, or any
+/// ingestion failure of a member.
+pub(crate) fn eval_set_to_pools(
+    py: Python<'_>,
+    eval_set: &Bound<'_, PyAny>,
+    cat_features: &[usize],
+) -> PyResult<Vec<Pool>> {
+    if eval_set.is_none() {
+        return Ok(Vec::new());
+    }
+    // A `Pool` is itself iterable-looking to nothing, but a TUPLE is: check the
+    // single-Pool and single-tuple forms BEFORE the list form, otherwise
+    // `(X, y)` would be read as "a list of two eval sets".
+    if eval_set.cast::<crate::pool::Pool>().is_ok() {
+        return Ok(vec![one_eval_pool(py, eval_set, cat_features)?]);
+    }
+    if let Ok(tuple) = eval_set.cast::<pyo3::types::PyTuple>() {
+        if tuple.len() == 2 {
+            return Ok(vec![one_eval_pool(py, eval_set, cat_features)?]);
+        }
+        return Err(CatBoostValueError::new_err(format!(
+            "eval_set tuple must be (X, y), got {} elements",
+            tuple.len()
+        )));
+    }
+    if let Ok(list) = eval_set.cast::<pyo3::types::PyList>() {
+        let mut pools = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            pools.push(one_eval_pool(py, &item, cat_features)?);
+        }
+        return Ok(pools);
+    }
+    Err(CatBoostValueError::new_err(
+        "eval_set must be a Pool, an (X, y) tuple, or a list of either",
+    ))
+}
+
+/// Ingest ONE eval-set member (a `Pool` or an `(X, y)` tuple) into an owned pool.
+fn one_eval_pool(
+    py: Python<'_>,
+    item: &Bound<'_, PyAny>,
+    cat_features: &[usize],
+) -> PyResult<Pool> {
+    if item.cast::<crate::pool::Pool>().is_ok() {
+        // A Pool already declares its own categorical columns; passing
+        // `cat_features` alongside one is the same ambiguity `data_to_pool`
+        // rejects for the learn set, so route through it with no declaration.
+        return data_to_pool(py, item, None, None);
+    }
+    let tuple = item.cast::<pyo3::types::PyTuple>().map_err(|_| {
+        CatBoostValueError::new_err(
+            "each eval_set entry must be a Pool or an (X, y) tuple",
+        )
+    })?;
+    if tuple.len() != 2 {
+        return Err(CatBoostValueError::new_err(format!(
+            "eval_set tuple must be (X, y), got {} elements",
+            tuple.len()
+        )));
+    }
+    let x = tuple.get_item(0)?;
+    let y = tuple.get_item(1)?;
+    data_to_pool(py, &x, Some(&y), Some(cat_features))
 }
 
 /// Resolve the categorical column indices for one `fit()` call (F17).
