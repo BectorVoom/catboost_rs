@@ -81,6 +81,10 @@ pub use cb_train::{
 
 // Re-export the Pool ingestion surface (the `fit`/predict input) from the
 // published crate.
+// PARAM-03: the class-weight scheme selector `CatBoostBuilder::auto_class_weights`
+// takes. Re-exported for the same reason as the CTR enums: without it a caller
+// could name the setter but not its argument type.
+pub use cb_data::AutoClassWeights;
 pub use cb_data::ingest::{IngestSource, OwnedColumns};
 pub use cb_data::Pool;
 

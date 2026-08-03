@@ -56,6 +56,11 @@ fn implemented_params_tag_implemented() {
         "grow_policy",
         "max_leaves",
         "min_data_in_leaf",
+        // PARAM-03 promotions.
+        "class_weights",
+        "auto_class_weights",
+        "scale_pos_weight",
+        "ignored_features",
     ] {
         assert_eq!(
             status_of(name),

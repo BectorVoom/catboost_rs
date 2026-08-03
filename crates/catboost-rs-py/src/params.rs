@@ -40,8 +40,9 @@
 use std::collections::BTreeMap;
 
 use catboost_rs::{
-    parse_metric, CatBoostBuilder, CounterCalcMethod, EBoostingType, EBootstrapType, ECtrType,
-    EGrowPolicy, EOverfittingDetectorType, EScoreFunction, EvalMetric, LeafMethod, Loss,
+    parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
+    EBootstrapType, ECtrType, EGrowPolicy, EOverfittingDetectorType, EScoreFunction, EvalMetric,
+    LeafMethod, Loss,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -116,6 +117,14 @@ const IMPLEMENTED: &[&str] = &[
     "grow_policy",
     "max_leaves",
     "min_data_in_leaf",
+    // PARAM-03: the class-weight family + ignored_features. The class-weight
+    // COMPUTATION already existed in `cb_data::weights` (oracle-gated against the
+    // frozen upstream `class_weights/` fixture); what PARAM-03 added is the path
+    // that APPLIES the resolved per-object weights during a fit.
+    "class_weights",
+    "auto_class_weights",
+    "scale_pos_weight",
+    "ignored_features",
 ];
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
@@ -807,6 +816,22 @@ fn to_constraint(v: i64) -> PyResult<i8> {
     }
 }
 
+/// Map an `auto_class_weights` string onto an [`AutoClassWeights`] (PARAM-03).
+///
+/// Upstream spells "off" as `None` (the Python literal `None`, i.e. the kwarg
+/// absent) — the string `"None"` is accepted too so an explicit round-trip
+/// through `get_params()` works.
+fn parse_auto_class_weights(name: &str) -> PyResult<AutoClassWeights> {
+    match name {
+        "None" => Ok(AutoClassWeights::None),
+        "Balanced" => Ok(AutoClassWeights::Balanced),
+        "SqrtBalanced" => Ok(AutoClassWeights::SqrtBalanced),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown auto_class_weights `{other}`; expected Balanced, SqrtBalanced or None"
+        ))),
+    }
+}
+
 /// Map a `leaf_estimation_method` string onto a [`LeafMethod`].
 fn parse_leaf_method(name: &str) -> PyResult<LeafMethod> {
     match name {
@@ -1000,6 +1025,32 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = extract_monotone_constraints(params, py)? {
         builder = builder.monotone_constraints(v);
+    }
+
+    // ---- PARAM-03: the class-weight family + ignored_features --------------
+    //
+    // The three class-weight controls are NOT cross-validated here: the facade's
+    // `resolve_weights` already rejects the combination (and rejects a
+    // classification-only control on a regression loss) with a message naming the
+    // conflict, and duplicating that rule in two places is how the two copies
+    // drift apart. Only per-value validation lives here.
+    if let Some(v) = get_with_aliases::<Vec<f64>>(params, py, "class_weights")? {
+        for (i, w) in v.iter().enumerate() {
+            check_range(&format!("class_weights[{i}]"), *w, 0.0, f64::INFINITY, true)?;
+        }
+        builder = builder.class_weights(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "auto_class_weights")? {
+        builder = builder.auto_class_weights(parse_auto_class_weights(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "scale_pos_weight")? {
+        // > 0: a zero or negative positive-class weight would erase or invert the
+        // class's contribution rather than reweight it.
+        check_range("scale_pos_weight", v, 0.0, f64::INFINITY, false)?;
+        builder = builder.scale_pos_weight(v);
+    }
+    if let Some(v) = get_with_aliases::<Vec<usize>>(params, py, "ignored_features")? {
+        builder = builder.ignored_features(v);
     }
 
     // ---- F15/F16: the categorical / CTR surface -----------------------------
