@@ -59,6 +59,12 @@ pub use cb_model::CoreMlExportError;
 // default, L2 = variance-reduction alternative).
 pub use cb_compute::{EScoreFunction, LeafMethod, Loss};
 pub use cb_train::EBootstrapType;
+// The categorical / CTR knobs `CatBoostBuilder::simple_ctr`,
+// `.combinations_ctr` and `.counter_calc_method` take (F07). Without these
+// re-exports an external crate could name the setters but not their argument
+// types, so a caller could not configure a categorical run through the
+// published crate alone.
+pub use cb_train::{CounterCalcMethod, ECtrType};
 
 // Re-export the Pool ingestion surface (the `fit`/predict input) from the
 // published crate.

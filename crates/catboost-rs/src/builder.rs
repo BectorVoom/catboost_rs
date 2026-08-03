@@ -36,8 +36,8 @@ use cb_train::{
     counter_calc_method_default, fold_len_multiplier_default, has_time_default,
     max_ctr_complexity_default,
     one_hot_max_size_default, permutation_count_default, score_function_default,
-    simple_ctr_default, simple_ctr_priors_default, train, BoostParams, EBootstrapType,
-    EOverfittingDetectorType, EvalMetric,
+    simple_ctr_default, simple_ctr_priors_default, train, BoostParams, CounterCalcMethod,
+    EBootstrapType, ECtrType, EOverfittingDetectorType, EvalMetric,
 };
 
 use crate::error::CatBoostError;
@@ -82,6 +82,41 @@ pub struct CatBoostBuilder {
     random_seed: u64,
     border_count: usize,
     score_function: EScoreFunction,
+    /// Cardinality ceiling for the one-hot categorical encoding path
+    /// (`one_hot_max_size`, upstream default 2). A categorical column with
+    /// `1 < learn-cardinality <= one_hot_max_size` routes to one-hot; above it,
+    /// to the CTR path.
+    one_hot_max_size: u32,
+    /// Maximum feature-combination (tensor-CTR) projection length
+    /// (`max_ctr_complexity`, upstream default 4). `1` emits SimpleCtrs only and
+    /// is the ONLY in-engine way to suppress combination CTRs entirely.
+    max_ctr_complexity: usize,
+    /// The SINGLE simple-CTR type (`simple_ctr`).
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`catboost_options.cpp:439-453`); this crate models ONE
+    /// description with a prior LIST. The type and the full prior list ARE
+    /// honored (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]`
+    /// configuration is NOT representable.
+    simple_ctr: ECtrType,
+    /// Per-prior NUMERATORS for [`Self::simple_ctr`]. Each denominator is pinned
+    /// to `1`: `Prior=<n>/<d>` with `d != 1` is illegal on CPU upstream
+    /// (`ctr_helper.cpp:50`), which is what vindicates the engine's
+    /// `prior_denom: 1.0` pin.
+    simple_ctr_priors: Vec<f64>,
+    /// The SINGLE combination-CTR type (`combinations_ctr`). Same
+    /// single-description parity gap as [`Self::simple_ctr`].
+    combinations_ctr: ECtrType,
+    /// Per-prior NUMERATORS for [`Self::combinations_ctr`]; unit denominators,
+    /// as for [`Self::simple_ctr_priors`].
+    combinations_ctr_priors: Vec<f64>,
+    /// Whether the Counter CTR tally folds the eval sets in (`Full`) or skips
+    /// them (`SkipTest`, the upstream default).
+    ///
+    /// **Observable only when an eval set is present**: with a learn set alone
+    /// the two settings produce bit-identical models (measured `0.000e+00`
+    /// learn-only vs `4.010e-01` with an eval set — the E23 gate).
+    counter_calc_method: CounterCalcMethod,
 }
 
 impl Default for CatBoostBuilder {
@@ -113,6 +148,13 @@ impl CatBoostBuilder {
             random_seed: 0,
             border_count: QuantizeParams::default().border_count,
             score_function: score_function_default(),
+            one_hot_max_size: one_hot_max_size_default(),
+            max_ctr_complexity: max_ctr_complexity_default(),
+            simple_ctr: simple_ctr_default(),
+            simple_ctr_priors: simple_ctr_priors_default(),
+            combinations_ctr: combinations_ctr_default(),
+            combinations_ctr_priors: combinations_ctr_priors_default(),
+            counter_calc_method: counter_calc_method_default(),
         }
     }
 
@@ -252,6 +294,90 @@ impl CatBoostBuilder {
         self
     }
 
+    /// Cardinality ceiling for the one-hot categorical encoding path
+    /// (`one_hot_max_size`, upstream default 2 —
+    /// `cat_feature_options.cpp:232-233`). A categorical column whose learn-set
+    /// cardinality satisfies `1 < cardinality <= one_hot_max_size` routes to the
+    /// one-hot path; above it, to the CTR path.
+    #[must_use]
+    pub fn one_hot_max_size(mut self, one_hot_max_size: u32) -> Self {
+        self.one_hot_max_size = one_hot_max_size;
+        self
+    }
+
+    /// Maximum feature-combination (tensor-CTR) projection length
+    /// (`max_ctr_complexity` / upstream `MaxTensorComplexity`, default 4 —
+    /// `cat_feature_options.cpp:231`). `1` emits SimpleCtrs only; `>= 2` admits
+    /// CombinationCtrs of that length. Setting `1` is the ONLY in-engine way to
+    /// suppress combination CTRs entirely.
+    #[must_use]
+    pub fn max_ctr_complexity(mut self, max_ctr_complexity: usize) -> Self {
+        self.max_ctr_complexity = max_ctr_complexity;
+        self
+    }
+
+    /// The simple-CTR type (`simple_ctr`). GENUINELY CONSUMED: it selects both
+    /// the online producer and the final bake, so changing it changes the model.
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+    /// `catboost_options.cpp:439-453`). This crate models ONE description with a
+    /// prior LIST — set the type here and the full prior list via
+    /// [`CatBoostBuilder::simple_ctr_priors`]. A simultaneous
+    /// `[Borders, Counter]` configuration is NOT representable.
+    #[must_use]
+    pub fn simple_ctr(mut self, simple_ctr: ECtrType) -> Self {
+        self.simple_ctr = simple_ctr;
+        self
+    }
+
+    /// The FULL prior list for [`CatBoostBuilder::simple_ctr`] — one CTR column
+    /// is generated per prior.
+    ///
+    /// Each value is a prior NUMERATOR over an implicit denominator of `1`:
+    /// upstream rejects `Prior=<n>/<d>` with `d != 1` on CPU
+    /// (`ctr_helper.cpp:50`), which is exactly why the engine pins
+    /// `prior_denom: 1.0`.
+    #[must_use]
+    pub fn simple_ctr_priors(mut self, simple_ctr_priors: Vec<f64>) -> Self {
+        self.simple_ctr_priors = simple_ctr_priors;
+        self
+    }
+
+    /// The combination-CTR type (`combinations_ctr`), applied to tensor
+    /// (multi-column) projections. Consumed whenever
+    /// [`CatBoostBuilder::max_ctr_complexity`] is `>= 2`. Carries the same
+    /// single-description parity gap as [`CatBoostBuilder::simple_ctr`].
+    #[must_use]
+    pub fn combinations_ctr(mut self, combinations_ctr: ECtrType) -> Self {
+        self.combinations_ctr = combinations_ctr;
+        self
+    }
+
+    /// The FULL prior list for [`CatBoostBuilder::combinations_ctr`]; unit
+    /// denominators, as for [`CatBoostBuilder::simple_ctr_priors`].
+    #[must_use]
+    pub fn combinations_ctr_priors(mut self, combinations_ctr_priors: Vec<f64>) -> Self {
+        self.combinations_ctr_priors = combinations_ctr_priors;
+        self
+    }
+
+    /// Whether the Counter CTR tally folds the eval sets into the counts
+    /// ([`CounterCalcMethod::Full`]) or skips them
+    /// ([`CounterCalcMethod::SkipTest`], the upstream default —
+    /// `cat_feature_options.cpp:234`).
+    ///
+    /// **This flag is observable only when an eval set is present.** Training on
+    /// a learn set alone produces bit-identical models under either setting
+    /// (measured max|diff| `0.000e+00` learn-only versus `4.010e-01` with an
+    /// eval set — the E23 gate). It is therefore NOT a blanket parity control:
+    /// it only bites through the eval-set training entrypoint.
+    #[must_use]
+    pub fn counter_calc_method(mut self, counter_calc_method: CounterCalcMethod) -> Self {
+        self.counter_calc_method = counter_calc_method;
+        self
+    }
+
     /// Map the builder fields onto the internal [`BoostParams`]. The
     /// overfitting-detector / `use_best_model` / `eval_metric` controls are off
     /// (the Phase-4 first-slice surface does not expose an eval set through the
@@ -281,26 +407,23 @@ impl CatBoostBuilder {
             // Custom eval metric (LOSS-07) when set via `custom_metric`; else the
             // train loop derives it from the loss (`EvalMetric::for_loss`).
             eval_metric: self.eval_metric.clone(),
-            // Pinned to the upstream default (cat_feature_options.cpp:231-232);
-            // the facade does not yet surface categorical config, and the
-            // numeric-only train path never exercises the one-hot branch.
-            one_hot_max_size: one_hot_max_size_default(),
+            // The facade now surfaces the categorical / CTR config (F01-F05);
+            // each field defaults to the upstream value in `new()`, so a
+            // builder that never touches them is byte-equivalent to the
+            // previously-pinned form (guarded by `builder_test`'s
+            // `untouched_builder_emits_the_canonical_ctr_defaults`).
+            one_hot_max_size: self.one_hot_max_size,
             // Pinned to the upstream defaults (RESEARCH Pitfall 6); the numeric
             // facade path needs no permutation, so these are inert here.
             permutation_count: permutation_count_default(),
             fold_len_multiplier: fold_len_multiplier_default(),
-            // CTR config pinned to the upstream defaults (D-07 / Pitfall 6); the
-            // numeric facade path bakes no CTR table, so these are inert here.
-            simple_ctr: simple_ctr_default(),
-            simple_ctr_priors: simple_ctr_priors_default(),
-            counter_calc_method: counter_calc_method_default(),
+            simple_ctr: self.simple_ctr,
+            simple_ctr_priors: self.simple_ctr_priors.clone(),
+            counter_calc_method: self.counter_calc_method,
             boosting_type: boosting_type_default(),
-            // Tensor-CTR config pinned to the upstream defaults (D-07 / Pitfall
-            // 6); the numeric facade path forms no combination, so these are
-            // inert here.
-            max_ctr_complexity: max_ctr_complexity_default(),
-            combinations_ctr: combinations_ctr_default(),
-            combinations_ctr_priors: combinations_ctr_priors_default(),
+            max_ctr_complexity: self.max_ctr_complexity,
+            combinations_ctr: self.combinations_ctr,
+            combinations_ctr_priors: self.combinations_ctr_priors.clone(),
             // Split-score function (`score_function`). The facade now surfaces
             // this via `.score_function()`, defaulting to the catboost CPU
             // default (Cosine, oblivious_tree_options.cpp:22) through
@@ -401,3 +524,7 @@ impl CatBoostBuilder {
         Ok(Model::from_canonical(canonical))
     }
 }
+
+#[cfg(test)]
+#[path = "builder_test.rs"]
+mod builder_test;

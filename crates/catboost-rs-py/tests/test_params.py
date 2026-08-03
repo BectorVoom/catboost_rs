@@ -100,3 +100,28 @@ def test_validation_fires_at_fit_not_init():
     x, y = _toy_xy()
     with pytest.raises(CatBoostParameterError):
         model.fit(x, y)
+
+
+def test_ctr_default_parity_gap_is_documented():
+    """SPEC-CTRT-19 / SPEC-CATF-Δ2 — the single-description CTR limit is recorded.
+
+    Upstream's CPU default is a LIST of two CTR descriptions; this crate models
+    ONE description with a prior LIST. That divergence must be documented, with
+    its upstream anchor, everywhere a user or implementer will look, so it
+    cannot silently rot into an undocumented parity gap.
+    """
+    src = (_REPO_ROOT / "crates" / "catboost-rs-py" / "src" / "params.rs").read_text()
+    assert "catboost_options.cpp:439-453" in src, (
+        "the multi-description default parity gap must cite its upstream anchor"
+    )
+    assert "single-description" in src or "one CTR description" in src
+
+    boosting = (
+        _REPO_ROOT / "crates" / "cb-train" / "src" / "boosting.rs"
+    ).read_text()
+    assert boosting.count("catboost_options.cpp:439-453") >= 4, (
+        "all four CTR *_default() doc comments must cite the parity-gap anchor"
+    )
+    # The now-false framing must be deleted, not left beside the new text.
+    assert "never exercise the CTR path" not in boosting
+    assert "never exercise the combination path" not in boosting
