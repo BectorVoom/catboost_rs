@@ -96,3 +96,73 @@ fn gen_rand_real1_from_seed_17_matches_to_rand_real1() {
     // The draw lies in the closed unit interval [0, 1].
     assert!((0.0..=1.0).contains(&got));
 }
+
+/// ORCH-03-S2 (TASK-02): [`TFastRng64::from_raw_state`] restores a generator that
+/// reproduces the ORIGINAL's `gen_rand` stream bit-for-bit from the captured
+/// position, and carries the captured `call_count` forward.
+///
+/// This is the snapshot/resume parity contract: a training run persists
+/// `(raw_state(), call_count())`, and the resumed run must consume the SAME draw
+/// sequence the straight-through run would have consumed. Exercised over several
+/// `(seed, offset, continue_draws)` triples so a constructor that accidentally
+/// re-derives from a seed (rather than restoring the raw state) cannot pass at
+/// offset 0 alone.
+#[test]
+fn from_raw_state_reproduces_the_gen_rand_stream_bit_for_bit() {
+    for &(seed, offset, continue_draws) in &[
+        (17u64, 0usize, 8usize),
+        (17, 1, 8),
+        (0, 5, 16),
+        (42, 37, 24),
+        (u64::MAX, 129, 4),
+    ] {
+        let mut original = TFastRng64::from_seed(seed);
+        for _ in 0..offset {
+            original.gen_rand();
+        }
+
+        let mut restored = TFastRng64::from_raw_state(original.raw_state(), original.call_count());
+        assert_eq!(
+            restored.call_count(),
+            original.call_count(),
+            "restored call_count must equal the captured one (seed={seed}, offset={offset})"
+        );
+        assert_eq!(
+            restored.raw_state(),
+            original.raw_state(),
+            "restored raw state must equal the captured one (seed={seed}, offset={offset})"
+        );
+
+        for draw in 0..continue_draws {
+            assert_eq!(
+                restored.gen_rand(),
+                original.gen_rand(),
+                "restored stream diverged at draw {draw} (seed={seed}, offset={offset})"
+            );
+        }
+        assert_eq!(
+            restored.call_count(),
+            original.call_count(),
+            "call_count must advance in lockstep (seed={seed}, offset={offset})"
+        );
+    }
+}
+
+/// The restore is a pure state transplant: `raw_state` alone (WITHOUT the
+/// original seed) is sufficient. A generator restored at offset `M` must NOT
+/// match a fresh `from_seed` generator's stream — otherwise the test above could
+/// pass with a constructor that ignored `raw_state` entirely.
+#[test]
+fn from_raw_state_differs_from_a_fresh_generator_at_a_nonzero_offset() {
+    let mut original = TFastRng64::from_seed(17);
+    for _ in 0..11 {
+        original.gen_rand();
+    }
+    let mut restored = TFastRng64::from_raw_state(original.raw_state(), original.call_count());
+    let mut fresh = TFastRng64::from_seed(17);
+    assert_ne!(
+        restored.gen_rand(),
+        fresh.gen_rand(),
+        "a restored generator at offset 11 must not replay the stream from the start"
+    );
+}

@@ -27,6 +27,37 @@ It is for two audiences: Rust developers who want to embed a memory-efficient gr
 
 <!-- GSD:stack-start source:codebase/STACK.md -->
 
+> ## ⚠️ CORRECTION — the sections below are STALE (verified 2026-08-01)
+>
+> Everything under **Technology Stack**, **Component Responsibilities**, **Layers** and
+> **Key Abstractions** that references `catboost-master/` describes a fully vendored
+> CatBoost C++ tree — Rust wrapper crates (`catboost`, `catboost-sys`), a C API,
+> CMake/Conan, and Python/JVM/.NET/Node/R packages. **None of it exists in this
+> repository.** Every path checked (`catboost-master/catboost/rust-package`,
+> `catboost-master/CMakeLists.txt`, `catboost-master/catboost/libs`,
+> `catboost-master/build/build_native.py`) is missing, and those sections contradict
+> this file's own **Constraints** ("No C API: PyO3 bindings only; no C FFI or CAPI
+> layer"). They appear to be generated from a stale `codebase/STACK.md`.
+>
+> **What is actually here:**
+>
+> - The implementation is a Rust workspace under `crates/`: `catboost-rs`,
+>   `catboost-rs-py`, `cb-backend`, `cb-compute`, `cb-core`, `cb-data`, `cb-model`,
+>   `cb-oracle`, `cb-train`. There is no FFI to upstream C++ and no build of it.
+> - `catboost-master/` contains exactly **three** files:
+>   `catboost/private/libs/algo/{greedy_tensor_search.cpp, train.cpp,
+>   yetirank_helpers.cpp}`.
+>
+> **Do NOT use `catboost-master/` as a parity reference.** Its
+> `greedy_tensor_search.cpp` is 1997 lines against v1.2.10's 1955 — a *different
+> revision* from the pinned parity target. For upstream source, read the
+> `v1.2.10` tag at github.com/catboost/catboost. Parity is established empirically
+> against the installed `catboost==1.2.10` Python package and the frozen fixtures in
+> `crates/cb-oracle/fixtures/`, not by reading vendored C++.
+>
+> Treat the rest of this file — **Conventions**, **Code Style**, the CubeCL rules,
+> and the source/test separation mandate — as current and authoritative.
+
 ## Technology Stack
 
 ## Languages

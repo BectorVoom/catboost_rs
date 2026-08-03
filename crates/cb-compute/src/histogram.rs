@@ -1129,6 +1129,144 @@ pub fn scan_and_score_borders_into<'s>(
     scores.as_slice()
 }
 
+/// The ONE-HOT sibling of [`scan_and_score_borders_into`] (SPEC-OH-06): score one
+/// categorical feature's candidate EQUALITY splits (`cat_bin == value`) through
+/// the SAME [`crate::score::multi_dim_split_score_into`] fold the float border
+/// path uses, so a float and a one-hot candidate are directly comparable in one
+/// argmax.
+///
+/// The only difference from the border path is the PARTITION: a border split is
+/// a prefix/suffix cut (`left = Σ bins[0..=b]`), whereas a one-hot split is an
+/// equality selection —
+///
+/// ```text
+///   TRUE  child (passes: cat_bin == value)  = bin_sums[value]
+///   FALSE child (everything else)           = total − bin_sums[value]
+/// ```
+///
+/// — so there is NO cross-candidate prefix accumulation: each `values[i]` is
+/// scored independently off the per-parent totals. Leaf ordering matches the
+/// border path exactly (`0..n_parent` = FALSE children, `n_parent..2·n_parent` =
+/// TRUE children), which is what makes the two score spaces commensurable.
+///
+/// `values` are the candidate bins in the caller's enumeration order (the CPU
+/// grower supplies `distinct_bins_ascending`); the returned slice is one score
+/// per entry, in that same order, borrowing `scratch.scores`.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_and_score_one_hot_bins_into<'s>(
+    scratch: &'s mut ScanScoreScratch,
+    hist: &BucketHistogram,
+    feature: usize,
+    values: &[u32],
+    approx_dimension: usize,
+    score_function: crate::runtime::EScoreFunction,
+    scaled_l2: f64,
+) -> &'s [f64] {
+    use crate::score::multi_dim_split_score_into;
+
+    let ScanScoreScratch {
+        total_w,
+        total_d,
+        col,
+        acc_false_w: _,
+        acc_false_d: _,
+        per_dim,
+        num,
+        den,
+        scores,
+    } = scratch;
+
+    let n_parent = hist.n_leaves();
+    let n_bins = hist.n_bins();
+    let n_channels = hist.n_channels();
+    let dim = approx_dimension.max(1);
+    let weight_channel = approx_dimension; // channel index of Σ weight
+
+    // Per-parent totals — computed EXACTLY as the border path does (same ordered
+    // `sum_f64` over the same gather column), so the shared `total − selected`
+    // arithmetic below is bit-comparable with the border path's `total − prefix`.
+    total_w.clear();
+    total_w.resize(n_parent, 0.0_f64);
+    total_d.clear();
+    total_d.resize(n_parent.saturating_mul(dim), 0.0_f64);
+    col.clear();
+    col.resize(n_bins, 0.0_f64);
+    for parent in 0..n_parent {
+        let block = match hist.feature_block(parent, feature) {
+            Some(b) => b,
+            None => continue, // out-of-range parent/feature → zero totals (empty row).
+        };
+        for bin in 0..n_bins {
+            if let Some(slot) = col.get_mut(bin) {
+                *slot = block.get(bin * n_channels + weight_channel).copied().unwrap_or(0.0);
+            }
+        }
+        if let Some(slot) = total_w.get_mut(parent) {
+            *slot = sum_f64(col.as_slice());
+        }
+        for d in 0..approx_dimension {
+            for bin in 0..n_bins {
+                if let Some(slot) = col.get_mut(bin) {
+                    *slot = block.get(bin * n_channels + d).copied().unwrap_or(0.0);
+                }
+            }
+            if let Some(slot) = total_d.get_mut(parent * dim + d) {
+                *slot = sum_f64(col.as_slice());
+            }
+        }
+    }
+
+    per_dim.resize_with(dim, Vec::new);
+    for row in per_dim.iter_mut() {
+        row.clear();
+        row.resize(2 * n_parent, LeafStats::default());
+    }
+    scores.clear();
+    scores.reserve(values.len());
+
+    for &value in values {
+        let bin = value as usize;
+        for parent in 0..n_parent {
+            let block = hist.feature_block(parent, feature);
+            // The TRUE side is this ONE bin's cell (no prefix); the FALSE side is
+            // the per-parent total minus it.
+            let w_true = block
+                .and_then(|blk| blk.get(bin * n_channels + weight_channel))
+                .copied()
+                .unwrap_or(0.0);
+            let total_weight = total_w.get(parent).copied().unwrap_or(0.0);
+            let w_false = total_weight - w_true;
+            for d in 0..approx_dimension {
+                let d_true = block
+                    .and_then(|blk| blk.get(bin * n_channels + d))
+                    .copied()
+                    .unwrap_or(0.0);
+                let td = total_d.get(parent * dim + d).copied().unwrap_or(0.0);
+                let false_stats = LeafStats {
+                    sum_weighted_delta: td - d_true,
+                    sum_weight: w_false,
+                };
+                let true_stats = LeafStats {
+                    sum_weighted_delta: d_true,
+                    sum_weight: w_true,
+                };
+                if let Some(row) = per_dim.get_mut(d) {
+                    if let Some(slot) = row.get_mut(parent) {
+                        *slot = false_stats;
+                    }
+                    if let Some(slot) = row.get_mut(parent + n_parent) {
+                        *slot = true_stats;
+                    }
+                }
+            }
+        }
+        let score =
+            multi_dim_split_score_into(num, den, score_function, per_dim.as_slice(), scaled_l2);
+        scores.push(score);
+    }
+    scores.as_slice()
+}
+
 /// Caller-owned reusable buffers for [`fused_feature_scan_and_score`]: one histogram
 /// `data` Vec (the single-feature [`BucketHistogram`] backing store) plus a
 /// [`ScanScoreScratch`]. This is the `map_init` unit `tree.rs` constructs ONCE per

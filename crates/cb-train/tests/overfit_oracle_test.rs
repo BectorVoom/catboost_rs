@@ -213,6 +213,7 @@ fn train_overfit(cfg: &OverfitConfig) -> (cb_train::Model, Vec<f64>) {
     let eval = EvalSet {
         feature_values: &x_eval,
         target: &y_eval,
+        cat_columns: &[],
     };
     let mut eval_loss = Vec::new();
     let model = train_with_eval(

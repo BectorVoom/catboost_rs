@@ -256,7 +256,7 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
             // Oblivious resident session: `approx` is ignored (the resident approx is
             // authoritative), so a zero vector satisfies the length-agreement guard.
             let tree = session
-                .grow_one(&vec![0.0_f64; n], &target)
+                .grow_one(&vec![0.0_f64; n], &target, &[])
                 .expect("grow_one must succeed on the clear-margin fixture");
             device_trees.push(tree);
         }
@@ -274,7 +274,7 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
             device_trees.iter().zip(cpu.iter()).enumerate()
         {
             assert_eq!(dev.splits.len(), 1, "device tree {k} must be a depth-1 stump (n={n})");
-            let (df, db) = dev.splits[0];
+            let (df, db, _one_hot) = dev.splits[0];
             assert_eq!(
                 (df as usize, db as usize),
                 *cpu_split,

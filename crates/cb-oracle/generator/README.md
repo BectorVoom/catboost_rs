@@ -64,6 +64,40 @@ Trained from the `numeric_tiny` input with the pinned `CatBoostRegressor` params
 The Rust side loads the `.npy` arrays via `cb_oracle::load_f64_vec` and gates
 each stage with `cb_oracle::compare_stage` at `1e-5`.
 
+## GPU-only Poisson bootstrap oracle — `poisson_bootstrap_oracle.cpp`
+
+`bootstrap_type=Poisson` is the one sampler with **no Python oracle available at all**.
+Upstream CatBoost's own validator rejects it on the CPU task type
+(`bootstrap_options.cpp:29` — "poisson bootstrap is not supported on CPU"), so no
+`catboost` call can produce a CPU reference; and the per-object weights its GPU kernel
+draws are not exposed through any public API, so no GPU run can either. Upstream's CUDA
+kernel *is* the specification.
+
+`poisson_bootstrap_oracle.cpp` is therefore a **verbatim host transcription** of that
+specification — `PoissonBootstrapImpl` (`catboost/cuda/cuda_util/kernel/bootstrap.cu`),
+`NextPoisson`/`NextUniform`/`AdvanceSeed` (`.../random_gen.cuh`), the
+`numBlocks = min(ceil(seeds/256), ceil(n/256))` launch geometry, and
+`GetPoissonLambda() = -log(1 - subsample)`. Every function involved is pure integer /
+IEEE-754 arithmetic over an explicit seed word, so it compiles and runs identically on
+the host with `g++`.
+
+This makes the resulting fixture a real cross-check rather than a tautology: it is
+produced by a different program, in a different language, by a different compiler, on
+the CPU — while the value under test comes from a `#[cube]` kernel JIT-compiled to GPU
+ISA (`cb-backend`'s `kernels::poisson_bootstrap_oracle_test`, which asserts bit-for-bit
+equality).
+
+```bash
+cd crates/cb-oracle/generator
+python3 gen_poisson_bootstrap_fixture.py     # writes fixtures/bootstrap_poisson/
+```
+
+Three scenarios pin three different launch geometries, because the object -> seed map
+depends on the block count: `one_pass` (stride > n), `grid_wrap` (stride < n, so each
+thread draws for several objects in sequence) and `wide` (the production 79-block
+shape). Each is drawn twice over the same, in-place-advanced seed buffer, so the
+cross-tree seed carry-over is frozen too.
+
 ## Phase-5 per-object oracle — `ordered_oracle.cpp` (transcribe-then-self-oracle)
 
 `ordered_oracle.cpp` is a **standalone, dependency-free transcription** (ZERO

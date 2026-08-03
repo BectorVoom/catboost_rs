@@ -1,0 +1,49 @@
+{
+  "scenario": "ctr_btmv_simple",
+  "requirement": "SPEC-CTRT-07",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 30,
+  "description": "BinarizedTargetMeanValue-CTR end-to-end isolation (E13 / A2). Categorical-ONLY feature matrix (two columns, cardinality 6 and 5, zero float columns) so upstream float-quantization nondeterminism is structurally excluded. one_hot_max_size=1 routes both columns to the CTR path. simple_ctr=BinarizedTargetMeanValue with combinations_ctr=[] and max_ctr_complexity=1 isolates the simple BTMV type: a read-before-increment prefix over TCtrMeanHistory whose Sum is accumulated in f32. model.cbm is committed here and is reused by E18/E19 as the upstream BTMV .cbm the decoder must load. NEVER regenerated in CI.",
+  "params": {
+    "loss_function": "Logloss",
+    "iterations": 5,
+    "depth": 2,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [
+      "BinarizedTargetMeanValue:Prior=0.5"
+    ],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "boost_from_average": false,
+    "verbose": false
+  },
+  "cardinalities": {
+    "cat0": 6,
+    "cat1": 5
+  },
+  "stages": [
+    "OnlineCtr",
+    "Predict"
+  ],
+  "npy_schema": {
+    "X_cat.npy": "[N,2] int32 \u2014 categorical codes (stringified A4 form on the Rust side)",
+    "y.npy": "[N] f64 \u2014 binclf label",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)",
+    "model.cbm": "upstream BTMV .cbm \u2014 the E18/E19 decoder fixture"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gate."
+}

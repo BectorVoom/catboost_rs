@@ -1,0 +1,55 @@
+{
+  "scenario": "ctr_borders_multiprior",
+  "requirement": "SPEC-CTRT-11",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 120,
+  "description": "Multi-prior Borders-CTR candidate expansion (E14/E15 / A4). Categorical-ONLY feature matrix (two columns, cardinality 8 and 6, zero float columns) so upstream float-quantization nondeterminism is structurally excluded. one_hot_max_size=1 routes both columns to the CTR path. simple_ctr=Borders at THREE priors (0, 0.5, 1) with combinations_ctr=[] and max_ctr_complexity=1 isolates the (projection, prior) candidate product: upstream emits one candidate column per prior, so a single-prior engine scores a strictly smaller candidate set and picks different splits. NEVER regenerated in CI.",
+  "params": {
+    "loss_function": "Logloss",
+    "iterations": 20,
+    "depth": 3,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [
+      "Borders:Prior=0:Prior=0.5:Prior=1"
+    ],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "boost_from_average": false,
+    "verbose": false
+  },
+  "cardinalities": {
+    "cat0": 8,
+    "cat1": 6
+  },
+  "stages": [
+    "OnlineCtr",
+    "CandidateExpansion",
+    "Predict"
+  ],
+  "observed_priors": [
+    0.0,
+    0.5,
+    1.0
+  ],
+  "double_generation_check": "Two consecutive runs of this generator produced byte-identical X_cat.npy / y.npy / predictions.npy and a structurally identical model.json. The ONLY model.json divergence is upstream's volatile metadata \u2014 `model_guid` and `train_finish_time` \u2014 which no oracle reads. The reference itself is therefore deterministic.",
+  "npy_schema": {
+    "X_cat.npy": "[N,2] int32 \u2014 categorical codes (stringified A4 form on the Rust side)",
+    "y.npy": "[N] f64 \u2014 binclf label",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gate. The anti-false-pass guard observed distinct priors [0.0, 0.5, 1.0] across the committed model.json's Borders descriptors."
+}

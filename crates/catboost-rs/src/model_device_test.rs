@@ -22,33 +22,28 @@ const SCORE_BOUND: f64 = 1e-9;
 /// with distinct borders, distinct leaf values, and a nonzero bias — a fixture
 /// exercising both trees and multiple leaves per tree.
 fn sample_model() -> cb_model::Model {
-    cb_model::Model {
-        oblivious_trees: vec![
-            cb_model::ObliviousTree {
-                splits: vec![
-                    cb_model::ModelSplit::Float(cb_model::Split { feature: 0, border: 0.5 }),
-                    cb_model::ModelSplit::Float(cb_model::Split { feature: 1, border: 0.3 }),
-                ],
-                leaf_values: vec![0.1, -0.2, 0.7, 1.3],
-                leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
-            },
-            cb_model::ObliviousTree {
-                splits: vec![
-                    cb_model::ModelSplit::Float(cb_model::Split { feature: 1, border: 0.7 }),
-                    cb_model::ModelSplit::Float(cb_model::Split { feature: 0, border: 0.2 }),
-                ],
-                leaf_values: vec![-0.5, 0.4, 0.9, -1.1],
-                leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
-            },
-        ],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.375,
-        float_feature_borders: vec![vec![0.2, 0.5], vec![0.3, 0.7]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    cb_model::Model::new(
+        vec![
+                cb_model::ObliviousTree {
+                    splits: vec![
+                        cb_model::ModelSplit::Float(cb_model::Split { feature: 0, border: 0.5 }),
+                        cb_model::ModelSplit::Float(cb_model::Split { feature: 1, border: 0.3 }),
+                    ],
+                    leaf_values: vec![0.1, -0.2, 0.7, 1.3],
+                    leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+                },
+                cb_model::ObliviousTree {
+                    splits: vec![
+                        cb_model::ModelSplit::Float(cb_model::Split { feature: 1, border: 0.7 }),
+                        cb_model::ModelSplit::Float(cb_model::Split { feature: 0, border: 0.2 }),
+                    ],
+                    leaf_values: vec![-0.5, 0.4, 0.9, -1.1],
+                    leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+                },
+            ],
+        0.375,
+        vec![vec![0.2, 0.5], vec![0.3, 0.7]],
+    )
 }
 
 /// The same structure but multi-dimensional (`approx_dimension = 2`) — an
@@ -65,26 +60,21 @@ fn multiclass_model() -> cb_model::Model {
 /// (checked `.get` → `false`) and the device kernel (`f >= n_features` guard →
 /// bit 0) treat that split as bit 0. Exercises the Finding #1 kernel guard.
 fn high_feature_model() -> cb_model::Model {
-    cb_model::Model {
-        oblivious_trees: vec![cb_model::ObliviousTree {
-            splits: vec![
-                cb_model::ModelSplit::Float(cb_model::Split { feature: 0, border: 0.5 }),
-                // Feature index 3 — deliberately beyond the 2 columns supplied below.
-                cb_model::ModelSplit::Float(cb_model::Split { feature: 3, border: -1.0 }),
-            ],
-            leaf_values: vec![0.1, -0.2, 0.7, 1.3],
-            leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.375,
+    cb_model::Model::new(
+        vec![cb_model::ObliviousTree {
+                splits: vec![
+                    cb_model::ModelSplit::Float(cb_model::Split { feature: 0, border: 0.5 }),
+                    // Feature index 3 — deliberately beyond the 2 columns supplied below.
+                    cb_model::ModelSplit::Float(cb_model::Split { feature: 3, border: -1.0 }),
+                ],
+                leaf_values: vec![0.1, -0.2, 0.7, 1.3],
+                leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+            }],
+        0.375,
         // Borders for features 0..=3; the inner vecs' contents are irrelevant to
         // apply (splits carry their own borders), only the index range matters.
-        float_feature_borders: vec![vec![0.5], vec![], vec![], vec![-1.0]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        vec![vec![0.5], vec![], vec![], vec![-1.0]],
+    )
 }
 
 /// Element-wise max absolute difference between two equal-length prediction

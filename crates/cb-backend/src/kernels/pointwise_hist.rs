@@ -120,7 +120,7 @@ fn host_reference_hist2(
     // reference stays the ordered ground truth while agreeing cell-for-cell with the
     // packed device path.
     let n_buckets = vec![n_bins; n_features];
-    let packed = pack_cindex(cindex, &n_buckets, n).unwrap();
+    let packed = pack_cindex(cindex, &n_buckets, &vec![false; n_buckets.len()], n).unwrap();
     // Gather each (feature, bin) cell's per-object contributions in ascending object
     // order, then fold through the ordered primitive (the reduce_leaf_stats shape).
     let mut delta_members: Vec<Vec<f64>> = vec![Vec::new(); n_features * n_bins];

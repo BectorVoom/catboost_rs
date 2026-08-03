@@ -151,10 +151,11 @@ fn feature_count(model: &Model) -> usize {
 }
 
 /// The number of DISTINCT categorical feature indices referenced by any
-/// `ModelSplit::Ctr` split's projection, across BOTH tree kinds — the
-/// categorical analogue of [`feature_count`] (SPEC FIC-01). `max(local cat
-/// index) + 1`, mirroring `feature_count`'s "widen based on observed usage"
-/// convention; `0` if the model has no CTR splits.
+/// `ModelSplit::Ctr` split's projection OR any `ModelSplit::OneHot` split's
+/// `cat_feature` (SPEC-OH-18), across BOTH tree kinds — the categorical
+/// analogue of [`feature_count`] (SPEC FIC-01). `max(cat index) + 1`, mirroring
+/// `feature_count`'s "widen based on observed usage" convention; `0` if the
+/// model has no categorical splits.
 fn cat_feature_count(model: &Model) -> usize {
     let oblivious_max = model
         .oblivious_trees
@@ -162,6 +163,7 @@ fn cat_feature_count(model: &Model) -> usize {
         .flat_map(|t| t.splits.iter())
         .filter_map(|s| match s {
             crate::ModelSplit::Ctr(c) => c.projection.cat_features().iter().copied().max(),
+            crate::ModelSplit::OneHot(oh) => Some(oh.cat_feature),
             crate::ModelSplit::Float(_) => None,
         })
         .map(|m| m + 1)
@@ -173,6 +175,7 @@ fn cat_feature_count(model: &Model) -> usize {
         .flat_map(|t| t.tree_splits.iter())
         .filter_map(|s| match s {
             crate::ModelSplit::Ctr(c) => c.projection.cat_features().iter().copied().max(),
+            crate::ModelSplit::OneHot(oh) => Some(oh.cat_feature),
             crate::ModelSplit::Float(_) => None,
         })
         .map(|m| m + 1)
@@ -436,11 +439,14 @@ fn pvc_accumulate_non_symmetric(
 /// in `projection.cat_features()`). Shared by `interaction()`'s oblivious and
 /// non-symmetric arms (FIC-02) and `prediction_values_change()`'s two
 /// accumulate helpers (FIC-03) so the expansion rule is defined exactly once.
+/// A `OneHot` split expands to the single flat index of the categorical column
+/// it tests (SPEC-OH-18) — never an empty vector, which would be a silent drop.
 /// An empty result (a `Ctr` split with an empty projection — should not occur
 /// from `Model::from_trained`, but defensively) means "attributes to nothing".
 fn split_flat_indices(split: &crate::ModelSplit, n_float: usize) -> Vec<usize> {
     match split {
         crate::ModelSplit::Float(s) => vec![s.feature],
+        crate::ModelSplit::OneHot(oh) => vec![flat_cat_index(n_float, oh.cat_feature)],
         crate::ModelSplit::Ctr(c) => c
             .projection
             .cat_features()
@@ -456,11 +462,17 @@ fn split_flat_indices(split: &crate::ModelSplit, n_float: usize) -> Vec<usize> {
 /// feature is the same internal feature); a `Ctr` split's is its FULL
 /// border-less CTR descriptor (`TModelCtr`: projection + ctr type + prior +
 /// target border idx + shift + scale — the split `border` is NOT part of the
-/// identity, it lives in the binary split, not the feature). Two splits of
-/// different kinds are never the same internal feature.
+/// identity, it lives in the binary split, not the feature); a `OneHot` split's
+/// is its CAT-FEATURE index alone (SPEC-OH-18) — the tested VALUE is excluded
+/// for exactly the reason the float border is: every `Values[k]` bin of one
+/// `TOneHotFeature` is the same internal feature, the value lives in the binary
+/// split. Two splits of different kinds are never the same internal feature.
 fn same_internal_feature(a: &crate::ModelSplit, b: &crate::ModelSplit) -> bool {
     match (a, b) {
         (crate::ModelSplit::Float(x), crate::ModelSplit::Float(y)) => x.feature == y.feature,
+        (crate::ModelSplit::OneHot(x), crate::ModelSplit::OneHot(y)) => {
+            x.cat_feature == y.cat_feature
+        }
         (crate::ModelSplit::Ctr(x), crate::ModelSplit::Ctr(y)) => {
             x.projection == y.projection
                 && x.ctr_type == y.ctr_type
@@ -784,24 +796,28 @@ fn interaction_dfs(
 /// `labels` are the binary targets (`0.0` / `1.0`); `n_features` is the SHAP
 /// feature width. Reductions route through [`cb_core::sum_f64`] (D-08); all access
 /// is checked `.get` (no `unwrap` / `expect`).
-#[must_use]
+///
+/// # Errors
+/// [`crate::ShapUnsupported`] if the model carries a one-hot or CTR split — the
+/// score is DEFINED as a SHAP difference, so it inherits SHAP's float-only
+/// restriction (SPEC-OH-15) rather than silently scoring a truncated tree.
 pub fn loss_function_change<F: Fn(&[f64], &[f64]) -> f64>(
     model: &Model,
     cols: &[Vec<f32>],
     labels: &[f64],
     n_features: usize,
     final_error: F,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, crate::ShapUnsupported> {
     let n_objects = cols.first().map_or(0, Vec::len);
     if n_objects == 0 || labels.len() != n_objects {
-        return vec![0.0_f64; n_features];
+        return Ok(vec![0.0_f64; n_features]);
     }
 
     // Raw approx (RawFormulaVal) over the documents.
     let approx = crate::apply::predict_raw(model, cols);
     // Per-document per-feature SHAP (shape [n_objects][n_features + 1]; the
     // trailing column is the bias / mean and is not subtracted).
-    let shap = shap_values(model, cols, n_features);
+    let shap = shap_values(model, cols, n_features)?;
 
     // finalError(approx) via the CALLER-supplied metric closure (its
     // `GetFinalError`); the metric MUST be Min-optimized so the per-feature
@@ -810,7 +826,7 @@ pub fn loss_function_change<F: Fn(&[f64], &[f64]) -> f64>(
     // loss → closure mapping.
     let base_score = final_error(&approx, labels);
 
-    (0..n_features)
+    let out = (0..n_features)
         .map(|feature| {
             // approx_f[obj] = approx[obj] − shap[obj][feature].
             let approx_f: Vec<f64> = (0..n_objects)
@@ -829,20 +845,23 @@ pub fn loss_function_change<F: Fn(&[f64], &[f64]) -> f64>(
             // verbatim.
             final_error(&approx_f, labels) - base_score
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 
 /// Logloss-defaulted convenience wrapper — the pre-FL-01 behavior verbatim,
 /// retained so existing binary-model callers/tests stay byte-identical. Delegates
 /// to the generic [`loss_function_change`] with the built-in
 /// [`logloss_final_error`] closure (`FL-02` back-compat).
-#[must_use]
+///
+/// # Errors
+/// As [`loss_function_change`].
 pub fn loss_function_change_logloss(
     model: &Model,
     cols: &[Vec<f32>],
     labels: &[f64],
     n_features: usize,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, crate::ShapUnsupported> {
     loss_function_change(model, cols, labels, n_features, logloss_final_error)
 }
 

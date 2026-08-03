@@ -53,15 +53,19 @@ pub(crate) fn resolve_metrics(
 /// # Errors
 /// [`CatBoostValueError`] on any dtype / layout / length failure (via
 /// [`data_to_pool`]).
-fn pool_from_arg(py: Python<'_>, pool: &Bound<'_, PyAny>) -> PyResult<catboost_rs::Pool> {
+fn pool_from_arg(
+    py: Python<'_>,
+    pool: &Bound<'_, PyAny>,
+    cat_features: &[usize],
+) -> PyResult<catboost_rs::Pool> {
     if let Ok(tuple) = pool.cast::<PyTuple>() {
         if tuple.len() == 2 {
             let x = tuple.get_item(0)?;
             let y = tuple.get_item(1)?;
-            return data_to_pool(py, &x, Some(&y));
+            return data_to_pool(py, &x, Some(&y), Some(cat_features));
         }
     }
-    data_to_pool(py, pool, None)
+    data_to_pool(py, pool, None, Some(cat_features))
 }
 
 /// `catboost_rs.cv(pool, params, fold_count=3, inverted=False,
@@ -113,7 +117,10 @@ pub(crate) fn cv(
         params_map.insert(name, value.unbind());
     }
 
-    let pool = pool_from_arg(py, pool)?;
+    // F17: honour `params["cat_features"]` so a categorical pool reaches F14's
+    // fail-fast guard rather than being silently ingested float-only.
+    let cats = crate::estimator::resolve_cat_features(&params_map, py, None)?;
+    let pool = pool_from_arg(py, pool, &cats)?;
     let builder = make_builder(&params_map, py)?;
 
     // The default metric derives from `loss_function` (default "RMSE").

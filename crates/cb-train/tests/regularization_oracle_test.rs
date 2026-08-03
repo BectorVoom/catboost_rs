@@ -331,12 +331,12 @@ fn regularization_oracle_bagging_temp_first_tree() {
     );
 }
 
-// KNOWN RESIDUAL (TRAIN-04 carry-over): the Bayesian multi-tree draw stream
-// diverges at tree 1+ (the same structural residual locked at first-tree
-// granularity in `bootstrap_oracle_bayesian_first_tree`); this `bagging_temp`
-// scenario inherits it. First tree locks; tree-1+ is `#[ignore]`d.
+// RESOLVED (TRAIN-04 carry-over, 2026-07-30): shared the same root cause as
+// `bootstrap_oracle_bayesian` (missing per-level RSM-reselection +
+// border-less-feature `SelectBestCandidate` draws) — see
+// `.planning/plans/bayesian-rng-draw-accounting/instrumented-ground-truth/
+// GROUND_TRUTH.md`. Fixed by the same `boosting.rs`/`tree.rs` change.
 #[test]
-#[ignore = "Bayesian tree-1+ residual (first tree locked); inherited from TRAIN-04, see deferred-items.md"]
 fn regularization_oracle_bagging_temp() {
     check_scenario(
         "regularization/bagging_temp",

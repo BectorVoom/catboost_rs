@@ -1,0 +1,62 @@
+{
+  "boost_from_average": false,
+  "cat_labels": [
+    [
+      "alpha23",
+      "beta23"
+    ]
+  ],
+  "catboost_version": "1.2.10",
+  "first_referenced_one_hot_values": {
+    "0": [
+      -1089101368
+    ]
+  },
+  "n_cat_features": 1,
+  "n_float_features": 3,
+  "n_rows": 256,
+  "note": "Upstream catboost 1.2.10 ONE-HOT training fixture (SPEC-OH-29). Generated OFFLINE with thread_count=1 and a pinned seed; NEVER regenerated in CI (upstream quantization is run-to-run nondeterministic) \u2014 CI only READS these artifacts. At least one cat feature's stored `values` array is NON-ascending, so the first-referenced vs ascending-hash ordering rule is genuinely discriminated.",
+  "npy_schema": {
+    "X_float.npy": "[N, 3] float64 \u2014 float columns",
+    "cat_cols.json": "raw categorical columns as STRING labels (the A4 form calc_cat_feature_hash hashes)",
+    "model.cbm": "upstream one-hot model, FlatBuffers (the interop target)",
+    "model.json": "upstream one-hot model, json (splits + leaf_values + borders + categorical_features.values)",
+    "predictions.npy": "[N] float64 \u2014 upstream RawFormulaVal (the \u22641e-5 target)",
+    "y.npy": "[N] float64 \u2014 Logloss labels"
+  },
+  "one_hot_max_size": 2,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "depth": 3,
+    "iterations": 3,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.1,
+    "loss_function": "Logloss",
+    "max_ctr_complexity": 0,
+    "one_hot_max_size": 2,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "prediction_type": "RawFormulaVal",
+  "requirement": "SPEC-OH-29",
+  "scenario": "one_hot_train/default_binary",
+  "seed": 0,
+  "stages": [
+    "Splits",
+    "LeafValues",
+    "Predictions"
+  ],
+  "stored_one_hot_values": {
+    "0": [
+      -1089101368
+    ]
+  },
+  "thread_count": 1,
+  "values_order_discriminates_ascending": false
+}

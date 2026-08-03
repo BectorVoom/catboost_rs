@@ -75,6 +75,10 @@ pub struct BakedCtrTable {
     pub int_counts: Vec<Vec<i64>>,
     /// `CounterDenominator` (Counter / FeatureFreq); `0` otherwise.
     pub counter_denominator: i64,
+    /// Per-bucket `(Sum, Count)` pairs for the mean types
+    /// (BinarizedTargetMeanValue / FloatTargetMeanValue); empty otherwise. `Sum`
+    /// is `f32` to match upstream `TCtrMeanHistory::Sum` (`online_ctr.h:373`).
+    pub mean: Vec<(f32, i64)>,
     /// The inference `Shift` (`calc_normalization(prior_num)` → `shift`).
     pub shift: f64,
     /// The inference `Scale` (`ctr_border_count / norm`).
@@ -104,9 +108,20 @@ pub struct BakedCtrData {
 /// `classes` is the target-class count (2 for binclf); `ctr_border_count` is the
 /// Borders CTR border count (15); `prior_num`/`prior_denom` are the prior PAIR.
 ///
+/// `counter_calc_skip_test` / `extra_cat_columns` (E22 / SPEC-CTRT-17): under
+/// `counter_calc_method = Full` (`counter_calc_skip_test == false`) a COUNTER
+/// bake tallies the learn documents PLUS every eval document into the bucket
+/// totals before the MAX denominator (`totalSampleCount += GetTestSampleCount()`
+/// gated `ctrType == Counter && counterCalcMethod == Full`,
+/// `online_ctr.cpp:956-960`; measured ground truth: Full Σ = learn + test,
+/// SkipTest Σ = learn only). Every other type ignores both arguments — the flag
+/// is Counter-only. `extra_cat_columns` is the eval columns in the SAME
+/// absolute layout as `cat_columns`; pass `&[]` under `SkipTest`.
+///
 /// # Errors
 /// - [`CbError::Degenerate`] if `cat_columns` is empty, `target_class` is shorter
 ///   than the columns, a projection member is out of range, or `prior_denom == 0`.
+#[allow(clippy::too_many_arguments)]
 pub fn bake_ctr_table(
     cat_columns: &[Vec<String>],
     projection: &TProjection,
@@ -115,6 +130,9 @@ pub fn bake_ctr_table(
     ctr_border_count: usize,
     prior_num: f64,
     prior_denom: f64,
+    ctr_type: ECtrType,
+    counter_calc_skip_test: bool,
+    extra_cat_columns: &[Vec<String>],
 ) -> CbResult<BakedCtrTable> {
     if cat_columns.is_empty() {
         return Err(CbError::Degenerate(
@@ -160,6 +178,28 @@ pub fn bake_ctr_table(
         }
         combined_keys.push(projection.combined_hash(&feature_hashes));
     }
+    // E22 / SPEC-CTRT-17: a COUNTER bake under `Full` appends every eval
+    // document's combined key AFTER the learn documents (learn bucket numbering
+    // byte-identical; an eval-only value can only ever open a NEW bucket), so
+    // the accumulated totals — and hence the MAX denominator — span
+    // learn + every eval set, mirroring `online_ctr.cpp:956-960`'s
+    // Counter-and-Full-only widening. Every other type ignores the eval
+    // columns entirely.
+    let mut accumulated_docs = n;
+    if ctr_type == ECtrType::Counter && !counter_calc_skip_test && !extra_cat_columns.is_empty()
+    {
+        let m = extra_cat_columns.iter().map(Vec::len).max().unwrap_or(0);
+        let extra_count = extra_cat_columns.len();
+        for i in 0..m {
+            let mut feature_hashes: Vec<u32> = Vec::with_capacity(extra_count);
+            for col in extra_cat_columns {
+                let value = col.get(i).map_or("", String::as_str);
+                feature_hashes.push(calc_cat_feature_hash(value));
+            }
+            combined_keys.push(projection.combined_hash(&feature_hashes));
+        }
+        accumulated_docs = accumulated_docs.saturating_add(m);
+    }
 
     // 2. Synthesize a per-document string column with one DISTINCT token per
     //    distinct combined hash (the decimal hash string), tracking the combined
@@ -186,10 +226,38 @@ pub fn bake_ctr_table(
     //    build_final_ctr producer (the inference TOTALS — completed counts, NOT a
     //    read-before-increment prefix). `target` (raw float) is irrelevant for the
     //    Borders class counts; pass a zero vector of matching length.
-    let target_zero = vec![0.0_f64; n];
-    let target_class_n = target_class.get(..n).unwrap_or(target_class).to_vec();
-    let acc = accumulate_online(&key_refs, &target_class_n, &target_zero, classes, classes)?;
-    let final_table = build_final_ctr(&acc, ECtrType::Borders);
+    let target_zero = vec![0.0_f64; accumulated_docs];
+    let mut target_class_n = target_class.get(..n).unwrap_or(target_class).to_vec();
+    // Eval documents carry no learn label; class 0 placeholders feed ONLY the
+    // class histograms, which the Counter arm of `build_final_ctr` never reads
+    // (`total_counts` is per-document, class-blind). Non-Counter types never
+    // append eval docs (gate above), so their class counts are untouched.
+    target_class_n.resize(accumulated_docs, 0);
+    // BUG-BTMV / SPEC-BTMV-01. The WHOLE-SET bake divides the binarized target by
+    // `targetClassesCount - 1` (`CalcFinalCtrsImpl`, online_ctr.cpp:914 — the
+    // binding sits OUTSIDE the per-type dispatch, so it is type-independent).
+    // Passing `classes` here made every BinarizedTargetMeanValue `Sum` exactly
+    // HALF upstream's. The defect was latent until E11 made the mean path live:
+    // the divisor reaches only `binarized_mean`, which only the
+    // BinarizedTargetMeanValue arm of `build_final_ctr` reads.
+    //
+    // *** NOT `ctr_type.target_border_count(classes)`. *** The two rules, the
+    // `.max(1)` floor and why they are deliberately not shared with
+    // `online_mean_prefix` are documented on `final_ctr_target_border_count`.
+    let target_border_count = super::final_ctr_target_border_count(classes);
+    // 4th arg `classes` = TargetClassesCount (the class-histogram WIDTH,
+    // online_ctr.cpp:909-911/930-934) — correct, and deliberately NOT the same
+    // quantity as the 5th.
+    let acc = accumulate_online(
+        &key_refs,
+        &target_class_n,
+        &target_zero,
+        classes,
+        target_border_count,
+    )?;
+    // E11: the requested type, not a hard-coded Borders head.
+    // `counter_calc_skip_test` is the SkipTest default and inert until E22.
+    let final_table = build_final_ctr(&acc, ctr_type, true);
 
     // 4. Reshape the flat bucket-major class counts into per-bucket `[N0, N1, …]`,
     //    keyed by the first-seen combined hash. accumulate_online's PerfectHash
@@ -207,15 +275,50 @@ pub fn bake_ctr_table(
         ));
     }
     let mut hashes: Vec<u64> = Vec::with_capacity(bucket_count);
-    let mut int_counts: Vec<Vec<i64>> = Vec::with_capacity(bucket_count);
     for b in 0..bucket_count {
-        let hash = first_seen_hashes.get(b).copied().unwrap_or(0);
-        let start = b.saturating_mul(classes);
-        let counts: Vec<i64> = (0..classes)
-            .map(|c| final_table.int_counts.get(start + c).copied().unwrap_or(0))
-            .collect();
-        hashes.push(hash);
-        int_counts.push(counts);
+        hashes.push(first_seen_hashes.get(b).copied().unwrap_or(0));
+    }
+
+    // E11 / SPEC-CTRT-13: reshape PER TYPE. `FinalCtrTable` already carries the
+    // right payload for all six types; only the per-bucket layout differs.
+    let mut int_counts: Vec<Vec<i64>> = Vec::new();
+    let mut mean: Vec<(f32, i64)> = Vec::new();
+    match ctr_type {
+        ECtrType::Borders | ECtrType::Buckets => {
+            // Bucket-major [N0, N1, …] — the pre-E11 layout, unchanged. Buckets
+            // and Borders bake IDENTICALLY; they differ only at apply time, where
+            // `target_border_idx` selects the numerator.
+            int_counts = Vec::with_capacity(bucket_count);
+            for b in 0..bucket_count {
+                let start = b.saturating_mul(classes);
+                let counts: Vec<i64> = (0..classes)
+                    .map(|c| final_table.int_counts.get(start + c).copied().unwrap_or(0))
+                    .collect();
+                int_counts.push(counts);
+            }
+        }
+        ECtrType::Counter | ECtrType::FeatureFreq => {
+            // ONE value per bucket. Counter's wire `TargetClassesCount` is 0 and
+            // the decoder forces `width = 1`, so emitting the class-major layout
+            // here would mis-align every decoded bucket.
+            int_counts = final_table
+                .int_counts
+                .iter()
+                .take(bucket_count)
+                .map(|&total| vec![total])
+                .collect();
+        }
+        ECtrType::BinarizedTargetMeanValue | ECtrType::FloatTargetMeanValue => {
+            // (Sum, Count) pairs; `int_counts` stays empty.
+            mean = (0..bucket_count)
+                .map(|b| {
+                    (
+                        final_table.mean_sum.get(b).copied().unwrap_or(0.0),
+                        final_table.mean_count.get(b).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+        }
     }
 
     // Derive (Shift, Scale) from the prior PAIR (calc_normalization(prior_num)):
@@ -229,11 +332,12 @@ pub fn bake_ctr_table(
 
     Ok(BakedCtrTable {
         projection: projection.clone(),
-        ctr_type: ECtrType::Borders.as_i8(),
+        ctr_type: ctr_type.as_i8(),
         target_classes_count: classes,
         hashes,
         int_counts,
-        counter_denominator: 0,
+        counter_denominator: final_table.counter_denominator,
+        mean,
         shift,
         scale,
         prior_num,

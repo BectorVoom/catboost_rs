@@ -1,0 +1,62 @@
+{
+  "scenario": "ctr_mixed_simple_vs_combo",
+  "requirement": "SPEC-CTRT-10",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 60,
+  "description": "Mixed simple-vs-combination CTR routing (E17 / A5). Categorical-ONLY feature matrix (three columns, cardinality 6/5/4, zero float columns). simple_ctr=Buckets:Prior=0.5 vs combinations_ctr=Counter:Prior=0.25 at max_ctr_complexity=2 pin the is_simple discriminator end to end: types AND priors differ across the two sides, so cross-routing cannot agree with upstream. NEVER regenerated in CI.",
+  "params": {
+    "loss_function": "Logloss",
+    "iterations": 10,
+    "depth": 3,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 2,
+    "simple_ctr": [
+      "Buckets:Prior=0.5"
+    ],
+    "combinations_ctr": [
+      "Counter:Prior=0.25"
+    ],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "random_seed": 0,
+    "thread_count": 1,
+    "boost_from_average": false,
+    "verbose": false
+  },
+  "cardinalities": {
+    "cat0": 6,
+    "cat1": 5,
+    "cat2": 4
+  },
+  "stages": [
+    "OnlineCtr",
+    "CandidateExpansion",
+    "Predict"
+  ],
+  "observed": {
+    "simple_ctr_types": [
+      "Buckets"
+    ],
+    "combo_ctr_types": [
+      "Counter"
+    ],
+    "n_simple": 2,
+    "n_combo": 1
+  },
+  "npy_schema": {
+    "X_cat.npy": "[N,3] int32 \u2014 categorical codes (stringified A4 form on the Rust side)",
+    "y.npy": "[N] f64 \u2014 binclf label",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gate."
+}

@@ -27,9 +27,9 @@
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, is_pairwise_scoring,
     logcosh_exact_leaf_delta, newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg,
-    score_st_dev, simple_leaf_delta, solve_symmetric_newton, Derivatives, DeviceGrowPolicy,
-    DeviceTrainConfig, GroupSpan, LeafMethod, Loss, Runtime, RankingCompetitor, QUANTILE_ALPHA,
-    QUANTILE_DELTA,
+    score_st_dev, simple_leaf_delta, solve_symmetric_newton, DeviceBootstrapType, Derivatives,
+    DeviceGrowPolicy, DeviceTrainConfig, GroupSpan, LeafMethod, Loss, Runtime, RankingCompetitor,
+    QUANTILE_ALPHA, QUANTILE_DELTA,
 };
 use cb_core::{sum_f64, CbError, CbResult, TFastRng64};
 use cb_data::Pair;
@@ -39,6 +39,7 @@ use crate::autolr::{self, TargetType};
 use crate::query_info::{build_query_info, QueryInfo};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::ctr::bake::{bake_ctr_table, BakedCtrData};
+use crate::device_draw_replay::replay_grow_draws;
 use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
@@ -57,12 +58,15 @@ use crate::tree::{
 /// is active so the bootstrap draws land on the correct RNG phase every tree.
 const PRE_TREE_DRAWS: usize = 2;
 
-/// Per-iteration POST-bootstrap draws BEYOND the `depth` per-level
-/// `CalcScores` random-strength seed draws (greedy_tensor_search.cpp:884): the
-/// depth loop evaluates `depth + 1` candidate levels (the final level finds no
-/// improving split and breaks), so `CalcScores` draws one extra `GenRand()`.
-/// Verified end-to-end against the Bernoulli oracle (post = depth + 1).
-const POST_TREE_EXTRA_DRAWS: usize = 1;
+/// Per-tree leaf-estimation-seed draws, consumed ONCE per tree after the
+/// level-search loop finishes (train.cpp's `GenRandUI64Vector(foldCount,
+/// Rand.GenRand())`-adjacent leaf-value phase). VERIFIED against a real
+/// instrumented upstream 1.2.10 build (`CB_INSTRUMENT_LOG`, 2026-07-30 —
+/// `.planning/plans/bayesian-rng-draw-accounting/instrumented-ground-truth/
+/// GROUND_TRUTH.md`): `tree_rng_end.cc - tree_rng_pre_leaf.cc == 2`,
+/// identically across all 4 bootstrap-type scenarios and all 3 trees (12/12
+/// confirmations) — NOT 1 as an earlier, unverified wave assumed.
+const POST_TREE_EXTRA_DRAWS: usize = 2;
 
 /// The boosting type (`EBoostingType`, `boosting_options.cpp:16`). The CPU
 /// default is [`EBoostingType::Plain`]; [`EBoostingType::Ordered`] drives the
@@ -230,8 +234,8 @@ pub struct BoostParams {
     /// (inclusive boundary) and to the CTR path (deferred to later waves) when
     /// `cardinality > one_hot_max_size`. See [`crate::route_categorical`] /
     /// [`crate::EncodingPath`] (ORD-04 / D-04). Consumed by the categorical
-    /// encoding-path selection; the numeric-only first slices leave it at the
-    /// pinned default and never exercise the one-hot branch.
+    /// encoding-path selection; numeric-only datasets leave it at the pinned
+    /// default because they have no categorical column to route.
     pub one_hot_max_size: u32,
     /// Number of random permutations used by the multi-permutation fold
     /// machinery (`permutation_count`, default 4 — `boosting_options.cpp`).
@@ -251,9 +255,13 @@ pub struct BoostParams {
     /// The SINGLE `simple_ctr` type the high-cardinality categorical path bakes
     /// (ORD-03 / D-07 — one explicit CTR type per fixture, never the upstream
     /// auto default set `[Borders, Counter]`, RESEARCH Pitfall 6). Pinned
-    /// EXPLICITLY ([`simple_ctr_default`]). Consumed by the Plain-CTR bake
-    /// ([`crate::build_final_ctr`]); the numeric/one-hot slices leave it at the
-    /// default and never exercise the CTR path.
+    /// EXPLICITLY ([`simple_ctr_default`]). GENUINELY CONSUMED: it selects the
+    /// online producer ([`crate::materialize_ctr_feature`]) and the final bake
+    /// ([`crate::build_final_ctr`]), so changing it changes the model.
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`catboost_options.cpp:439-453`); this scalar models ONE.
+    /// See [`simple_ctr_default`].
     pub simple_ctr: ECtrType,
     /// The explicit per-prior numerators for [`Self::simple_ctr`] (D-07 — one
     /// prior per CTR column, never auto). Each entry is a unit-denominator prior
@@ -262,9 +270,12 @@ pub struct BoostParams {
     /// ([`simple_ctr_priors_default`]).
     pub simple_ctr_priors: Vec<f64>,
     /// The `counter_calc_method` (`SkipTest` default, Pitfall 4 — pinned
-    /// EXPLICITLY, never auto). In the whole-learn-set Plain build there are no
-    /// test documents, so the flag does not change the counts; it is carried for
-    /// the tensor-CTR path. [`counter_calc_method_default`].
+    /// EXPLICITLY, never auto). GENUINELY CONSUMED by the Counter tally and the
+    /// final bake (SPEC-CTRT-13): `Full` folds the eval sets into the counts,
+    /// `SkipTest` does not. **Observable only when an eval set is present** —
+    /// with a learn set alone the two settings are bit-identical (measured
+    /// `0.000e+00` learn-only vs `4.010e-01` with an eval set, E22/E23).
+    /// [`counter_calc_method_default`].
     pub counter_calc_method: CounterCalcMethod,
     /// The boosting type ([`EBoostingType`], `boosting_options.cpp:16`). Pinned
     /// EXPLICITLY ([`boosting_type_default`] = [`EBoostingType::Plain`], the CPU
@@ -288,9 +299,14 @@ pub struct BoostParams {
     /// bakes (ORD-05 / D-07 — one explicit CTR type per fixture, never the
     /// upstream auto default set, RESEARCH Pitfall 6). Pinned EXPLICITLY
     /// ([`combinations_ctr_default`]); the tensor CTR keys the SAME online/ordered
-    /// accumulation (05-04/05-05) on the combined projection hash. The
-    /// numeric/one-hot/simple-CTR slices leave it at the default and never
-    /// exercise the combination path.
+    /// accumulation (05-04/05-05) on the combined projection hash. GENUINELY
+    /// CONSUMED whenever `max_ctr_complexity >= 2` admits a combination
+    /// candidate; `max_ctr_complexity == 1` is the only way to suppress the
+    /// combination path entirely.
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`catboost_options.cpp:439-453`); this scalar models ONE.
+    /// See [`combinations_ctr_default`].
     pub combinations_ctr: ECtrType,
     /// The explicit per-prior numerators for [`Self::combinations_ctr`] (D-07 —
     /// one prior per combination CTR column, never auto; the tensor_ctr fixture
@@ -454,8 +470,16 @@ pub fn fold_len_multiplier_default() -> f64 {
 
 /// The canonical default `simple_ctr` type ([`ECtrType::Borders`], the upstream
 /// default CTR family head). Pinned EXPLICITLY at every `BoostParams`
-/// construction site (RESEARCH Pitfall 6 — never auto-selected); the
-/// numeric/one-hot slices leave it here and never exercise the CTR path.
+/// construction site (RESEARCH Pitfall 6 — never auto-selected).
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. Deliberate: `simple_ctr: ECtrType` is pinned at 62
+/// construction sites and retyping it has zero behavioral benefit to any of
+/// them.
 #[must_use]
 pub fn simple_ctr_default() -> ECtrType {
     ECtrType::Borders
@@ -465,6 +489,15 @@ pub fn simple_ctr_default() -> ECtrType {
 /// `0.5/1` (the in-scope plain_ctr fixture pins `Borders:Prior=0.5`, so the
 /// online `+1` denom and the inference `+PriorDenom` coincide, RESEARCH A6).
 /// Pinned EXPLICITLY at every `BoostParams` construction site.
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. This default deliberately stays at the single prior
+/// `0.5/1` rather than upstream's `[0/1, 0.5/1, 1/1]`: every frozen CTR oracle
+/// in this repository is captured against it.
 #[must_use]
 pub fn simple_ctr_priors_default() -> Vec<f64> {
     vec![0.5]
@@ -498,9 +531,15 @@ pub fn max_ctr_complexity_default() -> usize {
 
 /// The canonical default `combinations_ctr` type ([`ECtrType::Borders`], the
 /// upstream default CTR family head). Pinned EXPLICITLY at every `BoostParams`
-/// construction site (RESEARCH Pitfall 6 — never auto-selected); the
-/// numeric/one-hot/simple-CTR slices leave it here and never exercise the
-/// combination path.
+/// construction site (RESEARCH Pitfall 6 — never auto-selected).
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. Deliberate: `combinations_ctr: ECtrType` is pinned at
+/// every construction site and retyping it has zero behavioral benefit.
 #[must_use]
 pub fn combinations_ctr_default() -> ECtrType {
     ECtrType::Borders
@@ -510,6 +549,15 @@ pub fn combinations_ctr_default() -> ECtrType {
 /// prior `0.5/1` (the in-scope tensor_ctr fixture pins `Borders:Prior=0.5`, so
 /// the online `+1` denom and the inference `+PriorDenom` coincide, RESEARCH A6).
 /// Pinned EXPLICITLY at every `BoostParams` construction site.
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. This default deliberately stays at the single prior
+/// `0.5/1` rather than upstream's `[0/1, 0.5/1, 1/1]`: every frozen CTR oracle
+/// in this repository is captured against it.
 #[must_use]
 pub fn combinations_ctr_priors_default() -> Vec<f64> {
     vec![0.5]
@@ -764,6 +812,32 @@ pub fn ordered_approx_delta_simple(
     Ok(approx_delta)
 }
 
+/// Assemble one [`ObliviousTree`] from a grown tree's parts, carrying the
+/// per-level kind order through (T03 / SPEC-OH-01).
+///
+/// Extracted from the boosting loop's push site so the level-order contract is
+/// unit-testable without running a fit. `level_kinds` is passed through verbatim:
+/// EMPTY for a single-kind tree (consumers keep the byte-identical legacy path),
+/// populated in true level order when kinds interleave.
+#[must_use]
+fn oblivious_from_grown(
+    splits: Vec<Split>,
+    ctr_splits: Vec<CtrSplitSpec>,
+    one_hot_splits: Vec<crate::tree::OneHotSplit>,
+    level_kinds: Vec<crate::tree::LevelKind>,
+    leaf_values: Vec<f64>,
+    leaf_weights: Vec<f64>,
+) -> ObliviousTree {
+    ObliviousTree {
+        splits,
+        ctr_splits,
+        one_hot_splits,
+        level_kinds,
+        leaf_values,
+        leaf_weights,
+    }
+}
+
 /// One trained oblivious tree: the ordered splits, the per-leaf values
 /// (already scaled by `learning_rate`, matching upstream `model.json`), and the
 /// per-leaf summed training-document weights (`leaf_weights`, RESEARCH Pitfall 1).
@@ -780,6 +854,29 @@ pub struct ObliviousTree {
     /// numeric / one-hot / ordered-boosting paths (no CTR candidates emitted).
     /// `cb_model::Model::from_trained` lifts each into a `ModelSplit::Ctr`.
     pub ctr_splits: Vec<CtrSplitSpec>,
+    /// The ordered ONE-HOT categorical splits chosen during tree growth
+    /// (`cat_bin == value`), one [`crate::tree::OneHotSplit`] per chosen one-hot
+    /// level. EMPTY for every path that emits no one-hot candidate — so the
+    /// widely-read `splits` surface stays byte-for-byte unchanged for float-only
+    /// and CTR-only models. `cb_model::Model::from_trained` lifts each into a
+    /// `ModelSplit::OneHot`.
+    pub one_hot_splits: Vec<crate::tree::OneHotSplit>,
+    /// The per-level chosen-split kinds in TRUE LEVEL ORDER, carried through from
+    /// [`crate::tree::GrownTree::level_kinds`].
+    ///
+    /// EMPTY when a tree's levels are all one kind — consumers then fall back to
+    /// the kind-grouped order, which is byte-identical to pre-change behaviour
+    /// (SPEC-OH-31). NON-empty only when kinds interleave.
+    ///
+    /// # Why this field exists
+    ///
+    /// `cb_model`'s apply path (`leaf_index_for`) treats the STORED split order as
+    /// the leaf-index bit order. Persisting only the kind-grouped vectors
+    /// (`splits` then `ctr_splits`) therefore TRANSPOSED leaf indices for any tree
+    /// whose levels interleave — e.g. `[Ctr, Float]` was stored as `[Float, Ctr]`,
+    /// swapping leaves 1 and 2. Carrying the true order here is what lets
+    /// `from_trained` reconstruct it.
+    pub level_kinds: Vec<crate::tree::LevelKind>,
     /// Leaf values in canonical forward-bit-order, length `2^depth`.
     pub leaf_values: Vec<f64>,
     /// Per-leaf summed training-document weights in the same forward-bit-order
@@ -877,6 +974,27 @@ pub struct Model {
     /// predictions recover the original labels via this map. EMPTY for every scalar
     /// regression / binary model (byte-identical to the pre-6.2 model).
     pub class_to_label: Vec<f64>,
+    /// The fit-wide `bin -> raw hash` table for the ONE-HOT-routed categorical
+    /// columns (SPEC-OH-05 / SPEC-OH-09), indexed by ONE-HOT POSITION then bin:
+    /// `one_hot_bin_to_hash[p][bin] == cb_data::calc_cat_feature_hash(raw)` for
+    /// the raw value that produced `bin`.
+    ///
+    /// The trainer's `AnySplit::OneHot` carries a first-seen `PerfectHash` BIN,
+    /// which is fit-local and meaningless to upstream; the model lift
+    /// (`cb_model::Model::from_trained`) re-expresses it in upstream's RAW hash
+    /// space through this table. EMPTY for every float-only / CTR-only fit.
+    ///
+    /// # Validity
+    /// Valid ONLY for the exact learn-set columns it was built from — bins are
+    /// first-seen per column, so a different row order yields a different
+    /// (equally valid) table.
+    pub one_hot_bin_to_hash: Vec<Vec<u32>>,
+    /// One-hot POSITION -> ABSOLUTE `cat_columns` index (SPEC-OH-05). Parallel to
+    /// [`Model::one_hot_bin_to_hash`]; the model lift needs it to record each
+    /// split's absolute cat-feature index (upstream's `TOneHotFeature.Index`)
+    /// rather than the dense one-hot position. EMPTY for every float-only /
+    /// CTR-only fit.
+    pub one_hot_absolute: Vec<usize>,
 }
 
 impl Model {
@@ -1229,6 +1347,39 @@ fn validate_score_function(score_function: cb_compute::EScoreFunction) -> CbResu
              degrade NewtonL2 to L2 and NewtonCosine to Cosine). Use a first-order \
              score function (Cosine, L2, SolarL2, LOOL2, or SatL2)."
         )));
+    }
+    Ok(())
+}
+
+/// Reject the CTR types that have no CPU training implementation (SPEC-CTRT-03).
+///
+/// Upstream gates this at option-parse time
+/// (`catboost_options.cpp:504-509`):
+/// ```text
+/// CB_ENSURE(IsSupportedCtrType(CPU, ctrType),
+///           "Ctr type " << ctrType << " is not implemented on CPU yet")
+/// ```
+/// `IsSupportedCtrType(ETaskType::CPU, …)` (`restrictions.h:18-48`) admits exactly
+/// `{Borders, Buckets, BinarizedTargetMeanValue, Counter}`, so
+/// [`FloatTargetMeanValue`](crate::ctr::ECtrType::FloatTargetMeanValue) and
+/// [`FeatureFreq`](crate::ctr::ECtrType::FeatureFreq) are GPU-only.
+///
+/// Checked BEFORE any CTR accumulation or tree growth so an unsupported request
+/// is a typed error rather than a model silently trained with a different CTR
+/// type than the caller asked for.
+fn validate_ctr_types(params: &BoostParams) -> CbResult<()> {
+    for (field, ty) in [
+        ("simple_ctr", params.simple_ctr),
+        ("combinations_ctr", params.combinations_ctr),
+    ] {
+        if !ty.is_cpu_supported() {
+            return Err(CbError::Unsupported(format!(
+                "Ctr type {ty:?} ({field}) is not implemented on CPU yet \
+                 (upstream catboost_options.cpp:504-509; \
+                 IsSupportedCtrType(CPU, …) admits only Borders, Buckets, \
+                 BinarizedTargetMeanValue and Counter)"
+            )));
+        }
     }
     Ok(())
 }
@@ -1772,12 +1923,16 @@ fn normalize_leaf_values(
 /// diverges from the structure partition (`[6,0,7,17]` vs `[6,0,9,15]` for the
 /// tensor_ctr_e2e config).
 ///
-/// `averaging_ctr_features` is index-aligned with the structure
-/// `materialized_ctr_features` (same projection order), and a `LevelKind::Ctr`'s
-/// `ctr_idx` indexes the tree's chosen `ctr_splits`, whose projection identifies
-/// which averaging column to read. Out-of-range indices contribute a `false` bit
+/// `ctr_columns` is whichever fold's materialized CTR column set the caller
+/// wants the partition under — the AVERAGING fold's for the leaf-VALUE
+/// partition, or a LEARNING fold's for that fold's own approx update
+/// (`UpdateLearningFold`, `train.cpp:585`). All fold column sets are emitted by
+/// the same `materialize_ctr_columns_for_perm`, so the candidate-identity keys
+/// used below are aligned across folds by construction. A `LevelKind::Ctr`'s
+/// `ctr_idx` indexes the tree's chosen `ctr_splits`, whose candidate identity
+/// selects which column to read. Out-of-range indices contribute a `false` bit
 /// defensively (checked `.get` only — no panic, no raw index).
-fn assign_leaf_of_averaging(
+fn assign_leaf_over_ctr_columns(
     matrix: &FeatureMatrix,
     averaging_ctr_features: &[crate::ctr::CtrFeatureColumn],
     grown: &GrownTree,
@@ -1799,16 +1954,46 @@ fn assign_leaf_of_averaging(
                                 .map(|&v| f64::from(v) > s.border)
                         })
                         .unwrap_or(false),
+                    // SPEC-OH-07: a one-hot level is the `cat_bin == value`
+                    // equality test on the matrix's one-hot bin column. This
+                    // rebuild runs on the CTR leaf-value path, where one-hot and
+                    // CTR columns never co-occur (SPEC-OH-26 gates the mix), but
+                    // the arm is real rather than a silent `false` so a future
+                    // mixed pool cannot mis-assign leaves undetected.
+                    LevelKind::OneHot(one_hot_idx) => grown
+                        .one_hot_splits
+                        .get(*one_hot_idx)
+                        .and_then(|oh| {
+                            matrix
+                                .cat_bins
+                                .get(oh.feature)
+                                .and_then(|col| col.get(obj))
+                                .map(|&bin| bin == oh.value)
+                        })
+                        .unwrap_or(false),
                     LevelKind::Ctr { ctr_idx, border } => grown
                         .ctr_splits
                         .get(*ctr_idx)
-                        // Find the averaging column whose projection matches this
-                        // chosen CTR split (index-aligned with the structure
-                        // columns; the projection is the stable key).
+                        // Find the averaging column this chosen CTR split was
+                        // scored on. The key is the FULL candidate identity —
+                        // `(projection, ctr_type, target_border_idx, prior)` —
+                        // NOT the projection alone (E15): the multi-prior
+                        // expansion emits one column per prior on the same
+                        // projection, so a projection-only `find` would silently
+                        // return the HEAD prior's column and partition the leaf
+                        // VALUES on bins the structure search never scored. Both
+                        // sides of the prior comparison originate from the same
+                        // configured list element (the column's prior is copied
+                        // verbatim onto the split in `crate::tree`), so bit
+                        // equality is exact rather than approximate.
                         .and_then(|spec| {
-                            averaging_ctr_features
-                                .iter()
-                                .find(|c| c.projection == spec.projection)
+                            averaging_ctr_features.iter().find(|c| {
+                                c.projection == spec.projection
+                                    && c.ctr_type == spec.ctr_type
+                                    && c.target_border_idx == spec.target_border_idx
+                                    && c.prior_num.to_bits() == spec.prior_num.to_bits()
+                                    && c.prior_denom.to_bits() == spec.prior_denom.to_bits()
+                            })
                         })
                         .and_then(|col| col.bins.get(obj))
                         .is_some_and(|&bin| f64::from(bin) > *border),
@@ -1835,24 +2020,211 @@ fn assign_leaf_of_averaging(
 /// in-scope `Borders:Prior=0.5` fixture) seeds the spec. The split BORDER is left
 /// `0.0` here (the candidate-emission stage); the categorical scorer overwrites it
 /// with the chosen CTR-value threshold when a CTR split actually wins a level.
+/// Resolve the `(CTR type, head prior)` pair that governs ONE candidate
+/// (SPEC-CTRT-09 / SPEC-CTRT-10).
+///
+/// A **simple** candidate (a single categorical feature) is governed by
+/// `simple_ctr` / `simple_ctr_priors`; a **combination** candidate by
+/// `combinations_ctr` / `combinations_ctr_priors`. Before E10 a single
+/// `combinations_ctr_priors.first()` fed BOTH, so the combination prior silently
+/// governed simple candidates — the bug SPEC-CTRT-10 fixes.
+///
+/// Returns only the HEAD prior. The candidate MATERIALIZATION expands over the
+/// whole list (E15, [`ctr_config_list_for`]); this single-prior form survives for
+/// [`ctr_splits_for_tree`], the no-CTR-candidate fallback where no materialized
+/// column exists to carry a per-candidate prior.
+fn ctr_config_for(
+    simple_ctr: crate::ctr::ECtrType,
+    simple_priors: &[f64],
+    combinations_ctr: crate::ctr::ECtrType,
+    combinations_priors: &[f64],
+    is_simple: bool,
+) -> (crate::ctr::ECtrType, f64) {
+    let (ctr_type, priors) = ctr_config_list_for(
+        simple_ctr,
+        simple_priors,
+        combinations_ctr,
+        combinations_priors,
+        is_simple,
+    );
+    (ctr_type, priors.first().copied().unwrap_or(DEFAULT_CTR_PRIOR))
+}
+
+/// The prior a candidate falls back to when its configured prior list is EMPTY.
+/// Matches the pre-E15 `.first().unwrap_or(0.5)` behavior exactly, so an empty
+/// list still emits exactly one column at `0.5`.
+const DEFAULT_CTR_PRIOR: f64 = 0.5;
+
+/// The prior list an empty configuration degenerates to — one column at
+/// [`DEFAULT_CTR_PRIOR`], never zero columns.
+const DEFAULT_CTR_PRIORS: [f64; 1] = [DEFAULT_CTR_PRIOR];
+
+/// Resolve the `(CTR type, FULL prior list)` pair that governs ONE candidate
+/// (SPEC-CTRT-10 / SPEC-CTRT-11).
+///
+/// The list half is what E15 needs: upstream emits one candidate column per
+/// `(ctrIdx, targetBorderIdx, priorIdx)` (`greedy_tensor_search.cpp:414-427`), so
+/// every configured prior produces its own scored column. An EMPTY configured
+/// list degenerates to `[DEFAULT_CTR_PRIOR]` rather than to no columns, keeping
+/// the pre-E15 `.first().unwrap_or(0.5)` behavior byte-identical.
+fn ctr_config_list_for<'a>(
+    simple_ctr: crate::ctr::ECtrType,
+    simple_priors: &'a [f64],
+    combinations_ctr: crate::ctr::ECtrType,
+    combinations_priors: &'a [f64],
+    is_simple: bool,
+) -> (crate::ctr::ECtrType, &'a [f64]) {
+    let (ctr_type, priors) = if is_simple {
+        (simple_ctr, simple_priors)
+    } else {
+        (combinations_ctr, combinations_priors)
+    };
+    if priors.is_empty() {
+        (ctr_type, &DEFAULT_CTR_PRIORS)
+    } else {
+        (ctr_type, priors)
+    }
+}
+
+/// The RAW per-object categorical-bucket column for every CTR-eligible cat
+/// feature — the `model_size_reg` cat-feature-weight input (`GetCatFeatureWeight`,
+/// `greedy_tensor_search.cpp:908-932`), consumed by an order-insensitive `.max()`
+/// in [`crate::tree::select_level_ctr_aware`]'s phantom mixed-partition bucket
+/// count.
+///
+/// **One column per CTR-eligible categorical FEATURE, never per emitted CTR
+/// candidate column.** It is NOT index-aligned with the materialized CTR column
+/// list and MUST NOT grow with the `(projection, prior)` — after E16,
+/// `(projection, target_border_idx, prior)` — candidate expansion: growing it
+/// would change `phantom_mixed_bucket_count`, hence `model_size_reg`'s
+/// cat-feature weight, hence split choice. Taking `eligible_absolute` rather than
+/// the column list is precisely what makes that structurally impossible.
+///
+/// Empty for the numeric path (`cat_columns` empty ⇒ `eligible_absolute` empty),
+/// a provable no-op there.
+pub(crate) fn cat_eligible_buckets_for(
+    cat_columns: &[Vec<String>],
+    eligible_absolute: &[usize],
+) -> CbResult<Vec<Vec<u32>>> {
+    eligible_absolute
+        .iter()
+        .map(|&abs_idx| match cat_columns.get(abs_idx) {
+            Some(col) => {
+                let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+                cb_data::perfect_hash_bins(&as_str)
+            }
+            None => Ok(Vec::new()),
+        })
+        .collect::<CbResult<Vec<Vec<u32>>>>()
+}
+
+/// Materialize the online CTR candidate columns for ONE permutation — the single
+/// place the candidate product is built (E15).
+///
+/// `train_inner` calls this twice: once per STRUCTURE learning fold (each fold's
+/// own permutation) and once for the AVERAGING fold. Because both go through this
+/// one function, the index alignment the chosen-split → averaging-column lookup
+/// depends on holds by construction rather than by convention.
+///
+/// The emitted order is upstream's `(ctrIdx, targetBorderIdx, priorIdx)`
+/// nesting (`greedy_tensor_search.cpp:400-428`): for each candidate, one column
+/// per `target_border_idx` in `0..target_border_count(classes)` (E16 /
+/// SPEC-CTRT-12 — `2` for Buckets at binclf, `1` for every other CPU-legal
+/// type), and inside that one column per prior in configured list order. With a
+/// single-element prior list and a non-Buckets type the sequence is
+/// byte-identical to the pre-E15 one-column-per-candidate emission (the D-04
+/// no-op proof).
+pub(crate) fn materialize_ctr_columns_for_perm(
+    cat_columns: &[Vec<String>],
+    absolute_projections: &[crate::TProjection],
+    ctr_candidates: &[crate::candidates::CtrCandidate],
+    params: &BoostParams,
+    permutation: &[i32],
+    target_class: &[usize],
+    ctr_border_count: usize,
+    extra_cat_columns: &[Vec<String>],
+) -> CbResult<Vec<crate::ctr::CtrFeatureColumn>> {
+    // The binclf target-class count — the SAME `2` the bake passes to
+    // `bake_ctr_table` (`GetTargetBorderCount`'s `targetClassesCount` input).
+    const TARGET_CLASSES: usize = 2;
+    let mut cols = Vec::with_capacity(ctr_candidates.len());
+    for (ci, proj) in absolute_projections.iter().enumerate() {
+        // `absolute_projections` is index-aligned with `ctr_candidates`, so
+        // `is_simple` is available without a second lookup.
+        let is_simple = ctr_candidates.get(ci).is_some_and(|c| c.is_simple);
+        let (ctr_type, priors) = ctr_config_list_for(
+            params.simple_ctr,
+            &params.simple_ctr_priors,
+            params.combinations_ctr,
+            &params.combinations_ctr_priors,
+            is_simple,
+        );
+        for target_border_idx in 0..ctr_type.target_border_count(TARGET_CLASSES) {
+            for &prior_num in priors {
+                let col = crate::ctr::materialize_ctr_feature(
+                    cat_columns,
+                    proj,
+                    permutation,
+                    target_class,
+                    prior_num,
+                    // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
+                    CTR_PRIOR_DENOM,
+                    ctr_border_count,
+                    ctr_type,
+                    target_border_idx,
+                    // E22 / SPEC-CTRT-17: the concatenated eval-set cat columns
+                    // under `counter_calc_method = Full` (empty otherwise); the
+                    // materializer applies them to COUNTER candidates only.
+                    extra_cat_columns,
+                )?;
+                cols.push(col);
+            }
+        }
+    }
+    Ok(cols)
+}
+
+/// The CTR prior DENOMINATOR. Constant `1` on the CPU path (RESEARCH A6; a
+/// non-unit denominator is forbidden by `ctr_helper.cpp:50`), carried as a
+/// separate half so the bake receives the denominator for `calc_normalization`
+/// rather than a pre-divided scalar.
+const CTR_PRIOR_DENOM: f64 = 1.0;
+
 fn ctr_splits_for_tree(
     candidates: &[crate::candidates::CtrCandidate],
-    priors: &[f64],
+    simple_ctr: crate::ctr::ECtrType,
+    simple_priors: &[f64],
+    combinations_ctr: crate::ctr::ECtrType,
+    combinations_priors: &[f64],
 ) -> Vec<CtrSplitSpec> {
-    let prior_num = priors.first().copied().unwrap_or(0.5);
     candidates
         .iter()
-        .map(|c| CtrSplitSpec {
-            projection: c.projection.clone(),
-            // combinations_ctr default head family is Borders (i8 == 0); pinned
-            // explicitly at the BoostParams level (combinations_ctr_default).
-            ctr_type: crate::ctr::ECtrType::Borders.as_i8(),
-            prior_num,
-            prior_denom: 1.0,
-            target_border_idx: 0,
-            border: 0.0,
-            shift: 0.0,
-            scale: 1.0,
+        .map(|c| {
+            // Per-candidate routing (E10): no hard-coded Borders head, and the
+            // simple/combination prior lists are kept distinct.
+            let (ctr_type, prior_num) = ctr_config_for(
+                simple_ctr,
+                simple_priors,
+                combinations_ctr,
+                combinations_priors,
+                c.is_simple,
+            );
+            CtrSplitSpec {
+                projection: c.projection.clone(),
+                ctr_type: ctr_type.as_i8(),
+                prior_num,
+                // CPU forbids a non-unit prior denominator (ctr_helper.cpp:50).
+                prior_denom: 1.0,
+                // DELIBERATE, TESTED CONSTANT (E16): this function is reached
+                // only from the `!has_ctr` fallback, where NO materialized
+                // column exists by construction — so there is no per-column
+                // `target_border_idx` to read, and structurally cannot be. The
+                // E03 characterization test pins the `0`.
+                target_border_idx: 0,
+                border: 0.0,
+                shift: 0.0,
+                scale: 1.0,
+            }
         })
         .collect()
 }
@@ -1865,6 +2237,13 @@ pub struct EvalSet<'a> {
     pub feature_values: &'a [Vec<f32>],
     /// Eval per-object target labels.
     pub target: &'a [f64],
+    /// `cat_columns[c]` is eval categorical column `c`'s per-object RAW string
+    /// values (E21, enabling SPEC-CTRT-17): under `counter_calc_method = Full`
+    /// upstream tallies learn **+ every eval set** into the Counter bucket
+    /// totals (`online_ctr.cpp:716-729`), so the eval categorical data must be
+    /// carriable at all. Empty (`&[]`) on every numeric path — exactly the
+    /// pre-E21 semantics, byte-identical.
+    pub cat_columns: &'a [Vec<String>],
 }
 
 /// The ranking (grouped) structure a ranking loss reads (LOSS-04, D-6.3-03):
@@ -2002,6 +2381,7 @@ pub fn train_with_eval<R: Runtime>(
             vec![EvalSet {
                 feature_values: es.feature_values,
                 target: es.target,
+                cat_columns: es.cat_columns,
             }]
         })
         .unwrap_or_default();
@@ -2071,6 +2451,7 @@ pub fn train_with_eval_sets<R: Runtime>(
         eval_sets,
         history,
         RankingData::default(),
+        None,
     )?;
     Ok(model)
 }
@@ -2111,6 +2492,7 @@ pub fn train_ranking<R: Runtime>(
         &[],
         None,
         ranking,
+        None,
     )?;
     Ok(model)
 }
@@ -2164,7 +2546,130 @@ pub fn train_cat<R: Runtime>(
         &[],
         None,
         RankingData::default(),
+        None,
     )
+}
+
+/// [`train_cat`] plus held-out evaluation sets (E21, enabling SPEC-CTRT-17) —
+/// the categorical mirror of [`train_with_eval_sets`], except the baked CTR
+/// data is RETURNED rather than discarded (a categorical model without its
+/// baked tables cannot predict).
+///
+/// Each eval set may carry its own `cat_columns`; under
+/// `counter_calc_method = Full` (threaded by E22) those columns join the
+/// Counter bucket tally exactly as upstream's learn-plus-every-test-set hash
+/// array does (`online_ctr.cpp:716-729`).
+///
+/// # Errors
+/// As [`train_cat`], plus [`CbError::LengthMismatch`] if any eval set's
+/// categorical column length disagrees with that set's target length.
+#[allow(clippy::too_many_arguments)]
+pub fn train_cat_with_eval_sets<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_columns: &[Vec<String>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+    eval_sets: &[EvalSet],
+    history: Option<&mut EvalMetricHistory>,
+) -> CbResult<(Model, BakedCtrData)> {
+    for (si, es) in eval_sets.iter().enumerate() {
+        for (ci, col) in es.cat_columns.iter().enumerate() {
+            if col.len() != es.target.len() {
+                return Err(CbError::LengthMismatch {
+                    column: format!("eval set {si} categorical column {ci}"),
+                    expected: es.target.len(),
+                    actual: col.len(),
+                });
+            }
+        }
+    }
+    train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        cat_columns,
+        target,
+        weights,
+        params,
+        staged_out,
+        eval_sets,
+        history,
+        RankingData::default(),
+        None,
+    )
+}
+
+/// Train a numeric model with a periodic on-disk CHECKPOINT, resuming
+/// automatically from `snapshot.snapshot_file` when it already exists and its
+/// fingerprint matches this run (ORCH-03-S7).
+///
+/// Mirrors upstream's `snapshot_file` / `snapshot_interval` semantics: a
+/// checkpoint is written at completed-iteration boundaries no more often than
+/// `snapshot_interval`, and a subsequent call with the same configuration picks up
+/// where the previous one stopped instead of retraining from scratch.
+///
+/// Snapshotting is defined only for plain float-only CPU boosting — see
+/// [`snapshot_scope_ok`] for the exact admitted regime and the reason each excluded
+/// feature is excluded.
+///
+/// Returns the trained model together with the iteration the run RESUMED FROM —
+/// `0` for a fresh fit, `K` when a `K`-tree checkpoint was picked up. That number
+/// is the only observable difference between a resume and a from-scratch retrain
+/// (both produce the same model, which is the point), so callers that need to know
+/// whether the checkpoint was used must read it here.
+///
+/// # Errors
+/// [`CbError::Snapshot`] if the configuration is outside the snapshot regime (no
+/// file is written), if the existing snapshot's fingerprint does not match this
+/// run's, or on any snapshot I/O / codec failure. Otherwise the same errors as
+/// [`train`].
+pub fn train_with_snapshot<R: Runtime>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    snapshot: &crate::snapshot::SnapshotConfig,
+) -> CbResult<(Model, usize)> {
+    // The resume point is determined by PEEKING the checkpoint here rather than by
+    // growing `train_inner`'s return type: that would force a three-tuple
+    // destructure at all four of its existing call sites, turning an additive
+    // change into a signature change across paths that have nothing to do with
+    // snapshots. `train_inner` re-reads and restores the file itself; on this
+    // deterministic single-threaded path the extra read is cheap and side-effect
+    // free.
+    //
+    // The fingerprint check runs BEFORE any training, so a mismatched checkpoint
+    // costs the caller nothing.
+    let resume_from = if snapshot.snapshot_file.exists() {
+        let stored = crate::snapshot::read_from(&snapshot.snapshot_file)?;
+        let current = crate::snapshot::fingerprint(params, target.len(), feature_borders, target);
+        crate::snapshot::check_resume(stored.fingerprint, current)?;
+        stored.completed_iters
+    } else {
+        0
+    };
+
+    let (model, _baked) = train_inner(
+        runtime,
+        feature_values,
+        feature_borders,
+        &[],
+        target,
+        weights,
+        params,
+        None,
+        &[],
+        None,
+        RankingData::default(),
+        Some(snapshot),
+    )?;
+    Ok((model, resume_from))
 }
 
 /// Quantize the float design matrix into the device's feature-major cindex
@@ -2228,6 +2733,68 @@ fn quantize_feature_major(
     (bins, n_bins)
 }
 
+/// The device quantizer for a pool that MAY carry one-hot columns (SPEC-OH-21),
+/// returning `(bins, n_bins, real_folds)`.
+///
+/// This is the ONE device-quantize entry the trainer calls — on EVERY device-eligible
+/// pool, float-only included (with an empty `cat_bins`). That is deliberate: it is what
+/// makes `real_folds` always populated, so the session's
+/// `real_folds.len() == eff_n_features` check can stay unconditional instead of
+/// degenerating into the silently-inert bound SPEC-OH-22 exists to eliminate.
+///
+/// - **Layout.** The device feature axis is the CONCATENATION `float | one-hot`: device
+///   feature index `n_float + c` is one-hot column `c`. The one-hot columns therefore
+///   form one CONTIGUOUS range, which is what lets the split scorer bound its second
+///   pass with a single `feature_lo = n_float`.
+/// - **Bins.** Float stripes are produced by delegating to [`quantize_feature_major`]
+///   with its body and signature unmodified, so the float bin bytes are provably
+///   identical (SPEC-OH-31). One-hot stripes are the `PerfectHash` bin columns copied
+///   VERBATIM — there is no second binning of a categorical column anywhere.
+/// - **`n_bins`.** `max(float n_bins, max cat cardinality).max(1)`. The `.max(1)` and the
+///   cat term matter: a 0-float pool would otherwise report `n_bins == 0` and the backend
+///   session declines on `n_features == 0 || n_bins == 0`, making SPEC-OH-20's 0-float
+///   target unreachable.
+/// - **`real_folds`.** The per-feature REAL cardinality — `borders[f].len() + 1` for a
+///   float feature, the column's `PerfectHash` cardinality for a one-hot column. This is
+///   a SEPARATE array and is **not** `TCFeature.folds`, which on the production path is
+///   the padded uniform line width and bounds nothing (see the `TCFeature.folds` doc in
+///   `cb-backend`'s `gpu_runtime::cindex`). It is also NOT fixable by passing true
+///   cardinalities into `pack_cindex`: that would change `feature_bits` and hence the
+///   packed words for every pool, float-only included.
+fn quantize_feature_major_with_one_hot(
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_bins: &[Vec<u32>],
+    n: usize,
+) -> (Vec<u32>, usize, Vec<u32>) {
+    let n_float = feature_values.len();
+    // Float prefix: delegate, so the float bytes cannot drift from the plain entry.
+    let (float_bins, float_n_bins) = quantize_feature_major(feature_values, feature_borders, n);
+
+    let mut real_folds: Vec<u32> = Vec::with_capacity(n_float + cat_bins.len());
+    for f in 0..n_float {
+        let borders = feature_borders.get(f).map_or(0usize, Vec::len);
+        real_folds.push(u32::try_from(borders + 1).unwrap_or(u32::MAX));
+    }
+
+    // One-hot suffix: cardinality is `max bin + 1` over the column (the `PerfectHash`
+    // bins are dense `0..cardinality` by construction, so this is exact).
+    let mut bins = float_bins;
+    bins.reserve(cat_bins.len() * n);
+    let mut max_cat_cardinality = 0usize;
+    for col in cat_bins {
+        let cardinality = col.iter().copied().max().map_or(0usize, |m| m as usize + 1);
+        max_cat_cardinality = max_cat_cardinality.max(cardinality);
+        real_folds.push(u32::try_from(cardinality).unwrap_or(u32::MAX));
+        for obj in 0..n {
+            bins.push(col.get(obj).copied().unwrap_or(0));
+        }
+    }
+
+    let n_bins = float_n_bins.max(max_cat_cardinality).max(1);
+    (bins, n_bins, real_folds)
+}
+
 /// RAII teardown for the GPUT-01 device training session (T-10-24): guarantees
 /// [`Runtime::end_device_training`] runs on EVERY exit path from [`train_inner`] —
 /// including the `?` error path — once [`Runtime::begin_device_training`] opened a
@@ -2249,6 +2816,239 @@ impl<R: Runtime> Drop for DeviceSessionGuard<'_, R> {
     }
 }
 
+/// Partition the categorical columns by encoding path (SPEC-OH-04), returning
+/// `(one_hot_absolute, ctr_absolute)` — both ASCENDING absolute `cat_columns`
+/// indices.
+///
+/// Derived from ONE [`crate::candidates::route_categorical`] match per column,
+/// so the two lists are DISJOINT BY CONSTRUCTION: two independent filters could
+/// drift (a routing-rule change touching only one of them would materialize the
+/// same feature on both paths, double-counting its contribution). A constant
+/// column (`cardinality <= 1`, [`crate::candidates::EncodingPath::Skip`])
+/// appears in NEITHER list.
+///
+/// The CTR list is byte-identical to the pre-one-hot `eligible_absolute`.
+fn partition_cat_columns(
+    cat_cardinalities: &[u32],
+    one_hot_max_size: u32,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut one_hot = Vec::new();
+    let mut ctr = Vec::new();
+    for (abs_idx, &card) in cat_cardinalities.iter().enumerate() {
+        match crate::candidates::route_categorical(card, one_hot_max_size) {
+            crate::candidates::EncodingPath::OneHot => one_hot.push(abs_idx),
+            crate::candidates::EncodingPath::Ctr => ctr.push(abs_idx),
+            crate::candidates::EncodingPath::Skip => {}
+        }
+    }
+    (one_hot, ctr)
+}
+
+/// The widest one-hot column the device grower accepts (SPEC §9 R10).
+///
+/// The device histogram line is padded to one of `{32, 64, 128, 256}` bins and is
+/// SHARED by every feature, so a one-hot column's cardinality must fit alongside the
+/// float bin count. `32` keeps a binary/low-cardinality pool inside the narrowest
+/// (fastest) legal line, which is the regime `one_hot_max_size` actually produces —
+/// upstream's default is `2`, and its documented ceiling for the one-hot route is far
+/// below this.
+///
+/// Exceeding it is NOT an error: the fit falls back to the CPU grower, which handles
+/// any cardinality. Aborting an otherwise-valid fit would be strictly worse behavior
+/// than training it correctly a bit slower.
+pub(crate) const DEVICE_ONE_HOT_MAX_CARDINALITY: u32 = 32;
+
+/// Whether every one-hot column fits the device histogram line
+/// ([`DEVICE_ONE_HOT_MAX_CARDINALITY`]). A pool with no one-hot columns trivially
+/// fits, which is what keeps the float-only path unchanged (SPEC-OH-31).
+fn one_hot_cardinalities_fit_the_device(cardinalities: &[u32]) -> bool {
+    cardinalities
+        .iter()
+        .all(|&c| c <= DEVICE_ONE_HOT_MAX_CARDINALITY)
+}
+
+/// Whether the pool has ANY feature the level search can rank (SPEC-OH-20).
+///
+/// This is clause 11 of `device_host_eligible`, extracted so it can be asserted
+/// on its own (the full eligibility expression needs a whole fit context). Before
+/// SPEC-OH-20 it read `matrix.n_features() > 0` — float columns only — which
+/// silently excluded a pool routed entirely one-hot from the device grower.
+///
+/// A one-hot cat column IS scorable: `AddOneHotFeatures` contributes
+/// `cat_bin == value` candidates to the SAME level argmax the float borders feed
+/// (SPEC-OH-06). Only a pool with neither kind has nothing to rank.
+fn has_any_scorable_feature(matrix: &crate::tree::FeatureMatrix<'_>) -> bool {
+    matrix.n_features() > 0 || matrix.n_cat_features() > 0
+}
+
+/// Materialize the one-hot-routed categorical columns (SPEC-OH-05), returning
+/// `(bins, hash_by_bin)`, both indexed by ONE-HOT POSITION (the index into
+/// `one_hot_abs`), NOT by absolute cat-column index.
+///
+/// - `bins[p][obj]` is the object's FIRST-SEEN [`cb_data::PerfectHash`] bin —
+///   produced by [`cb_data::perfect_hash_bins`], the single sanctioned hashing
+///   primitive (SPEC §3); no second hashing loop exists.
+/// - `hash_by_bin[p][bin]` is the raw `calc_cat_feature_hash` value that
+///   produced `bin` — the EXACT inverse of the bin assignment, and the table
+///   [`crate::Model::one_hot_bin_to_hash`] carries to the model lift so a
+///   trainer-side bin can be re-expressed in upstream's raw-hash split space
+///   (SPEC-OH-09).
+///
+/// The inverse is built by zipping the raw column with the returned bins, NOT by
+/// sorting distinct hashes: `PerfectHash::remap_bounded` assigns
+/// `bin = map.len()` on first sight, so bin order is ENCOUNTER order.
+///
+/// # Validity
+/// The table is valid ONLY for the exact learn-set column it was built from —
+/// bins are first-seen per column, so a different row order yields a different
+/// (equally valid) table.
+///
+/// # Errors
+/// [`CbError::OutOfRange`] if an absolute index is not a column of
+/// `cat_columns`; [`CbError::Degenerate`] if the built table is not exactly one
+/// entry per distinct value (an internal invariant violation, not a data
+/// condition); or any error [`cb_data::perfect_hash_bins`] surfaces.
+fn build_one_hot_columns(
+    cat_columns: &[Vec<String>],
+    one_hot_abs: &[usize],
+) -> CbResult<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
+    let mut bins_out = Vec::with_capacity(one_hot_abs.len());
+    let mut hash_out = Vec::with_capacity(one_hot_abs.len());
+
+    for &abs_idx in one_hot_abs {
+        let col = cat_columns.get(abs_idx).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "one-hot cat column {abs_idx} out of range ({} cat columns)",
+                cat_columns.len()
+            ))
+        })?;
+        let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+        let bins = cb_data::perfect_hash_bins(&as_str)?;
+
+        // Zip raw <-> bin and record each bin's raw hash on first sight. The
+        // table is grown to `bin + 1` as bins appear; because `remap_bounded`
+        // hands out `0, 1, 2, …` in encounter order, growth is always by one.
+        let mut hash_by_bin: Vec<Option<u32>> = Vec::new();
+        for (raw, &bin) in col.iter().zip(bins.iter()) {
+            let idx = bin as usize;
+            if idx >= hash_by_bin.len() {
+                hash_by_bin.resize(idx.saturating_add(1), None);
+            }
+            if let Some(slot) = hash_by_bin.get_mut(idx) {
+                if slot.is_none() {
+                    *slot = Some(cb_data::calc_cat_feature_hash(raw));
+                }
+            }
+        }
+
+        // Every bin in [0, cardinality) must have been filled: a hole would make
+        // the model lift emit a wrong (or missing) `value_hash` for that split.
+        let cardinality = hash_by_bin.len();
+        let table: Vec<u32> = hash_by_bin.iter().flatten().copied().collect();
+        if table.len() != cardinality {
+            return Err(CbError::Degenerate(format!(
+                "one-hot cat column {abs_idx}: bin -> hash table has {} of {cardinality} entries",
+                table.len()
+            )));
+        }
+
+        bins_out.push(bins);
+        hash_out.push(table);
+    }
+
+    Ok((bins_out, hash_out))
+}
+
+/// Admit a training run into the snapshot regime, or reject it with a typed error
+/// naming the offending feature (ORCH-03-S5).
+///
+/// Slice 1 snapshots exactly the configuration whose loop-carried mutable state is
+/// `{approx, trees, rng}` — established by the audit in
+/// `.planning/plans/snapshot-resume/TASK-01-findings.md` against this file. Every
+/// predicate below marks state that a checkpoint does NOT carry, so resuming such a
+/// run would continue from a partially-restored trainer and silently produce a
+/// model that is neither the interrupted run's nor a fresh run's. Refusing up front
+/// is the only honest option; each rejection names what to turn off.
+///
+/// Two predicates deserve their own note:
+///
+/// * A `Loss::Custom(_)` objective / `EvalMetric::Custom(_)` metric is an opaque
+///   `Arc<dyn …>` whose only equality is process-local pointer identity. No
+///   cross-process fingerprint can tell two custom instances apart, so a resume
+///   could silently pair a snapshot with a DIFFERENT objective. Neither is caught
+///   by any other predicate: `Loss::Custom` is single-dimension and is not a
+///   grouped loss.
+/// * A requested `staged_out` buffer accumulates one row per iteration and is NOT
+///   part of the checkpoint, so a resumed run would return `N-K` staged rows where
+///   a straight-through run returns `N`. (Found by the TASK-01 audit; it is a
+///   `train_inner` PARAMETER, not a local, which is why the original state audit
+///   missed it.)
+#[allow(clippy::too_many_arguments)]
+fn snapshot_scope_ok(
+    params: &BoostParams,
+    cat_columns: &[Vec<String>],
+    eval_sets: &[EvalSet],
+    approx_dimension: usize,
+    penalties_active: bool,
+    device_active: bool,
+    staged_requested: bool,
+    ranking: &RankingData,
+) -> CbResult<()> {
+    let reject = |what: &str| {
+        Err(CbError::Snapshot(format!(
+            "training snapshots are supported only for plain float-only CPU boosting; \
+             this run uses {what}"
+        )))
+    };
+
+    if matches!(params.loss, Loss::Custom(_)) {
+        return reject("a custom objective (its identity cannot be fingerprinted across runs)");
+    }
+    if matches!(params.eval_metric, Some(EvalMetric::Custom(_))) {
+        return reject("a custom eval metric (its identity cannot be fingerprinted across runs)");
+    }
+    if is_grouped_loss(&params.loss) {
+        return reject("a grouped / ranking loss");
+    }
+    if !ranking.group_id.is_empty() || !ranking.subgroup_id.is_empty() || !ranking.pairs.is_empty()
+    {
+        return reject("ranking data (group_id / subgroup_id / pairs)");
+    }
+    if !cat_columns.is_empty() {
+        return reject("categorical features");
+    }
+    if !matches!(params.boosting_type, EBoostingType::Plain) {
+        return reject("ordered boosting");
+    }
+    if !eval_sets.is_empty() {
+        return reject("eval sets (the overfitting detector's state is not checkpointed)");
+    }
+    if !matches!(params.bootstrap_type, EBootstrapType::No) {
+        return reject("bootstrap sampling");
+    }
+    if params.random_strength != 0.0 {
+        return reject("a non-zero random_strength");
+    }
+    if approx_dimension != 1 {
+        return reject("a multi-dimensional approximant");
+    }
+    if penalties_active {
+        return reject("feature weights / penalties");
+    }
+    if !matches!(params.grow_policy, EGrowPolicy::SymmetricTree) {
+        return reject("a non-symmetric grow policy");
+    }
+    if device_active {
+        return reject("device (GPU) training");
+    }
+    if staged_requested {
+        return reject(
+            "a staged-prediction buffer (a resumed run would emit only the post-resume rows)",
+        );
+    }
+    Ok(())
+}
+
 /// The shared boosting loop body for the numeric ([`train_with_eval_sets`]) and
 /// cat-aware ([`train_cat`]) entry points. `cat_columns` is EMPTY for the numeric
 /// path (byte-identical to the pre-05-11 driver); a non-empty `cat_columns`
@@ -2268,7 +3068,13 @@ fn train_inner<R: Runtime>(
     eval_sets: &[EvalSet],
     mut history: Option<&mut EvalMetricHistory>,
     ranking: RankingData,
+    snapshot: Option<&crate::snapshot::SnapshotConfig>,
 ) -> CbResult<(Model, BakedCtrData)> {
+    // ORCH-03 TASK-03: the parameter is threaded but not yet read — the write hook
+    // (TASK-06) and the resume block (TASK-07) are the first consumers. Every
+    // existing caller passes `None`, so this task is behavior-preserving by
+    // construction (the D-04 anchor: the FULL `cb-train` suite must stay green).
+    let _ = &snapshot;
     check_depth(params.depth)?;
 
     // Validate the loss's hyperparameters before any training work
@@ -2276,6 +3082,11 @@ fn train_inner<R: Runtime>(
     // NaN/Inf derivatives that poison the histogram and leaf reductions, so it is
     // rejected up front with a typed CbError rather than producing a corrupt model.
     params.loss.validate()?;
+
+    // Reject CTR types with no CPU training implementation (SPEC-CTRT-03) before
+    // any accumulation or tree growth. Placed AFTER `loss.validate()` so the
+    // existing loss-validation error precedence is unchanged.
+    validate_ctr_types(params)?;
 
     // Reject the second-order (Newton) split-score functions on the CPU training
     // path (CR-01): `NewtonL2` / `NewtonCosine` reuse the L2 / Cosine score formula
@@ -2363,6 +3174,26 @@ fn train_inner<R: Runtime>(
     } else {
         params.learning_rate
     };
+    // Upstream's `TBoostingOptions::LearningRate` is a **float**, so the rate that
+    // actually multiplies every leaf value is the f32-representable value, NOT the
+    // f64 the caller supplied. For the ubiquitous `learning_rate = 0.1` the two
+    // differ by a CONSTANT relative `1.4901161e-8`
+    // (`f32(0.1) = 0.10000000149011612`); the factor lands on every leaf of every
+    // tree and compounds through the boosting residuals.
+    //
+    // Pinned EXACTLY against the committed `one_hot_train/multi` fixture (real
+    // catboost 1.2.10): all eight of tree 0's upstream leaf values equal ours
+    // times `f32(0.1) / 0.1`, reproducing them to 6.9e-18 (one ulp). End to end
+    // through production train→predict, `one_hot_train/default_binary` improves
+    // from `1.998e-9` to `2.776e-17` against upstream.
+    //
+    // The error was invisible for the project's whole life because 1.49e-8 sits
+    // four orders of magnitude under the ≤1e-5 oracle bar; it surfaced only when
+    // it flipped a NEAR-TIED one-hot split, turning an 1e-8 arithmetic difference
+    // into a 4.6e-2 prediction difference. Full measurements and the re-baseline
+    // record:
+    // `.planning/plans/one-hot-categorical-training/instrumented-ground-truth/LEARNING_RATE_F32.md`
+    let learning_rate = f64::from(learning_rate as f32);
 
     // Per-object weights: default to 1.0 when no weights are supplied.
     let weights: Vec<f64> = if weights.is_empty() {
@@ -2668,10 +3499,58 @@ fn train_inner<R: Runtime>(
         }
     };
 
-    // Numeric-only training matrix (no categorical features in this path; the
-    // one-hot categorical splits are exercised through the categorical-aware
-    // tree search directly in the ORD-04 oracle test, D-04).
-    let matrix = FeatureMatrix::new(feature_values, feature_borders);
+    // SPEC-OH-04 / SPEC-OH-05: partition the cat columns by encoding path, then
+    // materialize the one-hot-routed ones into first-seen `PerfectHash` bin
+    // columns plus their exact bin -> raw-hash inverse. On the numeric path
+    // `cat_columns` is empty, so both lists and both tables are empty and the
+    // matrix below is byte-identical to `FeatureMatrix::new` (SPEC-OH-31).
+    //
+    // CAT INGESTION (Plan 05-11): the cat-aware path computes per-cat-feature
+    // OnLearnOnly cardinalities (`learn_set_cardinality` = calc_cat_feature_hash +
+    // PerfectHash, NEVER a model's CTR hash map).
+    let cat_cardinalities: Vec<u32> = cat_columns
+        .iter()
+        .map(|col| {
+            let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
+            crate::candidates::learn_set_cardinality(&as_str)
+        })
+        .collect::<CbResult<Vec<u32>>>()?;
+    let (one_hot_absolute, eligible_absolute) =
+        partition_cat_columns(&cat_cardinalities, params.one_hot_max_size);
+
+    // SPEC-OH-26 — a pool spanning BOTH encoding routes is typed-rejected.
+    //
+    // The level search has no three-way candidate union: `has_ctr` selects
+    // `greedy_tensor_search_oblivious_with_ctr` (which takes no `cat_bins` and
+    // therefore enumerates no one-hot candidates), otherwise the plain perturbed
+    // arm runs (which sees no CTR columns). A mixed pool would silently take one
+    // branch and drop the OTHER encoding's columns entirely — exactly the
+    // class of bug this whole plan exists to fix. Device-side CTR co-existence is
+    // deferred (SPEC §9 R12), so the honest gate ships instead of a silent drop.
+    //
+    // The gate lives HERE, where both partitions are in scope, so no future
+    // dispatch arm can bypass it.
+    if !one_hot_absolute.is_empty() && !eligible_absolute.is_empty() {
+        return Err(CbError::Unsupported(format!(
+            "training a pool with both one-hot-routed and CTR-routed categorical columns is \
+             not yet supported (device-side CTR co-existence is deferred): raise \
+             one_hot_max_size to route all columns one-hot, or lower it to route all columns \
+             to CTR. At one_hot_max_size = {}, one-hot columns are {one_hot_absolute:?} and \
+             CTR columns are {eligible_absolute:?}",
+            params.one_hot_max_size,
+        )));
+    }
+
+    let (one_hot_bins, one_hot_bin_to_hash) =
+        build_one_hot_columns(cat_columns, &one_hot_absolute)?;
+
+    // Training matrix: float columns plus the one-hot bin columns (empty on the
+    // numeric path ⇒ `n_cat_features() == 0`, the pre-one-hot behaviour).
+    let matrix = FeatureMatrix {
+        feature_values,
+        feature_borders,
+        cat_bins: &one_hot_bins,
+    };
 
     // FEAT-04 first-use / per-object penalty state (`feature_penalties_calcer.cpp`):
     // `used_features[f] == true` once any PRIOR tree in this run has split on float
@@ -2687,42 +3566,16 @@ fn train_inner<R: Runtime>(
     // Tensor / combination CTR candidate generation (ORD-05 / D-05, AddTreeCtrs,
     // greedy_tensor_search.cpp:491-551): emit the SimpleCtr / CombinationCtr
     // projections over the CTR-eligible cat features under the
-    // `params.max_ctr_complexity` gate (:532-533).
-    //
-    // CAT INGESTION (Plan 05-11): the cat-aware path computes per-cat-feature
-    // OnLearnOnly cardinalities (`learn_set_cardinality` = calc_cat_feature_hash +
-    // PerfectHash, NEVER a model's CTR hash map) and feeds the REAL cat set to
-    // `tensor_ctr_candidates`. The numeric `train` / `train_with_eval_sets` path
-    // supplies an EMPTY `cat_columns`, so the cardinalities and candidate set are
-    // both empty and the float-only oracles are byte-for-byte unchanged.
-    let cat_cardinalities: Vec<u32> = cat_columns
-        .iter()
-        .map(|col| {
-            let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
-            crate::candidates::learn_set_cardinality(&as_str)
-        })
-        .collect::<CbResult<Vec<u32>>>()?;
+    // `params.max_ctr_complexity` gate (:532-533). The numeric `train` /
+    // `train_with_eval_sets` path supplies an EMPTY `cat_columns`, so the
+    // cardinalities and candidate set are both empty and the float-only oracles
+    // are byte-for-byte unchanged. `cat_cardinalities` / `eligible_absolute` were
+    // computed above, alongside the SPEC-OH-04 one-hot partition.
     let ctr_candidates = tensor_ctr_candidates(
         &cat_cardinalities,
         params.one_hot_max_size,
         params.max_ctr_complexity,
     );
-
-    // Map the CTR-eligible-position projection members emitted by
-    // `tensor_ctr_candidates` (dense positions into the CTR-eligible feature list,
-    // candidates.rs) back to ABSOLUTE `cat_columns` indices so
-    // `materialize_ctr_feature` reads the right columns. The eligible list is the
-    // cat features routing to the CTR path (cardinality > one_hot_max_size), in
-    // ascending absolute-index order.
-    let eligible_absolute: Vec<usize> = cat_cardinalities
-        .iter()
-        .enumerate()
-        .filter(|(_, &card)| {
-            crate::candidates::route_categorical(card, params.one_hot_max_size)
-                == crate::candidates::EncodingPath::Ctr
-        })
-        .map(|(abs_idx, _)| abs_idx)
-        .collect();
 
     // ORD-07: raw per-object categorical-bucket data for every CTR-eligible cat
     // feature (the phantom mixed float-partition + categorical-feature
@@ -2733,25 +3586,21 @@ fn train_inner<R: Runtime>(
     // SPEC.md §7 rather than a new hand-rolled hashing loop). Empty for the
     // numeric path (`cat_columns` empty ⇒ `eligible_absolute` empty), a
     // provable no-op there.
-    let cat_eligible_buckets: Vec<Vec<u32>> = eligible_absolute
-        .iter()
-        .map(|&abs_idx| match cat_columns.get(abs_idx) {
-            Some(col) => {
-                let as_str: Vec<&str> = col.iter().map(String::as_str).collect();
-                cb_data::perfect_hash_bins(&as_str)
-            }
-            None => Ok(Vec::new()),
-        })
-        .collect::<CbResult<Vec<Vec<u32>>>>()?;
+    let cat_eligible_buckets: Vec<Vec<u32>> =
+        cat_eligible_buckets_for(cat_columns, &eligible_absolute)?;
 
     // The TWO permutations for the cat-CTR two-materialization (research Q1/Q3),
     // now CARRYING the initial learn-set shuffle `S` in the averaging order (ORD-01
     // / bar (c), plan 05-19):
     //   * `cat_learn_permutation` — the STRUCTURE-search fold = the lone learning
-    //     `Folds[0]`, the IDENTITY (`shuffle = foldIdx != 0`,
-    //     `learn_context.cpp:524`). The structure-search CTR column is materialized
-    //     under this permutation. (Per-iteration structure-fold cycling
-    //     `[0,2,0,2,2]` is Task 4; T3 keeps the fixed identity Folds[0].)
+    //     `Folds[0]` (`shuffle = foldIdx != 0`, `learn_context.cpp:526-529`).
+    //     Upstream builds the folds on the ALREADY-S-SHUFFLED learn data
+    //     (`ShuffleLearnDataIfNeeded` runs first), so Folds[0]'s "identity" is
+    //     identity over shuffled data — `S` itself in ORIGINAL-object order.
+    //     BUG-SFS was materializing this fold under the raw identity instead
+    //     (`ctr_structure_fold_shuffle_test` pins the corrected borders). The
+    //     actual per-fold permutations are built at `structure_fold_columns`
+    //     below; this Option is the has-CTR presence gate.
     //   * `cat_averaging_permutation` — the AveragingFold's original-object CTR
     //     order `Q = [S[p] for p in P_avg]`
     //     ([`crate::averaging_ctr_permutation`]), where `S` is the initial
@@ -2787,8 +3636,15 @@ fn train_inner<R: Runtime>(
         } else {
             let learning_folds =
                 crate::learning_fold_count(params.permutation_count, /* needed = */ true);
-            // STRUCTURE: identity Folds[0] (the structure-search fold).
-            let learn: Vec<i32> = (0..n as i32).collect();
+            // STRUCTURE: the fold-0 order in ORIGINAL-object coordinates — `S`
+            // when the learn set is shuffled (BUG-SFS), identity when time-ordered.
+            // The materialization below rebuilds the per-fold permutations itself;
+            // this value's role is the has-CTR presence gate (`.is_some()`).
+            let learn: Vec<i32> = if need_shuffle {
+                crate::create_shuffled_indices(n, params.random_seed)
+            } else {
+                (0..n as i32).collect()
+            };
             // LEAF VALUES: the averaging-fold original-object CTR order.
             // `need_shuffle` (the normal cat path) ⇒ `Q = S ∘ P_avg` carries the
             // initial learn-set shuffle. The (time-ordered) `!need_shuffle` fallback
@@ -2809,14 +3665,44 @@ fn train_inner<R: Runtime>(
     // `target_class[i] = usize::from(target[i] > 0.5)`.
     let target_class: Vec<usize> = target.iter().map(|&t| usize::from(t > 0.5)).collect();
 
-    // The combination/simple CTR prior PAIR (numerator + unit denominator). The
-    // head prior of the explicit `combinations_ctr_priors` (`0.5` for the in-scope
-    // `Borders:Prior=0.5` fixture); the denominator is `1` (RESEARCH A6) — both
-    // halves are carried so the Plan 05-12 bake receives the denominator for
-    // `calc_normalization`, never a pre-divided scalar.
-    let ctr_prior_num = params.combinations_ctr_priors.first().copied().unwrap_or(0.5);
-    let ctr_prior_denom = 1.0;
+    // There is deliberately NO shared prior NUMERATOR here (E10 / SPEC-CTRT-10):
+    // the numerator is resolved PER CANDIDATE — and, after E15, per (candidate,
+    // prior) — inside `materialize_ctr_columns_for_perm`, because
+    // `simple_ctr_priors` and `combinations_ctr_priors` are distinct lists. A
+    // single hoisted `combinations_ctr_priors.first()` is exactly the bug that
+    // made the combination prior govern simple candidates. The DENOMINATOR is the
+    // constant [`CTR_PRIOR_DENOM`].
     let ctr_border_count = ctr_border_count_default();
+
+    // `counter_calc_method` (E22 / SPEC-CTRT-17) — the FIRST read of
+    // `params.counter_calc_method` in this file. Under `Full`, the eval sets'
+    // categorical columns join the COUNTER bucket tally at both effect sites —
+    // the online materialization (`CountOnlineCTRTotal` over the learn +
+    // every-test-set hash array, `online_ctr.cpp:716-729`) and the final bake
+    // (`online_ctr.cpp:956-960`). `counter_full_eval_columns[c]` is the
+    // concatenation `eval[0].cat_columns[c] ++ eval[1].cat_columns[c] ++ …`,
+    // matching `cat_columns`' absolute layout; EMPTY under `SkipTest` (the
+    // default) or with no eval cat columns — byte-identical to the pre-E22
+    // behavior.
+    let counter_calc_skip_test =
+        matches!(params.counter_calc_method, CounterCalcMethod::SkipTest);
+    let counter_full_eval_columns: Vec<Vec<String>> = if counter_calc_skip_test {
+        Vec::new()
+    } else {
+        let mut cols: Vec<Vec<String>> = vec![Vec::new(); cat_columns.len()];
+        for es in eval_sets {
+            for (c, col) in cols.iter_mut().enumerate() {
+                if let Some(eval_col) = es.cat_columns.get(c) {
+                    col.extend(eval_col.iter().cloned());
+                }
+            }
+        }
+        if cols.iter().all(Vec::is_empty) {
+            Vec::new()
+        } else {
+            cols
+        }
+    };
 
     // Resolve the per-candidate ABSOLUTE projections ONCE (re-index the CTR-
     // eligible-position members emitted by `tensor_ctr_candidates` back to absolute
@@ -2879,10 +3765,14 @@ fn train_inner<R: Runtime>(
         };
         let mut per_fold = Vec::with_capacity(learning_folds_for_cycle);
         for fold in 0..learning_folds_for_cycle {
-            // fold 0: identity (unshuffled structure data, the lone Folds[0]).
+            // fold 0: identity over the S-SHUFFLED data (`shuffle = foldIdx != 0`,
+            // learn_context.cpp:526-529, on the ShuffleLearnDataIfNeeded output)
+            // ⇒ ORIGINAL-object order = S itself.
             // fold j>0: original-object order = [S[p] for p in stream[j]].
-            let perm: Vec<i32> = if fold == 0 || !need_shuffle {
+            let perm: Vec<i32> = if !need_shuffle {
                 (0..n as i32).collect()
+            } else if fold == 0 {
+                s.clone()
             } else {
                 stream
                     .get(fold)
@@ -2895,20 +3785,16 @@ fn train_inner<R: Runtime>(
                     })
                     .unwrap_or_else(|| (0..n as i32).collect())
             };
-            let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for proj in &absolute_projections {
-                let col = crate::ctr::materialize_ctr_feature(
-                    cat_columns,
-                    proj,
-                    &perm,
-                    &target_class,
-                    ctr_prior_num,
-                    ctr_prior_denom,
-                    ctr_border_count,
-                )?;
-                cols.push(col);
-            }
-            per_fold.push(cols);
+            per_fold.push(materialize_ctr_columns_for_perm(
+                cat_columns,
+                &absolute_projections,
+                &ctr_candidates,
+                params,
+                &perm,
+                &target_class,
+                ctr_border_count,
+                &counter_full_eval_columns,
+            )?);
         }
         per_fold
     } else {
@@ -2931,19 +3817,16 @@ fn train_inner<R: Runtime>(
     // order), so a chosen structure CTR split maps to the same averaging column.
     let averaging_ctr_features: Vec<crate::ctr::CtrFeatureColumn> =
         if let Some(avg_perm) = cat_averaging_permutation.as_deref() {
-            let mut cols = Vec::with_capacity(ctr_candidates.len());
-            for proj in &absolute_projections {
-                let col = crate::ctr::materialize_ctr_feature(
-                    cat_columns,
-                    proj,
-                    avg_perm,
-                    &target_class,
-                    ctr_prior_num, ctr_prior_denom,
-                    ctr_border_count,
-                )?;
-                cols.push(col);
-            }
-            cols
+            materialize_ctr_columns_for_perm(
+                cat_columns,
+                &absolute_projections,
+                &ctr_candidates,
+                params,
+                avg_perm,
+                &target_class,
+                ctr_border_count,
+                &counter_full_eval_columns,
+            )?
         } else {
             Vec::new()
         };
@@ -3016,6 +3899,43 @@ fn train_inner<R: Runtime>(
     // the bulk POST per-level draws must NOT be applied in that case.
     let perturb_active = params.random_strength != 0.0;
     let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No) || perturb_active;
+
+    // SPEC-OH-27 (T01b, branch b) — one-hot x ACTIVE RNG draws is typed-rejected.
+    //
+    // Upstream charges one unconditional `GenRandReal1()` per candidate sub-list,
+    // and `AddOneHotFeatures` contributes one sub-list per one-hot-routed cat
+    // column, so the per-level draw count becomes `n_float + n_one_hot`. That rule
+    // is SOURCE-DERIVED with HIGH confidence for the un-bundled `OneFeature` path
+    // — but `CompressCandidates` runs BETWEEN `AddOneHotFeatures` and the draw
+    // site and can re-bundle those candidates into `BinarySplits` /
+    // `ExclusiveBundle` / `FeaturesGroup` ensembles whose draw arithmetic DIFFERS,
+    // and a cardinality-2 categorical column is exactly the shape most likely to
+    // be packed. That case is NOT ESTABLISHED (see
+    // `.planning/plans/one-hot-categorical-training/instrumented-ground-truth/ONE_HOT_GROUND_TRUTH.md`).
+    //
+    // Consuming the un-bundled rule regardless would desynchronise every
+    // subsequent tree's bootstrap sample with no visible symptom on non-bootstrap
+    // tests — the exact defect class fixed in `d7676b5`. So the combination is
+    // refused until an instrumented upstream run settles it. The gate lives HERE,
+    // where both the one-hot column list and `draws_active` are in scope, so no
+    // downstream dispatch arm can bypass it.
+    //
+    // The DEFAULT path is unaffected: `bootstrap_type = No` and
+    // `random_strength = 0` are both draw-inert, so one-hot training works out of
+    // the box; only an explicit opt-in to draws is refused.
+    if !one_hot_absolute.is_empty() && draws_active {
+        return Err(CbError::Unsupported(format!(
+            "one-hot categorical training is not supported with bootstrap_type != No or \
+             random_strength != 0 (got bootstrap_type = {:?}, random_strength = {}); the \
+             upstream per-level RNG draw accounting for one-hot candidates under \
+             CompressCandidates has not been established (see \
+             .planning/plans/one-hot-categorical-training/instrumented-ground-truth/ONE_HOT_GROUND_TRUTH.md). \
+             {} one-hot-routed cat column(s): {one_hot_absolute:?}",
+            params.bootstrap_type,
+            params.random_strength,
+            one_hot_absolute.len(),
+        )));
+    }
     // MVS lambda for trees after the first uses the previous tree's mean leaf L2
     // norm (`CalculateLastIterMeanLeafValue`); `None` on the first tree.
     let mut prev_leaf_mean_l2: Option<f64> = None;
@@ -3067,10 +3987,59 @@ fn train_inner<R: Runtime>(
         && approx_dimension == 1
         && !is_multiclass
         && !is_multilabel
-        && matches!(params.bootstrap_type, EBootstrapType::No)
+        // WR-01 (`WR01-S9`): the three parity-target bootstrap types are now device-eligible
+        // via HOST sampling (Design A — `bootstrap()` runs here, only the per-object
+        // multiplier crosses the seam). They are admitted ONLY for the oblivious
+        // (SymmetricTree) grow: the non-symmetric / Region / CTR / exact-leaf × sampling
+        // combinations are out of scope this phase and the backend session declines them
+        // explicitly rather than dropping the sample.
+        //
+        // POISSON is admitted here too, but on a DIFFERENT footing and only for the
+        // oblivious grow. It is upstream's GPU-ONLY sampler — `TBootstrapConfig::Validate`
+        // rejects it on the CPU task type outright ("poisson bootstrap is not supported on
+        // CPU") — so it has no CPU sampler to run host-side and `bootstrap()` still refuses
+        // it. Instead the device draws it RESIDENT, from a verbatim transcription of
+        // upstream's CUDA `PoissonBootstrapImpl` (`cb_backend::kernels::bootstrap_device`,
+        // gated bit-for-bit against the `bootstrap_poisson/` upstream fixtures). If the
+        // device does not actually commit, Poisson is rejected below rather than silently
+        // falling back to a CPU grower that cannot express it.
+        && (matches!(params.bootstrap_type, EBootstrapType::No)
+            || (matches!(
+                params.bootstrap_type,
+                EBootstrapType::Bayesian
+                    | EBootstrapType::Bernoulli
+                    | EBootstrapType::Mvs
+                    | EBootstrapType::Poisson
+            ) && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
         && params.random_strength == 0.0
         && eval_sets.is_empty()
-        && matrix.n_features() > 0
+        // SPEC-OH-20 (T23): "has something to score" is float OR one-hot, not float
+        // alone. A pool routed entirely one-hot has zero float columns; the old
+        // `matrix.n_features() > 0` made SPEC-OH-20's 0-float target unreachable.
+        //
+        // Two things this clause deliberately does NOT do:
+        //   * It does NOT lift clause 3 (`materialized_ctr_features.is_empty() &&
+        //     structure_fold_columns.iter().all(Vec::is_empty)`) — one-hot × CTR stays
+        //     off the device (SPEC §9 R12, SPEC-OH-26 rejects the mixed pool outright).
+        //   * It is NOT the only place a 0-float pool is decided. The backend session
+        //     ALSO declines on `n == 0 || n_features == 0 || n_bins == 0`
+        //     (`cb-backend/src/gpu_runtime/session.rs`, the `begin` preamble) and then
+        //     pads the histogram line with `pad_hist_line_bins(n_bins)`. Under T24's
+        //     concatenated axis `n_features` is the TOTAL (`n_float + n_cat`) and
+        //     `n_bins = max(float n_bins, max cat cardinality)`, so a cat-only pool
+        //     passes both; a cardinality-2 column pads to a legal `n_bins_line == 32`.
+        && has_any_scorable_feature(&matrix)
+        // SPEC §9 R10 (T24): bound the one-hot cardinality on the device OR FALL BACK.
+        // Falling back is expressed HERE, as an eligibility clause, rather than as an
+        // error out of the quantizer — an over-wide column must train correctly on the
+        // CPU grower, not abort an otherwise valid fit. Inert for a float-only pool
+        // (an empty cardinality list trivially fits), so SPEC-OH-31 is unaffected.
+        && one_hot_cardinalities_fit_the_device(
+            &one_hot_bin_to_hash
+                .iter()
+                .map(|h| u32::try_from(h.len()).unwrap_or(u32::MAX))
+                .collect::<Vec<_>>(),
+        )
         // WR-03: the device grow path sums the UNWEIGHTED der (`Σ der1`) into
         // histogram channel 0 and estimates leaves via `calc_average(Σ der1,
         // Σ weight, l2)` — object weight enters only the denominator, never the
@@ -3099,21 +4068,36 @@ fn train_inner<R: Runtime>(
     // handed to `begin`, matching the CPU per-tree
     // `scale_l2_reg(l2, sumAllWeights, n)`.
     let device_scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
-    let (device_bins, device_n_bins) = if device_host_eligible {
+    // SPEC-OH-21 (T24): ONE device-quantize entry, on EVERY device-eligible pool. A
+    // float-only pool passes an empty `cat_bins` slice and still gets a fully populated
+    // `real_folds` (`[borders[f].len() + 1, …]`), which is what lets the session's
+    // `real_folds.len() == eff_n_features` check stay unconditional. Routing float-only
+    // fits back through the 2-tuple `quantize_feature_major` would leave nothing
+    // producing `real_folds` and break every existing float-only device oracle.
+    let (device_bins, device_n_bins, device_real_folds) = if device_host_eligible {
         let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
         let prof_t = std::time::Instant::now();
-        let out = quantize_feature_major(feature_values, feature_borders, n);
+        let out =
+            quantize_feature_major_with_one_hot(feature_values, feature_borders, &one_hot_bins, n);
         if prof {
             eprintln!(
-                "CB_GPU_PROF quantize n={n} nf={} elapsed={:.2}ms",
+                "CB_GPU_PROF quantize n={n} nf={} n_one_hot={} elapsed={:.2}ms",
                 feature_values.len(),
+                one_hot_bins.len(),
                 prof_t.elapsed().as_secs_f64() * 1e3,
             );
         }
         out
     } else {
-        (Vec::new(), 0)
+        (Vec::new(), 0, Vec::new())
     };
+    // The device feature axis is `float | one-hot` (T24's layout), so the total width
+    // and the one-hot boundary are both derived here and travel together.
+    let device_n_float = matrix.n_features();
+    let device_n_features = device_n_float + one_hot_bins.len();
+    let device_one_hot_flags: Vec<bool> = (0..device_n_features)
+        .map(|f| f >= device_n_float)
+        .collect();
     // Phase 12 Plan 03 (GPUT-18 / Open Q2 promotion): build the plain-host DeviceTrainConfig
     // from `params` so the grow-policy (+ Lossguide leaf cap / min-data) reaches the session
     // gate. SymmetricTree yields `DeviceTrainConfig::default()` (byte-unchanged, D-04); the two
@@ -3137,22 +4121,60 @@ fn train_inner<R: Runtime>(
             None
         },
         min_data_in_leaf: params.min_data_in_leaf,
-        // WR-01 (NOT YET WIRED — test-only / pending Kaggle CUDA sign-off): the
-        // remaining device family knobs — `bootstrap_type`, `mvs_lambda`,
-        // `exact_leaf`, `ctr`, `sample_rate`, `rng_seed` — are DELIBERATELY left at
-        // their `DeviceTrainConfig::default()` (No bootstrap, no MVS, no exact leaf,
-        // no CTR, sample_rate 1.0). The Plan-05/06/07/08 session apparatus
-        // (`ExactLeafState`/`compute_exact_leaf_values`, `BootstrapState` +
-        // `launch_bootstrap_weights_resident`, `MvsState` +
-        // `launch_mvs_weights_resident`, `build_ctr_cindex_columns`, and
-        // `device_score_stddev`) is validated ONLY by its `#[cfg(test)]`
-        // self-oracles this phase; end-to-end wiring from `train()` is a later plan.
-        // `device_host_eligible` above ALSO independently excludes any pool that
-        // would need these arms (bootstrap != No, random_strength != 0, non
-        // Gradient/Simple leaf method), so a real fit can never silently reach an
-        // unwired arm — it falls back to the CPU grower instead. Do NOT assume these
-        // features are active on the device `train()` path until this default is
-        // replaced with `params`-threaded values and the eligibility gate relaxed.
+        // ─── WR-01 WIRED: the bootstrap family knobs ────────────────────────────────
+        // `bootstrap_type` is now threaded from `params` and `sample_from_host` declares
+        // that the HOST computes the per-tree sample (Design A / `[DECISION D4]`). The two
+        // fields travel together: the backend session reads `sample_from_host` to decide
+        // that it must NOT open its own device-resident sampler, and reads
+        // `bootstrap_type` only as bookkeeping describing WHICH host sampler ran.
+        //
+        // POISSON inverts that: it is the one arm the DEVICE samples (upstream has no CPU
+        // Poisson sampler to mirror), so it travels with `sample_from_host = false` and the
+        // session opens its own resident sampler — which is why `sample_rate` and `rng_seed`
+        // below are wired for it and inert for everything else.
+        bootstrap_type: match params.bootstrap_type {
+            EBootstrapType::Bayesian => DeviceBootstrapType::Bayesian,
+            EBootstrapType::Bernoulli => DeviceBootstrapType::Bernoulli,
+            EBootstrapType::Mvs => DeviceBootstrapType::Mvs,
+            EBootstrapType::Poisson => DeviceBootstrapType::Poisson,
+            // `No` keeps the no-subsampling covered default.
+            _ => DeviceBootstrapType::No,
+        },
+        sample_from_host: !matches!(
+            params.bootstrap_type,
+            EBootstrapType::No | EBootstrapType::Poisson
+        ),
+        // Read by the device-resident sampler ONLY, i.e. only on the Poisson arm. λ is
+        // derived from `sample_rate` inside the kernel wrapper through upstream's
+        // `GetPoissonLambda() = -log(1 - subsample)`; the seed buffer is built once per fit
+        // from `rng_seed`. For every host-sampled arm these stay inert (the sample already
+        // crossed the seam fully formed), which is why they are set unconditionally rather
+        // than being made Poisson-only — an inert value cannot mislead, a missing one can.
+        sample_rate: params.subsample as f32,
+        rng_seed: params.random_seed,
+        // STILL NOT WIRED (deliberately, at `DeviceTrainConfig::default()`):
+        // `mvs_lambda`, `sample_rate` and `rng_seed` are the DEVICE-RESIDENT sampler's
+        // inputs, and Design A never opens that sampler — λ, the subsample rate and the
+        // RNG stream all live host-side inside `bootstrap()` above, which is the
+        // ≤1e-5-verified sampler and the reason upstream parity is reachable. Setting
+        // them here would be inert at best and, for `mvs_lambda`, actively misleading.
+        // `exact_leaf` / `ctr` likewise stay default: exact-leaf × sampling and CTR ×
+        // sampling are out of scope (SPEC §2) and the session declines both combinations.
+        // Design B′ (device-resident sampling) is the perf follow-up that would wire them.
+        //
+        // ─── SPEC-OH-21/22/24/25: the one-hot channel ───────────────────────────────
+        // All three travel together and describe the SAME concatenated `float | one-hot`
+        // device feature axis. On a float-only pool `one_hot_flags` is all-`false`,
+        // `n_float == n_features`, and `real_folds` is the per-float `borders + 1` — the
+        // scorer then only ever takes the `one_hot == false` arm whose eligibility is the
+        // unchanged `border < max_border`, so `real_folds` is uploaded but never read and
+        // the float path is numerically unchanged (SPEC-OH-31).
+        //
+        // `real_folds` is NOT `TCFeature.folds` (the padded line width): see the field doc
+        // on `DeviceTrainConfig`.
+        one_hot_flags: device_one_hot_flags.clone(),
+        real_folds: device_real_folds.clone(),
+        n_float: device_n_float,
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
@@ -3165,7 +4187,10 @@ fn train_inner<R: Runtime>(
             &device_bins,
             &weights,
             n,
-            matrix.n_features(),
+            // The device feature axis is the CONCATENATED `float | one-hot` width
+            // (SPEC-OH-21), not the float count — equal to `matrix.n_features()` on a
+            // float-only pool, so this is byte-unchanged there.
+            device_n_features,
             device_n_bins,
             learning_rate,
             device_scaled_l2,
@@ -3181,7 +4206,195 @@ fn train_inner<R: Runtime>(
         active: device_active,
     };
 
-    for iter in 0..params.iterations {
+    // Poisson exists ONLY as a device sampler (upstream rejects it on the CPU task type and
+    // `bootstrap()` below does the same). If the fit did not actually commit to the device —
+    // a CPU/wgpu build, or any config the coverage gate declined — there is nothing that can
+    // express it, so fail here with the reason rather than let the CPU grower's `bootstrap()`
+    // raise a bare "unsupported" from deep inside the tree loop.
+    if matches!(params.bootstrap_type, EBootstrapType::Poisson) && !device_active {
+        return Err(CbError::Degenerate(
+            "poisson bootstrap is not supported on CPU (upstream CatBoost rejects it on the \
+             CPU task type). It requires the device grow path: build with the `cuda` or \
+             `rocm` backend feature and a device-eligible configuration (grow_policy = \
+             SymmetricTree, random_strength = 0, unit object weights, boost_from_average = \
+             false, Gradient/Simple leaves, no CTR / eval sets / groups)"
+                .to_owned(),
+        ));
+    }
+    // Poisson is drawn device-resident from its own persistent seed buffer, so the host runs
+    // no per-tree sampler and consumes no draws for it — unlike every other bootstrap type,
+    // whose host draw order is load-bearing for upstream parity.
+    let device_poisson =
+        device_active && matches!(params.bootstrap_type, EBootstrapType::Poisson);
+
+    // One approx per LEARNING fold (Plain CTR path — `TFold`/`UpdateLearningFold`,
+    // `train.cpp:585`). Upstream's structure search does NOT read the averaging
+    // fold's derivatives: each learning fold carries its OWN approx, advanced every
+    // iteration over that fold's OWN CTR-bin leaf assignment, and the greedy search
+    // consumes the TAKEN fold's derivatives. With CTRs the fold partition diverges
+    // from the averaging partition from iteration 1 on (structure bins ≠ averaging
+    // bins), so feeding the single averaging approx to the search accumulates drift
+    // until a split choice flips — invisible on the committed 5-iteration CTR
+    // oracles, a >1e-1 prediction divergence by 20 iterations (the
+    // `ctr_borders_multiprior` localization, 2026-08-02). EMPTY on every non-CTR
+    // path (`structure_fold_columns` is empty there), so the float / one-hot /
+    // ordered / grouped paths are structurally byte-identical.
+    let mut fold_approxes: Vec<Vec<f64>> = if structure_fold_columns.is_empty() {
+        Vec::new()
+    } else {
+        vec![approx.clone(); structure_fold_columns.len()]
+    };
+
+    // EXP-DOMAIN approx semantics for `IsStoreExpApprox` losses on the CTR path
+    // (`approx_updater_helpers.h:60-72`; see [`crate::fast_approx`]). Upstream
+    // stores every TRAINING-FOLD approx (learning folds AND the averaging fold)
+    // as `exp(approx)` for these losses, and applies deltas through APPROXIMATE
+    // transcendentals — `fmath::expd_v` per leaf, `fast_exp(FastLogf(·)·lr)` per
+    // document. Their ~1e-6 per-application error feeds the next iteration's
+    // derivatives and moves greedy split scores across tie-break boundaries by
+    // ~10-20 iterations, so an exact-`exp` engine diverges from upstream's
+    // chosen STRUCTURE at iteration scale (the `ctr_borders_multiprior`
+    // localization, verified against an instrumented v1.2.10 build).
+    //
+    // Scope: the cat-CTR path (`structure_fold_columns` non-empty) with the
+    // binclf losses, matching every committed CTR fixture. The float-only /
+    // one-hot Logloss paths keep the exact-`exp` derivative stream — their
+    // committed oracles prove the divergence stays under the 1e-5 gate at their
+    // iteration scale; widening the exp-domain semantics to those paths is a
+    // recorded follow-up, not a silent behavior change here. The model-output
+    // approx (`approx`, upstream's `AvrgApprox`) STAYS linear and exact — only
+    // derivative computation reads the exp-domain buffers.
+    let exp_ctr = !structure_fold_columns.is_empty()
+        && matches!(params.loss, cb_compute::Loss::Logloss | cb_compute::Loss::CrossEntropy)
+        && approx_dimension == 1;
+    // The averaging fold's exp approx (`AveragingFold.BodyTailArr[0].Approx`) —
+    // feeds the LEAF-VALUE derivatives. Initialized like upstream's
+    // `InitApproxes` + `ExpApproxIf` (the fmath batch exp of the starting
+    // approx; `fmath_expd(0) == 1` for the un-biased binclf start).
+    let mut avg_exp_approx: Vec<f64> = if exp_ctr {
+        approx.iter().map(|&a| crate::fast_approx::fmath_expd(a)).collect()
+    } else {
+        Vec::new()
+    };
+    // Learning-fold approxes switch to exp domain under the same gate.
+    if exp_ctr {
+        for fa in &mut fold_approxes {
+            for v in fa.iter_mut() {
+                *v = crate::fast_approx::fmath_expd(*v);
+            }
+        }
+    }
+
+    // `TLearnProgress::UsedCtrSplits` (learn_context.h:108) — the MODEL-LIFETIME
+    // set of `(ctr_type, projection)` pairs some already-grown tree split on.
+    // `GetCatFeatureWeight` lifts the model-size penalty (weight 1.0) for
+    // members; `ProcessCtrSplit` inserts the pair the moment a level chooses a
+    // CTR split (greedy_tensor_search.cpp:926-950, :1126). Accumulated across
+    // the whole fit and passed into every tree's structure search.
+    let mut used_ctr_splits: Vec<(i8, crate::TProjection)> = Vec::new();
+
+    // ORCH-03-S5: snapshot admission. Placed HERE — after every gate local this
+    // guard reads is computed (`device_active` at the device-begin above is the
+    // last of them) and BEFORE the first tree grows — so an out-of-scope regime is
+    // refused without ever writing a file. `snapshot == None` skips the whole block
+    // and leaves the loop byte-identical (the D-04 anchor).
+    let snapshot_state = match snapshot {
+        None => None,
+        Some(cfg) => {
+            snapshot_scope_ok(
+                params,
+                cat_columns,
+                eval_sets,
+                approx_dimension,
+                penalties_active,
+                device_active,
+                staged_out.is_some(),
+                &ranking,
+            )?;
+            let fingerprint =
+                crate::snapshot::fingerprint(params, n, feature_borders, target);
+            Some((cfg, fingerprint))
+        }
+    };
+    // ORCH-03-S6: RESUME. When the configured file already exists and its stored
+    // fingerprint matches this run, the loop-carried state is replaced wholesale
+    // with the checkpoint's and the loop starts at `completed_iters` instead of 0.
+    //
+    // `approx` is taken VERBATIM from the checkpoint rather than rebuilt by
+    // re-applying the persisted trees: re-application would re-associate the
+    // per-iteration floating-point sums, and a resumed run must be BIT-identical to
+    // the straight-through run, not merely close.
+    //
+    // A fingerprint mismatch is an ERROR, never a silent fresh start — the file
+    // belongs to a different configuration, and quietly ignoring it would discard
+    // work the caller believes is being continued.
+    let mut resume_from = 0usize;
+    if let Some((cfg, fingerprint)) = snapshot_state {
+        if cfg.snapshot_file.exists() {
+            let stored = crate::snapshot::read_from(&cfg.snapshot_file)?;
+            crate::snapshot::check_resume(stored.fingerprint, fingerprint)?;
+
+            // Both are deterministic functions of the fingerprinted inputs, so a
+            // disagreement means the fingerprint failed to cover something — a
+            // silent-corruption bug, not a user error. Fail loudly.
+            if stored.approx_dimension != approx_dimension {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot approx_dimension {} != this run's {approx_dimension} despite a \
+                     matching fingerprint",
+                    stored.approx_dimension
+                )));
+            }
+            if stored.approx.len() != approx.len() {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot approx has {} values, this run has {} objects despite a matching \
+                     fingerprint",
+                    stored.approx.len(),
+                    approx.len()
+                )));
+            }
+            if stored.completed_iters > params.iterations {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot holds {} completed iterations, more than this run's {} — nothing \
+                     to resume",
+                    stored.completed_iters, params.iterations
+                )));
+            }
+            if stored.trees.len() != stored.completed_iters {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot claims {} completed iterations but carries {} trees",
+                    stored.completed_iters,
+                    stored.trees.len()
+                )));
+            }
+
+            // `bias` is `starting_approx(params, target)` — a pure function of the
+            // fingerprinted `loss` / `boost_from_average` / `target`. It is
+            // therefore VERIFIED against the checkpoint rather than restored from
+            // it: a disagreement means the fingerprint failed to cover an input
+            // that moves the starting approximant, which is a silent-corruption
+            // bug. Compared on bits, since this must be exact, not close.
+            if stored.bias.to_bits() != bias.to_bits() {
+                return Err(CbError::Snapshot(format!(
+                    "snapshot bias {} != this run's {bias} despite a matching fingerprint",
+                    stored.bias
+                )));
+            }
+
+            trees = stored.trees.iter().map(crate::snapshot::tree_from_dto).collect();
+            approx = stored.approx;
+            rng = cb_core::TFastRng64::from_raw_state(stored.rng_raw_state, stored.rng_call_count);
+            resume_from = stored.completed_iters;
+        }
+    }
+
+    // Interval accounting for the periodic write. Seeded at the loop start so the
+    // FIRST checkpoint also honours `snapshot_interval` (a zero interval writes at
+    // every tree, which is what the deterministic tests use).
+    let mut last_snapshot_write = std::time::Instant::now();
+
+    // `resume_from` is 0 unless a checkpoint was just restored, so the non-snapshot
+    // path keeps the original `0..iterations` bound byte-for-byte (the D-04 anchor).
+    for iter in resume_from..params.iterations {
         // GPUT-01 DEVICE GROW BRANCH (D-10-01 per-fit all-or-nothing). When the fit
         // committed to the device path at `begin` (`device_active`), grow THIS
         // iteration's oblivious tree on the device seam and fold it into the Model
@@ -3192,8 +4405,85 @@ fn train_inner<R: Runtime>(
         // it, so it is not a dead binding.
         if device_active {
             let _ = iter;
+
+            // ─── WR-01: PER-TREE HOST BOOTSTRAP (Design A) ───────────────────────────
+            // The device branch keeps the ENTIRE sampler on the host: `bootstrap()` is the
+            // ≤1e-5-verified CPU sampler and the sole source of `sample_weights`/`control`,
+            // so reusing it (rather than the device-resident draw) is what makes upstream
+            // parity reachable at all. Only the resulting per-object multiplier crosses the
+            // seam. The draw ORDER here is IDENTICAL to the CPU branch's — `PRE_TREE_DRAWS`
+            // → `bootstrap()` → the level-search draws (replayed after the grow below) →
+            // `POST_TREE_EXTRA_DRAWS` — because tree `k+1`'s sample is drawn from the phase
+            // tree `k` left behind, so any miscount silently changes every later tree's
+            // sample (`WR01-S7`).
+            let device_sample: Vec<f64> = if draws_active && !device_poisson {
+                // 1a. PRE-bootstrap per-iteration draws (train.cpp:208,211).
+                for _ in 0..PRE_TREE_DRAWS {
+                    rng.gen_rand();
+                }
+                // `bootstrap()` takes the OBJECT COUNT from `derivatives.len()`, so this
+                // vector's LENGTH is load-bearing for every arm even when its VALUES are
+                // not: a short vector silently yields an empty sample (⇒ the multiplier
+                // defaults to 1.0 everywhere AND the arm consumes no draws, desynchronising
+                // the stream). It must always be length `n`.
+                //
+                // MVS is the only arm that reads the VALUES (its threshold is a function of
+                // `|der|`), so the gradient round-trip is paid only when MVS is selected —
+                // Bayesian reads just `n` (`generate_random_weights`) and Bernoulli just `n`
+                // (`set_sampled_control`), so a zero-filled vector is exactly equivalent for
+                // them and keeps the hot device path free of an extra n-length pass.
+                //
+                // At `approx_dimension == 1` with the unit weights the gate requires, the
+                // CPU's `der_obj[i] = sqrt(Σ_d weighted_der1²)` collapses to `|der1[i]|`.
+                let der_obj: Vec<f64> = if matches!(params.bootstrap_type, EBootstrapType::Mvs) {
+                    let ders =
+                        runtime.compute_gradients(&params.loss, &approx, target, approx_dimension)?;
+                    (0..n)
+                        .map(|i| ders.der1.get(i).copied().unwrap_or(0.0).abs())
+                        .collect()
+                } else {
+                    vec![0.0_f64; n]
+                };
+                // 1b. The ONE per-tree `bootstrap()` call on the continuous stream.
+                // `prev_leaf_mean_l2` is this fit's carried MVS λ input (`WR01-S8`) — it is
+                // `None` on the first tree and the previous tree's mean leaf L2 norm after.
+                let sampled = bootstrap(
+                    params.bootstrap_type,
+                    &der_obj,
+                    params.subsample,
+                    params.bagging_temperature,
+                    prev_leaf_mean_l2,
+                    &mut rng,
+                )?;
+                // The per-object SPLIT-SCORING multiplier (`WR01-S6`): exactly the CPU
+                // branch's `control[i] ? sample_weights[i] : 0.0`. A zeroed entry excludes
+                // the object from the split histogram, which is how a `control == false`
+                // object drops out of upstream's `sampledDocs`. Leaf estimation on the
+                // device consumes the UNSAMPLED channels, mirroring the CPU split.
+                (0..n)
+                    .map(|i| {
+                        let sw = sampled.sample_weights.get(i).copied().unwrap_or(1.0);
+                        let c = sampled.control.get(i).copied().unwrap_or(true);
+                        if c {
+                            sw
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            } else {
+                // `bootstrap_type == No` and `random_strength == 0`: no sampling, no draws.
+                // An EMPTY sample keeps the device grow byte-identical to the pre-WR-01
+                // path (`WR01-S3`, D-04).
+                Vec::new()
+            };
+
+            // The stored (learning-rate-scaled) leaf values of THIS tree, captured by the
+            // fold arms below so the MVS λ carry after them has something to read.
+            let mut device_stored_leaf_values: Vec<f64> = Vec::new();
+
             let dev_tree = runtime
-                .grow_tree_on_device(&approx, target)?
+                .grow_tree_on_device(&approx, target, &device_sample)?
                 .ok_or_else(|| {
                     // `begin` returned Ok(true): the whole fit is committed to the
                     // device grower (D-10-01). Folding a CPU-grown tree here would MIX
@@ -3295,6 +4585,10 @@ fn train_inner<R: Runtime>(
                     region_n_leaves,
                     /* approx_dimension = */ 1,
                 );
+                // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
+                // per-tree MVS λ carry after the fold arms can compute this tree's mean
+                // leaf L2 norm, exactly as the CPU branch does.
+                device_stored_leaf_values.clone_from(&device_leaf_values);
 
                 for (i, &leaf) in device_leaf_of.iter().enumerate() {
                     if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
@@ -3319,10 +4613,44 @@ fn train_inner<R: Runtime>(
                 // `border = feature_borders[feature][bin_id]` (Pattern 4). Range-check
                 // `bin_id` (T-10-22): an out-of-range index is a typed error, never a
                 // panic / raw index. `DeviceGrownTree.leaf_of` is NOT consumed (D-05).
+                // SPEC-OH-24: the device feature axis is the CONCATENATION
+                // `float | one-hot` (T24's layout), so a device index `>= device_n_float`
+                // is one-hot column `idx - device_n_float`. Map it back to the ABSOLUTE
+                // cat-column index through `one_hot_absolute` (the inverse of the layout)
+                // and emit a `LevelKind::OneHot` + `OneHotSplit` instead of a float
+                // `Split`. `level_kinds` stays EMPTY when every level is float, so the
+                // float-only fold is byte-identical (SPEC-OH-31).
                 let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
-                for &(feature, bin_id) in &dev_tree.splits {
+                let mut device_one_hot_splits: Vec<crate::tree::OneHotSplit> = Vec::new();
+                let mut device_level_kinds: Vec<crate::tree::LevelKind> = Vec::new();
+                let device_has_one_hot = dev_tree.splits.iter().any(|&(_, _, oh)| oh);
+                for &(feature, bin_id, is_one_hot) in &dev_tree.splits {
                     let f = feature as usize;
                     let b = bin_id as usize;
+                    if is_one_hot {
+                        let pos = f.checked_sub(device_n_float).ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device one-hot split names device feature {f}, which is \
+                                 below the float boundary {device_n_float} (internal \
+                                 invariant: pass B sweeps only [{device_n_float}, ..))"
+                            ))
+                        })?;
+                        let absolute = one_hot_absolute.get(pos).copied().ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "device one-hot split names one-hot column {pos}, but only \
+                                 {} column(s) were routed one-hot",
+                                one_hot_absolute.len()
+                            ))
+                        })?;
+                        device_level_kinds.push(crate::tree::LevelKind::OneHot(
+                            device_one_hot_splits.len(),
+                        ));
+                        device_one_hot_splits.push(crate::tree::OneHotSplit {
+                            feature: absolute,
+                            value: bin_id,
+                        });
+                        continue;
+                    }
                     let border = feature_borders
                         .get(f)
                         .and_then(|borders| borders.get(b))
@@ -3335,6 +4663,10 @@ fn train_inner<R: Runtime>(
                                 feature_borders.get(f).map_or(0, Vec::len),
                             ))
                         })?;
+                    if device_has_one_hot {
+                        device_level_kinds
+                            .push(crate::tree::LevelKind::Float(device_splits.len()));
+                    }
                     device_splits.push(Split { feature: f, border });
                 }
 
@@ -3343,20 +4675,74 @@ fn train_inner<R: Runtime>(
                 // oblivious path uses; D-05). The split columns are resolved ONCE outside
                 // the object loop and the leaf bits set directly (no per-object Vec<bool>
                 // allocation — this loop runs n times per boosting iteration).
-                let split_cols: Vec<(&[f32], f64)> = device_splits
-                    .iter()
-                    .map(|s| {
-                        (
-                            feature_values.get(s.feature).map_or(&[][..], Vec::as_slice),
-                            s.border,
-                        )
-                    })
-                    .collect();
+                //
+                // SPEC-OH-24: with one-hot levels present the LEVEL order is what fixes
+                // each bit, so the per-level column + test are resolved from
+                // `device_level_kinds` — a float level keeps the `value > border` test,
+                // a one-hot level uses `cat_bin == value` over the ONE-HOT bin column (by
+                // one-hot POSITION, which is the device index minus the float boundary).
+                // With no one-hot level `device_level_kinds` is empty and this collapses
+                // to the byte-identical float-only loop.
+                enum DeviceLevelCol<'a> {
+                    Float(&'a [f32], f64),
+                    OneHot(&'a [u32], u32),
+                }
+                let level_cols: Vec<DeviceLevelCol<'_>> = if device_has_one_hot {
+                    device_level_kinds
+                        .iter()
+                        .map(|kind| match kind {
+                            crate::tree::LevelKind::OneHot(idx) => {
+                                let s = device_one_hot_splits.get(*idx);
+                                let pos = s.and_then(|s| {
+                                    one_hot_absolute.iter().position(|&a| a == s.feature)
+                                });
+                                DeviceLevelCol::OneHot(
+                                    pos.and_then(|p| one_hot_bins.get(p))
+                                        .map_or(&[][..], Vec::as_slice),
+                                    s.map_or(u32::MAX, |s| s.value),
+                                )
+                            }
+                            crate::tree::LevelKind::Float(idx) => {
+                                let s = device_splits.get(*idx);
+                                DeviceLevelCol::Float(
+                                    s.and_then(|s| feature_values.get(s.feature))
+                                        .map_or(&[][..], Vec::as_slice),
+                                    s.map_or(f64::INFINITY, |s| s.border),
+                                )
+                            }
+                            // A device-grown oblivious tree never carries a CTR level
+                            // (host eligibility excludes CTR pools entirely), so this arm
+                            // is unreachable; route it to a never-passing float test
+                            // rather than fabricating a split.
+                            crate::tree::LevelKind::Ctr { .. } => {
+                                DeviceLevelCol::Float(&[][..], f64::INFINITY)
+                            }
+                        })
+                        .collect()
+                } else {
+                    device_splits
+                        .iter()
+                        .map(|s| {
+                            DeviceLevelCol::Float(
+                                feature_values.get(s.feature).map_or(&[][..], Vec::as_slice),
+                                s.border,
+                            )
+                        })
+                        .collect()
+                };
                 let device_leaf_of: Vec<usize> = (0..n)
                     .map(|obj| {
                         let mut leaf = 0usize;
-                        for (l, (col, border)) in split_cols.iter().enumerate() {
-                            if col.get(obj).is_some_and(|&v| f64::from(v) > *border) {
+                        for (l, col) in level_cols.iter().enumerate() {
+                            let passes = match col {
+                                DeviceLevelCol::Float(values, border) => values
+                                    .get(obj)
+                                    .is_some_and(|&v| f64::from(v) > *border),
+                                DeviceLevelCol::OneHot(bins, value) => {
+                                    bins.get(obj).is_some_and(|&b| b == *value)
+                                }
+                            };
+                            if passes {
                                 leaf |= 1usize << l;
                             }
                         }
@@ -3378,6 +4764,10 @@ fn train_inner<R: Runtime>(
                     n_leaves,
                     /* approx_dimension = */ 1,
                 );
+                // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
+                // per-tree MVS λ carry after the fold arms can compute this tree's mean
+                // leaf L2 norm, exactly as the CPU branch does.
+                device_stored_leaf_values.clone_from(&device_leaf_values);
 
                 for (i, &leaf) in device_leaf_of.iter().enumerate() {
                     if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
@@ -3389,12 +4779,18 @@ fn train_inner<R: Runtime>(
                     out.extend_from_slice(&approx);
                 }
 
-                trees.push(ObliviousTree {
-                    splits: device_splits,
-                    ctr_splits: Vec::new(),
-                    leaf_values: device_leaf_values,
-                    leaf_weights: device_leaf_weights,
-                });
+                // `level_kinds` stays EMPTY when the device tree is single-kind (float
+                // only) — consumers then take the byte-identical legacy path
+                // (SPEC-OH-31). It is populated ONLY when a one-hot level is present, in
+                // which case it carries the full LEVEL ORDER (SPEC-OH-01/24).
+                trees.push(oblivious_from_grown(
+                    device_splits,
+                    Vec::new(),
+                    device_one_hot_splits,
+                    device_level_kinds,
+                    device_leaf_values,
+                    device_leaf_weights,
+                ));
             } else {
                 // ─── NON-SYMMETRIC ARM (Depthwise / Lossguide, GPUT-18) ───
                 // The device emits a PER-NODE `(feature, bin_id)` in `dev_tree.splits`
@@ -3404,7 +4800,9 @@ fn train_inner<R: Runtime>(
                 // nodes (step `(0,0)`) get an inert `Split` that the walk never reads for
                 // routing (its diffs are zero → the node is a halt point).
                 let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
-                for (node, &(feature, bin_id)) in dev_tree.splits.iter().enumerate() {
+                // SPEC-OH-24: the non-symmetric growers are OUT OF SCOPE for one-hot, so
+                // the kind is always `false` here and is deliberately ignored.
+                for (node, &(feature, bin_id, _one_hot)) in dev_tree.splits.iter().enumerate() {
                     let is_leaf = dev_tree
                         .step_nodes
                         .get(node)
@@ -3461,6 +4859,10 @@ fn train_inner<R: Runtime>(
                     nonsym_n_leaves,
                     /* approx_dimension = */ 1,
                 );
+                // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
+                // per-tree MVS λ carry after the fold arms can compute this tree's mean
+                // leaf L2 norm, exactly as the CPU branch does.
+                device_stored_leaf_values.clone_from(&device_leaf_values);
 
                 for (i, &leaf) in device_leaf_of.iter().enumerate() {
                     if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
@@ -3480,6 +4882,33 @@ fn train_inner<R: Runtime>(
                     leaf_weights: device_leaf_weights,
                 });
             }
+
+            // ─── WR-01: RESTORE THE RNG PHASE + CARRY THE MVS λ ──────────────────────
+            // The device grow skipped the CPU level search entirely, so the draws that
+            // search would have consumed must be replayed here — otherwise the NEXT tree's
+            // `bootstrap()` call above would read a different RNG phase than upstream and
+            // every tree from the second on would diverge (`WR01-S7`). The replay must land
+            // AFTER `bootstrap()` and BEFORE `POST_TREE_EXTRA_DRAWS` to reproduce the CPU
+            // branch's order exactly. `draws_active == false` keeps this a no-op, so the
+            // byte-unchanged `bootstrap_type = No` device path is untouched (D-04).
+            //
+            // Poisson is excluded for the same reason it skips `bootstrap()` above: its
+            // randomness lives entirely in the device seed buffer, this host stream feeds
+            // nothing on that arm, and there is no upstream CPU phase to stay aligned with.
+            if draws_active && !device_poisson {
+                replay_grow_draws(&mut rng, params.depth, matrix.n_features());
+                for _ in 0..POST_TREE_EXTRA_DRAWS {
+                    rng.gen_rand();
+                }
+            }
+
+            // MVS λ for the NEXT tree is THIS tree's mean leaf L2 norm
+            // (`CalculateLastIterMeanLeafValue`, mvs.cpp:21-35) over the stored,
+            // learning-rate-scaled leaf values — the same source and the same helper the
+            // CPU branch uses (`WR01-S8`). Carried unconditionally so the device branch's
+            // λ sequence matches the CPU branch's for every bootstrap type.
+            prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&device_stored_leaf_values));
+
             continue;
         }
 
@@ -3552,6 +4981,12 @@ fn train_inner<R: Runtime>(
                 }
             }
         }
+        // STRUCTURE-fold cycling (Task 4): THIS iteration's learning fold.
+        // `taken_fold = struct_fold_cycle[iter]` (defaulting to 0); hoisted above
+        // the derivative computation because the SEARCH derivatives come from the
+        // taken fold's own approx (fold-approx semantics, see `fold_approxes`).
+        let taken_fold = struct_fold_cycle.get(iter).copied().unwrap_or(0);
+
         // 1. Per-object derivatives (UN-reduced; D-02) via the runtime kernel.
         //    `approx` is the DIMENSION-MAJOR flat buffer `approx[d*n+i]` of length
         //    `approx_dimension * n` (Plan 06.2-02). The backend runs an OUTER
@@ -3594,6 +5029,21 @@ fn train_inner<R: Runtime>(
                     der1.len(),
                     der2.len()
                 )));
+            }
+            Derivatives { der1, der2 }
+        } else if exp_ctr {
+            // LEAF-VALUE derivatives from the AVERAGING fold's EXP-domain approx
+            // (`CalcApproxesLeafwise` reads `AveragingFold.BodyTailArr[0].Approx`,
+            // which upstream stores as exp for these losses and advances through
+            // the approximate `fmath::expd_v` pipeline — see `avg_exp_approx`).
+            // The linear `approx` stays the metrics/output stream (AvrgApprox).
+            let mut der1 = Vec::with_capacity(n);
+            let mut der2 = Vec::with_capacity(n);
+            for (i, &e) in avg_exp_approx.iter().enumerate() {
+                let t = target.get(i).copied().unwrap_or(0.0);
+                let (d1, d2) = crate::fast_approx::logloss_ders_exp(e, t);
+                der1.push(d1);
+                der2.push(d2);
             }
             Derivatives { der1, der2 }
         } else {
@@ -3642,6 +5092,49 @@ fn train_inner<R: Runtime>(
                 .collect()
         };
 
+        // FOLD-APPROX SEARCH DERIVATIVES (Plain CTR path). The structure search —
+        // and everything scoped to it: the bootstrap/MVS per-object der, the
+        // sampled score buffers, and the random-strength score std-dev
+        // (`CalcDerivativesStDevFromZeroPlainBoosting` reads the fold passed to
+        // `GreedyTensorSearch`) — consumes the TAKEN learning fold's derivatives,
+        // computed from that fold's own approx. The LEAF path below keeps the
+        // averaging `ders`/`weighted_der1` untouched. `fold_approxes` is empty on
+        // every non-CTR path and the grouped seam never co-occurs with CTR
+        // candidates, so `search_weighted_der1` aliases `weighted_der1` there —
+        // byte-identical.
+        let search_ders_owned: Option<Derivatives> = match fold_approxes.get(taken_fold) {
+            Some(fold_approx) if group_spans.is_none() => Some(if exp_ctr {
+                // `CalcWeightedDerivatives` on the fold's EXP-domain approx:
+                // `p = 1 - 1/(1+e)` (the upstream rounding order, see
+                // `fast_approx::logloss_ders_exp`).
+                let mut der1 = Vec::with_capacity(n);
+                let mut der2 = Vec::with_capacity(n);
+                for (i, &e) in fold_approx.iter().enumerate() {
+                    let t = target.get(i).copied().unwrap_or(0.0);
+                    let (d1, d2) = crate::fast_approx::logloss_ders_exp(e, t);
+                    der1.push(d1);
+                    der2.push(d2);
+                }
+                Derivatives { der1, der2 }
+            } else {
+                runtime.compute_gradients(&params.loss, fold_approx, target, approx_dimension)?
+            }),
+            _ => None,
+        };
+        let search_weighted_der1_owned: Option<Vec<f64>> = search_ders_owned.as_ref().map(|sd| {
+            sd.der1
+                .iter()
+                .enumerate()
+                .map(|(idx, &d)| {
+                    let i = idx % n;
+                    let w = weights.get(i).copied().unwrap_or(1.0);
+                    d * w
+                })
+                .collect()
+        });
+        let search_weighted_der1: &[f64] =
+            search_weighted_der1_owned.as_deref().unwrap_or(&weighted_der1);
+
         // EFFECTIVE histogram / leaf weight (LOSS-04, 06.3-09): for a
         // pairwise-loss (`UsesPairsForCalculation` — PairLogit / PairLogitPairwise /
         // YetiRank{,Pairwise}) the split-scoring histogram `sumWeight` and the
@@ -3679,11 +5172,14 @@ fn train_inner<R: Runtime>(
         // already has length `n`, so the scalar bootstrap/MVS inputs are
         // byte-identical to before (D-04). The per-dim squares route through the
         // sanctioned ordered `sum_f64` (D-08).
+        // Fold-approx semantics: the bootstrap/MVS input is the SEARCH (taken
+        // learning fold) derivative — `search_weighted_der1` aliases
+        // `weighted_der1` on every non-CTR path.
         let der_obj: Vec<f64> = (0..n)
             .map(|i| {
                 let squares: Vec<f64> = (0..approx_dimension)
                     .map(|d| {
-                        let v = weighted_der1.get(d * n + i).copied().unwrap_or(0.0);
+                        let v = search_weighted_der1.get(d * n + i).copied().unwrap_or(0.0);
                         v * v
                     })
                     .collect();
@@ -3732,7 +5228,7 @@ fn train_inner<R: Runtime>(
         // (tensor_search_helpers.cpp:468-472 — the same per-object weight the
         // leaf path already shares). At `approx_dimension == 1`, `idx % n == idx`
         // so this is byte-identical to the prior per-object zip (D-04).
-        let score_weighted_der1: Vec<f64> = weighted_der1
+        let score_weighted_der1: Vec<f64> = search_weighted_der1
             .iter()
             .enumerate()
             .map(|(idx, &d)| {
@@ -3797,14 +5293,33 @@ fn train_inner<R: Runtime>(
         // `eff_weights`, `scoring.cpp:276-279`), never the L2 scaling. `docCount`
         // stays `n`. For every non-pairwise loss this is byte-identical (D-04).
         let scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
-        let perturb = if perturb_active {
+        // Widened from `perturb_active` to `draws_active` (2026-07-30, real
+        // instrumented-upstream ground truth — see the `POST_TREE_EXTRA_DRAWS`
+        // doc comment and `.planning/plans/bayesian-rng-draw-accounting/
+        // instrumented-ground-truth/GROUND_TRUTH.md`): upstream's per-level RSM
+        // reselection + `SelectBestCandidate` draws happen UNCONDITIONALLY
+        // whenever sampling is active, even at `random_strength == 0`
+        // (`score_st_dev = 0.0` then makes the perturbation a numeric no-op —
+        // `val + std_normal(rng) * 0.0 == val` — so the CHOSEN split/leaf is
+        // unaffected; only the RNG phase entering the NEXT tree's `Bootstrap`
+        // call changes). When `draws_active` is false (bootstrap_type=No AND
+        // random_strength=0) `perturb` stays `None` and the search remains the
+        // byte-identical, zero-draw first-slice path — untouched.
+        let perturb = if draws_active {
             let model_length = iter as f64 * learning_rate;
             // CR-02: std-dev sums `wd²` over the FULL dim-major buffer but
             // divides by the per-OBJECT count `n` (NOT `dim*n`); the `ln(n)`
             // model-size multiplier likewise uses `n` (greedy_tensor_search.cpp:
             // 106, 125). At dim=1, `weighted_der1.len() == n` so this is
             // byte-identical to the prior call (D-04).
-            let std_dev = score_st_dev(params.random_strength, &weighted_der1, n, model_length);
+            let std_dev = if perturb_active {
+                // Fold-approx semantics: the score std-dev reads the fold handed
+                // to the search (`CalcDerivativesStDevFromZeroPlainBoosting`) —
+                // aliases `weighted_der1` on every non-CTR path.
+                score_st_dev(params.random_strength, search_weighted_der1, n, model_length)
+            } else {
+                0.0
+            };
             Some(Perturbation {
                 rng: &mut rng,
                 score_st_dev: std_dev,
@@ -3819,12 +5334,12 @@ fn train_inner<R: Runtime>(
         // false for them and they keep their exact previous dispatch.
         let has_ctr = !materialized_ctr_features.is_empty();
         // STRUCTURE-fold cycling (Task 4): select THIS iteration's learning fold's
-        // structure CTR columns. `taken_fold = struct_fold_cycle[iter]` (defaulting
-        // to 0). For learning_folds==1 the cycle is all-zeros, so this is always
+        // structure CTR columns (`taken_fold` was hoisted above the derivative
+        // computation — the search derivatives come from that fold's approx). For
+        // learning_folds==1 the cycle is all-zeros, so this is always
         // `structure_fold_columns[0]` == the prior fixed `materialized_ctr_features`
         // (byte-identical). For pc=4 it cycles `[0,2,0,2,2]`, materializing the tree
         // STRUCTURE under fold 0 (borders [7,2]) or fold 2 (borders [3,7]) per iter.
-        let taken_fold = struct_fold_cycle.get(iter).copied().unwrap_or(0);
         let iter_ctr_features: &[crate::ctr::CtrFeatureColumn] = structure_fold_columns
             .get(taken_fold)
             .map_or(materialized_ctr_features.as_slice(), Vec::as_slice);
@@ -3921,12 +5436,17 @@ fn train_inner<R: Runtime>(
                 &matrix,
                 iter_ctr_features,
                 ctr_border_count,
-                &weighted_der1,
-                &weights,
+                // FOLD-APPROX SEMANTICS: the structure search consumes the TAKEN
+                // learning fold's derivatives (`search_weighted_der1`), sampled/
+                // masked exactly like the float arm (`score_weighted_der1` is
+                // built FROM the search der above). At bootstrap_type=No +
+                // random_strength=0 — every committed CTR fixture — the mask is
+                // an element-wise no-op, so this equals the fold der verbatim.
+                &score_weighted_der1,
+                &score_weights,
                 scaled_l2,
                 params.depth,
                 n,
-                0,
                 // model_size_reg cat-feature weight (GetCatFeatureWeight): the
                 // default 0.5 down-weights high-cardinality (combination) CTR
                 // candidates so a new {0,1} combination does not out-score a second
@@ -3934,6 +5454,7 @@ fn train_inner<R: Runtime>(
                 model_size_reg_default(),
                 params.score_function,
                 &cat_eligible_buckets,
+                &used_ctr_splits,
             )?
         } else {
             match ordered_learning_perm.as_deref() {
@@ -3994,6 +5515,18 @@ fn train_inner<R: Runtime>(
             }
             }
         };
+
+        // `ProcessCtrSplit` (greedy_tensor_search.cpp:1126): every CTR split
+        // this tree chose enters the model-lifetime `UsedCtrSplits` set, so the
+        // NEXT tree's `GetCatFeatureWeight` scores the pair at weight 1.0
+        // (within-tree lifting is handled inside `select_level_ctr_aware` off
+        // `chosen`). De-duplicated — the set semantics of the upstream THashSet.
+        for spec in &grown.ctr_splits {
+            let key = (spec.ctr_type, spec.projection.clone());
+            if !used_ctr_splits.contains(&key) {
+                used_ctr_splits.push(key);
+            }
+        }
 
         // Per-tree leaf count: a non-symmetric leaf-wise tree has a DISTINCT leaf
         // count (number of terminal nodes), NOT `2^depth`. Shadow `n_leaves` for the
@@ -4169,7 +5702,7 @@ fn train_inner<R: Runtime>(
         // (byte-identical to before — the numeric / one-hot / ordered oracles are
         // provably unaffected by the gate below).
         let leaf_value_leaf_of: Vec<usize> = if has_ctr {
-            assign_leaf_of_averaging(&matrix, &averaging_ctr_features, &grown, n)
+            assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown, n)
         } else {
             grown.leaf_of.clone()
         };
@@ -4434,6 +5967,161 @@ fn train_inner<R: Runtime>(
             }
         }
 
+        // AVERAGING-FOLD EXP-APPROX UPDATE (`UpdateLearnAvrgApprox`,
+        // `approx_updater_helpers.cpp:24-48`): `avrgFoldApprox[i] *=
+        // expTreeDelta[leaf]`, where `expTreeDelta = ExpApproxIf(treeDelta)` —
+        // the fmath batch exp of the POST-NormalizeLeafValues (learning-rate-
+        // scaled) per-leaf tree values. The linear `approx` update above is
+        // upstream's `AvrgApprox += treeDelta[leaf]` — both run, feeding
+        // different consumers (ders vs metrics/output).
+        if exp_ctr {
+            let exp_tree_delta: Vec<f64> = leaf_values
+                .iter()
+                .map(|&v| crate::fast_approx::fmath_expd(v))
+                .collect();
+            for (i, &leaf) in leaf_value_leaf_of.iter().enumerate() {
+                if let (Some(a), Some(&factor)) =
+                    (avg_exp_approx.get_mut(i), exp_tree_delta.get(leaf))
+                {
+                    *a *= factor;
+                }
+            }
+        }
+
+        // FOLD-APPROX UPDATE (`UpdateLearningFold`, `train.cpp:585` — Plain CTR
+        // path). EVERY learning fold advances its own approx each iteration (not
+        // only the taken one): leaf deltas are re-estimated over the FOLD's own
+        // CTR-bin leaf assignment (the taken fold's is exactly `grown.leaf_of`;
+        // the others reassign against their fold's columns) and the FOLD's own
+        // PRE-update derivatives, then normalized and learning-rate-scaled
+        // identically to the model deltas. The monotone post-pass is not
+        // replicated: monotone constraints never co-occur with the CTR path in
+        // scope. `fold_approxes` is empty on every non-CTR path, so this whole
+        // block is a structural no-op there.
+        if !fold_approxes.is_empty() && group_spans.is_none() {
+            for (j, fold_approx) in fold_approxes.iter_mut().enumerate() {
+                let fold_leaf_of: Vec<usize> = if j == taken_fold {
+                    grown.leaf_of.clone()
+                } else {
+                    structure_fold_columns.get(j).map_or_else(
+                        || grown.leaf_of.clone(),
+                        |cols| assign_leaf_over_ctr_columns(&matrix, cols, &grown, n),
+                    )
+                };
+                // The taken fold's pre-update derivatives were already computed
+                // for the search — reuse them; the other folds compute theirs
+                // here (still pre-update: this fold's approx is untouched so far
+                // this iteration).
+                let fold_ders_recomputed: Derivatives;
+                let fold_ders: &Derivatives = match (&search_ders_owned, j == taken_fold) {
+                    (Some(sd), true) => sd,
+                    _ => {
+                        fold_ders_recomputed = if exp_ctr {
+                            // This fold's approx is EXP-domain under `exp_ctr` —
+                            // same der form as the search ders above.
+                            let mut der1 = Vec::with_capacity(n);
+                            let mut der2 = Vec::with_capacity(n);
+                            for (i, &e) in fold_approx.iter().enumerate() {
+                                let t = target.get(i).copied().unwrap_or(0.0);
+                                let (d1, d2) = crate::fast_approx::logloss_ders_exp(e, t);
+                                der1.push(d1);
+                                der2.push(d2);
+                            }
+                            Derivatives { der1, der2 }
+                        } else {
+                            runtime.compute_gradients(
+                                &params.loss,
+                                fold_approx,
+                                target,
+                                approx_dimension,
+                            )?
+                        };
+                        &fold_ders_recomputed
+                    }
+                };
+                let fold_weighted_der1: Vec<f64> = fold_ders
+                    .der1
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &d1)| {
+                        let i = idx % n;
+                        let w = weights.get(i).copied().unwrap_or(1.0);
+                        d1 * w
+                    })
+                    .collect();
+                let fold_leaf_weights = accumulate_leaf_weights(&fold_leaf_of, &weights, n_leaves);
+                let mut fold_leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
+                for d in 0..approx_dimension {
+                    let der1_d = fold_weighted_der1.get(d * n..(d + 1) * n).unwrap_or(&[]);
+                    let der2_d = fold_ders.der2.get(d * n..(d + 1) * n).unwrap_or(&[]);
+                    let approx_d = fold_approx.get(d * n..(d + 1) * n).unwrap_or(&[]);
+                    let deltas = compute_leaf_deltas(
+                        params.leaf_method,
+                        &params.loss,
+                        &fold_leaf_of,
+                        der1_d,
+                        der2_d,
+                        // Pointwise path only (the grouped seam is gated out
+                        // above): the leaf weight is the per-object weight.
+                        &weights,
+                        approx_d,
+                        target,
+                        scaled_l2,
+                        n_leaves,
+                        d,
+                    );
+                    fold_leaf_values.extend_from_slice(&deltas);
+                }
+                if exp_ctr {
+                    // `UpdateApproxDeltas` + `UpdateBodyTailApprox` for an
+                    // EXP-stored fold (`approx_calcer.cpp:83-117`,
+                    // `approx_updater_helpers.h:20-37`): the RAW leaf deltas
+                    // (no learning rate, no normalize) are exp-ified per LEAF
+                    // via the fmath batch exp, then each document's fold approx
+                    // is multiplied by
+                    // `fast_exp(FastLogf(expLeafDelta) * learning_rate)` — the
+                    // approximate per-doc pipeline whose error is load-bearing
+                    // for structure parity (see `fast_approx`). Logloss is
+                    // non-pairwise, so upstream's fold update applies no
+                    // centering — dropping `normalize_leaf_values` here loses
+                    // only its learning-rate scale, which `ApplyLearningRate`
+                    // supplies instead.
+                    let exp_leaf_deltas: Vec<f64> = fold_leaf_values
+                        .iter()
+                        .map(|&v| crate::fast_approx::fmath_expd(v))
+                        .collect();
+                    for (i, &leaf) in fold_leaf_of.iter().enumerate() {
+                        if let (Some(a), Some(&ed)) =
+                            (fold_approx.get_mut(i), exp_leaf_deltas.get(leaf))
+                        {
+                            *a *= crate::fast_approx::apply_learning_rate_exp(ed, learning_rate);
+                        }
+                    }
+                } else {
+                    normalize_leaf_values(
+                        uses_pairwise_weights(&params.loss),
+                        learning_rate,
+                        &fold_leaf_weights,
+                        &mut fold_leaf_values,
+                        n_leaves,
+                        approx_dimension,
+                    );
+                    for d in 0..approx_dimension {
+                        let approx_base = d * n;
+                        let leaf_base = d * n_leaves;
+                        for (i, &leaf) in fold_leaf_of.iter().enumerate() {
+                            if let (Some(a), Some(&lv)) = (
+                                fold_approx.get_mut(approx_base + i),
+                                fold_leaf_values.get(leaf_base + leaf),
+                            ) {
+                                *a += lv;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // YetiRank LEARNING-fold approx update (D-07, 06.3-14 ext): the learning
         // fold (fold 0, drives the NEXT tree's gradient/structure) carries its OWN
         // approx, updated by a SEPARATE leaf-value recalc over the LEARNING-fold
@@ -4545,31 +6233,21 @@ fn train_inner<R: Runtime>(
             out.extend_from_slice(&approx);
         }
 
-        // POST per-tree draws. Two distinct main-RNG consumers run AFTER the tree
-        // structure is grown:
-        //   (a) the per-level `CalcScores` randSeed (greedy_tensor_search.cpp:884)
-        //       — ONE `Rand.GenRand()` per level; and
-        //   (b) the leaf-estimation seed (train.cpp:303,
-        //       `GenRandUI64Vector(foldCount, Rand.GenRand())`) — ONE
-        //       `Rand.GenRand()` per TREE, drawn once the tree is built.
-        // When the perturbation is OFF but sampling is on, (a) is not observable
-        // individually, so the prior wave folds (a)+(b) into a single bulk
-        // `depth + 1` advance that keeps the next tree's Bootstrap phase-aligned.
-        // When the perturbation is ON, the perturbed search ALREADY consumed (a)'s
-        // randSeed AND the `SelectBestCandidate` normal draws inline in exact
-        // upstream order, so only (b) — the single leaf-estimation seed draw —
-        // remains to be consumed here (train.cpp:303). This source-faithful draw
-        // locks the FIRST tree end-to-end (splits + leaf values <= 1e-5); a
-        // per-tree main-RNG phase drift remains for tree-1+ (the variable-length
-        // normal-draw accounting could not be localized at tree granularity
-        // without C++ instrumentation of `LearnProgress->Rand` — escalated to
-        // D-11 / Open Q4, see the regularization oracle test header and SUMMARY).
-        if perturb_active {
+        // POST per-tree draws: the leaf-estimation seed
+        // (`GenRandUI64Vector(foldCount, Rand.GenRand())`-adjacent phase,
+        // train.cpp), `POST_TREE_EXTRA_DRAWS` (= 2) `Rand.GenRand()` calls, once
+        // per tree. This is the ONLY draw source left to consume out-of-line:
+        // the per-level RSM-reselection + `CalcScores` randSeed +
+        // `SelectBestCandidate` draws now all happen INLINE during the grow
+        // above (`perturb` is `Some` whenever `draws_active`, regardless of
+        // `perturb_active` — see its construction above), in exact upstream
+        // order/count, VERIFIED against a real instrumented upstream 1.2.10
+        // build (2026-07-30, `.planning/plans/bayesian-rng-draw-accounting/
+        // instrumented-ground-truth/GROUND_TRUTH.md`). `draws_active == false`
+        // (bootstrap_type=No, random_strength=0) stays the byte-identical
+        // zero-draw first-slice path.
+        if draws_active {
             for _ in 0..POST_TREE_EXTRA_DRAWS {
-                rng.gen_rand();
-            }
-        } else if draws_active {
-            for _ in 0..(params.depth + POST_TREE_EXTRA_DRAWS) {
                 rng.gen_rand();
             }
         }
@@ -4592,7 +6270,13 @@ fn train_inner<R: Runtime>(
         let ctr_splits = if has_ctr {
             grown.ctr_splits.clone()
         } else {
-            ctr_splits_for_tree(&ctr_candidates, &params.combinations_ctr_priors)
+            ctr_splits_for_tree(
+                &ctr_candidates,
+                params.simple_ctr,
+                &params.simple_ctr_priors,
+                params.combinations_ctr,
+                &params.combinations_ctr_priors,
+            )
         };
 
         // FEAT-06 / D-6.6-04: a non-symmetric leaf-wise tree (Lossguide / Depthwise)
@@ -4613,12 +6297,18 @@ fn train_inner<R: Runtime>(
                 leaf_weights,
             });
         } else if grown.step_nodes.is_empty() {
-            trees.push(ObliviousTree {
-                splits: grown.splits,
+            // SPEC-OH-07: carry the grower's ONE-HOT splits and the true per-level
+            // kind order through to the trained tree. A float-only / CTR-only tree
+            // leaves `one_hot_splits` empty and (for float-only) `level_kinds`
+            // empty too, so the persisted tree is byte-identical (SPEC-OH-31).
+            trees.push(oblivious_from_grown(
+                grown.splits,
                 ctr_splits,
+                grown.one_hot_splits,
+                grown.level_kinds,
                 leaf_values,
                 leaf_weights,
-            });
+            ));
         } else {
             non_symmetric_trees.push(NonSymmetricTree {
                 splits: grown.splits,
@@ -4671,6 +6361,31 @@ fn train_inner<R: Runtime>(
                 }
             }
         }
+
+        // ORCH-03-S5: periodic checkpoint. Written at the END of the iteration
+        // body, where iteration `iter` is fully complete — the tree is pushed and
+        // `approx` carries its contribution — so `completed_iters = iter + 1` is
+        // exactly where a resumed run must restart. The device arm `continue`s
+        // long before this point and is excluded by the scope guard anyway.
+        //
+        // The write is atomic (see `snapshot::write_atomic`); an I/O failure
+        // PROPAGATES rather than being swallowed, because a checkpoint the caller
+        // believes exists but does not is worse than a failed fit.
+        if let Some((cfg, fingerprint)) = snapshot_state {
+            if last_snapshot_write.elapsed() >= cfg.snapshot_interval {
+                let snap = crate::snapshot::capture(
+                    iter.saturating_add(1),
+                    fingerprint,
+                    bias,
+                    approx_dimension,
+                    &approx,
+                    &trees,
+                    &rng,
+                )?;
+                crate::snapshot::write_atomic(&cfg.snapshot_file, &snap)?;
+                last_snapshot_write = std::time::Instant::now();
+            }
+        }
     }
 
     // use_best_model: truncate the model's trees to best_iteration + 1
@@ -4707,37 +6422,85 @@ fn train_inner<R: Runtime>(
     // models keep ctr_data None.
     let mut baked = BakedCtrData::default();
     if !cat_columns.is_empty() {
-        // Distinct chosen projections (by the sorted member set) across all trees.
-        let mut seen: Vec<crate::TProjection> = Vec::new();
+        // Distinct chosen (projection, ctr_type) pairs across all trees.
+        //
+        // The de-dup key is `(projection, ctr_type)` and NOTHING ELSE. In
+        // particular `target_border_idx` MUST NOT enter it: it is a per-SPLIT
+        // selector consumed by `CtrValueTable::numerator_denominator`, so ONE
+        // Buckets table serves both b=0 and b=1. Adding it would break the
+        // apply-side key reconstruction (`cb_model::apply::ctr_table_key`), which
+        // rebuilds `"ctr:type=<i8>:proj=<members>"` from the split and carries no
+        // border index, and would invalidate every committed .cbm fixture.
+        let mut seen: Vec<(crate::TProjection, i8)> = Vec::new();
         for tree in &trees {
             for spec in &tree.ctr_splits {
-                if !seen.iter().any(|p| p == &spec.projection) {
-                    seen.push(spec.projection.clone());
+                let key = (spec.projection.clone(), spec.ctr_type);
+                if !seen.iter().any(|k| k == &key) {
+                    seen.push(key);
+                    let Some(spec_ctr_type) = crate::ctr::ECtrType::from_i8(spec.ctr_type) else {
+                        return Err(CbError::OutOfRange(format!(
+                            "chosen CTR split carries an unknown ctr_type discriminant {}",
+                            spec.ctr_type
+                        )));
+                    };
+                    // E10/E11: bake with the CHOSEN split's own routed type AND
+                    // prior, not a global default. This site is load-bearing
+                    // because the (Shift, Scale, prior) pair is COPIED BACK onto
+                    // every matching spec below — baking with the wrong prior
+                    // would overwrite the correctly-routed value and silently undo
+                    // SPEC-CTRT-10. At the default config both prior lists are
+                    // [0.5] and both types are Borders, so this is byte-identical
+                    // to the previous behavior.
                     let table = bake_ctr_table(
                         cat_columns,
                         &spec.projection,
                         &target_class,
                         2, // binclf target-class count
                         ctr_border_count,
-                        ctr_prior_num,
-                        ctr_prior_denom,
+                        spec.prior_num,
+                        spec.prior_denom,
+                        spec_ctr_type,
+                        counter_calc_skip_test,
+                        &counter_full_eval_columns,
                     )?;
                     baked.tables.push(table);
                 }
             }
         }
-        // Copy the bake-derived (Shift, Scale) + prior PAIR onto each chosen split.
+        // Derive each chosen split's inference (Shift, Scale) from ITS OWN prior.
+        //
+        // E15: this loop used to COPY `(shift, scale, prior_num, prior_denom)` off
+        // the matching baked table. Both halves of that were wrong once more than
+        // one prior is live on a projection:
+        //   * the prior copy CLOBBERED the split's own `prior_num`/`prior_denom`,
+        //     which already arrive correct from the winning column via
+        //     `crate::tree`'s `CtrSplitSpec` construction — so every split on a
+        //     projection collapsed onto the first baked table's (head) prior;
+        //   * one baked table carries ONE normalization, so copying it is wrong
+        //     for every split at a different prior.
+        // The table lookup SURVIVES purely as an existence gate: only a split with
+        // a baked `(projection, ctr_type)` table gets a derived normalization; a
+        // split without one keeps `0.0` / `1.0`. `(projection, ctr_type)` is the
+        // same key the bake de-dup uses — `target_border_idx` must not enter it.
+        //
+        // Consequence: `BakedCtrTable.{shift, scale, prior_num, prior_denom}` are
+        // now INFORMATIONAL-ONLY in production (`CtrData::from_baked` already
+        // ignores them), but they stay on the struct — `ctr_split_scoring_test`
+        // and `ctr::final_ctr_test` read them.
         for tree in &mut trees {
             for spec in &mut tree.ctr_splits {
-                if let Some(table) = baked
+                if baked
                     .tables
                     .iter()
-                    .find(|t| t.projection == spec.projection)
+                    .any(|t| t.projection == spec.projection && t.ctr_type == spec.ctr_type)
                 {
-                    spec.shift = table.shift;
-                    spec.scale = table.scale;
-                    spec.prior_num = table.prior_num;
-                    spec.prior_denom = table.prior_denom;
+                    let (shift, norm) = crate::ctr::calc_normalization(spec.prior_num);
+                    spec.shift = shift;
+                    spec.scale = if norm == 0.0 {
+                        1.0
+                    } else {
+                        ctr_border_count as f64 / norm
+                    };
                 }
             }
         }
@@ -4751,6 +6514,11 @@ fn train_inner<R: Runtime>(
             bias,
             approx_dimension,
             class_to_label,
+            // SPEC-OH-05: the fit-wide one-hot bin -> raw-hash table and the
+            // position -> absolute cat-index map, both EMPTY on the float-only
+            // and CTR-only paths.
+            one_hot_bin_to_hash,
+            one_hot_absolute,
         },
         baked,
     ))

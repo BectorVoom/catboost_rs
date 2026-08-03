@@ -40,6 +40,7 @@ fn depth3_region() -> RegionTree {
 
 fn region_model(tree: RegionTree) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: vec![tree],

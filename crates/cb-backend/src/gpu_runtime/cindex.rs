@@ -51,12 +51,11 @@ use rayon::prelude::*;
 /// downstream — the extracted bin VALUE is identical either way, only the split test
 /// differs (routed by the consumer, not here).
 //
-// `first_fold_index` / `folds` / `one_hot_feature` are the FROZEN descriptor contract
-// (the plan's `TCFeature` field set) — carried for the multi-group fold offset and the
-// one-hot split routing later phases consume; `#[allow(dead_code)]` keeps the default
-// build warning-free until those consumers land (the read_bin consumers use only
-// offset/shift/mask via [`PackedCindex::device_arrays`]).
-#[allow(dead_code)]
+// `first_fold_index` and `folds` are CONTRACT-ONLY fields: they belong to the plan's
+// frozen `TCFeature` field set but nothing in the lib target reads them (only the
+// two writes below and this doc). `#[allow(dead_code)]` on each keeps the default
+// build warning-free. `one_hot_feature` IS read — [`PackedCindex::device_arrays`]
+// exports it as the fourth device array (SPEC-OH-21 / T24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TCFeature {
     /// Word base of this feature's group (`read_bin` reads `cindex[offset + obj]`).
@@ -67,8 +66,23 @@ pub(crate) struct TCFeature {
     pub shift: u32,
     /// First border-fold index of this feature (the bin->border join base; 0 for the
     /// single-feature-group MVP, reserved for the multi-group fold offset).
+    #[allow(dead_code)]
     pub first_fold_index: u32,
-    /// Number of border folds (buckets) this feature spans.
+    /// Number of border folds (buckets) this feature spans — **as the CALLER supplied
+    /// it in `n_buckets`**, which on the production path is the PADDED UNIFORM LINE
+    /// WIDTH (`session.rs` packs `vec![n_bins_line; eff_n_features]`), not the
+    /// feature's real cardinality.
+    ///
+    /// **Never use this as a one-hot candidate bound** (SPEC-OH-22 / [C16]): with
+    /// `folds[f] == n_bins_line` for every feature, `border < folds[feature]` IS the
+    /// loop bound, so it excludes nothing and a cardinality-2 column contributes 30
+    /// phantom candidates in a 32-wide line. The real per-feature cardinality travels
+    /// separately as `real_folds` (built by the host quantizer, carried on
+    /// `DeviceTrainConfig`) and is deliberately NOT part of
+    /// [`PackedCindex::device_arrays`]. Passing true cardinalities into `n_buckets`
+    /// instead is also forbidden — it would change [`feature_bits`] and hence the
+    /// packed words for EVERY pool, including float-only.
+    #[allow(dead_code)]
     pub folds: u32,
     /// Whether this feature uses one-hot (equality) split semantics downstream.
     pub one_hot_feature: bool,
@@ -86,14 +100,22 @@ pub(crate) struct PackedCindex {
 }
 
 impl PackedCindex {
-    /// Device-ready per-feature `(offsets, shifts, masks)` `u32` arrays for
-    /// [`crate::kernels::read_bin`]. `TCFeature.offset` is checked-cast to `u32` (the
-    /// device array index type); an offset that overflows `u32` surfaces
-    /// [`CbError::OutOfRange`] (T-10-16 — no unguarded index reaches the device).
-    pub fn device_arrays(&self) -> CbResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    /// Device-ready per-feature `(offsets, shifts, masks, one_hot_flags)` `u32` arrays
+    /// for [`crate::kernels::read_bin`] and the split-semantics selection.
+    /// `TCFeature.offset` is checked-cast to `u32` (the device array index type); an
+    /// offset that overflows `u32` surfaces [`CbError::OutOfRange`] (T-10-16 — no
+    /// unguarded index reaches the device). `one_hot_flags` is `0`/`1` rather than
+    /// `bool` because the device index type is `u32`.
+    ///
+    /// `TCFeature.folds` is deliberately NOT exported here (SPEC-OH-22 / [C16]): on
+    /// the production path it is the padded uniform line width and must never bound a
+    /// one-hot candidate. The real per-feature cardinality travels as `real_folds` on
+    /// `DeviceTrainConfig`.
+    pub fn device_arrays(&self) -> CbResult<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
         let mut offsets = Vec::with_capacity(self.features.len());
         let mut shifts = Vec::with_capacity(self.features.len());
         let mut masks = Vec::with_capacity(self.features.len());
+        let mut one_hot_flags = Vec::with_capacity(self.features.len());
         for f in &self.features {
             let off = u32::try_from(f.offset).map_err(|_| {
                 CbError::OutOfRange(format!(
@@ -104,8 +126,9 @@ impl PackedCindex {
             offsets.push(off);
             shifts.push(f.shift);
             masks.push(f.mask);
+            one_hot_flags.push(u32::from(f.one_hot_feature));
         }
-        Ok((offsets, shifts, masks))
+        Ok((offsets, shifts, masks, one_hot_flags))
     }
 }
 
@@ -147,6 +170,12 @@ pub(crate) fn read_bin_host(words: &[u32], offset: u64, obj: usize, shift: u32, 
 /// column of `n` words) starts. Feature `f` in group `g` gets `offset = g * n` (word
 /// base), `shift = cumulative bits of prior features in `g``, `mask = (1 << bits) - 1`.
 ///
+/// `one_hot[f]` records whether feature `f` uses EQUALITY split semantics downstream; it
+/// is copied verbatim into `TCFeature.one_hot_feature` and does NOT affect the packing
+/// (the stored bin VALUE is identical either way — only the later split TEST differs).
+/// Every non-one-hot caller passes an all-`false` slice, which reproduces the pre-SPEC-OH-21
+/// bytes exactly. `one_hot.len() != n_features` → [`CbError::LengthMismatch`].
+///
 /// Every product / word-count that can overflow is `checked_*` → [`CbError::OutOfRange`]
 /// (T-10-16); `bins.len() != n_features * n` → [`CbError::LengthMismatch`]. An out-of-range
 /// bin (`>= n_buckets[feature]`) surfaces [`CbError::OutOfRange`] BEFORE it is masked into
@@ -154,9 +183,17 @@ pub(crate) fn read_bin_host(words: &[u32], offset: u64, obj: usize, shift: u32, 
 pub(crate) fn pack_cindex(
     bins: &[u32],
     n_buckets: &[usize],
+    one_hot: &[bool],
     n: usize,
 ) -> CbResult<PackedCindex> {
     let n_features = n_buckets.len();
+    if one_hot.len() != n_features {
+        return Err(CbError::LengthMismatch {
+            column: "cindex one_hot flags".to_owned(),
+            expected: n_features,
+            actual: one_hot.len(),
+        });
+    }
 
     // Length guard: the plain layout is exactly n_features * n cells.
     let stride = n_features.checked_mul(n).ok_or_else(|| {
@@ -210,7 +247,9 @@ pub(crate) fn pack_cindex(
 
     // Second pass (a): emit the TCFeature descriptor table (serial — `n_features` entries).
     let mut features: Vec<TCFeature> = Vec::with_capacity(n_features);
-    for (&nb, &(group, shift, mask)) in n_buckets.iter().zip(placed.iter()) {
+    for ((&nb, &(group, shift, mask)), &is_one_hot) in
+        n_buckets.iter().zip(placed.iter()).zip(one_hot.iter())
+    {
         let offset = (group as u64).checked_mul(n as u64).ok_or_else(|| {
             CbError::OutOfRange(format!("pack_cindex: group offset {group} * n ({n}) overflows u64"))
         })?;
@@ -223,7 +262,7 @@ pub(crate) fn pack_cindex(
             shift,
             first_fold_index: 0,
             folds,
-            one_hot_feature: false,
+            one_hot_feature: is_one_hot,
         });
     }
 

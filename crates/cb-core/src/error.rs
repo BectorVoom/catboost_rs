@@ -91,6 +91,18 @@ pub enum CbError {
     #[error("unsupported on the active backend: {0}")]
     Unsupported(String),
 
+    /// A training snapshot could not be written, read, or resumed (ORCH-03).
+    ///
+    /// Covers the whole snapshot surface: an unsupported training regime
+    /// (snapshotting is defined only for the scoped CPU boosting path), a
+    /// serialization / deserialization failure, an unknown `format_version`, and a
+    /// fingerprint mismatch between the snapshot and the run being started. The
+    /// underlying `serde_json` / `std::io` error is STRINGIFIED rather than
+    /// wrapped, so [`CbError`] keeps its `Clone` / `PartialEq` / `Eq` derives
+    /// (02-PATTERNS.md Shared Pattern C).
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
     /// An external (Arrow / Polars) source failed to yield a usable column.
     ///
     /// The external error is STRINGIFIED into `message` rather than wrapped via

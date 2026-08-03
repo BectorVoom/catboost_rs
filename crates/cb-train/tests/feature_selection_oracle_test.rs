@@ -188,7 +188,7 @@ fn select_features_shap_values_partition_matches_upstream() {
         let sub_borders: Vec<Vec<f64>> = (0..n_local).map(|i| bd[i].clone()).collect();
         let model = CbModel::from_trained(trained, sub_borders);
         let approx = cb_model::predict_raw(&model, sub);
-        let shap = shap_values(&model, sub, n_local);
+        let shap = shap_values(&model, sub, n_local).expect("the fixture model is float-only");
         let base = rmse_final_error(&approx, &labels);
         (0..n_local)
             .map(|f| {

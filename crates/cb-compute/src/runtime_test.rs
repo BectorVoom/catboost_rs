@@ -20,7 +20,7 @@ use crate::DeviceGrownTree;
 #[test]
 fn device_grown_tree_scalar_approx_dim_is_one() {
     let tree = DeviceGrownTree {
-        splits: vec![(0, 1)],
+        splits: vec![(0, 1, false)],
         leaf_values: vec![2.0, -3.0],
         approx_dim: 1,
         leaf_of: Vec::new(),
@@ -48,7 +48,7 @@ fn device_grown_tree_block_reinterpretation() {
     // Leaf 0 = [0.1, 0.2, 0.3]; leaf 1 = [0.4, 0.5, 0.6] (row-major per leaf).
     let leaf_values = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
     let tree = DeviceGrownTree {
-        splits: vec![(0, 1)],
+        splits: vec![(0, 1, false)],
         leaf_values,
         approx_dim: k,
         leaf_of: Vec::new(),

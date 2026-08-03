@@ -56,8 +56,10 @@ use std::collections::HashMap;
 use cb_core::{CbError, CbResult};
 use cb_data::calc_cat_feature_hash;
 
-use crate::ctr::calc_ctr::calc_ctr_online_bin;
-use crate::ctr::online::online_ctr_prefix_binclf;
+use crate::ctr::calc_ctr::{calc_ctr_online, calc_ctr_online_bin};
+use crate::ctr::online::{
+    online_class_prefix_column, online_counter_column, online_mean_prefix, SIMPLE_CLASSES_COUNT,
+};
 use crate::ctr::ECtrType;
 use crate::projection::TProjection;
 
@@ -70,9 +72,12 @@ pub struct CtrFeatureColumn {
     /// The combined categorical projection (sorted member set) this column was
     /// materialized over.
     pub projection: TProjection,
-    /// The CTR type i8 discriminant (Borders head — the combinations_ctr /
-    /// simple_ctr default; the SAME values as [`ECtrType`] / `cb_model::ECtrType`).
+    /// The CTR type i8 discriminant this column was materialized for (the SAME
+    /// values as [`ECtrType`] / `cb_model::ECtrType`).
     pub ctr_type: i8,
+    /// The Buckets per-class numerator selector this column was materialized for
+    /// (`GetTargetBorderCount`'s border index). `0` for every non-Buckets type.
+    pub target_border_idx: usize,
     /// The CTR prior numerator (`PriorNum`), carried as a PAIR (never pre-divided).
     pub prior_num: f64,
     /// The CTR prior denominator (`PriorDenom`); `1.0` for the default priors.
@@ -115,6 +120,23 @@ pub struct CtrFeatureColumn {
 /// `ctr_border_count` is the Borders CTR border count
 /// ([`crate::ctr_border_count_default`] = 15).
 ///
+/// # The `counter_calc_method = Full` bucket-space rule (E21 spec, E22 impl)
+///
+/// Under [`crate::CounterCalcMethod::Full`], the combined-projection hash and
+/// the first-seen `HashMap<u64, u32>` remap in step 2 are built over the
+/// **CONCATENATION of the learn cat columns and EVERY eval set's cat columns**,
+/// in the order `learn ++ eval[0] ++ eval[1] ++ …` — mirroring upstream, which
+/// tallies over a `hashArr` built across learn AND every test set and, under
+/// `Full`, sets `uniqValuesCounts.CounterCount = leafCount`
+/// (`online_ctr.cpp:716-729`). Consequence: an eval-only categorical value that
+/// never appears in the learn set gets ITS OWN bucket, so `bucket_count`
+/// (`leafCount`) GROWS. Under `SkipTest` the remap is built over the learn
+/// columns only and `bucket_count` is unchanged — today's behavior,
+/// byte-identical. In BOTH settings the learn-document OUTPUT column stays
+/// indexed by the LEARN slice: eval documents contribute to the tally and the
+/// bucket space but produce no output rows, so `bins.len()` and
+/// `ctr_value.len()` always equal the learn document count.
+///
 /// # Errors
 /// - [`CbError::Degenerate`] if `cat_columns` is empty, a member column is
 ///   shorter than the permutation implies, or `prior_denom == 0`.
@@ -128,6 +150,9 @@ pub fn materialize_ctr_feature(
     target_class: &[usize],
     prior_num: f64, prior_denom: f64,
     ctr_border_count: usize,
+    ctr_type: ECtrType,
+    target_border_idx: usize,
+    extra_cat_columns: &[Vec<String>],
 ) -> CbResult<CtrFeatureColumn> {
     // The document count is the permutation length (every learn document appears
     // once); the member columns must each be at least that long.
@@ -195,22 +220,119 @@ pub fn materialize_ctr_feature(
         combined_bins.push(bin);
     }
 
+    // 2b. The `counter_calc_method = Full` bucket-space rule (E22 implementing
+    //     E21's spec; see the doc comment above). COUNTER-ONLY: upstream widens
+    //     `uniqValuesCounts.CounterCount` — the Counter bucket space — to
+    //     `leafCount` over the learn ++ every-eval hash array
+    //     (`online_ctr.cpp:716-729`), while every other type's unique count
+    //     stays learn-only. Eval keys extend the SAME first-seen remap AFTER
+    //     the learn documents (learn bin numbering byte-identical; an eval-only
+    //     value can only ever receive a NEW, higher bin) and produce
+    //     `extra_bins` for the tally — never output rows. `extra_cat_columns`
+    //     is EMPTY under `SkipTest` (the caller's gate), making this a no-op.
+    let mut extra_bins: Vec<u32> = Vec::new();
+    if ctr_type == ECtrType::Counter && !extra_cat_columns.is_empty() {
+        let m = extra_cat_columns.iter().map(Vec::len).max().unwrap_or(0);
+        let extra_count = extra_cat_columns.len();
+        for i in 0..m {
+            let mut feature_hashes: Vec<u32> = Vec::with_capacity(extra_count);
+            for col in extra_cat_columns {
+                let value = col.get(i).map_or("", String::as_str);
+                feature_hashes.push(calc_cat_feature_hash(value));
+            }
+            let key = projection.combined_hash(&feature_hashes);
+            let next = remap.len();
+            if next >= u32::MAX as usize {
+                return Err(CbError::OutOfRange(
+                    "materialize_ctr_feature: more than u32::MAX distinct combined keys"
+                        .to_owned(),
+                ));
+            }
+            let bin = *remap.entry(key).or_insert(next as u32);
+            extra_bins.push(bin);
+        }
+    }
+
     // 3. Scalar online prior from the PAIR (prior_denom == 1 ⇒ scalar == num).
     let prior_scalar = prior_num / prior_denom;
     // The read-before-increment online prefix over the combined bins (OBJECT
     // order). Reused verbatim — no re-derived prefix loop. target_class is sliced
     // to n so the length contract matches the permutation/bins.
     let target_class_n = target_class.get(..n).unwrap_or(target_class);
-    let prefix =
-        online_ctr_prefix_binclf(permutation, &combined_bins, target_class_n, prior_scalar)?;
+
+    // 3b. Per-type dispatch (SPEC-CTRT-06/-07/-08). Each arm supplies the
+    //     per-document (numerator, denominator) INPUTS; the quantizer below is
+    //     type-agnostic and stays byte-identical.
+    let bucket_count = remap.len();
+    let (nums, denoms, ctr_value, quantize_in_f32) = match ctr_type {
+        ECtrType::Borders | ECtrType::Buckets => {
+            // Borders at target_border_idx == 0 is EXACTLY the pre-dispatch
+            // `online_ctr_prefix_binclf` path (E05's firewall proves the
+            // equivalence bit-for-bit).
+            let prefix = online_class_prefix_column(
+                permutation,
+                &combined_bins,
+                target_class_n,
+                SIMPLE_CLASSES_COUNT,
+                target_border_idx,
+                ctr_type,
+                prior_scalar,
+            )?;
+            let nums: Vec<f64> = prefix.good.iter().map(|&g| g as f64).collect();
+            (nums, prefix.total, prefix.value, false)
+        }
+        ECtrType::BinarizedTargetMeanValue => {
+            let prefix = online_mean_prefix(
+                permutation,
+                &combined_bins,
+                target_class_n,
+                SIMPLE_CLASSES_COUNT,
+                prior_scalar,
+            )?;
+            let nums: Vec<f64> = prefix.sum.iter().map(|&s| f64::from(s)).collect();
+            // BTMV quantizes in f32, mirroring upstream's all-`float` CalcCTR.
+            (nums, prefix.count, prefix.value, true)
+        }
+        ECtrType::Counter => {
+            // Whole-set totals with the CONSTANT max-bucket denominator; no
+            // permutation dependence at all (ctr_type.cpp:43-56). Under
+            // `counter_calc_method = Full` the eval bins join the tally and the
+            // MAX (step 2b); the output stays learn-indexed.
+            let (totals, denominator) =
+                online_counter_column(&combined_bins, &extra_bins, bucket_count);
+            let nums: Vec<f64> = totals.iter().map(|&t| t as f64).collect();
+            let denoms: Vec<i64> = vec![denominator; totals.len()];
+            let value: Vec<f64> = nums
+                .iter()
+                .map(|&num| calc_ctr_online(num, denominator, prior_scalar))
+                .collect();
+            (nums, denoms, value, false)
+        }
+        ECtrType::FloatTargetMeanValue | ECtrType::FeatureFreq => {
+            // Defence in depth — E02 already rejects these at `train_inner`, but a
+            // direct caller must not get a silently-wrong column either.
+            return Err(CbError::Unsupported(format!(
+                "Ctr type {ctr_type:?} is not implemented on CPU yet \
+                 (upstream catboost_options.cpp:504-509)"
+            )));
+        }
+    };
 
     // 4. Quantize each document's online CTR value to an integer CTR bin (the
-    //    implicit float -> ui8 truncation). good[i]/total[i] are in OBJECT order.
+    //    implicit float -> ui8 truncation). Inputs are in OBJECT order.
     let mut bins: Vec<u32> = Vec::with_capacity(n);
     for i in 0..n {
-        let good = prefix.good.get(i).copied().unwrap_or(0);
-        let total = prefix.total.get(i).copied().unwrap_or(0);
-        let bin_f = calc_ctr_online_bin(good as f64, total, prior_scalar, ctr_border_count);
+        let good = nums.get(i).copied().unwrap_or(0.0);
+        let total = denoms.get(i).copied().unwrap_or(0);
+        let bin_f = if quantize_in_f32 {
+            // Upstream's CalcCTR is all-`float` for the mean types; compute in f32
+            // and widen only at the end (research §A.0 caveat).
+            let norm = (total as f32) + 1.0f32;
+            let ctr = (good as f32 + prior_scalar as f32) / norm;
+            f64::from(ctr * ctr_border_count as f32)
+        } else {
+            calc_ctr_online_bin(good, total, prior_scalar, ctr_border_count)
+        };
         // Truncate toward zero, clamp into [0, ctr_border_count] (a degenerate
         // negative or over-range float maps to the nearest valid bin — no panic,
         // no out-of-range cast). The CTR is non-negative and bounded by the
@@ -228,14 +350,14 @@ pub fn materialize_ctr_feature(
 
     Ok(CtrFeatureColumn {
         projection: projection.clone(),
-        // Borders head — the combinations_ctr / simple_ctr default family.
-        ctr_type: ECtrType::Borders.as_i8(),
+        ctr_type: ctr_type.as_i8(),
+        target_border_idx,
         prior_num,
         prior_denom,
         bins,
-        ctr_value: prefix.value,
+        ctr_value,
         // Distinct combined-projection buckets (the projection cardinality) — the
         // size of the first-seen remap.
-        bucket_count: remap.len(),
+        bucket_count,
     })
 }

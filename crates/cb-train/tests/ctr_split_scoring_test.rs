@@ -41,6 +41,7 @@ fn ctr_column_from_bins(bins: &[u32]) -> CtrFeatureColumn {
     CtrFeatureColumn {
         projection: TProjection::single(0),
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: PRIOR_NUM,
         prior_denom: PRIOR_DENOM,
         bins: bins.to_vec(),
@@ -68,6 +69,7 @@ fn ctr_column_from_bins_with_projection(bins: &[u32], projection: TProjection) -
     CtrFeatureColumn {
         projection,
         ctr_type: 0,
+        target_border_idx: 0,
         prior_num: PRIOR_NUM,
         prior_denom: PRIOR_DENOM,
         bins: bins.to_vec(),
@@ -105,9 +107,9 @@ fn ctr_candidate_wins_over_uninformative_float() {
         3.0,
         1,
         n,
-        0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");
@@ -154,9 +156,9 @@ fn tie_break_float_then_ctr_first_wins() {
         3.0,
         1,
         n,
-        0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");
@@ -197,9 +199,9 @@ fn forward_bit_leaf_index_mixed_float_and_ctr() {
         0.0,
         2,
         n,
-        0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");
@@ -255,9 +257,9 @@ fn single_feature_ctr_structure_partition_6_0_9_15() {
         3.0,
         2,
         n,
-        0,
         0.0, // model_size_reg = 0 (no cat-feature penalty in these structure tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");
@@ -311,9 +313,9 @@ fn combination_ctr_cannot_win_at_level_zero() {
         3.0,
         1, // depth = 1: level 0 only, `chosen` starts empty.
         n,
-        0,
         0.0, // model_size_reg = 0 (not this fence's concern — see T2.5's own tests)
         cb_compute::EScoreFunction::Cosine,
+        &[],
         &[],
     )
     .expect("ctr search");
@@ -389,6 +391,9 @@ fn second_materialization_differs_from_structure() {
         PRIOR_NUM,
         PRIOR_DENOM,
         ctr_border_count_default(),
+        cb_train::ECtrType::Borders,
+        0,
+        &[],
     )
     .expect("identity materialization");
     let leaf_value = materialize_ctr_feature(
@@ -399,6 +404,9 @@ fn second_materialization_differs_from_structure() {
         PRIOR_NUM,
         PRIOR_DENOM,
         ctr_border_count_default(),
+        cb_train::ECtrType::Borders,
+        0,
+        &[],
     )
     .expect("averaging materialization");
 
@@ -515,16 +523,12 @@ fn single_ctr_split_model(
         leaf_values: vec![-10.0, 10.0],
         leaf_weights: vec![1.0, 1.0],
     };
-    cb_model::Model {
-        oblivious_trees: vec![tree],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.0,
-        float_feature_borders: Vec::new(),
-        ctr_data: Some(ctr_data),
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    cb_model::Model::new(
+        vec![tree],
+        0.0,
+        Vec::new(),
+    )
+    .with_ctr_data(ctr_data)
 }
 
 /// Test (Scale/Shift derivation): a Borders CTR with prior_num=0.5, prior_denom=1
@@ -547,6 +551,9 @@ fn bake_derives_shift_zero_scale_fifteen_for_borders_prior_half() {
         ctr_border_count_default(),
         PRIOR_NUM,
         PRIOR_DENOM,
+        cb_train::ECtrType::Borders,
+        true,
+        &[],
     )
     .expect("bake");
 
@@ -575,6 +582,9 @@ fn apply_found_branch_uses_split_scale() {
     let proj = TProjection::single(0);
     let table = bake_ctr_table(
         &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
+        cb_train::ECtrType::Borders,
+        true,
+        &[],
     )
     .expect("bake");
     let ctr_data = cb_model::CtrData::from_baked(&cb_train::BakedCtrData {
@@ -644,6 +654,9 @@ fn bake_round_trips_to_apply_inference_value() {
     let proj = TProjection::single(0);
     let table = bake_ctr_table(
         &cat_columns, &proj, &target_class, 2, ctr_border_count_default(), PRIOR_NUM, PRIOR_DENOM,
+        cb_train::ECtrType::Borders,
+        true,
+        &[],
     )
     .expect("bake");
     let shift = table.shift;

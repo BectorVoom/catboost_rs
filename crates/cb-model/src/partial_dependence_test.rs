@@ -34,6 +34,7 @@ fn one_split_tree(feature: usize, border: f64, leaf_values: Vec<f64>) -> Oblivio
 /// tree) but is present in `float_feature_borders` so `n_float == 2`.
 fn two_feature_model(lo: f64, hi: f64, bias: f64) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![one_split_tree(0, 0.5, vec![lo, hi])],
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -121,6 +122,7 @@ fn engine_does_not_mutate_columns() {
 /// unused), so `grid_for_feature(&model, 0)` exercises the transform.
 fn borders_model(borders_f0: Vec<f64>) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -162,6 +164,7 @@ fn grid_for_feature_is_per_bin_representatives() {
 /// `float_feature_borders.len()`).
 fn validation_model() -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -278,4 +281,37 @@ fn rejects_duplicate_feature_pair() {
         Err(PdpError::DuplicateFeature { index }) => assert_eq!(index, 0),
         other => panic!("expected DuplicateFeature{{index: 0}}, got {other:?}"),
     }
+}
+
+
+// ── SPEC-OH-19 — partial dependence rejects one-hot models ──────────────────
+
+#[test]
+fn partial_dependence_rejects_one_hot_models() {
+    // A model whose ONLY defect is a one-hot split: `validation_model`'s float
+    // layout is otherwise valid, so a rejection can only come from the
+    // SPEC-OH-19 guard, not from arity / shape / range.
+    let mut model = validation_model();
+    model.oblivious_trees.push(ObliviousTree {
+        splits: vec![
+            ModelSplit::Float(Split { feature: 0, border: 0.1 }),
+            ModelSplit::OneHot(crate::OneHotModelSplit {
+                cat_feature: 0,
+                value_hash: 1_296_865_003,
+            }),
+        ],
+        leaf_values: vec![1.0, 2.0, 3.0, 4.0],
+        leaf_weights: vec![1.0; 4],
+    });
+
+    let columns = valid_columns();
+    assert!(matches!(
+        partial_dependence(&model, &columns, &[0]),
+        Err(PdpError::OneHotSplitsUnsupported)
+    ));
+    // The same guard fires through `validate` directly.
+    assert!(matches!(
+        validate(&model, &columns, &[0]),
+        Err(PdpError::OneHotSplitsUnsupported)
+    ));
 }

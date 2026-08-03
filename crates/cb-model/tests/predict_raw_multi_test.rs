@@ -30,16 +30,11 @@ fn one_split_tree(feature: usize, border: f64, leaf_values: Vec<f64>) -> Oblivio
 
 /// A scalar (dim=1) model: one depth-1 tree, two leaves `[lo, hi]`, bias `b`.
 fn scalar_model(border: f64, lo: f64, hi: f64, bias: f64) -> Model {
-    Model {
-        oblivious_trees: vec![one_split_tree(0, border, vec![lo, hi])],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
+    Model::new(
+        vec![one_split_tree(0, border, vec![lo, hi])],
         bias,
-        float_feature_borders: vec![vec![border]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        vec![vec![border]],
+    )
 }
 
 #[test]
@@ -70,16 +65,11 @@ fn dim1_byte_identical_to_predict_raw() {
 fn dim1_byte_identical_empty_and_biasonly() {
     // Bias-only model (no trees) — every object predicts exactly `bias`, identical
     // on both paths.
-    let model = Model {
-        oblivious_trees: Vec::new(),
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: -0.75,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    };
+    let model = Model::new(
+        Vec::new(),
+        -0.75,
+        vec![vec![0.5]],
+    );
     let columns = vec![vec![0.1_f32, 0.9, 0.3]];
     let scalar = predict_raw(&model, &columns);
     let multi = predict_raw_multi(&model, &columns);
@@ -96,16 +86,12 @@ fn multi_dim_accumulation_dim_major_output() {
     //   d0: [10, 20]   d1: [30, 40]   d2: [50, 60]
     let leaf_values = vec![10.0, 20.0, /*d0*/ 30.0, 40.0, /*d1*/ 50.0, 60.0 /*d2*/];
     let bias = 1.0;
-    let model = Model {
-        oblivious_trees: vec![one_split_tree(0, 0.5, leaf_values)],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
+    let model = Model::new(
+        vec![one_split_tree(0, 0.5, leaf_values)],
         bias,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 3,
-        class_to_label: Vec::new(),
-    };
+        vec![vec![0.5]],
+    )
+    .with_approx_dimension(3);
     // Object 0 below border -> leaf 0; object 1 above border -> leaf 1.
     let columns = vec![vec![0.1_f32, 0.9]];
     let out = predict_raw_multi(&model, &columns);
@@ -138,16 +124,12 @@ fn out_of_range_leaf_contributes_zero_no_panic() {
     // contribute 0.0 (checked `.get`), never panic.
     let leaf_values = vec![7.0, 9.0];
     let bias = 0.5;
-    let model = Model {
-        oblivious_trees: vec![one_split_tree(0, 0.5, leaf_values)],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
+    let model = Model::new(
+        vec![one_split_tree(0, 0.5, leaf_values)],
         bias,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 2,
-        class_to_label: Vec::new(),
-    };
+        vec![vec![0.5]],
+    )
+    .with_approx_dimension(2);
     // obj0 below border -> structural leaf 0 ; obj1 above border -> structural leaf 1.
     let columns = vec![vec![0.1_f32, 0.9]];
     let out = predict_raw_multi(&model, &columns);

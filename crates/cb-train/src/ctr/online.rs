@@ -260,6 +260,314 @@ pub fn accumulate_online(
 /// # Errors
 /// [`CbError::Degenerate`] if `bins` / `target_class` are shorter than the
 /// permutation implies, or a permutation index is out of range.
+/// The per-object BinarizedTargetMeanValue prefix vectors in OBJECT order: the
+/// running `f32` `Sum`, the `i64` `Count`, and the resulting CTR value per
+/// document (SPEC-CTRT-07).
+///
+/// # Why a distinct type and not [`OnlineCtrPrefix`]
+/// `OnlineCtrPrefix::good` is `Vec<i64>`. Reusing it would force an i64
+/// truncation of the f32 `Sum` — precisely the silent-widening failure this
+/// producer exists to prevent. The `f32` width of `sum` is load-bearing and
+/// mirrors upstream `TCtrMeanHistory::Sum` (`online_ctr.h:373-376`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnlineMeanPrefix {
+    /// The running target-sum read by each document, in OBJECT order. `f32` to
+    /// match upstream's accumulator width bit-for-bit.
+    pub sum: Vec<f32>,
+    /// The running count read by each document, in OBJECT order.
+    pub count: Vec<i64>,
+    /// The per-document CTR value `calc_ctr_online(sum, count, prior)`.
+    pub value: Vec<f64>,
+}
+
+/// The read-before-increment BinarizedTargetMeanValue prefix over
+/// [`TCtrMeanHistory`] (SPEC-CTRT-07).
+///
+/// Each document READS its bucket's `(Sum, Count)` and only then folds its own
+/// binarized target in — the no-leakage property (`online_ctr.cpp:168-185`). The
+/// added value is `targetClass / targetBorderCount` where upstream passes
+/// `targetClassesCount - 1` (`online_ctr.cpp:762`), so for binclf it is exactly
+/// `targetClass ∈ {0.0f, 1.0f}`.
+///
+/// `Sum` is accumulated in **f32**, matching upstream; see
+/// `online_test::btmv_sum_is_accumulated_in_f32_not_f64`.
+///
+/// # Errors
+/// [`CbError::Degenerate`] on a length mismatch between `permutation`, `bins` and
+/// `target_class`, or a permutation index out of range for either.
+pub fn online_mean_prefix(
+    permutation: &[i32],
+    bins: &[u32],
+    target_class: &[usize],
+    classes: usize,
+    prior: f64,
+) -> CbResult<OnlineMeanPrefix> {
+    let n = permutation.len();
+    if bins.len() != n || target_class.len() != n {
+        return Err(CbError::Degenerate(
+            "online_mean_prefix: permutation / bins / target_class length mismatch".to_owned(),
+        ));
+    }
+
+    let bucket_count = bins.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut hists: Vec<TCtrMeanHistory> = vec![TCtrMeanHistory::default(); bucket_count];
+
+    let mut sum = vec![0f32; n];
+    let mut count = vec![0i64; n];
+    let mut value = vec![0f64; n];
+
+    // targetBorderCount = targetClassesCount - 1 (online_ctr.cpp:762), floored at
+    // 1 so a degenerate `classes` can never divide by zero.
+    let divisor = classes.saturating_sub(1).max(1) as f32;
+
+    for &doc_i in permutation {
+        let doc = doc_i as usize;
+        let Some(&bin) = bins.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_mean_prefix: permutation index out of range for bins".to_owned(),
+            ));
+        };
+        let Some(&class) = target_class.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_mean_prefix: permutation index out of range for target_class".to_owned(),
+            ));
+        };
+        let bucket = bin as usize;
+
+        // READ before incrementing.
+        let (s, c) = hists.get(bucket).map_or((0.0f32, 0i64), |h| (h.sum, h.count));
+        if let Some(slot) = sum.get_mut(doc) {
+            *slot = s;
+        }
+        if let Some(slot) = count.get_mut(doc) {
+            *slot = c;
+        }
+        if let Some(slot) = value.get_mut(doc) {
+            *slot = calc_ctr_online(f64::from(s), c, prior);
+        }
+
+        // INCREMENT after read: Add(targetClass / targetBorderCount).
+        if let Some(h) = hists.get_mut(bucket) {
+            h.add(class as f32 / divisor);
+        }
+    }
+
+    Ok(OnlineMeanPrefix { sum, count, value })
+}
+
+/// The read-before-increment class-count prefix COLUMN for any class-prefix CTR
+/// type, deriving every document's `(numerator, denominator)` **exclusively**
+/// through [`online_class_prefix`] (SPEC-CTRT-06).
+///
+/// This is the generalization of [`online_ctr_prefix_binclf`]: at
+/// `(ECtrType::Borders, target_border_idx = 0, classes = 2)` the two produce
+/// bit-identical output (pinned by
+/// `online_test::class_prefix_column_at_borders_b0_equals_the_binclf_prefix`).
+///
+/// # Errors
+/// - [`CbError::Degenerate`] on a length mismatch or an out-of-range permutation
+///   index.
+/// - [`CbError::Degenerate`] if `ctr_type` is [`ECtrType::Counter`](crate::ctr::ECtrType::Counter):
+///   its denominator is the MAX bucket total, which no single bucket's class
+///   counts can produce. Use [`online_counter_column`] instead. A checked misuse,
+///   never a silently wrong column.
+pub fn online_class_prefix_column(
+    permutation: &[i32],
+    bins: &[u32],
+    target_class: &[usize],
+    classes: usize,
+    target_border_idx: usize,
+    ctr_type: crate::ctr::ECtrType,
+    prior: f64,
+) -> CbResult<OnlineCtrPrefix> {
+    if matches!(ctr_type, crate::ctr::ECtrType::Counter) {
+        return Err(CbError::Degenerate(
+            "Counter is not a class-prefix CTR type; use online_counter_column".to_owned(),
+        ));
+    }
+
+    let n = permutation.len();
+    if bins.len() != n || target_class.len() != n {
+        return Err(CbError::Degenerate(
+            "online_class_prefix_column: permutation / bins / target_class length mismatch"
+                .to_owned(),
+        ));
+    }
+
+    let bucket_count = bins.iter().copied().max().map_or(0, |m| m as usize + 1);
+
+    // Per-bucket class counts as ONE FLAT allocation of `bucket_count * classes`,
+    // row-major by bucket — deliberately NOT `Vec<TCtrHistory>`.
+    //
+    // `TCtrHistory` owns a `Vec<i64>`, so a `Vec<TCtrHistory>` costs one heap
+    // allocation PER BUCKET plus a 24-byte Vec header each. Measured over a
+    // 500k-bucket column that is 48.2 MB above baseline versus 28.6 MB for the
+    // flat form — 1.7x the working set, and 500k mallocs instead of one. The
+    // pre-existing `online_ctr_prefix_binclf` this function generalizes uses the
+    // same flat shape (`Vec<[i64; SIMPLE_CLASSES_COUNT]>`); high memory efficiency
+    // is a first-class constraint here (CLAUDE.md), so the generic form must not
+    // regress it.
+    let Some(counts_len) = bucket_count.checked_mul(classes) else {
+        return Err(CbError::OutOfRange(
+            "online_class_prefix_column: bucket_count * classes overflows".to_owned(),
+        ));
+    };
+    let mut counts: Vec<i64> = vec![0; counts_len];
+
+    let mut good = vec![0i64; n];
+    let mut total = vec![0i64; n];
+    let mut value = vec![0f64; n];
+
+    for &doc_i in permutation {
+        let doc = doc_i as usize;
+        let Some(&bin) = bins.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_class_prefix_column: permutation index out of range for bins".to_owned(),
+            ));
+        };
+        let Some(&class) = target_class.get(doc) else {
+            return Err(CbError::Degenerate(
+                "online_class_prefix_column: permutation index out of range for target_class"
+                    .to_owned(),
+            ));
+        };
+        let bucket = bin as usize;
+        let start = bucket.saturating_mul(classes);
+        let end = start.saturating_add(classes);
+
+        // READ the prefix counts BEFORE incrementing, through the ONE generic
+        // numerator rule — this function contains no numerator arithmetic of its own.
+        let slots: &[i64] = counts.get(start..end).unwrap_or(&[]);
+        let (num, denom) = online_class_prefix(slots, target_border_idx, ctr_type);
+        if let Some(slot) = good.get_mut(doc) {
+            *slot = num as i64;
+        }
+        if let Some(slot) = total.get_mut(doc) {
+            *slot = denom;
+        }
+        if let Some(slot) = value.get_mut(doc) {
+            *slot = calc_ctr_online(num, denom, prior);
+        }
+
+        // INCREMENT after read. `class < classes` is checked FIRST: without it a
+        // malformed class index would land in the NEXT bucket's row rather than
+        // being dropped, silently corrupting a different bucket's counts.
+        if class < classes {
+            if let Some(slot) = counts.get_mut(start.saturating_add(class)) {
+                *slot += 1;
+            }
+        }
+    }
+
+    Ok(OnlineCtrPrefix { good, total, value })
+}
+
+/// The Counter per-document column: each document's WHOLE-SET bucket total, plus
+/// the constant MAX bucket total that serves as the shared denominator
+/// (SPEC-CTRT-08).
+///
+/// # Not a prefix
+/// Counter is permutation-INdependent
+/// (`IsPermutationDependentCtrType(Counter) == false`, `ctr_type.cpp:43-56`).
+/// Every document sees its bucket's FULL count — **including its own row** — so
+/// there is no read-before-increment and no leakage question. This function
+/// therefore takes **no permutation parameter at all**: permutation invariance is
+/// structural here rather than merely asserted.
+///
+/// # Upstream
+/// `online_ctr.cpp:503-562` (the Counter column build) and `:934-936` (the
+/// denominator = MAX bucket total, the same rule
+/// [`crate::ctr::final_ctr::build_final_ctr`]'s Counter arm already applies to the
+/// baked table).
+///
+/// # Not handled here
+/// `counter_calc_method` — which widens the counted sample range from learn-only
+/// to learn + every eval set (`online_ctr.cpp:714-729`) — is deliberately NOT a
+/// parameter of this function. It lands in E22, once `EvalSet` can carry
+/// categorical columns at all.
+///
+/// Returns `(per_document_bucket_total, max_bucket_total)`. An empty `bins`
+/// yields `(vec![], 0)` — a zero denominator is returned plainly rather than
+/// producing a division by zero downstream.
+#[must_use]
+pub fn online_counter_column(
+    bins: &[u32],
+    extra_bins: &[u32],
+    bucket_count: usize,
+) -> (Vec<i64>, i64) {
+    let mut totals = vec![0i64; bucket_count];
+    // `extra_bins` (E22 / SPEC-CTRT-17): the concatenated EVAL-set bins under
+    // `counter_calc_method = Full` — upstream's `CountOnlineCTRTotal` sample
+    // range spans the learn + every-test-set `hashArr` (`online_ctr.cpp:
+    // 716-729`), so eval documents join the per-bucket tally AND the MAX
+    // denominator. EMPTY under `SkipTest` — byte-identical to the learn-only
+    // behavior. The per-document OUTPUT column below is indexed by the LEARN
+    // `bins` only: eval documents never produce output rows.
+    for &bin in bins.iter().chain(extra_bins) {
+        if let Some(slot) = totals.get_mut(bin as usize) {
+            *slot += 1;
+        }
+    }
+
+    let denominator = totals.iter().copied().max().unwrap_or(0);
+
+    let column = bins
+        .iter()
+        .map(|&bin| totals.get(bin as usize).copied().unwrap_or(0))
+        .collect();
+
+    (column, denominator)
+}
+
+/// The ONE generic classes-prefix producer: given a bucket's per-class prefix
+/// `counts`, the target-border index `b` and the CTR type, return that bucket's
+/// `(numerator, denominator)` pair (SPEC-CTRT-04).
+///
+/// # Upstream
+/// `UpdateGoodCount` (`online_ctr.cpp:115-121`):
+/// ```text
+/// if (ctrType == Buckets) *goodCount = curCount; else *goodCount -= curCount;
+/// ```
+/// applied cumulatively over `border = 0..targetBorderCount` starting from
+/// `goodCount = Total`. For a single border index `b` that collapses to:
+///
+/// - [`Buckets`](crate::ctr::ECtrType::Buckets) → `N[b]`
+/// - everything else → `Total - Σ_{c ≤ b} N[c]`
+///
+/// The denominator is always the bucket total. The read-before-increment
+/// ORDER (`online_ctr.cpp:168-185`) is the CALLER's responsibility — this
+/// function is pure and sees only an already-read prefix.
+///
+/// # Not for `Counter`
+/// [`Counter`](crate::ctr::ECtrType::Counter) is **not** a class-prefix type: its
+/// numerator is the whole-set bucket total and its denominator is the MAX bucket
+/// total, neither of which is derivable from one bucket's class counts. It must
+/// never be passed here; `online_counter_column` owns that path.
+///
+/// # Safety of the arithmetic
+/// Access is via checked `.get` only — an out-of-range `b` contributes `0`
+/// rather than panicking — and the cumulative subtraction saturates, so a
+/// malformed `counts` can never underflow.
+#[must_use]
+pub fn online_class_prefix(
+    counts: &[i64],
+    target_border_idx: usize,
+    ctr_type: crate::ctr::ECtrType,
+) -> (f64, i64) {
+    let total: i64 = counts.iter().sum();
+
+    let num = if matches!(ctr_type, crate::ctr::ECtrType::Buckets) {
+        counts.get(target_border_idx).copied().unwrap_or(0)
+    } else {
+        let head: i64 = (0..=target_border_idx)
+            .map(|c| counts.get(c).copied().unwrap_or(0))
+            .sum();
+        total.saturating_sub(head)
+    };
+
+    (num as f64, total)
+}
+
 pub fn online_ctr_prefix_binclf(
     permutation: &[i32],
     bins: &[u32],
@@ -294,11 +602,13 @@ pub fn online_ctr_prefix_binclf(
             ));
         };
         let bucket = bin as usize;
-        let elem = counts.get(bucket);
         // READ the prefix counts BEFORE incrementing (online_ctr.cpp:303-304).
-        let (n0, n1) = elem.map_or((0, 0), |e| (e[0], e[1]));
-        let g = n1; // good = N[1] (pos class)
-        let t = n0 + n1; // total = N[0] + N[1]
+        // Routed through the ONE generic classes-prefix producer (E05/SPEC-CTRT-05):
+        // binclf Borders IS `online_class_prefix(&[N0, N1], 0, Borders)`, proven
+        // bit-identical over an exhaustive grid in `online_test.rs`.
+        let slots: &[i64] = counts.get(bucket).map_or(&[][..], |e| &e[..]);
+        let (g_f64, t) = online_class_prefix(slots, 0, crate::ctr::ECtrType::Borders);
+        let g = g_f64 as i64; // good = N[1] (pos class)
         if let Some(slot) = good.get_mut(doc) {
             *slot = g;
         }
@@ -306,7 +616,7 @@ pub fn online_ctr_prefix_binclf(
             *slot = t;
         }
         if let Some(slot) = value.get_mut(doc) {
-            *slot = calc_ctr_online(g as f64, t, prior);
+            *slot = calc_ctr_online(g_f64, t, prior);
         }
         // INCREMENT after read (learn set): ++N[targetClass[doc]].
         if let Some(elem) = counts.get_mut(bucket) {
@@ -390,9 +700,13 @@ pub fn ordered_ctr_per_permutation(
             ));
         };
         let bucket = bin as usize;
-        let (n0, n1) = counts.get(bucket).map_or((0, 0), |e| (e[0], e[1]));
-        step_num.push(n1);
-        step_denom.push(n0 + n1);
+        // Re-routed through the SAME generic producer as `online_ctr_prefix_binclf`
+        // above. Both loops MUST use it: this second derivation is independent, so
+        // re-routing only one of the two would let them silently diverge (E05).
+        let slots: &[i64] = counts.get(bucket).map_or(&[][..], |e| &e[..]);
+        let (num, denom) = online_class_prefix(slots, 0, crate::ctr::ECtrType::Borders);
+        step_num.push(num as i64);
+        step_denom.push(denom);
         if let Some(elem) = counts.get_mut(bucket) {
             if let Some(c) = elem.get_mut(class) {
                 *c += 1;

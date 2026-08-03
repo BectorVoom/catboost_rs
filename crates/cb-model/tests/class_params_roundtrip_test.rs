@@ -22,45 +22,37 @@ use cb_model::{
 /// (length `2 leaves * 3 dims`), `approx_dimension=3`, and the SORTED distinct
 /// class labels `[10, 20, 30]`.
 fn multiclass_model() -> Model {
-    Model {
-        oblivious_trees: vec![ObliviousTree {
-            splits: vec![ModelSplit::Float(Split {
-                feature: 0,
-                border: 0.5,
-            })],
-            // d0:[1,2] d1:[3,4] d2:[5,6]
-            leaf_values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            leaf_weights: vec![0.0, 0.0],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.0,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 3,
-        class_to_label: vec![10.0, 20.0, 30.0],
-    }
+    Model::new(
+        vec![ObliviousTree {
+                splits: vec![ModelSplit::Float(Split {
+                    feature: 0,
+                    border: 0.5,
+                })],
+                // d0:[1,2] d1:[3,4] d2:[5,6]
+                leaf_values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                leaf_weights: vec![0.0, 0.0],
+            }],
+        0.0,
+        vec![vec![0.5]],
+    )
+    .with_approx_dimension(3)
+    .with_class_to_label(vec![10.0, 20.0, 30.0])
 }
 
 /// A scalar (dim=1) model with NO class labels — the byte-identity reference.
 fn scalar_model() -> Model {
-    Model {
-        oblivious_trees: vec![ObliviousTree {
-            splits: vec![ModelSplit::Float(Split {
-                feature: 0,
-                border: 0.5,
-            })],
-            leaf_values: vec![-1.0, 2.0],
-            leaf_weights: vec![0.0, 0.0],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.25,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    Model::new(
+        vec![ObliviousTree {
+                splits: vec![ModelSplit::Float(Split {
+                    feature: 0,
+                    border: 0.5,
+                })],
+                leaf_values: vec![-1.0, 2.0],
+                leaf_weights: vec![0.0, 0.0],
+            }],
+        0.25,
+        vec![vec![0.5]],
+    )
 }
 
 fn tmp(name: &str) -> PathBuf {

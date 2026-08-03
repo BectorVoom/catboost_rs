@@ -283,3 +283,57 @@ fn sample_zero_or_empty_errs() {
     );
     assert!(sample_indices(0, 3, 0).is_empty(), "m == 0 ⇒ empty sample");
 }
+
+/// F14 test fn 2 (SPEC-CATF-Δ6) — `grid_search` on a categorical pool FAILS
+/// FAST rather than degrading to an all-NaN `SearchResult`.
+///
+/// The hazard this closes is not merely an error-vs-ok difference. With
+/// `ErrorScore::Value(NaN)` (the sklearn default), EVERY candidate would fail
+/// from inside its fold, `warn_fit_failed` would emit a warning, and a
+/// `SearchResult` with all-NaN scores and an arbitrary `best_index` would be
+/// RETURNED — a silent degradation, not an error. A categorical pool is a
+/// CONFIGURATION failure, not a candidate failure, so converting it into
+/// `error_score` is category confusion.
+#[test]
+fn grid_search_on_a_categorical_pool_fails_fast_not_as_all_nan_scores() {
+    let n = 40_usize;
+    let label: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+    let cat: Vec<String> = (0..n).map(|i| format!("c{}", i % 9)).collect();
+    let floats = vec![(0..n).map(|i| (i % 7) as f64).collect::<Vec<f64>>()];
+    use crate::IngestSource as _;
+    let pool = crate::OwnedColumns::new(floats, label)
+        .with_cat_features(vec![cat])
+        .into_pool()
+        .expect("categorical pool builds");
+
+    let candidates = vec![
+        crate::CatBoostBuilder::new().iterations(3).depth(2),
+        crate::CatBoostBuilder::new().iterations(4).depth(3),
+    ];
+
+    let result = crate::grid_search::grid_search(
+        &pool,
+        &candidates,
+        &["RMSE"],
+        3,
+        false,
+        0,
+        false,
+        None,
+        false,
+        crate::grid_search::ErrorScore::Value(f64::NAN),
+    );
+
+    match result {
+        Err(crate::CatBoostError::UnsupportedModel(msg)) => {
+            assert!(
+                msg.contains("categorical"),
+                "the error must name the categorical columns, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected UnsupportedModel, got {other:?}"),
+        Ok(_) => panic!(
+            "grid_search SILENTLY DEGRADED a categorical pool to an all-NaN SearchResult"
+        ),
+    }
+}

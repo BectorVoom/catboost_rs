@@ -149,21 +149,26 @@ fn bootstrap_oracle_no() {
     check_scenario("bootstrap/no", EBootstrapType::No, 1.0, 0.0);
 }
 
-// KNOWN RESIDUAL (TRAIN-04): the Bayesian per-block weight draws and the
-// per-1000-block reseed are unit-verified
-// (`bootstrap::tests::bayesian_draw_sequence_matches_reference_across_two_blocks`)
-// and the FIRST tree's splits + leaf values lock end-to-end at <= 1e-5 against
-// the upstream fixture. The SECOND tree onward diverges by a small amount
-// (~0.02 on the first tree-1 split border): the tree-1+ Bayesian weights do not
-// shift the split the way upstream's do, and the divergence is INSENSITIVE to
-// the main-RNG phase (no `pre`/`post`/extra-draw offset moves it), so it is a
-// structural Bayesian-specific issue in the multi-tree draw stream rather than a
-// phase misalignment. No/Bernoulli/MVS lock end-to-end (object subsample and the
-// MVS importance sampler reproduce upstream exactly). Tracked as a deferred
-// follow-up; gated `#[ignore]` so it does not block the wave while the first-tree
-// lock and the draw-sequence unit test stand as the TRAIN-04 Bayesian evidence.
+// RESOLVED (TRAIN-04, 2026-07-30): the tree-1+ divergence this test used to
+// hit was a genuine per-tree RNG-phase-accounting gap in `boosting.rs`'s
+// shared bulk-advance branch — NOT a Bayesian-weight-formula bug, and NOT
+// "insensitive to phase" as an earlier version of this comment claimed.
+// Root-caused with real ground truth from an instrumented upstream CatBoost
+// 1.2.10 build (`CB_INSTRUMENT_LOG`, this repo's own committed patches, no new
+// C++ written — see `.planning/plans/bayesian-rng-draw-accounting/
+// instrumented-ground-truth/GROUND_TRUTH.md`): upstream draws, per level, an
+// UNCONDITIONAL `n_features`-count RSM-reselection pass
+// (`SelectFeaturesForScoring`) that Rust had ZERO accounting for, and
+// `SelectBestCandidate`'s per-candidate normal draw applies to EVERY listed
+// float feature (including border-less/unused-but-quantized ones), which
+// `tree.rs::select_level_perturbed` was incorrectly skipping. The
+// leaf-estimation-seed draw is 2 per tree, not 1. Fixed by widening `perturb`
+// construction from `perturb_active` to `draws_active` (so these real,
+// value-invariant-at-`std_dev=0` draws always run inline) and adding the
+// missing RSM/border-less draws — verified against ALL FOUR bootstrap-type
+// scenarios (Bayesian/Bernoulli/MVS/No) via the same instrumented traces, not
+// just this one.
 #[test]
-#[ignore = "Bayesian tree-1+ residual divergence (first tree + draw sequence locked); see comment"]
 fn bootstrap_oracle_bayesian() {
     check_scenario("bootstrap/bayesian", EBootstrapType::Bayesian, 1.0, 1.0);
 }

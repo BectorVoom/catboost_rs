@@ -189,3 +189,113 @@ fn poisson_is_rejected_on_cpu() {
     let res = bootstrap(EBootstrapType::Poisson, &ders, 0.8, 0.0, None, &mut rng);
     assert!(res.is_err(), "Poisson must be rejected on CPU");
 }
+
+/// `MVS-S1`: an MVS `Bootstrap()` call consumes EXACTLY ONE main-stream draw.
+///
+/// Upstream takes a single `randSeed = rand->GenRand()` (`mvs.cpp:174`) and nothing
+/// else: with `performRandomChoice = false`, `TCalcScoreFold::Sample` goes down the
+/// `SetControlNoZeroWeighted` branch (`calc_score_cache.cpp:742-748`), which never
+/// touches `rand`, and `CalcWeightedData` (`tensor_search_helpers.cpp:442-485`) is
+/// draw-free.
+///
+/// This is the contract no oracle can express. An oracle only sees the *consequence*
+/// — a wrong per-tree RNG phase flipping a split argmax somewhere down the boosting
+/// run — and only for the seed/bias combinations where the wrong subset happens to
+/// change an argmax at all. That is exactly how a 2-draw-per-tree defect survived
+/// with the committed `bootstrap/mvs` oracle green: it is one of the configurations
+/// that passed *despite* it. Pinning the draw count directly makes the defect
+/// impossible to reintroduce silently.
+///
+/// All four legs assert the SAME single behaviour — the per-call main-stream draw
+/// count — so a failure has one principal cause.
+#[test]
+fn mvs_bootstrap_consumes_exactly_one_main_stream_draw() {
+    let n = 1500; // one MVS block (< 8192); the fixture's object count.
+    // Varied gradient magnitudes so the threshold is non-degenerate.
+    let ders: Vec<f64> = (0..n).map(|i| (i as f64 % 13.0) - 6.0).collect();
+    let seed = 0_u64;
+
+    // (1) The count itself — the assertion whose failure names the defect.
+    let mut rng = TFastRng64::from_seed(seed);
+    let _ = bootstrap(EBootstrapType::Mvs, &ders, 0.8, 0.0, None, &mut rng).unwrap();
+    assert_eq!(
+        rng.call_count(),
+        1,
+        "an MVS bootstrap() call must consume exactly ONE main-stream draw (the \
+         rand_seed); the per-block sample streams branch off it via \
+         TFastRng64::from_seed(rand_seed + block_idx) and never touch the main stream"
+    );
+
+    // (2) The state, not just the count: a wrong draw KIND would keep the count
+    //     right and still desynchronise every later tree.
+    let mut probe = TFastRng64::from_seed(seed);
+    let _ = probe.gen_rand();
+    assert_eq!(
+        rng.raw_state(),
+        probe.raw_state(),
+        "the one draw must be a bare gen_rand() on the main stream"
+    );
+
+    // (3) Zero-draw regression leg: `subsample >= 1.0` short-circuits to the
+    //     identity sample and must consume nothing at all.
+    let mut rng_full = TFastRng64::from_seed(seed);
+    let _ = bootstrap(EBootstrapType::Mvs, &ders, 1.0, 0.0, None, &mut rng_full).unwrap();
+    assert_eq!(
+        rng_full.call_count(),
+        0,
+        "MVS at subsample >= 1.0 must draw nothing (the identity short-circuit)"
+    );
+
+    // (4) Accumulation leg: the real hazard is CUMULATIVE per-tree drift, so pin
+    //     the count across consecutive calls on ONE continuous stream.
+    let mut rng_multi = TFastRng64::from_seed(seed);
+    for _ in 0..3 {
+        let _ = bootstrap(EBootstrapType::Mvs, &ders, 0.8, 0.0, None, &mut rng_multi).unwrap();
+    }
+    assert_eq!(
+        rng_multi.call_count(),
+        3,
+        "three consecutive MVS bootstrap() calls must consume exactly three draws; \
+         any surplus is a per-tree phase drift that desynchronises every later tree"
+    );
+}
+
+/// `MVS-S4` / `MVS-S5`: the two f32 transcription fidelities in the MVS sampler.
+///
+/// `TMvsSampler::SampleRate` is a `float` (`mvs.h:47`), so upstream's per-block
+/// threshold-search target `SampleRate * blockSize` is an f32 product. Computing it in
+/// f64 shifts the target by up to ~2.4e-4 at realistic block sizes, which can move the
+/// threshold and therefore which objects survive sampling.
+///
+/// The `(0.8, 8192)` case is the no-regression leg: scaling by a power of two is
+/// already exact, so it must hold both before and after. `(0.8, 1500)` and
+/// `(0.8, 3616)` are the discriminating cases — an f64 product gives `1200.0000178813934`
+/// and `2892.800043106079` respectively.
+#[test]
+fn mvs_f32_transcription_targets_and_weight_narrowing() {
+    use crate::bootstrap::mvs_block_sample_size;
+
+    // MVS-S4: the block threshold target reproduces upstream's `float * ui32`.
+    assert_eq!(mvs_block_sample_size(0.8, 1500), 1200.0);
+    assert_eq!(mvs_block_sample_size(0.8, 8192), 6553.600_097_656_25);
+    assert_eq!(mvs_block_sample_size(0.8, 3616), 2892.800_048_828_125);
+
+    // MVS-S5: every stored MVS weight round-trips through f32 losslessly, mirroring
+    // upstream's `TVector<float> SampleWeights` (`fold.h:217`).
+    let n = 2000;
+    let ders: Vec<f64> = (0..n).map(|i| (i as f64 % 13.0) - 6.0).collect();
+    let mut rng = TFastRng64::from_seed(0);
+    let res = bootstrap(EBootstrapType::Mvs, &ders, 0.5, 0.0, None, &mut rng).unwrap();
+    let kept = res.sample_weights.iter().filter(|&&w| w > 0.0).count();
+    assert!(kept > 0 && kept < n, "the sample must be non-degenerate");
+    for (&w, &c) in res.sample_weights.iter().zip(res.control.iter()) {
+        assert_eq!(
+            w,
+            f64::from(w as f32),
+            "MVS sample weights must be f32-representable (fold.h:217)"
+        );
+        // The narrowing must not disturb the control mask: a kept weight is 1/p >= 1,
+        // far above f32::EPSILON, and a dropped one is bit-exact 0.0.
+        assert_eq!(c, w > f64::from(f32::EPSILON));
+    }
+}

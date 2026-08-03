@@ -27,6 +27,13 @@ pub(crate) struct EstimatorBase {
     pub(crate) params: BTreeMap<String, Py<PyAny>>,
     /// The fitted model; `None` means not-yet-fitted.
     pub(crate) model: Option<Model>,
+    /// The categorical column indices this estimator was FITTED with (F17).
+    ///
+    /// Remembered because predict MUST declare the same categorical width: after
+    /// F10 the model checks the pool's declared width against the width recorded
+    /// at fit time, so a predict pool ingested without `cat_features` would be
+    /// rejected. Empty for a float-only fit.
+    pub(crate) cat_features: Vec<usize>,
 }
 
 impl EstimatorBase {
@@ -46,6 +53,7 @@ impl EstimatorBase {
         Ok(Self {
             params,
             model: None,
+            cat_features: Vec::new(),
         })
     }
 
@@ -57,6 +65,11 @@ impl EstimatorBase {
         Self {
             params: BTreeMap::new(),
             model: Some(model),
+            // A loaded model carries no fit-time categorical record: neither the
+            // .cbm nor the JSON codec stores `cat_feature_count` (it is
+            // runtime-only, F08), so `load_model` + `predict` works for
+            // float-only models and reports a typed width mismatch otherwise.
+            cat_features: Vec::new(),
         }
     }
 
@@ -194,15 +207,135 @@ pub(crate) fn accuracy_score(y: &[f64], pred: &[f64]) -> f64 {
     correct as f64 / n as f64
 }
 
-/// Build a [`CatBoostBuilder`] from the params and fit it on an OWNED pool. The
-/// caller is expected to invoke this under `py.detach` (the `pool` is owned, so
-/// no Python buffer borrow is alive — D-11). Returns the typed facade
-/// [`CatBoostError`]; the caller maps it via `errors::to_pyerr` (PYAPI-05).
+/// Build a [`CatBoostBuilder`] from the params and fit it on an OWNED learn pool
+/// with OWNED eval pools (PARAM-02). The caller is expected to invoke this under
+/// `py.detach` (every pool is owned, so no Python buffer borrow is alive — D-11).
+/// Returns the typed facade [`CatBoostError`]; the caller maps it via
+/// `errors::to_pyerr` (PYAPI-05).
+///
+/// An EMPTY `eval_pools` is a plain learn-only fit: the facade's
+/// `fit_with_eval_sets` and `fit` share one inner, so passing no eval set is
+/// byte-identical to calling `fit` directly.
 ///
 /// # Errors
-/// Returns the facade [`CatBoostError`] training error.
-pub(crate) fn fit_pool(builder: CatBoostBuilder, pool: &Pool) -> Result<Model, CatBoostError> {
-    builder.fit(pool)
+/// Returns the facade [`CatBoostError`] training error (including
+/// `FeatureMismatch` when an eval pool's width disagrees with the learn pool's).
+pub(crate) fn fit_pool_with_eval(
+    builder: CatBoostBuilder,
+    pool: &Pool,
+    eval_pools: &[Pool],
+) -> Result<Model, CatBoostError> {
+    let refs: Vec<&Pool> = eval_pools.iter().collect();
+    builder.fit_with_eval_sets(pool, &refs).map(|out| out.model)
+}
+
+/// Ingest the `eval_set` fit kwarg into owned [`Pool`]s (PARAM-02).
+///
+/// Upstream accepts any of:
+///  - a single `Pool`;
+///  - a single `(X, y)` tuple;
+///  - a LIST of either.
+///
+/// All four shapes are accepted here and normalized to a vector of owned pools,
+/// ingested through the SAME [`data_to_pool`] path as the learn set so an eval
+/// set gets identical dtype / layout / nullability validation (D-12).
+///
+/// `cat_features` is threaded through so an eval set declares the same
+/// categorical columns the learn set does — the facade rejects a width mismatch,
+/// and without this an eval set built from a DataFrame would silently arrive
+/// float-only.
+///
+/// # Errors
+/// [`CatBoostValueError`] on any shape the four forms above do not cover, or any
+/// ingestion failure of a member.
+pub(crate) fn eval_set_to_pools(
+    py: Python<'_>,
+    eval_set: &Bound<'_, PyAny>,
+    cat_features: &[usize],
+) -> PyResult<Vec<Pool>> {
+    if eval_set.is_none() {
+        return Ok(Vec::new());
+    }
+    // A `Pool` is itself iterable-looking to nothing, but a TUPLE is: check the
+    // single-Pool and single-tuple forms BEFORE the list form, otherwise
+    // `(X, y)` would be read as "a list of two eval sets".
+    if eval_set.cast::<crate::pool::Pool>().is_ok() {
+        return Ok(vec![one_eval_pool(py, eval_set, cat_features)?]);
+    }
+    if let Ok(tuple) = eval_set.cast::<pyo3::types::PyTuple>() {
+        if tuple.len() == 2 {
+            return Ok(vec![one_eval_pool(py, eval_set, cat_features)?]);
+        }
+        return Err(CatBoostValueError::new_err(format!(
+            "eval_set tuple must be (X, y), got {} elements",
+            tuple.len()
+        )));
+    }
+    if let Ok(list) = eval_set.cast::<pyo3::types::PyList>() {
+        let mut pools = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            pools.push(one_eval_pool(py, &item, cat_features)?);
+        }
+        return Ok(pools);
+    }
+    Err(CatBoostValueError::new_err(
+        "eval_set must be a Pool, an (X, y) tuple, or a list of either",
+    ))
+}
+
+/// Ingest ONE eval-set member (a `Pool` or an `(X, y)` tuple) into an owned pool.
+fn one_eval_pool(
+    py: Python<'_>,
+    item: &Bound<'_, PyAny>,
+    cat_features: &[usize],
+) -> PyResult<Pool> {
+    if item.cast::<crate::pool::Pool>().is_ok() {
+        // A Pool already declares its own categorical columns; passing
+        // `cat_features` alongside one is the same ambiguity `data_to_pool`
+        // rejects for the learn set, so route through it with no declaration.
+        return data_to_pool(py, item, None, None);
+    }
+    let tuple = item.cast::<pyo3::types::PyTuple>().map_err(|_| {
+        CatBoostValueError::new_err(
+            "each eval_set entry must be a Pool or an (X, y) tuple",
+        )
+    })?;
+    if tuple.len() != 2 {
+        return Err(CatBoostValueError::new_err(format!(
+            "eval_set tuple must be (X, y), got {} elements",
+            tuple.len()
+        )));
+    }
+    let x = tuple.get_item(0)?;
+    let y = tuple.get_item(1)?;
+    data_to_pool(py, &x, Some(&y), Some(cat_features))
+}
+
+/// Resolve the categorical column indices for one `fit()` call (F17).
+///
+/// Upstream accepts `cat_features` BOTH as a constructor kwarg and as a `fit()`
+/// kwarg; the `fit()` argument wins when both are given. Returns an empty vector
+/// for a float-only fit.
+///
+/// # Errors
+/// [`CatBoostValueError`] if the constructor's `cat_features` is not a list of
+/// non-negative integers.
+pub(crate) fn resolve_cat_features(
+    params: &BTreeMap<String, Py<PyAny>>,
+    py: Python<'_>,
+    fit_kwarg: Option<Vec<usize>>,
+) -> PyResult<Vec<usize>> {
+    if let Some(from_fit) = fit_kwarg {
+        return Ok(from_fit);
+    }
+    match params.get("cat_features") {
+        None => Ok(Vec::new()),
+        Some(obj) => obj.bind(py).extract::<Vec<usize>>().map_err(|_| {
+            CatBoostValueError::new_err(
+                "cat_features must be a list of non-negative column indices, e.g. [0, 3]",
+            )
+        }),
+    }
 }
 
 /// Build a facade [`Pool`] from `x` (+ optional `y`), accepting EITHER a native
@@ -237,16 +370,69 @@ pub(crate) fn data_to_pool(
     py: Python<'_>,
     x: &Bound<'_, PyAny>,
     y: Option<&Bound<'_, PyAny>>,
+    cat_features: Option<&[usize]>,
 ) -> PyResult<Pool> {
     if let Ok(pool_ref) = x.cast::<crate::pool::Pool>() {
         // Pool fast-path (WR-04): `y` is intentionally ignored (the Pool carries its
         // own label) and only the inherited length check runs here — a feature-width
         // mismatch defers to the facade's `FeatureMismatch` inside `predict_with`.
+        //
+        // F17 / OQ-3 (upstream-exact, core.py:1522-1533): a `Pool` already
+        // declares its own categorical columns, so combining it with an explicit
+        // `cat_features` is ambiguous and upstream RAISES. Silently preferring
+        // one over the other would be exactly the kind of ignored argument the
+        // honesty policy forbids.
+        if cat_features.is_some_and(|c| !c.is_empty()) {
+            return Err(CatBoostValueError::new_err(
+                "cat_features cannot be given when the data is a Pool: the Pool \
+                 already declares its categorical columns (construct it with \
+                 `Pool(..., cat_features=[...])` instead)",
+            ));
+        }
         return pool_ref.borrow().to_pool();
     }
-    ingest_to_owned(py, x, y, None)?
+
+    // MINOR-11: de-duplicate and range-check BEFORE ingestion. Without this,
+    // `cat_features=[2, 2]` declares "2 categorical columns" and then produces
+    // one, so the width guard below mis-reports "declared 2 ... carries 1"
+    // instead of naming the real problem (the duplicate).
+    let declared: Vec<usize> = match cat_features {
+        None => Vec::new(),
+        Some(list) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for &idx in list {
+                if !seen.insert(idx) {
+                    return Err(CatBoostValueError::new_err(format!(
+                        "cat_features contains duplicate column index {idx}"
+                    )));
+                }
+            }
+            seen.into_iter().collect()
+        }
+    };
+
+    let owned = ingest_to_owned(py, x, y, Some(&declared))?;
+    let pool = owned
         .into_pool()
-        .map_err(|e| CatBoostValueError::new_err(e.to_string()))
+        .map_err(|e| CatBoostValueError::new_err(e.to_string()))?;
+
+    // F17 / Finding F2: `ingest_to_owned`'s NumPy branch calls
+    // `numpy_to_owned(x, y)` and DROPS `cat_features` entirely, so a user who
+    // passes `cat_features=[3]` with a NumPy matrix would otherwise train a
+    // float-only model and never learn that the argument did nothing. The guard
+    // lives HERE rather than in `ingest_py.rs`, which SPEC §7 lists as
+    // verification-only.
+    if pool.n_cat_features() != declared.len() {
+        return Err(CatBoostValueError::new_err(format!(
+            "cat_features declared {} categorical column(s) but the ingested data \
+             carries {}; the NumPy ingestion path cannot carry categorical columns \
+             (its dtype is float32) — pass a Pandas DataFrame, an Arrow/Polars \
+             table, or a `Pool` constructed with `cat_features=[...]`",
+            declared.len(),
+            pool.n_cat_features()
+        )));
+    }
+    Ok(pool)
 }
 
 /// Shared FSTR-03 partial-dependence adapter for the estimators. Ingests `x` into
@@ -265,9 +451,10 @@ pub(crate) fn partial_dependence_py<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
     features: Vec<usize>,
+    cat_features: &[usize],
 ) -> PyResult<Bound<'py, PyDict>> {
     // --- GIL HELD: own the input before any detach (D-11) ---
-    let pool = data_to_pool(py, x, None)?;
+    let pool = data_to_pool(py, x, None, Some(cat_features))?;
     // --- owned data only: safe to release the GIL for the compute ---
     let pd = py
         .detach(|| model.partial_dependence(&pool, &features))

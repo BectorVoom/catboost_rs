@@ -271,3 +271,125 @@ fn deeply_nested_non_symmetric_tree_is_a_typed_error_not_a_stack_overflow() {
         "an over-deep tree must be a typed error, not unbounded recursion"
     );
 }
+
+/// T02b / SPEC-OH-28 (enabler): an upstream `model.json` containing a
+/// `OneHotFeature` split must PARSE, and `float_feature_borders()` must still
+/// yield exactly the float features' borders — a one-hot split contributes no
+/// border.
+///
+/// Upstream emits a one-hot split as
+/// `{"split_index":…,"cat_feature_index":…,"value":…,"split_type":"OneHotFeature"}`
+/// with **no `border` key** (research.md §4.2, byte-verified against a real
+/// catboost 1.2.10 model). Requiring `border` therefore rejects a genuine
+/// upstream document outright — exactly as requiring `float_feature_index`
+/// once rejected `OnlineCtr` models.
+#[test]
+fn upstream_one_hot_model_json_parses_and_yields_float_borders_only() {
+    // One float split (carries `border`) + one one-hot split (does NOT).
+    let json = r#"{
+        "features_info": {
+            "float_features": [
+                {"feature_index": 0, "borders": [-0.23132047, 0.17452943]}
+            ]
+        },
+        "oblivious_trees": [
+            {
+                "leaf_values": [0.0, 1.0, 2.0, 3.0],
+                "splits": [
+                    {"border": -0.23132047, "float_feature_index": 0,
+                     "split_index": 0, "split_type": "FloatFeature"},
+                    {"cat_feature_index": 0, "value": -1438285038,
+                     "split_index": 2, "split_type": "OneHotFeature"}
+                ]
+            }
+        ],
+        "scale_and_bias": [1, [0.0]]
+    }"#;
+
+    let model: crate::model_json::ModelJson =
+        serde_json::from_str(json).expect("an upstream one-hot model.json must parse");
+
+    // The float borders are read from `features_info`, not from the splits, so a
+    // one-hot split must not inject a phantom border.
+    assert_eq!(
+        model.float_feature_borders(),
+        vec![vec![-0.23132047, 0.17452943]],
+        "float_feature_borders() must return exactly the float features' borders"
+    );
+
+    let splits = &model
+        .oblivious_trees
+        .first()
+        .expect("one tree")
+        .splits;
+    assert_eq!(splits.len(), 2, "both splits must survive the parse");
+    assert!(
+        !splits[0].is_one_hot(),
+        "the FloatFeature split must not be classified one-hot"
+    );
+    assert!(
+        splits[1].is_one_hot(),
+        "the OneHotFeature split must be classified one-hot"
+    );
+    assert_eq!(
+        splits[1].cat_feature_index,
+        Some(0),
+        "the one-hot split carries its categorical feature index"
+    );
+    assert_eq!(
+        splits[1].value,
+        Some(-1_438_285_038),
+        "the one-hot split carries the raw upstream i32 category hash"
+    );
+}
+
+/// T02b second validation (deferred until T02 landed the fixture): the parser
+/// tolerates the REAL committed upstream one-hot `model.json`, not merely the
+/// inline document above.
+#[test]
+fn real_upstream_one_hot_fixture_model_json_parses() {
+    for scenario in ["default_binary", "multi"] {
+        let path = fixture(&format!("one_hot_train/{scenario}/model.json"));
+        let model =
+            load_model_json(&path).unwrap_or_else(|e| panic!("{scenario}/model.json parses: {e}"));
+
+        // The float borders come from `features_info`, so one-hot splits inject
+        // no phantom border.
+        let borders = model.float_feature_borders();
+        assert!(
+            !borders.is_empty(),
+            "{scenario}: expected at least one float feature"
+        );
+
+        // At least one OneHotFeature split must be present — otherwise the
+        // fixture would not exercise the path it exists for.
+        let one_hot_splits: usize = model
+            .oblivious_trees
+            .iter()
+            .flat_map(|t| t.splits.iter())
+            .filter(|s| s.is_one_hot())
+            .count();
+        assert!(
+            one_hot_splits > 0,
+            "{scenario}: fixture must contain at least one OneHotFeature split"
+        );
+
+        // Every one-hot split carries its cat index and raw hash value, and no
+        // meaningful border.
+        for split in model
+            .oblivious_trees
+            .iter()
+            .flat_map(|t| t.splits.iter())
+            .filter(|s| s.is_one_hot())
+        {
+            assert!(
+                split.cat_feature_index.is_some(),
+                "{scenario}: a one-hot split must carry cat_feature_index"
+            );
+            assert!(
+                split.value.is_some(),
+                "{scenario}: a one-hot split must carry its raw i32 category hash"
+            );
+        }
+    }
+}

@@ -1,0 +1,232 @@
+gpu: Tesla T4, 580.82.07
+nvcc: Build cuda_12.8.r12.8/compiler.35583870_0
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+### START cuda_device_bootstrap_parity Thu Jul 30 08:15:03 AM UTC 2026
+### cuda_device_bootstrap_parity rc=0
+test wr01_base_device_grower_holds_1e5_vs_cpu ... [BASE n=512 nf=4 d=3 it=5] max|Δpred|=3.605e-11 split_mismatched_trees=0/5
+[BASE n=2048 nf=8 d=6 it=10] max|Δpred|=5.992e-11 split_mismatched_trees=0/10
+[BASE n=20000 nf=16 d=6 it=20] max|Δpred|=6.212e-11 split_mismatched_trees=4/20
+[BASE n=20000 nf=16 d=6 it=20]   tree 0 split-mismatch: max|Δcontribution|=2.799e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 4 split-mismatch: max|Δcontribution|=1.847e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 9 split-mismatch: max|Δcontribution|=2.405e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 19 split-mismatch: max|Δcontribution|=2.121e-11
+test wr01_device_run_to_run_jitter_within_budget ... [jitter/no] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/bernoulli] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/mvs] run-to-run max|Δpred| over 5 fits = 0.000e0
+test wr01_device_sampled_bootstrap_holds_1e5_vs_cpu ... [bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.589e-11 split_mismatched_trees=2/20 first_mismatched_trees=[0, 3]
+[bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=3.003e-3
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.477e-11 split_mismatched_trees=4/20 first_mismatched_trees=[0, 5, 17, 19]
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=4.878e-3
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=4.703e-11 split_mismatched_trees=4/20 first_mismatched_trees=[0, 2, 3, 4]
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=2.558e-3
+test wr01_poisson_is_rejected_identically_on_every_backend ... [poisson] both backends rejected identically: degenerate training input: poisson bootstrap is not supported on CPU
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 151.01s
+running 4 tests
+test wr01_base_device_grower_holds_1e5_vs_cpu ... [BASE n=512 nf=4 d=3 it=5] max|Δpred|=3.605e-11 split_mismatched_trees=0/5
+[BASE n=2048 nf=8 d=6 it=10] max|Δpred|=5.992e-11 split_mismatched_trees=0/10
+[BASE n=20000 nf=16 d=6 it=20] max|Δpred|=6.212e-11 split_mismatched_trees=4/20
+[BASE n=20000 nf=16 d=6 it=20]   tree 0 split-mismatch: max|Δcontribution|=2.799e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 4 split-mismatch: max|Δcontribution|=1.847e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 9 split-mismatch: max|Δcontribution|=2.405e-11
+[BASE n=20000 nf=16 d=6 it=20]   tree 19 split-mismatch: max|Δcontribution|=2.121e-11
+ok
+test wr01_device_run_to_run_jitter_within_budget ... [jitter/no] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/bernoulli] run-to-run max|Δpred| over 5 fits = 0.000e0
+[jitter/mvs] run-to-run max|Δpred| over 5 fits = 0.000e0
+ok
+test wr01_device_sampled_bootstrap_holds_1e5_vs_cpu ... [bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.589e-11 split_mismatched_trees=2/20 first_mismatched_trees=[0, 3]
+[bernoulli n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=3.003e-3
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=5.477e-11 split_mismatched_trees=4/20 first_mismatched_trees=[0, 5, 17, 19]
+[bayesian n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=4.878e-3
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(device,cpu)|=4.703e-11 split_mismatched_trees=4/20 first_mismatched_trees=[0, 2, 3, 4]
+[mvs n=20000 nf=16 d=6 it=20] max|Δpred(sampled,unsampled)|=2.558e-3
+ok
+test wr01_poisson_is_rejected_identically_on_every_backend ... [poisson] both backends rejected identically: degenerate training input: poisson bootstrap is not supported on CPU
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 151.01s
+
+### END cuda_device_bootstrap_parity Thu Jul 30 08:24:51 AM UTC 2026
+### START cuda_bias0_device_vs_upstream Thu Jul 30 08:24:51 AM UTC 2026
+### cuda_bias0_device_vs_upstream rc=0
+test bootstrap_dev_device_matches_upstream ... [device] bootstrap_dev/no: splits + leaf values + staged within 1e-5 of upstream over 3/3 trees
+[device] bootstrap_dev/bayesian: splits + leaf values + staged within 1e-5 of upstream over 3/3 trees
+[device] bootstrap_dev/bernoulli: splits + leaf values + staged within 1e-5 of upstream over 3/3 trees
+[device] bootstrap_dev/mvs: splits + leaf values + staged within 1e-5 of upstream over 2/3 trees
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+    = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling cb-train v0.1.0 (/content/cbrs/crates/cb-train)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.75s
+     Running tests/bootstrap_dev_oracle_test.rs (target/debug/deps/bootstrap_dev_oracle_test-d24ddddfb53097e2)
+
+running 1 test
+test bootstrap_dev_device_matches_upstream ... [device] bootstrap_dev/no: splits + leaf values + staged within 1e-5 of upstream over 3/3 trees
+[device] bootstrap_dev/bayesian: splits + leaf values + staged within 1e-5 of upstream over 3/3 trees
+[device] bootstrap_dev/bernoulli: splits + leaf values + staged within 1e-5 of upstream over 3/3 trees
+[device] bootstrap_dev/mvs: splits + leaf values + staged within 1e-5 of upstream over 2/3 trees
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+
+### END cuda_bias0_device_vs_upstream Thu Jul 30 08:25:04 AM UTC 2026
+### START cuda_device_speed_ratio Thu Jul 30 08:25:04 AM UTC 2026
+### cuda_device_speed_ratio rc=0
+[speed] Bernoulli 0.108s  ratio_vs_No=1.32x
+[speed] Bayesian  0.129s  ratio_vs_No=1.58x
+[speed] MVS       0.145s  ratio_vs_No=1.78x
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling py_literal v0.4.0
+   Compiling zip v6.0.0
+   Compiling ndarray v0.17.2
+   Compiling byteorder v1.5.0
+   Compiling ndarray-npy v0.10.0
+   Compiling cb-train v0.1.0 (/content/cbrs/crates/cb-train)
+   Compiling prost v0.14.4
+   Compiling cb-model v0.1.0 (/content/cbrs/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+   Compiling cb-oracle v0.1.0 (/content/cbrs/crates/cb-oracle)
+   Compiling approx v0.5.1
+    Finished `release` profile [optimized] target(s) in 22m 22s
+     Running tests/device_bootstrap_speed_test.rs (target/release/deps/device_bootstrap_speed_test-d215efcf5c80c662)
+
+running 1 test
+test wr01_sampled_fits_run_at_device_speed ... [speed] No        0.082s (device baseline, n=60000 nf=24)
+[speed] Bernoulli 0.108s  ratio_vs_No=1.32x
+[speed] Bayesian  0.129s  ratio_vs_No=1.58x
+[speed] MVS       0.145s  ratio_vs_No=1.78x
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+
+### END cuda_device_speed_ratio Thu Jul 30 08:47:30 AM UTC 2026
+### START cuda_backend_bootstrap_kernels Thu Jul 30 08:47:30 AM UTC 2026
+### cuda_backend_bootstrap_kernels rc=0
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 204 filtered out; finished in 2.01s
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 32s
+     Running unittests src/lib.rs (target/debug/deps/cb_backend-d8e942f82611bd49)
+
+running 7 tests
+test gpu_runtime::session_depth_gt1_test::session_bootstrap_gate_covers_bernoulli_bayesian_poisson ... ok
+test gpu_runtime::session_depth_gt1_test::session_bootstrap_grows_finite_tree ... ok
+test kernels::bootstrap_device_test::bayesian_weights_match_frozen_cpu_sample_within_epsilon ... [bootstrap bayesian seed=17 temp=1 n=64] max_div=2.384e-7
+[bootstrap bayesian seed=7 temp=0.5 n=1536] max_div=2.384e-7
+ok
+test kernels::bootstrap_device_test::bernoulli_keep_mask_matches_frozen_cpu_sample_bit_for_bit ... [bootstrap bernoulli seed=17 rate=0.5] kept device=25 cpu=25 / 37
+[bootstrap bernoulli seed=42 rate=0.7] kept device=86 cpu=86 / 128
+[bootstrap bernoulli seed=123 rate=0.3] kept device=79 cpu=79 / 250
+ok
+test kernels::bootstrap_device_test::bernoulli_leaves_match_transitively_via_identical_mask ... [bootstrap leaves] device=-0.62965180 cpu=-0.62965180 div=0.000e0
+ok
+test kernels::bootstrap_device_test::poisson_weights_are_deterministic_and_nonnegative_integers ... [bootstrap poisson] n=200 mean_count=1.095 (Poisson(1) ⇒ ~1.0)
+ok
+test kernels::bootstrap_device_test::score_stddev_is_deterministic_and_matches_population_stddev ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 204 filtered out; finished in 2.01s
+
+### END cuda_backend_bootstrap_kernels Thu Jul 30 08:53:04 AM UTC 2026
+### START cuda_backend_mvs_kernels Thu Jul 30 08:53:04 AM UTC 2026
+### cuda_backend_mvs_kernels rc=0
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 2.13s
+
+warning: variable does not need to be mutable
+   --> crates/cb-backend/src/kernels/nonsym_grow_test.rs:181:9
+    |
+181 |     let mut do_split = |nodes: &mut Vec<RefNode>,
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `cb-backend` (lib test) generated 4 warnings (run `cargo fix --lib -p cb-backend --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+     Running unittests src/lib.rs (target/debug/deps/cb_backend-d8e942f82611bd49)
+
+running 3 tests
+test kernels::mvs_device_test::mvs_multi_block_reseed_is_deterministic_and_finite ... [mvs multiblock] n=8216 tail_kept(block1)=15/24
+ok
+test kernels::mvs_device_test::mvs_per_block_threshold_matches_and_reweight_is_consistent ... [mvs threshold] cpu_threshold=4.02701297 max_div=5.329e-15
+ok
+test kernels::mvs_device_test::mvs_weights_match_frozen_cpu_sample_within_epsilon ... [mvs seed=17 rate=0.5 n=48] max_div=4.441e-16 kept dev=25 cpu=25 (~target 24.0)
+[mvs seed=42 rate=0.7 n=64] max_div=6.661e-16 kept dev=47 cpu=47 (~target 44.8)
+[mvs seed=2024 rate=0.3 n=200] max_div=4.441e-15 kept dev=54 cpu=54 (~target 60.0)
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 2.13s
+
+### END cuda_backend_mvs_kernels Thu Jul 30 08:53:07 AM UTC 2026
+### START cpu_frozen_bootstrap_oracle Thu Jul 30 08:53:07 AM UTC 2026
+### cpu_frozen_bootstrap_oracle rc=0
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling prost v0.14.4
+   Compiling cb-oracle v0.1.0 (/content/cbrs/crates/cb-oracle)
+   Compiling cb-train v0.1.0 (/content/cbrs/crates/cb-train)
+   Compiling cb-model v0.1.0 (/content/cbrs/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 12s
+     Running tests/bootstrap_oracle_test.rs (target/debug/deps/bootstrap_oracle_test-61e4214f604c1c4b)
+
+running 5 tests
+test bootstrap_oracle_bayesian ... ok
+test bootstrap_oracle_bayesian_first_tree ... ok
+test bootstrap_oracle_bernoulli ... ok
+test bootstrap_oracle_mvs ... ok
+test bootstrap_oracle_no ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+### END cpu_frozen_bootstrap_oracle Thu Jul 30 09:01:20 AM UTC 2026
+### START cpu_draw_replay Thu Jul 30 09:01:20 AM UTC 2026
+### cpu_draw_replay rc=0
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 284 filtered out; finished in 0.03s
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+   --> crates/cb-backend/src/kernels.rs:673:38
+    |
+673 |             let mut contrib = F::new(0.0);
+    |                                      ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+   Compiling cb-train v0.1.0 (/content/cbrs/crates/cb-train)
+   Compiling cb-model v0.1.0 (/content/cbrs/crates/cb-model)
+warning: `cb-backend` (lib) generated 2 warnings (run `cargo fix --lib -p cb-backend` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 54.59s
+     Running unittests src/lib.rs (target/debug/deps/cb_train-e39db5748532eef2)
+
+running 5 tests
+test device_draw_replay::tests::replay_at_zero_features_still_takes_the_per_level_rand_seed ... ok
+test device_draw_replay::tests::replay_counts_borderless_features_because_the_grower_does ... ok
+test device_draw_replay::tests::replay_is_a_no_op_at_zero_depth ... ok
+test device_draw_replay::tests::replay_is_multi_tree_composable ... ok
+test device_draw_replay::tests::replay_matches_the_real_grower_rng_state_across_shapes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 284 filtered out; finished in 0.03s
+
+### END cpu_draw_replay Thu Jul 30 09:02:14 AM UTC 2026
+=== T4 ORACLE DONE Thu Jul 30 09:02:14 AM UTC 2026 ===
+
