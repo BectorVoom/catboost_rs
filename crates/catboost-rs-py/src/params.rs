@@ -39,7 +39,9 @@
 
 use std::collections::BTreeMap;
 
-use catboost_rs::{CatBoostBuilder, EBootstrapType, EScoreFunction, LeafMethod, Loss};
+use catboost_rs::{
+    CatBoostBuilder, CounterCalcMethod, EBootstrapType, ECtrType, EScoreFunction, LeafMethod, Loss,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
@@ -74,6 +76,29 @@ const IMPLEMENTED: &[&str] = &[
     "score_function",
     "boost_from_average",
     "leaf_estimation_method",
+    // The six categorical / CTR params promoted by F15-F17. Each is now
+    // GENUINELY consumed: F01-F05 gave the builder its setter, F09 routes a
+    // categorical pool through `train_cat`, and E10/E11/E22 made the engine read
+    // the type, the full prior list and `counter_calc_method`. `cat_features` is
+    // a `fit()` kwarg rather than a builder setter (F17) but is IMPLEMENTED all
+    // the same, so it must not be rejected as a parity gap.
+    "cat_features",
+    "one_hot_max_size",
+    "max_ctr_complexity",
+    "simple_ctr",
+    "combinations_ctr",
+    "counter_calc_method",
+];
+
+/// The four CTR types CatBoost implements ON CPU. `FloatTargetMeanValue` and
+/// `FeatureFreq` are GPU-only (`catboost_options.cpp:504-509`); upstream rejects
+/// them on CPU and so does this crate's engine (the E02 guard), so accepting
+/// them here would manufacture a kwarg that fails deeper with a worse message.
+const CPU_LEGAL_CTR_TYPES: &[&str] = &[
+    "Borders",
+    "Buckets",
+    "BinarizedTargetMeanValue",
+    "Counter",
 ];
 
 /// The full upstream `CatBoostClassifier.__init__` vocabulary (the AUTHORITATIVE
@@ -420,6 +445,158 @@ fn parse_bootstrap_type(name: &str) -> PyResult<EBootstrapType> {
     }
 }
 
+/// Map a `counter_calc_method` string onto a [`CounterCalcMethod`] (F15).
+///
+/// **Observable only with an eval set.** Training on a learn set alone produces
+/// bit-identical models under either setting (measured max|diff| `0.000e+00`
+/// learn-only versus `4.010e-01` with an eval set — the E23 gate), so this is
+/// NOT a blanket parity control: it bites only through the eval-set training
+/// entrypoint.
+fn parse_counter_calc_method(name: &str) -> PyResult<CounterCalcMethod> {
+    match name {
+        "SkipTest" => Ok(CounterCalcMethod::SkipTest),
+        "Full" => Ok(CounterCalcMethod::Full),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown counter_calc_method `{other}`; expected SkipTest or Full"
+        ))),
+    }
+}
+
+/// Map a CTR-type name onto an [`ECtrType`], rejecting the two GPU-only types
+/// by name with upstream's own reasoning (`catboost_options.cpp:504-509`).
+fn parse_ctr_type(name: &str, param: &str) -> PyResult<ECtrType> {
+    match name {
+        "Borders" => Ok(ECtrType::Borders),
+        "Buckets" => Ok(ECtrType::Buckets),
+        "BinarizedTargetMeanValue" => Ok(ECtrType::BinarizedTargetMeanValue),
+        "Counter" => Ok(ECtrType::Counter),
+        "FloatTargetMeanValue" | "FeatureFreq" => Err(CatBoostParameterError::new_err(format!(
+            "`{param}` CTR type `{name}` is not implemented on CPU (it is GPU-only, \
+             catboost_options.cpp:504-509); supported CPU types are {}",
+            CPU_LEGAL_CTR_TYPES.join(", ")
+        ))),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown `{param}` CTR type `{other}`; supported CPU types are {}",
+            CPU_LEGAL_CTR_TYPES.join(", ")
+        ))),
+    }
+}
+
+/// Parse ONE CatBoost CTR description — `"<Type>[:Key=Value]..."` — into its
+/// `(type, prior numerators)` pair (F16 / SPEC-CATF-13).
+///
+/// Recognised keys: `Prior` (repeatable — one CTR column per prior). A prior is
+/// `<num>` or `<num>/<denom>`; upstream rejects `denom != 1` on CPU
+/// (`ctr_helper.cpp:50`), which is exactly what vindicates the engine's
+/// `prior_denom: 1.0` pin, so a non-unit denominator is rejected here rather
+/// than silently renormalized.
+///
+/// Any other key is REJECTED, never ignored: silently dropping a
+/// `CtrBorderCount=...` the engine does not read would train a
+/// differently-parameterized model than the user asked for.
+fn parse_ctr_description(desc: &str, param: &str) -> PyResult<(ECtrType, Vec<f64>)> {
+    let mut tokens = desc.split(':');
+    let type_name = tokens.next().unwrap_or("").trim();
+    let ctr_type = parse_ctr_type(type_name, param)?;
+
+    let mut priors: Vec<f64> = Vec::new();
+    for token in tokens {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (key, value) = token.split_once('=').ok_or_else(|| {
+            CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: malformed token `{token}` (expected Key=Value)"
+            ))
+        })?;
+        if !key.trim().eq_ignore_ascii_case("Prior") {
+            return Err(CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: key `{}` is not supported; this crate \
+                 reads only the CTR type and its Prior list",
+                key.trim()
+            )));
+        }
+        let value = value.trim();
+        let (num_str, denom) = match value.split_once('/') {
+            Some((n, d)) => {
+                let denom: f64 = d.trim().parse().map_err(|_| {
+                    CatBoostParameterError::new_err(format!(
+                        "`{param}` description `{desc}`: prior denominator `{d}` is not a number"
+                    ))
+                })?;
+                (n.trim(), denom)
+            }
+            None => (value, 1.0),
+        };
+        if (denom - 1.0).abs() > f64::EPSILON {
+            return Err(CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: a prior denominator other than 1 is \
+                 illegal on CPU (ctr_helper.cpp:50), got `{denom}`; write the prior as \
+                 `Prior=<numerator>` or `Prior=<numerator>/1`"
+            )));
+        }
+        let num: f64 = num_str.trim().parse().map_err(|_| {
+            CatBoostParameterError::new_err(format!(
+                "`{param}` description `{desc}`: prior numerator `{num_str}` is not a number"
+            ))
+        })?;
+        priors.push(num);
+    }
+    Ok((ctr_type, priors))
+}
+
+/// Parse a `simple_ctr` / `combinations_ctr` kwarg — a LIST of CTR descriptions
+/// (upstream's shape) or a single bare string — into one `(type, priors)` pair.
+///
+/// `None` means "the list was empty", which only `combinations_ctr` gives a
+/// meaning to (see [`make_builder`]).
+///
+/// KNOWN PARITY GAP (SPEC-CTRT-19): upstream's CPU default is a LIST of two
+/// descriptions (`catboost_options.cpp:439-453`); this crate models ONE with a
+/// prior LIST. A multi-description list is therefore REJECTED with that gap
+/// named — never silently narrowed to its first entry, which would train a
+/// model the user did not ask for.
+fn parse_ctr_param(descs: &[String], param: &str) -> PyResult<Option<(ECtrType, Vec<f64>)>> {
+    match descs {
+        [] => Ok(None),
+        [one] => parse_ctr_description(one, param).map(Some),
+        many => Err(CatBoostParameterError::new_err(format!(
+            "`{param}` accepts exactly one CTR description, got {} ({many:?}). KNOWN \
+             PARITY GAP: upstream's CPU default is a LIST of two descriptions \
+             (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`, \
+             catboost_options.cpp:439-453), but this crate models ONE description \
+             with a prior LIST — the type and the full prior list ARE honored, a \
+             simultaneous [Borders, Counter] configuration is not representable. \
+             Passing several descriptions is rejected rather than narrowed to the \
+             first, which would silently train a different model.",
+            many.len()
+        ))),
+    }
+}
+
+/// Extract a `simple_ctr` / `combinations_ctr` kwarg as a list of descriptions,
+/// accepting either upstream's `list[str]` or a convenience bare `str`.
+fn extract_ctr_descriptions(
+    params: &BTreeMap<String, Py<PyAny>>,
+    py: Python<'_>,
+    name: &str,
+) -> PyResult<Option<Vec<String>>> {
+    let Some(obj) = params.get(name) else {
+        return Ok(None);
+    };
+    let bound = obj.bind(py);
+    if let Ok(one) = bound.extract::<String>() {
+        return Ok(Some(vec![one]));
+    }
+    bound.extract::<Vec<String>>().map(Some).map_err(|_| {
+        CatBoostParameterError::new_err(format!(
+            "`{name}` must be a list of CTR description strings (or a single string), \
+             e.g. [\"Borders:Prior=0:Prior=0.5\"]"
+        ))
+    })
+}
+
 /// Map a `leaf_estimation_method` string onto a [`LeafMethod`].
 fn parse_leaf_method(name: &str) -> PyResult<LeafMethod> {
     match name {
@@ -528,6 +705,63 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "leaf_estimation_method")? {
         builder = builder.leaf_method(parse_leaf_method(&v)?);
+    }
+
+    // ---- F15/F16: the categorical / CTR surface -----------------------------
+    if let Some(v) = get_with_aliases::<u32>(params, py, "one_hot_max_size")? {
+        // Upstream default 2; the CPU upper bound is `OneHotMaxSizeLimit =
+        // GetMaxBinCount()` (cat_feature_options.cpp:232-233, 267-268).
+        check_range("one_hot_max_size", f64::from(v), 0.0, 65535.0, true)?;
+        builder = builder.one_hot_max_size(v);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "max_ctr_complexity")? {
+        // Upstream default 4; `CB_ENSURE(MaxTensorComplexity < GetMaxTreeDepth())`
+        // (cat_feature_options.cpp:231, 269-271) with GetMaxTreeDepth() == 16.
+        check_range("max_ctr_complexity", v as f64, 0.0, 15.0, true)?;
+        builder = builder.max_ctr_complexity(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "counter_calc_method")? {
+        builder = builder.counter_calc_method(parse_counter_calc_method(&v)?);
+    }
+    if let Some(descs) = extract_ctr_descriptions(params, py, "simple_ctr")? {
+        match parse_ctr_param(&descs, "simple_ctr")? {
+            Some((ctr_type, priors)) => {
+                builder = builder.simple_ctr(ctr_type);
+                if !priors.is_empty() {
+                    builder = builder.simple_ctr_priors(priors);
+                }
+            }
+            // `simple_ctr=[]` has NO in-engine meaning: simple CTRs cannot be
+            // switched off (unlike combination CTRs, which `max_ctr_complexity=1`
+            // suppresses). Reject rather than silently ignore the kwarg.
+            None => {
+                return Err(CatBoostParameterError::new_err(
+                    "`simple_ctr=[]` has no meaning: simple CTRs cannot be disabled. \
+                     Every high-cardinality categorical column is CTR-encoded; pass a \
+                     single description such as [\"Borders:Prior=0.5\"] instead.",
+                ))
+            }
+        }
+    }
+    if let Some(descs) = extract_ctr_descriptions(params, py, "combinations_ctr")? {
+        match parse_ctr_param(&descs, "combinations_ctr")? {
+            Some((ctr_type, priors)) => {
+                builder = builder.combinations_ctr(ctr_type);
+                if !priors.is_empty() {
+                    builder = builder.combinations_ctr_priors(priors);
+                }
+            }
+            // RECORDED MAPPING (F16, option (a)): the engine field is a scalar
+            // `ECtrType` with no "disabled" representation, and
+            // `max_ctr_complexity = 1` is the ONLY in-engine way to suppress
+            // combination CTRs. `combinations_ctr=[]` therefore maps to
+            // `max_ctr_complexity = 1`. Chosen over rejecting `[]` because the
+            // committed crates/cb-oracle/fixtures/plain_ctr/config.json uses
+            // exactly that form, so F19 requires it be expressible here.
+            // Asserted by `empty_combinations_ctr_maps_to_max_ctr_complexity_one`,
+            // which checks the value ACTUALLY moves rather than that fit() is quiet.
+            None => builder = builder.max_ctr_complexity(1),
+        }
     }
     Ok(builder)
 }
