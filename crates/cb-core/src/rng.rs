@@ -222,6 +222,30 @@ impl TFastRng64 {
         [self.r1.x, self.r1.c, self.r2.x, self.r2.c]
     }
 
+    /// Restore a generator from the 4-tuple [`Self::raw_state`] captured, plus the
+    /// [`Self::call_count`] it was captured at (ORCH-03-S2, the snapshot/resume
+    /// restore constructor). The inverse of [`Self::raw_state`]: the returned
+    /// generator sits at EXACTLY the captured stream position, so its subsequent
+    /// [`Self::gen_rand`] draws reproduce the original's bit-for-bit.
+    ///
+    /// `raw_state` is `[r1.x, r1.c, r2.x, r2.c]` — each stream's 64-bit LCG state
+    /// followed by its odd per-stream addend. `call_count` is carried verbatim
+    /// rather than recomputed: it is a draw counter, not a function of the state
+    /// (the state alone cannot say how many draws produced it).
+    ///
+    /// Mirrors upstream `TRestorableFastRng64`'s `Save`/`Load` pair
+    /// (`restorable_rng.h`) — restoring the two stream states and the call count is
+    /// the whole of its persisted state.
+    #[inline]
+    #[must_use]
+    pub fn from_raw_state(raw_state: [u64; 4], call_count: u64) -> Self {
+        Self {
+            r1: Lcg32 { x: raw_state[0], c: raw_state[1] },
+            r2: Lcg32 { x: raw_state[2], c: raw_state[3] },
+            call_count,
+        }
+    }
+
     /// `TCommonRNG::GenRandReal1` for a `ui64` engine (`common_ops.h:19,99`):
     /// a real in `[0, 1]` with 53-bit resolution, `(GenRand() >> 11) *
     /// (1.0 / 9007199254740991.0)`. This is the exact draw the bootstrap /

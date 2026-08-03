@@ -31,6 +31,7 @@ mod permutation;
 mod projection;
 mod query_info;
 mod ranking_metrics;
+pub mod snapshot;
 mod tree;
 mod yetirank;
 
@@ -86,6 +87,7 @@ pub use yetirank::{
     derive_per_tree_query_seeds, derive_query_seeds, sample_pairs as yetirank_sample_pairs,
     sum_competitor_weights, YetiRankTreeSeeder, YetiRankTreeSeeds,
 };
+pub use snapshot::SnapshotConfig;
 pub use ranking_metrics::{
     clamp_top, compare_docs, dcg_group, err_group, map_at_group, mrr_group, ndcg_group,
     pfound_group, precision_at_group, query_auc_group, recall_at_group, AucType, DcgDenominator,
@@ -102,6 +104,7 @@ pub use boosting::{
     per_object_feature_penalties_default, structure_fold_cycle,
     permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_ranking,
+    train_with_snapshot,
     train_cat_with_eval_sets, train_with_eval, train_with_eval_sets, BoostParams, EBoostingType, EGrowPolicy, EvalSet, Model,
     NonSymmetricTree, ObliviousTree, RankingData, RegionTree,
 };
