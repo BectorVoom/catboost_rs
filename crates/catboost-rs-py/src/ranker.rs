@@ -18,7 +18,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
-use crate::estimator::{build_sklearn_tags, data_to_pool, fit_pool, EstimatorBase};
+use crate::estimator::{
+    build_sklearn_tags, data_to_pool, fit_pool, resolve_cat_features, EstimatorBase,
+};
 use crate::params::{make_builder, validate_params};
 
 /// CatBoost-mirror ranker. Reuses the shared estimator base, param registry, and
@@ -54,15 +56,20 @@ impl CatBoostRanker {
     /// `CatBoostParameterError` on an unknown / unsupported kwarg;
     /// `CatBoostValueError` when `group_id` is absent or on a dtype / layout
     /// mismatch (D-12); the typed taxonomy on a training failure.
-    #[pyo3(signature = (x, y = None))]
+    #[pyo3(signature = (x, y = None, cat_features = None))]
     fn fit(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
         y: Option<&Bound<'_, PyAny>>,
+        cat_features: Option<Vec<usize>>,
     ) -> PyResult<Py<Self>> {
         validate_params(&slf.base.params)?;
-        let pool = data_to_pool(py, x, y)?;
+        // F17: `cat_features` from the fit kwarg, else from the constructor.
+        // Remembered on the base because PREDICT must declare the same width
+        // (F10 checks the pool's declared width against the model's).
+        let cats = resolve_cat_features(&slf.base.params, py, cat_features)?;
+        let pool = data_to_pool(py, x, y, Some(&cats))?;
         // Ranking REQUIRES grouping. Reject a group-less dataset with an
         // actionable typed error rather than silently training a non-ranking model
         // or indexing unchecked group structure (threat T-08-14).
@@ -76,6 +83,7 @@ impl CatBoostRanker {
         let builder = make_builder(&slf.base.params, py)?;
         let model = py.detach(|| fit_pool(builder, &pool)).map_err(PyCbError)?;
         slf.base.model = Some(model);
+        slf.base.cat_features = cats;
         Ok(slf.into())
     }
 
@@ -97,7 +105,7 @@ impl CatBoostRanker {
                 "this CatBoostRanker is not fitted yet; call `fit` before `predict`",
             )
         })?;
-        let pool = data_to_pool(py, x, None)?;
+        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
         let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         Ok(preds.to_pyarray(py))
     }
@@ -123,7 +131,7 @@ impl CatBoostRanker {
                 "this CatBoostRanker is not fitted yet; call `fit` before `partial_dependence`",
             )
         })?;
-        crate::estimator::partial_dependence_py(model, py, x, features)
+        crate::estimator::partial_dependence_py(model, py, x, features, &self.base.cat_features)
     }
 
     /// Return the verbatim constructor kwargs (sklearn `get_params`). Enables

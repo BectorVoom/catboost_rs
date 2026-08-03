@@ -54,6 +54,19 @@ pub(crate) fn ingest_to_owned(
     y: Option<&Bound<'_, PyAny>>,
     cat_features: Option<&[usize]>,
 ) -> PyResult<OwnedColumns> {
+    let declares_cats = cat_features.is_some_and(|c| !c.is_empty());
+
+    // 0. F17 DISPATCH REFINEMENT — a Pandas DataFrame that DECLARES categorical
+    //    columns must take the Pandas branch, which ingests them; the Arrow
+    //    branch below rejects a non-empty `cat_features` outright. Pandas >= 2.2
+    //    implements `__arrow_c_stream__`, so without this the Arrow check claims
+    //    every modern DataFrame first and `cat_features` is unusable from Python
+    //    at all. The condition is scoped to `declares_cats`, so EVERY existing
+    //    cat-free call keeps its exact previous route (Arrow) and no ingestion
+    //    behaviour changes for them.
+    if declares_cats && is_pandas_dataframe(py, x)? {
+        return pandas_to_owned(py, x, y, cat_features);
+    }
     // 1. Arrow PyCapsule interface (pyarrow Table OR Polars DataFrame share it).
     if has_arrow_capsule(py, x)? {
         return arrow_to_owned(x, y, cat_features);
@@ -280,6 +293,15 @@ fn pandas_to_owned(
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item(intern!(py, "dtype"), float32)?;
         let arr = sub.call_method(intern!(py, "to_numpy"), (), Some(&kwargs))?;
+        // `to_numpy` on a MIXED-dtype frame (numeric + declared categorical
+        // columns — i.e. every real `cat_features` case) returns an
+        // F-CONTIGUOUS block, which `numpy_matrix_to_cols`'s strict
+        // C-contiguity check rejects with "X must be C-contiguous". This path
+        // had never been reached before F17 because Pandas >= 2.2 exposes
+        // `__arrow_c_stream__` and the Arrow branch claimed every DataFrame
+        // first. Normalize here rather than relaxing the strict check: the copy
+        // is what makes the buffer owned anyway (D-11).
+        let arr = np_module.call_method1(intern!(py, "ascontiguousarray"), (arr,))?;
         // numpy_matrix_to_cols validates + copies (label handled separately below).
         numpy_matrix_to_cols(&arr)?
     };

@@ -380,6 +380,30 @@ routing automatically. Both must be re-run as regression gates (CATF-07).
 > assertion/panic lines. `predict_raw_cat`, `CtrData`, `train_cat` and `train_inner`
 > remain untouched, so the rest of this section stands.
 
+> **AMENDMENT 2 (F17) — `ingest_py.rs` needed two forced changes.** This section
+> lists it as verification-only, and the plan's Finding F2 correctly placed the
+> declared-vs-ingested WIDTH GUARD in `estimator.rs::data_to_pool`. But making
+> `cat_features` reach the engine at all required two changes inside
+> `ingest_py.rs`, both discovered only by executing the path:
+>
+> 1. **Dispatch.** Pandas >= 2.2 implements `__arrow_c_stream__`, so
+>    `has_arrow_capsule` claimed every modern DataFrame before the Pandas branch
+>    was reached — and `arrow_to_owned` REJECTS a non-empty `cat_features`
+>    outright. `cat_features` was therefore unusable from Python for any
+>    DataFrame. Fixed by routing a Pandas DataFrame that DECLARES categorical
+>    columns to `pandas_to_owned` first. The condition is scoped to
+>    `declares_cats`, so every pre-existing cat-free call keeps its exact former
+>    route and no existing ingestion behaviour changes.
+> 2. **A latent bug in `pandas_to_owned`.** `sub.to_numpy(dtype=float32)` on a
+>    MIXED-dtype frame (numeric + categorical — i.e. every real `cat_features`
+>    case) returns an F-CONTIGUOUS block, which `numpy_matrix_to_cols`'s strict
+>    C-contiguity check rejects with "X must be C-contiguous". This had never
+>    fired because (1) made the branch unreachable for mixed frames. Fixed with
+>    `np.ascontiguousarray`, normalizing rather than relaxing the strict check.
+>
+> Neither change touches `arrow_to_owned`, `numpy_to_owned`, or the strict D-12
+> dtype contract.
+
 ## 8. Compatibility and migration
 
 - **Additive only.** No `BoostParams` field is added or removed — only the source of
