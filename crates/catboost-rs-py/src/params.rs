@@ -16,6 +16,26 @@
 //!
 //! Validation runs at `fit()` time (D-06), NOT in `__init__`, so the sklearn
 //! "no work in `__init__`" contract (08-05) holds.
+//!
+//! # KNOWN PARITY GAP — the CTR default is a single description, not a list
+//!
+//! Upstream's CPU default is a LIST of two CTR descriptions
+//! (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`, set by
+//! `SetCtrDefaults` at `catboost_options.cpp:439-453`; measured through
+//! `get_all_params()` as
+//! `['Borders:…:Prior=0/1:Prior=0.5/1:Prior=1/1', 'Counter:…:Prior=0/1']`).
+//!
+//! This crate models ONE CTR description with a prior LIST: the engine field is
+//! a scalar `ECtrType` plus a `Vec<f64>` of priors. The CTR **type** and the
+//! **full prior list** ARE honored (SPEC-CTRT-09/10/11) — but a simultaneous
+//! `[Borders, Counter]` configuration is NOT representable, so `simple_ctr` /
+//! `combinations_ctr` accept exactly one CTR description each (SPEC-CTRT-19).
+//!
+//! This is deliberate, not an oversight: `simple_ctr: ECtrType` is pinned at 62
+//! construction sites across the workspace and retyping it to a list has zero
+//! behavioral benefit to any of them. A user who passes more than one
+//! description is REJECTED with a `CatBoostParameterError` naming this gap —
+//! never silently narrowed to the first entry.
 
 use std::collections::BTreeMap;
 

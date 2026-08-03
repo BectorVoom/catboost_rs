@@ -234,8 +234,8 @@ pub struct BoostParams {
     /// (inclusive boundary) and to the CTR path (deferred to later waves) when
     /// `cardinality > one_hot_max_size`. See [`crate::route_categorical`] /
     /// [`crate::EncodingPath`] (ORD-04 / D-04). Consumed by the categorical
-    /// encoding-path selection; the numeric-only first slices leave it at the
-    /// pinned default and never exercise the one-hot branch.
+    /// encoding-path selection; numeric-only datasets leave it at the pinned
+    /// default because they have no categorical column to route.
     pub one_hot_max_size: u32,
     /// Number of random permutations used by the multi-permutation fold
     /// machinery (`permutation_count`, default 4 — `boosting_options.cpp`).
@@ -255,9 +255,13 @@ pub struct BoostParams {
     /// The SINGLE `simple_ctr` type the high-cardinality categorical path bakes
     /// (ORD-03 / D-07 — one explicit CTR type per fixture, never the upstream
     /// auto default set `[Borders, Counter]`, RESEARCH Pitfall 6). Pinned
-    /// EXPLICITLY ([`simple_ctr_default`]). Consumed by the Plain-CTR bake
-    /// ([`crate::build_final_ctr`]); the numeric/one-hot slices leave it at the
-    /// default and never exercise the CTR path.
+    /// EXPLICITLY ([`simple_ctr_default`]). GENUINELY CONSUMED: it selects the
+    /// online producer ([`crate::materialize_ctr_feature`]) and the final bake
+    /// ([`crate::build_final_ctr`]), so changing it changes the model.
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`catboost_options.cpp:439-453`); this scalar models ONE.
+    /// See [`simple_ctr_default`].
     pub simple_ctr: ECtrType,
     /// The explicit per-prior numerators for [`Self::simple_ctr`] (D-07 — one
     /// prior per CTR column, never auto). Each entry is a unit-denominator prior
@@ -266,9 +270,12 @@ pub struct BoostParams {
     /// ([`simple_ctr_priors_default`]).
     pub simple_ctr_priors: Vec<f64>,
     /// The `counter_calc_method` (`SkipTest` default, Pitfall 4 — pinned
-    /// EXPLICITLY, never auto). In the whole-learn-set Plain build there are no
-    /// test documents, so the flag does not change the counts; it is carried for
-    /// the tensor-CTR path. [`counter_calc_method_default`].
+    /// EXPLICITLY, never auto). GENUINELY CONSUMED by the Counter tally and the
+    /// final bake (SPEC-CTRT-13): `Full` folds the eval sets into the counts,
+    /// `SkipTest` does not. **Observable only when an eval set is present** —
+    /// with a learn set alone the two settings are bit-identical (measured
+    /// `0.000e+00` learn-only vs `4.010e-01` with an eval set, E22/E23).
+    /// [`counter_calc_method_default`].
     pub counter_calc_method: CounterCalcMethod,
     /// The boosting type ([`EBoostingType`], `boosting_options.cpp:16`). Pinned
     /// EXPLICITLY ([`boosting_type_default`] = [`EBoostingType::Plain`], the CPU
@@ -292,9 +299,14 @@ pub struct BoostParams {
     /// bakes (ORD-05 / D-07 — one explicit CTR type per fixture, never the
     /// upstream auto default set, RESEARCH Pitfall 6). Pinned EXPLICITLY
     /// ([`combinations_ctr_default`]); the tensor CTR keys the SAME online/ordered
-    /// accumulation (05-04/05-05) on the combined projection hash. The
-    /// numeric/one-hot/simple-CTR slices leave it at the default and never
-    /// exercise the combination path.
+    /// accumulation (05-04/05-05) on the combined projection hash. GENUINELY
+    /// CONSUMED whenever `max_ctr_complexity >= 2` admits a combination
+    /// candidate; `max_ctr_complexity == 1` is the only way to suppress the
+    /// combination path entirely.
+    ///
+    /// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR
+    /// descriptions (`catboost_options.cpp:439-453`); this scalar models ONE.
+    /// See [`combinations_ctr_default`].
     pub combinations_ctr: ECtrType,
     /// The explicit per-prior numerators for [`Self::combinations_ctr`] (D-07 —
     /// one prior per combination CTR column, never auto; the tensor_ctr fixture
@@ -458,8 +470,16 @@ pub fn fold_len_multiplier_default() -> f64 {
 
 /// The canonical default `simple_ctr` type ([`ECtrType::Borders`], the upstream
 /// default CTR family head). Pinned EXPLICITLY at every `BoostParams`
-/// construction site (RESEARCH Pitfall 6 — never auto-selected); the
-/// numeric/one-hot slices leave it here and never exercise the CTR path.
+/// construction site (RESEARCH Pitfall 6 — never auto-selected).
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. Deliberate: `simple_ctr: ECtrType` is pinned at 62
+/// construction sites and retyping it has zero behavioral benefit to any of
+/// them.
 #[must_use]
 pub fn simple_ctr_default() -> ECtrType {
     ECtrType::Borders
@@ -469,6 +489,15 @@ pub fn simple_ctr_default() -> ECtrType {
 /// `0.5/1` (the in-scope plain_ctr fixture pins `Borders:Prior=0.5`, so the
 /// online `+1` denom and the inference `+PriorDenom` coincide, RESEARCH A6).
 /// Pinned EXPLICITLY at every `BoostParams` construction site.
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. This default deliberately stays at the single prior
+/// `0.5/1` rather than upstream's `[0/1, 0.5/1, 1/1]`: every frozen CTR oracle
+/// in this repository is captured against it.
 #[must_use]
 pub fn simple_ctr_priors_default() -> Vec<f64> {
     vec![0.5]
@@ -502,9 +531,15 @@ pub fn max_ctr_complexity_default() -> usize {
 
 /// The canonical default `combinations_ctr` type ([`ECtrType::Borders`], the
 /// upstream default CTR family head). Pinned EXPLICITLY at every `BoostParams`
-/// construction site (RESEARCH Pitfall 6 — never auto-selected); the
-/// numeric/one-hot/simple-CTR slices leave it here and never exercise the
-/// combination path.
+/// construction site (RESEARCH Pitfall 6 — never auto-selected).
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. Deliberate: `combinations_ctr: ECtrType` is pinned at
+/// every construction site and retyping it has zero behavioral benefit.
 #[must_use]
 pub fn combinations_ctr_default() -> ECtrType {
     ECtrType::Borders
@@ -514,6 +549,15 @@ pub fn combinations_ctr_default() -> ECtrType {
 /// prior `0.5/1` (the in-scope tensor_ctr fixture pins `Borders:Prior=0.5`, so
 /// the online `+1` denom and the inference `+PriorDenom` coincide, RESEARCH A6).
 /// Pinned EXPLICITLY at every `BoostParams` construction site.
+///
+/// KNOWN PARITY GAP: upstream's CPU default is a LIST of two CTR descriptions
+/// (`[Borders(priors 0/1, 0.5/1, 1/1), Counter(prior 0/1)]`,
+/// `catboost_options.cpp:439-453`). This crate models ONE description with a
+/// prior LIST. The type and the full prior list ARE honored
+/// (SPEC-CTRT-09/10/11); a simultaneous `[Borders, Counter]` configuration is
+/// NOT representable. This default deliberately stays at the single prior
+/// `0.5/1` rather than upstream's `[0/1, 0.5/1, 1/1]`: every frozen CTR oracle
+/// in this repository is captured against it.
 #[must_use]
 pub fn combinations_ctr_priors_default() -> Vec<f64> {
     vec![0.5]
