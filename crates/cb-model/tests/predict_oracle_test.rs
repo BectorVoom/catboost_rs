@@ -56,16 +56,11 @@ fn model_from_json(mj: &ModelJson) -> Model {
             }
         })
         .collect();
-    Model {
+    Model::new(
         oblivious_trees,
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: mj.bias().expect("bias must parse"),
-        float_feature_borders: mj.float_feature_borders(),
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        mj.bias().expect("bias must parse"),
+        mj.float_feature_borders(),
+    )
 }
 
 /// Apply the shared model and return the per-object raw `approx`.

@@ -523,16 +523,12 @@ fn single_ctr_split_model(
         leaf_values: vec![-10.0, 10.0],
         leaf_weights: vec![1.0, 1.0],
     };
-    cb_model::Model {
-        oblivious_trees: vec![tree],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.0,
-        float_feature_borders: Vec::new(),
-        ctr_data: Some(ctr_data),
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    cb_model::Model::new(
+        vec![tree],
+        0.0,
+        Vec::new(),
+    )
+    .with_ctr_data(ctr_data)
 }
 
 /// Test (Scale/Shift derivation): a Borders CTR with prior_num=0.5, prior_denom=1

@@ -113,6 +113,7 @@ pub fn sum_models(models: &[&Model], weights: &[f64]) -> Result<Model, ModelErro
     // are constructed fresh rather than cloned from `first`, which would
     // wrongly suggest they might carry real merged data.
     Ok(Model {
+        cat_feature_count: 0,
         oblivious_trees,
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),

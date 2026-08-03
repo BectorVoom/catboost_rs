@@ -29,20 +29,15 @@ fn ctr_model() -> cb_model::Model {
         shift: 0.0,
         scale: 1.0,
     };
-    cb_model::Model {
-        oblivious_trees: vec![cb_model::ObliviousTree {
-            splits: vec![cb_model::ModelSplit::Ctr(ctr_split)],
-            leaf_values: vec![0.1, 0.2],
-            leaf_weights: vec![1.0, 1.0],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.0,
-        float_feature_borders: Vec::new(),
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    cb_model::Model::new(
+        vec![cb_model::ObliviousTree {
+                splits: vec![cb_model::ModelSplit::Ctr(ctr_split)],
+                leaf_values: vec![0.1, 0.2],
+                leaf_weights: vec![1.0, 1.0],
+            }],
+        0.0,
+        Vec::new(),
+    )
 }
 
 /// AT-01f-1b: `save_onnx` on a CTR model maps the guard rejection through

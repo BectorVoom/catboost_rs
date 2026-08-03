@@ -75,46 +75,36 @@ fn model_from_json(mj: &ModelJson) -> Model {
             }
         })
         .collect();
-    Model {
+    Model::new(
         oblivious_trees,
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: mj.bias().expect("bias must parse"),
-        float_feature_borders: mj.float_feature_borders(),
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        mj.bias().expect("bias must parse"),
+        mj.float_feature_borders(),
+    )
 }
 
 /// A small Rust-built model whose borders are f32-exact (`0.5`, `1.5`, `2.5`) so
 /// the f32 border wire type round-trips losslessly — leaf values/weights are f64
 /// on the wire and round-trip exactly.
 fn rust_built_model() -> Model {
-    Model {
-        oblivious_trees: vec![
-            ObliviousTree {
-                splits: vec![
-                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
-                    ModelSplit::Float(Split { feature: 1, border: 1.5 }),
-                ],
-                leaf_values: vec![0.1, -0.2, 0.3, -0.4],
-                leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
-            },
-            ObliviousTree {
-                splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
-                leaf_values: vec![0.05, -0.05],
-                leaf_weights: vec![12.0, 13.0],
-            },
-        ],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.25,
-        float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    Model::new(
+        vec![
+                ObliviousTree {
+                    splits: vec![
+                        ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                        ModelSplit::Float(Split { feature: 1, border: 1.5 }),
+                    ],
+                    leaf_values: vec![0.1, -0.2, 0.3, -0.4],
+                    leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
+                },
+                ObliviousTree {
+                    splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
+                    leaf_values: vec![0.05, -0.05],
+                    leaf_weights: vec![12.0, 13.0],
+                },
+            ],
+        0.25,
+        vec![vec![0.5, 2.5], vec![1.5]],
+    )
 }
 
 // ── (a) semantic round-trip ────────────────────────────────────────────────

@@ -320,6 +320,7 @@ fn save_ctr_split(cats: &[usize], border: f64, scale: f64) -> crate::CtrSplit {
 fn model_with_ctr_splits(splits: Vec<crate::CtrSplit>) -> crate::Model {
     let model_splits = splits.into_iter().map(crate::model::ModelSplit::Ctr).collect();
     crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![crate::ObliviousTree {
             splits: model_splits,
             leaf_values: Vec::new(),
@@ -950,6 +951,7 @@ fn save_non_symmetric_ctr_split_is_typed_error() {
         leaf_weights: vec![0.0],
     };
     let model = crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: vec![tree],
         region_trees: Vec::new(),
@@ -971,6 +973,7 @@ fn save_numeric_model_emits_no_tail() {
     // saves with NO model-parts tail — the file is exactly the 8-byte frame plus
     // the FlatBuffers core, byte-for-byte the pre-slice layout.
     let model = crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![crate::ObliviousTree {
             splits: vec![crate::model::ModelSplit::Float(crate::Split { feature: 0, border: 0.5 })],
             leaf_values: vec![0.1, -0.2],
@@ -1101,6 +1104,7 @@ fn one_hot_acceptance_model() -> (crate::Model, [i32; 4]) {
     // h1 > h2: referencing h1 first makes first-referenced != ascending.
     let (h0, h1, h2, h3) = (1_296_865_003_i32, 476_319_382_i32, -784_473_192_i32, 999_i32);
     let model = crate::Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![crate::ObliviousTree {
             splits: vec![
                 crate::model::ModelSplit::Float(crate::Split { feature: 0, border: 0.25 }),

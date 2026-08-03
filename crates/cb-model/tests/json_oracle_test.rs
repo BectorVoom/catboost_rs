@@ -50,30 +50,25 @@ fn unique_tmp(tag: &str) -> PathBuf {
 
 /// A small Rust-built model for the export round-trip.
 fn rust_built_model() -> Model {
-    Model {
-        oblivious_trees: vec![
-            ObliviousTree {
-                splits: vec![
-                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
-                    ModelSplit::Float(Split { feature: 1, border: 1.5 }),
-                ],
-                leaf_values: vec![0.1, -0.2, 0.3, -0.4],
-                leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
-            },
-            ObliviousTree {
-                splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
-                leaf_values: vec![0.05, -0.05],
-                leaf_weights: vec![12.0, 13.0],
-            },
-        ],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.25,
-        float_feature_borders: vec![vec![0.5, 2.5], vec![1.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    Model::new(
+        vec![
+                ObliviousTree {
+                    splits: vec![
+                        ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                        ModelSplit::Float(Split { feature: 1, border: 1.5 }),
+                    ],
+                    leaf_values: vec![0.1, -0.2, 0.3, -0.4],
+                    leaf_weights: vec![10.0, 5.0, 7.0, 3.0],
+                },
+                ObliviousTree {
+                    splits: vec![ModelSplit::Float(Split { feature: 0, border: 2.5 })],
+                    leaf_values: vec![0.05, -0.05],
+                    leaf_weights: vec![12.0, 13.0],
+                },
+            ],
+        0.25,
+        vec![vec![0.5, 2.5], vec![1.5]],
+    )
 }
 
 // ── (a) save_json round-trips through the cb-oracle parser ──────────────────
@@ -203,26 +198,21 @@ fn malformed_json_is_typed_error_not_panic() {
 /// split count from `leaf_values` and silently mis-predict on reload).
 #[test]
 fn save_json_rejects_one_hot_models_instead_of_shortening_splits() {
-    let model = Model {
-        oblivious_trees: vec![ObliviousTree {
-            splits: vec![
-                ModelSplit::Float(Split { feature: 0, border: 0.5 }),
-                ModelSplit::OneHot(cb_model::OneHotModelSplit {
-                    cat_feature: 0,
-                    value_hash: 1_296_865_003,
-                }),
-            ],
-            leaf_values: vec![1.0, 2.0, 3.0, 4.0],
-            leaf_weights: vec![1.0; 4],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.0,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    };
+    let model = Model::new(
+        vec![ObliviousTree {
+                splits: vec![
+                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                    ModelSplit::OneHot(cb_model::OneHotModelSplit {
+                        cat_feature: 0,
+                        value_hash: 1_296_865_003,
+                    }),
+                ],
+                leaf_values: vec![1.0, 2.0, 3.0, 4.0],
+                leaf_weights: vec![1.0; 4],
+            }],
+        0.0,
+        vec![vec![0.5]],
+    );
 
     let path = std::env::temp_dir().join(format!("cb_one_hot_json_{}.json", std::process::id()));
     let got = save_json(&model, &path);

@@ -13,23 +13,18 @@ use crate::{CatBoostError, Model, OwnedColumns};
 /// A tiny float-only oblivious canonical model, 1 split / 2 leaves, matching
 /// the `numeric_tiny`-style single-feature pool built below.
 fn tiny_model(bias: f64, leaf_values: [f64; 2]) -> cb_model::Model {
-    cb_model::Model {
-        oblivious_trees: vec![cb_model::ObliviousTree {
-            splits: vec![cb_model::ModelSplit::Float(cb_model::Split {
-                feature: 0,
-                border: 0.5,
-            })],
-            leaf_values: leaf_values.to_vec(),
-            leaf_weights: vec![1.0, 1.0],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
+    cb_model::Model::new(
+        vec![cb_model::ObliviousTree {
+                splits: vec![cb_model::ModelSplit::Float(cb_model::Split {
+                    feature: 0,
+                    border: 0.5,
+                })],
+                leaf_values: leaf_values.to_vec(),
+                leaf_weights: vec![1.0, 1.0],
+            }],
         bias,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        vec![vec![0.5]],
+    )
 }
 
 fn tiny_pool() -> crate::Pool {
