@@ -20,10 +20,10 @@ use pyo3::types::PyDict;
 
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
 use crate::estimator::{
-    accuracy_score, build_sklearn_tags, data_to_pool, fit_pool, load_model_path,
-    resolve_cat_features, EstimatorBase,
+    accuracy_score, build_sklearn_tags, data_to_pool, eval_set_to_pools, fit_pool_with_eval,
+    load_model_path, resolve_cat_features, EstimatorBase,
 };
-use crate::params::{make_builder, validate_params};
+use crate::params::{make_builder, validate_eval_set_only_params, validate_params};
 use crate::regressor::y_to_vec;
 
 /// CatBoost-mirror classifier (sklearn-compatible). Reuses the shared estimator
@@ -58,13 +58,14 @@ impl CatBoostClassifier {
     /// `CatBoostParameterError` on an unknown / unsupported kwarg;
     /// `CatBoostValueError` on a dtype / layout / shape mismatch (D-12); the typed
     /// taxonomy on a training failure (08-02 / PYAPI-05).
-    #[pyo3(signature = (x, y = None, cat_features = None))]
+    #[pyo3(signature = (x, y = None, cat_features = None, eval_set = None))]
     fn fit(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
         y: Option<&Bound<'_, PyAny>>,
         cat_features: Option<Vec<usize>>,
+        eval_set: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<Self>> {
         validate_params(&slf.base.params)?;
         // F17: `cat_features` from the fit kwarg, else from the constructor.
@@ -72,6 +73,14 @@ impl CatBoostClassifier {
         // (F10 checks the pool's declared width against the model's).
         let cats = resolve_cat_features(&slf.base.params, py, cat_features)?;
         let pool = data_to_pool(py, x, y, Some(&cats))?;
+        // PARAM-02: see the regressor for the eval-set contract.
+        let eval_pools = match eval_set {
+            Some(es) => eval_set_to_pools(py, es, &cats)?,
+            None => Vec::new(),
+        };
+        if eval_pools.is_empty() {
+            validate_eval_set_only_params(&slf.base.params)?;
+        }
         let mut builder = make_builder(&slf.base.params, py)?;
         // The classifier defaults to a CLASSIFICATION loss (D-05). Only override
         // when the user supplied neither the canonical name nor its alias, so an
@@ -80,7 +89,9 @@ impl CatBoostClassifier {
         {
             builder = builder.loss(Loss::Logloss);
         }
-        let model = py.detach(|| fit_pool(builder, &pool)).map_err(PyCbError)?;
+        let model = py
+            .detach(|| fit_pool_with_eval(builder, &pool, &eval_pools))
+            .map_err(PyCbError)?;
         slf.base.model = Some(model);
         slf.base.cat_features = cats;
         Ok(slf.into())

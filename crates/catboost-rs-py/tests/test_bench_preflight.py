@@ -20,15 +20,23 @@ def test_bench_preflight_facade_routing_marker_is_present():
     # 1. The bench's preflight (one_hot_bench_colab.py:117, checked at :210-227)
     #    only does `grep -c "train_cat"` — a comment would satisfy it. Assert
     #    the marker is in a CALL position on a non-comment line.
+    #
+    #    The pattern matches the whole `train_cat*` ENTRY-POINT FAMILY, not the
+    #    bare name: PARAM-01 routed `fit` through `train_cat_with_eval_sets` (so
+    #    one shared inner serves `fit` and `fit_with_eval`), which is the same
+    #    categorical trainer reached by a different door. The property this test
+    #    defends is "a pool with cat_features reaches a CAT-AWARE trainer", and
+    #    that is what the family expresses — pinning the exact function name
+    #    would fail the guard on a pure refactor while the routing is intact.
     call_sites = [
         ln
         for ln in builder.splitlines()
-        if re.search(r"\btrain_cat\s*\(", ln) and not ln.lstrip().startswith("//")
+        if re.search(r"\btrain_cat\w*\s*\(", ln) and not ln.lstrip().startswith("//")
     ]
     assert call_sites, (
-        "`train_cat` must appear as an actual CALL in builder.rs, not merely as a "
-        "comment: bench/one_hot_gpu_speed/one_hot_bench_colab.py:117 greps for the "
-        "bare string, so a comment would make the bench pass while fit() still "
+        "a `train_cat*` entry point must appear as an actual CALL in builder.rs, not "
+        "merely as a comment: bench/one_hot_gpu_speed/one_hot_bench_colab.py:117 greps "
+        "for the bare string, so a comment would make the bench pass while fit() still "
         "routes float-only"
     )
 
