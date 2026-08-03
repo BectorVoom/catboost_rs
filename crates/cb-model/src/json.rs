@@ -823,6 +823,7 @@ fn from_doc(doc: &ModelJsonDoc) -> Result<Model, ModelError> {
         .unwrap_or_default();
 
     Ok(Model {
+        cat_feature_count: 0,
         oblivious_trees,
         non_symmetric_trees,
         region_trees,

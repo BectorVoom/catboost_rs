@@ -23,6 +23,7 @@ use crate::model::{
 /// the baseline every disqualifying-condition test overrides one field of.
 fn empty_model() -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),

@@ -23,6 +23,7 @@ use crate::{predict_raw_cat, Model};
 fn one_hot_depth1_model() -> Model {
     let value_hash = cb_data::calc_cat_feature_hash("b") as i32;
     Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![ObliviousTree {
             splits: vec![ModelSplit::OneHot(OneHotModelSplit {
                 cat_feature: 0,

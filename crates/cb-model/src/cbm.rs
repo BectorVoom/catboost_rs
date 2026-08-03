@@ -1191,6 +1191,7 @@ fn reconstruct_model(
         let non_symmetric_trees =
             reconstruct_non_symmetric(trees, &bins, &leaf_values, leaf_weights.as_ref(), dim)?;
         return Ok(Model {
+            cat_feature_count: 0,
             oblivious_trees: Vec::new(),
             non_symmetric_trees,
             region_trees: Vec::new(),
@@ -1316,6 +1317,7 @@ fn reconstruct_model(
     };
 
     Ok(Model {
+        cat_feature_count: 0,
         oblivious_trees,
         // Oblivious models carry no non-symmetric trees (the non-symmetric `.cbm`
         // is handled by the early return above, D-6.6-05).

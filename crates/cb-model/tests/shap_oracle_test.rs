@@ -69,16 +69,11 @@ fn model_from_json(mj: &ModelJson) -> Model {
             }
         })
         .collect();
-    Model {
+    Model::new(
         oblivious_trees,
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: mj.bias().expect("bias must parse"),
-        float_feature_borders: mj.float_feature_borders(),
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        mj.bias().expect("bias must parse"),
+        mj.float_feature_borders(),
+    )
 }
 
 /// The number of float features = max split feature index + 1 (the fixture's
@@ -159,16 +154,11 @@ fn shap_local_accuracy_holds_in_env_no_fixture() {
         leaf_values: vec![-0.01, 0.04, 0.02, 0.07],
         leaf_weights: vec![6.0, 9.0, 4.0, 11.0],
     };
-    let model = Model {
-        oblivious_trees: vec![tree0, tree1],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.123,
-        float_feature_borders: vec![vec![0.5, 2.5], vec![0.5, 1.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    };
+    let model = Model::new(
+        vec![tree0, tree1],
+        0.123,
+        vec![vec![0.5, 2.5], vec![0.5, 1.5]],
+    );
 
     // A spread of objects covering every leaf.
     let cols: Vec<Vec<f32>> = vec![
@@ -240,26 +230,21 @@ fn non_symmetric_shap_matches_upstream_and_local_accuracy() {
 /// unreachable and `shap_values` summed to `2.0` instead of the real prediction
 /// — a SILENT local-accuracy violation. Every surface must now refuse.
 fn one_hot_depth2_model() -> Model {
-    Model {
-        oblivious_trees: vec![ObliviousTree {
-            splits: vec![
-                ModelSplit::Float(Split { feature: 0, border: 0.5 }),
-                ModelSplit::OneHot(cb_model::OneHotModelSplit {
-                    cat_feature: 0,
-                    value_hash: 1_296_865_003,
-                }),
-            ],
-            leaf_values: vec![1.0, 2.0, 30.0, 40.0],
-            leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
-        }],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.0,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    Model::new(
+        vec![ObliviousTree {
+                splits: vec![
+                    ModelSplit::Float(Split { feature: 0, border: 0.5 }),
+                    ModelSplit::OneHot(cb_model::OneHotModelSplit {
+                        cat_feature: 0,
+                        value_hash: 1_296_865_003,
+                    }),
+                ],
+                leaf_values: vec![1.0, 2.0, 30.0, 40.0],
+                leaf_weights: vec![1.0, 1.0, 1.0, 1.0],
+            }],
+        0.0,
+        vec![vec![0.5]],
+    )
 }
 
 #[test]

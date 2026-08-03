@@ -359,6 +359,27 @@ routing automatically. Both must be re-run as regression gates (CATF-07).
 `cb-train` (`train_cat`, `train_inner`), `cb-model` (`predict_raw_cat`, `CtrData`),
 `cb-data` (`Pool`), `crates/catboost-rs-py/src/ingest_py.rs`.
 
+> **AMENDMENT (F08 / PLAN-CHECK revision #3, option 1) — `cb-model` is no longer
+> verification-only.** Resolving CRITICAL-3 ("derived cat width is a data-dependent
+> lower bound enforced as equality") requires the model to carry the pool's
+> **DECLARED** categorical width rather than one derived from the splits it happened
+> to choose. `crates/cb-model/src/model.rs` therefore gains:
+>
+> - a `cat_feature_count: usize` field (runtime-only — neither the `.cbm` encoder nor
+>   `json.rs`'s serde shape writes or reads it, guarded by
+>   `adding_the_cat_feature_count_does_not_change_cbm_bytes`, so every frozen
+>   byte-identity baseline stays valid);
+> - `#[non_exhaustive]` plus `Model::new` and the `with_*` builder surface, so this
+>   field and every future one cost external crates nothing.
+>
+> The `#[non_exhaustive]` change forced a **one-time mechanical migration** of every
+> `Model` struct literal outside `cb-model` (24 sites: 19 in `cb-model/tests`, 4 in
+> `catboost-rs`, 1 in `cb-train/tests/ctr_split_scoring_test.rs`) and the addition of
+> `cat_feature_count: 0` to 22 literals inside it. **No assertion was added, removed,
+> weakened or reworded at any site** — verified by a zero-balance diff audit over
+> assertion/panic lines. `predict_raw_cat`, `CtrData`, `train_cat` and `train_inner`
+> remain untouched, so the rest of this section stands.
+
 ## 8. Compatibility and migration
 
 - **Additive only.** No `BoostParams` field is added or removed — only the source of

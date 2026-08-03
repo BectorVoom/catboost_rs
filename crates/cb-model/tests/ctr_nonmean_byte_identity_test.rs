@@ -105,19 +105,15 @@ fn hand_constructed_model() -> CbModel {
         leaf_weights: vec![2.0, 3.0],
     };
 
-    CbModel {
-        oblivious_trees: vec![
-            tree_for(ECtrType::Borders, 0.25, [-0.1, 0.2]),
-            tree_for(ECtrType::Counter, 0.5, [0.05, -0.15]),
-        ],
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.125,
-        float_feature_borders: Vec::new(),
-        ctr_data: Some(CtrData { tables }),
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+    CbModel::new(
+        vec![
+                tree_for(ECtrType::Borders, 0.25, [-0.1, 0.2]),
+                tree_for(ECtrType::Counter, 0.5, [0.05, -0.15]),
+            ],
+        0.125,
+        Vec::new(),
+    )
+    .with_ctr_data(CtrData { tables })
 }
 
 /// Serialize the hand-constructed model through the production encoder and return

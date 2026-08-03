@@ -301,7 +301,18 @@ pub struct ObliviousTree {
 /// borders, the baked [`CtrData`] tables CTR splits look up, and (for the
 /// categorical apply path) the per-document raw categorical feature columns.
 /// Carries everything apply / SHAP / serialize need without a training pool.
+///
+/// # `#[non_exhaustive]` (F08 / SPEC-CATF-Δ4)
+///
+/// This struct is `#[non_exhaustive]`, so struct-literal syntax is illegal from
+/// any OTHER crate. Build one with [`Model::new`] plus the `with_*` builders.
+/// The reason is recorded so it is not re-litigated: every time this shared
+/// struct grew a field, every external exhaustive literal broke at once — a
+/// defect class found FOUR times while planning this change. `#[non_exhaustive]`
+/// paid that migration once, and from here a new `Model` field is a
+/// `cb-model`-internal change only.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Model {
     /// The oblivious trees in boosting (iteration) order.
     pub oblivious_trees: Vec<ObliviousTree>,
@@ -343,6 +354,25 @@ pub struct Model {
     /// Predictions recover the original labels via this map (`class_params` /
     /// `multiclass_params` model_info, verified empirically against catboost 1.2.10).
     pub class_to_label: Vec<f64>,
+    /// The number of categorical columns the training pool DECLARED (F08 /
+    /// SPEC-CATF-Δ4). `0` for every float-only model and for every model that
+    /// arrived through a codec (neither the `.cbm` nor the JSON decoder has a
+    /// pool to report a width from).
+    ///
+    /// This is the DECLARED width, never one derived from the splits the model
+    /// happened to choose. `max(projection member) + 1` equals the true training
+    /// width only if the highest-indexed cat column is BOTH CTR-eligible AND
+    /// selected by some split; two reachable counterexamples at default
+    /// parameters are (a) a trailing cardinality-2 column that routes to
+    /// `EncodingPath::OneHot` and so never enters `eligible_absolute`, and (b) an
+    /// uninformative column that is never selected. In both, a derived width is
+    /// a strict LOWER BOUND, and enforcing it as equality would reject the
+    /// entirely legitimate `fit(pool) -> predict(same pool)`.
+    ///
+    /// **Runtime-only.** Neither the `.cbm` encoder nor `json.rs`'s serde shape
+    /// writes or reads it, so every frozen byte-identity baseline stays valid
+    /// (guarded by `adding_the_cat_feature_count_does_not_change_cbm_bytes`).
+    pub cat_feature_count: usize,
 }
 
 impl Model {
@@ -513,6 +543,7 @@ impl Model {
             })
             .collect();
         Self {
+            cat_feature_count: 0,
             oblivious_trees,
             non_symmetric_trees,
             region_trees,
@@ -524,12 +555,90 @@ impl Model {
         }
     }
 
+    /// Build a model from the three fields every model must supply, leaving
+    /// every other field at its zero/empty value (`approx_dimension: 1`,
+    /// `cat_feature_count: 0`, `ctr_data: None`, no non-symmetric or region
+    /// trees, no `class_to_label`).
+    ///
+    /// This is the entry point for the `with_*` builders, and — because
+    /// [`Model`] is `#[non_exhaustive]` — the ONLY way an external crate can
+    /// construct one. Chain the builders to express the other shapes:
+    /// [`Self::with_ctr_data`], [`Self::with_non_symmetric_trees`],
+    /// [`Self::with_region_trees`], [`Self::with_approx_dimension`],
+    /// [`Self::with_class_to_label`], [`Self::with_cat_feature_count`].
+    #[must_use]
+    pub fn new(
+        oblivious_trees: Vec<ObliviousTree>,
+        bias: f64,
+        float_feature_borders: Vec<Vec<f64>>,
+    ) -> Self {
+        Self {
+            oblivious_trees,
+            non_symmetric_trees: Vec::new(),
+            region_trees: Vec::new(),
+            bias,
+            float_feature_borders,
+            ctr_data: None,
+            approx_dimension: 1,
+            class_to_label: Vec::new(),
+            cat_feature_count: 0,
+        }
+    }
+
     /// Attach the baked [`CtrData`] tables CTR splits look up at apply time
     /// (the categorical train→predict path threads the model's `ctr_data` in).
     #[must_use]
     pub fn with_ctr_data(mut self, ctr_data: CtrData) -> Self {
         self.ctr_data = Some(ctr_data);
         self
+    }
+
+    /// Replace the non-symmetric (Lossguide / Depthwise) trees. A model is
+    /// EITHER all-oblivious or all-non-symmetric — upstream never mixes grow
+    /// policies within one model.
+    #[must_use]
+    pub fn with_non_symmetric_trees(mut self, trees: Vec<NonSymmetricTree>) -> Self {
+        self.non_symmetric_trees = trees;
+        self
+    }
+
+    /// Replace the region path trees (GPUT-18 / D-03a).
+    #[must_use]
+    pub fn with_region_trees(mut self, trees: Vec<RegionTree>) -> Self {
+        self.region_trees = trees;
+        self
+    }
+
+    /// Set the number of output (approx) dimensions — `1` for every scalar
+    /// regression / binary model, `> 1` for multiclass / multilabel /
+    /// MultiQuantile.
+    #[must_use]
+    pub fn with_approx_dimension(mut self, approx_dimension: usize) -> Self {
+        self.approx_dimension = approx_dimension;
+        self
+    }
+
+    /// Set the `ClassToLabel` map (the SORTED distinct original class labels).
+    #[must_use]
+    pub fn with_class_to_label(mut self, class_to_label: Vec<f64>) -> Self {
+        self.class_to_label = class_to_label;
+        self
+    }
+
+    /// Record the number of categorical columns the training pool DECLARED
+    /// (F08 / SPEC-CATF-Δ4). See [`Model::cat_feature_count`] for why this must
+    /// be the declared width and never one derived from the chosen splits.
+    #[must_use]
+    pub fn with_cat_feature_count(mut self, cat_feature_count: usize) -> Self {
+        self.cat_feature_count = cat_feature_count;
+        self
+    }
+
+    /// The number of categorical columns the training pool declared; `0` for a
+    /// float-only model or one loaded from a codec.
+    #[must_use]
+    pub fn cat_feature_count(&self) -> usize {
+        self.cat_feature_count
     }
 
     /// Per-tree leaf values flattened in tree order.

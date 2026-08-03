@@ -19,6 +19,7 @@ use crate::model::{CtrSplit, Model, ModelSplit, NonSymmetricTree, ObliviousTree,
 /// `export/onnx_test.rs::empty_model`.
 fn empty_model() -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),

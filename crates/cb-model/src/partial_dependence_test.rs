@@ -34,6 +34,7 @@ fn one_split_tree(feature: usize, border: f64, leaf_values: Vec<f64>) -> Oblivio
 /// tree) but is present in `float_feature_borders` so `n_float == 2`.
 fn two_feature_model(lo: f64, hi: f64, bias: f64) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: vec![one_split_tree(0, 0.5, vec![lo, hi])],
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -121,6 +122,7 @@ fn engine_does_not_mutate_columns() {
 /// unused), so `grid_for_feature(&model, 0)` exercises the transform.
 fn borders_model(borders_f0: Vec<f64>) -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),
@@ -162,6 +164,7 @@ fn grid_for_feature_is_per_bin_representatives() {
 /// `float_feature_borders.len()`).
 fn validation_model() -> Model {
     Model {
+        cat_feature_count: 0,
         oblivious_trees: Vec::new(),
         non_symmetric_trees: Vec::new(),
         region_trees: Vec::new(),

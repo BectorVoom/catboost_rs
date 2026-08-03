@@ -63,16 +63,11 @@ fn model_from_json(mj: &ModelJson) -> Model {
             }
         })
         .collect();
-    Model {
+    Model::new(
         oblivious_trees,
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: mj.bias().expect("bias must parse"),
-        float_feature_borders: mj.float_feature_borders(),
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    }
+        mj.bias().expect("bias must parse"),
+        mj.float_feature_borders(),
+    )
 }
 
 #[test]
@@ -107,16 +102,11 @@ fn binarize_strict_greater_count() {
 /// predicts exactly `bias` for every object, not `0` or `2*bias`.
 #[test]
 fn bias_added_once_no_trees() {
-    let model = Model {
-        oblivious_trees: Vec::new(),
-        non_symmetric_trees: Vec::new(),
-        region_trees: Vec::new(),
-        bias: 0.42,
-        float_feature_borders: vec![vec![0.5]],
-        ctr_data: None,
-        approx_dimension: 1,
-        class_to_label: Vec::new(),
-    };
+    let model = Model::new(
+        Vec::new(),
+        0.42,
+        vec![vec![0.5]],
+    );
     let columns = vec![vec![0.1_f32, 0.9, 0.3]];
     let preds = predict_raw(&model, &columns);
     assert_eq!(preds, vec![0.42, 0.42, 0.42]);
