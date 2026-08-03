@@ -311,6 +311,41 @@ fn one_eval_pool(
     data_to_pool(py, &x, Some(&y), Some(cat_features))
 }
 
+/// Ingest SCORING data (`predict` / `predict_proba` / `score` /
+/// `partial_dependence`) into an owned pool, declaring the estimator's
+/// REMEMBERED fit-time `cat_features`.
+///
+/// The distinction from [`data_to_pool`] is whose `cat_features` it is.
+/// `data_to_pool` raises when a non-empty `cat_features` accompanies a `Pool`,
+/// because a `Pool` already declares its own categorical columns and upstream
+/// treats the combination as ambiguous — but that rule is about an argument the
+/// CALLER passed. On the scoring paths the value is not an argument at all: it is
+/// the estimator's own record of what it was fit on, filled in automatically.
+/// Routing it through `data_to_pool` therefore made
+/// `clf.fit(df, y, cat_features=[0]); clf.predict(Pool(df_test, cat_features=[0]))`
+/// raise "cat_features cannot be given when the data is a Pool" for a call that
+/// passed no `cat_features` whatsoever — a sequence upstream accepts.
+///
+/// A `Pool` argument is therefore ingested with NO declaration (it is the single
+/// source of truth for its own categorical columns, exactly as
+/// [`one_eval_pool`] already does for an eval-set member); anything else keeps
+/// the remembered declaration, which is what makes a raw frame ingest with the
+/// same categorical layout it was fit with.
+///
+/// # Errors
+/// [`CatBoostValueError`] on any dtype / layout / length / nullability failure,
+/// via [`data_to_pool`].
+pub(crate) fn scoring_data_to_pool(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    cat_features: &[usize],
+) -> PyResult<Pool> {
+    if x.cast::<crate::pool::Pool>().is_ok() {
+        return data_to_pool(py, x, None, None);
+    }
+    data_to_pool(py, x, None, Some(cat_features))
+}
+
 /// Resolve the categorical column indices for one `fit()` call (F17).
 ///
 /// Upstream accepts `cat_features` BOTH as a constructor kwarg and as a `fit()`
@@ -454,7 +489,7 @@ pub(crate) fn partial_dependence_py<'py>(
     cat_features: &[usize],
 ) -> PyResult<Bound<'py, PyDict>> {
     // --- GIL HELD: own the input before any detach (D-11) ---
-    let pool = data_to_pool(py, x, None, Some(cat_features))?;
+    let pool = scoring_data_to_pool(py, x, cat_features)?;
     // --- owned data only: safe to release the GIL for the compute ---
     let pd = py
         .detach(|| model.partial_dependence(&pool, &features))

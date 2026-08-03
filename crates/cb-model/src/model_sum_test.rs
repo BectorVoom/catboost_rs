@@ -201,6 +201,64 @@ fn sum_models_rejects_ctr_model() {
     assert!(matches!(err, ModelError::Merge(_)), "expected Merge, got {err:?}");
 }
 
+/// A ONE-HOT model must be rejected too — and the `ctr_data` check does NOT
+/// cover it.
+///
+/// A pool whose categorical columns all fit `one_hot_max_size` routes entirely
+/// one-hot and bakes NO CTR table, so such a model reaches `validate` with
+/// `ctr_data == None` and `ModelSplit::OneHot` splits, and used to merge
+/// cleanly. The merged model kept those splits while its `cat_feature_count`
+/// was 0, so it either failed the predict-side width check (categorical pool)
+/// or scored every one-hot split as `false` (float-only pool) — plausible
+/// numbers, no error, entirely wrong.
+#[test]
+fn sum_models_rejects_one_hot_model() {
+    let m0 = tiny_model(0.0);
+    let mut m1 = tiny_model_b(0.0);
+    // A one-hot split, with ctr_data left at None — the exact combination the
+    // `ctr_data.is_some()` check cannot see.
+    if let Some(tree) = m1.oblivious_trees.first_mut() {
+        tree.splits = vec![ModelSplit::OneHot(crate::model::OneHotModelSplit {
+            cat_feature: 0,
+            value_hash: 42,
+        })];
+    }
+    assert!(m1.ctr_data.is_none(), "the fixture must have no ctr_data");
+
+    let err = sum_models(&[&m0, &m1], &[1.0, 1.0])
+        .expect_err("a one-hot model must be rejected");
+    match err {
+        ModelError::Merge(ref msg) => assert!(
+            msg.contains("one-hot"),
+            "the error must name the split kind, got: {msg}"
+        ),
+        other => panic!("expected Merge, got {other:?}"),
+    }
+}
+
+/// A model carrying CTR SPLITS but no baked `ctr_data` is rejected on the split
+/// kind, not on the (absent) table.
+#[test]
+fn sum_models_rejects_ctr_splits_without_ctr_data() {
+    let m0 = tiny_model(0.0);
+    let mut m1 = tiny_model_b(0.0);
+    if let Some(tree) = m1.oblivious_trees.first_mut() {
+        tree.splits = vec![ModelSplit::Ctr(crate::model::CtrSplit {
+            projection: cb_train::TProjection::single(0),
+            ctr_type: crate::ctr_data::ECtrType::Borders,
+            prior: crate::ctr_data::Prior { num: 0.5, denom: 1.0 },
+            target_border_idx: 0,
+            border: 0.5,
+            shift: 0.0,
+            scale: 1.0,
+        })];
+    }
+    assert!(m1.ctr_data.is_none(), "the fixture must have no ctr_data");
+    let err = sum_models(&[&m0, &m1], &[1.0, 1.0])
+        .expect_err("CTR splits must be rejected even without a baked table");
+    assert!(matches!(err, ModelError::Merge(_)), "expected Merge, got {err:?}");
+}
+
 #[test]
 fn sum_models_rejects_border_mismatch() {
     let m0 = tiny_model(0.0);

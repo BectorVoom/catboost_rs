@@ -34,7 +34,9 @@ use catboost_rs::{CatBoostBuilder, ErrorScore, SearchResult};
 
 use crate::errors::{CatBoostValueError, FitFailedWarning, PyCbError};
 use crate::estimator::data_to_pool;
-use crate::params::{make_builder, validate_params};
+use crate::params::{
+    make_builder, validate_eval_set_only_params, validate_params, EVAL_SET_REMEDY_SEARCH,
+};
 
 /// Read the `estimator`'s base params through its sklearn `get_params()` contract
 /// (implemented uniformly by the regressor / classifier / ranker), copying every
@@ -129,6 +131,12 @@ pub(crate) fn expand_param_grid(
             point.set_item(name, value.bind(py))?;
         }
         validate_params(&merged)?;
+        // Each candidate is fit through `builder.fit(&train_pool)` — the
+        // learn-only path, no eval set — so the detector / best-model params
+        // would be silently inert. Checked on the MERGED map so a grid that
+        // sweeps one (`{"early_stopping_rounds": [10, 20]}`) is caught as well as
+        // one inherited from the estimator's constructor kwargs.
+        validate_eval_set_only_params(py, &merged, EVAL_SET_REMEDY_SEARCH)?;
         let builder = make_builder(&merged, py)?;
         builders.push(builder);
         grid_points.push(point.unbind());

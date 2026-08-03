@@ -2308,6 +2308,93 @@ fn tree_eval_contribution(tree: &ObliviousTree, matrix: &FeatureMatrix, obj: usi
     tree.leaf_values.get(leaf).copied().unwrap_or(0.0)
 }
 
+/// [`tree_eval_contribution`] for a NON-SYMMETRIC (Lossguide / Depthwise) tree:
+/// walk the flat node graph to the object's leaf via the shared
+/// [`device_leaf_of_nonsym`] transcription and return that leaf's value. A
+/// malformed / cyclic graph contributes `0` (defensive; the grower supplies
+/// valid graphs), mirroring the oblivious arm's out-of-range convention.
+fn nonsym_eval_contribution(
+    tree: &NonSymmetricTree,
+    matrix: &FeatureMatrix,
+    obj: usize,
+) -> f64 {
+    device_leaf_of_nonsym(
+        obj,
+        &tree.splits,
+        &tree.step_nodes,
+        &tree.node_id_to_leaf_id,
+        matrix.feature_values,
+    )
+    .and_then(|leaf| tree.leaf_values.get(leaf).copied())
+    .unwrap_or(0.0)
+}
+
+/// [`tree_eval_contribution`] for a REGION path tree: the walk-until-diverge
+/// bin (`AddRegionImpl`) transcribed against the eval matrix — `bin = 0; for
+/// level { split = one_hot ? val == border : val > border; if split != direction
+/// { break }; bin += 1 }`, then `leaf_values[bin]`. Every access is checked; a
+/// missing column or level halts the walk at the bin reached so far, exactly as
+/// the trainer's own region walk does.
+fn region_eval_contribution(tree: &RegionTree, matrix: &FeatureMatrix, obj: usize) -> f64 {
+    let mut bin = 0usize;
+    for level in 0..tree.splits.len() {
+        let (Some(s), Some(&dir), Some(&oh)) = (
+            tree.splits.get(level),
+            tree.directions.get(level),
+            tree.one_hot.get(level),
+        ) else {
+            break;
+        };
+        let Some(val) = matrix
+            .feature_values
+            .get(s.feature)
+            .and_then(|col| col.get(obj))
+            .map(|&v| f64::from(v))
+        else {
+            break;
+        };
+        let split = if oh { val == s.border } else { val > s.border };
+        if split == dir {
+            bin = bin.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    tree.leaf_values.get(bin).copied().unwrap_or(0.0)
+}
+
+/// The eval-set contribution of the tree the CURRENT iteration just grew,
+/// whichever of the three ensembles received it.
+///
+/// A model is EITHER all-oblivious OR all-non-symmetric OR all-region (see the
+/// push dispatch in the boosting loop), so at most one of these vectors is ever
+/// non-empty and the branch order below is a formality rather than a priority.
+///
+/// This used to read `trees.last()` alone. Under `grow_policy=Lossguide` /
+/// `Depthwise` every tree lands in `non_symmetric_trees` and `trees` stays
+/// EMPTY, so the eval approximant never advanced past `bias`: the metric
+/// returned the same constant for every iteration, `BestModelTracker` never saw
+/// an improvement (leaving `best_iteration() == Some(0)`, which truncated the
+/// returned model to a single tree under `use_best_model`), and the `Iter`
+/// detector stopped after `od_wait` iterations regardless of `iterations`.
+fn last_tree_eval_contribution(
+    trees: &[ObliviousTree],
+    non_symmetric_trees: &[NonSymmetricTree],
+    region_trees: &[RegionTree],
+    matrix: &FeatureMatrix,
+    obj: usize,
+) -> f64 {
+    if let Some(tree) = region_trees.last() {
+        return region_eval_contribution(tree, matrix, obj);
+    }
+    if let Some(tree) = non_symmetric_trees.last() {
+        return nonsym_eval_contribution(tree, matrix, obj);
+    }
+    trees
+        .last()
+        .map_or(0.0, |tree| tree_eval_contribution(tree, matrix, obj))
+}
+
 /// Train a plain-boosted oblivious-tree model over the generic runtime `R`.
 ///
 /// `feature_values[f]` is float feature `f`'s per-object `f32` column;
@@ -2648,7 +2735,8 @@ pub fn train_with_snapshot<R: Runtime>(
     // costs the caller nothing.
     let resume_from = if snapshot.snapshot_file.exists() {
         let stored = crate::snapshot::read_from(&snapshot.snapshot_file)?;
-        let current = crate::snapshot::fingerprint(params, target.len(), feature_borders, target);
+        let current =
+            crate::snapshot::fingerprint(params, target.len(), feature_borders, target, weights);
         crate::snapshot::check_resume(stored.fingerprint, current)?;
         stored.completed_iters
     } else {
@@ -3852,6 +3940,30 @@ fn train_inner<R: Runtime>(
     // (RMSE / Logloss, weighted, multi-set) lives in `crate::metrics`; it defaults
     // to the objective and may be overridden via `params.eval_metric`.
     let has_test = !eval_sets.is_empty();
+    // The eval-set machinery below is SINGLE-DIMENSION end to end: `eval_approx`
+    // holds one `f64` per eval object (no `approx_dimension` factor, unlike the
+    // learn-side `approx`), the per-tree contribution reads `leaf_values[leaf]`
+    // (dimension 0 only, since the buffer is dimension-major
+    // `leaf_values[d * n_leaves + l]`), and `EvalMetric::eval` requires
+    // `approx.len() == target.len()`, which has no multi-dimensional reading.
+    //
+    // Running a multi-dimensional loss against an eval set therefore produced a
+    // metric curve computed from dimension 0's raw scores alone — and that curve
+    // drives `use_best_model`'s truncation and the overfitting detector's stop.
+    // A silently-wrong stopping decision is worse than a refused one, so reject
+    // the combination outright rather than reporting a meaningless curve. (The
+    // in-scope multiclass fixtures pin `od_type=None` with NO eval set, which is
+    // why this was never caught — see `EvalMetric::for_loss`.)
+    if has_test && approx_dimension > 1 {
+        return Err(CbError::Unsupported(format!(
+            "eval sets are not supported for a {approx_dimension}-dimensional loss \
+             ({:?}): the validation metric surface is single-dimension, so the \
+             per-iteration curve — and any `use_best_model` / overfitting-detector \
+             decision taken from it — would be computed from output dimension 0 \
+             alone. Fit without an `eval_set`, or use a scalar loss.",
+            params.loss
+        )));
+    }
     // `EvalMetric` is no longer `Copy` (LOSS-07 — the `Custom` variant carries a
     // non-`Copy` `Arc`); clone out of the borrowed `params` (cheap — an `Arc`
     // refcount bump for `Custom`, a bitwise copy otherwise).
@@ -4312,7 +4424,7 @@ fn train_inner<R: Runtime>(
                 &ranking,
             )?;
             let fingerprint =
-                crate::snapshot::fingerprint(params, n, feature_borders, target);
+                crate::snapshot::fingerprint(params, n, feature_borders, target, &weights);
             Some((cfg, fingerprint))
         }
     };
@@ -6325,12 +6437,19 @@ fn train_inner<R: Runtime>(
         // the per-set per-iteration value, and feed the PRIMARY set's metric to
         // the detector + best-model tracker (TRAIN-06), breaking on IsNeedStop().
         if has_test {
-            if let Some(tree) = trees.last() {
-                for (set_idx, approx_col) in eval_approx.iter_mut().enumerate() {
-                    if let Some(em) = eval_matrices.get(set_idx) {
-                        for (obj, a) in approx_col.iter_mut().enumerate() {
-                            *a += tree_eval_contribution(tree, em, obj);
-                        }
+            // Dispatches on WHICH ensemble this iteration's tree went into — the
+            // oblivious-only `trees.last()` this used to read is empty for every
+            // non-symmetric / region grow policy (see `last_tree_eval_contribution`).
+            for (set_idx, approx_col) in eval_approx.iter_mut().enumerate() {
+                if let Some(em) = eval_matrices.get(set_idx) {
+                    for (obj, a) in approx_col.iter_mut().enumerate() {
+                        *a += last_tree_eval_contribution(
+                            &trees,
+                            &non_symmetric_trees,
+                            &region_trees,
+                            em,
+                            obj,
+                        );
                     }
                 }
             }
