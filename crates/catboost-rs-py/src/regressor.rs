@@ -14,9 +14,11 @@ use pyo3::types::PyDict;
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
 use crate::estimator::{
     build_sklearn_tags, data_to_pool, eval_set_to_pools, fit_pool_with_eval, load_model_path,
-    r2_score, resolve_cat_features, EstimatorBase,
+    r2_score, resolve_cat_features, scoring_data_to_pool, EstimatorBase,
 };
-use crate::params::{make_builder, validate_eval_set_only_params, validate_params};
+use crate::params::{
+    make_builder, validate_eval_set_only_params, validate_params, EVAL_SET_REMEDY_FIT,
+};
 
 /// CatBoost-mirror regressor (sklearn-compatible). Plan 08-01 implements the
 /// thinnest `__init__` / `fit` / `predict` path; the full sklearn contract and
@@ -83,7 +85,7 @@ impl CatBoostRegressor {
         // The detector / best-model params act on the validation curve; with no
         // eval set they would be silently inert, so reject rather than ignore.
         if eval_pools.is_empty() {
-            validate_eval_set_only_params(&slf.base.params)?;
+            validate_eval_set_only_params(py, &slf.base.params, EVAL_SET_REMEDY_FIT)?;
         }
         let builder = make_builder(&slf.base.params, py)?;
         // --- owned/quantized data only: safe to release the GIL ---
@@ -168,7 +170,7 @@ impl CatBoostRegressor {
         })?;
         // --- GIL HELD: own the input before any detach (D-11) ---
         // Accept a framework object OR a native Pool, same as fit.
-        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
+        let pool = scoring_data_to_pool(py, x, &self.base.cat_features)?;
         let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         Ok(preds.to_pyarray(py))
     }
@@ -273,7 +275,7 @@ impl CatBoostRegressor {
                 "this CatBoostRegressor is not fitted yet; call `fit` before `score`",
             )
         })?;
-        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
+        let pool = scoring_data_to_pool(py, x, &self.base.cat_features)?;
         let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         let y_true = y_to_vec(y)?;
         if y_true.len() != preds.len() {

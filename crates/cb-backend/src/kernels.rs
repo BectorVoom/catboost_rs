@@ -642,7 +642,7 @@ pub fn apply_oblivious_float_kernel<F: Float>(
     let obj = ABSOLUTE_POS;
     if obj < n_objects as usize {
         // Accumulator seeded at 0.0 — bias is NOT seeded here (added once after the loop).
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0_f32);
         let mut t = 0u32;
         while t < n_trees {
             let s0 = tree_split_offsets[t as usize];
@@ -670,7 +670,7 @@ pub fn apply_oblivious_float_kernel<F: Float>(
             }
             let li = tree_leaf_offsets[t as usize] + leaf;
             // Out-of-range leaf contributes 0 (mirror CPU unwrap_or(0.0)); statement-form guard.
-            let mut contrib = F::new(0.0);
+            let mut contrib = F::new(0.0_f32);
             if li < tree_leaf_offsets[(t + 1) as usize] {
                 contrib = leaf_values[li as usize];
             }

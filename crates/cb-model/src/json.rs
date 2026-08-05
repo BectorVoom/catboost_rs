@@ -479,45 +479,66 @@ fn unflatten_non_symmetric(tree: &NonSymmetricTree) -> NonSymmetricNodeJson {
     build(tree, 0, 0)
 }
 
-/// Whether any tree of `model` — oblivious, non-symmetric or region — carries a
-/// [`ModelSplit::OneHot`] split (SPEC-OH-14).
-fn has_one_hot_split(model: &Model) -> bool {
-    let is_one_hot = |s: &ModelSplit| matches!(s, ModelSplit::OneHot(_));
+/// Every split of `model`, across all three tree kinds (oblivious,
+/// non-symmetric, region), in a single iterator.
+fn all_splits(model: &Model) -> impl Iterator<Item = &ModelSplit> {
     model
         .oblivious_trees
         .iter()
         .flat_map(|t| t.splits.iter())
         .chain(model.non_symmetric_trees.iter().flat_map(|t| t.tree_splits.iter()))
         .chain(model.region_trees.iter().flat_map(|t| t.levels.iter().map(|l| &l.split)))
-        .any(is_one_hot)
+}
+
+/// The human-readable kind name of the first CATEGORICAL split in `model` —
+/// one-hot (SPEC-OH-14) or CTR — or `None` for a float-only model.
+///
+/// Both kinds are unrepresentable in the numeric `model.json` schema and both
+/// desync the emitted split count from `leaf_values` if dropped, so `to_doc`
+/// refuses either. They are found in ONE pass so the error names whichever the
+/// model actually carries.
+fn categorical_split_kind(model: &Model) -> Option<&'static str> {
+    all_splits(model).find_map(|s| match *s {
+        ModelSplit::Float(_) => None,
+        ModelSplit::OneHot(_) => Some("one-hot"),
+        ModelSplit::Ctr(_) => Some("CTR"),
+    })
 }
 
 /// Build the serializable document from the canonical model.
 ///
-/// # One-hot (SPEC-OH-14 / Q1)
-/// A model carrying ANY one-hot split is rejected outright. The alternative —
-/// emitting upstream's real one-hot shape — would require `split_index` to
+/// # Categorical splits — one-hot (SPEC-OH-14 / Q1) and CTR
+/// A model carrying ANY categorical split is rejected outright. The alternative
+/// — emitting upstream's real one-hot shape — would require `split_index` to
 /// become the GLOBAL combined bin index (`Float → OneHot → Ctr`) instead of the
 /// positional counter this exporter has always used, re-specifying the json
 /// split-index semantics for every float model too and putting the float-only
 /// byte-identity guarantee (SPEC-OH-31) at risk for a secondary export. The
-/// `.cbm` path is the upstream-interop path and DOES carry one-hot splits; json
-/// one-hot emit is deferred.
+/// `.cbm` path is the upstream-interop path and DOES carry one-hot and CTR
+/// splits; json categorical emit is deferred.
+///
+/// CTR splits used to be silently DROPPED here (`filter_map(as_float)`), which is
+/// the same corruption WR-03 rejects for Region levels one screen down: a
+/// depth-`d` oblivious tree carrying a CTR level emitted `d - 1` splits next to
+/// its full `2^d` leaf values, so the reloaded tree's `leaf_index_for` could only
+/// ever reach the lower half of its leaves and the round-tripped model predicted
+/// differently from the original — with no error at either end. `from_doc` also
+/// hard-codes `ctr_data: None`, so a CTR model could never have round-tripped
+/// through this schema even if the split count had lined up.
 ///
 /// # Errors
-/// [`ModelError::Serialize`] if any tree carries a one-hot split (above), or if
-/// a Region tree carries a non-float split level (WR-03): the numeric JSON
+/// [`ModelError::Serialize`] if any tree carries a one-hot or CTR split (above),
+/// or if a Region tree carries a non-float split level (WR-03): the numeric JSON
 /// schema can only round-trip float levels, and silently dropping a CTR level
 /// would desync the level count from `leaf_values` (the walk could never reach
 /// the highest leaves). Surface it loudly instead of emitting a corrupt
 /// document.
 fn to_doc(model: &Model) -> Result<ModelJsonDoc, ModelError> {
-    if has_one_hot_split(model) {
-        return Err(ModelError::Serialize(
-            "one-hot splits cannot be represented in the numeric model.json schema (v1); \
+    if let Some(kind) = categorical_split_kind(model) {
+        return Err(ModelError::Serialize(format!(
+            "{kind} splits cannot be represented in the numeric model.json schema (v1); \
              save the model as .cbm instead"
-                .to_owned(),
-        ));
+        )));
     }
     // Output dimensions (D-6.2-01 / Plan 06.2-02); `0`/unset means the scalar
     // default `1`. Drives the leaf-major transpose + per-dim bias vector below.
@@ -543,11 +564,16 @@ fn to_doc(model: &Model) -> Result<ModelJsonDoc, ModelError> {
         .oblivious_trees
         .iter()
         .map(|t| {
-            // The numeric-only `model.json` schema emits FLOAT splits only; CTR
-            // splits round-trip through the `.cbm` / `ctr_data` path, not this
-            // numeric JSON export (a CTR split is skipped here, the json round-trip
-            // covers float-only models — the apply path for CTR splits is exercised
-            // via the trainer-lifted model + baked ctr_data, not this loader).
+            // The numeric-only `model.json` schema emits FLOAT splits only; one-hot
+            // and CTR splits round-trip through the `.cbm` / `ctr_data` path, not
+            // this numeric JSON export.
+            //
+            // The `filter_map` is now TOTAL, not a filter: the
+            // `categorical_split_kind` guard at the top of `to_doc` has already
+            // rejected every non-float split, so this cannot drop anything and the
+            // emitted split count is always exactly `depth` for `2^depth` leaf
+            // values. It is left as a `filter_map` only because the closure has no
+            // way to return an error; the guard is the invariant.
             let splits = t
                 .splits
                 .iter()

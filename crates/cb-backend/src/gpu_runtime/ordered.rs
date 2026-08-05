@@ -87,6 +87,7 @@ fn weight_of(weights: &[f64], doc: usize) -> f64 {
 ///   1. the row's own der/weight enters its leaf's running sum (`AddMethodDer`),
 ///   2. the running leaf average `gradient_leaf_delta(leafDer, leafWeight, l2)` — which NOW includes
 ///      this row (upstream adds-then-reads) — is written to `approx_delta[doc]`.
+///
 /// Body rows (and any object outside `[0, n)`) keep delta `0` (the anti-leakage estimation prefix).
 /// Returns the per-object delta in OBJECT order (length `permutation.len()`).
 ///

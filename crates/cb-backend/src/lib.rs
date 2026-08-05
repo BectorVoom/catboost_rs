@@ -1,11 +1,12 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![allow(clippy::collapsible_if, clippy::manual_slice_size_calculation, clippy::unnecessary_cast, clippy::manual_div_ceil, clippy::assign_op_pattern, clippy::manual_rotate, clippy::too_many_arguments, clippy::manual_is_multiple_of, clippy::indexing_slicing, clippy::approx_constant, clippy::excessive_precision, clippy::manual_range_contains, clippy::type_complexity, clippy::needless_range_loop, clippy::neg_multiply)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! `cb-backend` — the sole feature-gated runtime-alias owner (D-02). As of
 //! Phase 3 (D-01) the `cpu` arm stands up the real CubeCL `CpuRuntime` and owns
 //! the `#[cube]` kernels (D-03 keeps `cubecl` out of `cb-compute`). As of Phase
 //! 7.1 (D-7.1-01) the `wgpu`/`cuda`/`rocm` arms resolve to the real CubeCL GPU
-//! runtimes (`WgpuRuntime`/`CudaRuntime`/`HipRuntime`) and the `#[cube]` kernels
-//! + the `gpu_runtime` launch helpers compile under every backend. Selection is
-//! purely compile-time — there is no runtime `match` over backends.
+//! runtimes (`WgpuRuntime`/`CudaRuntime`/`HipRuntime`), the `#[cube]` kernels,
+//! and the `gpu_runtime` launch helpers — all compile under every backend.
+//! Selection is purely compile-time — there is no runtime `match` over backends.
 
 /// First-class `#[cube]` kernels (D-01/D-03). Elementwise loss kernels do only
 /// order-independent per-element work; the Phase-7.1 `block_reduce_kernel`

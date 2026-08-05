@@ -153,7 +153,7 @@ fn refingerprinted_k_run(name: &str, n_total: usize, k: usize) -> SnapshotConfig
 
     // 2/3. Re-fingerprint for the N-iteration run and write the fixture.
     snap.fingerprint =
-        snapshot::fingerprint(&params(n_total), target.len(), &borders, &target);
+        snapshot::fingerprint(&params(n_total), target.len(), &borders, &target, &weights);
     let resume_path = snap_path(&format!("{name}_resume"));
     snapshot::write_atomic(&resume_path, &snap).expect("the fixture must be writable");
     let _ = std::fs::remove_file(&k_path);

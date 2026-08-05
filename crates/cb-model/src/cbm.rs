@@ -1139,6 +1139,52 @@ fn read_class_to_label(core: &TModelCore) -> Result<Vec<f64>, ModelError> {
     Ok(Vec::new())
 }
 
+/// The widest categorical index any `splits` entry references, `+ 1` — the
+/// LOWER BOUND on a decoded model's categorical width, derived from the splits
+/// the model happened to choose. `0` for a float-only split list.
+///
+/// A `Ctr` split contributes the widest member of its projection; a `OneHot`
+/// split contributes its `cat_feature`. Mirrors `fstr::cat_feature_count`'s
+/// "widen based on observed usage" convention.
+fn derived_cat_width<'a>(splits: impl Iterator<Item = &'a ModelSplit>) -> usize {
+    splits
+        .filter_map(|s| match s {
+            ModelSplit::Ctr(c) => c.projection.cat_features().iter().copied().max(),
+            ModelSplit::OneHot(oh) => Some(oh.cat_feature),
+            ModelSplit::Float(_) => None,
+        })
+        .map(|m| m.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The categorical width to record on a decoded model.
+///
+/// `cat_feature_count` is runtime-only — it is deliberately NOT written to the
+/// `.cbm` bytes (F08 / SPEC-CATF-Δ4) — so a decoded model cannot recover the
+/// pool width its author declared at fit time. It recovers the best available
+/// LOWER BOUND instead, taking the larger of:
+///
+///   * `CatFeatures.len()` — upstream writes one `TCatFeature` per DECLARED
+///     categorical column (used or not), so for an upstream `.cbm` this IS the
+///     exact declared width. This crate's own writer emits one entry per
+///     one-hot-referenced column only, so there it is a lower bound too.
+///   * the width derived from the splits ([`derived_cat_width`]) — the floor
+///     below which apply provably cannot work.
+///
+/// Recording `0` here (as this decode used to) made EVERY categorical `.cbm`
+/// unusable through the facade: `needs_cat_columns()` was true while the
+/// declared width said "expects 0", so `Model::cat_columns` rejected the very
+/// pool the model was fit on. The predict-side check treats this value as a
+/// MINIMUM for exactly this reason — see `catboost_rs::Model::cat_columns`.
+fn decoded_cat_width<'a>(
+    trees: &TModelTrees,
+    splits: impl Iterator<Item = &'a ModelSplit>,
+) -> usize {
+    let declared = trees.CatFeatures().map_or(0, |v| v.len());
+    declared.max(derived_cat_width(splits))
+}
+
 /// Reconstruct the canonical [`Model`] from a verified `TModelTrees`, carrying the
 /// `class_to_label` already parsed from the enclosing `TModelCore` InfoMap and
 /// the raw model-parts `tail` bytes (CTR-03/CTR-04) — read ONLY when
@@ -1190,8 +1236,12 @@ fn reconstruct_model(
         }
         let non_symmetric_trees =
             reconstruct_non_symmetric(trees, &bins, &leaf_values, leaf_weights.as_ref(), dim)?;
+        let cat_feature_count = decoded_cat_width(
+            trees,
+            non_symmetric_trees.iter().flat_map(|t| t.tree_splits.iter()),
+        );
         return Ok(Model {
-            cat_feature_count: 0,
+            cat_feature_count,
             oblivious_trees: Vec::new(),
             non_symmetric_trees,
             region_trees: Vec::new(),
@@ -1316,8 +1366,11 @@ fn reconstruct_model(
         None
     };
 
+    let cat_feature_count =
+        decoded_cat_width(trees, oblivious_trees.iter().flat_map(|t| t.splits.iter()));
+
     Ok(Model {
-        cat_feature_count: 0,
+        cat_feature_count,
         oblivious_trees,
         // Oblivious models carry no non-symmetric trees (the non-symmetric `.cbm`
         // is handled by the early return above, D-6.6-05).

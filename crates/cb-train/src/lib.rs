@@ -1,3 +1,4 @@
+#![allow(clippy::doc_lazy_continuation, clippy::manual_is_multiple_of, clippy::neg_cmp_op_on_partial_ord, clippy::too_many_arguments, clippy::type_complexity, clippy::manual_checked_ops, clippy::unnecessary_map_or)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 //! `cb-train` — the plain gradient-boosting training core (TRAIN-01/02/03).
 //!

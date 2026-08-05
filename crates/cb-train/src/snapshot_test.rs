@@ -271,8 +271,24 @@ fn base_target() -> Vec<f64> {
     vec![1.0, 0.0, 1.0, 1.0, 0.0, 0.0]
 }
 
+fn base_weights() -> Vec<f64> {
+    vec![1.0; 6]
+}
+
 fn fp(params: &BoostParams, n: usize, borders: &[Vec<f64>], target: &[f64]) -> u64 {
-    fingerprint(params, n, borders, target)
+    fingerprint(params, n, borders, target, &base_weights())
+}
+
+/// `fp` with an explicit weight column — the field-17 sensitivity test's entry
+/// point (every other test holds the weights fixed at [`base_weights`]).
+fn fp_w(
+    params: &BoostParams,
+    n: usize,
+    borders: &[Vec<f64>],
+    target: &[f64],
+    weights: &[f64],
+) -> u64 {
+    fingerprint(params, n, borders, target, weights)
 }
 
 fn base_fp() -> u64 {
@@ -414,6 +430,22 @@ fn fingerprint_is_sensitive_to_every_hashed_field() {
             let mut t = base_target();
             t[3] = 0.0;
             fp(&base_params(), 6, &base_borders(), &t)
+        })),
+        // 17. the EFFECTIVE per-object weight column. A `class_weights` /
+        // `auto_class_weights` / `scale_pos_weight` change reaches the trainer
+        // ONLY through this vector — none of them is a `BoostParams` field — so
+        // without this the resume of a re-weighted run is silently accepted and
+        // the first K trees are fit against a different weighting than the rest.
+        ("a weight value", Box::new(|| {
+            let mut w = base_weights();
+            w[2] = 5.0;
+            fp_w(&base_params(), 6, &base_borders(), &base_target(), &w)
+        })),
+        // The LENGTH prefix, independently of the values: a shorter column must
+        // not collide with a longer one that shares its prefix.
+        ("the weight column length", Box::new(|| {
+            let w = vec![1.0; 5];
+            fp_w(&base_params(), 6, &base_borders(), &base_target(), &w)
         })),
     ];
 

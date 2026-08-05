@@ -422,42 +422,137 @@ pub(crate) fn validate_params(params: &BTreeMap<String, Py<PyAny>>) -> PyResult<
     Ok(())
 }
 
-/// Reject the EVAL-SET-ONLY params when `fit` was called WITHOUT an `eval_set`
-/// (PARAM-02, threat T-08-05).
+/// Whether an eval-set-only param is set to a value that would actually DO
+/// something — i.e. whether ignoring it silently would lose anything.
+///
+/// The guard below keys on this, not on the name alone. Every one of these
+/// params has a spelling that means "off", and passing the off-value is not a
+/// request for behaviour the learn-only path cannot deliver — it is a statement
+/// that the behaviour is not wanted. Rejecting `od_type="None"` or
+/// `use_best_model=False` told the caller their explicit *disabling* of early
+/// stopping was incompatible with not having an eval set, which reads as a bug
+/// and blocks any wrapper or config layer that materializes a full default
+/// parameter dict (a common sklearn / MLflow pattern).
+///
+/// The Python literal `None` is inert for ALL of them — it is upstream's
+/// universal "not set" (see [`get`]) — and is handled once, up front.
+fn eval_set_only_param_is_active(py: Python<'_>, canonical: &str, value: &Py<PyAny>) -> bool {
+    let bound = value.bind(py);
+    if bound.is_none() {
+        return false;
+    }
+    match canonical {
+        // The detector's own "no detector" spelling.
+        "od_type" => !bound
+            .extract::<String>()
+            .is_ok_and(|s| s.eq_ignore_ascii_case("None")),
+        // 0 is the default and leaves IncToDec / Wilcoxon inactive.
+        "od_pval" => !bound.extract::<f64>().is_ok_and(|v| v == 0.0),
+        // `False` is the default and truncates nothing.
+        "use_best_model" => bound.extract::<bool>().unwrap_or(true),
+        // `od_wait` and `early_stopping_rounds` have no inert numeric value —
+        // any count is a real request to stop early — so only `None` (handled
+        // above) disarms them.
+        _ => true,
+    }
+}
+
+/// The remedy sentence [`validate_eval_set_only_params`] appends for a `fit`
+/// call that was given no `eval_set`.
+pub(crate) const EVAL_SET_REMEDY_FIT: &str =
+    "Pass `eval_set=(X_valid, y_valid)` (or a Pool) to `fit`, or drop it.";
+
+/// The remedy sentence for `cv()`, which fits every fold through the learn-only
+/// training path and never builds a validation curve for the detector to read.
+pub(crate) const EVAL_SET_REMEDY_CV: &str =
+    "`cv()` fits each fold through the learn-only path and never builds a per-iteration \
+     validation curve, so this parameter cannot take effect here — drop it. (The fold's \
+     held-out split is scored ONCE, after training, to produce the reported metrics.)";
+
+/// The remedy sentence for `grid_search` / `randomized_search`, which evaluate
+/// each candidate through the same learn-only path.
+pub(crate) const EVAL_SET_REMEDY_SEARCH: &str =
+    "`grid_search` / `randomized_search` fit every candidate through the learn-only path \
+     and never build a per-iteration validation curve, so this parameter cannot take \
+     effect here — drop it.";
+
+/// Reject the EVAL-SET-ONLY params when training will run WITHOUT a validation
+/// curve (PARAM-02, threat T-08-05) — but only when they are set to a value that
+/// would actually take effect ([`eval_set_only_param_is_active`]).
 ///
 /// `od_type` / `od_wait` / `od_pval` / `early_stopping_rounds` / `use_best_model`
-/// all act on the per-iteration validation curve. With no eval set that curve
-/// does not exist, so the trainer runs to completion and returns the full model —
-/// a caller who asked for early stopping gets none, with nothing to notice. This
-/// is exactly the "silently ignored parameter" the honesty policy forbids, so it
-/// raises instead.
+/// all act on the per-iteration validation curve. Without one the trainer runs to
+/// completion and returns the full model — a caller who asked for early stopping
+/// gets none, with nothing to notice. This is exactly the "silently ignored
+/// parameter" the honesty policy forbids, so it raises instead. A caller who
+/// passed the param's OFF value loses nothing, so there is nothing to warn them
+/// about.
+///
+/// `remedy` names what the caller can do about it, because the answer differs by
+/// entry point — see the `EVAL_SET_REMEDY_*` constants. EVERY entry point that
+/// reaches the learn-only training path must call this: `fit` alone did, so
+/// promoting these params to IMPLEMENTED made `cv` / `grid_search` /
+/// `randomized_search` start ACCEPTING them and silently dropping them, while the
+/// same param on `fit` raised — the worst of both worlds, since the raise on one
+/// path is what convinces the user the param works on the others.
 ///
 /// # Errors
-/// `CatBoostParameterError` naming the first eval-set-only param present.
+/// `CatBoostParameterError` naming the first ACTIVE eval-set-only param present.
 pub(crate) fn validate_eval_set_only_params(
+    py: Python<'_>,
     params: &BTreeMap<String, Py<PyAny>>,
+    remedy: &str,
 ) -> PyResult<()> {
-    for name in params.keys() {
+    for (name, value) in params {
         let canonical = resolve_alias(name);
-        if EVAL_SET_ONLY.contains(&canonical) {
+        if EVAL_SET_ONLY.contains(&canonical) && eval_set_only_param_is_active(py, canonical, value)
+        {
             return Err(CatBoostParameterError::new_err(format!(
-                "parameter `{name}` only takes effect when `fit` is given an `eval_set`: it \
-                 acts on the per-iteration validation metric, which a learn-only fit never \
-                 computes. Pass `eval_set=(X_valid, y_valid)` (or a Pool), or drop `{name}`."
+                "parameter `{name}` only takes effect when training is given a validation \
+                 set: it acts on the per-iteration validation metric, which this fit never \
+                 computes. {remedy}"
             )));
         }
     }
     Ok(())
 }
 
+/// Whether `name` is present in `params` with a value that is not the Python
+/// literal `None`. See [`get`] for why `None` counts as absent.
+fn is_set(params: &BTreeMap<String, Py<PyAny>>, py: Python<'_>, name: &str) -> bool {
+    params.get(name).is_some_and(|v| !v.bind(py).is_none())
+}
+
 /// Read a stored param (alias-resolved at the call site) as `T` via `extract`.
+///
+/// The Python literal `None` is treated as ABSENT rather than extracted.
+/// Upstream CatBoost spells "this parameter is not set" as `None` for every
+/// optional parameter — it is the declared default of `auto_class_weights`,
+/// `od_type`, `eval_metric`, `monotone_constraints`, `early_stopping_rounds` and
+/// many others — so `None` reaching an `extract::<String>()` is not a user error,
+/// it is the ordinary value. Extracting it unconditionally raised
+/// `TypeError: 'NoneType' object cannot be converted to 'PyString'` from PyO3
+/// before any of this crate's own parsing (and its messages) could run, which
+/// broke the two commonest sklearn idioms: an explicit `param=None` default in
+/// wrapper code, and the `sklearn.clone(est)` / `set_params(**est.get_params())`
+/// round-trip that materializes every declared default. Grids such as
+/// `{"auto_class_weights": [None, "Balanced"]}` hit it too.
+///
+/// Skipping the param leaves the builder on its own default, which is exactly
+/// what "not set" means.
 fn get<'py, T>(params: &'py BTreeMap<String, Py<PyAny>>, py: Python<'py>, name: &str) -> PyResult<Option<T>>
 where
     T: FromPyObject<'py, 'py>,
     PyErr: From<<T as FromPyObject<'py, 'py>>::Error>,
 {
     match params.get(name) {
-        Some(v) => Ok(Some(v.bind(py).extract::<T>()?)),
+        Some(v) => {
+            let bound = v.bind(py);
+            if bound.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(bound.extract::<T>()?))
+        }
         None => Ok(None),
     }
 }
@@ -762,6 +857,15 @@ fn extract_monotone_constraints(
         return Ok(None);
     };
     let bound = obj.bind(py);
+    // `None` is upstream's declared default and means "unconstrained" — the same
+    // absent-not-invalid rule `get` applies. This reads the store directly rather
+    // than through `get` (the three accepted shapes have no single `T`), so the
+    // check has to be repeated here. Without it, `monotone_constraints=None` fell
+    // through every shape arm to "must be a list of -1/0/1", telling the caller to
+    // pass a list when they had explicitly asked for no constraints.
+    if bound.is_none() {
+        return Ok(None);
+    }
 
     if let Ok(list) = bound.extract::<Vec<i64>>() {
         return list.into_iter().map(to_constraint).collect::<PyResult<_>>().map(Some);
@@ -949,8 +1053,13 @@ pub(crate) fn make_builder(
     // `od_type` / `od_wait` alongside it is rejected outright (below) rather than
     // resolved by precedence — either resolution silently discards one of two
     // parameters the user explicitly set.
-    let has_early_stop = params.contains_key("early_stopping_rounds");
-    let has_explicit_od = params.contains_key("od_type") || params.contains_key("od_wait");
+    // Presence is `is_set`, not `contains_key`: a stored `None` is upstream's
+    // "not set" spelling (see `get`), so `od_type=None` alongside
+    // `early_stopping_rounds=10` is NOT the ambiguous both-forms combination — it
+    // is the shorthand alone, which is exactly what an sklearn `clone` round-trip
+    // reconstructs.
+    let has_early_stop = is_set(params, py, "early_stopping_rounds");
+    let has_explicit_od = is_set(params, py, "od_type") || is_set(params, py, "od_wait");
     if has_early_stop && has_explicit_od {
         return Err(CatBoostParameterError::new_err(
             "`early_stopping_rounds` is shorthand for `od_type=\"Iter\"` + `od_wait=<rounds>`; \
