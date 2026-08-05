@@ -36,7 +36,13 @@ use crate::tree::Split;
 /// The on-disk snapshot format version. Bumped whenever the meaning or the layout
 /// of any [`TrainSnapshot`] field changes; [`decode`] REFUSES any other value, so
 /// an older binary can never read a newer file with today's field meanings.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+///
+/// `2`: [`fingerprint`] now folds the per-object `weights` column (field 17). A
+/// v1 snapshot's stored fingerprint was computed WITHOUT the weights, so it would
+/// compare equal across two runs that differ only in their weighting — exactly
+/// the silent corruption the fingerprint exists to prevent. Refusing v1 files
+/// outright is the only way to guarantee that never happens on an upgrade.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Caller-facing snapshot configuration. Mirrors upstream's `snapshot_file` /
 /// `snapshot_interval` parameters; upstream's `save_snapshot=true` corresponds to
@@ -436,6 +442,17 @@ fn feed_loss(h: &mut u64, loss: &cb_compute::Loss) {
 /// 12. `boost_from_average`  13. `auto_learning_rate`  14. `n`
 /// 15. `feature_borders` (per-feature length + every border's bits)
 /// 16. `target` (length + every value's bits)
+/// 17. `weights` (length + every value's bits)
+///
+/// `weights` (field 17) is a DATA input on exactly the same footing as `target`:
+/// the scoped boosting path reduces leaf statistics over it every iteration, so
+/// two runs that differ only in their per-object weights produce different trees.
+/// It is the EFFECTIVE weight column the trainer consumes — i.e. the vector after
+/// `class_weights` / `auto_class_weights` / `scale_pos_weight` resolution — so a
+/// resume that changes any of those inputs is rejected even though none of them
+/// is a `BoostParams` field. An unweighted run passes the all-`1.0` column the
+/// trainer actually uses, which is a fixed function of `n` and therefore does not
+/// depend on how the caller spelled "no weights".
 ///
 /// Floats are folded via `to_bits`, never via their decimal rendering, so the hash
 /// is exact rather than round-trip-dependent. Every variable-length collection
@@ -451,6 +468,7 @@ pub fn fingerprint(
     n: usize,
     feature_borders: &[Vec<f64>],
     target: &[f64],
+    weights: &[f64],
 ) -> u64 {
     let mut h = FNV_OFFSET;
 
@@ -486,6 +504,11 @@ pub fn fingerprint(
     feed(&mut h, &(target.len() as u64).to_le_bytes());
     for t in target {
         feed(&mut h, &t.to_bits().to_le_bytes());
+    }
+    // 17 — the EFFECTIVE per-object weight column (see the doc above).
+    feed(&mut h, &(weights.len() as u64).to_le_bytes());
+    for w in weights {
+        feed(&mut h, &w.to_bits().to_le_bytes());
     }
 
     h

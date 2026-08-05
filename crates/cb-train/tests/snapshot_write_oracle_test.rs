@@ -112,7 +112,7 @@ fn writes_a_checkpoint_carrying_the_completed_iteration_count() {
     assert_eq!(stored.approx_dimension, 1);
     assert_eq!(
         stored.fingerprint,
-        snapshot::fingerprint(&params, target.len(), &borders, &target),
+        snapshot::fingerprint(&params, target.len(), &borders, &target, &weights),
         "the checkpoint carries THIS run's compat key"
     );
     assert_eq!(model.oblivious_trees.len(), 4, "the returned model is the full N-tree fit");

@@ -1,4 +1,5 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![allow(clippy::indexing_slicing, clippy::needless_range_loop, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
 //! `catboost_rs` — the PyO3 binding crate (Phase 8).
 //!
 //! Wraps the published [`catboost_rs`](catboost_rs) facade

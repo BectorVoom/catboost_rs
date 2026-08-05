@@ -663,8 +663,12 @@ fn eval_set_only_params_are_rejected_without_an_eval_set() {
         ] {
             let d = PyDict::new(py);
             d.set_item(name, 1).unwrap();
-            let err = crate::params::validate_eval_set_only_params(&params_from(py, &d))
-                .expect_err("an eval-set-only param must be rejected on a learn-only fit");
+            let err = crate::params::validate_eval_set_only_params(
+                py,
+                &params_from(py, &d),
+                crate::params::EVAL_SET_REMEDY_FIT,
+            )
+            .expect_err("an eval-set-only param must be rejected on a learn-only fit");
             let msg = err.value(py).to_string();
             assert!(
                 msg.contains(name) && msg.contains("eval_set"),
@@ -677,8 +681,113 @@ fn eval_set_only_params_are_rejected_without_an_eval_set() {
         d.set_item("iterations", 10).unwrap();
         d.set_item("eval_metric", "MAE").unwrap();
         assert!(
-            crate::params::validate_eval_set_only_params(&params_from(py, &d)).is_ok(),
+            crate::params::validate_eval_set_only_params(
+                py,
+                &params_from(py, &d),
+                crate::params::EVAL_SET_REMEDY_FIT,
+            )
+            .is_ok(),
             "only the detector / best-model params are eval-set-only"
+        );
+    });
+}
+
+/// The guard keys on the VALUE, not the name: passing an eval-set-only param's
+/// own DISABLING value is not a request for behaviour the learn-only path cannot
+/// deliver, so it must be accepted. Rejecting it blocked every wrapper / config
+/// layer that materializes a full default parameter dict, and told the caller
+/// their explicit *disabling* of early stopping was the problem.
+#[test]
+fn inert_eval_set_only_values_are_accepted_without_an_eval_set() {
+    Python::attach(|py| {
+        let accepts = |label: &str, d: &Bound<'_, PyDict>| {
+            assert!(
+                crate::params::validate_eval_set_only_params(
+                    py,
+                    &params_from(py, d),
+                    crate::params::EVAL_SET_REMEDY_FIT,
+                )
+                .is_ok(),
+                "`{label}` disables the parameter, so a learn-only fit loses nothing \
+                 by it — it must not be rejected"
+            );
+        };
+
+        let d = PyDict::new(py);
+        d.set_item("od_type", "None").unwrap();
+        accepts("od_type=\"None\"", &d);
+
+        let d = PyDict::new(py);
+        d.set_item("od_type", py.None()).unwrap();
+        accepts("od_type=None", &d);
+
+        let d = PyDict::new(py);
+        d.set_item("od_pval", 0.0_f64).unwrap();
+        accepts("od_pval=0.0", &d);
+
+        let d = PyDict::new(py);
+        d.set_item("use_best_model", false).unwrap();
+        accepts("use_best_model=False", &d);
+
+        let d = PyDict::new(py);
+        d.set_item("early_stopping_rounds", py.None()).unwrap();
+        accepts("early_stopping_rounds=None", &d);
+
+        let d = PyDict::new(py);
+        d.set_item("od_wait", py.None()).unwrap();
+        accepts("od_wait=None", &d);
+
+        // The whole default-dict shape a `clone` / config round-trip produces.
+        let d = PyDict::new(py);
+        d.set_item("iterations", 10).unwrap();
+        d.set_item("od_type", "None").unwrap();
+        d.set_item("od_pval", 0.0_f64).unwrap();
+        d.set_item("od_wait", py.None()).unwrap();
+        d.set_item("early_stopping_rounds", py.None()).unwrap();
+        d.set_item("use_best_model", false).unwrap();
+        accepts("a materialized full-default parameter dict", &d);
+    });
+}
+
+/// The Python literal `None` is upstream's universal "not set", so every param
+/// whose declared default is `None` must build a builder rather than raise a
+/// PyO3 `TypeError` from `extract`. This is what `sklearn.clone(est)` /
+/// `set_params(**est.get_params())` round-trips and explicit `param=None`
+/// wrapper defaults produce.
+#[test]
+fn none_valued_params_are_treated_as_unset() {
+    Python::attach(|py| {
+        for name in [
+            "auto_class_weights",
+            "od_type",
+            "eval_metric",
+            "monotone_constraints",
+            "early_stopping_rounds",
+            "class_weights",
+            "scale_pos_weight",
+            "ignored_features",
+            "grow_policy",
+        ] {
+            let d = PyDict::new(py);
+            d.set_item("iterations", 10).unwrap();
+            d.set_item(name, py.None()).unwrap();
+            assert!(
+                make_builder(&params_from(py, &d), py).is_ok(),
+                "`{name}=None` means UNSET upstream and must leave the builder on its \
+                 default, not raise"
+            );
+        }
+        // ...and the shorthand/pair ambiguity check must not fire on a `None`
+        // either: `od_type=None` is not an explicit od_type.
+        let d = PyDict::new(py);
+        d.set_item("iterations", 10).unwrap();
+        d.set_item("early_stopping_rounds", 10).unwrap();
+        d.set_item("od_type", py.None()).unwrap();
+        d.set_item("od_wait", py.None()).unwrap();
+        assert!(
+            make_builder(&params_from(py, &d), py).is_ok(),
+            "`early_stopping_rounds` alongside od_type=None/od_wait=None is the \
+             shorthand alone, not the ambiguous both-forms combination"
         );
     });
 }

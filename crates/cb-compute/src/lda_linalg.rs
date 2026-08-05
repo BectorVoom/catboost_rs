@@ -109,6 +109,7 @@ fn cholesky_lower(b: &[f32], dim: usize) -> CbResult<Vec<f32>> {
             if i == j {
                 // `!(sum > 0.0)` also rejects non-finite (NaN/inf) pivots, which
                 // `sum <= 0.0` silently lets through (NaN <= 0.0 is false) (CR-01).
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 if !(sum > 0.0) {
                     return Err(CbError::OutOfRange(format!(
                         "cholesky: non-SPD pivot {sum} at diagonal {i}"

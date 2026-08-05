@@ -20,9 +20,11 @@ use pyo3::types::PyDict;
 use crate::errors::{not_fitted_err, CatBoostValueError, PyCbError};
 use crate::estimator::{
     build_sklearn_tags, data_to_pool, eval_set_to_pools, fit_pool_with_eval, resolve_cat_features,
-    EstimatorBase,
+    scoring_data_to_pool, EstimatorBase,
 };
-use crate::params::{make_builder, validate_eval_set_only_params, validate_params};
+use crate::params::{
+    make_builder, validate_eval_set_only_params, validate_params, EVAL_SET_REMEDY_FIT,
+};
 
 /// CatBoost-mirror ranker. Reuses the shared estimator base, param registry, and
 /// ingestion; requires a `group_id`-bearing `Pool` at `fit` and returns raw
@@ -88,7 +90,7 @@ impl CatBoostRanker {
             None => Vec::new(),
         };
         if eval_pools.is_empty() {
-            validate_eval_set_only_params(&slf.base.params)?;
+            validate_eval_set_only_params(py, &slf.base.params, EVAL_SET_REMEDY_FIT)?;
         }
         let builder = make_builder(&slf.base.params, py)?;
         let model = py
@@ -117,7 +119,7 @@ impl CatBoostRanker {
                 "this CatBoostRanker is not fitted yet; call `fit` before `predict`",
             )
         })?;
-        let pool = data_to_pool(py, x, None, Some(&self.base.cat_features))?;
+        let pool = scoring_data_to_pool(py, x, &self.base.cat_features)?;
         let preds = py.detach(|| model.predict(&pool)).map_err(PyCbError)?;
         Ok(preds.to_pyarray(py))
     }

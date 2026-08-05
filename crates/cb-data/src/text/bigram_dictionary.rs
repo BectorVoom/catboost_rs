@@ -3,9 +3,9 @@
 //!
 //! Verbatim Rust transcription of upstream CatBoost's multigram dictionary
 //! builder (`catboost-master/library/cpp/text_processing/dictionary/`
-//! `dictionary_builder.cpp:204-291`, `TMultigramDictionaryBuilderImpl::AddImpl`
-//! + `Filter`) and its `Apply` path
-//! (`frequency_based_dictionary_impl.h:424-477`,
+//! `dictionary_builder.cpp:204-291`,
+//! `TMultigramDictionaryBuilderImpl::AddImpl` + `Filter`) and its `Apply`
+//! path (`frequency_based_dictionary_impl.h:424-477`,
 //! `TMultigramDictionaryImpl::ApplyImpl`), 1.2.10 snapshot, pinned to
 //! `GramOrder = 2`, `SkipStep = 0`, `EndOfSentenceTokenPolicy = Skip` (the D-02
 //! default text-processing configuration).
