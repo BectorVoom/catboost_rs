@@ -227,10 +227,11 @@ impl IncrementalCloud {
 /// # Errors
 /// [`CbError::OutOfRange`] if any cloud's dimension disagrees with `dim`.
 pub fn total_scatter(clouds: &[IncrementalCloud], size: f32, dim: usize) -> CbResult<Vec<f32>> {
+    // catches 0.0, -0.0, and NaN; an unguarded `total_size() / size` would
+    // otherwise produce inf/NaN weights that silently bypass the Cholesky
+    // SPD guard and flow into the eigensolve (CR-01).
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(size > 0.0) {
-        // catches 0.0, -0.0, and NaN; an unguarded `total_size() / size` would
-        // otherwise produce inf/NaN weights that silently bypass the Cholesky
-        // SPD guard and flow into the eigensolve (CR-01).
         return Err(CbError::Degenerate(format!(
             "total_scatter: non-positive size {size}"
         )));
@@ -287,9 +288,10 @@ pub fn between_matrix(
     dim: usize,
     reg: f32,
 ) -> CbResult<Vec<f32>> {
+    // catches 0.0, -0.0, and NaN; guards the `total_size() / size`
+    // weight in the classification path against silent inf/NaN (CR-01).
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(size > 0.0) {
-        // catches 0.0, -0.0, and NaN; guards the `total_size() / size`
-        // weight in the classification path against silent inf/NaN (CR-01).
         return Err(CbError::Degenerate(format!(
             "between_matrix: non-positive size {size}"
         )));
