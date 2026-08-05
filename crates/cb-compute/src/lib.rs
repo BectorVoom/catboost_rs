@@ -1,3 +1,4 @@
+#![allow(clippy::neg_multiply, clippy::excessive_precision, clippy::approx_constant, clippy::assign_op_pattern, clippy::manual_range_contains, clippy::type_complexity, clippy::needless_range_loop)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 //! `cb-compute` — the pure-generic compute boundary and host-side training math
 //! (D-03/D-04). This crate defines the abstract [`Runtime`] / [`Float`] traits

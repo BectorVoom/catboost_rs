@@ -403,6 +403,7 @@ pub enum Loss {
     ///    adjacency, `decay` default 0.85);
     /// 4. `competitorsWeight[w][l] = queryWeight · weights[w][l] / permutations`;
     ///    nonzero entries become the SAMPLED competitor pairs.
+    ///
     /// Those sampled pairs then feed the EXISTING `TPairLogitError` der over the
     /// group (POINTWISE leaf path — `IsPairwiseScoring` false). The der is
     /// recomputed every boosting iteration (the pairs are re-sampled,
@@ -456,6 +457,7 @@ pub enum Loss {
     ///    per-doc `Σ metricDiff · densityDiff / num_estimations` into `der1`;
     /// 3. SFA: subtract the mean der (orthogonalize), then (count > 2) project out
     ///    the approx direction (`Lambda`/`Nu`). `der2 = 0` (Gradient leaf method).
+    ///
     /// RAW approx; querywise POINTWISE (no pairs). The Gaussian draws go through
     /// [`cb_core::std_normal`] (the SAME variable-length Marsaglia-polar draw
     /// sequence — a different sampler desyncs the stream, RESEARCH Pitfall 1).

@@ -1,3 +1,4 @@
+#![allow(clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 //! `cb-model` — the canonical serializable model plus serialization and SHAP.
 //!
