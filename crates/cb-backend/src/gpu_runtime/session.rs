@@ -739,6 +739,15 @@ pub struct GpuTrainSession {
     indices_h: Handle,
     /// The per-object weight (channel float type), folded downstream by the histogram.
     weight_h: Handle,
+    /// GDC-02: whether the per-object weight is uniformly `1.0`, computed ONCE at
+    /// `begin`. The uniform path reuses `der1_h` as the weighted-der channel (the
+    /// same handle — ZERO extra kernel launches, byte-and-perf-unchanged, D-04);
+    /// only a genuinely weighted fit pays the one elementwise multiply per tree.
+    weights_uniform: bool,
+    /// GDC-02: the host copy of the per-object weight, kept for the host-side
+    /// fixed-point overflow guard on the sampled score channel (`w·der1·s`).
+    /// Empty on a uniform fit (the guard never reads it there).
+    weight_host: Vec<f64>,
     /// The regression/classification target (channel float type), for the der recompute.
     /// Set on the FIRST `grow_one` (the seam supplies `target` per tree, not at `begin`).
     target_h: Option<Handle>,
@@ -1432,6 +1441,10 @@ impl GpuTrainSession {
         let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
         let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices));
         let weight_h = upload_channel_floats(&client, weight);
+        // GDC-02: frozen once per fit — see the field doc. The host copy is kept
+        // only when non-uniform (the overflow guard's input); empty otherwise.
+        let weights_uniform = weight.iter().all(|&w| w == 1.0);
+        let weight_host = if weights_uniform { Vec::new() } else { weight.to_vec() };
         // The running approx starts all-zero (the RMSE-from-zero MVP; boost_from_average is
         // out of scope, the cross-oracle uses the SAME zero start).
         let approx_h = upload_channel_floats(&client, &vec![0.0_f64; n]);
@@ -1519,6 +1532,8 @@ impl GpuTrainSession {
             masks_h,
             indices_h,
             weight_h,
+            weights_uniform,
+            weight_host,
             target_h: None,
             approx_h,
             der1_h: None,
@@ -1909,12 +1924,16 @@ impl GpuTrainSession {
                 // BEFORE uploading it (`WR01-S10`). The check needs host `der1`, which is the
                 // same value the resident `der1_h` holds — recomputed here from the caller's
                 // approx/target through the SAME `host_der1` helper the nonsym / region / exact
-                // arms use, so the two can never disagree.
-                guard_sample_fixedpoint_range(
-                    sample,
-                    &host_der1(self.der_kernel, approx, target),
-                    self.n,
-                )?;
+                // arms use, so the two can never disagree. GDC-02: under non-uniform weights
+                // the score channel carries `w·der1·s`, so the guard folds the weight in too
+                // (the uniform path is byte-unchanged: `w == 1`).
+                let mut guard_der1 = host_der1(self.der_kernel, approx, target);
+                if !self.weights_uniform {
+                    for (d, w) in guard_der1.iter_mut().zip(self.weight_host.iter()) {
+                        *d *= w;
+                    }
+                }
+                guard_sample_fixedpoint_range(sample, &guard_der1, self.n)?;
                 Some(upload_channel_floats(&self.client, sample))
             }
             None => None,
@@ -1930,12 +1949,24 @@ impl GpuTrainSession {
         // NOTE this also corrects the device-RESIDENT sampler arm, which previously folded the
         // sample into the single `weight_ref` handed to BOTH the histogram and the leaf reduce
         // while leaving `der1` unsampled — wrong on both channels under any sampling.
+        // GDC-02: the WEIGHTED-der channel `w·der1` — upstream's `SumWeightedDelta`
+        // numerator — feeds BOTH the split histogram (via `score_der1_h` below) and
+        // the leaf-stat reduce (`leaf_der1_h`). On a uniform fit it IS `der1_h`
+        // (same handle, zero extra launches, byte-unchanged D-04). The raw `der1_h`
+        // is never mutated: the next tree's residual recompute reads the resident
+        // approx, and the routing split keeps the raw handle (mirrors the CPU
+        // `ders.der1` vs `weighted_der1` split).
+        let weighted_der1_h = if self.weights_uniform {
+            der1_h.clone()
+        } else {
+            fold_weights_resident(&self.client, &der1_h, &self.weight_h, self.n)?
+        };
         let (score_der1_h, score_weight_h) = match effective_sample_h.as_ref() {
             Some(s) => (
-                fold_weights_resident(&self.client, &der1_h, s, self.n)?,
+                fold_weights_resident(&self.client, &weighted_der1_h, s, self.n)?,
                 fold_weights_resident(&self.client, &self.weight_h, s, self.n)?,
             ),
-            None => (der1_h.clone(), self.weight_h.clone()),
+            None => (weighted_der1_h.clone(), self.weight_h.clone()),
         };
 
         // Grow one tree over the resident handles; take ownership of the resident approx
@@ -1945,6 +1976,7 @@ impl GpuTrainSession {
             &self.client,
             approx_h,
             &der1_h,
+            &weighted_der1_h,
             &self.weight_h,
             &score_der1_h,
             &score_weight_h,

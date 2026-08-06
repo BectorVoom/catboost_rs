@@ -129,7 +129,13 @@ fn session_depth_gt1_grows_and_matches_direct() {
             .expect("depth-6 grow_one must succeed on the clear-margin fixture");
 
         // Direct reference: `grow_oblivious_tree` over the SAME first-tree residual + Cosine.
-        let der1: Vec<f64> = (0..n).map(|i| cb_compute::rmse_der1(0.0, target[i])).collect();
+        // GDC-02: the session's histogram/leaf channels now consume the WEIGHTED der
+        // (`w·der1`, upstream's SumWeightedDelta), so the direct reference is fed the
+        // same weighted product — this fixture's `weight_mod5` is non-uniform, which
+        // is exactly what makes this a weighted-channel structure oracle.
+        let der1: Vec<f64> = (0..n)
+            .map(|i| cb_compute::rmse_der1(0.0, target[i]) * weight[i])
+            .collect();
         let indices: Vec<u32> = (0..n as u32).collect();
         let direct = grow_oblivious_tree(
             &der1, &weight, &cindex, &indices, n_bins, n_features, depth, scaled_l2, SCORE_FN_COSINE,
