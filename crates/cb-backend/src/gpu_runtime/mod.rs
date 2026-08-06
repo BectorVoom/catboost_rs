@@ -3982,6 +3982,13 @@ pub(crate) fn grow_oblivious_tree_resident(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx_h: Handle,
     der1_h: &Handle,
+    // GDC-02: the LEAF-VALUE der channel — `der1 ⊙ weight` when the fit carries
+    // non-uniform weights (upstream's `SumWeightedDelta` numerator), the SAME
+    // handle as `der1_h` on a uniform fit (byte-unchanged, D-04). Consumed ONLY
+    // by the final leaf-stat reduce; the routing split (`launch_partition_split
+    // _packed_into`) and the empty-carry short-circuit stay on the RAW `der1_h`
+    // (weighting applies to histogram/leaf CONTRIBUTION, never to the residual).
+    leaf_der1_h: &Handle,
     weight_h: &Handle,
     score_der1_h: &Handle,
     score_weight_h: &Handle,
@@ -4232,10 +4239,17 @@ pub(crate) fn grow_oblivious_tree_resident(
     //     const -1 (the Σ(der2·weight) channel is computed but the calc_average leaf reads
     //     channels 0/1; the Newton/Logloss leaf estimation is the dedicated
     //     `grow_oblivious_tree_newton_into` path, GPUT-07).
+    // GDC-02: the leaf reduce sums the WEIGHTED der (`Σ(w·der1)`, channel 0) while
+    // channel 1 stays the raw weight sum — `calc_average(Σ(w·der1), Σw, l2)`
+    // mirrors upstream's `SumWeightedDelta / (SumWeight + l2)`. On a uniform fit
+    // `leaf_der1_h` IS `der1_h` (same handle, zero extra launches). Fixed-point
+    // precondition: every summed channel must stay under |Σ| < 2^33 (`kernels.rs`
+    // encode contract) — the weighted fixtures are constructed under that bound by
+    // a documented margin; no runtime guard exists here (SPEC §9 residual).
     let der2_rmse_h = create_channel_const(client, -1.0, n);
     let part_stats_h = launch_partition_update_into(
         client,
-        der1_h.clone(),
+        leaf_der1_h.clone(),
         weight_h.clone(),
         der2_rmse_h,
         indices_h.clone(),
