@@ -77,7 +77,8 @@ pub use ranking_der::{
     Competitor as RankingCompetitor, GroupSpan,
 };
 pub use runtime::{
-    DeviceBootstrapType, DeviceCtrColumn, DeviceCtrConfig, DeviceGrowPolicy, DeviceGrownTree,
+    DeviceBootstrapType, DeviceCtrAveraging, DeviceCtrColumn, DeviceCtrConfig, DeviceGrowPolicy,
+    DeviceGrownTree,
     DeviceTrainConfig,
     Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime,
     StochasticRankMetric,
@@ -110,6 +111,8 @@ mod lda_linalg_test;
 mod leaf_test;
 #[cfg(test)]
 mod loss_test;
+#[cfg(test)]
+mod runtime_ctr_averaging_test;
 #[cfg(test)]
 mod runtime_test;
 #[cfg(test)]
