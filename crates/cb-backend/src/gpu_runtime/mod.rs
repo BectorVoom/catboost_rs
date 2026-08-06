@@ -3977,6 +3977,61 @@ pub(crate) fn launch_apply_leaf_delta_into(
 /// `der_kernel` selects the residual recompute (RMSE `target - approx` / Logloss `target -
 /// sigmoid(approx)`). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13). Threads
 /// ONE `&client`; never reads a 0-len handle.
+/// GDC-11 (T14): the per-fit CTR split-search coordination state for the resident
+/// oblivious grow. The CTR columns occupy the cindex TAIL
+/// `[n_features - n_ctr, n_features)`; they are scored per column as THRESHOLD
+/// candidates (never through the one-hot pass) with the CPU's `model_size_reg`
+/// cat-feature weight applied HOST-side to the O(1) per-column best that crosses
+/// back — `score · (1 + count/maxCount)^(-model_size_reg)` for an UNUSED
+/// `(ctr_type, projection)` group, `1.0` once used (model-lifetime `UsedCtrSplits`
+/// + the within-tree lift, `greedy_tensor_search.cpp:926-950`). `maxCount` combines
+/// the eligible-candidate max with the PHANTOM mixed float-partition projection
+/// (`CalcMaxFeatureValueCount`): once the tree has chosen ≥1 float split, the
+/// distinct `(float-partition-leaf, raw cat bucket)` pair count joins the max —
+/// replayed host-side from `float_bins` (the base float cindex columns).
+/// DEVICE SCOPE: simple (single-feature) projections only — the cb-train gate
+/// declines combination-CTR fits, so no combination-eligibility logic exists here.
+pub(crate) struct ResidentCtrSearch<'a> {
+    /// CTR tail width (columns `[n_features - n_ctr, n_features)`).
+    pub n_ctr: usize,
+    /// Per-column distinct-bucket count (the weight's `count` input).
+    pub bucket_counts: &'a [usize],
+    /// Per-column `(ctr_type, projection)` identity group (shared ⇒ shared lift).
+    pub weight_groups: &'a [u32],
+    /// Model-lifetime used flags per group — persisted across trees on the session,
+    /// updated the moment a level chooses a CTR split (upstream `ProcessCtrSplit`).
+    pub group_used: &'a mut Vec<bool>,
+    /// One raw per-object bucket column per CTR-eligible cat feature (the phantom
+    /// projection input); empty ⇒ no phantom contribution.
+    pub cat_eligible_buckets: &'a [Vec<u32>],
+    /// The `model_size_reg` coefficient (`0.0` disables the weight).
+    pub model_size_reg: f64,
+    /// The BASE (float) cindex columns, feature-major host copy, for the
+    /// float-partition replay the phantom count needs.
+    pub float_bins: &'a [u32],
+}
+
+/// `GetCatFeatureWeight`'s core: `(1 + count/maxCount)^(-model_size_reg)`
+/// (transcribed from `cb_train::tree::cat_feature_weight` — cb-backend cannot
+/// depend on cb-train, the T-10-04 landmine).
+fn resident_cat_feature_weight(count: usize, max_count: usize, model_size_reg: f64) -> f64 {
+    if model_size_reg == 0.0 || max_count == 0 {
+        return 1.0;
+    }
+    (1.0 + count as f64 / max_count as f64).powf(-model_size_reg)
+}
+
+/// The phantom mixed float-partition + cat-feature distinct-pair count
+/// (`phantom_mixed_bucket_count` transcription): distinct `(leaf, bucket)` pairs.
+fn resident_phantom_bucket_count(float_leaf_of: &[usize], cat_bucket: &[u32]) -> usize {
+    float_leaf_of
+        .iter()
+        .zip(cat_bucket.iter())
+        .map(|(&leaf, &bucket)| (leaf, bucket))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grow_oblivious_tree_resident(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
@@ -4017,6 +4072,11 @@ pub(crate) fn grow_oblivious_tree_resident(
     score_fn: u32,
     learning_rate: f64,
     der_kernel: DerBinaryKernel,
+    // GDC-11: `Some` iff this is a covered CTR fit — the cindex tail then holds
+    // the structure CTR columns, scored per column with the host-side cat-feature
+    // weight (see [`ResidentCtrSearch`]). `None` keeps every existing fit
+    // byte-unchanged (the tail windows collapse to today's arithmetic).
+    mut ctr_search: Option<&mut ResidentCtrSearch<'_>>,
 ) -> CbResult<(GrownTree, Handle, Handle)> {
     // Empty short-circuit (Pitfall 3/5): no objects / no candidates -> an empty tree, approx
     // unchanged, der1 carried forward.
@@ -4054,6 +4114,21 @@ pub(crate) fn grow_oblivious_tree_resident(
     let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(depth);
     // The previous level's (copy-folded, complete) histogram — the subtraction parent.
     let mut prev_bin_sums: Option<Handle> = None;
+
+    // GDC-11: the CTR coordination state for this tree. `base` is the first CTR
+    // column index; the float/one-hot passes stop there. `float_leaf_of` is the
+    // HOST replay of the partition over the chosen FLOAT splits only (the phantom
+    // projection's partition input — a CTR split never contributes a bit to it,
+    // `binAndOneHotFeaturesTree`); `float_split_count` is its next bit index.
+    let ctr_base = match ctr_search.as_ref() {
+        Some(cs) => n_features.saturating_sub(cs.n_ctr),
+        None => n_features,
+    };
+    let mut float_leaf_of: Vec<usize> = match ctr_search.as_ref() {
+        Some(_) => vec![0usize; n],
+        None => Vec::new(),
+    };
+    let mut float_split_count = 0usize;
 
     // CB_GPU_PROF stage attribution (cold unless the env var is set): each lap fences the
     // queue so the elapsed wall time is the STAGE's device time, not launch-enqueue time.
@@ -4131,6 +4206,12 @@ pub(crate) fn grow_oblivious_tree_resident(
         //
         // With no one-hot columns pass B's window is empty (`n_float == n_features`), so
         // this is ONE launch with today's arguments exactly.
+        // GDC-11: both windows stop at the CTR tail (`ctr_base == n_features` on
+        // every non-CTR fit — byte-unchanged). On a CTR fit `n_float == n_features`
+        // (one-hot × CTR is excluded), so pass A clamps to `[0, ctr_base)` and
+        // pass B is empty; the tail is scored per column in pass C below with the
+        // cat-feature weight applied host-side.
+        let pass_a_hi = n_float.min(ctr_base);
         let pass_a = score_partition_over_binsums(
             client,
             bin_sums.clone(),
@@ -4143,7 +4224,7 @@ pub(crate) fn grow_oblivious_tree_resident(
             real_folds,
             /* one_hot = */ false,
             /* feature_lo = */ 0,
-            /* feature_hi = */ n_float,
+            /* feature_hi = */ pass_a_hi,
         )?;
         let pass_b = score_partition_over_binsums(
             client,
@@ -4156,10 +4237,10 @@ pub(crate) fn grow_oblivious_tree_resident(
             score_fn,
             real_folds,
             /* one_hot = */ true,
-            /* feature_lo = */ n_float,
-            /* feature_hi = */ n_features,
+            /* feature_lo = */ pass_a_hi,
+            /* feature_hi = */ ctr_base,
         )?;
-        let best = match (pass_a, pass_b) {
+        let mut best = match (pass_a, pass_b) {
             (Some(a), Some(b)) => {
                 // STRICT `>`: pass B must beat pass A outright to win.
                 if b.gain > a.gain {
@@ -4171,6 +4252,70 @@ pub(crate) fn grow_oblivious_tree_resident(
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
+        // GDC-11 pass C: the CTR candidates, one scorer window per column so the
+        // cat-feature weight can be applied to the O(1) per-column best HOST-side
+        // (the weight differs per column, so a single tail-wide argmax would pick
+        // the wrong weighted winner). Enumeration order mirrors the CPU: floats
+        // first, then CTR columns ascending, all under strict `>` (a CTR tie never
+        // displaces a float winner, and an earlier column never loses a tie to a
+        // later one).
+        if let Some(cs) = ctr_search.as_deref_mut() {
+            // `maxCount`: the eligible-candidate max (simple columns are always
+            // eligible — the device gate admits only simple projections), combined
+            // with the phantom mixed-projection count once ≥1 float split is chosen.
+            let eligible_max = cs.bucket_counts.iter().copied().max().unwrap_or(1).max(1);
+            let phantom_max = if float_split_count > 0 {
+                cs.cat_eligible_buckets
+                    .iter()
+                    .map(|buckets| resident_phantom_bucket_count(&float_leaf_of, buckets))
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let max_bucket_count = eligible_max.max(phantom_max).max(1);
+            let mut best_weighted: Option<(BestSplit, f64)> = None;
+            for c in 0..cs.n_ctr {
+                let col_feature = ctr_base + c;
+                let pass = score_partition_over_binsums(
+                    client,
+                    bin_sums.clone(),
+                    n_parts,
+                    n_bins,
+                    n_bins_used,
+                    n_features,
+                    scaled_l2,
+                    score_fn,
+                    real_folds,
+                    /* one_hot = */ false,
+                    /* feature_lo = */ col_feature,
+                    /* feature_hi = */ col_feature + 1,
+                )?;
+                let Some(p) = pass else { continue };
+                let group = cs.weight_groups.get(c).copied().unwrap_or(0) as usize;
+                let used = cs.group_used.get(group).copied().unwrap_or(false);
+                let weight = if used {
+                    1.0
+                } else {
+                    let count = cs.bucket_counts.get(c).copied().unwrap_or(1);
+                    resident_cat_feature_weight(count, max_bucket_count, cs.model_size_reg)
+                };
+                let weighted = f64::from(p.gain) * weight;
+                let beats = best_weighted
+                    .as_ref()
+                    .is_none_or(|(_, bw)| weighted > *bw);
+                if beats {
+                    best_weighted = Some((p, weighted));
+                }
+            }
+            if let Some((p, weighted)) = best_weighted {
+                let float_gain = best.as_ref().map_or(f64::NEG_INFINITY, |b| f64::from(b.gain));
+                // STRICT `>` — the float/one-hot winner keeps ties.
+                if weighted > float_gain {
+                    best = Some(p);
+                }
+            }
+        }
         prev_bin_sums = Some(bin_sums);
         if prof {
             // The scorer's own read-back already drained the queue — this lap is pure elapsed.
@@ -4189,8 +4334,45 @@ pub(crate) fn grow_oblivious_tree_resident(
         // (equality) split. It must travel WITH the split, both into the device routing
         // below and out through `GrownTree.splits`; a parallel `Vec<bool>` would let the
         // kind and the split drift apart.
-        let split_is_one_hot = (split.feature_id as usize) >= n_float;
+        // GDC-11: a CTR-tail winner (`feature_id >= ctr_base`, pass C) is a
+        // THRESHOLD split — routing it through the equality arm would corrupt the
+        // partition. `ctr_base == n_features` on every non-CTR fit, so this is
+        // byte-identical to the former `>= n_float` test there.
+        let split_is_one_hot = {
+            let f = split.feature_id as usize;
+            f >= n_float && f < ctr_base
+        };
         splits.push((split.feature_id, split.bin_id, split_is_one_hot));
+
+        // GDC-11 bookkeeping: a chosen CTR split lifts its `(ctr_type, projection)`
+        // group to weight 1.0 (within-tree AND model-lifetime — the state is the
+        // session's, persisted across trees); a chosen FLOAT split advances the
+        // host float-partition replay feeding the phantom `maxCount` at later
+        // levels. One-hot × CTR cannot co-occur (the gate), so the one-hot arm
+        // never reaches this block with `ctr_search` present.
+        if let Some(cs) = ctr_search.as_deref_mut() {
+            let f = split.feature_id as usize;
+            if f >= ctr_base {
+                let col = f - ctr_base;
+                let group = cs.weight_groups.get(col).copied().unwrap_or(0) as usize;
+                if let Some(slot) = cs.group_used.get_mut(group) {
+                    *slot = true;
+                }
+            } else {
+                let bit = float_split_count;
+                for (obj, slot) in float_leaf_of.iter_mut().enumerate() {
+                    let bin = cs
+                        .float_bins
+                        .get(f * n + obj)
+                        .copied()
+                        .unwrap_or(0);
+                    if bin > split.bin_id {
+                        *slot |= 1usize << bit;
+                    }
+                }
+                float_split_count += 1;
+            }
+        }
 
         // (4) Device partition-split (forward-bit doc-routing) over the resident PACKED
         //     cindex words — IN-PLACE on device, NO read-back (D-05). The split feature's

@@ -502,6 +502,7 @@ fn session_ctr_gate_covers_single_permutation() {
         member_bins: vec![cat.clone()],
         prior: 0.5,
         borders: borders.clone(),
+        ..DeviceCtrColumn::default()
     };
     // GDC-09: a covered CTR config now carries BOTH permutations — the averaging
     // half uses a DIFFERENT (reversed) object order so the two materializations
@@ -516,6 +517,7 @@ fn session_ctr_gate_covers_single_permutation() {
             target_class: target_class.clone(),
             columns: vec![ctr_column.clone()],
         }),
+        ..DeviceCtrConfig::default()
     };
 
     let open = |folds: usize, cfg: &DeviceTrainConfig| {
@@ -552,8 +554,10 @@ fn session_ctr_gate_covers_single_permutation() {
                 member_bins: vec![cat.clone()],
                 prior: 0.5,
                 borders: vec![0.5_f64], // 2 buckets != n_bins
+                ..DeviceCtrColumn::default()
             }],
             averaging: None,
+            ..DeviceCtrConfig::default()
         }),
         ..DeviceTrainConfig::default()
     };
@@ -571,6 +575,7 @@ fn session_ctr_gate_covers_single_permutation() {
             target_class: target_class.clone(),
             columns: vec![ctr_column.clone()],
             averaging: None,
+            ..DeviceCtrConfig::default()
         }),
         ..DeviceTrainConfig::default()
     };
@@ -621,11 +626,12 @@ fn session_ctr_augments_resident_cindex() {
 
     // TWO CTR columns: one plain single-feature, one tensor/feature-combination (2 members, A5).
     let columns = vec![
-        DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone() },
+        DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone(), ..DeviceCtrColumn::default() },
         DeviceCtrColumn {
             member_bins: vec![cat0.clone(), cat1.clone()],
             prior: 1.0,
             borders: borders.clone(),
+            ..DeviceCtrColumn::default()
         },
     ];
     let averaging_permutation: Vec<u32> = (0..n as u32).rev().collect();
@@ -638,6 +644,7 @@ fn session_ctr_augments_resident_cindex() {
             columns: columns.clone(),
         }),
         columns,
+        ..DeviceCtrConfig::default()
     };
     let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
 
@@ -688,7 +695,7 @@ fn session_ctr_materializes_averaging_columns_separately() {
     let identity: Vec<u32> = (0..n as u32).collect();
     let reversed: Vec<u32> = (0..n as u32).rev().collect();
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
-    let column = DeviceCtrColumn { member_bins: vec![cat0], prior: 0.5, borders };
+    let column = DeviceCtrColumn { member_bins: vec![cat0], prior: 0.5, borders, ..DeviceCtrColumn::default() };
 
     let open = |avg_perm: &[u32]| {
         let ctr = DeviceCtrConfig {
@@ -700,6 +707,7 @@ fn session_ctr_materializes_averaging_columns_separately() {
                 target_class: target_class.clone(),
                 columns: vec![column.clone()],
             }),
+            ..DeviceCtrConfig::default()
         };
         let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
         GpuTrainSession::begin(
@@ -768,7 +776,7 @@ fn ctr_leaf_values_use_averaging_permutation_bins() {
     let identity: Vec<u32> = (0..n as u32).collect();
     let reversed: Vec<u32> = (0..n as u32).rev().collect();
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
-    let column = DeviceCtrColumn { member_bins: vec![cat], prior: 0.5, borders };
+    let column = DeviceCtrColumn { member_bins: vec![cat], prior: 0.5, borders, ..DeviceCtrColumn::default() };
 
     let ctr = DeviceCtrConfig {
         permutation: identity,
@@ -779,6 +787,7 @@ fn ctr_leaf_values_use_averaging_permutation_bins() {
             target_class,
             columns: vec![column],
         }),
+        ..DeviceCtrConfig::default()
     };
     let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
     let mut session = GpuTrainSession::begin(

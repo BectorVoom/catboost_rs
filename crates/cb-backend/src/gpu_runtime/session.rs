@@ -49,7 +49,7 @@ use rayon::prelude::*;
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
     grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
-    DerBinaryKernel, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
+    DerBinaryKernel, ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
     create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
@@ -169,6 +169,27 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
 /// # Errors
 /// [`CbError`] propagated from the device CTR launch / read-back; the caller only invokes this once
 /// [`ctr_covered`] has confirmed the shape invariants, so the length guards here are defensive.
+/// GDC-11 (T14): the owned session-side CTR split-search coordination state — see
+/// [`ResidentCtrSearch`] for the per-tree borrowed view and the semantics.
+struct CtrSearchState {
+    /// CTR tail width (== the number of structure CTR columns).
+    n_ctr: usize,
+    /// Per-column distinct-bucket count (the cat-feature weight's `count`).
+    bucket_counts: Vec<usize>,
+    /// Per-column `(ctr_type, projection)` identity group id.
+    weight_groups: Vec<u32>,
+    /// Per-group model-lifetime used flags (all `false` at fit start; a tree
+    /// choosing a CTR split lifts its group for every LATER level and tree).
+    group_used: Vec<bool>,
+    /// One raw per-object bucket column per CTR-eligible cat feature (phantom).
+    cat_eligible_buckets: Vec<Vec<u32>>,
+    /// The `model_size_reg` coefficient.
+    model_size_reg: f64,
+    /// The BASE float cindex columns (feature-major host copy) for the phantom's
+    /// float-partition replay.
+    float_bins: Vec<u32>,
+}
+
 /// GDC-09: parameterized over `(permutation, target_class, columns)` so `begin`
 /// can call it TWICE — once with the STRUCTURE permutation (split-search cindex)
 /// and once with the AVERAGING permutation (leaf-value gather bins) — reusing the
@@ -826,6 +847,12 @@ pub struct GpuTrainSession {
     /// (default) regime reaches here, so no field is consumed yet.
     #[allow(dead_code)]
     config: DeviceTrainConfig,
+    /// GDC-11 (T14): the CTR split-search coordination state — per-column bucket
+    /// counts / weight groups, the model-lifetime `group_used` flags (updated as
+    /// trees choose CTR splits), the phantom-projection inputs, and the host copy
+    /// of the BASE float cindex for the float-partition replay. `Some` iff this is
+    /// a covered CTR fit.
+    ctr_search: Option<CtrSearchState>,
     /// GDC-09 (T11): the AVERAGING-permutation binarized CTR bin columns (one
     /// `Vec<u32>` per CTR column, object order, bins in `0..n_bins`), read back
     /// once at `begin`. `Some` iff the fit committed to a covered two-permutation
@@ -1411,6 +1438,7 @@ impl GpuTrainSession {
         // (`ctr_averaging_bins`) so the split scorer structurally cannot read them —
         // they exist only for the leaf-value gather (GDC-10).
         let mut ctr_averaging_bins: Option<Vec<Vec<u32>>> = None;
+        let mut ctr_search: Option<CtrSearchState> = None;
         let (eff_bins, eff_n_features): (std::borrow::Cow<'_, [u32]>, usize) = if ctr_is_covered {
             if let Some(ctr) = config.ctr.as_ref() {
                 let ctr_columns = build_ctr_cindex_columns(
@@ -1429,6 +1457,38 @@ impl GpuTrainSession {
                         n,
                     )?);
                 }
+                // GDC-11: the split-search coordination state. `bucket_count == 0`
+                // falls back to the column's own observed distinct-bucket count
+                // (single-member columns; the gate admits only simple projections).
+                let bucket_counts: Vec<usize> = ctr
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        if col.bucket_count > 0 {
+                            col.bucket_count
+                        } else {
+                            col.member_bins
+                                .first()
+                                .map(|b| {
+                                    b.iter().collect::<std::collections::BTreeSet<_>>().len()
+                                })
+                                .unwrap_or(1)
+                                .max(1)
+                        }
+                    })
+                    .collect();
+                let weight_groups: Vec<u32> =
+                    ctr.columns.iter().map(|col| col.weight_group).collect();
+                let n_groups = weight_groups.iter().copied().max().map_or(0, |m| m as usize + 1);
+                ctr_search = Some(CtrSearchState {
+                    n_ctr: ctr_columns.len(),
+                    bucket_counts,
+                    weight_groups,
+                    group_used: vec![false; n_groups],
+                    cat_eligible_buckets: ctr.cat_eligible_buckets.clone(),
+                    model_size_reg: ctr.model_size_reg,
+                    float_bins: bins_feature_major.to_vec(),
+                });
                 let mut augmented = bins_feature_major.to_vec();
                 for col in &ctr_columns {
                     augmented.extend_from_slice(col);
@@ -1620,6 +1680,7 @@ impl GpuTrainSession {
             learning_rate,
             der_kernel,
             config: config.clone(),
+            ctr_search,
             ctr_averaging_bins,
             nonsym,
             exact_leaf,
@@ -2069,6 +2130,17 @@ impl GpuTrainSession {
 
         // Grow one tree over the resident handles; take ownership of the resident approx
         // (updated in place on device) and swap it back afterwards.
+        // GDC-11: the per-tree borrowed view of the session's CTR search state
+        // (`None` on every non-CTR fit — byte-unchanged).
+        let mut ctr_search_view = self.ctr_search.as_mut().map(|st| ResidentCtrSearch {
+            n_ctr: st.n_ctr,
+            bucket_counts: &st.bucket_counts,
+            weight_groups: &st.weight_groups,
+            group_used: &mut st.group_used,
+            cat_eligible_buckets: &st.cat_eligible_buckets,
+            model_size_reg: st.model_size_reg,
+            float_bins: &st.float_bins,
+        });
         let approx_h = self.approx_h.clone();
         let (tree, approx_next, der1_next) = grow_oblivious_tree_resident(
             &self.client,
@@ -2103,6 +2175,7 @@ impl GpuTrainSession {
             self.score_fn,
             self.learning_rate,
             self.der_kernel,
+            ctr_search_view.as_mut(),
         )?;
 
         // Advance the resident state for the next tree.
