@@ -639,6 +639,25 @@ fn host_der1(der_kernel: DerBinaryKernel, approx: &[f64], target: &[f64]) -> Vec
         .collect()
 }
 
+/// GDC-03/GDC-04: fold the per-object weight into the host der (`w·der1` — the CPU
+/// `weighted_der1`, upstream's `SumWeightedDelta` numerator) for the host-driven
+/// nonsym / Region growers, whose every internal `der1` use is a contribution sum.
+/// The uniform-weight path returns the raw der unchanged (no copy, D-04). This is a
+/// TRANSFORM, not a reduction, so `cb_core::sum_f64` does not apply — every
+/// downstream reduction inside the growers already routes through `sum_f64`.
+/// Fixed-point note: the growers gather host-side (no `2^33` encode on this path),
+/// but the weighted product still feeds the same `calc_average` contract as the
+/// resident arm (see `grow_oblivious_tree_resident`'s bound comment).
+fn host_weighted_der1(der1: Vec<f64>, weights_uniform: bool, weight: &[f64]) -> Vec<f64> {
+    if weights_uniform {
+        return der1;
+    }
+    der1.iter()
+        .zip(weight.iter())
+        .map(|(&d, &w)| d * w)
+        .collect()
+}
+
 /// The fixed-point histogram's accumulated-magnitude ceiling, `2^33` (WR-01 `WR01-S10`,
 /// finding F-D). The split histogram stores `round(Σ · 2^30)` as `i64` bits inside an
 /// `Atomic<u64>`, so the integer sum is exact only while `|Σ| · 2^30 < 2^63`, i.e.
@@ -1694,7 +1713,17 @@ impl GpuTrainSession {
                     actual: approx.len(),
                 });
             }
-            let der1 = host_der1(rg.der_kernel, approx, target);
+            // GDC-04: the Region grower's split scores AND leaf values are all
+            // contribution sums over its first argument, so passing `w·der1`
+            // caller-side fixes every internal site at once (leaf =
+            // `calc_average(Σ(w·der1), Σw, l2)`, upstream's SumWeightedDelta);
+            // `weight` stays raw for the denominators. Uniform weights reuse the
+            // raw der (no copy, byte-unchanged D-04).
+            let der1 = host_weighted_der1(
+                host_der1(rg.der_kernel, approx, target),
+                self.weights_uniform,
+                &rg.weight,
+            );
             return grow_region_tree(
                 &der1,
                 &rg.weight,
@@ -1723,7 +1752,16 @@ impl GpuTrainSession {
                     actual: approx.len(),
                 });
             }
-            let der1 = host_der1(ns.der_kernel, approx, target);
+            // GDC-03: every internal `der1` use in `grow_nonsym_tree` is a
+            // contribution SUM (unsplit baseline, per-node split score, leaf
+            // value — never a residual carried forward), so the caller-side
+            // `w·der1` substitution fixes all three sites in one edit; `weight`
+            // stays raw. Uniform weights reuse the raw der (byte-unchanged D-04).
+            let der1 = host_weighted_der1(
+                host_der1(ns.der_kernel, approx, target),
+                self.weights_uniform,
+                &ns.weight,
+            );
             return grow_nonsym_tree(
                 ns.policy,
                 &der1,

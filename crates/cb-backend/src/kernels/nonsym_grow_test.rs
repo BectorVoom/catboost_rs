@@ -400,6 +400,132 @@ fn assert_matches(policy: NonsymPolicy, score_fn: u32, label: &str) {
     }
 }
 
+/// GDC-03 (T05): the SESSION-level weighted oracle. The weighted-der substitution
+/// lives in `GpuTrainSession::grow_one`'s nonsym arm (caller-side `w·der1`), so the
+/// discriminating test drives the SESSION (not `grow_nonsym_tree` directly, which is
+/// deliberately untouched) with a NON-uniform weight and compares against the CPU
+/// leaf-wise reference fed the SAME weighted der. Pre-fix the session passed the RAW
+/// der — structure and leaf values both diverge from this reference.
+fn assert_session_weighted_matches(policy: NonsymPolicy, score_fn: u32, label: &str) {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!("[{label}] SKIP: non-sym device grow needs a real GPU backend (rocm/cuda)");
+        return;
+    }
+    const EPS: f64 = 1e-4;
+    let n = 64usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let max_depth = 4usize;
+    let l2 = 3.0_f64;
+
+    let (der1, weight, cindex) = fixture(n, n_features, n_bins);
+    assert!(
+        weight.iter().any(|&w| (w - 1.0).abs() > 1e-12),
+        "the fixture weight must be non-uniform or this oracle is vacuous"
+    );
+    let scaled_l2 = scaled_l2_for(&weight, n, l2);
+
+    // Session der derivation: RMSE, approx == 0 ⇒ der1 = target, so the fixture's
+    // der ramp doubles as the target.
+    let target = der1.clone();
+    let escore = if score_fn == SCORE_FN_COSINE {
+        cb_compute::EScoreFunction::Cosine
+    } else {
+        cb_compute::EScoreFunction::L2
+    };
+    let (device_policy, max_leaves_cfg) = match policy {
+        NonsymPolicy::Depthwise => (cb_compute::DeviceGrowPolicy::Depthwise, None),
+        NonsymPolicy::Lossguide => (cb_compute::DeviceGrowPolicy::Lossguide, Some(8usize)),
+    };
+    let config = cb_compute::DeviceTrainConfig {
+        grow_policy: device_policy,
+        max_leaves: max_leaves_cfg,
+        ..cb_compute::DeviceTrainConfig::default()
+    };
+    let mut session = crate::gpu_runtime::GpuTrainSession::begin(
+        &cb_compute::Loss::Rmse,
+        max_depth,
+        true,
+        1,
+        escore,
+        &cindex,
+        &weight,
+        n,
+        n_features,
+        n_bins,
+        0.3,
+        scaled_l2,
+        &config,
+    )
+    .expect("begin must not error on a covered nonsym config")
+    .expect("a covered nonsym config must open a session");
+    let dev = session
+        .grow_one(&vec![0.0_f64; n], &target, &[])
+        .expect("session nonsym grow must succeed");
+
+    // The CPU reference consumes the WEIGHTED der — exactly what the session arm
+    // now feeds `grow_nonsym_tree` (`host_weighted_der1`).
+    let weighted: Vec<f64> = der1.iter().zip(weight.iter()).map(|(&d, &w)| d * w).collect();
+    let cpu = cpu_leaf_wise(
+        policy,
+        &weighted,
+        &weight,
+        &cindex,
+        n,
+        n_bins,
+        n_features,
+        max_depth,
+        max_leaves_cfg.unwrap_or(usize::MAX),
+        1,
+        scaled_l2,
+        score_fn,
+    );
+
+    assert_eq!(
+        dev.splits, cpu.splits,
+        "[{label}] session weighted splits must match the weighted CPU reference"
+    );
+    assert_eq!(
+        dev.leaf_of, cpu.leaf_of,
+        "[{label}] session weighted leaf_of must match the weighted CPU reference"
+    );
+    let (abs, rel) = max_divergence(&dev.leaf_values, &cpu.leaf_values);
+    println!("[{label}] weighted session oracle: abs={abs:.3e} rel={rel:.3e} (bar={EPS:.0e})");
+    assert!(
+        abs <= EPS || rel <= EPS,
+        "[{label}] session weighted leaf values exceeded ε=1e-4: abs={abs:.3e} rel={rel:.3e}"
+    );
+    drop(session);
+}
+
+#[test]
+fn depthwise_weighted_matches_cpu_leaf_wise_l2() {
+    assert_session_weighted_matches(NonsymPolicy::Depthwise, SCORE_FN_L2, "depthwise-weighted-l2");
+}
+
+#[test]
+fn depthwise_weighted_matches_cpu_leaf_wise_cosine() {
+    assert_session_weighted_matches(
+        NonsymPolicy::Depthwise,
+        SCORE_FN_COSINE,
+        "depthwise-weighted-cosine",
+    );
+}
+
+#[test]
+fn lossguide_weighted_matches_cpu_leaf_wise_l2() {
+    assert_session_weighted_matches(NonsymPolicy::Lossguide, SCORE_FN_L2, "lossguide-weighted-l2");
+}
+
+#[test]
+fn lossguide_weighted_matches_cpu_leaf_wise_cosine() {
+    assert_session_weighted_matches(
+        NonsymPolicy::Lossguide,
+        SCORE_FN_COSINE,
+        "lossguide-weighted-cosine",
+    );
+}
+
 #[test]
 fn depthwise_matches_cpu_leaf_wise_l2() {
     assert_matches(NonsymPolicy::Depthwise, SCORE_FN_L2, "depthwise-l2");
