@@ -15,6 +15,7 @@ fn device_ctr_config_carries_optional_averaging() {
         member_bins: vec![vec![0, 1, 2, 0]],
         prior: 0.5,
         borders: vec![0.25, 0.5, 0.75],
+        ..DeviceCtrColumn::default()
     };
     let config = DeviceCtrConfig {
         permutation: vec![3, 1, 0, 2],
@@ -25,6 +26,7 @@ fn device_ctr_config_carries_optional_averaging() {
             target_class: vec![0, 1, 1, 0],
             columns: vec![column],
         }),
+        ..DeviceCtrConfig::default()
     };
 
     // Plain-host round-trip: Clone + PartialEq hold, and the two permutations are

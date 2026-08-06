@@ -1055,6 +1055,19 @@ pub struct DeviceCtrColumn {
     /// The border table binarizing the accumulated CTR VALUE into cindex bins (the `> bin`
     /// threshold convention; uploaded once per fit — quantization stays the CPU ≤1e-5 reference).
     pub borders: Vec<f64>,
+    /// GDC-11: the projection's distinct-bucket count (`TOnlineCtrUniqValuesCounts::Count`),
+    /// the `count` input of the `model_size_reg` cat-feature weight
+    /// `(1 + count/maxCount)^(-model_size_reg)` the split search applies to an
+    /// UNUSED CTR candidate's score. `0` is treated as "unknown" and falls back to
+    /// the column's own observed distinct-bucket count device-side.
+    pub bucket_count: usize,
+    /// GDC-11: the `UsedCtrSplits` identity group — columns sharing one
+    /// `(ctr_type, projection)` pair (e.g. the multi-prior expansion) share one
+    /// group id. Once ANY level in ANY tree of this fit chooses a column of a
+    /// group, every column of that group scores at weight `1.0` from the next
+    /// candidate on (upstream's model-lifetime `ProcessCtrSplit` insert plus the
+    /// within-tree lift).
+    pub weight_group: u32,
 }
 
 /// The device CTR (categorical target statistics) config (Phase 12 Plan 08, GPUT-10). A PLAIN
@@ -1082,6 +1095,18 @@ pub struct DeviceCtrConfig {
     /// level, and a `Some(config)` with `averaging: None` is declined by the
     /// session's `ctr_covered` gate rather than silently gathered structure-only.
     pub averaging: Option<DeviceCtrAveraging>,
+    /// GDC-11: one raw per-object `perfect_hash_bins` bucket column per
+    /// CTR-ELIGIBLE categorical feature (the RAW categorical identity, NOT an
+    /// online-CTR value) — the `cat_eligible_buckets` input of the phantom
+    /// mixed float-partition projection (`CalcMaxFeatureValueCount`'s
+    /// `binAndOneHotFeaturesTree` contribution) that sizes `max_bucket_count`
+    /// once the tree has chosen ≥1 float split. Empty means "no phantom
+    /// contribution" (numerically a no-op).
+    pub cat_eligible_buckets: Vec<Vec<u32>>,
+    /// GDC-11: the `model_size_reg` coefficient of the cat-feature weight
+    /// (`GetCatFeatureWeight`; upstream default `0.5`). `0.0` disables the
+    /// penalty entirely (weight `1.0` for every candidate).
+    pub model_size_reg: f64,
 }
 
 /// The averaging-permutation half of the two-materialization CTR contract (GDC-09,
