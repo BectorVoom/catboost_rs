@@ -503,11 +503,19 @@ fn session_ctr_gate_covers_single_permutation() {
         prior: 0.5,
         borders: borders.clone(),
     };
+    // GDC-09: a covered CTR config now carries BOTH permutations — the averaging
+    // half uses a DIFFERENT (reversed) object order so the two materializations
+    // genuinely diverge.
+    let averaging_permutation: Vec<u32> = (0..n as u32).rev().collect();
     let covered_ctr = DeviceCtrConfig {
         permutation: permutation.clone(),
         target_class: target_class.clone(),
         columns: vec![ctr_column.clone()],
-        averaging: None,
+        averaging: Some(cb_compute::DeviceCtrAveraging {
+            permutation: averaging_permutation,
+            target_class: target_class.clone(),
+            columns: vec![ctr_column.clone()],
+        }),
     };
 
     let open = |folds: usize, cfg: &DeviceTrainConfig| {
@@ -554,6 +562,23 @@ fn session_ctr_gate_covers_single_permutation() {
         "a CTR column not binarized to n_bins buckets must decline (uniform-histogram invariant)"
     );
 
+    // NOT covered (GDC-09): a CTR config WITHOUT the averaging half must decline —
+    // a structure-only materialization would silently gather wrong leaf values
+    // (research pitfall #2), so the gate refuses it outright.
+    let missing_averaging = DeviceTrainConfig {
+        ctr: Some(DeviceCtrConfig {
+            permutation: permutation.clone(),
+            target_class: target_class.clone(),
+            columns: vec![ctr_column.clone()],
+            averaging: None,
+        }),
+        ..DeviceTrainConfig::default()
+    };
+    assert!(
+        !open(1, &missing_averaging),
+        "a CTR config without the averaging-permutation half must decline (GDC-09)"
+    );
+
     // NOT covered: CTR PLUS a second non-default family flag (exact leaf) → decline (all-or-nothing).
     let ctr_plus_exact = DeviceTrainConfig {
         ctr: Some(covered_ctr.clone()),
@@ -595,18 +620,24 @@ fn session_ctr_augments_resident_cindex() {
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
 
     // TWO CTR columns: one plain single-feature, one tensor/feature-combination (2 members, A5).
+    let columns = vec![
+        DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone() },
+        DeviceCtrColumn {
+            member_bins: vec![cat0.clone(), cat1.clone()],
+            prior: 1.0,
+            borders: borders.clone(),
+        },
+    ];
+    let averaging_permutation: Vec<u32> = (0..n as u32).rev().collect();
     let ctr = DeviceCtrConfig {
         permutation,
-        target_class,
-        averaging: None,
-        columns: vec![
-            DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone() },
-            DeviceCtrColumn {
-                member_bins: vec![cat0.clone(), cat1.clone()],
-                prior: 1.0,
-                borders: borders.clone(),
-            },
-        ],
+        target_class: target_class.clone(),
+        averaging: Some(cb_compute::DeviceCtrAveraging {
+            permutation: averaging_permutation,
+            target_class,
+            columns: columns.clone(),
+        }),
+        columns,
     };
     let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
 
@@ -617,15 +648,83 @@ fn session_ctr_augments_resident_cindex() {
     .expect("begin must not error building the CTR-augmented resident session")
     .expect("a covered 2-column CTR config must open a session (Plan 08)");
 
-    // The effective feature count grew by the two binarized CTR columns (they are now resident
-    // cindex features the histogram loop reads).
+    // The effective feature count grew by the two STRUCTURE CTR columns only (they are now
+    // resident cindex features the histogram loop reads). GDC-09 invariant (i): the
+    // AVERAGING columns do NOT widen the scorer's axis — they are held off-cindex.
     assert_eq!(
         session.n_features_effective(),
         n_features + 2,
-        "the resident cindex must gain one feature per binarized CTR column"
+        "the resident cindex must gain one feature per binarized STRUCTURE CTR column \
+         (and NONE for the averaging columns — they never join the scorer's cindex)"
     );
     assert_eq!(session.n(), n, "object count unchanged by the CTR augmentation");
+    // The averaging materialization exists, one column per structure column.
+    let avg = session.ctr_averaging_bins().expect("covered CTR fit must materialize averaging bins");
+    assert_eq!(avg.len(), 2, "one averaging bin column per CTR column");
+    assert!(avg.iter().all(|col| col.len() == n), "averaging bins are object-order length n");
     drop(session);
+}
+
+/// GDC-09 (T11): the averaging-permutation materialization is REAL — driven by its own
+/// permutation input, not a copy of the structure columns. Two sessions differing ONLY
+/// in the averaging permutation (identity vs reversed; the structure permutation is
+/// identity in both) must produce (a) identical scorer axes, and (b) averaging bins that
+/// AGREE for the identity case (== the structure materialization by construction) and
+/// DIFFER for the reversed case in at least one object — the divergence a degenerate
+/// fixture could not discriminate (research pitfall #2's precondition).
+#[test]
+fn session_ctr_materializes_averaging_columns_separately() {
+    use cb_compute::{DeviceCtrAveraging, DeviceCtrColumn, DeviceCtrConfig};
+
+    let n = 80usize;
+    let n_features = 2usize;
+    let n_bins = 16usize;
+    let weight = vec![1.0_f64; n];
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    let cat0: Vec<u32> = (0..n).map(|k| (k % 4) as u32).collect();
+    let target_class: Vec<u32> = (0..n).map(|k| ((k / 3) % 2) as u32).collect();
+    let identity: Vec<u32> = (0..n as u32).collect();
+    let reversed: Vec<u32> = (0..n as u32).rev().collect();
+    let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
+    let column = DeviceCtrColumn { member_bins: vec![cat0], prior: 0.5, borders };
+
+    let open = |avg_perm: &[u32]| {
+        let ctr = DeviceCtrConfig {
+            permutation: identity.clone(),
+            target_class: target_class.clone(),
+            columns: vec![column.clone()],
+            averaging: Some(DeviceCtrAveraging {
+                permutation: avg_perm.to_vec(),
+                target_class: target_class.clone(),
+                columns: vec![column.clone()],
+            }),
+        };
+        let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
+        GpuTrainSession::begin(
+            &Loss::Rmse, 3, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+            n_bins, 0.3, scaled_l2, &cfg,
+        )
+        .expect("begin must not error building the two-permutation CTR session")
+        .expect("a covered two-permutation CTR config must open a session")
+    };
+
+    let same = open(&identity);
+    let diff = open(&reversed);
+    assert_eq!(same.n_features_effective(), diff.n_features_effective());
+
+    let same_bins = same.ctr_averaging_bins().expect("averaging bins materialized")[0].clone();
+    let diff_bins = diff.ctr_averaging_bins().expect("averaging bins materialized")[0].clone();
+    assert_eq!(same_bins.len(), n);
+    assert_eq!(diff_bins.len(), n);
+    assert_ne!(
+        same_bins, diff_bins,
+        "a reversed averaging permutation must change the averaging CTR bins for at \
+         least one object — otherwise the two-permutation machinery is a copy, not a \
+         second materialization"
+    );
+    drop((same, diff));
 }
 
 /// (End-to-end wiring, Plan 06 GPUT-09) a Bernoulli-bootstrap session grows a real device tree:

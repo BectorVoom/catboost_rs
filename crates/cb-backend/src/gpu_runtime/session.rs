@@ -134,10 +134,25 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
     let Some(ctr) = config.ctr.as_ref() else {
         return false;
     };
+    // GDC-09: a covered CTR fit carries BOTH permutations — the structure columns
+    // for split search and the averaging columns for leaf-value gather (D2 full
+    // two-permutation parity). A config without the averaging half is DECLINED
+    // (never silently gathered structure-only, research pitfall #2); the averaging
+    // set mirrors every shape invariant of the structure set.
+    let Some(avg) = ctr.averaging.as_ref() else {
+        return false;
+    };
     ctr.permutation.len() == n
         && ctr.target_class.len() == n
         && !ctr.columns.is_empty()
         && ctr
+            .columns
+            .iter()
+            .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
+        && avg.permutation.len() == n
+        && avg.target_class.len() == n
+        && avg.columns.len() == ctr.columns.len()
+        && avg
             .columns
             .iter()
             .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
@@ -154,13 +169,19 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
 /// # Errors
 /// [`CbError`] propagated from the device CTR launch / read-back; the caller only invokes this once
 /// [`ctr_covered`] has confirmed the shape invariants, so the length guards here are defensive.
+/// GDC-09: parameterized over `(permutation, target_class, columns)` so `begin`
+/// can call it TWICE — once with the STRUCTURE permutation (split-search cindex)
+/// and once with the AVERAGING permutation (leaf-value gather bins) — reusing the
+/// SAME online-CTR + binarize kernels verbatim (Do Not Hand-Roll).
 fn build_ctr_cindex_columns(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
-    ctr: &DeviceCtrConfig,
+    permutation: &[u32],
+    target_class: &[u32],
+    ctr_columns: &[cb_compute::DeviceCtrColumn],
     n: usize,
 ) -> CbResult<Vec<Vec<u32>>> {
-    let mut columns = Vec::with_capacity(ctr.columns.len());
-    for col in &ctr.columns {
+    let mut columns = Vec::with_capacity(ctr_columns.len());
+    for col in ctr_columns {
         // Fold the member categories into one (combined) bin column + its distinct-bucket count.
         let (bins, buckets) = if col.member_bins.len() == 1 {
             let single = col.member_bins.first().cloned().unwrap_or_default();
@@ -171,9 +192,9 @@ fn build_ctr_cindex_columns(
         };
         let res = launch_ordered_ctr_resident(
             client,
-            &ctr.permutation,
+            permutation,
             &bins,
-            &ctr.target_class,
+            target_class,
             col.prior,
             buckets,
             n,
@@ -805,6 +826,15 @@ pub struct GpuTrainSession {
     /// (default) regime reaches here, so no field is consumed yet.
     #[allow(dead_code)]
     config: DeviceTrainConfig,
+    /// GDC-09 (T11): the AVERAGING-permutation binarized CTR bin columns (one
+    /// `Vec<u32>` per CTR column, object order, bins in `0..n_bins`), read back
+    /// once at `begin`. `Some` iff the fit committed to a covered two-permutation
+    /// CTR regime. Held OFF the resident cindex deliberately: the split scorer
+    /// only sees the packed cindex, so these columns are structurally unreadable
+    /// by split search — they feed ONLY the leaf-value gather (GDC-10). The
+    /// index-aligned STRUCTURE columns occupy the cindex tail
+    /// (`n_features - ctr_averaging_bins.len() ..`).
+    ctr_averaging_bins: Option<Vec<Vec<u32>>>,
     /// The per-fit non-symmetric grow state (Phase 12 Plan 03). `Some` iff the fit committed
     /// to a Depthwise / Lossguide device grow — [`Self::grow_one`] then dispatches to the
     /// host-driven [`grow_nonsym_tree`] instead of the resident oblivious loop. `None` for the
@@ -1375,9 +1405,30 @@ impl GpuTrainSession {
         // Round-3 perf: the non-CTR path BORROWS the caller's bins (no n*n_features-cell
         // copy on the hot begin path); only the CTR arm materializes an augmented owned
         // buffer. `Cow` keeps both arms feeding the SAME pack below.
+        // GDC-09: the covered CTR fit materializes BOTH permutations. The STRUCTURE
+        // columns join the resident cindex (split search reads them like any plain
+        // feature); the AVERAGING columns are held SEPARATELY host-side
+        // (`ctr_averaging_bins`) so the split scorer structurally cannot read them —
+        // they exist only for the leaf-value gather (GDC-10).
+        let mut ctr_averaging_bins: Option<Vec<Vec<u32>>> = None;
         let (eff_bins, eff_n_features): (std::borrow::Cow<'_, [u32]>, usize) = if ctr_is_covered {
             if let Some(ctr) = config.ctr.as_ref() {
-                let ctr_columns = build_ctr_cindex_columns(&client, ctr, n)?;
+                let ctr_columns = build_ctr_cindex_columns(
+                    &client,
+                    &ctr.permutation,
+                    &ctr.target_class,
+                    &ctr.columns,
+                    n,
+                )?;
+                if let Some(avg) = ctr.averaging.as_ref() {
+                    ctr_averaging_bins = Some(build_ctr_cindex_columns(
+                        &client,
+                        &avg.permutation,
+                        &avg.target_class,
+                        &avg.columns,
+                        n,
+                    )?);
+                }
                 let mut augmented = bins_feature_major.to_vec();
                 for col in &ctr_columns {
                     augmented.extend_from_slice(col);
@@ -1569,6 +1620,7 @@ impl GpuTrainSession {
             learning_rate,
             der_kernel,
             config: config.clone(),
+            ctr_averaging_bins,
             nonsym,
             exact_leaf,
             bootstrap,
@@ -1614,6 +1666,14 @@ impl GpuTrainSession {
     #[must_use]
     pub fn n_features_effective(&self) -> usize {
         self.n_features
+    }
+
+    /// GDC-09 observation point: the AVERAGING-permutation binarized CTR bin
+    /// columns (`Some` iff a covered two-permutation CTR fit opened this session).
+    /// Held OFF the resident cindex — see the field doc.
+    #[must_use]
+    pub fn ctr_averaging_bins(&self) -> Option<&[Vec<u32>]> {
+        self.ctr_averaging_bins.as_deref()
     }
 
     /// SPEC-OH-22/24 observation point: the frozen one-hot channel as the resident scorer
