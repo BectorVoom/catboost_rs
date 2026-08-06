@@ -4294,7 +4294,12 @@ fn train_inner<R: Runtime>(
             &params.loss,
             params.depth,
             matches!(params.boosting_type, EBoostingType::Plain),
-            /* fold_count = */ 1,
+            // GDC-01: the REAL learning-fold count, not a literal 1. For every
+            // non-CTR fit `learning_fold_count(pc, false) == 1` (byte-unchanged,
+            // D-04); once the CTR clause admits fits, `ctr_covered`'s
+            // `fold_count != 1` decline (session.rs) becomes load-bearing and a
+            // multi-permutation CTR fit can never silently ride fold-0 columns.
+            learning_folds_for_cycle,
             params.score_function,
             &device_bins,
             &weights,
