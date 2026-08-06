@@ -727,6 +727,123 @@ fn session_ctr_materializes_averaging_columns_separately() {
     drop((same, diff));
 }
 
+/// GDC-10 (T12): the DISCRIMINATING leaf-value gather oracle. A tree whose split is a
+/// CTR column must compute its RETURNED leaf values over the AVERAGING-permutation
+/// bins (the CPU `assign_leaf_over_ctr_columns` semantics) — asserted BOTH ways:
+/// the device values match the averaging-bin `calc_average` reference at ε=1e-4 AND
+/// differ from the structure-only computation by more than 1e-4 (the assertion a
+/// naive structure-only implementation passes trivially — research pitfall #2 — so
+/// its failure direction is what makes this test real). Needs `Atomic<u64>` (the
+/// resident grow) → SKIPS on cpu/wgpu.
+#[test]
+fn ctr_leaf_values_use_averaging_permutation_bins() {
+    use cb_compute::{DeviceCtrAveraging, DeviceCtrColumn, DeviceCtrConfig};
+
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[GDC-10] SKIP ctr_leaf_values_use_averaging_permutation_bins: needs rocm/cuda"
+        );
+        return;
+    }
+
+    let n = 64usize;
+    let n_features = 1usize; // ONE constant float column: all split gain lives in the CTR column
+    let n_bins = 16usize;
+    let weight = vec![1.0_f64; n];
+    let cindex = vec![0u32; n]; // feature-major, single all-zero column
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    // Cat-driven target: categories {0,1} → +1, {2,3} → -1, PLUS a small per-object
+    // ramp (0.01·k) so objects that swap leaves between the structure and averaging
+    // assignments carry DISTINCT der values — a purely categorical ±1 target makes
+    // the swaps value-symmetric (same der, same weight) and the two references
+    // coincide numerically even though the partitions differ.
+    let cat: Vec<u32> = (0..n).map(|k| (k % 4) as u32).collect();
+    let target: Vec<f64> = cat
+        .iter()
+        .enumerate()
+        .map(|(k, &c)| if c < 2 { 1.0 } else { -1.0 } + 0.01 * k as f64)
+        .collect();
+    let target_class: Vec<u32> = cat.iter().map(|&c| u32::from(c < 2)).collect();
+    let identity: Vec<u32> = (0..n as u32).collect();
+    let reversed: Vec<u32> = (0..n as u32).rev().collect();
+    let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
+    let column = DeviceCtrColumn { member_bins: vec![cat], prior: 0.5, borders };
+
+    let ctr = DeviceCtrConfig {
+        permutation: identity,
+        target_class: target_class.clone(),
+        columns: vec![column.clone()],
+        averaging: Some(DeviceCtrAveraging {
+            permutation: reversed,
+            target_class,
+            columns: vec![column],
+        }),
+    };
+    let cfg = DeviceTrainConfig { ctr: Some(ctr), ..DeviceTrainConfig::default() };
+    let mut session = GpuTrainSession::begin(
+        &Loss::Rmse, 1, true, 1, EScoreFunction::Cosine, &cindex, &weight, n, n_features,
+        n_bins, 0.3, scaled_l2, &cfg,
+    )
+    .expect("begin must not error on the covered CTR fixture")
+    .expect("the covered two-permutation CTR config must open a session");
+
+    let avg_bins = session.ctr_averaging_bins().expect("averaging bins materialized")[0].clone();
+    // Tree 0 from the zero approx (der1 == target on RMSE).
+    let tree = session
+        .grow_one(&vec![0.0_f64; n], &target, &[])
+        .expect("CTR-split grow must succeed");
+
+    // The chosen split must BE the CTR column (device feature index 1 == the cindex
+    // tail), or the fixture failed to make the CTR signal dominant.
+    assert_eq!(tree.splits.len(), 1, "depth-1 stump");
+    let (feat, bin, _oh) = tree.splits[0];
+    assert_eq!(feat as usize, n_features, "the stump must split on the CTR column");
+
+    // References: calc_average over the AVERAGING assignment vs the STRUCTURE one.
+    let leaf_ref = |assignment: &dyn Fn(usize) -> usize| -> Vec<f64> {
+        let mut segs: Vec<Vec<f64>> = vec![Vec::new(); 2];
+        let mut wsegs: Vec<Vec<f64>> = vec![Vec::new(); 2];
+        for obj in 0..n {
+            let leaf = assignment(obj);
+            segs[leaf].push(target[obj]);
+            wsegs[leaf].push(1.0);
+        }
+        (0..2)
+            .map(|l| cb_compute::calc_average(sum_f64(&segs[l]), sum_f64(&wsegs[l]), scaled_l2))
+            .collect()
+    };
+    let averaging_ref = leaf_ref(&|obj| usize::from(avg_bins[obj] > bin));
+    let structure_ref = leaf_ref(&|obj| tree.leaf_of[obj] as usize);
+
+    let max_dev_vs_avg = tree
+        .leaf_values
+        .iter()
+        .zip(averaging_ref.iter())
+        .map(|(&d, &r)| (d - r).abs())
+        .fold(0.0_f64, f64::max);
+    let max_dev_vs_structure = tree
+        .leaf_values
+        .iter()
+        .zip(structure_ref.iter())
+        .map(|(&d, &r)| (d - r).abs())
+        .fold(0.0_f64, f64::max);
+    println!(
+        "[GDC-10] dev-vs-averaging |Δ|={max_dev_vs_avg:.3e}, dev-vs-structure |Δ|={max_dev_vs_structure:.3e}"
+    );
+    assert!(
+        max_dev_vs_avg <= 1e-4,
+        "device CTR leaf values must be gathered over the AVERAGING bins \
+         (|Δ|={max_dev_vs_avg:.3e} > 1e-4)"
+    );
+    assert!(
+        max_dev_vs_structure > 1e-4,
+        "the structure-only and averaging leaf values coincide on this fixture \
+         (|Δ|={max_dev_vs_structure:.3e}) — it cannot discriminate pitfall #2"
+    );
+    drop(session);
+}
+
 /// (End-to-end wiring, Plan 06 GPUT-09) a Bernoulli-bootstrap session grows a real device tree:
 /// `grow_one` draws the device-resident keep-mask, folds it into the resident weight, and grows a
 /// finite tree. Proves the begin→grow_one bootstrap wiring runs on device; the DRAW numerics are

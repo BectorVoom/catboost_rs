@@ -2128,6 +2128,86 @@ impl GpuTrainSession {
             None => tree.leaf_values,
         };
 
+        // GDC-10 (T12): the CTR two-permutation leaf-value gather. On a covered CTR
+        // fit whose tree chose ≥1 CTR-column split, the RETURNED leaf values are
+        // recomputed over the AVERAGING-permutation assignment (the CPU
+        // `assign_leaf_over_ctr_columns` semantics), from the MAIN-trajectory der —
+        // the caller's host `approx`, which cb-train advances over the averaging
+        // partition, exactly like the CPU main-approx update. The RESIDENT approx /
+        // der1 deliberately keep the STRUCTURE-partition update above: that
+        // trajectory IS the CPU learning-fold-0 approx (`UpdateLearningFold` with
+        // `fold_leaf_of = grown.leaf_of`), which drives the next tree's split
+        // SEARCH. Two trajectories by construction, matching the CPU CTR path.
+        //
+        // The averaging assignment re-derives ONLY the CTR-level bits: bit `l` of
+        // the structure `leaf_of` is reused verbatim for float levels (the two
+        // assignments agree there), and replaced by `avg_bin > bin_id` for a
+        // CTR-column level. CTR columns occupy the cindex tail
+        // `[n_features - n_ctr, n_features)`. Exact-leaf × CTR cannot co-occur
+        // (the gate declines the combination), so this and the override above are
+        // mutually exclusive.
+        let leaf_values = match self.ctr_averaging_bins.as_ref() {
+            Some(avg_bins) if !avg_bins.is_empty() => {
+                let n_ctr = avg_bins.len();
+                let base = self.n_features.saturating_sub(n_ctr);
+                let has_ctr_split =
+                    tree.splits.iter().any(|&(f, _, _)| (f as usize) >= base);
+                if has_ctr_split {
+                    if approx.len() != self.n {
+                        return Err(CbError::LengthMismatch {
+                            column: "approx (CTR leaf gather needs the caller's main approx)"
+                                .to_owned(),
+                            expected: self.n,
+                            actual: approx.len(),
+                        });
+                    }
+                    let der1 = host_der1(self.der_kernel, approx, target);
+                    let n_leaves = leaf_values.len();
+                    let mut der_segs: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+                    let mut w_segs: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+                    for obj in 0..self.n {
+                        let structure_leaf =
+                            tree.leaf_of.get(obj).copied().unwrap_or(0) as usize;
+                        let mut leaf = 0usize;
+                        for (l, &(f, b, _one_hot)) in tree.splits.iter().enumerate() {
+                            let fu = f as usize;
+                            let bit = if fu >= base {
+                                avg_bins
+                                    .get(fu - base)
+                                    .and_then(|col| col.get(obj))
+                                    .is_some_and(|&bin| bin > b)
+                            } else {
+                                (structure_leaf >> l) & 1 == 1
+                            };
+                            if bit {
+                                leaf |= 1usize << l;
+                            }
+                        }
+                        let w = self.weight_host.get(obj).copied().unwrap_or(1.0);
+                        let d = der1.get(obj).copied().unwrap_or(0.0);
+                        if let (Some(ds), Some(ws)) =
+                            (der_segs.get_mut(leaf), w_segs.get_mut(leaf))
+                        {
+                            ds.push(d * w);
+                            ws.push(w);
+                        }
+                    }
+                    let mut gathered = vec![0.0_f64; n_leaves];
+                    for leaf in 0..n_leaves {
+                        let sum = der_segs.get(leaf).map_or(0.0, |s| cb_core::sum_f64(s));
+                        let cnt = w_segs.get(leaf).map_or(0.0, |s| cb_core::sum_f64(s));
+                        if let Some(slot) = gathered.get_mut(leaf) {
+                            *slot = cb_compute::calc_average(sum, cnt, self.scaled_l2);
+                        }
+                    }
+                    gathered
+                } else {
+                    leaf_values
+                }
+            }
+            _ => leaf_values,
+        };
+
         Ok(DeviceGrownTree {
             splits: tree.splits,
             leaf_values,
