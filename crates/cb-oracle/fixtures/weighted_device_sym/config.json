@@ -1,0 +1,44 @@
+{
+  "scenario": "weighted_device_sym",
+  "requirement": "GDC-06 / GDC-07",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 64,
+  "weight_cycle": [
+    0.5,
+    1.0,
+    2.0,
+    3.0
+  ],
+  "overflow_margin": "n*max(w)*max(|der1|) <= 64*3.0*10 = 1920 << 2^33 ~= 8.6e9 (margin > 4.4e6x) \u2014 the device fixed-point histogram precondition",
+  "description": "Weighted-training device-parity fixture, SymmetricTree arm. 64 rows, two float columns, border_count=15, RMSE depth-3 x3 iterations, Plain, no sampling, bias 0, Gradient leaf, L2 score, sample_weight cycling {0.5,1.0,2.0,3.0}. Pins upstream's SumWeightedDelta leaf/histogram semantics (leaf = \u03a3(w\u00b7der1)/(\u03a3w+l2)) that the device weighted-der channel (GDC-02) must reproduce at <=1e-5. NEVER regenerated in CI.",
+  "params": {
+    "loss_function": "RMSE",
+    "iterations": 3,
+    "depth": 3,
+    "learning_rate": 0.3,
+    "l2_leaf_reg": 3.0,
+    "border_count": 15,
+    "boosting_type": "Plain",
+    "permutation_count": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "boost_from_average": false,
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "score_function": "L2",
+    "grow_policy": "SymmetricTree",
+    "random_seed": 0,
+    "thread_count": 1,
+    "verbose": false
+  },
+  "npy_schema": {
+    "borders.npy": "[2,15] f64 \u2014 the FULL frozen quantization border set (feed to train)",
+    "X.npy": "[N,2] f32 \u2014 float feature matrix",
+    "y.npy": "[N] f64 \u2014 RMSE target, |y| < 10 by construction",
+    "weights.npy": "[N] f64 \u2014 NON-uniform per-object weights",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gate."
+}
