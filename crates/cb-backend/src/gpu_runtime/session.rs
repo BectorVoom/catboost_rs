@@ -40,8 +40,8 @@
 use cubecl::server::Handle;
 
 use cb_compute::{
-    DeviceBootstrapType, DeviceCtrConfig, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig,
-    EScoreFunction, Loss,
+    DeviceBootstrapType, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig, EScoreFunction,
+    Loss,
 };
 use cb_core::{CbError, CbResult, TFastRng64};
 use rayon::prelude::*;
