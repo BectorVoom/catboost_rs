@@ -21,7 +21,10 @@ use ndarray::Array1;
 use ndarray_npy::write_npy;
 
 /// The canonical skeleton prediction values. These MUST stay in sync with the
-/// reference vector built in `tests/skeleton_oracle_test.rs`.
+/// reference vector built in `tests/skeleton_oracle_test.rs`. The truncated
+/// π/e-looking entries are FROZEN fixture data, not approximations of the
+/// mathematical constants (clippy 1.97's `approx_constant` misreads them).
+#[allow(clippy::approx_constant)]
 const SKELETON_VALUES: [f64; 5] = [0.0, 0.25, -1.5, 3.14159, 2.71828];
 
 fn main() {

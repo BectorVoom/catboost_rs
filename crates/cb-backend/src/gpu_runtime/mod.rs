@@ -3978,17 +3978,22 @@ pub(crate) fn launch_apply_leaf_delta_into(
 /// sigmoid(approx)`). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13). Threads
 /// ONE `&client`; never reads a 0-len handle.
 /// GDC-11 (T14): the per-fit CTR split-search coordination state for the resident
-/// oblivious grow. The CTR columns occupy the cindex TAIL
-/// `[n_features - n_ctr, n_features)`; they are scored per column as THRESHOLD
-/// candidates (never through the one-hot pass) with the CPU's `model_size_reg`
-/// cat-feature weight applied HOST-side to the O(1) per-column best that crosses
-/// back — `score · (1 + count/maxCount)^(-model_size_reg)` for an UNUSED
-/// `(ctr_type, projection)` group, `1.0` once used (model-lifetime `UsedCtrSplits`
-/// + the within-tree lift, `greedy_tensor_search.cpp:926-950`). `maxCount` combines
-/// the eligible-candidate max with the PHANTOM mixed float-partition projection
-/// (`CalcMaxFeatureValueCount`): once the tree has chosen ≥1 float split, the
-/// distinct `(float-partition-leaf, raw cat bucket)` pair count joins the max —
-/// replayed host-side from `float_bins` (the base float cindex columns).
+/// oblivious grow.
+///
+/// The CTR columns occupy the cindex TAIL `[n_features - n_ctr, n_features)`;
+/// they are scored per column as THRESHOLD candidates (never through the one-hot
+/// pass) with the CPU's `model_size_reg` cat-feature weight applied HOST-side to
+/// the O(1) per-column best that crosses back: the score is multiplied by
+/// `(1 + count/maxCount)^(-model_size_reg)` for an UNUSED `(ctr_type,
+/// projection)` group, and by `1.0` once used (model-lifetime `UsedCtrSplits`
+/// plus the within-tree lift, `greedy_tensor_search.cpp:926-950`).
+///
+/// `maxCount` combines the eligible-candidate max with the PHANTOM mixed
+/// float-partition projection (`CalcMaxFeatureValueCount`): once the tree has
+/// chosen at least one float split, the distinct `(float-partition-leaf, raw cat
+/// bucket)` pair count joins the max, replayed host-side from `float_bins` (the
+/// base float cindex columns).
+///
 /// DEVICE SCOPE: simple (single-feature) projections only — the cb-train gate
 /// declines combination-CTR fits, so no combination-eligibility logic exists here.
 pub(crate) struct ResidentCtrSearch<'a> {
