@@ -4152,16 +4152,13 @@ fn train_inner<R: Runtime>(
                 .map(|h| u32::try_from(h.len()).unwrap_or(u32::MAX))
                 .collect::<Vec<_>>(),
         )
-        // WR-03: the device grow path sums the UNWEIGHTED der (`Σ der1`) into
-        // histogram channel 0 and estimates leaves via `calc_average(Σ der1,
-        // Σ weight, l2)` — object weight enters only the denominator, never the
-        // numerator. That matches the in-repo CPU path (cpu-vs-gpu agree) but NOT
-        // upstream CatBoost's `Σ w·der` (`TBucketStats::SumWeightedDelta`). Until
-        // weighted-der is wired through the histogram/leaf math, a genuinely
-        // weighted pool cannot meet the ≤1e-5 upstream-parity bar, so restrict the
-        // device path to uniform unit weights and let weighted pools fall back to
-        // the CPU grower (D-04).
-        && weights.iter().all(|&w| w == 1.0)
+        // GDC-05: the former WR-03 weight-uniformity clause is GONE. The device
+        // grow paths now consume `w·der1` (upstream's `SumWeightedDelta`) in the
+        // split histogram AND the leaf estimate on every covered grow policy —
+        // the oblivious resident grow (GDC-02, `weighted_der1_h`), and the
+        // host-driven nonsym / Region growers (GDC-03/04, `host_weighted_der1`)
+        // — so a genuinely weighted pool meets the ≤1e-5 upstream bar on device.
+        // The `bias == 0.0` sibling (CR-01) below stays unrelaxed.
         // CR-01: the device session always seeds its resident approx to zero
         // (`GpuTrainSession::begin`), so a non-zero starting bias — e.g.
         // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must

@@ -243,3 +243,60 @@ fn ctr_binarized_cindex_column_bit_exact() {
         "a CTR cindex bin exceeds the borders+1 bucket count"
     );
 }
+
+#[test]
+fn ctr_averaging_permutation_column_bit_exact() {
+    // GDC-09 (T11): the SAME online-CTR + binarize kernels called with the AVERAGING
+    // permutation must reproduce the CPU averaging materialization bit-exact — i.e.
+    // the second-permutation pass is the same math over a different object order,
+    // exactly like the CPU `averaging_ctr_features` reference (a second
+    // `materialize_ctr_columns_for_perm` call). The structure-permutation column at
+    // the same inputs must DIFFER (the discriminating precondition for GDC-10's
+    // leaf-value gather — a fixture where the two orders agree cannot detect a
+    // structure-only bug).
+    if !device_ctr_active() {
+        eprintln!("SKIP ctr_averaging_permutation_column_bit_exact: wgpu has no f64 seam (WR-01)");
+        return;
+    }
+    let n = 300usize;
+    let prior = 0.5;
+    let (bins, class, structure_perm) = synth_fixture(n, 6, 314);
+    // The averaging order: a DIFFERENT deterministic permutation over the same objects
+    // (rotate + reverse of the structure order, guaranteed ≠ structure for n > 2).
+    let averaging_perm: Vec<u32> = {
+        let mut p: Vec<u32> = structure_perm.iter().rev().copied().collect();
+        p.rotate_left(7);
+        p
+    };
+    assert_ne!(structure_perm, averaging_perm);
+    let borders = vec![0.2_f64, 0.4, 0.5, 0.6, 0.8];
+
+    // Host reference: the CPU ordered CTR under the AVERAGING order, binarized.
+    let (_ag, _at, av) = cpu_ordered_ctr(&averaging_perm, &bins, &class, prior);
+    let host_avg_cindex: Vec<u32> = av
+        .iter()
+        .map(|&v| borders.iter().filter(|&&b| v > b).count() as u32)
+        .collect();
+
+    // Device: the SAME kernels, averaging permutation input.
+    let dev_avg_cindex = binarize_ctr_column_host(
+        &averaging_perm, &bins, &class, prior, bucket_count(&bins), &borders,
+    )
+    .unwrap();
+    assert_eq!(
+        dev_avg_cindex, host_avg_cindex,
+        "device averaging-permutation CTR->cindex must be bit-exact vs the CPU \
+         averaging materialization"
+    );
+
+    // Discriminator: the structure-permutation column differs in ≥1 object.
+    let dev_structure_cindex = binarize_ctr_column_host(
+        &structure_perm, &bins, &class, prior, bucket_count(&bins), &borders,
+    )
+    .unwrap();
+    assert_ne!(
+        dev_avg_cindex, dev_structure_cindex,
+        "the averaging and structure materializations coincide on this fixture — it \
+         cannot discriminate a structure-only leaf-gather bug (pick another order)"
+    );
+}
