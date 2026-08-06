@@ -1074,6 +1074,35 @@ pub struct DeviceCtrConfig {
     pub target_class: Vec<u32>,
     /// The CTR columns to accumulate + binarize into ADDITIONAL cindex columns.
     pub columns: Vec<DeviceCtrColumn>,
+    /// The AVERAGING-permutation materialization (GDC-09): the same CTR columns
+    /// re-accumulated under the averaging fold's object order, read ONLY by the
+    /// leaf-value gather (GDC-10), never by the split-search scorer. For a covered
+    /// CTR fit this is always `Some` (never partially populated); `None` continues
+    /// to mean "not a covered CTR regime" at the outer `Option<DeviceCtrConfig>`
+    /// level, and a `Some(config)` with `averaging: None` is declined by the
+    /// session's `ctr_covered` gate rather than silently gathered structure-only.
+    pub averaging: Option<DeviceCtrAveraging>,
+}
+
+/// The averaging-permutation half of the two-materialization CTR contract (GDC-09,
+/// D2 full two-permutation parity). A PLAIN HOST struct (no `cubecl` type — the
+/// T-10-04 seam landmine). The CPU reference materializes every CTR column TWICE —
+/// once under the structure (fold-0) permutation for split SEARCH, once under the
+/// averaging permutation for leaf VALUES (`averaging_ctr_features`,
+/// `cb-train/src/boosting.rs`) — and the device arm must mirror both or its leaf
+/// values silently diverge from the ≤1e-5 upstream bar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceCtrAveraging {
+    /// The averaging-fold object order (`cat_averaging_permutation`), distinct from
+    /// [`DeviceCtrConfig::permutation`] by construction (two draws off one stream).
+    pub permutation: Vec<u32>,
+    /// The binclf target class per object (object order) — same shape as
+    /// [`DeviceCtrConfig::target_class`]; carried separately because
+    /// `launch_ordered_ctr_resident` requires it per materialization pass.
+    pub target_class: Vec<u32>,
+    /// The same CTR column specs materialized under the averaging permutation
+    /// (index-aligned with [`DeviceCtrConfig::columns`]).
+    pub columns: Vec<DeviceCtrColumn>,
 }
 
 /// The single PLAIN HOST-typed device training config (Phase 12 Plan 01, Open Q2). It

@@ -501,6 +501,7 @@ fn session_ctr_gate_covers_single_permutation() {
         permutation: permutation.clone(),
         target_class: target_class.clone(),
         columns: vec![ctr_column.clone()],
+        averaging: None,
     };
 
     let open = |folds: usize, cfg: &DeviceTrainConfig| {
@@ -538,6 +539,7 @@ fn session_ctr_gate_covers_single_permutation() {
                 prior: 0.5,
                 borders: vec![0.5_f64], // 2 buckets != n_bins
             }],
+            averaging: None,
         }),
         ..DeviceTrainConfig::default()
     };
@@ -590,6 +592,7 @@ fn session_ctr_augments_resident_cindex() {
     let ctr = DeviceCtrConfig {
         permutation,
         target_class,
+        averaging: None,
         columns: vec![
             DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone() },
             DeviceCtrColumn {
