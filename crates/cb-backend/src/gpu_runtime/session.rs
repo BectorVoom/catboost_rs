@@ -50,7 +50,7 @@ use crate::gpu_runtime::cindex::{
     fill_packed_cindex_on_device, pack_cindex, plan_cindex, PackedCindex,
 };
 use crate::gpu_runtime::{
-    grow_oblivious_tree_ordered_resident, grow_oblivious_tree_resident,
+    create_channel_const, grow_oblivious_tree_ordered_resident, grow_oblivious_tree_resident,
     launch_der_binary_resident, launch_der_param_resident,
     read_part_stats_f64, upload_channel_floats, DerBinaryKernel, DerParamKernel,
     ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
@@ -1870,16 +1870,24 @@ impl GpuTrainSession {
         let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
         let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
         let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices));
-        let weight_h = upload_channel_floats(&client, weight);
         // GDC-02: frozen once per fit — see the field doc. The host copy is kept
         // only when non-uniform (the overflow guard's input); empty otherwise.
         let weights_uniform = weight.iter().all(|&w| w == 1.0);
         let weight_host = if weights_uniform { Vec::new() } else { weight.to_vec() };
+        // The uniform (all-1.0) weight channel — every unweighted fit — is filled ON
+        // device (O(1) bytes crossing) instead of uploading an n-length host constant;
+        // `create_channel_const` produces the identical channel-typed buffer.
+        let weight_h = if weights_uniform {
+            create_channel_const(&client, 1.0, n)
+        } else {
+            upload_channel_floats(&client, weight)
+        };
         // FPP-01 (CR-01): the running approx starts at the fit's REAL starting approximant.
         // `config.bias == 0.0` is byte-identical to the former hardcoded zero seed (D-04);
         // a `boost_from_average=true` fit seeds `mean(y)` (or the loss's own starting
         // approximant) here, so the first tree's resident `der1` matches the host reference.
-        let approx_h = upload_channel_floats(&client, &vec![config.bias; n]);
+        // Constant vector → device-filled (no n-length host alloc, no O(n) upload).
+        let approx_h = create_channel_const(&client, config.bias, n);
 
         // Phase 12 Plan 03: capture the non-symmetric grow state (host-driven; keeps host
         // copies of the bins + weights and re-derives der1 from the caller's approx per tree).
