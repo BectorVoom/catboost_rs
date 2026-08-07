@@ -437,10 +437,7 @@ pub(crate) fn fill_packed_cindex_on_device(
         ))
     })?;
 
-    let mut prev_group: Option<usize> = None;
-    for ((col, bord), &(group, shift, _mask)) in
-        columns.iter().zip(borders.iter()).zip(plan.placed.iter())
-    {
+    for col in columns {
         if col.len() != n {
             return Err(CbError::LengthMismatch {
                 column: "device quantize+pack float column".to_owned(),
@@ -448,15 +445,40 @@ pub(crate) fn fill_packed_cindex_on_device(
                 actual: col.len(),
             });
         }
+    }
+    // ONE feature-major matrix upload for all columns (SPD-03 wave 3: 50 separate
+    // 4 MB per-column uploads measured ~1.1 GB/s effective on the P100 — staging
+    // churn, not bandwidth; one 200 MB transfer with a parallel host gather is
+    // several times faster). `Bytes::from_elems` MOVES the gathered buffer — no
+    // second host copy. Each launch reads its column as the `n`-window at
+    // `f * n` (validated per-column lengths above make the offsets exact).
+    let mut matrix: Vec<f32> = vec![0.0_f32; n_features * n];
+    matrix
+        .par_chunks_mut(n.max(1))
+        .zip(columns.par_iter())
+        .for_each(|(dst, col)| dst.copy_from_slice(col));
+    let matrix_h = client.create(cubecl::bytes::Bytes::from_elems(matrix));
+    let matrix_len = n_features * n;
+
+    let n_objects = u32::try_from(n).map_err(|_| {
+        CbError::OutOfRange(format!("fill_packed_cindex_on_device: n = {n} exceeds u32"))
+    })?;
+
+    let mut prev_group: Option<usize> = None;
+    for (f, (bord, &(group, shift, _mask))) in
+        borders.iter().zip(plan.placed.iter()).enumerate()
+    {
         // First feature of its group initializes the word column (groups are assigned
         // in monotone non-decreasing order, so "first" is exactly a group transition).
         let init_word = u32::from(prev_group != Some(group));
         prev_group = Some(group);
 
-        // Upload straight from the borrowed column slice — no owned `col.clone()`
-        // (SPD-03: 50 × 4 MB host clones on the hot begin path bought nothing; the
-        // client copies into its staging buffer either way).
-        let col_h = client.create_from_slice(bytemuck::cast_slice(col));
+        let col_offset = u32::try_from(f * n).map_err(|_| {
+            CbError::OutOfRange(format!(
+                "fill_packed_cindex_on_device: column offset {} exceeds u32",
+                f * n
+            ))
+        })?;
         let borders_f32: Vec<f32> = bord.iter().map(|&b| b as f32).collect();
         let n_borders = borders_f32.len();
         // A zero-length device read is never issued: an empty border list still
@@ -482,9 +504,11 @@ pub(crate) fn fill_packed_cindex_on_device(
             client,
             CubeCount::Static(num_cubes.max(1), 1, 1),
             cube_dim,
-            unsafe { ArrayArg::from_raw_parts(col_h, n) },
+            unsafe { ArrayArg::from_raw_parts(matrix_h.clone(), matrix_len) },
             unsafe { ArrayArg::from_raw_parts(borders_h, n_borders.max(1)) },
             unsafe { ArrayArg::from_raw_parts(words_h.clone(), num_words) },
+            n_objects,
+            col_offset,
             u32::try_from(n_borders).map_err(|_| {
                 CbError::OutOfRange(format!(
                     "fill_packed_cindex_on_device: {n_borders} borders exceed u32"

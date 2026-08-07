@@ -2845,19 +2845,26 @@ pub fn quantize_pack_feature_kernel<F: Float>(
     values: &Array<F>,
     borders: &Array<F>,
     words: &mut Array<u32>,
+    n_objects: u32,
+    col_offset: u32,
     n_borders: u32,
     group_offset: u32,
     shift: u32,
     init_word: u32,
 ) {
-    let n = values.len();
+    // SPD-03 wave 3: `values` is the ONE feature-major matrix upload (this feature's
+    // column is the `n_objects` window at `col_offset`), so the host makes a single
+    // large transfer instead of 50 small ones (measured 1.1 GB/s effective on the
+    // P100 for per-column uploads). `n_objects` is an explicit scalar — the array
+    // length is the whole matrix, not this column.
+    let n = n_objects as usize;
     // `n_borders` is an explicit scalar (NOT `borders.len()`): an empty border list
     // ships a 1-element dummy buffer (a zero-length device read is never issued), and
     // the dummy cell must contribute no comparison — the host passes n_borders = 0.
     let nb = n_borders as usize;
     let obj = ABSOLUTE_POS;
     if obj < n {
-        let v = values[obj];
+        let v = values[col_offset as usize + obj];
         let mut bin = 0u32;
         for k in 0..nb {
             if v > borders[k] {

@@ -5432,83 +5432,153 @@ fn train_inner<R: Runtime>(
                         })
                         .collect()
                 };
-                let device_leaf_of: Vec<usize> = if device_has_ctr_split {
-                    // GDC-11/GDC-10 (T14): the LEAF-VALUE / main-approx assignment
-                    // for a CTR tree is the AVERAGING-fold partition — exactly the
-                    // CPU `leaf_value_leaf_of` (`assign_leaf_over_ctr_columns`,
-                    // `BuildIndices(AveragingFold)`): float levels keep the float
-                    // test, CTR levels re-test against the AVERAGING column's
-                    // bins. The device already gathered the RETURNED leaf values
-                    // over this same partition (GDC-10), so values and assignment
-                    // stay consistent here.
-                    let grown_like = GrownTree {
-                        splits: device_splits.clone(),
-                        one_hot_splits: device_one_hot_splits.clone(),
-                        leaf_of: Vec::new(),
-                        ctr_splits: device_ctr_splits.clone(),
-                        level_kinds: device_level_kinds.clone(),
-                        step_nodes: Vec::new(),
-                        node_id_to_leaf_id: Vec::new(),
-                        region_directions: Vec::new(),
-                        region_one_hot: Vec::new(),
-                    };
-                    assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown_like, n)
-                } else {
-                    // Pure per-object walk (reads only resolved split columns) —
-                    // parallel over objects, deterministic per index (this walk runs
-                    // once per boosting iteration at n scale).
-                    (0..n)
-                        .into_par_iter()
-                        .map(|obj| {
-                            let mut leaf = 0usize;
-                            for (l, col) in level_cols.iter().enumerate() {
-                                let passes = match col {
-                                    DeviceLevelCol::Float(values, border) => values
-                                        .get(obj)
-                                        .is_some_and(|&v| f64::from(v) > *border),
-                                    DeviceLevelCol::OneHot(bins, value) => {
-                                        bins.get(obj).is_some_and(|&b| b == *value)
-                                    }
-                                };
-                                if passes {
-                                    leaf |= 1usize << l;
-                                }
-                            }
-                            leaf
-                        })
-                        .collect()
-                };
-
                 // Leaf values: the device returns UN-scaled leaves; cb-train applies the
                 // `learning_rate` shrinkage. Non-pairwise → `normalize_leaf_values` applies
-                // ONLY the lr scale (byte-identical to `learning_rate * delta`, D-04).
+                // ONLY the lr scale (byte-identical to `learning_rate * delta`, D-04) and
+                // reads `leaf_weights` NOT AT ALL — which is what licenses the fused path
+                // below to scale BEFORE the weights exist.
                 let mut device_leaf_values = dev_tree.leaf_values.clone();
-                let device_leaf_weights =
-                    accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
-                normalize_leaf_values(
-                    /* is_pairwise = */ false,
-                    learning_rate,
-                    &device_leaf_weights,
-                    &mut device_leaf_values,
-                    n_leaves,
-                    /* approx_dimension = */ 1,
-                );
+                // SPD-03 wave 3 (P100 260808-r2: the three separate O(n) fold sweeps —
+                // walk, weight bucketing, approx add — still cost ~18 ms/tree on the
+                // 4-vCPU Kaggle host). The unit-weight float-only fold — every unweighted
+                // fit — fuses them into ONE parallel sweep with per-chunk integer leaf
+                // counts, never materializing `device_leaf_of`. Bit-exact: the walk is the
+                // same per-object test, the approx add hits each slot once with the same
+                // value, and a fold of k unit weights is EXACTLY `k as f64` (integer f64
+                // addition below 2^53), order-free.
+                let fused_unit_fold = !device_has_ctr_split && weights.iter().all(|&w| w == 1.0);
+                let device_leaf_weights: Vec<f64> = if fused_unit_fold {
+                    normalize_leaf_values(
+                        /* is_pairwise = */ false,
+                        learning_rate,
+                        &[],
+                        &mut device_leaf_values,
+                        n_leaves,
+                        /* approx_dimension = */ 1,
+                    );
+                    const FOLD_CHUNK: usize = 1 << 16;
+                    let weights_len = weights.len();
+                    let counts: Vec<u64> = approx
+                        .par_chunks_mut(FOLD_CHUNK)
+                        .enumerate()
+                        .map(|(c, approx_chunk)| {
+                            let start = c * FOLD_CHUNK;
+                            let mut counts = vec![0_u64; n_leaves];
+                            for (off, a) in approx_chunk.iter_mut().enumerate() {
+                                let obj = start + off;
+                                let mut leaf = 0usize;
+                                for (l, col) in level_cols.iter().enumerate() {
+                                    let passes = match col {
+                                        DeviceLevelCol::Float(values, border) => values
+                                            .get(obj)
+                                            .is_some_and(|&v| f64::from(v) > *border),
+                                        DeviceLevelCol::OneHot(bins, value) => {
+                                            bins.get(obj).is_some_and(|&b| b == *value)
+                                        }
+                                    };
+                                    if passes {
+                                        leaf |= 1usize << l;
+                                    }
+                                }
+                                // Same membership rule as `accumulate_leaf_weights`: an
+                                // object contributes to the weight only when it has a
+                                // weight entry (and the leaf is in range).
+                                if obj < weights_len {
+                                    if let Some(slot) = counts.get_mut(leaf) {
+                                        *slot += 1;
+                                    }
+                                }
+                                if let Some(&lv) = device_leaf_values.get(leaf) {
+                                    *a += lv;
+                                }
+                            }
+                            counts
+                        })
+                        .reduce(
+                            || vec![0_u64; n_leaves],
+                            |mut x, y| {
+                                for (a, b) in x.iter_mut().zip(y.iter()) {
+                                    *a += b;
+                                }
+                                x
+                            },
+                        );
+                    counts.into_iter().map(|c| c as f64).collect()
+                } else {
+                    let device_leaf_of: Vec<usize> = if device_has_ctr_split {
+                        // GDC-11/GDC-10 (T14): the LEAF-VALUE / main-approx assignment
+                        // for a CTR tree is the AVERAGING-fold partition — exactly the
+                        // CPU `leaf_value_leaf_of` (`assign_leaf_over_ctr_columns`,
+                        // `BuildIndices(AveragingFold)`): float levels keep the float
+                        // test, CTR levels re-test against the AVERAGING column's
+                        // bins. The device already gathered the RETURNED leaf values
+                        // over this same partition (GDC-10), so values and assignment
+                        // stay consistent here.
+                        let grown_like = GrownTree {
+                            splits: device_splits.clone(),
+                            one_hot_splits: device_one_hot_splits.clone(),
+                            leaf_of: Vec::new(),
+                            ctr_splits: device_ctr_splits.clone(),
+                            level_kinds: device_level_kinds.clone(),
+                            step_nodes: Vec::new(),
+                            node_id_to_leaf_id: Vec::new(),
+                            region_directions: Vec::new(),
+                            region_one_hot: Vec::new(),
+                        };
+                        assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown_like, n)
+                    } else {
+                        // Pure per-object walk (reads only resolved split columns) —
+                        // parallel over objects, deterministic per index (this walk runs
+                        // once per boosting iteration at n scale).
+                        (0..n)
+                            .into_par_iter()
+                            .map(|obj| {
+                                let mut leaf = 0usize;
+                                for (l, col) in level_cols.iter().enumerate() {
+                                    let passes = match col {
+                                        DeviceLevelCol::Float(values, border) => values
+                                            .get(obj)
+                                            .is_some_and(|&v| f64::from(v) > *border),
+                                        DeviceLevelCol::OneHot(bins, value) => {
+                                            bins.get(obj).is_some_and(|&b| b == *value)
+                                        }
+                                    };
+                                    if passes {
+                                        leaf |= 1usize << l;
+                                    }
+                                }
+                                leaf
+                            })
+                            .collect()
+                    };
+
+                    let device_leaf_weights =
+                        accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
+                    normalize_leaf_values(
+                        /* is_pairwise = */ false,
+                        learning_rate,
+                        &device_leaf_weights,
+                        &mut device_leaf_values,
+                        n_leaves,
+                        /* approx_dimension = */ 1,
+                    );
+                    // Elementwise, order-independent per-object add — bit-identical to the
+                    // serial loop (each slot is touched exactly once), parallel over objects
+                    // (this pass runs once per boosting iteration at n scale).
+                    approx
+                        .par_iter_mut()
+                        .zip(device_leaf_of.par_iter())
+                        .for_each(|(a, &leaf)| {
+                            if let Some(&lv) = device_leaf_values.get(leaf) {
+                                *a += lv;
+                            }
+                        });
+                    device_leaf_weights
+                };
                 // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
                 // per-tree MVS λ carry after the fold arms can compute this tree's mean
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
-
-                // Elementwise, order-independent per-object add — bit-identical to the
-                // serial loop (each slot is touched exactly once), parallel over objects
-                // (this pass runs once per boosting iteration at n scale).
-                approx
-                    .par_iter_mut()
-                    .zip(device_leaf_of.par_iter())
-                    .for_each(|(a, &leaf)| {
-                        if let Some(&lv) = device_leaf_values.get(leaf) {
-                            *a += lv;
-                        }
-                    });
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);

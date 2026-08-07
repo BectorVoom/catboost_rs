@@ -116,20 +116,23 @@ pub(crate) fn numpy_to_owned(
     // Borrow X as a read-only float32 2-D array. `extract` fails on a wrong dtype
     // / rank; map it to the typed CatBoostValueError with an actionable message
     // (D-12: reject float64, never coerce — threat T-08-09).
-    let float_cols = numpy_matrix_to_cols(x)?;
+    let (float_cols, f32_cache) = numpy_matrix_to_cols(x)?;
     let n_rows = float_cols.first().map_or(0, Vec::len);
     let label = label_to_owned(y, n_rows)?;
-    Ok(OwnedColumns::new(float_cols, label))
+    Ok(OwnedColumns::new(float_cols, label).with_float_f32_cache(f32_cache))
 }
 
 /// Validate a 2-D C-contiguous float32 NumPy array and copy it column-major into
-/// owned `Vec<Vec<f64>>` (cast f32 -> f64). Shared by the NumPy and Pandas
-/// (numeric block) paths so the strict D-12 contract is identical. The result is
-/// fully owned — no borrow escapes (D-11).
+/// owned `Vec<Vec<f64>>` (cast f32 -> f64) PLUS the bit-exact f32 SoA cache
+/// (SPD-03 wave 3: the input IS f32, so keeping the f32 view alongside lets
+/// fit-prep skip its full re-narrowing pass — `f64::from(v) as f32 == v` exactly).
+/// Shared by the NumPy and Pandas (numeric block) paths so the strict D-12
+/// contract is identical. The result is fully owned — no borrow escapes (D-11).
 ///
 /// # Errors
 /// [`CatBoostValueError`] if the array is not a 2-D C-contiguous float32 array.
-fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f64>>> {
+#[allow(clippy::type_complexity)]
+fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<(Vec<Vec<f64>>, Vec<Vec<f32>>)> {
     let x_arr: PyReadonlyArray2<f32> = x.extract().map_err(|_| {
         CatBoostValueError::new_err(
             "X must be a 2-D float32 NumPy array; pass `X.astype(np.float32)` \
@@ -163,19 +166,17 @@ fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f64>>> {
             "X must be C-contiguous; pass `np.ascontiguousarray(X, dtype=np.float32)`",
         )
     })?;
-    let float_cols: Vec<Vec<f64>> = (0..n_features)
+    let (float_cols, f32_cols): (Vec<Vec<f64>>, Vec<Vec<f32>>) = (0..n_features)
         .into_par_iter()
         .map(|col| {
-            (0..n_rows)
-                .map(|row| {
-                    flat.get(row * n_features + col)
-                        .copied()
-                        .map_or(0.0, f64::from)
-                })
-                .collect()
+            let f32_col: Vec<f32> = (0..n_rows)
+                .map(|row| flat.get(row * n_features + col).copied().unwrap_or(0.0))
+                .collect();
+            let f64_col: Vec<f64> = f32_col.iter().map(|&v| f64::from(v)).collect();
+            (f64_col, f32_col)
         })
-        .collect();
-    Ok(float_cols)
+        .unzip();
+    Ok((float_cols, f32_cols))
 }
 
 /// Read the optional float32 1-D NumPy label into an owned `Vec<f64>`, validating
@@ -296,8 +297,8 @@ fn pandas_to_owned(
 
     // Numeric block: select the numeric columns, materialize a float32 numpy
     // matrix, and route through the strict NumPy path (which copies + owns).
-    let float_cols: Vec<Vec<f64>> = if numeric_names.is_empty() {
-        Vec::new()
+    let (float_cols, f32_cache): (Vec<Vec<f64>>, Vec<Vec<f32>>) = if numeric_names.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         let np_module = py.import(intern!(py, "numpy"))?;
         let float32 = np_module.getattr(intern!(py, "float32"))?;
@@ -333,7 +334,7 @@ fn pandas_to_owned(
 
     let n_rows = pandas_n_rows(py, df)?;
     let label = label_to_owned(y, n_rows)?;
-    let mut owned = OwnedColumns::new(float_cols, label);
+    let mut owned = OwnedColumns::new(float_cols, label).with_float_f32_cache(f32_cache);
     if !cat_cols.is_empty() {
         owned = owned.with_cat_features(cat_cols);
     }
