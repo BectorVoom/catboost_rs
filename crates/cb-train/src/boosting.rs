@@ -39,7 +39,7 @@ use crate::autolr::{self, TargetType};
 use crate::query_info::{build_query_info, QueryInfo};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::ctr::bake::{bake_ctr_table, BakedCtrData};
-use crate::device_draw_replay::replay_grow_draws;
+use crate::device_draw_replay::{replay_grow_draws, ReplayPolicy};
 use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
@@ -5358,7 +5358,19 @@ fn train_inner<R: Runtime>(
             // randomness lives entirely in the device seed buffer, this host stream feeds
             // nothing on that arm, and there is no upstream CPU phase to stay aligned with.
             if draws_active && !device_poisson {
-                replay_grow_draws(&mut rng, params.depth, matrix.n_features());
+                // B-1: the replay is GROW-POLICY aware. Only the oblivious CPU grower
+                // touches the training RNG (region_grower / leaf_wise_grower take no
+                // Perturbation at all), so a Region / Depthwise / Lossguide device tree
+                // must replay NOTHING — replaying the oblivious level-search shape there
+                // would consume draws the CPU branch never consumes and desynchronise the
+                // NEXT tree's bootstrap().
+                let replay_policy = match params.grow_policy {
+                    EGrowPolicy::SymmetricTree => ReplayPolicy::SymmetricTree,
+                    EGrowPolicy::Region => ReplayPolicy::Region,
+                    EGrowPolicy::Depthwise => ReplayPolicy::Depthwise,
+                    EGrowPolicy::Lossguide => ReplayPolicy::Lossguide,
+                };
+                replay_grow_draws(&mut rng, replay_policy, params.depth, matrix.n_features());
                 for _ in 0..POST_TREE_EXTRA_DRAWS {
                     rng.gen_rand();
                 }
