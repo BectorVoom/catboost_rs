@@ -2248,6 +2248,38 @@ fn ctr_splits_for_tree(
 /// hashes, the device folds perfect-hash bucket codes, so a collision on ONE side only
 /// would diverge. Documented, not guarded; the ≤1e-5 e2e bar is its detector.
 ///
+/// # Combination CTR is device-INELIGIBLE (FPP-11, ESCALATED — do not re-open blind)
+///
+/// The paragraph above describes why the arity SHOULD be admissible, and the column
+/// builder ([`build_device_ctr_config`]) does emit one `member_bins` entry per member,
+/// unit-tested by `device_ctr_combo_config_test`. But the end-to-end oracle over the
+/// `ctr_device_combo/` fixture does NOT meet the ≤1e-5 bar, so the gate stays closed.
+///
+/// Measured on gfx1151 against upstream `catboost==1.2.10`:
+///
+/// - the CPU path over the same fixture is exact: **max|Δpred| = 1.4e-17**, with 8 CTR
+///   splits, so neither the fixture nor the CPU combination CTR is at fault;
+/// - the DEVICE path misses by **3.3e-2**;
+/// - trees 0, 1 and 2 are STRUCTURALLY IDENTICAL to the CPU's — including tree 2's
+///   2-member combination split `[0,1] @ border 4.0` — so `combine_projection_bins`
+///   is producing usable combined bins;
+/// - the divergence begins at **tree 3, level 0**: the CPU picks the simple projection
+///   `[0] @ 6.0` and the device picks the combination `[0,1] @ 8.0`. Every later level
+///   follows from that one different partition.
+///
+/// Tree 3 level 0 is the first point at which BOTH the simple and the combination group
+/// have already entered the model-lifetime `UsedCtrSplits` set (the combination enters at
+/// tree 2), so both candidates score at cat-feature weight `1.0` on both sides and the
+/// disagreement is a raw split-gain difference, not a weight difference. The most likely
+/// remaining suspects, in order: the device's `eligible_max` (`maxCount`) now maxes over a
+/// combination column's `bucket_count`, which its own comment says was written assuming
+/// "the device gate admits only simple projections"; and the combination column's
+/// `bucket_count` itself (`combine_projection_bins` returns the OBSERVED distinct-bucket
+/// count, whereas upstream's `TOnlineCtrUniqValuesCounts::Count` may not).
+///
+/// Re-opening this clause requires the e2e oracle to pass, not just the config unit test —
+/// this is exactly the ordering discipline that made the gap visible.
+///
 /// Everything else — Buckets / BinarizedTargetMeanValue / Counter (Track U), multi-target-
 /// border Buckets columns, non-unit prior denominators — still declines to the
 /// byte-unchanged CPU path (D-04): the device kernels do not implement those accumulation
@@ -2257,7 +2289,11 @@ fn ctr_splits_for_tree(
 fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
     !cols.is_empty()
         && cols.iter().all(|col| {
-            col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
+            // ESCALATED (FPP-11): the projection-arity conjunct is RESTORED. See the
+            // "combination CTR is device-INELIGIBLE" section of this function's doc
+            // comment for the measured evidence and the localisation.
+            col.projection.is_simple()
+                && col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
                 && col.target_border_idx == 0
                 && col.prior_denom == 1.0
         })

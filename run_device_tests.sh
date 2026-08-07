@@ -8,6 +8,10 @@ TESTS=(
   device_bias_gate_test
   device_exact_leaf_gate_test
   device_nonsym_bootstrap_gate_test
+  device_bias_fit_test
+  device_exact_leaf_fit_test
+  device_ctr_combo_fit_test
+  device_nonsym_bootstrap_test
   device_nonsym_fit_test
   device_region_fit_test
   device_weighted_fit_test
