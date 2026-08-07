@@ -166,16 +166,41 @@ fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<(Vec<Vec<f64>>, Vec<Ve
             "X must be C-contiguous; pass `np.ascontiguousarray(X, dtype=np.float32)`",
         )
     })?;
-    let (float_cols, f32_cols): (Vec<Vec<f64>>, Vec<Vec<f32>>) = (0..n_features)
+    // Cache-blocked transpose in COLUMN GROUPS of 16 (SPD-03 wave 5): the former
+    // one-column-at-a-time gather touched a fresh 64-byte line per element and so
+    // re-read the whole row-major matrix once PER COLUMN (~3.2 GB of traffic at
+    // 1M×50 — the P100 r4 diag attributes 405 ms to this ingest). A 16-column
+    // group consumes a full cache line per row visit, so the matrix is read
+    // effectively once per ~3 sweeps (~200 MB). Groups are disjoint and ordered,
+    // so the flattened output is byte-identical to the per-column form.
+    const GROUP: usize = 16;
+    let n_groups = n_features.div_ceil(GROUP).max(1);
+    let grouped: Vec<Vec<(Vec<f64>, Vec<f32>)>> = (0..n_groups)
         .into_par_iter()
-        .map(|col| {
-            let f32_col: Vec<f32> = (0..n_rows)
-                .map(|row| flat.get(row * n_features + col).copied().unwrap_or(0.0))
-                .collect();
-            let f64_col: Vec<f64> = f32_col.iter().map(|&v| f64::from(v)).collect();
-            (f64_col, f32_col)
+        .map(|g| {
+            let base = g * GROUP;
+            let width = GROUP.min(n_features.saturating_sub(base));
+            let mut f32_group: Vec<Vec<f32>> =
+                (0..width).map(|_| Vec::with_capacity(n_rows)).collect();
+            for row in 0..n_rows {
+                let row_base = row * n_features + base;
+                if let Some(row_slice) = flat.get(row_base..row_base + width) {
+                    for (col_buf, &v) in f32_group.iter_mut().zip(row_slice) {
+                        col_buf.push(v);
+                    }
+                }
+            }
+            f32_group
+                .into_iter()
+                .map(|c| {
+                    let f64_col: Vec<f64> = c.iter().map(|&v| f64::from(v)).collect();
+                    (f64_col, c)
+                })
+                .collect()
         })
-        .unzip();
+        .collect();
+    let (float_cols, f32_cols): (Vec<Vec<f64>>, Vec<Vec<f32>>) =
+        grouped.into_iter().flatten().unzip();
     Ok((float_cols, f32_cols))
 }
 
