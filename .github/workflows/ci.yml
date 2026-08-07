@@ -16,6 +16,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The workspace's debug test binaries have outgrown the stock ~14 GB of
+      # free runner disk (two identical "No space left on device" failures while
+      # compiling `cargo test --workspace` targets, 2026-08-07). Reclaim the
+      # preinstalled toolchains this CPU-only lane never uses (~30 GB).
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/share/swift /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
       # Honors rust-toolchain.toml (stable channel) and ensures clippy is present.
       - name: Install Rust toolchain
         run: rustup component add clippy
