@@ -1,0 +1,18 @@
+{
+  "id": "yensen2/catboost-rs-full-param-gpu-grid",
+  "title": "catboost-rs full param gpu grid",
+  "code_file": "kaggle_driver.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

@@ -220,11 +220,25 @@ pub(crate) fn device_best_split_for_node(
 ///   tree can be grown).
 /// - [`CbError::Degenerate`] if the root cannot be split at all.
 /// - [`CbError::OutOfRange`] if a child diff exceeds `u16` (extreme `max_depth`, CR-01).
+/// # The `score_der1` / `score_weight` channels (FPP-12, T08)
+///
+/// `der1`/`weight` are the LEAF-estimation channels; `score_der1`/`score_weight` are the
+/// SPLIT-SCORING channels. On an unsampled fit the caller passes the same slices for both
+/// (byte- and perf-unchanged, D-04). Under a host bootstrap the caller passes
+/// `der1 ⊙ sample` / `weight ⊙ sample` as the score pair while the leaf pair stays raw —
+/// which is the `Runtime::grow_tree_on_device` contract verbatim: *"the backend folds
+/// [`sample`] into the SPLIT-SCORING stat channels ONLY. Leaf estimation stays on the
+/// UNSAMPLED derivatives / weights."*
+///
+/// Both pairs must be length `n`; a caller that swapped them would silently sample the
+/// leaf values, which is the exact wrong-answer class this separation prevents.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grow_nonsym_tree(
     policy: NonsymPolicy,
     der1: &[f64],
     weight: &[f64],
+    score_der1: &[f64],
+    score_weight: &[f64],
     cindex: &[u32],
     n: usize,
     n_bins: usize,
@@ -310,8 +324,8 @@ pub(crate) fn grow_nonsym_tree(
                 for &leaf in &current_level {
                     let docs = node_docs.get(leaf).cloned().unwrap_or_default();
                     if let Some(bs) = device_best_split_for_node(
-                        &docs, der1, weight, cindex, n, n_bins, n_features, min_data_in_leaf,
-                        scaled_l2, score_fn,
+                        &docs, score_der1, score_weight, cindex, n, n_bins, n_features,
+                        min_data_in_leaf, scaled_l2, score_fn,
                     )? {
                         let (l, r) = do_split(
                             &mut nodes, &mut node_docs, &mut node_depth, &mut leaf_owner, leaf, &bs,
@@ -369,8 +383,8 @@ pub(crate) fn grow_nonsym_tree(
                     if node_depth.get(node).copied().unwrap_or(0) < max_depth {
                         let docs = node_docs.get(node).cloned().unwrap_or_default();
                         if let Some(bs) = device_best_split_for_node(
-                            &docs, der1, weight, cindex, n, n_bins, n_features, min_data_in_leaf,
-                            scaled_l2, score_fn,
+                            &docs, score_der1, score_weight, cindex, n, n_bins, n_features,
+                            min_data_in_leaf, scaled_l2, score_fn,
                         )? {
                             heap.push(QItem { gain: bs.gain, seq, node, best: bs });
                             seq += 1;

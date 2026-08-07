@@ -447,3 +447,168 @@ fn session_residency_coverage_gate_declines_uncovered() {
     assert!(!open(&Loss::Rmse, 1, true, 2, EScoreFunction::Cosine), "fold_count>1 must decline");
     assert!(!open(&Loss::Mae, 1, true, 1, EScoreFunction::Cosine), "non-RMSE/Logloss loss must decline");
 }
+
+// ─── FPP-01 (T05): the resident approx is seeded from `DeviceTrainConfig.bias` ──────────
+
+/// ε for the resident-channel read-back (the device self-oracle bound, D-07).
+const BIAS_EPS: f64 = 1e-4;
+
+/// Open a covered depth-1 session with the given `bias` and `learning_rate`.
+///
+/// `learning_rate == 0.0` neutralises `apply_leaf_delta`, so the resident approx stays AT
+/// the seed across grows — which is what lets the chained `der1` be compared against the
+/// seed's own derivative rather than tree 2's.
+fn bias_session(
+    loss: &Loss,
+    bias: f64,
+    learning_rate: f64,
+    n: usize,
+) -> GpuTrainSession {
+    let n_features = 2usize;
+    let n_bins = 16usize;
+    let weight = vec![1.0_f64; n];
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, sum_f64(&weight), n);
+
+    let config = DeviceTrainConfig {
+        bias,
+        ..DeviceTrainConfig::default()
+    };
+    GpuTrainSession::begin(
+        loss,
+        1,
+        true,
+        1,
+        EScoreFunction::Cosine,
+        &cindex,
+        &weight,
+        n,
+        n_features,
+        n_bins,
+        learning_rate,
+        scaled_l2,
+        &config,
+    )
+    .expect("session begin must not error on a covered config")
+    .expect("covered config (depth1/Plain/fold1/Cosine) must open a session")
+}
+
+/// FPP-01, the direct seam assertion: `begin` seeds the resident approximant to
+/// `vec![config.bias; n]`.
+///
+/// A device that ignored the bias would return all-zeros — off by exactly `1.75` at every
+/// element, four orders of magnitude above ε. This is the discriminating assertion for the
+/// whole bias track; the ≤1e-5 end-to-end consequence is T12's job.
+#[test]
+fn resident_approx_starts_from_config_bias() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[FPP-01] SKIP resident_approx_starts_from_config_bias: active backend lacks \
+             Atomic<u64> add (cpu/wgpu) — the resident grow path needs rocm/cuda"
+        );
+        return;
+    }
+
+    let n = 64usize;
+    let bias = 1.75_f64;
+    let session = bias_session(&Loss::Rmse, bias, 0.3, n);
+    let approx = session
+        .resident_approx_host()
+        .expect("resident approx read-back must not fail");
+
+    assert_eq!(approx.len(), n, "resident approx must be length n");
+    for (i, &got) in approx.iter().enumerate() {
+        assert!(
+            (got - bias).abs() <= BIAS_EPS,
+            "resident approx[{i}] = {got}, expected the seeded bias {bias} \
+             (|Δ|={:.3e} > ε={BIAS_EPS:.0e}) — `begin` did not seed from config.bias",
+            (got - bias).abs()
+        );
+    }
+}
+
+/// FPP-01's consequence on the derivative channel the split histogram actually consumes.
+///
+/// `learning_rate = 0.0` pins the resident approx at the seed, so the `der1` chained by the
+/// first `grow_one` is exactly the SEED's derivative: `target - bias` under RMSE and
+/// `target - sigmoid(bias)` under Logloss.
+#[test]
+fn resident_der1_starts_from_config_bias() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[FPP-01] SKIP resident_der1_starts_from_config_bias: needs rocm/cuda"
+        );
+        return;
+    }
+
+    let n = 64usize;
+    let bias = 1.75_f64;
+
+    // RMSE: der1 = target - approx.
+    let target = ramp_centred(n);
+    let mut session = bias_session(&Loss::Rmse, bias, 0.0, n);
+    session
+        .grow_one(&vec![bias; n], &target, &[])
+        .expect("grow_one must succeed");
+    let der1 = session
+        .resident_der1_host()
+        .expect("der1 is resident after the first grow")
+        .expect("der1 read-back must not fail");
+    assert_eq!(der1.len(), n);
+    for (i, &got) in der1.iter().enumerate() {
+        let want = target[i] - bias;
+        assert!(
+            (got - want).abs() <= BIAS_EPS,
+            "RMSE der1[{i}]: device {got} vs host reference target-bias {want} \
+             (|Δ|={:.3e} > ε={BIAS_EPS:.0e}) — the resident approx was NOT seeded from \
+             config.bias",
+            (got - want).abs()
+        );
+    }
+
+    // Logloss: der1 = target - sigmoid(approx). Binary labels, so sigmoid(bias) is the
+    // whole discriminating factor.
+    let labels: Vec<f64> = (0..n).map(|k| f64::from(u8::from(k % 3 == 0))).collect();
+    let mut session = bias_session(&Loss::Logloss, bias, 0.0, n);
+    session
+        .grow_one(&vec![bias; n], &labels, &[])
+        .expect("grow_one must succeed");
+    let der1 = session
+        .resident_der1_host()
+        .expect("der1 is resident after the first grow")
+        .expect("der1 read-back must not fail");
+    let sigmoid_bias = 1.0 / (1.0 + (-bias).exp());
+    for (i, &got) in der1.iter().enumerate() {
+        let want = labels[i] - sigmoid_bias;
+        assert!(
+            (got - want).abs() <= BIAS_EPS,
+            "Logloss der1[{i}]: device {got} vs host reference target-sigmoid(bias) {want} \
+             (|Δ|={:.3e} > ε={BIAS_EPS:.0e})",
+            (got - want).abs()
+        );
+    }
+}
+
+/// D-04: `bias == 0.0` must reproduce the former hardcoded `vec![0.0; n]` seed EXACTLY —
+/// bit equality, not "within ε", because the uploaded bytes are literally the same.
+#[test]
+fn resident_approx_bias_zero_is_byte_unchanged() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!("[FPP-01] SKIP resident_approx_bias_zero_is_byte_unchanged: needs rocm/cuda");
+        return;
+    }
+
+    let n = 64usize;
+    let session = bias_session(&Loss::Rmse, 0.0, 0.3, n);
+    let approx = session
+        .resident_approx_host()
+        .expect("resident approx read-back must not fail");
+    for (i, &got) in approx.iter().enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            0.0_f64.to_bits(),
+            "bias=0 resident approx[{i}] = {got}, expected exactly 0.0 — the zero-bias \
+             path must stay BYTE-unchanged (D-04), not merely within ε"
+        );
+    }
+}

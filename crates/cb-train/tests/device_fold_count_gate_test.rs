@@ -13,7 +13,9 @@
 
 use std::cell::Cell;
 
-use cb_compute::{Derivatives, DeviceGrownTree, EScoreFunction, LeafMethod, Loss, Runtime};
+use cb_compute::{
+    Derivatives, DeviceGrownTree, EScoreFunction, FamilyTreeArgs, LeafMethod, Loss, Runtime,
+};
 use cb_core::{CbError, CbResult};
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
@@ -71,6 +73,7 @@ impl Runtime for FoldCountRecorder {
         _approx: &[f64],
         _target: &[f64],
         _sample: &[f64],
+        _family: Option<&FamilyTreeArgs<'_>>,
     ) -> CbResult<Option<DeviceGrownTree>> {
         Ok(Some(DeviceGrownTree {
             splits: vec![(0, 1, false)],

@@ -230,6 +230,94 @@ pub(crate) fn launch_der_binary_resident(
     }
 }
 
+/// FPP-05 (T13 follow-up): the RESIDENT sibling of [`launch_der_param_into`] — launch a
+/// PARAMETRIC der1 kernel over handles that are ALREADY on the device, returning a new
+/// device handle without any host transfer.
+///
+/// # Why this exists
+///
+/// The resident grow loop chains `der1` on-device across trees and previously had only
+/// [`launch_der_binary_resident`], whose two arms are RMSE and Logloss. An EXACT-leaf fit
+/// (MAE / Quantile) therefore had to borrow `RmseGradient` for its split histogram, which
+/// drove the tree STRUCTURE with the wrong derivative: leaf values were the correct order
+/// statistic, but the splits were the ones an RMSE fit would have chosen. Against upstream
+/// that showed up as a ~3e-2 prediction gap on a 3-tree depth-3 MAE fit — four orders of
+/// magnitude past the ≤1e-5 bar, and invisible until the gate admitted Exact at all.
+///
+/// The KERNEL was never the problem: [`quantile_gradient_kernel`] already existed and MAE
+/// already routed through it at `(QUANTILE_ALPHA, QUANTILE_DELTA)`. Only the resident
+/// LAUNCHER was missing.
+///
+/// Mirrors [`launch_der_binary_resident`]'s geometry exactly (same `CUBE_DIM`, same
+/// per-element output length, same no-read-back discipline); only the parameter buffers
+/// differ. `n == 0` short-circuits to a zero-length handle with no launch.
+///
+/// # Errors
+/// Returns [`CbError::OutOfRange`] on wgpu (no f64 channel, WR-02) or when `params` is
+/// shorter than the kernel requires — never a panic, never a silently defaulted parameter.
+pub(crate) fn launch_der_param_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx_h: Handle,
+    target_h: Handle,
+    kernel: DerParamKernel,
+    params: &[f64],
+    n: usize,
+) -> CbResult<Handle> {
+    if n == 0 {
+        return Ok(client.empty(0));
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        let _ = (approx_h, target_h, kernel, params);
+        return Err(CbError::OutOfRange(
+            "resident parametric der seam requires an f64 device channel; the wgpu backend \
+             has no f64 type (WR-02). Use the rocm/cuda/cpu backend for derivative \
+             computation."
+                .to_owned(),
+        ));
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let out_handle = client.empty(n * std::mem::size_of::<f64>());
+        let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+        let count = CubeCount::Static(num_cubes as u32, 1, 1);
+        let dim = CubeDim {
+            x: CUBE_DIM as u32,
+            y: 1,
+            z: 1,
+        };
+        match kernel {
+            DerParamKernel::QuantileGradient => {
+                let (alpha, delta) = param_pair(params, "QuantileGradient")?;
+                let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
+                let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
+                quantile_gradient_kernel::launch::<f64, SelectedRuntime>(
+                    client,
+                    count,
+                    dim,
+                    unsafe { ArrayArg::from_raw_parts(approx_h, n) },
+                    unsafe { ArrayArg::from_raw_parts(target_h, n) },
+                    unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
+                    unsafe { ArrayArg::from_raw_parts(delta_handle, 1) },
+                );
+            }
+            DerParamKernel::FocalGradient | DerParamKernel::FocalHessian => {
+                // Focal has no resident consumer today. Reject explicitly rather than
+                // silently falling through to a wrong kernel — the exact failure class
+                // this whole function exists to fix.
+                return Err(CbError::OutOfRange(format!(
+                    "resident parametric der seam does not cover {kernel:?}; only \
+                     QuantileGradient has a resident consumer (the exact-leaf grow)"
+                )));
+            }
+        }
+        Ok(out_handle)
+    }
+}
+
 /// Host-readback wrapper over the der launch: launch the der1 kernel
 /// device-resident, then read the handle back to a host `Vec<f64>`. This is the
 /// seam the all-backend self-oracle exercises (it compares the device der1 to the

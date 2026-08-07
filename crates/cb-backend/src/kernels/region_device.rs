@@ -53,10 +53,20 @@ use crate::kernels::nonsym_grow::device_best_split_for_node;
 ///   `cb_train::tree::region_grower`'s degenerate contract.
 /// - [`CbError::LengthMismatch`] if `cindex` is not exactly `n_features * n` long.
 /// - [`CbError::OutOfRange`] if `n_features * n` overflows `usize`.
+/// # The `score_der1` / `score_weight` channels (FPP-12, T08)
+///
+/// `der1`/`weight` are the LEAF-estimation channels; `score_der1`/`score_weight` are the
+/// SPLIT-SCORING channels (and the unsplit-gain baseline, which lives inside
+/// `device_best_split_for_node`). On an unsampled fit the caller passes the same slices for
+/// both (byte- and perf-unchanged, D-04). Under a host bootstrap the caller passes
+/// `der1 * sample` / `weight * sample` as the score pair while the leaf pair stays raw —
+/// the `Runtime::grow_tree_on_device` contract verbatim.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grow_region_tree(
     der1: &[f64],
     weight: &[f64],
+    score_der1: &[f64],
+    score_weight: &[f64],
     cindex: &[u32],
     n: usize,
     n_bins: usize,
@@ -96,8 +106,8 @@ pub(crate) fn grow_region_tree(
         // so a beneficial split is required to extend the path — the root splits only when a
         // beneficial candidate exists; a degenerate root errors below).
         let Some(bs) = device_best_split_for_node(
-            &frontier, der1, weight, cindex, n, n_bins, n_features, min_data_in_leaf, scaled_l2,
-            score_fn,
+            &frontier, score_der1, score_weight, cindex, n, n_bins, n_features,
+            min_data_in_leaf, scaled_l2, score_fn,
         )?
         else {
             break;
@@ -108,13 +118,13 @@ pub(crate) fn grow_region_tree(
         // non-splittable child scores `NEG_INFINITY`. Ties prefer the passes (right) child
         // (`>=`), deterministic — the SAME rule as `region_grower`.
         let right_gain = device_best_split_for_node(
-            &bs.right_docs, der1, weight, cindex, n, n_bins, n_features, min_data_in_leaf,
-            scaled_l2, score_fn,
+            &bs.right_docs, score_der1, score_weight, cindex, n, n_bins, n_features,
+            min_data_in_leaf, scaled_l2, score_fn,
         )?
         .map_or(f64::NEG_INFINITY, |b| b.gain);
         let left_gain = device_best_split_for_node(
-            &bs.left_docs, der1, weight, cindex, n, n_bins, n_features, min_data_in_leaf,
-            scaled_l2, score_fn,
+            &bs.left_docs, score_der1, score_weight, cindex, n, n_bins, n_features,
+            min_data_in_leaf, scaled_l2, score_fn,
         )?
         .map_or(f64::NEG_INFINITY, |b| b.gain);
 

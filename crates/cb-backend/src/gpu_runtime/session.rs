@@ -48,8 +48,10 @@ use rayon::prelude::*;
 
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
-    grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
-    DerBinaryKernel, ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
+    grow_oblivious_tree_ordered_resident, grow_oblivious_tree_resident,
+    launch_der_binary_resident, launch_der_param_resident,
+    read_part_stats_f64, upload_channel_floats, DerBinaryKernel, DerParamKernel,
+    ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
     create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
@@ -324,11 +326,20 @@ struct RegionState {
 /// Newton/`calc_average` leaf values with the device weighted-quantile order statistic
 /// ([`device_exact_leaf_delta`]) per leaf, from the host residuals `target - approx`.
 ///
-/// The tree STRUCTURE is grown by the resident RMSE-residual-der path (`der_kernel =
-/// RmseGradient`, the MVP structural der); only the leaf VALUES become the Exact order
-/// statistic. Upstream quantile-der split parity + the full-tree Kaggle oracle are the
-/// Plan-09 sign-off; here the leaf-VALUE numerics are locked ≤1e-4 by the
-/// `kernels::exact_quantile` self-oracle (D-09).
+/// The tree STRUCTURE is grown from the QUANTILE derivative — the same one the CPU path
+/// uses — via [`GpuTrainSession::launch_resident_der1`]'s exact-leaf arm; the leaf VALUES
+/// are then replaced by the device weighted-quantile order statistic.
+///
+/// It did not always work that way. Until FPP-05 this arm borrowed
+/// `DerBinaryKernel::RmseGradient` as an "MVP structural der", so the splits were the ones
+/// an RMSE fit would have chosen while only the leaf values were exact. Measured against
+/// upstream `catboost==1.2.10` that was a **3.4e-2** prediction gap on a 3-tree depth-3 MAE
+/// fit; routing the resident der through the existing `quantile_gradient_kernel` closed it
+/// to **1.390e-8** (MAE) / **7.746e-8** (Quantile α=0.7). See
+/// `crates/cb-train/tests/device_exact_leaf_fit_test.rs`.
+///
+/// The leaf-VALUE numerics remain locked ≤1e-4 by the `kernels::exact_quantile`
+/// self-oracle (D-09).
 struct ExactLeafState {
     /// The quantile level α (loss param for [`Loss::Quantile`], else config default 0.5).
     alpha: f64,
@@ -700,6 +711,44 @@ fn host_weighted_der1(der1: Vec<f64>, weights_uniform: bool, weight: &[f64]) -> 
         .collect()
 }
 
+/// FPP-12 (T08): the host-driven growers' SPLIT-SCORING channel pair under a host
+/// bootstrap sample — `(der1 ⊙ sample, weight ⊙ sample)`.
+///
+/// Returns `None` for an EMPTY sample, so the unsampled path allocates nothing and the
+/// caller reuses the leaf channels for scoring (byte- and perf-unchanged, D-04).
+///
+/// # The double multiplication is CORRECT
+///
+/// `der1` reaching here has ALREADY been through [`host_weighted_der1`], so on a weighted ×
+/// sampled fit the score channel is `w · der1 · s` and the score weight is `w · s`. That
+/// mirrors the oblivious resident arm exactly, which nests
+/// `fold_weights_resident(fold_weights_resident(der1, weight), sample)`. Any reference
+/// implementation compared against this must multiply twice too, or it is chasing a
+/// phantom.
+///
+/// This is a TRANSFORM, not a reduction, so `cb_core::sum_f64` does not apply — every
+/// downstream reduction inside the growers already routes through it.
+fn host_sampled_channels(
+    der1: &[f64],
+    weight: &[f64],
+    sample: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if sample.is_empty() {
+        return None;
+    }
+    let score_der1 = der1
+        .iter()
+        .zip(sample.iter())
+        .map(|(&d, &s)| d * s)
+        .collect();
+    let score_weight = weight
+        .iter()
+        .zip(sample.iter())
+        .map(|(&w, &s)| w * s)
+        .collect();
+    Some((score_der1, score_weight))
+}
+
 /// The fixed-point histogram's accumulated-magnitude ceiling, `2^33` (WR-01 `WR01-S10`,
 /// finding F-D). The split histogram stores `round(Σ · 2^30)` as `i64` bits inside an
 /// `Atomic<u64>`, so the integer sum is exact only while `|Σ| · 2^30 < 2^63`, i.e.
@@ -918,6 +967,12 @@ pub struct GpuTrainSession {
     /// `pairwise` / `ranking` / `multiclass` / `config`).
     #[allow(dead_code)]
     ordered: Option<OrderedState>,
+    /// FPP-20 (T23): the per-fit ordered descriptor, `Some` exactly when [`Self::ordered`] is.
+    /// `perm_h` is the learn permutation resident on device — it drives the per-segment PREFIX
+    /// fills ONLY; routing and the leaf-value reduce stay on the identity `indices_h`.
+    ordered_perm_h: Option<Handle>,
+    ordered_segment_tail_finish: Vec<usize>,
+    ordered_segment_scaled_l2: Vec<f64>,
     /// The per-fit Langevin/SGLB state (Phase 13 Plan 09, GPUT-20). `Some` iff the fit committed to a
     /// covered Langevin config (a covered pointwise der loss with the seeded-Gaussian noise layered
     /// on the resident der); `None` for every non-Langevin path AND for every `*Pairwise` + Langevin
@@ -1070,10 +1125,28 @@ impl GpuTrainSession {
         // dependency, so BOTH the covered and uncovered ordered branches decline to the
         // byte-unchanged CPU grower (D-04 no-regression) — NEVER a fabricated Plain (leakage-prone)
         // pointwise grow on an ordered fit (the pairwise / ranking / multiclass gate precedent).
-        if !boosting_type_is_plain {
-            let _ordered = map_ordered_coverage(loss, config, depth, fold_count);
-            return Ok(None);
-        }
+        // FPP-20 (T23): the ordered arm no longer declines unconditionally. A covered ordered
+        // config that ALSO carries the per-fit `DeviceOrderedConfig` descriptor (the learn
+        // permutation + the body/tail segment table) now reaches the device, where
+        // `grow_oblivious_tree_ordered_resident` grows the STRUCTURE from the segment-summed
+        // score and takes Plain-identical leaf values — which is what upstream does
+        // (`cb-train`'s Ordered arm: "leaf values are Plain-identical; only the split scoring
+        // differs").
+        //
+        // Anything else still returns `Ok(None)` → the byte-unchanged CPU grower, never a
+        // fabricated Plain (leakage-prone) pointwise grow on an ordered fit. Note the
+        // descriptor requirement is a genuine guard, not a formality: `map_ordered_coverage`
+        // says the PARAMS are covered, while the descriptor says the host actually computed
+        // the fold segmentation. Admitting the first without the second would grow an ordered
+        // tree with no segments.
+        let ordered_state = if boosting_type_is_plain {
+            None
+        } else {
+            match map_ordered_coverage(loss, config, depth, fold_count) {
+                Some(st) if config.ordered.is_some() => Some(st),
+                _ => return Ok(None),
+            }
+        };
         if depth == 0 || fold_count != 1 {
             return Ok(None);
         }
@@ -1213,16 +1286,32 @@ impl GpuTrainSession {
                 // knob (`grow_policy=Region`, depth → `MaxLeaves = depth + 1`); every OTHER family
                 // flag must still be the covered default (D-10-01 all-or-nothing PER family: no
                 // subsampling / MVS / exact leaf / CTR / leaf cap). Otherwise decline to CPU.
-                let family_default = config.bootstrap_type == DeviceBootstrapType::No
-                    && config.mvs_lambda.is_none()
+                // FPP-13 (T11): Region × HOST sampling is now covered. The former
+                // `!config.sample_from_host` exclusion existed because the Region grow path
+                // IGNORED the multiplier, so accepting such a config would have silently
+                // dropped the sample. FPP-12 gave `grow_region_tree` real SPLIT-SCORING
+                // channels, so the sample is now consumed rather than dropped.
+                //
+                // `mvs_lambda` is deliberately not required under host sampling: λ lives
+                // host-side inside `cb_train::bootstrap`, so the device field is inert
+                // bookkeeping (the same rule the oblivious `host_sample_covered` arm uses).
+                // Poisson is absent BY DESIGN — it is device-resident and only the
+                // oblivious arm opens the resident sampler.
+                let sampling_covered = if config.sample_from_host {
+                    matches!(
+                        config.bootstrap_type,
+                        DeviceBootstrapType::Bayesian
+                            | DeviceBootstrapType::Bernoulli
+                            | DeviceBootstrapType::Mvs
+                    )
+                } else {
+                    config.bootstrap_type == DeviceBootstrapType::No
+                        && config.mvs_lambda.is_none()
+                };
+                let family_default = sampling_covered
                     && !config.exact_leaf
                     && config.ctr.is_none()
-                    && config.max_leaves.is_none()
-                    // WR-01: Region × sampling is OUT of scope (SPEC §2). Without this the
-                    // Region arm would accept `sample_from_host` + `bootstrap_type == No` and
-                    // then DROP the sample (the Region grow path ignores it) — a silent
-                    // wrong-answer. Decline to the CPU grower instead.
-                    && !config.sample_from_host;
+                    && config.max_leaves.is_none();
                 if !family_default {
                     return Ok(None);
                 }
@@ -1310,14 +1399,23 @@ impl GpuTrainSession {
                 // covered regime (no subsampling / MVS / exact leaf / CTR). Only `grow_policy`
                 // and `max_leaves` (the Lossguide cap) may be non-default — those are THIS
                 // family's own knobs (D-10-01 all-or-nothing PER family).
-                let family_default = config.bootstrap_type == DeviceBootstrapType::No
-                    && config.mvs_lambda.is_none()
-                    && !config.exact_leaf
-                    && config.ctr.is_none()
-                    // WR-01: non-symmetric (Depthwise / Lossguide) × sampling is OUT of scope
-                    // (SPEC §2). Same silent-drop hazard as the Region arm above — the nonsym
-                    // grow path ignores the sample, so decline rather than grow unsampled.
-                    && !config.sample_from_host;
+                // FPP-13 (T11): non-symmetric × HOST sampling is now covered, for the same
+                // reason as the Region arm above — FPP-12 gave `grow_nonsym_tree` real
+                // SPLIT-SCORING channels, so the multiplier is consumed, not dropped.
+                // `max_leaves` stays permitted here: it is this family's own knob.
+                let sampling_covered = if config.sample_from_host {
+                    matches!(
+                        config.bootstrap_type,
+                        DeviceBootstrapType::Bayesian
+                            | DeviceBootstrapType::Bernoulli
+                            | DeviceBootstrapType::Mvs
+                    )
+                } else {
+                    config.bootstrap_type == DeviceBootstrapType::No
+                        && config.mvs_lambda.is_none()
+                };
+                let family_default =
+                    sampling_covered && !config.exact_leaf && config.ctr.is_none();
                 if !family_default {
                     return Ok(None);
                 }
@@ -1575,9 +1673,11 @@ impl GpuTrainSession {
         // only when non-uniform (the overflow guard's input); empty otherwise.
         let weights_uniform = weight.iter().all(|&w| w == 1.0);
         let weight_host = if weights_uniform { Vec::new() } else { weight.to_vec() };
-        // The running approx starts all-zero (the RMSE-from-zero MVP; boost_from_average is
-        // out of scope, the cross-oracle uses the SAME zero start).
-        let approx_h = upload_channel_floats(&client, &vec![0.0_f64; n]);
+        // FPP-01 (CR-01): the running approx starts at the fit's REAL starting approximant.
+        // `config.bias == 0.0` is byte-identical to the former hardcoded zero seed (D-04);
+        // a `boost_from_average=true` fit seeds `mean(y)` (or the loss's own starting
+        // approximant) here, so the first tree's resident `der1` matches the host reference.
+        let approx_h = upload_channel_floats(&client, &vec![config.bias; n]);
 
         // Phase 12 Plan 03: capture the non-symmetric grow state (host-driven; keeps host
         // copies of the bins + weights and re-derives der1 from the caller's approx per tree).
@@ -1651,6 +1751,38 @@ impl GpuTrainSession {
             _ => None,
         };
 
+        // FPP-20 (T23): upload the learn permutation once per FIT (it is fold state, not tree
+        // state) and keep the segment table host-side. All three are empty/None on a Plain fit.
+        let (ordered_perm_h, ordered_segment_tail_finish, ordered_segment_scaled_l2) =
+            match (ordered_state.as_ref(), config.ordered.as_ref()) {
+                (Some(_), Some(oc)) => {
+                    // The permutation indexes der1/weight/leaf_of/cindex, so an out-of-range
+                    // entry would drive an unchecked device read. Validate HOST-side before
+                    // upload — the same discipline the pointwise fill's `indices` guard uses.
+                    if let Some(&bad) = oc.permutation.iter().find(|&&p| (p as usize) >= n) {
+                        return Err(CbError::OutOfRange(format!(
+                            "ordered permutation entry {bad} >= n ({n}); it would read \
+                             der1/leaf_of/cindex out of bounds"
+                        )));
+                    }
+                    if oc.segment_tail_finish.len() != oc.segment_scaled_l2.len() {
+                        return Err(CbError::LengthMismatch {
+                            column: "segment_scaled_l2".to_owned(),
+                            expected: oc.segment_tail_finish.len(),
+                            actual: oc.segment_scaled_l2.len(),
+                        });
+                    }
+                    let h = client
+                        .create(cubecl::bytes::Bytes::from_elems(oc.permutation.clone()));
+                    (
+                        Some(h),
+                        oc.segment_tail_finish.clone(),
+                        oc.segment_scaled_l2.clone(),
+                    )
+                }
+                _ => (None, Vec::new(), Vec::new()),
+            };
+
         Ok(Some(Self {
             client,
             feat_offsets,
@@ -1699,11 +1831,12 @@ impl GpuTrainSession {
             // is gated + declined ABOVE (the multiclass arm returns Ok(None) pending the per-tree
             // shared multi-dim grow seam), so this construction is only ever reached scalar.
             multiclass: None,
-            // Plain path: no ordered state (byte-unchanged, D-04). A covered ordered fit is gated +
-            // declined ABOVE (the ordered arm returns Ok(None) pending the per-tree ordered
-            // permutation-descriptor grow seam), and this construction is only ever reached on the
-            // Plain (`boosting_type_is_plain`) path, so it is never ordered.
-            ordered: None,
+            // FPP-20 (T23): `Some` on a covered ordered fit, `None` on every Plain fit
+            // (byte-unchanged, D-04).
+            ordered: ordered_state,
+            ordered_perm_h,
+            ordered_segment_tail_finish,
+            ordered_segment_scaled_l2,
             // Pointwise path: no Langevin state (byte-unchanged, D-04). A covered Langevin fit records
             // its coverage decision via `map_langevin_coverage` but declines to CPU (the noise
             // coefficient + per-tree grow seam are a forward dependency), and a `*Pairwise` + Langevin
@@ -1764,6 +1897,44 @@ impl GpuTrainSession {
         )
     }
 
+    /// FPP-01 observation point: the RESIDENT `der1` as the split histogram will actually
+    /// see it, read back to the host.
+    ///
+    /// This exists so a seam-level test can assert the resident derivative was seeded from
+    /// the fit's REAL starting approximant ([`DeviceTrainConfig::bias`]) rather than the
+    /// former hardcoded `vec![0.0; n]`. The load-bearing case is a
+    /// `boost_from_average=true` fit: every element would otherwise be off by exactly the
+    /// bias, which the split histogram consumes directly. Catching that here localizes the
+    /// bug at the seam instead of surfacing it as an unattributable ≤1e-5 device-vs-CPU gap.
+    ///
+    /// Read the RESIDENT APPROXIMANT back to the host. Available immediately after
+    /// `begin`, where it must equal `vec![config.bias; n]`.
+    ///
+    /// `pub(crate)` — reachable from the `gpu_runtime` sibling tests, no public surface.
+    /// Its only consumer is `#[cfg(test)]`, so the lib target sees it as unread.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resident_approx_host(&self) -> CbResult<Vec<f64>> {
+        read_part_stats_f64(&self.client, self.approx_h.clone())
+    }
+
+    /// Read the RESIDENT `der1` back to the host.
+    ///
+    /// Returns `None` before the first [`Self::grow_one`] (the resident `der1` is
+    /// initialised lazily on the first grow, from the `approx` seeded at `begin`), and
+    /// surfaces a typed [`CbError`] on a read-back failure — never a silent zero buffer.
+    ///
+    /// **Read the timing carefully**: `grow_one` CHAINS `der1` for the NEXT tree before it
+    /// returns, so after `k` grows this is `der(approx_after_k_trees)`, not tree `k`'s
+    /// derivative. A test that wants the seed's own derivative must neutralise the update
+    /// (e.g. `learning_rate == 0.0`, which leaves the resident approx at the seed).
+    ///
+    /// `pub(crate)` — reachable from the `gpu_runtime` sibling tests, no public surface.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resident_der1_host(&self) -> Option<CbResult<Vec<f64>>> {
+        let handle = self.der1_h.as_ref()?;
+        Some(read_part_stats_f64(&self.client, handle.clone()))
+    }
+
     /// Grow ONE tree over the resident state, advancing the device-resident boosting: it
     /// recomputes the residual `der1` from the resident approx device-side (no read-back),
     /// grows a depth-1 oblivious tree over the resident matrix (uploaded once at `begin`),
@@ -1776,6 +1947,49 @@ impl GpuTrainSession {
     /// a prior call surfaces a typed [`CbError`]. The resident approx is authoritative for the
     /// device pass (in the covered Plain/fold=1/from-zero regime it tracks the caller's approx
     /// exactly). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+    /// Launch the RESIDENT `der1` for this fit, dispatching on the leaf method.
+    ///
+    /// # Why the exact-leaf arm needs its own derivative (FPP-05, the T13 gap)
+    ///
+    /// The split histogram is driven by whatever this returns, so it decides the tree
+    /// STRUCTURE. An exact-leaf fit used to borrow [`DerBinaryKernel::RmseGradient`] here
+    /// — the leaf VALUES were then overwritten with the correct device order statistic,
+    /// but the splits were the ones an RMSE fit would have chosen. Measured against
+    /// upstream `catboost==1.2.10` on a 3-tree depth-3 MAE fit that was a ~3.4e-2
+    /// prediction gap: four orders of magnitude past the ≤1e-5 bar. It stayed invisible
+    /// only because `device_host_eligible` rejected `LeafMethod::Exact` outright until
+    /// FPP-06 admitted it.
+    ///
+    /// MAE and Quantile now route to the SAME [`DerParamKernel::QuantileGradient`] the CPU
+    /// path uses (MAE is Quantile at `α = 0.5`, `δ = 1e-6` — WR-04, no separate MAE
+    /// kernel), so both sides compute the identical derivative by construction.
+    ///
+    /// MAPE keeps the RMSE-residual structural der: its device der would need the
+    /// `weightsWithTargets[i] = weight_i / max(1, |target_i|)` divisor, which this seam
+    /// does not carry. It is unreachable in practice — `validate_leaf_method` rejects
+    /// `Exact` for MAPE on the CPU, so no fit can request it — and `device_exact_leaf_config`
+    /// declines it at the gate. Documented here so the asymmetry is discoverable rather
+    /// than folklore.
+    fn launch_resident_der1(&self, approx_h: Handle, target_h: Handle) -> CbResult<Handle> {
+        match self.exact_leaf.as_ref() {
+            Some(state) if !state.mape => launch_der_param_resident(
+                &self.client,
+                approx_h,
+                target_h,
+                DerParamKernel::QuantileGradient,
+                &[state.alpha, state.delta],
+                self.n,
+            ),
+            _ => launch_der_binary_resident(
+                &self.client,
+                approx_h,
+                target_h,
+                self.der_kernel,
+                self.n,
+            ),
+        }
+    }
+
     pub fn grow_one(
         &mut self,
         approx: &[f64],
@@ -1845,9 +2059,20 @@ impl GpuTrainSession {
                 self.weights_uniform,
                 &rg.weight,
             );
+            // FPP-12 (T08): the host bootstrap sample folds into the SPLIT-SCORING
+            // channels ONLY; leaf estimation stays on the unsampled der/weight
+            // (`Runtime::grow_tree_on_device`'s contract). An empty sample allocates
+            // nothing and reuses the leaf channels — byte- and perf-unchanged (D-04).
+            let sampled = host_sampled_channels(&der1, &rg.weight, sample);
+            let (score_der1, score_weight) = match sampled.as_ref() {
+                Some((d, w)) => (d.as_slice(), w.as_slice()),
+                None => (der1.as_slice(), rg.weight.as_slice()),
+            };
             return grow_region_tree(
                 &der1,
                 &rg.weight,
+                score_der1,
+                score_weight,
                 &rg.bins,
                 self.n,
                 self.n_bins,
@@ -1883,10 +2108,19 @@ impl GpuTrainSession {
                 self.weights_uniform,
                 &ns.weight,
             );
+            // FPP-12 (T08): see the Region arm above — the sample multiplies the SCORE
+            // channels only, and an empty sample reuses the leaf channels verbatim.
+            let sampled = host_sampled_channels(&der1, &ns.weight, sample);
+            let (score_der1, score_weight) = match sampled.as_ref() {
+                Some((d, w)) => (d.as_slice(), w.as_slice()),
+                None => (der1.as_slice(), ns.weight.as_slice()),
+            };
             return grow_nonsym_tree(
                 ns.policy,
                 &der1,
                 &ns.weight,
+                score_der1,
+                score_weight,
                 &ns.bins,
                 self.n,
                 self.n_bins,
@@ -1922,13 +2156,7 @@ impl GpuTrainSession {
                 }
             };
             self.approx_h = upload_channel_floats(&self.client, approx);
-            self.der1_h = Some(launch_der_binary_resident(
-                &self.client,
-                self.approx_h.clone(),
-                target_h,
-                self.der_kernel,
-                self.n,
-            )?);
+            self.der1_h = Some(self.launch_resident_der1(self.approx_h.clone(), target_h)?);
         }
 
         // Upload the target ONCE (first call), then initialise the resident der1 from the
@@ -1936,13 +2164,7 @@ impl GpuTrainSession {
         // already set both handles from the fresh approx, so this init is skipped for it.)
         if self.target_h.is_none() {
             let target_h = upload_channel_floats(&self.client, target);
-            let der1_h = launch_der_binary_resident(
-                &self.client,
-                self.approx_h.clone(),
-                target_h.clone(),
-                self.der_kernel,
-                self.n,
-            )?;
+            let der1_h = self.launch_resident_der1(self.approx_h.clone(), target_h.clone())?;
             self.target_h = Some(target_h);
             self.der1_h = Some(der1_h);
         }
@@ -2142,7 +2364,49 @@ impl GpuTrainSession {
             float_bins: &st.float_bins,
         });
         let approx_h = self.approx_h.clone();
-        let (tree, approx_next, der1_next) = grow_oblivious_tree_resident(
+
+        // FPP-20 (T23): a covered ORDERED fit grows through the segment-summed scorer. Only
+        // the split scoring differs — the leaf values, routing and approx update below are the
+        // Plain ones, which is what upstream's Ordered arm does. `perm_h` drives the per-segment
+        // prefix FILLS only; `indices_h` (identity) still drives routing + the leaf reduce.
+        let ordered_grow = match (self.ordered.as_ref(), self.ordered_perm_h.as_ref()) {
+            (Some(_), Some(perm_h)) => Some(grow_oblivious_tree_ordered_resident(
+                &self.client,
+                approx_h.clone(),
+                &der1_h,
+                &weighted_der1_h,
+                &self.weight_h,
+                &score_der1_h,
+                &score_weight_h,
+                &self.feat_offsets,
+                &self.feat_shifts,
+                &self.feat_masks,
+                &self.cindex_words_h,
+                &self.offsets_h,
+                &self.shifts_h,
+                &self.masks_h,
+                &self.indices_h,
+                perm_h,
+                &target_h,
+                self.num_words,
+                self.n,
+                self.n_bins_line,
+                self.n_bins,
+                self.n_features,
+                &self.real_folds,
+                &self.ordered_segment_tail_finish,
+                &self.ordered_segment_scaled_l2,
+                self.depth,
+                self.scaled_l2,
+                self.learning_rate,
+                self.der_kernel,
+            )?),
+            _ => None,
+        };
+
+        let (tree, approx_next, der1_next) = match ordered_grow {
+            Some(t) => t,
+            None => grow_oblivious_tree_resident(
             &self.client,
             approx_h,
             &der1_h,
@@ -2176,7 +2440,8 @@ impl GpuTrainSession {
             self.learning_rate,
             self.der_kernel,
             ctr_search_view.as_mut(),
-        )?;
+            )?,
+        };
 
         // Advance the resident state for the next tree.
         // IN-03: in the EXACT-leaf arm these two handles are overwritten from the

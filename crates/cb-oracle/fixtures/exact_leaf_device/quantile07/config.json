@@ -1,0 +1,39 @@
+{
+  "scenario": "exact_leaf_device/quantile07",
+  "requirement": "FPP-07 / FPP-08",
+  "seed": 0,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 64,
+  "exact_vs_gradient_max_delta": 0.7215411965150247,
+  "overflow_margin": "n*max(w)*max(|der1|) <= 64*1.0*1.0 = 64 << 2^33 ~= 8.6e9 (margin > 1.3e8x) \u2014 MAE/Quantile der1 is bounded by 1 in magnitude",
+  "border_count_note": "border_count=15 -> n_bins=16 -> pad_hist_line_bins(16)=32, an admitted resident histogram line width (PLAN blocker B-3, resolved)",
+  "description": "EXACT-leaf device-parity fixture, Quantile:alpha=0.7 arm. 64 rows, two float columns, border_count=15, depth-3 x3 iterations, Plain, no sampling, uniform weights, bias 0, L2 score, SymmetricTree, leaf_estimation_method=Exact. Pins the upstream order-statistic leaf the device exact_leaf path (FPP-05) must reproduce at <=1e-5. Paired with the sibling arm so that quantile_alpha is provably load-bearing. NEVER regenerated in CI.",
+  "params": {
+    "iterations": 3,
+    "depth": 3,
+    "learning_rate": 0.3,
+    "l2_leaf_reg": 3.0,
+    "border_count": 15,
+    "boosting_type": "Plain",
+    "permutation_count": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "boost_from_average": false,
+    "leaf_estimation_method": "Exact",
+    "leaf_estimation_iterations": 1,
+    "score_function": "L2",
+    "grow_policy": "SymmetricTree",
+    "random_seed": 0,
+    "thread_count": 1,
+    "verbose": false,
+    "loss_function": "Quantile:alpha=0.7"
+  },
+  "npy_schema": {
+    "borders.npy": "[2,15] f64 \u2014 the FULL frozen quantization border set (feed to train)",
+    "X.npy": "[N,2] f32 \u2014 float feature matrix",
+    "y.npy": "[N] f64 \u2014 target, |y| < 10 by construction",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's parent gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gate."
+}

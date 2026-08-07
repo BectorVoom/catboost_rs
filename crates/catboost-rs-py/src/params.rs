@@ -13,6 +13,24 @@
 //!    it (which would train a silently-wrong model).
 //! 3. **UNKNOWN** — not in the upstream vocabulary at all (likely a typo). We
 //!    REJECT it and suggest the closest vocabulary entry (Levenshtein).
+//! 4. **VALIDATED-INFORMATIONAL** (FPP-16) — a real upstream parameter this project
+//!    honours by VALIDATING CONSISTENCY rather than by changing behaviour. It is tagged
+//!    IMPLEMENTED (so it is accepted, not reported as a parity gap) but has no
+//!    [`CatBoostBuilder`] setter, because there is nothing for it to set.
+//!
+//!    `task_type` is the only member today. Backend selection in catboost-rs is a
+//!    COMPILE-TIME Cargo feature (`cpu` / `cuda` / `rocm` / `wgpu`) — see CLAUDE.md's
+//!    Constraints — so no runtime value could switch it. Accepting the parameter silently
+//!    would be dishonest in the same way category 2 warns about: a caller who wrote
+//!    `task_type="GPU"` and got a CPU model would have a silently-wrong result. So
+//!    `"CPU"` is always accepted and inert, `"GPU"` is accepted only when the wheel was
+//!    actually built with a device backend, and anything else is an error listing the
+//!    legal values.
+//!
+//!    This IS observable behaviour, which is what makes it honest rather than a no-op: an
+//!    inconsistent request fails loudly. What it deliberately does NOT do is change the
+//!    trained model — pinned by a pytest asserting bit-identical predictions with and
+//!    without `task_type="CPU"`.
 //!
 //! Validation runs at `fit()` time (D-06), NOT in `__init__`, so the sklearn
 //! "no work in `__init__`" contract (08-05) holds.
@@ -64,6 +82,11 @@ pub(crate) enum ParamStatus {
 /// setter applied in [`build_and_fit`]. Used both for the registry tag and as the
 /// alias-resolution target set.
 const IMPLEMENTED: &[&str] = &[
+    // FPP-16: VALIDATED-INFORMATIONAL (see the module doc's category 4). `task_type` has
+    // no `CatBoostBuilder` setter and never will — backend selection here is a Cargo
+    // feature, decided at compile time — so it is "implemented" in the sense that we
+    // honour it by VALIDATING it against the wheel, not by acting on it.
+    "task_type",
     "iterations",
     "learning_rate",
     "depth",
@@ -392,11 +415,69 @@ fn closest_match(name: &str) -> &'static str {
 ///
 /// # Errors
 /// `CatBoostParameterError` on the first KnownNotYet or unknown kwarg.
+/// Whether this wheel was built with a device backend feature. Backend selection in
+/// catboost-rs is COMPILE-TIME only (a Cargo feature), which is why `task_type` can be
+/// validated but never acted on.
+const DEVICE_FEATURE_COMPILED: bool =
+    cfg!(any(feature = "wgpu", feature = "cuda", feature = "rocm"));
+
+/// The legal `task_type` values, in the order the error message lists them.
+const TASK_TYPE_VALUES: &[&str] = &["CPU", "GPU"];
+
+/// The exact user-facing message for `task_type="GPU"` on a CPU-only wheel. Pinned as a
+/// constant because it IS the contract — the tests assert it verbatim.
+pub(crate) const TASK_TYPE_GPU_ON_CPU_WHEEL: &str =
+    "task_type=\"GPU\" requires a wheel built with a device backend feature (--features \
+     cuda, rocm, or wgpu); this wheel was built with --features cpu. Backend selection in \
+     catboost-rs is compile-time only (see CLAUDE.md), so task_type cannot switch backends \
+     at runtime.";
+
+/// FPP-16: validate `task_type` against the wheel this code was compiled into.
+///
+/// `None` is inert — upstream's universal "not set" (the [`get`] convention). `"CPU"` is
+/// always accepted and changes nothing. `"GPU"` is accepted only on a wheel built with a
+/// device backend feature; on a `cpu`-only wheel it is an ERROR, because silently training
+/// on the CPU after an explicit `task_type="GPU"` is exactly the silently-wrong-model
+/// failure this module's honesty policy exists to prevent.
+///
+/// A wrong VALUE is not a wrong NAME: the error lists the legal values rather than
+/// offering a Levenshtein suggestion, which would be nonsense here.
+fn validate_task_type(py: Python<'_>, value: &Py<PyAny>) -> PyResult<()> {
+    let bound = value.bind(py);
+    if bound.is_none() {
+        return Ok(());
+    }
+    let Ok(requested) = bound.extract::<String>() else {
+        return Err(CatBoostParameterError::new_err(format!(
+            "parameter `task_type` must be a string, one of {TASK_TYPE_VALUES:?}"
+        )));
+    };
+    if requested.eq_ignore_ascii_case("CPU") {
+        return Ok(());
+    }
+    if requested.eq_ignore_ascii_case("GPU") {
+        if DEVICE_FEATURE_COMPILED {
+            return Ok(());
+        }
+        return Err(CatBoostParameterError::new_err(TASK_TYPE_GPU_ON_CPU_WHEEL));
+    }
+    Err(CatBoostParameterError::new_err(format!(
+        "parameter `task_type` has an unknown value `{requested}`; the legal values are \
+         {TASK_TYPE_VALUES:?}"
+    )))
+}
+
 pub(crate) fn validate_params(params: &BTreeMap<String, Py<PyAny>>) -> PyResult<()> {
-    for name in params.keys() {
+    for (name, value) in params {
         let canonical = resolve_alias(name);
         match status_of(canonical) {
-            Some(ParamStatus::Implemented) => {}
+            Some(ParamStatus::Implemented) => {
+                // FPP-16: the one VALIDATED-INFORMATIONAL param needs its VALUE checked
+                // here; every other Implemented param is checked by its builder setter.
+                if canonical == "task_type" {
+                    Python::attach(|py| validate_task_type(py, value))?;
+                }
+            }
             Some(ParamStatus::KnownNotYet) => {
                 let detail = if canonical == name.as_str() {
                     format!(

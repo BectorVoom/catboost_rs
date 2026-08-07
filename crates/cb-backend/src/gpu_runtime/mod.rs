@@ -61,7 +61,9 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     apply_leaf_delta_kernel,
     apply_oblivious_float_kernel,
-    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
+    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, copy_u64_block_kernel,
+    find_optimal_split_kernel,
+    find_optimal_split_ordered_kernel,
     find_optimal_split_partition_kernel,
     focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
@@ -686,6 +688,11 @@ pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFin
 // ===========================================================================
 
 mod der_seams; // Phase 7.2 der1/der2 seam (DerBinaryKernel/.../launch_der_*).
+
+// FPP-05: self-oracle for the RESIDENT parametric der seam (`launch_der_param_resident`),
+// which closed the exact-leaf structural-derivative gap. Source/test separation.
+#[cfg(test)]
+mod der_seams_resident_test;
 pub use der_seams::*;
 
 mod pairwise; // Phase 7.4/7.5 pairwise histogram + scan/score + pairwise grow driver.
@@ -785,6 +792,14 @@ mod cindex_one_hot_test;
 //       --lib gpu_runtime::one_hot_split_score_test
 #[cfg(all(test, not(feature = "cpu")))]
 mod one_hot_split_score_test;
+
+// T22 / FPP-19: the ORDERED per-segment split scorer. Drives the private
+// `score_ordered_over_segment_binsums`, so it must likewise be a `gpu_runtime` descendant,
+// and it carries the same `CUBE_COUNT` cpu-backend limitation as the one-hot scorer test:
+//   cargo test -p cb-backend --no-default-features --features rocm \
+//       --lib gpu_runtime::ordered_split_score_test
+#[cfg(all(test, not(feature = "cpu")))]
+mod ordered_split_score_test;
 
 // T26 / SPEC-OH-23: the split APPLICATION's one-hot (EQUALITY) arm. Same `pub(crate)`
 // visibility reason, and the same `CUBE_COUNT` cpu-backend limitation
@@ -2554,6 +2569,7 @@ pub(crate) fn launch_partition_hist2_resident_into(
                         leaf_of_h.clone(),
                         num_words,
                         n,
+                        /* n_visit = */ n,
                         n_parts,
                         n_features,
                         total,
@@ -2646,6 +2662,7 @@ pub(crate) fn launch_partition_hist2_resident_into(
         leaf_of_h,
         num_words,
         n,
+        /* n_visit = */ n,
         n_parts,
         n_features,
         total,
@@ -2705,6 +2722,143 @@ static HIST_FILL_PROBED: std::sync::LazyLock<
 /// `Atomic<u64>` adds, and folds the copies into copy 0 (integer adds — exact,
 /// order-independent, GPUT-06).
 #[allow(clippy::too_many_arguments)]
+/// Copy the whole `src` u64 buffer into `dst` starting at `dst_offset` (FPP-19, T22).
+///
+/// Used to pack the ordered path's per-segment PREFIX histograms — each a separate handle from
+/// [`launch_partition_hist2_prefix_into`] — into the one contiguous array
+/// [`find_optimal_split_ordered_kernel`] indexes as `seg * seg_stride + ...`. Stays device-side:
+/// the bulk histogram never crosses to host (D-05).
+pub(crate) fn launch_copy_u64_block(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    src: Handle,
+    src_len: usize,
+    dst: Handle,
+    dst_len: usize,
+    dst_offset: usize,
+) -> CbResult<()> {
+    if src_len == 0 {
+        return Ok(());
+    }
+    // Host-side precondition for the kernel's unchecked `dst[base + i]` store.
+    if dst_offset.saturating_add(src_len) > dst_len {
+        return Err(CbError::OutOfRange(format!(
+            "copy_u64_block: dst_offset ({dst_offset}) + src_len ({src_len}) exceeds dst_len ({dst_len})"
+        )));
+    }
+    let dst_offset_u32 = u32::try_from(dst_offset).map_err(|_| {
+        CbError::OutOfRange(format!("copy_u64_block: dst_offset ({dst_offset}) exceeds u32"))
+    })?;
+    let num_cubes = src_len.div_ceil(HIST_CUBE_DIM).max(1);
+    copy_u64_block_kernel::launch::<SelectedRuntime>(
+        client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim { x: HIST_CUBE_DIM as u32, y: 1, z: 1 },
+        unsafe { ArrayArg::from_raw_parts(src, src_len) },
+        unsafe { ArrayArg::from_raw_parts(dst, dst_len) },
+        dst_offset_u32,
+    );
+    Ok(())
+}
+
+/// The ORDERED path's permutation-PREFIX histogram fill (FPP-19, T22).
+///
+/// Identical to [`launch_partition_hist2_resident_into`] except that it visits only the FIRST
+/// `n_visit` entries of `indices_h`. Driven with `indices_h = permutation` and
+/// `n_visit = tail_finish_s`, it produces segment `s`'s histogram — the whole "segmented fill"
+/// problem, solved without a new kernel (see the T21 design note).
+///
+/// Why `n` and `n_visit` must stay separate: the kernel bounds its grid-stride loop by
+/// `indices.len()`, but indexes `der1[obj]`, `weight[obj]`, `leaf_of[obj]` and
+/// `cindex[feature*n + obj]` by `indices[i]`, whose VALUES range over `0..n`. Shortening the
+/// object arrays alongside `indices` would read out of bounds on any non-identity permutation.
+///
+/// Always takes the MULTI-COPY arm: the LDS arm's tile compression is keyed to the grow loop's
+/// `filter_mask == half` invariant, and the ordered path deliberately runs with
+/// `filter_mask == 0` (no subtraction trick — correctness first, per the T21 note). Both arms
+/// are bit-identical anyway, so this costs only the LDS arm's throughput, on a path whose
+/// prefix fills already total under 2n object-visits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_hist2_prefix_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1_h: Handle,
+    weight_h: Handle,
+    cindex_words_h: Handle,
+    offsets_h: Handle,
+    shifts_h: Handle,
+    masks_h: Handle,
+    indices_h: Handle,
+    leaf_of_h: Handle,
+    num_words: usize,
+    n: usize,
+    n_visit: usize,
+    n_bins: usize,
+    n_features: usize,
+    level: u32,
+) -> CbResult<Handle> {
+    let n_parts = 1usize.checked_shl(level).ok_or_else(|| {
+        CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+    })?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let total = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
+        ))
+    })?;
+
+    if n == 0 || n_visit == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+    // A prefix longer than the pool is a wiring bug, not a clamp-and-continue condition: it
+    // would declare `indices` past its allocation.
+    if n_visit > n {
+        return Err(CbError::OutOfRange(format!(
+            "ordered prefix fill: n_visit ({n_visit}) exceeds n ({n})"
+        )));
+    }
+    if !device_supports_u64_atomic_add(client) {
+        return Err(CbError::Unsupported(
+            "ordered prefix histogram fill requires Atomic<u64> add, which the active backend \
+             does not advertise (cpu/wgpu lack u64 atomics — use the rocm/cuda backend)"
+                .to_owned(),
+        ));
+    }
+    let bits: u32 = match n_bins {
+        32 => 5,
+        64 => 6,
+        128 => 7,
+        256 => 8,
+        _ => {
+            return Err(CbError::Degenerate(format!(
+                "ordered prefix fill expects n_bins in {{32,64,128,256}}, got {n_bins}"
+            )));
+        }
+    };
+
+    launch_partition_hist2_multicopy(
+        client,
+        der1_h,
+        weight_h,
+        cindex_words_h,
+        offsets_h,
+        shifts_h,
+        masks_h,
+        indices_h,
+        leaf_of_h,
+        num_words,
+        n,
+        n_visit,
+        n_parts,
+        n_features,
+        total,
+        /* filter_mask = */ 0,
+        bits,
+    )
+}
+
 fn launch_partition_hist2_multicopy(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     der1_h: Handle,
@@ -2717,6 +2871,13 @@ fn launch_partition_hist2_multicopy(
     leaf_of_h: Handle,
     num_words: usize,
     n: usize,
+    // FPP-19 (T22): the number of `indices` entries to VISIT, which the ordered prefix fill
+    // makes distinct from `n` (the object count). The kernel bounds its grid-stride loop by
+    // `indices.len()`, so declaring `indices` at `n_visit` while `der1`/`weight`/`leaf_of`
+    // stay at `n` is what makes a permutation-PREFIX fill safe: the visited object ids still
+    // range over `0..n`, so shortening the object arrays too would read out of bounds.
+    // Every non-ordered caller passes `n_visit == n`, which is byte-unchanged.
+    n_visit: usize,
     n_parts: usize,
     n_features: usize,
     total: usize,
@@ -2750,7 +2911,7 @@ fn launch_partition_hist2_multicopy(
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
     );
 
-    let num_cubes = n.div_ceil(HIST_CUBE_DIM).max(1);
+    let num_cubes = n_visit.div_ceil(HIST_CUBE_DIM).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = hist_dim;
 
@@ -2770,7 +2931,7 @@ fn launch_partition_hist2_multicopy(
         unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
-        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n_visit) },
         unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
         n_features as u32,
@@ -2790,7 +2951,7 @@ fn launch_partition_hist2_multicopy(
         unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
-        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n_visit) },
         unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
         n_features as u32,
@@ -3266,6 +3427,185 @@ fn score_partition_over_binsums(
                 continue;
             }
         } else if cand_border >= n_bins_used - 1 {
+            continue;
+        }
+        let take = gain > best_gain || (gain == best_gain && cand < best_c);
+        if take {
+            best_gain = gain;
+            best_c = cand;
+        }
+    }
+
+    if (best_c as usize) < n_candidates {
+        let feature = (best_c as usize) / n_bins;
+        let bin = (best_c as usize) % n_bins;
+        return Ok(Some(BestSplit {
+            feature_id: feature as u32,
+            bin_id: bin as u32,
+            score: best_gain as f32,
+            gain: best_gain as f32,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// The ORDERED-boosting sibling of [`score_partition_over_binsums`] (FPP-19, T22): score every
+/// candidate as the SUM over the fold's body/tail segments and return the single winning
+/// [`BestSplit`], with only the O(blocks) per-block winner descriptors crossing back (D-05).
+///
+/// `bin_sums` holds the `scaled_l2_per_segment.len()` PREFIX histograms back to back, ascending
+/// by `tail_finish` — each one exactly the line the unchanged partition fill writes when driven
+/// with `indices = permutation` and `n = tail_finish_s`. `scaled_l2_per_segment[s]` is that
+/// segment's `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)`.
+///
+/// L2 only — [`find_optimal_split_ordered_kernel`]'s doc explains why the ordered path cannot
+/// carry a `score_fn` selector. Threshold splits only. Returns `None` on a degenerate level.
+#[allow(clippy::too_many_arguments)]
+fn score_ordered_over_segment_binsums(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    bin_sums: Handle,
+    n_parts: usize,
+    n_bins: usize,
+    n_bins_used: usize,
+    n_features: usize,
+    scaled_l2_per_segment: &[f64],
+    real_folds: &[u32],
+) -> CbResult<Option<BestSplit>> {
+    if n_bins_used == 0 || n_bins_used > n_bins {
+        return Err(CbError::OutOfRange(format!(
+            "n_bins_used ({n_bins_used}) must be in 1..=n_bins ({n_bins})"
+        )));
+    }
+    // Empty short-circuit (Pitfall 3/5), including the no-segment case: a fold with no
+    // body/tail segment has nothing to score, and must not launch with a zero-length lambda
+    // array the kernel would index.
+    if n_parts == 0 || n_features == 0 || n_bins == 0 || scaled_l2_per_segment.is_empty() {
+        return Ok(None);
+    }
+    if real_folds.len() != n_features {
+        return Err(CbError::LengthMismatch {
+            column: "real_folds".to_owned(),
+            expected: n_features,
+            actual: real_folds.len(),
+        });
+    }
+
+    let n_segments = scaled_l2_per_segment.len();
+    let n_candidates = n_features.checked_mul(n_bins).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (candidate count)"
+        ))
+    })?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let seg_stride = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
+        ))
+    })?;
+    let bin_sums_len = seg_stride.checked_mul(n_segments).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "seg_stride ({seg_stride}) * n_segments ({n_segments}) overflows usize \
+             (segmented binSums length)"
+        ))
+    })?;
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
+    })?;
+    let n_parts_u32 = u32::try_from(n_parts).map_err(|_| {
+        CbError::OutOfRange(format!("n_parts ({n_parts}) exceeds u32 device range"))
+    })?;
+    let n_segments_u32 = u32::try_from(n_segments).map_err(|_| {
+        CbError::OutOfRange(format!("n_segments ({n_segments}) exceeds u32 device range"))
+    })?;
+
+    // Same geometry as the partition scorer: one CUBE_DIM-thread cube per CUBE_DIM candidates.
+    let num_cubes = n_candidates.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+    let real_folds_h = client.create(cubecl::bytes::Bytes::from_elems(real_folds.to_vec()));
+
+    #[cfg(feature = "wgpu")]
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(
+            scaled_l2_per_segment.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        ));
+        find_optimal_split_ordered_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, n_segments) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), real_folds.len()) },
+            n_parts_u32,
+            n_features as u32,
+            n_bins_used as u32,
+            /* feature_lo = */ 0,
+            n_features as u32,
+            n_segments_u32,
+            n_bins_u32,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h =
+            client.create(cubecl::bytes::Bytes::from_elems(scaled_l2_per_segment.to_vec()));
+        find_optimal_split_ordered_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, n_segments) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), real_folds.len()) },
+            n_parts_u32,
+            n_features as u32,
+            n_bins_used as u32,
+            /* feature_lo = */ 0,
+            n_features as u32,
+            n_segments_u32,
+            n_bins_u32,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    let (best_gains, best_idx) = read_gain_and_idx(client, best_gain_handle, best_idx_handle)?;
+    if best_gains.len() != num_cubes || best_idx.len() != num_cubes {
+        return Err(CbError::Degenerate(format!(
+            "ordered best-split read-back returned {}/{} slots, expected {num_cubes}/{num_cubes}",
+            best_gains.len(),
+            best_idx.len()
+        )));
+    }
+
+    // Across-block argmin with the SAME strict-`>` / lowest-index tie-break the kernel uses.
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut best_c = u32::MAX;
+    for (block, &gain) in best_gains.iter().enumerate() {
+        let cand = best_idx.get(block).copied().unwrap_or(u32::MAX);
+        if (cand as usize) >= n_candidates {
+            continue;
+        }
+        let cand_border = (cand as usize) % n_bins;
+        // Host belt mirroring the kernel's threshold eligibility (WR-05).
+        if cand_border >= n_bins_used - 1 {
             continue;
         }
         let take = gain > best_gain || (gain == best_gain && cand < best_c);
@@ -4038,6 +4378,269 @@ fn resident_phantom_bucket_count(float_leaf_of: &[usize], cat_bucket: &[u32]) ->
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Grow ONE oblivious tree under ORDERED boosting, device-resident (FPP-19, T22).
+///
+/// # What differs from [`grow_oblivious_tree_resident`], and what deliberately does not
+///
+/// **Only the split SCORING differs.** Per level this fills one histogram per body/tail
+/// segment — the UNCHANGED partition fill driven with `indices = perm_h` and
+/// `n_visit = segment_tail_finish[s]` ([`launch_partition_hist2_prefix_into`]) — packs them
+/// into one array and scores each candidate as the segment SUM
+/// ([`score_ordered_over_segment_binsums`]).
+///
+/// Everything after the argmin is the Plain path verbatim: routing
+/// ([`launch_partition_split_packed_into`]), the `2^depth` part-stat reduce, `calc_average`
+/// leaf values, the resident approx update and the next-tree der recompute. That is not a
+/// shortcut — it is what upstream does. `cb-train`'s ordered branch grows the STRUCTURE on the
+/// learning fold's segments and then "estimates the leaf VALUES on the AVERAGING fold exactly
+/// as Plain (`CalcLeafValuesSimple` — leaf values are Plain-identical; only the split scoring
+/// differs)" (`cb-train/src/boosting.rs`, the `EBoostingType::Ordered` arm). The
+/// `gpu_runtime::ordered` approximant trajectory is a SEPARATE concern (the anti-leakage
+/// per-object approx used for derivatives) and is NOT on this leaf-value path.
+///
+/// # Permutation vs identity — the wiring that must not be crossed
+///
+/// `perm_h` (the learn permutation) drives the FILLS only. `indices_h` (the session's identity
+/// order) drives ROUTING and the part-stat reduce, because `launch_partition_split_*` requires
+/// `indices` to cover `0..n` and the leaf-value reduce must see every object exactly once.
+/// Swapping them silently trains on a subset.
+///
+/// # Scope
+///
+/// Float threshold splits, L2 only, no CTR / one-hot / sampling / subtraction trick. The
+/// coverage gate admits nothing else; anything it rejects trains on the CPU grower unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grow_oblivious_tree_ordered_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx_h: Handle,
+    der1_h: &Handle,
+    leaf_der1_h: &Handle,
+    weight_h: &Handle,
+    score_der1_h: &Handle,
+    score_weight_h: &Handle,
+    feat_offsets: &[u32],
+    feat_shifts: &[u32],
+    feat_masks: &[u32],
+    cindex_words_h: &Handle,
+    offsets_h: &Handle,
+    shifts_h: &Handle,
+    masks_h: &Handle,
+    // The IDENTITY visiting order — routing + part-stats.
+    indices_h: &Handle,
+    // The LEARN PERMUTATION — the per-segment prefix fills.
+    perm_h: &Handle,
+    target_h: &Handle,
+    num_words: usize,
+    n: usize,
+    n_bins: usize,
+    n_bins_used: usize,
+    n_features: usize,
+    real_folds: &[u32],
+    // Per-segment `tail_finish` (ascending) — each is a prefix length over `perm_h`.
+    segment_tail_finish: &[usize],
+    // Per-segment `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)`.
+    segment_scaled_l2: &[f64],
+    depth: usize,
+    scaled_l2: f64,
+    learning_rate: f64,
+    der_kernel: DerBinaryKernel,
+) -> CbResult<(GrownTree, Handle, Handle)> {
+    if n == 0 || n_features == 0 || n_bins == 0 || depth == 0 {
+        return Ok((
+            GrownTree {
+                splits: Vec::new(),
+                leaf_of: vec![0u32; n],
+                leaf_values: Vec::new(),
+                part_stats: Vec::new(),
+            },
+            approx_h,
+            der1_h.clone(),
+        ));
+    }
+    if segment_tail_finish.len() != segment_scaled_l2.len() {
+        return Err(CbError::LengthMismatch {
+            column: "segment_scaled_l2".to_owned(),
+            expected: segment_tail_finish.len(),
+            actual: segment_scaled_l2.len(),
+        });
+    }
+    if segment_tail_finish.is_empty() {
+        return Err(CbError::Degenerate(
+            "ordered grow: empty body/tail segment list".to_owned(),
+        ));
+    }
+
+    let n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+
+    let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
+    let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(depth);
+
+    for level in 0..depth {
+        let n_parts = 1usize.checked_shl(level as u32).ok_or_else(|| {
+            CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+        })?;
+        let seg_stride = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (segment stride)"
+            ))
+        })?;
+        let total_len = seg_stride.checked_mul(segment_tail_finish.len()).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "seg_stride ({seg_stride}) * n_segments ({}) overflows usize",
+                segment_tail_finish.len()
+            ))
+        })?;
+
+        // (1) One PREFIX fill per segment, packed back to back. No subtraction trick
+        //     (`filter_mask == 0` inside the prefix fill) — the prefix lengths are
+        //     geometric, so all segments together are under 2n object-visits.
+        let packed_hist = client.empty(total_len * std::mem::size_of::<u64>());
+        for (s, &tail_finish) in segment_tail_finish.iter().enumerate() {
+            let visit = tail_finish.min(n);
+            if visit == 0 {
+                continue;
+            }
+            let seg_h = launch_partition_hist2_prefix_into(
+                client,
+                score_der1_h.clone(),
+                score_weight_h.clone(),
+                cindex_words_h.clone(),
+                offsets_h.clone(),
+                shifts_h.clone(),
+                masks_h.clone(),
+                // The PERMUTATION — this is the segmented fill.
+                perm_h.clone(),
+                leaf_of_h.clone(),
+                num_words,
+                n,
+                visit,
+                n_bins,
+                n_features,
+                level as u32,
+            )?;
+            launch_copy_u64_block(
+                client,
+                seg_h,
+                seg_stride,
+                packed_hist.clone(),
+                total_len,
+                s * seg_stride,
+            )?;
+        }
+
+        // (2) Segment-summed score + deterministic argmin (the sole D-05 crossing).
+        let best = score_ordered_over_segment_binsums(
+            client,
+            packed_hist,
+            n_parts,
+            n_bins,
+            n_bins_used,
+            n_features,
+            segment_scaled_l2,
+            real_folds,
+        )?;
+        let split = match best {
+            Some(b) => b,
+            None => {
+                return Err(CbError::Degenerate(format!(
+                    "ordered grow level {level}: no candidate split available"
+                )))
+            }
+        };
+        splits.push((split.feature_id, split.bin_id, false));
+
+        // (3) Route over the IDENTITY order (never the permutation — see the fn doc).
+        let fi = split.feature_id as usize;
+        let (split_offset, split_shift, split_mask) =
+            match (feat_offsets.get(fi), feat_shifts.get(fi), feat_masks.get(fi)) {
+                (Some(&o), Some(&s), Some(&m)) => (o, s, m),
+                _ => {
+                    return Err(CbError::OutOfRange(format!(
+                        "ordered grow level {level}: split feature {fi} out of the \
+                         {n_features}-feature packed descriptor table"
+                    )))
+                }
+            };
+        leaf_of_h = launch_partition_split_packed_into(
+            client,
+            der1_h.clone(),
+            cindex_words_h.clone(),
+            indices_h.clone(),
+            leaf_of_h,
+            n,
+            num_words,
+            split_offset,
+            split_shift,
+            split_mask,
+            split.bin_id,
+            level as u32,
+            /* one_hot = */ false,
+        )?;
+    }
+
+    // (4) Plain-identical leaf values: the 2^depth part-stat reduce over the IDENTITY order.
+    let der2_rmse_h = create_channel_const(client, -1.0, n);
+    let part_stats_h = launch_partition_update_into(
+        client,
+        leaf_der1_h.clone(),
+        weight_h.clone(),
+        der2_rmse_h,
+        indices_h.clone(),
+        leaf_of_h.clone(),
+        n,
+        n_leaves,
+    )?;
+    let (part_stats, leaf_of) =
+        read_part_stats_and_leaf_of(client, part_stats_h, leaf_of_h.clone())?;
+
+    let mut leaf_values = vec![0.0_f64; n_leaves];
+    for leaf in 0..n_leaves {
+        let sum = part_stats.get(leaf * 3).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 3 + 1).copied().unwrap_or(0.0);
+        if let Some(slot) = leaf_values.get_mut(leaf) {
+            *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
+        }
+    }
+
+    // (5)/(6) Resident approx update + next-tree der recompute — unchanged.
+    let approx_h =
+        launch_apply_leaf_delta_into(client, approx_h, leaf_of_h, &leaf_values, learning_rate, n)?;
+    let der1_next =
+        launch_der_binary_resident(client, approx_h.clone(), target_h.clone(), der_kernel, n)?;
+
+    // Same `CB_GPU_PROF tree` observability the Plain resident grow emits. This is not
+    // decoration: it is the ONLY signal that distinguishes "the ordered device arm ran" from
+    // "the gate declined and the CPU grower produced an identical-looking answer". An oracle
+    // that passes either way proves nothing, and the ordered fixture passes on CPU by
+    // construction. Emitted unconditionally per tree (cold unless CB_GPU_PROF is set).
+    if gpu_prof_enabled() {
+        prof_sync(client);
+        eprintln!(
+            "CB_GPU_PROF tree ORDERED n={n} nf={n_features} bins={n_bins} depth={depth} \
+             segments={}",
+            segment_tail_finish.len()
+        );
+    }
+
+    Ok((
+        GrownTree {
+            splits,
+            leaf_of,
+            leaf_values,
+            part_stats,
+        },
+        approx_h,
+        der1_next,
+    ))
+}
+
 pub(crate) fn grow_oblivious_tree_resident(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx_h: Handle,

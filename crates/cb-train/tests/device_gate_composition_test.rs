@@ -7,9 +7,10 @@
 //! 2. `weighted_plus_ctr_admits_together` — the POSITIVE composition: non-uniform
 //!    weights × CTR commit to the device TOGETHER and match upstream
 //!    `catboost==1.2.10` (`predictions_weighted.npy`) at ≤1e-5 (scenario 6).
-//! 3. `depthwise_plus_bayesian_bootstrap_still_declines` — an exclusion UNRELATED
-//!    to this phase (the bootstrap × grow-policy cross-product) is still excluded
-//!    (scenario 7).
+//! 3. `depthwise_plus_bayesian_bootstrap_commits` — the bootstrap × grow-policy
+//!    cross-product, which was excluded when this file was written and is now COVERED
+//!    (FPP-12/FPP-13). Kept here as a composition guard: relaxing that cross-product must
+//!    not disturb the two exclusions above.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::float_cmp)]
 
 use cb_compute::{EScoreFunction, LeafMethod, Loss};
@@ -68,7 +69,9 @@ mod device {
 
     use super::base_params;
     use cb_backend::GpuBackend;
-    use cb_compute::{DeviceGrownTree, DeviceTrainConfig, EScoreFunction, Loss, Runtime};
+    use cb_compute::{
+        DeviceGrownTree, DeviceTrainConfig, EScoreFunction, FamilyTreeArgs, Loss, Runtime,
+    };
     use cb_core::CbResult;
     use cb_data::stringify_int_category;
     use cb_model::Model as CbModel;
@@ -130,8 +133,9 @@ mod device {
             approx: &[f64],
             target: &[f64],
             sample: &[f64],
+        family: Option<&FamilyTreeArgs<'_>>,
         ) -> CbResult<Option<DeviceGrownTree>> {
-            let out = self.inner.grow_tree_on_device(approx, target, sample)?;
+            let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
                 self.grown.set(self.grown.get() + 1);
             }
@@ -211,7 +215,7 @@ mod device {
     }
 
     /// GDC-19.3: an exclusion untouched by this phase is STILL excluded.
-    pub fn depthwise_plus_bayesian_declines() {
+    pub fn depthwise_plus_bayesian_commits() {
         let n = 64usize;
         let f0: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let borders0: Vec<f64> = (0..31).map(|k| k as f64 + 0.5).collect();
@@ -230,11 +234,17 @@ mod device {
         };
         let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
         train(&gpu, &[f0], &[borders0], &target, &[], &params, None)
-            .expect("depthwise+bayesian CPU fit must succeed");
+            .expect("depthwise+bayesian fit must succeed");
+        // FPP-13 (T11): this assertion is INVERTED. Depthwise × Bayesian used to decline
+        // because the non-symmetric grower IGNORED the per-object bootstrap multiplier, so
+        // the backend refused rather than silently drop it. FPP-12 (T08) gave the grower
+        // real SPLIT-SCORING channels, and FPP-13 removed the
+        // `bootstrap_type × grow_policy == SymmetricTree` restriction, so this cell now
+        // COMMITS. The full cross-product is covered by device_nonsym_bootstrap_gate_test.
         assert_eq!(
             gpu.grown.get(),
-            0,
-            "Depthwise × Bayesian must still decline (the untouched cross-product clause)"
+            params.iterations,
+            "Depthwise × Bayesian is device-eligible since FPP-13 and must COMMIT"
         );
     }
 }
@@ -262,9 +272,9 @@ fn weighted_plus_ctr_admits_together() {
 }
 
 #[test]
-fn depthwise_plus_bayesian_bootstrap_still_declines() {
+fn depthwise_plus_bayesian_bootstrap_commits() {
     #[cfg(any(feature = "rocm", feature = "cuda"))]
-    device::depthwise_plus_bayesian_declines();
+    device::depthwise_plus_bayesian_commits();
     #[cfg(not(any(feature = "rocm", feature = "cuda")))]
     {
         let _ = (base_params(), EGrowPolicy::Depthwise, EBootstrapType::Bayesian);
