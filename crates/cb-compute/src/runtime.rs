@@ -1215,6 +1215,21 @@ pub struct DeviceTrainConfig {
     pub mvs_lambda: Option<f64>,
     /// The pinned per-fit RNG seed (device-resident sampling reproducibility, Plan 06/07).
     pub rng_seed: u64,
+    /// FPP-01 (CR-01). The per-fit STARTING APPROXIMANT (`starting_approx` in
+    /// `cb_train::boosting`), i.e. what `boost_from_average` computes.
+    ///
+    /// `0.0` — the default — reproduces the former hardcoded `vec![0.0_f64; n]` resident
+    /// seed EXACTLY, so every fit that does not set it is byte-unchanged (D-04). A
+    /// non-zero value seeds the resident approximant to `vec![bias; n]` so a
+    /// `boost_from_average=true` fit (upstream's RMSE default, and this project's
+    /// `CatBoostBuilder` default) can reach the device at all.
+    ///
+    /// Only the OBLIVIOUS resident arm consumes this seed. The Region, non-symmetric and
+    /// exact-leaf arms re-derive `der1` from the CALLER's `approx` via `host_der1`, and
+    /// the caller's `approx` already starts at the bias — so they need no change.
+    ///
+    /// PLAIN HOST `f64`, no `cubecl` (T-10-04).
+    pub bias: f64,
     /// The exact-leaf (order-statistic) leaf method flag; `true` declines in Plan 01 (Plan 05).
     pub exact_leaf: bool,
     /// The quantile α for the exact-leaf method (Plan 05).
@@ -1274,6 +1289,9 @@ impl Default for DeviceTrainConfig {
             sample_rate: 1.0,
             mvs_lambda: None,
             rng_seed: 0,
+            // FPP-01: 0.0 IS the former hardcoded resident seed — the byte-unchanged D-04
+            // default, so every existing `..Default::default()` literal behaves identically.
+            bias: 0.0,
             exact_leaf: false,
             quantile_alpha: 0.5,
             quantile_delta: 1e-6,
