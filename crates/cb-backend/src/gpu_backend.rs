@@ -34,7 +34,8 @@
 use std::cell::RefCell;
 
 use cb_compute::{
-    DeviceGrownTree, Derivatives, EScoreFunction, Loss, Runtime, QUANTILE_ALPHA, QUANTILE_DELTA,
+    DeviceGrownTree, Derivatives, EScoreFunction, FamilyTreeArgs, Loss, Runtime, QUANTILE_ALPHA,
+    QUANTILE_DELTA,
 };
 use cb_core::{CbError, CbResult};
 
@@ -312,7 +313,13 @@ impl Runtime for GpuBackend {
         approx: &[f64],
         target: &[f64],
         sample: &[f64],
+        family: Option<&FamilyTreeArgs<'_>>,
     ) -> CbResult<Option<DeviceGrownTree>> {
+        // FPP-15 (T04): the per-family descriptor is threaded but not yet load-bearing —
+        // every fit this backend grows today is pointwise scalar, so `family` is `None`
+        // at every caller and the behaviour is byte-unchanged (D-04). Wave 7's pairwise /
+        // ranking / multi-output growers consume it here.
+        let _ = family;
         let mut guard = self.session.borrow_mut();
         match guard.as_mut() {
             None => Ok(None),

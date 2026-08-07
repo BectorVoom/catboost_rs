@@ -112,8 +112,8 @@ fn region_session_weighted_feeds_weighted_der() {
     // Reference: the SAME grower fed the weighted product directly.
     let weighted: Vec<f64> = der1.iter().zip(weight.iter()).map(|(&d, &w)| d * w).collect();
     let expected = grow_region_tree(
-        &weighted, &weight, &cindex, n, n_bins, n_features, max_depth, min_data_in_leaf,
-        scaled_l2, SCORE_FN_COSINE,
+        &weighted, &weight, &weighted, &weight, &cindex, n, n_bins, n_features, max_depth,
+        min_data_in_leaf, scaled_l2, SCORE_FN_COSINE,
     )
     .expect("direct weighted Region grow must succeed");
 
@@ -128,8 +128,8 @@ fn region_session_weighted_feeds_weighted_der() {
     // Discriminator: the RAW-der grow (what a pre-fix session computed) must differ
     // in leaf values — otherwise this fixture cannot detect the regression.
     let raw = grow_region_tree(
-        &der1, &weight, &cindex, n, n_bins, n_features, max_depth, min_data_in_leaf, scaled_l2,
-        SCORE_FN_COSINE,
+        &der1, &weight, &der1, &weight, &cindex, n, n_bins, n_features, max_depth,
+        min_data_in_leaf, scaled_l2, SCORE_FN_COSINE,
     )
     .expect("raw-der Region grow must succeed");
     let (raw_abs, _r) = max_divergence(&dev.leaf_values, &raw.leaf_values);
@@ -162,8 +162,8 @@ fn region_device_reproduces_frozen_cpu_region_path() {
     let scaled_l2 = 0.0_f64;
 
     let dev = grow_region_tree(
-        &der1, &weight, &cindex, n, n_bins, n_features, max_depth, min_data_in_leaf, scaled_l2,
-        SCORE_FN_COSINE,
+        &der1, &weight, &der1, &weight, &cindex, n, n_bins, n_features, max_depth,
+        min_data_in_leaf, scaled_l2, SCORE_FN_COSINE,
     )
     .expect("device Region grow must succeed on the frozen Plan-02 fixture");
 
@@ -210,5 +210,145 @@ fn region_device_reproduces_frozen_cpu_region_path() {
     assert!(
         abs <= EPS || rel <= EPS,
         "device Region leaf values exceeded ε=1e-4: abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+// ─── FPP-12 (T08): the host bootstrap sample reaches the Region grower's SCORE channels ──
+
+/// FPP-12: with a length-`n` `sample`, the Region device grower scores splits over
+/// `der1 ⊙ sample` / `weight ⊙ sample` while LEAF values keep using the UNSAMPLED channels
+/// — `Runtime::grow_tree_on_device`'s contract verbatim.
+///
+/// # Why the reference multiplies twice
+///
+/// The `der1` that reaches `grow_region_tree` has already been through
+/// `host_weighted_der1`, so on a weighted × sampled fit the score channel is
+/// `w · der1 · s` and the score weight is `w · s`. That mirrors the oblivious resident
+/// arm's nested `fold_weights_resident(fold_weights_resident(der1, weight), sample)`. A
+/// reference that multiplied once would be chasing a phantom.
+#[test]
+fn region_device_matches_cpu_with_nontrivial_sample() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!("[region-sampled] SKIP: device Region grow needs a real GPU backend (rocm/cuda)");
+        return;
+    }
+    const EPS: f64 = 1e-4;
+    // NOT the 6-object frozen Plan-02 fixture: its der1 is CONSTANT within every terminal
+    // bin, so a weighted leaf average equals the plain one and assertion (B) below can
+    // never fire. This test needs der1 to VARY inside a leaf, so it builds a wider ramp
+    // fixture from the shared primitives instead.
+    let n = 64usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let max_depth = 3usize;
+    let min_data_in_leaf = 1usize;
+    let der1 = crate::kernels::test_fixtures::ramp_centred(n);
+    let weight = crate::kernels::test_fixtures::weight_mod5(n);
+    let cindex = crate::kernels::test_fixtures::cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(3.0, cb_core::sum_f64(&weight), n);
+    // A non-trivial multiplier: ~30% DROPPED objects (0.0) plus up- and down-weighted
+    // ones. The zeros are the discriminating part — a dropped object must contribute
+    // NOTHING to any split histogram, so a grower that ignored the sample picks a
+    // different split.
+    let sample: Vec<f64> = (0..n)
+        .map(|i| match i % 10 {
+            0 | 3 | 7 => 0.0,
+            1 | 4 => 0.5,
+            2 | 5 | 8 => 1.0,
+            _ => 2.0,
+        })
+        .collect();
+    assert!(
+        sample.iter().any(|&s| s == 0.0) && sample.iter().any(|&s| s > 1.0),
+        "the sample must have both dropped and up-weighted objects or this is vacuous"
+    );
+
+    let score_der1: Vec<f64> = der1.iter().zip(sample.iter()).map(|(&d, &s)| d * s).collect();
+    let score_weight: Vec<f64> =
+        weight.iter().zip(sample.iter()).map(|(&w, &s)| w * s).collect();
+
+    let sampled = grow_region_tree(
+        &der1, &weight, &score_der1, &score_weight, &cindex, n, n_bins, n_features, max_depth,
+        min_data_in_leaf, scaled_l2, SCORE_FN_COSINE,
+    )
+    .expect("sampled Region grow must succeed");
+
+    // (A) The STRUCTURE must be the one a grower fed the SAMPLED channels for BOTH roles
+    // would pick — i.e. the sample genuinely reached the scorer.
+    let all_sampled = grow_region_tree(
+        &score_der1, &score_weight, &score_der1, &score_weight, &cindex, n, n_bins, n_features,
+        max_depth, min_data_in_leaf, scaled_l2, SCORE_FN_COSINE,
+    )
+    .expect("all-sampled Region grow must succeed");
+    assert_eq!(
+        sampled.region_path, all_sampled.region_path,
+        "the split path must be decided by the SAMPLED score channels"
+    );
+    assert_eq!(sampled.leaf_of, all_sampled.leaf_of, "routing follows the sampled path");
+
+    // …and (A) is only meaningful if the sampled path DIFFERS from the unsampled one.
+    // Without this, a fixture where both paths coincide would pass (A) vacuously — the
+    // sample could have been dropped on the floor.
+    let unsampled = grow_region_tree(
+        &der1, &weight, &der1, &weight, &cindex, n, n_bins, n_features, max_depth,
+        min_data_in_leaf, scaled_l2, SCORE_FN_COSINE,
+    )
+    .expect("unsampled Region grow must succeed");
+    assert_ne!(
+        sampled.region_path, unsampled.region_path,
+        "the sampled and unsampled Region paths coincide — the sample never reached the          scorer, or this fixture cannot detect it"
+    );
+
+    // (B) The LEAF VALUES must come from the UNSAMPLED channels, so they must DIFFER from
+    // the all-sampled grow — that difference IS the contract.
+    let (leaf_abs, _r) = max_divergence(&sampled.leaf_values, &all_sampled.leaf_values);
+    assert!(
+        leaf_abs > EPS,
+        "sampled and all-sampled leaf values coincide (abs={leaf_abs:.3e}) — leaf \
+         estimation must NOT see the sample; pick a fixture where it matters"
+    );
+
+    // (C) …and they must equal `calc_average` over each terminal bin's RAW der/weight,
+    // computed independently here.
+    let mut bins: Vec<Vec<usize>> = vec![Vec::new(); sampled.leaf_values.len()];
+    for (obj, &bin) in sampled.leaf_of.iter().enumerate() {
+        if let Some(slot) = bins.get_mut(bin as usize) {
+            slot.push(obj);
+        }
+    }
+    let expected_leaves: Vec<f64> = bins
+        .iter()
+        .map(|docs| {
+            let ds: Vec<f64> = docs.iter().map(|&i| der1[i]).collect();
+            let ws: Vec<f64> = docs.iter().map(|&i| weight[i]).collect();
+            calc_average(cb_core::sum_f64(&ds), cb_core::sum_f64(&ws), scaled_l2)
+        })
+        .collect();
+    let (abs, rel) = max_divergence(&sampled.leaf_values, &expected_leaves);
+    println!("[region-sampled] leaf oracle: abs={abs:.3e} rel={rel:.3e} (bar={EPS:.0e})");
+    assert!(
+        abs <= EPS || rel <= EPS,
+        "sampled Region leaf values must be calc_average over the RAW channels: \
+         abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+/// D-04: an unsampled grow (score channels == leaf channels) must reproduce the frozen
+/// Plan-02 routing exactly — the score-channel split changed nothing for it.
+#[test]
+fn region_device_empty_sample_is_byte_unchanged() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!("[region-sampled] SKIP: needs rocm/cuda");
+        return;
+    }
+    let (der1, weight, cindex) = fixture();
+    let dev = grow_region_tree(
+        &der1, &weight, &der1, &weight, &cindex, 6, 32, 2, 3, 1, 0.0, SCORE_FN_COSINE,
+    )
+    .expect("unsampled Region grow must succeed");
+    assert_eq!(
+        dev.leaf_of,
+        vec![1, 1, 2, 2, 0, 0],
+        "the frozen unsampled Region routing must be unchanged by the score-channel split"
     );
 }

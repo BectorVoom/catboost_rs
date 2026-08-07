@@ -47,10 +47,43 @@ use cb_core::{std_normal, TFastRng64};
 #[path = "device_draw_replay_test.rs"]
 mod tests;
 
-/// Consume, on `rng`, exactly the draws the CPU oblivious grow would have
-/// consumed for ONE tree of `depth` levels over `n_features` listed float
-/// features, leaving the stream in the phase the next tree's `bootstrap()` call
-/// expects (`WR01-S7`).
+/// Which CPU grower the device branch replaced, and therefore whose draw shape must be
+/// replayed (PLAN blocker **B-1**).
+///
+/// This is a deliberately minimal mirror of `boosting::EGrowPolicy` rather than a re-use
+/// of it: the only distinction that matters to the RNG contract is *oblivious vs not*, and
+/// declaring that here keeps the draw contract readable at the function that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayPolicy {
+    /// The oblivious level search (`greedy_tensor_search_oblivious_perturbed`) — the ONLY
+    /// grower that touches the training RNG.
+    SymmetricTree,
+    /// `region_grower` — takes no `Perturbation`, draws nothing.
+    Region,
+    /// `leaf_wise_grower(Depthwise)` — takes no `Perturbation`, draws nothing.
+    Depthwise,
+    /// `leaf_wise_grower(Lossguide)` — takes no `Perturbation`, draws nothing.
+    Lossguide,
+}
+
+/// Consume, on `rng`, exactly the draws the CPU grower for `policy` would have consumed
+/// for ONE tree of `depth` levels over `n_features` listed float features, leaving the
+/// stream in the phase the next tree's `bootstrap()` call expects (`WR01-S7`).
+///
+/// # Only the OBLIVIOUS grower draws (PLAN blocker B-1, RESOLVED)
+///
+/// `region_grower` and `leaf_wise_grower` take **no `Perturbation` and no
+/// `TFastRng64`** — verified against their signatures — so a Depthwise / Lossguide /
+/// Region tree consumes ZERO draws on the CPU branch, and the replay for those policies
+/// must be a no-op.
+///
+/// Before FPP-13 the gate forbade sampling × non-symmetric, so `draws_active` and a
+/// non-oblivious policy could never co-occur and an unconditional oblivious replay was
+/// unreachable. FPP-13 relaxes exactly that cross-product, which makes the distinction
+/// live: replaying `depth` oblivious levels on a Region fit would consume draws the CPU
+/// branch never consumes, and every tree from the second on would sample from a different
+/// RNG phase than upstream — a divergence with no kernel cause at all. (Precedent for the
+/// failure class: the MVS tree-2 gap, root-caused to fabricated RNG draws.)
 ///
 /// `n_features` is the LISTED float feature count (`FeatureMatrix::n_features()`
 /// on the CPU side / `matrix.n_features()` at the call site) — border-less
@@ -61,7 +94,17 @@ mod tests;
 /// likewise empty). All draws route through [`cb_core::TFastRng64`] only; the
 /// returned unit carries no value because the DRAWS, not their values, are the
 /// observable effect.
-pub fn replay_grow_draws(rng: &mut TFastRng64, depth: usize, n_features: usize) {
+pub fn replay_grow_draws(
+    rng: &mut TFastRng64,
+    policy: ReplayPolicy,
+    depth: usize,
+    n_features: usize,
+) {
+    // B-1: every non-oblivious CPU grower draws nothing, so replaying anything here would
+    // desynchronise the next tree's bootstrap().
+    if !matches!(policy, ReplayPolicy::SymmetricTree) {
+        return;
+    }
     for _level in 0..depth {
         // (1) Per-level RSM candidate reselection: one `GenRandReal1` per listed
         //     float feature, unconditionally (the always-select Rsm==1 regime

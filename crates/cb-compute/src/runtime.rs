@@ -891,6 +891,63 @@ pub struct Derivatives {
     pub der2: Vec<f64>,
 }
 
+/// The per-tree, per-family descriptor that rides [`Runtime::grow_tree_on_device`]
+/// (FPP-15, Track S). One variant per Phase-13 forward-dependency family.
+///
+/// # Invariants
+///
+/// - **Plain host types only.** No `cubecl` type and no `cb-train` type may appear
+///   here (T-10-04) — the `Runtime` trait must never gain a `cubecl`/`cb-backend`
+///   dependency via feature unification.
+/// - **Every field is a borrowed slice**, valid only for the duration of the
+///   `grow_tree_on_device` call. Nothing is retained by the backend. A future family
+///   that genuinely needs OWNED data must be escalated rather than worked around with
+///   a `Vec` field: an owned buffer here would move a per-tree allocation onto the
+///   seam, which D-05 (only O(1) per-level crossings) exists to prevent.
+/// - **Deliberately NOT `#[non_exhaustive]`.** Adding a variant during Wave 7 should
+///   be a compile error at every `match`, so no family is silently dropped.
+///
+/// `None` at the call site means "pointwise scalar fit" — the byte-unchanged D-04
+/// path — which is every fit this project trains on the device today.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FamilyTreeArgs<'a> {
+    /// Track R. Query grouping for QueryRMSE / QuerySoftMax / YetiRank.
+    /// `group_offsets` is a CSR-style prefix over object order, length
+    /// `n_groups + 1`, with `group_offsets[0] == 0` and
+    /// `group_offsets[n_groups] == n`.
+    Ranking {
+        /// CSR-style group boundary prefix over object order.
+        group_offsets: &'a [u32],
+    },
+    /// Track W. Per-object pair/group descriptor for PairLogitPairwise /
+    /// YetiRankPairwise, plus the per-tree re-sampled competitor adjacency the CPU
+    /// path rebuilds from the CURRENT approx before every tree.
+    Pairwise {
+        /// CSR-style group boundary prefix over object order.
+        group_offsets: &'a [u32],
+        /// Per-pair winner object index.
+        pair_begin: &'a [u32],
+        /// Per-pair loser object index.
+        pair_end: &'a [u32],
+        /// Per-pair weight; same length as `pair_begin` / `pair_end`.
+        pair_weight: &'a [f64],
+    },
+    /// Track X. The `K`-dimensional approximant for MultiClass / MultiClassOneVsAll /
+    /// MultiLogloss / MultiCrossEntropy / RMSEWithUncertainty.
+    ///
+    /// `approx_k` is **DIM-MAJOR** (`approx_k[d * n + i]`), matching cb-train's own
+    /// multi-output approx buffer layout. The returned
+    /// [`DeviceGrownTree::leaf_values`] is already a `leaf_count × approx_dim`
+    /// ROW-MAJOR block under the existing contract, so no return-type change is
+    /// needed.
+    MultiOutput {
+        /// Dim-major `approx_dim × n` approximant block.
+        approx_k: &'a [f64],
+        /// The per-leaf approximant dimension `K`.
+        approx_dim: usize,
+    },
+}
+
 /// The abstract compute runtime the boosting loop drives (D-04). A backend
 /// (`cb-backend`'s CubeCL `CpuRuntime` now; GPU runtimes in Phase 7) implements
 /// this by launching its `#[cube]` kernels and returning UN-reduced per-object
@@ -1130,6 +1187,28 @@ pub struct DeviceCtrAveraging {
     pub columns: Vec<DeviceCtrColumn>,
 }
 
+/// The per-fit ORDERED-boosting descriptor (FPP-19/FPP-20, T22/T23).
+///
+/// Every field is a pure function of `(n, fold_len_multiplier, weights)` plus the learning
+/// fold's permutation, so all of it is per-FIT constant and belongs here rather than on the
+/// per-tree grow seam (the T21 design note's question 1).
+///
+/// Plain host types only — no `cubecl` / `cb-backend` type may appear (the T-10-04 landmine).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceOrderedConfig {
+    /// The learn permutation: `permutation[position] = object id`. Drives the per-segment
+    /// PREFIX histogram fills, and nothing else — routing and the leaf-value reduce stay on
+    /// the identity order.
+    pub permutation: Vec<u32>,
+    /// Per-segment `tail_finish`, ascending. Segment `s`'s histogram is the permutation
+    /// prefix `[0, segment_tail_finish[s])` — `body_finish` does NOT appear because
+    /// `ordered_segment_leaf_stats` discards it (see the T21 note).
+    pub segment_tail_finish: Vec<usize>,
+    /// Per-segment `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)` — the ONE place
+    /// `body_finish` still matters.
+    pub segment_scaled_l2: Vec<f64>,
+}
+
 /// The single PLAIN HOST-typed device training config (Phase 12 Plan 01, Open Q2). It
 /// carries the grow-policy / leaf-method / sampling / exact / CTR knobs the later
 /// Phase-12 waves need, so [`Runtime::begin_device_training`]'s config surface widens by
@@ -1158,6 +1237,21 @@ pub struct DeviceTrainConfig {
     pub mvs_lambda: Option<f64>,
     /// The pinned per-fit RNG seed (device-resident sampling reproducibility, Plan 06/07).
     pub rng_seed: u64,
+    /// FPP-01 (CR-01). The per-fit STARTING APPROXIMANT (`starting_approx` in
+    /// `cb_train::boosting`), i.e. what `boost_from_average` computes.
+    ///
+    /// `0.0` — the default — reproduces the former hardcoded `vec![0.0_f64; n]` resident
+    /// seed EXACTLY, so every fit that does not set it is byte-unchanged (D-04). A
+    /// non-zero value seeds the resident approximant to `vec![bias; n]` so a
+    /// `boost_from_average=true` fit (upstream's RMSE default, and this project's
+    /// `CatBoostBuilder` default) can reach the device at all.
+    ///
+    /// Only the OBLIVIOUS resident arm consumes this seed. The Region, non-symmetric and
+    /// exact-leaf arms re-derive `der1` from the CALLER's `approx` via `host_der1`, and
+    /// the caller's `approx` already starts at the bias — so they need no change.
+    ///
+    /// PLAIN HOST `f64`, no `cubecl` (T-10-04).
+    pub bias: f64,
     /// The exact-leaf (order-statistic) leaf method flag; `true` declines in Plan 01 (Plan 05).
     pub exact_leaf: bool,
     /// The quantile α for the exact-leaf method (Plan 05).
@@ -1205,6 +1299,9 @@ pub struct DeviceTrainConfig {
     /// The split scorer derives its two pass windows from it. `n_float == n_features`
     /// is the float-only regime (pass B empty).
     pub n_float: usize,
+    /// `Some` iff this fit is a COVERED ordered-boosting fit (FPP-20). `None` — the default —
+    /// keeps every existing fit byte-unchanged.
+    pub ordered: Option<DeviceOrderedConfig>,
 }
 
 impl Default for DeviceTrainConfig {
@@ -1217,6 +1314,9 @@ impl Default for DeviceTrainConfig {
             sample_rate: 1.0,
             mvs_lambda: None,
             rng_seed: 0,
+            // FPP-01: 0.0 IS the former hardcoded resident seed — the byte-unchanged D-04
+            // default, so every existing `..Default::default()` literal behaves identically.
+            bias: 0.0,
             exact_leaf: false,
             quantile_alpha: 0.5,
             quantile_delta: 1e-6,
@@ -1230,6 +1330,7 @@ impl Default for DeviceTrainConfig {
             one_hot_flags: Vec::new(),
             real_folds: Vec::new(),
             n_float: 0,
+            ordered: None,
         }
     }
 }
@@ -1427,13 +1528,25 @@ pub trait Runtime {
     /// Returns a [`cb_core::CbError`] if a backend override fails mid-grow, or if
     /// `sample` is neither empty nor length `n`. The default implementation never
     /// errors.
+    /// # The `family` argument (FPP-15, Track S)
+    ///
+    /// `family` carries the per-tree, per-family descriptor the Phase-13 pairwise /
+    /// ranking / multi-output growers need and that the scalar `approx`/`target` seam
+    /// cannot express. It is `None` for EVERY pointwise scalar fit — the
+    /// byte-unchanged D-04 default path — so a backend that ignores it behaves exactly
+    /// as it did before this parameter existed.
+    ///
+    /// ONE signature change serves all four forward-dependency families deliberately:
+    /// four independent seam extensions would collide on the same ~15 call sites.
+    /// See [`FamilyTreeArgs`] for the per-variant contract and the borrowed-slice rule.
     fn grow_tree_on_device(
         &self,
         approx: &[f64],
         target: &[f64],
         sample: &[f64],
+        family: Option<&FamilyTreeArgs<'_>>,
     ) -> CbResult<Option<DeviceGrownTree>> {
-        let _ = (approx, target, sample);
+        let _ = (approx, target, sample, family);
         Ok(None)
     }
 

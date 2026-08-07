@@ -139,6 +139,89 @@ def binary_target(X, seed=42, dtype=np.float32):
 
 
 # --------------------------------------------------------------------------------------
+# SPD-01 (T17): categorical + non-uniform-weight axes for the full-parameter speed grid
+#
+# STRICTLY ADDITIVE. `generate()` and `binary_target()` above are UNCHANGED — their byte
+# output still reproduces every committed small-n correctness fixture bit-for-bit (D-06's
+# single-source rule). Everything below is new, so an existing caller cannot be affected.
+# --------------------------------------------------------------------------------------
+
+#: Cardinalities of the generated categorical columns. Deliberately small and mixed: the
+#: device CTR arm binarizes to `ctr_border_count + 1 == 16` buckets regardless, and small
+#: cardinalities keep the one-hot-vs-CTR routing decision (`one_hot_max_size`) meaningful.
+CAT_CARDINALITIES = (4, 16, 64)
+
+#: The per-object weight cycle for the non-uniform-weight axis. The same cycle the
+#: `weighted_device_sym/` correctness fixture uses, so the speed grid and the parity
+#: fixtures exercise the SAME weighted-derivative path (`Σ(w·der1)/(Σw+l2)`).
+WEIGHT_CYCLE = (0.5, 1.0, 2.0, 3.0)
+
+
+def generate_cat(n_rows, cardinalities=CAT_CARDINALITIES, seed=42):
+    """Deterministically generate integer categorical columns for the speed grid.
+
+    Uses a seed OFFSET (``seed + 2``) so the categorical stream is decorrelated from both
+    ``generate``'s regression weights (``seed``) and ``binary_target``'s logistic weights
+    (``seed + 1``) — three independent streams off one pinned seed.
+
+    Parameters
+    ----------
+    n_rows : int
+    cardinalities : sequence of int
+        One column per entry; column ``j`` takes values in ``[0, cardinalities[j])``.
+    seed : int
+
+    Returns
+    -------
+    np.ndarray, shape ``(n_rows, len(cardinalities))``, dtype ``int32``
+    """
+    rng = np.random.RandomState(seed + 2)  # legacy Mersenne -> version-stable bytes
+    cols = [rng.randint(0, int(c), size=n_rows).astype(np.int32) for c in cardinalities]
+    return np.stack(cols, axis=1)
+
+
+def generate_weights(n_rows, cycle=WEIGHT_CYCLE):
+    """The deterministic NON-UNIFORM per-object weight vector, ``w[i] = cycle[i % len]``.
+
+    Not random: a cycle is reproducible without a stream, is trivially auditable, and
+    guarantees every weight value appears with equal frequency at any ``n_rows`` — so the
+    weighted arm's cost is a property of the shape, not of a draw.
+
+    Returns
+    -------
+    np.ndarray, shape ``(n_rows,)``, dtype ``float64``
+    """
+    cycle = np.asarray(cycle, dtype=np.float64)
+    if cycle.size == 0:
+        raise ValueError("weight cycle must be non-empty")
+    return cycle[np.arange(n_rows) % cycle.size]
+
+
+def cat_driven_binary_target(X, cat, seed=42, dtype=np.float32):
+    """A {0,1} target driven by BOTH the float columns and the categorical columns.
+
+    The CTR arm of the speed grid is only meaningful if the trained model actually selects
+    CTR splits; a target that ignores the categorical columns would let the trainer skip
+    them and the "CTR" cell would silently measure a float-only fit.
+
+    Each categorical column contributes a seeded per-LEVEL effect (so the signal is in the
+    category identity, not in its integer ordering — an ordinal effect would be captured by
+    a plain numeric split and again bypass CTR).
+    """
+    n_rows, n_features = X.shape
+    rng = np.random.RandomState(seed + 3)
+    w = rng.randn(n_features).astype(np.float64)
+    score = X.astype(np.float64).dot(w)
+    for j in range(cat.shape[1]):
+        card = int(cat[:, j].max()) + 1
+        level_effect = rng.randn(card).astype(np.float64)
+        score = score + level_effect[cat[:, j]]
+    prob = 1.0 / (1.0 + np.exp(-score))
+    draws = rng.rand(n_rows)
+    return (draws < prob).astype(dtype)
+
+
+# --------------------------------------------------------------------------------------
 # Serial CPU references (the "expected values" the device oracle is checked against)
 #
 # These are intentionally the SIMPLEST correct serial implementations -- their job is to

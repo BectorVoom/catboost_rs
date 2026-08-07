@@ -15,7 +15,7 @@
 //! that merely advanced by an arithmetic count would pass a count assertion and
 //! still desynchronise.
 
-use super::replay_grow_draws;
+use super::{replay_grow_draws, ReplayPolicy};
 use crate::tree::{greedy_tensor_search_oblivious_perturbed, FeatureMatrix, Perturbation};
 use cb_compute::EScoreFunction;
 use cb_core::TFastRng64;
@@ -89,7 +89,7 @@ fn real_grow_state(
 /// Run only the replay on a fresh RNG and return its post-replay state.
 fn replay_state(seed: u64, n_features: usize, depth: usize) -> ([u64; 4], u64) {
     let mut rng = TFastRng64::from_seed(seed);
-    replay_grow_draws(&mut rng, depth, n_features);
+    replay_grow_draws(&mut rng, ReplayPolicy::SymmetricTree, depth, n_features);
     (rng.raw_state(), rng.call_count())
 }
 
@@ -167,7 +167,7 @@ fn replay_counts_borderless_features_because_the_grower_does() {
 
     let mut rep_rng = TFastRng64::from_seed(3);
     // 4 LISTED features — not the 2 bordered ones.
-    replay_grow_draws(&mut rep_rng, depth, 4);
+    replay_grow_draws(&mut rep_rng, ReplayPolicy::SymmetricTree, depth, 4);
 
     assert_eq!(
         rep_rng.raw_state(),
@@ -182,7 +182,7 @@ fn replay_is_a_no_op_at_zero_depth() {
     for nf in [0usize, 5] {
         let mut rng = TFastRng64::from_seed(99);
         let before = (rng.raw_state(), rng.call_count());
-        replay_grow_draws(&mut rng, 0, nf);
+        replay_grow_draws(&mut rng, ReplayPolicy::SymmetricTree, 0, nf);
         assert_eq!(
             (rng.raw_state(), rng.call_count()),
             before,
@@ -202,7 +202,7 @@ fn replay_at_zero_features_still_takes_the_per_level_rand_seed() {
     // encode a draw model the grower does not have.
     let depth = 4;
     let mut rng = TFastRng64::from_seed(99);
-    replay_grow_draws(&mut rng, depth, 0);
+    replay_grow_draws(&mut rng, ReplayPolicy::SymmetricTree, depth, 0);
     assert_eq!(
         rng.call_count(),
         depth as u64,
@@ -250,12 +250,98 @@ fn replay_is_multi_tree_composable() {
 
     let mut rep_rng = TFastRng64::from_seed(2024);
     for _ in 0..trees {
-        replay_grow_draws(&mut rep_rng, depth, nf);
+        replay_grow_draws(&mut rep_rng, ReplayPolicy::SymmetricTree, depth, nf);
     }
 
     assert_eq!(
         rep_rng.raw_state(),
         real_rng.raw_state(),
         "the replay must stay phase-exact across {trees} consecutive trees"
+    );
+}
+
+// ─── BLOCKER B-1 (blocks T11/T15): the replay must be GROW-POLICY aware ─────────────────
+
+/// B-1. `replay_grow_draws` replays the OBLIVIOUS level search's draw shape: `depth`
+/// levels × (`n_features` uniforms + 1 `gen_rand` + `n_features` normals). The
+/// non-symmetric and Region CPU growers consume a DIFFERENT number — specifically
+/// **zero**: `leaf_wise_grower` and `region_grower` take no `Perturbation` and no
+/// `TFastRng64` at all (verified against their signatures), so on a Depthwise / Lossguide
+/// / Region fit the CPU branch's per-tree draw count is 0.
+///
+/// Until T11 the gate forbade sampling × non-symmetric, so the two could never co-occur
+/// and the mismatch was unreachable. T11 relaxes exactly that, which makes this live: an
+/// unconditional oblivious replay would consume draws the CPU branch never consumes, and
+/// the NEXT tree's `bootstrap()` would read a different RNG phase — a tree-2 divergence
+/// owned by no other task in the phase. (Precedent for this exact failure class: the MVS
+/// tree-2 gap, root-caused to fabricated RNG draws.)
+///
+/// This test pins the CPU side of the contract: a real `region_grower` /
+/// `leaf_wise_grower` call must leave the RNG *untouched*.
+#[test]
+fn non_oblivious_cpu_growers_consume_zero_draws() {
+    use crate::tree::{leaf_wise_grower, region_grower, LeafWisePolicy};
+
+    let n = 48usize;
+    let nf = 3usize;
+    let (values, borders, der1, weight) = synth(n, nf, 7);
+    let matrix = FeatureMatrix::new(&values, &borders);
+
+    let rng = TFastRng64::from_seed(4242);
+    let before_state = rng.raw_state();
+    let before_calls = rng.call_count();
+
+    region_grower(&matrix, &der1, &weight, 1.0, 3, 1, n, EScoreFunction::Cosine)
+        .expect("region grow must succeed");
+    for policy in [LeafWisePolicy::Depthwise, LeafWisePolicy::Lossguide] {
+        leaf_wise_grower(policy, &matrix, &der1, &weight, 1.0, 3, 8, 1, n, EScoreFunction::Cosine)
+            .expect("leaf-wise grow must succeed");
+    }
+
+    assert_eq!(
+        rng.raw_state(),
+        before_state,
+        "the Region / leaf-wise CPU growers must not advance the training RNG at all — \
+         they take no Perturbation, so the device replay for those policies must be a no-op"
+    );
+    assert_eq!(rng.call_count(), before_calls, "…and must draw nothing");
+}
+
+/// B-1, the device side: the replay helper must consume NOTHING for a non-oblivious
+/// policy, and the oblivious draw shape must be unchanged.
+///
+/// Pre-fix, `replay_grow_draws` had no policy parameter and always replayed `depth`
+/// oblivious levels, so this fails to compile / over-consumes.
+#[test]
+fn replay_is_a_no_op_for_non_oblivious_policies() {
+    let depth = 4usize;
+    let nf = 3usize;
+
+    for policy in [
+        ReplayPolicy::Region,
+        ReplayPolicy::Depthwise,
+        ReplayPolicy::Lossguide,
+    ] {
+        let mut rng = TFastRng64::from_seed(777);
+        let before_state = rng.raw_state();
+        let before_calls = rng.call_count();
+        replay_grow_draws(&mut rng, policy, depth, nf);
+        assert_eq!(
+            rng.raw_state(),
+            before_state,
+            "{policy:?}: the CPU grower for this policy draws nothing, so the replay must \
+             leave the stream untouched — replaying the oblivious shape here would \
+             desynchronise the NEXT tree's bootstrap()"
+        );
+        assert_eq!(rng.call_count(), before_calls, "{policy:?}: no draws");
+    }
+
+    // …and the oblivious shape is unchanged: it must still consume.
+    let mut rng = TFastRng64::from_seed(777);
+    let before_calls = rng.call_count();
+    replay_grow_draws(&mut rng, ReplayPolicy::SymmetricTree, depth, nf);
+    assert!(
+        rng.call_count() > before_calls,
+        "the SymmetricTree replay must still consume the oblivious level-search draws"
     );
 }

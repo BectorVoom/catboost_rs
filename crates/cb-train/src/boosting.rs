@@ -39,7 +39,7 @@ use crate::autolr::{self, TargetType};
 use crate::query_info::{build_query_info, QueryInfo};
 use crate::bootstrap::{bootstrap, last_iter_mean_leaf_value, EBootstrapType};
 use crate::ctr::bake::{bake_ctr_table, BakedCtrData};
-use crate::device_draw_replay::replay_grow_draws;
+use crate::device_draw_replay::{replay_grow_draws, ReplayPolicy};
 use crate::ctr::{CounterCalcMethod, ECtrType};
 use crate::fold::Fold;
 use crate::metrics::{EvalMetric, EvalMetricHistory};
@@ -2229,23 +2229,123 @@ fn ctr_splits_for_tree(
         .collect()
 }
 
-/// GDC-11 (T14): whether every materialized CTR column is DEVICE-covered. The
-/// device CTR arm implements the ordered binclf `(good + prior) / (total + 1)`
-/// statistic over SIMPLE (single-feature) projections — exactly upstream's
-/// Borders CTR with `target_border_idx == 0` and a unit prior denominator.
-/// Everything else (Buckets / BinarizedTargetMeanValue / Counter, combination
-/// projections, multi-target-border Buckets columns) declines to the
-/// byte-unchanged CPU path (D-04): the device kernels do not implement those
-/// accumulation semantics, and a wrong device leaf is worse than a CPU fallback.
+/// GDC-11 (T14) / FPP-09 (T07): whether every materialized CTR column is DEVICE-covered.
+/// The device CTR arm implements the ordered binclf `(good + prior) / (total + 1)`
+/// statistic — exactly upstream's Borders CTR with `target_border_idx == 0` and a unit
+/// prior denominator — over projections of ANY arity.
+///
+/// # Why combination (tensor) projections are admitted (FPP-09, PLAN V-4)
+///
+/// The projection arity is NOT a semantic constraint on the online statistic: the
+/// statistic is computed over a projection's COMBINED bucket identity, and the two sides
+/// derive that identity identically. The CPU folds each member's per-document categorical
+/// hash in projection-sorted order (`TProjection::combined_hash`); the device is handed
+/// one `member_bins` column per member in that SAME sorted order and folds them with
+/// `combine_projection_bins`. The combined bins are integer-identical end to end, so the
+/// accumulator that is correct for one member is correct for `k`.
+///
+/// The residual is a hypothetical 64-bit hash-collision asymmetry — the CPU folds string
+/// hashes, the device folds perfect-hash bucket codes, so a collision on ONE side only
+/// would diverge. Documented, not guarded; the ≤1e-5 e2e bar is its detector.
+///
+/// # Combination CTR is device-INELIGIBLE (FPP-11, ESCALATED — do not re-open blind)
+///
+/// The paragraph above describes why the arity SHOULD be admissible, and the column
+/// builder ([`build_device_ctr_config`]) does emit one `member_bins` entry per member,
+/// unit-tested by `device_ctr_combo_config_test`. But the end-to-end oracle over the
+/// `ctr_device_combo/` fixture does NOT meet the ≤1e-5 bar, so the gate stays closed.
+///
+/// Measured on gfx1151 against upstream `catboost==1.2.10`:
+///
+/// - the CPU path over the same fixture is exact: **max|Δpred| = 1.4e-17**, with 8 CTR
+///   splits, so neither the fixture nor the CPU combination CTR is at fault;
+/// - the DEVICE path misses by **3.3e-2**;
+/// - trees 0, 1 and 2 are STRUCTURALLY IDENTICAL to the CPU's — including tree 2's
+///   2-member combination split `[0,1] @ border 4.0` — so `combine_projection_bins`
+///   is producing usable combined bins;
+/// - the divergence begins at **tree 3, level 0**: the CPU picks the simple projection
+///   `[0] @ 6.0` and the device picks the combination `[0,1] @ 8.0`. Every later level
+///   follows from that one different partition.
+///
+/// Tree 3 level 0 is the first point at which BOTH the simple and the combination group
+/// have already entered the model-lifetime `UsedCtrSplits` set (the combination enters at
+/// tree 2), so both candidates score at cat-feature weight `1.0` on both sides and the
+/// disagreement is a raw split-gain difference, not a weight difference. The most likely
+/// remaining suspects, in order: the device's `eligible_max` (`maxCount`) now maxes over a
+/// combination column's `bucket_count`, which its own comment says was written assuming
+/// "the device gate admits only simple projections"; and the combination column's
+/// `bucket_count` itself (`combine_projection_bins` returns the OBSERVED distinct-bucket
+/// count, whereas upstream's `TOnlineCtrUniqValuesCounts::Count` may not).
+///
+/// Re-opening this clause requires the e2e oracle to pass, not just the config unit test —
+/// this is exactly the ordering discipline that made the gap visible.
+///
+/// Everything else — Buckets / BinarizedTargetMeanValue / Counter (Track U), multi-target-
+/// border Buckets columns, non-unit prior denominators — still declines to the
+/// byte-unchanged CPU path (D-04): the device kernels do not implement those accumulation
+/// semantics, and a wrong device leaf is worse than a CPU fallback.
+///
 /// An EMPTY column set returns `false` (the caller's `is_empty()` arm owns that).
 fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
     !cols.is_empty()
         && cols.iter().all(|col| {
+            // ESCALATED (FPP-11): the projection-arity conjunct is RESTORED. See the
+            // "combination CTR is device-INELIGIBLE" section of this function's doc
+            // comment for the measured evidence and the localisation.
             col.projection.is_simple()
                 && col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
                 && col.target_border_idx == 0
                 && col.prior_denom == 1.0
         })
+}
+
+/// FPP-05 (T06): decide `DeviceTrainConfig::{exact_leaf, quantile_alpha, quantile_delta}`
+/// for a fit, as a pure function of its leaf method and loss.
+///
+/// # The intersection (PLAN V-6, derived — read this before widening the match)
+///
+/// The device Exact order-statistic leaf activates ONLY for the intersection of
+///
+/// - **(a) what `validate_leaf_method` permits** on the CPU
+///   (`LogCosh | Mae | Quantile | MultiQuantile`), and
+/// - **(b) what `map_leaf_method` covers** on the device
+///   (`Mae | Quantile | Mape`).
+///
+/// The two sets disagree in BOTH directions, which is why neither alone is the right
+/// condition:
+///
+/// - `LogCosh` is CPU-legal but device-UNCOVERED — admitting it would silently apply the
+///   Gradient `calc_average` leaf to a LogCosh fit, which is wrong and strictly worse than
+///   today's correct CPU fallback.
+/// - `Mape` is device-covered (with `mape: true`) but CPU-REJECTED by
+///   `validate_leaf_method`, so no fit can reach the device with that pair at all.
+/// - `MultiQuantile` is CPU-legal but multi-dimensional, which the scalar `exact_leaf`
+///   arm cannot express.
+///
+/// ⇒ the admitted set is exactly `{Mae, Quantile}`.
+///
+/// Note also that `builder.rs` defaults `leaf_method: Gradient` unconditionally, so this
+/// arm is reachable only by an EXPLICIT `LeafMethod::Exact` request.
+///
+/// # Returns
+///
+/// `(exact_leaf, quantile_alpha, quantile_delta)`. For a declined pair the α/δ are the
+/// [`DeviceTrainConfig`] defaults and are inert. For `Mae` the exact leaf IS the weighted
+/// median, so it also carries the defaults; only `Quantile` supplies its own — and the
+/// backend's `map_leaf_method` reads `Loss::Quantile`'s own fields there anyway, so the
+/// two agree by construction.
+#[must_use]
+fn device_exact_leaf_config(leaf_method: LeafMethod, loss: &Loss) -> (bool, f64, f64) {
+    let admitted =
+        matches!(leaf_method, LeafMethod::Exact) && matches!(loss, Loss::Mae | Loss::Quantile { .. });
+    if !admitted {
+        return (false, QUANTILE_ALPHA, QUANTILE_DELTA);
+    }
+    match *loss {
+        Loss::Quantile { alpha, delta } => (true, alpha, delta),
+        // Mae: the weighted MEDIAN — the struct's own defaults, not a re-typed literal.
+        _ => (true, QUANTILE_ALPHA, QUANTILE_DELTA),
+    }
 }
 
 /// GDC-11 (T14): build the two-permutation [`cb_compute::DeviceCtrConfig`] from
@@ -2294,27 +2394,46 @@ fn build_device_ctr_config(
      -> CbResult<Vec<cb_compute::DeviceCtrColumn>> {
         cols.iter()
             .map(|col| {
-                // Simple projection (guaranteed by `ctr_types_are_device_covered`):
-                // the single member's RAW bucket column.
-                let abs = col.projection.cat_features().first().copied().ok_or_else(|| {
-                    CbError::Degenerate(
+                // FPP-09 (T07): ONE raw bucket column per projection member, in the
+                // projection's SORTED member order — the same order `TProjection`
+                // guarantees (sort + dedup in `from_features`) and the same order
+                // `combined_hash` folds in. That shared order is what makes the device's
+                // `combine_projection_bins` output integer-identical to the CPU's combined
+                // bucket identity (PLAN V-4), so a `k`-member projection needs no new
+                // accumulation semantics — only all `k` columns.
+                //
+                // Emitting only member 0 (which is what this did before FPP-09) would make
+                // the device score a COMBINATION split from ONE member's bins: wrong, not
+                // merely worse. The residual `fold_cat_hash` collision asymmetry between
+                // the CPU's string-hash fold and the device's perfect-hash-bucket fold is
+                // documented on `ctr_types_are_device_covered`, detected by the ≤1e-5 e2e
+                // bar, and not prevented here.
+                if col.projection.cat_features().is_empty() {
+                    return Err(CbError::Degenerate(
                         "device CTR column with an empty projection".to_owned(),
-                    )
-                })?;
-                let pos = eligible_absolute
+                    ));
+                }
+                let members = col
+                    .projection
+                    .cat_features()
                     .iter()
-                    .position(|&a| a == abs)
-                    .ok_or_else(|| {
-                        CbError::OutOfRange(format!(
-                            "device CTR projection member {abs} is not a CTR-eligible \
-                             categorical feature"
-                        ))
-                    })?;
-                let member = cat_eligible_buckets.get(pos).cloned().ok_or_else(|| {
-                    CbError::OutOfRange(format!(
-                        "no raw bucket column for CTR-eligible feature position {pos}"
-                    ))
-                })?;
+                    .map(|&abs| {
+                        let pos = eligible_absolute
+                            .iter()
+                            .position(|&a| a == abs)
+                            .ok_or_else(|| {
+                                CbError::OutOfRange(format!(
+                                    "device CTR projection member {abs} is not a \
+                                     CTR-eligible categorical feature"
+                                ))
+                            })?;
+                        cat_eligible_buckets.get(pos).cloned().ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "no raw bucket column for CTR-eligible feature position {pos}"
+                            ))
+                        })
+                    })
+                    .collect::<CbResult<Vec<Vec<u32>>>>()?;
                 let prior = col.prior_num / col.prior_denom;
                 let (shift, norm) = crate::ctr::calc_normalization(prior);
                 let borders: Vec<f64> = (0..ctr_border_count)
@@ -2332,7 +2451,7 @@ fn build_device_ctr_config(
                     }
                 };
                 Ok(cb_compute::DeviceCtrColumn {
-                    member_bins: vec![member],
+                    member_bins: members,
                     prior,
                     borders,
                     bucket_count: col.bucket_count,
@@ -4212,7 +4331,18 @@ fn train_inner<R: Runtime>(
     // to the device; a later Ok(None) from a covered fit is a mid-run mix and is
     // rejected (T-10-23), never silently backfilled with a CPU tree.
     let device_host_eligible = group_spans.is_none()
-        && ordered_learning_perm.is_none()
+        // FPP-20 (T23): the former `ordered_learning_perm.is_none()` clause is GONE. It was
+        // the host half of the ordered decline — the session-side gate was the other half —
+        // and it existed because the device had no way to score a candidate over the fold's
+        // body/tail segments. It does now (`grow_oblivious_tree_ordered_resident`), and the
+        // per-fit `DeviceOrderedConfig` built below carries the permutation + segment table
+        // the grow needs.
+        //
+        // Removing it does NOT make every ordered fit device-eligible: `map_ordered_coverage`
+        // still requires a covered simple-approximant loss, depth >= 1, a single fold,
+        // SymmetricTree and every other family flag at its default, and `begin` additionally
+        // requires the descriptor to be present. An uncovered ordered fit still falls back to
+        // the byte-unchanged CPU grower.
         // GDC-11 (T14): the CTR clauses are RELAXED — a single-permutation
         // (`learning_folds_for_cycle == 1`, made real by GDC-01) fit whose
         // materialized CTR columns are all device-covered (simple Borders
@@ -4260,14 +4390,26 @@ fn train_inner<R: Runtime>(
         // gated bit-for-bit against the `bootstrap_poisson/` upstream fixtures). If the
         // device does not actually commit, Poisson is rejected below rather than silently
         // falling back to a CPU grower that cannot express it.
+        //
+        // FPP-13 (T11): the `&& grow_policy == SymmetricTree` restriction on the three
+        // HOST-sampled types is GONE. It existed because the Region and non-symmetric
+        // growers ignored the per-object multiplier — the backend declined those
+        // combinations rather than silently dropping the sample. FPP-12 gave both growers
+        // real SPLIT-SCORING channels, so a sampled Depthwise / Lossguide / Region fit now
+        // scores over `der1 * sample` while leaf estimation stays unsampled, exactly as
+        // the oblivious arm does.
+        //
+        // POISSON keeps the SymmetricTree restriction. It is not host-sampled at all: it
+        // is DEVICE-resident (upstream has no CPU Poisson sampler to mirror), and only the
+        // oblivious arm opens the resident sampler. Admitting it for a non-symmetric grow
+        // would commit a fit the session then declines.
         && (matches!(params.bootstrap_type, EBootstrapType::No)
-            || (matches!(
+            || matches!(
                 params.bootstrap_type,
-                EBootstrapType::Bayesian
-                    | EBootstrapType::Bernoulli
-                    | EBootstrapType::Mvs
-                    | EBootstrapType::Poisson
-            ) && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
+                EBootstrapType::Bayesian | EBootstrapType::Bernoulli | EBootstrapType::Mvs
+            )
+            || (matches!(params.bootstrap_type, EBootstrapType::Poisson)
+                && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
         && params.random_strength == 0.0
         && eval_sets.is_empty()
         // SPEC-OH-20 (T23): "has something to score" is float OR one-hot, not float
@@ -4303,19 +4445,35 @@ fn train_inner<R: Runtime>(
         // the oblivious resident grow (GDC-02, `weighted_der1_h`), and the
         // host-driven nonsym / Region growers (GDC-03/04, `host_weighted_der1`)
         // — so a genuinely weighted pool meets the ≤1e-5 upstream bar on device.
-        // The `bias == 0.0` sibling (CR-01) below stays unrelaxed.
-        // CR-01: the device session always seeds its resident approx to zero
-        // (`GpuTrainSession::begin`), so a non-zero starting bias — e.g.
-        // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must
-        // fall back to the CPU grower (D-04) rather than train against a wrong
-        // (zero) starting point. `bias` is the computed `starting_approx` above.
-        && bias == 0.0
-        // CR-02: the device grower always computes leaf values via
-        // `calc_average` (the Gradient/Simple formula); it has no Newton arm.
-        // For RMSE Gradient==Newton coincide, but for Logloss/CrossEntropy the
-        // Newton formula diverges, so only Gradient/Simple are device-eligible.
-        // A Newton request on a device-covered loss falls back to the CPU grower.
-        && matches!(params.leaf_method, LeafMethod::Gradient | LeafMethod::Simple);
+        //
+        // FPP-02 (T09): the former CR-01 `bias == 0.0` clause is GONE too. It existed
+        // because `GpuTrainSession::begin` seeded its resident approx to a hardcoded
+        // `vec![0.0; n]`, so a non-zero starting approximant would have trained against a
+        // wrong starting point. FPP-01 replaced that seed with `config.bias` (populated
+        // just below from this same `starting_approx`), so a `boost_from_average = true`
+        // fit — upstream's RMSE default, and this project's `CatBoostBuilder` default —
+        // now reaches the device with the CORRECT first-tree derivative.
+        //
+        // Only the OBLIVIOUS resident arm reads the seed; the Region / non-symmetric /
+        // exact-leaf arms re-derive `der1` from the CALLER's `approx` via `host_der1`, and
+        // the caller's `approx` already starts at the bias — so every covered grow policy
+        // is correct under this relaxation, not just SymmetricTree.
+        // CR-02: the device grower computes leaf values via `calc_average` (the
+        // Gradient/Simple formula); it has no Newton arm. For RMSE Gradient==Newton
+        // coincide, but for Logloss/CrossEntropy the Newton formula diverges, so a
+        // Newton request on a device-covered loss falls back to the CPU grower.
+        //
+        // FPP-06 (T10): `LeafMethod::Exact` is additionally admitted for {Mae, Quantile}
+        // — the intersection derived in `device_exact_leaf_config`, whose doc comment
+        // explains why neither `validate_leaf_method`'s set nor `map_leaf_method`'s set
+        // is the right condition alone (LogCosh is CPU-legal but device-uncovered; Mape is
+        // device-covered but CPU-rejected; MultiQuantile is multi-dimensional). The
+        // condition is read back off the already-computed config decision rather than
+        // re-derived here, so the gate and the config can never disagree — a gate that
+        // opened for a pair the config declined would apply the Gradient calc_average leaf
+        // to a Quantile fit.
+        && (matches!(params.leaf_method, LeafMethod::Gradient | LeafMethod::Simple)
+            || device_exact_leaf_config(params.leaf_method, &params.loss).0);
 
     // The leaf-regularization is constant across the fit for the device-eligible
     // config (fixed weights / n, no per-tree sampling), so it is computed ONCE and
@@ -4391,7 +4549,15 @@ fn train_inner<R: Runtime>(
     } else {
         None
     };
+    // FPP-05 (T06): the {Mae, Quantile} × Exact intersection, decided once as a pure
+    // function so it is unit-testable without a device (PLAN blocker B-2, option (a)).
+    let device_exact_leaf = device_exact_leaf_config(params.leaf_method, &params.loss);
     let device_config = DeviceTrainConfig {
+        // FPP-01/FPP-02 (T09): the fit's REAL starting approximant. `0.0` — every
+        // `boost_from_average = false` fit, which is every fixture that was device-eligible
+        // before this phase — reproduces the former hardcoded resident seed byte-for-byte
+        // (D-04), so no existing device test changes behaviour.
+        bias,
         ctr: device_ctr,
         grow_policy: device_grow_policy,
         // The Lossguide cap is meaningful ONLY for the non-sym leaf-wise policy; leave it
@@ -4439,9 +4605,22 @@ fn train_inner<R: Runtime>(
         // RNG stream all live host-side inside `bootstrap()` above, which is the
         // ≤1e-5-verified sampler and the reason upstream parity is reachable. Setting
         // them here would be inert at best and, for `mvs_lambda`, actively misleading.
-        // `exact_leaf` / `ctr` likewise stay default: exact-leaf × sampling and CTR ×
-        // sampling are out of scope (SPEC §2) and the session declines both combinations.
+        // `ctr` likewise stays default: CTR × sampling is out of scope (SPEC §2) and the
+        // session declines that combination.
         // Design B′ (device-resident sampling) is the perf follow-up that would wire them.
+        //
+        // ─── FPP-05: the device Exact order-statistic leaf ──────────────────────────
+        // Activated ONLY for the {Mae, Quantile} intersection — see
+        // `device_exact_leaf_config`'s doc comment for the derivation and for why
+        // neither `validate_leaf_method`'s set nor `map_leaf_method`'s set is the right
+        // condition alone. This is a config-only change: `device_host_eligible` still
+        // rejects `LeafMethod::Exact` until T10 relaxes it, so today the config is built
+        // but never reaches `begin`. That ORDER is mandatory — relaxing the gate without
+        // the config would silently apply the Gradient `calc_average` leaf to a Quantile
+        // fit, which is wrong and worse than the current correct CPU fallback.
+        exact_leaf: device_exact_leaf.0,
+        quantile_alpha: device_exact_leaf.1,
+        quantile_delta: device_exact_leaf.2,
         //
         // ─── SPEC-OH-21/22/24/25: the one-hot channel ───────────────────────────────
         // All three travel together and describe the SAME concatenated `float | one-hot`
@@ -4456,6 +4635,36 @@ fn train_inner<R: Runtime>(
         one_hot_flags: device_one_hot_flags.clone(),
         real_folds: device_real_folds.clone(),
         n_float: device_n_float,
+        // FPP-20 (T23): the per-fit ordered descriptor. `Some` only on an Ordered fit that
+        // actually built a learning fold; `None` keeps every Plain fit byte-unchanged (D-04).
+        //
+        // Everything here is a pure function of `(n, fold_len_multiplier, weights)` plus the
+        // learning permutation, i.e. per-FIT constant, which is why it rides the config rather
+        // than the per-tree grow seam. `segment_tail_finish` carries ONLY `tail_finish`:
+        // `ordered_segment_leaf_stats` discards `body_finish` (tree.rs), so a segment is the
+        // permutation PREFIX `[0, tail_finish)`. `body_finish` survives solely inside
+        // `scale_l2_reg`, which is exactly where it is applied below.
+        ordered: ordered_learning_perm.as_ref().map(|perm| {
+            let segments = crate::fold::body_tail_segments(n, params.fold_len_multiplier);
+            let seg_body_sum_weights =
+                crate::fold::body_sum_weights(n, params.fold_len_multiplier, &weights);
+            cb_compute::DeviceOrderedConfig {
+                // The device index type is u32; a negative permutation entry is a
+                // fold-construction bug, and mapping it to 0 here would silently train on a
+                // duplicated object. Clamp is not appropriate, so an out-of-range entry is left
+                // to the session's host-side validation, which rejects `>= n` before upload.
+                permutation: perm.iter().map(|&p| p as u32).collect(),
+                segment_tail_finish: segments.iter().map(|&(_, tail)| tail).collect(),
+                segment_scaled_l2: segments
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &(body_finish, _))| {
+                        let bsw = seg_body_sum_weights.get(idx).copied().unwrap_or(0.0);
+                        cb_compute::scale_l2_reg(params.l2_leaf_reg, bsw, body_finish)
+                    })
+                    .collect(),
+            }
+        }),
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
@@ -4769,7 +4978,7 @@ fn train_inner<R: Runtime>(
             let mut device_stored_leaf_values: Vec<f64> = Vec::new();
 
             let dev_tree = runtime
-                .grow_tree_on_device(&approx, target, &device_sample)?
+                .grow_tree_on_device(&approx, target, &device_sample, None)?
                 .ok_or_else(|| {
                     // `begin` returned Ok(true): the whole fit is committed to the
                     // device grower (D-10-01). Folding a CPU-grown tree here would MIX
@@ -5259,7 +5468,19 @@ fn train_inner<R: Runtime>(
             // randomness lives entirely in the device seed buffer, this host stream feeds
             // nothing on that arm, and there is no upstream CPU phase to stay aligned with.
             if draws_active && !device_poisson {
-                replay_grow_draws(&mut rng, params.depth, matrix.n_features());
+                // B-1: the replay is GROW-POLICY aware. Only the oblivious CPU grower
+                // touches the training RNG (region_grower / leaf_wise_grower take no
+                // Perturbation at all), so a Region / Depthwise / Lossguide device tree
+                // must replay NOTHING — replaying the oblivious level-search shape there
+                // would consume draws the CPU branch never consumes and desynchronise the
+                // NEXT tree's bootstrap().
+                let replay_policy = match params.grow_policy {
+                    EGrowPolicy::SymmetricTree => ReplayPolicy::SymmetricTree,
+                    EGrowPolicy::Region => ReplayPolicy::Region,
+                    EGrowPolicy::Depthwise => ReplayPolicy::Depthwise,
+                    EGrowPolicy::Lossguide => ReplayPolicy::Lossguide,
+                };
+                replay_grow_draws(&mut rng, replay_policy, params.depth, matrix.n_features());
                 for _ in 0..POST_TREE_EXTRA_DRAWS {
                     rng.gen_rand();
                 }
@@ -6901,3 +7122,11 @@ mod tests;
 #[cfg(test)]
 #[path = "boosting_device_fold_test.rs"]
 mod boosting_device_fold_tests;
+
+#[cfg(test)]
+#[path = "device_exact_leaf_config_test.rs"]
+mod device_exact_leaf_config_tests;
+
+#[cfg(test)]
+#[path = "device_ctr_combo_config_test.rs"]
+mod device_ctr_combo_config_tests;
