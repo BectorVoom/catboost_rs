@@ -4331,7 +4331,18 @@ fn train_inner<R: Runtime>(
     // to the device; a later Ok(None) from a covered fit is a mid-run mix and is
     // rejected (T-10-23), never silently backfilled with a CPU tree.
     let device_host_eligible = group_spans.is_none()
-        && ordered_learning_perm.is_none()
+        // FPP-20 (T23): the former `ordered_learning_perm.is_none()` clause is GONE. It was
+        // the host half of the ordered decline — the session-side gate was the other half —
+        // and it existed because the device had no way to score a candidate over the fold's
+        // body/tail segments. It does now (`grow_oblivious_tree_ordered_resident`), and the
+        // per-fit `DeviceOrderedConfig` built below carries the permutation + segment table
+        // the grow needs.
+        //
+        // Removing it does NOT make every ordered fit device-eligible: `map_ordered_coverage`
+        // still requires a covered simple-approximant loss, depth >= 1, a single fold,
+        // SymmetricTree and every other family flag at its default, and `begin` additionally
+        // requires the descriptor to be present. An uncovered ordered fit still falls back to
+        // the byte-unchanged CPU grower.
         // GDC-11 (T14): the CTR clauses are RELAXED — a single-permutation
         // (`learning_folds_for_cycle == 1`, made real by GDC-01) fit whose
         // materialized CTR columns are all device-covered (simple Borders
