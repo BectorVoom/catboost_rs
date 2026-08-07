@@ -80,7 +80,7 @@ pub use runtime::{
     DeviceBootstrapType, DeviceCtrAveraging, DeviceCtrColumn, DeviceCtrConfig, DeviceGrowPolicy,
     DeviceGrownTree,
     DeviceTrainConfig,
-    Derivatives, EScoreFunction, Float, LambdaMartMetric, Loss, Runtime,
+    Derivatives, EScoreFunction, FamilyTreeArgs, Float, LambdaMartMetric, Loss, Runtime,
     StochasticRankMetric,
     EXPECTILE_ALPHA_DEFAULT, QUERYSOFTMAX_BETA_DEFAULT, QUERYSOFTMAX_LAMBDA_DEFAULT,
     STOCHASTIC_RANK_LAMBDA_DEFAULT, STOCHASTIC_RANK_MU_DEFAULT,
@@ -113,6 +113,8 @@ mod leaf_test;
 mod loss_test;
 #[cfg(test)]
 mod runtime_ctr_averaging_test;
+#[cfg(test)]
+mod runtime_family_args_test;
 #[cfg(test)]
 mod runtime_test;
 #[cfg(test)]
