@@ -40,8 +40,8 @@
 use cubecl::server::Handle;
 
 use cb_compute::{
-    DeviceBootstrapType, DeviceCtrConfig, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig,
-    EScoreFunction, Loss,
+    DeviceBootstrapType, DeviceGrownTree, DeviceGrowPolicy, DeviceTrainConfig, EScoreFunction,
+    Loss,
 };
 use cb_core::{CbError, CbResult, TFastRng64};
 use rayon::prelude::*;
@@ -49,7 +49,7 @@ use rayon::prelude::*;
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
     grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
-    DerBinaryKernel, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
+    DerBinaryKernel, ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
     create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
@@ -134,10 +134,25 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
     let Some(ctr) = config.ctr.as_ref() else {
         return false;
     };
+    // GDC-09: a covered CTR fit carries BOTH permutations — the structure columns
+    // for split search and the averaging columns for leaf-value gather (D2 full
+    // two-permutation parity). A config without the averaging half is DECLINED
+    // (never silently gathered structure-only, research pitfall #2); the averaging
+    // set mirrors every shape invariant of the structure set.
+    let Some(avg) = ctr.averaging.as_ref() else {
+        return false;
+    };
     ctr.permutation.len() == n
         && ctr.target_class.len() == n
         && !ctr.columns.is_empty()
         && ctr
+            .columns
+            .iter()
+            .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
+        && avg.permutation.len() == n
+        && avg.target_class.len() == n
+        && avg.columns.len() == ctr.columns.len()
+        && avg
             .columns
             .iter()
             .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
@@ -154,13 +169,40 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
 /// # Errors
 /// [`CbError`] propagated from the device CTR launch / read-back; the caller only invokes this once
 /// [`ctr_covered`] has confirmed the shape invariants, so the length guards here are defensive.
+/// GDC-11 (T14): the owned session-side CTR split-search coordination state — see
+/// [`ResidentCtrSearch`] for the per-tree borrowed view and the semantics.
+struct CtrSearchState {
+    /// CTR tail width (== the number of structure CTR columns).
+    n_ctr: usize,
+    /// Per-column distinct-bucket count (the cat-feature weight's `count`).
+    bucket_counts: Vec<usize>,
+    /// Per-column `(ctr_type, projection)` identity group id.
+    weight_groups: Vec<u32>,
+    /// Per-group model-lifetime used flags (all `false` at fit start; a tree
+    /// choosing a CTR split lifts its group for every LATER level and tree).
+    group_used: Vec<bool>,
+    /// One raw per-object bucket column per CTR-eligible cat feature (phantom).
+    cat_eligible_buckets: Vec<Vec<u32>>,
+    /// The `model_size_reg` coefficient.
+    model_size_reg: f64,
+    /// The BASE float cindex columns (feature-major host copy) for the phantom's
+    /// float-partition replay.
+    float_bins: Vec<u32>,
+}
+
+/// GDC-09: parameterized over `(permutation, target_class, columns)` so `begin`
+/// can call it TWICE — once with the STRUCTURE permutation (split-search cindex)
+/// and once with the AVERAGING permutation (leaf-value gather bins) — reusing the
+/// SAME online-CTR + binarize kernels verbatim (Do Not Hand-Roll).
 fn build_ctr_cindex_columns(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
-    ctr: &DeviceCtrConfig,
+    permutation: &[u32],
+    target_class: &[u32],
+    ctr_columns: &[cb_compute::DeviceCtrColumn],
     n: usize,
 ) -> CbResult<Vec<Vec<u32>>> {
-    let mut columns = Vec::with_capacity(ctr.columns.len());
-    for col in &ctr.columns {
+    let mut columns = Vec::with_capacity(ctr_columns.len());
+    for col in ctr_columns {
         // Fold the member categories into one (combined) bin column + its distinct-bucket count.
         let (bins, buckets) = if col.member_bins.len() == 1 {
             let single = col.member_bins.first().cloned().unwrap_or_default();
@@ -171,9 +213,9 @@ fn build_ctr_cindex_columns(
         };
         let res = launch_ordered_ctr_resident(
             client,
-            &ctr.permutation,
+            permutation,
             &bins,
-            &ctr.target_class,
+            target_class,
             col.prior,
             buckets,
             n,
@@ -639,6 +681,25 @@ fn host_der1(der_kernel: DerBinaryKernel, approx: &[f64], target: &[f64]) -> Vec
         .collect()
 }
 
+/// GDC-03/GDC-04: fold the per-object weight into the host der (`w·der1` — the CPU
+/// `weighted_der1`, upstream's `SumWeightedDelta` numerator) for the host-driven
+/// nonsym / Region growers, whose every internal `der1` use is a contribution sum.
+/// The uniform-weight path returns the raw der unchanged (no copy, D-04). This is a
+/// TRANSFORM, not a reduction, so `cb_core::sum_f64` does not apply — every
+/// downstream reduction inside the growers already routes through `sum_f64`.
+/// Fixed-point note: the growers gather host-side (no `2^33` encode on this path),
+/// but the weighted product still feeds the same `calc_average` contract as the
+/// resident arm (see `grow_oblivious_tree_resident`'s bound comment).
+fn host_weighted_der1(der1: Vec<f64>, weights_uniform: bool, weight: &[f64]) -> Vec<f64> {
+    if weights_uniform {
+        return der1;
+    }
+    der1.iter()
+        .zip(weight.iter())
+        .map(|(&d, &w)| d * w)
+        .collect()
+}
+
 /// The fixed-point histogram's accumulated-magnitude ceiling, `2^33` (WR-01 `WR01-S10`,
 /// finding F-D). The split histogram stores `round(Σ · 2^30)` as `i64` bits inside an
 /// `Atomic<u64>`, so the integer sum is exact only while `|Σ| · 2^30 < 2^63`, i.e.
@@ -739,6 +800,15 @@ pub struct GpuTrainSession {
     indices_h: Handle,
     /// The per-object weight (channel float type), folded downstream by the histogram.
     weight_h: Handle,
+    /// GDC-02: whether the per-object weight is uniformly `1.0`, computed ONCE at
+    /// `begin`. The uniform path reuses `der1_h` as the weighted-der channel (the
+    /// same handle — ZERO extra kernel launches, byte-and-perf-unchanged, D-04);
+    /// only a genuinely weighted fit pays the one elementwise multiply per tree.
+    weights_uniform: bool,
+    /// GDC-02: the host copy of the per-object weight, kept for the host-side
+    /// fixed-point overflow guard on the sampled score channel (`w·der1·s`).
+    /// Empty on a uniform fit (the guard never reads it there).
+    weight_host: Vec<f64>,
     /// The regression/classification target (channel float type), for the der recompute.
     /// Set on the FIRST `grow_one` (the seam supplies `target` per tree, not at `begin`).
     target_h: Option<Handle>,
@@ -777,6 +847,21 @@ pub struct GpuTrainSession {
     /// (default) regime reaches here, so no field is consumed yet.
     #[allow(dead_code)]
     config: DeviceTrainConfig,
+    /// GDC-11 (T14): the CTR split-search coordination state — per-column bucket
+    /// counts / weight groups, the model-lifetime `group_used` flags (updated as
+    /// trees choose CTR splits), the phantom-projection inputs, and the host copy
+    /// of the BASE float cindex for the float-partition replay. `Some` iff this is
+    /// a covered CTR fit.
+    ctr_search: Option<CtrSearchState>,
+    /// GDC-09 (T11): the AVERAGING-permutation binarized CTR bin columns (one
+    /// `Vec<u32>` per CTR column, object order, bins in `0..n_bins`), read back
+    /// once at `begin`. `Some` iff the fit committed to a covered two-permutation
+    /// CTR regime. Held OFF the resident cindex deliberately: the split scorer
+    /// only sees the packed cindex, so these columns are structurally unreadable
+    /// by split search — they feed ONLY the leaf-value gather (GDC-10). The
+    /// index-aligned STRUCTURE columns occupy the cindex tail
+    /// (`n_features - ctr_averaging_bins.len() ..`).
+    ctr_averaging_bins: Option<Vec<Vec<u32>>>,
     /// The per-fit non-symmetric grow state (Phase 12 Plan 03). `Some` iff the fit committed
     /// to a Depthwise / Lossguide device grow — [`Self::grow_one`] then dispatches to the
     /// host-driven [`grow_nonsym_tree`] instead of the resident oblivious loop. `None` for the
@@ -1347,9 +1432,63 @@ impl GpuTrainSession {
         // Round-3 perf: the non-CTR path BORROWS the caller's bins (no n*n_features-cell
         // copy on the hot begin path); only the CTR arm materializes an augmented owned
         // buffer. `Cow` keeps both arms feeding the SAME pack below.
+        // GDC-09: the covered CTR fit materializes BOTH permutations. The STRUCTURE
+        // columns join the resident cindex (split search reads them like any plain
+        // feature); the AVERAGING columns are held SEPARATELY host-side
+        // (`ctr_averaging_bins`) so the split scorer structurally cannot read them —
+        // they exist only for the leaf-value gather (GDC-10).
+        let mut ctr_averaging_bins: Option<Vec<Vec<u32>>> = None;
+        let mut ctr_search: Option<CtrSearchState> = None;
         let (eff_bins, eff_n_features): (std::borrow::Cow<'_, [u32]>, usize) = if ctr_is_covered {
             if let Some(ctr) = config.ctr.as_ref() {
-                let ctr_columns = build_ctr_cindex_columns(&client, ctr, n)?;
+                let ctr_columns = build_ctr_cindex_columns(
+                    &client,
+                    &ctr.permutation,
+                    &ctr.target_class,
+                    &ctr.columns,
+                    n,
+                )?;
+                if let Some(avg) = ctr.averaging.as_ref() {
+                    ctr_averaging_bins = Some(build_ctr_cindex_columns(
+                        &client,
+                        &avg.permutation,
+                        &avg.target_class,
+                        &avg.columns,
+                        n,
+                    )?);
+                }
+                // GDC-11: the split-search coordination state. `bucket_count == 0`
+                // falls back to the column's own observed distinct-bucket count
+                // (single-member columns; the gate admits only simple projections).
+                let bucket_counts: Vec<usize> = ctr
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        if col.bucket_count > 0 {
+                            col.bucket_count
+                        } else {
+                            col.member_bins
+                                .first()
+                                .map(|b| {
+                                    b.iter().collect::<std::collections::BTreeSet<_>>().len()
+                                })
+                                .unwrap_or(1)
+                                .max(1)
+                        }
+                    })
+                    .collect();
+                let weight_groups: Vec<u32> =
+                    ctr.columns.iter().map(|col| col.weight_group).collect();
+                let n_groups = weight_groups.iter().copied().max().map_or(0, |m| m as usize + 1);
+                ctr_search = Some(CtrSearchState {
+                    n_ctr: ctr_columns.len(),
+                    bucket_counts,
+                    weight_groups,
+                    group_used: vec![false; n_groups],
+                    cat_eligible_buckets: ctr.cat_eligible_buckets.clone(),
+                    model_size_reg: ctr.model_size_reg,
+                    float_bins: bins_feature_major.to_vec(),
+                });
                 let mut augmented = bins_feature_major.to_vec();
                 for col in &ctr_columns {
                     augmented.extend_from_slice(col);
@@ -1432,6 +1571,10 @@ impl GpuTrainSession {
         let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
         let indices_h = client.create(cubecl::bytes::Bytes::from_elems(indices));
         let weight_h = upload_channel_floats(&client, weight);
+        // GDC-02: frozen once per fit — see the field doc. The host copy is kept
+        // only when non-uniform (the overflow guard's input); empty otherwise.
+        let weights_uniform = weight.iter().all(|&w| w == 1.0);
+        let weight_host = if weights_uniform { Vec::new() } else { weight.to_vec() };
         // The running approx starts all-zero (the RMSE-from-zero MVP; boost_from_average is
         // out of scope, the cross-oracle uses the SAME zero start).
         let approx_h = upload_channel_floats(&client, &vec![0.0_f64; n]);
@@ -1519,6 +1662,8 @@ impl GpuTrainSession {
             masks_h,
             indices_h,
             weight_h,
+            weights_uniform,
+            weight_host,
             target_h: None,
             approx_h,
             der1_h: None,
@@ -1535,6 +1680,8 @@ impl GpuTrainSession {
             learning_rate,
             der_kernel,
             config: config.clone(),
+            ctr_search,
+            ctr_averaging_bins,
             nonsym,
             exact_leaf,
             bootstrap,
@@ -1580,6 +1727,14 @@ impl GpuTrainSession {
     #[must_use]
     pub fn n_features_effective(&self) -> usize {
         self.n_features
+    }
+
+    /// GDC-09 observation point: the AVERAGING-permutation binarized CTR bin
+    /// columns (`Some` iff a covered two-permutation CTR fit opened this session).
+    /// Held OFF the resident cindex — see the field doc.
+    #[must_use]
+    pub fn ctr_averaging_bins(&self) -> Option<&[Vec<u32>]> {
+        self.ctr_averaging_bins.as_deref()
     }
 
     /// SPEC-OH-22/24 observation point: the frozen one-hot channel as the resident scorer
@@ -1679,7 +1834,17 @@ impl GpuTrainSession {
                     actual: approx.len(),
                 });
             }
-            let der1 = host_der1(rg.der_kernel, approx, target);
+            // GDC-04: the Region grower's split scores AND leaf values are all
+            // contribution sums over its first argument, so passing `w·der1`
+            // caller-side fixes every internal site at once (leaf =
+            // `calc_average(Σ(w·der1), Σw, l2)`, upstream's SumWeightedDelta);
+            // `weight` stays raw for the denominators. Uniform weights reuse the
+            // raw der (no copy, byte-unchanged D-04).
+            let der1 = host_weighted_der1(
+                host_der1(rg.der_kernel, approx, target),
+                self.weights_uniform,
+                &rg.weight,
+            );
             return grow_region_tree(
                 &der1,
                 &rg.weight,
@@ -1708,7 +1873,16 @@ impl GpuTrainSession {
                     actual: approx.len(),
                 });
             }
-            let der1 = host_der1(ns.der_kernel, approx, target);
+            // GDC-03: every internal `der1` use in `grow_nonsym_tree` is a
+            // contribution SUM (unsplit baseline, per-node split score, leaf
+            // value — never a residual carried forward), so the caller-side
+            // `w·der1` substitution fixes all three sites in one edit; `weight`
+            // stays raw. Uniform weights reuse the raw der (byte-unchanged D-04).
+            let der1 = host_weighted_der1(
+                host_der1(ns.der_kernel, approx, target),
+                self.weights_uniform,
+                &ns.weight,
+            );
             return grow_nonsym_tree(
                 ns.policy,
                 &der1,
@@ -1909,12 +2083,16 @@ impl GpuTrainSession {
                 // BEFORE uploading it (`WR01-S10`). The check needs host `der1`, which is the
                 // same value the resident `der1_h` holds — recomputed here from the caller's
                 // approx/target through the SAME `host_der1` helper the nonsym / region / exact
-                // arms use, so the two can never disagree.
-                guard_sample_fixedpoint_range(
-                    sample,
-                    &host_der1(self.der_kernel, approx, target),
-                    self.n,
-                )?;
+                // arms use, so the two can never disagree. GDC-02: under non-uniform weights
+                // the score channel carries `w·der1·s`, so the guard folds the weight in too
+                // (the uniform path is byte-unchanged: `w == 1`).
+                let mut guard_der1 = host_der1(self.der_kernel, approx, target);
+                if !self.weights_uniform {
+                    for (d, w) in guard_der1.iter_mut().zip(self.weight_host.iter()) {
+                        *d *= w;
+                    }
+                }
+                guard_sample_fixedpoint_range(sample, &guard_der1, self.n)?;
                 Some(upload_channel_floats(&self.client, sample))
             }
             None => None,
@@ -1930,21 +2108,45 @@ impl GpuTrainSession {
         // NOTE this also corrects the device-RESIDENT sampler arm, which previously folded the
         // sample into the single `weight_ref` handed to BOTH the histogram and the leaf reduce
         // while leaving `der1` unsampled — wrong on both channels under any sampling.
+        // GDC-02: the WEIGHTED-der channel `w·der1` — upstream's `SumWeightedDelta`
+        // numerator — feeds BOTH the split histogram (via `score_der1_h` below) and
+        // the leaf-stat reduce (`leaf_der1_h`). On a uniform fit it IS `der1_h`
+        // (same handle, zero extra launches, byte-unchanged D-04). The raw `der1_h`
+        // is never mutated: the next tree's residual recompute reads the resident
+        // approx, and the routing split keeps the raw handle (mirrors the CPU
+        // `ders.der1` vs `weighted_der1` split).
+        let weighted_der1_h = if self.weights_uniform {
+            der1_h.clone()
+        } else {
+            fold_weights_resident(&self.client, &der1_h, &self.weight_h, self.n)?
+        };
         let (score_der1_h, score_weight_h) = match effective_sample_h.as_ref() {
             Some(s) => (
-                fold_weights_resident(&self.client, &der1_h, s, self.n)?,
+                fold_weights_resident(&self.client, &weighted_der1_h, s, self.n)?,
                 fold_weights_resident(&self.client, &self.weight_h, s, self.n)?,
             ),
-            None => (der1_h.clone(), self.weight_h.clone()),
+            None => (weighted_der1_h.clone(), self.weight_h.clone()),
         };
 
         // Grow one tree over the resident handles; take ownership of the resident approx
         // (updated in place on device) and swap it back afterwards.
+        // GDC-11: the per-tree borrowed view of the session's CTR search state
+        // (`None` on every non-CTR fit — byte-unchanged).
+        let mut ctr_search_view = self.ctr_search.as_mut().map(|st| ResidentCtrSearch {
+            n_ctr: st.n_ctr,
+            bucket_counts: &st.bucket_counts,
+            weight_groups: &st.weight_groups,
+            group_used: &mut st.group_used,
+            cat_eligible_buckets: &st.cat_eligible_buckets,
+            model_size_reg: st.model_size_reg,
+            float_bins: &st.float_bins,
+        });
         let approx_h = self.approx_h.clone();
         let (tree, approx_next, der1_next) = grow_oblivious_tree_resident(
             &self.client,
             approx_h,
             &der1_h,
+            &weighted_der1_h,
             &self.weight_h,
             &score_der1_h,
             &score_weight_h,
@@ -1973,6 +2175,7 @@ impl GpuTrainSession {
             self.score_fn,
             self.learning_rate,
             self.der_kernel,
+            ctr_search_view.as_mut(),
         )?;
 
         // Advance the resident state for the next tree.
@@ -1996,6 +2199,86 @@ impl GpuTrainSession {
                 compute_exact_leaf_values(&tree.leaf_of, tree.leaf_values.len(), approx, target, ex)?
             }
             None => tree.leaf_values,
+        };
+
+        // GDC-10 (T12): the CTR two-permutation leaf-value gather. On a covered CTR
+        // fit whose tree chose ≥1 CTR-column split, the RETURNED leaf values are
+        // recomputed over the AVERAGING-permutation assignment (the CPU
+        // `assign_leaf_over_ctr_columns` semantics), from the MAIN-trajectory der —
+        // the caller's host `approx`, which cb-train advances over the averaging
+        // partition, exactly like the CPU main-approx update. The RESIDENT approx /
+        // der1 deliberately keep the STRUCTURE-partition update above: that
+        // trajectory IS the CPU learning-fold-0 approx (`UpdateLearningFold` with
+        // `fold_leaf_of = grown.leaf_of`), which drives the next tree's split
+        // SEARCH. Two trajectories by construction, matching the CPU CTR path.
+        //
+        // The averaging assignment re-derives ONLY the CTR-level bits: bit `l` of
+        // the structure `leaf_of` is reused verbatim for float levels (the two
+        // assignments agree there), and replaced by `avg_bin > bin_id` for a
+        // CTR-column level. CTR columns occupy the cindex tail
+        // `[n_features - n_ctr, n_features)`. Exact-leaf × CTR cannot co-occur
+        // (the gate declines the combination), so this and the override above are
+        // mutually exclusive.
+        let leaf_values = match self.ctr_averaging_bins.as_ref() {
+            Some(avg_bins) if !avg_bins.is_empty() => {
+                let n_ctr = avg_bins.len();
+                let base = self.n_features.saturating_sub(n_ctr);
+                let has_ctr_split =
+                    tree.splits.iter().any(|&(f, _, _)| (f as usize) >= base);
+                if has_ctr_split {
+                    if approx.len() != self.n {
+                        return Err(CbError::LengthMismatch {
+                            column: "approx (CTR leaf gather needs the caller's main approx)"
+                                .to_owned(),
+                            expected: self.n,
+                            actual: approx.len(),
+                        });
+                    }
+                    let der1 = host_der1(self.der_kernel, approx, target);
+                    let n_leaves = leaf_values.len();
+                    let mut der_segs: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+                    let mut w_segs: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+                    for obj in 0..self.n {
+                        let structure_leaf =
+                            tree.leaf_of.get(obj).copied().unwrap_or(0) as usize;
+                        let mut leaf = 0usize;
+                        for (l, &(f, b, _one_hot)) in tree.splits.iter().enumerate() {
+                            let fu = f as usize;
+                            let bit = if fu >= base {
+                                avg_bins
+                                    .get(fu - base)
+                                    .and_then(|col| col.get(obj))
+                                    .is_some_and(|&bin| bin > b)
+                            } else {
+                                (structure_leaf >> l) & 1 == 1
+                            };
+                            if bit {
+                                leaf |= 1usize << l;
+                            }
+                        }
+                        let w = self.weight_host.get(obj).copied().unwrap_or(1.0);
+                        let d = der1.get(obj).copied().unwrap_or(0.0);
+                        if let (Some(ds), Some(ws)) =
+                            (der_segs.get_mut(leaf), w_segs.get_mut(leaf))
+                        {
+                            ds.push(d * w);
+                            ws.push(w);
+                        }
+                    }
+                    let mut gathered = vec![0.0_f64; n_leaves];
+                    for leaf in 0..n_leaves {
+                        let sum = der_segs.get(leaf).map_or(0.0, |s| cb_core::sum_f64(s));
+                        let cnt = w_segs.get(leaf).map_or(0.0, |s| cb_core::sum_f64(s));
+                        if let Some(slot) = gathered.get_mut(leaf) {
+                            *slot = cb_compute::calc_average(sum, cnt, self.scaled_l2);
+                        }
+                    }
+                    gathered
+                } else {
+                    leaf_values
+                }
+            }
+            _ => leaf_values,
         };
 
         Ok(DeviceGrownTree {

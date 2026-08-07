@@ -2229,6 +2229,137 @@ fn ctr_splits_for_tree(
         .collect()
 }
 
+/// GDC-11 (T14): whether every materialized CTR column is DEVICE-covered. The
+/// device CTR arm implements the ordered binclf `(good + prior) / (total + 1)`
+/// statistic over SIMPLE (single-feature) projections — exactly upstream's
+/// Borders CTR with `target_border_idx == 0` and a unit prior denominator.
+/// Everything else (Buckets / BinarizedTargetMeanValue / Counter, combination
+/// projections, multi-target-border Buckets columns) declines to the
+/// byte-unchanged CPU path (D-04): the device kernels do not implement those
+/// accumulation semantics, and a wrong device leaf is worse than a CPU fallback.
+/// An EMPTY column set returns `false` (the caller's `is_empty()` arm owns that).
+fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
+    !cols.is_empty()
+        && cols.iter().all(|col| {
+            col.projection.is_simple()
+                && col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
+                && col.target_border_idx == 0
+                && col.prior_denom == 1.0
+        })
+}
+
+/// GDC-11 (T14): build the two-permutation [`cb_compute::DeviceCtrConfig`] from
+/// the CPU-side materialization state. The border table reproduces
+/// [`crate::ctr::calc_ctr_online_bin`]'s truncation EXACTLY under the device's
+/// strict `value > border` binarize: `bin >= k+1 ⟺ v >= v_k` with
+/// `v_k = (k+1)·norm/border_count − shift`, so `borders[k] = v_k.next_down()`
+/// (the greatest f64 strictly below `v_k`) makes the strict test equivalent to
+/// the truncation for EVERY f64 value, including exact boundary hits.
+///
+/// # Errors
+/// A negative permutation entry (impossible for a well-formed fold order) is a
+/// typed [`CbError::OutOfRange`] rather than a silent `as` truncation.
+#[allow(clippy::too_many_arguments)]
+fn build_device_ctr_config(
+    materialized_ctr_features: &[crate::ctr::CtrFeatureColumn],
+    averaging_ctr_features: &[crate::ctr::CtrFeatureColumn],
+    cat_learn_permutation: &[i32],
+    cat_averaging_permutation: &[i32],
+    target_class: &[usize],
+    cat_eligible_buckets: &[Vec<u32>],
+    eligible_absolute: &[usize],
+    ctr_border_count: usize,
+) -> CbResult<cb_compute::DeviceCtrConfig> {
+    let cast_perm = |perm: &[i32]| -> CbResult<Vec<u32>> {
+        perm.iter()
+            .map(|&p| {
+                u32::try_from(p).map_err(|_| {
+                    CbError::OutOfRange(format!(
+                        "device CTR permutation entry {p} is negative (malformed fold order)"
+                    ))
+                })
+            })
+            .collect()
+    };
+    let device_target_class: Vec<u32> = target_class
+        .iter()
+        .map(|&c| u32::try_from(c).unwrap_or(u32::MAX))
+        .collect();
+
+    // Group columns by `(ctr_type, projection)` — the `UsedCtrSplits` identity
+    // the cat-feature weight lifts on (multi-prior columns share one group).
+    let mut group_keys: Vec<(i8, crate::TProjection)> = Vec::new();
+    let build_columns = |cols: &[crate::ctr::CtrFeatureColumn],
+                         group_keys: &mut Vec<(i8, crate::TProjection)>|
+     -> CbResult<Vec<cb_compute::DeviceCtrColumn>> {
+        cols.iter()
+            .map(|col| {
+                // Simple projection (guaranteed by `ctr_types_are_device_covered`):
+                // the single member's RAW bucket column.
+                let abs = col.projection.cat_features().first().copied().ok_or_else(|| {
+                    CbError::Degenerate(
+                        "device CTR column with an empty projection".to_owned(),
+                    )
+                })?;
+                let pos = eligible_absolute
+                    .iter()
+                    .position(|&a| a == abs)
+                    .ok_or_else(|| {
+                        CbError::OutOfRange(format!(
+                            "device CTR projection member {abs} is not a CTR-eligible \
+                             categorical feature"
+                        ))
+                    })?;
+                let member = cat_eligible_buckets.get(pos).cloned().ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "no raw bucket column for CTR-eligible feature position {pos}"
+                    ))
+                })?;
+                let prior = col.prior_num / col.prior_denom;
+                let (shift, norm) = crate::ctr::calc_normalization(prior);
+                let borders: Vec<f64> = (0..ctr_border_count)
+                    .map(|k| {
+                        let v_k = (k as f64 + 1.0) * norm / ctr_border_count as f64 - shift;
+                        v_k.next_down()
+                    })
+                    .collect();
+                let key = (col.ctr_type, col.projection.clone());
+                let group = match group_keys.iter().position(|g| *g == key) {
+                    Some(g) => g,
+                    None => {
+                        group_keys.push(key);
+                        group_keys.len() - 1
+                    }
+                };
+                Ok(cb_compute::DeviceCtrColumn {
+                    member_bins: vec![member],
+                    prior,
+                    borders,
+                    bucket_count: col.bucket_count,
+                    weight_group: u32::try_from(group).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
+    };
+
+    let columns = build_columns(materialized_ctr_features, &mut group_keys)?;
+    // The averaging half shares the identity groups (same specs, different order).
+    let avg_columns = build_columns(averaging_ctr_features, &mut group_keys)?;
+
+    Ok(cb_compute::DeviceCtrConfig {
+        permutation: cast_perm(cat_learn_permutation)?,
+        target_class: device_target_class.clone(),
+        columns,
+        averaging: Some(cb_compute::DeviceCtrAveraging {
+            permutation: cast_perm(cat_averaging_permutation)?,
+            target_class: device_target_class,
+            columns: avg_columns,
+        }),
+        cat_eligible_buckets: cat_eligible_buckets.to_vec(),
+        model_size_reg: model_size_reg_default(),
+    })
+}
+
 /// A held-out evaluation set feeding the overfitting detector (TRAIN-06). The
 /// `feature_values` reuse the training feature borders (the model's float-feature
 /// borders) for the `value > border` split tests.
@@ -4082,8 +4213,22 @@ fn train_inner<R: Runtime>(
     // rejected (T-10-23), never silently backfilled with a CPU tree.
     let device_host_eligible = group_spans.is_none()
         && ordered_learning_perm.is_none()
-        && materialized_ctr_features.is_empty()
-        && structure_fold_columns.iter().all(Vec::is_empty)
+        // GDC-11 (T14): the CTR clauses are RELAXED — a single-permutation
+        // (`learning_folds_for_cycle == 1`, made real by GDC-01) fit whose
+        // materialized CTR columns are all device-covered (simple Borders
+        // projections, see `ctr_types_are_device_covered`) may now commit to the
+        // device; the session materializes BOTH permutations (GDC-09) and gathers
+        // leaf values over the averaging bins (GDC-10). Anything else — multi-
+        // permutation, combination projections, non-Borders types, one-hot × CTR
+        // — still falls back to the byte-unchanged CPU path (D-04). The Ordered
+        // clause above is deliberately UNTOUCHED (D5).
+        && (
+            (materialized_ctr_features.is_empty()
+                && structure_fold_columns.iter().all(Vec::is_empty))
+            || (learning_folds_for_cycle == 1
+                && one_hot_bins.is_empty()
+                && ctr_types_are_device_covered(&materialized_ctr_features))
+        )
         && !penalties_active
         && params.monotone_constraints.is_empty()
         // Phase 12 Plan 03/04 (GPUT-18): SymmetricTree (oblivious, Plan 01), the two
@@ -4152,16 +4297,13 @@ fn train_inner<R: Runtime>(
                 .map(|h| u32::try_from(h.len()).unwrap_or(u32::MAX))
                 .collect::<Vec<_>>(),
         )
-        // WR-03: the device grow path sums the UNWEIGHTED der (`Σ der1`) into
-        // histogram channel 0 and estimates leaves via `calc_average(Σ der1,
-        // Σ weight, l2)` — object weight enters only the denominator, never the
-        // numerator. That matches the in-repo CPU path (cpu-vs-gpu agree) but NOT
-        // upstream CatBoost's `Σ w·der` (`TBucketStats::SumWeightedDelta`). Until
-        // weighted-der is wired through the histogram/leaf math, a genuinely
-        // weighted pool cannot meet the ≤1e-5 upstream-parity bar, so restrict the
-        // device path to uniform unit weights and let weighted pools fall back to
-        // the CPU grower (D-04).
-        && weights.iter().all(|&w| w == 1.0)
+        // GDC-05: the former WR-03 weight-uniformity clause is GONE. The device
+        // grow paths now consume `w·der1` (upstream's `SumWeightedDelta`) in the
+        // split histogram AND the leaf estimate on every covered grow policy —
+        // the oblivious resident grow (GDC-02, `weighted_der1_h`), and the
+        // host-driven nonsym / Region growers (GDC-03/04, `host_weighted_der1`)
+        // — so a genuinely weighted pool meets the ≤1e-5 upstream bar on device.
+        // The `bias == 0.0` sibling (CR-01) below stays unrelaxed.
         // CR-01: the device session always seeds its resident approx to zero
         // (`GpuTrainSession::begin`), so a non-zero starting bias — e.g.
         // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must
@@ -4223,7 +4365,34 @@ fn train_inner<R: Runtime>(
         // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
         _ => DeviceGrowPolicy::SymmetricTree,
     };
+    // GDC-11 (T14): the two-permutation device CTR config. Populated ONLY for a
+    // host-eligible CTR fit (the relaxed clause above already vetted single-
+    // permutation + simple Borders columns); every other fit keeps `ctr: None`
+    // (byte-unchanged, D-04). The backend's `ctr_covered` gate independently
+    // re-checks the shape (borders+1 == n_bins, averaging present) and declines
+    // to CPU on any mismatch.
+    let device_ctr = if device_host_eligible && !materialized_ctr_features.is_empty() {
+        match (
+            cat_learn_permutation.as_deref(),
+            cat_averaging_permutation.as_deref(),
+        ) {
+            (Some(learn), Some(avg)) => Some(build_device_ctr_config(
+                &materialized_ctr_features,
+                &averaging_ctr_features,
+                learn,
+                avg,
+                &target_class,
+                &cat_eligible_buckets,
+                &eligible_absolute,
+                ctr_border_count,
+            )?),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let device_config = DeviceTrainConfig {
+        ctr: device_ctr,
         grow_policy: device_grow_policy,
         // The Lossguide cap is meaningful ONLY for the non-sym leaf-wise policy; leave it
         // `None` for SymmetricTree so `is_covered_regime()` (Plan 01) stays satisfied.
@@ -4294,7 +4463,12 @@ fn train_inner<R: Runtime>(
             &params.loss,
             params.depth,
             matches!(params.boosting_type, EBoostingType::Plain),
-            /* fold_count = */ 1,
+            // GDC-01: the REAL learning-fold count, not a literal 1. For every
+            // non-CTR fit `learning_fold_count(pc, false) == 1` (byte-unchanged,
+            // D-04); once the CTR clause admits fits, `ctr_covered`'s
+            // `fold_count != 1` decline (session.rs) becomes load-bearing and a
+            // multi-permutation CTR fit can never silently ride fold-0 columns.
+            learning_folds_for_cycle,
             params.score_function,
             &device_bins,
             &weights,
@@ -4735,10 +4909,54 @@ fn train_inner<R: Runtime>(
                 let mut device_splits: Vec<Split> = Vec::with_capacity(dev_tree.splits.len());
                 let mut device_one_hot_splits: Vec<crate::tree::OneHotSplit> = Vec::new();
                 let mut device_level_kinds: Vec<crate::tree::LevelKind> = Vec::new();
+                // GDC-11 (T14): the chosen CTR splits, translated from the device
+                // CTR tail (`feature >= device_n_features`) back to the CPU
+                // `CtrSplitSpec` identity (mirrors the CPU search emission,
+                // `tree.rs` `CtrAwareSplit::Ctr` arm — same value-space border,
+                // same default Shift/Scale the bake later overwrites).
+                let mut device_ctr_splits: Vec<CtrSplitSpec> = Vec::new();
+                let device_has_ctr_split = dev_tree
+                    .splits
+                    .iter()
+                    .any(|&(f, _, _)| (f as usize) >= device_n_features);
                 let device_has_one_hot = dev_tree.splits.iter().any(|&(_, _, oh)| oh);
+                let device_mixed_kinds = device_has_one_hot || device_has_ctr_split;
                 for &(feature, bin_id, is_one_hot) in &dev_tree.splits {
                     let f = feature as usize;
                     let b = bin_id as usize;
+                    if f >= device_n_features {
+                        // CTR tail column `f - device_n_features` (the session
+                        // appends the structure CTR columns after `float|one-hot`).
+                        let col = f - device_n_features;
+                        let column =
+                            materialized_ctr_features.get(col).ok_or_else(|| {
+                                CbError::OutOfRange(format!(
+                                    "device CTR split names tail column {col}, but only {} \
+                                     CTR column(s) are materialized",
+                                    materialized_ctr_features.len()
+                                ))
+                            })?;
+                        device_level_kinds.push(crate::tree::LevelKind::Ctr {
+                            ctr_idx: device_ctr_splits.len(),
+                            // BIN space — the training-only border
+                            // `assign_leaf_over_ctr_columns` tests integer bins
+                            // against (see the CPU emission's units contract).
+                            border: b as f64,
+                        });
+                        device_ctr_splits.push(CtrSplitSpec {
+                            projection: column.projection.clone(),
+                            ctr_type: column.ctr_type,
+                            prior_num: column.prior_num,
+                            prior_denom: column.prior_denom,
+                            target_border_idx: column.target_border_idx,
+                            // VALUE space (SPEC-CTRB-01) for every persisted-border
+                            // consumer, exactly like the CPU search emission.
+                            border: crate::tree::ctr_bin_border_to_value_space(b as f64),
+                            shift: 0.0,
+                            scale: 1.0,
+                        });
+                        continue;
+                    }
                     if is_one_hot {
                         let pos = f.checked_sub(device_n_float).ok_or_else(|| {
                             CbError::OutOfRange(format!(
@@ -4775,7 +4993,7 @@ fn train_inner<R: Runtime>(
                                 feature_borders.get(f).map_or(0, Vec::len),
                             ))
                         })?;
-                    if device_has_one_hot {
+                    if device_mixed_kinds {
                         device_level_kinds
                             .push(crate::tree::LevelKind::Float(device_splits.len()));
                     }
@@ -4842,25 +5060,48 @@ fn train_inner<R: Runtime>(
                         })
                         .collect()
                 };
-                let device_leaf_of: Vec<usize> = (0..n)
-                    .map(|obj| {
-                        let mut leaf = 0usize;
-                        for (l, col) in level_cols.iter().enumerate() {
-                            let passes = match col {
-                                DeviceLevelCol::Float(values, border) => values
-                                    .get(obj)
-                                    .is_some_and(|&v| f64::from(v) > *border),
-                                DeviceLevelCol::OneHot(bins, value) => {
-                                    bins.get(obj).is_some_and(|&b| b == *value)
+                let device_leaf_of: Vec<usize> = if device_has_ctr_split {
+                    // GDC-11/GDC-10 (T14): the LEAF-VALUE / main-approx assignment
+                    // for a CTR tree is the AVERAGING-fold partition — exactly the
+                    // CPU `leaf_value_leaf_of` (`assign_leaf_over_ctr_columns`,
+                    // `BuildIndices(AveragingFold)`): float levels keep the float
+                    // test, CTR levels re-test against the AVERAGING column's
+                    // bins. The device already gathered the RETURNED leaf values
+                    // over this same partition (GDC-10), so values and assignment
+                    // stay consistent here.
+                    let grown_like = GrownTree {
+                        splits: device_splits.clone(),
+                        one_hot_splits: device_one_hot_splits.clone(),
+                        leaf_of: Vec::new(),
+                        ctr_splits: device_ctr_splits.clone(),
+                        level_kinds: device_level_kinds.clone(),
+                        step_nodes: Vec::new(),
+                        node_id_to_leaf_id: Vec::new(),
+                        region_directions: Vec::new(),
+                        region_one_hot: Vec::new(),
+                    };
+                    assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown_like, n)
+                } else {
+                    (0..n)
+                        .map(|obj| {
+                            let mut leaf = 0usize;
+                            for (l, col) in level_cols.iter().enumerate() {
+                                let passes = match col {
+                                    DeviceLevelCol::Float(values, border) => values
+                                        .get(obj)
+                                        .is_some_and(|&v| f64::from(v) > *border),
+                                    DeviceLevelCol::OneHot(bins, value) => {
+                                        bins.get(obj).is_some_and(|&b| b == *value)
+                                    }
+                                };
+                                if passes {
+                                    leaf |= 1usize << l;
                                 }
-                            };
-                            if passes {
-                                leaf |= 1usize << l;
                             }
-                        }
-                        leaf
-                    })
-                    .collect();
+                            leaf
+                        })
+                        .collect()
+                };
 
                 // Leaf values: the device returns UN-scaled leaves; cb-train applies the
                 // `learning_rate` shrinkage. Non-pairwise → `normalize_leaf_values` applies
@@ -4891,13 +5132,23 @@ fn train_inner<R: Runtime>(
                     out.extend_from_slice(&approx);
                 }
 
+                // GDC-11: a chosen CTR split enters the model-lifetime
+                // `UsedCtrSplits` (upstream `ProcessCtrSplit`) exactly like the
+                // CPU branch — the bake and any later CPU-side scoring read it.
+                for spec in &device_ctr_splits {
+                    let key = (spec.ctr_type, spec.projection.clone());
+                    if !used_ctr_splits.contains(&key) {
+                        used_ctr_splits.push(key);
+                    }
+                }
+
                 // `level_kinds` stays EMPTY when the device tree is single-kind (float
                 // only) — consumers then take the byte-identical legacy path
-                // (SPEC-OH-31). It is populated ONLY when a one-hot level is present, in
-                // which case it carries the full LEVEL ORDER (SPEC-OH-01/24).
+                // (SPEC-OH-31). It is populated when a one-hot OR CTR level is present,
+                // in which case it carries the full LEVEL ORDER (SPEC-OH-01/24, GDC-11).
                 trees.push(oblivious_from_grown(
                     device_splits,
-                    Vec::new(),
+                    device_ctr_splits,
                     device_one_hot_splits,
                     device_level_kinds,
                     device_leaf_values,

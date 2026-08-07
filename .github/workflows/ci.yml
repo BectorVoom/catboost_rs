@@ -12,9 +12,27 @@ jobs:
   cpu:
     name: CPU lane (build + clippy + test + anyhow gate)
     runs-on: ubuntu-latest
+    env:
+      # The workspace's ~80 debug test binaries with full debuginfo exhaust the
+      # runner's disk during the parallel link (SIGBUS on the mmapped linker
+      # output = ENOSPC; main's CPU lane has failed this way for weeks).
+      # Debuginfo is useless in CI — no debugger ever attaches — and dropping it
+      # shrinks the target dir several-fold.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The workspace's debug test binaries have outgrown the stock ~14 GB of
+      # free runner disk (two identical "No space left on device" failures while
+      # compiling `cargo test --workspace` targets, 2026-08-07). Reclaim the
+      # preinstalled toolchains this CPU-only lane never uses (~30 GB).
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/share/swift /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
 
       # Honors rust-toolchain.toml (stable channel) and ensures clippy is present.
       - name: Install Rust toolchain
@@ -47,9 +65,12 @@ jobs:
         run: cargo clippy --workspace --lib -- -D warnings
 
       # Reads ONLY committed frozen fixtures (D-12); never installs catboost/numpy
-      # and never runs the build-time generator.
+      # and never runs the build-time generator. `catboost-rs-py` is excluded:
+      # its pyo3 ingest tests need a live NumPy this lane deliberately never
+      # installs (they were unreachable before the disk fix ever let the suite
+      # run this far); the wheel lane builds + import-smokes the Python surface.
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude catboost-rs-py
 
       - name: anyhow ban backstop (D-14)
         run: bash scripts/check-no-anyhow.sh

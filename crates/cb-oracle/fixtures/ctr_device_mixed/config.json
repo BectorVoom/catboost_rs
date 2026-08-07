@@ -1,0 +1,45 @@
+{
+  "scenario": "ctr_device_mixed",
+  "requirement": "GDC-06 / GDC-12",
+  "seed": 5,
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 64,
+  "cardinality": 6,
+  "description": "Mixed float+categorical CTR device-parity fixture. 64 rows, two float columns (border_count=15, FULL border set frozen as borders.npy) plus one cardinality-6 cat column routed to a simple Borders CTR (one_hot_max_size=1, Prior=0.5, CtrBorderCount default 15 = 16 buckets matching the 16 float bins \u2014 the ctr_covered n_bins requirement). Logloss depth-2 x5, Plain, permutation_count=1, no sampling, bias 0, Gradient, L2 score. The target is driven by BOTH split kinds (asserted). Pins the two-permutation CTR semantics (structure split search + averaging leaf values) the device CTR arm must reproduce at <=1e-5. NEVER regenerated in CI.",
+  "params": {
+    "loss_function": "Logloss",
+    "iterations": 5,
+    "depth": 2,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "border_count": 15,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [
+      "Borders:Prior=0.5"
+    ],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "score_function": "L2",
+    "boost_from_average": false,
+    "random_seed": 0,
+    "thread_count": 1,
+    "verbose": false
+  },
+  "npy_schema": {
+    "borders.npy": "[2,15] f64 \u2014 FULL frozen float border set (feed to train_cat)",
+    "X.npy": "[N,2] f32 \u2014 float feature matrix",
+    "X_cat.npy": "[N] int32 \u2014 categorical codes (stringified A4 form on the Rust side)",
+    "y.npy": "[N] f64 \u2014 binclf label",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. Regenerating invalidates the <=1e-5 gate."
+}

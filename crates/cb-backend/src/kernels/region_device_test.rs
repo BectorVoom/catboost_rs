@@ -59,6 +59,88 @@ fn fixture() -> (Vec<f64>, Vec<f64>, Vec<u32>) {
     (der1, weight, cindex)
 }
 
+/// GDC-04 (T06): the SESSION-level weighted Region oracle. The weighted-der
+/// substitution lives in `GpuTrainSession::grow_one`'s Region arm (caller-side
+/// `w·der1`; `grow_region_tree` itself is deliberately untouched), so this drives
+/// the SESSION with a NON-uniform weight and asserts it reproduces a DIRECT
+/// `grow_region_tree` call fed the weighted product — and that the result genuinely
+/// differs from the raw-der grow (the discriminator a pre-fix session fails).
+#[test]
+fn region_session_weighted_feeds_weighted_der() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!("[region-weighted] SKIP: device Region grow needs a real GPU backend (rocm/cuda)");
+        return;
+    }
+    let (der1, _unit_weight, cindex) = fixture();
+    let weight = vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0];
+    assert!(weight.iter().any(|&w| (w - 1.0).abs() > 1e-12));
+    let n = 6usize;
+    let n_bins = 32usize;
+    let n_features = 2usize;
+    let max_depth = 3usize;
+    let min_data_in_leaf = 1usize;
+    let scaled_l2 = 0.0_f64;
+
+    // Session: RMSE from a zero approx ⇒ der1 == target, Region policy.
+    let target = der1.clone();
+    let config = cb_compute::DeviceTrainConfig {
+        grow_policy: cb_compute::DeviceGrowPolicy::Region,
+        min_data_in_leaf,
+        ..cb_compute::DeviceTrainConfig::default()
+    };
+    let mut session = crate::gpu_runtime::GpuTrainSession::begin(
+        &cb_compute::Loss::Rmse,
+        max_depth,
+        true,
+        1,
+        cb_compute::EScoreFunction::Cosine,
+        &cindex,
+        &weight,
+        n,
+        n_features,
+        n_bins,
+        0.3,
+        scaled_l2,
+        &config,
+    )
+    .expect("begin must not error on a covered Region config")
+    .expect("a covered Region config must open a session");
+    let dev = session
+        .grow_one(&vec![0.0_f64; n], &target, &[])
+        .expect("session Region grow must succeed");
+
+    // Reference: the SAME grower fed the weighted product directly.
+    let weighted: Vec<f64> = der1.iter().zip(weight.iter()).map(|(&d, &w)| d * w).collect();
+    let expected = grow_region_tree(
+        &weighted, &weight, &cindex, n, n_bins, n_features, max_depth, min_data_in_leaf,
+        scaled_l2, SCORE_FN_COSINE,
+    )
+    .expect("direct weighted Region grow must succeed");
+
+    assert_eq!(dev.region_path, expected.region_path, "session must grow the weighted path");
+    assert_eq!(dev.leaf_of, expected.leaf_of, "session must route by the weighted path");
+    let (abs, _rel) = max_divergence(&dev.leaf_values, &expected.leaf_values);
+    assert!(
+        abs <= 1e-12,
+        "session Region leaf values must equal the weighted direct grow (abs={abs:.3e})"
+    );
+
+    // Discriminator: the RAW-der grow (what a pre-fix session computed) must differ
+    // in leaf values — otherwise this fixture cannot detect the regression.
+    let raw = grow_region_tree(
+        &der1, &weight, &cindex, n, n_bins, n_features, max_depth, min_data_in_leaf, scaled_l2,
+        SCORE_FN_COSINE,
+    )
+    .expect("raw-der Region grow must succeed");
+    let (raw_abs, _r) = max_divergence(&dev.leaf_values, &raw.leaf_values);
+    assert!(
+        raw_abs > 1e-4,
+        "the weighted and raw-der Region grows coincide (abs={raw_abs:.3e}) — pick a \
+         fixture where the weight matters"
+    );
+    drop(session);
+}
+
 #[test]
 fn region_device_reproduces_frozen_cpu_region_path() {
     // The device split scorer runs real GPU kernels; the cubecl-cpu backend cannot JIT the
