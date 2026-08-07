@@ -686,6 +686,11 @@ pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFin
 // ===========================================================================
 
 mod der_seams; // Phase 7.2 der1/der2 seam (DerBinaryKernel/.../launch_der_*).
+
+// FPP-05: self-oracle for the RESIDENT parametric der seam (`launch_der_param_resident`),
+// which closed the exact-leaf structural-derivative gap. Source/test separation.
+#[cfg(test)]
+mod der_seams_resident_test;
 pub use der_seams::*;
 
 mod pairwise; // Phase 7.4/7.5 pairwise histogram + scan/score + pairwise grow driver.

@@ -48,9 +48,9 @@ use rayon::prelude::*;
 
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
-    grow_oblivious_tree_resident, launch_der_binary_resident, read_part_stats_f64,
-    upload_channel_floats, DerBinaryKernel, ResidentCtrSearch,
-    PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
+    grow_oblivious_tree_resident, launch_der_binary_resident, launch_der_param_resident,
+    read_part_stats_f64, upload_channel_floats, DerBinaryKernel, DerParamKernel,
+    ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
     create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
@@ -1880,6 +1880,49 @@ impl GpuTrainSession {
     /// a prior call surfaces a typed [`CbError`]. The resident approx is authoritative for the
     /// device pass (in the covered Plain/fold=1/from-zero regime it tracks the caller's approx
     /// exactly). No `unwrap`/`expect`/`panic`/indexing (workspace lints + D-13).
+    /// Launch the RESIDENT `der1` for this fit, dispatching on the leaf method.
+    ///
+    /// # Why the exact-leaf arm needs its own derivative (FPP-05, the T13 gap)
+    ///
+    /// The split histogram is driven by whatever this returns, so it decides the tree
+    /// STRUCTURE. An exact-leaf fit used to borrow [`DerBinaryKernel::RmseGradient`] here
+    /// — the leaf VALUES were then overwritten with the correct device order statistic,
+    /// but the splits were the ones an RMSE fit would have chosen. Measured against
+    /// upstream `catboost==1.2.10` on a 3-tree depth-3 MAE fit that was a ~3.4e-2
+    /// prediction gap: four orders of magnitude past the ≤1e-5 bar. It stayed invisible
+    /// only because `device_host_eligible` rejected `LeafMethod::Exact` outright until
+    /// FPP-06 admitted it.
+    ///
+    /// MAE and Quantile now route to the SAME [`DerParamKernel::QuantileGradient`] the CPU
+    /// path uses (MAE is Quantile at `α = 0.5`, `δ = 1e-6` — WR-04, no separate MAE
+    /// kernel), so both sides compute the identical derivative by construction.
+    ///
+    /// MAPE keeps the RMSE-residual structural der: its device der would need the
+    /// `weightsWithTargets[i] = weight_i / max(1, |target_i|)` divisor, which this seam
+    /// does not carry. It is unreachable in practice — `validate_leaf_method` rejects
+    /// `Exact` for MAPE on the CPU, so no fit can request it — and `device_exact_leaf_config`
+    /// declines it at the gate. Documented here so the asymmetry is discoverable rather
+    /// than folklore.
+    fn launch_resident_der1(&self, approx_h: Handle, target_h: Handle) -> CbResult<Handle> {
+        match self.exact_leaf.as_ref() {
+            Some(state) if !state.mape => launch_der_param_resident(
+                &self.client,
+                approx_h,
+                target_h,
+                DerParamKernel::QuantileGradient,
+                &[state.alpha, state.delta],
+                self.n,
+            ),
+            _ => launch_der_binary_resident(
+                &self.client,
+                approx_h,
+                target_h,
+                self.der_kernel,
+                self.n,
+            ),
+        }
+    }
+
     pub fn grow_one(
         &mut self,
         approx: &[f64],
@@ -2046,13 +2089,7 @@ impl GpuTrainSession {
                 }
             };
             self.approx_h = upload_channel_floats(&self.client, approx);
-            self.der1_h = Some(launch_der_binary_resident(
-                &self.client,
-                self.approx_h.clone(),
-                target_h,
-                self.der_kernel,
-                self.n,
-            )?);
+            self.der1_h = Some(self.launch_resident_der1(self.approx_h.clone(), target_h)?);
         }
 
         // Upload the target ONCE (first call), then initialise the resident der1 from the
@@ -2060,13 +2097,7 @@ impl GpuTrainSession {
         // already set both handles from the fresh approx, so this init is skipped for it.)
         if self.target_h.is_none() {
             let target_h = upload_channel_floats(&self.client, target);
-            let der1_h = launch_der_binary_resident(
-                &self.client,
-                self.approx_h.clone(),
-                target_h.clone(),
-                self.der_kernel,
-                self.n,
-            )?;
+            let der1_h = self.launch_resident_der1(self.approx_h.clone(), target_h.clone())?;
             self.target_h = Some(target_h);
             self.der1_h = Some(der1_h);
         }
