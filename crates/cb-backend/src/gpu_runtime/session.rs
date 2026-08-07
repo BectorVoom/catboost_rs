@@ -1677,6 +1677,12 @@ impl GpuTrainSession {
 
         let begin_validate_ms = begin_t0.elapsed().as_secs_f64() * 1e3;
 
+        // SPD-03: a REAL fit is about to use the device — tell the background
+        // warm-up to stop compiling lower-priority variants (each further warm-up
+        // compile would only queue-block this fit's launches). No-op on the
+        // warm-up thread itself.
+        crate::gpu_runtime::warmup::real_fit_reached_device();
+
         // --- One client owns every handle for the whole fit (Pitfall 3). ---
         let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
         let client = <SelectedRuntime as cubecl::Runtime>::client(&device);

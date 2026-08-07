@@ -38,6 +38,23 @@ thread_local! {
     static WARMUP_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Flipped by [`real_fit_reached_device`] when a REAL session opens. The warm-up
+/// loop checks it between launches and yields: past this point every additional
+/// warm-up compile would only queue-block the real fit's launches behind the
+/// server channel (the remaining variants compile on demand as before).
+static REAL_FIT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the session gate when a real (non-warm-up) fit reaches the device.
+pub(crate) fn real_fit_reached_device() {
+    if !warmup_thread_active() {
+        REAL_FIT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn should_yield_to_real_fit() -> bool {
+    REAL_FIT_STARTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the CURRENT thread is a warm-up thread (gates probe latching and every
 /// `CB_GPU_PROF` print — see [`crate::gpu_runtime::gpu_prof_enabled`]).
 pub(crate) fn warmup_thread_active() -> bool {
@@ -110,6 +127,9 @@ pub fn spawn_fit_warmup(
         .spawn(move || {
             WARMUP_THREAD.with(|c| c.set(true));
             for n_bins in classes {
+                if should_yield_to_real_fit() {
+                    break;
+                }
                 // Best-effort per class; an uncovered config simply declines.
                 let _ = warm_one_class(&loss, depth, n_bins, score_function);
             }
@@ -163,6 +183,9 @@ fn warm_one_class(
     if let Some(mut session) = session {
         let approx = vec![0.0_f64; n];
         for _ in 0..2 {
+            if should_yield_to_real_fit() {
+                break;
+            }
             let _ = session.grow_one(&approx, &target, &[])?;
         }
     }
