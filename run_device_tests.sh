@@ -12,6 +12,7 @@ TESTS=(
   device_exact_leaf_fit_test
   device_ctr_combo_fit_test
   device_nonsym_bootstrap_test
+  device_fpp_composition_test
   device_nonsym_fit_test
   device_region_fit_test
   device_weighted_fit_test
