@@ -325,11 +325,20 @@ struct RegionState {
 /// Newton/`calc_average` leaf values with the device weighted-quantile order statistic
 /// ([`device_exact_leaf_delta`]) per leaf, from the host residuals `target - approx`.
 ///
-/// The tree STRUCTURE is grown by the resident RMSE-residual-der path (`der_kernel =
-/// RmseGradient`, the MVP structural der); only the leaf VALUES become the Exact order
-/// statistic. Upstream quantile-der split parity + the full-tree Kaggle oracle are the
-/// Plan-09 sign-off; here the leaf-VALUE numerics are locked ≤1e-4 by the
-/// `kernels::exact_quantile` self-oracle (D-09).
+/// The tree STRUCTURE is grown from the QUANTILE derivative — the same one the CPU path
+/// uses — via [`GpuTrainSession::launch_resident_der1`]'s exact-leaf arm; the leaf VALUES
+/// are then replaced by the device weighted-quantile order statistic.
+///
+/// It did not always work that way. Until FPP-05 this arm borrowed
+/// `DerBinaryKernel::RmseGradient` as an "MVP structural der", so the splits were the ones
+/// an RMSE fit would have chosen while only the leaf values were exact. Measured against
+/// upstream `catboost==1.2.10` that was a **3.4e-2** prediction gap on a 3-tree depth-3 MAE
+/// fit; routing the resident der through the existing `quantile_gradient_kernel` closed it
+/// to **1.390e-8** (MAE) / **7.746e-8** (Quantile α=0.7). See
+/// `crates/cb-train/tests/device_exact_leaf_fit_test.rs`.
+///
+/// The leaf-VALUE numerics remain locked ≤1e-4 by the `kernels::exact_quantile`
+/// self-oracle (D-09).
 struct ExactLeafState {
     /// The quantile level α (loss param for [`Loss::Quantile`], else config default 0.5).
     alpha: f64,

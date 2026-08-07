@@ -4201,6 +4201,27 @@ pub fn zero_u64_kernel(buf: &mut Array<u64>) {
     }
 }
 
+/// Copy a whole `u64` device buffer into `dst` starting at `dst_offset` (grid-stride, one
+/// load + one store per cell, no atomics — each lane owns its output cell).
+///
+/// FPP-19 (T22) uses this to pack the ordered path's per-segment PREFIX histograms — each one
+/// a separate handle returned by the unchanged partition fill — into the single contiguous
+/// `bin_sums` array [`find_optimal_split_ordered_kernel`] indexes as `seg * seg_stride + …`.
+/// The copy stays DEVICE-side: the bulk histogram never crosses to host (D-05).
+///
+/// The host guarantees `dst_offset + src.len() <= dst.len()`; the `i < src.len()` bound plus
+/// that precondition keeps every store in range.
+#[cube(launch)]
+pub fn copy_u64_block_kernel(src: &Array<u64>, dst: &mut Array<u64>, dst_offset: u32) {
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let base = dst_offset as usize;
+    let mut i = ABSOLUTE_POS;
+    while i < src.len() {
+        dst[base + i] = src[i];
+        i += stride;
+    }
+}
+
 /// Fold the `n_copies` privatized copies of the fixed-point partition histogram into
 /// copy 0 IN PLACE: `buf[i] += Σ_{c>=1} buf[c * copy_stride + i]` for
 /// `i < copy_stride = buf.len() / n_copies`. Plain wrapping `u64` adds — the same
@@ -4760,6 +4781,198 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
         // function doc — `best_idx` stays a genuine `u32`, never widened into the channel
         // float `F`, which is only exact up to 2^24 on the wgpu f32 channel). The host
         // batches both buffers into one read-back (one sync per level, same as before).
+        best_gain[CUBE_POS] = sh_gain[0usize];
+        best_idx[CUBE_POS] = sh_idx[0usize];
+    }
+}
+
+/// The ORDERED-boosting sibling of [`find_optimal_split_partition_kernel`] (FPP-19, T22):
+/// the same candidate sweep and the same deterministic argmin, but each candidate's score is
+/// the SUM over the fold's body/tail segments, each carrying its OWN regularizer.
+///
+/// # Why an outer loop is the whole difference
+///
+/// `score_candidate_ordered` (`cb-train/src/tree.rs:2383`) scores a candidate as
+///
+/// ```text
+///     Σ_s  l2_split_score( per-leaf stats over permutation prefix [0, tail_finish_s),
+///                          scale_l2_reg(l2, body_sum_weight_s, body_finish_s) )
+/// ```
+///
+/// Two properties of that formula make this kernel small (see the T21 design note
+/// `.planning/plans/gpu-full-parameter-parity/spikes/ordered-split-score.md`):
+///
+///  1. **The segments are nested PREFIXES.** `ordered_segment_leaf_stats` takes `body_finish`
+///     and then discards it (`let _ = body_finish;`, `tree.rs:2317`) — because
+///     `random_strength == 0` on this path makes body and tail rows accumulate identically, so
+///     the walk is the single contiguous `[0, tail_finish)`. `body_finish` survives ONLY inside
+///     `scale_l2_reg`. The host therefore builds segment `s`'s histogram by calling the
+///     UNCHANGED partition fill with `indices = permutation` and `n = tail_finish_s` — there is
+///     no segmented fill kernel, here or anywhere.
+///  2. **The sum is inside one candidate's score**, before any comparison — so the argmin is
+///     unchanged too. Only `score_acc` gains an outer loop.
+///
+/// # L2 only, by construction
+///
+/// `score_candidate_ordered` hard-codes `l2_split_score`, so this kernel carries no `score_fn`
+/// selector. That is not a simplification to revisit — it is what lets one `score_acc`
+/// accumulate across segments. Cosine's `num_s / sqrt(den_s)` is a PER-SEGMENT ratio and could
+/// not share an accumulator. The host declines any other score function to the CPU grower
+/// rather than approximating it.
+///
+/// # Layout
+///
+/// `bin_sums` holds the `n_segments` prefix histograms back to back, each exactly the
+/// `n_parts * n_features * n_bins * 2` line the partition fill already writes; segment `s`
+/// starts at `s * seg_stride`. `scaled_l2` is a length-`n_segments` array (the partition
+/// scorer's length-1 `Array<F>` widened — a `#[cube(launch)]` scalar cannot be an `F`).
+///
+/// Threshold splits only (`bin > border`): the ordered CPU search enumerates float borders
+/// alone (`select_level_ordered` loops `matrix.feature_borders`), so there is no `one_hot`
+/// arm. `real_folds` is still taken, and still bounds eligibility, so the signature and the
+/// host's range guard stay uniform with the partition scorer.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_optimal_split_ordered_kernel<F: Float>(
+    bin_sums: &Array<u64>,
+    best_gain: &mut Array<F>,
+    best_idx: &mut Array<u32>,
+    scaled_l2: &Array<F>,
+    real_folds: &Array<u32>,
+    n_parts: u32,
+    n_features: u32,
+    n_bins_used: u32,
+    feature_lo: u32,
+    feature_hi: u32,
+    n_segments: u32,
+    #[comptime] n_bins: u32,
+) {
+    let tid = UNIT_POS;
+    let n_bins_usize = n_bins as usize;
+    let max_border = (n_bins_used as usize) - 1usize;
+    let n_features_usize = n_features as usize;
+    let n_parts_usize = n_parts as usize;
+    let n_segments_usize = n_segments as usize;
+    // One full (feature, bin, channel) histogram line per partition slot — identical to the
+    // partition scorer, and derived from the FULL `n_features` (never a pass-narrowed count).
+    let leaf_stride = n_features_usize * n_bins_usize * 2usize;
+    // One whole partition histogram per SEGMENT: the prefix fills are concatenated in
+    // ascending `tail_finish` order.
+    let seg_stride = n_parts_usize * leaf_stride;
+
+    let lo = (feature_lo as usize) * n_bins_usize;
+    let hi = (feature_hi as usize) * n_bins_usize;
+
+    // Finite `f32::MIN` stand-in for `-inf` (WR-01: a literal `-inf` fails the gfx1100 JIT).
+    let minimal_score = F::new(f32::MIN);
+    let mut my_gain = minimal_score;
+    let mut my_idx = hi as u32;
+
+    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let mut c = ABSOLUTE_POS + lo;
+    while c < hi {
+        let feature = c / n_bins_usize;
+        let border = c % n_bins_usize;
+
+        // ONE accumulator across (segment, partition, left/right). The CPU folds per-leaf terms
+        // into a per-segment `l2_split_score` and then sums those; this runs the summands in a
+        // different ORDER, so the totals agree only to float tolerance. That is why T22's bar is
+        // integer equality on the CHOSEN (feature, border) plus ε=1e-4 on the summed score —
+        // the choice is what must be exact.
+        let mut score_acc = F::new(0.0_f32);
+
+        let mut seg = 0usize;
+        while seg < n_segments_usize {
+            // Per-segment regularizer: the host precomputes
+            // `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)` — the one place `body_finish`
+            // still matters.
+            let lambda = scaled_l2[seg];
+            let seg_base = seg * seg_stride;
+
+            let mut part = 0usize;
+            while part < n_parts_usize {
+                let part_base = seg_base + part * leaf_stride;
+                let mut left_w = F::new(0.0_f32);
+                let mut left_d = F::new(0.0_f32);
+                let mut right_w = F::new(0.0_f32);
+                let mut right_d = F::new(0.0_f32);
+                let mut bin = 0usize;
+                while bin < n_bins_usize {
+                    // channel 0 = Σ weight, channel 1 = Σ der1 (the partition-fill layout).
+                    let cell = part_base + (feature * n_bins_usize + bin) * 2usize;
+                    let w = fixedpoint_decode::<F>(bin_sums[cell]);
+                    let d = fixedpoint_decode::<F>(bin_sums[cell + 1usize]);
+                    // THRESHOLD split (`bin > border`) — the ordered search has no equality arm.
+                    if bin <= border {
+                        left_w += w;
+                        left_d += d;
+                    } else {
+                        right_w += w;
+                        right_d += d;
+                    }
+                    bin += 1usize;
+                }
+                // Left-then-right, the SAME per-leaf order the CPU oracle uses.
+                score_acc += cb_leaf_score_term::<F>(left_d, left_w, lambda, comptime!(SCORE_FN_L2));
+                score_acc +=
+                    cb_leaf_score_term::<F>(right_d, right_w, lambda, comptime!(SCORE_FN_L2));
+                part += 1usize;
+            }
+            seg += 1usize;
+        }
+
+        // Threshold eligibility: exclude the trailing no-op border and every phantom padded
+        // border (`border >= n_bins_used - 1`), exactly as the partition scorer does.
+        let mut eligible = false;
+        if border < max_border {
+            eligible = true;
+        }
+        if real_folds[feature] == 0u32 {
+            eligible = false;
+        }
+        if eligible {
+            if score_acc > my_gain {
+                my_gain = score_acc;
+                my_idx = c as u32;
+            }
+        }
+
+        c += stride;
+    }
+
+    // Block-reduce into ONE (gain, candidate-index) winner — the same wave-agnostic shared-mem
+    // tree and lowest-index tie-break as the partition scorer (D-09 verbatim reuse).
+    let mut sh_gain = SharedMemory::<F>::new(ARGMIN_SHMEM);
+    let mut sh_idx = SharedMemory::<u32>::new(ARGMIN_SHMEM);
+    sh_gain[tid as usize] = my_gain;
+    sh_idx[tid as usize] = my_idx;
+    sync_cube();
+
+    let mut s = CUBE_DIM_X / 2u32;
+    while s > 0u32 {
+        if tid < s {
+            let other_gain = sh_gain[(tid + s) as usize];
+            let other_idx = sh_idx[(tid + s) as usize];
+            let cur_gain = sh_gain[tid as usize];
+            let cur_idx = sh_idx[tid as usize];
+            let mut take_other = false;
+            if other_gain > cur_gain {
+                take_other = true;
+            } else if other_gain == cur_gain {
+                if other_idx < cur_idx {
+                    take_other = true;
+                }
+            }
+            if take_other {
+                sh_gain[tid as usize] = other_gain;
+                sh_idx[tid as usize] = other_idx;
+            }
+        }
+        sync_cube();
+        s /= 2u32;
+    }
+
+    if tid == 0u32 {
         best_gain[CUBE_POS] = sh_gain[0usize];
         best_idx[CUBE_POS] = sh_idx[0usize];
     }
