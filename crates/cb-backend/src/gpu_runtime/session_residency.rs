@@ -71,7 +71,9 @@ fn cpu_leaf_index(passes: &[bool]) -> usize {
 /// score under the catboost DEFAULT score fn), TRANSCRIBED from the FROZEN
 /// `cb_compute::cosine_split_score` over the forward-bit left/right partition
 /// (`cindex[feature * n + obj] > bin`, == the device `partition_split`). Each side's
-/// Σ der1 / Σ weight is folded in ascending object order via `sum_f64` (D-08).
+/// Σ(w·der1) / Σ weight is folded in ascending object order via `sum_f64` (D-08).
+/// GDC-02: the delta channel is the WEIGHTED der (`w·der1` — upstream's
+/// `TBucketStats::SumWeightedDelta`), matching the device's weighted-der histogram.
 fn cpu_stump_score_cosine(
     der1: &[f64],
     weight: &[f64],
@@ -87,10 +89,10 @@ fn cpu_stump_score_cosine(
     let mut right_w: Vec<f64> = Vec::new();
     for obj in 0..n {
         if (cindex[feature * n + obj] as usize) > bin {
-            right_der.push(der1[obj]);
+            right_der.push(der1[obj] * weight[obj]);
             right_w.push(weight[obj]);
         } else {
-            left_der.push(der1[obj]);
+            left_der.push(der1[obj] * weight[obj]);
             left_w.push(weight[obj]);
         }
     }
@@ -169,7 +171,9 @@ fn cpu_multi_tree_cosine(
             let mut w_seg: Vec<f64> = Vec::new();
             for obj in 0..n {
                 if leaf_of[obj] as usize == leaf {
-                    der_seg.push(der1[obj]);
+                    // GDC-02: the leaf numerator is the WEIGHTED der (`Σ w·der1` —
+                    // upstream's SumWeightedDelta), the denominator the raw Σw.
+                    der_seg.push(der1[obj] * weight[obj]);
                     w_seg.push(weight[obj]);
                 }
             }
@@ -320,6 +324,89 @@ fn session_residency_matches_cpu_multi_tree_boosting() {
         // The session (client + resident handles) frees deterministically on drop here.
         drop(session);
     }
+}
+
+/// GDC-02 (T04): the TIGHT weighted-leaf-value self-oracle — the device leaf values
+/// under a NON-uniform weight vector must equal
+/// `calc_average(Σ(w·der1), Σw, scaled_l2)` per leaf at ε=1e-4, strictly tighter
+/// than the generous multi-tree `LEAF_BOUND`. Before the weighted-der channel this
+/// fails by ~the mean weight factor (`Σder1` vs `Σ(w·der1)` numerator).
+#[test]
+fn resident_leaf_values_match_weighted_calc_average() {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[GDC-02] SKIP resident_leaf_values_match_weighted_calc_average: active backend \
+             lacks Atomic<u64> add (cpu/wgpu) — needs rocm/cuda"
+        );
+        return;
+    }
+
+    let n = 64usize;
+    let n_features = 2usize;
+    let n_bins = 16usize;
+    let depth = 2usize;
+    let l2 = 3.0_f64;
+    let learning_rate = 0.3_f64;
+
+    let target = ramp_centred(n);
+    let weight = weight_mod5(n);
+    assert!(
+        weight.iter().any(|&w| (w - 1.0).abs() > 1e-12),
+        "the fixture weight must be non-uniform or this oracle is vacuous"
+    );
+    let cindex = cindex_feature_major(n, n_features, n_bins);
+    let scaled_l2 = cb_compute::scale_l2_reg(l2, sum_f64(&weight), n);
+
+    let mut session = GpuTrainSession::begin(
+        &Loss::Rmse,
+        depth,
+        true,
+        1,
+        EScoreFunction::Cosine,
+        &cindex,
+        &weight,
+        n,
+        n_features,
+        n_bins,
+        learning_rate,
+        scaled_l2,
+        &DeviceTrainConfig::default(),
+    )
+    .expect("session begin must not error on a covered config")
+    .expect("covered config (depth2/RMSE/Plain/fold1/Cosine) must open a session");
+
+    let tree = session
+        .grow_one(&vec![0.0_f64; n], &target, &[])
+        .expect("grow_one must succeed on the clear-margin fixture");
+
+    // Tree 0: approx == 0 ⇒ der1[i] = target[i]. Re-derive the per-leaf weighted
+    // reference from the DEVICE's own leaf_of routing (the structure is separately
+    // oracled) so this assertion isolates the LEAF-VALUE formula.
+    let n_leaves = 1usize << depth;
+    assert_eq!(tree.leaf_values.len(), n_leaves);
+    assert_eq!(tree.leaf_of.len(), n);
+    let mut worst = 0.0_f64;
+    for leaf in 0..n_leaves {
+        let mut der_seg: Vec<f64> = Vec::new();
+        let mut w_seg: Vec<f64> = Vec::new();
+        for obj in 0..n {
+            if tree.leaf_of[obj] as usize == leaf {
+                der_seg.push(target[obj] * weight[obj]);
+                w_seg.push(weight[obj]);
+            }
+        }
+        let expected = cb_compute::calc_average(sum_f64(&der_seg), sum_f64(&w_seg), scaled_l2);
+        let got = tree.leaf_values[leaf];
+        let diff = (got - expected).abs();
+        worst = worst.max(diff);
+        assert!(
+            diff <= 1e-4,
+            "leaf {leaf}: device {got} != weighted calc_average reference {expected} \
+             (|Δ|={diff:.3e} > 1e-4) — the leaf reduce is not consuming Σ(w·der1)"
+        );
+    }
+    println!("[GDC-02] weighted leaf-value self-oracle worst |Δ| = {worst:.3e} (bound 1e-4)");
+    drop(session);
 }
 
 /// The coverage gate (D-10-02): `begin` returns `None` (→ CPU fallback) for depth==0 /
