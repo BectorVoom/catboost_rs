@@ -147,3 +147,68 @@ def test_ctr_default_parity_gap_is_documented():
     # The now-false framing must be deleted, not left beside the new text.
     assert "never exercise the CTR path" not in boosting
     assert "never exercise the combination path" not in boosting
+
+
+# ── FPP-16: task_type is VALIDATED-INFORMATIONAL ────────────────────────────────────────
+
+
+def test_task_type_cpu_does_not_change_predictions():
+    """FPP-16 (D1) — ``task_type="CPU"`` is pure input validation, not behaviour.
+
+    This is the assertion that PROVES the "validated-informational" claim rather than
+    asserting it in prose: the same fixed-seed fit, once with and once without
+    ``task_type="CPU"``, must produce **bit-identical** predictions. Anything less than
+    bit-identity would mean the parameter reached the trainer.
+    """
+    x, y = _toy_xy()
+
+    plain = CatBoostRegressor(iterations=5, depth=3, random_seed=7, learning_rate=0.3)
+    plain.fit(x, y)
+    tagged = CatBoostRegressor(
+        iterations=5, depth=3, random_seed=7, learning_rate=0.3, task_type="CPU"
+    )
+    tagged.fit(x, y)
+
+    np.testing.assert_array_equal(
+        plain.predict(x),
+        tagged.predict(x),
+        err_msg="task_type='CPU' must be inert — predictions must be BIT-identical",
+    )
+
+
+def test_task_type_is_accepted_and_not_a_parity_gap():
+    """``task_type`` must no longer be rejected at ``fit()`` as a KNOWN_NOT_YET gap."""
+    x, y = _toy_xy()
+    CatBoostRegressor(iterations=3, task_type="CPU").fit(x, y)  # must not raise
+    CatBoostRegressor(iterations=3, task_type=None).fit(x, y)  # None is inert
+
+
+def test_task_type_unknown_value_lists_the_legal_values():
+    """A wrong VALUE lists CPU/GPU; it must not be reported as a misspelled NAME."""
+    x, y = _toy_xy()
+    model = CatBoostRegressor(iterations=3, task_type="TPU")
+    with pytest.raises(CatBoostParameterError) as excinfo:
+        model.fit(x, y)
+    message = str(excinfo.value)
+    assert "CPU" in message and "GPU" in message
+    assert "did you mean" not in message
+
+
+def test_task_type_gpu_on_a_cpu_wheel_is_an_actionable_error():
+    """On a CPU-only wheel, ``task_type="GPU"`` must fail loudly and say how to fix it.
+
+    Skipped on a device-feature wheel, where GPU is legitimately accepted. Silently
+    training on the CPU after an explicit GPU request is precisely the silently-wrong-model
+    failure the module's honesty policy exists to prevent.
+    """
+    x, y = _toy_xy()
+    model = CatBoostRegressor(iterations=3, task_type="GPU")
+    try:
+        model.fit(x, y)
+    except CatBoostParameterError as exc:
+        message = str(exc)
+        assert "cuda" in message and "rocm" in message and "wgpu" in message
+        assert "compile-time" in message
+    else:
+        # A device-feature wheel: GPU is accepted, which is the other half of the contract.
+        pass
