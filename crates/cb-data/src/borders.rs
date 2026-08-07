@@ -33,7 +33,17 @@
 //! sanctioned reduction primitive [`cb_core::sum_f64`] rather than any raw
 //! fold — see [`total_object_weight`].
 
-use cb_core::sum_f64;
+use cb_core::{sum_f64, TFastRng64};
+
+/// Upstream `TQuantizationOptions::MaxSubsetSizeForBuildBordersAlgorithms`
+/// (`catboost/libs/data/quantization.h`, v1.2.10): border-building algorithms run
+/// on at most this many objects. A larger column builds its borders from a random
+/// subset of exactly this size (`GetArraySubsetForBuildBorders` →
+/// `SampleIndices(objectCount, sampleSize, rand)`), which is what keeps upstream's
+/// quantization O(1) in dataset size past this point. Mirroring the cap here is a
+/// PARITY improvement at scale, not just a speedup: above the cap upstream never
+/// sees the full column either, so full-column borders were already a divergence.
+pub const MAX_SUBSET_SIZE_FOR_BUILD_BORDERS: usize = 200_000;
 
 /// The `MaxSumLog` penalty: `-log(count + 1e-8)` (binarization.cpp:180). The
 /// `1e-8` epsilon guards `log(0)` for an empty side. Computed in `f64`.
@@ -211,19 +221,46 @@ pub fn select_borders_greedy_logsum(
     max_borders: usize,
     nan_sentinel: bool,
 ) -> Vec<f64> {
-    // Narrow to f32 (feature storage type), drop NaNs, sort ascending. The UNSTABLE
-    // sort is byte-identical here: keys equal under the comparator are either
-    // bit-identical f32s or the {-0.0, +0.0} pair, and every downstream consumer is
-    // order-insensitive across equal keys — `left_border`'s midpoint of any {-0.0, +0.0}
-    // adjacency is +0.0 in either order, the greedy split scores depend only on the
-    // sorted VALUES at each index, and the emitted border set normalizes -0.0 to +0.0
-    // before dedup. pdqsort avoids the stable merge sort's O(n/2) allocation on the hot
-    // fit-prep path.
-    let mut values: Vec<f32> = column
-        .iter()
-        .map(|&v| v as f32)
-        .filter(|v| !v.is_nan())
-        .collect();
+    // Narrow to f32 (feature storage type) and delegate to the f32 entry — the
+    // narrowing here is the SAME `v as f32` the fused loop performed before the
+    // f32 entry existed, so the border set is byte-identical for every caller.
+    let narrowed: Vec<f32> = column.iter().map(|&v| v as f32).collect();
+    select_borders_greedy_logsum_f32(&narrowed, max_borders, nan_sentinel)
+}
+
+/// [`select_borders_greedy_logsum`] over an already-narrowed f32 column — the
+/// hot fit-prep entry (the trainer stores features as f32, so routing the f64
+/// pool column through here after ONE narrowing pass avoids a second full-column
+/// f64 read on every fit).
+///
+/// Columns longer than [`MAX_SUBSET_SIZE_FOR_BUILD_BORDERS`] build their borders
+/// from a random subset of exactly that size, mirroring upstream's
+/// `GetArraySubsetForBuildBorders` (see the constant's doc). The subset is drawn
+/// by a partial Fisher–Yates with the FIXED-seed [`TFastRng64`] stream, so the
+/// selection is deterministic run-to-run (upstream seeds from the task RNG and is
+/// not reproducible across its own runs; a fixed stream keeps fixtures and CI
+/// stable while remaining statistically the same draw). Sub-threshold columns
+/// take the exact pre-existing full-column path — byte-identical borders.
+#[must_use]
+pub fn select_borders_greedy_logsum_f32(
+    column: &[f32],
+    max_borders: usize,
+    nan_sentinel: bool,
+) -> Vec<f64> {
+    // Drop NaNs (sampling first when over the cap — upstream subsets OBJECTS, so
+    // the subset is taken before NaN filtering there too), sort ascending. The
+    // UNSTABLE sort is byte-identical here: keys equal under the comparator are
+    // either bit-identical f32s or the {-0.0, +0.0} pair, and every downstream
+    // consumer is order-insensitive across equal keys — `left_border`'s midpoint
+    // of any {-0.0, +0.0} adjacency is +0.0 in either order, the greedy split
+    // scores depend only on the sorted VALUES at each index, and the emitted
+    // border set normalizes -0.0 to +0.0 before dedup. pdqsort avoids the stable
+    // merge sort's O(n/2) allocation on the hot fit-prep path.
+    let mut values: Vec<f32> = if column.len() > MAX_SUBSET_SIZE_FOR_BUILD_BORDERS {
+        sample_for_build_borders(column, MAX_SUBSET_SIZE_FOR_BUILD_BORDERS)
+    } else {
+        column.iter().copied().filter(|v| !v.is_nan()).collect()
+    };
     values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // Each non-NaN object carries unit weight; the total weight is accumulated
@@ -247,6 +284,32 @@ pub fn select_borders_greedy_logsum(
         out.push(f64::from(f32::MIN));
     }
     out.extend(sorted.into_iter().map(f64::from));
+    out
+}
+
+/// Draw `sample_size` objects uniformly WITHOUT replacement (upstream
+/// `SampleIndices<ui32>(objectCount, sampleSize, rand)`), then drop NaNs — so the
+/// returned slice may be slightly shorter than `sample_size` on a NaN-bearing
+/// column, exactly as upstream's object-subset-then-NaN-handling ordering yields.
+///
+/// Partial Fisher–Yates over an index array: each of the `sample_size` draws
+/// swaps a uniformly chosen remaining index into the prefix, so the prefix is an
+/// exact uniform sample. The RNG is the audited [`TFastRng64`] upstream port with
+/// a FIXED seed (determinism contract — see the caller's doc).
+fn sample_for_build_borders(column: &[f32], sample_size: usize) -> Vec<f32> {
+    let n = column.len();
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut rng = TFastRng64::from_seed(0);
+    let mut out: Vec<f32> = Vec::with_capacity(sample_size);
+    for i in 0..sample_size.min(n) {
+        let offset = rng.uniform((n - i) as u64) as usize;
+        indices.swap(i, i + offset);
+        if let Some(&v) = indices.get(i).and_then(|&idx| column.get(idx)) {
+            if !v.is_nan() {
+                out.push(v);
+            }
+        }
+    }
     out
 }
 

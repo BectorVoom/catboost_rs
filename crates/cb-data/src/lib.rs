@@ -34,7 +34,10 @@ mod quantized_pool;
 pub mod text;
 mod weights;
 
-pub use borders::{penalty_maxsumlog, select_borders_greedy_logsum};
+pub use borders::{
+    penalty_maxsumlog, select_borders_greedy_logsum, select_borders_greedy_logsum_f32,
+    MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
+};
 pub use cat_hash::{
     calc_cat_feature_hash, city_hash_64, perfect_hash_bins, stringify_int_category, PerfectHash,
 };

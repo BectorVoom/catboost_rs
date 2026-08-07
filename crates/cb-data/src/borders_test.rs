@@ -156,3 +156,64 @@ fn output_is_always_ascending_sorted() {
         }
     }
 }
+
+/// (f) The f32 entry is byte-identical to the f64 entry for a sub-threshold
+/// column (the f64 entry now delegates through it after one `as f32` narrowing
+/// — the exact narrowing the fused loop performed before the split).
+#[test]
+fn f32_entry_matches_f64_entry_below_subsample_threshold() {
+    use crate::borders::select_borders_greedy_logsum_f32;
+    let column: Vec<f64> = (0..1000)
+        .map(|i| f64::from(i % 97) * 1.37 - 42.0)
+        .collect();
+    let narrowed: Vec<f32> = column.iter().map(|&v| v as f32).collect();
+    for max_borders in [1usize, 8, 32, 254] {
+        for nan_sentinel in [false, true] {
+            assert_eq!(
+                select_borders_greedy_logsum(&column, max_borders, nan_sentinel),
+                select_borders_greedy_logsum_f32(&narrowed, max_borders, nan_sentinel),
+                "f32/f64 entry divergence at max_borders={max_borders}"
+            );
+        }
+    }
+}
+
+/// (g) Above `MAX_SUBSET_SIZE_FOR_BUILD_BORDERS` the border build subsamples
+/// (upstream `GetArraySubsetForBuildBorders` parity): the result is
+/// deterministic run-to-run (fixed-seed `TFastRng64` stream), stays
+/// ascending-sorted within the column's value range, respects the border
+/// budget, and lands near the full-column borders on a smooth distribution
+/// (the subset is a uniform draw of 200k of the column).
+#[test]
+fn oversized_column_borders_are_subsampled_and_deterministic() {
+    use crate::borders::{select_borders_greedy_logsum_f32, MAX_SUBSET_SIZE_FOR_BUILD_BORDERS};
+    let n = MAX_SUBSET_SIZE_FOR_BUILD_BORDERS * 3;
+    // Deterministic pseudo-uniform values in [0, 1) — smooth, so subsampled
+    // borders must approximate the full-column quantile grid closely.
+    let column: Vec<f32> = (0..n)
+        .map(|i| {
+            let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
+            (h >> 40) as f32 / (1u64 << 24) as f32
+        })
+        .collect();
+    let a = select_borders_greedy_logsum_f32(&column, 31, false);
+    let b = select_borders_greedy_logsum_f32(&column, 31, false);
+    assert_eq!(a, b, "subsampled border build must be deterministic");
+    assert_eq!(a.len(), 31, "a smooth 600k-value column must fill the budget");
+    assert!(a.windows(2).all(|w| w[0] < w[1]), "borders must ascend: {a:?}");
+    assert!(
+        a.iter().all(|&v| (0.0..1.0).contains(&v)),
+        "borders must lie inside the value range: {a:?}"
+    );
+    // Quality bound: each subsampled border sits within 0.01 of the uniform
+    // quantile it approximates (a 200k uniform draw's quantile error is ~1e-3;
+    // 0.01 leaves an order of magnitude of slack against greedy-split placement
+    // differences while still failing on any gross sampling bug).
+    for (k, &border) in a.iter().enumerate() {
+        let ideal = (k + 1) as f64 / 32.0;
+        assert!(
+            (border - ideal).abs() < 0.01,
+            "border {k} = {border}, expected near {ideal}"
+        );
+    }
+}

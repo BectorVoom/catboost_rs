@@ -29,7 +29,7 @@ use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
     LeafMethod, Loss,
 };
-use cb_data::{select_borders_greedy_logsum, AutoClassWeights, Pool, QuantizeParams};
+use cb_data::{select_borders_greedy_logsum_f32, AutoClassWeights, Pool, QuantizeParams};
 use rayon::prelude::*;
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
@@ -1085,29 +1085,24 @@ impl CatBoostBuilder {
         // binarizes f32 against the borders) AND the per-float-feature
         // quantization borders (Phase-2 greedy logsum; NaN sentinel is off for the
         // numeric first-slice surface — NaN-free features are always Forbidden
-        // regardless). Both are independent `rayon`-parallel reductions over the
-        // SAME `pool.float_features()`, reading disjoint per-column data and
-        // writing disjoint outputs (`feature_values` narrows f64->f32,
-        // `feature_borders` derives borders — neither reads the other's output),
-        // so they run CONCURRENTLY via `rayon::join` rather than sequentially, to
-        // shrink this fit-prep stage's latency (the CB_GPU_PROF timer below
-        // specifically attributes to this stage). Each inner `par_iter`'s indexed
-        // map preserves output order, so both results stay byte-identical to the
-        // fully-serial form.
-        let (feature_values, mut feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
-            || {
-                pool.float_features()
-                    .par_iter()
-                    .map(|col| col.iter().map(|&v| v as f32).collect())
-                    .collect()
-            },
-            || {
-                pool.float_features()
-                    .par_iter()
-                    .map(|col| select_borders_greedy_logsum(col, self.border_count, false))
-                    .collect()
-            },
-        );
+        // regardless). The f64 pool columns are narrowed ONCE (parallel over the
+        // disjoint per-column data), and the borders are then derived from the
+        // narrowed f32 columns via `select_borders_greedy_logsum_f32` — the same
+        // `v as f32` narrowing the f64 entry performs internally, so the border
+        // set is byte-identical while the full-width f64 columns are read exactly
+        // once instead of twice (this fit-prep stage is the largest host term at
+        // scale — the CB_GPU_PROF timer below attributes to it). Each `par_iter`'s
+        // indexed map preserves output order, so both results stay byte-identical
+        // to the fully-serial form.
+        let feature_values: Vec<Vec<f32>> = pool
+            .float_features()
+            .par_iter()
+            .map(|col| col.iter().map(|&v| v as f32).collect())
+            .collect();
+        let mut feature_borders: Vec<Vec<f64>> = feature_values
+            .par_iter()
+            .map(|col| select_borders_greedy_logsum_f32(col, self.border_count, false))
+            .collect();
         // PARAM-03: an ignored feature keeps its column and its index but loses
         // its borders, so the candidate enumeration never proposes a split on it.
         // Applied AFTER border selection (not before) so the borders of every
