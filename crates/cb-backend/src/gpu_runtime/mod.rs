@@ -62,6 +62,7 @@ use crate::kernels::{
     apply_leaf_delta_kernel,
     apply_oblivious_float_kernel,
     block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
+    find_optimal_split_ordered_kernel,
     find_optimal_split_partition_kernel,
     focal_gradient_kernel,
     focal_hessian_kernel, gradient_kernel, logloss_gradient_kernel, logloss_hessian_kernel,
@@ -790,6 +791,14 @@ mod cindex_one_hot_test;
 //       --lib gpu_runtime::one_hot_split_score_test
 #[cfg(all(test, not(feature = "cpu")))]
 mod one_hot_split_score_test;
+
+// T22 / FPP-19: the ORDERED per-segment split scorer. Drives the private
+// `score_ordered_over_segment_binsums`, so it must likewise be a `gpu_runtime` descendant,
+// and it carries the same `CUBE_COUNT` cpu-backend limitation as the one-hot scorer test:
+//   cargo test -p cb-backend --no-default-features --features rocm \
+//       --lib gpu_runtime::ordered_split_score_test
+#[cfg(all(test, not(feature = "cpu")))]
+mod ordered_split_score_test;
 
 // T26 / SPEC-OH-23: the split APPLICATION's one-hot (EQUALITY) arm. Same `pub(crate)`
 // visibility reason, and the same `CUBE_COUNT` cpu-backend limitation
@@ -3271,6 +3280,185 @@ fn score_partition_over_binsums(
                 continue;
             }
         } else if cand_border >= n_bins_used - 1 {
+            continue;
+        }
+        let take = gain > best_gain || (gain == best_gain && cand < best_c);
+        if take {
+            best_gain = gain;
+            best_c = cand;
+        }
+    }
+
+    if (best_c as usize) < n_candidates {
+        let feature = (best_c as usize) / n_bins;
+        let bin = (best_c as usize) % n_bins;
+        return Ok(Some(BestSplit {
+            feature_id: feature as u32,
+            bin_id: bin as u32,
+            score: best_gain as f32,
+            gain: best_gain as f32,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// The ORDERED-boosting sibling of [`score_partition_over_binsums`] (FPP-19, T22): score every
+/// candidate as the SUM over the fold's body/tail segments and return the single winning
+/// [`BestSplit`], with only the O(blocks) per-block winner descriptors crossing back (D-05).
+///
+/// `bin_sums` holds the `scaled_l2_per_segment.len()` PREFIX histograms back to back, ascending
+/// by `tail_finish` — each one exactly the line the unchanged partition fill writes when driven
+/// with `indices = permutation` and `n = tail_finish_s`. `scaled_l2_per_segment[s]` is that
+/// segment's `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)`.
+///
+/// L2 only — [`find_optimal_split_ordered_kernel`]'s doc explains why the ordered path cannot
+/// carry a `score_fn` selector. Threshold splits only. Returns `None` on a degenerate level.
+#[allow(clippy::too_many_arguments)]
+fn score_ordered_over_segment_binsums(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    bin_sums: Handle,
+    n_parts: usize,
+    n_bins: usize,
+    n_bins_used: usize,
+    n_features: usize,
+    scaled_l2_per_segment: &[f64],
+    real_folds: &[u32],
+) -> CbResult<Option<BestSplit>> {
+    if n_bins_used == 0 || n_bins_used > n_bins {
+        return Err(CbError::OutOfRange(format!(
+            "n_bins_used ({n_bins_used}) must be in 1..=n_bins ({n_bins})"
+        )));
+    }
+    // Empty short-circuit (Pitfall 3/5), including the no-segment case: a fold with no
+    // body/tail segment has nothing to score, and must not launch with a zero-length lambda
+    // array the kernel would index.
+    if n_parts == 0 || n_features == 0 || n_bins == 0 || scaled_l2_per_segment.is_empty() {
+        return Ok(None);
+    }
+    if real_folds.len() != n_features {
+        return Err(CbError::LengthMismatch {
+            column: "real_folds".to_owned(),
+            expected: n_features,
+            actual: real_folds.len(),
+        });
+    }
+
+    let n_segments = scaled_l2_per_segment.len();
+    let n_candidates = n_features.checked_mul(n_bins).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) overflows usize (candidate count)"
+        ))
+    })?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let seg_stride = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
+        ))
+    })?;
+    let bin_sums_len = seg_stride.checked_mul(n_segments).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "seg_stride ({seg_stride}) * n_segments ({n_segments}) overflows usize \
+             (segmented binSums length)"
+        ))
+    })?;
+    let n_bins_u32 = u32::try_from(n_bins).map_err(|_| {
+        CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
+    })?;
+    let n_parts_u32 = u32::try_from(n_parts).map_err(|_| {
+        CbError::OutOfRange(format!("n_parts ({n_parts}) exceeds u32 device range"))
+    })?;
+    let n_segments_u32 = u32::try_from(n_segments).map_err(|_| {
+        CbError::OutOfRange(format!("n_segments ({n_segments}) exceeds u32 device range"))
+    })?;
+
+    // Same geometry as the partition scorer: one CUBE_DIM-thread cube per CUBE_DIM candidates.
+    let num_cubes = n_candidates.div_ceil(CUBE_DIM).max(1);
+    let count = CubeCount::Static(num_cubes as u32, 1, 1);
+    let dim = CubeDim {
+        x: CUBE_DIM as u32,
+        y: 1,
+        z: 1,
+    };
+    let real_folds_h = client.create(cubecl::bytes::Bytes::from_elems(real_folds.to_vec()));
+
+    #[cfg(feature = "wgpu")]
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h = client.create(cubecl::bytes::Bytes::from_elems(
+            scaled_l2_per_segment.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        ));
+        find_optimal_split_ordered_kernel::launch::<f32, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, n_segments) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), real_folds.len()) },
+            n_parts_u32,
+            n_features as u32,
+            n_bins_used as u32,
+            /* feature_lo = */ 0,
+            n_features as u32,
+            n_segments_u32,
+            n_bins_u32,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    #[cfg(not(feature = "wgpu"))]
+    let (best_gain_handle, best_idx_handle) = {
+        let best_gain_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f64; num_cubes]));
+        let best_idx_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; num_cubes]));
+        let lambda_h =
+            client.create(cubecl::bytes::Bytes::from_elems(scaled_l2_per_segment.to_vec()));
+        find_optimal_split_ordered_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bin_sums, bin_sums_len) },
+            unsafe { ArrayArg::from_raw_parts(best_gain_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(best_idx_h.clone(), num_cubes) },
+            unsafe { ArrayArg::from_raw_parts(lambda_h, n_segments) },
+            unsafe { ArrayArg::from_raw_parts(real_folds_h.clone(), real_folds.len()) },
+            n_parts_u32,
+            n_features as u32,
+            n_bins_used as u32,
+            /* feature_lo = */ 0,
+            n_features as u32,
+            n_segments_u32,
+            n_bins_u32,
+        );
+        (best_gain_h, best_idx_h)
+    };
+
+    let (best_gains, best_idx) = read_gain_and_idx(client, best_gain_handle, best_idx_handle)?;
+    if best_gains.len() != num_cubes || best_idx.len() != num_cubes {
+        return Err(CbError::Degenerate(format!(
+            "ordered best-split read-back returned {}/{} slots, expected {num_cubes}/{num_cubes}",
+            best_gains.len(),
+            best_idx.len()
+        )));
+    }
+
+    // Across-block argmin with the SAME strict-`>` / lowest-index tie-break the kernel uses.
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut best_c = u32::MAX;
+    for (block, &gain) in best_gains.iter().enumerate() {
+        let cand = best_idx.get(block).copied().unwrap_or(u32::MAX);
+        if (cand as usize) >= n_candidates {
+            continue;
+        }
+        let cand_border = (cand as usize) % n_bins;
+        // Host belt mirroring the kernel's threshold eligibility (WR-05).
+        if cand_border >= n_bins_used - 1 {
             continue;
         }
         let take = gain > best_gain || (gain == best_gain && cand < best_c);
