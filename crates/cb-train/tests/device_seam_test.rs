@@ -290,14 +290,19 @@ fn device_bin_id_out_of_range_is_typed_error() {
 }
 
 #[test]
-fn device_declines_nonzero_starting_bias_boost_from_average() {
-    // CR-01 regression: `boost_from_average: true` on RMSE (the CatBoostBuilder
-    // default) makes `starting_approx` the target mean (2.5 here) — a non-zero
-    // bias the device session cannot seed (it always starts resident approx at
-    // zero). The host gate must therefore DECLINE the device path and fall back
-    // to the CPU grower, which calls the mock's `compute_gradients` sentinel.
-    // Reaching THAT error proves the CPU fallback (D-04) was taken even though
-    // the mock's `begin` would have accepted the device path.
+fn device_accepts_nonzero_starting_bias_boost_from_average() {
+    // FPP-02 (T09): this assertion is INVERTED, deliberately.
+    //
+    // `boost_from_average: true` on RMSE (the CatBoostBuilder default) makes
+    // `starting_approx` the target mean (2.5 here). The device session used to seed its
+    // resident approx to a hardcoded zero, so the host gate DECLINED and fell back to the
+    // CPU grower — which hit the mock's `compute_gradients` sentinel, and that error WAS
+    // the old assertion.
+    //
+    // FPP-01 (T05) replaced the seed with `DeviceTrainConfig.bias` and FPP-02 removed the
+    // gate clause, so the fit now COMMITS to the device. The mock's `compute_gradients`
+    // sentinel still errors if the CPU grower is entered, so a SUCCESSFUL fit is itself
+    // the proof that the device path was taken.
     let mock = DeviceMock {
         accept_begin: true,
         grow: Some(DeviceGrownTree {
@@ -316,7 +321,7 @@ fn device_declines_nonzero_starting_bias_boost_from_average() {
     };
     // Non-zero target mean -> non-zero starting bias.
     let target = vec![1.0, 2.0, 3.0, 4.0];
-    let err = train(
+    train(
         &mock,
         &feature_columns(),
         &feature_borders(),
@@ -325,14 +330,7 @@ fn device_declines_nonzero_starting_bias_boost_from_average() {
         &params,
         None,
     )
-    .expect_err("non-zero starting bias must route to the CPU grower");
-    match err {
-        CbError::Degenerate(msg) => assert!(
-            msg.contains("compute_gradients must not be called"),
-            "expected the CPU-path sentinel (bias fallback), got: {msg}"
-        ),
-        other => panic!("expected the CPU-path compute_gradients sentinel, got {other:?}"),
-    }
+    .expect("a non-zero starting bias must now train on the DEVICE path (FPP-02)");
 }
 
 #[test]

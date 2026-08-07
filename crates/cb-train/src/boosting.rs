@@ -4343,14 +4343,26 @@ fn train_inner<R: Runtime>(
         // gated bit-for-bit against the `bootstrap_poisson/` upstream fixtures). If the
         // device does not actually commit, Poisson is rejected below rather than silently
         // falling back to a CPU grower that cannot express it.
+        //
+        // FPP-13 (T11): the `&& grow_policy == SymmetricTree` restriction on the three
+        // HOST-sampled types is GONE. It existed because the Region and non-symmetric
+        // growers ignored the per-object multiplier — the backend declined those
+        // combinations rather than silently dropping the sample. FPP-12 gave both growers
+        // real SPLIT-SCORING channels, so a sampled Depthwise / Lossguide / Region fit now
+        // scores over `der1 * sample` while leaf estimation stays unsampled, exactly as
+        // the oblivious arm does.
+        //
+        // POISSON keeps the SymmetricTree restriction. It is not host-sampled at all: it
+        // is DEVICE-resident (upstream has no CPU Poisson sampler to mirror), and only the
+        // oblivious arm opens the resident sampler. Admitting it for a non-symmetric grow
+        // would commit a fit the session then declines.
         && (matches!(params.bootstrap_type, EBootstrapType::No)
-            || (matches!(
+            || matches!(
                 params.bootstrap_type,
-                EBootstrapType::Bayesian
-                    | EBootstrapType::Bernoulli
-                    | EBootstrapType::Mvs
-                    | EBootstrapType::Poisson
-            ) && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
+                EBootstrapType::Bayesian | EBootstrapType::Bernoulli | EBootstrapType::Mvs
+            )
+            || (matches!(params.bootstrap_type, EBootstrapType::Poisson)
+                && matches!(params.grow_policy, EGrowPolicy::SymmetricTree)))
         && params.random_strength == 0.0
         && eval_sets.is_empty()
         // SPEC-OH-20 (T23): "has something to score" is float OR one-hot, not float
@@ -4386,19 +4398,35 @@ fn train_inner<R: Runtime>(
         // the oblivious resident grow (GDC-02, `weighted_der1_h`), and the
         // host-driven nonsym / Region growers (GDC-03/04, `host_weighted_der1`)
         // — so a genuinely weighted pool meets the ≤1e-5 upstream bar on device.
-        // The `bias == 0.0` sibling (CR-01) below stays unrelaxed.
-        // CR-01: the device session always seeds its resident approx to zero
-        // (`GpuTrainSession::begin`), so a non-zero starting bias — e.g.
-        // `boost_from_average=true` on RMSE, the CatBoostBuilder default — must
-        // fall back to the CPU grower (D-04) rather than train against a wrong
-        // (zero) starting point. `bias` is the computed `starting_approx` above.
-        && bias == 0.0
-        // CR-02: the device grower always computes leaf values via
-        // `calc_average` (the Gradient/Simple formula); it has no Newton arm.
-        // For RMSE Gradient==Newton coincide, but for Logloss/CrossEntropy the
-        // Newton formula diverges, so only Gradient/Simple are device-eligible.
-        // A Newton request on a device-covered loss falls back to the CPU grower.
-        && matches!(params.leaf_method, LeafMethod::Gradient | LeafMethod::Simple);
+        //
+        // FPP-02 (T09): the former CR-01 `bias == 0.0` clause is GONE too. It existed
+        // because `GpuTrainSession::begin` seeded its resident approx to a hardcoded
+        // `vec![0.0; n]`, so a non-zero starting approximant would have trained against a
+        // wrong starting point. FPP-01 replaced that seed with `config.bias` (populated
+        // just below from this same `starting_approx`), so a `boost_from_average = true`
+        // fit — upstream's RMSE default, and this project's `CatBoostBuilder` default —
+        // now reaches the device with the CORRECT first-tree derivative.
+        //
+        // Only the OBLIVIOUS resident arm reads the seed; the Region / non-symmetric /
+        // exact-leaf arms re-derive `der1` from the CALLER's `approx` via `host_der1`, and
+        // the caller's `approx` already starts at the bias — so every covered grow policy
+        // is correct under this relaxation, not just SymmetricTree.
+        // CR-02: the device grower computes leaf values via `calc_average` (the
+        // Gradient/Simple formula); it has no Newton arm. For RMSE Gradient==Newton
+        // coincide, but for Logloss/CrossEntropy the Newton formula diverges, so a
+        // Newton request on a device-covered loss falls back to the CPU grower.
+        //
+        // FPP-06 (T10): `LeafMethod::Exact` is additionally admitted for {Mae, Quantile}
+        // — the intersection derived in `device_exact_leaf_config`, whose doc comment
+        // explains why neither `validate_leaf_method`'s set nor `map_leaf_method`'s set
+        // is the right condition alone (LogCosh is CPU-legal but device-uncovered; Mape is
+        // device-covered but CPU-rejected; MultiQuantile is multi-dimensional). The
+        // condition is read back off the already-computed config decision rather than
+        // re-derived here, so the gate and the config can never disagree — a gate that
+        // opened for a pair the config declined would apply the Gradient calc_average leaf
+        // to a Quantile fit.
+        && (matches!(params.leaf_method, LeafMethod::Gradient | LeafMethod::Simple)
+            || device_exact_leaf_config(params.leaf_method, &params.loss).0);
 
     // The leaf-regularization is constant across the fit for the device-eligible
     // config (fixed weights / n, no per-tree sampling), so it is computed ONCE and
@@ -4478,6 +4506,11 @@ fn train_inner<R: Runtime>(
     // function so it is unit-testable without a device (PLAN blocker B-2, option (a)).
     let device_exact_leaf = device_exact_leaf_config(params.leaf_method, &params.loss);
     let device_config = DeviceTrainConfig {
+        // FPP-01/FPP-02 (T09): the fit's REAL starting approximant. `0.0` — every
+        // `boost_from_average = false` fit, which is every fixture that was device-eligible
+        // before this phase — reproduces the former hardcoded resident seed byte-for-byte
+        // (D-04), so no existing device test changes behaviour.
+        bias,
         ctr: device_ctr,
         grow_policy: device_grow_policy,
         // The Lossguide cap is meaningful ONLY for the non-sym leaf-wise policy; leave it
