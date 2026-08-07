@@ -28,7 +28,7 @@
 
 #![cfg(not(feature = "wgpu"))]
 
-use cb_compute::{gradient_leaf_delta, DeviceTrainConfig, EScoreFunction, Loss};
+use cb_compute::{gradient_leaf_delta, DeviceOrderedConfig, DeviceTrainConfig, EScoreFunction, Loss};
 
 use crate::gpu_runtime::ordered::{accumulate_ordered_trajectory, ordered_approx_delta, OrderedTree};
 use crate::gpu_runtime::GpuTrainSession;
@@ -248,7 +248,7 @@ fn resident_trajectory_persists_across_iterations() {
 /// dependency — the pairwise / ranking / multiclass precedent), for BOTH a covered ordered config and
 /// a genuinely uncovered one. Never a fabricated Plain grow, never an error while classifying.
 #[test]
-fn begin_declines_ordered_to_cpu() {
+fn begin_admits_covered_ordered_and_declines_everything_else() {
     let n = 8usize;
     let n_features = 2usize;
     let n_bins = 32usize;
@@ -286,23 +286,48 @@ fn begin_declines_ordered_to_cpu() {
     };
     let def = DeviceTrainConfig::default();
 
-    // Covered ordered config (RMSE, SymmetricTree, depth≥1, single fold) but ORDERED (not Plain) →
-    // declines to CPU pending the per-tree ordered permutation-descriptor grow seam.
+    // FPP-20 (T23) FLIPPED THIS. It used to assert that a covered ordered fit declines
+    // "pending the per-tree ordered permutation-descriptor grow seam". That seam now exists
+    // (`grow_oblivious_tree_ordered_resident`), so a covered ordered fit that ALSO carries the
+    // `DeviceOrderedConfig` descriptor OPENS a session. Every negative below is PRESERVED —
+    // the point of the flip is that the positive became reachable, not that the gate loosened.
+    let ordered_cfg = |n_objects: usize| {
+        let mut cfg = DeviceTrainConfig::default();
+        cfg.ordered = Some(DeviceOrderedConfig {
+            permutation: (0..n_objects as u32).collect(),
+            // n = 8, multiplier 2.0 ⇒ boundaries [1,2,4,8] ⇒ tail_finish [2,4,8].
+            segment_tail_finish: vec![2, 4, 8],
+            segment_scaled_l2: vec![3.0, 3.0, 3.0],
+        });
+        cfg
+    };
+    let ord = ordered_cfg(n);
+    assert!(
+        open(&Loss::Rmse, 2, false, 1, &ord),
+        "a covered ordered RMSE fit WITH the descriptor now opens a device session (T23)"
+    );
+    assert!(
+        open(&Loss::Logloss, 2, false, 1, &ord),
+        "a covered ordered Logloss fit WITH the descriptor now opens a device session (T23)"
+    );
+
+    // A covered ordered fit WITHOUT the descriptor still declines. This is the guard that keeps
+    // the flip honest: `map_ordered_coverage` says the PARAMS are covered, the descriptor says
+    // the host actually computed the fold segmentation. Admitting the first without the second
+    // would grow an ordered tree with no segments.
     assert!(
         !open(&Loss::Rmse, 2, false, 1, &def),
-        "covered ordered RMSE declines to CPU pending the ordered grow seam"
+        "a covered ordered fit with NO DeviceOrderedConfig must still decline to CPU"
     );
+
+    // Genuinely uncovered ordered configs → still Ok(None) (all-or-nothing per family),
+    // descriptor present or not.
     assert!(
-        !open(&Loss::Logloss, 2, false, 1, &def),
-        "covered ordered Logloss declines to CPU pending the ordered grow seam"
-    );
-    // Genuinely uncovered ordered configs → also Ok(None) (all-or-nothing per family).
-    assert!(
-        !open(&Loss::Rmse, 0, false, 1, &def),
+        !open(&Loss::Rmse, 0, false, 1, &ord),
         "depth-0 ordered must decline"
     );
     assert!(
-        !open(&Loss::Rmse, 2, false, 2, &def),
+        !open(&Loss::Rmse, 2, false, 2, &ord),
         "fold_count>1 ordered must decline"
     );
     // The Plain path is byte-unchanged (a covered Plain RMSE fit opens a session as before).

@@ -79,6 +79,7 @@ pub use ranking_der::{
 pub use runtime::{
     DeviceBootstrapType, DeviceCtrAveraging, DeviceCtrColumn, DeviceCtrConfig, DeviceGrowPolicy,
     DeviceGrownTree,
+    DeviceOrderedConfig,
     DeviceTrainConfig,
     Derivatives, EScoreFunction, FamilyTreeArgs, Float, LambdaMartMetric, Loss, Runtime,
     StochasticRankMetric,

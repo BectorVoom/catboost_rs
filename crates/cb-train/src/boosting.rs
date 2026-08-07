@@ -4624,6 +4624,36 @@ fn train_inner<R: Runtime>(
         one_hot_flags: device_one_hot_flags.clone(),
         real_folds: device_real_folds.clone(),
         n_float: device_n_float,
+        // FPP-20 (T23): the per-fit ordered descriptor. `Some` only on an Ordered fit that
+        // actually built a learning fold; `None` keeps every Plain fit byte-unchanged (D-04).
+        //
+        // Everything here is a pure function of `(n, fold_len_multiplier, weights)` plus the
+        // learning permutation, i.e. per-FIT constant, which is why it rides the config rather
+        // than the per-tree grow seam. `segment_tail_finish` carries ONLY `tail_finish`:
+        // `ordered_segment_leaf_stats` discards `body_finish` (tree.rs), so a segment is the
+        // permutation PREFIX `[0, tail_finish)`. `body_finish` survives solely inside
+        // `scale_l2_reg`, which is exactly where it is applied below.
+        ordered: ordered_learning_perm.as_ref().map(|perm| {
+            let segments = crate::fold::body_tail_segments(n, params.fold_len_multiplier);
+            let seg_body_sum_weights =
+                crate::fold::body_sum_weights(n, params.fold_len_multiplier, &weights);
+            cb_compute::DeviceOrderedConfig {
+                // The device index type is u32; a negative permutation entry is a
+                // fold-construction bug, and mapping it to 0 here would silently train on a
+                // duplicated object. Clamp is not appropriate, so an out-of-range entry is left
+                // to the session's host-side validation, which rejects `>= n` before upload.
+                permutation: perm.iter().map(|&p| p as u32).collect(),
+                segment_tail_finish: segments.iter().map(|&(_, tail)| tail).collect(),
+                segment_scaled_l2: segments
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &(body_finish, _))| {
+                        let bsw = seg_body_sum_weights.get(idx).copied().unwrap_or(0.0);
+                        cb_compute::scale_l2_reg(params.l2_leaf_reg, bsw, body_finish)
+                    })
+                    .collect(),
+            }
+        }),
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {

@@ -48,7 +48,8 @@ use rayon::prelude::*;
 
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
-    grow_oblivious_tree_resident, launch_der_binary_resident, launch_der_param_resident,
+    grow_oblivious_tree_ordered_resident, grow_oblivious_tree_resident,
+    launch_der_binary_resident, launch_der_param_resident,
     read_part_stats_f64, upload_channel_floats, DerBinaryKernel, DerParamKernel,
     ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
@@ -966,6 +967,12 @@ pub struct GpuTrainSession {
     /// `pairwise` / `ranking` / `multiclass` / `config`).
     #[allow(dead_code)]
     ordered: Option<OrderedState>,
+    /// FPP-20 (T23): the per-fit ordered descriptor, `Some` exactly when [`Self::ordered`] is.
+    /// `perm_h` is the learn permutation resident on device — it drives the per-segment PREFIX
+    /// fills ONLY; routing and the leaf-value reduce stay on the identity `indices_h`.
+    ordered_perm_h: Option<Handle>,
+    ordered_segment_tail_finish: Vec<usize>,
+    ordered_segment_scaled_l2: Vec<f64>,
     /// The per-fit Langevin/SGLB state (Phase 13 Plan 09, GPUT-20). `Some` iff the fit committed to a
     /// covered Langevin config (a covered pointwise der loss with the seeded-Gaussian noise layered
     /// on the resident der); `None` for every non-Langevin path AND for every `*Pairwise` + Langevin
@@ -1118,10 +1125,28 @@ impl GpuTrainSession {
         // dependency, so BOTH the covered and uncovered ordered branches decline to the
         // byte-unchanged CPU grower (D-04 no-regression) — NEVER a fabricated Plain (leakage-prone)
         // pointwise grow on an ordered fit (the pairwise / ranking / multiclass gate precedent).
-        if !boosting_type_is_plain {
-            let _ordered = map_ordered_coverage(loss, config, depth, fold_count);
-            return Ok(None);
-        }
+        // FPP-20 (T23): the ordered arm no longer declines unconditionally. A covered ordered
+        // config that ALSO carries the per-fit `DeviceOrderedConfig` descriptor (the learn
+        // permutation + the body/tail segment table) now reaches the device, where
+        // `grow_oblivious_tree_ordered_resident` grows the STRUCTURE from the segment-summed
+        // score and takes Plain-identical leaf values — which is what upstream does
+        // (`cb-train`'s Ordered arm: "leaf values are Plain-identical; only the split scoring
+        // differs").
+        //
+        // Anything else still returns `Ok(None)` → the byte-unchanged CPU grower, never a
+        // fabricated Plain (leakage-prone) pointwise grow on an ordered fit. Note the
+        // descriptor requirement is a genuine guard, not a formality: `map_ordered_coverage`
+        // says the PARAMS are covered, while the descriptor says the host actually computed
+        // the fold segmentation. Admitting the first without the second would grow an ordered
+        // tree with no segments.
+        let ordered_state = if boosting_type_is_plain {
+            None
+        } else {
+            match map_ordered_coverage(loss, config, depth, fold_count) {
+                Some(st) if config.ordered.is_some() => Some(st),
+                _ => return Ok(None),
+            }
+        };
         if depth == 0 || fold_count != 1 {
             return Ok(None);
         }
@@ -1726,6 +1751,38 @@ impl GpuTrainSession {
             _ => None,
         };
 
+        // FPP-20 (T23): upload the learn permutation once per FIT (it is fold state, not tree
+        // state) and keep the segment table host-side. All three are empty/None on a Plain fit.
+        let (ordered_perm_h, ordered_segment_tail_finish, ordered_segment_scaled_l2) =
+            match (ordered_state.as_ref(), config.ordered.as_ref()) {
+                (Some(_), Some(oc)) => {
+                    // The permutation indexes der1/weight/leaf_of/cindex, so an out-of-range
+                    // entry would drive an unchecked device read. Validate HOST-side before
+                    // upload — the same discipline the pointwise fill's `indices` guard uses.
+                    if let Some(&bad) = oc.permutation.iter().find(|&&p| (p as usize) >= n) {
+                        return Err(CbError::OutOfRange(format!(
+                            "ordered permutation entry {bad} >= n ({n}); it would read \
+                             der1/leaf_of/cindex out of bounds"
+                        )));
+                    }
+                    if oc.segment_tail_finish.len() != oc.segment_scaled_l2.len() {
+                        return Err(CbError::LengthMismatch {
+                            column: "segment_scaled_l2".to_owned(),
+                            expected: oc.segment_tail_finish.len(),
+                            actual: oc.segment_scaled_l2.len(),
+                        });
+                    }
+                    let h = client
+                        .create(cubecl::bytes::Bytes::from_elems(oc.permutation.clone()));
+                    (
+                        Some(h),
+                        oc.segment_tail_finish.clone(),
+                        oc.segment_scaled_l2.clone(),
+                    )
+                }
+                _ => (None, Vec::new(), Vec::new()),
+            };
+
         Ok(Some(Self {
             client,
             feat_offsets,
@@ -1774,11 +1831,12 @@ impl GpuTrainSession {
             // is gated + declined ABOVE (the multiclass arm returns Ok(None) pending the per-tree
             // shared multi-dim grow seam), so this construction is only ever reached scalar.
             multiclass: None,
-            // Plain path: no ordered state (byte-unchanged, D-04). A covered ordered fit is gated +
-            // declined ABOVE (the ordered arm returns Ok(None) pending the per-tree ordered
-            // permutation-descriptor grow seam), and this construction is only ever reached on the
-            // Plain (`boosting_type_is_plain`) path, so it is never ordered.
-            ordered: None,
+            // FPP-20 (T23): `Some` on a covered ordered fit, `None` on every Plain fit
+            // (byte-unchanged, D-04).
+            ordered: ordered_state,
+            ordered_perm_h,
+            ordered_segment_tail_finish,
+            ordered_segment_scaled_l2,
             // Pointwise path: no Langevin state (byte-unchanged, D-04). A covered Langevin fit records
             // its coverage decision via `map_langevin_coverage` but declines to CPU (the noise
             // coefficient + per-tree grow seam are a forward dependency), and a `*Pairwise` + Langevin
@@ -2306,7 +2364,49 @@ impl GpuTrainSession {
             float_bins: &st.float_bins,
         });
         let approx_h = self.approx_h.clone();
-        let (tree, approx_next, der1_next) = grow_oblivious_tree_resident(
+
+        // FPP-20 (T23): a covered ORDERED fit grows through the segment-summed scorer. Only
+        // the split scoring differs — the leaf values, routing and approx update below are the
+        // Plain ones, which is what upstream's Ordered arm does. `perm_h` drives the per-segment
+        // prefix FILLS only; `indices_h` (identity) still drives routing + the leaf reduce.
+        let ordered_grow = match (self.ordered.as_ref(), self.ordered_perm_h.as_ref()) {
+            (Some(_), Some(perm_h)) => Some(grow_oblivious_tree_ordered_resident(
+                &self.client,
+                approx_h.clone(),
+                &der1_h,
+                &weighted_der1_h,
+                &self.weight_h,
+                &score_der1_h,
+                &score_weight_h,
+                &self.feat_offsets,
+                &self.feat_shifts,
+                &self.feat_masks,
+                &self.cindex_words_h,
+                &self.offsets_h,
+                &self.shifts_h,
+                &self.masks_h,
+                &self.indices_h,
+                perm_h,
+                &target_h,
+                self.num_words,
+                self.n,
+                self.n_bins_line,
+                self.n_bins,
+                self.n_features,
+                &self.real_folds,
+                &self.ordered_segment_tail_finish,
+                &self.ordered_segment_scaled_l2,
+                self.depth,
+                self.scaled_l2,
+                self.learning_rate,
+                self.der_kernel,
+            )?),
+            _ => None,
+        };
+
+        let (tree, approx_next, der1_next) = match ordered_grow {
+            Some(t) => t,
+            None => grow_oblivious_tree_resident(
             &self.client,
             approx_h,
             &der1_h,
@@ -2340,7 +2440,8 @@ impl GpuTrainSession {
             self.learning_rate,
             self.der_kernel,
             ctr_search_view.as_mut(),
-        )?;
+            )?,
+        };
 
         // Advance the resident state for the next tree.
         // IN-03: in the EXACT-leaf arm these two handles are overwritten from the
