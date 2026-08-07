@@ -4615,6 +4615,20 @@ pub(crate) fn grow_oblivious_tree_ordered_resident(
     let der1_next =
         launch_der_binary_resident(client, approx_h.clone(), target_h.clone(), der_kernel, n)?;
 
+    // Same `CB_GPU_PROF tree` observability the Plain resident grow emits. This is not
+    // decoration: it is the ONLY signal that distinguishes "the ordered device arm ran" from
+    // "the gate declined and the CPU grower produced an identical-looking answer". An oracle
+    // that passes either way proves nothing, and the ordered fixture passes on CPU by
+    // construction. Emitted unconditionally per tree (cold unless CB_GPU_PROF is set).
+    if gpu_prof_enabled() {
+        prof_sync(client);
+        eprintln!(
+            "CB_GPU_PROF tree ORDERED n={n} nf={n_features} bins={n_bins} depth={depth} \
+             segments={}",
+            segment_tail_finish.len()
+        );
+    }
+
     Ok((
         GrownTree {
             splits,
