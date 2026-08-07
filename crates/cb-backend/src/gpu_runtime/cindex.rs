@@ -152,6 +152,83 @@ pub(crate) fn feature_bits(n_buckets: usize) -> CbResult<u32> {
     Ok(bits)
 }
 
+/// The bins-independent half of [`pack_cindex`]: the per-feature word-group placement
+/// `(group, shift, mask)` and the [`TCFeature`] descriptor table, both pure functions of
+/// the bucket counts. Shared by the host packer and the device quantize+pack fast path
+/// (QPACK-01), so the two paths cannot disagree on geometry.
+pub(crate) struct CindexPlan {
+    /// Per-feature `TCFeature` descriptors (length `n_features`).
+    pub features: Vec<TCFeature>,
+    /// Per-feature `(group, shift, mask)` placement (length `n_features`; groups are
+    /// assigned in monotone non-decreasing order).
+    pub placed: Vec<(usize, u32, u32)>,
+    /// Number of 32-bit word groups (`words.len() == num_groups * n`).
+    pub num_groups: usize,
+}
+
+/// Compute the [`CindexPlan`] for `n_buckets`/`one_hot` over `n` objects — the "first
+/// pass" of the packer, extracted verbatim so [`pack_cindex`] and the device fill share
+/// it. Uses iterator folding — no slice indexing (D-13 / indexing_slicing).
+pub(crate) fn plan_cindex(
+    n_buckets: &[usize],
+    one_hot: &[bool],
+    n: usize,
+) -> CbResult<CindexPlan> {
+    let n_features = n_buckets.len();
+    if one_hot.len() != n_features {
+        return Err(CbError::LengthMismatch {
+            column: "cindex one_hot flags".to_owned(),
+            expected: n_features,
+            actual: one_hot.len(),
+        });
+    }
+    let mut placed: Vec<(usize, u32, u32)> = Vec::with_capacity(n_features);
+    let mut group_index: usize = 0;
+    let mut used_bits: u32 = 0;
+    for &nb in n_buckets {
+        let bits = feature_bits(nb)?;
+        // Start a new group when this feature would not fit the current word. `used_bits`
+        // and `bits` are each <= 32, so `used_bits + bits` <= 64 — no u32 overflow.
+        if used_bits + bits > 32 {
+            group_index = group_index.checked_add(1).ok_or_else(|| {
+                CbError::OutOfRange("plan_cindex: group index overflows usize".to_owned())
+            })?;
+            used_bits = 0;
+        }
+        let shift = used_bits;
+        let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        placed.push((group_index, shift, mask));
+        used_bits += bits;
+    }
+    let num_groups = group_index + 1;
+
+    // The TCFeature descriptor table (serial — `n_features` entries).
+    let mut features: Vec<TCFeature> = Vec::with_capacity(n_features);
+    for ((&nb, &(group, shift, mask)), &is_one_hot) in
+        n_buckets.iter().zip(placed.iter()).zip(one_hot.iter())
+    {
+        let offset = (group as u64).checked_mul(n as u64).ok_or_else(|| {
+            CbError::OutOfRange(format!("plan_cindex: group offset {group} * n ({n}) overflows u64"))
+        })?;
+        let folds = u32::try_from(nb).map_err(|_| {
+            CbError::OutOfRange(format!("plan_cindex: n_buckets ({nb}) exceeds u32 fold count"))
+        })?;
+        features.push(TCFeature {
+            offset,
+            mask,
+            shift,
+            first_fold_index: 0,
+            folds,
+            one_hot_feature: is_one_hot,
+        });
+    }
+    Ok(CindexPlan {
+        features,
+        placed,
+        num_groups,
+    })
+}
+
 /// Host replica of [`crate::kernels::read_bin`] — `(words[offset + obj] >> shift) &
 /// mask`. Used by the histogram host-reference and the bit-exact oracle to extract a
 /// packed bin exactly as the device accessor does (the reference and device then agree
@@ -215,27 +292,15 @@ pub(crate) fn pack_cindex(
         });
     }
 
-    // First pass: place each feature into a group and record (group, shift, mask). Uses
-    // iterator folding — no slice indexing (D-13 / indexing_slicing).
-    let mut placed: Vec<(usize, u32, u32)> = Vec::with_capacity(n_features);
-    let mut group_index: usize = 0;
-    let mut used_bits: u32 = 0;
-    for &nb in n_buckets {
-        let bits = feature_bits(nb)?;
-        // Start a new group when this feature would not fit the current word. `used_bits`
-        // and `bits` are each <= 32, so `used_bits + bits` <= 64 — no u32 overflow.
-        if used_bits + bits > 32 {
-            group_index = group_index.checked_add(1).ok_or_else(|| {
-                CbError::OutOfRange("pack_cindex: group index overflows usize".to_owned())
-            })?;
-            used_bits = 0;
-        }
-        let shift = used_bits;
-        let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
-        placed.push((group_index, shift, mask));
-        used_bits += bits;
-    }
-    let num_groups = group_index + 1;
+    // Placement + descriptors are pure functions of the bucket counts (the bins never
+    // influence the geometry) — shared with the device quantize+pack fast path, which
+    // has NO host bins at all (QPACK-01).
+    let plan = plan_cindex(n_buckets, one_hot, n)?;
+    let CindexPlan {
+        features,
+        placed,
+        num_groups,
+    } = plan;
 
     // Words: one word per object per group.
     let num_words = num_groups.checked_mul(n).ok_or_else(|| {
@@ -244,27 +309,6 @@ pub(crate) fn pack_cindex(
         ))
     })?;
     let mut words = vec![0u32; num_words];
-
-    // Second pass (a): emit the TCFeature descriptor table (serial — `n_features` entries).
-    let mut features: Vec<TCFeature> = Vec::with_capacity(n_features);
-    for ((&nb, &(group, shift, mask)), &is_one_hot) in
-        n_buckets.iter().zip(placed.iter()).zip(one_hot.iter())
-    {
-        let offset = (group as u64).checked_mul(n as u64).ok_or_else(|| {
-            CbError::OutOfRange(format!("pack_cindex: group offset {group} * n ({n}) overflows u64"))
-        })?;
-        let folds = u32::try_from(nb).map_err(|_| {
-            CbError::OutOfRange(format!("pack_cindex: n_buckets ({nb}) exceeds u32 fold count"))
-        })?;
-        features.push(TCFeature {
-            offset,
-            mask,
-            shift,
-            first_fold_index: 0,
-            folds,
-            one_hot_feature: is_one_hot,
-        });
-    }
 
     // Second pass (b): OR each feature's masked field into its group's word column, in
     // PARALLEL over the groups. Group columns are DISJOINT `n`-word slices
@@ -329,4 +373,119 @@ pub(crate) fn pack_cindex(
         })?;
 
     Ok(PackedCindex { words, features })
+}
+
+/// QPACK-01: build the packed cindex ON DEVICE from the raw f32 float columns + the
+/// per-feature borders — the fused device replacement for host
+/// `quantize_feature_major` → [`pack_cindex`] → upload on the float-only fast path.
+/// Returns the device handle of the packed word buffer (length
+/// `plan.num_groups * n` u32 words), bit-identical to the host pipeline's upload.
+///
+/// Per feature: upload the f32 column + the f32-narrowed borders, then launch
+/// [`crate::kernels::quantize_pack_feature_kernel`] to merge the feature's bit-field
+/// into its group's word column. The FIRST feature of each group STOREs (initializing
+/// the column — the buffer needs no zero-fill), later features OR into their disjoint
+/// fields; the session's single stream orders the launches. The per-column upload
+/// handles become garbage after the last launch retires and are dropped here.
+///
+/// # Preconditions (validated by the caller — `GpuTrainSession::begin_raw`)
+/// - `columns.len() == borders.len() == plan.features.len()`, each column length `n`;
+/// - every border round-trips f64→f32→f64 exactly (they are f32 midpoints by
+///   construction), so the kernel's f32 compare is bit-equivalent to the host's f64
+///   compare;
+/// - every `borders[f].len() + 1 <= n_buckets[f]` (bin values fit their field).
+///
+/// # Errors
+/// [`CbError::LengthMismatch`] on a column/borders arity mismatch (defense in depth —
+/// the caller validates first).
+pub(crate) fn fill_packed_cindex_on_device(
+    client: &cubecl::client::ComputeClient<crate::SelectedRuntime>,
+    columns: &[Vec<f32>],
+    borders: &[Vec<f64>],
+    plan: &CindexPlan,
+    n: usize,
+) -> CbResult<cubecl::server::Handle> {
+    use cubecl::prelude::*;
+
+    let n_features = plan.features.len();
+    if columns.len() != n_features || borders.len() != n_features {
+        return Err(CbError::LengthMismatch {
+            column: "device quantize+pack columns/borders".to_owned(),
+            expected: n_features,
+            actual: columns.len().min(borders.len()),
+        });
+    }
+    let num_words = plan.num_groups.checked_mul(n).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "fill_packed_cindex_on_device: num_groups ({}) * n ({n}) overflows usize",
+            plan.num_groups
+        ))
+    })?;
+    let words_h = client.empty(num_words * std::mem::size_of::<u32>());
+
+    // 256-lane cubes, one thread per object (the kernel is a single bounds-guarded
+    // pass — no CUBE_COUNT grid-stride, so it also runs on cubecl-cpu).
+    let cube_dim = CubeDim { x: 256, y: 1, z: 1 };
+    let num_cubes = u32::try_from(n.div_ceil(256).max(1)).map_err(|_| {
+        CbError::OutOfRange(format!(
+            "fill_packed_cindex_on_device: cube count for n = {n} exceeds u32"
+        ))
+    })?;
+
+    let mut prev_group: Option<usize> = None;
+    for ((col, bord), &(group, shift, _mask)) in
+        columns.iter().zip(borders.iter()).zip(plan.placed.iter())
+    {
+        if col.len() != n {
+            return Err(CbError::LengthMismatch {
+                column: "device quantize+pack float column".to_owned(),
+                expected: n,
+                actual: col.len(),
+            });
+        }
+        // First feature of its group initializes the word column (groups are assigned
+        // in monotone non-decreasing order, so "first" is exactly a group transition).
+        let init_word = u32::from(prev_group != Some(group));
+        prev_group = Some(group);
+
+        let col_h = client.create(cubecl::bytes::Bytes::from_elems(col.clone()));
+        let borders_f32: Vec<f32> = bord.iter().map(|&b| b as f32).collect();
+        let n_borders = borders_f32.len();
+        // A zero-length device read is never issued: an empty border list still
+        // launches (bin is constantly 0 and the field must be stored/OR-merged), so
+        // give the kernel a 1-element dummy border buffer it will never loop over.
+        let borders_h = if n_borders == 0 {
+            client.create(cubecl::bytes::Bytes::from_elems(vec![0.0_f32]))
+        } else {
+            client.create(cubecl::bytes::Bytes::from_elems(borders_f32))
+        };
+        let group_offset = (group as u64).checked_mul(n as u64).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "fill_packed_cindex_on_device: group offset {group} * n ({n}) overflows u64"
+            ))
+        })?;
+        let group_offset = u32::try_from(group_offset).map_err(|_| {
+            CbError::OutOfRange(format!(
+                "fill_packed_cindex_on_device: group offset {group_offset} exceeds u32"
+            ))
+        })?;
+
+        crate::kernels::quantize_pack_feature_kernel::launch::<f32, crate::SelectedRuntime>(
+            client,
+            CubeCount::Static(num_cubes.max(1), 1, 1),
+            cube_dim,
+            unsafe { ArrayArg::from_raw_parts(col_h, n) },
+            unsafe { ArrayArg::from_raw_parts(borders_h, n_borders.max(1)) },
+            unsafe { ArrayArg::from_raw_parts(words_h.clone(), num_words) },
+            u32::try_from(n_borders).map_err(|_| {
+                CbError::OutOfRange(format!(
+                    "fill_packed_cindex_on_device: {n_borders} borders exceed u32"
+                ))
+            })?,
+            group_offset,
+            shift,
+            init_word,
+        );
+    }
+    Ok(words_h)
 }

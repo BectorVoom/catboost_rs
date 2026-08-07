@@ -4480,26 +4480,70 @@ fn train_inner<R: Runtime>(
     // handed to `begin`, matching the CPU per-tree
     // `scale_l2_reg(l2, sumAllWeights, n)`.
     let device_scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
+    // Phase 12 Plan 03 (GPUT-18 / Open Q2 promotion): the device grow-policy mapping.
+    // (Hoisted above the quantize step so the QPACK-01 raw-channel gate below can read
+    // it — a pure function of `params`, so the hoist is order-invariant.)
+    let device_grow_policy = match params.grow_policy {
+        EGrowPolicy::Depthwise => DeviceGrowPolicy::Depthwise,
+        EGrowPolicy::Lossguide => DeviceGrowPolicy::Lossguide,
+        // Phase 12 Plan 04 (GPUT-18): Region routes to the host-driven device Region PATH grow.
+        EGrowPolicy::Region => DeviceGrowPolicy::Region,
+        // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
+        _ => DeviceGrowPolicy::SymmetricTree,
+    };
+    // QPACK-01: the raw float channel — the backend quantizes AND packs the cindex ON
+    // DEVICE, so the host bin matrix (an `n * nf` u32 buffer, ~200MB at 1M×50) never
+    // exists. Offered exactly when every session arm that would need host bins is
+    // absent: float-only (no one-hot), no CTR, and the oblivious SymmetricTree family
+    // (non-symmetric / Region keep host bin copies in their grow state). The session
+    // independently re-checks and declines to `false`, after which the host-quantize
+    // channel below runs unchanged — never a wrong device result, never a lost fit.
+    let raw_device_channel = device_host_eligible
+        && one_hot_bins.is_empty()
+        && materialized_ctr_features.is_empty()
+        && matches!(device_grow_policy, DeviceGrowPolicy::SymmetricTree);
     // SPEC-OH-21 (T24): ONE device-quantize entry, on EVERY device-eligible pool. A
     // float-only pool passes an empty `cat_bins` slice and still gets a fully populated
     // `real_folds` (`[borders[f].len() + 1, …]`), which is what lets the session's
     // `real_folds.len() == eff_n_features` check stay unconditional. Routing float-only
     // fits back through the 2-tuple `quantize_feature_major` would leave nothing
     // producing `real_folds` and break every existing float-only device oracle.
+    //
+    // QPACK-01 carve-out: on the raw channel the bins are NOT quantized here — only the
+    // metadata (`n_bins`, `real_folds`) is derived, by the SAME formulas the quantizer
+    // uses on a float-only pool (`n_bins = max_f(borders_f + 1).max(1)`, `real_folds[f]
+    // = borders_f + 1`), so the session sees identical scalars on either channel. The
+    // host quantize still runs lazily below if the raw attempt declines.
     let (device_bins, device_n_bins, device_real_folds) = if device_host_eligible {
-        let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
-        let prof_t = std::time::Instant::now();
-        let out =
-            quantize_feature_major_with_one_hot(feature_values, feature_borders, &one_hot_bins, n);
-        if prof {
-            eprintln!(
-                "CB_GPU_PROF quantize n={n} nf={} n_one_hot={} elapsed={:.2}ms",
-                feature_values.len(),
-                one_hot_bins.len(),
-                prof_t.elapsed().as_secs_f64() * 1e3,
+        if raw_device_channel {
+            let real_folds: Vec<u32> = feature_borders
+                .iter()
+                .map(|b| u32::try_from(b.len() + 1).unwrap_or(u32::MAX))
+                .collect();
+            let n_bins = feature_borders
+                .iter()
+                .fold(0usize, |acc, b| acc.max(b.len() + 1))
+                .max(1);
+            (Vec::new(), n_bins, real_folds)
+        } else {
+            let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
+            let prof_t = std::time::Instant::now();
+            let out = quantize_feature_major_with_one_hot(
+                feature_values,
+                feature_borders,
+                &one_hot_bins,
+                n,
             );
+            if prof {
+                eprintln!(
+                    "CB_GPU_PROF quantize n={n} nf={} n_one_hot={} elapsed={:.2}ms",
+                    feature_values.len(),
+                    one_hot_bins.len(),
+                    prof_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            out
         }
-        out
     } else {
         (Vec::new(), 0, Vec::new())
     };
@@ -4515,14 +4559,8 @@ fn train_inner<R: Runtime>(
     // gate. SymmetricTree yields `DeviceTrainConfig::default()` (byte-unchanged, D-04); the two
     // non-symmetric policies flip the device non-sym arm on. Every OTHER family knob stays at
     // its default covered value (host eligibility already excludes sampling / exact / CTR).
-    let device_grow_policy = match params.grow_policy {
-        EGrowPolicy::Depthwise => DeviceGrowPolicy::Depthwise,
-        EGrowPolicy::Lossguide => DeviceGrowPolicy::Lossguide,
-        // Phase 12 Plan 04 (GPUT-18): Region routes to the host-driven device Region PATH grow.
-        EGrowPolicy::Region => DeviceGrowPolicy::Region,
-        // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
-        _ => DeviceGrowPolicy::SymmetricTree,
-    };
+    // (`device_grow_policy` itself is mapped above the quantize step — QPACK-01.)
+    //
     // GDC-11 (T14): the two-permutation device CTR config. Populated ONLY for a
     // host-eligible CTR fit (the relaxed clause above already vetted single-
     // permutation + simple Borders columns); every other fit keeps `ctr: None`
@@ -4668,29 +4706,72 @@ fn train_inner<R: Runtime>(
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
-        runtime.begin_device_training(
-            &params.loss,
-            params.depth,
-            matches!(params.boosting_type, EBoostingType::Plain),
-            // GDC-01: the REAL learning-fold count, not a literal 1. For every
-            // non-CTR fit `learning_fold_count(pc, false) == 1` (byte-unchanged,
-            // D-04); once the CTR clause admits fits, `ctr_covered`'s
-            // `fold_count != 1` decline (session.rs) becomes load-bearing and a
-            // multi-permutation CTR fit can never silently ride fold-0 columns.
-            learning_folds_for_cycle,
-            params.score_function,
-            &device_bins,
-            &weights,
-            n,
-            // The device feature axis is the CONCATENATED `float | one-hot` width
-            // (SPEC-OH-21), not the float count — equal to `matrix.n_features()` on a
-            // float-only pool, so this is byte-unchanged there.
-            device_n_features,
-            device_n_bins,
-            learning_rate,
-            device_scaled_l2,
-            &device_config,
-        )?
+        // QPACK-01: offer the RAW float channel first (device-side quantize+pack — no
+        // host bin matrix). A `false` return is a coverage decline, NOT an error: fall
+        // through to the host-quantize channel, exactly as if the raw channel never
+        // existed. The lazy quantize below therefore runs only on that decline path.
+        let raw_opened = if raw_device_channel {
+            runtime.begin_device_training_raw(
+                &params.loss,
+                params.depth,
+                matches!(params.boosting_type, EBoostingType::Plain),
+                learning_folds_for_cycle,
+                params.score_function,
+                feature_values,
+                feature_borders,
+                &weights,
+                n,
+                device_n_features,
+                device_n_bins,
+                learning_rate,
+                device_scaled_l2,
+                &device_config,
+            )?
+        } else {
+            false
+        };
+        if raw_opened {
+            true
+        } else {
+            // The host-quantize channel. On the raw-decline path the bins were never
+            // quantized above — do it now (identical output to the eager path).
+            let host_bins: std::borrow::Cow<'_, [u32]> = if raw_device_channel {
+                std::borrow::Cow::Owned(
+                    quantize_feature_major_with_one_hot(
+                        feature_values,
+                        feature_borders,
+                        &one_hot_bins,
+                        n,
+                    )
+                    .0,
+                )
+            } else {
+                std::borrow::Cow::Borrowed(&device_bins)
+            };
+            runtime.begin_device_training(
+                &params.loss,
+                params.depth,
+                matches!(params.boosting_type, EBoostingType::Plain),
+                // GDC-01: the REAL learning-fold count, not a literal 1. For every
+                // non-CTR fit `learning_fold_count(pc, false) == 1` (byte-unchanged,
+                // D-04); once the CTR clause admits fits, `ctr_covered`'s
+                // `fold_count != 1` decline (session.rs) becomes load-bearing and a
+                // multi-permutation CTR fit can never silently ride fold-0 columns.
+                learning_folds_for_cycle,
+                params.score_function,
+                &host_bins,
+                &weights,
+                n,
+                // The device feature axis is the CONCATENATED `float | one-hot` width
+                // (SPEC-OH-21), not the float count — equal to `matrix.n_features()` on a
+                // float-only pool, so this is byte-unchanged there.
+                device_n_features,
+                device_n_bins,
+                learning_rate,
+                device_scaled_l2,
+                &device_config,
+            )?
+        }
     } else {
         false
     };

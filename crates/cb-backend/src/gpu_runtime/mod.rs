@@ -774,6 +774,11 @@ mod session_depth_gt1_test;
 #[cfg(test)]
 mod device_float_only_identity_test;
 
+// QPACK-01: the device quantize+pack fast path must be bit-identical to the host
+// quantize → pack pipeline. Same `pub(crate)`-visibility reason as the sibling above.
+#[cfg(test)]
+mod device_quantize_pack_test;
+
 // T24 / SPEC-OH-21: the packed cindex marks one-hot features truthfully, and the
 // standing pin that `TCFeature.folds` is the PADDED line width (never a candidate
 // bound). Same `pub(crate)`-visibility reason as the sibling above.

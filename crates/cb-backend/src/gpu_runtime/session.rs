@@ -46,7 +46,9 @@ use cb_compute::{
 use cb_core::{CbError, CbResult, TFastRng64};
 use rayon::prelude::*;
 
-use crate::gpu_runtime::cindex::pack_cindex;
+use crate::gpu_runtime::cindex::{
+    fill_packed_cindex_on_device, pack_cindex, plan_cindex, PackedCindex,
+};
 use crate::gpu_runtime::{
     grow_oblivious_tree_ordered_resident, grow_oblivious_tree_resident,
     launch_der_binary_resident, launch_der_param_resident,
@@ -1071,6 +1073,34 @@ fn map_leaf_method(config: &DeviceTrainConfig, loss: &Loss) -> Option<DeviceLeaf
     }
 }
 
+/// The bins input channel for [`GpuTrainSession::begin_inner`] (QPACK-01): either the
+/// host-quantized feature-major bin matrix (the pre-existing path, every coverage arm),
+/// or the raw f32 float columns + per-feature borders — the session then quantizes AND
+/// packs the cindex ON DEVICE and the host bin matrix never exists (float-only fits).
+#[derive(Clone, Copy)]
+pub(crate) enum BinsChannel<'a> {
+    /// Host-quantized feature-major bins (`cindex[feature * n + obj]`, length
+    /// `n_features * n`).
+    Host(&'a [u32]),
+    /// Raw float columns (each length `n`) + per-feature borders (each ascending and
+    /// f32-exact — they are `f64::from(f32)` midpoints by construction).
+    RawFloat {
+        columns: &'a [Vec<f32>],
+        borders: &'a [Vec<f64>],
+    },
+}
+
+impl BinsChannel<'_> {
+    /// The host bin matrix, when this channel carries one (the arms that keep host bin
+    /// copies — CTR augmentation, non-symmetric / Region grow state — require it).
+    fn host_bins(&self) -> Option<&[u32]> {
+        match *self {
+            BinsChannel::Host(b) => Some(b),
+            BinsChannel::RawFloat { .. } => None,
+        }
+    }
+}
+
 impl GpuTrainSession {
     /// Open a device-resident training session, running the coverage gate (D-10-02). Returns
     /// `Ok(None)` when the config is NOT covered (depth==0, non-RMSE/Logloss, non-Plain,
@@ -1093,6 +1123,82 @@ impl GpuTrainSession {
         fold_count: usize,
         score_function: EScoreFunction,
         bins_feature_major: &[u32],
+        weight: &[f64],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+        config: &DeviceTrainConfig,
+    ) -> CbResult<Option<Self>> {
+        Self::begin_inner(
+            loss,
+            depth,
+            boosting_type_is_plain,
+            fold_count,
+            score_function,
+            BinsChannel::Host(bins_feature_major),
+            weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+            config,
+        )
+    }
+
+    /// [`Self::begin`] over the RAW float channel (QPACK-01): the session quantizes AND
+    /// packs the cindex ON DEVICE from the f32 columns + per-feature borders — the
+    /// host-side bin matrix never exists. Coverage is a strict subset of the host
+    /// channel's: any host-bins-dependent arm (CTR / one-hot / non-symmetric / Region)
+    /// or a border set that does not round-trip f64→f32→f64 exactly declines with
+    /// `Ok(None)`, and the caller retries through the host-quantize channel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_raw(
+        loss: &Loss,
+        depth: usize,
+        boosting_type_is_plain: bool,
+        fold_count: usize,
+        score_function: EScoreFunction,
+        columns: &[Vec<f32>],
+        borders: &[Vec<f64>],
+        weight: &[f64],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+        config: &DeviceTrainConfig,
+    ) -> CbResult<Option<Self>> {
+        Self::begin_inner(
+            loss,
+            depth,
+            boosting_type_is_plain,
+            fold_count,
+            score_function,
+            BinsChannel::RawFloat { columns, borders },
+            weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+            config,
+        )
+    }
+
+    /// The one shared implementation behind [`Self::begin`] / [`Self::begin_raw`] —
+    /// identical gates and resident state; only the bins CHANNEL differs (see
+    /// [`BinsChannel`]).
+    #[allow(clippy::too_many_arguments)]
+    fn begin_inner(
+        loss: &Loss,
+        depth: usize,
+        boosting_type_is_plain: bool,
+        fold_count: usize,
+        score_function: EScoreFunction,
+        bins: BinsChannel<'_>,
         weight: &[f64],
         n: usize,
         n_features: usize,
@@ -1468,20 +1574,23 @@ impl GpuTrainSession {
             n_bins
         };
 
+        // --- QPACK-01: raw-channel coverage. The raw float channel supports exactly the
+        // arms that never touch host bins after packing. Everything else — CTR (augments
+        // the host bin matrix + keeps `float_bins`), one-hot (per-column equality
+        // semantics over PerfectHash bins), non-symmetric / Region (keep host bin copies
+        // in their grow state) — declines so the caller retries through the
+        // host-quantize channel, which supports them all. NEVER a wrong device result.
+        if matches!(bins, BinsChannel::RawFloat { .. })
+            && (nonsym_policy.is_some()
+                || region_active
+                || config.ctr.is_some()
+                || config.has_one_hot())
+        {
+            return Ok(None);
+        }
+
         // --- Host-side validation (V5): the resident grow skips per-tree guards, so validate
         // the value ranges ONCE here (T-10-18 residency + the histogram value-range contract).
-        let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
-            CbError::OutOfRange(format!(
-                "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
-            ))
-        })?;
-        if bins_feature_major.len() != cindex_stride {
-            return Err(CbError::LengthMismatch {
-                column: "bins_feature_major".to_owned(),
-                expected: cindex_stride,
-                actual: bins_feature_major.len(),
-            });
-        }
         if weight.len() != n {
             return Err(CbError::LengthMismatch {
                 column: "weight".to_owned(),
@@ -1489,18 +1598,76 @@ impl GpuTrainSession {
                 actual: weight.len(),
             });
         }
-        // Every quantized bin must fit the dispatched line size (`n_bins`); a value >= n_bins
-        // would write bin_sums out of bounds in the non-binary fill (which does not mask).
-        // Parallel scan (round-3 perf: this is an n*n_features-cell sweep on the hot begin
-        // path); `find_first` keeps the FIRST offender in slice order, so the surfaced
-        // error is byte-identical to the serial `find`.
-        if let Some(&bad) = bins_feature_major
-            .par_iter()
-            .find_first(|&&b| (b as usize) >= n_bins)
-        {
-            return Err(CbError::OutOfRange(format!(
-                "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out of bounds"
-            )));
+        match bins {
+            BinsChannel::Host(bins_feature_major) => {
+                let cindex_stride = n_features.checked_mul(n).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "n_features ({n_features}) * n ({n}) overflows usize (cindex stride)"
+                    ))
+                })?;
+                if bins_feature_major.len() != cindex_stride {
+                    return Err(CbError::LengthMismatch {
+                        column: "bins_feature_major".to_owned(),
+                        expected: cindex_stride,
+                        actual: bins_feature_major.len(),
+                    });
+                }
+                // Every quantized bin must fit the dispatched line size (`n_bins`); a value >=
+                // n_bins would write bin_sums out of bounds in the non-binary fill (which does
+                // not mask). Parallel scan (round-3 perf: this is an n*n_features-cell sweep on
+                // the hot begin path); `find_first` keeps the FIRST offender in slice order, so
+                // the surfaced error is byte-identical to the serial `find`.
+                if let Some(&bad) = bins_feature_major
+                    .par_iter()
+                    .find_first(|&&b| (b as usize) >= n_bins)
+                {
+                    return Err(CbError::OutOfRange(format!(
+                        "cindex bin value {bad} >= n_bins ({n_bins}); would write bin_sums out \
+                         of bounds"
+                    )));
+                }
+            }
+            BinsChannel::RawFloat { columns, borders } => {
+                // The raw channel is float-only, so the device axis IS the column list.
+                if columns.len() != n_features || borders.len() != n_features {
+                    return Err(CbError::LengthMismatch {
+                        column: "raw float columns/borders".to_owned(),
+                        expected: n_features,
+                        actual: columns.len().min(borders.len()),
+                    });
+                }
+                for col in columns {
+                    if col.len() != n {
+                        return Err(CbError::LengthMismatch {
+                            column: "raw float column".to_owned(),
+                            expected: n,
+                            actual: col.len(),
+                        });
+                    }
+                }
+                for feature_borders in borders {
+                    // The device bin is `#{k : v > b_k}` <= borders.len(), so the bin
+                    // range check reduces to the borders-vs-n_bins bound (no O(n·nf)
+                    // scan needed — the kernel's bins are range-bounded by construction).
+                    if feature_borders.len() + 1 > n_bins {
+                        return Err(CbError::OutOfRange(format!(
+                            "raw float channel: {} borders + 1 exceeds n_bins ({n_bins})",
+                            feature_borders.len()
+                        )));
+                    }
+                    // The kernel compares in f32. That is bit-equivalent to the host's
+                    // f64 `partition_point` ONLY when every border round-trips
+                    // f64→f32→f64 exactly (true by construction — borders are f32
+                    // midpoints). A border that does not round-trip cannot be honoured
+                    // bit-exactly on device → decline to the host-quantize channel.
+                    let roundtrips = feature_borders
+                        .iter()
+                        .all(|&b| f64::from(b as f32) == b && !b.is_nan());
+                    if !roundtrips {
+                        return Ok(None);
+                    }
+                }
+            }
         }
 
         // --- One client owns every handle for the whole fit (Pitfall 3). ---
@@ -1537,7 +1704,15 @@ impl GpuTrainSession {
         // they exist only for the leaf-value gather (GDC-10).
         let mut ctr_averaging_bins: Option<Vec<Vec<u32>>> = None;
         let mut ctr_search: Option<CtrSearchState> = None;
-        let (eff_bins, eff_n_features): (std::borrow::Cow<'_, [u32]>, usize) = if ctr_is_covered {
+        // QPACK-01: `eff_bins` exists only on the HOST channel (`None` = the raw channel,
+        // which already declined every arm that would read host bins). The raw arm's
+        // `bins_feature_major` binding below is an empty slice feeding the two CTR-only
+        // uses inside the covered-CTR arm, which the raw channel never reaches.
+        let bins_feature_major: &[u32] = bins.host_bins().unwrap_or(&[]);
+        let raw_channel = bins.host_bins().is_none();
+        let (eff_bins, eff_n_features): (std::borrow::Cow<'_, [u32]>, usize) = if raw_channel {
+            (std::borrow::Cow::Borrowed(&[][..]), n_features)
+        } else if ctr_is_covered {
             if let Some(ctr) = config.ctr.as_ref() {
                 let ctr_columns = build_ctr_cindex_columns(
                     &client,
@@ -1642,9 +1817,36 @@ impl GpuTrainSession {
             // is empty and the scorer collapses to today's single launch.
             eff_n_features
         };
-        let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, &one_hot_flags, n)?;
+        // QPACK-01: the two channels produce the SAME resident artifact — the packed word
+        // buffer on device + the TCFeature table — through different routes. Host: pack on
+        // host, upload once (unchanged). Raw: plan the geometry (bins-independent), then
+        // quantize+pack ON DEVICE from the uploaded f32 columns + borders; the host bin
+        // matrix and the host packed words never exist.
+        let (cindex_features, cindex_words_h, num_words) = match bins {
+            BinsChannel::Host(_) => {
+                let packed = pack_cindex(&eff_bins, &n_buckets_per_feature, &one_hot_flags, n)?;
+                let num_words = packed.words.len();
+                // `packed.words` is MOVED into the upload (no clone — round-3 perf).
+                let words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words));
+                (packed.features, words_h, num_words)
+            }
+            BinsChannel::RawFloat { columns, borders } => {
+                let plan = plan_cindex(&n_buckets_per_feature, &one_hot_flags, n)?;
+                let num_words = plan.num_groups.checked_mul(n).ok_or_else(|| {
+                    CbError::OutOfRange(format!(
+                        "cindex num_groups ({}) * n ({n}) overflows usize",
+                        plan.num_groups
+                    ))
+                })?;
+                let words_h = fill_packed_cindex_on_device(&client, columns, borders, &plan, n)?;
+                (plan.features, words_h, num_words)
+            }
+        };
+        let packed = PackedCindex {
+            words: Vec::new(),
+            features: cindex_features,
+        };
         let (offsets_v, shifts_v, masks_v, _one_hot_flags_v) = packed.device_arrays()?;
-        let num_words = packed.words.len();
 
         // Host copies of the per-feature packed addressing (offset/shift/mask): the
         // per-level partition split reads the chosen split feature's bin through the ONE
@@ -1662,8 +1864,8 @@ impl GpuTrainSession {
 
         // Upload ALL resident handles ONCE. der1/weight/approx are channel-typed (f32 on
         // wgpu, f64 elsewhere) via the shared helper; cindex/indices/TCFeature are u32.
-        // `packed.words` is MOVED into the upload (no clone — round-3 perf).
-        let cindex_words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words));
+        // (`cindex_words_h` is already resident — packed-and-uploaded or device-filled in
+        // the channel match above.)
         let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets_v));
         let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts_v));
         let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks_v));
