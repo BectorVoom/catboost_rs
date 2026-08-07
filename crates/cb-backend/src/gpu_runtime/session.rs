@@ -1252,16 +1252,32 @@ impl GpuTrainSession {
                 // knob (`grow_policy=Region`, depth → `MaxLeaves = depth + 1`); every OTHER family
                 // flag must still be the covered default (D-10-01 all-or-nothing PER family: no
                 // subsampling / MVS / exact leaf / CTR / leaf cap). Otherwise decline to CPU.
-                let family_default = config.bootstrap_type == DeviceBootstrapType::No
-                    && config.mvs_lambda.is_none()
+                // FPP-13 (T11): Region × HOST sampling is now covered. The former
+                // `!config.sample_from_host` exclusion existed because the Region grow path
+                // IGNORED the multiplier, so accepting such a config would have silently
+                // dropped the sample. FPP-12 gave `grow_region_tree` real SPLIT-SCORING
+                // channels, so the sample is now consumed rather than dropped.
+                //
+                // `mvs_lambda` is deliberately not required under host sampling: λ lives
+                // host-side inside `cb_train::bootstrap`, so the device field is inert
+                // bookkeeping (the same rule the oblivious `host_sample_covered` arm uses).
+                // Poisson is absent BY DESIGN — it is device-resident and only the
+                // oblivious arm opens the resident sampler.
+                let sampling_covered = if config.sample_from_host {
+                    matches!(
+                        config.bootstrap_type,
+                        DeviceBootstrapType::Bayesian
+                            | DeviceBootstrapType::Bernoulli
+                            | DeviceBootstrapType::Mvs
+                    )
+                } else {
+                    config.bootstrap_type == DeviceBootstrapType::No
+                        && config.mvs_lambda.is_none()
+                };
+                let family_default = sampling_covered
                     && !config.exact_leaf
                     && config.ctr.is_none()
-                    && config.max_leaves.is_none()
-                    // WR-01: Region × sampling is OUT of scope (SPEC §2). Without this the
-                    // Region arm would accept `sample_from_host` + `bootstrap_type == No` and
-                    // then DROP the sample (the Region grow path ignores it) — a silent
-                    // wrong-answer. Decline to the CPU grower instead.
-                    && !config.sample_from_host;
+                    && config.max_leaves.is_none();
                 if !family_default {
                     return Ok(None);
                 }
@@ -1349,14 +1365,23 @@ impl GpuTrainSession {
                 // covered regime (no subsampling / MVS / exact leaf / CTR). Only `grow_policy`
                 // and `max_leaves` (the Lossguide cap) may be non-default — those are THIS
                 // family's own knobs (D-10-01 all-or-nothing PER family).
-                let family_default = config.bootstrap_type == DeviceBootstrapType::No
-                    && config.mvs_lambda.is_none()
-                    && !config.exact_leaf
-                    && config.ctr.is_none()
-                    // WR-01: non-symmetric (Depthwise / Lossguide) × sampling is OUT of scope
-                    // (SPEC §2). Same silent-drop hazard as the Region arm above — the nonsym
-                    // grow path ignores the sample, so decline rather than grow unsampled.
-                    && !config.sample_from_host;
+                // FPP-13 (T11): non-symmetric × HOST sampling is now covered, for the same
+                // reason as the Region arm above — FPP-12 gave `grow_nonsym_tree` real
+                // SPLIT-SCORING channels, so the multiplier is consumed, not dropped.
+                // `max_leaves` stays permitted here: it is this family's own knob.
+                let sampling_covered = if config.sample_from_host {
+                    matches!(
+                        config.bootstrap_type,
+                        DeviceBootstrapType::Bayesian
+                            | DeviceBootstrapType::Bernoulli
+                            | DeviceBootstrapType::Mvs
+                    )
+                } else {
+                    config.bootstrap_type == DeviceBootstrapType::No
+                        && config.mvs_lambda.is_none()
+                };
+                let family_default =
+                    sampling_covered && !config.exact_leaf && config.ctr.is_none();
                 if !family_default {
                     return Ok(None);
                 }
