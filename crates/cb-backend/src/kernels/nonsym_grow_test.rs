@@ -357,9 +357,10 @@ fn assert_matches(policy: NonsymPolicy, score_fn: u32, label: &str) {
         let (der1, weight, cindex) = fixture(n, n_features, n_bins);
         let scaled_l2 = scaled_l2_for(&weight, n, l2);
 
+        // Unsampled: the score channels ARE the leaf channels (D-04 byte-unchanged).
         let dev = grow_nonsym_tree(
-            policy, &der1, &weight, &cindex, n, n_bins, n_features, max_depth, max_leaves,
-            min_data_in_leaf, scaled_l2, score_fn,
+            policy, &der1, &weight, &der1, &weight, &cindex, n, n_bins, n_features, max_depth,
+            max_leaves, min_data_in_leaf, scaled_l2, score_fn,
         )
         .expect("device non-sym grow must succeed on the clear-margin fixture");
 
@@ -544,4 +545,127 @@ fn lossguide_matches_cpu_leaf_wise_l2() {
 #[test]
 fn lossguide_matches_cpu_leaf_wise_cosine() {
     assert_matches(NonsymPolicy::Lossguide, SCORE_FN_COSINE, "lossguide-cosine");
+}
+
+// ─── FPP-12 (T08): the host bootstrap sample reaches the nonsym grower's SCORE channels ──
+
+/// FPP-12: with a length-`n` `sample`, the non-symmetric device grower scores splits (and
+/// the unsplit-gain baseline, and the Lossguide priority) over `der1 ⊙ sample` /
+/// `weight ⊙ sample`, while LEAF values keep using the UNSAMPLED channels —
+/// `Runtime::grow_tree_on_device`'s contract verbatim.
+///
+/// # Why the reference multiplies twice
+///
+/// The `der1` that reaches `grow_nonsym_tree` has already been through
+/// `host_weighted_der1`, so on a weighted × sampled fit the score channel is
+/// `w · der1 · s` and the score weight is `w · s`. That mirrors the oblivious resident
+/// arm's nested `fold_weights_resident(fold_weights_resident(der1, weight), sample)`. A
+/// reference that multiplied once would be chasing a phantom.
+fn assert_sampled_matches(policy: NonsymPolicy, score_fn: u32, label: &str) {
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!("[{label}] SKIP: non-sym device grow needs a real GPU backend (rocm/cuda)");
+        return;
+    }
+    const EPS: f64 = 1e-4;
+    let n = 64usize;
+    let n_features = 3usize;
+    let n_bins = 32usize;
+    let max_depth = 4usize;
+    let max_leaves = 8usize;
+    let min_data_in_leaf = 1usize;
+    let l2 = 3.0_f64;
+
+    let (der1, weight, cindex) = fixture(n, n_features, n_bins);
+    let scaled_l2 = scaled_l2_for(&weight, n, l2);
+    // ~30% DROPPED objects plus up- and down-weighted ones. The zeros are the
+    // discriminating part: a dropped object must contribute NOTHING to any histogram.
+    let sample: Vec<f64> = (0..n)
+        .map(|i| match i % 10 {
+            0 | 3 | 7 => 0.0,
+            1 | 4 => 0.5,
+            2 | 5 | 8 => 1.0,
+            _ => 2.0,
+        })
+        .collect();
+    let score_der1: Vec<f64> = der1.iter().zip(sample.iter()).map(|(&d, &s)| d * s).collect();
+    let score_weight: Vec<f64> =
+        weight.iter().zip(sample.iter()).map(|(&w, &s)| w * s).collect();
+
+    let sampled = grow_nonsym_tree(
+        policy, &der1, &weight, &score_der1, &score_weight, &cindex, n, n_bins, n_features,
+        max_depth, max_leaves, min_data_in_leaf, scaled_l2, score_fn,
+    )
+    .expect("sampled non-sym grow must succeed");
+
+    // (A) STRUCTURE is decided by the SAMPLED score channels.
+    let all_sampled = grow_nonsym_tree(
+        policy, &score_der1, &score_weight, &score_der1, &score_weight, &cindex, n, n_bins,
+        n_features, max_depth, max_leaves, min_data_in_leaf, scaled_l2, score_fn,
+    )
+    .expect("all-sampled non-sym grow must succeed");
+    assert_eq!(
+        sampled.splits, all_sampled.splits,
+        "[{label}] the node splits must be decided by the SAMPLED score channels"
+    );
+    assert_eq!(sampled.leaf_of, all_sampled.leaf_of, "[{label}] routing follows the sampled structure");
+
+    // …and (A) is only meaningful if the sampled structure DIFFERS from the unsampled one.
+    // Otherwise a fixture where both coincide would pass (A) vacuously.
+    let unsampled = grow_nonsym_tree(
+        policy, &der1, &weight, &der1, &weight, &cindex, n, n_bins, n_features, max_depth,
+        max_leaves, min_data_in_leaf, scaled_l2, score_fn,
+    )
+    .expect("unsampled non-sym grow must succeed");
+    assert_ne!(
+        sampled.splits, unsampled.splits,
+        "[{label}] the sampled and unsampled structures coincide — the sample never \
+         reached the scorer, or this fixture cannot detect it"
+    );
+
+    // (B) LEAF VALUES come from the UNSAMPLED channels, so they must DIFFER from the
+    // all-sampled grow. That difference IS the contract.
+    let (leaf_abs, _r) = max_divergence(&sampled.leaf_values, &all_sampled.leaf_values);
+    assert!(
+        leaf_abs > EPS,
+        "[{label}] sampled and all-sampled leaf values coincide (abs={leaf_abs:.3e}) — \
+         leaf estimation must NOT see the sample"
+    );
+
+    // (C) …and they equal `calc_average` over each leaf's RAW der/weight, recomputed here
+    // independently from the emitted routing.
+    let leaf_count = sampled.leaf_values.len();
+    let mut leaves: Vec<Vec<usize>> = vec![Vec::new(); leaf_count];
+    for (obj, &leaf) in sampled.leaf_of.iter().enumerate() {
+        if let Some(slot) = leaves.get_mut(leaf as usize) {
+            slot.push(obj);
+        }
+    }
+    let expected: Vec<f64> = leaves
+        .iter()
+        .map(|docs| {
+            let ds: Vec<f64> = docs.iter().map(|&i| der1[i]).collect();
+            let ws: Vec<f64> = docs.iter().map(|&i| weight[i]).collect();
+            calc_average(sum_f64(&ds), sum_f64(&ws), scaled_l2)
+        })
+        .collect();
+    let (abs, rel) = max_divergence(&sampled.leaf_values, &expected);
+    println!("[{label}] sampled leaf oracle: abs={abs:.3e} rel={rel:.3e} (bar={EPS:.0e})");
+    assert!(
+        abs <= EPS || rel <= EPS,
+        "[{label}] sampled leaf values must be calc_average over the RAW channels: \
+         abs={abs:.3e} rel={rel:.3e}"
+    );
+}
+
+#[test]
+fn depthwise_matches_cpu_with_nontrivial_sample() {
+    assert_sampled_matches(NonsymPolicy::Depthwise, SCORE_FN_L2, "depthwise-sampled-l2");
+}
+
+#[test]
+fn lossguide_matches_cpu_with_nontrivial_sample() {
+    // Lossguide additionally orders its priority queue by the per-node GAIN, which is
+    // computed from the score channels — so this arm exercises the sample's effect on
+    // expansion ORDER, not just on each node's chosen split.
+    assert_sampled_matches(NonsymPolicy::Lossguide, SCORE_FN_COSINE, "lossguide-sampled-cosine");
 }
