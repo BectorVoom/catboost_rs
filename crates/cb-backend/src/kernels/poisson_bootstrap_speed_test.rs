@@ -28,6 +28,47 @@
 //! still catches a collapse back to serial.
 //!
 //! rocm/cuda only; cpu/wgpu print a SKIP line rather than passing silently.
+//!
+//! # Why this test is `#[ignore]`d (measured 2026-08-07, gfx1151)
+//!
+//! It needs an UNCONTENDED device, and a package-wide `cargo test -p cb-backend --lib`
+//! does not provide one: ~260 tests share the GPU, and the default harness runs them on
+//! as many threads as there are cores. The kernel is fine — the measurement is not:
+//!
+//! | condition | parallel | serial | ratio |
+//! |---|---|---|---|
+//! | alone (×3) | 32.7 / 33.0 / 33.2 ms | ~350 ms | **10.5–10.7×** — passes, 2× the bar |
+//! | inside the full `--lib` suite (×3) | 218 / 186 / 171 ms | 723 / 703 / 627 ms | 3.3–3.8× — fails |
+//!
+//! Both arms slow down under load, but not equally: the parallel (GPU-bound) arm degrades
+//! ~6× while the serial arm degrades only ~2×. The ratio is a quotient of two quantities
+//! with different contention sensitivity, so it collapses while the code under test is
+//! untouched. Every failure observed was of this kind — the baseline commit fails it 3/3
+//! too.
+//!
+//! Three fixes were considered; only isolation survives scrutiny:
+//!
+//!  * **A fixed wall-clock budget** (e.g. "under 60 ms") does NOT work. It is *more*
+//!    contention-sensitive, not less: the parallel arm measures 171–293 ms under load, so
+//!    any budget near its uncontended 33 ms fails for exactly the same reason.
+//!  * **A process-wide GPU mutex** would work but only if EVERY GPU-touching test in the
+//!    crate took it — ~260 sites, for one test's benefit.
+//!  * **Retrying for a quiet window** is already effectively in place and already
+//!    insufficient: [`best_of_three`] takes the minimum of three runs per arm, and the
+//!    contention is sustained across the whole suite rather than a transient hiccup, so
+//!    all three samples are equally contended.
+//!
+//! So the test is `#[ignore]`d and run in its own process, where the measurement means
+//! what it claims. `run_device_tests.sh` does this; by hand it is:
+//!
+//! ```text
+//! cargo test -p cb-backend --no-default-features --features rocm \
+//!     --lib kernels::poisson_bootstrap_speed_test -- --ignored --nocapture
+//! ```
+//!
+//! `#[ignore]` here means "needs an isolated device", NOT "known-broken" — the assertion
+//! below is live and unweakened, and `MIN_SPEEDUP` was deliberately NOT lowered, since a
+//! bar tuned to contended numbers would measure the scheduler instead of the kernel.
 
 use std::time::Instant;
 
@@ -65,6 +106,8 @@ fn splitmix64_seeds(seed0: u64, count: usize) -> Vec<u64> {
 }
 
 #[test]
+#[ignore = "perf: needs an uncontended device — run in its own process (see the module \
+            docs, or run_device_tests.sh)"]
 fn poisson_parallel_draw_outpaces_the_serial_stream_draw() {
     if !device_backend_active() {
         eprintln!("[poisson speed] skipped — needs rocm/cuda");

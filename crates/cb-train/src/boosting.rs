@@ -97,10 +97,11 @@ pub enum EBoostingType {
 ///   `greedy_tensor_search.cpp:1806`).
 /// - [`Self::Depthwise`] — a level-order leaf-wise grower producing a non-symmetric
 ///   node graph (`GreedyTensorSearchDepthwise`, `greedy_tensor_search.cpp:1509`).
-/// - [`Self::Region`] — present in the upstream enum for parity but UNIMPLEMENTED
-///   on the CPU path (escalated gap, D-6.6-04 "Region OUT"); rejected up front by
-///   [`validate_grow_policy`] with a typed [`CbError`] — there is no grower arm and
-///   no fabricated structure.
+/// - [`Self::Region`] — the walk-until-diverge region path grower (`region_grower`),
+///   producing `region_trees`. It was originally an escalated CPU gap (D-6.6-04
+///   "Region OUT", rejected up front); GPUT-18 / D-03a IMPLEMENTED it, and it is also
+///   device-eligible (Phase 12 Plan 04). Only Region × non-empty `monotone_constraints`
+///   is still refused, by [`validate_grow_policy`].
 ///
 /// Pinned EXPLICITLY on [`BoostParams::grow_policy`] (never auto-selected, RESEARCH
 /// Pitfall 6); the vast majority of fixtures leave it at [`Self::SymmetricTree`] so
@@ -114,8 +115,8 @@ pub enum EGrowPolicy {
     Lossguide,
     /// Level-order leaf-wise growth (non-symmetric node graph).
     Depthwise,
-    /// Region growth — UNIMPLEMENTED on CPU (escalated gap, D-6.6-04); rejected by
-    /// [`validate_grow_policy`].
+    /// Region growth — the walk-until-diverge path grower, emitting `region_trees`
+    /// (GPUT-18 / D-03a; the D-6.6-04 "Region OUT" rejection is lifted).
     Region,
 }
 
@@ -386,8 +387,9 @@ pub struct BoostParams {
     /// [`EGrowPolicy::SymmetricTree`] (the default) dispatches to the literal
     /// pre-6.6 oblivious grower (byte-identical, D-6.6-05); [`EGrowPolicy::Lossguide`]
     /// / [`EGrowPolicy::Depthwise`] dispatch to the leaf-wise grower producing a TRUE
-    /// non-symmetric node graph; [`EGrowPolicy::Region`] is rejected up front
-    /// ([`validate_grow_policy`]). Pinned EXPLICITLY ([`grow_policy_default`]).
+    /// non-symmetric node graph; [`EGrowPolicy::Region`] dispatches to the
+    /// walk-until-diverge region grower (GPUT-18 / D-03a — no longer rejected).
+    /// Pinned EXPLICITLY ([`grow_policy_default`]).
     pub grow_policy: EGrowPolicy,
     /// The maximum leaf count for the Lossguide grower (`max_leaves` / upstream
     /// `MaxLeaves`, FEAT-06). The best-gain priority queue stops once the structure
@@ -1503,20 +1505,28 @@ fn validate_monotone_constraints(monotone_constraints: &[i8]) -> CbResult<()> {
 /// D-6.6-07 — the escalated gaps deferred by Plan 06.6-02, now reachable since
 /// `grow_policy` exists):
 ///
-/// 1. [`EGrowPolicy::Region`] — UNIMPLEMENTED on the CPU path ("Region OUT",
-///    D-6.6-04). There is no Region grower arm; selecting it errors rather than
-///    silently falling back to another policy and fabricating a structure.
-/// 2. `monotone_constraints` × a NON-SYMMETRIC `grow_policy` ({Lossguide,
-///    Depthwise}) — upstream EXPLICITLY rejects monotone constraints under every
-///    non-symmetric grow policy (`monotonic_constraint_utils.h:42`,
-///    `CB_ENSURE_INTERNAL(monotoneConstraints.empty(), "...unsupported for
-///    non-symmetric trees yet")`). The monotone PAVA post-pass is wired ONLY into
-///    the oblivious leaf path (D-6.6-06); routing a non-empty `monotone_constraints`
-///    through the leaf-wise grower would silently DROP the constraint, so it is
-///    rejected with a typed error (D-6.6-07 — no fabricated output).
+/// `monotone_constraints` × a NON-SYMMETRIC `grow_policy` ({Lossguide, Depthwise,
+/// Region}) — upstream EXPLICITLY rejects monotone constraints under every
+/// non-symmetric grow policy (`monotonic_constraint_utils.h:42`,
+/// `CB_ENSURE_INTERNAL(monotoneConstraints.empty(), "...unsupported for
+/// non-symmetric trees yet")`). The monotone PAVA post-pass is wired ONLY into
+/// the oblivious leaf path (D-6.6-06); routing a non-empty `monotone_constraints`
+/// through the leaf-wise grower would silently DROP the constraint, so it is
+/// rejected with a typed error (D-6.6-07 — no fabricated output).
 ///
-/// Both guards were DEFERRED by Plan 06.6-02 (the `grow_policy` enum did not yet
+/// This guard was DEFERRED by Plan 06.6-02 (the `grow_policy` enum did not yet
 /// exist); this is the enablement point Plan 06.6-04 owns.
+///
+/// # A second guard used to live here and is GONE
+///
+/// This function also used to reject [`EGrowPolicy::Region`] outright as
+/// "UNIMPLEMENTED on the CPU path" (D-6.6-04 "Region OUT"). GPUT-18 / D-03a lifted
+/// that — Region grows on the CPU as a `TRegionModel`-style path (`region_grower`)
+/// and the trained model carries `region_trees`. A BARE Region fit therefore trains;
+/// only Region × non-empty `monotone_constraints` is still refused, by the clause
+/// above. The doc is called out rather than silently deleted because the stale
+/// version outlived the code by long enough to keep a test asserting the old
+/// contract (`monotone_oracle_test`), which then failed.
 fn validate_grow_policy(grow_policy: EGrowPolicy, monotone_constraints: &[i8]) -> CbResult<()> {
     // GPUT-18 / D-03a: the "Region OUT" rejection is LIFTED — Region now grows on the
     // CPU as a `TRegionModel`-style path (`region_grower`). The monotone guard below
