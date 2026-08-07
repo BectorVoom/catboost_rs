@@ -4769,7 +4769,7 @@ fn train_inner<R: Runtime>(
             let mut device_stored_leaf_values: Vec<f64> = Vec::new();
 
             let dev_tree = runtime
-                .grow_tree_on_device(&approx, target, &device_sample)?
+                .grow_tree_on_device(&approx, target, &device_sample, None)?
                 .ok_or_else(|| {
                     // `begin` returned Ok(true): the whole fit is committed to the
                     // device grower (D-10-01). Folding a CPU-grown tree here would MIX

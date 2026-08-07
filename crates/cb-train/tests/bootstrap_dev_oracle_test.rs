@@ -200,7 +200,7 @@ fn bootstrap_dev_cpu_matches_upstream() {
 #[test]
 fn bootstrap_dev_device_matches_upstream() {
     use cb_backend::GpuBackend;
-    use cb_compute::{DeviceGrownTree, DeviceTrainConfig, Runtime};
+    use cb_compute::{DeviceGrownTree, DeviceTrainConfig, FamilyTreeArgs, Runtime};
     use cb_core::CbResult;
     use cb_train::train;
     use std::cell::Cell;
@@ -263,8 +263,9 @@ fn bootstrap_dev_device_matches_upstream() {
             approx: &[f64],
             target: &[f64],
             sample: &[f64],
+        family: Option<&FamilyTreeArgs<'_>>,
         ) -> CbResult<Option<DeviceGrownTree>> {
-            let out = self.inner.grow_tree_on_device(approx, target, sample)?;
+            let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
                 self.grown.set(self.grown.get() + 1);
                 if !sample.is_empty() {

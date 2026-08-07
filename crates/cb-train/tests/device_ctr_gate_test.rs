@@ -70,7 +70,9 @@ mod device {
 
     use super::{ctr_params, fixture};
     use cb_backend::GpuBackend;
-    use cb_compute::{DeviceGrownTree, DeviceTrainConfig, EScoreFunction, Loss, Runtime};
+    use cb_compute::{
+        DeviceGrownTree, DeviceTrainConfig, EScoreFunction, FamilyTreeArgs, Loss, Runtime,
+    };
     use cb_core::CbResult;
     use cb_data::stringify_int_category;
     use cb_train::train_cat;
@@ -121,8 +123,9 @@ mod device {
             approx: &[f64],
             target: &[f64],
             sample: &[f64],
+        family: Option<&FamilyTreeArgs<'_>>,
         ) -> CbResult<Option<DeviceGrownTree>> {
-            let out = self.inner.grow_tree_on_device(approx, target, sample)?;
+            let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
                 self.grown.set(self.grown.get() + 1);
             }
