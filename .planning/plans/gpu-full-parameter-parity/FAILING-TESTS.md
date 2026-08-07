@@ -1,5 +1,9 @@
 # Failing tests — `worktree-gpu-full-parameter-parity` @ `d24f25b`
 
+> **STATUS: BOTH FIXED.** See "Resolution" at the foot of this file. The analysis below is
+> kept as the diagnosis of record; one of its three F1 recommendations was wrong, and that
+> is corrected in the Resolution section rather than quietly edited out.
+
 Scope: **only the tests that failed.** Measured 2026-08-07 on the local rig (AMD gfx1151,
 ROCm) for the device lane and default features for the CPU lane.
 
@@ -156,3 +160,71 @@ notes record pre-existing failures in at least the first two:
 
 The DoD's full command list should be run before any release claim; this report covers only
 what was executed here.
+
+
+---
+
+# Resolution
+
+Both tests now pass. `cb-backend --lib` (rocm): **259 passed, 0 failed, 2 ignored**.
+`cb-train` (CPU): **106 suites ok, 0 failed**. `run_device_tests.sh`: all PASS.
+
+## F1 — fixed by isolation, and one recommendation above was WRONG
+
+The test is now `#[ignore]`d with the reason *"perf: needs an uncontended device"*, and runs
+in its own process via a new perf lane in `run_device_tests.sh`:
+
+```
+cargo test -p cb-backend --no-default-features --features rocm \
+    --lib kernels::poisson_bootstrap_speed_test -- --ignored --nocapture --test-threads=1
+```
+
+There it reads **11.8–12.6×** against the unchanged 5× bar.
+
+**Correction to this report's own recommendation (2).** "Compare against a fixed budget —
+e.g. assert the parallel draw is under ~60 ms" would NOT have worked, and recommending it was
+an error. A fixed wall-clock budget is *more* contention-sensitive than the ratio, not less:
+under full-suite load the parallel arm measures 171–293 ms, so any budget near its
+uncontended 33 ms fails for precisely the reason the ratio already did. Recommendation (1),
+a process-wide GPU mutex, is sound but would need all ~260 GPU-touching tests in the crate to
+take it. Only (3), isolation, holds up.
+
+Also worth recording: the module already contained a `best_of_three` helper documented as
+being there "so a scheduling hiccup cannot decide the result". Retrying was therefore already
+in place and already insufficient — the contention is sustained across the whole suite run,
+not transient, so all three samples are equally contended. `MIN_SPEEDUP` was deliberately NOT
+lowered; a bar tuned to contended numbers would measure the scheduler rather than the kernel.
+
+## F2 — fixed by inverting the stale assertion, plus four stale doc sites
+
+`monotone_non_symmetric_and_region_are_typed_errors` is renamed
+`monotone_rejected_on_all_non_symmetric_policies_while_bare_region_trains` and now asserts:
+
+1. `monotone_constraints` × {Lossguide, Depthwise, **Region**} → typed error. Region joins the
+   loop because `validate_grow_policy` folds it in via
+   `is_non_symmetric() || grow_policy == Region`. This is live behaviour and was previously
+   untested.
+2. A **bare** Region fit (empty constraints) **trains**, emits `region_trees`, and leaves the
+   oblivious / non-symmetric arms empty — the inverse of the obsolete assertion.
+
+Case (2) is not just a replacement; it is the control that makes case (1)'s Region iteration
+load-bearing. Without it, (1) could pass because Region is broken rather than because the
+monotone guard fired.
+
+Four documentation sites still claimed Region was unimplemented, all now corrected:
+
+| site | was |
+|---|---|
+| `EGrowPolicy` enum doc | "present in the upstream enum for parity but UNIMPLEMENTED on the CPU path … rejected up front" |
+| `EGrowPolicy::Region` variant doc | "UNIMPLEMENTED on CPU … rejected by `validate_grow_policy`" |
+| `BoostParams::grow_policy` doc | "`EGrowPolicy::Region` is rejected up front" |
+| `validate_grow_policy` doc, item 1 | "UNIMPLEMENTED on the CPU path … there is no Region grower arm" |
+
+The last one contradicted an inline comment four lines below it in the same function. That
+divergence is what let the stale test survive, so `validate_grow_policy`'s doc now states
+explicitly that the guard was removed and why, instead of simply dropping the item.
+
+## Unrelated gap closed while here
+
+`device_ordered_fit_test` shipped in the Track O merge but was never added to
+`run_device_tests.sh`, so the runner did not cover it. Added.

@@ -252,22 +252,38 @@ fn monotone_invalid_constraint_is_typed_error() {
 ///      PAVA post-pass is oblivious-only (D-6.6-06), so routing a non-empty
 ///      `monotone_constraints` through the leaf-wise grower would silently DROP the
 ///      constraint. The guard rejects it instead.
-///   2. `grow_policy == Region` — UNIMPLEMENTED on the CPU path (escalated gap,
-///      D-6.6-04 "Region OUT"); there is no Region grower arm.
+///   2. `grow_policy == Region` combined with a non-empty `monotone_constraints` —
+///      `validate_grow_policy` treats Region as non-symmetric for this purpose
+///      (`non_symmetric_policy = is_non_symmetric() || Region`), so the same upstream
+///      rejection applies.
 ///
-/// These were a commented `// TODO(06.6-04)` stub in this file under Plan 06.6-02
-/// (the `grow_policy` enum did not exist yet); 06.6-04 OWNS enabling them. The
-/// self-contained Region guard + the malformed-direction guard
-/// ([`monotone_invalid_constraint_is_typed_error`]) stay intact.
+/// # What changed (and why this test was failing)
+///
+/// This test used to assert that a BARE `grow_policy == Region` fit — empty
+/// `monotone_constraints` — was itself a typed error, citing D-6.6-04 "Region OUT".
+/// That contract is obsolete. GPUT-18 / D-03a LIFTED the Region rejection:
+/// `validate_grow_policy` says so inline, `region_grower` is dispatched from
+/// `boosting.rs`, the trained model carries `region_trees`, and `device_region_fit_test`
+/// exercises the device arm. A bare Region fit is now SUPPOSED to train.
+///
+/// So the stale assertion is replaced by its inverse — a bare Region fit trains and
+/// produces region trees — which doubles as the control that makes case (2) meaningful:
+/// without it, (2) could pass because Region is broken rather than because the monotone
+/// guard fired.
 #[test]
-fn monotone_non_symmetric_and_region_are_typed_errors() {
+fn monotone_rejected_on_all_non_symmetric_policies_while_bare_region_trains() {
     let columns = load_feature_columns();
     let target = load_target();
     let borders: Vec<Vec<f64>> = vec![vec![0.0]; columns.len()];
 
-    // (1) monotone_constraints × non-symmetric grow_policy → typed error. Test BOTH
-    //     non-symmetric policies (Lossguide AND Depthwise).
-    for policy in [EGrowPolicy::Lossguide, EGrowPolicy::Depthwise] {
+    // (1) monotone_constraints × every non-symmetric grow_policy → typed error. Region is
+    //     included: `validate_grow_policy` folds it in via
+    //     `is_non_symmetric() || grow_policy == Region`.
+    for policy in [
+        EGrowPolicy::Lossguide,
+        EGrowPolicy::Depthwise,
+        EGrowPolicy::Region,
+    ] {
         let mut params = isolating_params(vec![-1, 0, 1, 0]);
         params.grow_policy = policy;
         let result = train(&CpuBackend, &columns, &borders, &target, &[], &params, None);
@@ -278,13 +294,30 @@ fn monotone_non_symmetric_and_region_are_typed_errors() {
         );
     }
 
-    // (2) grow_policy=Region → typed error (CPU-unimplemented escalated gap). Empty
-    //     monotone_constraints so ONLY the Region rejection is exercised.
+    // (2) A BARE Region fit — empty monotone_constraints — now TRAINS (GPUT-18 / D-03a
+    //     lifted "Region OUT"). This is the inverse of what this case used to assert.
+    //
+    //     It is also the control for (1): if Region simply failed for some unrelated
+    //     reason, (1)'s Region iteration would pass while proving nothing about the
+    //     monotone guard. Asserting the fit SUCCEEDS here, and that it actually produced
+    //     region trees rather than silently falling back to another policy, is what makes
+    //     (1)'s Region case load-bearing.
     let mut params = isolating_params(vec![]);
     params.grow_policy = EGrowPolicy::Region;
-    let result = train(&CpuBackend, &columns, &borders, &target, &[], &params, None);
+    let trained = train(&CpuBackend, &columns, &borders, &target, &[], &params, None)
+        .unwrap_or_else(|e| {
+            panic!(
+                "a bare grow_policy=Region fit must train — GPUT-18 / D-03a lifted the \
+                 D-6.6-04 \"Region OUT\" rejection and `region_grower` is dispatched from \
+                 boosting.rs. Got: {e:?}"
+            )
+        });
     assert!(
-        result.is_err(),
-        "grow_policy=Region must be rejected with a typed error (D-6.6-04 \"Region OUT\")"
+        !trained.region_trees.is_empty(),
+        "a Region fit must emit region trees, not silently fall back to another grow policy"
+    );
+    assert!(
+        trained.oblivious_trees.is_empty() && trained.non_symmetric_trees.is_empty(),
+        "a Region fit must NOT populate the oblivious / non-symmetric arms"
     );
 }
