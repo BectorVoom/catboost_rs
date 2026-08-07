@@ -261,7 +261,7 @@ pub fn select_borders_greedy_logsum_f32(
     } else {
         column.iter().copied().filter(|v| !v.is_nan()).collect()
     };
-    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sort_f32_ascending(&mut values);
 
     // Each non-NaN object carries unit weight; the total weight is accumulated
     // through the audited reduction primitive (D-07) — for the unweighted path
@@ -285,6 +285,77 @@ pub fn select_borders_greedy_logsum_f32(
     }
     out.extend(sorted.into_iter().map(f64::from));
     out
+}
+
+/// Ascending f32 sort via LSD radix over the total-order key transform
+/// (`bits ^ (sign ? 0xFFFF_FFFF : 0x8000_0000)`) — SPD-03 wave 4: this sort is
+/// the dominant term of fit-prep's border selection at scale (200k values × every
+/// column; the P100 r3 diag attributes ~2.5 s CPU to the border stage), and the
+/// comparator-based `sort_unstable_by` costs ~4× a counting radix here.
+///
+/// Ordering contract vs the former `partial_cmp` unstable sort: the sorted VALUE
+/// sequence is identical for every NaN-free input except across `{-0.0, +0.0}`
+/// pairs (radix puts `-0.0` first deterministically; the unstable comparator sort
+/// ordered them arbitrarily). Every downstream consumer is order-insensitive
+/// across equal keys — `left_border`'s midpoint of a `{-0.0, +0.0}` adjacency is
+/// `+0.0` in either order, the greedy split scores depend only on the sorted
+/// values at each index, and the emitted border set normalizes `-0.0` before
+/// dedup — so the border SET is byte-identical (the same argument that already
+/// licensed the unstable sort). The caller guarantees NaN-free input (NaNs are
+/// filtered/sampled out above).
+fn sort_f32_ascending(values: &mut [f32]) {
+    // Small inputs: the comparator sort's constant factor wins; radix scratch
+    // would dominate.
+    if values.len() < 1 << 10 {
+        values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        return;
+    }
+    let mut keys: Vec<u32> = values
+        .iter()
+        .map(|v| {
+            let b = v.to_bits();
+            if b & 0x8000_0000 != 0 {
+                !b
+            } else {
+                b ^ 0x8000_0000
+            }
+        })
+        .collect();
+    let mut scratch: Vec<u32> = vec![0_u32; keys.len()];
+    for pass in 0..4_u32 {
+        let shift = pass * 8;
+        let mut counts = [0_usize; 256];
+        for &k in keys.iter() {
+            let bucket = ((k >> shift) & 0xFF) as usize;
+            if let Some(slot) = counts.get_mut(bucket) {
+                *slot += 1;
+            }
+        }
+        let mut offsets = [0_usize; 256];
+        let mut running = 0_usize;
+        for (o, &c) in offsets.iter_mut().zip(counts.iter()) {
+            *o = running;
+            running += c;
+        }
+        for &k in keys.iter() {
+            let bucket = ((k >> shift) & 0xFF) as usize;
+            if let Some(pos) = offsets.get_mut(bucket) {
+                if let Some(slot) = scratch.get_mut(*pos) {
+                    *slot = k;
+                }
+                *pos += 1;
+            }
+        }
+        std::mem::swap(&mut keys, &mut scratch);
+    }
+    for (v, &k) in values.iter_mut().zip(keys.iter()) {
+        let b = if k & 0x8000_0000 != 0 {
+            k ^ 0x8000_0000
+        } else {
+            !k
+        };
+        *v = f32::from_bits(b);
+    }
 }
 
 /// Draw `sample_size` objects uniformly WITHOUT replacement (upstream

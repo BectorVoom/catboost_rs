@@ -74,7 +74,18 @@ impl CatBoostRegressor {
         // Remembered on the base because PREDICT must declare the same width
         // (F10 checks the pool's declared width against the model's).
         let cats = resolve_cat_features(&slf.base.params, py, cat_features)?;
+        // CB_GPU_PROF py-stage attribution (SPD-03: the ingest was a ~0.4 s
+        // unattributed residual between the Python wallclock and the Rust
+        // fit-prep timer). Cold when unset.
+        let py_prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
+        let py_prof_t = std::time::Instant::now();
         let pool = data_to_pool(py, x, y, Some(&cats))?;
+        if py_prof {
+            eprintln!(
+                "CB_GPU_PROF py-ingest elapsed={:.2}ms",
+                py_prof_t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         // PARAM-02: the eval sets are ingested to OWNED pools under the GIL, like
         // the learn set. An absent `eval_set` yields an empty vector, which the
         // facade treats as a plain learn-only fit.

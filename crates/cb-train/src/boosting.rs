@@ -5458,6 +5458,20 @@ fn train_inner<R: Runtime>(
                     );
                     const FOLD_CHUNK: usize = 1 << 16;
                     let weights_len = weights.len();
+                    // SPD-03 wave 4: the seam ALREADY returns the device's resident
+                    // per-object leaf assignment (`read_part_stats_and_leaf_of` crosses
+                    // it with the part-stats every tree; `DeviceGrownTree.leaf_of`), in
+                    // the SAME forward-bit convention as the host walk
+                    // (`partition_split_kernel` doc: `leaf |= 1 << level`, quantized
+                    // `bin > split_bin` ⟺ value-space `v > border` — exact, since every
+                    // border round-trips f32 by construction). Re-walking the raw float
+                    // columns here was pure redundancy — and the walk's 6 column
+                    // gathers were the fold's dominant memory traffic (P100 r3:
+                    // 17 ms/tree on 4 vCPUs). Use the device assignment when its length
+                    // matches; the walk remains as the fallback.
+                    let device_assignment: Option<&[u32]> = (dev_tree.leaf_of.len()
+                        == approx.len())
+                    .then_some(dev_tree.leaf_of.as_slice());
                     let counts: Vec<u64> = approx
                         .par_chunks_mut(FOLD_CHUNK)
                         .enumerate()
@@ -5466,20 +5480,25 @@ fn train_inner<R: Runtime>(
                             let mut counts = vec![0_u64; n_leaves];
                             for (off, a) in approx_chunk.iter_mut().enumerate() {
                                 let obj = start + off;
-                                let mut leaf = 0usize;
-                                for (l, col) in level_cols.iter().enumerate() {
-                                    let passes = match col {
-                                        DeviceLevelCol::Float(values, border) => values
-                                            .get(obj)
-                                            .is_some_and(|&v| f64::from(v) > *border),
-                                        DeviceLevelCol::OneHot(bins, value) => {
-                                            bins.get(obj).is_some_and(|&b| b == *value)
+                                let leaf = if let Some(dev) = device_assignment {
+                                    dev.get(obj).copied().unwrap_or(0) as usize
+                                } else {
+                                    let mut leaf = 0usize;
+                                    for (l, col) in level_cols.iter().enumerate() {
+                                        let passes = match col {
+                                            DeviceLevelCol::Float(values, border) => values
+                                                .get(obj)
+                                                .is_some_and(|&v| f64::from(v) > *border),
+                                            DeviceLevelCol::OneHot(bins, value) => {
+                                                bins.get(obj).is_some_and(|&b| b == *value)
+                                            }
+                                        };
+                                        if passes {
+                                            leaf |= 1usize << l;
                                         }
-                                    };
-                                    if passes {
-                                        leaf |= 1usize << l;
                                     }
-                                }
+                                    leaf
+                                };
                                 // Same membership rule as `accumulate_leaf_weights`: an
                                 // object contributes to the weight only when it has a
                                 // weight entry (and the leaf is in range).

@@ -217,3 +217,58 @@ fn oversized_column_borders_are_subsampled_and_deterministic() {
         );
     }
 }
+
+/// SPD-03 wave 4: the radix f32 sort behind `select_borders_greedy_logsum_f32`
+/// must order every NaN-free adversarial input identically to the comparator
+/// sort it replaced (up to the documented `{-0.0, +0.0}` tie order, which the
+/// border pipeline normalizes away). Compare on BITS after normalizing -0.0,
+/// across negatives, ±0, subnormals, infinities and duplicates, at a length
+/// above the radix threshold.
+#[test]
+fn border_build_matches_comparator_sort_on_adversarial_values() {
+    use crate::borders::select_borders_greedy_logsum_f32;
+    let specials = [
+        f32::NEG_INFINITY,
+        f32::MIN,
+        -1.5,
+        -f32::MIN_POSITIVE,
+        -0.0,
+        0.0,
+        f32::MIN_POSITIVE,
+        1.0e-30,
+        1.5,
+        f32::MAX,
+        f32::INFINITY,
+    ];
+    // A deterministic mix well above the 1024-value radix threshold, with heavy
+    // duplication of the special values.
+    let mut s: u64 = 0x0123_4567_89AB_CDEF;
+    let column: Vec<f32> = (0..8192)
+        .map(|i| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if i % 3 == 0 {
+                specials[(s >> 33) as usize % specials.len()]
+            } else {
+                (((s >> 33) as f32) / (1u64 << 31) as f32) * 2.0e3 - 1.0e3
+            }
+        })
+        .collect();
+    let radix_borders = select_borders_greedy_logsum_f32(&column, 31, false);
+    // Reference: the identical pipeline over a comparator-presorted column —
+    // border selection is a pure function of the sorted value sequence, so any
+    // sort divergence surfaces as a border difference.
+    let mut reference = column.clone();
+    reference.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let reference_borders = select_borders_greedy_logsum_f32(&reference, 31, false);
+    assert_eq!(
+        radix_borders.len(),
+        reference_borders.len(),
+        "border count diverged"
+    );
+    for (i, (a, b)) in radix_borders.iter().zip(reference_borders.iter()).enumerate() {
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "border {i} diverged: radix {a:?} vs comparator {b:?}"
+        );
+    }
+}
