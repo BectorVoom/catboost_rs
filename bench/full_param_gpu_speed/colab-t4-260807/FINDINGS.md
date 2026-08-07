@@ -78,18 +78,15 @@ silently discarded:
 
 **These are not a GPU-vs-GPU result and must not be cited as one.**
 
-Two further confounders that would distort even a fixed run at this grid's settings:
+One further confounder that would distort even a fixed run at this grid's settings:
 
-1. **`border_count=32` ⇒ 33 bins ⇒ padded to a 64-wide line**, so the oblivious device fill
-   does ~2× the histogram work it would at a true 32. The P100 runs that produced the earlier
-   1.14–1.19× advantage did not carry this padding.
-2. **JIT warm-up dominates at 30 iterations.** The first tree above cost 725 ms of fill against
-   0.5–0.6 ms for every subsequent tree. Over a 30-iteration cell that is a large fixed cost
-   attributed to `catboost_rs` and not to official CatBoost.
+- **`border_count=32` ⇒ 33 bins ⇒ padded to a 64-wide line**, so the oblivious device fill
+  does ~2× the histogram work it would at a true 32. The P100 runs that produced the earlier
+  1.14–1.19× advantage did not carry this padding.
 
-Any re-run should fix D1–D4 *and* either raise the iteration count or exclude warm-up
-explicitly, otherwise the measurement answers a different question than "which trainer is
-faster per tree".
+**JIT warm-up is NOT a confounder** — `fit_once` is called once UNTIMED before the timed
+repeats specifically to absorb it, and only the subsequent `REPEATS` runs are recorded. (An
+earlier draft of this note claimed otherwise; the harness gets this right.)
 
 ## Status
 
