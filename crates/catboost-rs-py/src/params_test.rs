@@ -791,3 +791,125 @@ fn none_valued_params_are_treated_as_unset() {
         );
     });
 }
+
+// ─── FPP-16 (T16): `task_type` is VALIDATED-INFORMATIONAL ───────────────────────────────
+
+/// Whether this test binary was compiled with a device backend feature — the same
+/// compile-time question `validate_task_type` asks. Backend selection in catboost-rs is a
+/// Cargo feature, so the expected outcome for `task_type="GPU"` differs per wheel and the
+/// test has to split on it rather than pick one arm.
+const DEVICE_FEATURE_COMPILED: bool =
+    cfg!(any(feature = "wgpu", feature = "cuda", feature = "rocm"));
+
+fn validate_one(py: Python<'_>, name: &str, value: &str) -> PyResult<()> {
+    let dict = PyDict::new(py);
+    dict.set_item(name, value).unwrap();
+    validate_params(&params_from(py, &dict))
+}
+
+/// `task_type` is no longer rejected as a parity gap — it is an IMPLEMENTED param in the
+/// VALIDATED-INFORMATIONAL sense (honoured by validating consistency, not by acting).
+#[test]
+fn task_type_is_no_longer_known_not_yet() {
+    assert_eq!(
+        status_of("task_type"),
+        Some(ParamStatus::Implemented),
+        "task_type must be IMPLEMENTED (validated-informational), not KnownNotYet"
+    );
+}
+
+/// `task_type="CPU"` is accepted on EVERY wheel and changes nothing.
+#[test]
+fn task_type_cpu_is_accepted() {
+    Python::attach(|py| {
+        validate_one(py, "task_type", "CPU").expect("task_type=CPU must be accepted");
+        // Case-insensitively, like every other string param here.
+        validate_one(py, "task_type", "cpu").expect("task_type=cpu must be accepted");
+    });
+}
+
+/// `task_type="GPU"` must agree with the COMPILED backend: accepted on a device wheel,
+/// and an actionable error on a `cpu`-only wheel. Silently training on the CPU after an
+/// explicit GPU request is the silently-wrong-model failure the honesty policy exists to
+/// prevent, so the CPU-wheel arm asserts a real error, not a warning.
+#[test]
+fn task_type_gpu_matches_compiled_backend() {
+    Python::attach(|py| {
+        let result = validate_one(py, "task_type", "GPU");
+        if DEVICE_FEATURE_COMPILED {
+            result.expect("task_type=GPU must be accepted on a device-feature wheel");
+        } else {
+            let err = result.expect_err("task_type=GPU must be rejected on a cpu-only wheel");
+            let msg = err.value(py).to_string();
+            assert!(msg.contains("task_type"), "the message must name the parameter: {msg}");
+            assert!(
+                msg.contains("cuda") && msg.contains("rocm") && msg.contains("wgpu"),
+                "the message must name the Cargo features that would enable it: {msg}"
+            );
+            assert!(
+                msg.contains("compile-time"),
+                "the message must explain WHY it cannot switch at runtime: {msg}"
+            );
+        }
+    });
+}
+
+/// An unknown VALUE lists the legal values. It must NOT produce the Levenshtein
+/// "unknown parameter — did you mean …?" suggestion: the parameter NAME is known and
+/// perfectly spelled; only the value is wrong, and suggesting a different parameter name
+/// would send the caller in the wrong direction entirely.
+#[test]
+fn task_type_unknown_value_is_rejected_with_legal_values() {
+    Python::attach(|py| {
+        let err = validate_one(py, "task_type", "TPU")
+            .expect_err("task_type=TPU must be rejected");
+        let msg = err.value(py).to_string();
+        assert!(msg.contains("CPU") && msg.contains("GPU"), "must list the legal values: {msg}");
+        assert!(
+            !msg.contains("did you mean"),
+            "a wrong VALUE must not be reported as a misspelled NAME: {msg}"
+        );
+    });
+}
+
+/// Python `None` is inert — upstream's universal "not set".
+#[test]
+fn task_type_none_is_inert() {
+    Python::attach(|py| {
+        let dict = PyDict::new(py);
+        dict.set_item("task_type", py.None()).unwrap();
+        validate_params(&params_from(py, &dict)).expect("task_type=None must be inert");
+    });
+}
+
+/// A non-string value is a typed error naming the legal values, never a silent accept.
+#[test]
+fn task_type_non_string_is_rejected() {
+    Python::attach(|py| {
+        let dict = PyDict::new(py);
+        dict.set_item("task_type", 1_i64).unwrap();
+        let err = validate_params(&params_from(py, &dict))
+            .expect_err("a non-string task_type must be rejected");
+        let msg = err.value(py).to_string();
+        assert!(msg.contains("task_type"), "must name the parameter: {msg}");
+    });
+}
+
+/// `task_type` must not disturb the other params' validation — it rides the same loop.
+#[test]
+fn task_type_composes_with_other_params() {
+    Python::attach(|py| {
+        let dict = PyDict::new(py);
+        dict.set_item("task_type", "CPU").unwrap();
+        dict.set_item("iterations", 10).unwrap();
+        dict.set_item("max_depth", 3).unwrap();
+        validate_params(&params_from(py, &dict)).expect("a mixed param set must validate");
+
+        // …and a KnownNotYet param alongside it must still be rejected.
+        let dict = PyDict::new(py);
+        dict.set_item("task_type", "CPU").unwrap();
+        dict.set_item("nan_mode", "Min").unwrap();
+        validate_params(&params_from(py, &dict))
+            .expect_err("a KnownNotYet param must still be rejected alongside task_type");
+    });
+}
