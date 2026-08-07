@@ -92,3 +92,74 @@ earlier draft of this note claimed otherwise; the harness gets this right.)
 
 SPD-03 remains **not satisfied**. It is no longer blocked on Kaggle quota — Colab supplies a
 usable CUDA device — but it is now blocked on D1–D4. No headline number is published.
+
+---
+
+# Round 2 — after fixing D1 (same VM, same wheel)
+
+With the probe fixed, **5 cells activated the device** and produced a genuine GPU-vs-GPU
+comparison. `device_prof_tree_lines == 2` on each, i.e. activation was OBSERVED, not assumed.
+
+| cell | official (GPU) | catboost_rs (GPU) | ratio official/rs |
+|---|---|---|---|
+| `SymmetricTree\|RMSE\|unw\|noctr\|300k` | 1.574 s | 1.780 s | **0.884** |
+| `SymmetricTree\|Logloss\|unw\|noctr\|300k` | 1.622 s | 1.884 s | **0.861** |
+| `SymmetricTree\|RMSE\|unw\|noctr\|1000k` | 3.028 s | 6.264 s | **0.483** |
+| `SymmetricTree\|Logloss\|unw\|noctr\|1000k` | 3.052 s | 6.949 s | **0.439** |
+| `SHOWCASE-bias\|RMSE\|unw\|noctr\|300k` | 1.540 s | 1.679 s | **0.917** |
+
+Ratio > 1 would mean catboost_rs is faster. **It is slower in every activated cell** — by
+8–14 % at 300 k rows and by ~2.1–2.3× at 1 M rows. The remaining 29 cells stayed `N/A` or
+CPU-labelled for D2 / D3 / D4.
+
+**On this hardware and this grid, catboost_rs does not beat official CatBoost GPU.**
+
+## The 33→64 bin-padding hypothesis is REFUTED
+
+A four-point `border_count` A/B on the 1 M × 50 RMSE cell (3 timed repeats each, untimed warm
+run first):
+
+| `border_count` | bins | catboost_rs | official | ratio |
+|---|---|---|---|---|
+| 32 | 33 → padded 64 | 6.99 s | 2.90 s | 0.415 |
+| 31 | 32, no padding | 6.59 s | 3.01 s | 0.457 |
+| 63 | 64 | 6.42 s | 3.20 s | 0.499 |
+| 127 | 128 | 6.38 s | 4.24 s | 0.665 |
+
+Removing the padding bought **6 %**, not the ~2× the gap needs. Note the shape: catboost_rs is
+essentially **flat** (6.38–6.99 s) across a 4× bin-width range while official CatBoost *grows*
+(2.90 → 4.24 s). A histogram-width-bound workload cannot be flat in histogram width — so the
+1 M-row cost is not in the histogram at all.
+
+## Where the time actually goes: host-side setup, not the tree loop
+
+`CB_GPU_PROF` stage attribution at n = 1 M, nf = 50, 30 iterations:
+
+| stage | elapsed |
+|---|---|
+| `fit-prep copy+borders` | 1374–2290 ms |
+| `quantize` | 380–732 ms |
+| `begin` (upload/residency) | 568–945 ms |
+| **30 × per-tree device work** | **~36 ms/tree ⇒ ~1.1 s** |
+| `fit-train` (total) | 4084–4827 ms |
+
+Per-tree steady state is `fill≈25–30 ms, score≈6.6 ms, derive≈1.2 ms, split≈1.2 ms,
+stats_read≈1.3 ms, leaf_apply≈0.35 ms`.
+
+**~2.5–3.9 s — 40–60 % of the fit — is spent before a single tree is grown**, while the whole
+of official CatBoost's fit is 2.9 s. The grow kernels are competitive; the
+prep → quantize → upload pipeline is the bottleneck, and it is a *fixed* cost, which is exactly
+why the gap widens from 300 k (0.88) to 1 M (0.44) and why it is flat in bin width.
+
+This corroborates the earlier "round 2" note that the residual gap was "begin/upload + host
+prep fixed costs" — now quantified on a T4 at 1 M rows.
+
+## Consequence for the speed goal
+
+Chasing kernel-level tree-growing speed will not close this. The next optimisation target is
+`fit-prep copy+borders` (the largest single term, and host-side), then `quantize` and `begin`.
+Until then, no "beats official CatBoost" claim is supportable at 1 M rows on a T4.
+
+The earlier 1.14–1.19× advantage recorded on a Kaggle P100 was measured on a different shape
+and device; it is not contradicted by this, but it is also not reproduced here, and nothing in
+this run supports generalising it.
