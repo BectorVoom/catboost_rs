@@ -114,14 +114,35 @@ fn simple_projection_is_byte_unchanged() {
 }
 
 #[test]
-fn a_mixed_simple_and_combination_column_set_is_device_covered() {
+fn a_combination_column_set_is_NOT_device_covered_yet() {
+    // ESCALATED (FPP-11). The column BUILDER handles combinations correctly — that is
+    // what the tests above pin — but the end-to-end oracle over `ctr_device_combo/` misses
+    // the ≤1e-5 bar by 3.3e-2 while the CPU path is exact at 1.4e-17, so
+    // `ctr_types_are_device_covered` still rejects non-simple projections and the fit
+    // takes the correct CPU grower.
+    //
+    // This test pins the CLOSED gate deliberately: re-opening it must be a conscious act
+    // accompanied by a passing `device_ctr_combo_fit_test` (currently `#[ignore]`d), not
+    // an accident. The evidence and localisation live on `ctr_types_are_device_covered`.
     let cols = vec![
         covered_column(TProjection::from_features(&[0]), 2),
         covered_column(TProjection::from_features(&[0, 1]), 6),
     ];
     assert!(
-        ctr_types_are_device_covered(&cols),
-        "an all-Borders set mixing simple and combination projections must be covered"
+        !ctr_types_are_device_covered(&cols),
+        "a set containing a COMBINATION projection must still decline to the CPU path \
+         until the device combination-CTR e2e gap is closed"
+    );
+
+    // …while an all-SIMPLE Borders set stays covered (D-04: the shipped CTR arm is
+    // untouched by the escalation).
+    let simple = vec![
+        covered_column(TProjection::from_features(&[0]), 2),
+        covered_column(TProjection::from_features(&[1]), 3),
+    ];
+    assert!(
+        ctr_types_are_device_covered(&simple),
+        "an all-simple Borders set must remain device-covered"
     );
 }
 
