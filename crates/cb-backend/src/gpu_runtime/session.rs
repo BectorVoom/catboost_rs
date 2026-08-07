@@ -701,6 +701,44 @@ fn host_weighted_der1(der1: Vec<f64>, weights_uniform: bool, weight: &[f64]) -> 
         .collect()
 }
 
+/// FPP-12 (T08): the host-driven growers' SPLIT-SCORING channel pair under a host
+/// bootstrap sample — `(der1 ⊙ sample, weight ⊙ sample)`.
+///
+/// Returns `None` for an EMPTY sample, so the unsampled path allocates nothing and the
+/// caller reuses the leaf channels for scoring (byte- and perf-unchanged, D-04).
+///
+/// # The double multiplication is CORRECT
+///
+/// `der1` reaching here has ALREADY been through [`host_weighted_der1`], so on a weighted ×
+/// sampled fit the score channel is `w · der1 · s` and the score weight is `w · s`. That
+/// mirrors the oblivious resident arm exactly, which nests
+/// `fold_weights_resident(fold_weights_resident(der1, weight), sample)`. Any reference
+/// implementation compared against this must multiply twice too, or it is chasing a
+/// phantom.
+///
+/// This is a TRANSFORM, not a reduction, so `cb_core::sum_f64` does not apply — every
+/// downstream reduction inside the growers already routes through it.
+fn host_sampled_channels(
+    der1: &[f64],
+    weight: &[f64],
+    sample: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if sample.is_empty() {
+        return None;
+    }
+    let score_der1 = der1
+        .iter()
+        .zip(sample.iter())
+        .map(|(&d, &s)| d * s)
+        .collect();
+    let score_weight = weight
+        .iter()
+        .zip(sample.iter())
+        .map(|(&w, &s)| w * s)
+        .collect();
+    Some((score_der1, score_weight))
+}
+
 /// The fixed-point histogram's accumulated-magnitude ceiling, `2^33` (WR-01 `WR01-S10`,
 /// finding F-D). The split histogram stores `round(Σ · 2^30)` as `i64` bits inside an
 /// `Atomic<u64>`, so the integer sum is exact only while `|Σ| · 2^30 < 2^63`, i.e.
@@ -1886,9 +1924,20 @@ impl GpuTrainSession {
                 self.weights_uniform,
                 &rg.weight,
             );
+            // FPP-12 (T08): the host bootstrap sample folds into the SPLIT-SCORING
+            // channels ONLY; leaf estimation stays on the unsampled der/weight
+            // (`Runtime::grow_tree_on_device`'s contract). An empty sample allocates
+            // nothing and reuses the leaf channels — byte- and perf-unchanged (D-04).
+            let sampled = host_sampled_channels(&der1, &rg.weight, sample);
+            let (score_der1, score_weight) = match sampled.as_ref() {
+                Some((d, w)) => (d.as_slice(), w.as_slice()),
+                None => (der1.as_slice(), rg.weight.as_slice()),
+            };
             return grow_region_tree(
                 &der1,
                 &rg.weight,
+                score_der1,
+                score_weight,
                 &rg.bins,
                 self.n,
                 self.n_bins,
@@ -1924,10 +1973,19 @@ impl GpuTrainSession {
                 self.weights_uniform,
                 &ns.weight,
             );
+            // FPP-12 (T08): see the Region arm above — the sample multiplies the SCORE
+            // channels only, and an empty sample reuses the leaf channels verbatim.
+            let sampled = host_sampled_channels(&der1, &ns.weight, sample);
+            let (score_der1, score_weight) = match sampled.as_ref() {
+                Some((d, w)) => (d.as_slice(), w.as_slice()),
+                None => (der1.as_slice(), ns.weight.as_slice()),
+            };
             return grow_nonsym_tree(
                 ns.policy,
                 &der1,
                 &ns.weight,
+                score_der1,
+                score_weight,
                 &ns.bins,
                 self.n,
                 self.n_bins,
