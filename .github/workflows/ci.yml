@@ -12,6 +12,13 @@ jobs:
   cpu:
     name: CPU lane (build + clippy + test + anyhow gate)
     runs-on: ubuntu-latest
+    env:
+      # The workspace's ~80 debug test binaries with full debuginfo exhaust the
+      # runner's disk during the parallel link (SIGBUS on the mmapped linker
+      # output = ENOSPC; main's CPU lane has failed this way for weeks).
+      # Debuginfo is useless in CI — no debugger ever attaches — and dropping it
+      # shrinks the target dir several-fold.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
