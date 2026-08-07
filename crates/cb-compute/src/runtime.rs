@@ -1187,6 +1187,28 @@ pub struct DeviceCtrAveraging {
     pub columns: Vec<DeviceCtrColumn>,
 }
 
+/// The per-fit ORDERED-boosting descriptor (FPP-19/FPP-20, T22/T23).
+///
+/// Every field is a pure function of `(n, fold_len_multiplier, weights)` plus the learning
+/// fold's permutation, so all of it is per-FIT constant and belongs here rather than on the
+/// per-tree grow seam (the T21 design note's question 1).
+///
+/// Plain host types only — no `cubecl` / `cb-backend` type may appear (the T-10-04 landmine).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceOrderedConfig {
+    /// The learn permutation: `permutation[position] = object id`. Drives the per-segment
+    /// PREFIX histogram fills, and nothing else — routing and the leaf-value reduce stay on
+    /// the identity order.
+    pub permutation: Vec<u32>,
+    /// Per-segment `tail_finish`, ascending. Segment `s`'s histogram is the permutation
+    /// prefix `[0, segment_tail_finish[s])` — `body_finish` does NOT appear because
+    /// `ordered_segment_leaf_stats` discards it (see the T21 note).
+    pub segment_tail_finish: Vec<usize>,
+    /// Per-segment `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)` — the ONE place
+    /// `body_finish` still matters.
+    pub segment_scaled_l2: Vec<f64>,
+}
+
 /// The single PLAIN HOST-typed device training config (Phase 12 Plan 01, Open Q2). It
 /// carries the grow-policy / leaf-method / sampling / exact / CTR knobs the later
 /// Phase-12 waves need, so [`Runtime::begin_device_training`]'s config surface widens by
@@ -1277,6 +1299,9 @@ pub struct DeviceTrainConfig {
     /// The split scorer derives its two pass windows from it. `n_float == n_features`
     /// is the float-only regime (pass B empty).
     pub n_float: usize,
+    /// `Some` iff this fit is a COVERED ordered-boosting fit (FPP-20). `None` — the default —
+    /// keeps every existing fit byte-unchanged.
+    pub ordered: Option<DeviceOrderedConfig>,
 }
 
 impl Default for DeviceTrainConfig {
@@ -1305,6 +1330,7 @@ impl Default for DeviceTrainConfig {
             one_hot_flags: Vec::new(),
             real_folds: Vec::new(),
             n_float: 0,
+            ordered: None,
         }
     }
 }

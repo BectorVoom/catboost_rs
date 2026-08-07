@@ -4378,6 +4378,255 @@ fn resident_phantom_bucket_count(float_leaf_of: &[usize], cat_bucket: &[u32]) ->
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Grow ONE oblivious tree under ORDERED boosting, device-resident (FPP-19, T22).
+///
+/// # What differs from [`grow_oblivious_tree_resident`], and what deliberately does not
+///
+/// **Only the split SCORING differs.** Per level this fills one histogram per body/tail
+/// segment — the UNCHANGED partition fill driven with `indices = perm_h` and
+/// `n_visit = segment_tail_finish[s]` ([`launch_partition_hist2_prefix_into`]) — packs them
+/// into one array and scores each candidate as the segment SUM
+/// ([`score_ordered_over_segment_binsums`]).
+///
+/// Everything after the argmin is the Plain path verbatim: routing
+/// ([`launch_partition_split_packed_into`]), the `2^depth` part-stat reduce, `calc_average`
+/// leaf values, the resident approx update and the next-tree der recompute. That is not a
+/// shortcut — it is what upstream does. `cb-train`'s ordered branch grows the STRUCTURE on the
+/// learning fold's segments and then "estimates the leaf VALUES on the AVERAGING fold exactly
+/// as Plain (`CalcLeafValuesSimple` — leaf values are Plain-identical; only the split scoring
+/// differs)" (`cb-train/src/boosting.rs`, the `EBoostingType::Ordered` arm). The
+/// `gpu_runtime::ordered` approximant trajectory is a SEPARATE concern (the anti-leakage
+/// per-object approx used for derivatives) and is NOT on this leaf-value path.
+///
+/// # Permutation vs identity — the wiring that must not be crossed
+///
+/// `perm_h` (the learn permutation) drives the FILLS only. `indices_h` (the session's identity
+/// order) drives ROUTING and the part-stat reduce, because `launch_partition_split_*` requires
+/// `indices` to cover `0..n` and the leaf-value reduce must see every object exactly once.
+/// Swapping them silently trains on a subset.
+///
+/// # Scope
+///
+/// Float threshold splits, L2 only, no CTR / one-hot / sampling / subtraction trick. The
+/// coverage gate admits nothing else; anything it rejects trains on the CPU grower unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grow_oblivious_tree_ordered_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    approx_h: Handle,
+    der1_h: &Handle,
+    leaf_der1_h: &Handle,
+    weight_h: &Handle,
+    score_der1_h: &Handle,
+    score_weight_h: &Handle,
+    feat_offsets: &[u32],
+    feat_shifts: &[u32],
+    feat_masks: &[u32],
+    cindex_words_h: &Handle,
+    offsets_h: &Handle,
+    shifts_h: &Handle,
+    masks_h: &Handle,
+    // The IDENTITY visiting order — routing + part-stats.
+    indices_h: &Handle,
+    // The LEARN PERMUTATION — the per-segment prefix fills.
+    perm_h: &Handle,
+    target_h: &Handle,
+    num_words: usize,
+    n: usize,
+    n_bins: usize,
+    n_bins_used: usize,
+    n_features: usize,
+    real_folds: &[u32],
+    // Per-segment `tail_finish` (ascending) — each is a prefix length over `perm_h`.
+    segment_tail_finish: &[usize],
+    // Per-segment `scale_l2_reg(l2, body_sum_weight_s, body_finish_s)`.
+    segment_scaled_l2: &[f64],
+    depth: usize,
+    scaled_l2: f64,
+    learning_rate: f64,
+    der_kernel: DerBinaryKernel,
+) -> CbResult<(GrownTree, Handle, Handle)> {
+    if n == 0 || n_features == 0 || n_bins == 0 || depth == 0 {
+        return Ok((
+            GrownTree {
+                splits: Vec::new(),
+                leaf_of: vec![0u32; n],
+                leaf_values: Vec::new(),
+                part_stats: Vec::new(),
+            },
+            approx_h,
+            der1_h.clone(),
+        ));
+    }
+    if segment_tail_finish.len() != segment_scaled_l2.len() {
+        return Err(CbError::LengthMismatch {
+            column: "segment_scaled_l2".to_owned(),
+            expected: segment_tail_finish.len(),
+            actual: segment_scaled_l2.len(),
+        });
+    }
+    if segment_tail_finish.is_empty() {
+        return Err(CbError::Degenerate(
+            "ordered grow: empty body/tail segment list".to_owned(),
+        ));
+    }
+
+    let n_leaves = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| CbError::OutOfRange(format!("2^depth overflows usize (depth = {depth})")))?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+
+    let mut leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; n]));
+    let mut splits: Vec<(u32, u32, bool)> = Vec::with_capacity(depth);
+
+    for level in 0..depth {
+        let n_parts = 1usize.checked_shl(level as u32).ok_or_else(|| {
+            CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+        })?;
+        let seg_stride = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (segment stride)"
+            ))
+        })?;
+        let total_len = seg_stride.checked_mul(segment_tail_finish.len()).ok_or_else(|| {
+            CbError::OutOfRange(format!(
+                "seg_stride ({seg_stride}) * n_segments ({}) overflows usize",
+                segment_tail_finish.len()
+            ))
+        })?;
+
+        // (1) One PREFIX fill per segment, packed back to back. No subtraction trick
+        //     (`filter_mask == 0` inside the prefix fill) — the prefix lengths are
+        //     geometric, so all segments together are under 2n object-visits.
+        let packed_hist = client.empty(total_len * std::mem::size_of::<u64>());
+        for (s, &tail_finish) in segment_tail_finish.iter().enumerate() {
+            let visit = tail_finish.min(n);
+            if visit == 0 {
+                continue;
+            }
+            let seg_h = launch_partition_hist2_prefix_into(
+                client,
+                score_der1_h.clone(),
+                score_weight_h.clone(),
+                cindex_words_h.clone(),
+                offsets_h.clone(),
+                shifts_h.clone(),
+                masks_h.clone(),
+                // The PERMUTATION — this is the segmented fill.
+                perm_h.clone(),
+                leaf_of_h.clone(),
+                num_words,
+                n,
+                visit,
+                n_bins,
+                n_features,
+                level as u32,
+            )?;
+            launch_copy_u64_block(
+                client,
+                seg_h,
+                seg_stride,
+                packed_hist.clone(),
+                total_len,
+                s * seg_stride,
+            )?;
+        }
+
+        // (2) Segment-summed score + deterministic argmin (the sole D-05 crossing).
+        let best = score_ordered_over_segment_binsums(
+            client,
+            packed_hist,
+            n_parts,
+            n_bins,
+            n_bins_used,
+            n_features,
+            segment_scaled_l2,
+            real_folds,
+        )?;
+        let split = match best {
+            Some(b) => b,
+            None => {
+                return Err(CbError::Degenerate(format!(
+                    "ordered grow level {level}: no candidate split available"
+                )))
+            }
+        };
+        splits.push((split.feature_id, split.bin_id, false));
+
+        // (3) Route over the IDENTITY order (never the permutation — see the fn doc).
+        let fi = split.feature_id as usize;
+        let (split_offset, split_shift, split_mask) =
+            match (feat_offsets.get(fi), feat_shifts.get(fi), feat_masks.get(fi)) {
+                (Some(&o), Some(&s), Some(&m)) => (o, s, m),
+                _ => {
+                    return Err(CbError::OutOfRange(format!(
+                        "ordered grow level {level}: split feature {fi} out of the \
+                         {n_features}-feature packed descriptor table"
+                    )))
+                }
+            };
+        leaf_of_h = launch_partition_split_packed_into(
+            client,
+            der1_h.clone(),
+            cindex_words_h.clone(),
+            indices_h.clone(),
+            leaf_of_h,
+            n,
+            num_words,
+            split_offset,
+            split_shift,
+            split_mask,
+            split.bin_id,
+            level as u32,
+            /* one_hot = */ false,
+        )?;
+    }
+
+    // (4) Plain-identical leaf values: the 2^depth part-stat reduce over the IDENTITY order.
+    let der2_rmse_h = create_channel_const(client, -1.0, n);
+    let part_stats_h = launch_partition_update_into(
+        client,
+        leaf_der1_h.clone(),
+        weight_h.clone(),
+        der2_rmse_h,
+        indices_h.clone(),
+        leaf_of_h.clone(),
+        n,
+        n_leaves,
+    )?;
+    let (part_stats, leaf_of) =
+        read_part_stats_and_leaf_of(client, part_stats_h, leaf_of_h.clone())?;
+
+    let mut leaf_values = vec![0.0_f64; n_leaves];
+    for leaf in 0..n_leaves {
+        let sum = part_stats.get(leaf * 3).copied().unwrap_or(0.0);
+        let cnt = part_stats.get(leaf * 3 + 1).copied().unwrap_or(0.0);
+        if let Some(slot) = leaf_values.get_mut(leaf) {
+            *slot = cb_compute::calc_average(sum, cnt, scaled_l2);
+        }
+    }
+
+    // (5)/(6) Resident approx update + next-tree der recompute — unchanged.
+    let approx_h =
+        launch_apply_leaf_delta_into(client, approx_h, leaf_of_h, &leaf_values, learning_rate, n)?;
+    let der1_next =
+        launch_der_binary_resident(client, approx_h.clone(), target_h.clone(), der_kernel, n)?;
+
+    Ok((
+        GrownTree {
+            splits,
+            leaf_of,
+            leaf_values,
+            part_stats,
+        },
+        approx_h,
+        der1_next,
+    ))
+}
+
 pub(crate) fn grow_oblivious_tree_resident(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     approx_h: Handle,
