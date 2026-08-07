@@ -1,5 +1,5 @@
 {
-  "id": "yensen2/catboost-rs-hostprep-gpu-speed",
+  "id": "boomvector/catboost-rs-hostprep-gpu-speed",
   "title": "catboost-rs hostprep gpu speed",
   "code_file": "kaggle_driver.py",
   "language": "python",
