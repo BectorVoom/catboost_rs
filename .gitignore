@@ -18,3 +18,4 @@ crates/cb-oracle/catboost_info/
 # Python bytecode cache emitted when the generator is imported/run.
 crates/cb-oracle/generator/__pycache__/
 **/__pycache__/
+.env
