@@ -48,8 +48,9 @@ use rayon::prelude::*;
 
 use crate::gpu_runtime::cindex::pack_cindex;
 use crate::gpu_runtime::{
-    grow_oblivious_tree_resident, launch_der_binary_resident, upload_channel_floats,
-    DerBinaryKernel, ResidentCtrSearch, PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
+    grow_oblivious_tree_resident, launch_der_binary_resident, read_part_stats_f64,
+    upload_channel_floats, DerBinaryKernel, ResidentCtrSearch,
+    PAIRWISE_BUCKET_WEIGHT_PRIOR_REG_DEFAULT,
 };
 use crate::kernels::bootstrap_device::{
     create_poisson_seeds, fold_weights_resident, launch_bootstrap_weights_resident,
@@ -1575,9 +1576,11 @@ impl GpuTrainSession {
         // only when non-uniform (the overflow guard's input); empty otherwise.
         let weights_uniform = weight.iter().all(|&w| w == 1.0);
         let weight_host = if weights_uniform { Vec::new() } else { weight.to_vec() };
-        // The running approx starts all-zero (the RMSE-from-zero MVP; boost_from_average is
-        // out of scope, the cross-oracle uses the SAME zero start).
-        let approx_h = upload_channel_floats(&client, &vec![0.0_f64; n]);
+        // FPP-01 (CR-01): the running approx starts at the fit's REAL starting approximant.
+        // `config.bias == 0.0` is byte-identical to the former hardcoded zero seed (D-04);
+        // a `boost_from_average=true` fit seeds `mean(y)` (or the loss's own starting
+        // approximant) here, so the first tree's resident `der1` matches the host reference.
+        let approx_h = upload_channel_floats(&client, &vec![config.bias; n]);
 
         // Phase 12 Plan 03: capture the non-symmetric grow state (host-driven; keeps host
         // copies of the bins + weights and re-derives der1 from the caller's approx per tree).
@@ -1762,6 +1765,44 @@ impl GpuTrainSession {
             self.n_float,
             self.n_features,
         )
+    }
+
+    /// FPP-01 observation point: the RESIDENT `der1` as the split histogram will actually
+    /// see it, read back to the host.
+    ///
+    /// This exists so a seam-level test can assert the resident derivative was seeded from
+    /// the fit's REAL starting approximant ([`DeviceTrainConfig::bias`]) rather than the
+    /// former hardcoded `vec![0.0; n]`. The load-bearing case is a
+    /// `boost_from_average=true` fit: every element would otherwise be off by exactly the
+    /// bias, which the split histogram consumes directly. Catching that here localizes the
+    /// bug at the seam instead of surfacing it as an unattributable ≤1e-5 device-vs-CPU gap.
+    ///
+    /// Read the RESIDENT APPROXIMANT back to the host. Available immediately after
+    /// `begin`, where it must equal `vec![config.bias; n]`.
+    ///
+    /// `pub(crate)` — reachable from the `gpu_runtime` sibling tests, no public surface.
+    /// Its only consumer is `#[cfg(test)]`, so the lib target sees it as unread.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resident_approx_host(&self) -> CbResult<Vec<f64>> {
+        read_part_stats_f64(&self.client, self.approx_h.clone())
+    }
+
+    /// Read the RESIDENT `der1` back to the host.
+    ///
+    /// Returns `None` before the first [`Self::grow_one`] (the resident `der1` is
+    /// initialised lazily on the first grow, from the `approx` seeded at `begin`), and
+    /// surfaces a typed [`CbError`] on a read-back failure — never a silent zero buffer.
+    ///
+    /// **Read the timing carefully**: `grow_one` CHAINS `der1` for the NEXT tree before it
+    /// returns, so after `k` grows this is `der(approx_after_k_trees)`, not tree `k`'s
+    /// derivative. A test that wants the seed's own derivative must neutralise the update
+    /// (e.g. `learning_rate == 0.0`, which leaves the resident approx at the seed).
+    ///
+    /// `pub(crate)` — reachable from the `gpu_runtime` sibling tests, no public surface.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resident_der1_host(&self) -> Option<CbResult<Vec<f64>>> {
+        let handle = self.der1_h.as_ref()?;
+        Some(read_part_stats_f64(&self.client, handle.clone()))
     }
 
     /// Grow ONE tree over the resident state, advancing the device-resident boosting: it
