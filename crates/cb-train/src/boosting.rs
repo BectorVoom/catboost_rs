@@ -2229,20 +2229,35 @@ fn ctr_splits_for_tree(
         .collect()
 }
 
-/// GDC-11 (T14): whether every materialized CTR column is DEVICE-covered. The
-/// device CTR arm implements the ordered binclf `(good + prior) / (total + 1)`
-/// statistic over SIMPLE (single-feature) projections — exactly upstream's
-/// Borders CTR with `target_border_idx == 0` and a unit prior denominator.
-/// Everything else (Buckets / BinarizedTargetMeanValue / Counter, combination
-/// projections, multi-target-border Buckets columns) declines to the
-/// byte-unchanged CPU path (D-04): the device kernels do not implement those
-/// accumulation semantics, and a wrong device leaf is worse than a CPU fallback.
+/// GDC-11 (T14) / FPP-09 (T07): whether every materialized CTR column is DEVICE-covered.
+/// The device CTR arm implements the ordered binclf `(good + prior) / (total + 1)`
+/// statistic — exactly upstream's Borders CTR with `target_border_idx == 0` and a unit
+/// prior denominator — over projections of ANY arity.
+///
+/// # Why combination (tensor) projections are admitted (FPP-09, PLAN V-4)
+///
+/// The projection arity is NOT a semantic constraint on the online statistic: the
+/// statistic is computed over a projection's COMBINED bucket identity, and the two sides
+/// derive that identity identically. The CPU folds each member's per-document categorical
+/// hash in projection-sorted order (`TProjection::combined_hash`); the device is handed
+/// one `member_bins` column per member in that SAME sorted order and folds them with
+/// `combine_projection_bins`. The combined bins are integer-identical end to end, so the
+/// accumulator that is correct for one member is correct for `k`.
+///
+/// The residual is a hypothetical 64-bit hash-collision asymmetry — the CPU folds string
+/// hashes, the device folds perfect-hash bucket codes, so a collision on ONE side only
+/// would diverge. Documented, not guarded; the ≤1e-5 e2e bar is its detector.
+///
+/// Everything else — Buckets / BinarizedTargetMeanValue / Counter (Track U), multi-target-
+/// border Buckets columns, non-unit prior denominators — still declines to the
+/// byte-unchanged CPU path (D-04): the device kernels do not implement those accumulation
+/// semantics, and a wrong device leaf is worse than a CPU fallback.
+///
 /// An EMPTY column set returns `false` (the caller's `is_empty()` arm owns that).
 fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
     !cols.is_empty()
         && cols.iter().all(|col| {
-            col.projection.is_simple()
-                && col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
+            col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
                 && col.target_border_idx == 0
                 && col.prior_denom == 1.0
         })
@@ -2343,27 +2358,46 @@ fn build_device_ctr_config(
      -> CbResult<Vec<cb_compute::DeviceCtrColumn>> {
         cols.iter()
             .map(|col| {
-                // Simple projection (guaranteed by `ctr_types_are_device_covered`):
-                // the single member's RAW bucket column.
-                let abs = col.projection.cat_features().first().copied().ok_or_else(|| {
-                    CbError::Degenerate(
+                // FPP-09 (T07): ONE raw bucket column per projection member, in the
+                // projection's SORTED member order — the same order `TProjection`
+                // guarantees (sort + dedup in `from_features`) and the same order
+                // `combined_hash` folds in. That shared order is what makes the device's
+                // `combine_projection_bins` output integer-identical to the CPU's combined
+                // bucket identity (PLAN V-4), so a `k`-member projection needs no new
+                // accumulation semantics — only all `k` columns.
+                //
+                // Emitting only member 0 (which is what this did before FPP-09) would make
+                // the device score a COMBINATION split from ONE member's bins: wrong, not
+                // merely worse. The residual `fold_cat_hash` collision asymmetry between
+                // the CPU's string-hash fold and the device's perfect-hash-bucket fold is
+                // documented on `ctr_types_are_device_covered`, detected by the ≤1e-5 e2e
+                // bar, and not prevented here.
+                if col.projection.cat_features().is_empty() {
+                    return Err(CbError::Degenerate(
                         "device CTR column with an empty projection".to_owned(),
-                    )
-                })?;
-                let pos = eligible_absolute
+                    ));
+                }
+                let members = col
+                    .projection
+                    .cat_features()
                     .iter()
-                    .position(|&a| a == abs)
-                    .ok_or_else(|| {
-                        CbError::OutOfRange(format!(
-                            "device CTR projection member {abs} is not a CTR-eligible \
-                             categorical feature"
-                        ))
-                    })?;
-                let member = cat_eligible_buckets.get(pos).cloned().ok_or_else(|| {
-                    CbError::OutOfRange(format!(
-                        "no raw bucket column for CTR-eligible feature position {pos}"
-                    ))
-                })?;
+                    .map(|&abs| {
+                        let pos = eligible_absolute
+                            .iter()
+                            .position(|&a| a == abs)
+                            .ok_or_else(|| {
+                                CbError::OutOfRange(format!(
+                                    "device CTR projection member {abs} is not a \
+                                     CTR-eligible categorical feature"
+                                ))
+                            })?;
+                        cat_eligible_buckets.get(pos).cloned().ok_or_else(|| {
+                            CbError::OutOfRange(format!(
+                                "no raw bucket column for CTR-eligible feature position {pos}"
+                            ))
+                        })
+                    })
+                    .collect::<CbResult<Vec<Vec<u32>>>>()?;
                 let prior = col.prior_num / col.prior_denom;
                 let (shift, norm) = crate::ctr::calc_normalization(prior);
                 let borders: Vec<f64> = (0..ctr_border_count)
@@ -2381,7 +2415,7 @@ fn build_device_ctr_config(
                     }
                 };
                 Ok(cb_compute::DeviceCtrColumn {
-                    member_bins: vec![member],
+                    member_bins: members,
                     prior,
                     borders,
                     bucket_count: col.bucket_count,
@@ -6970,3 +7004,7 @@ mod boosting_device_fold_tests;
 #[cfg(test)]
 #[path = "device_exact_leaf_config_test.rs"]
 mod device_exact_leaf_config_tests;
+
+#[cfg(test)]
+#[path = "device_ctr_combo_config_test.rs"]
+mod device_ctr_combo_config_tests;
