@@ -484,12 +484,28 @@ def main():
                 "Cls = catboost_rs.CatBoostRegressor if kind == 'reg' "
                 "else catboost_rs.CatBoostClassifier\n"
                 "m = Cls(**kw)\n"
+                # D1 (Colab T4, 2026-08-07): `sample_weight` was passed UNCONDITIONALLY here,
+                # including when `w is None`. catboost_rs's sklearn surface is
+                # `fit(x, y=None, cat_features=None, eval_set=None)` — there is no
+                # `sample_weight` parameter — so the probe died with a TypeError before
+                # growing a single tree, reported 0 `CB_GPU_PROF tree` lines, and every one
+                # of the 34 cells was labelled "DEVICE NOT ACTIVATED". The whole grid was
+                # void as a comparison while the device path was in fact healthy.
+                #
+                # Build the kwargs conditionally, mirroring the TIMING path (which always
+                # got this right), so the probe exercises the same call the measurement does.
+                # A weighted cell still fails — that is D2, a real API-parity gap, and it is
+                # recorded as an N/A rather than papered over.
+                "fit_kw = {}\n"
+                "if w is not None:\n"
+                "    fit_kw['sample_weight'] = w\n"
                 "if ctr:\n"
                 "    import numpy as np\n"
                 "    Xf = np.concatenate([X, cat.astype(X.dtype)], axis=1)\n"
-                "    m.fit(Xf, y, sample_weight=w, cat_features=list(range(X.shape[1], Xf.shape[1])))\n"
+                "    fit_kw['cat_features'] = list(range(X.shape[1], Xf.shape[1]))\n"
+                "    m.fit(Xf, y, **fit_kw)\n"
                 "else:\n"
-                "    m.fit(X, y, sample_weight=w)\n"
+                "    m.fit(X, y, **fit_kw)\n"
             )
         env = dict(os.environ, CB_GPU_PROF="1")
         rc, out = _sh([sys.executable, probe], env=env, timeout=1800)
