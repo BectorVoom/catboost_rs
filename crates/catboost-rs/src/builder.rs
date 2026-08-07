@@ -1081,6 +1081,22 @@ impl CatBoostBuilder {
         let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
         let prof_t = std::time::Instant::now();
 
+        let params = self.boost_params();
+        // SPD-03: kick off the background device-kernel warm-up NOW so JIT
+        // compilation overlaps the host-side fit-prep below (and the caller's pool
+        // ingestion already behind us) instead of serializing inline with training —
+        // a cold GPU fit otherwise pays ~2-3 s of driver compilation inside
+        // `begin`/tree-0 (P100 diag 2026-08-08). Best-effort and detached; also
+        // enables CubeCL's disk compilation cache so later processes skip JIT
+        // entirely. No-op effect on the trained model: warm-up only compiles.
+        #[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
+        cb_backend::gpu_runtime::warmup::spawn_fit_warmup(
+            params.loss.clone(),
+            params.depth,
+            self.border_count,
+            params.score_function,
+        );
+
         // SoA float columns as f32 (the feature storage type; the apply path
         // binarizes f32 against the borders) AND the per-float-feature
         // quantization borders (Phase-2 greedy logsum; NaN sentinel is off for the
@@ -1175,7 +1191,9 @@ impl CatBoostBuilder {
 
         let prof_train_t = std::time::Instant::now();
 
-        let params = self.boost_params();
+        // (`params` was built at fit entry — before fit-prep — so the SPD-03 warm-up
+        // could read the loss/depth/score keys; it is byte-identical to building it
+        // here, `boost_params` is a pure constructor over `&self`.)
         // Compile-time backend selection (08-08): exactly one feature is active, so
         // exactly one `backend` binding is in scope. `train` is already generic over
         // `R: Runtime`, so it accepts either zero-sized backend with no other change.

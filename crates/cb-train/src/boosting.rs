@@ -1838,15 +1838,71 @@ fn device_leaf_of_nonsym(
 }
 
 fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) -> Vec<f64> {
-    // Bucket each leaf's member weights in object order (checked `.get` only —
-    // `indexing_slicing` is deny).
-    let mut members: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
-    for (i, &leaf) in leaf_of.iter().enumerate() {
-        if let (Some(bucket), Some(&w)) = (members.get_mut(leaf), weights.get(i)) {
-            bucket.push(w);
-        }
+    // Unit-weight fast path (every unweighted fit): a left-to-right fold of k ones
+    // is EXACTLY `k as f64` for any k < 2^53 (integer-valued f64 addition is
+    // exact), so a per-leaf COUNT is bit-identical to the serial `sum_f64` fold —
+    // and integer counts are order-independent, so the count may run in parallel.
+    // Membership rule mirrors the general path exactly: an object contributes only
+    // when its leaf index is in range AND it has a weight entry.
+    if weights.iter().all(|&w| w == 1.0) {
+        let bound = leaf_of.len().min(weights.len());
+        let counts = leaf_of
+            .get(..bound)
+            .unwrap_or(&[])
+            .par_iter()
+            .fold(
+                || vec![0_u64; n_leaves],
+                |mut acc, &leaf| {
+                    if let Some(slot) = acc.get_mut(leaf) {
+                        *slot += 1;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0_u64; n_leaves],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b.iter()) {
+                        *x += y;
+                    }
+                    a
+                },
+            );
+        return counts.into_iter().map(|c| c as f64).collect();
     }
-    members.iter().map(|bucket| sum_f64(bucket)).collect()
+    // General path: bucket each leaf's member weights in object order (checked
+    // `.get` only — `indexing_slicing` is deny), then fold each bucket with the
+    // sanctioned left-to-right `sum_f64`. The bucketing is chunked in parallel and
+    // the per-chunk buckets are concatenated IN CHUNK ORDER, so every leaf's member
+    // sequence — and therefore the fold order and its bits — is identical to the
+    // serial form (order is the parity contract, cb-core::reduction).
+    const CHUNK: usize = 1 << 16;
+    let n_chunks = leaf_of.len().div_ceil(CHUNK).max(1);
+    let partials: Vec<Vec<Vec<f64>>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|c| {
+            let start = c * CHUNK;
+            let mut buckets: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+            for (off, &leaf) in leaf_of.get(start..).unwrap_or(&[]).iter().take(CHUNK).enumerate() {
+                if let (Some(bucket), Some(&w)) = (buckets.get_mut(leaf), weights.get(start + off)) {
+                    bucket.push(w);
+                }
+            }
+            buckets
+        })
+        .collect();
+    (0..n_leaves)
+        .into_par_iter()
+        .map(|l| {
+            let mut members: Vec<f64> = Vec::new();
+            for chunk_buckets in &partials {
+                if let Some(bucket) = chunk_buckets.get(l) {
+                    members.extend_from_slice(bucket);
+                }
+            }
+            sum_f64(&members)
+        })
+        .collect()
 }
 
 /// `NormalizeLeafValues` (`approx_updater_helpers.cpp:8-21`, called from
@@ -4981,6 +5037,11 @@ fn train_inner<R: Runtime>(
         // it, so it is not a dead binding.
         if device_active {
             let _ = iter;
+            // CB_GPU_PROF host-stage attribution for the device fold (SPD-03 §2.3: the
+            // per-iteration host work between device calls was invisible to profiling).
+            // Cold when unset: one cached env read, three Instant reads, no prints.
+            let host_prof = crate::gpu_prof_host_enabled();
+            let hp_t0 = std::time::Instant::now();
 
             // ─── WR-01: PER-TREE HOST BOOTSTRAP (Design A) ───────────────────────────
             // The device branch keeps the ENTIRE sampler on the host: `bootstrap()` is the
@@ -5058,6 +5119,8 @@ fn train_inner<R: Runtime>(
             // fold arms below so the MVS λ carry after them has something to read.
             let mut device_stored_leaf_values: Vec<f64> = Vec::new();
 
+            let hp_sample_ms = hp_t0.elapsed().as_secs_f64() * 1e3;
+            let hp_grow_t = std::time::Instant::now();
             let dev_tree = runtime
                 .grow_tree_on_device(&approx, target, &device_sample, None)?
                 .ok_or_else(|| {
@@ -5073,6 +5136,8 @@ fn train_inner<R: Runtime>(
                             .to_owned(),
                     )
                 })?;
+            let hp_grow_ms = hp_grow_t.elapsed().as_secs_f64() * 1e3;
+            let hp_fold_t = std::time::Instant::now();
 
             // Phase 12 Plan 03/04 (GPUT-18): dispatch on the populated `DeviceGrownTree`
             // SHAPE, in the SAME order as the CPU fold at `:4419`: a NON-EMPTY
@@ -5121,6 +5186,7 @@ fn train_inner<R: Runtime>(
                 // a panic / raw index (T-12-05). `one_hot` is always false for the
                 // device float grower, so the `>` test is authoritative.
                 let device_leaf_of: Vec<usize> = (0..n)
+                    .into_par_iter()
                     .map(|obj| {
                         let mut bin = 0usize;
                         for level in 0..region_depth {
@@ -5166,11 +5232,17 @@ fn train_inner<R: Runtime>(
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
 
-                for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
-                        *a += lv;
-                    }
-                }
+                // Elementwise, order-independent per-object add — bit-identical to the
+                // serial loop (each slot is touched exactly once), parallel over objects
+                // (this pass runs once per boosting iteration at n scale).
+                approx
+                    .par_iter_mut()
+                    .zip(device_leaf_of.par_iter())
+                    .for_each(|(a, &leaf)| {
+                        if let Some(&lv) = device_leaf_values.get(leaf) {
+                            *a += lv;
+                        }
+                    });
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);
@@ -5372,7 +5444,11 @@ fn train_inner<R: Runtime>(
                     };
                     assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown_like, n)
                 } else {
+                    // Pure per-object walk (reads only resolved split columns) —
+                    // parallel over objects, deterministic per index (this walk runs
+                    // once per boosting iteration at n scale).
                     (0..n)
+                        .into_par_iter()
                         .map(|obj| {
                             let mut leaf = 0usize;
                             for (l, col) in level_cols.iter().enumerate() {
@@ -5412,11 +5488,17 @@ fn train_inner<R: Runtime>(
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
 
-                for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
-                        *a += lv;
-                    }
-                }
+                // Elementwise, order-independent per-object add — bit-identical to the
+                // serial loop (each slot is touched exactly once), parallel over objects
+                // (this pass runs once per boosting iteration at n scale).
+                approx
+                    .par_iter_mut()
+                    .zip(device_leaf_of.par_iter())
+                    .for_each(|(a, &leaf)| {
+                        if let Some(&lv) = device_leaf_values.get(leaf) {
+                            *a += lv;
+                        }
+                    });
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);
@@ -5486,6 +5568,7 @@ fn train_inner<R: Runtime>(
                 // `leaf_index_nonsym` pointer-walk. A malformed graph → checked leaf-0
                 // fallback (never a panic, T-12-05).
                 let device_leaf_of: Vec<usize> = (0..n)
+                    .into_par_iter()
                     .map(|obj| {
                         device_leaf_of_nonsym(
                             obj,
@@ -5517,11 +5600,17 @@ fn train_inner<R: Runtime>(
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
 
-                for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
-                        *a += lv;
-                    }
-                }
+                // Elementwise, order-independent per-object add — bit-identical to the
+                // serial loop (each slot is touched exactly once), parallel over objects
+                // (this pass runs once per boosting iteration at n scale).
+                approx
+                    .par_iter_mut()
+                    .zip(device_leaf_of.par_iter())
+                    .for_each(|(a, &leaf)| {
+                        if let Some(&lv) = device_leaf_values.get(leaf) {
+                            *a += lv;
+                        }
+                    });
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);
@@ -5574,6 +5663,13 @@ fn train_inner<R: Runtime>(
             // λ sequence matches the CPU branch's for every bootstrap type.
             prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&device_stored_leaf_values));
 
+            if host_prof {
+                eprintln!(
+                    "CB_GPU_PROF tree-host sample={hp_sample_ms:.2}ms grow={hp_grow_ms:.2}ms \
+                     fold={:.2}ms",
+                    hp_fold_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
             continue;
         }
 

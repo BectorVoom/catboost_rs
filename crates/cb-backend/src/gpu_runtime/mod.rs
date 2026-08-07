@@ -198,7 +198,11 @@ const HIST_LDS_MIN_OBJ_PER_THREAD: usize = 8;
 /// profiling branch cold — no sync, no timing, no output — so the hot path is unchanged.
 pub(crate) fn gpu_prof_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // The warm-up thread (SPD-03) must never print profiling lines (the bench's
+    // device probe counts them as activation evidence) nor pay profiling fences —
+    // its launches exist only to compile kernels.
     *ENABLED.get_or_init(|| std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0"))
+        && !warmup::warmup_thread_active()
 }
 
 /// Drain the device queue (a profiling FENCE — only ever called under
@@ -699,6 +703,10 @@ mod pairwise; // Phase 7.4/7.5 pairwise histogram + scan/score + pairwise grow d
 pub use pairwise::*;
 
 mod session; // Phase 10-07 (GPUT-02/03): the per-fit device-resident training session.
+
+/// SPD-03: fit-time background kernel warm-up + CubeCL disk compilation cache
+/// bootstrap (a cold fit otherwise pays every JIT compile inline with training).
+pub mod warmup;
 pub use session::*;
 
 // Phase 13 Plan 07 (GPUT-12): the multi-output device driver — the block-leaf emission that wires
@@ -2603,6 +2611,14 @@ pub(crate) fn launch_partition_hist2_resident_into(
                         bits,
                     )
                 };
+                // SPD-03: on the background warm-up thread, compile BOTH arms and
+                // return without timing or latching — tiny-shape timings are
+                // meaningless for the real fill, and a latched winner from them
+                // would mis-tune the real fit's probe-keyed arm choice.
+                if warmup::warmup_thread_active() {
+                    drop(run_mc()?);
+                    return run_lds();
+                }
                 // JIT warm-up launches (untimed — the first launch of each kernel
                 // family compiles it; timing that would swamp the exec comparison).
                 drop(run_mc()?);

@@ -422,6 +422,11 @@ pub(crate) fn fill_packed_cindex_on_device(
         ))
     })?;
     let words_h = client.empty(num_words * std::mem::size_of::<u32>());
+    // SPD-03 sub-attribution: the on-device quantize+pack cost ~1.2 s on a real
+    // P100 against a ~70 ms local claim (FINDINGS §2.2) — time the upload+launch
+    // loop separately so the next cloud run attributes it (cold unless CB_GPU_PROF).
+    let prof = crate::gpu_runtime::gpu_prof_enabled();
+    let prof_t = std::time::Instant::now();
 
     // 256-lane cubes, one thread per object (the kernel is a single bounds-guarded
     // pass — no CUBE_COUNT grid-stride, so it also runs on cubecl-cpu).
@@ -448,7 +453,10 @@ pub(crate) fn fill_packed_cindex_on_device(
         let init_word = u32::from(prev_group != Some(group));
         prev_group = Some(group);
 
-        let col_h = client.create(cubecl::bytes::Bytes::from_elems(col.clone()));
+        // Upload straight from the borrowed column slice — no owned `col.clone()`
+        // (SPD-03: 50 × 4 MB host clones on the hot begin path bought nothing; the
+        // client copies into its staging buffer either way).
+        let col_h = client.create_from_slice(bytemuck::cast_slice(col));
         let borders_f32: Vec<f32> = bord.iter().map(|&b| b as f32).collect();
         let n_borders = borders_f32.len();
         // A zero-length device read is never issued: an empty border list still
@@ -485,6 +493,13 @@ pub(crate) fn fill_packed_cindex_on_device(
             group_offset,
             shift,
             init_word,
+        );
+    }
+    if prof {
+        eprintln!(
+            "CB_GPU_PROF qpack-fill n={n} nf={n_features} upload_bytes={} elapsed={:.2}ms",
+            n_features * n * std::mem::size_of::<f32>(),
+            prof_t.elapsed().as_secs_f64() * 1e3,
         );
     }
     Ok(words_h)

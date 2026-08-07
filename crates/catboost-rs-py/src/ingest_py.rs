@@ -28,6 +28,7 @@ use catboost_rs::OwnedColumns;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::intern;
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use pyo3_arrow::input::AnyRecordBatch;
 
 use crate::errors::CatBoostValueError;
@@ -151,16 +152,29 @@ fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f64>>> {
         }
     };
 
-    // Column-major SoA copy (cast f32 -> f64). Row/col are derived from `shape`,
-    // so indexing is in range.
-    let mut float_cols: Vec<Vec<f64>> = Vec::with_capacity(n_features);
-    for col in 0..n_features {
-        let mut column = Vec::with_capacity(n_rows);
-        for row in 0..n_rows {
-            column.push(f64::from(view[[row, col]]));
-        }
-        float_cols.push(column);
-    }
+    // Column-major SoA copy (cast f32 -> f64), parallel over the DISJOINT output
+    // columns (SPD-03: the former serial per-element `view[[row, col]]` transpose
+    // was ~0.8 s at 1M×50 — a top-3 host term of the whole GPU fit). The array is
+    // C-contiguous (checked above), so a flat row-major slice view exists; each
+    // column is gathered by stride with checked access. The output is
+    // byte-identical to the serial form — same elements, same order, pure cast.
+    let flat: &[f32] = view.to_slice().ok_or_else(|| {
+        CatBoostValueError::new_err(
+            "X must be C-contiguous; pass `np.ascontiguousarray(X, dtype=np.float32)`",
+        )
+    })?;
+    let float_cols: Vec<Vec<f64>> = (0..n_features)
+        .into_par_iter()
+        .map(|col| {
+            (0..n_rows)
+                .map(|row| {
+                    flat.get(row * n_features + col)
+                        .copied()
+                        .map_or(0.0, f64::from)
+                })
+                .collect()
+        })
+        .collect();
     Ok(float_cols)
 }
 

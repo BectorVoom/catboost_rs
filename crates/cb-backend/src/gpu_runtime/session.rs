@@ -1207,6 +1207,11 @@ impl GpuTrainSession {
         scaled_l2: f64,
         config: &DeviceTrainConfig,
     ) -> CbResult<Option<Self>> {
+        // SPD-03 sub-attribution: begin/begin-raw cost ~1.2 s on a real P100 with no
+        // per-stage visibility (FINDINGS §2.2). Lap the begin into validate / cindex /
+        // uploads+rest; cold when CB_GPU_PROF is unset (three Instant reads, no prints).
+        let begin_prof = crate::gpu_runtime::gpu_prof_enabled();
+        let begin_t0 = std::time::Instant::now();
         // --- Coverage gate (D-10-02): classification lives where the session is created. ---
         // The device path grows a depth>=1 Plain oblivious tree over a single fold with an
         // RMSE/Logloss loss and a supported score function; ANYTHING else declines to CPU.
@@ -1670,6 +1675,8 @@ impl GpuTrainSession {
             }
         }
 
+        let begin_validate_ms = begin_t0.elapsed().as_secs_f64() * 1e3;
+
         // --- One client owns every handle for the whole fit (Pitfall 3). ---
         let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
         let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
@@ -1842,6 +1849,7 @@ impl GpuTrainSession {
                 (plan.features, words_h, num_words)
             }
         };
+        let begin_cindex_ms = begin_t0.elapsed().as_secs_f64() * 1e3 - begin_validate_ms;
         let packed = PackedCindex {
             words: Vec::new(),
             features: cindex_features,
@@ -1993,6 +2001,18 @@ impl GpuTrainSession {
                 _ => (None, Vec::new(), Vec::new()),
             };
 
+        if begin_prof {
+            // Drain the async queue first so the lap attributes the queued upload/fill
+            // work to the begin rather than to the first tree (profiling-only sync —
+            // the unprofiled path stays fully pipelined).
+            crate::gpu_runtime::prof_sync(&client);
+            let total_ms = begin_t0.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "CB_GPU_PROF begin-inner validate={begin_validate_ms:.2}ms \
+                 cindex={begin_cindex_ms:.2}ms uploads+rest={:.2}ms total={total_ms:.2}ms",
+                total_ms - begin_validate_ms - begin_cindex_ms,
+            );
+        }
         Ok(Some(Self {
             client,
             feat_offsets,

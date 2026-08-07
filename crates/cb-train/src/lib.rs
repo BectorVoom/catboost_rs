@@ -115,3 +115,10 @@ pub use tree::{
     region_grower, select_best_candidate, AnySplit, Candidate, CtrSplitSpec, FeatureMatrix,
     GrownOneHotTree, GrownTree, LeafWisePolicy, LevelKind, OneHotSplit, Split, MAX_DEPTH,
 };
+
+/// Whether `CB_GPU_PROF` host-stage attribution prints are enabled (latched at
+/// first read — the same gate the device profiler uses; cold when unset).
+pub(crate) fn gpu_prof_host_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0"))
+}
