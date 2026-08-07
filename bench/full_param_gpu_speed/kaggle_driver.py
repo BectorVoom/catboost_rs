@@ -18,7 +18,7 @@ import sys
 import time
 
 REPO_URL = os.environ.get("CB_REPO_URL", "https://github.com/BectorVoom/catboost_rs.git")
-BRANCH = os.environ.get("CB_BRANCH", "worktree-gpu-full-parameter-parity")
+BRANCH = os.environ.get("CB_BRANCH", "worktree-gpu-host-prep-speed")
 REPO = "/tmp/repo"
 WORK = "/kaggle/working"
 
