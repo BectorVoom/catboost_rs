@@ -65,9 +65,12 @@ jobs:
         run: cargo clippy --workspace --lib -- -D warnings
 
       # Reads ONLY committed frozen fixtures (D-12); never installs catboost/numpy
-      # and never runs the build-time generator.
+      # and never runs the build-time generator. `catboost-rs-py` is excluded:
+      # its pyo3 ingest tests need a live NumPy this lane deliberately never
+      # installs (they were unreachable before the disk fix ever let the suite
+      # run this far); the wheel lane builds + import-smokes the Python surface.
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude catboost-rs-py
 
       - name: anyhow ban backstop (D-14)
         run: bash scripts/check-no-anyhow.sh
