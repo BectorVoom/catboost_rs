@@ -2248,6 +2248,55 @@ fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
         })
 }
 
+/// FPP-05 (T06): decide `DeviceTrainConfig::{exact_leaf, quantile_alpha, quantile_delta}`
+/// for a fit, as a pure function of its leaf method and loss.
+///
+/// # The intersection (PLAN V-6, derived — read this before widening the match)
+///
+/// The device Exact order-statistic leaf activates ONLY for the intersection of
+///
+/// - **(a) what `validate_leaf_method` permits** on the CPU
+///   (`LogCosh | Mae | Quantile | MultiQuantile`), and
+/// - **(b) what `map_leaf_method` covers** on the device
+///   (`Mae | Quantile | Mape`).
+///
+/// The two sets disagree in BOTH directions, which is why neither alone is the right
+/// condition:
+///
+/// - `LogCosh` is CPU-legal but device-UNCOVERED — admitting it would silently apply the
+///   Gradient `calc_average` leaf to a LogCosh fit, which is wrong and strictly worse than
+///   today's correct CPU fallback.
+/// - `Mape` is device-covered (with `mape: true`) but CPU-REJECTED by
+///   `validate_leaf_method`, so no fit can reach the device with that pair at all.
+/// - `MultiQuantile` is CPU-legal but multi-dimensional, which the scalar `exact_leaf`
+///   arm cannot express.
+///
+/// ⇒ the admitted set is exactly `{Mae, Quantile}`.
+///
+/// Note also that `builder.rs` defaults `leaf_method: Gradient` unconditionally, so this
+/// arm is reachable only by an EXPLICIT `LeafMethod::Exact` request.
+///
+/// # Returns
+///
+/// `(exact_leaf, quantile_alpha, quantile_delta)`. For a declined pair the α/δ are the
+/// [`DeviceTrainConfig`] defaults and are inert. For `Mae` the exact leaf IS the weighted
+/// median, so it also carries the defaults; only `Quantile` supplies its own — and the
+/// backend's `map_leaf_method` reads `Loss::Quantile`'s own fields there anyway, so the
+/// two agree by construction.
+#[must_use]
+fn device_exact_leaf_config(leaf_method: LeafMethod, loss: &Loss) -> (bool, f64, f64) {
+    let admitted =
+        matches!(leaf_method, LeafMethod::Exact) && matches!(loss, Loss::Mae | Loss::Quantile { .. });
+    if !admitted {
+        return (false, QUANTILE_ALPHA, QUANTILE_DELTA);
+    }
+    match *loss {
+        Loss::Quantile { alpha, delta } => (true, alpha, delta),
+        // Mae: the weighted MEDIAN — the struct's own defaults, not a re-typed literal.
+        _ => (true, QUANTILE_ALPHA, QUANTILE_DELTA),
+    }
+}
+
 /// GDC-11 (T14): build the two-permutation [`cb_compute::DeviceCtrConfig`] from
 /// the CPU-side materialization state. The border table reproduces
 /// [`crate::ctr::calc_ctr_online_bin`]'s truncation EXACTLY under the device's
@@ -4391,6 +4440,9 @@ fn train_inner<R: Runtime>(
     } else {
         None
     };
+    // FPP-05 (T06): the {Mae, Quantile} × Exact intersection, decided once as a pure
+    // function so it is unit-testable without a device (PLAN blocker B-2, option (a)).
+    let device_exact_leaf = device_exact_leaf_config(params.leaf_method, &params.loss);
     let device_config = DeviceTrainConfig {
         ctr: device_ctr,
         grow_policy: device_grow_policy,
@@ -4439,9 +4491,22 @@ fn train_inner<R: Runtime>(
         // RNG stream all live host-side inside `bootstrap()` above, which is the
         // ≤1e-5-verified sampler and the reason upstream parity is reachable. Setting
         // them here would be inert at best and, for `mvs_lambda`, actively misleading.
-        // `exact_leaf` / `ctr` likewise stay default: exact-leaf × sampling and CTR ×
-        // sampling are out of scope (SPEC §2) and the session declines both combinations.
+        // `ctr` likewise stays default: CTR × sampling is out of scope (SPEC §2) and the
+        // session declines that combination.
         // Design B′ (device-resident sampling) is the perf follow-up that would wire them.
+        //
+        // ─── FPP-05: the device Exact order-statistic leaf ──────────────────────────
+        // Activated ONLY for the {Mae, Quantile} intersection — see
+        // `device_exact_leaf_config`'s doc comment for the derivation and for why
+        // neither `validate_leaf_method`'s set nor `map_leaf_method`'s set is the right
+        // condition alone. This is a config-only change: `device_host_eligible` still
+        // rejects `LeafMethod::Exact` until T10 relaxes it, so today the config is built
+        // but never reaches `begin`. That ORDER is mandatory — relaxing the gate without
+        // the config would silently apply the Gradient `calc_average` leaf to a Quantile
+        // fit, which is wrong and worse than the current correct CPU fallback.
+        exact_leaf: device_exact_leaf.0,
+        quantile_alpha: device_exact_leaf.1,
+        quantile_delta: device_exact_leaf.2,
         //
         // ─── SPEC-OH-21/22/24/25: the one-hot channel ───────────────────────────────
         // All three travel together and describe the SAME concatenated `float | one-hot`
@@ -6901,3 +6966,7 @@ mod tests;
 #[cfg(test)]
 #[path = "boosting_device_fold_test.rs"]
 mod boosting_device_fold_tests;
+
+#[cfg(test)]
+#[path = "device_exact_leaf_config_test.rs"]
+mod device_exact_leaf_config_tests;
