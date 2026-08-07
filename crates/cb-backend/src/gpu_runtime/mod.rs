@@ -61,7 +61,8 @@ use cb_core::{CbError, CbResult};
 use crate::kernels::{
     apply_leaf_delta_kernel,
     apply_oblivious_float_kernel,
-    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, find_optimal_split_kernel,
+    block_reduce_atomic_kernel, block_reduce_kernel, block_scan_kernel, copy_u64_block_kernel,
+    find_optimal_split_kernel,
     find_optimal_split_ordered_kernel,
     find_optimal_split_partition_kernel,
     focal_gradient_kernel,
@@ -2568,6 +2569,7 @@ pub(crate) fn launch_partition_hist2_resident_into(
                         leaf_of_h.clone(),
                         num_words,
                         n,
+                        /* n_visit = */ n,
                         n_parts,
                         n_features,
                         total,
@@ -2660,6 +2662,7 @@ pub(crate) fn launch_partition_hist2_resident_into(
         leaf_of_h,
         num_words,
         n,
+        /* n_visit = */ n,
         n_parts,
         n_features,
         total,
@@ -2719,6 +2722,143 @@ static HIST_FILL_PROBED: std::sync::LazyLock<
 /// `Atomic<u64>` adds, and folds the copies into copy 0 (integer adds — exact,
 /// order-independent, GPUT-06).
 #[allow(clippy::too_many_arguments)]
+/// Copy the whole `src` u64 buffer into `dst` starting at `dst_offset` (FPP-19, T22).
+///
+/// Used to pack the ordered path's per-segment PREFIX histograms — each a separate handle from
+/// [`launch_partition_hist2_prefix_into`] — into the one contiguous array
+/// [`find_optimal_split_ordered_kernel`] indexes as `seg * seg_stride + ...`. Stays device-side:
+/// the bulk histogram never crosses to host (D-05).
+pub(crate) fn launch_copy_u64_block(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    src: Handle,
+    src_len: usize,
+    dst: Handle,
+    dst_len: usize,
+    dst_offset: usize,
+) -> CbResult<()> {
+    if src_len == 0 {
+        return Ok(());
+    }
+    // Host-side precondition for the kernel's unchecked `dst[base + i]` store.
+    if dst_offset.saturating_add(src_len) > dst_len {
+        return Err(CbError::OutOfRange(format!(
+            "copy_u64_block: dst_offset ({dst_offset}) + src_len ({src_len}) exceeds dst_len ({dst_len})"
+        )));
+    }
+    let dst_offset_u32 = u32::try_from(dst_offset).map_err(|_| {
+        CbError::OutOfRange(format!("copy_u64_block: dst_offset ({dst_offset}) exceeds u32"))
+    })?;
+    let num_cubes = src_len.div_ceil(HIST_CUBE_DIM).max(1);
+    copy_u64_block_kernel::launch::<SelectedRuntime>(
+        client,
+        CubeCount::Static(num_cubes as u32, 1, 1),
+        CubeDim { x: HIST_CUBE_DIM as u32, y: 1, z: 1 },
+        unsafe { ArrayArg::from_raw_parts(src, src_len) },
+        unsafe { ArrayArg::from_raw_parts(dst, dst_len) },
+        dst_offset_u32,
+    );
+    Ok(())
+}
+
+/// The ORDERED path's permutation-PREFIX histogram fill (FPP-19, T22).
+///
+/// Identical to [`launch_partition_hist2_resident_into`] except that it visits only the FIRST
+/// `n_visit` entries of `indices_h`. Driven with `indices_h = permutation` and
+/// `n_visit = tail_finish_s`, it produces segment `s`'s histogram — the whole "segmented fill"
+/// problem, solved without a new kernel (see the T21 design note).
+///
+/// Why `n` and `n_visit` must stay separate: the kernel bounds its grid-stride loop by
+/// `indices.len()`, but indexes `der1[obj]`, `weight[obj]`, `leaf_of[obj]` and
+/// `cindex[feature*n + obj]` by `indices[i]`, whose VALUES range over `0..n`. Shortening the
+/// object arrays alongside `indices` would read out of bounds on any non-identity permutation.
+///
+/// Always takes the MULTI-COPY arm: the LDS arm's tile compression is keyed to the grow loop's
+/// `filter_mask == half` invariant, and the ordered path deliberately runs with
+/// `filter_mask == 0` (no subtraction trick — correctness first, per the T21 note). Both arms
+/// are bit-identical anyway, so this costs only the LDS arm's throughput, on a path whose
+/// prefix fills already total under 2n object-visits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_partition_hist2_prefix_into(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    der1_h: Handle,
+    weight_h: Handle,
+    cindex_words_h: Handle,
+    offsets_h: Handle,
+    shifts_h: Handle,
+    masks_h: Handle,
+    indices_h: Handle,
+    leaf_of_h: Handle,
+    num_words: usize,
+    n: usize,
+    n_visit: usize,
+    n_bins: usize,
+    n_features: usize,
+    level: u32,
+) -> CbResult<Handle> {
+    let n_parts = 1usize.checked_shl(level).ok_or_else(|| {
+        CbError::OutOfRange(format!("2^level overflows usize (level={level})"))
+    })?;
+    let per_leaf = hist2_binsums_len_checked(n_bins, n_features).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "n_features ({n_features}) * n_bins ({n_bins}) * {HIST_CHANNELS} overflows usize (per-leaf line)"
+        ))
+    })?;
+    let total = per_leaf.checked_mul(n_parts).ok_or_else(|| {
+        CbError::OutOfRange(format!(
+            "per_leaf ({per_leaf}) * n_parts ({n_parts}) overflows usize (partition binSums length)"
+        ))
+    })?;
+
+    if n == 0 || n_visit == 0 || n_features == 0 || n_bins == 0 {
+        return Ok(client.empty(0));
+    }
+    // A prefix longer than the pool is a wiring bug, not a clamp-and-continue condition: it
+    // would declare `indices` past its allocation.
+    if n_visit > n {
+        return Err(CbError::OutOfRange(format!(
+            "ordered prefix fill: n_visit ({n_visit}) exceeds n ({n})"
+        )));
+    }
+    if !device_supports_u64_atomic_add(client) {
+        return Err(CbError::Unsupported(
+            "ordered prefix histogram fill requires Atomic<u64> add, which the active backend \
+             does not advertise (cpu/wgpu lack u64 atomics — use the rocm/cuda backend)"
+                .to_owned(),
+        ));
+    }
+    let bits: u32 = match n_bins {
+        32 => 5,
+        64 => 6,
+        128 => 7,
+        256 => 8,
+        _ => {
+            return Err(CbError::Degenerate(format!(
+                "ordered prefix fill expects n_bins in {{32,64,128,256}}, got {n_bins}"
+            )));
+        }
+    };
+
+    launch_partition_hist2_multicopy(
+        client,
+        der1_h,
+        weight_h,
+        cindex_words_h,
+        offsets_h,
+        shifts_h,
+        masks_h,
+        indices_h,
+        leaf_of_h,
+        num_words,
+        n,
+        n_visit,
+        n_parts,
+        n_features,
+        total,
+        /* filter_mask = */ 0,
+        bits,
+    )
+}
+
 fn launch_partition_hist2_multicopy(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     der1_h: Handle,
@@ -2731,6 +2871,13 @@ fn launch_partition_hist2_multicopy(
     leaf_of_h: Handle,
     num_words: usize,
     n: usize,
+    // FPP-19 (T22): the number of `indices` entries to VISIT, which the ordered prefix fill
+    // makes distinct from `n` (the object count). The kernel bounds its grid-stride loop by
+    // `indices.len()`, so declaring `indices` at `n_visit` while `der1`/`weight`/`leaf_of`
+    // stay at `n` is what makes a permutation-PREFIX fill safe: the visited object ids still
+    // range over `0..n`, so shortening the object arrays too would read out of bounds.
+    // Every non-ordered caller passes `n_visit == n`, which is byte-unchanged.
+    n_visit: usize,
     n_parts: usize,
     n_features: usize,
     total: usize,
@@ -2764,7 +2911,7 @@ fn launch_partition_hist2_multicopy(
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
     );
 
-    let num_cubes = n.div_ceil(HIST_CUBE_DIM).max(1);
+    let num_cubes = n_visit.div_ceil(HIST_CUBE_DIM).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = hist_dim;
 
@@ -2784,7 +2931,7 @@ fn launch_partition_hist2_multicopy(
         unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
-        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n_visit) },
         unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
         n_features as u32,
@@ -2804,7 +2951,7 @@ fn launch_partition_hist2_multicopy(
         unsafe { ArrayArg::from_raw_parts(offsets_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(shifts_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
-        unsafe { ArrayArg::from_raw_parts(indices_h, n) },
+        unsafe { ArrayArg::from_raw_parts(indices_h, n_visit) },
         unsafe { ArrayArg::from_raw_parts(leaf_of_h, n) },
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
         n_features as u32,

@@ -376,3 +376,131 @@ fn disjoint_range_segments_would_score_differently_than_nested_prefixes() {
          this fixture cannot discriminate the T21 correction"
     );
 }
+
+/// Fn 4 — THE INTEGRATION TEST: build the per-segment histograms **on the device** via
+/// [`super::launch_partition_hist2_prefix_into`] and still match the CPU ordered reference.
+///
+/// Fns 1–2 fed the scorer histograms assembled HOST-side, which proves the scorer's segment
+/// fold but assumes the fill can produce those histograms. This closes that gap, and it is the
+/// test that actually exercises the T21 finding: the UNCHANGED partition fill, driven with
+/// `indices = permutation` and `n_visit = tail_finish_s`, IS the segmented fill.
+///
+/// The specific bug it guards is the `n` vs `n_visit` split. The fill declares `der1`,
+/// `weight` and `leaf_of` with length `n` and bounds its loop by `indices.len()`. Passing a
+/// single shortened `n` for both — the obvious way to write this — reads those object arrays
+/// out of bounds for every permutation position whose object id exceeds the prefix length.
+/// The stride-7 permutation makes that reachable at the very first segment.
+///
+/// Needs `Atomic<u64>`, so unlike fns 1–3 this one is rocm/cuda-only in substance as well as
+/// in build configuration.
+#[test]
+fn device_prefix_fill_feeds_the_ordered_scorer() {
+    use super::cindex::pack_cindex;
+    use super::{launch_copy_u64_block, launch_partition_hist2_prefix_into};
+
+    let fx = Fixture::new();
+    let part_of = vec![0usize; N];
+    let n_parts = 1usize;
+    let client = client();
+
+    // Feature-major bins, one bucket-width per feature equal to the padded line so the
+    // packed field and the histogram line agree exactly.
+    let mut bins: Vec<u32> = Vec::with_capacity(N_FEATURES * N);
+    for f in 0..N_FEATURES {
+        for obj in 0..N {
+            bins.push(fx.bins.get(f).and_then(|c| c.get(obj)).copied().unwrap_or(0) as u32);
+        }
+    }
+    let n_buckets = vec![N_BINS; N_FEATURES];
+    let one_hot = vec![false; N_FEATURES];
+    let packed = match pack_cindex(&bins, &n_buckets, &one_hot, N) {
+        Ok(p) => p,
+        Err(e) => panic!("pack_cindex failed: {e}"),
+    };
+    let (offsets, shifts, masks, _flags) = match packed.device_arrays() {
+        Ok(a) => a,
+        Err(e) => panic!("device_arrays failed: {e}"),
+    };
+
+    let der1_f: Vec<f64> = fx.der1.clone();
+    let weight_f: Vec<f64> = fx.weight.clone();
+    let der1_h = client.create(cubecl::bytes::Bytes::from_elems(der1_f));
+    let weight_h = client.create(cubecl::bytes::Bytes::from_elems(weight_f));
+    let words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
+    let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets));
+    let shifts_h = client.create(cubecl::bytes::Bytes::from_elems(shifts));
+    let masks_h = client.create(cubecl::bytes::Bytes::from_elems(masks));
+    // `indices` IS the learn permutation — the whole trick.
+    let perm_u32: Vec<u32> = fx.permutation.iter().map(|&p| p as u32).collect();
+    let perm_h = client.create(cubecl::bytes::Bytes::from_elems(perm_u32));
+    let leaf_of_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; N]));
+
+    let leaf_stride = N_FEATURES * N_BINS * 2;
+    let seg_stride = n_parts * leaf_stride;
+    let total_len = SEGMENTS.len() * seg_stride;
+    let packed_hist = client.empty(total_len * std::mem::size_of::<u64>());
+
+    for (s, &(_, tail_finish)) in SEGMENTS.iter().enumerate() {
+        let seg_h = match launch_partition_hist2_prefix_into(
+            &client,
+            der1_h.clone(),
+            weight_h.clone(),
+            words_h.clone(),
+            offsets_h.clone(),
+            shifts_h.clone(),
+            masks_h.clone(),
+            perm_h.clone(),
+            leaf_of_h.clone(),
+            packed.words.len(),
+            N,
+            tail_finish,
+            N_BINS,
+            N_FEATURES,
+            /* level = */ 0,
+        ) {
+            Ok(h) => h,
+            Err(e) => panic!("prefix fill failed for segment {s}: {e}"),
+        };
+        if let Err(e) = launch_copy_u64_block(
+            &client,
+            seg_h,
+            seg_stride,
+            packed_hist.clone(),
+            total_len,
+            s * seg_stride,
+        ) {
+            panic!("copy into segment slot {s} failed: {e}");
+        }
+    }
+
+    let real_folds = vec![N_BINS_USED as u32; N_FEATURES];
+    let best = match score_ordered_over_segment_binsums(
+        &client,
+        packed_hist,
+        n_parts,
+        N_BINS,
+        N_BINS_USED,
+        N_FEATURES,
+        &fx.per_segment_lambda(),
+        &real_folds,
+    ) {
+        Ok(Some(b)) => b,
+        Ok(None) => panic!("device found no candidate over the device-filled histograms"),
+        Err(e) => panic!("ordered scorer errored over device-filled histograms: {e}"),
+    };
+
+    let (cpu_f, cpu_b, cpu_score) = cpu_best_candidate(&fx, &part_of, n_parts);
+    assert_eq!(
+        (best.feature_id as usize, best.bin_id as usize),
+        (cpu_f, cpu_b),
+        "device-filled: chose (f={}, b={}), CPU reference chose (f={cpu_f}, b={cpu_b})",
+        best.feature_id,
+        best.bin_id,
+    );
+    let diff = (f64::from(best.gain) - cpu_score).abs();
+    assert!(
+        diff <= 1e-4,
+        "device-filled summed score: {} vs CPU {cpu_score} (|diff| = {diff} > 1e-4)",
+        best.gain,
+    );
+}
