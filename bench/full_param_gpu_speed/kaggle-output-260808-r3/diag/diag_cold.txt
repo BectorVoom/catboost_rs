@@ -1,0 +1,72 @@
+# diag run=cold rc=0 elapsed=5.7s cell=SymmetricTree|RMSE|unw|noctr|1000k
+CB_GPU_PROF hist-fill probe cpf=128: multicopy=4.94ms lds=3.99ms -> Lds
+CB_GPU_PROF hist-fill probe cpf=256: multicopy=1.72ms lds=3.22ms -> MultiCopy
+CB_GPU_PROF hist-fill probe cpf=512: multicopy=1.91ms lds=3.42ms -> MultiCopy
+CB_GPU_PROF hist-fill probe cpf=1024: multicopy=1.99ms lds=3.76ms -> MultiCopy
+CB_GPU_PROF hist-fill probe cpf=2048: multicopy=1.91ms lds=4.53ms -> MultiCopy
+WALLCLOCK_FIT_SECONDS=3.9660
+CB_GPU_PROF fit-prep copy+borders elapsed=736.43ms (cpu-time narrow=0.00ms borders=2817.66ms)
+CB_GPU_PROF qpack-fill n=1000000 nf=50 upload_bytes=200000000 elapsed=507.01ms
+CB_GPU_PROF begin-inner validate=0.01ms cindex=1387.54ms uploads+rest=19.13ms total=1406.68ms
+CB_GPU_PROF begin-raw covered=true n=1000000 nf=50 n_bins=33 elapsed=1406.72ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=253.93ms derive=0.57ms score=0.89ms split=0.58ms stats_read=33.89ms leaf_apply_der=0.32ms
+CB_GPU_PROF tree-host sample=0.00ms grow=305.77ms fold=30.60ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.97ms derive=1.10ms score=0.82ms split=0.55ms stats_read=1.00ms leaf_apply_der=0.37ms
+CB_GPU_PROF tree-host sample=0.00ms grow=22.84ms fold=20.37ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.33ms derive=1.04ms score=0.80ms split=0.54ms stats_read=0.97ms leaf_apply_der=0.20ms
+CB_GPU_PROF tree-host sample=0.00ms grow=22.05ms fold=18.72ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.69ms derive=1.23ms score=0.90ms split=0.63ms stats_read=1.08ms leaf_apply_der=0.25ms
+CB_GPU_PROF tree-host sample=0.00ms grow=20.69ms fold=17.18ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.32ms derive=1.20ms score=0.93ms split=0.62ms stats_read=1.05ms leaf_apply_der=0.29ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.35ms fold=17.48ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.74ms derive=0.99ms score=0.80ms split=0.54ms stats_read=0.97ms leaf_apply_der=0.22ms
+CB_GPU_PROF tree-host sample=0.00ms grow=20.21ms fold=17.50ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.69ms derive=1.44ms score=0.92ms split=0.64ms stats_read=1.23ms leaf_apply_der=0.35ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.41ms fold=16.04ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.73ms derive=0.78ms score=0.78ms split=0.55ms stats_read=1.01ms leaf_apply_der=0.38ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.26ms fold=15.44ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.78ms derive=0.72ms score=0.78ms split=0.54ms stats_read=0.97ms leaf_apply_der=0.39ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.12ms fold=17.36ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.10ms derive=1.10ms score=0.93ms split=0.64ms stats_read=1.14ms leaf_apply_der=0.36ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.39ms fold=16.02ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.05ms derive=1.13ms score=0.88ms split=0.59ms stats_read=1.02ms leaf_apply_der=0.41ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.19ms fold=16.64ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.14ms derive=1.36ms score=0.90ms split=0.68ms stats_read=1.13ms leaf_apply_der=0.38ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.40ms fold=17.65ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.04ms derive=1.21ms score=0.90ms split=0.62ms stats_read=1.17ms leaf_apply_der=0.36ms
+CB_GPU_PROF tree-host sample=0.00ms grow=20.31ms fold=15.24ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.09ms derive=1.19ms score=0.81ms split=0.58ms stats_read=0.98ms leaf_apply_der=0.42ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.97ms fold=16.28ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.59ms derive=0.86ms score=0.74ms split=0.53ms stats_read=0.91ms leaf_apply_der=0.22ms
+CB_GPU_PROF tree-host sample=0.00ms grow=20.40ms fold=16.54ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=16.21ms derive=1.26ms score=0.91ms split=0.59ms stats_read=1.05ms leaf_apply_der=0.30ms
+CB_GPU_PROF tree-host sample=0.00ms grow=22.10ms fold=13.94ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=12.29ms derive=1.03ms score=0.79ms split=0.54ms stats_read=0.92ms leaf_apply_der=0.32ms
+CB_GPU_PROF tree-host sample=0.00ms grow=17.65ms fold=17.46ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.18ms derive=0.86ms score=0.75ms split=0.54ms stats_read=0.94ms leaf_apply_der=0.19ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.24ms fold=15.74ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=12.10ms derive=0.64ms score=0.75ms split=0.55ms stats_read=0.99ms leaf_apply_der=0.35ms
+CB_GPU_PROF tree-host sample=0.00ms grow=17.15ms fold=14.31ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.92ms derive=0.90ms score=0.89ms split=0.60ms stats_read=1.13ms leaf_apply_der=0.34ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.66ms fold=15.00ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.65ms derive=0.92ms score=0.76ms split=0.54ms stats_read=1.05ms leaf_apply_der=0.34ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.10ms fold=14.60ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=17.61ms derive=0.90ms score=0.77ms split=0.54ms stats_read=1.03ms leaf_apply_der=0.32ms
+CB_GPU_PROF tree-host sample=0.00ms grow=22.97ms fold=14.11ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.07ms derive=1.07ms score=0.91ms split=0.60ms stats_read=1.11ms leaf_apply_der=0.35ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.08ms fold=15.15ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.91ms derive=0.92ms score=0.74ms split=0.54ms stats_read=1.04ms leaf_apply_der=0.33ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.29ms fold=14.85ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.73ms derive=1.31ms score=0.91ms split=0.63ms stats_read=1.09ms leaf_apply_der=0.38ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.08ms fold=15.68ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.31ms derive=1.27ms score=0.87ms split=0.59ms stats_read=1.06ms leaf_apply_der=0.49ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.35ms fold=14.86ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.27ms derive=0.78ms score=0.79ms split=0.54ms stats_read=1.00ms leaf_apply_der=0.38ms
+CB_GPU_PROF tree-host sample=0.00ms grow=20.51ms fold=15.62ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.76ms derive=0.64ms score=0.77ms split=0.53ms stats_read=0.95ms leaf_apply_der=0.40ms
+CB_GPU_PROF tree-host sample=0.00ms grow=18.83ms fold=14.34ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.28ms derive=1.36ms score=0.92ms split=0.60ms stats_read=1.06ms leaf_apply_der=0.45ms
+CB_GPU_PROF tree-host sample=0.00ms grow=21.58ms fold=15.06ms
+CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.44ms derive=0.98ms score=0.77ms split=0.55ms stats_read=0.96ms leaf_apply_der=0.40ms
+CB_GPU_PROF tree-host sample=0.00ms grow=19.87ms fold=15.77ms
+CB_GPU_PROF fit-train elapsed=2813.67ms
