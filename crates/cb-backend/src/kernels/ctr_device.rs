@@ -306,6 +306,90 @@ fn counter_ctr_kernel<F: Float>(
     }
 }
 
+/// Device **BinarizedTargetMeanValue** (BTMV) CTR prefix (DCTR-12) — the read-before-increment
+/// `(Sum, Count)` bucket history. A **sibling** of [`ordered_ctr_prefix_kernel`], deliberately not a
+/// mode on it: BTMV's per-bucket state is a running FLOAT sum of binarized targets, not a class
+/// count vector, so there is no shared accumulator to branch over (only the loop shape coincides).
+///
+/// # Upstream
+/// `CalcOnlineCTRMean` (`online_ctr.cpp:437-501`) over `TCtrMeanHistory`
+/// (`online_ctr.h:369-401`), with the added value `targetClass / targetBorderCount` where
+/// `targetBorderCount = targetClassesCount - 1` (`online_ctr.cpp:762`). The CPU mirror is
+/// `cb_train::ctr::online::online_mean_prefix` (`cb-train/src/ctr/online.rs:298-356`) composed
+/// with `calc_ctr_online` (`calc_ctr.rs:77-80`) at `ctr_feature.rs:284-294`:
+///
+/// ```text
+/// read (s, c) = hist[bucket]                       // BEFORE folding this document in
+/// value[doc]  = (f64(s) + prior) / (c + 1)         // the ONLY widening point
+/// hist[bucket].sum   = s + class[doc] / divisor    // an f32 add (TCtrMeanHistory::Add)
+/// hist[bucket].count = c + 1
+/// ```
+///
+/// # The `Array<f32>` accumulator is a PARITY CONTRACT, not an oversight
+/// AGENTS.md mandates generics-float for new kernels; `sums` / `out_sum` are the **documented
+/// exception** (`PLAN.md` §2.4): a buffer whose WIDTH is a parity contract stays concrete.
+/// `TCtrMeanHistory::Sum` is a `float` upstream (`online_ctr.h:373`), the CPU side pins that with
+/// `cb_train::ctr::online_test::btmv_sum_is_accumulated_in_f32_not_f64` (`online.rs:294`), and
+/// widening the device history to `f64` "for precision" would silently break parity. Everything
+/// else here is generic over `F: Float` — `prior` and `value` are the f64 CTR channel (WR-02).
+///
+/// # Why the width is only testable off the production path
+/// At binclf `SIMPLE_CLASSES_COUNT == 2` (`cb-train/src/ctr/online.rs:52`) ⇒ `divisor == 1` ⇒ the
+/// added values are exactly `{0.0, 1.0}`, every partial sum is an integer `<= n`, and f32 is exact
+/// on integers to 2^24. **An f32 and an f64 accumulator are bit-identical for every reachable
+/// binclf input** (`PLAN.md` §6 C-2), so no production-regime value comparison can discriminate the
+/// width. `divisor` is therefore a RUNTIME scalar: the self-oracle drives a synthetic
+/// `classes = 4` ⇒ `divisor = 3`, whose addends `{0, 1/3, 2/3, 1}` are inexact in f32 and do
+/// separate the two widths (`btmv_f32_accumulation_width_is_load_bearing`). Production launches
+/// `divisor = 1` and nothing else.
+///
+/// # Shape
+/// Serial single-thread (unit 0) — the prefix is inherently sequential, exactly like
+/// [`ordered_ctr_prefix_kernel`]. `sums`/`cnts` are the resident per-bucket history (length
+/// `bucket_count`, **PRE-ZEROED by the host**; a reused non-zeroed buffer silently continues a
+/// previous fit's history). Every index derives from a host-validated bound
+/// ([`launch_btmv_ctr_resident`] range-checks `perm`, `bins` and `class`). `while` with an explicit
+/// counter, no iterator adapters, no `if` EXPRESSION, no `-inf` literal (Pattern D).
+#[cube(launch)]
+fn btmv_ctr_prefix_kernel<F: Float>(
+    perm: &Array<u32>,
+    bins: &Array<u32>,
+    class: &Array<u32>,
+    prior: &Array<F>,
+    divisor: &Array<f32>,
+    sums: &mut Array<f32>,
+    cnts: &mut Array<u32>,
+    out_sum: &mut Array<f32>,
+    out_cnt: &mut Array<u32>,
+    value: &mut Array<F>,
+) {
+    if ABSOLUTE_POS == 0 {
+        let pr = prior[0];
+        let dv = divisor[0];
+        let n = perm.len();
+        let mut p = 0usize;
+        while p < n {
+            let doc = perm[p] as usize;
+            let bucket = bins[doc] as usize;
+            // READ the (Sum, Count) history BEFORE folding this document's own target in
+            // (`online_ctr.cpp:168-185`, the no-leakage invariant).
+            let s = sums[bucket];
+            let c = cnts[bucket];
+            out_sum[doc] = s;
+            out_cnt[doc] = c;
+            // The ONLY widening point: `calc_ctr_online(f64::from(s), c, prior)`. The hard `+1`
+            // denominator is an integer, so `F::from_int(1)` — `F::new(1.0)` takes an f32 literal
+            // and trips `float_literal_f32_fallback` under a generic `F`.
+            value[doc] = (F::cast_from(s) + pr) / (F::cast_from(c) + F::from_int(1));
+            // `TCtrMeanHistory::Add(targetClass / targetBorderCount)` — a single running **f32**
+            // add. Keeping this in f32 is the parity contract documented above; do not widen it.
+            sums[bucket] = s + (f32::cast_from(class[doc]) / dv);
+            cnts[bucket] = c + 1u32;
+            p += 1usize;
+        }
+    }
+}
+
 /// Binarize accumulated CTR VALUES into cindex bin indices on device (the CTR→cindex JOIN):
 /// `bin[i] = #{ borders[j] : value[i] > borders[j] }` — the upstream `> bin` threshold convention
 /// every cindex consumer already uses (so the emitted column drops straight into the histogram
@@ -358,6 +442,27 @@ pub(crate) struct ResidentCtr {
     pub value: Handle,
 }
 
+/// The resident device **BinarizedTargetMeanValue** outputs for one categorical feature/projection
+/// (DCTR-12): the three OBJECT-order buffers held on the client WITHOUT read-back (D-06 residency).
+/// This is BTMV's counterpart to [`ResidentCtr`] — the numerator channel is a running FLOAT `sum`,
+/// not an integer `good` count, which is exactly why it is a separate type.
+///
+/// `sum` is **f32-wide by parity contract** (`TCtrMeanHistory::Sum` is a `float` upstream,
+/// `online_ctr.h:373`; the CPU pin is `cb_train::ctr::online_test::btmv_sum_is_accumulated_in_f32_not_f64`)
+/// while `value` is the f64 CTR channel — the widening happens only at the value computation. See
+/// [`btmv_ctr_prefix_kernel`].
+pub(crate) struct ResidentCtrMean {
+    /// Per-object `TCtrMeanHistory::Sum` read before the document's own target (**f32**, object
+    /// order). The width is load-bearing — see the struct docs.
+    #[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+    pub sum: Handle,
+    /// Per-object `TCtrMeanHistory::Count` read before the document's own target (u32, object order).
+    #[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+    pub count: Handle,
+    /// Per-object online CTR value `(f64(sum) + prior) / (count + 1)` (f64, object order).
+    pub value: Handle,
+}
+
 /// `cb_train::ctr::ECtrType::Borders` — the i8 discriminant, transcribed BY VALUE (Pattern B /
 /// C-3: `cb-backend` must never gain a `cb-train` dep). The full upstream list is
 /// `0 Borders, 1 Buckets, 2 BinarizedTargetMeanValue, 3 FloatTargetMeanValue, 4 Counter,
@@ -371,6 +476,25 @@ pub(crate) const CTR_TYPE_BUCKETS: i8 = 1;
 /// [`launch_counter_ctr_resident`], never to [`launch_ordered_ctr_resident`] (whose host guard
 /// rejects it, DCTR-06 / T08).
 pub(crate) const CTR_TYPE_COUNTER: i8 = 4;
+/// `cb_train::ctr::ECtrType::BinarizedTargetMeanValue` — see [`CTR_TYPE_BORDERS`] for the
+/// transcription rationale.
+///
+/// BTMV IS a permutation-dependent read-before-increment online prefix (unlike
+/// [`CTR_TYPE_COUNTER`]), but its numerator is a running FLOAT `TCtrMeanHistory::Sum`
+/// (`online_ctr.h:373`) rather than a class count, so it cannot be derived from one bucket's
+/// `[N0, N1]`. It routes to [`launch_btmv_ctr_resident`] — which returns a
+/// [`ResidentCtrMean`], not a [`ResidentCtr`] — and never to [`launch_ordered_ctr_resident`],
+/// whose host guard rejects this discriminant (DCTR-06 / T08).
+pub(crate) const CTR_TYPE_BTMV: i8 = 2;
+
+/// The BTMV `targetBorderCount` divisor on the simple (binclf) CTR path:
+/// `targetClassesCount - 1` with `SIMPLE_CLASSES_COUNT == 2`
+/// (`cb-train/src/ctr/online.rs:52`; `online_ctr.cpp:762`). **Every production launch uses
+/// this value and nothing else** — the runtime `divisor` parameter of
+/// [`launch_btmv_ctr_resident`] exists so DCTR-12's f32-width detector can drive a synthetic
+/// multiclass regime, which is the only regime in which the accumulator width is numerically
+/// observable (PLAN §6 C-2).
+pub(crate) const BTMV_DIVISOR_BINCLF: u32 = 1;
 
 /// The largest `target_border_idx` reachable at binclf: `SIMPLE_CLASSES_COUNT == 2`
 /// (`cb-train/src/ctr/online.rs:52`) ⇒ the per-bucket class prefix is `[N0, N1]`, so a selector
@@ -598,6 +722,139 @@ pub(crate) fn launch_counter_ctr_resident(
     }
 }
 
+/// Accumulate the **BinarizedTargetMeanValue** CTR for one feature/projection ON device, resident
+/// across the permutation (D-06), returning the resident output handles WITHOUT reading them back
+/// (DCTR-12). `bins` is the per-object bucket (object order); `perm` the learn permutation;
+/// `class` the per-object target class; `divisor` the upstream `targetBorderCount`
+/// (`targetClassesCount - 1`, `online_ctr.cpp:762` — **`1` in every production launch**, since the
+/// simple CTR path is binclf); `bucket_count` the distinct-bucket count (`max(bins) + 1`).
+///
+/// # Not routed through [`launch_ordered_ctr_resident`] — by construction
+/// BTMV is not a class-prefix statistic: its numerator is a running float `Sum` of binarized
+/// targets, not a class count, so it cannot be derived from one bucket's `[N0, N1]`. The ordered
+/// launcher's host guard **rejects** `ctr_type == BinarizedTargetMeanValue` precisely so a BTMV
+/// column can never silently receive the Borders numerator (T08), and that guard stays. This
+/// entry point takes no `ctr_type` and no `target_border_idx` at all.
+///
+/// The emitted `value` channel is f64 and feeds [`binarize_ctr_column_resident`] and the existing
+/// per-column border table UNCHANGED (C-7: BTMV's CPU f32 quantizer was measured bit-identical to
+/// the f64 border table for every prior in `[0, 1]` — research spike Q2, 4,504,501 pairs/prior).
+/// No per-type border handling exists anywhere.
+///
+/// # Errors
+/// [`CbError::OutOfRange`] on the wgpu f64 path (WR-02), if `divisor == 0` (a division by zero on
+/// device), if any `perm` entry is `>= n`, if any bin is `>= bucket_count`, or if any target class
+/// exceeds `divisor` (`targetClass <= targetClassesCount - 1`);
+/// [`CbError::LengthMismatch`] if `bins`/`class` disagree with `perm`.
+#[cfg_attr(feature = "wgpu", allow(unused_variables))]
+pub(crate) fn launch_btmv_ctr_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    perm: &[u32],
+    bins: &[u32],
+    class: &[u32],
+    prior: f64,
+    divisor: u32,
+    bucket_count: usize,
+    n: usize,
+) -> CbResult<ResidentCtrMean> {
+    // `divisor = targetClassesCount - 1` floored at 1 by the CPU (`online.rs:321`); a zero would
+    // be a device division by zero, so it is refused rather than silently repaired.
+    if divisor == 0 {
+        return Err(CbError::OutOfRange(
+            "ctr BTMV divisor (targetBorderCount = targetClassesCount - 1) must be >= 1".to_owned(),
+        ));
+    }
+    if bins.len() != n || class.len() != n || perm.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "ctr btmv inputs".to_owned(),
+            expected: n,
+            actual: bins.len().min(class.len()).min(perm.len()),
+        });
+    }
+    // WR-02: guard every value the kernel turns into an index, host-side, before dispatch. The
+    // kernel indexes `bins[perm[p]]`, `class[perm[p]]` and `sums[bucket]`/`cnts[bucket]`
+    // (length `bucket_count`), so an out-of-range permutation entry or bin is an out-of-bounds
+    // device access (UB).
+    if let Some(&bad) = perm.iter().find(|&&d| (d as usize) >= n) {
+        return Err(CbError::OutOfRange(format!(
+            "ctr btmv permutation index {bad} >= n ({n})"
+        )));
+    }
+    if let Some(&bad) = bins.iter().find(|&&b| (b as usize) >= bucket_count) {
+        return Err(CbError::OutOfRange(format!(
+            "ctr bin value {bad} >= bucket_count ({bucket_count})"
+        )));
+    }
+    // `targetClass` ranges over `0 ..= targetClassesCount - 1 == divisor`, so the added value
+    // `class / divisor` lies in `[0, 1]`. A larger class is a caller bug, not a value to clamp.
+    if let Some(&bad) = class.iter().find(|&&c| c > divisor) {
+        return Err(CbError::OutOfRange(format!(
+            "ctr btmv target class {bad} > targetBorderCount ({divisor})"
+        )));
+    }
+    if n == 0 {
+        return Ok(ResidentCtrMean {
+            sum: client.empty(0),
+            count: client.empty(0),
+            value: client.empty(0),
+        });
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(wgpu_reject());
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        // PRE-ZEROED per-bucket (Sum, Count) history; at least length 1 so an all-zero-bin
+        // degenerate feature still has a valid bucket-0 slot. Freshly allocated per call and never
+        // shared — a reused non-zeroed buffer would silently continue a previous fit's history.
+        let scratch_len = bucket_count.max(1);
+        let sums_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0f32; scratch_len]));
+        let cnts_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; scratch_len]));
+        let perm_h = client.create(cubecl::bytes::Bytes::from_elems(perm.to_vec()));
+        let bins_h = client.create(cubecl::bytes::Bytes::from_elems(bins.to_vec()));
+        let class_h = client.create(cubecl::bytes::Bytes::from_elems(class.to_vec()));
+        let prior_h = client.create(cubecl::bytes::Bytes::from_elems(vec![prior]));
+        // The divisor crosses the seam as f32 because the addend `class / divisor` is computed in
+        // the f32 accumulator's own width (`class as f32 / divisor` on the CPU, `online.rs:321`
+        // and `:351`). It is an exact small integer, so the cast is lossless.
+        let divisor_h = client.create(cubecl::bytes::Bytes::from_elems(vec![divisor as f32]));
+        // The per-document sum output is f32-WIDE BY PARITY CONTRACT (see `ResidentCtrMean`).
+        let out_sum_h = client.empty(n * std::mem::size_of::<f32>());
+        let out_cnt_h = client.empty(n * std::mem::size_of::<u32>());
+        let value_h = client.empty(n * std::mem::size_of::<f64>());
+
+        // Serial single-thread launch (unit 0 loops the permutation); one cube, one unit.
+        let count = CubeCount::Static(1, 1, 1);
+        let dim = CubeDim { x: 1, y: 1, z: 1 };
+        // The kernel is generic over `F: Float` for the prior/value channel; the launch pins `f64`
+        // because the CTR seam is f64 end to end (WR-02) and `binarize_ctr_column_resident`
+        // binarizes at f64. The `sums`/`out_sum` accumulator stays `f32` inside the kernel.
+        btmv_ctr_prefix_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(perm_h, n) },
+            unsafe { ArrayArg::from_raw_parts(bins_h, n) },
+            unsafe { ArrayArg::from_raw_parts(class_h, n) },
+            unsafe { ArrayArg::from_raw_parts(prior_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(divisor_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(sums_h, scratch_len) },
+            unsafe { ArrayArg::from_raw_parts(cnts_h, scratch_len) },
+            unsafe { ArrayArg::from_raw_parts(out_sum_h.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(out_cnt_h.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(value_h.clone(), n) },
+        );
+        Ok(ResidentCtrMean {
+            sum: out_sum_h,
+            count: out_cnt_h,
+            value: value_h,
+        })
+    }
+}
+
 /// Binarize resident CTR VALUES into an ADDITIONAL cindex bin column ON device (the CTR→cindex
 /// JOIN), returning the resident bin handle WITHOUT read-back. `value_h` is the resident f64 CTR
 /// value buffer ([`launch_ordered_ctr_resident`]); `borders` the per-CTR-column border table
@@ -799,6 +1056,143 @@ pub(crate) fn binarize_counter_column_host(
     let bins_h = binarize_ctr_column_resident(&client, &res.value, borders, n)?;
     let bytes = client.read_one(bins_h).map_err(|e| {
         CbError::Degenerate(format!("CubeCL Counter CTR cindex read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, u32>(&bytes).to_vec())
+}
+
+/// DCTR-12 host-readback wrapper over the device **BTMV** CTR (the self-oracle seam): accumulate
+/// the resident `(Sum, Count)` prefix, then read the three buffers back to host `Vec`s (OBJECT
+/// order). This is NOT the residency path (that keeps the handles on-device); it is the
+/// device-vs-CPU oracle exerciser. A read-back failure surfaces [`CbError::Degenerate`] (WR-05),
+/// never a silent zero buffer.
+///
+/// Returns `(sum, count, value)`. **`sum` is `Vec<f32>`, not `Vec<f64>`** — widening it here would
+/// hide exactly the accumulator width DCTR-12 exists to pin (`ResidentCtrMean`); `count` is widened
+/// to `i64` to match the CPU reference's `TCtrMeanHistory::Count` schema.
+///
+/// # Errors
+/// As [`launch_btmv_ctr_resident`], plus [`CbError::Degenerate`] on a read-back failure.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+pub(crate) fn compute_btmv_ctr_host(
+    perm: &[u32],
+    bins: &[u32],
+    class: &[u32],
+    prior: f64,
+    divisor: u32,
+    bucket_count: usize,
+) -> CbResult<(Vec<f32>, Vec<i64>, Vec<f64>)> {
+    let n = perm.len();
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let res = launch_btmv_ctr_resident(
+        &client,
+        perm,
+        bins,
+        class,
+        prior,
+        divisor,
+        bucket_count,
+        n,
+    )?;
+    let sum_b = client
+        .read_one(res.sum)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL BTMV CTR sum read-back failed: {e:?}")))?;
+    let count_b = client.read_one(res.count).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL BTMV CTR count read-back failed: {e:?}"))
+    })?;
+    let value_b = client.read_one(res.value).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL BTMV CTR value read-back failed: {e:?}"))
+    })?;
+    let sum = bytemuck::cast_slice::<u8, f32>(&sum_b).to_vec();
+    let count = bytemuck::cast_slice::<u8, u32>(&count_b)
+        .iter()
+        .map(|&c| i64::from(c))
+        .collect();
+    let value = bytemuck::cast_slice::<u8, f64>(&value_b).to_vec();
+    Ok((sum, count, value))
+}
+
+/// DCTR-12 (C-2.1) read-back of the resident BTMV `sum` buffer as RAW BYTES, so the output-width
+/// pin can assert the on-device element width without the test constructing a `ComputeClient`
+/// (source/test separation). Deliberately does NOT interpret the bytes.
+///
+/// **Scope**: this observes the per-document OUTPUT buffer, not the per-bucket accumulator — an
+/// `Array<f64>` bucket history feeding an `f32` output would produce the same byte length. The
+/// numeric width proof is `btmv_f32_accumulation_width_is_load_bearing`.
+///
+/// # Errors
+/// As [`launch_btmv_ctr_resident`], plus [`CbError::Degenerate`] on a read-back failure.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+pub(crate) fn read_btmv_sum_bytes(
+    perm: &[u32],
+    bins: &[u32],
+    class: &[u32],
+    prior: f64,
+    divisor: u32,
+    bucket_count: usize,
+) -> CbResult<Vec<u8>> {
+    let n = perm.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let res = launch_btmv_ctr_resident(
+        &client,
+        perm,
+        bins,
+        class,
+        prior,
+        divisor,
+        bucket_count,
+        n,
+    )?;
+    let sum_b = client
+        .read_one(res.sum)
+        .map_err(|e| CbError::Degenerate(format!("CubeCL BTMV CTR sum read-back failed: {e:?}")))?;
+    Ok(sum_b.to_vec())
+}
+
+/// DCTR-12 host-readback wrapper over the device BTMV CTR→cindex binarize JOIN (the self-oracle
+/// seam): accumulate the BTMV column on device, binarize its values against the per-column border
+/// table on device, then read that bin column back. Returns the per-object bin indices
+/// (`> bin` convention). A read-back failure surfaces [`CbError::Degenerate`] (WR-05).
+///
+/// # Errors
+/// As [`launch_btmv_ctr_resident`], plus [`CbError::Degenerate`] on a read-back failure.
+#[cfg(not(feature = "wgpu"))]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+pub(crate) fn binarize_btmv_column_host(
+    perm: &[u32],
+    bins: &[u32],
+    class: &[u32],
+    prior: f64,
+    divisor: u32,
+    bucket_count: usize,
+    borders: &[f64],
+) -> CbResult<Vec<u32>> {
+    let n = perm.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let res = launch_btmv_ctr_resident(
+        &client,
+        perm,
+        bins,
+        class,
+        prior,
+        divisor,
+        bucket_count,
+        n,
+    )?;
+    let bins_h = binarize_ctr_column_resident(&client, &res.value, borders, n)?;
+    let bytes = client.read_one(bins_h).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL BTMV CTR cindex read-back failed: {e:?}"))
     })?;
     Ok(bytemuck::cast_slice::<u8, u32>(&bytes).to_vec())
 }

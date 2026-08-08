@@ -16,8 +16,9 @@
 //! cannot run the f64 CTR value seam — the assertions SKIP there (WR-01 anti-false-pass).
 
 use crate::kernels::ctr_device::{
-    binarize_counter_column_host, binarize_ctr_column_host, combine_projection_bins,
-    compute_counter_ctr_host, compute_ordered_ctr_host, compute_ordered_ctr_host_mode,
+    binarize_btmv_column_host, binarize_counter_column_host, binarize_ctr_column_host,
+    combine_projection_bins, compute_btmv_ctr_host, compute_counter_ctr_host,
+    compute_ordered_ctr_host, compute_ordered_ctr_host_mode, read_btmv_sum_bytes,
 };
 
 /// `cb_train::ctr::ECtrType::Borders` discriminant (`cb-train/src/ctr/mod.rs:96-108`),
@@ -48,6 +49,29 @@ fn synth_fixture(n: usize, cardinality: u32, seed: u32) -> (Vec<u32>, Vec<u32>, 
     let bins: Vec<u32> = (0..n).map(|_| lcg(&mut s) % cardinality).collect();
     let class: Vec<u32> = (0..n).map(|_| lcg(&mut s) % 2).collect();
     // A non-identity learn permutation (rotate + swap) so read-order matters.
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    for i in 0..n {
+        let j = (lcg(&mut s) as usize) % n;
+        perm.swap(i, j);
+    }
+    (bins, class, perm)
+}
+
+/// [`synth_fixture`] with a MULTICLASS target column (`class in 0..classes`) instead of the
+/// binclf `{0, 1}`. Only DCTR-12's f32-width detector needs it: at binclf the BinarizedTargetMeanValue
+/// addend is exactly `0.0f32` or `1.0f32` (`divisor = classes - 1 = 1`), both exact in f32 AND f64,
+/// so no binclf value comparison can discriminate the accumulator width (PLAN §6 C-2). At
+/// `classes = 4` the addend is `class / 3`, i.e. `{0, 1/3, 2/3, 1}` — inexact in f32 — and the two
+/// widths separate.
+fn synth_multiclass_fixture(
+    n: usize,
+    cardinality: u32,
+    classes: u32,
+    seed: u32,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut s = seed;
+    let bins: Vec<u32> = (0..n).map(|_| lcg(&mut s) % cardinality).collect();
+    let class: Vec<u32> = (0..n).map(|_| lcg(&mut s) % classes).collect();
     let mut perm: Vec<u32> = (0..n as u32).collect();
     for i in 0..n {
         let j = (lcg(&mut s) as usize) % n;
@@ -134,6 +158,108 @@ fn cpu_counter_ctr(bins: &[u32], prior: f64, bucket_count: usize) -> (Vec<i64>, 
         .map(|&g| (g as f64 + prior) / (denominator as f64 + 1.0))
         .collect();
     (good, denominator, value)
+}
+
+/// The FROZEN CPU BinarizedTargetMeanValue reference: an inline serial transcription of
+/// `cb_train::ctr::online::online_mean_prefix` (`cb-train/src/ctr/online.rs:298-356`) over
+/// `TCtrMeanHistory` (`online.rs:90-112`, upstream `online_ctr.h:369-401`), followed by
+/// `calc_ctr_online` (`calc_ctr.rs:77-80`), i.e. exactly what `ctr_feature.rs:284-294` composes
+/// for [`cb_train::ctr::ECtrType::BinarizedTargetMeanValue`].
+///
+/// Per document, READ the bucket's `(Sum, Count)` BEFORE folding the document's own binarized
+/// target in (the no-leakage invariant, `online_ctr.cpp:168-185`), then
+/// `Add(targetClass / targetBorderCount)` where `targetBorderCount = targetClassesCount - 1`
+/// (`online_ctr.cpp:762`).
+///
+/// **The running `Sum` is `f32`** — upstream's `TCtrMeanHistory::Sum` is a `float`
+/// (`online_ctr.h:373`), pinned on the CPU side by
+/// `cb_train::ctr::online_test::btmv_sum_is_accumulated_in_f32_not_f64`. The widening to `f64`
+/// happens ONLY at the value computation, never in the accumulator. That asymmetry is the whole
+/// content of DCTR-12, so this reference must keep the `f32 += f32` add verbatim.
+///
+/// Returns `(sum, count, value)` in OBJECT order.
+fn cpu_btmv_prefix(
+    perm: &[u32],
+    bins: &[u32],
+    class: &[u32],
+    prior: f64,
+    divisor: u32,
+) -> (Vec<f32>, Vec<i64>, Vec<f64>) {
+    let n = perm.len();
+    let buckets = bucket_count(bins);
+    let mut hist_sum = vec![0f32; buckets];
+    let mut hist_cnt = vec![0i64; buckets];
+    let mut sum = vec![0f32; n];
+    let mut count = vec![0i64; n];
+    let mut value = vec![0f64; n];
+    let dv = divisor as f32;
+    for &doc_i in perm {
+        let doc = doc_i as usize;
+        let bucket = bins[doc] as usize;
+        // READ before incrementing (the no-leakage invariant).
+        let s = hist_sum[bucket];
+        let c = hist_cnt[bucket];
+        sum[doc] = s;
+        count[doc] = c;
+        // `calc_ctr_online(f64::from(s), c, prior)` — the ONLY widening point.
+        value[doc] = (f64::from(s) + prior) / (c as f64 + 1.0);
+        // `TCtrMeanHistory::Add`: a single running f32 add.
+        hist_sum[bucket] += class[doc] as f32 / dv;
+        hist_cnt[bucket] += 1;
+    }
+    (sum, count, value)
+}
+
+/// The upstream default CTR border count for the Borders CTR family (`15`,
+/// `cat_feature_options.cpp`; mirrored on the CPU by `cb_train::boosting::ctr_border_count_default`
+/// and pinned by SPEC-CTRB-01's `bin_border <= 15`). Transcribed BY VALUE — cb-backend must never
+/// gain a `cb-train` dep (Pattern B / C-3), exactly like the CTR-type discriminants above.
+const CTR_BORDER_COUNT: usize = 15;
+
+/// `cb_train::ctr::calc_normalization` (`cb-train/src/ctr/calc_ctr.rs:60-66`, upstream
+/// `GetPriorShiftAndNorm`), transcribed BY VALUE (Pattern B / C-3): `shift = -min(0, prior)`,
+/// `norm = max(1, prior) - min(0, prior)`. Note `norm >= 1` always (C-17), and that at `prior = 0.0`
+/// the shift is `-0.0` rather than `0.0` — compare with `==`, never `f64::to_bits` (T03's finding).
+fn calc_normalization(prior: f64) -> (f64, f64) {
+    let left = f64::min(0.0, prior);
+    let right = f64::max(1.0, prior);
+    (-left, right - left)
+}
+
+/// The per-CTR-column device border table, built exactly the way `build_device_ctr_config`
+/// (`cb-train/src/boosting.rs`, the `let borders: Vec<f64>` map) builds it:
+/// `borders[k] = ((k+1)·norm/ctr_border_count − shift).next_down()`.
+///
+/// The `next_down()` is what makes the device's STRICT `value > border` binarize
+/// ([`crate::kernels::ctr_device::binarize_ctr_kernel`]) equivalent to
+/// `cb_train::ctr::calc_ctr_online_bin`'s truncation for EVERY f64 value, including exact boundary
+/// hits. Reproducing the production table (rather than the ad-hoc `[0.2, 0.4, …]` tables the older
+/// oracles use) is what makes [`btmv_and_borders_emit_identical_bins_at_binclf`] a statement about
+/// the columns a real fit would emit.
+fn device_ctr_border_table(prior: f64, ctr_border_count: usize) -> Vec<f64> {
+    let (shift, norm) = calc_normalization(prior);
+    (0..ctr_border_count)
+        .map(|k| {
+            let v_k = (k as f64 + 1.0) * norm / ctr_border_count as f64 - shift;
+            v_k.next_down()
+        })
+        .collect()
+}
+
+/// The largest number of documents any single bucket receives — DCTR-12's non-vacuity dial.
+/// T04's coordinator finding: a BTMV self-oracle that drives ≤ 2 documents per bucket is blind to
+/// the `norm`/`denom` conflation (at `count == 1` the CTR denominator `count + 1 == 2` coincides
+/// numerically with `calc_normalization(0.5)`'s norm), and it also never exercises a THIRD f32
+/// addition, which is where an f64 accumulator first diverges. Every BTMV oracle below asserts
+/// this is `>= 3` rather than assuming it.
+fn max_bucket_occupancy(bins: &[u32]) -> usize {
+    let mut occ = vec![0usize; bucket_count(bins)];
+    for &b in bins {
+        if let Some(slot) = occ.get_mut(b as usize) {
+            *slot += 1;
+        }
+    }
+    occ.into_iter().max().unwrap_or(0)
 }
 
 /// `max |a - b|` over two equal-length f64 vectors; `INFINITY` on a length mismatch so a truncated
@@ -578,5 +704,399 @@ fn counter_ctr_is_permutation_independent() {
         ordered_identity, ordered_reversed,
         "the ORDERED statistic coincides under both orders on this fixture — it cannot show that \
          the Counter invariance above is a property of Counter rather than of the fixture"
+    );
+}
+
+/// `targetBorderCount = targetClassesCount - 1` (`online_ctr.cpp:762`) at binclf:
+/// `SIMPLE_CLASSES_COUNT == 2` (`cb-train/src/ctr/online.rs:52`) ⇒ the BTMV addend is
+/// `targetClass / 1`, i.e. exactly `0.0f32` or `1.0f32`. This is the ONLY divisor production ever
+/// launches.
+const BTMV_DIVISOR_BINCLF: u32 = 1;
+/// A SYNTHETIC 4-class divisor (`classes = 4` ⇒ `4 - 1 = 3`). Production never launches it; it
+/// exists so DCTR-12's f32-accumulation width is testable at all (PLAN §6 C-2 — see
+/// [`btmv_f32_accumulation_width_is_load_bearing`]).
+const BTMV_DIVISOR_MULTICLASS: u32 = 3;
+
+#[test]
+fn btmv_sum_output_buffer_is_f32_wide() {
+    // DCTR-12 (T14) — OUTPUT-WIDTH PIN, *not* the width proof.
+    //
+    // SCOPE, stated deliberately: this pins the per-document OUTPUT buffer
+    // (`ResidentCtrMean.sum`) at `f32`. It does NOT pin the per-bucket `sums` ACCUMULATOR — an
+    // `Array<f64>` bucket history feeding an `f32` output would satisfy every assertion here.
+    // It is a cheap shape-regression guard, nothing more. PLAN §6 C-2 withdrew the earlier claim
+    // that "an f64 accumulator produces n * 8 bytes"; that assumed the accumulator and the output
+    // share a type. `btmv_f32_accumulation_width_is_load_bearing` below is the actual proof.
+    if !device_ctr_active() {
+        eprintln!("SKIP btmv_sum_output_buffer_is_f32_wide: wgpu has no f64 CTR seam (WR-01)");
+        return;
+    }
+    let n = 64usize;
+    let (bins, class, perm) = synth_fixture(n, 5, 4242);
+    let bytes = read_btmv_sum_bytes(
+        &perm,
+        &bins,
+        &class,
+        0.5,
+        BTMV_DIVISOR_BINCLF,
+        bucket_count(&bins),
+    )
+    .unwrap();
+    assert_eq!(
+        bytes.len(),
+        n * std::mem::size_of::<f32>(),
+        "the resident BTMV sum buffer must be n f32 elements wide (TCtrMeanHistory::Sum is a \
+         `float` upstream, online_ctr.h:373)"
+    );
+    assert_eq!(
+        bytemuck::cast_slice::<u8, f32>(&bytes).len(),
+        n,
+        "the resident BTMV sum buffer must round-trip as exactly n f32 values"
+    );
+}
+
+#[test]
+fn btmv_f32_accumulation_width_is_load_bearing() {
+    // DCTR-12 (T14) — THE NUMERIC WIDTH DETECTOR (PLAN §6 C-2.2), the evidence DCTR-12 rests on.
+    //
+    // `SPEC.md` DCTR-12 says "an f64 device sum must FAIL this test". At BINCLF that claim is
+    // FALSE: `divisor = classes - 1 = 1`, so the added values are exactly `{0.0, 1.0}`, every
+    // partial sum is an integer <= n, and f32 represents integers exactly to 2^24 — an f32 and an
+    // f64 accumulator are BIT-IDENTICAL for every reachable n. So the width is driven here with a
+    // SYNTHETIC `classes = 4` ⇒ `divisor = 3`, whose addends `{0, 1/3, 2/3, 1}` are inexact in f32.
+    // The device `sum` output must then be BIT-EQUAL (`f32::to_bits`) to an f32-accumulating CPU
+    // reference; an f64 bucket history rounded down to the f32 output diverges.
+    //
+    // Production always launches `divisor = 1` (BTMV_DIVISOR_BINCLF); the runtime divisor exists
+    // solely so this width is testable, and it future-proofs the kernel for multiclass.
+    if !device_ctr_active() {
+        eprintln!("SKIP btmv_f32_accumulation_width_is_load_bearing: wgpu has no f64 seam (WR-01)");
+        return;
+    }
+    let n = 96usize;
+    let prior = 0.5;
+    let (bins, class, perm) = synth_multiclass_fixture(n, 4, 4, 8821);
+    let buckets = bucket_count(&bins);
+
+    // NON-VACUITY GUARDS (asserted, never assumed).
+    // (1) T04's coordinator finding: at most TWO documents per bucket is blind — the third f32
+    //     addition is the first place the two widths can separate at all.
+    let occupancy = max_bucket_occupancy(&bins);
+    assert!(
+        occupancy >= 3,
+        "no bucket receives >= 3 documents on this fixture ({occupancy}) — the accumulator is \
+         never added to three times, so neither the f32/f64 width nor the norm/denom conflation \
+         can be detected (T04's finding; pick another fixture)"
+    );
+    // (2) the addends must actually be the inexact ones.
+    let distinct_classes: std::collections::BTreeSet<u32> = class.iter().copied().collect();
+    assert!(
+        distinct_classes.contains(&1) || distinct_classes.contains(&2),
+        "no document carries class 1 or 2 on this fixture, so every addend is exactly 0.0 or 1.0 \
+         and f32/f64 accumulation coincide; classes {distinct_classes:?}"
+    );
+
+    let (csum, ccount, cvalue) = cpu_btmv_prefix(&perm, &bins, &class, prior, BTMV_DIVISOR_MULTICLASS);
+    let (dsum, dcount, dvalue) = compute_btmv_ctr_host(
+        &perm,
+        &bins,
+        &class,
+        prior,
+        BTMV_DIVISOR_MULTICLASS,
+        buckets,
+    )
+    .unwrap();
+
+    assert_eq!(dcount, ccount, "device BTMV count != online_mean_prefix count");
+    let mismatches: Vec<usize> = (0..n)
+        .filter(|&i| dsum[i].to_bits() != csum[i].to_bits())
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "the device BTMV sum is NOT bit-equal to an f32-accumulating reference at divisor = {}: \
+         {} of {n} documents mismatch, first at doc {}: device 0x{:08X} ({}) vs f32 reference \
+         0x{:08X} ({}). A wider (f64) bucket history is exactly this failure \
+         (TCtrMeanHistory::Sum is a `float`, online_ctr.h:373).",
+        BTMV_DIVISOR_MULTICLASS,
+        mismatches.len(),
+        mismatches[0],
+        dsum[mismatches[0]].to_bits(),
+        dsum[mismatches[0]],
+        csum[mismatches[0]].to_bits(),
+        csum[mismatches[0]],
+    );
+    let div = max_divergence(&dvalue, &cvalue);
+    assert!(div <= TOL, "BTMV CTR value divergence {div} > {TOL} at divisor = 3");
+
+    // (3) the sums must be genuinely inexact: at least one document reads a sum that is NOT
+    //     representable as an exact multiple of 1 (otherwise the bit comparison is trivial).
+    assert!(
+        csum.iter().any(|&s| s.fract() != 0.0),
+        "every prefix sum on this fixture is a whole number — the f32 and f64 accumulators would \
+         agree bit-for-bit and this test proves nothing about the width"
+    );
+}
+
+#[test]
+fn btmv_prefix_matches_cpu_reference_at_binclf() {
+    // DCTR-12 (T14): the PRODUCTION regime — `classes = SIMPLE_CLASSES_COUNT == 2` ⇒
+    // `divisor = 1`. The device `(f32 Sum, u32 Count)` bucket history must reproduce
+    // `online_mean_prefix` exactly (sum bit-equal, count integer-equal, value within the ε=1e-4
+    // device bar), and the CTR->cindex binarize JOIN over the BTMV values must be BIT-EXACT
+    // against the host binarization of the CPU value column.
+    //
+    // The JOIN half reuses `binarize_ctr_kernel` and the existing per-column border table
+    // UNCHANGED (C-7 / no new quantize kernel): what it pins is the JOIN, not the equivalence of
+    // the CPU's f32 `((ctr + shift) / norm) * borderCount` quantizer with the f64 border table —
+    // that equivalence is research spike Q2 (4,504,501 pairs/prior, 0 mismatches) and T15/T16's
+    // business, not this test's.
+    if !device_ctr_active() {
+        eprintln!("SKIP btmv_prefix_matches_cpu_reference_at_binclf: wgpu has no f64 seam (WR-01)");
+        return;
+    }
+    let n = 128usize;
+    let prior = 0.5;
+    let (bins, class, perm) = synth_fixture(n, 5, 7);
+    let buckets = bucket_count(&bins);
+
+    // NON-VACUITY GUARD (T04's finding): >= 3 documents in at least one bucket, so the oracle
+    // reaches `count >= 2` — the first state at which the CTR denominator (`count + 1`) and
+    // `calc_normalization`'s norm stop coinciding.
+    let occupancy = max_bucket_occupancy(&bins);
+    assert!(
+        occupancy >= 3,
+        "no bucket receives >= 3 documents on this fixture ({occupancy}); a BTMV oracle driving \
+         <= 2 documents per bucket cannot distinguish the CTR denominator from the normalization \
+         norm (T04's finding)"
+    );
+
+    let (csum, ccount, cvalue) = cpu_btmv_prefix(&perm, &bins, &class, prior, BTMV_DIVISOR_BINCLF);
+    let (dsum, dcount, dvalue) =
+        compute_btmv_ctr_host(&perm, &bins, &class, prior, BTMV_DIVISOR_BINCLF, buckets).unwrap();
+    let dsum_bits: Vec<u32> = dsum.iter().map(|s| s.to_bits()).collect();
+    let csum_bits: Vec<u32> = csum.iter().map(|s| s.to_bits()).collect();
+    assert_eq!(dsum_bits, csum_bits, "device BTMV sum != online_mean_prefix sum (bitwise)");
+    assert_eq!(dcount, ccount, "device BTMV count != online_mean_prefix count");
+    let div = max_divergence(&dvalue, &cvalue);
+    assert!(div <= TOL, "BTMV CTR value divergence {div} > {TOL}");
+
+    // The prefix must actually advance past the prior-only first document.
+    assert!(
+        ccount.iter().any(|&c| c >= 2),
+        "no document reads a count >= 2 — the oracle never leaves the first-two-documents regime"
+    );
+
+    // The CTR->cindex binarize JOIN over the BTMV values, bit-exact vs the host reference.
+    let borders = vec![0.2_f64, 0.4, 0.5, 0.6, 0.8];
+    let host_cindex: Vec<u32> = cvalue
+        .iter()
+        .map(|&v| borders.iter().filter(|&&b| v > b).count() as u32)
+        .collect();
+    let dev_cindex = binarize_btmv_column_host(
+        &perm,
+        &bins,
+        &class,
+        prior,
+        BTMV_DIVISOR_BINCLF,
+        buckets,
+        &borders,
+    )
+    .unwrap();
+    assert_eq!(dev_cindex.len(), n, "device BTMV cindex column truncated");
+    assert_eq!(
+        dev_cindex, host_cindex,
+        "device BTMV->cindex binarization must be bit-exact vs the host BTMV column"
+    );
+    let distinct_bins: std::collections::BTreeSet<u32> = dev_cindex.iter().copied().collect();
+    assert!(
+        distinct_bins.len() >= 3,
+        "the BTMV cindex column is near-constant on these borders — a bit-exact comparison against \
+         it proves little (pick other borders); bins {distinct_bins:?}"
+    );
+}
+
+#[test]
+fn btmv_out_of_range_inputs_are_rejected() {
+    // DCTR-12 (T14): the BTMV-specific inputs are host-validated BEFORE dispatch, exactly like the
+    // ordered path's bin/class range guards. Two cases the ordered kernel has no analogue for:
+    //
+    //   * `divisor == 0` — the kernel computes `class / divisor` in f32, so a zero divisor is a
+    //     device division by zero producing a NaN/inf CTR column that binarizes to a silently
+    //     WRONG bin (`v > border` is false for NaN ⇒ bin 0 everywhere), not to an error. The CPU
+    //     floors it at 1 (`online.rs:321`); a caller that passes 0 has a bug, so it is refused.
+    //   * `class > divisor` — `targetClass` ranges over `0 ..= targetClassesCount - 1 == divisor`
+    //     (`online_ctr.cpp:762`), so the addend `class / divisor` must land in `[0, 1]`. A larger
+    //     class is a caller bug, not a value to clamp.
+    if !device_ctr_active() {
+        eprintln!("SKIP btmv_out_of_range_inputs_are_rejected: wgpu has no f64 CTR seam (WR-01)");
+        return;
+    }
+    let n = 32usize;
+    // The binclf class column of this fixture is deliberately unused — see the all-zero column
+    // below, which is what makes the divisor guard the only possible rejector.
+    let (bins, _class, perm) = synth_fixture(n, 4, 11);
+    let buckets = bucket_count(&bins);
+
+    // The class column here is ALL ZEROS on purpose. With `divisor = 0` the sibling
+    // `class > divisor` guard would otherwise fire first on any class-1 document, and this
+    // assertion would pass without the divisor guard existing at all (measured: it does — see
+    // T14's MUT-C). An all-zero class column satisfies `class <= divisor` for every document, so
+    // the ONLY thing that can reject it is the divisor guard itself.
+    let zero_class = vec![0u32; n];
+    let zero_divisor = compute_btmv_ctr_host(&perm, &bins, &zero_class, 0.5, 0, buckets);
+    assert!(
+        matches!(zero_divisor, Err(cb_core::CbError::OutOfRange(_))),
+        "divisor = 0 must be rejected (it is a device division by zero), got {zero_divisor:?}"
+    );
+
+    // The binclf column above carries class 1, which exceeds a `divisor` of ... well, nothing at
+    // divisor 1. Drive a 4-class column against the BINCLF divisor instead: class 2 and 3 are then
+    // out of range and the addend would exceed 1.0.
+    let (mc_bins, mc_class, mc_perm) = synth_multiclass_fixture(n, 4, 4, 8821);
+    assert!(
+        mc_class.iter().any(|&c| c > BTMV_DIVISOR_BINCLF),
+        "the multiclass fixture carries no class above the binclf divisor — this test would be \
+         vacuous; classes {mc_class:?}"
+    );
+    let class_too_big = compute_btmv_ctr_host(
+        &mc_perm,
+        &mc_bins,
+        &mc_class,
+        0.5,
+        BTMV_DIVISOR_BINCLF,
+        bucket_count(&mc_bins),
+    );
+    assert!(
+        matches!(class_too_big, Err(cb_core::CbError::OutOfRange(_))),
+        "a target class above targetBorderCount must be rejected, got {class_too_big:?}"
+    );
+}
+
+/// DCTR-13 (T15) — **BinarizedTargetMeanValue ≡ Borders@0 at binary classification**, as an
+/// executable structural cross-check between two INDEPENDENT device kernels.
+///
+/// # The equivalence, and its upstream proof
+///
+/// Upstream `CalcOnlineCTRMean` folds `float(permutedTargetClass[docId]) / targetBorderCount` into
+/// the bucket's [`TCtrMeanHistory`] (`online_ctr.cpp:467`), with
+/// `targetBorderCount = targetClassesCount - 1` (`online_ctr.cpp:762`). At binary classification
+/// `targetClassesCount == SIMPLE_CLASSES_COUNT == 2` (`cb-train/src/ctr/online.rs:52`) ⇒ the addend
+/// is `targetClass / 1`, i.e. exactly `0.0f32` or `1.0f32`. Therefore, after any prefix of the
+/// learn permutation,
+///
+/// * `TCtrMeanHistory::Sum` = the number of class-1 documents seen in that bucket = `N[1]`, and
+/// * `TCtrMeanHistory::Count` = the number of documents seen in that bucket = `Total`,
+///
+/// which are **exactly** the `good` / `total` the ordered class-prefix path already produces for
+/// `(Borders, target_border_idx = 0)` (`online_class_prefix`: `good = Total − Σ_{c ≤ 0} N[c] =
+/// Total − N[0] = N[1]`). Both then feed the **same** `CalcCTR` — `(good + prior) / (total + 1)`,
+/// `calc_ctr_online` in-repo — and the same per-column border table, so the emitted `u32` cindex
+/// columns must be **bit-identical**. The f32 `Sum` is exact here: every partial sum is an integer
+/// `<= n`, and f32 represents integers exactly to 2^24.
+///
+/// Mirrored in-repo by `online_mean_prefix`'s `divisor = 1` at binclf and its
+/// `calc_ctr_online(f64::from(s), c, prior)`.
+///
+/// # Why this is a cross-check and not a tautology
+///
+/// The two columns are produced by two **different `#[cube]` kernels** through two different
+/// launchers with different contracts — `btmv_ctr_prefix_kernel` via `launch_btmv_ctr_resident`
+/// (an f32 `Sum` / u32 `Count` mean history) and `ordered_ctr_prefix_kernel` via
+/// `launch_ordered_ctr_resident` (an integer 2-class prefix `[N0, N1]` with a
+/// `(ctr_type, target_border_idx)` numerator selector). Only the binarize JOIN
+/// (`binarize_ctr_kernel`) and the border table are shared. A mutation of **either** accumulator
+/// alone therefore breaks the equality — which is what T15's §2.5 mutation demonstrates, and what
+/// rules out the two vacuity modes (accidentally comparing BTMV with BTMV, or Borders with
+/// Borders): under a BTMV-only mutation a self-comparison would move both sides together and stay
+/// green.
+///
+/// # BINCLF ONLY — and why option (b) was chosen anyway
+///
+/// **This identity holds only at binary classification.** It rests entirely on
+/// `targetBorderCount == 1` making the addend `{0, 1}`. The day multiclass CTR lands, the addend
+/// becomes `class / (k−1)` with `k > 2`, `Sum` becomes a genuinely fractional f32 mean numerator
+/// (see [`btmv_f32_accumulation_width_is_load_bearing`], which measures precisely that at
+/// `divisor = 3`), and BTMV stops agreeing with any class-prefix numerator.
+///
+/// That is exactly why `SPEC.md` selects the **honest accumulator (option b)** over **aliasing
+/// BTMV onto Borders@0 (option a)**: an alias would be correct today and silently wrong the
+/// moment `SIMPLE_CLASSES_COUNT` stops being 2, with no test able to see the change. This test
+/// records that the two agree *today* without buying that liability.
+#[test]
+fn btmv_and_borders_emit_identical_bins_at_binclf() {
+    if !device_ctr_active() {
+        eprintln!("SKIP btmv_and_borders_emit_identical_bins_at_binclf: wgpu has no f64 seam (WR-01)");
+        return;
+    }
+    let n = 128usize;
+    let prior = 0.5;
+    let (bins, class, perm) = synth_fixture(n, 5, 3);
+    let buckets = bucket_count(&bins);
+    // The PRODUCTION border table, not an ad-hoc one: `build_device_ctr_config`'s formula at the
+    // upstream default `ctr_border_count = 15`.
+    let borders = device_ctr_border_table(prior, CTR_BORDER_COUNT);
+    assert_eq!(borders.len(), CTR_BORDER_COUNT);
+
+    // NON-VACUITY GUARD (a) — T04's coordinator finding, carried to T15 by T14: `calc_normalization`'s
+    // `norm` and the CTR denominator (`count + 1`) COINCIDE at `count == 1`, so any BTMV check
+    // driving <= 2 documents per bucket is blind to the conflation the CPU fix exists to prevent,
+    // and never performs a THIRD accumulator addition either.
+    let occupancy = max_bucket_occupancy(&bins);
+    assert!(
+        occupancy >= 3,
+        "no bucket receives >= 3 documents on this fixture ({occupancy}) — the BTMV accumulator is \
+         never added to three times and the CTR denominator never separates from the normalization \
+         norm (T04's finding; pick another fixture)"
+    );
+    // NON-VACUITY GUARD (b): both classes must actually occur. On an all-zero class column
+    // `Sum == 0` for every document and on an all-one column `Sum == Count`; either way the two
+    // paths would coincide for a reason that has nothing to do with the equivalence claimed here.
+    let distinct_classes: std::collections::BTreeSet<u32> = class.iter().copied().collect();
+    assert!(
+        distinct_classes.contains(&0) && distinct_classes.contains(&1),
+        "the class column is single-valued on this fixture ({distinct_classes:?}) — BTMV's Sum \
+         would be trivially 0 or trivially Count and the equality would say nothing"
+    );
+
+    // Path 1 — the BTMV mean history at the ONLY divisor production ever launches.
+    let btmv_bins = binarize_btmv_column_host(
+        &perm,
+        &bins,
+        &class,
+        prior,
+        BTMV_DIVISOR_BINCLF,
+        buckets,
+        &borders,
+    )
+    .unwrap();
+    // Path 2 — the ordered class prefix at `(ctr_type = Borders (0), target_border_idx = 0)`,
+    // which is what `binarize_ctr_column_host` is fixed at.
+    let borders_bins = binarize_ctr_column_host(&perm, &bins, &class, prior, buckets, &borders).unwrap();
+
+    assert_eq!(btmv_bins.len(), n, "device BTMV cindex column truncated");
+    assert_eq!(borders_bins.len(), n, "device Borders cindex column truncated");
+
+    // NON-VACUITY GUARD (c) — the one PLAN §2.5 names for this task. Asserted on the REFERENCE
+    // (Borders) column deliberately: it is the side no BTMV-side mutation can move, so this guard
+    // can never be what fires under the §2.5 mutation, and a degenerate all-zero column can never
+    // make the equality below trivially true.
+    let distinct_bins: std::collections::BTreeSet<u32> = borders_bins.iter().copied().collect();
+    assert!(
+        distinct_bins.len() >= 2,
+        "the Borders@0 cindex column is CONSTANT on this fixture ({distinct_bins:?}) — an equality \
+         against it is trivially satisfied by any column at all (pick another fixture/borders)"
+    );
+
+    let first_diff = (0..n).find(|&i| btmv_bins[i] != borders_bins[i]);
+    assert_eq!(
+        btmv_bins,
+        borders_bins,
+        "device BTMV (divisor = {BTMV_DIVISOR_BINCLF}) and device Borders@0 emit DIFFERENT cindex \
+         columns at binclf, where TCtrMeanHistory::Sum must equal N[1] and Count must equal Total \
+         (online_ctr.cpp:467/:762); first differing object {first_diff:?}: BTMV {:?} vs Borders {:?}. \
+         {} distinct bins in the reference column.",
+        first_diff.map(|i| btmv_bins[i]),
+        first_diff.map(|i| borders_bins[i]),
+        distinct_bins.len(),
     );
 }

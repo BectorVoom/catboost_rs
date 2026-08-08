@@ -193,7 +193,7 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 ///   row 2  combo    Borders      0  1.0  => false   flips_at: T19 (arity)
 ///   row 3  simple   Counter      0  1.0  => true    FLIPPED by T12 (type)
 ///   row 4  simple   Buckets      1  1.0  => true    FLIPPED by T10 (type + target border)
-///   row 5  simple   BTMV         0  1.0  => false   flips_at: T16 (type)
+///   row 5  simple   BTMV         0  1.0  => true    FLIPPED by T16 (type)
 ///   row 6  simple   Borders      0  2.0  => true    FLIPPED by T01 (prior denominator)
 ///   row 7  simple   FloatTMV     0  1.0  => false   flips_at: never (no parity surface)
 ///   row 8  simple   FeatureFreq  0  1.0  => false   flips_at: never
@@ -268,8 +268,11 @@ fn gate_state_table() -> Vec<GateRow> {
                 covered_column(simple(), 2),
                 ECtrType::BinarizedTargetMeanValue,
             ),
-            expected: false,
-            flips_at: "T16 — admits BinarizedTargetMeanValue in the `ctr_type` conjunct",
+            expected: true,
+            flips_at: "FLIPPED by T16 — admitted BinarizedTargetMeanValue in the `ctr_type` \
+                       conjunct (DCTR-14), completing the CPU-legal set. Like row 3 this row \
+                       varies exactly ONE attribute against row 1, so restoring the pre-T16 \
+                       three-type list turns THIS row, and only this row, red",
         },
         GateRow {
             label: "simple/Borders/b=0/denom=2.0",

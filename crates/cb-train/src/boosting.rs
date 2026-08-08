@@ -2346,9 +2346,9 @@ fn ctr_splits_for_tree(
 /// Re-opening this clause requires the e2e oracle to pass, not just the config unit test —
 /// this is exactly the ordering discipline that made the gap visible.
 ///
-/// Everything else — BinarizedTargetMeanValue (Track U) — still declines to the
-/// byte-unchanged CPU path (D-04): the device kernels do not implement that accumulation
-/// semantics, and a wrong device leaf is worse than a CPU fallback.
+/// Since DCTR-14 (T16) every CPU-legal CTR type is admitted; the two GPU-only types decline
+/// permanently (see below). A type this crate could not measure against a CPU oracle would
+/// decline to the byte-unchanged CPU path (D-04) rather than risk a wrong device leaf.
 ///
 /// # Buckets and the multi-target-border layout ARE covered (DCTR-08, T10)
 ///
@@ -2422,6 +2422,47 @@ fn ctr_splits_for_tree(
 ///   declining cells** when it lands device eval-set support and the Counter `Full`
 ///   widening: they are a P1/P3 boundary pin, not a requirement to be defended.
 ///
+/// # BinarizedTargetMeanValue IS covered (DCTR-14, T16)
+///
+/// BTMV is the fourth and last CPU-legal type. It IS a permutation-dependent
+/// read-before-increment prefix ([`crate::ctr::ECtrType::is_online_prefix`] is `true`), but its
+/// numerator is not a class COUNT: it is a running FLOAT `TCtrMeanHistory::Sum`
+/// (`online_ctr.h:373`, mirrored by [`crate::ctr::online::online_mean_prefix`]), which cannot be
+/// derived from one bucket's `[N0, N1]`. So it gets its own device accumulator —
+/// `cb-backend`'s `btmv_ctr_prefix_kernel` / `launch_btmv_ctr_resident` (DCTR-12, T14) — and the
+/// class-prefix launcher's host guard REJECTS the BTMV discriminant outright, exactly as it
+/// does for Counter. The accumulator is proved against the CPU `online_mean_prefix` by DCTR-12's
+/// kernel self-oracle, dispatched per column by DCTR-07's `match`, and the whole fit is pinned
+/// end to end against upstream `catboost==1.2.10` by `device_ctr_btmv_fit_test` on the frozen
+/// `ctr_device_btmv` fixture.
+///
+/// Four properties keep this a *type-list* widening and nothing more:
+///
+/// - **the parity target is the CORRECTED CPU (Track E, DCTR-04 / T04).** The CPU BTMV
+///   quantizer divides by the CTR denominator `total + 1` and normalizes by
+///   [`crate::ctr::calc_normalization`]'s `norm` — two DIFFERENT quantities that coincide only
+///   at `count == 1`. The device is measured against that corrected form, never against the
+///   pre-T04 shape that conflated them. Any BTMV numeric check must therefore drive ≥3
+///   documents through some bucket, or it cannot see the difference at all.
+/// - **the accumulator width is a parity contract, and it is invisible here.** Upstream's `Sum`
+///   is a `float`, and the device history stays `f32` for that reason. At binclf the addend is
+///   exactly `targetClass / 1 ∈ {0, 1}`, so an f32 and an f64 accumulator are BIT-IDENTICAL
+///   (PLAN §6 C-2) — the width can only be detected in a synthetic multiclass regime, which is
+///   what DCTR-12's detector uses. Do not read this fit's green as evidence about the width.
+/// - **BTMV ≡ `Borders@0` at binclf (DCTR-13, T15).** `Sum == N[1]` and `Count == Total`
+///   exactly (`online_ctr.cpp:467`/`:762`), so the two emit IDENTICAL cindex bins on a
+///   two-class fit — measured, on every one of 128 documents. ⇒ **the ≤1e-5 e2e cannot tell
+///   BTMV routing from Borders routing**; the routing evidence is the per-split `ctr_type`
+///   assertion in the e2e plus the fact that the two launchers have incompatible signatures.
+///   SPEC chose the honest accumulator (option b) over aliasing BTMV onto Borders (option a)
+///   precisely because the alias is correct today and silently wrong the moment
+///   `SIMPLE_CLASSES_COUNT` stops being `2`.
+/// - **the border table is shared (C-7).** BTMV is the one admitted type whose CPU quantizer is
+///   the `quantize_in_f32` arm, but that f32 quantizer was measured bit-identical to the f64
+///   border table for every prior in `[0, 1]` (research spike Q2, 4,504,501 pairs/prior), so
+///   the device binarizes it with the same `binarize_ctr_column_resident` and the same
+///   per-column table as every other type. No per-type shape handling exists anywhere.
+///
 /// `FloatTargetMeanValue` (`3`) and `FeatureFreq` (`5`) stay declined permanently: they are
 /// GPU-only upstream (`restrictions.h:20-32`) and have no CPU parity surface, which is why
 /// the admission list is an explicit `matches!` enumeration over
@@ -2455,21 +2496,24 @@ fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
             // "combination CTR is device-INELIGIBLE" section of this function's doc
             // comment for the measured evidence and the localisation.
             col.projection.is_simple()
-                // DCTR-08 (T10) / DCTR-10 (T12): the device CTR admission LIST — an explicit
-                // enumeration, never a range check, so an unknown discriminant (`from_i8`
-                // returns `None`) and every not-yet-implemented type are declined by
-                // default. Reconstruction goes through `crate::ctr::ECtrType::from_i8`,
-                // which is IN-CRATE here, so the Do-Not-Hand-Roll rule applies and a second
-                // transcription of the discriminants is forbidden (C-3; only `cb-backend`,
-                // which must never depend on `cb-train`, transcribes them inline).
-                // `Borders`/`Buckets` share the ordered class-prefix device kernel; `Counter`
-                // is a whole-set tally with its OWN permutation-free device entry point. See
-                // this function's doc for both proofs.
+                // DCTR-08 (T10) / DCTR-10 (T12) / DCTR-14 (T16): the device CTR admission
+                // LIST — an explicit enumeration, never a range check, so an unknown
+                // discriminant (`from_i8` returns `None`) and the two GPU-only types are
+                // declined by default. Reconstruction goes through
+                // `crate::ctr::ECtrType::from_i8`, which is IN-CRATE here, so the
+                // Do-Not-Hand-Roll rule applies and a second transcription of the
+                // discriminants is forbidden (C-3; only `cb-backend`, which must never depend
+                // on `cb-train`, transcribes them inline). `Borders`/`Buckets` share the
+                // ordered class-prefix device kernel; `Counter` is a whole-set tally with its
+                // OWN permutation-free device entry point; `BinarizedTargetMeanValue` is a
+                // permutation-dependent prefix over a running float mean, with its own entry
+                // point again. See this function's doc for all three proofs.
                 && matches!(
                     crate::ctr::ECtrType::from_i8(col.ctr_type),
                     Some(
                         crate::ctr::ECtrType::Borders
                             | crate::ctr::ECtrType::Buckets
+                            | crate::ctr::ECtrType::BinarizedTargetMeanValue
                             | crate::ctr::ECtrType::Counter
                     )
                 )

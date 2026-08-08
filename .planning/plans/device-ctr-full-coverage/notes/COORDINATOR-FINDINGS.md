@@ -575,3 +575,251 @@ isolated perf lane). New device binaries created so far that T24 must register:
 …plus whatever T16, T19 and T22 add. `device_ctr_combo_fit_test` is **already** listed
 (line 13) and is currently `#[ignore]`d — T19 un-ignores it, which changes that entry from
 a vacuous pass to a real one without changing the array.
+
+## From T14 → **T15** (primary), **T16** (the wiring), **T24**
+
+T14 added `btmv_ctr_prefix_kernel<F: Float>` (`ctr_device.rs`, `#[cube]` at `:353`, `fn` at `:354`),
+`ResidentCtrMean` (`:454`), `launch_btmv_ctr_resident` (`:731`) and three host-readback oracle seams
+(`compute_btmv_ctr_host` `:1057`, `read_btmv_sum_bytes` `:1110`, `binarize_btmv_column_host` `:1149`).
+**No production call site exists** — `grep -rn "launch_btmv_ctr_resident\|btmv_ctr_prefix_kernel::launch\|ResidentCtrMean"
+crates/ --include=*.rs` returns only definitions, their in-file callers, and one comment mention.
+Six things later tasks must act on:
+
+**1. PLAN §6 C-2 is now MEASURED, in both directions — and the SPEC sentence it corrects is dead.**
+Under a deliberately f64-widened accumulator, `btmv_f32_accumulation_width_is_load_bearing`
+(`divisor = 3`) fails with **38 of 96** documents mismatching (checker predicted 22–41), first at
+doc 0 `device 0x40E00000 (7)` vs `f32 reference 0x40E00001 (7.0000005)`. **In the same mutated
+build, `btmv_prefix_matches_cpu_reference_at_binclf` (`divisor = 1`) and
+`btmv_sum_output_buffer_is_f32_wide` both PASSED.** ⇒ `SPEC.md` DCTR-12's "an f64 device sum must
+FAIL this test" is false at binclf, exactly as C-2 says; the multiclass detector is the only proof,
+and the buffer-width test is an output-shape pin whose own comment states it would pass under an
+`Array<f64>` accumulator. **Any later task tempted to "simplify" the synthetic `divisor` parameter
+away destroys the only evidence DCTR-12 has.**
+
+**2. T16 must call `launch_btmv_ctr_resident`, NOT `launch_ordered_ctr_resident`.** T08's guard
+still rejects `ctr_type == 2` with `CbError::OutOfRange` and **was not widened**. The new entry
+point takes `(client, perm, bins, class, prior, divisor, bucket_count, n)` — **no `ctr_type`, no
+`target_border_idx`** — plus a `divisor` (= `targetClassesCount - 1`), which on the simple CTR path
+is `SIMPLE_CLASSES_COUNT - 1 == 1` and nothing else. A BTMV arm that threads a `target_border_idx`
+in will not type-check, which is the point. It returns `ResidentCtrMean`, **not** `ResidentCtr`
+(the numerator channel is an f32 `sum`, not an integer `good`), so the `build_ctr_cindex_columns`
+match arm cannot simply be copied from the Counter arm — it must bind `res.value` off the new type.
+`binarize_ctr_column_resident` and the per-column border table then apply **unchanged** (C-7).
+
+**3. There is no `CTR_TYPE_BTMV` const yet.** T16 should add `CTR_TYPE_BTMV: i8 = 2` beside
+`CTR_TYPE_BORDERS`/`_BUCKETS`/`_COUNTER` (`ctr_device.rs`, the `:466`-ish block) with the same C-3
+discriminant citation, rather than spelling a bare `2` in `session.rs`. T09 finding 1 + T12 finding
+2 already specify the rest of T16's hunk (both `ctr_covered` closures, the match arm, moving `2`
+from the decline loop to the admit loop, moving `session_ctr_type_test`'s mixed structure/averaging
+pair off BTMV onto an out-of-enum stray such as `6`, and adding BTMV to
+`buckets_keeps_the_borders_shape_checks`' loop).
+
+**4. T04's ≥3-documents finding is now enforced mechanically, and T15 inherits it.** A
+`max_bucket_occupancy(bins) >= 3` assertion guards both BTMV parity oracles. It is not decoration:
+MUT-B (leakage — fold the target in before reading) leaves every FIRST-in-bucket document matching,
+so a fixture whose buckets hold ≤2 documents detects roughly nothing. **T15's differential must
+drive ≥3 documents per bucket too**, and must use `divisor = 1`: the BTMV ≡ Borders@0 identity is
+binclf-only (it holds because the addend is `{0,1}`, so `Sum` counts class-1 documents exactly),
+and at `divisor = 3` it is simply false. `max_bucket_occupancy` is already in `ctr_device_test.rs`
+(`:219`) — reuse it.
+
+**5. A green §2.5 mutation is not always evidence the mutation MISSED — it can mean the test is
+vacuous. This one was.** MUT-C (delete the `divisor == 0` guard) **PASSED on its first run**: the
+sibling `class > divisor` guard fired instead on the fixture's class-1 documents, so the assertion
+had been green without the guard it claimed to pin ever existing. The fix (applied while the
+mutation was live) was an **all-zero class column**, after which MUT-C fails with the real payload —
+an `Ok(([NaN, 0.0, NaN, …]))` CTR column, which `binarize_ctr_kernel` maps to bin `0` everywhere
+because `NaN > border` is false. **Generalisation for T15/T16/T19/T21/T22: when a negative test has
+two or more guards that could each reject the same input, mutating one of them proves nothing
+unless the input is constructed so the others cannot fire.** Order-dependent guard chains make this
+easy to get wrong and impossible to see without the mutation.
+
+**6. `ctr_device.rs` now holds THREE launchers with three different contracts** —
+`launch_ordered_ctr_resident` (`perm, bins, class, prior, bucket_count, n, ctr_type,
+target_border_idx` ⇒ `ResidentCtr`), `launch_counter_ctr_resident` (`bins, prior, bucket_count, n`
+⇒ `ResidentCtr`), `launch_btmv_ctr_resident` (`perm, bins, class, prior, divisor, bucket_count, n`
+⇒ `ResidentCtrMean`). T24's DoD should note that the "one entry point per statistic, differing in
+exactly the arguments the statistic depends on" property is what makes a copy-paste routing error a
+compile error rather than a silent wrong numerator.
+
+**D-04 held at T14:** `device_ctr_fit_test` `max |Δpred| = 4.483e-11`, unchanged;
+`device_ctr_buckets_fit_test` `2.776e-17`; `device_ctr_counter_fit_test` `1.388e-17`;
+`device grows = 5` on all three; `bash ./run_device_tests.sh` **24 PASS / 0 FAIL** (+ perf lane,
+Poisson 10.5×, no R-13 flake); `cb-backend --lib` under rocm `271 passed / 0 failed; 2 ignored`
+(267 at T11/T12 + T14's 4 new tests); the same 14 `ctr_device_test` tests also pass on the **default
+cpu** backend; `cb-train --lib` `396 passed / 0 failed`; `cargo test -p cb-train` **109 targets, all
+ok**. Zero clippy diagnostics originate from `ctr_device.rs` / `ctr_device_test.rs`; the pre-existing
+`erasing_op` at `score_split.rs:374` is still the only `error` on that lane. **No new
+pre-existing-failure item was discovered.**
+
+## From T15 → **T16** (primary), **T19/T21/T22** (the §2.5 pattern), **T24**
+
+T15 added `btmv_and_borders_emit_identical_bins_at_binclf` (`ctr_device_test.rs:1026`) plus three
+test-side helpers (`CTR_BORDER_COUNT` `:217`, `calc_normalization` `:223`, `device_ctr_border_table`
+`:239`). **Test-only — zero production change**: `git diff --numstat` on
+`crates/cb-backend/src/kernels/ctr_device.rs` reads `375  0` both before and after T15, i.e. still
+byte-identical to the state T14 left it in.
+
+**1. PLAN §2.5's offered substitute for T15 was DECLINED, and the reasoning generalises.** §2.5 says
+T15's `>= 2 distinct bins` guard is an "accepted substitute" for a full mutation. T15 kept the guard
+**and** ran two real mutations, because the guard cannot see the vacuity mode specific to a
+**differential**: an equality between two columns is also satisfied when the two columns are the
+*same* column. A test that called one arm twice would be green, non-degenerate, and would assert
+nothing — T14's MUT-C failure mode transposed. A mutation of **one** arm settles it in both
+directions at once (a self-comparison moves both sides equally, or neither, and stays green).
+⇒ **Rule for T19/T21/T22: for any test whose assertion is `A == B` across two paths, the ≥N-distinct
+-values guard proves non-degeneracy, never non-tautology. Only a one-sided mutation proves the two
+arms are distinct.** Verbatim failures in `notes/T15.md` §3.
+
+**2. Buckets@0 and Borders@0 are the COMPLEMENTARY numerators at binclf, and this was measured
+twice, independently.** MUT-1 (BTMV's accumulator folds `1 − class`, so `Sum = N[0]`) and MUT-2
+(the reference arm's selector moved from `CTR_TYPE_BORDERS` to `CTR_TYPE_BUCKETS` inside
+`binarize_ctr_column_host`) each turn the test red on **all 128 of 128 documents**, and MUT-2's
+`left`/`right` vectors are **element-for-element MUT-1's `right`/`left`**. Two one-line mutations in
+two different kernels reached through two different launchers produce the same column pair with the
+arms exchanged. Useful to T22: on a `Prior = 0.5` binclf fixture the `Buckets@0` and `Borders@0`
+**bin columns are a mirrored pair**, which is the per-column form of T10's finding #2 (mirrored bins
+⇒ the same oblivious partition with one level bit flipped ⇒ identical predictions). A
+prediction-level differential cannot separate them; a **cindex-column-level** one can, and does.
+
+**3. The production border table is now reproducible from `cb-backend` test code.**
+`device_ctr_border_table(prior, bc)` implements `build_device_ctr_config`'s own
+`borders[k] = ((k+1)·norm/bc − shift).next_down()` at the upstream default `bc = 15`, over an inline
+transcription of `calc_normalization` (C-3 — `cb-backend` must not import `cb-train`). Every earlier
+`ctr_device_test` oracle used an ad-hoc table (`[0.2, 0.4, 0.5, 0.6, 0.8]`, `COUNTER_BORDERS`).
+**T16 and any later kernel-level differential should prefer `device_ctr_border_table`**: it is the
+table a real fit emits, and T15 measured that it resolves an `N[1] → N[0]` numerator swap on *every*
+object, whereas an ad-hoc coarse table need not.
+
+**4. T04's ≥3-documents constraint is satisfied with a wide margin on `synth_fixture(128, 5, 3)`** —
+recomputed independently from the LCG, the five buckets hold `{32, 19, 24, 28, 25}` documents
+(class counts `{0: 63, 1: 65}`). The runtime `max_bucket_occupancy(&bins) >= 3` assertion is in the
+test, so this is enforced rather than assumed. `BTMV_DIVISOR_BINCLF = 1` throughout, per T14 §8 —
+the equivalence is binclf-only and false at `divisor = 3`.
+
+**5. Nothing new blocks T16.** T14 §8's wiring instructions stand unchanged: call
+`launch_btmv_ctr_resident` (never `launch_ordered_ctr_resident`, whose guard still rejects
+`ctr_type == 2`), add `CTR_TYPE_BTMV: i8 = 2` beside the other three consts with the C-3 citation,
+then T09 finding 1's three-part hunk and T12 finding 2's obligations (move
+`session_ctr_type_test`'s mixed structure/averaging pair off `BINARIZED_TARGET_MEAN_VALUE` onto an
+out-of-enum stray such as `6`; add BTMV to `buckets_keeps_the_borders_shape_checks`' loop).
+`ResidentCtrMean` — not `ResidentCtr` — is what the new match arm must bind `res.value` off.
+
+**6. `CountingGpu` duplication count is UNCHANGED at FIVE** (T15 added no e2e). T16 and T19 are
+still expected to add one each.
+
+**D-04 held at T15:** `device_ctr_fit_test` `max |Δpred| = 4.483e-11`, unchanged;
+`device_ctr_buckets_fit_test` `2.776e-17`; `device_ctr_counter_fit_test` `1.388e-17`; `device grows
+= 5` on all three; `bash ./run_device_tests.sh` **24 PASS / 0 FAIL** (+ perf lane, Poisson 10.6×, no
+R-13 flake); `cb-backend --lib` under rocm `272 passed / 0 failed; 2 ignored` (271 at T14 + T15's 1
+new test); the same 15 `ctr_device_test` tests also pass on the **default cpu** backend; the wgpu
+`cargo check` is clean with zero `ctr_device` diagnostics. Zero clippy diagnostics originate from
+`ctr_device.rs` / `ctr_device_test.rs`; the pre-existing `erasing_op` at `score_split.rs:374` is
+still the only `error` on that lane. **No new pre-existing-failure item was discovered.**
+
+## From T16 → **T19** (primary), **T22/T23** (the closed type list), **T24**
+
+T16 wired T14's BTMV kernel into production: `CTR_TYPE_BTMV` + `BTMV_DIVISOR_BINCLF`
+(`ctr_device.rs:488`/`:497`, beside the other three consts), `2` added to **both** `ctr_covered`
+closures, a `CTR_TYPE_BTMV => launch_btmv_ctr_resident(client, permutation, &bins, target_class,
+col.prior, BTMV_DIVISOR_BINCLF, buckets, n)?.value` arm in `build_ctr_cindex_columns`, and
+`ECtrType::BinarizedTargetMeanValue` added to the `cb-train` gate's `from_i8` admission list.
+`device_ctr_btmv_fit_test`: **`grown = 5`, `max |Δpred| = 2.776e-17`, 1.69 s** (CPU fallback
+0.01 s). Gate-state **row 5 flipped to `true`** in the same edit; rows 1-4 and 6-10 untouched.
+
+**1. THE DEVICE CTR TYPE LIST IS NOW CLOSED at the four CPU-legal types**
+(`{Borders, Buckets, BinarizedTargetMeanValue, Counter}`). The only conjunct left in
+`ctr_types_are_device_covered` is `col.projection.is_simple()` — **T19's**. A new pin,
+`boosting_ctr_gate_tests::the_admitted_set_is_exactly_the_cpu_supported_types`, makes that
+executable: the gate must name each `is_cpu_supported()` type exactly once and **never** name
+`FloatTargetMeanValue` / `FeatureFreq`. ⇒ **T23's rewrite to delegate to
+`from_i8`/`is_cpu_supported` is now a near-identity transformation of the admission list**, but
+it must retire or update **all NINE** source-scan pins in `boosting_ctr_gate_test.rs` (T01's 2 +
+T10's 4 + T16's 3), not the six T10 counted.
+
+**2. MATERIAL for T19/T22 — the BTMV e2e CANNOT police its own routing, and no fixture choice
+could fix that.** T15's binclf identity (`Sum == N[1]`, `Count == Total` ⇒ BTMV and `Borders@0`
+emit IDENTICAL cindex bins) means a device path that kept routing these columns through
+`launch_ordered_ctr_resident` at `(CTR_TYPE_BORDERS, 0)` would produce identical predictions and
+pass the ≤1e-5 bar. This is **structural and holds for every binclf BTMV fixture** — unlike T06's
+Counter-prior blind spot, which was fixture-specific. The three layers that close it: the
+per-split `ctr_type` assertion in the e2e; the launchers' incompatible signatures (a swap is a
+compile error); and DCTR-12's kernel self-oracle. **T22's combination × BTMV arm must therefore
+compare something other than predictions** — a cindex-column-level differential works (T15 §2),
+a prediction-level one does not.
+
+**3. MUT-6 is a new, cheap, GENERALLY USEFUL mutation shape: delete the dispatch ARM, not the
+gate.** Replacing `CTR_TYPE_BTMV => {` with an unreachable discriminant made the e2e fail with
+`device BTMV CTR train failed: Unsupported("device CTR type 2 is not implemented")` in 0.14 s.
+Unlike T20's `&& false` (which proves the fit *can* commit) this proves the fit reaches **the
+specific new production call site** — the thing a device-commitment assertion alone cannot say.
+Every later task adding a `build_ctr_cindex_columns` arm should run it. It also records C-14 in
+its strongest form: because `ctr_covered` admits the type, the `Ok(None)` decline path is not
+taken and the mismatch surfaces as a **typed error out of `train_cat`**, not even as
+`grown == 0`.
+
+**4. Fourth data point on the delta.** On `ctr_device_btmv` the device and the CPU fallback print
+the **same** `2.776e-17` (as on `ctr_device_buckets`); on `ctr_device_counter` and
+`ctr_device_mixed` they differ. `grown == iterations` and the runtime (1.65-1.71 s device vs
+0.01 s CPU) are still the only two signals that held every time.
+
+**5. The prior trap is per-type and INVERTS between Counter and BTMV.** Counter's default is the
+single `0/1`; **BTMV's is the `{0, 0.5, 1}` TRIPLE** — so an omitted `simple_ctr_priors` on a
+BTMV fit materializes THREE CTR columns against a one-descriptor fixture. Both directions are now
+pinned in `boosting_ctr_gate_test.rs` and both e2es assert their own `simple_ctr_priors` before
+the fit. **Any later task copying one e2e's `ctr_params()` into another must re-check
+`ECtrType::default_priors`' arm for the new type.**
+
+**6. `session_ctr_type_test`'s mixed structure/averaging pair now uses an OUT-OF-ENUM STRAY**
+(`UNKNOWN_DISCRIMINANT: i8 = 6`), and this is the **durable** end state: with the CPU-legal set
+fully admitted, no future task can implement a stray, so the pair can never need swapping again.
+It was mutation-proved to still discriminate (deleting the type conjunct from the averaging
+closure alone reddens it). **Never delete those two assertions** — they are the only pins that
+BOTH `.all(..)` closures carry the type conjunct.
+
+**7. `build_ctr_cindex_columns`' `match` now binds `value: Handle`, not a `res` struct** —
+forced, because `launch_btmv_ctr_resident` returns `ResidentCtrMean` and the other two return
+`ResidentCtr`. Binding only the shared f64 `value` channel makes C-7 visually obvious: the
+`binarize_ctr_column_resident` below cannot see the CTR type at all. T17/T19 editing this region
+should keep that shape. (T09 finding 4's orphaned doc block at `session.rs:213-224` is still
+attached to `CtrSearchState` — **still not re-attached**, still out of scope.)
+
+**8. `CountingGpu` is now duplicated SIX times** (`device_ctr_gate_test.rs:82-138` canonical,
+`device_ctr_fit_test.rs`, `device_ctr_buckets_fit_test.rs`, `device_ctr_counter_fit_test.rs`,
+`device_ctr_type_gate_test.rs`, `device_ctr_btmv_fit_test.rs`). **T24 must register the new
+binary `device_ctr_btmv_fit_test`** in `run_device_tests.sh`'s `TESTS=(…)` — the fourth of the
+four (with T10's, T12's and T13's).
+
+**D-04 held at T16:** `device_ctr_fit_test` `max |Δpred| = 4.483e-11`, unchanged;
+`device_ctr_buckets_fit_test` `2.776e-17`; `device_ctr_counter_fit_test` `1.388e-17`; `device
+grows = 5` on all four e2es; `bash ./run_device_tests.sh` **24 PASS / 0 FAIL** (+ perf lane,
+Poisson 10.6×, no R-13 flake); `cb-backend --lib` under rocm `272 passed / 0 failed; 2 ignored`
+(identical to T15 — T16 added no `cb-backend` test); `cb-train --lib` `399 passed / 0 failed`
+(396 at T12/T14 + T16's 3 new gate pins); `cargo test -p cb-train` **110 targets, all ok**.
+**DCTR-05 held**: `ctr_btmv_simple_oracle_test`'s `--test-threads=1` output is byte-identical to
+T03's captured baseline, and `crates/cb-oracle/fixtures/ctr_device_btmv/` is byte-untouched.
+**No new pre-existing-failure item was discovered** — `cb-backend --lib` under default cpu is
+still exactly 60 failures (T02's item), now `222 passed` as the suite grew.
+
+## From the coordinator, consolidating T10 §2 + T16 → **T22** (BOTH non-Borders arms are prediction-blind)
+
+Two independent measurements now say the same thing, and together they constrain T22's
+design before it writes a line:
+
+* **Buckets (T10 §2)** — at `Prior = 0.5` the `b=0` and `b=1` columns are exact mirrors, so
+  device `[0]×8` and CPU `[0,1,0,0,1,1,0,1]` are the *same partition with one level bit
+  flipped*, both at `2.776e-17`. Chosen splits legitimately diverge while predictions agree.
+* **BTMV (T16)** — T15's binclf identity makes BTMV and `Borders@0` **prediction-identical on
+  any binclf fixture**, so the BTMV e2e cannot detect that BTMV was routed to the Borders
+  numerator at all.
+
+⇒ For T22, **predictions are not a routing detector for either arm**, and a raw
+`(feature, border)` split-sequence comparison is not one for Buckets. T16's recommendation,
+which the coordinator endorses: **T22's differential must compare at the cindex-column
+level** (the materialized bin columns), not predictions — or, for the Buckets arm, a
+partition-invariant projection of the split set with a prior ≠ 0.5.
+
+State this choice up front in T22's note with the reason. Do **not** discover it as a red
+test and then loosen the assertion — that is precisely the class of change §2.5 exists to
+prevent. And note it cuts both ways: a raw comparison that *passes* is not evidence the two
+paths agree, because these degeneracies make disagreement invisible.

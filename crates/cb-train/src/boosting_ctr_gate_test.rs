@@ -387,6 +387,154 @@ fn the_device_gate_admits_counter_in_its_type_list() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// DCTR-14 (T16) — the CTR TYPE conjunct, widened a final time to admit
+// `BinarizedTargetMeanValue`
+// ---------------------------------------------------------------------------------------
+
+/// The structural reason admitting `BinarizedTargetMeanValue` is a *type-list* change and
+/// nothing more — and the reason it could NOT be admitted by widening the class-prefix arm.
+///
+/// Four facts, each load-bearing:
+///
+/// 1. **BTMV is CPU-legal** (`restrictions.h:18-48`), so it has a parity surface a fixture can
+///    be measured against — unlike the GPU-only pair.
+/// 2. **BTMV IS an online prefix** (`IsPermutationDependentCtrType`, `ctr_type.cpp:43-56`),
+///    which is what separates it from `Counter`: the device must feed it the learn permutation
+///    and read each bucket's history strictly BEFORE folding the document's own target in. A
+///    permutation-free entry point would be the wrong home for it.
+/// 3. **…but its numerator is not a class COUNT.** Its history is `TCtrMeanHistory`, a running
+///    FLOAT `Sum` plus an integer `Count` (`online_ctr.h:373`), which cannot be derived from
+///    one bucket's `[N0, N1]` — hence its own device accumulator, and hence the class-prefix
+///    launcher's host guard rejecting the discriminant. `is_online_prefix()` alone does NOT
+///    imply "routes through the class-prefix kernel"; BTMV is the counterexample, and this
+///    assertion pair is what records that.
+/// 4. **BTMV emits exactly ONE column per `(projection, prior)`**
+///    (`target_border_count(BinarizedTargetMeanValue, 2) == 1`, `ctr_helper.h:34-42`), so
+///    admitting it cannot interact with the numerator-selector conjunct T10 deleted.
+///
+/// It also pins the prior trap, whose shape is the OPPOSITE of Counter's: BTMV gets the
+/// `{0/1, 0.5/1, 1/1}` TRIPLE by default (`cat_feature_options.cpp:118-138`), while the frozen
+/// `ctr_device_btmv` fixture carries the single `Prior=0.5`. Omitting `simple_ctr_priors` would
+/// therefore materialize THREE CTR columns against a one-descriptor model, which is why
+/// `device_ctr_btmv_fit_test` pins `simple_ctr_priors = vec![0.5]` and asserts it before the
+/// fit.
+///
+/// PLAN §2.5: green on write ⇒ its discriminating power was proved by mutation; the verbatim
+/// failures are recorded in `notes/T16.md`.
+#[test]
+fn btmv_is_a_cpu_legal_online_prefix_over_a_float_mean_not_a_class_count() {
+    use crate::ctr::ECtrType;
+
+    assert!(
+        ECtrType::BinarizedTargetMeanValue.is_cpu_supported(),
+        "BinarizedTargetMeanValue must be CPU-legal (`restrictions.h:18-48`) — the device gate \
+         may only admit types that have a CPU parity surface to be measured against"
+    );
+    assert!(
+        ECtrType::BinarizedTargetMeanValue.is_online_prefix(),
+        "BinarizedTargetMeanValue must be permutation DEPENDENT (`ctr_type.cpp:43-56`): the \
+         device accumulator reads each bucket's (Sum, Count) history strictly BEFORE folding \
+         the document's own target in, walking the LEARN PERMUTATION. If this classification \
+         flips, the permutation-free entry point (Counter's) would be the right home and the \
+         DCTR-14 dispatch arm is wrong"
+    );
+
+    // The binclf target-class count — the same `TARGET_CLASSES` constant
+    // `materialize_ctr_columns_for_perm` passes.
+    const CLASSES: usize = 2;
+    assert_eq!(
+        ECtrType::BinarizedTargetMeanValue.target_border_count(CLASSES),
+        1,
+        "BinarizedTargetMeanValue does not binarize the target into classes at all, so it \
+         emits ONE column per (projection, prior) and its columns can only ever carry \
+         selector 0"
+    );
+
+    // The prior trap, inverted relative to Counter's: BTMV gets the class-count TRIPLE, so an
+    // omitted `simple_ctr_priors` materializes three columns, not one.
+    let btmv_defaults = ECtrType::BinarizedTargetMeanValue.default_priors();
+    assert_eq!(
+        btmv_defaults.len(),
+        3,
+        "BinarizedTargetMeanValue's default prior set is the `{{0/1, 0.5/1, 1/1}}` triple \
+         (`cat_feature_options.cpp:118-138`); found {btmv_defaults:?}. `device_ctr_btmv_fit_test` \
+         pins `simple_ctr_priors = vec![0.5]` explicitly BECAUSE the default would materialize \
+         THREE CTR columns against a fixture whose model.json carries exactly one descriptor"
+    );
+    assert_eq!(
+        ECtrType::Counter.default_priors().len(),
+        1,
+        "Counter's single-prior default is the contrast that makes the per-type prior default a \
+         genuine trap rather than a uniform rule — a task copying one e2e's params into another \
+         must re-check this arm"
+    );
+}
+
+/// DCTR-14's observable completion: the gate expression itself admits
+/// `BinarizedTargetMeanValue`. RED before T16's widening, green after.
+///
+/// The scan runs over the COMMENT-STRIPPED body ([`code_lines_mentioning`]), so the prose
+/// inside the gate that explains why BTMV is admitted cannot satisfy this on its own — the
+/// enumeration entry must really be there. Exactly ONE code mention is expected: a second would
+/// mean the type is tested in two places, and the admission list would no longer be a single
+/// enumeration.
+#[test]
+fn the_device_gate_admits_binarized_target_mean_value_in_its_type_list() {
+    let body = gate_body();
+    let mentions = code_lines_mentioning(&body, "ECtrType::BinarizedTargetMeanValue");
+    assert_eq!(
+        mentions.len(),
+        1,
+        "`ctr_types_are_device_covered` must name `ECtrType::BinarizedTargetMeanValue` exactly \
+         once, in its `from_i8` admission list (DCTR-14): BTMV's device statistic is \
+         implemented (`launch_btmv_ctr_resident`, DCTR-12) and pinned end to end by \
+         `device_ctr_btmv_fit_test`. Found: {mentions:?}. Body was:\n{body}"
+    );
+}
+
+/// The admitted set is now CLOSED at the four CPU-legal types, and this is the executable
+/// statement of that.
+///
+/// P1's type track ends here: `is_cpu_supported()` partitions `ECtrType` into exactly the four
+/// types the device now implements and the two GPU-only ones that can never be measured against
+/// a CPU oracle. A later task that widens the gate past this partition is claiming a parity
+/// surface upstream does not provide, and this test is what stops that from being an accident.
+#[test]
+fn the_admitted_set_is_exactly_the_cpu_supported_types() {
+    use crate::ctr::ECtrType;
+
+    let body = gate_body();
+    for admitted in [
+        ECtrType::Borders,
+        ECtrType::Buckets,
+        ECtrType::BinarizedTargetMeanValue,
+        ECtrType::Counter,
+    ] {
+        assert!(
+            admitted.is_cpu_supported(),
+            "{admitted:?} is named in the gate's admission list, so it MUST be CPU-legal"
+        );
+        assert_eq!(
+            code_lines_mentioning(&body, &format!("ECtrType::{admitted:?}")).len(),
+            1,
+            "the gate must name `ECtrType::{admitted:?}` exactly once in its admission list; \
+             body was:\n{body}"
+        );
+    }
+    for gpu_only in [ECtrType::FloatTargetMeanValue, ECtrType::FeatureFreq] {
+        assert!(
+            !gpu_only.is_cpu_supported(),
+            "{gpu_only:?} must stay CPU-illegal (`restrictions.h:20-32`)"
+        );
+        assert!(
+            code_lines_mentioning(&body, &format!("ECtrType::{gpu_only:?}")).is_empty(),
+            "the gate must NEVER name the GPU-only `ECtrType::{gpu_only:?}` — there is no CPU \
+             oracle to prove parity against. Body was:\n{body}"
+        );
+    }
+}
+
 /// DCTR-08's second observable completion: the gate expression itself no longer reads the
 /// Buckets numerator selector. RED before T10's deletion, green after.
 ///

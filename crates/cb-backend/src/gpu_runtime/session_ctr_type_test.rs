@@ -44,6 +44,11 @@ const BINARIZED_TARGET_MEAN_VALUE: i8 = 2;
 const FLOAT_TARGET_MEAN_VALUE: i8 = 3;
 const COUNTER: i8 = 4;
 const FEATURE_FREQ: i8 = 5;
+/// NOT an `ECtrType` discriminant — the first value past the enum. Used by the mixed
+/// structure/averaging pair below, which needs an operand that `ctr_covered` declines; since
+/// DCTR-14 admitted the last CPU-legal type, a stray is the only choice no future task can
+/// invalidate.
+const UNKNOWN_DISCRIMINANT: i8 = 6;
 
 /// `n_bins - 1` borders spanning `(0, 1)` ⇒ `borders.len() + 1 == n_bins`, the uniform-histogram
 /// shape invariant `ctr_covered` enforces.
@@ -97,8 +102,9 @@ fn config(ctr_type: i8) -> DeviceTrainConfig {
     config_with(column(ctr_type, 0), column(ctr_type, 0))
 }
 
-/// DCTR-07 / DCTR-10: `ctr_covered` admits EXACTLY `{Borders, Buckets, Counter}` and declines
-/// every other `ECtrType` discriminant.
+/// DCTR-07 / DCTR-10 / DCTR-14: `ctr_covered` admits EXACTLY
+/// `{Borders, Buckets, BinarizedTargetMeanValue, Counter}` — the four CPU-legal types — and
+/// declines every other `ECtrType` discriminant.
 ///
 /// # The admitted set moves with the device statistics, one task at a time
 ///
@@ -106,10 +112,11 @@ fn config(ctr_type: i8) -> DeviceTrainConfig {
 /// **expected Red**, not a regression: a task that adds a device statistic must, in the same
 /// hunk, add its discriminant to both `ctr_covered` closures, add its arm to
 /// [`super::build_ctr_cindex_columns`]'s dispatch, and move the discriminant from the decline
-/// loop below to the admit loop above. T12 did that for `Counter` (`4`, DCTR-10). What must
-/// stay in the decline loop **forever** is `{FloatTargetMeanValue (3), FeatureFreq (5)}` —
-/// GPU-only upstream (`restrictions.h:20-32`), so no CPU oracle could ever prove parity — plus
-/// every out-of-enum stray.
+/// loop below to the admit loop above. T12 did that for `Counter` (`4`, DCTR-10) and T16 for
+/// `BinarizedTargetMeanValue` (`2`, DCTR-14). **The admitted set is now CLOSED**: what stays in
+/// the decline loop **forever** is `{FloatTargetMeanValue (3), FeatureFreq (5)}` — GPU-only
+/// upstream (`restrictions.h:20-32`), so no CPU oracle could ever prove parity — plus every
+/// out-of-enum stray.
 ///
 /// # Why declining loudly is safe (C-14 — the property this task records)
 ///
@@ -124,6 +131,10 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
     for (ctr_type, name) in [
         (BORDERS, "Borders"),
         (BUCKETS, "Buckets"),
+        // DCTR-14 (T16): BTMV is device-implemented via `launch_btmv_ctr_resident` (a
+        // permutation-dependent prefix over a running FLOAT sum, NOT a class count — so it
+        // cannot use the class-prefix kernel either).
+        (BINARIZED_TARGET_MEAN_VALUE, "BinarizedTargetMeanValue"),
         // DCTR-10 (T12): Counter is device-implemented via `launch_counter_ctr_resident`
         // (a whole-set tally, NOT the class-prefix kernel).
         (COUNTER, "Counter"),
@@ -135,7 +146,6 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
     }
 
     for (ctr_type, name) in [
-        (BINARIZED_TARGET_MEAN_VALUE, "BinarizedTargetMeanValue"),
         (FLOAT_TARGET_MEAN_VALUE, "FloatTargetMeanValue"),
         (FEATURE_FREQ, "FeatureFreq"),
     ] {
@@ -159,13 +169,16 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
     // covered but whose averaging half is not (or vice versa) must decline. A one-sided edit
     // would leave the leaf-value gather materializing an unimplemented type.
     //
-    // The mixed pair uses `BinarizedTargetMeanValue` — the one CPU-legal type that is still
-    // unimplemented on device. (T09 used `Counter` here; T12 implemented it. T16, which
-    // implements BTMV, must swap this pair to a type that is still declined, or to an
-    // out-of-enum stray, rather than deleting the two assertions.)
+    // The mixed pair uses the OUT-OF-ENUM stray [`UNKNOWN_DISCRIMINANT`]. (T09 used `Counter`
+    // here; T12 implemented it and moved the pair to `BinarizedTargetMeanValue`; T16
+    // implemented that too. With the CPU-legal set now fully admitted, the discriminants that
+    // still decline are the GPU-only pair and the strays — and a stray is the DURABLE choice,
+    // because no future task can implement one. **Swap the operand if that ever stops being
+    // true; never delete these two assertions**, which are the only pins that BOTH closures
+    // carry the type conjunct.)
     assert!(
         !ctr_covered(
-            &config_with(column(BORDERS, 0), column(BINARIZED_TARGET_MEAN_VALUE, 0)),
+            &config_with(column(BORDERS, 0), column(UNKNOWN_DISCRIMINANT, 0)),
             N,
             N_BINS
         ),
@@ -174,7 +187,7 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
     );
     assert!(
         !ctr_covered(
-            &config_with(column(BINARIZED_TARGET_MEAN_VALUE, 0), column(BORDERS, 0)),
+            &config_with(column(UNKNOWN_DISCRIMINANT, 0), column(BORDERS, 0)),
             N,
             N_BINS
         ),
@@ -187,9 +200,12 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
 /// for every type. Buckets (T09) and Counter (T12) both quantize through the same
 /// `calc_ctr_online_bin` border table as Borders on the CPU (`quantize_in_f32 == false`;
 /// Counter's `total` is the CONSTANT max-bucket denominator repeated per object, so the
-/// resident triple has the ordered path's shape exactly), so a per-type shape special case
-/// would be a divergence, not a fix. Every task that widens the admission list adds its type
-/// to the loop below.
+/// resident triple has the ordered path's shape exactly), and BTMV (T16) — the one admitted
+/// type whose CPU quantizer IS the `quantize_in_f32` arm — was measured bit-identical to that
+/// same f64 border table for every prior in `[0, 1]` (research spike Q2, 4,504,501
+/// pairs/prior), which is why it needs no per-type border handling either. So a per-type shape
+/// special case would be a divergence, not a fix. Every task that widens the admission list
+/// adds its type to the loop below.
 #[test]
 fn buckets_keeps_the_borders_shape_checks() {
     let wrong_borders = |ctr_type: i8| {
@@ -203,7 +219,12 @@ fn buckets_keeps_the_borders_shape_checks() {
         col
     };
 
-    for (ctr_type, name) in [(BORDERS, "Borders"), (BUCKETS, "Buckets"), (COUNTER, "Counter")] {
+    for (ctr_type, name) in [
+        (BORDERS, "Borders"),
+        (BUCKETS, "Buckets"),
+        (BINARIZED_TARGET_MEAN_VALUE, "BinarizedTargetMeanValue"),
+        (COUNTER, "Counter"),
+    ] {
         assert!(
             !ctr_covered(
                 &config_with(wrong_borders(ctr_type), column(ctr_type, 0)),
