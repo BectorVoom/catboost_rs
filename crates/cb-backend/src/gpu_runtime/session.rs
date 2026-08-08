@@ -62,6 +62,7 @@ use crate::kernels::bootstrap_device::{
 use crate::kernels::mvs_device::launch_mvs_weights_resident;
 use crate::kernels::ctr_device::{
     binarize_ctr_column_resident, combine_projection_bins, launch_ordered_ctr_resident,
+    CTR_TYPE_BORDERS,
 };
 use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
@@ -223,6 +224,11 @@ fn build_ctr_cindex_columns(
             col.prior,
             buckets,
             n,
+            // DCTR-06 (T08): the numerator selector is pinned to the historical
+            // `(Borders, target_border_idx = 0)` here so this wave is byte-unchanged (D-04).
+            // T09 (DCTR-07) is what makes this read `col.ctr_type` / `col.target_border_idx`.
+            CTR_TYPE_BORDERS,
+            0,
         )?;
         let bin_h = binarize_ctr_column_resident(client, &res.value, &col.borders, n)?;
         let bytes = client

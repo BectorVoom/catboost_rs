@@ -154,3 +154,101 @@ stops at whichever target compiles first, which is why different tasks report di
 - `crates/cb-oracle` has ~5 pre-existing clippy errors unrelated to this phase.
 - Wave-parallel artifact: fixture generators carry a corpus-contamination check that
   reports sibling `ctr_device_*` directories created by concurrent tasks. Harmless.
+
+## From T20 → **T10, T12, T16, T19** (every remaining `CountingGpu` e2e) and **T24**
+
+**1. There is now a measured CPU-fallback fingerprint, and it is cheap to read.** On
+`ctr_device_mixed`, forcing the gate closed (`&& false`) flips the printed
+`max |Δpred|` from **`4.483e-11` (device)** to **`1.388e-17` (CPU)** — the exact
+CPU-fallback value `SPEC.md` DCTR-17 predicts — and collapses the run from **1.9s to
+0.01s**. ⇒ *An unexpectedly tiny `max |Δpred|` or an instant device e2e is a
+CPU-fallback smell.* Note the direction: **the CPU path scores BETTER against the
+upstream oracle than the device path.** No ≤1e-5 bar can ever detect a fallback,
+because falling back makes the number improve. Do not read a very small delta as
+reassurance.
+
+**2. Put the `CountingGpu` assertion AFTER the ≤1e-5 loop, not right after the fit.**
+T20 did, deliberately. Under the §2.5 mutation the run then prints the passing
+`max |Δpred|` line *before* panicking on `grown`, so a **single** mutation run yields
+both halves of the required completion evidence ("the assertion failed AND the ≤1e-5
+bar still passed"). Fail-fast ordering hides exactly the evidence DCTR-08/10/14/17
+completion criteria ask for. In-source comments in `device_ctr_fit_test.rs` explain
+this so a later reader does not "fix" the ordering.
+
+**3. `&& false` on `ctr_types_are_device_covered` is the universal, cheap mutation for
+any device-commitment assertion.** Rebuild + run is ~2.3s + ~2s; it needs no fixture and
+no per-task bespoke mutation. Predicted failure shape is always
+``assertion `left == right` failed … left: 0, right: <iterations>``. It edits the gate
+expression, so the isolation rule applies — focused `--test <name>` only while live.
+
+**4. The `CountingGpu` wrapper now exists in TWO copies** —
+`device_ctr_gate_test.rs:82-138` (canonical) and `device_ctr_fit_test.rs` (copied
+verbatim per GLOBALS §2.2.6, with a keep-in-sync note). Each new e2e adds a third,
+fourth, … copy. Consequence: **any change to the `cb_compute::Runtime` method
+signatures this wrapper overrides (`compute_gradients`, `begin_device_training`,
+`grow_tree_on_device`, `end_device_training`) now breaks N test files, not one.** No
+task in this phase is scheduled to change them, but T24 should record the duplication
+count at DoD.
+
+**5. Parallel-wave build hazard (process).** Any `cargo {check,test,clippy} -p cb-train`
+transitively compiles `cb-backend`. During Wave 2, T08's in-flight edit left
+`crates/cb-backend/src/kernels/ctr_device.rs` non-compiling (`E0061` at `:294`, kernel
+signature mid-change) and that surfaced as a **red build in T20's commands** with
+nothing wrong in `cb-train`. ⇒ **Before chasing a `cb-backend` compile error, run
+`git diff --name-only` and check whether the broken file is yours.** If it is another
+task's, record and move on; do not "fix" it.
+
+## From T08 → **T09, T11, T12, T14, T16** (the ordered-prefix kernel seam after DCTR-06)
+
+T08 landed the `(ctr_type, target_border_idx)` numerator selector on
+`ordered_ctr_prefix_kernel` (`ctr_device.rs`, `fn` now at `:164`) and on
+`launch_ordered_ctr_resident` (`:307`). Four facts later kernel/plumbing tasks must act on:
+
+**1. `launch_ordered_ctr_resident` now REJECTS any `ctr_type` outside `{0 Borders, 1 Buckets}`
+with `CbError::OutOfRange`.** This is deliberate and beyond the letter of T08's task text: the
+alternative (accept `Counter` / `BTMV` and fall through to the Borders numerator) is a silent
+wrong answer, not a worse one. ⇒ **T11 (Counter) and T14 (BTMV) must not route their columns
+through this function.** If a later task genuinely needs to, widening the guard is a deliberate,
+test-visible act — `ctr_device_test::out_of_range_ctr_mode_is_rejected` pins it and will go red.
+`target_border_idx > 1` is rejected the same way (`SIMPLE_CLASSES_COUNT == 2`).
+
+**2. Reuse `CTR_TYPE_BORDERS` / `CTR_TYPE_BUCKETS`** (`pub(crate)` at `ctr_device.rs:277`/`:279`)
+rather than re-transcribing the `ECtrType` discriminants. C-3 demands a citation on every
+cb-backend transcription; these already carry the full list plus the `restrictions.h` reference.
+
+**3. T09's production edit is two literals, at `session.rs:230-231`** — replacing the
+`CTR_TYPE_BORDERS, 0` that T08 pinned there (with an in-source comment naming T09) by
+`col.ctr_type, col.target_border_idx`. **No conversion is needed**: `DeviceCtrColumn.ctr_type` is
+already `i8` and `.target_border_idx` already `u32` (T02's seam). Combined with finding 1 and
+C-14, a cb-train-gate / cb-backend-list mismatch surfaces as a loud `CbError` → `grown == 0`,
+never a silent numerator swap.
+
+**4. The `#[cube]` parameter order is now
+`perm, bins, class, prior, mode, counts, good, total, value`** — `mode` is the **5th** positional
+argument (`Array<u32>`, length 2, `[is_buckets, target_border_idx]`). There is still **exactly
+one** `ordered_ctr_prefix_kernel::launch` site (`ctr_device.rs:391`).
+
+**5. Test-side: `cpu_ordered_ctr` (`ctr_device_test.rs:69`) gained
+`is_buckets: bool, target_border_idx: usize`**; all 5 pre-existing call sites pass `(false, 0)`,
+which reduces to the previous `good = N1` exactly. It is deliberately kept in
+`online_class_prefix`'s **generic loop-over-classes** form while the kernel implements the
+2-class collapse — that asymmetry is what makes the oracle a cross-check rather than a copy.
+`compute_ordered_ctr_host` kept its old signature and delegates to the new
+`compute_ordered_ctr_host_mode` (`:496`), so the 4 pre-existing device oracle call sites are
+source-unchanged.
+
+**6. Kernel-style note for T11/T14 (cost-free, avoids a warning):** writing the CubeCL
+`let mut x = <default>;` + `if`/`else` pattern with an explicit assignment in *every* arm makes
+the initializer dead and emits `warning: value assigned to 'x' is never read`. Leaving the
+"unreachable/pinned" case to the initializer (and documenting it in a comment) keeps the manual's
+pattern and the build warning-free. T08 did this for `Borders@1`.
+
+**D-04 held at T08:** `device_ctr_fit_test` `max |Δpred| = 4.483e-11`, unchanged; 23/23 device
+PASS; `cb-backend --lib` under rocm `263 passed / 0 failed`.
+
+**Pre-existing clippy failure to add to T24's list (cb-BACKEND, not cb-train):**
+`cargo clippy -p cb-backend --no-default-features --features rocm --lib --tests` fails with
+`error: this operation will always return zero` (`clippy::erasing_op`) at
+`crates/cb-backend/src/kernels/score_split.rs:374` — `cindex[0 * n + obj] = bin;`. Verified
+pre-existing at `HEAD` via `git show HEAD:…/score_split.rs | sed -n '374p'`. `cargo test` and
+`cargo check` are unaffected. Do not fix inside another task.

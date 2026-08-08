@@ -126,17 +126,47 @@ pub(crate) fn combine_projection_bins(
 /// its binclf class in `{0, 1}`; `prior` the additive CTR prior numerator (length-1). `counts` is
 /// the resident per-bucket `[N0, N1]` scratch (length `2 * bucket_count`, PRE-ZEROED by the host).
 ///
-/// Per position: read the bucket's `(N0, N1)` BEFORE incrementing → `good = N1`,
-/// `total = N0 + N1`, `value[doc] = (good + prior) / (total + 1)`, then `++counts[2*bucket+class]`.
+/// Per position: read the bucket's `(N0, N1)` BEFORE incrementing → `total = N0 + N1`, `good` per
+/// `mode` (below), `value[doc] = (good + prior) / (total + 1)`, then `++counts[2*bucket+class]`.
 /// Outputs are OBJECT order (indexed by `doc`): `good`/`total` are exact integer counts (u32),
 /// `value` is f64. No float reduction (integer counting is exact — Pattern C not needed here); no
 /// `-inf` (Pattern D); every index derives from a bounds-validated host bucket count.
+///
+/// # `mode = [is_buckets, target_border_idx]` — the numerator selector (DCTR-06)
+///
+/// A length-2 `u32` runtime array, both elements HOST-VALIDATED by
+/// [`launch_ordered_ctr_resident`]. Only the NUMERATOR varies with the CTR type; the denominator
+/// is the bucket total in every mode. The generic rule is `online_class_prefix`
+/// (`cb-train/src/ctr/online.rs:552-569`), itself the single-border collapse of upstream
+/// `UpdateGoodCount` (`online_ctr.cpp:115-121`,
+/// `if (ctrType == Buckets) *goodCount = curCount; else *goodCount -= curCount;` applied
+/// cumulatively from `goodCount = Total`):
+///
+/// ```text
+/// Buckets    -> N[b]
+/// everything -> Total - Σ_{c ≤ b} N[c]
+/// ```
+///
+/// **This kernel implements the explicit 2-class collapse**, valid because the simple ordered CTR
+/// is binclf: `SIMPLE_CLASSES_COUNT == 2` (`cb-train/src/ctr/online.rs:52`), so the prefix is
+/// exactly `[N0, N1]` and `Total = N0 + N1`:
+///
+/// | mode | `good` |
+/// |---|---|
+/// | `Buckets @ b = 0` | `N0` |
+/// | `Buckets @ b = 1` | `N1` |
+/// | `Borders @ b = 0` | `Total - N0 == N1` (the historical hard-coded value) |
+/// | `Borders @ b = 1` | `0` — UNREACHABLE, pinned (see the body) |
+///
+/// A multiclass ordered CTR would need the generic loop instead; it is out of this seam's scope
+/// (the host guard rejects `target_border_idx > 1`).
 #[cube(launch)]
 fn ordered_ctr_prefix_kernel(
     perm: &Array<u32>,
     bins: &Array<u32>,
     class: &Array<u32>,
     prior: &Array<f64>,
+    mode: &Array<u32>,
     counts: &mut Array<u32>,
     good: &mut Array<u32>,
     total: &mut Array<u32>,
@@ -144,6 +174,8 @@ fn ordered_ctr_prefix_kernel(
 ) {
     if ABSOLUTE_POS == 0 {
         let pr = prior[0];
+        let is_buckets = mode[0];
+        let b = mode[1];
         let n = perm.len();
         let mut p = 0usize;
         while p < n {
@@ -153,8 +185,27 @@ fn ordered_ctr_prefix_kernel(
             // READ the prefix counts BEFORE incrementing (online_ctr.cpp:303-304).
             let n0 = counts[base];
             let n1 = counts[base + 1usize];
-            let g = n1;
             let t = n0 + n1;
+            // DCTR-06 numerator selection — the SIMPLE_CLASSES_COUNT == 2 collapse of
+            // `online_class_prefix` (see this function's doc comment). `if`/`else` STATEMENTS
+            // with a defaulted `let mut` (CubeCL conditionals manual: never an `if` EXPRESSION).
+            // The scan is serial on unit 0, so the per-iteration branch costs nothing and
+            // divergence is not a concern.
+            let mut g = 0u32;
+            if is_buckets == 1u32 {
+                if b == 0u32 {
+                    g = n0;
+                } else {
+                    g = n1;
+                }
+            } else if b == 0u32 {
+                g = t - n0;
+            }
+            // The remaining case is Borders@1, which is UNREACHABLE
+            // (`target_border_count(Borders, 2) == 1`, `ctr_helper.h:35-42`, and the host guard
+            // never admits it). It is PINNED to the arithmetic value `Total - (N0 + N1) == 0`
+            // rather than left undefined — carried by the `let mut g = 0u32` default above, so no
+            // arm re-assigns a value that is never read.
             good[doc] = g;
             total[doc] = t;
             value[doc] = (f64::cast_from(g) + pr) / (f64::cast_from(t) + 1.0);
@@ -218,15 +269,40 @@ pub(crate) struct ResidentCtr {
     pub value: Handle,
 }
 
+/// `cb_train::ctr::ECtrType::Borders` — the i8 discriminant, transcribed BY VALUE (Pattern B /
+/// C-3: `cb-backend` must never gain a `cb-train` dep). The full upstream list is
+/// `0 Borders, 1 Buckets, 2 BinarizedTargetMeanValue, 3 FloatTargetMeanValue, 4 Counter,
+/// 5 FeatureFreq` (`cb-train/src/ctr/mod.rs:96-108`; upstream `restrictions.h:20-32` limits the
+/// CPU task type to `{Borders, Buckets, BinarizedTargetMeanValue, Counter}`).
+pub(crate) const CTR_TYPE_BORDERS: i8 = 0;
+/// `cb_train::ctr::ECtrType::Buckets` — see [`CTR_TYPE_BORDERS`] for the transcription rationale.
+pub(crate) const CTR_TYPE_BUCKETS: i8 = 1;
+
+/// The largest `target_border_idx` reachable at binclf: `SIMPLE_CLASSES_COUNT == 2`
+/// (`cb-train/src/ctr/online.rs:52`) ⇒ the per-bucket class prefix is `[N0, N1]`, so a selector
+/// above `1` names a class that does not exist.
+const MAX_TARGET_BORDER_IDX: u32 = 1;
+
 /// Accumulate the ordered CTR for one feature/projection ON device, resident across the
 /// permutation (D-06), returning the resident output handles WITHOUT reading them back. `bins` is
 /// the per-object bucket (object order); `perm` the learn permutation; `class` the binclf class;
 /// `bucket_count` the distinct-bucket count (`max(bins) + 1`, host-validated). `client` owns the
 /// scratch + outputs for the whole fit (residency, Pitfall 3). Empty `n` short-circuits.
 ///
+/// # The `(ctr_type, target_border_idx)` numerator selector (DCTR-06)
+///
+/// The denominator (`total`, the bucket total) is the same for every CTR type; only the NUMERATOR
+/// differs. `online_class_prefix` (`cb-train/src/ctr/online.rs:552-569`, the collapse of upstream
+/// `UpdateGoodCount`, `online_ctr.cpp:115-121`) selects it as
+/// `Buckets → N[b]`, everything else → `Total - Σ_{c ≤ b} N[c]`. Both arguments are host-validated
+/// here and crossed into the kernel as the 2-element `mode` array `[is_buckets, target_border_idx]`
+/// — see [`ordered_ctr_prefix_kernel`] for the 2-class collapse it implements.
+/// `(CTR_TYPE_BORDERS, 0)` is the historical behaviour (`good = N1`) and is byte-unchanged.
+///
 /// # Errors
 /// [`CbError::OutOfRange`] on the wgpu f64 path (WR-02); [`CbError::LengthMismatch`] if
-/// `bins`/`class` disagree with `perm`.
+/// `bins`/`class` disagree with `perm`; [`CbError::OutOfRange`] if `ctr_type` is not a class-prefix
+/// type this kernel implements, or `target_border_idx` exceeds the binclf class count.
 #[cfg_attr(feature = "wgpu", allow(unused_variables))]
 pub(crate) fn launch_ordered_ctr_resident(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
@@ -236,7 +312,25 @@ pub(crate) fn launch_ordered_ctr_resident(
     prior: f64,
     bucket_count: usize,
     n: usize,
+    ctr_type: i8,
+    target_border_idx: u32,
 ) -> CbResult<ResidentCtr> {
+    // DCTR-06: validate the numerator selector host-side, mirroring the bin/class guards below.
+    // `Counter` / `BinarizedTargetMeanValue` are NOT class-prefix types (their numerator is not
+    // derivable from one bucket's class counts) and have their own device paths; admitting them
+    // here would silently return the Borders numerator — a WRONG answer, not a worse one.
+    if ctr_type != CTR_TYPE_BORDERS && ctr_type != CTR_TYPE_BUCKETS {
+        return Err(CbError::OutOfRange(format!(
+            "ctr_type {ctr_type} is not a class-prefix CTR type; the ordered prefix kernel \
+             implements only Borders ({CTR_TYPE_BORDERS}) and Buckets ({CTR_TYPE_BUCKETS})"
+        )));
+    }
+    if target_border_idx > MAX_TARGET_BORDER_IDX {
+        return Err(CbError::OutOfRange(format!(
+            "ctr target_border_idx {target_border_idx} > {MAX_TARGET_BORDER_IDX} (binclf has \
+             SIMPLE_CLASSES_COUNT == 2 classes)"
+        )));
+    }
     if bins.len() != n || class.len() != n || perm.len() != n {
         return Err(CbError::LengthMismatch {
             column: "ctr ordered inputs".to_owned(),
@@ -281,6 +375,12 @@ pub(crate) fn launch_ordered_ctr_resident(
         let bins_h = client.create(cubecl::bytes::Bytes::from_elems(bins.to_vec()));
         let class_h = client.create(cubecl::bytes::Bytes::from_elems(class.to_vec()));
         let prior_h = client.create(cubecl::bytes::Bytes::from_elems(vec![prior]));
+        // DCTR-06 `mode = [is_buckets, target_border_idx]` (both host-validated above).
+        let is_buckets = u32::from(ctr_type == CTR_TYPE_BUCKETS);
+        let mode_h = client.create(cubecl::bytes::Bytes::from_elems(vec![
+            is_buckets,
+            target_border_idx,
+        ]));
         let good_h = client.empty(n * std::mem::size_of::<u32>());
         let total_h = client.empty(n * std::mem::size_of::<u32>());
         let value_h = client.empty(n * std::mem::size_of::<f64>());
@@ -296,6 +396,7 @@ pub(crate) fn launch_ordered_ctr_resident(
             unsafe { ArrayArg::from_raw_parts(bins_h, n) },
             unsafe { ArrayArg::from_raw_parts(class_h, n) },
             unsafe { ArrayArg::from_raw_parts(prior_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(mode_h, 2) },
             unsafe { ArrayArg::from_raw_parts(counts_h, scratch_len) },
             unsafe { ArrayArg::from_raw_parts(good_h.clone(), n) },
             unsafe { ArrayArg::from_raw_parts(total_h.clone(), n) },
@@ -363,6 +464,9 @@ pub(crate) fn binarize_ctr_column_resident(
 ///
 /// Returns `(good, total, value)` in object order; `good`/`total` are widened to `i64` to match
 /// the CPU reference's integer prefix schema.
+///
+/// Fixed at the historical `(Borders, target_border_idx = 0)` numerator; DCTR-06's
+/// [`compute_ordered_ctr_host_mode`] is the seam that exercises the other reachable modes.
 #[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
 pub(crate) fn compute_ordered_ctr_host(
     perm: &[u32],
@@ -371,13 +475,50 @@ pub(crate) fn compute_ordered_ctr_host(
     prior: f64,
     bucket_count: usize,
 ) -> CbResult<(Vec<i64>, Vec<i64>, Vec<f64>)> {
+    compute_ordered_ctr_host_mode(
+        perm,
+        bins,
+        class,
+        prior,
+        bucket_count,
+        CTR_TYPE_BORDERS,
+        0,
+    )
+}
+
+/// DCTR-06: [`compute_ordered_ctr_host`] with the `(ctr_type, target_border_idx)` numerator
+/// selector exposed, so the self-oracle can drive every mode reachable at binclf —
+/// `(Borders, 0)`, `(Buckets, 0)`, `(Buckets, 1)` — against `online_class_prefix`.
+///
+/// # Errors
+/// As [`launch_ordered_ctr_resident`] (including the host-validated selector range).
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+pub(crate) fn compute_ordered_ctr_host_mode(
+    perm: &[u32],
+    bins: &[u32],
+    class: &[u32],
+    prior: f64,
+    bucket_count: usize,
+    ctr_type: i8,
+    target_border_idx: u32,
+) -> CbResult<(Vec<i64>, Vec<i64>, Vec<f64>)> {
     let n = perm.len();
     if n == 0 {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
-    let res = launch_ordered_ctr_resident(&client, perm, bins, class, prior, bucket_count, n)?;
+    let res = launch_ordered_ctr_resident(
+        &client,
+        perm,
+        bins,
+        class,
+        prior,
+        bucket_count,
+        n,
+        ctr_type,
+        target_border_idx,
+    )?;
     let good_b = client
         .read_one(res.good)
         .map_err(|e| CbError::Degenerate(format!("CubeCL CTR good read-back failed: {e:?}")))?;
@@ -419,7 +560,17 @@ pub(crate) fn binarize_ctr_column_host(
     }
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
-    let res = launch_ordered_ctr_resident(&client, perm, bins, class, prior, bucket_count, n)?;
+    let res = launch_ordered_ctr_resident(
+        &client,
+        perm,
+        bins,
+        class,
+        prior,
+        bucket_count,
+        n,
+        CTR_TYPE_BORDERS,
+        0,
+    )?;
     let bins_h = binarize_ctr_column_resident(&client, &res.value, borders, n)?;
     let bytes = client
         .read_one(bins_h)

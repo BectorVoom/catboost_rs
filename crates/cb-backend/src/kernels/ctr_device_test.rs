@@ -17,7 +17,14 @@
 
 use crate::kernels::ctr_device::{
     binarize_ctr_column_host, combine_projection_bins, compute_ordered_ctr_host,
+    compute_ordered_ctr_host_mode,
 };
+
+/// `cb_train::ctr::ECtrType::Borders` discriminant (`cb-train/src/ctr/mod.rs:96-108`),
+/// transcribed by value — cb-backend must never gain a `cb-train` dep (Pattern B / C-3).
+const CTR_TYPE_BORDERS: i8 = 0;
+/// `cb_train::ctr::ECtrType::Buckets` discriminant (`cb-train/src/ctr/mod.rs:96-108`).
+const CTR_TYPE_BUCKETS: i8 = 1;
 
 /// The ε=1e-4 device-vs-CPU bar (D-07; the GPU bar, looser than the CPU ref's own ≤1e-5).
 const TOL: f64 = 1e-4;
@@ -52,11 +59,20 @@ fn synth_fixture(n: usize, cardinality: u32, seed: u32) -> (Vec<u32>, Vec<u32>, 
 /// The FROZEN CPU ordered CTR reference: an inline serial transcription of
 /// `online_ctr_prefix_binclf` (read-before-increment, object order) + `calc_ctr_online`
 /// (`(good + prior) / (total + 1)`). Returns `(good, total, value)` in OBJECT order.
+///
+/// DCTR-06: the per-bucket NUMERATOR is selected by `(is_buckets, target_border_idx)` through an
+/// inline transcription of `cb_train::ctr::online::online_class_prefix` (`online.rs:552-569`,
+/// upstream `UpdateGoodCount`, `online_ctr.cpp:115-121`) kept in its GENERIC (loop-over-classes)
+/// form deliberately: the device kernel implements the 2-class COLLAPSE, so comparing the two is a
+/// genuine cross-check rather than a copy of the same arithmetic. `(false, 0)` — Borders at target
+/// border 0 — is the historical behaviour and reduces to `good = N1` exactly.
 fn cpu_ordered_ctr(
     perm: &[u32],
     bins: &[u32],
     class: &[u32],
     prior: f64,
+    is_buckets: bool,
+    target_border_idx: usize,
 ) -> (Vec<i64>, Vec<i64>, Vec<f64>) {
     let n = perm.len();
     let bucket_count = bins.iter().copied().max().map_or(0, |m| m as usize + 1);
@@ -68,10 +84,17 @@ fn cpu_ordered_ctr(
         let doc = doc_i as usize;
         let bucket = bins[doc] as usize;
         // READ before increment (the no-leakage invariant).
-        let n0 = counts[bucket][0];
-        let n1 = counts[bucket][1];
-        let g = n1;
-        let t = n0 + n1;
+        let prefix = counts[bucket];
+        // `online_class_prefix`: total is ALWAYS the bucket total, whatever the CTR type.
+        let t: i64 = prefix.iter().sum();
+        let g = if is_buckets {
+            prefix.get(target_border_idx).copied().unwrap_or(0)
+        } else {
+            let head: i64 = (0..=target_border_idx)
+                .map(|c| prefix.get(c).copied().unwrap_or(0))
+                .sum();
+            t.saturating_sub(head)
+        };
         good[doc] = g;
         total[doc] = t;
         value[doc] = (g as f64 + prior) / (t as f64 + 1.0);
@@ -109,7 +132,7 @@ fn ordered_ts_matches_cpu_reference() {
     let prior = 0.5;
     for &seed in &[1u32, 42, 12345] {
         let (bins, class, perm) = synth_fixture(n, 7, seed);
-        let (cg, ct, cv) = cpu_ordered_ctr(&perm, &bins, &class, prior);
+        let (cg, ct, cv) = cpu_ordered_ctr(&perm, &bins, &class, prior, false, 0);
         let (dg, dt, dv) =
             compute_ordered_ctr_host(&perm, &bins, &class, prior, bucket_count(&bins)).unwrap();
         assert_eq!(dg, cg, "device good count != CPU (seed {seed})");
@@ -162,7 +185,7 @@ fn one_hot_ctr_matches_cpu_reference() {
     let n = 256usize;
     let prior = 1.0;
     let (bins, class, perm) = synth_fixture(n, 3, 9091); // cardinality 3 => one-hot regime
-    let (cg, ct, cv) = cpu_ordered_ctr(&perm, &bins, &class, prior);
+    let (cg, ct, cv) = cpu_ordered_ctr(&perm, &bins, &class, prior, false, 0);
     let (dg, dt, dv) =
         compute_ordered_ctr_host(&perm, &bins, &class, prior, bucket_count(&bins)).unwrap();
     assert_eq!(dg, cg, "one-hot device good != CPU");
@@ -198,7 +221,7 @@ fn tensor_combination_ctr_matches_cpu_reference() {
     }
     assert!(buckets <= 4 * 3, "combined buckets bounded by the cartesian product");
 
-    let (cg, ct, cv) = cpu_ordered_ctr(&perm, &combined, &class, prior);
+    let (cg, ct, cv) = cpu_ordered_ctr(&perm, &combined, &class, prior, false, 0);
     let (dg, dt, dv) = compute_ordered_ctr_host(&perm, &combined, &class, prior, buckets).unwrap();
     assert_eq!(dg, cg, "tensor device good != CPU");
     assert_eq!(dt, ct, "tensor device total != CPU");
@@ -222,7 +245,7 @@ fn ctr_binarized_cindex_column_bit_exact() {
     let borders = vec![0.2_f64, 0.4, 0.5, 0.6, 0.8];
 
     // Host reference: CPU CTR column, then binarize each value against the borders.
-    let (_cg, _ct, cv) = cpu_ordered_ctr(&perm, &bins, &class, prior);
+    let (_cg, _ct, cv) = cpu_ordered_ctr(&perm, &bins, &class, prior, false, 0);
     let host_cindex: Vec<u32> = cv
         .iter()
         .map(|&v| borders.iter().filter(|&&b| v > b).count() as u32)
@@ -272,7 +295,7 @@ fn ctr_averaging_permutation_column_bit_exact() {
     let borders = vec![0.2_f64, 0.4, 0.5, 0.6, 0.8];
 
     // Host reference: the CPU ordered CTR under the AVERAGING order, binarized.
-    let (_ag, _at, av) = cpu_ordered_ctr(&averaging_perm, &bins, &class, prior);
+    let (_ag, _at, av) = cpu_ordered_ctr(&averaging_perm, &bins, &class, prior, false, 0);
     let host_avg_cindex: Vec<u32> = av
         .iter()
         .map(|&v| borders.iter().filter(|&&b| v > b).count() as u32)
@@ -298,5 +321,104 @@ fn ctr_averaging_permutation_column_bit_exact() {
         dev_avg_cindex, dev_structure_cindex,
         "the averaging and structure materializations coincide on this fixture — it \
          cannot discriminate a structure-only leaf-gather bug (pick another order)"
+    );
+}
+
+#[test]
+fn buckets_numerator_matches_cpu_reference() {
+    // DCTR-06 (T08): the ordered prefix kernel's per-bucket NUMERATOR is now selected by
+    // `(ctr_type, target_border_idx)` instead of being hard-coded to `N1`. For every
+    // (ctr_type, target_border_idx) pair reachable at binclf — `(Borders, 0)`, `(Buckets, 0)`,
+    // `(Buckets, 1)` — the device `good`/`total` must be INTEGER-EQUAL to the
+    // `online_class_prefix` reference (`cb-train/src/ctr/online.rs:552-569`), transcribed inline
+    // above in its generic loop-over-classes form. `total` is the bucket total in every mode.
+    if !device_ctr_active() {
+        eprintln!("SKIP buckets_numerator_matches_cpu_reference: wgpu has no f64 CTR seam (WR-01)");
+        return;
+    }
+    let n = 128usize;
+    let prior = 0.5;
+    let (bins, class, perm) = synth_fixture(n, 5, 7);
+    let buckets = bucket_count(&bins);
+
+    let modes: [(i8, u32, &str); 3] = [
+        (CTR_TYPE_BORDERS, 0, "Borders@0"),
+        (CTR_TYPE_BUCKETS, 0, "Buckets@0"),
+        (CTR_TYPE_BUCKETS, 1, "Buckets@1"),
+    ];
+    let mut goods: Vec<Vec<i64>> = Vec::new();
+    for &(ctr_type, target_border_idx, label) in &modes {
+        let (cg, ct, cv) = cpu_ordered_ctr(
+            &perm,
+            &bins,
+            &class,
+            prior,
+            ctr_type == CTR_TYPE_BUCKETS,
+            target_border_idx as usize,
+        );
+        let (dg, dt, dv) = compute_ordered_ctr_host_mode(
+            &perm,
+            &bins,
+            &class,
+            prior,
+            buckets,
+            ctr_type,
+            target_border_idx,
+        )
+        .unwrap();
+        assert_eq!(dg, cg, "device good != online_class_prefix ({label})");
+        assert_eq!(dt, ct, "device total != bucket total ({label})");
+        let div = max_divergence(&dv, &cv);
+        assert!(div <= TOL, "CTR value divergence {div} > {TOL} ({label})");
+        goods.push(dg);
+    }
+
+    // NON-VACUITY GUARD (mandatory): on a fixture where every bucket were singleton the three
+    // modes would all read `good = 0` and the assertions above would pass trivially. Buckets@0
+    // reads N0 where Borders@0 reads N1, so the two vectors MUST differ somewhere.
+    assert_ne!(
+        goods.first(),
+        goods.get(1),
+        "Buckets@0 and Borders@0 coincide on this fixture — it cannot discriminate the \
+         numerator selection (pick another fixture)"
+    );
+    // Collapse identity at SIMPLE_CLASSES_COUNT == 2 (`cb-train/src/ctr/online.rs:52`):
+    // Buckets@1 selects N[1] and Borders@0 selects Total - N[0] == N[1]. Documented, not
+    // load-bearing — the per-mode equalities above are what pin the behaviour.
+    assert_eq!(
+        goods.first(),
+        goods.get(2),
+        "at binclf Buckets@1 and Borders@0 must both select N1"
+    );
+}
+
+#[test]
+fn out_of_range_ctr_mode_is_rejected() {
+    // DCTR-06 (T08): the numerator selector is host-validated BEFORE dispatch, exactly like the
+    // pre-existing bin/class range guards. A `target_border_idx > 1` at binclf, or a CTR type this
+    // class-prefix kernel does not implement, must surface a typed `CbError::OutOfRange` — never a
+    // silent fallback onto the `b = 0` numerator (which would be a WRONG answer, not a worse one).
+    if !device_ctr_active() {
+        eprintln!("SKIP out_of_range_ctr_mode_is_rejected: wgpu has no f64 CTR seam (WR-01)");
+        return;
+    }
+    let n = 32usize;
+    let (bins, class, perm) = synth_fixture(n, 4, 11);
+    let buckets = bucket_count(&bins);
+
+    let too_big = compute_ordered_ctr_host_mode(
+        &perm, &bins, &class, 0.5, buckets, CTR_TYPE_BUCKETS, 2,
+    );
+    assert!(
+        matches!(too_big, Err(cb_core::CbError::OutOfRange(_))),
+        "target_border_idx = 2 must be rejected at binclf, got {too_big:?}"
+    );
+
+    // `ECtrType::Counter` (4) is not a class-prefix type — `online_counter_column` owns it.
+    let wrong_type =
+        compute_ordered_ctr_host_mode(&perm, &bins, &class, 0.5, buckets, 4, 0);
+    assert!(
+        matches!(wrong_type, Err(cb_core::CbError::OutOfRange(_))),
+        "a non-class-prefix ctr_type must be rejected, got {wrong_type:?}"
     );
 }
