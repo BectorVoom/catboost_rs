@@ -1125,6 +1125,42 @@ pub struct DeviceCtrColumn {
     /// candidate on (upstream's model-lifetime `ProcessCtrSplit` insert plus the
     /// within-tree lift).
     pub weight_group: u32,
+    /// DCTR-01: the CTR TYPE this column was materialized for, as the `cb_train::ctr::ECtrType`
+    /// i8 discriminant — `0 Borders, 1 Buckets, 2 BinarizedTargetMeanValue,
+    /// 3 FloatTargetMeanValue, 4 Counter, 5 FeatureFreq` (upstream `ECtrType`; the CPU task
+    /// type admits only `{Borders, Buckets, BinarizedTargetMeanValue, Counter}`,
+    /// `restrictions.h:20-32`). Transcribed BY VALUE rather than imported: `cb-compute` is the
+    /// backend-agnostic seam and must never depend on `cb-train` (T-10-04).
+    pub ctr_type: i8,
+    /// DCTR-01: the Buckets per-class NUMERATOR selector (`GetTargetBorderCount`,
+    /// `ctr_helper.h:35-42`). Only `ECtrType::Buckets` ever produces a value `> 0`; every
+    /// other type carries `0`. A silently-defaulted `0` on a Buckets column would select the
+    /// wrong numerator (a wrong answer, not a worse one), so the host builder converts from
+    /// its `usize` source with a checked conversion, never `unwrap_or(0)`.
+    pub target_border_idx: u32,
+    /// DCTR-01: the owning projection's cat-feature id set, SORTED and de-duplicated
+    /// (`TProjection::cat_features` is sorted by construction, so no re-sort happens on the
+    /// way here). `len() >= 1` — an empty projection is rejected at the host builder.
+    ///
+    /// Read by the per-level combination-eligibility gate (T17), which mirrors upstream
+    /// `AddTreeCtrs`' `seenProj` subset rule (`greedy_tensor_search.cpp:491-551`): a
+    /// combination candidate is eligible at a level only if its member set is a superset of
+    /// an already-chosen projection of the current tree, and a `baseProj.IsEmpty()` base is
+    /// skipped — which is why no combination CTR candidate exists at level 0 of any tree.
+    ///
+    /// # ⚠ IDENTIFIER-SPACE WARNING — not index-compatible with `member_bins`
+    ///
+    /// These are **ABSOLUTE** cat-feature indices (straight from
+    /// `TProjection::cat_features()`), whereas the sibling [`Self::member_bins`] is ordered by
+    /// **CTR-ELIGIBLE POSITION** — the host builder resolves each absolute id through
+    /// `eligible_absolute.iter().position(..)` before taking a bucket column
+    /// (`cb-train/src/boosting.rs:2487-2500`). The two fields therefore live in DIFFERENT
+    /// index spaces on the SAME struct: `projection_members[k]` must never be used to index
+    /// `member_bins`, nor compared against a bin index. This is safe only because the
+    /// eligibility predicate compares `projection_members` against other
+    /// `projection_members` and never against anything in bin space. Any new consumer that
+    /// needs the eligible position must re-resolve it.
+    pub projection_members: Vec<u32>,
 }
 
 /// The device CTR (categorical target statistics) config (Phase 12 Plan 08, GPUT-10). A PLAIN

@@ -1,5 +1,29 @@
 //! Unit tests for the CTR-value quantizers ([`crate::ctr::calc_ctr`]) — the
 //! online (`+1`) vs inference (`+PriorDenom`) distinction (Pitfall 1).
+//!
+//! # DCTR-05 — the no-op proof for DCTR-04 (Track E)
+//!
+//! [`calc_normalization_is_identity_for_every_repo_prior`] is **DCTR-05's
+//! characterization proof that DCTR-04 is inert for every committed artifact**.
+//! DCTR-04 corrects the CPU `BinarizedTargetMeanValue` quantizer to apply
+//! `(ctr + shift) / norm` (`CalcCTR`, `online_ctr.h:128-131`) instead of the raw
+//! `ctr`. That correction can only change a binned value when
+//! `(shift, norm) != (0.0, 1.0)`, i.e. when the prior falls outside `[0, 1]`
+//! (`calc_normalization`: `left = min(0, p)`, `right = max(1, p)` ⇒
+//! `p ∈ [0,1] ⇒ shift = 0, norm = 1`).
+//!
+//! Every prior this repository can produce is inside `[0, 1]`: the fixture
+//! `config.json`s carry only `Prior=0`, `Prior=0.25`, `Prior=0.5` and `Prior=1`,
+//! and the Rust callers construct only `priors: vec![0.25]` / `priors: vec![0.5]`.
+//! The test below pins `calc_normalization(p) == (0.0, 1.0)` for that exact set,
+//! so DCTR-04 is provably a no-op on every committed artifact and **no fixture is
+//! re-baselined** — in particular `ctr_btmv_simple_oracle_test` must stay green
+//! unchanged across DCTR-04.
+//!
+//! The two out-of-range companions (`p = 2.0`, `p = -0.5`) scope the claim: the
+//! identity holds *because* the repo's priors are in `[0, 1]`, not because
+//! `calc_normalization` is the identity everywhere — which is precisely why
+//! DCTR-04 is a real correction rather than a cosmetic one.
 
 use crate::ctr::calc_ctr::{
     calc_ctr_inference, calc_ctr_online, calc_ctr_online_bin, calc_normalization, Prior,
@@ -62,6 +86,32 @@ fn normalization_matches_calc_normalization_formula() {
     let (shift, norm) = calc_normalization(1.5);
     assert!((shift - 0.0).abs() < 1e-9);
     assert!((norm - 1.5).abs() < 1e-9);
+}
+
+/// DCTR-05 — Track E is inert for every committed artifact.
+///
+/// `calc_normalization(p) == (0.0, 1.0)` for every prior reachable in this
+/// repository (`{0, 0.25, 0.5, 1}`, all in `[0, 1]`), asserted as exact equality
+/// — not within an epsilon — because the whole point is that DCTR-04's
+/// `(ctr + shift) / norm` introduces *literally zero* arithmetic here. See this
+/// module's header for the full argument.
+#[test]
+fn calc_normalization_is_identity_for_every_repo_prior() {
+    // The complete set of priors this repository can produce: the fixture
+    // `config.json`s (`Prior=0`, `Prior=0.25`, `Prior=0.5`, `Prior=1`) and the
+    // Rust callers (`priors: vec![0.25]`, `priors: vec![0.5]`).
+    for &prior in &[0.0_f64, 0.25, 0.5, 1.0] {
+        assert_eq!(
+            calc_normalization(prior),
+            (0.0, 1.0),
+            "prior {prior} is in [0,1] and must normalize to the identity \
+             (shift 0, norm 1), making DCTR-04 a no-op for it"
+        );
+    }
+    // Out-of-`[0,1]` companions — pinned so the identity claim above is scoped to
+    // the repo's priors rather than mistaken for a property of the function.
+    assert_eq!(calc_normalization(2.0), (0.0, 2.0));
+    assert_eq!(calc_normalization(-0.5), (0.5, 1.5));
 }
 
 #[test]

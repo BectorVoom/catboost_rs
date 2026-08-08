@@ -2516,12 +2516,55 @@ fn build_device_ctr_config(
                         group_keys.len() - 1
                     }
                 };
+                // DCTR-01 (T02): carry the column's CTR IDENTITY across the seam alongside
+                // its bins. `target_border_idx` is `usize` here and `u32` on the seam; the
+                // conversion is CHECKED because a silent `unwrap_or(0)` would map an
+                // out-of-range Buckets numerator selector onto the `b = 0` numerator — a
+                // wrong answer rather than a degraded one.
+                let target_border_idx = u32::try_from(col.target_border_idx).map_err(|_| {
+                    CbError::OutOfRange(format!(
+                        "device CTR target border index {} does not fit u32",
+                        col.target_border_idx
+                    ))
+                })?;
+                // NOT re-sorted: `TProjection` keeps `cat_features` sorted and de-duplicated
+                // by construction (`projection.rs:121-126` `from_features`, `:111-115`
+                // `single`), which is the same order `combined_hash` folds in. Re-sorting
+                // here would be dead work and would hide a future ordering regression in the
+                // projection type itself.
+                //
+                // These are ABSOLUTE cat-feature indices, NOT the CTR-eligible positions the
+                // sibling `member_bins` above is ordered by — see the identifier-space
+                // warning on `DeviceCtrColumn::projection_members`.
+                let projection_members = col
+                    .projection
+                    .cat_features()
+                    .iter()
+                    .map(|&m| {
+                        u32::try_from(m).map_err(|_| {
+                            CbError::OutOfRange(format!(
+                                "device CTR projection member {m} does not fit u32"
+                            ))
+                        })
+                    })
+                    .collect::<CbResult<Vec<u32>>>()?;
+                // Mirrors the empty-projection rejection above: an empty member list would
+                // make the per-level combination-eligibility gate (T17) treat a combination
+                // as simple.
+                if projection_members.is_empty() {
+                    return Err(CbError::Degenerate(
+                        "device CTR column with an empty projection member list".to_owned(),
+                    ));
+                }
                 Ok(cb_compute::DeviceCtrColumn {
                     member_bins: members,
                     prior,
                     borders,
                     bucket_count: col.bucket_count,
                     weight_group: u32::try_from(group).unwrap_or(u32::MAX),
+                    ctr_type: col.ctr_type,
+                    target_border_idx,
+                    projection_members,
                 })
             })
             .collect()

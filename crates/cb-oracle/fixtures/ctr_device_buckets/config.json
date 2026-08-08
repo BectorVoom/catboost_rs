@@ -1,0 +1,91 @@
+{
+  "scenario": "ctr_device_buckets",
+  "requirement": "DCTR-08",
+  "data_seed": 1,
+  "escalation_rung": 0,
+  "escalation_rung_reason": "pinned starting point",
+  "seed_search": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "escalation_attempts": [
+    {
+      "rung": 0,
+      "why": "pinned starting point",
+      "seeds_tried": [
+        0,
+        1
+      ]
+    }
+  ],
+  "catboost_version": "1.2.10",
+  "thread_count": 1,
+  "n_rows": 64,
+  "n_float": 2,
+  "cardinalities": [
+    6
+  ],
+  "observed_target_border_idxs": [
+    0,
+    1
+  ],
+  "overflow_margin": "n*max(w)*max(|der1|) <= 64*1.0*1.0 = 64 << 2^33 ~= 8.6e9 (margin > 1.3e8x) \u2014 Logloss der1 is bounded by 1 in magnitude",
+  "description": "Buckets-CTR device-parity fixture (DCTR-08). 64 rows, two float columns (border_count=15, FULL border set frozen as borders.npy) plus small-cardinality cat column(s) routed to CTR (one_hot_max_size=1), with simple_ctr=Buckets:Prior=0.5, combinations_ctr=[] and max_ctr_complexity=1 so only SIMPLE Buckets columns can form. The float columns are mandatory: a cat-only pool can never reach the device. The committed model carries Buckets splits at BOTH target_border_idx 0 and 1 (asserted), which is the only thing in the phase that exercises the device Buckets@1 numerator (good = counts[1], SPEC 4.2). NEVER regenerated in CI.",
+  "params": {
+    "loss_function": "Logloss",
+    "iterations": 5,
+    "depth": 2,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "border_count": 15,
+    "boosting_type": "Plain",
+    "one_hot_max_size": 1,
+    "max_ctr_complexity": 1,
+    "simple_ctr": [
+      "Buckets:Prior=0.5"
+    ],
+    "combinations_ctr": [],
+    "permutation_count": 1,
+    "fold_len_multiplier": 2.0,
+    "counter_calc_method": "SkipTest",
+    "leaf_estimation_method": "Gradient",
+    "leaf_estimation_iterations": 1,
+    "bootstrap_type": "No",
+    "random_strength": 0,
+    "score_function": "L2",
+    "boost_from_average": false,
+    "random_seed": 0,
+    "thread_count": 1,
+    "verbose": false
+  },
+  "npy_schema": {
+    "borders.npy": "[2,15] f64 \u2014 FULL frozen float border set (feed to train_cat)",
+    "X.npy": "[N,2] f32 \u2014 float feature matrix",
+    "X_cat.npy": "[N] int32 \u2014 categorical codes (stringified A4 form on the Rust side)",
+    "y.npy": "[N] f64 \u2014 binclf label",
+    "predictions.npy": "[N] f64 \u2014 RawFormulaVal (<=1e-5 gate)"
+  },
+  "note": "FROZEN. Generated once by this directory's own gen_fixtures.py and NEVER regenerated in CI. CatBoost quantization is run-to-run nondeterministic on categorical routing; regenerating invalidates the <=1e-5 gate."
+}
