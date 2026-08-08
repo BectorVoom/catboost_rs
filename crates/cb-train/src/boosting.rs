@@ -2347,9 +2347,29 @@ fn ctr_splits_for_tree(
 /// this is exactly the ordering discipline that made the gap visible.
 ///
 /// Everything else — Buckets / BinarizedTargetMeanValue / Counter (Track U), multi-target-
-/// border Buckets columns, non-unit prior denominators — still declines to the
-/// byte-unchanged CPU path (D-04): the device kernels do not implement those accumulation
-/// semantics, and a wrong device leaf is worse than a CPU fallback.
+/// border Buckets columns — still declines to the byte-unchanged CPU path (D-04): the
+/// device kernels do not implement those accumulation semantics, and a wrong device leaf is
+/// worse than a CPU fallback.
+///
+/// # There is NO prior-denominator conjunct, deliberately (DCTR-02, T01)
+///
+/// This predicate used to carry a fourth conjunct, `col.prior_denom == 1.0`. It was deleted
+/// as provably dead, not relaxed: upstream forbids a non-unit CTR prior denominator on the
+/// CPU task type outright — `catboost/private/libs/algo/ctr_helper.cpp:50` (v1.2.10),
+/// `CB_ENSURE(denom == 1.0f, "Error: CPU could use only 1 as denom for ctrs currently")` —
+/// so a non-unit denominator has **no parity surface to gain or lose**. This crate mirrors
+/// that: the denominator is never a fit parameter, it is the constant [`CTR_PRIOR_DENOM`],
+/// passed bare at the single production materialization call site (in
+/// [`materialize_ctr_columns_for_perm`]); [`ctr_splits_for_tree`]'s `!has_ctr` fallback
+/// hard-codes the same `1.0`. A column with `prior_denom != 1.0` is therefore unreachable
+/// from any real fit, the conjunct could never fire, and removing it cannot move any fit's
+/// routing.
+///
+/// That structural argument — not the routing table — is what makes the deletion safe, so
+/// it is pinned executably by
+/// `boosting_ctr_gate_tests::ctr_prior_denom_is_structurally_unit`. **If
+/// [`CTR_PRIOR_DENOM`] ever becomes non-unit or fit-dependent, that test fails and this
+/// conjunct must be RESTORED here before the change lands.**
 ///
 /// An EMPTY column set returns `false` (the caller's `is_empty()` arm owns that).
 fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
@@ -2361,7 +2381,6 @@ fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
             col.projection.is_simple()
                 && col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
                 && col.target_border_idx == 0
-                && col.prior_denom == 1.0
         })
 }
 
@@ -7449,3 +7468,7 @@ mod device_exact_leaf_config_tests;
 #[cfg(test)]
 #[path = "device_ctr_combo_config_test.rs"]
 mod device_ctr_combo_config_tests;
+
+#[cfg(test)]
+#[path = "boosting_ctr_gate_test.rs"]
+mod boosting_ctr_gate_tests;

@@ -49,6 +49,9 @@ mod calc_ctr_test;
 #[path = "final_ctr_test.rs"]
 mod final_ctr_test;
 #[cfg(test)]
+#[path = "ctr_feature_test.rs"]
+mod ctr_feature_test;
+#[cfg(test)]
 #[path = "mod_test.rs"]
 mod mod_test;
 

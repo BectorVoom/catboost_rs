@@ -81,6 +81,65 @@ DCTR-01 byte identity held: `device_ctr_fit_test` `max |Δpred| = 4.483e-11` bef
 after T02. That is the number later device tasks should expect to stay put unless they
 intentionally move it.
 
+## From T01 → **T10, T12, T16, T19, T22, T23** (the gate covering-test home)
+
+T01 created `crates/cb-train/src/boosting_ctr_gate_test.rs`, mounted at the end of
+`boosting.rs`. Its module doc records the **extension contract** every later gate task
+follows: **two tests per conjunct** — a structural pin, plus a `gate_body()`-based
+"the gate no longer reads X" pin — using the reusable `production_source` /
+`code_lines_mentioning` / `gate_body` helpers already in the file. Extend it; do not
+start a new file.
+
+**Fragility to know about**: those helpers work by `include_str!("boosting.rs")` and
+scanning the source text of `ctr_types_are_device_covered`. They are fail-loud on rename.
+**T23 rewrites the gate entirely** (delegating to `ECtrType::from_i8` / `is_cpu_supported`)
+— T23 must therefore update or retire these source-scan pins as part of its own change,
+not leave them asserting against a function shape that no longer exists.
+
+## From T04 → **T14, T15, T16** (Track B — the device BTMV mirror target)
+
+The CPU BTMV quantizer is now (`ctr_feature.rs`, the `quantize_in_f32` arm):
+
+```rust
+let (shift, norm) = crate::ctr::calc_normalization(prior_scalar);   // norm, NOT the denominator
+let denom = (total as f32) + 1.0f32;                                // the CTR denominator
+let ctr   = (good as f32 + prior_scalar as f32) / denom;
+f64::from(((ctr + shift as f32) / norm as f32) * ctr_border_count as f32)
+```
+
+Track B's "device == CPU" claims are now provable against the **corrected** CPU. Two things
+to carry:
+
+1. **`norm` and `denom` are different quantities and they COINCIDE at `count == 1`.** The
+   plan's two-document T04 Red construction reaches `(good = 1.0, total = 1)` as predicted
+   — but at that state `denom == 2.0 == norm`, so it cannot distinguish "divide by
+   `calc_normalization`'s norm" from "divide by the CTR denominator". T04 widened its
+   column to **three** documents (`(sum = 1.0, count = 2)` ⇒ correct bin 7, uncorrected 15,
+   conflated 5) and only then did the mutation fail. **Any device BTMV self-oracle that
+   drives ≤ 2 documents per bucket inherits the same blind spot.** Drive ≥ 3 documents in at
+   least one bucket.
+2. **C-17 was applied as "omit/mark dead", not as a live guard.** The device side must not
+   introduce a `norm == 0.0` branch either — `norm = max(1, p) - min(0, p) >= 1` always.
+
+DCTR-05 held exactly: `ctr_btmv_simple_oracle_test`'s printed output is byte-identical to
+T03's captured baseline across DCTR-04, and **no fixture changed**. `cb-train` as a whole is
+**106 targets, all ok** after the change.
+
+## From T04 → **T24** (pre-existing clippy scope is WIDER than recorded)
+
+The "Pre-existing, out of scope" bullet below names only `device_seam_test.rs`. Measured in
+T04 with `cargo clippy -p cb-train --lib --tests --keep-going`: **12** `cb-train`
+integration-test targets fail the lint gate, not one — `one_hot_draw_accounting_test`,
+`learn_set_shuffle_oracle_test`, `yetirank_pairwise_tree_rng_oracle_test`,
+`tensor_ctr_oracle_test`, `device_fold_count_gate_test`, `permutation_oracle_test`,
+`structure_fold_cycle_oracle_test`, `plain_ctr_oracle_test`, `ordered_ctr_oracle_test`,
+`s_order_ctr_bins_oracle_test`, `device_seam_test`, `ordered_boost_oracle_test`. Same class
+(`panic`/`expect_used`/`indexing_slicing` in committed `tests/*.rs`), same cause,
+`cargo test` unaffected. The **`cb-train` lib / lib-test target itself is clippy-clean**, so
+a task whose work lands in `src/` can still verify itself. Without `--keep-going` clippy
+stops at whichever target compiles first, which is why different tasks report different
+"the" failing file.
+
 ## Environment / process facts for every executor
 
 - Settings live at `planning/settings.json` (**no leading dot**); `implementation.use_worktree`

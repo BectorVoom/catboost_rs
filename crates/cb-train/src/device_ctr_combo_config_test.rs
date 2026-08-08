@@ -194,7 +194,7 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 ///   row 3  simple   Counter      0  1.0  => false   flips_at: T12 (type)
 ///   row 4  simple   Buckets      1  1.0  => false   flips_at: T10 (type + target border)
 ///   row 5  simple   BTMV         0  1.0  => false   flips_at: T16 (type)
-///   row 6  simple   Borders      0  2.0  => false   flips_at: T01 (prior denominator)
+///   row 6  simple   Borders      0  2.0  => true    FLIPPED by T01 (prior denominator)
 ///   row 7  simple   FloatTMV     0  1.0  => false   flips_at: never (no parity surface)
 ///   row 8  simple   FeatureFreq  0  1.0  => false   flips_at: never
 /// ```
@@ -256,8 +256,12 @@ fn gate_state_table() -> Vec<GateRow> {
         GateRow {
             label: "simple/Borders/b=0/denom=2.0",
             column: with_prior_denom(covered_column(simple(), 2), 2.0),
-            expected: false,
-            flips_at: "T01 — deletes `col.prior_denom == 1.0`",
+            expected: true,
+            flips_at: "flipped by T01 — deleted `col.prior_denom == 1.0` (DCTR-02). The \
+                       deletion is a proven no-op: the only production materialization site \
+                       (`boosting.rs:2237`) passes `CTR_PRIOR_DENOM = 1.0`, pinned by \
+                       `boosting_ctr_gate_tests::ctr_prior_denom_is_structurally_unit`, so \
+                       this row is unreachable from any real fit",
         },
         GateRow {
             label: "simple/FloatTMV/b=0/denom=1.0",

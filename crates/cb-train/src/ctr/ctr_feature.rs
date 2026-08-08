@@ -326,10 +326,26 @@ pub fn materialize_ctr_feature(
         let total = denoms.get(i).copied().unwrap_or(0);
         let bin_f = if quantize_in_f32 {
             // Upstream's CalcCTR is all-`float` for the mean types; compute in f32
-            // and widen only at the end (research §A.0 caveat).
-            let norm = (total as f32) + 1.0f32;
-            let ctr = (good as f32 + prior_scalar as f32) / norm;
-            f64::from(ctr * ctr_border_count as f32)
+            // and widen only at the end (research §A.0 caveat). The full upstream
+            // form is `((sum + prior) / (count + 1) + shift) / norm * borderCount`
+            // (`online_ctr.h:128-131`, called from `CalcOnlineCTRMean`,
+            // `online_ctr.cpp:483-489`) — the `(ctr + shift) / norm` half must NOT
+            // be dropped (DCTR-04). It is the identity for every prior in [0, 1]
+            // (DCTR-05), so this is a no-op for every committed artifact.
+            //
+            // NOTE: `denom` below is the CTR DENOMINATOR (the hard `+1` of
+            // `calc_ctr_online`). It is a DIFFERENT quantity from
+            // `calc_normalization`'s `norm` — the two must not be conflated (the
+            // pre-DCTR-04 code named the denominator `norm`, shadowing the name).
+            //
+            // `calc_ctr_online_bin`'s `if norm == 0.0` guard is deliberately NOT
+            // mirrored here: `calc_normalization` returns
+            // `norm = max(1, p) - min(0, p) >= 1` for every `p`, so that guard is
+            // dead code, not a live safety check (PLAN C-17).
+            let (shift, norm) = crate::ctr::calc_normalization(prior_scalar);
+            let denom = (total as f32) + 1.0f32;
+            let ctr = (good as f32 + prior_scalar as f32) / denom;
+            f64::from(((ctr + shift as f32) / norm as f32) * ctr_border_count as f32)
         } else {
             calc_ctr_online_bin(good, total, prior_scalar, ctr_border_count)
         };
