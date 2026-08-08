@@ -272,3 +272,102 @@ fn border_build_matches_comparator_sort_on_adversarial_values() {
         );
     }
 }
+
+/// SPD-03 wave 6: the shared-sample entry (`sample_indices_for_build_borders` +
+/// `select_borders_greedy_logsum_f32_presampled`) must emit byte-identical
+/// borders to the historical per-column draw-order sampling it replaced. The
+/// reference below reproduces that original algorithm verbatim (identity index
+/// array, partial Fisher–Yates, gather in DRAW order, NaN drop) and feeds the
+/// values through the same public pipeline — sorting the draw-order sample is a
+/// no-op for the border set because the pipeline sorts internally. Run on a
+/// NaN-bearing over-cap column so the subset-before-NaN-drop ordering is
+/// exercised.
+#[test]
+fn presampled_borders_match_draw_order_reference() {
+    use crate::borders::{
+        sample_indices_for_build_borders, select_borders_greedy_logsum_f32,
+        select_borders_greedy_logsum_f32_presampled, MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
+    };
+    use cb_core::TFastRng64;
+
+    let n = MAX_SUBSET_SIZE_FOR_BUILD_BORDERS * 2 + 12_345;
+    // Deterministic value mix with ~1% NaNs and duplicated plateaus.
+    let column: Vec<f32> = (0..n)
+        .map(|i| {
+            let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
+            if h % 100 == 0 {
+                f32::NAN
+            } else if h % 7 == 0 {
+                42.5
+            } else {
+                ((h >> 40) as f32 / (1u64 << 24) as f32) * 2.0e3 - 1.0e3
+            }
+        })
+        .collect();
+
+    // Reference: the pre-wave-6 algorithm, byte-for-byte (same RNG stream, same
+    // swap sequence, same gather-then-NaN-drop in draw order).
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut rng = TFastRng64::from_seed(0);
+    let mut reference_values: Vec<f32> = Vec::with_capacity(MAX_SUBSET_SIZE_FOR_BUILD_BORDERS);
+    for i in 0..MAX_SUBSET_SIZE_FOR_BUILD_BORDERS.min(n) {
+        let offset = rng.uniform((n - i) as u64) as usize;
+        indices.swap(i, i + offset);
+        if let Some(&v) = indices.get(i).and_then(|&idx| column.get(idx)) {
+            if !v.is_nan() {
+                reference_values.push(v);
+            }
+        }
+    }
+    // The pipeline sorts internally, so feeding the (sub-cap-length) draw-order
+    // sample straight through the public sub-cap path yields the reference
+    // border set of the historical over-cap path.
+    assert!(reference_values.len() <= MAX_SUBSET_SIZE_FOR_BUILD_BORDERS);
+    let reference_borders = select_borders_greedy_logsum_f32(&reference_values, 31, false);
+
+    // New shared-sample path, and the self-sampling over-cap entry that now
+    // routes through it — all three must agree bit-for-bit.
+    let sample = sample_indices_for_build_borders(n, MAX_SUBSET_SIZE_FOR_BUILD_BORDERS);
+    let presampled_borders =
+        select_borders_greedy_logsum_f32_presampled(&column, &sample, 31, false);
+    let self_sampled_borders = select_borders_greedy_logsum_f32(&column, 31, false);
+
+    assert_eq!(
+        presampled_borders.len(),
+        reference_borders.len(),
+        "border count diverged from the draw-order reference"
+    );
+    for (i, (a, b)) in presampled_borders
+        .iter()
+        .zip(reference_borders.iter())
+        .enumerate()
+    {
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "border {i} diverged: presampled {a:?} vs draw-order reference {b:?}"
+        );
+    }
+    assert_eq!(
+        presampled_borders, self_sampled_borders,
+        "the self-sampling over-cap entry must route through the same sample"
+    );
+}
+
+/// The shared sample draw: sorted ascending, duplicate-free, in range, exactly
+/// `sample_size` long for an over-cap `n`, deterministic across calls, and the
+/// full identity set when `n <= sample_size` (sub-cap degenerates to all rows).
+#[test]
+fn border_sample_indices_are_sorted_unique_and_deterministic() {
+    use crate::borders::sample_indices_for_build_borders;
+    let n = 500_000;
+    let k = 200_000;
+    let a = sample_indices_for_build_borders(n, k);
+    let b = sample_indices_for_build_borders(n, k);
+    assert_eq!(a, b, "fixed-seed draw must be deterministic");
+    assert_eq!(a.len(), k);
+    assert!(a.windows(2).all(|w| w[0] < w[1]), "must be sorted and unique");
+    assert!(a.iter().all(|&i| (i as usize) < n), "indices must be in range");
+
+    let small = sample_indices_for_build_borders(10, 200);
+    assert_eq!(small, (0..10).collect::<Vec<u32>>());
+}

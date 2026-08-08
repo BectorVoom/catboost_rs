@@ -1130,14 +1130,44 @@ impl CatBoostBuilder {
                 .iter()
                 .zip(pool.float_features().iter())
                 .all(|(c, f)| c.len() == f.len());
+        // SPD-03 wave 6: the over-cap border sample is drawn from a FIXED-seed
+        // stream parameterized only by the object count, so every column samples
+        // the SAME index set. Draw it once here (sorted ascending — the gather
+        // becomes a forward streaming read) instead of once per column; the
+        // per-column border set is byte-identical (`_presampled` doc). Columns
+        // at or under the cap keep the full-column path (`None`).
+        let shared_sample: Option<Vec<u32>> = (pool.n_rows()
+            > cb_data::MAX_SUBSET_SIZE_FOR_BUILD_BORDERS)
+            .then(|| {
+                cb_data::sample_indices_for_build_borders(
+                    pool.n_rows(),
+                    cb_data::MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
+                )
+            });
+        let borders_for_col = |col: &[f32]| -> Vec<f64> {
+            match shared_sample.as_deref() {
+                // The shared draw is valid only for full-length columns; the
+                // Pool invariant makes every float column pool.n_rows() long,
+                // and the guard keeps a hypothetical short column correct by
+                // falling back to the self-sampling entry.
+                Some(sample) if col.len() == pool.n_rows() => {
+                    cb_data::select_borders_greedy_logsum_f32_presampled(
+                        col,
+                        sample,
+                        self.border_count,
+                        false,
+                    )
+                }
+                _ => select_borders_greedy_logsum_f32(col, self.border_count, false),
+            }
+        };
         let (owned_values, mut feature_borders): (Option<Vec<Vec<f32>>>, Vec<Vec<f64>>) =
             if cache_valid && !cached_f32.is_empty() {
                 let borders: Vec<Vec<f64>> = cached_f32
                     .par_iter()
                     .map(|col| {
                         let t1 = std::time::Instant::now();
-                        let borders =
-                            select_borders_greedy_logsum_f32(col, self.border_count, false);
+                        let borders = borders_for_col(col);
                         if prof {
                             let ord = std::sync::atomic::Ordering::Relaxed;
                             borders_ns.fetch_add(t1.elapsed().as_nanos() as u64, ord);
@@ -1154,8 +1184,7 @@ impl CatBoostBuilder {
                         let t0 = std::time::Instant::now();
                         let narrowed: Vec<f32> = col.iter().map(|&v| v as f32).collect();
                         let t1 = std::time::Instant::now();
-                        let borders =
-                            select_borders_greedy_logsum_f32(&narrowed, self.border_count, false);
+                        let borders = borders_for_col(&narrowed);
                         if prof {
                             let ord = std::sync::atomic::Ordering::Relaxed;
                             narrow_ns.fetch_add((t1 - t0).as_nanos() as u64, ord);

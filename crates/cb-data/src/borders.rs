@@ -248,19 +248,50 @@ pub fn select_borders_greedy_logsum_f32(
     nan_sentinel: bool,
 ) -> Vec<f64> {
     // Drop NaNs (sampling first when over the cap — upstream subsets OBJECTS, so
-    // the subset is taken before NaN filtering there too), sort ascending. The
-    // UNSTABLE sort is byte-identical here: keys equal under the comparator are
-    // either bit-identical f32s or the {-0.0, +0.0} pair, and every downstream
-    // consumer is order-insensitive across equal keys — `left_border`'s midpoint
-    // of any {-0.0, +0.0} adjacency is +0.0 in either order, the greedy split
-    // scores depend only on the sorted VALUES at each index, and the emitted
-    // border set normalizes -0.0 to +0.0 before dedup. pdqsort avoids the stable
-    // merge sort's O(n/2) allocation on the hot fit-prep path.
-    let mut values: Vec<f32> = if column.len() > MAX_SUBSET_SIZE_FOR_BUILD_BORDERS {
-        sample_for_build_borders(column, MAX_SUBSET_SIZE_FOR_BUILD_BORDERS)
+    // the subset is taken before NaN filtering there too), sort ascending.
+    let values: Vec<f32> = if column.len() > MAX_SUBSET_SIZE_FOR_BUILD_BORDERS {
+        let sample =
+            sample_indices_for_build_borders(column.len(), MAX_SUBSET_SIZE_FOR_BUILD_BORDERS);
+        gather_non_nan(column, &sample)
     } else {
         column.iter().copied().filter(|v| !v.is_nan()).collect()
     };
+    borders_from_values(values, max_borders, nan_sentinel)
+}
+
+/// [`select_borders_greedy_logsum_f32`] for an over-cap column whose sample
+/// index set was precomputed by [`sample_indices_for_build_borders`] — the
+/// SPD-03 fit-prep entry. The fixed-seed draw depends only on the object count,
+/// so every same-length column samples the SAME index set; hoisting the draw out
+/// of the per-column loop removes an O(n) index-array build + shuffle per column,
+/// and the ascending index order turns the per-column gather into a forward
+/// streaming read. The border set is byte-identical to the self-sampling entry:
+/// the gathered multiset is the same (same index set, same per-column NaN drop),
+/// and [`borders_from_values`] is a pure function of that multiset.
+#[must_use]
+pub fn select_borders_greedy_logsum_f32_presampled(
+    column: &[f32],
+    sorted_sample_indices: &[u32],
+    max_borders: usize,
+    nan_sentinel: bool,
+) -> Vec<f64> {
+    let values = gather_non_nan(column, sorted_sample_indices);
+    borders_from_values(values, max_borders, nan_sentinel)
+}
+
+/// Shared tail of border selection: sort the (NaN-free) sampled values, run the
+/// greedy split, normalize and dedup the border set, and widen to f64.
+///
+/// This is a pure function of the value MULTISET, not the incoming order: the
+/// sort's output value sequence is determined by the multiset alone (the radix
+/// path totally orders bit patterns; under the sub-threshold comparator sort the
+/// only comparator-equal-but-bitwise-distinct pair is {-0.0, +0.0}, and every
+/// downstream consumer is order-insensitive across equal keys — `left_border`'s
+/// midpoint of a {-0.0, +0.0} adjacency is +0.0 in either order, the greedy
+/// split scores depend only on the sorted values at each index, and the emitted
+/// border set normalizes -0.0 to +0.0 before dedup). pdqsort avoids the stable
+/// merge sort's O(n/2) allocation on the hot fit-prep path.
+fn borders_from_values(mut values: Vec<f32>, max_borders: usize, nan_sentinel: bool) -> Vec<f64> {
     sort_f32_ascending(&mut values);
 
     // Each non-NaN object carries unit weight; the total weight is accumulated
@@ -358,24 +389,41 @@ fn sort_f32_ascending(values: &mut [f32]) {
     }
 }
 
-/// Draw `sample_size` objects uniformly WITHOUT replacement (upstream
-/// `SampleIndices<ui32>(objectCount, sampleSize, rand)`), then drop NaNs — so the
-/// returned slice may be slightly shorter than `sample_size` on a NaN-bearing
-/// column, exactly as upstream's object-subset-then-NaN-handling ordering yields.
+/// Draw `sample_size` object indices uniformly WITHOUT replacement (upstream
+/// `SampleIndices<ui32>(objectCount, sampleSize, rand)`) and return them sorted
+/// ascending. The index SET is what matters downstream — the sampled values are
+/// sorted before any consumer sees them, so the draw order carries no
+/// information — and ascending order makes the per-column gather a forward
+/// streaming read instead of a random walk.
 ///
 /// Partial Fisher–Yates over an index array: each of the `sample_size` draws
 /// swaps a uniformly chosen remaining index into the prefix, so the prefix is an
-/// exact uniform sample. The RNG is the audited [`TFastRng64`] upstream port with
-/// a FIXED seed (determinism contract — see the caller's doc).
-fn sample_for_build_borders(column: &[f32], sample_size: usize) -> Vec<f32> {
-    let n = column.len();
-    let mut indices: Vec<usize> = (0..n).collect();
+/// exact uniform sample. The RNG is the audited [`TFastRng64`] upstream port
+/// with a FIXED seed (determinism contract — see the caller's doc); the drawn
+/// set depends only on `n` and `sample_size`, so equal-length columns share it.
+#[must_use]
+pub fn sample_indices_for_build_borders(n: usize, sample_size: usize) -> Vec<u32> {
+    let mut indices: Vec<u32> = (0..n as u32).collect();
     let mut rng = TFastRng64::from_seed(0);
-    let mut out: Vec<f32> = Vec::with_capacity(sample_size);
-    for i in 0..sample_size.min(n) {
+    let take = sample_size.min(n);
+    for i in 0..take {
         let offset = rng.uniform((n - i) as u64) as usize;
         indices.swap(i, i + offset);
-        if let Some(&v) = indices.get(i).and_then(|&idx| column.get(idx)) {
+    }
+    indices.truncate(take);
+    indices.sort_unstable();
+    indices
+}
+
+/// Gather `column[idx]` for each sampled index, dropping NaNs — so the returned
+/// vec may be slightly shorter than the sample on a NaN-bearing column, exactly
+/// as upstream's object-subset-then-NaN-handling ordering yields. Out-of-range
+/// indices (impossible for a sample drawn over this column's length) are
+/// skipped rather than panicking.
+fn gather_non_nan(column: &[f32], indices: &[u32]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        if let Some(&v) = column.get(idx as usize) {
             if !v.is_nan() {
                 out.push(v);
             }

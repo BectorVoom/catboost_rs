@@ -35,7 +35,8 @@ pub mod text;
 mod weights;
 
 pub use borders::{
-    penalty_maxsumlog, select_borders_greedy_logsum, select_borders_greedy_logsum_f32,
+    penalty_maxsumlog, sample_indices_for_build_borders, select_borders_greedy_logsum,
+    select_borders_greedy_logsum_f32, select_borders_greedy_logsum_f32_presampled,
     MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
 };
 pub use cat_hash::{
