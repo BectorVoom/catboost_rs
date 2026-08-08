@@ -1,0 +1,191 @@
+[{"stream_name":"stdout","time":0.712792476,"data":"$ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader\n"}
+,{"stream_name":"stdout","time":0.738777534,"data":"Tesla P100-PCIE-16GB, 16384 MiB\n"}
+,{"stream_name":"stdout","time":0.738816041,"data":"\n"}
+,{"stream_name":"stdout","time":0.738821093,"data":"$ git clone --depth 1 --branch worktree-gpu-borders-shared-sample https://github.com/BectorVoom/catboost_rs.git /tmp/repo\n"}
+,{"stream_name":"stdout","time":2.328503467,"data":"Cloning into '/tmp/repo'...\n"}
+,{"stream_name":"stdout","time":2.328534162,"data":"\n"}
+,{"stream_name":"stdout","time":2.328537671,"data":"$ git rev-parse HEAD\n"}
+,{"stream_name":"stdout","time":2.3318684530000002,"data":"935030e635178b8514df4b6bd8ce5f7ce5356fc0\n"}
+,{"stream_name":"stdout","time":2.331888111,"data":"\n"}
+,{"stream_name":"stdout","time":2.331892233,"data":"cloned worktree-gpu-borders-shared-sample at 935030e635178b8514df4b6bd8ce5f7ce5356fc0\n"}
+,{"stream_name":"stdout","time":2.33189594,"data":"$ cargo --version\n"}
+,{"stream_name":"stdout","time":2.3359653910000002,"data":"/bin/sh: 1: cargo: not found\n"}
+,{"stream_name":"stdout","time":2.335980716,"data":"\n"}
+,{"stream_name":"stdout","time":2.33598471,"data":"$ curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable\n"}
+,{"stream_name":"stdout","time":20.014707715,"data":"\n"}
+,{"stream_name":"stdout","time":20.014739663,"data":"  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)\n"}
+,{"stream_name":"stdout","time":20.01474645,"data":"\n"}
+,{"stream_name":"stdout","time":20.014752118,"data":"\n"}
+,{"stream_name":"stdout","time":20.014757002,"data":"Rust is installed now. Great!\n"}
+,{"stream_name":"stdout","time":20.014761795,"data":"\n"}
+,{"stream_name":"stdout","time":20.014766576,"data":"To get started you may need to restart your current shell.\n"}
+,{"stream_name":"stdout","time":20.014771368,"data":"This would reload your PATH environment variable to include\n"}
+,{"stream_name":"stdout","time":20.014776204,"data":"Cargo's bin directory ($HOME/.cargo/bin).\n"}
+,{"stream_name":"stdout","time":20.014781673,"data":"\n"}
+,{"stream_name":"stdout","time":20.014786654,"data":"To configure your current shell, you need to source\n"}
+,{"stream_name":"stdout","time":20.014791462,"data":"the corresponding env file under $HOME/.cargo.\n"}
+,{"stream_name":"stdout","time":20.014796455,"data":"\n"}
+,{"stream_name":"stdout","time":20.014800753,"data":"This is usually done by running one of the following (note the leading DOT):\n"}
+,{"stream_name":"stdout","time":20.014805257,"data":". \"$HOME/.cargo/env\"            # For sh/bash/zsh/ash/dash/pdksh\n"}
+,{"stream_name":"stdout","time":20.014809942,"data":"source \"$HOME/.cargo/env.fish\"  # For fish\n"}
+,{"stream_name":"stdout","time":20.014814354,"data":"source \"~/.cargo/env.nu\"  # For nushell\n"}
+,{"stream_name":"stdout","time":20.014818706,"data":"source \"$HOME/.cargo/env.tcsh\"  # For tcsh\n"}
+,{"stream_name":"stdout","time":20.014824745,"data":". \"$HOME/.cargo/env.ps1\"        # For pwsh\n"}
+,{"stream_name":"stdout","time":20.014833421,"data":"source \"$HOME/.cargo/env.xsh\"   # For xonsh\n"}
+,{"stream_name":"stdout","time":20.014836551,"data":"info: downloading installer\n"}
+,{"stream_name":"stdout","time":20.014839508,"data":"warn: It looks like you have an existing rustup settings file at:\n"}
+,{"stream_name":"stdout","time":20.014843021,"data":"warn: /root/.rustup/settings.toml\n"}
+,{"stream_name":"stdout","time":20.014846228,"data":"warn: Rustup will install the default toolchain as specified in the settings file,\n"}
+,{"stream_name":"stdout","time":20.014875658,"data":"warn: instead of the one inferred from the default host triple.\n"}
+,{"stream_name":"stdout","time":20.014881526,"data":"info: profile set to default\n"}
+,{"stream_name":"stdout","time":20.014885419,"data":"info: default host triple is x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":20.014889277,"data":"info: syncing channel updates for stable-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":20.014893279,"data":"info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)\n"}
+,{"stream_name":"stdout","time":20.014896843,"data":"info: downloading 6 components\n"}
+,{"stream_name":"stdout","time":20.014900542,"data":"info: default toolchain set to stable-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":20.014904218,"data":"\n"}
+,{"stream_name":"stdout","time":20.014909354,"data":"$ cargo --version\n"}
+,{"stream_name":"stdout","time":20.030628229,"data":"cargo 1.97.1 (c980f4866 2026-06-30)\n"}
+,{"stream_name":"stdout","time":20.030676658,"data":"\n"}
+,{"stream_name":"stdout","time":20.030868127,"data":"$ /usr/bin/python3 /tmp/repo/bench/full_param_gpu_speed/bench.py --dry-run\n"}
+,{"stream_name":"stdout","time":20.132836198,"data":"ted=False ctr=True\n"}
+,{"stream_name":"stdout","time":20.132877781,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132884079,"data":"[ELIGIBLE] Depthwise|RMSE|w|noctr|1000k\n"}
+,{"stream_name":"stdout","time":20.132886522,"data":"    shape=(1000000, 50) kind=reg weighted=True ctr=False\n"}
+,{"stream_name":"stdout","time":20.132889377,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132893259,"data":"[ELIGIBLE] Depthwise|RMSE|w|ctr|1000k\n"}
+,{"stream_name":"stdout","time":20.132895501,"data":"    shape=(1000000, 50) kind=reg weighted=True ctr=True\n"}
+,{"stream_name":"stdout","time":20.132897777,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132901088,"data":"[ELIGIBLE] Depthwise|Logloss|unw|noctr|1000k\n"}
+,{"stream_name":"stdout","time":20.132903366,"data":"    shape=(1000000, 50) kind=clf weighted=False ctr=False\n"}
+,{"stream_name":"stdout","time":20.132905662,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132908829,"data":"[ELIGIBLE] Depthwise|Logloss|unw|ctr|1000k\n"}
+,{"stream_name":"stdout","time":20.132911041,"data":"    shape=(1000000, 50) kind=clf weighted=False ctr=True\n"}
+,{"stream_name":"stdout","time":20.132926162,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132929531,"data":"[ELIGIBLE] Depthwise|Logloss|w|noctr|1000k\n"}
+,{"stream_name":"stdout","time":20.132931746,"data":"    shape=(1000000, 50) kind=clf weighted=True ctr=False\n"}
+,{"stream_name":"stdout","time":20.13293399,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132937124,"data":"[ELIGIBLE] Depthwise|Logloss|w|ctr|1000k\n"}
+,{"stream_name":"stdout","time":20.13293931,"data":"    shape=(1000000, 50) kind=clf weighted=True ctr=True\n"}
+,{"stream_name":"stdout","time":20.13294158,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132944734,"data":"[ELIGIBLE] SHOWCASE-bias|RMSE|unw|noctr|300k\n"}
+,{"stream_name":"stdout","time":20.132946994,"data":"    shape=(300000, 50) kind=reg weighted=False ctr=False\n"}
+,{"stream_name":"stdout","time":20.132949242,"data":"    kwargs={\"boost_from_average\": true, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"SymmetricTree\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":20.132952414,"data":"[ELIGIBLE] SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k\n"}
+,{"stream_name":"stdout","time":20.132954613,"data":"    shape=(300000, 50) kind=reg weighted=False ctr=False\n"}
+,{"stream_name":"stdout","time":20.132956942,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"Bernoulli\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\", \"subsample\": 0.66}\n"}
+,{"stream_name":"stdout","time":20.132960282,"data":"\n"}
+,{"stream_name":"stdout","time":20.132962425,"data":"\n"}
+,{"stream_name":"stdout","time":20.132964581,"data":"[SHOWCASE ELIGIBLE] SHOWCASE-bias|RMSE|unw|noctr|300k — boost_from_average\n"}
+,{"stream_name":"stdout","time":20.132967538,"data":"[SHOWCASE ELIGIBLE] SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k — Depthwise x Bernoulli\n"}
+,{"stream_name":"stdout","time":20.132969899,"data":"\n"}
+,{"stream_name":"stdout","time":20.132972003,"data":"DRY RUN OK — grid reviewable, every showcase cell eligible.\n"}
+,{"stream_name":"stdout","time":20.132974279,"data":"\n"}
+,{"stream_name":"stdout","time":20.132976461,"data":"$ /usr/bin/python3 /tmp/repo/bench/full_param_gpu_speed/bench.py\n"}
+,{"stream_name":"stdout","time":918.970655958,"data":"umber of categorical features\")\n"}
+,{"stream_name":"stdout","time":918.970742844,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":918.970749699,"data":"\n"}
+,{"stream_name":"stdout","time":918.970753323,"data":"=== Depthwise|RMSE|unw|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970757188,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.9707617,"data":"  [official] median=1.815s all=[1.782, 1.8184, 1.8155]\n"}
+,{"stream_name":"stdout","time":918.970765276,"data":"  [catboost_rs] N/A: CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 \u003c\u003c bits for bits in 5..=8), got 33')\n"}
+,{"stream_name":"stdout","time":918.970773606,"data":"\n"}
+,{"stream_name":"stdout","time":918.970777194,"data":"=== Depthwise|RMSE|unw|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970781183,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970785329,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":918.970789675,"data":"  [catboost_rs] N/A: CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) — pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')\n"}
+,{"stream_name":"stdout","time":918.970795163,"data":"\n"}
+,{"stream_name":"stdout","time":918.970799105,"data":"=== Depthwise|RMSE|w|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970802893,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970806727,"data":"  [official] median=1.848s all=[1.8665, 1.8478, 1.8449]\n"}
+,{"stream_name":"stdout","time":918.970810621,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":918.970814531,"data":"\n"}
+,{"stream_name":"stdout","time":918.970817974,"data":"=== Depthwise|RMSE|w|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970821594,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970825833,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":918.970830498,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":918.970834539,"data":"\n"}
+,{"stream_name":"stdout","time":918.970837742,"data":"=== Depthwise|Logloss|unw|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970841109,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970844691,"data":"  [official] median=2.094s all=[2.0942, 2.0166, 2.1007]\n"}
+,{"stream_name":"stdout","time":918.970850709,"data":"  [catboost_rs] N/A: CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 \u003c\u003c bits for bits in 5..=8), got 33')\n"}
+,{"stream_name":"stdout","time":918.970854829,"data":"\n"}
+,{"stream_name":"stdout","time":918.970868609,"data":"=== Depthwise|Logloss|unw|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970871374,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970873766,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":918.970876318,"data":"  [catboost_rs] N/A: CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) — pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')\n"}
+,{"stream_name":"stdout","time":918.970879097,"data":"\n"}
+,{"stream_name":"stdout","time":918.970881322,"data":"=== Depthwise|Logloss|w|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.970883544,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970885869,"data":"  [official] median=2.138s all=[2.1384, 2.1859, 2.1047]\n"}
+,{"stream_name":"stdout","time":918.970888111,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":918.97089056,"data":"\n"}
+,{"stream_name":"stdout","time":918.970892661,"data":"=== Depthwise|Logloss|w|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":918.97089487,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.970897249,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":918.970899772,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":918.970902131,"data":"\n"}
+,{"stream_name":"stdout","time":918.9709044,"data":"=== SHOWCASE-bias|RMSE|unw|noctr|300k ===\n"}
+,{"stream_name":"stdout","time":918.970906628,"data":"  [official] median=1.243s all=[1.24, 1.2595, 1.243]\n"}
+,{"stream_name":"stdout","time":918.970908868,"data":"  [catboost_rs] median=0.376s all=[0.3917, 0.3763, 0.3673]\n"}
+,{"stream_name":"stdout","time":918.970911103,"data":"\n"}
+,{"stream_name":"stdout","time":918.970913193,"data":"=== SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k ===\n"}
+,{"stream_name":"stdout","time":918.970915421,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":918.97091772,"data":"  [official] median=1.369s all=[1.3809, 1.369, 1.3305]\n"}
+,{"stream_name":"stdout","time":918.970919978,"data":"  [catboost_rs] N/A: CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 \u003c\u003c bits for bits in 5..=8), got 33')\n"}
+,{"stream_name":"stdout","time":918.970922486,"data":"\n"}
+,{"stream_name":"stdout","time":918.97092458,"data":"$ /usr/bin/python3 /tmp/repo/bench/full_param_gpu_speed/diag.py\n"}
+,{"stream_name":"stdout","time":926.416096784,"data":"_der=0.30ms\n"}
+,{"stream_name":"stdout","time":926.416140097,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.56ms fold=2.96ms\n"}
+,{"stream_name":"stdout","time":926.416144906,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=17.77ms derive=0.84ms score=0.88ms split=0.60ms stats_read=1.04ms leaf_apply_der=0.27ms\n"}
+,{"stream_name":"stdout","time":926.416157013,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=22.88ms fold=2.94ms\n"}
+,{"stream_name":"stdout","time":926.416159799,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.18ms derive=1.05ms score=0.90ms split=0.60ms stats_read=1.01ms leaf_apply_der=0.38ms\n"}
+,{"stream_name":"stdout","time":926.416162439,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=20.64ms fold=2.99ms\n"}
+,{"stream_name":"stdout","time":926.416164842,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.93ms derive=1.22ms score=0.76ms split=0.54ms stats_read=0.92ms leaf_apply_der=0.22ms\n"}
+,{"stream_name":"stdout","time":926.416167451,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.04ms fold=2.72ms\n"}
+,{"stream_name":"stdout","time":926.416170348,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.40ms derive=0.92ms score=0.71ms split=0.56ms stats_read=0.88ms leaf_apply_der=0.30ms\n"}
+,{"stream_name":"stdout","time":926.416172879,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.10ms fold=2.54ms\n"}
+,{"stream_name":"stdout","time":926.416175263,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.29ms derive=0.76ms score=0.71ms split=0.53ms stats_read=0.89ms leaf_apply_der=0.25ms\n"}
+,{"stream_name":"stdout","time":926.416178148,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=17.81ms fold=2.62ms\n"}
+,{"stream_name":"stdout","time":926.416180574,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.17ms derive=0.87ms score=0.72ms split=0.54ms stats_read=0.86ms leaf_apply_der=0.26ms\n"}
+,{"stream_name":"stdout","time":926.416183172,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.80ms fold=2.65ms\n"}
+,{"stream_name":"stdout","time":926.416185566,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.83ms derive=0.93ms score=0.73ms split=0.54ms stats_read=0.90ms leaf_apply_der=0.28ms\n"}
+,{"stream_name":"stdout","time":926.416188546,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=18.57ms fold=2.62ms\n"}
+,{"stream_name":"stdout","time":926.416190978,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.08ms derive=0.78ms score=0.74ms split=0.54ms stats_read=0.87ms leaf_apply_der=0.26ms\n"}
+,{"stream_name":"stdout","time":926.416193502,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.60ms fold=2.66ms\n"}
+,{"stream_name":"stdout","time":926.416195886,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.46ms derive=0.90ms score=0.78ms split=0.54ms stats_read=0.86ms leaf_apply_der=0.25ms\n"}
+,{"stream_name":"stdout","time":926.416198452,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.20ms fold=2.56ms\n"}
+,{"stream_name":"stdout","time":926.41620082,"data":"CB_GPU_PROF fit-train elapsed=1978.78ms\n"}
+,{"stream_name":"stdout","time":926.416203193,"data":"\n"}
+,{"stream_name":"stdout","time":926.416205463,"data":"diag[repeat] rc=0 -\u003e /kaggle/working/diag/diag_repeat.txt\n"}
+,{"stream_name":"stdout","time":926.416209331,"data":".18ms score=0.88ms split=0.60ms stats_read=0.95ms leaf_apply_der=0.25ms\n"}
+,{"stream_name":"stdout","time":926.416211842,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=18.84ms fold=2.92ms\n"}
+,{"stream_name":"stdout","time":926.416214234,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=17.78ms derive=1.23ms score=0.89ms split=0.61ms stats_read=0.97ms leaf_apply_der=0.30ms\n"}
+,{"stream_name":"stdout","time":926.416216753,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=23.20ms fold=2.99ms\n"}
+,{"stream_name":"stdout","time":926.416219187,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.96ms derive=1.15ms score=0.84ms split=0.60ms stats_read=0.96ms leaf_apply_der=0.29ms\n"}
+,{"stream_name":"stdout","time":926.416221751,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=20.02ms fold=2.79ms\n"}
+,{"stream_name":"stdout","time":926.416233219,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.87ms derive=1.34ms score=0.83ms split=0.63ms stats_read=0.99ms leaf_apply_der=0.30ms\n"}
+,{"stream_name":"stdout","time":926.416236029,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.27ms fold=2.83ms\n"}
+,{"stream_name":"stdout","time":926.416238487,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.67ms derive=1.45ms score=0.87ms split=0.62ms stats_read=0.91ms leaf_apply_der=0.37ms\n"}
+,{"stream_name":"stdout","time":926.416241613,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=20.34ms fold=2.89ms\n"}
+,{"stream_name":"stdout","time":926.416244103,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.16ms derive=0.81ms score=0.85ms split=0.59ms stats_read=0.91ms leaf_apply_der=0.35ms\n"}
+,{"stream_name":"stdout","time":926.416246636,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=17.91ms fold=2.70ms\n"}
+,{"stream_name":"stdout","time":926.416249147,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.15ms derive=1.24ms score=0.78ms split=0.56ms stats_read=0.82ms leaf_apply_der=0.34ms\n"}
+,{"stream_name":"stdout","time":926.416251683,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=20.20ms fold=2.50ms\n"}
+,{"stream_name":"stdout","time":926.416254113,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=13.85ms derive=0.75ms score=0.76ms split=0.53ms stats_read=0.87ms leaf_apply_der=0.27ms\n"}
+,{"stream_name":"stdout","time":926.416256727,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=18.21ms fold=3.83ms\n"}
+,{"stream_name":"stdout","time":926.416259158,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=15.13ms derive=0.92ms score=0.75ms split=0.54ms stats_read=0.86ms leaf_apply_der=0.33ms\n"}
+,{"stream_name":"stdout","time":926.416261673,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.94ms fold=2.53ms\n"}
+,{"stream_name":"stdout","time":926.41626416,"data":"CB_GPU_PROF tree n=1000000 nf=50 bins=64 depth=6 fill=14.43ms derive=0.99ms score=0.74ms split=0.53ms stats_read=0.82ms leaf_apply_der=0.34ms\n"}
+,{"stream_name":"stdout","time":926.416266695,"data":"CB_GPU_PROF tree-host sample=0.00ms grow=19.21ms fold=2.78ms\n"}
+,{"stream_name":"stdout","time":926.416269247,"data":"CB_GPU_PROF fit-train elapsed=1038.81ms\n"}
+,{"stream_name":"stdout","time":926.4162717,"data":"\n"}
+,{"stream_name":"stdout","time":926.416273949,"data":"\n"}
+,{"stream_name":"stdout","time":926.421109634,"data":"done rc=0 elapsed=926s\n"}
+,{"stream_name":"stderr","time":928.364459135,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":928.364542676,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":928.59127741,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":928.591304584,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":929.303460162,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":930.108831039,"data":"[NbConvertApp] Writing 294018 bytes to __results__.html\n"}
+]
