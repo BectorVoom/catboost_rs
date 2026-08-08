@@ -274,6 +274,119 @@ fn the_device_gate_no_longer_pins_the_ctr_type_to_borders() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// DCTR-10 (T12) — the CTR TYPE conjunct, widened again to admit `Counter`
+// ---------------------------------------------------------------------------------------
+
+/// The structural reason admitting `Counter` is a *type-list* change and nothing more — and
+/// the reason it could NOT be admitted by widening the class-prefix arm.
+///
+/// Three facts, each load-bearing:
+///
+/// 1. **`Counter` is CPU-legal** (`restrictions.h:18-48`), so it has a parity surface a
+///    fixture can be measured against — unlike the GPU-only pair.
+/// 2. **`Counter` is NOT an online prefix** (`IsPermutationDependentCtrType(Counter) ==
+///    false`, `ctr_type.cpp:43-56`): its numerator is the whole-learn-set bucket total and
+///    its denominator the CONSTANT max bucket total. Routing it through the ordered
+///    class-prefix kernel would return a silently wrong statistic, which is why `cb-backend`
+///    gives it a separate permutation-free entry point and keeps the class-prefix launcher's
+///    host guard rejecting the discriminant. **If this ever flips to `true`, the device
+///    dispatch's Counter arm is reading the wrong upstream contract.**
+/// 3. **`Counter` emits exactly ONE column per `(projection, prior)`**
+///    (`target_border_count(Counter, 2) == 1`, `ctr_helper.h:34-42`), so admitting it cannot
+///    interact with the numerator-selector conjunct T10 deleted.
+///
+/// It also pins the trap that no oracle on the frozen `ctr_device_counter` fixture can catch
+/// (T06's finding): **`Counter`'s DEFAULT prior is the single `0/1`**, not the
+/// `{0/1, 0.5/1, 1/1}` triple the class-count types get (`cat_feature_options.cpp:118-138`).
+/// Upstream compensates a Counter prior change by shifting the CTR border, so on that fixture
+/// `Prior=0.5`, `Prior=0` and `Prior=3` produce bit-identical predictions — the ≤1e-5 e2e
+/// cannot police a prior mismatch. The guard is the explicit pin on both sides
+/// (`"simple_ctr": ["Counter:Prior=0.5"]` in the frozen `config.json`,
+/// `simple_ctr_priors = vec![0.5]` in `device_ctr_counter_fit_test`), and THIS assertion is
+/// why that pin may never be dropped in favour of the default.
+///
+/// PLAN §2.5: green on write ⇒ its discriminating power was proved by mutation; the verbatim
+/// failures are recorded in `notes/T12.md`.
+#[test]
+fn counter_is_a_cpu_legal_whole_set_tally_not_a_class_prefix() {
+    use crate::ctr::ECtrType;
+
+    assert!(
+        ECtrType::Counter.is_cpu_supported(),
+        "Counter must be CPU-legal (`restrictions.h:18-48`) — the device gate may only admit \
+         types that have a CPU parity surface to be measured against"
+    );
+    assert!(
+        !ECtrType::Counter.is_online_prefix(),
+        "Counter must be permutation INDEPENDENT (`ctr_type.cpp:43-56`): a whole-set bucket \
+         tally over a CONSTANT max-bucket denominator, not a read-before-increment prefix. \
+         The device admits it through its OWN permutation-free entry point precisely because \
+         of this; if this classification flips, the class-prefix kernel would be the right \
+         home and the DCTR-10 dispatch arm is wrong"
+    );
+
+    // The binclf target-class count — the same `TARGET_CLASSES` constant
+    // `materialize_ctr_columns_for_perm` passes.
+    const CLASSES: usize = 2;
+    assert_eq!(
+        ECtrType::Counter.target_border_count(CLASSES),
+        1,
+        "Counter does not binarize the target at all, so it emits ONE column per \
+         (projection, prior) and its columns can only ever carry selector 0"
+    );
+
+    // The prior trap (T06). Counter gets a SINGLE zero prior by default; the class-count
+    // types get three. A `BoostParams` that omits `simple_ctr_priors` therefore does NOT
+    // reproduce the frozen `Counter:Prior=0.5` fixture.
+    let counter_defaults = ECtrType::Counter.default_priors();
+    assert_eq!(
+        counter_defaults.len(),
+        1,
+        "Counter's default prior set is the single `0/1` (`cat_feature_options.cpp:118-138`), \
+         not the class-count triple; found {counter_defaults:?}"
+    );
+    assert!(
+        counter_defaults
+            .first()
+            .is_some_and(|p| p.num == 0.0 && p.denom == 1.0),
+        "Counter's ONE default prior must be `0/1`; found {counter_defaults:?}. The DCTR-10 \
+         e2e pins `simple_ctr_priors = vec![0.5]` explicitly BECAUSE the default differs from \
+         the frozen fixture's `Counter:Prior=0.5`, and upstream's compensating CTR-border \
+         shift makes that mismatch invisible to the ≤1e-5 bar"
+    );
+    for triple in [ECtrType::Borders, ECtrType::Buckets] {
+        assert_eq!(
+            triple.default_priors().len(),
+            3,
+            "{triple:?} gets the `{{0/1, 0.5/1, 1/1}}` default triple — the contrast that \
+             makes Counter's single-prior default a genuine trap rather than a uniform rule"
+        );
+    }
+}
+
+/// DCTR-10's observable completion: the gate expression itself admits `Counter`. RED before
+/// T12's widening, green after.
+///
+/// The scan runs over the COMMENT-STRIPPED body ([`code_lines_mentioning`]), so the prose
+/// inside the gate that explains why Counter is admitted cannot satisfy this on its own — the
+/// enumeration entry must really be there. Exactly ONE code mention is expected: a second
+/// would mean the type is tested in two places, and the admission list would no longer be a
+/// single enumeration.
+#[test]
+fn the_device_gate_admits_counter_in_its_type_list() {
+    let body = gate_body();
+    let mentions = code_lines_mentioning(&body, "ECtrType::Counter");
+    assert_eq!(
+        mentions.len(),
+        1,
+        "`ctr_types_are_device_covered` must name `ECtrType::Counter` exactly once, in its \
+         `from_i8` admission list (DCTR-10): Counter's device statistic is implemented \
+         (`launch_counter_ctr_resident`, DCTR-09) and pinned end to end by \
+         `device_ctr_counter_fit_test`. Found: {mentions:?}. Body was:\n{body}"
+    );
+}
+
 /// DCTR-08's second observable completion: the gate expression itself no longer reads the
 /// Buckets numerator selector. RED before T10's deletion, green after.
 ///

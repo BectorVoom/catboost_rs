@@ -2346,8 +2346,8 @@ fn ctr_splits_for_tree(
 /// Re-opening this clause requires the e2e oracle to pass, not just the config unit test —
 /// this is exactly the ordering discipline that made the gap visible.
 ///
-/// Everything else — BinarizedTargetMeanValue / Counter (Track U) — still declines to the
-/// byte-unchanged CPU path (D-04): the device kernels do not implement those accumulation
+/// Everything else — BinarizedTargetMeanValue (Track U) — still declines to the
+/// byte-unchanged CPU path (D-04): the device kernels do not implement that accumulation
 /// semantics, and a wrong device leaf is worse than a CPU fallback.
 ///
 /// # Buckets and the multi-target-border layout ARE covered (DCTR-08, T10)
@@ -2378,6 +2378,49 @@ fn ctr_splits_for_tree(
 /// exactly the `Buckets@1` column and nothing else: a `Borders` column still structurally
 /// cannot carry a non-zero selector. That structural argument is pinned executably by
 /// `boosting_ctr_gate_tests::buckets_is_the_only_type_with_a_nonzero_target_border`.
+///
+/// # Counter IS covered (DCTR-10, T12)
+///
+/// `Counter` is the first admitted type that is **not** an online class prefix
+/// ([`crate::ctr::ECtrType::is_online_prefix`] is `false` for it). Its numerator is the
+/// whole-learn-set bucket total and its denominator the CONSTANT MAX bucket total
+/// (`online_ctr.cpp:503-562`, `:934-936`; [`crate::ctr::online::online_counter_column`]), so
+/// it is **permutation independent** — `IsPermutationDependentCtrType(Counter) == false`
+/// (`ctr_type.cpp:43-56`). The device mirrors that structurally rather than by convention:
+/// `cb-backend`'s `launch_counter_ctr_resident` (DCTR-09, T11) takes neither a permutation
+/// nor a target class, and the class-prefix launcher's host guard REJECTS the Counter
+/// discriminant outright, so a Counter column can never receive a prefix numerator. The
+/// statistic is proved against the CPU [`crate::ctr::online::online_counter_column`] by
+/// DCTR-09's kernel self-oracle (`kernels::ctr_device_test::counter_ctr_matches_cpu_reference`
+/// plus its permutation-independence sibling), dispatched per column by DCTR-07's `match`, and
+/// the whole fit is pinned end to end against upstream `catboost==1.2.10` by
+/// `device_ctr_counter_fit_test` on the frozen `ctr_device_counter` fixture.
+///
+/// Two properties keep this a *type-list* widening and nothing more:
+///
+/// - **the border table is shared.** Counter quantizes through the same
+///   `calc_ctr_online_bin` f64 path as Borders/Buckets (`quantize_in_f32 == false`,
+///   `ctr_feature.rs`), and the device returns the constant denominator repeated per object
+///   (mirroring `denoms = vec![denominator; n]`), so the resident triple has the ordered
+///   path's shape exactly. No per-type shape handling exists anywhere (C-7).
+/// - **`counter_calc_method` is structurally moot on a device fit (DCTR-11, T13).** It widens
+///   the counted sample range from learn-only to learn + every eval set
+///   (`online_ctr.cpp:714-729`), which is reachable only through
+///   [`train_cat_with_eval_sets`]. Its only effect in this crate is to assemble
+///   `counter_full_eval_columns` — built purely out of `eval_sets`, and collapsing to
+///   `Vec::new()` through its `cols.iter().all(Vec::is_empty)` arm when there are none — so
+///   with an empty eval-set slice **`Full ≡ SkipTest`**. And an eval set is declined at a
+///   DIFFERENT LAYER entirely: the `&& eval_sets.is_empty()` conjunct of the
+///   `device_host_eligible` conjunction below, **not** this predicate, which admits `Counter`
+///   unconditionally. ⇒ the device path can never observe `counter_calc_method`, so P1 ships
+///   no eval-widening device code and needs none.
+///
+///   That boundary is pinned executably by `tests/device_ctr_type_gate_test.rs`'s
+///   `{SkipTest, Full} × {no eval set, eval set}` square (the eval set moves the routing;
+///   `counter_calc_method` moves nothing), with the mutation evidence in
+///   `.planning/plans/device-ctr-full-coverage/notes/T13.md`. **P3 WILL INVERT the two
+///   declining cells** when it lands device eval-set support and the Counter `Full`
+///   widening: they are a P1/P3 boundary pin, not a requirement to be defended.
 ///
 /// `FloatTargetMeanValue` (`3`) and `FeatureFreq` (`5`) stay declined permanently: they are
 /// GPU-only upstream (`restrictions.h:20-32`) and have no CPU parity surface, which is why
@@ -2412,16 +2455,23 @@ fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
             // "combination CTR is device-INELIGIBLE" section of this function's doc
             // comment for the measured evidence and the localisation.
             col.projection.is_simple()
-                // DCTR-08 (T10): the ORDERED CLASS-PREFIX admission LIST — an explicit
+                // DCTR-08 (T10) / DCTR-10 (T12): the device CTR admission LIST — an explicit
                 // enumeration, never a range check, so an unknown discriminant (`from_i8`
                 // returns `None`) and every not-yet-implemented type are declined by
                 // default. Reconstruction goes through `crate::ctr::ECtrType::from_i8`,
                 // which is IN-CRATE here, so the Do-Not-Hand-Roll rule applies and a second
                 // transcription of the discriminants is forbidden (C-3; only `cb-backend`,
                 // which must never depend on `cb-train`, transcribes them inline).
+                // `Borders`/`Buckets` share the ordered class-prefix device kernel; `Counter`
+                // is a whole-set tally with its OWN permutation-free device entry point. See
+                // this function's doc for both proofs.
                 && matches!(
                     crate::ctr::ECtrType::from_i8(col.ctr_type),
-                    Some(crate::ctr::ECtrType::Borders | crate::ctr::ECtrType::Buckets)
+                    Some(
+                        crate::ctr::ECtrType::Borders
+                            | crate::ctr::ECtrType::Buckets
+                            | crate::ctr::ECtrType::Counter
+                    )
                 )
         })
 }

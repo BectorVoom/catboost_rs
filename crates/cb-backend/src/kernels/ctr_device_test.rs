@@ -16,8 +16,8 @@
 //! cannot run the f64 CTR value seam — the assertions SKIP there (WR-01 anti-false-pass).
 
 use crate::kernels::ctr_device::{
-    binarize_ctr_column_host, combine_projection_bins, compute_ordered_ctr_host,
-    compute_ordered_ctr_host_mode,
+    binarize_counter_column_host, binarize_ctr_column_host, combine_projection_bins,
+    compute_counter_ctr_host, compute_ordered_ctr_host, compute_ordered_ctr_host_mode,
 };
 
 /// `cb_train::ctr::ECtrType::Borders` discriminant (`cb-train/src/ctr/mod.rs:96-108`),
@@ -101,6 +101,39 @@ fn cpu_ordered_ctr(
         counts[bucket][class[doc] as usize] += 1;
     }
     (good, total, value)
+}
+
+/// The FROZEN CPU Counter reference: an inline transcription of
+/// `cb_train::ctr::online::online_counter_column` (`cb-train/src/ctr/online.rs:493-521`) followed
+/// by `calc_ctr_online` (`cb-train/src/ctr/calc_ctr.rs:77-80`), i.e. exactly what
+/// `ctr_feature.rs:296-309` composes for [`cb_train::ctr::ECtrType::Counter`].
+///
+/// Counter is a **whole-set tally with a CONSTANT denominator**: `totals[b] = #{obj : bins[obj] == b}`
+/// over the entire learn set, `denominator = max_b totals[b]`, and per object
+/// `value = (totals[bins[obj]] + prior) / (denominator + 1)`. It takes **no permutation parameter
+/// at all** — `IsPermutationDependentCtrType(Counter) == false` (`ctr_type.cpp:43-56`).
+///
+/// `extra_bins` (the `counter_calc_method = Full` eval widening, `online_ctr.cpp:713-729`) is
+/// deliberately absent: P1 ships no eval-widening device code and the boundary is pinned by T13.
+///
+/// Returns `(good, denominator, value)` in OBJECT order.
+fn cpu_counter_ctr(bins: &[u32], prior: f64, bucket_count: usize) -> (Vec<i64>, i64, Vec<f64>) {
+    let mut totals = vec![0i64; bucket_count];
+    for &bin in bins {
+        if let Some(slot) = totals.get_mut(bin as usize) {
+            *slot += 1;
+        }
+    }
+    let denominator = totals.iter().copied().max().unwrap_or(0);
+    let good: Vec<i64> = bins
+        .iter()
+        .map(|&bin| totals.get(bin as usize).copied().unwrap_or(0))
+        .collect();
+    let value: Vec<f64> = good
+        .iter()
+        .map(|&g| (g as f64 + prior) / (denominator as f64 + 1.0))
+        .collect();
+    (good, denominator, value)
 }
 
 /// `max |a - b|` over two equal-length f64 vectors; `INFINITY` on a length mismatch so a truncated
@@ -420,5 +453,130 @@ fn out_of_range_ctr_mode_is_rejected() {
     assert!(
         matches!(wrong_type, Err(cb_core::CbError::OutOfRange(_))),
         "a non-class-prefix ctr_type must be rejected, got {wrong_type:?}"
+    );
+}
+
+/// The Counter CTR border table used by the two DCTR-09 oracles. The Counter values on
+/// `synth_fixture(96, 5, 11)` are `(t + 0.5) / 23` for `t in {13, 20, 21, 22}` — i.e.
+/// `{0.5870, 0.8913, 0.9348, 0.9783}` — so these five borders separate all four of them and the
+/// emitted cindex column is non-degenerate (asserted below, not assumed).
+const COUNTER_BORDERS: [f64; 5] = [0.2, 0.7, 0.91, 0.95, 0.99];
+
+#[test]
+fn counter_ctr_matches_cpu_reference() {
+    // DCTR-09 (T11): the device Counter statistic must reproduce `online_counter_column` +
+    // `calc_ctr_online` exactly — per-object `good = totals[bin]` (whole-set tally, EXACT
+    // integers), a CONSTANT `max_b totals[b]` denominator for EVERY object (mirroring
+    // `ctr_feature.rs:304`'s `denoms = vec![denominator; n]`), and the f64 value within the
+    // ε=1e-4 device bar. The binarized `u32` cindex column must be BIT-EXACT against the host
+    // binarization of the CPU value column (the `ctr_binarized_cindex_column_bit_exact`
+    // template) — Counter quantizes through the SAME f64 border table as Borders/Buckets
+    // (`quantize_in_f32 == false`, `ctr_feature.rs:309`), so no per-type border handling exists.
+    if !device_ctr_active() {
+        eprintln!("SKIP counter_ctr_matches_cpu_reference: wgpu has no f64 CTR seam (WR-01)");
+        return;
+    }
+    let n = 96usize;
+    let prior = 0.5;
+    let (bins, _class, _perm) = synth_fixture(n, 5, 11);
+    let buckets = bucket_count(&bins);
+    let (cg, cdenom, cv) = cpu_counter_ctr(&bins, prior, buckets);
+
+    let (dg, dt, dv) = compute_counter_ctr_host(&bins, prior, buckets).unwrap();
+    assert_eq!(dg, cg, "device Counter good != online_counter_column totals[bin]");
+    assert_eq!(
+        dt,
+        vec![cdenom; n],
+        "device Counter denominator must be the CONSTANT max bucket total for every object"
+    );
+    let div = max_divergence(&dv, &cv);
+    assert!(div <= TOL, "Counter CTR value divergence {div} > {TOL}");
+
+    // NON-VACUITY GUARD (mandatory): on a fixture where every bucket held the same number of
+    // documents, `good == total` for every object and the constant-denominator assertion would
+    // pass trivially. The tally must actually vary across buckets.
+    let distinct_totals: std::collections::BTreeSet<i64> = cg.iter().copied().collect();
+    assert!(
+        distinct_totals.len() >= 2,
+        "every bucket has the same tally on this fixture — it cannot discriminate a per-object \
+         denominator from the constant max (pick another fixture); totals {distinct_totals:?}"
+    );
+    assert!(
+        cg.iter().any(|&g| g != cdenom),
+        "every bucket is the max bucket on this fixture — good and the denominator coincide and \
+         the oracle cannot tell them apart (pick another fixture)"
+    );
+
+    // The CTR->cindex binarize JOIN over the Counter values, bit-exact vs the host reference.
+    let borders = COUNTER_BORDERS.to_vec();
+    let host_cindex: Vec<u32> = cv
+        .iter()
+        .map(|&v| borders.iter().filter(|&&b| v > b).count() as u32)
+        .collect();
+    let dev_cindex = binarize_counter_column_host(&bins, prior, buckets, &borders).unwrap();
+    assert_eq!(dev_cindex.len(), n, "device Counter cindex column truncated");
+    assert_eq!(
+        dev_cindex, host_cindex,
+        "device Counter->cindex binarization must be bit-exact vs the host Counter column"
+    );
+    let distinct_bins: std::collections::BTreeSet<u32> = dev_cindex.iter().copied().collect();
+    assert!(
+        distinct_bins.len() >= 3,
+        "the Counter cindex column is near-constant on these borders — a bit-exact comparison \
+         against it proves little (pick other borders); bins {distinct_bins:?}"
+    );
+}
+
+#[test]
+fn counter_ctr_is_permutation_independent() {
+    // DCTR-09 (T11): `IsPermutationDependentCtrType(Counter) == false` (`ctr_type.cpp:43-56`).
+    // `launch_counter_ctr_resident` takes NO permutation argument, so the only route an order
+    // dependence could take is the order the documents are presented in. Present the SAME
+    // objects in two different orders (identity and a full reversal), undo the reordering on
+    // the output, and require the emitted cindex columns to be BIT-IDENTICAL.
+    //
+    // The contrast half is what makes this discriminating: the ORDERED (Borders) statistic on
+    // the SAME objects and the SAME two orders DOES change, so an "everything on this fixture
+    // is invariant" explanation is ruled out.
+    if !device_ctr_active() {
+        eprintln!("SKIP counter_ctr_is_permutation_independent: wgpu has no f64 CTR seam (WR-01)");
+        return;
+    }
+    let n = 96usize;
+    let prior = 0.5;
+    let (bins, class, _perm) = synth_fixture(n, 5, 11);
+    let buckets = bucket_count(&bins);
+    let counter_borders = COUNTER_BORDERS.to_vec();
+
+    let identity: Vec<u32> = (0..n as u32).collect();
+    let reversed: Vec<u32> = (0..n as u32).rev().collect();
+    assert_ne!(identity, reversed);
+
+    // Counter under the identity order, and under the reversal with the reordering undone.
+    let bins_reversed: Vec<u32> = reversed.iter().map(|&i| bins[i as usize]).collect();
+    let col_identity = binarize_counter_column_host(&bins, prior, buckets, &counter_borders).unwrap();
+    let col_reversed_raw =
+        binarize_counter_column_host(&bins_reversed, prior, buckets, &counter_borders).unwrap();
+    let mut col_reversed = vec![u32::MAX; n];
+    for (pos, &obj) in reversed.iter().enumerate() {
+        col_reversed[obj as usize] = col_reversed_raw[pos];
+    }
+    assert_eq!(
+        col_identity, col_reversed,
+        "the Counter statistic must be permutation independent (ctr_type.cpp:43-56)"
+    );
+
+    // Contrast: the ordered class-prefix statistic over the SAME objects and the SAME two orders
+    // is order DEPENDENT. Its values live in (0, 1] around the prior, so it needs its own
+    // border table (the Counter borders sit far above most ordered values).
+    let ordered_borders = vec![0.2_f64, 0.4, 0.5, 0.6, 0.8];
+    let ordered_identity =
+        binarize_ctr_column_host(&identity, &bins, &class, prior, buckets, &ordered_borders).unwrap();
+    let ordered_reversed =
+        binarize_ctr_column_host(&reversed, &bins, &class, prior, buckets, &ordered_borders).unwrap();
+    assert_ne!(
+        ordered_identity, ordered_reversed,
+        "the ORDERED statistic coincides under both orders on this fixture — it cannot show that \
+         the Counter invariance above is a property of Counter rather than of the fixture"
     );
 }

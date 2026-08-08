@@ -396,3 +396,182 @@ and must say in its note which it did and why. Do **not** discover this as a red
 "fix" it by loosening the assertion after the fact — that is exactly the class of change
 §2.5 exists to prevent. Note this cuts the other way too: because the partitions coincide,
 a raw-sequence comparison that happens to pass is not evidence the two paths agree.
+
+## From T11 → **T12** (primary), **T14/T16** (the Counter kernel sibling landed)
+
+T11 added `counter_ctr_kernel<F: Float>` (`ctr_device.rs`, `#[cube]` at `:262`) and
+`launch_counter_ctr_resident` (`:524`), plus two host-readback oracle seams
+(`compute_counter_ctr_host` `:739`, `binarize_counter_column_host` `:781`). **No production call
+site exists** — `grep -rn "launch_counter_ctr_resident\|counter_ctr_kernel::launch" crates/
+--include=*.rs` returns only definitions and the two in-file oracle callers. Five things later
+tasks must act on:
+
+**1. T12 must call `launch_counter_ctr_resident`, NOT `launch_ordered_ctr_resident`.** The
+ordered launcher still rejects `ctr_type == 4` with `CbError::OutOfRange` (T08 finding #1) and
+that guard **stays** — widening it was considered and deliberately not done. The new entry point
+takes `(client, bins, prior, bucket_count, n)`: **no `permutation`, no `target_class`, no
+`target_border_idx`** (structural permutation independence, `ctr_type.cpp:43-56`). A Counter arm
+that threads a permutation in will not type-check, which is the point.
+
+**2. There is no `CTR_TYPE_COUNTER` const yet.** T12 should add it beside `CTR_TYPE_BORDERS` /
+`CTR_TYPE_BUCKETS` (`ctr_device.rs:277`/`:279`) with the same C-3 discriminant citation, rather
+than spelling a bare `4` in `session.rs`. T09's finding #1 already specifies the rest of T12's
+hunk (both `ctr_covered` closures + the `build_ctr_cindex_columns` match + moving `4` from the
+decline loop to the admit loop in `session_ctr_type_test`).
+
+**3. C-7 confirmed empirically.** Counter returns the same `ResidentCtr` triple as the ordered
+path, with `total[obj]` = the CONSTANT max-bucket denominator repeated per object (mirroring
+`ctr_feature.rs:304`'s `denoms = vec![denominator; n]`), so `binarize_ctr_column_resident` and
+the existing per-column border table apply **unchanged** — `quantize_in_f32 == false` for
+Counter, the same f64 quantizer as Borders/Buckets. `binarize_counter_column_host`'s bit-exact
+oracle is the proof. No per-type border handling is needed anywhere.
+
+**4. Kernel-style note for T14 (BTMV), cost-free.** Under a generic `<F: Float>`, `F::new(1.0)`
+emits `warning: falling back to f32 as the trait bound f32: From<f64> is not satisfied`
+(`float_literal_f32_fallback`, a **future hard error**) — `Float::new` takes an `f32`. Use
+`F::from_int(1)` for integer constants inside a generic `#[cube]` body. T14's BTMV kernel does
+the same `/(count + 1)` division and will hit this on its first draft. **NOTE T14's contract is
+the opposite of T11's on width**: BTMV's accumulator is a *parity contract* `Array<f32>`
+(`TCtrMeanHistory::Sum` is `float` upstream) and must stay concrete with the C-2/§2.4 comment,
+whereas T11's Counter tally is an exact integer `Array<u32>` and its value channel is generic.
+
+**5. The device suite now exercises the ctr_device module on BOTH backends.**
+`cargo test -p cb-backend --lib kernels::ctr_device_test` (**default cpu** features) is
+`10 passed; 0 failed`, same as under rocm. Useful cheap smoke for any later kernel edit in this
+file — it catches a broken `#[cube]` body without a GPU. It is **not** a substitute for the rocm
+run (R-9 still applies to anything claiming device evidence).
+
+**D-04 held at T11:** `device_ctr_fit_test` `max |Δpred| = 4.483e-11`, unchanged; `device grows
+= 5`; 23/23 device PASS (+ perf lane, Poisson 10.7×, no R-13 flake); `cb-backend --lib` under
+rocm `267 passed / 0 failed; 2 ignored` (265 at T09/T10 + T11's 2 new tests). Zero clippy
+diagnostics originate from `ctr_device.rs` / `ctr_device_test.rs`; the pre-existing `erasing_op`
+at `score_split.rs:374` is still the only `error` on that lane.
+
+## From T12 → **T13** (primary), **T16/T19** (the gate chain), **T24**
+
+T12 wired T11's Counter kernel into production: `CTR_TYPE_COUNTER` (`ctr_device.rs`, beside the
+other two consts), `4` added to **both** `ctr_covered` closures, a
+`CTR_TYPE_COUNTER => launch_counter_ctr_resident(client, &bins, col.prior, buckets, n)` arm in
+`build_ctr_cindex_columns`, and `ECtrType::Counter` added to the `cb-train` gate's `from_i8`
+admission list. `device_ctr_counter_fit_test`: **`grown = 5`, `max |Δpred| = 1.388e-17`, 1.73 s**.
+Gate-state **row 3 flipped to `true`** in the same edit; rows 1-2 and 4-10 untouched.
+
+**1. `counter_calc_method` is structurally moot on a device fit — T13's decline must come from
+somewhere else.** Nothing in the device path reads that field, and the widening it performs
+(learn + every eval-set tally, `online_ctr.cpp:714-729`) is reachable ONLY through
+`train_cat_with_eval_sets` (PLAN C-1). Since T12 the CTR **type** list admits Counter, so a T13
+negative test that leaves `eval_sets` empty now proves nothing at all — it would decline for no
+reason and pass vacuously. T13 must drive a genuinely non-empty `eval_sets` slice and show the
+decline comes from the eval-set/fold gate. This is recorded in-source in the gate's new
+"Counter IS covered" doc section, which names T13 as the owner of that boundary.
+
+**2. `session_ctr_type_test`'s mixed structure/averaging pair now uses
+`BINARIZED_TARGET_MEAN_VALUE`, and T16 must swap it again.** Those two assertions
+(`config_with(BORDERS, X)` / `config_with(X, BORDERS)`) are what pin that BOTH `.all(..)`
+closures carry the type conjunct; they need an `X` that still DECLINES. T09 used `Counter`, T12
+implemented it and moved the pair to BTMV. **When T16 admits BTMV it must move the pair to an
+out-of-enum stray (e.g. `6`) — not delete the two assertions.** An in-source note says so.
+T12 also added `COUNTER` to `buckets_keeps_the_borders_shape_checks`' loop (C-7 for the newly
+admitted type, mutation-proved); T16 should add BTMV there the same way.
+
+**3. The delta is not a fingerprint in EITHER direction — third data point.** On
+`ctr_device_counter` the device prints `1.388e-17` and the CPU fallback `2.776e-17` (they
+differ); on `ctr_device_buckets` (T10) both print `2.776e-17` (they coincide); on
+`ctr_device_mixed` (T20) device `4.483e-11` vs CPU `1.388e-17`. Only `grown == iterations` and
+the runtime (≈1.7-1.9 s device vs 0.01 s CPU) held every time.
+
+**4. A prior mismatch is guarded by CONSTRUCTION, never by the fixture (T06's finding, closed).**
+Three layers now: `simple_ctr_priors: vec![0.5]` in the e2e's `BoostParams`; an in-test
+`assert_eq!` on it before the fit; and
+`boosting_ctr_gate_tests::counter_is_a_cpu_legal_whole_set_tally_not_a_class_prefix`, which pins
+`ECtrType::Counter.default_priors() == [0/1]` against Borders/Buckets' three-prior default
+(mutation-proved). Any later Counter/BTMV fixture inherits the same hazard class: **check the
+default-prior arm of `ECtrType::default_priors` before assuming the params list may be left
+implicit.**
+
+**5. PROCESS — never `git checkout <file>` to revert a §2.5 mutation in a file your task also
+edits.** T12 did that once after MUT-1 and silently lost all three of its `boosting.rs` hunks;
+caught by a `grep` for the admitted discriminant, reapplied, and every later mutation used a
+targeted textual revert. T10's use of `git checkout` was safe only because it had mutated a file
+(`ctr/mod.rs`) it had not otherwise edited. Verify with `git diff <file>` after every revert.
+
+**6. `CountingGpu` is now duplicated FOUR times** (`device_ctr_gate_test.rs:82-138` canonical,
+`device_ctr_fit_test.rs`, `device_ctr_buckets_fit_test.rs`, `device_ctr_counter_fit_test.rs`);
+expect one more per remaining e2e (T16, T19) at T24's DoD count.
+
+**D-04 held at T12:** `device_ctr_fit_test` `max |Δpred| = 4.483e-11`, unchanged; `device grows
+= 5`; `device_ctr_buckets_fit_test` unchanged at `2.776e-17`; 23/23 device PASS (+ perf lane,
+Poisson 10.7×, no R-13 flake); `cb-backend --lib` under rocm `267 passed / 0 failed; 2 ignored`
+(identical to T11); `cb-train --lib` `396 passed / 0 failed`; `cargo test -p cb-train` **108
+targets, all ok**. No new pre-existing-failure item was discovered.
+
+## From T13 → **T21** (file co-owner), **T16/T19** (every remaining e2e), **T23/T24**
+
+T13 created `crates/cb-train/tests/device_ctr_type_gate_test.rs` with the
+`{SkipTest, Full} × {no eval set, eval set}` square (4 tests, 1.77 s, all green). Production
+change: **doc comment only** on `ctr_types_are_device_covered`. D-04 held (`4.483e-11`);
+`run_device_tests.sh` **24 PASS / 0 FAIL**; `cargo test -p cb-train` **109 targets, all ok**.
+
+**1. The eval-set decline is at `device_host_eligible`, not at the CTR type list — and both
+mutations were needed to say so.** MUT-1 (delete only `&& eval_sets.is_empty()`,
+`boosting.rs:4620`) flips **both** declining cells to `grown = 5` (`left: 5, right: 0`,
+exactly as predicted) and leaves both committing cells green. MUT-2 (T20's universal
+`&& false` on the type gate) reddens **only** the two committing cells (`left: 0, right: 5`,
+run collapses to 0.02 s). The two mutations partition the four cells; on its own a
+`grown == 0` assertion cannot distinguish "declined at the eval-set clause" from "declined at
+the type clause". **Any later task asserting a decline should run the mutation for the clause
+it CLAIMS, not merely a mutation that reddens the test.**
+
+**2. LEARN-SET SIZE IS A VACUITY HAZARD — read before designing any new CTR e2e.** T13's first
+draft followed the task text literally (32-row learn half of `ctr_device_counter`) and **three
+of four cells grew models with ZERO CTR splits**: at 32 rows this recipe's float splits beat
+every Counter CTR candidate. The cell that *passed* was the required negative — i.e. without
+a `Σ ctr_splits >= 1` guard the test would have shipped green, vacuous and CTR-free. Two
+carries: (a) **every CTR routing test must assert ≥1 chosen CTR split AND assert the chosen
+splits' `ctr_type`**, not just `grown`; (b) **do not shrink or resample a CTR fixture's learn
+set** — T13's fix was to make the learn side the whole frozen fixture (byte-identical to
+DCTR-10's proven-committing configuration) and take only the eval slice from it. T16/T19
+should reuse their fixture's full learn set for the same reason.
+
+**3. `counter_calc_method` is now CLOSED as a P1 question.** `Full ≡ SkipTest` whenever
+`eval_sets` is empty (`counter_full_eval_columns` is assembled purely out of `eval_sets`,
+`boosting.rs:4231-4249`), and eval sets never reach the device. The gate's doc block now says
+so with the citations and the layer. **The two declining cells carry `// P3 WILL INVERT
+THIS.`** — P3 must FLIP them to `grown == params.iterations`, not preserve or delete them.
+
+**4. File ownership (T21).** `device_ctr_type_gate_test.rs` is shared with **T21**, which adds
+the DCTR-03 surviving-clause pins to the same file. T21 can reuse `device::assert_route(tag,
+method, with_eval_set, expect)` and `device::Route`; `load_split()` is `ctr_device_counter`
+specific. T22 does **not** touch this file (it owns `device_ctr_combo_types_diff_test.rs`).
+
+**5. `CountingGpu` is now duplicated FIVE times** (`device_ctr_gate_test.rs:82-138` canonical,
+`device_ctr_fit_test.rs`, `device_ctr_buckets_fit_test.rs`, `device_ctr_counter_fit_test.rs`,
+`device_ctr_type_gate_test.rs`); expect one more per remaining e2e (T16, T19) at T24's DoD
+count.
+
+**6. T23 must add `device_ctr_type_gate_test` to `run_device_tests.sh`'s `TESTS=(…)`** (C-8 —
+T13 did not touch that file; the binary was verified with explicit `--test` invocations).
+
+**7. Process (confirms T12 §6).** Both mutations were reverted by **targeted textual edit**
+and `git diff crates/cb-train/src/boosting.rs` re-verified after each (40 ins / 4 del,
+T12's three hunks, byte-identical before and after). `grep -rn "MUTATION-T13" crates/` is
+empty. No new pre-existing-failure item was discovered; T02/T04/T08/T10's list is unchanged.
+
+## From the coordinator → **T23 and T24** (ownership of `run_device_tests.sh` — settle this now)
+
+T10 and T13 each recorded that "T23 owns `run_device_tests.sh`". That is **wrong**. PLAN §6
+**C-8** names **T24** as the single owner, precisely to avoid concurrent edits to the
+`TESTS=(…)` array, and §7's DoD makes registering every new device binary a T24
+deliverable. **T23 must not touch the script; T24 registers all of the new binaries in one
+edit.**
+
+As of the end of Wave 4 the script is byte-unchanged from `HEAD` (23 test names + the
+isolated perf lane). New device binaries created so far that T24 must register:
+
+* `device_ctr_buckets_fit_test`   (T10)
+* `device_ctr_counter_fit_test`   (T12)
+* `device_ctr_type_gate_test`     (T13)
+
+…plus whatever T16, T19 and T22 add. `device_ctr_combo_fit_test` is **already** listed
+(line 13) and is currently `#[ignore]`d — T19 un-ignores it, which changes that entry from
+a vacuous pass to a real one without changing the array.

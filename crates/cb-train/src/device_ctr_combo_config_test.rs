@@ -191,7 +191,7 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 /// ```text
 ///   row 1  simple   Borders      0  1.0  => true    flips_at: never (D-04 pin)
 ///   row 2  combo    Borders      0  1.0  => false   flips_at: T19 (arity)
-///   row 3  simple   Counter      0  1.0  => false   flips_at: T12 (type)
+///   row 3  simple   Counter      0  1.0  => true    FLIPPED by T12 (type)
 ///   row 4  simple   Buckets      1  1.0  => true    FLIPPED by T10 (type + target border)
 ///   row 5  simple   BTMV         0  1.0  => false   flips_at: T16 (type)
 ///   row 6  simple   Borders      0  2.0  => true    FLIPPED by T01 (prior denominator)
@@ -244,8 +244,11 @@ fn gate_state_table() -> Vec<GateRow> {
         GateRow {
             label: "simple/Counter/b=0/denom=1.0",
             column: with_type(covered_column(simple(), 2), ECtrType::Counter),
-            expected: false,
-            flips_at: "T12 — admits Counter in the `ctr_type` conjunct",
+            expected: true,
+            flips_at: "FLIPPED by T12 — admitted Counter in the `ctr_type` conjunct \
+                       (DCTR-10). This row varies exactly ONE attribute against row 1, so \
+                       restoring the pre-T12 two-type list turns THIS row, and only this \
+                       row, red",
         },
         GateRow {
             label: "simple/Buckets/b=1/denom=1.0",

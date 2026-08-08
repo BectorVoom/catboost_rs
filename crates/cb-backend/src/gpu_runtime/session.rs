@@ -61,8 +61,8 @@ use crate::kernels::bootstrap_device::{
 };
 use crate::kernels::mvs_device::launch_mvs_weights_resident;
 use crate::kernels::ctr_device::{
-    binarize_ctr_column_resident, combine_projection_bins, launch_ordered_ctr_resident,
-    CTR_TYPE_BORDERS, CTR_TYPE_BUCKETS,
+    binarize_ctr_column_resident, combine_projection_bins, launch_counter_ctr_resident,
+    launch_ordered_ctr_resident, CTR_TYPE_BORDERS, CTR_TYPE_BUCKETS, CTR_TYPE_COUNTER,
 };
 use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
@@ -134,19 +134,27 @@ fn mvs_lambda_from_der(derivatives: &[f64]) -> f64 {
 /// must still be the covered default (no bootstrap / MVS / exact / leaf-cap) — D-10-01
 /// all-or-nothing PER family; the caller ANDs those in.
 ///
-/// # The per-type admission list (DCTR-07 / T09)
+/// # The per-type admission list (DCTR-07 / T09, DCTR-10 / T12)
 ///
-/// This wave implements the ORDERED CLASS-PREFIX types: `Borders` (`0`) and `Buckets` (`1`).
-/// Both share one numerator kernel selected by `(ctr_type, target_border_idx)`
-/// ([`launch_ordered_ctr_resident`]) and one border-table shape contract — **C-7: admitting
-/// Buckets adds an admission LIST and changes nothing else.** Buckets quantizes through the same
-/// `calc_ctr_online_bin` border table as Borders on the CPU, so a per-type shape special case
-/// would be a divergence, not a fix. `BinarizedTargetMeanValue` (`2`) and `Counter` (`4`) get
-/// their own device statistics in later waves; `FloatTargetMeanValue` (`3`) and `FeatureFreq`
-/// (`5`) are GPU-only upstream (`restrictions.h:20-32`) and have no parity surface. The
-/// discriminants are transcribed BY VALUE from `cb_train::ctr::ECtrType` — see
-/// [`CTR_TYPE_BORDERS`] / [`CTR_TYPE_BUCKETS`] for the Pattern B / C-3 rationale
-/// (`cb-backend` must never gain a `cb-train` dep).
+/// The admitted set is `{Borders (0), Buckets (1), Counter (4)}`.
+///
+/// `Borders` and `Buckets` are the ORDERED CLASS-PREFIX types: they share one numerator kernel
+/// selected by `(ctr_type, target_border_idx)` ([`launch_ordered_ctr_resident`]).
+/// `Counter` (DCTR-09 / T11) is a whole-set tally with a CONSTANT max-bucket denominator and is
+/// permutation-INdependent (`ctr_type.cpp:43-56`), so it has its own entry point
+/// ([`launch_counter_ctr_resident`]) — see [`build_ctr_cindex_columns`]'s dispatch.
+///
+/// All three share ONE border-table shape contract — **C-7: admitting a type adds an admission
+/// LIST entry and changes nothing else.** Buckets and Counter both quantize through the same
+/// `calc_ctr_online_bin` border table as Borders on the CPU (`quantize_in_f32 == false`), so a
+/// per-type shape special case would be a divergence, not a fix.
+///
+/// `BinarizedTargetMeanValue` (`2`) gets its own device statistic in a later wave;
+/// `FloatTargetMeanValue` (`3`) and `FeatureFreq` (`5`) are GPU-only upstream
+/// (`restrictions.h:20-32`) and have no parity surface. The discriminants are transcribed BY
+/// VALUE from `cb_train::ctr::ECtrType` — see [`CTR_TYPE_BORDERS`] / [`CTR_TYPE_BUCKETS`] /
+/// [`CTR_TYPE_COUNTER`] for the Pattern B / C-3 rationale (`cb-backend` must never gain a
+/// `cb-train` dep).
 ///
 /// # Safety property: a gate/list mismatch degrades LOUDLY (C-14)
 ///
@@ -177,11 +185,14 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
         && ctr.target_class.len() == n
         && !ctr.columns.is_empty()
         && ctr.columns.iter().all(|col| {
-            // DCTR-07 (T09): the per-type admission LIST — an explicit `{Borders, Buckets}`
-            // enumeration, never a range check, so a future discriminant is declined by
-            // default. C-7: the two shape conjuncts are UNCHANGED for every type.
-            matches!(col.ctr_type, CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS)
-                && !col.member_bins.is_empty()
+            // DCTR-07 (T09) / DCTR-10 (T12): the per-type admission LIST — an explicit
+            // `{Borders, Buckets, Counter}` enumeration, never a range check, so a future
+            // discriminant is declined by default. C-7: the two shape conjuncts are
+            // UNCHANGED for every type, Counter included.
+            matches!(
+                col.ctr_type,
+                CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS | CTR_TYPE_COUNTER
+            ) && !col.member_bins.is_empty()
                 && col.borders.len() + 1 == n_bins
         })
         && avg.permutation.len() == n
@@ -191,8 +202,10 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
             // The AVERAGING half mirrors every structure-half invariant (GDC-09): a
             // one-sided admission would leave the leaf-value gather materializing a type
             // the numerator kernel does not implement.
-            matches!(col.ctr_type, CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS)
-                && !col.member_bins.is_empty()
+            matches!(
+                col.ctr_type,
+                CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS | CTR_TYPE_COUNTER
+            ) && !col.member_bins.is_empty()
                 && col.borders.len() + 1 == n_bins
         })
 }
@@ -236,8 +249,9 @@ struct CtrSearchState {
 ///
 /// # Errors
 /// [`CbError::Unsupported`] if a column carries a CTR type this backend has no device
-/// statistic for (DCTR-07 / T09 — the dispatch admits only the ordered class-prefix types
-/// `Borders` and `Buckets`); plus any [`CbError`] propagated from the device CTR launch,
+/// statistic for (DCTR-07 / T09, DCTR-10 / T12 — the dispatch admits the ordered class-prefix
+/// types `Borders` / `Buckets` plus the whole-set `Counter` tally); plus any [`CbError`]
+/// propagated from the device CTR launch,
 /// the projection fold, the binarize or the bin read-back. [`ctr_covered`] has already
 /// declined an unsupported type before this runs, so the `_` dispatch arm is defensive —
 /// but it must stay an error, never a fall-through to the Borders numerator.
@@ -258,9 +272,15 @@ fn build_ctr_cindex_columns(
         } else {
             combine_projection_bins(&col.member_bins, n)?
         };
-        // DCTR-07 (T09): dispatch on the column's CTR TYPE. `Borders` and `Buckets` are the
-        // two ORDERED CLASS-PREFIX types — one kernel, one border-table contract, differing
-        // only in the numerator selected by `(ctr_type, target_border_idx)` (DCTR-06 / T08).
+        // DCTR-07 (T09) / DCTR-10 (T12): dispatch on the column's CTR TYPE. `Borders` and
+        // `Buckets` are the two ORDERED CLASS-PREFIX types — one kernel, one border-table
+        // contract, differing only in the numerator selected by `(ctr_type,
+        // target_border_idx)` (DCTR-06 / T08). `Counter` is NOT a class-prefix statistic: its
+        // numerator is the whole-set bucket total and its denominator the CONSTANT max bucket
+        // total, so it takes neither the permutation nor the target class (it is
+        // permutation-INdependent, `ctr_type.cpp:43-56`) and routes to its own entry point
+        // (DCTR-09 / T11). Threading `permutation` / `target_class` into that call would not
+        // type-check, which is the point — the two statistics can never be confused.
         // Every other discriminant gets its own device statistic in a later wave and is an
         // explicit typed error here, never a fall-through to the Borders numerator (which
         // would be a WRONG answer, not a worse one). `ctr_covered` already declined such a
@@ -277,6 +297,7 @@ fn build_ctr_cindex_columns(
                 col.ctr_type,
                 col.target_border_idx,
             )?,
+            CTR_TYPE_COUNTER => launch_counter_ctr_resident(client, &bins, col.prior, buckets, n)?,
             other => {
                 return Err(CbError::Unsupported(format!(
                     "device CTR type {other} is not implemented"

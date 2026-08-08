@@ -97,8 +97,19 @@ fn config(ctr_type: i8) -> DeviceTrainConfig {
     config_with(column(ctr_type, 0), column(ctr_type, 0))
 }
 
-/// DCTR-07: `ctr_covered` admits EXACTLY `{Borders, Buckets}` and declines every other
-/// `ECtrType` discriminant.
+/// DCTR-07 / DCTR-10: `ctr_covered` admits EXACTLY `{Borders, Buckets, Counter}` and declines
+/// every other `ECtrType` discriminant.
+///
+/// # The admitted set moves with the device statistics, one task at a time
+///
+/// T09 seeded this loop with `{Borders, Buckets}` and told T12/T16 that widening it is their
+/// **expected Red**, not a regression: a task that adds a device statistic must, in the same
+/// hunk, add its discriminant to both `ctr_covered` closures, add its arm to
+/// [`super::build_ctr_cindex_columns`]'s dispatch, and move the discriminant from the decline
+/// loop below to the admit loop above. T12 did that for `Counter` (`4`, DCTR-10). What must
+/// stay in the decline loop **forever** is `{FloatTargetMeanValue (3), FeatureFreq (5)}` —
+/// GPU-only upstream (`restrictions.h:20-32`), so no CPU oracle could ever prove parity — plus
+/// every out-of-enum stray.
 ///
 /// # Why declining loudly is safe (C-14 — the property this task records)
 ///
@@ -110,7 +121,13 @@ fn config(ctr_type: i8) -> DeviceTrainConfig {
 /// two lists may be widened in separate hunks with no torn intermediate state.
 #[test]
 fn ctr_covered_declines_unimplemented_ctr_types() {
-    for (ctr_type, name) in [(BORDERS, "Borders"), (BUCKETS, "Buckets")] {
+    for (ctr_type, name) in [
+        (BORDERS, "Borders"),
+        (BUCKETS, "Buckets"),
+        // DCTR-10 (T12): Counter is device-implemented via `launch_counter_ctr_resident`
+        // (a whole-set tally, NOT the class-prefix kernel).
+        (COUNTER, "Counter"),
+    ] {
         assert!(
             ctr_covered(&config(ctr_type), N, N_BINS),
             "{name} ({ctr_type}) is device-implemented and must be ADMITTED by ctr_covered"
@@ -120,7 +137,6 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
     for (ctr_type, name) in [
         (BINARIZED_TARGET_MEAN_VALUE, "BinarizedTargetMeanValue"),
         (FLOAT_TARGET_MEAN_VALUE, "FloatTargetMeanValue"),
-        (COUNTER, "Counter"),
         (FEATURE_FREQ, "FeatureFreq"),
     ] {
         assert!(
@@ -142,21 +158,38 @@ fn ctr_covered_declines_unimplemented_ctr_types() {
     // BOTH `.all(..)` closures must carry the conjunct: a config whose structure half is
     // covered but whose averaging half is not (or vice versa) must decline. A one-sided edit
     // would leave the leaf-value gather materializing an unimplemented type.
+    //
+    // The mixed pair uses `BinarizedTargetMeanValue` — the one CPU-legal type that is still
+    // unimplemented on device. (T09 used `Counter` here; T12 implemented it. T16, which
+    // implements BTMV, must swap this pair to a type that is still declined, or to an
+    // out-of-enum stray, rather than deleting the two assertions.)
     assert!(
-        !ctr_covered(&config_with(column(BORDERS, 0), column(COUNTER, 0)), N, N_BINS),
+        !ctr_covered(
+            &config_with(column(BORDERS, 0), column(BINARIZED_TARGET_MEAN_VALUE, 0)),
+            N,
+            N_BINS
+        ),
         "an unimplemented AVERAGING column must decline (the averaging `.all(..)` closure \
          needs the same conjunct as the structure one)"
     );
     assert!(
-        !ctr_covered(&config_with(column(COUNTER, 0), column(BORDERS, 0)), N, N_BINS),
+        !ctr_covered(
+            &config_with(column(BINARIZED_TARGET_MEAN_VALUE, 0), column(BORDERS, 0)),
+            N,
+            N_BINS
+        ),
         "an unimplemented STRUCTURE column must decline"
     );
 }
 
-/// C-7: admitting Buckets adds an admission LIST and nothing else — the border-table shape
-/// check (`borders.len() + 1 == n_bins`) and the non-empty-member check are UNCHANGED for
-/// every type. Buckets quantizes through the same `calc_ctr_online_bin` border table as
-/// Borders on the CPU, so a per-type shape special case would be a divergence, not a fix.
+/// C-7: admitting a type adds an admission LIST entry and nothing else — the border-table
+/// shape check (`borders.len() + 1 == n_bins`) and the non-empty-member check are UNCHANGED
+/// for every type. Buckets (T09) and Counter (T12) both quantize through the same
+/// `calc_ctr_online_bin` border table as Borders on the CPU (`quantize_in_f32 == false`;
+/// Counter's `total` is the CONSTANT max-bucket denominator repeated per object, so the
+/// resident triple has the ordered path's shape exactly), so a per-type shape special case
+/// would be a divergence, not a fix. Every task that widens the admission list adds its type
+/// to the loop below.
 #[test]
 fn buckets_keeps_the_borders_shape_checks() {
     let wrong_borders = |ctr_type: i8| {
@@ -170,7 +203,7 @@ fn buckets_keeps_the_borders_shape_checks() {
         col
     };
 
-    for (ctr_type, name) in [(BORDERS, "Borders"), (BUCKETS, "Buckets")] {
+    for (ctr_type, name) in [(BORDERS, "Borders"), (BUCKETS, "Buckets"), (COUNTER, "Counter")] {
         assert!(
             !ctr_covered(
                 &config_with(wrong_borders(ctr_type), column(ctr_type, 0)),

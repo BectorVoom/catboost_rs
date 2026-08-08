@@ -217,6 +217,95 @@ fn ordered_ctr_prefix_kernel(
     }
 }
 
+/// Device **Counter** CTR statistic (DCTR-09) — the whole-set per-bucket tally with a CONSTANT
+/// denominator. This is a **sibling** of [`ordered_ctr_prefix_kernel`], deliberately NOT a mode on
+/// it: the prefix kernel's loop is permutation-driven and read-before-increment, whereas Counter
+/// has no permutation and reads the FINAL tally, so branching the prefix loop would carry a dead
+/// mode through the hot path for no shared arithmetic.
+///
+/// # Upstream
+/// `CalcOnlineCTRCounter` (`online_ctr.cpp:503-568`) with `CountOnlineCTRTotal` +
+/// `counterCTRDenominator` (`online_ctr.cpp:713-729`); mirrored on the CPU by
+/// `cb_train::ctr::online::online_counter_column` (`cb-train/src/ctr/online.rs:493-521`)
+/// composed with `calc_ctr_online` at `ctr_feature.rs:296-309`:
+///
+/// ```text
+/// totals[b]   = #{obj : bins[obj] == b}     // WHOLE learn set, no permutation
+/// denominator = max_b totals[b]             // CONSTANT across objects
+/// value[obj]  = (totals[bins[obj]] + prior) / (denominator + 1)
+/// ```
+///
+/// `total[obj] = denominator` for every object is deliberate — it mirrors
+/// `denoms = vec![denominator; n]` (`ctr_feature.rs:304`), so the emitted `(good, total, value)`
+/// triple has the same shape as the ordered path's and quantizes through the SAME f64 border table
+/// (`quantize_in_f32 == false`, C-7). Counter is **permutation independent**
+/// (`IsPermutationDependentCtrType(Counter) == false`, `ctr_type.cpp:43-56`), which this kernel
+/// gets structurally: it has no `perm` parameter.
+///
+/// # `counter_calc_method = Full` is NOT implemented and is unreachable on device
+/// Upstream widens the tally AND the max denominator over the learn set plus every eval set
+/// (`CountOnlineCTRTotal`, `online_ctr.cpp:713-729`; the CPU mirror is `online_counter_column`'s
+/// `extra_bins`). This seam carries **no eval bins at all**, so the widening cannot be expressed
+/// here, and the fit declines to the CPU whenever an eval set is present — T13 pins that boundary
+/// with a negative test. Do not add an `extra_bins` argument without that test moving first.
+///
+/// # Shape
+/// Serial single-thread (unit 0), three passes: tally, max, map. Counter columns are built ONCE
+/// per fit inside `begin` (never per tree), so this is not a hot path and the serial form buys
+/// D-06 residency with no atomics (`SPEC.md` §9). `counts` is the per-bucket tally scratch
+/// (length `bucket_count`), **PRE-ZEROED by the host** — a reused non-zeroed buffer silently
+/// doubles the tally. Every index derives from a host-validated bound
+/// ([`launch_counter_ctr_resident`] range-checks `bins` against `bucket_count`). Generic over
+/// `F: Float` for the value channel (AGENTS.md generics-float); the tally is `Array<u32>` because
+/// it is an EXACT integer count. `while` with an explicit counter, `if` STATEMENTS only, no
+/// `-inf` literal (Pattern D).
+#[cube(launch)]
+fn counter_ctr_kernel<F: Float>(
+    bins: &Array<u32>,
+    prior: &Array<F>,
+    counts: &mut Array<u32>,
+    good: &mut Array<u32>,
+    total: &mut Array<u32>,
+    value: &mut Array<F>,
+) {
+    if ABSOLUTE_POS == 0 {
+        let pr = prior[0];
+        let n = bins.len();
+        let k = counts.len();
+        // PASS 1 — tally the WHOLE set. No read-before-increment here: unlike the ordered
+        // prefix, every object sees the FINAL tally (upstream counts first, then maps).
+        let mut i = 0usize;
+        while i < n {
+            let b = bins[i] as usize;
+            counts[b] = counts[b] + 1u32;
+            i += 1usize;
+        }
+        // PASS 2 — the CONSTANT denominator: `max_b totals[b]` (`counterCTRDenominator`).
+        let mut m = 0u32;
+        let mut j = 0usize;
+        while j < k {
+            let c = counts[j];
+            if c > m {
+                m = c;
+            }
+            j += 1usize;
+        }
+        // PASS 3 — map each object onto its bucket's total and the shared denominator.
+        let mut d = 0usize;
+        while d < n {
+            let b = bins[d] as usize;
+            let t = counts[b];
+            good[d] = t;
+            total[d] = m;
+            // `calc_ctr_online`'s denominator is a HARD `+1` (`calc_ctr.rs:77-80`), so it is
+            // written as the exact integer one: `F::new(1.0)` would take an `f32` literal and
+            // trip `float_literal_f32_fallback` on the generic parameter.
+            value[d] = (F::cast_from(t) + pr) / (F::cast_from(m) + F::from_int(1));
+            d += 1usize;
+        }
+    }
+}
+
 /// Binarize accumulated CTR VALUES into cindex bin indices on device (the CTR→cindex JOIN):
 /// `bin[i] = #{ borders[j] : value[i] > borders[j] }` — the upstream `> bin` threshold convention
 /// every cindex consumer already uses (so the emitted column drops straight into the histogram
@@ -277,6 +366,11 @@ pub(crate) struct ResidentCtr {
 pub(crate) const CTR_TYPE_BORDERS: i8 = 0;
 /// `cb_train::ctr::ECtrType::Buckets` — see [`CTR_TYPE_BORDERS`] for the transcription rationale.
 pub(crate) const CTR_TYPE_BUCKETS: i8 = 1;
+/// `cb_train::ctr::ECtrType::Counter` — see [`CTR_TYPE_BORDERS`] for the transcription rationale.
+/// Unlike Borders/Buckets this is NOT a class-prefix type: it routes to
+/// [`launch_counter_ctr_resident`], never to [`launch_ordered_ctr_resident`] (whose host guard
+/// rejects it, DCTR-06 / T08).
+pub(crate) const CTR_TYPE_COUNTER: i8 = 4;
 
 /// The largest `target_border_idx` reachable at binclf: `SIMPLE_CLASSES_COUNT == 2`
 /// (`cb-train/src/ctr/online.rs:52`) ⇒ the per-bucket class prefix is `[N0, N1]`, so a selector
@@ -397,6 +491,100 @@ pub(crate) fn launch_ordered_ctr_resident(
             unsafe { ArrayArg::from_raw_parts(class_h, n) },
             unsafe { ArrayArg::from_raw_parts(prior_h, 1) },
             unsafe { ArrayArg::from_raw_parts(mode_h, 2) },
+            unsafe { ArrayArg::from_raw_parts(counts_h, scratch_len) },
+            unsafe { ArrayArg::from_raw_parts(good_h.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(total_h.clone(), n) },
+            unsafe { ArrayArg::from_raw_parts(value_h.clone(), n) },
+        );
+        Ok(ResidentCtr {
+            good: good_h,
+            total: total_h,
+            value: value_h,
+        })
+    }
+}
+
+/// Accumulate the **Counter** CTR for one feature/projection ON device, resident (D-06), returning
+/// the resident output handles WITHOUT reading them back (DCTR-09). `bins` is the per-object bucket
+/// (object order); `bucket_count` the distinct-bucket count (`max(bins) + 1`, host-validated);
+/// `prior` the additive CTR prior numerator.
+///
+/// # No permutation, no class, no target border — by construction
+/// Counter is **permutation independent** (`IsPermutationDependentCtrType(Counter) == false`,
+/// `ctr_type.cpp:43-56`) and is not a class-prefix statistic at all: its numerator is the whole-set
+/// bucket total and its denominator the MAX bucket total, neither derivable from one bucket's class
+/// counts. That is why this is a separate entry point rather than a widening of
+/// [`launch_ordered_ctr_resident`], whose host guard **rejects** `ctr_type == Counter` precisely so
+/// a Counter column can never silently receive the Borders numerator (T08).
+///
+/// The emitted `(good, total, value)` triple has the ordered path's shape — `total` is the
+/// CONSTANT denominator repeated per object, mirroring `denoms = vec![denominator; n]`
+/// (`ctr_feature.rs:304`) — so [`binarize_ctr_column_resident`] and the existing per-column border
+/// table apply unchanged (C-7).
+///
+/// # Errors
+/// [`CbError::OutOfRange`] on the wgpu f64 path (WR-02) or if any bin is `>= bucket_count`;
+/// [`CbError::LengthMismatch`] if `bins` disagrees with `n`.
+#[cfg_attr(feature = "wgpu", allow(unused_variables))]
+pub(crate) fn launch_counter_ctr_resident(
+    client: &cubecl::client::ComputeClient<SelectedRuntime>,
+    bins: &[u32],
+    prior: f64,
+    bucket_count: usize,
+    n: usize,
+) -> CbResult<ResidentCtr> {
+    if bins.len() != n {
+        return Err(CbError::LengthMismatch {
+            column: "ctr counter bins".to_owned(),
+            expected: n,
+            actual: bins.len(),
+        });
+    }
+    // WR-02: guard the bin range host-side before dispatch. The kernel indexes `counts[bucket]`
+    // (length `bucket_count`), so a bin >= bucket_count is an out-of-bounds device access (UB).
+    // Same guard as `launch_ordered_ctr_resident`, minus the class check (Counter reads no class).
+    if let Some(&bad) = bins.iter().find(|&&b| (b as usize) >= bucket_count) {
+        return Err(CbError::OutOfRange(format!(
+            "ctr bin value {bad} >= bucket_count ({bucket_count})"
+        )));
+    }
+    if n == 0 {
+        return Ok(ResidentCtr {
+            good: client.empty(0),
+            total: client.empty(0),
+            value: client.empty(0),
+        });
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        return Err(wgpu_reject());
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        // PRE-ZEROED per-bucket tally scratch (one u32 per bucket); at least length 1 so an
+        // all-zero-bin degenerate feature still has a valid bucket-0 slot. A reused non-zeroed
+        // buffer would silently double the tally, so this allocation is never shared.
+        let scratch_len = bucket_count.max(1);
+        let counts_h = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; scratch_len]));
+        let bins_h = client.create(cubecl::bytes::Bytes::from_elems(bins.to_vec()));
+        let prior_h = client.create(cubecl::bytes::Bytes::from_elems(vec![prior]));
+        let good_h = client.empty(n * std::mem::size_of::<u32>());
+        let total_h = client.empty(n * std::mem::size_of::<u32>());
+        let value_h = client.empty(n * std::mem::size_of::<f64>());
+
+        // Serial single-thread launch (unit 0 runs the three passes); one cube, one unit.
+        let count = CubeCount::Static(1, 1, 1);
+        let dim = CubeDim { x: 1, y: 1, z: 1 };
+        // The kernel is generic over `F: Float`; the launch pins `f64` because the CTR seam is
+        // f64 end to end (WR-02) and `binarize_ctr_column_resident` binarizes at f64.
+        counter_ctr_kernel::launch::<f64, SelectedRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(bins_h, n) },
+            unsafe { ArrayArg::from_raw_parts(prior_h, 1) },
             unsafe { ArrayArg::from_raw_parts(counts_h, scratch_len) },
             unsafe { ArrayArg::from_raw_parts(good_h.clone(), n) },
             unsafe { ArrayArg::from_raw_parts(total_h.clone(), n) },
@@ -538,6 +726,81 @@ pub(crate) fn compute_ordered_ctr_host_mode(
         .collect();
     let value = bytemuck::cast_slice::<u8, f64>(&value_b).to_vec();
     Ok((good, total, value))
+}
+
+/// DCTR-09 host-readback wrapper over the device **Counter** CTR (the self-oracle seam):
+/// accumulate the resident Counter column, then read the three buffers back to host `Vec`s (OBJECT
+/// order). This is NOT the residency path (that keeps the handles on-device); it is the
+/// device-vs-CPU oracle exerciser. A read-back failure surfaces [`CbError::Degenerate`] (WR-05),
+/// never a silent zero buffer.
+///
+/// Returns `(good, total, value)`; `good[obj]` is the whole-set tally of `obj`'s bucket and
+/// `total[obj]` the CONSTANT max-bucket denominator, both widened to `i64` to match the CPU
+/// reference's integer schema.
+///
+/// # Errors
+/// As [`launch_counter_ctr_resident`], plus [`CbError::Degenerate`] on a read-back failure.
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+pub(crate) fn compute_counter_ctr_host(
+    bins: &[u32],
+    prior: f64,
+    bucket_count: usize,
+) -> CbResult<(Vec<i64>, Vec<i64>, Vec<f64>)> {
+    let n = bins.len();
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let res = launch_counter_ctr_resident(&client, bins, prior, bucket_count, n)?;
+    let good_b = client.read_one(res.good).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL Counter CTR good read-back failed: {e:?}"))
+    })?;
+    let total_b = client.read_one(res.total).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL Counter CTR total read-back failed: {e:?}"))
+    })?;
+    let value_b = client.read_one(res.value).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL Counter CTR value read-back failed: {e:?}"))
+    })?;
+    let good = bytemuck::cast_slice::<u8, u32>(&good_b)
+        .iter()
+        .map(|&g| i64::from(g))
+        .collect();
+    let total = bytemuck::cast_slice::<u8, u32>(&total_b)
+        .iter()
+        .map(|&t| i64::from(t))
+        .collect();
+    let value = bytemuck::cast_slice::<u8, f64>(&value_b).to_vec();
+    Ok((good, total, value))
+}
+
+/// DCTR-09 host-readback wrapper over the device Counter CTR→cindex binarize JOIN (the self-oracle
+/// seam): accumulate the Counter column on device, binarize its values against the per-column
+/// border table on device, then read that bin column back. Returns the per-object bin indices
+/// (`> bin` convention). A read-back failure surfaces [`CbError::Degenerate`] (WR-05).
+///
+/// # Errors
+/// As [`launch_counter_ctr_resident`], plus [`CbError::Degenerate`] on a read-back failure.
+#[cfg(not(feature = "wgpu"))]
+#[allow(dead_code)] // consumed by the #[cfg(test)] ctr_device_test self-oracle (source/test separation)
+pub(crate) fn binarize_counter_column_host(
+    bins: &[u32],
+    prior: f64,
+    bucket_count: usize,
+    borders: &[f64],
+) -> CbResult<Vec<u32>> {
+    let n = bins.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    let res = launch_counter_ctr_resident(&client, bins, prior, bucket_count, n)?;
+    let bins_h = binarize_ctr_column_resident(&client, &res.value, borders, n)?;
+    let bytes = client.read_one(bins_h).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL Counter CTR cindex read-back failed: {e:?}"))
+    })?;
+    Ok(bytemuck::cast_slice::<u8, u32>(&bytes).to_vec())
 }
 
 /// Host-readback wrapper over the device CTR→cindex binarize JOIN (the self-oracle seam):
