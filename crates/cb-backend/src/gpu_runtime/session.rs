@@ -62,7 +62,7 @@ use crate::kernels::bootstrap_device::{
 use crate::kernels::mvs_device::launch_mvs_weights_resident;
 use crate::kernels::ctr_device::{
     binarize_ctr_column_resident, combine_projection_bins, launch_ordered_ctr_resident,
-    CTR_TYPE_BORDERS,
+    CTR_TYPE_BORDERS, CTR_TYPE_BUCKETS,
 };
 use crate::kernels::exact_quantile::device_exact_leaf_delta;
 use crate::kernels::nonsym_grow::{grow_nonsym_tree, NonsymPolicy};
@@ -125,13 +125,39 @@ fn mvs_lambda_from_der(derivatives: &[f64]) -> f64 {
 
 /// Whether a single-permutation CTR config is DEVICE-COVERED this wave (Phase 12 Plan 08, GPUT-10,
 /// Pattern A). Covered when: a CTR config is present; its permutation + target-class span all `n`
-/// objects (the single-permutation regime, Open Q3); every CTR column has at least one member and
-/// binarizes to EXACTLY `n_bins` buckets (`borders.len() + 1 == n_bins`) so the extra CTR cindex
-/// columns join the UNIFORM-`n_bins` resident histogram cleanly; and the f64 CTR seam exists on
-/// this backend (NOT wgpu, WR-02). A multi-fold / multi-permutation CTR is NOT covered — it is
-/// declined by the `fold_count != 1` gate upstream (Open Q3, deferred behind `Ok(None)`). Every
-/// OTHER family flag must still be the covered default (no bootstrap / MVS / exact / leaf-cap) —
-/// D-10-01 all-or-nothing PER family; the caller ANDs those in.
+/// objects (the single-permutation regime, Open Q3); every CTR column carries a CTR TYPE this
+/// backend implements (see below) and has at least one member and binarizes to EXACTLY `n_bins`
+/// buckets (`borders.len() + 1 == n_bins`) so the extra CTR cindex columns join the
+/// UNIFORM-`n_bins` resident histogram cleanly; and the f64 CTR seam exists on this backend (NOT
+/// wgpu, WR-02). A multi-fold / multi-permutation CTR is NOT covered — it is declined by the
+/// `fold_count != 1` gate upstream (Open Q3, deferred behind `Ok(None)`). Every OTHER family flag
+/// must still be the covered default (no bootstrap / MVS / exact / leaf-cap) — D-10-01
+/// all-or-nothing PER family; the caller ANDs those in.
+///
+/// # The per-type admission list (DCTR-07 / T09)
+///
+/// This wave implements the ORDERED CLASS-PREFIX types: `Borders` (`0`) and `Buckets` (`1`).
+/// Both share one numerator kernel selected by `(ctr_type, target_border_idx)`
+/// ([`launch_ordered_ctr_resident`]) and one border-table shape contract — **C-7: admitting
+/// Buckets adds an admission LIST and changes nothing else.** Buckets quantizes through the same
+/// `calc_ctr_online_bin` border table as Borders on the CPU, so a per-type shape special case
+/// would be a divergence, not a fix. `BinarizedTargetMeanValue` (`2`) and `Counter` (`4`) get
+/// their own device statistics in later waves; `FloatTargetMeanValue` (`3`) and `FeatureFreq`
+/// (`5`) are GPU-only upstream (`restrictions.h:20-32`) and have no parity surface. The
+/// discriminants are transcribed BY VALUE from `cb_train::ctr::ECtrType` — see
+/// [`CTR_TYPE_BORDERS`] / [`CTR_TYPE_BUCKETS`] for the Pattern B / C-3 rationale
+/// (`cb-backend` must never gain a `cb-train` dep).
+///
+/// # Safety property: a gate/list mismatch degrades LOUDLY (C-14)
+///
+/// This predicate has TWO callers. The first feeds the `None`-grow-policy coverage disjunction
+/// whose failure path is a `return Ok(None)` that declines the **whole fit** to the
+/// byte-unchanged CPU path; the second guards the CTR augmentation. So if the `cb-train` gate
+/// (`ctr_types_are_device_covered`) ever admits a type this list does not, the fit does not
+/// silently lose its CTR columns — it degrades to `grown == 0`, which every device e2e detects
+/// via `CountingGpu.grown.get() == params.iterations`. That is why the two lists may be widened
+/// in separate commits with no torn intermediate state, and why the e2e device-commitment
+/// assertion is sufficient evidence downstream.
 fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
     if cfg!(feature = "wgpu") {
         return false;
@@ -150,17 +176,25 @@ fn ctr_covered(config: &DeviceTrainConfig, n: usize, n_bins: usize) -> bool {
     ctr.permutation.len() == n
         && ctr.target_class.len() == n
         && !ctr.columns.is_empty()
-        && ctr
-            .columns
-            .iter()
-            .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
+        && ctr.columns.iter().all(|col| {
+            // DCTR-07 (T09): the per-type admission LIST — an explicit `{Borders, Buckets}`
+            // enumeration, never a range check, so a future discriminant is declined by
+            // default. C-7: the two shape conjuncts are UNCHANGED for every type.
+            matches!(col.ctr_type, CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS)
+                && !col.member_bins.is_empty()
+                && col.borders.len() + 1 == n_bins
+        })
         && avg.permutation.len() == n
         && avg.target_class.len() == n
         && avg.columns.len() == ctr.columns.len()
-        && avg
-            .columns
-            .iter()
-            .all(|col| !col.member_bins.is_empty() && col.borders.len() + 1 == n_bins)
+        && avg.columns.iter().all(|col| {
+            // The AVERAGING half mirrors every structure-half invariant (GDC-09): a
+            // one-sided admission would leave the leaf-value gather materializing a type
+            // the numerator kernel does not implement.
+            matches!(col.ctr_type, CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS)
+                && !col.member_bins.is_empty()
+                && col.borders.len() + 1 == n_bins
+        })
 }
 
 /// Compute the ADDITIONAL binarized-CTR cindex columns for a covered CTR config ON device (Phase 12
@@ -199,6 +233,14 @@ struct CtrSearchState {
 /// can call it TWICE — once with the STRUCTURE permutation (split-search cindex)
 /// and once with the AVERAGING permutation (leaf-value gather bins) — reusing the
 /// SAME online-CTR + binarize kernels verbatim (Do Not Hand-Roll).
+///
+/// # Errors
+/// [`CbError::Unsupported`] if a column carries a CTR type this backend has no device
+/// statistic for (DCTR-07 / T09 — the dispatch admits only the ordered class-prefix types
+/// `Borders` and `Buckets`); plus any [`CbError`] propagated from the device CTR launch,
+/// the projection fold, the binarize or the bin read-back. [`ctr_covered`] has already
+/// declined an unsupported type before this runs, so the `_` dispatch arm is defensive —
+/// but it must stay an error, never a fall-through to the Borders numerator.
 fn build_ctr_cindex_columns(
     client: &cubecl::client::ComputeClient<SelectedRuntime>,
     permutation: &[u32],
@@ -216,20 +258,31 @@ fn build_ctr_cindex_columns(
         } else {
             combine_projection_bins(&col.member_bins, n)?
         };
-        let res = launch_ordered_ctr_resident(
-            client,
-            permutation,
-            &bins,
-            target_class,
-            col.prior,
-            buckets,
-            n,
-            // DCTR-06 (T08): the numerator selector is pinned to the historical
-            // `(Borders, target_border_idx = 0)` here so this wave is byte-unchanged (D-04).
-            // T09 (DCTR-07) is what makes this read `col.ctr_type` / `col.target_border_idx`.
-            CTR_TYPE_BORDERS,
-            0,
-        )?;
+        // DCTR-07 (T09): dispatch on the column's CTR TYPE. `Borders` and `Buckets` are the
+        // two ORDERED CLASS-PREFIX types — one kernel, one border-table contract, differing
+        // only in the numerator selected by `(ctr_type, target_border_idx)` (DCTR-06 / T08).
+        // Every other discriminant gets its own device statistic in a later wave and is an
+        // explicit typed error here, never a fall-through to the Borders numerator (which
+        // would be a WRONG answer, not a worse one). `ctr_covered` already declined such a
+        // config, so this arm is defensive — but per C-14 the loud failure is the point.
+        let res = match col.ctr_type {
+            CTR_TYPE_BORDERS | CTR_TYPE_BUCKETS => launch_ordered_ctr_resident(
+                client,
+                permutation,
+                &bins,
+                target_class,
+                col.prior,
+                buckets,
+                n,
+                col.ctr_type,
+                col.target_border_idx,
+            )?,
+            other => {
+                return Err(CbError::Unsupported(format!(
+                    "device CTR type {other} is not implemented"
+                )))
+            }
+        };
         let bin_h = binarize_ctr_column_resident(client, &res.value, &col.borders, n)?;
         let bytes = client
             .read_one(bin_h)
@@ -2851,3 +2904,12 @@ fn compute_exact_leaf_values(
     }
     Ok(values)
 }
+
+// T09 / DCTR-07: the covering test for [`ctr_covered`]'s per-type admission list. Mounted
+// HERE (an in-module `#[path]` sibling, the `boosting.rs:7469-7474` pattern) rather than in
+// `gpu_runtime/mod.rs` where `session_residency` / `session_depth_gt1_test` live, because
+// `ctr_covered` is PRIVATE to `mod session` and a `mod.rs`-mounted module is its sibling, not
+// its child (`E0603`). Source/test separation: no `#[cfg(test)] mod tests` in this file.
+#[cfg(test)]
+#[path = "session_ctr_type_test.rs"]
+mod session_ctr_type_test;

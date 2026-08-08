@@ -2346,10 +2346,43 @@ fn ctr_splits_for_tree(
 /// Re-opening this clause requires the e2e oracle to pass, not just the config unit test —
 /// this is exactly the ordering discipline that made the gap visible.
 ///
-/// Everything else — Buckets / BinarizedTargetMeanValue / Counter (Track U), multi-target-
-/// border Buckets columns — still declines to the byte-unchanged CPU path (D-04): the
-/// device kernels do not implement those accumulation semantics, and a wrong device leaf is
-/// worse than a CPU fallback.
+/// Everything else — BinarizedTargetMeanValue / Counter (Track U) — still declines to the
+/// byte-unchanged CPU path (D-04): the device kernels do not implement those accumulation
+/// semantics, and a wrong device leaf is worse than a CPU fallback.
+///
+/// # Buckets and the multi-target-border layout ARE covered (DCTR-08, T10)
+///
+/// `Borders` and `Buckets` are the two ORDERED CLASS-PREFIX types: one device kernel
+/// (`cb-backend`'s `ordered_ctr_prefix_kernel`, launched by `launch_ordered_ctr_resident`),
+/// one border-table shape contract, differing only in the numerator selected by
+/// `(ctr_type, target_border_idx)` (SPEC §4.2):
+///
+/// ```text
+/// Buckets @ b  =>  good = counts[b]
+/// otherwise    =>  good = total − Σ_{c ≤ b} counts[c]
+/// ```
+///
+/// which at binclf (`SIMPLE_CLASSES_COUNT == 2`) is `Borders@0 → n1`, `Buckets@0 → n0`,
+/// `Buckets@1 → n1`. That selector is proved against the CPU `online_class_prefix` by
+/// DCTR-06's kernel self-oracle (`cb-backend`'s
+/// `kernels::ctr_device_test::buckets_numerator_matches_cpu_reference`, T08), dispatched
+/// per column by DCTR-07 (T09), and the whole fit is pinned end to end against upstream
+/// `catboost==1.2.10` by `device_ctr_buckets_fit_test` on the frozen `ctr_device_buckets`
+/// fixture.
+///
+/// **`target_border_idx` is therefore no longer a conjunct.** `GetTargetBorderCount`
+/// (`ctr_helper.h:35-42`, mirrored by [`crate::ctr::ECtrType::target_border_count`]) is the
+/// ONLY producer of that field — [`materialize_ctr_columns_for_perm`] loops
+/// `0..ctr_type.target_border_count(2)` — and it returns `1` for every CPU-legal type
+/// EXCEPT `Buckets`, which returns `2`. So dropping the conjunct widens the admitted set by
+/// exactly the `Buckets@1` column and nothing else: a `Borders` column still structurally
+/// cannot carry a non-zero selector. That structural argument is pinned executably by
+/// `boosting_ctr_gate_tests::buckets_is_the_only_type_with_a_nonzero_target_border`.
+///
+/// `FloatTargetMeanValue` (`3`) and `FeatureFreq` (`5`) stay declined permanently: they are
+/// GPU-only upstream (`restrictions.h:20-32`) and have no CPU parity surface, which is why
+/// the admission list is an explicit `matches!` enumeration over
+/// [`crate::ctr::ECtrType::from_i8`] rather than a range test.
 ///
 /// # There is NO prior-denominator conjunct, deliberately (DCTR-02, T01)
 ///
@@ -2379,8 +2412,17 @@ fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
             // "combination CTR is device-INELIGIBLE" section of this function's doc
             // comment for the measured evidence and the localisation.
             col.projection.is_simple()
-                && col.ctr_type == crate::ctr::ECtrType::Borders.as_i8()
-                && col.target_border_idx == 0
+                // DCTR-08 (T10): the ORDERED CLASS-PREFIX admission LIST — an explicit
+                // enumeration, never a range check, so an unknown discriminant (`from_i8`
+                // returns `None`) and every not-yet-implemented type are declined by
+                // default. Reconstruction goes through `crate::ctr::ECtrType::from_i8`,
+                // which is IN-CRATE here, so the Do-Not-Hand-Roll rule applies and a second
+                // transcription of the discriminants is forbidden (C-3; only `cb-backend`,
+                // which must never depend on `cb-train`, transcribes them inline).
+                && matches!(
+                    crate::ctr::ECtrType::from_i8(col.ctr_type),
+                    Some(crate::ctr::ECtrType::Borders | crate::ctr::ECtrType::Buckets)
+                )
         })
 }
 

@@ -192,11 +192,13 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 ///   row 1  simple   Borders      0  1.0  => true    flips_at: never (D-04 pin)
 ///   row 2  combo    Borders      0  1.0  => false   flips_at: T19 (arity)
 ///   row 3  simple   Counter      0  1.0  => false   flips_at: T12 (type)
-///   row 4  simple   Buckets      1  1.0  => false   flips_at: T10 (type + target border)
+///   row 4  simple   Buckets      1  1.0  => true    FLIPPED by T10 (type + target border)
 ///   row 5  simple   BTMV         0  1.0  => false   flips_at: T16 (type)
 ///   row 6  simple   Borders      0  2.0  => true    FLIPPED by T01 (prior denominator)
 ///   row 7  simple   FloatTMV     0  1.0  => false   flips_at: never (no parity surface)
 ///   row 8  simple   FeatureFreq  0  1.0  => false   flips_at: never
+///   row 9  simple   Buckets      0  1.0  => true    FLIPPED by T10 (type only)
+///   row 10 simple   Borders      1  1.0  => true    FLIPPED by T10 (target border only)
 /// ```
 ///
 /// Rows 3–6 use a **SIMPLE** projection on purpose. The functions this table replaced used
@@ -206,12 +208,22 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 /// turned red at T19, all four at once. A simple projection makes each row isolate exactly
 /// the conjunct in its `flips_at` note.
 ///
-/// **Honest limitation of row 4**: it varies two attributes against row 1 (type AND target
-/// border), so it cannot distinguish "T10 removed the `target_border_idx == 0` conjunct
-/// globally" from "T10 made it conditional on Buckets". Adding `simple/Buckets/b=0` and
-/// `simple/Borders/b=1` rows (both `flips_at: T10`) would draw that distinction; the plan
-/// rates it low-impact either way, since T23 collapses the predicate and retires this table,
-/// and the extra rows would renumber the ones later tasks are specified against.
+/// **Row 4's honest limitation, and how T10 resolved it.** Row 4 varies two attributes
+/// against row 1 (type AND target border), so on its own it cannot distinguish "T10 removed
+/// the `target_border_idx == 0` conjunct globally" from "T10 made it conditional on
+/// Buckets". T00 declined to add the two disambiguating rows because inserting them would
+/// have renumbered the rows later tasks are specified against. T10 added them **APPENDED**
+/// as rows 9 and 10 instead, which renumbers nothing:
+///
+/// * row 9 (`simple/Buckets/b=0`) varies only the TYPE — its `b = 0` means the deleted
+///   target-border conjunct cannot be what admits it;
+/// * row 10 (`simple/Borders/b=1`) varies only the TARGET BORDER — its type was already
+///   admitted before T10.
+///
+/// Restoring either half of T10's edit alone therefore turns exactly one of rows 9/10 red
+/// (both were measured; the failures are recorded in `notes/T10.md`), which is the evidence
+/// T00's note asked T10 to produce. Row 10's shape is unreachable from a real fit — see its
+/// `flips_at` note and `boosting_ctr_gate_tests`.
 fn gate_state_table() -> Vec<GateRow> {
     let simple = || TProjection::from_features(&[0]);
     let combo = || TProjection::from_features(&[0, 1]);
@@ -241,8 +253,11 @@ fn gate_state_table() -> Vec<GateRow> {
                 with_type(covered_column(simple(), 2), ECtrType::Buckets),
                 1,
             ),
-            expected: false,
-            flips_at: "T10 — admits Buckets AND deletes `col.target_border_idx == 0`",
+            expected: true,
+            flips_at: "FLIPPED by T10 — admitted Buckets in the `ctr_type` conjunct AND \
+                       deleted `col.target_border_idx == 0` (DCTR-08). Rows 9 and 10 below \
+                       separate the two: row 9 (Buckets/b=0) isolates the type change and \
+                       row 10 (Borders/b=1) isolates the target-border deletion",
         },
         GateRow {
             label: "simple/BTMV/b=0/denom=1.0",
@@ -275,24 +290,60 @@ fn gate_state_table() -> Vec<GateRow> {
             expected: false,
             flips_at: "never — GPU-only upstream (`restrictions.h:20-32`), no parity surface",
         },
+        // Rows 9 and 10 are APPENDED (never inserted): rows 1-8 keep the numbers every
+        // later task is specified against. They are the two rows the doc block above
+        // records as missing — each varies exactly ONE attribute against row 1, so
+        // together with row 4 they decompose T10's two-conjunct edit.
+        GateRow {
+            label: "simple/Buckets/b=0/denom=1.0",
+            column: with_type(covered_column(simple(), 2), ECtrType::Buckets),
+            expected: true,
+            flips_at: "FLIPPED by T10 — isolates the `ctr_type` half of T10's edit (b = 0, \
+                       so the target-border conjunct could not have admitted this row). \
+                       Restoring `ctr_type == Borders` alone turns THIS row red",
+        },
+        GateRow {
+            label: "simple/Borders/b=1/denom=1.0",
+            column: with_target_border(covered_column(simple(), 2), 1),
+            expected: true,
+            flips_at: "FLIPPED by T10 — isolates the `target_border_idx == 0` half of T10's \
+                       edit (type is Borders, which the pre-T10 gate already admitted). \
+                       Restoring that conjunct alone turns THIS row red. NOTE: this shape is \
+                       unreachable from a real fit — `target_border_count(Borders, 2) == 1` \
+                       (`ctr_helper.h:35-42`) — which is precisely why deleting the conjunct \
+                       is safe; see `boosting_ctr_gate_tests::\
+                       buckets_is_the_only_type_with_a_nonzero_target_border`",
+        },
     ]
 }
 
 #[test]
 fn gate_admits_exactly_the_current_wave() {
+    // EVERY row is evaluated before reporting, deliberately: a fail-fast loop stops at the
+    // first mismatch, which hides exactly the information a gate task needs. T10's edit
+    // removed TWO conjuncts at once, and the only way to see WHICH one a restoration puts
+    // back is to observe rows 4, 9 and 10 in the SAME run (see the table doc). Collecting
+    // also keeps the failure message a complete diff of the gate's admitted set.
+    let mut mismatches: Vec<String> = Vec::new();
     for (idx, row) in gate_state_table().into_iter().enumerate() {
         let n = idx + 1;
         let expected = row.expected;
         let actual = ctr_types_are_device_covered(&[row.column]);
-        assert_eq!(
-            actual, expected,
-            "row {n} ({}): expected {expected}, got {actual}\n   flips_at: {}\n   \
-             If you deleted that conjunct, update THIS row in the SAME commit. If you did \
-             not, the device gate just moved by accident — which is exactly what the \
-             conscious-act contract in this module's doc forbids.",
-            row.label, row.flips_at
-        );
+        if actual != expected {
+            mismatches.push(format!(
+                "row {n} ({}): expected {expected}, got {actual}\n   flips_at: {}",
+                row.label, row.flips_at
+            ));
+        }
     }
+    assert!(
+        mismatches.is_empty(),
+        "the device CTR gate does not admit the set this wave pins:\n{}\n\
+         If you deleted the conjunct named in a row's `flips_at`, update THAT row in the \
+         SAME commit. If you did not, the device gate just moved by accident — which is \
+         exactly what the conscious-act contract in this module's doc forbids.",
+        mismatches.join("\n")
+    );
 }
 
 #[test]
@@ -353,6 +404,89 @@ fn averaging_columns_get_the_same_member_treatment() {
         col.member_bins.len(),
         2,
         "the averaging arm must carry both members too"
+    );
+}
+
+#[test]
+fn buckets_columns_share_one_weight_group_and_bucket_count() {
+    // DCTR-07 (T09): `GetTargetBorderCount(Buckets, 2) == 2` (`ctr_helper.h:35-42`), so ONE
+    // `(projection, prior)` Buckets spec materializes TWO columns at binclf — the `b = 0` and
+    // `b = 1` numerators. They are the SAME `UsedCtrSplits` identity: upstream's
+    // `ProcessCtrSplit` inserts the `(ctr_type, projection)` pair, not the numerator selector,
+    // so choosing either column must lift the cat-feature weight of BOTH. They also describe
+    // the same projection, so they must report the same `bucket_count` — the `count` input of
+    // `(1 + count/maxCount)^(-model_size_reg)`.
+    //
+    // GREEN-ON-WRITE (PLAN C-9): `build_device_ctr_config` already keys the group
+    // `(col.ctr_type, col.projection)` with `target_border_idx` deliberately excluded, so this
+    // is a CHARACTERIZATION pin, not a behaviour change. GLOBALS §2.5 therefore requires — and
+    // T09's note records — the mutation that proves it discriminates: adding
+    // `col.target_border_idx` to `key` makes the `weight_group` assertion below fail with
+    // `left: 0, right: 1`.
+    let projection = TProjection::from_features(&[1]);
+    let buckets_col = |target_border_idx: usize| {
+        with_target_border(
+            with_type(covered_column(projection.clone(), 3), ECtrType::Buckets),
+            target_border_idx,
+        )
+    };
+    // A THIRD column on the SAME projection but a DIFFERENT type — without it, a builder that
+    // put every column in group 0 (ignoring the key entirely) would satisfy the assertions
+    // below vacuously.
+    let borders_col = covered_column(projection.clone(), 3);
+    let cfg = build(&[buckets_col(0), buckets_col(1), borders_col]);
+
+    assert_eq!(
+        cfg.columns.len(),
+        3,
+        "one emitted column per source column (the two Buckets numerators are NOT merged)"
+    );
+    let b0 = cfg.columns.first().expect("the b=0 Buckets column");
+    let b1 = cfg.columns.get(1).expect("the b=1 Buckets column");
+    let borders = cfg.columns.get(2).expect("the Borders column");
+
+    assert_eq!(
+        b0.weight_group, b1.weight_group,
+        "the two Buckets numerator columns of one (projection, prior) must share ONE \
+         weight_group (the key is `(ctr_type, projection)`; `target_border_idx` is NOT part \
+         of the UsedCtrSplits identity) — got {} and {}",
+        b0.weight_group, b1.weight_group
+    );
+    assert_eq!(
+        b0.bucket_count, b1.bucket_count,
+        "both numerator columns describe the SAME projection and must report the same \
+         bucket_count — got {} and {}",
+        b0.bucket_count, b1.bucket_count
+    );
+    assert_eq!(b0.bucket_count, 3, "bucket_count comes straight from the source column");
+
+    let mut selectors = vec![b0.target_border_idx, b1.target_border_idx];
+    selectors.sort_unstable();
+    assert_eq!(
+        selectors,
+        vec![0_u32, 1],
+        "the two columns must carry the DISTINCT numerator selectors {{0, 1}} — a shared \
+         group must not collapse them into one numerator"
+    );
+
+    assert_ne!(
+        b0.weight_group, borders.weight_group,
+        "a DIFFERENT ctr_type on the same projection is a different UsedCtrSplits identity; \
+         if these matched, the group key would not be reading ctr_type at all"
+    );
+
+    // The averaging half runs through the SAME `group_keys` accumulator, so the leaf-value
+    // gather sees identical group ids — a per-half numbering would make the model-lifetime
+    // `group_used` flags disagree between the two permutations.
+    let averaging: &DeviceCtrAveraging = cfg
+        .averaging
+        .as_ref()
+        .expect("a covered CTR fit always populates the averaging arm");
+    let avg_groups: Vec<u32> = averaging.columns.iter().map(|c| c.weight_group).collect();
+    let struct_groups: Vec<u32> = cfg.columns.iter().map(|c| c.weight_group).collect();
+    assert_eq!(
+        avg_groups, struct_groups,
+        "the averaging half must reuse the SAME weight groups as the structure half"
     );
 }
 
