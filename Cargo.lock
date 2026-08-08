@@ -634,6 +634,7 @@ dependencies = [
  "prost",
  "pyo3",
  "pyo3-arrow",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

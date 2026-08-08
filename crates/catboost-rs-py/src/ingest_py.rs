@@ -28,6 +28,7 @@ use catboost_rs::OwnedColumns;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::intern;
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use pyo3_arrow::input::AnyRecordBatch;
 
 use crate::errors::CatBoostValueError;
@@ -115,20 +116,23 @@ pub(crate) fn numpy_to_owned(
     // Borrow X as a read-only float32 2-D array. `extract` fails on a wrong dtype
     // / rank; map it to the typed CatBoostValueError with an actionable message
     // (D-12: reject float64, never coerce — threat T-08-09).
-    let float_cols = numpy_matrix_to_cols(x)?;
+    let (float_cols, f32_cache) = numpy_matrix_to_cols(x)?;
     let n_rows = float_cols.first().map_or(0, Vec::len);
     let label = label_to_owned(y, n_rows)?;
-    Ok(OwnedColumns::new(float_cols, label))
+    Ok(OwnedColumns::new(float_cols, label).with_float_f32_cache(f32_cache))
 }
 
 /// Validate a 2-D C-contiguous float32 NumPy array and copy it column-major into
-/// owned `Vec<Vec<f64>>` (cast f32 -> f64). Shared by the NumPy and Pandas
-/// (numeric block) paths so the strict D-12 contract is identical. The result is
-/// fully owned — no borrow escapes (D-11).
+/// owned `Vec<Vec<f64>>` (cast f32 -> f64) PLUS the bit-exact f32 SoA cache
+/// (SPD-03 wave 3: the input IS f32, so keeping the f32 view alongside lets
+/// fit-prep skip its full re-narrowing pass — `f64::from(v) as f32 == v` exactly).
+/// Shared by the NumPy and Pandas (numeric block) paths so the strict D-12
+/// contract is identical. The result is fully owned — no borrow escapes (D-11).
 ///
 /// # Errors
 /// [`CatBoostValueError`] if the array is not a 2-D C-contiguous float32 array.
-fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f64>>> {
+#[allow(clippy::type_complexity)]
+fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<(Vec<Vec<f64>>, Vec<Vec<f32>>)> {
     let x_arr: PyReadonlyArray2<f32> = x.extract().map_err(|_| {
         CatBoostValueError::new_err(
             "X must be a 2-D float32 NumPy array; pass `X.astype(np.float32)` \
@@ -151,17 +155,53 @@ fn numpy_matrix_to_cols(x: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f64>>> {
         }
     };
 
-    // Column-major SoA copy (cast f32 -> f64). Row/col are derived from `shape`,
-    // so indexing is in range.
-    let mut float_cols: Vec<Vec<f64>> = Vec::with_capacity(n_features);
-    for col in 0..n_features {
-        let mut column = Vec::with_capacity(n_rows);
-        for row in 0..n_rows {
-            column.push(f64::from(view[[row, col]]));
-        }
-        float_cols.push(column);
-    }
-    Ok(float_cols)
+    // Column-major SoA copy (cast f32 -> f64), parallel over the DISJOINT output
+    // columns (SPD-03: the former serial per-element `view[[row, col]]` transpose
+    // was ~0.8 s at 1M×50 — a top-3 host term of the whole GPU fit). The array is
+    // C-contiguous (checked above), so a flat row-major slice view exists; each
+    // column is gathered by stride with checked access. The output is
+    // byte-identical to the serial form — same elements, same order, pure cast.
+    let flat: &[f32] = view.to_slice().ok_or_else(|| {
+        CatBoostValueError::new_err(
+            "X must be C-contiguous; pass `np.ascontiguousarray(X, dtype=np.float32)`",
+        )
+    })?;
+    // Cache-blocked transpose in COLUMN GROUPS of 16 (SPD-03 wave 5): the former
+    // one-column-at-a-time gather touched a fresh 64-byte line per element and so
+    // re-read the whole row-major matrix once PER COLUMN (~3.2 GB of traffic at
+    // 1M×50 — the P100 r4 diag attributes 405 ms to this ingest). A 16-column
+    // group consumes a full cache line per row visit, so the matrix is read
+    // effectively once per ~3 sweeps (~200 MB). Groups are disjoint and ordered,
+    // so the flattened output is byte-identical to the per-column form.
+    const GROUP: usize = 16;
+    let n_groups = n_features.div_ceil(GROUP).max(1);
+    let grouped: Vec<Vec<(Vec<f64>, Vec<f32>)>> = (0..n_groups)
+        .into_par_iter()
+        .map(|g| {
+            let base = g * GROUP;
+            let width = GROUP.min(n_features.saturating_sub(base));
+            let mut f32_group: Vec<Vec<f32>> =
+                (0..width).map(|_| Vec::with_capacity(n_rows)).collect();
+            for row in 0..n_rows {
+                let row_base = row * n_features + base;
+                if let Some(row_slice) = flat.get(row_base..row_base + width) {
+                    for (col_buf, &v) in f32_group.iter_mut().zip(row_slice) {
+                        col_buf.push(v);
+                    }
+                }
+            }
+            f32_group
+                .into_iter()
+                .map(|c| {
+                    let f64_col: Vec<f64> = c.iter().map(|&v| f64::from(v)).collect();
+                    (f64_col, c)
+                })
+                .collect()
+        })
+        .collect();
+    let (float_cols, f32_cols): (Vec<Vec<f64>>, Vec<Vec<f32>>) =
+        grouped.into_iter().flatten().unzip();
+    Ok((float_cols, f32_cols))
 }
 
 /// Read the optional float32 1-D NumPy label into an owned `Vec<f64>`, validating
@@ -282,8 +322,8 @@ fn pandas_to_owned(
 
     // Numeric block: select the numeric columns, materialize a float32 numpy
     // matrix, and route through the strict NumPy path (which copies + owns).
-    let float_cols: Vec<Vec<f64>> = if numeric_names.is_empty() {
-        Vec::new()
+    let (float_cols, f32_cache): (Vec<Vec<f64>>, Vec<Vec<f32>>) = if numeric_names.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         let np_module = py.import(intern!(py, "numpy"))?;
         let float32 = np_module.getattr(intern!(py, "float32"))?;
@@ -319,7 +359,7 @@ fn pandas_to_owned(
 
     let n_rows = pandas_n_rows(py, df)?;
     let label = label_to_owned(y, n_rows)?;
-    let mut owned = OwnedColumns::new(float_cols, label);
+    let mut owned = OwnedColumns::new(float_cols, label).with_float_f32_cache(f32_cache);
     if !cat_cols.is_empty() {
         owned = owned.with_cat_features(cat_cols);
     }

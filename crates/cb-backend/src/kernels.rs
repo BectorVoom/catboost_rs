@@ -2814,6 +2814,73 @@ pub fn read_all_bins_kernel<F: Float>(
     }
 }
 
+/// Device quantize+pack for ONE float feature (QPACK-01): compute each object's
+/// quantized bin from the raw f32 feature values + the feature's ascending border
+/// list, and merge the bin — as the feature's bit-field — directly into the packed
+/// cindex word column of the feature's GROUP (`words[group_offset + obj]`). This
+/// is the fused device replacement for the host `quantize_feature_major` →
+/// `pack_cindex` pair on the float-only fast path: the intermediate
+/// one-u32-per-cell bin matrix never exists anywhere.
+///
+/// The bin is the border count `#{k : v > borders[k]}` — EXACTLY the host
+/// `partition_point(|&b| v > b)` over the same ascending borders (the linear scan
+/// and the binary search count the identical monotone predicate; NaN compares
+/// false against every border → bin 0, matching the host's NaN → 0). The host
+/// guarantees each f64 border round-trips through f32 exactly before launching
+/// (they are `f64::from(f32)` midpoints by construction), so the f32 compare here
+/// is bit-equivalent to the host's f64 compare.
+///
+/// `init_word == 1` marks the FIRST feature of its group: it STOREs the field,
+/// initializing the whole word column (so the device buffer needs no zero-fill
+/// pass); every later feature of the group ORs into its own disjoint bit-field.
+/// Sequential launches on the one session stream order the read-modify-write.
+/// `bin <= borders.len() <= mask` by construction, so no masking is needed before
+/// the shift. One thread per object (the host sizes the grid to cover `n` exactly,
+/// so no `CUBE_COUNT` grid-stride is needed — which also keeps this kernel runnable
+/// on cubecl-cpu, where the `CUBE_COUNT` builtin is rejected); bounds-guarded; no
+/// `-inf` literal; `<F: Float>` per the generics-float rule (launched with the f32
+/// storage type).
+#[cube(launch)]
+pub fn quantize_pack_feature_kernel<F: Float>(
+    values: &Array<F>,
+    borders: &Array<F>,
+    words: &mut Array<u32>,
+    n_objects: u32,
+    col_offset: u32,
+    n_borders: u32,
+    group_offset: u32,
+    shift: u32,
+    init_word: u32,
+) {
+    // SPD-03 wave 3: `values` is the ONE feature-major matrix upload (this feature's
+    // column is the `n_objects` window at `col_offset`), so the host makes a single
+    // large transfer instead of 50 small ones (measured 1.1 GB/s effective on the
+    // P100 for per-column uploads). `n_objects` is an explicit scalar — the array
+    // length is the whole matrix, not this column.
+    let n = n_objects as usize;
+    // `n_borders` is an explicit scalar (NOT `borders.len()`): an empty border list
+    // ships a 1-element dummy buffer (a zero-length device read is never issued), and
+    // the dummy cell must contribute no comparison — the host passes n_borders = 0.
+    let nb = n_borders as usize;
+    let obj = ABSOLUTE_POS;
+    if obj < n {
+        let v = values[col_offset as usize + obj];
+        let mut bin = 0u32;
+        for k in 0..nb {
+            if v > borders[k] {
+                bin += 1;
+            }
+        }
+        let idx = group_offset as usize + obj;
+        let field = bin << shift;
+        if init_word == 1 {
+            words[idx] = field;
+        } else {
+            words[idx] = words[idx] | field;
+        }
+    }
+}
+
 // ===========================================================================
 // Plan 10-05 (GPUT-16): per-partition stat aggregation (`update_part_props`, upstream
 // `update_part_props.cu` `ComputeSum -> FastInBlockReduce -> SaveResults`,

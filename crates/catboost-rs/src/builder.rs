@@ -29,7 +29,7 @@ use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
     LeafMethod, Loss,
 };
-use cb_data::{select_borders_greedy_logsum, AutoClassWeights, Pool, QuantizeParams};
+use cb_data::{select_borders_greedy_logsum_f32, AutoClassWeights, Pool, QuantizeParams};
 use rayon::prelude::*;
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
@@ -1081,33 +1081,92 @@ impl CatBoostBuilder {
         let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
         let prof_t = std::time::Instant::now();
 
+        let params = self.boost_params();
+        // SPD-03: kick off the background device-kernel warm-up NOW so JIT
+        // compilation overlaps the host-side fit-prep below (and the caller's pool
+        // ingestion already behind us) instead of serializing inline with training —
+        // a cold GPU fit otherwise pays ~2-3 s of driver compilation inside
+        // `begin`/tree-0 (P100 diag 2026-08-08). Best-effort and detached; also
+        // enables CubeCL's disk compilation cache so later processes skip JIT
+        // entirely. No-op effect on the trained model: warm-up only compiles.
+        #[cfg(any(feature = "wgpu", feature = "cuda", feature = "rocm"))]
+        cb_backend::gpu_runtime::warmup::spawn_fit_warmup(
+            params.loss.clone(),
+            params.depth,
+            self.border_count,
+            params.score_function,
+        );
+
         // SoA float columns as f32 (the feature storage type; the apply path
         // binarizes f32 against the borders) AND the per-float-feature
         // quantization borders (Phase-2 greedy logsum; NaN sentinel is off for the
         // numeric first-slice surface — NaN-free features are always Forbidden
-        // regardless). Both are independent `rayon`-parallel reductions over the
-        // SAME `pool.float_features()`, reading disjoint per-column data and
-        // writing disjoint outputs (`feature_values` narrows f64->f32,
-        // `feature_borders` derives borders — neither reads the other's output),
-        // so they run CONCURRENTLY via `rayon::join` rather than sequentially, to
-        // shrink this fit-prep stage's latency (the CB_GPU_PROF timer below
-        // specifically attributes to this stage). Each inner `par_iter`'s indexed
-        // map preserves output order, so both results stay byte-identical to the
-        // fully-serial form.
-        let (feature_values, mut feature_borders): (Vec<Vec<f32>>, Vec<Vec<f64>>) = rayon::join(
-            || {
-                pool.float_features()
+        // regardless). The f64 pool columns are narrowed ONCE (parallel over the
+        // disjoint per-column data), and the borders are then derived from the
+        // narrowed f32 columns via `select_borders_greedy_logsum_f32` — the same
+        // `v as f32` narrowing the f64 entry performs internally, so the border
+        // set is byte-identical while the full-width f64 columns are read exactly
+        // once instead of twice (this fit-prep stage is the largest host term at
+        // scale — the CB_GPU_PROF timer below attributes to it). Each `par_iter`'s
+        // indexed map preserves output order, so both results stay byte-identical
+        // to the fully-serial form.
+        // SPD-03 wave 3: ONE fused parallel pass per column — narrow, then derive
+        // the borders from the just-narrowed column while it is still cache-warm —
+        // instead of two full passes over all columns (the second re-read of the
+        // whole matrix from RAM was pure waste on the 4-vCPU cloud hosts where this
+        // stage is the largest remaining host term). Outputs are byte-identical:
+        // same narrowing, same border derivation, indexed map preserves order.
+        // The two AtomicU64s accumulate per-column CPU nanos for the CB_GPU_PROF
+        // attribution line (thread-time, not wall — labeled as such).
+        let narrow_ns = std::sync::atomic::AtomicU64::new(0);
+        let borders_ns = std::sync::atomic::AtomicU64::new(0);
+        // SPD-03 wave 3: an ingestion source whose input was ALREADY f32 (the
+        // Python NumPy path) attaches a bit-exact narrowing cache — then the whole
+        // narrowing pass vanishes and only the border derivation runs. The cache is
+        // trusted only when its shape matches exactly (Pool doc: never load-bearing).
+        let cached_f32 = pool.float_features_f32();
+        let cache_valid = cached_f32.len() == pool.float_features().len()
+            && cached_f32
+                .iter()
+                .zip(pool.float_features().iter())
+                .all(|(c, f)| c.len() == f.len());
+        let (owned_values, mut feature_borders): (Option<Vec<Vec<f32>>>, Vec<Vec<f64>>) =
+            if cache_valid && !cached_f32.is_empty() {
+                let borders: Vec<Vec<f64>> = cached_f32
                     .par_iter()
-                    .map(|col| col.iter().map(|&v| v as f32).collect())
-                    .collect()
-            },
-            || {
-                pool.float_features()
+                    .map(|col| {
+                        let t1 = std::time::Instant::now();
+                        let borders =
+                            select_borders_greedy_logsum_f32(col, self.border_count, false);
+                        if prof {
+                            let ord = std::sync::atomic::Ordering::Relaxed;
+                            borders_ns.fetch_add(t1.elapsed().as_nanos() as u64, ord);
+                        }
+                        borders
+                    })
+                    .collect();
+                (None, borders)
+            } else {
+                let (values, borders) = pool
+                    .float_features()
                     .par_iter()
-                    .map(|col| select_borders_greedy_logsum(col, self.border_count, false))
-                    .collect()
-            },
-        );
+                    .map(|col| {
+                        let t0 = std::time::Instant::now();
+                        let narrowed: Vec<f32> = col.iter().map(|&v| v as f32).collect();
+                        let t1 = std::time::Instant::now();
+                        let borders =
+                            select_borders_greedy_logsum_f32(&narrowed, self.border_count, false);
+                        if prof {
+                            let ord = std::sync::atomic::Ordering::Relaxed;
+                            narrow_ns.fetch_add((t1 - t0).as_nanos() as u64, ord);
+                            borders_ns.fetch_add(t1.elapsed().as_nanos() as u64, ord);
+                        }
+                        (narrowed, borders)
+                    })
+                    .unzip();
+                (Some(values), borders)
+            };
+        let feature_values: &[Vec<f32>] = owned_values.as_deref().unwrap_or(cached_f32);
         // PARAM-03: an ignored feature keeps its column and its index but loses
         // its borders, so the candidate enumeration never proposes a split on it.
         // Applied AFTER border selection (not before) so the borders of every
@@ -1123,9 +1182,13 @@ impl CatBoostBuilder {
         let resolved_weights = self.resolve_weights(pool)?;
         let weights: &[f64] = resolved_weights.as_deref().unwrap_or_else(|| pool.weights());
         if prof {
+            let ord = std::sync::atomic::Ordering::Relaxed;
             eprintln!(
-                "CB_GPU_PROF fit-prep copy+borders elapsed={:.2}ms",
+                "CB_GPU_PROF fit-prep copy+borders elapsed={:.2}ms \
+                 (cpu-time narrow={:.2}ms borders={:.2}ms)",
                 prof_t.elapsed().as_secs_f64() * 1e3,
+                narrow_ns.load(ord) as f64 / 1e6,
+                borders_ns.load(ord) as f64 / 1e6,
             );
         }
         // Narrow each eval pool to the SAME f32 storage type the learn columns use
@@ -1180,7 +1243,9 @@ impl CatBoostBuilder {
 
         let prof_train_t = std::time::Instant::now();
 
-        let params = self.boost_params();
+        // (`params` was built at fit entry — before fit-prep — so the SPD-03 warm-up
+        // could read the loss/depth/score keys; it is byte-identical to building it
+        // here, `boost_params` is a pure constructor over `&self`.)
         // Compile-time backend selection (08-08): exactly one feature is active, so
         // exactly one `backend` binding is in scope. `train` is already generic over
         // `R: Runtime`, so it accepts either zero-sized backend with no other change.
@@ -1202,7 +1267,7 @@ impl CatBoostBuilder {
         let canonical = if pool.cat_features().is_empty() {
             let trained = train_with_eval_sets(
                 &backend,
-                &feature_values,
+                feature_values,
                 &feature_borders,
                 pool.label(),
                 weights,
@@ -1225,7 +1290,7 @@ impl CatBoostBuilder {
             let cat_columns = mask_ignored_cat_columns(pool.cat_features(), &ignored_cat);
             let (trained, baked) = train_cat_with_eval_sets(
                 &backend,
-                &feature_values,
+                feature_values,
                 &feature_borders,
                 cat_columns.as_ref(),
                 pool.label(),

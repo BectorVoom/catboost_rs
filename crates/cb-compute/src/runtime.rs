@@ -1492,6 +1492,57 @@ pub trait Runtime {
         Ok(false)
     }
 
+    /// [`Self::begin_device_training`] over the RAW float channel (QPACK-01): the backend
+    /// quantizes AND packs the compressed index ON DEVICE from the f32 feature columns +
+    /// the per-feature borders, so the trainer never materializes the host bin matrix.
+    ///
+    /// The trainer offers this channel FIRST on a float-only fit (no one-hot, no CTR,
+    /// SymmetricTree family); `Ok(false)` — the DEFAULT, and any backend/coverage
+    /// decline — means "not opened", and the caller falls back to host quantization +
+    /// [`Self::begin_device_training`], which supports every arm. A backend that honours
+    /// this channel MUST produce a resident cindex bit-identical to the host pipeline's
+    /// (each border is an f32-exact midpoint, so the device f32 compare replicates the
+    /// host f64 `partition_point` bin exactly).
+    ///
+    /// # Errors
+    /// Backend-specific failures opening the session; the default never errors.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_device_training_raw(
+        &self,
+        loss: &Loss,
+        depth: usize,
+        boosting_type_is_plain: bool,
+        fold_count: usize,
+        score_function: EScoreFunction,
+        float_columns: &[Vec<f32>],
+        feature_borders: &[Vec<f64>],
+        weight: &[f64],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+        config: &DeviceTrainConfig,
+    ) -> CbResult<bool> {
+        let _ = (
+            loss,
+            depth,
+            boosting_type_is_plain,
+            fold_count,
+            score_function,
+            float_columns,
+            feature_borders,
+            weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+            config,
+        );
+        Ok(false)
+    }
+
     /// Grow one oblivious tree on the device from the current `approx` and
     /// `target`, using the session state uploaded by
     /// [`Self::begin_device_training`] (GPUT-01). The only `n`-length buffers

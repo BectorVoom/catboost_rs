@@ -1848,15 +1848,71 @@ fn device_leaf_of_nonsym(
 }
 
 fn accumulate_leaf_weights(leaf_of: &[usize], weights: &[f64], n_leaves: usize) -> Vec<f64> {
-    // Bucket each leaf's member weights in object order (checked `.get` only —
-    // `indexing_slicing` is deny).
-    let mut members: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
-    for (i, &leaf) in leaf_of.iter().enumerate() {
-        if let (Some(bucket), Some(&w)) = (members.get_mut(leaf), weights.get(i)) {
-            bucket.push(w);
-        }
+    // Unit-weight fast path (every unweighted fit): a left-to-right fold of k ones
+    // is EXACTLY `k as f64` for any k < 2^53 (integer-valued f64 addition is
+    // exact), so a per-leaf COUNT is bit-identical to the serial `sum_f64` fold —
+    // and integer counts are order-independent, so the count may run in parallel.
+    // Membership rule mirrors the general path exactly: an object contributes only
+    // when its leaf index is in range AND it has a weight entry.
+    if weights.iter().all(|&w| w == 1.0) {
+        let bound = leaf_of.len().min(weights.len());
+        let counts = leaf_of
+            .get(..bound)
+            .unwrap_or(&[])
+            .par_iter()
+            .fold(
+                || vec![0_u64; n_leaves],
+                |mut acc, &leaf| {
+                    if let Some(slot) = acc.get_mut(leaf) {
+                        *slot += 1;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0_u64; n_leaves],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b.iter()) {
+                        *x += y;
+                    }
+                    a
+                },
+            );
+        return counts.into_iter().map(|c| c as f64).collect();
     }
-    members.iter().map(|bucket| sum_f64(bucket)).collect()
+    // General path: bucket each leaf's member weights in object order (checked
+    // `.get` only — `indexing_slicing` is deny), then fold each bucket with the
+    // sanctioned left-to-right `sum_f64`. The bucketing is chunked in parallel and
+    // the per-chunk buckets are concatenated IN CHUNK ORDER, so every leaf's member
+    // sequence — and therefore the fold order and its bits — is identical to the
+    // serial form (order is the parity contract, cb-core::reduction).
+    const CHUNK: usize = 1 << 16;
+    let n_chunks = leaf_of.len().div_ceil(CHUNK).max(1);
+    let partials: Vec<Vec<Vec<f64>>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|c| {
+            let start = c * CHUNK;
+            let mut buckets: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
+            for (off, &leaf) in leaf_of.get(start..).unwrap_or(&[]).iter().take(CHUNK).enumerate() {
+                if let (Some(bucket), Some(&w)) = (buckets.get_mut(leaf), weights.get(start + off)) {
+                    bucket.push(w);
+                }
+            }
+            buckets
+        })
+        .collect();
+    (0..n_leaves)
+        .into_par_iter()
+        .map(|l| {
+            let mut members: Vec<f64> = Vec::new();
+            for chunk_buckets in &partials {
+                if let Some(bucket) = chunk_buckets.get(l) {
+                    members.extend_from_slice(bucket);
+                }
+            }
+            sum_f64(&members)
+        })
+        .collect()
 }
 
 /// `NormalizeLeafValues` (`approx_updater_helpers.cpp:8-21`, called from
@@ -4490,26 +4546,70 @@ fn train_inner<R: Runtime>(
     // handed to `begin`, matching the CPU per-tree
     // `scale_l2_reg(l2, sumAllWeights, n)`.
     let device_scaled_l2 = scale_l2_reg(params.l2_leaf_reg, sum_all_weights, n);
+    // Phase 12 Plan 03 (GPUT-18 / Open Q2 promotion): the device grow-policy mapping.
+    // (Hoisted above the quantize step so the QPACK-01 raw-channel gate below can read
+    // it — a pure function of `params`, so the hoist is order-invariant.)
+    let device_grow_policy = match params.grow_policy {
+        EGrowPolicy::Depthwise => DeviceGrowPolicy::Depthwise,
+        EGrowPolicy::Lossguide => DeviceGrowPolicy::Lossguide,
+        // Phase 12 Plan 04 (GPUT-18): Region routes to the host-driven device Region PATH grow.
+        EGrowPolicy::Region => DeviceGrowPolicy::Region,
+        // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
+        _ => DeviceGrowPolicy::SymmetricTree,
+    };
+    // QPACK-01: the raw float channel — the backend quantizes AND packs the cindex ON
+    // DEVICE, so the host bin matrix (an `n * nf` u32 buffer, ~200MB at 1M×50) never
+    // exists. Offered exactly when every session arm that would need host bins is
+    // absent: float-only (no one-hot), no CTR, and the oblivious SymmetricTree family
+    // (non-symmetric / Region keep host bin copies in their grow state). The session
+    // independently re-checks and declines to `false`, after which the host-quantize
+    // channel below runs unchanged — never a wrong device result, never a lost fit.
+    let raw_device_channel = device_host_eligible
+        && one_hot_bins.is_empty()
+        && materialized_ctr_features.is_empty()
+        && matches!(device_grow_policy, DeviceGrowPolicy::SymmetricTree);
     // SPEC-OH-21 (T24): ONE device-quantize entry, on EVERY device-eligible pool. A
     // float-only pool passes an empty `cat_bins` slice and still gets a fully populated
     // `real_folds` (`[borders[f].len() + 1, …]`), which is what lets the session's
     // `real_folds.len() == eff_n_features` check stay unconditional. Routing float-only
     // fits back through the 2-tuple `quantize_feature_major` would leave nothing
     // producing `real_folds` and break every existing float-only device oracle.
+    //
+    // QPACK-01 carve-out: on the raw channel the bins are NOT quantized here — only the
+    // metadata (`n_bins`, `real_folds`) is derived, by the SAME formulas the quantizer
+    // uses on a float-only pool (`n_bins = max_f(borders_f + 1).max(1)`, `real_folds[f]
+    // = borders_f + 1`), so the session sees identical scalars on either channel. The
+    // host quantize still runs lazily below if the raw attempt declines.
     let (device_bins, device_n_bins, device_real_folds) = if device_host_eligible {
-        let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
-        let prof_t = std::time::Instant::now();
-        let out =
-            quantize_feature_major_with_one_hot(feature_values, feature_borders, &one_hot_bins, n);
-        if prof {
-            eprintln!(
-                "CB_GPU_PROF quantize n={n} nf={} n_one_hot={} elapsed={:.2}ms",
-                feature_values.len(),
-                one_hot_bins.len(),
-                prof_t.elapsed().as_secs_f64() * 1e3,
+        if raw_device_channel {
+            let real_folds: Vec<u32> = feature_borders
+                .iter()
+                .map(|b| u32::try_from(b.len() + 1).unwrap_or(u32::MAX))
+                .collect();
+            let n_bins = feature_borders
+                .iter()
+                .fold(0usize, |acc, b| acc.max(b.len() + 1))
+                .max(1);
+            (Vec::new(), n_bins, real_folds)
+        } else {
+            let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
+            let prof_t = std::time::Instant::now();
+            let out = quantize_feature_major_with_one_hot(
+                feature_values,
+                feature_borders,
+                &one_hot_bins,
+                n,
             );
+            if prof {
+                eprintln!(
+                    "CB_GPU_PROF quantize n={n} nf={} n_one_hot={} elapsed={:.2}ms",
+                    feature_values.len(),
+                    one_hot_bins.len(),
+                    prof_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            out
         }
-        out
     } else {
         (Vec::new(), 0, Vec::new())
     };
@@ -4525,14 +4625,8 @@ fn train_inner<R: Runtime>(
     // gate. SymmetricTree yields `DeviceTrainConfig::default()` (byte-unchanged, D-04); the two
     // non-symmetric policies flip the device non-sym arm on. Every OTHER family knob stays at
     // its default covered value (host eligibility already excludes sampling / exact / CTR).
-    let device_grow_policy = match params.grow_policy {
-        EGrowPolicy::Depthwise => DeviceGrowPolicy::Depthwise,
-        EGrowPolicy::Lossguide => DeviceGrowPolicy::Lossguide,
-        // Phase 12 Plan 04 (GPUT-18): Region routes to the host-driven device Region PATH grow.
-        EGrowPolicy::Region => DeviceGrowPolicy::Region,
-        // SymmetricTree (and any policy that reached here) → the oblivious covered regime.
-        _ => DeviceGrowPolicy::SymmetricTree,
-    };
+    // (`device_grow_policy` itself is mapped above the quantize step — QPACK-01.)
+    //
     // GDC-11 (T14): the two-permutation device CTR config. Populated ONLY for a
     // host-eligible CTR fit (the relaxed clause above already vetted single-
     // permutation + simple Borders columns); every other fit keeps `ctr: None`
@@ -4678,29 +4772,72 @@ fn train_inner<R: Runtime>(
         ..DeviceTrainConfig::default()
     };
     let device_active = if device_host_eligible && device_n_bins > 0 {
-        runtime.begin_device_training(
-            &params.loss,
-            params.depth,
-            matches!(params.boosting_type, EBoostingType::Plain),
-            // GDC-01: the REAL learning-fold count, not a literal 1. For every
-            // non-CTR fit `learning_fold_count(pc, false) == 1` (byte-unchanged,
-            // D-04); once the CTR clause admits fits, `ctr_covered`'s
-            // `fold_count != 1` decline (session.rs) becomes load-bearing and a
-            // multi-permutation CTR fit can never silently ride fold-0 columns.
-            learning_folds_for_cycle,
-            params.score_function,
-            &device_bins,
-            &weights,
-            n,
-            // The device feature axis is the CONCATENATED `float | one-hot` width
-            // (SPEC-OH-21), not the float count — equal to `matrix.n_features()` on a
-            // float-only pool, so this is byte-unchanged there.
-            device_n_features,
-            device_n_bins,
-            learning_rate,
-            device_scaled_l2,
-            &device_config,
-        )?
+        // QPACK-01: offer the RAW float channel first (device-side quantize+pack — no
+        // host bin matrix). A `false` return is a coverage decline, NOT an error: fall
+        // through to the host-quantize channel, exactly as if the raw channel never
+        // existed. The lazy quantize below therefore runs only on that decline path.
+        let raw_opened = if raw_device_channel {
+            runtime.begin_device_training_raw(
+                &params.loss,
+                params.depth,
+                matches!(params.boosting_type, EBoostingType::Plain),
+                learning_folds_for_cycle,
+                params.score_function,
+                feature_values,
+                feature_borders,
+                &weights,
+                n,
+                device_n_features,
+                device_n_bins,
+                learning_rate,
+                device_scaled_l2,
+                &device_config,
+            )?
+        } else {
+            false
+        };
+        if raw_opened {
+            true
+        } else {
+            // The host-quantize channel. On the raw-decline path the bins were never
+            // quantized above — do it now (identical output to the eager path).
+            let host_bins: std::borrow::Cow<'_, [u32]> = if raw_device_channel {
+                std::borrow::Cow::Owned(
+                    quantize_feature_major_with_one_hot(
+                        feature_values,
+                        feature_borders,
+                        &one_hot_bins,
+                        n,
+                    )
+                    .0,
+                )
+            } else {
+                std::borrow::Cow::Borrowed(&device_bins)
+            };
+            runtime.begin_device_training(
+                &params.loss,
+                params.depth,
+                matches!(params.boosting_type, EBoostingType::Plain),
+                // GDC-01: the REAL learning-fold count, not a literal 1. For every
+                // non-CTR fit `learning_fold_count(pc, false) == 1` (byte-unchanged,
+                // D-04); once the CTR clause admits fits, `ctr_covered`'s
+                // `fold_count != 1` decline (session.rs) becomes load-bearing and a
+                // multi-permutation CTR fit can never silently ride fold-0 columns.
+                learning_folds_for_cycle,
+                params.score_function,
+                &host_bins,
+                &weights,
+                n,
+                // The device feature axis is the CONCATENATED `float | one-hot` width
+                // (SPEC-OH-21), not the float count — equal to `matrix.n_features()` on a
+                // float-only pool, so this is byte-unchanged there.
+                device_n_features,
+                device_n_bins,
+                learning_rate,
+                device_scaled_l2,
+                &device_config,
+            )?
+        }
     } else {
         false
     };
@@ -4910,6 +5047,11 @@ fn train_inner<R: Runtime>(
         // it, so it is not a dead binding.
         if device_active {
             let _ = iter;
+            // CB_GPU_PROF host-stage attribution for the device fold (SPD-03 §2.3: the
+            // per-iteration host work between device calls was invisible to profiling).
+            // Cold when unset: one cached env read, three Instant reads, no prints.
+            let host_prof = crate::gpu_prof_host_enabled();
+            let hp_t0 = std::time::Instant::now();
 
             // ─── WR-01: PER-TREE HOST BOOTSTRAP (Design A) ───────────────────────────
             // The device branch keeps the ENTIRE sampler on the host: `bootstrap()` is the
@@ -4987,6 +5129,8 @@ fn train_inner<R: Runtime>(
             // fold arms below so the MVS λ carry after them has something to read.
             let mut device_stored_leaf_values: Vec<f64> = Vec::new();
 
+            let hp_sample_ms = hp_t0.elapsed().as_secs_f64() * 1e3;
+            let hp_grow_t = std::time::Instant::now();
             let dev_tree = runtime
                 .grow_tree_on_device(&approx, target, &device_sample, None)?
                 .ok_or_else(|| {
@@ -5002,6 +5146,8 @@ fn train_inner<R: Runtime>(
                             .to_owned(),
                     )
                 })?;
+            let hp_grow_ms = hp_grow_t.elapsed().as_secs_f64() * 1e3;
+            let hp_fold_t = std::time::Instant::now();
 
             // Phase 12 Plan 03/04 (GPUT-18): dispatch on the populated `DeviceGrownTree`
             // SHAPE, in the SAME order as the CPU fold at `:4419`: a NON-EMPTY
@@ -5050,6 +5196,7 @@ fn train_inner<R: Runtime>(
                 // a panic / raw index (T-12-05). `one_hot` is always false for the
                 // device float grower, so the `>` test is authoritative.
                 let device_leaf_of: Vec<usize> = (0..n)
+                    .into_par_iter()
                     .map(|obj| {
                         let mut bin = 0usize;
                         for level in 0..region_depth {
@@ -5095,11 +5242,17 @@ fn train_inner<R: Runtime>(
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
 
-                for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
-                        *a += lv;
-                    }
-                }
+                // Elementwise, order-independent per-object add — bit-identical to the
+                // serial loop (each slot is touched exactly once), parallel over objects
+                // (this pass runs once per boosting iteration at n scale).
+                approx
+                    .par_iter_mut()
+                    .zip(device_leaf_of.par_iter())
+                    .for_each(|(a, &leaf)| {
+                        if let Some(&lv) = device_leaf_values.get(leaf) {
+                            *a += lv;
+                        }
+                    });
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);
@@ -5279,73 +5432,172 @@ fn train_inner<R: Runtime>(
                         })
                         .collect()
                 };
-                let device_leaf_of: Vec<usize> = if device_has_ctr_split {
-                    // GDC-11/GDC-10 (T14): the LEAF-VALUE / main-approx assignment
-                    // for a CTR tree is the AVERAGING-fold partition — exactly the
-                    // CPU `leaf_value_leaf_of` (`assign_leaf_over_ctr_columns`,
-                    // `BuildIndices(AveragingFold)`): float levels keep the float
-                    // test, CTR levels re-test against the AVERAGING column's
-                    // bins. The device already gathered the RETURNED leaf values
-                    // over this same partition (GDC-10), so values and assignment
-                    // stay consistent here.
-                    let grown_like = GrownTree {
-                        splits: device_splits.clone(),
-                        one_hot_splits: device_one_hot_splits.clone(),
-                        leaf_of: Vec::new(),
-                        ctr_splits: device_ctr_splits.clone(),
-                        level_kinds: device_level_kinds.clone(),
-                        step_nodes: Vec::new(),
-                        node_id_to_leaf_id: Vec::new(),
-                        region_directions: Vec::new(),
-                        region_one_hot: Vec::new(),
-                    };
-                    assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown_like, n)
-                } else {
-                    (0..n)
-                        .map(|obj| {
-                            let mut leaf = 0usize;
-                            for (l, col) in level_cols.iter().enumerate() {
-                                let passes = match col {
-                                    DeviceLevelCol::Float(values, border) => values
-                                        .get(obj)
-                                        .is_some_and(|&v| f64::from(v) > *border),
-                                    DeviceLevelCol::OneHot(bins, value) => {
-                                        bins.get(obj).is_some_and(|&b| b == *value)
-                                    }
-                                };
-                                if passes {
-                                    leaf |= 1usize << l;
-                                }
-                            }
-                            leaf
-                        })
-                        .collect()
-                };
-
                 // Leaf values: the device returns UN-scaled leaves; cb-train applies the
                 // `learning_rate` shrinkage. Non-pairwise → `normalize_leaf_values` applies
-                // ONLY the lr scale (byte-identical to `learning_rate * delta`, D-04).
+                // ONLY the lr scale (byte-identical to `learning_rate * delta`, D-04) and
+                // reads `leaf_weights` NOT AT ALL — which is what licenses the fused path
+                // below to scale BEFORE the weights exist.
                 let mut device_leaf_values = dev_tree.leaf_values.clone();
-                let device_leaf_weights =
-                    accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
-                normalize_leaf_values(
-                    /* is_pairwise = */ false,
-                    learning_rate,
-                    &device_leaf_weights,
-                    &mut device_leaf_values,
-                    n_leaves,
-                    /* approx_dimension = */ 1,
-                );
+                // SPD-03 wave 3 (P100 260808-r2: the three separate O(n) fold sweeps —
+                // walk, weight bucketing, approx add — still cost ~18 ms/tree on the
+                // 4-vCPU Kaggle host). The unit-weight float-only fold — every unweighted
+                // fit — fuses them into ONE parallel sweep with per-chunk integer leaf
+                // counts, never materializing `device_leaf_of`. Bit-exact: the walk is the
+                // same per-object test, the approx add hits each slot once with the same
+                // value, and a fold of k unit weights is EXACTLY `k as f64` (integer f64
+                // addition below 2^53), order-free.
+                let fused_unit_fold = !device_has_ctr_split && weights.iter().all(|&w| w == 1.0);
+                let device_leaf_weights: Vec<f64> = if fused_unit_fold {
+                    normalize_leaf_values(
+                        /* is_pairwise = */ false,
+                        learning_rate,
+                        &[],
+                        &mut device_leaf_values,
+                        n_leaves,
+                        /* approx_dimension = */ 1,
+                    );
+                    const FOLD_CHUNK: usize = 1 << 16;
+                    let weights_len = weights.len();
+                    // SPD-03 wave 4: the seam ALREADY returns the device's resident
+                    // per-object leaf assignment (`read_part_stats_and_leaf_of` crosses
+                    // it with the part-stats every tree; `DeviceGrownTree.leaf_of`), in
+                    // the SAME forward-bit convention as the host walk
+                    // (`partition_split_kernel` doc: `leaf |= 1 << level`, quantized
+                    // `bin > split_bin` ⟺ value-space `v > border` — exact, since every
+                    // border round-trips f32 by construction). Re-walking the raw float
+                    // columns here was pure redundancy — and the walk's 6 column
+                    // gathers were the fold's dominant memory traffic (P100 r3:
+                    // 17 ms/tree on 4 vCPUs). Use the device assignment when its length
+                    // matches; the walk remains as the fallback.
+                    let device_assignment: Option<&[u32]> = (dev_tree.leaf_of.len()
+                        == approx.len())
+                    .then_some(dev_tree.leaf_of.as_slice());
+                    let counts: Vec<u64> = approx
+                        .par_chunks_mut(FOLD_CHUNK)
+                        .enumerate()
+                        .map(|(c, approx_chunk)| {
+                            let start = c * FOLD_CHUNK;
+                            let mut counts = vec![0_u64; n_leaves];
+                            for (off, a) in approx_chunk.iter_mut().enumerate() {
+                                let obj = start + off;
+                                let leaf = if let Some(dev) = device_assignment {
+                                    dev.get(obj).copied().unwrap_or(0) as usize
+                                } else {
+                                    let mut leaf = 0usize;
+                                    for (l, col) in level_cols.iter().enumerate() {
+                                        let passes = match col {
+                                            DeviceLevelCol::Float(values, border) => values
+                                                .get(obj)
+                                                .is_some_and(|&v| f64::from(v) > *border),
+                                            DeviceLevelCol::OneHot(bins, value) => {
+                                                bins.get(obj).is_some_and(|&b| b == *value)
+                                            }
+                                        };
+                                        if passes {
+                                            leaf |= 1usize << l;
+                                        }
+                                    }
+                                    leaf
+                                };
+                                // Same membership rule as `accumulate_leaf_weights`: an
+                                // object contributes to the weight only when it has a
+                                // weight entry (and the leaf is in range).
+                                if obj < weights_len {
+                                    if let Some(slot) = counts.get_mut(leaf) {
+                                        *slot += 1;
+                                    }
+                                }
+                                if let Some(&lv) = device_leaf_values.get(leaf) {
+                                    *a += lv;
+                                }
+                            }
+                            counts
+                        })
+                        .reduce(
+                            || vec![0_u64; n_leaves],
+                            |mut x, y| {
+                                for (a, b) in x.iter_mut().zip(y.iter()) {
+                                    *a += b;
+                                }
+                                x
+                            },
+                        );
+                    counts.into_iter().map(|c| c as f64).collect()
+                } else {
+                    let device_leaf_of: Vec<usize> = if device_has_ctr_split {
+                        // GDC-11/GDC-10 (T14): the LEAF-VALUE / main-approx assignment
+                        // for a CTR tree is the AVERAGING-fold partition — exactly the
+                        // CPU `leaf_value_leaf_of` (`assign_leaf_over_ctr_columns`,
+                        // `BuildIndices(AveragingFold)`): float levels keep the float
+                        // test, CTR levels re-test against the AVERAGING column's
+                        // bins. The device already gathered the RETURNED leaf values
+                        // over this same partition (GDC-10), so values and assignment
+                        // stay consistent here.
+                        let grown_like = GrownTree {
+                            splits: device_splits.clone(),
+                            one_hot_splits: device_one_hot_splits.clone(),
+                            leaf_of: Vec::new(),
+                            ctr_splits: device_ctr_splits.clone(),
+                            level_kinds: device_level_kinds.clone(),
+                            step_nodes: Vec::new(),
+                            node_id_to_leaf_id: Vec::new(),
+                            region_directions: Vec::new(),
+                            region_one_hot: Vec::new(),
+                        };
+                        assign_leaf_over_ctr_columns(&matrix, &averaging_ctr_features, &grown_like, n)
+                    } else {
+                        // Pure per-object walk (reads only resolved split columns) —
+                        // parallel over objects, deterministic per index (this walk runs
+                        // once per boosting iteration at n scale).
+                        (0..n)
+                            .into_par_iter()
+                            .map(|obj| {
+                                let mut leaf = 0usize;
+                                for (l, col) in level_cols.iter().enumerate() {
+                                    let passes = match col {
+                                        DeviceLevelCol::Float(values, border) => values
+                                            .get(obj)
+                                            .is_some_and(|&v| f64::from(v) > *border),
+                                        DeviceLevelCol::OneHot(bins, value) => {
+                                            bins.get(obj).is_some_and(|&b| b == *value)
+                                        }
+                                    };
+                                    if passes {
+                                        leaf |= 1usize << l;
+                                    }
+                                }
+                                leaf
+                            })
+                            .collect()
+                    };
+
+                    let device_leaf_weights =
+                        accumulate_leaf_weights(&device_leaf_of, &weights, n_leaves);
+                    normalize_leaf_values(
+                        /* is_pairwise = */ false,
+                        learning_rate,
+                        &device_leaf_weights,
+                        &mut device_leaf_values,
+                        n_leaves,
+                        /* approx_dimension = */ 1,
+                    );
+                    // Elementwise, order-independent per-object add — bit-identical to the
+                    // serial loop (each slot is touched exactly once), parallel over objects
+                    // (this pass runs once per boosting iteration at n scale).
+                    approx
+                        .par_iter_mut()
+                        .zip(device_leaf_of.par_iter())
+                        .for_each(|(a, &leaf)| {
+                            if let Some(&lv) = device_leaf_values.get(leaf) {
+                                *a += lv;
+                            }
+                        });
+                    device_leaf_weights
+                };
                 // WR-01 (`WR01-S8`): capture the STORED (lr-scaled) leaf values so the
                 // per-tree MVS λ carry after the fold arms can compute this tree's mean
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
-
-                for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
-                        *a += lv;
-                    }
-                }
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);
@@ -5415,6 +5667,7 @@ fn train_inner<R: Runtime>(
                 // `leaf_index_nonsym` pointer-walk. A malformed graph → checked leaf-0
                 // fallback (never a panic, T-12-05).
                 let device_leaf_of: Vec<usize> = (0..n)
+                    .into_par_iter()
                     .map(|obj| {
                         device_leaf_of_nonsym(
                             obj,
@@ -5446,11 +5699,17 @@ fn train_inner<R: Runtime>(
                 // leaf L2 norm, exactly as the CPU branch does.
                 device_stored_leaf_values.clone_from(&device_leaf_values);
 
-                for (i, &leaf) in device_leaf_of.iter().enumerate() {
-                    if let (Some(a), Some(&lv)) = (approx.get_mut(i), device_leaf_values.get(leaf)) {
-                        *a += lv;
-                    }
-                }
+                // Elementwise, order-independent per-object add — bit-identical to the
+                // serial loop (each slot is touched exactly once), parallel over objects
+                // (this pass runs once per boosting iteration at n scale).
+                approx
+                    .par_iter_mut()
+                    .zip(device_leaf_of.par_iter())
+                    .for_each(|(a, &leaf)| {
+                        if let Some(&lv) = device_leaf_values.get(leaf) {
+                            *a += lv;
+                        }
+                    });
 
                 if let Some(out) = staged_out.as_deref_mut() {
                     out.extend_from_slice(&approx);
@@ -5503,6 +5762,13 @@ fn train_inner<R: Runtime>(
             // λ sequence matches the CPU branch's for every bootstrap type.
             prev_leaf_mean_l2 = Some(last_iter_mean_leaf_value(&device_stored_leaf_values));
 
+            if host_prof {
+                eprintln!(
+                    "CB_GPU_PROF tree-host sample={hp_sample_ms:.2}ms grow={hp_grow_ms:.2}ms \
+                     fold={:.2}ms",
+                    hp_fold_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
             continue;
         }
 

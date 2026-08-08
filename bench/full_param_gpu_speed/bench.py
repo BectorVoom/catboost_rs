@@ -439,6 +439,14 @@ def main():
         return 1
     _sh(f"pip install -q --force-reinstall {sorted(wheels)[-1]}", timeout=1800)
 
+    # Kaggle images preinstall official catboost; Colab images do NOT (this cost the
+    # first Colab relaunch a 25-min build-then-ModuleNotFoundError round trip). The
+    # pin matches the project's parity target.
+    try:
+        import catboost  # noqa: F401
+    except ModuleNotFoundError:
+        _sh("pip install -q catboost==1.2.10", timeout=1800)
+
     import catboost as official  # noqa: F401
     import catboost_rs
 

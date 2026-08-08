@@ -298,6 +298,61 @@ impl Runtime for GpuBackend {
         Ok(covered)
     }
 
+    /// QPACK-01: open the session over the RAW float channel — the session quantizes AND
+    /// packs the cindex ON DEVICE (`GpuTrainSession::begin_raw`), so no host bin matrix
+    /// is ever built. `Ok(false)` on any coverage decline; the trainer then retries
+    /// through the host-quantize [`Self::begin_device_training`] channel.
+    fn begin_device_training_raw(
+        &self,
+        loss: &Loss,
+        depth: usize,
+        boosting_type_is_plain: bool,
+        fold_count: usize,
+        score_function: EScoreFunction,
+        float_columns: &[Vec<f32>],
+        feature_borders: &[Vec<f64>],
+        weight: &[f64],
+        n: usize,
+        n_features: usize,
+        n_bins: usize,
+        learning_rate: f64,
+        scaled_l2: f64,
+        config: &cb_compute::DeviceTrainConfig,
+    ) -> CbResult<bool> {
+        let prof = crate::gpu_runtime::gpu_prof_enabled();
+        let prof_t = std::time::Instant::now();
+        let session = GpuTrainSession::begin_raw(
+            loss,
+            depth,
+            boosting_type_is_plain,
+            fold_count,
+            score_function,
+            float_columns,
+            feature_borders,
+            weight,
+            n,
+            n_features,
+            n_bins,
+            learning_rate,
+            scaled_l2,
+            config,
+        )?;
+        let covered = session.is_some();
+        if prof {
+            eprintln!(
+                "CB_GPU_PROF begin-raw covered={covered} n={n} nf={n_features} \
+                 n_bins={n_bins} elapsed={:.2}ms",
+                prof_t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        // Only commit an OPENED session: a declined raw attempt must not clobber state
+        // (the caller immediately retries through the host channel).
+        if covered {
+            *self.session.borrow_mut() = session;
+        }
+        Ok(covered)
+    }
+
     /// GPUT-03/04: grow one oblivious tree on the device over the resident session, or signal
     /// the CPU fallback. When a session is open it advances the device-resident boosting
     /// (der1 chained on device, approx updated via `apply_leaf_delta` — no per-tree der1

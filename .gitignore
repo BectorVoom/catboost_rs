@@ -19,3 +19,6 @@ crates/cb-oracle/catboost_info/
 crates/cb-oracle/generator/__pycache__/
 **/__pycache__/
 .env
+
+# Nested crate target dirs (CubeCL kernel-cache roots under `cargo test` cwd)
+target/

@@ -1,0 +1,144 @@
+[{"stream_name":"stdout","time":1.3651791690000001,"data":"$ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader\n"}
+,{"stream_name":"stdout","time":1.401979644,"data":"Tesla P100-PCIE-16GB, 16384 MiB\n"}
+,{"stream_name":"stdout","time":1.402024114,"data":"\n"}
+,{"stream_name":"stdout","time":1.4020300749999999,"data":"$ git clone --depth 1 --branch worktree-gpu-host-prep-speed https://github.com/BectorVoom/catboost_rs.git /tmp/repo\n"}
+,{"stream_name":"stdout","time":3.657614691,"data":"Cloning into '/tmp/repo'...\n"}
+,{"stream_name":"stdout","time":3.657639854,"data":"\n"}
+,{"stream_name":"stdout","time":3.6576429729999997,"data":"$ git rev-parse HEAD\n"}
+,{"stream_name":"stdout","time":3.662353014,"data":"acefb65de9816648115a0a5f6093dc6883373a65\n"}
+,{"stream_name":"stdout","time":3.662376405,"data":"\n"}
+,{"stream_name":"stdout","time":3.662380777,"data":"cloned worktree-gpu-host-prep-speed at acefb65de9816648115a0a5f6093dc6883373a65\n"}
+,{"stream_name":"stdout","time":3.662384964,"data":"$ cargo --version\n"}
+,{"stream_name":"stdout","time":3.67227199,"data":"/bin/sh: 1: cargo: not found\n"}
+,{"stream_name":"stdout","time":3.672297265,"data":"\n"}
+,{"stream_name":"stdout","time":3.672302594,"data":"$ curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable\n"}
+,{"stream_name":"stdout","time":24.165245635,"data":"\n"}
+,{"stream_name":"stdout","time":24.165308001,"data":"  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)\n"}
+,{"stream_name":"stdout","time":24.165315715,"data":"\n"}
+,{"stream_name":"stdout","time":24.165320211,"data":"\n"}
+,{"stream_name":"stdout","time":24.165324025,"data":"Rust is installed now. Great!\n"}
+,{"stream_name":"stdout","time":24.165328631,"data":"\n"}
+,{"stream_name":"stdout","time":24.165333171,"data":"To get started you may need to restart your current shell.\n"}
+,{"stream_name":"stdout","time":24.165337998,"data":"This would reload your PATH environment variable to include\n"}
+,{"stream_name":"stdout","time":24.165342174,"data":"Cargo's bin directory ($HOME/.cargo/bin).\n"}
+,{"stream_name":"stdout","time":24.16534611,"data":"\n"}
+,{"stream_name":"stdout","time":24.165350025,"data":"To configure your current shell, you need to source\n"}
+,{"stream_name":"stdout","time":24.165367397,"data":"the corresponding env file under $HOME/.cargo.\n"}
+,{"stream_name":"stdout","time":24.165370905,"data":"\n"}
+,{"stream_name":"stdout","time":24.165379115,"data":"This is usually done by running one of the following (note the leading DOT):\n"}
+,{"stream_name":"stdout","time":24.165381743,"data":". \"$HOME/.cargo/env\"            # For sh/bash/zsh/ash/dash/pdksh\n"}
+,{"stream_name":"stdout","time":24.165384117,"data":"source \"$HOME/.cargo/env.fish\"  # For fish\n"}
+,{"stream_name":"stdout","time":24.165386412,"data":"source \"~/.cargo/env.nu\"  # For nushell\n"}
+,{"stream_name":"stdout","time":24.165388641,"data":"source \"$HOME/.cargo/env.tcsh\"  # For tcsh\n"}
+,{"stream_name":"stdout","time":24.165390913,"data":". \"$HOME/.cargo/env.ps1\"        # For pwsh\n"}
+,{"stream_name":"stdout","time":24.165393158,"data":"source \"$HOME/.cargo/env.xsh\"   # For xonsh\n"}
+,{"stream_name":"stdout","time":24.165421472,"data":"info: downloading installer\n"}
+,{"stream_name":"stdout","time":24.165425478,"data":"warn: It looks like you have an existing rustup settings file at:\n"}
+,{"stream_name":"stdout","time":24.165429038,"data":"warn: /root/.rustup/settings.toml\n"}
+,{"stream_name":"stdout","time":24.165433118,"data":"warn: Rustup will install the default toolchain as specified in the settings file,\n"}
+,{"stream_name":"stdout","time":24.165448065,"data":"warn: instead of the one inferred from the default host triple.\n"}
+,{"stream_name":"stdout","time":24.165452227,"data":"info: profile set to default\n"}
+,{"stream_name":"stdout","time":24.165455622,"data":"info: default host triple is x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":24.165459018,"data":"info: syncing channel updates for stable-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":24.165462392,"data":"info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)\n"}
+,{"stream_name":"stdout","time":24.165465822,"data":"info: downloading 6 components\n"}
+,{"stream_name":"stdout","time":24.165469167,"data":"info: default toolchain set to stable-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":24.165472478,"data":"\n"}
+,{"stream_name":"stdout","time":24.165475633,"data":"$ cargo --version\n"}
+,{"stream_name":"stdout","time":24.189286386,"data":"cargo 1.97.1 (c980f4866 2026-06-30)\n"}
+,{"stream_name":"stdout","time":24.189357871,"data":"\n"}
+,{"stream_name":"stdout","time":24.189523865,"data":"$ /usr/bin/python3 /tmp/repo/bench/full_param_gpu_speed/bench.py --dry-run\n"}
+,{"stream_name":"stdout","time":24.354500054,"data":"ted=False ctr=True\n"}
+,{"stream_name":"stdout","time":24.354532231,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.35454108,"data":"[ELIGIBLE] Depthwise|RMSE|w|noctr|1000k\n"}
+,{"stream_name":"stdout","time":24.354544595,"data":"    shape=(1000000, 50) kind=reg weighted=True ctr=False\n"}
+,{"stream_name":"stdout","time":24.354548338,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354553873,"data":"[ELIGIBLE] Depthwise|RMSE|w|ctr|1000k\n"}
+,{"stream_name":"stdout","time":24.354557369,"data":"    shape=(1000000, 50) kind=reg weighted=True ctr=True\n"}
+,{"stream_name":"stdout","time":24.354561612,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354566985,"data":"[ELIGIBLE] Depthwise|Logloss|unw|noctr|1000k\n"}
+,{"stream_name":"stdout","time":24.354570227,"data":"    shape=(1000000, 50) kind=clf weighted=False ctr=False\n"}
+,{"stream_name":"stdout","time":24.354573926,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354579324,"data":"[ELIGIBLE] Depthwise|Logloss|unw|ctr|1000k\n"}
+,{"stream_name":"stdout","time":24.354582729,"data":"    shape=(1000000, 50) kind=clf weighted=False ctr=True\n"}
+,{"stream_name":"stdout","time":24.354613898,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354619566,"data":"[ELIGIBLE] Depthwise|Logloss|w|noctr|1000k\n"}
+,{"stream_name":"stdout","time":24.35462306,"data":"    shape=(1000000, 50) kind=clf weighted=True ctr=False\n"}
+,{"stream_name":"stdout","time":24.354626585,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354632139,"data":"[ELIGIBLE] Depthwise|Logloss|w|ctr|1000k\n"}
+,{"stream_name":"stdout","time":24.35463536,"data":"    shape=(1000000, 50) kind=clf weighted=True ctr=True\n"}
+,{"stream_name":"stdout","time":24.354639018,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"Logloss\", \"one_hot_max_size\": 1, \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354644035,"data":"[ELIGIBLE] SHOWCASE-bias|RMSE|unw|noctr|300k\n"}
+,{"stream_name":"stdout","time":24.354647525,"data":"    shape=(300000, 50) kind=reg weighted=False ctr=False\n"}
+,{"stream_name":"stdout","time":24.354651177,"data":"    kwargs={\"boost_from_average\": true, \"bootstrap_type\": \"No\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"SymmetricTree\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\"}\n"}
+,{"stream_name":"stdout","time":24.354656832,"data":"[ELIGIBLE] SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k\n"}
+,{"stream_name":"stdout","time":24.354660335,"data":"    shape=(300000, 50) kind=reg weighted=False ctr=False\n"}
+,{"stream_name":"stdout","time":24.354663873,"data":"    kwargs={\"boost_from_average\": false, \"bootstrap_type\": \"Bernoulli\", \"border_count\": 32, \"depth\": 6, \"grow_policy\": \"Depthwise\", \"iterations\": 30, \"l2_leaf_reg\": 3.0, \"leaf_estimation_method\": \"Gradient\", \"learning_rate\": 0.1, \"loss_function\": \"RMSE\", \"random_seed\": 42, \"random_strength\": 0, \"score_function\": \"L2\", \"subsample\": 0.66}\n"}
+,{"stream_name":"stdout","time":24.354669288,"data":"\n"}
+,{"stream_name":"stdout","time":24.354672634,"data":"\n"}
+,{"stream_name":"stdout","time":24.354675913,"data":"[SHOWCASE ELIGIBLE] SHOWCASE-bias|RMSE|unw|noctr|300k — boost_from_average\n"}
+,{"stream_name":"stdout","time":24.354680228,"data":"[SHOWCASE ELIGIBLE] SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k — Depthwise x Bernoulli\n"}
+,{"stream_name":"stdout","time":24.3546839,"data":"\n"}
+,{"stream_name":"stdout","time":24.35468725,"data":"DRY RUN OK — grid reviewable, every showcase cell eligible.\n"}
+,{"stream_name":"stdout","time":24.35469068,"data":"\n"}
+,{"stream_name":"stdout","time":24.354693991,"data":"$ /usr/bin/python3 /tmp/repo/bench/full_param_gpu_speed/bench.py\n"}
+,{"stream_name":"stdout","time":1016.815498874,"data":"ber of categorical features\")\n"}
+,{"stream_name":"stdout","time":1016.815569915,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":1016.81557735,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815581674,"data":"=== Depthwise|RMSE|unw|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815586233,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.81559177,"data":"  [official] median=1.834s all=[1.7405, 1.8339, 1.8552]\n"}
+,{"stream_name":"stdout","time":1016.815595759,"data":"  [catboost_rs] N/A: CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 \u003c\u003c bits for bits in 5..=8), got 33')\n"}
+,{"stream_name":"stdout","time":1016.815601702,"data":"\n"}
+,{"stream_name":"stdout","time":1016.8156049,"data":"=== Depthwise|RMSE|unw|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815608067,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815611494,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":1016.815617015,"data":"  [catboost_rs] N/A: CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) — pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')\n"}
+,{"stream_name":"stdout","time":1016.815622217,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815626272,"data":"=== Depthwise|RMSE|w|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815630291,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815634274,"data":"  [official] median=1.935s all=[1.8629, 1.9359, 1.9346]\n"}
+,{"stream_name":"stdout","time":1016.815639043,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":1016.815644058,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815647884,"data":"=== Depthwise|RMSE|w|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815651955,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815656338,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":1016.815661964,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":1016.815666241,"data":"\n"}
+,{"stream_name":"stdout","time":1016.81566998,"data":"=== Depthwise|Logloss|unw|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815673986,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815678464,"data":"  [official] median=2.086s all=[2.16, 2.086, 2.0706]\n"}
+,{"stream_name":"stdout","time":1016.81568547,"data":"  [catboost_rs] N/A: CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 \u003c\u003c bits for bits in 5..=8), got 33')\n"}
+,{"stream_name":"stdout","time":1016.815690222,"data":"\n"}
+,{"stream_name":"stdout","time":1016.81569895,"data":"=== Depthwise|Logloss|unw|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815703951,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815707954,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":1016.81571153,"data":"  [catboost_rs] N/A: CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) — pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')\n"}
+,{"stream_name":"stdout","time":1016.815715799,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815719109,"data":"=== Depthwise|Logloss|w|noctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815722454,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815726135,"data":"  [official] median=2.192s all=[2.1959, 2.1921, 2.1897]\n"}
+,{"stream_name":"stdout","time":1016.815729163,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":1016.815732979,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815735826,"data":"=== Depthwise|Logloss|w|ctr|1000k ===\n"}
+,{"stream_name":"stdout","time":1016.815739902,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.815743125,"data":"  [official] N/A: CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")\n"}
+,{"stream_name":"stdout","time":1016.815747389,"data":"  [catboost_rs] N/A: TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")\n"}
+,{"stream_name":"stdout","time":1016.815750896,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815754363,"data":"=== SHOWCASE-bias|RMSE|unw|noctr|300k ===\n"}
+,{"stream_name":"stdout","time":1016.815758229,"data":"  [official] median=1.238s all=[1.2343, 1.2523, 1.2382]\n"}
+,{"stream_name":"stdout","time":1016.815761632,"data":"  [catboost_rs] median=1.263s all=[1.2632, 1.3172, 1.2283]\n"}
+,{"stream_name":"stdout","time":1016.81576547,"data":"\n"}
+,{"stream_name":"stdout","time":1016.815768915,"data":"=== SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k ===\n"}
+,{"stream_name":"stdout","time":1016.815772684,"data":"  DEVICE NOT ACTIVATED (0 CB_GPU_PROF tree lines) — reported as a CPU row\n"}
+,{"stream_name":"stdout","time":1016.81577668,"data":"  [official] median=1.337s all=[1.3804, 1.3311, 1.3365]\n"}
+,{"stream_name":"stdout","time":1016.815779676,"data":"  [catboost_rs] N/A: CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 \u003c\u003c bits for bits in 5..=8), got 33')\n"}
+,{"stream_name":"stdout","time":1016.81578388,"data":"\n"}
+,{"stream_name":"stdout","time":1016.820700741,"data":"done rc=0 elapsed=1015s\n"}
+,{"stream_name":"stderr","time":1019.301107658,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":1019.301190404,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":1019.712606446,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":1019.712653059,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":1021.000217947,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":1021.883819295,"data":"[NbConvertApp] Writing 292584 bytes to __results__.html\n"}
+]

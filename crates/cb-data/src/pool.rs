@@ -41,6 +41,14 @@ pub struct Pool {
     /// Float features, Structure-of-Arrays: `float_features[f][row]`. Each inner
     /// `Vec` has length `n_rows`.
     float_features: Vec<Vec<f64>>,
+    /// OPTIONAL f32 narrowing cache of `float_features` (empty = absent), SoA with
+    /// the same shape. Attached by ingestion sources whose input was ALREADY f32
+    /// (the Python NumPy path), where `f64::from(v) as f32 == v` bit-exactly — so
+    /// a consumer that needs the f32 storage view (fit-prep) can skip the full
+    /// re-narrowing pass (SPD-03 wave 3: that pass was a top host term at 1M×50).
+    /// Never load-bearing: every consumer must fall back to narrowing
+    /// `float_features` itself when this is empty or its shape disagrees.
+    float_features_f32: Vec<Vec<f32>>,
     /// Categorical features as raw owned strings (hashing happens in the
     /// cat-hash plan): `cat_features[f][row]`. Each inner `Vec` has length
     /// `n_rows`.
@@ -95,6 +103,7 @@ impl Pool {
         Self {
             n_rows,
             float_features,
+            float_features_f32: Vec::new(),
             cat_features,
             text_features,
             embedding_features,
@@ -105,6 +114,21 @@ impl Pool {
             pairs,
             baseline,
         }
+    }
+
+    /// Attach the f32 narrowing cache (see the field doc). Called by the
+    /// ingestion seam AFTER shape validation; a wrong-shape cache would be
+    /// silently ignored by consumers (they re-narrow), never wrong data.
+    pub(crate) fn set_float_f32_cache(&mut self, cache: Vec<Vec<f32>>) {
+        self.float_features_f32 = cache;
+    }
+
+    /// The f32 narrowing cache of the float columns, or an EMPTY slice when no
+    /// ingestion source attached one. Consumers must treat empty (or any shape
+    /// disagreement with [`Self::float_features`]) as "narrow it yourself".
+    #[must_use]
+    pub fn float_features_f32(&self) -> &[Vec<f32>] {
+        &self.float_features_f32
     }
 
     /// Number of objects (rows) in the dataset.
@@ -229,6 +253,11 @@ impl Pool {
             .iter()
             .map(|col| gather(col, indices))
             .collect();
+        let float_features_f32: Vec<Vec<f32>> = self
+            .float_features_f32
+            .iter()
+            .map(|col| gather(col, indices))
+            .collect();
         let cat_features = self
             .cat_features
             .iter()
@@ -251,7 +280,7 @@ impl Pool {
         // length-consistent. Empty columns gather to empty and are unaffected.
         let n_rows = indices.iter().filter(|&&i| i < self.n_rows).count();
 
-        Pool::from_validated_columns(
+        let mut out = Pool::from_validated_columns(
             n_rows,
             float_features,
             cat_features,
@@ -263,6 +292,10 @@ impl Pool {
             gather(&self.subgroup_id, indices),
             Vec::new(),
             gather(&self.baseline, indices),
-        )
+        );
+        // The f32 cache gathers with the same indices, so it stays a bit-exact
+        // narrowing of the gathered f64 columns (empty stays empty).
+        out.set_float_f32_cache(float_features_f32);
+        out
     }
 }

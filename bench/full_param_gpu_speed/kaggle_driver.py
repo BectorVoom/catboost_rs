@@ -18,7 +18,7 @@ import sys
 import time
 
 REPO_URL = os.environ.get("CB_REPO_URL", "https://github.com/BectorVoom/catboost_rs.git")
-BRANCH = os.environ.get("CB_BRANCH", "worktree-gpu-full-parameter-parity")
+BRANCH = os.environ.get("CB_BRANCH", "main")
 REPO = "/tmp/repo"
 WORK = "/kaggle/working"
 
@@ -73,6 +73,13 @@ def main():
     sh([sys.executable, bench, "--dry-run"], env=env, timeout=600)
 
     rc, _ = sh([sys.executable, bench], env=env, timeout=int(11 * 3600))
+
+    # SPD-03: the targeted 1M-cell per-stage diagnostic (cold-cache + repeat-process),
+    # AFTER the grid so the wheel bench.py built is installed. Best-effort — a diag
+    # failure must not lose the grid results.
+    diag = os.path.join(REPO, "bench", "full_param_gpu_speed", "diag.py")
+    if os.path.exists(diag):
+        sh([sys.executable, diag], env=env, timeout=7200)
 
     # Stamp provenance into whatever result.json the harness wrote.
     path = os.path.join(WORK, "result.json")

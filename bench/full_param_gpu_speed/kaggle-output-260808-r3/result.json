@@ -1,0 +1,2855 @@
+{
+  "provenance": {
+    "gpu": "Tesla P100-PCIE-16GB, 16384 MiB",
+    "catboost_version": "1.2.10",
+    "branch": "worktree-gpu-host-prep-speed",
+    "repo_url": "https://github.com/BectorVoom/catboost_rs.git",
+    "commit": "abc43fa083a57fc6dbaa7df7fc72b58703ed577f",
+    "driver_elapsed_s": 969.0
+  },
+  "grid": [
+    {
+      "name": "SymmetricTree|RMSE|unw|noctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.2348,
+          "min": 1.2328,
+          "max": 1.454,
+          "all": [
+            1.2348,
+            1.454,
+            1.2328
+          ]
+        },
+        "catboost_rs": {
+          "median": 0.9603,
+          "min": 0.9579,
+          "max": 0.9839,
+          "all": [
+            0.9579,
+            0.9603,
+            0.9839
+          ]
+        }
+      },
+      "quality": {},
+      "device_activated": true,
+      "device_prof_tree_lines": 4
+    },
+    {
+      "name": "SymmetricTree|RMSE|unw|ctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "SymmetricTree|RMSE|w|noctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.2323,
+          "min": 1.209,
+          "max": 1.239,
+          "all": [
+            1.209,
+            1.2323,
+            1.239
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|RMSE|w|ctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|Logloss|unw|noctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.4206,
+          "min": 1.3913,
+          "max": 1.4287,
+          "all": [
+            1.3913,
+            1.4206,
+            1.4287
+          ]
+        },
+        "catboost_rs": {
+          "median": 0.9567,
+          "min": 0.939,
+          "max": 0.9625,
+          "all": [
+            0.9567,
+            0.939,
+            0.9625
+          ]
+        }
+      },
+      "quality": {},
+      "device_activated": true,
+      "device_prof_tree_lines": 4
+    },
+    {
+      "name": "SymmetricTree|Logloss|unw|ctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "SymmetricTree|Logloss|w|noctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.4036,
+          "min": 1.356,
+          "max": 1.437,
+          "all": [
+            1.356,
+            1.437,
+            1.4036
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|Logloss|w|ctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|RMSE|unw|noctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.3244,
+          "min": 1.3001,
+          "max": 1.3543,
+          "all": [
+            1.3001,
+            1.3244,
+            1.3543
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "CB_GPU_PROF fit-prep copy+borders elapsed=385.09ms (cpu-time narrow=0.00ms borders=1503.21ms)\nCB_GPU_PROF quantize n=300000 nf=50 n_one_hot=0 elapsed=68.89ms\nCB_GPU_PROF begin-inner validate=85.58ms cindex=413.78ms uploads+rest=170.05ms total=669.42ms\nCB_GPU_PROF begin covered=true n=300000 nf=50 n_bins=33 elapsed=669.48ms\nTraceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\ncatboost_rs.CatBoostError: degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33\n"
+    },
+    {
+      "name": "Depthwise|RMSE|unw|ctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "Depthwise|RMSE|w|noctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.3451,
+          "min": 1.3408,
+          "max": 1.3989,
+          "all": [
+            1.3989,
+            1.3451,
+            1.3408
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|RMSE|w|ctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|Logloss|unw|noctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.634,
+          "min": 1.616,
+          "max": 1.6606,
+          "all": [
+            1.634,
+            1.616,
+            1.6606
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "CB_GPU_PROF fit-prep copy+borders elapsed=367.84ms (cpu-time narrow=0.00ms borders=1452.88ms)\nCB_GPU_PROF quantize n=300000 nf=50 n_one_hot=0 elapsed=79.06ms\nCB_GPU_PROF begin-inner validate=87.56ms cindex=476.91ms uploads+rest=170.31ms total=734.78ms\nCB_GPU_PROF begin covered=true n=300000 nf=50 n_bins=33 elapsed=734.84ms\nTraceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\ncatboost_rs.CatBoostError: degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33\n"
+    },
+    {
+      "name": "Depthwise|Logloss|unw|ctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "Depthwise|Logloss|w|noctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.6112,
+          "min": 1.5953,
+          "max": 1.6255,
+          "all": [
+            1.5953,
+            1.6112,
+            1.6255
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|Logloss|w|ctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 300000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|RMSE|unw|noctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.6775,
+          "min": 1.6213,
+          "max": 1.6993,
+          "all": [
+            1.6775,
+            1.6993,
+            1.6213
+          ]
+        },
+        "catboost_rs": {
+          "median": 2.3991,
+          "min": 2.3632,
+          "max": 2.4808,
+          "all": [
+            2.3632,
+            2.4808,
+            2.3991
+          ]
+        }
+      },
+      "quality": {},
+      "device_activated": true,
+      "device_prof_tree_lines": 4
+    },
+    {
+      "name": "SymmetricTree|RMSE|unw|ctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "SymmetricTree|RMSE|w|noctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.7337,
+          "min": 1.731,
+          "max": 1.7651,
+          "all": [
+            1.7651,
+            1.731,
+            1.7337
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|RMSE|w|ctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|Logloss|unw|noctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.8211,
+          "min": 1.7717,
+          "max": 1.8262,
+          "all": [
+            1.8211,
+            1.8262,
+            1.7717
+          ]
+        },
+        "catboost_rs": {
+          "median": 2.4722,
+          "min": 2.4165,
+          "max": 2.5588,
+          "all": [
+            2.4722,
+            2.5588,
+            2.4165
+          ]
+        }
+      },
+      "quality": {},
+      "device_activated": true,
+      "device_prof_tree_lines": 4
+    },
+    {
+      "name": "SymmetricTree|Logloss|unw|ctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "SymmetricTree|Logloss|w|noctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.8721,
+          "min": 1.8157,
+          "max": 1.914,
+          "all": [
+            1.8721,
+            1.914,
+            1.8157
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SymmetricTree|Logloss|w|ctr|1000k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "SymmetricTree",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|RMSE|unw|noctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.7778,
+          "min": 1.7108,
+          "max": 1.7794,
+          "all": [
+            1.7794,
+            1.7778,
+            1.7108
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "CB_GPU_PROF fit-prep copy+borders elapsed=639.83ms (cpu-time narrow=0.00ms borders=2465.17ms)\nCB_GPU_PROF quantize n=1000000 nf=50 n_one_hot=0 elapsed=274.65ms\nCB_GPU_PROF begin-inner validate=269.51ms cindex=123.80ms uploads+rest=351.69ms total=744.99ms\nCB_GPU_PROF begin covered=true n=1000000 nf=50 n_bins=33 elapsed=745.04ms\nTraceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\ncatboost_rs.CatBoostError: degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33\n"
+    },
+    {
+      "name": "Depthwise|RMSE|unw|ctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "Depthwise|RMSE|w|noctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.845,
+          "min": 1.8155,
+          "max": 1.9005,
+          "all": [
+            1.9005,
+            1.8155,
+            1.845
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|RMSE|w|ctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostRegressor.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|Logloss|unw|noctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 2.0157,
+          "min": 2.0105,
+          "max": 2.0306,
+          "all": [
+            2.0306,
+            2.0105,
+            2.0157
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "CB_GPU_PROF fit-prep copy+borders elapsed=665.62ms (cpu-time narrow=0.00ms borders=2553.33ms)\nCB_GPU_PROF quantize n=1000000 nf=50 n_one_hot=0 elapsed=220.74ms\nCB_GPU_PROF begin-inner validate=220.07ms cindex=108.33ms uploads+rest=203.51ms total=531.90ms\nCB_GPU_PROF begin covered=true n=1000000 nf=50 n_bins=33 elapsed=531.94ms\nTraceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\ncatboost_rs.CatBoostError: degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33\n"
+    },
+    {
+      "name": "Depthwise|Logloss|unw|ctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": false,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostValueError('cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\ncatboost_rs.CatBoostValueError: cat_features declared 3 categorical column(s) but the ingested data carries 0; the NumPy ingestion path cannot carry categorical columns (its dtype is float32) \u2014 pass a Pandas DataFrame, an Arrow/Polars table, or a `Pool` constructed with `cat_features=[...]`\n"
+    },
+    {
+      "name": "Depthwise|Logloss|w|noctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": false,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 2.1635,
+          "min": 2.1519,
+          "max": 2.1855,
+          "all": [
+            2.1635,
+            2.1855,
+            2.1519
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "Depthwise|Logloss|w|ctr|1000k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "Logloss",
+        "weighted": true,
+        "ctr": true,
+        "n_rows": 1000000,
+        "n_features": 50
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "Logloss",
+        "grow_policy": "Depthwise",
+        "one_hot_max_size": 1
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='Logloss' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "na": true,
+          "reason": "CatBoostError(\"'data' is numpy array of floating point numerical type, it means no categorical features, but 'cat_features' parameter specifies nonzero number of categorical features\")"
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "TypeError(\"CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\")"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "Traceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 22, in <module>\n    m.fit(Xf, y, **fit_kw)\nTypeError: CatBoostClassifier.fit() got an unexpected keyword argument 'sample_weight'\n"
+    },
+    {
+      "name": "SHOWCASE-bias|RMSE|unw|noctr|300k",
+      "axes": {
+        "grow_policy": "SymmetricTree",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50,
+        "new_reachability": "boost_from_average"
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": true,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree"
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='SymmetricTree' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=True."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='No'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.1932,
+          "min": 1.1798,
+          "max": 1.2105,
+          "all": [
+            1.1798,
+            1.2105,
+            1.1932
+          ]
+        },
+        "catboost_rs": {
+          "median": 0.8755,
+          "min": 0.8684,
+          "max": 0.878,
+          "all": [
+            0.8755,
+            0.8684,
+            0.878
+          ]
+        }
+      },
+      "quality": {},
+      "device_activated": true,
+      "device_prof_tree_lines": 4
+    },
+    {
+      "name": "SHOWCASE-sampled-nonsym|RMSE|unw|noctr|300k",
+      "axes": {
+        "grow_policy": "Depthwise",
+        "loss": "RMSE",
+        "weighted": false,
+        "ctr": false,
+        "n_rows": 300000,
+        "n_features": 50,
+        "new_reachability": "Depthwise x Bernoulli"
+      },
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "border_count": 32,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "Bernoulli",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "Depthwise",
+        "subsample": 0.66
+      },
+      "audit": {
+        "conditions": {
+          "grow_policy_covered": {
+            "satisfied": true,
+            "rationale": "grow_policy='Depthwise' is in the device-covered set."
+          },
+          "single_dim_target": {
+            "satisfied": true,
+            "rationale": "loss_function='RMSE' is single-dim with a covered der kernel."
+          },
+          "random_strength_zero": {
+            "satisfied": true,
+            "rationale": "random_strength=0 \u2014 the perturbed level search is not device-covered."
+          },
+          "leaf_method_covered": {
+            "satisfied": true,
+            "rationale": "Gradient leaf \u2014 the device grower's calc_average formula."
+          },
+          "bias_reachable": {
+            "satisfied": true,
+            "rationale": "FPP-01/FPP-02: boost_from_average is no longer a hard CPU fallback \u2014 the resident approx is seeded from DeviceTrainConfig.bias. This cell sets boost_from_average=False."
+          },
+          "sampling_x_grow_policy": {
+            "satisfied": true,
+            "rationale": "FPP-12/FPP-13: the three host-sampled types are device-eligible on EVERY covered grow policy, not just SymmetricTree. This cell sets bootstrap_type='Bernoulli'."
+          },
+          "ctr_projection_arity": {
+            "satisfied": true,
+            "rationale": "This cell uses SIMPLE (single-feature) CTR projections only (max_ctr_complexity left at its default of 1 for the CTR cells). COMBINATION projections are device-INELIGIBLE \u2014 FPP-11 is escalated, see ctr_types_are_device_covered \u2014 so a combination cell would silently measure a CPU fit and is deliberately absent from this grid."
+          },
+          "exact_leaf_absent": {
+            "satisfied": true,
+            "rationale": "FPP-05/FPP-06 made the Exact order-statistic leaf device-reachable for {Mae, Quantile}, but the grid's losses are RMSE/Logloss, whose leaf is Gradient \u2014 so the exact-leaf arm is not exercised here."
+          }
+        },
+        "all_satisfied": true,
+        "activation_observable": true,
+        "caveat": "Static audit only. Device activation is verified INDEPENDENTLY by the CB_GPU_PROF residency probe; a cell whose probe shows no device lines is reported as a CPU row regardless of what this audit says."
+      },
+      "timings": {
+        "official": {
+          "median": 1.296,
+          "min": 1.2499,
+          "max": 1.297,
+          "all": [
+            1.2499,
+            1.297,
+            1.296
+          ]
+        },
+        "catboost_rs": {
+          "na": true,
+          "reason": "CatBoostError('degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33')"
+        }
+      },
+      "quality": {},
+      "device_activated": false,
+      "device_prof_tree_lines": 0,
+      "probe_tail": "CB_GPU_PROF fit-prep copy+borders elapsed=360.88ms (cpu-time narrow=0.00ms borders=1429.24ms)\nCB_GPU_PROF quantize n=300000 nf=50 n_one_hot=0 elapsed=72.28ms\nCB_GPU_PROF begin-inner validate=63.52ms cindex=36.31ms uploads+rest=67.51ms total=167.34ms\nCB_GPU_PROF begin covered=true n=300000 nf=50 n_bins=33 elapsed=167.42ms\nTraceback (most recent call last):\n  File \"/kaggle/working/_probe.py\", line 24, in <module>\n    m.fit(X, y, **fit_kw)\ncatboost_rs.CatBoostError: degenerate training input: pointwise_hist2 one-byte non-binary fill expects n_bins in {32,64,128,256} (1 << bits for bits in 5..=8), got 33\n"
+    }
+  ],
+  "pruned": [],
+  "errors": {},
+  "budget_s": 32400.0,
+  "build_ok": true,
+  "build_tail": "event-listener v5.4.1\n   Compiling enumset_derive v0.15.0\n   Compiling rand v0.10.1\n   Compiling dirs v6.0.0\n   Compiling ciborium v0.2.2\n   Compiling lexical-parse-integer v1.0.6\n   Compiling lexical-write-integer v1.0.6\n   Compiling derive_more v2.1.1\n   Compiling sanitize-filename v0.6.0\n   Compiling float8 v0.7.0\n   Compiling spin v0.10.0\n   Compiling serde_bytes v0.11.19\n   Compiling socket2 v0.6.4\n   Compiling mio v1.2.1\n   Compiling oneshot v0.2.1\n   Compiling target-lexicon v0.13.5\n   Compiling float4 v0.2.0\n   Compiling embassy-futures v0.1.2\n   Compiling fast-float2 v0.2.3\n   Compiling web-time v1.1.0\n   Compiling strength_reduce v0.2.4\n   Compiling log v0.4.32\n   Compiling boxcar v0.2.14\n   Compiling polars-dtype v0.54.4\n   Compiling tokio v1.52.3\n   Compiling lexical-write-float v1.0.6\n   Compiling lexical-parse-float v1.0.6\n   Compiling enumset v1.1.13\n   Compiling event-listener-strategy v0.5.4\n   Compiling cubecl-macros-internal v0.10.0\n   Compiling cubecl-runtime v0.10.0\n   Compiling variadics_please v1.1.0\n   Compiling crossbeam-channel v0.5.15\n   Compiling polars-core v0.54.4\n   Compiling paste v1.0.15\n   Compiling unicode-width v0.2.2\n   Compiling cudarc v0.19.7\n   Compiling atomic-waker v1.1.2\n   Compiling semver v1.0.28\n   Compiling float-ord v0.3.2\n   Compiling cubecl-macros v0.10.0\n   Compiling rustc_version v0.4.1\n   Compiling cubecl-ir v0.10.0\n   Compiling polars-async v0.54.4\n   Compiling comfy-table v7.2.2\n   Compiling async-channel v2.5.0\n   Compiling lexical-core v1.0.6\n   Compiling polars-row v0.54.4\n   Compiling arrow-ord v59.0.0\n   Compiling cubecl-zspace v0.10.0\n   Compiling atoi v2.0.0\n   Compiling polars-ops v0.54.4\n   Compiling inflections v1.1.1\n   Compiling base64 v0.22.1\n   Compiling md5 v0.8.0\n   Compiling rustc-hash v2.1.2\n   Compiling arrow-cast v59.0.0\n   Compiling pyo3-build-config v0.29.0\n   Compiling flatbuffers v25.12.19\n   Compiling foldhash v0.1.5\n   Compiling hashbrown v0.15.5\n   Compiling cubecl-core v0.10.0\n   Compiling libloading v0.9.0\n   Compiling num-rational v0.4.2\n   Compiling num-iter v0.1.45\n   Compiling now v0.1.3\n   Compiling csv-core v0.1.13\n   Compiling fixedbitset v0.5.7\n   Compiling petgraph v0.8.3\n   Compiling csv v1.4.0\n   Compiling polars-time v0.54.4\n   Compiling num v0.4.3\n   Compiling type-map v0.5.1\n   Compiling polars v0.54.4\n   Compiling stable-vec v0.4.2\n   Compiling percent-encoding v2.3.2\n   Compiling home v0.5.12\n   Compiling glob v0.3.3\n   Compiling polars-io v0.54.4\n   Compiling cubecl-opt v0.10.0\n   Compiling arrow-ipc v59.0.0\n   Compiling cubecl-cuda v0.10.0\n   Compiling arrow-csv v59.0.0\n   Compiling pyo3-ffi v0.29.0\n   Compiling arrow-json v59.0.0\n   Compiling arrow-string v59.0.0\n   Compiling arrow-row v59.0.0\n   Compiling arrow-arith v59.0.0\n   Compiling itertools v0.14.0\n   Compiling arrow v59.0.0\n   Compiling cubecl-cpp v0.10.0\n   Compiling cb-core v0.1.0 (/tmp/repo/crates/cb-core)\n   Compiling cubecl v0.10.0\n   Compiling anyhow v1.0.102\n   Compiling cb-data v0.1.0 (/tmp/repo/crates/cb-data)\n   Compiling cubecl-std v0.10.0\n   Compiling pyo3 v0.29.0\n   Compiling matrixmultiply v0.3.10\n   Compiling cb-compute v0.1.0 (/tmp/repo/crates/cb-compute)\n   Compiling pyo3-macros-backend v0.29.0\n   Compiling rawpointer v0.2.1\n   Compiling pyo3-macros v0.29.0\n   Compiling prost-derive v0.14.4\n   Compiling cb-backend v0.1.0 (/tmp/repo/crates/cb-backend)\n   Compiling numpy v0.29.0\n   Compiling thiserror v1.0.69\n   Compiling prost v0.14.4\n   Compiling ndarray v0.17.2\n   Compiling cb-train v0.1.0 (/tmp/repo/crates/cb-train)\n   Compiling thiserror-impl v1.0.69\n   Compiling cb-model v0.1.0 (/tmp/repo/crates/cb-model)\n   Compiling catboost-rs v0.1.0 (/tmp/repo/crates/catboost-rs)\n   Compiling pyo3-arrow v0.19.0\n   Compiling catboost-rs-py v0.1.0 (/tmp/repo/crates/catboost-rs-py)\n    Finished `release` profile [optimized] target(s) in 10m 28s\n\ud83d\udce6 Built wheel for abi3 Python \u2265 3.12 to /tmp/repo/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl\n"
+}

@@ -21,6 +21,10 @@ use crate::pool::{Pair, Pool};
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OwnedColumns {
     float_features: Vec<Vec<f64>>,
+    /// Optional f32 narrowing cache of `float_features` (see
+    /// [`Pool::float_features_f32`]) — attached only by sources whose input was
+    /// already f32, where the narrowing is bit-exactly invertible.
+    float_features_f32: Vec<Vec<f32>>,
     cat_features: Vec<Vec<String>>,
     text_features: Vec<Vec<String>>,
     embedding_features: Vec<Vec<Vec<f32>>>,
@@ -43,6 +47,17 @@ impl OwnedColumns {
             label,
             ..Self::default()
         }
+    }
+
+    /// Attach the f32 narrowing cache of the float columns (SPD-03 wave 3).
+    /// ONLY legitimate when the source data was f32 to begin with (NumPy f32 /
+    /// pandas-to-f32 ingestion), so `col_f64[i] as f32 == cache[i]` bit-exactly —
+    /// the cache lets fit-prep skip a full re-narrowing pass. Shape is validated
+    /// in `into_pool`; a mismatching cache is a typed error.
+    #[must_use]
+    pub fn with_float_f32_cache(mut self, cache: Vec<Vec<f32>>) -> Self {
+        self.float_features_f32 = cache;
+        self
     }
 
     /// Attach categorical feature columns (SoA, raw owned strings).
@@ -178,6 +193,16 @@ impl IngestSource for OwnedColumns {
         for (index, col) in self.float_features.iter().enumerate() {
             check_len(&format!("float_feature[{index}]"), n_rows, col.len())?;
         }
+        if !self.float_features_f32.is_empty() {
+            check_len(
+                "float_features_f32 (column count)",
+                self.float_features.len(),
+                self.float_features_f32.len(),
+            )?;
+            for (index, col) in self.float_features_f32.iter().enumerate() {
+                check_len(&format!("float_feature_f32[{index}]"), n_rows, col.len())?;
+            }
+        }
         for (index, col) in self.cat_features.iter().enumerate() {
             check_len(&format!("cat_feature[{index}]"), n_rows, col.len())?;
         }
@@ -212,7 +237,7 @@ impl IngestSource for OwnedColumns {
             check_pair_id("loser_id", index, pair.loser_id, n_rows)?;
         }
 
-        Ok(Pool::from_validated_columns(
+        let mut pool = Pool::from_validated_columns(
             n_rows,
             self.float_features,
             self.cat_features,
@@ -224,6 +249,8 @@ impl IngestSource for OwnedColumns {
             self.subgroup_id,
             self.pairs,
             self.baseline,
-        ))
+        );
+        pool.set_float_f32_cache(self.float_features_f32);
+        Ok(pool)
     }
 }
