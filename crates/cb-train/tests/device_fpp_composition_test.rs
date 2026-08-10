@@ -245,6 +245,22 @@ mod device {
     /// FPP-17.4: one-hot × CTR still declines (SPEC-OH-26, entirely untouched by this
     /// phase).
     ///
+    /// **RETAINED BY DESIGN (DCTR-03) — not a P2/P3 boundary.** Every other negative in
+    /// this phase's suite marks a coverage boundary a later phase will invert; this one
+    /// does not. `SPEC.md` DCTR-03 keeps the `one_hot_bins.is_empty()` device conjunct
+    /// (`crates/cb-train/src/boosting.rs`, the CTR arm of `device_host_eligible`)
+    /// **indefinitely**, as defence in depth behind SPEC-OH-26, so that the day the CPU
+    /// gains a three-way candidate union one-hot × CTR cannot silently reach the device
+    /// untested. Do not read this test as a scheduled inversion and flip it.
+    ///
+    /// **It asserts the OBSERVABLE, not a layer.** Two independent layers reject the
+    /// mixed pool — SPEC-OH-26's typed `CbError::Unsupported` in `train_inner` (which
+    /// fires today, hence `expect_err`) and the device conjunct above (which fires if
+    /// SPEC-OH-26 is ever relaxed) — and `grown == 0` is asserted alongside, so the test
+    /// survives either layer moving. T21 measured both: with SPEC-OH-26 alone disabled
+    /// the pool trains at `grown == 0`; with both disabled it commits at `grown == 5`
+    /// (`.planning/plans/device-ctr-full-coverage/notes/T21.md` §3).
+    ///
     /// This needs a GENUINELY MIXED pool — some cat columns routed one-hot AND some routed
     /// to CTR. `ctr_device_mixed/` has a single cat column, so any `one_hot_max_size` there
     /// produces an all-one-hot or an all-CTR pool and the case is vacuous (an all-one-hot
@@ -311,6 +327,14 @@ mod device {
 
     /// FPP-17.5: multi-permutation × CTR still declines — the
     /// `learning_folds_for_cycle == 1` guard is untouched by FPP-09.
+    ///
+    /// **P3 WILL INVERT THIS (C-2), and only for the anchored `pc=4`/`seed=0` family
+    /// (R-17).** Boundary marker, not a requirement: when P3 lands device structure-fold
+    /// cycling the correct assertion becomes `grown == params.iterations` and this test
+    /// must be FLIPPED, not defended. The sibling pin is
+    /// `device_ctr_gate_test::multi_permutation_ctr_declines_to_device`; T21 re-ran and
+    /// mutation-checked that one (`notes/T21.md` §3) rather than duplicating the work
+    /// here.
     pub fn multi_permutation_x_ctr_still_declines() {
         let (columns, cat_columns, target) = load_mixed();
         let borders = load_borders("borders.npy");

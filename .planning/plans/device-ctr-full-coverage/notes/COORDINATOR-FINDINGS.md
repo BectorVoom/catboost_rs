@@ -1071,3 +1071,229 @@ pre-existing in `kernels/grow_loop.rs`); `duplicated_attributes` is still at
 `gpu_runtime/mod.rs:4535`/`:4567` (T19 inserts no code above it). Default-cpu `cb-backend --lib`
 re-measured at **`227 passed; 60 failed; 2 ignored`** — identical to T18, a third observation
 confirming T17's **59-60 range**.
+
+## From T22 → **T23** (unblocked), **T24**, and TWO UNOWNED DEFECT CANDIDATES needing triage
+
+T22 created `crates/cb-train/tests/device_ctr_combo_types_diff_test.rs` (DCTR-20): three
+device-vs-CPU **split-sequence** differentials over the frozen `ctr_device_combo` corpus, all
+green, all four assertions live. Production change: **comments only** (the R-20 paragraph in
+`gpu_runtime/mod.rs`, `27 8`, executable surface unchanged). D-04 held exactly
+(`4.483e-11` / `2.776e-17` / `1.388e-17` / `2.776e-17` / combo `2.082e-17`, `grows = 5` on all
+five, against a baseline captured before the first edit); `run_device_tests.sh` **24 PASS /
+0 FAIL**; `cb-backend --lib` rocm `277 passed / 0 failed / 2 ignored` (identical to T18/T19);
+`cb-train --lib` `401 passed`; `cargo test -p cb-train` **111 targets, all ok**. The upstream
+half of the chain is closed in the same place: `ctr_mixed_simple_vs_combo_oracle_test`
+(`2 passed`) and `tensor_ctr_e2e_oracle_test` (`3 passed`).
+
+**1. ⚠ R-20 IS STILL OPEN — now measured by the detector R-20 itself designated, at TWO
+horizons. Do not let it be quietly closed.** MUT-1 (D-2's call site reverted to the unfiltered
+`.max()`) leaves the split-sequence differential **byte-identical** at its shipped
+configuration, AND byte-identical on a deliberately longer-horizon probe (all three arms at
+`iterations = 20`: 40 level decisions per arm, 13 combination splits on the Buckets arm). The
+one arm that fails at that horizon fails **identically with and without the mutation**, so it
+is not attributable to D-2 (it is finding 4 below). ⇒ D-2 still has NO behavioural detector on
+any committed fixture; the evidence remains `gpu_runtime::ctr_eligibility_test`'s unit +
+source pins. **One hypothesis is now REFUTED**: T19 §5 proposed "a fixture whose combination's
+bucket count much exceeds its members'" as the plausible discriminator — on `ctr_device_combo`
+that ratio is already ~3× (simple 3/4 vs combined ≤12) and, because `phantom_max == 0` at
+level 0 where a combination is always ineligible, the filtered and unfiltered `eligible_max`
+genuinely DIFFER at every tree's level 0 (weights `(0.756, 0.707)` vs `(0.894, 0.866)`) — and
+the greedy winner still never flips. The ratio alone is not the missing ingredient. All of
+this is now written into the `mod.rs` R-20 comment in measured form.
+
+**2. ⚠ `T22-OBS-1` — an UNOWNED, PRE-EXISTING device-vs-CPU divergence: ~1e-3 on a CTR fit's
+CTR-FREE trees.** On any tree of a CTR fit whose greedy search chooses **zero** CTR splits,
+the device and CPU leaf VALUES diverge by ~1e-3 while their split sequences stay identical:
+`tree 23 → 1.069e-3`, `tree 27 → 1.280e-3` (Counter combos, 30 iters/depth 2), against ~1e-17
+on every CTR-carrying tree. **It reproduces unchanged with `combinations_ctr = Borders`, i.e.
+on the ALREADY-SHIPPED `ctr_device_combo` configuration** merely run to 30 iterations instead
+of the fixture's 5 (`7.824e-4` / `1.223e-3` / `1.943e-3` / `1.296e-3` at trees 23/25/28/29).
+Every committed device CTR fixture stops at 5 iterations, where every tree still carries a CTR
+split — which is why nothing has caught it. **Correlate (stated as a correlate, not a
+diagnosis)**: `device_has_ctr_split == false` ⇒ `fused_unit_fold == true`
+(`crates/cb-train/src/boosting.rs:5665`), the branch that consumes the device's resident
+`dev_tree.leaf_of` instead of the host CTR-aware `assign_leaf_over_ctr_columns` walk (T10 §1's
+two-path split). The same trees are also the ones where the device leaves `level_kinds` empty
+and the CPU does not. **This is neither T17's fallback nor T18's filter, so it has no owning
+task in P1.** T22 did not patch it (its task text forbids it). It needs triage — plausibly a
+P2/P3 item, but a decision, not silence. Containment: every T22 arm sits strictly below the
+first CTR-free tree and each run PRINTS its CTR-free tree count.
+
+**3. NEW, and it costs nothing to know: `ObliviousTree::level_kinds` is exercised DIFFERENTLY
+by the two growers.** On an all-float tree the device leaves it EMPTY (the documented
+single-kind fallback, SPEC-OH-31) while the CPU emits `[Float(0), Float(1)]`. Both decode to
+the same tree, so T22 canonicalises to the DECODED sequence and additionally asserts the
+precondition the fallback rests on (an empty vector must belong to a genuinely single-kind
+tree — an empty one on an interleaved tree would be a real defect). **No prior test compares
+`level_kinds` across the two growers**; any later task that does must canonicalise the same
+way or it will get a false red.
+
+**4. ⚠ `T22-OBS-2` — MATERIAL CORRECTION to the coordinator's own T22 guidance: a prior ≠ 0.5
+is NECESSARY BUT NOT SUFFICIENT for a Buckets differential.** The consolidated T10 §2 + T16
+entry offers two remedies (prior ≠ 0.5, or a partition-invariant projection). T22 took the
+first, up front and in writing. It is **not enough at a long horizon**: at
+`Buckets, Prior = 0.25`, 20 iters/depth 2, tree 12 level 1 the device picks
+`([0,1], Buckets, b=0, border 11.999999)` and the CPU `([0,1], Buckets, b=1, border 0.999999)`
+— T10 §2's signature, at a prior where the exact algebraic mirror
+(`ctr(b0)+ctr(b1) = 1`) is gone. Reason: a prior ≠ 0.5 removes the mirror IDENTITY but not the
+ordinal anti-monotonicity `bin(b0) + bin(b1) ≈ const`, and with ~12 buckets over 15 CTR bins
+many threshold pairs still induce the SAME partition and therefore an exact score tie.
+⇒ **for any FUTURE long-horizon Buckets differential, only the coordinator's other option — a
+genuinely partition-invariant projection of the split set — is robust.** T22's shipped Buckets
+arm is at 5 iterations, below the tie, per the ladder's "lowest rung that satisfies guard 4"
+discipline; the 20-iteration run existed only as a MUT-1 probe. Verified independent of D-2
+(identical failure with MUT-1 live and reverted).
+
+**5. Guard 4 needed the escalation ladder for Counter, and rung 1 sufficed — at 20, not 10.**
+Combination **Counter** chooses ZERO ≥2-member splits on this corpus at rungs 0-3 (5 and 10
+iters, depth 2 and 3, and priors `0.0/0.25/1.0/2.0`), on BOTH arms — a search outcome, not a
+device defect. Root cause, measured: the combination Counter column carries only the JOINT
+FREQUENCY of the two cat columns, `corr(joint freq, y) = 0.163` on this fixture, against
+`simple_ctr = Borders` columns that encode the target statistic directly and a
+`(1 + count/maxCount)^-0.5` weight that penalises the combination's larger bucket count. A
+`simple_ctr = Counter` diagnostic (30 iters/depth 3) still yields 0 combinations, so "Borders
+dominates" is not the whole story. **`iterations = 20, depth = 2` → 24 CTR splits, 4 of them
+≥2-member**, and that shipped. Guard 4 was never weakened. **General carry**: a CTR type that
+carries no target signal (Counter, FeatureFreq) will not produce combination splits on a
+small, near-uniform categorical corpus at short horizons — do not design a
+combination-Counter test around a 5-iteration fixture.
+
+**6. T17's `bucket_counts` combination fallback is PROVED CORRECT, by forcing it onto the
+production path.** MUT-2 (restore the pre-T17 `member_bins.first()`-only fallback) is GREEN,
+because the branch is production-unreachable (`col.bucket_count > 0` always). Rather than stop
+there (T14 §5 / T18 §3: a green mutation can mean a vacuous test), T22 drove both complements
+with `if false && col.bucket_count > 0`: **MUT-2b** (pre-T17 fallback forced onto the path)
+turns **all three arms RED** with the exact failure shape T17's comment predicts — the
+under-counted combination inflates every column's `cat_feature_weight` so CTR candidates start
+beating floats (`device: 10 CTR splits (5 ≥2-member)` vs `cpu: 8 (3)`, first divergence a
+FLOAT split at tree 0). **MUT-2c** (same forcing, T17's fold-all-members arm restored) is
+**GREEN and byte-identical to the unmutated run on all three arms**. ⇒ T17's
+`combine_projection_bins` fallback reproduces the production `bucket_count` exactly. No
+previously-shipped test makes that statement.
+
+**7. T23 is UNBLOCKED** (SPEC scenario 10 satisfied). T22 touches no gate expression and moves
+no gate-state row: `device_ctr_combo_config_tests` `8 passed` with every row unmoved and
+`boosting_ctr_gate_tests` `13 passed`, both unchanged from T19. T23 inherits exactly what T19
+left — a single `matches!` over `from_i8`, and **eleven** source-scan pins to retire or update.
+
+**8. T24: ONE new binary to register, and `CountingGpu` is now duplicated EIGHT times.**
+`run_device_tests.sh` was **NOT** touched (C-8). T24's registration list is now FIVE binaries:
+`device_ctr_buckets_fit_test` (T10), `device_ctr_counter_fit_test` (T12),
+`device_ctr_type_gate_test` (T13), `device_ctr_btmv_fit_test` (T16) and
+**`device_ctr_combo_types_diff_test`** (T22). The eighth `CountingGpu` copy lives in T22's file;
+T22 also adds a `CountingCpu` sibling (same body, `inner: CpuRefRuntime`) so the CPU reference
+arm's `grown == 0` / `accepted_begins == 0` is an observation rather than a type-level
+assumption — a shape later device-vs-CPU differentials should copy.
+
+**9. Pre-existing list: nothing new; ONE line-number correction.**
+`clippy::duplicated_attributes` is at **`gpu_runtime/mod.rs:4542`/`:4574`** at committed
+`HEAD 657b7dd` (T18/T19 recorded `:4535`/`:4567` against their uncommitted trees) — same
+single diagnostic. `erasing_op` at `kernels/score_split.rs:374` is still the only `error` on
+the rocm clippy lane, warning count still **18**; the 12 `cb-train` clippy test targets (T04)
+and the default-cpu `cb-backend --lib` **59-60 range** (T17 §7) are untouched — T22's
+`cb-backend` diff is comments only.
+
+## From T21 → **T23** (no impact, but read §4), **T24** (DoD scenario 9 + a phase-level fact)
+
+T21 discharged DCTR-03 without authoring a third one-hot × CTR test (C-18 honoured) and added
+the two remaining acceptance-9 boundary pins plus a control to
+`crates/cb-train/tests/device_ctr_type_gate_test.rs` (`7 passed`: T13's 4 + T21's 3).
+Production change: **comment only** (`boosting.rs`, `48 7`, every changed line `//`-prefixed —
+verified by diff filter); **zero `cb-backend` diff**. D-04 held exactly (`4.483e-11` /
+`2.776e-17` / `1.388e-17` / `2.776e-17` / combo `2.082e-17`, `grows = 5` on all five, against a
+baseline captured before the first edit); `run_device_tests.sh` **24 PASS / 0 FAIL** (Poisson
+10.9×, no R-13 flake); `cb-backend --lib` rocm `277 passed / 0 failed / 2 ignored` (identical to
+T18/T19/T22); `cb-train --lib` `401 passed`; `cargo test -p cb-train` **111 targets, all ok**
+(identical to T22 — T21 adds no binary).
+
+**1. WHICH CLAUSES ACTUALLY SURVIVE (T21 verified against the current source, not the plan's
+snapshot).** `ctr_types_are_device_covered` is now a single `matches!` over `from_i8` — no
+type-as-Borders, arity, target-border or prior conjunct — so **no P1 boundary lives inside it**.
+The surviving CTR-side exclusions and their pins: `learning_folds_for_cycle == 1`
+(`device_ctr_gate_test::multi_permutation_ctr_declines_to_device`, **P3**);
+`one_hot_bins.is_empty()` (`device_fpp_composition_test::one_hot_x_ctr_still_declines`,
+**retained by design, never inverts**); the type list (`boosting_ctr_gate_test.rs`,
+`session_ctr_type_test`); `eval_sets.is_empty()` (T13's 2×2, **P3**);
+`has_any_scorable_feature` (**NEW** `cat_only_ctr_pool_declines_to_device`, **P2/C-5**); and
+`ctr_covered`'s `col.borders.len() + 1 == n_bins` (**NEW**
+`non_15_border_count_ctr_pool_declines_to_device`, **P2/C-1**). ⇒ **acceptance scenario 9 is
+complete: all five negatives have a passing, annotated test.**
+
+**2. ⚠ MATERIAL, PHASE-LEVEL — "run the mutation for the clause you CLAIM" (T13 §1) is
+sometimes IMPOSSIBLE, and T21 measured three cases of it.** Two of the five negatives are
+**overdetermined by mutually-redundant guards**, so a single-clause mutation leaves the test
+green and that is a property of the CODE, not blindness (T18 §3's mode, not T17 MUT-1c's):
+  * **multi-permutation** — `learning_folds_for_cycle` is also passed to
+    `begin_device_training` as `fold_count`, and every backend coverage mapper declines
+    `fold_count != 1` (`session.rs:524/627/679/731/786`). Removing the host conjunct alone:
+    GREEN. Removing the backend's view alone: GREEN. Removing **both**: RED at
+    `left: 5, right: 0`. Both complements were driven before concluding.
+  * **cat-only** — FOUR guards, all keyed on the single fact that a CTR pool with no float and
+    no one-hot column has an EMPTY device feature axis: `has_any_scorable_feature`,
+    `device_active`'s `device_n_bins > 0`, the session `begin` preamble
+    (`n == 0 || n_features == 0 || n_bins == 0`) and `ctr_covered`'s shape check (`16 != 0`).
+    Cumulative mutation of the first three: all GREEN. Driving all four was DECLINED
+    deliberately — it yields `n_features == 0, n_bins == 0`, and a red from an empty problem
+    says nothing about the boundary.
+  ⇒ **the honest substitute, which T21 shipped: a CONTROL ARM through the same helper**
+  (`unmodified_float_half_commits_to_device`, `grown = 5/5`), so each pin is a one-factor
+  experiment whose assertion is provably sensitive to the attribute it varies. **Any later task
+  writing a decline test should check for overdetermination FIRST and budget for a control
+  arm** — and should not read a green mutation as "the code is right".
+
+**3. DCTR-03's retention is now MEASURED, not argued.** Splitting the mandated joint mutation
+into two rungs: with the **SPEC-OH-26 rejection alone** disabled the mixed pool TRAINS and
+`grown = 0` in **0.05 s** (the retained `one_hot_bins.is_empty()` conjunct is what holds it
+off the device); with **both** disabled it **COMMITS at `grown = 5`** in 52.81 s. The conjunct
+the research called provably dead is one deletion away from being the only thing standing
+between a mixed pool and an untested device path. Both numbers are written into the
+`boosting.rs` comment above the conjunct. **Do not delete it.**
+
+**4. `non_15_border_count` degrades SILENTLY, which is worth knowing.** Under MUT-3 (the
+`borders.len() + 1 == n_bins` conjunct neutralised in both `ctr_covered` closures) the fit
+commits (`grown = 5/5`) and produces **zero CTR splits** — the CTR columns' 16 bins forced into
+an 8-bin histogram line simply never win a candidate. No error, no warning; only the
+`≥1 CTR split` vacuity guard sees it. That guard is therefore load-bearing in this file, not
+decoration.
+
+**5. Process — report BEFORE asserting, generalised from T20 §2.** MUT-3's first run failed on
+the vacuity guard and hid `grown = 5`, the number the completion criterion asks for. T21's
+helper now PRINTS `grown` / `ctr_splits` / tree count before every guard, with an in-source
+comment saying not to "fix" the ordering. Any decline test with non-vacuity guards ahead of its
+route assertion has the same problem.
+
+**6. T23 is unaffected; T24's registration list is unchanged.** T21 changes no gate expression
+and moves no gate-state row (`device_ctr_combo_config_tests` `8 passed`, rows unmoved;
+`boosting_ctr_gate_tests` `13 passed`), so T23 still inherits **eleven** source-scan pins. T21
+adds **no** new binary (its three tests join `device_ctr_type_gate_test`, already on T24's
+list), and `CountingGpu` duplication stays at **EIGHT**. One preservation note for T23: T21's
+new `boosting.rs` comments are `//`-prefixed and sit OUTSIDE `gate_body()`, which is what keeps
+`code_lines_mentioning` from counting them.
+
+**7. Pre-existing list: nothing new, one addition of an already-true fact.**
+`cargo clippy -p cb-train --no-default-features --features rocm --test device_ctr_gate_test`
+emits `clippy::type_complexity` on `device_ctr_gate_test.rs:140` (`load_inputs`) — a WARNING,
+verified pre-existing at `HEAD` (same line, same signature), distinct from T04's 12 error-level
+targets. `erasing_op` (`score_split.rs:374`), `duplicated_attributes`
+(`gpu_runtime/mod.rs:4542`/`:4574`) and the default-cpu `cb-backend --lib` 59–60 range are all
+unmoved — T21's `cb-backend` diff is empty. **`T22-OBS-1` / `T22-OBS-2` were read and
+deliberately NOT chased** (unowned, out of T21's scope); they still need triage.
+
+## Coordinator disposition of T22-OBS-1 → **T24** (USER DECISION, 2026-08-10)
+
+T22 localised **T22-OBS-1**: a **pre-existing, unowned ~1e-3 device-vs-CPU divergence in
+leaf values on a CTR fit's CTR-FREE trees**, reproducing on the shipped
+`combinations_ctr = Borders` config at 30 iterations and correlating with `fused_unit_fold`
+(`boosting.rs:5665`). It is **not caused by this phase**, and no P1 acceptance test is
+affected — P1's fixtures run at 5–20 iterations, where it stays under the ≤1e-5 bar.
+
+**The user was asked and ruled: RECORD ONLY, decide later.** No bug chase, no spec, no
+plan, no fix in this phase.
+
+⇒ **T24 must carry OBS-1 into the phase completion summary** as an explicit open item, with
+its reproduction (config + 30 iterations), the `fused_unit_fold` correlation, and the fact
+that it is pre-existing and was deliberately not patched. Do **not** present the phase as
+having no open findings, and do **not** attempt a fix. Same treatment for **T22-OBS-2**
+(a prior ≠ 0.5 is necessary but NOT sufficient for a Buckets differential — the b=0/b=1 tie
+survives via ordinal anti-monotonicity, so only a partition-invariant projection is robust
+at long horizons).

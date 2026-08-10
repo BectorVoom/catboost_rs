@@ -184,6 +184,20 @@ fn single_permutation_ctr_commits_to_device() {
 /// Acceptance scenario 3: `permutation_count > 1` + CTR still declines to CPU —
 /// the `learning_folds_for_cycle == 1` guard fires (real value 3, not the old
 /// hardcoded 1, GDC-01). This test must FAIL if T01 is reverted.
+///
+/// **P3 WILL INVERT THIS (C-2), and only for the anchored `pc=4`/`seed=0` family
+/// (R-17).** Boundary marker, not a requirement: P3 lands device structure-fold
+/// cycling, after which the correct assertion is `grown == params.iterations` and
+/// this test must be FLIPPED, not defended.
+///
+/// **The decline is OVERDETERMINED, which is why the assertion is the observable.**
+/// `learning_folds_for_cycle` is also handed to `begin_device_training` as
+/// `fold_count`, and every backend coverage mapper declines `fold_count != 1`
+/// independently (`crates/cb-backend/src/gpu_runtime/session.rs`). T21 measured all
+/// three combinations: removing either guard alone leaves this test GREEN (the other
+/// one holds), removing both makes it fail `left: 5, right: 0`. The two are
+/// mutually-redundant guards on the SAME host-computed quantity, so no test can
+/// separate them — see `.planning/plans/device-ctr-full-coverage/notes/T21.md` §3.
 #[test]
 fn multi_permutation_ctr_declines_to_device() {
     #[cfg(any(feature = "rocm", feature = "cuda"))]

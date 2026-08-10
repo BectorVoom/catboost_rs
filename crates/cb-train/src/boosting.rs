@@ -4627,17 +4627,58 @@ fn train_inner<R: Runtime>(
         // the byte-unchanged CPU grower.
         // GDC-11 (T14): the CTR clauses are RELAXED — a single-permutation
         // (`learning_folds_for_cycle == 1`, made real by GDC-01) fit whose
-        // materialized CTR columns are all device-covered (simple Borders
-        // projections, see `ctr_types_are_device_covered`) may now commit to the
-        // device; the session materializes BOTH permutations (GDC-09) and gathers
-        // leaf values over the averaging bins (GDC-10). Anything else — multi-
-        // permutation, combination projections, non-Borders types, one-hot × CTR
-        // — still falls back to the byte-unchanged CPU path (D-04). The Ordered
-        // clause above is deliberately UNTOUCHED (D5).
+        // materialized CTR columns are all device-covered (see
+        // `ctr_types_are_device_covered`) may now commit to the device; the session
+        // materializes BOTH permutations (GDC-09) and gathers leaf values over the
+        // averaging bins (GDC-10). The Ordered clause above is deliberately
+        // UNTOUCHED (D5).
+        //
+        // P1 Device CTR Coverage (DCTR-08/10/14/17, T10-T19) widened what
+        // "device-covered" means — all four CPU-legal CTR types and combination
+        // (tensor) projections now qualify — so the surviving CTR-side exclusions
+        // are exactly the three conjuncts written below: multi-permutation, one-hot
+        // × CTR, and a CTR type outside the admitted list. Everything they reject
+        // falls back to the byte-unchanged CPU path (D-04), and each carries a
+        // negative device test (`SPEC.md` acceptance scenario 9) —
+        // `device_ctr_gate_test`'s `multi_permutation_ctr_declines_to_device`,
+        // `device_fpp_composition_test`'s `one_hot_x_ctr_still_declines`, and
+        // `device_ctr_type_gate_test`'s cat-only / border-count boundary pins.
         && (
             (materialized_ctr_features.is_empty()
                 && structure_fold_columns.iter().all(Vec::is_empty))
             || (learning_folds_for_cycle == 1
+                // DCTR-03 (T21): this conjunct is currently UNREACHABLE-TRUE, and it
+                // is RETAINED ON PURPOSE, as defence in depth. Do not "simplify" it
+                // away.
+                //
+                // Case analysis over `partition_cat_columns`, the ONE producer of
+                // both encodings' column sets:
+                //   * all-one-hot pool ⇒ no CTR-eligible cat column ⇒
+                //     `materialized_ctr_features` is empty ⇒ the FIRST arm of this
+                //     disjunction is taken and this arm is never evaluated;
+                //   * all-CTR pool ⇒ no one-hot column ⇒ `one_hot_bins` is empty and
+                //     this conjunct is `true`;
+                //   * MIXED pool ⇒ `train_inner` has ALREADY returned
+                //     `CbError::Unsupported` at the SPEC-OH-26 gate above (the level
+                //     search has no three-way candidate union), so control never
+                //     reaches here at all.
+                //
+                // The research proposed deleting it as provably dead code. `SPEC.md`
+                // DCTR-03 deliberately KEEPS it: the day the CPU gains that
+                // three-way candidate union, SPEC-OH-26 goes away and one-hot × CTR
+                // would otherwise reach the device with ZERO device testing.
+                // Retention costs one `is_empty()` on an already-materialized vector
+                // and removes a latent hazard.
+                //
+                // MEASURED, not assumed (T21's §2.5 mutations,
+                // `.planning/plans/device-ctr-full-coverage/notes/T21.md`): with the
+                // SPEC-OH-26 rejection alone disabled, the mixed pool trains and
+                // THIS conjunct is what keeps it off the device (`grown == 0`, in
+                // 0.05 s); with both disabled it COMMITS (`grown == 5`). Its pin is
+                // `device_fpp_composition_test`'s `one_hot_x_ctr_still_declines`,
+                // which asserts the OBSERVABLE — refused outright, or at least never
+                // device-grown — rather than either layer by name, because two
+                // independent layers can satisfy it and the earlier one fires today.
                 && one_hot_bins.is_empty()
                 && ctr_types_are_device_covered(&materialized_ctr_features))
         )

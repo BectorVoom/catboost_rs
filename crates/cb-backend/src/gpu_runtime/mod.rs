@@ -5069,18 +5069,37 @@ pub(crate) fn grow_oblivious_tree_resident(
             // `binAndOneHotFeaturesTree` base is unconditional. Do NOT pass
             // `phantom_max` through the filter.
             //
-            // ⚠ R-20 is STILL OPEN — and T19 MEASURED that, it did not assume it.
+            // ⚠ R-20 is STILL OPEN — and this is now MEASURED THREE TIMES, twice by
+            // the detector R-20 itself designated. Nobody assumed it.
+            //
             // Before T19 every column here had one member, so the filter was the
             // identity on every reachable input and no e2e could possibly observe
             // D-2. Since T19 a ≥2-member column DOES reach this loop, so the filter
             // is no longer structurally inert — yet reverting this call site to the
-            // unfiltered `cs.bucket_counts.iter().copied().max()...` leaves
-            // `device_ctr_combo_fit_test` byte-identical: same `2.082e-17`, same
-            // `grown = 5`, same 8 CTR splits of which 3 are combinations. ⇒ D-2 has
-            // no behavioural detector yet on ANY committed fixture. The evidence
-            // remains `gpu_runtime::ctr_eligibility_test`'s unit + source pins; the
-            // designated behavioural detector is still T22's split-sequence
-            // differential (DCTR-20). Do not read T19's green as closing R-20.
+            // unfiltered `cs.bucket_counts.iter().copied().max()...` leaves:
+            //
+            //   * `device_ctr_combo_fit_test` byte-identical (T19): same
+            //     `2.082e-17`, `grown = 5`, 8 CTR splits of which 3 combinations;
+            //   * `device_ctr_combo_types_diff_test` byte-identical (T22, DCTR-20 —
+            //     the designated SPLIT-SEQUENCE differential, at its shipped
+            //     combination × {Buckets@0.25, Counter, BTMV} configuration): all
+            //     three arms still green, same split counts, same `max |Δleaf|`;
+            //   * and byte-identical again on a deliberately LONGER-horizon probe of
+            //     the same differential (all three arms at `iterations = 20`, 40
+            //     level decisions per arm, 13 combination splits on the Buckets arm)
+            //     — the arm that fails there fails IDENTICALLY with and without this
+            //     filter, so the failure is not attributable to D-2 (T22 §, and
+            //     `T22-OBS-2` in `notes/T22.md` explains what it IS).
+            //
+            // ⇒ D-2 still has NO behavioural detector on any committed fixture, and
+            // T22 explicitly does not claim closure. The evidence for D-2 remains
+            // `gpu_runtime::ctr_eligibility_test`'s unit + source pins. A fixture
+            // whose combination's bucket count dominates its members' AND whose
+            // greedy winner sits near a CTR-vs-float tie is the plausible
+            // discriminator; on `ctr_device_combo` the count ratio is already ~3×
+            // (3/4 simple vs ≤12 combined) and the winner still never flips, so the
+            // ratio alone is NOT the missing ingredient. Do not read any green in
+            // this phase as closing R-20.
             let eligible_max = resident_eligible_max_bucket_count(
                 cs.bucket_counts,
                 cs.projection_members,
