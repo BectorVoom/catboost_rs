@@ -1297,3 +1297,138 @@ having no open findings, and do **not** attempt a fix. Same treatment for **T22-
 (a prior ≠ 0.5 is necessary but NOT sufficient for a Buckets differential — the b=0/b=1 tie
 survives via ordinal anti-monotonicity, so only a partition-invariant projection is robust
 at long horizons).
+
+## From T23 → **T24** (the final task) — DCTR-18 is CLOSED
+
+T23 collapsed `ctr_types_are_device_covered` (`boosting.rs:2556-2580`) to the SPEC §4.7
+delegation — `ECtrType::from_i8(col.ctr_type).is_some_and(|t| t.is_cpu_supported())` — and
+retired T00's gate-state table into its final form. Production executable diff is **one
+expression** (9 `matches!` lines → 1); the rest of the `99 ++/--` on that file is doc/comment.
+`cb-backend` diff is **EMPTY**. **D-04 held exactly** against a baseline captured before the
+first edit: `4.483e-11` / `2.776e-17` / `1.388e-17` / `2.776e-17` / combo `2.082e-17`,
+`grows = 5` on all five; `run_device_tests.sh` **24 PASS / 0 FAIL** (Poisson 9.9×, no R-13
+flake); `cb-backend --lib` rocm `277 passed / 0 failed / 2 ignored` (identical to
+T18/T19/T21/T22); `cb-train --lib` **401 passed**; `cargo test -p cb-train` **111 targets, all
+ok**; `device_ctr_combo_types_diff_test` (T22's DCTR-20 detector) re-run green under the final
+gate, all three arms split-sequence IDENTICAL.
+
+**1. ⚠ THE SOURCE-SCAN PIN COUNT WAS THIRTEEN, NOT ELEVEN — this file's running total was
+wrong.** T16's finding said "T01's 2 + T10's 4 + T16's 3 = nine" and T19 corrected it to eleven
+by adding its own two; **T12's two pins (`counter_is_a_cpu_legal_whole_set_tally_not_a_class_prefix`,
+`the_device_gate_admits_counter_in_its_type_list`) were never in that arithmetic.** T19's own
+note records `boosting_ctr_gate_tests` at `13 passed`, so the file was always right and only the
+running total drifted. T23 went through all thirteen: **9 KEPT** (one hardened), **2 RETIRED**,
+**1 REWRITTEN**, **+2 NEW** ⇒ still 13. Full row-by-row disposition is in `notes/T23.md` §2 AND
+in the module doc of `boosting_ctr_gate_test.rs` itself, so a later reader meets it at the code.
+T24's DoD should state the corrected number.
+
+**2. ⚠ MATERIAL, and the fifth instance of this class in the phase — `gate_body()` returns the
+gate's INLINE COMMENTS, so a raw `contains` pin can be satisfied by the gate's own prose.**
+T23's first draft of the DCTR-18 delegation pin asserted `body.contains("is_cpu_supported")`.
+Under MUT-B (the gate re-pointed at a different in-crate predicate, i.e. a COMPLETE un-wiring of
+the delegation) that assertion **PASSED**, because the gate's explanatory comment spells
+`is_cpu_supported`. It was hardened in place — `code_lines_mentioning(&body, …).len() == 1`,
+comment-STRIPPED and exact-count — and then reddened correctly under the same live mutation. The
+identical weakness in T10's kept pin (`body.contains("ECtrType::from_i8")`) was hardened the same
+way. ⇒ **rule for any future gate pin: a POSITIVE claim about the gate body must go through
+`code_lines_mentioning` (comment-stripped); only NEGATIVE claims ("the body must not contain X")
+are correct with the raw `contains`, and those are correct precisely because a surviving comment
+IS a rename hazard.** This is T18 §2's "a unit test proves the helper, never the call site"
+transposed onto source scans: the scan proved the comment, not the code.
+
+**3. The one mutation shape that matters for a DELEGATION, and it is cheap: restore the
+behaviourally-identical hand-rolled list.** MUT-C put T19's exact `matches!` list back. The
+behavioural test (`gate_admits_exactly_the_cpu_supported_ctr_types`, six discriminants + five
+strays + a mixed set + the empty slice), the prior-denominator case, and **all ten gate-state
+table rows** stayed GREEN — as they must, the mutation being a no-op today — and **exactly one**
+test reddened, the structural `the_gate_delegates_to_the_cpu_supported_partition`. ⇒ C-3's "do
+not hand-roll a second type list" is now ENFORCED rather than requested, and the evidence that
+it is enforced cannot come from any behavioural test or routing table. A later phase tempted to
+"inline the list for clarity" trips exactly one named test that says why not.
+
+**4. The gate-state table is RETIRED, not deleted, and it keeps all ten rows.** `GateRow.flips_at`
+is deleted (all ten forward promises discharged) and replaced by `permanent: bool`; a single
+header states that **P1 is complete, every expectation is final, and P2/P3 will ADD rows rather
+than flip these** — with the structural reason, which T24 may reuse: the four exclusions P2/P3
+lift (`learning_folds_for_cycle`, `eval_sets`, `has_any_scorable_feature`, the border-count shape
+check) are **not functions of a column's `(arity, ctr_type, target_border_idx, prior_denom)`
+shape**, so none of them CAN move a row. Rows 1/7/8 are marked permanent and the failure message
+says so per row. The test is **renamed** `gate_admits_exactly_the_current_wave` →
+`gate_admits_exactly_the_final_p1_set` (old name recorded in the module doc; nothing outside that
+file referenced it). Its coverage is intentionally redundant with the new behavioural test on the
+TYPE dimension and irreplaceable on the others — only the table varies arity, selector and
+denominator independently row by row, which is what lets a red be attributed to one conjunct.
+
+**5. T24's registration list and `CountingGpu` count are UNCHANGED.** `run_device_tests.sh` was
+**NOT** touched (C-8 — the coordinator's ruling that T24 owns it was followed; T10's and T13's
+"T23 owns it" claims stay wrong). Five binaries still to register: `device_ctr_buckets_fit_test`
+(T10), `device_ctr_counter_fit_test` (T12), `device_ctr_type_gate_test` (T13),
+`device_ctr_btmv_fit_test` (T16), `device_ctr_combo_types_diff_test` (T22). `CountingGpu`
+duplication stays at **EIGHT** — T23 adds no e2e.
+
+**6. Pre-existing list: nothing new, one addition of an already-true fact and one re-measurement.**
+`erasing_op` (`score_split.rs:374`), `duplicated_attributes` (`gpu_runtime/mod.rs:4542`/`:4574`,
+**unmoved** — T23's `cb-backend` diff is empty), `type_complexity` (`device_ctr_gate_test.rs:140`)
+and T04's 12 `cb-train` clippy test targets are all untouched. Default-cpu `cb-backend --lib`
+re-measured at **`227 passed; 60 failed; 2 ignored`** — a FOURTH observation inside T17 §7's
+59-60 range. **ADDITION (pre-existing, verified byte-identical at `HEAD`, only line-shifted):**
+two `clippy::useless_vec` warnings inside `device_ctr_combo_config_test.rs` (`&vec![0usize; N]`
+in `build()` and in `an_unknown_projection_member_is_a_typed_error`). **ALSO worth one line in
+the DoD: the workspace is NOT rustfmt-clean at `HEAD`** — `cargo fmt -p cb-train -- --check`
+reports 46 hunks in `boosting.rs` and 6 in `device_ctr_combo_config_test.rs` on unmodified code,
+so a task cannot use a clean `fmt --check` as its bar; T23 verified its own files by diffing the
+hunk sets against extracted `HEAD` copies instead. `T22-OBS-1` / `T22-OBS-2` were read and
+deliberately NOT chased (user ruling).
+
+## From T24 → **the coordinator** (phase closed; three findings stay OPEN)
+
+T24 registered the phase's five new device binaries in `run_device_tests.sh` (C-8's sole-owner
+rule honoured — no other task touched the file) and proved PLAN §7. **`bash ./run_device_tests.sh`
+= 28/28 PASS + perf lane, 0 FAIL, exit 0**, the count DERIVED from the array (23 at `a0a67ec` + 5).
+Production diff: **none** — T24's entire change is `run_device_tests.sh`. Full narrative, every
+§7 item, every mutation message and every open finding: **`notes/PHASE-COMPLETE.md`**.
+
+**1. The task text's registration-audit grep is ineffective here.** `grep -l "fn .*test"
+crates/cb-train/tests/device_*.rs` matches **one** of thirty files, because these tests are named
+`fn device_ctr_buckets_fit_commits_and_matches_upstream()` — no literal `test` after `fn `. The
+audit was done over the file set vs. the `TESTS=(…)` array instead. Anyone re-running the audit
+later should use the file set.
+
+**2. THREE device binaries remain unregistered, and all three PREDATE this phase** —
+`device_bootstrap_speed_test` (`f663a45`, 2 tests, **not** `#[ignore]`d),
+`device_oblivious_parity_probe_test` (`9e92a89`, 1 test, not ignored) and `device_perf_probe`
+(`44350a2`, 1 test, `#[ignore]`d). Left alone deliberately: C-8 scopes T24 to the binaries *this
+phase* created and scenario 7's roster is "the 23 green at `a0a67ec` plus every binary this phase
+adds". **Whether the first two belong in `TESTS` or in `PERF_TESTS` is a real, unowned question**
+for a later phase — a timing test in the main lane would reintroduce exactly R-13's contention
+flake.
+
+**3. R-20, `T22-OBS-1` and `T22-OBS-2` are carried into the phase summary as OPEN**, per the
+coordinator's disposition and the user's RECORD-ONLY ruling on OBS-1. None was patched. OBS-1's
+`fused_unit_fold` correlate has **moved with T23's doc additions**: T22 recorded
+`crates/cb-train/src/boosting.rs:5665`; at the T24 tree it is **`:5747`**.
+
+**4. Measured at the T24 tree (all re-run, not cited):** the e2e quintet is unmoved —
+`device_ctr_fit_test` `4.483e-11`, Buckets `2.776e-17`, Counter `1.388e-17`, BTMV `2.776e-17`,
+combo `2.082e-17`, `grown == iterations` on all five; `cb-backend --lib` rocm
+`277 passed / 0 failed / 2 ignored`; `cb-train --lib` `401 passed`; `boosting_ctr_gate_tests`
+`13 passed`; `device_ctr_combo_config_tests` `8 passed`; all 11 CPU CTR oracles and the 3 fixture
+smoke tests green; `ctr_btmv_simple_oracle_test` byte-identical to T03's baseline;
+`git diff --name-status a0a67ec..HEAD -- crates/cb-oracle/fixtures/` = **28 files, all `A`**, zero
+`M`/`D`. Poisson perf lane **9.6×** (pre-edit run) and **7.0×** (post-edit run) against a 5× bar —
+reported, not chased (R-13).
+
+**5. Pre-existing-failure list: nothing new, one re-measurement and one line-number move.**
+`cargo test --workspace` still fails exactly one target — `cb-backend --lib` under **default cpu**,
+**`228 passed; 59 failed; 2 ignored`** in 358.81 s, all 59 in `kernels::*`, zero in
+`gpu_runtime::*` — a **fifth** observation inside T17's 59-60 range, and this run is at the 59 end
+because the named flake `kernels::exact_quantile_test::exact_quantile_weighted_matches_cpu`
+**passed**. Everything else in the workspace is green and that was measured:
+`cargo test --workspace --exclude cb-backend --no-fail-fast` ⇒ **196 targets, 0 FAILED, 1665
+passed, exit 0**. `erasing_op` (`kernels/score_split.rs:374`), `duplicated_attributes`
+(`gpu_runtime/mod.rs:4542`/`:4574`, **verified still at those exact lines**), `type_complexity`
+(`device_ctr_gate_test.rs:140`), the 12 `cb-train` clippy test targets and the not-rustfmt-clean
+workspace are all unmoved.
+
+**6. `CountingGpu` duplication, final count: EIGHT in the CTR family** (as T22 predicted) and
+**NINETEEN across all `cb-train` device tests** (`grep -rn "struct CountingGpu"`). T24 adds none.

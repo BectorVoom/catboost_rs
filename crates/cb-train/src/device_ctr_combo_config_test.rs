@@ -49,15 +49,24 @@
 //!     corroborates that the device path ran — though `grown` is what proves it (on two other
 //!     fixtures in this phase the two paths print the SAME delta).
 //! (d) Those two functions are replaced by the single table-driven
-//!     `gate_admits_exactly_the_current_wave` **because per-conjunct negative tests go
+//!     `gate_admits_exactly_the_final_p1_set` (named
+//!     `gate_admits_exactly_the_current_wave` from T00 until P1 closed) **because
+//!     per-conjunct negative tests go
 //!     vacuous rather than red**: all three sub-assertions of
 //!     `a_non_borders_column_still_declines` used `TProjection::from_features(&[0, 1])`, a
 //!     COMBINATION, so each declined via the arity conjunct as well as via its named one.
 //!     Deleting the `prior_denom` conjunct would have left the `prior_denom = 2.0`
 //!     assertion green — no longer a prior-denominator pin, just a second arity pin. The
-//!     table uses SIMPLE projections for exactly those rows so each one isolates the
-//!     conjunct named in its `flips_at` note, and it asserts the gate's admitted set in
-//!     EVERY intermediate wave rather than only in its closed state.
+//!     table uses SIMPLE projections for exactly those rows so each one isolates a single
+//!     conjunct, and it asserted the gate's admitted set in EVERY intermediate wave rather
+//!     than only in its closed state.
+//! (e) **The conscious act is COMPLETE (T23).** All four conjuncts are gone and the
+//!     predicate now delegates to `crate::ctr::ECtrType::is_cpu_supported`, so the admitted
+//!     set is exactly the CPU-legal type set on projections of any arity. The table below
+//!     is retired into its FINAL form: its `flips_at` forward promises are all discharged
+//!     and deleted, and it now asserts the final admitted set rather than a wave-dependent
+//!     one. Nothing about the guardrail is weakened — the table still runs on every change
+//!     to the predicate, and a mismatch is now unambiguously a regression.
 //!
 //! Every task that mutates the gate expression runs
 //! `cargo test -p cb-train --lib device_ctr_combo_config_tests`.
@@ -159,16 +168,22 @@ fn simple_projection_is_byte_unchanged() {
     );
 }
 
-/// One row of the P1 GATE STATE TABLE: a single-column set, the coverage
-/// `ctr_types_are_device_covered` must report for it **right now**, and the ONE task allowed
-/// to change that expectation.
+/// One row of the FINAL GATE ADMITTED-SET TABLE: a single-column set and the coverage
+/// `ctr_types_are_device_covered` reports for it.
+///
+/// The `flips_at` field this struct carried through P1 — naming the ONE task permitted to
+/// change a row's `expected` — is **gone (DCTR-18, T23)**: every one of those forward
+/// promises has been discharged, and a note promising a flip that already happened is worse
+/// than no note. See the table's doc block for the single header that replaces them.
 struct GateRow {
     /// Human-readable shape, used verbatim in the failure message.
     label: &'static str,
     column: CtrFeatureColumn,
     expected: bool,
-    /// The single task permitted to flip `expected`, and the conjunct whose deletion does it.
-    flips_at: &'static str,
+    /// `true` for the three rows whose expectation is fixed for **every** phase, not just
+    /// for P1: row 1 (the D-04 positive pin) and rows 7/8 (the GPU-only types, which have
+    /// no CPU parity surface at all). A change to one of these is never a wave landing.
+    permanent: bool,
 }
 
 fn with_type(mut col: CtrFeatureColumn, ctr_type: ECtrType) -> CtrFeatureColumn {
@@ -186,23 +201,48 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
     col
 }
 
-/// GATE STATE TABLE (P1 / R-21 / DCTR-18). Each row is
-/// `(arity, ctr_type, target_border_idx, prior_denom) -> expected coverage`. The `flips_at`
-/// note names the ONE task allowed to change that row, and that task MUST change it in the
-/// SAME commit as its conjunct deletion. See this module's "conscious re-opening" doc
-/// section for the justification the superseded `:124-126` contract demanded.
+/// FINAL GATE ADMITTED-SET TABLE (R-21 / DCTR-18). Each row is
+/// `(arity, ctr_type, target_border_idx, prior_denom) -> expected coverage`.
+///
+/// # ⚠ THE HEADER — read this before changing any row (T23)
+///
+/// **P1 IS COMPLETE. Every expectation below is FINAL, not wave-dependent.** Through Waves
+/// 0-7 each row carried a `flips_at` note naming the one task allowed to flip it; all ten
+/// notes are now discharged (T01 row 6, T10 rows 4/9/10, T12 row 3, T16 row 5, T19 row 2 —
+/// the history is in the ASCII table below and in each task's note under
+/// `.planning/plans/device-ctr-full-coverage/notes/`). The `flips_at` field is deleted, and
+/// this paragraph replaces all ten of them:
+///
+/// * **P2 and P3 will ADD rows, not flip these.** The exclusions those phases lift —
+///   `learning_folds_for_cycle == 1`, `eval_sets.is_empty()`, `has_any_scorable_feature`,
+///   `col.borders.len() + 1 == n_bins` — live in `device_host_eligible` and in
+///   `cb-backend`'s `ctr_covered`, **not in this predicate** (their negative tests are named
+///   in `ctr_types_are_device_covered`'s doc block). None of them is a function of a
+///   column's `(arity, ctr_type, target_border_idx, prior_denom)` shape, so none of them can
+///   move a row of this table.
+/// * **Rows 1, 7 and 8 are PERMANENT** — fixed for every phase, and marked
+///   `permanent: true` so a failure says so. Row 1 is the D-04 pin (the shipped simple
+///   Borders arm must never stop being covered). Rows 7 and 8 are the GPU-only types
+///   (`restrictions.h:20-32`): they have no CPU parity surface at all, so no phase of this
+///   project can ever admit them, and a row of this table flipping to `true` would mean the
+///   gate had widened onto a statistic nothing can be measured against.
+/// * ⇒ **a mismatch in this table is now a REGRESSION, never a wave landing.** If a row
+///   moves, the device gate moved by accident — which is exactly what the conscious-act
+///   contract quoted in this module's doc forbids.
+///
+/// The row-by-row history the `flips_at` notes carried, kept as a record:
 ///
 /// ```text
-///   row 1  simple   Borders      0  1.0  => true    flips_at: never (D-04 pin)
-///   row 2  combo    Borders      0  1.0  => true    FLIPPED by T19 (arity)
-///   row 3  simple   Counter      0  1.0  => true    FLIPPED by T12 (type)
-///   row 4  simple   Buckets      1  1.0  => true    FLIPPED by T10 (type + target border)
-///   row 5  simple   BTMV         0  1.0  => true    FLIPPED by T16 (type)
-///   row 6  simple   Borders      0  2.0  => true    FLIPPED by T01 (prior denominator)
-///   row 7  simple   FloatTMV     0  1.0  => false   flips_at: never (no parity surface)
-///   row 8  simple   FeatureFreq  0  1.0  => false   flips_at: never
-///   row 9  simple   Buckets      0  1.0  => true    FLIPPED by T10 (type only)
-///   row 10 simple   Borders      1  1.0  => true    FLIPPED by T10 (target border only)
+///   row 1  simple   Borders      0  1.0  => true    PERMANENT (D-04 pin)
+///   row 2  combo    Borders      0  1.0  => true    admitted by T19 (arity conjunct deleted)
+///   row 3  simple   Counter      0  1.0  => true    admitted by T12 (type)
+///   row 4  simple   Buckets      1  1.0  => true    admitted by T10 (type + target border)
+///   row 5  simple   BTMV         0  1.0  => true    admitted by T16 (type)
+///   row 6  simple   Borders      0  2.0  => true    admitted by T01 (prior denominator)
+///   row 7  simple   FloatTMV     0  1.0  => false   PERMANENT (no CPU parity surface)
+///   row 8  simple   FeatureFreq  0  1.0  => false   PERMANENT (no CPU parity surface)
+///   row 9  simple   Buckets      0  1.0  => true    admitted by T10 (type only)
+///   row 10 simple   Borders      1  1.0  => true    admitted by T10 (target border only)
 /// ```
 ///
 /// Rows 3–6 use a **SIMPLE** projection on purpose. The functions this table replaced used
@@ -210,7 +250,7 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 /// via the ARITY conjunct as well as via its named one — meaning they would have gone
 /// silently VACUOUS (still green, no longer pinning anything) at T01/T10/T12, and only
 /// turned red at T19, all four at once. A simple projection makes each row isolate exactly
-/// the conjunct in its `flips_at` note.
+/// one conjunct, which is why the history column above can name a single task per row.
 ///
 /// **Row 4's honest limitation, and how T10 resolved it.** Row 4 varies two attributes
 /// against row 1 (type AND target border), so on its own it cannot distinguish "T10 removed
@@ -226,8 +266,10 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 ///
 /// Restoring either half of T10's edit alone therefore turns exactly one of rows 9/10 red
 /// (both were measured; the failures are recorded in `notes/T10.md`), which is the evidence
-/// T00's note asked T10 to produce. Row 10's shape is unreachable from a real fit — see its
-/// `flips_at` note and `boosting_ctr_gate_tests`.
+/// T00's note asked T10 to produce. Row 10's shape (`Borders` with a non-zero numerator
+/// selector) is unreachable from a real fit — `target_border_count(Borders, 2) == 1`
+/// (`ctr_helper.h:35-42`), which is precisely why deleting that conjunct was safe; see
+/// `boosting_ctr_gate_tests::buckets_is_the_only_type_with_a_nonzero_target_border`.
 fn gate_state_table() -> Vec<GateRow> {
     let simple = || TProjection::from_features(&[0]);
     let combo = || TProjection::from_features(&[0, 1]);
@@ -237,27 +279,19 @@ fn gate_state_table() -> Vec<GateRow> {
             label: "simple/Borders/b=0/denom=1.0",
             column: covered_column(simple(), 2),
             expected: true,
-            flips_at: "never — D-04 pin, no P1 task may flip this row",
+            permanent: true,
         },
         GateRow {
             label: "combo[0,1]/Borders/b=0/denom=1.0",
             column: covered_column(combo(), 6),
             expected: true,
-            flips_at: "FLIPPED by T19 — deleted `col.projection.is_simple()` (DCTR-17), the \
-                       LAST conjunct besides the type list. This row varies exactly ONE \
-                       attribute against row 1 (the arity), so restoring the conjunct turns \
-                       THIS row, and only this row, red. Its device evidence is \
-                       `device_ctr_combo_fit_test`, un-ignored in the same change and \
-                       asserting `CountingGpu.grown == iterations`",
+            permanent: false,
         },
         GateRow {
             label: "simple/Counter/b=0/denom=1.0",
             column: with_type(covered_column(simple(), 2), ECtrType::Counter),
             expected: true,
-            flips_at: "FLIPPED by T12 — admitted Counter in the `ctr_type` conjunct \
-                       (DCTR-10). This row varies exactly ONE attribute against row 1, so \
-                       restoring the pre-T12 two-type list turns THIS row, and only this \
-                       row, red",
+            permanent: false,
         },
         GateRow {
             label: "simple/Buckets/b=1/denom=1.0",
@@ -266,10 +300,7 @@ fn gate_state_table() -> Vec<GateRow> {
                 1,
             ),
             expected: true,
-            flips_at: "FLIPPED by T10 — admitted Buckets in the `ctr_type` conjunct AND \
-                       deleted `col.target_border_idx == 0` (DCTR-08). Rows 9 and 10 below \
-                       separate the two: row 9 (Buckets/b=0) isolates the type change and \
-                       row 10 (Borders/b=1) isolates the target-border deletion",
+            permanent: false,
         },
         GateRow {
             label: "simple/BTMV/b=0/denom=1.0",
@@ -278,32 +309,25 @@ fn gate_state_table() -> Vec<GateRow> {
                 ECtrType::BinarizedTargetMeanValue,
             ),
             expected: true,
-            flips_at: "FLIPPED by T16 — admitted BinarizedTargetMeanValue in the `ctr_type` \
-                       conjunct (DCTR-14), completing the CPU-legal set. Like row 3 this row \
-                       varies exactly ONE attribute against row 1, so restoring the pre-T16 \
-                       three-type list turns THIS row, and only this row, red",
+            permanent: false,
         },
         GateRow {
             label: "simple/Borders/b=0/denom=2.0",
             column: with_prior_denom(covered_column(simple(), 2), 2.0),
             expected: true,
-            flips_at: "flipped by T01 — deleted `col.prior_denom == 1.0` (DCTR-02). The \
-                       deletion is a proven no-op: the only production materialization site \
-                       (`boosting.rs:2237`) passes `CTR_PRIOR_DENOM = 1.0`, pinned by \
-                       `boosting_ctr_gate_tests::ctr_prior_denom_is_structurally_unit`, so \
-                       this row is unreachable from any real fit",
+            permanent: false,
         },
         GateRow {
             label: "simple/FloatTMV/b=0/denom=1.0",
             column: with_type(covered_column(simple(), 2), ECtrType::FloatTargetMeanValue),
             expected: false,
-            flips_at: "never — GPU-only upstream (`restrictions.h:20-32`), no parity surface",
+            permanent: true,
         },
         GateRow {
             label: "simple/FeatureFreq/b=0/denom=1.0",
             column: with_type(covered_column(simple(), 2), ECtrType::FeatureFreq),
             expected: false,
-            flips_at: "never — GPU-only upstream (`restrictions.h:20-32`), no parity surface",
+            permanent: true,
         },
         // Rows 9 and 10 are APPENDED (never inserted): rows 1-8 keep the numbers every
         // later task is specified against. They are the two rows the doc block above
@@ -313,50 +337,56 @@ fn gate_state_table() -> Vec<GateRow> {
             label: "simple/Buckets/b=0/denom=1.0",
             column: with_type(covered_column(simple(), 2), ECtrType::Buckets),
             expected: true,
-            flips_at: "FLIPPED by T10 — isolates the `ctr_type` half of T10's edit (b = 0, \
-                       so the target-border conjunct could not have admitted this row). \
-                       Restoring `ctr_type == Borders` alone turns THIS row red",
+            permanent: false,
         },
         GateRow {
             label: "simple/Borders/b=1/denom=1.0",
             column: with_target_border(covered_column(simple(), 2), 1),
             expected: true,
-            flips_at: "FLIPPED by T10 — isolates the `target_border_idx == 0` half of T10's \
-                       edit (type is Borders, which the pre-T10 gate already admitted). \
-                       Restoring that conjunct alone turns THIS row red. NOTE: this shape is \
-                       unreachable from a real fit — `target_border_count(Borders, 2) == 1` \
-                       (`ctr_helper.h:35-42`) — which is precisely why deleting the conjunct \
-                       is safe; see `boosting_ctr_gate_tests::\
-                       buckets_is_the_only_type_with_a_nonzero_target_border`",
+            permanent: false,
         },
     ]
 }
 
+/// The FINAL admitted set (DCTR-18, T23). Renamed from T00's
+/// `gate_admits_exactly_the_current_wave`: there is no "current wave" left to track — P1 is
+/// complete and every row's expectation is final. See the table's header for what that means
+/// for P2/P3.
 #[test]
-fn gate_admits_exactly_the_current_wave() {
+fn gate_admits_exactly_the_final_p1_set() {
     // EVERY row is evaluated before reporting, deliberately: a fail-fast loop stops at the
-    // first mismatch, which hides exactly the information a gate task needs. T10's edit
+    // first mismatch, which hides exactly the information a gate change needs. T10's edit
     // removed TWO conjuncts at once, and the only way to see WHICH one a restoration puts
     // back is to observe rows 4, 9 and 10 in the SAME run (see the table doc). Collecting
-    // also keeps the failure message a complete diff of the gate's admitted set.
+    // also keeps the failure message a complete diff of the gate's admitted set — the
+    // property that made this table the detector for every wave, and the reason T23 kept it
+    // rather than folding it into `boosting_ctr_gate_tests`.
     let mut mismatches: Vec<String> = Vec::new();
     for (idx, row) in gate_state_table().into_iter().enumerate() {
         let n = idx + 1;
         let expected = row.expected;
         let actual = ctr_types_are_device_covered(&[row.column]);
         if actual != expected {
+            let permanence = if row.permanent {
+                "   PERMANENT ROW — fixed for EVERY phase, not just P1 (row 1 is the D-04 \
+                 positive pin; rows 7/8 are the GPU-only types, which have no CPU parity \
+                 surface and can never be admitted by anything)"
+            } else {
+                "   this row's expectation was fixed when P1 completed; see the table's \
+                 header for why P2/P3 add rows rather than flipping these"
+            };
             mismatches.push(format!(
-                "row {n} ({}): expected {expected}, got {actual}\n   flips_at: {}",
-                row.label, row.flips_at
+                "row {n} ({}): expected {expected}, got {actual}\n{permanence}",
+                row.label
             ));
         }
     }
     assert!(
         mismatches.is_empty(),
-        "the device CTR gate does not admit the set this wave pins:\n{}\n\
-         If you deleted the conjunct named in a row's `flips_at`, update THAT row in the \
-         SAME commit. If you did not, the device gate just moved by accident — which is \
-         exactly what the conscious-act contract in this module's doc forbids.",
+        "the device CTR gate does not admit the FINAL P1 set:\n{}\n\
+         P1 is complete, so every mismatch here is a REGRESSION, not a wave landing: the \
+         device gate moved by accident — which is exactly what the conscious-act contract in \
+         this module's doc forbids.",
         mismatches.join("\n")
     );
 }

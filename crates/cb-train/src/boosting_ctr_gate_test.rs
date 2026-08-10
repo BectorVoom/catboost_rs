@@ -18,9 +18,9 @@
 //! because the attribute it tested is structurally constant at the single production
 //! materialization site, and that structural constancy is exactly what is pinned here.
 //!
-//! # Extension contract (T10 / T12 / T16 / T19 / T22 reuse this file)
+//! # Extension contract (T10 / T12 / T16 / T19 used this file; **CLOSED at T23**)
 //!
-//! Every later task in the serial gate chain adds ONE section below, in gate-conjunct order,
+//! Every task in the serial gate chain added ONE section below, in gate-conjunct order,
 //! consisting of:
 //!
 //! 1. a `#[test]` named `<attribute>_is_structurally_<invariant>` pinning the production
@@ -32,6 +32,37 @@
 //! Use the [`production_source`] / [`code_lines_mentioning`] / [`gate_body`] helpers rather
 //! than re-deriving a source scan; they already strip comments, so a doc-comment mention of
 //! a symbol never counts as a use.
+//!
+//! # The source-scan pins and what DCTR-18 (T23) did to each of them
+//!
+//! That contract produced a file of pins written against an *accumulating `matches!` list*.
+//! T23 replaced the list with a delegation to
+//! [`crate::ctr::ECtrType::is_cpu_supported`], so every pin had to be re-examined rather
+//! than assumed. The disposition, in file order — recorded here because a pin that
+//! silently stops discriminating is exactly the failure this file exists to prevent:
+//!
+//! | pin | disposition |
+//! |---|---|
+//! | `ctr_prior_denom_is_structurally_unit` (T01) | **KEPT** — scans [`production_source`], not the gate |
+//! | `the_device_gate_no_longer_reads_prior_denom` (T01) | **KEPT** — still the DCTR-02 conjunct pin |
+//! | `borders_and_buckets_are_the_cpu_legal_ordered_class_prefix_types` (T10) | **KEPT** — pure [`crate::ctr::ECtrType`] classification |
+//! | `buckets_is_the_only_type_with_a_nonzero_target_border` (T10) | **KEPT** — classification + a `production_source` scan |
+//! | `the_device_gate_no_longer_pins_the_ctr_type_to_borders` (T10) | **KEPT**, doc updated — both halves still hold and still bite |
+//! | `counter_is_a_cpu_legal_whole_set_tally_not_a_class_prefix` (T12) | **KEPT** — classification + the prior-default trap |
+//! | `the_device_gate_admits_counter_in_its_type_list` (T12) | **RETIRED** — unsatisfiable by the delegated form; replaced by the behavioural case |
+//! | `btmv_is_a_cpu_legal_online_prefix_over_a_float_mean_not_a_class_count` (T16) | **KEPT** |
+//! | `the_device_gate_admits_binarized_target_mean_value_in_its_type_list` (T16) | **RETIRED** — same reason |
+//! | `the_admitted_set_is_exactly_the_cpu_supported_types` (T16) | **REWRITTEN** as [`the_gate_delegates_to_the_cpu_supported_partition`] — same claim, structural evidence |
+//! | `the_device_gate_no_longer_reads_the_buckets_numerator_selector` (T10) | **KEPT** |
+//! | `combination_arity_is_structurally_bounded_and_carried_whole` (T19) | **KEPT** — scans `build_device_ctr_config`'s shape, never the gate |
+//! | `the_device_gate_no_longer_reads_the_projection_arity` (T19) | **KEPT** — still the DCTR-17 conjunct pin |
+//!
+//! ⚠ **The four raw-text pins are a trap for anyone editing the gate's inline comments.**
+//! [`gate_body`] returns the function's source INCLUDING its `//` comments, and four tests
+//! assert on it with `contains`: the body must never spell `prior_denom`,
+//! `target_border_idx`, `ECtrType::Borders.as_i8()` or `is_simple` — not even in prose.
+//! (The `ECtrType::<Variant>` scans run over the comment-STRIPPED body instead, so the
+//! gate's comment may discuss the types by name.)
 
 /// The production module this file characterizes, read at COMPILE time.
 ///
@@ -257,20 +288,32 @@ fn buckets_is_the_only_type_with_a_nonzero_target_border() {
 /// DCTR-08's first observable completion: the gate no longer pins the CTR type to `Borders`
 /// by equality, and reuses the in-crate `from_i8` reconstruction instead of a second
 /// hand-rolled discriminant list (C-3). RED before T10's edit, green after.
+///
+/// **KEPT VERBATIM THROUGH DCTR-18 (T23)**, unlike its two per-type siblings, because both
+/// halves survive the delegation with their meaning intact: the equality is still forbidden
+/// (a regression to `ctr_type == <one type>` is exactly the shape P1 removed) and `from_i8`
+/// is still the reconstruction the final form uses. Only the failure message needed
+/// updating — the `{Borders, Buckets}` admission list it named no longer exists, having
+/// been superseded by the `is_cpu_supported` delegation.
 #[test]
 fn the_device_gate_no_longer_pins_the_ctr_type_to_borders() {
     let body = gate_body();
     assert!(
         !body.contains("ECtrType::Borders.as_i8()"),
         "`ctr_types_are_device_covered` still tests `ctr_type == Borders.as_i8()`; DCTR-08 \
-         replaces that equality with the `{{Borders, Buckets}}` admission list. Body \
-         was:\n{body}"
+         replaced that equality with a type LIST, and DCTR-18 replaced the list in turn with \
+         the `is_cpu_supported` delegation. Body was:\n{body}"
     );
-    assert!(
-        body.contains("ECtrType::from_i8"),
-        "the admission list must go through `crate::ctr::ECtrType::from_i8` — it is in-crate \
-         here, so re-transcribing the discriminants is forbidden (C-3), and `from_i8` is \
-         what makes an UNKNOWN discriminant decline by default. Body was:\n{body}"
+    // Comment-STRIPPED, and hardened to an exact count by T23: the final gate's inline
+    // comment explains the delegation and therefore names its helpers, so a raw
+    // `contains` here would be satisfied by prose alone (T23 MUT-B measured that).
+    assert_eq!(
+        code_lines_mentioning(&body, "ECtrType::from_i8").len(),
+        1,
+        "the admission decision must go through `crate::ctr::ECtrType::from_i8`, in CODE and \
+         exactly once — it is in-crate here, so re-transcribing the discriminants is \
+         forbidden (C-3), and `from_i8` is what makes an UNKNOWN discriminant decline by \
+         default. Body was:\n{body}"
     );
 }
 
@@ -365,27 +408,13 @@ fn counter_is_a_cpu_legal_whole_set_tally_not_a_class_prefix() {
     }
 }
 
-/// DCTR-10's observable completion: the gate expression itself admits `Counter`. RED before
-/// T12's widening, green after.
-///
-/// The scan runs over the COMMENT-STRIPPED body ([`code_lines_mentioning`]), so the prose
-/// inside the gate that explains why Counter is admitted cannot satisfy this on its own — the
-/// enumeration entry must really be there. Exactly ONE code mention is expected: a second
-/// would mean the type is tested in two places, and the admission list would no longer be a
-/// single enumeration.
-#[test]
-fn the_device_gate_admits_counter_in_its_type_list() {
-    let body = gate_body();
-    let mentions = code_lines_mentioning(&body, "ECtrType::Counter");
-    assert_eq!(
-        mentions.len(),
-        1,
-        "`ctr_types_are_device_covered` must name `ECtrType::Counter` exactly once, in its \
-         `from_i8` admission list (DCTR-10): Counter's device statistic is implemented \
-         (`launch_counter_ctr_resident`, DCTR-09) and pinned end to end by \
-         `device_ctr_counter_fit_test`. Found: {mentions:?}. Body was:\n{body}"
-    );
-}
+// RETIRED by DCTR-18 (T23): `the_device_gate_admits_counter_in_its_type_list` asserted that
+// the gate body named `ECtrType::Counter` exactly once. The final gate names NO type at all
+// — it delegates to `is_cpu_supported` — so that assertion is not merely false, it is
+// unsatisfiable by the required form, and "keeping" it would mean forbidding the delegation
+// DCTR-18 mandates. Its coverage is REPLACED, and strengthened, by
+// `gate_admits_exactly_the_cpu_supported_ctr_types`, which CALLS the predicate with
+// `ctr_type = 4` and asserts `true` — the thing the name scan only ever approximated.
 
 // ---------------------------------------------------------------------------------------
 // DCTR-14 (T16) — the CTR TYPE conjunct, widened a final time to admit
@@ -471,40 +500,91 @@ fn btmv_is_a_cpu_legal_online_prefix_over_a_float_mean_not_a_class_count() {
     );
 }
 
-/// DCTR-14's observable completion: the gate expression itself admits
-/// `BinarizedTargetMeanValue`. RED before T16's widening, green after.
-///
-/// The scan runs over the COMMENT-STRIPPED body ([`code_lines_mentioning`]), so the prose
-/// inside the gate that explains why BTMV is admitted cannot satisfy this on its own — the
-/// enumeration entry must really be there. Exactly ONE code mention is expected: a second would
-/// mean the type is tested in two places, and the admission list would no longer be a single
-/// enumeration.
-#[test]
-fn the_device_gate_admits_binarized_target_mean_value_in_its_type_list() {
-    let body = gate_body();
-    let mentions = code_lines_mentioning(&body, "ECtrType::BinarizedTargetMeanValue");
-    assert_eq!(
-        mentions.len(),
-        1,
-        "`ctr_types_are_device_covered` must name `ECtrType::BinarizedTargetMeanValue` exactly \
-         once, in its `from_i8` admission list (DCTR-14): BTMV's device statistic is \
-         implemented (`launch_btmv_ctr_resident`, DCTR-12) and pinned end to end by \
-         `device_ctr_btmv_fit_test`. Found: {mentions:?}. Body was:\n{body}"
-    );
-}
+// RETIRED by DCTR-18 (T23): `the_device_gate_admits_binarized_target_mean_value_in_its_type_list`,
+// the exact sibling of the Counter scan retired above and retired for the same reason. Its
+// coverage is REPLACED by `gate_admits_exactly_the_cpu_supported_ctr_types`' `ctr_type = 2`
+// case.
+//
+// `the_admitted_set_is_exactly_the_cpu_supported_types` is NOT retired — it is REWRITTEN
+// below (`the_gate_delegates_to_the_cpu_supported_partition`), because its *statement* is
+// exactly DCTR-18's and only its *evidence* had to change: it used to prove "admitted ==
+// CPU-supported" by counting each type's name in the gate text, which the delegated form
+// cannot satisfy; it now proves the same thing by pinning the delegation itself.
 
-/// The admitted set is now CLOSED at the four CPU-legal types, and this is the executable
-/// statement of that.
+/// The admitted set is CLOSED at the four CPU-legal types, and stays closed because the gate
+/// does not carry its own list at all.
 ///
-/// P1's type track ends here: `is_cpu_supported()` partitions `ECtrType` into exactly the four
-/// types the device now implements and the two GPU-only ones that can never be measured against
-/// a CPU oracle. A later task that widens the gate past this partition is claiming a parity
-/// surface upstream does not provide, and this test is what stops that from being an accident.
+/// This is the rewritten form of T16's `the_admitted_set_is_exactly_the_cpu_supported_types`
+/// (DCTR-14), whose assertions counted `ECtrType::<Variant>` mentions inside the gate body.
+/// The claim is unchanged — *the device gate admits exactly `is_cpu_supported`* — but under
+/// DCTR-18 it is established structurally rather than by enumeration, which is strictly
+/// stronger in the direction that matters: a hand-rolled `matches!` list naming the same four
+/// types today would satisfy the behavioural test
+/// [`gate_admits_exactly_the_cpu_supported_ctr_types`] perfectly, and then drift the moment
+/// [`crate::ctr::ECtrType::is_cpu_supported`] changed. **This test is the only thing that
+/// forbids that list from coming back** (C-3 — `from_i8` / `is_cpu_supported` are in-crate
+/// here, so re-transcribing them is a duplicate, not a decoupling).
+///
+/// The partition assertions are kept from the retired version: they are what make
+/// "delegates to `is_cpu_supported`" equivalent to "admits exactly `{Borders, Buckets,
+/// BinarizedTargetMeanValue, Counter}`", so a later change to that helper cannot silently
+/// widen the device gate.
+///
+/// PLAN §2.5: green on write ⇒ mutation-proved; the verbatim failures are in `notes/T23.md`.
 #[test]
-fn the_admitted_set_is_exactly_the_cpu_supported_types() {
+fn the_gate_delegates_to_the_cpu_supported_partition() {
     use crate::ctr::ECtrType;
 
     let body = gate_body();
+
+    // (1) The delegation, spelled in the gate body: reconstruct through `from_i8`, decide
+    //     through `is_cpu_supported`. `the_device_gate_no_longer_pins_the_ctr_type_to_borders`
+    //     asserts the `from_i8` half too; it is repeated here so this test stands alone as
+    //     DCTR-18's statement.
+    //
+    //     BOTH scans run over the COMMENT-STRIPPED body, and that is not decoration: the
+    //     gate's own inline comment explains the delegation and therefore SPELLS both
+    //     helpers. A raw `body.contains(..)` here is satisfied by that prose and stays green
+    //     through a complete un-wiring — measured, under T23's MUT-B, which is what
+    //     upgraded these two assertions from `contains` to an exact code-mention count.
+    assert_eq!(
+        code_lines_mentioning(&body, "ECtrType::from_i8").len(),
+        1,
+        "the gate must reconstruct the discriminant through `crate::ctr::ECtrType::from_i8`, \
+         in CODE and exactly once — that is what makes an UNKNOWN discriminant decline BY \
+         DEFAULT rather than by a range test. Body was:\n{body}"
+    );
+    assert_eq!(
+        code_lines_mentioning(&body, "is_cpu_supported").len(),
+        1,
+        "the gate must DELEGATE its admission decision to \
+         `crate::ctr::ECtrType::is_cpu_supported` (DCTR-18), in CODE and exactly once, not \
+         carry its own type list. Body was:\n{body}"
+    );
+
+    // (2) No hand-rolled list may come back. NOT ONE `ECtrType` variant may be named in the
+    //     gate's code — neither an admitted one (that would be the duplicate C-3 forbids) nor
+    //     a GPU-only one (there is no CPU oracle to prove parity against). The scan runs over
+    //     the COMMENT-STRIPPED body, so the prose inside the gate may still discuss types.
+    for variant in [
+        ECtrType::Borders,
+        ECtrType::Buckets,
+        ECtrType::BinarizedTargetMeanValue,
+        ECtrType::FloatTargetMeanValue,
+        ECtrType::Counter,
+        ECtrType::FeatureFreq,
+    ] {
+        assert!(
+            code_lines_mentioning(&body, &format!("ECtrType::{variant:?}")).is_empty(),
+            "the final gate must not name `ECtrType::{variant:?}` in code: an enumeration \
+             here is a SECOND type list that can drift from `is_cpu_supported`, \
+             `validate_ctr_types` and `materialize_ctr_feature` silently (C-3). Body \
+             was:\n{body}"
+        );
+    }
+
+    // (3) …and the partition it delegates to is the one DCTR-18 specifies, so (1)+(2) really
+    //     do mean "admits exactly these four".
     for admitted in [
         ECtrType::Borders,
         ECtrType::Buckets,
@@ -513,24 +593,16 @@ fn the_admitted_set_is_exactly_the_cpu_supported_types() {
     ] {
         assert!(
             admitted.is_cpu_supported(),
-            "{admitted:?} is named in the gate's admission list, so it MUST be CPU-legal"
-        );
-        assert_eq!(
-            code_lines_mentioning(&body, &format!("ECtrType::{admitted:?}")).len(),
-            1,
-            "the gate must name `ECtrType::{admitted:?}` exactly once in its admission list; \
-             body was:\n{body}"
+            "{admitted:?} is admitted by the device gate through `is_cpu_supported`, so it \
+             MUST be CPU-legal (`restrictions.h:18-48`); if this flips, the device gate just \
+             narrowed without anyone deciding to"
         );
     }
     for gpu_only in [ECtrType::FloatTargetMeanValue, ECtrType::FeatureFreq] {
         assert!(
             !gpu_only.is_cpu_supported(),
-            "{gpu_only:?} must stay CPU-illegal (`restrictions.h:20-32`)"
-        );
-        assert!(
-            code_lines_mentioning(&body, &format!("ECtrType::{gpu_only:?}")).is_empty(),
-            "the gate must NEVER name the GPU-only `ECtrType::{gpu_only:?}` — there is no CPU \
-             oracle to prove parity against. Body was:\n{body}"
+            "{gpu_only:?} must stay CPU-illegal (`restrictions.h:20-32`); if this flips, the \
+             device gate WIDENS onto a type with no CPU parity surface, silently"
         );
     }
 }
@@ -690,5 +762,156 @@ fn the_device_gate_no_longer_reads_the_projection_arity() {
          cause was the device's MISSING per-level combination-eligibility gate, DCTR-15, not \
          the arity itself), and `device_ctr_combo_fit_test` now passes UN-IGNORED at \
          `max |Δpred| = 2.082e-17` with `CountingGpu.grown == iterations`. Body was:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// DCTR-18 (T23) — the FINAL gate form: delegation to `from_i8` / `is_cpu_supported`
+// ---------------------------------------------------------------------------------------
+//
+// Two tests replace three retired source-scan pins (see `the_gate_names_no_ctr_type_variant`
+// for the accounting). The first is BEHAVIOURAL — it calls the predicate over every
+// discriminant instead of scanning its text — and is therefore the durable statement of the
+// admitted set; the second pins the DELEGATION itself, which is the only thing a behavioural
+// test cannot see (a hand-rolled `matches!` list that happens to enumerate the same four
+// types satisfies the first test exactly).
+
+/// A CTR column carrying `ctr_type`, deliberately shaped so that **every conjunct P1
+/// removed would reject it**: a two-member COMBINATION projection (the arity conjunct T19
+/// deleted) and `target_border_idx = 1` (the numerator-selector conjunct T10 deleted).
+///
+/// So a `true` from the gate on such a column is only possible when both conjuncts are
+/// really gone — the admitted-type rows below double as arity/selector regression pins.
+/// `prior_denom` is the production `1.0`; the non-unit case is covered separately by
+/// `gate_ignores_a_non_unit_prior_denominator` and by the gate-state table's row 6.
+fn combination_column_with_type(ctr_type: i8) -> crate::ctr::CtrFeatureColumn {
+    const N: usize = 4;
+    crate::ctr::CtrFeatureColumn {
+        projection: crate::TProjection::from_features(&[0, 1]),
+        ctr_type,
+        target_border_idx: 1,
+        prior_num: 0.5,
+        prior_denom: 1.0,
+        bins: vec![0; N],
+        ctr_value: vec![0.0; N],
+        bucket_count: 4,
+    }
+}
+
+/// DCTR-18's observable completion, stated BEHAVIOURALLY: the gate admits exactly the
+/// CPU-supported CTR types, on a projection of any arity and any numerator selector, and
+/// declines everything else — including discriminants that are not `ECtrType` values at all.
+///
+/// This is the durable replacement for the two retired per-type source scans
+/// (`the_device_gate_admits_counter_in_its_type_list`,
+/// `the_device_gate_admits_binarized_target_mean_value_in_its_type_list`), and it is
+/// strictly stronger than they were: they asserted that a type's NAME appeared in the gate's
+/// text, which the delegated form cannot satisfy and which never proved the predicate
+/// actually returned `true` for it.
+///
+/// Every case is evaluated before reporting, mirroring the gate-state table's contract —
+/// a fail-fast loop would hide the rest of the admitted-set diff.
+///
+/// PLAN §2.5: this test is GREEN ON WRITE (the pre-T23 `matches!` list already admits
+/// exactly these four types and `from_i8` already declines unknown discriminants), so its
+/// discriminating power was proved by mutation; the verbatim failures are in `notes/T23.md`.
+#[test]
+fn gate_admits_exactly_the_cpu_supported_ctr_types() {
+    use crate::ctr::ECtrType;
+
+    // A free `fn` rather than a closure: the loop below also pushes to `mismatches`
+    // directly, which a `FnMut` capture would forbid (E0499).
+    fn check(
+        mismatches: &mut Vec<String>,
+        label: String,
+        cols: &[crate::ctr::CtrFeatureColumn],
+        expected: bool,
+    ) {
+        let actual = super::ctr_types_are_device_covered(cols);
+        if actual != expected {
+            mismatches.push(format!("{label}: expected {expected}, got {actual}"));
+        }
+    }
+
+    let mut mismatches: Vec<String> = Vec::new();
+
+    // Every ECtrType discriminant, admitted iff CPU-legal (`restrictions.h:18-48`). The
+    // expectation is DERIVED from `is_cpu_supported`, not restated — a second hand-written
+    // list here would reintroduce exactly the drift C-3 forbids in the production gate.
+    for discriminant in 0_i8..=5 {
+        let Some(ctr_type) = ECtrType::from_i8(discriminant) else {
+            mismatches.push(format!(
+                "discriminant {discriminant} must be a known `ECtrType` — `from_i8` covers 0..=5"
+            ));
+            continue;
+        };
+        check(
+            &mut mismatches,
+            format!("{ctr_type:?} (discriminant {discriminant})"),
+            &[combination_column_with_type(discriminant)],
+            ctr_type.is_cpu_supported(),
+        );
+    }
+
+    // Unknown discriminants decline by DEFAULT, because reconstruction goes through
+    // `from_i8` (which returns `None`) rather than through a range test. `i8::MIN` /
+    // `i8::MAX` are the boundary strays; `6` is the first value past the enum and `-1` the
+    // first below it.
+    for stray in [6_i8, 7, -1, i8::MIN, i8::MAX] {
+        check(
+            &mut mismatches,
+            format!("unknown discriminant {stray}"),
+            &[combination_column_with_type(stray)],
+            false,
+        );
+    }
+
+    // A MIXED set: one admitted column plus one GPU-only column must decline as a whole —
+    // the `.all(..)` fold, which no single-column case can reach.
+    check(
+        &mut mismatches,
+        "mixed {Borders, FeatureFreq}".to_string(),
+        &[
+            combination_column_with_type(ECtrType::Borders.as_i8()),
+            combination_column_with_type(ECtrType::FeatureFreq.as_i8()),
+        ],
+        false,
+    );
+
+    // The EMPTY set declines — the caller's `is_empty()` arm owns that, and `.all(..)` over
+    // an empty slice is vacuously `true`, so without the leading `!cols.is_empty()` a fit
+    // with no CTR columns at all would be reported as CTR-covered.
+    check(
+        &mut mismatches,
+        "the empty column set".to_string(),
+        &[],
+        false,
+    );
+
+    assert!(
+        mismatches.is_empty(),
+        "the FINAL device CTR gate does not admit exactly the CPU-supported type set:\n{}\n\
+         DCTR-18 fixes this set permanently for P1: the four CPU-legal types are admitted on \
+         ANY arity and ANY numerator selector, and the two GPU-only types \
+         (`restrictions.h:20-32`) plus every unknown discriminant decline. Widening it past \
+         `is_cpu_supported` claims a CPU parity surface upstream does not provide.",
+        mismatches.join("\n")
+    );
+}
+
+/// The prior DENOMINATOR is not read by the final gate either — the behavioural counterpart
+/// of `the_device_gate_no_longer_reads_prior_denom`'s source scan.
+///
+/// Kept separate from the loop above so the loop's columns stay at the production
+/// `prior_denom = 1.0` and a failure here names the denominator rather than the type.
+#[test]
+fn gate_ignores_a_non_unit_prior_denominator() {
+    let mut col = combination_column_with_type(crate::ctr::ECtrType::Borders.as_i8());
+    col.prior_denom = 2.0;
+    assert!(
+        super::ctr_types_are_device_covered(&[col]),
+        "the final gate must ignore `prior_denom` entirely (DCTR-02): the conjunct was \
+         deleted as provably dead, since `CTR_PRIOR_DENOM` is the only denominator any real \
+         fit can produce (`ctr_prior_denom_is_structurally_unit`)"
     );
 }

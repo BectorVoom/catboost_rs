@@ -2480,10 +2480,57 @@ fn ctr_splits_for_tree(
 ///   the device binarizes it with the same `binarize_ctr_column_resident` and the same
 ///   per-column table as every other type. No per-type shape handling exists anywhere.
 ///
-/// `FloatTargetMeanValue` (`3`) and `FeatureFreq` (`5`) stay declined permanently: they are
-/// GPU-only upstream (`restrictions.h:20-32`) and have no CPU parity surface, which is why
-/// the admission list is an explicit `matches!` enumeration over
-/// [`crate::ctr::ECtrType::from_i8`] rather than a range test.
+/// # The FINAL form: all four conjuncts are gone and the type list is DELEGATED (DCTR-18, T23)
+///
+/// P1 ends here. This predicate began the phase with four conjuncts — projection arity,
+/// `ctr_type == Borders`, `target_border_idx == 0` and `prior_denom == 1.0` — and carries
+/// **none** of them now. Each removal has its own section above, its own kernel self-oracle
+/// and its own frozen upstream fixture; the sections are kept because a reader arriving at a
+/// one-line predicate needs to know *why* it is one line.
+///
+/// What is left is a single question — *is this CTR type computable on the CPU?* — and the
+/// predicate does not answer it itself. It delegates to
+/// [`crate::ctr::ECtrType::is_cpu_supported`], reconstructing the discriminant through
+/// [`crate::ctr::ECtrType::from_i8`]. That is deliberate and it is the C-3 rule applied in
+/// the direction it actually points: both helpers are IN-CRATE here, so a second
+/// enumeration of the four admitted types would be a hand-rolled duplicate. (`cb-backend`
+/// is the opposite case — it must never depend on `cb-train`, so it transcribes the
+/// discriminants inline, with the citation.)
+///
+/// **The admitted set is therefore exactly the CPU-supported set**, and that is not a
+/// coincidence to be re-derived: the two GPU-only types are *already* rejected upstream of
+/// this gate, twice, by the same predicate —
+///
+/// * [`validate_ctr_types`] fails the whole fit with `CbError::Unsupported` when
+///   `simple_ctr` or `combinations_ctr` names one (`boosting.rs:1372-1387`), and
+/// * [`crate::ctr::materialize_ctr_feature`] refuses to build a column for one at all
+///   (`ctr/ctr_feature.rs:311-318`, "defence in depth"),
+///
+/// so a `FloatTargetMeanValue` (`3`) or `FeatureFreq` (`5`) column cannot reach this
+/// predicate from any real fit. They stay declined **permanently**, in P1 and after it, for
+/// a reason no later phase can change: they are GPU-only upstream
+/// (`restrictions.h:20-32`), so there is no CPU oracle to prove device parity against.
+/// An unknown discriminant declines by default, because `from_i8` returns `None` rather
+/// than because a range test happens to exclude it.
+///
+/// # What this predicate does NOT decide — the surviving P2/P3 boundaries
+///
+/// Widening this gate to the full CPU-legal type set did **not** open the device to every
+/// CTR fit. The remaining CTR-side exclusions live in the `device_host_eligible`
+/// conjunction below and in `cb-backend`'s `ctr_covered`, **not here**, and each has its own
+/// passing negative test (DCTR-03, T13/T21):
+///
+/// | clause | site | pinned by | status |
+/// |---|---|---|---|
+/// | `learning_folds_for_cycle == 1` | this file | `device_ctr_gate_test::multi_permutation_ctr_declines_to_device` | **P3** will invert |
+/// | `eval_sets.is_empty()` | this file | `device_ctr_type_gate_test`'s `{SkipTest, Full} × {no eval set, eval set}` square | **P3** will invert |
+/// | `one_hot_bins.is_empty()` | this file | `device_fpp_composition_test::one_hot_x_ctr_still_declines` | retained BY DESIGN; see SPEC-OH-26 |
+/// | `has_any_scorable_feature` | this file | `device_ctr_type_gate_test::cat_only_ctr_pool_declines_to_device` | **P2** (C-5) |
+/// | `col.borders.len() + 1 == n_bins` | `cb-backend`'s `ctr_covered` | `device_ctr_type_gate_test::non_15_border_count_ctr_pool_declines_to_device` | **P2** (C-1) |
+///
+/// ⇒ do not "simplify" a decline you observe on a CTR fit into this predicate. If a fit
+/// with an admitted CTR type still falls back to the CPU, one of those five clauses is why,
+/// and the table names the test that says so.
 ///
 /// # There is NO prior-denominator conjunct, deliberately (DCTR-02, T01)
 ///
@@ -2509,32 +2556,26 @@ fn ctr_splits_for_tree(
 fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
     !cols.is_empty()
         && cols.iter().all(|col| {
-            // DCTR-17 (T19): there is NO projection-arity conjunct, so the CTR TYPE is the
-            // gate's ONE remaining test. The FPP-11 escalation that had restored an arity
-            // conjunct is resolved — see the "Combination (tensor) projections ARE covered"
-            // section of this function's doc comment for the located cause and the proof.
+            // DCTR-18 (T23): the FINAL form. The CTR TYPE is the gate's ONE test, and it
+            // is not spelled here at all — it DELEGATES to the same partition the rest of
+            // this crate already uses. There is no type, arity, numerator-selector or
+            // prior-denominator conjunct left; see this function's doc comment for the
+            // proof behind each removal, and `boosting_ctr_gate_test.rs` for the pins.
             //
-            // DCTR-08 (T10) / DCTR-10 (T12) / DCTR-14 (T16): the device CTR admission
-            // LIST — an explicit enumeration, never a range check, so an unknown
-            // discriminant (`from_i8` returns `None`) and the two GPU-only types are
-            // declined by default. Reconstruction goes through
-            // `crate::ctr::ECtrType::from_i8`, which is IN-CRATE here, so the
-            // Do-Not-Hand-Roll rule applies and a second transcription of the
-            // discriminants is forbidden (C-3; only `cb-backend`, which must never depend
-            // on `cb-train`, transcribes them inline). `Borders`/`Buckets` share the
-            // ordered class-prefix device kernel; `Counter` is a whole-set tally with its
-            // OWN permutation-free device entry point; `BinarizedTargetMeanValue` is a
-            // permutation-dependent prefix over a running float mean, with its own entry
-            // point again. See this function's doc for all three proofs.
-            matches!(
-                crate::ctr::ECtrType::from_i8(col.ctr_type),
-                Some(
-                    crate::ctr::ECtrType::Borders
-                        | crate::ctr::ECtrType::Buckets
-                        | crate::ctr::ECtrType::BinarizedTargetMeanValue
-                        | crate::ctr::ECtrType::Counter
-                )
-            )
+            // Both halves are IN-CRATE, so the Do-Not-Hand-Roll rule applies in full
+            // (C-3; only `cb-backend`, which must never depend on `cb-train`, transcribes
+            // the discriminants inline, and it carries the citation where it does):
+            //
+            // * `from_i8` reconstructs the upstream discriminant and returns `None` for an
+            //   unknown one, so a value outside the enum declines BY DEFAULT rather than
+            //   by a range check somebody has to remember to widen;
+            // * `is_cpu_supported` is this crate's single statement of
+            //   `IsSupportedCtrType(ETaskType::CPU, …)` (`restrictions.h:18-48`) — the
+            //   same predicate `validate_ctr_types` rejects a fit with and
+            //   `materialize_ctr_feature` refuses to build a column for. Enumerating the
+            //   four admitted types here instead would be a SECOND list that could drift
+            //   from those two silently.
+            crate::ctr::ECtrType::from_i8(col.ctr_type).is_some_and(|t| t.is_cpu_supported())
         })
 }
 

@@ -1,7 +1,24 @@
 #!/usr/bin/env bash
 # Run every cb-train ROCm device test named in the PLAN's Definition of Done, one
-# `--test` at a time (a package-wide run fails E0432 — ~52 test files import CpuBackend
-# at module scope). Prints one PASS/FAIL line per test binary.
+# `--test` at a time. Prints one PASS/FAIL line per test binary.
+#
+# Roster: 28 binaries (the 23 green at `a0a67ec` + the 5 added by the "Device CTR
+# Coverage P1" phase: `device_ctr_buckets_fit_test` (T10), `device_ctr_counter_fit_test`
+# (T12), `device_ctr_type_gate_test` (T13), `device_ctr_btmv_fit_test` (T16) and
+# `device_ctr_combo_types_diff_test` (T22)). `device_ctr_combo_fit_test` was already
+# listed and was un-ignored by T19, so it converts from a vacuous pass to a real one
+# without changing this array. The count is DERIVED from the array below, never aimed
+# at — a new device binary that exists but is unregistered here is a phase-DoD failure
+# even if it passes standalone.
+#
+# ONE `--test <name>` PER BINARY IS MANDATORY, and it is not a stylistic choice (R-10):
+# a package-wide `cargo test -p cb-train --no-default-features --features rocm` fails
+# `E0432` because ~52 test files `use cb_backend::CpuBackend;` at module scope, which is
+# not compiled under rocm — the whole run dies before any device test executes. The CTR
+# binaries below are therefore separate `--test` invocations rather than one filtered
+# run. Equally mandatory (R-9): `--features rocm` NEVER without `--no-default-features`,
+# or `cb-backend`'s `default = ["cpu"]` wins the `cfg` chain, `SelectedRuntime` resolves
+# to `cubecl::cpu::CpuRuntime`, and every "device" test silently compares cpu with cpu.
 set -uo pipefail
 
 TESTS=(
@@ -28,6 +45,12 @@ TESTS=(
   device_poisson_bootstrap_test
   device_one_hot_parity_test
   device_seam_test
+  # ── Device CTR Coverage P1 (appended; the 5 binaries the phase created) ────────────
+  device_ctr_buckets_fit_test        # T10 — DCTR-08 Buckets e2e
+  device_ctr_counter_fit_test        # T12 — DCTR-10 Counter e2e
+  device_ctr_type_gate_test          # T13 + T21 — counter_calc_method / surviving-clause pins
+  device_ctr_btmv_fit_test           # T16 — DCTR-14 BinarizedTargetMeanValue e2e
+  device_ctr_combo_types_diff_test   # T22 — DCTR-20 combination x non-Borders differential
 )
 
 fail=0
