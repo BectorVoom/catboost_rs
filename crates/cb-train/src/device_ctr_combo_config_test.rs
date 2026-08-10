@@ -32,18 +32,22 @@
 //! (a) P1 removes all four conjuncts deliberately, one task per conjunct, each with its own
 //!     kernel self-oracle and its own frozen upstream fixture — it is not a side effect of
 //!     unrelated work.
-//! (b) The condition the original comment attached is honoured: `device_ctr_combo_fit_test`
-//!     is **un-ignored in T19** and rewritten with a `CountingGpu` device-commit assertion
-//!     (`grown.get() == params.iterations`), because `oblivious_trees.len() == iterations`
-//!     is satisfied by the CPU grower too and is therefore not evidence of device
-//!     commitment (R-8). The stale "(currently `#[ignore]`d)" clause above is preserved only
-//!     as a quotation of the superseded contract; T19 removes the attribute itself.
-//! (c) The measured evidence that closed the FPP-11 escalation: on `ctr_device_combo/`,
-//!     the control arm (today's device behaviour with the arity gate simply opened) misses
-//!     the bar at `max|Δpred| = 2.746e-2`, while the D-1 arm (a per-level combination
-//!     eligibility gate mirroring upstream's `AddTreeCtrs` `baseProj.IsEmpty()` skip) is
-//!     exact at `2.082e-17`. `2.082e-17 != 1.388e-17`, the CPU-fallback value, which is
-//!     independent evidence the device path actually ran.
+//! (b) The condition the original comment attached is **DISCHARGED (T19)**, not merely
+//!     scheduled: `#[ignore]` is gone from `tests/device_ctr_combo_fit_test.rs`, the fit runs
+//!     through a `CountingGpu` and asserts `grown.get() == params.iterations`, and the run is
+//!     green. That assertion — not `oblivious_trees.len() == iterations`, which the CPU
+//!     grower satisfies too (R-8) — is the device evidence. The stale "(currently
+//!     `#[ignore]`d)" clause above survives only as a quotation of the superseded contract;
+//!     the attribute itself no longer exists.
+//! (c) The measured evidence that closed the FPP-11 escalation, now **re-measured on the
+//!     landed code** rather than on a spike: on `ctr_device_combo/`, the control arm (the
+//!     arity gate simply opened, with no per-level eligibility gate) missed the bar at
+//!     `max|Δpred| = 2.746e-2`, while the shipped D-1 + D-2 arm (`resident_combination_eligible`
+//!     mirroring upstream's `AddTreeCtrs` admission rule, plus the same filter on `maxCount`)
+//!     is exact at **`2.082e-17`, observed, with `grown = 5` and a 1.7 s runtime**.
+//!     `2.082e-17 != 1.388e-17`, the CPU-fallback value this fixture prints in 0.01 s, which
+//!     corroborates that the device path ran — though `grown` is what proves it (on two other
+//!     fixtures in this phase the two paths print the SAME delta).
 //! (d) Those two functions are replaced by the single table-driven
 //!     `gate_admits_exactly_the_current_wave` **because per-conjunct negative tests go
 //!     vacuous rather than red**: all three sub-assertions of
@@ -190,7 +194,7 @@ fn with_prior_denom(mut col: CtrFeatureColumn, prior_denom: f64) -> CtrFeatureCo
 ///
 /// ```text
 ///   row 1  simple   Borders      0  1.0  => true    flips_at: never (D-04 pin)
-///   row 2  combo    Borders      0  1.0  => false   flips_at: T19 (arity)
+///   row 2  combo    Borders      0  1.0  => true    FLIPPED by T19 (arity)
 ///   row 3  simple   Counter      0  1.0  => true    FLIPPED by T12 (type)
 ///   row 4  simple   Buckets      1  1.0  => true    FLIPPED by T10 (type + target border)
 ///   row 5  simple   BTMV         0  1.0  => true    FLIPPED by T16 (type)
@@ -238,8 +242,13 @@ fn gate_state_table() -> Vec<GateRow> {
         GateRow {
             label: "combo[0,1]/Borders/b=0/denom=1.0",
             column: covered_column(combo(), 6),
-            expected: false,
-            flips_at: "T19 — deletes `col.projection.is_simple()`",
+            expected: true,
+            flips_at: "FLIPPED by T19 — deleted `col.projection.is_simple()` (DCTR-17), the \
+                       LAST conjunct besides the type list. This row varies exactly ONE \
+                       attribute against row 1 (the arity), so restoring the conjunct turns \
+                       THIS row, and only this row, red. Its device evidence is \
+                       `device_ctr_combo_fit_test`, un-ignored in the same change and \
+                       asserting `CountingGpu.grown == iterations`",
         },
         GateRow {
             label: "simple/Counter/b=0/denom=1.0",

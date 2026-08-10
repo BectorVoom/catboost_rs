@@ -498,10 +498,14 @@ fn session_ctr_gate_covers_single_permutation() {
     let permutation: Vec<u32> = (0..n as u32).collect();
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
     assert_eq!(borders.len() + 1, n_bins, "borders must yield exactly n_bins buckets");
+    // T17 / DCTR-15: `projection_members` is stated explicitly rather than left to
+    // `Default` (which yields an EMPTY list). One member ⇒ a SIMPLE projection, which is
+    // what this fixture means and what the per-level combination-eligibility gate must see.
     let ctr_column = DeviceCtrColumn {
         member_bins: vec![cat.clone()],
         prior: 0.5,
         borders: borders.clone(),
+        projection_members: vec![0],
         ..DeviceCtrColumn::default()
     };
     // GDC-09: a covered CTR config now carries BOTH permutations — the averaging
@@ -554,6 +558,7 @@ fn session_ctr_gate_covers_single_permutation() {
                 member_bins: vec![cat.clone()],
                 prior: 0.5,
                 borders: vec![0.5_f64], // 2 buckets != n_bins
+                projection_members: vec![0], // T17: SIMPLE, stated (see above)
                 ..DeviceCtrColumn::default()
             }],
             averaging: None,
@@ -625,12 +630,25 @@ fn session_ctr_augments_resident_cindex() {
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
 
     // TWO CTR columns: one plain single-feature, one tensor/feature-combination (2 members, A5).
+    //
+    // T17 / DCTR-15: `projection_members` is stated explicitly on BOTH. This fixture is the
+    // one the coordinator flagged: the second column is a genuine 2-member COMBINATION, and
+    // leaving its member list to `Default` (an EMPTY vec) would make the per-level
+    // eligibility gate read it as SIMPLE — the fixture would then misrepresent its own
+    // stated intent the moment a grow exercised it.
     let columns = vec![
-        DeviceCtrColumn { member_bins: vec![cat0.clone()], prior: 0.5, borders: borders.clone(), ..DeviceCtrColumn::default() },
+        DeviceCtrColumn {
+            member_bins: vec![cat0.clone()],
+            prior: 0.5,
+            borders: borders.clone(),
+            projection_members: vec![0],
+            ..DeviceCtrColumn::default()
+        },
         DeviceCtrColumn {
             member_bins: vec![cat0.clone(), cat1.clone()],
             prior: 1.0,
             borders: borders.clone(),
+            projection_members: vec![0, 1],
             ..DeviceCtrColumn::default()
         },
     ];
@@ -695,7 +713,14 @@ fn session_ctr_materializes_averaging_columns_separately() {
     let identity: Vec<u32> = (0..n as u32).collect();
     let reversed: Vec<u32> = (0..n as u32).rev().collect();
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
-    let column = DeviceCtrColumn { member_bins: vec![cat0], prior: 0.5, borders, ..DeviceCtrColumn::default() };
+    // T17: SIMPLE, stated explicitly (never left to `Default`'s empty list).
+    let column = DeviceCtrColumn {
+        member_bins: vec![cat0],
+        prior: 0.5,
+        borders,
+        projection_members: vec![0],
+        ..DeviceCtrColumn::default()
+    };
 
     let open = |avg_perm: &[u32]| {
         let ctr = DeviceCtrConfig {
@@ -776,7 +801,16 @@ fn ctr_leaf_values_use_averaging_permutation_bins() {
     let identity: Vec<u32> = (0..n as u32).collect();
     let reversed: Vec<u32> = (0..n as u32).rev().collect();
     let borders: Vec<f64> = (1..n_bins).map(|b| b as f64 / n_bins as f64).collect();
-    let column = DeviceCtrColumn { member_bins: vec![cat], prior: 0.5, borders, ..DeviceCtrColumn::default() };
+    // T17: SIMPLE, stated explicitly. This is the ONE fixture in this file that actually
+    // GROWS a tree through pass C, so its member list is what the eligibility gate reads:
+    // `len() == 1` ⇒ unconditionally eligible ⇒ this oracle is byte-unchanged by T17.
+    let column = DeviceCtrColumn {
+        member_bins: vec![cat],
+        prior: 0.5,
+        borders,
+        projection_members: vec![0],
+        ..DeviceCtrColumn::default()
+    };
 
     let ctr = DeviceCtrConfig {
         permutation: identity,

@@ -238,6 +238,13 @@ struct CtrSearchState {
     bucket_counts: Vec<usize>,
     /// Per-column `(ctr_type, projection)` identity group id.
     weight_groups: Vec<u32>,
+    /// DCTR-15 (T17): per-column SORTED ABSOLUTE cat-feature ids, in the SAME order
+    /// as `bucket_counts` / `weight_groups`. Copied verbatim off the seam
+    /// (`DeviceCtrColumn::projection_members`) and read ONLY by pass C's per-level
+    /// combination-eligibility gate. Unlike `group_used` below, the state derived
+    /// from it (the tree's chosen-projection list) is TREE-lifetime and therefore
+    /// lives in `grow_oblivious_tree_resident`, not here.
+    projection_members: Vec<Vec<u32>>,
     /// Per-group model-lifetime used flags (all `false` at fit start; a tree
     /// choosing a CTR split lifts its group for every LATER level and tree).
     group_used: Vec<bool>,
@@ -1863,32 +1870,64 @@ impl GpuTrainSession {
                     )?);
                 }
                 // GDC-11: the split-search coordination state. `bucket_count == 0`
-                // falls back to the column's own observed distinct-bucket count
-                // (single-member columns; the gate admits only simple projections).
+                // falls back to the column's own observed distinct-bucket count.
+                //
+                // DCTR-20 / T17: the former justification for reading only
+                // `member_bins.first()` here — "(single-member columns; the gate
+                // admits only simple projections)" — is DELETED, not amended: T19 has
+                // now dropped the cb-train gate's arity conjunct, which makes it
+                // false outright, and it was already false for the committed test corpus
+                // (`session_depth_gt1_test.rs:630` is a 2-member combination whose
+                // `bucket_count` defaults to `0`). Taking member 0's cardinality for a
+                // combination UNDER-counts the projection, which inflates every OTHER
+                // column's `cat_feature_weight` — a silent wrong answer, not merely a
+                // worse one.
+                //
+                // A combination therefore folds ALL its members through the SAME
+                // `combine_projection_bins` identity `build_ctr_cindex_columns` uses
+                // below, so the count is the projection's real distinct-bucket count
+                // by construction rather than by a second transcription. The
+                // single-member arm is byte-unchanged (D-04). Production never reaches
+                // either arm — `build_device_ctr_config` always sets
+                // `bucket_count = col.bucket_count > 0` off the materialized column.
                 let bucket_counts: Vec<usize> = ctr
                     .columns
                     .iter()
                     .map(|col| {
                         if col.bucket_count > 0 {
-                            col.bucket_count
-                        } else {
-                            col.member_bins
+                            Ok(col.bucket_count)
+                        } else if col.member_bins.len() <= 1 {
+                            Ok(col
+                                .member_bins
                                 .first()
                                 .map(|b| {
                                     b.iter().collect::<std::collections::BTreeSet<_>>().len()
                                 })
                                 .unwrap_or(1)
-                                .max(1)
+                                .max(1))
+                        } else {
+                            combine_projection_bins(&col.member_bins, n)
+                                .map(|(_, buckets)| buckets.max(1))
                         }
                     })
-                    .collect();
+                    .collect::<CbResult<Vec<usize>>>()?;
                 let weight_groups: Vec<u32> =
                     ctr.columns.iter().map(|col| col.weight_group).collect();
+                // DCTR-15 (T17): the per-column projection identity pass C's
+                // combination-eligibility gate compares. An order-preserving `map`
+                // over the SAME `ctr.columns` the two lists above walk, so column `c`
+                // means the same column in all three (and in the cindex tail).
+                let projection_members: Vec<Vec<u32>> = ctr
+                    .columns
+                    .iter()
+                    .map(|col| col.projection_members.clone())
+                    .collect();
                 let n_groups = weight_groups.iter().copied().max().map_or(0, |m| m as usize + 1);
                 ctr_search = Some(CtrSearchState {
                     n_ctr: ctr_columns.len(),
                     bucket_counts,
                     weight_groups,
+                    projection_members,
                     group_used: vec![false; n_groups],
                     cat_eligible_buckets: ctr.cat_eligible_buckets.clone(),
                     model_size_reg: ctr.model_size_reg,
@@ -2713,6 +2752,9 @@ impl GpuTrainSession {
             n_ctr: st.n_ctr,
             bucket_counts: &st.bucket_counts,
             weight_groups: &st.weight_groups,
+            // DCTR-15 (T17): the ONLY construction of the borrowed view — pass C sees
+            // nothing this literal does not wire.
+            projection_members: &st.projection_members,
             group_used: &mut st.group_used,
             cat_eligible_buckets: &st.cat_eligible_buckets,
             model_size_reg: st.model_size_reg,

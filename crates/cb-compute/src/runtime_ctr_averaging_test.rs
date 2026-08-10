@@ -11,10 +11,14 @@ fn device_ctr_config_carries_optional_averaging() {
     // Default: no averaging half (and the derive-Default shape is preserved).
     assert!(DeviceCtrConfig::default().averaging.is_none());
 
+    // T17 / DCTR-15: `projection_members` stated explicitly rather than left to `Default`
+    // (an EMPTY list). One member ⇒ SIMPLE, matching this column's single `member_bins`
+    // entry, so the fixture cannot misrepresent its arity to a future consumer.
     let column = DeviceCtrColumn {
         member_bins: vec![vec![0, 1, 2, 0]],
         prior: 0.5,
         borders: vec![0.25, 0.5, 0.75],
+        projection_members: vec![0],
         ..DeviceCtrColumn::default()
     };
     let config = DeviceCtrConfig {

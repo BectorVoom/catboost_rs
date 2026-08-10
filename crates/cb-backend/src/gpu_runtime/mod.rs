@@ -774,6 +774,13 @@ mod session_residency;
 #[cfg(test)]
 mod session_depth_gt1_test;
 
+// T17 / DCTR-15: the per-level combination-CTR eligibility predicate's covering test. A pure
+// host predicate over member-id lists — no `ComputeClient`, no kernel — so it runs on every
+// backend. Mounted here (the sibling-module form this file already uses) because
+// `resident_combination_eligible` is a private free function in THIS module.
+#[cfg(test)]
+mod ctr_eligibility_test;
+
 // T00 / SPEC-OH-31: the DEVICE float-only identity baseline. Lives here (a
 // `gpu_runtime` descendant) rather than in `tests/` because `pack_cindex` and
 // `PackedCindex::device_arrays` are `pub(crate)` inside a `pub(crate)` module and
@@ -4355,8 +4362,19 @@ pub(crate) fn launch_apply_leaf_delta_into(
 /// bucket)` pair count joins the max, replayed host-side from `float_bins` (the
 /// base float cindex columns).
 ///
-/// DEVICE SCOPE: simple (single-feature) projections only — the cb-train gate
-/// declines combination-CTR fits, so no combination-eligibility logic exists here.
+/// DEVICE SCOPE (rewritten at T17 / DCTR-15 — the former claim that "simple
+/// (single-feature) projections only … so no combination-eligibility logic exists
+/// here" is now FALSE): pass C applies the per-level combination-eligibility gate
+/// [`resident_combination_eligible`] over [`Self::projection_members`] before
+/// scoring, so a `>= 2`-member projection is a candidate only once this tree has
+/// chosen a CTR split on a projection it extends by exactly one feature. The
+/// cb-train gate's own projection-arity conjunct was removed separately, in **T19**
+/// (DCTR-17), so ≥2-member columns now really do reach here; while that conjunct
+/// still stood the predicate was unconditionally `true` and this struct's behaviour
+/// was byte-unchanged by construction, which was T17's safety property. T19's
+/// end-to-end evidence that the gate is now load-bearing: hoisting the tree-lifetime
+/// `chosen_ctr_projections` to fit lifetime moves `device_ctr_combo_fit_test` from
+/// `2.082e-17` to `|Δ| = 2.746e-2` — measured, not argued.
 pub(crate) struct ResidentCtrSearch<'a> {
     /// CTR tail width (columns `[n_features - n_ctr, n_features)`).
     pub n_ctr: usize,
@@ -4364,6 +4382,17 @@ pub(crate) struct ResidentCtrSearch<'a> {
     pub bucket_counts: &'a [usize],
     /// Per-column `(ctr_type, projection)` identity group (shared ⇒ shared lift).
     pub weight_groups: &'a [u32],
+    /// DCTR-15 (T17): per-column SORTED ABSOLUTE cat-feature ids — the projection
+    /// identity the per-level eligibility gate compares. One entry per structure
+    /// CTR column, in the SAME order as `bucket_counts` / `weight_groups` (i.e.
+    /// the cindex tail order). Length `>= 1` per column in production
+    /// (`build_device_ctr_config` rejects an empty member list with
+    /// `CbError::Degenerate`); `len() == 1` ⇔ a simple projection.
+    ///
+    /// NOT index-compatible with `DeviceCtrColumn::member_bins`, which lives in
+    /// CTR-eligible-POSITION space. Only ever compared against other
+    /// `projection_members`.
+    pub projection_members: &'a [Vec<u32>],
     /// Model-lifetime used flags per group — persisted across trees on the session,
     /// updated the moment a level chooses a CTR split (upstream `ProcessCtrSplit`).
     pub group_used: &'a mut Vec<bool>,
@@ -4385,6 +4414,118 @@ fn resident_cat_feature_weight(count: usize, max_count: usize, model_size_reg: f
         return 1.0;
     }
     (1.0 + count as f64 / max_count as f64).powf(-model_size_reg)
+}
+
+/// DCTR-15 (T17): whether a CTR column may be SCORED at the current level of the
+/// current tree, given the projections of the CTR splits this tree has ALREADY
+/// chosen.
+///
+/// Transcribed from `cb_train::tree::combination_ctr_eligible` (`tree.rs:2896-2906`)
+/// — cb-backend cannot depend on cb-train, the T-10-04 landmine — which itself
+/// mirrors upstream `AddTreeCtrs`'s `seenProj` / `baseProj.IsEmpty()` gate
+/// (`greedy_tensor_search.cpp:491-551`, v1.2.10).
+///
+/// * A SIMPLE (single-member) projection is ALWAYS eligible: `AddSimpleCtrs` is
+///   unconditional at every level of every tree. The CPU expresses this in the
+///   CALLER (`select_level_ctr_aware` guards on `projection.is_combination()`
+///   first); pass C enumerates a flat column list with no projection type to
+///   dispatch on, so the guard is folded into the predicate here as
+///   `members.len() < 2`. The two are the same function on the same inputs —
+///   `gpu_runtime::ctr_eligibility_test` transcribes the CPU's own case list.
+/// * A COMBINATION (`>= 2`-member) projection `p` is eligible iff some already
+///   chosen projection `q` is a SUBSET of `p` with EXACTLY one fewer member —
+///   upstream's one-at-a-time `proj.AddCatFeature(...)` extension.
+/// * ⇒ with `chosen` EMPTY, EVERY combination is ineligible. That is the level-0
+///   invariant DCTR-15 names: `chosen` is **TREE-lifetime** (see
+///   `chosen_ctr_projections` in [`grow_oblivious_tree_resident`]), so it is empty
+///   at level 0 of *every* tree, not merely the first.
+///
+/// `members` and each `q` carry ABSOLUTE cat-feature ids (`DeviceCtrColumn::
+/// projection_members`), never the CTR-eligible-position space its sibling
+/// `member_bins` lives in. This predicate only ever compares member lists against
+/// other member lists, which is what makes that safe.
+fn resident_combination_eligible(members: &[u32], chosen: &[Vec<u32>]) -> bool {
+    members.len() < 2
+        || chosen.iter().any(|q| {
+            q.len() + 1 == members.len() && q.iter().all(|m| members.contains(m))
+        })
+}
+
+/// DCTR-16 (T18): the `maxCount` input of the cat-feature weight
+/// `(1 + count/maxCount)^(-model_size_reg)`, maxed over the ELIGIBLE CTR columns
+/// ONLY — the D-2 half of the pair D-1 ([`resident_combination_eligible`]) opens.
+///
+/// Upstream recomputes this **per level** in `CalcMaxFeatureValueCount`
+/// (`greedy_tensor_search.cpp:1070-1088`, v1.2.10) over `candidatesContexts` —
+/// the CURRENT LEVEL's already-`AddTreeCtrs`-gated candidate list — so an
+/// INELIGIBLE combination's (larger) bucket count never enters the max. The CPU
+/// mirror is `cb_train::tree::eligible_max_bucket_count` (`tree.rs:2920-2933`),
+/// which filters on `c.projection.is_simple() || combination_ctr_eligible(...)`
+/// and whose doc comment demands the two gates stay in lockstep. This function
+/// therefore reads the SAME [`resident_combination_eligible`] predicate pass C
+/// scores with — never a second copy of the rule.
+///
+/// Why it is not cosmetic: `(1 + count/maxCount)^(-model_size_reg)` is
+/// INCREASING in `maxCount`, so an inflated `maxCount` raises the weight of
+/// every UNUSED simple candidate at once — an independent way to flip the greedy
+/// winner away from the CPU's, with no effect on the ≤1e-5 prediction bar until
+/// it does.
+///
+/// `projection_members[c]` is index-aligned with `bucket_counts[c]`: both are
+/// order-preserving maps over the same `ctr.columns` (T10 §1's single-producer
+/// property — this function filters a FOLD, never a column list, so the
+/// structure/averaging leaf-gather pairing is untouched). An ABSENT entry counts
+/// as SIMPLE, the same `is_none_or` convention pass C's own gate uses, so the two
+/// gates cannot disagree about a degenerate column.
+///
+/// ⚠ **C-16 SCOPE INVARIANT — this is the INNER max only.** The phantom mixed
+/// float-partition count is folded in by the CALLER, OUTSIDE this filter
+/// (`eligible_max.max(phantom_max).max(1)`), exactly as the CPU computes
+/// `eligible_max_bucket_count` FIRST (`tree.rs:3116`) and hands it to
+/// `max_bucket_count_with_phantom`, which ends `eligible_max.max(phantom_max)
+/// .max(1)` (`tree.rs:3033`) — upstream's `binAndOneHotFeaturesTree` base is
+/// unconditional in `AddTreeCtrs`. Filtering the phantom too would diverge from
+/// the CPU in the opposite direction (it would UNDER-count `maxCount` and
+/// depress every cat-feature weight).
+///
+/// The `.unwrap_or(1).max(1)` guard is the pre-T18 expression's, preserved
+/// verbatim. The filter makes its `None` arm reachable with a NON-empty column
+/// list for the first time (every column an ineligible combination); the CPU
+/// falls back identically.
+///
+/// ⚠ **R-20 (OPEN).** No committed *upstream* fixture discriminates this change,
+/// and `ctr_device_combo` provably does not (D-1 alone already passes it at
+/// `2.082e-17`). Until T19 that was structural — every column reaching pass C had
+/// exactly one member, so this filter was the IDENTITY on every reachable input.
+/// **T19 removed the arity conjunct and re-measured**: with ≥2-member columns now
+/// reaching pass C, reverting this call site to the unfiltered `.max()` STILL leaves
+/// `device_ctr_combo_fit_test` byte-identical (`2.082e-17`, `grown = 5`, 8 CTR
+/// splits of which 3 are combinations). So the filter is no longer inert by
+/// construction, but it still has no behavioural detector.
+/// `gpu_runtime::ctr_eligibility_test` proves
+/// the helper filters, and — at the SOURCE level only — that pass C calls it with
+/// the phantom outside. **`SPEC.md` R-20 names T22's device-vs-CPU
+/// split-sequence differential (DCTR-20) as the primary evidence and it is
+/// UNMEASURED as of T19**; if T22 measures that reverting D-2 does not change the
+/// split sequence, R-20 stays open and must be recorded as such, not glossed.
+#[must_use]
+fn resident_eligible_max_bucket_count(
+    bucket_counts: &[usize],
+    projection_members: &[Vec<u32>],
+    chosen: &[Vec<u32>],
+) -> usize {
+    bucket_counts
+        .iter()
+        .enumerate()
+        .filter(|(c, _)| {
+            projection_members
+                .get(*c)
+                .is_none_or(|members| resident_combination_eligible(members, chosen))
+        })
+        .map(|(_, &count)| count)
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// The phantom mixed float-partition + cat-feature distinct-pair count
@@ -4759,6 +4900,21 @@ pub(crate) fn grow_oblivious_tree_resident(
     };
     let mut float_split_count = 0usize;
 
+    // DCTR-15 (T17): the projections of the CTR splits THIS TREE has already chosen —
+    // upstream's `currentTree.GetUsedCtrs()` half of `AddTreeCtrs`'s `seenProj`. The
+    // per-level combination-eligibility gate in pass C reads it.
+    //
+    // SCOPE IS LOAD-BEARING (R-2, the failure mode DCTR-15 names). This list is
+    // **TREE-lifetime**: `grow_oblivious_tree_resident` is invoked once per tree, so a
+    // function-local `Vec` resets for free at every tree, and level 0 of EVERY tree sees
+    // it empty — which is exactly upstream's `baseProj.IsEmpty()` skip, a candidate no
+    // tree can have at its root. Contrast `ResidentCtrSearch::group_used`, which is
+    // **FIT-lifetime** (owned by `CtrSearchState` on the session, borrowed `&mut` here)
+    // because `UsedCtrSplits` is model-lifetime state. Hoisting THIS list onto the
+    // session would make a combination chosen in tree 0 eligible at tree 1 level 0 — a
+    // candidate that structurally cannot exist upstream.
+    let mut chosen_ctr_projections: Vec<Vec<u32>> = Vec::new();
+
     // CB_GPU_PROF stage attribution (cold unless the env var is set): each lap fences the
     // queue so the elapsed wall time is the STAGE's device time, not launch-enqueue time.
     let prof = gpu_prof_enabled();
@@ -4889,10 +5045,47 @@ pub(crate) fn grow_oblivious_tree_resident(
         // displaces a float winner, and an earlier column never loses a tie to a
         // later one).
         if let Some(cs) = ctr_search.as_deref_mut() {
-            // `maxCount`: the eligible-candidate max (simple columns are always
-            // eligible — the device gate admits only simple projections), combined
-            // with the phantom mixed-projection count once ≥1 float split is chosen.
-            let eligible_max = cs.bucket_counts.iter().copied().max().unwrap_or(1).max(1);
+            // `maxCount`: the ELIGIBLE-candidate max, combined with the phantom
+            // mixed-projection count once ≥1 float split is chosen.
+            //
+            // DCTR-16 / D-2 (T18): the max runs over the columns the per-level
+            // eligibility gate admits, NOT over every column — upstream recomputes
+            // `CalcMaxFeatureValueCount` (`greedy_tensor_search.cpp:1070-1088`,
+            // v1.2.10) per level over `candidatesContexts`, the already-
+            // `AddTreeCtrs`-gated candidate list. The CPU mirror is
+            // `eligible_max_bucket_count` (`tree.rs:2920-2933`); both read the SAME
+            // [`resident_combination_eligible`] predicate the loop below scores
+            // with, so the two gates stay in lockstep by construction. (Before T18
+            // this was `cs.bucket_counts.iter().copied().max()...`, justified by
+            // "the device gate admits only simple projections" — a claim T19 has
+            // now made false: the cb-train gate's arity conjunct is gone and a
+            // ≥2-member column really does reach this loop.)
+            //
+            // ⚠ C-16: the filter scopes the INNER max ONLY. `phantom_max` is folded
+            // in OUTSIDE it, below, exactly as the CPU computes
+            // `eligible_max_bucket_count` first (`tree.rs:3116`) and hands it to
+            // `max_bucket_count_with_phantom`, which ends
+            // `eligible_max.max(phantom_max).max(1)` (`tree.rs:3033`) — upstream's
+            // `binAndOneHotFeaturesTree` base is unconditional. Do NOT pass
+            // `phantom_max` through the filter.
+            //
+            // ⚠ R-20 is STILL OPEN — and T19 MEASURED that, it did not assume it.
+            // Before T19 every column here had one member, so the filter was the
+            // identity on every reachable input and no e2e could possibly observe
+            // D-2. Since T19 a ≥2-member column DOES reach this loop, so the filter
+            // is no longer structurally inert — yet reverting this call site to the
+            // unfiltered `cs.bucket_counts.iter().copied().max()...` leaves
+            // `device_ctr_combo_fit_test` byte-identical: same `2.082e-17`, same
+            // `grown = 5`, same 8 CTR splits of which 3 are combinations. ⇒ D-2 has
+            // no behavioural detector yet on ANY committed fixture. The evidence
+            // remains `gpu_runtime::ctr_eligibility_test`'s unit + source pins; the
+            // designated behavioural detector is still T22's split-sequence
+            // differential (DCTR-20). Do not read T19's green as closing R-20.
+            let eligible_max = resident_eligible_max_bucket_count(
+                cs.bucket_counts,
+                cs.projection_members,
+                &chosen_ctr_projections,
+            );
             let phantom_max = if float_split_count > 0 {
                 cs.cat_eligible_buckets
                     .iter()
@@ -4905,6 +5098,25 @@ pub(crate) fn grow_oblivious_tree_resident(
             let max_bucket_count = eligible_max.max(phantom_max).max(1);
             let mut best_weighted: Option<(BestSplit, f64)> = None;
             for c in 0..cs.n_ctr {
+                // DCTR-15 (T17): skip an INELIGIBLE combination BEFORE any scoring
+                // work, mirroring the CPU's pre-scoring `continue`
+                // (`select_level_ctr_aware`, `tree.rs:3131-3146`). Skipping before
+                // the scorer — rather than filtering the winner afterwards — is what
+                // makes the strict-`>` first-wins order over the SURVIVORS match the
+                // CPU's: a scored-then-discarded column would still have been able to
+                // claim `best_weighted` and block a later, eligible column that ties
+                // it. An absent member list is treated as SIMPLE (eligible), which is
+                // the byte-unchanged pre-T17 behaviour; production cannot produce one
+                // (`build_device_ctr_config` rejects it with `CbError::Degenerate`).
+                let eligible = cs
+                    .projection_members
+                    .get(c)
+                    .is_none_or(|members| {
+                        resident_combination_eligible(members, &chosen_ctr_projections)
+                    });
+                if !eligible {
+                    continue;
+                }
                 let col_feature = ctr_base + c;
                 let pass = score_partition_over_binsums(
                     client,
@@ -4986,6 +5198,19 @@ pub(crate) fn grow_oblivious_tree_resident(
                 let group = cs.weight_groups.get(col).copied().unwrap_or(0) as usize;
                 if let Some(slot) = cs.group_used.get_mut(group) {
                     *slot = true;
+                }
+                // DCTR-15 (T17): record the winner's projection so the NEXT level of
+                // THIS tree can license the combinations that extend it by one
+                // feature (upstream's `currentTree.GetUsedCtrs()`). Pushed
+                // unconditionally, including for a simple winner — a simple
+                // projection is precisely the `q` a 2-member combination needs. The
+                // CPU derives the same set per level by filtering `chosen` for `Ctr`
+                // splits (`tree.rs:3092-3100`); duplicates are harmless under the
+                // predicate's `any(..)`, so no de-duplication is done on either side.
+                // A FLOAT winner contributes nothing here — it feeds the phantom
+                // partition replay below instead (`binAndOneHotFeaturesTree`).
+                if let Some(members) = cs.projection_members.get(col) {
+                    chosen_ctr_projections.push(members.clone());
                 }
             } else {
                 let bit = float_split_count;

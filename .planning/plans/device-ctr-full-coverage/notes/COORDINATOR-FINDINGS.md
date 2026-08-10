@@ -823,3 +823,251 @@ State this choice up front in T22's note with the reason. Do **not** discover it
 test and then loosen the assertion — that is precisely the class of change §2.5 exists to
 prevent. And note it cuts both ways: a raw comparison that *passes* is not evidence the two
 paths agree, because these degeneracies make disagreement invisible.
+
+## From T17 → **T18** (primary), **T19** (the Track D tail), **T22/T24**, and a CPU-side gap
+
+T17 landed D-1: `resident_combination_eligible` (`gpu_runtime/mod.rs`, beside
+`resident_cat_feature_weight`), the seam → `CtrSearchState` → `ResidentCtrSearch` threading of
+`projection_members`, the tree-lifetime `chosen_ctr_projections` local inside
+`grow_oblivious_tree_resident`, the pre-scoring `continue` in pass C, and the winner push.
+**Test-visible behaviour is byte-unchanged and that was measured, not assumed**: D-04
+`4.483e-11` / Buckets `2.776e-17` / Counter `1.388e-17` / BTMV `2.776e-17`, `grows = 5` on all
+four; `run_device_tests.sh` **24 PASS / 0 FAIL**; `cb-backend --lib` under rocm
+`274 passed / 0 failed; 2 ignored` (272 at T15/T16 + T17's 2).
+
+**1. MATERIAL — the CPU's `combination_ctr_eligible` covering tests are BLIND to the subset
+conjunct, and so was T17's faithful transcription of them.** Mutating
+`q.iter().all(|m| members.contains(m))` → `any` left **all seven** transcribed cases GREEN.
+Cause: in every one of `cb-train/src/tree_test.rs:296-361`'s cases the chosen `q` is either a
+full subset or wholly disjoint, and `|q| == 1` (where `all ≡ any`) or the arity conjunct rejects
+first. The **same one-word edit to `cb_train::tree::combination_ctr_eligible` would also leave
+the CPU suite green** — this is a real CPU-side coverage gap, not a device artifact. T17 added
+an eighth case, a PARTIAL OVERLAP of the right arity (`members = [1,2,3]`, `chosen = [[1,9]]`
+⇒ `false`), which is the only shape that separates "SUBSET of `p`" from "intersects `p`".
+⇒ **T18 shares this predicate; do not re-derive the rule, call it.** And any later task adding
+a CPU-side eligibility test should add the partial-overlap case there too. Generalisation, for
+the third time in this phase (T14 §5, T15 §1, now here): **a case list transcribed from an
+existing suite inherits that suite's blind spots — the mutation, not the transcription, is what
+establishes discrimination.**
+
+**2. T18 has everything it needs in scope, and C-16 is now written in-source.** At the
+`eligible_max` line, `cs.projection_members` (index-aligned with `cs.bucket_counts`) and
+`chosen_ctr_projections` are both live; the filter is a `zip`/`enumerate` over the two.
+The comment there was rewritten by T17 and states explicitly that the expression is
+**deliberately still unfiltered, T18 owns it**, names the CPU mirror
+(`eligible_max_bucket_count`, `tree.rs:2920-2933`) and restates **C-16** — filter the INNER max
+only, leave `.max(phantom_max).max(1)` outside it. **T18 has no e2e detector** while the arity
+conjunct stands (every column simple ⇒ the filter is a no-op), exactly as DCTR-16 / R-20 say;
+its evidence must be the unit test on the filtered max. Mirror T17's convention that an
+ABSENT member list counts as SIMPLE (`is_none_or`), so the two gates cannot disagree on a
+degenerate column.
+
+**3. T19: `chosen_ctr_projections` is pushed for SIMPLE winners too — deliberately.** A simple
+projection is the only `q` a 2-member combination can extend, so restricting the push to
+combinations makes every 2-member column permanently ineligible and `ctr_device_combo` would
+silently reproduce today's CPU-fallback numbers. **T19 owns the R-2 tree-lifetime mutation**
+(hoist the list onto `CtrSearchState`, show `ctr_device_combo` reddens); the declaration sits
+beside `float_split_count` inside `grow_oblivious_tree_resident`, so the hoist is a two-line
+edit. Note also that `grow_oblivious_tree_ordered_resident` has **no** `ctr_search` parameter
+and no CTR pass C at all — `grow_oblivious_tree_resident` is the complete gate surface.
+
+**4. T10 §1's single-producer pairing is PRESERVED and the mechanism is worth restating.** The
+eligibility gate skips a column from **scoring**; it never filters, reorders or de-duplicates
+either the structure or the averaging column list, and `projection_members` is an
+order-preserving `map` over the same `ctr.columns` that `bucket_counts`/`weight_groups` walk.
+Column `c` still means `ctr_base + c`. Detector green throughout (`device_ctr_buckets_fit_test`
+`2.776e-17`). **T18/T19 must keep that property — a filtered CINDEX list, as opposed to a
+filtered SCORING loop, would break it at `|Δ| = 2.506e-1`.**
+
+**5. The `bucket_counts` fallback took FOLD-ALL-MEMBERS, not the typed error — PLAN's premise
+for the cheap option was wrong.** The plan calls the `bucket_count == 0` branch "unreachable in
+practice"; it is unreachable from **production** but **not** from the committed test corpus.
+`DeviceCtrColumn::default()` yields `bucket_count == 0`, and six committed literals use
+`..DeviceCtrColumn::default()` — including `session_depth_gt1_test.rs:630`, the 2-member
+combination. A `CbError::Degenerate` there would have reddened
+`session_ctr_augments_resident_cindex`. The landed shape: production arm unchanged,
+single-member arm **byte-unchanged**, combination arm folds all members through the SAME
+`combine_projection_bins` identity `build_ctr_cindex_columns` uses. The false comment
+*"(single-member columns; the gate admits only simple projections)"* is **deleted**.
+⇒ **general caution for the remaining tasks: "unreachable in production" ≠ "unreachable", and
+`..DeviceCtrColumn::default()` is how the test corpus reaches these branches.**
+
+**6. The eight-site `projection_members` re-review is CLOSED.** All 8 test literals now state
+the field explicitly; `grep -rn "DeviceCtrColumn {"` returns 10 lines (struct def + production +
+8). **Site `session_depth_gt1_test.rs:630` was the only genuine misrepresentation** (a 2-member
+combination that defaulted to an empty list) and is now `vec![0, 1]`; the other seven were
+truthful but latently trap-shaped and are now `vec![0]`. One fact later tasks should know:
+**`ctr_leaf_values_use_averaging_permutation_bins` (`:779`) is the ONLY fixture in that file
+that actually GROWS a tree through pass C** — every other CTR fixture there stops at `begin`.
+So it is the only one whose member list the gate really reads, and its `len() == 1` is what
+makes T17 inert for it.
+
+**7. Pre-existing-failure list CORRECTION for T24 — the default-cpu count is a RANGE, not 60.**
+`cargo test -p cb-backend --lib` under default cpu now reads `225 passed / 59 failed` where T16
+recorded `222 / 60`. All 59 are in `kernels::*` (zero in `gpu_runtime::*`, the only namespace
+T17's production diff touches). The delta is a **flake**:
+`kernels::exact_quantile_test::exact_quantile_weighted_matches_cpu` FAILED in three consecutive
+isolated runs and passed in a fourth, on untouched code. ⇒ record the item as **59–60 failed**.
+Also: **T10's `duplicated_attributes` moved to `gpu_runtime/mod.rs:4462`/`:4494`** (T17 inserted
+the predicate above it) — same single diagnostic, new line numbers. T08's `erasing_op` at
+`score_split.rs:374` is still the only `error` on the rocm clippy lane, and **no new
+pre-existing-failure item was discovered**.
+
+**8. `CountingGpu` duplication count is UNCHANGED at SIX** and `run_device_tests.sh` was **not**
+touched (C-8, T24 owns it). T17 adds **no** new test binary — its test is a `cb-backend` lib
+module (`gpu_runtime/ctr_eligibility_test.rs`, mounted with the plain
+`#[cfg(test)] mod …;` sibling form that module already uses, not `#[path]`; C-11's `#[path]`
+requirement applies to modules mounted inside `session.rs`, which this is not). **T24's
+registration list is unchanged.**
+
+## From T18 → **T22** (primary — R-20 is OPEN), **T19** (the Track D tail), **T24**
+
+T18 landed D-2: `resident_eligible_max_bucket_count` (`gpu_runtime/mod.rs`, immediately after
+T17's `resident_combination_eligible`, which it CALLS rather than re-deriving), pass C's
+`eligible_max` now going through it, and the pass-C comment rewritten with the
+`CalcMaxFeatureValueCount` (`greedy_tensor_search.cpp:1070-1088`) / `eligible_max_bucket_count`
+(`tree.rs:2920-2933`) citations. **C-16 honoured**: `let max_bucket_count =
+eligible_max.max(phantom_max).max(1);` is byte-unchanged and the phantom is not passed through
+the filter. **D-04 held exactly** (`4.483e-11` / `2.776e-17` / `1.388e-17` / `2.776e-17`,
+`grows = 5` on all four, against a baseline captured before the first edit);
+`run_device_tests.sh` **24 PASS / 0 FAIL**; `cb-backend --lib` under rocm
+`277 passed / 0 failed; 2 ignored` (274 at T17 + T18's 3).
+
+**1. R-20 IS OPEN. T18 did not close it and could not have — do not let it be quietly closed.**
+While the cb-train arity conjunct stands (T19's), every column reaching pass C has exactly one
+member, so the filter is the IDENTITY on every reachable production input and **no fit on any
+committed fixture can differ between filtered and unfiltered `eligible_max`**. T18 proves
+(a) the helper filters (red-first, `left: 40, right: 6`, every conjunct mutation-proved), (b) the
+composition is C-16-shaped, (c) at the SOURCE-TEXT level that pass C calls it, (d) via MUT-W
+(`.max(1)` → `.max(1000)`) that the helper's VALUE is consumed by the production cat-feature
+weight (`device_ctr_fit_test` → `|Δ| = 1.188e-1`). None of that says the FILTER changes an
+observable outcome. **T22's mutation 1 — put the unfiltered `.max()` back at the call site and
+check whether the device split SEQUENCE moves — is the outstanding measurement, and it is
+UNMEASURED.** If it does not move, record R-20 as still open; do not cite T18's unit tests as
+closure. (Reverting the call site also reddens T18's source-scan test; that is expected and is
+not the measurement.)
+
+**2. MATERIAL — D-2's UNIT tests cannot see the call site at all, and this was measured twice.**
+Under MUT-4 (call site un-wired back to the inline unfiltered expression) and under MUT-5 (a real
+C-16 violation: the phantom routed THROUGH the filter), **all four unit tests stayed green**;
+only the source scan `pass_c_calls_the_filtered_max_and_folds_the_phantom_outside_it`
+(`include_str!("mod.rs")`, the `boosting_ctr_gate_test.rs` pattern) reddened. Generalisation for
+T19/T21/T22, now the fourth time in this phase (T14 §5, T15 §1, T17 §1): **a unit test on an
+extracted helper proves the helper, never the call site.** If a task's whole value is at the
+call site, it needs either a behavioural mutation of the call site or an explicit source pin —
+the helper's own tests will happily stay green through a complete un-wiring.
+
+**3. A green mutation that is NOT the T17 MUT-1c blindness mode — how to tell them apart.**
+`.unwrap_or(1)` → `.unwrap_or(0)` and `.max(1)` → `.max(0)` BOTH pass. That is not test
+blindness: the two clauses are mutually redundant, so `x.unwrap_or(0).max(1) ==
+x.unwrap_or(1).max(1)` for every input and **no test can separate them**. Both directions were
+driven before concluding this. ⇒ when a §2.5 mutation passes, drive its complement before
+deciding which of the two diagnoses applies; and **do not "simplify" that guard away** — nothing
+will catch it.
+
+**4. T19 is what makes D-2 observable, and the intended behaviour will look like a change.**
+Once a ≥2-member column can reach pass C, `eligible_max` can legitimately DIFFER between levels
+of the same tree (a combination ineligible at level 0 and eligible at level 2 changes `maxCount`,
+hence every unused column's cat-feature weight, hence potentially the winner). That is CPU
+parity, not a regression. T10 §1's single-producer pairing is untouched by T18 — it filters a
+FOLD over `bucket_counts`, never a column list; pass C still loops `for c in 0..cs.n_ctr` and
+column `c` still means `ctr_base + c` (`device_ctr_buckets_fit_test` green at `2.776e-17`).
+
+**5. Nothing new for T24's pre-existing list; two line-number moves.** `duplicated_attributes`
+(T10's item) moved `gpu_runtime/mod.rs:4462`/`:4494` → **`:4535`/`:4567`** (T18 inserted the
+helper above it) — same single diagnostic. `erasing_op` at `score_split.rs:374` is still the only
+`error` on the rocm clippy lane, and the warning count is back to T17's **18** after T18 fixed
+the one `needless_borrow` its own call site introduced. T18 adds **no** new test binary (its 3
+tests are `cb-backend` lib modules in T17's `gpu_runtime/ctr_eligibility_test.rs`), so T24's
+registration list is unchanged and `CountingGpu`'s duplication count stays at **SIX**.
+`run_device_tests.sh` was **not** touched (C-8). Default-cpu `cb-backend --lib` re-measured at
+T18: **`227 passed / 60 failed; 2 ignored`** (287 total = T17's 284 + T18's 3), all 60 in
+`kernels::*`, **zero in `gpu_runtime::*`**, with the named flake
+`kernels::exact_quantile_test::exact_quantile_weighted_matches_cpu` in the failure list —
+i.e. T17's **59–60 RANGE** confirmed by a second independent observation, not a new item.
+
+## From T19 → **T22** (R-20 is sharper, not closed), **T21/T23**, **T24**
+
+T19 deleted the cb-train gate's LAST non-type conjunct (`col.projection.is_simple()`), flipped
+T00's gate-state **row 2** in the same change, un-ignored `device_ctr_combo_fit_test` and drove
+it through `CountingGpu`. Result: **`grown = 5`, `max |Δpred| = 2.082e-17`, 1.6-1.7 s**, 8 CTR
+splits of which **3 are ≥2-member combinations**. PLAN §6 assumption 5's `≈2.082e-17` — an
+expectation from a reverted spike — is now a measurement on the landed code. D-04 held exactly
+(`4.483e-11` / `2.776e-17` / `1.388e-17` / `2.776e-17`, `grows = 5` on all four, against a
+baseline captured before the first edit); `run_device_tests.sh` **24 PASS / 0 FAIL**;
+`cb-backend --lib` under rocm `277 passed / 0 failed; 2 ignored` — **identical to T18**, because
+T19's `cb-backend` diff is comments only. `cb-train --lib` **401 passed**; `cargo test -p
+cb-train` **110 targets, all ok**.
+
+**1. R-20 IS STILL OPEN, and the REASON it is open has changed — T22 must not misread this.**
+T18 could not close R-20 because the filter was the IDENTITY on every reachable input while the
+arity conjunct stood. That excuse is gone: ≥2-member columns now reach pass C. T19 therefore ran
+T22's mutation 1 early as a cheap **observation** — D-2's call site reverted to the unfiltered
+`cs.bucket_counts.iter().copied().max().unwrap_or(1).max(1)`, combo e2e re-run — and the result
+is **byte-identical in every printed quantity**: `2.082e-17`, `grown = 5`, 8 splits / 3
+combinations. ⇒ **the filter is live but no committed fixture moves under it.** R-20 stays OPEN;
+T19 explicitly does **not** claim closure. T22's designated measurement (the device-vs-CPU split
+**SEQUENCE**, per the coordinator's consolidated T10 §2 + T16 finding: NOT predictions) is still
+outstanding, and if it too does not move, R-20 must be recorded as still open and `SPEC.md` must
+say so. A fixture whose combination has a much larger bucket count than its members' simple
+projections is the plausible discriminator, but that is an untested hypothesis, not a finding.
+
+**2. The R-2 tree-lifetime failure mode is REAL, the combo e2e detects it, and its `|Δ|` equals
+the control arm's.** MUT-1 (the genuine hoist: `chosen_ctr_projections` moved onto
+`CtrSearchState` + `&'a mut` on `ResidentCtrSearch`, tree-local deleted) fails at
+**`|Δ| = 2.746e-2`** — bit-for-bit the number PLAN/T00 record for "the arity gate simply opened
+with NO per-level eligibility gate". That coincidence is informative: a fit-lifetime list makes
+the gate vacuous from tree 1 onward, which is observationally identical to having no gate at
+all. ⇒ `device_ctr_combo_fit_test` is now a live scope detector for any later change to D-1's
+list lifetime.
+
+**3. T10 §1's single-producer pairing is now EXECUTABLE, and it lives in
+`boosting_ctr_gate_test.rs`.** T19's structural pin
+(`combination_arity_is_structurally_bounded_and_carried_whole`) asserts by source scan that
+`boosting.rs` holds exactly ONE `DeviceCtrColumn {` construction, exactly TWO `build_columns(`
+calls (structure + averaging), and exactly ONE `tensor_ctr_candidates(` call, plus the
+`max_ctr_complexity` arity bound and `TProjection`'s sorted/deduped members. Any later task that
+filters, reorders or de-duplicates one column list without the other now trips a cb-train unit
+test in addition to `device_ctr_buckets_fit_test`'s `|Δ| = 2.506e-1`. **Gotcha for whoever edits
+that region: the closure binding `let build_columns = |…|` carries no `(`, so the expected count
+is 2, not 3** (T19 hit this as its own first red).
+
+**4. T23's source-scan pin count is ELEVEN, not nine.** T01's 2 + T10's 4 + T16's 3 + **T19's
+2** (`the_device_gate_no_longer_reads_the_projection_arity`, a `gate_body()` scan for
+`is_simple`; and the structural pin above). Only the first is about the gate expression — the
+structural pin scans `build_device_ctr_config`'s shape and survives a gate rewrite untouched.
+**T10 §4's trap now has a third member**: the gate body must not spell `prior_denom`,
+`target_border_idx`, `ECtrType::Borders.as_i8()` **or `is_simple`**, not even in an inline
+comment. T19's replacement comment says "projection-arity conjunct" in prose for that reason.
+Also: **the gate body is now a single `matches!` over `from_i8`** — T23's delegation rewrite is
+a near-identity transformation with no other conjunct left to preserve.
+
+**5. `≥1 CTR split` is NOT a sufficient vacuity guard for a COMBINATION e2e** (T13 §2
+generalised). `device_ctr_combo_fit_test`'s module doc had always claimed it "re-asserts" that
+the trained model contains a ≥2-member projection; it did not. T19 made it executable (≥1 chosen
+CTR split with `projection.cat_features().len() >= 2`) and prints the count. **T22's combination
+arms must carry the same guard** — a fit that silently degrades to simple projections reproduces
+`ctr_device_combo`'s predictions perfectly well.
+
+**6. The retired `#[ignore]` rationale must never be restored verbatim.** Its claim — "this fit
+runs on the CPU grower and the arm-routing assertion below would fail" — was false: run with
+`--ignored` the test PASSED at `1.388e-17` in **0.01 s**, the CPU-fallback fingerprint, because
+its only routing assertions were `oblivious_trees.len() == iterations` and the empty
+non-symmetric/region lists. T19's rollback clause records a corrected rationale. This is the
+cleanest worked example of R-8 in the phase and is written into the file's module doc.
+
+**7. `CountingGpu` duplication count is now SEVEN** (`device_ctr_gate_test.rs:82-138` canonical,
+`device_ctr_fit_test.rs`, `device_ctr_buckets_fit_test.rs`, `device_ctr_counter_fit_test.rs`,
+`device_ctr_type_gate_test.rs`, `device_ctr_btmv_fit_test.rs`, `device_ctr_combo_fit_test.rs`).
+**T19 adds NO new test binary** — `device_ctr_combo_fit_test` is already line 13 of
+`run_device_tests.sh`, so the un-ignore converted a vacuous "1 ignored" into a real run without
+touching the array (`git diff --stat run_device_tests.sh` empty; C-8, T24 owns it). T24's
+registration list is unchanged: T10's, T12's, T13's and T16's four binaries.
+
+**8. Nothing new for T24's pre-existing list; nothing moved either.** `erasing_op`
+(`score_split.rs:374`) is still the only rocm clippy `error`; the rocm warning count is still
+**18** and none names a T19-touched file (the 4 `doc list item without indentation` are
+pre-existing in `kernels/grow_loop.rs`); `duplicated_attributes` is still at
+`gpu_runtime/mod.rs:4535`/`:4567` (T19 inserts no code above it). Default-cpu `cb-backend --lib`
+re-measured at **`227 passed; 60 failed; 2 ignored`** — identical to T18, a third observation
+confirming T17's **59-60 range**.

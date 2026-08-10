@@ -2314,37 +2314,54 @@ fn ctr_splits_for_tree(
 /// hashes, the device folds perfect-hash bucket codes, so a collision on ONE side only
 /// would diverge. Documented, not guarded; the ≤1e-5 e2e bar is its detector.
 ///
-/// # Combination CTR is device-INELIGIBLE (FPP-11, ESCALATED — do not re-open blind)
+/// # The FPP-11 escalation is RESOLVED — what was actually wrong (DCTR-15/16/17, T17-T19)
 ///
-/// The paragraph above describes why the arity SHOULD be admissible, and the column
-/// builder ([`build_device_ctr_config`]) does emit one `member_bins` entry per member,
-/// unit-tested by `device_ctr_combo_config_test`. But the end-to-end oracle over the
-/// `ctr_device_combo/` fixture does NOT meet the ≤1e-5 bar, so the gate stays closed.
+/// This function used to carry a fourth conjunct, `col.projection.is_simple()`, restored
+/// under escalation because the `ctr_device_combo/` e2e missed the ≤1e-5 bar by **3.3e-2**
+/// on gfx1151 while the CPU path over the same fixture was exact (`1.4e-17`, 8 CTR splits) —
+/// so neither the fixture nor the CPU combination CTR was ever at fault. The localisation
+/// stood up and is worth keeping: trees 0-2 were STRUCTURALLY IDENTICAL to the CPU's,
+/// including tree 2's 2-member combination split `[0,1] @ border 4.0` (so
+/// `combine_projection_bins` was already producing usable combined bins), and the divergence
+/// began at **tree 3, level 0**, where the CPU picked the simple `[0] @ 6.0` and the device
+/// the combination `[0,1] @ 8.0`.
 ///
-/// Measured on gfx1151 against upstream `catboost==1.2.10`:
+/// The escalation note listed two suspects. Neither was the primary cause:
 ///
-/// - the CPU path over the same fixture is exact: **max|Δpred| = 1.4e-17**, with 8 CTR
-///   splits, so neither the fixture nor the CPU combination CTR is at fault;
-/// - the DEVICE path misses by **3.3e-2**;
-/// - trees 0, 1 and 2 are STRUCTURALLY IDENTICAL to the CPU's — including tree 2's
-///   2-member combination split `[0,1] @ border 4.0` — so `combine_projection_bins`
-///   is producing usable combined bins;
-/// - the divergence begins at **tree 3, level 0**: the CPU picks the simple projection
-///   `[0] @ 6.0` and the device picks the combination `[0,1] @ 8.0`. Every later level
-///   follows from that one different partition.
+/// - **Suspect 2, `bucket_count` semantics — REFUTED.** It guessed that
+///   `combine_projection_bins`' OBSERVED distinct-bucket count might differ from upstream's
+///   `TOnlineCtrUniqValuesCounts::Count`. It does not: that `Count` is exactly the value
+///   returned by `ComputeReindexHash` over the LEARN range with `topSize = Max<ui64>()`
+///   (`online_ctr.cpp:696-700`; the unbounded `topSize` comes from
+///   `cat_feature_options.cpp:236`), i.e. the observed distinct combined-hash count on the
+///   learn set — the same quantity, computed the same way.
+/// - **Suspect 1, `eligible_max` (`maxCount`) — CONFIRMED, and fixed by DCTR-16 (T18).** The
+///   device folded EVERY column's `bucket_count` into `maxCount`, including combinations the
+///   level could not legally use, which inflates `(1 + count/maxCount)^(-model_size_reg)` for
+///   every unused candidate at once. `cb-backend`'s `resident_eligible_max_bucket_count` now
+///   filters that fold exactly as the CPU's `eligible_max_bucket_count` (`tree.rs:2920-2933`)
+///   does, with the phantom count still folded in OUTSIDE the filter.
+/// - **The PRIMARY cause was neither, and was previously unnamed: the device had no
+///   per-level candidate ELIGIBILITY gate at all** — fixed by DCTR-15 (T17). Upstream's
+///   `AddTreeCtrs` (`greedy_tensor_search.cpp:491-551`) admits a combination `p` at a level
+///   only when some ALREADY-CHOSEN projection `q` in the SAME TREE satisfies `q ⊂ p` and
+///   `|q| + 1 == |p|`; the CPU mirrors it in `crate::tree::combination_ctr_eligible`. The
+///   device scored every combination column at every level, so at tree 3 level 0 it scored a
+///   candidate upstream structurally cannot have — which is precisely the observed symptom.
+///   `cb-backend`'s `resident_combination_eligible`, applied in pass C over a TREE-LIFETIME
+///   chosen list, closes it.
 ///
-/// Tree 3 level 0 is the first point at which BOTH the simple and the combination group
-/// have already entered the model-lifetime `UsedCtrSplits` set (the combination enters at
-/// tree 2), so both candidates score at cat-feature weight `1.0` on both sides and the
-/// disagreement is a raw split-gain difference, not a weight difference. The most likely
-/// remaining suspects, in order: the device's `eligible_max` (`maxCount`) now maxes over a
-/// combination column's `bucket_count`, which its own comment says was written assuming
-/// "the device gate admits only simple projections"; and the combination column's
-/// `bucket_count` itself (`combine_projection_bins` returns the OBSERVED distinct-bucket
-/// count, whereas upstream's `TOnlineCtrUniqValuesCounts::Count` may not).
+/// With all three in place the same fixture lands at **`max |Δpred| = 2.082e-17`** with
+/// `CountingGpu.grown == iterations` — deliberately a DIFFERENT number from the CPU
+/// fallback's `1.388e-17`, though that difference is corroboration and not the evidence (on
+/// `ctr_device_buckets` and `ctr_device_btmv` the two paths print the same delta; only
+/// `grown` discriminated on every fixture in this phase).
 ///
-/// Re-opening this clause requires the e2e oracle to pass, not just the config unit test —
-/// this is exactly the ordering discipline that made the gap visible.
+/// The ordering discipline that made the gap visible still stands: re-opening this clause
+/// required the e2e oracle to pass, not just the config unit test — and, per T00's
+/// conscious-act contract, `tests/device_ctr_combo_fit_test.rs` is un-ignored and asserts
+/// device commitment through `CountingGpu`, because `oblivious_trees.len() == iterations` is
+/// satisfied by the CPU grower too (R-8).
 ///
 /// Since DCTR-14 (T16) every CPU-legal CTR type is admitted; the two GPU-only types decline
 /// permanently (see below). A type this crate could not measure against a CPU oracle would
@@ -2492,31 +2509,32 @@ fn ctr_splits_for_tree(
 fn ctr_types_are_device_covered(cols: &[crate::ctr::CtrFeatureColumn]) -> bool {
     !cols.is_empty()
         && cols.iter().all(|col| {
-            // ESCALATED (FPP-11): the projection-arity conjunct is RESTORED. See the
-            // "combination CTR is device-INELIGIBLE" section of this function's doc
-            // comment for the measured evidence and the localisation.
-            col.projection.is_simple()
-                // DCTR-08 (T10) / DCTR-10 (T12) / DCTR-14 (T16): the device CTR admission
-                // LIST — an explicit enumeration, never a range check, so an unknown
-                // discriminant (`from_i8` returns `None`) and the two GPU-only types are
-                // declined by default. Reconstruction goes through
-                // `crate::ctr::ECtrType::from_i8`, which is IN-CRATE here, so the
-                // Do-Not-Hand-Roll rule applies and a second transcription of the
-                // discriminants is forbidden (C-3; only `cb-backend`, which must never depend
-                // on `cb-train`, transcribes them inline). `Borders`/`Buckets` share the
-                // ordered class-prefix device kernel; `Counter` is a whole-set tally with its
-                // OWN permutation-free device entry point; `BinarizedTargetMeanValue` is a
-                // permutation-dependent prefix over a running float mean, with its own entry
-                // point again. See this function's doc for all three proofs.
-                && matches!(
-                    crate::ctr::ECtrType::from_i8(col.ctr_type),
-                    Some(
-                        crate::ctr::ECtrType::Borders
-                            | crate::ctr::ECtrType::Buckets
-                            | crate::ctr::ECtrType::BinarizedTargetMeanValue
-                            | crate::ctr::ECtrType::Counter
-                    )
+            // DCTR-17 (T19): there is NO projection-arity conjunct, so the CTR TYPE is the
+            // gate's ONE remaining test. The FPP-11 escalation that had restored an arity
+            // conjunct is resolved — see the "Combination (tensor) projections ARE covered"
+            // section of this function's doc comment for the located cause and the proof.
+            //
+            // DCTR-08 (T10) / DCTR-10 (T12) / DCTR-14 (T16): the device CTR admission
+            // LIST — an explicit enumeration, never a range check, so an unknown
+            // discriminant (`from_i8` returns `None`) and the two GPU-only types are
+            // declined by default. Reconstruction goes through
+            // `crate::ctr::ECtrType::from_i8`, which is IN-CRATE here, so the
+            // Do-Not-Hand-Roll rule applies and a second transcription of the
+            // discriminants is forbidden (C-3; only `cb-backend`, which must never depend
+            // on `cb-train`, transcribes them inline). `Borders`/`Buckets` share the
+            // ordered class-prefix device kernel; `Counter` is a whole-set tally with its
+            // OWN permutation-free device entry point; `BinarizedTargetMeanValue` is a
+            // permutation-dependent prefix over a running float mean, with its own entry
+            // point again. See this function's doc for all three proofs.
+            matches!(
+                crate::ctr::ECtrType::from_i8(col.ctr_type),
+                Some(
+                    crate::ctr::ECtrType::Borders
+                        | crate::ctr::ECtrType::Buckets
+                        | crate::ctr::ECtrType::BinarizedTargetMeanValue
+                        | crate::ctr::ECtrType::Counter
                 )
+            )
         })
 }
 

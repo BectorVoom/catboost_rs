@@ -554,3 +554,141 @@ fn the_device_gate_no_longer_reads_the_buckets_numerator_selector() {
          was:\n{body}"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// DCTR-17 (T19) — the projection ARITY conjunct (deleted; the FPP-11 escalation resolved)
+// ---------------------------------------------------------------------------------------
+
+/// The structural reasons deleting `col.projection.is_simple()` admits exactly the
+/// projections the CPU itself enumerates, and hands the device all of each one.
+///
+/// Unlike the other three conjunct removals, this one does NOT rest on the tested attribute
+/// being constant — a combination column is perfectly reachable, and admitting it genuinely
+/// changes which candidates the device scores. What makes it a *coverage* change rather than
+/// a semantic one is three separate structural facts, pinned here:
+///
+/// 1. **Arity is bounded by a fit parameter, at ONE producer.**
+///    [`crate::tensor_ctr_candidates`] is the sole source of CTR candidates in this crate
+///    (`AddTreeCtrs`, `greedy_tensor_search.cpp:491-551`, gated `GetFullProjectionLength <=
+///    max_ctr_complexity` at `:532-533`), and `max_ctr_complexity == 1` emits SimpleCtrs
+///    only. So the device can never be handed an unbounded projection family, and a user who
+///    does not ask for combinations still gets exactly today's admitted set.
+/// 2. **A projection's member list is SORTED and de-duplicated by construction**
+///    ([`crate::TProjection::from_features`]), which is the order the CPU's `combined_hash`
+///    folds in AND the order [`super::build_device_ctr_config`] emits both `member_bins` and
+///    `projection_members` in. The device therefore folds the same members in the same order;
+///    `SPEC` §4.1's "SORTED" requirement needs no re-sort and no runtime check.
+/// 3. **Both the structure and the averaging column lists come from ONE producer.** There is
+///    exactly one `DeviceCtrColumn` construction in this file, inside `build_columns`, an
+///    order-preserving `map` applied to each list. That is what makes the device's
+///    POSITION-indexed leaf gather pair with the host's FULL-IDENTITY gather (T10 §1); a
+///    task that filters, reorders or de-duplicates one list without the other breaks the
+///    pairing silently (measured at `|Δ| = 2.506e-1` on `device_ctr_buckets_fit_test`).
+///    Note the DCTR-15 eligibility gate deliberately skips a column from SCORING inside
+///    `cb-backend`'s pass C — it never removes one from either list, which is why it is
+///    compatible with this invariant.
+///
+/// What this test canNOT say is that the device's per-level *candidate* semantics match the
+/// CPU's — that is `cb-backend`'s `resident_combination_eligible` / DCTR-15, whose covering
+/// tests live in `crates/cb-backend/src/gpu_runtime/ctr_eligibility_test.rs`, and whose
+/// end-to-end evidence is `tests/device_ctr_combo_fit_test.rs` (`grown == iterations`,
+/// `max |Δpred| = 2.082e-17`).
+///
+/// PLAN §2.5: green on write ⇒ mutation-proved; see `notes/T19.md`.
+#[test]
+fn combination_arity_is_structurally_bounded_and_carried_whole() {
+    use crate::{tensor_ctr_candidates, TProjection};
+
+    // (1) The arity bound. Three CTR-eligible cat features (cardinality above
+    // `one_hot_max_size`), so the enumeration is not degenerate.
+    let cards = [10u32, 10, 10];
+    let simple_only = tensor_ctr_candidates(&cards, 1, 1);
+    assert!(
+        !simple_only.is_empty() && simple_only.iter().all(|c| c.is_simple),
+        "`max_ctr_complexity == 1` must emit SimpleCtrs ONLY — that is what keeps the \
+         device's admitted set unchanged for a fit that never asked for combinations; got \
+         {simple_only:?}"
+    );
+    for max_complexity in [2usize, 3] {
+        let candidates = tensor_ctr_candidates(&cards, 1, max_complexity);
+        assert!(
+            candidates.iter().any(|c| !c.is_simple),
+            "`max_ctr_complexity == {max_complexity}` must emit at least one COMBINATION, \
+             or the deleted arity conjunct would have been unreachable and this whole track \
+             vacuous"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.projection.full_projection_length() <= max_complexity),
+            "`tensor_ctr_candidates` must honour the `GetFullProjectionLength <= \
+             max_ctr_complexity` gate (`greedy_tensor_search.cpp:532-533`) — the device gate \
+             no longer bounds the arity itself, so this is the ONLY bound"
+        );
+    }
+
+    // (2) Sorted, de-duplicated members — the fold order shared by `combined_hash` and the
+    // device seam.
+    let projection = TProjection::from_features(&[2, 0, 2, 1]);
+    assert_eq!(
+        projection.cat_features(),
+        [0usize, 1, 2],
+        "`TProjection` must keep its members sorted and de-duplicated (`AddCatFeature` / \
+         `IsRedundant`); `build_device_ctr_config` deliberately does NOT re-sort, so a \
+         regression here would silently reorder the device's `member_bins` fold"
+    );
+
+    // (3) One seam producer, applied to both lists. A source scan is the only way to assert
+    // "there is exactly one construction site" — a value assertion cannot see a second one a
+    // future edit adds.
+    let src = production_source();
+    let constructions = code_lines_mentioning(src, "DeviceCtrColumn {");
+    assert_eq!(
+        constructions.len(),
+        1,
+        "expected exactly ONE production `DeviceCtrColumn` construction (inside \
+         `build_device_ctr_config`'s `build_columns`); a second producer would break the \
+         single-producer pairing the device's position-indexed leaf gather depends on. \
+         Found: {constructions:?}"
+    );
+    let build_calls = code_lines_mentioning(src, "build_columns(");
+    assert_eq!(
+        build_calls.len(),
+        2,
+        "expected EXACTLY TWO `build_columns` calls — the structure list and the averaging \
+         list — so both halves are the same order-preserving map over the same specs. \
+         (The closure's own `let build_columns = |…|` binding carries no `(`, so it is not \
+         counted here.) Found: {build_calls:?}"
+    );
+
+    // And the single candidate producer this crate feeds that seam from.
+    let producer = code_lines_mentioning(src, "tensor_ctr_candidates(");
+    assert_eq!(
+        producer.len(),
+        1,
+        "expected exactly ONE production call to `tensor_ctr_candidates` — the sole CTR \
+         candidate enumeration, and therefore the sole place `max_ctr_complexity` bounds the \
+         arity the device can see. Found: {producer:?}"
+    );
+}
+
+/// DCTR-17's observable completion: the gate expression itself no longer reads the
+/// projection arity. RED before T19's deletion, green after.
+///
+/// (As with the `target_border_idx` pin above, [`gate_body`] returns the RAW source of the
+/// function including its inline comments, so spelling `is_simple` in a comment inside the
+/// body would fail this test. That is deliberate — a "removed" conjunct surviving in a
+/// comment is still a rename hazard — and it is why the body's DCTR-17 comment says
+/// "projection-arity conjunct" in prose instead.)
+#[test]
+fn the_device_gate_no_longer_reads_the_projection_arity() {
+    let body = gate_body();
+    assert!(
+        !body.contains("is_simple"),
+        "`ctr_types_are_device_covered` still tests the projection arity; DCTR-17 deletes \
+         that conjunct — the FPP-11 escalation it was restored under is resolved (the primary \
+         cause was the device's MISSING per-level combination-eligibility gate, DCTR-15, not \
+         the arity itself), and `device_ctr_combo_fit_test` now passes UN-IGNORED at \
+         `max |Δpred| = 2.082e-17` with `CountingGpu.grown == iterations`. Body was:\n{body}"
+    );
+}
