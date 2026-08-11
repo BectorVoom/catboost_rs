@@ -299,6 +299,18 @@ candidate — an independent way to flip the winner.
 (D-1 alone already passes). D-2 requires its own targeted test — a unit test on
 the filtered max is acceptable and is the specified detector (R-20).
 
+**AMENDMENT (post-phase, `notes/R20-CLOSURE.md`): the gap is CLOSED with a
+behavioural detector, so the unit-test fallback is no longer the primary
+evidence.** `crates/cb-train/tests/device_ctr_eligible_max_diff_test.rs` is a
+device-vs-CPU split-sequence differential over a synthetic in-test pool (no new
+fixture) whose bucket counts are `[0] = 5`, `[1] = 5`, `[0,1] = 25`. Un-wiring
+D-2 moves the level-0 `maxCount` `5 → 25`, the cat-feature weight
+`0.70711 → 0.91287` (a ×1.291 band), and the device's tree-0 level-0 winner from
+`Float(0)` to a CTR split — the test fails. The reason `ctr_device_combo` cannot
+do this is now measured: its ratio is only ~3× ⇒ an 18 % band, and no level-0
+float candidate lands inside it. `model_size_reg`, the other amplifier, is pinned
+at `0.5` and is not a `BoostParams` field.
+
 ### DCTR-17 — Combination CTR e2e ≤1e-5 with device commitment
 `device_ctr_combo_fit_test` is **un-ignored** and rewritten with `CountingGpu`.
 Expected `max|Δpred| ≈ 2.082e-17` (measured), not the CPU-fallback `1.388e-17`.
@@ -402,7 +414,7 @@ Python surface changes (`task_type` is not Python-exposed).
 | ID | Risk | Mitigation |
 |---|---|---|
 | R-1 | D-1 needs projection structure across the seam + tree-lifetime state in the resident grower | DCTR-01 lands first; DCTR-15 names the scope-confusion failure mode |
-| R-20 | `ctr_device_combo` does **not** discriminate D-2 | DCTR-16 mandates a dedicated unit test; **DCTR-20's differential is the stronger detector and supersedes the unit test as primary evidence** |
+| R-20 | `ctr_device_combo` does **not** discriminate D-2 | **CLOSED post-phase** (`notes/R20-CLOSURE.md`). DCTR-20's differential was measured NOT to discriminate at any horizon on `ctr_device_combo` (T19, T22 ×2); the closing detector is `device_ctr_eligible_max_diff_test`, the same split-sequence shape over a **synthetic** pool at a 5× `maxCount` ratio, which fails at tree 0 when D-2 is un-wired |
 | R-21 | The gate's existing five covering assertions (`device_ctr_combo_config_test.rs`) are a deliberate "conscious act" guardrail that four conjunct deletions would break as a side effect | DCTR-18 mandates an ordered, justified migration **before** the first deletion, and gate-mutating tasks must run that binary |
 | R-22 | CodeGraph's test attribution misses `#[path]`-mounted in-crate sibling modules, so "no covering tests found" is not evidence of absence | Any "no covering tests" claim must be confirmed with a repo-wide `grep` before it is used to justify an edit |
 | R-8 | Device tests can pass on CPU | `CountingGpu` mandatory (DCTR-08/10/14/17/19) |

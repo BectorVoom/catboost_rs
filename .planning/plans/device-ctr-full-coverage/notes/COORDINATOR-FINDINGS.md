@@ -1432,3 +1432,82 @@ workspace are all unmoved.
 
 **6. `CountingGpu` duplication, final count: EIGHT in the CTR family** (as T22 predicted) and
 **NINETEEN across all `cb-train` device tests** (`grep -rn "struct CountingGpu"`). T24 adds none.
+
+---
+
+## POST-PHASE — R-20 is CLOSED (`notes/R20-CLOSURE.md`)
+
+Base `0e20e16`, clean tree, primary checkout. R-20 was the phase's one remaining
+test-coverage gap: D-2 (filtering `eligible_max` to *eligible* columns) had unit-level and
+source-level evidence but **no behavioural detector**, and the designated DCTR-20 differential
+was measured NOT to discriminate at any horizon T22 ran.
+
+**It is closed by measurement, with a new detector:
+`crates/cb-train/tests/device_ctr_eligible_max_diff_test.rs`** — a device-vs-CPU
+split-sequence differential over a **synthetic in-test pool** (no new fixture; R-12 intact).
+Un-wire D-2 and it fails at **tree 0**:
+
+```
+assertion `left == right` failed: tree 0: the FLOAT split sequence diverges between the device and CPU growers…
+  left: []
+ right: [Split { feature: 0, border: 0.5211687088012695 }]
+```
+
+Wire it back: `9 CTR splits (4 ≥2-member)` on both arms, `grown = 5`, cpu `grown = 0 /
+accepted 0`, `max |Δleaf| = 1.518e-17`.
+
+**Why the three earlier probes missed it, root-caused rather than shrugged at.** The weight
+`(1 + count/maxCount)^(-model_size_reg)` is increasing in `maxCount`, so an inflated
+`maxCount` raises EVERY CTR candidate's weight at once ⇒ the reachable flip is
+CTR-vs-**float** (a single threshold), not a CTR-vs-CTR near-tie, and it is confined to
+**level 0** (from level 1 on, `phantom_max` is folded in outside the filter and dominates).
+The flip therefore needs a level-0 float candidate inside the band the inflated `maxCount`
+opens, and the band's width is set **entirely by the unfiltered/filtered `maxCount` ratio**.
+On `ctr_device_combo` that ratio is ~3× ⇒ weights `0.756 → 0.894`, an 18 % band nothing lands
+in. The new pool's two 5-category columns give bucket counts `5 / 5 / 25` ⇒ `maxCount` 5 vs
+25 ⇒ weights `0.70711 → 0.91287`, a ×1.291 band — and a level-0 float candidate sits inside
+it. **T19's refuted hypothesis is now REFINED, not resurrected**: the ratio is necessary but
+`ctr_device_combo`'s ~3× is simply too small; ~5× suffices.
+
+**`model_size_reg` — the other amplifier — was checked and is UNREACHABLE from a fit.** It is
+hard-coded to `model_size_reg_default() == 0.5` on both sides (`boosting.rs:2801` device,
+`:6612` CPU) and `BoostParams` has no such field. The cardinality ratio is the only lever.
+
+**Search space** (scratch harness, deleted): cardinalities 3×3 … 16×16, 40 data seeds, 6
+effect-size pairs, iterations 3/5/6/8/10, `n = 300`, `nf = 3`. **With D-2 live: 0 DIFF across
+every configuration run. With D-2 bypassed: DIFF in 13/40 at 16×16 and ≥58/240 at
+{5,6,7}×{4 coefs}×{20 seeds}.** The shipped configuration DIFFs at tree 0 at all five
+iteration counts, so it is not a knife-edge horizon.
+
+**Mutation battery (four).** MUT-A (un-wire D-2) **FAILS**; MUT-D (drop the `chosen` argument
+inside the filter — the OPPOSITE-direction defect) **FAILS**, and visibly, at the vacuity
+guard (`device 0, cpu 4` combination splits), so the filter is pinned in both directions.
+MUT-B (route `phantom_max` through the filter) and MUT-C (drop the phantom) **PASS** — and
+both were diagnosed rather than left ambiguous: MUT-B is **inert by construction** (its
+two-element array lines up with the two SIMPLE columns' member lists, the combination being
+column 2, so the filter admits both slots — this also explains T18 §3's MUT-5 green), and
+MUT-C is out of this detector's scope (`depth = 2` ⇒ `phantom_max ≤ 10`, which moves no
+winner here). C-16's guards remain T18's unit test + source scan.
+
+**Deltas to the phase's recorded state:**
+
+* `run_device_tests.sh` roster **28 → 29** binaries; the suite now reports **30 PASS / 0 FAIL**
+  (29 + the isolated perf lane; Poisson 8.7×, no R-13 flake).
+* `CountingGpu` duplication: **NINE** in the CTR family, **TWENTY** across `cb-train`.
+* `cargo test -p cb-train` (default cpu): **112 targets**, zero `FAILED`.
+* The **D-04 quintet is byte-unchanged** (`4.483e-11` / `2.776e-17` / `1.388e-17` /
+  `2.776e-17` / `2.082e-17`, `grown == iterations` on all five), baseline captured before the
+  first edit. `cb-backend --lib` rocm still `277 passed / 0 failed / 2 ignored`; `cb-train
+  --lib` still `401 passed`; `device_ctr_combo_config_tests` `8 passed` with **no gate-state
+  row moved**; `boosting_ctr_gate_tests` `13 passed`.
+* Every `cb-backend` production edit is **comment-only** (proved by a non-comment `git diff`
+  filter returning empty). The pass-C R-20 paragraph, the helper's doc and
+  `ctr_eligibility_test.rs`'s module doc now record R-20 as CLOSED, name the detector, and
+  **keep** the three negative measurements, because they are what makes the new
+  configuration's parameters load-bearing.
+
+**Still open, unchanged, still not chased**: `T22-OBS-1` and `T22-OBS-2` (user ruling:
+record only). The new detector sits at 5 iterations with **zero** CTR-free trees — strictly
+below OBS-1's boundary — and uses `combinations_ctr = Borders`, so OBS-2's `b=0`/`b=1` tie is
+structurally absent. Finding 2 above (the three pre-existing unregistered device binaries) is
+also unchanged and still unowned.

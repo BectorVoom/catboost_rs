@@ -4493,21 +4493,24 @@ fn resident_combination_eligible(members: &[u32], chosen: &[Vec<u32>]) -> bool {
 /// list for the first time (every column an ineligible combination); the CPU
 /// falls back identically.
 ///
-/// ⚠ **R-20 (OPEN).** No committed *upstream* fixture discriminates this change,
-/// and `ctr_device_combo` provably does not (D-1 alone already passes it at
-/// `2.082e-17`). Until T19 that was structural — every column reaching pass C had
-/// exactly one member, so this filter was the IDENTITY on every reachable input.
-/// **T19 removed the arity conjunct and re-measured**: with ≥2-member columns now
-/// reaching pass C, reverting this call site to the unfiltered `.max()` STILL leaves
-/// `device_ctr_combo_fit_test` byte-identical (`2.082e-17`, `grown = 5`, 8 CTR
-/// splits of which 3 are combinations). So the filter is no longer inert by
-/// construction, but it still has no behavioural detector.
-/// `gpu_runtime::ctr_eligibility_test` proves
-/// the helper filters, and — at the SOURCE level only — that pass C calls it with
-/// the phantom outside. **`SPEC.md` R-20 names T22's device-vs-CPU
-/// split-sequence differential (DCTR-20) as the primary evidence and it is
-/// UNMEASURED as of T19**; if T22 measures that reverting D-2 does not change the
-/// split sequence, R-20 stays open and must be recorded as such, not glossed.
+/// ✅ **R-20 (CLOSED, R20-CLOSURE).** This filter now has a BEHAVIOURAL detector:
+/// `crates/cb-train/tests/device_ctr_eligible_max_diff_test.rs`, a device-vs-CPU
+/// split-sequence differential over a synthetic pool whose two 5-category columns
+/// give bucket counts `[0] = 5`, `[1] = 5`, `[0,1] = 25`. Un-wire this call site and
+/// the level-0 `maxCount` moves `5 → 25`, every CTR candidate's weight moves
+/// `0.70711 → 0.91287` (a ×1.291 band), and at tree 0 level 0 the device picks a CTR
+/// split where the CPU picks `Float(0)` — the differential fails. Wire it back and it
+/// passes at `max |Δleaf| = 1.518e-17`.
+///
+/// Read the history before "simplifying" this: three earlier probes on the frozen
+/// `ctr_device_combo` corpus (T19's combo e2e, T22's DCTR-20 differential at its
+/// shipped configuration, and the same differential at a 20-iteration horizon) all
+/// came back BYTE-IDENTICAL under an un-wired D-2, because that corpus' unfiltered/
+/// filtered `maxCount` ratio is only ~3× (3/4 simple vs ≤12 combined) and no level-0
+/// float candidate sits inside the resulting band. The ratio is the amplifier
+/// (`model_size_reg` is fixed at `0.5` and is not a `BoostParams` field), which is
+/// why the detector had to bring its own pool. `gpu_runtime::ctr_eligibility_test`
+/// remains the unit-level and source-level evidence underneath it.
 #[must_use]
 fn resident_eligible_max_bucket_count(
     bucket_counts: &[usize],
@@ -5069,14 +5072,14 @@ pub(crate) fn grow_oblivious_tree_resident(
             // `binAndOneHotFeaturesTree` base is unconditional. Do NOT pass
             // `phantom_max` through the filter.
             //
-            // ⚠ R-20 is STILL OPEN — and this is now MEASURED THREE TIMES, twice by
-            // the detector R-20 itself designated. Nobody assumed it.
+            // ✅ R-20 is CLOSED, by measurement — and the four measurements that
+            // came BEFORE the closing one are kept here on purpose, because they are
+            // what makes the shipped detector's configuration load-bearing.
             //
             // Before T19 every column here had one member, so the filter was the
             // identity on every reachable input and no e2e could possibly observe
-            // D-2. Since T19 a ≥2-member column DOES reach this loop, so the filter
-            // is no longer structurally inert — yet reverting this call site to the
-            // unfiltered `cs.bucket_counts.iter().copied().max()...` leaves:
+            // D-2. Since T19 a ≥2-member column DOES reach this loop. Even then,
+            // un-wiring this call site left:
             //
             //   * `device_ctr_combo_fit_test` byte-identical (T19): same
             //     `2.082e-17`, `grown = 5`, 8 CTR splits of which 3 combinations;
@@ -5088,18 +5091,24 @@ pub(crate) fn grow_oblivious_tree_resident(
             //     the same differential (all three arms at `iterations = 20`, 40
             //     level decisions per arm, 13 combination splits on the Buckets arm)
             //     — the arm that fails there fails IDENTICALLY with and without this
-            //     filter, so the failure is not attributable to D-2 (T22 §, and
-            //     `T22-OBS-2` in `notes/T22.md` explains what it IS).
+            //     filter, so the failure is not attributable to D-2 (`T22-OBS-2` in
+            //     `notes/T22.md` explains what it IS).
             //
-            // ⇒ D-2 still has NO behavioural detector on any committed fixture, and
-            // T22 explicitly does not claim closure. The evidence for D-2 remains
-            // `gpu_runtime::ctr_eligibility_test`'s unit + source pins. A fixture
-            // whose combination's bucket count dominates its members' AND whose
-            // greedy winner sits near a CTR-vs-float tie is the plausible
-            // discriminator; on `ctr_device_combo` the count ratio is already ~3×
-            // (3/4 simple vs ≤12 combined) and the winner still never flips, so the
-            // ratio alone is NOT the missing ingredient. Do not read any green in
-            // this phase as closing R-20.
+            // ROOT CAUSE of those three negatives, now measured: the detector needs a
+            // level-0 float candidate to sit inside the band the inflated `maxCount`
+            // opens, and the band's width is set by the unfiltered/filtered ratio.
+            // On `ctr_device_combo` that ratio is only ~3× (3/4 simple vs ≤12
+            // combined) ⇒ weights `0.756 → 0.894`, an 18 % band nothing lands in.
+            // `model_size_reg`, the other amplifier, is pinned at `0.5` and is not a
+            // `BoostParams` field, so the ratio is the ONLY reachable lever.
+            //
+            // ⇒ `crates/cb-train/tests/device_ctr_eligible_max_diff_test.rs` brings
+            // its own synthetic pool at a 5× ratio (bucket counts 5 / 5 / 25 ⇒
+            // `maxCount` 5 vs 25 ⇒ weights `0.70711 → 0.91287`, a ×1.291 band) and a
+            // level-0 float candidate inside it. Un-wire this call site and that
+            // differential fails at tree 0: the device takes a CTR split where the
+            // CPU takes `Float(0)`. That is R-20's behavioural detector, and it is
+            // the reason this call site must keep the filtered helper.
             let eligible_max = resident_eligible_max_bucket_count(
                 cs.bucket_counts,
                 cs.projection_members,

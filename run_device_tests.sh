@@ -2,10 +2,11 @@
 # Run every cb-train ROCm device test named in the PLAN's Definition of Done, one
 # `--test` at a time. Prints one PASS/FAIL line per test binary.
 #
-# Roster: 28 binaries (the 23 green at `a0a67ec` + the 5 added by the "Device CTR
+# Roster: 29 binaries (the 23 green at `a0a67ec` + the 5 added by the "Device CTR
 # Coverage P1" phase: `device_ctr_buckets_fit_test` (T10), `device_ctr_counter_fit_test`
 # (T12), `device_ctr_type_gate_test` (T13), `device_ctr_btmv_fit_test` (T16) and
-# `device_ctr_combo_types_diff_test` (T22)). `device_ctr_combo_fit_test` was already
+# `device_ctr_combo_types_diff_test` (T22); + `device_ctr_eligible_max_diff_test`, the
+# R-20 closure detector for D-2). `device_ctr_combo_fit_test` was already
 # listed and was un-ignored by T19, so it converts from a vacuous pass to a real one
 # without changing this array. The count is DERIVED from the array below, never aimed
 # at — a new device binary that exists but is unregistered here is a phase-DoD failure
@@ -51,6 +52,9 @@ TESTS=(
   device_ctr_type_gate_test          # T13 + T21 — counter_calc_method / surviving-clause pins
   device_ctr_btmv_fit_test           # T16 — DCTR-14 BinarizedTargetMeanValue e2e
   device_ctr_combo_types_diff_test   # T22 — DCTR-20 combination x non-Borders differential
+  # ── R-20 closure (post-phase) ─────────────────────────────────────────────────────
+  device_ctr_eligible_max_diff_test  # DCTR-16 / D-2 — the behavioural detector for the
+                                     # per-level `eligible_max` eligibility filter (R-20)
 )
 
 fail=0

@@ -53,20 +53,23 @@
 //! unconditional in `AddTreeCtrs`. `phantom_max_is_folded_in_outside_the_eligibility_filter`
 //! pins that.
 //!
-//! **⚠ R-20 is OPEN and these tests do not close it.** `ctr_device_combo` provably does not
-//! discriminate D-2 (D-1 alone already passes it at `2.082e-17`). Until T19 that was
-//! structural — with the cb-train gate's projection-arity conjunct in place EVERY device CTR
-//! column had exactly one member, so the filter was the identity on every reachable input.
-//! **T19 dropped that conjunct and re-measured**: ≥2-member columns now reach pass C, yet
-//! reverting D-2's call site to the unfiltered `.max()` leaves `device_ctr_combo_fit_test`
-//! byte-identical (`2.082e-17`, `grown = 5`, 8 CTR splits / 3 combinations). The filter is no
-//! longer inert by construction, but **still no end-to-end test moves under it**. What is
-//! proved here is (a) that the helper
-//! filters, (b) — at the source level only — that pass C calls it and folds the phantom in
-//! outside it. Whether reverting D-2 changes anything a fit can observe is **UNMEASURED**;
-//! `SPEC.md` R-20 names **T22's device-vs-CPU split-sequence differential (DCTR-20)** as the
-//! primary evidence, and if T22 measures that reverting D-2 does not move the split sequence,
-//! R-20 stays open and must be recorded as such.
+//! **R-20 is CLOSED, and these tests are its unit-level half, not its closure.** What is
+//! proved *here* is (a) that the helper filters, and (b) — at the source level only — that
+//! pass C calls it and folds the phantom in outside it. Neither is behavioural: MUT-4 and
+//! MUT-5 (T18 §3) measured that a completely un-wired call site and a real C-16 violation
+//! both leave the first two tests green.
+//!
+//! The BEHAVIOURAL detector is `crates/cb-train/tests/device_ctr_eligible_max_diff_test.rs`
+//! (R20-CLOSURE): a device-vs-CPU split-sequence differential over a synthetic pool with
+//! bucket counts `[0] = 5`, `[1] = 5`, `[0,1] = 25`, where un-wiring D-2 moves the level-0
+//! `maxCount` `5 → 25`, the cat-feature weight `0.70711 → 0.91287`, and the device's tree-0
+//! level-0 winner from `Float(0)` to a CTR split.
+//!
+//! Three earlier probes on the frozen `ctr_device_combo` corpus (T19's combo e2e, T22's
+//! DCTR-20 differential, and the same differential at a 20-iteration horizon) came back
+//! byte-identical under an un-wired D-2 — that corpus' unfiltered/filtered `maxCount` ratio is
+//! only ~3×, an 18 % weight band no level-0 float candidate lands in. The ratio is the
+//! amplifier; `model_size_reg` is pinned at `0.5` and is not a `BoostParams` field.
 
 use super::{resident_combination_eligible, resident_eligible_max_bucket_count};
 
@@ -306,11 +309,11 @@ fn phantom_max_is_folded_in_outside_the_eligibility_filter() {
 ///
 /// This is a **textual** pin over `gpu_runtime/mod.rs`, in the same style as
 /// `cb-train`'s `boosting_ctr_gate_test.rs` source scans. It proves the call site EXISTS and
-/// has the C-16 shape. It is **not** behavioural evidence: while the cb-train gate still
-/// carries its projection-arity conjunct, every device CTR column has exactly one member, the
-/// filter is the identity, and **no fit can observe D-2 at all** (R-20). The behavioural
-/// detector is T22's device-vs-CPU split-sequence differential (DCTR-20), and it is
-/// UNMEASURED as of T18.
+/// has the C-16 shape. It is **not** behavioural evidence — MUT-4 (un-wire the call site) and
+/// MUT-5 (route the phantom through the filter) both leave every OTHER test in this file
+/// green, so only this scan sees them, and it sees them as characters in a file rather than
+/// as a fit. The behavioural detector is
+/// `crates/cb-train/tests/device_ctr_eligible_max_diff_test.rs` (R-20, CLOSED).
 ///
 /// It is fail-loud on rename/reformat by design: if the call site moves or is rewritten, this
 /// test must be re-read and updated deliberately, exactly like the gate scans in cb-train.
