@@ -67,33 +67,38 @@
 //! A cindex-column-level differential would see it; it is not reachable from a `cb-train`
 //! integration test without new production readback seams, and T22 adds no production code.
 //!
-//! # A divergence this file MEASURED but does NOT own — `T22-OBS-1`
+//! # A divergence this file MEASURED but does not own — `T22-OBS-1`, now FIXED elsewhere
 //!
 //! While climbing the guard-4 escalation ladder for the Counter arm (below), longer fits on
 //! this corpus reached the first tree whose greedy search chooses **no CTR split at all**.
-//! On exactly those trees the device and CPU leaf VALUES diverge by ~1e-3 while their split
-//! sequences stay identical:
+//! On exactly those trees the device and CPU leaf VALUES diverged by ~1e-3 while their split
+//! sequences stayed identical (`tree 23 → 1.069e-3`, `tree 27 → 1.280e-3` at 30 iterations;
+//! reproducing unchanged on the shipped `combinations_ctr = Borders` configuration). Every
+//! committed device CTR fixture stops at 5 iterations, where every tree still carries a CTR
+//! split, which is why nothing had caught it.
 //!
-//! ```text
-//! trees  0..22  max |Δleaf| ~ 1e-17     (every tree carries ≥1 CTR split)
-//! tree   23     max |Δleaf| = 1.069e-3  (ctr_splits == 0)
-//! trees  24..26 max |Δleaf| ~ 6e-6      (residual carried forward)
-//! tree   27     max |Δleaf| = 1.280e-3  (ctr_splits == 0)
-//! ```
+//! **Root cause and fix (post-phase):** the device's averaging-permutation leaf-value gather
+//! (`gpu_runtime/session.rs`) was gated on *"this tree chose ≥1 CTR split"*, so a CTR fit's
+//! CTR-free tree returned the RESIDENT learning-fold leaf estimate instead of the main /
+//! averaging one. The gate is now removed — the gather is unconditional on a covered CTR fit —
+//! and the divergence is ≤1.4e-17 on every tree. The detector is
+//! `crates/cb-train/tests/device_ctr_free_tree_leaf_test.rs`, which runs this same corpus at 30
+//! iterations and asserts that the horizon really does reach a CTR-free tree.
 //!
-//! It is **not** a DCTR-20 finding and T22 deliberately does not fix it: it reproduces
-//! unchanged with `combinations_ctr = Borders`, i.e. on the ALREADY-SHIPPED `ctr_device_combo`
-//! configuration (7.824e-4 / 1.223e-3 / 1.943e-3 / 1.296e-3 at trees 23/25/28/29), merely run
-//! to 30 iterations instead of the fixture's 5. Every committed device CTR fixture stops at 5
-//! iterations, where every tree still carries a CTR split, which is why nothing has caught it.
-//! The correlate is `device_has_ctr_split == false` ⇒ `fused_unit_fold == true`
-//! (`boosting.rs:5665`), the branch that takes the device's own resident leaf assignment
-//! instead of the host CTR-aware walk (T10 §1). Reported to the coordinator for triage; do not
-//! read this file's green as evidence that a CTR fit's CTR-free trees agree.
+//! T22's own arms are unchanged: each is still configured to sit strictly BELOW the first
+//! CTR-free tree, and each run still PRINTS its CTR-free tree count so that is visible rather
+//! than assumed. This file's green was never, and still is not, the evidence for CTR-free
+//! trees — that is the other file's job.
 //!
-//! Every arm below is configured to sit strictly BELOW the first CTR-free tree, and each run
-//! PRINTS its CTR-free tree count so that is visible rather than assumed. No assertion in this
-//! file was weakened to accommodate it.
+//! # The Buckets arm's horizon — `T22-OBS-2`, addressed elsewhere
+//!
+//! The Buckets arm below ships at 5 iterations because at longer horizons the raw
+//! `CtrSplitSpec`-identity comparison false-reds on a benign `b=0`/`b=1` tie that survives a
+//! prior ≠ 0.5 (see `T22-OBS-2`; measured at tree 12 of a 20-iteration run). The long-horizon
+//! statement is made instead by
+//! `crates/cb-train/tests/device_ctr_buckets_long_horizon_diff_test.rs`, over a
+//! partition-invariant projection of the tree. Keep this arm strict and short; keep that one
+//! invariant and long.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -522,9 +527,10 @@ mod device {
         let (dev_ctr, dev_combo) = ctr_split_counts(&dev.oblivious_trees);
         let (cpu_ctr, cpu_combo) = ctr_split_counts(&host.oblivious_trees);
         // The CTR-FREE tree count is printed, not asserted: it is the boundary of the
-        // separately-reported `T22-OBS-1` divergence (see the module doc's "A divergence
-        // this file measured but does NOT own"). Every arm here is configured to sit
-        // strictly below it, and a reader must be able to see that rather than take it on
+        // separately-reported `T22-OBS-1` divergence (see the module doc — the divergence
+        // itself is now FIXED, and owned by `device_ctr_free_tree_leaf_test`). Every arm here
+        // is configured to sit strictly below it, and a reader must be able to see that
+        // rather than take it on
         // trust.
         let dev_ctr_free = dev.oblivious_trees.iter().filter(|t| t.ctr_splits.is_empty()).count();
         let cpu_ctr_free = host.oblivious_trees.iter().filter(|t| t.ctr_splits.is_empty()).count();

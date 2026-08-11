@@ -15,6 +15,29 @@ Written by **T24**, the phase's tail task, against `PLAN.md` §7 (*Phase definit
 recorded rather than closed** (R-20, `T22-OBS-1`, `T22-OBS-2`) and a list of pre-existing failures
 that are **not** phase regressions. Nothing below is presented as "no open findings".
 
+> **POST-PHASE UPDATE (2026-08-11): all three are now CLOSED.** R-20 was closed by
+> `device_ctr_eligible_max_diff_test` (see `R20-CLOSURE.md`). The user then lifted the
+> RECORD-ONLY ruling on the other two and both were implemented:
+>
+> * **`T22-OBS-1` was a REAL device defect and is FIXED.** Not the `fused_unit_fold` correlate
+>   §9.1 localised — that branch is innocent (the device `leaf_of` and the host walk agree
+>   exactly on a CTR-free tree, `mism = 0/64`). The cause was one gate in
+>   `gpu_runtime/session.rs`: the averaging-permutation leaf-value gather was conditioned on
+>   *"this tree chose ≥1 CTR split"*, so a CTR fit's CTR-free tree returned the RESIDENT
+>   learning-fold leaf estimate instead of the main/averaging one. Gate removed; every tree now
+>   agrees to ≤1.4e-17. Detector: `crates/cb-train/tests/device_ctr_free_tree_leaf_test.rs`
+>   (30 iterations, with a hard guard that the horizon actually reaches a CTR-free tree).
+> * **`T22-OBS-2`'s remedy is implemented**:
+>   `crates/cb-train/tests/device_ctr_buckets_long_horizon_diff_test.rs` makes the long-horizon
+>   (20-iteration) Buckets differential over a partition-invariant projection. At prior 0.25 the
+>   raw identity diverges on exactly tree 12 — T22's reported tie — while the projection holds
+>   on all 20 trees; a prior-0.5 arm ships alongside it.
+>
+> Roster **29 → 31** binaries, **32 PASS / 0 FAIL**. Full detail, including both mutation runs
+> and the `(a+v)−a` recovery trap, is the final entry of `COORDINATOR-FINDINGS.md`. §9.1 and
+> §9.2 below are left as written — they are the contemporaneous record of the finding, not of
+> the fix.
+
 ---
 
 ## 1. Headline

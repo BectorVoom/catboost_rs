@@ -1511,3 +1511,123 @@ record only). The new detector sits at 5 iterations with **zero** CTR-free trees
 below OBS-1's boundary — and uses `combinations_ctr = Borders`, so OBS-2's `b=0`/`b=1` tie is
 structurally absent. Finding 2 above (the three pre-existing unregistered device binaries) is
 also unchanged and still unowned.
+
+---
+
+## `T22-OBS-1` and `T22-OBS-2` — both CLOSED (post-phase, 2026-08-11)
+
+The user lifted the earlier RECORD-ONLY ruling and asked for both to be implemented. Both are
+now done; neither needed the other's machinery.
+
+### `T22-OBS-1` — a REAL device defect, root-caused and FIXED
+
+**Not** the `fused_unit_fold` correlate T22 localised. That branch (`boosting.rs`, the device
+oblivious fold) turned out to be innocent: on a CTR-free tree the device's `leaf_of` and the
+host walk agree **exactly** (measured `mism = 0/64` on every CTR-free tree, against 42–60/64 on
+every CTR-carrying one), so the two arms partition the objects identically and the fold path
+makes no difference to the leaf VALUES at all.
+
+The defect is one gate in `crates/cb-backend/src/gpu_runtime/session.rs`. A covered CTR fit runs
+**two derivative trajectories** by construction (GDC-10 / T10 §1):
+
+* the **resident** device approx/der1, advanced over the STRUCTURE partition — the CPU's
+  learning-fold-0 approx, which drives the next tree's split SEARCH;
+* the caller's **main** host approx, advanced over the AVERAGING partition — the trajectory the
+  LEAF VALUES must be estimated from.
+
+The returned leaf values are reconciled onto the second trajectory by the averaging-permutation
+gather at the end of `grow_tree_on_device`. That gather was gated on `has_ctr_split` — *"this
+tree chose ≥1 CTR split"* — so a CTR fit's tree that happened to pick only FLOAT splits silently
+returned the RESIDENT estimate. Same splits, same partition, **different der source**.
+
+The gate confused *which columns the partition reads* with *which trajectory the leaves are
+estimated from*. The CPU's counterpart (`boosting.rs`'s `leaf_value_leaf_of` /
+`lv_weighted_der1`) keys on the **fit-level** `has_ctr`, never on the per-tree split kinds. With
+no CTR level present the gather's re-derived leaf is bit-for-bit the structure `leaf_of`, so
+removing the gate changes exactly one thing on such a tree — the der source — which is the
+defect.
+
+Measured on `ctr_device_combo`, `simple_ctr = combinations_ctr = Borders`, 30 iterations:
+
+| | before | after |
+|---|---|---|
+| trees 0–22 (CTR-carrying) | 1e-17 … 2.4e-17 | unchanged |
+| tree 23 (CTR-free) | **7.824e-4** | 8.7e-18 |
+| tree 25 (CTR-free) | **1.223e-3** | 1.0e-17 |
+| tree 28 (CTR-free) | **1.943e-3** | 5.2e-18 |
+| tree 29 (CTR-free) | **1.296e-3** | 1.4e-17 |
+| trees 24 / 26 / 27 | 1.27e-5 … 1.30e-5 (contaminated via the main approx) | ≤ 8.9e-18 |
+
+Note the contamination row: the defect pushed **CTR-carrying** trees past the project's 1e-5
+bar too, purely by poisoning the main approx.
+
+**Detector**: `crates/cb-train/tests/device_ctr_free_tree_leaf_test.rs` — the same two-arm
+harness at **30** iterations, bar 1e-9. Its load-bearing guard is *not* the leaf comparison but
+the assertion that **both arms actually contain ≥1 CTR-free tree**; at 5 iterations (where every
+committed CTR fixture stops) the file would be green and vacuous, which is exactly the state the
+whole device CTR suite was in. MUT-1 (restore the `has_ctr_split` gate) → **RED at tree 23 with
+|Δ| = 7.824e-4**, the reported signature byte for byte. Reverted textually, never by
+`git checkout`.
+
+### `T22-OBS-2` — the coordinator's SECOND remedy, implemented
+
+Nothing to fix in production: OBS-2 is a statement about what a long-horizon Buckets
+differential must compare. Implemented as
+`crates/cb-train/tests/device_ctr_buckets_long_horizon_diff_test.rs`.
+
+**The projection.** A split set's only observable effect is the partition it induces, so project
+each tree to that partition. The per-object, per-tree leaf assignment at TRAINING time needs no
+new production seam — `train_cat`'s existing `staged_out` records the main approx per iteration,
+so tree `t`'s contribution is `staged[t·n+i] − staged[(t−1)·n+i]`, i.e.
+`leaf_values[leaf_of(i)]`. Recover each object's leaf by matching that against the tree's own
+`leaf_values`, then relabel by first occurrence. Invariant to a complemented level bit (the
+`b=0`/`b=1` swap: leaf indices flip, leaf values permute with their members, every object keeps
+its value) and to leaf renumbering; sensitive to any object actually changing groups.
+
+**Trap worth carrying**: grouping objects by *exact `f64` equality of the recovered
+contribution* does NOT work. `(a + v) − a` is not bit-exactly `v`, so members of one leaf
+recover values differing in the last bits and a 4-leaf tree splits into 5–6 spurious groups —
+observed as a false red on tree 2 before the recovery was anchored to `leaf_values`.
+
+**Result on `gfx1151`**, `simple_ctr = Borders`, combination Buckets, 20 iterations / depth 2:
+
+| prior | trees whose RAW `CtrSplitSpec` identity diverges | partitions | max \|Δcontribution\| |
+|---|---|---|---|
+| 0.25 | **1** — tree **12**, exactly T22's reported tie | identical, all 20 | 5.551e-17 |
+| 0.5 (the exact-mirror prior) | **4** — trees 3, 6, 10, 12 | identical, all 20 | 2.776e-17 |
+
+So the strict comparison would have false-redded at this horizon and the projection does not —
+which is OBS-2's thesis, measured rather than argued. The prior-0.5 arm ships too: it is the
+configuration the strict comparison cannot express *at all* (T10 §2), and it is kept separate
+from the 0.25 arm rather than replacing it, because at that prior the projection is blind to
+which mirrored column each grower chose.
+
+The projection's invariance AND its discrimination are pinned by a constructed, backend-
+independent unit test in the same file — the file is therefore not a total skip off-device.
+MUT-2 (device CTR levels re-derive from the STRUCTURE bit instead of the averaging bin) turns
+both device arms **RED on the partition assertion**, and `device_ctr_free_tree_leaf_test` red
+too. Reverted textually.
+
+### Verification
+
+* `bash ./run_device_tests.sh`: roster **29 → 31** binaries, **32 PASS / 0 FAIL** (31 + the
+  isolated perf lane, Poisson 10.6×).
+* `cb-backend --lib` under rocm: **277 passed / 0 failed / 2 ignored**, unmoved.
+* `cargo test -p cb-train` (default cpu): **113 targets, zero FAILED**.
+* `cb-backend --lib` default cpu: 227 passed / **60 failed** — all 60 in `kernels::*`
+  (CubeCL/MLIR), the documented pre-existing 59–60 range; **zero** `gpu_runtime::` failures, and
+  the change is in `gpu_runtime/session.rs`.
+* Clippy on both new tests, under rocm and under cpu: clean. The one `duplicated attribute`
+  warning is pre-existing (`gpu_runtime/mod.rs:4577`), as is the `cb-backend --lib --all-targets`
+  rocm clippy `error: this operation will always return zero` (confirmed by stashing).
+* `CountingGpu` duplication: **ELEVEN** in the CTR family (this pair added the ninth and tenth
+  copies of the canonical `device_ctr_gate_test.rs` shape).
+
+### Carry
+
+* **A gate that names a per-tree property is suspect wherever the CPU's counterpart names a
+  fit-level one.** OBS-1 was exactly that mismatch, and it survived a 25-task phase because
+  every fixture stopped short of the branch.
+* **Fixture horizon is a coverage dimension.** "All committed fixtures stop at 5 iterations" hid
+  a 1e-3 defect. A differential's *vacuity guard should assert that the horizon reaches the
+  branch under test*, not just that the branch exists somewhere.

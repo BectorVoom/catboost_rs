@@ -55,6 +55,16 @@ TESTS=(
   # ── R-20 closure (post-phase) ─────────────────────────────────────────────────────
   device_ctr_eligible_max_diff_test  # DCTR-16 / D-2 — the behavioural detector for the
                                      # per-level `eligible_max` eligibility filter (R-20)
+  # ── T22-OBS-1 / T22-OBS-2 closure (post-phase) ────────────────────────────────────
+  device_ctr_free_tree_leaf_test     # T22-OBS-1 — a CTR fit's CTR-FREE trees must estimate
+                                     # their leaves from the MAIN/averaging der trajectory,
+                                     # not the resident learning-fold one (30-iteration
+                                     # horizon; every other CTR fixture stops at 5)
+  device_ctr_buckets_long_horizon_diff_test
+                                     # T22-OBS-2 — the LONG-horizon (20-iteration) combination
+                                     # Buckets differential, over a partition-invariant
+                                     # projection that absorbs the benign b=0/b=1 tie a raw
+                                     # split-identity comparison false-reds on
 )
 
 fail=0
