@@ -450,15 +450,40 @@ impl<'a> FeatureMatrix<'a> {
         self.cat_bins.len()
     }
 
+    /// Whether float feature `feature` routes `NaN` ABOVE every border, i.e. it
+    /// was quantized under `nan_mode=Max`.
+    ///
+    /// Upstream carries the NaN routing in the BORDER LIST: `Min` PREPENDS an
+    /// `f32::MIN` sentinel, `Max` APPENDS an `f32::MAX` one. No FINITE `f32` can
+    /// be `> f32::MAX`, so a trailing `f32::MAX` border is a split only a NaN can
+    /// pass — which is exactly why upstream appends it. Mirrors
+    /// `cb_model::apply::nan_is_above_all_borders`, so the trainer and the apply
+    /// path agree on where a missing value goes.
+    #[must_use]
+    fn nan_is_above_all_borders(&self, feature: usize) -> bool {
+        self.feature_borders
+            .get(feature)
+            .and_then(|borders| borders.last())
+            .is_some_and(|&b| b == f64::from(f32::MAX))
+    }
+
     /// Whether object `obj` passes the float split `value > border` on float
     /// feature `feature`. Out-of-range indices return `false` defensively (the
     /// trainer passes valid indices).
+    ///
+    /// A `NaN` value takes the feature's NaN treatment
+    /// ([`Self::nan_is_above_all_borders`]) rather than the raw comparison, so a
+    /// `nan_mode=Max` feature sends missing values right at EVERY level, not
+    /// just at the sentinel split. Under `nan_mode=Min` (the catboost default)
+    /// and on NaN-free data the IEEE result already IS the treatment, so that
+    /// path is byte-for-byte unchanged.
     #[must_use]
     fn passes_float(&self, feature: usize, obj: usize, border: f64) -> bool {
-        self.feature_values
-            .get(feature)
-            .and_then(|col| col.get(obj))
-            .is_some_and(|&v| f64::from(v) > border)
+        match self.feature_values.get(feature).and_then(|col| col.get(obj)) {
+            Some(&v) if v.is_nan() => self.nan_is_above_all_borders(feature),
+            Some(&v) => f64::from(v) > border,
+            None => false,
+        }
     }
 
     /// Whether object `obj` passes the one-hot split `cat_bin == value` on

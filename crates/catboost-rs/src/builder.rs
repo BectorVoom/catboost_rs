@@ -30,7 +30,8 @@ use cb_compute::{
     LeafMethod, Loss,
 };
 use cb_data::{
-    select_borders_greedy_logsum_f32, AutoClassWeights, EBorderSelectionType, Pool, QuantizeParams,
+    select_borders_greedy_logsum_f32, AutoClassWeights, EBorderSelectionType, NanMode, Pool,
+    QuantizeParams,
 };
 use rayon::prelude::*;
 use cb_train::{
@@ -89,6 +90,9 @@ pub struct CatBoostBuilder {
     /// The `feature_border_type` binarizer. Only observable when `border_count`
     /// binds — see [`CatBoostBuilder::feature_border_type`].
     feature_border_type: EBorderSelectionType,
+    /// How `NaN` float values are quantized (`nan_mode`) — see
+    /// [`CatBoostBuilder::nan_mode`].
+    nan_mode: NanMode,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -309,6 +313,8 @@ impl CatBoostBuilder {
             random_seed: 0,
             border_count: QuantizeParams::default().border_count,
             feature_border_type: EBorderSelectionType::default(),
+            // catboost's default nan_mode is Min.
+            nan_mode: NanMode::Min,
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -483,6 +489,24 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn feature_border_type(mut self, feature_border_type: EBorderSelectionType) -> Self {
         self.feature_border_type = feature_border_type;
+        self
+    }
+
+    /// How `NaN` float values are quantized (`nan_mode`, catboost default
+    /// [`NanMode::Min`]).
+    ///
+    /// A float column containing `NaN` gets a SENTINEL border that isolates the
+    /// missing values into their own bin: [`NanMode::Min`] prepends `f32::MIN`
+    /// (NaN sorts below every real value), [`NanMode::Max`] appends `f32::MAX`
+    /// (above every real value). [`NanMode::Forbidden`] rejects a `NaN`-bearing
+    /// column at fit time with a [`CatBoostError`], mirroring upstream's
+    /// `quantization.cpp:320` refusal.
+    ///
+    /// The sentinel costs one slot of the feature's `border_count` budget, and a
+    /// `NaN`-free column is unaffected by this setting.
+    #[must_use]
+    pub fn nan_mode(mut self, nan_mode: NanMode) -> Self {
+        self.nan_mode = nan_mode;
         self
     }
 
@@ -1164,8 +1188,54 @@ impl CatBoostBuilder {
                     cb_data::MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
                 )
             });
+        // `nan_mode=Forbidden` refuses a NaN-bearing learn column, mirroring
+        // upstream `quantization.cpp:320`. Checked BEFORE any border work so the
+        // rejection is cheap and cannot race the parallel pass below.
+        if self.nan_mode == NanMode::Forbidden {
+            for (f, col) in pool.float_features().iter().enumerate() {
+                if col.iter().any(|v| v.is_nan()) {
+                    return Err(CatBoostError::InvalidConfig(format!(
+                        "Feature #{f}: There are nan factors and nan values for float \
+                         features are not allowed. Set nan_mode != Forbidden."
+                    )));
+                }
+            }
+        }
+
         let border_type = self.feature_border_type;
+        let nan_mode = self.nan_mode;
         let borders_for_col = |col: &[f32]| -> Vec<f64> {
+            // A NaN-bearing column gets the NanMode sentinel that isolates the
+            // missing values into their own bin. `Min` PREPENDS `f32::MIN`;
+            // `Max` APPENDS `f32::MAX` after selection — a tail value, so it
+            // cannot perturb which real borders get chosen (the same ordering
+            // `cb_data::quantize` documents). Either way the sentinel consumes
+            // one slot of the border budget.
+            //
+            // A NaN-FREE column takes the untouched pre-existing path, so no
+            // existing fixture moves.
+            let has_nan = col.iter().any(|v| v.is_nan());
+            if has_nan {
+                return match nan_mode {
+                    NanMode::Min => {
+                        cb_data::select_borders_f32(col, self.border_count, border_type, true)
+                    }
+                    NanMode::Max => {
+                        let mut borders = cb_data::select_borders_f32(
+                            col,
+                            self.border_count.saturating_sub(1),
+                            border_type,
+                            false,
+                        );
+                        borders.push(f64::from(f32::MAX));
+                        borders
+                    }
+                    // Rejected above; a NaN column never reaches here.
+                    NanMode::Forbidden => {
+                        cb_data::select_borders_f32(col, self.border_count, border_type, false)
+                    }
+                };
+            }
             // The presampled fast path exists only for the default GreedyLogSum
             // binarizer (it is the fit-prep hot path). The other six route
             // through `select_borders_f32`, which draws the SAME fixed-seed

@@ -1,0 +1,76 @@
+{
+  "catboost_version": "1.2.10",
+  "eval_rows": "12 ordinary, 6 NaN-in-f0, 3 with f0=-1e30, 3 with f0=+1e30",
+  "forbidden_rejection_message": "catboost/libs/data/quantization.cpp:320: Feature #0: There are nan factors and nan values for float features are not allowed. Set nan_mode != Forbidden.",
+  "min_vs_max_max_abs_diff": 2.0090942737420354,
+  "modes": {
+    "Max": {
+      "float_features": [
+        {
+          "feature_index": 0,
+          "has_nans": true,
+          "n_borders": 7,
+          "nan_value_treatment": "AsTrue"
+        },
+        {
+          "feature_index": 1,
+          "has_nans": false,
+          "n_borders": 5,
+          "nan_value_treatment": "AsIs"
+        },
+        {
+          "feature_index": 2,
+          "has_nans": false,
+          "n_borders": 2,
+          "nan_value_treatment": "AsIs"
+        }
+      ]
+    },
+    "Min": {
+      "float_features": [
+        {
+          "feature_index": 0,
+          "has_nans": true,
+          "n_borders": 7,
+          "nan_value_treatment": "AsFalse"
+        },
+        {
+          "feature_index": 1,
+          "has_nans": false,
+          "n_borders": 5,
+          "nan_value_treatment": "AsIs"
+        },
+        {
+          "feature_index": 2,
+          "has_nans": false,
+          "n_borders": 2,
+          "nan_value_treatment": "AsIs"
+        }
+      ]
+    }
+  },
+  "n_features": 3,
+  "n_train": 300,
+  "nan_feature_index": 0,
+  "nan_fraction": 0.22,
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "border_count": 16,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "nan_mode",
+  "seed": 20260814,
+  "target": "y = 3*f0 + 2*f1 - f2 with f0 imputed at 0 for the NaN rows -- VALUE-driven on purpose, so Min and Max actually differ (a missingness-driven target makes the two modes identical)"
+}

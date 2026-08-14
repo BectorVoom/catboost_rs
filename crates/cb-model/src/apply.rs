@@ -130,13 +130,46 @@ fn ctr_table_key(split: &CtrSplit) -> String {
     ctr_base_key(split.ctr_type, split.projection.cat_features())
 }
 
+/// Whether float feature `feature` routes `NaN` ABOVE every border, i.e. it was
+/// quantized under `nan_mode=Max` (DATA / `nan_mode`).
+///
+/// Upstream encodes `nan_mode` in the BORDER LIST itself, and a trained model
+/// carries the matching `nan_value_treatment`:
+///
+/// | `nan_mode`  | sentinel border           | `nan_value_treatment` |
+/// |-------------|---------------------------|-----------------------|
+/// | `Min`       | `f32::MIN` PREPENDED      | `AsFalse`             |
+/// | `Max`       | `f32::MAX` APPENDED       | `AsTrue`              |
+/// | `Forbidden` | none (a NaN column is rejected at fit time)      |         |
+///
+/// Reading the treatment back off the borders is exact rather than a heuristic:
+/// no FINITE `f32` can be `> f32::MAX`, so a trailing `f32::MAX` border is a
+/// split that only a NaN can pass — which is precisely why upstream appends it.
+/// `Min` needs no special case at all: IEEE makes every `NaN > border`
+/// comparison false, which IS `AsFalse`.
+fn nan_is_above_all_borders(model: &Model, feature: usize) -> bool {
+    model
+        .float_feature_borders
+        .get(feature)
+        .and_then(|borders| borders.last())
+        .is_some_and(|&b| b == f64::from(f32::MAX))
+}
+
 /// Whether an object passes one float split (`value > border`, Step B).
 /// Out-of-range feature indices return `false` defensively (the loaded model
 /// supplies valid indices) — checked `.get` only.
-fn passes_float_split(feature: usize, border: f64, features: &[f32]) -> bool {
-    features
-        .get(feature)
-        .is_some_and(|&v| f64::from(v) > border)
+///
+/// A `NaN` value takes the feature's NaN treatment
+/// ([`nan_is_above_all_borders`]) instead of the raw comparison, so a
+/// `nan_mode=Max` feature sends NaN right at EVERY level (not just at the
+/// sentinel split). Under `nan_mode=Min` — the catboost default — the IEEE
+/// result and the treatment agree, so that path is byte-for-byte unchanged.
+fn passes_float_split(model: &Model, feature: usize, border: f64, features: &[f32]) -> bool {
+    match features.get(feature) {
+        Some(&v) if v.is_nan() => nan_is_above_all_borders(model, feature),
+        Some(&v) => f64::from(v) > border,
+        None => false,
+    }
 }
 
 /// Whether an object passes one CTR split (`ctr_value > border`, ORD-05 / D-05).
@@ -217,7 +250,7 @@ fn passes_one_hot_split(s: &crate::OneHotModelSplit, cat_values: &[String]) -> b
 /// ([`passes_ctr_split`]).
 fn passes_split(model: &Model, split: &ModelSplit, features: &[f32], cat_values: &[String]) -> bool {
     match split {
-        ModelSplit::Float(s) => passes_float_split(s.feature, s.border, features),
+        ModelSplit::Float(s) => passes_float_split(model, s.feature, s.border, features),
         ModelSplit::OneHot(s) => passes_one_hot_split(s, cat_values),
         ModelSplit::Ctr(c) => passes_ctr_split(model, c, cat_values),
     }

@@ -87,6 +87,10 @@ pub use cb_train::{
 pub use cb_data::AutoClassWeights;
 pub use cb_data::ingest::{IngestSource, OwnedColumns};
 pub use cb_data::Pool;
+/// The `feature_border_type` binarizer family and the `nan_mode` missing-value
+/// policy, re-exported so a caller configuring quantization through
+/// [`CatBoostBuilder`] needs no direct `cb-data` dependency.
+pub use cb_data::{EBorderSelectionType, NanMode};
 
 #[cfg(test)]
 mod error_test;

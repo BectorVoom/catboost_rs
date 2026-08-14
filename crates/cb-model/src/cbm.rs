@@ -51,7 +51,8 @@ use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use crate::ctr_data::{ctr_base_key, decode_ctr_model_parts, encode_ctr_model_parts, ECtrType, Prior};
 use crate::error::ModelError;
 use crate::model_generated::ncat_boost_fbs::{
-    root_as_tmodel_core, ECtrType as CoreECtrType, TCatFeature, TCatFeatureArgs, TCtrFeature,
+    root_as_tmodel_core, ECtrType as CoreECtrType, ENanValueTreatment, TCatFeature, TCatFeatureArgs,
+    TCtrFeature,
     TCtrFeatureArgs, TFeatureCombination, TFeatureCombinationArgs, TFloatFeature,
     TFloatFeatureArgs, TKeyValue, TKeyValueArgs, TModelCore, TModelCoreArgs, TModelCtr,
     TModelCtrArgs, TModelCtrBase, TModelCtrBaseArgs, TModelTrees, TModelTreesArgs,
@@ -857,12 +858,35 @@ fn build_core_blob(model: &Model) -> Result<Vec<u8>, ModelError> {
         let feature_idx = i32::try_from(idx).map_err(|_| {
             ModelError::SchemaVersion("float-feature index exceeds i32 range".to_owned())
         })?;
+        // NanMode annotation (`nan_mode`). Upstream carries the NaN routing on
+        // the float feature as `HasNans` + `NanValueTreatment`, redundantly with
+        // the sentinel border it also stores:
+        //
+        //   nan_mode=Min -> f32::MIN PREPENDED, NanValueTreatment = AsFalse
+        //   nan_mode=Max -> f32::MAX APPENDED,  NanValueTreatment = AsTrue
+        //
+        // Recovering the annotation from the sentinel keeps ONE source of truth
+        // (the border list, which is what the apply path actually reads) while
+        // still emitting the fields a catboost reader expects. A NaN-free
+        // feature keeps the schema defaults (`HasNans=false`, `AsIs`), so every
+        // pre-existing numeric model serializes byte-identically.
+        let first_is_min_sentinel = borders_f32.first() == Some(&f32::MIN);
+        let last_is_max_sentinel = borders_f32.last() == Some(&f32::MAX);
+        let nan_value_treatment = if first_is_min_sentinel {
+            ENanValueTreatment::AsFalse
+        } else if last_is_max_sentinel {
+            ENanValueTreatment::AsTrue
+        } else {
+            ENanValueTreatment::AsIs
+        };
         let ff = TFloatFeature::create(
             &mut fbb,
             &TFloatFeatureArgs {
                 Index: feature_idx,
                 FlatIndex: feature_idx,
                 Borders: Some(borders_vec),
+                HasNans: first_is_min_sentinel || last_is_max_sentinel,
+                NanValueTreatment: nan_value_treatment,
                 ..TFloatFeatureArgs::default()
             },
         );

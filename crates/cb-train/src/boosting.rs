@@ -3386,9 +3386,21 @@ fn quantize_feature_major(
                  for partition_point to be correct (see function doc precondition)",
             );
             let col = feature_values.get(f).map_or(&[][..], Vec::as_slice);
+            // `nan_mode=Max` APPENDS an `f32::MAX` sentinel border (upstream
+            // encodes the NaN treatment in the border list itself; see
+            // `cb_model::apply::nan_is_above_all_borders`). A NaN must then land
+            // in the TOP bin, but IEEE makes every `NaN > b` false, which would
+            // bin it to 0 — the `nan_mode=Min` answer. Under `Min` (the catboost
+            // default) and for NaN-free columns this flag is false and the loop
+            // is byte-identical to before.
+            let nan_to_top_bin = borders.last().is_some_and(|&b| b == f64::from(f32::MAX));
             for (i, slot) in stripe.iter_mut().enumerate() {
                 let v = col.get(i).copied().map_or(0.0_f64, f64::from);
-                *slot = borders.partition_point(|&b| v > b) as u32;
+                *slot = if nan_to_top_bin && v.is_nan() {
+                    borders.len() as u32
+                } else {
+                    borders.partition_point(|&b| v > b) as u32
+                };
             }
         });
     (bins, n_bins)

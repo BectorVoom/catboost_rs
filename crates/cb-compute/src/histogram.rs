@@ -543,8 +543,27 @@ impl BucketHistogram {
 /// boundary the prefix scan relies on (RESEARCH Pitfall 4). Values equal to a
 /// border land in the lower bucket (strict `<`), below-min lands in bin `0`, and
 /// above-max lands in bin `borders.len()` (`= n_bins - 1`).
+///
+/// # `NaN` and `nan_mode`
+///
+/// Upstream carries a float feature's missing-value routing in the BORDER LIST:
+/// `nan_mode=Min` PREPENDS an `f32::MIN` sentinel (`nan_value_treatment=AsFalse`)
+/// and `nan_mode=Max` APPENDS an `f32::MAX` one (`AsTrue`). Under `Min` the IEEE
+/// result already does the right thing — every `b < NaN` is false, so a NaN bins
+/// to `0`, BELOW the sentinel, which is its own bin. Under `Max` the NaN must
+/// instead land in the TOP bin, ABOVE the `f32::MAX` sentinel, and IEEE would
+/// wrongly put it at `0`; the explicit branch below is what makes the histogram
+/// (and therefore split SCORING) agree with `FeatureMatrix::passes_float` and
+/// `cb_model::apply`.
+///
+/// Reading the treatment off the borders is exact, not a heuristic: no FINITE
+/// `f32` can exceed `f32::MAX`, so a trailing `f32::MAX` border is reachable only
+/// by a NaN — which is precisely why upstream appends it.
 #[must_use]
 pub fn bin_of(borders: &[f64], value: f32) -> usize {
+    if value.is_nan() && borders.last().is_some_and(|&b| b == f64::from(f32::MAX)) {
+        return borders.len();
+    }
     let v = f64::from(value);
     borders.iter().filter(|&&b| b < v).count()
 }

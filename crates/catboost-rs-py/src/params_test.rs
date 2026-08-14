@@ -85,7 +85,12 @@ fn implemented_params_tag_implemented() {
 #[test]
 fn known_not_yet_params_tag_known_not_yet() {
     for name in [
-        "nan_mode",
+        // `nan_mode` used to sit here; the string-valued-parameter wave
+        // implemented it (sentinel-border quantization + a frozen catboost
+        // oracle), so calling it a parity gap became dishonest in the opposite
+        // direction. `model_shrink_rate` replaces it as a still-unimplemented
+        // member of the same (data/boosting-control) area.
+        "model_shrink_rate",
         "leaf_estimation_iterations",
         "rsm",
         "ctr_leaf_count_limit",
@@ -156,12 +161,12 @@ fn validate_accepts_implemented_and_aliases() {
 fn validate_rejects_known_not_yet_as_parity_gap() {
     Python::attach(|py| {
         let dict = PyDict::new(py);
-        dict.set_item("nan_mode", "Min").unwrap();
+        dict.set_item("model_shrink_rate", 0.1).unwrap();
         let params = params_from(py, &dict);
         let err = validate_params(&params).unwrap_err();
         assert!(err.is_instance_of::<CatBoostParameterError>(py));
         let msg = err.value(py).to_string();
-        assert!(msg.contains("nan_mode"), "msg: {msg}");
+        assert!(msg.contains("model_shrink_rate"), "msg: {msg}");
         assert!(msg.contains("parity gap"), "msg: {msg}");
     });
 }
@@ -231,6 +236,73 @@ fn builder_map_rejects_bad_enum_string() {
         let params = params_from(py, &dict);
         let err = make_builder(&params, py).unwrap_err();
         assert!(err.is_instance_of::<CatBoostParameterError>(py));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The string-valued-parameter wave — `feature_border_type` + `nan_mode`
+// ---------------------------------------------------------------------------
+
+/// Both quantization params are tagged IMPLEMENTED, so they are ACCEPTED rather
+/// than rejected as a parity gap. Each is genuinely consumed by `fit`'s
+/// quantization stage and gated by a frozen catboost 1.2.10 oracle.
+#[test]
+fn quantization_string_params_are_implemented() {
+    for name in ["feature_border_type", "nan_mode"] {
+        assert_eq!(
+            status_of(name),
+            Some(ParamStatus::Implemented),
+            "{name} should be Implemented"
+        );
+    }
+}
+
+/// EVERY legal value of both params reaches the builder. The legal sets are the
+/// ones the catboost 1.2.10 enum parser reports for `EBorderSelectionType` and
+/// `ENanMode` — probed from the wheel, not transcribed.
+#[test]
+fn builder_map_applies_every_legal_quantization_string() {
+    Python::attach(|py| {
+        for value in [
+            "Median",
+            "GreedyLogSum",
+            "UniformAndQuantiles",
+            "MinEntropy",
+            "MaxLogSum",
+            "Uniform",
+            "GreedyMinEntropy",
+        ] {
+            let d = PyDict::new(py);
+            d.set_item("feature_border_type", value).unwrap();
+            make_builder(&params_from(py, &d), py)
+                .unwrap_or_else(|e| panic!("feature_border_type={value} must build: {e:?}"));
+        }
+        for value in ["Min", "Max", "Forbidden"] {
+            let d = PyDict::new(py);
+            d.set_item("nan_mode", value).unwrap();
+            make_builder(&params_from(py, &d), py)
+                .unwrap_or_else(|e| panic!("nan_mode={value} must build: {e:?}"));
+        }
+    });
+}
+
+/// An out-of-vocabulary value for either is a typed error naming the legal set,
+/// never a silent fallback to the default binarizer / NaN policy.
+#[test]
+fn builder_map_rejects_bad_quantization_strings() {
+    Python::attach(|py| {
+        for (key, bad) in [
+            ("feature_border_type", "greedylogsum"),
+            ("feature_border_type", "Nonsense"),
+            ("nan_mode", "min"),
+            ("nan_mode", "Nonsense"),
+        ] {
+            let d = PyDict::new(py);
+            d.set_item(key, bad).unwrap();
+            let err = make_builder(&params_from(py, &d), py)
+                .expect_err(&format!("{key}={bad} must be rejected"));
+            assert!(err.is_instance_of::<CatBoostParameterError>(py));
+        }
     });
 }
 
@@ -908,7 +980,7 @@ fn task_type_composes_with_other_params() {
         // …and a KnownNotYet param alongside it must still be rejected.
         let dict = PyDict::new(py);
         dict.set_item("task_type", "CPU").unwrap();
-        dict.set_item("nan_mode", "Min").unwrap();
+        dict.set_item("model_shrink_rate", 0.1).unwrap();
         validate_params(&params_from(py, &dict))
             .expect_err("a KnownNotYet param must still be rejected alongside task_type");
     });

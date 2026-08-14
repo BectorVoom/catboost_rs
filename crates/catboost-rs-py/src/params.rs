@@ -59,8 +59,8 @@ use std::collections::BTreeMap;
 
 use catboost_rs::{
     parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
-    EBootstrapType, ECtrType, EGrowPolicy, EOverfittingDetectorType, EScoreFunction, EvalMetric,
-    LeafMethod, Loss,
+    EBootstrapType, EBorderSelectionType, ECtrType, EGrowPolicy, EOverfittingDetectorType,
+    EScoreFunction, EvalMetric, LeafMethod, Loss, NanMode,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -148,6 +148,16 @@ const IMPLEMENTED: &[&str] = &[
     "auto_class_weights",
     "scale_pos_weight",
     "ignored_features",
+    // The string-valued-parameter wave. Both are GENUINELY consumed: the
+    // quantization stage of `fit` dispatches on them, and each has a frozen
+    // catboost 1.2.10 oracle (`border_types/`, `nan_mode/`).
+    //
+    // `feature_border_type` implements all seven upstream binarizers; only
+    // `GreedyLogSum` existed before. `nan_mode` was previously ABSENT from the
+    // fit path entirely — a NaN column got no sentinel border at all, so missing
+    // values silently shared bin 0 with the smallest real values.
+    "feature_border_type",
+    "nan_mode",
 ];
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
@@ -695,6 +705,31 @@ fn parse_score_function(name: &str) -> PyResult<EScoreFunction> {
     }
 }
 
+/// Map a `feature_border_type` string onto an [`EBorderSelectionType`].
+///
+/// The legal set is the one the catboost 1.2.10 enum parser reports for
+/// `EBorderSelectionType`; all seven are implemented.
+fn parse_feature_border_type(name: &str) -> PyResult<EBorderSelectionType> {
+    EBorderSelectionType::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown feature_border_type `{name}`; expected one of Median, GreedyLogSum, \
+             UniformAndQuantiles, MinEntropy, MaxLogSum, Uniform, GreedyMinEntropy"
+        ))
+    })
+}
+
+/// Map a `nan_mode` string onto a [`NanMode`].
+fn parse_nan_mode(name: &str) -> PyResult<NanMode> {
+    match name {
+        "Min" => Ok(NanMode::Min),
+        "Max" => Ok(NanMode::Max),
+        "Forbidden" => Ok(NanMode::Forbidden),
+        other => Err(CatBoostParameterError::new_err(format!(
+            "unknown nan_mode `{other}`; expected one of Min, Max, Forbidden"
+        ))),
+    }
+}
+
 /// Map a `bootstrap_type` string onto an [`EBootstrapType`].
 fn parse_bootstrap_type(name: &str) -> PyResult<EBootstrapType> {
     match name {
@@ -1119,6 +1154,12 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "score_function")? {
         builder = builder.score_function(parse_score_function(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "feature_border_type")? {
+        builder = builder.feature_border_type(parse_feature_border_type(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "nan_mode")? {
+        builder = builder.nan_mode(parse_nan_mode(&v)?);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "bootstrap_type")? {
         builder = builder.bootstrap_type(parse_bootstrap_type(&v)?);
