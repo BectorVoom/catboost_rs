@@ -205,6 +205,13 @@ PARAM_CASES = [
         {"grow_policy": "Lossguide"},
         {"grow_policy": "Lossguide", "min_data_in_leaf": 20},
     ),
+    # `leaf_estimation_iterations` was implemented in the engine but left OFF the
+    # Python surface's IMPLEMENTED list, so `fit` rejected it as a parity gap
+    # while the Rust builder happily consumed it. Caught by the GPU-bench
+    # preflight, not by a test — hence this cell. `backtracking="No"` is
+    # required, not decorative: the default `AnyImprovement` is rejected outright
+    # at N > 1 because the step-shrinking search is not verified to parity.
+    ({}, {"leaf_estimation_iterations": 3, "leaf_estimation_backtracking": "No"}),
 ]
 
 

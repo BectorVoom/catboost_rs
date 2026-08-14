@@ -160,12 +160,21 @@ const IMPLEMENTED: &[&str] = &[
     "feature_border_type",
     "nan_mode",
     // `leaf_estimation_backtracking`: the CPU-legal policies (`No`,
-    // `AnyImprovement`) are provably EQUIVALENT at the single leaf-estimation
-    // step this engine takes -- measured over 64 catboost 1.2.10 configurations,
-    // 0 distinguish them (53 do once `leaf_estimation_iterations > 1`, which is
-    // not implemented here). `Armijo` is GPU-only upstream and is REJECTED, so
-    // the parameter has real observable behaviour rather than being a no-op.
+    // `AnyImprovement`) are provably EQUIVALENT at a SINGLE leaf-estimation step
+    // -- measured over 64 catboost 1.2.10 configurations, 0 distinguish them. 53
+    // of those 64 DO distinguish them once `leaf_estimation_iterations > 1`,
+    // which is why the multi-step estimator rejects `AnyImprovement` outright
+    // rather than silently treating it as `No`: the step-shrinking SEARCH is not
+    // verified to parity, and accepting it would return a model the caller did
+    // not ask for. `Armijo` is GPU-only upstream and is REJECTED. So the
+    // parameter has real observable behaviour rather than being a no-op.
     "leaf_estimation_backtracking",
+    // `leaf_estimation_iterations`: the multi-step accumulate-and-recompute leaf
+    // estimator. `1` (the default) is the single closed-form step and leaves the
+    // loop byte-identical; `> 1` refines the leaf values and DECLINES the device
+    // grower (the loop lives in the CPU leaf-value section, which the device
+    // branch skips -- see `string_param_device_routing_test`).
+    "leaf_estimation_iterations",
     // Model shrinkage. `model_shrink_rate = 0` (the upstream default) is INERT
     // and leaves the boosting loop byte-identical; a non-zero rate multiplies the
     // whole accumulated model each iteration and declines the device grower.
@@ -1314,6 +1323,20 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "leaf_estimation_backtracking")? {
         builder = builder.leaf_estimation_backtracking(parse_leaf_backtracking(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "leaf_estimation_iterations")? {
+        // Upstream requires >= 1. Rejecting 0 here keeps the error at the surface,
+        // where the offending kwarg name is still in hand; the deeper
+        // `cb_train::validate_leaf_estimation_iterations` is the backstop for the
+        // Rust-native path, and additionally rejects the
+        // `AnyImprovement`/`Armijo` x `> 1` combinations.
+        if v == 0 {
+            return Err(CatBoostParameterError::new_err(
+                "parameter `leaf_estimation_iterations` = 0 is out of range; expected >= 1 \
+                 (upstream default 1)",
+            ));
+        }
+        builder = builder.leaf_estimation_iterations(v);
     }
     if let Some(v) = get_with_aliases::<f64>(params, py, "model_shrink_rate")? {
         // Upstream accepts [0, 1): a rate of 1 would annihilate the model every

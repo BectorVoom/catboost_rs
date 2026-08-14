@@ -45,12 +45,22 @@ def test_promoted_params_report_implemented(name):
     assert catboost_rs._param_status(name) == "IMPLEMENTED"
 
 
-def test_nan_mode_is_still_a_rejected_parity_gap():
-    """The promotion must not have loosened the honesty policy wholesale."""
-    assert catboost_rs._param_status("nan_mode") == "KNOWN_NOT_YET"
+def test_an_unimplemented_param_is_still_a_rejected_parity_gap():
+    """The promotion must not have loosened the honesty policy wholesale.
+
+    The witness used to be `nan_mode`, which the string-parameter wave then
+    IMPLEMENTED — so the witness moved rather than the policy. `sampling_unit` is
+    the replacement: genuinely unimplemented (its `Group` value needs group-aware
+    sampling this engine does not have), and therefore still a real gap.
+
+    If a later wave implements `sampling_unit` too, swap the witness again — do
+    not delete the test. What it guards is that SOME known-but-unimplemented
+    parameter is still refused at `fit`, which is the whole honesty policy.
+    """
+    assert catboost_rs._param_status("sampling_unit") == "KNOWN_NOT_YET"
     x, y = _toy_xy()
     with pytest.raises(CatBoostParameterError):
-        CatBoostRegressor(nan_mode="Min").fit(x, y)
+        CatBoostRegressor(sampling_unit="Object").fit(x, y)
 
 
 def test_scalar_categorical_params_are_accepted_at_fit():

@@ -88,12 +88,17 @@ def test_every_upstream_param_is_in_registry():
 
 
 def test_known_not_yet_param_rejected_as_parity_gap():
+    # The witness was `nan_mode` until the string-parameter wave IMPLEMENTED it.
+    # `sampling_unit` is genuinely still a gap (its `Group` value needs
+    # group-aware sampling this engine does not have). Swap the witness again
+    # when it too is implemented; what is being tested is the REJECTION SHAPE for
+    # a known-but-unimplemented parameter, not this particular name.
     x, y = _toy_xy()
-    model = CatBoostRegressor(nan_mode="Min")
+    model = CatBoostRegressor(sampling_unit="Object")
     with pytest.raises(CatBoostParameterError) as excinfo:
         model.fit(x, y)
     msg = str(excinfo.value)
-    assert "nan_mode" in msg
+    assert "sampling_unit" in msg
     assert "parity gap" in msg
 
 
@@ -118,7 +123,7 @@ def test_sklearn_aliases_resolve_and_fit_succeeds():
 def test_validation_fires_at_fit_not_init():
     # __init__ must do NO validation (D-06): constructing with a bad param is OK;
     # only fit() rejects it.
-    model = CatBoostRegressor(nan_mode="Min")  # no raise here
+    model = CatBoostRegressor(sampling_unit="Object")  # no raise here
     x, y = _toy_xy()
     with pytest.raises(CatBoostParameterError):
         model.fit(x, y)
