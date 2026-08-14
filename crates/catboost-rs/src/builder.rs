@@ -577,11 +577,25 @@ impl CatBoostBuilder {
         self
     }
 
-    // NOTE: no public `leaf_estimation_iterations` setter yet. The field is
-    // carried through to `ExtraBoostParams` but the leaf estimator does not read
-    // it, so exposing a setter would ship an inert knob — exactly the silent
-    // no-op the params registry's honesty policy exists to prevent. The setter
-    // lands together with the multi-step estimator.
+    /// How many refinement steps the leaf estimator takes per tree
+    /// (`leaf_estimation_iterations`, this port's canonical default `1`).
+    ///
+    /// Upstream runs the leaf solve N times, ACCUMULATING the per-leaf delta and
+    /// RECOMPUTING the derivatives at `approx + accumulated_delta` before each
+    /// further step. `1` is the single-step solve and is byte-identical to the
+    /// pre-existing behaviour.
+    ///
+    /// Values above `1` are implemented for the POINTWISE, single-dimension,
+    /// `SymmetricTree`, Gradient/Newton path. Grouped/ranking losses,
+    /// multi-dimension losses, `LeafMethod::Exact`, non-symmetric grow policies
+    /// and `monotone_constraints` are REFUSED at [`Self::fit`] rather than
+    /// silently running a single step — see
+    /// `cb_train::validate_leaf_estimation_iterations`.
+    #[must_use]
+    pub fn leaf_estimation_iterations(mut self, leaf_estimation_iterations: usize) -> Self {
+        self.leaf_estimation_iterations = leaf_estimation_iterations;
+        self
+    }
 
     /// Split-score function (`score_function`). [`EScoreFunction::Cosine`] is the
     /// catboost CPU default; [`EScoreFunction::L2`] is the variance-reduction

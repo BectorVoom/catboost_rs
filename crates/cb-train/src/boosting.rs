@@ -1508,6 +1508,72 @@ fn validate_ctr_types(params: &BoostParams) -> CbResult<()> {
     Ok(())
 }
 
+/// Coverage gate for `leaf_estimation_iterations > 1`.
+///
+/// Upstream's `CalcApproxDeltaSimple` runs the leaf solve N times, accumulating
+/// the per-leaf delta and RECOMPUTING the derivatives at
+/// `approx + accumulated_delta` before each step. This port implements that loop
+/// for the POINTWISE, SINGLE-DIMENSION, SYMMETRIC-tree, gradient-step path.
+///
+/// Everything else is refused rather than quietly running a single step:
+///
+/// - **grouped / ranking losses** recompute their derivatives through the
+///   `compute_gradients_grouped` seam over query spans, which the step loop does
+///   not drive;
+/// - **multi-dimension losses** (MultiClass and friends) solve the leaf either
+///   coupled (softmax Newton) or per-dimension over dimension-major slices, so
+///   the running delta would have to be threaded per dimension;
+/// - **`LeafMethod::Exact`** computes a leaf's exact optimum in one shot (a
+///   weighted quantile), not a step to iterate — upstream does not refine it;
+/// - **non-symmetric / Region grow policies** compute their leaf values on a
+///   different code path with its own leaf indexing;
+/// - **monotone constraints** insert an isotonic (PAVA) projection between the
+///   raw deltas and the leaf values, and where that projection belongs inside a
+///   multi-step loop is not pinned by any oracle here.
+///
+/// A single iteration (the default) is unaffected and stays byte-identical.
+fn validate_leaf_estimation_iterations(params: &BoostParams, has_groups: bool) -> CbResult<()> {
+    let iters = params.extra.leaf_estimation_iterations;
+    if iters == 0 {
+        return Err(CbError::OutOfRange(
+            "leaf_estimation_iterations must be >= 1 (0 would produce no leaf values)".to_owned(),
+        ));
+    }
+    if iters == 1 {
+        return Ok(());
+    }
+    let unsupported = if has_groups {
+        Some("a grouped / ranking loss")
+    } else if matches!(
+        params.loss,
+        Loss::MultiClass
+            | Loss::MultiClassOneVsAll
+            | Loss::MultiLogloss
+            | Loss::MultiCrossEntropy
+            | Loss::RmseWithUncertainty
+            | Loss::MultiQuantile { .. }
+    ) {
+        Some("a multi-dimension loss")
+    } else if matches!(params.leaf_method, LeafMethod::Exact) {
+        Some("leaf_estimation_method=Exact (a one-shot exact optimum, not an iterated step)")
+    } else if !matches!(params.grow_policy, EGrowPolicy::SymmetricTree) {
+        Some("a non-symmetric grow policy")
+    } else if !params.monotone_constraints.is_empty() {
+        Some("monotone_constraints")
+    } else {
+        None
+    };
+    if let Some(what) = unsupported {
+        return Err(CbError::Unsupported(format!(
+            "leaf_estimation_iterations = {iters} is not implemented for {what}; \
+             the multi-step leaf estimator covers the pointwise, single-dimension, \
+             SymmetricTree, Gradient/Newton path. Use leaf_estimation_iterations = 1 \
+             for this configuration."
+        )));
+    }
+    Ok(())
+}
+
 fn validate_leaf_method(loss: &Loss, method: LeafMethod) -> CbResult<()> {
     if matches!(method, LeafMethod::Exact)
         && !matches!(
@@ -3899,6 +3965,14 @@ fn train_inner<R: Runtime>(
     // compute the weighted median instead of that loss's true optimum, and an
     // Lq{q<2} Newton step would inject inf/NaN into the leaf denominator.
     validate_leaf_method(&params.loss, params.leaf_method)?;
+
+    // MULTI-STEP LEAF ESTIMATION coverage gate (`leaf_estimation_iterations`).
+    // The accumulate-and-recompute loop is implemented for the POINTWISE,
+    // single-dimension, oblivious, gradient-step path only. Every other family
+    // is REJECTED rather than silently running a single step, which would train
+    // a model the caller did not ask for — the same honesty rule the params
+    // registry applies to unimplemented kwargs.
+    validate_leaf_estimation_iterations(params, !ranking.group_id.is_empty())?;
 
     // Reject malformed / unsupported monotone_constraints up front (FEAT-03 /
     // D-6.6-07): each entry must be a valid direction {-1,0,+1}.
@@ -7204,7 +7278,7 @@ fn train_inner<R: Runtime>(
                     // Pointwise path: per-object weights (eff_weights == weights, D-04).
                     &eff_weights
                 };
-                let leaf_deltas = compute_leaf_deltas(
+                let mut leaf_deltas = compute_leaf_deltas(
                     params.leaf_method,
                     &params.loss,
                     &leaf_value_leaf_of,
@@ -7217,6 +7291,62 @@ fn train_inner<R: Runtime>(
                     n_leaves,
                     d,
                 );
+                // ─── MULTI-STEP LEAF ESTIMATION (`leaf_estimation_iterations`) ───
+                // Upstream's `CalcApproxDeltaSimple` runs the leaf solve N times,
+                // ACCUMULATING the per-leaf delta and RECOMPUTING the derivatives at
+                // `approx + accumulated_delta` before each further step. Step 0 above
+                // is the pre-existing single-step solve, so `iterations == 1` (the
+                // default) stays byte-identical — no extra gradient call, no extra
+                // allocation.
+                //
+                // `validate_leaf_estimation_iterations` has already refused every
+                // family this loop does not cover (grouped, multi-dimension, Exact,
+                // non-symmetric, monotone), so here the path is pointwise,
+                // single-dimension and symmetric: `approx_d` is the whole approx
+                // vector and the per-object weights are `weights`.
+                let leaf_steps = params.extra.leaf_estimation_iterations;
+                if leaf_steps > 1 {
+                    for _step in 1..leaf_steps {
+                        // The approximant this step's derivatives are taken at.
+                        let cur_approx: Vec<f64> = (0..n)
+                            .map(|i| {
+                                let base = approx_d.get(i).copied().unwrap_or(0.0);
+                                let acc = leaf_value_leaf_of
+                                    .get(i)
+                                    .and_then(|&l| leaf_deltas.get(l))
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                base + acc
+                            })
+                            .collect();
+                        let step_ders =
+                            runtime.compute_gradients(&params.loss, &cur_approx, target, 1)?;
+                        // Same weighting the pointwise gradient buffer uses.
+                        let step_weighted_der1: Vec<f64> = step_ders
+                            .der1
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &dv)| dv * weights.get(i).copied().unwrap_or(1.0))
+                            .collect();
+                        let step_deltas = compute_leaf_deltas(
+                            params.leaf_method,
+                            &params.loss,
+                            &leaf_value_leaf_of,
+                            &step_weighted_der1,
+                            &step_ders.der2,
+                            leaf_weights_for_deltas,
+                            &cur_approx,
+                            target,
+                            scaled_l2,
+                            n_leaves,
+                            d,
+                        );
+                        for (slot, add) in leaf_deltas.iter_mut().zip(step_deltas.iter()) {
+                            *slot += add;
+                        }
+                    }
+                }
+                let leaf_deltas = leaf_deltas;
                 // FEAT-03 monotone post-pass (D-6.6-06): project the RAW per-leaf
                 // deltas onto the monotone cone implied by `monotone_constraints`
                 // via the isotonic (PAVA) leaf-value pass

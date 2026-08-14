@@ -1,0 +1,38 @@
+{
+  "AnyImprovement_iters5_vs_iters1_max_abs_diff": 0.556314299557157,
+  "No_iters5_vs_iters1_max_abs_diff": 0.5541954155952173,
+  "anyimprovement_iters5_max_abs_prediction": 1.7614034602880333,
+  "backtracking_policies": [
+    "No",
+    "AnyImprovement"
+  ],
+  "catboost_version": "1.2.10",
+  "iteration_counts": [
+    1,
+    2,
+    5
+  ],
+  "no_iters5_max_abs_prediction": 1.7849892983221687,
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_method": "Newton",
+    "learning_rate": 0.3,
+    "loss_function": "Poisson",
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "policies_agree_at_one_iteration_max_abs_diff": 0.0,
+  "policies_differ_at_five_iterations_max_abs_diff": 0.2510531019784764,
+  "prediction_type": "RawFormulaVal",
+  "scenario": "leaf_estimation_iterations",
+  "seed": 20260814
+}
