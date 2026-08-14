@@ -1,0 +1,219 @@
+{
+  "base_params": {
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "catboost_version": "1.2.10",
+  "cells": {
+    "boosting_type__Ordered": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "boosting_type",
+      "subsample": null,
+      "value": "Ordered"
+    },
+    "boosting_type__Plain": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "boosting_type",
+      "subsample": null,
+      "value": "Plain"
+    },
+    "bootstrap_type__Bayesian": {
+      "bagging_temperature": 1.0,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "bootstrap_type",
+      "subsample": null,
+      "value": "Bayesian"
+    },
+    "bootstrap_type__Bernoulli": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "bootstrap_type",
+      "subsample": 0.8,
+      "value": "Bernoulli"
+    },
+    "bootstrap_type__MVS": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "bootstrap_type",
+      "subsample": 0.8,
+      "value": "MVS"
+    },
+    "bootstrap_type__No": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "bootstrap_type",
+      "subsample": null,
+      "value": "No"
+    },
+    "grow_policy__Depthwise": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "grow_policy",
+      "subsample": null,
+      "value": "Depthwise"
+    },
+    "grow_policy__Lossguide": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "grow_policy",
+      "subsample": null,
+      "value": "Lossguide"
+    },
+    "grow_policy__SymmetricTree": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "grow_policy",
+      "subsample": null,
+      "value": "SymmetricTree"
+    },
+    "leaf_estimation_method__Gradient": {
+      "bagging_temperature": null,
+      "corpus": "bin",
+      "loss_function": "RMSE",
+      "param": "leaf_estimation_method",
+      "subsample": null,
+      "value": "Gradient"
+    },
+    "leaf_estimation_method__Newton": {
+      "bagging_temperature": null,
+      "corpus": "bin",
+      "loss_function": "RMSE",
+      "param": "leaf_estimation_method",
+      "subsample": null,
+      "value": "Newton"
+    },
+    "leaf_estimation_method__Simple": {
+      "bagging_temperature": null,
+      "corpus": "bin",
+      "loss_function": "RMSE",
+      "param": "leaf_estimation_method",
+      "subsample": null,
+      "value": "Simple"
+    },
+    "loss_function__CrossEntropy": {
+      "bagging_temperature": null,
+      "corpus": "bin",
+      "loss_function": "CrossEntropy",
+      "param": "loss_function",
+      "subsample": null,
+      "value": "CrossEntropy"
+    },
+    "loss_function__LogCosh": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "LogCosh",
+      "param": "loss_function",
+      "subsample": null,
+      "value": "LogCosh"
+    },
+    "loss_function__Logloss": {
+      "bagging_temperature": null,
+      "corpus": "bin",
+      "loss_function": "Logloss",
+      "param": "loss_function",
+      "subsample": null,
+      "value": "Logloss"
+    },
+    "loss_function__MAE": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "MAE",
+      "param": "loss_function",
+      "subsample": null,
+      "value": "MAE"
+    },
+    "loss_function__RMSE": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "loss_function",
+      "subsample": null,
+      "value": "RMSE"
+    },
+    "score_function__Cosine": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "score_function",
+      "subsample": null,
+      "value": "Cosine"
+    },
+    "score_function__L2": {
+      "bagging_temperature": null,
+      "corpus": "reg",
+      "loss_function": "RMSE",
+      "param": "score_function",
+      "subsample": null,
+      "value": "L2"
+    }
+  },
+  "prediction_type": "RawFormulaVal",
+  "scenario": "string_param_matrix",
+  "seed": 20260814,
+  "skipped": {
+    "bootstrap_type__Poisson": "catboost/private/libs/options/bootstrap_options.cpp:29: Error: poisson bootstrap is not supported on CPU",
+    "grow_policy__Region": "catboost/private/libs/algo/greedy_tensor_search.cpp:1953: GrowPolicy Region is unimplemented for CPU.",
+    "score_function__LOOL2": "catboost/private/libs/options/oblivious_tree_options.cpp:146: Only Cosine and L2 score functions are supported for CPU.",
+    "score_function__NewtonCosine": "catboost/private/libs/options/oblivious_tree_options.cpp:146: Only Cosine and L2 score functions are supported for CPU.",
+    "score_function__NewtonL2": "catboost/private/libs/options/oblivious_tree_options.cpp:146: Only Cosine and L2 score functions are supported for CPU.",
+    "score_function__SatL2": "catboost/private/libs/options/oblivious_tree_options.cpp:146: Only Cosine and L2 score functions are supported for CPU.",
+    "score_function__SolarL2": "catboost/private/libs/options/oblivious_tree_options.cpp:146: Only Cosine and L2 score functions are supported for CPU."
+  },
+  "values_per_param": {
+    "boosting_type": [
+      "Ordered",
+      "Plain"
+    ],
+    "bootstrap_type": [
+      "Bayesian",
+      "Bernoulli",
+      "MVS",
+      "No"
+    ],
+    "grow_policy": [
+      "Depthwise",
+      "Lossguide",
+      "SymmetricTree"
+    ],
+    "leaf_estimation_method": [
+      "Gradient",
+      "Newton",
+      "Simple"
+    ],
+    "loss_function": [
+      "CrossEntropy",
+      "LogCosh",
+      "Logloss",
+      "MAE",
+      "RMSE"
+    ],
+    "score_function": [
+      "Cosine",
+      "L2"
+    ]
+  }
+}
