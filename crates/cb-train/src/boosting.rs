@@ -1571,6 +1571,42 @@ fn validate_leaf_estimation_iterations(params: &BoostParams, has_groups: bool) -
              for this configuration."
         )));
     }
+    // A step-SHRINKING policy at N > 1 is REFUSED: the multi-step estimator is
+    // implemented, but the backtracking SEARCH is not verified to the 1e-5 bar.
+    //
+    // What is known (measured against catboost 1.2.10 on the frozen
+    // `leaf_estimation_iterations/` Poisson+Newton fixture):
+    //
+    //   * The search must shrink the FIRST step too. Skipping it makes
+    //     `AnyImprovement` collapse onto `No` exactly — no later step ever
+    //     triggers the halving.
+    //   * A step that never improves is DROPPED (scale 0), not taken shrunk:
+    //     that is the only way catboost's Huber+Newton run can return the
+    //     all-zero model it does.
+    //   * With those two, a straightforward "halve while the objective does not
+    //     improve" search lands within 3.4e-5 at N=5 but 7.0e-2 at N=2 — close,
+    //     but not parity, so it is not shipped.
+    //
+    // The most likely remaining factor is that Poisson is an `IsStoreExpApprox`
+    // loss upstream (`cb_compute::Loss::Poisson`): catboost keeps the
+    // EXPONENTIATED approx for it, so both the objective value and the way a
+    // scaled step composes differ from the plain-approx form assumed here.
+    // Resolving that needs a fixture on a non-exp-approx loss that still fires
+    // the search non-degenerately — the sweep behind this fixture found none.
+    //
+    // Refusing is the honest behaviour: silently running `No` instead would
+    // train a different model than the caller asked for. At N == 1 every policy
+    // is allowed, because there the three are provably equivalent.
+    if params.extra.leaf_estimation_backtracking != cb_compute::LeafEstimationBacktracking::No {
+        return Err(CbError::Unsupported(format!(
+            "leaf_estimation_backtracking = {:?} with leaf_estimation_iterations = \
+             {iters} is not implemented (the multi-step estimator is; the step-shrinking \
+             SEARCH is not verified to parity). Use leaf_estimation_backtracking = No, \
+             or leaf_estimation_iterations = 1, where all three policies are provably \
+             equivalent.",
+            params.extra.leaf_estimation_backtracking
+        )));
+    }
     Ok(())
 }
 

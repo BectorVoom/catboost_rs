@@ -138,6 +138,97 @@ fn the_frozen_fixture_separates_one_iteration_from_five() {
 }
 
 // ---------------------------------------------------------------------------
+// The BACKTRACKING SEARCH, reachable only now that N > 1 exists
+// ---------------------------------------------------------------------------
+
+/// The step-shrinking SEARCH is not implemented, so a shrinking policy at N > 1
+/// is REFUSED rather than silently running `No` — which would train a different
+/// model than the caller asked for.
+///
+/// The `preds_AnyImprovement_*` fixtures are frozen and deliberately NOT
+/// asserted yet: they are what the search will be gated on. What the
+/// investigation established, recorded here so it is not re-derived:
+///
+/// - the search must shrink the FIRST step too (skipping it collapses
+///   `AnyImprovement` onto `No` exactly);
+/// - a step that never improves is DROPPED, not taken shrunk (that is the only
+///   way catboost's Huber run returns its all-zero model);
+/// - with both, a plain "halve while not improving" search reaches 3.4e-5 at
+///   N=5 but 7.0e-2 at N=2 — close, not parity.
+///
+/// The prime suspect is that Poisson is an `IsStoreExpApprox` loss upstream, so
+/// catboost keeps the EXPONENTIATED approx and a scaled step composes
+/// differently than the plain-approx form assumed.
+#[test]
+fn a_shrinking_policy_beyond_one_iteration_is_refused() {
+    // `Armijo` is refused earlier and for a DIFFERENT reason (GPU-only
+    // upstream), so it is covered by the backtracking suite, not here.
+    let pool = pool_of(load_x("X.npy"), load_y("y.npy"));
+    let err = builder(5, LeafEstimationBacktracking::AnyImprovement)
+        .fit(&pool)
+        .expect_err("a shrinking policy at N > 1 must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("leaf_estimation_backtracking"),
+        "the refusal must name the parameter; got: {msg}"
+    );
+}
+
+/// `AnyImprovement` is allowed at ONE iteration, where it is provably identical
+/// to `No` — so the refusal above cannot leak into the default path.
+#[test]
+fn every_policy_is_allowed_at_one_iteration() {
+    let pool = pool_of(load_x("X.npy"), load_y("y.npy"));
+    // Armijo is GPU-only upstream and refused independently of N.
+    let baseline = fit_and_predict(1, LeafEstimationBacktracking::No);
+    let policy = LeafEstimationBacktracking::AnyImprovement;
+    let model = builder(1, policy)
+        .fit(&pool)
+        .expect("one leaf iteration must accept AnyImprovement");
+    let preds = model.predict(&eval_pool()).expect("predict must succeed");
+    assert_eq!(
+        preds, baseline,
+        "{policy:?} must be identical to No at one leaf iteration"
+    );
+}
+
+/// The two policies must DIVERGE at N > 1 — that divergence is the only thing
+/// that can detect a missing backtracking search — while still agreeing at N = 1.
+#[test]
+fn the_policies_agree_at_one_iteration_and_diverge_beyond_it() {
+    let sep = |a: &[f64], b: &[f64]| -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    assert_eq!(
+        load_y("preds_No_1.npy"),
+        load_y("preds_AnyImprovement_1.npy"),
+        "the policies must coincide at one leaf iteration"
+    );
+    assert!(
+        sep(&load_y("preds_No_5.npy"), &load_y("preds_AnyImprovement_5.npy")) > TOL,
+        "the frozen catboost predictions must differ at five leaf iterations, else \
+         the backtracking search would be untestable once it is written"
+    );
+}
+
+/// `AnyImprovement` must not be the degenerate all-zero model here: an
+/// implementation that simply refused every step would match that, so the
+/// fixture would prove nothing about the search.
+#[test]
+fn the_backtracked_model_is_not_degenerate() {
+    let any = load_y("preds_AnyImprovement_5.npy");
+    let mag = any.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    assert!(
+        mag > 1e-6,
+        "AnyImprovement collapsed to all zeros (max |pred| = {mag}); every step was \
+         rejected, so this cannot distinguish a real search from a total refusal"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Coverage gate: refused rather than silently single-stepped
 // ---------------------------------------------------------------------------
 
