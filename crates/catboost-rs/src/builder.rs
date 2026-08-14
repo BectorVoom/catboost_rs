@@ -43,7 +43,8 @@ use cb_train::{
     permutation_count_default, score_function_default, simple_ctr_default,
     simple_ctr_priors_default, train_cat_with_eval_sets, train_with_eval_sets, BoostParams,
     CounterCalcMethod, EBoostingType, EBootstrapType, ECtrHistoryUnit, ECtrType,
-    EFinalCtrComputationMode, EGrowPolicy, EModelShrinkMode, EOverfittingDetectorType, EvalMetric,
+    EFinalCtrComputationMode, EGrowPolicy, EModelShrinkMode, EOverfittingDetectorType,
+    ESamplingFrequency, ESamplingUnit, EvalMetric,
     EvalMetricHistory, EvalSet,
 };
 
@@ -110,6 +111,10 @@ pub struct CatBoostBuilder {
     final_ctr_computation_mode: EFinalCtrComputationMode,
     /// The ordered-CTR history granularity (`ctr_history_unit`).
     ctr_history_unit: ECtrHistoryUnit,
+    /// The unit the bootstrap draws over (`sampling_unit`).
+    sampling_unit: ESamplingUnit,
+    /// How often the bootstrap sample is redrawn (`sampling_frequency`).
+    sampling_frequency: ESamplingFrequency,
     /// Whether an all-equal learn target is allowed (`allow_const_label`).
     allow_const_label: bool,
     /// The CTR-projection size penalty (`model_size_reg`).
@@ -351,6 +356,8 @@ impl CatBoostBuilder {
             random_score_type: ERandomScoreType::NormalWithModelSizeDecrease,
             final_ctr_computation_mode: EFinalCtrComputationMode::Default,
             ctr_history_unit: ECtrHistoryUnit::Sample,
+            sampling_unit: ESamplingUnit::Object,
+            sampling_frequency: ESamplingFrequency::PerTree,
             allow_const_label: false,
             model_size_reg: cb_train::model_size_reg_default(),
             save_snapshot: false,
@@ -693,6 +700,33 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn ctr_history_unit(mut self, ctr_history_unit: ECtrHistoryUnit) -> Self {
         self.ctr_history_unit = ctr_history_unit;
+        self
+    }
+
+    /// The unit the bootstrap sampler draws over (`sampling_unit`, catboost
+    /// default [`ESamplingUnit::Object`]).
+    ///
+    /// [`ESamplingUnit::Group`] is REFUSED at [`Self::fit`]: this engine's
+    /// sampler draws per OBJECT and has no group spans. On an ungrouped pool
+    /// upstream refuses it too, so the refusal is parity there; on a grouped pool
+    /// it is a real gap, refused rather than silently downgraded.
+    #[must_use]
+    pub fn sampling_unit(mut self, sampling_unit: ESamplingUnit) -> Self {
+        self.sampling_unit = sampling_unit;
+        self
+    }
+
+    /// How often the bootstrap sample is redrawn (`sampling_frequency`, catboost
+    /// default [`ESamplingFrequency::PerTree`] — which is what this engine does).
+    ///
+    /// [`ESamplingFrequency::PerTreeLevel`] is REFUSED at [`Self::fit`] **only
+    /// when the sampler actually draws**. Under `bootstrap_type = No` the two
+    /// frequencies are bit-identical (verified against catboost 1.2.10 at depths
+    /// 1, 2 and 4), so the value is accepted there rather than rejected for an
+    /// inert difference.
+    #[must_use]
+    pub fn sampling_frequency(mut self, sampling_frequency: ESamplingFrequency) -> Self {
+        self.sampling_frequency = sampling_frequency;
         self
     }
 
@@ -1131,6 +1165,8 @@ impl CatBoostBuilder {
                 random_score_type: self.random_score_type,
                 final_ctr_computation_mode: self.final_ctr_computation_mode,
                 ctr_history_unit: self.ctr_history_unit,
+                sampling_unit: self.sampling_unit,
+                sampling_frequency: self.sampling_frequency,
                 allow_const_label: self.allow_const_label,
                 model_size_reg: self.model_size_reg,
             },

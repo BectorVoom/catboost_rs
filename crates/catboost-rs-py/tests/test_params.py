@@ -87,18 +87,18 @@ def test_every_upstream_param_is_in_registry():
         assert status in ("IMPLEMENTED", "KNOWN_NOT_YET"), (name, status)
 
 
-def test_known_not_yet_param_rejected_as_parity_gap():
-    # The witness was `nan_mode` until the string-parameter wave IMPLEMENTED it.
-    # `sampling_unit` is genuinely still a gap (its `Group` value needs
-    # group-aware sampling this engine does not have). Swap the witness again
-    # when it too is implemented; what is being tested is the REJECTION SHAPE for
-    # a known-but-unimplemented parameter, not this particular name.
+def test_known_not_yet_param_rejected_as_parity_gap(unimplemented_param):
+    # What is tested is the REJECTION SHAPE for a known-but-unimplemented
+    # parameter, not any particular name — so the witness comes from the
+    # `unimplemented_param` fixture, which walks a candidate list. Naming one
+    # here made this test fail every time that parameter got implemented.
+    name, value = unimplemented_param
     x, y = _toy_xy()
-    model = CatBoostRegressor(sampling_unit="Object")
+    model = CatBoostRegressor(**{name: value})
     with pytest.raises(CatBoostParameterError) as excinfo:
         model.fit(x, y)
     msg = str(excinfo.value)
-    assert "sampling_unit" in msg
+    assert name in msg
     assert "parity gap" in msg
 
 
@@ -120,10 +120,11 @@ def test_sklearn_aliases_resolve_and_fit_succeeds():
     assert preds.shape == (4,)
 
 
-def test_validation_fires_at_fit_not_init():
+def test_validation_fires_at_fit_not_init(unimplemented_param):
     # __init__ must do NO validation (D-06): constructing with a bad param is OK;
-    # only fit() rejects it.
-    model = CatBoostRegressor(sampling_unit="Object")  # no raise here
+    # only fit() rejects it. Witness supplied by the fixture — see conftest.
+    name, value = unimplemented_param
+    model = CatBoostRegressor(**{name: value})  # no raise here
     x, y = _toy_xy()
     with pytest.raises(CatBoostParameterError):
         model.fit(x, y)

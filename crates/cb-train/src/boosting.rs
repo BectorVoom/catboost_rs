@@ -336,6 +336,158 @@ impl ECtrHistoryUnit {
     }
 }
 
+/// The unit the bootstrap sampler draws over (`sampling_unit`, `ESamplingUnit`).
+/// Legal values probed from the installed catboost 1.2.10 wheel: `Object`,
+/// `Group`.
+///
+/// `Object` is the default and is exactly what this engine's sampler already
+/// does — [`crate::bootstrap`] draws a keep-mask / weight per OBJECT.
+///
+/// # `Group` needs a group-aware sampler, which this engine does not have
+///
+/// `Group` draws once per QUERY GROUP and applies the result to every document
+/// in it, so a group is kept or dropped whole. That requires group spans in the
+/// sampler, which [`crate::bootstrap`] has no notion of.
+///
+/// Upstream refuses it too whenever the pool carries no groups:
+///
+/// ```text
+/// tensor_search_helpers.cpp:509: No groups in dataset. Please disable
+/// sampling or use per object sampling
+/// ```
+///
+/// so on an ungrouped pool the refusal here IS upstream's behaviour. On a
+/// GROUPED pool upstream does implement it and this engine does not — that
+/// residue is a real gap, and it is refused with a typed error rather than
+/// silently downgraded to per-object sampling (which would return a model the
+/// caller did not ask for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ESamplingUnit {
+    /// Per-object sampling — the default, and what this engine implements.
+    #[default]
+    Object,
+    /// Per-group sampling. REJECTED: needs a group-aware sampler.
+    Group,
+}
+
+impl ESamplingUnit {
+    /// Parse the upstream spelling (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "Object" => Some(Self::Object),
+            "Group" => Some(Self::Group),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Object => "Object",
+            Self::Group => "Group",
+        }
+    }
+
+    /// Every legal value.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Object, Self::Group]
+    }
+
+    /// Whether this engine implements the value.
+    #[must_use]
+    pub fn is_supported(self) -> bool {
+        matches!(self, Self::Object)
+    }
+}
+
+/// How often the bootstrap sample is REDRAWN (`sampling_frequency`,
+/// `ESamplingFrequency`). Legal values probed from the installed catboost
+/// 1.2.10 wheel: `PerTree`, `PerTreeLevel`.
+///
+/// # What the two mean, from `greedy_tensor_search.cpp`
+///
+/// `PerTree` (the default) calls `DoBootstrap(..., leavesCount = 1)` ONCE per
+/// tree, BEFORE the depth loop (`:1957-1959`); the level loop then only
+/// re-indexes the existing sample (`SampledDocs.UpdateIndices`).
+///
+/// `PerTreeLevel` instead calls `DoBootstrap(..., leavesCount = 1 << curDepth)`
+/// at the TOP OF EVERY LEVEL (`:1221-1222`), so a tree of depth `d` draws `d`
+/// independent samples instead of one.
+///
+/// # Inert without a draw — measured, not assumed
+///
+/// Under `bootstrap_type = No` there is no draw at all, so the two frequencies
+/// are BIT-IDENTICAL. Verified against catboost 1.2.10 at depths 1, 2 and 4:
+/// `max |diff| = 0` in every case. That is what makes `PerTree` safe to accept
+/// as this engine's behaviour, and it is pinned by
+/// `sampling_frequency_is_inert_without_a_draw`.
+///
+/// # Why `PerTreeLevel` is REFUSED rather than approximated
+///
+/// This engine calls [`crate::bootstrap`] exactly once per tree
+/// (`boosting.rs`, "Bootstrap / sampling (TRAIN-04): once per tree"), which IS
+/// `PerTree`. Implementing `PerTreeLevel` means moving the draw inside the
+/// level loop of every grower AND reproducing upstream's RNG draw ORDER
+/// exactly — and the order is not merely "one draw per level":
+///
+/// Measured against catboost 1.2.10 with `bootstrap_type=Bernoulli,
+/// subsample=0.7`, the two frequencies already differ at **depth 1**
+/// (`max |diff| = 3.88e-01`), where both make the SAME NUMBER of draws (one).
+/// So the divergence there is the draw's POSITION in the shared RNG stream
+/// relative to the other per-level consumers, not its count — which means a
+/// "just move the call into the loop" implementation would be wrong in a way no
+/// amount of care at the call site would fix.
+///
+/// Establishing that order needs the instrumented-CLI RNG-call-count workflow
+/// against a built catboost, which is its own investigation. Until then the
+/// value is REFUSED with a typed error: shipping a `PerTreeLevel` that redraws
+/// per level but lands on a different RNG phase would produce a plausible,
+/// silently non-parity model, which is strictly worse than refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ESamplingFrequency {
+    /// Draw ONCE per tree — the default, and what this engine implements.
+    #[default]
+    PerTree,
+    /// Redraw at every tree LEVEL. REFUSED: see the type doc.
+    PerTreeLevel,
+}
+
+impl ESamplingFrequency {
+    /// Parse the upstream spelling (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "PerTree" => Some(Self::PerTree),
+            "PerTreeLevel" => Some(Self::PerTreeLevel),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerTree => "PerTree",
+            Self::PerTreeLevel => "PerTreeLevel",
+        }
+    }
+
+    /// Every legal value.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::PerTree, Self::PerTreeLevel]
+    }
+
+    /// Whether this engine implements the value.
+    #[must_use]
+    pub fn is_supported(self) -> bool {
+        matches!(self, Self::PerTree)
+    }
+}
+
 /// Training knobs added after the original [`BoostParams`] surface was frozen,
 /// grouped into ONE `Default`-able struct.
 ///
@@ -397,6 +549,14 @@ pub struct ExtraBoostParams {
     /// `metric.cpp:7011`) because most metrics are undefined on a constant
     /// target; with the flag set it trains and predicts that constant.
     pub allow_const_label: bool,
+    /// `sampling_unit` — the unit the bootstrap draws over. Only `Object` is
+    /// implemented; `Group` needs a group-aware sampler. See [`ESamplingUnit`].
+    pub sampling_unit: ESamplingUnit,
+    /// `sampling_frequency` — how often the bootstrap sample is redrawn. Only
+    /// `PerTree` (the default, and what this engine does) is implemented. INERT
+    /// under `bootstrap_type = No`, where there is no draw to place — verified
+    /// against catboost 1.2.10 at three depths. See [`ESamplingFrequency`].
+    pub sampling_frequency: ESamplingFrequency,
 }
 
 impl Default for ExtraBoostParams {
@@ -413,6 +573,8 @@ impl Default for ExtraBoostParams {
             ctr_history_unit: ECtrHistoryUnit::Sample,
             model_size_reg: model_size_reg_default(),
             allow_const_label: false,
+            sampling_unit: ESamplingUnit::Object,
+            sampling_frequency: ESamplingFrequency::PerTree,
         }
     }
 }
@@ -4175,6 +4337,50 @@ fn train_inner<R: Runtime>(
              ctr_history_unit is unimplemented for task type CPU\"); only Sample \
              is supported",
             params.extra.ctr_history_unit.as_str()
+        )));
+    }
+
+    // `sampling_unit = Group` needs a group-aware sampler (`bootstrap()` draws
+    // per OBJECT and has no notion of group spans). On an UNGROUPED pool upstream
+    // refuses it too, so the refusal is parity there; on a grouped pool it is a
+    // real gap, refused rather than silently downgraded to per-object sampling —
+    // which would return a model the caller did not ask for.
+    if !params.extra.sampling_unit.is_supported() {
+        return Err(CbError::Unsupported(format!(
+            "sampling_unit = {} is not implemented (this engine's bootstrap draws \
+             per OBJECT and has no group spans). catboost 1.2.10 refuses it on an \
+             ungrouped pool too: \"No groups in dataset. Please disable sampling or \
+             use per object sampling\". Use sampling_unit = Object.",
+            params.extra.sampling_unit.as_str()
+        )));
+    }
+
+    // `sampling_frequency = PerTreeLevel` redraws the bootstrap at EVERY tree
+    // level; this engine draws once per tree, which is `PerTree`. Refused rather
+    // than approximated: measured against catboost 1.2.10 the two already diverge
+    // at DEPTH 1 (max |diff| = 3.88e-01 under Bernoulli/0.7), where both make the
+    // same single draw — so the difference is the draw's POSITION in the shared
+    // RNG stream, not its count, and a "move the call into the level loop"
+    // implementation would land on the wrong RNG phase and produce a plausible
+    // but non-parity model.
+    //
+    // The guard is skipped when the sampler makes NO draw, because the two
+    // frequencies are then BIT-IDENTICAL — verified against catboost 1.2.10 at
+    // depths 1, 2 and 4 (max |diff| = 0). Refusing an inert value would reject
+    // configurations this engine reproduces exactly.
+    if !params.extra.sampling_frequency.is_supported()
+        && !matches!(params.bootstrap_type, EBootstrapType::No)
+    {
+        return Err(CbError::Unsupported(format!(
+            "sampling_frequency = {} is not implemented for a DRAWING sampler \
+             (bootstrap_type = {:?}). This engine draws the bootstrap sample once \
+             per tree (= PerTree); PerTreeLevel redraws at every level, and \
+             reproducing it needs upstream's exact RNG draw ORDER — the two differ \
+             even at depth 1, where the draw COUNT is identical. Use \
+             sampling_frequency = PerTree, or bootstrap_type = No (under which the \
+             two are bit-identical and this value is accepted).",
+            params.extra.sampling_frequency.as_str(),
+            params.bootstrap_type
         )));
     }
 

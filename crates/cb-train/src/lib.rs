@@ -107,7 +107,8 @@ pub use boosting::{
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_ranking,
     train_with_snapshot,
     train_cat_with_eval_sets, train_with_eval, train_with_eval_sets, BoostParams, EBoostingType,
-    ECtrHistoryUnit, EFinalCtrComputationMode, EGrowPolicy, EModelShrinkMode, EvalSet,
+    ECtrHistoryUnit, EFinalCtrComputationMode, EGrowPolicy, EModelShrinkMode,
+    ESamplingFrequency, ESamplingUnit, EvalSet,
     ExtraBoostParams, Model, NonSymmetricTree,
     ObliviousTree, RankingData, RegionTree,
 };

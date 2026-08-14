@@ -15,6 +15,56 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _ORACLE_FIXTURES = _REPO_ROOT / "crates" / "cb-oracle" / "fixtures"
 
 
+#: Candidate witnesses for "a known CatBoost parameter this port has not implemented".
+#:
+#: Several honesty-policy tests need ONE such parameter to prove that a
+#: known-but-unimplemented kwarg is still refused at `fit`. Naming a specific
+#: parameter makes those tests break every time that parameter gets implemented —
+#: which has now happened THREE times (`nan_mode` -> `sampling_unit` -> here), each
+#: time a false failure that says nothing about the policy being tested.
+#:
+#: So the witness is CHOSEN AT RUNTIME from this list: the first entry the registry
+#: still reports as `KNOWN_NOT_YET`. Implementing one simply moves the tests to the
+#: next; implementing ALL of them skips them with a message rather than failing,
+#: because "nothing is unimplemented any more" is not a policy violation.
+#:
+#: Each entry must be a REAL upstream parameter (in the vocabulary) that this port
+#: genuinely does not implement — never a typo, which would be rejected by a
+#: different code path and make the test assert the wrong thing.
+_UNIMPLEMENTED_WITNESS_CANDIDATES = (
+    "rsm",
+    "input_borders",
+    "eval_fraction",
+    "used_ram_limit",
+    "class_names",
+)
+
+
+@pytest.fixture
+def unimplemented_param():
+    """A (name, value) pair for a parameter the port still reports as a parity gap.
+
+    Skips the test if every candidate has been implemented.
+    """
+    import catboost_rs
+
+    values = {
+        "rsm": 0.8,
+        "input_borders": "borders.tsv",
+        "eval_fraction": 0.2,
+        "used_ram_limit": "1gb",
+        "class_names": ["a", "b"],
+    }
+    for name in _UNIMPLEMENTED_WITNESS_CANDIDATES:
+        if catboost_rs._param_status(name) == "KNOWN_NOT_YET":
+            return name, values[name]
+    pytest.skip(
+        "every witness candidate is now IMPLEMENTED (%s) — add a new one to "
+        "_UNIMPLEMENTED_WITNESS_CANDIDATES in conftest.py if any known-but-"
+        "unimplemented parameter remains" % ", ".join(_UNIMPLEMENTED_WITNESS_CANDIDATES)
+    )
+
+
 @pytest.fixture
 def toy_regression():
     """A small C-contiguous float32 regression dataset.

@@ -1,0 +1,53 @@
+{
+  "catboost_version": "1.2.10",
+  "drawing_samplers": {
+    "Bayesian": {
+      "bagging_temperature": 1.0
+    },
+    "Bernoulli": {
+      "subsample": 0.7
+    },
+    "MVS": {
+      "subsample": 0.7
+    }
+  },
+  "group_sampling_unit_rejection": "catboost/private/libs/algo/tensor_search_helpers.cpp:509: No groups in dataset. Please disable sampling or use per object sampling",
+  "inert_without_draw_max_abs_diff": {
+    "depth_1": 0.0,
+    "depth_2": 0.0,
+    "depth_4": 0.0
+  },
+  "params": {
+    "boost_from_average": false,
+    "border_count": 32,
+    "depth": 3,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "pertreelevel_divergence_max_abs_diff": {
+    "bayesian_depth_1": 0.3994235911780892,
+    "bayesian_depth_3": 0.5424734959099793,
+    "bernoulli_depth_1": 0.046627248485057726,
+    "bernoulli_depth_3": 0.40850488632609105,
+    "mvs_depth_1": 0.5062060048987667,
+    "mvs_depth_3": 0.6464437851617486
+  },
+  "sampling_frequencies": [
+    "PerTree",
+    "PerTreeLevel"
+  ],
+  "sampling_units": [
+    "Object",
+    "Group"
+  ],
+  "scenario": "sampling",
+  "seed": 20260815
+}

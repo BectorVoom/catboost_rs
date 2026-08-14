@@ -60,7 +60,8 @@ use std::collections::BTreeMap;
 use catboost_rs::{
     parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
     EBootstrapType, EBorderSelectionType, ECtrType, EGrowPolicy, EOverfittingDetectorType,
-    ECtrHistoryUnit, EFinalCtrComputationMode, EModelShrinkMode, ERandomScoreType, EScoreFunction,
+    ECtrHistoryUnit, EFinalCtrComputationMode, EModelShrinkMode, ERandomScoreType,
+    ESamplingFrequency, ESamplingUnit, EScoreFunction,
     EvalMetric, LeafEstimationBacktracking, LeafMethod, Loss, NanMode,
 };
 use pyo3::prelude::*;
@@ -190,6 +191,17 @@ const IMPLEMENTED: &[&str] = &[
     // does not implement the other value on CPU either.
     "final_ctr_computation_mode",
     "ctr_history_unit",
+    // The sampling pair. `sampling_unit` accepts only `Object` (this engine's
+    // sampler draws per OBJECT and has no group spans; upstream refuses `Group`
+    // on an ungrouped pool too). `sampling_frequency` accepts `PerTree` -- what
+    // this engine does -- and additionally accepts `PerTreeLevel` when
+    // `bootstrap_type = No`, where the two are BIT-IDENTICAL (verified against
+    // catboost 1.2.10 at depths 1, 2 and 4). With a drawing sampler
+    // `PerTreeLevel` is refused: the two diverge even at depth 1, where the draw
+    // COUNT is identical, so the difference is RNG POSITION and cannot be
+    // reproduced by moving the call into the level loop.
+    "sampling_unit",
+    "sampling_frequency",
     // `allow_const_label`: a real behavioural gate — an all-equal learn target is
     // REFUSED unless this is set, mirroring upstream's `metric.cpp:7011`.
     "allow_const_label",
@@ -871,6 +883,24 @@ fn parse_ctr_history_unit(name: &str) -> PyResult<ECtrHistoryUnit> {
     })
 }
 
+/// Map a `sampling_unit` string onto an [`ESamplingUnit`].
+fn parse_sampling_unit(name: &str) -> PyResult<ESamplingUnit> {
+    ESamplingUnit::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown sampling_unit `{name}`; expected one of Object, Group"
+        ))
+    })
+}
+
+/// Map a `sampling_frequency` string onto an [`ESamplingFrequency`].
+fn parse_sampling_frequency(name: &str) -> PyResult<ESamplingFrequency> {
+    ESamplingFrequency::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown sampling_frequency `{name}`; expected one of PerTree, PerTreeLevel"
+        ))
+    })
+}
+
 /// Map a `random_score_type` string onto an [`ERandomScoreType`].
 fn parse_random_score_type(name: &str) -> PyResult<ERandomScoreType> {
     ERandomScoreType::parse(name).ok_or_else(|| {
@@ -1320,6 +1350,12 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "nan_mode")? {
         builder = builder.nan_mode(parse_nan_mode(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "sampling_unit")? {
+        builder = builder.sampling_unit(parse_sampling_unit(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "sampling_frequency")? {
+        builder = builder.sampling_frequency(parse_sampling_frequency(&v)?);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "leaf_estimation_backtracking")? {
         builder = builder.leaf_estimation_backtracking(parse_leaf_backtracking(&v)?);

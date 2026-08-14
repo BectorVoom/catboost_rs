@@ -79,7 +79,7 @@ pub use cb_train::{CounterCalcMethod, ECtrType};
 // caller would have to reconstruct the parametric variants by hand.
 pub use cb_train::{
     parse_metric, EBoostingType, ECtrHistoryUnit, EFinalCtrComputationMode, EGrowPolicy,
-    EModelShrinkMode, EOverfittingDetectorType, EvalMetric,
+    EModelShrinkMode, EOverfittingDetectorType, ESamplingFrequency, ESamplingUnit, EvalMetric,
 };
 
 // Re-export the Pool ingestion surface (the `fit`/predict input) from the
