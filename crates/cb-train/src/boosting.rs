@@ -5077,6 +5077,13 @@ fn train_inner<R: Runtime>(
         // shrink is applied device-side; `model_shrink_rate = 0.0` (the default)
         // leaves every existing device fit eligible exactly as before.
         && params.extra.model_shrink_rate == 0.0
+        // MULTI-STEP LEAF ESTIMATION declines to the CPU grower. The
+        // accumulate-and-recompute loop lives in the CPU leaf-value section, which
+        // the device branch skips entirely (it `continue`s above) — so a device fit
+        // would silently take ONE step and ignore the parameter, returning a model
+        // the caller did not ask for. `leaf_estimation_iterations == 1` (the
+        // default) leaves every existing device fit eligible exactly as before.
+        && params.extra.leaf_estimation_iterations == 1
         // FPP-20 (T23): the former `ordered_learning_perm.is_none()` clause is GONE. It was
         // the host half of the ordered decline — the session-side gate was the other half —
         // and it existed because the device had no way to score a candidate over the fold's

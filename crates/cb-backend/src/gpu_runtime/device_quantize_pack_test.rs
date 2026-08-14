@@ -41,15 +41,33 @@ fn synth_borders(count: usize) -> Vec<f64> {
 /// `cb_train::boosting::quantize_feature_major` performs (that fn is not reachable
 /// from this crate; the expression is small enough that replicating it here is the
 /// oracle, with the comparison done in f64 exactly like the host).
+///
+/// Including the host's `nan_to_top_bin` branch: a trailing `f32::MAX` border is
+/// upstream's `nan_mode=Max` sentinel, and a NaN then belongs in the TOP bin rather
+/// than in bin 0. Replicating that here is what makes this oracle able to catch a
+/// device kernel that ignores the sentinel.
 fn host_quantize(columns: &[Vec<f32>], borders: &[Vec<f64>], n: usize) -> Vec<u32> {
     let mut bins = vec![0u32; columns.len() * n];
     for (f, col) in columns.iter().enumerate() {
         let b = &borders[f];
+        let nan_to_top_bin = b.last().is_some_and(|&x| x == f64::from(f32::MAX));
         for (i, &v) in col.iter().enumerate() {
-            bins[f * n + i] = b.partition_point(|&bb| f64::from(v) > bb) as u32;
+            let value = f64::from(v);
+            bins[f * n + i] = if nan_to_top_bin && value.is_nan() {
+                b.len() as u32
+            } else {
+                b.partition_point(|&bb| value > bb) as u32
+            };
         }
     }
     bins
+}
+
+/// `synth_borders` with upstream's `nan_mode=Max` SENTINEL appended.
+fn synth_borders_with_nan_sentinel(count: usize) -> Vec<f64> {
+    let mut b = synth_borders(count);
+    b.push(f64::from(f32::MAX));
+    b
 }
 
 /// Host `plan_cindex` and the packer's own geometry can never disagree: the TCFeature
@@ -136,4 +154,70 @@ fn device_quantize_pack_words_are_bit_identical_to_host_pipeline() {
             i % n
         );
     }
+}
+
+/// `nan_mode=Max` on the RAW device channel. Upstream encodes the NaN treatment in
+/// the border list itself — an appended `f32::MAX` SENTINEL — and a NaN must then
+/// land in the TOP bin. The device kernel's bin is a count of `v > borders[k]`, and
+/// IEEE makes every one of those compares false for a NaN, so the natural device
+/// answer is bin 0: the `nan_mode=Min` answer, for a caller who asked for `Max`.
+///
+/// This is not hypothetical. The raw channel is offered on exactly the float-only
+/// SymmetricTree pool a NaN column routes through, and until the kernel's
+/// `nan_to_top` branch existed a device `Max` fit silently trained a `Min` model
+/// while the CPU path (already sentinel-aware) trained the right one — the two
+/// diverging with no error raised anywhere.
+///
+/// Both directions are pinned: the sentinel column must match the host, AND the two
+/// modes must actually DISAGREE on the NaN rows. Without the second assertion a
+/// kernel that ignored the sentinel entirely would still pass a host comparison run
+/// against an equally-broken oracle.
+#[test]
+fn nan_sentinel_column_bins_to_the_top_on_the_device() {
+    let device = <crate::SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <crate::SelectedRuntime as cubecl::Runtime>::client(&device);
+
+    let n = 512usize;
+    let n_features = 4usize;
+    let n_bins_line = 64usize; // 6 bits: comfortably above the 21 bins used here
+    let n_buckets = vec![n_bins_line; n_features];
+    let one_hot = vec![false; n_features];
+
+    // Every column carries NaNs (every 5th row) so the sentinel branch is exercised
+    // across word groups, not just in one isolated feature.
+    let columns: Vec<Vec<f32>> = (0..n_features)
+        .map(|f| synth_column(n, 7000 + f as u32, 5))
+        .collect();
+
+    let borders_min: Vec<Vec<f64>> = (0..n_features).map(|_| synth_borders(20)).collect();
+    let borders_max: Vec<Vec<f64>> = (0..n_features)
+        .map(|_| synth_borders_with_nan_sentinel(20))
+        .collect();
+
+    let plan = plan_cindex(&n_buckets, &one_hot, n).unwrap();
+
+    let mut device_by_mode = Vec::new();
+    for borders in [&borders_min, &borders_max] {
+        let host_packed =
+            pack_cindex(&host_quantize(&columns, borders, n), &n_buckets, &one_hot, n).unwrap();
+        let words_h = fill_packed_cindex_on_device(&client, &columns, borders, &plan, n).unwrap();
+        let bytes = client.read_one(words_h).unwrap();
+        let device_words: &[u32] = bytemuck::cast_slice(&bytes);
+        assert_eq!(
+            device_words,
+            &host_packed.words[..],
+            "device quantize+pack diverges from the sentinel-aware host oracle"
+        );
+        device_by_mode.push(device_words.to_vec());
+    }
+
+    // Discrimination: Min and Max must produce DIFFERENT packed words. If they
+    // coincide, the sentinel is being ignored on both sides and the equality above
+    // proves nothing.
+    assert_ne!(
+        device_by_mode[0], device_by_mode[1],
+        "nan_mode Min and Max produced identical packed cindex words — the f32::MAX \
+         sentinel is not reaching the device quantizer, so the equality assertions \
+         above are vacuous"
+    );
 }

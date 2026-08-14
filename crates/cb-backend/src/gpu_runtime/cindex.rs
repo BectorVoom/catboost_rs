@@ -468,6 +468,11 @@ pub(crate) fn fill_packed_cindex_on_device(
         let col_h = client.create_from_slice(bytemuck::cast_slice(col));
         let borders_f32: Vec<f32> = bord.iter().map(|&b| b as f32).collect();
         let n_borders = borders_f32.len();
+        // Mirror of the host `quantize_feature_major`'s `nan_to_top_bin`: a trailing
+        // `f32::MAX` border is upstream's `nan_mode=Max` SENTINEL, and it is the only
+        // signal the quantizer gets that NaNs belong in the top bin. Computed from the
+        // SAME predicate on the SAME border list, so the two channels cannot drift.
+        let nan_to_top = u32::from(bord.last().is_some_and(|&b| b == f64::from(f32::MAX)));
         // A zero-length device read is never issued: an empty border list still
         // launches (bin is constantly 0 and the field must be stored/OR-merged), so
         // give the kernel a 1-element dummy border buffer it will never loop over.
@@ -504,6 +509,7 @@ pub(crate) fn fill_packed_cindex_on_device(
             group_offset,
             shift,
             init_word,
+            nan_to_top,
         );
     }
     if prof {

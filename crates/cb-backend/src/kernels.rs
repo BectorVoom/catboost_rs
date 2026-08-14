@@ -2824,11 +2824,19 @@ pub fn read_all_bins_kernel<F: Float>(
 ///
 /// The bin is the border count `#{k : v > borders[k]}` — EXACTLY the host
 /// `partition_point(|&b| v > b)` over the same ascending borders (the linear scan
-/// and the binary search count the identical monotone predicate; NaN compares
-/// false against every border → bin 0, matching the host's NaN → 0). The host
+/// and the binary search count the identical monotone predicate). The host
 /// guarantees each f64 border round-trips through f32 exactly before launching
 /// (they are `f64::from(f32)` midpoints by construction), so the f32 compare here
 /// is bit-equivalent to the host's f64 compare.
+///
+/// `nan_to_top == 1` mirrors the host `quantize_feature_major`'s `nan_to_top_bin`:
+/// under `nan_mode=Max` upstream appends an `f32::MAX` SENTINEL border, and a NaN
+/// must land in the TOP bin (`n_borders`). IEEE makes every `NaN > b` false, so the
+/// plain count would give bin 0 — which is the `nan_mode=Min` answer. Without this
+/// branch the raw device channel (float-only + SymmetricTree — exactly where a NaN
+/// column routes) silently trained a `Min` model for a caller who asked for `Max`.
+/// The host passes 0 for `Min` (the catboost default) and for every NaN-free
+/// column, leaving the kernel byte-identical to before on all existing fits.
 ///
 /// `init_word == 1` marks the FIRST feature of its group: it STOREs the field,
 /// initializing the whole word column (so the device buffer needs no zero-fill
@@ -2851,6 +2859,7 @@ pub fn quantize_pack_feature_kernel<F: Float>(
     group_offset: u32,
     shift: u32,
     init_word: u32,
+    nan_to_top: u32,
 ) {
     // SPD-03 wave 3: `values` is the ONE feature-major matrix upload (this feature's
     // column is the `n_objects` window at `col_offset`), so the host makes a single
@@ -2866,9 +2875,34 @@ pub fn quantize_pack_feature_kernel<F: Float>(
     if obj < n {
         let v = values[col_offset as usize + obj];
         let mut bin = 0u32;
-        for k in 0..nb {
-            if v > borders[k] {
-                bin += 1;
+        if nan_to_top == 1 {
+            // The `nan_mode=Max` sentinel column. Count the COMPLEMENT `!(v <= b)`
+            // instead of `v > b`: for every non-NaN value the two predicates are
+            // exact complements, so ordinary rows bin byte-identically to the branch
+            // below — but for a NaN every `v <= b` is false, so the count runs to
+            // `n_borders`, the TOP bin, which is exactly what `Max` asks for.
+            //
+            // Expressed as a comparison complement rather than an `is_nan` test on
+            // purpose: a generic `F::is_nan` returns `<F as CubePrimitive>::
+            // WithScalar<bool>` (a possibly-vectorized bool), not a plain `bool`, so
+            // it cannot gate a `#[cube]` `if` without pinning `F` to a scalar type
+            // and breaking the generics-float rule.
+            // `neg_cmp_op_on_partial_ord` fires here and is describing the mechanism
+            // rather than a mistake: the lint warns that the two values may be
+            // INCOMPARABLE, and that incomparability is precisely what this branch
+            // exists to detect. Rewriting it via `partial_cmp` would make the NaN case
+            // explicit at the cost of a `#[cube]`-hostile `Option` match.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            for k in 0..nb {
+                if !(v <= borders[k]) {
+                    bin += 1;
+                }
+            }
+        } else {
+            for k in 0..nb {
+                if v > borders[k] {
+                    bin += 1;
+                }
             }
         }
         let idx = group_offset as usize + obj;
