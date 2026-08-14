@@ -386,6 +386,77 @@ mod device {
         );
     }
 
+    /// EVERY `feature_border_type` must produce the same model on the device as on
+    /// the CPU. The parameter never reaches `cb-train` as a flag — it reaches it only
+    /// as BORDER VALUES — so "does it decline" is the wrong question and a
+    /// differential is the only honest one.
+    ///
+    /// It is not a formality. The raw device channel requires each border to
+    /// round-trip `f64 -> f32 -> f64` EXACTLY and declines otherwise, and the seven
+    /// types build their borders by three different midpoint formulas over different
+    /// value sets. A type whose borders fail the round-trip falls back to the
+    /// host-quantize channel — correct, but a DIFFERENT path — and a type whose
+    /// borders pass it exercises the on-GPU quantizer. This asserts the model is the
+    /// same either way, so which path a type takes stays an implementation detail
+    /// rather than a silent behaviour change.
+    pub fn every_border_type_matches_cpu_on_device() {
+        let (cols, _, target) = corpus();
+        let weights = vec![1.0_f64; target.len()];
+        let params = base_params();
+
+        for border_type in cb_data::EBorderSelectionType::all() {
+            let borders: Vec<Vec<f64>> = cols
+                .iter()
+                .map(|c| cb_data::select_borders_f32(c, 32, border_type, false))
+                .collect();
+            // A border type that produced NO borders would make every fit trivially
+            // agree; that is a vacuous cell, not a passing one.
+            assert!(
+                borders.iter().any(|b| !b.is_empty()),
+                "{border_type:?} produced no borders on this corpus — the comparison \
+                 below would be vacuous"
+            );
+
+            let gpu = CountingGpu::new();
+            let device_model = train(&gpu, &cols, &borders, &target, &weights, &params, None)
+                .unwrap_or_else(|e| panic!("{border_type:?}: device fit failed: {e}"));
+            assert_eq!(
+                gpu.grown.get(),
+                params.iterations,
+                "{border_type:?}: a border choice must not change device routing"
+            );
+
+            let cpu_model = train(
+                &HostOnly(GpuBackend::default()),
+                &cols,
+                &borders,
+                &target,
+                &weights,
+                &params,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{border_type:?}: CPU baseline fit failed: {e}"));
+
+            let d: Vec<f64> = device_model
+                .oblivious_trees
+                .iter()
+                .flat_map(|t| t.leaf_values.iter().copied())
+                .collect();
+            let c: Vec<f64> = cpu_model
+                .oblivious_trees
+                .iter()
+                .flat_map(|t| t.leaf_values.iter().copied())
+                .collect();
+            assert_eq!(d.len(), c.len(), "{border_type:?}: model shape differs");
+            for (i, (dv, cv)) in d.iter().zip(c.iter()).enumerate() {
+                assert!(
+                    (dv - cv).abs() <= 1e-9,
+                    "{border_type:?} leaf {i}: device {dv} vs CPU {cv}"
+                );
+            }
+        }
+    }
+
     /// `random_score_type` is only consulted when `random_strength != 0`, and a
     /// non-zero strength already declines — so the score type can never reach the
     /// device path. Pinned so a future relaxation of the random_strength clause
@@ -436,6 +507,10 @@ device_test!(
 device_test!(
     non_grow_params_stay_device_eligible,
     device::non_grow_params_stay_device_eligible
+);
+device_test!(
+    every_border_type_matches_cpu_on_device,
+    device::every_border_type_matches_cpu_on_device
 );
 device_test!(
     random_score_type_is_unreachable_on_device,
