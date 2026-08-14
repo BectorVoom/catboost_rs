@@ -138,6 +138,7 @@ fn device_params() -> BoostParams {
         grow_policy: grow_policy_default(),
         max_leaves: max_leaves_default(),
         min_data_in_leaf: min_data_in_leaf_default(),
+        extra: Default::default(),
     }
 }
 

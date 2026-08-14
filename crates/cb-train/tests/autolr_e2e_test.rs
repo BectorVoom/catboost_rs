@@ -118,6 +118,7 @@ fn run_autolr_e2e(
         od_wait: 0,
         use_best_model: false,
         eval_metric: None,
+        extra: Default::default(),
     };
 
     let mut staged = Vec::new();

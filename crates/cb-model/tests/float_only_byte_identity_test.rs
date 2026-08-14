@@ -104,6 +104,7 @@ fn pinned_float_only_params() -> BoostParams {
         grow_policy: EGrowPolicy::SymmetricTree,
         max_leaves: cb_train::max_leaves_default(),
         min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+        extra: Default::default(),
     }
 }
 

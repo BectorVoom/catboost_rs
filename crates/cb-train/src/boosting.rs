@@ -161,6 +161,122 @@ pub fn min_data_in_leaf_default() -> usize {
     1
 }
 
+/// How the per-iteration model shrinkage decays (`model_shrink_mode`,
+/// `EModelShrinkMode`). Legal values probed from the installed catboost 1.2.10
+/// wheel: `Constant`, `Decreasing`.
+///
+/// Shrinkage multiplies the ENTIRE accumulated model — the bias and every
+/// already-grown tree's leaf values — before each new tree is grown. The two
+/// modes differ only in the multiplier used at iteration `i` (1-based, counting
+/// the shrink applications, so the first tree is never shrunk):
+///
+/// | mode         | per-iteration multiplier         |
+/// |--------------|----------------------------------|
+/// | `Constant`   | `1 - model_shrink_rate * learning_rate` |
+/// | `Decreasing` | `1 - model_shrink_rate / i`      |
+///
+/// Both forms are derived from catboost 1.2.10's own leaf values: at
+/// `rate = 0.1`, `learning_rate = 0.3`, 5 iterations, tree 0's leaves come back
+/// scaled by `0.97^4 = 0.88529` under `Constant` and by
+/// `0.9 * 0.95 * 0.96667 * 0.975 = 0.80583` under `Decreasing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EModelShrinkMode {
+    /// `1 - rate * learning_rate` every iteration — the upstream default.
+    #[default]
+    Constant,
+    /// `1 - rate / i` at iteration `i`, so the shrink weakens over time.
+    Decreasing,
+}
+
+impl EModelShrinkMode {
+    /// Parse the upstream spelling (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "Constant" => Some(Self::Constant),
+            "Decreasing" => Some(Self::Decreasing),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Constant => "Constant",
+            Self::Decreasing => "Decreasing",
+        }
+    }
+
+    /// Every legal value, in the order the wheel's enum parser lists them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Constant, Self::Decreasing]
+    }
+
+    /// The multiplier applied to the whole accumulated model before growing the
+    /// tree at 1-based shrink step `i` (`i >= 1`).
+    #[must_use]
+    pub fn multiplier(self, rate: f64, learning_rate: f64, i: usize) -> f64 {
+        match self {
+            Self::Constant => 1.0 - rate * learning_rate,
+            // `i >= 1` at every call site; the guard keeps a hypothetical 0 from
+            // producing an infinity rather than panicking.
+            Self::Decreasing => 1.0 - rate / (i.max(1) as f64),
+        }
+    }
+}
+
+/// Training knobs added after the original [`BoostParams`] surface was frozen,
+/// grouped into ONE `Default`-able struct.
+///
+/// # Why these are grouped rather than top-level fields
+///
+/// `BoostParams` is built as a STRUCT LITERAL at 211 sites across 103 files.
+/// That is deliberate — the codebase's parity discipline is that every
+/// parameter is "pinned EXPLICITLY at every construction site, never
+/// auto-selected" (RESEARCH Pitfall 6), which is what stops a knob from
+/// silently taking a value that differs from upstream. The cost is that each
+/// new top-level field is a 211-site edit.
+///
+/// Grouping pays that cost ONCE: a construction site names
+/// `extra: ExtraBoostParams::default()`, and every later parameter adds a field
+/// HERE without touching a single site. The explicit opt-in survives at the
+/// group level, and each field below documents its own canonical upstream
+/// default — so a reader can still see what is being pinned and to what.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtraBoostParams {
+    /// `model_shrink_rate` — the per-iteration shrinkage applied to the whole
+    /// accumulated model. `0.0` (the upstream default) disables shrinkage
+    /// entirely and keeps the boosting loop byte-identical.
+    pub model_shrink_rate: f64,
+    /// `model_shrink_mode` — how that shrinkage decays. Inert while
+    /// [`Self::model_shrink_rate`] is `0.0`.
+    pub model_shrink_mode: EModelShrinkMode,
+    /// `leaf_estimation_iterations` — how many refinement steps the leaf
+    /// estimator takes per tree. `1` is this port's canonical default (upstream
+    /// picks a per-loss default; the fixtures pin it explicitly).
+    pub leaf_estimation_iterations: usize,
+    /// `leaf_estimation_backtracking` — the step-shrinking policy applied
+    /// BETWEEN those refinement steps. Inert at
+    /// `leaf_estimation_iterations == 1` (there is no earlier step to fall back
+    /// to); see [`cb_compute::LeafEstimationBacktracking`].
+    pub leaf_estimation_backtracking: cb_compute::LeafEstimationBacktracking,
+}
+
+impl Default for ExtraBoostParams {
+    fn default() -> Self {
+        Self {
+            model_shrink_rate: 0.0,
+            model_shrink_mode: EModelShrinkMode::Constant,
+            // NOT `usize::default()` — a zero-iteration leaf estimator would
+            // produce no leaf values at all.
+            leaf_estimation_iterations: 1,
+            leaf_estimation_backtracking: cb_compute::LeafEstimationBacktracking::AnyImprovement,
+        }
+    }
+}
+
 /// Parameters for the plain boosting loop (the D-07 simplified isolating set).
 ///
 /// No longer `Copy`: the CTR config carries an owned `Vec<f64>` of explicit
@@ -402,6 +518,12 @@ pub struct BoostParams {
     /// ([`min_data_in_leaf_default`] = `1`, every leaf splittable — the symmetric
     /// path is byte-identical at the default).
     pub min_data_in_leaf: usize,
+    /// Knobs added after this struct's original surface was frozen, grouped so a
+    /// new parameter does not require editing all 211 construction sites — see
+    /// [`ExtraBoostParams`] for the rationale. `ExtraBoostParams::default()`
+    /// leaves every one of them at its canonical upstream default, so the
+    /// boosting loop stays byte-identical.
+    pub extra: ExtraBoostParams,
 }
 
 /// The canonical default `feature_weights` (EMPTY — every float feature weight is

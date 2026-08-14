@@ -106,8 +106,9 @@ pub use boosting::{
     permutation_count_default, score_function_default,
     simple_ctr_default, simple_ctr_priors_default, train, train_cat, train_ranking,
     train_with_snapshot,
-    train_cat_with_eval_sets, train_with_eval, train_with_eval_sets, BoostParams, EBoostingType, EGrowPolicy, EvalSet, Model,
-    NonSymmetricTree, ObliviousTree, RankingData, RegionTree,
+    train_cat_with_eval_sets, train_with_eval, train_with_eval_sets, BoostParams, EBoostingType,
+    EGrowPolicy, EModelShrinkMode, EvalSet, ExtraBoostParams, Model, NonSymmetricTree,
+    ObliviousTree, RankingData, RegionTree,
 };
 pub use tree::{
     check_depth, greedy_tensor_search_oblivious, greedy_tensor_search_oblivious_ordered,

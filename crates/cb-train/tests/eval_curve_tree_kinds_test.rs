@@ -89,6 +89,7 @@ fn params(grow_policy: EGrowPolicy, iterations: usize, use_best_model: bool) -> 
         grow_policy,
         max_leaves: cb_train::max_leaves_default(),
         min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+        extra: Default::default(),
     }
 }
 

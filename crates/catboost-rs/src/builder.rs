@@ -928,6 +928,7 @@ impl CatBoostBuilder {
             grow_policy: self.grow_policy,
             max_leaves: self.max_leaves,
             min_data_in_leaf: self.min_data_in_leaf,
+            extra: Default::default(),
         }
     }
 

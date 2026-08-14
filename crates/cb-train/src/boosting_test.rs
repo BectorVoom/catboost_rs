@@ -639,6 +639,7 @@ fn e02_params(simple: crate::ctr::ECtrType, combos: crate::ctr::ECtrType) -> cra
         grow_policy: crate::grow_policy_default(),
         max_leaves: crate::max_leaves_default(),
         min_data_in_leaf: crate::min_data_in_leaf_default(),
+        extra: Default::default(),
     }
 }
 

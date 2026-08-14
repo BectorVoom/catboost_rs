@@ -107,6 +107,7 @@ fn train_scenario(
         grow_policy: cb_train::grow_policy_default(),
         max_leaves: cb_train::max_leaves_default(),
         min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+        extra: Default::default(),
     };
 
     let mut staged = Vec::new();
@@ -210,6 +211,7 @@ fn check_scenario_first_trees(
         grow_policy: cb_train::grow_policy_default(),
         max_leaves: cb_train::max_leaves_default(),
         min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+        extra: Default::default(),
     };
     let model = train(&CpuBackend, &columns, &borders, &target, &[], &params, None).unwrap();
 

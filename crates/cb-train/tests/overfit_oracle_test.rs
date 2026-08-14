@@ -208,6 +208,7 @@ fn train_overfit(cfg: &OverfitConfig) -> (cb_train::Model, Vec<f64>) {
         grow_policy: cb_train::grow_policy_default(),
         max_leaves: cb_train::max_leaves_default(),
         min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+        extra: Default::default(),
     };
 
     let eval = EvalSet {

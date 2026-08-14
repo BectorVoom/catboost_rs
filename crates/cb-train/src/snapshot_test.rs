@@ -256,6 +256,7 @@ fn base_params() -> BoostParams {
         grow_policy: crate::EGrowPolicy::SymmetricTree,
         max_leaves: crate::max_leaves_default(),
         min_data_in_leaf: 1,
+        extra: Default::default(),
     }
 }
 

@@ -74,6 +74,7 @@ fn sampled_params(grow_policy: EGrowPolicy, bootstrap_type: EBootstrapType) -> B
         grow_policy,
         max_leaves: cb_train::max_leaves_default(),
         min_data_in_leaf: cb_train::min_data_in_leaf_default(),
+        extra: Default::default(),
     }
 }
 
