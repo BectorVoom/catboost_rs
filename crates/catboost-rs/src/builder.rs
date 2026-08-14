@@ -29,7 +29,9 @@ use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
     LeafMethod, Loss,
 };
-use cb_data::{select_borders_greedy_logsum_f32, AutoClassWeights, Pool, QuantizeParams};
+use cb_data::{
+    select_borders_greedy_logsum_f32, AutoClassWeights, EBorderSelectionType, Pool, QuantizeParams,
+};
 use rayon::prelude::*;
 use cb_train::{
     boosting_type_default, combinations_ctr_default, combinations_ctr_priors_default,
@@ -84,6 +86,9 @@ pub struct CatBoostBuilder {
     bagging_temperature: f32,
     random_seed: u64,
     border_count: usize,
+    /// The `feature_border_type` binarizer. Only observable when `border_count`
+    /// binds — see [`CatBoostBuilder::feature_border_type`].
+    feature_border_type: EBorderSelectionType,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -303,6 +308,7 @@ impl CatBoostBuilder {
             bagging_temperature: 0.0,
             random_seed: 0,
             border_count: QuantizeParams::default().border_count,
+            feature_border_type: EBorderSelectionType::default(),
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -463,6 +469,20 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn border_count(mut self, border_count: usize) -> Self {
         self.border_count = border_count;
+        self
+    }
+
+    /// Which border-selection algorithm quantization uses
+    /// (`feature_border_type`, catboost default
+    /// [`EBorderSelectionType::GreedyLogSum`]).
+    ///
+    /// All seven upstream binarizers are supported; see
+    /// [`cb_data::EBorderSelectionType`]. The choice is only observable when the
+    /// `border_count` budget BINDS — below the number of representable splits
+    /// every algorithm returns the same border set.
+    #[must_use]
+    pub fn feature_border_type(mut self, feature_border_type: EBorderSelectionType) -> Self {
+        self.feature_border_type = feature_border_type;
         self
     }
 
@@ -1144,22 +1164,32 @@ impl CatBoostBuilder {
                     cb_data::MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
                 )
             });
+        let border_type = self.feature_border_type;
         let borders_for_col = |col: &[f32]| -> Vec<f64> {
-            match shared_sample.as_deref() {
-                // The shared draw is valid only for full-length columns; the
-                // Pool invariant makes every float column pool.n_rows() long,
-                // and the guard keeps a hypothetical short column correct by
-                // falling back to the self-sampling entry.
-                Some(sample) if col.len() == pool.n_rows() => {
-                    cb_data::select_borders_greedy_logsum_f32_presampled(
-                        col,
-                        sample,
-                        self.border_count,
-                        false,
-                    )
-                }
-                _ => select_borders_greedy_logsum_f32(col, self.border_count, false),
+            // The presampled fast path exists only for the default GreedyLogSum
+            // binarizer (it is the fit-prep hot path). The other six route
+            // through `select_borders_f32`, which draws the SAME fixed-seed
+            // sample internally — the index set depends only on the object
+            // count, so the borders are identical; only the (once-per-column)
+            // draw is repeated.
+            if border_type == EBorderSelectionType::GreedyLogSum {
+                return match shared_sample.as_deref() {
+                    // The shared draw is valid only for full-length columns; the
+                    // Pool invariant makes every float column pool.n_rows() long,
+                    // and the guard keeps a hypothetical short column correct by
+                    // falling back to the self-sampling entry.
+                    Some(sample) if col.len() == pool.n_rows() => {
+                        cb_data::select_borders_greedy_logsum_f32_presampled(
+                            col,
+                            sample,
+                            self.border_count,
+                            false,
+                        )
+                    }
+                    _ => select_borders_greedy_logsum_f32(col, self.border_count, false),
+                };
             }
+            cb_data::select_borders_f32(col, self.border_count, border_type, false)
         };
         let (owned_values, mut feature_borders): (Option<Vec<Vec<f32>>>, Vec<Vec<f64>>) =
             if cache_valid && !cached_f32.is_empty() {

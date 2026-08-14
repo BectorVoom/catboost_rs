@@ -137,8 +137,23 @@ def synthesize_runs_input() -> np.ndarray:
     return np.ascontiguousarray(np.column_stack(cols), dtype=np.float64)
 
 
+# Corpora that live outside inputs/ (their own fixture directory owns them).
+EXTERNAL_INPUTS = {
+    # The SPEC-OH-31 byte-identity corpus. It quantizes 512 unique values into 32
+    # borders, so its border budget BINDS hard -- which is exactly why the greedy
+    # tie-break bug moved its frozen `.cbm`. Freezing catboost's borders for it
+    # turns "the baseline changed" into "the baseline changed TOWARD upstream".
+    "float_only_byte_identity": os.path.join(
+        FIXTURES, "float_only_byte_identity", "inputs", "X.npy"
+    ),
+}
+
+
 def load_input(dataset: str) -> np.ndarray:
-    return np.load(os.path.join(INPUTS, dataset, "X.npy"))
+    path = EXTERNAL_INPUTS.get(dataset)
+    if path is None:
+        path = os.path.join(INPUTS, dataset, "X.npy")
+    return np.load(path)
 
 
 def standalone_borders(x, border_count, border_type, nan_mode):
@@ -198,6 +213,9 @@ SCENARIOS = [
     (RUNS_DATASET, 8, "Min"),
     (RUNS_DATASET, 16, "Min"),
     (RUNS_DATASET, 32, "Min"),
+    # The SPEC-OH-31 byte-identity corpus at the exact budget its fixture uses
+    # (512 unique values -> 32 borders). See EXTERNAL_INPUTS.
+    ("float_only_byte_identity", 32, "Min"),
 ]
 
 

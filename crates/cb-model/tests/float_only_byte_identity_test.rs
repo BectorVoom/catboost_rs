@@ -211,6 +211,28 @@ fn capture_float_only_baseline() {
              leaf differs by exactly that one factor. So `no one-hot change leaked\n\
              into the float-only path` remains PROVEN, not merely asserted.\n\
              \n\
+             ## RE-BASELINED a second time, deliberately (greedy border tie-break)\n\
+             \n\
+             The capture taken before the `feature_border_type` wave is preserved\n\
+             verbatim as `baseline_pre_border_tiebreak.cbm` (sha256\n\
+             `876310517504e8d9cbf55e85cf46aeb9f96d30a011179ce5537bb890fe9fd629`).\n\
+             \n\
+             `baseline.cbm` was regenerated for one deliberate reason: the greedy\n\
+             binarizer resolved TIED split scores with a libstdc++ heap emulation\n\
+             that does not match catboost 1.2.10. This fixture quantizes 512\n\
+             UNIQUE values into 32 borders, so its budget BINDS — precisely the\n\
+             regime where the tie-break decides where borders land — and the frozen\n\
+             bytes therefore encoded the wrong border set.\n\
+             \n\
+             **This re-baseline is a move TOWARD upstream, and that is PROVEN, not\n\
+             asserted.** `cb-data`'s `border_types` oracle now includes the cell\n\
+             `float_only_byte_identity.bc32.GreedyLogSum` — catboost's own\n\
+             `Pool.quantize(...).save_quantization_borders()` output for THIS\n\
+             corpus at THIS budget — and\n\
+             `baseline_moved_its_borders_onto_the_catboost_oracle` checks that the\n\
+             new `.cbm` stores exactly those borders while the pre-fix `.cbm` does\n\
+             not. The bytes changed because the quantization got CORRECT.\n\
+             \n\
              ## Still frozen from here on\n\
              \n\
              Do not regenerate again without the same treatment: preserve the prior\n\
@@ -221,6 +243,8 @@ fn capture_float_only_baseline() {
              \n\
              - `baseline.cbm` — the pinned float-only fit, serialized.\n\
              - `baseline_pre_lr_f32.cbm` — the ORIGINAL plan-base capture (frozen).\n\
+             - `baseline_pre_border_tiebreak.cbm` — the capture taken before the\n\
+               greedy border tie-break fix (frozen).\n\
              - `inputs/X.npy` — `{N_ROWS} x {N_FEATURES}` float64 features.\n\
              - `inputs/y.npy` — `{N_ROWS}` float64 RMSE target.\n\
              \n\
@@ -319,6 +343,87 @@ fn frozen_baseline_records_its_plan_base_sha() {
     assert!(
         baseline_dir().join("baseline_pre_lr_f32.cbm").is_file(),
         "the preserved plan-base baseline must not be deleted"
+    );
+    assert!(
+        readme.contains("baseline_pre_border_tiebreak.cbm"),
+        "README.md must point at the bytes preserved across the greedy border \
+         tie-break re-baseline"
+    );
+    assert!(
+        baseline_dir()
+            .join("baseline_pre_border_tiebreak.cbm")
+            .is_file(),
+        "the preserved pre-border-tiebreak baseline must not be deleted"
+    );
+}
+
+/// The SECOND re-baseline is a move TOWARD upstream, proven mechanically.
+///
+/// The greedy binarizer used to resolve TIED split scores with a libstdc++ heap
+/// emulation that catboost 1.2.10 does not match. This fixture bins 512 unique
+/// values into 32 borders, so its budget BINDS and the tie-break decides where
+/// borders land — which is why the frozen `.cbm` had to be re-captured.
+///
+/// A re-capture with no proof would turn SPEC-OH-31 into a self-comparison. So
+/// this test reads the borders back out of BOTH `.cbm` files and checks them
+/// against catboost's own standalone quantization for this exact corpus at this
+/// exact budget (the `border_types/float_only_byte_identity.bc32.GreedyLogSum`
+/// oracle cell): the NEW baseline must match it, and the OLD one must NOT. That
+/// is the difference between "the bytes drifted" and "the bytes got correct".
+#[test]
+fn baseline_moved_its_borders_onto_the_catboost_oracle() {
+    let dir = baseline_dir();
+    let new_model = cb_model::load_cbm(&dir.join("baseline.cbm"))
+        .expect("the re-captured baseline must load");
+    let old_model = cb_model::load_cbm(&dir.join("baseline_pre_border_tiebreak.cbm"))
+        .expect("the preserved pre-fix baseline must load");
+
+    // catboost's own borders for this corpus at border_count=32.
+    let oracle_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("cb-oracle")
+        .join("fixtures")
+        .join("border_types");
+    let stem = "float_only_byte_identity.bc32.GreedyLogSum";
+    let flat: Vec<f64> = read_npy::<_, ndarray::Array1<f64>>(oracle_dir.join(format!("{stem}.borders.npy")))
+        .expect("oracle borders")
+        .to_vec();
+    let per_feature: Vec<f64> =
+        read_npy::<_, ndarray::Array1<f64>>(oracle_dir.join(format!("{stem}.borders_per_feature.npy")))
+            .expect("oracle per-feature counts")
+            .to_vec();
+
+    let mut expected: Vec<Vec<f64>> = Vec::new();
+    let mut offset = 0usize;
+    for &count in &per_feature {
+        let count = count as usize;
+        expected.push(flat[offset..offset + count].to_vec());
+        offset += count;
+    }
+
+    // A `.cbm` stores borders as f32, and the oracle text-rounds to ~10
+    // significant digits, so compare at f32 resolution rather than bit-exactly.
+    let matches_oracle = |borders: &[Vec<f64>]| -> bool {
+        borders.len() == expected.len()
+            && borders.iter().zip(expected.iter()).all(|(got, want)| {
+                got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(want.iter())
+                        .all(|(a, b)| (a - b).abs() <= 1e-6 * a.abs().max(1.0))
+            })
+    };
+
+    assert!(
+        matches_oracle(&new_model.float_feature_borders),
+        "the re-captured baseline must store catboost's borders for this corpus; \
+         the whole point of the re-baseline was to move onto them"
+    );
+    assert!(
+        !matches_oracle(&old_model.float_feature_borders),
+        "the PRE-FIX baseline must NOT already match catboost's borders — if it \
+         did, the greedy tie-break was not the reason the bytes moved and this \
+         re-baseline is unexplained"
     );
 }
 

@@ -40,7 +40,14 @@ fn fixture(rel: &str) -> PathBuf {
 }
 
 fn load_x(dataset: &str) -> Array2<f64> {
-    read_npy(fixture(&format!("inputs/{dataset}/X.npy")))
+    // The SPEC-OH-31 byte-identity corpus owns its own fixture directory rather
+    // than living under inputs/ (mirrors the generator's EXTERNAL_INPUTS).
+    let rel = if dataset == "float_only_byte_identity" {
+        format!("{dataset}/inputs/X.npy")
+    } else {
+        format!("inputs/{dataset}/X.npy")
+    };
+    read_npy(fixture(&rel))
         .unwrap_or_else(|e| panic!("{dataset}/X.npy must load as 2-D f64: {e:?}"))
 }
 
@@ -55,6 +62,12 @@ const CELLS: &[(&str, usize)] = &[
     ("borders_runs", 8),
     ("borders_runs", 16),
     ("borders_runs", 32),
+    // The SPEC-OH-31 byte-identity corpus at the exact budget its own fixture
+    // quantizes with (512 unique values -> 32 borders). This cell is the reason
+    // that frozen `.cbm` baseline had to be re-captured: its budget BINDS, so it
+    // was serialized with the buggy greedy tie-break. Pinning catboost's borders
+    // for it makes the re-baseline a move TOWARD upstream, not a silent drift.
+    ("float_only_byte_identity", 32),
 ];
 
 /// Feature indices whose oracle borders begin with the NanMode(`Min`)

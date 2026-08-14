@@ -1,6 +1,6 @@
 # float-only `.cbm` byte-identity baseline (SPEC-OH-31 / T00)
 
-**CAPTURED_AT_SHA: `41e7e9c86ff8f91b55cff694832637aeddecb34d`** (plus the uncommitted working tree at
+**CAPTURED_AT_SHA: `21dbd13142c617cf3c0af393093f1ec1b82ffbe2`** (plus the uncommitted working tree at
 capture time — see the re-baseline note below).
 
 Written by `float_only_byte_identity_test::capture_float_only_baseline`
@@ -27,6 +27,28 @@ structure (same split count, features and borders) and that every
 leaf differs by exactly that one factor. So `no one-hot change leaked
 into the float-only path` remains PROVEN, not merely asserted.
 
+## RE-BASELINED a second time, deliberately (greedy border tie-break)
+
+The capture taken before the `feature_border_type` wave is preserved
+verbatim as `baseline_pre_border_tiebreak.cbm` (sha256
+`876310517504e8d9cbf55e85cf46aeb9f96d30a011179ce5537bb890fe9fd629`).
+
+`baseline.cbm` was regenerated for one deliberate reason: the greedy
+binarizer resolved TIED split scores with a libstdc++ heap emulation
+that does not match catboost 1.2.10. This fixture quantizes 512
+UNIQUE values into 32 borders, so its budget BINDS — precisely the
+regime where the tie-break decides where borders land — and the frozen
+bytes therefore encoded the wrong border set.
+
+**This re-baseline is a move TOWARD upstream, and that is PROVEN, not
+asserted.** `cb-data`'s `border_types` oracle now includes the cell
+`float_only_byte_identity.bc32.GreedyLogSum` — catboost's own
+`Pool.quantize(...).save_quantization_borders()` output for THIS
+corpus at THIS budget — and
+`baseline_moved_its_borders_onto_the_catboost_oracle` checks that the
+new `.cbm` stores exactly those borders while the pre-fix `.cbm` does
+not. The bytes changed because the quantization got CORRECT.
+
 ## Still frozen from here on
 
 Do not regenerate again without the same treatment: preserve the prior
@@ -37,6 +59,8 @@ SPEC-OH-31 into a self-comparison that proves nothing.
 
 - `baseline.cbm` — the pinned float-only fit, serialized.
 - `baseline_pre_lr_f32.cbm` — the ORIGINAL plan-base capture (frozen).
+- `baseline_pre_border_tiebreak.cbm` — the capture taken before the
+greedy border tie-break fix (frozen).
 - `inputs/X.npy` — `512 x 4` float64 features.
 - `inputs/y.npy` — `512` float64 RMSE target.
 

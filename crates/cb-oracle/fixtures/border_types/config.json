@@ -503,6 +503,104 @@
       "n_features": 4,
       "nan_mode": "Min"
     },
+    "float_only_byte_identity.bc32.GreedyLogSum": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "float_only_byte_identity.bc32.GreedyMinEntropy": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "float_only_byte_identity.bc32.MaxLogSum": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "float_only_byte_identity.bc32.Median": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "float_only_byte_identity.bc32.MinEntropy": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "float_only_byte_identity.bc32.Uniform": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "float_only_byte_identity.bc32.UniformAndQuantiles": {
+      "border_count": 32,
+      "dataset": "float_only_byte_identity",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        31,
+        31,
+        31,
+        31
+      ],
+      "n_borders_total": 124,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
     "numeric_nan.bc8.GreedyLogSum": {
       "border_count": 8,
       "dataset": "numeric_nan",
