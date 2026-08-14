@@ -656,6 +656,12 @@ pub struct Perturbation<'a> {
     /// `scoreStDev` (`CalcScoreStDev`): the perturbation magnitude for this tree
     /// (`random_strength * derivativesStDevFromZero * modelSizeMultiplier`).
     pub score_st_dev: f64,
+    /// `random_score_type` — which DISTRIBUTION the per-candidate draw comes
+    /// from. This changes the RNG consumption per candidate (the normal draw is
+    /// rejection sampling over PAIRS of uniforms; Gumbel takes exactly one), so
+    /// it shifts the whole downstream draw stream, not just the noise scale.
+    /// See [`cb_compute::ERandomScoreType`].
+    pub score_type: cb_compute::ERandomScoreType,
 }
 
 /// Grow one oblivious tree with the OPTIONAL `random_strength` perturbation
@@ -1396,6 +1402,9 @@ fn select_level_perturbed(
         )));
     }
     let std_dev = perturb.score_st_dev;
+    // `random_score_type` — bound alongside the std-dev because both come from
+    // the same per-tree perturbation state and both feed every candidate draw.
+    let score_type = perturb.score_type;
     // FEAT-04 penalties apply at the per-feature SelectBestCandidate stage (pass 3
     // below) — the multiplicative feature weight scales the gain and the
     // subtractive first-use / per-object penalties act on the per-feature best
@@ -1499,7 +1508,8 @@ fn select_level_perturbed(
         for (bi, &border) in borders.iter().enumerate() {
             let raw = raw_scores.get(bi).copied().unwrap_or(MINIMAL_SCORE);
             // scoreInstance = scoreWoNoise + std_normal(featRng) * scoreStDev.
-            let instance = random_score_instance(raw, std_dev, &mut feat_rng);
+            let instance =
+                cb_compute::random_score_instance_typed(score_type, raw, std_dev, &mut feat_rng);
             // Strict `>` first-wins on the per-feature border (SetBestScore).
             if instance > best_instance {
                 best_instance = instance;
@@ -1526,7 +1536,12 @@ fn select_level_perturbed(
                     Some(p) => p.penalize(feature, raw),
                     None => raw,
                 };
-                let instance = random_score_instance(penalized_raw, std_dev, perturb.rng);
+                let instance = cb_compute::random_score_instance_typed(
+                    score_type,
+                    penalized_raw,
+                    std_dev,
+                    perturb.rng,
+                );
                 if instance > best_gain {
                     best_gain = instance;
                     chosen_split = Some(Split { feature, border });
@@ -1541,7 +1556,12 @@ fn select_level_perturbed(
                 // instrumented-ground-truth/GROUND_TRUTH.md`), even though it can
                 // never actually win (no valid split border). Draw and discard;
                 // `f64::NEG_INFINITY` guarantees it never beats `best_gain`.
-                let _ = random_score_instance(f64::NEG_INFINITY, std_dev, perturb.rng);
+                let _ = cb_compute::random_score_instance_typed(
+                    score_type,
+                    f64::NEG_INFINITY,
+                    std_dev,
+                    perturb.rng,
+                );
             }
         }
     }

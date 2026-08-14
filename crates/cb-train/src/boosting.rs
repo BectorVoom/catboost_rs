@@ -262,6 +262,11 @@ pub struct ExtraBoostParams {
     /// `leaf_estimation_iterations == 1` (there is no earlier step to fall back
     /// to); see [`cb_compute::LeafEstimationBacktracking`].
     pub leaf_estimation_backtracking: cb_compute::LeafEstimationBacktracking,
+    /// `random_score_type` — the distribution the `random_strength` split-score
+    /// perturbation is drawn from, and whether that perturbation decays as the
+    /// model grows. Inert at `random_strength == 0.0` (no draw happens at all);
+    /// see [`cb_compute::ERandomScoreType`].
+    pub random_score_type: cb_compute::ERandomScoreType,
 }
 
 impl Default for ExtraBoostParams {
@@ -273,6 +278,7 @@ impl Default for ExtraBoostParams {
             // produce no leaf values at all.
             leaf_estimation_iterations: 1,
             leaf_estimation_backtracking: cb_compute::LeafEstimationBacktracking::AnyImprovement,
+            random_score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
         }
     }
 }
@@ -6776,13 +6782,23 @@ fn train_inner<R: Runtime>(
                 // Fold-approx semantics: the score std-dev reads the fold handed
                 // to the search (`CalcDerivativesStDevFromZeroPlainBoosting`) —
                 // aliases `weighted_der1` on every non-CTR path.
-                score_st_dev(params.random_strength, search_weighted_der1, n, model_length)
+                // `random_score_type` also selects the STD-DEV form: Gumbel
+                // drops the model-size-decrease multiplier
+                // (`greedy_tensor_search.cpp:861-866`).
+                cb_compute::score_st_dev_typed(
+                    params.extra.random_score_type,
+                    params.random_strength,
+                    search_weighted_der1,
+                    n,
+                    model_length,
+                )
             } else {
                 0.0
             };
             Some(Perturbation {
                 rng: &mut rng,
                 score_st_dev: std_dev,
+                score_type: params.extra.random_score_type,
             })
         } else {
             None

@@ -73,6 +73,7 @@ fn real_grow_state(
             // The WR-01 in-scope regime: sampling active, `random_strength == 0`,
             // so the perturbation is a numeric no-op but the draws still happen.
             score_st_dev: 0.0,
+            score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
         }),
         EScoreFunction::Cosine,
         None,
@@ -159,6 +160,7 @@ fn replay_counts_borderless_features_because_the_grower_does() {
         Some(Perturbation {
             rng: &mut real_rng,
             score_st_dev: 0.0,
+            score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
         }),
         EScoreFunction::Cosine,
         None,
@@ -241,6 +243,7 @@ fn replay_is_multi_tree_composable() {
             Some(Perturbation {
                 rng: &mut real_rng,
                 score_st_dev: 0.0,
+                score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
             }),
             EScoreFunction::Cosine,
             None,

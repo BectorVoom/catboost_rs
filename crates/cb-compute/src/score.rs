@@ -362,3 +362,116 @@ pub fn score_st_dev(random_strength: f64, weighted_der1: &[f64], n: usize, model
 pub fn random_score_instance(val: f64, std_dev: f64, rng: &mut TFastRng64) -> f64 {
     val + std_normal(rng) * std_dev
 }
+
+/// The `random_score_type` split-score perturbation distribution
+/// (`ERandomScoreType`, `enums.h`; the draw lives in
+/// `catboost/private/libs/algo/rand_score.h`). Legal values probed from the
+/// installed catboost 1.2.10 wheel: `NormalWithModelSizeDecrease`, `Gumbel`.
+///
+/// The two variants differ in BOTH the std-dev and the draw:
+///
+/// | | std-dev (`CalcScoreStDev`) | draw (`TRandomScore::GetInstance`) |
+/// |---|---|---|
+/// | `NormalWithModelSizeDecrease` | `strength * dsdz * modelSizeMultiplier` | `Val + Normal(0, StDev)` |
+/// | `Gumbel` | `strength * dsdz * 1.0` | `Val + StDev * ln(ln(1/GenRandReal1()))` |
+///
+/// So Gumbel does NOT shrink the perturbation as the model grows — the
+/// model-size multiplier is exactly the "…WithModelSizeDecrease" half of the
+/// other variant's name (`greedy_tensor_search.cpp:861-866`).
+///
+/// The two also consume DIFFERENT amounts of RNG: the normal draw is
+/// Box–Muller-style rejection sampling over pairs of `GenRandReal1()` calls
+/// ([`cb_core::std_normal`]), while Gumbel takes exactly one. That shifts the
+/// whole downstream draw stream, which is why the two settings produce visibly
+/// different models rather than merely differently-scaled noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ERandomScoreType {
+    /// Normal perturbation whose scale DECAYS as the model grows — the catboost
+    /// default.
+    #[default]
+    NormalWithModelSizeDecrease,
+    /// Gumbel perturbation at a constant scale (no model-size decay).
+    Gumbel,
+}
+
+impl ERandomScoreType {
+    /// Parse the upstream spelling (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "NormalWithModelSizeDecrease" => Some(Self::NormalWithModelSizeDecrease),
+            "Gumbel" => Some(Self::Gumbel),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NormalWithModelSizeDecrease => "NormalWithModelSizeDecrease",
+            Self::Gumbel => "Gumbel",
+        }
+    }
+
+    /// Every legal value, in the order the wheel's enum parser lists them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::NormalWithModelSizeDecrease, Self::Gumbel]
+    }
+
+    /// Whether this type applies the model-size-decrease multiplier to the
+    /// perturbation std-dev (`greedy_tensor_search.cpp:861-866`).
+    #[must_use]
+    pub fn uses_model_size_decrease(self) -> bool {
+        matches!(self, Self::NormalWithModelSizeDecrease)
+    }
+}
+
+/// [`score_st_dev`] parameterized by [`ERandomScoreType`]: `Gumbel` replaces the
+/// model-size multiplier with `1.0` (`greedy_tensor_search.cpp:861-866`).
+#[must_use]
+pub fn score_st_dev_typed(
+    score_type: ERandomScoreType,
+    random_strength: f64,
+    weighted_der1: &[f64],
+    n: usize,
+    model_length: f64,
+) -> f64 {
+    let dsdz = derivatives_std_dev_from_zero(weighted_der1, n);
+    let mult = if score_type.uses_model_size_decrease() {
+        model_size_multiplier(n, model_length)
+    } else {
+        1.0
+    };
+    random_strength * dsdz * mult
+}
+
+/// [`random_score_instance`] parameterized by [`ERandomScoreType`]
+/// (`TRandomScore::GetInstance`, `rand_score.h:41-49`):
+///
+/// ```text
+/// Normal: Val + NormalDistribution<double>(rand, 0, StDev)
+/// Gumbel: Val + StDev * std::log(std::log(1.0 / rand.GenRandReal1()))
+/// ```
+///
+/// Both branches ALWAYS draw, even at `StDev == 0`, so the per-candidate RNG
+/// advance stays aligned with upstream regardless of the std-dev (the same
+/// parity contract [`random_score_instance`] documents). The two branches
+/// advance the stream by different amounts — that is upstream's behaviour, not
+/// an artifact.
+#[must_use]
+pub fn random_score_instance_typed(
+    score_type: ERandomScoreType,
+    val: f64,
+    std_dev: f64,
+    rng: &mut TFastRng64,
+) -> f64 {
+    match score_type {
+        ERandomScoreType::NormalWithModelSizeDecrease => val + std_normal(rng) * std_dev,
+        // `ln(ln(1/u))` for u in (0, 1]: at u == 1 the inner log is 0 and the
+        // outer is -inf, which upstream also produces (the candidate is then
+        // never selected). Reproduced rather than guarded so the draw matches.
+        ERandomScoreType::Gumbel => val + std_dev * (1.0 / rng.gen_rand_real1()).ln().ln(),
+    }
+}

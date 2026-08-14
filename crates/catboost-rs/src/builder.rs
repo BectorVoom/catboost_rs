@@ -27,7 +27,7 @@ use cb_backend::CpuBackend;
 use cb_backend::GpuBackend;
 use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
-    LeafEstimationBacktracking, LeafMethod, Loss,
+    ERandomScoreType, LeafEstimationBacktracking, LeafMethod, Loss,
 };
 use cb_data::{
     select_borders_greedy_logsum_f32, AutoClassWeights, EBorderSelectionType, NanMode, Pool,
@@ -103,6 +103,8 @@ pub struct CatBoostBuilder {
     model_shrink_mode: EModelShrinkMode,
     /// Leaf refinement steps per tree (`leaf_estimation_iterations`).
     leaf_estimation_iterations: usize,
+    /// The `random_strength` perturbation distribution (`random_score_type`).
+    random_score_type: ERandomScoreType,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -331,6 +333,7 @@ impl CatBoostBuilder {
             model_shrink_rate: 0.0,
             model_shrink_mode: EModelShrinkMode::Constant,
             leaf_estimation_iterations: 1,
+            random_score_type: ERandomScoreType::NormalWithModelSizeDecrease,
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -574,6 +577,24 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn model_shrink_mode(mut self, model_shrink_mode: EModelShrinkMode) -> Self {
         self.model_shrink_mode = model_shrink_mode;
+        self
+    }
+
+    /// The distribution the `random_strength` split-score perturbation is drawn
+    /// from (`random_score_type`, catboost default
+    /// [`ERandomScoreType::NormalWithModelSizeDecrease`]).
+    ///
+    /// The two values differ in BOTH the perturbation scale and the draw:
+    /// `NormalWithModelSizeDecrease` shrinks the noise as the model grows and
+    /// draws from a normal; `Gumbel` keeps a constant scale and draws
+    /// `stdev * ln(ln(1/u))`. They also consume different amounts of RNG per
+    /// candidate, which shifts the whole downstream draw stream.
+    ///
+    /// INERT at `random_strength == 0.0` (the default) — no perturbation is
+    /// drawn at all, so the setting cannot affect a default fit.
+    #[must_use]
+    pub fn random_score_type(mut self, random_score_type: ERandomScoreType) -> Self {
+        self.random_score_type = random_score_type;
         self
     }
 
@@ -991,6 +1012,7 @@ impl CatBoostBuilder {
                 model_shrink_mode: self.model_shrink_mode,
                 leaf_estimation_iterations: self.leaf_estimation_iterations,
                 leaf_estimation_backtracking: self.leaf_estimation_backtracking,
+                random_score_type: self.random_score_type,
             },
         }
     }

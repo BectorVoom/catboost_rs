@@ -1,0 +1,32 @@
+{
+  "catboost_version": "1.2.10",
+  "formulas": {
+    "Gumbel": "stdev = strength*dsdz*1.0; draw = Val + stdev*log(log(1/GenRandReal1()))",
+    "NormalWithModelSizeDecrease": "stdev = strength*dsdz*modelSizeMultiplier; draw = Val + Normal(0, stdev)"
+  },
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "random_strength": 1.0,
+  "scenario": "random_score_type",
+  "seed": 20260814,
+  "strength_zero_max_abs_diff_between_types": 0.0,
+  "types": [
+    "NormalWithModelSizeDecrease",
+    "Gumbel"
+  ],
+  "types_max_abs_diff": 0.6843621837628646
+}

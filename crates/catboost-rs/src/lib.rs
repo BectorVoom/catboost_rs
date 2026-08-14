@@ -57,7 +57,9 @@ pub use cb_model::CoreMlExportError;
 // Builder consumes, so a caller configures a run entirely through the published
 // crate. `EScoreFunction` drives `.score_function()` (Cosine = catboost CPU
 // default, L2 = variance-reduction alternative).
-pub use cb_compute::{EScoreFunction, LeafEstimationBacktracking, LeafMethod, Loss};
+pub use cb_compute::{
+    ERandomScoreType, EScoreFunction, LeafEstimationBacktracking, LeafMethod, Loss,
+};
 pub use cb_train::EBootstrapType;
 // The categorical / CTR knobs `CatBoostBuilder::simple_ctr`,
 // `.combinations_ctr` and `.counter_calc_method` take (F07). Without these

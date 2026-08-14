@@ -60,8 +60,8 @@ use std::collections::BTreeMap;
 use catboost_rs::{
     parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
     EBootstrapType, EBorderSelectionType, ECtrType, EGrowPolicy, EOverfittingDetectorType,
-    EModelShrinkMode, EScoreFunction, EvalMetric, LeafEstimationBacktracking, LeafMethod, Loss,
-    NanMode,
+    EModelShrinkMode, ERandomScoreType, EScoreFunction, EvalMetric, LeafEstimationBacktracking,
+    LeafMethod, Loss, NanMode,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -171,6 +171,10 @@ const IMPLEMENTED: &[&str] = &[
     // whole accumulated model each iteration and declines the device grower.
     "model_shrink_rate",
     "model_shrink_mode",
+    // `random_score_type` selects BOTH the perturbation distribution and whether
+    // it decays with model size. INERT at `random_strength = 0` (the default),
+    // where no draw happens at all.
+    "random_score_type",
 ];
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
@@ -756,6 +760,16 @@ fn parse_leaf_backtracking(name: &str) -> PyResult<LeafEstimationBacktracking> {
     })
 }
 
+/// Map a `random_score_type` string onto an [`ERandomScoreType`].
+fn parse_random_score_type(name: &str) -> PyResult<ERandomScoreType> {
+    ERandomScoreType::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown random_score_type `{name}`; expected one of \
+             NormalWithModelSizeDecrease, Gumbel"
+        ))
+    })
+}
+
 /// Map a `model_shrink_mode` string onto an [`EModelShrinkMode`].
 fn parse_model_shrink_mode(name: &str) -> PyResult<EModelShrinkMode> {
     EModelShrinkMode::parse(name).ok_or_else(|| {
@@ -1207,6 +1221,9 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "model_shrink_mode")? {
         builder = builder.model_shrink_mode(parse_model_shrink_mode(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "random_score_type")? {
+        builder = builder.random_score_type(parse_random_score_type(&v)?);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "bootstrap_type")? {
         builder = builder.bootstrap_type(parse_bootstrap_type(&v)?);

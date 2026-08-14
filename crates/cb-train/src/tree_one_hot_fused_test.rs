@@ -277,6 +277,7 @@ fn one_hot_candidates_are_never_enumerated_under_perturbation() {
     let perturb = super::Perturbation {
         rng: &mut rng,
         score_st_dev: 1.0,
+        score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
     };
 
     let got = greedy_tensor_search_oblivious_perturbed(
@@ -307,6 +308,7 @@ fn one_hot_candidates_are_never_enumerated_under_perturbation() {
     let perturb2 = super::Perturbation {
         rng: &mut rng2,
         score_st_dev: 1.0,
+        score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
     };
     assert!(greedy_tensor_search_oblivious_perturbed(
         &m2,
