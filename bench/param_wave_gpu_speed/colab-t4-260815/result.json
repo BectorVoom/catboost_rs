@@ -1,0 +1,503 @@
+{
+  "provenance": {
+    "gpu": "Tesla T4, 15360 MiB",
+    "commit": "unknown",
+    "catboost_version": "1.2.10"
+  },
+  "grid": [
+    {
+      "name": "baseline",
+      "group": "decline-cliff",
+      "expect_device": true,
+      "nan_pool": false,
+      "note": "the device-eligible reference every decline row is measured against",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.1008694171905518,
+        "min": 1.0809545516967773,
+        "max": 1.4778876304626465
+      },
+      "official": {
+        "median": 1.9409232139587402,
+        "min": 1.907029151916504,
+        "max": 2.158596992492676
+      },
+      "ratio_median": 1.7630821454846373,
+      "ratio_range": [
+        1.2903749328489316,
+        1.9969359387999432
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "model_shrink_rate=0.2",
+      "group": "decline-cliff",
+      "expect_device": false,
+      "nan_pool": false,
+      "note": "declines: the shrink rescales the running approx each iteration, but the device keeps its approx RESIDENT and never reads the host copy back per tree",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "model_shrink_rate": 0.2
+      },
+      "device_tree_lines": 0,
+      "device_observed": false,
+      "official_error": "CatBoostError: catboost/private/libs/options/json_helper.h:185: Error: change of option model_shrink_rate is unimplemented for task type GPU and was not default in previous run",
+      "rs": {
+        "median": 40.69612240791321,
+        "min": 40.502426624298096,
+        "max": 41.11907935142517
+      },
+      "official": null
+    },
+    {
+      "name": "leaf_estimation_iterations=3",
+      "group": "decline-cliff",
+      "expect_device": false,
+      "nan_pool": false,
+      "note": "declines: the accumulate-and-recompute loop lives in the CPU leaf-value section, which the device branch skips. `backtracking=No` is required \u2014 the default AnyImprovement is rejected outright at N>1",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "leaf_estimation_iterations": 3,
+        "leaf_estimation_backtracking": "No"
+      },
+      "device_tree_lines": 0,
+      "device_observed": false,
+      "rs": {
+        "median": 40.643773555755615,
+        "min": 40.588321685791016,
+        "max": 40.782715797424316
+      },
+      "official": {
+        "median": 2.078144073486328,
+        "min": 1.7630417346954346,
+        "max": 3.021662473678589
+      },
+      "ratio_median": 0.05113068722901689,
+      "ratio_range": [
+        0.043230120903492694,
+        0.07444659813900113
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "feature_border_type=Median",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "Median"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.4526572227478027,
+        "min": 1.4164538383483887,
+        "max": 1.4916350841522217
+      },
+      "official": {
+        "median": 1.971235752105713,
+        "min": 1.8187344074249268,
+        "max": 2.940446615219116
+      },
+      "ratio_median": 1.3569861638638898,
+      "ratio_range": [
+        1.2192891054574608,
+        2.075921244738714
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "feature_border_type=GreedyLogSum",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "GreedyLogSum"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.0907585620880127,
+        "min": 1.080634355545044,
+        "max": 1.1024534702301025
+      },
+      "official": {
+        "median": 2.0402839183807373,
+        "min": 1.7965693473815918,
+        "max": 2.791088342666626
+      },
+      "ratio_median": 1.870518361529128,
+      "ratio_range": [
+        1.6296101340282545,
+        2.5828239943925095
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "feature_border_type=UniformAndQuantiles",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "UniformAndQuantiles"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.4369349479675293,
+        "min": 1.3744330406188965,
+        "max": 1.4537067413330078
+      },
+      "official": {
+        "median": 1.848949670791626,
+        "min": 1.62703275680542,
+        "max": 3.011002779006958
+      },
+      "ratio_median": 1.2867316459989162,
+      "ratio_range": [
+        1.1192303857059074,
+        2.1907235129120055
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "feature_border_type=MinEntropy",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "MinEntropy"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 57.41505217552185,
+        "min": 57.096734285354614,
+        "max": 57.70609974861145
+      },
+      "official": {
+        "median": 51.654006004333496,
+        "min": 51.58821368217468,
+        "max": 52.116745948791504
+      },
+      "ratio_median": 0.8996596545174873,
+      "ratio_range": [
+        0.8939819864262447,
+        0.9127798043286605
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "feature_border_type=MaxLogSum",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "MaxLogSum"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 53.857337951660156,
+        "min": 53.57788300514221,
+        "max": 53.94925260543823
+      },
+      "official": {
+        "median": 49.979496002197266,
+        "min": 49.89470934867859,
+        "max": 50.14050078392029
+      },
+      "ratio_median": 0.9279978904092241,
+      "ratio_range": [
+        0.9248452376826638,
+        0.9358432616516033
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "feature_border_type=Uniform",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "Uniform"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.2874526977539062,
+        "min": 1.2720353603363037,
+        "max": 1.320706844329834
+      },
+      "official": {
+        "median": 1.5969457626342773,
+        "min": 1.1871602535247803,
+        "max": 2.050261974334717
+      },
+      "ratio_median": 1.2403917949143402,
+      "ratio_range": [
+        0.898882487526731,
+        1.6117963684536754
+      ],
+      "within_noise": true
+    },
+    {
+      "name": "feature_border_type=GreedyMinEntropy",
+      "group": "border-build",
+      "expect_device": true,
+      "nan_pool": false,
+      "official_na": null,
+      "note": "border building is HOST prep; exact-DP types can cost real wall clock",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "feature_border_type": "GreedyMinEntropy"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.467529535293579,
+        "min": 1.434293270111084,
+        "max": 1.5092236995697021
+      },
+      "official": {
+        "median": 1.9368345737457275,
+        "min": 1.7371594905853271,
+        "max": 3.0602405071258545
+      },
+      "ratio_median": 1.3197925678260807,
+      "ratio_range": [
+        1.1510284996721243,
+        2.133622579773273
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "nan_mode=Min",
+      "group": "nan-mode",
+      "expect_device": true,
+      "nan_pool": true,
+      "note": "NaN-bearing pool; Max appends the f32::MAX sentinel border",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "nan_mode": "Min"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.1644065380096436,
+        "min": 1.1572623252868652,
+        "max": 1.1747150421142578
+      },
+      "official": {
+        "median": 1.8829948902130127,
+        "min": 1.7084414958953857,
+        "max": 2.375736951828003
+      },
+      "ratio_median": 1.6171284072585805,
+      "ratio_range": [
+        1.4543454664720428,
+        2.0528940586043003
+      ],
+      "within_noise": false
+    },
+    {
+      "name": "nan_mode=Max",
+      "group": "nan-mode",
+      "expect_device": true,
+      "nan_pool": true,
+      "note": "NaN-bearing pool; Max appends the f32::MAX sentinel border",
+      "kwargs": {
+        "iterations": 30,
+        "depth": 6,
+        "learning_rate": 0.03,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "random_seed": 42,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "boost_from_average": false,
+        "leaf_estimation_method": "Gradient",
+        "score_function": "L2",
+        "loss_function": "RMSE",
+        "grow_policy": "SymmetricTree",
+        "nan_mode": "Max"
+      },
+      "device_tree_lines": 4,
+      "device_observed": true,
+      "rs": {
+        "median": 1.174644947052002,
+        "min": 1.1709208488464355,
+        "max": 1.188391923904419
+      },
+      "official": {
+        "median": 1.9310581684112549,
+        "min": 1.6712396144866943,
+        "max": 1.9624767303466797
+      },
+      "ratio_median": 1.6439505173521733,
+      "ratio_range": [
+        1.4063034095653366,
+        1.676011433462874
+      ],
+      "within_noise": false
+    }
+  ],
+  "errors": {},
+  "budget_s": 10800.0,
+  "build_ok": true,
+  "build_tail": "\ud83d\udc0d Found CPython 3.12 at /usr/bin/python3\n\ud83d\udd17 Found pyo3 bindings with abi3-py3.12 support\n    Finished `release` profile [optimized] target(s) in 0.40s\n\ud83d\udce6 Built wheel for abi3 Python \u2265 3.12 to /content/cbrs/target/wheels/catboost_rs-0.1.0-cp312-abi3-manylinux_2_34_x86_64.whl\n"
+}
