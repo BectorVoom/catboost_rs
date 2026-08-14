@@ -382,6 +382,16 @@ pub struct ExtraBoostParams {
     /// `ctr_history_unit` — the ordered-CTR history granularity. Only `Sample`
     /// is implemented on CPU, upstream included.
     pub ctr_history_unit: ECtrHistoryUnit,
+    /// `model_size_reg` — the CTR-projection size penalty. A NEW CTR
+    /// projection's candidate score is multiplied by
+    /// `(1 + count/maxCount)^(-model_size_reg)`, down-weighting high-cardinality
+    /// (combination) CTR candidates. `0.0` disables the penalty. Inert on a fit
+    /// with no categorical columns.
+    ///
+    /// The weight function ([`crate::tree`]'s `cat_feature_weight`) already
+    /// existed; the boosting loop just PINNED it to the default, so the
+    /// parameter was implemented but unreachable.
+    pub model_size_reg: f64,
     /// `allow_const_label` — whether a learn set whose targets are ALL EQUAL is
     /// allowed. Upstream refuses it by default ("All train targets are equal",
     /// `metric.cpp:7011`) because most metrics are undefined on a constant
@@ -401,6 +411,7 @@ impl Default for ExtraBoostParams {
             random_score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
             final_ctr_computation_mode: EFinalCtrComputationMode::Default,
             ctr_history_unit: ECtrHistoryUnit::Sample,
+            model_size_reg: model_size_reg_default(),
             allow_const_label: false,
         }
     }
@@ -7078,7 +7089,10 @@ fn train_inner<R: Runtime>(
                 // default 0.5 down-weights high-cardinality (combination) CTR
                 // candidates so a new {0,1} combination does not out-score a second
                 // border on an already-used {0} simple CTR on a thin margin.
-                model_size_reg_default(),
+                //
+                // Reads the PARAM now; this used to be pinned to the default, which
+                // made `model_size_reg` implemented-but-unreachable.
+                params.extra.model_size_reg,
                 params.score_function,
                 &cat_eligible_buckets,
                 &used_ctr_splits,

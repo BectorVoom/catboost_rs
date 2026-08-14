@@ -112,6 +112,14 @@ pub struct CatBoostBuilder {
     ctr_history_unit: ECtrHistoryUnit,
     /// Whether an all-equal learn target is allowed (`allow_const_label`).
     allow_const_label: bool,
+    /// The CTR-projection size penalty (`model_size_reg`).
+    model_size_reg: f64,
+    /// Whether periodic checkpointing is enabled (`save_snapshot`).
+    save_snapshot: bool,
+    /// Where the checkpoint is written / resumed from (`snapshot_file`).
+    snapshot_file: Option<std::path::PathBuf>,
+    /// Minimum wall-clock time between checkpoint writes (`snapshot_interval`).
+    snapshot_interval: std::time::Duration,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -344,6 +352,11 @@ impl CatBoostBuilder {
             final_ctr_computation_mode: EFinalCtrComputationMode::Default,
             ctr_history_unit: ECtrHistoryUnit::Sample,
             allow_const_label: false,
+            model_size_reg: cb_train::model_size_reg_default(),
+            save_snapshot: false,
+            snapshot_file: None,
+            // Upstream's default is 600s.
+            snapshot_interval: std::time::Duration::from_secs(600),
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -587,6 +600,54 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn model_shrink_mode(mut self, model_shrink_mode: EModelShrinkMode) -> Self {
         self.model_shrink_mode = model_shrink_mode;
+        self
+    }
+
+    /// The CTR-projection size penalty (`model_size_reg`, upstream default
+    /// `0.5`).
+    ///
+    /// A NEW CTR projection's candidate score is multiplied by
+    /// `(1 + count/maxCount)^(-model_size_reg)`, so high-cardinality
+    /// (combination) CTR candidates are down-weighted against a lower-cardinality
+    /// simple CTR. `0.0` disables the penalty. Inert on a fit with no categorical
+    /// columns.
+    #[must_use]
+    pub fn model_size_reg(mut self, model_size_reg: f64) -> Self {
+        self.model_size_reg = model_size_reg;
+        self
+    }
+
+    /// Enable periodic checkpointing (`save_snapshot`, upstream default
+    /// `false`).
+    ///
+    /// Requires [`Self::snapshot_file`]. When enabled, the fit writes a
+    /// checkpoint at most every [`Self::snapshot_interval`] and RESUMES
+    /// automatically if the file already exists.
+    ///
+    /// Snapshotting is implemented for the NUMERIC path only (the engine's
+    /// `train_with_snapshot` entry takes neither categorical columns nor eval
+    /// sets); a categorical or eval-set fit with snapshotting on is refused at
+    /// [`Self::fit`] rather than silently training without checkpoints.
+    #[must_use]
+    pub fn save_snapshot(mut self, save_snapshot: bool) -> Self {
+        self.save_snapshot = save_snapshot;
+        self
+    }
+
+    /// The checkpoint path (`snapshot_file`). Setting it implies nothing on its
+    /// own — [`Self::save_snapshot`] enables the behaviour.
+    #[must_use]
+    pub fn snapshot_file(mut self, snapshot_file: impl Into<std::path::PathBuf>) -> Self {
+        self.snapshot_file = Some(snapshot_file.into());
+        self
+    }
+
+    /// Minimum wall-clock time between checkpoint writes (`snapshot_interval`,
+    /// upstream default 600s). A zero interval writes on every completed
+    /// iteration.
+    #[must_use]
+    pub fn snapshot_interval(mut self, snapshot_interval: std::time::Duration) -> Self {
+        self.snapshot_interval = snapshot_interval;
         self
     }
 
@@ -1071,6 +1132,7 @@ impl CatBoostBuilder {
                 final_ctr_computation_mode: self.final_ctr_computation_mode,
                 ctr_history_unit: self.ctr_history_unit,
                 allow_const_label: self.allow_const_label,
+                model_size_reg: self.model_size_reg,
             },
         }
     }
@@ -1578,7 +1640,62 @@ impl CatBoostBuilder {
         // The cat-free arm is left EXACTLY as it was (same `train` call, same
         // arguments, same order), so a numeric pool is bit-identical to the
         // pre-F09 result — the F21 no-regression gate.
-        let canonical = if pool.cat_features().is_empty() {
+        // SNAPSHOTTING (`save_snapshot` / `snapshot_file` / `snapshot_interval`).
+        // The engine's checkpoint entry (`train_with_snapshot`) is the NUMERIC
+        // path only — it takes neither categorical columns nor eval sets — so a
+        // categorical or eval-set fit with snapshotting on is REFUSED rather than
+        // silently trained without checkpoints, which would lose the very
+        // durability the caller asked for.
+        let snapshot_cfg = if self.save_snapshot {
+            let Some(path) = self.snapshot_file.clone() else {
+                return Err(CatBoostError::InvalidConfig(
+                    "save_snapshot=true requires snapshot_file to be set".to_owned(),
+                ));
+            };
+            if !pool.cat_features().is_empty() {
+                return Err(CatBoostError::InvalidConfig(
+                    "save_snapshot is implemented for the numeric path only; this pool                      has categorical columns. Train without snapshotting, or drop the                      categorical features."
+                        .to_owned(),
+                ));
+            }
+            if !eval_pools.is_empty() {
+                return Err(CatBoostError::InvalidConfig(
+                    "save_snapshot is implemented for the numeric path only and does not                      carry eval sets; fit without an eval_set to use snapshotting."
+                        .to_owned(),
+                ));
+            }
+            Some(cb_train::SnapshotConfig {
+                snapshot_file: path,
+                snapshot_interval: self.snapshot_interval,
+            })
+        } else {
+            None
+        };
+
+        let canonical = if let Some(cfg) = snapshot_cfg {
+            // DENSIFY the weights before handing them to the snapshot entry. An
+            // unweighted `Pool` carries an EMPTY weight vector, but the resume
+            // fingerprint is hashed over the EFFECTIVE per-object weights, which
+            // the trainer densifies to all-ones internally. Passing `&[]` here
+            // makes the fingerprint written during the fit disagree with the one
+            // recomputed on resume, so every resume fails with a spurious "the
+            // training data or parameters changed".
+            let dense_weights: Vec<f64> = if weights.is_empty() {
+                vec![1.0; pool.n_rows()]
+            } else {
+                weights.to_vec()
+            };
+            let (trained, _resumed_from) = cb_train::train_with_snapshot(
+                &backend,
+                feature_values,
+                &feature_borders,
+                pool.label(),
+                &dense_weights,
+                &params,
+                &cfg,
+            )?;
+            cb_model::Model::from_trained(&trained, feature_borders)
+        } else if pool.cat_features().is_empty() {
             let trained = train_with_eval_sets(
                 &backend,
                 feature_values,

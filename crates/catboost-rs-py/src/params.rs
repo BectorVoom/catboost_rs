@@ -184,6 +184,14 @@ const IMPLEMENTED: &[&str] = &[
     // `allow_const_label`: a real behavioural gate — an all-equal learn target is
     // REFUSED unless this is set, mirroring upstream's `metric.cpp:7011`.
     "allow_const_label",
+    // Wire-ups: the engine already implemented these, but nothing could reach
+    // them. `model_size_reg`'s CTR-projection weight existed with the boosting
+    // loop pinning it to the default; `cb_train::train_with_snapshot` existed
+    // with no caller at all.
+    "model_size_reg",
+    "save_snapshot",
+    "snapshot_file",
+    "snapshot_interval",
     // The LOGGING family (category 4, VALIDATED-INFORMATIONAL — see the module
     // doc). These are OUTPUT controls: measured against catboost 1.2.10 they are
     // numerically INERT (max |diff| = 0 across Silent/Verbose/Info/Debug,
@@ -314,6 +322,14 @@ const VOCABULARY: &[&str] = &[
     "max_ctr_complexity",
     "has_time",
     "allow_const_label",
+    // Wire-ups: the engine already implemented these, but nothing could reach
+    // them. `model_size_reg`'s CTR-projection weight existed with the boosting
+    // loop pinning it to the default; `cb_train::train_with_snapshot` existed
+    // with no caller at all.
+    "model_size_reg",
+    "save_snapshot",
+    "snapshot_file",
+    "snapshot_interval",
     "target_border",
     "classes_count",
     "class_weights",
@@ -1316,6 +1332,22 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<bool>(params, py, "allow_const_label")? {
         builder = builder.allow_const_label(v);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "model_size_reg")? {
+        // Upstream accepts a non-negative penalty exponent.
+        check_range("model_size_reg", v, 0.0, f64::INFINITY, true)?;
+        builder = builder.model_size_reg(v);
+    }
+    if let Some(v) = get_with_aliases::<bool>(params, py, "save_snapshot")? {
+        builder = builder.save_snapshot(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "snapshot_file")? {
+        builder = builder.snapshot_file(v);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "snapshot_interval")? {
+        // Upstream takes SECONDS.
+        check_range("snapshot_interval", v, 0.0, f64::INFINITY, true)?;
+        builder = builder.snapshot_interval(std::time::Duration::from_secs_f64(v));
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "ctr_history_unit")? {
         // `Group` PARSES (it is a legal upstream token) and is refused later at
