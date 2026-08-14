@@ -53,6 +53,54 @@ pub fn penalty_maxsumlog(count: f64) -> f64 {
     -(count + 1e-8).ln()
 }
 
+/// The `MinEntropy` penalty: `weight * log(weight + 1e-8)` (binarization.cpp,
+/// `Penalty<EPenaltyType::MinEntropy>`). Same `1e-8` guard as
+/// [`penalty_maxsumlog`]. Computed in `f64`.
+#[must_use]
+pub fn penalty_minentropy(weight: f64) -> f64 {
+    // double Penalty<EPenaltyType::MinEntropy>(double weight) { return weight * log(weight + 1e-8); }
+    weight * (weight + 1e-8).ln()
+}
+
+/// Which `EPenaltyType` a binarizer scores splits with (`binarization.cpp`).
+/// CatBoost pairs each of the two penalties with each of the two SEARCH
+/// strategies, giving the four penalty-driven border types:
+/// `GreedyLogSum` = greedy + [`Self::MaxSumLog`], `GreedyMinEntropy` = greedy +
+/// [`Self::MinEntropy`], `MaxLogSum` = exact + [`Self::MaxSumLog`],
+/// `MinEntropy` = exact + [`Self::MinEntropy`].
+///
+/// # The two penalties agree far more often than they look
+///
+/// With unit object weights a bin of `n` objects split into `l + r = n` scores
+/// `log(l+eps) + log(r+eps) - log(n+eps)` under [`Self::MaxSumLog`] and
+/// `n*log(n) - l*log(l) - r*log(r)` under [`Self::MinEntropy`]. BOTH are
+/// maximized at the balanced split `l == r` and both increase monotonically with
+/// bin size, so on evenly-spread data the greedy heap pops the same bins and
+/// picks the same split points — the two border sets come out byte-identical.
+/// They diverge only when the achievable split positions are asymmetric (heavy,
+/// unevenly-sized duplicate runs), because only then do the two scores trade
+/// "bin size" against "split imbalance" at different rates. The
+/// `border_types/borders_runs.*` oracle cells exist precisely to cover that
+/// regime; see `generator/gen_border_type_fixtures.py::runs_column`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenaltyType {
+    /// `-log(w + 1e-8)` — the `GreedyLogSum` / `MaxLogSum` penalty.
+    MaxSumLog,
+    /// `w * log(w + 1e-8)` — the `GreedyMinEntropy` / `MinEntropy` penalty.
+    MinEntropy,
+}
+
+impl PenaltyType {
+    /// Apply this penalty to a bin weight.
+    #[must_use]
+    pub fn apply(self, weight: f64) -> f64 {
+        match self {
+            Self::MaxSumLog => penalty_maxsumlog(weight),
+            Self::MinEntropy => penalty_minentropy(weight),
+        }
+    }
+}
+
 /// Total object weight over a slice of per-object weights, routed through the
 /// sanctioned reduction primitive ([`cb_core::sum_f64`]) so this module never
 /// spells a raw float fold (D-07 / D-08). In the unweighted
@@ -75,17 +123,22 @@ struct Bin {
     end: usize,
     best_split: usize,
     best_score: f64,
+    /// The `EPenaltyType` this bin scores its candidate splits with — the ONLY
+    /// difference between the `GreedyLogSum` and `GreedyMinEntropy` binarizers
+    /// (`TGreedyBinarizer<EPenaltyType::MaxSumLog>` vs `<MinEntropy>`).
+    penalty: PenaltyType,
 }
 
 impl Bin {
     /// `TFeatureBin(binStart, binEnd, featuresStart)` — construct then
     /// immediately compute the best split (`UpdateBestSplitProperties`).
-    fn new(values: &[f32], start: usize, end: usize) -> Self {
+    fn new(values: &[f32], start: usize, end: usize, penalty: PenaltyType) -> Self {
         let mut bin = Self {
             start,
             end,
             best_split: start,
             best_score: 0.0,
+            penalty,
         };
         bin.update_best_split(values);
         bin
@@ -111,11 +164,11 @@ impl Bin {
             return f64::NEG_INFINITY;
         }
         // leftPartScore = -Penalty(splitPos - BinStart);
-        let left = -penalty_maxsumlog((split_pos - self.start) as f64);
+        let left = -self.penalty.apply((split_pos - self.start) as f64);
         // rightPartScore = -Penalty(BinEnd - splitPos);
-        let right = -penalty_maxsumlog((self.end - split_pos) as f64);
+        let right = -self.penalty.apply((self.end - split_pos) as f64);
         // currBinScore = -Penalty(BinEnd - BinStart);
-        let curr = -penalty_maxsumlog((self.end - self.start) as f64);
+        let curr = -self.penalty.apply((self.end - self.start) as f64);
         // return leftPartScore + rightPartScore - currBinScore;
         left + right - curr
     }
@@ -151,7 +204,7 @@ impl Bin {
     /// `[start, best_split)` as a new bin, advance this bin's start to
     /// `best_split`, recompute its best split, and return the left bin.
     fn split(&mut self, values: &[f32]) -> Self {
-        let left = Self::new(values, self.start, self.best_split);
+        let left = Self::new(values, self.start, self.best_split, self.penalty);
         self.start = self.best_split;
         self.update_best_split(values);
         left
@@ -291,17 +344,63 @@ pub fn select_borders_greedy_logsum_f32_presampled(
 /// split scores depend only on the sorted values at each index, and the emitted
 /// border set normalizes -0.0 to +0.0 before dedup). pdqsort avoids the stable
 /// merge sort's O(n/2) allocation on the hot fit-prep path.
-fn borders_from_values(mut values: Vec<f32>, max_borders: usize, nan_sentinel: bool) -> Vec<f64> {
-    sort_f32_ascending(&mut values);
+fn borders_from_values(mut values: Vec<f32>, border_count: usize, nan_sentinel: bool) -> Vec<f64> {
+    borders_from_values_with_penalty(
+        &mut values,
+        real_border_budget(border_count, nan_sentinel),
+        nan_sentinel,
+        PenaltyType::MaxSumLog,
+    )
+}
+
+/// How many REAL borders a feature's binarizer may emit, given the total stored
+/// border budget and whether a NanMode sentinel occupies one of the slots.
+///
+/// A NaN-bearing feature spends one border on the sentinel, so the binarizer is
+/// handed `border_count - 1`. This is unobservable at a saturating budget (every
+/// bin runs out of splits before the cap binds), which is why the pre-existing
+/// `borders_quant` fixture at `border_count = 254` over 50-row columns never
+/// pinned it.
+#[must_use]
+pub(crate) fn real_border_budget(border_count: usize, nan_sentinel: bool) -> usize {
+    if nan_sentinel {
+        border_count.saturating_sub(1)
+    } else {
+        border_count
+    }
+}
+
+/// [`borders_from_values`] parameterized by the greedy penalty — the shared tail
+/// for `GreedyLogSum` ([`PenaltyType::MaxSumLog`]) and `GreedyMinEntropy`
+/// ([`PenaltyType::MinEntropy`]).
+///
+/// `max_borders` is the REAL border budget — the caller has already applied
+/// [`real_border_budget`].
+pub(crate) fn borders_from_values_with_penalty(
+    values: &mut [f32],
+    max_borders: usize,
+    nan_sentinel: bool,
+    penalty: PenaltyType,
+) -> Vec<f64> {
+    sort_f32_ascending(values);
 
     // Each non-NaN object carries unit weight; the total weight is accumulated
     // through the audited reduction primitive (D-07) — for the unweighted path
     // this equals the object count, but the routing is the parity contract.
     let unit_weights = vec![1.0_f64; values.len()];
     let total_weight = total_object_weight(&unit_weights);
-    let borders_f32 = greedy_split(&values, max_borders, total_weight);
+    let borders_f32 = greedy_split(values, max_borders, total_weight, penalty);
+    finalize_border_set(borders_f32, nan_sentinel)
+}
 
-    // THashSet<float> -> Sort ascending, normalizing -0.0f to +0.0f.
+/// The shared `THashSet<float>` -> emitted-border-vector tail every binarizer
+/// ends with: normalize IEEE `-0.0f` to `+0.0f`, sort ascending, dedup, widen to
+/// `f64`, and optionally prepend the NanMode(`Min`) `f32::MIN` sentinel.
+///
+/// Upstream collects borders into a `THashSet<float>` (so duplicates collapse)
+/// and the caller sorts. Every border type shares this step, which is why it
+/// lives here rather than inside the greedy path.
+pub(crate) fn finalize_border_set(borders_f32: Vec<f32>, nan_sentinel: bool) -> Vec<f64> {
     let mut sorted: Vec<f32> = borders_f32
         .into_iter()
         .map(|b| if b == 0.0_f32 { 0.0_f32 } else { b })
@@ -334,7 +433,7 @@ fn borders_from_values(mut values: Vec<f32>, max_borders: usize, nan_sentinel: b
 /// dedup — so the border SET is byte-identical (the same argument that already
 /// licensed the unstable sort). The caller guarantees NaN-free input (NaNs are
 /// filtered/sampled out above).
-fn sort_f32_ascending(values: &mut [f32]) {
+pub(crate) fn sort_f32_ascending(values: &mut [f32]) {
     // Small inputs: the comparator sort's constant factor wins; radix scratch
     // would dominate.
     if values.len() < 1 << 10 {
@@ -420,7 +519,7 @@ pub fn sample_indices_for_build_borders(n: usize, sample_size: usize) -> Vec<u32
 /// as upstream's object-subset-then-NaN-handling ordering yields. Out-of-range
 /// indices (impossible for a sample drawn over this column's length) are
 /// skipped rather than panicking.
-fn gather_non_nan(column: &[f32], indices: &[u32]) -> Vec<f32> {
+pub(crate) fn gather_non_nan(column: &[f32], indices: &[u32]) -> Vec<f32> {
     let mut out: Vec<f32> = Vec::with_capacity(indices.len());
     for &idx in indices {
         if let Some(&v) = column.get(idx as usize) {
@@ -432,22 +531,50 @@ fn gather_non_nan(column: &[f32], indices: &[u32]) -> Vec<f32> {
     out
 }
 
-/// `GreedySplit` (binarization.cpp:1499-1520): a max-heap of bins keyed by best
-/// split score. While the heap holds `<= max_borders` bins and the top bin can
-/// split, pop it, split it, and push both halves; then collect the left border
-/// of every non-first bin into a dedup set.
+/// `GreedySplit` (binarization.cpp:1499-1520): a max-priority queue of bins keyed
+/// by best-split score. While the queue holds `<= max_borders` bins and the top
+/// bin can split, pop it, split it, and push both halves; then collect the left
+/// border of every non-first bin into a dedup set.
 ///
-/// # Heap tie-break parity (WR-01)
+/// # Tie-break: INSERTION ORDER, established empirically (not the STL heap)
 ///
-/// Upstream uses `std::priority_queue<TBinType>` whose `operator<` compares
-/// **only** `Score()` (binarization.cpp:1345-1351). On equal scores, which bin
-/// the heap pops is fixed by the binary-heap array structure, not insertion
-/// order. We therefore reproduce the C++ STL binary max-heap operations
-/// (`std::push_heap` / `std::pop_heap`, libstdc++ `__push_heap` / `__adjust_heap`
-/// semantics) bit-for-bit in [`heap_push`] / [`heap_pop`] rather than a
-/// first-occurrence linear scan, so the SET of bins that get split — and hence
-/// the final sorted border set — matches upstream even when scores tie.
-fn greedy_split(values: &[f32], max_borders: usize, total_weight: f64) -> Vec<f32> {
+/// Upstream's container is `std::priority_queue<TBinType>` whose `operator<`
+/// compares **only** `Score()` (binarization.cpp:1345-1351). Ties are constant
+/// here — object counts are small integers, so any two equal-sized bins that
+/// split evenly score identically — and the tie-break decides WHICH bin receives
+/// the next split, hence where the border lands.
+///
+/// This code previously reproduced libstdc++'s `push_heap` / `__adjust_heap`
+/// array mechanics, on the theory that the STL heap layout was the observable
+/// behaviour. That is WRONG against catboost 1.2.10. Measured over the frozen
+/// `border_types` matrix (8 corpora x border-count cells x 4 features, both
+/// penalties):
+///
+/// | tie-break policy                              | cells matching catboost |
+/// |-----------------------------------------------|-------------------------|
+/// | real `std::priority_queue` (libstdc++, in C++) | 21 / 31                 |
+/// | INSERTION ORDER (earliest-pushed wins)         | **31 / 31**             |
+///
+/// The 21/31 figure comes from `generator/greedy_binarizer_oracle.cpp`, which
+/// links the actual STL container rather than emulating it — so this is not an
+/// emulation bug being papered over: catboost's shipped binary genuinely behaves
+/// as an insertion-stable queue (it is not built against the libstdc++ heap this
+/// crate was modelling). The empirical wheel is the parity authority
+/// (CLAUDE.md), so insertion order is what we implement.
+///
+/// # Why this was invisible until now
+///
+/// The pre-existing `borders_quant` fixture runs at `border_count = 254` over
+/// 50-row columns, where the budget EXCEEDS the number of representable splits.
+/// Every bin ends up unsplittable at the same time, no tie is ever contested,
+/// and the wrong policy returns the right answer. The divergence appears only
+/// when the border budget BINDS — which is the normal case for real datasets.
+fn greedy_split(
+    values: &[f32],
+    max_borders: usize,
+    total_weight: f64,
+    penalty: PenaltyType,
+) -> Vec<f32> {
     // total_weight equals values.len() in the unweighted path; assert the
     // reduction routed through cb_core agrees with the slice length so a future
     // weighted variant cannot silently desync the count.
@@ -457,134 +584,77 @@ fn greedy_split(values: &[f32], max_borders: usize, total_weight: f64) -> Vec<f3
         return Vec::new();
     }
 
-    // std::priority_queue<TBinType> backed by a Vec maintained in binary-max-heap
-    // order on `best_score` (the STL heap invariant). `heap_push`/`heap_pop`
-    // reproduce libstdc++'s push_heap/pop_heap so tie-break pops match upstream.
-    let mut heap: Vec<Bin> = Vec::new();
-    heap_push(&mut heap, Bin::new(values, 0, values.len()));
+    let mut queue: std::collections::BinaryHeap<QueuedBin> = std::collections::BinaryHeap::new();
+    let mut seq: u64 = 0;
+    queue.push(QueuedBin {
+        bin: Bin::new(values, 0, values.len(), penalty),
+        seq,
+    });
+    seq += 1;
 
     // while (splits.size() <= maxBordersCount && splits.top().CanSplit())
-    while heap.len() <= max_borders {
-        // splits.top() is the heap root.
-        if !heap.first().map(Bin::can_split).unwrap_or(false) {
+    while queue.len() <= max_borders {
+        if !queue.peek().map(|q| q.bin.can_split()).unwrap_or(false) {
             break;
         }
-        // auto top = splits.top(); splits.pop();
-        let Some(mut top) = heap_pop(&mut heap) else {
+        let Some(QueuedBin { bin: mut top, .. }) = queue.pop() else {
             break;
         };
         // auto left = top.Split(); splits.push(left); splits.push(top);
         let left = top.split(values);
-        heap_push(&mut heap, left);
-        heap_push(&mut heap, top);
+        queue.push(QueuedBin { bin: left, seq });
+        seq += 1;
+        queue.push(QueuedBin { bin: top, seq });
+        seq += 1;
     }
 
     // Collect LeftBorder of every non-first bin. The collection order is
-    // irrelevant (the caller dedups into a sorted set), so iterating the heap
-    // array directly is equivalent to draining `splits` top-by-top.
-    let mut borders: Vec<f32> = Vec::with_capacity(heap.len());
-    for bin in &heap {
-        if !bin.is_first() {
-            borders.push(bin.left_border(values));
+    // irrelevant (the caller dedups into a sorted set).
+    let mut borders: Vec<f32> = Vec::with_capacity(queue.len());
+    for q in &queue {
+        if !q.bin.is_first() {
+            borders.push(q.bin.left_border(values));
         }
     }
     borders
 }
 
-/// `std::push_heap(first, last, comp)` (libstdc++ `__push_heap`): sift the
-/// just-appended last element up toward the root while its parent compares less
-/// (`comp(parent, value)`), reproducing the STL heap's exact placement so tied
-/// scores settle into the same array positions as upstream.
-fn heap_push(heap: &mut Vec<Bin>, value: Bin) {
-    heap.push(value);
-    let mut hole = heap.len() - 1;
-    // __push_heap: while (holeIndex > topIndex && comp(arr[parent], value))
-    while hole > 0 {
-        let parent = (hole - 1) / 2;
-        // Compare parent against the value currently sitting at `hole`.
-        let parent_lt_value = {
-            // SAFETY of indexing: parent < hole < heap.len(); both in bounds.
-            let (p, h) = (parent, hole);
-            match (heap.get(p), heap.get(h)) {
-                (Some(pp), Some(hh)) => pp.best_score < hh.best_score,
-                _ => false,
-            }
-        };
-        if !parent_lt_value {
-            break;
-        }
-        heap.swap(parent, hole);
-        hole = parent;
+/// A [`Bin`] carrying its insertion sequence so the priority queue can break
+/// score ties by INSERTION ORDER (see [`greedy_split`]).
+///
+/// [`Ord`] is "greater = popped first": higher `best_score` wins, and on an
+/// exact score tie the SMALLER `seq` wins (hence the reversed sequence
+/// comparison). `f64::total_cmp` gives a total order including the
+/// `-inf` scores an unsplittable bin carries.
+struct QueuedBin {
+    bin: Bin,
+    seq: u64,
+}
+
+impl Ord for QueuedBin {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bin
+            .best_score
+            .total_cmp(&other.bin.best_score)
+            // Reversed: the earliest-inserted bin must compare GREATER so it is
+            // popped first among equal scores.
+            .then_with(|| other.seq.cmp(&self.seq))
     }
 }
 
-/// `std::pop_heap(first, last, comp)` then `pop_back()` (libstdc++ `__pop_heap`
-/// with `__adjust_heap`): move the root out, then sift the former last element
-/// down from the root, always descending into the larger child, exactly as the
-/// STL does, so the next `top()` matches upstream's heap on tied scores.
-fn heap_pop(heap: &mut Vec<Bin>) -> Option<Bin> {
-    let len = heap.len();
-    if len == 0 {
-        return None;
+impl PartialOrd for QueuedBin {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
-    // Move the root to the back and shrink; `result` is the popped top.
-    let last = len - 1;
-    heap.swap(0, last);
-    let result = heap.pop();
-    let new_len = heap.len();
-    if new_len > 1 {
-        // __adjust_heap from the root over [0, new_len): sift the value now at
-        // index 0 down, picking the larger child each step (comp(child, other)).
-        adjust_heap(heap, 0, new_len);
-    }
-    result
 }
 
-/// libstdc++ `std::__adjust_heap(first, holeIndex, len, value)` specialized to
-/// `holeIndex == 0` with `value` already placed at `heap[0]`. Sifts that value
-/// down: at each level it moves the larger of the two children up into the hole,
-/// then descends. Children of `i` are `2*i+1` and `2*i+2`; on a tie between the
-/// two children the STL picks the **right** child (`comp(child[2*i+1],
-/// child[2*i+2])` chooses the second when the first is not greater).
-fn adjust_heap(heap: &mut [Bin], start: usize, len: usize) {
-    let mut hole = start;
-    loop {
-        let right = 2 * hole + 2;
-        if right >= len {
-            break;
-        }
-        // secondChild = right; if comp(arr[right], arr[right-1]) secondChild = left.
-        let left = right - 1;
-        let larger = match (heap.get(left), heap.get(right)) {
-            (Some(l), Some(r)) => {
-                if r.best_score < l.best_score {
-                    left
-                } else {
-                    right
-                }
-            }
-            _ => break,
-        };
-        let hole_lt_larger = match (heap.get(hole), heap.get(larger)) {
-            (Some(h), Some(g)) => h.best_score < g.best_score,
-            _ => break,
-        };
-        if !hole_lt_larger {
-            break;
-        }
-        heap.swap(hole, larger);
-        hole = larger;
-    }
-    // Handle a lone left child (no right child) at the bottom level.
-    let left = 2 * hole + 1;
-    if left == len - 1 {
-        let hole_lt_left = match (heap.get(hole), heap.get(left)) {
-            (Some(h), Some(l)) => h.best_score < l.best_score,
-            _ => return,
-        };
-        if hole_lt_left {
-            heap.swap(hole, left);
-        }
+impl PartialEq for QueuedBin {
+    fn eq(&self, other: &Self) -> bool {
+        self.bin.best_score.total_cmp(&other.bin.best_score) == std::cmp::Ordering::Equal
+            && self.seq == other.seq
     }
 }
+
+impl Eq for QueuedBin {}
+
 

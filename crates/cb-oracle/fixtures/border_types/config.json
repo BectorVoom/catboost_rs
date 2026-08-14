@@ -1,0 +1,795 @@
+{
+  "border_types": [
+    "Median",
+    "GreedyLogSum",
+    "UniformAndQuantiles",
+    "MinEntropy",
+    "MaxLogSum",
+    "Uniform",
+    "GreedyMinEntropy"
+  ],
+  "borders_layout": "<stem>.borders.npy = flat f64 (feature 0 borders, then feature 1, ...); <stem>.borders_per_feature.npy = per-feature counts. stem = <dataset>.bc<border_count>.<feature_border_type>",
+  "borders_source": "standalone Pool.quantize(...).save_quantization_borders()",
+  "catboost_version": "1.2.10",
+  "scenario": "border_types",
+  "scenarios": {
+    "borders_dense.bc128.GreedyLogSum": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        128,
+        128,
+        11,
+        128
+      ],
+      "n_borders_total": 395,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc128.GreedyMinEntropy": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        128,
+        128,
+        11,
+        128
+      ],
+      "n_borders_total": 395,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc128.MaxLogSum": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        128,
+        128,
+        11,
+        128
+      ],
+      "n_borders_total": 395,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc128.Median": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        128,
+        128,
+        11,
+        128
+      ],
+      "n_borders_total": 395,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc128.MinEntropy": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        128,
+        128,
+        11,
+        128
+      ],
+      "n_borders_total": 395,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc128.Uniform": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "n_borders_total": 512,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc128.UniformAndQuantiles": {
+      "border_count": 128,
+      "dataset": "borders_dense",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        128,
+        103,
+        11,
+        116
+      ],
+      "n_borders_total": 358,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.GreedyLogSum": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        16,
+        16,
+        11,
+        16
+      ],
+      "n_borders_total": 59,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.GreedyMinEntropy": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        16,
+        16,
+        11,
+        16
+      ],
+      "n_borders_total": 59,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.MaxLogSum": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        16,
+        16,
+        11,
+        16
+      ],
+      "n_borders_total": 59,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.Median": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        16,
+        16,
+        11,
+        16
+      ],
+      "n_borders_total": 59,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.MinEntropy": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        16,
+        16,
+        11,
+        16
+      ],
+      "n_borders_total": 59,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.Uniform": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "n_borders_total": 64,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_dense.bc16.UniformAndQuantiles": {
+      "border_count": 16,
+      "dataset": "borders_dense",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        16,
+        16,
+        10,
+        15
+      ],
+      "n_borders_total": 57,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.GreedyLogSum": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "n_borders_total": 64,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.GreedyMinEntropy": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "n_borders_total": 64,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.MaxLogSum": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "n_borders_total": 64,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.Median": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        11,
+        14,
+        14,
+        12
+      ],
+      "n_borders_total": 51,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.MinEntropy": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "n_borders_total": 64,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.Uniform": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "n_borders_total": 64,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc16.UniformAndQuantiles": {
+      "border_count": 16,
+      "dataset": "borders_runs",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        12,
+        16,
+        15,
+        12
+      ],
+      "n_borders_total": 55,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.GreedyLogSum": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        22,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 118,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.GreedyMinEntropy": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        22,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 118,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.MaxLogSum": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        22,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 118,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.Median": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        14,
+        21,
+        24,
+        20
+      ],
+      "n_borders_total": 79,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.MinEntropy": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        22,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 118,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.Uniform": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc32.UniformAndQuantiles": {
+      "border_count": 32,
+      "dataset": "borders_runs",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        17,
+        24,
+        26,
+        21
+      ],
+      "n_borders_total": 88,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.GreedyLogSum": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.GreedyMinEntropy": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.MaxLogSum": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.Median": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        7,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 31,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.MinEntropy": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.Uniform": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "borders_runs.bc8.UniformAndQuantiles": {
+      "border_count": 8,
+      "dataset": "borders_runs",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        8,
+        7,
+        7,
+        7
+      ],
+      "n_borders_total": 29,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.GreedyLogSum": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 24,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.GreedyMinEntropy": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 24,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.MaxLogSum": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 24,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.Median": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 24,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.MinEntropy": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 24,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.Uniform": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 24,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_nan.bc8.UniformAndQuantiles": {
+      "border_count": 8,
+      "dataset": "numeric_nan",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        8,
+        8,
+        7
+      ],
+      "n_borders_total": 23,
+      "n_features": 3,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.GreedyLogSum": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.GreedyMinEntropy": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.MaxLogSum": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.Median": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.MinEntropy": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.Uniform": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "n_borders_total": 128,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc32.UniformAndQuantiles": {
+      "border_count": 32,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        25,
+        21,
+        26,
+        23
+      ],
+      "n_borders_total": 95,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.GreedyLogSum": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "GreedyLogSum",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.GreedyMinEntropy": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "GreedyMinEntropy",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.MaxLogSum": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "MaxLogSum",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.Median": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "Median",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.MinEntropy": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "MinEntropy",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.Uniform": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "Uniform",
+      "n_borders_per_feature": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "n_borders_total": 32,
+      "n_features": 4,
+      "nan_mode": "Min"
+    },
+    "numeric_tiny.bc8.UniformAndQuantiles": {
+      "border_count": 8,
+      "dataset": "numeric_tiny",
+      "feature_border_type": "UniformAndQuantiles",
+      "n_borders_per_feature": [
+        6,
+        7,
+        8,
+        8
+      ],
+      "n_borders_total": 29,
+      "n_features": 4,
+      "nan_mode": "Min"
+    }
+  },
+  "under_budget_rationale": "Every cell runs with border_count BELOW the column's unique-value count. At or above saturation all seven binarizers collapse to the same answer and the fixture would pass for a wrong implementation."
+}

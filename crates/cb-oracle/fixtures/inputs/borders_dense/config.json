@@ -1,0 +1,13 @@
+{
+  "columns": [
+    "uniform(-5,5)",
+    "lognormal(0,1.5)",
+    "discrete integers 0..11",
+    "bimodal normal mixture(-3,0.4)+(4,1.2)"
+  ],
+  "dataset": "borders_dense",
+  "purpose": "Spread corpus for feature_border_type: skewed and low-cardinality columns make equal-frequency, equal-width and penalty-optimal binarizers disagree.",
+  "rows": 2000,
+  "seed": 20260814,
+  "y": "all zeros - border selection is unsupervised and never reads the label"
+}

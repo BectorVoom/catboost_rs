@@ -24,6 +24,7 @@
     )
 )]
 
+mod border_types;
 mod borders;
 mod cat_hash;
 pub mod ingest;
@@ -34,9 +35,11 @@ mod quantized_pool;
 pub mod text;
 mod weights;
 
+pub use border_types::{select_borders, select_borders_f32, EBorderSelectionType};
 pub use borders::{
-    penalty_maxsumlog, sample_indices_for_build_borders, select_borders_greedy_logsum,
-    select_borders_greedy_logsum_f32, select_borders_greedy_logsum_f32_presampled,
+    penalty_maxsumlog, penalty_minentropy, sample_indices_for_build_borders,
+    select_borders_greedy_logsum, select_borders_greedy_logsum_f32,
+    select_borders_greedy_logsum_f32_presampled, PenaltyType,
     MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
 };
 pub use cat_hash::{

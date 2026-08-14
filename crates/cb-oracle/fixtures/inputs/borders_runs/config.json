@@ -1,0 +1,18 @@
+{
+  "columns": [
+    "small unique-value set with wildly uneven duplicate run lengths",
+    "small unique-value set with wildly uneven duplicate run lengths",
+    "small unique-value set with wildly uneven duplicate run lengths",
+    "small unique-value set with wildly uneven duplicate run lengths"
+  ],
+  "dataset": "borders_runs",
+  "purpose": "The DISCRIMINATING corpus. On evenly-spread data the MaxSumLog and MinEntropy penalties provably coincide (both peak at the balanced split and both grow with bin size), so GreedyMinEntropy is byte-identical to GreedyLogSum and MinEntropy to MaxLogSum. Uneven duplicate runs break that tie, which is what makes the border_types fixture non-vacuous for those two binarizers. See generator/gen_border_type_fixtures.py::runs_column.",
+  "rows": 1200,
+  "seeds": [
+    51,
+    33,
+    15,
+    28
+  ],
+  "y": "all zeros - border selection is unsupervised and never reads the label"
+}
