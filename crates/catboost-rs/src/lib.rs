@@ -76,7 +76,8 @@ pub use cb_train::{CounterCalcMethod, ECtrType};
 // (`"AUC"`, `"Quantile:alpha=0.9"`) is how upstream names a metric — without it a
 // caller would have to reconstruct the parametric variants by hand.
 pub use cb_train::{
-    parse_metric, EBoostingType, EGrowPolicy, EOverfittingDetectorType, EvalMetric,
+    parse_metric, EBoostingType, EGrowPolicy, EModelShrinkMode, EOverfittingDetectorType,
+    EvalMetric,
 };
 
 // Re-export the Pool ingestion surface (the `fit`/predict input) from the

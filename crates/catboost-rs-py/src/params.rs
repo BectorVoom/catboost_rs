@@ -60,7 +60,8 @@ use std::collections::BTreeMap;
 use catboost_rs::{
     parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
     EBootstrapType, EBorderSelectionType, ECtrType, EGrowPolicy, EOverfittingDetectorType,
-    EScoreFunction, EvalMetric, LeafEstimationBacktracking, LeafMethod, Loss, NanMode,
+    EModelShrinkMode, EScoreFunction, EvalMetric, LeafEstimationBacktracking, LeafMethod, Loss,
+    NanMode,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -165,6 +166,11 @@ const IMPLEMENTED: &[&str] = &[
     // not implemented here). `Armijo` is GPU-only upstream and is REJECTED, so
     // the parameter has real observable behaviour rather than being a no-op.
     "leaf_estimation_backtracking",
+    // Model shrinkage. `model_shrink_rate = 0` (the upstream default) is INERT
+    // and leaves the boosting loop byte-identical; a non-zero rate multiplies the
+    // whole accumulated model each iteration and declines the device grower.
+    "model_shrink_rate",
+    "model_shrink_mode",
 ];
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
@@ -750,6 +756,15 @@ fn parse_leaf_backtracking(name: &str) -> PyResult<LeafEstimationBacktracking> {
     })
 }
 
+/// Map a `model_shrink_mode` string onto an [`EModelShrinkMode`].
+fn parse_model_shrink_mode(name: &str) -> PyResult<EModelShrinkMode> {
+    EModelShrinkMode::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown model_shrink_mode `{name}`; expected one of Constant, Decreasing"
+        ))
+    })
+}
+
 /// Map a `bootstrap_type` string onto an [`EBootstrapType`].
 fn parse_bootstrap_type(name: &str) -> PyResult<EBootstrapType> {
     match name {
@@ -1183,6 +1198,15 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "leaf_estimation_backtracking")? {
         builder = builder.leaf_estimation_backtracking(parse_leaf_backtracking(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "model_shrink_rate")? {
+        // Upstream accepts [0, 1): a rate of 1 would annihilate the model every
+        // iteration.
+        check_range("model_shrink_rate", v, 0.0, 1.0, true)?;
+        builder = builder.model_shrink_rate(v);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "model_shrink_mode")? {
+        builder = builder.model_shrink_mode(parse_model_shrink_mode(&v)?);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "bootstrap_type")? {
         builder = builder.bootstrap_type(parse_bootstrap_type(&v)?);

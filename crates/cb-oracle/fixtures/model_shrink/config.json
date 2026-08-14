@@ -1,0 +1,35 @@
+{
+  "Constant_vs_unshrunk_max_abs_diff": 0.590920723256743,
+  "Decreasing_vs_unshrunk_max_abs_diff": 0.5515407423158667,
+  "catboost_version": "1.2.10",
+  "constant_vs_decreasing_max_abs_diff": 0.3921514951456815,
+  "model_shrink_rate": 0.1,
+  "modes": [
+    "Constant",
+    "Decreasing"
+  ],
+  "multipliers": {
+    "Constant": "1 - model_shrink_rate * learning_rate, every iteration",
+    "Decreasing": "1 - model_shrink_rate / i at 1-based shrink step i"
+  },
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "rate_zero_vs_unset_max_abs_diff": 0.0,
+  "scenario": "model_shrink",
+  "seed": 20260814
+}

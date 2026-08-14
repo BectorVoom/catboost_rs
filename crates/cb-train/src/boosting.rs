@@ -4214,7 +4214,10 @@ fn train_inner<R: Runtime>(
     // multiclass, else the raw target (unchanged for every scalar / binary loss).
     let target: &[f64] = remapped_target.as_deref().unwrap_or(target);
 
-    let bias = starting_approx(params, target);
+    // `mut` for `model_shrink_rate`: shrinkage multiplies the ENTIRE accumulated
+    // model each iteration, and the bias is part of that model. It stays
+    // effectively immutable at the default `model_shrink_rate = 0.0`.
+    let mut bias = starting_approx(params, target);
     // RMSEWithUncertainty (Wave B, LOSS-08 / D-6.4-04) starts from the per-dimension
     // optimal-constant `[mean, 0.5·log(var)]` REGARDLESS of `boost_from_average`
     // (`train_model.cpp:858`), unlike every other loss (single scalar `bias`). The
@@ -4788,6 +4791,14 @@ fn train_inner<R: Runtime>(
     // to the device; a later Ok(None) from a covered fit is a mid-run mix and is
     // rejected (T-10-23), never silently backfilled with a CPU tree.
     let device_host_eligible = group_spans.is_none()
+        // MODEL SHRINKAGE declines to the CPU grower. The shrink rescales the
+        // running approx every iteration, but the device path keeps its approx
+        // RESIDENT on the GPU and never reads the host copy back per tree — so a
+        // host-side rescale would be silently dropped and the device model would
+        // diverge from the CPU one. Declining is the honest behaviour until the
+        // shrink is applied device-side; `model_shrink_rate = 0.0` (the default)
+        // leaves every existing device fit eligible exactly as before.
+        && params.extra.model_shrink_rate == 0.0
         // FPP-20 (T23): the former `ordered_learning_perm.is_none()` clause is GONE. It was
         // the host half of the ordered decline — the session-side gate was the other half —
         // and it existed because the device had no way to score a candidate over the fold's
@@ -5469,6 +5480,53 @@ fn train_inner<R: Runtime>(
     // `resume_from` is 0 unless a checkpoint was just restored, so the non-snapshot
     // path keeps the original `0..iterations` bound byte-for-byte (the D-04 anchor).
     for iter in resume_from..params.iterations {
+        // ─── MODEL SHRINKAGE (`model_shrink_rate` / `model_shrink_mode`) ─────────
+        // Upstream multiplies the ENTIRE accumulated model before growing the next
+        // tree: the bias AND every already-grown tree's leaf values. Shrinking the
+        // model necessarily rescales the running approx too, which is what feeds
+        // the next tree's gradients — so the shrink is a training-dynamics change,
+        // not a post-hoc rescale.
+        //
+        // The FIRST tree is never shrunk (there is no model yet), so the 1-based
+        // shrink-step index is exactly `iter`. Verified against catboost 1.2.10:
+        // at rate=0.1, lr=0.3, 5 iterations, tree 0's saved leaves come back scaled
+        // by 0.97^4 under `Constant` and by 0.9*0.95*0.96667*0.975 under
+        // `Decreasing` — i.e. four applications, one per iteration after the first.
+        //
+        // Inert at the default `model_shrink_rate = 0.0`: the guard skips the whole
+        // block, so every existing fit stays byte-identical.
+        if params.extra.model_shrink_rate != 0.0 && iter > 0 {
+            let mult = params.extra.model_shrink_mode.multiplier(
+                params.extra.model_shrink_rate,
+                params.learning_rate,
+                iter,
+            );
+            bias *= mult;
+            for tree in &mut trees {
+                for v in &mut tree.leaf_values {
+                    *v *= mult;
+                }
+            }
+            for tree in &mut non_symmetric_trees {
+                for v in &mut tree.leaf_values {
+                    *v *= mult;
+                }
+            }
+            for tree in &mut region_trees {
+                for v in &mut tree.leaf_values {
+                    *v *= mult;
+                }
+            }
+            for a in &mut approx {
+                *a *= mult;
+            }
+            for set in &mut eval_approx {
+                for a in set {
+                    *a *= mult;
+                }
+            }
+        }
+
         // GPUT-01 DEVICE GROW BRANCH (D-10-01 per-fit all-or-nothing). When the fit
         // committed to the device path at `begin` (`device_active`), grow THIS
         // iteration's oblivious tree on the device seam and fold it into the Model

@@ -85,13 +85,14 @@ fn implemented_params_tag_implemented() {
 #[test]
 fn known_not_yet_params_tag_known_not_yet() {
     for name in [
-        // `nan_mode` used to sit here; the string-valued-parameter wave
-        // implemented it (sentinel-border quantization + a frozen catboost
-        // oracle), so calling it a parity gap became dishonest in the opposite
-        // direction. `model_shrink_rate` replaces it as a still-unimplemented
-        // member of the same (data/boosting-control) area.
-        "model_shrink_rate",
-        "leaf_estimation_iterations",
+        // This list keeps churning as the string-valued-parameter wave lands
+        // members of it: `nan_mode` left when sentinel-border quantization
+        // shipped, and `model_shrink_rate` left when model shrinkage did.
+        // Calling an implemented param a parity gap is dishonest in the opposite
+        // direction, so each departure is replaced by a param that is still
+        // genuinely unimplemented.
+        "eval_fraction",
+        "used_ram_limit",
         "rsm",
         "ctr_leaf_count_limit",
         "thread_count",
@@ -161,12 +162,12 @@ fn validate_accepts_implemented_and_aliases() {
 fn validate_rejects_known_not_yet_as_parity_gap() {
     Python::attach(|py| {
         let dict = PyDict::new(py);
-        dict.set_item("model_shrink_rate", 0.1).unwrap();
+        dict.set_item("eval_fraction", 0.1).unwrap();
         let params = params_from(py, &dict);
         let err = validate_params(&params).unwrap_err();
         assert!(err.is_instance_of::<CatBoostParameterError>(py));
         let msg = err.value(py).to_string();
-        assert!(msg.contains("model_shrink_rate"), "msg: {msg}");
+        assert!(msg.contains("eval_fraction"), "msg: {msg}");
         assert!(msg.contains("parity gap"), "msg: {msg}");
     });
 }
@@ -980,7 +981,7 @@ fn task_type_composes_with_other_params() {
         // …and a KnownNotYet param alongside it must still be rejected.
         let dict = PyDict::new(py);
         dict.set_item("task_type", "CPU").unwrap();
-        dict.set_item("model_shrink_rate", 0.1).unwrap();
+        dict.set_item("eval_fraction", 0.1).unwrap();
         validate_params(&params_from(py, &dict))
             .expect_err("a KnownNotYet param must still be rejected alongside task_type");
     });

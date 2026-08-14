@@ -42,7 +42,7 @@ use cb_train::{
     one_hot_max_size_default, penalties_coefficient_default, per_object_feature_penalties_default,
     permutation_count_default, score_function_default, simple_ctr_default,
     simple_ctr_priors_default, train_cat_with_eval_sets, train_with_eval_sets, BoostParams,
-    CounterCalcMethod, EBoostingType, EBootstrapType, ECtrType, EGrowPolicy,
+    CounterCalcMethod, EBoostingType, EBootstrapType, ECtrType, EGrowPolicy, EModelShrinkMode,
     EOverfittingDetectorType, EvalMetric, EvalMetricHistory, EvalSet,
 };
 
@@ -96,6 +96,13 @@ pub struct CatBoostBuilder {
     /// The leaf-step backtracking policy (`leaf_estimation_backtracking`) — see
     /// [`CatBoostBuilder::leaf_estimation_backtracking`].
     leaf_estimation_backtracking: LeafEstimationBacktracking,
+    /// Per-iteration model shrinkage (`model_shrink_rate`) — see
+    /// [`CatBoostBuilder::model_shrink_rate`].
+    model_shrink_rate: f64,
+    /// How that shrinkage decays (`model_shrink_mode`).
+    model_shrink_mode: EModelShrinkMode,
+    /// Leaf refinement steps per tree (`leaf_estimation_iterations`).
+    leaf_estimation_iterations: usize,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -319,6 +326,11 @@ impl CatBoostBuilder {
             // catboost's default nan_mode is Min.
             nan_mode: NanMode::Min,
             leaf_estimation_backtracking: LeafEstimationBacktracking::default(),
+            // 0.0 disables shrinkage (the upstream default); 1 leaf refinement
+            // step is this port's canonical default.
+            model_shrink_rate: 0.0,
+            model_shrink_mode: EModelShrinkMode::Constant,
+            leaf_estimation_iterations: 1,
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -538,6 +550,38 @@ impl CatBoostBuilder {
         self.leaf_estimation_backtracking = leaf_estimation_backtracking;
         self
     }
+
+    /// Per-iteration model shrinkage (`model_shrink_rate`, upstream default
+    /// `0.0` = disabled).
+    ///
+    /// Before each new tree, the ENTIRE accumulated model — the bias and every
+    /// already-grown tree's leaf values — is multiplied by a factor below 1.
+    /// That also rescales the running approximant the next tree's gradients come
+    /// from, so this changes training dynamics rather than merely rescaling the
+    /// output. [`Self::model_shrink_mode`] selects how the factor decays.
+    ///
+    /// A non-zero rate declines the device grower (the device keeps its approx
+    /// resident and would silently drop a host-side rescale), so a shrinking fit
+    /// runs on the CPU path.
+    #[must_use]
+    pub fn model_shrink_rate(mut self, model_shrink_rate: f64) -> Self {
+        self.model_shrink_rate = model_shrink_rate;
+        self
+    }
+
+    /// How [`Self::model_shrink_rate`] decays (`model_shrink_mode`, upstream
+    /// default [`EModelShrinkMode::Constant`]). Inert while the rate is `0.0`.
+    #[must_use]
+    pub fn model_shrink_mode(mut self, model_shrink_mode: EModelShrinkMode) -> Self {
+        self.model_shrink_mode = model_shrink_mode;
+        self
+    }
+
+    // NOTE: no public `leaf_estimation_iterations` setter yet. The field is
+    // carried through to `ExtraBoostParams` but the leaf estimator does not read
+    // it, so exposing a setter would ship an inert knob — exactly the silent
+    // no-op the params registry's honesty policy exists to prevent. The setter
+    // lands together with the multi-step estimator.
 
     /// Split-score function (`score_function`). [`EScoreFunction::Cosine`] is the
     /// catboost CPU default; [`EScoreFunction::L2`] is the variance-reduction
@@ -928,7 +972,12 @@ impl CatBoostBuilder {
             grow_policy: self.grow_policy,
             max_leaves: self.max_leaves,
             min_data_in_leaf: self.min_data_in_leaf,
-            extra: Default::default(),
+            extra: cb_train::ExtraBoostParams {
+                model_shrink_rate: self.model_shrink_rate,
+                model_shrink_mode: self.model_shrink_mode,
+                leaf_estimation_iterations: self.leaf_estimation_iterations,
+                leaf_estimation_backtracking: self.leaf_estimation_backtracking,
+            },
         }
     }
 
