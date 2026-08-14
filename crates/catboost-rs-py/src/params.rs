@@ -181,7 +181,66 @@ const IMPLEMENTED: &[&str] = &[
     // does not implement the other value on CPU either.
     "final_ctr_computation_mode",
     "ctr_history_unit",
+    // `allow_const_label`: a real behavioural gate — an all-equal learn target is
+    // REFUSED unless this is set, mirroring upstream's `metric.cpp:7011`.
+    "allow_const_label",
+    // The LOGGING family (category 4, VALIDATED-INFORMATIONAL — see the module
+    // doc). These are OUTPUT controls: measured against catboost 1.2.10 they are
+    // numerically INERT (max |diff| = 0 across Silent/Verbose/Info/Debug,
+    // silent, verbose, and metric_period). They are accepted and VALIDATED —
+    // including upstream's mutual-exclusion rule — but this engine emits no
+    // training log, so a verbose level produces no output.
+    //
+    // Accepting them is a real improvement over rejecting them: `verbose=False`
+    // is one of the most commonly passed kwargs in existing CatBoost code, and
+    // it cannot change a model.
+    "logging_level",
+    "verbose",
+    "silent",
+    "metric_period",
 ];
+
+/// The parameters upstream allows only ONE of. Passing two raises:
+/// "Only one of parameters ['verbose', 'logging_level', 'verbose_eval',
+/// 'silent'] should be set" (reproduced against catboost 1.2.10).
+///
+/// `verbose_eval` is included for message fidelity even though it is not in this
+/// crate's vocabulary; `metric_period` is deliberately NOT a member — upstream
+/// accepts it alongside `verbose`.
+const LOGGING_MUTUALLY_EXCLUSIVE: &[&str] = &["verbose", "logging_level", "verbose_eval", "silent"];
+
+/// The legal `logging_level` values (`ELoggingLevel`), probed from the wheel.
+const LOGGING_LEVELS: &[&str] = &["Silent", "Verbose", "Info", "Debug"];
+
+/// Enforce upstream's "only one of verbose / logging_level / verbose_eval /
+/// silent" rule, and validate `logging_level` against its enum.
+///
+/// # Errors
+/// `CatBoostParameterError` when more than one is supplied, or when
+/// `logging_level` is not a legal value.
+pub(crate) fn validate_logging_params(
+    params: &BTreeMap<String, Py<PyAny>>,
+    py: Python<'_>,
+) -> PyResult<()> {
+    let supplied: Vec<&str> = LOGGING_MUTUALLY_EXCLUSIVE
+        .iter()
+        .copied()
+        .filter(|name| params.contains_key(*name))
+        .collect();
+    if supplied.len() > 1 {
+        return Err(CatBoostParameterError::new_err(format!(
+            "Only one of parameters {LOGGING_MUTUALLY_EXCLUSIVE:?} should be set; got {supplied:?}"
+        )));
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "logging_level")? {
+        if !LOGGING_LEVELS.contains(&v.as_str()) {
+            return Err(CatBoostParameterError::new_err(format!(
+                "unknown logging_level `{v}`; expected one of {LOGGING_LEVELS:?}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
 /// one without a validation set is REJECTED rather than silently ignored (threat
@@ -533,6 +592,9 @@ pub(crate) fn validate_params(params: &BTreeMap<String, Py<PyAny>>) -> PyResult<
             }
         }
     }
+    // Upstream's cross-parameter logging rule, checked once the individual names
+    // are known to be legal.
+    Python::attach(|py| validate_logging_params(params, py))?;
     Ok(())
 }
 
@@ -1251,6 +1313,9 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "final_ctr_computation_mode")? {
         builder = builder.final_ctr_computation_mode(parse_final_ctr_mode(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<bool>(params, py, "allow_const_label")? {
+        builder = builder.allow_const_label(v);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "ctr_history_unit")? {
         // `Group` PARSES (it is a legal upstream token) and is refused later at

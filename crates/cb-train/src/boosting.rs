@@ -382,6 +382,11 @@ pub struct ExtraBoostParams {
     /// `ctr_history_unit` — the ordered-CTR history granularity. Only `Sample`
     /// is implemented on CPU, upstream included.
     pub ctr_history_unit: ECtrHistoryUnit,
+    /// `allow_const_label` — whether a learn set whose targets are ALL EQUAL is
+    /// allowed. Upstream refuses it by default ("All train targets are equal",
+    /// `metric.cpp:7011`) because most metrics are undefined on a constant
+    /// target; with the flag set it trains and predicts that constant.
+    pub allow_const_label: bool,
 }
 
 impl Default for ExtraBoostParams {
@@ -396,6 +401,7 @@ impl Default for ExtraBoostParams {
             random_score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
             final_ctr_computation_mode: EFinalCtrComputationMode::Default,
             ctr_history_unit: ECtrHistoryUnit::Sample,
+            allow_const_label: false,
         }
     }
 }
@@ -4132,6 +4138,22 @@ fn train_inner<R: Runtime>(
     // a model the caller did not ask for — the same honesty rule the params
     // registry applies to unimplemented kwargs.
     validate_leaf_estimation_iterations(params, !ranking.group_id.is_empty())?;
+
+    // A CONSTANT learn target is refused unless `allow_const_label` opts in,
+    // mirroring upstream (`metric.cpp:7011`, "All train targets are equal").
+    // Most metrics are undefined on a constant target, and a silently-trained
+    // degenerate model is worse than a named error. Checked on the RAW target,
+    // before any loss-specific remapping.
+    if !params.extra.allow_const_label && target.len() > 1 {
+        let first = target.first().copied().unwrap_or(0.0);
+        if target.iter().all(|&t| t == first) {
+            return Err(CbError::Degenerate(
+                "All train targets are equal. Set allow_const_label=true to train \
+                 on a constant target anyway (the model will predict that constant)."
+                    .to_owned(),
+            ));
+        }
+    }
 
     // `ctr_history_unit` is unimplemented on the CPU task type UPSTREAM too, so
     // refusing a non-default value is exact parity rather than a gap here.

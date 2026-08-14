@@ -110,6 +110,8 @@ pub struct CatBoostBuilder {
     final_ctr_computation_mode: EFinalCtrComputationMode,
     /// The ordered-CTR history granularity (`ctr_history_unit`).
     ctr_history_unit: ECtrHistoryUnit,
+    /// Whether an all-equal learn target is allowed (`allow_const_label`).
+    allow_const_label: bool,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -341,6 +343,7 @@ impl CatBoostBuilder {
             random_score_type: ERandomScoreType::NormalWithModelSizeDecrease,
             final_ctr_computation_mode: EFinalCtrComputationMode::Default,
             ctr_history_unit: ECtrHistoryUnit::Sample,
+            allow_const_label: false,
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -584,6 +587,19 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn model_shrink_mode(mut self, model_shrink_mode: EModelShrinkMode) -> Self {
         self.model_shrink_mode = model_shrink_mode;
+        self
+    }
+
+    /// Whether a learn set whose targets are ALL EQUAL is allowed
+    /// (`allow_const_label`, upstream default `false`).
+    ///
+    /// Upstream refuses a constant target ("All train targets are equal",
+    /// `metric.cpp:7011`) because most metrics are undefined on one; this port
+    /// refuses it the same way. Setting the flag trains anyway, and the model
+    /// predicts that constant.
+    #[must_use]
+    pub fn allow_const_label(mut self, allow_const_label: bool) -> Self {
+        self.allow_const_label = allow_const_label;
         self
     }
 
@@ -1054,6 +1070,7 @@ impl CatBoostBuilder {
                 random_score_type: self.random_score_type,
                 final_ctr_computation_mode: self.final_ctr_computation_mode,
                 ctr_history_unit: self.ctr_history_unit,
+                allow_const_label: self.allow_const_label,
             },
         }
     }

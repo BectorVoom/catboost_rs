@@ -241,6 +241,82 @@ fn builder_map_rejects_bad_enum_string() {
 }
 
 // ---------------------------------------------------------------------------
+// The logging family + `allow_const_label`
+// ---------------------------------------------------------------------------
+
+/// The logging family is ACCEPTED. It is numerically inert (measured against
+/// catboost 1.2.10: max |diff| = 0 across every setting), so accepting it cannot
+/// produce a wrong model — and `verbose=False` is one of the most commonly
+/// passed kwargs in existing CatBoost code, so rejecting it was a real wart.
+#[test]
+fn the_logging_family_is_accepted() {
+    for name in ["logging_level", "verbose", "silent", "metric_period"] {
+        assert_eq!(
+            status_of(name),
+            Some(ParamStatus::Implemented),
+            "{name} should be Implemented"
+        );
+    }
+    assert_eq!(status_of("allow_const_label"), Some(ParamStatus::Implemented));
+}
+
+/// Upstream allows only ONE of verbose / logging_level / verbose_eval / silent.
+#[test]
+fn logging_params_are_mutually_exclusive() {
+    Python::attach(|py| {
+        for (a, b) in [
+            ("verbose", "logging_level"),
+            ("verbose", "silent"),
+            ("silent", "logging_level"),
+        ] {
+            let d = PyDict::new(py);
+            // Values are irrelevant to the rule; only presence matters.
+            d.set_item(a, if a == "verbose" { "False" } else { "Silent" })
+                .unwrap();
+            d.set_item(b, if b == "verbose" { "False" } else { "Silent" })
+                .unwrap();
+            let err = validate_params(&params_from(py, &d))
+                .expect_err("mutually exclusive logging params must be rejected");
+            let msg = err.value(py).to_string();
+            assert!(
+                msg.contains("Only one of parameters"),
+                "the rejection must quote upstream's rule; got: {msg}"
+            );
+        }
+    });
+}
+
+/// `metric_period` is NOT part of the rule — upstream accepts it with `verbose`.
+#[test]
+fn metric_period_may_accompany_verbose() {
+    Python::attach(|py| {
+        let d = PyDict::new(py);
+        d.set_item("verbose", false).unwrap();
+        d.set_item("metric_period", 3).unwrap();
+        validate_params(&params_from(py, &d))
+            .expect("metric_period is not in the mutual-exclusion set");
+    });
+}
+
+/// Each logging param ALONE is fine, and an unknown logging_level is rejected.
+#[test]
+fn logging_level_values_are_validated() {
+    Python::attach(|py| {
+        for level in ["Silent", "Verbose", "Info", "Debug"] {
+            let d = PyDict::new(py);
+            d.set_item("logging_level", level).unwrap();
+            validate_params(&params_from(py, &d))
+                .unwrap_or_else(|e| panic!("logging_level={level} must validate: {e:?}"));
+        }
+        let d = PyDict::new(py);
+        d.set_item("logging_level", "ZzBogus").unwrap();
+        let err = validate_params(&params_from(py, &d))
+            .expect_err("an unknown logging_level must be rejected");
+        assert!(err.is_instance_of::<CatBoostParameterError>(py));
+    });
+}
+
+// ---------------------------------------------------------------------------
 // The string-valued-parameter wave — `feature_border_type` + `nan_mode`
 // ---------------------------------------------------------------------------
 

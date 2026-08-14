@@ -1,0 +1,42 @@
+{
+  "catboost_version": "1.2.10",
+  "const_allowed_prediction": 3.5,
+  "const_allowed_tree_count": 5,
+  "const_label_rejection": "catboost/libs/metrics/metric.cpp:7011: All train targets are equal",
+  "const_target": 3.5,
+  "logging_levels": [
+    "Silent",
+    "Verbose",
+    "Info",
+    "Debug"
+  ],
+  "logging_max_abs_diff_over_all_settings": 0.0,
+  "mutual_exclusion_rejections": {
+    "{\"logging_level\": \"Silent\", \"silent\": true}": "Only one of parameters ['verbose', 'logging_level', 'verbose_eval', 'silent'] should be set",
+    "{\"logging_level\": \"Silent\", \"verbose\": false}": "Only one of parameters ['verbose', 'logging_level', 'verbose_eval', 'silent'] should be set",
+    "{\"silent\": true, \"verbose\": false}": "Only one of parameters ['verbose', 'logging_level', 'verbose_eval', 'silent'] should be set"
+  },
+  "mutually_exclusive": [
+    "verbose",
+    "logging_level",
+    "verbose_eval",
+    "silent"
+  ],
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1
+  },
+  "scenario": "logging_const_label",
+  "seed": 20260814
+}
