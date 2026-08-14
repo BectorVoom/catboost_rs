@@ -27,7 +27,7 @@ use cb_backend::CpuBackend;
 use cb_backend::GpuBackend;
 use cb_compute::{
     CustomMetric, CustomMetricHandle, CustomObjective, CustomObjectiveHandle, EScoreFunction,
-    LeafMethod, Loss,
+    LeafEstimationBacktracking, LeafMethod, Loss,
 };
 use cb_data::{
     select_borders_greedy_logsum_f32, AutoClassWeights, EBorderSelectionType, NanMode, Pool,
@@ -93,6 +93,9 @@ pub struct CatBoostBuilder {
     /// How `NaN` float values are quantized (`nan_mode`) — see
     /// [`CatBoostBuilder::nan_mode`].
     nan_mode: NanMode,
+    /// The leaf-step backtracking policy (`leaf_estimation_backtracking`) — see
+    /// [`CatBoostBuilder::leaf_estimation_backtracking`].
+    leaf_estimation_backtracking: LeafEstimationBacktracking,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -315,6 +318,7 @@ impl CatBoostBuilder {
             feature_border_type: EBorderSelectionType::default(),
             // catboost's default nan_mode is Min.
             nan_mode: NanMode::Min,
+            leaf_estimation_backtracking: LeafEstimationBacktracking::default(),
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -507,6 +511,31 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn nan_mode(mut self, nan_mode: NanMode) -> Self {
         self.nan_mode = nan_mode;
+        self
+    }
+
+    /// The leaf-step backtracking policy (`leaf_estimation_backtracking`,
+    /// catboost default [`LeafEstimationBacktracking::AnyImprovement`]).
+    ///
+    /// [`LeafEstimationBacktracking::Armijo`] is GPU-ONLY upstream and is
+    /// rejected at [`Self::fit`] with a [`CatBoostError::InvalidConfig`],
+    /// mirroring `catboost_options.cpp:664`.
+    ///
+    /// `No` and `AnyImprovement` are provably EQUIVALENT in this engine's
+    /// supported regime: backtracking shrinks a leaf step that would worsen the
+    /// loss, so it needs more than one leaf-estimation step to have anything to
+    /// fall back to, and `leaf_estimation_iterations` is not implemented here
+    /// (the estimator takes exactly one step). Measured against catboost 1.2.10
+    /// over 64 loss x leaf-method x learning-rate configurations at one
+    /// iteration, the two policies never differ; at more than one iteration they
+    /// differ in 53. See [`LeafEstimationBacktracking`] and the
+    /// `leaf_estimation_backtracking/` oracle.
+    #[must_use]
+    pub fn leaf_estimation_backtracking(
+        mut self,
+        leaf_estimation_backtracking: LeafEstimationBacktracking,
+    ) -> Self {
+        self.leaf_estimation_backtracking = leaf_estimation_backtracking;
         self
     }
 
@@ -1188,6 +1217,18 @@ impl CatBoostBuilder {
                     cb_data::MAX_SUBSET_SIZE_FOR_BUILD_BORDERS,
                 )
             });
+        // `leaf_estimation_backtracking=Armijo` is GPU-ONLY upstream
+        // (`catboost_options.cpp:664`). Refusing it here is real parity: silently
+        // training with AnyImprovement instead would hand back a model the user
+        // did not ask for.
+        if !self.leaf_estimation_backtracking.is_cpu_supported() {
+            return Err(CatBoostError::InvalidConfig(format!(
+                "Backtracking type {} is supported only on GPU; the CPU training \
+                 path admits No and AnyImprovement",
+                self.leaf_estimation_backtracking.as_str()
+            )));
+        }
+
         // `nan_mode=Forbidden` refuses a NaN-bearing learn column, mirroring
         // upstream `quantization.cpp:320`. Checked BEFORE any border work so the
         // rejection is cheap and cannot race the parallel pass below.

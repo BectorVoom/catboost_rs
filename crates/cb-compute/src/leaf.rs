@@ -73,6 +73,84 @@ pub enum LeafMethod {
     Exact,
 }
 
+/// The leaf-step backtracking policy (`leaf_estimation_backtracking`,
+/// `ELeavesEstimationStepBacktracking`). Legal values probed from the installed
+/// catboost 1.2.10 wheel: `No`, `AnyImprovement`, `Armijo`.
+///
+/// Backtracking HALVES the leaf-value step when the step would not improve the
+/// loss. It is therefore a property of the leaf-estimation ITERATION loop, and
+/// that is what bounds its observability here.
+///
+/// # Observability (measured, not assumed)
+///
+/// `leaf_estimation_iterations` is not implemented in this port — the leaf
+/// estimator takes exactly ONE step. A sweep over catboost 1.2.10 covering
+/// {RMSE, Logloss, MAE, Poisson, Tweedie, Huber, LogCosh, Quantile} x
+/// {Gradient, Newton} x learning_rate {0.3, 1, 3, 10} found:
+///
+/// - at `leaf_estimation_iterations = 1`: **0 of 64** configurations distinguish
+///   `No` from `AnyImprovement` — with a single step there is no earlier step to
+///   fall back to, so the policy cannot bite;
+/// - at `leaf_estimation_iterations > 1`: 53 configurations DO distinguish them
+///   (e.g. `Huber:delta=1.0`, `lr=0.3`, Newton, 5 iterations separates them by
+///   5.16).
+///
+/// So in the regime this engine supports the two CPU policies are provably
+/// equivalent, and that equivalence is oracle-pinned rather than assumed. The
+/// backtracking SEARCH itself is deliberately not written: it would be
+/// unreachable code that no test could exercise until
+/// `leaf_estimation_iterations` lands.
+///
+/// [`Self::Armijo`] is a different matter — upstream REJECTS it on CPU
+/// (`catboost_options.cpp:664`, "Backtracking type Armijo is supported only on
+/// GPU"), so refusing it is real, observable parity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeafEstimationBacktracking {
+    /// Never shrink the step.
+    No,
+    /// Halve the step until the loss does not get worse — the catboost default.
+    #[default]
+    AnyImprovement,
+    /// Armijo rule. GPU-ONLY upstream; rejected on the CPU path.
+    Armijo,
+}
+
+impl LeafEstimationBacktracking {
+    /// Parse the upstream spelling (exact, case-sensitive — the enum parser is).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "No" => Some(Self::No),
+            "AnyImprovement" => Some(Self::AnyImprovement),
+            "Armijo" => Some(Self::Armijo),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "No",
+            Self::AnyImprovement => "AnyImprovement",
+            Self::Armijo => "Armijo",
+        }
+    }
+
+    /// Whether this policy is legal on the CPU training path. Upstream admits
+    /// only `No` and `AnyImprovement`; `Armijo` is GPU-only.
+    #[must_use]
+    pub fn is_cpu_supported(self) -> bool {
+        !matches!(self, Self::Armijo)
+    }
+
+    /// Every legal value, in the order the wheel's enum parser lists them.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::No, Self::AnyImprovement, Self::Armijo]
+    }
+}
+
 /// L2-regularized guarded average: `count > 0 ? sum_delta/(count + scaled_l2) :
 /// 0.0`.
 ///

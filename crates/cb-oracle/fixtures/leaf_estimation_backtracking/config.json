@@ -1,0 +1,37 @@
+{
+  "armijo": "GPU-only upstream (catboost_options.cpp:664)",
+  "armijo_rejection_message": "catboost/private/libs/options/catboost_options.cpp:664: Backtracking type Armijo is supported only on GPU",
+  "catboost_version": "1.2.10",
+  "counterexample_at_5_leaf_iterations": {
+    "boost_from_average": false,
+    "leaf_estimation_iterations": 5,
+    "leaf_estimation_method": "Newton",
+    "loss_function": "Huber:delta=1.0",
+    "no_vs_anyimprovement_max_abs_diff": 7.12239014729334,
+    "note": "Proves the parameter is NOT inert in general -- only at the single leaf iteration this engine currently supports."
+  },
+  "cpu_policies": [
+    "No",
+    "AnyImprovement"
+  ],
+  "no_vs_anyimprovement_max_abs_diff": 0.0,
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "leaf_estimation_backtracking",
+  "seed": 20260814
+}

@@ -60,7 +60,7 @@ use std::collections::BTreeMap;
 use catboost_rs::{
     parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
     EBootstrapType, EBorderSelectionType, ECtrType, EGrowPolicy, EOverfittingDetectorType,
-    EScoreFunction, EvalMetric, LeafMethod, Loss, NanMode,
+    EScoreFunction, EvalMetric, LeafEstimationBacktracking, LeafMethod, Loss, NanMode,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -158,6 +158,13 @@ const IMPLEMENTED: &[&str] = &[
     // values silently shared bin 0 with the smallest real values.
     "feature_border_type",
     "nan_mode",
+    // `leaf_estimation_backtracking`: the CPU-legal policies (`No`,
+    // `AnyImprovement`) are provably EQUIVALENT at the single leaf-estimation
+    // step this engine takes -- measured over 64 catboost 1.2.10 configurations,
+    // 0 distinguish them (53 do once `leaf_estimation_iterations > 1`, which is
+    // not implemented here). `Armijo` is GPU-only upstream and is REJECTED, so
+    // the parameter has real observable behaviour rather than being a no-op.
+    "leaf_estimation_backtracking",
 ];
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
@@ -730,6 +737,19 @@ fn parse_nan_mode(name: &str) -> PyResult<NanMode> {
     }
 }
 
+/// Map a `leaf_estimation_backtracking` string onto a
+/// [`LeafEstimationBacktracking`]. `Armijo` PARSES here (it is a legal upstream
+/// token) and is refused later, at fit time, with upstream's GPU-only reason --
+/// rejecting it at parse time would report it as an unknown value instead.
+fn parse_leaf_backtracking(name: &str) -> PyResult<LeafEstimationBacktracking> {
+    LeafEstimationBacktracking::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown leaf_estimation_backtracking `{name}`; expected one of No, \
+             AnyImprovement, Armijo"
+        ))
+    })
+}
+
 /// Map a `bootstrap_type` string onto an [`EBootstrapType`].
 fn parse_bootstrap_type(name: &str) -> PyResult<EBootstrapType> {
     match name {
@@ -1160,6 +1180,9 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "nan_mode")? {
         builder = builder.nan_mode(parse_nan_mode(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "leaf_estimation_backtracking")? {
+        builder = builder.leaf_estimation_backtracking(parse_leaf_backtracking(&v)?);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "bootstrap_type")? {
         builder = builder.bootstrap_type(parse_bootstrap_type(&v)?);

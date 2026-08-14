@@ -56,7 +56,8 @@ pub use lda_linalg::{
 pub use leaf::{
     build_monotonic_linear_orders, calc_average, calc_monotonic_leaf_deltas, exact_leaf_delta,
     gradient_leaf_delta, logcosh_exact_leaf_delta, newton_leaf_delta, pairwise_cholesky_solve,
-    scale_l2_reg, simple_leaf_delta, solve_symmetric_newton, LeafMethod,
+    scale_l2_reg, simple_leaf_delta, solve_symmetric_newton, LeafEstimationBacktracking,
+    LeafMethod,
 };
 pub use loss::{
     calc_softmax, cross_entropy_der1, cross_entropy_der2, expectile_der1, expectile_der2,
