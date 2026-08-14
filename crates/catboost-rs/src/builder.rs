@@ -42,8 +42,9 @@ use cb_train::{
     one_hot_max_size_default, penalties_coefficient_default, per_object_feature_penalties_default,
     permutation_count_default, score_function_default, simple_ctr_default,
     simple_ctr_priors_default, train_cat_with_eval_sets, train_with_eval_sets, BoostParams,
-    CounterCalcMethod, EBoostingType, EBootstrapType, ECtrType, EGrowPolicy, EModelShrinkMode,
-    EOverfittingDetectorType, EvalMetric, EvalMetricHistory, EvalSet,
+    CounterCalcMethod, EBoostingType, EBootstrapType, ECtrHistoryUnit, ECtrType,
+    EFinalCtrComputationMode, EGrowPolicy, EModelShrinkMode, EOverfittingDetectorType, EvalMetric,
+    EvalMetricHistory, EvalSet,
 };
 
 use crate::error::CatBoostError;
@@ -105,6 +106,10 @@ pub struct CatBoostBuilder {
     leaf_estimation_iterations: usize,
     /// The `random_strength` perturbation distribution (`random_score_type`).
     random_score_type: ERandomScoreType,
+    /// Whether the final CTR tables are baked (`final_ctr_computation_mode`).
+    final_ctr_computation_mode: EFinalCtrComputationMode,
+    /// The ordered-CTR history granularity (`ctr_history_unit`).
+    ctr_history_unit: ECtrHistoryUnit,
     score_function: EScoreFunction,
     /// Cardinality ceiling for the one-hot categorical encoding path
     /// (`one_hot_max_size`, upstream default 2). A categorical column with
@@ -334,6 +339,8 @@ impl CatBoostBuilder {
             model_shrink_mode: EModelShrinkMode::Constant,
             leaf_estimation_iterations: 1,
             random_score_type: ERandomScoreType::NormalWithModelSizeDecrease,
+            final_ctr_computation_mode: EFinalCtrComputationMode::Default,
+            ctr_history_unit: ECtrHistoryUnit::Sample,
             score_function: score_function_default(),
             one_hot_max_size: one_hot_max_size_default(),
             max_ctr_complexity: max_ctr_complexity_default(),
@@ -577,6 +584,38 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn model_shrink_mode(mut self, model_shrink_mode: EModelShrinkMode) -> Self {
         self.model_shrink_mode = model_shrink_mode;
+        self
+    }
+
+    /// Whether the final CTR tables are baked into the model
+    /// (`final_ctr_computation_mode`, catboost default
+    /// [`EFinalCtrComputationMode::Default`]).
+    ///
+    /// [`EFinalCtrComputationMode::Skip`] trains IDENTICALLY — verified against
+    /// catboost 1.2.10, which returns byte-identical trees, leaves, bias and CTR
+    /// splits — but omits the CTR table bake, so the resulting model cannot be
+    /// applied. [`Model::predict`] refuses it with a typed error; catboost 1.2.10
+    /// segfaults on the same model.
+    ///
+    /// Inert on a fit with no categorical columns.
+    #[must_use]
+    pub fn final_ctr_computation_mode(
+        mut self,
+        final_ctr_computation_mode: EFinalCtrComputationMode,
+    ) -> Self {
+        self.final_ctr_computation_mode = final_ctr_computation_mode;
+        self
+    }
+
+    /// The ordered-CTR history granularity (`ctr_history_unit`, catboost default
+    /// [`ECtrHistoryUnit::Sample`]).
+    ///
+    /// [`ECtrHistoryUnit::Group`] is REFUSED at [`Self::fit`] — upstream does not
+    /// implement it for the CPU task type either, and rejects it with the same
+    /// reason. So this refusal is exact parity, not a gap.
+    #[must_use]
+    pub fn ctr_history_unit(mut self, ctr_history_unit: ECtrHistoryUnit) -> Self {
+        self.ctr_history_unit = ctr_history_unit;
         self
     }
 
@@ -1013,6 +1052,8 @@ impl CatBoostBuilder {
                 leaf_estimation_iterations: self.leaf_estimation_iterations,
                 leaf_estimation_backtracking: self.leaf_estimation_backtracking,
                 random_score_type: self.random_score_type,
+                final_ctr_computation_mode: self.final_ctr_computation_mode,
+                ctr_history_unit: self.ctr_history_unit,
             },
         }
     }

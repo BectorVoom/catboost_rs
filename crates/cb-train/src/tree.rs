@@ -32,7 +32,7 @@
 use cb_compute::{
     bin_of, build_bucket_histogram, calculate_pairwise_score,
     compute_der_sums as compute_pairwise_der_sums, compute_pair_weight_statistics,
-    cosine_split_score, l2_split_score, multi_dim_split_score, random_score_instance,
+    cosine_split_score, l2_split_score, multi_dim_split_score,
     reduce_leaf_stats, scale_l2_reg, scan_and_score_borders, scan_and_score_borders_into,
     scan_and_score_one_hot_bins_into, scan_border_to_leaf_stats, BucketHistogram, EScoreFunction,
     GroupSpan, LeafStats,

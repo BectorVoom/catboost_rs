@@ -200,6 +200,19 @@ impl Model {
         pool: &Pool,
         prediction_type: PredictionType,
     ) -> Result<Vec<f64>, CatBoostError> {
+        // A `final_ctr_computation_mode = Skip` fit trains normally and KEEPS its
+        // CTR splits, but has no baked tables for them. catboost 1.2.10 segfaults
+        // on such a model; refuse it with a typed error instead.
+        if !self.as_canonical().ctr_tables_present() {
+            return Err(CatBoostError::UnsupportedModel(
+                "this model has CTR splits but no baked CTR tables, so it cannot be \
+                 applied. It was trained with final_ctr_computation_mode=Skip, which \
+                 deliberately omits the final CTR bake (training is otherwise \
+                 identical). Re-fit with final_ctr_computation_mode=Default to get an \
+                 appliable model."
+                    .to_owned(),
+            ));
+        }
         let columns = self.feature_columns(pool)?;
         // F11: route through the CATEGORICAL apply entry. For a float-only model
         // `cat_columns` yields `&[]`, and `predict_raw(m, fv)` is *defined* as

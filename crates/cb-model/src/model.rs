@@ -336,9 +336,10 @@ pub struct Model {
     /// lines up with the float-feature index.
     pub float_feature_borders: Vec<Vec<f64>>,
     /// The baked `ctr_data` tables CTR splits look up at apply time (ORD-05).
-    /// `None` for the numeric-only models (no CTR splits). Keyed by the upstream
-    /// CTR-base string; a [`CtrSplit`] reconstructs its key from
-    /// `(projection, ctr_type)`.
+    /// `None` for the numeric-only models (no CTR splits) AND for a model
+    /// trained with `final_ctr_computation_mode = Skip`, which deliberately
+    /// omits the bake. Keyed by the upstream CTR-base string; a [`CtrSplit`]
+    /// reconstructs its key from `(projection, ctr_type)`.
     pub ctr_data: Option<CtrData>,
     /// The number of output (approx) dimensions (D-6.2-01 / Plan 06.2-02). `1`
     /// for every scalar regression / binary model; `> 1` for multiclass /
@@ -382,6 +383,38 @@ impl Model {
     ///
     /// The trained trees' float splits become [`ModelSplit::Float`] and any
     /// trainer-side CTR splits (`cb_train::CtrSplitSpec`) become
+    /// Whether this model carries at least one CTR split.
+    ///
+    /// Used to detect an UNAPPLIABLE model: a `final_ctr_computation_mode = Skip`
+    /// fit trains normally and keeps its CTR splits, but has no baked tables for
+    /// them. catboost 1.2.10 SEGFAULTS on such a model; this port refuses the
+    /// apply with a typed error instead ([`Self::ctr_tables_present`]).
+    #[must_use]
+    pub fn has_ctr_splits(&self) -> bool {
+        let tree_has = |splits: &[ModelSplit]| splits.iter().any(|s| matches!(s, ModelSplit::Ctr(_)));
+        self.oblivious_trees.iter().any(|t| tree_has(&t.splits))
+            || self
+                .non_symmetric_trees
+                .iter()
+                .any(|t| tree_has(&t.tree_splits))
+            || self.region_trees.iter().any(|t| {
+                t.levels
+                    .iter()
+                    .any(|l| matches!(l.split, ModelSplit::Ctr(_)))
+            })
+    }
+
+    /// Whether this model can actually evaluate its CTR splits: either it has
+    /// none, or the baked tables are present.
+    ///
+    /// `false` means the model was trained with
+    /// `final_ctr_computation_mode = Skip` (or otherwise lost its tables) and
+    /// must NOT be applied.
+    #[must_use]
+    pub fn ctr_tables_present(&self) -> bool {
+        !self.has_ctr_splits() || self.ctr_data.is_some()
+    }
+
     /// [`ModelSplit::Ctr`] — no recomputation. The numeric / one-hot / ordered
     /// paths carry no CTR splits, so `ctr_data` is left `None`; the categorical
     /// train→predict path threads the baked tables in via [`Self::with_ctr_data`].

@@ -60,8 +60,8 @@ use std::collections::BTreeMap;
 use catboost_rs::{
     parse_metric, AutoClassWeights, CatBoostBuilder, CounterCalcMethod, EBoostingType,
     EBootstrapType, EBorderSelectionType, ECtrType, EGrowPolicy, EOverfittingDetectorType,
-    EModelShrinkMode, ERandomScoreType, EScoreFunction, EvalMetric, LeafEstimationBacktracking,
-    LeafMethod, Loss, NanMode,
+    ECtrHistoryUnit, EFinalCtrComputationMode, EModelShrinkMode, ERandomScoreType, EScoreFunction,
+    EvalMetric, LeafEstimationBacktracking, LeafMethod, Loss, NanMode,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -175,6 +175,12 @@ const IMPLEMENTED: &[&str] = &[
     // it decays with model size. INERT at `random_strength = 0` (the default),
     // where no draw happens at all.
     "random_score_type",
+    // The CTR mode pair. `final_ctr_computation_mode=Skip` trains identically and
+    // yields a model that cannot be applied (catboost 1.2.10 SEGFAULTS on it; we
+    // return a typed error). `ctr_history_unit` accepts only `Sample` — upstream
+    // does not implement the other value on CPU either.
+    "final_ctr_computation_mode",
+    "ctr_history_unit",
 ];
 
 /// The params that only DO something when `fit` is given an `eval_set`. Passing
@@ -760,6 +766,24 @@ fn parse_leaf_backtracking(name: &str) -> PyResult<LeafEstimationBacktracking> {
     })
 }
 
+/// Map a `final_ctr_computation_mode` string onto an [`EFinalCtrComputationMode`].
+fn parse_final_ctr_mode(name: &str) -> PyResult<EFinalCtrComputationMode> {
+    EFinalCtrComputationMode::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown final_ctr_computation_mode `{name}`; expected one of Default, Skip"
+        ))
+    })
+}
+
+/// Map a `ctr_history_unit` string onto an [`ECtrHistoryUnit`].
+fn parse_ctr_history_unit(name: &str) -> PyResult<ECtrHistoryUnit> {
+    ECtrHistoryUnit::parse(name).ok_or_else(|| {
+        CatBoostParameterError::new_err(format!(
+            "unknown ctr_history_unit `{name}`; expected one of Sample, Group"
+        ))
+    })
+}
+
 /// Map a `random_score_type` string onto an [`ERandomScoreType`].
 fn parse_random_score_type(name: &str) -> PyResult<ERandomScoreType> {
     ERandomScoreType::parse(name).ok_or_else(|| {
@@ -1224,6 +1248,15 @@ pub(crate) fn make_builder(
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "random_score_type")? {
         builder = builder.random_score_type(parse_random_score_type(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "final_ctr_computation_mode")? {
+        builder = builder.final_ctr_computation_mode(parse_final_ctr_mode(&v)?);
+    }
+    if let Some(v) = get_with_aliases::<String>(params, py, "ctr_history_unit")? {
+        // `Group` PARSES (it is a legal upstream token) and is refused later at
+        // fit time with the CPU-unimplemented reason, so it is reported the way
+        // upstream reports it rather than as an unknown value.
+        builder = builder.ctr_history_unit(parse_ctr_history_unit(&v)?);
     }
     if let Some(v) = get_with_aliases::<String>(params, py, "bootstrap_type")? {
         builder = builder.bootstrap_type(parse_bootstrap_type(&v)?);

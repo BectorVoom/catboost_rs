@@ -27,7 +27,7 @@
 use cb_compute::{
     collect_leaf_residuals, exact_leaf_delta, gradient_leaf_delta, is_pairwise_scoring,
     logcosh_exact_leaf_delta, newton_leaf_delta, reduce_leaf_der2, reduce_leaf_stats, scale_l2_reg,
-    score_st_dev, simple_leaf_delta, solve_symmetric_newton, DeviceBootstrapType, Derivatives,
+    simple_leaf_delta, solve_symmetric_newton, DeviceBootstrapType, Derivatives,
     DeviceGrowPolicy, DeviceTrainConfig, GroupSpan, LeafMethod, Loss, Runtime, RankingCompetitor,
     QUANTILE_ALPHA, QUANTILE_DELTA,
 };
@@ -227,6 +227,115 @@ impl EModelShrinkMode {
     }
 }
 
+/// Whether the FINAL CTR tables are baked into the model
+/// (`final_ctr_computation_mode`, `EFinalCtrComputationMode`). Legal values
+/// probed from the installed catboost 1.2.10 wheel: `Default`, `Skip`.
+///
+/// # What `Skip` actually changes (measured, not assumed)
+///
+/// Training is UNAFFECTED. Against catboost 1.2.10 on a 25-level categorical
+/// corpus, `Skip` returns byte-identical trees, leaves, bias and the same 8 CTR
+/// splits; the ONLY difference is that `ctr_data` comes back EMPTY.
+///
+/// That leaves a model whose CTR splits have no tables to look up. Upstream
+/// SEGFAULTS when such a model is applied (catboost 1.2.10, reproduced). This
+/// port keeps the training behaviour identical but refuses the APPLY with a
+/// typed error rather than crashing — deliberately better than upstream, and
+/// documented as a divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EFinalCtrComputationMode {
+    /// Bake the final CTR tables — the upstream default.
+    #[default]
+    Default,
+    /// Skip the bake. The model trains identically but cannot be applied.
+    Skip,
+}
+
+impl EFinalCtrComputationMode {
+    /// Parse the upstream spelling (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "Default" => Some(Self::Default),
+            "Skip" => Some(Self::Skip),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Skip => "Skip",
+        }
+    }
+
+    /// Every legal value, in the order the wheel's enum parser lists them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Skip, Self::Default]
+    }
+}
+
+/// The ordered-CTR history granularity (`ctr_history_unit`, `ECtrHistoryUnit`).
+/// Legal values probed from the installed catboost 1.2.10 wheel: `Group`,
+/// `Sample`.
+///
+/// # Upstream does not implement this on CPU either
+///
+/// catboost 1.2.10 REJECTS any non-default value on the CPU task type:
+///
+/// ```text
+/// json_helper.h:185: Error: change of option ctr_history_unit is
+/// unimplemented for task type CPU and was not default in previous run
+/// ```
+///
+/// So refusing `Group` here is not a gap in this port — it is exact parity with
+/// upstream's own CPU behaviour, and the refusal is the observable contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ECtrHistoryUnit {
+    /// Per-sample history — the default, and the only value CPU implements.
+    #[default]
+    Sample,
+    /// Per-group history. REJECTED on CPU, exactly as upstream rejects it.
+    Group,
+}
+
+impl ECtrHistoryUnit {
+    /// Parse the upstream spelling (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "Sample" => Some(Self::Sample),
+            "Group" => Some(Self::Group),
+            _ => None,
+        }
+    }
+
+    /// The upstream spelling of this variant.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sample => "Sample",
+            Self::Group => "Group",
+        }
+    }
+
+    /// Every legal value, in the order the wheel's enum parser lists them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Group, Self::Sample]
+    }
+
+    /// Whether this value is implemented on the CPU task type. Only `Sample` is,
+    /// upstream included.
+    #[must_use]
+    pub fn is_cpu_supported(self) -> bool {
+        matches!(self, Self::Sample)
+    }
+}
+
 /// Training knobs added after the original [`BoostParams`] surface was frozen,
 /// grouped into ONE `Default`-able struct.
 ///
@@ -267,6 +376,12 @@ pub struct ExtraBoostParams {
     /// model grows. Inert at `random_strength == 0.0` (no draw happens at all);
     /// see [`cb_compute::ERandomScoreType`].
     pub random_score_type: cb_compute::ERandomScoreType,
+    /// `final_ctr_computation_mode` — whether the final CTR tables are baked.
+    /// Inert on any fit with no categorical columns.
+    pub final_ctr_computation_mode: EFinalCtrComputationMode,
+    /// `ctr_history_unit` — the ordered-CTR history granularity. Only `Sample`
+    /// is implemented on CPU, upstream included.
+    pub ctr_history_unit: ECtrHistoryUnit,
 }
 
 impl Default for ExtraBoostParams {
@@ -279,6 +394,8 @@ impl Default for ExtraBoostParams {
             leaf_estimation_iterations: 1,
             leaf_estimation_backtracking: cb_compute::LeafEstimationBacktracking::AnyImprovement,
             random_score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
+            final_ctr_computation_mode: EFinalCtrComputationMode::Default,
+            ctr_history_unit: ECtrHistoryUnit::Sample,
         }
     }
 }
@@ -4015,6 +4132,18 @@ fn train_inner<R: Runtime>(
     // a model the caller did not ask for — the same honesty rule the params
     // registry applies to unimplemented kwargs.
     validate_leaf_estimation_iterations(params, !ranking.group_id.is_empty())?;
+
+    // `ctr_history_unit` is unimplemented on the CPU task type UPSTREAM too, so
+    // refusing a non-default value is exact parity rather than a gap here.
+    if !params.extra.ctr_history_unit.is_cpu_supported() {
+        return Err(CbError::Unsupported(format!(
+            "ctr_history_unit = {} is unimplemented for task type CPU (catboost \
+             1.2.10 refuses it with the same reason: \"change of option \
+             ctr_history_unit is unimplemented for task type CPU\"); only Sample \
+             is supported",
+            params.extra.ctr_history_unit.as_str()
+        )));
+    }
 
     // Reject malformed / unsupported monotone_constraints up front (FEAT-03 /
     // D-6.6-07): each entry must be a valid direction {-1,0,+1}.
@@ -7960,7 +8089,18 @@ fn train_inner<R: Runtime>(
     // CtrSplitSpec, so this loop is a no-op and `baked` is empty — the float-only
     // models keep ctr_data None.
     let mut baked = BakedCtrData::default();
-    if !cat_columns.is_empty() {
+    // `final_ctr_computation_mode = Skip` suppresses the final CTR table bake.
+    // Training is UNAFFECTED — verified against catboost 1.2.10: `Skip` produces
+    // byte-identical trees, leaves, bias and CTR splits, and differs ONLY in that
+    // `ctr_data` comes back empty. The resulting model therefore carries CTR
+    // splits with no tables to look up, which is why upstream SEGFAULTS when such
+    // a model is applied; this port refuses the apply with a typed error instead
+    // (see `cb_model::Model::ctr_tables_present`).
+    let skip_final_ctr = matches!(
+        params.extra.final_ctr_computation_mode,
+        EFinalCtrComputationMode::Skip
+    );
+    if !cat_columns.is_empty() && !skip_final_ctr {
         // Distinct chosen (projection, ctr_type) pairs across all trees.
         //
         // The de-dup key is `(projection, ctr_type)` and NOTHING ELSE. In

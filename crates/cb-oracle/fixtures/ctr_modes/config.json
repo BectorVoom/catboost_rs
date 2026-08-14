@@ -1,0 +1,36 @@
+{
+  "catboost_version": "1.2.10",
+  "ctr_history_unit_group_rejection": "catboost/private/libs/options/json_helper.h:185: Error: change of option ctr_history_unit is unimplemented for task type CPU and was not default in previous run",
+  "final_ctr_computation_mode": {
+    "ctr_data_keys_Default": [
+      "{\"identifier\":[{\"cat_feature_index\":0,\"combination_element\":\"cat_feature_value\"}],\"type\":\"Borders\"}"
+    ],
+    "ctr_data_keys_Skip": [],
+    "ctr_split_count": 8,
+    "note": "Skip changes ONLY ctr_data; catboost 1.2.10 SEGFAULTS applying it.",
+    "scale_and_bias_identical": true,
+    "trees_identical": true
+  },
+  "n_levels": 25,
+  "params": {
+    "boost_from_average": true,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "max_ctr_complexity": 1,
+    "one_hot_max_size": 2,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "simple_ctr": "Borders:Prior=0.5",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "scenario": "ctr_modes",
+  "seed": 20260814
+}
