@@ -214,7 +214,26 @@ fn check_cell(param: &str, value: &str) -> Option<String> {
 const KNOWN_DIVERGENT: &[(&str, &str, &str)] = &[(
     "boosting_type",
     "Ordered",
-    "Ordered boosting diverges by ~0.105 on this float-only corpus. It is NOT the      initial learn-set shuffle: forcing has_time=true upstream (which disables the      shuffle) moves catboost FURTHER away, to ~0.347. The repository's existing      ordered_boost / ordered_boost_e2e oracles are also float-only and DO pass, so      the ordered path is right on those corpora and wrong here — a pre-existing gap      this wave surfaced rather than caused, and its own investigation.",
+    "Ordered boosting diverges on this float-only corpus. LOCALIZED (see \
+     `cb-train/tests/ordered_permutation_count_defect_test.rs`, which pins the \
+     defect as a self-correcting test): the float-only ordered path is \
+     INSENSITIVE to `permutation_count` -- our predictions are byte-identical \
+     at pc=1/2/4 while catboost's change (pc=1 and pc=2 agree, pc=4 differs). \
+     `create_folds` gives every LEARNING fold the IDENTITY permutation (correct \
+     only relative to upstream's already-shuffled learn data) and `train_inner` \
+     always reads the first non-averaging fold, so upstream's per-iteration \
+     structure-fold selection (`takenFold[iter] = Folds[Rand.GenRand() % \
+     learning_folds]`) has no counterpart here. Established while localizing: \
+     the PLAIN path is exact (2.2e-16); the divergence is present in the FIRST \
+     tree, so it is not accumulated drift; when we do match we match EXACTLY \
+     (0.0 / 1.1e-16), so the arithmetic and apply path are right and only the \
+     STRUCTURE selection differs; `has_time` does NOT separate the cases; and \
+     composing the learning permutation with `create_shuffled_indices(n, seed)` \
+     was TRIED and makes parity WORSE. The committed ordered_boost_e2e oracle \
+     passes because it pins permutation_count=1 on a 30-row corpus where \
+     identity coincides with upstream -- it is not evidence the path is right. \
+     Closing it needs upstream's exact fold-permutation RNG stream via the \
+     instrumented-CLI draw accounting.",
 )];
 
 fn is_known_divergent(param: &str, value: &str) -> bool {

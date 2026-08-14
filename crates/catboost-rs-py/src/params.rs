@@ -134,6 +134,11 @@ const IMPLEMENTED: &[&str] = &[
     "boosting_type",
     "has_time",
     "fold_len_multiplier",
+    // `permutation_count` was implemented on the builder and consumed by the fold
+    // construction, but was absent from this registry -- so `fit` rejected it as an
+    // unknown parameter for a knob the engine honours. It selects how many LEARNING
+    // permutations the ordered / CTR fold set carries.
+    "permutation_count",
     "monotone_constraints",
     "feature_weights",
     "penalties_coefficient",
@@ -370,6 +375,7 @@ const VOCABULARY: &[&str] = &[
     "snapshot_file",
     "snapshot_interval",
     "fold_len_multiplier",
+    "permutation_count",
     "used_ram_limit",
     "gpu_ram_part",
     "pinned_memory_size",
@@ -1478,6 +1484,16 @@ pub(crate) fn make_builder(
         // grow the tail, so the dynamic fold would not advance).
         check_range("fold_len_multiplier", v, 1.0, f64::INFINITY, false)?;
         builder = builder.fold_len_multiplier(v);
+    }
+    if let Some(v) = get_with_aliases::<usize>(params, py, "permutation_count")? {
+        // Upstream requires >= 1: the fold set needs at least one permutation.
+        if v == 0 {
+            return Err(CatBoostParameterError::new_err(
+                "parameter `permutation_count` = 0 is out of range; expected >= 1 \
+                 (upstream default 4)",
+            ));
+        }
+        builder = builder.permutation_count(v);
     }
 
     // ---- PARAM-02: the grow policy -----------------------------------------
