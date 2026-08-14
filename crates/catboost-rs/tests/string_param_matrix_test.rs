@@ -214,26 +214,29 @@ fn check_cell(param: &str, value: &str) -> Option<String> {
 const KNOWN_DIVERGENT: &[(&str, &str, &str)] = &[(
     "boosting_type",
     "Ordered",
-    "Ordered boosting diverges on this float-only corpus. LOCALIZED (see \
-     `cb-train/tests/ordered_permutation_count_defect_test.rs`, which pins the \
-     defect as a self-correcting test): the float-only ordered path is \
-     INSENSITIVE to `permutation_count` -- our predictions are byte-identical \
-     at pc=1/2/4 while catboost's change (pc=1 and pc=2 agree, pc=4 differs). \
-     `create_folds` gives every LEARNING fold the IDENTITY permutation (correct \
-     only relative to upstream's already-shuffled learn data) and `train_inner` \
-     always reads the first non-averaging fold, so upstream's per-iteration \
-     structure-fold selection (`takenFold[iter] = Folds[Rand.GenRand() % \
-     learning_folds]`) has no counterpart here. Established while localizing: \
-     the PLAIN path is exact (2.2e-16); the divergence is present in the FIRST \
-     tree, so it is not accumulated drift; when we do match we match EXACTLY \
-     (0.0 / 1.1e-16), so the arithmetic and apply path are right and only the \
-     STRUCTURE selection differs; `has_time` does NOT separate the cases; and \
-     composing the learning permutation with `create_shuffled_indices(n, seed)` \
-     was TRIED and makes parity WORSE. The committed ordered_boost_e2e oracle \
-     passes because it pins permutation_count=1 on a 30-row corpus where \
-     identity coincides with upstream -- it is not evidence the path is right. \
-     Closing it needs upstream's exact fold-permutation RNG stream via the \
-     instrumented-CLI draw accounting.",
+    "Ordered boosting still diverges on this float-only corpus, but NARROWED. One real \
+     bug was found and FIXED: the ordered split score merged the BODY and TAIL rows \
+     into one statistic pair, when upstream fills `SumDelta`/`Count` from the body \
+     `[0, BodyFinish)` and `SumWeightedDelta`/`SumWeight` from the tail \
+     `[BodyFinish, TailFinish)` (`scoring.cpp:291-309`) and `AddLeafOrdered` \
+     (`score_calcers.cpp:36-49`) takes the leaf average from the BODY pair and \
+     multiplies it by the TAIL sum -- estimate on the body, score on the tail, which \
+     is what stops a document contributing to the leaf value that scores it. The old \
+     code justified merging with \"random_strength == 0 implies the derivative arrays \
+     are equal\", true of the ARRAYS and irrelevant to the RANGES. Fixing it resolved \
+     the whole DEPTH axis (n=30, f=2 now matches upstream at depths 1-5; it previously \
+     diverged at depth >= 3). \
+     WHAT REMAINS: divergence persists along the FEATURE axis (f >= 3 diverges even at \
+     depth 1, a single split) and irregularly along n. A second, independent defect is \
+     recorded separately in `ordered_permutation_count_defect_test.rs`: the float-only \
+     ordered path is insensitive to `permutation_count` because every learning fold \
+     carries an identity placeholder and `train_inner` always reads `Folds[0]`, while \
+     upstream picks a structure fold per iteration. Wiring that cycling was TRIED and \
+     does NOT reach parity either, so it was reverted rather than shipped unverified. \
+     Also refuted along the way: composing the learning permutation with \
+     `create_shuffled_indices(n, seed)` makes parity strictly WORSE. When we match, we \
+     match EXACTLY (0.0 / 1.1e-16), so the arithmetic and apply path are right and only \
+     the STRUCTURE selection is wrong; the PLAIN path is exact at 2.2e-16.",
 )];
 
 fn is_known_divergent(param: &str, value: &str) -> bool {

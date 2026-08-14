@@ -91,7 +91,8 @@ pub use runtime::{
     YETIRANK_PERMUTATIONS_DEFAULT,
 };
 pub use score::{
-    add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero, l2_split_score,
+    add_leaf_ordered, add_leaf_plain, cosine_split_score, derivatives_std_dev_from_zero,
+    l2_split_score, l2_split_score_ordered,
     multi_dim_split_score, multi_dim_split_score_into, random_score_instance,
     random_score_instance_typed, score_st_dev, score_st_dev_typed, ERandomScoreType,
     MINIMAL_SCORE,

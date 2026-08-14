@@ -41,6 +41,50 @@ pub fn add_leaf_plain(stats: LeafStats, scaled_l2: f64) -> f64 {
     avg * stats.sum_weighted_delta
 }
 
+/// One leaf's L2 `AddLeafOrdered` contribution — the ORDERED-boosting term, which
+/// is NOT `add_leaf_plain` with different inputs.
+///
+/// `TL2ScoreCalcer::AddLeafOrdered` (`score_calcers.cpp:36-49`) computes
+/// `avg = CalcAverage(SumDelta, Count, L2)` and then accumulates
+/// `avg * SumWeightedDelta`. The two stat pairs come from DIFFERENT ROW RANGES:
+/// `CalcStatsKernel`'s `!isPlainMode` arm (`scoring.cpp:291-309`) fills
+/// `SumDelta`/`Count` from the **BODY** `[begin, BodyFinish)` via `UpdateDeltaCount`
+/// and `SumWeightedDelta`/`SumWeight` from the **TAIL** `[BodyFinish, TailFinish)`
+/// via `UpdateWeighted`. Plain mode instead fills one pair over the whole
+/// `[begin, TailFinish)`.
+///
+/// That split IS ordered boosting's defining property: the leaf value is estimated
+/// on the body prefix and the gain is evaluated on the tail, so a document never
+/// contributes to the leaf value that scores it.
+///
+/// It is why a single merged walk over `[0, TailFinish)` is WRONG even when
+/// `random_strength == 0` makes `SampleWeightedDerivatives == WeightedDerivatives`
+/// and the weights are all 1: the derivative ARRAYS coincide, but the RANGES do
+/// not, so the average is taken over body ∪ tail instead of the body and the gain
+/// multiplier over body ∪ tail instead of the tail.
+///
+/// `body` supplies `(sum_weighted_delta, sum_weight)` read as upstream's
+/// `(SumDelta, Count)`; `tail` supplies the `SumWeightedDelta` multiplier.
+#[must_use]
+pub fn add_leaf_ordered(body: LeafStats, tail: LeafStats, scaled_l2: f64) -> f64 {
+    let avg = calc_average(body.sum_weighted_delta, body.sum_weight, scaled_l2);
+    avg * tail.sum_weighted_delta
+}
+
+/// The total ORDERED L2 score for a candidate split: [`add_leaf_ordered`] summed
+/// over every leaf, through the sanctioned reduction primitive (D-08).
+///
+/// `body` and `tail` MUST be the same length and in the canonical leaf-index order.
+#[must_use]
+pub fn l2_split_score_ordered(body: &[LeafStats], tail: &[LeafStats], scaled_l2: f64) -> f64 {
+    let terms: Vec<f64> = body
+        .iter()
+        .zip(tail.iter())
+        .map(|(&b, &t)| add_leaf_ordered(b, t, scaled_l2))
+        .collect();
+    sum_f64(&terms)
+}
+
 /// The total L2 score for a candidate split: the sum of [`add_leaf_plain`] over
 /// every leaf the split produces, accumulated in the given leaf order through the
 /// sanctioned reduction primitive (D-08). `leaves` MUST be supplied in the

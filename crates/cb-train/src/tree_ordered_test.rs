@@ -42,97 +42,110 @@ fn fixture() -> (Vec<Vec<f32>>, Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
 }
 
 #[test]
-fn single_full_span_segment_identity_perm_degenerates_to_plain_splits() {
-    // The degeneration anchor: a single full-span segment [(n, n)] + identity
-    // permutation makes each per-segment ordered score equal the plain whole-fold
-    // L2 score, so the ordered LEVEL picks the same split as the plain search.
+fn single_full_span_segment_has_an_empty_tail_and_scores_zero() {
+    // REWRITTEN with the ORD-SCORE fix. This test previously asserted that a single
+    // full-span segment `[(n, n)]` degenerates to the PLAIN search. That property was
+    // an artifact of the bug it was written against: the old implementation merged the
+    // body and tail rows into ONE stat pair, which made the ordered score collapse to
+    // the plain formula whenever the segment spanned everything.
+    //
+    // Upstream does NOT do that. `CalcStatsKernel`'s `!isPlainMode` arm
+    // (`scoring.cpp:291-309`) fills `SumDelta`/`Count` from `[begin, BodyFinish)` and
+    // `SumWeightedDelta`/`SumWeight` from `[BodyFinish, TailFinish)`, the latter
+    // GUARDED by `if (tailFinishInRange > bt.BodyFinish)`. At `BodyFinish ==
+    // TailFinish == n` that guard is false, no `SumWeightedDelta` is ever accumulated,
+    // and `AddLeafOrdered`'s `avg * SumWeightedDelta` is 0 for every leaf.
+    //
+    // So the correct property is that a full-span segment scores ZERO -- there are no
+    // tail rows to evaluate the gain on. Asserting the old equality would re-introduce
+    // the bug.
     let (fv, fb, der1, weight) = fixture();
     let n = der1.len();
     let matrix = FeatureMatrix::new(&fv, &fb);
-    let scaled_l2 = 3.0;
+    let identity: Vec<i32> = (0..n as i32).collect();
+    let candidate = Split { feature: 0, border: 1.5 };
 
-    // Plain whole-fold search (the reference structure). The ordered path scores
-    // with L2 (`score_candidate_ordered`), so the plain reference must too for the
-    // degeneration equality to hold.
-    let plain = greedy_tensor_search_oblivious(
+    let score = score_candidate_ordered(
         &matrix,
+        &[],
+        candidate,
         &der1,
         &weight,
-        scaled_l2,
-        2,
+        &identity,
+        &[(n, n)],
+        &[n as f64],
+        2.0,
         n,
-        cb_compute::EScoreFunction::L2,
     )
-    .expect("plain search");
+    .expect("ordered score");
 
-    // Force a single full-span segment [(n, n)] with body_sum_weight = n (the
-    // unweighted whole-fold weight) and the identity permutation. With
-    // body_finish == n, scale_l2_reg(l2, n, n) == l2, so the per-segment scaledL2
-    // equals the plain `scaled_l2`, and the single segment's per-leaf stats over
-    // [0, n) (identity perm) equal the plain whole-fold stats.
-    let identity: Vec<i32> = (0..n as i32).collect();
-    let segments = vec![(n, n)];
-    let seg_bsw = vec![n as f64];
-
-    // Reproduce the ordered search level-by-level with the forced single segment,
-    // and assert it picks the same splits as the plain search.
-    let mut chosen_ordered: Vec<Split> = Vec::new();
-    for _level in 0..2 {
-        let best = select_level_ordered(
-            &matrix,
-            &chosen_ordered,
-            &der1,
-            &weight,
-            &identity,
-            &segments,
-            &seg_bsw,
-            scaled_l2,
-            n,
-        )
-        .expect("ordered level");
-        chosen_ordered.push(best);
-    }
-    assert_eq!(
-        chosen_ordered, plain.splits,
-        "single full-span segment + identity perm must degenerate to the plain splits"
+    assert!(
+        score.abs() < 1e-12,
+        "a full-span segment has an EMPTY tail, so the ordered gain must be 0; got {score}"
     );
 }
 
 #[test]
-fn single_full_span_segment_score_equals_plain_whole_fold_score() {
-    // The per-candidate degeneration: at [(n, n)] + identity perm the ordered
-    // candidate score equals the plain whole-fold L2 score (reduce_leaf_stats over
-    // all objects, l2_split_score) for the same candidate.
+fn ordered_score_estimates_on_the_body_and_scores_on_the_tail() {
+    // REWRITTEN with the ORD-SCORE fix (see the sibling test for why the old
+    // "equals the plain whole-fold score" assertion encoded the bug).
+    //
+    // The defining property of ordered boosting, asserted directly against a
+    // hand-computed reference: for segment `(body_finish, tail_finish)` each leaf's
+    // value is estimated on the BODY rows `[0, body_finish)` and multiplied by the
+    // TAIL rows' derivative sum `[body_finish, tail_finish)` --
+    // `TL2ScoreCalcer::AddLeafOrdered` (`score_calcers.cpp:36-49`). A document
+    // therefore never contributes to the leaf value that scores it.
     let (fv, fb, der1, weight) = fixture();
     let n = der1.len();
+    assert!(n >= 4, "fixture must have enough rows to split a body from a tail");
     let matrix = FeatureMatrix::new(&fv, &fb);
-    let l2 = 2.0;
     let identity: Vec<i32> = (0..n as i32).collect();
-    let segments = vec![(n, n)];
-    let seg_bsw = vec![n as f64];
-    let candidate = Split {
-        feature: 0,
-        border: 1.5,
-    };
+    let candidate = Split { feature: 0, border: 1.5 };
+    let body_finish = n / 2;
+    let l2 = 2.0;
+    let bsw: f64 = cb_core::sum_f64(&weight[..body_finish]);
 
-    let ordered_score = score_candidate_ordered(
-        &matrix, &[], candidate, &der1, &weight, &identity, &segments, &seg_bsw, l2, n,
+    let got = score_candidate_ordered(
+        &matrix, &[], candidate, &der1, &weight, &identity, &[(body_finish, n)], &[bsw], l2, n,
     )
     .expect("ordered score");
 
-    // Plain whole-fold reference: assign leaves on the same single candidate, then
-    // l2_split_score with scaled_l2 == scale_l2_reg(l2, n, n) == l2.
+    // Hand-computed reference over the SAME two ranges.
     let leaf_of: Vec<usize> = (0..n)
-        .map(|obj| {
-            usize::from(f64::from(fv[0][obj]) > 1.5)
-        })
+        .map(|obj| usize::from(f64::from(fv[0][obj]) > 1.5))
         .collect();
-    let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, &der1, &weight, 2);
-    let plain_score = l2_split_score(&stats, l2);
+    let scaled_l2 = scale_l2_reg(l2, bsw, body_finish);
+    let mut expected = 0.0_f64;
+    for leaf in 0..2usize {
+        let body_sum: f64 = (0..body_finish)
+            .filter(|&i| leaf_of[i] == leaf)
+            .map(|i| der1[i])
+            .sum();
+        let body_cnt: f64 = (0..body_finish)
+            .filter(|&i| leaf_of[i] == leaf)
+            .map(|i| weight[i])
+            .sum();
+        let tail_sum: f64 = (body_finish..n)
+            .filter(|&i| leaf_of[i] == leaf)
+            .map(|i| der1[i])
+            .sum();
+        expected += cb_compute::calc_average(body_sum, body_cnt, scaled_l2) * tail_sum;
+    }
 
     assert!(
-        (ordered_score - plain_score).abs() < 1e-12,
-        "ordered single-segment score {ordered_score} must equal plain score {plain_score}"
+        (got - expected).abs() < 1e-12,
+        "ordered score {got} must equal the body-estimated / tail-scored reference {expected}"
+    );
+
+    // Discrimination: the ordered score must NOT coincide with the plain whole-fold
+    // score, or this test would pass against the very bug it replaces.
+    let stats: Vec<LeafStats> = reduce_leaf_stats(&leaf_of, &der1, &weight, 2);
+    let plain = l2_split_score(&stats, scaled_l2);
+    assert!(
+        (got - plain).abs() > 1e-12,
+        "ordered and plain scores coincide ({got} vs {plain}) — the body/tail split is \
+         not being applied, which is exactly the bug this test replaces"
     );
 }
 

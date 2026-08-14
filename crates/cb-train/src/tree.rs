@@ -2344,22 +2344,40 @@ fn ordered_segment_leaf_stats(
     body_finish: usize,
     tail_finish: usize,
     n_leaves: usize,
-) -> CbResult<Vec<LeafStats>> {
-    // Gather this segment's member objects (body ∪ tail) in permutation order,
+) -> CbResult<(Vec<LeafStats>, Vec<LeafStats>)> {
+    // Gather this segment's BODY and TAIL member objects separately, in permutation
+    // order,
     // along with their parallel der/weight, then reduce via the sanctioned
     // primitive so the sum order is the canonical object order (D-08).
     let mut seg_leaf_of: Vec<usize> = Vec::new();
     let mut seg_der: Vec<f64> = Vec::new();
     let mut seg_weight: Vec<f64> = Vec::new();
 
+    let mut tail_leaf_of: Vec<usize> = Vec::new();
+    let mut tail_der: Vec<f64> = Vec::new();
+    let mut tail_weight: Vec<f64> = Vec::new();
+
     let n = permutation.len();
     let upper = tail_finish.min(n);
-    // Walk [0, tail_finish): the BODY rows [0, body_finish) then the TAIL rows
-    // [body_finish, tail_finish) are accumulated identically (random_strength == 0
-    // ⇒ SampleWeightedDerivatives == WeightedDerivatives), so a single contiguous
-    // walk over [0, tail_finish) is exact. `body_finish` is retained in the
-    // signature to document the body/tail split the segment represents.
-    let _ = body_finish;
+    // ORD-SCORE FIX. The BODY rows `[0, body_finish)` and the TAIL rows
+    // `[body_finish, tail_finish)` are NOT interchangeable, and merging them was the
+    // ordered-boosting parity bug:
+    //
+    // upstream's `CalcStatsKernel` `!isPlainMode` arm (`scoring.cpp:291-309`) fills
+    // `SumDelta`/`Count` from the BODY (`UpdateDeltaCount`) and
+    // `SumWeightedDelta`/`SumWeight` from the TAIL (`UpdateWeighted`), and
+    // `TL2ScoreCalcer::AddLeafOrdered` then takes the leaf average from the BODY pair
+    // and multiplies it by the TAIL `SumWeightedDelta`. Estimating the leaf on the
+    // body and scoring it on the tail IS ordered boosting — it is what stops a
+    // document from contributing to the leaf value that scores it.
+    //
+    // The previous single contiguous walk over `[0, tail_finish)` justified itself
+    // with "random_strength == 0 ⇒ SampleWeightedDerivatives == WeightedDerivatives",
+    // which is true of the derivative ARRAYS but says nothing about the RANGES. It
+    // averaged over body ∪ tail and multiplied by body ∪ tail, which is the PLAIN
+    // formula wearing ordered segments — silently right whenever the argmax happened
+    // to survive (2 features) and wrong as soon as enough candidates competed.
+    let body_upper = body_finish.min(upper);
     for p in 0..upper {
         let Some(&doc_i) = permutation.get(p) else {
             return Err(CbError::Degenerate(
@@ -2389,12 +2407,21 @@ fn ordered_segment_leaf_stats(
                 }
             }
         };
-        seg_leaf_of.push(leaf);
-        seg_der.push(d);
-        seg_weight.push(w);
+        if p < body_upper {
+            seg_leaf_of.push(leaf);
+            seg_der.push(d);
+            seg_weight.push(w);
+        } else {
+            tail_leaf_of.push(leaf);
+            tail_der.push(d);
+            tail_weight.push(w);
+        }
     }
 
-    Ok(reduce_leaf_stats(&seg_leaf_of, &seg_der, &seg_weight, n_leaves))
+    Ok((
+        reduce_leaf_stats(&seg_leaf_of, &seg_der, &seg_weight, n_leaves),
+        reduce_leaf_stats(&tail_leaf_of, &tail_der, &tail_weight, n_leaves),
+    ))
 }
 
 // DEFERRAL (Phase 21 → Phase 22): the ordered-boosting split search
@@ -2448,7 +2475,7 @@ fn score_candidate_ordered(
         // Per-segment scaled L2 = l2 * (BodySumWeight / BodyFinish)
         // (scoring.cpp:746-748). scale_l2_reg guards body_finish == 0.
         let scaled_l2_segment = scale_l2_reg(l2_leaf_reg, body_sum_weight, body_finish);
-        let stats = ordered_segment_leaf_stats(
+        let (body_stats, tail_stats) = ordered_segment_leaf_stats(
             &leaf_of,
             der1,
             weight,
@@ -2457,7 +2484,11 @@ fn score_candidate_ordered(
             tail_finish,
             n_leaves,
         )?;
-        segment_scores.push(l2_split_score(&stats, scaled_l2_segment));
+        segment_scores.push(cb_compute::l2_split_score_ordered(
+            &body_stats,
+            &tail_stats,
+            scaled_l2_segment,
+        ));
     }
     Ok(cb_core::sum_f64(&segment_scores))
 }
