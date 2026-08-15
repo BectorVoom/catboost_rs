@@ -67,7 +67,9 @@ fn ctr_params(permutation_count: usize) -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{ctr_params, fixture};
     use cb_backend::GpuBackend;
@@ -82,7 +84,7 @@ mod device {
 
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -128,7 +130,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -157,16 +159,16 @@ mod device {
     pub fn run(permutation_count: usize, expect_device: bool, label: &str) {
         let (columns, borders, cat_columns, target) = load_inputs();
         let params = ctr_params(permutation_count);
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train_cat(&gpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
             .unwrap_or_else(|e| panic!("[{label}] CTR train failed: {e:?}"));
         let expected = if expect_device { params.iterations } else { 0 };
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             expected,
             "[{label}] expected {expected} device grows (permutation_count={permutation_count})"
         );
-        println!("[{label}] device grows = {}", gpu.grown.get());
+        println!("[{label}] device grows = {}", gpu.grown.load(Ordering::Relaxed));
     }
 }
 

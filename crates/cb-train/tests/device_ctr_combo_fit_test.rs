@@ -90,7 +90,9 @@ fn combo_params() -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::path::PathBuf;
 
     use super::combo_params;
@@ -115,7 +117,7 @@ mod device {
     /// CPU-fallback fit. See the module doc for why the prediction delta cannot.
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -161,7 +163,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -219,7 +221,7 @@ mod device {
         // (`oblivious_trees.len()`, the empty non-symmetric/region lists) are kept, but they
         // are NOT the device evidence — the CPU oblivious grower satisfies all of them (R-8).
         // `gpu.grown` is, and it is asserted at the END of this function; see there for why.
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let (trained, baked) = train_cat(
             &gpu,
             &columns,
@@ -286,16 +288,16 @@ mod device {
         // prediction bar still passed"). Fail-fast ordering hides exactly that. Do not
         // "fix" this ordering. (Same rationale as `device_ctr_fit_test`, T20.)
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "the combination-CTR fit must COMMIT to the device: expected {} device grows, \
              got {}. `oblivious_trees.len() == iterations` above does not say this — the CPU \
              oblivious grower satisfies it too (R-8), which is why this test was a false pass \
              for as long as it was `#[ignore]`d with a wrong rationale.",
             params.iterations,
-            gpu.grown.get()
+            gpu.grown.load(Ordering::Relaxed)
         );
-        println!("[device-ctr-combo-e2e] device grows = {}", gpu.grown.get());
+        println!("[device-ctr-combo-e2e] device grows = {}", gpu.grown.load(Ordering::Relaxed));
     }
 }
 

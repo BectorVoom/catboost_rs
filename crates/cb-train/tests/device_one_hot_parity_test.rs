@@ -103,7 +103,9 @@ mod device {
     use cb_core::CbResult;
     use cb_model::{predict_raw_cat, Model as CbModel, ModelSplit};
     use cb_train::{train_cat, BoostParams};
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// CPU reference runtime that DECLINES the device seam (trait defaults: `begin →
     /// Ok(false)`, `grow → Ok(None)`) so `train_cat` runs the byte-unchanged CPU grower,
@@ -129,16 +131,16 @@ mod device {
     /// The real [`GpuBackend`], instrumented so the suite can PROVE the device grow ran.
     struct CountingGpu {
         inner: GpuBackend,
-        grown: Cell<usize>,
-        begun: Cell<usize>,
+        grown: AtomicUsize,
+        begun: AtomicUsize,
     }
 
     impl CountingGpu {
         fn new() -> Self {
             Self {
                 inner: GpuBackend::default(),
-                grown: Cell::new(0),
-                begun: Cell::new(0),
+                grown: AtomicUsize::new(0),
+                begun: AtomicUsize::new(0),
             }
         }
     }
@@ -187,7 +189,7 @@ mod device {
                 config,
             )?;
             if accepted {
-                self.begun.set(self.begun.get() + 1);
+                self.begun.fetch_add(1, Ordering::Relaxed);
             }
             Ok(accepted)
         }
@@ -201,7 +203,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -258,13 +260,13 @@ mod device {
 
         // ── Guard 1: the device really grew every tree. ──
         assert_eq!(
-            gpu.begun.get(),
+            gpu.begun.load(Ordering::Relaxed),
             1,
             "[{label}] the backend must ACCEPT exactly one device session; 0 means the \
              eligibility gate declined and the 'device' fit is really a CPU fit"
         );
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "[{label}] the device must grow every tree ({} expected); a shortfall means a \
              silent CPU fallback",

@@ -108,7 +108,7 @@ mod bench {
         }
     }
 
-    fn time_train<R: Runtime>(
+    fn time_train<R: Runtime + Sync>(
         backend: &R,
         cols: &[Vec<f32>],
         borders: &[Vec<f64>],

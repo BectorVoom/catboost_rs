@@ -133,7 +133,9 @@ mod device {
     use cb_core::{CbError, CbResult};
     use cb_model::Model as CbModel;
     use cb_train::{train, BoostParams, EBootstrapType, EGrowPolicy};
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// CPU reference runtime that DECLINES the device seam (trait defaults: `begin →
     /// Ok(false)`, `grow → Ok(None)`) so `train` runs the byte-unchanged CPU grower,
@@ -165,20 +167,20 @@ mod device {
     struct CountingGpu {
         inner: GpuBackend,
         /// Trees the device actually returned (`Ok(Some(_))`).
-        grown: Cell<usize>,
+        grown: AtomicUsize,
         /// Sessions the backend accepted (`begin → Ok(true)`).
-        begun: Cell<usize>,
+        begun: AtomicUsize,
         /// Length of the sample handed to the most recent grow call.
-        last_sample_len: Cell<usize>,
+        last_sample_len: AtomicUsize,
     }
 
     impl CountingGpu {
         fn new() -> Self {
             Self {
                 inner: GpuBackend::default(),
-                grown: Cell::new(0),
-                begun: Cell::new(0),
-                last_sample_len: Cell::new(usize::MAX),
+                grown: AtomicUsize::new(0),
+                begun: AtomicUsize::new(0),
+                last_sample_len: AtomicUsize::new(usize::MAX),
             }
         }
     }
@@ -227,7 +229,7 @@ mod device {
                 config,
             )?;
             if accepted {
-                self.begun.set(self.begun.get() + 1);
+                self.begun.fetch_add(1, Ordering::Relaxed);
             }
             Ok(accepted)
         }
@@ -239,10 +241,10 @@ mod device {
             sample: &[f64],
         family: Option<&FamilyTreeArgs<'_>>,
         ) -> CbResult<Option<DeviceGrownTree>> {
-            self.last_sample_len.set(sample.len());
+            self.last_sample_len.store(sample.len(), Ordering::Relaxed);
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -273,13 +275,13 @@ mod device {
 
         // ── Anti-false-pass 1: the device really grew every tree. ──
         assert_eq!(
-            gpu.begun.get(),
+            gpu.begun.load(Ordering::Relaxed),
             1,
             "[{label}] the backend must ACCEPT exactly one device session; \
              0 means the eligibility gate declined and the 'device' fit is a CPU fit"
         );
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "[{label}] the device must grow every tree ({} expected); a shortfall means \
              the fit silently fell back to the CPU grower",
@@ -313,7 +315,7 @@ mod device {
 
         let dev_pred = cb_model::predict_raw(&CbModel::from_trained(&dev, borders.clone()), &columns);
         let cpu_pred = cb_model::predict_raw(&CbModel::from_trained(&cpu, borders.clone()), &columns);
-        (dev_pred, cpu_pred, mismatches, gpu.last_sample_len.get())
+        (dev_pred, cpu_pred, mismatches, gpu.last_sample_len.load(Ordering::Relaxed))
     }
 
     fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
@@ -355,18 +357,18 @@ mod device {
 
                 // ── Anti-false-pass 1: the device really grew every tree. ──
                 assert_eq!(
-                    gpu.begun.get(), 1,
+                    gpu.begun.load(Ordering::Relaxed), 1,
                     "[{label}] the backend must ACCEPT exactly one device session; 0 means \
                      the eligibility gate declined and the 'device' fit is a CPU fit"
                 );
                 assert_eq!(
-                    gpu.grown.get(), params.iterations,
+                    gpu.grown.load(Ordering::Relaxed), params.iterations,
                     "[{label}] the device must grow every tree; a shortfall means the fit \
                      silently fell back to the CPU grower"
                 );
                 // ── Anti-false-pass 2: a length-n sample really crossed the seam. ──
                 assert_eq!(
-                    gpu.last_sample_len.get(), n,
+                    gpu.last_sample_len.load(Ordering::Relaxed), n,
                     "[{label}] a host-sampled fit must hand the seam a length-n multiplier; \
                      0 means the sample never crossed and the fit is effectively unsampled"
                 );
@@ -426,7 +428,7 @@ mod device {
                 println!(
                     "[{label}] {} device trees; worst iteration {} at {:.3e} (bar {EPS:.0e}); \
                      sampling effect {sampling_effect:.3e}",
-                    gpu.grown.get(), worst.0, worst.1
+                    gpu.grown.load(Ordering::Relaxed), worst.0, worst.1
                 );
             }
         }

@@ -31,7 +31,7 @@
 //! `Derivatives` the host loop folds via `cb_core::sum_f64` are bit-compatible with
 //! the CPU path within the Phase-7 GPU tolerance (D-04, <=1e-4).
 
-use std::cell::RefCell;
+use std::sync::{Mutex, MutexGuard};
 
 use cb_compute::{
     DeviceGrownTree, Derivatives, EScoreFunction, FamilyTreeArgs, Loss, Runtime, QUANTILE_ALPHA,
@@ -52,22 +52,42 @@ use crate::gpu_runtime::{
 /// [`Runtime`] seam signatures stay unchanged (Pitfall 6 — the interior mutability drops the
 /// former `Copy`/zero-sized derive).
 ///
-/// `RefCell` is `!Sync`; that is fine here — the `Model` Send+Sync contract is about the
-/// TRAINED model, not this transient training-time backend (which is bound once and used by
-/// `&reference` within a single training call). `Default` constructs it with NO open session.
+/// The session lives behind a `Mutex` rather than a `RefCell`, and specifically so this
+/// backend is `Sync`: `cb_train::train` runs the fit inside a `thread_count`-sized rayon
+/// pool, which requires `R: Runtime + Sync`. The lock is uncontended in practice — a
+/// session is opened once per fit and taken once per TREE, never per row — so it costs
+/// nothing on the hot path. A poisoned lock is surfaced as a typed error rather than
+/// unwrapped. `Default` constructs it with NO open session.
 #[derive(Default)]
 pub struct GpuBackend {
     /// The per-fit device-resident training session (GPUT-02): `Some` between a covered
     /// [`Runtime::begin_device_training`] and [`Runtime::end_device_training`], `None`
     /// otherwise (the CPU-fallback state, D-04).
-    session: RefCell<Option<GpuTrainSession>>,
+    session: Mutex<Option<GpuTrainSession>>,
+}
+
+/// Lock the session, turning a poisoned mutex into a typed error.
+///
+/// Poisoning means a previous holder panicked mid-session, so the device state is
+/// of unknown validity; surfacing that beats `unwrap()`ing into a second panic,
+/// and production code here may not `unwrap` at all (workspace lints / D-13).
+fn lock_session(
+    session: &Mutex<Option<GpuTrainSession>>,
+) -> CbResult<MutexGuard<'_, Option<GpuTrainSession>>> {
+    session.lock().map_err(|_| {
+        CbError::Degenerate(
+            "the GPU training session lock is poisoned (a previous fit panicked while \
+             holding it); the device state cannot be trusted"
+                .to_owned(),
+        )
+    })
 }
 
 impl std::fmt::Debug for GpuBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // A GpuTrainSession holds device handles (not Debug); surface only whether a session
         // is currently open so `GpuBackend` stays `Debug` without requiring the session to be.
-        let active = self.session.borrow().is_some();
+        let active = self.session.lock().is_ok_and(|g| g.is_some());
         f.debug_struct("GpuBackend")
             .field("session_active", &active)
             .finish()
@@ -294,7 +314,7 @@ impl Runtime for GpuBackend {
                 prof_t.elapsed().as_secs_f64() * 1e3,
             );
         }
-        *self.session.borrow_mut() = session;
+        *lock_session(&self.session)? = session;
         Ok(covered)
     }
 
@@ -348,7 +368,7 @@ impl Runtime for GpuBackend {
         // Only commit an OPENED session: a declined raw attempt must not clobber state
         // (the caller immediately retries through the host channel).
         if covered {
-            *self.session.borrow_mut() = session;
+            *lock_session(&self.session)? = session;
         }
         Ok(covered)
     }
@@ -375,7 +395,7 @@ impl Runtime for GpuBackend {
         // at every caller and the behaviour is byte-unchanged (D-04). Wave 7's pairwise /
         // ranking / multi-output growers consume it here.
         let _ = family;
-        let mut guard = self.session.borrow_mut();
+        let mut guard = lock_session(&self.session)?;
         match guard.as_mut() {
             None => Ok(None),
             Some(session) => {
@@ -400,7 +420,7 @@ impl Runtime for GpuBackend {
     /// deterministically (a no-op if no session was open — the CPU-fallback path).
     fn end_device_training(&self) -> CbResult<()> {
         // `take()` moves the session out and drops it here (frees the client + handles).
-        let _ = self.session.borrow_mut().take();
+        let _ = lock_session(&self.session)?.take();
         Ok(())
     }
 }

@@ -65,7 +65,9 @@ fn base_params() -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::path::PathBuf;
 
     use super::base_params;
@@ -92,7 +94,7 @@ mod device {
 
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -138,7 +140,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -172,11 +174,11 @@ mod device {
             boosting_type: cb_train::EBoostingType::Ordered,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train_cat(&gpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
             .expect("ordered+ctr CPU fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             0,
             "Ordered × CTR must still decline to CPU (the D5-untouched clause)"
         );
@@ -190,13 +192,13 @@ mod device {
         let expected = load_f64_vec(&fixture("predictions_weighted.npy")).unwrap();
         assert!(weights.iter().any(|&w| (w - 1.0).abs() > 1e-12));
         let params = base_params();
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let (trained, baked) = train_cat(
             &gpu, &columns, &borders, &cat_columns, &target, &weights, &params, None,
         )
         .expect("weighted+ctr device fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "weighted × CTR must COMMIT to the device together (positive composition)"
         );
@@ -212,7 +214,7 @@ mod device {
                 "obj {i}: weighted×CTR device pred {a} vs upstream {e} (|Δ|={abs:.3e})"
             );
         }
-        println!("[weighted×ctr] device grows = {}, max |Δpred| = {max_abs:.3e}", gpu.grown.get());
+        println!("[weighted×ctr] device grows = {}, max |Δpred| = {max_abs:.3e}", gpu.grown.load(Ordering::Relaxed));
     }
 
     /// GDC-19.3: an exclusion untouched by this phase is STILL excluded.
@@ -233,7 +235,7 @@ mod device {
             fold_len_multiplier: cb_train::fold_len_multiplier_default(),
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train(&gpu, &[f0], &[borders0], &target, &[], &params, None)
             .expect("depthwise+bayesian fit must succeed");
         // FPP-13 (T11): this assertion is INVERTED. Depthwise × Bayesian used to decline
@@ -243,7 +245,7 @@ mod device {
         // `bootstrap_type × grow_policy == SymmetricTree` restriction, so this cell now
         // COMMITS. The full cross-product is covered by device_nonsym_bootstrap_gate_test.
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "Depthwise × Bayesian is device-eligible since FPP-13 and must COMMIT"
         );

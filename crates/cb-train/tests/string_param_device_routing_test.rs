@@ -68,7 +68,9 @@ fn base_params() -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::base_params;
     use cb_backend::GpuBackend;
@@ -80,14 +82,14 @@ mod device {
 
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl CountingGpu {
         fn new() -> Self {
             Self {
                 inner: GpuBackend::default(),
-                grown: Cell::new(0),
+                grown: AtomicUsize::new(0),
             }
         }
     }
@@ -178,7 +180,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -245,7 +247,7 @@ mod device {
         let gpu = CountingGpu::new();
         train(&gpu, &cols, &borders, &target, &weights, params, None)
             .expect("the fit must succeed on whichever path it takes");
-        gpu.grown.get()
+        gpu.grown.load(Ordering::Relaxed)
     }
 
     /// The baseline MUST commit, otherwise every "declines" assertion below is
@@ -388,7 +390,7 @@ mod device {
         let device_model = train(&gpu, &cols, &borders, &target, &weights, &params, None)
             .expect("the NaN-sentinel device fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "a NaN-sentinel column must still COMMIT to the device — quantization is a \
              host-side border choice with no eligibility clause of its own"
@@ -483,7 +485,7 @@ mod device {
             let device_model = train(&gpu, &cols, &borders, &target, &weights, &params, None)
                 .unwrap_or_else(|e| panic!("{border_type:?}: device fit failed: {e}"));
             assert_eq!(
-                gpu.grown.get(),
+                gpu.grown.load(Ordering::Relaxed),
                 params.iterations,
                 "{border_type:?}: a border choice must not change device routing"
             );

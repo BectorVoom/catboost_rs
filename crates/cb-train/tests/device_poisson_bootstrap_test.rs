@@ -123,24 +123,26 @@ mod device {
     use cb_core::CbResult;
     use cb_model::Model as CbModel;
     use cb_train::{train, BoostParams, EBootstrapType};
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The real [`GpuBackend`], instrumented to PROVE the device grow ran and to record
     /// the sample length the seam received (0 for Poisson — the draw is device-resident).
     struct CountingGpu {
         inner: GpuBackend,
-        grown: Cell<usize>,
-        begun: Cell<usize>,
-        last_sample_len: Cell<usize>,
+        grown: AtomicUsize,
+        begun: AtomicUsize,
+        last_sample_len: AtomicUsize,
     }
 
     impl CountingGpu {
         fn new() -> Self {
             Self {
                 inner: GpuBackend::default(),
-                grown: Cell::new(0),
-                begun: Cell::new(0),
-                last_sample_len: Cell::new(usize::MAX),
+                grown: AtomicUsize::new(0),
+                begun: AtomicUsize::new(0),
+                last_sample_len: AtomicUsize::new(usize::MAX),
             }
         }
     }
@@ -189,7 +191,7 @@ mod device {
                 config,
             )?;
             if accepted {
-                self.begun.set(self.begun.get() + 1);
+                self.begun.fetch_add(1, Ordering::Relaxed);
             }
             Ok(accepted)
         }
@@ -201,10 +203,10 @@ mod device {
             sample: &[f64],
         family: Option<&FamilyTreeArgs<'_>>,
         ) -> CbResult<Option<DeviceGrownTree>> {
-            self.last_sample_len.set(sample.len());
+            self.last_sample_len.store(sample.len(), Ordering::Relaxed);
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -225,15 +227,15 @@ mod device {
         let gpu = CountingGpu::new();
         let model = train(&gpu, &columns, &borders, &target, &[], params, None)
             .unwrap_or_else(|e| panic!("[{label}] device train failed: {e:?}"));
-        assert_eq!(gpu.begun.get(), 1, "[{label}] the device session must be accepted");
+        assert_eq!(gpu.begun.load(Ordering::Relaxed), 1, "[{label}] the device session must be accepted");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "[{label}] every tree must be grown on device"
         );
         if params.bootstrap_type == EBootstrapType::Poisson {
             assert_eq!(
-                gpu.last_sample_len.get(),
+                gpu.last_sample_len.load(Ordering::Relaxed),
                 0,
                 "[{label}] Poisson draws device-resident; the host must pass an EMPTY sample"
             );

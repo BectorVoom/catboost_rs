@@ -188,7 +188,9 @@ fn ctr_params(counter_calc_method: CounterCalcMethod) -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::path::PathBuf;
 
     use super::{ctr_params, EVAL_HALF_START, TRUNCATED_BORDER_COUNT};
@@ -211,7 +213,7 @@ mod device {
     /// `grow_tree_on_device` calls that actually returned a device tree.
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -257,7 +259,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -407,7 +409,7 @@ mod device {
             );
         }
 
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let (trained, _baked) = train_cat_with_eval_sets(
             &gpu,
             &split.learn_columns,
@@ -454,7 +456,7 @@ mod device {
             }
         }
 
-        let grown = gpu.grown.get();
+        let grown = gpu.grown.load(Ordering::Relaxed);
         println!(
             "[device-ctr-type-gate] {tag}: method={method:?} eval_sets={} \
              ctr_splits={n_ctr_splits} grown={grown}/{}",
@@ -535,7 +537,7 @@ mod device {
             );
         }
 
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let (trained, _baked) = train_cat_with_eval_sets(
             &gpu,
             &float_columns,
@@ -554,7 +556,7 @@ mod device {
         // must be able to read `grown` and the CTR-split count even when a non-vacuity
         // guard is the assertion that fires. Fail-fast ordering hides exactly the
         // evidence the completion criteria ask for — do not "fix" this ordering.
-        let grown = gpu.grown.get();
+        let grown = gpu.grown.load(Ordering::Relaxed);
         let n_ctr_splits: usize =
             trained.oblivious_trees.iter().map(|t| t.ctr_splits.len()).sum();
         println!(

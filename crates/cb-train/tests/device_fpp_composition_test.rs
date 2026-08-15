@@ -67,7 +67,9 @@ fn base_params() -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::path::PathBuf;
 
     use super::base_params;
@@ -94,7 +96,7 @@ mod device {
 
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -140,7 +142,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -182,19 +184,19 @@ mod device {
             boost_from_average: true,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let (trained, _baked) = train_cat(
             &gpu, &columns, &borders, &cat_columns, &target, &weights, &params, None,
         )
         .expect("bias × weighted × CTR device fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "bias × weighted × CTR must COMMIT to the device together — a decline means one \
              relaxation narrowed another's reach"
         );
         assert_eq!(trained.oblivious_trees.len(), params.iterations);
-        println!("[bias×weighted×ctr] device grows = {}", gpu.grown.get());
+        println!("[bias×weighted×ctr] device grows = {}", gpu.grown.load(Ordering::Relaxed));
     }
 
     /// FPP-17.2: exact leaf × CTR still declines. FPP-06 admitted Exact for {Mae,
@@ -208,11 +210,11 @@ mod device {
             leaf_method: LeafMethod::Exact,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train_cat(&gpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
             .expect("exact-leaf × CTR CPU fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             0,
             "exact leaf × CTR must still decline to the CPU grower — FPP-06 widened the \
              leaf-method clause only, not the CTR family gate"
@@ -232,11 +234,11 @@ mod device {
             subsample: 0.66,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train(&gpu, &columns, &borders, &target, &[], &params, None)
             .expect("exact-leaf × sampling CPU fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             0,
             "exact leaf × sampling must still decline — FPP-13 opened bootstrap × \
              grow_policy, not bootstrap × leaf_method"
@@ -276,7 +278,7 @@ mod device {
             one_hot_max_size: 3,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let err = train_cat(&gpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
             .expect_err("a mixed one-hot/CTR pool must be REFUSED, not trained");
         let msg = format!("{err}");
@@ -289,7 +291,7 @@ mod device {
             "the refusal must name the knob that resolves it: {msg}"
         );
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             0,
             "…and nothing may have been grown on the device before the refusal"
         );
@@ -343,11 +345,11 @@ mod device {
             permutation_count: 4,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train_cat(&gpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
             .expect("multi-permutation × CTR CPU fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             0,
             "multi-permutation × CTR must still decline — the single-permutation guard is \
              untouched by the projection-arity work"
@@ -364,11 +366,11 @@ mod device {
             random_strength: 1.0,
             ..base_params()
         };
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train(&gpu, &columns, &borders, &target, &[], &params, None)
             .expect("random_strength CPU fit must succeed");
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             0,
             "random_strength != 0 must still decline — it is this suite's control clause"
         );

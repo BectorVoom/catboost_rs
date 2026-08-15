@@ -204,14 +204,16 @@ fn bootstrap_dev_device_matches_upstream() {
     use cb_compute::{DeviceGrownTree, DeviceTrainConfig, FamilyTreeArgs, Runtime};
     use cb_core::CbResult;
     use cb_train::train;
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Counts the trees the device actually returned, so a silent CPU fallback
     /// cannot make this test pass while proving nothing about the device.
     struct CountingGpu {
         inner: GpuBackend,
-        grown: Cell<usize>,
-        sampled_trees: Cell<usize>,
+        grown: AtomicUsize,
+        sampled_trees: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -268,9 +270,9 @@ fn bootstrap_dev_device_matches_upstream() {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
                 if !sample.is_empty() {
-                    self.sampled_trees.set(self.sampled_trees.get() + 1);
+                    self.sampled_trees.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Ok(out)
@@ -290,8 +292,8 @@ fn bootstrap_dev_device_matches_upstream() {
         let p = params(bt, subsample, temp);
         let gpu = CountingGpu {
             inner: GpuBackend::default(),
-            grown: Cell::new(0),
-            sampled_trees: Cell::new(0),
+            grown: AtomicUsize::new(0),
+            sampled_trees: AtomicUsize::new(0),
         };
         let mut staged = Vec::new();
         let model = train(&gpu, &columns, &borders, &target, &[], &p, Some(&mut staged))
@@ -300,7 +302,7 @@ fn bootstrap_dev_device_matches_upstream() {
         // Anti-false-pass: every tree must have come from the device, and every
         // SAMPLED scenario must have carried a real sample across the seam.
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             p.iterations,
             "bootstrap_dev/{scenario}: the device must grow all {} trees; a shortfall means \
              the fit silently fell back to the CPU grower and this is not a device oracle",
@@ -308,11 +310,11 @@ fn bootstrap_dev_device_matches_upstream() {
         );
         let expect_sampled = if matches!(bt, EBootstrapType::No) { 0 } else { p.iterations };
         assert_eq!(
-            gpu.sampled_trees.get(),
+            gpu.sampled_trees.load(Ordering::Relaxed),
             expect_sampled,
             "bootstrap_dev/{scenario}: expected {expect_sampled} trees to carry a host sample \
              across the seam, saw {}",
-            gpu.sampled_trees.get()
+            gpu.sampled_trees.load(Ordering::Relaxed)
         );
 
         gate_against_upstream("device", scenario, &model, &staged);

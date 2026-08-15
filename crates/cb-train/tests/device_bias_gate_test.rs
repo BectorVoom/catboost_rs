@@ -75,7 +75,9 @@ fn bias_params(grow_policy: EGrowPolicy) -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{bias_params, fixture};
     use cb_backend::GpuBackend;
@@ -89,7 +91,7 @@ mod device {
     /// seam method to the real `GpuBackend`, counting committed device grows.
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -135,7 +137,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -161,18 +163,18 @@ mod device {
         );
 
         let w = vec![1.0_f64; target.len()];
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         train(&gpu, &columns, &borders, &target, &w, &params, None)
             .unwrap_or_else(|e| panic!("[{label}] bias device train failed: {e:?}"));
 
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "[{label}] a boost_from_average fit must COMMIT to the device (one device grow \
              per iteration) — zero means the removed bias clause silently resurrected a CPU \
              fallback"
         );
-        println!("[{label}] bias fit committed to device: {} grows", gpu.grown.get());
+        println!("[{label}] bias fit committed to device: {} grows", gpu.grown.load(Ordering::Relaxed));
     }
 }
 

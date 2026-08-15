@@ -122,7 +122,9 @@ fn ctr_free_params(iterations: usize) -> BoostParams {
 
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 mod device {
-    use std::cell::Cell;
+    // Atomics, not `Cell`: `cb_train::train` requires `R: Runtime + Sync` so the
+    // fit can run inside a `thread_count`-sized rayon pool.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::path::PathBuf;
 
     use super::ctr_free_params;
@@ -144,7 +146,7 @@ mod device {
     /// NINTH copy.
     pub struct CountingGpu {
         pub inner: GpuBackend,
-        pub grown: Cell<usize>,
+        pub grown: AtomicUsize,
     }
 
     impl Runtime for CountingGpu {
@@ -190,7 +192,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -227,9 +229,9 @@ mod device {
     /// assumptions. Without it this file would be a device-vs-device tautology (the R-8 class).
     pub struct CountingCpu {
         inner: CpuRefRuntime,
-        pub grown: Cell<usize>,
-        pub begins: Cell<usize>,
-        pub accepted_begins: Cell<usize>,
+        pub grown: AtomicUsize,
+        pub begins: AtomicUsize,
+        pub accepted_begins: AtomicUsize,
     }
 
     impl Runtime for CountingCpu {
@@ -260,13 +262,13 @@ mod device {
             scaled_l2: f64,
             config: &DeviceTrainConfig,
         ) -> CbResult<bool> {
-            self.begins.set(self.begins.get() + 1);
+            self.begins.fetch_add(1, Ordering::Relaxed);
             let accepted = self.inner.begin_device_training(
                 loss, depth, plain, fold_count, score_function, bins, weight, n, n_features,
                 n_bins, lr, scaled_l2, config,
             )?;
             if accepted {
-                self.accepted_begins.set(self.accepted_begins.get() + 1);
+                self.accepted_begins.fetch_add(1, Ordering::Relaxed);
             }
             Ok(accepted)
         }
@@ -280,7 +282,7 @@ mod device {
         ) -> CbResult<Option<DeviceGrownTree>> {
             let out = self.inner.grow_tree_on_device(approx, target, sample, family)?;
             if out.is_some() {
-                self.grown.set(self.grown.get() + 1);
+                self.grown.fetch_add(1, Ordering::Relaxed);
             }
             Ok(out)
         }
@@ -367,7 +369,7 @@ mod device {
         );
 
         // ---- arm 1: the DEVICE grower ----
-        let gpu = CountingGpu { inner: GpuBackend::default(), grown: Cell::new(0) };
+        let gpu = CountingGpu { inner: GpuBackend::default(), grown: AtomicUsize::new(0) };
         let (dev, _dev_baked) =
             train_cat(&gpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
                 .unwrap_or_else(|e| panic!("device CTR train failed: {e:?}"));
@@ -375,9 +377,9 @@ mod device {
         // ---- arm 2: the CPU grower, same inputs, same gradients ----
         let cpu = CountingCpu {
             inner: CpuRefRuntime { inner: GpuBackend::default() },
-            grown: Cell::new(0),
-            begins: Cell::new(0),
-            accepted_begins: Cell::new(0),
+            grown: AtomicUsize::new(0),
+            begins: AtomicUsize::new(0),
+            accepted_begins: AtomicUsize::new(0),
         };
         let (host, _host_baked) =
             train_cat(&cpu, &columns, &borders, &cat_columns, &target, &[], &params, None)
@@ -392,27 +394,27 @@ mod device {
 
         // ---- the arms are really what they claim to be ----
         assert_eq!(
-            gpu.grown.get(),
+            gpu.grown.load(Ordering::Relaxed),
             params.iterations,
             "the CTR fit must COMMIT to the device: expected {} device grows, got {}. \
              `oblivious_trees.len() == iterations` does not say this — the CPU oblivious \
              grower satisfies it too (R-8).",
             params.iterations,
-            gpu.grown.get()
+            gpu.grown.load(Ordering::Relaxed)
         );
         assert_eq!(
-            cpu.grown.get(),
+            cpu.grown.load(Ordering::Relaxed),
             0,
             "the reference arm must run the CPU grower — a `CpuRefRuntime` that committed to \
              the device would make this differential a device-vs-device tautology"
         );
         assert_eq!(
-            cpu.accepted_begins.get(),
+            cpu.accepted_begins.load(Ordering::Relaxed),
             0,
             "the reference arm's `begin_device_training` must inherit the trait default \
              `Ok(false)`; it accepted {} of {} sessions",
-            cpu.accepted_begins.get(),
-            cpu.begins.get()
+            cpu.accepted_begins.load(Ordering::Relaxed),
+            cpu.begins.load(Ordering::Relaxed)
         );
         assert_eq!(dev.oblivious_trees.len(), params.iterations);
         assert_eq!(host.oblivious_trees.len(), params.iterations);
@@ -440,10 +442,10 @@ mod device {
              CTR splits: device {dev_ctr} / cpu {cpu_ctr} | \
              CTR-free trees: device {dev_ctr_free} / cpu {cpu_ctr_free} | \
              device grows = {}, cpu device-grows = {} (begins {} / accepted {})",
-            gpu.grown.get(),
-            cpu.grown.get(),
-            cpu.begins.get(),
-            cpu.accepted_begins.get()
+            gpu.grown.load(Ordering::Relaxed),
+            cpu.grown.load(Ordering::Relaxed),
+            cpu.begins.load(Ordering::Relaxed),
+            cpu.accepted_begins.load(Ordering::Relaxed)
         );
 
         // ---- split-sequence equality FIRST: a leaf comparison over two different trees
