@@ -1238,6 +1238,128 @@ pub fn ordered_approx_delta_simple(
     Ok(approx_delta)
 }
 
+/// The FULL ordered approximant delta for one body/tail — body rows included.
+///
+/// [`ordered_approx_delta_simple`] computes only the TAIL half and leaves body rows
+/// at `0`, documenting them as "the estimation prefix, not updated here". That is
+/// wrong as a description of upstream's per-body/tail approx trajectory, and the
+/// repository already contained the evidence: the committed upstream dump
+/// `cb-oracle/fixtures/ordered_boost/ordered_approx_iter0.npy` has **no zeros at
+/// all** — every one of its 30 per-object entries is non-zero, body prefix included.
+/// It went unnoticed because the only test touching that fixture asserts
+/// well-formedness (finite / full-length / bounded), never its values, since the
+/// raw inputs behind it are uncommitted.
+///
+/// So both halves advance, by DIFFERENT rules:
+///   * BODY rows `[0, body_finish)` take the leaf average over the body prefix — one
+///     value per leaf, exactly the plain estimate restricted to the prefix;
+///   * TAIL rows `[body_finish, tail_finish)` take the running add-then-read leaf
+///     average, so each tail row sees only the prefix before it.
+///
+/// The rule was derived by replaying upstream's own tree sequence: with a shuffle-free
+/// (`has_time`) fit, advancing each segment's approx by `learning_rate * this_delta`
+/// reproduces upstream's chosen splits where freezing the body rows does not — the
+/// frozen variant is in fact WORSE than not modelling per-segment approximants at all,
+/// because a body that never advances keeps its derivatives pinned at the initial
+/// target forever.
+///
+/// [`ordered_approx_delta_simple`] is retained unchanged: it is mirrored bit-for-bit
+/// by the device ordered path (`cb-backend`'s `gpu_runtime::ordered`) and is that
+/// mirror's frozen self-oracle, so changing it would be a cross-crate device change
+/// rather than a CPU parity fix.
+///
+/// # Errors
+/// [`CbError::Degenerate`] on a short `leaf_of` / `der`, or an out-of-range
+/// permutation index.
+#[allow(clippy::too_many_arguments)]
+pub fn ordered_approx_delta_with_body(
+    leaf_of: &[usize],
+    der: &[f64],
+    weights: &[f64],
+    permutation: &[i32],
+    body_finish: usize,
+    tail_finish: usize,
+    n_leaves: usize,
+    scaled_l2: f64,
+) -> CbResult<Vec<f64>> {
+    let n = permutation.len();
+    if leaf_of.len() < n || der.len() < n {
+        return Err(CbError::Degenerate(
+            "ordered_approx_with_body: leaf_of / der shorter than permutation".to_owned(),
+        ));
+    }
+    let w_of = |doc: usize| -> f64 {
+        if weights.is_empty() {
+            1.0
+        } else {
+            weights.get(doc).copied().unwrap_or(0.0)
+        }
+    };
+    let doc_at = |p: usize| -> CbResult<usize> {
+        match permutation.get(p) {
+            Some(&d) if d >= 0 => Ok(d as usize),
+            _ => Err(CbError::Degenerate(
+                "ordered_approx_with_body: permutation index out of range".to_owned(),
+            )),
+        }
+    };
+
+    let mut leaf_sum_der = vec![0.0_f64; n_leaves];
+    let mut leaf_sum_weight = vec![0.0_f64; n_leaves];
+    let upper = tail_finish.min(n);
+    let body_upper = body_finish.min(upper);
+
+    // Body prefix sums.
+    for p in 0..body_upper {
+        let doc = doc_at(p)?;
+        let leaf = leaf_of.get(doc).copied().unwrap_or(0);
+        if let (Some(sd), Some(sw)) = (leaf_sum_der.get_mut(leaf), leaf_sum_weight.get_mut(leaf)) {
+            *sd += der.get(doc).copied().unwrap_or(0.0);
+            *sw += w_of(doc);
+        }
+    }
+
+    let mut approx_delta = vec![0.0_f64; n];
+
+    // BODY rows: the per-leaf average over the prefix (one value per leaf).
+    let body_delta: Vec<f64> = (0..n_leaves)
+        .map(|leaf| {
+            gradient_leaf_delta(
+                leaf_sum_der.get(leaf).copied().unwrap_or(0.0),
+                leaf_sum_weight.get(leaf).copied().unwrap_or(0.0),
+                scaled_l2,
+            )
+        })
+        .collect();
+    for p in 0..body_upper {
+        let doc = doc_at(p)?;
+        let leaf = leaf_of.get(doc).copied().unwrap_or(0);
+        if let Some(slot) = approx_delta.get_mut(doc) {
+            *slot = body_delta.get(leaf).copied().unwrap_or(0.0);
+        }
+    }
+
+    // TAIL rows: the running add-then-read average.
+    for p in body_upper..upper {
+        let doc = doc_at(p)?;
+        let leaf = leaf_of.get(doc).copied().unwrap_or(0);
+        if let (Some(sd), Some(sw)) = (leaf_sum_der.get_mut(leaf), leaf_sum_weight.get_mut(leaf)) {
+            *sd += der.get(doc).copied().unwrap_or(0.0);
+            *sw += w_of(doc);
+        }
+        let delta = gradient_leaf_delta(
+            leaf_sum_der.get(leaf).copied().unwrap_or(0.0),
+            leaf_sum_weight.get(leaf).copied().unwrap_or(0.0),
+            scaled_l2,
+        );
+        if let Some(slot) = approx_delta.get_mut(doc) {
+            *slot = delta;
+        }
+    }
+
+    Ok(approx_delta)
+}
+
 /// Assemble one [`ObliviousTree`] from a grown tree's parts, carrying the
 /// per-level kind order through (T03 / SPEC-OH-01).
 ///
@@ -5984,6 +6106,31 @@ fn train_inner<R: Runtime>(
 
     // `resume_from` is 0 unless a checkpoint was just restored, so the non-snapshot
     // path keeps the original `0..iterations` bound byte-for-byte (the D-04 anchor).
+    // ORD-APPROX: upstream gives EACH body/tail its own ordered approximant
+    // (`TFold::TBodyTail::Approx`) and derives that segment's split-scoring
+    // derivatives from it (`bt.WeightedDerivatives`). This engine kept ONE approx per
+    // tree and scored every segment from it.
+    //
+    // That is invisible at iteration 0 -- the approx is all zeros there, so every
+    // segment's derivatives coincide, which is why the first tree matched upstream
+    // once the shuffle and body/tail score were fixed -- and it accumulates from
+    // iteration 1 onward until it flips a split (measured: the divergence enters at
+    // iteration 2, 3 or 4 depending on the corpus).
+    //
+    // Each entry is a per-OBJECT approx (object order, like the main `approx`), one
+    // per segment of the learning fold's body/tail sequence. Empty for Plain, which
+    // leaves that path byte-identical.
+    let ordered_segments: Vec<(usize, usize)> = if ordered_learning_perm.is_some() {
+        crate::fold::body_tail_segments(n, params.fold_len_multiplier)
+    } else {
+        Vec::new()
+    };
+    // Seeded from the SAME starting approx as the main trajectory: under
+    // `boost_from_average` that start is the bias, and zero-seeding gives iteration 0
+    // different derivatives from the rest of the fit (the ordered_boost_e2e oracle,
+    // whose fixture pins boost_from_average = true, catches this immediately).
+    let mut ordered_seg_approx: Vec<Vec<f64>> = vec![approx.clone(); ordered_segments.len()];
+
     for iter in resume_from..params.iterations {
         // ─── MODEL SHRINKAGE (`model_shrink_rate` / `model_shrink_mode`) ─────────
         // Upstream multiplies the ENTIRE accumulated model before growing the next
@@ -6990,6 +7137,32 @@ fn train_inner<R: Runtime>(
         let search_weighted_der1: &[f64] =
             search_weighted_der1_owned.as_deref().unwrap_or(&weighted_der1);
 
+        // ORD-APPROX: each body/tail segment's split-scoring derivatives, taken from
+        // ITS OWN ordered approximant (upstream `bt.WeightedDerivatives`). At
+        // iteration 0 every segment approx is all zeros, so every entry equals the
+        // shared `search_weighted_der1` and the first tree is byte-identical to the
+        // pre-ORD-APPROX behaviour. Empty on the Plain path.
+        let ordered_seg_weighted_der1: Vec<Vec<f64>> = if ordered_segments.is_empty() {
+            Vec::new()
+        } else {
+            let mut per_seg = Vec::with_capacity(ordered_segments.len());
+            for seg_approx in &ordered_seg_approx {
+                let ders =
+                    runtime.compute_gradients(&params.loss, seg_approx, target, approx_dimension)?;
+                per_seg.push(
+                    ders.der1
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &d)| {
+                            let i = idx % n;
+                            d * weights.get(i).copied().unwrap_or(1.0)
+                        })
+                        .collect::<Vec<f64>>(),
+                );
+            }
+            per_seg
+        };
+
         // EFFECTIVE histogram / leaf weight (LOSS-04, 06.3-09): for a
         // pairwise-loss (`UsesPairsForCalculation` — PairLogit / PairLogitPairwise /
         // YetiRank{,Pairwise}) the split-scoring histogram `sumWeight` and the
@@ -7337,7 +7510,7 @@ fn train_inner<R: Runtime>(
                 // the SAME averaging-fold leaf-value path below applies.
                 Some(learning_perm) => greedy_tensor_search_oblivious_ordered(
                     &matrix,
-                    &weighted_der1,
+                    &ordered_seg_weighted_der1,
                     &weights,
                     learning_perm,
                     params.l2_leaf_reg,
@@ -7887,6 +8060,48 @@ fn train_inner<R: Runtime>(
                     leaf_values.get(leaf_base + leaf),
                 ) {
                     *a += lv;
+                }
+            }
+        }
+
+        // ORD-APPROX UPDATE: advance EACH body/tail's own ordered approximant with
+        // that segment's ordered delta (`ordered_approx_delta_simple`, upstream's
+        // `CalcApproxDeltaSimple` over the fold's BodyTailArr). The body rows are the
+        // estimation prefix and keep delta 0; each tail row's delta is the running
+        // per-leaf average that INCLUDES the body prefix, so a row never contributes
+        // to the leaf value that will later score it.
+        //
+        // These trajectories feed ONLY the next iteration's split-scoring
+        // derivatives. The model's leaf VALUES continue to come from the averaging
+        // fold via the `approx` update above (upstream `CalcLeafValuesSimple`), which
+        // is why the Plain path and every leaf-value oracle are untouched.
+        if !ordered_segments.is_empty() {
+            if let Some(learning_perm) = ordered_learning_perm.as_deref() {
+                let seg_bsw = crate::fold::body_sum_weights(n, params.fold_len_multiplier, &weights);
+                for (idx, &(body_finish, tail_finish)) in ordered_segments.iter().enumerate() {
+                    let bsw = seg_bsw.get(idx).copied().unwrap_or(0.0);
+                    let scaled_l2 = cb_compute::scale_l2_reg(params.l2_leaf_reg, bsw, body_finish);
+                    let der = ordered_seg_weighted_der1
+                        .get(idx)
+                        .map_or(&[][..], Vec::as_slice);
+                    let _ = bsw;
+                    let delta = ordered_approx_delta_with_body(
+                        &leaf_value_leaf_of,
+                        der,
+                        &weights,
+                        learning_perm,
+                        body_finish,
+                        tail_finish,
+                        n_leaves,
+                        scaled_l2,
+                    )?;
+                    if let Some(seg_approx) = ordered_seg_approx.get_mut(idx) {
+                        for (i, &d) in delta.iter().enumerate() {
+                            if let Some(a) = seg_approx.get_mut(i) {
+                                *a += params.learning_rate * d;
+                            }
+                        }
+                    }
                 }
             }
         }

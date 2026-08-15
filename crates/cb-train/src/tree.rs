@@ -2456,7 +2456,7 @@ fn score_candidate_ordered(
     matrix: &FeatureMatrix,
     chosen: &[Split],
     candidate: Split,
-    der1: &[f64],
+    seg_der1: &[Vec<f64>],
     weight: &[f64],
     permutation: &[i32],
     segments: &[(usize, usize)],
@@ -2475,6 +2475,9 @@ fn score_candidate_ordered(
         // Per-segment scaled L2 = l2 * (BodySumWeight / BodyFinish)
         // (scoring.cpp:746-748). scale_l2_reg guards body_finish == 0.
         let scaled_l2_segment = scale_l2_reg(l2_leaf_reg, body_sum_weight, body_finish);
+        // ORD-APPROX: segment `idx` is scored with ITS OWN ordered approximant's
+        // derivatives (upstream's `bt.WeightedDerivatives`), not one shared array.
+        let der1 = seg_der1.get(idx).map_or(&[][..], Vec::as_slice);
         let (body_stats, tail_stats) = ordered_segment_leaf_stats(
             &leaf_of,
             der1,
@@ -2503,7 +2506,7 @@ fn score_candidate_ordered(
 fn select_level_ordered(
     matrix: &FeatureMatrix,
     chosen: &[Split],
-    der1: &[f64],
+    seg_der1: &[Vec<f64>],
     weight: &[f64],
     permutation: &[i32],
     segments: &[(usize, usize)],
@@ -2519,7 +2522,7 @@ fn select_level_ordered(
                 matrix,
                 chosen,
                 Split { feature, border },
-                der1,
+                seg_der1,
                 weight,
                 permutation,
                 segments,
@@ -2573,7 +2576,7 @@ fn select_level_ordered(
 #[allow(clippy::too_many_arguments)]
 pub fn greedy_tensor_search_oblivious_ordered(
     matrix: &FeatureMatrix,
-    der1: &[f64],
+    seg_der1: &[Vec<f64>],
     weight: &[f64],
     permutation: &[i32],
     l2_leaf_reg: f64,
@@ -2598,7 +2601,7 @@ pub fn greedy_tensor_search_oblivious_ordered(
         let best = select_level_ordered(
             matrix,
             &chosen,
-            der1,
+            seg_der1,
             weight,
             permutation,
             &segments,

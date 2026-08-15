@@ -28,6 +28,17 @@ use crate::tree::{
 
 /// A small numeric-only fixture: 6 objects, 2 float features, hand-chosen
 /// derivatives so the ordered and plain searches are both well-defined.
+/// Replicate one derivative array across `k` segments.
+///
+/// The scorer takes one derivative array PER body/tail segment (upstream's
+/// `bt.WeightedDerivatives`, each from that segment's own ordered approximant).
+/// These unit tests model a SINGLE iteration, where every segment's approx is all
+/// zeros and the derivative arrays therefore genuinely coincide -- so replicating is
+/// faithful here, not a shortcut.
+fn per_segment(der: &[f64], k: usize) -> Vec<Vec<f64>> {
+    vec![der.to_vec(); k.max(1)]
+}
+
 fn fixture() -> (Vec<Vec<f32>>, Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
     // feature 0: 0,1,2,3,4,5 ; feature 1: 5,4,3,2,1,0
     let feature_values = vec![
@@ -69,7 +80,7 @@ fn single_full_span_segment_has_an_empty_tail_and_scores_zero() {
         &matrix,
         &[],
         candidate,
-        &der1,
+        &per_segment(&der1, 8),
         &weight,
         &identity,
         &[(n, n)],
@@ -107,7 +118,7 @@ fn ordered_score_estimates_on_the_body_and_scores_on_the_tail() {
     let bsw: f64 = cb_core::sum_f64(&weight[..body_finish]);
 
     let got = score_candidate_ordered(
-        &matrix, &[], candidate, &der1, &weight, &identity, &[(body_finish, n)], &[bsw], l2, n,
+        &matrix, &[], candidate, &per_segment(&der1, 8), &weight, &identity, &[(body_finish, n)], &[bsw], l2, n,
     )
     .expect("ordered score");
 
@@ -198,7 +209,7 @@ fn multi_segment_ordered_search_runs_and_can_differ_from_plain() {
     let identity: Vec<i32> = (0..n as i32).collect();
 
     let ordered = greedy_tensor_search_oblivious_ordered(
-        &matrix, &der1, &weight, &identity, 2.0, 2.0, 2, n,
+        &matrix, &per_segment(&der1, 8), &weight, &identity, 2.0, 2.0, 2, n,
     )
     .expect("ordered search");
     assert_eq!(ordered.splits.len(), 2, "depth-2 tree has 2 splits");
@@ -229,7 +240,7 @@ fn strict_first_wins_on_equal_score_pair() {
     let identity: Vec<i32> = (0..n as i32).collect();
 
     let tree = greedy_tensor_search_oblivious_ordered(
-        &matrix, &der1, &weight, &identity, 1.0, 2.0, 1, n,
+        &matrix, &per_segment(&der1, 8), &weight, &identity, 1.0, 2.0, 1, n,
     )
     .expect("ordered search");
     assert_eq!(
@@ -254,7 +265,7 @@ fn permutation_index_out_of_range_returns_degenerate() {
         &matrix,
         &[],
         Split { feature: 0, border: 1.5 },
-        &der1,
+        &per_segment(&der1, 8),
         &weight,
         &bad_perm,
         &segments,
@@ -283,7 +294,7 @@ fn negative_permutation_index_returns_degenerate() {
         &matrix,
         &[],
         Split { feature: 0, border: 1.5 },
-        &der1,
+        &per_segment(&der1, 8),
         &weight,
         &bad_perm,
         &segments,

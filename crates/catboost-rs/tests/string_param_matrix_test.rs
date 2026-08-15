@@ -214,31 +214,32 @@ fn check_cell(param: &str, value: &str) -> Option<String> {
 const KNOWN_DIVERGENT: &[(&str, &str, &str)] = &[(
     "boosting_type",
     "Ordered",
-    "Ordered boosting: the FIRST TREE now matches catboost 1.2.10; a residual \
-     MULTI-ITERATION divergence remains. Two real bugs were found and fixed. (1) The \
-     ordered split score merged each segment\'s BODY and TAIL rows into one statistic \
-     pair, when upstream fills `SumDelta`/`Count` from the body and \
-     `SumWeightedDelta`/`SumWeight` from the tail (`scoring.cpp:291-309`) and \
+    "Ordered boosting: THREE real bugs found and fixed; a residual remains at \
+     permutation_count > 1, which is what this cell exercises (the matrix leaves it at \
+     the default 4). \
+     (1) The ordered split score merged each segment\'s BODY and TAIL rows into one \
+     statistic pair; upstream fills `SumDelta`/`Count` from the body and \
+     `SumWeightedDelta`/`SumWeight` from the tail (`scoring.cpp:291-309`), and \
      `AddLeafOrdered` (`score_calcers.cpp:36-49`) averages the BODY pair and \
-     multiplies by the TAIL sum -- estimate on the body, score on the tail. (2) The \
-     float-only ordered path never SHUFFLED the learn set, though upstream shuffles \
-     whenever `NeedShuffle` holds -- `(hasCtrs || ordered) && !has_time` \
-     (`preprocess.cpp:161`) -- which ordered satisfies alone; `Folds[0]` is the \
-     identity over ALREADY-SHUFFLED data, so in original coordinates it is `S`. \
-     With both fixed, the first tree matches at 10/10 corpus sizes for f=2 and 9/10 \
-     for f=4 (previously 2/10 and 0/10). \
-     WHAT REMAINS: divergence enters at iteration 2-4 depending on corpus. The likely \
-     cause is that upstream gives each body/tail its OWN ordered approximant \
-     (`bt.WeightedDerivatives`) while this engine keeps one per tree -- invisible at \
-     iteration 0, where every segment\'s approx is zero, which is exactly why the \
-     first tree is now exact. Implementing it was ATTEMPTED (per-segment approx \
-     seeded from the bias, advanced by `ordered_approx_delta_simple` -- which has no \
-     production caller) and REVERTED: it helped some corpora and made others worse, \
-     so it is not yet upstream-faithful and was not shipped on mixed evidence. The \
-     `learning_rate` scaling of the ordered delta is the prime suspect. \
-     Also still open, tracked separately in \
-     `ordered_permutation_count_defect_test.rs`: the path is insensitive to \
-     `permutation_count`.",
+     multiplies by the TAIL sum. (2) The float-only path never SHUFFLED the learn set, \
+     though `NeedShuffle` = `(hasCtrs || ordered) && !has_time` \
+     (`preprocess.cpp:161`) is satisfied by ordered alone. (3) Each body/tail lacked \
+     its OWN ordered approximant, and the delta that advances it froze the BODY rows \
+     at 0 -- so a body prefix never learned and its derivatives stayed pinned at the \
+     initial target. The committed upstream dump \
+     `ordered_boost/ordered_approx_iter0.npy` has NO zero entries at all, which is \
+     direct evidence body rows advance; it went unnoticed because the only test \
+     touching it asserts well-formedness, never values. \
+     MEASURED: at permutation_count=1 over a 60-cell corpus x iteration grid, 27/60 -> \
+     44/60 cells match catboost 1.2.10 with ZERO cells regressed; the first tree is \
+     exact essentially everywhere. \
+     WHAT REMAINS: `permutation_count > 1`. The path ignores it entirely (all learning \
+     folds carry identity placeholders and `train_inner` always reads `Folds[0]`, while \
+     upstream selects a structure fold per iteration) -- pinned by \
+     `ordered_permutation_count_defect_test.rs`. Wiring the existing, oracle-validated \
+     `structure_fold_cycle` was TRIED and does not reach parity, so it was reverted \
+     rather than shipped unverified. A smaller residual also persists at pc=1 on some \
+     corpora from iteration 3.",
 )];
 
 fn is_known_divergent(param: &str, value: &str) -> bool {
