@@ -278,6 +278,9 @@ fn one_hot_candidates_are_never_enumerated_under_perturbation() {
         rng: &mut rng,
         score_st_dev: 1.0,
         score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
+        // `rsm = 1.0` keeps every feature a candidate, so this test
+        // observes the unchanged draw stream it was written against.
+        rsm: 1.0,
     };
 
     let got = greedy_tensor_search_oblivious_perturbed(
@@ -309,6 +312,9 @@ fn one_hot_candidates_are_never_enumerated_under_perturbation() {
         rng: &mut rng2,
         score_st_dev: 1.0,
         score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
+        // `rsm = 1.0` keeps every feature a candidate, so this test
+        // observes the unchanged draw stream it was written against.
+        rsm: 1.0,
     };
     assert!(greedy_tensor_search_oblivious_perturbed(
         &m2,

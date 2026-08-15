@@ -242,6 +242,20 @@ const IMPLEMENTED: &[&str] = &[
     "verbose",
     "silent",
     "metric_period",
+    // `rsm` (alias `colsample_bylevel`): per-level feature subsampling. GENUINELY
+    // consumed — the oblivious grow loop keeps feature `f` at a level iff that
+    // level's `GenRandReal1()` draw is `<= rsm`, and a level that selects nothing
+    // ENDS the tree early, exactly as upstream does.
+    //
+    // Promoting it also makes the pre-existing `colsample_bylevel` alias reach a
+    // real implementation for the first time — it resolved onto `rsm`, which was
+    // KnownNotYet, so migrating xgboost/lightgbm users were told it was a parity
+    // gap.
+    //
+    // SymmetricTree only: the leaf-wise / region growers refuse a non-default
+    // value rather than silently ignoring it (their per-level draw accounting
+    // against upstream is not established).
+    "rsm",
 ];
 
 /// The parameters upstream allows only ONE of. Passing two raises:
@@ -1377,6 +1391,14 @@ pub(crate) fn make_builder(
         // 0 < subsample <= 1.
         check_range("subsample", v, 0.0, 1.0, false)?;
         builder = builder.subsample(v);
+    }
+    if let Some(v) = get_with_aliases::<f64>(params, py, "rsm")? {
+        // 0 < rsm <= 1 — upstream's own range (`Rsm should be in (0, 1]`,
+        // oblivious_tree_options.cpp:125). Checked here so the Python caller gets
+        // a `CatBoostParameterError` rather than the engine's deeper error, and
+        // the `colsample_bylevel` alias resolves onto this same target.
+        check_range("rsm", v, 0.0, 1.0, false)?;
+        builder = builder.rsm(v);
     }
     if let Some(v) = get_with_aliases::<f32>(params, py, "bagging_temperature")? {
         builder = builder.bagging_temperature(v);

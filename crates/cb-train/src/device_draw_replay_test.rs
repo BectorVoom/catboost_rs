@@ -74,6 +74,9 @@ fn real_grow_state(
             // so the perturbation is a numeric no-op but the draws still happen.
             score_st_dev: 0.0,
             score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
+            // `rsm = 1.0` keeps every feature a candidate, so this test
+            // observes the unchanged draw stream it was written against.
+            rsm: 1.0,
         }),
         EScoreFunction::Cosine,
         None,
@@ -161,6 +164,9 @@ fn replay_counts_borderless_features_because_the_grower_does() {
             rng: &mut real_rng,
             score_st_dev: 0.0,
             score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
+            // `rsm = 1.0` keeps every feature a candidate, so this test
+            // observes the unchanged draw stream it was written against.
+            rsm: 1.0,
         }),
         EScoreFunction::Cosine,
         None,
@@ -244,6 +250,9 @@ fn replay_is_multi_tree_composable() {
                 rng: &mut real_rng,
                 score_st_dev: 0.0,
                 score_type: cb_compute::ERandomScoreType::NormalWithModelSizeDecrease,
+                // `rsm = 1.0` keeps every feature a candidate, so this test
+                // observes the unchanged draw stream it was written against.
+                rsm: 1.0,
             }),
             EScoreFunction::Cosine,
             None,

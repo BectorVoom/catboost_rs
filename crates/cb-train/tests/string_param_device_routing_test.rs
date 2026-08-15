@@ -299,6 +299,45 @@ mod device {
         );
     }
 
+    /// `rsm < 1` declines. The device grow loop scores every quantized feature at
+    /// every level and never touches the host learn RNG, so committing would both
+    /// ignore the per-level candidate mask (training the `rsm = 1` model) and skip
+    /// the `GenRandReal1()` draws that the mask is made of — leaving the RNG phase
+    /// wrong for everything downstream. Exactly the silently-wrong-model class
+    /// this file exists to catch.
+    pub fn rsm_declines() {
+        let params = BoostParams {
+            extra: cb_train::ExtraBoostParams {
+                rsm: 0.5,
+                ..Default::default()
+            },
+            ..base_params()
+        };
+        assert_eq!(
+            device_grows(&params),
+            0,
+            "rsm < 1 must decline — the device grower has no per-level candidate mask"
+        );
+    }
+
+    /// ...and the DEFAULT `rsm` must still commit, so the decline above is a real
+    /// routing decision rather than this parameter having disabled the device path
+    /// outright.
+    pub fn default_rsm_still_commits() {
+        let params = BoostParams {
+            extra: cb_train::ExtraBoostParams {
+                rsm: 1.0,
+                ..Default::default()
+            },
+            ..base_params()
+        };
+        assert_eq!(
+            device_grows(&params),
+            params.iterations,
+            "rsm = 1.0 is the default and must stay device-eligible"
+        );
+    }
+
     /// `nan_mode=Max` COMMITS to the device, and the device model must equal the CPU
     /// model. Quantization params reach `cb-train` only as BORDERS, so there is no
     /// eligibility clause to read — the honest question is not "does it decline" but
@@ -516,3 +555,5 @@ device_test!(
     random_score_type_is_unreachable_on_device,
     device::random_score_type_is_unreachable_on_device
 );
+device_test!(rsm_declines, device::rsm_declines);
+device_test!(default_rsm_still_commits, device::default_rsm_still_commits);

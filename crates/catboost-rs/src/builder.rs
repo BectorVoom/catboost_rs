@@ -115,6 +115,8 @@ pub struct CatBoostBuilder {
     sampling_unit: ESamplingUnit,
     /// How often the bootstrap sample is redrawn (`sampling_frequency`).
     sampling_frequency: ESamplingFrequency,
+    /// The per-level feature-subsampling fraction (`rsm`).
+    rsm: f64,
     /// Whether an all-equal learn target is allowed (`allow_const_label`).
     allow_const_label: bool,
     /// The CTR-projection size penalty (`model_size_reg`).
@@ -358,6 +360,7 @@ impl CatBoostBuilder {
             ctr_history_unit: ECtrHistoryUnit::Sample,
             sampling_unit: ESamplingUnit::Object,
             sampling_frequency: ESamplingFrequency::PerTree,
+            rsm: 1.0,
             allow_const_label: false,
             model_size_reg: cb_train::model_size_reg_default(),
             save_snapshot: false,
@@ -727,6 +730,28 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn sampling_frequency(mut self, sampling_frequency: ESamplingFrequency) -> Self {
         self.sampling_frequency = sampling_frequency;
+        self
+    }
+
+    /// The fraction of features offered to the split search at EACH TREE LEVEL
+    /// (`rsm`, alias `colsample_bylevel`; upstream default `1.0`).
+    ///
+    /// Legal range is `(0, 1]`; anything else is refused at [`Self::fit`] with the
+    /// same rule upstream applies (`Rsm should be in (0, 1]`,
+    /// `oblivious_tree_options.cpp:125`). Validation is deferred to `fit` because
+    /// this setter is infallible by the builder's convention.
+    ///
+    /// `1.0` is INERT — byte-identical to never calling this. Below `1.0` the
+    /// per-level candidate draws become observable and therefore consume the
+    /// shared learn RNG, so a fit with `rsm < 1` is NOT comparable to one without
+    /// even on features the subsampling happened to keep.
+    ///
+    /// Only [`EGrowPolicy::SymmetricTree`] is supported; the leaf-wise growers
+    /// refuse a non-default `rsm` at [`Self::fit`] rather than silently ignoring
+    /// it (their per-level draw accounting is not established).
+    #[must_use]
+    pub fn rsm(mut self, rsm: f64) -> Self {
+        self.rsm = rsm;
         self
     }
 
@@ -1167,6 +1192,7 @@ impl CatBoostBuilder {
                 ctr_history_unit: self.ctr_history_unit,
                 sampling_unit: self.sampling_unit,
                 sampling_frequency: self.sampling_frequency,
+                rsm: self.rsm,
                 allow_const_label: self.allow_const_label,
                 model_size_reg: self.model_size_reg,
             },

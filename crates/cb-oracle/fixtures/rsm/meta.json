@@ -1,0 +1,69 @@
+{
+  "catboost_version": "1.2.10",
+  "colsample_bylevel_alias_max_abs_diff": 0.0,
+  "composition_vs_rsm_one_max_abs_diff": {
+    "bayesian": 0.8159558849778028,
+    "bernoulli": 0.6101927814434163,
+    "random_strength": 0.8045307568146873
+  },
+  "early_stop_rsm": 0.1,
+  "early_stop_tree_split_counts": [
+    3,
+    0,
+    0,
+    1,
+    0
+  ],
+  "full_depth": 3,
+  "n_features": 6,
+  "out_of_range_rejections": {
+    "-0.1": "catboost/private/libs/options/oblivious_tree_options.cpp:125: Rsm should be in (0, 1]",
+    "0": "catboost/private/libs/options/oblivious_tree_options.cpp:125: Rsm should be in (0, 1]",
+    "1.5": "catboost/private/libs/options/oblivious_tree_options.cpp:125: Rsm should be in (0, 1]"
+  },
+  "params": {
+    "allow_writing_files": false,
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "rsm_one_is_inert_max_abs_diff": {
+    "bayesian": 0.0,
+    "bernoulli": 0.0,
+    "bootstrap_no": 0.0,
+    "random_strength": 0.0
+  },
+  "rsm_one_tree_split_counts": [
+    3,
+    3,
+    3,
+    3,
+    3
+  ],
+  "rsm_value_tags": {
+    "0.25": "0p25",
+    "0.5": "0p5",
+    "0.75": "0p75",
+    "1": "1"
+  },
+  "rsm_values": [
+    1.0,
+    0.75,
+    0.5,
+    0.25
+  ],
+  "scenario": "rsm",
+  "seed": 20260815
+}

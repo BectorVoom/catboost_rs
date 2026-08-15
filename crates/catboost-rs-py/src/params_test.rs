@@ -93,9 +93,10 @@ fn known_not_yet_params_tag_known_not_yet() {
         // genuinely unimplemented.
         "eval_fraction",
         "used_ram_limit",
-        "rsm",
+        // `rsm` LEFT this list when per-level feature subsampling shipped.
         "ctr_leaf_count_limit",
         "thread_count",
+        "approx_on_full_history",
     ] {
         assert_eq!(
             status_of(name),
@@ -112,8 +113,8 @@ fn unknown_param_is_none() {
     assert_eq!(status_of("iteratons"), None); // typo
 }
 
-/// Aliases resolve to their canonical status: implemented aliases -> Implemented,
-/// `colsample_bylevel` -> `rsm` -> KnownNotYet.
+/// Aliases resolve to their canonical status. Every alias in this list now
+/// resolves onto an IMPLEMENTED canonical name.
 #[test]
 fn aliases_resolve_to_canonical_status() {
     for name in [
@@ -129,6 +130,11 @@ fn aliases_resolve_to_canonical_status() {
         // PARAM-02: the two LightGBM-style leaf aliases.
         "num_leaves",
         "min_child_samples",
+        // `colsample_bylevel` -> `rsm`. This alias spent the whole project
+        // resolving onto a KnownNotYet target, so migrating xgboost / lightgbm
+        // users were told their most common column-sampling kwarg was a parity
+        // gap. Per-level feature subsampling now backs it.
+        "colsample_bylevel",
     ] {
         assert_eq!(
             status_of_user(name),
@@ -136,11 +142,6 @@ fn aliases_resolve_to_canonical_status() {
             "{name} alias should resolve to Implemented"
         );
     }
-    // colsample_bylevel -> rsm (no builder setter) is honestly a parity gap.
-    assert_eq!(
-        status_of_user("colsample_bylevel"),
-        Some(ParamStatus::KnownNotYet)
-    );
 }
 
 /// `validate_params` accepts only IMPLEMENTED params (incl. aliases).

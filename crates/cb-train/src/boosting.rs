@@ -557,6 +557,19 @@ pub struct ExtraBoostParams {
     /// under `bootstrap_type = No`, where there is no draw to place — verified
     /// against catboost 1.2.10 at three depths. See [`ESamplingFrequency`].
     pub sampling_frequency: ESamplingFrequency,
+    /// `rsm` (upstream `ObliviousTreeOptions->Rsm`, alias `colsample_bylevel`) —
+    /// the fraction of features offered to the split search at EACH TREE LEVEL.
+    /// Legal range `(0, 1]`; upstream raises "Rsm should be in (0, 1]" outside it
+    /// (`oblivious_tree_options.cpp:125`).
+    ///
+    /// `1.0` (the default) is INERT and byte-identical to the pre-rsm path: the
+    /// per-level `GenRandReal1()` draws were already being taken and discarded,
+    /// and `draw <= 1.0` always holds, so every feature stays a candidate.
+    ///
+    /// A value below `1.0` makes those draws OBSERVABLE, which is why it widens
+    /// `draws_active` — see [`crate::tree::Perturbation::rsm`] for the per-level
+    /// filter and the early-stop rule when a level selects nothing.
+    pub rsm: f64,
 }
 
 impl Default for ExtraBoostParams {
@@ -575,6 +588,9 @@ impl Default for ExtraBoostParams {
             allow_const_label: false,
             sampling_unit: ESamplingUnit::Object,
             sampling_frequency: ESamplingFrequency::PerTree,
+            // NOT `f64::default()` — a zero subspace fraction would select no
+            // feature at any level and every tree would collapse to one leaf.
+            rsm: 1.0,
         }
     }
 }
@@ -2233,6 +2249,48 @@ fn validate_grow_policy(grow_policy: EGrowPolicy, monotone_constraints: &[i8]) -
              (grow_policy={grow_policy:?}); upstream rejects them \
              (monotonic_constraint_utils.h:42). Use grow_policy=SymmetricTree for \
              monotone constraints (D-6.6-07)."
+        )));
+    }
+    Ok(())
+}
+
+/// Validate `rsm` (`ObliviousTreeOptions->Rsm`) and the grow policies it is
+/// implemented for.
+///
+/// Two separate rules:
+///
+/// 1. **Range.** Upstream requires `(0, 1]` and raises
+///    `oblivious_tree_options.cpp:125: Rsm should be in (0, 1]` outside it
+///    (measured against catboost 1.2.10 at `0.0`, `-0.1` and `1.5`). `0` is
+///    excluded on purpose — it would select no feature at any level, so every
+///    tree would collapse to a single leaf.
+///
+/// 2. **Grow policy.** Only [`EGrowPolicy::SymmetricTree`] is implemented. The
+///    leaf-wise growers (`GreedyTensorSearchDepthwise` / `Lossguide`) and the
+///    Region grower each call `SelectFeaturesForScoring` from their OWN loop, so
+///    their per-level draw COUNT differs from the oblivious depth loop's and is
+///    not established here. Accepting `rsm` there would consume the wrong number
+///    of draws and desynchronise every later tree's bootstrap sample with no
+///    visible symptom on a non-bootstrap test — the defect class fixed in
+///    `d7676b5`. Refused rather than silently ignored, matching this crate's
+///    standing policy for unverified parameter values.
+///
+/// The DEFAULT (`rsm == 1.0`) is inert and passes both rules for every policy.
+fn validate_rsm(rsm: f64, grow_policy: EGrowPolicy) -> CbResult<()> {
+    if !(rsm > 0.0 && rsm <= 1.0) {
+        return Err(CbError::OutOfRange(format!(
+            "rsm should be in (0, 1] (got {rsm}); upstream refuses the same range \
+             (oblivious_tree_options.cpp:125)"
+        )));
+    }
+    if rsm < 1.0 && grow_policy != EGrowPolicy::SymmetricTree {
+        return Err(CbError::Unsupported(format!(
+            "rsm < 1 is only implemented for grow_policy=SymmetricTree (got \
+             {grow_policy:?}); the leaf-wise and region growers call \
+             SelectFeaturesForScoring from their own loop, so their per-level RNG \
+             draw accounting differs and has not been established against upstream. \
+             Refused rather than silently ignored — consuming the wrong draw count \
+             would desynchronise every later tree's sampling."
         )));
     }
     Ok(())
@@ -4561,6 +4619,7 @@ fn train_inner<R: Runtime>(
     // oblivious-only). These are the escalated-gap guards Plan 06.6-02 DEFERRED to
     // this plan because the `grow_policy` enum did not exist until now.
     validate_grow_policy(params.grow_policy, &params.monotone_constraints)?;
+    validate_rsm(params.extra.rsm, params.grow_policy)?;
 
     // The multilabel losses (MultiLogloss / MultiCrossEntropy) carry a DIM-MAJOR
     // target of length `dim*n` (one label per dimension per object), so `n` cannot
@@ -5385,7 +5444,15 @@ fn train_inner<R: Runtime>(
     // consumed INLINE by the perturbed tree search (in exact upstream order), so
     // the bulk POST per-level draws must NOT be applied in that case.
     let perturb_active = params.random_strength != 0.0;
-    let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No) || perturb_active;
+    // `rsm < 1.0` joins the two pre-existing draw sources. The per-level
+    // `GenRandReal1()` draws happen upstream REGARDLESS, but they are only
+    // OBSERVABLE once something consumes the stream — which is why `bootstrap_type
+    // = No` + `random_strength = 0` could stay a zero-draw path. Subsampling makes
+    // each draw decide a candidate, so it must now be taken. At `rsm == 1.0` this
+    // clause is false and the zero-draw path is untouched (D-6.6-05).
+    let rsm_active = params.extra.rsm < 1.0;
+    let draws_active =
+        !matches!(params.bootstrap_type, EBootstrapType::No) || perturb_active || rsm_active;
 
     // SPEC-OH-27 (T01b, branch b) — one-hot x ACTIVE RNG draws is typed-rejected.
     //
@@ -5471,6 +5538,17 @@ fn train_inner<R: Runtime>(
         // the caller did not ask for. `leaf_estimation_iterations == 1` (the
         // default) leaves every existing device fit eligible exactly as before.
         && params.extra.leaf_estimation_iterations == 1
+        // FEATURE SUBSAMPLING (`rsm < 1`) declines to the CPU grower. The device
+        // grow loop scores EVERY quantized feature every level — it has no notion
+        // of a per-level candidate mask, and it does not touch the host learn RNG
+        // at all, so it would neither drop the unselected features nor consume the
+        // per-level `GenRandReal1()` draws. A device fit would therefore silently
+        // train the `rsm = 1` model AND leave the RNG phase wrong for anything
+        // downstream. Declining is the honest behaviour until a device-side
+        // candidate mask exists; `rsm == 1.0` (the default) leaves every existing
+        // device fit eligible exactly as before. Pinned by
+        // `string_param_device_routing_test`.
+        && params.extra.rsm >= 1.0
         // FPP-20 (T23): the former `ordered_learning_perm.is_none()` clause is GONE. It was
         // the host half of the ordered decline — the session-side gate was the other half —
         // and it existed because the device had no way to score a candidate over the fold's
@@ -7406,6 +7484,7 @@ fn train_inner<R: Runtime>(
                 rng: &mut rng,
                 score_st_dev: std_dev,
                 score_type: params.extra.random_score_type,
+                rsm: params.extra.rsm,
             })
         } else {
             None
@@ -7623,7 +7702,26 @@ fn train_inner<R: Runtime>(
             // GPUT-18: a depth-d region path has exactly d+1 leaves (bins 0..=depth).
             grown.region_directions.len() + 1
         } else if grown.step_nodes.is_empty() {
-            n_leaves
+            // OBLIVIOUS: normally `2^depth`, but `rsm < 1.0` can end a tree EARLY
+            // (a level whose candidate list came back empty `break`s the depth
+            // loop upstream), so the leaf count is `2^(levels actually grown)`.
+            //
+            // `level_kinds` is authoritative WHEN POPULATED, but it is EMPTY for
+            // every search that does not mix CTR candidates (see its doc on
+            // `GrownTree`) — reading it unconditionally yields `1 << 0 == 1` and
+            // collapses every tree to a single leaf. So fall back to counting the
+            // per-level split vectors, which partition the grown levels between
+            // them: float, one-hot and CTR contribute one entry per level each.
+            //
+            // Every one of these sums to `depth` unless a level was skipped, so at
+            // `rsm == 1.0` this is the unchanged `2^depth` (byte-identical,
+            // D-6.6-05).
+            let levels = if grown.level_kinds.is_empty() {
+                grown.splits.len() + grown.one_hot_splits.len() + grown.ctr_splits.len()
+            } else {
+                grown.level_kinds.len()
+            };
+            1usize << levels
         } else {
             grown
                 .node_id_to_leaf_id

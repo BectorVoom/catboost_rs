@@ -662,6 +662,17 @@ pub struct Perturbation<'a> {
     /// it shifts the whole downstream draw stream, not just the noise scale.
     /// See [`cb_compute::ERandomScoreType`].
     pub score_type: cb_compute::ERandomScoreType,
+    /// `rsm` — the per-level random-subspace fraction, in `(0, 1]`
+    /// (`ObliviousTreeOptions->Rsm`). The per-level draws described on
+    /// [`Self::rng`] are no longer discarded: feature `f` is a candidate at this
+    /// level iff its draw is `<= rsm`
+    /// (`SelectCandidatesAndCleanupStatsFromPrevTree`,
+    /// `greedy_tensor_search.cpp:334`).
+    ///
+    /// `1.0` keeps EVERY feature (`gen_rand_real1()` returns a value in `[0, 1]`,
+    /// so `draw <= 1.0` always holds) and is therefore byte-identical to the
+    /// pre-rsm behaviour — the draws were already being taken and thrown away.
+    pub rsm: f64,
 }
 
 /// Grow one oblivious tree with the OPTIONAL `random_strength` perturbation
@@ -726,11 +737,18 @@ pub fn greedy_tensor_search_oblivious_perturbed(
         // `perturb` is `Some` — `None` means `draws_active == false`
         // (bootstrap_type=No, random_strength=0), the byte-identical
         // zero-draw first-slice path this must not touch.
-        if let Some(p) = perturb.as_mut() {
-            for _ in 0..matrix.n_features() {
-                p.rng.gen_rand_real1();
-            }
-        }
+        //
+        // The draws are no longer DISCARDED: each one decides whether its feature
+        // is a candidate at this level (`draw <= rsm`), which is the whole of
+        // `rsm` / `colsample_bylevel`. At the default `rsm == 1.0` every draw
+        // passes (`gen_rand_real1()` is in `[0, 1]`), so the mask is all-true and
+        // the search below is byte-identical to the pre-rsm path.
+        let selected: Option<Vec<bool>> = perturb.as_mut().map(|p| {
+            let rsm = p.rsm;
+            (0..matrix.n_features())
+                .map(|_| p.rng.gen_rand_real1() <= rsm)
+                .collect()
+        });
         // PLAIN path (perturb = None): `select_level_plain` FUSES the per-feature
         // build/derive + score in ONE rayon parallel-over-features pass (D-01) and
         // RETURNS this level's per-feature histograms, which become the parent the
@@ -756,10 +774,23 @@ pub fn greedy_tensor_search_oblivious_perturbed(
                 split
             }
             Some(p) => {
-                let (split, hists, cat_hists) =
-                    select_level_perturbed(matrix, &scratch, der1, weight, scaled_l2, p, score_function, penalties)?;
+                let mask = selected.as_deref().unwrap_or(&[]);
+                let (split, hists, cat_hists) = select_level_perturbed(
+                    matrix, &scratch, der1, weight, scaled_l2, p, score_function, penalties, mask,
+                )?;
                 scratch.feature_hists = hists;
                 scratch.cat_hists = cat_hists;
+                // `rsm < 1.0` can leave a level with NO candidate at all (every
+                // feature filtered out, or every selected feature border-less).
+                // Upstream does NOT skip such a level and carry on: `bestScore ==
+                // MINIMAL_SCORE` `break`s out of the depth loop entirely
+                // (`greedy_tensor_search.cpp:1209`), so the tree ENDS here with
+                // the splits chosen so far — a depth-`d` request can legitimately
+                // yield a tree of 0..d splits (verified against catboost 1.2.10:
+                // at `rsm = 0.01` every tree comes back with `n_splits == 0`, a
+                // single-leaf tree). Breaking also stops the remaining levels'
+                // rsm draws, which is what keeps the RNG stream aligned.
+                let Some(split) = split else { break };
                 if level + 1 < depth {
                     scratch.advance_leaf_only(matrix, &split, n_objects);
                 }
@@ -1378,8 +1409,9 @@ fn select_level_perturbed(
     perturb: &mut Perturbation<'_>,
     score_function: EScoreFunction,
     penalties: Option<&FeaturePenalties<'_>>,
+    selected: &[bool],
 ) -> CbResult<(
-    AnySplit,
+    Option<AnySplit>,
     Vec<Option<BucketHistogram>>,
     Vec<Option<BucketHistogram>>,
 )> {
@@ -1484,12 +1516,22 @@ fn select_level_perturbed(
     //     instance. The chosen border's RAW score is that feature's BestScore.Val.
     //     A feature with no border is not a candidate (taskIdx skips it), matching
     //     upstream where empty candidate lists produce no task.
-    let mut feature_best: Vec<Option<(f64, f64)>> = Vec::with_capacity(matrix.n_features());
+    let mut feature_best: Vec<CandidateSlot> = Vec::with_capacity(matrix.n_features());
     let mut task_idx: u64 = 0;
     for feature in 0..matrix.n_features() {
+        // `rsm`: a feature the per-level draw did not select is NOT in `candList`
+        // at all, so it contributes no `SetBestScore` task (no `taskIdx`, no
+        // reseed) AND no `SelectBestCandidate` draw below — which is exactly what
+        // distinguishes it from the border-less case. `selected` is all-true at
+        // `rsm == 1.0`, making this branch unreachable and the pass
+        // byte-identical.
+        if !selected.get(feature).copied().unwrap_or(true) {
+            feature_best.push(CandidateSlot::NotSelected);
+            continue;
+        }
         let borders = matrix.feature_borders.get(feature).map_or(&[][..], Vec::as_slice);
         if borders.is_empty() {
-            feature_best.push(None);
+            feature_best.push(CandidateSlot::BorderLess);
             continue;
         }
         // TRestorableFastRng64(randSeed + taskIdx); rand.Advance(10).
@@ -1517,7 +1559,7 @@ fn select_level_perturbed(
                 best_raw = raw;
             }
         }
-        feature_best.push(Some((best_border, best_raw)));
+        feature_best.push(CandidateSlot::Scored(best_border, best_raw));
     }
 
     // (3) SelectBestCandidate: per feature ONE GetInstance(Rand) from the MAIN
@@ -1527,7 +1569,7 @@ fn select_level_perturbed(
     let mut chosen_split: Option<Split> = None;
     for (feature, slot) in feature_best.iter().enumerate() {
         match slot {
-            Some((border, raw)) => {
+            CandidateSlot::Scored(border, raw) => {
                 let (border, raw) = (*border, *raw);
                 // FEAT-04: penalize the per-feature best RAW score before the noise
                 // instance (multiplicative weight + subtractive first-use/per-object).
@@ -1547,7 +1589,7 @@ fn select_level_perturbed(
                     chosen_split = Some(Split { feature, border });
                 }
             }
-            None => {
+            CandidateSlot::BorderLess => {
                 // Border-less ("unused-but-quantized") feature: upstream's
                 // SelectBestCandidate still iterates it as a listed candidate and
                 // draws ONE GetInstance normal for it (VERIFIED against a real
@@ -1563,15 +1605,37 @@ fn select_level_perturbed(
                     perturb.rng,
                 );
             }
+            // `rsm` dropped this feature from `candList` before scoring, so it is
+            // not iterated by `SelectBestCandidate` at all — no draw.
+            CandidateSlot::NotSelected => {}
         }
     }
 
-    let split = chosen_split.ok_or_else(|| {
-        CbError::Degenerate("no candidate split available (no feature has any border)".to_owned())
-    })?;
+    // `None` (rather than `CbError::Degenerate`) when nothing won: under `rsm < 1`
+    // an empty candidate list is a NORMAL outcome and upstream responds by
+    // `break`ing the depth loop, ending the tree early. The caller distinguishes
+    // the two — at `rsm == 1.0` every feature is selected, so a `None` here still
+    // means "no feature has any border" and the caller's degenerate-tree handling
+    // is unchanged.
     // No cat histograms: the guard at the top of this function proves
     // `n_cat_features() == 0` on every reachable perturbed level.
-    Ok((AnySplit::Float(split), hists, Vec::new()))
+    Ok((chosen_split.map(AnySplit::Float), hists, Vec::new()))
+}
+
+/// One feature's standing in a level's candidate list (`candList`), which decides
+/// how many RNG draws it consumes in [`select_level_perturbed`]'s passes (2)/(3).
+///
+/// The three states are NOT interchangeable: [`Self::BorderLess`] is a LISTED
+/// candidate that still draws one `SelectBestCandidate` instance, while
+/// [`Self::NotSelected`] was filtered out by `rsm` before scoring and draws
+/// nothing. Collapsing them would silently shift the whole downstream RNG stream.
+enum CandidateSlot {
+    /// Scored: `(best border, that border's raw score)`.
+    Scored(f64, f64),
+    /// Listed but has no border, so it cannot win — draws once, discards.
+    BorderLess,
+    /// Filtered out by the per-level `rsm` draw — not a candidate, draws nothing.
+    NotSelected,
 }
 
 // ===========================================================================
