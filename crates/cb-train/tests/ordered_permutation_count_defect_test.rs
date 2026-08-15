@@ -60,9 +60,43 @@
 //!   neither was shipped. pc=1 stayed at 44/60 throughout — the cycling work does not
 //!   regress the single-fold path, it just does not improve the multi-fold one.
 //!
-//! So the missing piece is specifically **what permutation each learning fold beyond
-//! the first carries**, which needs upstream's exact fold-permutation RNG stream via
-//! the instrumented-CLI draw-accounting workflow.
+//! # ROOT CAUSE, localized: the learn-set shuffle is permutation_count-DEPENDENT
+//!
+//! The missing piece is NOT (only) the fold-`j` permutations. A Python reference that
+//! reproduces upstream's FIRST tree — the tree grown on fold 0, so it constrains fold
+//! 0 alone, with no cycle and no approximant trajectory in play — gives a clean
+//! 3-of-4 control at n = 6:
+//!
+//! | config | fold-0 order used | reproduces upstream's first tree |
+//! |---|---|---|
+//! | pc = 1, `has_time = true`  | identity                        | YES |
+//! | pc = 1, `has_time = false` | `create_shuffled_indices(n, s)` | YES |
+//! | pc = 4, `has_time = true`  | identity                        | YES |
+//! | pc = 4, `has_time = false` | `create_shuffled_indices(n, s)` | **NO** |
+//!
+//! Only the last cell fails, and brute-forcing all 720 orders for it shows our `S` is
+//! not among the 40 that survive. So at `permutation_count > 1` upstream's fold 0 is
+//! NOT `create_shuffled_indices(n, seed)` — the shuffle's RNG stream position shifts
+//! with the number of folds created (`create_folds` already documents consuming one
+//! pre-averaging `gen_rand()` per learning-fold position), while
+//! `create_shuffled_indices` always restarts from the seed and therefore always
+//! returns the pc=1 answer.
+//!
+//! That is why BOTH cycling attempts made parity worse: they varied the fold-`j`
+//! rule while fold 0 — the fold every run starts on — was already wrong.
+//!
+//! # And the cycle itself cannot be a pure function of (pc, seed)
+//!
+//! `structure_fold_cycle`'s own doc says the fold-pick draw "rides the persistent
+//! `LearnProgress->Rand` whose phase is entangled with the per-tree variable-length
+//! draw budget", and that the budget "could NOT be localized in cb-train's draw model
+//! without C++ instrumentation". Its `[0,2,0,2,2]` is an anchor captured from ONE
+//! instrumented run, not a general rule — so it cannot be right across corpora, which
+//! is a second, independent reason the cycling attempts could not have worked.
+//!
+//! So closing this needs upstream's actual RNG stream for BOTH the pc-dependent
+//! learn-set shuffle AND the per-tree draw budget that positions each fold pick —
+//! i.e. the instrumented-CLI draw-accounting workflow, not another rule guess.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use cb_backend::CpuBackend;
