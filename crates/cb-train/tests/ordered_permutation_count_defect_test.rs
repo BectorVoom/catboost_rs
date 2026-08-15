@@ -41,8 +41,28 @@
 //!   `permutation_count = 1` on a 30-row corpus where the identity permutation
 //!   coincides with upstream's — it is NOT evidence that the path is right.
 //!
-//! Closing this needs upstream's exact fold-permutation RNG stream, via the
-//! instrumented-CLI draw-accounting workflow.
+//! # What has been tried, and measured (so it is not re-derived)
+//!
+//! The cycling itself has been WIRED and measured, twice, and reverted both times.
+//! The mechanism is not the hard part — the per-fold PERMUTATIONS are:
+//!
+//! * `structure_fold_cycle` (instrument-derived, pc=4/seed=0 -> `[0,2,0,2,2]`) wires
+//!   in cleanly, and the invariant it must satisfy HOLDS: at `iterations = 1` the
+//!   cycle takes fold 0, and pc=4 then reproduces pc=1 EXACTLY (max |diff| = 0).
+//! * Per-fold, per-body/tail approximants were added alongside it, with every fold's
+//!   trajectory advanced each iteration over its own permutation (a fold left stale
+//!   would score a later tree from an out-of-date trajectory).
+//! * Two candidate rules for fold `j >= 1`'s object order were measured over a 60-cell
+//!   corpus x iteration grid at pc=4, against the 21/60 baseline of NOT cycling:
+//!     - `[S[p] for p in stream[j]]` (the rule the CTR path documents): **19/60**
+//!     - `stream[j]` uncomposed:                                        **12/60**
+//!   Both are WORSE than not cycling at all, so neither is upstream's rule and
+//!   neither was shipped. pc=1 stayed at 44/60 throughout — the cycling work does not
+//!   regress the single-fold path, it just does not improve the multi-fold one.
+//!
+//! So the missing piece is specifically **what permutation each learning fold beyond
+//! the first carries**, which needs upstream's exact fold-permutation RNG stream via
+//! the instrumented-CLI draw-accounting workflow.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use cb_backend::CpuBackend;
