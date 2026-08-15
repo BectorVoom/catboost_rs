@@ -1956,6 +1956,51 @@ fn validate_ctr_types(params: &BoostParams) -> CbResult<()> {
 ///   multi-step loop is not pinned by any oracle here.
 ///
 /// A single iteration (the default) is unaffected and stays byte-identical.
+///
+/// # `leaf_estimation_backtracking = AnyImprovement` at N > 1 — the ALGORITHM is
+/// known; the blocker is that no objective-VALUE function exists
+///
+/// Upstream's search is `FastGradientWalker`
+/// (`algo/approx_calcer/gradient_walker.h:60-104`), short enough to state exactly:
+///
+/// ```text
+/// lossValue = loss(point)                       // ONCE, before the loop
+/// for iterationIdx in 0..iterationCount:
+///     step = leafUpdater(point)                 // solved at the CURRENT point
+///     scale = 1.0
+///     do:
+///         valueAfterStep = loss(point + scale*step)
+///         if valueAfterStep < lossValue:        // STRICT <
+///             lossValue = valueAfterStep
+///             point += scale*step               // applied ONLY on acceptance
+///             break
+///         scale /= 2
+///         ++iterationIdx                        // <-- a REJECTION consumes budget
+///     while iterationIdx < iterationCount
+/// ```
+///
+/// Two details are easy to get wrong, and one explains an earlier attempt here that
+/// landed 7.0e-2 off at N = 2:
+///   * `++iterationIdx` sits INSIDE the halving loop, so `leaf_estimation_iterations`
+///     bounds the total number of (solves + rejected halvings), NOT the number of
+///     accepted steps;
+///   * `lossValue` is seeded once and updated only on an ACCEPTED step -- never
+///     recomputed per outer iteration -- and if the budget runs out mid-halving the
+///     point is left UNCHANGED.
+///
+/// What is missing is the loss calcer. This crate has per-loss DERIVATIVES
+/// (`cb_compute::loss`) but no objective VALUE functions, and
+/// [`crate::EvalMetric::for_loss`] is not a substitute: it deliberately reports the
+/// "parity-neutral RMSE eval surface" for Huber / LogCosh / Lq / Expectile / Poisson
+/// / Tweedie / MAPE and the ranking losses -- i.e. for almost every loss on which
+/// backtracking is observable at all (measured: 53 of 64 configurations distinguish
+/// `No` from `AnyImprovement` once N > 1, with `Huber:delta=1.0` + Newton + 5
+/// iterations separating by 7.12). Driving the accept/reject test off an RMSE proxy
+/// would take the wrong branch on exactly those losses.
+///
+/// So closing this is: add faithful per-loss objective values, THEN transcribe the
+/// walker above. Refusing until then is why `AnyImprovement` is rejected at N > 1
+/// rather than silently behaving as `No`.
 fn validate_leaf_estimation_iterations(params: &BoostParams, has_groups: bool) -> CbResult<()> {
     let iters = params.extra.leaf_estimation_iterations;
     if iters == 0 {
