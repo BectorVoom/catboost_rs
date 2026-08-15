@@ -178,14 +178,26 @@ fn ordered_branch_alive_structural_authority_is_e2e_oracle() {
         }
     }
 
-    // On this randomness-free synthetic config (bootstrap=No, random_strength=0),
-    // the Ordered structure search consumes the IDENTITY learning Folds[0]
-    // (boosting.rs:~1054 `find(|f| !f.is_averaging)`, identity for ALL
-    // permutation_count after 05-12), so its per-segment scoring legitimately
-    // COINCIDES with Plain — this is upstream-faithful, NOT a dead branch. The
-    // original `assert_ne!` divergence premise is therefore retired; the
-    // authoritative ORD-02 structural check is `ordered_boost_e2e_oracle_test`
-    // (2/2 ≤1e-5 vs catboost 1.2.10).
+    // RESTORED divergence premise (ORD-SHUFFLE / ORD-SCORE).
+    //
+    // This assertion used to be `assert_ne!`, was observed to fail, and was flipped to
+    // `assert_eq!` with a comment calling the coincidence "upstream-faithful". It was
+    // not: Ordered and Plain coincided because the ordered path carried TWO bugs that
+    // each collapsed it onto Plain —
+    //
+    //   1. it consumed the IDENTITY learning permutation, i.e. it behaved as though
+    //      the learn set were never shuffled (upstream shuffles whenever
+    //      `NeedShuffle` holds, which ordered boosting alone satisfies), and
+    //   2. its split score merged each segment's body and tail rows into one
+    //      statistic pair, which IS the plain L2 formula.
+    //
+    // With both fixed, Ordered legitimately produces a DIFFERENT structure from
+    // Plain — which is the entire point of ordered boosting, and what the original
+    // premise asserted. A test that was weakened to fit a bug is restored rather than
+    // left as a monument to it.
+    //
+    // The authoritative numeric check remains `ordered_boost_e2e_oracle_test`
+    // (≤ 1e-5 vs catboost 1.2.10); this one guards that the branch is ALIVE.
     let ordered_splits: Vec<(usize, f64)> = ordered
         .oblivious_trees
         .iter()
@@ -196,11 +208,13 @@ fn ordered_branch_alive_structural_authority_is_e2e_oracle() {
         .iter()
         .flat_map(|t| t.splits.iter().map(|s| (s.feature, s.border)))
         .collect();
-    assert_eq!(
+    assert_ne!(
         ordered_splits, plain_splits,
-        "On this randomness-free identity-fold config Ordered and Plain structures \
-         legitimately coincide (upstream-faithful); ORD-02 structural authority is \
-         ordered_boost_e2e_oracle_test (2/2 ≤1e-5 vs catboost 1.2.10)"
+        "Ordered and Plain produced IDENTICAL structures. Ordered boosting scores over \
+         the shuffled learning fold's body/tail segments and must not collapse onto the \
+         plain whole-fold search — when it does, the ordered path has regressed to one \
+         of the two bugs this premise was restored to catch (identity permutation, or a \
+         merged body/tail statistic pair)."
     );
 }
 

@@ -4777,7 +4777,21 @@ fn train_inner<R: Runtime>(
                 .ok_or_else(|| {
                     CbError::Degenerate("ordered boosting: no learning fold created".to_owned())
                 })?;
-            Some(perm)
+            // ORD-SHUFFLE: upstream shuffles the LEARN SET before building folds
+            // whenever `NeedShuffle` holds — `hasCtrs || ordered`, and `!has_time`
+            // (`preprocess.cpp:161`). `Folds[0]` is then the identity over the
+            // ALREADY-SHUFFLED data, so in ORIGINAL-object coordinates it IS `S`.
+            //
+            // The float-only ordered path used `perm` (the identity from
+            // `create_folds`) directly, i.e. it behaved as though the learn set were
+            // never shuffled. That is the `has_time = true` behaviour, and it is why
+            // this path matched upstream ONLY when `has_time` was set.
+            if need_shuffle(/* has_cat_features = */ false, params.boosting_type, params.has_time)
+            {
+                Some(crate::create_shuffled_indices(n, params.random_seed))
+            } else {
+                Some(perm)
+            }
         }
     };
 
