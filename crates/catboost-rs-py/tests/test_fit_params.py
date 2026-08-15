@@ -255,35 +255,47 @@ def test_min_data_in_leaf_is_inert_under_the_symmetric_grower():
 
 
 def test_has_time_is_observable_only_with_categorical_features():
-    """`has_time` is a CTR-path parameter in this engine, and the test says so.
+    """`has_time` is observable under ORDERED boosting AND on the CTR path.
 
-    `need_shuffle` (boosting.rs:616) is
-    `(has_cat_features || Ordered) && !has_time`, but its result is consumed ONLY
-    inside the CTR branch of `train_inner` (boosting.rs:3634, guarded by
-    `cat_learn_permutation.is_some()`, which requires CTR candidates). So on a
-    FLOAT-ONLY pool `has_time` cannot change the model — not even under Ordered
-    boosting, because the ordered approximant path does not read the learn-set
-    shuffle. Both halves are asserted:
+    This test previously asserted the opposite for the float-only ordered case, and
+    said so deliberately: "if the shuffle is ever threaded into the ordered numeric
+    path, this test fails loudly instead of the parameter silently changing meaning."
+    It then did exactly that. The limitation it marked has been fixed — the ordered
+    path now applies the learn-set shuffle (`NeedShuffle` is
+    `(has_cat_features || Ordered) && !has_time`, which ORDERED satisfies on its own,
+    `preprocess.cpp:161`), so `has_time` genuinely changes a float-only ordered fit by
+    suppressing that shuffle.
 
-      * float-only + Ordered -> byte-identical (the honest inert case);
-      * a CTR-routed categorical column -> the model MOVES.
+    Three regimes are asserted:
 
-    Recording the float-only half as an equality rather than omitting it is what
-    keeps the limitation visible: if the shuffle is ever threaded into the ordered
-    numeric path, this test fails loudly instead of the parameter silently
-    changing meaning.
+      * float-only + Ordered   -> the model MOVES (has_time suppresses the shuffle);
+      * float-only + Plain     -> INERT (Plain has no learn permutation at all);
+      * a CTR-routed cat column -> the model MOVES.
     """
     x, y = _xy()
-    plain = CatBoostRegressor(iterations=15, depth=3, boosting_type="Ordered")
-    plain.fit(x, y)
+    shuffled = CatBoostRegressor(iterations=15, depth=3, boosting_type="Ordered")
+    shuffled.fit(x, y)
     timed = CatBoostRegressor(
         iterations=15, depth=3, boosting_type="Ordered", has_time=True
     )
     timed.fit(x, y)
+    assert not np.allclose(shuffled.predict(x), timed.predict(x)), (
+        "has_time must CHANGE a float-only Ordered fit: ordered boosting shuffles the "
+        "learn set, and has_time is what suppresses that shuffle"
+    )
+
+    # The flip side, so "observable" is not mistaken for "observable everywhere":
+    # Plain boosting has no learning permutation, so has_time has nothing to suppress.
+    p_base = CatBoostRegressor(iterations=15, depth=3, boosting_type="Plain")
+    p_base.fit(x, y)
+    p_timed = CatBoostRegressor(
+        iterations=15, depth=3, boosting_type="Plain", has_time=True
+    )
+    p_timed.fit(x, y)
     np.testing.assert_array_equal(
-        plain.predict(x),
-        timed.predict(x),
-        err_msg="has_time must be inert on a float-only fit (no CTR shuffle to skip)",
+        p_base.predict(x),
+        p_timed.predict(x),
+        err_msg="has_time must be inert under Plain boosting (no learn permutation)",
     )
 
     # The regime where it IS consumed: a high-cardinality categorical column
