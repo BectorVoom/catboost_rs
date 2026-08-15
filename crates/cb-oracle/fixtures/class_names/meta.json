@@ -1,0 +1,38 @@
+{
+  "catboost_version": "1.2.10",
+  "labels": [
+    "neg",
+    "pos"
+  ],
+  "orders": [
+    [
+      "neg",
+      "pos"
+    ],
+    [
+      "pos",
+      "neg"
+    ]
+  ],
+  "params": {
+    "boost_from_average": false,
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 2,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "reversed_columns_max_abs_diff": 1.1102230246251565e-16,
+  "scenario": "class_names",
+  "seed": 3,
+  "straight_columns_max_abs_diff": 0.26473230701619266
+}

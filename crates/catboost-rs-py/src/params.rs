@@ -207,6 +207,16 @@ const IMPLEMENTED: &[&str] = &[
     // reproduced by moving the call into the level loop.
     "sampling_unit",
     "sampling_frequency",
+    // `class_names`: the class-label mapping. Supplying it makes `fit` accept a
+    // target of arbitrary labels (mapped onto class indices in the ORDER given --
+    // that order is the parameter's whole point, since it decides which label is
+    // the positive class and how `predict_proba`'s columns are arranged), makes
+    // `predict` return those labels, and populates `classes_`.
+    //
+    // CLASSIFIER-ONLY, exactly as upstream: `CatBoostRegressor.__init__()` raises
+    // `unexpected keyword argument 'class_names'`, so the regressor and ranker
+    // reject it here too rather than accepting a parameter they cannot honour.
+    "class_names",
     // `allow_const_label`: a real behavioural gate — an all-equal learn target is
     // REFUSED unless this is set, mirroring upstream's `metric.cpp:7011`.
     "allow_const_label",
@@ -600,6 +610,35 @@ fn validate_task_type(py: Python<'_>, value: &Py<PyAny>) -> PyResult<()> {
         "parameter `task_type` has an unknown value `{requested}`; the legal values are \
          {TASK_TYPE_VALUES:?}"
     )))
+}
+
+/// Parameters upstream accepts on the CLASSIFIER ONLY.
+///
+/// `CatBoostRegressor(class_names=[...])` raises `unexpected keyword argument
+/// 'class_names'` in catboost 1.2.10 -- the parameter is not part of the regressor's
+/// or ranker's surface at all. Accepting it there would mean silently ignoring a
+/// class-label mapping on an estimator that has no classes.
+const CLASSIFIER_ONLY: &[&str] = &["class_names"];
+
+/// Reject any [`CLASSIFIER_ONLY`] parameter, for the regressor / ranker entry points.
+///
+/// # Errors
+/// `CatBoostParameterError` naming the parameter and the estimator that does take it.
+pub(crate) fn validate_no_classifier_only_params(
+    params: &BTreeMap<String, Py<PyAny>>,
+    estimator: &str,
+) -> PyResult<()> {
+    for name in params.keys() {
+        let canonical = resolve_alias(name);
+        if CLASSIFIER_ONLY.contains(&canonical) {
+            return Err(CatBoostParameterError::new_err(format!(
+                "parameter `{canonical}` is not supported by {estimator}; it is a \
+                 CatBoostClassifier parameter (catboost 1.2.10 rejects it on the \
+                 regressor too)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_params(params: &BTreeMap<String, Py<PyAny>>) -> PyResult<()> {

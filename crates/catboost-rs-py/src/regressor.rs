@@ -17,6 +17,7 @@ use crate::estimator::{
     r2_score, resolve_cat_features, scoring_data_to_pool, EstimatorBase,
 };
 use crate::params::{
+    validate_no_classifier_only_params,
     make_builder, validate_eval_set_only_params, validate_params, EVAL_SET_REMEDY_FIT,
 };
 
@@ -65,6 +66,7 @@ impl CatBoostRegressor {
         // CatBoostParameterError, so no unsupported param is silently ignored
         // (threat T-08-05).
         validate_params(&slf.base.params)?;
+        validate_no_classifier_only_params(&slf.base.params, "CatBoostRegressor")?;
         // --- GIL HELD: own the input before any detach (D-11) ---
         // data_to_pool accepts EITHER a framework object (NumPy / Pandas / Arrow /
         // Polars) OR a native Pool; in every case it COPIES into owned columns

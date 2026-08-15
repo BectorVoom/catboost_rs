@@ -23,6 +23,7 @@ use crate::estimator::{
     scoring_data_to_pool, EstimatorBase,
 };
 use crate::params::{
+    validate_no_classifier_only_params,
     make_builder, validate_eval_set_only_params, validate_params, EVAL_SET_REMEDY_FIT,
 };
 
@@ -69,6 +70,7 @@ impl CatBoostRanker {
         eval_set: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<Self>> {
         validate_params(&slf.base.params)?;
+        validate_no_classifier_only_params(&slf.base.params, "CatBoostRanker")?;
         // F17: `cat_features` from the fit kwarg, else from the constructor.
         // Remembered on the base because PREDICT must declare the same width
         // (F10 checks the pool's declared width against the model's).

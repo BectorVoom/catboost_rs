@@ -34,6 +34,15 @@ pub(crate) struct EstimatorBase {
     /// at fit time, so a predict pool ingested without `cat_features` would be
     /// rejected. Empty for a float-only fit.
     pub(crate) cat_features: Vec<usize>,
+    /// The `class_names` this estimator was FITTED with, in the order the caller
+    /// gave them (`classes_`). Empty when the parameter was not supplied, which
+    /// keeps the default path byte-identical.
+    ///
+    /// Class index `i` IS position `i` in this list — that ordering is the whole
+    /// point of the parameter upstream: passing the labels in a non-sorted order
+    /// flips which label is the positive class, and `predict_proba`'s columns
+    /// follow it (verified against catboost 1.2.10).
+    pub(crate) class_names: Vec<Py<PyAny>>,
 }
 
 impl EstimatorBase {
@@ -54,6 +63,7 @@ impl EstimatorBase {
             params,
             model: None,
             cat_features: Vec::new(),
+            class_names: Vec::new(),
         })
     }
 
@@ -70,6 +80,7 @@ impl EstimatorBase {
             // runtime-only, F08), so `load_model` + `predict` works for
             // float-only models and reports a typed width mismatch otherwise.
             cat_features: Vec::new(),
+            class_names: Vec::new(),
         }
     }
 
