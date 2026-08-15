@@ -99,8 +99,19 @@ pub struct CatBoostBuilder {
     /// [`CatBoostBuilder::leaf_estimation_backtracking`].
     leaf_estimation_backtracking: LeafEstimationBacktracking,
     /// Per-iteration model shrinkage (`model_shrink_rate`) — see
-    /// [`CatBoostBuilder::model_shrink_rate`].
-    model_shrink_rate: f64,
+    /// [`CatBoostBuilder::model_shrink_rate`]. `None` means the caller never set
+    /// one, which is DISTINCT from an explicit `0.0`: turning `langevin` on
+    /// selects upstream's `0.001` only in the unset case.
+    model_shrink_rate: Option<f64>,
+    /// Whether Stochastic Gradient Langevin Boosting is on (`langevin`).
+    /// `None` means unset — supplying a `diffusion_temperature` then turns it
+    /// ON, matching upstream.
+    langevin: Option<bool>,
+    /// The SGLB temperature (`diffusion_temperature`). `None` means unset,
+    /// which `posterior_sampling` requires (upstream refuses an explicit one).
+    diffusion_temperature: Option<f64>,
+    /// The SGLB preset (`posterior_sampling`).
+    posterior_sampling: bool,
     /// How that shrinkage decays (`model_shrink_mode`).
     model_shrink_mode: EModelShrinkMode,
     /// Leaf refinement steps per tree (`leaf_estimation_iterations`).
@@ -352,7 +363,10 @@ impl CatBoostBuilder {
             leaf_estimation_backtracking: LeafEstimationBacktracking::default(),
             // 0.0 disables shrinkage (the upstream default); 1 leaf refinement
             // step is this port's canonical default.
-            model_shrink_rate: 0.0,
+            model_shrink_rate: None,
+            langevin: None,
+            diffusion_temperature: None,
+            posterior_sampling: false,
             model_shrink_mode: EModelShrinkMode::Constant,
             leaf_estimation_iterations: 1,
             random_score_type: ERandomScoreType::NormalWithModelSizeDecrease,
@@ -601,7 +615,65 @@ impl CatBoostBuilder {
     /// runs on the CPU path.
     #[must_use]
     pub fn model_shrink_rate(mut self, model_shrink_rate: f64) -> Self {
-        self.model_shrink_rate = model_shrink_rate;
+        self.model_shrink_rate = Some(model_shrink_rate);
+        self
+    }
+
+    /// Stochastic Gradient Langevin Boosting (`langevin`, upstream default off).
+    ///
+    /// Adds seeded Gaussian noise to the gradients so the boosting trajectory
+    /// samples a posterior instead of descending to a point estimate. The noise
+    /// enters at two places — the per-object derivatives (changing the tree
+    /// STRUCTURE) and the per-leaf derivative sums (changing the LEAF VALUES) —
+    /// scaled by `sqrt(2 / (learning_rate * diffusion_temperature))`, so a HIGHER
+    /// [`Self::diffusion_temperature`] means LESS noise.
+    ///
+    /// Turning this on also selects `model_shrink_rate = 0.001` unless
+    /// [`Self::model_shrink_rate`] was set explicitly, matching upstream — which
+    /// is why an explicit `model_shrink_rate(0.0)` is NOT the same as leaving it
+    /// alone.
+    ///
+    /// Setting [`Self::diffusion_temperature`] turns Langevin on by itself; call
+    /// this with `false` to keep it off despite a temperature.
+    ///
+    /// Declines the device grower, and is refused for `boosting_type = Ordered`
+    /// and for the non-symmetric grow policies.
+    #[must_use]
+    pub fn langevin(mut self, langevin: bool) -> Self {
+        self.langevin = Some(langevin);
+        self
+    }
+
+    /// The SGLB noise temperature (`diffusion_temperature`, upstream default
+    /// `10000` once Langevin is on).
+    ///
+    /// Supplying it turns [`Self::langevin`] ON unless Langevin was explicitly
+    /// disabled. `0.0` disables the noise (and its RNG draws) outright.
+    ///
+    /// REFUSED together with [`Self::posterior_sampling`], which derives the
+    /// temperature from the learn-set size — upstream raises
+    /// "Diffusion Temperature in Posterior Sampling is specified".
+    #[must_use]
+    pub fn diffusion_temperature(mut self, diffusion_temperature: f64) -> Self {
+        self.diffusion_temperature = Some(diffusion_temperature);
+        self
+    }
+
+    /// The SGLB posterior-sampling preset (`posterior_sampling`, upstream default
+    /// off).
+    ///
+    /// Implies [`Self::langevin`] and derives both knobs from the learn-set size
+    /// `n`: `diffusion_temperature = n` and `model_shrink_rate = 1 / (2n)`. It
+    /// OVERRIDES an explicitly supplied `model_shrink_rate` (unlike plain
+    /// Langevin, where the explicit value wins) — verified against catboost
+    /// 1.2.10.
+    ///
+    /// Refused with an explicit [`Self::diffusion_temperature`], with
+    /// `langevin(false)`, or with a non-`Constant` [`Self::model_shrink_mode`],
+    /// each mirroring an upstream refusal.
+    #[must_use]
+    pub fn posterior_sampling(mut self, posterior_sampling: bool) -> Self {
+        self.posterior_sampling = posterior_sampling;
         self
     }
 
@@ -1128,7 +1200,71 @@ impl CatBoostBuilder {
     /// BUILDER instead of being pinned to literals here. `new()` seeds each with
     /// the value that was pinned, so an untouched builder emits an identical
     /// `BoostParams` (the D-04 no-regression gate).
+    /// Resolve the Langevin family the way upstream's option parser does.
+    ///
+    /// Returns `(langevin_on, diffusion_temperature, model_shrink_rate)`. Three
+    /// rules, each measured against catboost 1.2.10:
+    ///
+    /// * Supplying a `diffusion_temperature` turns Langevin ON by itself; only an
+    ///   explicit `langevin(false)` keeps it off.
+    /// * `posterior_sampling` implies Langevin (its temperature and shrink rate
+    ///   are then overridden inside the engine, which knows the learn-set size).
+    /// * Langevin selects `model_shrink_rate = 0.001` only when the caller left
+    ///   the rate UNSET. An explicit value — `0.0` included — wins.
+    fn resolve_langevin(&self) -> (bool, f64, f64) {
+        let langevin_on = match self.langevin {
+            Some(explicit) => explicit || self.posterior_sampling,
+            // Unset: `posterior_sampling` implies it, and so does supplying a
+            // temperature.
+            None => self.posterior_sampling || self.diffusion_temperature.is_some(),
+        };
+        let diffusion_temperature = if langevin_on {
+            self.diffusion_temperature
+                .unwrap_or_else(cb_train::langevin_default_diffusion_temperature)
+        } else {
+            // Upstream zeroes the temperature when Langevin is off, which is what
+            // makes `langevin=False, diffusion_temperature=X` bit-identical to the
+            // default fit.
+            0.0
+        };
+        let model_shrink_rate = self.model_shrink_rate.unwrap_or(if langevin_on {
+            cb_train::langevin_default_model_shrink_rate()
+        } else {
+            0.0
+        });
+        (langevin_on, diffusion_temperature, model_shrink_rate)
+    }
+
+    /// The surface-level Langevin refusals — the ones that need to know whether a
+    /// value was SUPPLIED, which `BoostParams` cannot express.
+    ///
+    /// # Errors
+    /// [`CatBoostError::InvalidConfig`] when `posterior_sampling` is combined with
+    /// an explicit `diffusion_temperature` or with `langevin(false)`. Both mirror
+    /// upstream refusals (`catboost_options.cpp:746` / `:748`).
+    fn validate_langevin_surface(&self) -> Result<(), CatBoostError> {
+        if !self.posterior_sampling {
+            return Ok(());
+        }
+        if self.langevin == Some(false) {
+            return Err(CatBoostError::InvalidConfig(
+                "posterior_sampling requires langevin boosting; got langevin=false \
+                 (upstream: catboost_options.cpp:746)"
+                    .to_owned(),
+            ));
+        }
+        if self.diffusion_temperature.is_some() {
+            return Err(CatBoostError::InvalidConfig(
+                "diffusion_temperature must not be set with posterior_sampling — it is \
+                 derived from the learn-set size (upstream: catboost_options.cpp:748)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn boost_params(&self) -> BoostParams {
+        let (langevin, diffusion_temperature, model_shrink_rate) = self.resolve_langevin();
         BoostParams {
             // `Loss` is no longer `Copy` (Phase 6.2, D-6.2-05 — the Wave-3
             // MultiQuantile variant carries an owned Vec<f64>); clone out of the
@@ -1183,7 +1319,7 @@ impl CatBoostBuilder {
             max_leaves: self.max_leaves,
             min_data_in_leaf: self.min_data_in_leaf,
             extra: cb_train::ExtraBoostParams {
-                model_shrink_rate: self.model_shrink_rate,
+                model_shrink_rate,
                 model_shrink_mode: self.model_shrink_mode,
                 leaf_estimation_iterations: self.leaf_estimation_iterations,
                 leaf_estimation_backtracking: self.leaf_estimation_backtracking,
@@ -1193,6 +1329,9 @@ impl CatBoostBuilder {
                 sampling_unit: self.sampling_unit,
                 sampling_frequency: self.sampling_frequency,
                 rsm: self.rsm,
+                langevin,
+                diffusion_temperature,
+                posterior_sampling: self.posterior_sampling,
                 allow_const_label: self.allow_const_label,
                 model_size_reg: self.model_size_reg,
             },
@@ -1422,6 +1561,7 @@ impl CatBoostBuilder {
         let prof = std::env::var_os("CB_GPU_PROF").is_some_and(|v| v != "0");
         let prof_t = std::time::Instant::now();
 
+        self.validate_langevin_surface()?;
         let params = self.boost_params();
         // SPD-03: kick off the background device-kernel warm-up NOW so JIT
         // compilation overlaps the host-side fit-prep below (and the caller's pool

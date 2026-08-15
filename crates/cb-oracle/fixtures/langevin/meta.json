@@ -1,0 +1,73 @@
+{
+  "catboost_version": "1.2.10",
+  "deviation_from_default_by_temperature": {
+    "1": 0.7090125833830291,
+    "100": 0.38825027060651696,
+    "10000": 0.0056601793293419855
+  },
+  "langevin_default_shrink_rate": 0.0010000000474974513,
+  "langevin_false_is_inert_max_abs_diff": 0.0,
+  "n_train": 300,
+  "params": {
+    "allow_writing_files": false,
+    "boost_from_average": false,
+    "boosting_type": "Plain",
+    "bootstrap_type": "No",
+    "border_count": 32,
+    "depth": 3,
+    "grow_policy": "SymmetricTree",
+    "iterations": 5,
+    "l2_leaf_reg": 3.0,
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_method": "Gradient",
+    "learning_rate": 0.3,
+    "random_seed": 0,
+    "random_strength": 0,
+    "score_function": "L2",
+    "thread_count": 1,
+    "verbose": false
+  },
+  "posterior_expected_shrink_rate": 0.0016666667070239782,
+  "posterior_overrides_explicit_shrink_max_abs_diff": 0.0,
+  "rejections": {
+    "posterior_with_decreasing_shrink": "catboost/private/libs/options/catboost_options.cpp:750: Posterior Sampling requires \u0421onstant Model Shrink Mode",
+    "posterior_with_temperature": "catboost/private/libs/options/catboost_options.cpp:748: Diffusion Temperature in Posterior Sampling is specified",
+    "posterior_without_langevin": "catboost/private/libs/options/catboost_options.cpp:746: Posterior Sampling requires Langevin boosting."
+  },
+  "resolved": {
+    "langevin_explicit_shrink": {
+      "diffusion_temperature": 10000,
+      "langevin": true,
+      "model_shrink_mode": "Constant",
+      "model_shrink_rate": 0.5,
+      "posterior_sampling": false
+    },
+    "langevin_only": {
+      "diffusion_temperature": 10000,
+      "langevin": true,
+      "model_shrink_mode": "Constant",
+      "model_shrink_rate": 0.0010000000474974513,
+      "posterior_sampling": false
+    },
+    "posterior_sampling": {
+      "diffusion_temperature": 300,
+      "langevin": true,
+      "model_shrink_mode": "Constant",
+      "model_shrink_rate": 0.0016666667070239782,
+      "posterior_sampling": true
+    }
+  },
+  "scenario": "langevin",
+  "seed": 20260815,
+  "temperature_tags": {
+    "1": "1",
+    "100": "100",
+    "10000": "10000"
+  },
+  "temperatures": [
+    1.0,
+    100.0,
+    10000.0
+  ],
+  "zero_temperature_equals_shrink_only_max_abs_diff": 0.0
+}

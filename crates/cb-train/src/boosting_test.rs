@@ -97,6 +97,8 @@ fn exact_single_leaf_dim(loss: Loss, residuals: &[f64], dim_index: usize) -> f64
         /* scaled_l2 */ 0.0,
         /* n_leaves */ 1,
         dim_index,
+        // No Langevin noise: this helper pins the un-noised leaf estimator.
+        None,
     );
     assert_eq!(deltas.len(), 1);
     deltas[0]

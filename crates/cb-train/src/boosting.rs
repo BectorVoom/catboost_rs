@@ -570,6 +570,30 @@ pub struct ExtraBoostParams {
     /// `draws_active` — see [`crate::tree::Perturbation::rsm`] for the per-level
     /// filter and the early-stop rule when a level selects nothing.
     pub rsm: f64,
+    /// `langevin` — whether Stochastic Gradient Langevin Boosting is on. When
+    /// `false`, [`Self::diffusion_temperature`] is IGNORED entirely (upstream
+    /// zeroes it, and `langevin=False, diffusion_temperature=X` is measurably
+    /// bit-identical to the default fit).
+    ///
+    /// Upstream also couples this to model shrinkage: turning Langevin on with no
+    /// explicit `model_shrink_rate` selects
+    /// [`crate::langevin_default_model_shrink_rate`]. That resolution is the
+    /// CALLER's job — this struct carries concrete values, never auto-selected
+    /// (RESEARCH Pitfall 6) — and distinguishing "unset" from "explicitly 0.0" is
+    /// a surface-level concern the builder owns.
+    pub langevin: bool,
+    /// `diffusion_temperature` — the SGLB temperature. The gradient-noise scale is
+    /// `sqrt(2 / (learning_rate * diffusion_temperature))`, so a HIGHER
+    /// temperature means LESS noise. Inert unless [`Self::langevin`] is set;
+    /// `0.0` disables the noise (and its RNG draws) outright, matching upstream's
+    /// early return.
+    pub diffusion_temperature: f64,
+    /// `posterior_sampling` — the SGLB preset. Implies [`Self::langevin`] and
+    /// OVERRIDES both [`Self::diffusion_temperature`] (to the learn-set size) and
+    /// [`Self::model_shrink_rate`] (to `1 / (2n)`) even when the caller supplied
+    /// them. Because both depend on `n`, this one IS resolved inside the engine,
+    /// which is where the learn-set size is known.
+    pub posterior_sampling: bool,
 }
 
 impl Default for ExtraBoostParams {
@@ -591,6 +615,13 @@ impl Default for ExtraBoostParams {
             // NOT `f64::default()` — a zero subspace fraction would select no
             // feature at any level and every tree would collapse to one leaf.
             rsm: 1.0,
+            langevin: false,
+            // `0.0` (not upstream's `10000`) because this field is only read when
+            // `langevin` is on, and `0.0` is upstream's own "no noise, no draws"
+            // sentinel. The `10000` default belongs to the RESOLUTION step, which
+            // the builder owns.
+            diffusion_temperature: 0.0,
+            posterior_sampling: false,
         }
     }
 }
@@ -2296,6 +2327,53 @@ fn validate_rsm(rsm: f64, grow_policy: EGrowPolicy) -> CbResult<()> {
     Ok(())
 }
 
+/// Validate the Langevin family and refuse the combinations whose draw
+/// accounting is not established.
+///
+/// * A negative `diffusion_temperature` is refused — the noise rate
+///   `sqrt(2 / (lr * dt))` would be `NaN`, silently poisoning every derivative.
+/// * `boosting_type = Ordered` is refused. Upstream applies the derivative noise
+///   once per body/tail segment, each consuming its OWN main-RNG `GenRand()`
+///   (`greedy_tensor_search.cpp:761`). This engine's ordered path is itself still
+///   converging on upstream (see the ordered-boosting parity work), so layering
+///   an unverified multi-segment draw sequence on top would produce a model that
+///   is wrong for two independent reasons at once and attributable to neither.
+///   Refused rather than silently mis-drawing.
+///
+/// Inert at the default (`langevin = false`), which passes every clause.
+fn validate_langevin(params: &BoostParams) -> CbResult<()> {
+    if !params.extra.langevin {
+        return Ok(());
+    }
+    if !(params.extra.diffusion_temperature >= 0.0) {
+        return Err(CbError::OutOfRange(format!(
+            "diffusion_temperature must be >= 0 (got {}); the Langevin noise rate \
+             sqrt(2 / (learning_rate * diffusion_temperature)) is not real below zero",
+            params.extra.diffusion_temperature
+        )));
+    }
+    if matches!(params.boosting_type, EBoostingType::Ordered) {
+        return Err(CbError::Unsupported(
+            "langevin is not implemented for boosting_type = Ordered; upstream adds the \
+             derivative noise once per body/tail segment, each taking its own main-RNG \
+             draw, and that multi-segment draw sequence has not been established against \
+             upstream for this engine's ordered path. Refused rather than silently \
+             consuming the wrong number of draws."
+                .to_owned(),
+        ));
+    }
+    if params.grow_policy != EGrowPolicy::SymmetricTree {
+        return Err(CbError::Unsupported(format!(
+            "langevin is only implemented for grow_policy=SymmetricTree (got \
+             {:?}); the leaf-wise and region growers reach the leaf solve through a \
+             different path whose Langevin seeding has not been established against \
+             upstream. Refused rather than silently training an un-noised model.",
+            params.grow_policy
+        )));
+    }
+    Ok(())
+}
+
 /// Map the per-feature `monotone_constraints` onto this oblivious tree's SPLITS,
 /// in split order — `GetTreeMonotoneConstraints`
 /// (`monotonic_constraint_utils.cpp:120-134`). Split `i` (a `value > border` test
@@ -2358,6 +2436,22 @@ fn monotonic_leaf_isotonic_weights(
 /// the Newton sum); `approx`/`target` the running approximant/labels; `loss`
 /// selects the Exact optimizer.
 #[allow(clippy::too_many_arguments)]
+/// The per-call Langevin leaf-sum noise state handed to [`compute_leaf_deltas`].
+///
+/// `seed` is ONE `Rand.GenRand()` from the persistent learn stream, taken by the
+/// CALLER immediately before each leaf solve — upstream draws it inside
+/// `CalcLeafValuesSimple`'s `leafUpdaterFunc` (`approx_calcer.cpp:973`), which
+/// runs once per leaf-estimation iteration, so a multi-step estimator consumes
+/// one draw per step.
+pub(crate) struct LangevinLeafNoise {
+    /// `diffusion_temperature`, already resolved (posterior sampling applied).
+    pub diffusion_temperature: f64,
+    /// `learning_rate` — the second half of the noise rate.
+    pub learning_rate: f64,
+    /// This solve's `randomSeed`.
+    pub seed: u64,
+}
+
 fn compute_leaf_deltas(
     method: LeafMethod,
     loss: &Loss,
@@ -2374,10 +2468,33 @@ fn compute_leaf_deltas(
     // arm reads this dimension's quantile level `alpha[dim_index]` (D-6.2-05). Every
     // other loss ignores it.
     dim_index: usize,
+    // LANGEVIN leaf-sum noise (`AddLangevinNoiseToLeaf{Derivatives,Newton}Sum`,
+    // `approx_calcer.cpp:768-782`), applied to the reduced per-leaf `SumDer`
+    // BEFORE the closed-form delta. `None` on every non-Langevin fit, which keeps
+    // all four arms byte-identical.
+    langevin: Option<&LangevinLeafNoise>,
 ) -> Vec<f64> {
     match method {
         LeafMethod::Gradient => {
-            let stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            let mut stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            // Upstream applies the noise only for `Gradient` and `Newton` (the
+            // `if/else if` at approx_calcer.cpp:768); `Simple` and `Exact` get none.
+            if let Some(lv) = langevin {
+                let sum_weights: Vec<f64> = stats.iter().map(|s| s.sum_weight).collect();
+                let mut sum_der: Vec<f64> =
+                    stats.iter().map(|s| s.sum_weighted_delta).collect();
+                crate::add_noise_to_leaf_der_sums(
+                    &mut sum_der,
+                    &sum_weights,
+                    lv.diffusion_temperature,
+                    lv.learning_rate,
+                    scaled_l2,
+                    lv.seed,
+                );
+                for (s, &d) in stats.iter_mut().zip(sum_der.iter()) {
+                    s.sum_weighted_delta = d;
+                }
+            }
             stats
                 .iter()
                 .map(|s| gradient_leaf_delta(s.sum_weighted_delta, s.sum_weight, scaled_l2))
@@ -2391,7 +2508,7 @@ fn compute_leaf_deltas(
                 .collect()
         }
         LeafMethod::Newton => {
-            let stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
+            let mut stats = reduce_leaf_stats(leaf_of, weighted_der1, weights, n_leaves);
             // Newton needs Σ der2*weight per leaf; build the weighted-der2 column
             // (elementwise product the host folds), then reduce ordered (D-05).
             let weighted_der2: Vec<f64> = der2
@@ -2400,6 +2517,27 @@ fn compute_leaf_deltas(
                 .map(|(&d, &w)| d * w)
                 .collect();
             let sum_der2 = reduce_leaf_der2(leaf_of, &weighted_der2, n_leaves);
+            if let Some(lv) = langevin {
+                // The Newton variant scales by `sqrt(|SumDer2| + scaledL2)` instead
+                // of `sqrt(SumWeights + scaledL2)`, but still SKIPS on the summed
+                // WEIGHT — so the skip predicate and the scale read different
+                // quantities. Keeping both is what makes the draw stream match.
+                let sum_weights: Vec<f64> = stats.iter().map(|s| s.sum_weight).collect();
+                let mut sum_der: Vec<f64> =
+                    stats.iter().map(|s| s.sum_weighted_delta).collect();
+                crate::add_noise_to_leaf_newton_sums(
+                    &mut sum_der,
+                    &sum_der2,
+                    &sum_weights,
+                    lv.diffusion_temperature,
+                    lv.learning_rate,
+                    scaled_l2,
+                    lv.seed,
+                );
+                for (s, &d) in stats.iter_mut().zip(sum_der.iter()) {
+                    s.sum_weighted_delta = d;
+                }
+            }
             stats
                 .iter()
                 .zip(sum_der2.iter())
@@ -4653,6 +4791,40 @@ fn train_inner<R: Runtime>(
         return Err(CbError::Degenerate("empty target".to_owned()));
     }
 
+    // `posterior_sampling` is the one Langevin knob that MUST be resolved here
+    // rather than by the caller: both values it forces depend on the learn-set
+    // size, which is `n`. It overrides `diffusion_temperature` and
+    // `model_shrink_rate` even when they were supplied explicitly (measured
+    // against catboost 1.2.10: `posterior_sampling=True, model_shrink_rate=0.5`
+    // still resolves to `1/(2n)`) — unlike plain `langevin`, where an explicit
+    // `model_shrink_rate` wins.
+    //
+    // `resolved` outlives the borrow so `params` can be re-bound to it; on the
+    // default path nothing is cloned and `params` is the caller's reference
+    // unchanged (D-04, byte-identical).
+    let resolved_posterior;
+    let params: &BoostParams = if params.extra.posterior_sampling {
+        // Upstream refuses a non-Constant shrink mode here
+        // (`catboost_options.cpp:750`, message typo'd with a Cyrillic "С"
+        // upstream — reproduced in spirit, not character-for-character).
+        if params.extra.model_shrink_mode != EModelShrinkMode::Constant {
+            return Err(CbError::Unsupported(format!(
+                "posterior_sampling requires model_shrink_mode = Constant (got {:?}); \
+                 upstream refuses the same combination (catboost_options.cpp:750)",
+                params.extra.model_shrink_mode
+            )));
+        }
+        let mut p = params.clone();
+        p.extra.langevin = true;
+        p.extra.diffusion_temperature = crate::posterior_sampling_diffusion_temperature(n);
+        p.extra.model_shrink_rate = crate::posterior_sampling_shrink_rate(n);
+        resolved_posterior = p;
+        &resolved_posterior
+    } else {
+        params
+    };
+    validate_langevin(params)?;
+
     // Automatic learning-rate selection (TRAIN-08): when the caller opted into
     // auto-LR AND the loss is in the upstream coefficient table, guess the rate
     // pre-train from (target, useBestModel, boostFromAverage, learnObjectCount,
@@ -5451,8 +5623,15 @@ fn train_inner<R: Runtime>(
     // each draw decide a candidate, so it must now be taken. At `rsm == 1.0` this
     // clause is false and the zero-draw path is untouched (D-6.6-05).
     let rsm_active = params.extra.rsm < 1.0;
-    let draws_active =
-        !matches!(params.bootstrap_type, EBootstrapType::No) || perturb_active || rsm_active;
+    // LANGEVIN likewise makes the stream observable: the derivative noise takes a
+    // main-RNG `GenRand()` per tree and the leaf-sum noise takes one per
+    // leaf-estimation step, so every pre/post-tree draw upstream always makes must
+    // now be made here too, in phase.
+    let langevin_active = params.extra.langevin && params.extra.diffusion_temperature != 0.0;
+    let draws_active = !matches!(params.bootstrap_type, EBootstrapType::No)
+        || perturb_active
+        || rsm_active
+        || langevin_active;
 
     // SPEC-OH-27 (T01b, branch b) — one-hot x ACTIVE RNG draws is typed-rejected.
     //
@@ -5549,6 +5728,17 @@ fn train_inner<R: Runtime>(
         // device fit eligible exactly as before. Pinned by
         // `string_param_device_routing_test`.
         && params.extra.rsm >= 1.0
+        // LANGEVIN declines to the CPU grower. There IS a device Langevin kernel
+        // (`cb_backend::kernels::langevin`), but it reseeds PER ELEMENT
+        // (`from_seed(rand_seed + i).advance(10)`) while upstream — and this
+        // engine's CPU path — seeds per BLOCK of 128 and draws sequentially within
+        // the block. Those are different streams, so committing would produce a
+        // differently-noised model; the kernel's self-oracle cannot see this
+        // because it only checks the kernel against a CPU replica of its OWN rule.
+        // The leaf-sum noise has no device arm at all. Declining until the kernel
+        // is reconciled; `langevin = false` (the default) leaves every existing
+        // device fit eligible exactly as before.
+        && !params.extra.langevin
         // FPP-20 (T23): the former `ordered_learning_perm.is_none()` clause is GONE. It was
         // the host half of the ordered decline — the session-side gate was the other half —
         // and it existed because the device had no way to score a candidate over the fold's
@@ -7349,6 +7539,49 @@ fn train_inner<R: Runtime>(
             &mut rng,
         )?;
 
+        // 1c. LANGEVIN derivative noise (`AddLangevinNoiseToDerivatives`). Upstream
+        //     applies it INSIDE `DoBootstrap`, immediately after `Bootstrap(...)`
+        //     returns (`greedy_tensor_search.cpp:760-769`) — so it comes AFTER the
+        //     bootstrap's draws and takes exactly ONE more `Rand.GenRand()` (the
+        //     Plain fold has a single body/tail; the multi-segment Ordered case is
+        //     refused by `validate_langevin`).
+        //
+        //     The noise lands on the SPLIT-SCORING derivatives only. Upstream
+        //     perturbs `bt.WeightedDerivatives`, which feeds `CalcScoreStDev` and
+        //     the histogram; LEAF VALUES are estimated from derivatives that
+        //     `CalcLeafDersSimple` recomputes from the approx, and get their OWN
+        //     noise at the leaf-sum site below. So this must NOT write through to
+        //     `weighted_der1` — which it would, since `search_weighted_der1` ALIASES
+        //     it on every non-CTR path. Hence a fresh owned buffer rather than an
+        //     in-place edit.
+        //
+        //     Note the ordering against the bootstrap: `der_obj` (the MVS/bootstrap
+        //     input) was built from the UN-noised derivatives above, matching
+        //     upstream, where `Bootstrap` runs before the noise is added.
+        let langevin_noised_der1: Option<Vec<f64>> =
+            if params.extra.langevin && params.extra.diffusion_temperature != 0.0 {
+                let seed = rng.gen_rand();
+                let mut noised = search_weighted_der1.to_vec();
+                // Upstream's multi-dimensional overload re-blocks PER DIMENSION over
+                // the per-object count, so a dim-major buffer is noised one
+                // dimension-slice at a time rather than as one flat range. At
+                // `approx_dimension == 1` the loop runs once over the whole buffer.
+                for dim_slice in noised.chunks_mut(n) {
+                    crate::add_noise_to_derivatives(
+                        dim_slice,
+                        params.extra.diffusion_temperature,
+                        params.learning_rate,
+                        seed,
+                    );
+                }
+                Some(noised)
+            } else {
+                None
+            };
+        let search_weighted_der1: &[f64] = langevin_noised_der1
+            .as_deref()
+            .unwrap_or(search_weighted_der1);
+
         // WR-04 (06.2-07): after CR-02 the sample weight / control mask are
         // per-OBJECT (length `n`). Assert it so a future dimension-major
         // regression is caught here rather than silently truncated by the
@@ -7911,6 +8144,33 @@ fn train_inner<R: Runtime>(
         //    in leaf order (unchanged). The leaf_value leaf_of partition is shared
         //    across dimensions (the oblivious structure is one tree).
         let mut leaf_values: Vec<f64> = Vec::with_capacity(approx_dimension * n_leaves);
+        // LANGEVIN draw-phase split. `POST_TREE_EXTRA_DRAWS` (= 2, instrumented
+        // ground truth) is normally consumed as one block at the END of the tree.
+        // That is only equivalent while nothing BETWEEN those two draws touches the
+        // RNG — and Langevin's leaf seed does exactly that, so the block has to be
+        // unpacked here. Naming upstream's three per-tree leaf-phase draws:
+        //
+        //   A  `GenRandUI64Vector(foldCount, Rand.GenRand())`  train.cpp:303,
+        //      once per tree, BEFORE `CalcLeafValues`.
+        //   B  `CalcLeafDersSimple(..., Rand.GenRand(), ...)`  approx_calcer.cpp:958,
+        //      inside `leafUpdaterFunc` — so once per LEAF-ESTIMATION STEP, and
+        //      taken whether or not Langevin is on.
+        //   C  the Langevin leaf-noise seed                    approx_calcer.cpp:973,
+        //      immediately after B in the same lambda, only when Langevin is on.
+        //
+        // With Langevin OFF and one leaf step that is exactly A + B = 2, which is
+        // what `POST_TREE_EXTRA_DRAWS` measures. With Langevin ON the sequence is
+        // A, B₁, C₁, B₂, C₂, … — so C is NOT reachable by shifting the block; A must
+        // be taken here and each step must take its own B before its C.
+        //
+        // `langevin_owns_post_draws` therefore suppresses the end-of-tree block
+        // entirely: this path accounts for A/B/C itself. Langevin off ⇒ false, and
+        // the block at the end is the unchanged 2 (byte-identical, D-04).
+        let langevin_owns_post_draws = langevin_active && draws_active;
+        if langevin_owns_post_draws {
+            // A.
+            rng.gen_rand();
+        }
         // NOTE: each leaf branch below pushes RAW deltas (NO learning_rate); the
         // `learning_rate` scale + pairwise weighted-mean centering are applied once,
         // after the branches, by `normalize_leaf_values` (upstream order).
@@ -8038,6 +8298,18 @@ fn train_inner<R: Runtime>(
                     // Pointwise path: per-object weights (eff_weights == weights, D-04).
                     &eff_weights
                 };
+                // LANGEVIN leaf-sum noise, draws B then C for this leaf-estimation
+                // step (see the `langevin_owns_post_draws` note above). B is
+                // `CalcLeafDersSimple`'s own seed: this engine does not use it, but
+                // upstream SPENDS it, and skipping it would hand C the wrong value.
+                let langevin_leaf = langevin_owns_post_draws.then(|| {
+                    let _calc_leaf_ders_seed = rng.gen_rand(); // B
+                    LangevinLeafNoise {
+                        diffusion_temperature: params.extra.diffusion_temperature,
+                        learning_rate: params.learning_rate,
+                        seed: rng.gen_rand(), // C
+                    }
+                });
                 let mut leaf_deltas = compute_leaf_deltas(
                     params.leaf_method,
                     &params.loss,
@@ -8050,6 +8322,7 @@ fn train_inner<R: Runtime>(
                     scaled_l2,
                     n_leaves,
                     d,
+                    langevin_leaf.as_ref(),
                 );
                 // ─── MULTI-STEP LEAF ESTIMATION (`leaf_estimation_iterations`) ───
                 // Upstream's `CalcApproxDeltaSimple` runs the leaf solve N times,
@@ -8088,6 +8361,17 @@ fn train_inner<R: Runtime>(
                             .enumerate()
                             .map(|(i, &dv)| dv * weights.get(i).copied().unwrap_or(1.0))
                             .collect();
+                        // A FRESH B/C pair per step: `leafUpdaterFunc` re-enters
+                        // both `Rand.GenRand()` calls on every leaf-estimation
+                        // iteration.
+                        let step_langevin = langevin_owns_post_draws.then(|| {
+                            let _calc_leaf_ders_seed = rng.gen_rand(); // B
+                            LangevinLeafNoise {
+                                diffusion_temperature: params.extra.diffusion_temperature,
+                                learning_rate: params.learning_rate,
+                                seed: rng.gen_rand(), // C
+                            }
+                        });
                         let step_deltas = compute_leaf_deltas(
                             params.leaf_method,
                             &params.loss,
@@ -8100,6 +8384,7 @@ fn train_inner<R: Runtime>(
                             scaled_l2,
                             n_leaves,
                             d,
+                            step_langevin.as_ref(),
                         );
                         for (slot, add) in leaf_deltas.iter_mut().zip(step_deltas.iter()) {
                             *slot += add;
@@ -8351,6 +8636,12 @@ fn train_inner<R: Runtime>(
                         scaled_l2,
                         n_leaves,
                         d,
+                        // No Langevin noise on the CTR fold leaf solve: `langevin`
+                        // is refused for the ordered / multi-permutation families
+                        // whose draw accounting this path shares, so reaching here
+                        // with Langevin on is impossible. Passing `None` keeps the
+                        // path byte-identical rather than inventing a seed.
+                        None,
                     );
                     fold_leaf_values.extend_from_slice(&deltas);
                 }
@@ -8495,6 +8786,9 @@ fn train_inner<R: Runtime>(
                     scaled_l2,
                     n_leaves,
                     0,
+                    // Learning-fold approx update: ordered / CTR only, where
+                    // `langevin` is refused. See the CTR fold solve above.
+                    None,
                 )
             };
             // The LEARNING-fold approx update applies ONLY `learning_rate`
@@ -8528,7 +8822,10 @@ fn train_inner<R: Runtime>(
         // instrumented-ground-truth/GROUND_TRUTH.md`). `draws_active == false`
         // (bootstrap_type=No, random_strength=0) stays the byte-identical
         // zero-draw first-slice path.
-        if draws_active {
+        // `langevin_owns_post_draws` means the leaf phase already spent upstream's
+        // A/B/C sequence itself (see its definition); taking the block again here
+        // would double-count. Off ⇒ the unchanged 2 (byte-identical, D-04).
+        if draws_active && !langevin_owns_post_draws {
             for _ in 0..POST_TREE_EXTRA_DRAWS {
                 rng.gen_rand();
             }

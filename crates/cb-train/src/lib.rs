@@ -25,6 +25,7 @@ mod estimated;
 mod fast_approx;
 mod feature_selection;
 mod fold;
+mod langevin;
 mod metrics;
 mod overfit;
 mod pairwise_leaves;
@@ -75,6 +76,12 @@ pub use fold::{
     plain_fold_body_tail, select_min_batch_size, select_tail_size, Fold,
 };
 pub use calc_metrics::{calc_metric, eval_metric, parse_metric};
+pub use langevin::{
+    add_noise_to_derivatives, add_noise_to_leaf_der_sums, add_noise_to_leaf_newton_sums,
+    langevin_default_diffusion_temperature, langevin_default_model_shrink_rate,
+    langevin_noise_rate, posterior_sampling_diffusion_temperature, posterior_sampling_shrink_rate,
+    LANGEVIN_BLOCK_SIZE,
+};
 pub use metrics::{EvalMetric, EvalMetricHistory};
 pub use overfit::{BestModelTracker, EOverfittingDetectorType, OverfittingDetector};
 pub use pairwise_leaves::{calculate_pairwise_leaf_values, compute_pairwise_leaf_deltas};

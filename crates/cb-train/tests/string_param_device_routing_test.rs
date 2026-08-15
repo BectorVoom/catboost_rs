@@ -320,6 +320,29 @@ mod device {
         );
     }
 
+    /// `langevin` declines. There IS a device Langevin kernel, but it reseeds PER
+    /// ELEMENT while upstream (and this engine's CPU path) seeds per BLOCK of 128
+    /// and draws sequentially inside the block — different streams. The kernel's
+    /// self-oracle cannot see that, because it only checks the kernel against a
+    /// CPU replica of its own rule. Committing would therefore return a
+    /// differently-noised model.
+    pub fn langevin_declines() {
+        let params = BoostParams {
+            extra: cb_train::ExtraBoostParams {
+                langevin: true,
+                diffusion_temperature: 100.0,
+                ..Default::default()
+            },
+            ..base_params()
+        };
+        assert_eq!(
+            device_grows(&params),
+            0,
+            "langevin must decline — the device kernel's per-element reseed is a \
+             different stream from the CPU path's per-block-of-128 one"
+        );
+    }
+
     /// ...and the DEFAULT `rsm` must still commit, so the decline above is a real
     /// routing decision rather than this parameter having disabled the device path
     /// outright.
@@ -556,4 +579,5 @@ device_test!(
     device::random_score_type_is_unreachable_on_device
 );
 device_test!(rsm_declines, device::rsm_declines);
+device_test!(langevin_declines, device::langevin_declines);
 device_test!(default_rsm_still_commits, device::default_rsm_still_commits);
