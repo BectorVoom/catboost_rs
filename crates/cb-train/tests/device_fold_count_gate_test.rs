@@ -11,7 +11,9 @@
 //! source (`learning_fold_count`) here, and end-to-end by T14's
 //! `multi_permutation_ctr_declines_to_device` once the CTR clause opens.
 
-use std::cell::Cell;
+// `Mutex`, not `Cell`: `cb_train::train` requires `R: Sync` so the fit can run
+// inside a `thread_count`-sized rayon pool, and `Cell` is not `Sync`.
+use std::sync::Mutex;
 
 use cb_compute::{
     Derivatives, DeviceGrownTree, EScoreFunction, FamilyTreeArgs, LeafMethod, Loss, Runtime,
@@ -31,7 +33,7 @@ use cb_train::{
 /// `begin_device_training`, accepts the session, and grows a canned depth-1 tree
 /// (the `device_seam_test.rs` pattern).
 struct FoldCountRecorder {
-    recorded: Cell<Option<usize>>,
+    recorded: Mutex<Option<usize>>,
 }
 
 impl Runtime for FoldCountRecorder {
@@ -64,7 +66,9 @@ impl Runtime for FoldCountRecorder {
         _scaled_l2: f64,
         _config: &cb_compute::DeviceTrainConfig,
     ) -> CbResult<bool> {
-        self.recorded.set(Some(fold_count));
+        if let Ok(mut slot) = self.recorded.lock() {
+            *slot = Some(fold_count);
+        }
         Ok(true)
     }
 
@@ -154,7 +158,7 @@ fn device_params() -> BoostParams {
 fn plain_fit_still_passes_fold_count_one() {
     for pc in [1_usize, 4] {
         let mock = FoldCountRecorder {
-            recorded: Cell::new(None),
+            recorded: Mutex::new(None),
         };
         let params = BoostParams {
             permutation_count: pc,
@@ -172,7 +176,7 @@ fn plain_fit_still_passes_fold_count_one() {
         )
         .expect("device fit must succeed");
         assert_eq!(
-            mock.recorded.get(),
+            mock.recorded.lock().ok().and_then(|g| *g),
             Some(1),
             "non-CTR fit (permutation_count={pc}) must hand fold_count == 1"
         );

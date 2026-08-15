@@ -154,7 +154,7 @@ fn calc_num_to_eliminate_by_steps(
 /// duplicate index, when `num_features_to_select > features_for_select.len()`,
 /// or when `steps == 0`. Propagates any [`train`] error.
 #[allow(clippy::too_many_arguments)]
-pub fn select_features<R: Runtime>(
+pub fn select_features<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],

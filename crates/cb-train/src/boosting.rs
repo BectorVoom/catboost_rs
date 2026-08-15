@@ -588,6 +588,19 @@ pub struct ExtraBoostParams {
     /// `0.0` disables the noise (and its RNG draws) outright, matching upstream's
     /// early return.
     pub diffusion_temperature: f64,
+    /// `thread_count` — how many worker threads the fit may use. `0` means "as
+    /// many as the machine has", which is upstream's `-1`.
+    ///
+    /// This is a PURE PERFORMANCE knob: the model must be bit-identical at every
+    /// thread count. That is structural rather than incidental — every
+    /// parallelised loop here (and upstream) blocks on CONSTANT block sizes, never
+    /// on the runtime thread count, so neither the RNG stream nor the reduction
+    /// order can move. Measured against catboost 1.2.10 over
+    /// `thread_count` ∈ {1, 2, 4, 8, 16, -1}: max|diff| = 0 in every case.
+    ///
+    /// An implementation that changes results across thread counts is therefore
+    /// wrong by construction, which is what `thread_count_oracle_test` asserts.
+    pub thread_count: usize,
     /// `posterior_sampling` — the SGLB preset. Implies [`Self::langevin`] and
     /// OVERRIDES both [`Self::diffusion_temperature`] (to the learn-set size) and
     /// [`Self::model_shrink_rate`] (to `1 / (2n)`) even when the caller supplied
@@ -622,6 +635,8 @@ impl Default for ExtraBoostParams {
             // the builder owns.
             diffusion_temperature: 0.0,
             posterior_sampling: false,
+            // `0` == "all available cores", upstream's `-1`.
+            thread_count: 0,
         }
     }
 }
@@ -3871,7 +3886,7 @@ fn last_tree_eval_contribution(
 /// - [`CbError::Degenerate`] on an empty dataset or a level with no candidate
 ///   split.
 /// - Any error the runtime's `compute_gradients` surfaces.
-pub fn train<R: Runtime>(
+pub fn train<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -3911,7 +3926,7 @@ pub fn train<R: Runtime>(
 /// ([`CbError::Degenerate`] for Wilcoxon without a test set) or a degenerate eval
 /// set ([`CbError::Degenerate`] from the metric).
 #[allow(clippy::too_many_arguments)]
-pub fn train_with_eval<R: Runtime>(
+pub fn train_with_eval<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -3974,7 +3989,7 @@ pub fn train_with_eval<R: Runtime>(
 /// ([`CbError::Degenerate`] for Wilcoxon without a test set) or a degenerate eval
 /// set ([`CbError::Degenerate`] from the metric).
 #[allow(clippy::too_many_arguments)]
-pub fn train_with_eval_sets<R: Runtime>(
+pub fn train_with_eval_sets<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -4019,7 +4034,7 @@ pub fn train_with_eval_sets<R: Runtime>(
 /// As [`train`], plus [`CbError::Degenerate`] / [`CbError::OutOfRange`] from
 /// [`build_query_info`] on malformed group/pair structure.
 #[allow(clippy::too_many_arguments)]
-pub fn train_ranking<R: Runtime>(
+pub fn train_ranking<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -4073,7 +4088,7 @@ pub fn train_ranking<R: Runtime>(
 /// column exceeding the perfect-hash `u32::MAX` bound, or any error
 /// [`crate::materialize_ctr_feature`] / [`crate::bake_ctr_table`] surfaces.
 #[allow(clippy::too_many_arguments)]
-pub fn train_cat<R: Runtime>(
+pub fn train_cat<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -4113,7 +4128,7 @@ pub fn train_cat<R: Runtime>(
 /// As [`train_cat`], plus [`CbError::LengthMismatch`] if any eval set's
 /// categorical column length disagrees with that set's target length.
 #[allow(clippy::too_many_arguments)]
-pub fn train_cat_with_eval_sets<R: Runtime>(
+pub fn train_cat_with_eval_sets<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -4176,7 +4191,7 @@ pub fn train_cat_with_eval_sets<R: Runtime>(
 /// file is written), if the existing snapshot's fingerprint does not match this
 /// run's, or on any snapshot I/O / codec failure. Otherwise the same errors as
 /// [`train`].
-pub fn train_with_snapshot<R: Runtime>(
+pub fn train_with_snapshot<R: Runtime + Sync>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],
@@ -4618,7 +4633,77 @@ fn snapshot_scope_ok(
 /// [`tensor_ctr_candidates`], and materializes a per-candidate combined-projection
 /// online CTR feature column ([`crate::materialize_ctr_feature`]).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn train_inner<R: Runtime>(
+/// `thread_count` entry point: run the whole fit inside a rayon pool of exactly
+/// the requested size, then delegate to the unchanged implementation.
+///
+/// A dedicated pool (rather than the global one) is what makes the knob
+/// per-fit and composable — two concurrently fitting models can ask for
+/// different thread counts, and `cv` / `grid_search` fitting folds in parallel
+/// are not silently overridden.
+///
+/// `thread_count == 0` means "all cores": no pool is built and the global rayon
+/// pool is used exactly as before, so the default path is untouched.
+///
+/// This CANNOT change the model — see [`ExtraBoostParams::thread_count`]. It only
+/// bounds how many workers the parallel-over-features passes may occupy.
+#[allow(clippy::too_many_arguments)]
+fn train_inner<R: Runtime + Sync>(
+    runtime: &R,
+    feature_values: &[Vec<f32>],
+    feature_borders: &[Vec<f64>],
+    cat_columns: &[Vec<String>],
+    target: &[f64],
+    weights: &[f64],
+    params: &BoostParams,
+    staged_out: Option<&mut Vec<f64>>,
+    eval_sets: &[EvalSet],
+    history: Option<&mut EvalMetricHistory>,
+    ranking: RankingData,
+    snapshot: Option<&crate::snapshot::SnapshotConfig>,
+) -> CbResult<(Model, BakedCtrData)> {
+    let requested = params.extra.thread_count;
+    if requested == 0 {
+        return train_inner_impl(
+            runtime,
+            feature_values,
+            feature_borders,
+            cat_columns,
+            target,
+            weights,
+            params,
+            staged_out,
+            eval_sets,
+            history,
+            ranking,
+            snapshot,
+        );
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(requested)
+        .build()
+        .map_err(|e| {
+            CbError::Unsupported(format!("could not create a {requested}-thread pool: {e}"))
+        })?;
+    pool.install(move || {
+        train_inner_impl(
+            runtime,
+            feature_values,
+            feature_borders,
+            cat_columns,
+            target,
+            weights,
+            params,
+            staged_out,
+            eval_sets,
+            history,
+            ranking,
+            snapshot,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn train_inner_impl<R: Runtime>(
     runtime: &R,
     feature_values: &[Vec<f32>],
     feature_borders: &[Vec<f64>],

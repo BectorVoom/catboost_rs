@@ -256,6 +256,16 @@ const IMPLEMENTED: &[&str] = &[
     // value rather than silently ignoring it (their per-level draw accounting
     // against upstream is not established).
     "rsm",
+    // `thread_count`: how many worker threads a fit may use. GENUINELY consumed —
+    // the fit runs inside a pool of exactly this size — but numerically INERT by
+    // construction, which is the whole point: upstream measures max|diff| = 0
+    // across {1, 2, 4, 8, 16, -1} and this engine asserts the same invariance
+    // under bootstrap / random_strength / rsm, the configurations where a
+    // thread-order dependency would actually surface.
+    //
+    // `-1` (upstream's default, "all cores") is accepted and mapped to the
+    // engine's `0`.
+    "thread_count",
 ];
 
 /// The parameters upstream allows only ONE of. Passing two raises:
@@ -1391,6 +1401,18 @@ pub(crate) fn make_builder(
         // 0 < subsample <= 1.
         check_range("subsample", v, 0.0, 1.0, false)?;
         builder = builder.subsample(v);
+    }
+    if let Some(v) = get_with_aliases::<i64>(params, py, "thread_count")? {
+        // Upstream spells "all cores" as `-1`; the engine spells it `0`. Any other
+        // negative value is a typo rather than a request, so it is refused instead
+        // of silently collapsing to "all cores".
+        if v < -1 {
+            return Err(CatBoostParameterError::new_err(format!(
+                "thread_count must be -1 (all cores) or a positive count; got {v}"
+            )));
+        }
+        let resolved = if v < 0 { 0 } else { usize::try_from(v).unwrap_or(0) };
+        builder = builder.thread_count(resolved);
     }
     if let Some(v) = get_with_aliases::<f64>(params, py, "rsm")? {
         // 0 < rsm <= 1 — upstream's own range (`Rsm should be in (0, 1]`,

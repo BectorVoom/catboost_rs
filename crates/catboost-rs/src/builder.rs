@@ -112,6 +112,8 @@ pub struct CatBoostBuilder {
     diffusion_temperature: Option<f64>,
     /// The SGLB preset (`posterior_sampling`).
     posterior_sampling: bool,
+    /// Worker-thread cap (`thread_count`); `0` means all cores.
+    thread_count: usize,
     /// How that shrinkage decays (`model_shrink_mode`).
     model_shrink_mode: EModelShrinkMode,
     /// Leaf refinement steps per tree (`leaf_estimation_iterations`).
@@ -367,6 +369,7 @@ impl CatBoostBuilder {
             langevin: None,
             diffusion_temperature: None,
             posterior_sampling: false,
+            thread_count: 0,
             model_shrink_mode: EModelShrinkMode::Constant,
             leaf_estimation_iterations: 1,
             random_score_type: ERandomScoreType::NormalWithModelSizeDecrease,
@@ -656,6 +659,24 @@ impl CatBoostBuilder {
     #[must_use]
     pub fn diffusion_temperature(mut self, diffusion_temperature: f64) -> Self {
         self.diffusion_temperature = Some(diffusion_temperature);
+        self
+    }
+
+    /// How many worker threads the fit may use (`thread_count`). `0` — the
+    /// default — means "as many as the machine has", which is upstream's `-1`.
+    ///
+    /// This CANNOT change the model. Every parallelised loop here blocks on
+    /// CONSTANT block sizes rather than the thread count, so neither the RNG
+    /// stream nor any reduction order depends on it; catboost 1.2.10 measures
+    /// max|diff| = 0 across `thread_count` ∈ {1, 2, 4, 8, 16, -1} and this engine
+    /// asserts the same invariance. Treat it purely as a resource knob — useful
+    /// for leaving cores free, or for making a benchmark reproducible.
+    ///
+    /// Each fit gets its OWN pool, so two concurrent fits can ask for different
+    /// counts and a parallel `cv` / `grid_search` is not silently overridden.
+    #[must_use]
+    pub fn thread_count(mut self, thread_count: usize) -> Self {
+        self.thread_count = thread_count;
         self
     }
 
@@ -1332,6 +1353,7 @@ impl CatBoostBuilder {
                 langevin,
                 diffusion_temperature,
                 posterior_sampling: self.posterior_sampling,
+                thread_count: self.thread_count,
                 allow_const_label: self.allow_const_label,
                 model_size_reg: self.model_size_reg,
             },

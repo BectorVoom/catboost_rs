@@ -95,8 +95,9 @@ fn known_not_yet_params_tag_known_not_yet() {
         "used_ram_limit",
         // `rsm` LEFT this list when per-level feature subsampling shipped.
         "ctr_leaf_count_limit",
-        "thread_count",
+        // `thread_count` LEFT this list when the per-fit thread pool shipped.
         "approx_on_full_history",
+        "store_all_simple_ctr",
     ] {
         assert_eq!(
             status_of(name),
