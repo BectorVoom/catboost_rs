@@ -29,11 +29,36 @@ use crate::kernels::{
     poisson_gradient_kernel, poisson_hessian_kernel, quantile_gradient_kernel,
     tweedie_gradient_kernel, tweedie_hessian_kernel,
 };
+use crate::launch_geometry::launch_1d;
 
-/// Launch geometry: threads per cube (the cube `x` dimension) shared by every
-/// launch helper below. Extracted to a single constant (IN-02) so the launch
-/// geometry lives in one place instead of being repeated verbatim per helper.
-const CUBE_DIM: usize = 32;
+/// Approximate scalar operations one lane of an elementwise loss kernel performs,
+/// the `work_per_lane` argument every helper below passes to [`launch_1d`].
+///
+/// `16` is CALIBRATED, not counted. The instruction count per lane ranges from one
+/// subtraction (`target - approx`) to an f64 `exp` plus a divide (Logloss, Poisson,
+/// Tweedie), so no single honest static number exists; what the constant really has to
+/// do is put the unit count in the right place across the range of `n` a fit actually
+/// sees. Measured on the 16-core dev box, `compute_gradients(Logloss)`, best-of-3 in
+/// ms/call:
+///
+/// | n         |  wpl=4 | wpl=16 |  wpl=64 |
+/// |-----------|--------|--------|---------|
+/// | 10 000    |  0.250 |  0.434 |   2.638 |
+/// | 50 000    |  2.850 |  1.449 |   2.448 |
+/// | 100 000   |  6.610 |  3.238 |   4.668 |
+/// | 300 000   | 15.698 | 11.323 |  14.160 |
+/// | 1 000 000 | 46.305 | 36.204 |  45.276 |
+///
+/// `4` was the first estimate and it is the wrong answer: it under-parallelizes the
+/// mid-range, reaching only 12 of 16 units at n=100k, which measured SLOWER than the
+/// hard-coded 32-wide geometry it replaced. `64` overshoots the other way and splits
+/// launches too small to pay for the split. `16` is the only one of the three that
+/// beats the old geometry at every size tested.
+///
+/// This replaces the former `const CUBE_DIM: usize = 32`, which fixed the geometry
+/// regardless of both the hardware and `n`. See [`crate::launch_geometry`] for the
+/// cost model that motivates the change.
+const ELEMENTWISE_WORK_PER_LANE: usize = 16;
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
 /// the actual CubeCL client is created per call from the default device (the
@@ -56,14 +81,7 @@ fn launch_binary_f64(
     let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let cube_dim = CUBE_DIM;
-    let num_cubes = n.div_ceil(cube_dim).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: cube_dim as u32,
-        y: 1,
-        z: 1,
-    };
+    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
 
     match kernel {
         BinaryKernel::RmseGradient => gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
@@ -163,17 +181,12 @@ fn launch_logloss_hessian(approx: &[f64]) -> CbResult<Vec<f64>> {
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let cube_dim = CUBE_DIM;
-    let num_cubes = n.div_ceil(cube_dim).max(1);
+    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
 
     logloss_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
         &client,
-        CubeCount::Static(num_cubes as u32, 1, 1),
-        CubeDim {
-            x: cube_dim as u32,
-            y: 1,
-            z: 1,
-        },
+        count,
+        dim,
         unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
     );
@@ -200,17 +213,12 @@ fn launch_poisson_hessian(approx: &[f64]) -> CbResult<Vec<f64>> {
     let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let cube_dim = CUBE_DIM;
-    let num_cubes = n.div_ceil(cube_dim).max(1);
+    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
 
     poisson_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
         &client,
-        CubeCount::Static(num_cubes as u32, 1, 1),
-        CubeDim {
-            x: cube_dim as u32,
-            y: 1,
-            z: 1,
-        },
+        count,
+        dim,
         unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
     );
@@ -248,14 +256,7 @@ fn launch_focal_f64(
     let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
     let gamma_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![gamma]));
 
-    let cube_dim = CUBE_DIM;
-    let num_cubes = n.div_ceil(cube_dim).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: cube_dim as u32,
-        y: 1,
-        z: 1,
-    };
+    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
 
     if hessian {
         focal_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
@@ -316,17 +317,12 @@ fn launch_quantile_f64(
     let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
     let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
 
-    let cube_dim = CUBE_DIM;
-    let num_cubes = n.div_ceil(cube_dim).max(1);
+    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
 
     quantile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
         &client,
-        CubeCount::Static(num_cubes as u32, 1, 1),
-        CubeDim {
-            x: cube_dim as u32,
-            y: 1,
-            z: 1,
-        },
+        count,
+        dim,
         unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
         unsafe { ArrayArg::from_raw_parts(target_handle, n) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
@@ -383,14 +379,7 @@ fn launch_param_f64(
     // ScalarArgType bound).
     let param_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![param]));
 
-    let cube_dim = CUBE_DIM;
-    let num_cubes = n.div_ceil(cube_dim).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: cube_dim as u32,
-        y: 1,
-        z: 1,
-    };
+    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
 
     let approx_arg = unsafe { ArrayArg::from_raw_parts(approx_handle, n) };
     let target_arg = unsafe { ArrayArg::from_raw_parts(target_handle, n) };

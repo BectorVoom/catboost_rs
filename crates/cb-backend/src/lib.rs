@@ -27,6 +27,23 @@ pub mod kernels;
 #[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
 pub mod gpu_runtime;
 
+/// Hardware-adaptive launch geometry for the ORDER-INDEPENDENT elementwise kernels.
+/// Replaces the hard-coded `CUBE_DIM = 32` cube width with one derived from the
+/// runtime's own reported hardware: plane-aligned on GPU, work-proportional on the
+/// CubeCL CPU runtime, whose per-launch host cost is O(cube_dim) OS-thread tasks
+/// (`cubecl-cpu` `runner.rs::execute_data`) and whose worker pool GROWS to match the
+/// cube width. Deliberately NOT used by the geometry-pinned Poisson draw, the
+/// shared-memory float block-reduce family, or the tuned histogram family — see the
+/// module docs. Mounted under every backend with the same gate as `kernels`.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+mod launch_geometry;
+
+#[cfg(all(
+    test,
+    any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm")
+))]
+mod launch_geometry_test;
+
 /// The CubeCL `CpuRuntime` as `cb-compute`'s abstract `Runtime` (D-01/D-03):
 /// launches the elementwise `#[cube]` kernels and returns UN-reduced per-object
 /// buffers for the host to fold (D-02). The GPU runtimes implement the same

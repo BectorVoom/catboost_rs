@@ -1,0 +1,49 @@
+# CubeCL runtime configuration — found by `from_current_dir()`, which walks UP from
+# the PROCESS's working directory to the filesystem root looking for `cubecl.toml`.
+# `cargo test -p <pkg>` runs each test binary with cwd = `crates/<pkg>/`, so the walk
+# reaches this repo-root file from every package. A binary launched from outside the
+# repo will NOT find it and silently falls back to defaults (there is no diagnostic
+# for a missing or unparsed config).
+
+[compilation]
+# The compiled-kernel cache is `Option<CacheConfig>` and defaults to `None` — i.e.
+# OFF — while the autotune cache next to it is a plain `CacheConfig` defaulting to
+# `Target`, i.e. ON. That asymmetry is why this repo looked like it already had
+# caching (autotune results were on disk) while every process still paid full hipRTC
+# JIT for all ~280 kernel specialisations.
+#
+# "global" rather than "target" is deliberate, for two repo-specific reasons:
+#
+#   1. ONE cache across packages. `CacheConfig::Target` resolves against the nearest
+#      `Cargo.toml` ABOVE THE CWD, which under `cargo test -p <pkg>` is the package
+#      manifest, not the workspace root — so it would create a separate, cold
+#      `crates/cb-backend/target/hip/` and `crates/cb-train/target/hip/`. The device
+#      suite (`run_device_tests.sh`) runs 30+ binaries split across exactly those two
+#      packages and they launch overlapping kernels, so splitting the cache halves
+#      the hit rate for no benefit.
+#   2. It survives `cargo clean`. This workspace's documented failure mode is `target/`
+#      growing to hundreds of GB and exhausting the disk, so `target/` gets wiped
+#      routinely; a cache living there is wiped with it. The kernel cache is ~7 MB.
+#
+# Safety: the cache key is `KernelId::stable_hash()` — the same identity that already
+# separates two `#[comptime]` specialisations of one `#[cube]` fn, so two kernels that
+# would collide here could never have shared an in-memory entry either. The directory
+# is versioned per CubeCL release (`<root>/hip/0.10.0/hip-kernel/`), so an upgrade
+# starts cold rather than loading stale binaries.
+#
+# ⚠️ The key does NOT cover the hipRTC environment. `HIPRTC_COMPILE_OPTIONS_APPEND`
+# (e.g. `-ffp-contract=off`, which changes FP RESULTS by suppressing a*b+c → fma
+# contraction) is invisible to it: a cache populated without the flag is served back
+# unchanged to a run that sets it, silently, with different numbers. If you ever change
+# that variable, `rm -rf ~/.config/hip` first, exactly as you would for a
+# toolchain upgrade.
+#
+# NOTE on the path: `CacheConfig::Global` resolves to `dirs::config_local_dir()`
+# VERBATIM — it appends no "cubecl" component — so on Linux the cache lands at
+# `~/.config/hip/0.10.0/hip-kernel/` (a `chunk<N>.cbor` blob plus a `toc.json.log`
+# index), not under `~/.cache`. Measured here: 217 kernel specialisations, 2.4 MB.
+#
+# Backends that honour this: hip (device binaries) and cuda (PTX) always; wgpu only
+# with the `spirv` feature; the cpu runtime never (it holds MLIR in a process-local
+# HashMap), so the default `cargo test` lane is unaffected either way.
+cache = "global"
