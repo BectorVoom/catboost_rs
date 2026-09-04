@@ -133,10 +133,14 @@ pub(crate) fn launch_1d<R: Runtime>(
     lanes: usize,
     work_per_lane: usize,
 ) -> (CubeCount, CubeDim) {
-    let cube_dim = if has_planes(client) {
+    // Read the device properties ONCE and reuse them for both the plane check and the
+    // CPU core count below, rather than paying a second `client.properties()` call.
+    let hardware = &client.properties().hardware;
+    let on_gpu = hardware.plane_size_max > 1;
+
+    let cube_dim = if on_gpu {
         CubeDim::new(client, lanes.max(1))
     } else {
-        let hardware = &client.properties().hardware;
         let cores = hardware.num_cpu_cores.unwrap_or(1).max(1) as usize;
         let total = lanes.saturating_mul(work_per_lane.max(1));
         // `cores.min(lanes.max(1))` is the upper clamp: never more units than cores,
@@ -145,11 +149,21 @@ pub(crate) fn launch_1d<R: Runtime>(
         CubeDim::new_1d((units as u32).min(CPU_CUBE_DIM_MAX))
     };
 
-    // Cover `lanes` with this width. Computed here rather than through
-    // `calculate_cube_count_elemwise` so the `lanes == 0` case stays a 1-cube launch
-    // (that helper returns `CubeCount::Static(0, 0, 0)` for an empty span).
-    let per_cube = cube_dim.num_elems().max(1) as usize;
-    let num_cubes = lanes.div_ceil(per_cube).max(1);
+    // `lanes.max(1)` keeps the `lanes == 0` case a launchable 1-cube grid (the HIP
+    // backend is unforgiving about zero-extent work) rather than
+    // `calculate_cube_count_elemwise`'s own `CubeCount::Static(0, 0, 0)` short-circuit
+    // for a truly empty span.
+    //
+    // Routing through cubecl-core's own helper — instead of packing the whole cube
+    // count into the x dimension by hand — spreads a large cube count across x/y/z so
+    // it respects the device's per-dimension `hardware.max_cube_count` (e.g. WebGPU's
+    // ~65535-per-dimension cap). This is safe for every kernel this helper serves
+    // because `ABSOLUTE_POS` is the fully linearized unit index across the WHOLE grid
+    // ("the position of the working unit in the whole cube kernel, without regards to
+    // cubes and axis" — cubecl-core's own doc), so an elementwise
+    // `out[ABSOLUTE_POS] = ..` kernel is indifferent to how the cube count is factored
+    // across dimensions.
+    let cube_count = cubecl::calculate_cube_count_elemwise(client, lanes.max(1), cube_dim);
 
-    (CubeCount::Static(num_cubes as u32, 1, 1), cube_dim)
+    (cube_count, cube_dim)
 }

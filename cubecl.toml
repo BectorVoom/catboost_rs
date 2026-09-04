@@ -38,6 +38,24 @@
 # that variable, `rm -rf ~/.config/hip` first, exactly as you would for a
 # toolchain upgrade.
 #
+# ⚠️ The key also does NOT cover the target GPU architecture (`KernelId::stable_hash()`
+# hashes `type_name`/`address_type`/`cube_dim`/`mode`/`info` only — verified against
+# `cubecl-runtime-0.10.0/src/id.rs`; there is no arch field to hash, and no
+# `--offload-arch` is passed to hipRTC either — cubecl-hip auto-targets whatever
+# `gcnArchName` the HIP driver reports for the CURRENT device, so the same kernel
+# compiles to a different binary on a different architecture). This project's dev
+# machines include hosts on both gfx1100 and gfx1151. `~/.config/hip/0.10.0/hip-kernel/`
+# is PER-HOST (each machine has its own home directory / config dir), so an ordinary
+# local setup never mixes architectures in one cache. The risk is narrow — only a home
+# directory or this cache path SHARED across hosts with different GPU architectures
+# (an NFS-mounted home, a synced dev container image, a container image baked on one
+# arch and run on another) could serve a wrong-ISA binary back to `hipModuleLoadData`.
+# In practice `hipModuleLoadData` typically rejects a mismatched code object with a
+# loud `CompilationError` rather than computing wrong results, but do not rely on that:
+# if you ever share this cache path across differing GPU architectures, `rm -rf
+# ~/.config/hip` first — the SAME remedy as the hipRTC-environment caveat above, and for
+# the same reason (an external factor the cache key cannot see).
+#
 # NOTE on the path: `CacheConfig::Global` resolves to `dirs::config_local_dir()`
 # VERBATIM — it appends no "cubecl" component — so on Linux the cache lands at
 # `~/.config/hip/0.10.0/hip-kernel/` (a `chunk<N>.cbor` blob plus a `toc.json.log`

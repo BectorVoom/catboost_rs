@@ -1,11 +1,35 @@
 //! IN-03: Phase 7.2 device-resident der1/der2 seam, mechanically relocated out of the
-//! oversized `gpu_runtime.rs` with ZERO logic changes. `DerBinaryKernel` /
-//! `DerUnaryKernel` / `DerParamKernel` and the `launch_der_*` helpers are re-exported
-//! from `gpu_runtime` (`pub use der_seams::*`) so every existing `crate::gpu_runtime::X`
-//! path still resolves. `use super::*` brings in the shared parent items (`CUBE_DIM`,
-//! `launch_block_reduce_f64`, the cubecl/cb-core imports) this seam consumes.
+//! oversized `gpu_runtime.rs`. `DerBinaryKernel` / `DerUnaryKernel` / `DerParamKernel`
+//! and the `launch_der_*` helpers are re-exported from `gpu_runtime` (`pub use
+//! der_seams::*`) so every existing `crate::gpu_runtime::X` path still resolves. `use
+//! super::*` brings in the shared parent items (`launch_block_reduce_f64`, the
+//! cubecl/cb-core imports) this seam consumes.
+//!
+//! Launch geometry for the der1/der2 kernels below now goes through
+//! [`crate::launch_geometry::launch_1d`] rather than the parent module's fixed
+//! `CUBE_DIM` width: every kernel here is order-independent, one-write-per-lane
+//! (`out[ABSOLUTE_POS] = f(..)`, no reduction/atomic) — the exact shape
+//! `launch_geometry` documents as safe to re-geometry, and the SAME kernels
+//! (`gradient_kernel`, `logloss_gradient_kernel`, `logloss_hessian_kernel`,
+//! `quantile_gradient_kernel`, `focal_gradient_kernel`, `focal_hessian_kernel`) already
+//! ride `launch_1d` from the CPU backend (`cpu_runtime.rs`). `CHEAP_WORK_PER_LANE` /
+//! `WORK_PER_LANE` below mirror that module's two calibrated tiers.
 #![allow(unused_imports)]
 use super::*;
+
+/// Cheap-tier per-lane work for [`crate::launch_geometry::launch_1d`]: pure
+/// arithmetic/compare, no transcendental call — the RMSE gradient (`target -
+/// approx`) and the Quantile gradient (compare-and-select). Mirrors
+/// `cpu_runtime::CHEAP_ELEMENTWISE_WORK_PER_LANE`; kept as a local constant
+/// (rather than importing that private item) since the two modules share the
+/// value by convention, not by a coupling either enforces.
+const CHEAP_WORK_PER_LANE: usize = 4;
+
+/// Transcendental-tier per-lane work for [`crate::launch_geometry::launch_1d`]:
+/// the Logloss gradient/hessian (`exp`) and Focal gradient/hessian (`exp` +
+/// `powf` + `ln`). Mirrors `cpu_runtime::ELEMENTWISE_WORK_PER_LANE` — see that
+/// constant's doc for the calibration this value is anchored to.
+const WORK_PER_LANE: usize = 16;
 
 /// Which elementwise binary `(approx, target) -> der1` kernel the device-resident
 /// der seam launches (Phase 7.2, GPU-01 der). This is the GPU analog of the
@@ -125,13 +149,14 @@ pub(crate) fn launch_der_binary_into(
     // The der output is per-element (length `n`), NOT one slot per cube.
     let out_handle = client.empty(n * std::mem::size_of::<f64>());
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: CUBE_DIM as u32,
-        y: 1,
-        z: 1,
+    // Order-independent, one-write-per-lane elementwise kernel (the same shape
+    // `cpu_runtime.rs`'s launches serve) — adaptive geometry via `launch_1d`
+    // instead of the fixed `CUBE_DIM` width, per kernel's per-lane cost.
+    let work_per_lane = match kernel {
+        DerBinaryKernel::RmseGradient => CHEAP_WORK_PER_LANE,
+        DerBinaryKernel::LoglossGradient => WORK_PER_LANE,
     };
+    let (count, dim) = crate::launch_geometry::launch_1d(client, n, work_per_lane);
 
     // `from_raw_parts` consumes the handle; clone the output so the original stays
     // returnable on-device (the 7.1 idiom). NO `read_one` here (SC-3). The
@@ -198,13 +223,13 @@ pub(crate) fn launch_der_binary_resident(
     {
         // The der output is per-element (length `n`), NOT one slot per cube.
         let out_handle = client.empty(n * std::mem::size_of::<f64>());
-        let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-        let count = CubeCount::Static(num_cubes as u32, 1, 1);
-        let dim = CubeDim {
-            x: CUBE_DIM as u32,
-            y: 1,
-            z: 1,
+        // Order-independent elementwise kernel — adaptive geometry via `launch_1d`
+        // (see `launch_der_binary_into`), not the fixed `CUBE_DIM` width.
+        let work_per_lane = match kernel {
+            DerBinaryKernel::RmseGradient => CHEAP_WORK_PER_LANE,
+            DerBinaryKernel::LoglossGradient => WORK_PER_LANE,
         };
+        let (count, dim) = crate::launch_geometry::launch_1d(client, n, work_per_lane);
         // `from_raw_parts` consumes each input handle; clone the output so the original
         // stays returnable on-device. NO `read_one` here (SC-3). Each match arm consumes
         // approx_h/target_h — mutually exclusive at runtime, so the moves do not conflict.
@@ -248,9 +273,10 @@ pub(crate) fn launch_der_binary_resident(
 /// already routed through it at `(QUANTILE_ALPHA, QUANTILE_DELTA)`. Only the resident
 /// LAUNCHER was missing.
 ///
-/// Mirrors [`launch_der_binary_resident`]'s geometry exactly (same `CUBE_DIM`, same
-/// per-element output length, same no-read-back discipline); only the parameter buffers
-/// differ. `n == 0` short-circuits to a zero-length handle with no launch.
+/// Mirrors [`launch_der_binary_resident`]'s geometry mechanism (adaptive `launch_1d`,
+/// same per-element output length, same no-read-back discipline); only the parameter
+/// buffers and the per-kernel work-per-lane tier differ. `n == 0` short-circuits to a
+/// zero-length handle with no launch.
 ///
 /// # Errors
 /// Returns [`CbError::OutOfRange`] on wgpu (no f64 channel, WR-02) or when `params` is
@@ -281,13 +307,9 @@ pub(crate) fn launch_der_param_resident(
     #[cfg(not(feature = "wgpu"))]
     {
         let out_handle = client.empty(n * std::mem::size_of::<f64>());
-        let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-        let count = CubeCount::Static(num_cubes as u32, 1, 1);
-        let dim = CubeDim {
-            x: CUBE_DIM as u32,
-            y: 1,
-            z: 1,
-        };
+        // The only arm this function actually launches is QuantileGradient (Focal
+        // rejects below) — compare-and-select, no transcendental, the cheap tier.
+        let (count, dim) = crate::launch_geometry::launch_1d(client, n, CHEAP_WORK_PER_LANE);
         match kernel {
             DerParamKernel::QuantileGradient => {
                 let (alpha, delta) = param_pair(params, "QuantileGradient")?;
@@ -432,13 +454,8 @@ fn launch_der_unary_into(
     // The der output is per-element (length `n`), NOT one slot per cube.
     let out_handle = client.empty(n * std::mem::size_of::<f64>());
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: CUBE_DIM as u32,
-        y: 1,
-        z: 1,
-    };
+    // The only arm is LoglossHessian (`exp`) — the transcendental tier.
+    let (count, dim) = crate::launch_geometry::launch_1d(client, n, WORK_PER_LANE);
 
     match kernel {
         DerUnaryKernel::LoglossHessian => logloss_hessian_kernel::launch::<f64, SelectedRuntime>(
@@ -603,13 +620,13 @@ fn launch_der_param_into(
     let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
     let out_handle = client.empty(n * std::mem::size_of::<f64>());
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
-    let count = CubeCount::Static(num_cubes as u32, 1, 1);
-    let dim = CubeDim {
-        x: CUBE_DIM as u32,
-        y: 1,
-        z: 1,
+    // Quantile is compare-and-select (cheap); Focal carries `exp`/`powf`/`ln`
+    // (transcendental) — see the module-level tier constants above.
+    let work_per_lane = match kernel {
+        DerParamKernel::QuantileGradient => CHEAP_WORK_PER_LANE,
+        DerParamKernel::FocalGradient | DerParamKernel::FocalHessian => WORK_PER_LANE,
     };
+    let (count, dim) = crate::launch_geometry::launch_1d(client, n, work_per_lane);
 
     match kernel {
         DerParamKernel::QuantileGradient => {

@@ -58,7 +58,33 @@ use crate::launch_geometry::launch_1d;
 /// This replaces the former `const CUBE_DIM: usize = 32`, which fixed the geometry
 /// regardless of both the hardware and `n`. See [`crate::launch_geometry`] for the
 /// cost model that motivates the change.
+///
+/// This is the TRANSCENDENTAL tier: every kernel routed through it contains an f64
+/// `exp`/`tanh`/`ln`/`powf` (Logloss, Focal, LogCosh, Lq, Poisson, Tweedie). Kernels
+/// that are pure arithmetic/branch with no transcendental call (RMSE, MAPE,
+/// Quantile/MAE, Huber, Expectile) use [`CHEAP_ELEMENTWISE_WORK_PER_LANE`] instead —
+/// see that constant for why blending the two tiers is wrong, not just imprecise.
 const ELEMENTWISE_WORK_PER_LANE: usize = 16;
+
+/// Scalar element-operations one CPU unit should be worth for a CHEAP elementwise
+/// kernel: pure arithmetic and/or a branch, no transcendental call. `target - approx`
+/// (RMSE), a sign/compare/divide (MAPE), or a compare-and-select (Quantile/MAE, Huber,
+/// Expectile) is on the order of a handful of scalar ops, not the ~20-30 cycles an f64
+/// `exp` plus a divide costs (the workload [`ELEMENTWISE_WORK_PER_LANE`] is calibrated
+/// against).
+///
+/// This value is an ANALYTICAL estimate from the kernel's own instruction count (see
+/// `kernels.rs`: `gradient_kernel`/`mape_gradient_kernel`/`quantile_gradient_kernel`/
+/// `huber_*_kernel`/`expectile_*_kernel` bodies), not a re-run of the
+/// [`ELEMENTWISE_WORK_PER_LANE`] benchmark on this per-kernel workload — that table was
+/// measured against Logloss, whose true per-lane cost is close to its 16. Using that
+/// SAME 16 for a ~1-op kernel overstates its true cost 16x, which understates how far
+/// `n` must grow before a second CPU unit earns back its dispatch overhead, i.e. it
+/// would parallelize a cheap kernel earlier than the real workload justifies. `4` is a
+/// deliberately conservative floor above the true op count (not `1`), so a
+/// mis-estimate errs toward under- rather than over-parallelizing — the safe direction
+/// for this module's whole thesis (dispatch overhead dominates below the threshold).
+const CHEAP_ELEMENTWISE_WORK_PER_LANE: usize = 4;
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
 /// the actual CubeCL client is created per call from the default device (the
@@ -67,11 +93,15 @@ const ELEMENTWISE_WORK_PER_LANE: usize = 16;
 pub struct CpuBackend;
 
 /// Launch a single elementwise `der1 = f(approx, target)` kernel on `CpuRuntime`
-/// and read back the `f64` output, in object order.
+/// and read back the `f64` output, in object order. `work_per_lane` is the caller's
+/// classification of `kernel`'s per-lane cost — [`ELEMENTWISE_WORK_PER_LANE`] for a
+/// kernel with a transcendental call, [`CHEAP_ELEMENTWISE_WORK_PER_LANE`] for pure
+/// arithmetic/branch — so one shared launch helper still gets per-kernel geometry.
 fn launch_binary_f64(
     approx: &[f64],
     target: &[f64],
     kernel: BinaryKernel,
+    work_per_lane: usize,
 ) -> CbResult<Vec<f64>> {
     let n = approx.len();
     let device = cubecl::cpu::CpuDevice;
@@ -81,7 +111,7 @@ fn launch_binary_f64(
     let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
     let out_handle = client.empty(std::mem::size_of_val(approx));
 
-    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
+    let (count, dim) = launch_1d(&client, n, work_per_lane);
 
     match kernel {
         BinaryKernel::RmseGradient => gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
@@ -317,7 +347,8 @@ fn launch_quantile_f64(
     let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
     let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
 
-    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
+    // Quantile is compare-and-select only (no transcendental) — the cheap tier.
+    let (count, dim) = launch_1d(&client, n, CHEAP_ELEMENTWISE_WORK_PER_LANE);
 
     quantile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
         &client,
@@ -379,7 +410,13 @@ fn launch_param_f64(
     // ScalarArgType bound).
     let param_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![param]));
 
-    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
+    // Lq (`powf`) and Tweedie (two `exp`s) carry a transcendental; Huber and
+    // Expectile are compare/arithmetic only — the cheap tier.
+    let work_per_lane = match kind {
+        ParamKernel::Lq | ParamKernel::Tweedie => ELEMENTWISE_WORK_PER_LANE,
+        ParamKernel::Huber | ParamKernel::Expectile => CHEAP_ELEMENTWISE_WORK_PER_LANE,
+    };
+    let (count, dim) = launch_1d(&client, n, work_per_lane);
 
     let approx_arg = unsafe { ArrayArg::from_raw_parts(approx_handle, n) };
     let target_arg = unsafe { ArrayArg::from_raw_parts(target_handle, n) };
@@ -452,7 +489,12 @@ fn compute_gradients_one_dim(
 ) -> CbResult<(Vec<f64>, Vec<f64>)> {
     match *loss {
         Loss::Rmse => {
-            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::RmseGradient)?;
+            let der1 = launch_binary_f64(
+                approx_d,
+                target_d,
+                BinaryKernel::RmseGradient,
+                CHEAP_ELEMENTWISE_WORK_PER_LANE,
+            )?;
             // RMSE hessian is the constant -1.0 (no kernel needed).
             let der2 = vec![-1.0_f64; approx_d.len()];
             Ok((der1, der2))
@@ -460,7 +502,12 @@ fn compute_gradients_one_dim(
         // CrossEntropy shares Logloss's der1/der2 EXACTLY (D-09): reuse the
         // Logloss gradient + hessian kernels (no separate kernel needed).
         Loss::Logloss | Loss::CrossEntropy => {
-            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::LoglossGradient)?;
+            let der1 = launch_binary_f64(
+                approx_d,
+                target_d,
+                BinaryKernel::LoglossGradient,
+                ELEMENTWISE_WORK_PER_LANE,
+            )?;
             let der2 = launch_logloss_hessian(approx_d)?;
             Ok((der1, der2))
         }
@@ -493,8 +540,18 @@ fn compute_gradients_one_dim(
         // Wave-1 smooth losses (D-6.1-02): all four have a real der2, so each
         // launches BOTH a gradient and a hessian kernel.
         Loss::LogCosh => {
-            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::LogCoshGradient)?;
-            let der2 = launch_binary_f64(approx_d, target_d, BinaryKernel::LogCoshHessian)?;
+            let der1 = launch_binary_f64(
+                approx_d,
+                target_d,
+                BinaryKernel::LogCoshGradient,
+                ELEMENTWISE_WORK_PER_LANE,
+            )?;
+            let der2 = launch_binary_f64(
+                approx_d,
+                target_d,
+                BinaryKernel::LogCoshHessian,
+                ELEMENTWISE_WORK_PER_LANE,
+            )?;
             Ok((der1, der2))
         }
         Loss::Lq { q } => {
@@ -516,7 +573,12 @@ fn compute_gradients_one_dim(
         // Poisson: exp-link der (inline F::exp); gradient is a binary kernel,
         // the hessian is the unary -exp(approx) kernel (no target input).
         Loss::Poisson => {
-            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::PoissonGradient)?;
+            let der1 = launch_binary_f64(
+                approx_d,
+                target_d,
+                BinaryKernel::PoissonGradient,
+                ELEMENTWISE_WORK_PER_LANE,
+            )?;
             let der2 = launch_poisson_hessian(approx_d)?;
             Ok((der1, der2))
         }
@@ -532,7 +594,12 @@ fn compute_gradients_one_dim(
         // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient
         // kernel; the hessian is the constant 0.0 vec (the Mae precedent).
         Loss::Mape => {
-            let der1 = launch_binary_f64(approx_d, target_d, BinaryKernel::MapeGradient)?;
+            let der1 = launch_binary_f64(
+                approx_d,
+                target_d,
+                BinaryKernel::MapeGradient,
+                CHEAP_ELEMENTWISE_WORK_PER_LANE,
+            )?;
             let der2 = vec![0.0_f64; approx_d.len()];
             Ok((der1, der2))
         }
