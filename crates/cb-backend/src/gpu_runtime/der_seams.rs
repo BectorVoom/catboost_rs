@@ -13,23 +13,23 @@
 //! (`gradient_kernel`, `logloss_gradient_kernel`, `logloss_hessian_kernel`,
 //! `quantile_gradient_kernel`, `focal_gradient_kernel`, `focal_hessian_kernel`) already
 //! ride `launch_1d` from the CPU backend (`cpu_runtime.rs`). `CHEAP_WORK_PER_LANE` /
-//! `WORK_PER_LANE` below mirror that module's two calibrated tiers.
+//! `WORK_PER_LANE` below are direct re-exports of that module's two calibrated
+//! tiers (not local copies) so the two backends can never drift out of sync.
 #![allow(unused_imports)]
 use super::*;
 
 /// Cheap-tier per-lane work for [`crate::launch_geometry::launch_1d`]: pure
 /// arithmetic/compare, no transcendental call — the RMSE gradient (`target -
-/// approx`) and the Quantile gradient (compare-and-select). Mirrors
-/// `cpu_runtime::CHEAP_ELEMENTWISE_WORK_PER_LANE`; kept as a local constant
-/// (rather than importing that private item) since the two modules share the
-/// value by convention, not by a coupling either enforces.
-const CHEAP_WORK_PER_LANE: usize = 4;
+/// approx`) and the Quantile gradient (compare-and-select). Re-exported from
+/// `cpu_runtime::CHEAP_ELEMENTWISE_WORK_PER_LANE` (rather than a local copy) so
+/// a future recalibration there cannot silently leave this seam on stale tuning.
+use crate::cpu_runtime::CHEAP_ELEMENTWISE_WORK_PER_LANE as CHEAP_WORK_PER_LANE;
 
 /// Transcendental-tier per-lane work for [`crate::launch_geometry::launch_1d`]:
 /// the Logloss gradient/hessian (`exp`) and Focal gradient/hessian (`exp` +
-/// `powf` + `ln`). Mirrors `cpu_runtime::ELEMENTWISE_WORK_PER_LANE` — see that
-/// constant's doc for the calibration this value is anchored to.
-const WORK_PER_LANE: usize = 16;
+/// `powf` + `ln`). Re-exported from `cpu_runtime::ELEMENTWISE_WORK_PER_LANE` —
+/// see that constant's doc for the calibration this value is anchored to.
+use crate::cpu_runtime::ELEMENTWISE_WORK_PER_LANE as WORK_PER_LANE;
 
 /// Which elementwise binary `(approx, target) -> der1` kernel the device-resident
 /// der seam launches (Phase 7.2, GPU-01 der). This is the GPU analog of the

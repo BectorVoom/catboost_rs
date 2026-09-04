@@ -64,7 +64,7 @@ use crate::launch_geometry::launch_1d;
 /// that are pure arithmetic/branch with no transcendental call (RMSE, MAPE,
 /// Quantile/MAE, Huber, Expectile) use [`CHEAP_ELEMENTWISE_WORK_PER_LANE`] instead —
 /// see that constant for why blending the two tiers is wrong, not just imprecise.
-const ELEMENTWISE_WORK_PER_LANE: usize = 16;
+pub(crate) const ELEMENTWISE_WORK_PER_LANE: usize = 16;
 
 /// Scalar element-operations one CPU unit should be worth for a CHEAP elementwise
 /// kernel: pure arithmetic and/or a branch, no transcendental call. `target - approx`
@@ -84,7 +84,7 @@ const ELEMENTWISE_WORK_PER_LANE: usize = 16;
 /// deliberately conservative floor above the true op count (not `1`), so a
 /// mis-estimate errs toward under- rather than over-parallelizing — the safe direction
 /// for this module's whole thesis (dispatch overhead dominates below the threshold).
-const CHEAP_ELEMENTWISE_WORK_PER_LANE: usize = 4;
+pub(crate) const CHEAP_ELEMENTWISE_WORK_PER_LANE: usize = 4;
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
 /// the actual CubeCL client is created per call from the default device (the
