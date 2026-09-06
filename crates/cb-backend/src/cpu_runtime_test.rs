@@ -613,6 +613,33 @@ fn host_der1(loss: &Loss, a: f64, t: f64) -> f64 {
             let sign = if t - a > 0.0 { 1.0 } else { -1.0 };
             sign / 1.0f64.max(t.abs())
         }
+        Loss::LogCosh => -(a - t).tanh(),
+        Loss::Lq { q } => {
+            let abs_loss = (a - t).abs();
+            let sign = if t - a > 0.0 { 1.0 } else { -1.0 };
+            q * sign * abs_loss.powf(q - 1.0)
+        }
+        Loss::Poisson => t - a.exp(),
+        Loss::Tweedie { variance_power: p } => {
+            let e1 = ((1.0 - p) * a).exp();
+            let e2 = ((2.0 - p) * a).exp();
+            t * e1 - e2
+        }
+        // Mirrors `focal_gradient_kernel` (error_functions.h:1684-1709 TFocalError)
+        // operation-for-operation, including the p_min clamp, so this is a bit-level
+        // transliteration rather than an independent derivation.
+        Loss::Focal { alpha, gamma } => {
+            let p_min = 1e-13;
+            let e = (-a).exp();
+            let p = (1.0 / (1.0 + e)).clamp(p_min, 1.0 - p_min);
+            let is_pos = t == 1.0;
+            let at = if is_pos { alpha } else { 1.0 - alpha };
+            let pt = if is_pos { p } else { 1.0 - p };
+            let y = 2.0 * t - 1.0;
+            let factor = (1.0 - pt).powf(gamma);
+            let inner = gamma * pt * pt.ln() + pt - 1.0;
+            -(at * y * factor * inner)
+        }
         _ => unreachable!("not a loss this reference covers"),
     }
 }
@@ -631,6 +658,11 @@ fn padded_tail_lengths_match_host_reference_for_every_kernel_family() {
         Loss::Quantile { alpha: 0.3, delta: 1e-6 },
         Loss::Expectile { alpha: 0.8 },
         Loss::Mape,
+        Loss::LogCosh,
+        Loss::Lq { q: 2.0 },
+        Loss::Poisson,
+        Loss::Tweedie { variance_power: 1.5 },
+        Loss::Focal { alpha: 0.25, gamma: 2.0 },
     ];
     for &n in &[1usize, 2, 3, 7, 8, 9, 15, 16, 17, 31, 33, 100, 1001] {
         // Deterministic, sign-mixed data with exact ties at every 5th object so the

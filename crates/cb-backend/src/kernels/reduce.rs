@@ -352,24 +352,20 @@ fn block_reduce_atomic_finalize_matches_cpu_sum_and_reports_variance() {
 /// finalize — the headline deliverable of commit 4916c8e — on the in-env hardware,
 /// regardless of the advertised capability. Without this, the gated oracle takes the
 /// deterministic host-sum branch and the atomic kernel is never launched in-env.
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn block_reduce_atomic_kernel_direct_matches_cpu_sum() {
     // Multi-cube input (300 elements -> ~10 cubes at CUBE_DIM 32) so several cubes
     // race to fetch_add into the single accumulator — the setup that drives the
     // cross-cube atomic finalize.
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` kernel at all. Unlike
-    // the sibling tests here, this one launches `block_reduce_atomic_kernel` DIRECTLY
-    // rather than through the capability-gated `launch_block_reduce_atomic_f64`, so
-    // nothing upstream would stop it — and on cubecl-cpu (no atomics of any type) the
+    // Unlike the sibling tests here, this one launches `block_reduce_atomic_kernel`
+    // DIRECTLY rather than through the capability-gated `launch_block_reduce_atomic_f64`,
+    // so nothing upstream would stop it — and on cubecl-cpu (no atomics of any type) the
     // unsupported-type panic lands on a device worker while the host blocks forever on
-    // that unit's mpsc receive, wedging the whole test binary.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[reduce] SKIP block_reduce_atomic_kernel_direct: backend advertises no \
-             channel-float atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    // that unit's mpsc receive, wedging the whole test binary. The `ignore` attribute
+    // above is what actually keeps this test from running on cpu; the macro below is
+    // defense-in-depth in case that attribute is ever removed.
+    crate::gpu_runtime::skip_unless_channel_atomics!();
 
     let input: Vec<f64> = (0..300).map(|k| ((k % 23) as f64) - 11.0 + 0.125 * (k as f64)).collect();
     let baseline = cb_core::sum_f64(&input);

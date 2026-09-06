@@ -246,19 +246,10 @@ fn reference_best_split(scores: &[f64], n_bins: usize, n_features: usize) -> Opt
     winner
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn score_l2_matches_cpu_oracle() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[score_split] SKIP score_l2_matches_cpu_oracle: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The device per-candidate L2 split score must match the ORDERED host reference
     // (`l2_split_score` over the SAME reduced LeafStats) within the REPORTED bound, over
     // the edge cases n=1, n=37 (non-cube-multiple), large N, plus the empty
@@ -315,19 +306,10 @@ fn score_l2_matches_cpu_oracle() {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn argmin_clear_margin_matches_select_best_candidate() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[score_split] SKIP argmin_clear_margin_matches_select_best_candidate: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // STRUCTURE is the STRICT bar (D-7.5-06): on a CLEAR-gain-margin fixture the device
     // argmin MUST pick the EXACT same (feature, bin) as the FROZEN CPU
     // `select_best_candidate` over the SAME ascending (feature, bin) candidate order. The
@@ -371,19 +353,10 @@ fn argmin_clear_margin_matches_select_best_candidate() {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn argmin_lowest_index_tie_break_matches_select_best_candidate() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[score_split] SKIP argmin_lowest_index_tie_break_matches_select_best_candidate: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The deliberate-tie fixture (Pitfall 1/2): TWO candidates with EXACTLY equal gain.
     // The device argmin's lowest-(feature,bin)-index tie-break must keep the SAME winner
     // as the CPU strict-`>` first-wins over ascending (feature, bin) order — the LOWER
@@ -541,19 +514,10 @@ mod scan {
         binsums
     }
 
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn cumulative_matches_host_ordered_reference() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP cumulative_matches_host_ordered_reference: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         // The device scan/update over the FROZEN 7.3 binSums handle must produce
         // per-(feature, bin) cumulative (Σder, Σweight) equal to the host ORDERED
         // prefix-sum (folded via sum_f64 over ascending bins) within the REPORTED
@@ -811,88 +775,43 @@ mod variants {
         }
     }
 
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn cosine_matches_cpu_oracle() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP cosine_matches_cpu_oracle: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         // Cosine (the catboost DEFAULT score fn): device num/sqrt(den) with the 1e-100 seed
         // as the FIRST denominator summand (score.rs:78) must match cb_compute::cosine_split_score.
         assert_arm_matches_oracle("cosine", SCORE_FN_COSINE, EScoreFunction::Cosine);
     }
 
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn solar_matches_cpu_oracle() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP solar_matches_cpu_oracle: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         // SolarL2: weight>1e-20 ? (-sum*sum)*(1+2*ln(weight+1))/weight : 0 (NO scaled_l2, IN-04).
         assert_arm_matches_oracle("solar", SCORE_FN_SOLAR_L2, EScoreFunction::SolarL2);
     }
 
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn loo_matches_cpu_oracle() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP loo_matches_cpu_oracle: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         // LOOL2: adjust=weight>1?weight/(weight-1):0; adjust²; weight>0?adjust*(-sum*sum)/weight:0.
         assert_arm_matches_oracle("loo", SCORE_FN_LOO_L2, EScoreFunction::LOOL2);
     }
 
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn sat_matches_cpu_oracle() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP sat_matches_cpu_oracle: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         // SatL2: adjust=weight>2?weight*(weight-2)/(weight²-3*weight+1):0; weight>0?adjust*(-sum*sum)/weight:0.
         assert_arm_matches_oracle("sat", SCORE_FN_SAT_L2, EScoreFunction::SatL2);
     }
 
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn degenerate_leaf_guards_yield_finite_not_nan() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP degenerate_leaf_guards_yield_finite_not_nan: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         // The guard ladders (Cosine 1e-100 seed; Solar weight>1e-20; LOO weight>1/weight>0;
         // Sat weight>2/weight>0) must yield FINITE scores (0.0 on a degenerate leaf), never
         // NaN/Inf (T-07.5-05-01). Build a fixture where MANY borders carve an empty / tiny /
@@ -1123,19 +1042,10 @@ mod pairwise {
     /// REPORTED tolerance, AND the device argmax must pick the SAME (feature, border) as
     /// the CPU pairwise reference EXACTLY (the strict STRUCTURE bar, SC-3). The device
     /// der-sum descriptor must match `compute_der_sums` (the bounded device scatter).
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn score_matches_cpu_oracle() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP score_matches_cpu_oracle: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         let n_features = 3usize;
         let n_bins = 32usize; // 5-bit one-byte non-binary family, <= CUBE_DIM
         let l2_diag_reg = 3.0_f64;
@@ -1232,19 +1142,10 @@ mod pairwise {
     /// host ordered cumulative 4-channel reference within the REPORTED tolerance, AND
     /// `n_bins > CUBE_DIM` must surface the typed cross-cube-carry follow-up error (NOT a
     /// silent truncated prefix).
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn scan_matches_reference() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[score_split] SKIP scan_matches_reference: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         let n_features = 2usize;
         let n_objects = 60usize;
 

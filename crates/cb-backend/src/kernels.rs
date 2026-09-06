@@ -1927,6 +1927,81 @@ pub fn block_reduce_atomic_kernel<F: Float>(
 /// (Pitfall 3 — a runtime/topology size will not compile); it holds one slot per
 /// plane (an upper bound at CUBE_DIM units). Uses the if-as-STATEMENT pattern only
 /// (CubeCL conditionals manual — never if-as-expression).
+/// Cross-plane Hillis-Steele carry over each plane's INCLUSIVE total (`scanned_in_plane`)
+/// — the shared core of the four plane-carry scan kernels (`block_scan_kernel`,
+/// `block_scan_total_kernel`, `scan_update_pointwise_kernel`, `scan_update_pairwise_kernel`;
+/// see SHARED-MEMORY CUBE INDEPENDENCE at the top of this module). The LAST unit of each
+/// plane hands in that plane's inclusive total; every unit gets back that plane's
+/// EXCLUSIVE carry (the sum of all strictly-prior planes' totals). WITHOUT planes every
+/// unit is its own plane (`plane_slot == tid`), so this degenerates to the ordinary
+/// per-unit exclusive prefix over `partials` — see PLANE-FREE FALLBACK at the top of this
+/// module.
+///
+/// Allocates its OWN `SharedMemory` (sized to the comptime [`BLOCK_REDUCE_SHMEM`] const,
+/// Pitfall 3) and contains its OWN internal barriers — that part of the module-wide
+/// invariant is satisfied here, once, for all four callers. It does NOT emit a trailing
+/// `sync_cube()`: the LOCAL, per-kernel invariant the module doc requires is each
+/// CALLER's job, since only the caller knows whether it has more work (a write) to do
+/// after the carry is read. if-as-STATEMENT only (CubeCL conditionals manual).
+#[cube]
+fn plane_carry_scan<F: Float>(scanned_in_plane: F, tid: u32, #[comptime] use_plane: bool) -> F {
+    let mut plane_slot = tid;
+    let mut num_planes = CUBE_DIM_X;
+    let mut owns_slot = true;
+    if use_plane {
+        plane_slot = PLANE_POS;
+        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
+    }
+
+    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
+    if owns_slot {
+        partials[plane_slot as usize] = scanned_in_plane;
+    }
+    sync_cube();
+
+    // Hillis-Steele INCLUSIVE scan over the per-plane partials (mirrors
+    // `inplace_scan.cuh`'s `val += data[tid - s]`, `s = 1,2,4,…`, `sync_cube()`
+    // between stages). Only the first `num_planes` slots participate; one unit
+    // (tid == its plane index) owns each slot.
+    let mut s = 1u32;
+    while s < num_planes {
+        let mut add = F::new(0.0_f32);
+        // tid drives a slot iff tid < num_planes and tid >= s.
+        if tid < num_planes {
+            if tid >= s {
+                add = partials[(tid - s) as usize];
+            }
+        }
+        sync_cube();
+        if tid < num_planes {
+            if tid >= s {
+                partials[tid as usize] += add;
+            }
+        }
+        sync_cube();
+        s *= 2u32;
+    }
+
+    // Each plane's EXCLUSIVE carry = inclusive-scan of partials, shifted by one plane
+    // (carry for plane p = sum of all strictly-prior planes' totals). Slot 0 has zero
+    // carry; otherwise carry = partials[plane_slot - 1]. Without planes
+    // `plane_slot == UNIT_POS`, so this is the ordinary exclusive prefix.
+    let mut carry = F::new(0.0_f32);
+    if plane_slot >= 1u32 {
+        carry = partials[(plane_slot - 1u32) as usize];
+    }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module),
+    // applied uniformly here too even though this fn returns a value rather than
+    // being a kernel entry point: every caller's own trailing barrier comes after
+    // further per-kernel work (a write, another field), so THIS barrier is what
+    // pins every unit to this cube before any may advance and reuse `partials`,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
+    carry
+}
+
 #[cube(launch)]
 pub fn block_scan_kernel<F: Float>(
     input: &Array<F>,
@@ -1968,55 +2043,7 @@ pub fn block_scan_kernel<F: Float>(
     //    slot keyed by its plane index. Without planes every unit owns a slot, and
     //    `partials` is sized to one slot per unit at this launch width, so the same
     //    allocation serves both arms.
-    let mut plane_slot = tid;
-    let mut num_planes = CUBE_DIM_X;
-    let mut owns_slot = true;
-    if use_plane {
-        plane_slot = PLANE_POS;
-        // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on
-        // wave32 at CUBE_DIM 32 — the carry below then adds nothing). Derived from
-        // CUBE_DIM_X / PLANE_DIM, NOT a literal 32/64 (D-09).
-        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
-        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
-    }
-
-    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if owns_slot {
-        partials[plane_slot as usize] = scanned_in_plane;
-    }
-    sync_cube();
-
-    // Hillis-Steele INCLUSIVE scan over the per-plane partials (mirrors
-    // `inplace_scan.cuh`'s `val += data[tid - s]`, `s = 1,2,4,…`, `sync_cube()`
-    // between stages). Only the first `num_planes` slots participate; one unit
-    // (tid == its plane index) owns each slot.
-    let mut s = 1u32;
-    while s < num_planes {
-        let mut add = F::new(0.0_f32);
-        // tid drives a slot iff tid < num_planes and tid >= s.
-        if tid < num_planes {
-            if tid >= s {
-                add = partials[(tid - s) as usize];
-            }
-        }
-        sync_cube();
-        if tid < num_planes {
-            if tid >= s {
-                partials[tid as usize] += add;
-            }
-        }
-        sync_cube();
-        s *= 2u32;
-    }
-
-    // 3) Each plane's EXCLUSIVE carry = inclusive-scan of partials, shifted by one
-    //    plane (carry for plane p = sum of all strictly-prior planes' totals). Slot 0
-    //    has zero carry; otherwise carry = partials[plane_slot - 1]. Without planes
-    //    `plane_slot == UNIT_POS`, so this is the ordinary exclusive prefix.
-    let mut carry = F::new(0.0_f32);
-    if plane_slot >= 1u32 {
-        carry = partials[(plane_slot - 1u32) as usize];
-    }
+    let carry = plane_carry_scan::<F>(scanned_in_plane, tid, use_plane);
     // IN-01 (SUPERSEDED): this previously argued that a barrier after the `carry` read
     // "synchronizes nothing relevant" and was needless on the scan hot path. That holds
     // only INTRA-cube. Across cubes it is wrong on the CPU runtime, where the shared
@@ -2090,43 +2117,7 @@ pub fn block_scan_total_kernel<F: Float>(
     // structure to `block_scan_kernel`. The last unit of each plane writes that plane's
     // inclusive total into the slot keyed by its plane index; without planes every unit
     // owns a slot, and `partials` holds one per unit at this launch width.
-    let mut plane_slot = tid;
-    let mut num_planes = CUBE_DIM_X;
-    let mut owns_slot = true;
-    if use_plane {
-        plane_slot = PLANE_POS;
-        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
-        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
-    }
-
-    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if owns_slot {
-        partials[plane_slot as usize] = scanned_in_plane;
-    }
-    sync_cube();
-
-    let mut s = 1u32;
-    while s < num_planes {
-        let mut add = F::new(0.0_f32);
-        if tid < num_planes {
-            if tid >= s {
-                add = partials[(tid - s) as usize];
-            }
-        }
-        sync_cube();
-        if tid < num_planes {
-            if tid >= s {
-                partials[tid as usize] += add;
-            }
-        }
-        sync_cube();
-        s *= 2u32;
-    }
-
-    let mut carry = F::new(0.0_f32);
-    if plane_slot >= 1u32 {
-        carry = partials[(plane_slot - 1u32) as usize];
-    }
+    let carry = plane_carry_scan::<F>(scanned_in_plane, tid, use_plane);
 
     let result = scanned + carry;
     // The block's INCLUSIVE within-block prefix (flag-independent): its value at the
@@ -4086,47 +4077,7 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     // 2) Cross-plane carry: the LAST unit of each plane writes that plane's inclusive
     //    total into the shared slot keyed by its plane index. Without planes every unit
     //    owns a slot, and `partials` holds one per unit at this launch width.
-    let mut plane_slot = tid;
-    let mut num_planes = CUBE_DIM_X;
-    let mut owns_slot = true;
-    if use_plane {
-        plane_slot = PLANE_POS;
-        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
-        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
-    }
-
-    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if owns_slot {
-        partials[plane_slot as usize] = scanned_in_plane;
-    }
-    sync_cube();
-
-    // Hillis-Steele inclusive scan over the per-plane partials.
-    let mut s = 1u32;
-    while s < num_planes {
-        let mut add = F::new(0.0_f32);
-        if tid < num_planes {
-            if tid >= s {
-                add = partials[(tid - s) as usize];
-            }
-        }
-        sync_cube();
-        if tid < num_planes {
-            if tid >= s {
-                partials[tid as usize] += add;
-            }
-        }
-        sync_cube();
-        s *= 2u32;
-    }
-
-    // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
-    //    Without planes `plane_slot == UNIT_POS`, so this is the ordinary exclusive
-    //    prefix over the per-unit partials.
-    let mut carry = F::new(0.0_f32);
-    if plane_slot >= 1u32 {
-        carry = partials[(plane_slot - 1u32) as usize];
-    }
+    let carry = plane_carry_scan::<F>(scanned_in_plane, tid, use_plane);
 
     let result = scanned + carry;
 
@@ -5535,47 +5486,7 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     // 2) Cross-plane carry: the LAST unit of each plane writes that plane's inclusive
     //    total into the shared slot keyed by its plane index. Without planes every unit
     //    owns a slot, and `partials` holds one per unit at this launch width.
-    let mut plane_slot = tid;
-    let mut num_planes = CUBE_DIM_X;
-    let mut owns_slot = true;
-    if use_plane {
-        plane_slot = PLANE_POS;
-        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
-        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
-    }
-
-    let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if owns_slot {
-        partials[plane_slot as usize] = scanned_in_plane;
-    }
-    sync_cube();
-
-    // Hillis-Steele inclusive scan over the per-plane partials.
-    let mut s = 1u32;
-    while s < num_planes {
-        let mut add = F::new(0.0_f32);
-        if tid < num_planes {
-            if tid >= s {
-                add = partials[(tid - s) as usize];
-            }
-        }
-        sync_cube();
-        if tid < num_planes {
-            if tid >= s {
-                partials[tid as usize] += add;
-            }
-        }
-        sync_cube();
-        s *= 2u32;
-    }
-
-    // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
-    //    Without planes `plane_slot == UNIT_POS`, so this is the ordinary exclusive
-    //    prefix over the per-unit partials.
-    let mut carry = F::new(0.0_f32);
-    if plane_slot >= 1u32 {
-        carry = partials[(plane_slot - 1u32) as usize];
-    }
+    let carry = plane_carry_scan::<F>(scanned_in_plane, tid, use_plane);
 
     let result = scanned + carry;
 

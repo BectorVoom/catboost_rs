@@ -229,6 +229,42 @@ const HIST_LDS_TARGET_CUBES: usize = 256;
 /// than on scatter work (each extra chunk re-merges its whole tile).
 const HIST_LDS_MIN_OBJ_PER_THREAD: usize = 8;
 
+/// `PART_UPDATE_CUBE_DIM` and `HIST_CUBE_DIM` are tuned to the SAME occupancy target
+/// and [`lds_cube_dim`] below caps both of their barrier-using kernels from ONE
+/// memoized query; coupling them here makes future drift between the two constants a
+/// COMPILE error rather than a silently wrong cap for whichever one changes.
+const _: () = assert!(
+    PART_UPDATE_CUBE_DIM == HIST_CUBE_DIM,
+    "lds_cube_dim assumes PART_UPDATE_CUBE_DIM == HIST_CUBE_DIM so partition_update_lds \
+     and partition_hist2_lds can share one core-capped width"
+);
+
+/// The cube width [`crate::kernels::partition_update_lds_kernel`] and
+/// [`crate::kernels::partition_hist2_lds_kernel`] are ACTUALLY launched at:
+/// [`HIST_CUBE_DIM`] (== [`PART_UPDATE_CUBE_DIM`]) on a GPU, and at most one unit per
+/// core on the CPU runtime — same reasoning as [`cube_dim`], just at the wider
+/// occupancy-tuned width these two LDS-privatized (`SharedMemory` + `sync_cube`)
+/// kernels use instead of [`CUBE_DIM`]. `zero_u64_kernel` and the other grid-stride
+/// HIST_CUBE_DIM launches have NO shared memory and stay decoupled from this — see
+/// the doc on [`HIST_CUBE_DIM`].
+///
+/// Both kernels are dormant on the default `cpu` feature today (gated behind
+/// `device_supports_channel_atomic_add`, which cubecl-cpu never advertises — see
+/// `channel_atomics_available`'s test-support twin), so this cap only bites if a
+/// future backend adds the atomic capability WITHOUT also adding planes: without it,
+/// that combination would launch 256 spin-barrier OS threads per cube on a CPU-style
+/// runtime, the exact oversubscription [`cube_dim`] exists to prevent.
+///
+/// Memoized: the device properties do not change for the life of the process.
+pub(crate) fn lds_cube_dim() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+        let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+        crate::launch_geometry::barrier_cube_dim(&client, HIST_CUBE_DIM)
+    })
+}
+
 /// `CB_GPU_PROF=1` gates the per-stage device profiling prints (stage attribution for
 /// the resident grow loop). The env var is read ONCE; unset (or `"0"`) keeps every
 /// profiling branch cold — no sync, no timing, no output — so the hot path is unchanged.
@@ -678,6 +714,33 @@ pub(crate) fn channel_atomics_available() -> bool {
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
     device_supports_channel_atomic_add(&client)
 }
+
+/// Shared body for the ~30 `Atomic<F>`-fill oracle tests across `score_split`,
+/// `pointwise_hist`, `pairwise_hist`, `grow_loop` and `reduce`: SKIP, don't fail,
+/// when the ACTIVE backend cannot run an atomic fill at all (a red test would
+/// report a runtime limitation as a numerical regression).
+///
+/// This runtime probe is defense-in-depth only. The REPORTED skip — visible in
+/// `cargo test` output as `ignored`, unlike a captured `eprintln!` on a passing
+/// test — is the paired `#[cfg_attr(not(feature = "rocm"), ignore = "...")]` that
+/// belongs on every call site: per this crate's testing convention, GPU-dependent
+/// tests only really run on `rocm`, so cpu/wgpu/cuda builds skip via that
+/// attribute before this macro's body ever executes. It stays in place for the
+/// rarer case where a `rocm` device itself doesn't advertise the capability.
+#[cfg(test)]
+macro_rules! skip_unless_channel_atomics {
+    () => {
+        if !$crate::gpu_runtime::channel_atomics_available() {
+            eprintln!(
+                "SKIP: backend advertises no channel-float atomic-add (cubecl-cpu has \
+                 no atomics; run with --features rocm)"
+            );
+            return;
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use skip_unless_channel_atomics;
 
 /// The shared [`CbError::Unsupported`] for a float-atomic fill the active backend cannot
 /// run. `what` names the fill so the message says which seam refused.
@@ -2388,11 +2451,17 @@ pub(crate) fn launch_partition_update_into(
             let lds_cubes = n
                 .div_ceil(PART_UPDATE_CUBE_DIM)
                 .clamp(1, PART_UPDATE_MAX_CUBES);
+            // The ACTUAL launch width (core-capped on the CPU runtime, see
+            // `lds_cube_dim`) — NOT the nominal `PART_UPDATE_CUBE_DIM` occupancy
+            // target above, which only sizes the cube COUNT. `grid_stride` MUST
+            // match this width, since the kernel's grid-stride loop derives its
+            // step from the host-supplied value, not from `PART_UPDATE_CUBE_DIM`.
+            let lds_width = lds_cube_dim();
             partition_update_lds_kernel::launch::<f64, SelectedRuntime>(
                 client,
                 CubeCount::Static(lds_cubes as u32, 1, 1),
                 CubeDim {
-                    x: PART_UPDATE_CUBE_DIM as u32,
+                    x: lds_width as u32,
                     y: 1,
                     z: 1,
                 },
@@ -2402,7 +2471,7 @@ pub(crate) fn launch_partition_update_into(
                 unsafe { ArrayArg::from_raw_parts(indices, n) },
                 unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
-                (lds_cubes * PART_UPDATE_CUBE_DIM) as u32,
+                (lds_cubes * lds_width) as u32,
                 part_stats_len as u32,
             );
         } else {
@@ -3224,13 +3293,25 @@ fn launch_partition_hist2_lds(
 
     let count = CubeCount::Static(chunks as u32, groups as u32, 1);
 
+    // The ACTUAL launch width for `partition_hist2_lds_kernel` (core-capped on the CPU
+    // runtime, see `lds_cube_dim`) — deliberately NOT `hist_dim`/`HIST_CUBE_DIM` above,
+    // which stays fixed for the barrier-free `zero_u64_kernel` grid-stride zero fill.
+    // `grid_stride` MUST match this width: the kernel derives its grid-stride step from
+    // the host-supplied value, not from `HIST_CUBE_DIM`.
+    let lds_width = lds_cube_dim();
+    let lds_dim = CubeDim {
+        x: lds_width as u32,
+        y: 1,
+        z: 1,
+    };
+
     // The der1/weight channel float type is f32 on wgpu, f64 elsewhere (RESEARCH A1);
     // unreachable on wgpu in practice (the caller's Atomic<u64> capability gate).
     #[cfg(feature = "wgpu")]
     partition_hist2_lds_kernel::launch::<f32, SelectedRuntime>(
         client,
         count,
-        hist_dim,
+        lds_dim,
         unsafe { ArrayArg::from_raw_parts(der1_h, n) },
         unsafe { ArrayArg::from_raw_parts(weight_h, n) },
         unsafe { ArrayArg::from_raw_parts(cindex_words_h, num_words) },
@@ -3244,7 +3325,7 @@ fn launch_partition_hist2_lds(
         filter_mask,
         n_active as u32,
         tile_f as u32,
-        (chunks * HIST_CUBE_DIM) as u32,
+        (chunks * lds_width) as u32,
         bits,
         lds_cells as u32,
     );
@@ -3253,7 +3334,7 @@ fn launch_partition_hist2_lds(
     partition_hist2_lds_kernel::launch::<f64, SelectedRuntime>(
         client,
         count,
-        hist_dim,
+        lds_dim,
         unsafe { ArrayArg::from_raw_parts(der1_h, n) },
         unsafe { ArrayArg::from_raw_parts(weight_h, n) },
         unsafe { ArrayArg::from_raw_parts(cindex_words_h, num_words) },
@@ -3267,7 +3348,7 @@ fn launch_partition_hist2_lds(
         filter_mask,
         n_active as u32,
         tile_f as u32,
-        (chunks * HIST_CUBE_DIM) as u32,
+        (chunks * lds_width) as u32,
         bits,
         lds_cells as u32,
     );

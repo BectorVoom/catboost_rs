@@ -414,12 +414,18 @@ impl DerInputs {
         self.read(out)
     }
 
-    /// Launch a Focal derivative kernel (`gradient` or `hessian`) with the scalar
-    /// `alpha`/`gamma` loss parameters, and read back the `f64` output in object order.
-    fn focal(&self, alpha: f64, gamma: f64, hessian: bool) -> CbResult<Vec<f64>> {
+    /// Launch a Focal derivative kernel (`gradient` or `hessian`) with the ALREADY-
+    /// UPLOADED `alpha`/`gamma` loss-parameter handles, and read back the `f64` output
+    /// in object order. Takes handles rather than `f64` values (manual R6) so the
+    /// caller can upload each parameter ONCE and pass it to both the der1 and der2
+    /// call — see [`DerInputs::scalar`].
+    fn focal(
+        &self,
+        alpha_h: cubecl::server::Handle,
+        gamma_h: cubecl::server::Handle,
+        hessian: bool,
+    ) -> CbResult<Vec<f64>> {
         let out = self.out();
-        let alpha_h = self.scalar(alpha);
-        let gamma_h = self.scalar(gamma);
         // Focal evaluates `exp`, `ln` and `powf` per lane — the compute-bound tier.
         let (count, dim) = self.geometry(TRANSCENDENTAL_LANE);
         let approx = unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) };
@@ -485,11 +491,18 @@ impl DerInputs {
     }
 
     /// Launch a single-parameter smooth-loss derivative kernel (`gradient` or
-    /// `hessian`), passing the scalar loss `param` (q / delta / alpha) as a length-1
-    /// device array, and read back the `f64` output in object order.
-    fn param(&self, param: f64, kind: ParamKernel, hessian: bool) -> CbResult<Vec<f64>> {
+    /// `hessian`), passing the ALREADY-UPLOADED scalar loss-parameter handle (q /
+    /// delta / alpha / variance_power) as a length-1 device array, and read back the
+    /// `f64` output in object order. Takes a handle rather than an `f64` value
+    /// (manual R6) so the caller can upload it ONCE and pass it to both the der1 and
+    /// der2 call — see [`DerInputs::scalar`].
+    fn param(
+        &self,
+        param_h: cubecl::server::Handle,
+        kind: ParamKernel,
+        hessian: bool,
+    ) -> CbResult<Vec<f64>> {
         let out = self.out();
-        let param_h = self.scalar(param);
         let (count, dim) = self.geometry(kind.lane());
         let approx = unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) };
         let target = unsafe { ArrayArg::from_raw_parts(self.target.clone(), self.n_pad) };
@@ -571,8 +584,12 @@ fn compute_gradients_one_dim(
             Ok((der1, der2))
         }
         Loss::Focal { alpha, gamma } => {
-            let der1 = inputs.focal(alpha, gamma, false)?;
-            let der2 = inputs.focal(alpha, gamma, true)?;
+            // Upload alpha/gamma ONCE (manual R6): both the der1 and der2 launch
+            // read the SAME handle, rather than each re-uploading its own copy.
+            let alpha_h = inputs.scalar(alpha);
+            let gamma_h = inputs.scalar(gamma);
+            let der1 = inputs.focal(alpha_h.clone(), gamma_h.clone(), false)?;
+            let der2 = inputs.focal(alpha_h, gamma_h, true)?;
             Ok((der1, der2))
         }
         // MAE == Quantile{alpha=0.5, delta=1e-6} (WR-04): route through the
@@ -604,18 +621,24 @@ fn compute_gradients_one_dim(
             Ok((der1, der2))
         }
         Loss::Lq { q } => {
-            let der1 = inputs.param(q, ParamKernel::Lq, false)?;
-            let der2 = inputs.param(q, ParamKernel::Lq, true)?;
+            // Upload q ONCE (manual R6): both launches read the SAME handle.
+            let q_h = inputs.scalar(q);
+            let der1 = inputs.param(q_h.clone(), ParamKernel::Lq, false)?;
+            let der2 = inputs.param(q_h, ParamKernel::Lq, true)?;
             Ok((der1, der2))
         }
         Loss::Huber { delta } => {
-            let der1 = inputs.param(delta, ParamKernel::Huber, false)?;
-            let der2 = inputs.param(delta, ParamKernel::Huber, true)?;
+            // Upload delta ONCE (manual R6): both launches read the SAME handle.
+            let delta_h = inputs.scalar(delta);
+            let der1 = inputs.param(delta_h.clone(), ParamKernel::Huber, false)?;
+            let der2 = inputs.param(delta_h, ParamKernel::Huber, true)?;
             Ok((der1, der2))
         }
         Loss::Expectile { alpha } => {
-            let der1 = inputs.param(alpha, ParamKernel::Expectile, false)?;
-            let der2 = inputs.param(alpha, ParamKernel::Expectile, true)?;
+            // Upload alpha ONCE (manual R6): both launches read the SAME handle.
+            let alpha_h = inputs.scalar(alpha);
+            let der1 = inputs.param(alpha_h.clone(), ParamKernel::Expectile, false)?;
+            let der2 = inputs.param(alpha_h, ParamKernel::Expectile, true)?;
             Ok((der1, der2))
         }
         // Wave-2 positive-domain / link losses (D-6.1-02 / Plan 06.1-02).
@@ -629,8 +652,11 @@ fn compute_gradients_one_dim(
         // Tweedie: exp INSIDE the der (raw approx, NOT exp-approx); both
         // gradient and hessian carry the variance_power scalar param.
         Loss::Tweedie { variance_power } => {
-            let der1 = inputs.param(variance_power, ParamKernel::Tweedie, false)?;
-            let der2 = inputs.param(variance_power, ParamKernel::Tweedie, true)?;
+            // Upload variance_power ONCE (manual R6): both launches read the SAME
+            // handle.
+            let variance_power_h = inputs.scalar(variance_power);
+            let der1 = inputs.param(variance_power_h.clone(), ParamKernel::Tweedie, false)?;
+            let der2 = inputs.param(variance_power_h, ParamKernel::Tweedie, true)?;
             Ok((der1, der2))
         }
         // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient

@@ -437,19 +437,10 @@ mod partition {
     /// Σ der1 / Σ weight must equal the host ORDERED `sum_f64` per-leaf reference within
     /// the reported tolerance (D-7.5-05). Validates the per-partition reduce
     /// (== upstream `UpdatePartitionProps`) over the SAME device-resident routing.
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn update_matches_ordered_reference() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[grow_loop] SKIP update_matches_ordered_reference: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         let n_features = 3usize;
         let n_bins = 32usize;
 
@@ -1495,19 +1486,10 @@ mod pairwise {
     /// and assert the device STRUCTURE matches the inline CPU pairwise grow reference
     /// EXACTLY (split `(feature, border)` + per-object `leaf_of` == `leaf_index`), then
     /// REPORT the leaf-value divergence vs `cb_compute::calc_average`. This closes GPU-01.
+    #[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
     #[test]
     fn matches_cpu_pairwise_grow() {
-        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-        // (cubecl-cpu implements no atomics). A red test here would report a runtime
-        // limitation as a numerical regression — the `pointwise_hist` precedent; see
-        // `channel_atomics_available`.
-        if !crate::gpu_runtime::channel_atomics_available() {
-            eprintln!(
-                "[grow_loop] SKIP matches_cpu_pairwise_grow: backend advertises no channel-float \
-                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-            );
-            return;
-        }
+        crate::gpu_runtime::skip_unless_channel_atomics!();
         let n_features = 3usize;
         let n_bins = 32usize; // 5-bit, <= CUBE_DIM
         let depth = 1usize;

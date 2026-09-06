@@ -272,19 +272,10 @@ fn read_pair_handle(h: cubecl::server::Handle) -> Vec<f64> {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn nonbinary_bits() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP nonbinary_bits: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The 5/6/7-bit non-binary pairwise fill self-oracle: the device 4-channel histogram
     // must match the ordered host reference within the REPORTED bound over the edge cases
     // n_pairs=0 (empty, NO launch/read-back), n_pairs=1, n_pairs=37 (non-cube-multiple),
@@ -335,19 +326,10 @@ fn nonbinary_bits() {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn eightbit_atomics() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP eightbit_atomics: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The 8-bit-atomics pairwise fill self-oracle (D-7.4-02 — the structurally DISTINCT
     // global-atomics family; upstream `pairwise_hist_one_byte_8bit_atomics.cuh`). At 8 bits
     // a 256-bin x 4-channel line does not fit the per-block shared-memory budget, so
@@ -432,19 +414,10 @@ fn eightbit_atomics() {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn half_byte() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP half_byte: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The half-byte (4-bit, 16-bin) pairwise fill self-oracle (D-7.4-02 — the structurally
     // DISTINCT half-byte family; upstream `pairwise_hist_half_byte.cu`). The half-byte line
     // is a FIXED 16-bin (4-bit) histogram (the comptime `HALF_BYTE_BINS` precedent from the
@@ -529,19 +502,10 @@ fn half_byte() {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn binary() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP binary: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The binary (1-bit, 2-bin) pairwise fill self-oracle (D-7.4-02 — the structurally
     // DISTINCT binary family; upstream `pairwise_hist_binary.cu`). The binary line is a
     // FIXED 2-bin (1-bit) histogram (a bin COUNT, NOT a warp literal), and the family takes
@@ -627,19 +591,10 @@ fn binary() {
     }
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn handoff() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP handoff: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The SC-3 / D-7.4-03 device-residency assertion: pair_i/pair_j/pair_weight/cindex
     // handles in -> `launch_pairwise_hist_handle` returns the 4-channel `binSums` as a
     // device HANDLE with NO host fold on the seam. The read-back happens ONCE here
@@ -686,19 +641,10 @@ fn handoff() {
     );
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn pairlogit_fixture() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP pairlogit_fixture: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // SC-2: a PairLogitPairwise-derived pair/weight fixture grounds the oracle in a
     // realistic ranking-loss pair list. The pairs + per-pair weights are derived from
     // `cb_compute::loss::pairlogit_pair_prob` (read-only — D-7.4-08): for each
@@ -765,19 +711,10 @@ fn pairlogit_fixture() {
     );
 }
 
+#[cfg_attr(not(feature = "rocm"), ignore = "requires GPU channel-atomic-add; only the rocm backend is expected to have it")]
 #[test]
 fn one_hot() {
-    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
-    // (cubecl-cpu implements no atomics). A red test here would report a runtime
-    // limitation as a numerical regression — the `pointwise_hist` precedent; see
-    // `channel_atomics_available`.
-    if !crate::gpu_runtime::channel_atomics_available() {
-        eprintln!(
-            "[pairwise_hist] SKIP one_hot: backend advertises no channel-float \
-             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
-        );
-        return;
-    }
+    crate::gpu_runtime::skip_unless_channel_atomics!();
     // The one-hot overlay self-oracle (D-7.4-02 / SC-1 / SC-3): the COMPTIME `one_hot`
     // predicate swap on the EXISTING non-binary (5/6/7-bit) and 8-bit-atomics kernels —
     // upstream's `TCmpBinsOneByteTrait<OneHotPass>` template-bool whose `Compare` is

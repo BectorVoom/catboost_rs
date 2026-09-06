@@ -175,6 +175,16 @@ fn brace_counting_is_soundcheck() {
 /// inside an `if`/`while`, where only some units would reach it and the barrier would
 /// deadlock instead of synchronizing).
 ///
+/// A plain `#[cube]` HELPER (as opposed to a `#[cube(launch)]` kernel entry point) may
+/// return a value instead of `()`, in which case its literal last line is the bare
+/// tail-expression variable, not `sync_cube();` — `plane_carry_scan` is the first such
+/// case. That shape is still accepted, but only in the exact form that preserves the
+/// same guarantee: the barrier must be the line immediately BEFORE that bare
+/// identifier, i.e. still the last thing touching `SharedMemory` before control
+/// returns to the caller. This is a structural generalization of the same rule, not a
+/// named exception — it applies to any future value-returning shared-memory helper
+/// shaped the same way, and nothing that pattern-matches a specific function name.
+///
 /// See SHARED-MEMORY CUBE INDEPENDENCE at the top of `kernels.rs` for why: CubeCL
 /// shares one `SharedMemory` allocation BETWEEN cubes, and the CPU runtime reuses it
 /// across sequential cube iterations, so without this barrier a unit that finishes
@@ -203,16 +213,39 @@ fn every_shared_memory_kernel_ends_with_a_trailing_sync_cube() {
          drifted and it would pass vacuously"
     );
 
+    // A bare tail-expression return: a lone identifier, no parens/operators/semicolon
+    // (e.g. `carry`). Anything else on this line is not the value-returning-helper
+    // shape and must fall through to the ordinary kernel check.
+    fn is_bare_tail_expr(line: &str) -> bool {
+        let t = line.trim();
+        !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    }
+
     let offenders: Vec<&str> = shared
         .iter()
         .filter(|k| {
-            let last = k
+            let mut tail = k
                 .body
                 .iter()
                 .rev()
-                .find(|l| !l.trim().is_empty() && !l.trim().starts_with("//"));
+                .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("//"));
+            let last = tail.next();
             // Exactly 4 spaces of indent == the kernel's top level.
-            last.map(|l| l.as_str()) != Some("    sync_cube();")
+            if last.map(|l| l.as_str()) == Some("    sync_cube();") {
+                return false;
+            }
+            // Value-returning helper shape: bare tail expression, with the barrier as
+            // the line immediately before it.
+            if last.is_some_and(|l| is_bare_tail_expr(l)) {
+                let prev = tail.next();
+                if prev.map(|l| l.as_str()) == Some("    sync_cube();") {
+                    return false;
+                }
+            }
+            true
         })
         .map(|k| k.name.as_str())
         .collect();
