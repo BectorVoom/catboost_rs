@@ -219,10 +219,17 @@ fn launch_pairwise_hist_into(
 
     // Launch geometry: enough cubes to cover `n_pairs` (the grid-stride loop handles any
     // surplus via the total-thread-count stride).
-    let num_cubes = n_pairs.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("pairwise non-binary histogram fill"));
+    }
+
+    let num_cubes = n_pairs.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -255,6 +262,7 @@ fn launch_pairwise_hist_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
             bits,
             one_hot,
         );
@@ -276,6 +284,7 @@ fn launch_pairwise_hist_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
             bits,
             one_hot,
         );
@@ -470,10 +479,17 @@ fn launch_pairwise_hist_8bit_into(
 
     // Launch geometry: enough cubes to cover `n_pairs` (the grid-stride loop handles any
     // surplus via the total-thread-count stride).
-    let num_cubes = n_pairs.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("pairwise 8-bit histogram fill"));
+    }
+
+    let num_cubes = n_pairs.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -502,6 +518,7 @@ fn launch_pairwise_hist_8bit_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
             one_hot,
         );
         Ok(h)
@@ -522,6 +539,7 @@ fn launch_pairwise_hist_8bit_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
             one_hot,
         );
         Ok(h)
@@ -685,10 +703,17 @@ fn launch_pairwise_hist_half_byte_into(
 
     // Launch geometry: enough cubes to cover `n_pairs` (the grid-stride loop handles any
     // surplus via the total-thread-count stride).
-    let num_cubes = n_pairs.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("pairwise half-byte histogram fill"));
+    }
+
+    let num_cubes = n_pairs.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -717,6 +742,7 @@ fn launch_pairwise_hist_half_byte_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
         );
         Ok(h)
     }
@@ -736,6 +762,7 @@ fn launch_pairwise_hist_half_byte_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
         );
         Ok(h)
     }
@@ -895,10 +922,17 @@ fn launch_pairwise_hist_binary_into(
 
     // Launch geometry: enough cubes to cover `n_pairs` (the grid-stride loop handles any
     // surplus via the total-thread-count stride).
-    let num_cubes = n_pairs.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("pairwise binary histogram fill"));
+    }
+
+    let num_cubes = n_pairs.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -927,6 +961,7 @@ fn launch_pairwise_hist_binary_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
         );
         Ok(h)
     }
@@ -946,6 +981,7 @@ fn launch_pairwise_hist_binary_into(
             unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
             n_features as u32,
             n_objects as u32,
+            (num_cubes * cube_dim()) as u32,
         );
         Ok(h)
     }
@@ -1120,13 +1156,20 @@ fn launch_scan_update_pairwise_into(
         client, pair_i, pair_j, pair_weight, cindex, n_objects, n_bins, n_features, bits, one_hot,
     )?;
 
-    // Launch geometry: ONE cube of CUBE_DIM units per (feature, histId) scan axis.
+    // Launch geometry: ONE cube per (feature, histId) scan axis, at the narrowest width
+    // that gives every bin its own unit (`single_cube_dim`; n_bins <= CUBE_DIM is
+    // guaranteed above).
     let count = CubeCount::Static(num_cubes_u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: single_cube_dim(n_bins) as u32,
         y: 1,
         z: 1,
     };
+
+    // Query the plane capability ONCE on the host and drive the kernel's comptime
+    // branch (see PLANE-FREE FALLBACK in `kernels.rs`): the CPU runtime reports no
+    // plane ops, and a plane op emitted there does not compile.
+    let use_plane = client.features().plane.contains(Plane::Ops);
 
     // The cumulative output buffer matches the FROZEN 4-channel layout / channel float
     // type: f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1) — read back via
@@ -1142,6 +1185,7 @@ fn launch_scan_update_pairwise_into(
             unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
             unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
             n_bins_u32,
+            use_plane,
         );
         cumulative_h
     };
@@ -1157,6 +1201,7 @@ fn launch_scan_update_pairwise_into(
             unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
             unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
             n_bins_u32,
+            use_plane,
         );
         cumulative_h
     };
@@ -1257,10 +1302,17 @@ fn launch_pairwise_make_derivatives_into(
         CbError::OutOfRange(format!("n_bins ({n_bins}) exceeds u32 (kernel comptime line size)"))
     })?;
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("pairwise make-derivatives scatter"));
+    }
+
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -1281,6 +1333,7 @@ fn launch_pairwise_make_derivatives_into(
             unsafe { ArrayArg::from_raw_parts(indices_h, n) },
             unsafe { ArrayArg::from_raw_parts(h.clone(), der_sums_len) },
             n_features as u32,
+            (num_cubes * cube_dim()) as u32,
             n_bins_u32,
         );
         h
@@ -1298,6 +1351,7 @@ fn launch_pairwise_make_derivatives_into(
             unsafe { ArrayArg::from_raw_parts(indices_h, n) },
             unsafe { ArrayArg::from_raw_parts(h.clone(), der_sums_len) },
             n_features as u32,
+            (num_cubes * cube_dim()) as u32,
             n_bins_u32,
         );
         h
@@ -1870,7 +1924,7 @@ fn select_best_split_over_scores(
     let num_cubes = 1usize;
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };

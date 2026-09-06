@@ -30,6 +30,8 @@ where
     // cubecl 0.10.0 `ArrayArg::from_raw_parts(handle, length)` consumes the
     // `Handle` (which is `Clone`); clone the output handle so the original is
     // still readable after launch.
+    // Width-1 vectors: this spike sizes its buffers at exactly `n` (no padding), so
+    // only the scalar line is admissible — see `launch_geometry::SCALAR_LINE`.
     gradient_kernel::launch::<F, cubecl::cpu::CpuRuntime>(
         &client,
         CubeCount::Static(num_cubes as u32, 1, 1),
@@ -38,6 +40,7 @@ where
             y: 1,
             z: 1,
         },
+        crate::launch_geometry::SCALAR_LINE,
         unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
         unsafe { ArrayArg::from_raw_parts(target_handle, n) },
         unsafe { ArrayArg::from_raw_parts(der1_handle.clone(), n) },

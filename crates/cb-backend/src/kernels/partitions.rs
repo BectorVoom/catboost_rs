@@ -18,7 +18,12 @@ use crate::kernels::{
 };
 
 /// 32-wide cubes (wave32 gfx1100); enough cubes to cover every element.
-const CUBE_DIM: usize = 32;
+/// The block-reduce-family cube width the selected runtime is launched at — the
+/// core-capped `gpu_runtime::cube_dim()` (32 on a GPU, at most one unit per core on
+/// the CPU runtime, where a wider spin-barrier launch costs ~1 s per cube).
+fn cube_dim() -> usize {
+    crate::gpu_runtime::cube_dim()
+}
 
 /// Compute each partition's `{Offset, Size}` from a SORTED `part_ids` array over the
 /// selected runtime: head flags (10-01 `key_head_flag`) → exclusive `full_scan`
@@ -28,8 +33,8 @@ fn run_partition_update(part_ids: &[u32], num_partitions: usize) -> (Vec<u32>, V
     let n = part_ids.len();
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: CUBE_DIM as u32, y: 1, z: 1 };
-    let n_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let dim32 = CubeDim { x: cube_dim() as u32, y: 1, z: 1 };
+    let n_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(n_cubes as u32, 1, 1);
 
     // Distinct-run count (host scalar; positions are computed on-device, mirroring
@@ -77,7 +82,7 @@ fn run_partition_update(part_ids: &[u32], num_partitions: usize) -> (Vec<u32>, V
     );
 
     // Phase 4: per-run sizes (one lane per run).
-    let runs_cubes = num_runs.div_ceil(CUBE_DIM).max(1);
+    let runs_cubes = num_runs.div_ceil(cube_dim()).max(1);
     update_partition_sizes_kernel::launch::<f64, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(runs_cubes as u32, 1, 1),

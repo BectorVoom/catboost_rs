@@ -21,15 +21,24 @@ use super::*;
 /// Cheap-tier per-lane work for [`crate::launch_geometry::launch_1d`]: pure
 /// arithmetic/compare, no transcendental call — the RMSE gradient (`target -
 /// approx`) and the Quantile gradient (compare-and-select). Re-exported from
-/// `cpu_runtime::CHEAP_ELEMENTWISE_WORK_PER_LANE` (rather than a local copy) so
-/// a future recalibration there cannot silently leave this seam on stale tuning.
-use crate::cpu_runtime::CHEAP_ELEMENTWISE_WORK_PER_LANE as CHEAP_WORK_PER_LANE;
+/// [`crate::launch_geometry::STREAMING_LANE`] (rather than a local
+/// copy) so a future recalibration there cannot silently leave this seam on stale
+/// tuning. It lives in `launch_geometry` — mounted under EVERY backend — rather than
+/// in the `cpu`-gated `cpu_runtime`, so this import also compiles on wgpu/cuda/rocm.
+use crate::launch_geometry::STREAMING_LANE as CHEAP_WORK_PER_LANE;
+// The der kernels are vectorized (`Array<Vector<F, N>>`, see VECTORIZED ELEMENTWISE
+// DER KERNELS in `kernels.rs`) and take their width at launch. These seams keep their
+// resident handles at exactly `n` elements — no padding — so they launch at width 1,
+// which lowers to the scalar codegen they had before; see `SCALAR_LINE`'s doc for why
+// widening them is a measured decision, not a flag flip.
+use crate::launch_geometry::SCALAR_LINE;
 
 /// Transcendental-tier per-lane work for [`crate::launch_geometry::launch_1d`]:
 /// the Logloss gradient/hessian (`exp`) and Focal gradient/hessian (`exp` +
-/// `powf` + `ln`). Re-exported from `cpu_runtime::ELEMENTWISE_WORK_PER_LANE` —
-/// see that constant's doc for the calibration this value is anchored to.
-use crate::cpu_runtime::ELEMENTWISE_WORK_PER_LANE as WORK_PER_LANE;
+/// `powf` + `ln`). Re-exported from
+/// [`crate::launch_geometry::TRANSCENDENTAL_LANE`] — see that constant's doc
+/// for the calibration this value is anchored to.
+use crate::launch_geometry::TRANSCENDENTAL_LANE as WORK_PER_LANE;
 
 /// Which elementwise binary `(approx, target) -> der1` kernel the device-resident
 /// der seam launches (Phase 7.2, GPU-01 der). This is the GPU analog of the
@@ -167,6 +176,7 @@ pub(crate) fn launch_der_binary_into(
             client,
             count,
             dim,
+            SCALAR_LINE,
             unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
             unsafe { ArrayArg::from_raw_parts(target_handle, n) },
             unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
@@ -175,6 +185,7 @@ pub(crate) fn launch_der_binary_into(
             client,
             count,
             dim,
+            SCALAR_LINE,
             unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
             unsafe { ArrayArg::from_raw_parts(target_handle, n) },
             unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
@@ -238,6 +249,7 @@ pub(crate) fn launch_der_binary_resident(
                 client,
                 count,
                 dim,
+                SCALAR_LINE,
                 unsafe { ArrayArg::from_raw_parts(approx_h, n) },
                 unsafe { ArrayArg::from_raw_parts(target_h, n) },
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
@@ -246,6 +258,7 @@ pub(crate) fn launch_der_binary_resident(
                 client,
                 count,
                 dim,
+                SCALAR_LINE,
                 unsafe { ArrayArg::from_raw_parts(approx_h, n) },
                 unsafe { ArrayArg::from_raw_parts(target_h, n) },
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
@@ -319,6 +332,7 @@ pub(crate) fn launch_der_param_resident(
                     client,
                     count,
                     dim,
+                    SCALAR_LINE,
                     unsafe { ArrayArg::from_raw_parts(approx_h, n) },
                     unsafe { ArrayArg::from_raw_parts(target_h, n) },
                     unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
@@ -462,6 +476,7 @@ fn launch_der_unary_into(
             client,
             count,
             dim,
+            SCALAR_LINE,
             unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
             // Clone so the original output handle stays returnable (the 7.1 idiom).
             // NO `read_one` here (SC-3).
@@ -639,6 +654,7 @@ fn launch_der_param_into(
                 client,
                 count,
                 dim,
+                SCALAR_LINE,
                 unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(target_handle, n) },
                 // Clone so the original output handle stays returnable (SC-3, no read).
@@ -658,6 +674,7 @@ fn launch_der_param_into(
                 client,
                 count,
                 dim,
+                SCALAR_LINE,
                 unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(target_handle, n) },
                 // Clone so the original output handle stays returnable (SC-3, no read).
@@ -675,6 +692,7 @@ fn launch_der_param_into(
                 client,
                 count,
                 dim,
+                SCALAR_LINE,
                 unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(target_handle, n) },
                 unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },

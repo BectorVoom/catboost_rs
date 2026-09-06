@@ -17,6 +17,9 @@ cpu = ["cb-train/cpu"]
 rocm = ["cb-train/rocm"]
 wgpu = ["cb-train/wgpu"]
 cuda = ["cb-train/cuda"]
+# Metal-Shading-Language variant of the `wgpu` arm — enables our own `wgpu` too so the
+# `#[cfg(feature = "wgpu")]` arms downstream keep applying (see cb-backend Cargo.toml).
+wgpu-msl = ["wgpu", "cb-train/wgpu-msl"]
 
 [dependencies]
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.

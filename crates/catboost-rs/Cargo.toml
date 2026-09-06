@@ -19,6 +19,9 @@ cpu = ["cb-backend/cpu", "cb-train/cpu", "cb-model/cpu"]
 rocm = ["cb-backend/rocm", "cb-train/rocm", "cb-model/rocm"]
 wgpu = ["cb-backend/wgpu", "cb-train/wgpu", "cb-model/wgpu"]
 cuda = ["cb-backend/cuda", "cb-train/cuda", "cb-model/cuda"]
+# Metal-Shading-Language variant of the `wgpu` arm — enables our own `wgpu` too so the
+# `#[cfg(feature = "wgpu")]` arms downstream keep applying (see cb-backend Cargo.toml).
+wgpu-msl = ["wgpu", "cb-backend/wgpu-msl", "cb-train/wgpu-msl", "cb-model/wgpu-msl"]
 
 [dependencies]
 # D-15 default: the published facade is treated as a thiserror-only LIBRARY —

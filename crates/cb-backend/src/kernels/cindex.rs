@@ -20,11 +20,17 @@
 use cubecl::prelude::*;
 
 use crate::gpu_runtime::cindex::{feature_bits, pack_cindex, read_bin_host};
+#[cfg(not(feature = "wgpu"))]
 use crate::kernels::ctr_device::binarize_ctr_column_host;
 use crate::kernels::read_all_bins_kernel;
 
 /// Launch geometry: 32-wide cubes (wave32 gfx1100), enough cubes to cover every cell.
-const CUBE_DIM: usize = 32;
+/// The block-reduce-family cube width the selected runtime is launched at — the
+/// core-capped `gpu_runtime::cube_dim()` (32 on a GPU, at most one unit per core on
+/// the CPU runtime, where a wider spin-barrier launch costs ~1 s per cube).
+fn cube_dim() -> usize {
+    crate::gpu_runtime::cube_dim()
+}
 
 /// Pack `bins` (feature-major `bins[feature * n + obj]`, per-feature bucket counts
 /// `n_buckets`) into the grouped bit-packed cindex on the host, upload it, then read back
@@ -38,7 +44,7 @@ fn pack_then_read_all(bins: &[u32], n_buckets: &[usize], n: usize) -> Vec<u32> {
 
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: CUBE_DIM as u32, y: 1, z: 1 };
+    let dim32 = CubeDim { x: cube_dim() as u32, y: 1, z: 1 };
 
     let words_h = client.create(cubecl::bytes::Bytes::from_elems(packed.words.clone()));
     let offsets_h = client.create(cubecl::bytes::Bytes::from_elems(offsets));
@@ -47,7 +53,7 @@ fn pack_then_read_all(bins: &[u32], n_buckets: &[usize], n: usize) -> Vec<u32> {
 
     let total = n_features * n;
     let out_h = client.empty(total * std::mem::size_of::<u32>());
-    let cubes = total.div_ceil(CUBE_DIM).max(1);
+    let cubes = total.div_ceil(cube_dim()).max(1);
     read_all_bins_kernel::launch::<f64, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(cubes as u32, 1, 1),
@@ -58,6 +64,10 @@ fn pack_then_read_all(bins: &[u32], n_buckets: &[usize], n: usize) -> Vec<u32> {
         unsafe { ArrayArg::from_raw_parts(masks_h, n_features) },
         unsafe { ArrayArg::from_raw_parts(out_h.clone(), total) },
         n_features as u32,
+        // The grid-stride step = this launch's total thread count. Supplied by the
+        // host because `CUBE_COUNT` is not a builtin the CPU runtime implements —
+        // see GRID STRIDE in `kernels.rs`.
+        (cubes * cube_dim()) as u32,
     );
 
     let bytes = client.read_one(out_h).unwrap();
@@ -216,6 +226,7 @@ fn synth_ctr_fixture(n: usize, cardinality: u32, seed: u32) -> (Vec<u32>, Vec<u3
     (bins, class, perm)
 }
 
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn ctr_binarized_column_joins_cindex_bit_exact() {
     // Plan 08 (GPUT-10) CTR→cindex JOIN: a binarized device CTR column must pack into the cindex as

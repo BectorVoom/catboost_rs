@@ -574,3 +574,109 @@ fn multiclass_onevsall_target_class_ge_k_is_error_not_degenerate() {
         .compute_gradients(&Loss::MultiClassOneVsAll, &approx, &target_oob, k)
         .is_err());
 }
+
+/// Host references for the losses whose kernels have a branch (now a lane `select_many`)
+/// and for the two pure-arithmetic tiers, so one sweep pins every kernel family.
+fn host_der1(loss: &Loss, a: f64, t: f64) -> f64 {
+    match *loss {
+        Loss::Rmse => t - a,
+        Loss::Logloss => t - sigmoid_host(a),
+        Loss::Huber { delta } => {
+            let diff = t - a;
+            if diff.abs() < delta {
+                diff
+            } else if diff > 0.0 {
+                delta
+            } else {
+                -delta
+            }
+        }
+        Loss::Quantile { alpha, delta } => {
+            let val = t - a;
+            if val.abs() < delta {
+                0.0
+            } else if val > 0.0 {
+                alpha
+            } else {
+                -(1.0 - alpha)
+            }
+        }
+        Loss::Expectile { alpha } => {
+            let e = t - a;
+            if e > 0.0 {
+                2.0 * alpha * e
+            } else {
+                2.0 * (1.0 - alpha) * e
+            }
+        }
+        Loss::Mape => {
+            let sign = if t - a > 0.0 { 1.0 } else { -1.0 };
+            sign / 1.0f64.max(t.abs())
+        }
+        _ => unreachable!("not a loss this reference covers"),
+    }
+}
+
+/// The kernels read and write whole `Vector<F, N>`s over buffers PADDED to a multiple of
+/// the device width, and the read-back truncates. Every `n` around the width boundary —
+/// one element, one below, exactly one vector, one above, several vectors plus a tail —
+/// must produce exactly `n` derivatives that match the scalar reference. A padding bug
+/// shows here as a wrong length, a garbage tail, or a skipped last vector.
+#[test]
+fn padded_tail_lengths_match_host_reference_for_every_kernel_family() {
+    let losses = [
+        Loss::Rmse,
+        Loss::Logloss,
+        Loss::Huber { delta: 0.75 },
+        Loss::Quantile { alpha: 0.3, delta: 1e-6 },
+        Loss::Expectile { alpha: 0.8 },
+        Loss::Mape,
+    ];
+    for &n in &[1usize, 2, 3, 7, 8, 9, 15, 16, 17, 31, 33, 100, 1001] {
+        // Deterministic, sign-mixed data with exact ties at every 5th object so the
+        // `> 0` / `>= delta` boundaries are exercised, not just the generic case.
+        let approx: Vec<f64> = (0..n).map(|k| ((k * 37 % 11) as f64) * 0.35 - 1.7).collect();
+        let target: Vec<f64> = (0..n)
+            .map(|k| if k % 5 == 0 { approx[k] } else { ((k * 13 % 7) as f64) * 0.5 - 1.0 })
+            .collect();
+        for loss in &losses {
+            let ders = CpuBackend.compute_gradients(loss, &approx, &target, 1).unwrap();
+            assert_eq!(ders.der1.len(), n, "{loss:?} n={n}: der1 length");
+            assert_eq!(ders.der2.len(), n, "{loss:?} n={n}: der2 length");
+            for i in 0..n {
+                let expected = host_der1(loss, approx[i], target[i]);
+                assert!(
+                    (ders.der1[i] - expected).abs() <= 1e-12,
+                    "{loss:?} n={n} i={i}: kernel={} host={expected}",
+                    ders.der1[i]
+                );
+            }
+        }
+    }
+}
+
+/// The per-dimension loop shares one padded `target` upload across dimensions; a
+/// dimension slice whose length disagrees with it must be a typed error, never a
+/// mis-sized launch. (Reachable only through a caller bug, hence pinned here.)
+#[test]
+fn multi_dim_padding_is_consistent_across_dimensions() {
+    // dim = 3, n = 5: neither the per-dimension slice nor the whole buffer is a
+    // multiple of any vector width, so every dimension pads independently and the
+    // concatenated output must still be exactly dim * n long with no pad leaking in.
+    let n = 5;
+    let dim = 3;
+    let approx: Vec<f64> = (0..dim * n).map(|k| (k as f64) * 0.25 - 1.0).collect();
+    let target: Vec<f64> = (0..n).map(|k| (k as f64) * 0.5).collect();
+    let ders = CpuBackend
+        .compute_gradients(&Loss::Rmse, &approx, &target, dim)
+        .unwrap();
+    assert_eq!(ders.der1.len(), dim * n);
+    assert_eq!(ders.der2.len(), dim * n);
+    for d in 0..dim {
+        for i in 0..n {
+            let idx = d * n + i;
+            assert!((ders.der1[idx] - (target[i] - approx[idx])).abs() <= 1e-12, "d={d} i={i}");
+            assert!((ders.der2[idx] + 1.0).abs() <= 1e-12);
+        }
+    }
+}

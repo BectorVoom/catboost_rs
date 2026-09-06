@@ -40,6 +40,23 @@ cpu = ["cubecl/cpu"]
 wgpu = ["cubecl/wgpu"]
 cuda = ["cubecl/cuda"]
 rocm = ["cubecl/hip"]
+# `wgpu` with the Metal Shading Language compiler path (`cubecl/wgpu-msl` ->
+# `cubecl-wgpu/msl`), i.e. wgpu emitting MSL for a Metal device instead of routing
+# through naga's WGSL path. This is a SHADER-BACKEND VARIANT of the existing `wgpu`
+# arm, NOT a fifth runtime: `SelectedRuntime` stays `cubecl::wgpu::WgpuRuntime` and
+# every `#[cfg(feature = "wgpu")]` arm in `lib.rs` / `gpu_runtime` must keep applying.
+#
+# That is why this enables our OWN `wgpu` feature as well as the cubecl one. Without
+# it, `--no-default-features --features wgpu-msl` would turn on `cubecl/wgpu` (via
+# cubecl's own `wgpu-msl = ["wgpu", ...]`) while leaving cb-backend's `wgpu` cfg OFF —
+# so no `SelectedRuntime` arm would match and the crate would fail to compile with a
+# confusing "cannot find type SelectedRuntime" rather than a feature error.
+#
+# Selection still lives here rather than on the workspace `cubecl` pin, so a
+# `--features wgpu-msl` build stays cpu-free (the feature-unification landmine noted
+# above). cubecl also spells this `metal = ["wgpu-msl"]`; we forward the explicit
+# `wgpu-msl` name so the shader path is visible at the call site.
+wgpu-msl = ["wgpu", "cubecl/wgpu-msl"]
 
 [dev-dependencies]
 # Test-only (D-14/D-15 permit dev edges): the Poisson bootstrap self-oracle reads the

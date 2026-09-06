@@ -213,6 +213,16 @@ fn read_handle_f64(h: cubecl::server::Handle) -> Vec<f64> {
 
 #[test]
 fn nonbinary_8bit() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP nonbinary_8bit: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     // The 8-bit non-binary fill self-oracle: the device 2-channel histogram must
     // match the ordered host reference within the REPORTED bound over n=1, n=37
     // (non-cube-multiple), and large N, plus the empty short-circuit. The reported
@@ -256,6 +266,16 @@ fn nonbinary_8bit() {
 
 #[test]
 fn nonbinary_8bit_f32() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP nonbinary_8bit_f32: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     // f32-magnitude fixture cast to f64 at the seam (the seam is f64-typed, matching
     // the cb-compute reduction order). A generous f32 relative bound (~1e-3) catches a
     // wrong histogram without pinning the GPU-06 epsilon.
@@ -290,6 +310,16 @@ fn nonbinary_8bit_f32() {
 
 #[test]
 fn handoff() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP handoff: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     // The SC-3 / D-7.3-05 device-residency assertion: der1(UNWEIGHTED)/weight/cindex/
     // indices handles in -> `launch_pointwise_hist2_handle` returns the `binSums` as a
     // device HANDLE with NO host fold inserted on the seam. The read-back happens ONCE
@@ -329,6 +359,16 @@ fn handoff() {
 
 #[test]
 fn nonbinary_bits() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP nonbinary_bits: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     // The 5/6/7-bit non-binary fill self-oracle (Plan B): the SAME
     // `pointwise_hist2_nonbinary_kernel` selected through the comptime `bits` arg —
     // no new kernel family, no runtime bit-count branch (D-7.3-02). For each bit-width
@@ -390,6 +430,16 @@ fn nonbinary_bits() {
 
 #[test]
 fn half_byte() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP half_byte: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     // The half-byte (4-bit) fill self-oracle (Plan C — D-7.3-02/03/04): the SEPARATE
     // `pointwise_hist2_half_byte_kernel` family (NOT a comptime case of the non-binary
     // kernel) selected host-side from the half-byte border count `n_bins == 16`. Its
@@ -472,6 +522,16 @@ fn half_byte() {
 
 #[test]
 fn binary() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP binary: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     // The binary (1-bit) fill self-oracle (Plan D — D-7.3-02/03/04): the SEPARATE
     // `pointwise_hist2_binary_kernel` family (NOT a comptime case of the non-binary or
     // half-byte kernels) selected host-side from the binary border count `n_bins == 2`.
@@ -562,6 +622,16 @@ fn binary() {
 /// its kernel family (binary=2, half-byte=16, non-binary 5/6/7/8-bit=32/64/128/256).
 #[test]
 fn whole_family() {
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+    // (cubecl-cpu implements no atomics). A red test here would report a runtime
+    // limitation as a numerical regression — see `channel_atomics_available`.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[pointwise_hist] SKIP whole_family: backend advertises no channel-float \
+             atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
     let n_features = 2usize;
     // Every covered border count -> the kernel family the frozen seam dispatches to:
     //   2   -> pointwise_hist2_binary_kernel      (1-bit, Plan D)

@@ -47,7 +47,12 @@ use crate::SelectedRuntime;
 
 /// Launch geometry: 32-wide cubes (wave32 gfx1100), enough cubes to cover every element —
 /// mirrors the `sort.rs` / `kernels.rs` scatter geometry (one bounds-guarded write per lane).
-const CUBE_DIM: usize = 32;
+/// The block-reduce-family cube width the selected runtime is launched at — the
+/// core-capped `gpu_runtime::cube_dim()` (32 on a GPU, at most one unit per core on
+/// the CPU runtime, where a wider spin-barrier launch costs ~1 s per cube).
+fn cube_dim() -> usize {
+    crate::gpu_runtime::cube_dim()
+}
 
 /// `DBL_EPSILON` — the tolerance the upstream weighted-quantile search compares against
 /// (`quantile.cpp:67/98`, `optimal_const_for_loss.h:95`), matching
@@ -87,8 +92,8 @@ fn run_radix_sort_device(keys: &[u32], values: &[u32]) -> CbResult<(Vec<u32>, Ve
 
     let device = <SelectedRuntime as Runtime>::Device::default();
     let client = <SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: CUBE_DIM as u32, y: 1, z: 1 };
-    let n_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let dim32 = CubeDim { x: cube_dim() as u32, y: 1, z: 1 };
+    let n_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(n_cubes as u32, 1, 1);
 
     // Number of LSD passes = bit-width of the largest key (0 keys ⇒ already sorted).

@@ -29,62 +29,9 @@ use crate::kernels::{
     poisson_gradient_kernel, poisson_hessian_kernel, quantile_gradient_kernel,
     tweedie_gradient_kernel, tweedie_hessian_kernel,
 };
-use crate::launch_geometry::launch_1d;
-
-/// Approximate scalar operations one lane of an elementwise loss kernel performs,
-/// the `work_per_lane` argument every helper below passes to [`launch_1d`].
-///
-/// `16` is CALIBRATED, not counted. The instruction count per lane ranges from one
-/// subtraction (`target - approx`) to an f64 `exp` plus a divide (Logloss, Poisson,
-/// Tweedie), so no single honest static number exists; what the constant really has to
-/// do is put the unit count in the right place across the range of `n` a fit actually
-/// sees. Measured on the 16-core dev box, `compute_gradients(Logloss)`, best-of-3 in
-/// ms/call:
-///
-/// | n         |  wpl=4 | wpl=16 |  wpl=64 |
-/// |-----------|--------|--------|---------|
-/// | 10 000    |  0.250 |  0.434 |   2.638 |
-/// | 50 000    |  2.850 |  1.449 |   2.448 |
-/// | 100 000   |  6.610 |  3.238 |   4.668 |
-/// | 300 000   | 15.698 | 11.323 |  14.160 |
-/// | 1 000 000 | 46.305 | 36.204 |  45.276 |
-///
-/// `4` was the first estimate and it is the wrong answer: it under-parallelizes the
-/// mid-range, reaching only 12 of 16 units at n=100k, which measured SLOWER than the
-/// hard-coded 32-wide geometry it replaced. `64` overshoots the other way and splits
-/// launches too small to pay for the split. `16` is the only one of the three that
-/// beats the old geometry at every size tested.
-///
-/// This replaces the former `const CUBE_DIM: usize = 32`, which fixed the geometry
-/// regardless of both the hardware and `n`. See [`crate::launch_geometry`] for the
-/// cost model that motivates the change.
-///
-/// This is the TRANSCENDENTAL tier: every kernel routed through it contains an f64
-/// `exp`/`tanh`/`ln`/`powf` (Logloss, Focal, LogCosh, Lq, Poisson, Tweedie). Kernels
-/// that are pure arithmetic/branch with no transcendental call (RMSE, MAPE,
-/// Quantile/MAE, Huber, Expectile) use [`CHEAP_ELEMENTWISE_WORK_PER_LANE`] instead —
-/// see that constant for why blending the two tiers is wrong, not just imprecise.
-pub(crate) const ELEMENTWISE_WORK_PER_LANE: usize = 16;
-
-/// Scalar element-operations one CPU unit should be worth for a CHEAP elementwise
-/// kernel: pure arithmetic and/or a branch, no transcendental call. `target - approx`
-/// (RMSE), a sign/compare/divide (MAPE), or a compare-and-select (Quantile/MAE, Huber,
-/// Expectile) is on the order of a handful of scalar ops, not the ~20-30 cycles an f64
-/// `exp` plus a divide costs (the workload [`ELEMENTWISE_WORK_PER_LANE`] is calibrated
-/// against).
-///
-/// This value is an ANALYTICAL estimate from the kernel's own instruction count (see
-/// `kernels.rs`: `gradient_kernel`/`mape_gradient_kernel`/`quantile_gradient_kernel`/
-/// `huber_*_kernel`/`expectile_*_kernel` bodies), not a re-run of the
-/// [`ELEMENTWISE_WORK_PER_LANE`] benchmark on this per-kernel workload — that table was
-/// measured against Logloss, whose true per-lane cost is close to its 16. Using that
-/// SAME 16 for a ~1-op kernel overstates its true cost 16x, which understates how far
-/// `n` must grow before a second CPU unit earns back its dispatch overhead, i.e. it
-/// would parallelize a cheap kernel earlier than the real workload justifies. `4` is a
-/// deliberately conservative floor above the true op count (not `1`), so a
-/// mis-estimate errs toward under- rather than over-parallelizing — the safe direction
-/// for this module's whole thesis (dispatch overhead dominates below the threshold).
-pub(crate) const CHEAP_ELEMENTWISE_WORK_PER_LANE: usize = 4;
+use crate::launch_geometry::{
+    der_line_size, LaneCost, launch_1d, STREAMING_LANE, TRANSCENDENTAL_LANE,
+};
 
 /// The CubeCL CPU runtime as `cb-compute`'s [`Runtime`]. A zero-sized handle —
 /// the actual CubeCL client is created per call from the default device (the
@@ -92,97 +39,73 @@ pub(crate) const CHEAP_ELEMENTWISE_WORK_PER_LANE: usize = 4;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
-/// Launch a single elementwise `der1 = f(approx, target)` kernel on `CpuRuntime`
-/// and read back the `f64` output, in object order. `work_per_lane` is the caller's
-/// classification of `kernel`'s per-lane cost — [`ELEMENTWISE_WORK_PER_LANE`] for a
-/// kernel with a transcendental call, [`CHEAP_ELEMENTWISE_WORK_PER_LANE`] for pure
-/// arithmetic/branch — so one shared launch helper still gets per-kernel geometry.
-fn launch_binary_f64(
-    approx: &[f64],
-    target: &[f64],
-    kernel: BinaryKernel,
-    work_per_lane: usize,
-) -> CbResult<Vec<f64>> {
-    let n = approx.len();
-    let device = cubecl::cpu::CpuDevice;
-    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-
-    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
-    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
-    let out_handle = client.empty(std::mem::size_of_val(approx));
-
-    let (count, dim) = launch_1d(&client, n, work_per_lane);
-
-    match kernel {
-        BinaryKernel::RmseGradient => gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-            &client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-        ),
-        BinaryKernel::LoglossGradient => {
-            logloss_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            )
-        }
-        BinaryKernel::LogCoshGradient => {
-            logcosh_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            )
-        }
-        BinaryKernel::LogCoshHessian => {
-            logcosh_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            )
-        }
-        BinaryKernel::PoissonGradient => {
-            poisson_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            )
-        }
-        BinaryKernel::MapeGradient => {
-            mape_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client,
-                count,
-                dim,
-                unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-                unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            )
-        }
-    }
-
-    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
-    // to a zero buffer would masquerade as a valid all-zero derivative vector,
-    // silently producing a degenerate (no-gradient) tree instead of surfacing the
-    // backend failure. `compute_gradients` returns CbResult, so the error channel
-    // exists — use it.
-    let bytes = client.read_one(out_handle).map_err(|e| {
-        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
-    })?;
-    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+/// One upload of a loss's `(approx, target)` inputs, shared by EVERY derivative
+/// launch that reads them — padded to the kernels' vector width and written straight
+/// into the runtime's own memory.
+///
+/// # Why this exists
+///
+/// Nearly every loss needs two derivative buffers, and each used to be produced by a
+/// self-contained launcher that re-created the client, re-uploaded its inputs, launched,
+/// and read back. So a two-derivative loss uploaded the same `approx` (and usually the
+/// same `target`) TWICE per call, and MultiQuantile uploaded the same `target` once per
+/// quantile dimension. Hoisting the uploads out of the launchers is rule R6 of the
+/// CPU-kernel design manual ("fewer launches, fewer readbacks"). The handles are
+/// `.clone()`d into each launch (a CubeCL handle is a shared reference to the device
+/// allocation, not a copy of it), so N launches read ONE upload.
+///
+/// # Why the upload bypasses `client.create`
+///
+/// On the CubeCL CPU runtime the upload was the dominant cost of the whole call. A
+/// sampling profile of `compute_gradients` at `n = 1_000_000` (f64, 8 MB per vector)
+/// put `_platform_memmove` second only to `exp` in the whole process, and every one of
+/// those copies belonged to `client.create(Bytes::from_elems(v.to_vec()))`:
+///
+/// 1. our own `to_vec()` of the caller's slice;
+/// 2. `Bytes::from_elems` re-allocating to enforce the runtime's alignment
+///    (`try_enforce_runtime_align` -> `alloc_with_data`);
+/// 3. `ComputeClient::do_create` copying the `Bytes` AGAIN
+///    (`Bytes::from_bytes_vec(data.to_vec())`, `cubecl-runtime` `client.rs`);
+/// 4. the queue thread's `copy_from_slice` into the freshly `alloc_zeroed` pool page.
+///
+/// Four 8 MB copies to move 8 MB. `client.empty` + `client.get_resource` exposes the
+/// pool memory of a fresh handle directly (`BytesResource::get_write_ptr_and_length`),
+/// so [`upload_padded`] does exactly ONE copy, from the caller's slice into the pool.
+/// Measured on an 8-core Apple M1 at `n = 1_000_000`, median of 21, two vectors:
+///
+/// | upload path                                   | ms   |
+/// |-----------------------------------------------|------|
+/// | `client.create(Bytes::from_elems(to_vec()))`  | 2.22 |
+/// | `client.empty` + `get_resource` + one memcpy  | 0.76 |
+///
+/// This is CPU-runtime specific by construction: it relies on the storage resource
+/// being host memory (`BytesResource`), which is why it lives here and not in the
+/// backend-generic der seams.
+///
+/// # Why the buffers are padded
+///
+/// The der kernels read and write `Vector<F, N>` (VECTORIZED ELEMENTWISE DER KERNELS
+/// in `kernels.rs`), and a kernel that indexes whole vectors cannot bounds-check a
+/// trailing partial one — it would simply skip it. Rather than fall back to a scalar
+/// launch whenever `n` is not a multiple of the width (which real row counts almost
+/// never are), every buffer here is `n_pad = ceil(n / line) * line` elements: the pad
+/// lanes of the inputs are zeroed (pool memory is recycled, so a fresh handle is NOT
+/// guaranteed clean), the kernel computes their derivative like any other lane, and
+/// [`DerInputs::read`] truncates to `n`. The padding costs at most `line - 1` elements
+/// per buffer and keeps every launch on the vectorized path.
+struct DerInputs {
+    client: cubecl::client::ComputeClient<cubecl::cpu::CpuRuntime>,
+    /// Uploaded `approx` (`n_pad` elements) — read by every gradient and hessian kernel.
+    approx: cubecl::server::Handle,
+    /// Uploaded `target` (`n_pad` elements) — read by every BINARY kernel (the unary
+    /// hessians ignore it).
+    target: cubecl::server::Handle,
+    /// Object count; the length of both logical inputs and of every returned output.
+    n: usize,
+    /// `n` rounded up to a multiple of `line`: the element count of every device buffer.
+    n_pad: usize,
+    /// The kernels' vector width for this device ([`der_line_size`]).
+    line: usize,
 }
 
 /// Which elementwise binary (approx, target) -> der kernel to launch. LogCosh is
@@ -195,181 +118,37 @@ enum BinaryKernel {
     LogCoshGradient,
     LogCoshHessian,
     /// Poisson gradient `target - exp(approx)` (the hessian is the unary
-    /// [`launch_poisson_hessian`] — no target input).
+    /// [`UnaryKernel::PoissonHessian`] — no target input).
     PoissonGradient,
     /// MAPE gradient `sign(target-approx)/max(1,|target|)` (der2=0 — no hessian
     /// kernel; the dispatch fills a constant-0 vec, the Mae precedent).
     MapeGradient,
 }
 
-/// Launch the Logloss hessian kernel (`der2 = -p*(1-p)`) on `CpuRuntime`.
-fn launch_logloss_hessian(approx: &[f64]) -> CbResult<Vec<f64>> {
-    let n = approx.len();
-    let device = cubecl::cpu::CpuDevice;
-    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-
-    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
-    let out_handle = client.empty(std::mem::size_of_val(approx));
-
-    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
-
-    logloss_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-        &client,
-        count,
-        dim,
-        unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-    );
-
-    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
-    // to a zero buffer would masquerade as a valid all-zero derivative vector,
-    // silently producing a degenerate (no-gradient) tree instead of surfacing the
-    // backend failure. `compute_gradients` returns CbResult, so the error channel
-    // exists — use it.
-    let bytes = client.read_one(out_handle).map_err(|e| {
-        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
-    })?;
-    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
-}
-
-/// Launch the Poisson hessian kernel (`der2 = -exp(approx)`) on `CpuRuntime`. A
-/// unary (approx-only) kernel like [`launch_logloss_hessian`] — the Poisson
-/// hessian does not depend on the target.
-fn launch_poisson_hessian(approx: &[f64]) -> CbResult<Vec<f64>> {
-    let n = approx.len();
-    let device = cubecl::cpu::CpuDevice;
-    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-
-    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
-    let out_handle = client.empty(std::mem::size_of_val(approx));
-
-    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
-
-    poisson_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-        &client,
-        count,
-        dim,
-        unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-    );
-
-    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
-    // to a zero buffer would masquerade as a valid all-zero derivative vector,
-    // silently producing a degenerate (no-gradient) tree instead of surfacing the
-    // backend failure. `compute_gradients` returns CbResult, so the error channel
-    // exists — use it.
-    let bytes = client.read_one(out_handle).map_err(|e| {
-        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
-    })?;
-    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
-}
-
-/// Launch a Focal elementwise derivative kernel (`gradient` or `hessian`) on
-/// `CpuRuntime`, passing the scalar `alpha`/`gamma` loss parameters, and read
-/// back the `f64` output in object order.
-fn launch_focal_f64(
-    approx: &[f64],
-    target: &[f64],
-    alpha: f64,
-    gamma: f64,
-    hessian: bool,
-) -> CbResult<Vec<f64>> {
-    let n = approx.len();
-    let device = cubecl::cpu::CpuDevice;
-    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-
-    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
-    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
-    let out_handle = client.empty(std::mem::size_of_val(approx));
-    // Loss params pass as length-1 device arrays (the kernel stays generic over
-    // F — a generic scalar arg would need the non-generic ScalarArgType bound).
-    let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
-    let gamma_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![gamma]));
-
-    let (count, dim) = launch_1d(&client, n, ELEMENTWISE_WORK_PER_LANE);
-
-    if hessian {
-        focal_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-            &client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
-            unsafe { ArrayArg::from_raw_parts(gamma_handle, 1) },
-        );
-    } else {
-        focal_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-            &client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-            unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-            unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
-            unsafe { ArrayArg::from_raw_parts(gamma_handle, 1) },
-        );
+impl BinaryKernel {
+    /// The per-lane cost class that picks this kernel's launch width. Kernels carrying
+    /// an f64 transcendental are compute-bound ([`TRANSCENDENTAL_LANE`]); the pure
+    /// arithmetic/branch ones are memory-bound ([`STREAMING_LANE`]) and must NOT be
+    /// given the whole machine — see that constant for the measurements.
+    fn lane(self) -> LaneCost {
+        match self {
+            BinaryKernel::RmseGradient | BinaryKernel::MapeGradient => STREAMING_LANE,
+            BinaryKernel::LoglossGradient
+            | BinaryKernel::LogCoshGradient
+            | BinaryKernel::LogCoshHessian
+            | BinaryKernel::PoissonGradient => TRANSCENDENTAL_LANE,
+        }
     }
-
-    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
-    // to a zero buffer would masquerade as a valid all-zero derivative vector,
-    // silently producing a degenerate (no-gradient) tree instead of surfacing the
-    // backend failure. `compute_gradients` returns CbResult, so the error channel
-    // exists — use it.
-    let bytes = client.read_one(out_handle).map_err(|e| {
-        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
-    })?;
-    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
-/// Launch the Quantile gradient kernel (`val = target - approx; der1 = |val| <
-/// delta ? 0 : (val > 0 ? alpha : -(1-alpha))`) on `CpuRuntime`, passing the
-/// `alpha`/`delta` loss parameters as length-1 device arrays, and read back the
-/// `f64` der1 in object order. Gradient-only — the Quantile der2 is the constant
-/// `0` (the dispatch fills a zero vec, the Mae precedent). Mirrors
-/// [`launch_focal_f64`] for the two-parameter Quantile gradient.
-fn launch_quantile_f64(
-    approx: &[f64],
-    target: &[f64],
-    alpha: f64,
-    delta: f64,
-) -> CbResult<Vec<f64>> {
-    let n = approx.len();
-    let device = cubecl::cpu::CpuDevice;
-    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-
-    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
-    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
-    let out_handle = client.empty(std::mem::size_of_val(approx));
-    // The loss params pass as length-1 device arrays (the kernel stays generic
-    // over F — a generic scalar arg would need the non-generic ScalarArgType bound).
-    let alpha_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![alpha]));
-    let delta_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![delta]));
-
-    // Quantile is compare-and-select only (no transcendental) — the cheap tier.
-    let (count, dim) = launch_1d(&client, n, CHEAP_ELEMENTWISE_WORK_PER_LANE);
-
-    quantile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-        &client,
-        count,
-        dim,
-        unsafe { ArrayArg::from_raw_parts(approx_handle, n) },
-        unsafe { ArrayArg::from_raw_parts(target_handle, n) },
-        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
-        unsafe { ArrayArg::from_raw_parts(alpha_handle, 1) },
-        unsafe { ArrayArg::from_raw_parts(delta_handle, 1) },
-    );
-
-    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
-    // to a zero buffer would masquerade as a valid all-zero derivative vector,
-    // silently producing a degenerate (no-gradient) tree instead of surfacing the
-    // backend failure. `compute_gradients` returns CbResult, so the error channel
-    // exists — use it.
-    let bytes = client.read_one(out_handle).map_err(|e| {
-        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
-    })?;
-    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
+/// Which elementwise UNARY (approx-only) hessian kernel to launch. Both are exp-link
+/// second derivatives that do not read the target at all.
+#[derive(Clone, Copy)]
+enum UnaryKernel {
+    /// Logloss / CrossEntropy hessian `der2 = -p*(1-p)`, `p = sigmoid(approx)`.
+    LoglossHessian,
+    /// Poisson hessian `der2 = -exp(approx)`.
+    PoissonHessian,
 }
 
 /// Which single-parameter smooth-loss derivative kernel to launch (Lq{q},
@@ -387,133 +166,413 @@ enum ParamKernel {
     Tweedie,
 }
 
-/// Launch a single-parameter smooth-loss derivative kernel (`gradient` or
-/// `hessian`) on `CpuRuntime`, passing the scalar loss `param` (q / delta /
-/// alpha) as a length-1 device array, and read back the `f64` output in object
-/// order. Mirrors [`launch_focal_f64`] for the one-parameter losses.
-fn launch_param_f64(
-    approx: &[f64],
-    target: &[f64],
-    param: f64,
-    kind: ParamKernel,
-    hessian: bool,
-) -> CbResult<Vec<f64>> {
-    let n = approx.len();
-    let device = cubecl::cpu::CpuDevice;
-    let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
-
-    let approx_handle = client.create(cubecl::bytes::Bytes::from_elems(approx.to_vec()));
-    let target_handle = client.create(cubecl::bytes::Bytes::from_elems(target.to_vec()));
-    let out_handle = client.empty(std::mem::size_of_val(approx));
-    // The loss parameter passes as a length-1 device array (the kernel stays
-    // generic over F — a generic scalar arg would need the non-generic
-    // ScalarArgType bound).
-    let param_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![param]));
-
-    // Lq (`powf`) and Tweedie (two `exp`s) carry a transcendental; Huber and
-    // Expectile are compare/arithmetic only — the cheap tier.
-    let work_per_lane = match kind {
-        ParamKernel::Lq | ParamKernel::Tweedie => ELEMENTWISE_WORK_PER_LANE,
-        ParamKernel::Huber | ParamKernel::Expectile => CHEAP_ELEMENTWISE_WORK_PER_LANE,
-    };
-    let (count, dim) = launch_1d(&client, n, work_per_lane);
-
-    let approx_arg = unsafe { ArrayArg::from_raw_parts(approx_handle, n) };
-    let target_arg = unsafe { ArrayArg::from_raw_parts(target_handle, n) };
-    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) };
-    let param_arg = unsafe { ArrayArg::from_raw_parts(param_handle, 1) };
-
-    match (kind, hessian) {
-        (ParamKernel::Lq, false) => lq_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-            &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-        ),
-        (ParamKernel::Lq, true) => lq_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-            &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-        ),
-        (ParamKernel::Huber, false) => {
-            huber_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-            )
-        }
-        (ParamKernel::Huber, true) => {
-            huber_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-            )
-        }
-        (ParamKernel::Expectile, false) => {
-            expectile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-            )
-        }
-        (ParamKernel::Expectile, true) => {
-            expectile_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-            )
-        }
-        (ParamKernel::Tweedie, false) => {
-            tweedie_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-            )
-        }
-        (ParamKernel::Tweedie, true) => {
-            tweedie_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
-                &client, count, dim, approx_arg, target_arg, out_arg, param_arg,
-            )
+impl ParamKernel {
+    /// Per-lane cost class — see [`BinaryKernel::lane`]. Lq (`powf`) and Tweedie (two
+    /// `exp`s) carry a transcendental; Huber and Expectile are compare/arithmetic only.
+    fn lane(self) -> LaneCost {
+        match self {
+            ParamKernel::Lq | ParamKernel::Tweedie => TRANSCENDENTAL_LANE,
+            ParamKernel::Huber | ParamKernel::Expectile => STREAMING_LANE,
         }
     }
-
-    // Propagate a device read-back failure as a typed CbError (WR-05): mapping it
-    // to a zero buffer would masquerade as a valid all-zero derivative vector,
-    // silently producing a degenerate (no-gradient) tree instead of surfacing the
-    // backend failure. `compute_gradients` returns CbResult, so the error channel
-    // exists — use it.
-    let bytes = client.read_one(out_handle).map_err(|e| {
-        CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
-    })?;
-    Ok(bytemuck::cast_slice::<u8, f64>(&bytes).to_vec())
 }
 
-/// Compute the per-object der1/der2 for `loss` over a SINGLE dimension's slices
-/// (`approx_d` and `target_d` both length `n`), reusing the existing per-loss
-/// CubeCL kernel launchers. This is the scalar body of the historical
-/// `compute_gradients` match, extracted verbatim so the outer per-dimension loop
-/// in [`CpuBackend::compute_gradients`] can call it once per dimension over the
-/// dim-major slices. At `approx_dimension == 1` the loop runs this exactly once
-/// over `approx[0..n]`, so the kernel inputs, the `cb_core::sum_f64` order
-/// downstream, and the output are byte-identical to the pre-6.2 scalar path
-/// (RESEARCH Pitfall 1). No new loss arm is added here.
+/// Upload `data` into a fresh `n_pad`-element `f64` device buffer with ONE copy, zeroing
+/// the `n_pad - data.len()` pad lanes. See [`DerInputs`] for why this bypasses
+/// `client.create`.
+fn upload_padded(
+    client: &cubecl::client::ComputeClient<cubecl::cpu::CpuRuntime>,
+    data: &[f64],
+    n_pad: usize,
+) -> CbResult<cubecl::server::Handle> {
+    let total_bytes = n_pad * std::mem::size_of::<f64>();
+    let handle = client.empty(total_bytes);
+    // `get_resource` runs the stream to completion before handing out the resource, so
+    // nothing is in flight on this allocation, and the `ManagedResource` keeps the
+    // binding alive for as long as the pointer is used.
+    let resource = client.get_resource(handle.clone()).map_err(|e| {
+        CbError::Degenerate(format!("CubeCL device upload failed to map the buffer: {e:?}"))
+    })?;
+    let (dst, dst_len) = resource.resource().get_write_ptr_and_length();
+    let src = bytemuck::cast_slice::<f64, u8>(data);
+    if dst_len < total_bytes || src.len() > total_bytes {
+        return Err(CbError::Degenerate(format!(
+            "CubeCL device upload mapped {dst_len} bytes for a {total_bytes}-byte buffer \
+             ({} bytes of input)",
+            src.len()
+        )));
+    }
+    // SAFETY: `dst` addresses `dst_len >= total_bytes` bytes of a live, initialised
+    // (`alloc_zeroed`) pool allocation that `resource` keeps bound; the handle was
+    // created two statements above and has been handed to no launch, so this is the
+    // only access to that region; `src.len() <= total_bytes` and the two ranges belong
+    // to different allocations, so they cannot overlap. This is the same contract as
+    // `BytesResource::write`, which only differs in requiring `&mut` to prove
+    // exclusivity at the type level — exclusivity we hold by construction.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        std::ptr::write_bytes(dst.add(src.len()), 0, total_bytes - src.len());
+    }
+    Ok(handle)
+}
+
+impl DerInputs {
+    /// Upload `approx` and `target` ONCE, padded to the device's vector width. Every
+    /// launch below reads these handles.
+    fn new(approx: &[f64], target: &[f64]) -> CbResult<Self> {
+        let device = cubecl::cpu::CpuDevice;
+        let client = <cubecl::cpu::CpuRuntime as cubecl::Runtime>::client(&device);
+        let line = der_line_size(&client, std::mem::size_of::<f64>());
+        let n = approx.len();
+        let n_pad = n.div_ceil(line) * line;
+        Ok(Self {
+            approx: upload_padded(&client, approx, n_pad)?,
+            target: upload_padded(&client, target, n_pad)?,
+            n,
+            n_pad,
+            line,
+            client,
+        })
+    }
+
+    /// The same uploaded `target`, paired with a DIFFERENT `approx` of the same length.
+    ///
+    /// MultiQuantile is `K` independent quantile dimensions over ONE shared per-object
+    /// target: only `approx` changes from dimension to dimension. Re-running
+    /// [`DerInputs::new`] per dimension would re-upload that shared target `K` times
+    /// (8 MB each at `n = 1M`); this uploads only the slice that actually changed.
+    fn with_approx(&self, approx: &[f64]) -> CbResult<Self> {
+        if approx.len() != self.n {
+            return Err(CbError::LengthMismatch {
+                column: "approx".to_owned(),
+                expected: self.n,
+                actual: approx.len(),
+            });
+        }
+        Ok(Self {
+            client: self.client.clone(),
+            approx: upload_padded(&self.client, approx, self.n_pad)?,
+            target: self.target.clone(),
+            n: self.n,
+            n_pad: self.n_pad,
+            line: self.line,
+        })
+    }
+
+    /// A fresh, uninitialised `n_pad`-element `f64` output buffer. Every kernel writes
+    /// each of its lanes exactly once, so there is nothing to zero (manual R4: write, do
+    /// not add) — and `client.empty` is free where a zero-fill would move 8 MB.
+    fn out(&self) -> cubecl::server::Handle {
+        self.client.empty(self.n_pad * std::mem::size_of::<f64>())
+    }
+
+    /// The launch geometry for one elementwise kernel of per-lane cost `lane`: one lane
+    /// per `line`-wide vector, so the launch spans `n_pad / line` lanes.
+    fn geometry(&self, lane: LaneCost) -> (CubeCount, CubeDim) {
+        launch_1d(&self.client, self.n_pad / self.line, lane.per_vector(self.line))
+    }
+
+    /// Read one output buffer back in object order, dropping the pad lanes.
+    ///
+    /// Propagate a device read-back failure as a typed CbError (WR-05): mapping it to a
+    /// zero buffer would masquerade as a valid all-zero derivative vector, silently
+    /// producing a degenerate (no-gradient) tree instead of surfacing the backend
+    /// failure. `compute_gradients` returns CbResult, so the error channel exists.
+    fn read(&self, out: cubecl::server::Handle) -> CbResult<Vec<f64>> {
+        let bytes = self.client.read_one(out).map_err(|e| {
+            CbError::Degenerate(format!("CubeCL device read-back failed: {e:?}"))
+        })?;
+        let all = bytemuck::cast_slice::<u8, f64>(&bytes);
+        let live = all.get(..self.n).ok_or_else(|| {
+            CbError::Degenerate(format!(
+                "CubeCL device read-back returned {} elements for an n={} launch",
+                all.len(),
+                self.n
+            ))
+        })?;
+        Ok(live.to_vec())
+    }
+
+    /// A length-1 device array holding one scalar loss parameter. The parameters pass as
+    /// arrays rather than scalar kernel args so the kernels stay generic over `F: Float`
+    /// (a generic scalar arg would need the non-generic `ScalarArgType` bound).
+    fn scalar(&self, value: f64) -> cubecl::server::Handle {
+        self.client
+            .create(cubecl::bytes::Bytes::from_elems(vec![value]))
+    }
+
+    /// Launch an elementwise binary `der = f(approx, target)` kernel and read it back.
+    fn binary(&self, kernel: BinaryKernel) -> CbResult<Vec<f64>> {
+        let out = self.out();
+        let (count, dim) = self.geometry(kernel.lane());
+        let approx = unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) };
+        let target = unsafe { ArrayArg::from_raw_parts(self.target.clone(), self.n_pad) };
+        let der = unsafe { ArrayArg::from_raw_parts(out.clone(), self.n_pad) };
+
+        match kernel {
+            BinaryKernel::RmseGradient => gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &self.client,
+                count,
+                dim,
+                self.line,
+                approx,
+                target,
+                der,
+            ),
+            BinaryKernel::LoglossGradient => {
+                logloss_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    target,
+                    der,
+                )
+            }
+            BinaryKernel::LogCoshGradient => {
+                logcosh_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    target,
+                    der,
+                )
+            }
+            BinaryKernel::LogCoshHessian => {
+                logcosh_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    target,
+                    der,
+                )
+            }
+            BinaryKernel::PoissonGradient => {
+                poisson_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    target,
+                    der,
+                )
+            }
+            BinaryKernel::MapeGradient => {
+                mape_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    target,
+                    der,
+                )
+            }
+        }
+
+        self.read(out)
+    }
+
+    /// Launch an elementwise UNARY `der2 = f(approx)` hessian kernel and read it back.
+    /// These do not read `target`, so the shared upload simply goes unused here.
+    fn unary(&self, kernel: UnaryKernel) -> CbResult<Vec<f64>> {
+        let out = self.out();
+        // Both unary hessians evaluate an f64 `exp` — the compute-bound tier.
+        let (count, dim) = self.geometry(TRANSCENDENTAL_LANE);
+        let approx = unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) };
+        let der = unsafe { ArrayArg::from_raw_parts(out.clone(), self.n_pad) };
+
+        match kernel {
+            UnaryKernel::LoglossHessian => {
+                logloss_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    der,
+                )
+            }
+            UnaryKernel::PoissonHessian => {
+                poisson_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    &self.client,
+                    count,
+                    dim,
+                    self.line,
+                    approx,
+                    der,
+                )
+            }
+        }
+
+        self.read(out)
+    }
+
+    /// Launch a Focal derivative kernel (`gradient` or `hessian`) with the scalar
+    /// `alpha`/`gamma` loss parameters, and read back the `f64` output in object order.
+    fn focal(&self, alpha: f64, gamma: f64, hessian: bool) -> CbResult<Vec<f64>> {
+        let out = self.out();
+        let alpha_h = self.scalar(alpha);
+        let gamma_h = self.scalar(gamma);
+        // Focal evaluates `exp`, `ln` and `powf` per lane — the compute-bound tier.
+        let (count, dim) = self.geometry(TRANSCENDENTAL_LANE);
+        let approx = unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) };
+        let target = unsafe { ArrayArg::from_raw_parts(self.target.clone(), self.n_pad) };
+        let der = unsafe { ArrayArg::from_raw_parts(out.clone(), self.n_pad) };
+        let alpha_arg = unsafe { ArrayArg::from_raw_parts(alpha_h, 1) };
+        let gamma_arg = unsafe { ArrayArg::from_raw_parts(gamma_h, 1) };
+
+        if hessian {
+            focal_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &self.client,
+                count,
+                dim,
+                self.line,
+                approx,
+                target,
+                der,
+                alpha_arg,
+                gamma_arg,
+            );
+        } else {
+            focal_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                &self.client,
+                count,
+                dim,
+                self.line,
+                approx,
+                target,
+                der,
+                alpha_arg,
+                gamma_arg,
+            );
+        }
+
+        self.read(out)
+    }
+
+    /// Launch the Quantile gradient kernel (`val = target - approx; der1 = |val| <
+    /// delta ? 0 : (val > 0 ? alpha : -(1-alpha))`) with the `alpha`/`delta` loss
+    /// parameters, and read back the `f64` der1 in object order. Gradient-only — the
+    /// Quantile der2 is the constant `0` (the dispatch fills a zero vec, the Mae
+    /// precedent).
+    fn quantile(&self, alpha: f64, delta: f64) -> CbResult<Vec<f64>> {
+        let out = self.out();
+        let alpha_h = self.scalar(alpha);
+        let delta_h = self.scalar(delta);
+        // Quantile is compare-and-select only (no transcendental) — the streaming tier.
+        let (count, dim) = self.geometry(STREAMING_LANE);
+
+        quantile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+            &self.client,
+            count,
+            dim,
+            self.line,
+            unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) },
+            unsafe { ArrayArg::from_raw_parts(self.target.clone(), self.n_pad) },
+            unsafe { ArrayArg::from_raw_parts(out.clone(), self.n_pad) },
+            unsafe { ArrayArg::from_raw_parts(alpha_h, 1) },
+            unsafe { ArrayArg::from_raw_parts(delta_h, 1) },
+        );
+
+        self.read(out)
+    }
+
+    /// Launch a single-parameter smooth-loss derivative kernel (`gradient` or
+    /// `hessian`), passing the scalar loss `param` (q / delta / alpha) as a length-1
+    /// device array, and read back the `f64` output in object order.
+    fn param(&self, param: f64, kind: ParamKernel, hessian: bool) -> CbResult<Vec<f64>> {
+        let out = self.out();
+        let param_h = self.scalar(param);
+        let (count, dim) = self.geometry(kind.lane());
+        let approx = unsafe { ArrayArg::from_raw_parts(self.approx.clone(), self.n_pad) };
+        let target = unsafe { ArrayArg::from_raw_parts(self.target.clone(), self.n_pad) };
+        let der = unsafe { ArrayArg::from_raw_parts(out.clone(), self.n_pad) };
+        let param_arg = unsafe { ArrayArg::from_raw_parts(param_h, 1) };
+        let c = &self.client;
+
+        match (kind, hessian) {
+            (ParamKernel::Lq, false) => lq_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                c, count, dim, self.line, approx, target, der, param_arg,
+            ),
+            (ParamKernel::Lq, true) => lq_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                c, count, dim, self.line, approx, target, der, param_arg,
+            ),
+            (ParamKernel::Huber, false) => {
+                huber_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    c, count, dim, self.line, approx, target, der, param_arg,
+                )
+            }
+            (ParamKernel::Huber, true) => {
+                huber_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    c, count, dim, self.line, approx, target, der, param_arg,
+                )
+            }
+            (ParamKernel::Expectile, false) => {
+                expectile_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    c, count, dim, self.line, approx, target, der, param_arg,
+                )
+            }
+            (ParamKernel::Expectile, true) => {
+                expectile_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    c, count, dim, self.line, approx, target, der, param_arg,
+                )
+            }
+            (ParamKernel::Tweedie, false) => {
+                tweedie_gradient_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    c, count, dim, self.line, approx, target, der, param_arg,
+                )
+            }
+            (ParamKernel::Tweedie, true) => {
+                tweedie_hessian_kernel::launch::<f64, cubecl::cpu::CpuRuntime>(
+                    c, count, dim, self.line, approx, target, der, param_arg,
+                )
+            }
+        }
+
+        self.read(out)
+    }
+}
+
+/// Compute the per-object der1/der2 for `loss` over ONE dimension's already-uploaded
+/// `(approx, target)` ([`DerInputs`], both length `n`). This is the scalar body of the
+/// historical `compute_gradients` match, so the outer per-dimension loop in
+/// [`CpuBackend::compute_gradients`] can call it once per dimension over the dim-major
+/// slices. At `approx_dimension == 1` the loop runs this exactly once over
+/// `approx[0..n]`, so the kernel inputs, the `cb_core::sum_f64` order downstream, and
+/// the output are byte-identical to the pre-6.2 scalar path (RESEARCH Pitfall 1). No
+/// new loss arm is added here.
+///
+/// It takes the uploaded inputs rather than the host slices so that BOTH derivative
+/// launches of a loss — and, across the caller's loop, every dimension — read ONE upload
+/// of each buffer (manual R6). See [`DerInputs`] for what that upload costs.
 fn compute_gradients_one_dim(
     loss: &Loss,
-    approx_d: &[f64],
-    target_d: &[f64],
+    inputs: &DerInputs,
 ) -> CbResult<(Vec<f64>, Vec<f64>)> {
     match *loss {
         Loss::Rmse => {
-            let der1 = launch_binary_f64(
-                approx_d,
-                target_d,
-                BinaryKernel::RmseGradient,
-                CHEAP_ELEMENTWISE_WORK_PER_LANE,
-            )?;
+            let der1 = inputs.binary(BinaryKernel::RmseGradient)?;
             // RMSE hessian is the constant -1.0 (no kernel needed).
-            let der2 = vec![-1.0_f64; approx_d.len()];
+            let der2 = vec![-1.0_f64; inputs.n];
             Ok((der1, der2))
         }
         // CrossEntropy shares Logloss's der1/der2 EXACTLY (D-09): reuse the
         // Logloss gradient + hessian kernels (no separate kernel needed).
         Loss::Logloss | Loss::CrossEntropy => {
-            let der1 = launch_binary_f64(
-                approx_d,
-                target_d,
-                BinaryKernel::LoglossGradient,
-                ELEMENTWISE_WORK_PER_LANE,
-            )?;
-            let der2 = launch_logloss_hessian(approx_d)?;
+            let der1 = inputs.binary(BinaryKernel::LoglossGradient)?;
+            let der2 = inputs.unary(UnaryKernel::LoglossHessian)?;
             Ok((der1, der2))
         }
         Loss::Focal { alpha, gamma } => {
-            let der1 = launch_focal_f64(approx_d, target_d, alpha, gamma, false)?;
-            let der2 = launch_focal_f64(approx_d, target_d, alpha, gamma, true)?;
+            let der1 = inputs.focal(alpha, gamma, false)?;
+            let der2 = inputs.focal(alpha, gamma, true)?;
             Ok((der1, der2))
         }
         // MAE == Quantile{alpha=0.5, delta=1e-6} (WR-04): route through the
@@ -523,9 +582,9 @@ fn compute_gradients_one_dim(
         // the host scalar under a future f32 instantiation. This makes MAE and
         // Quantile{0.5} bit-identical by construction.
         Loss::Mae => {
-            let der1 = launch_quantile_f64(approx_d, target_d, QUANTILE_ALPHA, QUANTILE_DELTA)?;
+            let der1 = inputs.quantile(QUANTILE_ALPHA, QUANTILE_DELTA)?;
             // MAE / Quantile hessian is the constant 0.0 (no kernel needed).
-            let der2 = vec![0.0_f64; approx_d.len()];
+            let der2 = vec![0.0_f64; inputs.n];
             Ok((der1, der2))
         }
         // Quantile{alpha, delta} (Wave 3): the alpha-general pinball gradient
@@ -533,74 +592,52 @@ fn compute_gradients_one_dim(
         // constant-0 vec, the Mae precedent). At alpha=0.5,delta=1e-6 the
         // gradient equals the Mae arm above (MAE == Quantile{0.5}).
         Loss::Quantile { alpha, delta } => {
-            let der1 = launch_quantile_f64(approx_d, target_d, alpha, delta)?;
-            let der2 = vec![0.0_f64; approx_d.len()];
+            let der1 = inputs.quantile(alpha, delta)?;
+            let der2 = vec![0.0_f64; inputs.n];
             Ok((der1, der2))
         }
         // Wave-1 smooth losses (D-6.1-02): all four have a real der2, so each
         // launches BOTH a gradient and a hessian kernel.
         Loss::LogCosh => {
-            let der1 = launch_binary_f64(
-                approx_d,
-                target_d,
-                BinaryKernel::LogCoshGradient,
-                ELEMENTWISE_WORK_PER_LANE,
-            )?;
-            let der2 = launch_binary_f64(
-                approx_d,
-                target_d,
-                BinaryKernel::LogCoshHessian,
-                ELEMENTWISE_WORK_PER_LANE,
-            )?;
+            let der1 = inputs.binary(BinaryKernel::LogCoshGradient)?;
+            let der2 = inputs.binary(BinaryKernel::LogCoshHessian)?;
             Ok((der1, der2))
         }
         Loss::Lq { q } => {
-            let der1 = launch_param_f64(approx_d, target_d, q, ParamKernel::Lq, false)?;
-            let der2 = launch_param_f64(approx_d, target_d, q, ParamKernel::Lq, true)?;
+            let der1 = inputs.param(q, ParamKernel::Lq, false)?;
+            let der2 = inputs.param(q, ParamKernel::Lq, true)?;
             Ok((der1, der2))
         }
         Loss::Huber { delta } => {
-            let der1 = launch_param_f64(approx_d, target_d, delta, ParamKernel::Huber, false)?;
-            let der2 = launch_param_f64(approx_d, target_d, delta, ParamKernel::Huber, true)?;
+            let der1 = inputs.param(delta, ParamKernel::Huber, false)?;
+            let der2 = inputs.param(delta, ParamKernel::Huber, true)?;
             Ok((der1, der2))
         }
         Loss::Expectile { alpha } => {
-            let der1 = launch_param_f64(approx_d, target_d, alpha, ParamKernel::Expectile, false)?;
-            let der2 = launch_param_f64(approx_d, target_d, alpha, ParamKernel::Expectile, true)?;
+            let der1 = inputs.param(alpha, ParamKernel::Expectile, false)?;
+            let der2 = inputs.param(alpha, ParamKernel::Expectile, true)?;
             Ok((der1, der2))
         }
         // Wave-2 positive-domain / link losses (D-6.1-02 / Plan 06.1-02).
         // Poisson: exp-link der (inline F::exp); gradient is a binary kernel,
         // the hessian is the unary -exp(approx) kernel (no target input).
         Loss::Poisson => {
-            let der1 = launch_binary_f64(
-                approx_d,
-                target_d,
-                BinaryKernel::PoissonGradient,
-                ELEMENTWISE_WORK_PER_LANE,
-            )?;
-            let der2 = launch_poisson_hessian(approx_d)?;
+            let der1 = inputs.binary(BinaryKernel::PoissonGradient)?;
+            let der2 = inputs.unary(UnaryKernel::PoissonHessian)?;
             Ok((der1, der2))
         }
         // Tweedie: exp INSIDE the der (raw approx, NOT exp-approx); both
         // gradient and hessian carry the variance_power scalar param.
         Loss::Tweedie { variance_power } => {
-            let der1 =
-                launch_param_f64(approx_d, target_d, variance_power, ParamKernel::Tweedie, false)?;
-            let der2 =
-                launch_param_f64(approx_d, target_d, variance_power, ParamKernel::Tweedie, true)?;
+            let der1 = inputs.param(variance_power, ParamKernel::Tweedie, false)?;
+            let der2 = inputs.param(variance_power, ParamKernel::Tweedie, true)?;
             Ok((der1, der2))
         }
         // MAPE: der2 = 0 (Pitfall 5 — Newton undefined). Only a gradient
         // kernel; the hessian is the constant 0.0 vec (the Mae precedent).
         Loss::Mape => {
-            let der1 = launch_binary_f64(
-                approx_d,
-                target_d,
-                BinaryKernel::MapeGradient,
-                CHEAP_ELEMENTWISE_WORK_PER_LANE,
-            )?;
-            let der2 = vec![0.0_f64; approx_d.len()];
+            let der1 = inputs.binary(BinaryKernel::MapeGradient)?;
+            let der2 = vec![0.0_f64; inputs.n];
             Ok((der1, der2))
         }
         // MultiClass / MultiClassOneVsAll are multi-output losses handled in
@@ -923,6 +960,10 @@ fn compute_multiquantile_gradients(
     let mut der1 = Vec::with_capacity(dim * n);
     // der2 = 0 across every dimension (QUANTILE_DER2 = 0 -> Exact leaf).
     let der2 = vec![0.0_f64; dim * n];
+    // ONE upload of the shared per-object `target`, reused by every dimension (manual
+    // R6): only `approx_d` changes across the loop. The first dimension establishes the
+    // upload; every later one swaps in just its own `approx` slice via `with_approx`.
+    let mut shared: Option<DerInputs> = None;
     for d in 0..dim {
         let approx_d = approx.get(d * n..d * n + n).unwrap_or(&[]);
         let alpha_d = alpha.get(d).copied().unwrap_or(QUANTILE_ALPHA);
@@ -932,8 +973,15 @@ fn compute_multiquantile_gradients(
         // would masquerade as a valid all-zero gradient for that quantile dimension,
         // silently training a degenerate (no-gradient) tree instead of surfacing the
         // backend failure. The empty-input guard already short-circuits dim*n == 0.
-        let der1_d = launch_quantile_f64(approx_d, target, alpha_d, delta)?;
+        let inputs = match shared.as_ref() {
+            Some(s) => s.with_approx(approx_d)?,
+            None => DerInputs::new(approx_d, target)?,
+        };
+        let der1_d = inputs.quantile(alpha_d, delta)?;
         der1.extend_from_slice(&der1_d);
+        if shared.is_none() {
+            shared = Some(inputs);
+        }
     }
     Ok((der1, der2))
 }
@@ -1077,11 +1125,25 @@ impl Runtime for CpuBackend {
         // are byte-identical to the pre-6.2 scalar path.
         let mut der1 = Vec::with_capacity(approx.len());
         let mut der2 = Vec::with_capacity(approx.len());
+        // ONE upload of the shared per-object `target` for the WHOLE separable loop
+        // (manual R6): a separable multi-dimension loss evaluates the same scalar loss
+        // against the same target on each dimension's `approx` slice, so only `approx`
+        // changes. The first dimension establishes the upload; every later one swaps in
+        // just its own slice. At `approx_dimension == 1` this is exactly one
+        // `DerInputs::new`, i.e. byte-for-byte the scalar path.
+        let mut shared: Option<DerInputs> = None;
         for d in 0..approx_dimension {
             let approx_d = &approx[d * n..d * n + n];
-            let (der1_d, der2_d) = compute_gradients_one_dim(loss, approx_d, target)?;
+            let inputs = match shared.as_ref() {
+                Some(s) => s.with_approx(approx_d)?,
+                None => DerInputs::new(approx_d, target)?,
+            };
+            let (der1_d, der2_d) = compute_gradients_one_dim(loss, &inputs)?;
             der1.extend_from_slice(&der1_d);
             der2.extend_from_slice(&der2_d);
+            if shared.is_none() {
+                shared = Some(inputs);
+            }
         }
         Ok(Derivatives { der1, der2 })
     }

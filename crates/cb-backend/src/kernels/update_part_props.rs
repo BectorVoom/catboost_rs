@@ -47,7 +47,7 @@ where
     update_part_props_kernel::launch::<F, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(num_parts as u32, 1, 1),
-        CubeDim { x: 32u32, y: 1, z: 1 },
+        CubeDim { x: crate::gpu_runtime::cube_dim() as u32, y: 1, z: 1 },
         unsafe { ArrayArg::from_raw_parts(stat_h, stat.len()) },
         unsafe { ArrayArg::from_raw_parts(off_h, part_offsets.len()) },
         unsafe { ArrayArg::from_raw_parts(props_h.clone(), num_parts) },

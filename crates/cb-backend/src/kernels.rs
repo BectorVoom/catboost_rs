@@ -14,6 +14,129 @@ use cb_core::{CbError, CbResult};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
+// ===========================================================================
+// SHARED-MEMORY CUBE INDEPENDENCE — the one rule that makes every `SharedMemory`
+// kernel in this module correct under BOTH backends.
+//
+// CubeCL allocates `SharedMemory` ONCE per launch and shares it BETWEEN cubes. How
+// cubes execute relative to one another is a property of the BACKEND, not of the
+// kernel (CubeCL shared-memory manual §1, "Runtime Execution Semantics"):
+//
+//   * GPU runtimes (`cuda` / `rocm` / `wgpu`) schedule cubes CONCURRENTLY, and the
+//     hardware gives each resident cube its own on-chip shared slice.
+//   * The CPU runtime — this crate's DEFAULT backend (`Cargo.toml`: `default =
+//     ["cpu"]`) — executes cubes SEQUENTIALLY, looping over the grid inside each
+//     unit thread and REUSING the single allocated buffer across cube iterations.
+//
+// So a kernel that is race-free on GPU can still be wrong on CPU: a unit that
+// finishes cube `c` early loops straight into cube `c+1` and writes the shared
+// buffer while a slower unit is still reading cube `c`'s data out of it.
+//
+// That is not hypothetical here. The four plane-carry scans
+// (`block_scan_kernel`, `block_scan_total_kernel`, `scan_update_pointwise_kernel`,
+// `scan_update_pairwise_kernel`) all END with `carry = partials[PLANE_POS - 1]` —
+// a read of a NEIGHBOUR's slot, after the last barrier — while the top of the
+// kernel writes `partials[PLANE_POS]` BEFORE any barrier. On the CPU runtime
+// `PLANE_DIM == 1`, so `PLANE_POS == UNIT_POS`: the neighbour being read is
+// exactly the unit whose next-cube write lands in that slot. Unit `k` racing into
+// cube `c+1` clobbers `partials[k]` while unit `k+1` is still reading it for cube
+// `c`, and the scan silently returns a carry from the wrong cube.
+//
+// The fix is the manual's §4 checklist rule 3 ("Trailing Kernel Barrier"), applied
+// UNIFORMLY: every kernel below that declares a `SharedMemory` ends with a
+// top-level `sync_cube()`, pinning all units to the current cube iteration before
+// any may advance. It is written at every such kernel — including those whose
+// current access pattern is own-slot-or-unit-strided and therefore already safe —
+// so the property is a LOCAL, checkable invariant of each kernel rather than a
+// whole-module aliasing argument that a later edit could silently invalidate.
+//
+// It must be at the kernel's TOP LEVEL, never inside a conditional: a barrier only
+// some units reach deadlocks. None of these kernels has an early `return`, so the
+// trailing placement is reached uniformly by construction.
+//
+// Cost: one cube-wide barrier per cube. On GPU that is a hardware barrier the units
+// arrive at together anyway; on CPU it is the software barrier they were about to
+// hit at the top of the next cube iteration regardless.
+// ===========================================================================
+
+// ===========================================================================
+// GRID STRIDE — why the grid-stride loops take a host-supplied `grid_stride`
+// instead of reading `CUBE_COUNT`.
+//
+// `cubecl-cpu` 0.10 populates only these builtins (its
+// `compiler/visitor/args_manager.rs` + `visitor/mod.rs`):
+//
+//   AbsolutePos{,X,Y,Z}   CubeDim{,X,Y,Z}   CubePos{,X,Y,Z}   UnitPos{,X,Y,Z}
+//
+// `CubeCount` is NOT among them. Reading it does not degrade — the MLIR visitor
+// panics with `Unsupported builtin was used: CubeCount`, and because that panic
+// happens on a device worker thread while the host blocks on the mpsc receive for
+// that unit, the symptom is a HANG or a silently all-zero output buffer, not an
+// error the caller can see.
+//
+// The grid-stride idiom `for i = ABSOLUTE_POS; i < n; i += CUBE_COUNT * CUBE_DIM`
+// needs only ONE value the builtin provided: the total thread count of the launch.
+// The host already computes that (it chose `count` and `dim`), so it is passed in as
+// a plain runtime `u32` argument. Identical semantics on every backend, no builtin,
+// and — unlike making it `#[comptime]` — it does NOT re-specialize the kernel for
+// every distinct `n`, which would thrash the JIT cache since `num_cubes` scales with
+// the input size.
+//
+// This is applied to EVERY grid-stride kernel in this module — no kernel here reads the
+// `CUBE_COUNT` builtin any more. That removed a documented cpu-backend exclusion: the
+// `one_hot_split_score_test`, `ordered_split_score_test` and `one_hot_partition_split_test`
+// modules were `#[cfg(not(feature = "cpu"))]` solely because their kernels grid-strode over
+// `CUBE_COUNT`, and they now build and pass under the default backend.
+//
+// TODO(cpu-unification): the `pointwise_hist2_*`, `pairwise_hist_*` and `partition_*`
+// fills still cannot RUN on cpu, for an unrelated reason the stride fix does not touch:
+// they accumulate into `Atomic<F>`, and `cubecl-cpu` implements no atomics at all
+// (u64/f64/f32 all report `AtomicUsage::Add == false`; emitting one panics with
+// `not yet implemented: atomic<T>`). Their launchers now gate on the advertised
+// capability and return `CbError::Unsupported` before launching — see
+// `gpu_runtime::device_supports_channel_atomic_add`. Unblocking them needs either
+// upstream atomic support in cubecl-cpu or an atomic-free accumulator (per-cube private
+// slices of a global scratch buffer keyed by `CUBE_POS`, then a deterministic cross-cube
+// reduction), which would also remove the GPU path's atomic-order non-determinism.
+// ===========================================================================
+
+// ===========================================================================
+// PLANE-FREE FALLBACK — the second half of running one kernel source on both
+// backends.
+//
+// `cubecl-cpu` has no plane (warp/wavefront) concept at all. It reports
+// `plane_size_max == 1` and `features().plane.contains(Plane::Ops) == false`, and a
+// kernel that calls a plane op does not merely run slowly there — it fails to
+// COMPILE, with the MLIR visitor raising
+// `plane_inclusive_sum(...) is not supported on CPU`. Because that panic happens on
+// a device worker thread while the host blocks on the mpsc receive for that unit's
+// completion, the symptom is a HANG, not a clean error.
+//
+// So every kernel that uses a plane op takes a `#[comptime] use_plane: bool` and
+// carries a plane-free path. The host decides ONCE, per launch, with
+// `client.features().plane.contains(Plane::Ops)`, and the comptime branch means the
+// unused arm is never emitted — the CPU build never even compiles the plane op.
+//
+// The plane-free arm is not a separate algorithm; it is the same one at
+// `PLANE_DIM == 1`, where each unit IS its own plane and the plane ops collapse to
+// their identities:
+//
+//   plane_inclusive_sum(v) -> v        (a one-unit plane's inclusive prefix)
+//   plane_exclusive_sum(v) -> 0        (…and its exclusive prefix)
+//   PLANE_POS              -> UNIT_POS
+//   UNIT_POS_PLANE == PLANE_DIM - 1 -> true (every unit is its plane's last)
+//   num_planes             -> CUBE_DIM_X
+//
+// Substituting those turns the "cross-plane carry" into a plain Hillis-Steele scan
+// over one shared slot per UNIT, which is the whole answer rather than a carry on
+// top of a within-plane prefix. The `partials` array is sized `BLOCK_REDUCE_SHMEM`
+// (== `gpu_runtime::CUBE_DIM` == 32), an upper bound of one slot per unit at
+// the launch width every scan kernel here uses, so the plane-free arm fits the same
+// allocation the plane arm does. A scan kernel launched WIDER than
+// `BLOCK_REDUCE_SHMEM` would overflow that array on the plane-free path — keep the
+// two coupled if a wider scan launch is ever added.
+// ===========================================================================
+
 /// Comptime `SharedMemory` size for [`block_reduce_kernel`] (Pitfall 3 — the size
 /// MUST be a compile-time `usize` const, not a runtime/topology value). It equals
 /// the launch-geometry cube width (`CUBE_DIM = 32` in `gpu_runtime.rs` /
@@ -41,19 +164,64 @@ pub(crate) const BLOCK_REDUCE_SHMEM: usize = 32;
 /// [`BLOCK_REDUCE_SHMEM`].
 pub(crate) const HIST_SHMEM: usize = 2 * (1 << 8);
 
+// ===========================================================================
+// VECTORIZED ELEMENTWISE DER KERNELS — every per-object derivative kernel below
+// (`gradient_kernel` through `mape_gradient_kernel`) is written over
+// `Array<Vector<F, N>>` rather than `Array<F>`.
+//
+// Why. On the CPU runtime these kernels are memory-bound: a lane reads two f64 and
+// writes one against a handful of flops. Written scalar, the JIT emits one load /
+// one op / one store per object, and the per-object loop overhead and bounds test
+// dominate the arithmetic. Written over `Vector<F, N>`, one unit moves `N` objects
+// per instruction (`<8 x f64>` NEON/AVX loads and `fsub`s on the CPU backend;
+// `double2`-style loads on a GPU) and the per-object overhead is paid once per `N`.
+// Measured on an 8-core Apple M1 at n = 1M, f64 (`bench/perf_param_cpu/
+// KERNEL-DESIGN-PASS.md` §4): `gradient_kernel` 1.15 ms scalar -> 0.49 ms at N = 8
+// on one unit, `logloss_gradient_kernel` 8.0 -> 7.0 ms (its `exp` is scalarized by
+// the backend, so only the loads/stores widen).
+//
+// How the width is chosen. `N` is a launch-time argument (`Size`), NOT a comptime
+// generic of this crate: the host passes the width after `CubeDim`
+// (`kernel::launch::<f64, R>(client, count, dim, line, ...)`) and the JIT
+// specializes per width. `crate::launch_geometry::der_line_size` picks it from the
+// device's `io_optimized_vector_sizes` (8 for f64 on the CPU runtime), and every
+// `ArrayArg` length stays the SCALAR element count, which must be a multiple of the
+// width — the CPU launcher pads its buffers to one (`cpu_runtime::DerInputs`); the
+// resident GPU der seams launch at width 1 (`launch_geometry::SCALAR_LINE`) because
+// their handles are allocated at exactly `n`.
+//
+// Branches. A `Vector<bool, N>` cannot drive an `if`, so every kernel that used the
+// if-as-STATEMENT pattern now computes BOTH arms and lane-selects with
+// `select_many(cond, then, else)`. Each lane therefore ends with exactly the value
+// its scalar branch would have produced — the same IEEE operations in the same
+// order, so the outputs are BIT-IDENTICAL to the scalar formulation, not merely
+// close (verified for every kernel against the pre-vectorization build on the CPU
+// runtime; `cpu_runtime_test` pins the per-loss host references). The one cost of
+// evaluating both arms is the discarded arm's arithmetic, which is 1-3 ops here.
+//
+// Scalar loss parameters (`alpha`, `delta`, `q`, ...) stay length-1 `Array<F>`
+// arguments (the generics-float discipline) and are broadcast once per unit with
+// `Vector::<F, N>::new(param[0])`.
+// ===========================================================================
+
 /// First-order RMSE gradient kernel: `der1[i] = target[i] - approx[i]`.
 ///
 /// CatBoost's RMSE first derivative for object `i` is `target[i] - approx[i]`
-/// (`error_functions.*`); it is purely elementwise, so it maps to one thread per
-/// object with no cross-thread communication. The bounds check `ABSOLUTE_POS <
-/// approx.len()` lets the host launch a thread count rounded up to a cube
-/// multiple without reading out of bounds (T-03-00-01 mitigation).
+/// (`error_functions.*`); it is purely elementwise, so it maps to one `N`-wide
+/// vector per unit with no cross-thread communication (see VECTORIZED ELEMENTWISE
+/// DER KERNELS above). The bounds check `ABSOLUTE_POS < approx.len()` (a count of
+/// VECTORS) lets the host launch a unit count rounded up to a cube multiple without
+/// reading out of bounds (T-03-00-01 mitigation).
 ///
 /// This kernel does NO reduction (D-02): the per-object gradients it emits are
 /// later summed host-side via `cb-core::sum_f64` when building histograms / leaf
 /// values in the Wave-1 training slice.
 #[cube(launch)]
-pub fn gradient_kernel<F: Float>(approx: &Array<F>, target: &Array<F>, der1: &mut Array<F>) {
+pub fn gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
+) {
     if ABSOLUTE_POS < approx.len() {
         der1[ABSOLUTE_POS] = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
     }
@@ -66,15 +234,17 @@ pub fn gradient_kernel<F: Float>(approx: &Array<F>, target: &Array<F>, der1: &mu
 /// (== `sigmoid(approx)`), `der1 = target - p`. The approx is the raw logit
 /// (`RawFormulaVal`) — sigmoid is applied exactly once here (Pitfall 6). All
 /// `Float` ops (`exp`) are kernel-legal. Order-independent, no reduction (D-02).
+/// Vectorized over `N` objects per unit.
 #[cube(launch)]
-pub fn logloss_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn logloss_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let e = F::exp(approx[ABSOLUTE_POS]);
-        let p = F::new(1.0_f32) - F::new(1.0_f32) / (F::new(1.0_f32) + e);
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let e = Vector::<F, N>::exp(approx[ABSOLUTE_POS]);
+        let p = one - one / (one + e);
         der1[ABSOLUTE_POS] = target[ABSOLUTE_POS] - p;
     }
 }
@@ -83,42 +253,36 @@ pub fn logloss_gradient_kernel<F: Float>(
 /// approx`, `der1 = |val| < delta ? 0 : (val > 0 ? alpha : -(1-alpha))`.
 ///
 /// `error_functions.h:485-489` (`TQuantileError::CalcDer`). `alpha`/`delta` pass
-/// as length-1 `Array<F>` arguments (read at index 0) — NOT scalar args — to keep
-/// the kernel fully generic over `F: Float` (AGENTS.md generics-float; the
-/// [`focal_gradient_kernel`] / [`lq_gradient_kernel`] length-1-array precedent).
-/// der2 is the constant `0` (no kernel — the dispatch fills a zero vec). The
-/// branch result is assigned to a `mut` variable initialized to the deadzone
-/// value via the if-as-STATEMENT pattern (CubeCL conditionals manual).
-/// Elementwise, order-independent, no reduction (D-02). MAE routes through THIS
-/// kernel at `alpha = 0.5`, `delta = 1e-6` (WR-04 — no duplicate MAE kernel), so
-/// MAE and Quantile{0.5} are bit-identical by construction.
+/// as length-1 `Array<F>` arguments (read at index 0 and broadcast across the
+/// vector) — NOT scalar args — to keep the kernel fully generic over `F: Float`
+/// (AGENTS.md generics-float; the [`focal_gradient_kernel`] /
+/// [`lq_gradient_kernel`] length-1-array precedent). der2 is the constant `0` (no
+/// kernel — the dispatch fills a zero vec). The band complement of the scalar
+/// `|val| < delta` deadzone is used: `|val| >= delta` is OUTSIDE the deadzone, so
+/// the boundary `|val| == delta` returns the signed quantile weight (matching
+/// `quantile_der1`), NOT 0 — the same `>= delta` band as [`huber_gradient_kernel`].
+/// Both arms are lane-selected with `select_many` (see VECTORIZED ELEMENTWISE DER
+/// KERNELS above), so every lane computes exactly the scalar arm it would have
+/// branched into. Elementwise, order-independent, no reduction (D-02). MAE routes
+/// through THIS kernel at `alpha = 0.5`, `delta = 1e-6` (WR-04 — no duplicate MAE
+/// kernel), so MAE and Quantile{0.5} are bit-identical by construction.
 #[cube(launch)]
-pub fn quantile_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn quantile_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
     alpha: &Array<F>,
     delta: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let a = alpha[0];
-        let d = delta[0];
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let a = Vector::<F, N>::new(alpha[0]);
+        let d = Vector::<F, N>::new(delta[0]);
         let val = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        // Band complement of the scalar `|val| < delta` deadzone: `|val| >= delta`
-        // is OUTSIDE the deadzone, so the boundary `|val| == delta` returns the
-        // signed quantile weight (matching `quantile_der1`), NOT 0. This mirrors
-        // the correct `huber_gradient_kernel` `>= delta` band. The if-as-STATEMENT
-        // pattern (CubeCL conditionals manual): `g` starts at the deadzone `0`,
-        // then is overwritten with the `val < 0` arm and finally the `val > 0` arm.
-        let mut g = F::new(0.0_f32);
-        if F::abs(val) >= d {
-            g = F::new(0.0_f32) - (one - a);
-            if val > F::new(0.0_f32) {
-                g = a;
-            }
-        }
-        der1[ABSOLUTE_POS] = g;
+        let outside_deadzone = Vector::<F, N>::abs(val).greater_equal(d);
+        let signed = select_many(val.greater_than(zero), a, zero - (one - a));
+        der1[ABSOLUTE_POS] = select_many(outside_deadzone, signed, zero);
     }
 }
 
@@ -126,14 +290,19 @@ pub fn quantile_gradient_kernel<F: Float>(
 /// `p = sigmoid(approx[i]); der2[i] = -p*(1-p)`.
 ///
 /// `error_functions.cpp:331` — `der2 = -p*(1-p)`. Elementwise, no reduction
-/// (D-02). The RMSE hessian is the constant `-1.0`, so it needs no kernel; the
-/// host fills it directly.
+/// (D-02). Vectorized over `N` objects per unit. The RMSE hessian is the constant
+/// `-1.0`, so it needs no kernel; the host fills it directly.
 #[cube(launch)]
-pub fn logloss_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) {
+pub fn logloss_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
+) {
     if ABSOLUTE_POS < approx.len() {
-        let e = F::exp(approx[ABSOLUTE_POS]);
-        let p = F::new(1.0_f32) - F::new(1.0_f32) / (F::new(1.0_f32) + e);
-        der2[ABSOLUTE_POS] = F::new(0.0_f32) - p * (F::new(1.0_f32) - p);
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let e = Vector::<F, N>::exp(approx[ABSOLUTE_POS]);
+        let p = one - one / (one + e);
+        der2[ABSOLUTE_POS] = zero - p * (one - p);
     }
 }
 
@@ -143,41 +312,41 @@ pub fn logloss_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) 
 /// `der1 = -( at*y*pow(1-pt, gamma) * (gamma*pt*log(pt) + pt - 1) )`.
 ///
 /// Elementwise, order-independent, no reduction (D-02). The loss parameters
-/// `alpha`/`gamma` are passed as length-1 `Array<F>` arguments (read at index 0)
-/// rather than as scalar kernel args — this keeps the kernel FULLY generic over
-/// `F: Float` (AGENTS.md generics-float; a generic scalar arg would require the
-/// non-generic `F: ScalarArgType + CubeElement + …` bound). The `target == 1`
-/// branch selects `at`/`pt` via the if-as-STATEMENT pattern (CubeCL conditionals
-/// manual — never if-as-expression). `p` is clamped before `ln`/`powf` so a
-/// saturated logit cannot produce `NaN` (T-04-02-02).
+/// `alpha`/`gamma` are passed as length-1 `Array<F>` arguments (read at index 0
+/// and broadcast) rather than as scalar kernel args — this keeps the kernel FULLY
+/// generic over `F: Float` (AGENTS.md generics-float; a generic scalar arg would
+/// require the non-generic `F: ScalarArgType + CubeElement + …` bound). The
+/// `target == 1` label selects `at`/`pt` per lane via `select_many` (see
+/// VECTORIZED ELEMENTWISE DER KERNELS above). `p` is clamped — as `min(max(..))`,
+/// which the vector type provides — before `ln`/`powf` so a saturated logit cannot
+/// produce `NaN` (T-04-02-02).
 #[cube(launch)]
-pub fn focal_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn focal_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
     alpha: &Array<F>,
     gamma: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let p_min = F::new(1e-13_f32);
-        let a = alpha[0];
-        let g = gamma[0];
-        let e = F::exp(F::new(0.0_f32) - approx[ABSOLUTE_POS]);
-        let p = F::clamp(one / (one + e), p_min, one - p_min);
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let p_min = Vector::<F, N>::new(F::new(1e-13_f32));
+        let a = Vector::<F, N>::new(alpha[0]);
+        let g = Vector::<F, N>::new(gamma[0]);
+        let e = Vector::<F, N>::exp(zero - approx[ABSOLUTE_POS]);
+        let p = min(max(one / (one + e), p_min), one - p_min);
 
-        let is_pos = target[ABSOLUTE_POS] == one;
-        let mut at = one - a;
-        let mut pt = one - p;
-        if is_pos {
-            at = a;
-            pt = p;
-        }
-        let y = F::new(2.0_f32) * target[ABSOLUTE_POS] - one;
+        let t = target[ABSOLUTE_POS];
+        let is_pos = t.equal(one);
+        let at = select_many(is_pos, a, one - a);
+        let pt = select_many(is_pos, p, one - p);
+        let y = two * t - one;
 
-        let factor = F::powf(one - pt, g);
-        let inner = g * pt * F::ln(pt) + pt - one;
-        der1[ABSOLUTE_POS] = F::new(0.0_f32) - (at * y * factor * inner);
+        let factor = Vector::<F, N>::powf(one - pt, g);
+        let inner = g * pt * Vector::<F, N>::ln(pt) + pt - one;
+        der1[ABSOLUTE_POS] = zero - (at * y * factor * inner);
     }
 }
 
@@ -188,38 +357,37 @@ pub fn focal_gradient_kernel<F: Float>(
 /// v = gamma*pt*log(pt) + pt - 1;    dv = gamma*log(pt) + gamma + 1
 /// der2 = -( (du*v + u*dv) * y * (pt*(1-pt)) )
 /// ```
-/// Same clamp / label-branch / generics-float discipline as
+/// Same clamp / label-select / generics-float discipline as
 /// [`focal_gradient_kernel`].
 #[cube(launch)]
-pub fn focal_hessian_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der2: &mut Array<F>,
+pub fn focal_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
     alpha: &Array<F>,
     gamma: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let p_min = F::new(1e-13_f32);
-        let a = alpha[0];
-        let g = gamma[0];
-        let e = F::exp(F::new(0.0_f32) - approx[ABSOLUTE_POS]);
-        let p = F::clamp(one / (one + e), p_min, one - p_min);
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let p_min = Vector::<F, N>::new(F::new(1e-13_f32));
+        let a = Vector::<F, N>::new(alpha[0]);
+        let g = Vector::<F, N>::new(gamma[0]);
+        let e = Vector::<F, N>::exp(zero - approx[ABSOLUTE_POS]);
+        let p = min(max(one / (one + e), p_min), one - p_min);
 
-        let is_pos = target[ABSOLUTE_POS] == one;
-        let mut at = one - a;
-        let mut pt = one - p;
-        if is_pos {
-            at = a;
-            pt = p;
-        }
-        let y = F::new(2.0_f32) * target[ABSOLUTE_POS] - one;
+        let t = target[ABSOLUTE_POS];
+        let is_pos = t.equal(one);
+        let at = select_many(is_pos, a, one - a);
+        let pt = select_many(is_pos, p, one - p);
+        let y = two * t - one;
 
-        let u = at * y * F::powf(one - pt, g);
-        let du = (F::new(0.0_f32) - at) * y * g * F::powf(one - pt, g - one);
-        let v = g * pt * F::ln(pt) + pt - one;
-        let dv = g * F::ln(pt) + g + one;
-        der2[ABSOLUTE_POS] = F::new(0.0_f32) - ((du * v + u * dv) * y * (pt * (one - pt)));
+        let u = at * y * Vector::<F, N>::powf(one - pt, g);
+        let du = (zero - at) * y * g * Vector::<F, N>::powf(one - pt, g - one);
+        let v = g * pt * Vector::<F, N>::ln(pt) + pt - one;
+        let dv = g * Vector::<F, N>::ln(pt) + g + one;
+        der2[ABSOLUTE_POS] = zero - ((du * v + u * dv) * y * (pt * (one - pt)));
     }
 }
 
@@ -227,16 +395,17 @@ pub fn focal_hessian_kernel<F: Float>(
 ///
 /// `error_functions.h:414` (`TLogCoshError::CalcDer`). Non-parametric, smooth
 /// (the saturating analogue of MAE's sign gradient). Elementwise, no reduction
-/// (D-02). `F::tanh` is a kernel-legal `Float` op.
+/// (D-02). `tanh` is a kernel-legal `Float` op; vectorized over `N` objects.
 #[cube(launch)]
-pub fn logcosh_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn logcosh_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
 ) {
     if ABSOLUTE_POS < approx.len() {
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
         let r = approx[ABSOLUTE_POS] - target[ABSOLUTE_POS];
-        der1[ABSOLUTE_POS] = F::new(0.0_f32) - F::tanh(r);
+        der1[ABSOLUTE_POS] = zero - Vector::<F, N>::tanh(r);
     }
 }
 
@@ -244,17 +413,20 @@ pub fn logcosh_gradient_kernel<F: Float>(
 /// `der2[i] = -1 / (cosh(approx[i] - target[i]))^2`.
 ///
 /// `error_functions.h:418` (`TLogCoshError::CalcDer2`). Always strictly negative
-/// (convex loss). Elementwise, no reduction (D-02). `F::cosh` is kernel-legal.
+/// (convex loss). Elementwise, no reduction (D-02). `cosh` is kernel-legal;
+/// vectorized over `N` objects.
 #[cube(launch)]
-pub fn logcosh_hessian_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der2: &mut Array<F>,
+pub fn logcosh_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
 ) {
     if ABSOLUTE_POS < approx.len() {
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
         let r = approx[ABSOLUTE_POS] - target[ABSOLUTE_POS];
-        let c = F::cosh(r);
-        der2[ABSOLUTE_POS] = F::new(0.0_f32) - F::new(1.0_f32) / (c * c);
+        let c = Vector::<F, N>::cosh(r);
+        der2[ABSOLUTE_POS] = zero - one / (c * c);
     }
 }
 
@@ -262,30 +434,27 @@ pub fn logcosh_hessian_kernel<F: Float>(
 /// `der1[i] = q * sign(target-approx) * |approx-target|^(q-1)`.
 ///
 /// `error_functions.h:553` (`TLqError::CalcDer`). The loss exponent `q` is passed
-/// as a length-1 `Array<F>` (read at index 0) — NOT a scalar arg — to keep the
-/// kernel fully generic over `F: Float` (AGENTS.md generics-float; the
+/// as a length-1 `Array<F>` (read at index 0 and broadcast) — NOT a scalar arg — to
+/// keep the kernel fully generic over `F: Float` (AGENTS.md generics-float; the
 /// `focal_gradient_kernel` length-1-array precedent). The `target - approx > 0`
-/// sign is selected via the if-as-STATEMENT pattern (CubeCL conditionals manual —
-/// never if-as-expression): `sign` is initialized to `-1` and flipped to `+1`
-/// only when the residual is positive, matching upstream's `> 0 ? 1 : -1`.
+/// sign is lane-selected with `select_many`: `+1` only when the residual is
+/// positive, `-1` otherwise (covering the tie), matching upstream's `> 0 ? 1 : -1`.
 #[cube(launch)]
-pub fn lq_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn lq_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
     q: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let qv = q[0];
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let qv = Vector::<F, N>::new(q[0]);
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
-        let abs_loss = F::abs(a - t);
-        let abs_loss_q = F::powf(abs_loss, qv - one);
-        let mut sign = F::new(0.0_f32) - one;
-        if t - a > F::new(0.0_f32) {
-            sign = one;
-        }
+        let abs_loss = Vector::<F, N>::abs(a - t);
+        let abs_loss_q = Vector::<F, N>::powf(abs_loss, qv - one);
+        let sign = select_many((t - a).greater_than(zero), one, zero - one);
         der1[ABSOLUTE_POS] = qv * sign * abs_loss_q;
     }
 }
@@ -298,18 +467,20 @@ pub fn lq_gradient_kernel<F: Float>(
 /// collapses to the constant `-2`. `q` passes as a length-1 `Array<F>` like
 /// [`lq_gradient_kernel`]. Elementwise, no reduction (D-02).
 #[cube(launch)]
-pub fn lq_hessian_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der2: &mut Array<F>,
+pub fn lq_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
     q: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let qv = q[0];
-        let abs_loss = F::abs(target[ABSOLUTE_POS] - approx[ABSOLUTE_POS]);
-        let pow_term = F::powf(abs_loss, qv - F::new(2.0_f32));
-        der2[ABSOLUTE_POS] = (F::new(0.0_f32) - qv) * (qv - one) * pow_term;
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let qv = Vector::<F, N>::new(q[0]);
+        let abs_loss = Vector::<F, N>::abs(target[ABSOLUTE_POS] - approx[ABSOLUTE_POS]);
+        let pow_term = Vector::<F, N>::powf(abs_loss, qv - two);
+        der2[ABSOLUTE_POS] = (zero - qv) * (qv - one) * pow_term;
     }
 }
 
@@ -317,29 +488,24 @@ pub fn lq_hessian_kernel<F: Float>(
 /// `der1[i] = |diff| < delta ? diff : (diff > 0 ? delta : -delta)`.
 ///
 /// `error_functions.h:1612` (`THuberError::CalcDer`). `delta` passes as a
-/// length-1 `Array<F>` (read at index 0) — generics-float discipline. The
-/// in-band / saturated branch and the `diff > 0` sign both use the
-/// if-as-STATEMENT pattern (CubeCL conditionals manual): `g` is initialized to
-/// the in-band value `diff`, then overwritten by `±delta` only when
-/// `|diff| >= delta`. Elementwise, no reduction (D-02).
+/// length-1 `Array<F>` (read at index 0 and broadcast) — generics-float
+/// discipline. The in-band / saturated arm and the `diff > 0` sign are both
+/// lane-selected with `select_many`: `±delta` only when `|diff| >= delta`, the
+/// in-band value `diff` otherwise. Elementwise, no reduction (D-02).
 #[cube(launch)]
-pub fn huber_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn huber_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
     delta: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let d = delta[0];
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let d = Vector::<F, N>::new(delta[0]);
         let diff = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let mut g = diff;
-        if F::abs(diff) >= d {
-            g = F::new(0.0_f32) - d;
-            if diff > F::new(0.0_f32) {
-                g = d;
-            }
-        }
-        der1[ABSOLUTE_POS] = g;
+        let saturated = select_many(diff.greater_than(zero), d, zero - d);
+        let outside_band = Vector::<F, N>::abs(diff).greater_equal(d);
+        der1[ABSOLUTE_POS] = select_many(outside_band, saturated, diff);
     }
 }
 
@@ -348,23 +514,22 @@ pub fn huber_gradient_kernel<F: Float>(
 ///
 /// `error_functions.h:1621` (`THuberError::CalcDer2`). `delta` passes as a
 /// length-1 `Array<F>` like [`huber_gradient_kernel`]. The strict `<` band
-/// boundary matches upstream. if-as-STATEMENT: `h` initialized to the saturated
-/// `0`, set to `-1` only inside the band. Elementwise, no reduction (D-02).
+/// boundary matches upstream: `-1` inside the band, the saturated `0` outside,
+/// lane-selected with `select_many`. Elementwise, no reduction (D-02).
 #[cube(launch)]
-pub fn huber_hessian_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der2: &mut Array<F>,
+pub fn huber_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
     delta: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let d = delta[0];
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let d = Vector::<F, N>::new(delta[0]);
         let diff = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let mut h = F::new(0.0_f32);
-        if F::abs(diff) < d {
-            h = F::new(0.0_f32) - F::new(1.0_f32);
-        }
-        der2[ABSOLUTE_POS] = h;
+        let in_band = Vector::<F, N>::abs(diff).less_than(d);
+        der2[ABSOLUTE_POS] = select_many(in_band, zero - one, zero);
     }
 }
 
@@ -372,28 +537,24 @@ pub fn huber_hessian_kernel<F: Float>(
 /// `der1[i] = (e > 0) ? 2*alpha*e : 2*(1-alpha)*e`.
 ///
 /// `error_functions.h:527` (`TExpectileError::CalcDer`). `alpha` passes as a
-/// length-1 `Array<F>` (read at index 0) — generics-float discipline. The
-/// `e > 0` asymmetry uses the if-as-STATEMENT pattern: `g` is initialized to the
-/// below-branch (`2*(1-alpha)*e`, which also covers the `e == 0` boundary like
-/// upstream's `> 0` test) and overwritten by the above-branch only for `e > 0`.
-/// Elementwise, no reduction (D-02).
+/// length-1 `Array<F>` (read at index 0 and broadcast) — generics-float
+/// discipline. The `e > 0` asymmetry is lane-selected with `select_many`; the
+/// `e == 0` boundary takes the below-branch (`2*(1-alpha)*e`) like upstream's
+/// `> 0` test. Elementwise, no reduction (D-02).
 #[cube(launch)]
-pub fn expectile_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn expectile_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
     alpha: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let two = F::new(2.0_f32);
-        let a = alpha[0];
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let a = Vector::<F, N>::new(alpha[0]);
         let e = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let mut g = two * (one - a) * e;
-        if e > F::new(0.0_f32) {
-            g = two * a * e;
-        }
-        der1[ABSOLUTE_POS] = g;
+        der1[ABSOLUTE_POS] = select_many(e.greater_than(zero), two * a * e, two * (one - a) * e);
     }
 }
 
@@ -403,24 +564,23 @@ pub fn expectile_gradient_kernel<F: Float>(
 /// `error_functions.h:532` (`TExpectileError::CalcDer2`). `alpha` passes as a
 /// length-1 `Array<F>` like [`expectile_gradient_kernel`]. Piecewise-constant; the
 /// `e == 0` boundary selects the below-branch (`-2*(1-alpha)`), matching
-/// upstream's `> 0`. if-as-STATEMENT. Elementwise, no reduction (D-02).
+/// upstream's `> 0`. Lane-selected with `select_many`. Elementwise, no reduction
+/// (D-02).
 #[cube(launch)]
-pub fn expectile_hessian_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der2: &mut Array<F>,
+pub fn expectile_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
     alpha: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let two = F::new(2.0_f32);
-        let a = alpha[0];
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let a = Vector::<F, N>::new(alpha[0]);
         let e = target[ABSOLUTE_POS] - approx[ABSOLUTE_POS];
-        let mut h = (F::new(0.0_f32) - two) * (one - a);
-        if e > F::new(0.0_f32) {
-            h = (F::new(0.0_f32) - two) * a;
-        }
-        der2[ABSOLUTE_POS] = h;
+        der2[ABSOLUTE_POS] =
+            select_many(e.greater_than(zero), (zero - two) * a, (zero - two) * (one - a));
     }
 }
 
@@ -428,18 +588,18 @@ pub fn expectile_hessian_kernel<F: Float>(
 /// over the RAW approx.
 ///
 /// `error_functions.h:657-676` (`TPoissonError::CalcDer`). Poisson is
-/// IsStoreExpApprox upstream but cb-train stores RAW approx and computes `F::exp`
+/// IsStoreExpApprox upstream but cb-train stores RAW approx and computes `exp`
 /// INLINE here (the [`logloss_gradient_kernel`] inline-link precedent — the final
-/// prediction applies the `Exponent` transform). `F::exp` is kernel-legal.
-/// Elementwise, no reduction (D-02).
+/// prediction applies the `Exponent` transform). `exp` is kernel-legal.
+/// Elementwise, no reduction (D-02); vectorized over `N` objects.
 #[cube(launch)]
-pub fn poisson_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn poisson_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let e = F::exp(approx[ABSOLUTE_POS]);
+        let e = Vector::<F, N>::exp(approx[ABSOLUTE_POS]);
         der1[ABSOLUTE_POS] = target[ABSOLUTE_POS] - e;
     }
 }
@@ -448,13 +608,18 @@ pub fn poisson_gradient_kernel<F: Float>(
 /// approx.
 ///
 /// `error_functions.h:657-676` (`TPoissonError::CalcDer2 = -expApprox`). Always
-/// strictly negative (convex). `F::exp` INLINE on the raw approx (the Poisson
-/// inline-link discipline). Elementwise, no reduction (D-02).
+/// strictly negative (convex). `exp` INLINE on the raw approx (the Poisson
+/// inline-link discipline). Elementwise, no reduction (D-02); vectorized over `N`
+/// objects.
 #[cube(launch)]
-pub fn poisson_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) {
+pub fn poisson_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
+) {
     if ABSOLUTE_POS < approx.len() {
-        let e = F::exp(approx[ABSOLUTE_POS]);
-        der2[ABSOLUTE_POS] = F::new(0.0_f32) - e;
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let e = Vector::<F, N>::exp(approx[ABSOLUTE_POS]);
+        der2[ABSOLUTE_POS] = zero - e;
     }
 }
 
@@ -462,26 +627,26 @@ pub fn poisson_hessian_kernel<F: Float>(approx: &Array<F>, der2: &mut Array<F>) 
 /// `der1[i] = target*e^((1-p)*approx) - e^((2-p)*approx)` over the RAW approx.
 ///
 /// `error_functions.h:1648-1652` (`TTweedieError::CalcDer`). The `variance_power`
-/// passes as a length-1 `Array<F>` (read at index 0) — generics-float discipline
-/// (the [`focal_gradient_kernel`] length-1-array precedent). Tweedie is NOT
-/// exp-approx (`error_functions.h:1644`): the `F::exp` lives INSIDE the der over
-/// the raw approx; no `Exponent` predict transform (A4). `F::exp` is kernel-legal.
-/// Elementwise, no reduction (D-02).
+/// passes as a length-1 `Array<F>` (read at index 0 and broadcast) — generics-float
+/// discipline (the [`focal_gradient_kernel`] length-1-array precedent). Tweedie is
+/// NOT exp-approx (`error_functions.h:1644`): the `exp` lives INSIDE the der over
+/// the raw approx; no `Exponent` predict transform (A4). `exp` is kernel-legal.
+/// Elementwise, no reduction (D-02); vectorized over `N` objects.
 #[cube(launch)]
-pub fn tweedie_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn tweedie_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
     variance_power: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let two = F::new(2.0_f32);
-        let p = variance_power[0];
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let p = Vector::<F, N>::new(variance_power[0]);
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
-        let e1 = F::exp((one - p) * a);
-        let e2 = F::exp((two - p) * a);
+        let e1 = Vector::<F, N>::exp((one - p) * a);
+        let e2 = Vector::<F, N>::exp((two - p) * a);
         der1[ABSOLUTE_POS] = t * e1 - e2;
     }
 }
@@ -492,22 +657,23 @@ pub fn tweedie_gradient_kernel<F: Float>(
 ///
 /// `error_functions.h:1654-1658` (`TTweedieError::CalcDer2`). `variance_power`
 /// passes as a length-1 `Array<F>` like [`tweedie_gradient_kernel`]. exp INSIDE
-/// the der (raw approx, NOT exp-approx). Elementwise, no reduction (D-02).
+/// the der (raw approx, NOT exp-approx). Elementwise, no reduction (D-02);
+/// vectorized over `N` objects.
 #[cube(launch)]
-pub fn tweedie_hessian_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der2: &mut Array<F>,
+pub fn tweedie_hessian_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der2: &mut Array<Vector<F, N>>,
     variance_power: &Array<F>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
-        let two = F::new(2.0_f32);
-        let p = variance_power[0];
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let two = Vector::<F, N>::new(F::new(2.0_f32));
+        let p = Vector::<F, N>::new(variance_power[0]);
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
-        let e1 = F::exp((one - p) * a);
-        let e2 = F::exp((two - p) * a);
+        let e1 = Vector::<F, N>::exp((one - p) * a);
+        let e2 = Vector::<F, N>::exp((two - p) * a);
         der2[ABSOLUTE_POS] = t * (one - p) * e1 - (two - p) * e2;
     }
 }
@@ -517,27 +683,25 @@ pub fn tweedie_hessian_kernel<F: Float>(
 ///
 /// `error_functions.h:607-630` (`TMAPEError::CalcDer`). Non-parametric; the divisor
 /// `max(1.0, |target|) >= 1.0` so the division is always safe (T-06.1.02-04). The
-/// `1.f` divisor floor is f32-domain upstream (Pitfall 7); `F::max(1.0, |t|)`
-/// reproduces it. The `target - approx > 0` sign uses the if-as-STATEMENT pattern
-/// (CubeCL conditionals manual): `sign` is initialized to `-1` (covering the tie
-/// `target == approx`, upstream's `> 0 ? 1 : -1`) and flipped to `+1` only when the
-/// residual is positive. der2 is the constant 0 (no kernel — the dispatch fills a
-/// zero vec, the Mae precedent). Elementwise, no reduction (D-02).
+/// `1.f` divisor floor is f32-domain upstream (Pitfall 7); `max(1.0, |t|)`
+/// reproduces it. The `target - approx > 0` sign is lane-selected with
+/// `select_many`: `+1` only when the residual is positive, `-1` otherwise (covering
+/// the tie `target == approx`, upstream's `> 0 ? 1 : -1`). der2 is the constant 0
+/// (no kernel — the dispatch fills a zero vec, the Mae precedent). Elementwise, no
+/// reduction (D-02).
 #[cube(launch)]
-pub fn mape_gradient_kernel<F: Float>(
-    approx: &Array<F>,
-    target: &Array<F>,
-    der1: &mut Array<F>,
+pub fn mape_gradient_kernel<F: Float, N: Size>(
+    approx: &Array<Vector<F, N>>,
+    target: &Array<Vector<F, N>>,
+    der1: &mut Array<Vector<F, N>>,
 ) {
     if ABSOLUTE_POS < approx.len() {
-        let one = F::new(1.0_f32);
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
         let a = approx[ABSOLUTE_POS];
         let t = target[ABSOLUTE_POS];
-        let denom = F::max(one, F::abs(t));
-        let mut sign = F::new(0.0_f32) - one;
-        if t - a > F::new(0.0_f32) {
-            sign = one;
-        }
+        let denom = max(one, Vector::<F, N>::abs(t));
+        let sign = select_many((t - a).greater_than(zero), one, zero - one);
         der1[ABSOLUTE_POS] = sign / denom;
     }
 }
@@ -724,7 +888,7 @@ pub fn apply_oblivious_float_kernel<F: Float>(
 /// # Wave-size policy (D-09)
 ///
 /// The per-object loop strides by the TOTAL thread count `CUBE_COUNT_X * CUBE_DIM_X`
-/// (a grid-stride loop) — derived from the launch topology intrinsics, NEVER a literal
+/// (a grid-stride loop) — derived from the launch topology on the HOST, NEVER a literal
 /// 32/64. No `& 31`/`tiled_partition<32>` appears: the bin index comes from
 /// `cindex[feature * n + indices[i]]`, not a warp-lane partition. Generic over `F:
 /// Float` (AGENTS.md generics-float). Every device read is under a POSITION bounds
@@ -750,6 +914,7 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
     indices: &Array<u32>,
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
+    grid_stride: u32,
     #[comptime] bits: u32,
 ) {
     // n_bins = 1 << bits (comptime; the USED prefix of the HIST_SHMEM worst case).
@@ -764,13 +929,13 @@ pub fn pointwise_hist2_nonbinary_kernel<F: Float>(
     let n = indices.len();
     let n_features_usize = n_features as usize;
 
-    // Grid-stride loop over the object-visiting order. The stride is the total thread
-    // count (CUBE_COUNT * CUBE_DIM) — a topology-derived value, NEVER a literal 32/64
-    // (D-09). Each unit processes objects ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a
-    // launch narrower than `n` still covers every object (T-7.1-01). `ABSOLUTE_POS` and
-    // `CUBE_COUNT` are `usize` intrinsics; `CUBE_DIM` is `u32` — cast it once to keep
-    // the stride arithmetic in `usize`.
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride loop over the object-visiting order. The stride is the launch's total
+    // thread count — a topology-derived value, NEVER a literal 32/64 (D-09) — supplied by
+    // the host as `grid_stride` because `CUBE_COUNT` is not a builtin the CPU runtime
+    // implements (see GRID STRIDE at the top of this module). Each unit processes objects
+    // ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch narrower than `n` still covers
+    // every object (T-7.1-01).
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         // Bounds guard (T-7.1-01); `indices` is length n, indexed directly like the
@@ -862,8 +1027,8 @@ pub(crate) const HALF_BYTE_BINS: usize = 16;
 ///
 /// # Wave-size policy (D-09)
 ///
-/// The per-object loop strides by the TOTAL thread count `CUBE_COUNT * CUBE_DIM` (a
-/// grid-stride loop) — derived from the launch topology intrinsics, NEVER a literal
+/// The per-object loop strides by the TOTAL thread count `grid_stride` (a
+/// grid-stride loop) — derived from the launch topology on the HOST, NEVER a literal
 /// 32/64. No `& 31`/`tiled_partition<32>`/`512 * (threadIdx/32)` warp-tile construct
 /// appears (upstream's `SliceOffset`/`SyncTile` warp partitioning is replaced by the
 /// wave-agnostic grid-stride loop + global atomic merge). The bin index comes from the
@@ -889,6 +1054,7 @@ pub fn pointwise_hist2_half_byte_kernel<F: Float>(
     indices: &Array<u32>,
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
+    grid_stride: u32,
 ) {
     // FIXED 16-bin (4-bit) line — the comptime HALF_BYTE_BINS (NOT a runtime `bits`
     // value): the structural mark of the half-byte family (`TPointHistHalfByte` is a
@@ -898,9 +1064,10 @@ pub fn pointwise_hist2_half_byte_kernel<F: Float>(
     let n = indices.len();
     let n_features_usize = n_features as usize;
 
-    // Grid-stride loop over the object-visiting order; stride = total thread count
-    // (CUBE_COUNT * CUBE_DIM) — topology-derived, never a literal 32/64 (D-09).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride loop over the object-visiting order; stride = the launch's total thread
+    // count — topology-derived, never a literal 32/64 (D-09) — supplied by the host as
+    // `grid_stride` (`CUBE_COUNT` is not a CPU-runtime builtin; see GRID STRIDE at the top).
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         let obj_u = indices[i];
@@ -987,8 +1154,8 @@ pub(crate) const BINARY_BINS: usize = 2;
 ///
 /// # Wave-size policy (D-09)
 ///
-/// The per-object loop strides by the TOTAL thread count `CUBE_COUNT * CUBE_DIM` (a
-/// grid-stride loop) — derived from the launch topology intrinsics, NEVER a literal
+/// The per-object loop strides by the TOTAL thread count `grid_stride` (a
+/// grid-stride loop) — derived from the launch topology on the HOST, NEVER a literal
 /// 32/64. No `& 31`/`threadIdx & 1`/`tiled_partition<32>` warp-tile/lane construct
 /// appears (upstream's `threadIdx.x & 1` channel select + warp partitioning is replaced
 /// by the wave-agnostic grid-stride loop + global atomic merge). The bin index comes from
@@ -1014,6 +1181,7 @@ pub fn pointwise_hist2_binary_kernel<F: Float>(
     indices: &Array<u32>,
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
+    grid_stride: u32,
 ) {
     // FIXED 2-bin (1-bit) line — the comptime BINARY_BINS (NOT a runtime `bits` value,
     // NOR the half-byte's 16): the structural mark of the binary family. Held `usize` for
@@ -1023,9 +1191,10 @@ pub fn pointwise_hist2_binary_kernel<F: Float>(
     let n = indices.len();
     let n_features_usize = n_features as usize;
 
-    // Grid-stride loop over the object-visiting order; stride = total thread count
-    // (CUBE_COUNT * CUBE_DIM) — topology-derived, never a literal 32/64 (D-09).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride loop over the object-visiting order; stride = the launch's total thread
+    // count — topology-derived, never a literal 32/64 (D-09) — supplied by the host as
+    // `grid_stride` (`CUBE_COUNT` is not a CPU-runtime builtin; see GRID STRIDE at the top).
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         let obj_u = indices[i];
@@ -1090,7 +1259,7 @@ pub fn pointwise_hist2_binary_kernel<F: Float>(
 ///
 /// `pair_i`/`pair_j` hold OBJECT ids; the cindex stride is over OBJECTS (`n_objects`, a
 /// runtime scalar), NOT `n_pairs` — `bin = cindex[feature * n_objects + obj]`. The
-/// grid-stride is the total thread count (`CUBE_COUNT * CUBE_DIM`), never a literal
+/// grid-stride is the total thread count (`grid_stride`), never a literal
 /// 32/64 (D-09). Bin/object VALUE ranges are validated HOST-SIDE in
 /// `launch_pairwise_hist_into` (T-07.4-01/02) before launch. Generic over `F: Float`
 /// (AGENTS.md generics-float). if-as-STATEMENT only (CubeCL conditionals manual).
@@ -1103,6 +1272,7 @@ pub fn pairwise_hist_nonbinary_kernel<F: Float>(
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
     n_objects: u32,
+    grid_stride: u32,
     #[comptime] bits: u32,
     #[comptime] one_hot: bool,
 ) {
@@ -1114,11 +1284,12 @@ pub fn pairwise_hist_nonbinary_kernel<F: Float>(
     let n_features_usize = n_features as usize;
     let n_objects_usize = n_objects as usize;
 
-    // Grid-stride loop over PAIRS; stride = total thread count (CUBE_COUNT * CUBE_DIM)
-    // — topology-derived, never a literal 32/64 (D-09). Each unit processes pairs
-    // ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch narrower than n_pairs still
-    // covers every pair (idle-guard `p < n_pairs`).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride loop over PAIRS; stride = the launch's total thread count —
+    // topology-derived, never a literal 32/64 (D-09) — supplied by the host as
+    // `grid_stride` (`CUBE_COUNT` is not a CPU-runtime builtin; see GRID STRIDE at the
+    // top). Each unit processes pairs ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch
+    // narrower than n_pairs still covers every pair (idle-guard `p < n_pairs`).
+    let stride = grid_stride as usize;
     let mut p = ABSOLUTE_POS;
     while p < n_pairs {
         let oi = pair_i[p] as usize;
@@ -1209,7 +1380,7 @@ pub fn pairwise_hist_nonbinary_kernel<F: Float>(
 ///
 /// `pair_i`/`pair_j` hold OBJECT ids; the cindex stride is over OBJECTS (`n_objects`, a
 /// runtime scalar), NOT `n_pairs` — `bin = cindex[feature * n_objects + obj]`. The
-/// grid-stride is the total thread count (`CUBE_COUNT * CUBE_DIM`), never a literal
+/// grid-stride is the total thread count (`grid_stride`), never a literal
 /// 32/64 (D-09). Bin/object VALUE ranges are validated HOST-SIDE in
 /// `launch_pairwise_hist_8bit_into` (T-07.4-07/08) before launch. Generic over
 /// `F: Float` (AGENTS.md generics-float). if-as-STATEMENT only (CubeCL conditionals
@@ -1223,6 +1394,7 @@ pub fn pairwise_hist_8bit_atomics_kernel<F: Float>(
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
     n_objects: u32,
+    grid_stride: u32,
     #[comptime] one_hot: bool,
 ) {
     // n_bins fixed at 256 (the 8-bit-atomics line size — comptime). Held `usize` for the
@@ -1234,11 +1406,12 @@ pub fn pairwise_hist_8bit_atomics_kernel<F: Float>(
     let n_features_usize = n_features as usize;
     let n_objects_usize = n_objects as usize;
 
-    // Grid-stride loop over PAIRS; stride = total thread count (CUBE_COUNT * CUBE_DIM)
-    // — topology-derived, never a literal 32/64 (D-09). Each unit processes pairs
-    // ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch narrower than n_pairs still
-    // covers every pair (idle-guard `p < n_pairs`).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride loop over PAIRS; stride = the launch's total thread count —
+    // topology-derived, never a literal 32/64 (D-09) — supplied by the host as
+    // `grid_stride` (`CUBE_COUNT` is not a CPU-runtime builtin; see GRID STRIDE at the
+    // top). Each unit processes pairs ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch
+    // narrower than n_pairs still covers every pair (idle-guard `p < n_pairs`).
+    let stride = grid_stride as usize;
     let mut p = ABSOLUTE_POS;
     while p < n_pairs {
         let oi = pair_i[p] as usize;
@@ -1333,7 +1506,7 @@ pub fn pairwise_hist_8bit_atomics_kernel<F: Float>(
 ///
 /// `pair_i`/`pair_j` hold OBJECT ids; the cindex stride is over OBJECTS (`n_objects`, a
 /// runtime scalar), NOT `n_pairs` — `bin = cindex[feature * n_objects + obj]`. The
-/// grid-stride is the total thread count (`CUBE_COUNT * CUBE_DIM`), never a literal 32/64
+/// grid-stride is the total thread count (`grid_stride`), never a literal 32/64
 /// (D-09 — the 16-bin line is a bin COUNT, not a warp literal). The nibble mask (`& 15`)
 /// additionally bounds the bin into `0..16` structurally; Bin/object VALUE ranges are also
 /// validated HOST-SIDE in `launch_pairwise_hist_half_byte_into` before launch. Generic
@@ -1348,6 +1521,7 @@ pub fn pairwise_hist_half_byte_kernel<F: Float>(
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
     n_objects: u32,
+    grid_stride: u32,
 ) {
     // FIXED 16-bin (4-bit) line — the comptime HALF_BYTE_BINS (NOT a runtime `bits` value):
     // the structural mark of the half-byte family. Held `usize` for the (feature, bin)
@@ -1362,11 +1536,13 @@ pub fn pairwise_hist_half_byte_kernel<F: Float>(
     let n_features_usize = n_features as usize;
     let n_objects_usize = n_objects as usize;
 
-    // Grid-stride loop over PAIRS; stride = total thread count (CUBE_COUNT * CUBE_DIM) —
+    // Grid-stride loop over PAIRS; stride = total thread count (`grid_stride`) —
     // topology-derived, never a literal 32/64 (D-09). Each unit processes pairs
     // ABSOLUTE_POS, ABSOLUTE_POS + stride, … so a launch narrower than n_pairs still covers
     // every pair (idle-guard `p < n_pairs`).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut p = ABSOLUTE_POS;
     while p < n_pairs {
         let oi = pair_i[p] as usize;
@@ -1448,7 +1624,7 @@ pub fn pairwise_hist_half_byte_kernel<F: Float>(
 ///
 /// `pair_i`/`pair_j` hold OBJECT ids; the cindex stride is over OBJECTS (`n_objects`, a
 /// runtime scalar), NOT `n_pairs` — `bin = cindex[feature * n_objects + obj]`. The grid-stride
-/// is the total thread count (`CUBE_COUNT * CUBE_DIM`), never a literal 32/64 (D-09 — the
+/// is the total thread count (`grid_stride`), never a literal 32/64 (D-09 — the
 /// 2-bin line is a bin COUNT, not a warp literal). The bit mask (`& 1`) additionally bounds
 /// the bin into `0..2` structurally; Bin/object VALUE ranges are also validated HOST-SIDE in
 /// `launch_pairwise_hist_binary_into` before launch. Generic over `F: Float` (AGENTS.md
@@ -1462,6 +1638,7 @@ pub fn pairwise_hist_binary_kernel<F: Float>(
     bin_sums: &Array<Atomic<F>>,
     n_features: u32,
     n_objects: u32,
+    grid_stride: u32,
 ) {
     // FIXED 2-bin (1-bit) line — a bin COUNT, NOT a runtime `bits` value or warp literal
     // (D-09): the structural mark of the binary family. Held `usize` for the (feature, bin)
@@ -1476,11 +1653,13 @@ pub fn pairwise_hist_binary_kernel<F: Float>(
     let n_features_usize = n_features as usize;
     let n_objects_usize = n_objects as usize;
 
-    // Grid-stride loop over PAIRS; stride = total thread count (CUBE_COUNT * CUBE_DIM) —
+    // Grid-stride loop over PAIRS; stride = total thread count (`grid_stride`) —
     // topology-derived, never a literal 32/64 (D-09). Each unit processes pairs ABSOLUTE_POS,
     // ABSOLUTE_POS + stride, … so a launch narrower than n_pairs still covers every pair
     // (idle-guard `p < n_pairs`).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut p = ABSOLUTE_POS;
     while p < n_pairs {
         let oi = pair_i[p] as usize;
@@ -1612,6 +1791,11 @@ pub fn block_reduce_kernel<F: Float>(
             output[CUBE_POS] = shared[0usize];
         }
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Block-level sum reduction with IN-KERNEL ATOMIC FINALIZE (D-03 / D-7.1-07; the
@@ -1707,6 +1891,11 @@ pub fn block_reduce_atomic_kernel<F: Float>(
     if tid == 0u32 {
         acc[0].fetch_add(cube_partial);
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Block-level inclusive/exclusive prefix-scan (the Phase-7.1 device primitive,
@@ -1743,6 +1932,7 @@ pub fn block_scan_kernel<F: Float>(
     input: &Array<F>,
     output: &mut Array<F>,
     #[comptime] inclusive: bool,
+    #[comptime] use_plane: bool,
 ) {
     let tid = UNIT_POS;
 
@@ -1753,31 +1943,48 @@ pub fn block_scan_kernel<F: Float>(
         val = input[ABSOLUTE_POS];
     }
 
-    // 1) Within-plane prefix via wave-agnostic plane ops (width = PLANE_DIM, never
-    //    a literal). `scanned` is this unit's prefix WITHIN its own plane; `incl`
-    //    is the plane-inclusive prefix (always includes self), used both to derive
-    //    each plane's total and — for the exclusive request — to recover the
-    //    inclusive value needed to seed the per-plane partial.
-    let scanned_in_plane = plane_inclusive_sum(val);
+    // 1) Within-plane prefix. WITH planes these are the wave-agnostic plane ops
+    //    (width = PLANE_DIM, never a literal): `scanned_in_plane` is the plane-
+    //    INCLUSIVE prefix (always includes self), used both to derive each plane's
+    //    total and — for the exclusive request — to recover the inclusive value that
+    //    seeds the per-plane partial. WITHOUT planes each unit IS its own plane, so
+    //    both collapse to their identities (see PLANE-FREE FALLBACK at the top of
+    //    this module) and the carry below becomes the whole scan. if-as-STATEMENT.
+    let mut scanned_in_plane = val;
+    if use_plane {
+        scanned_in_plane = plane_inclusive_sum(val);
+    }
     let mut scanned = scanned_in_plane;
     if !inclusive {
-        scanned = plane_exclusive_sum(val);
+        scanned = F::new(0.0_f32);
+        if use_plane {
+            scanned = plane_exclusive_sum(val);
+        }
     }
 
     // 2) Cross-plane carry (Hillis-Steele over per-plane inclusive totals — the
     //    `InplaceInclusiveScan` structure). The LAST unit of each plane holds that
-    //    plane's inclusive total (`scanned_in_plane`); write it into a per-plane
-    //    shared slot keyed by PLANE_POS.
+    //    plane's inclusive total (`scanned_in_plane`) and writes it into the shared
+    //    slot keyed by its plane index. Without planes every unit owns a slot, and
+    //    `partials` is sized to one slot per unit at this launch width, so the same
+    //    allocation serves both arms.
+    let mut plane_slot = tid;
+    let mut num_planes = CUBE_DIM_X;
+    let mut owns_slot = true;
+    if use_plane {
+        plane_slot = PLANE_POS;
+        // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on
+        // wave32 at CUBE_DIM 32 — the carry below then adds nothing). Derived from
+        // CUBE_DIM_X / PLANE_DIM, NOT a literal 32/64 (D-09).
+        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
+    }
+
     let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
-        partials[PLANE_POS as usize] = scanned_in_plane;
+    if owns_slot {
+        partials[plane_slot as usize] = scanned_in_plane;
     }
     sync_cube();
-
-    // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on wave32
-    // at CUBE_DIM 32 — the carry below then adds nothing). The stride loop derives
-    // its bound from CUBE_DIM_X / PLANE_DIM, NOT a literal 32/64 (D-09).
-    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
 
     // Hillis-Steele INCLUSIVE scan over the per-plane partials (mirrors
     // `inplace_scan.cuh`'s `val += data[tid - s]`, `s = 1,2,4,…`, `sync_cube()`
@@ -1803,29 +2010,32 @@ pub fn block_scan_kernel<F: Float>(
     }
 
     // 3) Each plane's EXCLUSIVE carry = inclusive-scan of partials, shifted by one
-    //    plane (carry for plane p = sum of all strictly-prior planes' totals).
-    //    PLANE_POS == 0 has zero carry; otherwise carry = partials[PLANE_POS - 1].
+    //    plane (carry for plane p = sum of all strictly-prior planes' totals). Slot 0
+    //    has zero carry; otherwise carry = partials[plane_slot - 1]. Without planes
+    //    `plane_slot == UNIT_POS`, so this is the ordinary exclusive prefix.
     let mut carry = F::new(0.0_f32);
-    if PLANE_POS >= 1u32 {
-        carry = partials[(PLANE_POS - 1u32) as usize];
+    if plane_slot >= 1u32 {
+        carry = partials[(plane_slot - 1u32) as usize];
     }
-    // IN-01: no post-read `sync_cube()` here — the barrier this read depends on is the
-    // trailing sync of the Hillis-Steele loop above; a barrier AFTER the read
-    // synchronizes nothing relevant to `carry` and is a needless cube-wide barrier on
-    // the scan hot path.
+    // IN-01 (SUPERSEDED): this previously argued that a barrier after the `carry` read
+    // "synchronizes nothing relevant" and was needless on the scan hot path. That holds
+    // only INTRA-cube. Across cubes it is wrong on the CPU runtime, where the shared
+    // buffer is reused per sequential cube iteration: the read above is of a NEIGHBOUR's
+    // slot (`PLANE_POS - 1`, i.e. `UNIT_POS - 1` when `PLANE_DIM == 1`), and that
+    // neighbour's next-cube write at the top of this kernel lands in exactly that slot.
+    // The barrier is now taken at the end of the kernel — see SHARED-MEMORY CUBE
+    // INDEPENDENCE at the top of this module.
 
     let result = scanned + carry;
     if ABSOLUTE_POS < input.len() {
         output[ABSOLUTE_POS] = result;
     }
-}
 
-/// Launch-geometry cube width for the two-level [`full_scan`] (Plan 10-01, GPUT-16).
-/// It equals [`BLOCK_REDUCE_SHMEM`] (a power-of-two width = the shared-mem allocation
-/// each block-scan reuses); it is the launch-geometry const, NOT a wave/warp-size
-/// literal in any reduction stride (the strides derive from `CUBE_DIM_X` / `PLANE_DIM`,
-/// D-09).
-pub(crate) const SCAN_CUBE_DIM: usize = BLOCK_REDUCE_SHMEM;
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
+}
 
 /// Per-block prefix scan that ALSO emits each block's total to `block_sums` — the
 /// first phase of the cross-cube two-level [`full_scan`] (GPUT-16; RESEARCH Open Q2:
@@ -1848,6 +2058,7 @@ pub fn block_scan_total_kernel<F: Float>(
     output: &mut Array<F>,
     block_sums: &mut Array<F>,
     #[comptime] inclusive: bool,
+    #[comptime] use_plane: bool,
 ) {
     let tid = UNIT_POS;
     let n = input.len();
@@ -1858,25 +2069,42 @@ pub fn block_scan_total_kernel<F: Float>(
         val = input[ABSOLUTE_POS];
     }
 
-    // Within-plane prefix via wave-agnostic plane ops (width = PLANE_DIM, never a
-    // literal). `scanned_in_plane` is always the plane-INCLUSIVE prefix; `scanned` is
-    // the requested (inclusive/exclusive) variant.
-    let scanned_in_plane = plane_inclusive_sum(val);
+    // Within-plane prefix — identical structure to `block_scan_kernel`. WITH planes
+    // these are the wave-agnostic plane ops (width = PLANE_DIM, never a literal);
+    // WITHOUT planes each unit is its own plane and they collapse to their identities
+    // (PLANE-FREE FALLBACK at the top of this module). `scanned_in_plane` is always
+    // the plane-INCLUSIVE prefix; `scanned` is the requested variant.
+    let mut scanned_in_plane = val;
+    if use_plane {
+        scanned_in_plane = plane_inclusive_sum(val);
+    }
     let mut scanned = scanned_in_plane;
     if !inclusive {
-        scanned = plane_exclusive_sum(val);
+        scanned = F::new(0.0_f32);
+        if use_plane {
+            scanned = plane_exclusive_sum(val);
+        }
     }
 
     // Cross-plane carry (Hillis-Steele over per-plane inclusive totals) — identical
     // structure to `block_scan_kernel`. The last unit of each plane writes that plane's
-    // inclusive total into a per-plane shared slot keyed by PLANE_POS.
+    // inclusive total into the slot keyed by its plane index; without planes every unit
+    // owns a slot, and `partials` holds one per unit at this launch width.
+    let mut plane_slot = tid;
+    let mut num_planes = CUBE_DIM_X;
+    let mut owns_slot = true;
+    if use_plane {
+        plane_slot = PLANE_POS;
+        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
+    }
+
     let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
-        partials[PLANE_POS as usize] = scanned_in_plane;
+    if owns_slot {
+        partials[plane_slot as usize] = scanned_in_plane;
     }
     sync_cube();
 
-    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
     let mut s = 1u32;
     while s < num_planes {
         let mut add = F::new(0.0_f32);
@@ -1896,8 +2124,8 @@ pub fn block_scan_total_kernel<F: Float>(
     }
 
     let mut carry = F::new(0.0_f32);
-    if PLANE_POS >= 1u32 {
-        carry = partials[(PLANE_POS - 1u32) as usize];
+    if plane_slot >= 1u32 {
+        carry = partials[(plane_slot - 1u32) as usize];
     }
 
     let result = scanned + carry;
@@ -1924,6 +2152,11 @@ pub fn block_scan_total_kernel<F: Float>(
             block_sums[CUBE_POS as usize] = inclusive_val;
         }
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Phase 3 of the two-level [`full_scan`]: add each block's exclusive-scanned offset
@@ -1943,11 +2176,11 @@ pub fn add_block_offset_kernel<F: Float>(data: &mut Array<F>, block_offsets: &Ar
 /// handle holding the full prefix scan of `in_handle` (`n` elements) WITHOUT reading it
 /// back — every handle stays bound to the SAME `client` that allocated it (Pitfall 3).
 ///
-/// - `num_cubes <= 1` (n <= [`SCAN_CUBE_DIM`]): single-cube base case via
+/// - `num_cubes <= 1` (n <= the launch width): single-cube base case via
 ///   [`block_scan_kernel`] (the cross-cube carry collapses to identity).
 /// - otherwise: phase 1 [`block_scan_total_kernel`] (per-block scan + block totals),
 ///   phase 2 = an EXCLUSIVE `full_scan_into` of the block totals (recurses until a
-///   single cube suffices — so arbitrary `n` is covered, not just `n <= SCAN_CUBE_DIM^2`),
+///   single cube suffices — so arbitrary `n` is covered, not just `n <= width^2`),
 ///   phase 3 [`add_block_offset_kernel`].
 ///
 /// No `unwrap`/`expect`/`panic`/host indexing (workspace lints + D-13): a device
@@ -1966,15 +2199,28 @@ where
     F: Float + CubeElement,
 {
     let out_handle = client.empty(n * std::mem::size_of::<F>());
-    let num_cubes = n.div_ceil(SCAN_CUBE_DIM).max(1);
+    // The barrier width: `gpu_runtime::CUBE_DIM` (== `BLOCK_REDUCE_SHMEM`) on a GPU, at most
+    // one spinning unit per core on the CPU runtime (see `gpu_runtime::cube_dim` and
+    // `launch_geometry::barrier_cube_dim` for the measurement that makes this mandatory).
+    // The cube count MUST follow the actual width.
+    let width = crate::gpu_runtime::cube_dim();
+    let num_cubes = n.div_ceil(width).max(1);
     let dim = CubeDim {
-        x: SCAN_CUBE_DIM as u32,
+        x: width as u32,
         y: 1,
         z: 1,
     };
 
+    // Query the plane capability ONCE on the host and drive the comptime branch of
+    // both scan kernels (see PLANE-FREE FALLBACK at the top of this module): the CPU
+    // runtime reports no plane ops, and a plane op emitted there does not compile.
+    let use_plane = client
+        .features()
+        .plane
+        .contains(cubecl::features::Plane::Ops);
+
     if num_cubes <= 1 {
-        // Single-cube base case: n <= SCAN_CUBE_DIM, the documented `block_scan_kernel`
+        // Single-cube base case: n <= width, the documented `block_scan_kernel`
         // scope where the whole scan fits one cube.
         block_scan_kernel::launch::<F, crate::SelectedRuntime>(
             client,
@@ -1983,6 +2229,7 @@ where
             unsafe { ArrayArg::from_raw_parts(in_handle, n) },
             unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
             inclusive,
+            use_plane,
         );
         return Ok(out_handle);
     }
@@ -1997,6 +2244,7 @@ where
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
         unsafe { ArrayArg::from_raw_parts(block_sums.clone(), num_cubes) },
         inclusive,
+        use_plane,
     );
 
     // Phase 2: exclusive scan of the block totals → each block's additive offset
@@ -2061,7 +2309,7 @@ where
 /// before the barrier so the in-place shared update has no read/write hazard.
 ///
 /// SCOPE (mirrors `block_scan_kernel` Open Q2): this performs the segmented scan WITHIN
-/// a single cube (`n <= SCAN_CUBE_DIM`). The cross-cube segmented carry (propagating a
+/// a single cube (`n <= gpu_runtime::CUBE_DIM`). The cross-cube segmented carry (propagating a
 /// block's tail sum into the next block only until its first segment head) is the
 /// documented forward dependency — it reuses the SAME two-level pattern as [`full_scan`]
 /// plus a head-seen mask, and is NOT performed here (documented, not a silent cut).
@@ -2138,6 +2386,11 @@ pub fn segmented_scan_kernel<F: Float>(
     if ABSOLUTE_POS < n {
         output[ABSOLUTE_POS] = result;
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 // ===========================================================================
@@ -2210,6 +2463,11 @@ pub fn segmented_reduce_kernel<F: Float>(
     if tid == 0u32 {
         output[seg] = F::cast_from(shared[0usize]);
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Key-head flag kernel (reduce-by-key phase 1): `flags[i] = 1.0` iff element `i`
@@ -2313,6 +2571,11 @@ pub fn reduce_by_key_kernel<F: Float>(
     if tid == 0u32 {
         out_sums[seg] = F::cast_from(shared[0usize]);
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Fixed-point scale for the deterministic reduce finalize (`2^30`, the well-tested
@@ -2382,6 +2645,11 @@ pub fn block_reduce_fixedpoint_kernel<F: Float>(input: &Array<F>, acc: &Array<At
         let q = u64::cast_from(i64::cast_from(f64::round(scaled)));
         acc[0].fetch_add(q);
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 // ===========================================================================
@@ -2788,7 +3056,8 @@ pub(crate) fn read_bin(cindex: &Array<u32>, offset: u32, obj: u32, shift: u32, m
 /// the CPU quantized bins, integer-exact). `out` is length `n_features * n`
 /// (feature-major, `out[feature * n + obj]`); `offsets`/`shifts`/`masks` are the
 /// per-feature `TCFeature` fields (length `n_features`). Grid-stride over the output
-/// cells (stride = total thread count `CUBE_COUNT * CUBE_DIM`, D-09); bounds-guarded
+/// cells (stride = the total thread count, supplied by the host as `grid_stride` — see
+/// GRID STRIDE at the top of this module, D-09); bounds-guarded
 /// (T-10-16); no `-inf` literal (T-10-17); `<F: Float>` phantom for launch-signature
 /// uniformity (`let _ = F::new(0.0)`). The host guards `n_features > 0` before launch so
 /// the `total / n_features` here never divides by zero.
@@ -2800,11 +3069,12 @@ pub fn read_all_bins_kernel<F: Float>(
     masks: &Array<u32>,
     out: &mut Array<u32>,
     n_features: u32,
+    grid_stride: u32,
 ) {
     let _ = F::new(0.0_f32);
     let total = out.len();
     let n = total / (n_features as usize);
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    let stride = grid_stride as usize;
     let mut cell = ABSOLUTE_POS;
     while cell < total {
         let feature = cell / n;
@@ -2981,6 +3251,11 @@ pub fn update_part_props_kernel<F: Float>(
     if tid == 0u32 {
         part_props[part] = F::cast_from(shared[0usize]);
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 // Spike tests live in the dedicated `kernels/gradient.rs` file (source/test
@@ -2999,6 +3274,16 @@ mod gradient;
 // so it builds/runs under EVERY backend (the rocm in-env oracle + wgpu host run).
 #[cfg(test)]
 mod reduce;
+
+// Structural guard for the SHARED-MEMORY CUBE INDEPENDENCE rule at the top of this
+// file (source/test separation): asserts that EVERY `#[cube]` kernel declaring a
+// `SharedMemory` ends with a top-level `sync_cube()`, which is what makes the same
+// kernel source correct under BOTH the parallel-cube GPU runtimes and the
+// sequential-cube CPU runtime. Structural rather than behavioural on purpose — the
+// bug it prevents is a race, so a behavioural test would have to lose that race to
+// fail and could never hold the invariant. Mounted under every backend.
+#[cfg(test)]
+mod shared_memory_cube_independence_test;
 
 // Block-scan primitive oracle (source/test separation): the inclusive/exclusive
 // prefix-sum self-oracle vs a Rust CPU prefix-sum lives in `kernels/scan.rs`,
@@ -3700,6 +3985,11 @@ pub fn find_optimal_split_kernel<F: Float>(
         best_gain[CUBE_POS] = sh_gain[0usize];
         best_idx[CUBE_POS] = sh_idx[0usize];
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Device-resident **scan/update** over the FROZEN 7.3 device-resident 2-channel
@@ -3756,6 +4046,7 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     bin_sums: &Array<F>,
     cumulative: &mut Array<F>,
     n_bins: u32,
+    #[comptime] use_plane: bool,
 ) {
     let tid = UNIT_POS;
     let n_bins_usize = n_bins as usize;
@@ -3782,22 +4073,33 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     //     mechanism VERBATIM (within-plane plane scan + Hillis-Steele cross-plane
     //     carry over per-plane partials). inclusive = true (cumulative includes self).
 
-    // 1) Within-plane inclusive prefix (width = PLANE_DIM, never a literal).
-    let scanned_in_plane = plane_inclusive_sum(val);
+    // 1) Within-plane inclusive prefix. WITH planes this is the wave-agnostic plane op
+    //    (width = PLANE_DIM, never a literal); WITHOUT planes each unit is its own
+    //    plane and it collapses to the unit's own value — see PLANE-FREE FALLBACK at
+    //    the top of this module. if-as-STATEMENT only.
+    let mut scanned_in_plane = val;
+    if use_plane {
+        scanned_in_plane = plane_inclusive_sum(val);
+    }
     let scanned = scanned_in_plane;
 
     // 2) Cross-plane carry: the LAST unit of each plane writes that plane's inclusive
-    //    total into a per-plane shared slot keyed by PLANE_POS.
+    //    total into the shared slot keyed by its plane index. Without planes every unit
+    //    owns a slot, and `partials` holds one per unit at this launch width.
+    let mut plane_slot = tid;
+    let mut num_planes = CUBE_DIM_X;
+    let mut owns_slot = true;
+    if use_plane {
+        plane_slot = PLANE_POS;
+        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
+    }
+
     let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
-        partials[PLANE_POS as usize] = scanned_in_plane;
+    if owns_slot {
+        partials[plane_slot as usize] = scanned_in_plane;
     }
     sync_cube();
-
-    // Number of planes in this cube = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on wave32 at
-    // CUBE_DIM 32 — the carry below then adds nothing). The stride bound derives from
-    // CUBE_DIM_X / PLANE_DIM, NOT a literal 32/64 (D-09).
-    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
 
     // Hillis-Steele inclusive scan over the per-plane partials.
     let mut s = 1u32;
@@ -3819,9 +4121,11 @@ pub fn scan_update_pointwise_kernel<F: Float>(
     }
 
     // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
+    //    Without planes `plane_slot == UNIT_POS`, so this is the ordinary exclusive
+    //    prefix over the per-unit partials.
     let mut carry = F::new(0.0_f32);
-    if PLANE_POS >= 1u32 {
-        carry = partials[(PLANE_POS - 1u32) as usize];
+    if plane_slot >= 1u32 {
+        carry = partials[(plane_slot - 1u32) as usize];
     }
 
     let result = scanned + carry;
@@ -3834,6 +4138,11 @@ pub fn scan_update_pointwise_kernel<F: Float>(
             cumulative[out_cell] = result;
         }
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Device-resident **partition split** — the per-object doc-routing reorder that
@@ -3860,7 +4169,7 @@ pub fn scan_update_pointwise_kernel<F: Float>(
 /// # Wave-size policy (D-09) / generics-float (AGENTS.md)
 ///
 /// The per-object loop is a grid-stride loop over the total thread count
-/// (`CUBE_COUNT * CUBE_DIM`), a topology-derived value — NEVER a literal 32/64. The
+/// (`grid_stride`), a topology-derived value — NEVER a literal 32/64. The
 /// kernel is generic over `F: Float` (AGENTS.md generics-float): the resident der1
 /// handle is threaded in as `&Array<F>` so the SAME persistent float buffer the grow
 /// loop already holds is bound without a fresh upload; the routing itself reads only
@@ -3885,6 +4194,7 @@ pub fn partition_split_kernel<F: Float>(
     mask: u32,
     bin: u32,
     level_bit: u32,
+    grid_stride: u32,
     #[comptime] one_hot: bool,
 ) {
     // Keep the `F: Float` generic real (AGENTS.md generics-float) while routing on the
@@ -3895,8 +4205,9 @@ pub fn partition_split_kernel<F: Float>(
     let n = indices.len();
 
     // Grid-stride loop over the object-visiting order (the stride is the total thread
-    // count CUBE_COUNT * CUBE_DIM — a topology value, NEVER a literal 32/64, D-09).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // count — a topology value, NEVER a literal 32/64, D-09), supplied by the host as
+    // `grid_stride` (`CUBE_COUNT` is not a CPU-runtime builtin; see GRID STRIDE at the top).
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         let obj_u = indices[i];
@@ -3964,7 +4275,7 @@ pub fn partition_split_kernel<F: Float>(
 /// # Wave-size policy (D-09) / generics-float (AGENTS.md)
 ///
 /// The per-object loop is a grid-stride loop over the total thread count
-/// (`CUBE_COUNT * CUBE_DIM`) — NEVER a literal 32/64. Generic over `F: Float`
+/// (`grid_stride`) — NEVER a literal 32/64. Generic over `F: Float`
 /// (AGENTS.md generics-float). Every device read is under a POSITION bounds guard; the
 /// `leaf_of` partition VALUE range (`< n_parts`) is validated HOST-SIDE before launch
 /// so the atomic store cannot address `part_stats` out of bounds. if-as-STATEMENT only.
@@ -4004,12 +4315,15 @@ pub fn partition_update_kernel<F: Float>(
     indices: &Array<u32>,
     leaf_of: &Array<u32>,
     part_stats: &Array<Atomic<F>>,
+    grid_stride: u32,
 ) {
     let n = indices.len();
 
     // Grid-stride loop over the object-visiting order (stride == total thread count,
     // a topology value — NEVER a literal 32/64, D-09).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         let obj = indices[i] as usize;
@@ -4067,6 +4381,7 @@ pub fn partition_update_lds_kernel<F: Float>(
     indices: &Array<u32>,
     leaf_of: &Array<u32>,
     part_stats: &Array<Atomic<F>>,
+    grid_stride: u32,
     #[comptime] lds_cells: u32,
 ) {
     let lds = SharedMemory::<Atomic<u64>>::new(comptime!(lds_cells as usize));
@@ -4086,7 +4401,9 @@ pub fn partition_update_lds_kernel<F: Float>(
     sync_cube();
 
     // (2) Fold this cube's grid-strided object chunk into the private sub-result.
-    let stride = (CUBE_COUNT_X as usize) * cd;
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = (CUBE_POS_X as usize) * cd + (UNIT_POS as usize);
     while i < n {
         let obj = indices[i] as usize;
@@ -4114,6 +4431,11 @@ pub fn partition_update_lds_kernel<F: Float>(
         part_stats[m].fetch_add(fixedpoint_decode::<F>(lds[m].load()));
         m += cd;
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 // ===========================================================================
@@ -4204,7 +4526,7 @@ fn fixedpoint_decode<F: Float>(bits: u64) -> F {
 /// # Wave-size policy (D-09) / generics-float (AGENTS.md)
 ///
 /// The per-object loop is a grid-stride loop over the TOTAL thread count
-/// (`CUBE_COUNT * CUBE_DIM`) — NEVER a literal 32/64. Generic over `F: Float` (the input
+/// (`grid_stride`) — NEVER a literal 32/64. Generic over `F: Float` (the input
 /// der1/weight channel). Bins are read through the ONE [`read_bin`] accessor over the
 /// bit-packed grouped cindex (T-10-15). Every position read is grid-stride-bounded; the
 /// VALUE ranges (`indices[i] < n`, bin `< n_bins`, `leaf_of[obj] < 2^level`) are
@@ -4225,6 +4547,7 @@ pub fn partition_hist2_nonbinary_kernel<F: Float>(
     n_features: u32,
     n_copies: u32,
     filter_mask: u32,
+    grid_stride: u32,
     #[comptime] bits: u32,
 ) {
     // n_bins = 1 << bits (comptime); the (feature, bin) index arithmetic stays `usize`.
@@ -4245,7 +4568,9 @@ pub fn partition_hist2_nonbinary_kernel<F: Float>(
 
     // Grid-stride loop over the object-visiting order (stride == total thread count,
     // a topology value — NEVER a literal 32/64, D-09).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         let obj_u = indices[i];
@@ -4293,8 +4618,10 @@ pub fn partition_hist2_nonbinary_kernel<F: Float>(
 /// partition histogram: the buffer is `client.empty`-allocated and zeroed ON DEVICE, so
 /// no O(histogram) zero bytes ever cross the PCIe bus.
 #[cube(launch)]
-pub fn zero_u64_kernel(buf: &mut Array<u64>) {
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+pub fn zero_u64_kernel(buf: &mut Array<u64>, grid_stride: u32) {
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < buf.len() {
         buf[i] = 0u64;
@@ -4313,8 +4640,15 @@ pub fn zero_u64_kernel(buf: &mut Array<u64>) {
 /// The host guarantees `dst_offset + src.len() <= dst.len()`; the `i < src.len()` bound plus
 /// that precondition keeps every store in range.
 #[cube(launch)]
-pub fn copy_u64_block_kernel(src: &Array<u64>, dst: &mut Array<u64>, dst_offset: u32) {
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+pub fn copy_u64_block_kernel(
+    src: &Array<u64>,
+    dst: &mut Array<u64>,
+    dst_offset: u32,
+    grid_stride: u32,
+) {
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let base = dst_offset as usize;
     let mut i = ABSOLUTE_POS;
     while i < src.len() {
@@ -4331,9 +4665,11 @@ pub fn copy_u64_block_kernel(src: &Array<u64>, dst: &mut Array<u64>, dst_offset:
 /// output cell (no cross-thread writes → no atomics needed). Downstream consumers read
 /// the handle with length `copy_stride` (copy 0 only).
 #[cube(launch)]
-pub fn fold_hist_copies_kernel(buf: &mut Array<u64>, n_copies: u32) {
+pub fn fold_hist_copies_kernel(buf: &mut Array<u64>, n_copies: u32, grid_stride: u32) {
     let copy_stride = buf.len() / (n_copies as usize);
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < copy_stride {
         let mut acc = buf[i];
@@ -4425,6 +4761,7 @@ pub fn partition_hist2_lds_kernel<F: Float>(
     filter_mask: u32,
     n_active_parts: u32,
     tile_features: u32,
+    grid_stride: u32,
     #[comptime] bits: u32,
     #[comptime] lds_cells: u32,
 ) {
@@ -4461,7 +4798,9 @@ pub fn partition_hist2_lds_kernel<F: Float>(
 
     // (2) Scatter this cube's object chunk into the private LDS sub-histogram
     //     (grid-stride along the X axis only — Y is the feature tile).
-    let stride = (CUBE_COUNT_X as usize) * cd;
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = (CUBE_POS_X as usize) * cd + (UNIT_POS as usize);
     while i < n {
         let obj_u = indices[i];
@@ -4528,6 +4867,11 @@ pub fn partition_hist2_lds_kernel<F: Float>(
         }
         m += cd;
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// Derive the UNFILLED sibling half of a partition histogram from the parent level's
@@ -4552,10 +4896,13 @@ pub fn derive_sibling_partition_hist_kernel<F: Float>(
     hist: &mut Array<u64>,
     half: u32,
     leaf_stride: u32,
+    grid_stride: u32,
 ) {
     let ls = leaf_stride as usize;
     let cells = (half as usize) * ls;
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut c = ABSOLUTE_POS;
     while c < cells {
         let p = c / ls;
@@ -4659,7 +5006,7 @@ pub fn subtract_histograms_kernel<F: Float>(
 /// # Deterministic argmin (Pitfall 1) + D-05
 ///
 /// Each thread keeps a running best `(gain, candidate-index)` over its grid-strided candidate
-/// subset (stride = total thread count `CUBE_COUNT * CUBE_DIM`, D-09 — MULTI-cube so the
+/// subset (stride = total thread count `grid_stride`, D-09 — MULTI-cube so the
 /// candidate sweep uses the whole device, not one SM) with the strict-`>` first-wins /
 /// lowest-`(feature, bin)`-index tie-break, then each cube block-reduces (wave-agnostic
 /// `CUBE_DIM_X`-strided shared-mem tree, D-09) into its per-block `(best_gain, best_idx)`
@@ -4695,6 +5042,7 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     n_bins_used: u32,
     feature_lo: u32,
     feature_hi: u32,
+    grid_stride: u32,
     #[comptime] n_bins: u32,
     #[comptime] score_fn: u32,
     #[comptime] one_hot: bool,
@@ -4736,9 +5084,11 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
     // what keeps a narrower pass's sentinel from being read as a real winner.
     let mut my_idx = hi as u32;
 
-    // Grid-stride over candidates (D-09: stride == TOTAL thread count CUBE_COUNT * CUBE_DIM,
-    // a topology value — the multi-cube dispatch spreads the candidate sweep over the device).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride over candidates (D-09: stride == the launch's TOTAL thread count, a
+    // topology value — the multi-cube dispatch spreads the candidate sweep over the device),
+    // supplied by the host as `grid_stride` (`CUBE_COUNT` is not a CPU-runtime builtin; see
+    // GRID STRIDE at the top).
+    let stride = grid_stride as usize;
     let mut c = ABSOLUTE_POS + lo;
     while c < hi {
         let feature = c / n_bins_usize;
@@ -4885,6 +5235,11 @@ pub fn find_optimal_split_partition_kernel<F: Float>(
         best_gain[CUBE_POS] = sh_gain[0usize];
         best_idx[CUBE_POS] = sh_idx[0usize];
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// The ORDERED-boosting sibling of [`find_optimal_split_partition_kernel`] (FPP-19, T22):
@@ -4946,6 +5301,7 @@ pub fn find_optimal_split_ordered_kernel<F: Float>(
     feature_lo: u32,
     feature_hi: u32,
     n_segments: u32,
+    grid_stride: u32,
     #[comptime] n_bins: u32,
 ) {
     let tid = UNIT_POS;
@@ -4969,7 +5325,9 @@ pub fn find_optimal_split_ordered_kernel<F: Float>(
     let mut my_gain = minimal_score;
     let mut my_idx = hi as u32;
 
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut c = ABSOLUTE_POS + lo;
     while c < hi {
         let feature = c / n_bins_usize;
@@ -5077,6 +5435,11 @@ pub fn find_optimal_split_ordered_kernel<F: Float>(
         best_gain[CUBE_POS] = sh_gain[0usize];
         best_idx[CUBE_POS] = sh_idx[0usize];
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 // ===========================================================================
@@ -5133,6 +5496,7 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     bin_sums: &Array<F>,
     cumulative: &mut Array<F>,
     n_bins: u32,
+    #[comptime] use_plane: bool,
 ) {
     let tid = UNIT_POS;
     let n_bins_usize = n_bins as usize;
@@ -5158,22 +5522,33 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     //     mechanism VERBATIM (within-plane plane scan + Hillis-Steele cross-plane
     //     carry over per-plane partials). inclusive = true (cumulative includes self).
 
-    // 1) Within-plane inclusive prefix (width = PLANE_DIM, never a literal).
-    let scanned_in_plane = plane_inclusive_sum(val);
+    // 1) Within-plane inclusive prefix. WITH planes this is the wave-agnostic plane op
+    //    (width = PLANE_DIM, never a literal); WITHOUT planes each unit is its own
+    //    plane and it collapses to the unit's own value — see PLANE-FREE FALLBACK at
+    //    the top of this module. if-as-STATEMENT only.
+    let mut scanned_in_plane = val;
+    if use_plane {
+        scanned_in_plane = plane_inclusive_sum(val);
+    }
     let scanned = scanned_in_plane;
 
     // 2) Cross-plane carry: the LAST unit of each plane writes that plane's inclusive
-    //    total into a per-plane shared slot keyed by PLANE_POS.
+    //    total into the shared slot keyed by its plane index. Without planes every unit
+    //    owns a slot, and `partials` holds one per unit at this launch width.
+    let mut plane_slot = tid;
+    let mut num_planes = CUBE_DIM_X;
+    let mut owns_slot = true;
+    if use_plane {
+        plane_slot = PLANE_POS;
+        num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
+        owns_slot = UNIT_POS_PLANE == PLANE_DIM - 1u32;
+    }
+
     let mut partials = SharedMemory::<F>::new(BLOCK_REDUCE_SHMEM);
-    if UNIT_POS_PLANE == PLANE_DIM - 1u32 {
-        partials[PLANE_POS as usize] = scanned_in_plane;
+    if owns_slot {
+        partials[plane_slot as usize] = scanned_in_plane;
     }
     sync_cube();
-
-    // Number of planes = ceil(CUBE_DIM_X / PLANE_DIM) (== 1 on wave32 at CUBE_DIM 32 —
-    // the carry below then adds nothing). The stride bound derives from CUBE_DIM_X /
-    // PLANE_DIM, NOT a literal 32/64 (D-09).
-    let num_planes = (CUBE_DIM_X + PLANE_DIM - 1u32) / PLANE_DIM;
 
     // Hillis-Steele inclusive scan over the per-plane partials.
     let mut s = 1u32;
@@ -5195,9 +5570,11 @@ pub fn scan_update_pairwise_kernel<F: Float>(
     }
 
     // 3) Each plane's exclusive carry = sum of all strictly-prior planes' totals.
+    //    Without planes `plane_slot == UNIT_POS`, so this is the ordinary exclusive
+    //    prefix over the per-unit partials.
     let mut carry = F::new(0.0_f32);
-    if PLANE_POS >= 1u32 {
-        carry = partials[(PLANE_POS - 1u32) as usize];
+    if plane_slot >= 1u32 {
+        carry = partials[(plane_slot - 1u32) as usize];
     }
 
     let result = scanned + carry;
@@ -5210,6 +5587,11 @@ pub fn scan_update_pairwise_kernel<F: Float>(
             cumulative[out_cell] = result;
         }
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 /// **Pairwise make-derivatives** — the per-(feature, bucket) der-sum scatter that
@@ -5237,7 +5619,7 @@ pub fn scan_update_pairwise_kernel<F: Float>(
 /// # Wave-size policy (D-09) / generics-float (AGENTS.md)
 ///
 /// The per-object loop is a grid-stride loop over the total thread count
-/// (`CUBE_COUNT * CUBE_DIM`) — NEVER a literal 32/64. Generic over `F: Float`. Every
+/// (`grid_stride`) — NEVER a literal 32/64. Generic over `F: Float`. Every
 /// device read is under a POSITION bounds guard; the bin/object VALUE ranges are
 /// validated HOST-SIDE before launch. if-as-STATEMENT only.
 ///
@@ -5252,6 +5634,7 @@ pub fn pairwise_make_derivatives_kernel<F: Float>(
     indices: &Array<u32>,
     der_sums: &mut Array<Atomic<F>>,
     n_features: u32,
+    grid_stride: u32,
     #[comptime] n_bins: u32,
 ) {
     let n = indices.len();
@@ -5260,7 +5643,9 @@ pub fn pairwise_make_derivatives_kernel<F: Float>(
 
     // Grid-stride loop over the object-visiting order (stride == total thread count,
     // a topology value — NEVER a literal 32/64, D-09).
-    let stride = CUBE_COUNT * (CUBE_DIM as usize);
+    // Grid-stride step = the launch's total thread count, supplied by the host
+    // (`CUBE_COUNT` is not a CPU-runtime builtin) — see GRID STRIDE at the top.
+    let stride = grid_stride as usize;
     let mut i = ABSOLUTE_POS;
     while i < n {
         let obj = indices[i] as usize;
@@ -5446,6 +5831,11 @@ pub fn select_best_split_kernel<F: Float>(
         best_gain[CUBE_POS] = sh_gain[0usize];
         best_idx[CUBE_POS] = sh_idx[0usize];
     }
+
+    // Trailing cube barrier — SHARED-MEMORY CUBE INDEPENDENCE (top of module): pin
+    // every unit to this cube before any may advance and reuse the shared buffer,
+    // which the CPU runtime does on every sequential cube iteration.
+    sync_cube();
 }
 
 #[cfg(test)]

@@ -77,5 +77,8 @@ cpu = ["catboost-rs/cpu"]
 rocm = ["catboost-rs/rocm"]
 # 08-08: wgpu/cuda passthrough alongside cpu/rocm so the generic GpuBackend is
 # selectable for all three GPU backends through the facade (cpu-free under each).
+# Metal-Shading-Language variant of the `wgpu` arm — enables our own `wgpu` too so the
+# `#[cfg(feature = "wgpu")]` arms downstream keep applying (see cb-backend Cargo.toml).
+wgpu-msl = ["wgpu", "catboost-rs/wgpu-msl"]
 wgpu = ["catboost-rs/wgpu"]
 cuda = ["catboost-rs/cuda"]

@@ -439,6 +439,17 @@ mod partition {
     /// (== upstream `UpdatePartitionProps`) over the SAME device-resident routing.
     #[test]
     fn update_matches_ordered_reference() {
+        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+        // (cubecl-cpu implements no atomics). A red test here would report a runtime
+        // limitation as a numerical regression — the `pointwise_hist` precedent; see
+        // `channel_atomics_available`.
+        if !crate::gpu_runtime::channel_atomics_available() {
+            eprintln!(
+                "[grow_loop] SKIP update_matches_ordered_reference: backend advertises no channel-float \
+                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+            );
+            return;
+        }
         let n_features = 3usize;
         let n_bins = 32usize;
 
@@ -1486,6 +1497,17 @@ mod pairwise {
     /// REPORT the leaf-value divergence vs `cb_compute::calc_average`. This closes GPU-01.
     #[test]
     fn matches_cpu_pairwise_grow() {
+        // SKIP, don't fail, when the backend cannot run an `Atomic<F>` fill at all
+        // (cubecl-cpu implements no atomics). A red test here would report a runtime
+        // limitation as a numerical regression — the `pointwise_hist` precedent; see
+        // `channel_atomics_available`.
+        if !crate::gpu_runtime::channel_atomics_available() {
+            eprintln!(
+                "[grow_loop] SKIP matches_cpu_pairwise_grow: backend advertises no channel-float \
+                 atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+            );
+            return;
+        }
         let n_features = 3usize;
         let n_bins = 32usize; // 5-bit, <= CUBE_DIM
         let depth = 1usize;

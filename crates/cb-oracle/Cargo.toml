@@ -21,6 +21,9 @@ cpu = ["cb-backend/cpu", "cb-train/cpu"]
 rocm = ["cb-backend/rocm", "cb-train/rocm"]
 wgpu = ["cb-backend/wgpu", "cb-train/wgpu"]
 cuda = ["cb-backend/cuda", "cb-train/cuda"]
+# Metal-Shading-Language variant of the `wgpu` arm — enables our own `wgpu` too so the
+# `#[cfg(feature = "wgpu")]` arms downstream keep applying (see cb-backend Cargo.toml).
+wgpu-msl = ["wgpu", "cb-backend/wgpu-msl", "cb-train/wgpu-msl"]
 
 [dependencies]
 thiserror.workspace = true

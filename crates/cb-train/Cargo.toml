@@ -17,6 +17,9 @@ cpu = ["cb-backend/cpu"]
 rocm = ["cb-backend/rocm"]
 wgpu = ["cb-backend/wgpu"]
 cuda = ["cb-backend/cuda"]
+# Metal-Shading-Language variant of the `wgpu` arm — enables our own `wgpu` too so the
+# `#[cfg(feature = "wgpu")]` arms downstream keep applying (see cb-backend Cargo.toml).
+wgpu-msl = ["wgpu", "cb-backend/wgpu-msl"]
 
 [dependencies]
 # NOTE: `anyhow` is intentionally absent (D-14 structural ban). Do not add it.

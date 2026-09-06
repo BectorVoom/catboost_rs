@@ -145,6 +145,42 @@ const _: () = assert!(
      halves its stride and would silently drop the top element(s) otherwise"
 );
 
+/// The cube width the block-reduce family is ACTUALLY launched at on the selected
+/// runtime: [`CUBE_DIM`] on a GPU, and at most one unit per core on the CPU runtime.
+///
+/// [`CUBE_DIM`] is the width the kernels were written for and the capacity of their
+/// `SharedMemory`; it stays the compile-time upper bound the asserts above couple to
+/// `BLOCK_REDUCE_SHMEM`. But on `cubecl-cpu` every unit is an OS thread and `sync_cube`
+/// is a pure spin barrier, so launching 32 units on an 8-core host costs about ONE SECOND
+/// PER CUBE (measured; see `launch_geometry::barrier_cube_dim`) — the "hang" every
+/// large-`n` shared-memory test on this backend used to show. Every launch site in this
+/// module therefore sizes its cubes, its cube count and its grid stride from THIS width.
+/// It is always a power of two `<= CUBE_DIM`, so both asserts above still hold for it,
+/// and the kernels derive every stride and slot count from the `CUBE_DIM_X` builtin
+/// (D-09), so a narrower launch is the same algorithm over fewer slots.
+///
+/// Memoized: the device properties do not change for the life of the process.
+pub(crate) fn cube_dim() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+        let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+        crate::launch_geometry::barrier_cube_dim(&client, CUBE_DIM)
+    })
+}
+
+/// The width for a SINGLE-cube launch whose kernel maps one unit to one of `items`
+/// (the single-cube scans: `block_scan_kernel`, `scan_update_*_kernel`, and the
+/// segmented scan). Such a kernel needs at least `items` units, so it cannot always
+/// take the core-capped [`cube_dim`]; it takes the narrowest power of two that covers
+/// `items`, never below [`cube_dim`] and never above [`CUBE_DIM`] (the capacity the
+/// caller has already validated `items` against). On the CPU runtime a 32-item scan
+/// therefore still pays the oversubscribed barrier — correct, and bounded to the one
+/// cube — while every smaller one runs at the core-capped width.
+pub(crate) fn single_cube_dim(items: usize) -> usize {
+    CUBE_DIM.min(cube_dim().max(items.max(1).next_power_of_two()))
+}
+
 /// Launch geometry for the PARTITION-HISTOGRAM family (fill / zero / fold / derive):
 /// 256 threads per cube. These kernels are pure grid-stride loops with NO
 /// `SharedMemory` allocation, so they are decoupled from the [`CUBE_DIM`]-sized
@@ -252,7 +288,7 @@ pub fn launch_block_reduce_f64(input: &[f64]) -> CbResult<Vec<f64>> {
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let out_handle = client.empty(num_cubes * std::mem::size_of::<f64>());
 
     // Query the plane capability ONCE on the host and drive the comptime branch
@@ -261,7 +297,7 @@ pub fn launch_block_reduce_f64(input: &[f64]) -> CbResult<Vec<f64>> {
 
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -403,10 +439,10 @@ pub fn launch_apply_oblivious_f64(
     let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
-    let num_cubes = n_objects.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n_objects.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -534,18 +570,25 @@ pub fn launch_block_scan_f64(input: &[f64], inclusive: bool) -> CbResult<Vec<f64
     let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
-    // n <= CUBE_DIM (guarded above), so this is always a single cube.
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    // n <= CUBE_DIM (guarded above), so this is always a single cube, launched at the
+    // narrowest width that still gives every element its own unit (`single_cube_dim`).
+    let width = single_cube_dim(n);
+    let num_cubes = n.div_ceil(width).max(1);
     // The scan output is per-element (same length as the input), NOT one slot per
     // cube — a scan is not a reduction.
     let out_handle = client.empty(n * std::mem::size_of::<f64>());
 
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: width as u32,
         y: 1,
         z: 1,
     };
+
+    // Query the plane capability ONCE on the host and drive the comptime branch (see
+    // PLANE-FREE FALLBACK in `kernels.rs`): the CPU runtime reports no plane ops, and
+    // emitting one there does not compile.
+    let use_plane = client.features().plane.contains(Plane::Ops);
 
     block_scan_kernel::launch::<f64, SelectedRuntime>(
         &client,
@@ -554,6 +597,7 @@ pub fn launch_block_scan_f64(input: &[f64], inclusive: bool) -> CbResult<Vec<f64
         unsafe { ArrayArg::from_raw_parts(in_handle, n) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
         inclusive,
+        use_plane,
     );
 
     // Typed-error read-back (WR-05): never a silent all-zero buffer masquerading as
@@ -593,6 +637,56 @@ fn device_supports_u64_atomic_add<R: cubecl::Runtime>(
         .properties()
         .atomic_type_usage(ty)
         .contains(AtomicUsage::Add)
+}
+
+/// Does the device advertise atomic-add for the HISTOGRAM CHANNEL float — `f32` on wgpu,
+/// `f64` everywhere else (RESEARCH A1, the same compile-time channel choice the fills
+/// dispatch on)? Gates every fill that accumulates into `&Array<Atomic<F>>`.
+///
+/// Why this gate exists (WR-02, and why it is not merely informational): `cubecl-cpu`
+/// 0.10 implements NO atomics — `Atomic<u64>`, `Atomic<f64>` and `Atomic<f32>` all report
+/// `AtomicUsage::Add == false`, and emitting one panics its MLIR visitor with
+/// `not yet implemented: This type is not implemented yet. atomic<T>`. That panic happens
+/// on a device WORKER thread while the host blocks on the mpsc receive for that unit, so
+/// an ungated launch does not fail — it HANGS, or silently returns the all-zero output
+/// buffer it allocated. Both are far worse than a typed error: the first wedges
+/// `cargo test -p cb-backend`, the second is indistinguishable from a real numerical
+/// regression. Gate on the advertised capability and surface [`CbError::Unsupported`]
+/// BEFORE the launch, exactly as the sibling `Atomic<u64>` fills already do.
+fn device_supports_channel_atomic_add<R: cubecl::Runtime>(
+    client: &cubecl::client::ComputeClient<R>,
+) -> bool {
+    #[cfg(feature = "wgpu")]
+    let ty = <Atomic<f32> as CubePrimitive>::as_type_native_unchecked();
+    #[cfg(not(feature = "wgpu"))]
+    let ty = <Atomic<f64> as CubePrimitive>::as_type_native_unchecked();
+    client
+        .properties()
+        .atomic_type_usage(ty)
+        .contains(AtomicUsage::Add)
+}
+
+/// Test-support: does the ACTIVE backend advertise the channel-float atomic-add that every
+/// `Atomic<F>` fill needs? Test modules gate on this to SKIP rather than fail, because a red
+/// test on a backend that cannot execute the kernel at all reports a RUNTIME LIMITATION as
+/// if it were a numerical regression — the same reasoning as the `gpu_backend_active()`
+/// skips in `kernels::gpu_tolerance`, but keyed on the measured capability rather than on
+/// which cargo feature happens to be on.
+#[cfg(test)]
+pub(crate) fn channel_atomics_available() -> bool {
+    let device = <SelectedRuntime as cubecl::Runtime>::Device::default();
+    let client = <SelectedRuntime as cubecl::Runtime>::client(&device);
+    device_supports_channel_atomic_add(&client)
+}
+
+/// The shared [`CbError::Unsupported`] for a float-atomic fill the active backend cannot
+/// run. `what` names the fill so the message says which seam refused.
+fn channel_atomic_unsupported(what: &str) -> CbError {
+    CbError::Unsupported(format!(
+        "{what} accumulates into Atomic<F> (the histogram channel float), which the active \
+         backend does not advertise. cubecl-cpu implements no atomics at all, so this kernel \
+         would hang a device worker rather than fail — use the rocm/cuda backend"
+    ))
 }
 
 /// Reduce `input` to a SINGLE scalar sum on the compile-time [`SelectedRuntime`]
@@ -643,7 +737,7 @@ pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFin
     }
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
 
     // The accumulator is a single f64 slot, zero-initialized so the in-kernel
     // `fetch_add`s accumulate from 0.0 (the additive identity).
@@ -653,7 +747,7 @@ pub fn launch_block_reduce_atomic_f64(input: &[f64]) -> CbResult<(f64, AtomicFin
 
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -803,29 +897,25 @@ mod cindex_one_hot_test;
 // T25 / SPEC-OH-22: the split scorer's one-hot (EQUALITY) fold arm. Drives the private
 // `score_partition_over_binsums` directly, so it must be a `gpu_runtime` descendant.
 //
-// NOT built under the default `cpu` backend: `find_optimal_split_partition_kernel` uses the
-// `CUBE_COUNT` builtin for its grid stride, and cubecl-cpu rejects it outright
-// ("Unsupported builtin was used: CubeCount"). Every fn here would fail for that reason
-// alone, which would be indistinguishable from a real one-hot regression. Run with a real
-// device:
-//   cargo test -p cb-backend --no-default-features --features rocm \
-//       --lib gpu_runtime::one_hot_split_score_test
-#[cfg(all(test, not(feature = "cpu")))]
+// Formerly cpu-excluded because `find_optimal_split_partition_kernel` grid-strode over the
+// `CUBE_COUNT` builtin, which cubecl-cpu rejects outright ("Unsupported builtin was used:
+// CubeCount"). That kernel now takes a host-supplied `grid_stride` instead (see GRID STRIDE
+// in `kernels.rs`), so the module builds and runs under the default backend again. Cases
+// that still need a capability the backend lacks self-skip.
+#[cfg(test)]
 mod one_hot_split_score_test;
 
 // T22 / FPP-19: the ORDERED per-segment split scorer. Drives the private
 // `score_ordered_over_segment_binsums`, so it must likewise be a `gpu_runtime` descendant,
-// and it carries the same `CUBE_COUNT` cpu-backend limitation as the one-hot scorer test:
-//   cargo test -p cb-backend --no-default-features --features rocm \
-//       --lib gpu_runtime::ordered_split_score_test
-#[cfg(all(test, not(feature = "cpu")))]
+// and it carried the same (now-removed) `CUBE_COUNT` cpu-backend limitation as the one-hot
+// scorer test — `find_optimal_split_ordered_kernel` takes a host-supplied `grid_stride`.
+#[cfg(test)]
 mod ordered_split_score_test;
 
 // T26 / SPEC-OH-23: the split APPLICATION's one-hot (EQUALITY) arm. Same `pub(crate)`
-// visibility reason, and the same `CUBE_COUNT` cpu-backend limitation
-// (`partition_split_kernel` grid-strides over `CUBE_COUNT * CUBE_DIM`), so it is likewise
-// device-only.
-#[cfg(all(test, not(feature = "cpu")))]
+// visibility reason. The `CUBE_COUNT` cpu-backend limitation that made it device-only is
+// gone: `partition_split_kernel` now grid-strides over a host-supplied `grid_stride`.
+#[cfg(test)]
 mod one_hot_partition_split_test;
 
 // T27b / SPEC-OH-24+25: the one-hot channel (`one_hot_flags` / `real_folds` / `n_float`)
@@ -1120,10 +1210,17 @@ fn hist2_launch_resident(
 
     // Launch geometry: enough cubes to cover `n` objects (the grid-stride loop in every fill
     // kernel handles any surplus via the total-thread-count stride). Shared by all families.
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("pointwise 2-channel histogram fill"));
+    }
+
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -1154,6 +1251,9 @@ fn hist2_launch_resident(
                     unsafe { ArrayArg::from_raw_parts(indices_h.clone(), n) },
                     unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                     n_features as u32,
+                    // Grid-stride step = this launch's total thread count (GRID STRIDE
+                    // in `kernels.rs`): `CUBE_COUNT` is not a CPU-runtime builtin.
+                    (num_cubes * cube_dim()) as u32,
                     $( $extra, )*
                 );
                 return Ok(h);
@@ -1175,6 +1275,9 @@ fn hist2_launch_resident(
                     unsafe { ArrayArg::from_raw_parts(indices_h.clone(), n) },
                     unsafe { ArrayArg::from_raw_parts(h.clone(), bin_sums_len) },
                     n_features as u32,
+                    // Grid-stride step = this launch's total thread count (GRID STRIDE
+                    // in `kernels.rs`): `CUBE_COUNT` is not a CPU-runtime builtin.
+                    (num_cubes * cube_dim()) as u32,
                     $( $extra, )*
                 );
                 return Ok(h);
@@ -1481,7 +1584,7 @@ fn score_over_binsums(
     let num_cubes = 1usize;
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -1754,15 +1857,21 @@ fn launch_scan_update_pointwise_into(
     // returns a device HANDLE with NO read-back). The bulk histogram stays device-resident.
     let bin_sums = launch_pointwise_hist2_into(client, der1, weight, cindex, indices, n_bins, n_features)?;
 
-    // Launch geometry: ONE cube of CUBE_DIM units per (feature, channel) scan axis. The
-    // kernel decodes feature = CUBE_POS / 2, channel = CUBE_POS % 2, and scans n_bins
-    // (<= CUBE_DIM) bins via the single-cube block-scan mechanism.
+    // Launch geometry: ONE cube per (feature, channel) scan axis, at the narrowest width
+    // that gives every bin its own unit (`single_cube_dim`; n_bins <= CUBE_DIM is
+    // guaranteed above). The kernel decodes feature = CUBE_POS / 2, channel =
+    // CUBE_POS % 2, and scans n_bins bins via the single-cube block-scan mechanism.
     let count = CubeCount::Static(num_cubes_u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: single_cube_dim(n_bins) as u32,
         y: 1,
         z: 1,
     };
+
+    // Query the plane capability ONCE on the host and drive the kernel's comptime
+    // branch (see PLANE-FREE FALLBACK in `kernels.rs`): the CPU runtime reports no
+    // plane ops, and a plane op emitted there does not compile.
+    let use_plane = client.features().plane.contains(Plane::Ops);
 
     // The cumulative output buffer matches the FROZEN binSums layout / channel float
     // type: f64 on rocm/cuda/cpu, f32 on wgpu (RESEARCH A1) — read back and UPCAST to
@@ -1778,6 +1887,7 @@ fn launch_scan_update_pointwise_into(
             unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
             unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
             n_bins_u32,
+            use_plane,
         );
         cumulative_h
     };
@@ -1793,6 +1903,7 @@ fn launch_scan_update_pointwise_into(
             unsafe { ArrayArg::from_raw_parts(bin_sums, cumulative_len) },
             unsafe { ArrayArg::from_raw_parts(cumulative_h.clone(), cumulative_len) },
             n_bins_u32,
+            use_plane,
         );
         cumulative_h
     };
@@ -2026,10 +2137,10 @@ pub(crate) fn launch_partition_split_into(
         return Ok(client.empty(0));
     }
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -2075,6 +2186,7 @@ pub(crate) fn launch_partition_split_into(
         // SPEC-OH-23: this launcher serves the plain feature-major (non-packed) path and
         // the OUT-OF-SCOPE non-symmetric / Region / pairwise growers. All of them are
         // threshold splits, so the byte-unchanged default is the only correct value here.
+        (num_cubes * cube_dim()) as u32,
         /* one_hot = */ false,
     );
 
@@ -2096,6 +2208,7 @@ pub(crate) fn launch_partition_split_into(
         // SPEC-OH-23: this launcher serves the plain feature-major (non-packed) path and
         // the OUT-OF-SCOPE non-symmetric / Region / pairwise growers. All of them are
         // threshold splits, so the byte-unchanged default is the only correct value here.
+        (num_cubes * cube_dim()) as u32,
         /* one_hot = */ false,
     );
 
@@ -2138,10 +2251,10 @@ pub(crate) fn launch_partition_split_packed_into(
         return Ok(client.empty(0));
     }
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -2165,6 +2278,7 @@ pub(crate) fn launch_partition_split_packed_into(
         mask,
         bin,
         level_bit,
+        (num_cubes * cube_dim()) as u32,
         one_hot,
     );
 
@@ -2183,6 +2297,7 @@ pub(crate) fn launch_partition_split_packed_into(
         mask,
         bin,
         level_bit,
+        (num_cubes * cube_dim()) as u32,
         one_hot,
     );
 
@@ -2227,10 +2342,17 @@ pub(crate) fn launch_partition_update_into(
         CbError::OutOfRange(format!("n_parts ({n_parts}) * 3 overflows usize (part-stats length)"))
     })?;
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    // Capability gate (WR-02): this fill accumulates into `Atomic<F>`. Surface a
+    // typed error BEFORE launching, because an unsupported atomic does not fail
+    // on the CPU runtime — it hangs a device worker or returns an all-zero buffer.
+    if !device_supports_channel_atomic_add(client) {
+        return Err(channel_atomic_unsupported("partition leaf-stats update"));
+    }
+
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -2248,6 +2370,7 @@ pub(crate) fn launch_partition_update_into(
             unsafe { ArrayArg::from_raw_parts(indices, n) },
             unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
             unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+            (num_cubes * cube_dim()) as u32,
         );
         h
     };
@@ -2279,6 +2402,7 @@ pub(crate) fn launch_partition_update_into(
                 unsafe { ArrayArg::from_raw_parts(indices, n) },
                 unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+                (lds_cubes * PART_UPDATE_CUBE_DIM) as u32,
                 part_stats_len as u32,
             );
         } else {
@@ -2292,6 +2416,7 @@ pub(crate) fn launch_partition_update_into(
                 unsafe { ArrayArg::from_raw_parts(indices, n) },
                 unsafe { ArrayArg::from_raw_parts(leaf_of, n) },
                 unsafe { ArrayArg::from_raw_parts(h.clone(), part_stats_len) },
+                (num_cubes * cube_dim()) as u32,
             );
         }
         h
@@ -2784,6 +2909,7 @@ pub(crate) fn launch_copy_u64_block(
         unsafe { ArrayArg::from_raw_parts(src, src_len) },
         unsafe { ArrayArg::from_raw_parts(dst, dst_len) },
         dst_offset_u32,
+        (num_cubes * HIST_CUBE_DIM) as u32,
     );
     Ok(())
 }
@@ -2937,6 +3063,7 @@ fn launch_partition_hist2_multicopy(
         CubeCount::Static(zero_cubes as u32, 1, 1),
         hist_dim,
         unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
+        (zero_cubes * HIST_CUBE_DIM) as u32,
     );
 
     let num_cubes = n_visit.div_ceil(HIST_CUBE_DIM).max(1);
@@ -2965,6 +3092,7 @@ fn launch_partition_hist2_multicopy(
         n_features as u32,
         n_copies as u32,
         filter_mask,
+        (num_cubes * HIST_CUBE_DIM) as u32,
         bits,
     );
 
@@ -2985,6 +3113,7 @@ fn launch_partition_hist2_multicopy(
         n_features as u32,
         n_copies as u32,
         filter_mask,
+        (num_cubes * HIST_CUBE_DIM) as u32,
         bits,
     );
 
@@ -2999,6 +3128,7 @@ fn launch_partition_hist2_multicopy(
             hist_dim,
             unsafe { ArrayArg::from_raw_parts(out.clone(), alloc_len) },
             n_copies as u32,
+            (fold_cubes * HIST_CUBE_DIM) as u32,
         );
     }
 
@@ -3069,6 +3199,7 @@ fn launch_partition_hist2_lds(
         CubeCount::Static(zero_cubes as u32, 1, 1),
         hist_dim,
         unsafe { ArrayArg::from_raw_parts(out.clone(), total) },
+        (zero_cubes * HIST_CUBE_DIM) as u32,
     );
 
     // Tile geometry (see the doc header). `cells_per_feature >= 1` (caller guards
@@ -3113,6 +3244,7 @@ fn launch_partition_hist2_lds(
         filter_mask,
         n_active as u32,
         tile_f as u32,
+        (chunks * HIST_CUBE_DIM) as u32,
         bits,
         lds_cells as u32,
     );
@@ -3135,6 +3267,7 @@ fn launch_partition_hist2_lds(
         filter_mask,
         n_active as u32,
         tile_f as u32,
+        (chunks * HIST_CUBE_DIM) as u32,
         bits,
         lds_cells as u32,
     );
@@ -3199,6 +3332,7 @@ pub(crate) fn launch_derive_sibling_hist_into(
         unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
         half_u32,
         leaf_stride_u32,
+        (num_cubes * HIST_CUBE_DIM) as u32,
     );
 
     #[cfg(not(feature = "wgpu"))]
@@ -3210,6 +3344,7 @@ pub(crate) fn launch_derive_sibling_hist_into(
         unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
         half_u32,
         leaf_stride_u32,
+        (num_cubes * HIST_CUBE_DIM) as u32,
     );
 
     Ok(())
@@ -3339,10 +3474,10 @@ fn score_partition_over_binsums(
     // launch over the one-hot suffix must not spawn cubes for the float prefix it never
     // sweeps. On the single-pass float-only launch `pass_candidates == n_candidates`, so
     // the geometry is byte-unchanged.
-    let num_cubes = pass_candidates.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = pass_candidates.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -3378,6 +3513,7 @@ fn score_partition_over_binsums(
             n_bins_used as u32,
             feature_lo_u32,
             feature_hi_u32,
+            (num_cubes * cube_dim()) as u32,
             n_bins_u32,
             score_fn,
             one_hot,
@@ -3404,6 +3540,7 @@ fn score_partition_over_binsums(
             n_bins_used as u32,
             feature_lo_u32,
             feature_hi_u32,
+            (num_cubes * cube_dim()) as u32,
             n_bins_u32,
             score_fn,
             one_hot,
@@ -3552,10 +3689,10 @@ fn score_ordered_over_segment_binsums(
     })?;
 
     // Same geometry as the partition scorer: one CUBE_DIM-thread cube per CUBE_DIM candidates.
-    let num_cubes = n_candidates.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n_candidates.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -3583,6 +3720,7 @@ fn score_ordered_over_segment_binsums(
             /* feature_lo = */ 0,
             n_features as u32,
             n_segments_u32,
+            (num_cubes * cube_dim()) as u32,
             n_bins_u32,
         );
         (best_gain_h, best_idx_h)
@@ -3609,6 +3747,7 @@ fn score_ordered_over_segment_binsums(
             /* feature_lo = */ 0,
             n_features as u32,
             n_segments_u32,
+            (num_cubes * cube_dim()) as u32,
             n_bins_u32,
         );
         (best_gain_h, best_idx_h)
@@ -3724,10 +3863,10 @@ pub(crate) fn launch_subtract_histograms_into(
 
     let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u64; cells]));
 
-    let num_cubes = cells.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = cells.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };
@@ -4274,10 +4413,10 @@ pub(crate) fn launch_apply_leaf_delta_into(
     let leaf_values_h = upload_channel_floats(client, leaf_values);
     let lr_h = upload_channel_floats(client, &[lr]);
 
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let num_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(num_cubes as u32, 1, 1);
     let dim = CubeDim {
-        x: CUBE_DIM as u32,
+        x: cube_dim() as u32,
         y: 1,
         z: 1,
     };

@@ -52,14 +52,14 @@ where
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
-    let num_cubes = n.div_ceil(32usize).max(1);
+    let num_cubes = n.div_ceil(crate::gpu_runtime::cube_dim()).max(1);
     let out_handle = client.empty(num_cubes * std::mem::size_of::<F>());
 
     block_reduce_kernel::launch::<F, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(num_cubes as u32, 1, 1),
         CubeDim {
-            x: 32u32,
+            x: crate::gpu_runtime::cube_dim() as u32,
             y: 1,
             z: 1,
         },
@@ -89,7 +89,7 @@ where
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
-    let num_cubes = n.div_ceil(32usize).max(1);
+    let num_cubes = n.div_ceil(crate::gpu_runtime::cube_dim()).max(1);
     // Zero-initialized length-1 accumulator: the in-kernel `fetch_add`s accumulate
     // from the additive identity.
     let acc_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![F::new(0.0)]));
@@ -98,7 +98,7 @@ where
         &client,
         CubeCount::Static(num_cubes as u32, 1, 1),
         CubeDim {
-            x: 32u32,
+            x: crate::gpu_runtime::cube_dim() as u32,
             y: 1,
             z: 1,
         },
@@ -357,6 +357,20 @@ fn block_reduce_atomic_kernel_direct_matches_cpu_sum() {
     // Multi-cube input (300 elements -> ~10 cubes at CUBE_DIM 32) so several cubes
     // race to fetch_add into the single accumulator — the setup that drives the
     // cross-cube atomic finalize.
+    // SKIP, don't fail, when the backend cannot run an `Atomic<F>` kernel at all. Unlike
+    // the sibling tests here, this one launches `block_reduce_atomic_kernel` DIRECTLY
+    // rather than through the capability-gated `launch_block_reduce_atomic_f64`, so
+    // nothing upstream would stop it — and on cubecl-cpu (no atomics of any type) the
+    // unsupported-type panic lands on a device worker while the host blocks forever on
+    // that unit's mpsc receive, wedging the whole test binary.
+    if !crate::gpu_runtime::channel_atomics_available() {
+        eprintln!(
+            "[reduce] SKIP block_reduce_atomic_kernel_direct: backend advertises no \
+             channel-float atomic-add (cubecl-cpu has no atomics; run with --features rocm)"
+        );
+        return;
+    }
+
     let input: Vec<f64> = (0..300).map(|k| ((k % 23) as f64) - 11.0 + 0.125 * (k as f64)).collect();
     let baseline = cb_core::sum_f64(&input);
 
@@ -424,7 +438,7 @@ where
     segmented_reduce_kernel::launch::<F, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(num_segments as u32, 1, 1),
-        CubeDim { x: 32u32, y: 1, z: 1 },
+        CubeDim { x: crate::gpu_runtime::cube_dim() as u32, y: 1, z: 1 },
         unsafe { ArrayArg::from_raw_parts(in_handle, input.len()) },
         unsafe { ArrayArg::from_raw_parts(off_handle, seg_offsets.len()) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), num_segments) },
@@ -469,8 +483,8 @@ where
 
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: 32u32, y: 1, z: 1 };
-    let n_cubes = n.div_ceil(32usize).max(1);
+    let dim32 = CubeDim { x: crate::gpu_runtime::cube_dim() as u32, y: 1, z: 1 };
+    let n_cubes = n.div_ceil(crate::gpu_runtime::cube_dim()).max(1);
 
     let keys_h = client.create(cubecl::bytes::Bytes::from_elems(keys.to_vec()));
     let values_h = client.create(cubecl::bytes::Bytes::from_elems(values.to_vec()));
@@ -690,12 +704,12 @@ fn tree_reduce_into(
     in_handle: cubecl::server::Handle,
     n: usize,
 ) -> cubecl::server::Handle {
-    let num_cubes = n.div_ceil(32usize).max(1);
+    let num_cubes = n.div_ceil(crate::gpu_runtime::cube_dim()).max(1);
     let out = client.empty(num_cubes * std::mem::size_of::<f64>());
     block_reduce_kernel::launch::<f64, crate::SelectedRuntime>(
         client,
         CubeCount::Static(num_cubes as u32, 1, 1),
-        CubeDim { x: 32u32, y: 1, z: 1 },
+        CubeDim { x: crate::gpu_runtime::cube_dim() as u32, y: 1, z: 1 },
         unsafe { ArrayArg::from_raw_parts(in_handle, n) },
         unsafe { ArrayArg::from_raw_parts(out.clone(), num_cubes) },
         false,
@@ -744,12 +758,12 @@ fn run_fixedpoint_reduce(input: &[f64]) -> (f64, ReduceFinalizeStrategy) {
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
     // Zero-initialized single u64 fixed-point accumulator.
     let acc_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u64]));
-    let num_cubes = n.div_ceil(32usize).max(1);
+    let num_cubes = n.div_ceil(crate::gpu_runtime::cube_dim()).max(1);
 
     block_reduce_fixedpoint_kernel::launch::<f64, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(num_cubes as u32, 1, 1),
-        CubeDim { x: 32u32, y: 1, z: 1 },
+        CubeDim { x: crate::gpu_runtime::cube_dim() as u32, y: 1, z: 1 },
         unsafe { ArrayArg::from_raw_parts(in_handle, n) },
         unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), 1) },
     );

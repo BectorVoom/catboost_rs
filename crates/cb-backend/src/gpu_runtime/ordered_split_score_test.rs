@@ -395,6 +395,20 @@ fn disjoint_range_segments_would_score_differently_than_nested_prefixes() {
 /// in build configuration.
 #[test]
 fn device_prefix_fill_feeds_the_ordered_scorer() {
+    // The SCORER half of this module runs anywhere now that `find_optimal_split_ordered_kernel`
+    // no longer reads the `CUBE_COUNT` builtin, but this case additionally drives the ordered
+    // prefix FILL, which accumulates into `Atomic<u64>` — a capability cpu/wgpu do not
+    // advertise, so its launcher returns `CbError::Unsupported` before launching. Skip rather
+    // than report that backend limitation as an ordered-scorer regression (same precedent as
+    // `one_hot_session_wiring_test`).
+    if !cfg!(any(feature = "rocm", feature = "cuda")) {
+        println!(
+            "[FPP-19] SKIP device_prefix_fill_feeds_the_ordered_scorer: the prefix fill needs \
+             Atomic<u64> (rocm/cuda); cpu/wgpu lack it"
+        );
+        return;
+    }
+
     use super::cindex::pack_cindex;
     use super::{launch_copy_u64_block, launch_partition_hist2_prefix_into};
 

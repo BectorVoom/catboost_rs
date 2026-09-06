@@ -32,7 +32,12 @@ use crate::kernels::{full_scan_into, radix_bit_flag_kernel, reorder_one_bit_scat
 /// Launch geometry: 32-wide cubes (wave32 gfx1100), enough cubes to cover every
 /// element (mirrors the `key_head_flag` / `segment_offset_scatter` launch geometry —
 /// one bounds-guarded write per lane).
-const CUBE_DIM: usize = 32;
+/// The block-reduce-family cube width the selected runtime is launched at — the
+/// core-capped `gpu_runtime::cube_dim()` (32 on a GPU, at most one unit per core on
+/// the CPU runtime, where a wider spin-barrier launch costs ~1 s per cube).
+fn cube_dim() -> usize {
+    crate::gpu_runtime::cube_dim()
+}
 
 /// Run the STABLE single-bit reorder of `keys` (with paired `values`) at `bit` over the
 /// selected runtime: bit-flag kernel → 10-01 exclusive `full_scan` (onesBefore) →
@@ -43,8 +48,8 @@ fn run_reorder_one_bit(keys: &[u32], values: &[u32], bit: u32) -> (Vec<u32>, Vec
     assert_eq!(n, values.len(), "keys/values length mismatch");
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: CUBE_DIM as u32, y: 1, z: 1 };
-    let n_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let dim32 = CubeDim { x: cube_dim() as u32, y: 1, z: 1 };
+    let n_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(n_cubes as u32, 1, 1);
 
     let keys_h = client.create(cubecl::bytes::Bytes::from_elems(keys.to_vec()));
@@ -104,8 +109,8 @@ fn run_radix_sort(keys: &[u32], values: &[u32]) -> (Vec<u32>, Vec<u32>) {
     }
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: CUBE_DIM as u32, y: 1, z: 1 };
-    let n_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let dim32 = CubeDim { x: cube_dim() as u32, y: 1, z: 1 };
+    let n_cubes = n.div_ceil(cube_dim()).max(1);
     let count = CubeCount::Static(n_cubes as u32, 1, 1);
 
     // Number of LSD passes = bit-width of the largest key (0 keys ⇒ already sorted).

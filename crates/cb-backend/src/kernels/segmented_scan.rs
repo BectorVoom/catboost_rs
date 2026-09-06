@@ -50,7 +50,7 @@ where
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim {
-            x: CUBE_DIM as u32,
+            x: crate::gpu_runtime::single_cube_dim(n) as u32,
             y: 1,
             z: 1,
         },

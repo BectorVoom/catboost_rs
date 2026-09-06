@@ -16,9 +16,18 @@
 //! cannot run the f64 CTR value seam — the assertions SKIP there (WR-01 anti-false-pass).
 
 use crate::kernels::ctr_device::{
-    binarize_btmv_column_host, binarize_counter_column_host, binarize_ctr_column_host,
     combine_projection_bins, compute_btmv_ctr_host, compute_counter_ctr_host,
     compute_ordered_ctr_host, compute_ordered_ctr_host_mode, read_btmv_sum_bytes,
+};
+
+// The CTR->cindex binarize wrappers are `#[cfg(not(feature = "wgpu"))]` in
+// `ctr_device.rs` (the resident CTR path they wrap is not built for wgpu), so this
+// import and the cases using it carry the SAME gate. Without it the test target fails
+// to compile under `--features wgpu` / `--features wgpu-msl` while the library builds
+// fine — a split that hides the real state of the backend behind a build error.
+#[cfg(not(feature = "wgpu"))]
+use crate::kernels::ctr_device::{
+    binarize_btmv_column_host, binarize_counter_column_host, binarize_ctr_column_host,
 };
 
 /// `cb_train::ctr::ECtrType::Borders` discriminant (`cb-train/src/ctr/mod.rs:96-108`),
@@ -387,6 +396,7 @@ fn tensor_combination_ctr_matches_cpu_reference() {
     assert!(max_divergence(&dv, &cv) <= TOL, "tensor CTR value divergence > {TOL}");
 }
 
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn ctr_binarized_cindex_column_bit_exact() {
     // The CTR→cindex binarize JOIN: the device binarizes the accumulated CTR VALUES into an extra
@@ -426,6 +436,7 @@ fn ctr_binarized_cindex_column_bit_exact() {
     );
 }
 
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn ctr_averaging_permutation_column_bit_exact() {
     // GDC-09 (T11): the SAME online-CTR + binarize kernels called with the AVERAGING
@@ -588,6 +599,7 @@ fn out_of_range_ctr_mode_is_rejected() {
 /// emitted cindex column is non-degenerate (asserted below, not assumed).
 const COUNTER_BORDERS: [f64; 5] = [0.2, 0.7, 0.91, 0.95, 0.99];
 
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn counter_ctr_matches_cpu_reference() {
     // DCTR-09 (T11): the device Counter statistic must reproduce `online_counter_column` +
@@ -653,6 +665,7 @@ fn counter_ctr_matches_cpu_reference() {
     );
 }
 
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn counter_ctr_is_permutation_independent() {
     // DCTR-09 (T11): `IsPermutationDependentCtrType(Counter) == false` (`ctr_type.cpp:43-56`).
@@ -837,6 +850,7 @@ fn btmv_f32_accumulation_width_is_load_bearing() {
     );
 }
 
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn btmv_prefix_matches_cpu_reference_at_binclf() {
     // DCTR-12 (T14): the PRODUCTION regime — `classes = SIMPLE_CLASSES_COUNT == 2` ⇒
@@ -1022,6 +1036,7 @@ fn btmv_out_of_range_inputs_are_rejected() {
 /// BTMV onto Borders@0 (option a)**: an alias would be correct today and silently wrong the
 /// moment `SIMPLE_CLASSES_COUNT` stops being 2, with no test able to see the change. This test
 /// records that the two agree *today* without buying that liability.
+#[cfg(not(feature = "wgpu"))]
 #[test]
 fn btmv_and_borders_emit_identical_bins_at_binclf() {
     if !device_ctr_active() {

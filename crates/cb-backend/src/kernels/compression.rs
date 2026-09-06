@@ -20,7 +20,12 @@ use cubecl::prelude::*;
 use crate::kernels::{bit_pack_layout, pack_bins_kernel, unpack_bins_kernel, BitPackLayout};
 
 /// Launch geometry: 32-wide cubes (wave32 gfx1100), enough cubes to cover every lane.
-const CUBE_DIM: usize = 32;
+/// The block-reduce-family cube width the selected runtime is launched at — the
+/// core-capped `gpu_runtime::cube_dim()` (32 on a GPU, at most one unit per core on
+/// the CPU runtime, where a wider spin-barrier launch costs ~1 s per cube).
+fn cube_dim() -> usize {
+    crate::gpu_runtime::cube_dim()
+}
 
 /// Pack `bins` (each `u32` holds one ≤8-bit bin) into 32-bit words on the device, then
 /// unpack them back into a bin column — the full round-trip over the selected runtime.
@@ -37,13 +42,13 @@ fn run_pack_unpack(bins: &[u32], n_bins: u32) -> Vec<u32> {
 
     let device = <crate::SelectedRuntime as Runtime>::Device::default();
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
-    let dim32 = CubeDim { x: CUBE_DIM as u32, y: 1, z: 1 };
+    let dim32 = CubeDim { x: cube_dim() as u32, y: 1, z: 1 };
 
     let bins_h = client.create(cubecl::bytes::Bytes::from_elems(bins.to_vec()));
 
     // Pack: one lane per OUTPUT word (each thread owns a word — no cross-lane |= race).
     let words_h = client.empty(num_words * std::mem::size_of::<u32>());
-    let word_cubes = num_words.div_ceil(CUBE_DIM).max(1);
+    let word_cubes = num_words.div_ceil(cube_dim()).max(1);
     pack_bins_kernel::launch::<f64, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(word_cubes as u32, 1, 1),
@@ -57,7 +62,7 @@ fn run_pack_unpack(bins: &[u32], n_bins: u32) -> Vec<u32> {
 
     // Unpack: one lane per KEY.
     let out_h = client.empty(n * std::mem::size_of::<u32>());
-    let key_cubes = n.div_ceil(CUBE_DIM).max(1);
+    let key_cubes = n.div_ceil(cube_dim()).max(1);
     unpack_bins_kernel::launch::<f64, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(key_cubes as u32, 1, 1),

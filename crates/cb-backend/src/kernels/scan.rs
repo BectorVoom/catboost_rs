@@ -25,6 +25,9 @@ use crate::kernels::block_scan_kernel;
 
 /// Launch geometry: one cube of CUBE_DIM units. The oracle is scoped to a single
 /// cube (N <= CUBE_DIM, Open Q2), so a single static cube is launched.
+/// Capacity of the single-cube `block_scan_kernel` oracle: `n <= CUBE_DIM`. The launch
+/// itself uses `gpu_runtime::single_cube_dim(n)` — the narrowest power of two that
+/// gives every element its own unit, core-capped on the CPU runtime.
 const CUBE_DIM: usize = 32;
 
 // IN-03: the "generous, run-stable" oracle bounds, hoisted into named consts shared
@@ -53,21 +56,28 @@ where
     let client = <crate::SelectedRuntime as Runtime>::client(&device);
 
     let in_handle = client.create(cubecl::bytes::Bytes::from_elems(input.to_vec()));
-    // Single cube covers N <= CUBE_DIM (the documented oracle scope).
-    let num_cubes = n.div_ceil(CUBE_DIM).max(1);
+    // Single cube covers N <= CUBE_DIM (the documented oracle scope): the kernel maps
+    // one unit to one element, so a wider input would be silently truncated.
+    assert!(n <= CUBE_DIM, "single-cube block-scan oracle scope: n <= {CUBE_DIM}, got {n}");
+    let width = crate::gpu_runtime::single_cube_dim(n);
+    let num_cubes = n.div_ceil(width).max(1);
     let out_handle = client.empty(n * std::mem::size_of::<F>());
 
     block_scan_kernel::launch::<F, crate::SelectedRuntime>(
         &client,
         CubeCount::Static(num_cubes as u32, 1, 1),
         CubeDim {
-            x: CUBE_DIM as u32,
+            x: width as u32,
             y: 1,
             z: 1,
         },
         unsafe { ArrayArg::from_raw_parts(in_handle, n) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) },
         inclusive,
+        // Same host-side capability query the production launcher uses: the plane arm
+        // on a device that has planes, the plane-free arm on the CPU runtime (whose
+        // plane ops do not compile). Both must produce the same scan.
+        client.features().plane.contains(cubecl::features::Plane::Ops),
     );
 
     let bytes = client.read_one(out_handle).unwrap();

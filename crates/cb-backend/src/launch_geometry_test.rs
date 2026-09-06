@@ -17,7 +17,9 @@
 use cubecl::Runtime;
 use cubecl::prelude::CubeCount;
 
-use crate::launch_geometry::{has_planes, launch_1d};
+use crate::launch_geometry::{
+    LaneCost, barrier_cube_dim, der_line_size, has_planes, launch_1d, SCALAR_LINE,
+};
 
 /// Total units the grid spans — the span `ABSOLUTE_POS` takes over the whole launch.
 fn total_units(count: &CubeCount, dim: cubecl::prelude::CubeDim) -> usize {
@@ -45,7 +47,7 @@ fn grid_always_covers_every_element() {
         0usize, 1, 2, 3, 7, 8, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 999, 1000,
         1024, 4095, 4096, 4097, 65_537, 1_000_003,
     ] {
-        let (count, dim) = launch_1d(&client, n, 1);
+        let (count, dim) = launch_1d(&client, n, LaneCost::compute(1));
         assert!(
             total_units(&count, dim) >= n,
             "geometry for n={n} spans {} units, short of {n} — the tail of the output \
@@ -65,10 +67,9 @@ fn grid_always_covers_every_element() {
 #[test]
 fn empty_input_still_yields_a_launchable_grid() {
     let client = client();
-    let (count, dim) = launch_1d(&client, 0, 1);
-    assert_eq!(
+    let (count, dim) = launch_1d(&client, 0, LaneCost::compute(1));
+    assert!(
         total_units(&count, dim) >= 1,
-        true,
         "n=0 must still produce a launchable (bounds-guarded, no-op) grid"
     );
     match count {
@@ -97,7 +98,7 @@ fn cpu_small_launch_collapses_to_a_single_unit() {
         "the cpu feature must select a runtime with no hardware planes"
     );
     for &n in &[1usize, 10, 100, 1000] {
-        let (_, dim) = launch_1d(&client, n, 1);
+        let (_, dim) = launch_1d(&client, n, LaneCost::compute(1));
         assert_eq!(
             dim.num_elems(),
             1,
@@ -119,7 +120,7 @@ fn cpu_width_scales_with_work_and_stays_bounded() {
 
     // Well past the threshold: the width should have grown beyond a single unit
     // (otherwise the helper is just a constant-1 function and the scaling is dead).
-    let (_, big) = launch_1d(&client, 4_000_000, 1);
+    let (_, big) = launch_1d(&client, 4_000_000, LaneCost::compute(1));
     assert!(
         big.num_elems() > 1,
         "4M elements must engage more than one unit on a {cores}-core host"
@@ -127,7 +128,7 @@ fn cpu_width_scales_with_work_and_stays_bounded() {
 
     // ... but never past the cores, and never past the element count.
     for &n in &[1usize, 100, 100_000, 4_000_000, 100_000_000] {
-        let (_, dim) = launch_1d(&client, n, 1);
+        let (_, dim) = launch_1d(&client, n, LaneCost::compute(1));
         assert!(
             dim.num_elems() <= cores,
             "n={n}: width {} exceeds the {cores} reported cores — this oversubscribes \
@@ -150,8 +151,8 @@ fn cpu_width_scales_with_work_and_stays_bounded() {
 fn cpu_width_responds_to_per_lane_work() {
     let client = client();
     let n = 10_000usize;
-    let (_, cheap) = launch_1d(&client, n, 1);
-    let (_, expensive) = launch_1d(&client, n, 1024);
+    let (_, cheap) = launch_1d(&client, n, LaneCost::compute(1));
+    let (_, expensive) = launch_1d(&client, n, LaneCost::compute(1024));
     assert!(
         expensive.num_elems() > cheap.num_elems(),
         "the same {n} lanes at 1024x the per-lane work must earn more units \
@@ -159,6 +160,66 @@ fn cpu_width_responds_to_per_lane_work() {
         cheap.num_elems(),
         expensive.num_elems()
     );
+}
+
+/// The UPPER bound the `ops`-only model was missing: a streaming (bandwidth-bound)
+/// lane must stop earning units well before the core count, while a compute-bound lane
+/// of the SAME per-lane op count keeps scaling to it.
+///
+/// This is the assertion that fails if the memory-saturation ceiling is ever dropped
+/// and `launch_1d` goes back to reading "more total work" as "more units" for a kernel
+/// that is already at the memory ceiling. On the 8-core M1 that mistake measured 2.7x
+/// on `gradient_kernel` at n = 1M (the table at `STREAMING_LANE`), and it is invisible
+/// to every other test here: the output stays bit-identical, it is only slower.
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_streaming_width_stops_at_memory_saturation() {
+    let client = client();
+    let cores = client.properties().hardware.num_cpu_cores.unwrap_or(1).max(1) as usize;
+    // A host that reports fewer than two cores cannot distinguish the two ceilings —
+    // `cores / 2` and `cores` coincide at 1 — so there is nothing to assert.
+    if cores < 2 {
+        return;
+    }
+
+    // `n` far past the point where the op-count model wants every core, so the width is
+    // decided by the ceiling and by nothing else.
+    let n = 100_000_000usize;
+    let (_, streaming) = launch_1d(&client, n, LaneCost::streaming(4));
+    let (_, compute) = launch_1d(&client, n, LaneCost::compute(4));
+
+    assert_eq!(
+        compute.num_elems() as usize,
+        cores.min(crate::launch_geometry::CPU_CUBE_DIM_MAX as usize),
+        "a compute-bound lane must still scale to the full core count"
+    );
+    assert!(
+        (streaming.num_elems() as usize) <= (cores / 2).max(1),
+        "a streaming lane must be capped at the memory-saturation width ({} units),          not at the {cores} cores it was given — it got {}",
+        (cores / 2).max(1),
+        streaming.num_elems()
+    );
+    assert!(
+        streaming.num_elems() >= 1,
+        "the ceiling must never collapse the width to zero"
+    );
+}
+
+/// The ceiling is an upper bound, not a floor: it must never PROMOTE a small launch
+/// that the op-count model would keep at one unit.
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_streaming_ceiling_never_widens_a_small_launch() {
+    let client = client();
+    for &n in &[1usize, 10, 100, 1000] {
+        let (_, dim) = launch_1d(&client, n, LaneCost::streaming(4));
+        assert_eq!(
+            dim.num_elems(),
+            1,
+            "n={n} is far below one unit's worth of work, so the streaming ceiling must              leave it at a single task, not widen it to {}",
+            dim.num_elems()
+        );
+    }
 }
 
 /// On a real GPU the width must be a whole number of planes, so no SIMD lane in a
@@ -175,7 +236,7 @@ fn gpu_width_is_plane_aligned_and_within_device_limits() {
     let plane = hardware.plane_size_max as usize;
 
     for &n in &[1usize, 33, 1000, 65_537, 1_000_003] {
-        let (_, dim) = launch_1d(&client, n, 1);
+        let (_, dim) = launch_1d(&client, n, LaneCost::compute(1));
         let units = dim.num_elems() as usize;
         assert!(
             units % plane == 0,
@@ -225,6 +286,9 @@ fn elementwise_output_is_bit_identical_across_geometries() {
             &client,
             cubecl::prelude::CubeCount::Static(cubes, 1, 1),
             dim,
+            // Width 1: this test allocates at exactly `n` (no padding), so only the scalar
+            // line is admissible — see `SCALAR_LINE`.
+            SCALAR_LINE,
             unsafe { ArrayArg::from_raw_parts(a, n) },
             unsafe { ArrayArg::from_raw_parts(t, n) },
             unsafe { ArrayArg::from_raw_parts(out.clone(), n) },
@@ -264,5 +328,121 @@ fn elementwise_output_is_bit_identical_across_geometries() {
             (target[i] - approx[i]).to_bits(),
             "element {i} is not the RMSE gradient `target - approx`"
         );
+    }
+}
+
+/// A vectorized launch must reach the SAME width decision as the scalar launch it
+/// replaces: `n / width` lanes at `width` times the per-lane cost is the same total
+/// work, and the total is what the lower bound is calibrated on. If `per_vector` did
+/// not scale the ops, an 8-wide launch would look 8x cheaper and under-parallelize.
+#[cfg(feature = "cpu")]
+#[test]
+fn per_vector_keeps_the_width_decision_of_the_scalar_launch() {
+    let client = client();
+    for &n in &[8usize, 4096, 100_000, 1_000_000] {
+        for width in [1usize, 2, 4, 8] {
+            let lanes = n.div_ceil(width);
+            let (_, scalar) = launch_1d(&client, n, LaneCost::compute(16));
+            let (_, vector) = launch_1d(&client, lanes, LaneCost::compute(16).per_vector(width));
+            assert_eq!(
+                vector.num_elems(),
+                scalar.num_elems(),
+                "n={n} width={width}: the vector launch chose a different width"
+            );
+        }
+    }
+}
+
+/// A vector streaming lane saturates memory on far fewer units than a scalar one (see
+/// `STREAMING_LANE`, "Vector lanes"): its ceiling is `cores / 8`, never above the scalar
+/// `cores / 2`, and never below one unit. The compute tier is untouched by the width.
+#[cfg(feature = "cpu")]
+#[test]
+fn per_vector_narrows_the_streaming_ceiling_and_leaves_compute_alone() {
+    let client = client();
+    let cores = client.properties().hardware.num_cpu_cores.unwrap_or(1).max(1) as usize;
+    if cores < 2 {
+        return;
+    }
+    let n = 100_000_000usize;
+    let (_, streaming) = launch_1d(&client, n / 8, LaneCost::streaming(4).per_vector(8));
+    let (_, scalar_streaming) = launch_1d(&client, n, LaneCost::streaming(4));
+    let (_, compute) = launch_1d(&client, n / 8, LaneCost::compute(16).per_vector(8));
+    assert_eq!(
+        streaming.num_elems() as usize,
+        (cores / 8).max(1),
+        "an 8-wide streaming lane must stop at cores / 8, got {}",
+        streaming.num_elems()
+    );
+    assert!(streaming.num_elems() <= scalar_streaming.num_elems());
+    assert_eq!(
+        compute.num_elems() as usize,
+        cores.min(crate::launch_geometry::CPU_CUBE_DIM_MAX as usize),
+        "a vector compute-bound lane must still scale to the full core count"
+    );
+}
+
+/// The device width is a power of two >= 1 everywhere, and the padded buffers the CPU
+/// launcher builds must be a whole number of vectors; on the CPU runtime it is the
+/// widest io-optimized width for f64 (> 1, the whole point), on a GPU it is the scalar
+/// line until the device seams learn to pad.
+#[test]
+fn der_line_size_is_a_power_of_two_the_launcher_can_pad_to() {
+    let client = client();
+    let line = der_line_size(&client, std::mem::size_of::<f64>());
+    assert!(line >= SCALAR_LINE);
+    assert!(line.is_power_of_two(), "line {line} is not a power of two");
+    if has_planes(&client) {
+        assert_eq!(line, SCALAR_LINE, "device seams do not pad, so they must get width 1");
+    } else {
+        assert!(line > 1, "the CPU runtime advertises SIMD widths; got {line}");
+    }
+    for n in [1usize, 7, 8, 9, 1001] {
+        let n_pad = n.div_ceil(line) * line;
+        assert_eq!(n_pad % line, 0);
+        assert!(n_pad >= n && n_pad - n < line);
+    }
+}
+
+/// The barrier width never exceeds what was requested, is always a power of two (the
+/// tree reductions halve `CUBE_DIM_X`), and on the CPU runtime never exceeds the core
+/// count — one spinning unit per core is the whole fix for the ~1 s/cube spin-barrier
+/// collapse measured at 32 units on 8 cores.
+#[test]
+fn barrier_cube_dim_is_a_power_of_two_capped_by_request_and_cores() {
+    let client = client();
+    let cores = client.properties().hardware.num_cpu_cores.unwrap_or(1).max(1) as usize;
+    for requested in [1usize, 2, 8, 32, 256] {
+        let width = barrier_cube_dim(&client, requested);
+        assert!(width >= 1);
+        assert!(width.is_power_of_two(), "requested={requested}: width {width}");
+        assert!(width <= requested, "requested={requested}: width {width}");
+        if has_planes(&client) {
+            assert_eq!(width, requested, "a GPU launch keeps the width it asked for");
+        } else {
+            assert!(width <= cores, "requested={requested}: {width} units on {cores} cores");
+            assert!(
+                width * 2 > requested.min(cores),
+                "requested={requested}: {width} is not the largest admissible power of two"
+            );
+        }
+    }
+    assert_eq!(barrier_cube_dim(&client, 0), 1, "a zero request still launches one unit");
+}
+
+/// The block-reduce family's memoized width is exactly `barrier_cube_dim` of its
+/// requested 32, and the single-cube width covers its items without exceeding the
+/// capacity the callers validate against.
+#[test]
+fn gpu_runtime_cube_dims_follow_the_barrier_rule() {
+    let client = client();
+    let width = crate::gpu_runtime::cube_dim();
+    assert_eq!(width, barrier_cube_dim(&client, 32));
+    for items in [0usize, 1, 2, 5, 8, 9, 17, 32] {
+        let single = crate::gpu_runtime::single_cube_dim(items);
+        assert!(single.is_power_of_two());
+        assert!(single >= items, "items={items}: {single} units cannot give each its own");
+        assert!(single >= width, "items={items}: never narrower than the batch width");
+        assert!(single <= 32, "items={items}: never wider than the validated capacity");
     }
 }

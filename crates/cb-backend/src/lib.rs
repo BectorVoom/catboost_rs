@@ -83,6 +83,14 @@ pub type SelectedRuntime = cubecl::cpu::CpuRuntime;
 /// `wgpu` backend (GPU-04, D-7.1-01): CubeCL's `WgpuRuntime`. Builds and runs on
 /// dev machines with no ROCm/CUDA toolchain. The mutual-exclusion `not(...)` chain
 /// is preserved verbatim — only the RHS changed from `()`.
+///
+/// The `wgpu-msl` feature selects the SAME runtime with wgpu's Metal Shading Language
+/// compiler path (`cubecl/wgpu-msl` → `cubecl-wgpu/msl` → `cubecl-cpp/metal`) instead
+/// of naga's WGSL path — the practical way to reach a real GPU on macOS. It is a
+/// shader-backend VARIANT, not a fifth runtime: it enables `wgpu` too, so this arm and
+/// every other `#[cfg(feature = "wgpu")]` arm in the crate keep applying unchanged.
+/// In particular the f32 histogram channel (RESEARCH A1) still applies, because wgpu
+/// has no f64 regardless of which shader language it emits.
 #[cfg(all(feature = "wgpu", not(feature = "cpu")))]
 pub type SelectedRuntime = cubecl::wgpu::WgpuRuntime;
 
